@@ -1878,6 +1878,12 @@ impl Drop for Scripted {
 
 impl Scripted {
     async fn connect(network: &str, subnet: u8) -> Self {
+        Self::connect_capped(network, subnet, None).await
+    }
+
+    /// [`Self::connect`] with a node-wide egress cap of `a_cap` bytes per
+    /// second on `a`'s socket.
+    async fn connect_capped(network: &str, subnet: u8, a_cap: Option<u64>) -> Self {
         use super::super::config::{self, QuicSettings};
         use super::super::identity::{PeerKey, QuicIdentity};
         use crate::transport::Socket;
@@ -1904,7 +1910,7 @@ impl Scripted {
 
         let a_socket = Arc::new(DemuxSocket::wrap(
             SimulationSocket::bind(a_addr).await.expect("sim bind"),
-            None,
+            a_cap.map(|rate| crate::transport::egress_cap::EgressCap::new(rate, time.clone())),
         ));
         let a_endpoint = super::super::QuicEndpoint::bind(
             a_socket.clone(),
@@ -2008,7 +2014,11 @@ impl Scripted {
 
     /// A sample of `a`'s connection, as the acknowledgement watch takes it.
     fn sample(&self) -> recycle::AckSample {
-        recycle::AckSample::of(self.a.connection().inner()).expect("an AckCounting controller")
+        recycle::AckSample::of(
+            self.a.connection().inner(),
+            &self.a.connection().cap_holds(),
+        )
+        .expect("an AckCounting controller")
     }
 
     fn keep_sending(&self) {
@@ -2160,6 +2170,41 @@ fn recovery_from_an_outage_in_both_directions_does_not_close() {
     })
 }
 
+/// #5940 step M6, guard 2 (review finding, fourth round): `a` has a
+/// node-wide egress cap of 50 B/s, so each transmit waits about 24 s for
+/// its 1200-byte admission, longer than the window, while `b` keeps
+/// sending. quinn counts the frames of a transmit when it builds it, so
+/// without the cap rule `a` would latch a send that has not left and close.
+/// `b` is conforming: `a` must not close.
+#[test]
+fn a_send_held_by_the_egress_cap_does_not_close_the_path() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let network = "quic-path-ack-watch-capped";
+        let mut s = Scripted::connect_capped(network, 4, Some(50)).await;
+        s.keep_sending();
+        s.wait(Duration::from_secs(5)).await;
+        let cap_holds = s.a.connection().cap_holds();
+        let (holds_before, received_before) = (cap_holds.read().0, s.sample().received());
+        s.a_sends(20_000);
+        s.wait(Duration::from_secs(60)).await;
+        assert!(
+            cap_holds.read().0 > holds_before,
+            "the cap held no transmit"
+        );
+        assert!(
+            s.sample().received() > received_before + 1000,
+            "b sent too little"
+        );
+        assert!(
+            s.a.connection().inner().close_reason().is_none(),
+            "{:?}",
+            s.a.connection().inner().close_reason()
+        );
+        assert!(recycle_closes_to(s.b_addr).is_empty());
+    })
+}
+
 /// #5940 step M6, guard 2 must not fire on a slow but conforming peer: a
 /// 5 s round trip (2.5 s each way, from before the handshake), with
 /// messages both ways for a while and then an idle minute. Neither side
@@ -2255,7 +2300,9 @@ async fn max_outstanding(paths: [Arc<QuicPath>; 2], time: VirtualTime, end: u64)
     let mut max = 0;
     while time.now_nanos() < end {
         for path in &paths {
-            if let Some(sample) = recycle::AckSample::of(path.connection().inner()) {
+            if let Some(sample) =
+                recycle::AckSample::of(path.connection().inner(), &path.connection().cap_holds())
+            {
                 max = max.max(sample.outstanding_after_acks());
             }
         }

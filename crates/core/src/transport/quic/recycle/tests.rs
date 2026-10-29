@@ -21,12 +21,18 @@ struct Reading {
     outstanding: u64,
     sent: u64,
     received: u64,
+    /// Times the egress cap started holding a QUIC transmit, and whether it
+    /// holds one now; [`Reading::cap_held`] sets them.
+    cap_holds: u64,
+    cap_held_now: bool,
 }
 
 const fn reading(acked: u64, outstanding: u64, sent: u64, received: u64) -> Reading {
     Reading {
         acked,
         batches: acked,
+        cap_holds: 0,
+        cap_held_now: false,
         outstanding,
         sent,
         received,
@@ -37,6 +43,24 @@ impl Reading {
     /// The same reading with `batches` batches of acknowledgements.
     const fn batches(self, batches: u64) -> Self {
         Self { batches, ..self }
+    }
+
+    /// The same reading with the egress cap holding a QUIC transmit, held
+    /// `holds` times so far.
+    const fn cap_held(self, holds: u64) -> Self {
+        Self {
+            cap_holds: holds,
+            cap_held_now: true,
+            ..self
+        }
+    }
+
+    /// The same reading with no transmit held now.
+    const fn released(self) -> Self {
+        Self {
+            cap_held_now: false,
+            ..self
+        }
     }
 }
 
@@ -52,6 +76,8 @@ fn run(ticks: u64, mut at: impl FnMut(u64) -> Reading) -> Option<u64> {
             r.outstanding,
             r.sent,
             r.received,
+            r.cap_holds,
+            r.cap_held_now,
         )
     };
     let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample(at(0)));
@@ -167,6 +193,25 @@ fn a_batch_without_new_acknowledgements_clears_a_latched_send() {
     assert_eq!(closed, None);
 }
 
+/// Review finding (fourth round): quinn counts a transmit's frames when it
+/// builds it, and a saturated egress cap can hold it longer than the
+/// window. A send at tick 1 whose transmit the cap holds from tick 1 to
+/// tick 9, while the peer sends every tick and acknowledges nothing (its
+/// acknowledgement cannot come before the send leaves): no close while
+/// held, and the latch is gone afterwards.
+#[test]
+fn a_send_held_by_the_egress_cap_starts_no_window() {
+    let closed = run(40, |t| {
+        let r = reading(5, 0, 10 + t.min(1), 100 + t).cap_held(1);
+        if (1..=9).contains(&t) {
+            r
+        } else {
+            r.released()
+        }
+    });
+    assert_eq!(closed, None);
+}
+
 /// Recovery from an outage in both directions. Before it, sends with
 /// nothing from the peer (probes); after it, packets still outstanding but
 /// nothing new sent and nothing acknowledged (the probe timer is backed
@@ -239,7 +284,8 @@ fn a_busy_conforming_peer_is_never_closed() {
 fn a_new_controller_restarts_the_window() {
     let first: Arc<Mutex<AckState>> = Arc::default();
     let second: Arc<Mutex<AckState>> = Arc::default();
-    let s = |record, sent, received| AckSample::synthetic(record, 0, 0, 0, sent, received);
+    let s =
+        |record, sent, received| AckSample::synthetic(record, 0, 0, 0, sent, received, 0, false);
     let mut watch = AckWatch::new(ACK_WATCH_WINDOW, s(&first, 0, 0));
     assert!(!watch.observe(2 * SEC, s(&first, 1, 1)));
     assert!(!watch.observe(4 * SEC, s(&second, 2, 2)));

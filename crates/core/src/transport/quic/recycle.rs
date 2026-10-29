@@ -33,7 +33,8 @@
 //!    - the peer kept sending: no two samples in a row of the window
 //!      without anything from it.
 //!
-//!    It is a conformance check, not a liveness check: a peer that
+//!    It is a conformance check, not a liveness check. It targets a peer
+//!    that sends ACK frames for none of this side's data; a peer that
 //!    acknowledges something within each window is never closed by it.
 //!
 //! What "acknowledged" is measured with. quinn's `ConnectionStats` has no
@@ -65,7 +66,13 @@
 //! - the handshake: a path is built on an established connection, and the
 //!   window starts no earlier than the path;
 //! - a peer that went silent: quinn's idle timeout ends the connection
-//!   instead.
+//!   instead;
+//! - a send the node's egress cap (`total-bandwidth-limit`) holds: quinn
+//!   counts a transmit's frames when it builds it, and the cap may hold it
+//!   longer than the window, so while the cap holds any QUIC transmit (or
+//!   held one since the previous sample) no window runs. The cap is
+//!   node-wide and quinn does not say which connection a held transmit
+//!   belongs to, so this pauses the watch on every path.
 //!
 //! It can also fire when this side's packets stop reaching a peer whose
 //! packets still arrive (a path broken in one direction): from this side
@@ -87,9 +94,10 @@
 //! rebinding (it clones it, so the count is shared and continues) and builds
 //! a new one otherwise, which [`AckWatch`] sees as a new counter and treats
 //! like an acknowledgement. While quinn validates a new path it does not
-//! report acknowledgements to the controller (`on_ack`), which delays a
-//! close and cannot cause one, since the window needs the peer to keep
-//! sending for all of it.
+//! report acknowledgements to the controller (`on_ack`), so a validation
+//! lasting a window while the peer sends could close the path. That does not
+//! happen while migration is off: quinn validates a path only when the
+//! peer's address changes, and this node does not accept that.
 //!
 //! [`QuicCloseCode`]: crate::transport::metrics::QuicCloseCode
 
@@ -105,6 +113,7 @@ use quinn::congestion::{Controller, ControllerFactory, ControllerMetrics};
 use super::QuicCloser;
 #[cfg(doc)]
 use super::error::close_code;
+use super::socket::CapHolds;
 use crate::simulation::TimeSource;
 use crate::transport::metrics::QuicCloseCode;
 
@@ -382,28 +391,38 @@ pub(crate) struct AckSample {
     sent: u64,
     /// Frames received from the peer.
     received: u64,
+    /// Times the egress cap started holding a QUIC transmit, node-wide.
+    cap_holds: u64,
+    /// The egress cap holds a QUIC transmit now.
+    cap_held_now: bool,
 }
 
 impl AckSample {
     /// The connection's counts now, or `None` if its controller is not an
     /// [`AckCounting`] (a config that does not install it).
-    pub(crate) fn of(connection: &quinn::Connection) -> Option<Self> {
-        Self::from_parts(connection.congestion_state(), connection.stats())
-    }
-
-    /// A sample from a controller (a clone of the connection's) and the
-    /// connection's stats.
-    pub(crate) fn from_parts(
-        controller: Box<dyn Controller>,
-        stats: quinn::ConnectionStats,
-    ) -> Option<Self> {
-        let record = controller.into_any().downcast::<AckCounting>().ok()?.state;
+    ///
+    /// Read in this order: the record, then the stats, then `cap_holds`. A
+    /// send that lands between two reads then shows up in a later read, so
+    /// it is seen after the record it may follow and is not taken as a send
+    /// before a batch; and a transmit quinn built (counted in the stats) and
+    /// the cap then held is seen as held.
+    pub(crate) fn of(connection: &quinn::Connection, cap_holds: &CapHolds) -> Option<Self> {
+        let record = connection
+            .congestion_state()
+            .into_any()
+            .downcast::<AckCounting>()
+            .ok()?
+            .state;
         let state = *record.lock();
+        let stats = connection.stats();
+        let (cap_holds, cap_held_now) = cap_holds.read();
         Some(Self {
             record,
             state,
             sent: ack_eliciting_frames(&stats.frame_tx),
             received: frames_received(&stats.frame_rx),
+            cap_holds,
+            cap_held_now,
         })
     }
 
@@ -422,6 +441,7 @@ impl AckSample {
     /// A sample with these counts; `batches` counts every batch of
     /// acknowledgements, those with an `on_ack` and those without.
     #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn synthetic(
         record: &Arc<Mutex<AckState>>,
         acked: u64,
@@ -429,6 +449,8 @@ impl AckSample {
         outstanding_after_acks: u64,
         sent: u64,
         received: u64,
+        cap_holds: u64,
+        cap_held_now: bool,
     ) -> Self {
         Self {
             record: record.clone(),
@@ -440,6 +462,8 @@ impl AckSample {
             },
             sent,
             received,
+            cap_holds,
+            cap_held_now,
         }
     }
 }
@@ -484,7 +508,9 @@ impl AckSample {
 ///
 /// The window ends, without a close, at any sample where nothing is
 /// outstanding, at the second sample in a row with nothing from the peer,
-/// or at any new acknowledgement (which may start a new window as above).
+/// at any sample where the egress cap holds a QUIC transmit or held one
+/// since the previous sample (which also clears the send latch), or at any
+/// new acknowledgement (which may start a new window as above).
 /// Otherwise the path is closed at the first sample at least a window after
 /// the start, so a close needs at least `window / tick + 1` consecutive
 /// samples with no new acknowledgement and packets outstanding, with
@@ -525,6 +551,7 @@ impl AckWatch {
         let peer_sent = same_controller && sample.received != self.previous.received;
         let sent_new = same_controller && sample.sent != self.previous.sent;
         let outstanding_after_acks = same_controller && sample.state.outstanding_after_acks() > 0;
+        let cap_held = sample.cap_held_now || sample.cap_holds != self.previous.cap_holds;
         self.previous = sample;
         if new_batch {
             self.sent_after_acks = false;
@@ -536,6 +563,13 @@ impl AckWatch {
         } else {
             self.quiet_samples.saturating_add(1)
         };
+        if cap_held {
+            // A send counted in quinn's stats may still wait in the egress
+            // cap, so nothing says when it left: no latch, no window.
+            self.sent_after_acks = false;
+            self.since = None;
+            return false;
+        }
         let outstanding = outstanding_after_acks || self.sent_after_acks;
         if !outstanding || self.quiet_samples >= QUIET_SAMPLES_END_WINDOW {
             self.since = None;
@@ -562,8 +596,9 @@ pub(crate) async fn watch_acknowledgements<T: TimeSource>(
     connection: quinn::Connection,
     closer: QuicCloser,
     time: T,
+    cap_holds: Arc<CapHolds>,
 ) {
-    let Some(first) = AckSample::of(&connection) else {
+    let Some(first) = AckSample::of(&connection, &cap_holds) else {
         tracing::warn!(
             remote = %connection.remote_address(),
             "QUIC path: the connection's congestion controller does not count \
@@ -577,7 +612,7 @@ pub(crate) async fn watch_acknowledgements<T: TimeSource>(
         if connection.close_reason().is_some() {
             return;
         }
-        let Some(sample) = AckSample::of(&connection) else {
+        let Some(sample) = AckSample::of(&connection, &cap_holds) else {
             return;
         };
         if watch.observe(time.now_nanos(), sample) {

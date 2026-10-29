@@ -592,6 +592,7 @@ async fn attempt(
                             incoming.permit,
                             Some(incoming.hold),
                             incoming.peer,
+                            incoming.cap_holds,
                         ))
                     }
                 }

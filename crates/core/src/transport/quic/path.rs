@@ -530,6 +530,7 @@ impl QuicPath {
             Arc::new(receiver),
             stats.clone(),
             time,
+            connection.cap_holds(),
         ));
         (
             Self {
@@ -735,6 +736,7 @@ async fn supervise_receive<T: TimeSource>(
     receiver: Arc<inbound::Receiver<T>>,
     stats: Arc<QuicPathStats>,
     time: T,
+    cap_holds: Arc<super::socket::CapHolds>,
 ) {
     use futures::FutureExt;
     let mut receive = std::pin::pin!(
@@ -744,6 +746,7 @@ async fn supervise_receive<T: TimeSource>(
         connection.clone(),
         closer.clone(),
         time,
+        cap_holds,
     ))
     .catch_unwind();
     let ended = tokio::select! {

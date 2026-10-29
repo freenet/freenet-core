@@ -22,9 +22,40 @@ use crate::transport::demux::{DemuxSocket, QuicIngressReceiver};
 use crate::transport::egress_cap::AdmissionWaiter;
 use crate::transport::{Socket, normalize_mapped_addr};
 
+/// QUIC transmits the egress cap is holding, node-wide: quinn has built
+/// them (their frames are counted in its stats) but they have not been
+/// sent. The path's acknowledgement watch (`recycle`) does not count a send
+/// while one is held, since it may not have left yet.
+#[derive(Debug, Default)]
+pub(crate) struct CapHolds {
+    /// Pollers the cap holds right now.
+    held_now: AtomicU64,
+    /// Times a poller started being held, ever.
+    holds: AtomicU64,
+}
+
+impl CapHolds {
+    fn hold(&self) {
+        self.held_now.fetch_add(1, Ordering::AcqRel);
+        self.holds.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn release(&self) {
+        self.held_now.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    /// Times a poller started being held, and whether one is held now.
+    pub(crate) fn read(&self) -> (u64, bool) {
+        let holds = self.holds.load(Ordering::Acquire);
+        (holds, self.held_now.load(Ordering::Acquire) > 0)
+    }
+}
+
 /// The QUIC endpoint's socket. See the module docs.
 pub(crate) struct QuicSocket<S> {
     socket: Arc<DemuxSocket<S>>,
+    /// Transmits the egress cap holds, shared with every connection's path.
+    cap_holds: Arc<CapHolds>,
     /// Only quinn's endpoint driver receives, one call at a time; the lock
     /// is never contended.
     ingress: parking_lot::Mutex<QuicIngressReceiver>,
@@ -70,6 +101,11 @@ impl<S> fmt::Debug for QuicSocket<S> {
 }
 
 impl<S: Socket> QuicSocket<S> {
+    /// The transmits the egress cap holds, for the paths' watches.
+    pub(crate) fn cap_holds(&self) -> Arc<CapHolds> {
+        self.cap_holds.clone()
+    }
+
     pub(crate) fn new(
         socket: Arc<DemuxSocket<S>>,
         ingress: QuicIngressReceiver,
@@ -77,6 +113,7 @@ impl<S: Socket> QuicSocket<S> {
     ) -> Self {
         Self {
             socket,
+            cap_holds: Arc::default(),
             ingress: parking_lot::Mutex::new(ingress),
             local_addr,
             send_errors: AtomicU64::new(0),
@@ -131,6 +168,7 @@ impl<S: Socket> AsyncUdpSocket for QuicSocket<S> {
         Box::pin(QuicPoller {
             socket: self,
             waiter: std::sync::Mutex::new(AdmissionWaiter::default()),
+            held: false,
         })
     }
 
@@ -254,6 +292,27 @@ struct QuicPoller<S> {
     /// `poll_writable` has `&mut self` and uses `get_mut`, so it is never
     /// locked.
     waiter: std::sync::Mutex<AdmissionWaiter>,
+    /// The cap is holding this poller's transmit ([`CapHolds`]).
+    held: bool,
+}
+
+impl<S> QuicPoller<S> {
+    fn set_held(&mut self, held: bool) {
+        if held != self.held {
+            self.held = held;
+            if held {
+                self.socket.cap_holds.hold();
+            } else {
+                self.socket.cap_holds.release();
+            }
+        }
+    }
+}
+
+impl<S> Drop for QuicPoller<S> {
+    fn drop(&mut self) {
+        self.set_held(false);
+    }
 }
 
 impl<S> fmt::Debug for QuicPoller<S> {
@@ -281,7 +340,8 @@ impl<S: Socket> UdpPoller for QuicPoller<S> {
             Ok(waiter) => waiter,
             Err(poisoned) => poisoned.into_inner(),
         };
-        cap.poll_admit(usize::from(MAX_UDP_PAYLOAD), waiter, cx)
-            .map(Ok)
+        let admitted = cap.poll_admit(usize::from(MAX_UDP_PAYLOAD), waiter, cx);
+        this.set_held(admitted.is_pending());
+        admitted.map(Ok)
     }
 }
