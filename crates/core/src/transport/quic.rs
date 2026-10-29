@@ -77,7 +77,6 @@ const _: () = assert!(
     cfg!(panic = "unwind"),
     "the QUIC transport relies on panic = \"unwind\" to contain panics (transport/quic/liveness.rs)"
 );
-#[cfg(test)]
 pub(crate) use liveness::QuicAvailability;
 pub(crate) use liveness::QuicAvailabilityWatch;
 
