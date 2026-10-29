@@ -17,7 +17,8 @@
 #     aborted: a stream that died before the spiked ACKs returned leaves no
 #     evidence. On a seed that did not abort it means the controller stopped
 #     reacting to the spike.
-#   - Anything else, a seed that panicked included, is a new failure.
+#   - Any other per-seed reason, a seed that panicked included, is a new
+#     failure. `across seeds:` lines are not judged here.
 #
 # Exit 0 when the run failed only the known way. Exit 1 otherwise, printing
 # one line per reason that is not covered.

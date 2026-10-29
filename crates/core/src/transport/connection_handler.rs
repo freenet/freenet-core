@@ -3202,7 +3202,7 @@ fn record_remote_inbound_completion(this_addr: SocketAddr, remote_addr: SocketAd
 /// Test-only: whether `this_addr` completed a handshake with `remote_addr`
 /// in the `RemoteInbound` arm.
 #[cfg(test)]
-fn completed_in_remote_inbound(this_addr: SocketAddr, remote_addr: SocketAddr) -> bool {
+pub(super) fn completed_in_remote_inbound(this_addr: SocketAddr, remote_addr: SocketAddr) -> bool {
     REMOTE_INBOUND_COMPLETIONS
         .lock()
         .contains(&(this_addr, remote_addr))

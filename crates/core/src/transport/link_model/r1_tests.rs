@@ -54,7 +54,9 @@ use super::{Delivery, HostLink, LinkEvent, LinkModel, Loss, Offer};
 use crate::config::GlobalRng;
 use crate::simulation::{TimeSource, VirtualTime};
 use crate::transport::congestion_control::{CongestionControlAlgorithm, CongestionControlConfig};
-use crate::transport::connection_handler::OutboundConnectionHandler;
+use crate::transport::connection_handler::{
+    OutboundConnectionHandler, completed_in_remote_inbound,
+};
 use crate::transport::mock_transport::{Channels, MockSocket, create_mock_peer_with_link_model};
 use crate::transport::packet_data::MAX_PACKET_SIZE;
 use crate::transport::peer_connection::{CongestionProbe, PeerConnection};
@@ -871,6 +873,11 @@ fn hole_punch_completes_when_one_side_loses_its_completion_ack() {
                         .any(|d| d.content_hash == b_offers[1].content_hash),
                 "seed {seed}: the link did not drop B's completion ack, so this seed no longer \
                  exercises the lost-ack handshake"
+            );
+            assert!(
+                completed_in_remote_inbound(pair.addr_b, pair.addr_a),
+                "seed {seed}: B did not complete on A's ack, so this seed no longer exercises \
+                 the lost-ack handshake"
             );
             assert!(
                 pair.conn_a.is_ok(),
