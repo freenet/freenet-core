@@ -185,6 +185,7 @@ pub async fn base_node_test_config_with_rng<R: Rng>(
             congestion_control: None,
             bbr_startup_rate: None,
             transport_quic: None,
+            quic_max_paths: None,
             quic_ignore_crash_breaker: None,
         },
         config_paths: freenet::config::ConfigPathsArgs {

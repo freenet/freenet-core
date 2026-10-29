@@ -2004,7 +2004,7 @@ impl SimNetwork {
     }
 
     /// Sets `transport-quic` to `value`, as `config.toml` would (`"off"`,
-    /// `"prefer"`), on every node. Unset (off) by default. Call before the
+    /// `"shadow"`, `"prefer"`), on every node. Unset (off) by default. Call before the
     /// simulation starts.
     ///
     /// # Panics
@@ -8082,7 +8082,7 @@ mod tests {
         );
     }
 
-    /// In a running simulation a node with `transport-quic = "prefer"`
+    /// In a running simulation a node with `transport-quic = "shadow"`
     /// has a QUIC ingress on its socket (a QUIC-class datagram from a
     /// stranger is refused as not allowed), and a node left off has none.
     #[tokio::test(flavor = "current_thread")]
@@ -8092,7 +8092,7 @@ mod tests {
         const NETWORK: &str = "quic-running-endpoint-e5a1";
         let mut sim = SimNetwork::new(NETWORK, 1, 1, 7, 3, 6, 1, 0x5940_E5A1_0012).await;
         let labels = labels_in_order(&sim);
-        sim.with_node_transport_quic(&labels[0], "prefer");
+        sim.with_node_transport_quic(&labels[0], "shadow");
         let _handles = sim
             .start_with_rand_gen::<rand::rngs::SmallRng>(0x5940_E5A1_0012, 1, 1)
             .await;

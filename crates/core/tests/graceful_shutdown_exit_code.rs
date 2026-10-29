@@ -480,9 +480,11 @@ fn quic_breaker_marker_is_armed_and_cleared_by_a_clean_stop() -> anyhow::Result<
 /// `--quic-ignore-crash-breaker` runs QUIC, arms the marker, and clears it on
 /// a clean stop.
 ///
-/// FALSIFY: replace the `breaker::gate(..)` call in `P2pConnManager::build`
-/// with the bare `quic_settings()`; no marker is written, the third run builds
-/// the QUIC endpoint, and this test fails.
+/// FALSIFY: replace the `breaker::gate(..).await` call in
+/// `P2pConnManager::build` with `breaker::Gated { settings:
+/// config.quic_settings(), breaker: breaker::BreakerOutcome::NotConsulted }`;
+/// no marker is written, the third run builds the QUIC endpoint, and this test
+/// fails.
 #[test]
 fn quic_breaker_trips_after_an_abnormal_exit() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;

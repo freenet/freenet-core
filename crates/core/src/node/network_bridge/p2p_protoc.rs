@@ -719,8 +719,10 @@ pub(in crate::node) struct P2pConnManager {
     /// Congestion control configuration.
     congestion_config: CongestionControlConfig,
     /// QUIC endpoint settings when `transport-quic` is on (#5940), `None`
-    /// when it is off. Only used to open the transport.
-    quic: Option<crate::transport::quic::QuicSettings>,
+    /// when it is off or the crash-loop breaker keeps it off, and what the
+    /// breaker decided (for the upgrade policy, from e5a-3). The settings are
+    /// used to open the transport.
+    quic: crate::transport::quic::breaker::Gated<crate::transport::quic::QuicSettings>,
     /// Test-only override for the #5161 version-carrying-ack floor, threaded
     /// into the transport handler. `None` in production.
     /// See `NodeConfig::ack_version_floor_override`.
@@ -1267,6 +1269,9 @@ impl P2pConnManager {
         let uptime_clock: DynTimeSource = Arc::new(InstantTimeSrc::new());
         let started_at = uptime_clock.now();
         let quic_breaker_now = uptime_clock.system_time_now();
+        // Once per node: `prefer` running as shadow, and a `quic-max-paths`
+        // that is ignored or lowered (#5940).
+        crate::transport::quic::upgrade::policy::log_startup(&config.config.network_api);
 
         Ok(P2pConnManager {
             gateways,
@@ -1391,7 +1396,7 @@ impl P2pConnManager {
                 ledbat_min_ssthresh: self.ledbat_min_ssthresh,
                 congestion_config: Some(self.congestion_config.clone()),
                 ack_version_floor_override: self.ack_version_floor_override,
-                quic: self.quic,
+                quic: self.quic.settings,
                 advertised_version_override: self.advertised_version_override,
             },
         )
