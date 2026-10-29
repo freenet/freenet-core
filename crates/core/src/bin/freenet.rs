@@ -258,6 +258,11 @@ async fn run_network(config: Config) -> anyhow::Result<()> {
     // update-check task so an operator opt-out (#4690) can park it.
     let disable_auto_update = config.disable_auto_update;
 
+    // The QUIC crash-loop breaker (#5940): if a run with QUIC enabled ended
+    // abnormally, QUIC stays off for a cooldown. Enabled here, before the node
+    // is built, because only this binary marks its clean exits (see `main`).
+    freenet::enable_quic_crash_breaker();
+
     let node_config = NodeConfig::new(config)
         .await
         .with_context(|| "failed while loading node config")?;
@@ -403,6 +408,11 @@ async fn run_network_node_with_signals(
     #[cfg(unix)]
     let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
         .context("failed to install SIGTERM handler")?;
+    // The QUIC crash-loop breaker arms its marker only from here on (#5940):
+    // a SIGTERM before the handler exists ends the node without its clean
+    // exit, which would read as a crash.
+    #[cfg(unix)]
+    freenet::quic_breaker_signals_ready();
 
     // Set when THIS process asks the node to stop because an operator signalled
     // it (SIGTERM from `systemctl stop`, SIGINT from Ctrl+C). Load-bearing for
@@ -1176,6 +1186,17 @@ async fn run_network_node_with_signals(
         }
     };
 
+    // Classified now, before the pause and the runtime drop below, so the QUIC
+    // crash-loop breaker's marker is cleared well inside the supervisor's stop
+    // timeout (#5940): a SIGKILL after it would leave the marker armed.
+    let result = finish_run(
+        result,
+        shutdown_requested.load(std::sync::atomic::Ordering::SeqCst),
+    );
+    if quic_breaker_exit_is_clean(&result) {
+        freenet::quic_breaker_clean_exit();
+    }
+
     // Clean up tasks
     signal_task.abort();
     update_check_task.abort();
@@ -1188,16 +1209,23 @@ async fn run_network_node_with_signals(
     // and complete their cleanup without being forcefully killed by SIGKILL.
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-    let result = finish_run(
-        result,
-        shutdown_requested.load(std::sync::atomic::Ordering::SeqCst),
-    );
-
     if result.is_ok() {
         tracing::info!("Graceful shutdown complete");
     }
 
     result
+}
+
+/// Whether a finished run (after [`finish_run`]) ended cleanly for the QUIC
+/// crash-loop breaker (#5940): an operator stop, which `finish_run` made `Ok`,
+/// or an auto-update exit. Every other ending leaves the marker armed.
+fn quic_breaker_exit_is_clean(result: &anyhow::Result<()>) -> bool {
+    match result {
+        Ok(()) => true,
+        Err(e) => e
+            .downcast_ref::<commands::auto_update::UpdateNeededError>()
+            .is_some(),
+    }
 }
 
 /// Decide what a finished node run means for the PROCESS EXIT CODE (#5227).
@@ -1653,8 +1681,36 @@ fn merge_pre_subcommand_ws_api_args(config: &mut ConfigArgs, top_level: &ConfigA
         .or_else(|| top_level.ws_api.allowed_source_cidrs.clone());
 }
 
+/// The `quic-ignore-crash-breaker` value for a `network`/`local` run. The
+/// flag can be given before the subcommand (top-level `matches`) or after it,
+/// and its environment variable fills both copies, so the value is chosen by
+/// where it came from: the command line after the subcommand, then before
+/// it, then the environment.
+fn quic_ignore_crash_breaker_from(matches: &clap::ArgMatches) -> Option<bool> {
+    use clap::parser::ValueSource;
+    const ID: &str = "quic_ignore_crash_breaker";
+    let read = |m: &clap::ArgMatches| {
+        let value = m.try_get_one::<bool>(ID).ok().flatten().copied()?;
+        Some((value, m.value_source(ID)?))
+    };
+    let sub = matches.subcommand().and_then(|(_, m)| read(m));
+    let top = read(matches);
+    let from_cli = |v: Option<(bool, ValueSource)>| {
+        v.filter(|(_, source)| *source == ValueSource::CommandLine)
+            .map(|(value, _)| value)
+    };
+    from_cli(sub)
+        .or(from_cli(top))
+        .or(sub.map(|(value, _)| value))
+        .or(top.map(|(value, _)| value))
+}
+
 fn freenet_main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    // Parsed in two steps so the node arms can see where a value came from
+    // (`quic_ignore_crash_breaker_from`); errors exit as `Cli::parse` does.
+    let matches = <Cli as clap::CommandFactory>::command().get_matches();
+    let cli =
+        <Cli as clap::FromArgMatches>::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
 
     match cli.command {
         // The link-handler commands need no node directories: skip building
@@ -1709,12 +1765,14 @@ fn freenet_main() -> anyhow::Result<()> {
             // we are preventing).
             config.disable_auto_update |= cli.config.disable_auto_update;
             merge_pre_subcommand_ws_api_args(&mut config, &cli.config);
+            config.network_api.quic_ignore_crash_breaker = quic_ignore_crash_breaker_from(&matches);
             run_node(config)
         }
         Some(Command::Local { mut config }) => {
             config.mode = Some(OperationMode::Local);
             config.disable_auto_update |= cli.config.disable_auto_update;
             merge_pre_subcommand_ws_api_args(&mut config, &cli.config);
+            config.network_api.quic_ignore_crash_breaker = quic_ignore_crash_breaker_from(&matches);
             run_node(config)
         }
         None => {
@@ -2331,6 +2389,110 @@ mod tests {
         }
     }
 
+    /// One case of the test below, run in a child process with the case in
+    /// its environment. In a normal test run (no case set) it does nothing.
+    #[test]
+    fn quic_ignore_crash_breaker_case_in_a_child() {
+        use super::{Cli, quic_ignore_crash_breaker_from};
+        use clap::CommandFactory;
+        let Ok(argv) = std::env::var("FREENET_TEST_QUIC_OVERRIDE_ARGV") else {
+            return;
+        };
+        let expected = std::env::var("FREENET_TEST_QUIC_OVERRIDE_EXPECTED").expect("expected");
+        let argv: Vec<&str> = argv.split(' ').collect();
+        let matches = Cli::command()
+            .try_get_matches_from(&argv)
+            .unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+        assert_eq!(
+            format!("{:?}", quic_ignore_crash_breaker_from(&matches)),
+            expected,
+            "{argv:?}"
+        );
+    }
+
+    /// `--quic-ignore-crash-breaker` given on the command line, before or
+    /// after the subcommand, beats its environment variable; after the
+    /// subcommand beats before it; and the environment applies otherwise.
+    ///
+    /// Each case runs in a child process with the variable set there, so this
+    /// process's environment, which other tests read while parsing `Cli`, is
+    /// never changed.
+    #[test]
+    fn quic_ignore_crash_breaker_prefers_the_command_line_over_the_environment() {
+        const VAR: &str = "FREENET_QUIC_IGNORE_CRASH_BREAKER";
+        const FLAG_TRUE: &str = "--quic-ignore-crash-breaker=true";
+        const FLAG_FALSE: &str = "--quic-ignore-crash-breaker=false";
+        let cases: [(Option<&str>, &[&str], Option<bool>); 9] = [
+            (None, &["freenet", "network"], None),
+            (None, &["freenet", FLAG_TRUE, "network"], Some(true)),
+            (
+                None,
+                &["freenet", "network", "--quic-ignore-crash-breaker"],
+                Some(true),
+            ),
+            (
+                None,
+                &["freenet", FLAG_TRUE, "network", FLAG_FALSE],
+                Some(false),
+            ),
+            (Some("true"), &["freenet", "network"], Some(true)),
+            (Some("0"), &["freenet", "network"], Some(false)),
+            (
+                Some("true"),
+                &["freenet", FLAG_FALSE, "network"],
+                Some(false),
+            ),
+            (
+                Some("true"),
+                &["freenet", "network", FLAG_FALSE],
+                Some(false),
+            ),
+            (Some("1"), &["freenet", "local", FLAG_FALSE], Some(false)),
+        ];
+        let exe = std::env::current_exe().expect("test binary");
+        for (env, argv, expected) in cases {
+            let mut child = std::process::Command::new(&exe);
+            child
+                .args([
+                    "--exact",
+                    "tests::quic_ignore_crash_breaker_case_in_a_child",
+                    "--nocapture",
+                ])
+                .env("FREENET_TEST_QUIC_OVERRIDE_ARGV", argv.join(" "))
+                .env(
+                    "FREENET_TEST_QUIC_OVERRIDE_EXPECTED",
+                    format!("{expected:?}"),
+                );
+            match env {
+                Some(value) => child.env(VAR, value),
+                None => child.env_remove(VAR),
+            };
+            let out = child.output().expect("run the test binary");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success() && stdout.contains("1 passed"),
+                "{VAR}={env:?} {argv:?}: the child must run the case and pass.\n\
+                 stdout:\n{stdout}\nstderr:\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        // Both node arms take the value this way.
+        let src = strip_line_comments(include_str!("freenet.rs"));
+        let prod = production_region(&src);
+        for arm in [
+            "Some(Command::Network { mut config }) => {",
+            "Some(Command::Local { mut config }) => {",
+        ] {
+            assert!(
+                squeeze(braced_block(prod, arm)).contains(&squeeze(
+                    "config.network_api.quic_ignore_crash_breaker = \
+                     quic_ignore_crash_breaker_from(&matches);"
+                )),
+                "`{arm}` must take the override from quic_ignore_crash_breaker_from"
+            );
+        }
+    }
+
     /// The subcommand's own value wins; the top-level one only fills a gap.
     #[test]
     fn subcommand_ws_api_address_beats_the_pre_subcommand_one() {
@@ -2909,6 +3071,102 @@ mod tests {
             "exit-42 handler must log at error! level on the unsupervised path \
              so the silent 'detected update, exited, never applied' failure is \
              diagnosable (#4580)"
+        );
+    }
+
+    /// #5940: the QUIC crash-loop breaker's marker is cleared on a clean
+    /// ending (an operator stop or an auto-update exit) and on no other.
+    #[test]
+    fn quic_breaker_exit_is_clean_only_for_a_stop_or_an_update() {
+        use super::commands::auto_update::UpdateNeededError;
+        use super::{finish_run, quic_breaker_exit_is_clean};
+        use freenet::EventLoopExitReason;
+        let clean = |result, requested| quic_breaker_exit_is_clean(&finish_run(result, requested));
+        assert!(clean(Ok(()), false));
+        assert!(clean(
+            Err(EventLoopExitReason::GracefulShutdown.into()),
+            true
+        ));
+        assert!(clean(
+            Err(UpdateNeededError {
+                new_version: "9.9.9".to_string()
+            }
+            .into()),
+            false
+        ));
+        assert!(!clean(
+            Err(EventLoopExitReason::GracefulShutdown.into()),
+            false
+        ));
+        assert!(!clean(
+            Err(EventLoopExitReason::UnexpectedStreamEnd.into()),
+            true
+        ));
+        assert!(!clean(Err(anyhow::anyhow!("boom")), true));
+    }
+
+    /// #5940: the clean-exit call runs right after the run is classified and
+    /// before the 2 s pause and the runtime drop, so it finishes inside a
+    /// supervisor's stop timeout. It is the binary's only call. Reads the raw
+    /// source and counts calls at line start only, so a commented-out call
+    /// does not count.
+    #[test]
+    fn quic_breaker_clean_exit_runs_before_the_shutdown_pause() {
+        const CALL: &str = "freenet::quic_breaker_clean_exit();";
+        let src = include_str!("freenet.rs");
+        assert_eq!(
+            src.lines()
+                .filter(|l| l.trim_start().starts_with(CALL))
+                .count(),
+            1,
+            "one clean-exit call in the binary"
+        );
+        let lines: Vec<&str> = fn_body(src, "async fn run_network_node_with_signals(")
+            .lines()
+            .map(str::trim_start)
+            .collect();
+        let line_of = |text: &str| {
+            let found: Vec<usize> = (0..lines.len())
+                .filter(|&i| lines[i].starts_with(text))
+                .collect();
+            assert_eq!(found.len(), 1, "expected one `{text}`: {found:?}");
+            found[0]
+        };
+        let classified = line_of("let result = finish_run(");
+        let guard = line_of("if quic_breaker_exit_is_clean(&result) {");
+        let call = line_of(CALL);
+        let pause = line_of("tokio::time::sleep(std::time::Duration::from_secs(2)).await;");
+        assert!(
+            classified < guard && guard + 1 == call && call < pause,
+            "classify, then clear the marker, then pause: {classified} {guard} {call} {pause}"
+        );
+    }
+
+    /// #5940: the breaker arms only once the SIGTERM handler is installed, so
+    /// `run_network_node_with_signals` reports it right after installing the
+    /// handler and before the signal task and the node run.
+    #[test]
+    fn quic_breaker_signals_ready_follows_the_sigterm_handler() {
+        let lines: Vec<&str> = fn_body(
+            include_str!("freenet.rs"),
+            "async fn run_network_node_with_signals(",
+        )
+        .lines()
+        .map(str::trim_start)
+        .collect();
+        let line_of = |text: &str| {
+            let found: Vec<usize> = (0..lines.len())
+                .filter(|&i| lines[i].starts_with(text))
+                .collect();
+            assert_eq!(found.len(), 1, "expected one `{text}`: {found:?}");
+            found[0]
+        };
+        let handler = line_of("let mut sigterm = signal::unix::signal(");
+        let ready = line_of("freenet::quic_breaker_signals_ready();");
+        let signal_task = line_of("let signal_task = {");
+        assert!(
+            handler < ready && ready < signal_task,
+            "signals_ready must come right after the SIGTERM handler is installed"
         );
     }
 

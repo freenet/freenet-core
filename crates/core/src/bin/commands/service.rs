@@ -3753,6 +3753,80 @@ echo "RC=$?"
         );
     }
 
+    /// The brace-matched body of the item that `opener` starts (from the
+    /// first `{` at or after it), with `//` comments dropped. Panics unless `opener` occurs
+    /// exactly once, so a moved or duplicated anchor fails instead of
+    /// widening the region.
+    fn quic_breaker_pin_body(src: &str, opener: &str) -> String {
+        assert_eq!(
+            src.matches(opener).count(),
+            1,
+            "expected exactly one `{opener}`"
+        );
+        let at = src.find(opener).expect("counted above");
+        let start = at + src[at..].find('{').expect("the item has no body") + 1;
+        let mut depth = 1usize;
+        for (i, c) in src[start..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return src[start..start + i]
+                            .lines()
+                            .filter(|line| !line.trim_start().starts_with("//"))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("braces never balance after `{opener}`")
+    }
+
+    /// #5940: on macOS (Freenet.app) the run wrapper passes the QUIC
+    /// crash-loop breaker's stop note to its child, and records the child's
+    /// pid in it as the statement right before every kill of any form
+    /// (`child.kill()`, `start_kill`, a `taskkill` of `child.id()`), so a
+    /// tray Restart, Stop, Quit or update is not read as a crash. The breaker
+    /// is off on Windows.
+    #[test]
+    fn wrapper_records_every_deliberate_child_kill_for_the_quic_breaker() {
+        let body = quic_breaker_pin_body(
+            include_str!("service/wrapper.rs"),
+            // No newline in the anchor: a Windows checkout has CRLF endings.
+            "fn run_wrapper_loop(",
+        );
+        // Whitespace-free and without trailing argument commas, so rustfmt's
+        // line breaks do not matter.
+        let flat: String = body
+            .split_whitespace()
+            .collect::<String>()
+            .replace(",)", ")");
+        assert!(
+            flat.contains(
+                "#[cfg(target_os=\"macos\")]letquic_stop_note=log_dir.join(freenet::QUIC_BREAKER_STOP_NOTE_FILE);"
+            ) && flat.contains(
+                "#[cfg(target_os=\"macos\")]cmd.env(freenet::QUIC_BREAKER_STOP_NOTE_ENV_VAR,&quic_stop_note);"
+            ),
+            "on macOS the child must be told where the stop note is"
+        );
+        let note = "#[cfg(target_os=\"macos\")]freenet::record_quic_breaker_deliberate_stop(&quic_stop_note,child.id());";
+        let mut kills = 0;
+        for (at, _) in flat.match_indices("kill(") {
+            kills += 1;
+            let before = &flat[..at];
+            let statement_start = before.rfind(';').map_or(0, |end| end + 1);
+            assert!(
+                before[..statement_start].ends_with(note),
+                "every kill must directly follow the stop note; found `...{}`",
+                &flat[at.saturating_sub(100)..at + 5]
+            );
+        }
+        assert!(kills > 0, "no kill found; the anchor moved");
+    }
+
     #[test]
     fn a_short_run_keeps_the_failure_streak() {
         // A tight crash loop must still reach the give-up limit.

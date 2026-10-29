@@ -8192,10 +8192,13 @@ mod tests {
                     .to_string()
             })
             .collect();
-        let assigned = code
-            .iter()
-            .filter(|line| line.starts_with("quic: config.quic_settings(),"))
-            .count();
+        // Directly, or through the QUIC crash-loop breaker's `gate` (#5940),
+        // which takes these settings as its first argument.
+        let flat: String = code.concat().split_whitespace().collect();
+        let assigned = flat.matches("quic:config.quic_settings(),").count()
+            + flat
+                .matches("quic:crate::transport::quic::breaker::gate(config.quic_settings(),")
+                .count();
         assert_eq!(
             assigned, 1,
             "`build` sets `quic` from `config.quic_settings()`"
