@@ -484,6 +484,8 @@ fn fault_injection_delivery_decision(
             // without it has the rules inactive, as a partition is.
             let now = inj.virtual_time.as_ref().map(|vt| vt.now_nanos());
             if now.is_none() {
+                // Process-wide: the first such network in the process warns,
+                // later ones do not.
                 static WARNED: std::sync::atomic::AtomicBool =
                     std::sync::atomic::AtomicBool::new(false);
                 if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -8078,19 +8080,71 @@ mod tests {
         );
     }
 
-    /// `P2pConnManager` opens the transport with `NodeConfig::quic_settings`,
-    /// which applies the simulation's idle timeout, not with the bare
-    /// `network_api` settings, which would drop it.
+    /// `P2pConnManager::build` opens the transport with
+    /// `NodeConfig::quic_settings`, which applies the simulation's idle
+    /// timeout, not with the bare `network_api` settings, which would drop
+    /// it. Scoped to `build`'s body (AGENTS.md, source-scrape pins), with
+    /// trailing comments stripped, so a commented-out assignment such as
+    /// `quic: None, // quic: config.quic_settings(),` does not satisfy it.
     #[test]
     fn the_transport_is_opened_with_node_config_quic_settings() {
-        let code: Vec<&str> = include_str!("network_bridge/p2p_protoc.rs")
+        let source = include_str!("network_bridge/p2p_protoc.rs");
+        let code: Vec<String> = method_body(source, "    pub async fn build(")
             .lines()
-            .map(str::trim)
-            .filter(|line| !line.starts_with("//"))
+            .map(|line| {
+                line.split_once("//")
+                    .map_or(line, |(code, _)| code)
+                    .trim()
+                    .to_string()
+            })
             .collect();
-        let count = |needle: &str| code.iter().filter(|line| line.contains(needle)).count();
-        assert_eq!(count("quic: config.quic_settings(),"), 1);
-        assert_eq!(count("network_api.quic_settings()"), 0);
+        let assigned = code
+            .iter()
+            .filter(|line| line.starts_with("quic: config.quic_settings(),"))
+            .count();
+        assert_eq!(
+            assigned, 1,
+            "`build` sets `quic` from `config.quic_settings()`"
+        );
+        assert!(
+            code.iter()
+                .all(|line| !line.contains("network_api.quic_settings()")),
+            "`build` must not read the bare `network_api` settings"
+        );
+    }
+
+    /// The body of the method `signature` (indented four spaces, as in an
+    /// `impl` block) in `src`: from the signature to the method's closing
+    /// brace at the same indentation. Panics, rather than widening
+    /// silently, if the signature is not found exactly once, is not
+    /// indented as a method, or lies in the test module.
+    fn method_body<'a>(src: &'a str, signature: &str) -> &'a str {
+        assert_eq!(
+            src.matches(signature).count(),
+            1,
+            "exactly one `{signature}`"
+        );
+        let at = src.find(signature).expect("counted above");
+        assert!(
+            src.as_bytes()[at - 1] == b'\n',
+            "`{signature}` must start a line"
+        );
+        if let Some(tests_at) = src.find("\n#[cfg(test)]\nmod ") {
+            assert!(
+                at < tests_at,
+                "`{signature}` matched inside the test module"
+            );
+        }
+        let (body, _) = src[at + signature.len()..]
+            .split_once("\n    }\n")
+            .unwrap_or_else(|| panic!("could not locate the end of `{signature}`"));
+        assert!(
+            !body.contains("\n    pub ")
+                && !body.contains("\n    fn ")
+                && !body.contains("\n    async fn "),
+            "the region for `{signature}` ran past the method"
+        );
+        body
     }
 
     /// Misuse of the QUIC harness panics at the call, and a refused drop

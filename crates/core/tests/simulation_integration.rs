@@ -20520,9 +20520,11 @@ fn test_quic_prefer_is_deterministic() {
 
 /// A node's advertised-version override is what its peers record for it:
 /// the gateway learns the joiner's version from its intro packet, and the
-/// joiner learns the gateway's from the version-carrying ack. Both advertise
-/// this binary's min-compatible version, the oldest a peer accepts. A
-/// control run without overrides records the real version both ways.
+/// joiner learns the gateway's from the version-carrying ack. One side at a
+/// time advertises this binary's min-compatible version (the oldest a peer
+/// accepts) while the other keeps the real one, so a side that recorded its
+/// own advertised version instead of its peer's would fail. A control run
+/// without overrides records the real version both ways.
 /// Skipped (with a log line) when min-compatible equals the real version,
 /// as it does at the first release of a new minor version, since an
 /// override could not then be told apart from the real version.
@@ -20535,7 +20537,9 @@ fn test_advertised_version_override_reaches_peers() {
 
     /// `(what the gateway recorded for the node, what the node recorded
     /// for the gateway)`.
-    fn run(name: &str, advertised: Option<(u8, u8, u16)>) -> (Version, Version) {
+    /// `node_version` / `gateway_version`: what each side advertises, when
+    /// overridden.
+    fn run(name: &str, node_version: Version, gateway_version: Version) -> (Version, Version) {
         setup_deterministic_state(SEED);
         let rt = create_runtime();
         let gateway = NodeLabel::gateway(name, 0);
@@ -20545,8 +20549,10 @@ fn test_advertised_version_override_reaches_peers() {
         // version-carrying ack, which simulations leave off by default.
         sim.enable_gateway_ack_version();
         sim.with_transport_quic("prefer");
-        if let Some(version) = advertised {
+        if let Some(version) = node_version {
             sim.with_node_advertised_version(&node, version);
+        }
+        if let Some(version) = gateway_version {
             sim.with_node_advertised_version(&gateway, version);
         }
         let addresses = sim.all_node_addresses();
@@ -20580,13 +20586,18 @@ fn test_advertised_version_override_reaches_peers() {
         return;
     }
     assert_eq!(
-        run("advertised-version-control", None),
+        run("advertised-version-control", None, None),
         (Some(real), Some(real)),
         "without overrides both sides record the real version"
     );
     assert_eq!(
-        run("advertised-version-override", Some(min)),
-        (Some(min), Some(min)),
-        "each side records the version the other advertises"
+        run("advertised-version-node", Some(min), None),
+        (Some(min), Some(real)),
+        "the gateway records the node's advertised version (intro packet)"
+    );
+    assert_eq!(
+        run("advertised-version-gateway", None, Some(min)),
+        (Some(real), Some(min)),
+        "the node records the gateway's advertised version (ack)"
     );
 }
