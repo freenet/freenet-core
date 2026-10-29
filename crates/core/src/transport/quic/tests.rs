@@ -2035,9 +2035,6 @@ fn a_sent_datagram_is_charged_once() {
     );
 }
 
-/// With the cap short of the datagram the send is `WouldBlock`, nothing is
-/// sent and nothing is charged; quinn then waits in `poll_writable`, which is
-/// `Pending` until the cap has a full datagram and `Ready` once it does.
 /// #5940 step M6: a connection that ends while the egress cap holds its
 /// transmit leaves its poller held, because quinn keeps the poller until
 /// the connection's last handle goes and never polls it again. Such a hold
@@ -2095,6 +2092,50 @@ fn a_hold_left_by_an_ended_connection_stops_pausing_the_ack_watch() {
     );
 }
 
+/// #5940 step M6: `socket::cap_hold_validity`, without its margin, bounds
+/// the longest wait the real cap gives a QUIC transmit before its poller is
+/// polled again: with the cap at its deepest debt (`DEBT_LIMIT`) and the
+/// most waiters it queues (`MAX_ADMISSION_WAKERS`), the last waiter's timer
+/// is no later than that.
+#[test]
+fn cap_hold_validity_bounds_the_longest_admission_wait() {
+    use super::socket::{CAP_HOLD_VALIDITY_MARGIN, cap_hold_validity};
+    use crate::transport::egress_cap::{AdmissionWaiter, DEBT_LIMIT, MAX_ADMISSION_WAKERS};
+    use std::task::Context;
+    let waker = futures::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    for rate in [10_000u64, 1_000_000, 100_000_000] {
+        let time = VirtualTime::new();
+        let cap = EgressCap::new(rate, time.clone());
+        // Past the debt limit: the rest is forgiven.
+        let deepest = cap.burst_bytes() + 2 * rate * DEBT_LIMIT.as_secs();
+        cap.charge_unpaced(deepest as usize);
+        let mut waiters: Vec<AdmissionWaiter> = (0..MAX_ADMISSION_WAKERS)
+            .map(|_| AdmissionWaiter::default())
+            .collect();
+        for waiter in &mut waiters {
+            assert!(
+                cap.poll_admit(usize::from(MAX_UDP_PAYLOAD), waiter, &mut cx)
+                    .is_pending()
+            );
+        }
+        let last = waiters
+            .last()
+            .and_then(AdmissionWaiter::wake_at_ns)
+            .expect("the last waiter has a timer");
+        let wait = Duration::from_nanos(last - time.now_nanos());
+        let bound = cap_hold_validity(rate) / CAP_HOLD_VALIDITY_MARGIN;
+        assert!(wait > DEBT_LIMIT, "premise: the cap is in debt ({wait:?})");
+        assert!(
+            wait <= bound,
+            "rate {rate}: waited {wait:?}, bound {bound:?}"
+        );
+    }
+}
+
+/// With the cap short of the datagram the send is `WouldBlock`, nothing is
+/// sent and nothing is charged; quinn then waits in `poll_writable`, which is
+/// `Pending` until the cap has a full datagram and `Ready` once it does.
 #[test]
 fn a_cap_short_of_the_datagram_is_would_block() {
     use quinn::AsyncUdpSocket;

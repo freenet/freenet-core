@@ -71,6 +71,13 @@ pub(crate) const CAP_HOLD_VALIDITY_MARGIN: u32 = 2;
 /// ahead of it (`MAX_ADMISSION_WAKERS`) and for its own. A held poller of a
 /// live connection is polled again within that, at its timer; one that is
 /// not was left behind by a connection that ended.
+///
+/// The tail is long at low rates: about 4 min at 10 KB/s, 27 s at
+/// 100 KB/s, under 5 s at 1 MB/s. For that long a left-behind hold still
+/// pauses guard 2. The bound is in the cap's time, and the watch measures
+/// the hold's age on the path's clock, so the two must be one clock;
+/// `connection_handler` already requires a QUIC endpoint to share the cap's
+/// clock before it uses the cap.
 pub(crate) fn cap_hold_validity(rate_bytes_per_sec: u64) -> Duration {
     use crate::transport::egress_cap::{DEBT_LIMIT, MAX_ADMISSION_WAKERS, WAKE_DATAGRAM_BYTES};
     let queued = (MAX_ADMISSION_WAKERS as u64 + 1) * WAKE_DATAGRAM_BYTES as u64;
@@ -94,7 +101,8 @@ impl CapHolds {
         if !already_held {
             self.held_now.fetch_add(1, Ordering::AcqRel);
         }
-        self.holds.fetch_add(1, Ordering::AcqRel);
+        // A count read only for change: no ordering needed.
+        self.holds.fetch_add(1, Ordering::Relaxed);
     }
 
     fn release(&self) {
@@ -104,7 +112,7 @@ impl CapHolds {
     /// The hold events so far, whether a poller is held now, and how long a
     /// hold stays valid with no new event.
     pub(crate) fn read(&self) -> CapHoldReading {
-        let holds = self.holds.load(Ordering::Acquire);
+        let holds = self.holds.load(Ordering::Relaxed);
         CapHoldReading {
             holds,
             held_now: self.held_now.load(Ordering::Acquire) > 0,
