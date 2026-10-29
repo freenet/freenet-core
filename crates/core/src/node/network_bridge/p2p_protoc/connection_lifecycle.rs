@@ -37,6 +37,41 @@ fn identity_kind(
     }
 }
 
+/// When the event loop runs [`P2pConnManager::retry_pending_claims`]: every
+/// `interval`, and only while a claim may be pending. The loop passes
+/// [`Self::deadline`] to its timer wake-up and calls [`Self::take_due`] on
+/// every pass.
+#[derive(Debug)]
+pub(super) struct PendingClaimRetry {
+    last: Instant,
+    interval: Duration,
+}
+
+impl PendingClaimRetry {
+    pub(super) fn new(now: Instant, interval: Duration) -> Self {
+        Self {
+            last: now,
+            interval,
+        }
+    }
+
+    /// The timer deadline for the next retry: `None` while no claim may be
+    /// pending, so an idle loop arms no timer for it.
+    pub(super) fn deadline(&self, may_have_pending_claims: bool) -> Option<Instant> {
+        may_have_pending_claims.then(|| self.last + self.interval)
+    }
+
+    /// Whether a retry is due at `now`. When it is, the interval restarts
+    /// from `now`, so the next one is a full interval later.
+    pub(super) fn take_due(&mut self, now: Instant) -> bool {
+        if now.saturating_duration_since(self.last) < self.interval {
+            return false;
+        }
+        self.last = now;
+        true
+    }
+}
+
 /// Whether [`P2pConnManager::promote_existing_connection`] put the
 /// connection into the ring.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -184,6 +219,11 @@ impl P2pConnManager {
     /// from within `identity::HOLD_WINDOW`, so that a claim of `key` can be
     /// bound: its release binds the newest pending claim (see
     /// [`Self::release_identity`]).
+    ///
+    /// When this node sits exactly at its readiness threshold, the close can
+    /// broadcast "not ready" before the claim's promotion broadcasts "ready"
+    /// again: a short flap, the same as for any connection closed and
+    /// replaced at that threshold.
     async fn replace_quiet_dial(
         &mut self,
         quiet: SocketAddr,
@@ -206,10 +246,11 @@ impl P2pConnManager {
 
     /// For each key with a pending claim: when the dial holding it has gone
     /// quiet, replace that dial, whose release binds the newest claim of the
-    /// key; when no connection is bound to the key, bind the newest claim.
-    /// So at most one claim per key is bound per pass. Claims held by a live
-    /// dial, or by a bound claim, keep waiting. Run from the event
-    /// loop's timer (see [`Self::pending_claim_retry_deadline`]), so a peer
+    /// key; when no dial holds the key, bind the newest claim, promoting it
+    /// only if no other connection keeps the key in the ring. At most one
+    /// claim per key is bound per pass; claims held by a live dial keep
+    /// waiting. Run from the event
+    /// loop's timer (see [`PendingClaimRetry`]), so a peer
     /// that reconnected from another address is linked within about
     /// `identity::HOLD_WINDOW` of its old session going quiet.
     pub(super) async fn retry_pending_claims(
@@ -223,9 +264,6 @@ impl P2pConnManager {
                     self.replace_quiet_dial(quiet, &key, handshake_commands)
                         .await
                 }
-                // Bound to a claim already: the remaining claims wait for it
-                // to close (its release binds the newest of them).
-                None if self.addr_by_pub_key.get(&key).is_some() => {}
                 None => {
                     if let Some((claimant, promote)) =
                         identity::pending_claimant(&self.connections, None, &key)
@@ -237,18 +275,6 @@ impl P2pConnManager {
             }
         }
         identity::clear_pending_hint(&self.connections, &mut self.addr_by_pub_key);
-    }
-
-    /// When the event loop should next run [`Self::retry_pending_claims`]:
-    /// `interval` after `last`, while a claim may be pending, else never.
-    pub(super) fn pending_claim_retry_deadline(
-        &self,
-        last: Instant,
-        interval: Duration,
-    ) -> Option<Instant> {
-        self.addr_by_pub_key
-            .may_have_pending_claims()
-            .then(|| last + interval)
     }
 
     /// Count disconnect cleanup of the connection `entry` at `addr`, when the
@@ -1670,8 +1696,15 @@ impl P2pConnManager {
         // Only promote to ring if we know the peer's identity.
         // For transient connections without known identity, we keep them as transport-only
         // until the peer identifies itself (e.g., via ConnectRequest).
-        let promote_to_ring =
-            peer_id.is_some() && (!is_transient || connection_manager.is_gateway());
+        // A claim is not promoted while another connection keeps its key in
+        // the ring: the key would be in the ring at two addresses.
+        let claim_of_key_in_ring = source == IdentitySource::Claimed
+            && peer_id
+                .as_ref()
+                .is_some_and(|peer| self.key_in_ring(peer.pub_key(), Some(peer_addr)));
+        let promote_to_ring = peer_id.is_some()
+            && (!is_transient || connection_manager.is_gateway())
+            && !claim_of_key_in_ring;
 
         if newly_inserted {
             tracing::info!(peer_id = ?peer_id, %peer_addr, is_transient, "handle_successful_connection: inserted new connection entry");

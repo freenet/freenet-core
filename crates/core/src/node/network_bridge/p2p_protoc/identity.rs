@@ -14,7 +14,10 @@
 //!   a dial. The claim can be kept on its connection as pending. A dial that
 //!   has not been heard from within [`HOLD_WINDOW`] is closed by the caller
 //!   ([`BindOutcome::HeldByQuietDial`]); when a dial holding the key closes,
-//!   the newest pending claim of the key is bound.
+//!   the newest pending claim of the key is bound. A claim is not held back
+//!   by another claim: several connections can be bound to one key by
+//!   claims (a peer reconnecting while its old connection is still open), and
+//!   the bridge promotes at most one connection per key into the ring.
 //! - A binding does not take the index from a connection in the ring; a
 //!   connection promoted into the ring takes it ([`promoted`]).
 //! - The index maps a key to an open connection bound to it whenever one
@@ -161,7 +164,9 @@ pub(super) enum BindOutcome {
 /// The transport itself keeps a silent connection for much longer before
 /// closing it, since small packets are lost on some NAT paths; replacing a
 /// dial here costs that connection, so the window must not be shorter than a
-/// single lost keepalive round trip.
+/// single lost keepalive round trip. The receipt stamp records when the
+/// connection's task processed a packet, not when it arrived, so a backlog
+/// on that task also counts toward the window.
 pub(super) const HOLD_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The dialled connection, other than `exclude`, bound to `key`, and whether
@@ -838,5 +843,33 @@ mod tests {
     #[test]
     fn the_hold_window_spans_two_keepalive_intervals() {
         assert!(HOLD_WINDOW >= 2 * crate::transport::peer_connection::MAX_KEEPALIVE_INTERVAL);
+    }
+
+    /// The window is exactly 30 s: long enough for a lost keepalive round
+    /// trip (pinned above), and well inside the transport's 120 s idle
+    /// timeout, so a dial whose remote has gone is replaced long before the
+    /// transport would close it.
+    #[test]
+    fn the_hold_window_is_thirty_seconds() {
+        assert_eq!(HOLD_WINDOW, std::time::Duration::from_secs(30));
+    }
+
+    /// A dial whose transport does not report receipt counts as heard from,
+    /// so it holds its key however long ago it was opened.
+    #[test]
+    fn a_dial_without_a_receipt_stamp_counts_as_heard_from() {
+        let mut t = Table::new();
+        let k = key();
+        t.open(addr(70), None);
+        t.bind(addr(70), &k, IdentitySource::Dialled, None);
+        t.open(addr(71), None);
+        assert_eq!(
+            dial_holder(&t.connections, None, &k),
+            Some((addr(70), true))
+        );
+        assert_eq!(
+            t.bind(addr(71), &k, IdentitySource::Claimed, Some(true)),
+            BindOutcome::HeldByDial(addr(70))
+        );
     }
 }

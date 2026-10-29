@@ -8844,16 +8844,16 @@ async fn test_connection_growth_stall_regression() {
 
     // Connection identity tripwire: through formation and 20% message loss,
     // no connection is closed or refused for naming a key other than the one
-    // it is bound to, and none is bound to a node's own key. Keepalive is off
-    // under virtual time, so an idle dial here would always look quiet to the
-    // hold window; that it is never tested is what `claim_held_by_dial` and
-    // `quiet_dial_replaced` staying at zero shows. A delta over
-    // this test's run: the totals are process-wide and never reset, so under
-    // plain `cargo test` other simulations in the binary add to them too
-    // (none of them is expected to produce these kinds either). This guards
-    // against a regression in ordinary formation; it is not evidence that
-    // the refusals work, which the lifecycle unit tests cover. The kinds are
-    // also zero on releases before connection identity was fixed.
+    // it is bound to, and none is bound to a node's own key. A delta over
+    // this test's run of process-wide totals: under plain `cargo test` the
+    // other simulations in this binary run in the same process and add to
+    // them. So only kinds that no simulation produces are held at zero; kinds
+    // that crash, restart and churn simulations can produce
+    // (`duplicate_key`, `claim_held_by_dial`, `quiet_dial_replaced`; keepalive
+    // is off under virtual time, so idle dials there look quiet) are not
+    // asserted here. This guards against a regression in ordinary formation;
+    // it is not evidence that the refusals work, which the lifecycle unit
+    // tests cover.
     let after: std::collections::BTreeMap<_, _> = freenet::dev_tool::conn_identity_totals()
         .into_iter()
         .collect();
@@ -8863,16 +8863,7 @@ async fn test_connection_growth_stall_regression() {
         delta("set_dialed") > 0,
         "premise: identity decisions were counted ({after:?})"
     );
-    // No two connections claim one key in this network either, so nothing
-    // is held back, replaced or bound twice.
-    for kind in [
-        "changed_connect_request",
-        "changed_connect_peer",
-        "own_key",
-        "duplicate_key",
-        "claim_held_by_dial",
-        "quiet_dial_replaced",
-    ] {
+    for kind in ["changed_connect_request", "changed_connect_peer", "own_key"] {
         assert_eq!(
             delta(kind),
             0,

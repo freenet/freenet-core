@@ -2336,6 +2336,7 @@ async fn restart_at_a_new_port_replaces_the_old_dial_once_it_goes_quiet() {
     assert_eq!(h.pending_on(new), Some(true), "still within the window");
     assert!(h.mgr.connections.contains_key(&old));
 
+    let old_connection_id = h.mgr.connections[&old].connection_id;
     clock.go_quiet(Duration::from_secs(1));
     h.mgr.retry_pending_claims(&handshake).await;
     assert!(
@@ -2365,6 +2366,25 @@ async fn restart_at_a_new_port_replaces_the_old_dial_once_it_goes_quiet() {
         "the peer's state is kept"
     );
     assert!(!h.mgr.addr_by_pub_key.may_have_pending_claims());
+
+    // The old session's own close arrives later; it changes nothing.
+    let handshake = h.handshake.clone();
+    h.mgr
+        .handle_transport_event(
+            Some(ConnEvent::TransportClosed {
+                remote_addr: old,
+                error: TransportError::ConnectionClosed(old),
+                connection_id: old_connection_id,
+                reason: crate::tracing::DisconnectReason::Timeout,
+            }),
+            &mut h.state,
+            &handshake,
+        )
+        .await
+        .expect("handle_transport_event");
+    assert_eq!(h.mgr.addr_by_pub_key.get(&peer), Some(&new));
+    assert_eq!(h.ring_addr_of(&peer), Some(new));
+    assert!(neighbour_hosts(&h, &peer, &hosted));
 }
 
 /// A dial that keeps receiving keeps holding its key, however long it has
@@ -2639,32 +2659,47 @@ async fn connect_peer_refused_at_the_cap_leaves_the_connection_unbound() {
     assert!(!h.mgr.addr_by_pub_key.contains_key(&peer));
 }
 
-/// The event loop arms its retry timer only while a claim may be pending:
-/// `pending_claim_retry_deadline` is `None` with no claim kept, the retry
-/// interval after the last retry once one is, and `None` again after a retry
-/// finds none left. The loop passes it to `next_wake` with the zombie sweep
-/// deadline (pinned below), so the retry runs on a node with no events.
+/// The retry deadline is armed only while a claim may be pending: `None`
+/// with no claim kept, set once one is, and `None` again after a retry finds
+/// none left.
 #[tokio::test]
 async fn the_retry_deadline_is_set_only_while_a_claim_may_be_pending() {
     let mut h = Harness::new("conn-identity-retry-deadline").await;
     let holder: SocketAddr = "198.51.100.20:6001".parse().unwrap();
     let claimant: SocketAddr = "198.51.100.20:6002".parse().unwrap();
     let peer = key();
-    let last = Instant::now();
-    let interval = Duration::from_secs(5);
+    let retry = PendingClaimRetry::new(Instant::now(), Duration::from_secs(5));
+    let deadline = |h: &Harness| retry.deadline(h.mgr.addr_by_pub_key.may_have_pending_claims());
 
-    assert_eq!(h.mgr.pending_claim_retry_deadline(last, interval), None);
+    assert_eq!(deadline(&h), None);
     let clock = h.dial_with_receipt(holder, &peer).await;
     h.accept_expected(claimant, &peer).await;
-    assert_eq!(
-        h.mgr.pending_claim_retry_deadline(last, interval),
-        Some(last + interval)
-    );
+    assert!(deadline(&h).is_some());
     clock.go_quiet(identity::HOLD_WINDOW + Duration::from_secs(1));
     let handshake = h.handshake.clone();
     h.mgr.retry_pending_claims(&handshake).await;
     assert_eq!(h.mgr.connections[&claimant].pub_key(), Some(&peer));
-    assert_eq!(h.mgr.pending_claim_retry_deadline(last, interval), None);
+    assert_eq!(deadline(&h), None);
+}
+
+/// The retry is due once per interval: not before it, at it, and then not
+/// again until a full interval later, so a loop that checks on every pass
+/// does not retry on every pass.
+#[test]
+fn the_retry_is_due_once_per_interval() {
+    let start = Instant::now();
+    let interval = Duration::from_secs(5);
+    let mut retry = PendingClaimRetry::new(start, interval);
+    assert_eq!(retry.deadline(true), Some(start + interval));
+    assert_eq!(retry.deadline(false), None);
+    assert!(!retry.take_due(start + Duration::from_secs(4)));
+    assert!(retry.take_due(start + interval));
+    assert!(
+        !retry.take_due(start + interval + Duration::from_millis(1)),
+        "due again right after a retry"
+    );
+    assert_eq!(retry.deadline(true), Some(start + interval * 2));
+    assert!(retry.take_due(start + interval * 2));
 }
 
 /// `next_wake` returns at the earlier deadline when no event arrives, which
@@ -2698,8 +2733,12 @@ fn the_event_loop_wakes_for_the_pending_claim_retry() {
         .expect("the event loop's next_wake call");
     let call = &source[at..at + source[at..].find("=> {").expect("end of the call")];
     assert!(
-        call.contains("ctx.pending_claim_retry_deadline("),
+        call.contains(".deadline(ctx.addr_by_pub_key.may_have_pending_claims())"),
         "the loop's timer must include the pending-claim retry deadline: {call}"
+    );
+    assert!(
+        source.contains("pending_claim_retry.take_due(Instant::now())"),
+        "the loop must check the retry on every pass"
     );
     assert!(
         source.contains("ctx.retry_pending_claims(&handshake_cmd_sender).await;"),
@@ -2708,11 +2747,11 @@ fn the_event_loop_wakes_for_the_pending_claim_retry() {
 }
 
 /// Several claims of one key wait on a dial that goes quiet: the retry
-/// replaces the dial and binds only the newest claim; the older ones keep
-/// waiting on later retries while that claim holds the key, and the next
-/// newest is bound when it closes.
+/// replaces the dial and binds and promotes only the newest claim. Later
+/// passes bind one more claim each, outside the ring, since the newest keeps
+/// the key in the ring.
 #[tokio::test]
-async fn the_retry_binds_one_claim_per_key() {
+async fn the_retry_binds_one_claim_per_key_per_pass() {
     let mut h = Harness::new("conn-identity-retry-one-per-key").await;
     let holder: SocketAddr = "198.51.100.21:6001".parse().unwrap();
     let oldest: SocketAddr = "198.51.100.21:6004".parse().unwrap();
@@ -2727,16 +2766,98 @@ async fn the_retry_binds_one_claim_per_key() {
     clock.go_quiet(identity::HOLD_WINDOW + Duration::from_secs(1));
     let handshake = h.handshake.clone();
     h.mgr.retry_pending_claims(&handshake).await;
-    h.mgr.retry_pending_claims(&handshake).await;
-
     assert_eq!(h.mgr.connections[&newest].pub_key(), Some(&peer));
     assert_eq!(h.pending_on(middle), Some(true));
     assert_eq!(h.pending_on(oldest), Some(true));
     assert_eq!(h.ring_addr_of(&peer), Some(newest));
 
-    h.transport_closed(newest).await;
+    h.mgr.retry_pending_claims(&handshake).await;
     assert_eq!(h.mgr.connections[&middle].pub_key(), Some(&peer));
+    assert_eq!(
+        h.ring_key_at(middle),
+        None,
+        "not promoted beside the newest"
+    );
     assert_eq!(h.pending_on(oldest), Some(true));
+    assert_eq!(h.ring_addr_of(&peer), Some(newest));
+}
+
+/// A peer's own ConnectRequest on a new connection binds beside a connection
+/// already bound to its key by a claim (a peer reconnecting while its old
+/// connection is still open): claims are not held back by claims, and a
+/// request never promotes, so the key stays in the ring at one address.
+#[tokio::test]
+async fn a_connect_request_binds_beside_a_claimed_holder() {
+    let mut h = Harness::new("conn-identity-request-beside-claim").await;
+    let old: SocketAddr = "198.51.100.24:6001".parse().unwrap();
+    let new: SocketAddr = "198.51.100.24:6002".parse().unwrap();
+    h.watch(&[new]);
+    let peer = key();
+
+    h.accept(old).await;
+    h.connect_request(old, PeerKeyLocation::with_unknown_addr(peer.clone()))
+        .await;
+    h.connect_peer(PeerKeyLocation::new(peer.clone(), old))
+        .await;
+    h.accept(new).await;
+    h.connect_request(new, PeerKeyLocation::with_unknown_addr(peer.clone()))
+        .await;
+    assert_eq!(
+        seen(new),
+        vec![ConnIdentity::DuplicateKey, ConnIdentity::SetConnectRequest]
+    );
+    assert_eq!(h.mgr.connections[&new].pub_key(), Some(&peer));
+    assert_eq!(h.ring_key_at(new), None);
+    assert_eq!(h.ring_addr_of(&peer), Some(old));
+    assert_eq!(h.mgr.addr_by_pub_key.get(&peer), Some(&old));
+}
+
+/// A dial holding a key closes while a claimed connection keeps the key in
+/// the ring and another claim is pending: the pending claim is bound, but not
+/// promoted, and the peer's state is kept.
+#[tokio::test]
+async fn a_pending_claim_bound_beside_an_in_ring_claim_is_not_promoted() {
+    let mut h = Harness::new("conn-identity-release-beside-claim").await;
+    let claimed: SocketAddr = "198.51.100.25:6001".parse().unwrap();
+    let dialled: SocketAddr = "198.51.100.25:6002".parse().unwrap();
+    let pending: SocketAddr = "198.51.100.25:6003".parse().unwrap();
+    let peer = key();
+
+    h.accept(claimed).await;
+    h.connect_request(claimed, PeerKeyLocation::with_unknown_addr(peer.clone()))
+        .await;
+    h.connect_peer(PeerKeyLocation::new(peer.clone(), claimed))
+        .await;
+    h.dial(dialled, &peer).await;
+    h.accept_expected(pending, &peer).await;
+    assert_eq!(h.pending_on(pending), Some(true));
+    let hosted = seed_neighbour_hosting(&h, &peer);
+
+    h.transport_closed(dialled).await;
+    assert_eq!(h.mgr.connections[&pending].pub_key(), Some(&peer));
+    assert_eq!(h.ring_key_at(pending), None);
+    assert_eq!(h.ring_addr_of(&peer), Some(claimed));
+    assert!(neighbour_hosts(&h, &peer, &hosted));
+}
+
+/// An expected-inbound claim bound while another connection keeps its key
+/// in the ring is not promoted on establishment.
+#[tokio::test]
+async fn an_expected_inbound_claim_is_not_promoted_beside_the_key_in_the_ring() {
+    let mut h = Harness::new("conn-identity-matched-beside-ring").await;
+    let in_ring: SocketAddr = "198.51.100.26:6001".parse().unwrap();
+    let matched: SocketAddr = "198.51.100.26:6002".parse().unwrap();
+    let peer = key();
+
+    h.accept(in_ring).await;
+    h.connect_request(in_ring, PeerKeyLocation::with_unknown_addr(peer.clone()))
+        .await;
+    h.connect_peer(PeerKeyLocation::new(peer.clone(), in_ring))
+        .await;
+    h.accept_expected(matched, &peer).await;
+    assert_eq!(h.mgr.connections[&matched].pub_key(), Some(&peer));
+    assert_eq!(h.ring_key_at(matched), None);
+    assert_eq!(h.ring_addr_of(&peer), Some(in_ring));
 }
 
 /// Two connections claim one key, and the one in the ring closes while the

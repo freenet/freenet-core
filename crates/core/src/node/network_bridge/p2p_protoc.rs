@@ -1558,7 +1558,10 @@ impl P2pConnManager {
         // (`P2pConnManager::retry_pending_claims`). The retry deadline is part
         // of the loop's timer wake-up, so it runs on a node with no events.
         const PENDING_CLAIM_RETRY_INTERVAL: Duration = Duration::from_secs(5);
-        let mut last_pending_claim_retry = Instant::now();
+        let mut pending_claim_retry = connection_lifecycle::PendingClaimRetry::new(
+            Instant::now(),
+            PENDING_CLAIM_RETRY_INTERVAL,
+        );
         const STATS_LOG_INTERVAL: Duration = Duration::from_secs(30);
         let mut zombie_sweep_state = ZombieSweepState::new(Instant::now());
         const SLOW_EVENT_THRESHOLD: Duration = Duration::from_millis(100);
@@ -1584,10 +1587,8 @@ impl P2pConnManager {
                     &mut select_stream,
                     zombie_sweep::earliest(
                         zombie_sweep_state.backlog_deadline(),
-                        ctx.pending_claim_retry_deadline(
-                            last_pending_claim_retry,
-                            PENDING_CLAIM_RETRY_INTERVAL,
-                        ),
+                        pending_claim_retry
+                            .deadline(ctx.addr_by_pub_key.may_have_pending_claims()),
                     ),
                 ) => {
                     match wake {
@@ -1635,11 +1636,10 @@ impl P2pConnManager {
                 EventResult::Continue
             };
 
-            if last_pending_claim_retry.elapsed() >= PENDING_CLAIM_RETRY_INTERVAL {
-                if ctx.addr_by_pub_key.may_have_pending_claims() {
-                    ctx.retry_pending_claims(&handshake_cmd_sender).await;
-                }
-                last_pending_claim_retry = Instant::now();
+            if pending_claim_retry.take_due(Instant::now())
+                && ctx.addr_by_pub_key.may_have_pending_claims()
+            {
+                ctx.retry_pending_claims(&handshake_cmd_sender).await;
             }
 
             // Periodic stats logging

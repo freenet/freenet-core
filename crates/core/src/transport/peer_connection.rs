@@ -5698,7 +5698,7 @@ mod tests {
         let mut other_key = [0u8; 16];
         crate::config::GlobalRng::fill_bytes(&mut other_key);
         let other_cipher = Aes128Gcm::new(&other_key.into());
-        let forged = SymmetricMessage::serialize_msg_to_packet_data(
+        let undecryptable = SymmetricMessage::serialize_msg_to_packet_data(
             1,
             SymmetricMessagePayload::ShortMessage {
                 payload: Bytes::from_static(b"not under the session key"),
@@ -5711,13 +5711,22 @@ mod tests {
             .send(InboundPacket::unstamped(PacketData::<
                 crate::transport::packet_data::UnknownEncryption,
             >::from_buf(
-                forged.data()
+                undecryptable.data()
             )))
             .await
             .expect("send");
         let receiver = tokio::spawn(async move { conn.recv().await.map(|_| ()) });
-        // `recv` drops the packet and waits for the next one.
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // The channel is back to full capacity once `recv` has taken the
+        // packet off it; it then fails to decrypt it, drops it and waits for
+        // the next one, so it has not returned.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while inbound_tx.capacity() < inbound_tx.max_capacity() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("recv takes the packet off the channel");
+        tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(
             !receiver.is_finished(),
             "premise: the packet was not accepted"
