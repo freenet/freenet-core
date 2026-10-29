@@ -3757,6 +3757,12 @@ pub mod mock_transport {
         /// `PacketDelayPolicy::Uniform` (the link model is FIFO per path
         /// already).
         pending_inbound: std::sync::Mutex<PendingInbound>,
+        /// The sender this socket registered in `channels` under `this`.
+        /// Weak, so the socket does not keep its own inbound channel open.
+        /// On drop the socket removes `this` only while it still maps to
+        /// this sender, so a socket started at the same address before this
+        /// one is dropped (a node restarted at its address) keeps its entry.
+        registered: mpsc::WeakUnboundedSender<MockDatagram>,
     }
 
     /// A VirtualTime sleep kept across `recv_from` calls.
@@ -3789,6 +3795,7 @@ pub mod mock_transport {
             channels: Channels,
         ) -> Self {
             let (outbound, inbound) = mpsc::unbounded_channel();
+            let registered = outbound.downgrade();
             channels.insert(addr, outbound);
             static SEED: AtomicU64 = AtomicU64::new(0xfeedbeef);
             MockSocket {
@@ -3804,6 +3811,7 @@ pub mod mock_transport {
                 virtual_time: None,
                 link: None,
                 pending_inbound: std::sync::Mutex::new(PendingInbound::default()),
+                registered,
             }
         }
 
@@ -3819,6 +3827,7 @@ pub mod mock_transport {
             time_source: Option<crate::simulation::VirtualTime>,
         ) -> Self {
             let (outbound, inbound) = mpsc::unbounded_channel();
+            let registered = outbound.downgrade();
             channels.insert(addr, outbound);
             static SEED: AtomicU64 = AtomicU64::new(0xfeedbeef);
             MockSocket {
@@ -3834,6 +3843,7 @@ pub mod mock_transport {
                 virtual_time: time_source,
                 link: None,
                 pending_inbound: std::sync::Mutex::new(PendingInbound::default()),
+                registered,
             }
         }
     }
@@ -4068,7 +4078,12 @@ pub mod mock_transport {
 
     impl Drop for MockSocket {
         fn drop(&mut self) {
-            self.channels.remove(&self.this);
+            // Only this socket's own registration: a newer socket at the same
+            // address may already have replaced it.
+            if let Some(ours) = self.registered.upgrade() {
+                self.channels
+                    .remove_if(&self.this, |_, sender| sender.same_channel(&ours));
+            }
         }
     }
 

@@ -1341,6 +1341,65 @@ async fn expected_inbound_after_the_window_is_not_bound_to_the_key() {
     assert!(!h.mgr.addr_by_pub_key.contains_key(&rig.peer_key));
     assert_eq!(h.ring_key_at(peer_addr), None, "not promoted");
     h.assert_own_key_absent();
+
+    // The unmatched connection is then named by the remote with a key other
+    // than the one the connect op dialled: the remote's key is bound, and
+    // the connect op's ConnectPeer for the dialled key is refused.
+    let named = key();
+    h.connect_request(peer_addr, PeerKeyLocation::with_unknown_addr(named.clone()))
+        .await;
+    assert!(
+        !h.try_connect_peer(PeerKeyLocation::new(rig.peer_key.clone(), peer_addr))
+            .await,
+        "the ConnectPeer for the dialled key is refused"
+    );
+    assert_eq!(
+        seen(peer_addr),
+        vec![
+            ConnIdentity::ExpectedInboundUnbound,
+            ConnIdentity::SetConnectRequest,
+            ConnIdentity::ChangedConnectPeer,
+        ]
+    );
+    assert_eq!(h.mgr.connections[&peer_addr].pub_key(), Some(&named));
+    assert!(!h.mgr.addr_by_pub_key.contains_key(&rig.peer_key));
+    assert_eq!(h.ring_key_at(peer_addr), None, "not promoted");
+}
+
+/// End to end through the real driver: the driver matches an inbound
+/// connection to an expectation for a key that a dialled connection at
+/// another address still holds. The claim is held back, and bound and
+/// promoted when the dialled connection closes.
+#[tokio::test]
+async fn driver_matched_claim_held_by_a_dial_is_bound_when_the_dial_closes() {
+    let mut h = Harness::new("conn-identity-driver-held").await;
+    let mut rig = DriverRig::new(&h).await;
+    let dialled_at: SocketAddr = "203.0.113.192:5813".parse().unwrap();
+    let peer_addr = rig.peer_addr;
+    watch(&[peer_addr]);
+
+    h.dial(dialled_at, &rig.peer_key).await;
+    rig.expect_peer(&h).await;
+    let dial = rig.peer_dials();
+    assert_eq!(rig.handle_next_event(&mut h).await, "inbound");
+    assert!(dial.await.expect("dial task"), "the peer's dial completes");
+
+    assert_eq!(seen(peer_addr), vec![ConnIdentity::ClaimHeldByDial]);
+    assert_eq!(h.mgr.connections[&peer_addr].pub_key(), None);
+    assert_eq!(h.ring_key_at(peer_addr), None);
+    assert_eq!(h.mgr.addr_by_pub_key.get(&rig.peer_key), Some(&dialled_at));
+
+    h.transport_closed(dialled_at).await;
+    assert_eq!(
+        seen(peer_addr),
+        vec![
+            ConnIdentity::ClaimHeldByDial,
+            ConnIdentity::PendingClaimBound
+        ]
+    );
+    assert_eq!(h.mgr.addr_by_pub_key.get(&rig.peer_key), Some(&peer_addr));
+    assert_eq!(h.ring_key_at(peer_addr).as_ref(), Some(&rig.peer_key));
+    h.assert_own_key_absent();
 }
 
 /// End to end: once our dial to the expected peer succeeds, its expectation
@@ -1559,7 +1618,7 @@ async fn dialled_connection_is_closed_when_its_peer_names_another_key() {
 #[tokio::test]
 async fn matched_claim_is_closed_when_the_peer_names_another_key() {
     let mut h = Harness::new("conn-identity-matched-renamed").await;
-    let remote: SocketAddr = "203.0.113.160:5601".parse().unwrap();
+    let remote: SocketAddr = "198.51.100.202:7201".parse().unwrap();
     watch(&[remote]);
     let (expected, named) = (key(), key());
 
@@ -1624,7 +1683,7 @@ async fn self_named_connection_refuses_a_connect_peer_for_another_key() {
 #[tokio::test]
 async fn matched_claim_held_by_a_dial_is_bound_when_the_dial_closes() {
     let mut h = Harness::new("conn-identity-matched-held").await;
-    let dialled_at: SocketAddr = "203.0.113.180:5801".parse().unwrap();
+    let dialled_at: SocketAddr = "198.51.100.203:7202".parse().unwrap();
     let claimed_at: SocketAddr = "203.0.113.181:5802".parse().unwrap();
     watch(&[dialled_at, claimed_at]);
     let peer = key();
@@ -1946,18 +2005,23 @@ impl RestartRig {
     }
 
     /// Stops the remote and starts a new node at its address with `keypair`,
-    /// which dials this node. Returns the dial.
-    async fn restart_remote(&mut self, keypair: TransportKeypair) -> tokio::task::JoinHandle<bool> {
+    /// which dials this node. Returns the dial, which yields whether it
+    /// completed and the restarted node, kept so its transport stays up
+    /// while the test inspects. The old remote's socket only removes its own
+    /// registration when it is dropped (see `MockSocket::registered`), so the
+    /// new node can start at the address at once.
+    async fn restart_remote(
+        &mut self,
+        keypair: TransportKeypair,
+    ) -> tokio::task::JoinHandle<RestartedRemote> {
         use crate::transport::mock_transport::create_mock_node_at_addr;
         drop(self.remote.take());
-        tokio::time::sleep(Duration::from_millis(100)).await;
         let (outbound, accepted) =
             create_mock_node_at_addr(false, self.remote_addr, keypair, self.channels.clone())
                 .await
                 .expect("restarted remote");
         let (node_key, node_addr) = (self.node_key.clone(), self.node_addr);
         tokio::spawn(async move {
-            let _accepted = accepted;
             let pending = OutboundConnector::connect(
                 &outbound,
                 node_key,
@@ -1965,16 +2029,31 @@ impl RestartRig {
                 crate::transport::NatAttemptOrigin::ConnectJoiner,
             )
             .await;
-            let ok = matches!(
-                tokio::time::timeout(Duration::from_secs(10), pending).await,
-                Ok(Ok(_))
-            );
-            // Keep the restarted node's transport up while the test inspects.
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            drop(outbound);
-            ok
+            let connection = tokio::time::timeout(Duration::from_secs(10), pending)
+                .await
+                .ok()
+                .and_then(Result::ok);
+            RestartedRemote {
+                connected: connection.is_some(),
+                _connection: connection,
+                _node: (outbound, accepted),
+            }
         })
     }
+}
+
+/// A restarted remote from [`RestartRig::restart_remote`].
+struct RestartedRemote {
+    connected: bool,
+    _connection: Option<Box<dyn PeerConnectionApi>>,
+    _node: (
+        crate::transport::connection_handler::OutboundConnectionHandler<
+            crate::transport::mock_transport::MockSocket,
+        >,
+        mpsc::Receiver<
+            crate::transport::PeerConnection<crate::transport::mock_transport::MockSocket>,
+        >,
+    ),
 }
 
 /// A non-gateway accepts a reconnection from an address it has an
@@ -2012,10 +2091,8 @@ async fn restart_accept_with_a_live_expectation_binds_a_claim() {
     assert_eq!(h.mgr.addr_by_pub_key.get(&remote_key), Some(&remote_addr));
     assert_eq!(h.ring_key_at(remote_addr).as_ref(), Some(&remote_key));
     h.assert_own_key_absent();
-    assert!(
-        dial.await.expect("dial task"),
-        "the restarted node's dial completes"
-    );
+    let restarted = dial.await.expect("dial task");
+    assert!(restarted.connected, "the restarted node's dial completes");
 }
 
 /// As above, but another peer, with another key, reconnects from the address
@@ -2058,8 +2135,32 @@ async fn restart_accept_by_another_peer_is_closed_when_it_names_itself() {
     assert!(!h.mgr.addr_by_pub_key.contains_key(&first_key));
     assert!(!h.mgr.addr_by_pub_key.contains_key(&other_key));
     assert_eq!(h.ring_key_at(remote_addr), None);
+    let restarted = dial.await.expect("dial task");
+    assert!(restarted.connected, "the other peer's dial completed");
+}
+
+/// Identity telemetry is watched per remote address, process-wide, so two
+/// tests in this file using one address see each other's records when they
+/// run in one process (plain `cargo test`). Each address literal here must
+/// be unique.
+#[test]
+fn test_addresses_are_unique() {
+    let source = include_str!("tests.rs");
+    let mut seen = std::collections::BTreeSet::new();
+    let mut duplicates = Vec::new();
+    for prefix in ["\"203.0.113.", "\"198.51.100."] {
+        for (at, _) in source.match_indices(prefix) {
+            let rest = &source[at + 1..];
+            let Some(end) = rest.find('"') else { continue };
+            let literal = &rest[..end];
+            if literal.contains(':') && !seen.insert(literal.to_string()) {
+                duplicates.push(literal.to_string());
+            }
+        }
+    }
+    assert!(seen.len() > 20, "premise: the address literals were found");
     assert!(
-        dial.await.expect("dial task"),
-        "the other peer's dial completed"
+        duplicates.is_empty(),
+        "address literals used twice: {duplicates:?}"
     );
 }
