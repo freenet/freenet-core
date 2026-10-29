@@ -52,7 +52,9 @@
 //! and removes its entry, so answering it with a reset adds none. The path
 //! counts its resets and closes the connection past
 //! [`recycle::SEND_ABORT_LIMIT`] (`close_code::SEND_ABORT_LIMIT`), so the
-//! peer falls back to UDP and a new connection starts with an empty map.
+//! peer falls back to UDP and a new connection starts with an empty map. A
+//! write that fails because the peer stopped the stream is not a reset of
+//! this side's and is not counted.
 //! Worth an upstream quinn issue (not filed).
 //!
 //! The receive task also runs the path's acknowledgement watch
@@ -60,6 +62,11 @@
 //! acknowledges none of our packets is not a conforming QUIC peer (RFC 9000
 //! 13.2.1 requires acknowledging ack-eliciting packets within
 //! max_ack_delay), so the path is closed (`close_code::PEER_NOT_ACKNOWLEDGING`).
+//!
+//! Both recycle codes ask the peer to fall back to UDP for this connection
+//! only, not for good. e5 constraint: after either, the pair may upgrade
+//! again after its normal re-upgrade backoff; neither side may treat the
+//! code as a permanent downgrade of the peer.
 //!
 //! Receiving: one task per connection accepts every uni stream and reads all
 //! of them concurrently (no task per stream), parsing the header and then:
@@ -483,6 +490,10 @@ impl QuicPath {
     ///   connection's next 5 s `timeout_check` sweep (or its own admission
     ///   under pressure), so this path can refuse with `BUDGET_REFUSED` for
     ///   up to about 5 s on room that is free.
+    /// - The path may close itself (`recycle`: `close_code::SEND_ABORT_LIMIT`
+    ///   or `close_code::PEER_NOT_ACKNOWLEDGING`). That is a request to fall
+    ///   back to UDP for this connection, not a permanent downgrade: e5 must
+    ///   allow a new upgrade after its normal backoff.
     /// - The shared `Arc` outlives either owner: this path keeps the UDP
     ///   connection's charges (and their room) after the `PeerConnection`
     ///   drops, and gone UDP charges are then released by nobody, since a
@@ -796,7 +807,7 @@ impl Outgoing {
             written = send.write_all(buf) => written,
             result = stopped => return Err(self.stopped_early(result)),
         };
-        written.map_err(Into::into)
+        self.written(written)
     }
 
     async fn write_chunk(&mut self, chunk: Bytes) -> Result<(), QuicSendError> {
@@ -805,7 +816,25 @@ impl Outgoing {
             written = send.write_chunk(chunk) => written,
             result = stopped => return Err(self.stopped_early(result)),
         };
-        written.map_err(Into::into)
+        self.written(written)
+    }
+
+    /// The outcome of a write. A stop the peer sent is handled as in
+    /// [`Self::stopped_early`]: on STOP_SENDING both the write and the
+    /// `stopped` future become ready, and `select!` may pick the write.
+    /// Returned through `?` instead, the stream would be left open and
+    /// `Drop` would reset it as an abort of this side's own
+    /// ([`SendAborts`]), which it is not.
+    fn written(&mut self, written: Result<(), quinn::WriteError>) -> Result<(), QuicSendError> {
+        match written {
+            Ok(()) => Ok(()),
+            Err(quinn::WriteError::Stopped(code)) => Err(self.stopped_early(Ok(Some(code)))),
+            Err(
+                error @ (quinn::WriteError::ConnectionLost(_)
+                | quinn::WriteError::ClosedStream
+                | quinn::WriteError::ZeroRttRejected),
+            ) => Err(error.into()),
+        }
     }
 
     /// The peer stopped the stream (or the connection ended) mid-write:

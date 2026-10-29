@@ -2,62 +2,80 @@
 //! (#5940, step M6).
 //!
 //! Two conditions close a path, each with its own close code and counted in
-//! `quic_close_sent_<label>` ([`QuicCloseCode`]):
+//! `quic_close_sent_<label>` ([`QuicCloseCode`]). Either code asks the peer
+//! to fall back to UDP for THIS connection only. It is not a permanent
+//! downgrade: e5 must let the pair upgrade again after its normal backoff.
 //!
 //! 1. **Too many locally reset sends** ([`close_code::SEND_ABORT_LIMIT`]).
 //!    Each send this side resets leaves an entry in quinn's `stopped` map
 //!    until the connection closes (see "Known quinn cost" in the `path`
 //!    module doc), so the path counts the resets ([`SendAborts`]) and closes
 //!    the connection once there are more than [`SEND_ABORT_LIMIT`]. A new
-//!    connection starts with an empty map and a zero count.
+//!    connection starts with an empty map and a zero count. A stop the peer
+//!    sent is not a reset of this side's and is not counted, and neither is
+//!    a reset on a connection that is already closed.
 //!
 //! 2. **A peer that acknowledges nothing**
 //!    ([`close_code::PEER_NOT_ACKNOWLEDGING`]). A peer that keeps sending
 //!    but acknowledges none of our packets is not a conforming QUIC peer
 //!    (RFC 9000 section 13.2.1 requires acknowledging ack-eliciting packets
 //!    within `max_ack_delay`), so the path is closed. [`watch_acknowledgements`]
-//!    checks it every [`ACK_WATCH_TICK`] on the receive task the path
-//!    already has, and closes the path once, for at least
-//!    [`ACK_WATCH_WINDOW`], this side has had ack-eliciting packets
-//!    outstanding, none of them was acknowledged, and the peer sent
-//!    datagrams ([`AckWatch`]).
+//!    samples the connection every [`ACK_WATCH_TICK`] on the receive task the
+//!    path already has, and [`AckWatch`] closes the path when, for
+//!    [`ACK_WATCH_WINDOW`]:
+//!    - this side had ack-eliciting packets outstanding that the peer should
+//!      have acknowledged by then (see [`AckWatch`] for when the window
+//!      starts);
+//!    - the peer acknowledged none of them; and
+//!    - the peer sent something in EVERY sample of the window.
+//!
+//!    It is a conformance check, not a liveness check: a peer that
+//!    acknowledges something within each window is never closed by it.
 //!
 //! What "acknowledged" is measured with. quinn's `ConnectionStats` has no
 //! counter of packets the peer newly acknowledged: `frame_rx.acks` counts
-//! ACK frames, including ones that acknowledge nothing new (an ACK frame
-//! repeating an old range), so it cannot tell a peer that acknowledges from
-//! one that only sends ACK frames. quinn does tell the congestion controller
-//! about every ack-eliciting packet the peer newly acknowledges
-//! (`Controller::on_ack`, once per packet, quinn-proto 0.11.19
-//! `on_packet_acked`), so the transport config wraps Cubic in
-//! [`AckCounting`], which counts those calls and otherwise passes
-//! everything through. The other two inputs are from `ConnectionStats`:
+//! ACK frames, including ones that acknowledge nothing new, so it cannot
+//! tell a peer that acknowledges from one that only sends ACK frames. quinn
+//! does tell the congestion controller about every ack-eliciting packet the
+//! peer newly acknowledges (`Controller::on_ack`, once per packet) and, after
+//! each batch of acknowledgements, the bytes still in flight
+//! (`Controller::on_end_acks`); packets later declared lost are reported
+//! through `on_congestion_event`. So the transport config wraps Cubic in
+//! [`AckCounting`], which records those and otherwise passes every call
+//! through. The other two inputs are from `ConnectionStats`:
 //! - sent: the ack-eliciting frames this side sent (`frame_tx`, every frame
-//!   kind except ACK and CONNECTION_CLOSE; a packet is ack-eliciting exactly
-//!   when it carries one of them), [`ack_eliciting_frames`];
-//! - the peer kept sending: `udp_rx.datagrams`.
+//!   kind except ACK and CONNECTION_CLOSE), [`ack_eliciting_frames`];
+//! - the peer sent: every frame received from it (`frame_rx`), which counts
+//!   only packets that were authenticated, [`frames_received`].
 //!
 //! What it does not fire on:
-//! - an idle path: nothing ack-eliciting is outstanding (a keepalive PING
-//!   is acknowledged within one round trip);
+//! - an idle path: nothing ack-eliciting is outstanding (a keepalive PING is
+//!   acknowledged within one round trip);
 //! - a slow but conforming peer: its acknowledgements arrive within a round
 //!   trip plus `max_ack_delay` (25 ms), and the window allows a round trip
 //!   of several seconds;
+//! - recovery from an outage in both directions: a sample with nothing from
+//!   the peer ends the window, and after the outage a window starts only at
+//!   a new send of this side's or an acknowledgement, which a conforming
+//!   peer acknowledges in turn;
 //! - the handshake: a path is built on an established connection, and the
 //!   window starts no earlier than the path;
-//! - a peer that went silent: without datagrams from the peer, quinn's idle
-//!   timeout ends the connection instead.
+//! - a peer that went silent: quinn's idle timeout ends the connection
+//!   instead.
 //!
 //! It also fires when this side's packets stop reaching a peer whose
-//! packets still arrive (a path broken in one direction): from this side
-//! that is the same observation, and falling back to UDP is the right
-//! outcome there too.
+//! packets still arrive all the time (a path broken in one direction): from
+//! this side that is the same observation, and falling back to UDP is the
+//! right outcome there too.
 //!
-//! Not covered: quinn skips `on_ack` while it validates a new network path
-//! (`path.challenge`), and builds a new controller for a migrated
-//! connection. Migration is off (`config::server_config`), and a new
-//! controller is seen as a new counter and restarts the window, so neither
-//! can close a path by itself.
+//! Network path changes: migration is off (`config::server_config`). Were a
+//! connection to change paths anyway, quinn keeps the controller for a NAT
+//! rebinding (it clones it, so the count is shared and continues) and builds
+//! a new one otherwise, which [`AckWatch`] sees as a new counter and treats
+//! like an acknowledgement. While quinn validates a new path it does not
+//! report acknowledgements to the controller (`on_ack`), which delays a
+//! close and cannot cause one, since the window needs the peer to keep
+//! sending for all of it.
 //!
 //! [`QuicCloseCode`]: crate::transport::metrics::QuicCloseCode
 
@@ -66,6 +84,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use parking_lot::Mutex;
 use quinn::FrameStats;
 use quinn::congestion::{Controller, ControllerFactory, ControllerMetrics};
 
@@ -87,9 +106,9 @@ use crate::transport::metrics::QuicCloseCode;
 /// (`config::MAX_WINDOW_BYTES`, 2 MiB).
 pub(crate) const SEND_ABORT_LIMIT: u64 = 4096;
 
-/// How long this side may have ack-eliciting packets outstanding, none of
-/// them acknowledged, while the peer keeps sending, before the path is
-/// closed ([`close_code::PEER_NOT_ACKNOWLEDGING`]).
+/// How long the peer may go on sending without acknowledging packets this
+/// side has outstanding, before the path is closed
+/// ([`close_code::PEER_NOT_ACKNOWLEDGING`]).
 ///
 /// A conforming peer acknowledges within a round trip plus its
 /// `max_ack_delay` (25 ms by default, quinn's and ours), and a lost
@@ -101,9 +120,15 @@ pub(crate) const SEND_ABORT_LIMIT: u64 = 4096;
 /// reaches it; a path that does is closed and its peer stays on UDP.
 pub(crate) const ACK_WATCH_WINDOW: Duration = Duration::from_secs(10);
 
-/// How often the acknowledgement watch samples the connection. A path is
-/// closed between [`ACK_WATCH_WINDOW`] and `ACK_WATCH_WINDOW + ACK_WATCH_TICK`
-/// after its first unacknowledged send, never earlier.
+/// How often the acknowledgement watch samples the connection.
+///
+/// The window starts at the first sample that sees its starting event (a
+/// send, or an acknowledgement that left packets outstanding), so it starts
+/// at most one tick after that event; and the path is closed at the first
+/// sample a full window after that start. So a close comes at least
+/// [`ACK_WATCH_WINDOW`] after the event, and at most
+/// `ACK_WATCH_WINDOW + ACK_WATCH_TICK` after it, given that every sample in
+/// between saw the peer send.
 pub(crate) const ACK_WATCH_TICK: Duration = Duration::from_secs(2);
 
 /// Counts the sends a path reset, and closes its connection past the
@@ -123,9 +148,13 @@ impl SendAborts {
         }
     }
 
-    /// One more send was reset on this side. Past the limit, close the
-    /// connection (once; [`QuicCloser`] ignores later calls).
+    /// One more send was reset on this side. Not counted once the
+    /// connection is closed: closing frees quinn's map. Past the limit,
+    /// close the connection (once; [`QuicCloser`] ignores later calls).
     pub(crate) fn record(&self) {
+        if !self.closer.is_open() {
+            return;
+        }
         let count = self.count.fetch_add(1, Ordering::Relaxed) + 1;
         if count > self.limit && self.closer.close(QuicCloseCode::SendAbortLimit) {
             tracing::warn!(
@@ -153,23 +182,48 @@ pub(crate) struct AckCountingFactory {
 
 impl ControllerFactory for AckCountingFactory {
     fn build(self: Arc<Self>, now: Instant, current_mtu: u16) -> Box<dyn Controller> {
-        Box::new(AckCounting {
-            inner: self.cubic.clone().build(now, current_mtu),
-            acked: Arc::default(),
-        })
+        Box::new(AckCounting::new(self.cubic.clone().build(now, current_mtu)))
     }
 }
 
-/// A congestion controller that counts the ack-eliciting packets the peer
-/// newly acknowledged and passes every call to `inner` unchanged. Its
-/// clones (quinn's `Connection::congestion_state`) share the count, so a
-/// clone taken once reads it as it grows.
+/// What [`AckCounting`] records, under one lock so a reader sees one
+/// consistent state.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AckState {
+    /// Ack-eliciting packets the peer newly acknowledged (`on_ack` calls).
+    acked: u64,
+    /// The bytes in flight after the latest batch of acknowledgements
+    /// (`on_end_acks`).
+    in_flight_after_acks: u64,
+    /// Bytes declared lost since that batch (`on_congestion_event`).
+    lost_since_acks: u64,
+}
+
+impl AckState {
+    /// Bytes still outstanding of those in flight at the latest batch of
+    /// acknowledgements. Packets sent after that batch are not included.
+    fn outstanding_after_acks(&self) -> u64 {
+        self.in_flight_after_acks
+            .saturating_sub(self.lost_since_acks)
+    }
+}
+
+/// A congestion controller that records the acknowledgements the peer
+/// sends ([`AckState`]) and passes every call to `inner` unchanged. Its
+/// clones (quinn's `Connection::congestion_state`) share the record.
 pub(crate) struct AckCounting {
     inner: Box<dyn Controller>,
-    acked: Arc<AtomicU64>,
+    state: Arc<Mutex<AckState>>,
 }
 
 impl AckCounting {
+    fn new(inner: Box<dyn Controller>) -> Self {
+        Self {
+            inner,
+            state: Arc::default(),
+        }
+    }
+
     /// Whether the wrapped controller is a `C`.
     #[cfg(test)]
     pub(crate) fn wraps<C: Controller + 'static>(&self) -> bool {
@@ -190,7 +244,7 @@ impl Controller for AckCounting {
         app_limited: bool,
         rtt: &quinn_proto::RttEstimator,
     ) {
-        self.acked.fetch_add(1, Ordering::Relaxed);
+        self.state.lock().acked += 1;
         self.inner.on_ack(now, sent, bytes, app_limited, rtt);
     }
 
@@ -201,6 +255,11 @@ impl Controller for AckCounting {
         app_limited: bool,
         largest_packet_num_acked: Option<u64>,
     ) {
+        {
+            let mut state = self.state.lock();
+            state.in_flight_after_acks = in_flight;
+            state.lost_since_acks = 0;
+        }
         self.inner
             .on_end_acks(now, in_flight, app_limited, largest_packet_num_acked);
     }
@@ -212,6 +271,10 @@ impl Controller for AckCounting {
         is_persistent_congestion: bool,
         lost_bytes: u64,
     ) {
+        {
+            let mut state = self.state.lock();
+            state.lost_since_acks = state.lost_since_acks.saturating_add(lost_bytes);
+        }
         self.inner
             .on_congestion_event(now, sent, is_persistent_congestion, lost_bytes);
     }
@@ -231,7 +294,7 @@ impl Controller for AckCounting {
     fn clone_box(&self) -> Box<dyn Controller> {
         Box::new(Self {
             inner: self.inner.clone_box(),
-            acked: self.acked.clone(),
+            state: self.state.clone(),
         })
     }
 
@@ -280,16 +343,23 @@ pub(crate) fn ack_eliciting_frames(frames: &FrameStats) -> u64 {
     .fold(0u64, u64::saturating_add)
 }
 
+/// Every frame in `frames`, of any kind.
+pub(crate) fn frames_received(frames: &FrameStats) -> u64 {
+    ack_eliciting_frames(frames)
+        .saturating_add(frames.acks)
+        .saturating_add(frames.connection_close)
+}
+
 /// One reading of a connection, for [`AckWatch`].
 #[derive(Clone)]
 pub(crate) struct AckSample {
-    /// The controller's count, to notice a new controller.
-    counter: Arc<AtomicU64>,
-    /// Ack-eliciting packets the peer newly acknowledged.
-    acked: u64,
+    /// The controller's record, to notice a new controller.
+    record: Arc<Mutex<AckState>>,
+    /// The record's values when the sample was taken.
+    state: AckState,
     /// Ack-eliciting frames this side sent.
     sent: u64,
-    /// Datagrams received from the peer.
+    /// Frames received from the peer.
     received: u64,
 }
 
@@ -297,77 +367,109 @@ impl AckSample {
     /// The connection's counts now, or `None` if its controller is not an
     /// [`AckCounting`] (a config that does not install it).
     pub(crate) fn of(connection: &quinn::Connection) -> Option<Self> {
-        let counter = connection
-            .congestion_state()
-            .into_any()
-            .downcast::<AckCounting>()
-            .ok()?
-            .acked;
-        let stats = connection.stats();
+        Self::from_parts(connection.congestion_state(), connection.stats())
+    }
+
+    /// A sample from a controller (a clone of the connection's) and the
+    /// connection's stats.
+    pub(crate) fn from_parts(
+        controller: Box<dyn Controller>,
+        stats: quinn::ConnectionStats,
+    ) -> Option<Self> {
+        let record = controller.into_any().downcast::<AckCounting>().ok()?.state;
+        let state = *record.lock();
         Some(Self {
-            acked: counter.load(Ordering::Relaxed),
-            counter,
+            record,
+            state,
             sent: ack_eliciting_frames(&stats.frame_tx),
-            received: stats.udp_rx.datagrams,
+            received: frames_received(&stats.frame_rx),
         })
     }
 
     #[cfg(test)]
     pub(crate) fn synthetic(
-        counter: &Arc<AtomicU64>,
+        record: &Arc<Mutex<AckState>>,
         acked: u64,
+        outstanding_after_acks: u64,
         sent: u64,
         received: u64,
     ) -> Self {
         Self {
-            counter: counter.clone(),
-            acked,
+            record: record.clone(),
+            state: AckState {
+                acked,
+                in_flight_after_acks: outstanding_after_acks,
+                lost_since_acks: 0,
+            },
             sent,
             received,
         }
     }
 }
 
-/// Decides, from samples taken over time, whether the peer has
-/// acknowledged none of this side's ack-eliciting packets for the window
-/// while it kept sending.
+/// Decides, from samples taken every tick, whether the peer has gone a
+/// whole window without acknowledging packets this side has outstanding,
+/// while it sent something in every sample.
+///
+/// The window starts at a sample that shows packets outstanding which a
+/// conforming peer is about to acknowledge:
+/// - one that sees a new ack-eliciting send (no acknowledgement since the
+///   previous sample); or
+/// - one that sees an acknowledgement after which packets are still in
+///   flight (minus those since declared lost), so the peer was
+///   acknowledging and left some unacknowledged.
+///
+/// Packets outstanding with nothing new sent and no acknowledgement (after
+/// an outage, while quinn's probe timer is backed off) do not start a
+/// window: nothing then tells this side that the peer has received anything
+/// to acknowledge. A probe that quinn sends later starts one.
+///
+/// The window ends, without a close, at any sample in which the peer sent
+/// nothing, or at any new acknowledgement (which may start a new window as
+/// above). Otherwise the path is closed at the first sample at least a
+/// window after the start, so a close needs at least
+/// `window / tick + 1` consecutive samples, each with something from the
+/// peer and no new acknowledgement.
 pub(crate) struct AckWatch {
     window_nanos: u64,
-    /// The last sample at which nothing was outstanding or the peer had
-    /// acknowledged something new.
-    base: AckSample,
-    /// When the first sample with unacknowledged sends was taken, and the
-    /// datagrams received by then.
-    since: Option<(u64, u64)>,
+    previous: AckSample,
+    /// When the window started.
+    since: Option<u64>,
 }
 
 impl AckWatch {
     pub(crate) fn new(window: Duration, first: AckSample) -> Self {
         Self {
             window_nanos: u64::try_from(window.as_nanos()).unwrap_or(u64::MAX),
-            base: first,
+            previous: first,
             since: None,
         }
     }
 
     /// Take `sample`, taken at `now_nanos`; whether the path must close.
-    ///
-    /// The window starts at the first sample that sees a send not
-    /// acknowledged, so it starts after that send and the path is never
-    /// closed less than a window after it. Any new acknowledgement (or a
-    /// new controller) ends the window; so does a sample with nothing sent
-    /// since the base, as nothing is then waiting for an acknowledgement.
     pub(crate) fn observe(&mut self, now_nanos: u64, sample: AckSample) -> bool {
-        let progressed = !Arc::ptr_eq(&sample.counter, &self.base.counter)
-            || sample.acked != self.base.acked
-            || sample.sent == self.base.sent;
-        if progressed {
-            self.base = sample;
+        let same_controller = Arc::ptr_eq(&sample.record, &self.previous.record);
+        // A new controller restarts the counts: read it as an
+        // acknowledgement, with nothing known to be outstanding.
+        let acknowledged = !same_controller || sample.state.acked != self.previous.state.acked;
+        let peer_sent = same_controller && sample.received != self.previous.received;
+        let sent_new = same_controller && sample.sent != self.previous.sent;
+        let outstanding_after_acks = same_controller && sample.state.outstanding_after_acks() > 0;
+        self.previous = sample;
+        if !peer_sent {
             self.since = None;
             return false;
         }
-        let (start, received_at_start) = *self.since.get_or_insert((now_nanos, sample.received));
-        now_nanos.saturating_sub(start) >= self.window_nanos && sample.received > received_at_start
+        if acknowledged {
+            self.since = outstanding_after_acks.then_some(now_nanos);
+            return false;
+        }
+        let start = match self.since {
+            Some(start) => start,
+            None if sent_new => *self.since.insert(now_nanos),
+            None => return false,
+        };
+        now_nanos.saturating_sub(start) >= self.window_nanos
     }
 }
 
@@ -412,112 +514,4 @@ pub(crate) async fn watch_acknowledgements<T: TimeSource>(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    const SEC: u64 = 1_000_000_000;
-
-    /// Feed `watch` one sample per tick from `samples(tick)`, from tick 1
-    /// to `ticks`; the first tick (in seconds) at which it said close.
-    fn run(
-        ticks: u64,
-        tick_secs: u64,
-        mut samples: impl FnMut(u64) -> (u64, u64, u64),
-    ) -> Option<u64> {
-        let counter = Arc::new(AtomicU64::new(0));
-        let (acked, sent, received) = samples(0);
-        let mut watch = AckWatch::new(
-            ACK_WATCH_WINDOW,
-            AckSample::synthetic(&counter, acked, sent, received),
-        );
-        (1..=ticks).find(|tick| {
-            let (acked, sent, received) = samples(*tick);
-            watch.observe(
-                tick * tick_secs * SEC,
-                AckSample::synthetic(&counter, acked, sent, received),
-            )
-        })
-    }
-
-    /// Sends never acknowledged while the peer keeps sending: closed at
-    /// the first sample a full window after the first one that saw them,
-    /// and not before.
-    #[test]
-    fn unacknowledged_sends_while_the_peer_sends_close_after_the_window() {
-        // A send before tick 1, never acknowledged; the peer sends a
-        // datagram every second.
-        let closed = run(100, 1, |t| (5, 10 + t.min(1), 100 + t));
-        assert_eq!(closed, Some(1 + ACK_WATCH_WINDOW.as_secs()));
-    }
-
-    /// The same, but the peer is silent: never closed here (quinn's idle
-    /// timeout ends that connection).
-    #[test]
-    fn a_silent_peer_is_left_to_the_idle_timeout() {
-        assert_eq!(run(100, 1, |t| (5, 10 + t, 100)), None);
-    }
-
-    /// Nothing sent: idle, never closed, however much the peer sends.
-    #[test]
-    fn an_idle_path_is_never_closed() {
-        assert_eq!(run(1000, 1, |t| (5, 10, 100 + t)), None);
-    }
-
-    /// A keepalive every 15 s, acknowledged one round trip (here up to 9 s)
-    /// later, with the peer sending throughout: never closed.
-    #[test]
-    fn a_slow_conforming_peer_is_never_closed() {
-        for rtt in [1, 3, 9] {
-            let closed = run(1000, 1, |t| {
-                let pings = t / 15 + 1;
-                let acked = t.saturating_sub(rtt) / 15 + u64::from(t >= rtt);
-                (acked, pings, t)
-            });
-            assert_eq!(closed, None, "rtt {rtt} s");
-        }
-    }
-
-    /// A busy conforming peer: sends every tick, acknowledgements every
-    /// tick: never closed.
-    #[test]
-    fn a_busy_conforming_peer_is_never_closed() {
-        assert_eq!(run(1000, 2, |t| (t * 7, t * 9, t * 11)), None);
-    }
-
-    /// One acknowledgement inside the window restarts it.
-    #[test]
-    fn an_acknowledgement_restarts_the_window() {
-        // Acknowledged once, at tick 8; otherwise as in the first test.
-        let closed = run(100, 1, |t| (5 + u64::from(t >= 8), 10 + t, 100 + t));
-        // Tick 8 resets; tick 9 starts the window again.
-        assert_eq!(closed, Some(9 + ACK_WATCH_WINDOW.as_secs()));
-    }
-
-    /// A new controller (a new counter) restarts the window too.
-    #[test]
-    fn a_new_controller_restarts_the_window() {
-        let first = Arc::new(AtomicU64::new(0));
-        let second = Arc::new(AtomicU64::new(0));
-        let mut watch = AckWatch::new(ACK_WATCH_WINDOW, AckSample::synthetic(&first, 0, 0, 0));
-        assert!(!watch.observe(SEC, AckSample::synthetic(&first, 0, 1, 1)));
-        assert!(!watch.observe(5 * SEC, AckSample::synthetic(&second, 0, 2, 2)));
-        assert!(!watch.observe(6 * SEC, AckSample::synthetic(&second, 0, 3, 3)));
-        assert!(!watch.observe(15 * SEC, AckSample::synthetic(&second, 0, 4, 4)));
-        assert!(watch.observe(16 * SEC, AckSample::synthetic(&second, 0, 5, 5)));
-    }
-
-    /// Every frame kind except ACK and CONNECTION_CLOSE counts as
-    /// ack-eliciting.
-    #[test]
-    fn ack_and_close_frames_are_not_ack_eliciting() {
-        let mut frames = FrameStats::default();
-        frames.acks = 1000;
-        frames.connection_close = 1000;
-        assert_eq!(ack_eliciting_frames(&frames), 0);
-        frames.ping = 1;
-        frames.stream = 2;
-        frames.max_streams_uni = 3;
-        frames.handshake_done = 4;
-        assert_eq!(ack_eliciting_frames(&frames), 10);
-    }
-}
+mod tests;

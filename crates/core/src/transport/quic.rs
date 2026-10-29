@@ -889,6 +889,11 @@ impl QuicCloser {
         true
     }
 
+    /// Whether the connection is still open (quinn has no close reason).
+    pub(crate) fn is_open(&self) -> bool {
+        self.connection.close_reason().is_none()
+    }
+
     /// The connection's remote address (for logs).
     pub(crate) fn remote_address(&self) -> SocketAddr {
         self.connection.remote_address()
