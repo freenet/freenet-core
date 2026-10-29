@@ -428,7 +428,7 @@ impl P2pConnManager {
         let was_transient = connection_manager.drop_transient(peer_addr);
 
         // Promote if: (a) was tracked as transient, OR (b) not already in ring.
-        // Case (b) handles expired transient TTL — transport preserved per 76058cf4
+        // Case (b) handles expired transient TTL: transport preserved per 76058cf4
         // but tracking entry gone. Without this, CONNECT succeeds but peer is never
         // added to ring topology (#3113).
         let needs_promotion = was_transient.is_some() || !connection_manager.is_in_ring(peer_addr);
@@ -438,7 +438,7 @@ impl P2pConnManager {
             let loc = was_transient
                 .and_then(|e| e.location)
                 .unwrap_or_else(|| Location::from_address(&peer_addr));
-            // Don't re-run should_accept() here — the connection was already
+            // Don't re-run should_accept() here: the connection was already
             // accepted at the protocol level (the CONNECT terminus handler in connect.rs) and NAT traversal
             // already succeeded. Re-evaluating the probabilistic Kleinberg filter
             // would discard hard-won connections for no capacity reason (#3545).
@@ -471,7 +471,7 @@ impl P2pConnManager {
             // #4787 instrumentation: count the promotion only if the ring
             // actually took the connection. `add_connection`'s own `bool`
             // reports the readiness-threshold crossing, NOT acceptance, so
-            // the outcome struct is what this has to branch on — otherwise
+            // the outcome struct is what this has to branch on; otherwise
             // a cap-rejected promotion inflates `promoted_to_ring` in
             // exactly the saturation direction the counter is meant to
             // expose.
@@ -494,7 +494,7 @@ impl P2pConnManager {
             );
 
             // Update the dashboard/network_status with the peer's location.
-            // Without this, peers promoted via this path show "—" on the
+            // Without this, peers promoted via this path show no location on the
             // dashboard because the initial record_peer_connected(addr, None, None)
             // from handle_successful_connection is never updated.
             let pkl = crate::ring::PeerKeyLocation::new(key.clone(), peer_addr);
@@ -507,7 +507,7 @@ impl P2pConnManager {
             // tell the promoted peer about our subscriptions and cache.
             // Non-blocking (#4145): handle_connect_peer runs INLINE on the
             // event-loop task, and bridge.send() awaits the cap-512
-            // ev_listener_tx that this same task drains — a self-stall under
+            // ev_listener_tx that this same task drains, a self-stall under
             // the connection-churn the SubscribeHint nudge drives. Use
             // bridge.try_send: a dropped interest/cache message is recovered
             // by the periodic InterestSync exchange + subscription-renewal
