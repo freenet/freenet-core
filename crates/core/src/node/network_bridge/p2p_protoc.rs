@@ -526,16 +526,41 @@ impl NetworkBridge for P2pBridge {
 type PeerConnChannelSender = Sender<Either<NetMessage, ConnEvent>>;
 type PeerConnChannelRecv = Receiver<Either<NetMessage, ConnEvent>>;
 
+/// How a connection's peer identity was bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdentitySource {
+    /// The key this node dialled, bound when the outbound connection was
+    /// established.
+    Dialled,
+    /// A key named for the connection without a dial of it: the key an
+    /// expected-inbound registration carried for an inbound connection
+    /// matched to it by address, the joiner key of the peer's own first
+    /// ConnectRequest, or the key a ConnectPeer named for a connection that
+    /// had none. It is held to the same rules as a dialled key once bound
+    /// (it never changes), and in addition it never takes a key from a
+    /// dialled connection that still holds it (see
+    /// `P2pConnManager::bind_identity`).
+    Claimed,
+}
+
+/// The peer identity bound to a connection: set once, by
+/// `P2pConnManager::bind_identity`, and never changed while the connection
+/// is open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BoundIdentity {
+    key: TransportPublicKey,
+    source: IdentitySource,
+}
+
 /// Entry in the connections HashMap, keyed by SocketAddr.
-/// The pub_key is learned from the first message received on this connection.
 #[derive(Debug)]
 struct ConnectionEntry {
     sender: PeerConnChannelSender,
-    /// The peer's public key: the key dialled for an outbound connection, or
-    /// for an inbound one matched to an expected-inbound registration.
-    /// `None` for any other inbound connection until a ConnectPeer or the
-    /// peer's ConnectRequest names the peer.
-    pub_key: Option<TransportPublicKey>,
+    /// The peer's identity: the key dialled for an outbound connection, or
+    /// the claimed key of an inbound one. `None` for an inbound connection
+    /// until it is first named. Written only by
+    /// `P2pConnManager::bind_identity`; read through [`Self::pub_key`].
+    identity: Option<BoundIdentity>,
     /// Unique ID for this connection entry. Used to distinguish stale
     /// TransportClosed events from replaced connections (e.g., after identity change).
     connection_id: u64,
@@ -555,6 +580,13 @@ struct ConnectionEntry {
     /// `None` when the version wasn't exchanged (e.g. joiner->gateway path).
     /// Used to gate version-dependent message types (e.g. SubscribeHint).
     remote_version: Option<(u8, u8, u16)>,
+}
+
+impl ConnectionEntry {
+    /// The key bound to this connection, if any.
+    fn pub_key(&self) -> Option<&TransportPublicKey> {
+        self.identity.as_ref().map(|identity| &identity.key)
+    }
 }
 
 /// Monotonically increasing counter for generating unique connection IDs.
@@ -2270,7 +2302,7 @@ impl P2pConnManager {
                                     let peers_to_cleanup: Vec<_> = ctx
                                         .connections
                                         .iter()
-                                        .map(|(addr, entry)| (*addr, entry.pub_key.clone()))
+                                        .map(|(addr, entry)| (*addr, entry.pub_key().cloned()))
                                         .collect();
                                     for (peer_addr, pub_key_opt) in peers_to_cleanup {
                                         tracing::debug!(
@@ -2518,7 +2550,7 @@ impl P2pConnManager {
                                     .iter()
                                     .filter_map(|(addr, entry)| {
                                         // Only include connections where we know the public key
-                                        entry.pub_key.as_ref().map(|pub_key| {
+                                        entry.pub_key().map(|pub_key| {
                                             PeerKeyLocation::new(pub_key.clone(), *addr)
                                         })
                                     })
@@ -2596,7 +2628,7 @@ impl P2pConnManager {
                                     .iter()
                                     .filter_map(|(addr, entry)| {
                                         // Only include connections where we know the public key
-                                        entry.pub_key.as_ref().map(|pub_key| {
+                                        entry.pub_key().map(|pub_key| {
                                             PeerKeyLocation::new(pub_key.clone(), *addr)
                                         })
                                     })
@@ -5014,7 +5046,7 @@ pub(crate) mod tests {
             addr,
             super::ConnectionEntry {
                 sender: tx1,
-                pub_key: None,
+                identity: None,
                 connection_id: 10,
                 created_at: Instant::now(),
                 link_use: super::zombie_sweep::LinkUseStamp::new(Instant::now()),
@@ -5026,7 +5058,7 @@ pub(crate) mod tests {
             addr,
             super::ConnectionEntry {
                 sender: tx2,
-                pub_key: None,
+                identity: None,
                 connection_id: 20,
                 created_at: Instant::now(),
                 link_use: super::zombie_sweep::LinkUseStamp::new(Instant::now()),

@@ -2544,8 +2544,8 @@ fn advance_to_next_peer(
         // `k_closest_potentially_hosting` does admit addressless candidates
         // past its addr-keyed filters, but it can only ever be handed
         // `PeerAddr::Known` entries: every production write to
-        // `ConnectionManager::connections_by_location` (`add_connection`,
-        // `update_peer_identity`) stores an addr, `prune_connection` only
+        // `ConnectionManager::connections_by_location` (`add_connection`)
+        // stores an addr, `prune_connection` only
         // removes, and the getter returns a clone so no caller can mutate an
         // entry back to `Unknown`. Expect a flat zero on this reason; do NOT
         // treat its absence as a measured ring-health signal.

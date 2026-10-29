@@ -158,7 +158,7 @@ impl Harness {
                 None,
                 transient,
                 &self.handshake,
-                ConnIdentity::SetDialed,
+                IdentitySource::Dialled,
             )
             .await
             .expect("handle_successful_connection");
@@ -176,8 +176,26 @@ impl Harness {
         self.establish(addr, None, true).await;
     }
 
-    /// A ConnectRequest from the connection at `remote` naming `joiner`.
+    /// A ConnectRequest from the connection at `remote` naming `joiner`,
+    /// which the handler passes on.
     async fn connect_request(&mut self, remote: SocketAddr, joiner: PeerKeyLocation) {
+        assert!(
+            self.try_connect_request(remote, joiner).await,
+            "message is passed on"
+        );
+    }
+
+    /// As [`Self::connect_request`], for a request the handler drops.
+    async fn refused_connect_request(&mut self, remote: SocketAddr, joiner: PeerKeyLocation) {
+        assert!(
+            !self.try_connect_request(remote, joiner).await,
+            "message is dropped"
+        );
+    }
+
+    /// A ConnectRequest from the connection at `remote` naming `joiner`;
+    /// returns whether the handler passed it on.
+    async fn try_connect_request(&mut self, remote: SocketAddr, joiner: PeerKeyLocation) -> bool {
         let tx = Transaction::new::<ConnectMsg>();
         let msg = NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Request {
             id: tx,
@@ -200,10 +218,10 @@ impl Harness {
             )
             .await
             .expect("handle_transport_event");
-        assert!(
-            matches!(result, EventResult::Event(_)),
-            "message is passed on"
-        );
+        match result {
+            EventResult::Event(_) => true,
+            EventResult::Continue => false,
+        }
     }
 
     /// A ConnectPeer (connect op accepted `peer`) for an existing connection.
@@ -277,7 +295,7 @@ impl Harness {
             self.mgr
                 .connections
                 .values()
-                .all(|entry| entry.pub_key.as_ref() != Some(&own)),
+                .all(|entry| entry.pub_key() != Some(&own)),
             "a connection is recorded under this node's key"
         );
         assert!(
@@ -347,7 +365,7 @@ fn is_set(kind: ConnIdentity) -> bool {
         ConnIdentity::ChangedConnectRequest
         | ConnIdentity::ConnectRequestKnownAddr
         | ConnIdentity::ChangedConnectPeer
-        | ConnIdentity::ChangedRingPromotion
+        | ConnIdentity::ClaimHeldByDial
         | ConnIdentity::OwnKey
         | ConnIdentity::DuplicateKey
         | ConnIdentity::TeardownKeyElsewhere
@@ -419,19 +437,22 @@ async fn ordinary_establishment_counts_only_set_and_same() {
     );
 }
 
-/// A second ConnectRequest naming another key replaces the connection's key
-/// and counts `changed_connect_request`.
+/// A second ConnectRequest naming another key does not change the
+/// connection's key: it counts `changed_connect_request`, the request is
+/// dropped, and the connection is closed. Nothing is recorded under the new
+/// key, and the first key's mapping goes with the connection.
 #[tokio::test]
-async fn connect_request_naming_another_key_counts_changed() {
+async fn connect_request_naming_another_key_closes_the_connection() {
     let mut h = Harness::new("conn-identity-changed-request").await;
     let remote: SocketAddr = "203.0.113.20:4201".parse().unwrap();
     watch(&[remote]);
     let (first, second) = (key(), key());
 
     h.accept(remote).await;
-    h.connect_request(remote, PeerKeyLocation::with_unknown_addr(first))
+    h.connect_request(remote, PeerKeyLocation::with_unknown_addr(first.clone()))
         .await;
-    h.connect_request(remote, PeerKeyLocation::with_unknown_addr(second.clone()))
+    assert_eq!(h.mgr.connections[&remote].pub_key(), Some(&first));
+    h.refused_connect_request(remote, PeerKeyLocation::with_unknown_addr(second.clone()))
         .await;
 
     assert_eq!(
@@ -441,7 +462,12 @@ async fn connect_request_naming_another_key_counts_changed() {
             ConnIdentity::ChangedConnectRequest
         ]
     );
-    assert_eq!(h.mgr.connections[&remote].pub_key.as_ref(), Some(&second));
+    assert!(
+        !h.mgr.connections.contains_key(&remote),
+        "the connection is closed"
+    );
+    assert!(!h.mgr.addr_by_pub_key.contains_key(&second));
+    assert!(!h.mgr.addr_by_pub_key.contains_key(&first));
 }
 
 /// A ConnectRequest whose joiner address is given as the connection's own
@@ -487,14 +513,14 @@ async fn connect_peer_on_unidentified_connection_counts_set() {
         .await;
 
     assert_eq!(seen(remote), vec![ConnIdentity::SetConnectPeer]);
-    assert_eq!(h.mgr.connections[&remote].pub_key.as_ref(), Some(&peer_key));
+    assert_eq!(h.mgr.connections[&remote].pub_key(), Some(&peer_key));
 }
 
-/// A ConnectPeer naming a key other than the connection's promotes the
-/// connection into the ring under the ConnectPeer key while the connection
-/// keeps its own: both decisions are counted.
+/// A ConnectPeer naming a key other than the connection's is refused: the
+/// connect op is told it failed, the connection keeps its key and is not
+/// promoted into the ring, and nothing is recorded under the other key.
 #[tokio::test]
-async fn connect_peer_naming_another_key_counts_changed_and_ring_promotion() {
+async fn connect_peer_naming_another_key_is_refused() {
     let mut h = Harness::new("conn-identity-changed-connect-peer").await;
     let remote: SocketAddr = "203.0.113.50:4501".parse().unwrap();
     watch(&[remote]);
@@ -503,35 +529,31 @@ async fn connect_peer_naming_another_key_counts_changed_and_ring_promotion() {
     h.accept(remote).await;
     h.connect_request(remote, PeerKeyLocation::with_unknown_addr(recorded.clone()))
         .await;
-    h.connect_peer(PeerKeyLocation::new(other.clone(), remote))
-        .await;
+    assert!(
+        !h.try_connect_peer(PeerKeyLocation::new(other.clone(), remote))
+            .await,
+        "the ConnectPeer is refused"
+    );
 
     assert_eq!(
         seen(remote),
         vec![
             ConnIdentity::SetConnectRequest,
-            ConnIdentity::ChangedRingPromotion,
             ConnIdentity::ChangedConnectPeer,
         ]
     );
     assert_eq!(
-        h.mgr.connections[&remote].pub_key.as_ref(),
+        h.mgr.connections[&remote].pub_key(),
         Some(&recorded),
         "the connection keeps its key"
     );
-    let ring_peer = h
-        .mgr
-        .bridge
-        .op_manager
-        .ring
-        .connection_manager
-        .get_peer_by_addr(remote)
-        .expect("promoted into the ring");
-    assert_eq!(
-        ring_peer.pub_key(),
-        &other,
-        "the ring took the ConnectPeer key"
-    );
+    assert_eq!(h.ring_key_at(remote), None, "nothing is promoted");
+    assert!(!h.mgr.addr_by_pub_key.contains_key(&other));
+
+    // The ConnectPeer naming the connection's own key still promotes it.
+    h.connect_peer(PeerKeyLocation::new(recorded.clone(), remote))
+        .await;
+    assert_eq!(h.ring_key_at(remote).as_ref(), Some(&recorded));
 }
 
 /// An inbound connection matched to an expected-inbound registration that
@@ -546,7 +568,7 @@ async fn expected_inbound_without_a_key_starts_without_a_peer_identity() {
     h.accept_expected_unkeyed(remote).await;
 
     assert_eq!(seen(remote), vec![ConnIdentity::ExpectedInboundUnbound]);
-    assert_eq!(h.mgr.connections[&remote].pub_key, None);
+    assert_eq!(h.mgr.connections[&remote].pub_key(), None);
     assert!(h.mgr.addr_by_pub_key.is_empty(), "nothing is mapped");
     assert_eq!(h.ring_key_at(remote), None, "not in the ring");
     h.assert_own_key_absent();
@@ -562,8 +584,9 @@ async fn expected_inbound_without_a_key_starts_without_a_peer_identity() {
     );
 }
 
-/// A peer that reappears at another address while its first connection is
-/// still open gets a second live connection for its key (`duplicate_key`).
+/// A peer that reappears at another address while its first (claimed)
+/// connection is still open gets a second live connection for its key
+/// (`duplicate_key`).
 /// When the first connection later closes, its cleanup is for a key now
 /// recorded for the second (`teardown_key_elsewhere`), and that removes the
 /// mapping, so the second's later close counts `teardown_key_unmapped`.
@@ -575,19 +598,24 @@ async fn second_connection_for_a_key_counts_duplicate_then_both_teardowns() {
     watch(&[old, new]);
     let peer_key = key();
 
-    h.dial(old, &peer_key).await;
+    h.accept(old).await;
+    h.connect_request(old, PeerKeyLocation::with_unknown_addr(peer_key.clone()))
+        .await;
     h.accept(new).await;
     h.connect_request(new, PeerKeyLocation::with_unknown_addr(peer_key.clone()))
         .await;
     assert_eq!(
         seen(new),
-        vec![ConnIdentity::SetConnectRequest, ConnIdentity::DuplicateKey]
+        vec![ConnIdentity::DuplicateKey, ConnIdentity::SetConnectRequest]
     );
 
     h.transport_closed(old).await;
     assert_eq!(
         seen(old),
-        vec![ConnIdentity::SetDialed, ConnIdentity::TeardownKeyElsewhere]
+        vec![
+            ConnIdentity::SetConnectRequest,
+            ConnIdentity::TeardownKeyElsewhere
+        ]
     );
 
     // The older connection's cleanup removed the key's mapping, so the
@@ -597,8 +625,8 @@ async fn second_connection_for_a_key_counts_duplicate_then_both_teardowns() {
     assert_eq!(
         seen(new),
         vec![
-            ConnIdentity::SetConnectRequest,
             ConnIdentity::DuplicateKey,
+            ConnIdentity::SetConnectRequest,
             ConnIdentity::TeardownKeyUnmapped,
         ]
     );
@@ -609,7 +637,7 @@ async fn second_connection_for_a_key_counts_duplicate_then_both_teardowns() {
     assert_eq!(
         seen(old),
         vec![
-            ConnIdentity::SetDialed,
+            ConnIdentity::SetConnectRequest,
             ConnIdentity::TeardownKeyElsewhere,
             ConnIdentity::SetDialed,
         ]
@@ -694,7 +722,7 @@ async fn expected_inbound_without_a_key_is_identified_by_the_named_peer() {
     );
 
     for (addr, peer_key) in [(by_connect_peer, &first), (by_request, &second)] {
-        assert_eq!(h.mgr.connections[&addr].pub_key.as_ref(), Some(peer_key));
+        assert_eq!(h.mgr.connections[&addr].pub_key(), Some(peer_key));
         assert_eq!(h.mgr.addr_by_pub_key.get(peer_key), Some(&addr));
         assert_eq!(
             h.ring_key_at(addr).as_ref(),
@@ -734,7 +762,7 @@ async fn connect_request_naming_own_key_counts_own_key() {
 
     assert_eq!(
         seen(remote),
-        vec![ConnIdentity::SetConnectRequest, ConnIdentity::OwnKey]
+        vec![ConnIdentity::OwnKey, ConnIdentity::SetConnectRequest]
     );
 }
 
@@ -751,7 +779,7 @@ async fn connect_peer_naming_own_key_counts_own_key() {
 
     assert_eq!(
         seen(remote),
-        vec![ConnIdentity::SetConnectPeer, ConnIdentity::OwnKey]
+        vec![ConnIdentity::OwnKey, ConnIdentity::SetConnectPeer]
     );
 }
 
@@ -759,17 +787,16 @@ async fn connect_peer_naming_own_key_counts_own_key() {
 /// connect op dialled, as the dial would be. The ConnectPeer that follows
 /// (the order when the inbound connection completes first) finds it already
 /// in the ring and promotes nothing again; the peer's own ConnectRequest
-/// confirms the key, and a later relayed request naming another peer is a
-/// change, counted as one, exactly as on any other connection.
+/// naming the same key changes nothing.
 #[tokio::test]
 async fn expected_inbound_is_promoted_under_the_dialled_key_once() {
     let mut h = Harness::new("conn-identity-expected-keyed").await;
     let in_order: SocketAddr = "203.0.113.130:5301".parse().unwrap();
     watch(&[in_order]);
-    let (peer, third_party) = (key(), key());
+    let peer = key();
 
     h.accept_expected(in_order, &peer).await;
-    assert_eq!(h.mgr.connections[&in_order].pub_key.as_ref(), Some(&peer));
+    assert_eq!(h.mgr.connections[&in_order].pub_key(), Some(&peer));
     assert_eq!(h.mgr.addr_by_pub_key.get(&peer), Some(&in_order));
     assert_eq!(
         h.ring_key_at(in_order).as_ref(),
@@ -788,18 +815,12 @@ async fn expected_inbound_is_promoted_under_the_dialled_key_once() {
     );
     h.connect_request(in_order, PeerKeyLocation::with_unknown_addr(peer.clone()))
         .await;
-    h.connect_request(
-        in_order,
-        PeerKeyLocation::with_unknown_addr(third_party.clone()),
-    )
-    .await;
     assert_eq!(
         seen(in_order),
         vec![
             ConnIdentity::ExpectedInboundBound,
             ConnIdentity::SameConnectPeer,
             ConnIdentity::SameConnectRequest,
-            ConnIdentity::ChangedConnectRequest,
         ]
     );
     h.assert_own_key_absent();
@@ -839,7 +860,7 @@ fn h_count(h: &Harness) -> usize {
 /// nothing under this node's key into the key-to-address map, so they do not
 /// make a later claim of this node's own key on another connection a
 /// duplicate: that claim counts `own_key` alone, and a later claim of another
-/// key is a change.
+/// key is refused.
 #[tokio::test]
 async fn own_key_claim_beside_expected_inbound_connections_is_not_a_duplicate() {
     let mut h = Harness::new("conn-identity-own-key-beside-expected").await;
@@ -855,14 +876,14 @@ async fn own_key_claim_beside_expected_inbound_connections_is_not_a_duplicate() 
     let own = h.own_key();
     h.connect_request(remote, PeerKeyLocation::with_unknown_addr(own))
         .await;
-    h.connect_request(remote, PeerKeyLocation::with_unknown_addr(key()))
+    h.refused_connect_request(remote, PeerKeyLocation::with_unknown_addr(key()))
         .await;
 
     assert_eq!(
         seen(remote),
         vec![
-            ConnIdentity::SetConnectRequest,
             ConnIdentity::OwnKey,
+            ConnIdentity::SetConnectRequest,
             ConnIdentity::ChangedConnectRequest,
         ]
     );
@@ -1192,10 +1213,7 @@ async fn expected_inbound_matched_by_the_handshake_driver_gets_the_peer_key() {
         vec![ConnIdentity::ExpectedInboundBound],
         "the driver matched the connection to the expectation"
     );
-    assert_eq!(
-        h.mgr.connections[&peer_addr].pub_key.as_ref(),
-        Some(&rig.peer_key)
-    );
+    assert_eq!(h.mgr.connections[&peer_addr].pub_key(), Some(&rig.peer_key));
     assert_eq!(h.mgr.addr_by_pub_key.get(&rig.peer_key), Some(&peer_addr));
     assert_eq!(
         h.ring_key_at(peer_addr).as_ref(),
@@ -1265,10 +1283,7 @@ async fn expected_inbound_after_a_failed_dial_is_promoted_under_the_dialled_key(
     assert!(dial.await.expect("dial task"), "the peer's dial completes");
 
     assert_eq!(seen(peer_addr), vec![ConnIdentity::ExpectedInboundBound]);
-    assert_eq!(
-        h.mgr.connections[&peer_addr].pub_key.as_ref(),
-        Some(&rig.peer_key)
-    );
+    assert_eq!(h.mgr.connections[&peer_addr].pub_key(), Some(&rig.peer_key));
     assert_eq!(
         h.ring_key_at(peer_addr).as_ref(),
         Some(&rig.peer_key),
@@ -1312,7 +1327,7 @@ async fn expected_inbound_after_the_window_is_not_bound_to_the_key() {
     assert!(dial.await.expect("dial task"), "the peer's dial completes");
 
     assert_eq!(seen(peer_addr), vec![ConnIdentity::ExpectedInboundUnbound]);
-    assert_eq!(h.mgr.connections[&peer_addr].pub_key, None);
+    assert_eq!(h.mgr.connections[&peer_addr].pub_key(), None);
     assert!(!h.mgr.addr_by_pub_key.contains_key(&rig.peer_key));
     assert_eq!(h.ring_key_at(peer_addr), None, "not promoted");
     h.assert_own_key_absent();

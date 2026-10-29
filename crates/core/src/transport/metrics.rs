@@ -70,32 +70,34 @@ macro_rules! labelled_counters {
 }
 
 labelled_counters! {
-    /// A decision about the peer identity (public key) the node records for
-    /// a connection, counted where the node makes it, to measure how often a
-    /// connection's peer identity is set or changed after establishment.
-    /// Exported per period as `conn_identity_<label>`, each key only when its
-    /// count is non-zero. Each `set_*`, `same_*` and `changed_*` kind is one
-    /// per decision on its path; `connect_request_known_addr`, `own_key`,
-    /// `duplicate_key` and `changed_ring_promotion` (which accompanies a
-    /// `changed_connect_peer` on the same ConnectPeer) are counted in
-    /// addition to the kind of the decision they qualify.
+    /// A decision about the peer identity (public key) the node binds to a
+    /// connection, counted where the node makes it. A connection is bound at
+    /// most once and keeps its key until it closes. Exported per period as
+    /// `conn_identity_<label>`, each key only when its count is non-zero.
+    /// Each `set_*`, `same_*` and `changed_*` kind is one per decision on its
+    /// path; `connect_request_known_addr`, `own_key` and `duplicate_key` are
+    /// counted in addition to the kind of the decision they qualify.
     ///
-    /// An inbound connection that matched an expected-inbound registration
-    /// is recorded under the key the connect op dialled
+    /// An outbound connection is bound to the key it was dialled with
+    /// (`set_dialed`). An inbound connection that matched an expected-inbound
+    /// registration is bound to the key the connect op dialled
     /// (`expected_inbound_bound`), or, when the registration carried no key,
     /// starts with none (`expected_inbound_unbound`). Any other inbound
     /// connection starts with no key, so its first key is counted as
     /// `set_connect_peer` or `set_connect_request`, whichever names the peer
-    /// first. A connection is recorded under this node's own key only when a
-    /// dial, a registration, a ConnectRequest or a ConnectPeer names that
+    /// first. Both kinds of inbound match happen on a gateway, and on any
+    /// node that accepts a reconnection from an address it already has a
+    /// session with. A connection is bound to this node's own key only when
+    /// a dial, a registration, a ConnectRequest or a ConnectPeer names that
     /// key, so `own_key` is expected to stay at zero.
     pub(crate) enum ConnIdentity {
-        /// An outbound connection was established and recorded under the key
+        /// An outbound connection was established and bound to the key
         /// it was dialled with.
         SetDialed => "set_dialed",
         /// An inbound connection matched an expected-inbound registration and
-        /// was recorded under the key the connect op dialled, which the
-        /// registration carried.
+        /// was bound to the key the connect op dialled, which the
+        /// registration carried. The match is by address only, so this
+        /// binding is a claim (see `claim_held_by_dial`).
         ExpectedInboundBound => "expected_inbound_bound",
         /// An inbound connection matched an expected-inbound registration
         /// that carried no key, so it starts with none, like an unexpected
@@ -105,8 +107,9 @@ labelled_counters! {
         SetConnectRequest => "set_connect_request",
         /// A ConnectRequest named the key the connection already had.
         SameConnectRequest => "same_connect_request",
-        /// A ConnectRequest named a key other than the one the connection had,
-        /// and the connection's key was replaced with it.
+        /// A ConnectRequest named a key other than the one the connection is
+        /// bound to. The connection keeps its key: the request is dropped
+        /// and the connection closed.
         ChangedConnectRequest => "changed_connect_request",
         /// The ConnectRequest counted by one of the three kinds above gave the
         /// joiner a known address equal to the connection's remote address,
@@ -118,17 +121,21 @@ labelled_counters! {
         /// A ConnectPeer for an existing connection named the key it had.
         SameConnectPeer => "same_connect_peer",
         /// A ConnectPeer for an existing connection named a key other than the
-        /// one it had; the connection kept its key.
+        /// one it is bound to. The connection keeps its key and is not
+        /// promoted; the connect op is told the connection failed.
         ChangedConnectPeer => "changed_connect_peer",
-        /// A ConnectPeer promoted an existing connection into the ring, and
-        /// the ring took it, under a key other than the one recorded for the
-        /// connection.
-        ChangedRingPromotion => "changed_ring_promotion",
-        /// A connection was recorded under this node's own key, on any path.
+        /// A claimed key (an expected-inbound match, a ConnectRequest, or a
+        /// ConnectPeer for a connection without one) was not bound because
+        /// another open connection is bound to it from a dial. The claiming
+        /// connection stays without an identity; a ConnectRequest carrying
+        /// the claim is dropped and a ConnectPeer is refused.
+        ClaimHeldByDial => "claim_held_by_dial",
+        /// A connection was bound to this node's own key, on any path.
         OwnKey => "own_key",
-        /// A key was recorded for a connection while the key-to-address map
-        /// held it for another open connection that still has that key (the
-        /// newer one replaces it in the map).
+        /// A key was bound to a connection while the key-to-address map held
+        /// it for another open connection still bound to that key (the newer
+        /// one replaces it in the map). Not counted when the binding is
+        /// refused (`claim_held_by_dial`).
         DuplicateKey => "duplicate_key",
         /// Cleanup ran for a connection whose key is mapped to a different
         /// connection. Counted on transport close, on an explicit drop, on
@@ -136,7 +143,7 @@ labelled_counters! {
         /// same address replaces the entry; not on the cleanup when the event
         /// loop shuts down.
         TeardownKeyElsewhere => "teardown_key_elsewhere",
-        /// Cleanup, on the same paths, ran for a connection with no recorded
+        /// Cleanup, on the same paths, ran for a connection with no bound
         /// key, so no per-peer cleanup ran for it.
         TeardownUnidentified => "teardown_unidentified",
         /// Cleanup, on the same paths, ran for a connection whose key is not
@@ -2099,8 +2106,8 @@ impl TransportMetrics {
             conn_identity_changed_connect_peer: get32(
                 &identity[ConnIdentity::ChangedConnectPeer as usize],
             ),
-            conn_identity_changed_ring_promotion: get32(
-                &identity[ConnIdentity::ChangedRingPromotion as usize],
+            conn_identity_claim_held_by_dial: get32(
+                &identity[ConnIdentity::ClaimHeldByDial as usize],
             ),
             conn_identity_own_key: get32(&identity[ConnIdentity::OwnKey as usize]),
             conn_identity_duplicate_key: get32(&identity[ConnIdentity::DuplicateKey as usize]),
@@ -2600,7 +2607,7 @@ pub struct TransportSnapshot {
     pub conn_identity_set_connect_peer: u32,
     pub conn_identity_same_connect_peer: u32,
     pub conn_identity_changed_connect_peer: u32,
-    pub conn_identity_changed_ring_promotion: u32,
+    pub conn_identity_claim_held_by_dial: u32,
     pub conn_identity_own_key: u32,
     pub conn_identity_duplicate_key: u32,
     pub conn_identity_teardown_key_elsewhere: u32,
@@ -2674,7 +2681,7 @@ impl TransportSnapshot {
             ConnIdentity::SetConnectPeer => self.conn_identity_set_connect_peer,
             ConnIdentity::SameConnectPeer => self.conn_identity_same_connect_peer,
             ConnIdentity::ChangedConnectPeer => self.conn_identity_changed_connect_peer,
-            ConnIdentity::ChangedRingPromotion => self.conn_identity_changed_ring_promotion,
+            ConnIdentity::ClaimHeldByDial => self.conn_identity_claim_held_by_dial,
             ConnIdentity::OwnKey => self.conn_identity_own_key,
             ConnIdentity::DuplicateKey => self.conn_identity_duplicate_key,
             ConnIdentity::TeardownKeyElsewhere => self.conn_identity_teardown_key_elsewhere,
@@ -2864,7 +2871,7 @@ impl TransportSnapshot {
             conn_identity_set_connect_peer,
             conn_identity_same_connect_peer,
             conn_identity_changed_connect_peer,
-            conn_identity_changed_ring_promotion,
+            conn_identity_claim_held_by_dial,
             conn_identity_own_key,
             conn_identity_duplicate_key,
             conn_identity_teardown_key_elsewhere,
@@ -2973,7 +2980,7 @@ impl TransportSnapshot {
         self.conn_identity_set_connect_peer = conn_identity_set_connect_peer;
         self.conn_identity_same_connect_peer = conn_identity_same_connect_peer;
         self.conn_identity_changed_connect_peer = conn_identity_changed_connect_peer;
-        self.conn_identity_changed_ring_promotion = conn_identity_changed_ring_promotion;
+        self.conn_identity_claim_held_by_dial = conn_identity_claim_held_by_dial;
         self.conn_identity_own_key = conn_identity_own_key;
         self.conn_identity_duplicate_key = conn_identity_duplicate_key;
         self.conn_identity_teardown_key_elsewhere = conn_identity_teardown_key_elsewhere;
@@ -3169,7 +3176,7 @@ struct SnapshotExtras {
     pub conn_identity_set_connect_peer: u32,
     pub conn_identity_same_connect_peer: u32,
     pub conn_identity_changed_connect_peer: u32,
-    pub conn_identity_changed_ring_promotion: u32,
+    pub conn_identity_claim_held_by_dial: u32,
     pub conn_identity_own_key: u32,
     pub conn_identity_duplicate_key: u32,
     pub conn_identity_teardown_key_elsewhere: u32,
@@ -3268,7 +3275,7 @@ impl SnapshotExtras {
             || self.conn_identity_set_connect_peer != 0
             || self.conn_identity_same_connect_peer != 0
             || self.conn_identity_changed_connect_peer != 0
-            || self.conn_identity_changed_ring_promotion != 0
+            || self.conn_identity_claim_held_by_dial != 0
             || self.conn_identity_own_key != 0
             || self.conn_identity_duplicate_key != 0
             || self.conn_identity_teardown_key_elsewhere != 0
@@ -5282,7 +5289,7 @@ mod tests {
             "conn_identity_set_connect_peer",
             "conn_identity_same_connect_peer",
             "conn_identity_changed_connect_peer",
-            "conn_identity_changed_ring_promotion",
+            "conn_identity_claim_held_by_dial",
             "conn_identity_own_key",
             "conn_identity_duplicate_key",
             "conn_identity_teardown_key_elsewhere",
