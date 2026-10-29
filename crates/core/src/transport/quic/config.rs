@@ -39,7 +39,7 @@ use std::time::{Duration, SystemTime};
 
 use quinn::{
     ClientConfig, EndpointConfig, IdleTimeout, MtuDiscoveryConfig, NoneTokenLog, NoneTokenStore,
-    ServerConfig, TransportConfig, ValidationTokenConfig, VarInt, congestion,
+    ServerConfig, TransportConfig, ValidationTokenConfig, VarInt,
 };
 use ring_crypto::{hkdf, hmac};
 
@@ -261,6 +261,10 @@ pub(crate) struct QuicSettings {
     pub max_connections: usize,
     /// The memory the node may use (host RAM, or a cgroup limit).
     pub memory_limit: usize,
+    /// Simulation-only: quinn's idle timeout, in place of the time
+    /// source's connection idle timeout (24 h on `VirtualTime`), so a
+    /// simulation can see a silent QUIC path time out. `None` in production.
+    pub idle_timeout: Option<Duration>,
 }
 
 impl QuicSettings {
@@ -373,7 +377,11 @@ pub(crate) fn transport_config<T: TimeSource>(
     config
         .max_concurrent_uni_streams(VarInt::from_u32(MAX_UNI_STREAMS))
         .max_concurrent_bidi_streams(VarInt::from_u32(MAX_BIDI_STREAMS))
-        .max_idle_timeout(Some(idle_timeout(time.connection_idle_timeout())))
+        .max_idle_timeout(Some(idle_timeout(
+            settings
+                .idle_timeout
+                .unwrap_or_else(|| time.connection_idle_timeout()),
+        )))
         .keep_alive_interval(time.supports_keepalive().then_some(KEEPALIVE_INTERVAL))
         // A window is at most MAX_WINDOW_BYTES (2 MiB), far inside a VarInt.
         .stream_receive_window(VarInt::from_u32(window as u32))
@@ -385,7 +393,9 @@ pub(crate) fn transport_config<T: TimeSource>(
         .mtu_discovery_config(None::<MtuDiscoveryConfig>)
         .pad_to_mtu(false)
         .enable_segmentation_offload(false)
-        .congestion_controller_factory(Arc::new(congestion::CubicConfig::default()))
+        // Cubic, wrapped to count the packets the peer acknowledges (the
+        // path's acknowledgement watch, `recycle`).
+        .congestion_controller_factory(Arc::new(super::recycle::AckCountingFactory::default()))
         .initial_rtt(Duration::from_millis(333))
         .packet_threshold(3)
         .time_threshold(9.0 / 8.0)

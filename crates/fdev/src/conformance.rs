@@ -34,7 +34,8 @@ use freenet::conformance::verifier::Bytes;
 use freenet::conformance::{
     ConformanceCase, ConformanceEvidence, ConformanceProperty, EvidenceRejected, GeneratorConfig,
     IdempotenceSettling, Inconclusive, MinimizeConfig, OracleBuildError, PropertyOutcome,
-    ReplayBundle, RuntimeOracle, Severity, Transition, generate_cases, minimize, verify_case,
+    RemovalTier, ReplayBundle, RuntimeOracle, Severity, Transition, generate_cases,
+    minimize_toward, removal_tier, verify_case,
 };
 use freenet_stdlib::prelude::{CodeHash, ContractCode, ContractInstanceId, State, UpdateData};
 use serde::Serialize;
@@ -44,8 +45,10 @@ use serde::Serialize;
 /// Runs the *exact* checks the network's own conformance checker runs; see
 /// `freenet::conformance` for why the two must never be allowed to drift.
 /// Diagnostics (efficiency reports, e.g. a self-delta as large as the state
-/// it is against) never fail this command — only an enforceable
-/// (`Severity::Violation`) merge-law break does.
+/// it is against) never fail this command. Every merge-law break
+/// (`Severity::Violation`) does, including a break of a law the network only
+/// reports and never acts on (`freenet::conformance::policy::removal_tier`): an
+/// author should hear about every broken law, whatever the network does about it.
 #[derive(clap::Parser, Clone)]
 pub struct ConformanceConfig {
     /// Path to the compiled contract WASM. Required unless `--bundle` supplies
@@ -121,8 +124,12 @@ pub struct ConformanceConfig {
     #[arg(long)]
     pub(crate) json: bool,
 
-    /// Write a framed evidence file per distinct enforceable
+    /// Write a framed evidence file per distinct removal-eligible
     /// violation into this directory (created if it does not exist).
+    ///
+    /// Report-only findings (`freenet::conformance::policy::removal_tier`) are
+    /// not written: a peer receiving one would only report it. They are counted
+    /// in the summary, and they still fail the command.
     #[arg(long = "evidence-out")]
     pub(crate) evidence_out: Option<PathBuf>,
 
@@ -411,17 +418,21 @@ fn write_bundle(
 /// distinction CI needs and a single exit code cannot express.
 #[derive(Debug, thiserror::Error)]
 #[error(
-    "{count} merge-law violation(s) found. A violation is removal-eligible under \
-     enforcement; see each finding for what it means. NOTE: `state_idempotence` \
-     reporting `settled_after` is a real break whose harm is redundant anti-entropy \
-     rather than divergence \u{2014} expected against correct canonicalizing \
-     contracts until the PUT install path canonicalizes"
+    "{count} merge-law violation(s) found. Most laws are removal-eligible under \
+     enforcement and some are report-only; see each finding for what it means. \
+     NOTE: `state_idempotence` reporting `settled_after` is a real break whose harm \
+     is redundant anti-entropy rather than divergence, and is report-only \
+     \u{2014} expected against correct canonicalizing contracts until the PUT \
+     install path canonicalizes"
 )]
 pub struct ConformanceViolations {
     pub count: usize,
 }
 
-/// 0 when no [`PropertyOutcome`] is an enforceable violation, 1 otherwise.
+/// 0 when no [`PropertyOutcome`] is a merge-law violation, 1 otherwise.
+///
+/// Report-only laws count: the exit code tells the author a law broke, not what
+/// the network would do about it.
 ///
 /// Diagnostics (`Severity::Diagnostic`) never fail the exit code — only a
 /// `Severity::Violation` finding does. Split out from [`conformance`] so it
@@ -609,7 +620,14 @@ async fn verify_evidence(config: &ConformanceConfig, path: &PathBuf) -> anyhow::
             {
                 println!("  note     : a DIFFERENT law broke here than the sender reported");
             }
-            if v.severity == Severity::Violation {
+            if let Some(note) = reproduced_tier_note(v) {
+                println!("  note     : {note}");
+            }
+            // From the property, as `exit_code` and the report read it. `v` is
+            // this run's own verification, whose field `verify_case` fills from
+            // the property, so the two agree; one form keeps every exit decision
+            // reading the same source.
+            if v.property.severity() == Severity::Violation {
                 return Err(ConformanceViolations { count: 1 }.into());
             }
             Ok(())
@@ -959,7 +977,22 @@ fn describe_oracle_build_error(err: OracleBuildError) -> anyhow::Error {
     }
 }
 
-/// Write one evidence file per distinct enforceable violation.
+/// What `verify-evidence` adds to a REPRODUCED verdict about the network's
+/// response: a reproduced break of a report-only law (`policy::removal_tier`) is
+/// real, and still fails the command, but a peer receiving it would only report
+/// it. That concerns conformance removal only: the live re-apply probe can still
+/// suppress the contract's propagation independently (see `removal_tier`'s
+/// rustdoc). `None` for a removal-eligible violation and for a diagnostic, whose
+/// severity already says it is report-only.
+fn reproduced_tier_note(v: &freenet::conformance::Violation) -> Option<&'static str> {
+    (v.property.severity() == Severity::Violation && removal_tier(v) == RemovalTier::ReportOnly)
+        .then_some(
+            "this law is report-only: a peer receiving this evidence would report it \
+             and never act on it",
+        )
+}
+
+/// Write one evidence file per distinct removal-eligible violation.
 ///
 /// "Distinct" is by [`ConformanceEvidence::id`] (a content hash of the
 /// inputs), so cases whose inputs coincide overwrite the same filename
@@ -984,6 +1017,7 @@ fn write_evidence<O: ConformanceOracle + ?Sized>(
     let mut written = HashSet::new();
     let mut oversized = 0usize;
     let mut local_only = 0usize;
+    let mut report_only = 0usize;
     let mut shrunk_from = 0usize;
     let mut shrunk_to = 0usize;
     // Grouped, not per-case. Both of these fire once per VIOLATED CASE, and a corpus
@@ -1014,13 +1048,32 @@ fn write_evidence<O: ConformanceOracle + ?Sized>(
             continue;
         }
 
+        // A report-only finding (`policy::removal_tier`) is not grounds for any
+        // peer to act, so evidence for it would make every recipient re-execute a
+        // case whose only possible outcome is a report. Checked after the
+        // local-only test so that count keeps meaning what it says, and before
+        // minimising for the same cost reason.
+        let Some(checked) = outcome.violation() else {
+            continue;
+        };
+        let tier = removal_tier(checked);
+        if tier == RemovalTier::ReportOnly {
+            report_only += 1;
+            continue;
+        }
+
         // Shrink before serializing. A case generated from large states can carry
         // several MB, well over the evidence size bound, and evidence that every
         // recipient rejects is not evidence. Shrinking also makes the file a usable
         // bug report rather than two large blobs that happen to disagree.
-        let (minimized, shrink) = minimize(
+        //
+        // Toward the finding checked above, not one `minimize` would re-derive by
+        // verifying the case again: a contract whose verdict changes between runs
+        // could otherwise be shrunk toward a different finding.
+        let (minimized, shrink) = minimize_toward(
             oracle,
             case,
+            (checked.property, tier),
             state_candidates,
             delta_candidates,
             &MinimizeConfig::default(),
@@ -1028,6 +1081,18 @@ fn write_evidence<O: ConformanceOracle + ?Sized>(
         shrunk_from += shrink.original_bytes;
         shrunk_to += shrink.final_bytes;
         let observed = verify_case(oracle, &minimized).violation().cloned();
+        // And the evidence carries what THIS verification found, so its tier is
+        // checked again. Against a contract whose verdict is not stable (it reads
+        // the clock, or is nondeterministic) the minimized case can come back
+        // report-only even though every shrink trial matched the target, and
+        // evidence of that is evidence no peer may act on.
+        if observed
+            .as_ref()
+            .is_some_and(|v| removal_tier(v) == RemovalTier::ReportOnly)
+        {
+            report_only += 1;
+            continue;
+        }
         let evidence =
             ConformanceEvidence::new(instance, parameters.to_vec(), &minimized, observed);
 
@@ -1067,6 +1132,7 @@ fn write_evidence<O: ConformanceOracle + ?Sized>(
         directory: dir.display().to_string(),
         files_written: written.len(),
         findings_local_only: local_only,
+        findings_report_only: report_only,
         findings_too_large: oversized,
         input_bytes_before_shrinking: shrunk_from,
         input_bytes_after_shrinking: shrunk_to,
@@ -1149,6 +1215,13 @@ struct EvidenceSummary {
     /// counted as "too large": the reason is permanent and has nothing to do with
     /// size. See `ConformanceProperty::premise_source`.
     findings_local_only: usize,
+    /// Findings of a report-only tier (`policy::removal_tier`), for which no
+    /// evidence is written because no peer may act on one. Checked before
+    /// minimisation, and again on the minimized case's own verification, since a
+    /// contract whose verdict is not stable can come back report-only. Findings
+    /// counted by the first check are excluded from the shrink byte totals
+    /// (minimisation never ran); by the second, they are included.
+    findings_report_only: usize,
     /// Findings that stayed over the evidence size bound even after shrinking.
     /// Reported rather than swallowed: they are real findings that simply cannot be
     /// propagated, and silently writing nothing would look like there were none.
@@ -1275,7 +1348,13 @@ struct Report {
     cases_run: usize,
     holds: usize,
     violations: usize,
+    /// Law breaks (`Severity::Violation`), which fail this command, report-only
+    /// ones included. The name is kept for compatibility with existing `--json`
+    /// consumers; what the network may act on is `removal_eligible_violations`.
     enforceable_violations: usize,
+    /// The subset of `enforceable_violations` the network may act on
+    /// (`policy::removal_tier` is `RemovalEligible`).
+    removal_eligible_violations: usize,
     diagnostic_violations: usize,
     inconclusive: usize,
     findings: Vec<Finding>,
@@ -1306,6 +1385,10 @@ struct Finding {
     /// would leave the tool discarding structure it was handed — the defect
     /// #5461 fixed, one field over.
     settling: Option<IdempotenceSettling>,
+    /// `removal_eligible` or `report_only`: whether the network may act on this
+    /// finding (`policy::removal_tier`). Separate from `severity`, which says
+    /// whether a law broke.
+    tier: &'static str,
 }
 
 /// How many distinct detail texts the HUMAN report shows per inconclusive reason.
@@ -1393,6 +1476,7 @@ impl Report {
         let mut holds = 0usize;
         let mut violations = 0usize;
         let mut enforceable_violations = 0usize;
+        let mut removal_eligible_violations = 0usize;
         let mut diagnostic_violations = 0usize;
         let mut inconclusive = 0usize;
 
@@ -1404,13 +1488,22 @@ impl Report {
                 PropertyOutcome::Holds => holds += 1,
                 PropertyOutcome::Violated(v) => {
                     violations += 1;
-                    match v.severity {
+                    // Severity from the property, as `decide` and `exit_code` read
+                    // it, for both counts, so a removal-eligible count can never
+                    // include a diagnostic and the two counts cannot disagree on
+                    // what a law break is.
+                    let severity = v.property.severity();
+                    match severity {
                         Severity::Violation => enforceable_violations += 1,
                         Severity::Diagnostic => diagnostic_violations += 1,
                     }
+                    let tier = removal_tier(v);
+                    if severity == Severity::Violation && tier == RemovalTier::RemovalEligible {
+                        removal_eligible_violations += 1;
+                    }
                     findings.push(Finding {
                         property: v.property.as_str().to_string(),
-                        severity: match v.severity {
+                        severity: match severity {
                             Severity::Violation => "violation",
                             Severity::Diagnostic => "diagnostic",
                         },
@@ -1418,6 +1511,10 @@ impl Report {
                         left: v.left.to_string(),
                         right: v.right.to_string(),
                         settling: v.settling,
+                        tier: match tier {
+                            RemovalTier::RemovalEligible => "removal_eligible",
+                            RemovalTier::ReportOnly => "report_only",
+                        },
                     });
                 }
                 PropertyOutcome::Inconclusive(reason) => {
@@ -1467,6 +1564,7 @@ impl Report {
             holds,
             violations,
             enforceable_violations,
+            removal_eligible_violations,
             diagnostic_violations,
             inconclusive,
             findings,
@@ -1500,11 +1598,12 @@ impl Report {
         )?;
         writeln!(
             out,
-            "merge check: {} case(s) run \u{2014} {} held, {} violation(s) ({} enforceable, {} diagnostic-only), {} inconclusive",
+            "merge check: {} case(s) run \u{2014} {} held, {} violation(s) ({} merge-law break(s), {} of them removal-eligible; {} diagnostic-only), {} inconclusive",
             self.cases_run,
             self.holds,
             self.violations,
             self.enforceable_violations,
+            self.removal_eligible_violations,
             self.diagnostic_violations,
             self.inconclusive
         )?;
@@ -1517,10 +1616,18 @@ impl Report {
                 } else {
                     format!("{count} cases")
                 };
+                // The tier on each violation line, so the summary's "M of them
+                // removal-eligible" can be traced to the findings it counts. A
+                // diagnostic is always report-only and says so by its severity.
+                let label = match (f.severity, f.tier) {
+                    ("violation", "removal_eligible") => "violation, removal-eligible",
+                    ("violation", _) => "violation, report-only",
+                    (severity, _) => severity,
+                };
                 writeln!(
                     out,
-                    "  [{}] {} ({cases}): {}\n      example \u{2014} left: {}; right: {}",
-                    f.severity, f.property, f.detail, f.left, f.right
+                    "  [{label}] {} ({cases}): {}\n      example \u{2014} left: {}; right: {}",
+                    f.property, f.detail, f.left, f.right
                 )?;
             }
         }
@@ -1616,6 +1723,15 @@ impl Report {
                     evidence.findings_local_only
                 )?;
             }
+            if evidence.findings_report_only > 0 {
+                writeln!(
+                    out,
+                    "  {} finding(s) came from a report-only law, which no peer may \
+                     act on, so no evidence was written for them; they are listed \
+                     above and still fail this command",
+                    evidence.findings_report_only
+                )?;
+            }
             if evidence.findings_too_large > 0 {
                 writeln!(
                     out,
@@ -1638,7 +1754,7 @@ impl Report {
         }
 
         if self.enforceable_violations == 0 {
-            writeln!(out, "\nno enforceable violations found.")?;
+            writeln!(out, "\nno merge-law violations found.")?;
             if self.diagnostic_violations > 0 {
                 writeln!(
                     out,
@@ -1647,7 +1763,7 @@ impl Report {
                 )?;
             }
             // Without this the line above is the last thing a reader sees, and
-            // "no enforceable violations found." reads as a clean bill of health
+            // "no merge-law violations found." reads as a clean bill of health
             // for a contract whose clock call will trap in a future release.
             if !self.code_diagnostics.is_empty() {
                 writeln!(
@@ -1677,7 +1793,7 @@ fn group_findings(findings: &[Finding]) -> Vec<(&Finding, usize)> {
     for f in findings {
         match groups
             .iter_mut()
-            .find(|(g, _)| g.property == f.property && g.detail == f.detail)
+            .find(|(g, _)| g.property == f.property && g.detail == f.detail && g.tier == f.tier)
         {
             Some((_, count)) => *count += 1,
             None => groups.push((f, 1)),
@@ -2700,7 +2816,7 @@ mod tests {
         let property = ConformanceProperty::TransitionPathAgreement;
         assert!(
             !property.is_self_verifying() && property.severity() == Severity::Violation,
-            "the fixture depends on this property being enforceable AND local-only"
+            "the fixture depends on this property being a Violation AND local-only"
         );
         let case = ConformanceCase::new(
             property,
@@ -2843,6 +2959,7 @@ mod tests {
             holds: 0,
             violations: 2,
             enforceable_violations: 2,
+            removal_eligible_violations: 2,
             diagnostic_violations: 0,
             inconclusive: 0,
             findings: Vec::new(),
@@ -2852,6 +2969,7 @@ mod tests {
                 directory: "/tmp/evidence".to_string(),
                 files_written: 0,
                 findings_local_only: 1,
+                findings_report_only: 1,
                 findings_too_large: 1,
                 input_bytes_before_shrinking: 0,
                 input_bytes_after_shrinking: 0,
@@ -2875,6 +2993,11 @@ mod tests {
             "an over-size finding drew no explanation, so the report says \
              'wrote 0 evidence file(s)' and nothing else — which reads exactly \
              like a clean run:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("came from a report-only law"),
+            "a report-only finding drew no explanation for its missing evidence \
+             file:\n{rendered}"
         );
     }
 
@@ -2949,6 +3072,7 @@ mod tests {
             holds: 1,
             violations: 0,
             enforceable_violations: 0,
+            removal_eligible_violations: 0,
             diagnostic_violations: 0,
             inconclusive: 0,
             findings: Vec::new(),
@@ -2958,6 +3082,7 @@ mod tests {
                 directory: "/tmp/evidence".to_string(),
                 files_written: 0,
                 findings_local_only: 0,
+                findings_report_only: 0,
                 findings_too_large: 0,
                 input_bytes_before_shrinking: 0,
                 input_bytes_after_shrinking: 0,
@@ -3444,9 +3569,323 @@ mod tests {
         }
     }
 
+    /// A report-only finding gets no evidence file, is counted as such, and costs
+    /// no minimisation. A peer receiving that evidence could only report it.
+    ///
+    /// Both a report-only property (`PathAgreement`, which IS self-verifying, so it
+    /// passes the local-only check) and the report-only idempotence class (settled
+    /// after a rewrite) are covered, since the second is decided per finding.
+    #[test]
+    fn a_report_only_finding_writes_no_evidence_and_is_counted() {
+        let path_agreement = violation_of(ConformanceProperty::PathAgreement);
+        let settled = Violation {
+            settling: Some(IdempotenceSettling::SettledAfter(1)),
+            ..violation_of(ConformanceProperty::StateIdempotence)
+        };
+        for (property, violation, arity) in [
+            (ConformanceProperty::PathAgreement, path_agreement, 2),
+            (ConformanceProperty::StateIdempotence, settled, 1),
+        ] {
+            assert!(
+                property.is_self_verifying(),
+                "{property} must reach the tier check"
+            );
+            let dir = tempfile::tempdir().expect("temp dir");
+            let mut oracle = CountingOracle::default();
+            let case = ConformanceCase::new(
+                property,
+                (0..arity).map(|i| Bytes::from(vec![i as u8; 64])).collect(),
+            );
+            let summary = write_evidence(
+                &dir.path().join("evidence"),
+                ContractInstanceId::new([3u8; 32]),
+                &[],
+                &[(case, PropertyOutcome::Violated(violation))],
+                &mut oracle,
+                &[],
+                &[],
+            )
+            .expect("write evidence");
+            assert_eq!(summary.files_written, 0, "{property}");
+            assert_eq!(summary.findings_report_only, 1, "{property}");
+            assert_eq!(summary.findings_local_only, 0, "{property}");
+            assert_eq!(oracle.calls.get(), 0, "{property}: minimisation ran");
+        }
+    }
+
+    /// Minimisation must not trade a removal-eligible finding for a report-only one
+    /// of the same property and then write it. Short states here settle after one
+    /// rewrite (report-only); the original, longer one never settles. The only
+    /// smaller candidate is short, so a minimiser that kept only the property would
+    /// shrink to it and write report-only evidence counted as written.
+    #[test]
+    fn minimisation_keeps_a_removal_eligible_finding_removal_eligible() {
+        // Same contract as `SettlesOnlyWhenShort` in `freenet::conformance::minimize`'s
+        // tests, which this crate cannot reach; keep the two in step.
+        struct SettlesOnlyWhenShort;
+        impl freenet::conformance::ConformanceOracle for SettlesOnlyWhenShort {
+            fn validate_state(
+                &mut self,
+                _state: &[u8],
+                _related: &RelatedContracts<'_>,
+            ) -> Result<ValidateResult, OracleError> {
+                Ok(ValidateResult::Valid)
+            }
+            fn update_state(
+                &mut self,
+                state: &[u8],
+                _updates: &[UpdateData<'_>],
+            ) -> Result<UpdateModification<'static>, OracleError> {
+                let mut out = state.to_vec();
+                if out.len() > 4 {
+                    out.push(0);
+                } else {
+                    out.sort_unstable();
+                }
+                Ok(UpdateModification::valid(State::from(out)))
+            }
+            fn summarize_state(&mut self, state: &[u8]) -> Result<Vec<u8>, OracleError> {
+                Ok(state.to_vec())
+            }
+            fn get_state_delta(
+                &mut self,
+                state: &[u8],
+                _summary: &[u8],
+            ) -> Result<Vec<u8>, OracleError> {
+                Ok(state.to_vec())
+            }
+        }
+
+        let case = ConformanceCase::new(
+            ConformanceProperty::StateIdempotence,
+            vec![Bytes::from(vec![7u8; 64])],
+        );
+        let outcome = verify_case(&mut SettlesOnlyWhenShort, &case);
+        assert!(
+            outcome
+                .violation()
+                .is_some_and(|v| removal_tier(v) == RemovalTier::RemovalEligible),
+            "fixture: the original must be removal-eligible: {outcome:?}"
+        );
+        let dir = tempfile::tempdir().expect("temp dir");
+        let summary = write_evidence(
+            &dir.path().join("evidence"),
+            ContractInstanceId::new([3u8; 32]),
+            &[],
+            &[(case, outcome)],
+            &mut SettlesOnlyWhenShort,
+            &[Bytes::from(vec![3u8, 2, 1])],
+            &[],
+        )
+        .expect("write evidence");
+        assert_eq!(summary.files_written, 1);
+        assert_eq!(summary.findings_report_only, 0);
+        assert_eq!(
+            summary.input_bytes_after_shrinking, 64,
+            "the case was shrunk to the report-only candidate"
+        );
+    }
+
+    /// The minimized case's own verdict is checked before it is written. A
+    /// contract whose verdict changes between runs (here, flipped by the test)
+    /// can turn a removal-eligible original into a report-only minimized case,
+    /// and evidence of that is evidence no peer may act on: it must be counted as
+    /// report-only, not written.
+    #[test]
+    fn a_minimized_case_that_comes_back_report_only_is_not_written() {
+        struct Flips {
+            sorts: bool,
+        }
+        impl freenet::conformance::ConformanceOracle for Flips {
+            fn validate_state(
+                &mut self,
+                _state: &[u8],
+                _related: &RelatedContracts<'_>,
+            ) -> Result<ValidateResult, OracleError> {
+                Ok(ValidateResult::Valid)
+            }
+            fn update_state(
+                &mut self,
+                state: &[u8],
+                _updates: &[UpdateData<'_>],
+            ) -> Result<UpdateModification<'static>, OracleError> {
+                let mut out = state.to_vec();
+                if self.sorts {
+                    out.sort_unstable();
+                } else {
+                    out.push(0);
+                }
+                Ok(UpdateModification::valid(State::from(out)))
+            }
+            fn summarize_state(&mut self, state: &[u8]) -> Result<Vec<u8>, OracleError> {
+                Ok(state.to_vec())
+            }
+            fn get_state_delta(
+                &mut self,
+                state: &[u8],
+                _summary: &[u8],
+            ) -> Result<Vec<u8>, OracleError> {
+                Ok(state.to_vec())
+            }
+        }
+
+        let case = ConformanceCase::new(
+            ConformanceProperty::StateIdempotence,
+            vec![Bytes::from(vec![3u8, 2, 1])],
+        );
+        let mut oracle = Flips { sorts: false };
+        let outcome = verify_case(&mut oracle, &case);
+        assert!(
+            outcome
+                .violation()
+                .is_some_and(|v| removal_tier(v) == RemovalTier::RemovalEligible),
+            "fixture: the checked outcome must be removal-eligible: {outcome:?}"
+        );
+        oracle.sorts = true;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let summary = write_evidence(
+            &dir.path().join("evidence"),
+            ContractInstanceId::new([3u8; 32]),
+            &[],
+            &[(case, outcome)],
+            &mut oracle,
+            &[],
+            &[],
+        )
+        .expect("write evidence");
+        assert_eq!(summary.files_written, 0, "report-only evidence was written");
+        assert_eq!(summary.findings_report_only, 1);
+    }
+
+    /// A report-only finding still fails the command. The exit code tells an author
+    /// a law broke; what the network does about it is a separate question.
+    #[test]
+    fn exit_code_fails_on_a_report_only_violation() {
+        let outcome = PropertyOutcome::Violated(violation_of(ConformanceProperty::PathAgreement));
+        assert_eq!(exit_code([&outcome]), 1);
+    }
+
+    /// The report counts removal-eligible findings separately and tags each JSON
+    /// finding with its tier.
+    #[test]
+    fn the_report_separates_removal_eligible_from_report_only_findings() {
+        let outcomes = vec![
+            (
+                ConformanceCase::new(ConformanceProperty::StateCommutativity, vec![]),
+                PropertyOutcome::Violated(violation_of(ConformanceProperty::StateCommutativity)),
+            ),
+            (
+                ConformanceCase::new(ConformanceProperty::PathAgreement, vec![]),
+                PropertyOutcome::Violated(violation_of(ConformanceProperty::PathAgreement)),
+            ),
+            (
+                ConformanceCase::new(ConformanceProperty::StateIdempotence, vec![]),
+                PropertyOutcome::Violated(Violation {
+                    settling: Some(IdempotenceSettling::SettledAfter(1)),
+                    ..violation_of(ConformanceProperty::StateIdempotence)
+                }),
+            ),
+        ];
+        let report = Report::build(&Corpus::default(), &outcomes, None, Vec::new());
+        assert_eq!(report.enforceable_violations, 3);
+        assert_eq!(report.removal_eligible_violations, 1);
+        let tiers: Vec<(&str, &str)> = report
+            .findings
+            .iter()
+            .map(|f| (f.property.as_str(), f.tier))
+            .collect();
+        assert_eq!(
+            tiers,
+            vec![
+                ("state_commutativity", "removal_eligible"),
+                ("path_agreement", "report_only"),
+                ("state_idempotence", "report_only"),
+            ]
+        );
+        let json = serde_json::to_string(&report).expect("the report must serialize");
+        assert!(json.contains("\"tier\":\"report_only\""), "{json}");
+        assert!(json.contains("\"removal_eligible_violations\":1"), "{json}");
+
+        // The human report attributes the count: each violation line says its tier.
+        let rendered = render_human(&report);
+        let line = |property: &str| {
+            rendered
+                .lines()
+                .find(|l| l.contains(&format!("] {property} (")))
+                .unwrap_or_else(|| panic!("no finding line for {property}:\n{rendered}"))
+                .to_string()
+        };
+        assert!(
+            line("state_commutativity").contains("[violation, removal-eligible]"),
+            "{rendered}"
+        );
+        assert!(
+            line("path_agreement").contains("[violation, report-only]"),
+            "{rendered}"
+        );
+        assert!(
+            line("state_idempotence").contains("[violation, report-only]"),
+            "{rendered}"
+        );
+    }
+
+    /// Both law-break counts, the finding's severity and its human line read
+    /// severity from the PROPERTY, as `decide` and `exit_code` do, never from the
+    /// `Violation`'s own field. A field claiming `Diagnostic` on a law-break
+    /// property must not drop it from either count or relabel it.
+    #[test]
+    fn the_report_counts_severity_from_the_property() {
+        let outcomes = vec![(
+            ConformanceCase::new(ConformanceProperty::StateCommutativity, vec![]),
+            PropertyOutcome::Violated(Violation {
+                severity: Severity::Diagnostic,
+                ..violation_of(ConformanceProperty::StateCommutativity)
+            }),
+        )];
+        let report = Report::build(&Corpus::default(), &outcomes, None, Vec::new());
+        assert_eq!(
+            (
+                report.enforceable_violations,
+                report.removal_eligible_violations,
+                report.diagnostic_violations
+            ),
+            (1, 1, 0)
+        );
+        // And the line and the JSON say the same thing as the counts.
+        assert_eq!(report.findings[0].severity, "violation");
+        assert!(
+            render_human(&report).contains("[violation, removal-eligible] state_commutativity"),
+            "{}",
+            render_human(&report)
+        );
+    }
+
+    /// A reproduced report-only break says the network would only report it; a
+    /// removal-eligible break and a diagnostic get no such note.
+    #[test]
+    fn verify_evidence_notes_a_reproduced_report_only_law() {
+        assert!(
+            reproduced_tier_note(&violation_of(ConformanceProperty::PathAgreement))
+                .is_some_and(|n| n.contains("report-only"))
+        );
+        let settled = Violation {
+            settling: Some(IdempotenceSettling::SettledAfter(1)),
+            ..violation_of(ConformanceProperty::StateIdempotence)
+        };
+        assert!(reproduced_tier_note(&settled).is_some());
+        assert_eq!(
+            reproduced_tier_note(&violation_of(ConformanceProperty::StateCommutativity)),
+            None
+        );
+        assert_eq!(
+            reproduced_tier_note(&violation_of(ConformanceProperty::DeltaIdempotence)),
+            None
+        );
+    }
+
     /// The exit-code decision is the enforcement boundary: a diagnostic-only
     /// finding (e.g. the wasteful-self-delta checks) must never fail the
-    /// command, only an enforceable `Severity::Violation` finding may.
+    /// command, only a `Severity::Violation` finding may (report-only or not).
     #[test]
     fn exit_code_treats_diagnostic_violation_as_success() {
         // DeltaIdempotence is diagnostic-only: contested, and never removal-eligible.
@@ -3477,7 +3916,27 @@ mod tests {
             left: left.to_string(),
             right: right.to_string(),
             settling: None,
+            tier: "removal_eligible",
         }
+    }
+
+    /// Two findings that differ only in tier are two groups. The human report
+    /// labels each group with one tier, so merging them would label one of the
+    /// two wrongly.
+    #[test]
+    fn group_findings_keeps_findings_of_different_tiers_separate() {
+        let eligible = finding("state_idempotence", "same detail", "a", "b");
+        let report_only = Finding {
+            tier: "report_only",
+            ..finding("state_idempotence", "same detail", "c", "d")
+        };
+        let findings = [eligible, report_only];
+        let groups = group_findings(&findings);
+        assert_eq!(
+            groups.len(),
+            2,
+            "different tiers were merged into one group"
+        );
     }
 
     /// Regression pin: the original grouping keyed on the output digests,
@@ -3542,6 +4001,7 @@ mod tests {
             holds: 4,
             violations: 0,
             enforceable_violations: 0,
+            removal_eligible_violations: 0,
             diagnostic_violations: 0,
             inconclusive: 0,
             findings: Vec::new(),
@@ -4271,7 +4731,7 @@ mod tests {
             (0, 0),
             "a code diagnostic was counted as a merge-law violation; it is about \
              the contract's code, no law was checked, and counting it here makes \
-             it removal-eligible"
+             it fail the command"
         );
         assert_eq!(report.code_diagnostics.len(), 1);
         // `exit_code` reads outcomes, never the report, so no code diagnostic can
@@ -4297,7 +4757,7 @@ mod tests {
         );
         assert!(
             rendered.contains("code diagnostic(s) above"),
-            "'no enforceable violations found.' is the last thing this report \
+            "'no merge-law violations found.' is the last thing this report \
              says, so a contract whose clock call will trap in a future release \
              reads as a clean bill of health:\n{rendered}"
         );

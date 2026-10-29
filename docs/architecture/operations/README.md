@@ -381,13 +381,17 @@ network_bridge.send(target, msg).await?;    // 2. Send message
 
 ### Visited Peers (Privacy-Preserving)
 
-The `VisitedPeers` bloom filter tracks visited peers during GET/SUBSCRIBE:
+The `VisitedPeers` bloom filter tracks visited peers during GET/SUBSCRIBE/CONNECT.
+Its measured false-positive rates (about 1 in 3,700 checks with 10 peers marked)
+are in the `VisitedPeers` docs, along with why they exceed the textbook rate for
+small sets (#5994).
 
-| Peers | False Positive Rate |
-|-------|-------------------|
-| 10 | ~0.006% (1 in 17,000) |
-| 20 | ~0.04% (1 in 2,500) |
-| 30 | ~0.2% (1 in 500) |
+**Cross-release compatibility:** receivers recompute bit indices from the
+transaction id, so every release must derive the same indices. Peers mark a
+superset of the old indices and keep checking the old ones until the repaired
+marking has shipped (`REPAIRED_INDICES_SHIPPED_IN`) and the handshake floor
+reaches `REPAIRED_INDICES_MIN_VERSION`. Raise the floor that far only once
+older releases have left the network.
 
 **Privacy feature:** Hash keys derived from transaction ID, so same peer hashes differently in different transactions.
 

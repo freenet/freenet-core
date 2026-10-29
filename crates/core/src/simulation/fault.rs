@@ -5,6 +5,7 @@
 //! - Latency variation
 //! - Network partitions
 //! - Node crashes
+//! - QUIC-class datagram drops between two peers
 
 use std::{collections::HashSet, net::SocketAddr, ops::Range, time::Duration};
 
@@ -77,6 +78,38 @@ impl Partition {
     }
 }
 
+/// Drops the QUIC-class datagrams between two peers, in both directions,
+/// from a virtual time on. A datagram is QUIC-class when the transport's
+/// demux would hand it to the QUIC endpoint (its first byte, the same
+/// classifier the demux uses); every other datagram between the pair, and
+/// every datagram before `from_nanos`, is delivered as without the rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuicDatagramDrop {
+    /// One peer of the pair.
+    pub a: SocketAddr,
+    /// The other peer of the pair.
+    pub b: SocketAddr,
+    /// Virtual time (nanos) from which the rule drops.
+    pub from_nanos: u64,
+}
+
+impl QuicDatagramDrop {
+    /// A rule for the pair `a`, `b` from virtual time `from_nanos`.
+    pub fn new(a: SocketAddr, b: SocketAddr, from_nanos: u64) -> Self {
+        Self { a, b, from_nanos }
+    }
+
+    /// Whether this rule drops `datagram` sent from `from` to `to` at
+    /// virtual time `now`.
+    pub fn drops(&self, from: &SocketAddr, to: &SocketAddr, datagram: &[u8], now: u64) -> bool {
+        use crate::transport::demux::classify;
+        use crate::transport::metrics::DemuxClass;
+        now >= self.from_nanos
+            && ((*from == self.a && *to == self.b) || (*from == self.b && *to == self.a))
+            && classify(datagram) == DemuxClass::Quic
+    }
+}
+
 /// Configuration for fault injection during simulation.
 #[derive(Debug, Clone)]
 pub struct FaultConfig {
@@ -90,6 +123,8 @@ pub struct FaultConfig {
     pub crashed_nodes: HashSet<SocketAddr>,
     /// Probability of a node crashing per time step
     pub node_crash_rate: f64,
+    /// Rules that drop QUIC-class datagrams between a pair of peers.
+    pub quic_datagram_drops: Vec<QuicDatagramDrop>,
 }
 
 impl Default for FaultConfig {
@@ -100,6 +135,7 @@ impl Default for FaultConfig {
             partitions: Vec::new(),
             crashed_nodes: HashSet::new(),
             node_crash_rate: 0.0,
+            quic_datagram_drops: Vec::new(),
         }
     }
 }
@@ -151,6 +187,25 @@ impl FaultConfig {
         self.partitions
             .iter()
             .any(|p| p.blocks(from, to, current_time))
+    }
+
+    /// Checks if a QUIC-class datagram rule drops `datagram` from `from` to
+    /// `to` at virtual time `now`.
+    pub fn drops_quic_datagram(
+        &self,
+        from: &SocketAddr,
+        to: &SocketAddr,
+        datagram: &[u8],
+        now: u64,
+    ) -> bool {
+        self.quic_datagram_drops
+            .iter()
+            .any(|rule| rule.drops(from, to, datagram, now))
+    }
+
+    /// Adds a rule that drops QUIC-class datagrams between a pair of peers.
+    pub fn add_quic_datagram_drop(&mut self, rule: QuicDatagramDrop) {
+        self.quic_datagram_drops.push(rule);
     }
 
     /// Checks if a node has crashed.
@@ -264,6 +319,12 @@ impl FaultConfigBuilder {
         self
     }
 
+    /// Adds a rule that drops QUIC-class datagrams between a pair of peers.
+    pub fn quic_datagram_drop(mut self, rule: QuicDatagramDrop) -> Self {
+        self.config.quic_datagram_drops.push(rule);
+        self
+    }
+
     /// Builds the FaultConfig.
     pub fn build(self) -> FaultConfig {
         self.config
@@ -277,6 +338,43 @@ mod tests {
 
     fn addr(port: u16) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
+    }
+
+    /// The rule drops only QUIC-class datagrams, only between its pair (both
+    /// directions), and only from its start time.
+    #[test]
+    fn quic_datagram_drop_is_scoped_by_class_pair_and_time() {
+        const T: u64 = 5_000;
+        let config = FaultConfig::builder()
+            .quic_datagram_drop(QuicDatagramDrop::new(addr(1), addr(2), T))
+            .build();
+        // A QUIC long header, a QUIC short header, and the UDP transport's
+        // two type bytes plus one byte that is neither.
+        let (quic_long, quic_short) = ([0xC0u8, 0, 0, 0, 1], [0x40u8, 7, 7]);
+        let (intro, symmetric, other) = ([0x01u8, 9], [0x02u8, 9], [0x00u8, 9]);
+        for (from, to) in [(addr(1), addr(2)), (addr(2), addr(1))] {
+            for now in [T, T + 1, u64::MAX] {
+                assert!(config.drops_quic_datagram(&from, &to, &quic_long, now));
+                assert!(config.drops_quic_datagram(&from, &to, &quic_short, now));
+                for legacy in [&intro[..], &symmetric[..], &other[..], &[]] {
+                    assert!(
+                        !config.drops_quic_datagram(&from, &to, legacy, now),
+                        "{legacy:?} is not QUIC-class"
+                    );
+                }
+            }
+            assert!(
+                !config.drops_quic_datagram(&from, &to, &quic_long, T - 1),
+                "before T nothing is dropped"
+            );
+        }
+        for (from, to) in [(addr(1), addr(3)), (addr(3), addr(2)), (addr(3), addr(4))] {
+            assert!(
+                !config.drops_quic_datagram(&from, &to, &quic_long, T),
+                "{from} -> {to} is not the pair"
+            );
+        }
+        assert!(!FaultConfig::new().drops_quic_datagram(&addr(1), &addr(2), &quic_long, T));
     }
 
     #[test]

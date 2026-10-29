@@ -4030,6 +4030,296 @@ async fn test_delegate_contract_put_and_update(ctx: &mut TestContext) -> TestRes
     Ok(())
 }
 
+/// E2E test for #5488: an UPDATE to a contract a delegate subscribed to runs
+/// that delegate, and the delegate's output reaches the app that subscribed.
+///
+/// **What was uncovered.** The notification path has three legs and no test
+/// crossed all three. `RuntimePool` hands every executor the notification
+/// sender (three sites in `pool.rs`: the first executor, the ones built in the
+/// loop, and a replacement after a worker is rebuilt); the executor's
+/// post-commit fan-out looks up the contract's delegate subscribers and
+/// enqueues one notification each (`send_delegate_contract_notifications`); and
+/// the contract loop takes the receiver and runs the delegate for each
+/// (`handle_delegate_notification`). An executor built without the sender
+/// returns from the fan-out silently, so losing any one of those wiring sites
+/// turns the path into a no-op on the executors it built, with no error
+/// anywhere. This test guards only the first of the three: `pop_executor` hands
+/// out the first free slot, so a sequential single-node run always lands on
+/// slot 0. The loop-built and replacement sites are pinned by
+/// `pool_executors_share_fast_path_caches_and_notification_sender` in `pool.rs`.
+/// `test_delegate_subscribe_reaches_the_network_for_an_unseen_contract` covers
+/// the subscribe being accepted, not notifications then flowing. This is that
+/// second half.
+///
+/// **Why the notification is observable on this socket.** A notification-driven
+/// delegate run has no originating client request to answer, so
+/// `route_notification_outbound` fans the run's residual `ApplicationMessage`s
+/// out through `delegate_app_registry` instead. This client is in that
+/// registry: an app registers by talking to a delegate over a connection that
+/// carries a notification channel, which any `ApplicationMessages` request
+/// does (`client_events.rs`), so the `SubscribeContract` command in step 3 both
+/// creates the subscription and registers the socket that observes it. Only a
+/// local (loopback) registration receives delegate output, which the test
+/// harness's connection is. What
+/// arrives is a `DelegateResponse` holding exactly one value, because
+/// `route_notification_outbound` builds one response per `ApplicationMessage`.
+///
+/// **Isolation from the rest of this binary.** Delegate subscriptions are a
+/// process-global registry keyed by contract instance id, and the app registry
+/// is keyed by delegate key; both are shared by every node in the test binary,
+/// and only plain `cargo test` can see interference through them (nextest's
+/// process-per-test hides it). So this test gives both its contract and its
+/// delegate parameters that no other test uses, which makes its instance id and
+/// its delegate key its own: nothing else here can update the contract it
+/// subscribed to, and its notification cannot land on another test's delegate
+/// socket. Step 5 still matches on the notification's `contract_id` rather than
+/// accepting the first one to arrive, because that check is free and does not
+/// depend on the paragraph above staying true.
+///
+/// **If this test fails, which leg broke.** Step 3 failing means the
+/// subscription was never created, so steps 4 and 5 would be vacuous. Step 5
+/// timing out after step 3 passed and the `UpdateResponse` arrived means the
+/// commit happened and the notification did not: that is the path this test
+/// exists to watch, and it is the shape a lost first-executor wiring site in
+/// `pool.rs` produces.
+#[freenet_test(
+    health_check_readiness = true,
+    nodes = ["gateway"],
+    timeout_secs = 300,
+    startup_wait_secs = 20,
+    tokio_flavor = "multi_thread",
+    tokio_worker_threads = 4
+)]
+async fn test_delegate_is_notified_when_a_subscribed_contract_updates(
+    ctx: &mut TestContext,
+) -> TestResult {
+    const TEST_DELEGATE: &str = "test-delegate-capabilities";
+    const TEST_CONTRACT: &str = "test-contract-integration";
+    // Parameters nobody else in this binary uses, per "Isolation" above.
+    const TEST_PARAMS: &[u8] = b"5488-delegate-notification";
+
+    let contract = load_contract(TEST_CONTRACT, Parameters::from(TEST_PARAMS.to_vec()))?;
+    let contract_key = contract.key();
+    let contract_id = *contract_key.id();
+    let delegate_params = Parameters::from(TEST_PARAMS.to_vec());
+    let delegate = load_delegate(TEST_DELEGATE, delegate_params.clone())?;
+    let delegate_key = delegate.key().clone();
+
+    let gateway = ctx.node("gateway")?;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let uri = gateway.ws_url();
+    let (stream, _) = connect_async(&uri).await?;
+    let mut client = WebApi::start(stream);
+
+    // Step 1: register the delegate.
+    tracing::info!("Step 1: registering delegate");
+    client
+        .send(ClientRequest::DelegateOp(
+            freenet_stdlib::client_api::DelegateRequest::RegisterDelegate {
+                delegate: delegate.clone(),
+                cipher: TEST_DELEGATE_CIPHER,
+                nonce: TEST_DELEGATE_NONCE,
+            },
+        ))
+        .await?;
+    match timeout(Duration::from_secs(30), client.recv()).await?? {
+        HostResponse::DelegateResponse { key, .. } => {
+            ensure!(key == delegate_key, "delegate key mismatch on register");
+        }
+        other @ HostResponse::ContractResponse(_)
+        | other @ HostResponse::QueryResponse(_)
+        | other @ HostResponse::Ok
+        | other @ HostResponse::StreamChunk { .. }
+        | other @ HostResponse::StreamHeader { .. }
+        | other => bail!("unexpected register response: {other:?}"),
+    }
+
+    // Step 2: PUT the contract from the client side, so the delegate subscribes
+    // to state it did not write itself.
+    tracing::info!("Step 2: client PUT of the contract");
+    let initial_state = WrappedState::from(test_utils::create_empty_todo_list());
+    make_put(&mut client, initial_state, contract.clone(), false).await?;
+    loop {
+        match timeout(Duration::from_secs(60), client.recv()).await?? {
+            HostResponse::ContractResponse(ContractResponse::PutResponse { key }) => {
+                ensure!(key == contract_key, "PUT answered for another contract");
+                break;
+            }
+            other @ HostResponse::ContractResponse(_)
+            | other @ HostResponse::DelegateResponse { .. }
+            | other @ HostResponse::QueryResponse(_)
+            | other @ HostResponse::Ok
+            | other @ HostResponse::StreamChunk { .. }
+            | other @ HostResponse::StreamHeader { .. }
+            | other => {
+                tracing::debug!("ignored while awaiting PutResponse: {other:?}")
+            }
+        }
+    }
+
+    // Step 3: the delegate subscribes. Sending this as an ApplicationMessages
+    // request is also what registers this socket as an app of the delegate, so
+    // step 5 has somewhere to be delivered.
+    tracing::info!("Step 3: delegate subscribes to the contract");
+    let subscribe_cmd = DelegateCommand::SubscribeContract { contract_id };
+    client
+        .send(ClientRequest::DelegateOp(
+            freenet_stdlib::client_api::DelegateRequest::ApplicationMessages {
+                key: delegate_key.clone(),
+                params: delegate_params.clone(),
+                inbound: vec![InboundDelegateMsg::ApplicationMessage(
+                    ApplicationMessage::new(bincode::serialize(&subscribe_cmd)?),
+                )],
+            },
+        ))
+        .await?;
+    match timeout(Duration::from_secs(60), client.recv()).await?? {
+        HostResponse::DelegateResponse { key, values } => {
+            ensure!(key == delegate_key, "delegate key mismatch on subscribe");
+            let response = values
+                .iter()
+                .find_map(|v| {
+                    if let OutboundDelegateMsg::ApplicationMessage(msg) = v {
+                        bincode::deserialize::<DelegateCommandResponse>(&msg.payload).ok()
+                    } else {
+                        None
+                    }
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!("no ApplicationMessage in the delegate subscribe response")
+                })?;
+            match response {
+                DelegateCommandResponse::ContractSubscribeResult { success, error, .. } => {
+                    ensure!(
+                        success,
+                        "delegate SUBSCRIBE failed, so steps 4 and 5 would prove nothing: {}",
+                        error.unwrap_or_default()
+                    );
+                }
+                other @ DelegateCommandResponse::ContractState { .. }
+                | other @ DelegateCommandResponse::MultipleContractStates { .. }
+                | other @ DelegateCommandResponse::Echo { .. }
+                | other @ DelegateCommandResponse::ContractPutResult { .. }
+                | other @ DelegateCommandResponse::ContractUpdateResult { .. }
+                | other @ DelegateCommandResponse::ContractNotificationReceived { .. }
+                | other @ DelegateCommandResponse::Error { .. } => {
+                    bail!("expected ContractSubscribeResult, got {other:?}")
+                }
+            }
+        }
+        other @ HostResponse::ContractResponse(_)
+        | other @ HostResponse::QueryResponse(_)
+        | other @ HostResponse::Ok
+        | other @ HostResponse::StreamChunk { .. }
+        | other @ HostResponse::StreamHeader { .. }
+        | other => bail!("unexpected subscribe response: {other:?}"),
+    }
+
+    // Step 4: update the contract from the client side. This is the commit the
+    // delegate must hear about, and it reaches the fan-out through the ordinary
+    // UPDATE path rather than through anything delegate-specific.
+    tracing::info!("Step 4: client UPDATE of the subscribed contract");
+    let updated_bytes = test_utils::create_todo_list_with_item("notification for #5488");
+    make_update(
+        &mut client,
+        contract_key,
+        WrappedState::from(updated_bytes.clone()),
+    )
+    .await?;
+
+    // Step 5: the notification. The UpdateResponse and the notification are two
+    // independent arrivals on one socket with no guaranteed order, so receive
+    // until the notification shows up and record whether the commit was
+    // acknowledged, which is what distinguishes "the update never happened" from
+    // "the update happened and nothing was notified".
+    tracing::info!("Step 5: awaiting the delegate's contract notification");
+    let mut update_acknowledged = false;
+    let notified_state = loop {
+        let next = match timeout(Duration::from_secs(60), client.recv()).await {
+            Ok(res) => res?,
+            Err(_) => bail!(
+                "no ContractNotificationReceived within 60s of the UPDATE \
+                 (update_acknowledged={update_acknowledged}). With the subscribe \
+                 confirmed in step 3, an acknowledged update and no notification \
+                 means the commit did not reach the delegate: the executor's \
+                 notification sender is unwired, the fan-out found no subscriber, \
+                 the contract loop never ran the delegate, or its output was not \
+                 routed to this socket through the app registry"
+            ),
+        };
+        match next {
+            HostResponse::ContractResponse(ContractResponse::UpdateResponse { key, .. }) => {
+                ensure!(key == contract_key, "UPDATE answered for another contract");
+                update_acknowledged = true;
+            }
+            HostResponse::DelegateResponse { key, values } => {
+                ensure!(
+                    key == delegate_key,
+                    "a notification arrived for delegate {key}, which is not this \
+                     test's delegate"
+                );
+                ensure!(
+                    values.len() == 1,
+                    "route_notification_outbound builds one response per \
+                     ApplicationMessage, so a notification carries exactly one \
+                     value; got {}",
+                    values.len()
+                );
+                let Some(OutboundDelegateMsg::ApplicationMessage(msg)) = values.first() else {
+                    bail!("notification carried something other than an ApplicationMessage");
+                };
+                match bincode::deserialize::<DelegateCommandResponse>(&msg.payload)? {
+                    DelegateCommandResponse::ContractNotificationReceived {
+                        contract_id: notified_id,
+                        new_state,
+                    } => {
+                        ensure!(
+                            notified_id == contract_id,
+                            "notification for contract {notified_id}, expected \
+                             {contract_id}"
+                        );
+                        break new_state;
+                    }
+                    other @ DelegateCommandResponse::ContractState { .. }
+                    | other @ DelegateCommandResponse::MultipleContractStates { .. }
+                    | other @ DelegateCommandResponse::Echo { .. }
+                    | other @ DelegateCommandResponse::ContractPutResult { .. }
+                    | other @ DelegateCommandResponse::ContractUpdateResult { .. }
+                    | other @ DelegateCommandResponse::ContractSubscribeResult { .. }
+                    | other @ DelegateCommandResponse::Error { .. } => {
+                        bail!("expected ContractNotificationReceived, got {other:?}")
+                    }
+                }
+            }
+            other @ HostResponse::ContractResponse(_)
+            | other @ HostResponse::QueryResponse(_)
+            | other @ HostResponse::Ok
+            | other @ HostResponse::StreamChunk { .. }
+            | other @ HostResponse::StreamHeader { .. }
+            | other => {
+                tracing::debug!("ignored while awaiting the notification: {other:?}")
+            }
+        }
+    };
+
+    // The delegate is handed the committed state, so what it reports back must
+    // be the state the UPDATE installed. Asserting the bytes is what makes this
+    // a test of the notification's CONTENT and not just of its arrival.
+    let notified: test_utils::TodoList = serde_json::from_slice(&notified_state)?;
+    ensure!(
+        notified.tasks.len() == 1 && notified.tasks[0].title == "notification for #5488",
+        "the notified state is not the state the UPDATE installed: {notified:?}"
+    );
+    ensure!(
+        notified_state == updated_bytes,
+        "the notified state differs from the state the UPDATE installed"
+    );
+
+    tracing::info!("Delegate contract notification E2E test passed");
+    Ok(())
+}
+
 /// E2E test: delegate issues GET to retrieve a contract's state.
 ///
 /// This test verifies:
@@ -4671,13 +4961,16 @@ async fn test_delegate_get_reaches_the_network_for_an_unseen_contract(
 /// **What this establishes, and what it does not.** It establishes that the
 /// gate is open and the subscribe is reported successful. It does NOT establish
 /// that notifications subsequently flow: that needs an update on another peer
-/// observed arriving at this delegate, and a notification-driven delegate run
-/// routes its output through the app registry rather than back to this client,
-/// so it is not observable on this socket. That second half is exactly why
-/// `run_executor_subscribe` is the right entry point — it bootstraps the body,
-/// registers demand AND establishes the network subscription, where the old arm
-/// did none of the three — and it deserves its own test rather than an
-/// assertion this one cannot make. Said plainly, because "subscribe returned
+/// observed arriving at this delegate, which this test does not make. That
+/// cross-peer half is exactly why `run_executor_subscribe` is the right entry
+/// point — it bootstraps the body, registers demand AND establishes the network
+/// subscription, where the old arm did none of the three — and it deserves its
+/// own test rather than an assertion this one cannot make. (The delegate's
+/// output would reach this socket: a notification-driven run is delivered
+/// through the app registry, which this client joined by sending
+/// `ApplicationMessages`. The single-node case is covered by
+/// `test_delegate_is_notified_when_a_subscribed_contract_updates`.) Said
+/// plainly, because "subscribe returned
 /// Ok" reading as "the delegate will now hear about changes" is precisely the
 /// silent failure #5467 describes.
 #[freenet_test(

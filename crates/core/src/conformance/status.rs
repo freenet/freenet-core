@@ -121,7 +121,9 @@ pub struct MergeFinding {
     /// The law that was broken, e.g. `state_commutativity`.
     pub property: &'static str,
     /// `Diagnostic` means the contract is legal but wasteful. `Violation` means it
-    /// broke an algebraic law and would be removal-eligible under enforcement.
+    /// broke an algebraic law. Whether that law may lead to a removal is a separate
+    /// question (`policy::removal_tier`), and its answer for this finding is
+    /// `would_remove`.
     ///
     /// It does NOT mean "cannot converge". That was true when every `Violation` was
     /// a divergence, and `state_idempotence` now reports a class that converges: a
@@ -256,15 +258,30 @@ impl CheckedContract {
             // non-convergent one on the same contract — the operator would read
             // "settles after a rewrite" for a contract that also never settles.
             //
-            // So the SERIOUS classification wins the slot, and an unknown one
-            // outranks a benign one because it has not been shown to be benign.
-            if settling_rank(finding.settling) > settling_rank(existing.settling) {
+            // So the SERIOUS finding wins the slot: one that would remove outranks
+            // one that would not, then the settling class decides, and an unknown
+            // class outranks a benign one because it has not been shown to be
+            // benign. Same order as `shadow::LoggedSeverity`, so the log and the
+            // dashboard name the same finding.
+            //
+            // The winner supplies BOTH fields. Taking the decision from one finding
+            // and the class from another could render "settles after a rewrite
+            // (report-only)" beside "Would remove: yes". Since `would_remove` leads
+            // the order, the kept decision is still true if any finding's was.
+            if slot_rank(&finding) > slot_rank(existing) {
                 existing.settling = finding.settling;
+                existing.would_remove = finding.would_remove;
             }
             return;
         }
         self.findings.insert(0, finding);
     }
+}
+
+/// The order in which [`CheckedContract::note_finding`] picks the finding that
+/// keeps a slot: the decision first, then [`settling_rank`].
+fn slot_rank(finding: &MergeFinding) -> (bool, u8) {
+    (finding.would_remove, settling_rank(finding.settling))
 }
 
 /// How much a settling classification should outrank another for the one slot a
@@ -274,9 +291,9 @@ impl CheckedContract {
 /// partly to keep it that way. This orders how much a reader NEEDS to see it when
 /// two findings for one property must collapse to one: an unknown class outranks a
 /// benign one because it has not been shown benign, and a never-settling class
-/// outranks both because it is the case enforcement can act on without waiting for
-/// the install path.
-fn settling_rank(settling: Option<IdempotenceSettling>) -> u8 {
+/// outranks both because it is the case enforcement can act on. The benign class,
+/// `SettledAfter`, is report-only (`policy::removal_tier`).
+pub(crate) fn settling_rank(settling: Option<IdempotenceSettling>) -> u8 {
     match settling {
         Some(IdempotenceSettling::NeverSettled) => 3,
         Some(IdempotenceSettling::Indeterminate) => 2,
@@ -701,12 +718,25 @@ mod tests {
                 Some(IdempotenceSettling::Indeterminate),
                 Some(IdempotenceSettling::Indeterminate),
             ),
+            // Same decision: the settling class alone decides.
+            (
+                Some(IdempotenceSettling::Indeterminate),
+                Some(IdempotenceSettling::NeverSettled),
+                Some(IdempotenceSettling::NeverSettled),
+            ),
         ] {
             let mut record = CheckedContract::new(instance(1), 1, 0, Instant::now());
+            // Each fixture carries the decision `policy::removal_tier` gives its
+            // class: a settled finding is report-only.
+            let settled = |s: Option<IdempotenceSettling>| {
+                matches!(s, Some(IdempotenceSettling::SettledAfter(_)))
+            };
             let mut a = finding(1, "state_idempotence");
             a.settling = first;
+            a.would_remove = !settled(first);
             let mut b = finding(1, "state_idempotence");
             b.settling = second;
+            b.would_remove = !settled(second);
             record.note_finding(a);
             record.note_finding(b);
 
@@ -715,6 +745,87 @@ mod tests {
             assert_eq!(
                 kept[0].settling, expected,
                 "arrived {first:?} then {second:?}; the slot must hold {expected:?}"
+            );
+        }
+    }
+
+    /// The kept slot says "would remove" if ANY finding for that property did.
+    ///
+    /// A settled idempotence finding is report-only and a never-settling one is
+    /// not, so the two arrive with different `would_remove`. Keeping the first
+    /// arrival's value would render a never-settling contract as "would remove:
+    /// no" next to a "never settles" label whenever the settled case came first.
+    #[test]
+    fn deduplication_keeps_would_remove_if_any_finding_would_remove() {
+        for settled_first in [true, false] {
+            let mut record = CheckedContract::new(instance(1), 1, 0, Instant::now());
+            let mut settled = finding(1, "state_idempotence");
+            settled.settling = Some(IdempotenceSettling::SettledAfter(1));
+            settled.would_remove = false;
+            let mut never = finding(1, "state_idempotence");
+            never.settling = Some(IdempotenceSettling::NeverSettled);
+            never.would_remove = true;
+            if settled_first {
+                record.note_finding(settled);
+                record.note_finding(never);
+            } else {
+                record.note_finding(never);
+                record.note_finding(settled);
+            }
+            let kept = record.findings();
+            assert_eq!(kept.len(), 1);
+            assert!(
+                kept[0].would_remove,
+                "settled_first={settled_first}: the never-settling finding's decision was lost"
+            );
+            assert_eq!(
+                kept[0].settling,
+                Some(IdempotenceSettling::NeverSettled),
+                "settled_first={settled_first}: the slot must describe the finding \
+                 whose decision it shows"
+            );
+        }
+        // And report-only findings alone stay report-only.
+        let mut record = CheckedContract::new(instance(1), 1, 0, Instant::now());
+        for _ in 0..2 {
+            let mut f = finding(1, "path_agreement");
+            f.would_remove = false;
+            record.note_finding(f);
+        }
+        assert!(!record.findings()[0].would_remove);
+    }
+
+    /// The kept slot takes its decision AND its settling class from one finding,
+    /// so a row can never pair "settles after a rewrite (report-only)" with
+    /// "would remove: yes".
+    ///
+    /// Not reachable from today's policy, which never gives a settled finding a
+    /// would-remove decision; the mixed pair here is a removal-eligible finding
+    /// with no settling class against a settled report-only one. Under the old
+    /// rule (class by settling rank, decision by OR) the slot read SettledAfter
+    /// with would_remove = true in both orders.
+    #[test]
+    fn deduplication_takes_the_decision_and_class_from_the_same_finding() {
+        for settled_first in [true, false] {
+            let mut record = CheckedContract::new(instance(1), 1, 0, Instant::now());
+            let mut settled = finding(1, "state_idempotence");
+            settled.settling = Some(IdempotenceSettling::SettledAfter(1));
+            settled.would_remove = false;
+            let mut unclassified = finding(1, "state_idempotence");
+            unclassified.settling = None;
+            unclassified.would_remove = true;
+            if settled_first {
+                record.note_finding(settled);
+                record.note_finding(unclassified);
+            } else {
+                record.note_finding(unclassified);
+                record.note_finding(settled);
+            }
+            let kept = &record.findings()[0];
+            assert_eq!(
+                (kept.would_remove, kept.settling),
+                (true, None),
+                "settled_first={settled_first}"
             );
         }
     }

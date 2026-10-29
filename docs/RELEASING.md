@@ -383,6 +383,29 @@ Current wire-gated floors:
   `untracked_noop_floor_stays_above_every_release_that_tracks_noops` catches
   the floor being lowered.
 
+- `REPAIRED_INDICES_MIN_VERSION` in
+  `crates/core/src/operations/visited_peers.rs` (visited-peers bloom
+  index repair, #5994). Not a wire variant and not a per-peer gate: peers mark
+  the repaired bloom indices (a superset of the old ones) from this release on,
+  and switch their CHECK to them only once this node's handshake floor
+  (`min-compatible-version`) reaches it, because a filter mixes bits from every
+  release on the path.
+
+  Set to **`(0, 2, 151)`** and guarded by `REPAIRED_INDICES_SHIPPED_IN`,
+  now `Some((0, 2, 151))` (the repaired marking shipped in 0.2.151), checked by
+  `visited_peers::tests::repaired_indices_floor_tracks_the_shipping_release`.
+  When the 0.2.151 bump fails that test, set the marker to
+  `Some(REPAIRED_INDICES_MIN_VERSION)` if the release carries #5994's fix,
+  otherwise raise the floor. Failure mode of a floor that is too LOW: once the
+  handshake floor passes it, peers test bloom bits that the release just
+  below never set, read visited peers as unvisited and route requests back to
+  them. Bias high. If you raise it, move `LAST_RELEASE_WITHOUT` in
+  `repaired_indices_floor_stays_above_every_release_without_it` (which catches
+  the floor being lowered) to the release that lacked the fix. The repaired
+  check takes effect only when someone raises `min-compatible-version` to at
+  least this value, which should wait until older releases have left the
+  network; see "Check what the raise switches on" below.
+
 - `BROADCAST_TARGET_LIST_MIN_VERSION` in
   `crates/core/src/node/network_bridge/p2p_protoc.rs` — the originator target
   list on contract broadcasts (#5147).
@@ -795,6 +818,12 @@ Before raising it:
 - **Expect a gradual effect.** Peers still on older releases keep accepting
   the refused versions until they update, so the refusal reaches the whole
   network only as the release spreads.
+- **Check what the raise switches on.** A floor at or above
+  `REPAIRED_INDICES_MIN_VERSION` switches visited-peers lookups to the repaired
+  bloom indices (see the wire-gated floors above), which is safe only once
+  releases before it have left the network.
+  `visited_peers::tests::repaired_check_is_a_decision_not_a_side_effect` fails
+  until `REPAIRED_CHECK_FLOOR_CONFIRMED` is set.
 
 ## Rollback
 

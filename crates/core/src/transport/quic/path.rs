@@ -47,11 +47,26 @@
 //! neither event (`reset_acked` emits none), so each locally reset stream
 //! leaves one entry until the connection closes. Every send registers
 //! (its writes race `stopped()`), so the entries are bounded by the sends
-//! aborted on the connection over its lifetime (a source that failed, a
-//! cancelled send, a stop answered with a reset). e5 constraint: a
-//! connection that aborts sends without limit grows without limit, so it
-//! must be recycled or the abort rate bounded. Worth an upstream quinn
-//! issue (not filed).
+//! this side reset on the connection over its lifetime (a source that
+//! failed, a cancelled send). A stop the peer sent is reported as Stopped
+//! and removes its entry, so answering it with a reset adds none. The path
+//! counts its resets and closes the connection past
+//! [`recycle::SEND_ABORT_LIMIT`] (`close_code::SEND_ABORT_LIMIT`), so the
+//! peer falls back to UDP and a new connection starts with an empty map. A
+//! write that fails because the peer stopped the stream is not a reset of
+//! this side's and is not counted.
+//! Worth an upstream quinn issue (not filed).
+//!
+//! The receive task also runs the path's acknowledgement watch
+//! ([`recycle::watch_acknowledgements`]): a peer that keeps sending but
+//! acknowledges none of our packets is not a conforming QUIC peer (RFC 9000
+//! 13.2.1 requires acknowledging ack-eliciting packets within
+//! max_ack_delay), so the path is closed (`close_code::PEER_NOT_ACKNOWLEDGING`).
+//!
+//! Both recycle codes ask the peer to fall back to UDP for this connection
+//! only, not for good. e5 constraint: after either, the pair may upgrade
+//! again after its normal re-upgrade backoff; neither side may treat the
+//! code as a permanent downgrade of the peer.
 //!
 //! Receiving: one task per connection accepts every uni stream and reads all
 //! of them concurrently (no task per stream), parsing the header and then:
@@ -90,20 +105,22 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
-use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
 use super::QuicConnection;
 use super::framing::{FrameHeader, HeaderError};
 use super::identity::PeerKey;
+use super::recycle::{self, SendAborts};
 use crate::config::GlobalExecutor;
 use crate::simulation::TimeSource;
 use crate::transport::StreamId;
 use crate::transport::metrics::{InboundStreamOutcome, QuicCloseCode};
 use crate::transport::peer_connection::embeds_metadata;
-use crate::transport::peer_connection::inbound_budget::InboundStreamBudget;
+use crate::transport::peer_connection::inbound_budget::SharedInboundBudget;
+use crate::transport::peer_connection::streaming::StreamError;
+#[cfg(test)]
 use crate::transport::peer_connection::streaming::{
-    MAX_INBOUND_STREAM_BYTES_PER_CONNECTION, MAX_INBOUND_STREAMS_PER_CONNECTION, StreamError,
+    MAX_INBOUND_STREAM_BYTES_PER_CONNECTION, MAX_INBOUND_STREAMS_PER_CONNECTION,
 };
 
 pub(crate) use inbound::{InboundShort, InboundStreamArrival};
@@ -160,37 +177,55 @@ pub(crate) mod reset_code {
 
 /// Capacity of [`QuicInbound::shorts`]. Each queued message still holds its
 /// inbound budget charge, so the budget bounds the bytes queued.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const SHORT_CHANNEL_CAPACITY: usize = 256;
 /// Capacity of [`QuicInbound::streams`]. Each queued stream holds its charge.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const STREAM_CHANNEL_CAPACITY: usize = 256;
 /// Capacity of [`QuicInbound::controls`]; control frames are at most
 /// `MAX_CONTROL_BYTES` each.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const CONTROL_CHANNEL_CAPACITY: usize = 16;
 
 /// The receive-side limits of a path.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct QuicPathLimits {
-    /// Inbound streams (Short and Stream) holding a budget charge at once.
+    /// Inbound streams (Short and Stream) holding a budget charge at once,
+    /// for the test-only [`QuicPath::with_limits`], which gives the path a
+    /// budget of its own. A node path ([`QuicPath::with_budget`]) takes its
+    /// limits from the budget, so this field does not exist outside tests.
+    #[cfg(test)]
     pub(crate) max_streams: usize,
-    /// Bytes of inbound budget charges at once.
+    /// Bytes of inbound budget charges at once; see `max_streams`.
+    #[cfg(test)]
     pub(crate) max_bytes: u64,
     pub(crate) short_capacity: usize,
     pub(crate) stream_capacity: usize,
     pub(crate) control_capacity: usize,
+    /// Sends this side may reset before the path is closed
+    /// ([`recycle::SEND_ABORT_LIMIT`]).
+    pub(crate) max_send_aborts: u64,
     /// The receive task panics on its first stream (supervisor test).
     #[cfg(test)]
     pub(crate) panic_in_receive: bool,
 }
 
 impl QuicPathLimits {
-    /// The UDP transport's per-connection inbound limits and the channel
-    /// capacities above.
+    /// The channel capacities above, and for a test path with a budget of
+    /// its own, inbound limits equal to one peer's UDP allowance
+    /// (`MAX_INBOUND_STREAMS_PER_CONNECTION`,
+    /// `MAX_INBOUND_STREAM_BYTES_PER_CONNECTION`). A node path built with
+    /// [`QuicPath::with_budget`] takes its inbound limits from the budget.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) const DEFAULT: Self = Self {
+        #[cfg(test)]
         max_streams: MAX_INBOUND_STREAMS_PER_CONNECTION,
+        #[cfg(test)]
         max_bytes: MAX_INBOUND_STREAM_BYTES_PER_CONNECTION,
         short_capacity: SHORT_CHANNEL_CAPACITY,
         stream_capacity: STREAM_CHANNEL_CAPACITY,
         control_capacity: CONTROL_CHANNEL_CAPACITY,
+        max_send_aborts: recycle::SEND_ABORT_LIMIT,
         #[cfg(test)]
         panic_in_receive: false,
     };
@@ -380,8 +415,10 @@ pub(crate) struct QuicPath {
     connection: QuicConnection,
     stats: Arc<QuicPathStats>,
     receive: tokio::task::JoinHandle<()>,
+    /// Sends this side reset; closes the connection past the limit.
+    aborts: Arc<SendAborts>,
     #[cfg(test)]
-    budget: Arc<Mutex<InboundStreamBudget>>,
+    budget: SharedInboundBudget,
 }
 
 impl std::fmt::Debug for QuicPath {
@@ -399,38 +436,83 @@ impl Drop for QuicPath {
 }
 
 impl QuicPath {
-    /// A path over `connection` with the default limits. `time` drives the
-    /// idle and age limits of inbound streams; use the clock quinn runs on.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// A path over `connection` with the default limits and a budget of its
+    /// own. Tests only; nodes must use [`Self::with_budget`]. `time` drives
+    /// the idle and age limits of inbound streams; use the clock quinn runs
+    /// on.
+    #[cfg(test)]
     pub(crate) fn new<T: TimeSource>(connection: QuicConnection, time: T) -> (Self, QuicInbound) {
         Self::with_limits(connection, time, QuicPathLimits::DEFAULT)
     }
 
     /// [`Self::new`] with given limits.
     ///
-    /// The path has its own inbound budget, sized like the UDP transport's
-    /// per-connection one. A peer with both a UDP session and a QUIC path
-    /// may therefore hold up to twice the per-connection allowance; e5 must
-    /// resolve that before QUIC carries traffic (the QUIC memory gate). Do
-    /// not hand this budget's keys to the UDP side as they are: short
-    /// messages are charged under ids this path picks (see `inbound`),
-    /// which could equal a UDP transport-internal id.
+    /// Tests only; nodes must use [`Self::with_budget`]. The path has its
+    /// own inbound budget of `limits.max_streams` and `limits.max_bytes`, so
+    /// a peer that also had a UDP session would hold two allowances.
+    #[cfg(test)]
     pub(crate) fn with_limits<T: TimeSource>(
         connection: QuicConnection,
         time: T,
         limits: QuicPathLimits,
     ) -> (Self, QuicInbound) {
+        let budget = SharedInboundBudget::new(limits.max_streams, limits.max_bytes);
+        Self::with_budget(connection, time, limits, budget)
+    }
+
+    /// [`Self::with_limits`], charging inbound streams to `budget` instead
+    /// of a budget of its own: pass the peer's UDP connection's
+    /// (`PeerConnection::inbound_budget`), so the peer has one reassembly
+    /// allowance across both paths (the QUIC memory gate). `budget` brings
+    /// its own limits; `limits.max_streams` and `limits.max_bytes` are not
+    /// used. The path's charges are keyed `InboundKey::Quic` and
+    /// `InboundKey::QuicShort`, so they never meet or release a UDP charge
+    /// (its admission releases gone QUIC charges only; see
+    /// `inbound_budget::Releaser`).
+    ///
+    /// For e5, the effects of sharing across the two paths' lifetimes:
+    /// - Two QUIC paths on one budget at once (a replacement built before
+    ///   the old one is gone) share the `Quic` namespace: a stream id held
+    ///   by one is refused on the other as `StreamIdInUse`.
+    /// - If the UDP `PeerConnection` is replaced (reconnect or fallback)
+    ///   while this path lives, the new connection gets a fresh budget and
+    ///   the peer has two allowances again. Hand the path the new handle or
+    ///   rebuild it on the new connection's budget.
+    /// - A UDP stream refused because this path filled the budget is
+    ///   remembered as refused (`RefusedStreams`), and
+    ///   `MAX_REMEMBERED_REFUSALS` outstanding refusals close the UDP
+    ///   connection. That is UDP's own overload behaviour, but now the other
+    ///   path can cause it.
+    /// - A QUIC charge whose consumer never lets go blocks UDP admissions
+    ///   too: the UDP sweep evicts only UDP streams, and the QUIC path's own
+    ///   eviction cannot end a charge a consumer still holds.
+    /// - A gone UDP charge holds room against this path until the UDP
+    ///   connection's next 5 s `timeout_check` sweep (or its own admission
+    ///   under pressure), so this path can refuse with `BUDGET_REFUSED` for
+    ///   up to about 5 s on room that is free.
+    /// - The path may close itself (`recycle`: `close_code::SEND_ABORT_LIMIT`
+    ///   or `close_code::PEER_NOT_ACKNOWLEDGING`). That is a request to fall
+    ///   back to UDP for this connection, not a permanent downgrade: e5 must
+    ///   allow a new upgrade after its normal backoff.
+    /// - The shared `Arc` outlives either owner: this path keeps the UDP
+    ///   connection's charges (and their room) after the `PeerConnection`
+    ///   drops, and gone UDP charges are then released by nobody, since a
+    ///   QUIC path never releases a UDP charge. Do not keep a path on the
+    ///   handle of a connection that has gone.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(in crate::transport) fn with_budget<T: TimeSource>(
+        connection: QuicConnection,
+        time: T,
+        limits: QuicPathLimits,
+        budget: SharedInboundBudget,
+    ) -> (Self, QuicInbound) {
         let stats = Arc::new(QuicPathStats::new());
         let (shorts_tx, shorts) = mpsc::channel(limits.short_capacity);
         let (streams_tx, streams) = mpsc::channel(limits.stream_capacity);
         let (controls_tx, controls) = mpsc::channel(limits.control_capacity);
-        let budget = Arc::new(Mutex::new(InboundStreamBudget::new(
-            limits.max_streams,
-            limits.max_bytes,
-        )));
         #[cfg_attr(not(test), allow(unused_mut))]
         let mut receiver = inbound::Receiver::new(
-            time,
+            time.clone(),
             budget.clone(),
             stats.clone(),
             shorts_tx,
@@ -441,17 +523,21 @@ impl QuicPath {
         {
             receiver.panic_on_stream = limits.panic_in_receive;
         }
+        let aborts = Arc::new(SendAborts::new(limits.max_send_aborts, connection.closer()));
         let receive = GlobalExecutor::spawn(supervise_receive(
             connection.inner().clone(),
             connection.closer(),
             Arc::new(receiver),
             stats.clone(),
+            time,
+            connection.cap_holds(),
         ));
         (
             Self {
                 connection,
                 stats,
                 receive,
+                aborts,
                 #[cfg(test)]
                 budget,
             },
@@ -475,17 +561,24 @@ impl QuicPath {
         &self.stats
     }
 
-    /// Streams and bytes charged to the inbound budget, after releasing the
-    /// charges of streams whose state is gone.
+    /// Sends this side reset on this path so far.
+    #[cfg(test)]
+    pub(crate) fn send_aborts(&self) -> u64 {
+        self.aborts.count()
+    }
+
+    /// Streams and bytes charged to the inbound budget (peer-wide when the
+    /// budget is shared), after releasing the gone QUIC charges.
     #[cfg(test)]
     pub(crate) fn charged(&self) -> (usize, u64) {
         let mut budget = self.budget.lock();
-        budget.release_gone();
+        budget.release_gone(crate::transport::peer_connection::inbound_budget::Releaser::Quic);
         (budget.stream_count(), budget.charged_bytes())
     }
 
-    /// Streams charged right now, WITHOUT releasing gone charges first: what
-    /// the receive side itself released.
+    /// Streams charged right now (peer-wide when the budget is shared),
+    /// WITHOUT releasing gone charges first: what the receive side itself
+    /// released.
     #[cfg(test)]
     pub(crate) fn charged_streams_now(&self) -> usize {
         self.budget.lock().stream_count()
@@ -597,7 +690,10 @@ impl QuicPath {
     /// stream credit when the peer's [`super::config::MAX_UNI_STREAMS`] are
     /// in use.
     async fn open(&self, header: &FrameHeader, metadata: &[u8]) -> Result<Outgoing, QuicSendError> {
-        let mut send = Outgoing::new(self.connection.inner().open_uni().await?);
+        let mut send = Outgoing::new(
+            self.connection.inner().open_uni().await?,
+            self.aborts.clone(),
+        );
         send.write_all(&header.encode()).await?;
         if !metadata.is_empty() {
             send.write_all(metadata).await?;
@@ -629,16 +725,44 @@ fn frame_metadata(metadata: Option<&[u8]>) -> &[u8] {
 /// `close_code::DOWNGRADE`: the QUIC path is broken on this side, and the
 /// peer should fall back to the UDP session. Dropping the path aborts this
 /// task, which is not counted.
+///
+/// The path's acknowledgement watch ([`recycle::watch_acknowledgements`])
+/// runs beside it in this task, with its own panic containment: a panic in
+/// the watch is logged and the receive task goes on. When the watch closes
+/// the connection, the receive task then ends as the connection does.
 async fn supervise_receive<T: TimeSource>(
     connection: quinn::Connection,
     closer: super::QuicCloser,
     receiver: Arc<inbound::Receiver<T>>,
     stats: Arc<QuicPathStats>,
+    time: T,
+    cap_holds: Arc<super::socket::CapHolds>,
 ) {
     use futures::FutureExt;
-    let ended = std::panic::AssertUnwindSafe(inbound::receive(connection.clone(), receiver))
-        .catch_unwind()
-        .await;
+    let mut receive = std::pin::pin!(
+        std::panic::AssertUnwindSafe(inbound::receive(connection.clone(), receiver)).catch_unwind()
+    );
+    let watch = std::panic::AssertUnwindSafe(recycle::watch_acknowledgements(
+        connection.clone(),
+        closer.clone(),
+        time,
+        cap_holds,
+    ))
+    .catch_unwind();
+    let ended = tokio::select! {
+        ended = &mut receive => ended,
+        watched = watch => {
+            if watched.is_err() {
+                // The path still works; only guard 2 is gone for it.
+                tracing::error!(
+                    remote = %connection.remote_address(),
+                    "QUIC path: the acknowledgement watch panicked; the path stays \
+                     up without it"
+                );
+            }
+            receive.await
+        }
+    };
     if ended.is_err() {
         stats.record(QuicInboundOutcome::ReceiveTaskPanicked);
         tracing::error!(
@@ -666,17 +790,20 @@ struct Outgoing {
     stopped: Pin<Box<dyn Future<Output = StoppedResult> + Send + Sync>>,
     /// Finished or reset: dropping it then sends nothing more.
     closed: bool,
+    /// The path's count of sends reset on this side.
+    aborts: Arc<SendAborts>,
 }
 
 type StoppedResult = Result<Option<quinn::VarInt>, quinn::StoppedError>;
 
 impl Outgoing {
-    fn new(send: quinn::SendStream) -> Self {
+    fn new(send: quinn::SendStream, aborts: Arc<SendAborts>) -> Self {
         let stopped = Box::pin(send.stopped());
         Self {
             send,
             stopped,
             closed: false,
+            aborts,
         }
     }
 
@@ -698,7 +825,7 @@ impl Outgoing {
             written = send.write_all(buf) => written,
             result = stopped => return Err(self.stopped_early(result)),
         };
-        written.map_err(Into::into)
+        self.written(written)
     }
 
     async fn write_chunk(&mut self, chunk: Bytes) -> Result<(), QuicSendError> {
@@ -707,7 +834,25 @@ impl Outgoing {
             written = send.write_chunk(chunk) => written,
             result = stopped => return Err(self.stopped_early(result)),
         };
-        written.map_err(Into::into)
+        self.written(written)
+    }
+
+    /// The outcome of a write. A stop the peer sent is handled as in
+    /// [`Self::stopped_early`]: on STOP_SENDING both the write and the
+    /// `stopped` future become ready, and `select!` may pick the write.
+    /// Returned through `?` instead, the stream would be left open and
+    /// `Drop` would reset it as an abort of this side's own
+    /// ([`SendAborts`]), which it is not.
+    fn written(&mut self, written: Result<(), quinn::WriteError>) -> Result<(), QuicSendError> {
+        match written {
+            Ok(()) => Ok(()),
+            Err(quinn::WriteError::Stopped(code)) => Err(self.stopped_early(Ok(Some(code)))),
+            Err(
+                error @ (quinn::WriteError::ConnectionLost(_)
+                | quinn::WriteError::ClosedStream
+                | quinn::WriteError::ZeroRttRejected),
+            ) => Err(error.into()),
+        }
     }
 
     /// The peer stopped the stream (or the connection ended) mid-write:
@@ -731,10 +876,16 @@ impl Outgoing {
         self.reset(code);
     }
 
+    /// Reset the stream on this side, and count it ([`SendAborts`]) if the
+    /// reset was sent. Not used for a stop the peer sent
+    /// ([`Self::stopped_early`]): quinn reports that stream as Stopped, so
+    /// it leaves nothing in quinn's `stopped` map.
     fn reset(&mut self, code: u32) {
         if !self.closed {
             self.closed = true;
-            self.send.reset(code.into()).ok();
+            if self.send.reset(code.into()).is_ok() {
+                self.aborts.record();
+            }
         }
     }
 

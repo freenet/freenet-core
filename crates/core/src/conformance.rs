@@ -150,9 +150,11 @@ pub use generator::{GeneratorConfig, generate_cases};
 pub use host_clock::{
     HOST_CLOCK_DEPRECATION_DOC, HOST_CLOCK_IMPORT, HOST_CLOCK_NAMESPACE, imports_host_clock,
 };
-pub use minimize::{MinimizeConfig, MinimizeReport, minimize};
+pub use minimize::{MinimizeConfig, MinimizeReport, minimize, minimize_toward};
 pub use oracle::{ConformanceOracle, OracleError, OracleErrorKind};
-pub use policy::{ConformanceAction, EnforcementMode, decide};
+pub use policy::{
+    ConformanceAction, EnforcementMode, RemovalTier, decide, property_tier, removal_tier,
+};
 pub use property::{
     ConformanceProperty, IdempotenceSettling, Inconclusive, OutputDigest, PremiseSource,
     PropertyOutcome, Severity, Violation,

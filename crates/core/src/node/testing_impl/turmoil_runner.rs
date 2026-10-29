@@ -42,7 +42,8 @@ use crate::client_events::test::RandomEventGenerator;
 use crate::config::GlobalRng;
 use crate::simulation::VirtualTime;
 use crate::transport::in_memory_socket::{
-    register_address_network, register_network_time_source, unregister_network_time_source,
+    clear_network_address_mappings, register_address_network, register_network_time_source,
+    unregister_network_time_source,
 };
 
 /// Result type for Turmoil simulations
@@ -277,6 +278,11 @@ where
 
     // Cleanup
     unregister_network_time_source(&network_name);
+    // Remove this network's address registrations. Left behind, they would
+    // stay as extra owners of addresses another simulation in this process
+    // may register, and binds from threads that did not register those
+    // addresses would be refused as ambiguous (#5676).
+    clear_network_address_mappings(&network_name);
 
     result
 }

@@ -4769,7 +4769,12 @@ mod tests {
                         property: "state_idempotence",
                         severity: Severity::Violation,
                         settling,
-                        would_remove: true,
+                        // The decision `policy::removal_tier` gives the class: a
+                        // settled finding is report-only.
+                        would_remove: !matches!(
+                            settling,
+                            Some(IdempotenceSettling::SettledAfter(_))
+                        ),
                     }],
                 )],
                 1,
@@ -4795,13 +4800,83 @@ mod tests {
             settled.contains("converges"),
             "the settling case must say so in words the operator reads:\n{settled}"
         );
+        // The ROW label, since the legend also says "report-only".
+        assert!(
+            settled.contains("Violation — settles after a rewrite (converges, report-only)"),
+            "the settled row must say it is report-only:\n{settled}"
+        );
+        assert!(
+            settled.contains(r#"<td class="right">no</td></tr>"#),
+            "a settled finding must show 'would remove: no':\n{settled}"
+        );
+    }
+
+    /// A report-only `Violation` must not be labelled removal-eligible.
+    ///
+    /// Every `Violation` row used to say "removal-eligible", which stopped being
+    /// true when some laws became report-only in every mode. The panel reads the
+    /// decision (`would_remove`) for the generic label; this checks the ROW, since
+    /// the legend below it mentions both tiers and would satisfy a whole-card match.
+    #[test]
+    fn the_panel_labels_a_report_only_violation_as_report_only() {
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let rendered = |property: &'static str, would_remove: bool| {
+            let key_id = ContractInstanceId::new([8u8; 32]);
+            let key = key_id.to_string();
+            let mut status = MergeCheckStatus::default();
+            status.record(
+                [checked_record(
+                    key_id,
+                    40,
+                    0,
+                    vec![MergeFinding {
+                        contract: key_id,
+                        property,
+                        severity: Severity::Violation,
+                        settling: None,
+                        would_remove,
+                    }],
+                )],
+                1,
+                0,
+                tokio::time::Instant::now(),
+            );
+            let snap = hosted_snap(&key);
+            let view = merge_view(&status, &key_id);
+            let html = contract_detail_html_from(&Some(snap), &key, true, Some(&view));
+            merge_panel(&html)
+        };
+
+        let report_only = rendered("path_agreement", false);
+        assert!(
+            report_only.contains("Violation — report-only")
+                && !report_only.contains("Violation — removal-eligible"),
+            "a report-only finding was labelled as removal-eligible:\n{report_only}"
+        );
+        // The "Would remove" column carries the decision itself.
+        assert!(
+            report_only.contains(r#"<td class="right">no</td></tr>"#),
+            "a report-only finding must show 'would remove: no':\n{report_only}"
+        );
+        let eligible = rendered("state_commutativity", true);
+        assert!(
+            eligible.contains("Violation — removal-eligible")
+                && !eligible.contains("Violation — report-only"),
+            "a removal-eligible finding lost its label:\n{eligible}"
+        );
+        assert!(
+            eligible.contains(r#"<td class="right">yes</td></tr>"#),
+            "a removal-eligible finding must show 'would remove: yes':\n{eligible}"
+        );
     }
 
     /// State 4: checked, with findings — the state the whole card exists for.
     ///
     /// Each finding must show its property, and a `Violation` must read as
-    /// visibly more serious than a `Diagnostic`: the former is removal-eligible
-    /// under enforcement, the latter is legal but wasteful. A panel that only
+    /// visibly more serious than a `Diagnostic`: the former broke a law (and is
+    /// removal-eligible under enforcement unless its law is report-only), the
+    /// latter is legal but wasteful. A panel that only
     /// printed the bare enum name would satisfy "shows severity" without making
     /// the distinction an operator actually needs.
     ///
@@ -4852,8 +4927,10 @@ mod tests {
             panel.contains("state_commutativity") && panel.contains("self_delta_empty"),
             "both findings for this contract must be listed — got:\n{panel}"
         );
+        // The ROW label, not the bare word: the legend also says
+        // "removal-eligible", so a whole-card match passed whatever the row said.
         assert!(
-            panel.contains("removal-eligible"),
+            panel.contains("Violation — removal-eligible"),
             "a Violation must be explained, not just labelled with the bare \
              enum name — got:\n{panel}"
         );

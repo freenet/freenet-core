@@ -242,8 +242,14 @@ and every `SimNetwork::Drop` cleared it. Under plain `cargo test` the first
 simulation to finish turned crash enforcement off for every other one, so
 crash tests could pass without the crash ever happening. The fix was to key
 the state by the network that owns it, as every other harness registry
-already was. The same family still has one open member: `ADDRESS_NETWORKS`
-is keyed by bare `SocketAddr`, and simulations share one port range (#5676).
+already was. A third member was a global keyed by something two simulations
+can share. `ADDRESS_NETWORKS` mapped each socket address to one network, last
+registration wins, and simulations derive addresses from seed and node
+locations, so concurrent simulations registered identical addresses and a node
+could bind into the other simulation's network (#5676). Keying by owner is not
+enough when the key itself collides: the address now records every network
+that registered it, and a bind resolves to the one registered from its own
+thread.
 
 Audit question for any new or changed test: *could this interact with other
 tests through global state* (a static cache, `set_global_default`, an env var,
@@ -882,8 +888,9 @@ Audit questions for any new byte budget:
 **Recorded exception: inbound stream reassembly.** `MAX_STREAM_TOTAL_BYTES` and
 `MAX_INBOUND_STREAM_BYTES_PER_CONNECTION` are flat and sit outside the
 aggregate (listed in `NOT_SUMMED` with the reason). They bound one stream and
-one connection, not the node: reassembly memory across the node is at most the
-number of connections times the per-connection allowance. The QUIC
+one peer, not the node: reassembly memory across the node is at most the
+number of peers times the per-peer allowance (one budget, shared by a peer's
+UDP connection and QUIC path). The QUIC
 flow-control windows (`quic::config::connection_window_bytes`, #5940) are
 the same class of per-connection exception and are in `NOT_SUMMED`. They are
 NOT covered by the reassembly allowance: they come on top of it, the send

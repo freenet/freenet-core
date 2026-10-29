@@ -200,7 +200,10 @@ The cap is built on RealTime even in simulation, because the listener and
 its connections run on RealTime there: a VirtualTime cap would compute
 deficits on another clock than its waiters sleep and time out on. The QUIC
 endpoint runs on the cap's clock for the same reason (bind_udp_listener
-builds both on RealTime; tests build both on one VirtualTime).
+builds both on RealTime in production; tests build both on one
+VirtualTime). In a simulation the endpoint runs on the network's
+VirtualTime, so bind_udp_listener refuses a simulated node with both
+transport-quic and total-bandwidth-limit.
 Tests assert on per-cap EgressCap::stats(), never the global counters.
 ```
 
@@ -923,6 +926,29 @@ back the next. QUIC integration tests run under a watchdog thread
 In tests, two endpoints on SimulationSocket with one VirtualTime and a
 seeded GlobalRng repeat the same event trace; the bytes differ, because
 rustls's key exchange and the XEdDSA nonce use the OS RNG.
+
+In SimNetwork: `with_transport_quic` / `with_node_transport_quic` set the
+config value per node (off by default; an unknown value panics), and the
+endpoint runs on the network's VirtualTime (`get_socket_virtual_time`;
+RealTime in production, pinned by
+`the_transport_endpoint_runs_on_virtual_time_only_in_simulation`). Its
+bind-time GlobalRng draw (quinn's rng_seed) runs on
+`GlobalRng::with_side_stream`, so an endpoint that is bound and idle does not
+shift the run's main random stream. That is all the determinism tests cover:
+once connections open, quinn's connection-ID draws
+(`initial_dst_cid_provider`, the CID generator) take from the main stream
+inside quinn's tasks. With endpoints idle, the one difference from QUIC off
+is scheduling (one endpoint driver task per node), which changes some
+connection choices, so a QUIC-on run is compared with QUIC off by the peers
+that join, not by the exact edge set. `probe_quic_endpoints_at` sends each
+node a stranger's QUIC datagram during a direct-runner run, so a test can
+check every endpoint was live (`not_allowed`) rather than failed to bind.
+Other knobs: `with_node_advertised_version` (the version a node advertises
+in its intro and AckConnectionV2, to emulate an older peer of the same
+major.minor; compatibility checks keep the real version),
+`with_quic_idle_timeout`, and `drop_quic_datagrams_between` (drops
+QUIC-class datagrams, by the demux classifier, for one pair from a virtual
+time; `simulation::QuicDatagramDrop`, kept across `with_fault_injection`).
 `quic/test_tls.rs` holds only a plain Ed25519 identity for tests where a
 peer presents a key that is not its transport key.
 
@@ -1013,7 +1039,10 @@ Sending (QuicPath::send_short / send_stream / send_stream_chunks /
   connection `stopped` map until the connection closes (quinn 0.11.12:
   stopped() registers it, and a local reset produces neither the Finished
   nor the Stopped event that removes it). Bounded by the sends aborted on
-  the connection; e5 must bound that or recycle the connection.
+  the connection: the path counts its own resets (a stop the peer sent,
+  surfaced through a write or through stopped(), is not one; nor is a reset
+  on a closed connection) and closes the connection past
+  recycle::SEND_ABORT_LIMIT (4096) with close code SEND_ABORT_LIMIT (M6).
   Every write, and the wait for a source's next chunk, races the
   stream's stopped() future and resets on a stop:
   quinn-proto 0.11.19 does not report STOP_SENDING to a writer blocked on
@@ -1032,7 +1061,8 @@ Inbound adapter: a Stream's payload goes into an ordinary StreamHandle,
   StreamIdentity / registry are unchanged. The handle is announced
   (InboundStreamArrival, with the metadata) before the payload.
   → Before allocating: header checks, then the path's
-    InboundStreamBudget check and charge (same cost and limits as UDP).
+    InboundStreamBudget check and charge (same cost and limits as UDP;
+    one lock from check to charge).
     Short messages are charged too (a token rides with the message until
     its payload is taken). Refusal: STOP_SENDING (stop_code), counted in
     the shared InboundStreamOutcome counters, path and process-wide.
@@ -1074,13 +1104,85 @@ Inbound adapter: a Stream's payload goes into an ordinary StreamHandle,
     more bytes, and a new QUIC stream with that id carries the whole
     stream. A Stream id already held on the path is refused
     (StreamIdInUse). Dropping the path cancels streams in progress.
-Not here: dedup (e5: is_duplicate_dispatch, completed_inbound_streams),
-  export of the QUIC-only counters (per path, QuicPath::stats), and one
-  budget shared with the UDP session. The path has its own budget, so a
-  peer with both may hold twice the per-connection allowance until e5
-  resolves it (QUIC memory gate). Short-message budget keys are picked by
-  the path and could equal a UDP transport-internal id: do not share the
-  budget without separating the keys.
+One budget per peer (QUIC memory gate M3): QuicPath::with_budget charges
+  the SharedInboundBudget of the peer's UDP connection
+  (PeerConnection::inbound_budget), so a peer with both paths has ONE
+  allowance; with_limits gives a path its own budget and is for tests.
+  QuicPath::new and with_limits are #[cfg(test)]; with_budget ignores
+  limits.max_streams/max_bytes. Charges are keyed by InboundKey:
+  Udp(StreamId), Quic(StreamId), QuicShort(u32). The same numeric id on
+  both paths is two charges; never charge, test or release one path's
+  stream under another path's variant. UDP's take_expired and
+  live_buffer_streams see only Udp keys (QUIC evicts by its own timers).
+  A gone UDP charge is released ONLY by UDP code (its check and sweep,
+  Releaser::Udp), so UDP's release timing is exactly main's; a UDP-only
+  node releases as before. (The dedup against restarting a stream is
+  completed_inbound_streams, not the held charge.) A QUIC admission
+  (Releaser::Quic) releases gone QUIC charges only. UDP's check and sweep
+  also release gone QUIC charges, since QUIC reads its own gone charge as
+  free; otherwise one would hold UDP's room until the path next needed
+  room, or for good once the path is gone. Pinned at the call sites by
+  udp_and_quic_paths_share_one_inbound_allowance (read_stream and
+  read_short refused on room a gone UDP charge holds),
+  a_quic_guard_releases_only_its_own_charge,
+  udp_admission_releases_its_own_gone_charges_for_room,
+  the_udp_sweep_releases_a_gone_quic_charge and
+  quic_admission_holds_one_budget_lock_from_check_to_charge (which also
+  pins Releaser::Quic in both QUIC checks). The lock is parking_lot,
+  never held across .await, and not reentrant (do not call the handle's
+  stream_count/charged_bytes while holding lock()); it may be held while
+  taking the StreamRegistry (DashMap) locks, never the reverse. UDP
+  admission holds it from check to charge, so a QUIC charge cannot take
+  the room between (pinned by
+  udp_admission_holds_one_budget_lock_from_check_to_charge).
+  e5 MUST build node paths with with_budget, and MUST handle:
+  → If the UDP PeerConnection is replaced (reconnect or fallback) while a
+    QUIC path lives, the new connection gets a fresh budget and the peer
+    has two allowances again: hand the path the new handle or rebuild it.
+  → A UDP stream refused because QUIC filled the budget is remembered as
+    refused (sticky), and MAX_REMEMBERED_REFUSALS (4096) outstanding
+    refusals close the UDP connection. Same as UDP's own overload, but the
+    other path can now cause it.
+  → A QUIC charge whose consumer never releases it blocks UDP admissions
+    too: the UDP sweep does not evict QUIC streams.
+  → A gone UDP charge holds room against QUIC until UDP's next 5 s
+    timeout_check sweep (or UDP's own admission under pressure), so QUIC
+    can see BUDGET_REFUSED for up to about 5 s on room that is free.
+  → The shared Arc can keep UDP charges (and their room) alive after the
+    PeerConnection drops, and no QUIC code releases them: do not keep a
+    path on a gone connection's handle.
+  Telemetry and logs that read the budget (sample_inbound_concurrency's
+  outstanding count, the refusal warning's open_streams/charged_bytes)
+  are peer-wide once shared and include QUIC charges.
+  With one allowance, a large UDP stream still draining can make a QUIC
+  stream refuse (BUDGET_REFUSED) where two allowances admitted it; that
+  is the intended semantics, retried like any transfer failure.
+Path recycling (quic/recycle.rs, #5940 step M6): besides the send-reset
+  limit above, the path's receive task samples the connection every
+  ACK_WATCH_TICK (2 s) and closes it with PEER_NOT_ACKNOWLEDGING when, for
+  ACK_WATCH_WINDOW (10 s), this side had ack-eliciting packets outstanding,
+  the peer acknowledged none of them, and the peer kept sending (no two
+  samples in a row without anything from it). A peer that keeps sending but acknowledges none of our packets is
+  not a conforming QUIC peer (RFC 9000 13.2.1). Newly acknowledged packets
+  are counted by AckCounting, which wraps Cubic in transport_config;
+  ConnectionStats has no such counter. Two samples in a row with nothing
+  from the peer end the window, and so does a sample with nothing
+  outstanding (in flight after the latest acknowledgements, minus losses,
+  or a send since), so recovery from an outage does not close the path.
+  quinn counts a transmit's frames, and its bytes in flight, when it builds
+  it, before the egress cap admits it. Guard 2 is therefore inactive while
+  the egress cap holds QUIC transmits: while the cap holds any (or held one
+  since the previous sample; socket::CapHolds, node-wide) no window runs on
+  any path, so on a node whose cap binds most of the time guard 2 is off
+  most of the time. Do not narrow this to the sends counted since the hold:
+  a held transmit is also in quinn's bytes in flight. A hold whose poller
+  is not polled again within socket::cap_hold_validity of the cap's rate
+  (a poller left by an ended connection) stops counting.
+  e5 constraint: SEND_ABORT_LIMIT and PEER_NOT_ACKNOWLEDGING ask the peer to
+  fall back to UDP for THIS connection only. They are not a permanent
+  downgrade: e5 must allow a new upgrade after its normal backoff.
+Not here: dedup (e5: is_duplicate_dispatch, completed_inbound_streams) and
+  export of the QUIC-only counters (per path, QuicPath::stats).
 ```
 
 #### QUIC errors, close codes and liveness (`quic/error.rs`, `quic/liveness.rs`, #5940 step e4)
@@ -1144,7 +1246,9 @@ Application error codes, one range per QUIC frame type, all one-byte
   quic/error.rs refuses an out-of-range or duplicated code, and a
   source-scrape test refuses a code constant missing from ALL:
     0x00..=0x0f CONNECTION_CLOSE: close_code::NODE_DROPPED_PEER 0,
-                DOWNGRADE 1 (fall back to UDP), IDENTITY_MISMATCH 2
+                DOWNGRADE 1 (fall back to UDP), IDENTITY_MISMATCH 2,
+                SEND_ABORT_LIMIT 3 and PEER_NOT_ACKNOWLEDGING 4 (path
+                recycling, M6; the peer reads both as Downgrade)
     0x10..=0x1f STOP_SENDING: path::stop_code (receiver refusals)
     0x20..=0x2f RESET_STREAM: path::reset_code (sender gave up)
   The scrape test checks every constant by name against ALL, and
@@ -1304,7 +1408,7 @@ Stream length limits (streaming.rs):
   check_declared_stream_length(): 0 and > MAX_STREAM_TOTAL_BYTES are invalid
 
 Receiver: every new stream passes check_declared_stream_length() and the
-per-connection InboundStreamBudget (inbound_budget.rs) BEFORE any state is
+per-peer InboundStreamBudget (inbound_budget.rs) BEFORE any state is
 created from its declared length.
   - Limits: MAX_INBOUND_STREAMS_PER_CONNECTION streams and
     MAX_INBOUND_STREAM_BYTES_PER_CONNECTION bytes (one maximum-size
@@ -1314,8 +1418,10 @@ created from its declared length.
     its length allows. Admission (check) and the charge use the same cost.
   - Both reassembly paths hold fragments as received and assemble once on
     completion: the memory held is the fragments received.
-  - The bound is per connection; node-wide fairness is deferred to the
-    transport redesign (exception recorded in bug-prevention-patterns.md;
+  - The bound is per peer: the UDP connection's budget, shared with a QUIC
+    path to the same peer (SharedInboundBudget, keyed by InboundKey).
+    Node-wide fairness is deferred to the transport redesign (exception
+    recorded in bug-prevention-patterns.md;
     the flat constants are in executor.rs NOT_SUMMED).
   - A refused stream id is remembered (inbound_budget::RefusedStreams) until
     the age limit for its length, and its later fragments are dropped
