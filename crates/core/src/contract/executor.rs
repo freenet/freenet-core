@@ -2078,6 +2078,16 @@ where
         &self.delta_cache
     }
 
+    /// Whether this executor can send delegate contract notifications (test
+    /// introspection). An executor built without the sender returns from
+    /// `send_delegate_contract_notifications` silently, so a pool slot that
+    /// missed the wiring is indistinguishable from a contract nobody
+    /// subscribed to (#5488).
+    #[cfg(test)]
+    pub(crate) fn has_delegate_notification_tx(&self) -> bool {
+        self.delegate_notification_tx.is_some()
+    }
+
     /// Set the delegate notification sender for pool-based operation.
     /// When set, `commit_state_update()` will send notifications to subscribed delegates.
     pub(crate) fn set_delegate_notification_tx(&mut self, tx: DelegateNotificationSender) {

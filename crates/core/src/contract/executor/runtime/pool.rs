@@ -2190,6 +2190,102 @@ mod tests {
         drop(task_monitor);
     }
 
+    /// Every executor of a real `RuntimePool` — the first, the ones built in
+    /// the pool loop, and a replacement — can send delegate contract
+    /// notifications (#5488).
+    ///
+    /// **Why this is not covered by the E2E test.** `tests/operations.rs`'s
+    /// `test_delegate_is_notified_when_a_subscribed_contract_updates` drives
+    /// the whole notification path through a real node, but it cannot reach
+    /// past the FIRST executor: `pop_executor` returns the first free slot, so
+    /// a sequential single-node test always runs on slot 0. Removing the
+    /// loop-built wiring leaves it green, and the replacement site is only
+    /// reached after a worker is found unhealthy, which that test never
+    /// provokes. These are the two sites it cannot see.
+    ///
+    /// **Why their failure is silent.** An executor with no sender returns
+    /// from `send_delegate_contract_notifications` without an error, so a slot
+    /// that missed the wiring is indistinguishable from a contract nobody
+    /// subscribed to. The symptom is a delegate that is simply never run, on
+    /// some requests and not others depending on which slot served them.
+    #[tokio::test]
+    async fn every_pool_executor_can_send_delegate_notifications() {
+        let config_args = ConfigArgs {
+            id: Some("pool-delegate-notification-wiring".to_string()),
+            mode: Some(OperationMode::Local),
+            ..Default::default()
+        };
+        let node_config =
+            crate::node::NodeConfig::new(config_args.build().await.expect("build Config"))
+                .await
+                .expect("build NodeConfig");
+        let config = node_config.config.clone();
+        let (_notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, _ch_channel, _wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, _result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+        let op_manager = Arc::new(
+            OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+
+        // More than one, or the pool loop never runs and the site this test
+        // exists for is not built at all.
+        const POOL: usize = 3;
+        const _: () = assert!(
+            POOL > 1,
+            "a pool of one builds no loop executors, so this test would only \
+             re-check the first-executor site the E2E test already covers"
+        );
+
+        let pool = RuntimePool::new(
+            config,
+            op_manager.clone(),
+            NonZeroUsize::new(POOL).expect("nonzero pool size"),
+        )
+        .await
+        .expect("build RuntimePool");
+
+        assert_eq!(
+            pool.runtimes.len(),
+            POOL,
+            "the pool must hold every slot it was sized for, or the slots this \
+             test walks are not the ones serving requests"
+        );
+        for (slot, executor) in pool.runtimes.iter().enumerate() {
+            let executor = executor.as_ref().expect("executor present");
+            assert!(
+                executor.has_delegate_notification_tx(),
+                "pool slot {slot} cannot send delegate notifications, so a \
+                 contract committed on it runs no subscribed delegate and \
+                 reports no error"
+            );
+        }
+
+        let replacement = pool
+            .create_replacement_executor()
+            .await
+            .expect("replacement executor");
+        assert!(
+            replacement.has_delegate_notification_tx(),
+            "a replacement executor cannot send delegate notifications, so \
+             every delegate subscription served by the rebuilt slot goes quiet \
+             after a worker is replaced"
+        );
+        drop(replacement);
+        drop(task_monitor);
+    }
+
     /// End-to-end proof that evicting an advertised contract through the real
     /// `RuntimePool::remove_contract` path retracts the hosting advertisement
     /// and records `GlobalTestMetrics::neighbor_hosting_retractions()` — giving
