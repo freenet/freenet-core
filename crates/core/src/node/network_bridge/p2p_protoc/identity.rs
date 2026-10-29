@@ -614,6 +614,26 @@ mod tests {
     }
 
     #[test]
+    fn release_prefers_a_dial_among_holders_in_the_ring() {
+        let mut t = Table::new();
+        let k = key();
+        for port in 40..=42 {
+            t.open(addr(port), None);
+        }
+        for (port, source) in [
+            (40, IdentitySource::Claimed),
+            (41, IdentitySource::Dialled),
+            (42, IdentitySource::Dialled),
+        ] {
+            assert_eq!(t.bind(addr(port), &k, source, None), BindOutcome::Bound);
+        }
+        assert_eq!(
+            t.close(addr(42), &k, &[addr(40), addr(41)]),
+            Release::Moved(addr(41))
+        );
+    }
+
+    #[test]
     fn release_without_an_index_entry_moves_or_releases() {
         let mut t = Table::new();
         let k = key();
