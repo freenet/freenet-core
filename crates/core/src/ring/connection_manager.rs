@@ -4809,9 +4809,10 @@ mod tests {
     /// Source-scrape pin (B1 regression guard, extended for #5827): EACH
     /// connection-lifecycle cap gate must refuse at the cap through the shared
     /// `refuses_connection_at_cap`, which carries the lattice exemption. The
-    /// gates are the transient-promotion gate and the outbound pre-flight check
-    /// in `handle_connect_peer`, and the promotion gate in
-    /// `handle_successful_connection`. Without the exemption a lattice edge is
+    /// gates are the transient-promotion gate in `promote_existing_connection`
+    /// (which `handle_connect_peer` calls for an existing connection), the
+    /// outbound pre-flight check in `handle_connect_peer`, and the promotion
+    /// gate in `handle_successful_connection`. Without the exemption a lattice edge is
     /// silently dropped at the cap on the real CONNECT path and mechanism 3's
     /// at-capacity displacement is inert: the exact defect the external review
     /// caught for the promotion gates (the over-max unit test passed only
@@ -4891,12 +4892,18 @@ mod tests {
 
         const CALL: &str = "connection_manager.refuses_connection_at_cap(loc)";
         let connect_peer = fn_body(LIFECYCLE_SRC, "async fn handle_connect_peer(");
+        let promote = fn_body(LIFECYCLE_SRC, "async fn promote_existing_connection(");
         let successful = fn_body(LIFECYCLE_SRC, "async fn handle_successful_connection(");
+        assert!(
+            code_calls(connect_peer, "self.promote_existing_connection(peer_addr"),
+            "handle_connect_peer must promote an existing connection through \
+             promote_existing_connection, which holds the transient-promotion gate"
+        );
         let gates = [
             (
-                "handle_connect_peer transient-promotion gate",
+                "promote_existing_connection transient-promotion gate",
                 region(
-                    connect_peer,
+                    promote,
                     "connection_manager.drop_transient(peer_addr)",
                     "connect_peer: rejecting transient promotion to enforce cap",
                 ),
