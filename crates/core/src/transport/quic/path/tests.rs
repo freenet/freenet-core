@@ -56,7 +56,10 @@ impl Paths {
     }
 }
 
-/// Build the pair on `10.203.<subnet>.1` and `.2` and connect it.
+/// Build the pair on `10.203.<subnet>.1` and `.2` and connect it. Every
+/// test needs a subnet of its own: the simulated network maps each address
+/// to one network for the whole process, so two tests on one subnet send
+/// each other's packets into the wrong network.
 async fn paths(network: &str, subnet: u8, b_limits: QuicPathLimits) -> Paths {
     paths_with(network, subnet, b_limits, None).await
 }
@@ -1647,7 +1650,7 @@ fn a_path_closes_once_its_reset_sends_pass_the_limit() {
             max_send_aborts: ABORT_LIMIT,
             ..QuicPathLimits::DEFAULT
         };
-        let p = paths("quic-path-abort-limit", 24, limits).await;
+        let p = paths("quic-path-abort-limit", 40, limits).await;
         let a_addr = p.pair.a_addr;
         for (aborts, total) in [(ABORT_LIMIT - 1, ABORT_LIMIT - 1), (1, ABORT_LIMIT)] {
             let b = p.b.clone();
@@ -1701,7 +1704,7 @@ fn a_dropped_send_counts_as_a_reset() {
             max_send_aborts: ABORT_LIMIT,
             ..QuicPathLimits::DEFAULT
         };
-        let p = paths("quic-path-abort-dropped", 28, limits).await;
+        let p = paths("quic-path-abort-dropped", 41, limits).await;
         let a_addr = p.pair.a_addr;
         let drop_sends = |count: u64| {
             let (b, time) = (p.b.clone(), p.time());
@@ -1739,7 +1742,7 @@ fn a_dropped_send_counts_as_a_reset() {
 fn a_stop_reported_by_the_write_is_not_counted() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let p = paths("quic-path-written-stopped", 30, QuicPathLimits::DEFAULT).await;
+        let p = paths("quic-path-written-stopped", 42, QuicPathLimits::DEFAULT).await;
         let a = p.a.clone();
         let (written, aborts) = p
             .drive(async move {
@@ -1778,7 +1781,7 @@ fn a_stop_from_the_peer_is_not_counted_as_a_reset() {
             max_bytes: ChargeOverhead::DEFAULT.cost(1000),
             ..QuicPathLimits::DEFAULT
         };
-        let p = paths("quic-path-abort-stops", 29, b_limits).await;
+        let p = paths("quic-path-abort-stops", 43, b_limits).await;
         let b_addr = p.pair.b_addr;
         let a = p.a.clone();
         let stops = p
@@ -2175,7 +2178,7 @@ fn a_slow_conforming_peer_is_not_closed() {
                 PacketDeliveryDecision::DelayedDelivery(one_way)
             })),
         );
-        let p = paths(network, 26, QuicPathLimits::DEFAULT).await;
+        let p = paths(network, 45, QuicPathLimits::DEFAULT).await;
         let (a_addr, b_addr) = (p.pair.a_addr, p.pair.b_addr);
         let (a, b) = (p.a.clone(), p.b.clone());
         let time = p.time();
@@ -2241,7 +2244,7 @@ fn a_lossy_path_is_not_closed() {
         let _seed = GlobalRng::seed_guard(SEED);
         let network = "quic-path-ack-watch-lossy";
         seeded_loss(network, 25);
-        let p = paths(network, 31, QuicPathLimits::DEFAULT).await;
+        let p = paths(network, 46, QuicPathLimits::DEFAULT).await;
         let (a_addr, b_addr) = (p.pair.a_addr, p.pair.b_addr);
         let (a, b, time) = (p.a.clone(), p.b.clone(), p.time());
         let (bulk_ab, bulk_ba, trickles) = p
@@ -2294,7 +2297,7 @@ fn a_bulk_transfer_at_a_long_round_trip_is_not_closed() {
                 PacketDeliveryDecision::DelayedDelivery(one_way)
             })),
         );
-        let p = paths(network, 32, QuicPathLimits::DEFAULT).await;
+        let p = paths(network, 47, QuicPathLimits::DEFAULT).await;
         let (a_addr, b_addr) = (p.pair.a_addr, p.pair.b_addr);
         let (a, b) = (p.a.clone(), p.b.clone());
         let (to_b, to_a) = p
@@ -2324,7 +2327,7 @@ fn a_bulk_transfer_at_a_long_round_trip_is_not_closed() {
 fn an_idle_path_is_not_closed() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let p = paths("quic-path-ack-watch-idle", 27, QuicPathLimits::DEFAULT).await;
+        let p = paths("quic-path-ack-watch-idle", 44, QuicPathLimits::DEFAULT).await;
         let (a_addr, b_addr) = (p.pair.a_addr, p.pair.b_addr);
         let (a, b) = (p.a.clone(), p.b.clone());
         let time = p.time();
