@@ -699,35 +699,57 @@ fn fn_names_in_block(source: &str, start: &str) -> Vec<String> {
     names
 }
 
-/// The `congestion.rs` of the quinn-proto this crate links, located with
-/// `cargo metadata` (freenet's own resolved `quinn_proto` dependency).
-/// Runs `--offline` only, so a runner without network fails at once
-/// instead of waiting; fails if that fails or the source is not on disk.
-fn quinn_proto_congestion_rs() -> std::path::PathBuf {
+/// The `congestion.rs` of the quinn-proto this crate links, or a reason it
+/// was not found. Two ways, both offline, so a runner without network does
+/// not wait:
+/// 1. `cargo metadata --offline --filter-platform <host>`: freenet's own
+///    resolved `quinn_proto` dependency. Without the filter, cargo needs the
+///    crates of every platform, and a CI cache holds only the host's.
+/// 2. The registry sources under `$CARGO_HOME` for the quinn-proto version
+///    locked in `Cargo.lock`.
+fn quinn_proto_congestion_rs() -> Result<std::path::PathBuf, String> {
     let manifest = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
+    let metadata_error = match quinn_proto_from_metadata(manifest) {
+        Ok(source) => return Ok(source),
+        Err(error) => error,
+    };
+    quinn_proto_from_registry().map_err(|registry_error| {
+        format!("cargo metadata: {metadata_error}; registry: {registry_error}")
+    })
+}
+
+/// [`quinn_proto_congestion_rs`], way 1.
+fn quinn_proto_from_metadata(manifest: &str) -> Result<std::path::PathBuf, String> {
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    let version = std::process::Command::new(&rustc)
+        .arg("-vV")
+        .output()
+        .map_err(|error| format!("run {rustc} -vV: {error}"))?;
+    let host = String::from_utf8_lossy(&version.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix("host: ").map(str::to_string))
+        .ok_or("no host triple in rustc -vV")?;
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-    let run = || {
-        let mut command = std::process::Command::new(&cargo);
-        command.args([
+    let output = std::process::Command::new(&cargo)
+        .args([
             "metadata",
             "--format-version",
             "1",
             "--locked",
+            "--offline",
+            "--filter-platform",
+            &host,
             "--manifest-path",
             manifest,
-        ]);
-        command.arg("--offline");
-        command.output().expect("run cargo metadata")
-    };
-    let output = run();
-    assert!(
-        output.status.success(),
-        "cargo metadata failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+        ])
+        .output()
+        .map_err(|error| format!("run cargo metadata: {error}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).into_owned());
+    }
     let metadata: serde_json::Value =
-        serde_json::from_slice(&output.stdout).expect("cargo metadata JSON");
-    let packages = metadata["packages"].as_array().expect("packages");
+        serde_json::from_slice(&output.stdout).map_err(|error| error.to_string())?;
+    let packages = metadata["packages"].as_array().ok_or("no packages")?;
     let freenet = packages
         .iter()
         .find(|package| {
@@ -736,31 +758,63 @@ fn quinn_proto_congestion_rs() -> std::path::PathBuf {
                     std::path::Path::new(path) == std::path::Path::new(manifest)
                 })
         })
-        .expect("this crate in cargo metadata");
+        .ok_or("this crate is not in cargo metadata")?;
     let node = metadata["resolve"]["nodes"]
         .as_array()
-        .expect("resolve nodes")
+        .ok_or("no resolve graph")?
         .iter()
         .find(|node| node["id"] == freenet["id"])
-        .expect("this crate in the resolve graph");
+        .ok_or("this crate is not in the resolve graph")?;
     let quinn_proto = node["deps"]
         .as_array()
-        .expect("deps")
+        .ok_or("no deps")?
         .iter()
         .find(|dep| dep["name"] == "quinn_proto")
-        .expect("quinn_proto among this crate's dependencies")["pkg"]
+        .ok_or("quinn_proto is not among this crate's dependencies")?["pkg"]
         .clone();
     let manifest_path = packages
         .iter()
         .find(|package| package["id"] == quinn_proto)
         .and_then(|package| package["manifest_path"].as_str())
-        .expect("quinn-proto's manifest path");
+        .ok_or("no manifest path for quinn-proto")?;
     let source = std::path::Path::new(manifest_path)
         .parent()
-        .expect("quinn-proto's directory")
+        .ok_or("quinn-proto's manifest has no directory")?
         .join("src/congestion.rs");
-    assert!(source.is_file(), "{} is not on disk", source.display());
-    source
+    if source.is_file() {
+        Ok(source)
+    } else {
+        Err(format!("{} is not on disk", source.display()))
+    }
+}
+
+/// [`quinn_proto_congestion_rs`], way 2.
+fn quinn_proto_from_registry() -> Result<std::path::PathBuf, String> {
+    let lock = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.lock"))
+        .map_err(|error| format!("read Cargo.lock: {error}"))?;
+    let marker = "name = \"quinn-proto\"\nversion = \"";
+    let mut versions = lock.match_indices(marker).map(|(at, _)| {
+        let rest = &lock[at + marker.len()..];
+        rest[..rest.find('"').unwrap_or(0)].to_string()
+    });
+    let version = versions.next().ok_or("quinn-proto is not in Cargo.lock")?;
+    if versions.next().is_some() {
+        return Err("Cargo.lock holds more than one quinn-proto".to_string());
+    }
+    let cargo_home = std::env::var("CARGO_HOME")
+        .or_else(|_| std::env::var("HOME").map(|home| format!("{home}/.cargo")))
+        .map_err(|_| "neither CARGO_HOME nor HOME is set".to_string())?;
+    let registry = std::path::Path::new(&cargo_home).join("registry/src");
+    std::fs::read_dir(&registry)
+        .map_err(|error| format!("{}: {error}", registry.display()))?
+        .filter_map(Result::ok)
+        .map(|index| {
+            index
+                .path()
+                .join(format!("quinn-proto-{version}/src/congestion.rs"))
+        })
+        .find(|path| path.is_file())
+        .ok_or_else(|| format!("quinn-proto {version} is not under {}", registry.display()))
 }
 
 /// Pin: `impl Controller for AckCounting` implements every method of the
@@ -770,7 +824,7 @@ fn quinn_proto_congestion_rs() -> std::path::PathBuf {
 /// would fail. Fails if the quinn-proto source cannot be found.
 #[test]
 fn ack_counting_implements_every_controller_method() {
-    let source = quinn_proto_congestion_rs();
+    let source = quinn_proto_congestion_rs().unwrap_or_else(|error| panic!("{error}"));
     let quinn = std::fs::read_to_string(&source).expect("read congestion.rs");
     let trait_methods = fn_names_in_block(&quinn, "pub trait Controller");
     let ours = fn_names_in_block(

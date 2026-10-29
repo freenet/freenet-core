@@ -1894,6 +1894,7 @@ impl Scripted {
         };
         use crate::transport::packet_data::MAX_RECV_PACKET_SIZE;
         use std::collections::VecDeque;
+        use std::time::Instant;
 
         let a_addr: SocketAddr = format!("10.206.{subnet}.1:5000").parse().unwrap();
         let b_addr: SocketAddr = format!("10.206.{subnet}.2:5000").parse().unwrap();
@@ -1959,7 +1960,10 @@ impl Scripted {
         }));
         let keep_sending = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (peer_time, sending) = (time.clone(), keep_sending.clone());
-        let base = std::time::Instant::now();
+        // quinn-proto takes `Instant`s; this one is only the epoch they
+        // are counted from. Every elapsed time comes from `peer_time`
+        // (virtual), as in `memory_tests::connected_pair`.
+        let base = Instant::now();
         tasks.push(tokio::spawn(async move {
             let mut last_stream = None;
             loop {
