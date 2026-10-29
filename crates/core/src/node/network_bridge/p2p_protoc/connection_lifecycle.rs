@@ -1741,7 +1741,12 @@ impl P2pConnManager {
 
         if newly_inserted {
             tracing::info!(peer_id = ?peer_id, %peer_addr, is_transient, "handle_successful_connection: inserted new connection entry");
-            crate::node::network_status::record_peer_connected(peer_addr, None, None);
+            // Already in the ring when a quiet holder of its key was replaced
+            // on arrival and this connection promoted in its place; that
+            // promotion recorded its location and key, which this would erase.
+            if !connection_manager.is_in_ring(peer_addr) {
+                crate::node::network_status::record_peer_connected(peer_addr, None, None);
+            }
             if promote_to_ring {
                 // Only prune reservation when promoting to ring - transient connections
                 // don't go through should_accept() so they have no reservation to prune

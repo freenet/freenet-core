@@ -3070,3 +3070,46 @@ async fn a_claim_whose_holder_went_quiet_is_not_counted_as_long() {
     assert!(!seen(waiting).contains(&ConnIdentity::ClaimHeldLong));
     assert_eq!(h.ring_addr_of(&peer), Some(waiting));
 }
+
+/// A connection that replaces a quiet holder on arrival is promoted while it
+/// is being set up; the dashboard status keeps the location and key that
+/// promotion recorded, rather than the bare entry the setup records for a
+/// new connection.
+#[test]
+fn a_connection_promoted_on_arrival_keeps_its_recorded_location() {
+    let _lock = crate::node::network_status::TEST_GLOBAL_STATE_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    crate::node::network_status::init(0, Default::default(), "test".to_string());
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build test runtime")
+        .block_on(async {
+            let mut h = Harness::new("conn-identity-arrival-status").await;
+            let old: SocketAddr = "198.51.100.47:6221".parse().unwrap();
+            let new: SocketAddr = "198.51.100.47:6222".parse().unwrap();
+            let peer = key();
+            let clock = h.dial_with_receipt(old, &peer).await;
+            clock.go_quiet(identity::HOLD_WINDOW + Duration::from_secs(1));
+            h.dial(new, &peer).await;
+            assert_eq!(
+                h.ring_addr_of(&peer),
+                Some(new),
+                "premise: promoted on arrival"
+            );
+
+            let snapshot = crate::node::network_status::get_snapshot().expect("initialized");
+            let entry = snapshot
+                .peers
+                .iter()
+                .find(|p| p.address == new)
+                .expect("the new connection is recorded");
+            assert!(entry.location.is_some(), "location kept");
+            assert_eq!(
+                entry.peer_key_location.as_ref().map(|p| p.pub_key()),
+                Some(&peer),
+                "key kept"
+            );
+        });
+}

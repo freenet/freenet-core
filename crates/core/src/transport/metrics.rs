@@ -177,14 +177,19 @@ labelled_counters! {
         /// from. Counted once per claim, on the waiting connection. Two
         /// sessions with one peer established at the same time can stay
         /// crossed this way (each side binds the one the other keeps
-        /// waiting); this shows how often a claim waits that long.
+        /// waiting). An upper bound on crossed sessions: any claim that
+        /// waits this long behind a live holder is counted, crossed or not.
         ClaimHeldLong => "claim_held_long",
         /// A connection was bound to this node's own key, on any path.
         OwnKey => "own_key",
         /// A key was bound to a connection while another open connection was
         /// still bound to it. No longer recorded: a key is bound to one
-        /// connection at a time, and a second one waits (`claim_held`). Kept
-        /// so the field stays in the snapshot for nodes that still send it.
+        /// connection at a time, and a second one waits (`claim_held`). Kept,
+        /// reading zero, because releases before the rule recorded it in the
+        /// hundreds per version, so the drop to zero is the before-and-after
+        /// comparison for the rule. `changed_ring_promotion`, removed with
+        /// the same rule, read zero in every release, so it had nothing to
+        /// compare and is gone.
         DuplicateKey => "duplicate_key",
         /// Cleanup ran for a connection whose key is mapped to a different
         /// connection. That connection keeps the mapping and the peer's

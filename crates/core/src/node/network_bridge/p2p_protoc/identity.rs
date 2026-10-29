@@ -26,9 +26,12 @@
 //! bound to the session the other keeps waiting. Both stay heard from, so
 //! neither is replaced as quiet. Requests still flow over both, but state
 //! keyed by the peer is not attributed to the session the peer uses until one
-//! of the two closes. Rare; a claim that waits this long is counted
-//! ([`LONG_CLAIM_WAIT`], `claim_held_long`) so field data shows how often.
-//! Making them converge is #6040.
+//! of the two closes. If the pair is idle, both sessions can be lost
+//! instead: a waiting connection is never in the ring, so the zombie sweep
+//! reaps it on each side, and the peers stay unlinked until they reconnect.
+//! Rare; a claim that waits this long is counted ([`LONG_CLAIM_WAIT`],
+//! `claim_held_long`, an upper bound on crossed sessions) so field data shows
+//! how often. Making them converge is #6040.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
