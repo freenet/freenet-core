@@ -352,6 +352,7 @@ impl From<QuicSendError> for QuicErrorKind {
             QuicSendError::Stopped(code) => Self::Stopped { code },
             QuicSendError::ConnectionLost(error) => error.into(),
             QuicSendError::Closed => Self::StreamClosed,
+            QuicSendError::EndpointDown => Self::EndpointDown,
         }
     }
 }

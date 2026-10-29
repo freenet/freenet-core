@@ -19,22 +19,15 @@
 //!   left): the availability becomes `Released` and nothing is counted.
 //! - a driver task dropped without finishing (the runtime shutting down) is
 //!   not reported: the process is ending.
-//!
-//! What this does NOT cover: a PANIC in the driver. quinn's driver returns
-//! only on an I/O error from `drive_recv`, and [`QuicSocket`] never returns
-//! one, so in production today the driver cannot return at all; the only
-//! way it ends is a panic, and a panic is not contained. quinn 0.11.12 polls
-//! the driver while holding its endpoint state mutex
-//! (`EndpointDriver::poll`, `endpoint.rs` line 370: `state.lock().unwrap()`),
-//! so a panic there poisons it, and every later lock of it panics too:
-//! `EndpointDriver::drop` (line 403), `Accept::poll` (line 651, inside
-//! `quic_accept_loop`), `connect` (line 214) and the connection drivers. Where
-//! one of those runs while the first panic is still unwinding, the process
-//! aborts. So this circuit only reports a driver that RETURNED (tests inject
-//! that with a receive error, `socket::ReceiveFault`). Containing a quinn
-//! panic (catch the unwind, leak the driver instead of dropping it, guard
-//! the accept loop against the poisoned lock) is a separate prerequisite
-//! before QUIC is on by default.
+//! - a PANIC in a QUIC task (quinn's connection drivers, the socket adapter
+//!   quinn's drivers call, or the node's own QUIC tasks and calls into
+//!   quinn) is caught (`super::contain`, which also says which panic it
+//!   cannot catch) and reported through [`EndpointHealth::task_panicked`]:
+//!   the endpoint is marked poisoned and `Down` (unless already
+//!   `Released`), the panic is logged at ERROR once and counted
+//!   (`quic_task_panicked`). quinn's driver returns only on an I/O error
+//!   from `drive_recv`, and [`QuicSocket`] never returns one, so in
+//!   production a panic is the one way the driver can end.
 //!
 //! With `transport-quic = "off"` no endpoint exists, and the transport
 //! reports [`QuicAvailability::Disabled`].
@@ -49,6 +42,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 
 use crate::transport::metrics::TRANSPORT_METRICS;
 
@@ -118,6 +112,12 @@ pub(crate) struct EndpointHealth {
     /// Set when the node dropped its last handle to the endpoint; the
     /// driver ending after that is the normal shutdown.
     released: AtomicBool,
+    /// Cancelled when a QUIC task of this endpoint panicked: from then on
+    /// quinn's locks may be poisoned, so nothing touches or drops a quinn
+    /// object of this endpoint again (see `super::contain`). Final.
+    poisoned: CancellationToken,
+    /// Whether a panic was already logged at ERROR.
+    panic_logged: AtomicBool,
     local_addr: SocketAddr,
 }
 
@@ -127,6 +127,8 @@ impl EndpointHealth {
         Arc::new(Self {
             availability,
             released: AtomicBool::new(false),
+            poisoned: CancellationToken::new(),
+            panic_logged: AtomicBool::new(false),
             local_addr,
         })
     }
@@ -161,6 +163,62 @@ impl EndpointHealth {
         self.released.load(Ordering::Acquire)
     }
 
+    /// Whether a QUIC task of this endpoint panicked (see
+    /// [`Self::task_panicked`]).
+    pub(crate) fn is_poisoned(&self) -> bool {
+        self.poisoned.is_cancelled()
+    }
+
+    /// Resolves once a QUIC task of this endpoint panicked; at once if one
+    /// already did.
+    pub(crate) fn poisoned(&self) -> tokio_util::sync::WaitForCancellationFutureOwned {
+        self.poisoned.clone().cancelled_owned()
+    }
+
+    /// A panic was caught in `task`, a QUIC task of this endpoint or a call
+    /// into quinn on its behalf. The future that panicked was leaked, not
+    /// dropped (see `super::contain`).
+    ///
+    /// Poisons the endpoint first, so anything that reacts to the `Down`
+    /// that follows already finds it poisoned and leaks instead of
+    /// dropping. Then marks it `Down` unless the node already released it
+    /// (counted in `quic_endpoint_down`, once), counts the panic, and logs
+    /// it: the first at ERROR, any later one at DEBUG (once poisoned, a
+    /// second panic is usually the same fault reached from another task).
+    pub(crate) fn task_panicked(&self, task: &'static str, payload: &(dyn std::any::Any + Send)) {
+        self.poisoned.cancel();
+        TRANSPORT_METRICS.record_quic_task_panicked(self.local_addr);
+        let message = panic_message(payload);
+        if self.panic_logged.swap(true, Ordering::AcqRel) {
+            tracing::debug!(
+                local_addr = %self.local_addr,
+                task,
+                panic = message,
+                "Another QUIC task panicked after the endpoint was turned off"
+            );
+        } else {
+            tracing::error!(
+                local_addr = %self.local_addr,
+                task,
+                panic = message,
+                "A QUIC task panicked. The QUIC endpoint is turned off and its \
+                 state is leaked instead of dropped; the node keeps running on the \
+                 UDP transport, with QUIC off until it restarts"
+            );
+        }
+        let went_down = self.availability.send_if_modified(|availability| {
+            if *availability == QuicAvailability::Up {
+                *availability = QuicAvailability::Down;
+                true
+            } else {
+                false
+            }
+        });
+        if went_down {
+            TRANSPORT_METRICS.record_quic_endpoint_down(self.local_addr);
+        }
+    }
+
     /// The endpoint driver's future returned.
     fn driver_ended(&self) {
         if self.is_released() {
@@ -190,10 +248,25 @@ impl EndpointHealth {
     }
 }
 
+/// The text of a panic payload, when it has one.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        message
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message
+    } else {
+        "(not a string)"
+    }
+}
+
 /// Run quinn's endpoint driver and report to `health` when it returns.
 ///
-/// No panic handling: a panic in quinn's driver is not contained here (see
-/// the module docs) and is never reported as `Down`.
+/// The catch here is a second line only. A panic in quinn's own driver code
+/// aborts the process before it reaches it (quinn drops the driver during
+/// the unwind; see `super::contain`), and the socket adapter catches its
+/// own. It would catch a panic that reaches it without unwinding through the
+/// driver's lock, and contains the endpoint driver too if quinn ever stops
+/// locking in `EndpointDriver::drop`.
 pub(crate) async fn watch_endpoint_driver(
     driver: Pin<Box<dyn Future<Output = ()> + Send>>,
     health: Arc<EndpointHealth>,
@@ -201,8 +274,12 @@ pub(crate) async fn watch_endpoint_driver(
     // quinn's spawned future logs and swallows the driver's I/O error, so an
     // error return and a normal return look alike here; `released` tells
     // them apart.
-    driver.await;
-    health.driver_ended();
+    if super::contain::catch_panics(&health, "endpoint driver", driver)
+        .await
+        .is_some()
+    {
+        health.driver_ended();
+    }
 }
 
 #[cfg(test)]

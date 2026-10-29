@@ -538,9 +538,14 @@ pub struct TransportMetrics {
     conn_identity: [AtomicU32; ConnIdentity::COUNT],
 
     /// Times the QUIC endpoint went down while the node still held it (its
-    /// driver future returned), after which the node runs with QUIC off
-    /// (reset each snapshot). At most one per endpoint.
+    /// driver future returned, or a QUIC task panicked), after which the
+    /// node runs with QUIC off (reset each snapshot). At most one per
+    /// endpoint.
     quic_endpoint_down: AtomicU64,
+    /// Panics caught in QUIC tasks (quinn's drivers, or the node's own QUIC
+    /// tasks and calls into quinn); each turns the endpoint off (reset each
+    /// snapshot).
+    quic_task_panicked: AtomicU64,
     /// QUIC connections this node closed, by [`QuicCloseCode`] (reset each
     /// snapshot).
     quic_close_sent: [AtomicU64; QuicCloseCode::COUNT],
@@ -706,6 +711,10 @@ struct NatDetailCounters {
     /// down (bounded), one per `record_quic_endpoint_down`.
     #[cfg(test)]
     quic_endpoint_down_at: parking_lot::Mutex<std::collections::VecDeque<SocketAddr>>,
+    /// Test-only log of the local addresses of QUIC endpoints a caught
+    /// panic was counted for (bounded), one per `record_quic_task_panicked`.
+    #[cfg(test)]
+    quic_task_panicked_at: parking_lot::Mutex<std::collections::VecDeque<SocketAddr>>,
     /// Test-only log of QUIC closes this node sent, with the remote
     /// (bounded).
     #[cfg(test)]
@@ -926,6 +935,7 @@ impl TransportMetrics {
             handshake_unauthenticated_dropped: AtomicU64::new(0),
             conn_identity: Default::default(),
             quic_endpoint_down: AtomicU64::new(0),
+            quic_task_panicked: AtomicU64::new(0),
             quic_close_sent: Default::default(),
             inbound_concurrency_epoch: AtomicU64::new(1),
             inbound_concurrency: Default::default(),
@@ -1352,6 +1362,28 @@ impl TransportMetrics {
         #[cfg(not(test))]
         let _ = local;
         self.quic_endpoint_down.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A panic was caught in a task of the QUIC endpoint bound at `local`
+    /// (`local` is never exported).
+    pub(crate) fn record_quic_task_panicked(&self, local: SocketAddr) {
+        #[cfg(test)]
+        push_test_log(&self.nat_detail.quic_task_panicked_at, local);
+        #[cfg(not(test))]
+        let _ = local;
+        self.quic_task_panicked.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Test-only: how many panics were caught in tasks of the QUIC endpoint
+    /// bound at `local`.
+    #[cfg(test)]
+    pub(crate) fn quic_task_panicked_at(&self, local: SocketAddr) -> usize {
+        self.nat_detail
+            .quic_task_panicked_at
+            .lock()
+            .iter()
+            .filter(|addr| **addr == local)
+            .count()
     }
 
     /// Test-only: how many times the QUIC endpoint bound at `local` went
@@ -1980,6 +2012,7 @@ impl TransportMetrics {
             upgrade_control_received: get64(&self.upgrade_control_received),
             handshake_unauthenticated_dropped: get64(&self.handshake_unauthenticated_dropped),
             quic_endpoint_down: get64(&self.quic_endpoint_down),
+            quic_task_panicked: get64(&self.quic_task_panicked),
             quic_close_sent_node_dropped_peer: get64(
                 &self.quic_close_sent[QuicCloseCode::NodeDroppedPeer as usize],
             ),
@@ -2493,6 +2526,8 @@ pub struct TransportSnapshot {
     /// Times the QUIC endpoint went down while the node held it; the node
     /// then runs with QUIC off (#5940 e4).
     pub quic_endpoint_down: u64,
+    /// Panics caught in QUIC tasks; each turns the endpoint off (#5940).
+    pub quic_task_panicked: u64,
     /// QUIC connections this node closed, by close code
     /// ([`QuicCloseCode`]).
     pub quic_close_sent_node_dropped_peer: u64,
@@ -2801,6 +2836,7 @@ impl TransportSnapshot {
             upgrade_control_received,
             handshake_unauthenticated_dropped,
             quic_endpoint_down,
+            quic_task_panicked,
             quic_close_sent_node_dropped_peer,
             quic_close_sent_downgrade,
             quic_close_sent_identity_mismatch,
@@ -2910,6 +2946,7 @@ impl TransportSnapshot {
         self.upgrade_control_received = upgrade_control_received;
         self.handshake_unauthenticated_dropped = handshake_unauthenticated_dropped;
         self.quic_endpoint_down = quic_endpoint_down;
+        self.quic_task_panicked = quic_task_panicked;
         self.quic_close_sent_node_dropped_peer = quic_close_sent_node_dropped_peer;
         self.quic_close_sent_downgrade = quic_close_sent_downgrade;
         self.quic_close_sent_identity_mismatch = quic_close_sent_identity_mismatch;
@@ -3062,6 +3099,8 @@ struct SnapshotExtras {
     /// Times the QUIC endpoint went down while the node held it; the node
     /// then runs with QUIC off (#5940 e4).
     pub quic_endpoint_down: u64,
+    /// Panics caught in QUIC tasks; each turns the endpoint off (#5940).
+    pub quic_task_panicked: u64,
     /// QUIC connections this node closed, by close code
     /// ([`QuicCloseCode`]).
     pub quic_close_sent_node_dropped_peer: u64,
@@ -3209,6 +3248,7 @@ impl SnapshotExtras {
             || self.upgrade_control_received != 0
             || self.handshake_unauthenticated_dropped != 0
             || self.quic_endpoint_down != 0
+            || self.quic_task_panicked != 0
             || self.quic_close_sent_node_dropped_peer != 0
             || self.quic_close_sent_downgrade != 0
             || self.quic_close_sent_identity_mismatch != 0
@@ -4095,6 +4135,27 @@ mod tests {
         assert_eq!(json["quic_endpoint_down"], 1);
         assert!(metrics.take_snapshot().is_none(), "the counter must reset");
         assert_eq!(metrics.quic_endpoint_down_at(local), 1);
+    }
+
+    /// Panics caught in QUIC tasks reach the snapshot and its JSON, count
+    /// as activity on their own, and reset.
+    #[test]
+    fn quic_task_panicked_reaches_snapshot_and_resets() {
+        let metrics = TransportMetrics::new();
+        let local: SocketAddr = "10.255.10.2:7".parse().unwrap();
+        assert!(
+            metrics.take_snapshot().is_none(),
+            "a fresh instance is idle"
+        );
+        metrics.record_quic_task_panicked(local);
+        let snap = metrics
+            .take_snapshot()
+            .expect("a caught panic alone is activity");
+        assert_eq!(snap.quic_task_panicked, 1);
+        let json = serde_json::to_value(&snap).unwrap();
+        assert_eq!(json["quic_task_panicked"], 1);
+        assert!(metrics.take_snapshot().is_none(), "the counter must reset");
+        assert_eq!(metrics.quic_task_panicked_at(local), 1);
     }
 
     /// The snapshot field that carries the period count of closes sent
@@ -5219,6 +5280,7 @@ mod tests {
             "upgrade_control_received",
             "handshake_unauthenticated_dropped",
             "quic_endpoint_down",
+            "quic_task_panicked",
             "quic_close_sent_node_dropped_peer",
             "quic_close_sent_downgrade",
             "quic_close_sent_identity_mismatch",

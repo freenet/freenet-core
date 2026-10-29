@@ -9,7 +9,10 @@
 //! The first task quinn spawns is the endpoint driver
 //! (`Endpoint::new_with_abstract_socket` spawns it before returning; every
 //! later spawn is a connection driver). The runtime wraps that one so its end
-//! is reported to the endpoint's [`EndpointHealth`] (see `liveness`).
+//! is reported to the endpoint's [`EndpointHealth`] (see `liveness`). Every
+//! task it spawns runs under `contain::catch_panics`: a panic in a driver is
+//! caught, the driver is leaked instead of dropped, and the endpoint is
+//! reported poisoned (see `contain`).
 
 use std::fmt;
 use std::future::Future;
@@ -21,6 +24,7 @@ use std::time::{Duration, Instant};
 
 use quinn::{AsyncTimer, AsyncUdpSocket, Runtime};
 
+use super::contain::catch_panics;
 use super::liveness::{EndpointHealth, watch_endpoint_driver};
 use crate::config::GlobalExecutor;
 use crate::simulation::TimeSource;
@@ -69,8 +73,9 @@ impl<T: TimeSource> Clock<T> {
 /// The QUIC endpoint's runtime: quinn's clock and timers on `T`.
 pub(crate) struct QuicRuntime<T> {
     clock: Arc<Clock<T>>,
-    /// Taken by the first spawn, quinn's endpoint driver.
-    endpoint_driver: parking_lot::Mutex<Option<Arc<EndpointHealth>>>,
+    health: Arc<EndpointHealth>,
+    /// Set by the first spawn, quinn's endpoint driver.
+    endpoint_driver_spawned: std::sync::atomic::AtomicBool,
 }
 
 impl<T: TimeSource> QuicRuntime<T> {
@@ -79,7 +84,8 @@ impl<T: TimeSource> QuicRuntime<T> {
     pub(crate) fn new(time: T, health: Arc<EndpointHealth>) -> Self {
         Self {
             clock: Arc::new(Clock::new(time)),
-            endpoint_driver: parking_lot::Mutex::new(Some(health)),
+            health,
+            endpoint_driver_spawned: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -103,15 +109,18 @@ impl<T: TimeSource> Runtime for QuicRuntime<T> {
         // quinn spawns its endpoint driver first, then one driver per
         // connection; each ends when its endpoint or connection does. None
         // is registered with BackgroundTaskMonitor: their end must not stop
-        // the node. The endpoint driver's end is reported instead.
-        let endpoint_driver = self.endpoint_driver.lock().take();
-        match endpoint_driver {
-            Some(health) => {
-                GlobalExecutor::spawn(watch_endpoint_driver(future, health));
-            }
-            None => {
-                GlobalExecutor::spawn(future);
-            }
+        // the node. The endpoint driver's end is reported instead, and a
+        // panic in any of them is caught and reported (`contain`).
+        let health = self.health.clone();
+        if self
+            .endpoint_driver_spawned
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            GlobalExecutor::spawn(async move {
+                catch_panics(&health, "connection driver", future).await;
+            });
+        } else {
+            GlobalExecutor::spawn(watch_endpoint_driver(future, health));
         }
     }
 

@@ -4,6 +4,15 @@
 //! fills; the endpoint never reads the UDP socket itself. Sending goes
 //! through the demux socket without waiting, and when the node has an egress
 //! cap each datagram is admitted by it first.
+//!
+//! quinn calls `poll_recv`, `try_send` and `poll_writable` while it holds its
+//! endpoint or connection state lock. A panic in them is caught here, so it
+//! never unwinds through quinn and never poisons that lock: it is reported
+//! like a panic in any QUIC task (`super::contain`), and the call returns as
+//! if nothing had arrived (`poll_recv`), as if the datagram was lost
+//! (`try_send`), or ready (`poll_writable`). This matters most for the
+//! endpoint driver, whose panic cannot be contained once it unwinds through
+//! quinn (see `super::contain`).
 
 use std::fmt;
 use std::io::{self, IoSliceMut};
@@ -18,6 +27,8 @@ use quinn::udp::{RecvMeta, Transmit};
 use quinn::{AsyncUdpSocket, UdpPoller};
 
 use super::config::MAX_UDP_PAYLOAD;
+use super::contain::catch;
+use super::liveness::EndpointHealth;
 use crate::transport::demux::{DemuxSocket, QuicIngressReceiver};
 use crate::transport::egress_cap::AdmissionWaiter;
 use crate::transport::{Socket, normalize_mapped_addr};
@@ -33,30 +44,86 @@ pub(crate) struct QuicSocket<S> {
     send_errors: AtomicU64,
     /// Whether the ingress queue's sending side is gone has been logged.
     ingress_closed_logged: AtomicBool,
-    /// Test hook: make the next receive fail, which ends quinn's endpoint
-    /// driver.
+    /// The endpoint's health, told of a panic caught in this adapter.
+    health: Arc<EndpointHealth>,
+    /// Test hooks: faults injected into quinn's drivers.
     #[cfg(test)]
-    receive_fault: Arc<ReceiveFault>,
+    faults: Arc<SocketFaults>,
 }
 
-/// Test hook: a socket error quinn's endpoint driver cannot get past, the
-/// way a socket that fails for good would end it.
+/// Test hooks: faults injected into quinn's drivers through this socket.
 #[cfg(test)]
 #[derive(Default)]
-pub(crate) struct ReceiveFault {
-    tripped: AtomicBool,
+pub(crate) struct SocketFaults {
+    /// What the endpoint's next receive does: [`RECEIVE_OK`],
+    /// [`RECEIVE_ERROR`], [`RECEIVE_PANIC`] or [`RECEIVE_PANIC_IN_QUINN`].
+    receive: std::sync::atomic::AtomicU8,
     waker: parking_lot::Mutex<Option<std::task::Waker>>,
+    /// Panic in the next connection driver that asks whether it can send:
+    /// [`WRITABLE_OK`], [`WRITABLE_PANIC`] or [`WRITABLE_PANIC_IN_QUINN`].
+    writable: std::sync::atomic::AtomicU8,
 }
 
 #[cfg(test)]
-impl ReceiveFault {
-    /// Fail the endpoint's next receive, and wake the driver so it makes
-    /// one.
-    pub(crate) fn trip(&self) {
-        self.tripped.store(true, Ordering::Release);
+const RECEIVE_OK: u8 = 0;
+#[cfg(test)]
+const RECEIVE_ERROR: u8 = 1;
+#[cfg(test)]
+const RECEIVE_PANIC: u8 = 2;
+/// A panic that unwinds through quinn, as one in quinn's own code would:
+/// raised outside the adapter's `catch_unwind`.
+#[cfg(test)]
+const RECEIVE_PANIC_IN_QUINN: u8 = 3;
+#[cfg(test)]
+const WRITABLE_OK: u8 = 0;
+#[cfg(test)]
+const WRITABLE_PANIC: u8 = 1;
+#[cfg(test)]
+const WRITABLE_PANIC_IN_QUINN: u8 = 2;
+
+#[cfg(test)]
+impl SocketFaults {
+    /// Fail the endpoint's next receive with a socket error quinn's
+    /// endpoint driver cannot get past, the way a socket that fails for
+    /// good would end it, and wake the driver so it makes one.
+    pub(crate) fn fail_receive(&self) {
+        self.trip_receive(RECEIVE_ERROR);
+    }
+
+    /// Panic in the endpoint's next receive, in the adapter's own code: the
+    /// adapter catches it. Wakes the driver so it makes one.
+    pub(crate) fn panic_receive(&self) {
+        self.trip_receive(RECEIVE_PANIC);
+    }
+
+    /// Panic in the endpoint's next receive in a way that unwinds through
+    /// quinn's endpoint driver while it holds the endpoint's state lock, as
+    /// a panic in quinn's own code would. Wakes the driver.
+    pub(crate) fn panic_receive_in_quinn(&self) {
+        self.trip_receive(RECEIVE_PANIC_IN_QUINN);
+    }
+
+    fn trip_receive(&self, fault: u8) {
+        self.receive.store(fault, Ordering::Release);
         if let Some(waker) = self.waker.lock().take() {
             waker.wake();
         }
+    }
+
+    /// Panic in the next connection driver that polls the socket for
+    /// write readiness, in the adapter's own code: the adapter catches it.
+    /// Once.
+    pub(crate) fn panic_next_writable(&self) {
+        self.writable.store(WRITABLE_PANIC, Ordering::Release);
+    }
+
+    /// Panic in the next connection driver that polls the socket for write
+    /// readiness in a way that unwinds through quinn's connection driver
+    /// while it holds that connection's state lock, as a panic in quinn's
+    /// own code would. Once.
+    pub(crate) fn panic_next_writable_in_quinn(&self) {
+        self.writable
+            .store(WRITABLE_PANIC_IN_QUINN, Ordering::Release);
     }
 }
 
@@ -74,6 +141,7 @@ impl<S: Socket> QuicSocket<S> {
         socket: Arc<DemuxSocket<S>>,
         ingress: QuicIngressReceiver,
         local_addr: SocketAddr,
+        health: Arc<EndpointHealth>,
     ) -> Self {
         Self {
             socket,
@@ -81,15 +149,16 @@ impl<S: Socket> QuicSocket<S> {
             local_addr,
             send_errors: AtomicU64::new(0),
             ingress_closed_logged: AtomicBool::new(false),
+            health,
             #[cfg(test)]
-            receive_fault: Arc::default(),
+            faults: Arc::default(),
         }
     }
 
-    /// The hook that fails this socket's receives (tests).
+    /// The hooks that inject faults through this socket (tests).
     #[cfg(test)]
-    pub(crate) fn receive_fault(&self) -> Arc<ReceiveFault> {
-        self.receive_fault.clone()
+    pub(crate) fn faults(&self) -> Arc<SocketFaults> {
+        self.faults.clone()
     }
 
     /// Sends that failed with an error other than `WouldBlock`.
@@ -141,6 +210,60 @@ impl<S: Socket> AsyncUdpSocket for QuicSocket<S> {
     /// connection driver stops the connection on a send error; a datagram
     /// lost here is retransmitted like one lost on the path.
     fn try_send(&self, transmit: &Transmit) -> io::Result<()> {
+        // A panic is caught (module docs) and the datagram counts as lost.
+        catch(&self.health, "socket send", || self.send_one(transmit)).unwrap_or(Ok(()))
+    }
+
+    /// Returns queued datagrams one per call. Never returns an error: quinn's
+    /// endpoint driver stops on any receive error other than
+    /// `ConnectionReset`, and nothing here is one it should stop for. Once
+    /// the queue's sending side is gone (the demux socket was dropped with
+    /// the transport) it stays `Pending`, and so it does once the endpoint
+    /// is poisoned (`super::contain`).
+    fn poll_recv(
+        &self,
+        cx: &mut Context<'_>,
+        bufs: &mut [IoSliceMut<'_>],
+        meta: &mut [RecvMeta],
+    ) -> Poll<io::Result<usize>> {
+        #[cfg(test)]
+        if self.faults.receive.load(Ordering::Acquire) == RECEIVE_PANIC_IN_QUINN {
+            self.faults.receive.store(RECEIVE_OK, Ordering::Release);
+            panic!("injected panic in the QUIC endpoint driver, unwinding through quinn");
+        }
+        if self.health.is_poisoned() {
+            return Poll::Pending;
+        }
+        catch(&self.health, "socket receive", || {
+            self.receive_one(cx, bufs, meta)
+        })
+        .unwrap_or(Poll::Pending)
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        Ok(self.local_addr)
+    }
+
+    /// One datagram per transmit: no GSO, and no request larger than one
+    /// datagram ever reaches the egress cap.
+    fn max_transmit_segments(&self) -> usize {
+        1
+    }
+
+    fn max_receive_segments(&self) -> usize {
+        1
+    }
+
+    /// Reported as `true` so quinn does not run path MTU discovery even if
+    /// the transport configuration asked for it; it does not.
+    fn may_fragment(&self) -> bool {
+        true
+    }
+}
+
+impl<S: Socket> QuicSocket<S> {
+    /// [`AsyncUdpSocket::try_send`], below the panic catch.
+    fn send_one(&self, transmit: &Transmit) -> io::Result<()> {
         debug_assert!(
             transmit.segment_size.is_none(),
             "max_transmit_segments is 1, so quinn sends one datagram per transmit"
@@ -177,12 +300,8 @@ impl<S: Socket> AsyncUdpSocket for QuicSocket<S> {
         }
     }
 
-    /// Returns queued datagrams one per call. Never returns an error: quinn's
-    /// endpoint driver stops on any receive error other than
-    /// `ConnectionReset`, and nothing here is one it should stop for. Once
-    /// the queue's sending side is gone (the demux socket was dropped with
-    /// the transport) it stays `Pending`.
-    fn poll_recv(
+    /// [`AsyncUdpSocket::poll_recv`], below the panic catch.
+    fn receive_one(
         &self,
         cx: &mut Context<'_>,
         bufs: &mut [IoSliceMut<'_>],
@@ -193,10 +312,15 @@ impl<S: Socket> AsyncUdpSocket for QuicSocket<S> {
         };
         #[cfg(test)]
         {
-            if self.receive_fault.tripped.load(Ordering::Acquire) {
-                return Poll::Ready(Err(io::Error::other("injected receive failure")));
+            match self.faults.receive.load(Ordering::Acquire) {
+                RECEIVE_OK => {}
+                RECEIVE_PANIC => {
+                    self.faults.receive.store(RECEIVE_OK, Ordering::Release);
+                    panic!("injected panic in the QUIC socket adapter (endpoint driver)");
+                }
+                _ => return Poll::Ready(Err(io::Error::other("injected receive failure"))),
             }
-            *self.receive_fault.waker.lock() = Some(cx.waker().clone());
+            *self.faults.waker.lock() = Some(cx.waker().clone());
         }
         let datagram = match self.ingress.lock().poll_recv(cx) {
             Poll::Pending => return Poll::Pending,
@@ -224,26 +348,6 @@ impl<S: Socket> AsyncUdpSocket for QuicSocket<S> {
         };
         Poll::Ready(Ok(1))
     }
-
-    fn local_addr(&self) -> io::Result<SocketAddr> {
-        Ok(self.local_addr)
-    }
-
-    /// One datagram per transmit: no GSO, and no request larger than one
-    /// datagram ever reaches the egress cap.
-    fn max_transmit_segments(&self) -> usize {
-        1
-    }
-
-    fn max_receive_segments(&self) -> usize {
-        1
-    }
-
-    /// Reported as `true` so quinn does not run path MTU discovery even if
-    /// the transport configuration asked for it; it does not.
-    fn may_fragment(&self) -> bool {
-        true
-    }
 }
 
 /// quinn's write-readiness check for one connection: ready when the socket
@@ -263,8 +367,50 @@ impl<S> fmt::Debug for QuicPoller<S> {
 }
 
 impl<S: Socket> UdpPoller for QuicPoller<S> {
+    /// A panic is caught (module docs) and reads as ready; the send that
+    /// follows then decides.
     fn poll_writable(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        #[cfg(test)]
+        if this
+            .socket
+            .faults
+            .writable
+            .compare_exchange(
+                WRITABLE_PANIC_IN_QUINN,
+                WRITABLE_OK,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            panic!("injected panic in a QUIC connection driver, unwinding through quinn");
+        }
+        let health = this.socket.health.clone();
+        catch(&health, "socket write readiness", || this.poll_ready(cx))
+            .unwrap_or(Poll::Ready(Ok(())))
+    }
+}
+
+impl<S: Socket> QuicPoller<S> {
+    /// [`UdpPoller::poll_writable`], below the panic catch.
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        #[cfg(test)]
+        if self
+            .socket
+            .faults
+            .writable
+            .compare_exchange(
+                WRITABLE_PANIC,
+                WRITABLE_OK,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            panic!("injected panic in the QUIC socket adapter");
+        }
+        let this = self;
         let demux = &this.socket.socket;
         match demux.poll_send_ready(cx) {
             Poll::Pending => return Poll::Pending,

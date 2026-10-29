@@ -584,12 +584,15 @@ async fn attempt(
                             quinn::crypto::rustls::QuicServerConfig::try_from(Arc::new(*tls))
                                 .unwrap(),
                         );
-                        let connection = incoming.incoming.accept_with(Arc::new(config))?.await?;
+                        let health = incoming.incoming.health().clone();
+                        let raw = incoming.incoming.into_inner().expect("healthy endpoint");
+                        let connection = raw.accept_with(Arc::new(config))?.await?;
                         Ok(QuicConnection::new(
                             connection,
                             incoming.permit,
                             Some(incoming.hold),
                             incoming.peer,
+                            health,
                         ))
                     }
                 }
@@ -1789,7 +1792,12 @@ fn the_socket_never_batches() {
             None,
         ));
         let ingress = demux.enable_quic_ingress().unwrap();
-        let socket = super::socket::QuicSocket::new(demux, ingress, addr);
+        let socket = super::socket::QuicSocket::new(
+            demux,
+            ingress,
+            addr,
+            super::liveness::EndpointHealth::new(addr),
+        );
         check(&socket);
         unregister_network_time_source(network);
     });
@@ -1994,6 +2002,7 @@ fn scripted(
             demux.clone(),
             ingress,
             local,
+            super::liveness::EndpointHealth::new(local),
         )),
         demux,
     )
@@ -2876,4 +2885,405 @@ fn concurrent_closers_close_and_count_once() {
         drop((client, _server));
         assert_eq!(TRANSPORT_METRICS.quic_close_sent_to(pair.b_addr).len(), 1);
     });
+}
+
+/// Set in the child process [`in_child`] starts.
+const PANIC_CHILD_ENV: &str = "FREENET_QUIC_PANIC_CHILD";
+
+/// Run `body` in a child process: the test binary re-run on the one test
+/// named `name` (under `transport::quic::tests`). A test whose failure is an
+/// aborted process then fails as one test instead of taking every test
+/// running beside it down, and its output says what happened.
+fn in_child(name: &str, body: impl FnOnce()) {
+    if std::env::var_os(PANIC_CHILD_ENV).is_some() {
+        body();
+        return;
+    }
+    let (test, output) = run_child(name);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "the child running {test} failed ({}).\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status
+    );
+    // libtest exits 0 when its filter matches nothing: a rename must fail.
+    assert!(
+        stdout.contains("1 passed"),
+        "the child did not run {test}; was it renamed?\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+/// Re-run the test binary on the one test `name`, in [`PANIC_CHILD_ENV`].
+fn run_child(name: &str) -> (String, std::process::Output) {
+    // The running image: after a concurrent rebuild replaces the test
+    // binary, Linux current_exe() reports "<path> (deleted)" (#5185).
+    let exe = if cfg!(target_os = "linux") {
+        std::path::PathBuf::from("/proc/self/exe")
+    } else {
+        std::env::current_exe().expect("test binary path")
+    };
+    let test = format!("transport::quic::tests::{name}");
+    let output = std::process::Command::new(exe)
+        .args(["--exact", "--test-threads=1", "--nocapture", &test])
+        .env(PANIC_CHILD_ENV, "1")
+        .output()
+        .expect("re-run the test binary");
+    (test, output)
+}
+
+/// A panic in the socket adapter while quinn's ENDPOINT driver calls it
+/// (its receive), inside quinn's poll while it holds the endpoint state
+/// lock. Without containment it unwinds through quinn, poisons that lock,
+/// and the process aborts: quinn's own task drops the driver during the
+/// unwind, and `EndpointDriver::drop` locks the poisoned mutex ("panic in a
+/// destructor during cleanup"). The adapter catches it before it reaches
+/// quinn. In a child process, so an abort fails this test:
+/// - the process keeps running, and the socket still passes UDP-transport
+///   datagrams;
+/// - the endpoint is `Down`, counted once as down and once as a panic;
+/// - a send in flight on a path returns `EndpointDown` (it would otherwise
+///   wait for acknowledgements no driver will ever receive), a new send and
+///   a new connect are refused as `EndpointDown`, and the accept loop parks
+///   without firing its monitor;
+/// - the connection's own state is intact, so the peer is told at once, by
+///   a close with DOWNGRADE;
+/// - dropping every handle afterwards neither panics nor aborts.
+#[test]
+fn the_endpoint_survives_a_panic_in_its_driver() {
+    in_child("the_endpoint_survives_a_panic_in_its_driver", || {
+        bounded(|| async move {
+            use super::path::{QuicPath, QuicSendError};
+            use crate::node::background_task_monitor::BackgroundTaskMonitor;
+            use crate::transport::QuicErrorKind;
+            use crate::transport::metrics::TRANSPORT_METRICS;
+            let _seed = GlobalRng::seed_guard(SEED);
+            let pair = pair(
+                "quic-panic-endpoint",
+                "10.201.37.1:5000".parse().unwrap(),
+                "10.201.37.2:5000".parse().unwrap(),
+                None,
+            )
+            .await;
+            let (_, client, server) = pair.transfer(payload(100), Duration::from_secs(60)).await;
+            let peer_side = server.inner().clone();
+            let (path, _inbound) = QuicPath::new(client, pair.time.clone());
+            let path = Arc::new(path);
+
+            let monitor = BackgroundTaskMonitor::new();
+            let (attempts, _attempts_rx) = tokio::sync::mpsc::channel(4);
+            assert!(pair.a.spawn_accept_loop(&monitor, attempts));
+            let monitor_fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let wait = {
+                let fired = monitor_fired.clone();
+                let wait = monitor.wait_for_any_exit();
+                tokio::spawn(async move {
+                    let _ = wait.await;
+                    fired.store(true, std::sync::atomic::Ordering::SeqCst);
+                })
+            };
+
+            // A send in flight: nothing reads the peer's side, so its stream
+            // credits are never returned, and the send after the last credit
+            // waits in `open_uni`. The transfer above used one credit, which
+            // quinn has not returned (it returns credit only once more than
+            // an eighth of the limit is freed).
+            let p = path.clone();
+            drive(&pair.time, Duration::from_secs(10), async move {
+                for _ in 1..config::MAX_UNI_STREAMS {
+                    p.send_short(b"fill").await.expect("a send with credit");
+                }
+            })
+            .await;
+            let in_flight = {
+                let path = path.clone();
+                tokio::spawn(async move { path.send_short(b"waits").await })
+            };
+            for _ in 0..64 {
+                tokio::task::yield_now().await;
+            }
+            if in_flight.is_finished() {
+                panic!(
+                    "the send should wait for a stream credit: {:?}",
+                    in_flight.await
+                );
+            }
+
+            pair.a.faults().panic_receive();
+            let mut availability = pair.a.availability();
+            let seen = drive(&pair.time, Duration::from_secs(1), async move {
+                availability.not_up().await
+            })
+            .await;
+            assert_eq!(seen, QuicAvailability::Down);
+            assert_eq!(TRANSPORT_METRICS.quic_endpoint_down_at(pair.a_addr), 1);
+            assert_eq!(TRANSPORT_METRICS.quic_task_panicked_at(pair.a_addr), 1);
+
+            // Callers see an error, never a hang.
+            let sent = drive(&pair.time, Duration::from_secs(1), async move {
+                in_flight.await.expect("the send task")
+            })
+            .await;
+            assert!(matches!(sent, Err(QuicSendError::EndpointDown)), "{sent:?}");
+            let p = path.clone();
+            let sent = drive(&pair.time, Duration::from_secs(1), async move {
+                p.send_short(b"after").await
+            })
+            .await;
+            assert!(matches!(sent, Err(QuicSendError::EndpointDown)), "{sent:?}");
+            let refused = pair
+                .a
+                .connect(pair.b_addr, &pair.b_key())
+                .await
+                .expect_err("the endpoint is down");
+            assert_eq!(QuicErrorKind::from(refused), QuicErrorKind::EndpointDown);
+
+            // The connection's state is intact, so the peer is told.
+            let closed = drive(&pair.time, Duration::from_secs(10), async move {
+                peer_side.closed().await
+            })
+            .await;
+            let quinn::ConnectionError::ApplicationClosed(close) = &closed else {
+                panic!("the peer saw {closed:?}");
+            };
+            assert_eq!(
+                close.error_code.into_inner(),
+                u64::from(error::close_code::DOWNGRADE)
+            );
+
+            // The accept loop parked, so its monitor never fires.
+            let time = pair.time.clone();
+            drive(&pair.time, Duration::from_secs(60), async move {
+                time.sleep(Duration::from_secs(30)).await;
+            })
+            .await;
+            assert!(
+                !monitor_fired.load(std::sync::atomic::Ordering::SeqCst),
+                "the accept loop's end would stop the node"
+            );
+
+            // The UDP side of the socket still works.
+            pair.pumps[0].abort();
+            pair.b_socket
+                .send_to(&[0x01, 0, 0, 0], pair.a_addr)
+                .await
+                .unwrap();
+            let socket = pair.a_socket.clone();
+            let (len, from) = drive(&pair.time, Duration::from_secs(10), async move {
+                let mut buf = vec![0u8; MAX_RECV_PACKET_SIZE];
+                loop {
+                    match socket.recv_classified(&mut buf).await.unwrap() {
+                        crate::transport::SocketRead::Datagram(len, from) => break (len, from),
+                        crate::transport::SocketRead::Diverted => {}
+                    }
+                }
+            })
+            .await;
+            assert_eq!((len, from), (4, pair.b_addr));
+
+            // Dropping everything is safe, and counts nothing more.
+            let a_addr = pair.a_addr;
+            drop(path);
+            drop(pair);
+            for _ in 0..64 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(TRANSPORT_METRICS.quic_endpoint_down_at(a_addr), 1);
+            assert_eq!(TRANSPORT_METRICS.quic_task_panicked_at(a_addr), 1);
+            wait.abort();
+        });
+    });
+}
+
+/// A panic in a quinn CONNECTION driver that unwinds through quinn while it
+/// holds that connection's state lock, as one in quinn's own code would
+/// (injected in the socket adapter's write-readiness poll, outside the
+/// adapter's catch). Without containment the panic itself is survived but
+/// nothing notices it: the endpoint stays `Up`, every later call on the
+/// connection panics in the caller, and dropping the connection handle
+/// aborts the process. With it (the runtime's catch), in a child process:
+/// - the endpoint is `Down`, counted once as down and once as a panic;
+/// - the send that ran into the panic, and any later one, return
+///   `EndpointDown`; a new connect is refused;
+/// - the connection's state is poisoned, so the path's receive task is left
+///   behind, and the path's channels are closed so a consumer sees the end;
+/// - dropping every handle afterwards neither panics nor aborts.
+#[test]
+fn the_endpoint_survives_a_panic_in_a_connection_driver() {
+    in_child(
+        "the_endpoint_survives_a_panic_in_a_connection_driver",
+        || {
+            bounded(|| async move {
+                use super::path::{QuicPath, QuicSendError};
+                use crate::transport::QuicErrorKind;
+                use crate::transport::metrics::TRANSPORT_METRICS;
+                let _seed = GlobalRng::seed_guard(SEED);
+                let pair = pair(
+                    "quic-panic-connection",
+                    "10.201.38.1:5000".parse().unwrap(),
+                    "10.201.38.2:5000".parse().unwrap(),
+                    None,
+                )
+                .await;
+                let (_, client, _server) =
+                    pair.transfer(payload(100), Duration::from_secs(60)).await;
+                let (path, inbound) = QuicPath::new(client, pair.time.clone());
+                let path = Arc::new(path);
+
+                // The connection driver panics on its next transmit, which this
+                // send asks for.
+                pair.a.faults().panic_next_writable_in_quinn();
+                let in_flight = {
+                    let path = path.clone();
+                    tokio::spawn(async move { path.send_short(b"boom").await })
+                };
+                let mut availability = pair.a.availability();
+                let seen = drive(&pair.time, Duration::from_secs(1), async move {
+                    availability.not_up().await
+                })
+                .await;
+                assert_eq!(seen, QuicAvailability::Down);
+                assert_eq!(TRANSPORT_METRICS.quic_endpoint_down_at(pair.a_addr), 1);
+                assert_eq!(TRANSPORT_METRICS.quic_task_panicked_at(pair.a_addr), 1);
+
+                let sent = drive(&pair.time, Duration::from_secs(1), async move {
+                    in_flight.await.expect("the send task")
+                })
+                .await;
+                assert!(matches!(sent, Err(QuicSendError::EndpointDown)), "{sent:?}");
+                let p = path.clone();
+                let sent = drive(&pair.time, Duration::from_secs(1), async move {
+                    p.send_control(b"after").await
+                })
+                .await;
+                assert!(matches!(sent, Err(QuicSendError::EndpointDown)), "{sent:?}");
+                let refused = pair
+                    .a
+                    .connect(pair.b_addr, &pair.b_key())
+                    .await
+                    .expect_err("the endpoint is down");
+                assert_eq!(QuicErrorKind::from(refused), QuicErrorKind::EndpointDown);
+
+                // The path's channels end.
+                let super::path::QuicInbound {
+                    mut shorts,
+                    mut streams,
+                    mut controls,
+                } = inbound;
+                let ended = drive(&pair.time, Duration::from_secs(1), async move {
+                    (
+                        shorts.recv().await.is_none(),
+                        streams.recv().await.is_none(),
+                        controls.recv().await.is_none(),
+                    )
+                })
+                .await;
+                assert_eq!(ended, (true, true, true));
+
+                // Dropping everything is safe, and counts nothing more.
+                let a_addr = pair.a_addr;
+                drop(path);
+                drop(_server);
+                drop(pair);
+                for _ in 0..64 {
+                    tokio::task::yield_now().await;
+                }
+                assert_eq!(TRANSPORT_METRICS.quic_endpoint_down_at(a_addr), 1);
+                assert_eq!(TRANSPORT_METRICS.quic_task_panicked_at(a_addr), 1);
+            });
+        },
+    );
+}
+
+/// NOT contained, pinned so it is not forgotten: a panic that unwinds
+/// through quinn's ENDPOINT driver (as one in quinn-proto's endpoint code
+/// would) still aborts the process. quinn's own spawned task holds the
+/// driver as a local, so the unwind drops it inside quinn, before any catch
+/// of ours can run, and `EndpointDriver::drop` (quinn 0.11.12 and quinn's
+/// main branch) unwraps the lock the panic poisoned. Only a change in quinn
+/// can contain it. When one lands, this test fails and the docs in
+/// `contain` must change with it.
+#[test]
+fn a_panic_unwinding_through_the_endpoint_driver_still_aborts() {
+    const NAME: &str = "a_panic_unwinding_through_the_endpoint_driver_still_aborts";
+    if std::env::var_os(PANIC_CHILD_ENV).is_some() {
+        bounded(|| async move {
+            let _seed = GlobalRng::seed_guard(SEED);
+            let pair = pair(
+                "quic-panic-in-quinn",
+                "10.201.39.1:5000".parse().unwrap(),
+                "10.201.39.2:5000".parse().unwrap(),
+                None,
+            )
+            .await;
+            pair.a.faults().panic_receive_in_quinn();
+            let mut availability = pair.a.availability();
+            drive(&pair.time, Duration::from_secs(1), async move {
+                availability.not_up().await
+            })
+            .await;
+        });
+        return;
+    }
+    let (test, output) = run_child(NAME);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success()
+            && stderr
+                .contains("injected panic in the QUIC endpoint driver, unwinding through quinn")
+            && stderr.contains("panic in a destructor during cleanup"),
+        "{test}: expected the child to abort in quinn's EndpointDriver::drop ({}).\nstderr:\n{stderr}",
+        output.status
+    );
+}
+
+/// A panic in the socket adapter while a quinn CONNECTION driver calls it
+/// (its write-readiness poll) is caught in the adapter, so the connection's
+/// lock is never poisoned: the endpoint goes `Down` and counts the panic, a
+/// send returns `EndpointDown`, and the connection is still closed for the
+/// peer with DOWNGRADE.
+#[test]
+fn a_panic_in_the_socket_adapter_under_a_connection_driver_is_caught() {
+    in_child(
+        "a_panic_in_the_socket_adapter_under_a_connection_driver_is_caught",
+        || {
+            bounded(|| async move {
+                use super::path::{QuicPath, QuicSendError};
+                use crate::transport::metrics::TRANSPORT_METRICS;
+                let _seed = GlobalRng::seed_guard(SEED);
+                let pair = pair(
+                    "quic-panic-adapter",
+                    "10.201.40.1:5000".parse().unwrap(),
+                    "10.201.40.2:5000".parse().unwrap(),
+                    None,
+                )
+                .await;
+                let (_, client, server) =
+                    pair.transfer(payload(100), Duration::from_secs(60)).await;
+                let peer_side = server.inner().clone();
+                let (path, _inbound) = QuicPath::new(client, pair.time.clone());
+                pair.a.faults().panic_next_writable();
+                let sent = drive(&pair.time, Duration::from_secs(1), async move {
+                    path.send_short(b"boom").await
+                })
+                .await;
+                assert!(matches!(sent, Err(QuicSendError::EndpointDown)), "{sent:?}");
+                assert_eq!(pair.a.availability().get(), QuicAvailability::Down);
+                assert_eq!(TRANSPORT_METRICS.quic_task_panicked_at(pair.a_addr), 1);
+                let closed = drive(&pair.time, Duration::from_secs(10), async move {
+                    peer_side.closed().await
+                })
+                .await;
+                let quinn::ConnectionError::ApplicationClosed(close) = &closed else {
+                    panic!("the peer saw {closed:?}");
+                };
+                assert_eq!(
+                    close.error_code.into_inner(),
+                    u64::from(error::close_code::DOWNGRADE)
+                );
+                drop(server);
+                drop(pair);
+            });
+        },
+    );
 }

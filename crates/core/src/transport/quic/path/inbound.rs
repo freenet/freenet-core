@@ -158,14 +158,31 @@ pub(in crate::transport::quic) struct Receiver<T> {
     time: T,
     budget: SharedInboundBudget,
     stats: Arc<QuicPathStats>,
-    shorts: mpsc::Sender<InboundShort>,
-    streams: mpsc::Sender<InboundStreamArrival>,
-    controls: mpsc::Sender<Bytes>,
+    /// The path's channels; `None` once severed ([`Self::sever`]).
+    outlets: parking_lot::Mutex<Option<Outlets>>,
     /// Source of the budget keys short messages are charged under.
     next_short_key: AtomicU32,
     /// Panic on the next stream, to test the supervisor.
     #[cfg(test)]
     pub(in crate::transport::quic) panic_on_stream: bool,
+}
+
+/// The sending ends of a path's channels.
+struct Outlets {
+    shorts: mpsc::Sender<InboundShort>,
+    streams: mpsc::Sender<InboundStreamArrival>,
+    controls: mpsc::Sender<Bytes>,
+}
+
+impl<T> Receiver<T> {
+    /// Drop the sending ends of the path's channels, so their consumers'
+    /// `recv` returns `None` once drained, even while a leaked receive task
+    /// still holds this receiver (see `supervise_receive`). Anything the
+    /// receive task delivers after this counts as dropped for a full
+    /// channel.
+    pub(in crate::transport::quic) fn sever(&self) {
+        drop(self.outlets.lock().take());
+    }
 }
 
 impl<T: TimeSource> Receiver<T> {
@@ -181,9 +198,11 @@ impl<T: TimeSource> Receiver<T> {
             time,
             budget,
             stats,
-            shorts,
-            streams,
-            controls,
+            outlets: parking_lot::Mutex::new(Some(Outlets {
+                shorts,
+                streams,
+                controls,
+            })),
             next_short_key: AtomicU32::new(1),
             #[cfg(test)]
             panic_on_stream: false,
@@ -741,12 +760,15 @@ impl<T: TimeSource> Receiver<T> {
             payload,
             _charge: token,
         };
-        match self.shorts.try_send(message) {
-            Ok(()) => self.stats.record(QuicInboundOutcome::DeliveredShort),
-            Err(_) => {
-                self.stats.record(QuicInboundOutcome::ShortDroppedFull);
-                tracing::debug!(total, "QUIC path: short message channel full; dropping");
-            }
+        let sent = match self.outlets.lock().as_ref() {
+            Some(outlets) => outlets.shorts.try_send(message).is_ok(),
+            None => false,
+        };
+        if sent {
+            self.stats.record(QuicInboundOutcome::DeliveredShort);
+        } else {
+            self.stats.record(QuicInboundOutcome::ShortDroppedFull);
+            tracing::debug!(total, "QUIC path: short message channel full; dropping");
         }
     }
 
@@ -808,7 +830,11 @@ impl<T: TimeSource> Receiver<T> {
             metadata,
             handle: guard.handle().clone(),
         };
-        if self.streams.try_send(arrival).is_err() {
+        let sent = match self.outlets.lock().as_ref() {
+            Some(outlets) => outlets.streams.try_send(arrival).is_ok(),
+            None => false,
+        };
+        if !sent {
             self.stats.record(QuicInboundOutcome::StreamDroppedFull);
             reader.stop(stop_code::CHANNEL_FULL);
             return;
@@ -897,9 +923,14 @@ impl<T: TimeSource> Receiver<T> {
             self.fail(&mut reader, failure, Charged::No);
             return;
         }
-        match self.controls.try_send(payload) {
-            Ok(()) => self.stats.record(QuicInboundOutcome::DeliveredControl),
-            Err(_) => self.stats.record(QuicInboundOutcome::ControlDroppedFull),
+        let sent = match self.outlets.lock().as_ref() {
+            Some(outlets) => outlets.controls.try_send(payload).is_ok(),
+            None => false,
+        };
+        if sent {
+            self.stats.record(QuicInboundOutcome::DeliveredControl);
+        } else {
+            self.stats.record(QuicInboundOutcome::ControlDroppedFull);
         }
     }
 }
