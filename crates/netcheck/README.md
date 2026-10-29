@@ -149,7 +149,9 @@ What the split changes for anyone reading the series:
 
 - A "0h" GET now runs minutes after its PUT (the job handoff, a build, a
   release download), not about 10 s after. The run line's `put_get_gap_ms`
-  says how long; `duration_ms` covers only the time spent in either phase.
+  says how long, up to the start of the GET phase; the getter's join (up to
+  120 s) comes on top. `duration_ms` covers only the time spent in either
+  phase.
 - The getter's address, and so its ring location, changes every night. The
   run line records both (`ephemeral_addr`, `ephemeral_location`).
 - The PUTs are recorded in the manifest before the GETs run, whatever they

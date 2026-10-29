@@ -115,8 +115,10 @@ phase_get() {
     local getter_host="${NETCHECK_GETTER_HOST:-gw2.freenet.org}"
     local getter_port="${NETCHECK_GETTER_PORT:-31338}"
     local getter_ip getter_key
-    getter_ip=$(getent ahostsv4 "$getter_host" | awk '{print $1}' | head -1)
-    getter_key=$(curl -fsS --max-time 30 "$key_url" | tr -d '[:space:]')
+    # `|| true`: under pipefail a failed lookup would exit here, before the
+    # message below says which of the two failed.
+    getter_ip=$(getent ahostsv4 "$getter_host" | awk '{print $1}' | head -1) || true
+    getter_key=$(curl -fsS --max-time 30 "$key_url" | tr -d '[:space:]') || true
     if [ -z "$getter_ip" ] || [ -z "$getter_key" ]; then
         log "could not resolve the getter gateway ($getter_host / $key_url)"
         exit 1

@@ -38,7 +38,9 @@ pub struct RunMeta {
     /// handoff, a build, a release download), where it used to be the ~10s
     /// settle. So a "0h" GET is read minutes after its PUT, and
     /// `duration_ms`, which covers only the time spent in either phase, does
-    /// not include it. Absent from runs before the split.
+    /// not include it. It is taken when the GET phase starts, before the
+    /// getter's node boots and joins (up to 120s more), so the first GET is
+    /// read somewhat later than this says. Absent from runs before the split.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub put_get_gap_ms: Option<u128>,
     /// The getter's own address and ring location, as its node reported them

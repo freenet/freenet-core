@@ -160,6 +160,7 @@ pub async fn run_put(args: PutCmd) -> Result<bool> {
         // Best effort: the handoff already on disk lacks only the note.
         put.handoff.save(&args.handoff)?;
     }
+    print_put_run_line(run_id, &args.put);
     Ok(true)
 }
 
@@ -208,6 +209,15 @@ fn report_put_failure(
     args: &PutArgs,
     report: &Report,
 ) -> anyhow::Error {
+    print_put_run_line(run_id, args);
+    report.print_summary();
+    e
+}
+
+/// The `put` host's report is published only when the GET side left none, as
+/// a run that could not complete. Without its own run line that record would
+/// carry no run id, so it could not be matched to the night's handoff.
+fn print_put_run_line(run_id: String, args: &PutArgs) {
     RunMeta::new(
         SCENARIO,
         run_id,
@@ -216,8 +226,6 @@ fn report_put_failure(
         Vec::new(),
     )
     .print();
-    report.print_summary();
-    e
 }
 
 /// Mark the PUT records with the host they ran on. The report is published
@@ -1261,6 +1269,18 @@ mod tests {
         put.record(&ok).expect("a writable manifest records");
         assert!(put.handoff.manifest_error.is_none());
         assert_eq!(Manifest::load(&ok).expect("load").runs.len(), 1);
+    }
+
+    #[test]
+    fn a_successful_put_phase_prints_its_run_line() {
+        // The `put` report is published when the GET side leaves none. Without
+        // a run line, emit files it under run id "unknown".
+        let put = fn_body(include_str!("put_get.rs"), "pub async fn run_put(");
+        let (_, after) = split_at_call(put, "put.handoff.save(&args.handoff)?;");
+        assert!(
+            after.contains("print_put_run_line(run_id, &args.put);"),
+            "`put` must print its run line once the handoff is written"
+        );
     }
 
     #[test]

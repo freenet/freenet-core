@@ -84,7 +84,7 @@ jobs:
     if: needs.put.outputs.handoff == 'yes'
     # Deliberately NOT the gateway host; see the comment at the top.
     runs-on: ubuntu-latest
-    timeout-minutes: 75
+    timeout-minutes: 85
 
     steps:
       - uses: actions/checkout@v7
@@ -162,7 +162,9 @@ jobs:
     # Whatever the GETs found, and also when the PUT phase failed, which then
     # publishes the run it left as one that could not complete. Not on a
     # manual cancel. Its result does not feed the notifications: a collector
-    # that is down is not a network regression.
+    # that is down is not a network regression. Re-running a failed `get`
+    # re-runs this too, so the night is published again under the same run
+    # id, with its "0h" GETs read hours late (`put_get_gap_ms` shows it).
     if: ${{ !cancelled() }}
     runs-on: self-hosted
     timeout-minutes: 20
