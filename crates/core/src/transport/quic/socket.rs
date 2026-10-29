@@ -479,23 +479,27 @@ impl<S: Socket> QuicPoller<S> {
     /// [`UdpPoller::poll_writable`], below the panic catch.
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         #[cfg(test)]
-        let fault = self.socket.faults.writable.load(Ordering::Acquire);
-        if fault == WRITABLE_PANIC_ONCE {
-            self.socket.faults.writable.store(0, Ordering::Release);
-        }
-        // Past this many panics the hook reports Pending instead, so a test
-        // of a driver that loops on the fault ends and can count the loops.
-        if fault == WRITABLE_PANIC
-            && self.socket.faults.writable_panics.load(Ordering::Acquire) >= WRITABLE_PANIC_LIMIT
         {
-            return Poll::Pending;
-        }
-        if fault == WRITABLE_PANIC || fault == WRITABLE_PANIC_ONCE {
-            self.socket
-                .faults
-                .writable_panics
-                .fetch_add(1, Ordering::AcqRel);
-            panic!("injected panic in the QUIC socket adapter (write readiness)");
+            let fault = self.socket.faults.writable.load(Ordering::Acquire);
+            if fault == WRITABLE_PANIC_ONCE {
+                self.socket.faults.writable.store(0, Ordering::Release);
+            }
+            // Past this many panics the hook reports Pending instead, so a
+            // test of a driver that loops on the fault ends and can count
+            // the loops.
+            if fault == WRITABLE_PANIC
+                && self.socket.faults.writable_panics.load(Ordering::Acquire)
+                    >= WRITABLE_PANIC_LIMIT
+            {
+                return Poll::Pending;
+            }
+            if fault == WRITABLE_PANIC || fault == WRITABLE_PANIC_ONCE {
+                self.socket
+                    .faults
+                    .writable_panics
+                    .fetch_add(1, Ordering::AcqRel);
+                panic!("injected panic in the QUIC socket adapter (write readiness)");
+            }
         }
         let this = self;
         let demux = &this.socket.socket;
