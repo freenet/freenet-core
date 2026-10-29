@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::config::{NetworkApiConfig, QuicMaxPathsSetting};
 use crate::transport::quic::QuicMode;
-use crate::transport::quic::breaker::BreakerOutcome;
+use crate::transport::quic::breaker::{BreakerOutcome, Verdict};
 use crate::transport::quic::liveness::{QuicAvailability, QuicAvailabilityWatch};
 
 /// The node's QUIC upgrade policy. See the module docs.
@@ -48,8 +48,9 @@ pub(crate) struct QuicPolicy {
 pub(crate) enum DisabledBy {
     /// `transport-quic` is off.
     Mode,
-    /// The crash-loop breaker keeps QUIC off for this run.
-    Breaker(BreakerOutcome),
+    /// The crash-loop breaker keeps QUIC off for this run, with this
+    /// verdict.
+    Breaker(Verdict),
     /// `quic-max-paths` is 0.
     NoPaths,
     /// The endpoint is not up: never built, down, or released.
@@ -119,8 +120,8 @@ impl QuicPolicy {
         if self.mode == QuicMode::Off {
             return Some(DisabledBy::Mode);
         }
-        if self.breaker.suppresses() {
-            return Some(DisabledBy::Breaker(self.breaker));
+        if let Some(verdict) = self.breaker.suppressing_verdict() {
+            return Some(DisabledBy::Breaker(verdict));
         }
         if self.permits.limit() == 0 {
             return Some(DisabledBy::NoPaths);
@@ -196,14 +197,19 @@ fn configured_mode(config: &NetworkApiConfig) -> QuicMode {
 }
 
 /// Report the QUIC upgrade configuration once, at node startup: that
-/// `prefer` runs as `shadow` (INFO), a `quic-max-paths` that cannot be
-/// parsed (WARN), and one lowered to `max-number-of-connections` (INFO).
+/// `prefer` runs as `shadow` (INFO), and, with QUIC on, a `quic-max-paths`
+/// that cannot be parsed (WARN) or is lowered to `max-number-of-connections`
+/// (INFO).
 pub(crate) fn log_startup(config: &NetworkApiConfig) {
     if configured_mode(config) == QuicMode::Prefer {
         tracing::info!(
             "transport-quic = \"prefer\" runs as \"shadow\" in this release: QUIC paths \
              carry only control frames and all application traffic stays on UDP"
         );
+    }
+    // `quic-max-paths` matters only with QUIC on.
+    if configured_mode(config) == QuicMode::Off {
+        return;
     }
     match config.quic_max_paths_setting() {
         QuicMaxPathsSetting::Unset => {}
@@ -225,7 +231,6 @@ pub(crate) fn log_startup(config: &NetworkApiConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::quic::breaker::Verdict;
 
     const AVAILABILITIES: [QuicAvailability; 4] = [
         QuicAvailability::Disabled,
@@ -271,8 +276,8 @@ mod tests {
                     for availability in AVAILABILITIES {
                         let expected = if mode == "off" {
                             Some(DisabledBy::Mode)
-                        } else if breaker.suppresses() {
-                            Some(DisabledBy::Breaker(breaker))
+                        } else if let BreakerOutcome::Decided(Verdict::Trip) = breaker {
+                            Some(DisabledBy::Breaker(Verdict::Trip))
                         } else if max_paths == 0 {
                             Some(DisabledBy::NoPaths)
                         } else if availability != QuicAvailability::Up {
@@ -438,8 +443,8 @@ mod tests {
     }
 
     /// Startup says that `prefer` runs as `shadow` (INFO), warns about a
-    /// `quic-max-paths` it cannot parse, and says when it lowers one; a
-    /// plain configuration logs none of it.
+    /// `quic-max-paths` it cannot parse, and says when it lowers one, the
+    /// last two only with QUIC on; a plain configuration logs none of it.
     #[test]
     fn startup_reports_prefer_and_max_paths() {
         const PREFER: &str = "runs as \"shadow\" in this release";
@@ -448,6 +453,8 @@ mod tests {
         let above = (config("off", None).max_connections + 1).to_string();
         for (mode, max_paths, expected) in [
             ("off", None, None),
+            ("off", Some("lots"), None),
+            ("off", Some(above.as_str()), None),
             ("shadow", Some("3"), None),
             ("prefer", None, Some(("INFO", PREFER))),
             ("shadow", Some("lots"), Some(("WARN", INVALID))),

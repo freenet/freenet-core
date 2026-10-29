@@ -1024,7 +1024,7 @@ impl ConfigArgs {
             if self.network_api.transport_quic.is_none() {
                 self.network_api.transport_quic = cfg.network_api.transport_quic.clone();
             }
-            // Kept as written, an unparsable value included, like
+            // Merged whatever it holds, an unparsable value included, like
             // `transport-quic` above.
             if let Some(limit) = cfg.network_api.quic_max_paths.clone() {
                 self.network_api.quic_max_paths.get_or_insert(limit);
@@ -2795,10 +2795,12 @@ pub struct NetworkApiConfig {
     )]
     pub transport_quic: Option<String>,
 
-    /// The most QUIC paths this node holds at once (#5940), as written. Kept
-    /// as text, so a value this binary cannot parse neither stops it from
-    /// starting nor is lost when `config.toml` is rewritten (as with
-    /// `transport-quic`). Read through [`Self::quic_max_paths`].
+    /// The most QUIC paths this node holds at once (#5940), stored as text so
+    /// a value this binary cannot parse does not stop it from starting (as
+    /// with `transport-quic`). An integer or string is kept as written; a
+    /// bool or float is kept as its text, and an array, table or datetime as
+    /// a placeholder ([`lenient_count`]). Read through
+    /// [`Self::quic_max_paths`].
     #[serde(
         default,
         rename = "quic-max-paths",
@@ -2943,9 +2945,12 @@ pub(crate) enum QuicMaxPathsSetting<'a> {
     Invalid(&'a str),
 }
 
-/// Serde for a count kept as text (`quic-max-paths`): any scalar is accepted
-/// and stored as written, so a value this binary cannot parse does not stop
-/// `config.toml` from loading. An integer is written back as a number.
+/// Serde for a count stored as text (`quic-max-paths`). Any TOML value is
+/// accepted, so a value this binary cannot parse does not stop `config.toml`
+/// from loading. An integer or string is stored as written and written back
+/// the same way; a bool or float is stored as its text and written back as a
+/// string; an array, table or datetime (which TOML hands over as a table) is
+/// stored as [`NOT_A_SCALAR`].
 mod lenient_count {
     use std::fmt;
 
@@ -7133,14 +7138,25 @@ shutdown-drain-secs = 42
             );
         }
 
-        // `quic-max-paths`: kebab-case, kept as written whether or not this
-        // binary can parse it (so neither a later release's value nor a typo
-        // stops the node from starting), and written back as a number when it
-        // is one. Only the parsed value is lowered or ignored.
+        // `quic-max-paths`: kebab-case, and any value loads (so neither a
+        // later release's value nor a typo stops the node from starting).
+        // Integers and strings round-trip as written; other values are kept
+        // as text or a placeholder. Only the parsed value is lowered or
+        // ignored.
         assert!(
             toml::to_string(&unset)
                 .unwrap()
                 .contains("quic-max-paths = 7")
+        );
+        let without = RELEASED_CONFIG_TOML.replacen("quic-max-paths = 7\n", "", 1);
+        assert_ne!(without, RELEASED_CONFIG_TOML, "the key was removed");
+        let without: Config = toml::from_str(&without).unwrap();
+        assert_eq!(without.network_api.quic_max_paths, None);
+        assert!(
+            !toml::to_string(&without)
+                .unwrap()
+                .contains("quic-max-paths"),
+            "an unset key is not written"
         );
         for (written, kept, limit, rewritten) in [
             ("5", "5", 5, "quic-max-paths = 5"),

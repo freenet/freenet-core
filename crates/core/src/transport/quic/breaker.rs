@@ -298,11 +298,12 @@ pub(crate) enum BreakerOutcome {
 }
 
 impl BreakerOutcome {
-    /// Whether the breaker keeps QUIC off for this run.
-    pub(crate) fn suppresses(self) -> bool {
+    /// The verdict, when the breaker ran and keeps QUIC off for this run.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn suppressing_verdict(self) -> Option<Verdict> {
         match self {
-            Self::NotConsulted => false,
-            Self::Decided(verdict) => !verdict.quic_enabled(),
+            Self::NotConsulted => None,
+            Self::Decided(verdict) => (!verdict.quic_enabled()).then_some(verdict),
         }
     }
 }
@@ -1186,7 +1187,7 @@ mod tests {
     /// verdict keeps QUIC off; a breaker that did not run suppresses nothing.
     #[test]
     fn outcome_suppresses_only_a_verdict_that_keeps_quic_off() {
-        assert!(!BreakerOutcome::NotConsulted.suppresses());
+        assert_eq!(BreakerOutcome::NotConsulted.suppressing_verdict(), None);
         for (verdict, suppresses) in [
             (Verdict::Arm, false),
             (Verdict::RunUnarmed, false),
@@ -1195,8 +1196,8 @@ mod tests {
             (Verdict::Unreadable, true),
         ] {
             assert_eq!(
-                BreakerOutcome::Decided(verdict).suppresses(),
-                suppresses,
+                BreakerOutcome::Decided(verdict).suppressing_verdict(),
+                suppresses.then_some(verdict),
                 "{verdict:?}"
             );
         }

@@ -854,9 +854,14 @@ true when none does. `admit()` returns a `QuicPathPermit` or
 still up. `QuicPathPermits` holds at most `quic-max-paths` paths, released on
 drop.
 
-`quic-max-paths` is kept as text (`lenient_count`), like `transport-quic`: a
-value that is not a whole number is ignored with a WARN at startup and reads
-as the default, so a typo or a later release's value cannot stop the node.
+`quic-max-paths` is stored as text (`lenient_count`), like `transport-quic`,
+so any value loads: an integer or string is kept as written, a bool or float
+as its text, and an array, table or datetime as a placeholder. A value that is
+not a whole number is ignored with a WARN at startup (only when
+`transport-quic` is not off) and reads as the default, so a typo or a later
+release's value cannot stop the node. On the command line a negative value
+needs `=` (`--quic-max-paths=-1`): with a space clap reads `-1` as a flag and
+refuses the command line, as for every numeric option.
 The default is `max-number-of-connections`, and a larger value is lowered to
 it, because the flow-control windows are sized for that many connections.
 At the default the limit rarely binds (a permit is held from the offer, so a

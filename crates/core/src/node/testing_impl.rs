@@ -8082,7 +8082,7 @@ mod tests {
         );
     }
 
-    /// In a running simulation a node with `transport-quic = "prefer"`
+    /// In a running simulation a node with `transport-quic = "shadow"`
     /// has a QUIC ingress on its socket (a QUIC-class datagram from a
     /// stranger is refused as not allowed), and a node left off has none.
     #[tokio::test(flavor = "current_thread")]
