@@ -1908,7 +1908,8 @@ impl Scripted {
             conn: None,
         };
         let b_socket = Arc::new(SimulationSocket::bind(b_addr).await.expect("sim bind"));
-        let inbox: Arc<std::sync::Mutex<VecDeque<(Vec<u8>, SocketAddr)>>> = Arc::default();
+        type Inbox = std::sync::Mutex<VecDeque<(Vec<u8>, SocketAddr)>>;
+        let inbox: Arc<Inbox> = Arc::default();
         let (socket, queue) = (b_socket.clone(), inbox.clone());
         tasks.push(tokio::spawn(async move {
             let mut buf = vec![0u8; MAX_RECV_PACKET_SIZE];
@@ -1941,7 +1942,7 @@ impl Scripted {
                         if let Some(id) = conn.streams().open(quinn_proto::Dir::Uni) {
                             let mut first = header(1, 1, StreamId::next().0, 1024 * 1024, 0);
                             first.extend_from_slice(&[0xEE; 64]);
-                            let _ = conn.send_stream(id).write(&first);
+                            conn.send_stream(id).write(&first).ok();
                             last_stream = Some(id);
                         }
                     }

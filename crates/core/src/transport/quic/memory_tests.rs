@@ -441,7 +441,7 @@ pub(super) fn transfer_one_stream(
             let mut recv = receiver.conn().recv_stream(*stream);
             if let Ok(mut chunks) = recv.read(true) {
                 while let Ok(Some(_)) = chunks.next(usize::MAX) {}
-                let _ = chunks.finalize();
+                let _transmit = chunks.finalize();
             }
         }
         for datagram in receiver.transmit(now) {
