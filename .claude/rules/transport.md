@@ -833,18 +833,39 @@ it must not wait unless it is a pacing point.
 
 `transport-quic` (config key, `off` by default, `shadow` or `prefer`) decides
 whether `bind_udp_listener` builds a quinn endpoint over the DemuxSocket.
-`prefer` runs as `shadow` until QUIC carries data (`QuicMode::effective`,
-which logs it at INFO). Off: no endpoint, no QUIC ingress, nothing changes.
-QUIC must stay off by default on Windows until the crash-loop breaker works
-there (#6031). Shadow or prefer: the endpoint is built
+`prefer` runs as `shadow` until QUIC carries data (`QuicMode::effective`;
+`upgrade::policy::log_startup` says so at INFO once per node). The release
+that makes `prefer` carry data must say in its notes that existing `prefer`
+configs start carrying data. Off: no endpoint, no QUIC ingress, nothing
+changes. QUIC must stay off by default on Windows until the crash-loop
+breaker works there (#6031). Shadow or prefer: the endpoint is built
 with the node's QUIC identity (below) and an EMPTY allow-set, so nothing
 reaches it and it sends nothing; the listener holds it. Upgrading a UDP
-session to QUIC comes later, so only tests open QUIC connections. Its policy
-exists (`quic/upgrade/policy.rs`, not yet wired in): `QuicPolicy::allowed()`
-is true only when the mode is not off, the endpoint is `Up` and the breaker
-is not suppressing QUIC, and `QuicPathPermits` holds at most `quic-max-paths`
-paths (default `max-number-of-connections`). An unknown
-value is off with a warning, never an error: a crash-loop rollback
+session to QUIC comes later, so only tests open QUIC connections.
+
+Upgrade policy (`quic/upgrade/policy.rs`, not yet wired in):
+`QuicPolicy::new(network_api, breaker, availability)` takes the config, the
+breaker's decision (`breaker::gate` returns it beside the settings, as
+`Gated`) and the endpoint's availability. `disabled_by()` names the first
+rule that stops upgrades: `Mode` (off), `Breaker`, `NoPaths`
+(`quic-max-paths` = 0) or `Endpoint(availability)` (not `Up`); `allowed()` is
+true when none does. `admit()` returns a `QuicPathPermit` or
+`PathRefusal::{Disabled(cause), Busy}`; `Ok` does not prove the endpoint is
+still up. `QuicPathPermits` holds at most `quic-max-paths` paths, released on
+drop.
+
+`quic-max-paths` is kept as text (`lenient_count`), like `transport-quic`: a
+value that is not a whole number is ignored with a WARN at startup and reads
+as the default, so a typo or a later release's value cannot stop the node.
+The default is `max-number-of-connections`, and a larger value is lowered to
+it, because the flow-control windows are sized for that many connections.
+At the default the limit rarely binds (a permit is held from the offer, so a
+path still closing can briefly hold a slot). A rollback to a release before
+the key drops it: the older binary rewrites `config.toml` without it. It is
+kebab-case from the start, so it has no `CONFIG_KEY_SPELLINGS` entry.
+
+An unknown `transport-quic` value is off with a warning, never an error: a
+crash-loop rollback
 reinstalls an older binary, which must start with a value a later release
 wrote, and keeps it in config.toml.
 

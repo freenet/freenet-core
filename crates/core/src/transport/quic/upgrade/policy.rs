@@ -1,30 +1,34 @@
 //! Whether this node may upgrade a UDP session to QUIC, and how many QUIC
 //! paths it may hold (#5940, step e5a-2).
 //!
-//! [`QuicPolicy::allowed`] is true only when all three hold:
+//! [`QuicPolicy::disabled_by`] names the first rule that stops upgrades, and
+//! [`QuicPolicy::allowed`] is true when none does:
 //!
-//! - `transport-quic` is not `off` ([`QuicMode`]; `prefer` runs as
-//!   `shadow` in this release);
+//! - `transport-quic` is not `off` ([`QuicMode`]; `prefer` runs as `shadow`
+//!   in this release);
+//! - the crash-loop breaker is not keeping QUIC off ([`BreakerOutcome`]).
+//!   Today a suppressing breaker also stops the endpoint being built, so the
+//!   availability is `Disabled` anyway; the policy checks the breaker itself
+//!   so the result does not depend on that, and so a refusal names the cause;
+//! - `quic-max-paths` is not 0, which is a decision to turn upgrades off;
 //! - the endpoint is [`QuicAvailability::Up`]. Every other availability is
-//!   final, so once the endpoint is down the node never upgrades again
-//!   before it restarts;
-//! - the crash-loop breaker is not keeping QUIC off
-//!   ([`breaker`](super::super::breaker)). Today a suppressing breaker also
-//!   stops the endpoint being built, so the availability is `Disabled`
-//!   anyway; the policy checks the breaker itself so that it holds without
-//!   relying on that.
+//!   final, so once the endpoint is down the node does not upgrade again
+//!   before it restarts.
 //!
 //! [`QuicPathPermits`] bounds the paths the node holds, from offering or
 //! dialing through active, at `quic-max-paths`. A permit is released when it
 //! is dropped, so a path cannot keep one past its own end.
 //!
 //! Nothing in the node builds a policy yet: the upgrade negotiation that
-//! reads it comes in later steps (e5a-3 to e5a-5).
+//! reads it comes in later steps (e5a-3 to e5a-5). [`log_startup`] already
+//! runs at node startup.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::config::{NetworkApiConfig, QuicMaxPathsSetting};
 use crate::transport::quic::QuicMode;
+use crate::transport::quic::breaker::BreakerOutcome;
 use crate::transport::quic::liveness::{QuicAvailability, QuicAvailabilityWatch};
 
 /// The node's QUIC upgrade policy. See the module docs.
@@ -33,17 +37,31 @@ use crate::transport::quic::liveness::{QuicAvailability, QuicAvailabilityWatch};
 pub(crate) struct QuicPolicy {
     /// The mode this release runs ([`QuicMode::effective`]): never `Prefer`.
     mode: QuicMode,
+    breaker: BreakerOutcome,
     availability: QuicAvailabilityWatch,
-    breaker_suppressed: bool,
     permits: QuicPathPermits,
+}
+
+/// Why the policy refuses upgrades.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DisabledBy {
+    /// `transport-quic` is off.
+    Mode,
+    /// The crash-loop breaker keeps QUIC off for this run.
+    Breaker(BreakerOutcome),
+    /// `quic-max-paths` is 0.
+    NoPaths,
+    /// The endpoint is not up: never built, down, or released.
+    Endpoint(QuicAvailability),
 }
 
 /// Why [`QuicPolicy::admit`] refused a new path.
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PathRefusal {
-    /// [`QuicPolicy::allowed`] is false.
-    Disabled,
+    /// The policy refuses upgrades at all.
+    Disabled(DisabledBy),
     /// Every permit is held.
     Busy,
 }
@@ -70,22 +88,22 @@ impl Drop for QuicPathPermit {
 
 #[cfg_attr(not(test), allow(dead_code))]
 impl QuicPolicy {
-    /// The policy for a node configured with `configured`, whose endpoint
-    /// reports `availability`, with `breaker_suppressed` set when the
-    /// crash-loop breaker keeps QUIC off for this run, holding at most
-    /// `max_paths` paths (`quic-max-paths`). Logs at INFO when `configured`
-    /// is `Prefer` ([`QuicMode::effective`]).
+    /// The policy for a node configured by `config`, whose crash-loop
+    /// breaker decided `breaker` ([`breaker::gate`]) and whose endpoint
+    /// reports `availability`. Logs nothing: [`log_startup`] reports the
+    /// configuration once.
+    ///
+    /// [`breaker::gate`]: crate::transport::quic::breaker::gate
     pub(crate) fn new(
-        configured: QuicMode,
+        config: &NetworkApiConfig,
+        breaker: BreakerOutcome,
         availability: QuicAvailabilityWatch,
-        breaker_suppressed: bool,
-        max_paths: usize,
     ) -> Self {
         Self {
-            mode: configured.effective(),
+            mode: configured_mode(config).effective(),
+            breaker,
             availability,
-            breaker_suppressed,
-            permits: QuicPathPermits::new(max_paths),
+            permits: QuicPathPermits::new(config.quic_max_paths()),
         }
     }
 
@@ -94,19 +112,40 @@ impl QuicPolicy {
         self.mode
     }
 
-    /// Whether the node may upgrade a session to QUIC now. Read it again for
-    /// each decision: it turns false for good when the endpoint goes down.
-    pub(crate) fn allowed(&self) -> bool {
-        self.mode != QuicMode::Off
-            && self.availability.get() == QuicAvailability::Up
-            && !self.breaker_suppressed
+    /// The first rule that stops upgrades now, in the order of the module
+    /// docs, or `None` when upgrades are allowed. Read it again for each
+    /// decision: it changes for good when the endpoint goes down.
+    pub(crate) fn disabled_by(&self) -> Option<DisabledBy> {
+        if self.mode == QuicMode::Off {
+            return Some(DisabledBy::Mode);
+        }
+        if self.breaker.suppresses() {
+            return Some(DisabledBy::Breaker(self.breaker));
+        }
+        if self.permits.limit() == 0 {
+            return Some(DisabledBy::NoPaths);
+        }
+        match self.availability.get() {
+            QuicAvailability::Up => None,
+            other @ (QuicAvailability::Disabled
+            | QuicAvailability::Down
+            | QuicAvailability::Released) => Some(DisabledBy::Endpoint(other)),
+        }
     }
 
-    /// A permit for one new path, or why there is none. A disallowed policy
+    /// Whether the node may upgrade a session to QUIC now.
+    pub(crate) fn allowed(&self) -> bool {
+        self.disabled_by().is_none()
+    }
+
+    /// A permit for one new path, or why there is none. A disabled policy
     /// refuses without touching the permits.
+    ///
+    /// `Ok` does not prove the endpoint is still up: it can go down just
+    /// after the check, so a path must still handle a down endpoint.
     pub(crate) fn admit(&self) -> Result<QuicPathPermit, PathRefusal> {
-        if !self.allowed() {
-            return Err(PathRefusal::Disabled);
+        if let Some(cause) = self.disabled_by() {
+            return Err(PathRefusal::Disabled(cause));
         }
         self.permits.try_acquire().ok_or(PathRefusal::Busy)
     }
@@ -150,9 +189,43 @@ impl QuicPathPermits {
     }
 }
 
+/// The configured `transport-quic` mode. An unknown value is off, and
+/// `quic_settings` has already warned about it.
+fn configured_mode(config: &NetworkApiConfig) -> QuicMode {
+    QuicMode::from_config_value(config.transport_quic.as_deref())
+}
+
+/// Report the QUIC upgrade configuration once, at node startup: that
+/// `prefer` runs as `shadow` (INFO), a `quic-max-paths` that cannot be
+/// parsed (WARN), and one lowered to `max-number-of-connections` (INFO).
+pub(crate) fn log_startup(config: &NetworkApiConfig) {
+    if configured_mode(config) == QuicMode::Prefer {
+        tracing::info!(
+            "transport-quic = \"prefer\" runs as \"shadow\" in this release: QUIC paths \
+             carry only control frames and all application traffic stays on UDP"
+        );
+    }
+    match config.quic_max_paths_setting() {
+        QuicMaxPathsSetting::Unset => {}
+        QuicMaxPathsSetting::Invalid(raw) => tracing::warn!(
+            quic_max_paths = %raw,
+            default = config.max_connections,
+            "quic-max-paths is not a whole number and is ignored; using \
+             max-number-of-connections"
+        ),
+        QuicMaxPathsSetting::Set(limit) if limit > config.max_connections => tracing::info!(
+            quic_max_paths = limit,
+            max_connections = config.max_connections,
+            "quic-max-paths is above max-number-of-connections and is lowered to it"
+        ),
+        QuicMaxPathsSetting::Set(_) => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::quic::breaker::Verdict;
 
     const AVAILABILITIES: [QuicAvailability; 4] = [
         QuicAvailability::Disabled,
@@ -161,46 +234,73 @@ mod tests {
         QuicAvailability::Released,
     ];
 
+    const BREAKERS: [BreakerOutcome; 3] = [
+        BreakerOutcome::NotConsulted,
+        BreakerOutcome::Decided(Verdict::Arm),
+        BreakerOutcome::Decided(Verdict::Trip),
+    ];
+
+    fn config(transport_quic: &str, max_paths: Option<&str>) -> NetworkApiConfig {
+        // Every key has a default, so an empty document is the default config.
+        let mut config: NetworkApiConfig = toml::from_str("").expect("default network config");
+        config.transport_quic = Some(transport_quic.to_string());
+        config.quic_max_paths = max_paths.map(str::to_string);
+        config
+    }
+
     fn policy(
-        mode: QuicMode,
+        mode: &str,
+        breaker: BreakerOutcome,
         availability: QuicAvailability,
-        breaker_suppressed: bool,
         max_paths: usize,
     ) -> QuicPolicy {
         let (_sender, watch) = QuicAvailabilityWatch::for_test(availability);
-        QuicPolicy::new(mode, watch, breaker_suppressed, max_paths)
+        QuicPolicy::new(&config(mode, Some(&max_paths.to_string())), breaker, watch)
     }
 
-    /// `allowed()` over every combination of its three inputs: true only for
-    /// a mode other than off, an endpoint that is up, and no breaker
-    /// suppression. Each rule has a case where it alone decides, so dropping
-    /// any one of them fails this test.
+    /// `disabled_by()` over every combination of its inputs names the first
+    /// rule that applies, in the documented order, and `allowed()` and
+    /// `admit()` agree with it. Each rule has a case where it alone decides,
+    /// so dropping or reordering any one of them fails this test.
     #[test]
-    fn allowed_only_when_on_up_and_not_suppressed() {
+    fn disabled_by_names_the_first_rule_that_applies() {
         let mut allowed_cases = 0;
-        for mode in [QuicMode::Off, QuicMode::Shadow, QuicMode::Prefer] {
-            for availability in AVAILABILITIES {
-                for suppressed in [false, true] {
-                    let expected = mode != QuicMode::Off
-                        && availability == QuicAvailability::Up
-                        && !suppressed;
-                    let policy = policy(mode, availability, suppressed, 4);
-                    assert_eq!(
-                        policy.allowed(),
-                        expected,
-                        "mode {mode:?}, availability {availability:?}, suppressed {suppressed}"
-                    );
-                    let admitted = policy.admit();
-                    assert_eq!(admitted.is_ok(), expected);
-                    if !expected {
-                        assert_eq!(admitted.unwrap_err(), PathRefusal::Disabled);
-                        assert_eq!(policy.permits().in_use(), 0, "a refusal holds nothing");
+        for mode in ["off", "shadow", "prefer"] {
+            for breaker in BREAKERS {
+                for max_paths in [0, 4] {
+                    for availability in AVAILABILITIES {
+                        let expected = if mode == "off" {
+                            Some(DisabledBy::Mode)
+                        } else if breaker.suppresses() {
+                            Some(DisabledBy::Breaker(breaker))
+                        } else if max_paths == 0 {
+                            Some(DisabledBy::NoPaths)
+                        } else if availability != QuicAvailability::Up {
+                            Some(DisabledBy::Endpoint(availability))
+                        } else {
+                            None
+                        };
+                        let case = format!(
+                            "mode {mode}, breaker {breaker:?}, max_paths {max_paths}, \
+                             availability {availability:?}"
+                        );
+                        let policy = policy(mode, breaker, availability, max_paths);
+                        assert_eq!(policy.disabled_by(), expected, "{case}");
+                        assert_eq!(policy.allowed(), expected.is_none(), "{case}");
+                        match (policy.admit(), expected) {
+                            (Ok(_), None) => allowed_cases += 1,
+                            (Err(refusal), Some(cause)) => {
+                                assert_eq!(refusal, PathRefusal::Disabled(cause), "{case}");
+                                assert_eq!(policy.permits().in_use(), 0, "{case}");
+                            }
+                            (outcome, _) => panic!("{case}: admit gave {outcome:?}"),
+                        }
                     }
-                    allowed_cases += usize::from(expected);
                 }
             }
         }
-        assert_eq!(allowed_cases, 2, "shadow and prefer, up, not suppressed");
+        // shadow and prefer, with a breaker that did not run or armed.
+        assert_eq!(allowed_cases, 4);
     }
 
     /// The policy reads the availability at each call: an endpoint that goes
@@ -209,14 +309,62 @@ mod tests {
     #[test]
     fn endpoint_going_down_turns_the_policy_off() {
         let (sender, watch) = QuicAvailabilityWatch::for_test(QuicAvailability::Up);
-        let policy = QuicPolicy::new(QuicMode::Shadow, watch, false, 2);
+        let policy = QuicPolicy::new(
+            &config("shadow", Some("2")),
+            BreakerOutcome::NotConsulted,
+            watch,
+        );
         let held = policy.admit().expect("allowed while up");
         sender.send_replace(QuicAvailability::Down);
-        assert!(!policy.allowed());
-        assert_eq!(policy.admit().unwrap_err(), PathRefusal::Disabled);
+        assert_eq!(
+            policy.admit().unwrap_err(),
+            PathRefusal::Disabled(DisabledBy::Endpoint(QuicAvailability::Down))
+        );
         assert_eq!(policy.permits().in_use(), 1);
         drop(held);
         assert_eq!(policy.permits().in_use(), 0);
+    }
+
+    /// The policy takes its mode and limit from the config: `prefer` runs as
+    /// shadow, the limit is `quic-max-paths` lowered to
+    /// `max-number-of-connections`, and an unparsable value means the
+    /// default.
+    #[test]
+    fn the_policy_reads_mode_and_limit_from_the_config() {
+        let up = || QuicAvailabilityWatch::for_test(QuicAvailability::Up).1;
+        let build = |mode, max_paths| {
+            QuicPolicy::new(&config(mode, max_paths), BreakerOutcome::NotConsulted, up())
+        };
+        let max_connections = config("off", None).max_connections;
+        assert!(max_connections > 3, "premise");
+        for (mode, effective) in [
+            ("off", QuicMode::Off),
+            ("shadow", QuicMode::Shadow),
+            ("prefer", QuicMode::Shadow),
+            ("a-later-mode", QuicMode::Off),
+        ] {
+            assert_eq!(build(mode, None).mode(), effective, "{mode}");
+        }
+        for (max_paths, limit) in [
+            (None, max_connections),
+            (Some("3"), 3),
+            (Some(" 3 "), 3),
+            (Some("0"), 0),
+            (Some("lots"), max_connections),
+            (Some("-1"), max_connections),
+        ] {
+            assert_eq!(
+                build("shadow", max_paths).permits().limit(),
+                limit,
+                "{max_paths:?}"
+            );
+        }
+        let above = (max_connections + 1).to_string();
+        assert_eq!(
+            build("shadow", Some(&above)).permits().limit(),
+            max_connections,
+            "lowered to max-number-of-connections"
+        );
     }
 
     /// Permits stop at the limit, a dropped permit frees its slot, and the
@@ -235,37 +383,47 @@ mod tests {
         drop((second, third));
         assert_eq!(permits.in_use(), 0);
         assert_eq!(permits.limit(), 2);
+        assert!(QuicPathPermits::new(0).try_acquire().is_none());
     }
 
-    /// A limit of 0 admits nothing, and an allowed policy at its limit
-    /// refuses with `Busy`, not `Disabled`.
+    /// An allowed policy at its limit refuses with `Busy`, and a limit of 0
+    /// is reported as disabled, not busy.
     #[test]
-    fn zero_limit_and_busy_refusal() {
-        assert!(QuicPathPermits::new(0).try_acquire().is_none());
-        let policy = policy(QuicMode::Shadow, QuicAvailability::Up, false, 1);
+    fn busy_at_the_limit_and_disabled_at_zero() {
+        let up = QuicAvailability::Up;
+        let policy = policy("shadow", BreakerOutcome::NotConsulted, up, 1);
         let held = policy.admit().expect("one slot");
         assert_eq!(policy.admit().unwrap_err(), PathRefusal::Busy);
         drop(held);
         assert!(policy.admit().is_ok());
-        let none = self::policy(QuicMode::Shadow, QuicAvailability::Up, false, 0);
-        assert_eq!(none.admit().unwrap_err(), PathRefusal::Busy);
+        let none = self::policy("shadow", BreakerOutcome::NotConsulted, up, 0);
+        assert_eq!(
+            none.admit().unwrap_err(),
+            PathRefusal::Disabled(DisabledBy::NoPaths)
+        );
     }
 
-    /// Threads racing for permits never hold more than the limit, and every
-    /// permit is returned.
+    /// Threads released together race for permits while each holds its
+    /// permit across a yield. The count never passes the limit, reaches it
+    /// (so the race really happened), and returns to zero.
     #[test]
     fn concurrent_acquires_never_exceed_the_limit() {
         const LIMIT: usize = 3;
+        const THREADS: usize = 8;
         let permits = QuicPathPermits::new(LIMIT);
         let peak = Arc::new(AtomicUsize::new(0));
-        let threads: Vec<_> = (0..8)
+        let start = Arc::new(std::sync::Barrier::new(THREADS));
+        let threads: Vec<_> = (0..THREADS)
             .map(|_| {
                 let permits = permits.clone();
                 let peak = Arc::clone(&peak);
+                let start = Arc::clone(&start);
                 std::thread::spawn(move || {
-                    for _ in 0..2_000 {
+                    start.wait();
+                    for _ in 0..5_000 {
                         if let Some(permit) = permits.try_acquire() {
                             peak.fetch_max(permits.in_use(), Ordering::AcqRel);
+                            std::thread::yield_now();
                             drop(permit);
                         }
                     }
@@ -275,33 +433,42 @@ mod tests {
         for thread in threads {
             thread.join().unwrap();
         }
-        assert!(peak.load(Ordering::Acquire) <= LIMIT);
+        assert_eq!(peak.load(Ordering::Acquire), LIMIT);
         assert_eq!(permits.in_use(), 0);
     }
 
-    /// `prefer` runs as `shadow` and says so at INFO; `off` and `shadow` are
-    /// themselves and log nothing.
+    /// Startup says that `prefer` runs as `shadow` (INFO), warns about a
+    /// `quic-max-paths` it cannot parse, and says when it lowers one; a
+    /// plain configuration logs none of it.
     #[test]
-    fn prefer_runs_as_shadow_with_an_info_log() {
-        const NEEDLE: &str = "runs as \"shadow\" in this release";
-        for (configured, effective, logs_it) in [
-            (QuicMode::Off, QuicMode::Off, false),
-            (QuicMode::Shadow, QuicMode::Shadow, false),
-            (QuicMode::Prefer, QuicMode::Shadow, true),
+    fn startup_reports_prefer_and_max_paths() {
+        const PREFER: &str = "runs as \"shadow\" in this release";
+        const INVALID: &str = "quic-max-paths is not a whole number";
+        const LOWERED: &str = "quic-max-paths is above max-number-of-connections";
+        let above = (config("off", None).max_connections + 1).to_string();
+        for (mode, max_paths, expected) in [
+            ("off", None, None),
+            ("shadow", Some("3"), None),
+            ("prefer", None, Some(("INFO", PREFER))),
+            ("shadow", Some("lots"), Some(("WARN", INVALID))),
+            ("shadow", Some(above.as_str()), Some(("INFO", LOWERED))),
         ] {
+            let config = config(mode, max_paths);
             let (logs, guard) = crate::util::test_log_capture::install();
-            let policy = policy(configured, QuicAvailability::Up, false, 1);
+            log_startup(&config);
             drop(guard);
-            assert_eq!(policy.mode(), effective, "{configured:?}");
             let logs = logs.lock().unwrap().clone();
-            let lines: Vec<_> = logs.iter().filter(|line| line.contains(NEEDLE)).collect();
-            assert_eq!(
-                lines.len(),
-                usize::from(logs_it),
-                "{configured:?}; captured: {logs:?}"
-            );
-            if let Some(line) = lines.first() {
-                assert!(line.starts_with("INFO"), "{line}");
+            let ours: Vec<_> = logs
+                .iter()
+                .filter(|line| [PREFER, INVALID, LOWERED].iter().any(|n| line.contains(n)))
+                .collect();
+            match expected {
+                None => assert!(ours.is_empty(), "{mode} {max_paths:?}: {logs:?}"),
+                Some((level, needle)) => {
+                    assert_eq!(ours.len(), 1, "{mode} {max_paths:?}: {logs:?}");
+                    assert!(ours[0].starts_with(level), "{}", ours[0]);
+                    assert!(ours[0].contains(needle), "{}", ours[0]);
+                }
             }
         }
     }

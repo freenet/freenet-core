@@ -1024,7 +1024,9 @@ impl ConfigArgs {
             if self.network_api.transport_quic.is_none() {
                 self.network_api.transport_quic = cfg.network_api.transport_quic.clone();
             }
-            if let Some(limit) = cfg.network_api.quic_max_paths {
+            // Kept as written, an unparsable value included, like
+            // `transport-quic` above.
+            if let Some(limit) = cfg.network_api.quic_max_paths.clone() {
                 self.network_api.quic_max_paths.get_or_insert(limit);
             }
             if cfg.network_api.quic_ignore_crash_breaker {
@@ -1545,7 +1547,7 @@ impl ConfigArgs {
                     .unwrap_or_else(default_congestion_control),
                 bbr_startup_rate: self.network_api.bbr_startup_rate,
                 transport_quic: self.network_api.transport_quic.clone(),
-                quic_max_paths: self.network_api.quic_max_paths,
+                quic_max_paths: self.network_api.quic_max_paths.clone(),
                 quic_ignore_crash_breaker: self
                     .network_api
                     .quic_ignore_crash_breaker
@@ -2486,11 +2488,22 @@ pub struct NetworkArgs {
     /// The most QUIC paths this node holds at once, counting paths being
     /// offered or dialed (#5940).
     ///
-    /// Default: `max-number-of-connections`, so every connection may have
-    /// one. Unused in this release.
-    #[arg(long = "quic-max-paths", env = "FREENET_QUIC_MAX_PATHS")]
-    #[serde(rename = "quic-max-paths", skip_serializing_if = "Option::is_none")]
-    pub quic_max_paths: Option<usize>,
+    /// Default: `max-number-of-connections`; a larger value is lowered to it,
+    /// and 0 turns QUIC upgrades off. A value that is not a whole number is
+    /// ignored with a warning in the log. Unused in this release.
+    #[arg(
+        long = "quic-max-paths",
+        env = "FREENET_QUIC_MAX_PATHS",
+        value_name = "N"
+    )]
+    #[serde(
+        default,
+        rename = "quic-max-paths",
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_count::deserialize",
+        serialize_with = "lenient_count::serialize"
+    )]
+    pub quic_max_paths: Option<String>,
 
     /// Run QUIC even when the crash-loop breaker would keep it off (unix
     /// only; the breaker is off on Windows).
@@ -2782,14 +2795,18 @@ pub struct NetworkApiConfig {
     )]
     pub transport_quic: Option<String>,
 
-    /// The most QUIC paths this node holds at once (#5940); unset means
-    /// [`Self::max_connections`]. Read through [`Self::quic_max_paths`].
+    /// The most QUIC paths this node holds at once (#5940), as written. Kept
+    /// as text, so a value this binary cannot parse neither stops it from
+    /// starting nor is lost when `config.toml` is rewritten (as with
+    /// `transport-quic`). Read through [`Self::quic_max_paths`].
     #[serde(
         default,
         rename = "quic-max-paths",
-        skip_serializing_if = "Option::is_none"
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_count::deserialize",
+        serialize_with = "lenient_count::serialize"
     )]
-    pub quic_max_paths: Option<usize>,
+    pub quic_max_paths: Option<String>,
 
     /// Run QUIC even when the crash-loop breaker would keep it off
     /// (`transport::quic::breaker`). Default false.
@@ -2841,12 +2858,32 @@ impl NetworkApiConfig {
         })
     }
 
-    /// The most QUIC paths this node may hold at once: `quic-max-paths`, or
-    /// [`Self::max_connections`] when unset, which caps nothing (a
-    /// connection has at most one path).
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// The most QUIC paths this node may hold at once: `quic-max-paths`,
+    /// lowered to [`Self::max_connections`], which is also the value when the
+    /// key is unset or cannot be parsed ([`Self::quic_max_paths_setting`]).
+    ///
+    /// The cap is `max_connections` because the endpoint's flow-control
+    /// windows are sized for that many connections
+    /// (`quic::config::connection_window_bytes`); more paths would exceed the
+    /// memory share they were sized for. At the default the limit rarely
+    /// binds: a connection has at most one path, but a permit is held from
+    /// the offer, so a path still closing can briefly hold a slot.
     pub(crate) fn quic_max_paths(&self) -> usize {
-        self.quic_max_paths.unwrap_or(self.max_connections)
+        match self.quic_max_paths_setting() {
+            QuicMaxPathsSetting::Set(limit) => limit.min(self.max_connections),
+            QuicMaxPathsSetting::Unset | QuicMaxPathsSetting::Invalid(_) => self.max_connections,
+        }
+    }
+
+    /// How `quic-max-paths` reads.
+    pub(crate) fn quic_max_paths_setting(&self) -> QuicMaxPathsSetting<'_> {
+        match self.quic_max_paths.as_deref() {
+            None => QuicMaxPathsSetting::Unset,
+            Some(raw) => match raw.trim().parse::<usize>() {
+                Ok(limit) => QuicMaxPathsSetting::Set(limit),
+                Err(_) => QuicMaxPathsSetting::Invalid(raw),
+            },
+        }
     }
 
     /// Build a `CongestionControlConfig` from the current network API configuration.
@@ -2895,6 +2932,88 @@ fn default_transient_ttl_secs() -> u64 {
 
 fn default_min_connections() -> usize {
     DEFAULT_MIN_CONNECTIONS
+}
+
+/// How the `quic-max-paths` key reads ([`NetworkApiConfig::quic_max_paths_setting`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QuicMaxPathsSetting<'a> {
+    Unset,
+    Set(usize),
+    /// Not a whole number: ignored, with a warning at startup.
+    Invalid(&'a str),
+}
+
+/// Serde for a count kept as text (`quic-max-paths`): any scalar is accepted
+/// and stored as written, so a value this binary cannot parse does not stop
+/// `config.toml` from loading. An integer is written back as a number.
+mod lenient_count {
+    use std::fmt;
+
+    use serde::de::{self, IgnoredAny, MapAccess, SeqAccess, Visitor};
+    use serde::{Deserializer, Serializer};
+
+    /// Stored for an array or table, which has no text form to keep.
+    const NOT_A_SCALAR: &str = "<not a number>";
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<String>, D::Error> {
+        struct Any;
+        impl<'de> Visitor<'de> for Any {
+            type Value = Option<String>;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a whole number")
+            }
+            fn visit_bool<E: de::Error>(self, v: bool) -> Result<Self::Value, E> {
+                Ok(Some(v.to_string()))
+            }
+            fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
+                Ok(Some(v.to_string()))
+            }
+            fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                Ok(Some(v.to_string()))
+            }
+            fn visit_f64<E: de::Error>(self, v: f64) -> Result<Self::Value, E> {
+                Ok(Some(v.to_string()))
+            }
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(Some(v.to_string()))
+            }
+            fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+                Ok(None)
+            }
+            fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+                Ok(None)
+            }
+            fn visit_some<D: Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+                d.deserialize_any(self)
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(Some(NOT_A_SCALAR.to_string()))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                Ok(Some(NOT_A_SCALAR.to_string()))
+            }
+        }
+        deserializer.deserialize_any(Any)
+    }
+
+    pub(super) fn serialize<S: Serializer>(
+        value: &Option<String>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match value.as_deref() {
+            None => serializer.serialize_none(),
+            // i64, not u64: TOML integers are signed, so a larger value is
+            // kept as text.
+            Some(raw) => match raw.trim().parse::<i64>() {
+                Ok(count) => serializer.serialize_i64(count),
+                Err(_) => serializer.serialize_str(raw),
+            },
+        }
+    }
 }
 
 fn default_max_connections() -> usize {
@@ -6780,6 +6899,7 @@ streaming-threshold = 65537
 ledbat-min-ssthresh = 102401
 congestion-control = "bbr"
 bbr-startup-rate = 12345678
+quic-max-paths = 7
 skip_load_from_network = true
 ws-api-address = "127.0.0.1"
 ws-api-port = 7510
@@ -6941,6 +7061,8 @@ shutdown-drain-secs = 42
         assert_eq!(cfg.network_api.congestion_control, "bbr");
         assert_eq!(cfg.ws_api.per_user_op_burst, 101);
         assert_eq!(cfg.shutdown_drain_secs, 42);
+        assert_eq!(cfg.network_api.quic_max_paths.as_deref(), Some("7"));
+        assert_eq!(cfg.network_api.quic_max_paths(), 7);
     }
 
     /// THE BUG (#5124): a `config.toml` key could not be spelled the way the
@@ -7011,24 +7133,47 @@ shutdown-drain-secs = 42
             );
         }
 
-        // `quic-max-paths`: absent unless set, kebab-case, and read back.
-        assert!(!toml::to_string(&unset).unwrap().contains("quic-max-paths"));
-        assert_eq!(
-            unset.network_api.quic_max_paths(),
-            unset.network_api.max_connections
-        );
-        let text = RELEASED_CONFIG_TOML.replacen(
-            "mode = \"network\"\n",
-            "mode = \"network\"\nquic-max-paths = 5\n",
-            1,
-        );
-        let cfg: Config = toml::from_str(&text).unwrap();
-        assert_eq!(cfg.network_api.quic_max_paths(), 5);
+        // `quic-max-paths`: kebab-case, kept as written whether or not this
+        // binary can parse it (so neither a later release's value nor a typo
+        // stops the node from starting), and written back as a number when it
+        // is one. Only the parsed value is lowered or ignored.
         assert!(
-            toml::to_string(&cfg)
+            toml::to_string(&unset)
                 .unwrap()
-                .contains("quic-max-paths = 5")
+                .contains("quic-max-paths = 7")
         );
+        for (written, kept, limit, rewritten) in [
+            ("5", "5", 5, "quic-max-paths = 5"),
+            ("1000000", "1000000", 200, "quic-max-paths = 1000000"),
+            ("\"lots\"", "lots", 200, "quic-max-paths = \"lots\""),
+            ("-3", "-3", 200, "quic-max-paths = -3"),
+            ("2.5", "2.5", 200, "quic-max-paths = \"2.5\""),
+            ("true", "true", 200, "quic-max-paths = \"true\""),
+            (
+                "[1, 2]",
+                "<not a number>",
+                200,
+                "quic-max-paths = \"<not a number>\"",
+            ),
+        ] {
+            let text = RELEASED_CONFIG_TOML.replacen(
+                "quic-max-paths = 7\n",
+                &format!("quic-max-paths = {written}\n"),
+                1,
+            );
+            assert_ne!(text, RELEASED_CONFIG_TOML, "the key was replaced");
+            let cfg: Config = toml::from_str(&text)
+                .unwrap_or_else(|e| panic!("quic-max-paths = {written} must parse: {e}"));
+            assert_eq!(cfg.network_api.max_connections, 200, "premise");
+            assert_eq!(
+                cfg.network_api.quic_max_paths.as_deref(),
+                Some(kept),
+                "{written}"
+            );
+            assert_eq!(cfg.network_api.quic_max_paths(), limit, "{written}");
+            let out = toml::to_string(&cfg).unwrap();
+            assert!(out.contains(rewritten), "{written}: {out}");
+        }
     }
 
     /// The two spellings must be genuinely interchangeable, not merely both
@@ -9303,34 +9448,64 @@ shutdown-drain-secs = 42
         }
     }
 
-    /// `quic-max-paths` (#5940) survives a bare restart, a value on the
-    /// command line wins over the file, and unset reads as
+    /// `quic-max-paths` (#5940) survives a bare restart, an unparsable value
+    /// included (it reads as the default and does not stop the build), a
+    /// value on the command line wins over the file, and unset reads as
     /// `max-number-of-connections`.
     #[tokio::test]
     async fn quic_max_paths_survives_a_bare_build_and_defaults_to_max_connections() {
         let temp_dir = tempfile::tempdir().unwrap();
         let cfg = local_args(temp_dir.path()).build().await.unwrap();
         assert_eq!(cfg.network_api.quic_max_paths, None);
-        assert_eq!(
-            cfg.network_api.quic_max_paths(),
-            cfg.network_api.max_connections
-        );
+        let max_connections = cfg.network_api.max_connections;
+        assert_eq!(cfg.network_api.quic_max_paths(), max_connections);
 
-        let mut first = local_args(temp_dir.path());
-        first.network_api.quic_max_paths = Some(3);
-        first.build().await.unwrap();
-        let cfg = local_args(temp_dir.path()).build().await.unwrap();
-        assert_eq!(cfg.network_api.quic_max_paths, Some(3), "bare build");
-        assert_eq!(cfg.network_api.quic_max_paths(), 3);
+        for (value, limit) in [("3", 3), ("lots", max_connections)] {
+            let mut first = local_args(temp_dir.path());
+            first.network_api.quic_max_paths = Some(value.to_string());
+            first.build().await.unwrap();
+            let cfg = local_args(temp_dir.path()).build().await.unwrap();
+            assert_eq!(
+                cfg.network_api.quic_max_paths.as_deref(),
+                Some(value),
+                "bare build"
+            );
+            assert_eq!(cfg.network_api.quic_max_paths(), limit, "{value}");
+        }
 
         let mut cli = local_args(temp_dir.path());
-        cli.network_api.quic_max_paths = Some(0);
+        cli.network_api.quic_max_paths = Some("0".to_string());
         let cfg = cli.build().await.unwrap();
         assert_eq!(
             cfg.network_api.quic_max_paths(),
             0,
             "the command line overrides the file"
         );
+    }
+
+    /// `--quic-max-paths` takes a value in either form, accepts one that is
+    /// not a number (it is ignored later, with a warning, rather than
+    /// refused here), and `--transport-quic shadow` parses. The environment
+    /// is not touched: `FREENET_QUIC_MAX_PATHS` and `FREENET_TRANSPORT_QUIC`
+    /// go through the same parser as the flags.
+    #[test]
+    fn quic_flags_parse_from_the_command_line() {
+        use clap::Parser as _;
+        for (argv, max_paths) in [
+            (&["freenet", "--quic-max-paths", "5"][..], "5"),
+            (&["freenet", "--quic-max-paths=5"][..], "5"),
+            (&["freenet", "--quic-max-paths", "lots"][..], "lots"),
+        ] {
+            let args = ConfigArgs::try_parse_from(argv).expect("parses");
+            assert_eq!(
+                args.network_api.quic_max_paths.as_deref(),
+                Some(max_paths),
+                "{argv:?}"
+            );
+        }
+        let args =
+            ConfigArgs::try_parse_from(["freenet", "--transport-quic", "shadow"]).expect("parses");
+        assert_eq!(args.network_api.transport_quic.as_deref(), Some("shadow"));
     }
 
     #[tokio::test]
@@ -9604,7 +9779,7 @@ shutdown-drain-secs = 42
                 congestion_control: "bbr".to_string(),
                 bbr_startup_rate: Some(5_000),
                 transport_quic: Some("prefer".to_string()),
-                quic_max_paths: Some(17),
+                quic_max_paths: Some("17".to_string()),
                 quic_ignore_crash_breaker: true,
                 skip_load_from_network: true,
                 // serde-skip: a per-boot migration record, never persisted.

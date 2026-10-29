@@ -277,6 +277,36 @@ impl Verdict {
     }
 }
 
+/// What [`gate`] returns: the settings to open the endpoint with, and what
+/// the breaker decided. The upgrade policy reads the decision, so a refusal
+/// it causes can name the breaker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Gated<T> {
+    /// `None` when QUIC is off by config or kept off by the breaker.
+    pub settings: Option<T>,
+    pub breaker: BreakerOutcome,
+}
+
+/// What the breaker decided at this start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BreakerOutcome {
+    /// The breaker did not run: it is not enabled (tests and embedders), the
+    /// platform is not unix, or `transport-quic` is off.
+    NotConsulted,
+    /// The breaker ran and decided this.
+    Decided(Verdict),
+}
+
+impl BreakerOutcome {
+    /// Whether the breaker keeps QUIC off for this run.
+    pub(crate) fn suppresses(self) -> bool {
+        match self {
+            Self::NotConsulted => false,
+            Self::Decided(verdict) => !verdict.quic_enabled(),
+        }
+    }
+}
+
 /// The breaker's whole decision, as described in the module docs.
 pub(crate) fn verdict(facts: &Facts<'_>) -> Verdict {
     match facts.previous {
@@ -414,7 +444,8 @@ fn observe_with(
 }
 
 /// The production entry point: apply the breaker to the QUIC `settings`
-/// chosen by the config, returning `None` when the breaker keeps QUIC off.
+/// chosen by the config. The returned settings are `None` when the breaker
+/// keeps QUIC off, and [`Gated::breaker`] says what it decided.
 /// Logs the outcome and updates the transport telemetry. `now` is the wall
 /// clock of the caller's `TimeSource`. May wait up to `drain_secs` plus
 /// [`HOLDER_EXIT_MARGIN`] for a previous node to exit. On Windows it returns
@@ -425,9 +456,13 @@ pub(crate) async fn gate<T>(
     ignore_breaker: bool,
     drain_secs: u64,
     now: SystemTime,
-) -> Option<T> {
+) -> Gated<T> {
+    let not_consulted = |settings| Gated {
+        settings,
+        breaker: BreakerOutcome::NotConsulted,
+    };
     if !ENABLED.load(Ordering::Relaxed) || cfg!(not(unix)) {
-        return settings;
+        return not_consulted(settings);
     }
     // The wrapper's note when it passed one; otherwise the note at its fixed
     // place, which may be meant for another node (`shared`).
@@ -438,10 +473,13 @@ pub(crate) async fn gate<T>(
             true,
         ),
     };
-    let Observed {
+    let Some(Observed {
         mut previous,
         stopped,
-    } = observe(settings.is_some(), data_dir, note_path.as_deref(), shared)?;
+    }) = observe(settings.is_some(), data_dir, note_path.as_deref(), shared)
+    else {
+        return not_consulted(settings);
+    };
     let path = marker_path(data_dir);
     let own_pid = std::process::id();
     let now_secs = unix_secs(now);
@@ -546,10 +584,9 @@ pub(crate) async fn gate<T>(
             );
         }
     }
-    if decided.quic_enabled() {
-        settings
-    } else {
-        None
+    Gated {
+        settings: settings.filter(|_| decided.quic_enabled()),
+        breaker: BreakerOutcome::Decided(decided),
     }
 }
 
@@ -1134,9 +1171,35 @@ mod tests {
         // `tests/graceful_shutdown_exit_code.rs`).
         assert!(!ENABLED.load(Ordering::Relaxed));
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(T0);
-        assert_eq!(gate(Some(7u8), dir.path(), false, 30, now).await, Some(7));
+        assert_eq!(
+            gate(Some(7u8), dir.path(), false, 30, now).await,
+            Gated {
+                settings: Some(7),
+                breaker: BreakerOutcome::NotConsulted,
+            }
+        );
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
         assert!(PENDING.lock().marker.is_none());
+    }
+
+    /// The outcome suppresses QUIC exactly when the breaker ran and its
+    /// verdict keeps QUIC off; a breaker that did not run suppresses nothing.
+    #[test]
+    fn outcome_suppresses_only_a_verdict_that_keeps_quic_off() {
+        assert!(!BreakerOutcome::NotConsulted.suppresses());
+        for (verdict, suppresses) in [
+            (Verdict::Arm, false),
+            (Verdict::RunUnarmed, false),
+            (Verdict::Trip, true),
+            (Verdict::Cool { tripped_at_secs: 1 }, true),
+            (Verdict::Unreadable, true),
+        ] {
+            assert_eq!(
+                BreakerOutcome::Decided(verdict).suppresses(),
+                suppresses,
+                "{verdict:?}"
+            );
+        }
     }
 
     /// `gate` decides on the marker as read after the wait: the call that

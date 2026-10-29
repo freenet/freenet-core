@@ -105,7 +105,7 @@ pub enum QuicMode {
     /// Meant to carry application data over QUIC. Until that ships it acts
     /// as [`Self::Shadow`] (see [`Self::effective`]), so a node that sets it
     /// early starts carrying data over QUIC once it runs a release where
-    /// `prefer` does.
+    /// `prefer` does. That release's notes must say so.
     Prefer,
 }
 
@@ -146,20 +146,12 @@ impl QuicMode {
     }
 
     /// The mode this release runs: `Off` and `Shadow` are themselves, and
-    /// `Prefer` runs as `Shadow` and says so at INFO. Called once per node,
-    /// when its [`upgrade::policy::QuicPolicy`] is built.
+    /// `Prefer` runs as `Shadow`. Startup says so at INFO
+    /// ([`upgrade::policy::log_startup`]).
     pub(crate) fn effective(self) -> Self {
         match self {
             Self::Off => Self::Off,
-            Self::Shadow => Self::Shadow,
-            Self::Prefer => {
-                tracing::info!(
-                    "transport-quic = \"prefer\" runs as \"shadow\" in this release: \
-                     QUIC paths carry only control frames and all application traffic \
-                     stays on UDP"
-                );
-                Self::Shadow
-            }
+            Self::Shadow | Self::Prefer => Self::Shadow,
         }
     }
 }
