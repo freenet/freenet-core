@@ -200,7 +200,10 @@ The cap is built on RealTime even in simulation, because the listener and
 its connections run on RealTime there: a VirtualTime cap would compute
 deficits on another clock than its waiters sleep and time out on. The QUIC
 endpoint runs on the cap's clock for the same reason (bind_udp_listener
-builds both on RealTime; tests build both on one VirtualTime).
+builds both on RealTime in production; tests build both on one
+VirtualTime). In a simulation the endpoint runs on the network's
+VirtualTime, so bind_udp_listener refuses a simulated node with both
+transport-quic and total-bandwidth-limit.
 Tests assert on per-cap EgressCap::stats(), never the global counters.
 ```
 
@@ -365,7 +368,11 @@ ignored (`upgrade_control_received`) and hole-punch handshake packets dropped,
 one count per packet, because they were not encrypted under the attempt's
 inbound session key (`handshake_unauthenticated_dropped`), QUIC endpoint deaths
 (`quic_endpoint_down`), panics the QUIC socket adapter caught
-(`quic_adapter_panicked`, once per endpoint) and QUIC connections this node closed, by close code
+(`quic_adapter_panicked`, once per endpoint), QUIC crash-loop breaker trips at startup
+(`quic_breaker_trips`, counted for any abnormal end of a QUIC-enabled run, not
+only a QUIC fault; see `quic/breaker.rs`) and whether the breaker keeps QUIC
+off in this process (`quic_breaker_suppressed`, a state that is never reset and
+is not activity by itself) and QUIC connections this node closed, by close code
 (`quic_close_sent_<label>`, one per `QuicCloseCode`). Each label set is declared once in a
 `labelled_counters!` list, so a new variant needs a snapshot field. Hot
 path writes are single relaxed atomics; `SentPacketTracker` keeps an
@@ -584,11 +591,17 @@ peer_connection.rs. A receipt is only useful for a packet the SENDER
 tracks for retransmission:
   → Ping / Pong: never acked (every release sends them untracked).
   → AckConnection*: acked on every arrival but NOT recorded for dedup.
-    The handshake's completion ack is tracked at packet id 0 and must be
-    acked; id 0 is also the remote's first data packet, so recording it
-    would drop that packet as a duplicate. Answering a connection ack with
-    `ack_ok` happens at most ONCE per connection: the reply is itself an
-    AckConnection, so answering every one loops forever between two peers.
+    Earlier releases track a gateway's success ack at packet id 0 and need
+    the receipt; they also give their first data packet id 0, so recording
+    it would drop that packet as a duplicate. Our own data starts at
+    FIRST_DATA_PACKET_ID (1) on every path and no handshake ack is tracked
+    on a connection, because a receipt for id 0 (sent for every connection
+    ack, including a handshake ack resent across our completion) would
+    otherwise be credited to our first data packet: a false RTT sample and
+    a lost packet never retransmitted. DO NOT start data at 0 again.
+    Answering a connection ack with `ack_ok` happens at most ONCE per
+    connection: the reply is itself an AckConnection, so answering every
+    one loops forever between two peers.
   → ShortMessage / StreamFragment / Upgrade: acked within
     ACK_CHECK_INTERVAL (100 ms), and RE-ACKED when a duplicate arrives (a
     duplicate means our receipt was lost). A duplicate is never delivered
@@ -809,7 +822,7 @@ QUIC-class datagram is counted as `quic_ingress_forwarded`, `_not_allowed`,
 receiver gone, or disabled; every node with `transport-quic` off). The QUIC
 endpoint enables the ingress through `with_quic_ingress`, which disables it
 again (allow-set emptied and closed) if the endpoint cannot be built, so a
-failed `prefer` bind leaves the socket as with QUIC off.
+failed `shadow`/`prefer` bind leaves the socket as with QUIC off.
 
 Socket-health signal: the listener reads through `Socket::recv_classified`,
 which `DemuxSocket` answers with `Datagram` for a legacy datagram and
@@ -825,13 +838,46 @@ it must not wait unless it is a pacing point.
 
 #### QUIC endpoint (`transport/quic.rs`, #5940 step c2)
 
-`transport-quic` (config key, `off` by default, or `prefer`) decides whether
-`bind_udp_listener` builds a quinn endpoint over the DemuxSocket. Off: no
-endpoint, no QUIC ingress, nothing changes. Prefer: the endpoint is built
+`transport-quic` (config key, `off` by default, `shadow` or `prefer`) decides
+whether `bind_udp_listener` builds a quinn endpoint over the DemuxSocket.
+`prefer` runs as `shadow` until QUIC carries data (`QuicMode::effective`;
+`upgrade::policy::log_startup` says so at INFO once per node). The release
+that makes `prefer` carry data must say in its notes that existing `prefer`
+configs start carrying data. Off: no endpoint, no QUIC ingress, nothing
+changes. QUIC must stay off by default on Windows until the crash-loop
+breaker works there (#6031). Shadow or prefer: the endpoint is built
 with the node's QUIC identity (below) and an EMPTY allow-set, so nothing
 reaches it and it sends nothing; the listener holds it. Upgrading a UDP
-session to QUIC comes later, so only tests open QUIC connections. An unknown
-value is off with a warning, never an error: a crash-loop rollback
+session to QUIC comes later, so only tests open QUIC connections.
+
+Upgrade policy (`quic/upgrade/policy.rs`, not yet wired in):
+`QuicPolicy::new(network_api, breaker, availability)` takes the config, the
+breaker's decision (`breaker::gate` returns it beside the settings, as
+`Gated`) and the endpoint's availability. `disabled_by()` names the first
+rule that stops upgrades: `Mode` (off), `Breaker`, `NoPaths`
+(`quic-max-paths` = 0) or `Endpoint(availability)` (not `Up`); `allowed()` is
+true when none does. `admit()` returns a `QuicPathPermit` or
+`PathRefusal::{Disabled(cause), Busy}`; `Ok` does not prove the endpoint is
+still up. `QuicPathPermits` holds at most `quic-max-paths` paths, released on
+drop.
+
+`quic-max-paths` is stored as text (`lenient_count`), like `transport-quic`,
+so any value loads: an integer or string is kept as written, a bool or float
+as its text, and an array, table or datetime as a placeholder. A value that is
+not a whole number is ignored with a WARN at startup (only when
+`transport-quic` is not off) and reads as the default, so a typo or a later
+release's value cannot stop the node. On the command line a negative value
+needs `=` (`--quic-max-paths=-1`): with a space clap reads `-1` as a flag and
+refuses the command line, as for every numeric option.
+The default is `max-number-of-connections`, and a larger value is lowered to
+it, because the flow-control windows are sized for that many connections.
+At the default the limit rarely binds (a permit is held from the offer, so a
+path still closing can briefly hold a slot). A rollback to a release before
+the key drops it: the older binary rewrites `config.toml` without it. It is
+kebab-case from the start, so it has no `CONFIG_KEY_SPELLINGS` entry.
+
+An unknown `transport-quic` value is off with a warning, never an error: a
+crash-loop rollback
 reinstalls an older binary, which must start with a value a later release
 wrote, and keeps it in config.toml.
 
@@ -914,7 +960,7 @@ CI, so CI does not check that the test ran.
 
 Key material (stateless-reset key, token key, CID MAC key) comes from the OS
 entropy pool, never GlobalRng; quinn's rng_seed and the CID nonces stay on
-GlobalRng. With `prefer`, a failed endpoint build logs a WARN and the node
+GlobalRng. With `shadow` or `prefer`, a failed endpoint build logs a WARN and the node
 runs with QUIC off. `accept` returns the attempt without awaiting its
 handshake (QuicIncoming::establish), so one stalled handshake does not hold
 back the next. QUIC integration tests run under a watchdog thread
@@ -924,6 +970,29 @@ back the next. QUIC integration tests run under a watchdog thread
 In tests, two endpoints on SimulationSocket with one VirtualTime and a
 seeded GlobalRng repeat the same event trace; the bytes differ, because
 rustls's key exchange and the XEdDSA nonce use the OS RNG.
+
+In SimNetwork: `with_transport_quic` / `with_node_transport_quic` set the
+config value per node (off by default; an unknown value panics), and the
+endpoint runs on the network's VirtualTime (`get_socket_virtual_time`;
+RealTime in production, pinned by
+`the_transport_endpoint_runs_on_virtual_time_only_in_simulation`). Its
+bind-time GlobalRng draw (quinn's rng_seed) runs on
+`GlobalRng::with_side_stream`, so an endpoint that is bound and idle does not
+shift the run's main random stream. That is all the determinism tests cover:
+once connections open, quinn's connection-ID draws
+(`initial_dst_cid_provider`, the CID generator) take from the main stream
+inside quinn's tasks. With endpoints idle, the one difference from QUIC off
+is scheduling (one endpoint driver task per node), which changes some
+connection choices, so a QUIC-on run is compared with QUIC off by the peers
+that join, not by the exact edge set. `probe_quic_endpoints_at` sends each
+node a stranger's QUIC datagram during a direct-runner run, so a test can
+check every endpoint was live (`not_allowed`) rather than failed to bind.
+Other knobs: `with_node_advertised_version` (the version a node advertises
+in its intro and AckConnectionV2, to emulate an older peer of the same
+major.minor; compatibility checks keep the real version),
+`with_quic_idle_timeout`, and `drop_quic_datagrams_between` (drops
+QUIC-class datagrams, by the demux classifier, for one pair from a virtual
+time; `simulation::QuicDatagramDrop`, kept across `with_fault_injection`).
 `quic/test_tls.rs` holds only a plain Ed25519 identity for tests where a
 peer presents a key that is not its transport key.
 
@@ -1014,7 +1083,10 @@ Sending (QuicPath::send_short / send_stream / send_stream_chunks /
   connection `stopped` map until the connection closes (quinn 0.11.12:
   stopped() registers it, and a local reset produces neither the Finished
   nor the Stopped event that removes it). Bounded by the sends aborted on
-  the connection; e5 must bound that or recycle the connection.
+  the connection: the path counts its own resets (a stop the peer sent,
+  surfaced through a write or through stopped(), is not one; nor is a reset
+  on a closed connection) and closes the connection past
+  recycle::SEND_ABORT_LIMIT (4096) with close code SEND_ABORT_LIMIT (M6).
   Every write, and the wait for a source's next chunk, races the
   stream's stopped() future and resets on a stop:
   quinn-proto 0.11.19 does not report STOP_SENDING to a writer blocked on
@@ -1129,6 +1201,30 @@ One budget per peer (QUIC memory gate M3): QuicPath::with_budget charges
   With one allowance, a large UDP stream still draining can make a QUIC
   stream refuse (BUDGET_REFUSED) where two allowances admitted it; that
   is the intended semantics, retried like any transfer failure.
+Path recycling (quic/recycle.rs, #5940 step M6): besides the send-reset
+  limit above, the path's receive task samples the connection every
+  ACK_WATCH_TICK (2 s) and closes it with PEER_NOT_ACKNOWLEDGING when, for
+  ACK_WATCH_WINDOW (10 s), this side had ack-eliciting packets outstanding,
+  the peer acknowledged none of them, and the peer kept sending (no two
+  samples in a row without anything from it). A peer that keeps sending but acknowledges none of our packets is
+  not a conforming QUIC peer (RFC 9000 13.2.1). Newly acknowledged packets
+  are counted by AckCounting, which wraps Cubic in transport_config;
+  ConnectionStats has no such counter. Two samples in a row with nothing
+  from the peer end the window, and so does a sample with nothing
+  outstanding (in flight after the latest acknowledgements, minus losses,
+  or a send since), so recovery from an outage does not close the path.
+  quinn counts a transmit's frames, and its bytes in flight, when it builds
+  it, before the egress cap admits it. Guard 2 is therefore inactive while
+  the egress cap holds QUIC transmits: while the cap holds any (or held one
+  since the previous sample; socket::CapHolds, node-wide) no window runs on
+  any path, so on a node whose cap binds most of the time guard 2 is off
+  most of the time. Do not narrow this to the sends counted since the hold:
+  a held transmit is also in quinn's bytes in flight. A hold whose poller
+  is not polled again within socket::cap_hold_validity of the cap's rate
+  (a poller left by an ended connection) stops counting.
+  e5 constraint: SEND_ABORT_LIMIT and PEER_NOT_ACKNOWLEDGING ask the peer to
+  fall back to UDP for THIS connection only. They are not a permanent
+  downgrade: e5 must allow a new upgrade after its normal backoff.
 Not here: dedup (e5: is_duplicate_dispatch, completed_inbound_streams) and
   export of the QUIC-only counters (per path, QuicPath::stats).
 ```
@@ -1194,7 +1290,9 @@ Application error codes, one range per QUIC frame type, all one-byte
   quic/error.rs refuses an out-of-range or duplicated code, and a
   source-scrape test refuses a code constant missing from ALL:
     0x00..=0x0f CONNECTION_CLOSE: close_code::NODE_DROPPED_PEER 0,
-                DOWNGRADE 1 (fall back to UDP), IDENTITY_MISMATCH 2
+                DOWNGRADE 1 (fall back to UDP), IDENTITY_MISMATCH 2,
+                SEND_ABORT_LIMIT 3 and PEER_NOT_ACKNOWLEDGING 4 (path
+                recycling, M6; the peer reads both as Downgrade)
     0x10..=0x1f STOP_SENDING: path::stop_code (receiver refusals)
     0x20..=0x2f RESET_STREAM: path::reset_code (sender gave up)
   The scrape test checks every constant by name against ALL, and

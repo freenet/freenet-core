@@ -96,15 +96,37 @@ impl Drop for NodeProcess {
 impl NodeProcess {
     /// Spawn a self-contained, fully offline gateway node rooted at `dir`.
     fn spawn(dir: &Path) -> anyhow::Result<Self> {
+        Self::spawn_with(dir, dir, &[])
+    }
+
+    /// As [`Self::spawn`], logging to `log_dir` and passing `extra_args`.
+    fn spawn_with(dir: &Path, log_dir: &Path, extra_args: &[&str]) -> anyhow::Result<Self> {
+        Self::spawn_full(dir, log_dir, extra_args, None)
+    }
+
+    /// As [`Self::spawn_with`]. With `home`, the node gets no stop-note
+    /// variable and `HOME` set to `home`, so it uses the note at its default
+    /// place under `home`.
+    fn spawn_full(
+        dir: &Path,
+        log_dir: &Path,
+        extra_args: &[&str],
+        home: Option<&Path>,
+    ) -> anyhow::Result<Self> {
         let ws_port = reserve_port()?;
         let network_port = reserve_port()?;
-        let child = Command::new(freenet_bin())
+        let mut command = Command::new(freenet_bin());
+        command
             .arg("network")
             // Same #4366 telemetry-contamination guard as persistence_roundtrip.rs:
             // this runs the real binary from target/<profile>/, so neither of the
             // in-process "under cargo test" signals fires and telemetry would
             // otherwise default ON and POST to the production OTLP collector.
             .env("FREENET_TELEMETRY_ENABLED", "false")
+            // The QUIC crash-loop breaker's stop note, in this test's own
+            // directory: without it the node would use the default log
+            // directory's note, which belongs to the machine's real node.
+            .env("FREENET_QUIC_BREAKER_STOP_NOTE", stop_note(dir))
             // Pin the child's logging rather than inheriting it. CI's test_unit
             // job exports `RUST_LOG=error` (ci.yml), and the tracing layer builds
             // its file filter with `from_env_lossy()`, which would drop the INFO
@@ -139,13 +161,19 @@ impl NodeProcess {
             .args(["--shutdown-drain-secs", "1"])
             .args(["--config-dir", &dir.to_string_lossy()])
             .args(["--data-dir", &dir.to_string_lossy()])
-            .args(["--log-dir", &dir.to_string_lossy()])
+            .args(["--log-dir", &log_dir.to_string_lossy()])
+            .args(extra_args)
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
+            .stderr(Stdio::null());
+        if let Some(home) = home {
+            command
+                .env_remove("FREENET_QUIC_BREAKER_STOP_NOTE")
+                .env("HOME", home);
+        }
+        let child = command.spawn()?;
         Ok(Self {
             child,
-            log_dir: dir.to_path_buf(),
+            log_dir: log_dir.to_path_buf(),
         })
     }
 
@@ -172,22 +200,25 @@ impl NodeProcess {
     /// Block until the node has installed its SIGTERM handler and entered the
     /// event loop, or fail with the node's own logs attached.
     fn wait_until_ready(&mut self, timeout: Duration) -> anyhow::Result<()> {
+        self.wait_for_logs(&[READY_MARKER], timeout)
+    }
+
+    /// Block until every one of `markers` is in the node's logs.
+    fn wait_for_logs(&mut self, markers: &[&str], timeout: Duration) -> anyhow::Result<()> {
         let deadline = Instant::now() + timeout;
         loop {
             if let Some(status) = self.child.try_wait()? {
                 anyhow::bail!(
-                    "freenet exited ({status:?}) before reaching {READY_MARKER:?}. Logs:\n{}",
+                    "freenet exited ({status:?}) before logging {markers:?}. Logs:\n{}",
                     self.logs()
                 );
             }
-            if self.logs().contains(READY_MARKER) {
+            let logs = self.logs();
+            if markers.iter().all(|m| logs.contains(m)) {
                 return Ok(());
             }
             if Instant::now() >= deadline {
-                anyhow::bail!(
-                    "freenet did not log {READY_MARKER:?} within {timeout:?}. Logs:\n{}",
-                    self.logs()
-                );
+                anyhow::bail!("freenet did not log {markers:?} within {timeout:?}. Logs:\n{logs}");
             }
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -201,6 +232,12 @@ impl NodeProcess {
             anyhow::bail!("kill(SIGTERM) failed: {}", std::io::Error::last_os_error());
         }
         Ok(())
+    }
+
+    /// Kill the node with SIGKILL, an abnormal exit, and reap it.
+    fn kill_abnormally(&mut self) -> anyhow::Result<std::process::ExitStatus> {
+        self.child.kill()?;
+        Ok(self.child.wait()?)
     }
 
     /// Wait for the process to exit, returning its raw `ExitStatus`.
@@ -303,4 +340,343 @@ fn graceful_classification_is_by_type_not_by_message() {
     assert!(!freenet::listener_exit_is_graceful(&anyhow::anyhow!(
         "Graceful shutdown"
     )));
+}
+
+// ---------------------------------------------------------------------------
+// QUIC crash-loop breaker (#5940), driven through the real binary.
+//
+// The breaker's decisions are unit-tested in `transport::quic::breaker`; these
+// tests cover the wiring no in-process test can see: that the node consults the
+// breaker where it decides on QUIC (`p2p_protoc.rs`), and that `main` clears the
+// marker on a clean exit.
+// ---------------------------------------------------------------------------
+
+/// The marker file the breaker keeps in the data directory.
+const QUIC_MARKER_FILE: &str = "quic-crash-breaker.json";
+
+/// Logged by `bind_udp_listener` right after it decides whether to build the
+/// QUIC endpoint, so once it is present the QUIC decision has been acted on.
+const TRANSPORT_BOUND_MARKER: &str = "UDP socket bound successfully";
+
+/// Logged when the QUIC endpoint is built: QUIC is on.
+const QUIC_BUILT_MARKER: &str = "QUIC endpoint built";
+
+/// The breaker's WARN when it trips at startup.
+const QUIC_TRIP_MARKER: &str = "The previous run with QUIC enabled ended abnormally";
+
+/// The breaker's WARN on a later start inside the cooldown.
+const QUIC_COOLING_MARKER: &str = "QUIC stays off: a run with QUIC enabled ended abnormally";
+
+/// The stop note every test node is given (see `NodeProcess::spawn_with`).
+fn stop_note(dir: &Path) -> PathBuf {
+    dir.join("quic-breaker-stop-note")
+}
+
+/// Spawn a node with `transport-quic = prefer`, logging to `log_dir`, and wait
+/// until it is ready for SIGTERM and has bound its transport.
+fn spawn_quic_node(dir: &Path, log_dir: &Path) -> anyhow::Result<NodeProcess> {
+    spawn_quic_node_with(dir, log_dir, &[])
+}
+
+/// As [`spawn_quic_node`], with `extra_args`.
+fn spawn_quic_node_with(
+    dir: &Path,
+    log_dir: &Path,
+    extra_args: &[&str],
+) -> anyhow::Result<NodeProcess> {
+    std::fs::create_dir_all(log_dir)?;
+    spawn_quic_node_full(dir, log_dir, extra_args, None)
+}
+
+/// As [`spawn_quic_node_with`], with `home` as in `NodeProcess::spawn_full`.
+fn spawn_quic_node_full(
+    dir: &Path,
+    log_dir: &Path,
+    extra_args: &[&str],
+    home: Option<&Path>,
+) -> anyhow::Result<NodeProcess> {
+    std::fs::create_dir_all(log_dir)?;
+    let mut args = vec!["--transport-quic", "prefer"];
+    args.extend_from_slice(extra_args);
+    let mut node = NodeProcess::spawn_full(dir, log_dir, &args, home)?;
+    node.wait_for_logs(
+        &[READY_MARKER, TRANSPORT_BOUND_MARKER],
+        Duration::from_secs(120),
+    )?;
+    Ok(node)
+}
+
+/// Wait until the breaker marker is Armed by `node`. The node arms it just
+/// after binding its socket, so it can lag the bind log line slightly.
+fn wait_for_armed_marker(dir: &Path, node: &NodeProcess) -> anyhow::Result<serde_json::Value> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let marker = read_quic_marker(dir)?;
+        let armed_by = marker.as_ref().and_then(|m| {
+            (m.get("state")?.as_str()? == "armed").then_some(m.get("pid")?.as_i64()?)
+        });
+        if armed_by == Some(i64::from(node.pid())) {
+            return Ok(marker.expect("checked above"));
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "the marker was not armed by pid {} within 30 s; it is {marker:?}. Logs:\n{}",
+                node.pid(),
+                node.logs()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The breaker marker's contents, or `None` when there is no marker.
+fn read_quic_marker(dir: &Path) -> anyhow::Result<Option<serde_json::Value>> {
+    match std::fs::read(dir.join(QUIC_MARKER_FILE)) {
+        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// (a) A node with QUIC enabled arms the marker with its own pid and runs
+/// QUIC; (b) a SIGTERM stop exits 0 and clears it.
+///
+/// FALSIFY: delete the `quic_breaker_clean_exit()` call in `main`'s `Ok` arm;
+/// the marker survives the SIGTERM and (b) fails.
+#[test]
+fn quic_breaker_marker_is_armed_and_cleared_by_a_clean_stop() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut node = spawn_quic_node(dir.path(), &dir.path().join("logs-1"))?;
+
+    // (a)
+    let marker = wait_for_armed_marker(dir.path(), &node)?;
+    assert!(
+        marker.get("boot_id").and_then(|b| b.as_str()).is_some(),
+        "the marker records the boot identity: {marker}"
+    );
+    assert!(
+        node.logs().contains(QUIC_BUILT_MARKER),
+        "QUIC must be on in this run. Logs:\n{}",
+        node.logs()
+    );
+
+    // (b)
+    node.send_sigterm()?;
+    let status = node.wait_for_exit(Duration::from_secs(45))?;
+    assert_eq!(status.code(), Some(0), "Logs:\n{}", node.logs());
+    assert_eq!(
+        read_quic_marker(dir.path())?,
+        None,
+        "a clean stop must clear the marker, or the next start reads it as a \
+         crash and runs without QUIC for the cooldown"
+    );
+    Ok(())
+}
+
+/// (c) A node with QUIC enabled that is SIGKILLed trips the breaker: the next
+/// start records the trip, warns, and runs with QUIC off. A clean stop of that
+/// run leaves the trip in place, the start after it is still inside the
+/// cooldown and stays off without rewriting the marker, and a start with
+/// `--quic-ignore-crash-breaker` runs QUIC, arms the marker, and clears it on
+/// a clean stop.
+///
+/// FALSIFY: replace the `breaker::gate(..).await` call in
+/// `P2pConnManager::build` with `breaker::Gated { settings:
+/// config.quic_settings(), breaker: breaker::BreakerOutcome::NotConsulted }`;
+/// no marker is written, the third run builds the QUIC endpoint, and this test
+/// fails.
+#[test]
+fn quic_breaker_trips_after_an_abnormal_exit() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+
+    let mut first = spawn_quic_node(dir.path(), &dir.path().join("logs-1"))?;
+    assert!(
+        first.logs().contains(QUIC_BUILT_MARKER),
+        "QUIC must be on before the crash. Logs:\n{}",
+        first.logs()
+    );
+    // Killed only once it has armed, or there is nothing to trip on.
+    wait_for_armed_marker(dir.path(), &first)?;
+    first.kill_abnormally()?;
+    drop(first);
+
+    let mut second = spawn_quic_node(dir.path(), &dir.path().join("logs-2"))?;
+    let marker = read_quic_marker(dir.path())?;
+    assert_eq!(
+        marker.as_ref().and_then(|m| m.get("state")?.as_str()),
+        Some("tripped"),
+        "after an abnormal exit the marker must record a trip; got {marker:?}. Logs:\n{}",
+        second.logs()
+    );
+    let logs = second.logs();
+    assert!(
+        logs.contains(QUIC_TRIP_MARKER),
+        "the trip must be logged. Logs:\n{logs}"
+    );
+    assert!(
+        !logs.contains(QUIC_BUILT_MARKER),
+        "QUIC must stay off after the trip, but the endpoint was built. Logs:\n{logs}"
+    );
+
+    second.send_sigterm()?;
+    let status = second.wait_for_exit(Duration::from_secs(45))?;
+    assert_eq!(status.code(), Some(0), "Logs:\n{}", second.logs());
+    let tripped = read_quic_marker(dir.path())?;
+    assert_eq!(
+        tripped
+            .as_ref()
+            .and_then(|m| Some(m.get("state")?.as_str()?.to_owned())),
+        Some("tripped".to_owned()),
+        "a clean stop of a run the breaker kept off must not clear the trip"
+    );
+
+    // Cooling: still off, and the trip time is not moved.
+    let mut third = spawn_quic_node(dir.path(), &dir.path().join("logs-3"))?;
+    let logs = third.logs();
+    assert!(
+        logs.contains(QUIC_COOLING_MARKER) && !logs.contains(QUIC_BUILT_MARKER),
+        "inside the cooldown QUIC must stay off, with the cooling WARN. Logs:\n{logs}"
+    );
+    assert_eq!(
+        read_quic_marker(dir.path())?,
+        tripped,
+        "a start inside the cooldown must not rewrite the marker"
+    );
+    third.send_sigterm()?;
+    assert_eq!(
+        third.wait_for_exit(Duration::from_secs(45))?.code(),
+        Some(0),
+        "Logs:\n{}",
+        third.logs()
+    );
+
+    // Override: QUIC runs, the marker is armed by this run and cleared by its
+    // clean stop.
+    let mut fourth = spawn_quic_node_with(
+        dir.path(),
+        &dir.path().join("logs-4"),
+        &["--quic-ignore-crash-breaker"],
+    )?;
+    let logs = fourth.logs();
+    assert!(
+        logs.contains(QUIC_BUILT_MARKER),
+        "the override must run QUIC inside the cooldown. Logs:\n{logs}"
+    );
+    // The override arms the marker like any QUIC start.
+    wait_for_armed_marker(dir.path(), &fourth)?;
+    fourth.send_sigterm()?;
+    assert_eq!(
+        fourth.wait_for_exit(Duration::from_secs(45))?.code(),
+        Some(0),
+        "Logs:\n{}",
+        fourth.logs()
+    );
+    assert_eq!(read_quic_marker(dir.path())?, None);
+    Ok(())
+}
+
+/// A SIGKILL whose pid is in the stop note (a deliberate hard kill, as the
+/// macOS tray does) is not a trip, and the start consumes the note; a note
+/// naming another pid does not excuse the kill. Drives `gate`'s reading of
+/// the note from `FREENET_QUIC_BREAKER_STOP_NOTE`.
+///
+/// FALSIFY: make `gate` ignore `FREENET_QUIC_BREAKER_STOP_NOTE` (so it falls
+/// back to the default path); the noted kill trips and the test's note is
+/// left behind.
+#[test]
+fn quic_breaker_stop_note_excuses_only_the_noted_pid() -> anyhow::Result<()> {
+    for noted_matches in [true, false] {
+        let dir = tempfile::tempdir()?;
+        let mut first = spawn_quic_node(dir.path(), &dir.path().join("logs-1"))?;
+        wait_for_armed_marker(dir.path(), &first)?;
+        let pid = u32::try_from(first.pid())?;
+        first.kill_abnormally()?;
+        drop(first);
+        let noted = if noted_matches { pid } else { pid + 1 };
+        std::fs::write(stop_note(dir.path()), format!("{noted}\n"))?;
+
+        let mut second = spawn_quic_node(dir.path(), &dir.path().join("logs-2"))?;
+        assert!(
+            !stop_note(dir.path()).exists(),
+            "the start must consume the note (noted pid matches: {noted_matches})"
+        );
+        let logs = second.logs();
+        if noted_matches {
+            assert!(
+                !logs.contains(QUIC_TRIP_MARKER) && logs.contains(QUIC_BUILT_MARKER),
+                "a noted kill is not a trip. Logs:\n{logs}"
+            );
+            wait_for_armed_marker(dir.path(), &second)?;
+        } else {
+            assert!(
+                logs.contains(QUIC_TRIP_MARKER) && !logs.contains(QUIC_BUILT_MARKER),
+                "a note for another pid does not excuse the kill. Logs:\n{logs}"
+            );
+            assert_eq!(
+                read_quic_marker(dir.path())?
+                    .and_then(|m| Some(m.get("state")?.as_str()?.to_owned())),
+                Some("tripped".to_owned())
+            );
+        }
+        second.send_sigterm()?;
+        assert_eq!(
+            second.wait_for_exit(Duration::from_secs(45))?.code(),
+            Some(0),
+            "Logs:\n{}",
+            second.logs()
+        );
+    }
+    Ok(())
+}
+
+/// A node started without `FREENET_QUIC_BREAKER_STOP_NOTE` (not by the tray
+/// wrapper) reads the note at its default place, `$HOME/.local/state/freenet`
+/// on Linux. That file may be meant for another node, so the start takes out
+/// only its own marker's pid and leaves every other entry.
+///
+/// FALSIFY: treat the default-path note like the wrapper's (delete it whole);
+/// the other node's entry is lost.
+#[cfg(target_os = "linux")]
+#[test]
+fn quic_breaker_default_path_note_keeps_other_entries() -> anyhow::Result<()> {
+    const OTHER: &str = "999999999";
+    let dir = tempfile::tempdir()?;
+    let home = dir.path().join("home");
+    let note = home.join(".local/state/freenet/quic-breaker-stop-note");
+    std::fs::create_dir_all(note.parent().expect("parent"))?;
+    let entries = |note: &Path| -> anyhow::Result<Vec<String>> {
+        Ok(std::fs::read_to_string(note)?
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect())
+    };
+
+    // A note for another node only: this start leaves it as it is.
+    std::fs::write(&note, format!("{OTHER}\n"))?;
+    let mut first = spawn_quic_node_full(dir.path(), &dir.path().join("logs-1"), &[], Some(&home))?;
+    wait_for_armed_marker(dir.path(), &first)?;
+    assert_eq!(entries(&note)?, vec![OTHER], "another node's entry is left");
+
+    // Our pid beside it: no trip, and only our pid is taken out.
+    let pid = first.pid();
+    first.kill_abnormally()?;
+    drop(first);
+    std::fs::write(&note, format!("{OTHER}\n{pid}\n"))?;
+    let mut second =
+        spawn_quic_node_full(dir.path(), &dir.path().join("logs-2"), &[], Some(&home))?;
+    let logs = second.logs();
+    assert!(
+        !logs.contains(QUIC_TRIP_MARKER) && logs.contains(QUIC_BUILT_MARKER),
+        "a kill noted at the default path is not a trip. Logs:\n{logs}"
+    );
+    assert_eq!(entries(&note)?, vec![OTHER], "only our pid is taken out");
+    wait_for_armed_marker(dir.path(), &second)?;
+    second.send_sigterm()?;
+    assert_eq!(
+        second.wait_for_exit(Duration::from_secs(45))?.code(),
+        Some(0),
+        "Logs:\n{}",
+        second.logs()
+    );
+    Ok(())
 }

@@ -32,6 +32,24 @@ pub struct RunMeta {
     /// run from before the shuffle.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub order_seed: Option<u64>,
+    /// Time from the end of the PUTs to the start of the GET phase.
+    ///
+    /// When the two phases run on different hosts this is minutes (the job
+    /// handoff, a build, a release download), where it used to be the ~10s
+    /// settle. So a "0h" GET is read minutes after its PUT, and
+    /// `duration_ms`, which covers only the time spent in either phase, does
+    /// not include it. It is taken when the GET phase starts, before the
+    /// getter's node boots and joins (up to 120s more), so the first GET is
+    /// read somewhat later than this says. Absent from runs before the split.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub put_get_gap_ms: Option<u128>,
+    /// The getter's own address and ring location, as its node reported them
+    /// once joined. The location is derived from the address, and a hosted
+    /// runner gets a new one every night.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ephemeral_addr: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ephemeral_location: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -58,6 +76,9 @@ impl RunMeta {
             ephemeral_peers: Vec::new(),
             duration_ms: 0,
             order_seed: None,
+            put_get_gap_ms: None,
+            ephemeral_addr: None,
+            ephemeral_location: None,
         }
     }
 
@@ -66,7 +87,7 @@ impl RunMeta {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct OpReport {
     /// 0-based position in the order the run actually executed.
     ///
@@ -104,6 +125,11 @@ pub struct OpReport {
     pub errors_ignored: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Where this operation ran, when that differs from the run's vantage:
+    /// the nightly's PUTs run on the gateway host while its GETs, and so the
+    /// run, are published from another.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vantage: Option<String>,
 }
 
 /// The exact line `RunMeta::print` writes. Public so the emitter's tests can
@@ -163,9 +189,8 @@ impl Report {
         self.ops.push(op);
     }
 
-    /// The operations recorded so far, in the order they ran. Exists so a test
-    /// can read back what was recorded; the run itself only ever writes.
-    #[cfg(test)]
+    /// The operations recorded so far, in the order they ran. The PUT phase
+    /// hands its records to the GET phase through this.
     pub fn ops(&self) -> &[OpReport] {
         &self.ops
     }
@@ -204,6 +229,7 @@ mod tests {
             size: 1,
             errors_ignored: 0,
             error: None,
+            vantage: None,
         }
     }
 

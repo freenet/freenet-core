@@ -483,6 +483,33 @@ async fn periodic_log_prune(log_dir: PathBuf) {
     }
 }
 
+/// Environment variable that sends the node's logs to stderr INSTEAD of the
+/// log directory's files. Presence is what counts, so any value enables it.
+///
+/// netcheck depends on this exact name: its ephemeral getter node
+/// (`crates/netcheck/src/ephemeral.rs`) sets it so the node's logs land in the
+/// file netcheck prints on failure. netcheck does not link this crate, so it
+/// cannot use the constant; `netcheck_sets_the_env_vars_this_crate_reads`
+/// pins the two together.
+pub(crate) const LOG_TO_STDERR_ENV_VAR: &str = "FREENET_LOG_TO_STDERR";
+
+/// Environment variable selecting the log format. `json` (any case) gives one
+/// JSON object per line; anything else, or unset, the default format.
+pub(crate) const LOG_FORMAT_ENV_VAR: &str = "FREENET_LOG_FORMAT";
+
+/// Whether logs go to the rolling files: when there is a directory for them
+/// and [`LOG_TO_STDERR_ENV_VAR`] does not redirect them to stderr.
+///
+/// Pure for the same reason as [`console_logging_enabled`].
+fn file_logging_enabled(to_stderr_set: bool, has_log_dir: bool) -> bool {
+    !to_stderr_set && has_log_dir
+}
+
+/// Whether [`LOG_FORMAT_ENV_VAR`]'s raw value asks for JSON.
+fn json_format_requested(raw: Option<&str>) -> bool {
+    raw.is_some_and(|v| v.eq_ignore_ascii_case("json"))
+}
+
 /// Environment variable that forces the console log layer on even when stdout
 /// is not a terminal.
 ///
@@ -622,10 +649,8 @@ pub fn init_tracer(
         return Ok(());
     }
 
-    let to_stderr = std::env::var("FREENET_LOG_TO_STDERR").is_ok();
-    let use_json = std::env::var("FREENET_LOG_FORMAT")
-        .map(|v| v.eq_ignore_ascii_case("json"))
-        .unwrap_or(false);
+    let to_stderr = std::env::var(LOG_TO_STDERR_ENV_VAR).is_ok();
+    let use_json = json_format_requested(std::env::var(LOG_FORMAT_ENV_VAR).ok().as_deref());
 
     // Determine if we should write to files:
     // - Always write to files when a log directory is available (ensures diagnostic reports work)
@@ -634,7 +659,7 @@ pub fn init_tracer(
     //
     // Note: On Windows especially, logs must go to files because Task Scheduler
     // doesn't capture stdout, making `freenet service report` unable to collect logs.
-    let use_file_logging = !to_stderr && log_dir.is_some();
+    let use_file_logging = file_logging_enabled(to_stderr, log_dir.is_some());
 
     // Build filter (we'll create separate instances for each layer since filters are consumed)
     fn build_filter(default_filter: LevelFilter) -> tracing_subscriber::EnvFilter {
@@ -900,9 +925,7 @@ pub fn init_cli_stderr_tracer(level: LevelFilter) -> anyhow::Result<()> {
     if std::env::var("FREENET_DISABLE_LOGS").is_ok() {
         return Ok(());
     }
-    let use_json = std::env::var("FREENET_LOG_FORMAT")
-        .map(|v| v.eq_ignore_ascii_case("json"))
-        .unwrap_or(false);
+    let use_json = json_format_requested(std::env::var(LOG_FORMAT_ENV_VAR).ok().as_deref());
     let filter_layer = tracing_subscriber::EnvFilter::builder()
         .with_default_directive(level.into())
         .from_env_lossy()
@@ -1075,6 +1098,76 @@ mod console_logging_tests {
             "docker/freenet-node/Dockerfile must set {LOG_TO_CONSOLE_ENV_VAR}, or a \
              containerized node logs nothing to `docker logs`"
         );
+    }
+}
+
+/// Coverage for the stderr and format switches, which netcheck's ephemeral
+/// getter node depends on by name.
+#[cfg(test)]
+mod log_destination_tests {
+    use super::{
+        LOG_FORMAT_ENV_VAR, LOG_TO_STDERR_ENV_VAR, file_logging_enabled, json_format_requested,
+    };
+
+    #[test]
+    fn the_stderr_switch_takes_logs_off_the_files() {
+        assert!(
+            !file_logging_enabled(true, true),
+            "{LOG_TO_STDERR_ENV_VAR} must stop file logging even with a log dir, or a node \
+             whose stderr is captured (netcheck's getter) writes nothing there"
+        );
+        assert!(
+            file_logging_enabled(false, true),
+            "without the switch a node with a log dir must keep logging to files, which \
+             `freenet service report` reads"
+        );
+        assert!(!file_logging_enabled(false, false));
+    }
+
+    #[test]
+    fn json_is_requested_by_value_in_any_case() {
+        assert!(json_format_requested(Some("json")));
+        assert!(json_format_requested(Some("JSON")));
+        assert!(!json_format_requested(Some("pretty")));
+        assert!(!json_format_requested(None));
+    }
+
+    /// netcheck cannot import these constants (it does not link this crate),
+    /// so it repeats the names as literals. Renaming one here without
+    /// netcheck silently sends its getter's logs back to the default log dir,
+    /// and its failure diagnostics come out empty again.
+    #[test]
+    fn netcheck_sets_the_env_vars_this_crate_reads() {
+        assert_eq!(LOG_TO_STDERR_ENV_VAR, "FREENET_LOG_TO_STDERR");
+        assert_eq!(LOG_FORMAT_ENV_VAR, "FREENET_LOG_FORMAT");
+
+        // Bounded to the function that spawns the node, with comment lines
+        // dropped, so a commented-out call or a mention elsewhere in the file
+        // cannot satisfy this.
+        let src = include_str!("../../../netcheck/src/ephemeral.rs");
+        let sig = "pub async fn spawn_ephemeral(";
+        let at = src
+            .find(sig)
+            .expect("spawn_ephemeral not found in crates/netcheck/src/ephemeral.rs");
+        let body = src[at..]
+            .split_once("\n}\n")
+            .expect("could not locate the end of spawn_ephemeral")
+            .0;
+        let ephemeral: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .flat_map(|l| l.split_whitespace())
+            .collect();
+        for call in [
+            format!(".env(\"{LOG_TO_STDERR_ENV_VAR}\","),
+            format!(".env(\"{LOG_FORMAT_ENV_VAR}\",\"json\")"),
+        ] {
+            assert!(
+                ephemeral.contains(&call),
+                "spawn_ephemeral in crates/netcheck/src/ephemeral.rs no longer calls \
+                 `{call}` on its node; rename both sides together"
+            );
+        }
     }
 }
 

@@ -29,11 +29,15 @@
 //!   codes (connection close, stream stop and reset), one range each.
 //! - [`liveness`]: whether the endpoint is alive ([`QuicAvailability`]);
 //!   endpoint death turns QUIC off for the node and never stops it.
+//! - [`upgrade`]: upgrading a UDP session to QUIC. So far only the policy
+//!   ([`upgrade::policy`]): whether the node may upgrade at all, and how
+//!   many paths it may hold.
 //!
 //! [`DemuxSocket`]: super::DemuxSocket
 //! [`TransportPublicKey`]: super::TransportPublicKey
 //! [`TimeSource`]: crate::simulation::TimeSource
 
+pub(crate) mod breaker;
 pub(crate) mod cid;
 pub(crate) mod config;
 pub(crate) mod error;
@@ -41,8 +45,10 @@ pub(crate) mod framing;
 pub(crate) mod identity;
 pub(crate) mod liveness;
 pub(crate) mod path;
+pub(crate) mod recycle;
 pub(crate) mod runtime;
 pub(crate) mod socket;
+pub(crate) mod upgrade;
 
 #[cfg(test)]
 mod memory_tests;
@@ -81,26 +87,39 @@ pub(crate) use liveness::QuicAvailability;
 pub(crate) use liveness::QuicAvailabilityWatch;
 
 /// Whether the node may use QUIC: the `transport-quic` config key.
+///
+/// Off is the default on every platform, and must stay the default on
+/// Windows until the crash-loop breaker works there (#6031): the breaker is
+/// unix-only ([`breaker`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum QuicMode {
     /// No QUIC endpoint is built and no QUIC datagram is read. The default.
     #[default]
     Off,
-    /// The node builds a QUIC endpoint on its UDP port. In this release
-    /// nothing in the node asks it to accept or open a connection. It still
-    /// differs from `Off`
-    /// in three ways: the demux socket has a QUIC ingress, so a QUIC-class
-    /// datagram is counted `quic_ingress_not_allowed` instead of
+    /// The node builds a QUIC endpoint on its UDP port and may upgrade a UDP
+    /// session to a QUIC path that carries only control frames: all
+    /// application traffic stays on UDP. In this release nothing in the node
+    /// upgrades yet ([`upgrade::policy`] is not wired in), so the endpoint
+    /// accepts and opens no connection. It still differs from `Off` in three
+    /// ways: the demux socket has a QUIC ingress, so a QUIC-class datagram is
+    /// counted `quic_ingress_not_allowed` instead of
     /// `quic_ingress_no_ingress`; quinn's endpoint driver runs as a task
     /// (idle, waiting on the empty ingress queue); and the endpoint's memory.
     /// If the endpoint cannot be built the node logs a warning and runs with
     /// QUIC off.
+    Shadow,
+    /// Meant to carry application data over QUIC. Until that ships it acts
+    /// as [`Self::Shadow`] (see [`Self::effective`]), so a node that sets it
+    /// early starts carrying data over QUIC once it runs a release where
+    /// `prefer` does. That release's notes must say so.
     Prefer,
 }
 
 impl QuicMode {
     /// The value written in `config.toml` and accepted on the command line.
     pub const OFF: &'static str = "off";
+    /// See [`QuicMode::Shadow`].
+    pub const SHADOW: &'static str = "shadow";
     /// See [`QuicMode::Prefer`].
     pub const PREFER: &'static str = "prefer";
 
@@ -112,14 +131,33 @@ impl QuicMode {
         match value.map(|v| v.trim().to_ascii_lowercase()) {
             None => Self::Off,
             Some(v) if v == Self::OFF => Self::Off,
+            Some(v) if v == Self::SHADOW => Self::Shadow,
             Some(v) if v == Self::PREFER => Self::Prefer,
             Some(other) => {
                 tracing::warn!(
                     transport_quic = %other,
-                    "Unknown transport-quic value; QUIC stays off. Known values: off, prefer"
+                    "Unknown transport-quic value; QUIC stays off. Known values: off, shadow, prefer"
                 );
                 Self::Off
             }
+        }
+    }
+
+    /// Whether the node builds a QUIC endpoint in this mode.
+    pub(crate) fn builds_endpoint(self) -> bool {
+        match self {
+            Self::Off => false,
+            Self::Shadow | Self::Prefer => true,
+        }
+    }
+
+    /// The mode this release runs: `Off` and `Shadow` are themselves, and
+    /// `Prefer` runs as `Shadow`. Startup says so at INFO
+    /// ([`upgrade::policy::log_startup`]).
+    pub(crate) fn effective(self) -> Self {
+        match self {
+            Self::Off => Self::Off,
+            Self::Shadow | Self::Prefer => Self::Shadow,
         }
     }
 }
@@ -172,9 +210,14 @@ pub(crate) struct EndpointCore {
     expected_clients: Arc<ExpectedClients>,
     /// The endpoint's availability, handed to each connection's watcher.
     availability: QuicAvailabilityWatch,
+    /// The QUIC transmits the egress cap holds (`socket::CapHolds`).
+    cap_holds: Arc<socket::CapHolds>,
     /// Test hooks that inject faults into quinn's drivers.
     #[cfg(test)]
     faults: Arc<socket::SocketFaults>,
+    /// The type name of the clock quinn runs on (tests).
+    #[cfg(any(test, feature = "testing"))]
+    clock: &'static str,
 }
 
 /// Shared by every handle to one endpoint; the last one dropped marks the
@@ -429,6 +472,7 @@ impl QuicEndpoint {
         let health = EndpointHealth::new(local_addr);
         #[cfg(test)]
         let mut faults = None;
+        let mut cap_holds = None;
         // If quinn refuses the socket after the ingress is enabled, the
         // ingress is disabled again, so the node is left as with QUIC off.
         let endpoint = socket
@@ -439,6 +483,7 @@ impl QuicEndpoint {
                     local_addr,
                     health.clone(),
                 ));
+                cap_holds = Some(quic_socket.cap_holds());
                 #[cfg(test)]
                 {
                     faults = Some(quic_socket.faults());
@@ -480,8 +525,12 @@ impl QuicEndpoint {
                 identity,
                 expected_clients: Arc::new(ExpectedClients::default()),
                 availability: health.watch(),
+                // Set by the closure, which ran: `endpoint` is built.
+                cap_holds: cap_holds.expect("the QUIC socket's cap holds"),
                 #[cfg(test)]
                 faults: faults.unwrap_or_default(),
+                #[cfg(any(test, feature = "testing"))]
+                clock: std::any::type_name::<T>(),
             },
         })
     }
@@ -503,6 +552,12 @@ impl QuicEndpoint {
     #[cfg(test)]
     pub(crate) fn faults(&self) -> &socket::SocketFaults {
         &self.faults
+    }
+
+    /// The type name of the clock quinn runs on (tests).
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn clock_type(&self) -> &'static str {
+        self.clock
     }
 
     /// Accept connection attempts in a task registered with `monitor` as
@@ -714,6 +769,7 @@ impl QuicEndpoint {
             None,
             peer,
             self.availability(),
+            self.cap_holds.clone(),
         ))
     }
 }
@@ -762,6 +818,7 @@ impl EndpointCore {
                 config: Arc::new(config),
                 peer: expected,
                 hold,
+                cap_holds: self.cap_holds.clone(),
             });
         }
     }
@@ -781,6 +838,8 @@ pub(crate) struct QuicIncoming {
     peer: PeerKey,
     /// Keeps the address bound to `peer` while the attempt lives.
     hold: KeyHold,
+    /// The endpoint's record of cap-held transmits.
+    cap_holds: Arc<socket::CapHolds>,
 }
 
 impl QuicIncoming {
@@ -804,6 +863,7 @@ impl QuicIncoming {
             Some(self.hold),
             self.peer,
             self.availability,
+            self.cap_holds,
         ))
     }
 }
@@ -818,6 +878,8 @@ pub(crate) struct QuicConnection {
     closer: QuicCloser,
     /// The key the peer proved in the handshake.
     peer: PeerKey,
+    /// The endpoint's record of cap-held transmits, for the path's watch.
+    cap_holds: Arc<socket::CapHolds>,
 }
 
 impl std::fmt::Debug for QuicConnection {
@@ -835,6 +897,7 @@ impl QuicConnection {
         hold: Option<KeyHold>,
         peer: PeerKey,
         mut availability: QuicAvailabilityWatch,
+        cap_holds: Arc<socket::CapHolds>,
     ) -> Self {
         let closer = QuicCloser::new(connection.clone());
         // The watcher holds the permit, and on the server side the hold
@@ -874,6 +937,7 @@ impl QuicConnection {
             connection,
             closer,
             peer,
+            cap_holds,
         }
     }
 
@@ -899,6 +963,11 @@ impl QuicConnection {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn close(&self, code: QuicCloseCode) {
         self.closer.close(code);
+    }
+
+    /// The endpoint's record of the QUIC transmits its egress cap holds.
+    pub(crate) fn cap_holds(&self) -> Arc<socket::CapHolds> {
+        self.cap_holds.clone()
     }
 
     /// The connection's closer, for another task that may close it (the
@@ -964,6 +1033,16 @@ impl QuicCloser {
         }
         self.connection.close(code.code().into(), code.reason());
         true
+    }
+
+    /// Whether the connection is still open (quinn has no close reason).
+    pub(crate) fn is_open(&self) -> bool {
+        self.connection.close_reason().is_none()
+    }
+
+    /// The connection's remote address (for logs).
+    pub(crate) fn remote_address(&self) -> SocketAddr {
+        self.connection.remote_address()
     }
 
     /// Mark a close as in progress without closing (tests: a second

@@ -180,6 +180,44 @@ fn log_record<T: Serialize>(
     }))
 }
 
+/// One `netcheck_op` record per operation. An operation that names its own
+/// vantage is published under it; the rest under the run's.
+fn op_records(
+    ops: &[OpReport],
+    scenario: &str,
+    run_id: &str,
+    run_vantage: &str,
+    now_ns: u128,
+) -> Result<Vec<serde_json::Value>> {
+    let mut records = Vec::with_capacity(ops.len() + 1);
+    for op in ops {
+        let vantage = op.vantage.as_deref().unwrap_or(run_vantage);
+        records.push(log_record(
+            "netcheck_op",
+            vantage,
+            now_ns,
+            &CheckOp {
+                kind: "netcheck_op",
+                scenario,
+                run_id,
+                vantage,
+                op: &op.op,
+                seq: op.seq,
+                dimension: &op.age,
+                dimension_secs: dimension_secs(&op.age),
+                contract_key: &op.key,
+                ok: op.ok,
+                latency_ms: op.latency_ms,
+                bytes: op.size,
+                errors_ignored: op.errors_ignored,
+                error: op.error.as_deref(),
+                extra: serde_json::json!({ "label": op.label }),
+            },
+        )?);
+    }
+    Ok(records)
+}
+
 pub async fn run(args: EmitArgs) -> Result<bool> {
     let mut input = String::new();
     std::io::stdin()
@@ -211,31 +249,7 @@ pub async fn run(args: EmitArgs) -> Result<bool> {
         .context("system clock before epoch")?
         .as_nanos();
 
-    let mut records = Vec::with_capacity(parsed.ops.len() + 1);
-    for op in &parsed.ops {
-        records.push(log_record(
-            "netcheck_op",
-            &args.vantage,
-            now_ns,
-            &CheckOp {
-                kind: "netcheck_op",
-                scenario: &scenario,
-                run_id: &run_id,
-                vantage: &args.vantage,
-                op: &op.op,
-                seq: op.seq,
-                dimension: &op.age,
-                dimension_secs: dimension_secs(&op.age),
-                contract_key: &op.key,
-                ok: op.ok,
-                latency_ms: op.latency_ms,
-                bytes: op.size,
-                errors_ignored: op.errors_ignored,
-                error: op.error.as_deref(),
-                extra: serde_json::json!({ "label": op.label }),
-            },
-        )?);
-    }
+    let mut records = op_records(&parsed.ops, &scenario, &run_id, &args.vantage, now_ns)?;
     records.push(log_record(
         "netcheck_run",
         &args.vantage,
@@ -261,6 +275,9 @@ pub async fn run(args: EmitArgs) -> Result<bool> {
                 // no reason for the dashboard's verdict series to carry no
                 // record of the change. Null on runs from before the shuffle.
                 "order_seed": run_meta.order_seed,
+                "put_get_gap_ms": run_meta.put_get_gap_ms,
+                "ephemeral_addr": run_meta.ephemeral_addr,
+                "ephemeral_location": run_meta.ephemeral_location,
             }),
         },
     )?);
@@ -309,6 +326,7 @@ mod tests {
             size: 123,
             errors_ignored: 2,
             error: (!ok).then(|| "boom".to_string()),
+            vantage: None,
         }
     }
 
@@ -410,8 +428,8 @@ mod tests {
             .find("\n#[cfg(test)]\nmod ")
             .map(|i| i + 1)
             .expect("test module not located — this guard cannot verify anything");
-        let sig = "pub async fn run(args: EmitArgs) -> Result<bool> {";
-        let at = src.find(sig).expect("emit::run not found");
+        let sig = "fn op_records(";
+        let at = src.find(sig).expect("emit::op_records not found");
         assert!(
             at < tests_at,
             "anchor matched inside the test module — this pin would scrape its own source"
@@ -424,15 +442,46 @@ mod tests {
         let after_sig = &src[at + sig.len()..];
         let end = after_sig
             .find("\n}\n")
-            .expect("could not locate the end of emit::run");
+            .expect("could not locate the end of emit::op_records");
         let body = &after_sig[..end];
         for mirror in ["seq: op.seq,", "errors_ignored: op.errors_ignored,"] {
             assert!(
                 body.contains(mirror),
-                "`{mirror}` is gone from the CheckOp built in `run`. The published record no \
+                "`{mirror}` is gone from the CheckOp built in `op_records`. The published record no \
                  longer carries what the report recorded, and no other test in this crate can \
                  tell: substituting a literal for either field is invisible to all of them."
             );
         }
+    }
+
+    fn vantage_of(record: &serde_json::Value) -> (String, String) {
+        let attr = record["attributes"]
+            .as_array()
+            .expect("attributes")
+            .iter()
+            .find(|a| a["key"] == "vantage")
+            .expect("vantage attribute")["value"]["stringValue"]
+            .as_str()
+            .expect("string")
+            .to_string();
+        let body: serde_json::Value =
+            serde_json::from_str(record["body"]["stringValue"].as_str().expect("body"))
+                .expect("body json");
+        (attr, body["vantage"].as_str().expect("vantage").to_string())
+    }
+
+    #[test]
+    fn an_op_that_ran_elsewhere_is_published_under_its_own_vantage() {
+        // The nightly PUTs on the gateway host and GETs from a hosted runner;
+        // publishing the PUTs under the GETs' vantage would file nova's
+        // latencies under a machine that never made them.
+        let mut put = op("put", "0h", true);
+        put.vantage = Some("nova".to_string());
+        let get = op("get", "0h", true);
+        let records = op_records(&[put, get], "put_get", "r", "github-hosted", 0).expect("records");
+        let n = "nova".to_string();
+        let g = "github-hosted".to_string();
+        assert_eq!(vantage_of(&records[0]), (n.clone(), n));
+        assert_eq!(vantage_of(&records[1]), (g.clone(), g));
     }
 }

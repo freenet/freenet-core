@@ -44,6 +44,8 @@ pub struct NetworkStats {
     pub messages_dropped_partition: u64,
     /// Messages dropped due to crashed nodes
     pub messages_dropped_crash: u64,
+    /// QUIC-class datagrams dropped by a `QuicDatagramDrop` rule
+    pub messages_dropped_quic_datagram: u64,
     /// Messages queued for delayed delivery (VirtualTime mode)
     pub messages_queued: u64,
     /// Messages delivered after delay
@@ -55,7 +57,10 @@ pub struct NetworkStats {
 impl NetworkStats {
     /// Returns the total number of dropped messages.
     pub fn total_dropped(&self) -> u64 {
-        self.messages_dropped_loss + self.messages_dropped_partition + self.messages_dropped_crash
+        self.messages_dropped_loss
+            + self.messages_dropped_partition
+            + self.messages_dropped_crash
+            + self.messages_dropped_quic_datagram
     }
 
     /// Returns the message loss ratio (0.0 to 1.0).
@@ -296,6 +301,7 @@ mod tests {
             messages_dropped_loss: 10,
             messages_dropped_partition: 5,
             messages_dropped_crash: 5,
+            messages_dropped_quic_datagram: 0,
             messages_queued: 0,
             messages_delayed_delivered: 20,
             total_latency_nanos: 200_000_000, // 200ms total

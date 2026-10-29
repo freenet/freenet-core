@@ -440,13 +440,14 @@ async fn get_inner(
     }
 }
 
-/// Asks for the network section, which lists the ring's own connections.
+/// Asks for the network section, which lists the ring's own connections, and
+/// the node section, which carries the node's own address and ring location.
 /// `contract_keys` cannot be switched off: empty means every hosted contract,
 /// which on a freshly booted getter is none.
 fn ring_connections_query() -> ClientRequest<'static> {
     ClientRequest::NodeQueries(NodeQuery::NodeDiagnostics {
         config: NodeDiagnosticsConfig {
-            include_node_info: false,
+            include_node_info: true,
             include_network_info: true,
             include_subscriptions: false,
             contract_keys: Vec::new(),
@@ -457,9 +458,22 @@ fn ring_connections_query() -> ClientRequest<'static> {
     })
 }
 
-/// Wait until the node joins the ring; returns the addresses it connected to.
-/// The report carries them: they are the only evidence of whether a GET could
-/// have been answered by the node that stored the PUTs.
+/// What the getter looked like once it joined.
+#[derive(Debug, Default, PartialEq)]
+pub struct Joined {
+    /// Addresses of its ring connections. The report carries them: they are
+    /// the only evidence of whether a GET could have been answered by the node
+    /// that stored the PUTs.
+    pub peers: Vec<String>,
+    /// Its own address as the node reports it, and its ring location. The
+    /// location is derived from the address, and a hosted runner has a new
+    /// address every night, so without these the location the GETs were
+    /// routed from is a variable nobody can see.
+    pub own_addr: Option<String>,
+    pub own_location: Option<String>,
+}
+
+/// Wait until the node joins the ring.
 ///
 /// Asks for the node's RING connections, not `ConnectedPeers`. The latter
 /// lists transport connections, which include the transient link to the
@@ -472,7 +486,7 @@ fn ring_connections_query() -> ClientRequest<'static> {
 /// One ring connection is the minimum bar, not proof of a well-joined peer:
 /// it may be the bootstrap gateway itself, accepted as a neighbour. The
 /// returned addresses (the report's `ephemeral_peers`) say which.
-pub async fn wait_for_ring_join(client: &mut WebApi, timeout: Duration) -> Result<Vec<String>> {
+pub async fn wait_for_ring_join(client: &mut WebApi, timeout: Duration) -> Result<Joined> {
     let deadline = Instant::now() + timeout;
     loop {
         client.send(ring_connections_query()).await?;
@@ -481,12 +495,21 @@ pub async fn wait_for_ring_join(client: &mut WebApi, timeout: Duration) -> Resul
                 let peers = diag.network_info.map(|n| n.connected_peers);
                 if let Some(peers) = peers.filter(|p| !p.is_empty()) {
                     let addrs: Vec<String> = peers.into_iter().map(|(_, addr)| addr).collect();
+                    let (own_addr, own_location) = diag
+                        .node_info
+                        .map_or((None, None), |n| (n.listening_address, n.location));
                     eprintln!(
-                        "ephemeral node joined the ring ({} connection(s): {})",
+                        "ephemeral node joined the ring ({} connection(s): {}) as {} at location {}",
                         addrs.len(),
-                        addrs.join(", ")
+                        addrs.join(", "),
+                        own_addr.as_deref().unwrap_or("an unreported address"),
+                        own_location.as_deref().unwrap_or("unreported")
                     );
-                    return Ok(addrs);
+                    return Ok(Joined {
+                        peers: addrs,
+                        own_addr,
+                        own_location,
+                    });
                 }
                 "the node reported an empty ring".to_string()
             }
@@ -516,7 +539,7 @@ mod tests {
     use std::net::Ipv4Addr;
     use std::sync::Arc;
 
-    use freenet_stdlib::client_api::{NetworkInfo, NodeDiagnosticsResponse};
+    use freenet_stdlib::client_api::{NetworkInfo, NodeDiagnosticsResponse, NodeInfo};
     use freenet_stdlib::prelude::bincode;
     use futures::{SinkExt, StreamExt};
     use tokio::net::TcpListener;
@@ -624,13 +647,23 @@ mod tests {
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
-    /// As the real handler does, the network section is filled only when the
-    /// query asked for it.
-    fn diagnostics_with_ring(peers: &[&str], include_network_info: bool) -> HostResult {
+    /// Where the fake node says it is.
+    const OWN_ADDR: &str = "198.51.100.9:32177";
+    const OWN_LOCATION: &str = "0.25";
+
+    /// As the real handler does, each section is filled only when the query
+    /// asked for it.
+    fn diagnostics_with_ring(peers: &[&str], config: &NodeDiagnosticsConfig) -> HostResult {
         Ok(HostResponse::QueryResponse(QueryResponse::NodeDiagnostics(
             NodeDiagnosticsResponse {
-                node_info: None,
-                network_info: include_network_info.then(|| NetworkInfo {
+                node_info: config.include_node_info.then(|| NodeInfo {
+                    peer_id: "getter".to_string(),
+                    is_gateway: false,
+                    location: Some(OWN_LOCATION.to_string()),
+                    listening_address: Some(OWN_ADDR.to_string()),
+                    uptime_seconds: 1,
+                }),
+                network_info: config.include_network_info.then(|| NetworkInfo {
                     connected_peers: peers
                         .iter()
                         .map(|a| (format!("peer-at-{a}"), a.to_string()))
@@ -679,7 +712,7 @@ mod tests {
                     let i = diagnostics_asked.min(ring.len() - 1);
                     diagnostics_asked += 1;
                     match &ring[i] {
-                        Some(peers) => diagnostics_with_ring(peers, config.include_network_info),
+                        Some(peers) => diagnostics_with_ring(peers, &config),
                         None => Err(network_error_because("node busy")),
                     }
                 }
@@ -741,7 +774,18 @@ mod tests {
         let joined = wait_for_ring_join(&mut client, TEST_TIMEOUT)
             .await
             .expect("the node joined on the second poll");
-        assert_eq!(joined, vec!["203.0.113.7:40000".to_string()]);
+        assert_eq!(joined.peers, vec!["203.0.113.7:40000".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn the_join_reports_where_the_getter_itself_is() {
+        let mut client =
+            start_joining_node("5.9.111.215:31338", vec![Some(vec!["203.0.113.7:40000"])]).await;
+        let joined = wait_for_ring_join(&mut client, TEST_TIMEOUT)
+            .await
+            .expect("joined on the first poll");
+        assert_eq!(joined.own_addr.as_deref(), Some(OWN_ADDR));
+        assert_eq!(joined.own_location.as_deref(), Some(OWN_LOCATION));
     }
 
     #[tokio::test]
@@ -754,7 +798,7 @@ mod tests {
         let joined = wait_for_ring_join(&mut client, TEST_TIMEOUT)
             .await
             .expect("the error was one poll; the next found a ring peer");
-        assert_eq!(joined, vec!["203.0.113.7:40000".to_string()]);
+        assert_eq!(joined.peers, vec!["203.0.113.7:40000".to_string()]);
     }
 
     // ---- defect 3: errors must be key-filtered like successes ----

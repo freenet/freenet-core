@@ -24,7 +24,7 @@
 use dashmap::DashMap;
 use std::net::SocketAddr;
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use tokio::sync::mpsc;
 
 use crate::tracing::{TransferDirection, TransferEvent};
@@ -268,6 +268,12 @@ labelled_counters! {
         Downgrade => "downgrade",
         /// The peer proved a key this node does not have on record for it.
         IdentityMismatch => "identity_mismatch",
+        /// This side reset too many sends on the connection
+        /// (`quic::recycle::SEND_ABORT_LIMIT`).
+        SendAbortLimit => "send_abort_limit",
+        /// The peer kept sending but acknowledged none of this side's
+        /// packets for `quic::recycle::ACK_WATCH_WINDOW`.
+        PeerNotAcknowledging => "peer_not_acknowledging",
     }
 }
 
@@ -548,6 +554,12 @@ pub struct TransportMetrics {
     /// counted here (`receive_task_panicked`), and a panic in quinn's own
     /// driver code is not caught at all.
     quic_adapter_panicked: AtomicU64,
+    /// Times the QUIC crash-loop breaker tripped at startup (reset each
+    /// snapshot; at most one per process).
+    quic_breaker_trips: AtomicU64,
+    /// Whether the crash-loop breaker keeps QUIC off in this process (a
+    /// state, never reset).
+    quic_breaker_suppressed: AtomicBool,
     /// QUIC connections this node closed, by [`QuicCloseCode`] (reset each
     /// snapshot).
     quic_close_sent: [AtomicU64; QuicCloseCode::COUNT],
@@ -694,7 +706,9 @@ struct NatDetailCounters {
     demux_watched: DashMap<SocketAddr, Vec<DemuxClass>>,
     /// Test-only record of QUIC ingress outcomes, for the remotes a test
     /// registered with `watch_quic_ingress`; same rules as `demux_watched`.
-    #[cfg(test)]
+    /// Also built with the `testing` feature, for the simulation harness's
+    /// endpoint probe (`SimNetwork::probe_quic_endpoints_at`).
+    #[cfg(any(test, feature = "testing"))]
     quic_ingress_watched: DashMap<SocketAddr, Vec<QuicIngressOutcome>>,
     /// Test-only log of dropped stray intros `(remote, kind)` (bounded).
     #[cfg(test)]
@@ -939,6 +953,8 @@ impl TransportMetrics {
             conn_identity: Default::default(),
             quic_endpoint_down: AtomicU64::new(0),
             quic_adapter_panicked: AtomicU64::new(0),
+            quic_breaker_trips: AtomicU64::new(0),
+            quic_breaker_suppressed: AtomicBool::new(false),
             quic_close_sent: Default::default(),
             inbound_concurrency_epoch: AtomicU64::new(1),
             inbound_concurrency: Default::default(),
@@ -1109,16 +1125,22 @@ impl TransportMetrics {
     /// Test-only: start recording what the demultiplexer's QUIC ingress did
     /// with each QUIC-class datagram from `remote`. Same rules as
     /// [`Self::watch_demux`].
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     pub(crate) fn watch_quic_ingress(&self, remote: SocketAddr) {
         self.nat_detail
             .quic_ingress_watched
             .insert(remote, Vec::new());
     }
 
+    /// Test-only: stop recording QUIC ingress outcomes for `remote`.
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn unwatch_quic_ingress(&self, remote: SocketAddr) {
+        self.nat_detail.quic_ingress_watched.remove(&remote);
+    }
+
     /// Test-only: the QUIC ingress outcomes recorded, in order, for
     /// datagrams from a `remote` registered with `watch_quic_ingress`.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     pub(crate) fn quic_ingress_from(&self, remote: SocketAddr) -> Vec<QuicIngressOutcome> {
         self.nat_detail
             .quic_ingress_watched
@@ -1128,7 +1150,7 @@ impl TransportMetrics {
     }
 
     /// Test-only: add `outcome` to `remote`'s record if it is watched.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     pub(crate) fn note_quic_ingress_from(&self, remote: SocketAddr, outcome: QuicIngressOutcome) {
         if let Some(mut watched) = self.nat_detail.quic_ingress_watched.get_mut(&remote) {
             watched.push(outcome);
@@ -1387,6 +1409,18 @@ impl TransportMetrics {
             .iter()
             .filter(|addr| **addr == local)
             .count()
+    }
+
+    /// The QUIC crash-loop breaker tripped at startup
+    /// (`quic::breaker`).
+    pub(crate) fn record_quic_breaker_trip(&self) {
+        self.quic_breaker_trips.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Whether the crash-loop breaker keeps QUIC off in this process.
+    pub(crate) fn set_quic_breaker_suppressed(&self, suppressed: bool) {
+        self.quic_breaker_suppressed
+            .store(suppressed, Ordering::Relaxed);
     }
 
     /// Test-only: how many times the QUIC endpoint bound at `local` went
@@ -2016,6 +2050,8 @@ impl TransportMetrics {
             handshake_unauthenticated_dropped: get64(&self.handshake_unauthenticated_dropped),
             quic_endpoint_down: get64(&self.quic_endpoint_down),
             quic_adapter_panicked: get64(&self.quic_adapter_panicked),
+            quic_breaker_trips: get64(&self.quic_breaker_trips),
+            quic_breaker_suppressed: self.quic_breaker_suppressed.load(Ordering::Relaxed),
             quic_close_sent_node_dropped_peer: get64(
                 &self.quic_close_sent[QuicCloseCode::NodeDroppedPeer as usize],
             ),
@@ -2024,6 +2060,12 @@ impl TransportMetrics {
             ),
             quic_close_sent_identity_mismatch: get64(
                 &self.quic_close_sent[QuicCloseCode::IdentityMismatch as usize],
+            ),
+            quic_close_sent_send_abort_limit: get64(
+                &self.quic_close_sent[QuicCloseCode::SendAbortLimit as usize],
+            ),
+            quic_close_sent_peer_not_acknowledging: get64(
+                &self.quic_close_sent[QuicCloseCode::PeerNotAcknowledging as usize],
             ),
             nat_fail_samples: if reset {
                 std::mem::take(&mut *d.samples.lock())
@@ -2533,11 +2575,18 @@ pub struct TransportSnapshot {
     /// endpoint); each turns that endpoint off (#5940). Not counted: a
     /// panic in a path's receive task.
     pub quic_adapter_panicked: u64,
+    /// Times the QUIC crash-loop breaker tripped: a run with QUIC enabled
+    /// ended abnormally, so this one started with QUIC off (#5940).
+    pub quic_breaker_trips: u64,
+    /// Whether the crash-loop breaker keeps QUIC off in this process.
+    pub quic_breaker_suppressed: bool,
     /// QUIC connections this node closed, by close code
     /// ([`QuicCloseCode`]).
     pub quic_close_sent_node_dropped_peer: u64,
     pub quic_close_sent_downgrade: u64,
     pub quic_close_sent_identity_mismatch: u64,
+    pub quic_close_sent_send_abort_limit: u64,
+    pub quic_close_sent_peer_not_acknowledging: u64,
     /// Per-attempt records of the FIRST 8 failed outbound NAT traversals in
     /// the period (not a representative sample of a busy period);
     /// `nat_fail_samples_dropped` counts the rest. Read with the same
@@ -2842,9 +2891,13 @@ impl TransportSnapshot {
             handshake_unauthenticated_dropped,
             quic_endpoint_down,
             quic_adapter_panicked,
+            quic_breaker_trips,
+            quic_breaker_suppressed,
             quic_close_sent_node_dropped_peer,
             quic_close_sent_downgrade,
             quic_close_sent_identity_mismatch,
+            quic_close_sent_send_abort_limit,
+            quic_close_sent_peer_not_acknowledging,
             nat_fail_samples,
             nat_fail_samples_dropped,
             inbound_stream_refused_invalid_length,
@@ -2952,9 +3005,13 @@ impl TransportSnapshot {
         self.handshake_unauthenticated_dropped = handshake_unauthenticated_dropped;
         self.quic_endpoint_down = quic_endpoint_down;
         self.quic_adapter_panicked = quic_adapter_panicked;
+        self.quic_breaker_trips = quic_breaker_trips;
+        self.quic_breaker_suppressed = quic_breaker_suppressed;
         self.quic_close_sent_node_dropped_peer = quic_close_sent_node_dropped_peer;
         self.quic_close_sent_downgrade = quic_close_sent_downgrade;
         self.quic_close_sent_identity_mismatch = quic_close_sent_identity_mismatch;
+        self.quic_close_sent_send_abort_limit = quic_close_sent_send_abort_limit;
+        self.quic_close_sent_peer_not_acknowledging = quic_close_sent_peer_not_acknowledging;
         self.nat_fail_samples = nat_fail_samples;
         self.nat_fail_samples_dropped = nat_fail_samples_dropped;
         self.inbound_stream_refused_invalid_length = inbound_stream_refused_invalid_length;
@@ -3108,11 +3165,18 @@ struct SnapshotExtras {
     /// endpoint); each turns that endpoint off (#5940). Not counted: a
     /// panic in a path's receive task.
     pub quic_adapter_panicked: u64,
+    /// Times the QUIC crash-loop breaker tripped: a run with QUIC enabled
+    /// ended abnormally, so this one started with QUIC off (#5940).
+    pub quic_breaker_trips: u64,
+    /// Whether the crash-loop breaker keeps QUIC off in this process.
+    pub quic_breaker_suppressed: bool,
     /// QUIC connections this node closed, by close code
     /// ([`QuicCloseCode`]).
     pub quic_close_sent_node_dropped_peer: u64,
     pub quic_close_sent_downgrade: u64,
     pub quic_close_sent_identity_mismatch: u64,
+    pub quic_close_sent_send_abort_limit: u64,
+    pub quic_close_sent_peer_not_acknowledging: u64,
     /// Per-attempt records of the FIRST 8 failed outbound NAT traversals in
     /// the period (not a representative sample of a busy period);
     /// `nat_fail_samples_dropped` counts the rest. Read with the same
@@ -3256,9 +3320,12 @@ impl SnapshotExtras {
             || self.handshake_unauthenticated_dropped != 0
             || self.quic_endpoint_down != 0
             || self.quic_adapter_panicked != 0
+            || self.quic_breaker_trips != 0
             || self.quic_close_sent_node_dropped_peer != 0
             || self.quic_close_sent_downgrade != 0
             || self.quic_close_sent_identity_mismatch != 0
+            || self.quic_close_sent_send_abort_limit != 0
+            || self.quic_close_sent_peer_not_acknowledging != 0
             || !self.nat_fail_samples.is_empty()
             || self.inbound_stream_refused_invalid_length != 0
             || self.inbound_stream_refused_connection_bytes != 0
@@ -4165,6 +4232,40 @@ mod tests {
         assert_eq!(metrics.quic_adapter_panicked_at(local), 1);
     }
 
+    /// A breaker trip reaches the snapshot and its JSON, counts as activity
+    /// on its own, and resets; the suppressed state is carried while it
+    /// holds and is not activity by itself.
+    #[test]
+    fn quic_breaker_reaches_snapshot_and_trips_reset() {
+        let metrics = TransportMetrics::new();
+        assert!(
+            metrics.take_snapshot().is_none(),
+            "a fresh instance is idle"
+        );
+        metrics.set_quic_breaker_suppressed(true);
+        assert!(
+            metrics.take_snapshot().is_none(),
+            "a suppressed state alone is not activity"
+        );
+        metrics.record_quic_breaker_trip();
+        let snap = metrics
+            .take_snapshot()
+            .expect("a breaker trip alone is activity");
+        assert_eq!(snap.quic_breaker_trips, 1);
+        assert!(snap.quic_breaker_suppressed);
+        let json = serde_json::to_value(&snap).unwrap();
+        assert_eq!(json["quic_breaker_trips"], 1);
+        assert_eq!(json["quic_breaker_suppressed"], true);
+        assert!(
+            metrics.take_snapshot().is_none(),
+            "the trip count must reset"
+        );
+        metrics.record_upgrade_control_received();
+        let snap = metrics.take_snapshot().expect("activity");
+        assert_eq!(snap.quic_breaker_trips, 0);
+        assert!(snap.quic_breaker_suppressed, "the state is not reset");
+    }
+
     /// The snapshot field that carries the period count of closes sent
     /// with `code`. Exhaustive on purpose: a new `QuicCloseCode` fails to
     /// compile here until it is given a `TransportSnapshot` field.
@@ -4173,6 +4274,8 @@ mod tests {
             QuicCloseCode::NodeDroppedPeer => snap.quic_close_sent_node_dropped_peer,
             QuicCloseCode::Downgrade => snap.quic_close_sent_downgrade,
             QuicCloseCode::IdentityMismatch => snap.quic_close_sent_identity_mismatch,
+            QuicCloseCode::SendAbortLimit => snap.quic_close_sent_send_abort_limit,
+            QuicCloseCode::PeerNotAcknowledging => snap.quic_close_sent_peer_not_acknowledging,
         }
     }
 
@@ -5288,9 +5391,13 @@ mod tests {
             "handshake_unauthenticated_dropped",
             "quic_endpoint_down",
             "quic_adapter_panicked",
+            "quic_breaker_trips",
+            "quic_breaker_suppressed",
             "quic_close_sent_node_dropped_peer",
             "quic_close_sent_downgrade",
             "quic_close_sent_identity_mismatch",
+            "quic_close_sent_send_abort_limit",
+            "quic_close_sent_peer_not_acknowledging",
             "nat_fail_samples",
             "nat_fail_samples_dropped",
             "inbound_stream_refused_invalid_length",

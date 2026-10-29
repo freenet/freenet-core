@@ -103,7 +103,16 @@ pub async fn spawn_ephemeral(
             cmd.args(["--gateway", spec]);
         }
     }
-    cmd.stdout(Stdio::from(log.try_clone()?))
+    // Without FREENET_LOG_TO_STDERR the node logs to the user's default log
+    // dir (~/.local/state/freenet on Linux), shared with every other node that
+    // user runs, and node.log, the file `log_tail` reads, stays empty. JSON
+    // because the default stderr format is multi-line and colour-coded, so a
+    // 40-line tail held only a handful of events; JSON is one per line, with
+    // no escape codes. Core pins both names against this file
+    // (`netcheck_sets_the_env_vars_this_crate_reads` in its tracer.rs).
+    cmd.env("FREENET_LOG_TO_STDERR", "1")
+        .env("FREENET_LOG_FORMAT", "json")
+        .stdout(Stdio::from(log.try_clone()?))
         .stderr(Stdio::from(log))
         .kill_on_drop(true);
 
@@ -184,4 +193,55 @@ pub async fn run_local_gateway(args: LocalGatewayArgs) -> Result<()> {
     tokio::time::sleep(Duration::from_millis(100)).await;
     anyhow::ensure!(status.success(), "local gateway exited with {status}");
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    /// The node's logs must land in node.log, which is all `log_tail` reads.
+    /// Without `FREENET_LOG_TO_STDERR` a real node writes them to the user's
+    /// default log dir instead, and every failed nightly printed an empty
+    /// "ephemeral node log tail". A stand-in binary reports what it inherited.
+    #[tokio::test]
+    async fn the_node_log_tail_captures_what_the_node_logs() {
+        // The node inherits this process's environment, so if either variable
+        // were already set here, deleting the `.env(...)` that sets it would
+        // leave this test green.
+        for var in ["FREENET_LOG_TO_STDERR", "FREENET_LOG_FORMAT"] {
+            assert!(
+                std::env::var_os(var).is_none(),
+                "{var} is set in the test environment, so this test cannot tell whether \
+                 spawn_ephemeral sets it; unset it and re-run"
+            );
+        }
+        let bin_dir = tempfile::tempdir().unwrap();
+        let fake = bin_dir.path().join("freenet");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\n\
+             echo \"FREENET_LOG_TO_STDERR=${FREENET_LOG_TO_STDERR:-unset}\" >&2\n\
+             echo \"FREENET_LOG_FORMAT=${FREENET_LOG_FORMAT:-unset}\" >&2\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut node = spawn_ephemeral(&fake, 31999, 7999, &[], None)
+            .await
+            .unwrap();
+        let status = node.child.wait().await.unwrap();
+        assert!(status.success(), "stand-in node exited with {status}");
+
+        let tail = node.log_tail();
+        assert!(
+            tail.contains("FREENET_LOG_TO_STDERR=1"),
+            "node was not told to log to stderr; log tail: {tail:?}"
+        );
+        assert!(
+            tail.contains("FREENET_LOG_FORMAT=json"),
+            "node was not told to log one event per line; log tail: {tail:?}"
+        );
+    }
 }
