@@ -28,6 +28,7 @@
 //! keyed by the peer is not attributed to the session the peer uses until one
 //! of the two closes. Rare; a claim that waits this long is counted
 //! ([`LONG_CLAIM_WAIT`], `claim_held_long`) so field data shows how often.
+//! Making them converge is #6040.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
