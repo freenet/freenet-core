@@ -1629,7 +1629,7 @@ fn recycle_closes_to(remote: SocketAddr) -> Vec<QuicCloseCode> {
         .collect()
 }
 
-/// Memory-gate M6, guard 1: a path that has reset its limit of sends stays
+/// #5940 step M6, guard 1: a path that has reset its limit of sends stays
 /// open (checked at the limit minus one and at the limit), and the next
 /// reset closes it with `close_code::SEND_ABORT_LIMIT`, counted once; the
 /// peer reads it as a request to fall back to UDP.
@@ -1714,7 +1714,7 @@ impl Drop for DropFrom {
     }
 }
 
-/// Memory-gate M6, guard 2: `a`'s packets stop reaching `b` while `b`'s
+/// #5940 step M6, guard 2: `a`'s packets stop reaching `b` while `b`'s
 /// keep reaching `a`, and both have data outstanding. From `a`, the peer
 /// keeps sending (`b` retransmits and probes) and acknowledges none of
 /// `a`'s packets, so `a` closes the path with
@@ -1778,7 +1778,7 @@ fn a_peer_that_acknowledges_nothing_while_sending_is_closed_after_the_window() {
     })
 }
 
-/// Memory-gate M6, guard 2 must not fire on a slow but conforming peer: a
+/// #5940 step M6, guard 2 must not fire on a slow but conforming peer: a
 /// 5 s round trip (2.5 s each way, from before the handshake), with
 /// messages both ways for a while and then an idle minute. Neither side
 /// closes, and nothing is counted.
@@ -1827,7 +1827,7 @@ fn a_slow_conforming_peer_is_not_closed() {
     })
 }
 
-/// Memory-gate M6, guard 2 must not fire on an idle path: two minutes with
+/// #5940 step M6, guard 2 must not fire on an idle path: two minutes with
 /// nothing to send after an exchange, then the path still carries a message.
 #[test]
 fn an_idle_path_is_not_closed() {

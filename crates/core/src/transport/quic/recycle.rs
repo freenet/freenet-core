@@ -1,5 +1,5 @@
 //! When a QUIC path is closed so its peer falls back to the UDP session
-//! (#5940, memory-gate step M6).
+//! (#5940, step M6).
 //!
 //! Two conditions close a path, each with its own close code and counted in
 //! `quic_close_sent_<label>` ([`QuicCloseCode`]):
