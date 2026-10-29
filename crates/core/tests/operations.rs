@@ -4033,19 +4033,29 @@ async fn test_delegate_contract_put_and_update(ctx: &mut TestContext) -> TestRes
 /// E2E test for #5488: an UPDATE to a contract a delegate subscribed to runs
 /// that delegate, and the delegate's output reaches the app that subscribed.
 ///
-/// **What was uncovered.** The notification path has three legs and no test
-/// crossed all three. `RuntimePool` hands every executor the notification
-/// sender (three sites in `pool.rs`: the first executor, the ones built in the
-/// loop, and a replacement after a worker is rebuilt); the executor's
-/// post-commit fan-out looks up the contract's delegate subscribers and
-/// enqueues one notification each (`send_delegate_contract_notifications`); and
-/// the contract loop takes the receiver and runs the delegate for each
-/// (`handle_delegate_notification`). An executor built without the sender
-/// returns from the fan-out silently, so losing any one of those wiring sites
-/// turns the whole path into a no-op that reports no error anywhere.
+/// **What was uncovered.** `RuntimePool` hands each executor the notification
+/// sender; the executor's post-commit fan-out looks up the contract's delegate
+/// subscribers and enqueues one notification each
+/// (`send_delegate_contract_notifications`); and the contract loop takes the
+/// receiver and runs the delegate for each (`handle_delegate_notification`).
+/// An executor built without the sender returns from the fan-out silently, so
+/// a break anywhere along that chain is a no-op that reports no error.
 /// `test_delegate_subscribe_reaches_the_network_for_an_unseen_contract` covers
-/// the subscribe being accepted, and says — correctly — that it does not cover
-/// notifications then flowing. This is that second half.
+/// the subscribe being accepted and does not cover notifications then flowing.
+/// This is that second half.
+///
+/// **Exactly which wiring this reaches, and which it does not.** `pool.rs` sets
+/// the sender at three sites: the first executor, the executors built in the
+/// pool loop, and a replacement built after a worker is found unhealthy.
+/// `pop_executor` returns the first free slot, so a sequential single-node test
+/// always runs on the first executor and therefore only exercises that one
+/// site. Verified by isolating the mutations: removing the loop site alone
+/// leaves this test GREEN, and it is removing the first-executor site that
+/// turns it red. The loop site and the replacement site need unit tests on
+/// `RuntimePool` itself, which this test does not provide and must not be read
+/// as providing. What it does cover end to end is the first-executor wiring,
+/// the fan-out, the receiver drain, the app registration and the outbound
+/// routing.
 ///
 /// **Why the notification is observable on this socket.** A notification-driven
 /// delegate run has no originating client request to answer, so
@@ -4066,15 +4076,17 @@ async fn test_delegate_contract_put_and_update(ctx: &mut TestContext) -> TestRes
 /// delegate parameters that no other test uses, which makes its instance id and
 /// its delegate key its own: nothing else here can update the contract it
 /// subscribed to, and its notification cannot land on another test's delegate
-/// socket. Step 4 still matches on the notification's `contract_id` rather than
+/// socket. Step 5 still matches on the notification's `contract_id` rather than
 /// accepting the first one to arrive, because that check is free and does not
 /// depend on the paragraph above staying true.
 ///
 /// **If this test fails, which leg broke.** Step 3 failing means the
 /// subscription was never created, so steps 4 and 5 would be vacuous. Step 5
 /// timing out after step 3 passed and the `UpdateResponse` arrived means the
-/// commit happened and the notification did not: that is the path this test
-/// exists to watch, and it is the shape a lost `pool.rs` wiring site produces.
+/// commit happened and the notification did not. That is the path this test
+/// exists to watch: the first-executor wiring, the fan-out, the receiver
+/// drain, or the app-registry routing and delivery that carry the delegate's
+/// reply back to this socket.
 #[freenet_test(
     health_check_readiness = true,
     nodes = ["gateway"],
@@ -4235,9 +4247,10 @@ async fn test_delegate_is_notified_when_a_subscribed_contract_updates(
                 "no ContractNotificationReceived within 60s of the UPDATE \
                  (update_acknowledged={update_acknowledged}). With the subscribe \
                  confirmed in step 3, an acknowledged update and no notification \
-                 means the commit did not reach the delegate: the executor's \
-                 notification sender is unwired, the fan-out found no subscriber, \
-                 or the contract loop never ran the delegate"
+                 means the delegate's reply never reached this socket: the \
+                 executor's notification sender is unwired, the fan-out found no \
+                 subscriber, the contract loop never ran the delegate, or the run's \
+                 output was not routed to this app's registration"
             ),
         };
         match next {
