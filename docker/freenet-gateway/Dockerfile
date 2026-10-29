@@ -1,4 +1,4 @@
-FROM node:26-bullseye-slim
+FROM node:26-bookworm-slim
 
 # Install required dependencies
 RUN DEBIAN_FRONTEND=noninteractive \
