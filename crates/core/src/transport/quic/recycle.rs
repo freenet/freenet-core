@@ -130,8 +130,10 @@ pub(crate) const SEND_ABORT_LIMIT: u64 = 4096;
 /// probe after one PTO (about a round trip and a half at a steady RTT,
 /// 1 s at quinn's initial estimate). 10 s is several PTOs even at a round
 /// trip of 2 s, above geostationary satellite links (about 600 ms) and
-/// heavily buffered access links (1 to 2 s), so a conforming peer never
-/// reaches it; a path that does is closed and its peer stays on UDP.
+/// heavily buffered access links (1 to 2 s), so a conforming peer reaches
+/// it rarely: at a 2 s round trip, two probe rounds in a row lost in one
+/// direction already come close. When one does, the cost is a fallback to
+/// UDP for that connection only.
 pub(crate) const ACK_WATCH_WINDOW: Duration = Duration::from_secs(10);
 
 /// How often the acknowledgement watch samples the connection.
@@ -206,6 +208,10 @@ impl ControllerFactory for AckCountingFactory {
 pub(crate) struct AckState {
     /// Ack-eliciting packets the peer newly acknowledged (`on_ack` calls).
     acked: u64,
+    /// Batches of acknowledgements (`on_end_acks` calls), counting those
+    /// that acknowledged only acknowledgement-only packets, which have no
+    /// `on_ack`.
+    batches: u64,
     /// The bytes in flight after the latest batch of acknowledgements
     /// (`on_end_acks`).
     in_flight_after_acks: u64,
@@ -271,6 +277,7 @@ impl Controller for AckCounting {
     ) {
         {
             let mut state = self.state.lock();
+            state.batches += 1;
             state.in_flight_after_acks = in_flight;
             state.lost_since_acks = 0;
         }
@@ -412,10 +419,13 @@ impl AckSample {
         self.received
     }
 
+    /// A sample with these counts; `batches` counts every batch of
+    /// acknowledgements, those with an `on_ack` and those without.
     #[cfg(test)]
     pub(crate) fn synthetic(
         record: &Arc<Mutex<AckState>>,
         acked: u64,
+        batches: u64,
         outstanding_after_acks: u64,
         sent: u64,
         received: u64,
@@ -424,6 +434,7 @@ impl AckSample {
             record: record.clone(),
             state: AckState {
                 acked,
+                batches,
                 in_flight_after_acks: outstanding_after_acks,
                 lost_since_acks: 0,
             },
@@ -440,13 +451,21 @@ impl AckSample {
 /// Outstanding, at a sample, means either of:
 /// - bytes still in flight from the latest batch of acknowledgements, minus
 ///   those quinn has since declared lost; or
-/// - an ack-eliciting send seen at a sample that saw no acknowledgement, so
-///   made after the latest batch. quinn declares a packet lost only below
-///   the largest packet the peer acknowledged, so such a packet stays
-///   outstanding until the next acknowledgement.
+/// - an ack-eliciting send seen at a sample that saw no new batch of
+///   acknowledgements, so made after the latest batch. quinn declares a
+///   packet lost only below the largest packet the peer acknowledged, and
+///   it runs loss detection only on a batch or on its loss timer for
+///   packets below that largest one, so such a packet stays outstanding
+///   until the next batch. Every batch counts here, also one that
+///   acknowledges only this side's acknowledgement-only packets (it has no
+///   `on_ack`, yet its loss detection may declare the send lost): a new
+///   batch clears this, and the bytes it leaves in flight take over.
 ///
-/// Sends at a sample that also saw an acknowledgement may have come before
-/// that batch and are not counted; a later probe of quinn's counts them.
+/// Sends at a sample that also saw a batch may have come before it and are
+/// not counted; a later probe of quinn's counts them. When quinn discards
+/// its handshake keys, the in-flight bytes it held for them leave without
+/// any call to the controller, so the figure from the latest batch may
+/// stay high until the next batch replaces it.
 /// `ConnectionStats` cannot give the bytes sent since a batch directly:
 /// quinn reports every datagram to the controller (`on_sent`),
 /// acknowledgement-only ones included, and a node that mostly receives
@@ -475,7 +494,8 @@ pub(crate) struct AckWatch {
     previous: AckSample,
     /// When the window started.
     since: Option<u64>,
-    /// An ack-eliciting send was seen after the latest acknowledgement.
+    /// An ack-eliciting send was seen after the latest batch of
+    /// acknowledgements.
     sent_after_acks: bool,
     /// Samples in a row with nothing from the peer.
     quiet_samples: u32,
@@ -501,11 +521,12 @@ impl AckWatch {
         // A new controller restarts the counts: read it as an
         // acknowledgement, with nothing known to be outstanding.
         let acknowledged = !same_controller || sample.state.acked != self.previous.state.acked;
+        let new_batch = !same_controller || sample.state.batches != self.previous.state.batches;
         let peer_sent = same_controller && sample.received != self.previous.received;
         let sent_new = same_controller && sample.sent != self.previous.sent;
         let outstanding_after_acks = same_controller && sample.state.outstanding_after_acks() > 0;
         self.previous = sample;
-        if acknowledged {
+        if new_batch {
             self.sent_after_acks = false;
         } else if sent_new {
             self.sent_after_acks = true;

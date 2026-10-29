@@ -15,6 +15,9 @@ fn closes_at(start: u64) -> u64 {
 #[derive(Clone, Copy)]
 struct Reading {
     acked: u64,
+    /// Batches of acknowledgements; [`reading`] makes it `acked` (every
+    /// `on_ack` comes in a batch), [`Reading::batches`] sets it.
+    batches: u64,
     outstanding: u64,
     sent: u64,
     received: u64,
@@ -23,9 +26,17 @@ struct Reading {
 const fn reading(acked: u64, outstanding: u64, sent: u64, received: u64) -> Reading {
     Reading {
         acked,
+        batches: acked,
         outstanding,
         sent,
         received,
+    }
+}
+
+impl Reading {
+    /// The same reading with `batches` batches of acknowledgements.
+    const fn batches(self, batches: u64) -> Self {
+        Self { batches, ..self }
     }
 }
 
@@ -33,8 +44,16 @@ const fn reading(acked: u64, outstanding: u64, sent: u64, received: u64) -> Read
 /// (tick 0 is the first sample); the first tick at which it said close.
 fn run(ticks: u64, mut at: impl FnMut(u64) -> Reading) -> Option<u64> {
     let record = Arc::default();
-    let sample =
-        |r: Reading| AckSample::synthetic(&record, r.acked, r.outstanding, r.sent, r.received);
+    let sample = |r: Reading| {
+        AckSample::synthetic(
+            &record,
+            r.acked,
+            r.batches,
+            r.outstanding,
+            r.sent,
+            r.received,
+        )
+    };
     let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample(at(0)));
     (1..=ticks).find(|tick| watch.observe(tick * ACK_WATCH_TICK.as_secs() * SEC, sample(at(*tick))))
 }
@@ -117,9 +136,10 @@ fn a_window_ends_when_its_outstanding_bytes_are_declared_lost() {
     assert_eq!(closed, None);
 }
 
-/// A send made after the latest acknowledgement stays outstanding when the
-/// bytes left from that acknowledgement are declared lost (quinn declares
-/// loss only below the largest acknowledged packet): the window goes on and
+/// A send made after the latest batch of acknowledgements stays
+/// outstanding while quinn's loss timer declares the bytes left from that
+/// batch lost, with no new batch (the timer declares loss only below the
+/// largest acknowledged packet, so not the send): the window goes on and
 /// closes.
 #[test]
 fn a_send_after_the_latest_acknowledgement_keeps_the_window_open() {
@@ -128,6 +148,23 @@ fn a_send_after_the_latest_acknowledgement_keeps_the_window_open() {
         reading(5, outstanding, 10 + t.min(1), 100 + t)
     });
     assert_eq!(closed, Some(closes_at(1)));
+}
+
+/// Review finding (third round): a batch of acknowledgements with no
+/// `on_ack` (the peer acknowledged only this side's acknowledgement-only
+/// packets) runs quinn's loss detection, which may declare the latched send
+/// lost. Such a batch clears the latch, and with nothing left in flight the
+/// window ends: no close while the peer keeps sending.
+#[test]
+fn a_batch_without_new_acknowledgements_clears_a_latched_send() {
+    let closed = run(100, |t| {
+        // A send at tick 1, never acknowledged; at tick 3 a batch that
+        // acknowledges only acknowledgement-only packets and leaves nothing
+        // in flight.
+        let batches = if t >= 3 { 6 } else { 5 };
+        reading(5, 0, 10 + t.min(1), 100 + t).batches(batches)
+    });
+    assert_eq!(closed, None);
 }
 
 /// Recovery from an outage in both directions. Before it, sends with
@@ -202,7 +239,7 @@ fn a_busy_conforming_peer_is_never_closed() {
 fn a_new_controller_restarts_the_window() {
     let first: Arc<Mutex<AckState>> = Arc::default();
     let second: Arc<Mutex<AckState>> = Arc::default();
-    let s = |record, sent, received| AckSample::synthetic(record, 0, 0, sent, received);
+    let s = |record, sent, received| AckSample::synthetic(record, 0, 0, 0, sent, received);
     let mut watch = AckWatch::new(ACK_WATCH_WINDOW, s(&first, 0, 0));
     assert!(!watch.observe(2 * SEC, s(&first, 1, 1)));
     assert!(!watch.observe(4 * SEC, s(&second, 2, 2)));
@@ -448,6 +485,7 @@ fn ack_counting_forwards_every_call_unchanged() {
         *record.lock(),
         AckState {
             acked: 0,
+            batches: 1,
             in_flight_after_acks: 2400,
             lost_since_acks: 1200,
         }
@@ -489,7 +527,9 @@ fn ack_counting_forwards_quinns_calls_and_counts_each_ack() {
         inner_log: Arc::clone(&inner_log),
     });
     let (mut receiver, mut sender, now) = connected_pair_with(factory);
-    transfer_one_stream(&mut receiver, &mut sender, now, 64 * 1024);
+    let now = transfer_one_stream(&mut receiver, &mut sender, now, 64 * 1024);
+    // A transfer back, so the stack also handles batches while receiving.
+    transfer_one_stream(&mut sender, &mut receiver, now, 64 * 1024);
     let stack = Stack {
         outer: sender.conn().congestion_state().clone_box(),
         outer_log,
@@ -503,7 +543,19 @@ fn ack_counting_forwards_quinns_calls_and_counts_each_ack() {
         .filter(|call| matches!(call, Call::OnAck(..)))
         .count();
     assert!(acks > 0, "the transfer was acknowledged");
-    assert_eq!(record_of(stack.outer.as_ref()).lock().acked, acks as u64);
+    let record = *record_of(stack.outer.as_ref()).lock();
+    assert_eq!(record.acked, acks as u64);
+    // Every batch is counted. (A batch with no `on_ack`, which acknowledges
+    // only acknowledgement-only packets, is not produced on demand here:
+    // each packet this side sends while receiving also carries a
+    // flow-control frame. The latch rule for it is pinned by
+    // `a_batch_without_new_acknowledgements_clears_a_latched_send`.)
+    let log = stack.outer_log.lock().clone();
+    let batches = log
+        .iter()
+        .filter(|call| matches!(call, Call::OnEndAcks(..)))
+        .count();
+    assert_eq!(record.batches, batches as u64);
 }
 
 /// The names of the `fn`s declared directly in the `{ ... }` block that
@@ -545,12 +597,12 @@ fn fn_names_in_block(source: &str, start: &str) -> Vec<String> {
 
 /// The `congestion.rs` of the quinn-proto this crate links, located with
 /// `cargo metadata` (freenet's own resolved `quinn_proto` dependency).
-/// Tries `--offline` first, then with network access; fails if neither
-/// works or the source is not on disk.
+/// Runs `--offline` only, so a runner without network fails at once
+/// instead of waiting; fails if that fails or the source is not on disk.
 fn quinn_proto_congestion_rs() -> std::path::PathBuf {
     let manifest = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-    let run = |offline: bool| {
+    let run = || {
         let mut command = std::process::Command::new(&cargo);
         command.args([
             "metadata",
@@ -560,15 +612,10 @@ fn quinn_proto_congestion_rs() -> std::path::PathBuf {
             "--manifest-path",
             manifest,
         ]);
-        if offline {
-            command.arg("--offline");
-        }
+        command.arg("--offline");
         command.output().expect("run cargo metadata")
     };
-    let mut output = run(true);
-    if !output.status.success() {
-        output = run(false);
-    }
+    let output = run();
     assert!(
         output.status.success(),
         "cargo metadata failed: {}",

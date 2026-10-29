@@ -2078,14 +2078,15 @@ fn a_peer_that_keeps_sending_but_acknowledges_nothing_is_closed() {
     })
 }
 
-/// #5940 step M6, guard 2 (review finding 3): `a` is in the middle of a
-/// transfer that `b` has been acknowledging when `a`'s packets stop
-/// reaching `b`, so packets are outstanding after `b`'s last
-/// acknowledgement. `b` keeps sending. `a` closes within the window of the
-/// cut. (In simulation `a`'s probe timer is short, so this also closes
-/// through the probes; the unit test
+/// #5940 step M6, guard 2: `a` is in the middle of a transfer that `b` has
+/// been acknowledging when `a`'s packets stop reaching `b`. `b` keeps
+/// sending. The test checks on the real connection that `b`'s last
+/// acknowledgements left bytes outstanding, and that `a` closes within the
+/// window of the cut. It does not tell which rule started the window: in
+/// simulation `a`'s probe timer is short, so a new send starts one as soon
+/// as an acknowledgement would. The unit test
 /// `packets_left_outstanding_by_an_acknowledgement_close_after_the_window`
-/// isolates the outstanding-after-acknowledgement start.)
+/// pins the acknowledgement rule on its own.
 #[test]
 fn packets_left_outstanding_when_the_peer_stops_acknowledging_close_the_path() {
     bounded(|| async move {
@@ -2208,15 +2209,27 @@ fn a_slow_conforming_peer_is_not_closed() {
     })
 }
 
-/// A seeded loss of `percent` of datagrams in both directions on `network`.
-fn seeded_loss(network: &str, percent: u64) {
+/// Datagrams a [`seeded_loss`] saw and dropped.
+#[derive(Default)]
+struct LossCount {
+    seen: std::sync::atomic::AtomicU64,
+    dropped: std::sync::atomic::AtomicU64,
+}
+
+/// A seeded loss of `percent` of datagrams in both directions on `network`;
+/// the counts of what it saw and dropped.
+fn seeded_loss(network: &str, percent: u64) -> Arc<LossCount> {
     use crate::transport::in_memory_socket::{
         PacketDeliveryDecision, set_packet_delivery_callback,
     };
+    use std::sync::atomic::Ordering::Relaxed;
     let state = Arc::new(std::sync::atomic::AtomicU64::new(0x5940_0006));
+    let count = Arc::new(LossCount::default());
+    let counted = count.clone();
     set_packet_delivery_callback(
         network,
         Some(Arc::new(move |_, _, _| {
+            counted.seen.fetch_add(1, Relaxed);
             // A fixed linear congruential sequence, one draw per datagram.
             let next = state
                 .fetch_update(
@@ -2226,12 +2239,29 @@ fn seeded_loss(network: &str, percent: u64) {
                 )
                 .unwrap_or_default();
             if (next >> 33) % 100 < percent {
+                counted.dropped.fetch_add(1, Relaxed);
                 PacketDeliveryDecision::Drop
             } else {
                 PacketDeliveryDecision::Deliver
             }
         })),
     );
+    count
+}
+
+/// Sample `paths`' connections every 500 ms until `end` (virtual nanos);
+/// the largest `outstanding_after_acks` seen on either.
+async fn max_outstanding(paths: [Arc<QuicPath>; 2], time: VirtualTime, end: u64) -> u64 {
+    let mut max = 0;
+    while time.now_nanos() < end {
+        for path in &paths {
+            if let Some(sample) = recycle::AckSample::of(path.connection().inner()) {
+                max = max.max(sample.outstanding_after_acks());
+            }
+        }
+        time.sleep(Duration::from_millis(500)).await;
+    }
+    max
 }
 
 /// #5940 step M6, guard 2 must not fire on a conforming peer over a lossy
@@ -2243,7 +2273,7 @@ fn a_lossy_path_is_not_closed() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
         let network = "quic-path-ack-watch-lossy";
-        seeded_loss(network, 25);
+        let loss = seeded_loss(network, 25);
         let p = paths(network, 46, QuicPathLimits::DEFAULT).await;
         let (a_addr, b_addr) = (p.pair.a_addr, p.pair.b_addr);
         let (a, b, time) = (p.a.clone(), p.b.clone(), p.time());
@@ -2259,15 +2289,26 @@ fn a_lossy_path_is_not_closed() {
                     }
                     sent
                 };
-                let (bulk_ab, bulk_ba, t_a, t_b) = tokio::join!(
+                let (bulk_ab, bulk_ba, t_a, t_b, max) = tokio::join!(
                     a.send_stream(StreamId::next(), None, Bytes::from(payload(2 * MIB))),
                     b.send_stream(StreamId::next(), None, Bytes::from(payload(2 * MIB))),
                     trickle(a.clone(), time.clone()),
                     trickle(b.clone(), time.clone()),
+                    max_outstanding([a.clone(), b.clone()], time.clone(), end),
                 );
-                (bulk_ab, bulk_ba, t_a.min(t_b))
+                (bulk_ab, bulk_ba, (t_a.min(t_b), max))
             })
             .await;
+        let (trickles, max_outstanding) = trickles;
+        // The loss really happened, and the watch really had packets
+        // outstanding to judge, so "no close" is not vacuous.
+        let (seen, dropped) = (
+            loss.seen.load(std::sync::atomic::Ordering::Relaxed),
+            loss.dropped.load(std::sync::atomic::Ordering::Relaxed),
+        );
+        assert!(seen > 2000, "{seen} datagrams");
+        assert!(dropped * 100 >= seen * 20, "{dropped} of {seen} dropped");
+        assert!(max_outstanding > 0, "nothing was ever outstanding");
         crate::transport::in_memory_socket::set_packet_delivery_callback(network, None);
         bulk_ab.expect("a to b");
         bulk_ba.expect("b to a");
@@ -2299,15 +2340,19 @@ fn a_bulk_transfer_at_a_long_round_trip_is_not_closed() {
         );
         let p = paths(network, 47, QuicPathLimits::DEFAULT).await;
         let (a_addr, b_addr) = (p.pair.a_addr, p.pair.b_addr);
-        let (a, b) = (p.a.clone(), p.b.clone());
-        let (to_b, to_a) = p
+        let (a, b, time) = (p.a.clone(), p.b.clone(), p.time());
+        let (to_b, to_a, max) = p
             .drive(async move {
+                let end = time.now_nanos() + Duration::from_secs(20).as_nanos() as u64;
                 tokio::join!(
                     a.send_stream(StreamId::next(), None, Bytes::from(payload(8 * MIB))),
                     b.send_stream(StreamId::next(), None, Bytes::from(payload(8 * MIB))),
+                    max_outstanding([a.clone(), b.clone()], time.clone(), end),
                 )
             })
             .await;
+        // A full round trip of data in flight: tens of kilobytes at least.
+        assert!(max > 64 * 1024, "at most {max} bytes outstanding");
         set_packet_delivery_callback(network, None);
         to_b.expect("a to b");
         to_a.expect("b to a");
