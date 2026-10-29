@@ -168,7 +168,7 @@ pub(crate) struct EndpointCore {
     #[cfg(test)]
     receive_fault: Arc<socket::ReceiveFault>,
     /// The type name of the clock quinn runs on (tests).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     clock: &'static str,
 }
 
@@ -472,7 +472,7 @@ impl QuicEndpoint {
                 expected_clients: Arc::new(ExpectedClients::default()),
                 #[cfg(test)]
                 receive_fault: receive_fault.unwrap_or_default(),
-                #[cfg(test)]
+                #[cfg(any(test, feature = "testing"))]
                 clock: std::any::type_name::<T>(),
             },
         })
@@ -492,7 +492,7 @@ impl QuicEndpoint {
     }
 
     /// The type name of the clock quinn runs on (tests).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     pub(crate) fn clock_type(&self) -> &'static str {
         self.clock
     }

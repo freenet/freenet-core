@@ -95,6 +95,38 @@ pub fn clear_network_address_mappings(network_name: &str) {
     ADDRESS_NETWORKS.retain(|_, v| v != network_name);
 }
 
+/// The clock type each simulated node's QUIC endpoint was built on, keyed by
+/// `(network, address)`. Written by `bind_udp_listener` for an address that
+/// belongs to a simulation network; read by tests to check the endpoint
+/// really runs on the network's `VirtualTime`.
+#[cfg(any(test, feature = "testing"))]
+static QUIC_ENDPOINT_CLOCKS: LazyLock<DashMap<(String, SocketAddr), &'static str>> =
+    LazyLock::new(DashMap::new);
+
+/// Records that the QUIC endpoint at `addr` runs on a clock of type `clock`,
+/// if `addr` belongs to a simulation network.
+#[cfg(any(test, feature = "testing"))]
+pub(crate) fn record_quic_endpoint_clock(addr: SocketAddr, clock: &'static str) {
+    if let Some(network) = get_address_network(&addr) {
+        QUIC_ENDPOINT_CLOCKS.insert((network, addr), clock);
+    }
+}
+
+/// The clock type the QUIC endpoint at `addr` in `network` was built on, or
+/// `None` if no endpoint was built there.
+#[cfg(any(test, feature = "testing"))]
+pub(crate) fn quic_endpoint_clock(network: &str, addr: SocketAddr) -> Option<&'static str> {
+    QUIC_ENDPOINT_CLOCKS
+        .get(&(network.to_string(), addr))
+        .map(|clock| *clock)
+}
+
+/// Forgets every recorded QUIC endpoint clock of `network`.
+#[cfg(any(test, feature = "testing"))]
+pub(crate) fn clear_quic_endpoint_clocks(network: &str) {
+    QUIC_ENDPOINT_CLOCKS.retain(|(owner, _), _| owner != network);
+}
+
 /// Clears all network time sources, for EVERY network in the process.
 #[deprecated(
     note = "also wipes simulations running concurrently in this process (#5673); \

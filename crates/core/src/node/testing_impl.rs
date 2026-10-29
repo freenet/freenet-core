@@ -483,6 +483,16 @@ fn fault_injection_delivery_decision(
             // an injector with rules a VirtualTime. One replaced by hand
             // without it has the rules inactive, as a partition is.
             let now = inj.virtual_time.as_ref().map(|vt| vt.now_nanos());
+            if now.is_none() {
+                static WARNED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::warn!(
+                        network = network_name,
+                        "QUIC datagram drop rules are inactive: the fault injector has no VirtualTime"
+                    );
+                }
+            }
             if let Some(now) = now
                 && inj.config.drops_quic_datagram(&from, &to, datagram, now)
             {
@@ -2123,9 +2133,16 @@ impl SimNetwork {
     ///
     /// Only `run_simulation_direct` sends the probe; the other runners
     /// panic if one is set.
+    ///
+    /// # Panics
+    /// If a probe is already set.
     #[cfg(any(test, feature = "testing"))]
     pub fn probe_quic_endpoints_at(&mut self, at: Duration) -> QuicEndpointProbe {
         use crate::transport::metrics::TRANSPORT_METRICS;
+        assert!(
+            self.quic_endpoint_probe.is_none(),
+            "probe_quic_endpoints_at is already set for this network"
+        );
         // One stranger per node, in a ULA prefix named by this network, so
         // simulations running at once in one process do not share one.
         let network = self
@@ -2184,6 +2201,15 @@ impl SimNetwork {
         });
     }
 
+    /// The type name of the clock the QUIC endpoint of the node `label` was
+    /// built on, once the node has bound its socket; `None` if it built no
+    /// endpoint (QUIC off, or the bind failed).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn quic_endpoint_clock(&self, label: &NodeLabel) -> Option<&'static str> {
+        let addr = *self.node_addresses.get(label)?;
+        crate::transport::in_memory_socket::quic_endpoint_clock(&self.name, addr)
+    }
+
     /// Panics if a QUIC endpoint probe is set: only `run_simulation_direct`
     /// sends one, and a probe that silently never ran would fail later
     /// with a misleading message.
@@ -2199,6 +2225,7 @@ impl SimNetwork {
 /// [`SimNetwork::probe_quic_endpoints_at`] sent it.
 #[cfg(any(test, feature = "testing"))]
 #[derive(Debug)]
+#[must_use = "read the probe's outcomes after the run"]
 pub struct QuicEndpointProbe {
     pairs: Vec<(SocketAddr, SocketAddr)>,
 }
@@ -7027,6 +7054,8 @@ impl Drop for SimNetwork {
         // running in the same process (#5673).
         set_packet_delivery_callback(&self.name, None);
         set_queue_packet_callback(&self.name, None);
+        #[cfg(any(test, feature = "testing"))]
+        crate::transport::in_memory_socket::clear_quic_endpoint_clocks(&self.name);
 
         // Thread-local cleanup
         clear_current_network_name();
@@ -7854,29 +7883,24 @@ mod tests {
             SimNetwork::new("quic-harness-bad-e5a1", 1, 1, 7, 3, 6, 1, 0x5940_E5A1_0013).await;
         let label = labels_in_order(&sim)[1].clone();
         let real = SimNetwork::real_protocol_version();
-        let refused = |f: &mut dyn FnMut()| {
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err()
-        };
-        assert!(refused(&mut || {
+        assert_panics_with("unknown transport-quic value", || {
             sim.with_transport_quic("not-a-mode");
-        }));
-        assert!(refused(&mut || {
+        });
+        assert_panics_with("must lie between", || {
             sim.with_node_advertised_version(&label, (real.0, real.1, real.2 + 1));
-        }));
-        assert!(refused(&mut || {
+        });
+        assert_panics_with("must lie between", || {
             sim.with_node_advertised_version(&label, (real.0, real.1 + 1, 0));
-        }));
+        });
         let min = SimNetwork::min_compatible_protocol_version();
         if min.2 > 0 {
-            assert!(refused(&mut || {
+            assert_panics_with("must lie between", || {
                 sim.with_node_advertised_version(&label, (min.0, min.1, min.2 - 1));
-            }));
+            });
         }
-        assert!(!refused(&mut || {
-            sim.with_transport_quic(" PREFER ")
-                .with_node_advertised_version(&label, real)
-                .with_node_advertised_version(&label, min);
-        }));
+        sim.with_transport_quic(" PREFER ")
+            .with_node_advertised_version(&label, real)
+            .with_node_advertised_version(&label, min);
     }
 
     /// `drop_quic_datagrams_between` drops QUIC-class datagrams between its
@@ -7976,15 +8000,6 @@ mod tests {
         let _handles = sim
             .start_with_rand_gen::<rand::rngs::SmallRng>(0x5940_E5A1_0012, 1, 1)
             .await;
-        // Once started, `bind_udp_listener` builds the endpoint on VirtualTime exactly when
-        // this lookup finds one for the node's address.
-        for label in &labels {
-            let addr = sim.all_node_addresses()[label];
-            assert!(
-                crate::transport::in_memory_socket::get_socket_virtual_time(&addr).is_some(),
-                "{label} binds on the network's VirtualTime"
-            );
-        }
         let targets: Vec<(SocketAddr, SocketAddr, QuicIngressOutcome)> = [
             (&labels[0], 1, QuicIngressOutcome::NotAllowed),
             (&labels[1], 2, QuicIngressOutcome::NoIngress),
@@ -7992,10 +8007,10 @@ mod tests {
         .into_iter()
         .map(|(label, port, expected)| {
             let stranger = SocketAddr::from(([10, 201, 39, 1], port));
-            TRANSPORT_METRICS.watch_quic_ingress(stranger);
             (sim.all_node_addresses()[label], stranger, expected)
         })
         .collect();
+        let _watched = WatchedStrangers::new(targets.iter().map(|(_, stranger, _)| *stranger));
         let mut initial = vec![0xC0, 0, 0, 0, 1, 8];
         initial.resize(1200, 0);
         // A bound on how long the nodes take to bind, not a timing
@@ -8017,6 +8032,50 @@ mod tests {
                 "{target}"
             );
         }
+        // The clock each endpoint was actually built on: the network's
+        // VirtualTime for the node with QUIC, and no endpoint for the other.
+        let virtual_clock = std::any::type_name::<crate::simulation::VirtualTime>();
+        assert_eq!(sim.quic_endpoint_clock(&labels[0]), Some(virtual_clock));
+        assert_eq!(sim.quic_endpoint_clock(&labels[1]), None);
+    }
+
+    /// Watches the QUIC ingress outcomes of some addresses for a test, and
+    /// stops watching them when dropped, even if the test fails.
+    struct WatchedStrangers(Vec<SocketAddr>);
+
+    impl WatchedStrangers {
+        fn new(strangers: impl IntoIterator<Item = SocketAddr>) -> Self {
+            use crate::transport::metrics::TRANSPORT_METRICS;
+            let strangers: Vec<SocketAddr> = strangers.into_iter().collect();
+            for stranger in &strangers {
+                TRANSPORT_METRICS.watch_quic_ingress(*stranger);
+            }
+            Self(strangers)
+        }
+    }
+
+    impl Drop for WatchedStrangers {
+        fn drop(&mut self) {
+            use crate::transport::metrics::TRANSPORT_METRICS;
+            for stranger in &self.0 {
+                TRANSPORT_METRICS.unwatch_quic_ingress(*stranger);
+            }
+        }
+    }
+
+    /// Runs `f`, which must panic with a message containing `expected`.
+    fn assert_panics_with(expected: &str, f: impl FnOnce()) {
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+            .expect_err(&format!("expected a panic containing {expected:?}"));
+        let message = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default();
+        assert!(
+            message.contains(expected),
+            "panic {message:?} does not contain {expected:?}"
+        );
     }
 
     /// `P2pConnManager` opens the transport with `NodeConfig::quic_settings`,
@@ -8024,9 +8083,14 @@ mod tests {
     /// `network_api` settings, which would drop it.
     #[test]
     fn the_transport_is_opened_with_node_config_quic_settings() {
-        let source = include_str!("network_bridge/p2p_protoc.rs");
-        assert_eq!(source.matches("quic: config.quic_settings(),").count(), 1);
-        assert!(!source.contains("network_api.quic_settings()"));
+        let code: Vec<&str> = include_str!("network_bridge/p2p_protoc.rs")
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with("//"))
+            .collect();
+        let count = |needle: &str| code.iter().filter(|line| line.contains(needle)).count();
+        assert_eq!(count("quic: config.quic_settings(),"), 1);
+        assert_eq!(count("network_api.quic_settings()"), 0);
     }
 
     /// Misuse of the QUIC harness panics at the call, and a refused drop
@@ -8037,29 +8101,23 @@ mod tests {
             FaultInjectorState, get_fault_injector, set_fault_injector,
         };
         use futures::FutureExt;
-        use std::panic::{AssertUnwindSafe, catch_unwind};
+        use std::panic::AssertUnwindSafe;
         const NETWORK: &str = "quic-harness-misuse-e5a1";
         let mut sim = SimNetwork::new(NETWORK, 1, 1, 7, 3, 6, 1, 0x5940_E5A1_0014).await;
         let labels = labels_in_order(&sim);
 
         // An unknown label.
         let unknown = NodeLabel::node(NETWORK, 99);
-        assert!(
-            catch_unwind(AssertUnwindSafe(|| {
-                sim.with_node_transport_quic(&unknown, "prefer");
-            }))
-            .is_err()
-        );
+        assert_panics_with("is waiting to start", || {
+            sim.with_node_transport_quic(&unknown, "prefer");
+        });
 
         // A drop rule on an injector without VirtualTime.
         let bare = FaultInjectorState::new(crate::simulation::FaultConfig::default(), 1);
         set_fault_injector(NETWORK, Some(Arc::new(std::sync::Mutex::new(bare))));
-        assert!(
-            catch_unwind(AssertUnwindSafe(|| {
-                sim.drop_quic_datagrams_between(&labels[0], &labels[1], Duration::ZERO);
-            }))
-            .is_err()
-        );
+        assert_panics_with("needs the fault injector's VirtualTime", || {
+            sim.drop_quic_datagrams_between(&labels[0], &labels[1], Duration::ZERO);
+        });
         let injector = get_fault_injector(NETWORK).unwrap();
         assert!(
             injector.lock().is_ok(),
@@ -8077,22 +8135,31 @@ mod tests {
 
         // A probe with a runner that does not send it.
         let _probe = sim.probe_quic_endpoints_at(Duration::from_secs(1));
+        assert_panics_with("probe_quic_endpoints_at is already set", || {
+            let _second = sim.probe_quic_endpoints_at(Duration::from_secs(2));
+        });
         let started = AssertUnwindSafe(sim.start_with_rand_gen::<rand::rngs::SmallRng>(1, 1, 1))
             .catch_unwind()
-            .await;
-        assert!(started.is_err());
+            .await
+            .expect_err("a probe with another runner panics");
+        let message = started
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| started.downcast_ref::<String>().cloned())
+            .unwrap_or_default();
+        assert!(
+            message.contains("only honoured by run_simulation_direct"),
+            "{message:?}"
+        );
         sim.quic_endpoint_probe = None;
 
         // A node that already started.
         let _handles = sim
             .start_with_rand_gen::<rand::rngs::SmallRng>(1, 1, 1)
             .await;
-        assert!(
-            catch_unwind(AssertUnwindSafe(|| {
-                sim.with_node_transport_quic(&labels[1], "prefer");
-            }))
-            .is_err()
-        );
+        assert_panics_with("is waiting to start", || {
+            sim.with_node_transport_quic(&labels[1], "prefer");
+        });
     }
 
     /// A rule given through `FaultConfig::builder()` to `with_fault_injection`

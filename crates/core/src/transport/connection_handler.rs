@@ -303,6 +303,10 @@ pub(super) async fn bind_udp_listener<S: Socket>(
         }
     });
 
+    #[cfg(any(test, feature = "testing"))]
+    if let Some(endpoint) = &quic_endpoint {
+        super::in_memory_socket::record_quic_endpoint_clock(bind_addr, endpoint.clock_type());
+    }
     tracing::info!(
         target: "freenet_core::transport::send_debug",
         bind_addr = %bind_addr,
