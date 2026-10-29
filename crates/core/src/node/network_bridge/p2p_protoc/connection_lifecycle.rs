@@ -6,23 +6,6 @@
 use super::*;
 use crate::transport::{ConnIdentity, TRANSPORT_METRICS};
 
-/// The outcome of [`P2pConnManager::bind_identity`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum BindOutcome {
-    /// The connection had no identity and is now bound to the key.
-    Bound,
-    /// The connection was already bound to the key. Nothing changed.
-    Same,
-    /// The connection is bound to another key, which it keeps. Nothing
-    /// changed.
-    Mismatch(TransportPublicKey),
-    /// A claimed key that a dialled connection at another address still
-    /// holds. The connection stays without an identity. Nothing changed.
-    HeldByDial(SocketAddr),
-    /// There is no open connection at the address. Nothing changed.
-    NoConnection,
-}
-
 /// The identity telemetry kinds of a ConnectPeer for an existing connection.
 const CONNECT_PEER_KINDS: [ConnIdentity; 3] = [
     ConnIdentity::SetConnectPeer,
@@ -53,86 +36,104 @@ fn identity_kind(
     }
 }
 
+/// Whether [`P2pConnManager::promote_existing_connection`] put the
+/// connection into the ring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Promotion {
+    /// The ring took the connection, or already held it.
+    InRing,
+    /// The connection is not in the ring: the ring is at its cap, or the
+    /// connection has no identity to promote it under.
+    Refused,
+}
+
 impl P2pConnManager {
     /// Bind `key`, from `source`, as the peer identity of the open connection
-    /// at `addr`. This is the only place a connection's identity or the
-    /// key-to-address map gains an entry.
-    ///
-    /// A connection is bound at most once and keeps its key until it closes:
-    /// binding a key to a connection that already has one changes nothing
-    /// and reports [`BindOutcome::Same`] or [`BindOutcome::Mismatch`]. A
-    /// claimed key ([`IdentitySource::Claimed`]) is not bound while another
-    /// open connection holds it from a dial
-    /// ([`BindOutcome::HeldByDial`]): the dialled connection keeps the key's
-    /// address in `addr_by_pub_key`.
+    /// at `addr` (see `identity::bind` for the rules). A claim refused
+    /// because a dialled connection holds the key is kept as pending, with
+    /// `promote`, and bound when the key is released
+    /// ([`Self::release_identity`]).
     ///
     /// On a bind it counts `own_key` when `key` is this node's own key, and
-    /// `duplicate_key` when `addr_by_pub_key` held the key for another open
-    /// connection still bound to it.
+    /// `duplicate_key` when another open connection is bound to the key.
     pub(super) fn bind_identity(
         &mut self,
         addr: SocketAddr,
         key: &TransportPublicKey,
         source: IdentitySource,
+        promote: bool,
     ) -> BindOutcome {
-        let (outcome, holder) = self.check_bind(addr, key, source);
-        if outcome != BindOutcome::Bound {
-            return outcome;
+        let (outcome, holder) = identity::bind(
+            &mut self.connections,
+            &mut self.addr_by_pub_key,
+            addr,
+            key,
+            source,
+            promote,
+        );
+        if outcome == BindOutcome::Bound {
+            if *key == *self.bridge.op_manager.ring.connection_manager.pub_key {
+                TRANSPORT_METRICS.record_conn_identity(addr, ConnIdentity::OwnKey);
+            }
+            if holder.is_some() {
+                TRANSPORT_METRICS.record_conn_identity(addr, ConnIdentity::DuplicateKey);
+            }
         }
-        if *key == *self.bridge.op_manager.ring.connection_manager.pub_key {
-            TRANSPORT_METRICS.record_conn_identity(addr, ConnIdentity::OwnKey);
-        }
-        if holder.is_some() {
-            TRANSPORT_METRICS.record_conn_identity(addr, ConnIdentity::DuplicateKey);
-        }
-        if let Some(entry) = self.connections.get_mut(&addr) {
-            entry.identity = Some(BoundIdentity {
-                key: key.clone(),
-                source,
-            });
-        }
-        self.addr_by_pub_key.insert(key.clone(), addr);
-        BindOutcome::Bound
+        outcome
     }
 
-    /// What [`Self::bind_identity`] would do, without doing it, and the
-    /// other open connection still bound to `key` that `addr_by_pub_key`
-    /// maps it to, if any.
-    fn check_bind(
-        &self,
+    /// The connection at `addr`, bound to `key`, is closing: updates the
+    /// key-to-address index (see `identity::release`). The caller must run
+    /// the per-peer cleanup for `key` only on [`Release::Released`], when no
+    /// other open connection is bound to it.
+    pub(super) fn unbind_identity(
+        &mut self,
         addr: SocketAddr,
         key: &TransportPublicKey,
-        source: IdentitySource,
-    ) -> (BindOutcome, Option<SocketAddr>) {
-        let Some(entry) = self.connections.get(&addr) else {
-            return (BindOutcome::NoConnection, None);
+    ) -> Release {
+        identity::release(&self.connections, &mut self.addr_by_pub_key, addr, key)
+    }
+
+    /// The connection at `addr`, bound to `key`, has been removed from
+    /// `connections`. Updates the index, and when no other open connection
+    /// is bound to `key`: forgets the peer's subscriptions and cached state
+    /// (only with `forget_peer_state`), then binds a claim of `key` that was
+    /// left pending because this connection held it, promoting that
+    /// connection into the ring when the claim would have.
+    pub(super) async fn release_identity(
+        &mut self,
+        addr: SocketAddr,
+        key: &TransportPublicKey,
+        forget_peer_state: bool,
+    ) {
+        debug_assert!(!self.connections.contains_key(&addr));
+        if self.unbind_identity(addr, key) != Release::Released {
+            return;
+        }
+        if forget_peer_state {
+            self.bridge.op_manager.on_ring_connection_lost(key);
+        }
+        let Some((claimant, promote)) = identity::pending_claimant(&self.connections, addr, key)
+        else {
+            return;
         };
-        if let Some(bound) = entry.pub_key() {
-            let outcome = if bound == key {
-                BindOutcome::Same
-            } else {
-                BindOutcome::Mismatch(bound.clone())
-            };
-            return (outcome, None);
+        let outcome = self.bind_identity(claimant, key, IdentitySource::Claimed, promote);
+        if outcome != BindOutcome::Bound {
+            return;
         }
-        let holder = self
-            .addr_by_pub_key
-            .get(key)
-            .copied()
-            .filter(|previous| *previous != addr)
-            .and_then(|previous| {
-                self.connections
-                    .get(&previous)
-                    .and_then(|other| other.identity.as_ref())
-                    .filter(|other| other.key == *key)
-                    .map(|other| (previous, other.source))
-            });
-        match holder {
-            Some((previous, IdentitySource::Dialled)) if source == IdentitySource::Claimed => {
-                (BindOutcome::HeldByDial(previous), Some(previous))
-            }
-            _ => (BindOutcome::Bound, holder.map(|(previous, _)| previous)),
-        }
+        TRANSPORT_METRICS.record_conn_identity(claimant, ConnIdentity::PendingClaimBound);
+        let promotion = if promote {
+            Some(self.promote_existing_connection(claimant, None).await)
+        } else {
+            None
+        };
+        tracing::info!(
+            %claimant,
+            released = %addr,
+            pub_key = %key,
+            ?promotion,
+            "Bound a pending identity claim after the dialled connection holding its key closed"
+        );
     }
 
     /// Count disconnect cleanup of the connection `entry` at `addr`, when the
@@ -180,8 +181,10 @@ impl P2pConnManager {
     /// `NodeEvent::ExpectPeerConnection`: a connect op expects a connection
     /// from `addr` and is dialling it under `peer_key`. Registers the address
     /// with the transport and, with the key, with the handshake driver, so a
-    /// matched inbound connection is recorded and promoted under the key the
-    /// connect op dialled, as the dial itself would be if it succeeded.
+    /// matched inbound connection is bound to the key the connect op dialled
+    /// and promoted under it. The match is by address only, so that binding is
+    /// a claim: it is held back while a dialled connection elsewhere holds the
+    /// key, and the connection is closed if the peer later names another key.
     pub(super) fn handle_expect_peer_connection(
         addr: SocketAddr,
         peer_key: TransportPublicKey,
@@ -284,16 +287,14 @@ impl P2pConnManager {
             self.handle_broadcast_ready_state(false).await;
         }
 
-        // Forget this peer's subscriptions and cached contract state. A
-        // connection that never named a peer has none.
+        // Forget this peer's subscriptions and cached contract state, only
+        // when no other open connection is bound to its key. A connection
+        // that never named a peer has none.
+        let removed = self.connections.remove(&peer_addr);
         if let Some(pub_key) = &pub_key_to_remove {
-            self.bridge.op_manager.on_ring_connection_lost(pub_key);
+            self.release_identity(peer_addr, pub_key, true).await;
         }
-
-        if let Some(conn) = self.connections.remove(&peer_addr) {
-            if let Some(pub_key) = pub_key_to_remove {
-                self.addr_by_pub_key.remove(&pub_key);
-            }
+        if let Some(conn) = removed {
             // TODO: review: this could potentially leave garbage tasks in the background with peer listener
             match timeout(
                 Duration::from_secs(1),
@@ -378,17 +379,15 @@ impl P2pConnManager {
             self.handle_broadcast_ready_state(false).await;
         }
 
-        // Forget subscriptions and cached contract state. A connection that
-        // never named a peer has none.
+        // Remove from transport tracking and notify the per-connection task.
+        // The peer's subscriptions and cached contract state are forgotten
+        // only when no other open connection is bound to its key (a
+        // connection that never named a peer has none).
+        let removed = self.connections.remove(&peer_addr);
         if let Some(pub_key) = &pub_key_to_remove {
-            self.bridge.op_manager.on_ring_connection_lost(pub_key);
+            self.release_identity(peer_addr, pub_key, true).await;
         }
-
-        // Remove from transport tracking and notify the per-connection task
-        if let Some(conn) = self.connections.remove(&peer_addr) {
-            if let Some(pub_key) = pub_key_to_remove {
-                self.addr_by_pub_key.remove(&pub_key);
-            }
+        if let Some(conn) = removed {
             // Short timeout — zombie connections may already be dead
             match timeout(
                 Duration::from_millis(100),
@@ -406,6 +405,139 @@ impl P2pConnManager {
                 }
             }
         }
+    }
+
+    /// Promote the open connection at `peer_addr` into the ring under its
+    /// bound key, unless the ring already holds it. Used when a ConnectPeer
+    /// names an existing connection and when a pending identity claim is
+    /// bound. `tx` is the connect transaction, for logs.
+    pub(super) async fn promote_existing_connection(
+        &mut self,
+        peer_addr: SocketAddr,
+        tx: Option<Transaction>,
+    ) -> Promotion {
+        let Some(key) = self
+            .connections
+            .get(&peer_addr)
+            .and_then(|entry| entry.pub_key())
+            .cloned()
+        else {
+            return Promotion::Refused;
+        };
+        let connection_manager = &self.bridge.op_manager.ring.connection_manager;
+        let was_transient = connection_manager.drop_transient(peer_addr);
+
+        // Promote if: (a) was tracked as transient, OR (b) not already in ring.
+        // Case (b) handles expired transient TTL — transport preserved per 76058cf4
+        // but tracking entry gone. Without this, CONNECT succeeds but peer is never
+        // added to ring topology (#3113).
+        let needs_promotion = was_transient.is_some() || !connection_manager.is_in_ring(peer_addr);
+        let transient_expired = was_transient.is_none() && needs_promotion;
+
+        if needs_promotion {
+            let loc = was_transient
+                .and_then(|e| e.location)
+                .unwrap_or_else(|| Location::from_address(&peer_addr));
+            // Don't re-run should_accept() here — the connection was already
+            // accepted at the protocol level (the CONNECT terminus handler in connect.rs) and NAT traversal
+            // already succeeded. Re-evaluating the probabilistic Kleinberg filter
+            // would discard hard-won connections for no capacity reason (#3545).
+            // Enforce the hard max_connections cap as a resource safety limit,
+            // EXCEPT for a strictly-closer per-side nearest-neighbor lattice
+            // edge within the bounded over-max ceiling (mechanism 3). Without
+            // this exception the cap silently drops the guaranteed
+            // successor/predecessor edge on the REAL CONNECT/promotion path,
+            // making mechanism 3's at-capacity displacement inert in
+            // production (nodes routinely sit at max). The same predicate is
+            // re-checked in add_connection; the over-max topology prune sheds a
+            // farther non-lattice link next tick. See
+            // connection_manager.rs::{admits_lattice_edge_over_cap, LATTICE_OVERMAX_SLACK}.
+            let current = connection_manager.connection_count();
+            if connection_manager.refuses_connection_at_cap(loc) {
+                tracing::warn!(
+                    tx = ?tx,
+                    %peer_addr,
+                    current_connections = current,
+                    max_connections = connection_manager.max_connections,
+                    %loc,
+                    transient_expired,
+                    "connect_peer: rejecting transient promotion to enforce cap"
+                );
+                return Promotion::Refused;
+            }
+            // The key promoted is the connection's own, or the one it is
+            // bound to below: a ConnectPeer naming another one was refused
+            // above.
+            // #4787 instrumentation: count the promotion only if the ring
+            // actually took the connection. `add_connection`'s own `bool`
+            // reports the readiness-threshold crossing, NOT acceptance, so
+            // the outcome struct is what this has to branch on — otherwise
+            // a cap-rejected promotion inflates `promoted_to_ring` in
+            // exactly the saturation direction the counter is meant to
+            // expose.
+            let outcome = self
+                .bridge
+                .op_manager
+                .ring
+                .add_connection_reporting(loc, PeerId::new(key.clone(), peer_addr), true)
+                .await;
+            if outcome.added {
+                crate::node::network_status::record_bootstrap_promoted_to_ring();
+            }
+            let just_became_ready = outcome.just_became_ready;
+            tracing::info!(
+                tx = ?tx,
+                remote = %peer_addr,
+                transient_expired,
+                added = outcome.added,
+                "connect_peer: promoted to ring"
+            );
+
+            // Update the dashboard/network_status with the peer's location.
+            // Without this, peers promoted via this path show "—" on the
+            // dashboard because the initial record_peer_connected(addr, None, None)
+            // from handle_successful_connection is never updated.
+            let pkl = crate::ring::PeerKeyLocation::new(key.clone(), peer_addr);
+            crate::node::network_status::record_peer_connected(
+                peer_addr,
+                Some(loc.as_f64()),
+                Some(pkl),
+            );
+
+            // tell the promoted peer about our subscriptions and cache.
+            // Non-blocking (#4145): handle_connect_peer runs INLINE on the
+            // event-loop task, and bridge.send() awaits the cap-512
+            // ev_listener_tx that this same task drains — a self-stall under
+            // the connection-churn the SubscribeHint nudge drives. Use
+            // bridge.try_send: a dropped interest/cache message is recovered
+            // by the periodic InterestSync exchange + subscription-renewal
+            // background task, which re-advertise our interests to this peer.
+            for (target, msg) in self
+                .bridge
+                .op_manager
+                .on_ring_connection_established(peer_addr, &key)
+            {
+                if let Err(e) = self.bridge.try_send(target, msg) {
+                    tracing::warn!(
+                        %peer_addr,
+                        error = %e,
+                        "Failed to send interest/cache data on transient promotion \
+                         (will re-sync via periodic InterestSync/renewal)"
+                    );
+                }
+            }
+
+            // Directed-subscribe placement (#4404): the new neighbor may be
+            // the closest non-hosting peer for some contracts we host.
+            self.consider_migration_for_new_peer(peer_addr);
+
+            // Broadcast readiness if we just crossed the threshold
+            if just_became_ready {
+                self.handle_broadcast_ready_state(true).await;
+            }
+        }
+
+        Promotion::InRing
     }
 
     // `origin` is telemetry carried alongside the dial; bundling it with the
@@ -506,20 +638,35 @@ impl P2pConnManager {
                 transient,
                 "connect_peer: reusing existing transport / promoting transient if present"
             );
-            // The connection keeps the identity it has: a ConnectPeer naming
-            // another key is refused, before anything is promoted.
-            let (check, _) = self.check_bind(peer_addr, peer.pub_key(), IdentitySource::Claimed);
-            if matches!(check, BindOutcome::Mismatch(_) | BindOutcome::HeldByDial(_)) {
-                if let Some(kind) = identity_kind(&check, CONNECT_PEER_KINDS) {
-                    TRANSPORT_METRICS.record_conn_identity(peer_addr, kind);
+            // The connection keeps the identity it has, and is promoted only
+            // under it: a ConnectPeer naming another key is refused before
+            // anything is promoted. A connection without one is bound to the
+            // named key. A key a dialled connection holds is not reached
+            // here: the lookup by key above resolves it to that connection.
+            let outcome =
+                self.bind_identity(peer_addr, peer.pub_key(), IdentitySource::Claimed, true);
+            if let Some(kind) = identity_kind(&outcome, CONNECT_PEER_KINDS) {
+                TRANSPORT_METRICS.record_conn_identity(peer_addr, kind);
+            }
+            let refused = match &outcome {
+                BindOutcome::Bound | BindOutcome::Same => {
+                    self.promote_existing_connection(peer_addr, Some(tx)).await
+                        == Promotion::Refused
                 }
-                tracing::warn!(
-                    tx = %tx,
-                    %peer_addr,
-                    named = %peer.pub_key(),
-                    ?check,
-                    "connect_peer: existing connection has another identity; refusing"
-                );
+                BindOutcome::Mismatch(_)
+                | BindOutcome::HeldByDial(_)
+                | BindOutcome::NoConnection => {
+                    tracing::warn!(
+                        tx = %tx,
+                        %peer_addr,
+                        named = %peer.pub_key(),
+                        ?outcome,
+                        "connect_peer: existing connection has another identity; refusing"
+                    );
+                    true
+                }
+            };
+            if refused {
                 callback
                     .send_result(Err(()))
                     .await
@@ -528,155 +675,12 @@ impl P2pConnManager {
                             tx = %tx,
                             remote = %peer,
                             ?err,
-                            "connect_peer: failed to notify identity-refusal callback"
+                            "connect_peer: failed to notify refusal callback"
                         );
                     })
                     .ok();
                 return Ok(());
             }
-            let connection_manager = &self.bridge.op_manager.ring.connection_manager;
-            let was_transient = connection_manager.drop_transient(peer_addr);
-
-            // Promote if: (a) was tracked as transient, OR (b) not already in ring.
-            // Case (b) handles expired transient TTL — transport preserved per 76058cf4
-            // but tracking entry gone. Without this, CONNECT succeeds but peer is never
-            // added to ring topology (#3113).
-            let needs_promotion =
-                was_transient.is_some() || !connection_manager.is_in_ring(peer_addr);
-            let transient_expired = was_transient.is_none() && needs_promotion;
-
-            if needs_promotion {
-                let loc = was_transient
-                    .and_then(|e| e.location)
-                    .unwrap_or_else(|| Location::from_address(&peer_addr));
-                // Don't re-run should_accept() here — the connection was already
-                // accepted at the protocol level (the CONNECT terminus handler in connect.rs) and NAT traversal
-                // already succeeded. Re-evaluating the probabilistic Kleinberg filter
-                // would discard hard-won connections for no capacity reason (#3545).
-                // Enforce the hard max_connections cap as a resource safety limit,
-                // EXCEPT for a strictly-closer per-side nearest-neighbor lattice
-                // edge within the bounded over-max ceiling (mechanism 3). Without
-                // this exception the cap silently drops the guaranteed
-                // successor/predecessor edge on the REAL CONNECT/promotion path,
-                // making mechanism 3's at-capacity displacement inert in
-                // production (nodes routinely sit at max). The same predicate is
-                // re-checked in add_connection; the over-max topology prune sheds a
-                // farther non-lattice link next tick. See
-                // connection_manager.rs::{admits_lattice_edge_over_cap, LATTICE_OVERMAX_SLACK}.
-                let current = connection_manager.connection_count();
-                if connection_manager.refuses_connection_at_cap(loc) {
-                    tracing::warn!(
-                        tx = %tx,
-                        %peer,
-                        current_connections = current,
-                        max_connections = connection_manager.max_connections,
-                        %loc,
-                        transient_expired,
-                        "connect_peer: rejecting transient promotion to enforce cap"
-                    );
-                    callback
-                        .send_result(Err(()))
-                        .await
-                        .inspect_err(|err| {
-                            tracing::debug!(
-                                tx = %tx,
-                                remote = %peer,
-                                ?err,
-                                "connect_peer: failed to notify cap-rejection callback"
-                            );
-                        })
-                        .ok();
-                    return Ok(());
-                }
-                // The key promoted is the connection's own, or the one it is
-                // bound to below: a ConnectPeer naming another one was refused
-                // above.
-                // #4787 instrumentation: count the promotion only if the ring
-                // actually took the connection. `add_connection`'s own `bool`
-                // reports the readiness-threshold crossing, NOT acceptance, so
-                // the outcome struct is what this has to branch on — otherwise
-                // a cap-rejected promotion inflates `promoted_to_ring` in
-                // exactly the saturation direction the counter is meant to
-                // expose.
-                let outcome = self
-                    .bridge
-                    .op_manager
-                    .ring
-                    .add_connection_reporting(
-                        loc,
-                        PeerId::new(peer.pub_key().clone(), peer_addr),
-                        true,
-                    )
-                    .await;
-                if outcome.added {
-                    crate::node::network_status::record_bootstrap_promoted_to_ring();
-                }
-                let just_became_ready = outcome.just_became_ready;
-                tracing::info!(
-                    tx = %tx,
-                    remote = %peer,
-                    transient_expired,
-                    added = outcome.added,
-                    "connect_peer: promoted to ring"
-                );
-
-                // Update the dashboard/network_status with the peer's location.
-                // Without this, peers promoted via this path show "—" on the
-                // dashboard because the initial record_peer_connected(addr, None, None)
-                // from handle_successful_connection is never updated.
-                let pkl = crate::ring::PeerKeyLocation::new(peer.pub_key().clone(), peer_addr);
-                crate::node::network_status::record_peer_connected(
-                    peer_addr,
-                    Some(loc.as_f64()),
-                    Some(pkl),
-                );
-
-                // tell the promoted peer about our subscriptions and cache.
-                // Non-blocking (#4145): handle_connect_peer runs INLINE on the
-                // event-loop task, and bridge.send() awaits the cap-512
-                // ev_listener_tx that this same task drains — a self-stall under
-                // the connection-churn the SubscribeHint nudge drives. Use
-                // bridge.try_send: a dropped interest/cache message is recovered
-                // by the periodic InterestSync exchange + subscription-renewal
-                // background task, which re-advertise our interests to this peer.
-                for (target, msg) in self
-                    .bridge
-                    .op_manager
-                    .on_ring_connection_established(peer_addr, peer.pub_key())
-                {
-                    if let Err(e) = self.bridge.try_send(target, msg) {
-                        tracing::warn!(
-                            %peer_addr,
-                            error = %e,
-                            "Failed to send interest/cache data on transient promotion \
-                             (will re-sync via periodic InterestSync/renewal)"
-                        );
-                    }
-                }
-
-                // Directed-subscribe placement (#4404): the new neighbor may be
-                // the closest non-hosting peer for some contracts we host.
-                self.consider_migration_for_new_peer(peer_addr);
-
-                // Broadcast readiness if we just crossed the threshold
-                if just_became_ready {
-                    self.handle_broadcast_ready_state(true).await;
-                }
-            }
-
-            // A connection still without an identity is bound to the key the
-            // connect op named, so QueryConnections returns this peer.
-            let outcome = self.bind_identity(peer_addr, peer.pub_key(), IdentitySource::Claimed);
-            if let Some(kind) = identity_kind(&outcome, CONNECT_PEER_KINDS) {
-                TRANSPORT_METRICS.record_conn_identity(peer_addr, kind);
-            }
-            tracing::info!(
-                tx = %tx,
-                %peer_addr,
-                pub_key = %peer.pub_key(),
-                ?outcome,
-                "connect_peer: transport entry identity"
-            );
 
             // Return the remote peer's address we are connected to.
             let resolved_addr = peer
@@ -893,14 +897,15 @@ impl P2pConnManager {
                     }
                 }
 
-                // A connection matched to an expectation is the one the connect
-                // op is dialling: it is recorded and promoted under the key the
-                // op dialled, exactly as the dial would be, so a peer that
-                // reaches us before (or instead of) our dial is still linked.
-                // Any other inbound connection starts without a peer identity
-                // and gets one when the connect op names the peer in a
-                // ConnectPeer, or when the peer names itself in a
-                // ConnectRequest.
+                // A connection matched to an expectation is taken to be the one
+                // the connect op is dialling, so a peer that reaches us before
+                // (or instead of) our dial is still linked: it is bound to the
+                // key the op dialled, as a claim, and promoted under it. The
+                // claim is held back while a dialled connection elsewhere holds
+                // the key (see `handle_successful_connection`). Any other
+                // inbound connection starts without a peer identity and gets
+                // one when the connect op names the peer in a ConnectPeer, or
+                // when the peer names itself in a ConnectRequest.
                 let peer = match matched {
                     HandshakeInboundMatch::Expected(Some(peer_key)) => {
                         // As for a successful dial: CONNECT routing stops
@@ -1238,9 +1243,6 @@ impl P2pConnManager {
         // ensures that stale event won't remove the new entry.
         if let Some(old) = self.connections.remove(&peer_addr) {
             self.record_identity_teardown(peer_addr, &old);
-            if let Some(old_pub_key) = old.pub_key() {
-                self.addr_by_pub_key.remove(old_pub_key);
-            }
 
             // Full cleanup: handle both transient and ring-promoted connections.
             // If transient, drop_transient releases the budget slot.
@@ -1274,9 +1276,6 @@ impl P2pConnManager {
                     // Deferred: broadcast after connection_manager borrow ends
                     broadcast_ready = Some(false);
                 }
-                if let Some(old_pub_key) = old.pub_key() {
-                    self.bridge.op_manager.on_ring_connection_lost(old_pub_key);
-                }
                 // Non-blocking (#4145): this runs on the event-loop task while
                 // handling an inbound handshake event, so a `.send().await` that
                 // back-pressures on the handshake command channel (cap 128) would
@@ -1299,11 +1298,17 @@ impl P2pConnManager {
                 }
             }
 
+            // Per-peer state is forgotten for a connection that was in the
+            // ring, and only when no other open connection is bound to its key.
+            if let Some(old_pub_key) = old.pub_key() {
+                self.release_identity(peer_addr, old_pub_key, !was_transient)
+                    .await;
+            }
             tracing::info!(
                 %peer_addr,
                 old_connection_id = old.connection_id,
                 was_transient,
-                "Replacing stale connection entry (peer reconnected with new identity)"
+                "Replacing the connection entry at this address"
             );
         }
 
@@ -1343,7 +1348,7 @@ impl P2pConnManager {
                 // Bound below through `bind_identity`. An unexpected inbound
                 // connection stays unbound until a ConnectPeer or the peer's
                 // first ConnectRequest names it.
-                identity: None,
+                identity: Default::default(),
                 connection_id: conn_id,
                 created_at: now,
                 link_use: link_use.clone(),
@@ -1370,11 +1375,17 @@ impl P2pConnManager {
         // Bind the identity the connection was established with: the dialled
         // key, or the key an expected-inbound registration carried, which is
         // a claim. A claim that a dialled connection elsewhere still holds is
-        // not bound, and the connection then continues as an unidentified
-        // inbound one: it is neither recorded nor promoted under the key.
+        // not bound yet: the connection continues as an unidentified inbound
+        // one, neither recorded nor promoted under the key, with the claim
+        // pending until that dialled connection closes (`release_identity`
+        // then binds it, and promotes it when this connection would have
+        // been promoted now).
+        let promote_on_bind =
+            !is_transient || self.bridge.op_manager.ring.connection_manager.is_gateway();
         let peer_id = match peer_id {
             Some(peer) => {
-                let outcome = self.bind_identity(peer_addr, peer.pub_key(), source);
+                let outcome =
+                    self.bind_identity(peer_addr, peer.pub_key(), source, promote_on_bind);
                 match outcome {
                     BindOutcome::Bound => {
                         let kind = match source {
@@ -1391,8 +1402,8 @@ impl P2pConnManager {
                             %peer_addr,
                             %holder,
                             pub_key = %peer.pub_key(),
-                            "Expected inbound connection left unbound: a dialled \
-                             connection holds its key"
+                            "Expected inbound connection left unbound until the dialled \
+                             connection holding its key closes"
                         );
                         None
                     }
@@ -1743,6 +1754,7 @@ impl P2pConnManager {
                                 remote_addr,
                                 sender_peer.pub_key(),
                                 IdentitySource::Claimed,
+                                false,
                             );
                             if let Some(kind) = identity_kind(&outcome, CONNECT_REQUEST_KINDS) {
                                 TRANSPORT_METRICS.record_conn_identity(remote_addr, kind);
@@ -1792,9 +1804,12 @@ impl P2pConnManager {
                                 BindOutcome::HeldByDial(holder) => {
                                     // The key is bound to a dialled connection
                                     // that is still open. The request is
-                                    // dropped and this connection left
-                                    // unbound; the zombie sweep collects it
-                                    // unless something else names it.
+                                    // dropped and the claim kept pending on
+                                    // this connection; it is bound when that
+                                    // dialled connection closes, which for a
+                                    // peer that restarted elsewhere is when its
+                                    // old session times out. The peer's
+                                    // connect op retries the request.
                                     tracing::info!(
                                         remote = %remote_addr,
                                         %holder,
@@ -1849,10 +1864,6 @@ impl P2pConnManager {
                 // Look up the connection directly by address
                 if let Some(entry) = self.connections.remove(&remote_addr) {
                     self.record_identity_teardown(remote_addr, &entry);
-                    // Remove from reverse lookup
-                    if let Some(pub_key) = entry.pub_key() {
-                        self.addr_by_pub_key.remove(pub_key);
-                    }
                     tracing::debug!(self_peer = %self.bridge.op_manager.ring.connection_manager.pub_key, peer = ?entry.pub_key(), socket_addr = %remote_addr, conn_map_size = self.connections.len(), "[CONN_TRACK] REMOVE: TransportClosed - removing from connections HashMap");
                     let prune_result = self
                         .bridge
@@ -1876,10 +1887,11 @@ impl P2pConnManager {
                         self.handle_broadcast_ready_state(false).await;
                     }
 
-                    // forget this peer's subscriptions and cached contract state;
-                    // a connection that never named a peer has none
+                    // Forget this peer's subscriptions and cached contract
+                    // state, only when no other open connection is bound to
+                    // its key; a connection that never named a peer has none.
                     if let Some(pub_key) = entry.pub_key() {
-                        self.bridge.op_manager.on_ring_connection_lost(pub_key);
+                        self.release_identity(remote_addr, pub_key, true).await;
                     }
 
                     // Backoff prevents reconnect-timeout-reconnect cycles to dead peers (#3252).

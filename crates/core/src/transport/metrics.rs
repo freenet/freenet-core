@@ -90,6 +90,13 @@ labelled_counters! {
     /// session with. A connection is bound to this node's own key only when
     /// a dial, a registration, a ConnectRequest or a ConnectPeer names that
     /// key, so `own_key` is expected to stay at zero.
+    ///
+    /// `changed_connect_request` and `changed_connect_peer` changed meaning
+    /// when a connection's identity became fixed at establishment: they now
+    /// count a ConnectRequest that closed the connection and a ConnectPeer
+    /// that was refused. Before that change they counted a connection's key
+    /// being replaced or promoted under another key, so their values are not
+    /// comparable across node versions.
     pub(crate) enum ConnIdentity {
         /// An outbound connection was established and bound to the key
         /// it was dialled with.
@@ -127,9 +134,14 @@ labelled_counters! {
         /// A claimed key (an expected-inbound match, a ConnectRequest, or a
         /// ConnectPeer for a connection without one) was not bound because
         /// another open connection is bound to it from a dial. The claiming
-        /// connection stays without an identity; a ConnectRequest carrying
-        /// the claim is dropped and a ConnectPeer is refused.
+        /// connection stays without an identity, with the claim kept pending
+        /// until the dialled connection closes (`pending_claim_bound`); a
+        /// ConnectRequest carrying the claim is dropped.
         ClaimHeldByDial => "claim_held_by_dial",
+        /// A claim held back by `claim_held_by_dial` was bound after the
+        /// dialled connection holding its key closed, on the connection that
+        /// made it.
+        PendingClaimBound => "pending_claim_bound",
         /// A connection was bound to this node's own key, on any path.
         OwnKey => "own_key",
         /// A key was bound to a connection while the key-to-address map held
@@ -2109,6 +2121,9 @@ impl TransportMetrics {
             conn_identity_claim_held_by_dial: get32(
                 &identity[ConnIdentity::ClaimHeldByDial as usize],
             ),
+            conn_identity_pending_claim_bound: get32(
+                &identity[ConnIdentity::PendingClaimBound as usize],
+            ),
             conn_identity_own_key: get32(&identity[ConnIdentity::OwnKey as usize]),
             conn_identity_duplicate_key: get32(&identity[ConnIdentity::DuplicateKey as usize]),
             conn_identity_teardown_key_elsewhere: get32(
@@ -2608,6 +2623,7 @@ pub struct TransportSnapshot {
     pub conn_identity_same_connect_peer: u32,
     pub conn_identity_changed_connect_peer: u32,
     pub conn_identity_claim_held_by_dial: u32,
+    pub conn_identity_pending_claim_bound: u32,
     pub conn_identity_own_key: u32,
     pub conn_identity_duplicate_key: u32,
     pub conn_identity_teardown_key_elsewhere: u32,
@@ -2682,6 +2698,7 @@ impl TransportSnapshot {
             ConnIdentity::SameConnectPeer => self.conn_identity_same_connect_peer,
             ConnIdentity::ChangedConnectPeer => self.conn_identity_changed_connect_peer,
             ConnIdentity::ClaimHeldByDial => self.conn_identity_claim_held_by_dial,
+            ConnIdentity::PendingClaimBound => self.conn_identity_pending_claim_bound,
             ConnIdentity::OwnKey => self.conn_identity_own_key,
             ConnIdentity::DuplicateKey => self.conn_identity_duplicate_key,
             ConnIdentity::TeardownKeyElsewhere => self.conn_identity_teardown_key_elsewhere,
@@ -2872,6 +2889,7 @@ impl TransportSnapshot {
             conn_identity_same_connect_peer,
             conn_identity_changed_connect_peer,
             conn_identity_claim_held_by_dial,
+            conn_identity_pending_claim_bound,
             conn_identity_own_key,
             conn_identity_duplicate_key,
             conn_identity_teardown_key_elsewhere,
@@ -2981,6 +2999,7 @@ impl TransportSnapshot {
         self.conn_identity_same_connect_peer = conn_identity_same_connect_peer;
         self.conn_identity_changed_connect_peer = conn_identity_changed_connect_peer;
         self.conn_identity_claim_held_by_dial = conn_identity_claim_held_by_dial;
+        self.conn_identity_pending_claim_bound = conn_identity_pending_claim_bound;
         self.conn_identity_own_key = conn_identity_own_key;
         self.conn_identity_duplicate_key = conn_identity_duplicate_key;
         self.conn_identity_teardown_key_elsewhere = conn_identity_teardown_key_elsewhere;
@@ -3177,6 +3196,7 @@ struct SnapshotExtras {
     pub conn_identity_same_connect_peer: u32,
     pub conn_identity_changed_connect_peer: u32,
     pub conn_identity_claim_held_by_dial: u32,
+    pub conn_identity_pending_claim_bound: u32,
     pub conn_identity_own_key: u32,
     pub conn_identity_duplicate_key: u32,
     pub conn_identity_teardown_key_elsewhere: u32,
@@ -3276,6 +3296,7 @@ impl SnapshotExtras {
             || self.conn_identity_same_connect_peer != 0
             || self.conn_identity_changed_connect_peer != 0
             || self.conn_identity_claim_held_by_dial != 0
+            || self.conn_identity_pending_claim_bound != 0
             || self.conn_identity_own_key != 0
             || self.conn_identity_duplicate_key != 0
             || self.conn_identity_teardown_key_elsewhere != 0
@@ -5290,6 +5311,7 @@ mod tests {
             "conn_identity_same_connect_peer",
             "conn_identity_changed_connect_peer",
             "conn_identity_claim_held_by_dial",
+            "conn_identity_pending_claim_bound",
             "conn_identity_own_key",
             "conn_identity_duplicate_key",
             "conn_identity_teardown_key_elsewhere",

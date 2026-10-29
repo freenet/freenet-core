@@ -17,6 +17,8 @@ use tokio::time::Instant;
 use tokio::time::{sleep, timeout};
 use tracing::Instrument;
 
+use identity::{BindOutcome, IdentitySource, Release};
+
 use super::{ConnectionError, EventLoopNotificationsReceiver, NetworkBridge};
 use crate::contract::{ContractHandlerEvent, WaitingTransaction};
 use crate::message::{NetMessageV1, QueryResult};
@@ -52,6 +54,7 @@ use freenet_stdlib::client_api::{ContractResponse, HostResponse};
 mod broadcast;
 mod connection_lifecycle;
 mod dispatch;
+mod identity;
 mod migration;
 mod zombie_sweep;
 
@@ -526,43 +529,18 @@ impl NetworkBridge for P2pBridge {
 type PeerConnChannelSender = Sender<Either<NetMessage, ConnEvent>>;
 type PeerConnChannelRecv = Receiver<Either<NetMessage, ConnEvent>>;
 
-/// How a connection's peer identity was bound.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum IdentitySource {
-    /// The key this node dialled, bound when the outbound connection was
-    /// established.
-    Dialled,
-    /// A key named for the connection without a dial of it: the key an
-    /// expected-inbound registration carried for an inbound connection
-    /// matched to it by address, the joiner key of the peer's own first
-    /// ConnectRequest, or the key a ConnectPeer named for a connection that
-    /// had none. It is held to the same rules as a dialled key once bound
-    /// (it never changes), and in addition it never takes a key from a
-    /// dialled connection that still holds it (see
-    /// `P2pConnManager::bind_identity`).
-    Claimed,
-}
-
-/// The peer identity bound to a connection: set once, by
-/// `P2pConnManager::bind_identity`, and never changed while the connection
-/// is open.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct BoundIdentity {
-    key: TransportPublicKey,
-    source: IdentitySource,
-}
-
 /// Entry in the connections HashMap, keyed by SocketAddr.
 #[derive(Debug)]
 struct ConnectionEntry {
     sender: PeerConnChannelSender,
     /// The peer's identity: the key dialled for an outbound connection, or
-    /// the claimed key of an inbound one. `None` for an inbound connection
-    /// until it is first named. Written only by
-    /// `P2pConnManager::bind_identity`; read through [`Self::pub_key`].
-    identity: Option<BoundIdentity>,
+    /// the claimed key of an inbound one. Unbound for an inbound connection
+    /// until it is first named. Only the `identity` module can change it
+    /// (through `P2pConnManager::bind_identity`).
+    identity: identity::IdentitySlot,
     /// Unique ID for this connection entry. Used to distinguish stale
-    /// TransportClosed events from replaced connections (e.g., after identity change).
+    /// TransportClosed events from replaced connections (e.g., a new
+    /// connection at the same address).
     connection_id: u64,
     /// When this transport connection was established.
     /// Used for zombie detection: connections not promoted to the ring
@@ -585,7 +563,7 @@ struct ConnectionEntry {
 impl ConnectionEntry {
     /// The key bound to this connection, if any.
     fn pub_key(&self) -> Option<&TransportPublicKey> {
-        self.identity.as_ref().map(|identity| &identity.key)
+        self.identity.key()
     }
 }
 
@@ -718,7 +696,7 @@ pub(in crate::node) struct P2pConnManager {
     /// Used to find connections when we only know the peer's identity.
     /// Must be kept in sync with `connections`.
     /// Uses BTreeMap for deterministic iteration order in simulation tests.
-    addr_by_pub_key: BTreeMap<TransportPublicKey, SocketAddr>,
+    addr_by_pub_key: identity::KeyIndex,
     conn_event_tx: Option<Sender<ConnEvent>>,
     key_pair: TransportKeypair,
     listening_ip: IpAddr,
@@ -1301,7 +1279,7 @@ impl P2pConnManager {
             conn_bridge_rx: rx_bridge_cmd,
             event_listener: Box::new(event_listener),
             connections: BTreeMap::new(),
-            addr_by_pub_key: BTreeMap::new(),
+            addr_by_pub_key: identity::KeyIndex::default(),
             conn_event_tx: None,
             key_pair,
             listening_ip: listener_ip,
@@ -2342,8 +2320,16 @@ impl P2pConnManager {
                                             ctx.handle_broadcast_ready_state(false).await;
                                         }
 
+                                        // Per-peer state goes only with the last
+                                        // connection bound to the key.
                                         if let Some(ref pub_key) = pub_key_opt {
-                                            ctx.bridge.op_manager.on_ring_connection_lost(pub_key);
+                                            if ctx.unbind_identity(peer_addr, pub_key)
+                                                == Release::Released
+                                            {
+                                                ctx.bridge
+                                                    .op_manager
+                                                    .on_ring_connection_lost(pub_key);
+                                            }
                                         }
 
                                         // Remove from connection map
@@ -2354,9 +2340,6 @@ impl P2pConnManager {
                                             "Removing connection from tracking map"
                                         );
                                         ctx.connections.remove(&peer_addr);
-                                        if let Some(pub_key) = pub_key_opt {
-                                            ctx.addr_by_pub_key.remove(&pub_key);
-                                        }
 
                                         // Notify handshake handler to clean up.
                                         // Non-blocking (#4145): runs on the event-loop task,
@@ -5046,7 +5029,7 @@ pub(crate) mod tests {
             addr,
             super::ConnectionEntry {
                 sender: tx1,
-                identity: None,
+                identity: Default::default(),
                 connection_id: 10,
                 created_at: Instant::now(),
                 link_use: super::zombie_sweep::LinkUseStamp::new(Instant::now()),
@@ -5058,7 +5041,7 @@ pub(crate) mod tests {
             addr,
             super::ConnectionEntry {
                 sender: tx2,
-                identity: None,
+                identity: Default::default(),
                 connection_id: 20,
                 created_at: Instant::now(),
                 link_use: super::zombie_sweep::LinkUseStamp::new(Instant::now()),
