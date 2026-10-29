@@ -62,6 +62,13 @@ thread_local! {
     /// every node from one thread), so when an address has several owners in
     /// [`ADDRESS_NETWORKS`], the one this thread registered is the binding
     /// node's network.
+    ///
+    /// This separates simulations on DIFFERENT threads only. One slot per
+    /// address per thread means two simulations driven by the same thread
+    /// that register the same address resolve to whichever registered last,
+    /// as before #5676. A node therefore resolves correctly only if no other
+    /// network on its thread re-registers its address between its own
+    /// registration and its bind (or a bind retried after `AddrInUse`).
     static THREAD_ADDRESS_NETWORKS: RefCell<HashMap<SocketAddr, String>> =
         RefCell::new(HashMap::new());
 }
@@ -108,12 +115,15 @@ pub(crate) fn unregister_address_network(addr: &SocketAddr, network_name: &str) 
             entry.remove();
         }
     }
-    THREAD_ADDRESS_NETWORKS.with(|m| {
+    // `try_with`: this runs from socket `Drop`, which can happen while the
+    // thread's locals are being destroyed. An `Err` means the record is
+    // already gone with the thread, so there is nothing to remove.
+    if let Err(_destroyed) = THREAD_ADDRESS_NETWORKS.try_with(|m| {
         let mut m = m.borrow_mut();
         if m.get(addr).is_some_and(|n| n == network_name) {
             m.remove(addr);
         }
-    });
+    }) {}
 }
 
 /// Why an address could not be resolved to one network.
@@ -190,8 +200,20 @@ pub fn clear_network_address_mappings(network_name: &str) {
         owners.retain(|n| n != network_name);
         !owners.is_empty()
     });
-    THREAD_ADDRESS_NETWORKS.with(|m| m.borrow_mut().retain(|_, n| n != network_name));
+    // `try_with`: this runs from `SimNetwork::drop`, see
+    // `unregister_address_network`.
+    if let Err(_destroyed) =
+        THREAD_ADDRESS_NETWORKS.try_with(|m| m.borrow_mut().retain(|_, n| n != network_name))
+    {}
 }
+
+/// Every in-memory socket bind in this test process: the binding thread, the
+/// network the socket was bound into, and its address. Lets a test check
+/// which network each of its threads' sockets joined without trusting the
+/// resolution it is testing.
+#[cfg(test)]
+pub(crate) static BIND_LOG: std::sync::Mutex<Vec<(std::thread::ThreadId, String, SocketAddr)>> =
+    std::sync::Mutex::new(Vec::new());
 
 /// Clears all network time sources, for EVERY network in the process.
 #[deprecated(
@@ -563,6 +585,13 @@ impl<T: TimeSource> InMemorySocket<T> {
     pub async fn bind_with_time_source(addr: SocketAddr, time_source: T) -> io::Result<Self> {
         let network_name = resolve_address_network(&addr)
             .map_err(|e| resolve_error(&addr, io::ErrorKind::Other, e))?;
+
+        #[cfg(test)]
+        BIND_LOG.lock().unwrap_or_else(|e| e.into_inner()).push((
+            std::thread::current().id(),
+            network_name.clone(),
+            addr,
+        ));
 
         let registry = get_or_create_registry(&network_name);
         let inbox = registry.write().unwrap().register(addr);
@@ -1098,8 +1127,8 @@ mod tests {
         const NET_A: &str = "addr-collision-5676-a";
         const NET_B: &str = "addr-collision-5676-b";
         // The address both networks register, and a second node in A only.
-        let shared: SocketAddr = "[::1]:47676".parse().unwrap();
-        let a_sender: SocketAddr = "[::1]:47677".parse().unwrap();
+        let shared: SocketAddr = "[fd00::5676]:1".parse().unwrap();
+        let a_sender: SocketAddr = "[fd00::5676]:2".parse().unwrap();
         // A's clock is set ahead of B's, so a lookup of the wrong network's
         // clock is visible.
         const A_CLOCK_AHEAD: Duration = Duration::from_secs(5);
@@ -1246,7 +1275,7 @@ mod tests {
     /// thread, is refused rather than bound into either (#5676).
     #[tokio::test]
     async fn bind_refuses_an_address_ambiguous_to_this_thread() {
-        let addr: SocketAddr = "[::1]:47678".parse().unwrap();
+        let addr: SocketAddr = "[fd00::5676]:3".parse().unwrap();
         let (net_a, net_b) = ("ambiguous-5676-a", "ambiguous-5676-b");
         std::thread::spawn(move || {
             register_address_network(addr, net_a);

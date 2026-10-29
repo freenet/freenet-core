@@ -12723,8 +12723,9 @@ struct StrandedRun {
 /// The six-peer cluster sits on the first contract's key; further contracts
 /// (the storm test) have keys within 0.03 of it. Peer addresses follow peer
 /// locations, which follow that key. Each test passes its own
-/// `contract_seed`; tests that share one also share addresses, which is safe
-/// in one process since #5676.
+/// `contract_seed`. Tests that share one also share addresses, which is safe
+/// for simulations on different threads of one process since #5676, and not
+/// for two simulations driven by the same thread.
 ///
 /// Placement migration is pinned OFF: it is the holding-driven push the
 /// hosting invariants forbid, and it would place the contract on its own.
