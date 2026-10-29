@@ -1731,9 +1731,14 @@ fn a_dropped_send_counts_as_a_reset() {
 }
 
 /// #5940 step M6, guard 1 counts only this side's resets: streams the
-/// peer stops (here refused by its budget while the write waits for flow
-/// control, so the stop can surface through the write or through the
-/// `stopped` future) are not counted, and the path stays open.
+/// peer stops (here refused by its budget) are not counted, and the path
+/// stays open. The source yields to the runtime between small chunks, so
+/// the stop often lands while the next write has room: quinn then reports
+/// it through the write (`WriteError::Stopped`) as well as through the
+/// `stopped` future, and `select!` picks either (about one stream in ten
+/// here, so 128 streams take the write path many times). A write blocked on
+/// connection flow control never reports it, so a large single write would
+/// only ever see the `stopped` future.
 #[test]
 fn a_stop_from_the_peer_is_not_counted_as_a_reset() {
     bounded(|| async move {
@@ -1748,8 +1753,15 @@ fn a_stop_from_the_peer_is_not_counted_as_a_reset() {
         let stops = p
             .drive(async move {
                 let mut stops = 0;
-                for _ in 0..32 {
-                    match a.send_stream(StreamId::next(), None, over_window()).await {
+                for _ in 0..128 {
+                    let chunks = Box::pin(futures::stream::unfold((), |()| async {
+                        tokio::task::yield_now().await;
+                        Some((Ok(Bytes::from(vec![0u8; 1000])), ()))
+                    }));
+                    match a
+                        .send_stream_chunks(StreamId::next(), 1024 * 1024, None, chunks)
+                        .await
+                    {
                         Err(QuicSendError::Stopped(code))
                             if code == u64::from(stop_code::BUDGET_REFUSED) =>
                         {
@@ -1761,7 +1773,7 @@ fn a_stop_from_the_peer_is_not_counted_as_a_reset() {
                 stops
             })
             .await;
-        assert_eq!(stops, 32);
+        assert_eq!(stops, 128);
         assert_eq!(p.a.send_aborts(), 0);
         assert!(p.a.connection().inner().close_reason().is_none());
         assert!(recycle_closes_to(b_addr).is_empty());
