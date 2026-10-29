@@ -83,7 +83,7 @@ impl Partition {
 /// demux would hand it to the QUIC endpoint (its first byte, the same
 /// classifier the demux uses); every other datagram between the pair, and
 /// every datagram before `from_nanos`, is delivered as without the rule.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuicDatagramDrop {
     /// One peer of the pair.
     pub a: SocketAddr,

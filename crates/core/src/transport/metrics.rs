@@ -1105,6 +1105,12 @@ impl TransportMetrics {
             .insert(remote, Vec::new());
     }
 
+    /// Test-only: stop recording QUIC ingress outcomes for `remote`.
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn unwatch_quic_ingress(&self, remote: SocketAddr) {
+        self.nat_detail.quic_ingress_watched.remove(&remote);
+    }
+
     /// Test-only: the QUIC ingress outcomes recorded, in order, for
     /// datagrams from a `remote` registered with `watch_quic_ingress`.
     #[cfg(any(test, feature = "testing"))]

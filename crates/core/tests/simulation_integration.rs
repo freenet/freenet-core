@@ -20339,14 +20339,22 @@ struct QuicSimTrace {
 }
 
 impl QuicSimTrace {
-    /// Asserts every node answered the endpoint probe with `expected`.
+    /// Asserts the probe covered all `QUIC_HARNESS_NODES` and every one
+    /// answered it with `expected`.
     fn assert_probe(&self, expected: &str) {
-        assert!(!self.endpoint_probe.is_empty(), "the probe covered no node");
+        assert_eq!(
+            self.endpoint_probe.len(),
+            QUIC_HARNESS_NODES,
+            "the probe covered every node"
+        );
         for (node, outcomes) in &self.endpoint_probe {
             assert_eq!(outcomes.as_slice(), [expected], "probe of {node}");
         }
     }
 }
+
+/// Gateways plus regular nodes in `run_quic_harness_sim`.
+const QUIC_HARNESS_NODES: usize = 6;
 
 /// One direct-runner simulation (2 gateways, 4 nodes), with
 /// `transport-quic` set to `quic` on every node when given. Every node is
@@ -20446,7 +20454,7 @@ fn quic_mesh_peers_and_connected(
 #[test_log::test]
 fn test_quic_prefer_forms_a_mesh_of_the_same_peers_as_quic_off() {
     const SEED: u64 = 0x5940_E5A1_0001;
-    const NODES: usize = 6;
+    const NODES: usize = QUIC_HARNESS_NODES;
     let off = run_quic_harness_sim("quic-mesh-off", SEED, None);
     let prefer = run_quic_harness_sim("quic-mesh-prefer", SEED, Some("prefer"));
     off.assert_probe("no_ingress");
@@ -20534,8 +20542,9 @@ fn test_advertised_version_override_reaches_peers() {
         sim.enable_gateway_ack_version();
         sim.with_transport_quic("prefer");
         if overrides {
-            sim.with_node_advertised_version(&node, (0, 2, 148));
-            sim.with_node_advertised_version(&gateway, (0, 2, 149));
+            let (node_version, gateway_version) = older_versions();
+            sim.with_node_advertised_version(&node, node_version);
+            sim.with_node_advertised_version(&gateway, gateway_version);
         }
         let addresses = sim.all_node_addresses();
         let (gateway_addr, node_addr) = (addresses[&gateway], addresses[&node]);
@@ -20556,7 +20565,22 @@ fn test_advertised_version_override_reaches_peers() {
         )
     }
 
+    /// Two distinct versions below this binary's, not below min-compatible.
+    fn older_versions() -> ((u8, u8, u16), (u8, u8, u16)) {
+        let (min, real) = (
+            SimNetwork::min_compatible_protocol_version(),
+            SimNetwork::real_protocol_version(),
+        );
+        let older = |by: u16| (real.0, real.1, real.2.saturating_sub(by).max(min.2));
+        (older(3), older(2))
+    }
+
     let real = SimNetwork::real_protocol_version();
+    let (node_version, gateway_version) = older_versions();
+    assert!(
+        node_version != gateway_version && gateway_version != real,
+        "premise: two distinct older versions: {node_version:?} {gateway_version:?}"
+    );
     assert_eq!(
         run("advertised-version-control", false),
         (Some(real), Some(real)),
@@ -20564,7 +20588,7 @@ fn test_advertised_version_override_reaches_peers() {
     );
     assert_eq!(
         run("advertised-version-override", true),
-        (Some((0, 2, 148)), Some((0, 2, 149))),
+        (Some(node_version), Some(gateway_version)),
         "each side records the version the other advertises"
     );
 }

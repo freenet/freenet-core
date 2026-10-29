@@ -479,12 +479,13 @@ fn fault_injection_delivery_decision(
         }
         if !inj.config.quic_datagram_drops.is_empty() {
             use crate::simulation::TimeSource;
-            let now = inj
-                .virtual_time
-                .as_ref()
-                .expect("a QuicDatagramDrop rule needs the fault injector's VirtualTime")
-                .now_nanos();
-            if inj.config.drops_quic_datagram(&from, &to, datagram, now) {
+            // `drop_quic_datagrams_between` and `with_fault_injection` give
+            // an injector with rules a VirtualTime. One replaced by hand
+            // without it has the rules inactive, as a partition is.
+            let now = inj.virtual_time.as_ref().map(|vt| vt.now_nanos());
+            if let Some(now) = now
+                && inj.config.drops_quic_datagram(&from, &to, datagram, now)
+            {
                 inj.stats.messages_dropped_quic_datagram += 1;
                 return PacketDeliveryDecision::Drop;
             }
@@ -1935,7 +1936,8 @@ impl SimNetwork {
 
     /// Installs [`fault_injection_delivery_decision`] as this network's
     /// packet-delivery callback, without opting in to crash and partition
-    /// drops. Idempotent.
+    /// drops. Idempotent; it replaces any other callback set for this
+    /// network with `set_packet_delivery_callback`.
     #[cfg(any(test, feature = "testing"))]
     fn install_fault_delivery_callback(&self) {
         crate::transport::in_memory_socket::set_packet_delivery_callback(
@@ -1980,6 +1982,15 @@ impl SimNetwork {
         crate::node::network_bridge::p2p_protoc::own_crate_version()
     }
 
+    /// The oldest version this binary connects to (its min-compatible
+    /// version): the lowest `with_node_advertised_version` accepts.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn min_compatible_protocol_version() -> (u8, u8, u16) {
+        crate::node::network_bridge::p2p_protoc::parse_crate_version(
+            crate::config::MIN_COMPATIBLE_VERSION,
+        )
+    }
+
     /// Sets `transport-quic` to `value`, as `config.toml` would (`"off"`,
     /// `"prefer"`), on every node. Unset (off) by default. Call before the
     /// simulation starts.
@@ -2003,13 +2014,11 @@ impl SimNetwork {
     #[cfg(any(test, feature = "testing"))]
     pub fn with_node_transport_quic(&mut self, label: &NodeLabel, value: &str) -> &mut Self {
         use crate::transport::quic::QuicMode;
-        // Every mode `QuicMode::from_config_value` accepts. Add a new mode
-        // here when it is added there.
-        let known = [QuicMode::OFF, QuicMode::PREFER];
-        assert!(
-            known.contains(&value.trim().to_ascii_lowercase().as_str()),
-            "unknown transport-quic value {value:?}; known values: {known:?}"
-        );
+        // `from_config_value` reads an unknown value as off; a value it reads
+        // as another mode, or one that spells off, is known.
+        let known = QuicMode::from_config_value(Some(value)) != QuicMode::Off
+            || value.trim().eq_ignore_ascii_case(QuicMode::OFF);
+        assert!(known, "unknown transport-quic value {value:?}");
         let config = self.node_config_mut(label);
         Arc::make_mut(&mut config.config).network_api.transport_quic = Some(value.to_string());
         self
@@ -2022,21 +2031,24 @@ impl SimNetwork {
     /// runs this binary's code; only what its peers learn changes.
     ///
     /// # Panics
-    /// Unless `version` has this binary's major and minor version and is not
-    /// above [`Self::real_protocol_version`]. The advertised bytes keep this
-    /// binary's min-compatible patch, so a version below it would be refused
-    /// by every peer, and one with another major or minor would be read
-    /// against the wrong min-compatible.
+    /// Unless `version` lies between [`Self::min_compatible_protocol_version`]
+    /// and [`Self::real_protocol_version`] (so it has this binary's major
+    /// and minor). The advertised bytes keep this binary's min-compatible
+    /// patch: a version below it would be refused by every peer, and one
+    /// above the real version would make a peer believe it must update.
     #[cfg(any(test, feature = "testing"))]
     pub fn with_node_advertised_version(
         &mut self,
         label: &NodeLabel,
         version: (u8, u8, u16),
     ) -> &mut Self {
-        let real = Self::real_protocol_version();
+        let (min, real) = (
+            Self::min_compatible_protocol_version(),
+            Self::real_protocol_version(),
+        );
         assert!(
-            (version.0, version.1) == (real.0, real.1) && version <= real,
-            "advertised version {version:?} must share {real:?}'s major and minor and not exceed it"
+            (version.0, version.1) == (real.0, real.1) && min <= version && version <= real,
+            "advertised version {version:?} must lie between {min:?} and {real:?}"
         );
         self.node_config_mut(label).advertised_version_override = Some(version);
         self
@@ -2077,13 +2089,25 @@ impl SimNetwork {
             address(b),
             u64::try_from(from.as_nanos()).unwrap_or(u64::MAX),
         );
-        self.quic_datagram_drops.push(rule.clone());
-        crate::node::network_bridge::get_fault_injector(&self.name)
-            .expect("SimNetwork::new registers a fault injector")
-            .lock()
-            .unwrap()
-            .config
-            .add_quic_datagram_drop(rule);
+        let injector = crate::node::network_bridge::get_fault_injector(&self.name)
+            .expect("SimNetwork::new registers a fault injector");
+        let has_clock = {
+            let mut state = injector.lock().unwrap();
+            let has_clock = state.virtual_time.is_some();
+            if has_clock && !self.quic_datagram_drops.contains(&rule) {
+                state.config.add_quic_datagram_drop(rule.clone());
+            }
+            has_clock
+        };
+        // Checked here rather than at delivery, where a panic would hold
+        // (and poison) the injector's lock.
+        assert!(
+            has_clock,
+            "a QUIC datagram drop rule needs the fault injector's VirtualTime"
+        );
+        if !self.quic_datagram_drops.contains(&rule) {
+            self.quic_datagram_drops.push(rule);
+        }
         self.install_fault_delivery_callback();
         self
     }
@@ -2174,7 +2198,7 @@ impl SimNetwork {
 /// What each node's socket did with the stranger's datagram that
 /// [`SimNetwork::probe_quic_endpoints_at`] sent it.
 #[cfg(any(test, feature = "testing"))]
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct QuicEndpointProbe {
     pairs: Vec<(SocketAddr, SocketAddr)>,
 }
@@ -2199,12 +2223,25 @@ impl QuicEndpointProbe {
             .collect()
     }
 
-    /// Whether every node refused the probe as `not_allowed`, i.e. had a
-    /// live QUIC endpoint.
+    /// Whether the probe covered at least one node and every node refused
+    /// it as `not_allowed`, i.e. had a live QUIC endpoint.
     pub fn every_node_has_a_live_endpoint(&self) -> bool {
-        self.outcomes()
-            .iter()
-            .all(|(_, labels)| labels.as_slice() == ["not_allowed"])
+        let outcomes = self.outcomes();
+        !outcomes.is_empty()
+            && outcomes
+                .iter()
+                .all(|(_, labels)| labels.as_slice() == ["not_allowed"])
+    }
+}
+
+#[cfg(any(test, feature = "testing"))]
+impl Drop for QuicEndpointProbe {
+    /// Stops recording datagrams from the probe's strangers.
+    fn drop(&mut self) {
+        use crate::transport::metrics::TRANSPORT_METRICS;
+        for (_, stranger) in &self.pairs {
+            TRANSPORT_METRICS.unwatch_quic_ingress(*stranger);
+        }
     }
 }
 
@@ -2775,12 +2812,22 @@ impl SimNetwork {
         );
     }
 
-    /// `config` plus this network's QUIC datagram drop rules
-    /// (`drop_quic_datagrams_between`), which outlive a replaced injector.
-    fn with_quic_datagram_drops(&self, mut config: FaultConfig) -> FaultConfig {
-        config
-            .quic_datagram_drops
-            .extend(self.quic_datagram_drops.iter().cloned());
+    /// `config` with every QUIC datagram drop rule this network holds:
+    /// the rules `config` brings (from `FaultConfig::builder()`) are kept
+    /// with those of `drop_quic_datagrams_between`, without duplicates, so
+    /// they all outlive a replaced injector. With any rule, the delivery
+    /// callback that applies them is installed.
+    fn with_quic_datagram_drops(&mut self, mut config: FaultConfig) -> FaultConfig {
+        for rule in config.quic_datagram_drops.drain(..) {
+            if !self.quic_datagram_drops.contains(&rule) {
+                self.quic_datagram_drops.push(rule);
+            }
+        }
+        config.quic_datagram_drops = self.quic_datagram_drops.clone();
+        #[cfg(any(test, feature = "testing"))]
+        if !config.quic_datagram_drops.is_empty() {
+            self.install_fault_delivery_callback();
+        }
         config
     }
 
@@ -3035,6 +3082,7 @@ impl SimNetwork {
     where
         R: crate::client_events::test::RandomEventGenerator + Send + 'static,
     {
+        self.assert_no_quic_endpoint_probe();
         use crate::node::network_bridge::get_fault_injector;
         use crate::transport::in_memory_socket::unregister_socket;
 
@@ -3698,6 +3746,7 @@ impl SimNetwork {
         &mut self,
         operations: Vec<ScheduledOperation>,
     ) -> (Vec<tokio::task::JoinHandle<anyhow::Result<()>>>, usize) {
+        self.assert_no_quic_endpoint_probe();
         use crate::ring::topology_registry::set_current_network_name;
         use crate::transport::in_memory_socket::is_socket_registered;
 
@@ -5898,6 +5947,7 @@ impl SimNetwork {
     where
         R: RandomEventGenerator + Send + 'static,
     {
+        self.assert_no_quic_endpoint_probe();
         use crate::config::{GlobalRng, GlobalSimulationTime};
         use crate::ring::topology_registry::set_current_network_name;
         use std::sync::Mutex;
@@ -7764,13 +7814,14 @@ mod tests {
             assert_eq!(config.advertised_version_override, None);
             assert_eq!(config.quic_idle_timeout_override, None);
         }
+        let older = SimNetwork::min_compatible_protocol_version();
         sim.with_transport_quic("prefer")
             .with_node_transport_quic(second, "off")
-            .with_node_advertised_version(first, (0, 2, 148))
+            .with_node_advertised_version(first, older)
             .with_quic_idle_timeout(Duration::from_secs(5));
         for (label, quic, version) in [
             (gateway, true, None),
-            (first, true, Some((0, 2, 148))),
+            (first, true, Some(older)),
             (second, false, None),
         ] {
             let config = sim.node_config_mut(label);
@@ -7815,10 +7866,16 @@ mod tests {
         assert!(refused(&mut || {
             sim.with_node_advertised_version(&label, (real.0, real.1 + 1, 0));
         }));
+        let min = SimNetwork::min_compatible_protocol_version();
+        if min.2 > 0 {
+            assert!(refused(&mut || {
+                sim.with_node_advertised_version(&label, (min.0, min.1, min.2 - 1));
+            }));
+        }
         assert!(!refused(&mut || {
             sim.with_transport_quic(" PREFER ")
                 .with_node_advertised_version(&label, real)
-                .with_node_advertised_version(&label, (real.0, real.1, 148));
+                .with_node_advertised_version(&label, min);
         }));
     }
 
@@ -7919,6 +7976,15 @@ mod tests {
         let _handles = sim
             .start_with_rand_gen::<rand::rngs::SmallRng>(0x5940_E5A1_0012, 1, 1)
             .await;
+        // Once started, `bind_udp_listener` builds the endpoint on VirtualTime exactly when
+        // this lookup finds one for the node's address.
+        for label in &labels {
+            let addr = sim.all_node_addresses()[label];
+            assert!(
+                crate::transport::in_memory_socket::get_socket_virtual_time(&addr).is_some(),
+                "{label} binds on the network's VirtualTime"
+            );
+        }
         let targets: Vec<(SocketAddr, SocketAddr, QuicIngressOutcome)> = [
             (&labels[0], 1, QuicIngressOutcome::NotAllowed),
             (&labels[1], 2, QuicIngressOutcome::NoIngress),
@@ -7951,5 +8017,123 @@ mod tests {
                 "{target}"
             );
         }
+    }
+
+    /// `P2pConnManager` opens the transport with `NodeConfig::quic_settings`,
+    /// which applies the simulation's idle timeout, not with the bare
+    /// `network_api` settings, which would drop it.
+    #[test]
+    fn the_transport_is_opened_with_node_config_quic_settings() {
+        let source = include_str!("network_bridge/p2p_protoc.rs");
+        assert_eq!(source.matches("quic: config.quic_settings(),").count(), 1);
+        assert!(!source.contains("network_api.quic_settings()"));
+    }
+
+    /// Misuse of the QUIC harness panics at the call, and a refused drop
+    /// rule leaves the fault injector's lock usable.
+    #[tokio::test(flavor = "current_thread")]
+    async fn quic_harness_misuse_panics() {
+        use crate::node::network_bridge::{
+            FaultInjectorState, get_fault_injector, set_fault_injector,
+        };
+        use futures::FutureExt;
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        const NETWORK: &str = "quic-harness-misuse-e5a1";
+        let mut sim = SimNetwork::new(NETWORK, 1, 1, 7, 3, 6, 1, 0x5940_E5A1_0014).await;
+        let labels = labels_in_order(&sim);
+
+        // An unknown label.
+        let unknown = NodeLabel::node(NETWORK, 99);
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                sim.with_node_transport_quic(&unknown, "prefer");
+            }))
+            .is_err()
+        );
+
+        // A drop rule on an injector without VirtualTime.
+        let bare = FaultInjectorState::new(crate::simulation::FaultConfig::default(), 1);
+        set_fault_injector(NETWORK, Some(Arc::new(std::sync::Mutex::new(bare))));
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                sim.drop_quic_datagrams_between(&labels[0], &labels[1], Duration::ZERO);
+            }))
+            .is_err()
+        );
+        let injector = get_fault_injector(NETWORK).unwrap();
+        assert!(
+            injector.lock().is_ok(),
+            "the injector's lock is not poisoned"
+        );
+        assert!(
+            injector
+                .lock()
+                .unwrap()
+                .config
+                .quic_datagram_drops
+                .is_empty()
+        );
+        sim.clear_fault_injection();
+
+        // A probe with a runner that does not send it.
+        let _probe = sim.probe_quic_endpoints_at(Duration::from_secs(1));
+        let started = AssertUnwindSafe(sim.start_with_rand_gen::<rand::rngs::SmallRng>(1, 1, 1))
+            .catch_unwind()
+            .await;
+        assert!(started.is_err());
+        sim.quic_endpoint_probe = None;
+
+        // A node that already started.
+        let _handles = sim
+            .start_with_rand_gen::<rand::rngs::SmallRng>(1, 1, 1)
+            .await;
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                sim.with_node_transport_quic(&labels[1], "prefer");
+            }))
+            .is_err()
+        );
+    }
+
+    /// A rule given through `FaultConfig::builder()` to `with_fault_injection`
+    /// is applied (its delivery callback installed) and kept by
+    /// `clear_fault_injection`, like one from `drop_quic_datagrams_between`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_builder_quic_drop_rule_is_applied_and_kept() {
+        use crate::simulation::{FaultConfig, QuicDatagramDrop};
+        use crate::transport::in_memory_socket::{SimulationSocket, register_address_network};
+        use futures::FutureExt;
+        const NETWORK: &str = "quic-builder-drop-e5a1";
+        let mut sim = SimNetwork::new(NETWORK, 1, 1, 7, 3, 6, 1, 0x5940_E5A1_0015).await;
+        let labels = labels_in_order(&sim);
+        let (a, b) = (
+            sim.all_node_addresses()[&labels[0]],
+            sim.all_node_addresses()[&labels[1]],
+        );
+        sim.with_fault_injection(
+            FaultConfig::builder()
+                .quic_datagram_drop(QuicDatagramDrop::new(a, b, 0))
+                .build(),
+        );
+        sim.clear_fault_injection();
+        let mut sockets = HashMap::new();
+        for at in [a, b] {
+            register_address_network(at, NETWORK);
+            sockets.insert(at, SimulationSocket::bind(at).await.unwrap());
+        }
+        let delivered = |datagram: &[u8]| {
+            sockets[&a]
+                .send_to(datagram, b)
+                .now_or_never()
+                .expect("an in-memory send never waits")
+                .unwrap();
+            let mut buf = [0u8; 64];
+            sockets[&b].recv_from(&mut buf).now_or_never().is_some()
+        };
+        assert!(
+            !delivered(&[0xC0, 0, 0, 0, 1]),
+            "the QUIC datagram is dropped"
+        );
+        assert!(delivered(&[0x02, 1]), "the legacy datagram is delivered");
     }
 }

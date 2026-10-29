@@ -248,17 +248,17 @@ pub(super) async fn bind_udp_listener<S: Socket>(
         .as_ref()
         .and_then(|_| get_socket_virtual_time(&bind_addr));
     // The node-wide egress cap exists only when `total-bandwidth-limit` is
-    // set (which is when `global_bandwidth` is), so a node without it pays
-    // nothing. The cap uses the same clock kind as the listener built below
-    // (`RealTime`); waiters sleep on their own connection's time source.
-    // That holds in simulation too: the listener and its connections run on
-    // `RealTime` there, so a cap on the network's `VirtualTime` would compute
-    // deficits on one clock for stream senders that sleep and time out on
-    // another. The QUIC endpoint must run on the cap's clock (see
+    // set and not 0 (`global_bandwidth` is set, and `from_total_limit`
+    // builds no cap for 0), so a node without it pays nothing. The cap runs
+    // on `RealTime`, as the listener built below does, in production and in
+    // simulation alike; waiters sleep on their own connection's time
+    // source. A cap on the network's `VirtualTime` would compute deficits on
+    // one clock for stream senders that sleep and time out on another.
+    //
+    // The QUIC endpoint must run on the cap's clock (see
     // `QuicEndpoint::bind`), and in simulation it runs on `VirtualTime`, so
-    // a simulated node with both is refused rather than run on two clocks.
-    // A limit that builds no cap (`total-bandwidth-limit = 0`) is no
-    // conflict.
+    // a simulated node that has both a cap and QUIC is refused rather than
+    // run on two clocks.
     let egress_cap = config.global_bandwidth.as_ref().and_then(|manager| {
         super::egress_cap::EgressCap::from_total_limit(manager.total_limit(), RealTime::new())
     });
