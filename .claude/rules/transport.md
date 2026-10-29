@@ -1232,22 +1232,34 @@ Liveness ("alive" = the endpoint driver has not ENDED; it does not mean
     quic_adapter_panicked once per endpoint and logs ERROR once. The call
     returns an io error (never Ready(Ok)/Ok, which would make a lasting
     fault repeat on every transmit), ending that driver; every later
-    receive returns one too (one AtomicBool load), so the endpoint driver
-    ends at its next receive. Each connection's watcher closes it with
-    DOWNGRADE on Down, which fails calls waiting on a driver that ended,
-    and connect is refused while Down. QUIC stays off until the node
-    restarts. Also contained, per connection: a panic in the path's
-    receive task (DOWNGRADE that connection, receive_task_panicked).
+    receive returns one too (one AtomicBool load), and the adapter wakes
+    the endpoint driver so it ends promptly. try_send and poll_writable do
+    NOT short-circuit on the flag: healthy connections still send their
+    CONNECTION_CLOSE, and a lasting send fault is hit once per live
+    connection. connect and QuicIncoming::establish race the handshake
+    against Down (an adapter panic mid-handshake ends the driver without
+    ending the connection) and drop the attempt and its permit; connect is
+    also refused while Down. On EVERY Down (a returned driver too) each
+    connection's watcher closes it with DOWNGRADE, uncounted in
+    quic_close_sent_* because its driver may be gone; that is what fails
+    calls waiting on a driver that ended. Released closes nothing, and a
+    socket-adapter panic after Released leaves it Released. QUIC stays off
+    until the node restarts. Also contained, per connection: a panic in the
+    path's receive task (DOWNGRADE that connection, receive_task_panicked,
+    not quic_adapter_panicked).
     NOT CONTAINED: a panic in quinn's own endpoint- or connection-driver
     code. quinn 0.11.12 polls each driver holding a std Mutex it locks with
     .lock().unwrap(), so the panic poisons it, and quinn's destructors
-    unwrap the poisoned lock: EndpointDriver::drop runs inside quinn's own
-    task during the unwind (always an abort; pinned by
-    a_panic_unwinding_through_the_endpoint_driver_still_aborts), and
+    unwrap the poisoned lock: quinn spawns the endpoint driver inside its
+    own async block, the unwind drops it there (before any catch around the
+    spawned future), and EndpointDriver::drop (endpoint.rs:403) then
+    EndpointRef::drop (:724) lock the poisoned mutex: always an abort,
+    pinned by a_panic_unwinding_through_the_endpoint_driver_still_aborts;
+    and
     SendStream, RecvStream and the last Connection handle lock in Drop, so
     a connection-driver panic can abort when another task drops one. The
     fix is upstream in quinn (tolerate a poisoned lock in those
-    destructors); do not add catch-and-leak machinery around quinn here
+    destructors, both :403 and :724 for the endpoint driver); do not add catch-and-leak machinery around quinn here
     (PR #6027 tried; its review found it cannot close the stream-drop
     case).
   → When the node drops its last handle, the availability is Released
