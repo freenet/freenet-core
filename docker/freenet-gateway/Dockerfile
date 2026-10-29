@@ -36,7 +36,7 @@ RUN git clone https://github.com/freenet/freenet-core.git "$FREENET_DIR/freenet-
 
 # Build Freenet
 WORKDIR $FREENET_DIR/freenet-core/crates/core
-RUN cargo install --path .
+RUN cargo install --locked --path .
 
 # Copy the gateway startup script
 COPY freenet-gateway-startup.sh /usr/local/bin/freenet-gateway-startup.sh
