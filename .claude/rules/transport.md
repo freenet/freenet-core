@@ -927,20 +927,28 @@ In tests, two endpoints on SimulationSocket with one VirtualTime and a
 seeded GlobalRng repeat the same event trace; the bytes differ, because
 rustls's key exchange and the XEdDSA nonce use the OS RNG.
 
-In SimNetwork (#5940 e5a-1): `with_transport_quic` / `with_node_transport_quic`
-set the config value per node (off by default), and the endpoint runs on the
-network's VirtualTime (`get_socket_virtual_time`; RealTime in production,
-pinned by `the_transport_endpoint_runs_on_virtual_time_only_in_simulation`).
-Its bind-time GlobalRng draw (quinn's rng_seed) runs on
-`GlobalRng::with_side_stream`, so enabling QUIC does not shift the run's main
-random stream; the one remaining difference from QUIC off is scheduling (one
-endpoint driver task per node), which changes some connection choices, so a
-QUIC-on run is compared with QUIC off by the peers that join, not by the
-exact edge set. Other knobs: `with_node_advertised_version` (the version a
-node advertises in its intro and AckConnectionV2, to emulate an older peer;
-compatibility checks keep the real version), `with_quic_idle_timeout`, and
-`drop_quic_datagrams_between` (drops QUIC-class datagrams, by the demux
-classifier, for one pair from a virtual time; `simulation::QuicDatagramDrop`).
+In SimNetwork: `with_transport_quic` / `with_node_transport_quic` set the
+config value per node (off by default; an unknown value panics), and the
+endpoint runs on the network's VirtualTime (`get_socket_virtual_time`;
+RealTime in production, pinned by
+`the_transport_endpoint_runs_on_virtual_time_only_in_simulation`). Its
+bind-time GlobalRng draw (quinn's rng_seed) runs on
+`GlobalRng::with_side_stream`, so an endpoint that is bound and idle does not
+shift the run's main random stream. That is all the determinism tests cover:
+once connections open, quinn's connection-ID draws
+(`initial_dst_cid_provider`, the CID generator) take from the main stream
+inside quinn's tasks. With endpoints idle, the one difference from QUIC off
+is scheduling (one endpoint driver task per node), which changes some
+connection choices, so a QUIC-on run is compared with QUIC off by the peers
+that join, not by the exact edge set. `probe_quic_endpoints_at` sends each
+node a stranger's QUIC datagram during a direct-runner run, so a test can
+check every endpoint was live (`not_allowed`) rather than failed to bind.
+Other knobs: `with_node_advertised_version` (the version a node advertises
+in its intro and AckConnectionV2, to emulate an older peer of the same
+major.minor; compatibility checks keep the real version),
+`with_quic_idle_timeout`, and `drop_quic_datagrams_between` (drops
+QUIC-class datagrams, by the demux classifier, for one pair from a virtual
+time; `simulation::QuicDatagramDrop`, kept across `with_fault_injection`).
 `quic/test_tls.rs` holds only a plain Ed25519 identity for tests where a
 peer presents a key that is not its transport key.
 

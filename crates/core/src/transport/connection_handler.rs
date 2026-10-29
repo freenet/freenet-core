@@ -257,16 +257,18 @@ pub(super) async fn bind_udp_listener<S: Socket>(
     // another. The QUIC endpoint must run on the cap's clock (see
     // `QuicEndpoint::bind`), and in simulation it runs on `VirtualTime`, so
     // a simulated node with both is refused rather than run on two clocks.
-    if quic_virtual_time.is_some() && config.global_bandwidth.is_some() {
+    // A limit that builds no cap (`total-bandwidth-limit = 0`) is no
+    // conflict.
+    let egress_cap = config.global_bandwidth.as_ref().and_then(|manager| {
+        super::egress_cap::EgressCap::from_total_limit(manager.total_limit(), RealTime::new())
+    });
+    if quic_virtual_time.is_some() && egress_cap.is_some() {
         return Err(TransportError::Other(anyhow::anyhow!(
             "simulated node at {bind_addr} sets both transport-quic and \
              total-bandwidth-limit: the egress cap runs on RealTime and the \
              simulated QUIC endpoint on VirtualTime, so they cannot share a clock"
         )));
     }
-    let egress_cap = config.global_bandwidth.as_ref().and_then(|manager| {
-        super::egress_cap::EgressCap::from_total_limit(manager.total_limit(), RealTime::new())
-    });
     let socket = Arc::new(
         bind_socket_with_retry::<DemuxSocket<S>>(bind_addr, SOCKET_BIND_MAX_RETRIES)
             .await?
@@ -283,8 +285,11 @@ pub(super) async fn bind_udp_listener<S: Socket>(
         match quic_virtual_time {
             // Building the endpoint draws quinn's RNG seed from `GlobalRng`.
             // A side stream (named by the bind address) keeps that draw out
-            // of the run's main stream, so turning QUIC on in a simulation
-            // does not change every later random choice of the run.
+            // of the run's main stream, so an endpoint that is bound and idle
+            // does not change any later random choice of the run. Once it
+            // opens connections, quinn's connection-ID draws (the
+            // `initial_dst_cid_provider` in `quic::config` and the CID
+            // generator) take from the main stream inside quinn's tasks.
             Some(time) => GlobalRng::with_side_stream(side_stream_of(bind_addr), || {
                 super::quic::QuicEndpoint::bind_or_warn(socket, bind_addr, time, settings, &keypair)
             }),

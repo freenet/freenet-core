@@ -1320,12 +1320,7 @@ impl P2pConnManager {
                 }),
             ledbat_min_ssthresh: config.config.network_api.ledbat_min_ssthresh,
             congestion_config: config.config.network_api.build_congestion_config(),
-            quic: config.config.network_api.quic_settings().map(|settings| {
-                crate::transport::quic::QuicSettings {
-                    idle_timeout: config.quic_idle_timeout_override,
-                    ..settings
-                }
-            }),
+            quic: config.quic_settings(),
             blocked_addresses: config.blocked_addresses.clone(),
             broadcast_retries: HashMap::new(),
             broadcast_no_target_streak: HashMap::new(),

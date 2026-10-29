@@ -5008,7 +5008,15 @@ impl GlobalRng {
         let Some(seed) = THREAD_SEED.with(|s| s.get()) else {
             return f();
         };
-        let side = SmallRng::seed_from_u64(seed ^ stream.wrapping_mul(0x9E3779B97F4A7C15));
+        // Both inputs pass through a mixer (SplitMix64's finalizer), so no
+        // stream id makes the side seed equal the main seed by construction.
+        fn mix(mut z: u64) -> u64 {
+            z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        let side = SmallRng::seed_from_u64(mix(seed ^ mix(stream)));
         let _restore = Restore(THREAD_RNG.with(|rng| rng.borrow_mut().replace(side)));
         f()
     }
@@ -10359,6 +10367,12 @@ shutdown-drain-secs = 42
         assert_eq!(main_a, main_untouched, "the main stream did not move");
         assert_eq!(side_a, side_a_again, "a side stream repeats");
         assert_ne!(side_a, side_b, "streams differ");
+        let (_, side_zero, _) = run(0, false);
+        let main_pair = {
+            let _guard = GlobalRng::seed_guard(0x5940);
+            (draw(), draw())
+        };
+        assert_ne!(side_zero, main_pair, "stream 0 is not the main stream");
         let (first, _, second) = run(1, true);
         let expected = {
             let _guard = GlobalRng::seed_guard(0x5940);

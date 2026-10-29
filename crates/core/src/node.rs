@@ -592,6 +592,18 @@ fn loopback_listener_with_remote_gateways(listener_ip: IpAddr, gateways: &[Socke
 }
 
 impl NodeConfig {
+    /// The QUIC endpoint settings the transport is opened with: those of
+    /// `transport-quic` (`None` when it is off), with the simulation's idle
+    /// timeout ([`Self::quic_idle_timeout_override`]) when one is set.
+    pub(crate) fn quic_settings(&self) -> Option<crate::transport::quic::QuicSettings> {
+        self.config.network_api.quic_settings().map(|settings| {
+            crate::transport::quic::QuicSettings {
+                idle_timeout: self.quic_idle_timeout_override.or(settings.idle_timeout),
+                ..settings
+            }
+        })
+    }
+
     /// This node's own peer id as a telemetry attribution string
     /// (public key + best-effort address). The address portion falls
     /// back to the listener address for non-gateway nodes until

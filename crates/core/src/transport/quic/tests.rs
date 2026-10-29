@@ -2832,6 +2832,37 @@ fn the_transport_reports_quic_availability() {
     })
 }
 
+/// A simulation registration (an address's network, or a network's
+/// clock) undone on drop, so a failing assertion leaves none behind for the
+/// next test in the process.
+enum Registration {
+    Address(SocketAddr),
+    TimeSource(&'static str),
+}
+
+impl Registration {
+    fn address(addr: SocketAddr, network: &str) -> Self {
+        register_address_network(addr, network);
+        Self::Address(addr)
+    }
+
+    fn time_source(network: &'static str, time: VirtualTime) -> Self {
+        register_network_time_source(network, time);
+        Self::TimeSource(network)
+    }
+}
+
+impl Drop for Registration {
+    fn drop(&mut self) {
+        match self {
+            Self::Address(addr) => {
+                crate::transport::in_memory_socket::unregister_address_network(addr)
+            }
+            Self::TimeSource(network) => unregister_network_time_source(network),
+        }
+    }
+}
+
 /// The clock the transport's endpoint runs on: `RealTime` on a real socket
 /// (production) and on a socket whose network has no `VirtualTime`, the
 /// network's `VirtualTime` in a simulation.
@@ -2871,7 +2902,7 @@ fn the_transport_endpoint_runs_on_virtual_time_only_in_simulation() {
         // An in-memory socket whose network has no VirtualTime.
         let network = "quic-clock-no-virtual-time";
         let local = SocketAddr::from(([10, 201, 37, 1], 5000));
-        register_address_network(local, network);
+        let _registered = Registration::address(local, network);
         let (outbound, _inbound, listener) = bind_udp_listener::<InMemorySocket>(
             crate::transport::TransportKeypair::new(),
             local.ip(),
@@ -2884,14 +2915,13 @@ fn the_transport_endpoint_runs_on_virtual_time_only_in_simulation() {
         let endpoint = outbound.quic_endpoint().expect("an endpoint");
         assert_eq!(endpoint.clock_type(), real_clock);
         listener.abort();
-        crate::transport::in_memory_socket::unregister_address_network(&local);
 
         // A simulation: the network registered a VirtualTime.
         let network = "quic-clock-simulation";
         let time = VirtualTime::new();
-        register_network_time_source(network, time.clone());
+        let _clock = Registration::time_source(network, time.clone());
         let local = SocketAddr::from(([10, 201, 37, 2], 5000));
-        register_address_network(local, network);
+        let _registered = Registration::address(local, network);
         let (outbound, _inbound, listener) = bind_udp_listener::<SimulationSocket>(
             crate::transport::TransportKeypair::new(),
             local.ip(),
@@ -2908,14 +2938,13 @@ fn the_transport_endpoint_runs_on_virtual_time_only_in_simulation() {
             "a simulation runs on VirtualTime"
         );
         listener.abort();
-        crate::transport::in_memory_socket::unregister_address_network(&local);
-        unregister_network_time_source(network);
     })
 }
 
 /// A simulated node with both `transport-quic` and an egress cap is
 /// refused: the cap runs on `RealTime` and the simulated endpoint on
-/// `VirtualTime`. Either one alone binds.
+/// `VirtualTime`. Either one alone binds, and so does QUIC with
+/// `total-bandwidth-limit = 0`, which builds no cap.
 #[test]
 fn a_simulated_node_with_quic_and_an_egress_cap_is_refused() {
     bounded(|| async move {
@@ -2923,15 +2952,16 @@ fn a_simulated_node_with_quic_and_an_egress_cap_is_refused() {
         use crate::transport::global_bandwidth::GlobalBandwidthManager;
         let network = "quic-sim-egress-cap";
         let time = VirtualTime::new();
-        register_network_time_source(network, time.clone());
-        let cap = || Some(Arc::new(GlobalBandwidthManager::new(1_000_000, None)));
+        let _clock = Registration::time_source(network, time.clone());
+        let cap = |limit| Some(Arc::new(GlobalBandwidthManager::new(limit, None)));
         for (port, quic, global_bandwidth, refused) in [
-            (5000, Some(settings()), cap(), true),
+            (5000, Some(settings()), cap(1_000_000), true),
             (5001, Some(settings()), None, false),
-            (5002, None, cap(), false),
+            (5002, None, cap(1_000_000), false),
+            (5003, Some(settings()), cap(0), false),
         ] {
             let local = SocketAddr::from(([10, 201, 38, 1], port));
-            register_address_network(local, network);
+            let _registered = Registration::address(local, network);
             let bound = bind_udp_listener::<SimulationSocket>(
                 crate::transport::TransportKeypair::new(),
                 local.ip(),
@@ -2958,9 +2988,7 @@ fn a_simulated_node_with_quic_and_an_egress_cap_is_refused() {
                     );
                 }
             }
-            crate::transport::in_memory_socket::unregister_address_network(&local);
         }
-        unregister_network_time_source(network);
     })
 }
 

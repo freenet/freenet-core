@@ -687,7 +687,9 @@ struct NatDetailCounters {
     demux_watched: DashMap<SocketAddr, Vec<DemuxClass>>,
     /// Test-only record of QUIC ingress outcomes, for the remotes a test
     /// registered with `watch_quic_ingress`; same rules as `demux_watched`.
-    #[cfg(test)]
+    /// Also built with the `testing` feature, for the simulation harness's
+    /// endpoint probe (`SimNetwork::probe_quic_endpoints_at`).
+    #[cfg(any(test, feature = "testing"))]
     quic_ingress_watched: DashMap<SocketAddr, Vec<QuicIngressOutcome>>,
     /// Test-only log of dropped stray intros `(remote, kind)` (bounded).
     #[cfg(test)]
@@ -1096,7 +1098,7 @@ impl TransportMetrics {
     /// Test-only: start recording what the demultiplexer's QUIC ingress did
     /// with each QUIC-class datagram from `remote`. Same rules as
     /// [`Self::watch_demux`].
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     pub(crate) fn watch_quic_ingress(&self, remote: SocketAddr) {
         self.nat_detail
             .quic_ingress_watched
@@ -1105,7 +1107,7 @@ impl TransportMetrics {
 
     /// Test-only: the QUIC ingress outcomes recorded, in order, for
     /// datagrams from a `remote` registered with `watch_quic_ingress`.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     pub(crate) fn quic_ingress_from(&self, remote: SocketAddr) -> Vec<QuicIngressOutcome> {
         self.nat_detail
             .quic_ingress_watched
@@ -1115,7 +1117,7 @@ impl TransportMetrics {
     }
 
     /// Test-only: add `outcome` to `remote`'s record if it is watched.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     pub(crate) fn note_quic_ingress_from(&self, remote: SocketAddr, outcome: QuicIngressOutcome) {
         if let Some(mut watched) = self.nat_detail.quic_ingress_watched.get_mut(&remote) {
             watched.push(outcome);

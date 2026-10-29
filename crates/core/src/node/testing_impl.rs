@@ -461,15 +461,6 @@ fn fault_injection_delivery_decision(
     use crate::transport::in_memory_socket::PacketDeliveryDecision;
     if let Some(injector) = crate::node::network_bridge::get_fault_injector(network_name) {
         let mut inj = injector.lock().unwrap();
-        if !inj.config.quic_datagram_drops.is_empty() {
-            use crate::simulation::TimeSource;
-            if let Some(now) = inj.virtual_time.as_ref().map(|vt| vt.now_nanos()) {
-                if inj.config.drops_quic_datagram(&from, &to, datagram, now) {
-                    inj.stats.messages_dropped_quic_datagram += 1;
-                    return PacketDeliveryDecision::Drop;
-                }
-            }
-        }
         if inj.enforce_fault_drops {
             if inj.config.is_crashed(&from) || inj.config.is_crashed(&to) {
                 inj.stats.messages_dropped_crash += 1;
@@ -484,6 +475,18 @@ fn fault_injection_delivery_decision(
                     inj.stats.messages_dropped_partition += 1;
                     return PacketDeliveryDecision::Drop;
                 }
+            }
+        }
+        if !inj.config.quic_datagram_drops.is_empty() {
+            use crate::simulation::TimeSource;
+            let now = inj
+                .virtual_time
+                .as_ref()
+                .expect("a QuicDatagramDrop rule needs the fault injector's VirtualTime")
+                .now_nanos();
+            if inj.config.drops_quic_datagram(&from, &to, datagram, now) {
+                inj.stats.messages_dropped_quic_datagram += 1;
+                return PacketDeliveryDecision::Drop;
             }
         }
     }
@@ -1648,6 +1651,14 @@ pub struct SimNetwork {
     /// location and the advertised `own_location` stay equal, exactly as the
     /// default port path keeps them). Build via `new_with_node_locations`.
     node_port_override: Option<Vec<u16>>,
+    /// QUIC datagram drop rules added by `drop_quic_datagrams_between`, kept
+    /// here so replacing the fault injector (`with_fault_injection`,
+    /// `clear_fault_injection`) carries them over.
+    quic_datagram_drops: Vec<crate::simulation::QuicDatagramDrop>,
+    /// When `probe_quic_endpoints_at` asked for it: the virtual time at which
+    /// `run_simulation_direct` sends each node a stranger's QUIC datagram,
+    /// with the node and stranger addresses.
+    quic_endpoint_probe: Option<(Duration, Vec<(SocketAddr, SocketAddr)>)>,
 }
 
 impl SimNetwork {
@@ -1826,6 +1837,8 @@ impl SimNetwork {
             hosting_budget_override: None,
             shared_rings: HashMap::new(),
             node_port_override,
+            quic_datagram_drops: Vec::new(),
+            quic_endpoint_probe: None,
         };
         net.config_gateways(
             gateways
@@ -1847,8 +1860,11 @@ impl SimNetwork {
     fn init_default_fault_injection(&mut self) {
         use crate::node::network_bridge::{FaultInjectorState, set_fault_injector};
         let fault_seed = self.seed.wrapping_add(0xFA01_7777);
-        let state = FaultInjectorState::new(FaultConfig::default(), fault_seed)
-            .with_virtual_time(self.virtual_time.clone());
+        let state = FaultInjectorState::new(
+            self.with_quic_datagram_drops(FaultConfig::default()),
+            fault_seed,
+        )
+        .with_virtual_time(self.virtual_time.clone());
         set_fault_injector(
             &self.name,
             Some(std::sync::Arc::new(std::sync::Mutex::new(state))),
@@ -1932,6 +1948,7 @@ impl SimNetwork {
     ///
     /// # Panics
     /// If no node with that label is waiting to start.
+    #[cfg(any(test, feature = "testing"))]
     fn node_config_mut(&mut self, label: &NodeLabel) -> &mut NodeConfig {
         if let Some((builder, _)) = self
             .gateways
@@ -1946,25 +1963,53 @@ impl SimNetwork {
         }
     }
 
-    /// Sets `transport-quic` to `value`, as `config.toml` would (`"off"`,
-    /// `"prefer"`), on every node. Unset (off) by default. Call before the
-    /// simulation starts.
-    pub fn with_transport_quic(&mut self, value: &str) -> &mut Self {
-        let labels: Vec<NodeLabel> = self
-            .gateways
+    /// Every node waiting to start: gateways, then regular nodes.
+    #[cfg(any(test, feature = "testing"))]
+    fn pending_labels(&self) -> Vec<NodeLabel> {
+        self.gateways
             .iter()
             .map(|(_, gateway)| gateway.label.clone())
             .chain(self.nodes.iter().map(|(_, label)| label.clone()))
-            .collect();
-        for label in &labels {
-            self.with_node_transport_quic(label, value);
+            .collect()
+    }
+
+    /// This binary's protocol version, `(major, minor, patch)`: what a node
+    /// advertises unless `with_node_advertised_version` overrides it.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn real_protocol_version() -> (u8, u8, u16) {
+        crate::node::network_bridge::p2p_protoc::own_crate_version()
+    }
+
+    /// Sets `transport-quic` to `value`, as `config.toml` would (`"off"`,
+    /// `"prefer"`), on every node. Unset (off) by default. Call before the
+    /// simulation starts.
+    ///
+    /// # Panics
+    /// On a value this binary does not know. A node would read it as off
+    /// with a warning, which in a test would silently disable QUIC.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_transport_quic(&mut self, value: &str) -> &mut Self {
+        for label in self.pending_labels() {
+            self.with_node_transport_quic(&label, value);
         }
         self
     }
 
     /// Sets `transport-quic` to `value` on the node `label` only. A node in
     /// a simulation builds its QUIC endpoint on the network's `VirtualTime`.
+    ///
+    /// # Panics
+    /// On a value this binary does not know (see [`Self::with_transport_quic`]).
+    #[cfg(any(test, feature = "testing"))]
     pub fn with_node_transport_quic(&mut self, label: &NodeLabel, value: &str) -> &mut Self {
+        use crate::transport::quic::QuicMode;
+        // Every mode `QuicMode::from_config_value` accepts. Add a new mode
+        // here when it is added there.
+        let known = [QuicMode::OFF, QuicMode::PREFER];
+        assert!(
+            known.contains(&value.trim().to_ascii_lowercase().as_str()),
+            "unknown transport-quic value {value:?}; known values: {known:?}"
+        );
         let config = self.node_config_mut(label);
         Arc::make_mut(&mut config.config).network_api.transport_quic = Some(value.to_string());
         self
@@ -1975,11 +2020,24 @@ impl SimNetwork {
     /// that (older) release in every version gate, e.g. `(0, 2, 148)` for a
     /// peer that cannot decode a QUIC upgrade message. The node itself still
     /// runs this binary's code; only what its peers learn changes.
+    ///
+    /// # Panics
+    /// Unless `version` has this binary's major and minor version and is not
+    /// above [`Self::real_protocol_version`]. The advertised bytes keep this
+    /// binary's min-compatible patch, so a version below it would be refused
+    /// by every peer, and one with another major or minor would be read
+    /// against the wrong min-compatible.
+    #[cfg(any(test, feature = "testing"))]
     pub fn with_node_advertised_version(
         &mut self,
         label: &NodeLabel,
         version: (u8, u8, u16),
     ) -> &mut Self {
+        let real = Self::real_protocol_version();
+        assert!(
+            (version.0, version.1) == (real.0, real.1) && version <= real,
+            "advertised version {version:?} must share {real:?}'s major and minor and not exceed it"
+        );
         self.node_config_mut(label).advertised_version_override = Some(version);
         self
     }
@@ -1987,12 +2045,10 @@ impl SimNetwork {
     /// Gives every node's QUIC endpoint the idle timeout `timeout` instead
     /// of its clock's (24 h on `VirtualTime`), so a silent QUIC path times
     /// out within a simulation. No effect on a node with QUIC off.
+    #[cfg(any(test, feature = "testing"))]
     pub fn with_quic_idle_timeout(&mut self, timeout: Duration) -> &mut Self {
-        for (builder, _) in self.gateways.iter_mut() {
-            builder.config.quic_idle_timeout_override = Some(timeout);
-        }
-        for (builder, _) in self.nodes.iter_mut() {
-            builder.config.quic_idle_timeout_override = Some(timeout);
+        for label in self.pending_labels() {
+            self.node_config_mut(&label).quic_idle_timeout_override = Some(timeout);
         }
         self
     }
@@ -2001,10 +2057,8 @@ impl SimNetwork {
     /// directions, from virtual time `from` on (the network's clock starts
     /// at zero). Every other datagram between them is delivered as before,
     /// so their UDP session is unaffected. Counted in the network's
-    /// `messages_dropped_quic_datagram`.
-    ///
-    /// The rule lives in this network's fault injector: call it after
-    /// [`Self::with_fault_injection`], which replaces the injector.
+    /// `messages_dropped_quic_datagram`. The rule survives
+    /// [`Self::with_fault_injection`] and [`Self::clear_fault_injection`].
     #[cfg(any(test, feature = "testing"))]
     pub fn drop_quic_datagrams_between(
         &mut self,
@@ -2023,6 +2077,7 @@ impl SimNetwork {
             address(b),
             u64::try_from(from.as_nanos()).unwrap_or(u64::MAX),
         );
+        self.quic_datagram_drops.push(rule.clone());
         crate::node::network_bridge::get_fault_injector(&self.name)
             .expect("SimNetwork::new registers a fault injector")
             .lock()
@@ -2031,6 +2086,125 @@ impl SimNetwork {
             .add_quic_datagram_drop(rule);
         self.install_fault_delivery_callback();
         self
+    }
+
+    /// Makes `run_simulation_direct` send every node, at virtual time `at`,
+    /// one QUIC Initial-shaped datagram from an address no node knows (a
+    /// stranger), and returns a handle that reads, after the run, what each
+    /// node's socket did with it. A node with a live QUIC endpoint refuses
+    /// it as `not_allowed` (its allow-set is empty); a node without one
+    /// counts it `no_ingress`. Either way the node does not answer, so the
+    /// probe changes nothing else in the run. `at` must be after every node
+    /// has bound its socket; a node that had not records nothing.
+    ///
+    /// Only `run_simulation_direct` sends the probe; the other runners
+    /// panic if one is set.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn probe_quic_endpoints_at(&mut self, at: Duration) -> QuicEndpointProbe {
+        use crate::transport::metrics::TRANSPORT_METRICS;
+        // One stranger per node, in a ULA prefix named by this network, so
+        // simulations running at once in one process do not share one.
+        let network = self
+            .name
+            .bytes()
+            .fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
+                (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+            });
+        let mut nodes: Vec<(NodeLabel, SocketAddr)> = self
+            .node_addresses
+            .iter()
+            .map(|(label, addr)| (label.clone(), *addr))
+            .collect();
+        nodes.sort_by_key(|(label, _)| label.to_string());
+        let pairs: Vec<(SocketAddr, SocketAddr)> = nodes
+            .into_iter()
+            .enumerate()
+            .map(|(index, (_, node))| {
+                let [a, b, c, d] = [
+                    (network >> 48) as u16,
+                    (network >> 32) as u16,
+                    (network >> 16) as u16,
+                    network as u16,
+                ];
+                let ip = std::net::Ipv6Addr::new(0xfd59, a, b, c, d, 0, 0, index as u16 + 1);
+                let stranger = SocketAddr::new(ip.into(), 40_000);
+                TRANSPORT_METRICS.watch_quic_ingress(stranger);
+                (node, stranger)
+            })
+            .collect();
+        self.quic_endpoint_probe = Some((at, pairs.clone()));
+        QuicEndpointProbe { pairs }
+    }
+
+    /// Spawns the probe `probe_quic_endpoints_at` asked for, if any.
+    #[cfg(any(test, feature = "testing"))]
+    fn spawn_quic_endpoint_probe(&self) {
+        let Some((at, pairs)) = self.quic_endpoint_probe.clone() else {
+            return;
+        };
+        let (network, time) = (self.name.clone(), self.virtual_time.clone());
+        GlobalExecutor::spawn(async move {
+            use crate::simulation::TimeSource;
+            time.sleep_until(u64::try_from(at.as_nanos()).unwrap_or(u64::MAX))
+                .await;
+            let mut initial = vec![0xC0, 0, 0, 0, 1, 8];
+            initial.resize(1200, 0);
+            for (node, stranger) in pairs {
+                crate::transport::in_memory_socket::deliver_packet_to_network(
+                    &network,
+                    node,
+                    initial.clone(),
+                    stranger,
+                );
+            }
+        });
+    }
+
+    /// Panics if a QUIC endpoint probe is set: only `run_simulation_direct`
+    /// sends one, and a probe that silently never ran would fail later
+    /// with a misleading message.
+    fn assert_no_quic_endpoint_probe(&self) {
+        assert!(
+            self.quic_endpoint_probe.is_none(),
+            "probe_quic_endpoints_at is only honoured by run_simulation_direct"
+        );
+    }
+}
+
+/// What each node's socket did with the stranger's datagram that
+/// [`SimNetwork::probe_quic_endpoints_at`] sent it.
+#[cfg(any(test, feature = "testing"))]
+#[derive(Debug, Clone)]
+pub struct QuicEndpointProbe {
+    pairs: Vec<(SocketAddr, SocketAddr)>,
+}
+
+#[cfg(any(test, feature = "testing"))]
+impl QuicEndpointProbe {
+    /// Per node address, the outcome labels recorded for the probe
+    /// datagram (`"not_allowed"`: a live endpoint refused it;
+    /// `"no_ingress"`: no endpoint). Empty if the node never read it.
+    pub fn outcomes(&self) -> Vec<(SocketAddr, Vec<&'static str>)> {
+        use crate::transport::metrics::TRANSPORT_METRICS;
+        self.pairs
+            .iter()
+            .map(|(node, stranger)| {
+                let labels = TRANSPORT_METRICS
+                    .quic_ingress_from(*stranger)
+                    .into_iter()
+                    .map(|outcome| outcome.label())
+                    .collect();
+                (*node, labels)
+            })
+            .collect()
+    }
+
+    /// Whether every node refused the probe as `not_allowed`, i.e. had a
+    /// live QUIC endpoint.
+    pub fn every_node_has_a_live_endpoint(&self) -> bool {
+        self.outcomes()
+            .iter()
+            .all(|(_, labels)| labels.as_slice() == ["not_allowed"])
     }
 }
 
@@ -2593,7 +2767,7 @@ impl SimNetwork {
         // Use a derived seed for fault injection to maintain determinism
         let fault_seed = self.seed.wrapping_add(0xFA01_7777);
         // Always use VirtualTime for deterministic behavior
-        let state = FaultInjectorState::new(config, fault_seed)
+        let state = FaultInjectorState::new(self.with_quic_datagram_drops(config), fault_seed)
             .with_virtual_time(self.virtual_time.clone());
         set_fault_injector(
             &self.name,
@@ -2601,7 +2775,17 @@ impl SimNetwork {
         );
     }
 
-    /// Clears any configured fault injection and resets to default (VirtualTime only).
+    /// `config` plus this network's QUIC datagram drop rules
+    /// (`drop_quic_datagrams_between`), which outlive a replaced injector.
+    fn with_quic_datagram_drops(&self, mut config: FaultConfig) -> FaultConfig {
+        config
+            .quic_datagram_drops
+            .extend(self.quic_datagram_drops.iter().cloned());
+        config
+    }
+
+    /// Clears any configured fault injection and resets to default (VirtualTime
+    /// only). QUIC datagram drop rules are kept.
     pub fn clear_fault_injection(&mut self) {
         self.init_default_fault_injection();
     }
@@ -2624,7 +2808,8 @@ impl SimNetwork {
     ) {
         use crate::node::network_bridge::{FaultInjectorState, set_fault_injector};
         let fault_seed = self.seed.wrapping_add(0xFA01_7777);
-        let state = FaultInjectorState::new(config, fault_seed).with_virtual_time(virtual_time);
+        let state = FaultInjectorState::new(self.with_quic_datagram_drops(config), fault_seed)
+            .with_virtual_time(virtual_time);
         set_fault_injector(
             &self.name,
             Some(std::sync::Arc::new(std::sync::Mutex::new(state))),
@@ -3258,6 +3443,7 @@ impl SimNetwork {
     where
         R: RandomEventGenerator + Send + 'static,
     {
+        self.assert_no_quic_endpoint_probe();
         use crate::ring::topology_registry::set_current_network_name;
         use crate::transport::in_memory_socket::is_socket_registered;
 
@@ -4748,6 +4934,7 @@ impl SimNetwork {
         F: FnOnce() -> Fut + Send + 'static,
         Fut: std::future::Future<Output = turmoil::Result> + 'static,
     {
+        self.assert_no_quic_endpoint_probe();
         use crate::config::{GlobalRng, GlobalSimulationTime};
         use std::sync::Mutex;
 
@@ -5001,6 +5188,7 @@ impl SimNetwork {
         simulation_duration: Duration,
         post_operations_wait: Duration,
     ) -> ControlledSimulationResult {
+        self.assert_no_quic_endpoint_probe();
         use crate::config::{GlobalRng, GlobalSimulationTime};
         use crate::ring::topology_registry::{
             get_all_topology_snapshots, set_current_network_name,
@@ -6149,6 +6337,9 @@ impl SimNetwork {
 
                 node_handles.push(handle);
             }
+
+            #[cfg(any(test, feature = "testing"))]
+            self.spawn_quic_endpoint_probe();
 
             // Chaos driver: periodically crash/recover nodes via fault injection.
             //
@@ -7594,7 +7785,41 @@ mod tests {
                 Some(Duration::from_secs(5)),
                 "{label}"
             );
+            // What `P2pConnManager` opens the transport with, which
+            // `bind_udp_listener` builds the endpoint from.
+            assert_eq!(
+                config.quic_settings().map(|settings| settings.idle_timeout),
+                quic.then_some(Some(Duration::from_secs(5))),
+                "{label}"
+            );
         }
+    }
+
+    /// Bad knob values fail at once rather than silently running another
+    /// configuration.
+    #[tokio::test(flavor = "current_thread")]
+    async fn quic_harness_knobs_refuse_bad_values() {
+        let mut sim =
+            SimNetwork::new("quic-harness-bad-e5a1", 1, 1, 7, 3, 6, 1, 0x5940_E5A1_0013).await;
+        let label = labels_in_order(&sim)[1].clone();
+        let real = SimNetwork::real_protocol_version();
+        let refused = |f: &mut dyn FnMut()| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err()
+        };
+        assert!(refused(&mut || {
+            sim.with_transport_quic("not-a-mode");
+        }));
+        assert!(refused(&mut || {
+            sim.with_node_advertised_version(&label, (real.0, real.1, real.2 + 1));
+        }));
+        assert!(refused(&mut || {
+            sim.with_node_advertised_version(&label, (real.0, real.1 + 1, 0));
+        }));
+        assert!(!refused(&mut || {
+            sim.with_transport_quic(" PREFER ")
+                .with_node_advertised_version(&label, real)
+                .with_node_advertised_version(&label, (real.0, real.1, 148));
+        }));
     }
 
     /// `drop_quic_datagrams_between` drops QUIC-class datagrams between its
@@ -7614,6 +7839,9 @@ mod tests {
         let addr = |label: &NodeLabel| sim.all_node_addresses()[label];
         let (a, b, c) = (addr(&labels[0]), addr(&labels[1]), addr(&labels[2]));
         sim.drop_quic_datagrams_between(&labels[0], &labels[1], T);
+        // Replacing the injector keeps the rule.
+        sim.with_fault_injection(crate::simulation::FaultConfig::default());
+        sim.clear_fault_injection();
         // The nodes are not started, so their addresses are free to bind
         // (and not yet registered with the network: starting does that).
         let mut sockets = HashMap::new();

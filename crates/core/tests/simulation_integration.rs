@@ -20332,20 +20332,36 @@ struct QuicSimTrace {
     event_sequence: Vec<String>,
     /// `(tx, peer, variant, contract key, state hash)` per event, sorted.
     event_keys: Vec<String>,
+    /// Per node, what its socket did with a stranger's QUIC datagram
+    /// (`SimNetwork::probe_quic_endpoints_at`): `["not_allowed"]` when the
+    /// node had a live QUIC endpoint, `["no_ingress"]` when it had none.
+    endpoint_probe: Vec<(SocketAddr, Vec<&'static str>)>,
+}
+
+impl QuicSimTrace {
+    /// Asserts every node answered the endpoint probe with `expected`.
+    fn assert_probe(&self, expected: &str) {
+        assert!(!self.endpoint_probe.is_empty(), "the probe covered no node");
+        for (node, outcomes) in &self.endpoint_probe {
+            assert_eq!(outcomes.as_slice(), [expected], "probe of {node}");
+        }
+    }
 }
 
 /// One direct-runner simulation (2 gateways, 4 nodes), with
-/// `transport-quic` set to `quic` on every node when given.
+/// `transport-quic` set to `quic` on every node when given. Every node is
+/// probed for a QUIC endpoint 2 s into the run, after all have bound.
 fn run_quic_harness_sim(name: &str, seed: u64, quic: Option<&str>) -> QuicSimTrace {
     setup_deterministic_state(seed);
     let rt = create_runtime();
-    let (sim, logs_handle) = rt.block_on(async {
+    let (sim, logs_handle, probe) = rt.block_on(async {
         let mut sim = SimNetwork::new(name, 2, 4, 10, 3, 10, 3, seed).await;
         if let Some(value) = quic {
             sim.with_transport_quic(value);
         }
+        let probe = sim.probe_quic_endpoints_at(Duration::from_secs(2));
         let logs_handle = sim.event_logs_handle();
-        (sim, logs_handle)
+        (sim, logs_handle, probe)
     });
     drop(rt);
     sim.run_simulation_direct::<rand::rngs::SmallRng>(seed, 6, 20, Duration::from_millis(200))
@@ -20380,6 +20396,7 @@ fn run_quic_harness_sim(name: &str, seed: u64, quic: Option<&str>) -> QuicSimTra
             mesh,
             event_sequence,
             event_keys,
+            endpoint_probe: probe.outcomes(),
         }
     })
 }
@@ -20432,6 +20449,8 @@ fn test_quic_prefer_forms_a_mesh_of_the_same_peers_as_quic_off() {
     const NODES: usize = 6;
     let off = run_quic_harness_sim("quic-mesh-off", SEED, None);
     let prefer = run_quic_harness_sim("quic-mesh-prefer", SEED, Some("prefer"));
+    off.assert_probe("no_ingress");
+    prefer.assert_probe("not_allowed");
     let (off_peers, off_connected) = quic_mesh_peers_and_connected(&off.mesh);
     let (prefer_peers, prefer_connected) = quic_mesh_peers_and_connected(&prefer.mesh);
     assert_eq!(
@@ -20455,11 +20474,24 @@ fn test_quic_prefer_forms_a_mesh_of_the_same_peers_as_quic_off() {
 
 /// Two runs with QUIC on and the same seed produce the same event trace.
 /// Compares events, not bytes: rustls's key exchange uses the OS RNG.
+///
+/// Scope: every endpoint is bound and idle. No connection is upgraded yet,
+/// so no QUIC packet flows and neither quinn's timers nor its
+/// connection-ID draws (from the main `GlobalRng` stream) enter the trace.
+/// A run on another seed is checked to differ, so the comparison is not
+/// blind to the seed.
 #[test_log::test]
 fn test_quic_prefer_is_deterministic() {
     const SEED: u64 = 0x5940_E5A1_0002;
     let first = run_quic_harness_sim("quic-det-run1", SEED, Some("prefer"));
     let second = run_quic_harness_sim("quic-det-run2", SEED, Some("prefer"));
+    let other_seed = run_quic_harness_sim("quic-det-other", SEED + 1, Some("prefer"));
+    first.assert_probe("not_allowed");
+    second.assert_probe("not_allowed");
+    assert_ne!(
+        first.event_keys, other_seed.event_keys,
+        "another seed gives another trace"
+    );
     assert!(!first.event_sequence.is_empty(), "the run produced events");
     assert_eq!(first.mesh, second.mesh, "same mesh");
     assert_eq!(
@@ -20524,16 +20556,7 @@ fn test_advertised_version_override_reaches_peers() {
         )
     }
 
-    let real = {
-        let mut parts = env!("CARGO_PKG_VERSION")
-            .split(['.', '-'])
-            .filter_map(|p| p.parse::<u16>().ok());
-        (
-            parts.next().expect("major") as u8,
-            parts.next().expect("minor") as u8,
-            parts.next().expect("patch"),
-        )
-    };
+    let real = SimNetwork::real_protocol_version();
     assert_eq!(
         run("advertised-version-control", false),
         (Some(real), Some(real)),

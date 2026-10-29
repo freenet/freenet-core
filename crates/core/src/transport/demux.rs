@@ -388,10 +388,9 @@ impl<S> DemuxSocket<S> {
         };
         TRANSPORT_METRICS.record_quic_ingress(outcome);
         #[cfg(test)]
-        {
-            self.quic_outcomes[outcome as usize].fetch_add(1, Ordering::Relaxed);
-            TRANSPORT_METRICS.note_quic_ingress_from(from, outcome);
-        }
+        self.quic_outcomes[outcome as usize].fetch_add(1, Ordering::Relaxed);
+        #[cfg(any(test, feature = "testing"))]
+        TRANSPORT_METRICS.note_quic_ingress_from(from, outcome);
     }
 
     /// This socket's count of QUIC-class datagrams with `outcome`.
