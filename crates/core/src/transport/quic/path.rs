@@ -93,7 +93,6 @@ use futures::{Stream, StreamExt};
 use tokio::sync::mpsc;
 
 use super::QuicConnection;
-use super::contain::{Contained, Quinn, contain};
 use super::framing::{FrameHeader, HeaderError};
 use super::identity::PeerKey;
 use crate::config::GlobalExecutor;
@@ -377,11 +376,6 @@ pub(crate) enum QuicSendError {
     /// The stream was closed locally (not expected).
     #[error("the stream was closed")]
     Closed,
-    /// A QUIC task of the endpoint panicked, so the endpoint is off: the
-    /// send was refused, or abandoned while it waited (`super::contain`).
-    /// Ends the path, as `ConnectionLost` does.
-    #[error("the QUIC endpoint is down")]
-    EndpointDown,
 }
 
 impl From<quinn::WriteError> for QuicSendError {
@@ -504,7 +498,7 @@ impl QuicPath {
             receiver.panic_on_stream = limits.panic_in_receive;
         }
         let receive = GlobalExecutor::spawn(supervise_receive(
-            connection.quinn(),
+            connection.inner().clone(),
             connection.closer(),
             Arc::new(receiver),
             stats.clone(),
@@ -560,42 +554,22 @@ impl QuicPath {
         &self.connection
     }
 
-    /// Run one send under `contain`: refused at once once the endpoint is
-    /// poisoned, and abandoned (its stream leaked, not reset) when the
-    /// endpoint is poisoned while it waits, so a caller never waits on a
-    /// connection whose driver can no longer run. Both return
-    /// [`QuicSendError::EndpointDown`].
-    async fn contained<F>(&self, send: F) -> Result<(), QuicSendError>
-    where
-        F: Future<Output = Result<(), QuicSendError>>,
-    {
-        contain(self.connection.health(), "path send", send)
-            .await
-            .unwrap_or(Err(QuicSendError::EndpointDown))
-    }
-
     /// Send one serialized message.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn send_short(&self, payload: &[u8]) -> Result<(), QuicSendError> {
-        self.contained(async {
-            let header = FrameHeader::short(payload.len() as u64)?;
-            let mut send = self.open(&header, &[]).await?;
-            send.write_all(payload).await?;
-            send.finish().await
-        })
-        .await
+        let header = FrameHeader::short(payload.len() as u64)?;
+        let mut send = self.open(&header, &[]).await?;
+        send.write_all(payload).await?;
+        send.finish().await
     }
 
     /// Send one control frame.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn send_control(&self, payload: &[u8]) -> Result<(), QuicSendError> {
-        self.contained(async {
-            let header = FrameHeader::control(payload.len() as u64)?;
-            let mut send = self.open(&header, &[]).await?;
-            send.write_all(payload).await?;
-            send.finish().await
-        })
-        .await
+        let header = FrameHeader::control(payload.len() as u64)?;
+        let mut send = self.open(&header, &[]).await?;
+        send.write_all(payload).await?;
+        send.finish().await
     }
 
     /// Send stream `stream_id` (caller-named) with `payload`, announced by
@@ -607,14 +581,11 @@ impl QuicPath {
         metadata: Option<&[u8]>,
         payload: Bytes,
     ) -> Result<(), QuicSendError> {
-        self.contained(async {
-            let metadata = frame_metadata(metadata);
-            let header = FrameHeader::stream(stream_id, payload.len() as u64, metadata.len())?;
-            let mut send = self.open(&header, metadata).await?;
-            send.write_chunk(payload).await?;
-            send.finish().await
-        })
-        .await
+        let metadata = frame_metadata(metadata);
+        let header = FrameHeader::stream(stream_id, payload.len() as u64, metadata.len())?;
+        let mut send = self.open(&header, metadata).await?;
+        send.write_chunk(payload).await?;
+        send.finish().await
     }
 
     /// Send stream `stream_id` (caller-named) of `total_len` bytes from
@@ -626,21 +597,6 @@ impl QuicPath {
     /// No byte past `total_len` is written.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn send_stream_chunks<S>(
-        &self,
-        stream_id: StreamId,
-        total_len: u64,
-        metadata: Option<&[u8]>,
-        chunks: S,
-    ) -> Result<(), QuicSendError>
-    where
-        S: Stream<Item = Result<Bytes, StreamError>> + Unpin,
-    {
-        self.contained(self.send_chunks(stream_id, total_len, metadata, chunks))
-            .await
-    }
-
-    /// [`Self::send_stream_chunks`], run under `contain`.
-    async fn send_chunks<S>(
         &self,
         stream_id: StreamId,
         total_len: u64,
@@ -686,8 +642,7 @@ impl QuicPath {
                     | QuicSendError::Source(_)
                     | QuicSendError::Stopped(_)
                     | QuicSendError::ConnectionLost(_)
-                    | QuicSendError::Closed
-                    | QuicSendError::EndpointDown => reset_code::SENDER_ABORTED,
+                    | QuicSendError::Closed => reset_code::SENDER_ABORTED,
                 };
                 send.abort(code);
                 Err(error)
@@ -726,58 +681,27 @@ fn frame_metadata(metadata: Option<&[u8]>) -> &[u8] {
 
 /// Run the receive task, and close the connection if it ends while the
 /// connection is still open. It ends on its own only when the connection
-/// has ended.
-///
-/// A panic in it is a panic in a QUIC task like any other (`contain`): it
-/// is counted here (`ReceiveTaskPanicked`), the receive task is leaked, the
-/// endpoint is poisoned and turned off, and the connection is closed with
-/// `close_code::DOWNGRADE` where its state is intact, so the peer falls back
-/// to the UDP session.
-///
-/// When another QUIC task panicked instead, the connection is closed the
-/// same way. If its state is intact the close ends the receive task as
-/// usual; if not (its own driver panicked), nothing would ever wake the
-/// receive task, so it is leaked.
-///
-/// Whenever the receive task is leaked, the path's channels are closed
-/// ([`inbound::Receiver::sever`]) so their consumers see the end. Streams
-/// already announced on such a path are not ended: their readers are part
-/// of what was leaked. Dropping the path aborts this task, which is not
-/// counted.
+/// has ended; any other end (a panic) leaves a connection on which nothing
+/// would be read again, so it is counted and the connection is closed with
+/// `close_code::DOWNGRADE`: the QUIC path is broken on this side, and the
+/// peer should fall back to the UDP session. Dropping the path aborts this
+/// task, which is not counted.
 async fn supervise_receive<T: TimeSource>(
-    connection: Quinn<quinn::Connection>,
+    connection: quinn::Connection,
     closer: super::QuicCloser,
     receiver: Arc<inbound::Receiver<T>>,
     stats: Arc<QuicPathStats>,
 ) {
-    // Inside `Contained`, the plain quinn handle is dropped only while the
-    // endpoint is healthy.
-    let mut receiving = Contained::new(
-        connection.health().clone(),
-        "path receive",
-        Box::pin(inbound::receive((*connection).clone(), receiver.clone())),
-    );
-    let panicked = match receiving.run_until_poisoned().await {
-        Ok(Some(())) => false,
-        Ok(None) => true,
-        Err(super::contain::Poisoned) => {
-            if closer.close_after_poison(QuicCloseCode::Downgrade) {
-                receiving.run().await.is_none()
-            } else {
-                receiver.sever();
-                return;
-            }
-        }
-    };
-    if panicked {
+    use futures::FutureExt;
+    let ended = std::panic::AssertUnwindSafe(inbound::receive(connection.clone(), receiver))
+        .catch_unwind()
+        .await;
+    if ended.is_err() {
         stats.record(QuicInboundOutcome::ReceiveTaskPanicked);
-        tracing::debug!(
-            remote = %closer.remote(),
+        tracing::error!(
+            remote = %connection.remote_address(),
             "QUIC path: the receive task panicked; closing the connection"
         );
-        closer.close_after_poison(QuicCloseCode::Downgrade);
-        receiver.sever();
-        return;
     }
     // Only if still open and not already being closed (QuicCloser).
     closer.close(QuicCloseCode::Downgrade);

@@ -29,8 +29,6 @@
 //!   codes (connection close, stream stop and reset), one range each.
 //! - [`liveness`]: whether the endpoint is alive ([`QuicAvailability`]);
 //!   endpoint death turns QUIC off for the node and never stops it.
-//! - [`contain`]: a panic in any QUIC task is caught, what it touched is
-//!   leaked instead of dropped, and the endpoint is turned off.
 //!
 //! [`DemuxSocket`]: super::DemuxSocket
 //! [`TransportPublicKey`]: super::TransportPublicKey
@@ -38,7 +36,6 @@
 
 pub(crate) mod cid;
 pub(crate) mod config;
-pub(crate) mod contain;
 pub(crate) mod error;
 pub(crate) mod framing;
 pub(crate) mod identity;
@@ -69,11 +66,17 @@ use super::metrics::{QuicCloseCode, TRANSPORT_METRICS};
 use crate::config::GlobalExecutor;
 use crate::node::background_task_monitor::BackgroundTaskMonitor;
 use crate::simulation::TimeSource;
-use contain::{Quinn, catch, catch_panics, contain, guard};
 use identity::{PeerKey, QuicIdentity};
 use liveness::EndpointHealth;
 
 pub(crate) use config::QuicSettings;
+
+// The QUIC code contains panics by unwinding to a catch (`socket`,
+// `liveness`); with `panic = "abort"` the first panic in it ends the process.
+const _: () = assert!(
+    cfg!(panic = "unwind"),
+    "the QUIC transport relies on panic = \"unwind\" to contain panics (transport/quic/liveness.rs)"
+);
 #[cfg(test)]
 pub(crate) use liveness::QuicAvailability;
 pub(crate) use liveness::QuicAvailabilityWatch;
@@ -155,8 +158,7 @@ impl std::ops::Deref for QuicEndpoint {
 /// loop holds one, and drops it when the endpoint is released.
 #[derive(Clone)]
 pub(crate) struct EndpointCore {
-    /// Leaked instead of dropped once the endpoint is poisoned (`contain`).
-    endpoint: Quinn<quinn::Endpoint>,
+    endpoint: quinn::Endpoint,
     sources: Arc<dyn QuicSources>,
     /// The transport settings of every connection (`config::transport_config`).
     transport: Arc<quinn::TransportConfig>,
@@ -169,6 +171,8 @@ pub(crate) struct EndpointCore {
     identity: Arc<QuicIdentity>,
     /// The transport key each allowed client must present.
     expected_clients: Arc<ExpectedClients>,
+    /// The endpoint's availability, handed to each connection's watcher.
+    availability: QuicAvailabilityWatch,
     /// Test hooks that inject faults into quinn's drivers.
     #[cfg(test)]
     faults: Arc<socket::SocketFaults>,
@@ -322,12 +326,8 @@ impl<S: Socket> QuicSources for DemuxSocket<S> {
 
 impl std::fmt::Debug for QuicEndpoint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let local_addr = guard(self.endpoint.health(), "local_addr", || {
-            self.endpoint.local_addr().ok()
-        })
-        .flatten();
         f.debug_struct("QuicEndpoint")
-            .field("local_addr", &local_addr)
+            .field("local_addr", &self.endpoint.local_addr().ok())
             .finish_non_exhaustive()
     }
 }
@@ -474,12 +474,13 @@ impl QuicEndpoint {
                 accept_loop_started: std::sync::atomic::AtomicBool::new(false),
             }),
             core: EndpointCore {
-                endpoint: Quinn::new(endpoint, health.clone()),
+                endpoint,
                 sources,
                 transport,
                 server,
                 identity,
                 expected_clients: Arc::new(ExpectedClients::default()),
+                availability: health.watch(),
                 #[cfg(test)]
                 faults: faults.unwrap_or_default(),
             },
@@ -521,10 +522,8 @@ impl QuicEndpoint {
     /// reads any end of a registered task as a node failure and an
     /// endpoint's end must not stop the node. Endpoint death is reported by
     /// the driver's watcher ([`Self::availability`]), not by this task. A
-    /// panic in the loop is caught like one in any QUIC task (`contain`):
-    /// the endpoint goes `Down` and the loop parks, so the monitor does not
-    /// fire. The loop's state is then leaked with its `attempts` sender, so
-    /// the consumer must also watch the availability.
+    /// panic here is still a node failure, as for every monitored task; a
+    /// quinn panic is not contained (see `liveness`).
     ///
     /// `monitor` must not have started waiting yet
     /// ([`BackgroundTaskMonitor::wait_for_any_exit`] drains it, and a task
@@ -561,15 +560,38 @@ impl QuicEndpoint {
         let core = self.core.clone();
         let mut availability = self.availability();
         let full = self.owner.accept_queue_full.clone();
-        let health = self.owner.health.clone();
         let handle = GlobalExecutor::spawn(async move {
-            let accepting = async move {
-                accept_until_stopped(&core, &mut availability, &attempts, &full).await;
-                drop(attempts);
-                drop(core);
-            };
-            catch_panics(&health, "accept loop", accepting).await;
+            loop {
+                let incoming = tokio::select! {
+                    incoming = core.accept() => incoming,
+                    _ = availability.not_up() => None,
+                };
+                let Some(incoming) = incoming else { break };
+                match attempts.try_send(incoming) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(incoming)) => {
+                        let count = full.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        if count == 1 || count % 1024 == 0 {
+                            tracing::warn!(
+                                remote = %incoming.incoming.remote_address(),
+                                accept_queue_full = count,
+                                "QUIC accept queue full; ignoring the attempt"
+                            );
+                        }
+                        incoming.incoming.ignore();
+                    }
+                    Err(mpsc::error::TrySendError::Closed(incoming)) => {
+                        tracing::warn!(
+                            "QUIC accept loop: the attempt consumer is gone; no longer accepting"
+                        );
+                        incoming.incoming.ignore();
+                        break;
+                    }
+                }
+            }
             tracing::debug!("QUIC accept loop stopped; parking");
+            drop(attempts);
+            drop(core);
             std::future::pending::<()>().await;
         });
         monitor.register("quic_accept_loop", handle);
@@ -677,65 +699,30 @@ impl QuicEndpoint {
         config: quinn::ClientConfig,
         peer: PeerKey,
     ) -> Result<QuicConnection, QuicConnectError> {
-        // Refused at once once the endpoint is poisoned, as quinn refuses a
-        // connect on a stopping endpoint (`EndpointDown`).
-        let down = || QuicConnectError::Connect(quinn::ConnectError::EndpointStopping);
-        let health = self.endpoint.health().clone();
-        if health.is_poisoned() {
-            return Err(down());
+        // Refused while the endpoint is down. After a death by a driver
+        // return quinn refuses it anyway; after a panic the socket adapter
+        // caught, quinn's endpoint driver may not have ended yet (it ends at
+        // its next receive).
+        if self.availability().get() == QuicAvailability::Down {
+            return Err(QuicConnectError::Connect(
+                quinn::ConnectError::EndpointStopping,
+            ));
         }
         let permit = self
             .sources
             .allow(addr)
             .ok_or(QuicConnectError::AllowSetFull)?;
-        let connecting = guard(&health, "connect", || {
-            self.endpoint
-                .connect_with(config, addr, config::SERVER_NAME)
-        })
-        .ok_or_else(down)??;
-        let connection = contain(&health, "connect", connecting)
-            .await
-            .ok_or_else(down)??;
-        Ok(QuicConnection::new(connection, permit, None, peer, health))
-    }
-}
-
-/// The accept loop's body ([`QuicEndpoint::spawn_accept_loop`]): returns
-/// when the endpoint is no longer `Up`, `accept` returns `None`, or the
-/// consumer is gone.
-async fn accept_until_stopped(
-    core: &EndpointCore,
-    availability: &mut QuicAvailabilityWatch,
-    attempts: &mpsc::Sender<QuicIncoming>,
-    full: &std::sync::atomic::AtomicU64,
-) {
-    loop {
-        let incoming = tokio::select! {
-            incoming = core.accept() => incoming,
-            _ = availability.not_up() => None,
-        };
-        let Some(incoming) = incoming else { break };
-        match attempts.try_send(incoming) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(incoming)) => {
-                let count = full.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                if count == 1 || count % 1024 == 0 {
-                    tracing::warn!(
-                        remote = %incoming.remote_address(),
-                        accept_queue_full = count,
-                        "QUIC accept queue full; ignoring the attempt"
-                    );
-                }
-                incoming.ignore();
-            }
-            Err(mpsc::error::TrySendError::Closed(incoming)) => {
-                tracing::warn!(
-                    "QUIC accept loop: the attempt consumer is gone; no longer accepting"
-                );
-                incoming.ignore();
-                break;
-            }
-        }
+        let connecting = self
+            .endpoint
+            .connect_with(config, addr, config::SERVER_NAME)?;
+        let connection = connecting.await?;
+        Ok(QuicConnection::new(
+            connection,
+            permit,
+            None,
+            peer,
+            self.availability(),
+        ))
     }
 }
 
@@ -748,19 +735,9 @@ impl EndpointCore {
     /// allow-set (which the demux socket should not pass on; it can happen
     /// when the permit was dropped after the datagram was queued), or that
     /// has no expected key (this endpoint's own outgoing connection to it is
-    /// what allowed it), is ignored. `None` once the endpoint is closed, or
-    /// at once when it is poisoned (`contain`).
+    /// what allowed it), is ignored. `None` once the endpoint is closed.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn accept(&self) -> Option<QuicIncoming> {
-        let health = self.endpoint.health().clone();
-        contain(&health, "accept", self.accept_attempt(&health))
-            .await
-            .flatten()
-    }
-
-    /// [`Self::accept`], run under `contain`: a panic or the endpoint's
-    /// poisoning leaks it, with any quinn `Incoming` it holds.
-    async fn accept_attempt(&self, health: &Arc<EndpointHealth>) -> Option<QuicIncoming> {
         loop {
             let incoming = self.endpoint.accept().await?;
             let remote = incoming.remote_address();
@@ -787,7 +764,8 @@ impl EndpointCore {
             let mut config = (*self.server).clone();
             config.crypto = Arc::new(tls);
             return Some(QuicIncoming {
-                incoming: Quinn::new(incoming, health.clone()),
+                availability: self.availability.clone(),
+                incoming,
                 permit,
                 config: Arc::new(config),
                 peer: expected,
@@ -800,8 +778,9 @@ impl EndpointCore {
 /// An incoming connection attempt from an allowed source, holding a permit
 /// for its address until the handshake ends.
 pub(crate) struct QuicIncoming {
-    /// Leaked instead of dropped once the endpoint is poisoned (`contain`).
-    incoming: Quinn<quinn::Incoming>,
+    incoming: quinn::Incoming,
+    /// The endpoint's availability, for the connection's watcher.
+    availability: QuicAvailabilityWatch,
     permit: QuicSourcePermit,
     /// The endpoint's server settings with TLS pinned to the key the
     /// source was allowed with.
@@ -814,42 +793,16 @@ pub(crate) struct QuicIncoming {
 
 impl QuicIncoming {
     /// Complete the handshake. On failure the permit is dropped with it.
-    /// Once the endpoint is poisoned it fails at once with `LocallyClosed`,
-    /// which `QuicEndpoint::error_kind` reads as `EndpointDown`.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn establish(self) -> Result<QuicConnection, quinn::ConnectionError> {
-        let refused = || quinn::ConnectionError::LocallyClosed;
-        let health = self.incoming.health().clone();
-        let incoming = self.incoming.into_inner().ok_or_else(refused)?;
-        let config = self.config;
-        // `catch`, not `guard`: the closure must run to consume `incoming`,
-        // whose unrun drop would lock the endpoint's state.
-        let connecting = catch(&health, "establish", move || incoming.accept_with(config))
-            .ok_or_else(refused)??;
-        let connection = contain(&health, "establish", connecting)
-            .await
-            .ok_or_else(refused)??;
+        let connection = self.incoming.accept_with(self.config)?.await?;
         Ok(QuicConnection::new(
             connection,
             self.permit,
             Some(self.hold),
             self.peer,
-            health,
+            self.availability,
         ))
-    }
-
-    /// The attempt's source address (quinn takes no lock for it).
-    pub(crate) fn remote_address(&self) -> SocketAddr {
-        self.incoming.remote_address()
-    }
-
-    /// Refuse the attempt without answering it (quinn's `ignore`). Once the
-    /// endpoint is poisoned the attempt is leaked instead.
-    pub(crate) fn ignore(self) {
-        let health = self.incoming.health().clone();
-        if let Some(incoming) = self.incoming.into_inner() {
-            catch(&health, "ignore", move || incoming.ignore());
-        }
     }
 }
 
@@ -857,8 +810,7 @@ impl QuicIncoming {
 /// socket's allow-set until the connection ends: closed by either side,
 /// timed out, failed, or dropped here (dropping closes it).
 pub(crate) struct QuicConnection {
-    /// Leaked instead of dropped once the endpoint is poisoned (`contain`).
-    connection: Quinn<quinn::Connection>,
+    connection: quinn::Connection,
     /// Closes the connection at most once, shared with the path's receive
     /// supervisor.
     closer: QuicCloser,
@@ -869,7 +821,7 @@ pub(crate) struct QuicConnection {
 impl std::fmt::Debug for QuicConnection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("QuicConnection")
-            .field("remote", &self.closer.remote)
+            .field("remote", &self.connection.remote_address())
             .finish_non_exhaustive()
     }
 }
@@ -880,31 +832,31 @@ impl QuicConnection {
         permit: QuicSourcePermit,
         hold: Option<KeyHold>,
         peer: PeerKey,
-        health: Arc<EndpointHealth>,
+        mut availability: QuicAvailabilityWatch,
     ) -> Self {
-        // The permit's address is the peer's, normalized as the demux keys
-        // it; read here so nothing later takes quinn's lock just for it.
-        let remote = permit.addr();
-        let connection = Quinn::new(connection, health.clone());
-        let closer = QuicCloser::new(connection.clone(), remote);
+        let closer = QuicCloser::new(connection.clone());
         // The watcher holds the permit, and on the server side the hold
         // binding the address to the client's key, until quinn reports the
         // connection closed, however it ends. Dropping this handle closes it
         // explicitly (see Drop), because the watcher's clone keeps quinn from
-        // closing it implicitly. If the endpoint is poisoned first, the
-        // watcher closes the connection with DOWNGRADE where its state is
-        // intact (`QuicCloser::close_after_poison`) and lets the address go.
+        // closing it implicitly. When the endpoint goes Down the watcher
+        // closes the connection with DOWNGRADE: after a panic the socket
+        // adapter caught, this connection's driver may have ended without
+        // closing it, and a local close is what makes calls waiting on it
+        // return an error (quinn's close fails them at once, driver or not).
         let watched = connection.clone();
-        let watch_closer = closer.clone();
+        let down_closer = closer.clone();
         GlobalExecutor::spawn(async move {
-            match contain(&health, "connection watcher", watched.closed()).await {
-                Some(reason) => {
-                    tracing::debug!(%reason, %remote, "QUIC connection ended");
-                }
-                None => {
-                    watch_closer.close_after_poison(QuicCloseCode::Downgrade);
+            tokio::select! {
+                _ = watched.closed() => {}
+                seen = availability.not_up() => {
+                    if seen == QuicAvailability::Down {
+                        down_closer.close(QuicCloseCode::Downgrade);
+                    }
                 }
             }
+            let reason = watched.closed().await;
+            tracing::debug!(%reason, remote = %watched.remote_address(), "QUIC connection ended");
             drop(hold);
             drop(permit);
         });
@@ -923,21 +875,10 @@ impl QuicConnection {
         &self.peer
     }
 
-    /// The quinn connection. Call into it only under `contain` or `guard`.
+    /// The quinn connection.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn inner(&self) -> &quinn::Connection {
         &self.connection
-    }
-
-    /// A handle to the quinn connection that is leaked instead of dropped
-    /// once the endpoint is poisoned.
-    pub(crate) fn quinn(&self) -> Quinn<quinn::Connection> {
-        self.connection.clone()
-    }
-
-    /// The health of the endpoint this connection belongs to.
-    pub(crate) fn health(&self) -> &Arc<EndpointHealth> {
-        self.connection.health()
     }
 }
 
@@ -967,24 +908,17 @@ impl Drop for QuicConnection {
 /// Every close the QUIC code sends goes through here.
 #[derive(Clone)]
 pub(crate) struct QuicCloser {
-    connection: Quinn<quinn::Connection>,
-    /// The peer's address, for the close counter and logs.
-    remote: SocketAddr,
+    connection: quinn::Connection,
     /// Set by the first close attempt, in one step: a second caller, on
     /// any thread, sends and counts nothing.
     closing: Arc<std::sync::atomic::AtomicBool>,
-    /// Whether the connection's own state was intact when the endpoint was
-    /// poisoned, found by [`Self::close_after_poison`] once.
-    intact_after_poison: Arc<std::sync::OnceLock<bool>>,
 }
 
 impl QuicCloser {
-    fn new(connection: Quinn<quinn::Connection>, remote: SocketAddr) -> Self {
+    fn new(connection: quinn::Connection) -> Self {
         Self {
             connection,
-            remote,
             closing: Arc::default(),
-            intact_after_poison: Arc::default(),
         }
     }
 
@@ -995,66 +929,16 @@ impl QuicCloser {
     /// reports (the peer's close) with LocallyClosed. A peer close landing
     /// between the check and `close` is still reported as LocallyClosed and
     /// counted; two local closers can no longer both count.
-    ///
-    /// Once the endpoint is poisoned this touches nothing and returns
-    /// `false`: the connection's watcher closes it then
-    /// ([`Self::close_after_poison`]).
     pub(crate) fn close(&self, code: QuicCloseCode) -> bool {
-        let health = self.connection.health();
-        if health.is_poisoned() {
-            return false;
-        }
         if self.closing.swap(true, std::sync::atomic::Ordering::AcqRel) {
             return false;
         }
-        guard(health, "close", || self.close_if_open(code)).unwrap_or(false)
-    }
-
-    /// Close with `code` and count it if the connection is still open.
-    fn close_if_open(&self, code: QuicCloseCode) -> bool {
         if self.connection.close_reason().is_some() {
             return false;
         }
-        TRANSPORT_METRICS.record_quic_close_sent(code, self.remote);
+        TRANSPORT_METRICS.record_quic_close_sent(code, self.connection.remote_address());
         self.connection.close(code.code().into(), code.reason());
         true
-    }
-
-    /// After the endpoint was poisoned: close the connection with `code` if
-    /// no close was attempted before and it is still open, and return
-    /// whether the connection's own state is intact. The answer is found
-    /// once, by the first caller, and remembered.
-    ///
-    /// The one call into quinn made after the endpoint is poisoned (see
-    /// `contain`). A panic in the endpoint driver leaves every connection's
-    /// state intact, so the close reaches the peer and the connection's
-    /// streams end with an error. A connection whose own driver panicked has
-    /// its lock poisoned: the call panics at the lock, holding nothing, and
-    /// the panic is caught here and not counted again (the peer then finds
-    /// out by its idle timeout).
-    pub(crate) fn close_after_poison(&self, code: QuicCloseCode) -> bool {
-        *self.intact_after_poison.get_or_init(|| {
-            let probed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                if !self.closing.swap(true, std::sync::atomic::Ordering::AcqRel) {
-                    self.close_if_open(code);
-                } else {
-                    // Still takes the lock, which is the check.
-                    let _ = self.connection.close_reason();
-                }
-            }));
-            if probed.is_err() {
-                tracing::debug!(
-                    remote = %self.remote,
-                    "QUIC connection's own state is poisoned; leaving it for the peer's idle timeout"
-                );
-            }
-            probed.is_ok()
-        })
-    }
-
-    /// The peer's address.
-    pub(crate) fn remote(&self) -> SocketAddr {
-        self.remote
     }
 
     /// Mark a close as in progress without closing (tests: a second
