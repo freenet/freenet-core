@@ -8844,7 +8844,10 @@ async fn test_connection_growth_stall_regression() {
 
     // Connection identity tripwire: through formation and 20% message loss,
     // no connection is closed or refused for naming a key other than the one
-    // it is bound to, and none is bound to a node's own key. A delta over
+    // it is bound to, and none is bound to a node's own key. Keepalive is off
+    // under virtual time, so an idle dial here would always look quiet to the
+    // hold window; that it is never tested is what `claim_held_by_dial` and
+    // `quiet_dial_replaced` staying at zero shows. A delta over
     // this test's run: the totals are process-wide and never reset, so under
     // plain `cargo test` other simulations in the binary add to them too
     // (none of them is expected to produce these kinds either). This guards
@@ -8860,7 +8863,16 @@ async fn test_connection_growth_stall_regression() {
         delta("set_dialed") > 0,
         "premise: identity decisions were counted ({after:?})"
     );
-    for kind in ["changed_connect_request", "changed_connect_peer", "own_key"] {
+    // No two connections claim one key in this network either, so nothing
+    // is held back, replaced or bound twice.
+    for kind in [
+        "changed_connect_request",
+        "changed_connect_peer",
+        "own_key",
+        "duplicate_key",
+        "claim_held_by_dial",
+        "quiet_dial_replaced",
+    ] {
         assert_eq!(
             delta(kind),
             0,

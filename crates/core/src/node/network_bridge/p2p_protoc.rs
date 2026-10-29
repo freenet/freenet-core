@@ -1554,9 +1554,9 @@ impl P2pConnManager {
         let mut loop_iteration_count = 0u64;
         let mut slow_event_count = 0u64;
         let mut last_stats_log = Instant::now();
-        // A claim held back by a dialled connection is bound once that
-        // connection has not been heard from for `identity::HOLD_WINDOW`; this
-        // is how often that is checked (on the next event after it is due).
+        // How often pending identity claims are retried while one may exist
+        // (`P2pConnManager::retry_pending_claims`). The retry deadline is part
+        // of the loop's timer wake-up, so it runs on a node with no events.
         const PENDING_CLAIM_RETRY_INTERVAL: Duration = Duration::from_secs(5);
         let mut last_pending_claim_retry = Instant::now();
         const STATS_LOG_INTERVAL: Duration = Duration::from_secs(30);
@@ -1577,13 +1577,23 @@ impl P2pConnManager {
                     return Err(listener_exit_error(&exit));
                 },
 
-                // Also wakes for a zombie sweep backlog deadline, so a backlog
-                // drains on a quiet node (see `zombie_sweep::next_wake`).
-                wake = zombie_sweep::next_wake(&mut select_stream, zombie_sweep_state.backlog_deadline()) => {
+                // Also wakes for a zombie sweep backlog deadline and for the
+                // pending-claim retry deadline, so both run on a quiet node
+                // (see `zombie_sweep::next_wake`).
+                wake = zombie_sweep::next_wake(
+                    &mut select_stream,
+                    zombie_sweep::earliest(
+                        zombie_sweep_state.backlog_deadline(),
+                        ctx.pending_claim_retry_deadline(
+                            last_pending_claim_retry,
+                            PENDING_CLAIM_RETRY_INTERVAL,
+                        ),
+                    ),
+                ) => {
                     match wake {
                         zombie_sweep::LoopWake::Event(Some(result)) => Some(result),
                         zombie_sweep::LoopWake::Event(None) => break,
-                        zombie_sweep::LoopWake::ZombieSweepDue => None,
+                        zombie_sweep::LoopWake::TimerDue => None,
                     }
                 },
             };
@@ -1620,16 +1630,19 @@ impl P2pConnManager {
                 }
                 event
             } else {
-                // Woken only for a zombie sweep backlog slice; it runs below.
+                // Woken only for a timer (a zombie sweep backlog slice or the
+                // pending-claim retry); both run below.
                 EventResult::Continue
             };
 
-            // Periodic stats logging
-            if last_pending_claim_retry.elapsed() > PENDING_CLAIM_RETRY_INTERVAL {
-                ctx.retry_pending_claims().await;
+            if last_pending_claim_retry.elapsed() >= PENDING_CLAIM_RETRY_INTERVAL {
+                if ctx.addr_by_pub_key.may_have_pending_claims() {
+                    ctx.retry_pending_claims(&handshake_cmd_sender).await;
+                }
                 last_pending_claim_retry = Instant::now();
             }
 
+            // Periodic stats logging
             if last_stats_log.elapsed() > STATS_LOG_INTERVAL {
                 let notifier = &op_manager.to_event_listener;
                 let transport_connections = ctx.connections.len();
@@ -2334,16 +2347,15 @@ impl P2pConnManager {
                                             ctx.handle_broadcast_ready_state(false).await;
                                         }
 
-                                        // Per-peer state goes only with the last
-                                        // connection bound to the key.
+                                        // Per-peer state goes only when no
+                                        // connection bound to the key is left in
+                                        // the ring, decided as on every other
+                                        // disconnect path.
                                         if let Some(ref pub_key) = pub_key_opt {
-                                            if ctx.unbind_identity(peer_addr, pub_key)
-                                                == Release::Released
-                                            {
-                                                ctx.bridge
-                                                    .op_manager
-                                                    .on_ring_connection_lost(pub_key);
-                                            }
+                                            ctx.unbind_identity(peer_addr, pub_key);
+                                            ctx.forget_peer_state_unless_in_ring(
+                                                pub_key, peer_addr,
+                                            );
                                         }
 
                                         // Remove from connection map

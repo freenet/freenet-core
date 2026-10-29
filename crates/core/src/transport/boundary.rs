@@ -541,10 +541,6 @@ pub(crate) trait PeerConnectionApi: Send {
     /// `None` as "unsupported" when gating version-dependent message types.
     fn remote_version(&self) -> Option<(u8, u8, u16)>;
 
-    /// Why `recv` ended this connection, when the transport knows. Read
-    /// after `recv` returns an error, to label the disconnect in telemetry.
-    /// `None` means an ordinary transport closure. Defaults to `None` for
-    /// test doubles.
     /// When this connection last received an authenticated packet (any
     /// packet that decrypted under the session key, keepalives included).
     /// `None` when the connection does not track it, as for test doubles.
@@ -552,6 +548,10 @@ pub(crate) trait PeerConnectionApi: Send {
         None
     }
 
+    /// Why `recv` ended this connection, when the transport knows. Read
+    /// after `recv` returns an error, to label the disconnect in telemetry.
+    /// `None` means an ordinary transport closure. Defaults to `None` for
+    /// test doubles.
     fn close_reason(&self) -> Option<CloseReason> {
         None
     }
