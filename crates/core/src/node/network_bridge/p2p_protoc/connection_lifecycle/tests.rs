@@ -1192,8 +1192,12 @@ impl DriverRig {
 /// key the connect op dialled. The ConnectPeer that follows reuses it and
 /// promotes nothing again. This node's key is never stored or promoted.
 ///
-/// The simulation never takes the matched path (its hole punches complete on
-/// the dialling side), so this is the test that covers it. The watched
+/// The simulation rarely takes the matched path: its hole punches complete
+/// on the dialling side, and the other way in, a reconnection accepted from
+/// an address with a live session while an expectation for it is live, needs
+/// a restart inside the expectation window (see
+/// `restart_accept_with_a_live_expectation_binds_a_claim`). So this test and
+/// that one cover it. The watched
 /// `expected_inbound_bound` record is counted only when the driver reported
 /// the connection as matched with a key, so it proves the matched path ran.
 #[tokio::test]
@@ -1729,4 +1733,246 @@ fn identity_is_written_only_by_bind_identity() {
             "premise: bind_identity writes {pattern}"
         );
     }
+}
+
+/// This node as a NON-gateway on a mock-socket transport with the real
+/// handshake driver, and a remote gateway at a fixed address that this node
+/// dials. The remote can then be stopped and a new node started at its
+/// address, with the same key or another one, which reconnects to this
+/// node. A non-gateway accepts that reconnection only on its restart path
+/// (an intro from an address with an established session).
+struct RestartRig {
+    driver: HandshakeHandler,
+    commands: HandshakeCommandSender,
+    channels: crate::transport::mock_transport::Channels,
+    node_key: TransportPublicKey,
+    node_addr: SocketAddr,
+    remote_addr: SocketAddr,
+    remote: Option<(
+        crate::transport::connection_handler::OutboundConnectionHandler<
+            crate::transport::mock_transport::MockSocket,
+        >,
+        mpsc::Receiver<
+            crate::transport::PeerConnection<crate::transport::mock_transport::MockSocket>,
+        >,
+    )>,
+}
+
+impl RestartRig {
+    /// `ports` are this node's and the remote's, unique per test: identity
+    /// telemetry is watched per address, process-wide.
+    async fn new(h: &Harness, ports: (u16, u16), remote_keypair: TransportKeypair) -> Self {
+        use crate::transport::mock_transport::create_mock_node_at_addr;
+        let channels: crate::transport::mock_transport::Channels = Default::default();
+        let node_addr: SocketAddr = (Ipv4Addr::LOCALHOST, ports.0).into();
+        let remote_addr: SocketAddr = (Ipv4Addr::LOCALHOST, ports.1).into();
+        let node_keypair = TransportKeypair::new();
+        let node_key = node_keypair.public().clone();
+        let (node_outbound, node_accepted) =
+            create_mock_node_at_addr(false, node_addr, node_keypair, channels.clone())
+                .await
+                .expect("mock node");
+        let remote = create_mock_node_at_addr(true, remote_addr, remote_keypair, channels.clone())
+            .await
+            .expect("mock remote");
+        let (driver, commands) = HandshakeHandler::new(
+            Box::new(MockAcceptor(node_accepted)),
+            Arc::new(node_outbound),
+            h.mgr.bridge.op_manager.ring.connection_manager.clone(),
+            h.mgr.bridge.op_manager.ring.router.clone(),
+            None,
+            false,
+            None,
+            Arc::new(crate::util::time_source::InstantTimeSrc::new()),
+        );
+        Self {
+            driver,
+            commands,
+            channels,
+            node_key,
+            node_addr,
+            remote_addr,
+            remote: Some(remote),
+        }
+    }
+
+    /// The next handshake event, handled by the event loop's handler.
+    async fn handle_next_event(&mut self, h: &mut Harness) -> &'static str {
+        use futures::StreamExt;
+        let event = tokio::time::timeout(Duration::from_secs(20), self.driver.next())
+            .await
+            .expect("the driver reports an event")
+            .expect("the driver is running");
+        let kind = match &event {
+            HandshakeEvent::InboundConnection {
+                matched: HandshakeInboundMatch::Expected(Some(_)),
+                ..
+            } => "inbound_matched",
+            HandshakeEvent::InboundConnection { .. } => "inbound",
+            HandshakeEvent::OutboundEstablished { .. } => "outbound_established",
+            HandshakeEvent::OutboundFailed { .. } => "outbound_failed",
+        };
+        h.mgr
+            .handle_handshake_action(event, &mut h.state, &self.commands)
+            .await
+            .expect("handle_handshake_action");
+        kind
+    }
+
+    /// The connect op dials the remote under `key`, and the dial completes.
+    async fn dial_remote(&mut self, h: &mut Harness, key: &TransportPublicKey) {
+        let (callback, mut result_rx) = mpsc::channel(1);
+        h.mgr
+            .handle_connect_peer(
+                PeerKeyLocation::new(key.clone(), self.remote_addr),
+                Box::new(callback),
+                Transaction::new::<ConnectMsg>(),
+                &self.commands,
+                &mut h.state,
+                false,
+                crate::transport::NatAttemptOrigin::ConnectJoiner,
+            )
+            .await
+            .expect("handle_connect_peer");
+        assert_eq!(self.handle_next_event(h).await, "outbound_established");
+        assert!(
+            matches!(result_rx.try_recv(), Ok(Ok(_))),
+            "the dial succeeded"
+        );
+    }
+
+    /// A connect op expects the remote's address under `key`; the driver has
+    /// processed the registration when this returns.
+    async fn expect_remote(&self, h: &Harness, key: &TransportPublicKey) {
+        P2pConnManager::handle_expect_peer_connection(
+            self.remote_addr,
+            key.clone(),
+            &h.state,
+            &self.commands,
+        );
+        let (done, processed) = tokio::sync::oneshot::channel();
+        assert!(self.commands.try_send(HandshakeCommand::Barrier(done)));
+        tokio::time::timeout(Duration::from_secs(5), processed)
+            .await
+            .expect("the driver processes commands")
+            .expect("the driver is running");
+    }
+
+    /// Stops the remote and starts a new node at its address with `keypair`,
+    /// which dials this node. Returns the dial.
+    async fn restart_remote(&mut self, keypair: TransportKeypair) -> tokio::task::JoinHandle<bool> {
+        use crate::transport::mock_transport::create_mock_node_at_addr;
+        drop(self.remote.take());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let (outbound, accepted) =
+            create_mock_node_at_addr(false, self.remote_addr, keypair, self.channels.clone())
+                .await
+                .expect("restarted remote");
+        let (node_key, node_addr) = (self.node_key.clone(), self.node_addr);
+        tokio::spawn(async move {
+            let _accepted = accepted;
+            let pending = OutboundConnector::connect(
+                &outbound,
+                node_key,
+                node_addr,
+                crate::transport::NatAttemptOrigin::ConnectJoiner,
+            )
+            .await;
+            let ok = matches!(
+                tokio::time::timeout(Duration::from_secs(10), pending).await,
+                Ok(Ok(_))
+            );
+            // Keep the restarted node's transport up while the test inspects.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            drop(outbound);
+            ok
+        })
+    }
+}
+
+/// A non-gateway accepts a reconnection from an address it has an
+/// established session with (the remote restarted there), and the handshake
+/// driver matches it to an expectation for that address that is still live.
+/// The connection is bound to the expected key as a claim, replacing the
+/// dialled connection at the address, and `expected_inbound_bound` is
+/// counted on a node that is not a gateway.
+#[tokio::test]
+async fn restart_accept_with_a_live_expectation_binds_a_claim() {
+    let mut h = Harness::new("conn-identity-restart-accept").await;
+    let remote_keypair = TransportKeypair::new();
+    let remote_key = remote_keypair.public().clone();
+    let mut rig = RestartRig::new(&h, (49311, 49321), remote_keypair.clone()).await;
+    let remote_addr = rig.remote_addr;
+    watch(&[remote_addr]);
+
+    rig.dial_remote(&mut h, &remote_key).await;
+    assert_eq!(bound_source(&h, remote_addr), Some(IdentitySource::Dialled));
+    rig.expect_remote(&h, &remote_key).await;
+
+    let dial = rig.restart_remote(remote_keypair).await;
+    assert_eq!(
+        rig.handle_next_event(&mut h).await,
+        "inbound_matched",
+        "the reconnection is accepted and matched to the live expectation"
+    );
+
+    assert_eq!(
+        seen(remote_addr),
+        vec![ConnIdentity::SetDialed, ConnIdentity::ExpectedInboundBound]
+    );
+    assert_eq!(h.mgr.connections[&remote_addr].pub_key(), Some(&remote_key));
+    assert_eq!(bound_source(&h, remote_addr), Some(IdentitySource::Claimed));
+    assert_eq!(h.mgr.addr_by_pub_key.get(&remote_key), Some(&remote_addr));
+    assert_eq!(h.ring_key_at(remote_addr).as_ref(), Some(&remote_key));
+    h.assert_own_key_absent();
+    assert!(
+        dial.await.expect("dial task"),
+        "the restarted node's dial completes"
+    );
+}
+
+/// As above, but another peer, with another key, reconnects from the address
+/// inside the expectation window. The match binds the expected key as a
+/// claim; when the peer names its own key in a ConnectRequest, the connection
+/// is closed and nothing stays recorded or promoted under either key.
+#[tokio::test]
+async fn restart_accept_by_another_peer_is_closed_when_it_names_itself() {
+    let mut h = Harness::new("conn-identity-restart-other-peer").await;
+    let first_keypair = TransportKeypair::new();
+    let first_key = first_keypair.public().clone();
+    let mut rig = RestartRig::new(&h, (49312, 49322), first_keypair).await;
+    let remote_addr = rig.remote_addr;
+    watch(&[remote_addr]);
+
+    rig.dial_remote(&mut h, &first_key).await;
+    rig.expect_remote(&h, &first_key).await;
+
+    let other_keypair = TransportKeypair::new();
+    let other_key = other_keypair.public().clone();
+    let dial = rig.restart_remote(other_keypair).await;
+    assert_eq!(rig.handle_next_event(&mut h).await, "inbound_matched");
+    assert_eq!(h.mgr.connections[&remote_addr].pub_key(), Some(&first_key));
+    assert_eq!(bound_source(&h, remote_addr), Some(IdentitySource::Claimed));
+
+    h.refused_connect_request(
+        remote_addr,
+        PeerKeyLocation::with_unknown_addr(other_key.clone()),
+    )
+    .await;
+    assert_eq!(
+        seen(remote_addr),
+        vec![
+            ConnIdentity::SetDialed,
+            ConnIdentity::ExpectedInboundBound,
+            ConnIdentity::ChangedConnectRequest,
+        ]
+    );
+    assert!(!h.mgr.connections.contains_key(&remote_addr), "closed");
+    assert!(!h.mgr.addr_by_pub_key.contains_key(&first_key));
+    assert!(!h.mgr.addr_by_pub_key.contains_key(&other_key));
+    assert_eq!(h.ring_key_at(remote_addr), None);
+    assert!(
+        dial.await.expect("dial task"),
+        "the other peer's dial completed"
+    );
 }
