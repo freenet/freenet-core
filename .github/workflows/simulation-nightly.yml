@@ -268,23 +268,20 @@ jobs:
       # BBR and LEDBAT++ are #[ignore]d as known failures (#5929, #5930). Run
       # them anyway so they keep running to their verdict. This step fails if
       # one now PASSES on every seed (remove its #[ignore] and close the
-      # issue), or fails in a way its expected failure does not cover: every
-      # per-seed reason must match the test's allowed list below, so a new
-      # failure mode cannot hide behind a known one.
+      # issue), or fails in a way its expected failure does not cover, judged
+      # seed by seed by scripts/wan-bench-classify.sh (rules in its header,
+      # tested by scripts/wan-bench-classify_test.sh), so a new failure mode
+      # cannot hide behind a known one.
       - name: R1 and R1b, known failures (BBR, LEDBAT++) still fail the known way
         if: ${{ !cancelled() && steps.present.outputs.run == 'true' }}
         timeout-minutes: 40
         env:
           FREENET_WAN_BENCH_SEEDS: ${{ steps.seeds.outputs.list }}
         run: |
-          # Allowed per-seed reasons. A stream that aborts before the spiked
-          # ACKs return also leaves no evidence the spike drove its timers.
-          slow='^(did not complete within |goodput never reached )'
-          abort='^(did not complete within |goodput never reached |sender gave up on the stream )'
-          abort_early='^(did not complete within |goodput never reached |sender gave up on the stream |no evidence the spike drove)'
           status=0
+          # check <test> <max seeds that may abort the stream, or "all">
           check() {
-            test_name=$1 allowed=$2
+            test_name=$1 max_aborts=$2
             set +e
             cargo nextest run -p freenet --lib --profile nightly --no-capture --run-ignored only \
               -E "test(/link_model::r1_tests::${test_name}\$/)" > "${test_name}.log" 2>&1
@@ -296,23 +293,20 @@ jobs:
               status=1
               return
             fi
-            if ! grep -qE '^R1b? failed for' "${test_name}.log"; then
-              echo "::error::${test_name} failed without reaching its verdict (panic, hang or build error)"
-              status=1
-              return
-            fi
-            unexpected=$(sed -nE 's/^  seed 0x[0-9a-f]+: //p' "${test_name}.log" | grep -vE "$allowed" || true)
-            if [ -n "$unexpected" ]; then
+            if ! uncovered=$(bash scripts/wan-bench-classify.sh "${test_name}.log" "$max_aborts"); then
               echo "::error::${test_name} failed in a way its known failure does not cover:"
-              echo "$unexpected" | sort | uniq -c
+              echo "$uncovered" | sort | uniq -c
               status=1
             fi
           }
-          check r1_spike_recovery_bbr "$abort_early"
-          check r1_spike_recovery_ledbat "$abort_early"
-          # At the shorter stall BBR has never aborted; an abort would be new.
-          check r1b_spike_recovery_bbr "$slow"
-          check r1b_spike_recovery_ledbat "$abort_early"
+          check r1_spike_recovery_bbr all
+          check r1_spike_recovery_ledbat all
+          # BBR also aborts at the shorter stall when the one ACK batch for its
+          # initial window is lost: no ACK returns until an RTO (1 s) plus the
+          # spike, past the 3 s cwnd-wait timeout. Seen on 2 of 160 nightly
+          # seeds (7228, 7299), at most 1 in a night's 20; more than 4 is new.
+          check r1b_spike_recovery_bbr 4
+          check r1b_spike_recovery_ledbat all
           exit "$status"
 
   # Notify the Freenet dev room on failure.
