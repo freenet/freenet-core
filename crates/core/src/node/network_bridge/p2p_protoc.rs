@@ -538,6 +538,10 @@ struct ConnectionEntry {
     /// until it is first named. Only the `identity` module can change it
     /// (through `P2pConnManager::bind_identity`).
     identity: identity::IdentitySlot,
+    /// When the transport last received an authenticated packet on this
+    /// connection, if it reports it. A dialled identity holds its key
+    /// against a claim only while this is recent (`identity::HOLD_WINDOW`).
+    receipt: Option<crate::transport::ReceiptStamp>,
     /// Unique ID for this connection entry. Used to distinguish stale
     /// TransportClosed events from replaced connections (e.g., a new
     /// connection at the same address).
@@ -1550,6 +1554,11 @@ impl P2pConnManager {
         let mut loop_iteration_count = 0u64;
         let mut slow_event_count = 0u64;
         let mut last_stats_log = Instant::now();
+        // A claim held back by a dialled connection is bound once that
+        // connection has not been heard from for `identity::HOLD_WINDOW`; this
+        // is how often that is checked (on the next event after it is due).
+        const PENDING_CLAIM_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+        let mut last_pending_claim_retry = Instant::now();
         const STATS_LOG_INTERVAL: Duration = Duration::from_secs(30);
         let mut zombie_sweep_state = ZombieSweepState::new(Instant::now());
         const SLOW_EVENT_THRESHOLD: Duration = Duration::from_millis(100);
@@ -1616,6 +1625,11 @@ impl P2pConnManager {
             };
 
             // Periodic stats logging
+            if last_pending_claim_retry.elapsed() > PENDING_CLAIM_RETRY_INTERVAL {
+                ctx.retry_pending_claims().await;
+                last_pending_claim_retry = Instant::now();
+            }
+
             if last_stats_log.elapsed() > STATS_LOG_INTERVAL {
                 let notifier = &op_manager.to_event_listener;
                 let transport_connections = ctx.connections.len();
@@ -5030,6 +5044,7 @@ pub(crate) mod tests {
             super::ConnectionEntry {
                 sender: tx1,
                 identity: Default::default(),
+                receipt: None,
                 connection_id: 10,
                 created_at: Instant::now(),
                 link_use: super::zombie_sweep::LinkUseStamp::new(Instant::now()),
@@ -5042,6 +5057,7 @@ pub(crate) mod tests {
             super::ConnectionEntry {
                 sender: tx2,
                 identity: Default::default(),
+                receipt: None,
                 connection_id: 20,
                 created_at: Instant::now(),
                 link_use: super::zombie_sweep::LinkUseStamp::new(Instant::now()),

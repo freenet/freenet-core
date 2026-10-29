@@ -8642,6 +8642,10 @@ async fn test_connection_growth_stall_regression() {
 
     const SEED: u64 = 0x3408_3398_0001;
     const NETWORK_NAME: &str = "connection-growth-stall";
+    let identity_before: std::collections::BTreeMap<_, _> =
+        freenet::dev_tool::conn_identity_totals()
+            .into_iter()
+            .collect();
     const GATEWAYS: usize = 2;
     const NODES: usize = 15;
     const RING_MAX_HTL: usize = 7;
@@ -8838,20 +8842,30 @@ async fn test_connection_growth_stall_regression() {
         NODES
     );
 
-    // Connection identity: through formation and 20% message loss, no
-    // connection is closed or refused for naming a key other than the one it
-    // is bound to, and none is bound to a node's own key. Process-wide
-    // totals: under nextest this process runs only this test.
-    let totals: std::collections::BTreeMap<_, _> = freenet::dev_tool::conn_identity_totals()
+    // Connection identity tripwire: through formation and 20% message loss,
+    // no connection is closed or refused for naming a key other than the one
+    // it is bound to, and none is bound to a node's own key. A delta over
+    // this test's run: the totals are process-wide and never reset, so under
+    // plain `cargo test` other simulations in the binary add to them too
+    // (none of them is expected to produce these kinds either). This guards
+    // against a regression in ordinary formation; it is not evidence that
+    // the refusals work, which the lifecycle unit tests cover. The kinds are
+    // also zero on releases before connection identity was fixed.
+    let after: std::collections::BTreeMap<_, _> = freenet::dev_tool::conn_identity_totals()
         .into_iter()
         .collect();
-    tracing::info!(?totals, "connection identity totals");
+    tracing::info!(?after, "connection identity totals");
+    let delta = |kind: &str| after[kind] - identity_before[kind];
     assert!(
-        totals["set_dialed"] > 0,
-        "premise: identity decisions were counted ({totals:?})"
+        delta("set_dialed") > 0,
+        "premise: identity decisions were counted ({after:?})"
     );
     for kind in ["changed_connect_request", "changed_connect_peer", "own_key"] {
-        assert_eq!(totals[kind], 0, "{kind} in {totals:?}");
+        assert_eq!(
+            delta(kind),
+            0,
+            "{kind}: before {identity_before:?}, after {after:?}"
+        );
     }
 }
 

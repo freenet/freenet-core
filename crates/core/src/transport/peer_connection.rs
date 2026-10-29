@@ -3498,6 +3498,14 @@ impl<S: super::Socket> super::PeerConnectionApi for PeerConnection<S> {
         close_reason_from_flags(self.closed_by_idle_timeout, self.closed_by_stream_refusals)
     }
 
+    fn receipt_stamp(&self) -> Option<super::ReceiptStamp> {
+        let time_source = self.remote_conn.time_source.clone();
+        Some(super::ReceiptStamp::new(
+            self.last_inbound_nanos.clone(),
+            std::sync::Arc::new(move || time_source.now_nanos()),
+        ))
+    }
+
     fn send_bytes(
         &mut self,
         data: Vec<u8>,

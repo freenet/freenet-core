@@ -141,9 +141,9 @@ labelled_counters! {
         /// bound to. The connection keeps its key: the request is dropped
         /// and the connection closed.
         ChangedConnectRequest => "changed_connect_request",
-        /// The ConnectRequest counted by one of the three kinds above gave the
-        /// joiner a known address equal to the connection's remote address,
-        /// rather than an unknown one.
+        /// A ConnectRequest counted by one of the three kinds above, or by
+        /// `claim_held_by_dial`, gave the joiner a known address equal to the
+        /// connection's remote address, rather than an unknown one.
         ConnectRequestKnownAddr => "connect_request_known_addr",
         /// A ConnectPeer for an existing connection gave the key of a
         /// connection that had none.
@@ -154,16 +154,18 @@ labelled_counters! {
         /// one it is bound to. The connection keeps its key and is not
         /// promoted; the connect op is told the connection failed.
         ChangedConnectPeer => "changed_connect_peer",
-        /// A claimed key (an expected-inbound match, a ConnectRequest, or a
-        /// ConnectPeer for a connection without one) was not bound because
-        /// another open connection is bound to it from a dial. The claiming
-        /// connection stays without an identity, with the claim kept pending
-        /// until the dialled connection closes (`pending_claim_bound`); a
-        /// ConnectRequest carrying the claim is dropped.
+        /// An attempt to bind a claimed key (an expected-inbound match or a
+        /// ConnectRequest) was refused because another open connection is
+        /// bound to it from a dial that was heard from within the last 15 s.
+        /// Counted per attempt, so a connection whose peer repeats its
+        /// ConnectRequest counts once per request. The claiming connection
+        /// stays without an identity, with the claim kept pending until the
+        /// dial closes or goes quiet (`pending_claim_bound`); a ConnectRequest
+        /// carrying the claim is dropped.
         ClaimHeldByDial => "claim_held_by_dial",
-        /// A claim held back by `claim_held_by_dial` was bound after the
-        /// dialled connection holding its key closed, on the connection that
-        /// made it.
+        /// A claim held back by `claim_held_by_dial` was bound later, on the
+        /// connection that made it, after the dialled connection holding its
+        /// key closed or went quiet.
         PendingClaimBound => "pending_claim_bound",
         /// A connection was bound to this node's own key, on any path.
         OwnKey => "own_key",
@@ -173,17 +175,19 @@ labelled_counters! {
         /// refused (`claim_held_by_dial`).
         DuplicateKey => "duplicate_key",
         /// Cleanup ran for a connection whose key is mapped to a different
-        /// connection. Counted on transport close, on an explicit drop, on
-        /// the unpromoted-connection sweep and when a new connection at the
-        /// same address replaces the entry; not on the cleanup when the event
-        /// loop shuts down.
+        /// connection. That connection keeps the mapping and the peer's
+        /// state. Counted on transport close, on an explicit drop, on the
+        /// unpromoted-connection sweep and when a new connection at the same
+        /// address replaces the entry; not on the cleanup when the event loop
+        /// shuts down.
         TeardownKeyElsewhere => "teardown_key_elsewhere",
         /// Cleanup, on the same paths, ran for a connection with no bound
         /// key, so no per-peer cleanup ran for it.
         TeardownUnidentified => "teardown_unidentified",
         /// Cleanup, on the same paths, ran for a connection whose key is not
-        /// mapped to any connection (for example, an earlier cleanup of
-        /// another connection with the same key removed the mapping).
+        /// mapped to any connection. Expected to stay at zero, since the map
+        /// holds every bound key; the cleanup then moves the key to another
+        /// connection bound to it, or, with none, runs the per-peer cleanup.
         TeardownKeyUnmapped => "teardown_key_unmapped",
     }
 }
