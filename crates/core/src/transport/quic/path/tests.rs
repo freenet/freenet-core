@@ -1617,7 +1617,9 @@ async fn abort_sends(path: Arc<QuicPath>, count: u64) {
     }
 }
 
-/// The recycle close codes this node sent to `remote`.
+/// The recycle close codes this node sent to `remote`. The record is
+/// process-wide and keyed by address, so every test that reads it needs
+/// addresses of its own (its own subnet), or it sees another test's closes.
 fn recycle_closes_to(remote: SocketAddr) -> Vec<QuicCloseCode> {
     crate::transport::metrics::TRANSPORT_METRICS
         .quic_close_sent_to(remote)
@@ -1727,6 +1729,35 @@ fn a_dropped_send_counts_as_a_reset() {
             recycle_closes_to(a_addr),
             vec![QuicCloseCode::SendAbortLimit]
         );
+    })
+}
+
+/// #5940 step M6, guard 1: a stop reported through the write
+/// (`WriteError::Stopped`, handled by `Outgoing::written`) ends the stream
+/// as the peer's stop. `Drop` then sends no reset, and nothing is counted.
+#[test]
+fn a_stop_reported_by_the_write_is_not_counted() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths("quic-path-written-stopped", 30, QuicPathLimits::DEFAULT).await;
+        let a = p.a.clone();
+        let (written, aborts) = p
+            .drive(async move {
+                let header = FrameHeader::short(10).expect("a short header");
+                let mut send = a.open(&header, &[]).await.expect("open");
+                let written = send.written(Err(quinn::WriteError::Stopped(
+                    stop_code::BUDGET_REFUSED.into(),
+                )));
+                drop(send);
+                (written, a.send_aborts())
+            })
+            .await;
+        assert!(
+            matches!(written, Err(QuicSendError::Stopped(code)) if code == u64::from(stop_code::BUDGET_REFUSED)),
+            "{written:?}"
+        );
+        assert_eq!(aborts, 0);
+        assert!(p.a.connection().inner().close_reason().is_none());
     })
 }
 
@@ -1972,6 +2003,11 @@ impl Scripted {
         }
     }
 
+    /// A sample of `a`'s connection, as the acknowledgement watch takes it.
+    fn sample(&self) -> recycle::AckSample {
+        recycle::AckSample::of(self.a.connection().inner()).expect("an AckCounting controller")
+    }
+
     fn keep_sending(&self) {
         self.keep_sending
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -2058,6 +2094,10 @@ fn packets_left_outstanding_when_the_peer_stops_acknowledging_close_the_path() {
         s.wait(Duration::from_millis(100)).await;
         let _cut = DropFrom::new(network, &[s.a_addr]);
         let cut_at = s.time.now_nanos();
+        // `b` acknowledges what it already holds at its next step; that last
+        // batch leaves part of the transfer in flight.
+        s.wait(Duration::from_millis(200)).await;
+        assert!(s.sample().outstanding_after_acks() > 0);
         let waited = s.closed_after(cut_at).await;
         assert!(
             waited >= recycle::ACK_WATCH_WINDOW - recycle::ACK_WATCH_TICK,
@@ -2092,11 +2132,21 @@ fn recovery_from_an_outage_in_both_directions_does_not_close() {
         // new to acknowledge and `a`'s data waits for its probe timer.
         let cut = DropFrom::new(network, &[s.a_addr]);
         s.wait(Duration::from_millis(100)).await;
+        // `b`'s last acknowledgements, sent at its step after the cut, left
+        // `a` with data outstanding.
+        assert!(s.sample().outstanding_after_acks() > 0);
         drop(cut);
         let outage = DropFrom::new(network, &[s.a_addr, s.b_addr]);
         s.wait(Duration::from_secs(30)).await;
         drop(outage);
+        let at_recovery = s.sample().received();
         s.wait(Duration::from_secs(60)).await;
+        // `b` sent all through the minute after the outage (one write every
+        // PEER_STEP, 3000 steps), so the result is not an idle peer's.
+        assert!(
+            s.sample().received() > at_recovery + 1000,
+            "b sent too little after recovery"
+        );
         assert!(
             s.a.connection().inner().close_reason().is_none(),
             "{:?}",
@@ -2148,6 +2198,116 @@ fn a_slow_conforming_peer_is_not_closed() {
         })
         .await;
         set_packet_delivery_callback(network, None);
+        assert!(p.a.connection().inner().close_reason().is_none());
+        assert!(p.b.connection().inner().close_reason().is_none());
+        assert!(recycle_closes_to(a_addr).is_empty());
+        assert!(recycle_closes_to(b_addr).is_empty());
+    })
+}
+
+/// A seeded loss of `percent` of datagrams in both directions on `network`.
+fn seeded_loss(network: &str, percent: u64) {
+    use crate::transport::in_memory_socket::{
+        PacketDeliveryDecision, set_packet_delivery_callback,
+    };
+    let state = Arc::new(std::sync::atomic::AtomicU64::new(0x5940_0006));
+    set_packet_delivery_callback(
+        network,
+        Some(Arc::new(move |_, _, _| {
+            // A fixed linear congruential sequence, one draw per datagram.
+            let next = state
+                .fetch_update(
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                    |x| Some(x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1)),
+                )
+                .unwrap_or_default();
+            if (next >> 33) % 100 < percent {
+                PacketDeliveryDecision::Drop
+            } else {
+                PacketDeliveryDecision::Deliver
+            }
+        })),
+    );
+}
+
+/// #5940 step M6, guard 2 must not fire on a conforming peer over a lossy
+/// path: 25% of datagrams lost in both directions (seeded), a 2 MiB
+/// transfer each way plus a short message each way every 500 ms, for three
+/// virtual minutes.
+#[test]
+fn a_lossy_path_is_not_closed() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let network = "quic-path-ack-watch-lossy";
+        seeded_loss(network, 25);
+        let p = paths(network, 31, QuicPathLimits::DEFAULT).await;
+        let (a_addr, b_addr) = (p.pair.a_addr, p.pair.b_addr);
+        let (a, b, time) = (p.a.clone(), p.b.clone(), p.time());
+        let (bulk_ab, bulk_ba, trickles) = p
+            .drive(async move {
+                let end = time.now_nanos() + Duration::from_secs(180).as_nanos() as u64;
+                let trickle = |from: Arc<QuicPath>, time: VirtualTime| async move {
+                    let mut sent = 0u32;
+                    while time.now_nanos() < end {
+                        from.send_short(b"trickle").await.expect("trickle");
+                        sent += 1;
+                        time.sleep(Duration::from_millis(500)).await;
+                    }
+                    sent
+                };
+                let (bulk_ab, bulk_ba, t_a, t_b) = tokio::join!(
+                    a.send_stream(StreamId::next(), None, Bytes::from(payload(2 * MIB))),
+                    b.send_stream(StreamId::next(), None, Bytes::from(payload(2 * MIB))),
+                    trickle(a.clone(), time.clone()),
+                    trickle(b.clone(), time.clone()),
+                );
+                (bulk_ab, bulk_ba, t_a.min(t_b))
+            })
+            .await;
+        crate::transport::in_memory_socket::set_packet_delivery_callback(network, None);
+        bulk_ab.expect("a to b");
+        bulk_ba.expect("b to a");
+        assert!(trickles > 50, "{trickles} trickle messages");
+        assert!(p.a.connection().inner().close_reason().is_none());
+        assert!(p.b.connection().inner().close_reason().is_none());
+        assert!(recycle_closes_to(a_addr).is_empty());
+        assert!(recycle_closes_to(b_addr).is_empty());
+    })
+}
+
+/// #5940 step M6, guard 2 must not fire on a multi-megabyte transfer over a
+/// 1.5 s round trip (750 ms each way, from before the handshake): 8 MiB
+/// each way at once.
+#[test]
+fn a_bulk_transfer_at_a_long_round_trip_is_not_closed() {
+    bounded(|| async move {
+        use crate::transport::in_memory_socket::{
+            PacketDeliveryDecision, set_packet_delivery_callback,
+        };
+        let _seed = GlobalRng::seed_guard(SEED);
+        let network = "quic-path-ack-watch-bulk-rtt";
+        let one_way = Duration::from_millis(750);
+        set_packet_delivery_callback(
+            network,
+            Some(Arc::new(move |_, _, _| {
+                PacketDeliveryDecision::DelayedDelivery(one_way)
+            })),
+        );
+        let p = paths(network, 32, QuicPathLimits::DEFAULT).await;
+        let (a_addr, b_addr) = (p.pair.a_addr, p.pair.b_addr);
+        let (a, b) = (p.a.clone(), p.b.clone());
+        let (to_b, to_a) = p
+            .drive(async move {
+                tokio::join!(
+                    a.send_stream(StreamId::next(), None, Bytes::from(payload(8 * MIB))),
+                    b.send_stream(StreamId::next(), None, Bytes::from(payload(8 * MIB))),
+                )
+            })
+            .await;
+        set_packet_delivery_callback(network, None);
+        to_b.expect("a to b");
+        to_a.expect("b to a");
         assert!(p.a.connection().inner().close_reason().is_none());
         assert!(p.b.connection().inner().close_reason().is_none());
         assert!(recycle_closes_to(a_addr).is_empty());
