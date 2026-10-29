@@ -1950,7 +1950,8 @@ fn a_commutative_but_non_idempotent_delta_is_a_diagnostic_not_a_violation() {
          whether any deployed contract relies on it is unanswered"
     );
 
-    // And the ordering property, which IS enforceable, must stay clean for it —
+    // And the ordering property, a `Severity::Violation` (now report-only, but
+    // still a law that fails `fdev`), must stay clean for it —
     // summing is order-invariant. If this fired, downgrading DeltaIdempotence would
     // have bought nothing, because the same contract would still be accused.
     let mut fake = Fake::conforming()
@@ -3205,8 +3206,9 @@ fn evidence_at_the_related_contract_limit_is_accepted() {
 /// can only surface a real defect sooner. `TransitionPathAgreement` is a law only
 /// because the SENDER witnessed that `result` was reached from `base`, and that
 /// witness is not in the bytes — so a fabricated pair from a conforming grow-only
-/// contract would have every recipient independently confirm a removal-eligible
-/// violation against a correct contract.
+/// contract would have every recipient independently confirm a violation against a
+/// correct contract. The property is also report-only (`policy::removal_tier`); the
+/// refusal is the first of the two guards.
 #[test]
 fn evidence_for_a_property_that_is_not_self_verifying_is_refused() {
     let case = case(
@@ -3317,9 +3319,10 @@ fn every_property_declares_whether_it_is_self_verifying() {
 /// and which does not tombstone a tag it has never seen. Sound in production, because
 /// a delta is always `get_state_delta(sender, recipient_summary)`. Fed the
 /// causally-sequenced pair `D1 = add A^t`, `D2 = remove t`, the two orders diverge —
-/// and this property is `Severity::Violation`, which `policy::decide` maps to
-/// `ConformanceAction::Remove` in Enforce mode. Every recipient would independently
-/// confirm a removal against a correct contract.
+/// and this property is `Severity::Violation`. It is also report-only now
+/// (`policy::removal_tier`), so `policy::decide` would only report it; the refusal
+/// is the first of two guards, and stays because a recipient would still confirm a
+/// violation against a correct contract.
 #[test]
 fn evidence_for_delta_permutation_invariance_is_refused() {
     let built = ConformanceCase::new(
@@ -3436,11 +3439,17 @@ fn verdict_survives_fabricated_bytes(property: ConformanceProperty) -> bool {
 /// go straight into another peer's WASM and come back out as a removal verdict.
 ///
 /// Two properties carry deltas. `DeltaPermutationInvariance` is `Violation` and is
-/// kept off the wire by `premise_source`. `DeltaIdempotence` ships, and is safe only
-/// because it is `Diagnostic`, which `policy::decide` never turns into a removal —
-/// so its severity is not independently adjustable, and its own documentation says
-/// so. This test is what makes that a rule rather than a note: promoting it without
-/// revisiting `premise_source` in the same change fails here.
+/// kept off the wire by `premise_source` (and is report-only besides).
+/// `DeltaIdempotence` ships, and is safe only because it is `Diagnostic` and
+/// report-only, which `policy::decide` never turns into a removal — so neither its
+/// severity nor its tier is independently adjustable, and its own documentation says
+/// so. This test is what makes that a rule rather than a note: making it
+/// removal-eligible without revisiting `premise_source` in the same change fails here.
+///
+/// "Removal-eligible" here is what `policy::decide` can turn into a removal: a
+/// `Violation` whose `policy::property_tier` is `RemovalEligible`. The per-finding
+/// refinement in `policy::removal_tier` can only lower that tier, so the property
+/// level is the conservative question to ask.
 ///
 /// One property consumes a supplied SUMMARY: `DeltaDeterminism`, which both ships and
 /// is `Violation`. It is in scope here — the earlier version of this test filtered on
@@ -3455,6 +3464,11 @@ fn verdict_survives_fabricated_bytes(property: ConformanceProperty) -> bool {
 fn no_shippable_removal_eligible_property_consumes_unvalidated_bytes() {
     let consumes_unvalidated =
         |p: ConformanceProperty| p.delta_arity() > 0 || consumes_supplied_summary(p);
+    let removal_eligible = |p: ConformanceProperty| {
+        p.severity() == Severity::Violation
+            && crate::conformance::property_tier(p)
+                == crate::conformance::RemovalTier::RemovalEligible
+    };
 
     let hazardous: Vec<ConformanceProperty> = ConformanceProperty::ALL
         .iter()
@@ -3462,7 +3476,7 @@ fn no_shippable_removal_eligible_property_consumes_unvalidated_bytes() {
         .filter(|p| {
             consumes_unvalidated(*p)
                 && p.is_self_verifying()
-                && p.severity() == Severity::Violation
+                && removal_eligible(*p)
                 && !verdict_survives_fabricated_bytes(*p)
         })
         .collect();
@@ -3471,8 +3485,9 @@ fn no_shippable_removal_eligible_property_consumes_unvalidated_bytes() {
         "{hazardous:?}: a property that ships as evidence, runs attacker-chosen \
          delta or summary bytes through the WASM, and is removal-eligible is the \
          combination the evidence gate exists to prevent. Either mark it \
-         `PremiseSource::LocalProvenance`, or drop it to `Severity::Diagnostic`, or \
-         give those bytes a validity check first — do not simply update this test"
+         `PremiseSource::LocalProvenance`, or make it report-only \
+         (`policy::property_tier`), or give those bytes a validity check first — do \
+         not simply update this test"
     );
 
     // The fixture must be able to fail: at least one property really does carry
@@ -3492,9 +3507,7 @@ fn no_shippable_removal_eligible_property_consumes_unvalidated_bytes() {
     let carried_only_by_the_exemption: Vec<ConformanceProperty> = ConformanceProperty::ALL
         .iter()
         .copied()
-        .filter(|p| {
-            consumes_unvalidated(*p) && p.is_self_verifying() && p.severity() == Severity::Violation
-        })
+        .filter(|p| consumes_unvalidated(*p) && p.is_self_verifying() && removal_eligible(*p))
         .collect();
     assert_eq!(
         carried_only_by_the_exemption,

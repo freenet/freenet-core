@@ -442,10 +442,15 @@ fn merge_law_card(merge_enabled: bool, merge_view: Option<&status::MergeCheckVie
             // from "genuinely non-convergent", and showing the first as though it
             // were the second is the misreading this whole change exists to
             // prevent.
+            //
+            // A `Violation` is not removal-eligible just for being one: some laws
+            // are report-only (`conformance::policy::removal_tier`). The decision
+            // that was actually made travels as `would_remove`, so the generic
+            // label reads that rather than restating a rule the policy owns.
             let (pill_class, label) = match (f.severity, f.settling) {
                 (Severity::Violation, Some(IdempotenceSettling::SettledAfter(_))) => (
                     "fresh-stale",
-                    "Violation — settles after a rewrite (converges)",
+                    "Violation — settles after a rewrite (converges, report-only)",
                 ),
                 (Severity::Violation, Some(IdempotenceSettling::NeverSettled)) => {
                     ("fresh-stale", "Violation — never settles")
@@ -453,7 +458,10 @@ fn merge_law_card(merge_enabled: bool, merge_view: Option<&status::MergeCheckVie
                 (Severity::Violation, Some(IdempotenceSettling::Indeterminate)) => {
                     ("fresh-stale", "Violation — settling unknown")
                 }
-                (Severity::Violation, _) => ("fresh-stale", "Violation — removal-eligible"),
+                (Severity::Violation, _) if f.would_remove => {
+                    ("fresh-stale", "Violation — removal-eligible")
+                }
+                (Severity::Violation, _) => ("fresh-stale", "Violation — report-only"),
                 (Severity::Diagnostic, _) => ("use-idle", "Diagnostic — legal but wasteful"),
             };
             rows.push_str(&format!(
@@ -469,7 +477,7 @@ fn merge_law_card(merge_enabled: bool, merge_view: Option<&status::MergeCheckVie
                 <div class="info-grid" style="margin-top:0.75rem">
                     {cases_row}
                 </div>
-                <p class="empty" style="margin-top:0.75rem"><strong>Violation</strong> means the contract broke an algebraic law and is removal-eligible under enforcement. Most do not converge, but not all: a contract that normalises a stored state once and then holds still breaks idempotence and still agrees with its peers — those rows say <em>settles after a rewrite</em>. <strong>Diagnostic</strong> is legal but wasteful — it never justifies removal on its own.</p>
+                <p class="empty" style="margin-top:0.75rem"><strong>Violation</strong> means the contract broke an algebraic law. Most are removal-eligible under enforcement; some laws are report-only, because their findings can be produced by inputs anyone may supply or describe a contract that converges after a bounded cost. A contract that normalises a stored state once and then holds still breaks idempotence and still agrees with its peers — those rows say <em>settles after a rewrite</em> and are report-only. <strong>Diagnostic</strong> is legal but wasteful — it never justifies removal on its own.</p>
                 {note}
             </div>"#,
             rows = rows,

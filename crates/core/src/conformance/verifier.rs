@@ -324,8 +324,9 @@ fn run<O: ConformanceOracle + ?Sized>(
             // The choice looked binary — flag every canonicalizing contract as
             // removal-eligible, or suppress — and it is not. The distinction is
             // kept as DATA on the finding ([`IdempotenceSettling`]) rather than as
-            // a severity fork, so an eventual removal policy can branch on it
-            // without the verifier having pre-decided the answer. Bending the
+            // a severity fork, so the removal policy branches on it
+            // (`policy::removal_tier`) without the verifier having pre-decided the
+            // answer. Bending the
             // classification to soften an enforcement consequence is the specific
             // mistake this replaced (#5462).
             //
@@ -343,10 +344,10 @@ fn run<O: ConformanceOracle + ?Sized>(
             // suppression starts firing on canonicalizing contracts (#5462).
             //
             // Sequencing note: canonicalising at install removes the benign class
-            // entirely, and is what makes this honest report safe to enforce on
-            // later. Until then, expect `SettledAfter(1)` findings against correct
+            // entirely. Until then, expect `SettledAfter(1)` findings against correct
             // contracts and read them as "the install path has not been fixed yet",
-            // not as "this contract is broken".
+            // not as "this contract is broken". `policy::removal_tier` makes that
+            // class report-only in every mode, so it never reaches `WouldRemove`.
             let a: &[u8] = &case.states[0];
             let once = merge(oracle, a, a)?;
             if once == a {
@@ -432,14 +433,24 @@ fn run<O: ConformanceOracle + ?Sized>(
             // in iteration order, the #4295 shape) settles after one apply, so it
             // lands squarely in the `SettledAfter` arm. The commutativity path
             // already carries a test against exactly this misdiagnosis.
+            //
+            // The note must not claim more than this finding shows. The rewritten
+            // state is a fixpoint of its own merge, so the cost is phantom
+            // anti-entropy until each copy has been through a merge, which is why
+            // the class is report-only. If the byte order instead depends on merge
+            // history, so that peers holding the same content keep different
+            // bytes, the two merge orders differ and `StateCommutativity` reports
+            // it as its own finding (removal-eligible).
             if is_reordering(&once, a) {
                 detail.push_str(
                     ". NOTE: the rewritten state holds exactly the same bytes in a \
                      different order, so the merge agreed on content and the ENCODING \
                      is not canonical (e.g. a HashMap serialized in iteration order). \
-                     Peers compare state by hash, so this still prevents convergence, \
-                     but the fix is a deterministic encoding rather than a change to \
-                     the merge",
+                     Peers compare state by hash, so copies with the same content \
+                     disagree until each has been through a merge, and an encoding \
+                     that varies with merge history keeps them apart for good (that \
+                     case is a state_commutativity finding). The fix is a \
+                     deterministic encoding rather than a change to the merge",
                 );
             }
             Ok(idempotence_violation(
@@ -1024,7 +1035,7 @@ fn path_agreement<O: ConformanceOracle + ?Sized>(
     // computed something the merge path cannot reach does not heal.
     //
     // The guard errs toward silence in every direction, which is the right direction
-    // for a removal-eligible property. That includes when the merge itself is
+    // for a check that accuses a contract. That includes when the merge itself is
     // unsound: a last-write-wins merge heals trivially, so this declines to pile a
     // second accusation onto a defect `StateCommutativity` already names.
     let healed = merge(oracle, &delta_path, other)?;
