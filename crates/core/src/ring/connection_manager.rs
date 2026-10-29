@@ -4895,7 +4895,8 @@ mod tests {
         let promote = fn_body(LIFECYCLE_SRC, "async fn promote_existing_connection(");
         let successful = fn_body(LIFECYCLE_SRC, "async fn handle_successful_connection(");
         assert!(
-            code_calls(connect_peer, "self.promote_existing_connection(peer_addr"),
+            // Without `self`: rustfmt may break the call before the dot.
+            code_calls(connect_peer, ".promote_existing_connection(peer_addr"),
             "handle_connect_peer must promote an existing connection through \
              promote_existing_connection, which holds the transient-promotion gate"
         );
