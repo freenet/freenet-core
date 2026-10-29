@@ -726,8 +726,9 @@ fn frame_metadata(metadata: Option<&[u8]>) -> &[u8] {
 /// task, which is not counted.
 ///
 /// The path's acknowledgement watch ([`recycle::watch_acknowledgements`])
-/// runs beside it in this task. When the watch closes the connection, the
-/// receive task then ends as the connection does.
+/// runs beside it in this task, with its own panic containment: a panic in
+/// the watch is logged and the receive task goes on. When the watch closes
+/// the connection, the receive task then ends as the connection does.
 async fn supervise_receive<T: TimeSource>(
     connection: quinn::Connection,
     closer: super::QuicCloser,
@@ -739,9 +740,23 @@ async fn supervise_receive<T: TimeSource>(
     let mut receive = std::pin::pin!(
         std::panic::AssertUnwindSafe(inbound::receive(connection.clone(), receiver)).catch_unwind()
     );
+    let watch = std::panic::AssertUnwindSafe(recycle::watch_acknowledgements(
+        connection.clone(),
+        closer.clone(),
+        time,
+    ))
+    .catch_unwind();
     let ended = tokio::select! {
         ended = &mut receive => ended,
-        () = recycle::watch_acknowledgements(connection.clone(), closer.clone(), time) => {
+        watched = watch => {
+            if watched.is_err() {
+                // The path still works; only guard 2 is gone for it.
+                tracing::error!(
+                    remote = %connection.remote_address(),
+                    "QUIC path: the acknowledgement watch panicked; the path stays \
+                     up without it"
+                );
+            }
             receive.await
         }
     };

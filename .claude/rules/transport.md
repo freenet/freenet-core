@@ -1135,12 +1135,14 @@ Path recycling (quic/recycle.rs, #5940 step M6): besides the send-reset
   limit above, the path's receive task samples the connection every
   ACK_WATCH_TICK (2 s) and closes it with PEER_NOT_ACKNOWLEDGING when, for
   ACK_WATCH_WINDOW (10 s), this side had ack-eliciting packets outstanding,
-  the peer acknowledged none of them, and the peer sent something in every
-  sample. A peer that keeps sending but acknowledges none of our packets is
+  the peer acknowledged none of them, and the peer kept sending (no two
+  samples in a row without anything from it). A peer that keeps sending but acknowledges none of our packets is
   not a conforming QUIC peer (RFC 9000 13.2.1). Newly acknowledged packets
   are counted by AckCounting, which wraps Cubic in transport_config;
-  ConnectionStats has no such counter. A sample with nothing from the peer
-  ends the window, so recovery from an outage does not close the path.
+  ConnectionStats has no such counter. Two samples in a row with nothing
+  from the peer end the window, and so does a sample with nothing
+  outstanding (in flight after the latest acknowledgements, minus losses,
+  or a send since), so recovery from an outage does not close the path.
   e5 constraint: SEND_ABORT_LIMIT and PEER_NOT_ACKNOWLEDGING ask the peer to
   fall back to UDP for THIS connection only. They are not a permanent
   downgrade: e5 must allow a new upgrade after its normal backoff.

@@ -13,7 +13,10 @@
 //!    the connection once there are more than [`SEND_ABORT_LIMIT`]. A new
 //!    connection starts with an empty map and a zero count. A stop the peer
 //!    sent is not a reset of this side's and is not counted, and neither is
-//!    a reset on a connection that is already closed.
+//!    a reset on a connection that is already closed. The count can still
+//!    run high: a reset this side sends before it has processed a stop
+//!    already received is counted, although quinn then reports the stream
+//!    as Stopped and drops its entry. That only closes a path earlier.
 //!
 //! 2. **A peer that acknowledges nothing**
 //!    ([`close_code::PEER_NOT_ACKNOWLEDGING`]). A peer that keeps sending
@@ -27,7 +30,8 @@
 //!      have acknowledged by then (see [`AckWatch`] for when the window
 //!      starts);
 //!    - the peer acknowledged none of them; and
-//!    - the peer sent something in EVERY sample of the window.
+//!    - the peer kept sending: no two samples in a row of the window
+//!      without anything from it.
 //!
 //!    It is a conformance check, not a liveness check: a peer that
 //!    acknowledges something within each window is never closed by it.
@@ -63,10 +67,20 @@
 //! - a peer that went silent: quinn's idle timeout ends the connection
 //!   instead.
 //!
-//! It also fires when this side's packets stop reaching a peer whose
-//! packets still arrive all the time (a path broken in one direction): from
-//! this side that is the same observation, and falling back to UDP is the
-//! right outcome there too.
+//! It can also fire when this side's packets stop reaching a peer whose
+//! packets still arrive (a path broken in one direction): from this side
+//! that is the same observation, and falling back to UDP is the right
+//! outcome there too. Only while the peer keeps sending, though: a quinn
+//! peer that hears nothing from this side soon has its congestion window
+//! full of unacknowledged data and then sends only probes, at doubling
+//! intervals, so such a break usually ends the window (two samples without
+//! anything from the peer) and is left to quinn's idle timeout.
+//!
+//! The peer's `max_ack_delay` transport parameter may be up to 2^14 ms
+//! (RFC 9000 18.2), above [`ACK_WATCH_WINDOW`]; a peer that advertises that
+//! and uses all of it would be closed. Every peer is a Freenet node, whose
+//! quinn uses the default 25 ms (`config::transport_config` does not set
+//! it), so the window is not derived from the peer's value.
 //!
 //! Network path changes: migration is off (`config::server_config`). Were a
 //! connection to change paths anyway, quinn keeps the controller for a NAT
@@ -127,8 +141,8 @@ pub(crate) const ACK_WATCH_WINDOW: Duration = Duration::from_secs(10);
 /// at most one tick after that event; and the path is closed at the first
 /// sample a full window after that start. So a close comes at least
 /// [`ACK_WATCH_WINDOW`] after the event, and at most
-/// `ACK_WATCH_WINDOW + ACK_WATCH_TICK` after it, given that every sample in
-/// between saw the peer send.
+/// `ACK_WATCH_WINDOW + ACK_WATCH_TICK` after it, given that the window was
+/// not ended in between (see [`AckWatch`]).
 pub(crate) const ACK_WATCH_TICK: Duration = Duration::from_secs(2);
 
 /// Counts the sends a path reset, and closes its connection past the
@@ -386,6 +400,18 @@ impl AckSample {
         })
     }
 
+    /// Bytes outstanding after the latest acknowledgements, minus losses.
+    #[cfg(test)]
+    pub(crate) fn outstanding_after_acks(&self) -> u64 {
+        self.state.outstanding_after_acks()
+    }
+
+    /// Frames received from the peer.
+    #[cfg(test)]
+    pub(crate) fn received(&self) -> u64 {
+        self.received
+    }
+
     #[cfg(test)]
     pub(crate) fn synthetic(
         record: &Arc<Mutex<AckState>>,
@@ -409,33 +435,54 @@ impl AckSample {
 
 /// Decides, from samples taken every tick, whether the peer has gone a
 /// whole window without acknowledging packets this side has outstanding,
-/// while it sent something in every sample.
+/// while it kept sending.
 ///
-/// The window starts at a sample that shows packets outstanding which a
-/// conforming peer is about to acknowledge:
-/// - one that sees a new ack-eliciting send (no acknowledgement since the
-///   previous sample); or
-/// - one that sees an acknowledgement after which packets are still in
-///   flight (minus those since declared lost), so the peer was
-///   acknowledging and left some unacknowledged.
+/// Outstanding, at a sample, means either of:
+/// - bytes still in flight from the latest batch of acknowledgements, minus
+///   those quinn has since declared lost; or
+/// - an ack-eliciting send seen at a sample that saw no acknowledgement, so
+///   made after the latest batch. quinn declares a packet lost only below
+///   the largest packet the peer acknowledged, so such a packet stays
+///   outstanding until the next acknowledgement.
+///
+/// Sends at a sample that also saw an acknowledgement may have come before
+/// that batch and are not counted; a later probe of quinn's counts them.
+/// `ConnectionStats` cannot give the bytes sent since a batch directly:
+/// quinn reports every datagram to the controller (`on_sent`),
+/// acknowledgement-only ones included, and a node that mostly receives
+/// sends those all the time.
+///
+/// The window starts at a sample with something from the peer that shows
+/// packets outstanding which a conforming peer is about to acknowledge:
+/// - one that sees a new ack-eliciting send and no acknowledgement; or
+/// - one that sees an acknowledgement after which packets are still
+///   outstanding, so the peer was acknowledging and left some.
 ///
 /// Packets outstanding with nothing new sent and no acknowledgement (after
 /// an outage, while quinn's probe timer is backed off) do not start a
 /// window: nothing then tells this side that the peer has received anything
 /// to acknowledge. A probe that quinn sends later starts one.
 ///
-/// The window ends, without a close, at any sample in which the peer sent
-/// nothing, or at any new acknowledgement (which may start a new window as
-/// above). Otherwise the path is closed at the first sample at least a
-/// window after the start, so a close needs at least
-/// `window / tick + 1` consecutive samples, each with something from the
-/// peer and no new acknowledgement.
+/// The window ends, without a close, at any sample where nothing is
+/// outstanding, at the second sample in a row with nothing from the peer,
+/// or at any new acknowledgement (which may start a new window as above).
+/// Otherwise the path is closed at the first sample at least a window after
+/// the start, so a close needs at least `window / tick + 1` consecutive
+/// samples with no new acknowledgement and packets outstanding, with
+/// something from the peer in at least one of any two in a row.
 pub(crate) struct AckWatch {
     window_nanos: u64,
     previous: AckSample,
     /// When the window started.
     since: Option<u64>,
+    /// An ack-eliciting send was seen after the latest acknowledgement.
+    sent_after_acks: bool,
+    /// Samples in a row with nothing from the peer.
+    quiet_samples: u32,
 }
+
+/// Samples in a row with nothing from the peer that end a window.
+const QUIET_SAMPLES_END_WINDOW: u32 = 2;
 
 impl AckWatch {
     pub(crate) fn new(window: Duration, first: AckSample) -> Self {
@@ -443,6 +490,8 @@ impl AckWatch {
             window_nanos: u64::try_from(window.as_nanos()).unwrap_or(u64::MAX),
             previous: first,
             since: None,
+            sent_after_acks: false,
+            quiet_samples: 0,
         }
     }
 
@@ -456,17 +505,28 @@ impl AckWatch {
         let sent_new = same_controller && sample.sent != self.previous.sent;
         let outstanding_after_acks = same_controller && sample.state.outstanding_after_acks() > 0;
         self.previous = sample;
-        if !peer_sent {
+        if acknowledged {
+            self.sent_after_acks = false;
+        } else if sent_new {
+            self.sent_after_acks = true;
+        }
+        self.quiet_samples = if peer_sent {
+            0
+        } else {
+            self.quiet_samples.saturating_add(1)
+        };
+        let outstanding = outstanding_after_acks || self.sent_after_acks;
+        if !outstanding || self.quiet_samples >= QUIET_SAMPLES_END_WINDOW {
             self.since = None;
             return false;
         }
         if acknowledged {
-            self.since = outstanding_after_acks.then_some(now_nanos);
+            self.since = peer_sent.then_some(now_nanos);
             return false;
         }
         let start = match self.since {
             Some(start) => start,
-            None if sent_new => *self.since.insert(now_nanos),
+            None if sent_new && peer_sent => *self.since.insert(now_nanos),
             None => return false,
         };
         now_nanos.saturating_sub(start) >= self.window_nanos

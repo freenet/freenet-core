@@ -78,16 +78,56 @@ fn a_silent_peer_is_left_to_the_idle_timeout() {
     assert_eq!(run(100, |t| reading(5, 1200, 10 + t, 100)), None);
 }
 
-/// One sample with nothing from the peer, inside the window, ends it; the
-/// next send starts a new one.
+/// One sample with nothing from the peer inside the window does not end it
+/// (its packets may arrive with gaps longer than a tick); two in a row do,
+/// and the next send then starts a new window.
 #[test]
-fn a_sample_with_nothing_from_the_peer_ends_the_window() {
-    // Sends every tick; nothing from the peer at tick 4.
+fn two_samples_in_a_row_with_nothing_from_the_peer_end_the_window() {
+    // Sends every tick; nothing from the peer at tick 4 only.
     let closed = run(100, |t| {
         let received = if t >= 4 { 99 + t } else { 100 + t };
         reading(5, 0, 10 + t, received)
     });
-    assert_eq!(closed, Some(closes_at(5)));
+    assert_eq!(closed, Some(closes_at(1)));
+    // Nothing from the peer at ticks 4 and 5: the window ends at 5, and
+    // the send at tick 6 starts the next one.
+    let closed = run(100, |t| {
+        let received = match t {
+            0..=3 => 100 + t,
+            4 | 5 => 103,
+            _ => 98 + t,
+        };
+        reading(5, 0, 10 + t, received)
+    });
+    assert_eq!(closed, Some(closes_at(6)));
+}
+
+/// Review finding (second round): a window started by an acknowledgement
+/// that left bytes outstanding ends when quinn later declares those bytes
+/// lost, with nothing sent since. Without that, a node that mostly receives
+/// and whose last ack-eliciting packet is lost would be closed while the
+/// peer keeps sending.
+#[test]
+fn a_window_ends_when_its_outstanding_bytes_are_declared_lost() {
+    let closed = run(100, |t| {
+        let acked = if t >= 3 { 6 } else { 5 };
+        let outstanding = if t >= 5 { 0 } else { 1200 };
+        reading(acked, outstanding, 10, 100 + t)
+    });
+    assert_eq!(closed, None);
+}
+
+/// A send made after the latest acknowledgement stays outstanding when the
+/// bytes left from that acknowledgement are declared lost (quinn declares
+/// loss only below the largest acknowledged packet): the window goes on and
+/// closes.
+#[test]
+fn a_send_after_the_latest_acknowledgement_keeps_the_window_open() {
+    let closed = run(100, |t| {
+        let outstanding = if t >= 4 { 0 } else { 1200 };
+        reading(5, outstanding, 10 + t.min(1), 100 + t)
+    });
+    assert_eq!(closed, Some(closes_at(1)));
 }
 
 /// Recovery from an outage in both directions. Before it, sends with
