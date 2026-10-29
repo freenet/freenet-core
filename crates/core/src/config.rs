@@ -2769,6 +2769,7 @@ impl NetworkApiConfig {
                 max_connections: self.max_connections,
                 memory_limit: crate::wasm_runtime::read_total_ram_bytes()
                     .unwrap_or(QUIC_FALLBACK_TOTAL_RAM),
+                idle_timeout: None,
             }),
         }
     }
@@ -4983,6 +4984,32 @@ impl GlobalRng {
         F: FnOnce() -> R,
     {
         let _guard = Self::seed_guard(seed);
+        f()
+    }
+
+    /// Runs `f` with this thread's seeded RNG replaced by one seeded from
+    /// the thread's seed and `stream`, then puts the thread's RNG back
+    /// exactly as it was (also if `f` panics). Draws inside `f` are
+    /// repeatable and do not move the main stream, so a component that
+    /// takes randomness when it is built (the simulated QUIC endpoint)
+    /// changes no other random choice in the run. Without a seed
+    /// (production) it runs `f` with the system RNG, unchanged.
+    pub fn with_side_stream<F, R>(stream: u64, f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        struct Restore(Option<SmallRng>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let saved = self.0.take();
+                THREAD_RNG.with(|rng| *rng.borrow_mut() = saved);
+            }
+        }
+        let Some(seed) = THREAD_SEED.with(|s| s.get()) else {
+            return f();
+        };
+        let side = SmallRng::seed_from_u64(seed ^ stream.wrapping_mul(0x9E3779B97F4A7C15));
+        let _restore = Restore(THREAD_RNG.with(|rng| rng.borrow_mut().replace(side)));
         f()
     }
 
@@ -10308,6 +10335,36 @@ shutdown-drain-secs = 42
         let config2: NetworkApiConfig = toml::from_str(&serialized).unwrap();
         assert_eq!(config2.congestion_control, "bbr");
         assert_eq!(config2.bbr_startup_rate, Some(5_000_000));
+    }
+
+    /// Draws inside `with_side_stream` repeat for one seed and stream,
+    /// differ between streams, and leave the main stream exactly where it
+    /// was, whether or not the main stream had drawn yet.
+    #[test]
+    fn side_stream_draws_repeat_and_leave_the_main_stream_alone() {
+        let draw = || GlobalRng::with_rng(|rng| rng.next_u64());
+        let run = |stream: u64, draw_first: bool| {
+            let _guard = GlobalRng::seed_guard(0x5940);
+            let before = draw_first.then(draw);
+            let side = GlobalRng::with_side_stream(stream, || (draw(), draw()));
+            (before, side, draw())
+        };
+        let main_untouched = {
+            let _guard = GlobalRng::seed_guard(0x5940);
+            draw()
+        };
+        let (_, side_a, main_a) = run(1, false);
+        let (_, side_a_again, _) = run(1, false);
+        let (_, side_b, _) = run(2, false);
+        assert_eq!(main_a, main_untouched, "the main stream did not move");
+        assert_eq!(side_a, side_a_again, "a side stream repeats");
+        assert_ne!(side_a, side_b, "streams differ");
+        let (first, _, second) = run(1, true);
+        let expected = {
+            let _guard = GlobalRng::seed_guard(0x5940);
+            (draw(), draw())
+        };
+        assert_eq!((first.unwrap(), second), expected, "resumes mid-stream");
     }
 
     #[test]

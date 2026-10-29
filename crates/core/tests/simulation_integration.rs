@@ -20318,3 +20318,230 @@ fn test_5842_update_right_after_relaying_another_converges() {
          back-to-back broadcasts of one contract to one peer"
     );
 }
+
+// =============================================================================
+// QUIC in the simulation harness (#5940 step e5a-1)
+// =============================================================================
+
+/// What a QUIC harness run produced: the mesh (every connection a node
+/// reported, as an unordered address pair) and the event trace.
+#[derive(Debug, PartialEq)]
+struct QuicSimTrace {
+    mesh: std::collections::BTreeSet<(SocketAddr, SocketAddr)>,
+    /// Event variant names in log order.
+    event_sequence: Vec<String>,
+    /// `(tx, peer, variant, contract key, state hash)` per event, sorted.
+    event_keys: Vec<String>,
+}
+
+/// One direct-runner simulation (2 gateways, 4 nodes), with
+/// `transport-quic` set to `quic` on every node when given.
+fn run_quic_harness_sim(name: &str, seed: u64, quic: Option<&str>) -> QuicSimTrace {
+    setup_deterministic_state(seed);
+    let rt = create_runtime();
+    let (sim, logs_handle) = rt.block_on(async {
+        let mut sim = SimNetwork::new(name, 2, 4, 10, 3, 10, 3, seed).await;
+        if let Some(value) = quic {
+            sim.with_transport_quic(value);
+        }
+        let logs_handle = sim.event_logs_handle();
+        (sim, logs_handle)
+    });
+    drop(rt);
+    sim.run_simulation_direct::<rand::rngs::SmallRng>(seed, 6, 20, Duration::from_millis(200))
+        .expect("direct simulation should succeed");
+    let rt = create_runtime();
+    rt.block_on(async {
+        let logs = logs_handle.lock().await;
+        let mesh = logs
+            .iter()
+            .filter_map(|log| log.kind.connect_connected_addrs())
+            .map(|(a, b)| if a <= b { (a, b) } else { (b, a) })
+            .collect();
+        let event_sequence = logs
+            .iter()
+            .map(|log| log.kind.variant_name().to_string())
+            .collect();
+        let mut event_keys: Vec<String> = logs
+            .iter()
+            .map(|log| {
+                format!(
+                    "{:?} {} {} {:?} {:?}",
+                    log.tx,
+                    log.peer_id.socket_addr(),
+                    log.kind.variant_name(),
+                    log.kind.contract_key(),
+                    log.kind.state_hash()
+                )
+            })
+            .collect();
+        event_keys.sort();
+        QuicSimTrace {
+            mesh,
+            event_sequence,
+            event_keys,
+        }
+    })
+}
+
+/// The peers in `mesh`, and whether `mesh` connects all of them.
+fn quic_mesh_peers_and_connected(
+    mesh: &std::collections::BTreeSet<(SocketAddr, SocketAddr)>,
+) -> (std::collections::BTreeSet<SocketAddr>, bool) {
+    let peers: std::collections::BTreeSet<SocketAddr> =
+        mesh.iter().flat_map(|(a, b)| [*a, *b]).collect();
+    let Some(&start) = peers.iter().next() else {
+        return (peers, false);
+    };
+    let mut reached = std::collections::BTreeSet::from([start]);
+    let mut stack = vec![start];
+    while let Some(at) = stack.pop() {
+        for (a, b) in mesh {
+            let next = if *a == at {
+                *b
+            } else if *b == at {
+                *a
+            } else {
+                continue;
+            };
+            if reached.insert(next) {
+                stack.push(next);
+            }
+        }
+    }
+    let connected = reached == peers;
+    (peers, connected)
+}
+
+/// A simulation with `transport-quic = "prefer"` on every node (an endpoint
+/// on each node's port, on the network's VirtualTime, moving no traffic
+/// before the upgrade negotiation lands) forms a mesh of the same peers as
+/// with QUIC off on the same seed, and that mesh is connected.
+///
+/// Not the identical edge set, which no seed-independent test can promise:
+/// quinn spawns one endpoint driver task per node, and one more task on the
+/// single-threaded scheduler changes the interleaving and with it some
+/// connection choices (measured: QUIC off plus one idle task per node gives
+/// a trace identical to QUIC prefer in order and content, while QUIC off
+/// alone differs). The endpoint's own random draws are kept out of the
+/// run's `GlobalRng` stream (`GlobalRng::with_side_stream`), so scheduling
+/// is the only difference.
+#[test_log::test]
+fn test_quic_prefer_forms_a_mesh_of_the_same_peers_as_quic_off() {
+    const SEED: u64 = 0x5940_E5A1_0001;
+    const NODES: usize = 6;
+    let off = run_quic_harness_sim("quic-mesh-off", SEED, None);
+    let prefer = run_quic_harness_sim("quic-mesh-prefer", SEED, Some("prefer"));
+    let (off_peers, off_connected) = quic_mesh_peers_and_connected(&off.mesh);
+    let (prefer_peers, prefer_connected) = quic_mesh_peers_and_connected(&prefer.mesh);
+    assert_eq!(
+        off_peers.len(),
+        NODES,
+        "premise: every node joined: {:?}",
+        off.mesh
+    );
+    assert!(
+        off_connected,
+        "premise: the mesh is connected: {:?}",
+        off.mesh
+    );
+    assert_eq!(prefer_peers, off_peers, "QUIC prefer: the same peers join");
+    assert!(
+        prefer_connected,
+        "QUIC prefer: the mesh is connected: {:?}",
+        prefer.mesh
+    );
+}
+
+/// Two runs with QUIC on and the same seed produce the same event trace.
+/// Compares events, not bytes: rustls's key exchange uses the OS RNG.
+#[test_log::test]
+fn test_quic_prefer_is_deterministic() {
+    const SEED: u64 = 0x5940_E5A1_0002;
+    let first = run_quic_harness_sim("quic-det-run1", SEED, Some("prefer"));
+    let second = run_quic_harness_sim("quic-det-run2", SEED, Some("prefer"));
+    assert!(!first.event_sequence.is_empty(), "the run produced events");
+    assert_eq!(first.mesh, second.mesh, "same mesh");
+    assert_eq!(
+        first.event_sequence.len(),
+        second.event_sequence.len(),
+        "same number of events"
+    );
+    for (i, (a, b)) in first
+        .event_sequence
+        .iter()
+        .zip(&second.event_sequence)
+        .enumerate()
+    {
+        assert_eq!(a, b, "event sequence differs at index {i}");
+    }
+    assert_eq!(first.event_keys, second.event_keys, "same event content");
+}
+
+/// A node's advertised-version override is what its peers record for it:
+/// the gateway learns the joiner's version from its intro packet, and the
+/// joiner learns the gateway's from the version-carrying ack. A control run
+/// without overrides records the real version both ways.
+#[test_log::test]
+fn test_advertised_version_override_reaches_peers() {
+    use freenet::dev_tool::NodeLabel;
+    const SEED: u64 = 0x5940_E5A1_0003;
+
+    type Version = Option<(u8, u8, u16)>;
+
+    /// `(what the gateway recorded for the node, what the node recorded
+    /// for the gateway)`.
+    fn run(name: &str, overrides: bool) -> (Version, Version) {
+        setup_deterministic_state(SEED);
+        let rt = create_runtime();
+        let gateway = NodeLabel::gateway(name, 0);
+        let node = NodeLabel::node(name, 1);
+        let mut sim = rt.block_on(async { SimNetwork::new(name, 1, 1, 7, 3, 10, 2, SEED).await });
+        // The joiner records the gateway's version only from the
+        // version-carrying ack, which simulations leave off by default.
+        sim.enable_gateway_ack_version();
+        sim.with_transport_quic("prefer");
+        if overrides {
+            sim.with_node_advertised_version(&node, (0, 2, 148));
+            sim.with_node_advertised_version(&gateway, (0, 2, 149));
+        }
+        let addresses = sim.all_node_addresses();
+        let (gateway_addr, node_addr) = (addresses[&gateway], addresses[&node]);
+        let result = sim.run_controlled_simulation(
+            SEED,
+            Vec::new(),
+            Duration::from_secs(60),
+            Duration::from_secs(10),
+        );
+        assert!(
+            result.turmoil_result.is_ok(),
+            "simulation failed: {:?}",
+            result.turmoil_result.err()
+        );
+        (
+            result.node_recorded_remote_version(&gateway, node_addr),
+            result.node_recorded_remote_version(&node, gateway_addr),
+        )
+    }
+
+    let real = {
+        let mut parts = env!("CARGO_PKG_VERSION")
+            .split(['.', '-'])
+            .filter_map(|p| p.parse::<u16>().ok());
+        (
+            parts.next().expect("major") as u8,
+            parts.next().expect("minor") as u8,
+            parts.next().expect("patch"),
+        )
+    };
+    assert_eq!(
+        run("advertised-version-control", false),
+        (Some(real), Some(real)),
+        "without overrides both sides record the real version"
+    );
+    assert_eq!(
+        run("advertised-version-override", true),
+        (Some((0, 2, 148)), Some((0, 2, 149))),
+        "each side records the version the other advertises"
+    );
+}

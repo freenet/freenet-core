@@ -200,7 +200,10 @@ The cap is built on RealTime even in simulation, because the listener and
 its connections run on RealTime there: a VirtualTime cap would compute
 deficits on another clock than its waiters sleep and time out on. The QUIC
 endpoint runs on the cap's clock for the same reason (bind_udp_listener
-builds both on RealTime; tests build both on one VirtualTime).
+builds both on RealTime in production; tests build both on one
+VirtualTime). In a simulation the endpoint runs on the network's
+VirtualTime, so bind_udp_listener refuses a simulated node with both
+transport-quic and total-bandwidth-limit.
 Tests assert on per-cap EgressCap::stats(), never the global counters.
 ```
 
@@ -923,6 +926,21 @@ back the next. QUIC integration tests run under a watchdog thread
 In tests, two endpoints on SimulationSocket with one VirtualTime and a
 seeded GlobalRng repeat the same event trace; the bytes differ, because
 rustls's key exchange and the XEdDSA nonce use the OS RNG.
+
+In SimNetwork (#5940 e5a-1): `with_transport_quic` / `with_node_transport_quic`
+set the config value per node (off by default), and the endpoint runs on the
+network's VirtualTime (`get_socket_virtual_time`; RealTime in production,
+pinned by `the_transport_endpoint_runs_on_virtual_time_only_in_simulation`).
+Its bind-time GlobalRng draw (quinn's rng_seed) runs on
+`GlobalRng::with_side_stream`, so enabling QUIC does not shift the run's main
+random stream; the one remaining difference from QUIC off is scheduling (one
+endpoint driver task per node), which changes some connection choices, so a
+QUIC-on run is compared with QUIC off by the peers that join, not by the
+exact edge set. Other knobs: `with_node_advertised_version` (the version a
+node advertises in its intro and AckConnectionV2, to emulate an older peer;
+compatibility checks keep the real version), `with_quic_idle_timeout`, and
+`drop_quic_datagrams_between` (drops QUIC-class datagrams, by the demux
+classifier, for one pair from a virtual time; `simulation::QuicDatagramDrop`).
 `quic/test_tls.rs` holds only a plain Ed25519 identity for tests where a
 peer presents a key that is not its transport key.
 

@@ -159,9 +159,11 @@ pub enum PacketDeliveryDecision {
 /// Callback type for packet delivery decisions.
 ///
 /// This allows the fault injection logic to be injected from outside
-/// without creating circular dependencies.
+/// without creating circular dependencies. Arguments: network name, source,
+/// destination, and the datagram itself (so a fault can act on one class of
+/// datagram, e.g. QUIC by its first byte).
 pub type PacketDeliveryCallback =
-    Arc<dyn Fn(&str, SocketAddr, SocketAddr) -> PacketDeliveryDecision + Send + Sync>;
+    Arc<dyn Fn(&str, SocketAddr, SocketAddr, &[u8]) -> PacketDeliveryDecision + Send + Sync>;
 
 /// Callback for queuing a packet for delayed delivery.
 pub type QueuePacketCallback =
@@ -220,6 +222,7 @@ pub(crate) fn check_packet_delivery(
     network_name: &str,
     from: SocketAddr,
     to: SocketAddr,
+    datagram: &[u8],
 ) -> PacketDeliveryDecision {
     // Clone the Arc out so no map shard guard is held while the callback runs
     // (it locks the network's fault injector).
@@ -227,7 +230,7 @@ pub(crate) fn check_packet_delivery(
         .get(network_name)
         .map(|r| r.value().clone());
     match callback {
-        Some(cb) => cb(network_name, from, to),
+        Some(cb) => cb(network_name, from, to, datagram),
         None => PacketDeliveryDecision::Deliver,
     }
 }
@@ -526,7 +529,7 @@ impl<T: TimeSource> InMemorySocket<T> {
 
         let data = buf.to_vec();
 
-        match check_packet_delivery(&self.network_name, self.addr, target) {
+        match check_packet_delivery(&self.network_name, self.addr, target, buf) {
             PacketDeliveryDecision::Drop => {
                 // Silently drop - from sender's perspective, packet was sent
                 Ok(buf.len())
@@ -566,7 +569,7 @@ impl<T: TimeSource> InMemorySocket<T> {
 
         let data = buf.to_vec();
 
-        match check_packet_delivery(&self.network_name, self.addr, target) {
+        match check_packet_delivery(&self.network_name, self.addr, target, buf) {
             PacketDeliveryDecision::Drop => Ok(buf.len()),
             PacketDeliveryDecision::DelayedDelivery(delay) => {
                 // For blocking context, just sleep and deliver
@@ -742,27 +745,31 @@ mod tests {
         let is_drop = |d: PacketDeliveryDecision| matches!(d, PacketDeliveryDecision::Drop);
 
         let drop_all: PacketDeliveryCallback =
-            Arc::new(|_: &str, _: SocketAddr, _: SocketAddr| PacketDeliveryDecision::Drop);
+            Arc::new(|_: &str, _: SocketAddr, _: SocketAddr, _: &[u8]| {
+                PacketDeliveryDecision::Drop
+            });
         let deliver_all: PacketDeliveryCallback =
-            Arc::new(|_: &str, _: SocketAddr, _: SocketAddr| PacketDeliveryDecision::Deliver);
+            Arc::new(|_: &str, _: SocketAddr, _: SocketAddr, _: &[u8]| {
+                PacketDeliveryDecision::Deliver
+            });
 
         set_packet_delivery_callback(net_a, Some(drop_all));
         set_packet_delivery_callback(net_b, Some(deliver_all));
         assert!(
-            is_drop(check_packet_delivery(net_a, from, to)),
+            is_drop(check_packet_delivery(net_a, from, to, &[])),
             "installing network B's callback must not replace network A's"
         );
-        assert!(!is_drop(check_packet_delivery(net_b, from, to)));
+        assert!(!is_drop(check_packet_delivery(net_b, from, to, &[])));
 
         set_packet_delivery_callback(net_b, None);
         assert!(
-            is_drop(check_packet_delivery(net_a, from, to)),
+            is_drop(check_packet_delivery(net_a, from, to, &[])),
             "removing network B's callback must leave network A's in force"
         );
 
         set_packet_delivery_callback(net_a, None);
         assert!(
-            !is_drop(check_packet_delivery(net_a, from, to)),
+            !is_drop(check_packet_delivery(net_a, from, to, &[])),
             "a network with no callback delivers everything"
         );
 
@@ -917,7 +924,7 @@ mod tests {
         const DELAY: Duration = Duration::from_millis(30);
         set_packet_delivery_callback(
             network,
-            Some(Arc::new(move |_, _, to| match to {
+            Some(Arc::new(move |_, _, to, _| match to {
                 t if t == drop_to => PacketDeliveryDecision::Drop,
                 t if t == queue_to => PacketDeliveryDecision::QueuedDelivery { deadline: DEADLINE },
                 t if t == delay_to => PacketDeliveryDecision::DelayedDelivery(DELAY),

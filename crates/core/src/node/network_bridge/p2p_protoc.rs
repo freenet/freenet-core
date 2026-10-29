@@ -725,6 +725,10 @@ pub(in crate::node) struct P2pConnManager {
     /// into the transport handler. `None` in production.
     /// See `NodeConfig::ack_version_floor_override`.
     ack_version_floor_override: Option<(u8, u8, u16)>,
+    /// Simulation-only: the version the transport advertises in place of
+    /// the real one. `None` in production. Only used to open the transport.
+    /// See `NodeConfig::advertised_version_override`.
+    advertised_version_override: Option<(u8, u8, u16)>,
     blocked_addresses: Option<HashSet<SocketAddr>>,
     /// Per-contract retry count for broadcasts that found no targets yet.
     broadcast_retries: HashMap<freenet_stdlib::prelude::ContractKey, u8>,
@@ -1280,6 +1284,7 @@ impl P2pConnManager {
             this_location: config.location,
             check_version: !config.config.network_api.ignore_protocol_version,
             ack_version_floor_override: config.ack_version_floor_override,
+            advertised_version_override: config.advertised_version_override,
             bandwidth_limit: config.config.network_api.bandwidth_limit,
             global_bandwidth: config
                 .config
@@ -1315,7 +1320,12 @@ impl P2pConnManager {
                 }),
             ledbat_min_ssthresh: config.config.network_api.ledbat_min_ssthresh,
             congestion_config: config.config.network_api.build_congestion_config(),
-            quic: config.config.network_api.quic_settings(),
+            quic: config.config.network_api.quic_settings().map(|settings| {
+                crate::transport::quic::QuicSettings {
+                    idle_timeout: config.quic_idle_timeout_override,
+                    ..settings
+                }
+            }),
             blocked_addresses: config.blocked_addresses.clone(),
             broadcast_retries: HashMap::new(),
             broadcast_no_target_streak: HashMap::new(),
@@ -1376,6 +1386,7 @@ impl P2pConnManager {
                 congestion_config: Some(self.congestion_config.clone()),
                 ack_version_floor_override: self.ack_version_floor_override,
                 quic: self.quic,
+                advertised_version_override: self.advertised_version_override,
             },
         )
         .await?;
@@ -1422,6 +1433,7 @@ impl P2pConnManager {
             congestion_config,
             ack_version_floor_override,
             quic,
+            advertised_version_override,
             blocked_addresses,
             broadcast_retries,
             broadcast_no_target_streak,
@@ -1519,6 +1531,7 @@ impl P2pConnManager {
             ack_version_floor_override,
             // Used by open_udp_transport like the fields above.
             quic,
+            advertised_version_override,
             blocked_addresses,
             broadcast_retries,
             broadcast_no_target_streak,

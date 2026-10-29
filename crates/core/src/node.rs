@@ -517,6 +517,19 @@ pub struct NodeConfig {
     /// serialized.
     #[serde(skip)]
     pub(crate) broadcast_target_list_floor_override: Option<(u8, u8, u16)>,
+    /// Simulation-only: the protocol version this node advertises in its
+    /// transport handshakes instead of the real one, so a simulation can
+    /// emulate an older peer (`SimNetwork::with_node_advertised_version`).
+    /// The node still behaves as this binary; only what its peers learn of
+    /// its version changes. `None` in production. `#[serde(skip)]`.
+    #[serde(skip)]
+    pub(crate) advertised_version_override: Option<(u8, u8, u16)>,
+    /// Simulation-only: the QUIC endpoint's idle timeout instead of its
+    /// clock's (24 h on `VirtualTime`), so a simulation can see a silent QUIC
+    /// path time out (`SimNetwork::with_quic_idle_timeout`). `None` in
+    /// production. `#[serde(skip)]`.
+    #[serde(skip)]
+    pub(crate) quic_idle_timeout_override: Option<std::time::Duration>,
     /// Test-only harness flag: when set, a startup-hosted contract
     /// (`SeedHostedContract`, i.e. `append_contracts` with `subscription =
     /// true`) is registered in the neighbor-hosting advertised set so the
@@ -776,6 +789,8 @@ impl NodeConfig {
             hash_first_summaries_floor_override: None,
             ack_version_floor_override: None,
             broadcast_target_list_floor_override: None,
+            advertised_version_override: None,
+            quic_idle_timeout_override: None,
             advertise_seeded_hosts: false,
             hosting_time_source_override: None,
             update_rate_limit_time_source_override: None,

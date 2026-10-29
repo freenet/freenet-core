@@ -446,15 +446,30 @@ impl ScheduledOperation {
 /// every network that did not opt in) is delivered unchanged, so installing this
 /// callback cannot alter fault behavior for any path that did not opt in.
 /// See #4642 piece F (scripted crashes) and #4694 (direct-runner churn).
+///
+/// Independently of `enforce_fault_drops`, it drops a QUIC-class datagram a
+/// `QuicDatagramDrop` rule matches (counted in
+/// `stats.messages_dropped_quic_datagram`): a rule is only there because a
+/// test added one (`SimNetwork::drop_quic_datagrams_between`).
 #[cfg(any(test, feature = "testing"))]
 fn fault_injection_delivery_decision(
     network_name: &str,
     from: SocketAddr,
     to: SocketAddr,
+    datagram: &[u8],
 ) -> crate::transport::in_memory_socket::PacketDeliveryDecision {
     use crate::transport::in_memory_socket::PacketDeliveryDecision;
     if let Some(injector) = crate::node::network_bridge::get_fault_injector(network_name) {
         let mut inj = injector.lock().unwrap();
+        if !inj.config.quic_datagram_drops.is_empty() {
+            use crate::simulation::TimeSource;
+            if let Some(now) = inj.virtual_time.as_ref().map(|vt| vt.now_nanos()) {
+                if inj.config.drops_quic_datagram(&from, &to, datagram, now) {
+                    inj.stats.messages_dropped_quic_datagram += 1;
+                    return PacketDeliveryDecision::Drop;
+                }
+            }
+        }
         if inj.enforce_fault_drops {
             if inj.config.is_crashed(&from) || inj.config.is_crashed(&to) {
                 inj.stats.messages_dropped_crash += 1;
@@ -1896,13 +1911,126 @@ impl SimNetwork {
     /// neither replace it nor clear it (#5673).
     #[cfg(any(test, feature = "testing"))]
     fn enable_fault_drop_enforcement(&self) {
+        self.install_fault_delivery_callback();
+        if let Some(injector) = crate::node::network_bridge::get_fault_injector(&self.name) {
+            injector.lock().unwrap().enforce_fault_drops = true;
+        }
+    }
+
+    /// Installs [`fault_injection_delivery_decision`] as this network's
+    /// packet-delivery callback, without opting in to crash and partition
+    /// drops. Idempotent.
+    #[cfg(any(test, feature = "testing"))]
+    fn install_fault_delivery_callback(&self) {
         crate::transport::in_memory_socket::set_packet_delivery_callback(
             &self.name,
             Some(Arc::new(fault_injection_delivery_decision)),
         );
-        if let Some(injector) = crate::node::network_bridge::get_fault_injector(&self.name) {
-            injector.lock().unwrap().enforce_fault_drops = true;
+    }
+
+    /// The config of the node `label`, gateway or regular, before it starts.
+    ///
+    /// # Panics
+    /// If no node with that label is waiting to start.
+    fn node_config_mut(&mut self, label: &NodeLabel) -> &mut NodeConfig {
+        if let Some((builder, _)) = self
+            .gateways
+            .iter_mut()
+            .find(|(_, gateway)| gateway.label == *label)
+        {
+            return &mut builder.config;
         }
+        match self.nodes.iter_mut().find(|(_, node)| node == label) {
+            Some((builder, _)) => &mut builder.config,
+            None => panic!("no node {label} is waiting to start"),
+        }
+    }
+
+    /// Sets `transport-quic` to `value`, as `config.toml` would (`"off"`,
+    /// `"prefer"`), on every node. Unset (off) by default. Call before the
+    /// simulation starts.
+    pub fn with_transport_quic(&mut self, value: &str) -> &mut Self {
+        let labels: Vec<NodeLabel> = self
+            .gateways
+            .iter()
+            .map(|(_, gateway)| gateway.label.clone())
+            .chain(self.nodes.iter().map(|(_, label)| label.clone()))
+            .collect();
+        for label in &labels {
+            self.with_node_transport_quic(label, value);
+        }
+        self
+    }
+
+    /// Sets `transport-quic` to `value` on the node `label` only. A node in
+    /// a simulation builds its QUIC endpoint on the network's `VirtualTime`.
+    pub fn with_node_transport_quic(&mut self, label: &NodeLabel, value: &str) -> &mut Self {
+        let config = self.node_config_mut(label);
+        Arc::make_mut(&mut config.config).network_api.transport_quic = Some(value.to_string());
+        self
+    }
+
+    /// Makes the node `label` advertise `version` in its transport
+    /// handshakes instead of this binary's version, so its peers treat it as
+    /// that (older) release in every version gate, e.g. `(0, 2, 148)` for a
+    /// peer that cannot decode a QUIC upgrade message. The node itself still
+    /// runs this binary's code; only what its peers learn changes.
+    pub fn with_node_advertised_version(
+        &mut self,
+        label: &NodeLabel,
+        version: (u8, u8, u16),
+    ) -> &mut Self {
+        self.node_config_mut(label).advertised_version_override = Some(version);
+        self
+    }
+
+    /// Gives every node's QUIC endpoint the idle timeout `timeout` instead
+    /// of its clock's (24 h on `VirtualTime`), so a silent QUIC path times
+    /// out within a simulation. No effect on a node with QUIC off.
+    pub fn with_quic_idle_timeout(&mut self, timeout: Duration) -> &mut Self {
+        for (builder, _) in self.gateways.iter_mut() {
+            builder.config.quic_idle_timeout_override = Some(timeout);
+        }
+        for (builder, _) in self.nodes.iter_mut() {
+            builder.config.quic_idle_timeout_override = Some(timeout);
+        }
+        self
+    }
+
+    /// Drops every QUIC-class datagram between the nodes `a` and `b`, both
+    /// directions, from virtual time `from` on (the network's clock starts
+    /// at zero). Every other datagram between them is delivered as before,
+    /// so their UDP session is unaffected. Counted in the network's
+    /// `messages_dropped_quic_datagram`.
+    ///
+    /// The rule lives in this network's fault injector: call it after
+    /// [`Self::with_fault_injection`], which replaces the injector.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn drop_quic_datagrams_between(
+        &mut self,
+        a: &NodeLabel,
+        b: &NodeLabel,
+        from: Duration,
+    ) -> &mut Self {
+        let address = |label: &NodeLabel| {
+            *self
+                .node_addresses
+                .get(label)
+                .unwrap_or_else(|| panic!("no node {label}"))
+        };
+        let rule = crate::simulation::QuicDatagramDrop::new(
+            address(a),
+            address(b),
+            u64::try_from(from.as_nanos()).unwrap_or(u64::MAX),
+        );
+        crate::node::network_bridge::get_fault_injector(&self.name)
+            .expect("SimNetwork::new registers a fault injector")
+            .lock()
+            .unwrap()
+            .config
+            .add_quic_datagram_drop(rule);
+        self.install_fault_delivery_callback();
+        self
     }
 }
 
@@ -7210,7 +7338,7 @@ mod tests {
             .config
             .crash_node(crashed);
         assert!(
-            is_drop(check_packet_delivery(NET_B, live_x, crashed)),
+            is_drop(check_packet_delivery(NET_B, live_x, crashed, &[])),
             "precondition: B's crashed node drops packets before A exists"
         );
 
@@ -7232,15 +7360,15 @@ mod tests {
             "dropping A must not remove B's callback"
         );
         assert!(
-            is_drop(check_packet_delivery(NET_B, live_x, crashed)),
+            is_drop(check_packet_delivery(NET_B, live_x, crashed, &[])),
             "after A dropped, packets TO B's crashed node must still be dropped"
         );
         assert!(
-            is_drop(check_packet_delivery(NET_B, crashed, live_x)),
+            is_drop(check_packet_delivery(NET_B, crashed, live_x, &[])),
             "after A dropped, packets FROM B's crashed node must still be dropped"
         );
         assert!(
-            !is_drop(check_packet_delivery(NET_B, live_x, live_y)),
+            !is_drop(check_packet_delivery(NET_B, live_x, live_y, &[])),
             "B's healthy nodes must still reach each other"
         );
 
@@ -7292,11 +7420,21 @@ mod tests {
 
         // (1) Not opted in: faults are inert, everything is delivered.
         assert!(
-            !is_drop(fault_injection_delivery_decision(NETWORK, crashed, live_a)),
+            !is_drop(fault_injection_delivery_decision(
+                NETWORK,
+                crashed,
+                live_a,
+                &[]
+            )),
             "crash must be inert without enforce_fault_drops (pre-#4694 behavior)"
         );
         assert!(
-            !is_drop(fault_injection_delivery_decision(NETWORK, part_x, part_y)),
+            !is_drop(fault_injection_delivery_decision(
+                NETWORK,
+                part_x,
+                part_y,
+                &[]
+            )),
             "partition must be inert without enforce_fault_drops"
         );
 
@@ -7304,27 +7442,52 @@ mod tests {
 
         // (2) Crashed node: dropped in both directions.
         assert!(
-            is_drop(fault_injection_delivery_decision(NETWORK, crashed, live_a)),
+            is_drop(fault_injection_delivery_decision(
+                NETWORK,
+                crashed,
+                live_a,
+                &[]
+            )),
             "packet FROM a crashed node must be dropped"
         );
         assert!(
-            is_drop(fault_injection_delivery_decision(NETWORK, live_a, crashed)),
+            is_drop(fault_injection_delivery_decision(
+                NETWORK,
+                live_a,
+                crashed,
+                &[]
+            )),
             "packet TO a crashed node must be dropped"
         );
 
         // (3) Partitioned pair: dropped in both directions.
         assert!(
-            is_drop(fault_injection_delivery_decision(NETWORK, part_x, part_y)),
+            is_drop(fault_injection_delivery_decision(
+                NETWORK,
+                part_x,
+                part_y,
+                &[]
+            )),
             "packet across an active partition must be dropped (x->y)"
         );
         assert!(
-            is_drop(fault_injection_delivery_decision(NETWORK, part_y, part_x)),
+            is_drop(fault_injection_delivery_decision(
+                NETWORK,
+                part_y,
+                part_x,
+                &[]
+            )),
             "packet across an active partition must be dropped (y->x)"
         );
 
         // (4) Unaffected pair: delivered.
         assert!(
-            !is_drop(fault_injection_delivery_decision(NETWORK, live_a, part_x)),
+            !is_drop(fault_injection_delivery_decision(
+                NETWORK,
+                live_a,
+                part_x,
+                &[]
+            )),
             "healthy, non-partitioned pair must be delivered"
         );
 
@@ -7384,5 +7547,181 @@ mod tests {
              Run 2: {:?}",
             locations1, locations2
         );
+    }
+
+    /// The gateway, then the regular nodes in order, of `sim`.
+    fn labels_in_order(sim: &SimNetwork) -> Vec<NodeLabel> {
+        let mut labels: Vec<NodeLabel> = sim.all_node_addresses().keys().cloned().collect();
+        labels.sort_by_key(|label| (!label.is_gateway(), label.to_string()));
+        labels
+    }
+
+    /// Each QUIC harness knob reaches the config of exactly the nodes it
+    /// names (#5940 e5a-1).
+    #[tokio::test(flavor = "current_thread")]
+    async fn quic_harness_knobs_reach_the_node_configs() {
+        const NETWORK: &str = "quic-harness-knobs-e5a1";
+        let mut sim = SimNetwork::new(NETWORK, 1, 2, 7, 3, 6, 2, 0x5940_E5A1_0010).await;
+        let labels = labels_in_order(&sim);
+        let (gateway, first, second) = (&labels[0], &labels[1], &labels[2]);
+        for label in &labels {
+            let config = sim.node_config_mut(label);
+            assert!(
+                config.config.network_api.quic_settings().is_none(),
+                "QUIC is off by default"
+            );
+            assert_eq!(config.advertised_version_override, None);
+            assert_eq!(config.quic_idle_timeout_override, None);
+        }
+        sim.with_transport_quic("prefer")
+            .with_node_transport_quic(second, "off")
+            .with_node_advertised_version(first, (0, 2, 148))
+            .with_quic_idle_timeout(Duration::from_secs(5));
+        for (label, quic, version) in [
+            (gateway, true, None),
+            (first, true, Some((0, 2, 148))),
+            (second, false, None),
+        ] {
+            let config = sim.node_config_mut(label);
+            assert_eq!(
+                config.config.network_api.quic_settings().is_some(),
+                quic,
+                "{label}"
+            );
+            assert_eq!(config.advertised_version_override, version, "{label}");
+            assert_eq!(
+                config.quic_idle_timeout_override,
+                Some(Duration::from_secs(5)),
+                "{label}"
+            );
+        }
+    }
+
+    /// `drop_quic_datagrams_between` drops QUIC-class datagrams between its
+    /// pair, both directions, from its start time on, and nothing else: not
+    /// before the start, not the pair's other datagrams, not another pair.
+    /// Sent through real simulation sockets, so the socket's send path, the
+    /// network's delivery callback and the rule are all exercised.
+    #[tokio::test(flavor = "current_thread")]
+    async fn quic_datagram_drop_drops_only_quic_datagrams_of_the_pair_after_t() {
+        use crate::node::network_bridge::get_fault_injector;
+        use crate::transport::in_memory_socket::SimulationSocket;
+        use futures::FutureExt;
+        const NETWORK: &str = "quic-datagram-drop-e5a1";
+        const T: Duration = Duration::from_secs(5);
+        let mut sim = SimNetwork::new(NETWORK, 1, 2, 7, 3, 6, 2, 0x5940_E5A1_0011).await;
+        let labels = labels_in_order(&sim);
+        let addr = |label: &NodeLabel| sim.all_node_addresses()[label];
+        let (a, b, c) = (addr(&labels[0]), addr(&labels[1]), addr(&labels[2]));
+        sim.drop_quic_datagrams_between(&labels[0], &labels[1], T);
+        // The nodes are not started, so their addresses are free to bind
+        // (and not yet registered with the network: starting does that).
+        let mut sockets = HashMap::new();
+        for at in [a, b, c] {
+            crate::transport::in_memory_socket::register_address_network(at, NETWORK);
+            sockets.insert(at, SimulationSocket::bind(at).await.unwrap());
+        }
+        let quic = [0xC0u8, 0, 0, 0, 1, 8];
+        let legacy = [0x02u8, 1, 2, 3];
+        // Sends `datagram` and says whether it arrived. Delivery is
+        // immediate (no latency is configured), so one poll suffices.
+        let delivered = |from: SocketAddr, to: SocketAddr, datagram: &[u8]| {
+            sockets[&from]
+                .send_to(datagram, to)
+                .now_or_never()
+                .expect("an in-memory send never waits")
+                .unwrap();
+            let mut buf = [0u8; 64];
+            match sockets[&to].recv_from(&mut buf).now_or_never() {
+                Some(Ok((len, source))) => {
+                    assert_eq!((source, &buf[..len]), (from, datagram));
+                    true
+                }
+                Some(Err(error)) => panic!("{error}"),
+                None => false,
+            }
+        };
+        let cases = [
+            (a, b, &quic[..]),
+            (b, a, &quic[..]),
+            (a, b, &legacy[..]),
+            (b, a, &legacy[..]),
+            (a, c, &quic[..]),
+            (c, b, &quic[..]),
+        ];
+        for (from, to, datagram) in cases {
+            assert!(
+                delivered(from, to, datagram),
+                "before T: {from} -> {to} {datagram:?} is delivered"
+            );
+        }
+        sim.advance_time(T);
+        for (from, to, datagram) in cases {
+            let dropped = datagram == &quic[..] && [from, to] != [a, c] && [from, to] != [c, b];
+            assert_eq!(
+                delivered(from, to, datagram),
+                !dropped,
+                "from T: {from} -> {to} {datagram:?}"
+            );
+        }
+        let stats = get_fault_injector(NETWORK)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .stats
+            .clone();
+        assert_eq!(stats.messages_dropped_quic_datagram, 2);
+        assert_eq!(
+            stats.messages_dropped_crash + stats.messages_dropped_partition,
+            0
+        );
+    }
+
+    /// In a running simulation a node with `transport-quic = "prefer"`
+    /// has a QUIC ingress on its socket (a QUIC-class datagram from a
+    /// stranger is refused as not allowed), and a node left off has none.
+    #[tokio::test(flavor = "current_thread")]
+    async fn transport_quic_builds_the_endpoint_of_a_running_simulated_node() {
+        use crate::transport::in_memory_socket::deliver_packet_to_network;
+        use crate::transport::metrics::{QuicIngressOutcome, TRANSPORT_METRICS};
+        const NETWORK: &str = "quic-running-endpoint-e5a1";
+        let mut sim = SimNetwork::new(NETWORK, 1, 1, 7, 3, 6, 1, 0x5940_E5A1_0012).await;
+        let labels = labels_in_order(&sim);
+        sim.with_node_transport_quic(&labels[0], "prefer");
+        let _handles = sim
+            .start_with_rand_gen::<rand::rngs::SmallRng>(0x5940_E5A1_0012, 1, 1)
+            .await;
+        let targets: Vec<(SocketAddr, SocketAddr, QuicIngressOutcome)> = [
+            (&labels[0], 1, QuicIngressOutcome::NotAllowed),
+            (&labels[1], 2, QuicIngressOutcome::NoIngress),
+        ]
+        .into_iter()
+        .map(|(label, port, expected)| {
+            let stranger = SocketAddr::from(([10, 201, 39, 1], port));
+            TRANSPORT_METRICS.watch_quic_ingress(stranger);
+            (sim.all_node_addresses()[label], stranger, expected)
+        })
+        .collect();
+        let mut initial = vec![0xC0, 0, 0, 0, 1, 8];
+        initial.resize(1200, 0);
+        // A bound on how long the nodes take to bind, not a timing
+        // assumption: each pass resends until the listener has read one.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        for (target, stranger, expected) in targets {
+            while TRANSPORT_METRICS.quic_ingress_from(stranger).is_empty() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "{target} never read the datagram"
+                );
+                deliver_packet_to_network(NETWORK, target, initial.clone(), stranger);
+                sim.advance_time(Duration::from_millis(100));
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(
+                TRANSPORT_METRICS.quic_ingress_from(stranger)[0],
+                expected,
+                "{target}"
+            );
+        }
     }
 }

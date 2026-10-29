@@ -44,6 +44,17 @@ const fn encode_new_format(version: &str, min_compatible: &str) -> [u8; 8] {
     ]
 }
 
+/// `version` in the new 8-byte format, with this binary's min_compatible,
+/// for a simulated node that advertises an older version (see
+/// `UdpTransportConfig::advertised_version_override`).
+pub(super) fn encode_version((major, minor, patch): (u8, u8, u16)) -> [u8; 8] {
+    let mut bytes = PROTOC_VERSION;
+    bytes[1] = major;
+    bytes[2] = minor;
+    bytes[3..5].copy_from_slice(&patch.to_be_bytes());
+    bytes
+}
+
 /// Parse "X.Y.Z" or "X.Y.Z-prerelease" into (major, minor, patch as u16).
 const fn parse_semver(version: &str) -> (u8, u8, u16) {
     let mut major = 0u8;
@@ -430,6 +441,20 @@ mod tests {
         assert!(
             !old_peer_rejection_means_we_must_update("0.1.153", &local),
             "should not trigger update for same version"
+        );
+    }
+
+    #[test]
+    fn encode_version_keeps_min_compatible_and_round_trips() {
+        let ours = parse_version_bytes(&PROTOC_VERSION);
+        let older = parse_version_bytes(&encode_version((0, 2, 148)));
+        assert_eq!(older.version, (0, 2, 148));
+        assert_eq!(older.min_compatible, ours.min_compatible);
+        assert_eq!(encode_version(ours.version), PROTOC_VERSION);
+        assert_eq!(
+            parse_version_bytes(&encode_version((0, 2, 300))).version,
+            (0, 2, 300),
+            "a patch above 255 uses both bytes"
         );
     }
 
