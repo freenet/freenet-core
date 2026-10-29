@@ -776,11 +776,21 @@ impl ZombieSweepState {
 pub(super) enum LoopWake<T> {
     /// The event stream yielded (or ended, with `None`).
     Event(Option<T>),
-    /// A backlog sweep slice is due and no event arrived first.
-    ZombieSweepDue,
+    /// The timer deadline passed (a backlog sweep slice or the pending-claim
+    /// retry is due) and no event arrived first.
+    TimerDue,
 }
 
-/// Wait for the next event from `stream`, or, while a backlog exists, for its
+/// The earlier of two optional timer deadlines.
+pub(super) fn earliest(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// Wait for the next event from `stream`, or, while a backlog exists (or the
+/// caller passes another deadline, such as the pending-claim retry), for that
 /// deadline. This drains an EXISTING backlog on a quiet node, which would
 /// otherwise wait for some unrelated event. It does not start sweeping on a
 /// quiet node that has no backlog: that node still runs its first sweep of an
@@ -794,19 +804,16 @@ pub(super) enum LoopWake<T> {
 ///
 /// Cancellation-safe: dropping this future drops a `StreamExt::next` future,
 /// which is cancellation-safe, and a `Sleep`, which holds no state.
-pub(super) async fn next_wake<S>(
-    stream: &mut S,
-    backlog_deadline: Option<Instant>,
-) -> LoopWake<S::Item>
+pub(super) async fn next_wake<S>(stream: &mut S, deadline: Option<Instant>) -> LoopWake<S::Item>
 where
     S: futures::Stream + Unpin,
 {
-    match backlog_deadline {
+    match deadline {
         None => LoopWake::Event(StreamExt::next(stream).await),
         Some(deadline) => tokio::select! {
             biased;
             item = StreamExt::next(stream) => LoopWake::Event(item),
-            () = tokio::time::sleep_until(deadline) => LoopWake::ZombieSweepDue,
+            () = tokio::time::sleep_until(deadline) => LoopWake::TimerDue,
         },
     }
 }
@@ -1635,7 +1642,8 @@ mod tests {
                 SocketAddr::from(([192, 0, 2, 1], port)),
                 ConnectionEntry {
                     sender,
-                    pub_key: None,
+                    identity: Default::default(),
+                    receipt: None,
                     connection_id: 1,
                     created_at: created,
                     link_use: LinkUseStamp::new(created),
@@ -1672,7 +1680,7 @@ mod tests {
         let drained = tokio::time::timeout(Duration::from_secs(600), async {
             while !connections.is_empty() {
                 match next_wake(&mut events, state.backlog_deadline()).await {
-                    LoopWake::ZombieSweepDue => {
+                    LoopWake::TimerDue => {
                         if state.slice_due(Instant::now(), false) {
                             slices.push(run_slice(&mut connections, &mut state, &cm, false));
                         }
@@ -1702,7 +1710,8 @@ mod tests {
         }
         ConnectionEntry {
             sender,
-            pub_key: None,
+            identity: Default::default(),
+            receipt: None,
             connection_id: 1,
             created_at,
             link_use,
@@ -1939,11 +1948,12 @@ mod tests {
         const BACKLOG: &str = "} else if zombie_sweep_state.slice_due(Instant::now(), false) {";
 
         // The wake, then the event binding, then the sweep check, then dispatch.
-        let wake = find_unique(
-            SRC,
-            "zombie_sweep::next_wake(&mut select_stream, zombie_sweep_state.backlog_deadline())",
-        );
+        let wake = find_unique(SRC, "wake = zombie_sweep::next_wake(");
         let bind = find_unique(SRC, "let event = if let Some(result) = result {");
+        assert!(
+            SRC[wake..bind].contains("zombie_sweep_state.backlog_deadline()"),
+            "the loop's timer wake-up must include the backlog deadline"
+        );
         let (_, then_close) = block_span(SRC, bind);
         let after_then = &SRC[then_close + 1..];
         assert!(
@@ -2491,7 +2501,8 @@ mod tests {
             remote,
             ConnectionEntry {
                 sender,
-                pub_key: None,
+                identity: Default::default(),
+                receipt: None,
                 connection_id: 7,
                 created_at: created,
                 link_use: link_use.clone(),

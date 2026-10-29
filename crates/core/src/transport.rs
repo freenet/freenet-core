@@ -242,6 +242,8 @@ pub use congestion_control::{
     CongestionControlStats, CongestionController,
 };
 // Re-export transport metrics for periodic telemetry snapshots
+#[cfg(any(test, feature = "testing"))]
+pub use metrics::conn_identity_totals;
 pub(crate) use metrics::{ConnIdentity, NatAttemptOrigin};
 pub use metrics::{TRANSPORT_METRICS, TransportMetrics, TransportSnapshot};
 // Re-export reset functions for deterministic simulation testing
@@ -347,7 +349,7 @@ impl From<SocketAddr> for ObservedAddr {
 pub(crate) use self::boundary::TransportHandle;
 pub(crate) use self::boundary::{
     CloseReason, InboundAcceptor, InboundExpectations, InboundStreamRegistry, ListenerExit,
-    NextConnection, OutboundConnector, PeerConnectionApi, PendingConnection,
+    NextConnection, OutboundConnector, PeerConnectionApi, PendingConnection, ReceiptStamp,
     StreamProgressObserver, StreamSendOutcome,
 };
 pub use self::boundary::{IncomingChunks, IncomingStream, StreamIdentity};

@@ -206,7 +206,7 @@ impl P2pConnManager {
         let new_peer_loc = self
             .connections
             .get(&peer_addr)
-            .and_then(|e| e.pub_key.as_ref())
+            .and_then(|e| e.pub_key())
             .and_then(|pk| {
                 self.bridge
                     .op_manager

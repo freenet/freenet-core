@@ -15,10 +15,7 @@ pub struct Connection {
     ///
     /// Known gaps (best effort): if the bounded per-peer table evicts and
     /// recreates the entry mid-connection, the totals restart and the
-    /// reported bytes undercount (still positive) or are `None`; and a
-    /// connection moved to a new address by
-    /// `ConnectionManager::update_peer_identity` gets a fresh baseline for
-    /// the new address, so bytes sent before the move are not reported.
+    /// reported bytes undercount (still positive) or are `None`.
     pub(crate) bytes_at_connect: (u64, u64),
 }
 

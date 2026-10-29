@@ -17,6 +17,8 @@ use tokio::time::Instant;
 use tokio::time::{sleep, timeout};
 use tracing::Instrument;
 
+use identity::{BindOutcome, IdentitySource, Release};
+
 use super::{ConnectionError, EventLoopNotificationsReceiver, NetworkBridge};
 use crate::contract::{ContractHandlerEvent, WaitingTransaction};
 use crate::message::{NetMessageV1, QueryResult};
@@ -52,6 +54,7 @@ use freenet_stdlib::client_api::{ContractResponse, HostResponse};
 mod broadcast;
 mod connection_lifecycle;
 mod dispatch;
+mod identity;
 mod migration;
 mod zombie_sweep;
 
@@ -527,17 +530,21 @@ type PeerConnChannelSender = Sender<Either<NetMessage, ConnEvent>>;
 type PeerConnChannelRecv = Receiver<Either<NetMessage, ConnEvent>>;
 
 /// Entry in the connections HashMap, keyed by SocketAddr.
-/// The pub_key is learned from the first message received on this connection.
 #[derive(Debug)]
 struct ConnectionEntry {
     sender: PeerConnChannelSender,
-    /// The peer's public key: the key dialled for an outbound connection, or
-    /// for an inbound one matched to an expected-inbound registration.
-    /// `None` for any other inbound connection until a ConnectPeer or the
-    /// peer's ConnectRequest names the peer.
-    pub_key: Option<TransportPublicKey>,
+    /// The peer's identity: the key dialled for an outbound connection, or
+    /// the claimed key of an inbound one. Unbound for an inbound connection
+    /// until it is first named. Only the `identity` module can change it
+    /// (through `P2pConnManager::bind_identity`).
+    identity: identity::IdentitySlot,
+    /// When the transport last received an authenticated packet on this
+    /// connection, if it reports it. A bound connection holds its key against
+    /// a newer connection only while this is recent (`identity::HOLD_WINDOW`).
+    receipt: Option<crate::transport::ReceiptStamp>,
     /// Unique ID for this connection entry. Used to distinguish stale
-    /// TransportClosed events from replaced connections (e.g., after identity change).
+    /// TransportClosed events from replaced connections (e.g., a new
+    /// connection at the same address).
     connection_id: u64,
     /// When this transport connection was established.
     /// Used for zombie detection: connections not promoted to the ring
@@ -555,6 +562,13 @@ struct ConnectionEntry {
     /// `None` when the version wasn't exchanged (e.g. joiner->gateway path).
     /// Used to gate version-dependent message types (e.g. SubscribeHint).
     remote_version: Option<(u8, u8, u16)>,
+}
+
+impl ConnectionEntry {
+    /// The key bound to this connection, if any.
+    fn pub_key(&self) -> Option<&TransportPublicKey> {
+        self.identity.key()
+    }
 }
 
 /// Monotonically increasing counter for generating unique connection IDs.
@@ -686,7 +700,7 @@ pub(in crate::node) struct P2pConnManager {
     /// Used to find connections when we only know the peer's identity.
     /// Must be kept in sync with `connections`.
     /// Uses BTreeMap for deterministic iteration order in simulation tests.
-    addr_by_pub_key: BTreeMap<TransportPublicKey, SocketAddr>,
+    addr_by_pub_key: identity::KeyIndex,
     conn_event_tx: Option<Sender<ConnEvent>>,
     key_pair: TransportKeypair,
     listening_ip: IpAddr,
@@ -1279,7 +1293,7 @@ impl P2pConnManager {
             conn_bridge_rx: rx_bridge_cmd,
             event_listener: Box::new(event_listener),
             connections: BTreeMap::new(),
-            addr_by_pub_key: BTreeMap::new(),
+            addr_by_pub_key: identity::KeyIndex::default(),
             conn_event_tx: None,
             key_pair,
             listening_ip: listener_ip,
@@ -1564,6 +1578,14 @@ impl P2pConnManager {
         let mut loop_iteration_count = 0u64;
         let mut slow_event_count = 0u64;
         let mut last_stats_log = Instant::now();
+        // How often pending identity claims are retried while one may exist
+        // (`P2pConnManager::retry_pending_claims`). The retry deadline is part
+        // of the loop's timer wake-up, so it runs on a node with no events.
+        const PENDING_CLAIM_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+        let mut pending_claim_retry = connection_lifecycle::PendingClaimRetry::new(
+            Instant::now(),
+            PENDING_CLAIM_RETRY_INTERVAL,
+        );
         const STATS_LOG_INTERVAL: Duration = Duration::from_secs(30);
         let mut zombie_sweep_state = ZombieSweepState::new(Instant::now());
         const SLOW_EVENT_THRESHOLD: Duration = Duration::from_millis(100);
@@ -1582,13 +1604,21 @@ impl P2pConnManager {
                     return Err(listener_exit_error(&exit));
                 },
 
-                // Also wakes for a zombie sweep backlog deadline, so a backlog
-                // drains on a quiet node (see `zombie_sweep::next_wake`).
-                wake = zombie_sweep::next_wake(&mut select_stream, zombie_sweep_state.backlog_deadline()) => {
+                // Also wakes for a zombie sweep backlog deadline and for the
+                // pending-claim retry deadline, so both run on a quiet node
+                // (see `zombie_sweep::next_wake`).
+                wake = zombie_sweep::next_wake(
+                    &mut select_stream,
+                    zombie_sweep::earliest(
+                        zombie_sweep_state.backlog_deadline(),
+                        pending_claim_retry
+                            .deadline(ctx.addr_by_pub_key.may_have_pending_claims()),
+                    ),
+                ) => {
                     match wake {
                         zombie_sweep::LoopWake::Event(Some(result)) => Some(result),
                         zombie_sweep::LoopWake::Event(None) => break,
-                        zombie_sweep::LoopWake::ZombieSweepDue => None,
+                        zombie_sweep::LoopWake::TimerDue => None,
                     }
                 },
             };
@@ -1625,9 +1655,18 @@ impl P2pConnManager {
                 }
                 event
             } else {
-                // Woken only for a zombie sweep backlog slice; it runs below.
+                // Woken only for a timer (a zombie sweep backlog slice or the
+                // pending-claim retry); both run below.
                 EventResult::Continue
             };
+
+            if pending_claim_retry.take_due(Instant::now())
+                && ctx.addr_by_pub_key.may_have_pending_claims()
+                && ctx.retry_pending_claims(&handshake_cmd_sender).await
+            {
+                // Work left: run the next pass as soon as no event waits.
+                pending_claim_retry.run_again_now(Instant::now());
+            }
 
             // Periodic stats logging
             if last_stats_log.elapsed() > STATS_LOG_INTERVAL {
@@ -2294,7 +2333,7 @@ impl P2pConnManager {
                                     let peers_to_cleanup: Vec<_> = ctx
                                         .connections
                                         .iter()
-                                        .map(|(addr, entry)| (*addr, entry.pub_key.clone()))
+                                        .map(|(addr, entry)| (*addr, entry.pub_key().cloned()))
                                         .collect();
                                     for (peer_addr, pub_key_opt) in peers_to_cleanup {
                                         tracing::debug!(
@@ -2334,8 +2373,15 @@ impl P2pConnManager {
                                             ctx.handle_broadcast_ready_state(false).await;
                                         }
 
+                                        // Per-peer state goes only when no
+                                        // connection bound to the key is left in
+                                        // the ring, decided as on every other
+                                        // disconnect path.
                                         if let Some(ref pub_key) = pub_key_opt {
-                                            ctx.bridge.op_manager.on_ring_connection_lost(pub_key);
+                                            ctx.unbind_identity(peer_addr, pub_key);
+                                            ctx.forget_peer_state_unless_in_ring(
+                                                pub_key, peer_addr,
+                                            );
                                         }
 
                                         // Remove from connection map
@@ -2346,9 +2392,6 @@ impl P2pConnManager {
                                             "Removing connection from tracking map"
                                         );
                                         ctx.connections.remove(&peer_addr);
-                                        if let Some(pub_key) = pub_key_opt {
-                                            ctx.addr_by_pub_key.remove(&pub_key);
-                                        }
 
                                         // Notify handshake handler to clean up.
                                         // Non-blocking (#4145): runs on the event-loop task,
@@ -2542,7 +2585,7 @@ impl P2pConnManager {
                                     .iter()
                                     .filter_map(|(addr, entry)| {
                                         // Only include connections where we know the public key
-                                        entry.pub_key.as_ref().map(|pub_key| {
+                                        entry.pub_key().map(|pub_key| {
                                             PeerKeyLocation::new(pub_key.clone(), *addr)
                                         })
                                     })
@@ -2620,7 +2663,7 @@ impl P2pConnManager {
                                     .iter()
                                     .filter_map(|(addr, entry)| {
                                         // Only include connections where we know the public key
-                                        entry.pub_key.as_ref().map(|pub_key| {
+                                        entry.pub_key().map(|pub_key| {
                                             PeerKeyLocation::new(pub_key.clone(), *addr)
                                         })
                                     })
@@ -5038,7 +5081,8 @@ pub(crate) mod tests {
             addr,
             super::ConnectionEntry {
                 sender: tx1,
-                pub_key: None,
+                identity: Default::default(),
+                receipt: None,
                 connection_id: 10,
                 created_at: Instant::now(),
                 link_use: super::zombie_sweep::LinkUseStamp::new(Instant::now()),
@@ -5050,7 +5094,8 @@ pub(crate) mod tests {
             addr,
             super::ConnectionEntry {
                 sender: tx2,
-                pub_key: None,
+                identity: Default::default(),
+                receipt: None,
                 connection_id: 20,
                 created_at: Instant::now(),
                 link_use: super::zombie_sweep::LinkUseStamp::new(Instant::now()),
