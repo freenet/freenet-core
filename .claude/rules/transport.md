@@ -815,7 +815,7 @@ QUIC-class datagram is counted as `quic_ingress_forwarded`, `_not_allowed`,
 receiver gone, or disabled; every node with `transport-quic` off). The QUIC
 endpoint enables the ingress through `with_quic_ingress`, which disables it
 again (allow-set emptied and closed) if the endpoint cannot be built, so a
-failed `prefer` bind leaves the socket as with QUIC off.
+failed `shadow`/`prefer` bind leaves the socket as with QUIC off.
 
 Socket-health signal: the listener reads through `Socket::recv_classified`,
 which `DemuxSocket` answers with `Datagram` for a legacy datagram and
@@ -831,12 +831,19 @@ it must not wait unless it is a pacing point.
 
 #### QUIC endpoint (`transport/quic.rs`, #5940 step c2)
 
-`transport-quic` (config key, `off` by default, or `prefer`) decides whether
-`bind_udp_listener` builds a quinn endpoint over the DemuxSocket. Off: no
-endpoint, no QUIC ingress, nothing changes. Prefer: the endpoint is built
+`transport-quic` (config key, `off` by default, `shadow` or `prefer`) decides
+whether `bind_udp_listener` builds a quinn endpoint over the DemuxSocket.
+`prefer` runs as `shadow` until QUIC carries data (`QuicMode::effective`,
+which logs it at INFO). Off: no endpoint, no QUIC ingress, nothing changes.
+QUIC must stay off by default on Windows until the crash-loop breaker works
+there (#6031). Shadow or prefer: the endpoint is built
 with the node's QUIC identity (below) and an EMPTY allow-set, so nothing
 reaches it and it sends nothing; the listener holds it. Upgrading a UDP
-session to QUIC comes later, so only tests open QUIC connections. An unknown
+session to QUIC comes later, so only tests open QUIC connections. Its policy
+exists (`quic/upgrade/policy.rs`, not yet wired in): `QuicPolicy::allowed()`
+is true only when the mode is not off, the endpoint is `Up` and the breaker
+is not suppressing QUIC, and `QuicPathPermits` holds at most `quic-max-paths`
+paths (default `max-number-of-connections`). An unknown
 value is off with a warning, never an error: a crash-loop rollback
 reinstalls an older binary, which must start with a value a later release
 wrote, and keeps it in config.toml.
@@ -920,7 +927,7 @@ CI, so CI does not check that the test ran.
 
 Key material (stateless-reset key, token key, CID MAC key) comes from the OS
 entropy pool, never GlobalRng; quinn's rng_seed and the CID nonces stay on
-GlobalRng. With `prefer`, a failed endpoint build logs a WARN and the node
+GlobalRng. With `shadow` or `prefer`, a failed endpoint build logs a WARN and the node
 runs with QUIC off. `accept` returns the attempt without awaiting its
 handshake (QuicIncoming::establish), so one stalled handshake does not hold
 back the next. QUIC integration tests run under a watchdog thread

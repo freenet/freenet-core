@@ -139,7 +139,7 @@ congestion-control = "ledbat"  # or "bbr" or "fixedrate"
 ### Default Configuration
 - **Per-connection bandwidth limit**: 10 MB/s (configurable)
 - **Global bandwidth pool**: Disabled by default (enable with `--total-bandwidth-limit`)
-- **QUIC endpoint**: `transport-quic = "off"` by default (`--transport-quic`, `FREENET_TRANSPORT_QUIC`). `"prefer"` builds a QUIC endpoint on the network port that, in this release, accepts no connections and opens none; an unknown value is treated as `"off"` with a warning (#5940)
+- **QUIC endpoint**: `transport-quic = "off"` by default (`--transport-quic`, `FREENET_TRANSPORT_QUIC`). `"shadow"` builds a QUIC endpoint on the network port that, in this release, accepts no connections and opens none, and `"prefer"` runs as `"shadow"`; `quic-max-paths` (default `max-number-of-connections`) will bound the QUIC paths a node holds; an unknown value is treated as `"off"` with a warning (#5940)
 - **Min per-connection rate**: 1 MB/s (when global pool enabled), clamped to the total; `total-bandwidth-limit` is also a node-wide cap on everything the node sends (see [bandwidth configuration](configuration/bandwidth-configuration.md))
 - **Initial window (IW26)**: 38 KB (26 × 1,464-byte MSS)
 - **Slow start threshold**: 100 KB

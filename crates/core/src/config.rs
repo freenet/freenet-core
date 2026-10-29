@@ -332,6 +332,7 @@ impl Default for ConfigArgs {
                 congestion_control: None,  // Default: fixedrate (set in NetworkApiConfig)
                 bbr_startup_rate: None,    // Uses default from BBR config
                 transport_quic: None,      // Default: off
+                quic_max_paths: None,      // Default: max-number-of-connections
                 quic_ignore_crash_breaker: None,
             },
             ws_api: WebsocketApiArgs {
@@ -1023,6 +1024,9 @@ impl ConfigArgs {
             if self.network_api.transport_quic.is_none() {
                 self.network_api.transport_quic = cfg.network_api.transport_quic.clone();
             }
+            if let Some(limit) = cfg.network_api.quic_max_paths {
+                self.network_api.quic_max_paths.get_or_insert(limit);
+            }
             if cfg.network_api.quic_ignore_crash_breaker {
                 self.network_api
                     .quic_ignore_crash_breaker
@@ -1541,6 +1545,7 @@ impl ConfigArgs {
                     .unwrap_or_else(default_congestion_control),
                 bbr_startup_rate: self.network_api.bbr_startup_rate,
                 transport_quic: self.network_api.transport_quic.clone(),
+                quic_max_paths: self.network_api.quic_max_paths,
                 quic_ignore_crash_breaker: self
                     .network_api
                     .quic_ignore_crash_breaker
@@ -2468,15 +2473,24 @@ pub struct NetworkArgs {
     #[serde(rename = "bbr-startup-rate", skip_serializing_if = "Option::is_none")]
     pub bbr_startup_rate: Option<u64>,
 
-    /// QUIC transport (#5940): `off` (default) or `prefer`.
+    /// QUIC transport (#5940): `off` (default), `shadow` or `prefer`.
     ///
-    /// `prefer` builds a QUIC endpoint on the network port. In this release
+    /// `shadow` builds a QUIC endpoint on the network port. In this release
     /// the endpoint accepts no connections and opens none, so the node
-    /// behaves as with `off`. An unknown value is treated as `off`, with a
-    /// warning in the log.
-    #[arg(long, env = "FREENET_TRANSPORT_QUIC", value_name = "off|prefer")]
+    /// behaves as with `off`. `prefer` runs as `shadow` in this release. An
+    /// unknown value is treated as `off`, with a warning in the log.
+    #[arg(long, env = "FREENET_TRANSPORT_QUIC", value_name = "off|shadow|prefer")]
     #[serde(rename = "transport-quic", skip_serializing_if = "Option::is_none")]
     pub transport_quic: Option<String>,
+
+    /// The most QUIC paths this node holds at once, counting paths being
+    /// offered or dialed (#5940).
+    ///
+    /// Default: `max-number-of-connections`, so every connection may have
+    /// one. Unused in this release.
+    #[arg(long = "quic-max-paths", env = "FREENET_QUIC_MAX_PATHS")]
+    #[serde(rename = "quic-max-paths", skip_serializing_if = "Option::is_none")]
+    pub quic_max_paths: Option<usize>,
 
     /// Run QUIC even when the crash-loop breaker would keep it off (unix
     /// only; the breaker is off on Windows).
@@ -2758,15 +2772,24 @@ pub struct NetworkApiConfig {
     )]
     pub bbr_startup_rate: Option<u64>,
 
-    /// QUIC transport (#5940): `off` (the default when unset) or `prefer`.
-    /// Kept as written, so a value from a later release round-trips; see
-    /// [`Self::quic_settings`] for how it is read.
+    /// QUIC transport (#5940): `off` (the default when unset), `shadow` or
+    /// `prefer`. Kept as written, so a value from a later release
+    /// round-trips; see [`Self::quic_settings`] for how it is read.
     #[serde(
         default,
         rename = "transport-quic",
         skip_serializing_if = "Option::is_none"
     )]
     pub transport_quic: Option<String>,
+
+    /// The most QUIC paths this node holds at once (#5940); unset means
+    /// [`Self::max_connections`]. Read through [`Self::quic_max_paths`].
+    #[serde(
+        default,
+        rename = "quic-max-paths",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub quic_max_paths: Option<usize>,
 
     /// Run QUIC even when the crash-loop breaker would keep it off
     /// (`transport::quic::breaker`). Default false.
@@ -2807,15 +2830,23 @@ impl NetworkApiConfig {
     /// endpoint's flow-control windows are sized from it.
     pub(crate) fn quic_settings(&self) -> Option<crate::transport::quic::QuicSettings> {
         use crate::transport::quic::QuicMode;
-        match QuicMode::from_config_value(self.transport_quic.as_deref()) {
-            QuicMode::Off => None,
-            QuicMode::Prefer => Some(crate::transport::quic::QuicSettings {
-                max_connections: self.max_connections,
-                memory_limit: crate::wasm_runtime::read_total_ram_bytes()
-                    .unwrap_or(QUIC_FALLBACK_TOTAL_RAM),
-                idle_timeout: None,
-            }),
+        if !QuicMode::from_config_value(self.transport_quic.as_deref()).builds_endpoint() {
+            return None;
         }
+        Some(crate::transport::quic::QuicSettings {
+            max_connections: self.max_connections,
+            memory_limit: crate::wasm_runtime::read_total_ram_bytes()
+                .unwrap_or(QUIC_FALLBACK_TOTAL_RAM),
+            idle_timeout: None,
+        })
+    }
+
+    /// The most QUIC paths this node may hold at once: `quic-max-paths`, or
+    /// [`Self::max_connections`] when unset, which caps nothing (a
+    /// connection has at most one path).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn quic_max_paths(&self) -> usize {
+        self.quic_max_paths.unwrap_or(self.max_connections)
     }
 
     /// Build a `CongestionControlConfig` from the current network API configuration.
@@ -6950,7 +6981,12 @@ shutdown-drain-secs = 42
             "an unset key is not written"
         );
 
-        for (value, on) in [("prefer", true), ("off", false), ("a-later-mode", false)] {
+        for (value, on) in [
+            ("shadow", true),
+            ("prefer", true),
+            ("off", false),
+            ("a-later-mode", false),
+        ] {
             let text = RELEASED_CONFIG_TOML.replacen(
                 "mode = \"network\"\n",
                 &format!("mode = \"network\"\ntransport-quic = \"{value}\"\n"),
@@ -6974,6 +7010,25 @@ shutdown-drain-secs = 42
                 "written back as it was read: {rewritten}"
             );
         }
+
+        // `quic-max-paths`: absent unless set, kebab-case, and read back.
+        assert!(!toml::to_string(&unset).unwrap().contains("quic-max-paths"));
+        assert_eq!(
+            unset.network_api.quic_max_paths(),
+            unset.network_api.max_connections
+        );
+        let text = RELEASED_CONFIG_TOML.replacen(
+            "mode = \"network\"\n",
+            "mode = \"network\"\nquic-max-paths = 5\n",
+            1,
+        );
+        let cfg: Config = toml::from_str(&text).unwrap();
+        assert_eq!(cfg.network_api.quic_max_paths(), 5);
+        assert!(
+            toml::to_string(&cfg)
+                .unwrap()
+                .contains("quic-max-paths = 5")
+        );
     }
 
     /// The two spellings must be genuinely interchangeable, not merely both
@@ -9222,7 +9277,7 @@ shutdown-drain-secs = 42
     /// command line wins over the file.
     #[tokio::test]
     async fn transport_quic_survives_a_bare_build_and_cli_overrides_it() {
-        for value in ["prefer", "off", "a-later-mode"] {
+        for value in ["shadow", "prefer", "off", "a-later-mode"] {
             let temp_dir = tempfile::tempdir().unwrap();
             let mut first = local_args(temp_dir.path());
             first.network_api.transport_quic = Some(value.to_string());
@@ -9246,6 +9301,36 @@ shutdown-drain-secs = 42
             );
             assert_eq!(cfg.network_api.quic_settings().is_some(), other == "prefer");
         }
+    }
+
+    /// `quic-max-paths` (#5940) survives a bare restart, a value on the
+    /// command line wins over the file, and unset reads as
+    /// `max-number-of-connections`.
+    #[tokio::test]
+    async fn quic_max_paths_survives_a_bare_build_and_defaults_to_max_connections() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cfg = local_args(temp_dir.path()).build().await.unwrap();
+        assert_eq!(cfg.network_api.quic_max_paths, None);
+        assert_eq!(
+            cfg.network_api.quic_max_paths(),
+            cfg.network_api.max_connections
+        );
+
+        let mut first = local_args(temp_dir.path());
+        first.network_api.quic_max_paths = Some(3);
+        first.build().await.unwrap();
+        let cfg = local_args(temp_dir.path()).build().await.unwrap();
+        assert_eq!(cfg.network_api.quic_max_paths, Some(3), "bare build");
+        assert_eq!(cfg.network_api.quic_max_paths(), 3);
+
+        let mut cli = local_args(temp_dir.path());
+        cli.network_api.quic_max_paths = Some(0);
+        let cfg = cli.build().await.unwrap();
+        assert_eq!(
+            cfg.network_api.quic_max_paths(),
+            0,
+            "the command line overrides the file"
+        );
     }
 
     #[tokio::test]
@@ -9519,6 +9604,7 @@ shutdown-drain-secs = 42
                 congestion_control: "bbr".to_string(),
                 bbr_startup_rate: Some(5_000),
                 transport_quic: Some("prefer".to_string()),
+                quic_max_paths: Some(17),
                 quic_ignore_crash_breaker: true,
                 skip_load_from_network: true,
                 // serde-skip: a per-boot migration record, never persisted.
@@ -9731,6 +9817,7 @@ shutdown-drain-secs = 42
             congestion_control,
             bbr_startup_rate,
             transport_quic,
+            quic_max_paths,
             quic_ignore_crash_breaker,
             skip_load_from_network,
             dropped_persisted_loopback: _, // serde-skip: per-boot migration record
@@ -9801,6 +9888,10 @@ shutdown-drain-secs = 42
         assert_eq!(
             transport_quic, seed.network_api.transport_quic,
             "transport_quic"
+        );
+        assert_eq!(
+            quic_max_paths, seed.network_api.quic_max_paths,
+            "quic_max_paths"
         );
         assert_eq!(
             skip_load_from_network, seed.network_api.skip_load_from_network,

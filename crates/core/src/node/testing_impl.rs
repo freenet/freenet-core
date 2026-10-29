@@ -2004,7 +2004,7 @@ impl SimNetwork {
     }
 
     /// Sets `transport-quic` to `value`, as `config.toml` would (`"off"`,
-    /// `"prefer"`), on every node. Unset (off) by default. Call before the
+    /// `"shadow"`, `"prefer"`), on every node. Unset (off) by default. Call before the
     /// simulation starts.
     ///
     /// # Panics

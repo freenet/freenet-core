@@ -81,6 +81,13 @@ impl QuicAvailabilityWatch {
         Self(receiver)
     }
 
+    /// A watch starting at `initial`, and the sender that changes it (tests).
+    #[cfg(test)]
+    pub(crate) fn for_test(initial: QuicAvailability) -> (watch::Sender<QuicAvailability>, Self) {
+        let (sender, receiver) = watch::channel(initial);
+        (sender, Self(receiver))
+    }
+
     /// The current value.
     pub(crate) fn get(&self) -> QuicAvailability {
         *self.0.borrow()
