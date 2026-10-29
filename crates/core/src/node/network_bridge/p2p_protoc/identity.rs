@@ -10,18 +10,14 @@
 //!
 //! Rules kept here:
 //! - A connection is bound at most once and keeps its key until it closes.
-//! - One connection per key for claims: a claimed key is not bound while
-//!   another open connection is bound to it, however that one was bound. The
-//!   claim can be kept on its connection as pending. A holder that has not
-//!   been heard from within [`HOLD_WINDOW`] is closed by the caller
+//! - One connection per key. A key is not bound to a connection while
+//!   another open connection is bound to it, whether the new one was dialled
+//!   or claimed and however the holder was bound. The new connection can be
+//!   kept waiting, as a pending claim. A holder that has not been heard from
+//!   within [`HOLD_WINDOW`] is closed by the caller
 //!   ([`BindOutcome::HeldByQuiet`]); when the holder closes, the newest
-//!   pending claim of the key is bound. A dial is bound even while another
-//!   connection holds its key, since the connect op chose to dial it.
-//! - A binding does not take the index from a connection in the ring; a
-//!   connection promoted into the ring takes it ([`promoted`]).
-//! - The index maps a key to an open connection bound to it whenever one
-//!   exists. A connection that closes moves or removes its key's entry
-//!   unless the entry points at another open connection bound to the key.
+//!   pending claim of the key is bound.
+//! - The index maps each bound key to the one connection bound to it.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -40,22 +36,22 @@ pub(super) enum IdentitySource {
     /// expected-inbound registration carried for an inbound connection
     /// matched to it by address, the joiner key of the peer's own first
     /// ConnectRequest, or the key a ConnectPeer named for a connection that
-    /// had none. Once bound it is held to the same rules as a dialled key
-    /// (it never changes), and it is not bound while a dialled connection
-    /// elsewhere holds the key.
+    /// had none.
     Claimed,
 }
 
-/// A claim that was not bound because a dialled connection held the key.
-/// It is bound later (the key is released, or the dial goes quiet), if its
+/// A binding that was not made because another connection held the key. It
+/// is made later (the holder closes, or is replaced once quiet), if its
 /// connection is still open and still without an identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct PendingClaim {
     pub(super) key: TransportPublicKey,
-    /// Whether the claim, had it been bound, would have promoted the
-    /// connection into the ring (an expected-inbound match or a
-    /// ConnectPeer). A ConnectRequest claim does not promote.
+    /// Whether the binding, once made, promotes the connection into the
+    /// ring (a dial, an expected-inbound match, or a ConnectPeer; a
+    /// ConnectRequest does not promote).
     pub(super) promote: bool,
+    /// How the key will be bound: dialled if any attempt was a dial.
+    pub(super) source: IdentitySource,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -83,6 +79,7 @@ impl IdentitySlot {
     }
 
     /// How the bound key was bound, if the connection has one.
+    #[cfg(test)]
     pub(super) fn source(&self) -> Option<IdentitySource> {
         match &self.0 {
             State::Bound { source, .. } => Some(*source),
@@ -90,7 +87,7 @@ impl IdentitySlot {
         }
     }
 
-    /// The claim waiting for its key to be released, if any.
+    /// The binding waiting for its key to be released, if any.
     pub(super) fn pending(&self) -> Option<&PendingClaim> {
         match &self.0 {
             State::Pending(claim) => Some(claim),
@@ -99,7 +96,7 @@ impl IdentitySlot {
     }
 }
 
-/// Peer key to the address of an open connection bound to it, and whether
+/// Peer key to the address of the open connection bound to it, and whether
 /// a claim may be pending on some connection (set when [`bind`] keeps one,
 /// cleared by [`clear_pending_hint`] once none is left). The flag lets the
 /// event loop arm its retry timer only while there is something to retry.
@@ -138,24 +135,23 @@ pub(super) enum BindOutcome {
     /// The connection is bound to another key, which it keeps. Nothing
     /// changed.
     Mismatch(TransportPublicKey),
-    /// A claimed key that a connection at another address is bound to and
-    /// was heard from within [`HOLD_WINDOW`]. The connection stays without
-    /// an identity (with the claim pending, if the caller asked).
+    /// The key is bound to a connection at another address that was heard
+    /// from within [`HOLD_WINDOW`]. The connection stays without an identity
+    /// (kept waiting, if the caller asked).
     Held(SocketAddr),
-    /// A claimed key that a connection at another address is bound to but
-    /// has not been heard from within [`HOLD_WINDOW`]. Not bound either (the
-    /// claim is kept pending, if the caller asked): the caller closes the
-    /// quiet holder, and its release binds the newest pending claim of the
-    /// key.
+    /// The key is bound to a connection at another address that has not
+    /// been heard from within [`HOLD_WINDOW`]. Not bound either (kept
+    /// waiting, if the caller asked): the caller closes the quiet holder, and
+    /// its release binds the newest pending claim of the key.
     HeldByQuiet(SocketAddr),
     /// There is no open connection at the address. Nothing changed.
     NoConnection,
 }
 
-/// How long a connection holds its key against a claim after it last
-/// received an authenticated packet. Past it the connection is taken to
+/// How long a connection holds its key against a newer connection after it
+/// last received an authenticated packet. Past it the connection is taken to
 /// belong to a peer that has gone, for example restarted at another address,
-/// and is replaced by the claim rather than kept until the old session's
+/// and is replaced by the newer one rather than kept until the old session's
 /// idle timeout.
 ///
 /// Twice the transport's longest keepalive interval (15 s, which its
@@ -163,16 +159,15 @@ pub(super) enum BindOutcome {
 /// at least one of two consecutive pings in that time unless both are lost.
 /// The transport itself keeps a silent connection for much longer before
 /// closing it, since small packets are lost on some NAT paths; replacing a
-/// dial here costs that connection, so the window must not be shorter than a
-/// single lost keepalive round trip. The receipt stamp records when the
+/// connection here costs it, so the window must not be shorter than a single
+/// lost keepalive round trip. The receipt stamp records when the
 /// connection's task processed a packet, not when it arrived, so a backlog
 /// on that task also counts toward the window.
 pub(super) const HOLD_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// A connection, other than `exclude`, bound to `key`, and whether it was
-/// heard from within [`HOLD_WINDOW`]. A live one is preferred. A connection
-/// whose transport does not report receipt (a test double) counts as heard
-/// from.
+/// The connection, other than `exclude`, bound to `key`, and whether it was
+/// heard from within [`HOLD_WINDOW`]. A connection whose transport does not
+/// report receipt (a test double) counts as heard from.
 pub(super) fn key_holder(
     connections: &BTreeMap<SocketAddr, ConnectionEntry>,
     exclude: Option<SocketAddr>,
@@ -197,58 +192,35 @@ pub(super) fn key_holder(
     quiet
 }
 
-/// What [`bind`] would do for `key` at `addr` from `source`, without doing
-/// it, and another open connection bound to `key`, if any (preferring the
-/// one the index points at).
+/// What [`bind`] would do for `key` at `addr`, without doing it.
 pub(super) fn check(
     connections: &BTreeMap<SocketAddr, ConnectionEntry>,
-    index: &KeyIndex,
     addr: SocketAddr,
     key: &TransportPublicKey,
-    source: IdentitySource,
-) -> (BindOutcome, Option<SocketAddr>) {
+) -> BindOutcome {
     let Some(entry) = connections.get(&addr) else {
-        return (BindOutcome::NoConnection, None);
+        return BindOutcome::NoConnection;
     };
     if let Some(bound) = entry.identity.key() {
-        let outcome = if bound == key {
+        return if bound == key {
             BindOutcome::Same
         } else {
             BindOutcome::Mismatch(bound.clone())
         };
-        return (outcome, None);
     }
-    if source == IdentitySource::Claimed {
-        match key_holder(connections, Some(addr), key) {
-            Some((holder, true)) => return (BindOutcome::Held(holder), Some(holder)),
-            Some((holder, false)) => {
-                return (BindOutcome::HeldByQuiet(holder), Some(holder));
-            }
-            None => {}
-        }
+    match key_holder(connections, Some(addr), key) {
+        Some((holder, true)) => BindOutcome::Held(holder),
+        Some((holder, false)) => BindOutcome::HeldByQuiet(holder),
+        None => BindOutcome::Bound,
     }
-    let indexed = index.get(key).copied().filter(|holder| {
-        *holder != addr
-            && connections
-                .get(holder)
-                .is_some_and(|other| other.identity.key() == Some(key))
-    });
-    let holder = indexed.or_else(|| other_holder(connections, addr, key, |_| true));
-    (BindOutcome::Bound, holder)
 }
 
 /// Bind `key` from `source` to the connection at `addr`, as [`check`]
-/// decides. On [`BindOutcome::Held`] or
-/// [`BindOutcome::HeldByQuiet`], `pending` decides whether the claim is
-/// kept on the connection to be bound later: `Some(promote)` keeps it (see
-/// [`PendingClaim::promote`]; a claim already pending for the same key keeps
-/// `promote` if either says so), `None` leaves the connection as it was.
-///
-/// On a bind the index points at the new connection, unless it points at
-/// another connection bound to the key that `in_ring` reports in the ring
-/// while the new one is not: routing by key keeps finding the connection in
-/// the ring. Returns the outcome and, on a bind, another open connection
-/// bound to the same key.
+/// decides. On [`BindOutcome::Held`] or [`BindOutcome::HeldByQuiet`],
+/// `pending` decides whether the connection is kept waiting for the key:
+/// `Some(promote)` keeps it (see [`PendingClaim::promote`]; a claim already
+/// pending for the same key keeps `promote` if either says so, and becomes a
+/// dial if either was one), `None` leaves the connection as it was.
 pub(super) fn bind(
     connections: &mut BTreeMap<SocketAddr, ConnectionEntry>,
     index: &mut KeyIndex,
@@ -256,19 +228,10 @@ pub(super) fn bind(
     key: &TransportPublicKey,
     source: IdentitySource,
     pending: Option<bool>,
-    in_ring: impl Fn(SocketAddr) -> bool,
-) -> (BindOutcome, Option<SocketAddr>) {
-    let (outcome, holder) = check(connections, index, addr, key, source);
-    let keeps_index = index.get(key).copied().is_some_and(|indexed| {
-        indexed != addr
-            && in_ring(indexed)
-            && !in_ring(addr)
-            && connections
-                .get(&indexed)
-                .is_some_and(|other| other.identity.key() == Some(key))
-    });
+) -> BindOutcome {
+    let outcome = check(connections, addr, key);
     let Some(entry) = connections.get_mut(&addr) else {
-        return (outcome, holder);
+        return outcome;
     };
     match &outcome {
         BindOutcome::Bound => {
@@ -276,76 +239,51 @@ pub(super) fn bind(
                 key: key.clone(),
                 source,
             };
-            if !keeps_index {
-                index.0.insert(key.clone(), addr);
-            }
+            index.0.insert(key.clone(), addr);
         }
         BindOutcome::Held(_) | BindOutcome::HeldByQuiet(_) => {
             if let Some(promote) = pending {
-                let promote = promote
-                    || entry
-                        .identity
-                        .pending()
-                        .is_some_and(|claim| claim.key == *key && claim.promote);
+                let earlier = entry.identity.pending().filter(|claim| claim.key == *key);
+                let promote = promote || earlier.is_some_and(|claim| claim.promote);
+                let source = if earlier.is_some_and(|claim| claim.source == IdentitySource::Dialled)
+                {
+                    IdentitySource::Dialled
+                } else {
+                    source
+                };
                 entry.identity.0 = State::Pending(PendingClaim {
                     key: key.clone(),
                     promote,
+                    source,
                 });
                 index.1 = true;
             }
         }
         BindOutcome::Same | BindOutcome::Mismatch(_) | BindOutcome::NoConnection => {}
     }
-    (outcome, holder)
-}
-
-/// The connection at `addr` was promoted into the ring: point the index for
-/// its key at it, so routing by key finds the connection in the ring. Does
-/// nothing for a connection without an identity.
-pub(super) fn promoted(
-    connections: &BTreeMap<SocketAddr, ConnectionEntry>,
-    index: &mut KeyIndex,
-    addr: SocketAddr,
-) {
-    if let Some(key) = connections
-        .get(&addr)
-        .and_then(|entry| entry.identity.key())
-    {
-        index.0.insert(key.clone(), addr);
-    }
+    outcome
 }
 
 /// The outcome of [`release`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Release {
-    /// No other open connection is bound to the key: its index entry was
-    /// removed, and the key is no longer connected.
+    /// The index entry for the key pointed at the closing connection (or,
+    /// against the one-connection-per-key rule, at nothing) and is removed.
     Released,
-    /// The index now points at this other open connection bound to the same
-    /// key.
-    Moved(SocketAddr),
-    /// The index points at another open connection bound to the key.
-    /// Nothing changed.
+    /// The index points at another open connection bound to the key, which
+    /// the one-connection-per-key rule does not let arise. Nothing changed.
     NotOwner,
 }
 
-/// The connection at `addr`, bound to `key`, is closing. Updates the index
-/// for it. Call with the closing connection either still in `connections`
-/// or already removed; it is never chosen as the new holder.
-///
-/// Relies on the index invariant kept by [`bind`] and this function:
-/// whenever an open connection is bound to a key, the index maps the key to
-/// one of them. So an entry that points at another open connection bound to
-/// the key is left alone ([`Release::NotOwner`]); otherwise (it points at the
-/// closing connection, or, against the invariant, at nothing) the key moves
-/// to another holder, preferring one `in_ring` reports in the ring, then a
-/// dialled one, or is released.
+/// The connection at `addr`, bound to `key`, is closing: remove the index
+/// entry for the key unless it points at another open connection bound to
+/// it. Call with the closing connection either still in `connections` or
+/// already removed.
 pub(super) fn release(
     connections: &BTreeMap<SocketAddr, ConnectionEntry>,
     index: &mut KeyIndex,
     addr: SocketAddr,
     key: &TransportPublicKey,
-    in_ring: impl Fn(SocketAddr) -> bool,
 ) -> Release {
     if let Some(indexed) = index.get(key).copied() {
         if indexed != addr
@@ -356,31 +294,18 @@ pub(super) fn release(
             return Release::NotOwner;
         }
     }
-    let dialled =
-        |entry: &ConnectionEntry| entry.identity.source() == Some(IdentitySource::Dialled);
-    let next = other_holder(connections, addr, key, |(a, e)| in_ring(a) && dialled(e))
-        .or_else(|| other_holder(connections, addr, key, |(a, _)| in_ring(a)))
-        .or_else(|| other_holder(connections, addr, key, |(_, e)| dialled(e)))
-        .or_else(|| other_holder(connections, addr, key, |_| true));
-    match next {
-        Some(next) => {
-            index.0.insert(key.clone(), next);
-            Release::Moved(next)
-        }
-        None => {
-            index.0.remove(key);
-            Release::Released
-        }
-    }
+    index.0.remove(key);
+    Release::Released
 }
 
 /// The open connection, other than any at `exclude`, with a pending claim of
-/// `key`. The newest one (highest connection id) if there are several.
+/// `key`, and that claim. The newest one (highest connection id) if there
+/// are several.
 pub(super) fn pending_claimant(
     connections: &BTreeMap<SocketAddr, ConnectionEntry>,
     exclude: Option<SocketAddr>,
     key: &TransportPublicKey,
-) -> Option<(SocketAddr, bool)> {
+) -> Option<(SocketAddr, PendingClaim)> {
     connections
         .iter()
         .filter(|(addr, _)| Some(**addr) != exclude)
@@ -389,14 +314,14 @@ pub(super) fn pending_claimant(
                 .identity
                 .pending()
                 .filter(|claim| claim.key == *key)
-                .map(|claim| (entry.connection_id, *addr, claim.promote))
+                .map(|claim| (entry.connection_id, *addr, claim.clone()))
         })
         .max_by_key(|(id, _, _)| *id)
-        .map(|(_, addr, promote)| (addr, promote))
+        .map(|(_, addr, claim)| (addr, claim))
 }
 
 /// Mark the newest pending claim of `key` as promoting: it takes the ring
-/// slot of a holder in the ring that is being replaced for it.
+/// place of a holder in the ring that is being replaced for it.
 pub(super) fn promote_newest_claim(
     connections: &mut BTreeMap<SocketAddr, ConnectionEntry>,
     key: &TransportPublicKey,
@@ -435,22 +360,6 @@ pub(super) fn clear_pending_hint(
     }
 }
 
-/// An open connection other than `exclude` bound to `key` that `select`
-/// accepts.
-fn other_holder(
-    connections: &BTreeMap<SocketAddr, ConnectionEntry>,
-    exclude: SocketAddr,
-    key: &TransportPublicKey,
-    select: impl Fn((SocketAddr, &ConnectionEntry)) -> bool,
-) -> Option<SocketAddr> {
-    connections
-        .iter()
-        .find(|(addr, entry)| {
-            **addr != exclude && entry.identity.key() == Some(key) && select((**addr, entry))
-        })
-        .map(|(addr, _)| *addr)
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -485,6 +394,11 @@ mod tests {
 
         fn advance(&self, by: std::time::Duration) {
             self.now.fetch_add(by.as_nanos() as u64, Ordering::Relaxed);
+        }
+
+        fn receive(&self) {
+            self.last
+                .store(self.now.load(Ordering::Relaxed), Ordering::Relaxed);
         }
     }
 
@@ -528,19 +442,6 @@ mod tests {
             source: IdentitySource,
             pending: Option<bool>,
         ) -> BindOutcome {
-            self.bind_in_ring(at, key, source, pending, &[]).0
-        }
-
-        /// [`bind`] with the connections at `in_ring` in the ring, returning
-        /// the other holder too.
-        fn bind_in_ring(
-            &mut self,
-            at: SocketAddr,
-            key: &TransportPublicKey,
-            source: IdentitySource,
-            pending: Option<bool>,
-            in_ring: &[SocketAddr],
-        ) -> (BindOutcome, Option<SocketAddr>) {
             bind(
                 &mut self.connections,
                 &mut self.index,
@@ -548,20 +449,12 @@ mod tests {
                 key,
                 source,
                 pending,
-                |a| in_ring.contains(&a),
             )
         }
 
-        fn close(
-            &mut self,
-            at: SocketAddr,
-            key: &TransportPublicKey,
-            in_ring: &[SocketAddr],
-        ) -> Release {
+        fn close(&mut self, at: SocketAddr, key: &TransportPublicKey) -> Release {
             self.connections.remove(&at);
-            release(&self.connections, &mut self.index, at, key, |a| {
-                in_ring.contains(&a)
-            })
+            release(&self.connections, &mut self.index, at, key)
         }
     }
 
@@ -591,58 +484,62 @@ mod tests {
         assert!(!t.index.contains_key(&other));
     }
 
+    /// One connection per key, whatever the source of either: a claim and a
+    /// dial both wait for a holder bound by a claim or a dial, and are kept
+    /// waiting only when asked.
     #[test]
-    fn a_claim_is_held_by_a_live_dial_and_kept_only_when_asked() {
-        let mut t = Table::new();
-        let k = key();
-        t.open(addr(1), None);
-        t.bind(addr(1), &k, IdentitySource::Dialled, None);
-        t.open(addr(2), None);
-        t.open(addr(3), None);
-        assert_eq!(
-            t.bind(addr(2), &k, IdentitySource::Claimed, None),
-            BindOutcome::Held(addr(1))
-        );
-        assert!(t.connections[&addr(2)].identity.pending().is_none());
-        assert_eq!(
-            t.bind(addr(3), &k, IdentitySource::Claimed, Some(false)),
-            BindOutcome::Held(addr(1))
-        );
-        assert_eq!(
-            t.connections[&addr(3)].identity.pending(),
-            Some(&PendingClaim {
-                key: k.clone(),
-                promote: false
-            })
-        );
-        // A dial is not held back by another dial.
-        t.open(addr(4), None);
-        assert_eq!(
-            t.bind(addr(4), &k, IdentitySource::Dialled, None),
-            BindOutcome::Bound
-        );
-        assert_eq!(t.index.get(&k), Some(&addr(4)));
+    fn a_key_is_bound_to_one_connection_whatever_the_source() {
+        for holder_source in [IdentitySource::Dialled, IdentitySource::Claimed] {
+            for new_source in [IdentitySource::Dialled, IdentitySource::Claimed] {
+                let mut t = Table::new();
+                let k = key();
+                t.open(addr(1), None);
+                t.bind(addr(1), &k, holder_source, None);
+                t.open(addr(2), None);
+                assert_eq!(
+                    t.bind(addr(2), &k, new_source, None),
+                    BindOutcome::Held(addr(1)),
+                    "{new_source:?} beside {holder_source:?}"
+                );
+                assert!(t.connections[&addr(2)].identity.pending().is_none());
+                assert_eq!(
+                    t.bind(addr(2), &k, new_source, Some(false)),
+                    BindOutcome::Held(addr(1))
+                );
+                assert_eq!(
+                    t.connections[&addr(2)].identity.pending(),
+                    Some(&PendingClaim {
+                        key: k.clone(),
+                        promote: false,
+                        source: new_source,
+                    })
+                );
+                assert_eq!(t.index.get(&k), Some(&addr(1)));
+            }
+        }
     }
 
     #[test]
-    fn a_pending_claim_keeps_promote_if_either_attempt_had_it() {
+    fn a_pending_claim_keeps_promote_and_a_dial_if_either_attempt_had_it() {
         let mut t = Table::new();
         let k = key();
         t.open(addr(1), None);
         t.bind(addr(1), &k, IdentitySource::Dialled, None);
         t.open(addr(2), None);
-        t.bind(addr(2), &k, IdentitySource::Claimed, Some(true));
+        t.bind(addr(2), &k, IdentitySource::Dialled, Some(true));
         t.bind(addr(2), &k, IdentitySource::Claimed, Some(false));
-        assert!(t.connections[&addr(2)].identity.pending().unwrap().promote);
+        let claim = t.connections[&addr(2)].identity.pending().unwrap();
+        assert!(claim.promote);
+        assert_eq!(claim.source, IdentitySource::Dialled);
     }
 
     #[test]
-    fn a_dial_not_heard_from_within_the_window_does_not_hold_its_key() {
+    fn a_holder_not_heard_from_within_the_window_is_quiet() {
         let mut t = Table::new();
         let k = key();
         let clock = Clock::default();
         t.open(addr(1), Some(clock.stamp()));
-        t.bind(addr(1), &k, IdentitySource::Dialled, None);
+        t.bind(addr(1), &k, IdentitySource::Claimed, None);
         t.open(addr(2), None);
         clock.advance(HOLD_WINDOW);
         assert_eq!(
@@ -654,26 +551,25 @@ mod tests {
         assert_eq!(
             t.bind(addr(2), &k, IdentitySource::Claimed, Some(true)),
             BindOutcome::HeldByQuiet(addr(1)),
-            "a quiet dial still holds the key until the caller closes it"
+            "a quiet holder still holds the key until the caller closes it"
         );
-        assert!(t.connections[&addr(2)].identity.pending().is_some());
         assert_eq!(key_holder(&t.connections, None, &k), Some((addr(1), false)));
-        assert_eq!(t.index.get(&k), Some(&addr(1)));
-        // Its close leaves the key free for the pending claim.
-        assert_eq!(t.close(addr(1), &k, &[]), Release::Released);
+        assert_eq!(t.close(addr(1), &k), Release::Released);
         assert_eq!(
-            pending_claimant(&t.connections, None, &k),
+            pending_claimant(&t.connections, None, &k).map(|(a, c)| (a, c.promote)),
             Some((addr(2), true))
         );
-        // A receipt makes a dial hold again.
+        assert_eq!(
+            t.bind(addr(2), &k, IdentitySource::Claimed, None),
+            BindOutcome::Bound
+        );
+        // A receipt makes a holder hold again.
+        clock.receive();
         let k2 = key();
-        let clock2 = Clock::default();
-        t.open(addr(3), Some(clock2.stamp()));
+        t.open(addr(3), Some(clock.stamp()));
         t.bind(addr(3), &k2, IdentitySource::Dialled, None);
-        clock2.advance(HOLD_WINDOW * 2);
-        clock2
-            .last
-            .store(clock2.now.load(Ordering::Relaxed), Ordering::Relaxed);
+        clock.advance(HOLD_WINDOW * 2);
+        clock.receive();
         t.open(addr(4), None);
         assert_eq!(
             t.bind(addr(4), &k2, IdentitySource::Claimed, None),
@@ -685,95 +581,21 @@ mod tests {
     fn release_outcomes() {
         let mut t = Table::new();
         let k = key();
-        // Released: the last connection for the key.
         t.open(addr(1), None);
         t.bind(addr(1), &k, IdentitySource::Claimed, None);
-        assert_eq!(t.close(addr(1), &k, &[]), Release::Released);
+        assert_eq!(t.close(addr(1), &k), Release::Released);
         assert!(t.index.is_empty());
-
-        // NotOwner: the index points at another open holder.
+        // A missing entry is released too.
         t.open(addr(2), None);
         t.bind(addr(2), &k, IdentitySource::Claimed, None);
+        t.index.0.remove(&k);
+        assert_eq!(t.close(addr(2), &k), Release::Released);
+        // An entry for another open holder is left (against the rule; only
+        // reachable by editing the index directly).
         t.open(addr(3), None);
-        assert_eq!(
-            t.bind(addr(3), &k, IdentitySource::Dialled, None),
-            BindOutcome::Bound
-        );
+        t.bind(addr(3), &k, IdentitySource::Claimed, None);
+        assert_eq!(t.close(addr(4), &k), Release::NotOwner);
         assert_eq!(t.index.get(&k), Some(&addr(3)));
-        assert_eq!(t.close(addr(2), &k, &[]), Release::NotOwner);
-        assert_eq!(t.index.get(&k), Some(&addr(3)));
-        assert_eq!(t.close(addr(3), &k, &[]), Release::Released);
-    }
-
-    #[test]
-    fn release_moves_the_key_to_an_in_ring_holder_then_a_dialled_one() {
-        let mut t = Table::new();
-        let k = key();
-        // Ports order the map: the first holder found is the claimed one
-        // outside the ring, so the preference is what picks the others.
-        // The claims bind before the dials, which would hold them back.
-        for port in 10..=13 {
-            t.open(addr(port), None);
-        }
-        for (port, source) in [
-            (10, IdentitySource::Claimed),
-            (11, IdentitySource::Dialled),
-            (12, IdentitySource::Dialled),
-            (13, IdentitySource::Dialled),
-        ] {
-            assert_eq!(t.bind(addr(port), &k, source, None), BindOutcome::Bound);
-        }
-        assert_eq!(t.index.get(&k), Some(&addr(13)));
-        assert_eq!(
-            t.close(addr(13), &k, &[addr(12)]),
-            Release::Moved(addr(12)),
-            "in the ring first"
-        );
-        assert_eq!(
-            t.close(addr(12), &k, &[]),
-            Release::Moved(addr(11)),
-            "then dialled"
-        );
-        assert_eq!(t.close(addr(11), &k, &[]), Release::Moved(addr(10)));
-        assert_eq!(t.close(addr(10), &k, &[]), Release::Released);
-    }
-
-    #[test]
-    fn release_prefers_a_dial_among_holders_in_the_ring() {
-        let mut t = Table::new();
-        let k = key();
-        for port in 40..=42 {
-            t.open(addr(port), None);
-        }
-        for (port, source) in [
-            (40, IdentitySource::Claimed),
-            (41, IdentitySource::Dialled),
-            (42, IdentitySource::Dialled),
-        ] {
-            assert_eq!(t.bind(addr(port), &k, source, None), BindOutcome::Bound);
-        }
-        assert_eq!(
-            t.close(addr(42), &k, &[addr(40), addr(41)]),
-            Release::Moved(addr(41))
-        );
-    }
-
-    #[test]
-    fn release_without_an_index_entry_moves_or_releases() {
-        let mut t = Table::new();
-        let k = key();
-        t.open(addr(20), None);
-        t.bind(addr(20), &k, IdentitySource::Claimed, None);
-        t.open(addr(21), None);
-        assert_eq!(
-            t.bind(addr(21), &k, IdentitySource::Dialled, None),
-            BindOutcome::Bound
-        );
-        t.index.0.remove(&k);
-        assert_eq!(t.close(addr(21), &k, &[]), Release::Moved(addr(20)));
-        assert_eq!(t.index.get(&k), Some(&addr(20)));
-        t.index.0.remove(&k);
-        assert_eq!(t.close(addr(20), &k, &[]), Release::Released);
     }
 
     #[test]
@@ -782,21 +604,21 @@ mod tests {
         let (k, other) = (key(), key());
         t.open(addr(30), None);
         t.bind(addr(30), &k, IdentitySource::Dialled, None);
-        t.open(addr(30 + 2), None);
+        t.open(addr(32), None);
         t.bind(addr(32), &k, IdentitySource::Claimed, Some(false));
         t.open(addr(31), None);
         t.bind(addr(31), &k, IdentitySource::Claimed, Some(true));
         t.open(addr(33), None);
         t.bind(addr(33), &other, IdentitySource::Claimed, Some(true));
+        let newest = |t: &Table, exclude| {
+            pending_claimant(&t.connections, exclude, &k).map(|(a, c)| (a, c.promote))
+        };
         assert_eq!(
-            pending_claimant(&t.connections, Some(addr(30)), &k),
+            newest(&t, Some(addr(30))),
             Some((addr(31), true)),
             "the newest connection, not the lowest address"
         );
-        assert_eq!(
-            pending_claimant(&t.connections, Some(addr(31)), &k),
-            Some((addr(32), false))
-        );
+        assert_eq!(newest(&t, Some(addr(31))), Some((addr(32), false)));
         assert_eq!(pending_keys(&t.connections), vec![k.clone()]);
         assert!(pending_claimant(&t.connections, None, &other).is_none());
         assert!(t.index.may_have_pending_claims());
@@ -805,36 +627,6 @@ mod tests {
             t.index.may_have_pending_claims(),
             "claims are still pending"
         );
-    }
-
-    #[test]
-    fn bind_reports_the_other_holder_and_keeps_an_in_ring_index() {
-        let mut t = Table::new();
-        let k = key();
-        for port in 50..=52 {
-            t.open(addr(port), None);
-        }
-        assert_eq!(
-            t.bind_in_ring(addr(50), &k, IdentitySource::Claimed, None, &[]),
-            (BindOutcome::Bound, None)
-        );
-        // A claim is held by it; a dial binds beside it.
-        assert_eq!(
-            t.bind_in_ring(addr(51), &k, IdentitySource::Claimed, None, &[addr(50)]),
-            (BindOutcome::Held(addr(50)), Some(addr(50)))
-        );
-        // In the ring now; a dial outside it does not take the index.
-        assert_eq!(
-            t.bind_in_ring(addr(51), &k, IdentitySource::Dialled, None, &[addr(50)]),
-            (BindOutcome::Bound, Some(addr(50)))
-        );
-        assert_eq!(t.index.get(&k), Some(&addr(50)));
-        // Outside the ring, the index follows the newest binding.
-        assert_eq!(
-            t.bind_in_ring(addr(52), &k, IdentitySource::Dialled, None, &[]),
-            (BindOutcome::Bound, Some(addr(50)))
-        );
-        assert_eq!(t.index.get(&k), Some(&addr(52)));
     }
 
     #[test]
@@ -857,9 +649,21 @@ mod tests {
         assert!(!t.index.may_have_pending_claims());
     }
 
-    /// A live remote can miss one keepalive round trip without its dial
-    /// being taken for gone: the window spans at least two of the transport's
-    /// longest keepalive intervals.
+    #[test]
+    fn promote_newest_claim_marks_the_newest_claim() {
+        let mut t = Table::new();
+        let k = key();
+        t.open(addr(80), None);
+        t.bind(addr(80), &k, IdentitySource::Claimed, None);
+        t.open(addr(81), None);
+        t.bind(addr(81), &k, IdentitySource::Claimed, Some(false));
+        promote_newest_claim(&mut t.connections, &k);
+        assert!(t.connections[&addr(81)].identity.pending().unwrap().promote);
+    }
+
+    /// A live remote can miss one keepalive round trip without its
+    /// connection being taken for gone: the window spans at least two of the
+    /// transport's longest keepalive intervals.
     #[test]
     fn the_hold_window_spans_two_keepalive_intervals() {
         assert!(HOLD_WINDOW >= 2 * crate::transport::peer_connection::MAX_KEEPALIVE_INTERVAL);
@@ -867,17 +671,17 @@ mod tests {
 
     /// The window is exactly 30 s: long enough for a lost keepalive round
     /// trip (pinned above), and well inside the transport's 120 s idle
-    /// timeout, so a dial whose remote has gone is replaced long before the
-    /// transport would close it.
+    /// timeout, so a connection whose remote has gone is replaced long before
+    /// the transport would close it.
     #[test]
     fn the_hold_window_is_thirty_seconds() {
         assert_eq!(HOLD_WINDOW, std::time::Duration::from_secs(30));
     }
 
-    /// A dial whose transport does not report receipt counts as heard from,
-    /// so it holds its key however long ago it was opened.
+    /// A holder whose transport does not report receipt counts as heard
+    /// from, so it holds its key however long ago it was opened.
     #[test]
-    fn a_dial_without_a_receipt_stamp_counts_as_heard_from() {
+    fn a_holder_without_a_receipt_stamp_counts_as_heard_from() {
         let mut t = Table::new();
         let k = key();
         t.open(addr(70), None);
@@ -888,32 +692,5 @@ mod tests {
             t.bind(addr(71), &k, IdentitySource::Claimed, Some(true)),
             BindOutcome::Held(addr(70))
         );
-    }
-
-    /// One connection per key for claims: a claim is held by a connection
-    /// bound by a claim exactly as by a dial, live or quiet.
-    #[test]
-    fn a_claim_is_held_by_any_bound_connection() {
-        let mut t = Table::new();
-        let k = key();
-        let clock = Clock::default();
-        t.open(addr(80), Some(clock.stamp()));
-        t.bind(addr(80), &k, IdentitySource::Claimed, None);
-        t.open(addr(81), None);
-        assert_eq!(
-            t.bind(addr(81), &k, IdentitySource::Claimed, Some(false)),
-            BindOutcome::Held(addr(80))
-        );
-        clock.advance(HOLD_WINDOW + std::time::Duration::from_millis(1));
-        assert_eq!(
-            t.bind(addr(81), &k, IdentitySource::Claimed, Some(false)),
-            BindOutcome::HeldByQuiet(addr(80))
-        );
-        assert_eq!(
-            key_holder(&t.connections, None, &k),
-            Some((addr(80), false))
-        );
-        promote_newest_claim(&mut t.connections, &k);
-        assert!(t.connections[&addr(81)].identity.pending().unwrap().promote);
     }
 }

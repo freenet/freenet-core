@@ -154,9 +154,10 @@ labelled_counters! {
         /// one it is bound to. The connection keeps its key and is not
         /// promoted; the connect op is told the connection failed.
         ChangedConnectPeer => "changed_connect_peer",
-        /// An attempt to bind a claimed key (an expected-inbound match or a
-        /// ConnectRequest) was refused because another open connection, heard
-        /// from within the last 30 s, is bound to it. Counted per attempt, so
+        /// An attempt to bind a key to a connection (a dial, an
+        /// expected-inbound match or a ConnectRequest) was refused because
+        /// another open connection, heard from within the last 30 s, is bound
+        /// to it. Counted per attempt, so
         /// a connection whose peer repeats its ConnectRequest counts once per
         /// request. The claiming connection stays without an identity, with
         /// the claim kept pending until the holder closes or goes quiet
@@ -173,10 +174,10 @@ labelled_counters! {
         QuietHolderReplaced => "quiet_holder_replaced",
         /// A connection was bound to this node's own key, on any path.
         OwnKey => "own_key",
-        /// A key was bound to a connection while the key-to-address map held
-        /// it for another open connection still bound to that key (the newer
-        /// one replaces it in the map). Not counted when the binding is
-        /// refused (`claim_held`).
+        /// A key was bound to a connection while another open connection was
+        /// still bound to it. No longer recorded: a key is bound to one
+        /// connection at a time, and a second one waits (`claim_held`). Kept
+        /// so the field stays in the snapshot for nodes that still send it.
         DuplicateKey => "duplicate_key",
         /// Cleanup ran for a connection whose key is mapped to a different
         /// connection. That connection keeps the mapping and the peer's

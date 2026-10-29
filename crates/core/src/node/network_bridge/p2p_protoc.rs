@@ -1638,8 +1638,10 @@ impl P2pConnManager {
 
             if pending_claim_retry.take_due(Instant::now())
                 && ctx.addr_by_pub_key.may_have_pending_claims()
+                && ctx.retry_pending_claims(&handshake_cmd_sender).await
             {
-                ctx.retry_pending_claims(&handshake_cmd_sender).await;
+                // Work left: run the next pass as soon as no event waits.
+                pending_claim_retry.run_again_now(Instant::now());
             }
 
             // Periodic stats logging

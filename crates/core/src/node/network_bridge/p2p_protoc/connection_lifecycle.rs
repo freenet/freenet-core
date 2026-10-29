@@ -37,6 +37,11 @@ fn identity_kind(
     }
 }
 
+/// The most replacements and binds one pending-claim retry pass does,
+/// bounding how long it holds the event loop (as the zombie sweep bounds its
+/// slices).
+pub(super) const MAX_PENDING_CLAIM_WORK_PER_PASS: usize = 8;
+
 /// When the event loop runs [`P2pConnManager::retry_pending_claims`]: every
 /// `interval`, and only while a claim may be pending. The loop passes
 /// [`Self::deadline`] to its timer wake-up and calls [`Self::take_due`] on
@@ -59,6 +64,11 @@ impl PendingClaimRetry {
     /// pending, so an idle loop arms no timer for it.
     pub(super) fn deadline(&self, may_have_pending_claims: bool) -> Option<Instant> {
         may_have_pending_claims.then(|| self.last + self.interval)
+    }
+
+    /// Make the next retry due at `now`: a pass stopped with work left.
+    pub(super) fn run_again_now(&mut self, now: Instant) {
+        self.last = now.checked_sub(self.interval).unwrap_or(now);
     }
 
     /// Whether a retry is due at `now`. When it is, the interval restarts
@@ -86,13 +96,12 @@ pub(super) enum Promotion {
 impl P2pConnManager {
     /// Bind `key`, from `source`, as the peer identity of the open connection
     /// at `addr` (see `identity::bind` for the rules). On
-    /// [`BindOutcome::Held`] or [`BindOutcome::HeldByQuiet`],
-    /// `pending` decides whether the claim is kept to be bound later:
+    /// [`BindOutcome::Held`] or [`BindOutcome::HeldByQuiet`], `pending`
+    /// decides whether the connection is kept waiting for the key:
     /// `Some(promote)` keeps it, with whether binding it should promote the
     /// connection; `None` drops it.
     ///
-    /// On a bind it counts `own_key` when `key` is this node's own key, and
-    /// `duplicate_key` when another open connection is bound to the key.
+    /// On a bind it counts `own_key` when `key` is this node's own key.
     pub(super) fn bind_identity(
         &mut self,
         addr: SocketAddr,
@@ -100,43 +109,30 @@ impl P2pConnManager {
         source: IdentitySource,
         pending: Option<bool>,
     ) -> BindOutcome {
-        let connection_manager = &self.bridge.op_manager.ring.connection_manager;
-        let (outcome, holder) = identity::bind(
+        let outcome = identity::bind(
             &mut self.connections,
             &mut self.addr_by_pub_key,
             addr,
             key,
             source,
             pending,
-            |holder| connection_manager.is_in_ring(holder),
         );
-        if outcome == BindOutcome::Bound {
-            if *key == *self.bridge.op_manager.ring.connection_manager.pub_key {
-                TRANSPORT_METRICS.record_conn_identity(addr, ConnIdentity::OwnKey);
-            }
-            if holder.is_some() {
-                TRANSPORT_METRICS.record_conn_identity(addr, ConnIdentity::DuplicateKey);
-            }
+        if outcome == BindOutcome::Bound
+            && *key == *self.bridge.op_manager.ring.connection_manager.pub_key
+        {
+            TRANSPORT_METRICS.record_conn_identity(addr, ConnIdentity::OwnKey);
         }
         outcome
     }
 
     /// The connection at `addr`, bound to `key`, is closing: updates the
-    /// key-to-address index (see `identity::release`), preferring a new
-    /// holder that is in the ring.
+    /// key-to-address index (see `identity::release`).
     pub(super) fn unbind_identity(
         &mut self,
         addr: SocketAddr,
         key: &TransportPublicKey,
     ) -> Release {
-        let connection_manager = &self.bridge.op_manager.ring.connection_manager;
-        identity::release(
-            &self.connections,
-            &mut self.addr_by_pub_key,
-            addr,
-            key,
-            |holder| connection_manager.is_in_ring(holder),
-        )
+        identity::release(&self.connections, &mut self.addr_by_pub_key, addr, key)
     }
 
     /// Whether an open connection other than `exclude` is bound to `key` and
@@ -178,25 +174,21 @@ impl P2pConnManager {
     ) {
         debug_assert!(!self.connections.contains_key(&addr));
         self.unbind_identity(addr, key);
-        if let Some((claimant, promote)) =
+        if let Some((claimant, claim)) =
             identity::pending_claimant(&self.connections, Some(addr), key)
         {
-            self.bind_pending_claim(claimant, key, promote).await;
+            self.bind_pending_claim(claimant, &claim).await;
         }
         if forget_peer_state {
             self.forget_peer_state_unless_in_ring(key, addr);
         }
     }
 
-    /// Bind the pending claim of `key` on the connection at `claimant`, if it
-    /// can now be bound, and promote the connection when `promote`.
-    async fn bind_pending_claim(
-        &mut self,
-        claimant: SocketAddr,
-        key: &TransportPublicKey,
-        promote: bool,
-    ) {
-        let outcome = self.bind_identity(claimant, key, IdentitySource::Claimed, Some(promote));
+    /// Bind the pending `claim` on the connection at `claimant`, if it can
+    /// now be bound, and promote the connection when the claim does.
+    async fn bind_pending_claim(&mut self, claimant: SocketAddr, claim: &identity::PendingClaim) {
+        let (key, promote) = (&claim.key, claim.promote);
+        let outcome = self.bind_identity(claimant, key, claim.source, Some(promote));
         if outcome != BindOutcome::Bound {
             return;
         }
@@ -261,27 +253,40 @@ impl P2pConnManager {
     /// loop's timer (see [`PendingClaimRetry`]), so a peer that reconnected
     /// from another address is linked within about `identity::HOLD_WINDOW` of
     /// its old session going quiet.
+    ///
+    /// Each replacement or bind awaits pruning, promotion and sends on the
+    /// event loop, so one pass does at most
+    /// [`MAX_PENDING_CLAIM_WORK_PER_PASS`] of them. Returns whether it
+    /// stopped with work left, in which case the loop runs the next pass as
+    /// soon as no event is waiting.
     pub(super) async fn retry_pending_claims(
         &mut self,
         handshake_commands: &HandshakeCommandSender,
-    ) {
+    ) -> bool {
+        let mut work = 0;
         for key in identity::pending_keys(&self.connections) {
+            if work == MAX_PENDING_CLAIM_WORK_PER_PASS {
+                return true;
+            }
             match identity::key_holder(&self.connections, None, &key) {
                 Some((_, true)) => {}
                 Some((quiet, false)) => {
+                    work += 1;
                     self.replace_quiet_holder(quiet, &key, handshake_commands)
                         .await
                 }
                 None => {
-                    if let Some((claimant, promote)) =
+                    if let Some((claimant, claim)) =
                         identity::pending_claimant(&self.connections, None, &key)
                     {
-                        self.bind_pending_claim(claimant, &key, promote).await;
+                        work += 1;
+                        self.bind_pending_claim(claimant, &claim).await;
                     }
                 }
             }
         }
         identity::clear_pending_hint(&self.connections, &mut self.addr_by_pub_key);
+        false
     }
 
     /// Count disconnect cleanup of the connection `entry` at `addr`, when the
@@ -629,7 +634,6 @@ impl P2pConnManager {
                 .add_connection_reporting(loc, PeerId::new(key.clone(), peer_addr), true)
                 .await;
             if outcome.added {
-                identity::promoted(&self.connections, &mut self.addr_by_pub_key, peer_addr);
                 crate::node::network_status::record_bootstrap_promoted_to_ring();
             }
             let just_became_ready = outcome.just_became_ready;
@@ -791,21 +795,14 @@ impl P2pConnManager {
             // anything is promoted. A connection without one is bound to the
             // named key once the ring has taken it, so a ConnectPeer refused
             // at the cap leaves it as it was.
-            let check = identity::check(
-                &self.connections,
-                &self.addr_by_pub_key,
-                peer_addr,
-                peer.pub_key(),
-                IdentitySource::Claimed,
-            )
-            .0;
-            // Not reachable: a key held by a dialled connection resolves to
-            // that connection through the lookup by key above, so `peer_addr`
-            // is the holder. If it were reached, nothing is kept pending, since
+            let check = identity::check(&self.connections, peer_addr, peer.pub_key());
+            // Not reachable: a key held by another connection resolves to that
+            // connection through the lookup by key above, so `peer_addr` is
+            // the holder. If it were reached, nothing is kept pending, since
             // the connect op is told it failed.
             debug_assert!(
                 !matches!(check, BindOutcome::Held(_) | BindOutcome::HeldByQuiet(_)),
-                "a ConnectPeer for a key held by a dial resolves to the holder"
+                "a ConnectPeer for a held key resolves to the holder"
             );
             let refused = match &check {
                 BindOutcome::Bound | BindOutcome::Same => {
@@ -1555,15 +1552,15 @@ impl P2pConnManager {
             .record_remote_version(peer_addr, remote_version);
         // Bind the identity the connection was established with: the dialled
         // key, or the key an expected-inbound registration carried, which is
-        // a claim. A claim that a dialled connection elsewhere still holds is
-        // not bound yet: the connection continues as an unidentified inbound
-        // one, neither recorded nor promoted under the key, with the claim
-        // pending until that dialled connection closes (`release_identity`
-        // then binds it, and promotes it when this connection would have
-        // been promoted now).
+        // a claim. A key that another connection still holds is not bound
+        // yet, whatever the source: the connection continues unidentified,
+        // neither recorded nor promoted under the key, with the claim pending
+        // until the holder closes or goes quiet (`release_identity` then
+        // binds it, and promotes it when this connection would have been
+        // promoted now).
         let promote_on_bind =
             !is_transient || self.bridge.op_manager.ring.connection_manager.is_gateway();
-        let established_with_claim = source == IdentitySource::Claimed && peer_id.is_some();
+        let established_with_key = peer_id.is_some();
         let peer_id = match peer_id {
             Some(peer) => {
                 let outcome =
@@ -1583,12 +1580,13 @@ impl P2pConnManager {
                             %peer_addr,
                             %holder,
                             pub_key = %peer.pub_key(),
-                            "Expected inbound connection left unbound until the dialled \
-                             connection holding its key closes or goes quiet"
+                            ?source,
+                            "New connection left unbound until the connection holding its \
+                             key closes or goes quiet"
                         );
                         None
                     }
-                    // The quiet dial is replaced; its release binds the newest
+                    // The quiet holder is replaced; its release binds the newest
                     // pending claim of the key (normally this one) and promotes
                     // it, so nothing is left to promote here.
                     BindOutcome::HeldByQuiet(quiet) => {
@@ -1700,16 +1698,14 @@ impl P2pConnManager {
         // Only promote to ring if we know the peer's identity.
         // For transient connections without known identity, we keep them as transport-only
         // until the peer identifies itself (e.g., via ConnectRequest).
-        // A claim is bound only when no other connection holds its key, so it
-        // never puts its key in the ring at a second address. A dial is
-        // promoted as the connect op asked, even if another connection holds
-        // its key.
+        // A connection is bound only when no other connection holds its key,
+        // so promoting it never puts its key in the ring at a second address.
         let promote_to_ring =
             peer_id.is_some() && (!is_transient || connection_manager.is_gateway());
-        // A claim that is not promoted here (held by another connection)
-        // releases the reservation the connect op made for it, which would
-        // otherwise wait for its expiry.
-        if established_with_claim
+        // A connection that is not promoted here because another connection
+        // holds its key releases the reservation the connect op made for it,
+        // which would otherwise wait for its expiry.
+        if established_with_key
             && !promote_to_ring
             && !connection_manager.is_in_ring(peer_addr)
             && connection_manager.has_connection_or_pending(peer_addr)
@@ -1790,7 +1786,6 @@ impl P2pConnManager {
                     )
                     .await;
                 if outcome.added {
-                    identity::promoted(&self.connections, &mut self.addr_by_pub_key, peer_addr);
                     crate::node::network_status::record_bootstrap_promoted_to_ring();
                 }
                 let just_became_ready = outcome.just_became_ready;
