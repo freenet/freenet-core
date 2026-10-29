@@ -154,10 +154,12 @@ fn recovery_from_an_outage_in_both_directions_does_not_close() {
 /// closed: the guard is a conformance check, not a liveness check.
 #[test]
 fn an_acknowledgement_at_the_closing_tick_prevents_the_close() {
+    // The acknowledgement leaves packets outstanding, so it is the
+    // acknowledgement itself, not an empty flight, that holds the close off.
     let at_close = closes_at(1);
     let closed = run(at_close, |t| {
-        let acked = if t >= at_close { 6 } else { 5 };
-        reading(acked, 0, 10 + t, 100 + t)
+        let (acked, outstanding) = if t >= at_close { (6, 1200) } else { (5, 0) };
+        reading(acked, outstanding, 10 + t, 100 + t)
     });
     assert_eq!(closed, None);
     // And a peer acknowledging once every window, sends throughout.
