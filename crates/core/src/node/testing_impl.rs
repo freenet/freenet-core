@@ -7578,7 +7578,9 @@ mod tests {
     /// Scope: this checks the per-network callback map, calling
     /// `check_packet_delivery` with B's name exactly as B's sockets do. It does
     /// not cover how a socket learns its network name from its address at bind
-    /// time (`ADDRESS_NETWORKS`), which has its own cross-network hazard: #5676.
+    /// time (`ADDRESS_NETWORKS`); `in_memory_socket`'s
+    /// `concurrent_networks_sharing_an_address_each_bind_their_own` covers that
+    /// (#5676).
     #[test]
     fn dropping_one_network_keeps_crash_enforcement_of_another() {
         use crate::node::network_bridge::get_fault_injector;
@@ -7648,6 +7650,98 @@ mod tests {
         assert!(
             !has_packet_delivery_callback(NET_B),
             "dropping B must remove B's own callback"
+        );
+    }
+
+    /// Two direct-runner simulations with the SAME seed, run at the same time
+    /// on two threads of one process, each bind every socket into their own
+    /// network (#5676).
+    ///
+    /// The same seed gives both simulations the same node addresses, so every
+    /// address has two owners in `ADDRESS_NETWORKS` while they overlap. The
+    /// fix resolves a bind to the network its own thread registered, which is
+    /// correct only because the direct runner registers and binds on the
+    /// thread that drives it. This pins that assumption: a runner change that
+    /// moved binding to another thread would turn binds into ambiguity errors
+    /// or binds into the wrong network, and this test would fail.
+    ///
+    /// The oracle is `BIND_LOG`, which records the binding THREAD and the
+    /// network the socket joined, so it does not trust the resolution being
+    /// tested. `in_memory_socket`'s
+    /// `concurrent_networks_sharing_an_address_each_bind_their_own` is the
+    /// deterministic reproduction of the collision; this one runs real
+    /// simulations, so before the fix whether it failed depended on how the
+    /// two threads interleaved.
+    #[test]
+    fn concurrent_direct_simulations_with_one_seed_bind_into_their_own_networks() {
+        use crate::transport::in_memory_socket::BIND_LOG;
+        use std::sync::{Arc, Barrier};
+
+        const SEED: u64 = 0x5676_0001;
+        const NETS: [&str; 2] = ["same-seed-5676-a", "same-seed-5676-b"];
+        const GATEWAYS: usize = 1;
+        const NODES: usize = 3;
+
+        let start = Arc::new(Barrier::new(NETS.len()));
+        let runs: Vec<_> = NETS
+            .iter()
+            .map(|&name| {
+                let start = start.clone();
+                std::thread::spawn(move || {
+                    let sim = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap()
+                        .block_on(SimNetwork::new(name, GATEWAYS, NODES, 7, 3, 6, 2, SEED));
+                    // Both networks exist before either binds, so their binds
+                    // overlap.
+                    start.wait();
+                    let result = sim.run_simulation_direct::<rand::rngs::SmallRng>(
+                        SEED,
+                        2,
+                        10,
+                        Duration::from_millis(200),
+                    );
+                    (
+                        std::thread::current().id(),
+                        result.map_err(|e| e.to_string()),
+                    )
+                })
+            })
+            .collect();
+        let runs: Vec<_> = runs
+            .into_iter()
+            .map(|h| h.join().expect("simulation thread panicked"))
+            .collect();
+
+        for ((_, result), name) in runs.iter().zip(NETS) {
+            assert!(result.is_ok(), "{name} failed: {result:?}");
+        }
+
+        let log = BIND_LOG.lock().unwrap_or_else(|e| e.into_inner());
+        let mut bound: Vec<std::collections::BTreeSet<SocketAddr>> = Vec::new();
+        for ((thread, _), name) in runs.iter().zip(NETS) {
+            let from_thread: Vec<_> = log.iter().filter(|(t, _, _)| t == thread).collect();
+            let wrong: Vec<_> = from_thread.iter().filter(|(_, n, _)| n != name).collect();
+            assert!(
+                wrong.is_empty(),
+                "{name}'s thread bound sockets into another network: {wrong:?}"
+            );
+            let addrs: std::collections::BTreeSet<SocketAddr> =
+                from_thread.iter().map(|(_, _, a)| *a).collect();
+            assert!(
+                addrs.len() >= GATEWAYS + NODES,
+                "{name} bound {} distinct addresses, expected at least {}",
+                addrs.len(),
+                GATEWAYS + NODES
+            );
+            bound.push(addrs);
+        }
+        // Precondition, so a change to address derivation cannot make this
+        // pass without any collision to resolve.
+        assert_eq!(
+            bound[0], bound[1],
+            "precondition: one seed must give both networks the same addresses"
         );
     }
 

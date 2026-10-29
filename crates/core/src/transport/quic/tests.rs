@@ -2927,10 +2927,10 @@ fn the_transport_reports_quic_availability() {
             listener.abort();
         }
         for port in [5000, 5001] {
-            crate::transport::in_memory_socket::unregister_address_network(&SocketAddr::from((
-                [10, 201, 34, 1],
-                port,
-            )));
+            crate::transport::in_memory_socket::unregister_address_network(
+                &SocketAddr::from(([10, 201, 34, 1], port)),
+                network,
+            );
         }
         unregister_network_time_source(network);
     })
@@ -2940,14 +2940,14 @@ fn the_transport_reports_quic_availability() {
 /// clock) undone on drop, so a failing assertion leaves none behind for the
 /// next test in the process.
 enum Registration {
-    Address(SocketAddr),
+    Address(SocketAddr, String),
     TimeSource(&'static str),
 }
 
 impl Registration {
     fn address(addr: SocketAddr, network: &str) -> Self {
         register_address_network(addr, network);
-        Self::Address(addr)
+        Self::Address(addr, network.to_string())
     }
 
     fn time_source(network: &'static str, time: VirtualTime) -> Self {
@@ -2959,8 +2959,8 @@ impl Registration {
 impl Drop for Registration {
     fn drop(&mut self) {
         match self {
-            Self::Address(addr) => {
-                crate::transport::in_memory_socket::unregister_address_network(addr)
+            Self::Address(addr, network) => {
+                crate::transport::in_memory_socket::unregister_address_network(addr, network)
             }
             Self::TimeSource(network) => unregister_network_time_source(network),
         }
