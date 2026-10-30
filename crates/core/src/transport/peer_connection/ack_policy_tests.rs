@@ -124,6 +124,7 @@ fn end_with_wire_capacity(
             fail: fail_sends.clone(),
         }),
         global_bandwidth: None,
+        bandwidth_limit: None,
         rolling_rtt_stats: crate::transport::rolling_rtt_stats::RollingRttStatsHandle::new(
             remote_addr,
             time_source.clone(),

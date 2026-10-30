@@ -215,6 +215,12 @@ impl<T: TimeSource> TokenBucket<T> {
         self.state.lock().rate
     }
 
+    /// Burst capacity in bytes, fixed at construction.
+    #[cfg(test)]
+    pub fn capacity(&self) -> usize {
+        self.state.lock().capacity
+    }
+
     /// Get current available tokens (bytes)
     #[cfg(test)]
     pub fn available_tokens(&self) -> usize {

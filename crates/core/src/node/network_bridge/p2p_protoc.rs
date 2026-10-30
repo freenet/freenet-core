@@ -1317,7 +1317,7 @@ impl P2pConnManager {
             advertised_version_override: config.advertised_version_override,
             task_registrar: task_monitor.late_registrar(),
             transport_has_quic: false,
-            bandwidth_limit: config.config.network_api.bandwidth_limit,
+            bandwidth_limit: config.config.network_api.transport_bandwidth_limit(),
             global_bandwidth: config
                 .config
                 .network_api

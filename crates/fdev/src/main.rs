@@ -307,6 +307,7 @@ mod tests {
             bundle: None,
             contract_store: None,
             max_cases: None,
+            max_case_bytes: None,
             properties: Vec::new(),
             json: false,
             evidence_out: None,

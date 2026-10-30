@@ -1285,6 +1285,28 @@ where
                 .remove(&key);
         }
 
+        // A merge that left the stored state unchanged needs no validation: those
+        // bytes were validated when they were stored, and validating them again
+        // costs a full `validate_state` (and possibly a related-contract fetch)
+        // on every duplicate or replayed update (#6050).
+        //
+        // Consequence: a stored state that has become invalid since it was stored
+        // (post-write corruption that still decodes, a time-dependent
+        // `validate_state`, a related contract that changed) no longer makes a
+        // no-op update fail with "invalid outcome state". It is surfaced by the
+        // next update that changes it. No repair depended on the old error: it
+        // re-fired on every update and never replaced the state.
+        if updated_state.as_ref() == current_state.as_ref() {
+            // Recovery installs the incoming full state, and an incoming state
+            // identical to the stored one already returned at the byte-identical
+            // short-circuit above, so a recovery cannot end here.
+            debug_assert!(
+                !recovery_performed,
+                "a corrupted-state recovery produced the stored state"
+            );
+            return Ok(UpsertResult::NoChange);
+        }
+
         let result = self
             .fetch_related_for_validation(
                 &key,
@@ -1298,64 +1320,54 @@ where
         if result != ValidateResult::Valid {
             return Err(Self::validation_error(key, result));
         }
-        if updated_state.as_ref() == current_state.as_ref() {
-            Ok(UpsertResult::NoChange)
-        } else {
-            // Sampled re-apply probe. With low probability, re-apply the
-            // incoming full state to `updated_state`. A re-apply that changes
-            // the content is a strict associativity failure on (S, X, X); the
-            // contract is flagged only when the conformance verifier's heal
-            // step shows the merge does not settle (a mutate-on-every-apply or
-            // cycling contract, which storms the network), not when it changes
-            // once and reconciles. See `reapply_probe` and
-            // `crate::ring::broken_invariants`.
-            //
-            // `RelatedState` inputs are skipped: re-applying a cross-
-            // contract state hint isn't required to be a no-op by the
-            // contract ABI, so probing it can produce false positives.
-            // Not after a corrupted-state recovery: there `updated_state` is the
-            // incoming state rather than a merge with the stored one, so the
-            // probe's premise does not hold. Not after a related-state retry
-            // either: there `updated_state` was computed with fetched
-            // `RelatedState` entries that the probe's re-apply would lack.
-            if !recovery_performed && !related_retry_performed {
-                self.maybe_probe_idempotency(
-                    &key,
-                    &params,
-                    &current_state,
-                    &updated_state,
-                    &updates,
-                )
+        // Sampled re-apply probe. With low probability, re-apply the
+        // incoming full state to `updated_state`. A re-apply that changes
+        // the content is a strict associativity failure on (S, X, X); the
+        // contract is flagged only when the conformance verifier's heal
+        // step shows the merge does not settle (a mutate-on-every-apply or
+        // cycling contract, which storms the network), not when it changes
+        // once and reconciles. See `reapply_probe` and
+        // `crate::ring::broken_invariants`.
+        //
+        // `RelatedState` inputs are skipped: re-applying a cross-
+        // contract state hint isn't required to be a no-op by the
+        // contract ABI, so probing it can produce false positives.
+        // Not after a corrupted-state recovery: there `updated_state` is the
+        // incoming state rather than a merge with the stored one, so the
+        // probe's premise does not hold. Not after a related-state retry
+        // either: there `updated_state` was computed with fetched
+        // `RelatedState` entries that the probe's re-apply would lack.
+        if !recovery_performed && !related_retry_performed {
+            self.maybe_probe_idempotency(&key, &params, &current_state, &updated_state, &updates)
                 .await;
-            }
-
-            if self
-                .op_manager
-                .as_ref()
-                .map(|m| m.ring.is_contract_broken(&key))
-                .unwrap_or(false)
-            {
-                // Probe just flagged this contract (or it was already
-                // flagged). Skip the commit so we don't extend the
-                // problematic state, and surface the suppression to
-                // callers via NoChange — there is no state change the
-                // network should observe.
-                tracing::debug!(
-                    contract = %key,
-                    event = "merge_suppressed_broken_contract",
-                    "Skipping commit_state_update for contract flagged as broken"
-                );
-                return Ok(UpsertResult::NoChange);
-            }
-
-            // Outcome discarded deliberately: a broken-contract suppression
-            // here is already reported to the caller as the `NoChange` above,
-            // and this path has no trailing fan-out to gate on it.
-            let _ = self
-                .commit_state_update(&key, &params, &updated_state)
-                .await?;
-            Ok(UpsertResult::Updated(updated_state))
         }
+
+        if self
+            .op_manager
+            .as_ref()
+            .map(|m| m.ring.is_contract_broken(&key))
+            .unwrap_or(false)
+        {
+            // Probe just flagged this contract (or it was already
+            // flagged). Skip the commit so we don't extend the
+            // problematic state, and surface the suppression to
+            // callers via NoChange — there is no state change the
+            // network should observe.
+            tracing::debug!(
+                contract = %key,
+                event = "merge_suppressed_broken_contract",
+                "Skipping commit_state_update for contract flagged as broken"
+            );
+            return Ok(UpsertResult::NoChange);
+        }
+
+        // Outcome discarded deliberately: a broken-contract suppression
+        // here is already reported to the caller as the `NoChange` above,
+        // and this path has no trailing fan-out to gate on it.
+        let _ = self
+            .commit_state_update(&key, &params, &updated_state)
+            .await?;
+        Ok(UpsertResult::Updated(updated_state))
     }
 
     pub(in crate::contract::executor) fn bridged_register_contract_notifier(

@@ -205,7 +205,7 @@ congestion-control = "fixedrate"  # or "ledbat" or "bbr"
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| Per-connection bandwidth | 10 MB/s | Token bucket limit |
+| Per-connection bandwidth | 1.25 MB/s | Token bucket limit (FixedRate rate; no node-wide cap unless `total-bandwidth-limit` is set) |
 | Initial window | 38 KB | LEDBAT IW26 |
 | Target delay | 60ms | LEDBAT congestion threshold |
 | Keep-alive interval | 25s | Connection maintenance |

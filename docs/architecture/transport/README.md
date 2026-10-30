@@ -88,7 +88,7 @@ Low Extra Delay Background Transport with periodic slowdowns (draft-irtf-iccrg-l
 - Periodic slowdowns to probe for available bandwidth
 - Fair bandwidth sharing between concurrent connections
 
-**Performance:** >3 MB/s throughput goal achieved (up to 10 MB/s with default token bucket limit)
+**Performance:** >3 MB/s throughput goal achieved (up to 10 MB/s, measured with a 10 MB/s token bucket)
 
 **Documentation:** [LEDBAT++ Implementation](design/ledbat-plus-plus.md)
 
@@ -137,7 +137,7 @@ congestion-control = "ledbat"  # or "bbr" or "fixedrate"
 ## Quick Reference
 
 ### Default Configuration
-- **Per-connection bandwidth limit**: 10 MB/s (configurable)
+- **Per-connection bandwidth limit**: unset, so connections pace at the FixedRate rate of 1.25 MB/s each (`--bandwidth-limit` caps each connection below that; use `--total-bandwidth-limit` to limit the node)
 - **Global bandwidth pool**: Disabled by default (enable with `--total-bandwidth-limit`)
 - **QUIC endpoint**: `transport-quic = "off"` by default (`--transport-quic`, `FREENET_TRANSPORT_QUIC`). `"shadow"` builds a QUIC endpoint on the network port that, in this release, accepts no connections and opens none, and `"prefer"` runs as `"shadow"`; `quic-max-paths` (default and maximum `max-number-of-connections`; a value that is not a whole number is ignored with a warning) will bound the QUIC paths a node holds; an unknown value is treated as `"off"` with a warning (#5940)
 - **Min per-connection rate**: 1 MB/s (when global pool enabled), clamped to the total; `total-bandwidth-limit` is also a node-wide cap on everything the node sends (see [bandwidth configuration](configuration/bandwidth-configuration.md))
@@ -150,10 +150,10 @@ congestion-control = "ledbat"  # or "bbr" or "fixedrate"
 - **Slowdown interval**: 9x slowdown duration (~10% overhead)
 
 ### Key Performance Metrics
-- **>3 MB/s goal**: ✅ Achieved (10 MB/s default, 3.3x target)
+- **>3 MB/s goal**: ✅ Achieved (10 MB/s measured with a 10 MB/s token bucket, 3.3x target)
 - **Cold start ramp-up**: ~300ms to reach 300KB cwnd @ 100ms RTT
-- **Steady-state throughput**: Up to 10 MB/s (token bucket limit, not LEDBAT)
-- **Real-world bottleneck**: Token bucket (10 MB/s), not LEDBAT cwnd (1 GB max)
+- **Steady-state throughput**: Up to the token bucket rate (not LEDBAT)
+- **Real-world bottleneck**: Token bucket rate, not LEDBAT cwnd (1 GB max)
 
 ### Running Benchmarks
 ```bash
@@ -230,7 +230,7 @@ flowchart TB
     OutStream --> LEDBAT
     OutStream --> TokenBucket
     GlobalBW -.->|"provides rate"| TokenBucket
-    LEDBAT -->|"ledbat_rate"| RateCalc["rate = min(ledbat_rate, global_rate)"]
+    LEDBAT -->|"ledbat_rate"| RateCalc["rate = min(cc_rate, global_rate or bandwidth_limit)"]
     TokenBucket -->|"global_rate"| RateCalc
     RateCalc --> Assembly
     Assembly --> UDP
@@ -250,7 +250,7 @@ flowchart TB
 **Send Path:**
 1. Application calls `PeerConnection::send(message)`
 2. **cwnd check**: Wait if `flightsize + packet_size > cwnd` (LEDBAT enforcement)
-3. **Rate calculation**: `min(ledbat_rate, global_pool_rate)` if global pool enabled
+3. **Rate calculation**: the congestion controller's rate, capped by the global pool share if enabled, else by `bandwidth-limit` if set
 4. **Token reservation**: Reserve tokens at calculated rate, wait if needed
 5. **Packet assembly**: Serialize + encrypt
 6. **Send tracking**: Record packet for RTT measurement and retransmission
@@ -260,7 +260,7 @@ flowchart TB
 1. UDP socket receives packet
 2. Decrypt + deserialize
 3. **RTT update**: If ACK, update smoothed RTT and cwnd (LEDBAT feedback)
-4. **Rate update**: Recalculate `min(ledbat_rate, global_pool_rate)` (RTT-adaptive timing)
+4. **Rate update**: Recalculate the step 3 rate (`peer_connection::paced_rate`, RTT-adaptive timing)
 5. **Flightsize update**: Decrement flightsize on ACK. Flightsize has two
    additional release paths so a stream whose ACKs never arrive cannot pin
    flightsize for the connection's life (#4345): (a) when a packet is

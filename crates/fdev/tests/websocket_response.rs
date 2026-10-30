@@ -9,13 +9,10 @@ use freenet_stdlib::client_api::{
 use freenet_stdlib::prelude::*;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio_tungstenite::tungstenite::Message;
-
-static PORT: AtomicU16 = AtomicU16::new(54000);
 
 /// Test that the WebSocket client properly waits for a PutResponse
 ///
@@ -24,8 +21,6 @@ static PORT: AtomicU16 = AtomicU16::new(54000);
 /// errors on the server side.
 #[tokio::test]
 async fn test_websocket_client_waits_for_put_response() {
-    let port = PORT.fetch_add(1, Ordering::SeqCst);
-
     // Create a mock contract key for the response (base58 encoded)
     let instance_id = ContractInstanceId::try_from("11111111111111111111111111111111".to_string())
         .expect("valid id");
@@ -36,10 +31,13 @@ async fn test_websocket_client_waits_for_put_response() {
     // Channel to signal when server is ready to accept connections
     let (ready_tx, ready_rx) = oneshot::channel::<()>();
 
-    // Start the mock server
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))
+    // Start the mock server on a port the OS picks. A fixed port inside the
+    // ephemeral range (32768-60999 on Linux) can already be held as the source
+    // port of some outgoing connection, and then bind fails with AddrInUse.
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
         .expect("bind");
+    let port = listener.local_addr().expect("local addr").port();
 
     let server_response = response.clone();
     let server_handle = tokio::spawn(async move {

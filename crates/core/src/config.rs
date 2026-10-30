@@ -318,7 +318,10 @@ impl Default for ConfigArgs {
                 gateways: None,
                 gateway: None,
                 location: None,
-                bandwidth_limit: Some(3_000_000), // 3 MB/s default for streaming transfers only
+                // Unset, as a bare CLI parse leaves it (NetworkArgs::bandwidth_limit).
+                // Since #6047 the limit caps every rate update, so a library default
+                // here would silently cap callers that pick a faster controller.
+                bandwidth_limit: None,
                 total_bandwidth_limit: None,
                 min_bandwidth_per_connection: None,
                 blocked_addresses: None,
@@ -2356,7 +2359,17 @@ pub struct NetworkArgs {
     /// Bandwidth limit for large streaming data transfers, in bytes per second.
     /// Applies only to the streaming path used for large transfers; the general
     /// packet rate limiter is currently disabled for reliability reasons.
-    /// Default: 3 MB/s (3,000,000 bytes/second).
+    /// Applies to each connection separately and caps the congestion
+    /// controller's rate: it can lower a connection's rate, never raise it, and
+    /// N connections may send up to N times this. Short messages, ACKs and
+    /// retransmits are not paced. To limit what the node sends as a whole, use
+    /// --total-bandwidth-limit, which overrides this.
+    /// 0 means unset; a value below 64 KiB/s (65,536 bytes/second) is raised to
+    /// it with a warning. Low limits slow large transfers in proportion, and
+    /// very large ones (multi-MB contract states) can miss their deadlines.
+    /// Default: unset, so each connection is paced at the congestion
+    /// controller's rate, 1.25 MB/s (1,250,000 bytes/second) for the default
+    /// `fixedrate` controller.
     #[arg(long)]
     pub bandwidth_limit: Option<usize>,
 
@@ -2665,9 +2678,15 @@ pub struct NetworkApiConfig {
     pub ignore_protocol_version: bool,
 
     /// Bandwidth limit per connection for data transfers (in bytes per second).
-    /// NOTE: This applies to each connection independently - N connections may use N * bandwidth_limit total.
-    /// Each connection uses LEDBAT congestion control to yield to foreground traffic.
-    /// Default: 10 MB/s (10,000,000 bytes/second)
+    /// NOTE: This applies to each connection independently - N connections may use
+    /// N * bandwidth_limit total. It caps the congestion controller's rate for
+    /// streamed transfers (short messages, ACKs and retransmits are not paced), so it
+    /// can lower a connection's rate but never raise it. A value of 0 is treated as unset,
+    /// and one below `MIN_BANDWIDTH_LIMIT` (64 KiB/s) is raised to it
+    /// (`NetworkApiConfig::transport_bandwidth_limit`).
+    /// Default: None, so each connection is paced at the congestion controller's
+    /// rate: 1.25 MB/s (`fixed_rate::DEFAULT_RATE_BYTES_PER_SEC`) for the default
+    /// `fixedrate` controller, which does not adapt to queuing delay or other traffic.
     ///
     /// If `total_bandwidth_limit` is set, this field is ignored and per-connection rates
     /// are derived from: `total_bandwidth_limit / active_connections`.
@@ -2843,6 +2862,20 @@ pub struct NetworkApiConfig {
 }
 
 impl NetworkApiConfig {
+    /// The per-connection `bandwidth-limit` the node hands its transport
+    /// (#6047): the configured value after
+    /// [`effective_bandwidth_limit`](crate::transport::peer_connection::effective_bandwidth_limit),
+    /// which ignores it whenever `total-bandwidth-limit` is set. That includes
+    /// a total of 0: a global pool is built for any configured total, and its
+    /// share overrides the per-connection limit anyway. Logs what it decided,
+    /// so call it once per node.
+    pub(crate) fn transport_bandwidth_limit(&self) -> Option<usize> {
+        crate::transport::peer_connection::effective_bandwidth_limit(
+            self.bandwidth_limit,
+            self.total_bandwidth_limit.is_some(),
+        )
+    }
+
     /// The QUIC endpoint settings when `transport-quic` turns QUIC on, or
     /// `None` when it is off, unset or a value this binary does not know
     /// (which logs a warning). Reads the node's memory limit, since the
@@ -9662,6 +9695,64 @@ shutdown-drain-secs = 42
         // Remote is a superset / identical → nothing is dropped → no warning.
         assert!(gateways_dropped_by_remote_replace(&local, &local).is_empty());
         assert!(gateways_dropped_by_remote_replace(&[], &remote).is_empty());
+    }
+
+    /// `transport_bandwidth_limit` is what a node hands its transport (#6047):
+    /// ignored under any `total-bandwidth-limit` (including 0, which still
+    /// builds a global pool), 0 means unset, and a value below the floor is
+    /// raised to it.
+    #[tokio::test]
+    async fn transport_bandwidth_limit_sanitizes_the_configured_limit() {
+        use crate::transport::peer_connection::MIN_BANDWIDTH_LIMIT;
+        // The library default leaves the limit unset, as the CLI does: a value
+        // here would silently cap callers that pick a faster controller.
+        assert_eq!(ConfigArgs::default().network_api.bandwidth_limit, None);
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut api = clap_bare_args(temp_dir.path())
+            .build()
+            .await
+            .unwrap()
+            .network_api;
+        let cases = [
+            (None, None, None),
+            (Some(500_000), None, Some(500_000)),
+            (Some(0), None, None),
+            (Some(1_000), None, Some(MIN_BANDWIDTH_LIMIT)),
+            (Some(500_000), Some(10_000_000), None),
+            (Some(500_000), Some(0), None),
+        ];
+        for (bandwidth_limit, total_bandwidth_limit, expected) in cases {
+            api.bandwidth_limit = bandwidth_limit;
+            api.total_bandwidth_limit = total_bandwidth_limit;
+            assert_eq!(
+                api.transport_bandwidth_limit(),
+                expected,
+                "bandwidth_limit {bandwidth_limit:?}, total {total_bandwidth_limit:?}"
+            );
+        }
+    }
+
+    /// The node hands its transport the sanitised limit, not the raw config
+    /// value (#6047). A cross-file scrape scoped to the `bandwidth_limit` field
+    /// of the `P2pConnManager` built in `P2pConnManager::build`, so it cannot
+    /// be satisfied by this test's own text or by another use of the name.
+    #[test]
+    fn p2p_conn_manager_takes_the_sanitised_bandwidth_limit() {
+        let source = include_str!("node/network_bridge/p2p_protoc.rs");
+        let at = source
+            .find("Ok(P2pConnManager {")
+            .expect("P2pConnManager::build constructs the manager");
+        let literal = &source[at..];
+        let literal = &literal[..literal.find("\n        })").expect("end of the literal")];
+        let field = literal
+            .lines()
+            .map(str::trim)
+            .find(|line| line.starts_with("bandwidth_limit:"))
+            .expect("the manager's bandwidth_limit field");
+        assert_eq!(
+            field, "bandwidth_limit: config.config.network_api.transport_bandwidth_limit(),",
+            "the transport must get the sanitised per-connection limit"
+        );
     }
 
     /// A `ConfigArgs` mirroring a real bare `freenet network` parse: every
