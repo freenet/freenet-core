@@ -102,8 +102,15 @@
 //!   [`Action::TearDown`] names its attempt.
 //! - Read [`UpgradeMachine::backoff_seed`] after stepping
 //!   [`Event::SessionEnded`], since that step can charge or clear the count.
-//!   A machine that took no seed has none to hand on: a promotion that comes
-//!   after `Off` is ignored, seed included.
+//!   A machine that took no seed has none to hand on (`None`): a promotion that
+//!   comes after `Off` is ignored, seed included, and the caller files nothing
+//!   for that session.
+//! - End and file any older session for the same peer key before stepping
+//!   [`Event::Promoted`] on the new one. A seed from an older session never
+//!   replaces the seed filed by a newer one, so the caller tracks session
+//!   order. A max merge is wrong: it undoes the clear a stable path makes.
+//! - Give every session the listener's clock clone: `RealTime::new()` starts
+//!   its own epoch, and `retry_at` is on the clock of [`Inputs::now`].
 //! - Give the client and server machines of a session one lifetime, the
 //!   session's. Attempt ids restart with each session, and a client ignores
 //!   with no reply an `Offer` at or below the highest it has seen, so a client
@@ -468,6 +475,8 @@ pub(in crate::transport) struct UpgradeMachine {
     failures: u32,
     /// No attempt before this.
     retry_at: Duration,
+    /// Whether a seed came in through [`Event::Promoted`].
+    seeded: bool,
 }
 
 impl UpgradeMachine {
@@ -480,16 +489,19 @@ impl UpgradeMachine {
             last_offer: None,
             failures: 0,
             retry_at: Duration::ZERO,
+            seeded: false,
         }
     }
 
     /// The backoff to carry to the next session's machine, through
-    /// [`Event::Promoted`].
-    pub(in crate::transport) fn backoff_seed(&self) -> BackoffSeed {
-        BackoffSeed {
+    /// [`Event::Promoted`]. `None` until this machine has taken a seed through
+    /// that event: a session that ended first holds no count of its own, and
+    /// filing its zeros would replace the peer's real count.
+    pub(in crate::transport) fn backoff_seed(&self) -> Option<BackoffSeed> {
+        self.seeded.then_some(BackoffSeed {
             failures: self.failures,
             retry_at: self.retry_at,
-        }
+        })
     }
 
     /// When to send the next [`Event::Tick`], if any.
@@ -609,6 +621,7 @@ impl UpgradeMachine {
     }
 
     fn take_seed(&mut self, cx: Inputs<'_>, seed: BackoffSeed) {
+        self.seeded = true;
         let expired = cx.now.saturating_sub(seed.retry_at) > BACKOFF_MAX;
         self.failures = if expired { 0 } else { seed.failures };
         self.retry_at = seed.retry_at.min(cx.now + SEED_WAIT_MAX);

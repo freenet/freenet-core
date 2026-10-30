@@ -957,7 +957,7 @@ doc has the transition table.
   does not reply.
   Caller contracts (e5a-5b): report OfferSent before stepping any reply to that
   Offer; drop an Offer still deferred behind allow_peer once a TearDown names
-  its attempt; read backoff_seed after stepping SessionEnded; give the client
+  its attempt; read backoff_seed after stepping SessionEnded (None when the machine took no seed: file nothing); end and file any older session for the peer key BEFORE stepping Promoted on the new one, and never let an older session's seed replace a newer one's (a max merge undoes a stable path's clear, so track session order); give every session the listener's clock clone (RealTime::new() starts its own epoch); give the client
   and server machines of a session the session's lifetime, since attempt ids
   restart per session and a client ignores an Offer at or below the highest it
   has seen, with no reply.

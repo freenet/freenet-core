@@ -1447,7 +1447,7 @@ fn a_replaced_session_continues_the_backoff() {
     for _ in 0..3 {
         old.declined(DeclineReason::Disabled.wire());
     }
-    let seed = old.machine.backoff_seed();
+    let seed = old.machine.backoff_seed().expect("promoted");
     assert_eq!(seed.failures, 3);
     assert_eq!(seed.retry_at, old.now + Duration::from_secs(240));
 
@@ -1549,7 +1549,7 @@ fn a_seed_arrives_with_the_promotion() {
         retry_at: client.now + Duration::from_secs(120),
     };
     client.promote_with(Some(QUIC_UPGRADE_NEGOTIATES_IN), seed);
-    assert_eq!(client.machine.backoff_seed(), seed);
+    assert_eq!(client.machine.backoff_seed(), Some(seed));
     assert_eq!(
         client.offer(2)[1],
         Action::Record(Outcome::DeclineSent(DeclineReason::Backoff))
@@ -1562,13 +1562,13 @@ fn a_seed_arrives_with_the_promotion() {
     };
     below_floor.promote_with(None, seed);
     assert!(below_floor.machine.is_off());
-    assert_eq!(below_floor.machine.backoff_seed(), seed);
+    assert_eq!(below_floor.machine.backoff_seed(), Some(seed));
 
     let mut equal_keys = Rig::new(Role::Server);
     equal_keys.peer = equal_keys.machine.local_key.clone();
     equal_keys.promote_with(Some(QUIC_UPGRADE_NEGOTIATES_IN), seed);
     assert!(equal_keys.machine.is_off());
-    assert_eq!(equal_keys.machine.backoff_seed(), seed);
+    assert_eq!(equal_keys.machine.backoff_seed(), Some(seed));
 }
 
 /// A stable path clears the count whatever ends the machine, since the count
@@ -1683,7 +1683,7 @@ fn a_flapping_session_is_retried_less_and_less_often() {
                 "{case}"
             );
             assert_eq!(rig.backoff(), Duration::from_secs(seconds), "{case}");
-            seed = rig.machine.backoff_seed();
+            seed = rig.machine.backoff_seed().expect("promoted");
         }
         assert_eq!(seed.failures, 4, "{case}");
 
@@ -2244,4 +2244,17 @@ fn two_machines_agree_after_any_one_lost_message() {
             assert!(pair.now() - start <= ACTIVE_WITHIN, "{case}");
         }
     }
+}
+
+/// A machine that was never promoted has no seed to hand on, even after its
+/// session ends: filing its zeros would replace the peer's real count.
+#[test]
+fn a_machine_that_took_no_seed_has_none_to_hand_on() {
+    let mut rig = Rig::new(Role::Server);
+    rig.step(Event::SessionEnded);
+    assert_eq!(rig.machine.backoff_seed(), None);
+
+    let mut rig = Rig::promoted(Role::Server);
+    rig.step(Event::SessionEnded);
+    assert!(rig.machine.backoff_seed().is_some());
 }
