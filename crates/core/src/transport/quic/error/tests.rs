@@ -424,6 +424,7 @@ fn stream_kinds_keep_the_connection_and_the_rest_end_it() {
         (stop_code::EVICTED, true),
         (stop_code::CANCELLED, true),
         (stop_code::FRAGMENT_REFUSED, false),
+        (stop_code::NOT_ACCEPTING_DATA, true),
         (reset_code::LENGTH_MISMATCH, true),
         (0x1f, true),
         (9, true),

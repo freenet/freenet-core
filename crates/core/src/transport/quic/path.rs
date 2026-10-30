@@ -93,6 +93,7 @@
 //! [`MAX_UNI_STREAMS`]: super::config::MAX_UNI_STREAMS
 //! [`StreamHandle`]: crate::transport::peer_connection::streaming::StreamHandle
 
+pub(crate) mod bounded;
 pub(crate) mod inbound;
 
 #[cfg(test)]
@@ -108,6 +109,8 @@ use futures::{Stream, StreamExt};
 use tokio::sync::mpsc;
 
 use super::QuicConnection;
+use super::config::STREAMED_SEND_LIMIT;
+use super::control::{ControlError, QuicControl};
 use super::framing::{FrameHeader, HeaderError};
 use super::identity::PeerKey;
 use super::recycle::{self, SendAborts};
@@ -123,6 +126,8 @@ use crate::transport::peer_connection::streaming::{
     MAX_INBOUND_STREAM_BYTES_PER_CONNECTION, MAX_INBOUND_STREAMS_PER_CONNECTION,
 };
 
+#[cfg_attr(not(test), allow(unused_imports))]
+pub(crate) use bounded::{BoundedSend, MaybeDelivered, SendFailure, SendProgress, bounded_send};
 pub(crate) use inbound::{InboundShort, InboundStreamArrival};
 
 /// Application error codes a receiver stops a stream with (STOP_SENDING),
@@ -147,10 +152,14 @@ pub(crate) mod stop_code {
     /// The receiver's stream buffer refused a fragment (a shape it cannot
     /// hold; not expected). The same message fails the same way again.
     pub(crate) const FRAGMENT_REFUSED: u32 = 0x18;
+    /// The path carries control frames only (shadow mode): a Short or
+    /// Stream frame is refused before anything is charged. The message
+    /// itself is fine; the sender should send it on the UDP session.
+    pub(crate) const NOT_ACCEPTING_DATA: u32 = 0x19;
     /// Every stop code, for the range and duplicate checks in
     /// `super::error`. A source-scrape test checks that each `const` in this
     /// module is listed.
-    pub(crate) const ALL: [u32; 8] = [
+    pub(crate) const ALL: [u32; 9] = [
         HEADER_REFUSED,
         BUDGET_REFUSED,
         STREAM_ID_IN_USE,
@@ -159,6 +168,7 @@ pub(crate) mod stop_code {
         EVICTED,
         CANCELLED,
         FRAGMENT_REFUSED,
+        NOT_ACCEPTING_DATA,
     ];
 }
 
@@ -205,6 +215,11 @@ pub(crate) struct QuicPathLimits {
     /// Sends this side may reset before the path is closed
     /// ([`recycle::SEND_ABORT_LIMIT`]).
     pub(crate) max_send_aborts: u64,
+    /// Whether the path accepts data (Short and Stream frames). A path in
+    /// shadow mode ([`Self::SHADOW`]) carries control frames only and
+    /// refuses data with [`stop_code::NOT_ACCEPTING_DATA`] right after the
+    /// header, before anything is charged to the inbound budget.
+    pub(crate) accept_data: bool,
     /// The receive task panics on its first stream (supervisor test).
     #[cfg(test)]
     pub(crate) panic_in_receive: bool,
@@ -226,8 +241,16 @@ impl QuicPathLimits {
         stream_capacity: STREAM_CHANNEL_CAPACITY,
         control_capacity: CONTROL_CHANNEL_CAPACITY,
         max_send_aborts: recycle::SEND_ABORT_LIMIT,
+        accept_data: true,
         #[cfg(test)]
         panic_in_receive: false,
+    };
+
+    /// [`Self::DEFAULT`] for a path in shadow mode: control frames only.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) const SHADOW: Self = Self {
+        accept_data: false,
+        ..Self::DEFAULT
     };
 }
 
@@ -308,6 +331,15 @@ quic_outcomes! {
         ReadFailed => "read_failed",
         /// The receive task panicked; the connection was closed.
         ReceiveTaskPanicked => "receive_task_panicked",
+        /// A Short or Stream frame on a path that accepts no data (shadow
+        /// mode); stopped before anything was charged.
+        RefusedNotAcceptingData => "refused_not_accepting_data",
+        /// A control payload of a version this node does not read.
+        ControlUnknownVersion => "control_unknown_version",
+        /// A control payload of a type this node does not know.
+        ControlUnknownType => "control_unknown_type",
+        /// A control payload that is empty or of the wrong length.
+        ControlMalformed => "control_malformed",
     }
 }
 
@@ -323,6 +355,14 @@ impl QuicInboundOutcome {
             HeaderError::UnexpectedMetadata => Self::HeaderUnexpectedMetadata,
             HeaderError::UnexpectedStreamId => Self::HeaderUnexpectedStreamId,
             HeaderError::NotCallerNamed(_) => Self::HeaderNotCallerNamed,
+        }
+    }
+
+    fn of_control_error(error: &ControlError) -> Self {
+        match error {
+            ControlError::UnknownVersion(_) => Self::ControlUnknownVersion,
+            ControlError::UnknownType(_) => Self::ControlUnknownType,
+            ControlError::Empty | ControlError::WrongLength(_) => Self::ControlMalformed,
         }
     }
 }
@@ -417,6 +457,10 @@ pub(crate) struct QuicPath {
     receive: tokio::task::JoinHandle<()>,
     /// Sends this side reset; closes the connection past the limit.
     aborts: Arc<SendAborts>,
+    /// One permit per streamed message in flight
+    /// ([`STREAMED_SEND_LIMIT`]), so the remaining uni stream slots stay
+    /// for short messages and control frames. Never closed.
+    stream_slots: tokio::sync::Semaphore,
     #[cfg(test)]
     budget: SharedInboundBudget,
 }
@@ -518,6 +562,7 @@ impl QuicPath {
             shorts_tx,
             streams_tx,
             controls_tx,
+            limits.accept_data,
         );
         #[cfg(test)]
         {
@@ -538,6 +583,7 @@ impl QuicPath {
                 stats,
                 receive,
                 aborts,
+                stream_slots: tokio::sync::Semaphore::new(STREAMED_SEND_LIMIT as usize),
                 #[cfg(test)]
                 budget,
             },
@@ -590,11 +636,37 @@ impl QuicPath {
         &self.connection
     }
 
+    /// Parse a control frame from [`QuicInbound::controls`]. A payload this
+    /// node refuses (`ControlError`) is counted on the path
+    /// (`QuicInboundOutcome::Control*`) and gives `None`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn decode_control(&self, payload: &[u8]) -> Option<QuicControl> {
+        match QuicControl::decode(payload) {
+            Ok(control) => Some(control),
+            Err(error) => {
+                self.stats
+                    .record(QuicInboundOutcome::of_control_error(&error));
+                tracing::debug!(%error, "QUIC path: refusing a control frame");
+                None
+            }
+        }
+    }
+
     /// Send one serialized message.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn send_short(&self, payload: &[u8]) -> Result<(), QuicSendError> {
+        self.send_short_with(payload, SendProgress::new()).await
+    }
+
+    /// [`Self::send_short`], reporting to `progress` (for [`bounded_send`]).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn send_short_with(
+        &self,
+        payload: &[u8],
+        progress: SendProgress,
+    ) -> Result<(), QuicSendError> {
         let header = FrameHeader::short(payload.len() as u64)?;
-        let mut send = self.open(&header, &[]).await?;
+        let mut send = self.open(&header, &[], progress).await?;
         send.write_all(payload).await?;
         send.finish().await
     }
@@ -602,14 +674,43 @@ impl QuicPath {
     /// Send one control frame.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn send_control(&self, payload: &[u8]) -> Result<(), QuicSendError> {
+        self.send_control_with(payload, SendProgress::new()).await
+    }
+
+    /// [`Self::send_control`], reporting to `progress` (for
+    /// [`bounded_send`]).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn send_control_with(
+        &self,
+        payload: &[u8],
+        progress: SendProgress,
+    ) -> Result<(), QuicSendError> {
         let header = FrameHeader::control(payload.len() as u64)?;
-        let mut send = self.open(&header, &[]).await?;
+        let mut send = self.open(&header, &[], progress).await?;
         send.write_all(payload).await?;
         send.finish().await
     }
 
+    /// Send `control` as a control frame, within `timeout` on `time`
+    /// ([`bounded_send`]).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn send_control_bounded<T: TimeSource>(
+        &self,
+        time: &T,
+        timeout: std::time::Duration,
+        control: QuicControl,
+    ) -> BoundedSend {
+        let payload = control.encode();
+        bounded_send(time, timeout, |progress| {
+            self.send_control_with(&payload[..], progress)
+        })
+        .await
+    }
+
     /// Send stream `stream_id` (caller-named) with `payload`, announced by
-    /// `metadata` ([`frame_metadata`] says what goes in the frame).
+    /// `metadata` ([`frame_metadata`] says what goes in the frame). Takes
+    /// one of the path's streamed-message permits ([`STREAMED_SEND_LIMIT`]),
+    /// waiting for one if all are taken, and holds it until it returns.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn send_stream(
         &self,
@@ -617,9 +718,24 @@ impl QuicPath {
         metadata: Option<&[u8]>,
         payload: Bytes,
     ) -> Result<(), QuicSendError> {
+        self.send_stream_with(stream_id, metadata, payload, SendProgress::new())
+            .await
+    }
+
+    /// [`Self::send_stream`], reporting to `progress` (for
+    /// [`bounded_send`]).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn send_stream_with(
+        &self,
+        stream_id: StreamId,
+        metadata: Option<&[u8]>,
+        payload: Bytes,
+        progress: SendProgress,
+    ) -> Result<(), QuicSendError> {
         let metadata = frame_metadata(metadata);
         let header = FrameHeader::stream(stream_id, payload.len() as u64, metadata.len())?;
-        let mut send = self.open(&header, metadata).await?;
+        let _slot = self.stream_slot().await?;
+        let mut send = self.open(&header, metadata, progress).await?;
         send.write_chunk(payload).await?;
         send.finish().await
     }
@@ -630,21 +746,41 @@ impl QuicPath {
     /// more or fewer than `total_len` bytes, the stream is reset
     /// ([`reset_code::SENDER_ABORTED`], or [`reset_code::LENGTH_MISMATCH`]
     /// for a wrong length) and the receiver cancels its handle.
-    /// No byte past `total_len` is written.
+    /// No byte past `total_len` is written. Takes a streamed-message permit
+    /// as [`Self::send_stream`] does.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn send_stream_chunks<S>(
         &self,
         stream_id: StreamId,
         total_len: u64,
         metadata: Option<&[u8]>,
+        chunks: S,
+    ) -> Result<(), QuicSendError>
+    where
+        S: Stream<Item = Result<Bytes, StreamError>> + Unpin,
+    {
+        self.send_stream_chunks_with(stream_id, total_len, metadata, chunks, SendProgress::new())
+            .await
+    }
+
+    /// [`Self::send_stream_chunks`], reporting to `progress` (for
+    /// [`bounded_send`]).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) async fn send_stream_chunks_with<S>(
+        &self,
+        stream_id: StreamId,
+        total_len: u64,
+        metadata: Option<&[u8]>,
         mut chunks: S,
+        progress: SendProgress,
     ) -> Result<(), QuicSendError>
     where
         S: Stream<Item = Result<Bytes, StreamError>> + Unpin,
     {
         let metadata = frame_metadata(metadata);
         let header = FrameHeader::stream(stream_id, total_len, metadata.len())?;
-        let mut send = self.open(&header, metadata).await?;
+        let _slot = self.stream_slot().await?;
+        let mut send = self.open(&header, metadata, progress).await?;
         let mut delivered: u64 = 0;
         let failure = loop {
             match send.race(chunks.next()).await? {
@@ -686,13 +822,29 @@ impl QuicPath {
         }
     }
 
+    /// One of the permits that cap streamed messages at
+    /// [`STREAMED_SEND_LIMIT`]; waits while all are taken.
+    async fn stream_slot(&self) -> Result<tokio::sync::SemaphorePermit<'_>, QuicSendError> {
+        // The semaphore is never closed, so acquire never fails.
+        self.stream_slots
+            .acquire()
+            .await
+            .map_err(|_| QuicSendError::Closed)
+    }
+
     /// Open a uni stream and write the header and metadata. Waits for a
     /// stream credit when the peer's [`super::config::MAX_UNI_STREAMS`] are
     /// in use.
-    async fn open(&self, header: &FrameHeader, metadata: &[u8]) -> Result<Outgoing, QuicSendError> {
+    async fn open(
+        &self,
+        header: &FrameHeader,
+        metadata: &[u8],
+        progress: SendProgress,
+    ) -> Result<Outgoing, QuicSendError> {
         let mut send = Outgoing::new(
             self.connection.inner().open_uni().await?,
             self.aborts.clone(),
+            progress,
         );
         send.write_all(&header.encode()).await?;
         if !metadata.is_empty() {
@@ -792,18 +944,21 @@ struct Outgoing {
     closed: bool,
     /// The path's count of sends reset on this side.
     aborts: Arc<SendAborts>,
+    /// Set once the end of the stream is sent ([`bounded_send`]).
+    progress: SendProgress,
 }
 
 type StoppedResult = Result<Option<quinn::VarInt>, quinn::StoppedError>;
 
 impl Outgoing {
-    fn new(send: quinn::SendStream, aborts: Arc<SendAborts>) -> Self {
+    fn new(send: quinn::SendStream, aborts: Arc<SendAborts>, progress: SendProgress) -> Self {
         let stopped = Box::pin(send.stopped());
         Self {
             send,
             stopped,
             closed: false,
             aborts,
+            progress,
         }
     }
 
@@ -894,6 +1049,7 @@ impl Outgoing {
     async fn finish(mut self) -> Result<(), QuicSendError> {
         self.closed = true;
         self.send.finish().map_err(|_| QuicSendError::Closed)?;
+        self.progress.mark_finished();
         match (&mut self.stopped).await {
             Ok(None) => Ok(()),
             Ok(Some(code)) => Err(QuicSendError::Stopped(code.into_inner())),

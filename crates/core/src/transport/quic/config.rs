@@ -28,7 +28,7 @@
 //! - send-side packet records and the buffers behind sent data;
 //! - allocators other than jemalloc on linux-gnu (macOS and Windows builds
 //!   round differently);
-//! - data on the bidirectional control stream ([`MAX_BIDI_STREAMS`]); the
+//! - data on the one bidirectional stream ([`MAX_BIDI_STREAMS`]); the
 //!   measured streams are unidirectional;
 //! - CRYPTO-frame reassembly, quinn-proto's second assembler (its buffer is
 //!   `crypto_buffer_size`, 16 KiB here);
@@ -76,13 +76,12 @@ pub(crate) const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 /// than an eighth of the limit has been freed), so a sender can wait with
 /// as few as seven eighths of the limit open at the receiver.
 ///
-/// e5 constraint: short messages and control frames take slots from the
-/// same pool as streamed messages, and a streamed message holds its slot
-/// for its whole transfer. Since every send must be bounded by a timeout
-/// (`path` module doc), a short or control message queued behind long
-/// transfers can time out. e5 must keep slots for them (cap concurrent
-/// outbound streamed messages below this value) or carry control frames on
-/// the bidirectional stream reserved for it ([`MAX_BIDI_STREAMS`]).
+/// Short messages and control frames take slots from the same pool as
+/// streamed messages, and a streamed message holds its slot for its whole
+/// transfer. A path caps its outbound streamed messages at
+/// [`STREAMED_SEND_LIMIT`], so [`RESERVED_UNI_STREAMS`] slots stay for
+/// short messages and control frames (see there for what that does not
+/// cover).
 ///
 /// Set from the `inbound_concurrency` gauge (#5993), which estimates on
 /// the UDP transport how many inbound streams each connection would hold
@@ -110,8 +109,28 @@ pub(crate) const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 /// real QUIC connections may justify raising it.
 pub(crate) const MAX_UNI_STREAMS: u32 = 64;
 
-/// Concurrent bidirectional streams a peer may open: one, kept for a control
-/// stream; messages use unidirectional streams.
+/// Uni stream slots streamed messages never take: kept for short messages
+/// and control frames, so they do not wait behind long transfers.
+pub(crate) const RESERVED_UNI_STREAMS: u32 = 8;
+
+/// Streamed messages (`QuicPath::send_stream`, `send_stream_chunks`) a path
+/// sends at once: [`MAX_UNI_STREAMS`] - [`RESERVED_UNI_STREAMS`], 56. A
+/// streamed send past it waits for one of the path's permits before it
+/// opens its stream. Short messages and control frames take no permit.
+///
+/// What the reservation does not cover: the receiver returns stream credit
+/// in batches (above), so up to `MAX_UNI_STREAMS / 8` (8) slots the
+/// receiver has freed can still be unannounced. With 56 streamed messages
+/// open at the receiver and 8 freed slots unannounced, a short message
+/// waits until the receiver frees one more stream. And a permit is
+/// returned when the peer has acknowledged every byte, which can be before
+/// the receiver has read the stream to its end and freed it.
+pub(crate) const STREAMED_SEND_LIMIT: u32 = MAX_UNI_STREAMS - RESERVED_UNI_STREAMS;
+const _: () = assert!(RESERVED_UNI_STREAMS > 0 && STREAMED_SEND_LIMIT > 0);
+
+/// Concurrent bidirectional streams a peer may open: one. Nothing uses it:
+/// messages and control frames ([`super::control`]) go on unidirectional
+/// streams.
 pub(crate) const MAX_BIDI_STREAMS: u32 = 1;
 
 /// Connection attempts quinn holds before they are accepted or refused.

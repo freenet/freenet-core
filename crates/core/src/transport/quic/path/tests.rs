@@ -1747,7 +1747,10 @@ fn a_stop_reported_by_the_write_is_not_counted() {
         let (written, aborts) = p
             .drive(async move {
                 let header = FrameHeader::short(10).expect("a short header");
-                let mut send = a.open(&header, &[]).await.expect("open");
+                let mut send = a
+                    .open(&header, &[], SendProgress::new())
+                    .await
+                    .expect("open");
                 let written = send.written(Err(quinn::WriteError::Stopped(
                     stop_code::BUDGET_REFUSED.into(),
                 )));
@@ -2443,5 +2446,332 @@ fn an_idle_path_is_not_closed() {
         assert!(p.b.connection().inner().close_reason().is_none());
         assert!(recycle_closes_to(a_addr).is_empty());
         assert!(recycle_closes_to(b_addr).is_empty());
+    })
+}
+
+/// A future that never completes, standing in for a send blocked on the
+/// peer.
+async fn never() -> Result<(), QuicSendError> {
+    futures::future::pending().await
+}
+
+/// `bounded_send`'s classification, on virtual time with sends that block:
+/// a deadline before the end of the stream is `Failed(TimedOut)`, one after
+/// it `MaybeDelivered(TimedOut)`; a connection lost after the end is
+/// `MaybeDelivered(ConnectionLost)` and before it `Failed`; a stop after
+/// the end is `Failed` (the peer refused it); success is `Sent`. The
+/// deadline is the one given, on the given clock.
+#[test]
+fn bounded_send_classifies_by_whether_the_stream_was_finished() {
+    bounded(|| async move {
+        let time = VirtualTime::new();
+        let clock = time.clone();
+        let (blocked, finished_then_blocked, timings) = drive(&time, LIMIT, async move {
+            let start = clock.now();
+            let blocked = bounded_send(&clock, Duration::from_secs(5), |_| never()).await;
+            let blocked_after = clock.now() - start;
+            let finished = bounded_send(&clock, Duration::from_secs(3), |progress| async move {
+                progress.mark_finished();
+                never().await
+            })
+            .await;
+            (blocked, finished, (blocked_after, clock.now() - start))
+        })
+        .await;
+        assert!(
+            matches!(blocked, BoundedSend::Failed(SendFailure::TimedOut)),
+            "{blocked:?}"
+        );
+        assert!(
+            matches!(
+                finished_then_blocked,
+                BoundedSend::MaybeDelivered(MaybeDelivered::TimedOut)
+            ),
+            "{finished_then_blocked:?}"
+        );
+        assert_eq!(timings, (Duration::from_secs(5), Duration::from_secs(8)));
+
+        let lost = || QuicSendError::ConnectionLost(quinn::ConnectionError::LocallyClosed);
+        let progress = SendProgress::new();
+        assert!(matches!(
+            bounded::outcome(Err(lost()), &progress),
+            BoundedSend::Failed(SendFailure::Error(QuicSendError::ConnectionLost(_)))
+        ));
+        assert!(matches!(
+            bounded::outcome(Ok(()), &progress),
+            BoundedSend::Sent
+        ));
+        progress.mark_finished();
+        assert!(matches!(
+            bounded::outcome(Err(lost()), &progress),
+            BoundedSend::MaybeDelivered(MaybeDelivered::ConnectionLost)
+        ));
+        assert!(matches!(
+            bounded::outcome(Err(stopped(stop_code::CHANNEL_FULL)), &progress),
+            BoundedSend::Failed(SendFailure::Error(QuicSendError::Stopped(_)))
+        ));
+    })
+}
+
+/// The outcomes on a real path. A `Ready` sent and acknowledged is `Sent`,
+/// and the receiver decodes it. With every acknowledgement from the peer
+/// dropped, the next frame is written whole and arrives, but the sender
+/// cannot know: `MaybeDelivered(TimedOut)`, not `Failed`. With every uni
+/// stream credit held, a send cannot open its stream: `Failed(TimedOut)`.
+/// A connection closed while waiting for the acknowledgement is
+/// `MaybeDelivered(ConnectionLost)`.
+#[test]
+fn bounded_sends_on_a_path_report_each_outcome() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let mut p = paths("quic-path-bounded", 60, QuicPathLimits::DEFAULT).await;
+        let (a, time) = (p.a.clone(), p.time());
+        let ready = QuicControl::Ready {
+            attempt: 7,
+            caps: 0,
+        };
+        let ack = QuicControl::ReadyAck {
+            attempt: 7,
+            caps: 0,
+        };
+        let timeout = Duration::from_secs(5);
+        let sent = p
+            .drive(async move { a.send_control_bounded(&time, timeout, ready).await })
+            .await;
+        assert!(matches!(sent, BoundedSend::Sent), "{sent:?}");
+        let payload = p.b_in.controls.try_recv().expect("delivered");
+        assert_eq!(p.b.decode_control(&payload), Some(ready));
+
+        // Nothing from b reaches a: no acknowledgement.
+        let silenced = DropFrom::new("quic-path-bounded", &[p.pair.b_addr]);
+        let (a, time) = (p.a.clone(), p.time());
+        let unacked = p
+            .drive(async move { a.send_control_bounded(&time, timeout, ack).await })
+            .await;
+        assert!(
+            matches!(
+                unacked,
+                BoundedSend::MaybeDelivered(MaybeDelivered::TimedOut)
+            ),
+            "{unacked:?}"
+        );
+        let payload = p.b_in.controls.try_recv().expect("it did arrive");
+        assert_eq!(p.b.decode_control(&payload), Some(ack));
+
+        // Still no acknowledgements; a closes its side while waiting.
+        let (a, time) = (p.a.clone(), p.time());
+        let lost = p
+            .drive(async move {
+                let send = a.send_control_bounded(&time, Duration::from_secs(60), ack);
+                tokio::pin!(send);
+                tokio::select! {
+                    outcome = &mut send => panic!("returned before the close: {outcome:?}"),
+                    () = time.sleep(Duration::from_secs(1)) => {}
+                }
+                a.connection().close(QuicCloseCode::Downgrade);
+                send.await
+            })
+            .await;
+        assert!(
+            matches!(
+                lost,
+                BoundedSend::MaybeDelivered(MaybeDelivered::ConnectionLost)
+            ),
+            "{lost:?}"
+        );
+        drop(silenced);
+
+        // A fresh pair, every credit held by streams b is still reading.
+        let p = paths("quic-path-bounded-open", 61, QuicPathLimits::DEFAULT).await;
+        let (conn, a, time) = (p.a_raw(), p.a.clone(), p.time());
+        let (blocked, held) = p
+            .drive(async move {
+                let mut held = Vec::new();
+                for _ in 0..super::super::config::MAX_UNI_STREAMS {
+                    let mut send = conn.open_uni().await.unwrap();
+                    send.write_all(&[1, 0]).await.unwrap();
+                    held.push(send);
+                }
+                let blocked = a.send_control_bounded(&time, timeout, ready).await;
+                (blocked, held)
+            })
+            .await;
+        assert!(
+            matches!(blocked, BoundedSend::Failed(SendFailure::TimedOut)),
+            "{blocked:?}"
+        );
+        assert_eq!(p.b.stats().count(QuicInboundOutcome::DeliveredControl), 0);
+        drop(held);
+    })
+}
+
+/// A control payload the receiving path cannot read is refused and counted
+/// by kind: an unknown version, an unknown type, a wrong length.
+#[test]
+fn refused_control_payloads_are_counted() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths("quic-path-control-refused", 62, QuicPathLimits::DEFAULT).await;
+        let mut ready = QuicControl::Ready {
+            attempt: 1,
+            caps: 0,
+        }
+        .encode();
+        assert!(p.b.decode_control(&ready).is_some());
+        ready[0] = 2;
+        assert_eq!(p.b.decode_control(&ready), None);
+        ready[0] = 1;
+        ready[1] = 9;
+        assert_eq!(p.b.decode_control(&ready), None);
+        assert_eq!(p.b.decode_control(&[1, 0, 0]), None);
+        assert_eq!(p.b.decode_control(&[]), None);
+        let stats = p.b.stats();
+        assert_eq!(stats.count(QuicInboundOutcome::ControlUnknownVersion), 1);
+        assert_eq!(stats.count(QuicInboundOutcome::ControlUnknownType), 1);
+        assert_eq!(stats.count(QuicInboundOutcome::ControlMalformed), 2);
+    })
+}
+
+/// Streamed messages take at most `STREAMED_SEND_LIMIT` (56) of the
+/// `MAX_UNI_STREAMS` (64) slots: with more streamed sends than that blocked
+/// on a source that never delivers, 56 streams are open at the receiver,
+/// the rest wait for a permit without opening one, and a short message and
+/// a control frame still go through on the reserved slots.
+#[test]
+fn a_short_still_sends_while_streamed_messages_are_blocked() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let mut p = paths("quic-path-reserved", 63, QuicPathLimits::DEFAULT).await;
+        let limit = super::super::config::STREAMED_SEND_LIMIT as usize;
+        assert_eq!(limit, 56);
+        let streamed = super::super::config::MAX_UNI_STREAMS as usize + 6;
+        let (a, time) = (p.a.clone(), p.time());
+        let (short, control, still_blocked) = p
+            .drive(async move {
+                let mut blocked = futures::stream::FuturesUnordered::new();
+                for _ in 0..streamed {
+                    let a = a.clone();
+                    blocked.push(async move {
+                        a.send_stream_chunks(
+                            StreamId::next(),
+                            1000,
+                            None,
+                            futures::stream::pending::<Result<Bytes, StreamError>>(),
+                        )
+                        .await
+                    });
+                }
+                let timeout = Duration::from_secs(5);
+                let sends = async {
+                    time.sleep(Duration::from_secs(2)).await;
+                    let short = bounded_send(&time, timeout, |progress| {
+                        a.send_short_with(b"through", progress)
+                    })
+                    .await;
+                    let control = a
+                        .send_control_bounded(
+                            &time,
+                            timeout,
+                            QuicControl::Ready {
+                                attempt: 1,
+                                caps: 0,
+                            },
+                        )
+                        .await;
+                    (short, control)
+                };
+                tokio::select! {
+                    done = blocked.next() => panic!("a blocked send returned: {done:?}"),
+                    (short, control) = sends => (short, control, blocked.len()),
+                }
+            })
+            .await;
+        assert!(matches!(short, BoundedSend::Sent), "{short:?}");
+        assert!(matches!(control, BoundedSend::Sent), "{control:?}");
+        assert_eq!(still_blocked, streamed);
+        assert_eq!(
+            p.b.stats().count(QuicInboundOutcome::AnnouncedStream) as usize,
+            limit,
+            "streamed sends past the limit wait without opening a stream"
+        );
+        assert_eq!(
+            &p.b_in.shorts.try_recv().expect("short").into_payload()[..],
+            b"through"
+        );
+        assert!(p.b_in.controls.try_recv().is_ok());
+    })
+}
+
+/// A path in shadow mode refuses a Short or Stream frame with
+/// `NOT_ACCEPTING_DATA` before anything is charged, and counts it: the
+/// inbound budget it shares with the UDP session is untouched (no charge,
+/// no budget refusal), even when that budget is full. Control frames still
+/// arrive. The sender sees the stop as a failed send.
+#[test]
+fn a_shadow_path_refuses_data_before_charging_the_budget() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        for (subnet, budget) in [
+            (64, SharedInboundBudget::new(1024, 1 << 30)),
+            (65, SharedInboundBudget::new(0, 0)),
+        ] {
+            let mut p = paths_with(
+                &format!("quic-path-shadow-{subnet}"),
+                subnet,
+                QuicPathLimits::SHADOW,
+                Some(budget),
+            )
+            .await;
+            let (a, time) = (p.a.clone(), p.time());
+            let timeout = Duration::from_secs(5);
+            let (short, stream, control) = p
+                .drive(async move {
+                    let short = bounded_send(&time, timeout, |progress| {
+                        let payload = over_window();
+                        let a = a.clone();
+                        async move { a.send_short_with(&payload, progress).await }
+                    })
+                    .await;
+                    let stream = bounded_send(&time, timeout, |progress| {
+                        a.send_stream_with(StreamId::next(), Some(b"meta"), over_window(), progress)
+                    })
+                    .await;
+                    let control = a
+                        .send_control_bounded(
+                            &time,
+                            timeout,
+                            QuicControl::Ready {
+                                attempt: 3,
+                                caps: 0,
+                            },
+                        )
+                        .await;
+                    (short, stream, control)
+                })
+                .await;
+            for (what, outcome) in [("short", short), ("stream", stream)] {
+                match outcome {
+                    BoundedSend::Failed(SendFailure::Error(QuicSendError::Stopped(code))) => {
+                        assert_eq!(code, u64::from(stop_code::NOT_ACCEPTING_DATA), "{what}")
+                    }
+                    other => panic!("{what}: expected a stop, got {other:?}"),
+                }
+            }
+            assert!(matches!(control, BoundedSend::Sent), "{control:?}");
+            let stats = p.b.stats();
+            assert_eq!(stats.count(QuicInboundOutcome::RefusedNotAcceptingData), 2);
+            assert_eq!(p.b.charged_streams_now(), 0, "nothing was charged");
+            assert_eq!(p.b.charged(), (0, 0));
+            for outcome in [
+                InboundStreamOutcome::RefusedConnectionBytes,
+                InboundStreamOutcome::RefusedConnectionStreams,
+            ] {
+                assert_eq!(stats.shared_count(outcome), 0, "{outcome:?}");
+            }
+            assert!(p.b_in.shorts.try_recv().is_err());
+            assert!(p.b_in.streams.try_recv().is_err());
+            let payload = p.b_in.controls.try_recv().expect("control arrives");
+            assert!(p.b.decode_control(&payload).is_some());
+        }
     })
 }

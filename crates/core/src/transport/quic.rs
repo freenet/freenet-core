@@ -40,6 +40,7 @@
 pub(crate) mod breaker;
 pub(crate) mod cid;
 pub(crate) mod config;
+pub(crate) mod control;
 pub(crate) mod error;
 pub(crate) mod framing;
 pub(crate) mod identity;

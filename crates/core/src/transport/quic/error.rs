@@ -76,7 +76,7 @@ const _: () = {
     let reset = reset_code::ALL;
     // No code is used twice, within or across the namespaces.
     let all_len = close.len() + stop.len() + reset.len();
-    let mut all = [0u32; 5 + 8 + 2];
+    let mut all = [0u32; 5 + 9 + 2];
     assert!(all.len() == all_len, "update the combined length");
     let mut n = 0;
     let mut i = 0;
@@ -250,7 +250,9 @@ pub(in crate::transport) fn attribute(
 /// `HEADER_REFUSED`, `OVERLONG` and `FRAGMENT_REFUSED` (the receiver's
 /// buffer refused a fragment of this shape). Every other stop code is
 /// retryable: budget, channel-full, eviction, id-in-use, cancellation by
-/// the consumer, and stop codes this node does not know.
+/// the consumer, a path that accepts no data (`NOT_ACCEPTING_DATA`: the
+/// message is fine, and the UDP session carries it), and stop codes this
+/// node does not know.
 pub(in crate::transport) fn stop_is_retryable(code: u64) -> bool {
     ![
         stop_code::HEADER_REFUSED,

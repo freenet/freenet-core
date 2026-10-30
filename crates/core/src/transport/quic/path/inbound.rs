@@ -163,6 +163,8 @@ pub(in crate::transport::quic) struct Receiver<T> {
     controls: mpsc::Sender<Bytes>,
     /// Source of the budget keys short messages are charged under.
     next_short_key: AtomicU32,
+    /// Whether Short and Stream frames are read (`QuicPathLimits::accept_data`).
+    accept_data: bool,
     /// Panic on the next stream, to test the supervisor.
     #[cfg(test)]
     pub(in crate::transport::quic) panic_on_stream: bool,
@@ -176,6 +178,7 @@ impl<T: TimeSource> Receiver<T> {
         shorts: mpsc::Sender<InboundShort>,
         streams: mpsc::Sender<InboundStreamArrival>,
         controls: mpsc::Sender<Bytes>,
+        accept_data: bool,
     ) -> Self {
         Self {
             time,
@@ -185,6 +188,7 @@ impl<T: TimeSource> Receiver<T> {
             streams,
             controls,
             next_short_key: AtomicU32::new(1),
+            accept_data,
             #[cfg(test)]
             panic_on_stream: false,
         }
@@ -618,6 +622,20 @@ async fn read_one<T: TimeSource>(recv: quinn::RecvStream, receiver: Arc<Receiver
             return;
         }
     };
+    // Shadow mode: refuse data before the budget is looked at, so a data
+    // frame neither takes room from the UDP session sharing the budget nor
+    // leaves a refusal there.
+    if !receiver.accept_data && header.kind() != FrameKind::Control {
+        receiver
+            .stats
+            .record(QuicInboundOutcome::RefusedNotAcceptingData);
+        tracing::debug!(
+            kind = ?header.kind(),
+            "QUIC path: refusing data on a path that accepts none"
+        );
+        reader.stop(stop_code::NOT_ACCEPTING_DATA);
+        return;
+    }
     match header.kind() {
         FrameKind::Short => receiver.read_short(reader, header).await,
         FrameKind::Stream => receiver.read_stream(reader, header).await,
