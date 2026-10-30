@@ -3186,7 +3186,12 @@ fn ended_by_endpoint_down(error: &quinn::ConnectionError) -> bool {
         quinn::ConnectionError::TransportError(e) => {
             e.code == quinn::TransportErrorCode::INTERNAL_ERROR
         }
-        _ => false,
+        quinn::ConnectionError::VersionMismatch
+        | quinn::ConnectionError::ConnectionClosed(_)
+        | quinn::ConnectionError::ApplicationClosed(_)
+        | quinn::ConnectionError::Reset
+        | quinn::ConnectionError::TimedOut
+        | quinn::ConnectionError::CidsExhausted => false,
     }
 }
 
@@ -4045,7 +4050,7 @@ fn a_receive_panic_during_connect_ends_the_handshake() {
 /// is only checked to be `true` here.
 #[test]
 fn an_aborting_build_refuses_the_endpoint() {
-    assert!(UNWINDS, "the tests run unwinding");
+    const { assert!(UNWINDS, "the tests run unwinding") };
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
         let network = "quic-abort-build";
@@ -4058,16 +4063,16 @@ fn an_aborting_build_refuses_the_endpoint() {
             None,
         ));
         let keys = TransportKeypair::new();
-        let refused = QuicEndpoint::bind_checked(
+        let Err(refused) = QuicEndpoint::bind_checked(
             false,
             socket.clone(),
             addr,
             time.clone(),
             &settings(),
             &keys,
-        )
-        .err()
-        .expect("an aborting build refuses the endpoint");
+        ) else {
+            panic!("an aborting build refuses the endpoint");
+        };
         assert_eq!(refused.kind(), std::io::ErrorKind::Unsupported);
         assert!(
             QuicEndpoint::bind_or_warn_checked(

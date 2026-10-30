@@ -426,6 +426,7 @@ impl QuicEndpoint {
     /// the socket's ingress was already enabled, or if the TLS
     /// configuration cannot be built, or if the build aborts on panic
     /// ([`require_unwinding`]).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn bind<S: Socket, T: TimeSource>(
         socket: Arc<DemuxSocket<S>>,
         local_addr: SocketAddr,
