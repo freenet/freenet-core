@@ -13,7 +13,7 @@ The Freenet transport layer supports two bandwidth configuration modes:
 ### Per-Connection Mode (Default)
 
 ```bash
-# Each connection can use up to 10 MB/s (default)
+# Each connection can use up to 1.25 MB/s (default, fixedrate controller)
 freenet
 
 # Custom per-connection limit
@@ -33,7 +33,7 @@ freenet --total-bandwidth-limit 50000000 --min-bandwidth-per-connection 1000000
 
 | Argument | Description | Default |
 |----------|-------------|---------|
-| `--bandwidth-limit <bytes/sec>` | Per-connection bandwidth limit | 10,000,000 (10 MB/s) |
+| `--bandwidth-limit <bytes/sec>` | Per-connection bandwidth limit | None (the congestion controller's rate: 1,250,000 (1.25 MB/s) for `fixedrate`) |
 | `--total-bandwidth-limit <bytes/sec>` | Cap on everything the node sends over UDP, across ALL connections | None (disabled) |
 | `--min-bandwidth-per-connection <bytes/sec>` | Minimum per-connection pacing rate inside the total (clamped to the total) | 1,000,000 (1 MB/s) |
 | `--congestion-control <algorithm>` | Congestion control algorithm (`fixedrate`, `ledbat`, `bbr`) | `fixedrate` |
@@ -347,8 +347,10 @@ Rates are recalculated on an RTT-adaptive schedule:
 ## Backward Compatibility
 
 The default behavior (no `total-bandwidth-limit`) is unchanged:
-- Each connection gets an independent 10 MB/s limit
-- N connections can use up to N × 10 MB/s total
+- Each connection is paced independently, at 1.25 MB/s under the default `fixedrate`
+  controller
+- N connections can use up to N × 1.25 MB/s total, which on a home connection can be
+  several times the upload capacity; set `total-bandwidth-limit` to stay below it
 - No egress cap exists
 
 Before the egress cap, `total-bandwidth-limit` only divided a per-connection rate:

@@ -2356,7 +2356,11 @@ pub struct NetworkArgs {
     /// Bandwidth limit for large streaming data transfers, in bytes per second.
     /// Applies only to the streaming path used for large transfers; the general
     /// packet rate limiter is currently disabled for reliability reasons.
-    /// Default: 3 MB/s (3,000,000 bytes/second).
+    /// Applies to each connection separately, so N connections may send up to
+    /// N times this rate; use --total-bandwidth-limit to cap the node as a whole.
+    /// Default: unset, so each connection is paced at the congestion
+    /// controller's rate, 1.25 MB/s (1,250,000 bytes/second) for the default
+    /// `fixedrate` controller.
     #[arg(long)]
     pub bandwidth_limit: Option<usize>,
 
@@ -2666,8 +2670,9 @@ pub struct NetworkApiConfig {
 
     /// Bandwidth limit per connection for data transfers (in bytes per second).
     /// NOTE: This applies to each connection independently - N connections may use N * bandwidth_limit total.
-    /// Each connection uses LEDBAT congestion control to yield to foreground traffic.
-    /// Default: 10 MB/s (10,000,000 bytes/second)
+    /// Default: None, so each connection is paced at the congestion controller's
+    /// rate: 1.25 MB/s (`fixed_rate::DEFAULT_RATE_BYTES_PER_SEC`) for the default
+    /// `fixedrate` controller, which does not slow down for other traffic.
     ///
     /// If `total_bandwidth_limit` is set, this field is ignored and per-connection rates
     /// are derived from: `total_bandwidth_limit / active_connections`.
