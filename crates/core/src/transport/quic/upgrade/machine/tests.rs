@@ -71,10 +71,19 @@ impl Rig {
     }
 
     fn promote(&mut self, remote_version: Option<(u8, u8, u16)>) -> Vec<Action> {
+        self.promote_with(remote_version, BackoffSeed::default())
+    }
+
+    fn promote_with(
+        &mut self,
+        remote_version: Option<(u8, u8, u16)>,
+        backoff: BackoffSeed,
+    ) -> Vec<Action> {
         let peer_key = self.peer.clone();
         self.step(Event::Promoted {
             peer_key,
             remote_version,
+            backoff,
         })
     }
 
@@ -303,6 +312,7 @@ fn event(name: &str, attempt: u32, peer: &TransportPublicKey) -> Event {
         "promoted" => Event::Promoted {
             peer_key: peer.clone(),
             remote_version: Some(QUIC_UPGRADE_NEGOTIATES_IN),
+            backoff: BackoffSeed::default(),
         },
         "tick" => Event::Tick,
         "offer" => Event::Upgrade(UpgradeControl::Offer { attempt, caps: 0 }),
@@ -1442,9 +1452,8 @@ fn a_replaced_session_continues_the_backoff() {
     assert_eq!(seed.retry_at, old.now + Duration::from_secs(240));
 
     let mut server = Rig::new(Role::Server);
-    server.machine = UpgradeMachine::with_backoff(server.machine.local_key.clone(), seed);
     server.now = old.now;
-    server.promote(Some(QUIC_UPGRADE_NEGOTIATES_IN));
+    server.promote_with(Some(QUIC_UPGRADE_NEGOTIATES_IN), seed);
     assert_eq!(server.machine.deadline(), Some(seed.retry_at));
     assert_eq!(
         server.tick_at(seed.retry_at - Duration::from_nanos(1)),
@@ -1458,9 +1467,8 @@ fn a_replaced_session_continues_the_backoff() {
     );
 
     let mut client = Rig::new(Role::Client);
-    client.machine = UpgradeMachine::with_backoff(client.machine.local_key.clone(), seed);
     client.now = old.now;
-    client.promote(Some(QUIC_UPGRADE_NEGOTIATES_IN));
+    client.promote_with(Some(QUIC_UPGRADE_NEGOTIATES_IN), seed);
     assert_eq!(
         client.offer(1)[1],
         Action::Record(Outcome::DeclineSent(DeclineReason::Backoff))
@@ -1469,13 +1477,98 @@ fn a_replaced_session_continues_the_backoff() {
     assert_eq!(client.offer(2)[2], Action::Record(Outcome::Accepted));
 
     let mut late = Rig::new(Role::Server);
-    late.machine = UpgradeMachine::with_backoff(late.machine.local_key.clone(), seed);
     late.now = seed.retry_at + BACKOFF_MAX;
-    late.promote(Some(QUIC_UPGRADE_NEGOTIATES_IN));
+    late.promote_with(Some(QUIC_UPGRADE_NEGOTIATES_IN), seed);
     assert_eq!(
         late.machine.deadline(),
         Some(late.now + Duration::from_secs(6))
     );
+}
+
+/// A seed from a clock with another epoch cannot lock a peer out: the wait is
+/// cut to the longest delay with the most jitter, on both roles. The count is
+/// kept then, and only expires once `retry_at` is more than the longest delay
+/// in the past.
+#[test]
+fn a_seed_is_bounded_when_it_is_taken() {
+    let now = Duration::from_secs(100_000);
+    let nano = Duration::from_nanos(1);
+    let promoted = |role, retry_at, failures| {
+        let mut rig = Rig::new(role);
+        rig.now = now;
+        rig.promote_with(
+            Some(QUIC_UPGRADE_NEGOTIATES_IN),
+            BackoffSeed { failures, retry_at },
+        );
+        rig
+    };
+    let limit = now + Duration::from_secs(4320);
+    for (retry_at, taken) in [
+        (limit - nano, limit - nano),
+        (limit, limit),
+        (limit + nano, limit),
+        (limit * 1000, limit),
+    ] {
+        let rig = promoted(Role::Server, retry_at, 3);
+        assert_eq!(rig.machine.deadline(), Some(taken), "{retry_at:?}");
+        assert_eq!(rig.machine.failures, 3, "{retry_at:?}");
+
+        let mut client = promoted(Role::Client, retry_at, 3);
+        assert_eq!(client.machine.retry_at, taken, "{retry_at:?}");
+        assert_eq!(client.machine.failures, 3, "{retry_at:?}");
+        client.now = taken - nano;
+        assert_eq!(
+            client.offer(1)[1],
+            Action::Record(Outcome::DeclineSent(DeclineReason::Backoff))
+        );
+        client.now = taken;
+        assert_eq!(client.offer(2)[2], Action::Record(Outcome::Accepted));
+    }
+
+    let hour_ago = now - Duration::from_secs(3600);
+    for role in [Role::Server, Role::Client] {
+        assert_eq!(promoted(role, now, 3).machine.failures, 3);
+        assert_eq!(promoted(role, hour_ago, 3).machine.failures, 3);
+        assert_eq!(promoted(role, hour_ago - nano, 3).machine.failures, 0);
+        assert_eq!(promoted(role, Duration::ZERO, 3).machine.failures, 0);
+    }
+}
+
+/// An inbound session answers an Offer before it has a key, so it has no seed
+/// yet. The seed applies from its promotion, on a machine that has already
+/// seen an Offer, and a machine the promotion turns `Off` hands it on.
+#[test]
+fn a_seed_arrives_with_the_promotion() {
+    let mut client = Rig::new(Role::Client);
+    assert_eq!(
+        client.offer(1)[1],
+        Action::Record(Outcome::DeclineSent(DeclineReason::NotReady))
+    );
+    let seed = BackoffSeed {
+        failures: 2,
+        retry_at: client.now + Duration::from_secs(120),
+    };
+    client.promote_with(Some(QUIC_UPGRADE_NEGOTIATES_IN), seed);
+    assert_eq!(client.machine.backoff_seed(), seed);
+    assert_eq!(
+        client.offer(2)[1],
+        Action::Record(Outcome::DeclineSent(DeclineReason::Backoff))
+    );
+
+    let mut below_floor = Rig::new(Role::Server);
+    let seed = BackoffSeed {
+        failures: 2,
+        retry_at: below_floor.now + Duration::from_secs(120),
+    };
+    below_floor.promote_with(None, seed);
+    assert!(below_floor.machine.is_off());
+    assert_eq!(below_floor.machine.backoff_seed(), seed);
+
+    let mut equal_keys = Rig::new(Role::Server);
+    equal_keys.peer = equal_keys.machine.local_key.clone();
+    equal_keys.promote_with(Some(QUIC_UPGRADE_NEGOTIATES_IN), seed);
+    assert!(equal_keys.machine.is_off());
+    assert_eq!(equal_keys.machine.backoff_seed(), seed);
 }
 
 /// A stable path clears the count however it ends, also when the session ends
@@ -1489,8 +1582,7 @@ fn a_stable_path_ended_by_its_session_clears_the_count() {
                 failures: 5,
                 retry_at: Duration::ZERO,
             };
-            rig.machine = UpgradeMachine::with_backoff(rig.machine.local_key.clone(), seed);
-            rig.promote(Some(QUIC_UPGRADE_NEGOTIATES_IN));
+            rig.promote_with(Some(QUIC_UPGRADE_NEGOTIATES_IN), seed);
             let attempt = rig.activate();
             rig.now += age;
             if recheck_first {
@@ -1527,8 +1619,7 @@ fn a_flapping_session_is_retried_less_and_less_often() {
         for seconds in [60, 120, 240, 480] {
             let mut rig = Rig::new(role);
             rig.now = rig.now.max(seed.retry_at);
-            rig.machine = UpgradeMachine::with_backoff(rig.machine.local_key.clone(), seed);
-            rig.promote(Some(QUIC_UPGRADE_NEGOTIATES_IN));
+            rig.promote_with(Some(QUIC_UPGRADE_NEGOTIATES_IN), seed);
             advance_to(&mut rig, role, start);
             assert_eq!(
                 rig.step(Event::SessionEnded).len(),
@@ -1544,8 +1635,7 @@ fn a_flapping_session_is_retried_less_and_less_often() {
         if start == S::Active {
             let mut rig = Rig::new(role);
             rig.now = seed.retry_at;
-            rig.machine = UpgradeMachine::with_backoff(rig.machine.local_key.clone(), seed);
-            rig.promote(Some(QUIC_UPGRADE_NEGOTIATES_IN));
+            rig.promote_with(Some(QUIC_UPGRADE_NEGOTIATES_IN), seed);
             advance_to(&mut rig, role, start);
             rig.now += STABLE_PATH;
             rig.step(Event::SessionEnded);
@@ -1751,6 +1841,7 @@ fn timeouts_and_windows_have_these_values() {
         (BACKOFF_MIN, 60),
         (BACKOFF_MAX, 3600),
         (IDENTITY_BACKOFF, 3600),
+        (SEED_WAIT_MAX, 4320),
         (STABLE_PATH, 600),
         (OFFER_DELAY_MIN, 2),
         (OFFER_DELAY_MAX, 10),
@@ -1784,7 +1875,14 @@ fn a_second_promotion_with_another_key_changes_nothing() {
 
         rig.peer = second;
         rig.now += Duration::from_secs(1);
-        assert_eq!(rig.promote(Some(QUIC_UPGRADE_NEGOTIATES_IN)), vec![]);
+        let seed = BackoffSeed {
+            failures: 9,
+            retry_at: rig.now + BACKOFF_MAX,
+        };
+        assert_eq!(
+            rig.promote_with(Some(QUIC_UPGRADE_NEGOTIATES_IN), seed),
+            vec![]
+        );
         assert_eq!(rig.machine.role, Some(role));
         assert_eq!(rig.machine.deadline(), deadline);
         assert_eq!(Ledger::of(&rig.machine), ledger);
@@ -1870,6 +1968,7 @@ impl Pair {
         let promoted = |rig: &Rig| Event::Promoted {
             peer_key: rig.peer.clone(),
             remote_version: Some(QUIC_UPGRADE_NEGOTIATES_IN),
+            backoff: BackoffSeed::default(),
         };
         let start = pair.now();
         // A client not yet promoted is what declines, so a Decline can be lost.

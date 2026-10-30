@@ -114,6 +114,11 @@ pub(in crate::transport) const IDENTITY_BACKOFF: Duration = BACKOFF_MAX;
 /// that fails sooner keeps it, so one that establishes and then dies at once
 /// is retried less and less often.
 pub(in crate::transport) const STABLE_PATH: Duration = Duration::from_secs(10 * 60);
+/// The longest wait a carried [`BackoffSeed`] may impose: the longest delay with
+/// the most jitter. A seed read off a clock with another epoch cannot lock a
+/// peer out for longer than this.
+pub(in crate::transport) const SEED_WAIT_MAX: Duration =
+    Duration::from_secs(BACKOFF_MAX.as_secs() * 6 / 5);
 /// The earliest first offer after promotion.
 pub(in crate::transport) const OFFER_DELAY_MIN: Duration = Duration::from_secs(2);
 /// The latest first offer after promotion.
@@ -141,9 +146,15 @@ pub(in crate::transport) enum Event {
     /// The node promoted this connection into the ring under `peer_key`
     /// (the transport took it: `PeerIdentityUpdate::Set` or `Same`). A later
     /// promotion changes nothing.
+    ///
+    /// `backoff` is what the machine of this peer's previous session left, or
+    /// the default if none. It comes here and not at construction because an
+    /// inbound session holds no key until promotion, and the seed is filed per
+    /// key, while the machine must exist before that to answer an early Offer.
     Promoted {
         peer_key: TransportPublicKey,
         remote_version: Option<(u8, u8, u16)>,
+        backoff: BackoffSeed,
     },
     /// [`UpgradeMachine::deadline`] may have passed.
     Tick,
@@ -389,9 +400,11 @@ fn unit(sample: f64) -> f64 {
     }
 }
 
-/// What a machine hands to the machine of the session that replaces it, so
-/// the backoff survives the replacement. `retry_at` is on the clock of
-/// [`Inputs::now`]; a time in the past means no wait.
+/// What a machine hands to the machine of the session that replaces it, through
+/// [`Event::Promoted`], so the backoff survives the replacement. `retry_at` is
+/// on the clock of [`Inputs::now`]; a time in the past means no wait. At
+/// promotion a wait is cut to [`SEED_WAIT_MAX`], and a count whose `retry_at` is
+/// more than [`BACKOFF_MAX`] in the past has expired.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(in crate::transport) struct BackoffSeed {
     pub(in crate::transport) failures: u32,
@@ -426,26 +439,19 @@ pub(in crate::transport) struct UpgradeMachine {
 
 impl UpgradeMachine {
     pub(in crate::transport) fn new(local_key: TransportPublicKey) -> Self {
-        Self::with_backoff(local_key, BackoffSeed::default())
-    }
-
-    /// A machine that continues the backoff of the session it replaces.
-    pub(in crate::transport) fn with_backoff(
-        local_key: TransportPublicKey,
-        seed: BackoffSeed,
-    ) -> Self {
         Self {
             local_key,
             role: None,
             state: State::Idle,
             last_attempt: 0,
             last_offer: None,
-            failures: seed.failures,
-            retry_at: seed.retry_at,
+            failures: 0,
+            retry_at: Duration::ZERO,
         }
     }
 
-    /// The backoff to carry to the next session's machine.
+    /// The backoff to carry to the next session's machine, through
+    /// [`Event::Promoted`].
     pub(in crate::transport) fn backoff_seed(&self) -> BackoffSeed {
         BackoffSeed {
             failures: self.failures,
@@ -489,7 +495,8 @@ impl UpgradeMachine {
             Event::Promoted {
                 peer_key,
                 remote_version,
-            } => self.on_promoted(cx, &peer_key, remote_version),
+                backoff,
+            } => self.on_promoted(cx, &peer_key, remote_version, backoff),
             Event::Tick => self.on_tick(cx),
             Event::OfferSent { attempt } => {
                 if self.phase_of(attempt) == Some(Phase::Offered) {
@@ -537,12 +544,16 @@ impl UpgradeMachine {
         cx: Inputs<'_>,
         peer_key: &TransportPublicKey,
         remote_version: Option<(u8, u8, u16)>,
+        backoff: BackoffSeed,
     ) -> Vec<Action> {
         // Off covers what `role` cannot: equal keys leave no role, and a
         // session can end before its promotion. Neither is counted again.
         if self.role.is_some() || self.is_off() {
             return Vec::new();
         }
+        // Before the role's verdict, so a machine that goes `Off` here still
+        // hands the backoff on.
+        self.take_seed(cx, backoff);
         self.role = Role::of(&self.local_key, peer_key);
         match self.role {
             None => {
@@ -562,6 +573,12 @@ impl UpgradeMachine {
                 Vec::new()
             }
         }
+    }
+
+    fn take_seed(&mut self, cx: Inputs<'_>, seed: BackoffSeed) {
+        let expired = cx.now.saturating_sub(seed.retry_at) > BACKOFF_MAX;
+        self.failures = if expired { 0 } else { seed.failures };
+        self.retry_at = seed.retry_at.min(cx.now + SEED_WAIT_MAX);
     }
 
     fn on_tick(&mut self, cx: Inputs<'_>) -> Vec<Action> {
