@@ -1846,7 +1846,13 @@ impl Pair {
             let closer = match self.lost {
                 Lost::CloseFromServer => Some(SERVER),
                 Lost::CloseFromClient => Some(CLIENT),
-                _ => None,
+                Lost::Nothing
+                | Lost::Offer
+                | Lost::Accept
+                | Lost::Decline
+                | Lost::Dial
+                | Lost::Ready
+                | Lost::ReadyAck => None,
             };
             let both_active = self.settled() && self.rigs[SERVER].machine.is_active();
             if let (Some(side), None, true) = (closer, self.lost_at, both_active) {
