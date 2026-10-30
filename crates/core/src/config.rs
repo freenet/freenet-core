@@ -318,7 +318,9 @@ impl Default for ConfigArgs {
                 gateways: None,
                 gateway: None,
                 location: None,
-                bandwidth_limit: Some(3_000_000), // 3 MB/s default for streaming transfers only
+                // Library/test default only: the CLI leaves this unset (see
+                // NetworkArgs::bandwidth_limit), and it only seeds the initial rate (#6047).
+                bandwidth_limit: Some(3_000_000),
                 total_bandwidth_limit: None,
                 min_bandwidth_per_connection: None,
                 blocked_addresses: None,
@@ -2356,7 +2358,12 @@ pub struct NetworkArgs {
     /// Bandwidth limit for large streaming data transfers, in bytes per second.
     /// Applies only to the streaming path used for large transfers; the general
     /// packet rate limiter is currently disabled for reliability reasons.
-    /// Default: 3 MB/s (3,000,000 bytes/second).
+    /// Currently this only sets a connection's initial pacing rate: the first
+    /// rate update replaces it with the congestion controller's rate (#6047).
+    /// To limit what the node sends, use --total-bandwidth-limit.
+    /// Default: unset, so each connection is paced at the congestion
+    /// controller's rate, 1.25 MB/s (1,250,000 bytes/second) for the default
+    /// `fixedrate` controller.
     #[arg(long)]
     pub bandwidth_limit: Option<usize>,
 
@@ -2665,9 +2672,12 @@ pub struct NetworkApiConfig {
     pub ignore_protocol_version: bool,
 
     /// Bandwidth limit per connection for data transfers (in bytes per second).
-    /// NOTE: This applies to each connection independently - N connections may use N * bandwidth_limit total.
-    /// Each connection uses LEDBAT congestion control to yield to foreground traffic.
-    /// Default: 10 MB/s (10,000,000 bytes/second)
+    /// NOTE: Currently this only seeds a connection's initial token-bucket rate;
+    /// the first rate update replaces it with the congestion controller's rate (#6047).
+    /// Default: None, so each connection is paced at the congestion controller's
+    /// rate: 1.25 MB/s (`fixed_rate::DEFAULT_RATE_BYTES_PER_SEC`) for the default
+    /// `fixedrate` controller, which does not adapt to queuing delay or other traffic.
+    /// N connections may therefore send up to N times that rate.
     ///
     /// If `total_bandwidth_limit` is set, this field is ignored and per-connection rates
     /// are derived from: `total_bandwidth_limit / active_connections`.

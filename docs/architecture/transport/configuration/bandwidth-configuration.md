@@ -4,7 +4,8 @@
 
 The Freenet transport layer supports two bandwidth configuration modes:
 
-1. **Per-connection mode** (default): Each connection gets an independent bandwidth limit
+1. **Per-connection mode** (default): Each connection is paced independently at the congestion
+   controller's rate (1.25 MB/s under the default `fixedrate`), with no node-wide cap
 2. **Global pool mode**: Total bandwidth is shared fairly across all connections, and
    `total-bandwidth-limit` is a node-wide cap on everything the node sends
 
@@ -13,10 +14,11 @@ The Freenet transport layer supports two bandwidth configuration modes:
 ### Per-Connection Mode (Default)
 
 ```bash
-# Each connection can use up to 10 MB/s (default)
+# Each connection can use up to 1.25 MB/s (default, fixedrate controller)
 freenet
 
-# Custom per-connection limit
+# Custom per-connection limit. Currently only sets the initial rate: the
+# congestion controller's rate replaces it at the first rate update (#6047).
 freenet --bandwidth-limit 5000000  # 5 MB/s per connection
 ```
 
@@ -33,7 +35,7 @@ freenet --total-bandwidth-limit 50000000 --min-bandwidth-per-connection 1000000
 
 | Argument | Description | Default |
 |----------|-------------|---------|
-| `--bandwidth-limit <bytes/sec>` | Per-connection bandwidth limit | 10,000,000 (10 MB/s) |
+| `--bandwidth-limit <bytes/sec>` | Per-connection bandwidth limit (currently only the initial rate, #6047) | None (the congestion controller's rate: 1,250,000 (1.25 MB/s) for `fixedrate`) |
 | `--total-bandwidth-limit <bytes/sec>` | Cap on everything the node sends over UDP, across ALL connections | None (disabled) |
 | `--min-bandwidth-per-connection <bytes/sec>` | Minimum per-connection pacing rate inside the total (clamped to the total) | 1,000,000 (1 MB/s) |
 | `--congestion-control <algorithm>` | Congestion control algorithm (`fixedrate`, `ledbat`, `bbr`) | `fixedrate` |
@@ -48,7 +50,7 @@ freenet --total-bandwidth-limit 50000000 --min-bandwidth-per-connection 1000000
 congestion-control = "fixedrate"  # Options: "fixedrate" (default), "ledbat", "bbr"
 
 # Per-connection mode (traditional)
-bandwidth-limit = 10000000  # 10 MB/s per connection
+bandwidth-limit = 10000000  # 10 MB/s per connection (currently only the initial rate, #6047)
 
 # OR Global pool mode (recommended)
 total-bandwidth-limit = 50000000           # 50 MB/s total
@@ -109,7 +111,7 @@ freenet --ledbat-min-ssthresh 614400
 ledbat-min-ssthresh = 524288  # 500KB
 
 # Can combine with bandwidth limits
-bandwidth-limit = 10000000
+bandwidth-limit = 10000000  # currently only the initial rate (#6047)
 ledbat-min-ssthresh = 750000
 ```
 
@@ -347,8 +349,10 @@ Rates are recalculated on an RTT-adaptive schedule:
 ## Backward Compatibility
 
 The default behavior (no `total-bandwidth-limit`) is unchanged:
-- Each connection gets an independent 10 MB/s limit
-- N connections can use up to N × 10 MB/s total
+- Each connection is paced independently, at 1.25 MB/s under the default `fixedrate`
+  controller
+- N connections can use up to N × 1.25 MB/s total, which on a home connection can be
+  several times the upload capacity; set `total-bandwidth-limit` to stay below it
 - No egress cap exists
 
 Before the egress cap, `total-bandwidth-limit` only divided a per-connection rate:
@@ -379,10 +383,11 @@ min-bandwidth-per-connection = 500000      # 500 KB/s minimum
 
 ```toml
 [network-api]
-# Higher limits for local testing
-bandwidth-limit = 100000000                # 100 MB/s per connection
-# OR
-total-bandwidth-limit = 500000000          # 500 MB/s total
+# Higher throughput for local testing. A connection's rate is
+# min(congestion controller rate, total share), so neither bandwidth-limit
+# (#6047) nor a large total-bandwidth-limit raises it above fixedrate's
+# 1.25 MB/s. Use a controller that adapts its rate instead:
+congestion-control = "bbr"
 ```
 
 ## LEDBAT Configuration for High-Latency Paths

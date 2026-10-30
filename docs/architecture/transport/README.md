@@ -88,7 +88,7 @@ Low Extra Delay Background Transport with periodic slowdowns (draft-irtf-iccrg-l
 - Periodic slowdowns to probe for available bandwidth
 - Fair bandwidth sharing between concurrent connections
 
-**Performance:** >3 MB/s throughput goal achieved (up to 10 MB/s with default token bucket limit)
+**Performance:** >3 MB/s throughput goal achieved (up to 10 MB/s, measured with a 10 MB/s token bucket)
 
 **Documentation:** [LEDBAT++ Implementation](design/ledbat-plus-plus.md)
 
@@ -137,7 +137,7 @@ congestion-control = "ledbat"  # or "bbr" or "fixedrate"
 ## Quick Reference
 
 ### Default Configuration
-- **Per-connection bandwidth limit**: 10 MB/s (configurable)
+- **Per-connection bandwidth limit**: unset, so connections pace at the FixedRate rate of 1.25 MB/s each (`--bandwidth-limit` currently sets only the initial rate, #6047; use `--total-bandwidth-limit` to limit the node)
 - **Global bandwidth pool**: Disabled by default (enable with `--total-bandwidth-limit`)
 - **QUIC endpoint**: `transport-quic = "off"` by default (`--transport-quic`, `FREENET_TRANSPORT_QUIC`). `"shadow"` builds a QUIC endpoint on the network port that, in this release, accepts no connections and opens none, and `"prefer"` runs as `"shadow"`; `quic-max-paths` (default and maximum `max-number-of-connections`; a value that is not a whole number is ignored with a warning) will bound the QUIC paths a node holds; an unknown value is treated as `"off"` with a warning (#5940)
 - **Min per-connection rate**: 1 MB/s (when global pool enabled), clamped to the total; `total-bandwidth-limit` is also a node-wide cap on everything the node sends (see [bandwidth configuration](configuration/bandwidth-configuration.md))
@@ -150,10 +150,10 @@ congestion-control = "ledbat"  # or "bbr" or "fixedrate"
 - **Slowdown interval**: 9x slowdown duration (~10% overhead)
 
 ### Key Performance Metrics
-- **>3 MB/s goal**: ✅ Achieved (10 MB/s default, 3.3x target)
+- **>3 MB/s goal**: ✅ Achieved (10 MB/s measured with a 10 MB/s token bucket, 3.3x target)
 - **Cold start ramp-up**: ~300ms to reach 300KB cwnd @ 100ms RTT
-- **Steady-state throughput**: Up to 10 MB/s (token bucket limit, not LEDBAT)
-- **Real-world bottleneck**: Token bucket (10 MB/s), not LEDBAT cwnd (1 GB max)
+- **Steady-state throughput**: Up to the token bucket rate (not LEDBAT)
+- **Real-world bottleneck**: Token bucket rate, not LEDBAT cwnd (1 GB max)
 
 ### Running Benchmarks
 ```bash
