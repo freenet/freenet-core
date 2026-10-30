@@ -29,7 +29,9 @@
 //! `open_uni` waits for a stream credit, a write waits for flow-control
 //! credit, and the final wait for acknowledgement has no deadline of its
 //! own (only quinn's connection idle timeout ends it, and keepalives keep a
-//! connection alive). e5 callers MUST bound every send with a timeout.
+//! connection alive). Every send the node makes goes through
+//! [`bounded_send`], which also says whether a timed-out message may have
+//! been delivered.
 //!
 //! Cancel safety: dropping a send future before it returns resets the
 //! stream ([`reset_code::SENDER_ABORTED`]), so the receiver sees
@@ -37,9 +39,15 @@
 //! early as if it were complete or truncated. A dropped short message or
 //! control frame is lost. A send future dropped while it waits for
 //! acknowledgement (after `finish` was issued) is NOT reset: every byte
-//! was already written, so the message may still be delivered. For e5, a
-//! timeout that fires during that wait means "maybe delivered", not
-//! "failed".
+//! was already written, so the message may still be delivered:
+//! [`bounded_send`] reports a timeout there as `MaybeDelivered`, not
+//! `Failed`.
+//!
+//! Streamed messages hold at most `config::STREAMED_SEND_LIMIT` of the uni
+//! stream slots at once (one permit each), so short messages and control
+//! frames keep slots of their own. A path in shadow mode
+//! ([`QuicPathLimits::SHADOW`]) refuses inbound data with
+//! [`stop_code::NOT_ACCEPTING_DATA`] before charging anything.
 //!
 //! Known quinn cost (quinn 0.11.12): `SendStream::stopped()` registers an
 //! `Arc<Notify>` in the connection's `stopped` map, removed only when quinn

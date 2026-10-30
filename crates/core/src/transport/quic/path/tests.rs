@@ -2760,12 +2760,11 @@ fn a_shadow_path_refuses_data_before_charging_the_budget() {
                 })
                 .await;
             for (what, outcome) in [("short", short), ("stream", stream)] {
-                match outcome {
-                    BoundedSend::Failed(SendFailure::Error(QuicSendError::Stopped(code))) => {
-                        assert_eq!(code, u64::from(stop_code::NOT_ACCEPTING_DATA), "{what}")
-                    }
-                    other => panic!("{what}: expected a stop, got {other:?}"),
-                }
+                let BoundedSend::Failed(SendFailure::Error(QuicSendError::Stopped(code))) = outcome
+                else {
+                    panic!("{what}: expected a stop, got {outcome:?}");
+                };
+                assert_eq!(code, u64::from(stop_code::NOT_ACCEPTING_DATA), "{what}");
             }
             assert!(matches!(control, BoundedSend::Sent), "{control:?}");
             let stats = p.b.stats();
