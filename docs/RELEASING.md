@@ -457,8 +457,8 @@ Current wire-gated floors:
   message `SymmetricMessagePayload::Upgrade`, #5940 step e1).
 
   Set to **`(0, 2, 149)`**, the release intended to first ship the decoder.
-  Nothing sends the message yet; a later step sends it only to peers that pass
-  `may_send_upgrade`, which reads this floor. Guarded by
+  The negotiation (e5a-5b) sends it only to peers that pass `may_send_upgrade`,
+  which reads this floor, or in reply to one they sent. Guarded by
   `QUIC_UPGRADE_SHIPPED_IN`, checked by
   `symmetric_message.rs::upgrade_floor_tracks_the_shipping_release`. It is set
   to `Some((0, 2, 149))` ahead of the 0.2.149 cut, because the decoder (#5970)
@@ -472,12 +472,21 @@ Current wire-gated floors:
   floor being lowered.
 
 - `QUIC_UPGRADE_NEGOTIATES_IN` in the same file (the first release that answers
-  a QUIC upgrade `Offer`, #5940 step e5a). Parked at `(0, 3, 0)`: nothing sends
-  an `Offer` until the negotiation is wired in (e5a-5b), which must set this to
-  the release that first ships it and then freeze it. Guarded by
-  `QUIC_UPGRADE_NEGOTIATES_SHIPPED_IN`, checked by
-  `symmetric_message.rs::negotiation_floor_tracks_the_shipping_release`. Too high
-  only delays upgrades.
+  a QUIC upgrade `Offer`, #5940 step e5a).
+
+  Set to **`(0, 2, 153)`**, the release intended to first ship the negotiation
+  (e5a-5b). Guarded by `QUIC_UPGRADE_NEGOTIATES_SHIPPED_IN`, now `None`, checked
+  by `symmetric_message.rs::negotiation_floor_tracks_the_shipping_release`. When
+  the 0.2.153 bump fails that test, set the marker to
+  `Some(QUIC_UPGRADE_NEGOTIATES_IN)` if the release carries the negotiation,
+  otherwise raise the floor; then freeze it. Too high only delays upgrades; too
+  low makes offers to peers that ignore them, which time out and count against
+  the upgrade success rate.
+  `negotiation_floor_stays_above_every_release_that_ignores_an_offer` catches the
+  floor being lowered. The simulation test
+  `test_quic_shadow_real_version_offers_only_from_the_first_negotiating_release`
+  requires real upgrades once the crate reaches 0.2.153, so raising the floor also
+  means moving `QUIC_FIRST_NEGOTIATING_RELEASE` beside it.
 
 When a NEW wire-gated feature first ships (not this one), set its floor to
 **exactly that release version** and freeze it, as described above.

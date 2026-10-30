@@ -103,13 +103,13 @@ pub mod local_node {
 /// Exports for the dev tool.
 pub mod dev_tool {
     use super::*;
-    #[cfg(any(test, feature = "testing"))]
-    pub use crate::transport::quic::upgrade::sim_trace::{QuicUpgradeRecord, QuicUpgradeTrace};
     pub use crate::config::{
         Config, GlobalTestMetrics, KEK_SIZE, KekBackend, KekBackendKind, KekError, Secrets,
         ensure_kek_loaded, load_from_backend, read_backend_marker, replace_backend_marker,
         write_backend_marker,
     };
+    #[cfg(any(test, feature = "testing"))]
+    pub use crate::transport::quic::upgrade::sim_trace::{QuicUpgradeRecord, QuicUpgradeTrace};
     // Backend constructors live in the `kek` submodule rather than the
     // top-level `config` re-export to keep `Config`'s public surface
     // free of platform-specific concrete types.

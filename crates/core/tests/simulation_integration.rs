@@ -20777,6 +20777,9 @@ fn run_quic_shadow_sim(
     let rt = create_runtime();
     let (sim, logs_handle, trace, addresses) = rt.block_on(async {
         let mut sim = SimNetwork::new(name, gateways, nodes, 7, 3, 10, 2, seed).await;
+        // A joiner learns its gateway's version only from this ack, and a peer of
+        // unknown version is not offered.
+        sim.enable_gateway_ack_version();
         let trace = sim.quic_upgrade_trace();
         let mut labels: Vec<_> = sim.all_node_addresses().keys().cloned().collect();
         labels.sort_by_key(|label| (!label.is_gateway(), label.number()));
@@ -20928,7 +20931,27 @@ fn test_quic_off_peer_declines_with_disabled() {
             assert_eq!(declined.permits, 0, "a refused offer returns its permit");
         }
     }
-    assert_eq!(offers_seen, 1, "exactly one assignment makes shadow the server");
+    assert_eq!(
+        offers_seen, 1,
+        "exactly one assignment makes shadow the server"
+    );
+}
+
+/// With QUIC off on both ends, as by default, no upgrade message moves at all, even
+/// with both nodes counting as a release that negotiates.
+#[test_log::test]
+fn test_quic_off_nodes_exchange_no_upgrade_messages() {
+    let run = run_quic_shadow_sim(
+        "quic-off-silent",
+        0x5940_E5B0_000A,
+        (1, 1),
+        4,
+        |_, trace, _| run_as_first_negotiating_release(trace),
+    );
+    assert!(run.trace.records().is_empty(), "{}", run.dump());
+    for node in &run.nodes {
+        assert_eq!(run.trace.permits_in_use(*node), None, "it has no upgrades");
+    }
 }
 
 /// A peer below the decoder floor must not receive a single Upgrade byte, and one
@@ -20940,7 +20963,10 @@ fn test_quic_old_peers_are_never_offered() {
         SimNetwork::min_compatible_protocol_version(),
         SimNetwork::real_protocol_version(),
     );
-    for (version, label) in [((0, 2, 148), "decoder-floor"), ((0, 2, 149), "answer-floor")] {
+    for (version, label) in [
+        ((0, 2, 148), "decoder-floor"),
+        ((0, 2, 149), "answer-floor"),
+    ] {
         if !(min <= version && version <= real) {
             tracing::warn!(?version, "SKIPPED: not advertisable on this release");
             continue;
@@ -20953,7 +20979,6 @@ fn test_quic_old_peers_are_never_offered() {
                 (1, 1),
                 3,
                 |sim, trace, labels| {
-                    sim.enable_gateway_ack_version();
                     sim.with_node_transport_quic(&labels[1 - old_index], "shadow");
                     sim.with_node_advertised_version(&labels[old_index], version);
                     run_as_first_negotiating_release(trace);
@@ -20962,7 +20987,12 @@ fn test_quic_old_peers_are_never_offered() {
             let old = run.nodes[old_index];
             let shadow = run.nodes[1 - old_index];
             assert_eq!(run.whats(old, "received"), 0, "{version:?}: {}", run.dump());
-            assert_eq!(run.whats(shadow, "Offered"), 0, "{version:?}: {}", run.dump());
+            assert_eq!(
+                run.whats(shadow, "Offered"),
+                0,
+                "{version:?}: {}",
+                run.dump()
+            );
             ineligible += run.whats(shadow, "IneligibleVersion");
         }
         assert_eq!(
@@ -21026,11 +21056,7 @@ fn test_quic_established_path_that_idles_out_falls_back() {
     );
     let server = run.server();
     assert!(run.total("Established") >= 2, "{}", run.dump());
-    assert!(
-        run.whats(server, "Fallback(Idle)") >= 1,
-        "{}",
-        run.dump()
-    );
+    assert!(run.whats(server, "Fallback(Idle)") >= 1, "{}", run.dump());
     assert!(run.whats(server, "Offered") >= 2, "{}", run.dump());
 }
 
@@ -21063,7 +21089,12 @@ fn test_quic_wrong_key_closes_with_identity_mismatch() {
         assert_eq!(run.whats(wrong, "IdentityMismatch"), 1, "{}", run.dump());
         assert_eq!(run.whats(other, "IdentityMismatch"), 1, "{}", run.dump());
         assert_eq!(run.whats(wrong, "Established"), 0, "{}", run.dump());
-        assert_eq!(run.total("Offered"), 1, "no new offer for an hour: {}", run.dump());
+        assert_eq!(
+            run.total("Offered"),
+            1,
+            "no new offer for an hour: {}",
+            run.dump()
+        );
     }
 }
 
@@ -21116,68 +21147,41 @@ fn test_quic_shadow_upgrade_is_deterministic() {
     assert_eq!(once("quic-shadow-det-run1"), once("quic-shadow-det-run2"));
 }
 
-/// The client of an established path restarts, with its identity. The survivor's
-/// session is replaced, so its path closes, and the backoff of the session that
-/// ended carries over to the new one: a survivor that is the server waits for it
-/// before it offers, and one that is the client declines with `Backoff` first.
+/// The client or server of an established path restarts, with its identity, and
+/// its old path's datagrams no longer arrive. The survivor's session is replaced,
+/// so its live path closes by that alone, and the backoff of the session that ended
+/// carries over to the new one: a survivor that is the server waits for it before
+/// it offers, and one that is the client declines with `Backoff`.
 #[test_log::test]
 fn test_quic_replaced_connection_closes_its_path_and_keeps_the_backoff() {
-    use freenet::config::SimulationIdleTimeout;
+    /// When the two nodes stop hearing each other over QUIC, after the path is up.
+    const QUIET_FROM: Duration = Duration::from_secs(30);
     let mut roles_seen = std::collections::BTreeSet::new();
-    for (index, seed) in (0..8u64).map(|i| 0x5940_E5B0_0100 + i).enumerate() {
-        let name = format!("quic-replaced-{index}");
-        setup_deterministic_state(seed);
-        SimulationIdleTimeout::enable();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .start_paused(true)
-            .build()
-            .unwrap();
-        let (trace, survivor, restarted, replaced_at) = rt.block_on(async {
-            let mut sim = SimNetwork::new(&name, 1, 1, 7, 3, 10, 2, seed).await;
-            sim.with_transport_quic("shadow");
-            let trace = sim.quic_upgrade_trace();
-            run_as_first_negotiating_release(&trace);
-            let labels = sim.all_node_addresses().clone();
-            let gateway = labels.keys().find(|l| l.is_gateway()).unwrap().clone();
-            let node = labels.keys().find(|l| !l.is_gateway()).unwrap().clone();
-            let time = sim.virtual_time().clone();
-            let driver = tokio::spawn(async move {
-                let start = tokio::time::Instant::now();
-                loop {
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                    time.advance_to(start.elapsed().as_nanos() as u64);
-                }
-            });
-            let _handles = sim
-                .start_with_rand_gen::<rand::rngs::SmallRng>(seed, 1, 1)
-                .await;
-            tokio::time::sleep(Duration::from_secs(40)).await;
-            assert!(sim.crash_node(&node));
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            let replaced_at = trace.now();
-            sim.restart_node::<rand::rngs::SmallRng>(&node, seed + 1, 1, 1)
-                .await
-                .expect("the node restarts");
-            tokio::time::sleep(Duration::from_secs(120)).await;
-            driver.abort();
-            (trace, labels[&gateway], labels[&node], replaced_at)
-        });
-        drop(rt);
+    for (index, seed) in (0..16u64).map(|i| 0x5940_E5B0_0100 + i).enumerate() {
+        let (trace, survivor, replaced_at) = run_quic_restart_sim(
+            &format!("quic-replaced-{index}"),
+            seed,
+            Some(QUIET_FROM),
+            Duration::from_secs(120),
+        );
         let dump = format!("{:#?}", trace.records());
         let of = |prefix: &str| trace.matching(survivor, prefix);
-        assert_eq!(
-            of("Established").iter().filter(|e| e.at < replaced_at).count(),
-            1,
-            "path up before the restart: {dump}"
-        );
-        let old_session = of("Established")[0].session;
+        let old = of("Established")[0].session;
+        let ended = of("session ended")
+            .into_iter()
+            .find(|e| e.session == old)
+            .unwrap_or_else(|| panic!("the old session ended: {dump}"));
+        assert!(ended.at >= replaced_at, "{dump}");
+        assert_eq!(ended.permits, 0, "{dump}");
         assert!(
-            trace
-                .of(survivor, restarted)
+            of("closed path with Downgrade")
                 .iter()
-                .any(|r| r.session == old_session && r.what.starts_with("closed path")),
-            "the replaced connection's path closed: {dump}"
+                .any(|c| c.session == old && c.at >= replaced_at),
+            "the session's end closed the live path: {dump}"
+        );
+        assert!(
+            of("Fallback").iter().all(|f| f.session != old),
+            "nothing but the replacement ended the path: {dump}"
         );
         let survivor_was_server = of("Offered").iter().any(|o| o.at < replaced_at);
         if survivor_was_server {
@@ -21186,7 +21190,7 @@ fn test_quic_replaced_connection_closes_its_path_and_keeps_the_backoff() {
                 .find(|o| o.at > replaced_at)
                 .unwrap_or_else(|| panic!("no new offer: {dump}"));
             assert!(
-                next.at >= replaced_at + Duration::from_secs(48),
+                next.at >= ended.at + Duration::from_secs(48),
                 "the first offer of the new session waits for the backoff, \
                  not its own 2-10 s: {dump}"
             );
@@ -21197,13 +21201,82 @@ fn test_quic_replaced_connection_closes_its_path_and_keeps_the_backoff() {
             );
         }
         roles_seen.insert(survivor_was_server);
-        assert!(
-            of("Established").iter().any(|e| e.at > replaced_at && e.session != old_session),
-            "the new session upgrades in the end: {dump}"
-        );
         if roles_seen.len() == 2 {
             return;
         }
     }
     panic!("the seeds did not cover both roles: {roles_seen:?}");
+}
+
+/// With nothing in the way, a session that replaced one upgrades in the end.
+#[test_log::test]
+fn test_quic_replacement_session_upgrades_after_the_backoff() {
+    let (trace, survivor, replaced_at) = run_quic_restart_sim(
+        "quic-replaced-upgrades",
+        0x5940_E5B0_0200,
+        None,
+        Duration::from_secs(240),
+    );
+    let established = trace.matching(survivor, "Established");
+    let old = established[0].session;
+    assert!(
+        established
+            .iter()
+            .any(|e| e.at > replaced_at && e.session != old),
+        "{:#?}",
+        trace.records()
+    );
+}
+
+/// One gateway and one node in shadow, with the path up by 40 s: the node crashes
+/// and restarts with its identity, and the run goes on for `then`. `quiet_from`
+/// stops QUIC datagrams between them. Returns the trace, the gateway's address and
+/// the time of the restart.
+fn run_quic_restart_sim(
+    name: &str,
+    seed: u64,
+    quiet_from: Option<Duration>,
+    then: Duration,
+) -> (freenet::dev_tool::QuicUpgradeTrace, SocketAddr, Duration) {
+    setup_deterministic_state(seed);
+    freenet::config::SimulationIdleTimeout::enable();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let mut sim = SimNetwork::new(name, 1, 1, 7, 3, 10, 2, seed).await;
+        sim.enable_gateway_ack_version();
+        sim.with_transport_quic("shadow");
+        let trace = sim.quic_upgrade_trace();
+        run_as_first_negotiating_release(&trace);
+        let labels = sim.all_node_addresses().clone();
+        let gateway = labels.keys().find(|l| l.is_gateway()).unwrap().clone();
+        let node = labels.keys().find(|l| !l.is_gateway()).unwrap().clone();
+        if let Some(from) = quiet_from {
+            sim.drop_quic_datagrams_between(&gateway, &node, from);
+        }
+        let time = sim.virtual_time().clone();
+        let driver = tokio::spawn(async move {
+            let start = tokio::time::Instant::now();
+            loop {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                time.advance_to(start.elapsed().as_nanos() as u64);
+            }
+        });
+        let _handles = sim
+            .start_with_rand_gen::<rand::rngs::SmallRng>(seed, 1, 1)
+            .await;
+        tokio::time::sleep(Duration::from_secs(40)).await;
+        assert!(sim.crash_node(&node));
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let replaced_at = trace.now();
+        sim.restart_node::<rand::rngs::SmallRng>(&node, seed + 1, 1, 1)
+            .await
+            .expect("the node restarts");
+        tokio::time::sleep(then).await;
+        driver.abort();
+        (trace, labels[&gateway], replaced_at)
+    })
 }

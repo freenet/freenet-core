@@ -638,11 +638,11 @@ SymmetricMessagePayload::Upgrade(UpgradeControl) is bincode index 7,
 appended after AckConnectionV2. UpgradeControl is Offer { attempt, caps },
 Accept { attempt } or Decline { attempt, reason }.
 
-Decode-only until step e5a-5b wires quic/upgrade/machine.rs in: nothing sends
-it. A node that receives one acks
-it like a ShortMessage, counts it (upgrade_control_received in
-transport_snapshot) and ignores it. It never replies and never closes the
-connection.
+A node that receives one acks it like a ShortMessage, counts it
+(upgrade_control_received in transport_snapshot) and never closes the
+connection over it. With upgrades (see "Upgrade driver") it goes to the
+session's driver. Without them an Offer gets Decline{Disabled} and an Accept
+or a Decline is dropped.
 
 Version gate: send it only when may_send_upgrade(remote_version) is true,
 i.e. the remote is at or above QUIC_UPGRADE_MIN_VERSION (0.2.149). None
@@ -654,9 +654,10 @@ gate. The floor follows the wire-gated-floor rule in docs/RELEASING.md
 
 An Offer also needs may_offer_upgrade(remote_version): the remote is at or
 above QUIC_UPGRADE_NEGOTIATES_IN, the first release that answers one (a peer
-below it decodes an Offer and ignores it). Parked at (0, 3, 0), above every
-release, until e5a-5b sets it to the release that first ships the negotiation
-and records it in QUIC_UPGRADE_NEGOTIATES_SHIPPED_IN.
+below it decodes an Offer and ignores it). It is (0, 2, 153), a prediction until
+the release bump records it in QUIC_UPGRADE_NEGOTIATES_SHIPPED_IN. Until the
+crate reaches it, nodes of this tree report a version below the floor and do not
+offer to each other.
 
 Decline reasons (DeclineReason, wire values): 1 Disabled, 2 Backoff, 3 Busy,
 4 NotReady (no peer key from a promotion yet, or an attempt in progress). Any
@@ -877,11 +878,10 @@ breaker works there (#6031). Shadow or prefer: the endpoint is built
 with the node's QUIC identity (below) and an EMPTY allow-set, so nothing
 reaches it and it sends nothing; the listener holds it, with the queue of
 its accept loop (below), which hands on no attempt while the allow-set is
-empty. Upgrading a UDP session to QUIC comes later, so only tests open
-QUIC connections.
+empty. An upgrade adds a peer to the allow-set ("Upgrade driver" below).
 
-Upgrade state machine (`quic/upgrade/machine.rs`, #5940 step e5a-5a, not yet
-wired in): UpgradeMachine::step(Inputs { now, sample, policy }, Event) returns
+Upgrade state machine (`quic/upgrade/machine.rs`, #5940 step e5a-5a):
+UpgradeMachine::step(Inputs { now, sample, policy }, Event) returns
 the Actions for the caller to carry out. It does no I/O and reads no clock:
 now comes from the connection's TimeSource, sample is a GlobalRng draw in
 0..1. The caller sends Event::Tick at UpgradeMachine::deadline(). The module
@@ -975,9 +975,45 @@ doc has the transition table.
   negotiation_floor_stays_above_every_release_that_ignores_an_offer stops
   QUIC_UPGRADE_NEGOTIATES_IN going down to 0.2.152 or below.
 
-Upgrade policy (`quic/upgrade/policy.rs`, not yet wired in):
-`QuicPolicy::new(network_api, breaker, availability)` takes the config, the
-breaker's decision (`breaker::gate` returns it beside the settings, as
+Upgrade driver (`quic/upgrade/driver.rs`, #5940 step e5a-5b): QuicUpgrades is
+per node (endpoint, policy, routes by address, live sessions by peer key, backoff
+store), and exists only with an endpoint, a policy and a task registrar.
+QuicPathState is a PeerConnection field; with none, as with QUIC off, there is no
+task, no select arm and no GlobalRng draw. It owns one task per connection, which
+runs the machine, so nothing of a negotiation runs inside `recv`, which only
+`try_send`s a received Upgrade to it.
+  Sends: UDP Upgrade messages are tracked packets, sent by the driver through
+  UpgradeSender, which holds only what a send needs. Control frames go through
+  send_control_bounded in a task per send, and nothing else is sent on a path.
+  Paths: QuicPath::with_budget(.., QuicPathLimits::SHADOW, the connection's
+  inbound budget), on the clock quinn runs on (PathClock: RealTime, or the
+  network's VirtualTime in simulation). The machine reads the connection's
+  time_source, the listener's clock. A data send on a shadow path is a debug
+  assertion. The field is declared before inbound_budget.
+  Liveness: nothing on the QUIC side can reach last_received_nanos or
+  last_inbound_nanos, so QUIC inbound does not refresh the UDP session.
+  With QUIC on, a UDP session differs by those Upgrade packets: they use packet
+  ids, enter the sent tracker and flight size, are retransmitted and earn
+  receipts.
+  Promotion: the machine's Promoted is stepped from set_peer_identity on Set or
+  Same only, so a dialled key alone does not start an upgrade. It first ends any
+  older session of the key, through that session's lock (never held across an
+  await): its path closes and its seed is filed. An older session arriving after
+  a newer one ends itself. Session numbers order sessions in BackoffSeed filing.
+  Backoff store: an LRU of SEED_STORE_ENTRIES (4096) peer keys with fixed-size
+  values; the least recently used goes first.
+  Attempts: the listener's attempt queue goes to a registered task
+  (quic_attempt_router), which holds the upgrades weakly and routes by normalized
+  address with try_send. An attempt nobody waits for is ignored and counted. The
+  machine's deadline bounds a dial or an establish: its TearDown aborts the task.
+  A connection for anything but the live attempt is closed with DOWNGRADE.
+  Cleanup: ending a session removes its route and its by-key entry, each only if
+  it is that session's, and drops its attempt. It runs at connection drop and if
+  the driver panics. e5a-6 reads the machine's Outcome where Action::Record lands.
+
+Upgrade policy (`quic/upgrade/policy.rs`):
+`QuicPolicy::from_config(QuicPolicyConfig::new(network_api, breaker), availability)`
+takes the config, the breaker's decision (`breaker::gate` returns it beside the settings, as
 `Gated`) and the endpoint's availability. `disabled_by()` names the first
 rule that stops upgrades: `Mode` (off), `Breaker`, `NoPaths`
 (`quic-max-paths` = 0) or `Endpoint(availability)` (not `Up`); `allowed()` is
@@ -1111,6 +1147,14 @@ connection choices, so a QUIC-on run is compared with QUIC off by the peers
 that join, not by the exact edge set. `probe_quic_endpoints_at` sends each
 node a stranger's QUIC datagram during a direct-runner run, so a test can
 check every endpoint was live (`not_allowed`) rather than failed to bind.
+`SimNetwork::quic_upgrade_trace` returns a handle (`quic/upgrade/sim_trace.rs`,
+tests only) with what each node's upgrades did, readable after the run. It also
+injects: `make_record_wrong` (the key compared after the handshake disagrees, so
+the path closes with IDENTITY_MISMATCH), `fail_endpoint_at` (the endpoint driver
+dies) and `run_as_release` (a peer reporting the crate's version reads as a given
+release, since this tree reports a version below the negotiation floor until the
+release bump). The first offer is 2-10 s after promotion, so give a run tens of
+virtual seconds.
 Other knobs: `with_node_advertised_version` (the version a node advertises
 in its intro and AckConnectionV2, to emulate an older peer of the same
 major.minor; compatibility checks keep the real version),
@@ -1189,7 +1233,8 @@ either side, and a man in the middle with its own key on either leg.
 
 #### QUIC framing and path (`quic/framing.rs`, `quic/path.rs`, #5940 step e3)
 
-Dead code until e5: nothing in the node builds a `QuicPath`.
+The upgrade driver builds a `QuicPath` in shadow, and sends only control frames
+on it; data sends are for e5b.
 
 ```
 One message per QUIC uni stream: an 18-byte header, then metadata, then

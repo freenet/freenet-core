@@ -2841,6 +2841,20 @@ fn a_bounded_send_timing_out_on_a_permit_opens_no_stream() {
     })
 }
 
+/// A shadow path never sends data. Only a debug build checks.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "a shadow QUIC path sends control frames only")]
+fn a_shadow_path_does_not_send_data() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths("quic-path-shadow-sends", 66, QuicPathLimits::SHADOW).await;
+        let time = p.time();
+        p.b.send_short_bounded(&time, Duration::from_secs(5), b"data")
+            .await;
+    });
+}
+
 /// A path in shadow mode refuses a Short or Stream frame with
 /// `NOT_ACCEPTING_DATA` before anything is charged, and counts it: the
 /// inbound budget it shares with the UDP session is untouched (no charge,

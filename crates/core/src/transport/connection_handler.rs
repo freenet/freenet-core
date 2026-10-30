@@ -343,7 +343,8 @@ fn build_quic_upgrades(
 ) -> Option<Arc<super::quic::upgrade::driver::QuicUpgrades>> {
     use super::quic::upgrade::driver::{PathClock, QuicUpgrades};
     let (endpoint, policy, _registrar) = (endpoint?, policy?, registrar?);
-    let policy = super::quic::upgrade::policy::QuicPolicy::from_config(policy, endpoint.availability());
+    let policy =
+        super::quic::upgrade::policy::QuicPolicy::from_config(policy, endpoint.availability());
     // The clock quinn runs on (`bind_udp_listener`).
     let path_clock = get_socket_virtual_time(&socket_addr)
         .map_or_else(|| PathClock::Real(time_source.clone()), PathClock::Virtual);
@@ -631,10 +632,8 @@ impl<S: Socket> OutboundConnectionHandler<S> {
             }
             (_, _, attempts) => attempts,
         };
-        let upgrade_site = super::quic::upgrade::driver::UpgradeSite::new(
-            quic_upgrades.as_ref(),
-            socket_addr,
-        );
+        let upgrade_site =
+            super::quic::upgrade::driver::UpgradeSite::new(quic_upgrades.as_ref(), socket_addr);
         let transport = UdpPacketsListener {
             is_gateway,
             socket_listener: socket,
@@ -779,11 +778,9 @@ impl<S: Socket> OutboundConnectionHandler<S> {
         }
         recv_connection
             .map(move |res| match res {
-                Ok(Ok(remote_conn)) => {
-                    Ok(PeerConnection::new(remote_conn)
-                        .with_upgrade_site(&upgrade_site)
-                        .with_dialled_key(dialled_key))
-                }
+                Ok(Ok(remote_conn)) => Ok(PeerConnection::new(remote_conn)
+                    .with_upgrade_site(&upgrade_site)
+                    .with_dialled_key(dialled_key)),
                 Ok(Err(e)) => Err(e),
                 Err(_) => Err(TransportError::ConnectionEstablishmentFailure {
                     cause: "Failed to establish connection".into(),
@@ -1121,13 +1118,14 @@ struct UdpPacketsListener<S = UdpSocket, T: TimeSource = RealTime> {
     advertised_version: [u8; 8],
     /// The QUIC endpoint on this listener's socket, when `transport-quic`
     /// is on. Held here so it lives as long as the listener reading the
-    /// socket that feeds it. Its allow-set is empty until upgrades are
-    /// wired in (#5940), so its accept loop accepts no connections yet.
+    /// socket that feeds it. Its allow-set is empty until an upgrade allows a
+    /// peer (#5940).
     _quic_endpoint: Option<super::quic::QuicEndpoint>,
     /// The connection attempts the endpoint's accept loop hands on, when it
-    /// runs (`UdpTransportConfig::task_registrar` was set). Nothing reads it
-    /// yet: with an empty allow-set no attempt is handed on. Each queued
-    /// attempt would keep quinn's endpoint alive until drained or dropped.
+    /// runs (`UdpTransportConfig::task_registrar` was set) and the node has no
+    /// upgrades to route them to (`_quic_upgrades`): nothing allows a peer then,
+    /// so no attempt is handed on. Each queued attempt would keep quinn's endpoint
+    /// alive until drained or dropped.
     _quic_attempts: Option<mpsc::Receiver<super::quic::QuicIncoming>>,
     /// The node's upgrades. Holds an endpoint share, and every connection holds
     /// these while it lives; the router and `upgrade_site` hold them weakly.

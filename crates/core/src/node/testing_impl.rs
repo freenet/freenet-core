@@ -2070,7 +2070,9 @@ impl SimNetwork {
     /// faults a test can inject into them. Call it before the nodes start. The
     /// handle stays readable after the run has consumed the network.
     #[cfg(any(test, feature = "testing"))]
-    pub fn quic_upgrade_trace(&self) -> crate::transport::quic::upgrade::sim_trace::QuicUpgradeTrace {
+    pub fn quic_upgrade_trace(
+        &self,
+    ) -> crate::transport::quic::upgrade::sim_trace::QuicUpgradeTrace {
         crate::transport::in_memory_socket::quic_upgrade_trace(&self.name)
     }
 

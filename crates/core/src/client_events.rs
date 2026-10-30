@@ -299,6 +299,10 @@ where
     op_manager.set_request_router(request_router.clone());
     let request_router = Some(request_router);
     let mut results = FuturesUnordered::new();
+    // Cleared when every response sender is gone: a closed channel is always
+    // ready, so polling it again would spin this task and starve the runtime
+    // (under paused time, stop the clock).
+    let mut responses_open = true;
     loop {
         // Uses deterministic_select! for DST - guards are evaluated BEFORE futures are created
         crate::deterministic_select! {
@@ -372,7 +376,10 @@ where
                     }
                 });
             },
-            res = client_responses.recv() => {
+            res = client_responses.recv(), if responses_open => {
+                if res.is_none() {
+                    responses_open = false;
+                }
                 if let Some((cli_id, request_id, res)) = res {
                     if let Ok(result) = &res {
                         tracing::debug!(

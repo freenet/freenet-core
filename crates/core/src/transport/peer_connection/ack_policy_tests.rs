@@ -3070,22 +3070,24 @@ async fn upgrade_control_with_quic_off_is_counted_and_only_an_offer_is_answered(
         assert!(e.pump(Duration::from_secs(2)).await.is_none());
         let sent = e.drain_sent();
         // QUIC is off here, so the Offer gets `Disabled` and the two answers to
-        // offers this node never made get nothing.
-        let answers: Vec<_> = replies(&sent)
-            .into_iter()
-            .map(|m| m.payload.clone())
-            .collect();
-        assert!(
-            matches!(
-                answers.as_slice(),
-                [SymmetricMessagePayload::Upgrade(UpgradeControl::Decline {
-                    attempt: 1,
-                    reason,
-                })] if *reason == crate::transport::symmetric_message::DeclineReason::Disabled.wire()
-            ),
-            "{version:?}: the Offer and nothing else is answered, got {:?}",
-            answers.iter().map(ToString::to_string).collect::<Vec<_>>()
-        );
+        // offers this node never made get nothing. The Decline is a tracked
+        // packet, so unacked here it is retransmitted under its one id.
+        let answers = replies(&sent);
+        let ids: std::collections::BTreeSet<u32> = answers.iter().map(|m| m.packet_id).collect();
+        assert_eq!(ids.len(), 1, "{version:?}: one reply, under one packet id");
+        for answer in answers {
+            assert!(
+                matches!(
+                    answer.payload,
+                    SymmetricMessagePayload::Upgrade(UpgradeControl::Decline {
+                        attempt: 1,
+                        reason,
+                    }) if reason == crate::transport::symmetric_message::DeclineReason::Disabled.wire()
+                ),
+                "{version:?}: only the Offer is answered, got {}",
+                answer.payload
+            );
+        }
         for id in 1..=3 {
             assert_eq!(
                 receipts_for(&sent, id),
@@ -3107,7 +3109,12 @@ async fn duplicate_upgrade_control_is_reacked_and_not_recounted() {
     };
     e.deliver(5, upgrade(offer), vec![]).await;
     assert!(e.pump(Duration::from_millis(300)).await.is_none());
-    assert_eq!(receipts_for(&e.drain_sent(), 5), 1, "first ack");
+    let first = e.drain_sent();
+    assert_eq!(receipts_for(&first, 5), 1, "first ack");
+    let declined = replies(&first)
+        .first()
+        .expect("QUIC is off, so the offer is declined")
+        .packet_id;
     assert_eq!(e.conn.telemetry_test_counts.upgrade_controls_ignored, 1);
 
     tokio::time::advance(Duration::from_millis(700)).await;
@@ -3124,7 +3131,10 @@ async fn duplicate_upgrade_control_is_reacked_and_not_recounted() {
         1,
         "the duplicate must be re-acked so the sender stops retransmitting"
     );
-    assert!(replies(&sent).is_empty());
+    assert!(
+        replies(&sent).iter().all(|m| m.packet_id == declined),
+        "the duplicate gets no new reply; only the first one's retransmission"
+    );
     assert_eq!(
         e.conn.telemetry_test_counts.upgrade_controls_ignored, 1,
         "a duplicate is not processed again"

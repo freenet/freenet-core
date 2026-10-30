@@ -60,9 +60,7 @@ use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use super::machine::{
-    Action, BackoffSeed, CONTROL_SEND_TIMEOUT, Event, Inputs, UpgradeMachine,
-};
+use super::machine::{Action, BackoffSeed, CONTROL_SEND_TIMEOUT, Event, Inputs, UpgradeMachine};
 use super::policy::QuicPolicy;
 use crate::config::{GlobalExecutor, GlobalRng};
 use crate::node::background_task_monitor::LateRegistrar;
@@ -219,7 +217,10 @@ enum SessionEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UdpSend {
     /// Report `OfferSent` once it is sent, if the attempt is still live.
-    Offer { attempt: u32, caps: u32 },
+    Offer {
+        attempt: u32,
+        caps: u32,
+    },
     Reply(UpgradeControl),
 }
 
@@ -450,7 +451,6 @@ impl QuicUpgrades {
     fn file_seed(&self, key: &TransportPublicKey, session: u64, seed: BackoffSeed) {
         self.seeds.lock().file(key, session, seed);
     }
-
 }
 
 impl Session {
@@ -747,10 +747,9 @@ impl Session {
             live.path.close(code);
             self.note(|| format!("closed path with {code:?}"));
             self.note(|| {
-                let refused = live
-                    .path
-                    .stats()
-                    .count(crate::transport::quic::path::QuicInboundOutcome::RefusedNotAcceptingData);
+                let refused = live.path.stats().count(
+                    crate::transport::quic::path::QuicInboundOutcome::RefusedNotAcceptingData,
+                );
                 format!(
                     "path carried data: refused {refused}, delivered {}",
                     live._shorts.len() + live._streams.len()
@@ -773,7 +772,10 @@ impl Session {
         let state = self.state.lock();
         !state.ended
             && state.machine.live_attempt() == Some(attempt)
-            && state.attempt.as_ref().is_some_and(|held| held.id == attempt)
+            && state
+                .attempt
+                .as_ref()
+                .is_some_and(|held| held.id == attempt)
     }
 
     /// The node promoted this session under `key`: end any older session of the
@@ -830,10 +832,12 @@ impl Session {
             }
             let actions = self.step(&mut state, Event::SessionEnded);
             let sends = self.apply(&mut state, actions);
-            debug_assert!(sends.is_empty(), "ending a session sends nothing: {sends:?}");
+            debug_assert!(
+                sends.is_empty(),
+                "ending a session sends nothing: {sends:?}"
+            );
             state.ended = true;
-            if let (Some(seed), Some(key)) =
-                (state.machine.backoff_seed(), state.peer_key.as_ref())
+            if let (Some(seed), Some(key)) = (state.machine.backoff_seed(), state.peer_key.as_ref())
             {
                 self.hub.file_seed(key, self.id, seed);
             }

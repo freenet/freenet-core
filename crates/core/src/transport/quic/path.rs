@@ -1,6 +1,7 @@
 //! A QUIC connection used as a transport path to one peer (#5940, step e3).
 //!
-//! Dead code in this release: nothing in the node builds a [`QuicPath`] yet.
+//! The upgrade driver ([`super::upgrade::driver`]) builds a [`QuicPath`] in shadow
+//! mode and sends only control frames on it; data sends wait for e5b.
 //! Step e5 moves a peer's traffic onto one once the connection is
 //! established, and keeps the UDP session as the fallback.
 //!
@@ -688,7 +689,10 @@ impl QuicPath {
 
     /// A data send must not happen on a shadow path. See `accept_data`.
     fn debug_assert_carries_data(&self) {
-        debug_assert!(self.accept_data, "a shadow QUIC path sends control frames only");
+        debug_assert!(
+            self.accept_data,
+            "a shadow QUIC path sends control frames only"
+        );
     }
 
     /// Send one serialized message. Tests only, with no deadline; nodes use
