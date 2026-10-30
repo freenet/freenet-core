@@ -2363,6 +2363,8 @@ pub struct NetworkArgs {
     /// controller's rate: it can lower a connection's rate, never raise it, and
     /// N connections may send up to N times this. To limit what the node sends
     /// as a whole, use --total-bandwidth-limit, which overrides this.
+    /// 0 means unset; a value below 32 KiB/s (32,768 bytes/second), the slowest
+    /// stream rate peers accept, is raised to it with a warning.
     /// Default: unset, so each connection is paced at the congestion
     /// controller's rate, 1.25 MB/s (1,250,000 bytes/second) for the default
     /// `fixedrate` controller.
@@ -2676,7 +2678,9 @@ pub struct NetworkApiConfig {
     /// Bandwidth limit per connection for data transfers (in bytes per second).
     /// NOTE: This applies to each connection independently - N connections may use
     /// N * bandwidth_limit total. It caps the congestion controller's rate, so it can
-    /// lower a connection's rate but never raise it. A value of 0 is treated as unset.
+    /// lower a connection's rate but never raise it. A value of 0 is treated as unset,
+    /// and one below `MIN_INBOUND_STREAM_RATE_BYTES_PER_SEC` (32 KiB/s) is raised to it
+    /// (`transport::peer_connection::effective_bandwidth_limit`).
     /// Default: None, so each connection is paced at the congestion controller's
     /// rate: 1.25 MB/s (`fixed_rate::DEFAULT_RATE_BYTES_PER_SEC`) for the default
     /// `fixedrate` controller, which does not adapt to queuing delay or other traffic.

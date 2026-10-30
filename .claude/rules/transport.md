@@ -692,12 +692,18 @@ Intro packet rate limiting:
 ### WHEN using token bucket
 
 ```
-Rate calculation (peer_connection::paced_rate, at bucket creation AND every
-rate update, so the two cannot drift; #6047):
+Rate calculation on every rate update (peer_connection::paced_rate; #6047):
   final_rate = min(cc_rate, global_pool_rate)        with total-bandwidth-limit
-  final_rate = min(cc_rate, bandwidth_limit)         else, if bandwidth-limit > 0
+  final_rate = min(cc_rate, bandwidth_limit)         else, if bandwidth-limit set
   final_rate = cc_rate                               otherwise
   A configured limit only lowers the rate, never raises it above cc_rate.
+  bandwidth_limit is the config after effective_bandwidth_limit (called once
+  in p2p_protoc): 0 = unset, ignored under total-bandwidth-limit, and raised
+  to MIN_INBOUND_STREAM_RATE_BYTES_PER_SEC (32 KiB/s) if lower, since a
+  slower sender would fail every long stream at the receiver's age limit.
+  The bucket's INITIAL rate is set separately at the three connection setup
+  sites (global share, else bandwidth_limit, else cc_rate) and fixes the
+  bucket's capacity (initial_rate / 10) for the connection's life.
 
 Token reservation:
   → Reserve BEFORE sending

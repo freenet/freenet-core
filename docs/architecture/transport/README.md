@@ -250,7 +250,7 @@ flowchart TB
 **Send Path:**
 1. Application calls `PeerConnection::send(message)`
 2. **cwnd check**: Wait if `flightsize + packet_size > cwnd` (LEDBAT enforcement)
-3. **Rate calculation**: `min(ledbat_rate, global_pool_rate)` if global pool enabled
+3. **Rate calculation**: the congestion controller's rate, capped by the global pool share if enabled, else by `bandwidth-limit` if set
 4. **Token reservation**: Reserve tokens at calculated rate, wait if needed
 5. **Packet assembly**: Serialize + encrypt
 6. **Send tracking**: Record packet for RTT measurement and retransmission
@@ -260,7 +260,7 @@ flowchart TB
 1. UDP socket receives packet
 2. Decrypt + deserialize
 3. **RTT update**: If ACK, update smoothed RTT and cwnd (LEDBAT feedback)
-4. **Rate update**: Recalculate `min(ledbat_rate, global_pool_rate)` (RTT-adaptive timing)
+4. **Rate update**: Recalculate the step 3 rate (`peer_connection::paced_rate`, RTT-adaptive timing)
 5. **Flightsize update**: Decrement flightsize on ACK. Flightsize has two
    additional release paths so a stream whose ACKs never arrive cannot pin
    flightsize for the connection's life (#4345): (a) when a packet is

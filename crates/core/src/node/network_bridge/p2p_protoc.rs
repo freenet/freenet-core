@@ -1305,7 +1305,11 @@ impl P2pConnManager {
             check_version: !config.config.network_api.ignore_protocol_version,
             ack_version_floor_override: config.ack_version_floor_override,
             advertised_version_override: config.advertised_version_override,
-            bandwidth_limit: config.config.network_api.bandwidth_limit,
+            // `total_limit_set` matches when `global_bandwidth` below is built.
+            bandwidth_limit: crate::transport::peer_connection::effective_bandwidth_limit(
+                config.config.network_api.bandwidth_limit,
+                config.config.network_api.total_bandwidth_limit.is_some(),
+            ),
             global_bandwidth: config
                 .config
                 .network_api

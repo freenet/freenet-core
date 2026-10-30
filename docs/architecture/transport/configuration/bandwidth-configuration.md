@@ -35,7 +35,7 @@ freenet --total-bandwidth-limit 50000000 --min-bandwidth-per-connection 1000000
 
 | Argument | Description | Default |
 |----------|-------------|---------|
-| `--bandwidth-limit <bytes/sec>` | Per-connection cap on the congestion controller's rate (0 = unset) | None (the congestion controller's rate: 1,250,000 (1.25 MB/s) for `fixedrate`) |
+| `--bandwidth-limit <bytes/sec>` | Per-connection cap on the congestion controller's rate (0 = unset; values below 32 KiB/s are raised to it; ignored when `--total-bandwidth-limit` is set) | None (the congestion controller's rate: 1,250,000 (1.25 MB/s) for `fixedrate`) |
 | `--total-bandwidth-limit <bytes/sec>` | Cap on everything the node sends over UDP, across ALL connections | None (disabled) |
 | `--min-bandwidth-per-connection <bytes/sec>` | Minimum per-connection pacing rate inside the total (clamped to the total) | 1,000,000 (1 MB/s) |
 | `--congestion-control <algorithm>` | Congestion control algorithm (`fixedrate`, `ledbat`, `bbr`) | `fixedrate` |
@@ -111,7 +111,7 @@ freenet --ledbat-min-ssthresh 614400
 ledbat-min-ssthresh = 524288  # 500KB
 
 # Can combine with bandwidth limits
-bandwidth-limit = 10000000  # caps each connection at 10 MB/s
+bandwidth-limit = 10000000  # caps each connection at 10 MB/s (binds only above fixedrate's 1.25 MB/s, i.e. with ledbat/bbr)
 ledbat-min-ssthresh = 750000
 ```
 
@@ -284,6 +284,8 @@ The global bandwidth pool works alongside LEDBAT congestion control:
 final_rate = min(ledbat_rate, global_pool_rate)
 ```
 
+(Without a global pool, a set `bandwidth-limit` takes the global rate's place.)
+
 - **LEDBAT** measures network conditions and adjusts rate to avoid congestion
 - **Global pool** enforces your bandwidth budget across all connections
 - The **minimum** of both rates is used
@@ -358,7 +360,9 @@ The default behavior (no `total-bandwidth-limit`) is unchanged:
 Before #6047 was fixed, `bandwidth-limit` only set a connection's initial rate: the
 first rate update replaced it with the congestion controller's rate. It now caps every
 rate update, so a value set in an old `config.toml` takes effect when it is below the
-controller's rate.
+controller's rate (1.25 MB/s under the default `fixedrate`). A value below 32 KiB/s is
+raised to 32 KiB/s with a startup warning, because below that a receiver evicts long
+streams before they complete. The node logs the limit it applies at startup.
 
 Before the egress cap, `total-bandwidth-limit` only divided a per-connection rate:
 `min-bandwidth-per-connection` could take the node above it, and control traffic was

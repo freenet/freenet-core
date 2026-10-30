@@ -172,22 +172,72 @@ pub(crate) struct RemoteConnection<S = super::UdpSocket, T: TimeSource = RealTim
     pub(super) time_source: T,
 }
 
-/// The rate a connection's token bucket is paced at: the congestion
-/// controller's rate, capped by the node's fair share when
+/// The rate a rate update paces a connection's token bucket at: the
+/// congestion controller's rate, capped by the node's fair share when
 /// `total-bandwidth-limit` is set, and otherwise by the per-connection
-/// `bandwidth-limit`. A per-connection limit of 0 is treated as unset.
+/// `bandwidth-limit`. A cap only lowers the rate, never raises it.
 ///
-/// Used both when the bucket is created and on every rate update, so the
-/// configured limit holds for the life of the connection. Before #6047 the
-/// rate update ignored `bandwidth-limit`, which then only set the initial rate.
+/// Before #6047 the rate update ignored `bandwidth-limit`, which then only set
+/// the initial rate. `bandwidth_limit` is the value after
+/// [`effective_bandwidth_limit`].
 pub(super) fn paced_rate(
     cc_rate: usize,
     global_rate: Option<usize>,
     bandwidth_limit: Option<usize>,
 ) -> usize {
-    match global_rate.or(bandwidth_limit.filter(|&limit| limit > 0)) {
+    match global_rate.or(bandwidth_limit) {
         Some(cap) => cc_rate.min(cap),
         None => cc_rate,
+    }
+}
+
+/// The per-connection `bandwidth-limit` the transport applies, given the
+/// configured one. Call it once, where the config enters the transport: it
+/// logs what it decided.
+///
+/// - Ignored (`None`) when `total-bandwidth-limit` is set, which overrides it.
+/// - 0 means unset, as `total-bandwidth-limit = 0` does.
+/// - A value below [`streaming::MIN_INBOUND_STREAM_RATE_BYTES_PER_SEC`] is
+///   raised to it. A receiver gives a stream `length / that rate` to complete
+///   before evicting it, so a slower sender would fail every long stream, and
+///   the failure would show on the receiver, not here.
+pub(crate) fn effective_bandwidth_limit(
+    configured: Option<usize>,
+    total_limit_set: bool,
+) -> Option<usize> {
+    let floor = streaming::MIN_INBOUND_STREAM_RATE_BYTES_PER_SEC as usize;
+    match configured {
+        None => None,
+        Some(limit) if total_limit_set => {
+            tracing::info!(
+                bandwidth_limit = limit,
+                "bandwidth-limit is ignored because total-bandwidth-limit is set"
+            );
+            None
+        }
+        Some(0) => {
+            tracing::warn!(
+                "bandwidth-limit = 0 is ignored; set total-bandwidth-limit to limit \
+                 what the node sends"
+            );
+            None
+        }
+        Some(limit) if limit < floor => {
+            tracing::warn!(
+                configured = limit,
+                applied = floor,
+                "bandwidth-limit is below the slowest stream rate peers accept; raised \
+                 to it. Use total-bandwidth-limit to limit what the node sends"
+            );
+            Some(floor)
+        }
+        Some(limit) => {
+            tracing::info!(
+                bandwidth_limit = limit,
+                "each connection is paced at no more than bandwidth-limit bytes/sec"
+            );
+            Some(limit)
+        }
     }
 }
 
@@ -2166,6 +2216,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                             new_rate_mbps = (new_rate as f64) / 1_000_000.0,
                             cc_rate_mbps = (cc_rate as f64) / 1_000_000.0,
                             global_limit_mbps = global_limit.map(|r| (r as f64) / 1_000_000.0),
+                            bandwidth_limit = ?self.remote_conn.bandwidth_limit,
                             // Congestion controller state
                             cwnd_bytes = cwnd,
                             cwnd_packets = cwnd / MAX_DATA_SIZE,
@@ -2191,6 +2242,13 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
 
     pub fn remote_addr(&self) -> SocketAddr {
         self.remote_conn.remote_addr
+    }
+
+    /// The per-connection `bandwidth-limit` this connection applies on every
+    /// rate update, for tests that check the listener hands it on (#6047).
+    #[cfg(test)]
+    pub(crate) fn bandwidth_limit(&self) -> Option<usize> {
+        self.remote_conn.bandwidth_limit
     }
 
     /// Remote peer's negotiated protocol version, if known (None on joiner->gateway connections).
@@ -6111,10 +6169,10 @@ mod tests {
         }
     }
 
-    /// `paced_rate` caps the controller's rate by the tighter configured limit:
-    /// the node's fair share when `total-bandwidth-limit` is set (the
-    /// per-connection limit is then ignored), otherwise `bandwidth-limit`. No
-    /// limit raises the rate, and a per-connection limit of 0 means unset.
+    /// `paced_rate` caps the controller's rate by the node's fair share when
+    /// `total-bandwidth-limit` is set (the per-connection limit is then ignored,
+    /// even when it is lower), otherwise by `bandwidth-limit`. No limit raises
+    /// the rate.
     #[test]
     fn paced_rate_applies_the_configured_limit() {
         const CC: usize = 1_250_000;
@@ -6122,7 +6180,6 @@ mod tests {
             (None, None, CC),
             (None, Some(200_000), 200_000),
             (None, Some(10_000_000), CC),
-            (None, Some(0), CC),
             (Some(500_000), None, 500_000),
             (Some(500_000), Some(100_000), 500_000),
             (Some(5_000_000), Some(100_000), CC),
@@ -6132,6 +6189,33 @@ mod tests {
                 paced_rate(CC, global_rate, bandwidth_limit),
                 expected,
                 "paced_rate({CC}, {global_rate:?}, {bandwidth_limit:?})"
+            );
+        }
+    }
+
+    /// `effective_bandwidth_limit` turns the configured `bandwidth-limit` into
+    /// the one the transport applies: ignored under `total-bandwidth-limit`, 0
+    /// is unset, and a value below the slowest stream rate a receiver accepts is
+    /// raised to it, so a stray small value cannot make every long stream fail.
+    #[test]
+    fn effective_bandwidth_limit_sanitizes_the_configured_value() {
+        let floor = streaming::MIN_INBOUND_STREAM_RATE_BYTES_PER_SEC as usize;
+        let cases = [
+            (None, false, None),
+            (Some(0), false, None),
+            (Some(1), false, Some(floor)),
+            (Some(floor - 1), false, Some(floor)),
+            (Some(floor), false, Some(floor)),
+            (Some(500_000), false, Some(500_000)),
+            (Some(500_000), true, None),
+            (Some(1), true, None),
+            (None, true, None),
+        ];
+        for (configured, total_limit_set, expected) in cases {
+            assert_eq!(
+                effective_bandwidth_limit(configured, total_limit_set),
+                expected,
+                "effective_bandwidth_limit({configured:?}, total set: {total_limit_set})"
             );
         }
     }

@@ -38,7 +38,7 @@ use super::{
     packet_data::{
         MAX_PACKET_SIZE, MAX_RECV_PACKET_SIZE as RECV_BUF_SIZE, PacketData, SymmetricAES,
     },
-    peer_connection::{InboundPacket, PeerConnection, RemoteConnection, paced_rate},
+    peer_connection::{InboundPacket, PeerConnection, RemoteConnection},
     sent_packet_tracker::SentPacketTracker,
     symmetric_message::{SymmetricMessage, SymmetricMessagePayload},
     token_bucket::TokenBucket,
@@ -2432,13 +2432,13 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
             // 10 MB/s which is 8x higher than FixedRate's 1.25 MB/s — the
             // initial burst triggered packet loss and immediate loss_pause,
             // collapsing throughput. See #3702.
-            let initial_rate = paced_rate(
-                congestion_controller.current_rate(TOKEN_BUCKET_WINDOW),
-                global_bandwidth
-                    .as_ref()
-                    .map(|global| global.register_connection()),
-                bandwidth_limit,
-            );
+            let initial_rate = if let Some(ref global) = global_bandwidth {
+                global.register_connection()
+            } else if let Some(limit) = bandwidth_limit {
+                limit
+            } else {
+                congestion_controller.current_rate(TOKEN_BUCKET_WINDOW)
+            };
             // Capacity = one TOKEN_BUCKET_WINDOW worth of tokens at the configured rate.
             // Previously 1MB, which allowed an immediate burst 800x larger
             // than FixedRate's per-100ms budget, triggering loss. See #3702.
@@ -2867,14 +2867,15 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
 
                                             // Initialize token bucket at congestion controller's
                                             // rate to avoid initial burst. See #3702.
-                                            let initial_rate = paced_rate(
-                                                congestion_controller
-                                                    .current_rate(TOKEN_BUCKET_WINDOW),
-                                                global_bandwidth
-                                                    .as_ref()
-                                                    .map(|global| global.register_connection()),
-                                                bandwidth_limit,
-                                            );
+                                            let initial_rate =
+                                                if let Some(ref global) = global_bandwidth {
+                                                    global.register_connection()
+                                                } else if let Some(limit) = bandwidth_limit {
+                                                    limit
+                                                } else {
+                                                    congestion_controller
+                                                        .current_rate(TOKEN_BUCKET_WINDOW)
+                                                };
                                             let bucket_capacity =
                                                 (initial_rate / 10).max(MIN_BUCKET_CAPACITY_BYTES);
                                             let token_bucket =
@@ -3058,13 +3059,13 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
 
                                 // Initialize token bucket at congestion controller's
                                 // rate to avoid initial burst. See #3702.
-                                let initial_rate = paced_rate(
-                                    congestion_controller.current_rate(TOKEN_BUCKET_WINDOW),
-                                    global_bandwidth
-                                        .as_ref()
-                                        .map(|global| global.register_connection()),
-                                    bandwidth_limit,
-                                );
+                                let initial_rate = if let Some(ref global) = global_bandwidth {
+                                    global.register_connection()
+                                } else if let Some(limit) = bandwidth_limit {
+                                    limit
+                                } else {
+                                    congestion_controller.current_rate(TOKEN_BUCKET_WINDOW)
+                                };
                                 let bucket_capacity =
                                     (initial_rate / 10).max(MIN_BUCKET_CAPACITY_BYTES);
                                 let token_bucket = Arc::new(TokenBucket::new_with_time_source(
@@ -5163,6 +5164,87 @@ pub mod mock_transport {
             crate_at_or_above_floor,
             "joiner's view of the gateway version must follow the production floor exactly"
         );
+        Ok(())
+    }
+
+    /// Each node's configured `bandwidth-limit` reaches the connections it
+    /// establishes, on the gateway's accept path and on the joiner's path, so
+    /// the rate update can apply it (#6047). Each side gets a distinct limit,
+    /// so a site that passed the other node's value, or none, fails here.
+    #[tokio::test]
+    async fn bandwidth_limit_reaches_gateway_and_joiner_connections() -> anyhow::Result<()> {
+        const JOINER_LIMIT: usize = 400_000;
+        const GATEWAY_LIMIT: usize = 600_000;
+        let channels = Arc::new(DashMap::new());
+        let (_, (mut joiner, _joiner_inbound), _) = create_mock_peer_internal(
+            Default::default(),
+            Default::default(),
+            false,
+            channels.clone(),
+            Some(JOINER_LIMIT),
+            None,
+        )
+        .await?;
+        let (gw_pub, (_gw_out, mut gw_inbound), gw_addr) = create_mock_peer_internal(
+            Default::default(),
+            Default::default(),
+            true,
+            channels,
+            Some(GATEWAY_LIMIT),
+            None,
+        )
+        .await?;
+
+        let connecting = joiner.connect(gw_pub, gw_addr).await;
+        let (joiner_conn, gw_conn) = tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::join!(connecting, gw_inbound.recv())
+        })
+        .await?;
+        let joiner_conn = joiner_conn?;
+        let gw_conn = gw_conn.ok_or_else(|| anyhow::anyhow!("gateway accepted nothing"))?;
+
+        assert_eq!(joiner_conn.bandwidth_limit(), Some(JOINER_LIMIT));
+        assert_eq!(gw_conn.bandwidth_limit(), Some(GATEWAY_LIMIT));
+        Ok(())
+    }
+
+    /// The same as `bandwidth_limit_reaches_gateway_and_joiner_connections`
+    /// for a peer-to-peer hole-punch, which builds its connection on either
+    /// traversal arm (the ack path or answering the remote's intro), so both
+    /// arms are exercised across runs.
+    #[tokio::test]
+    async fn bandwidth_limit_reaches_hole_punched_connections() -> anyhow::Result<()> {
+        const A_LIMIT: usize = 400_000;
+        const B_LIMIT: usize = 600_000;
+        let channels = Arc::new(DashMap::new());
+        let (a_pub, mut peer_a, a_addr) = create_mock_peer_with_bandwidth(
+            Default::default(),
+            Default::default(),
+            channels.clone(),
+            Some(A_LIMIT),
+        )
+        .await?;
+        let (b_pub, mut peer_b, b_addr) = create_mock_peer_with_bandwidth(
+            Default::default(),
+            Default::default(),
+            channels,
+            Some(B_LIMIT),
+        )
+        .await?;
+
+        let a_side = GlobalExecutor::spawn(async move {
+            let conn = peer_a.connect(b_pub, b_addr).await;
+            let conn = tokio::time::timeout(Duration::from_secs(30), conn).await??;
+            Ok::<_, anyhow::Error>(conn.bandwidth_limit())
+        });
+        let b_side = GlobalExecutor::spawn(async move {
+            let conn = peer_b.connect(a_pub, a_addr).await;
+            let conn = tokio::time::timeout(Duration::from_secs(30), conn).await??;
+            Ok::<_, anyhow::Error>(conn.bandwidth_limit())
+        });
+        let (a, b) = tokio::try_join!(a_side, b_side)?;
+        assert_eq!(a?, Some(A_LIMIT));
+        assert_eq!(b?, Some(B_LIMIT));
         Ok(())
     }
 
