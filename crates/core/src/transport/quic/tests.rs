@@ -3442,7 +3442,10 @@ fn a_panic_in_the_socket_adapter_turns_quic_off_and_the_node_keeps_running() {
 
                 let monitor = BackgroundTaskMonitor::new();
                 let (attempts, _attempts_rx) = tokio::sync::mpsc::channel(4);
-                assert!(pair.a.spawn_accept_loop(&monitor, attempts));
+                assert!(
+                    pair.a
+                        .spawn_accept_loop(&monitor.late_registrar(), attempts)
+                );
                 let monitor_fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let wait = {
                     let fired = monitor_fired.clone();
