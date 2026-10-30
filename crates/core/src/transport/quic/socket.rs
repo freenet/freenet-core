@@ -389,9 +389,11 @@ impl<S: Socket> AsyncUdpSocket for QuicSocket<S> {
     /// is a panic, caught here, and every send after one: those return the
     /// error, to end the driver (see the module docs).
     fn try_send(&self, transmit: &Transmit) -> io::Result<()> {
-        // quinn 0.11.12 polls write readiness before every send, and that
-        // check already refuses after a panic, so this one is reached only
-        // if quinn stops doing so (a mutation removing it passes the tests).
+        // A connection driver polls write readiness before every send, and
+        // that check refuses first. The endpoint driver does not: quinn's
+        // `respond` (stateless reset, version negotiation, Retry, a close
+        // for a refused attempt) calls this directly, so this check is what
+        // keeps those off the wire after a panic.
         if self.health.has_adapter_panicked() {
             return Err(adapter_panicked_error());
         }

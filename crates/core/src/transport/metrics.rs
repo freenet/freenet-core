@@ -562,7 +562,10 @@ pub struct TransportMetrics {
     /// state, never reset).
     quic_breaker_suppressed: AtomicBool,
     /// QUIC connections this node closed, by [`QuicCloseCode`] (reset each
-    /// snapshot).
+    /// snapshot). Counted when the close is queued, and only while it can
+    /// still be sent (not after the endpoint went Down or its socket adapter
+    /// caught a panic); a panic between the count and quinn's transmit can
+    /// still leave a counted close unsent, so this is an upper bound.
     quic_close_sent: [AtomicU64; QuicCloseCode::COUNT],
 
     /// The current snapshot period, starting at 1 and advanced by each

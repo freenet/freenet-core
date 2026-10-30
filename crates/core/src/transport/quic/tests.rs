@@ -2723,13 +2723,7 @@ fn endpoint_death_turns_quic_off_without_stopping_the_node() {
             QuicErrorKind::EndpointDown,
             "{ended:?}"
         );
-        assert!(
-            matches!(
-                ended,
-                quinn::ConnectionError::LocallyClosed | quinn::ConnectionError::TransportError(_)
-            ),
-            "{ended:?}"
-        );
+        assert!(ended_by_endpoint_down(&ended), "{ended:?}");
         // The watcher's close on Down is not counted as a close sent.
         assert!(TRANSPORT_METRICS.quic_close_sent_to(pair.b_addr).is_empty());
         let refused = pair
@@ -3182,6 +3176,20 @@ fn concurrent_closers_close_and_count_once() {
     });
 }
 
+/// Whether `error` is one of the two ways a connection ends locally when its
+/// endpoint goes down: the watcher's local close, or quinn's own
+/// INTERNAL_ERROR when the endpoint driver was dropped. Any other error (a
+/// peer's close, a crypto or protocol error, an idle timeout) is not.
+fn ended_by_endpoint_down(error: &quinn::ConnectionError) -> bool {
+    match error {
+        quinn::ConnectionError::LocallyClosed => true,
+        quinn::ConnectionError::TransportError(e) => {
+            e.code == quinn::TransportErrorCode::INTERNAL_ERROR
+        }
+        _ => false,
+    }
+}
+
 /// Set in the child process [`in_child`] starts.
 const PANIC_CHILD_ENV: &str = "FREENET_QUIC_PANIC_CHILD";
 
@@ -3390,13 +3398,7 @@ fn a_panic_in_the_socket_adapter_turns_quic_off_and_the_node_keeps_running() {
                 // scheduling). Neither is a close sent, so none is counted.
                 let reason = client_conn.close_reason();
                 assert!(
-                    matches!(
-                        reason,
-                        Some(
-                            quinn::ConnectionError::LocallyClosed
-                                | quinn::ConnectionError::TransportError(_)
-                        )
-                    ),
+                    reason.as_ref().is_some_and(ended_by_endpoint_down),
                     "{reason:?}"
                 );
                 assert!(TRANSPORT_METRICS.quic_close_sent_to(pair.b_addr).is_empty());
@@ -3666,6 +3668,13 @@ fn connect_right_after_an_adapter_panic_is_refused() {
                 .connect(pair.b_addr, &pair.b_key())
                 .await
                 .expect_err("the endpoint is down");
+            assert!(
+                matches!(
+                    refused,
+                    QuicConnectError::Connect(quinn::ConnectError::EndpointStopping)
+                ),
+                "{refused:?}"
+            );
             assert_eq!(pair.a.error_kind(refused), QuicErrorKind::EndpointDown);
             let time = pair.time.clone();
             drive(&pair.time, Duration::from_secs(10), async move {
@@ -3710,6 +3719,13 @@ fn a_panic_during_connect_ends_the_handshake_and_releases_its_permit() {
                 .await
                 .expect_err("the endpoint went down during the handshake");
                 assert_eq!(pair.a.availability().get(), QuicAvailability::Down);
+                assert!(
+                    matches!(
+                        refused,
+                        QuicConnectError::Connection(quinn::ConnectionError::LocallyClosed)
+                    ),
+                    "{refused:?}"
+                );
                 assert_eq!(pair.a.error_kind(refused), QuicErrorKind::EndpointDown);
                 assert!(
                     pair.a_socket
@@ -3758,6 +3774,7 @@ fn a_panic_during_establish_ends_the_handshake_and_releases_its_permit() {
                 .await
                 .expect_err("the endpoint went down during the handshake");
                 assert_eq!(pair.b.availability().get(), QuicAvailability::Down);
+                assert_eq!(failed, quinn::ConnectionError::LocallyClosed);
                 assert_eq!(pair.b.error_kind(failed), QuicErrorKind::EndpointDown);
                 assert!(
                     pair.b_socket
@@ -3816,19 +3833,22 @@ fn an_adapter_panic_ends_every_connection_and_counts_once() {
                 })
                 .await
                 .expect_err("the endpoint is down");
+                assert!(ended_by_endpoint_down(&error), "{error:?}");
+                assert_eq!(
+                    pair.a.error_kind(error.clone()),
+                    QuicErrorKind::EndpointDown
+                );
+                let reason = other.close_reason();
                 assert!(
-                    matches!(
-                        other.close_reason(),
-                        Some(
-                            quinn::ConnectionError::LocallyClosed
-                                | quinn::ConnectionError::TransportError(_)
-                        )
-                    ),
-                    "{error:?}"
+                    reason.as_ref().is_some_and(ended_by_endpoint_down),
+                    "{reason:?}"
                 );
 
                 // 30 s of timers: nothing more leaves `a`, the fault is not hit
-                // again, and the peers have not been told.
+                // again, and the peers have not been told. Their idle timeout
+                // (the time source's, as `settings()` sets none) is longer, so an
+                // open connection here means no close arrived.
+                assert!(pair.time.connection_idle_timeout() > Duration::from_secs(30));
                 let time = pair.time.clone();
                 drive(&pair.time, Duration::from_secs(60), async move {
                     time.sleep(Duration::from_secs(30)).await;
@@ -3977,6 +3997,18 @@ fn handshake_fault_ends_connect(network: &'static str, octet: u8, fault: Handsha
         .await
         .expect_err("the endpoint went down during the handshake");
         assert_eq!(pair.a.availability().get(), QuicAvailability::Down);
+        // A send panic ends this connection's driver, and quinn's implicit
+        // close ends the handshake; a receive panic ends the endpoint driver,
+        // whose drop ends this one with INTERNAL_ERROR.
+        match (&refused, fault) {
+            (
+                QuicConnectError::Connection(quinn::ConnectionError::LocallyClosed),
+                HandshakeFault::Send,
+            ) => {}
+            (QuicConnectError::Connection(error), HandshakeFault::Receive)
+                if ended_by_endpoint_down(error) => {}
+            _ => panic!("unexpected error: {refused:?}"),
+        }
         assert_eq!(pair.a.error_kind(refused), QuicErrorKind::EndpointDown);
         match fault {
             HandshakeFault::Send => assert_eq!(pair.a.faults().send_panics(), 1),
@@ -4005,11 +4037,167 @@ fn a_receive_panic_during_connect_ends_the_handshake() {
     });
 }
 
-/// A build that aborts on panic refuses the endpoint (the node then runs
-/// with QUIC off); one that unwinds builds it.
+/// A build that aborts on panic refuses the endpoint through the bind path
+/// itself (`bind_checked`, which `bind` calls with [`UNWINDS`]):
+/// `Unsupported`, nothing enabled on the socket (a later bind on it
+/// succeeds), and `bind_or_warn`'s path returns `None`, so the node runs
+/// with QUIC off. No CI build sets `panic = "abort"`, so the constant itself
+/// is only checked to be `true` here.
 #[test]
 fn an_aborting_build_refuses_the_endpoint() {
-    assert!(require_unwinding(true).is_ok());
-    let refused = require_unwinding(false).expect_err("panic = abort");
-    assert_eq!(refused.kind(), std::io::ErrorKind::Unsupported);
+    assert!(UNWINDS, "the tests run unwinding");
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let network = "quic-abort-build";
+        let addr: SocketAddr = "10.201.48.1:5000".parse().unwrap();
+        let time = VirtualTime::new();
+        register_network_time_source(network, time.clone());
+        register_address_network(addr, network);
+        let socket = Arc::new(DemuxSocket::wrap(
+            SimulationSocket::bind(addr).await.unwrap(),
+            None,
+        ));
+        let keys = TransportKeypair::new();
+        let refused = QuicEndpoint::bind_checked(
+            false,
+            socket.clone(),
+            addr,
+            time.clone(),
+            &settings(),
+            &keys,
+        )
+        .err()
+        .expect("an aborting build refuses the endpoint");
+        assert_eq!(refused.kind(), std::io::ErrorKind::Unsupported);
+        assert!(
+            QuicEndpoint::bind_or_warn_checked(
+                false,
+                socket.clone(),
+                addr,
+                time.clone(),
+                &settings(),
+                &keys
+            )
+            .is_none()
+        );
+        // Nothing was enabled on the socket: an unwinding bind still works.
+        let endpoint = QuicEndpoint::bind(socket, addr, time, &settings(), &keys)
+            .expect("the refused binds left the socket as it was");
+        drop(endpoint);
+        unregister_network_time_source(network);
+    });
+}
+
+/// Once the endpoint's health records an adapter panic, the adapter refuses
+/// every call before its own code runs: a send (the path quinn's endpoint
+/// driver takes, with no write-readiness poll, for a stateless reset,
+/// version negotiation, Retry or a close of a refused attempt), a
+/// write-readiness poll and a receive. The injected faults are not hit, and
+/// nothing reaches the socket.
+#[test]
+fn the_adapter_refuses_sends_after_a_panic_without_running() {
+    use quinn::AsyncUdpSocket;
+    use std::task::{Context, Poll};
+    let local: SocketAddr = "10.201.49.1:5000".parse().unwrap();
+    let health = super::liveness::EndpointHealth::new(local);
+    let demux = Arc::new(DemuxSocket::wrap(
+        ScriptedSocket::new(SendMode::Send, Vec::new()),
+        None,
+    ));
+    let ingress = demux.enable_quic_ingress().unwrap();
+    let socket = Arc::new(super::socket::QuicSocket::new(
+        demux.clone(),
+        ingress,
+        local,
+        health.clone(),
+    ));
+    let faults = socket.faults();
+    faults.panic_every_send();
+    faults.panic_every_writable();
+    health.adapter_panicked("test", &"reported by the test");
+
+    let to: SocketAddr = "10.201.49.2:5000".parse().unwrap();
+    let error = socket
+        .try_send(&transmit(&[0xC0; 100], to))
+        .expect_err("the adapter caught a panic");
+    assert!(error.to_string().contains("adapter panicked"), "{error}");
+    let waker = futures::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut poller = socket.clone().create_io_poller();
+    assert!(matches!(
+        poller.as_mut().poll_writable(&mut cx),
+        Poll::Ready(Err(_))
+    ));
+    let mut buf = [0u8; 1500];
+    let mut bufs = [std::io::IoSliceMut::new(&mut buf)];
+    let mut meta = [quinn::udp::RecvMeta::default()];
+    assert!(matches!(
+        socket.poll_recv(&mut cx, &mut bufs, &mut meta),
+        Poll::Ready(Err(_))
+    ));
+    assert_eq!(faults.send_panics(), 0);
+    assert_eq!(faults.writable_panics(), 0);
+    assert!(demux.inner_for_test().sent.lock().unwrap().is_empty());
+}
+
+/// A socket-adapter panic after the node released the endpoint (its
+/// connections may outlive the endpoint handle). The availability stays
+/// `Released` and no death is counted, but every send of the endpoint now
+/// fails, which ends connection drivers without closing their connections;
+/// each watcher therefore closes its connection when the panic is
+/// reported, so a call on either connection fails instead of waiting
+/// forever, and no close is counted. The release is the health's own
+/// (`EndpointHealth::release`, what dropping the last handle runs), so the
+/// endpoint driver stays up while the test holds the endpoint.
+#[test]
+fn an_adapter_panic_after_release_closes_its_connections() {
+    in_child(
+        "an_adapter_panic_after_release_closes_its_connections",
+        || {
+            bounded(|| async move {
+                use super::path::QuicPath;
+                use crate::transport::metrics::TRANSPORT_METRICS;
+                let _seed = GlobalRng::seed_guard(SEED);
+                let pair = pair(
+                    "quic-panic-after-release",
+                    "10.201.50.1:5000".parse().unwrap(),
+                    "10.201.50.2:5000".parse().unwrap(),
+                    None,
+                )
+                .await;
+                let (_, client1, _server1) =
+                    pair.transfer(payload(100), Duration::from_secs(60)).await;
+                let (_, client2, _server2) =
+                    pair.transfer(payload(100), Duration::from_secs(60)).await;
+                let (first, other) = (client1.inner().clone(), client2.inner().clone());
+                pair.a.owner.health.release();
+                assert_eq!(pair.a.availability().get(), QuicAvailability::Released);
+
+                pair.a.faults().panic_every_send();
+                let (path, _inbound) = QuicPath::new(client1, pair.time.clone());
+                drive(&pair.time, Duration::from_secs(1), async move {
+                    path.send_short(b"boom").await
+                })
+                .await
+                .expect_err("the connection was closed");
+                let o = other.clone();
+                let error = drive(&pair.time, Duration::from_secs(1), async move {
+                    o.open_uni().await.map(|_| ())
+                })
+                .await
+                .expect_err("the connection was closed");
+                assert!(ended_by_endpoint_down(&error), "{error:?}");
+                assert_eq!(
+                    first.close_reason(),
+                    Some(quinn::ConnectionError::LocallyClosed)
+                );
+                assert_eq!(pair.a.availability().get(), QuicAvailability::Released);
+                assert_eq!(pair.a.faults().send_panics(), 1);
+                assert_eq!(TRANSPORT_METRICS.quic_adapter_panicked_at(pair.a_addr), 1);
+                assert_eq!(TRANSPORT_METRICS.quic_endpoint_down_at(pair.a_addr), 0);
+                assert!(TRANSPORT_METRICS.quic_close_sent_to(pair.b_addr).is_empty());
+                drop(client2);
+            });
+        },
+    );
 }
