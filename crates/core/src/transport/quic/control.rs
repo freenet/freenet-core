@@ -26,7 +26,8 @@
 //!   does not know. A new bit is how a newer node says it supports more.
 //! - An unknown version, an unknown type, or a length other than
 //!   [`CONTROL_LEN`] is refused ([`ControlError`]), never a panic. The
-//!   receiving path counts each (`QuicPath::decode_control`). The sender
+//!   receiving path counts each, only through `QuicPath::decode_control`
+//!   ([`QuicControl::decode`] counts nothing). The sender
 //!   learns nothing: its send reports `Sent`.
 //! - A new type or field needs a new version. Bytes past the end are refused,
 //!   so a field cannot be appended silently. `UpgradeControl` is different:
@@ -64,7 +65,8 @@ pub(crate) enum QuicControl {
 /// receiving path (`QuicInboundOutcome`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum ControlError {
-    /// No bytes at all.
+    /// No bytes at all. Not reachable from a real stream: the frame header
+    /// refuses a control length of 0.
     #[error("empty control payload")]
     Empty,
     /// A version this node does not read.

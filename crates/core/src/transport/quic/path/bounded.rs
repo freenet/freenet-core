@@ -15,7 +15,7 @@
 //! - [`BoundedSend::Failed`]: the message did not reach the peer as a whole.
 //!   A deadline that passes earlier drops the send: waiting for a
 //!   streamed-message permit or a stream credit, no stream was opened;
-//!   waiting for flow control, the stream is reset
+//!   waiting for flow control or the chunk source, the stream is reset
 //!   (`reset_code::SENDER_ABORTED`), so the receiver discards what arrived.
 //!
 //! A caller must not treat `MaybeDelivered` as `Failed`: the two sides may
@@ -54,7 +54,7 @@ pub(crate) enum MaybeDelivered {
 #[derive(Debug)]
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum SendFailure {
-    /// The deadline passed before the whole message was written; the
+    /// The deadline passed before the end of the stream was sent; the
     /// stream was reset (or never opened).
     TimedOut,
     /// The send failed (`QuicSendError`), before the end of the stream was

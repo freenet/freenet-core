@@ -10,11 +10,13 @@
 //! the receiver has read one to its end: that limit is the path's
 //! back-pressure.
 //!
-//! Sending: [`QuicPath::send_short`], [`QuicPath::send_stream`] (from bytes),
-//! [`QuicPath::send_stream_chunks`] (from a stream of chunks, such as an
-//! inbound stream being piped onward) and [`QuicPath::send_control`]. Each
-//! returns once the peer's QUIC stack has acknowledged every byte, or with
-//! the code the peer stopped the stream with ([`QuicSendError::Stopped`]).
+//! Sending: [`QuicPath::send_short_bounded`],
+//! [`QuicPath::send_stream_bounded`] (from bytes),
+//! [`QuicPath::send_stream_chunks_bounded`] (from a stream of chunks, such as
+//! an inbound stream being piped onward) and
+//! [`QuicPath::send_control_bounded`]. Each returns once the peer's QUIC stack
+//! has acknowledged every byte, with the code the peer stopped the stream with
+//! ([`QuicSendError::Stopped`]), or at its deadline ([`bounded`]).
 //! A stop is seen only if it arrives before every byte is acknowledged: a
 //! message that fits in the flow-control window can be acknowledged before
 //! the receiver reads its header, and its refusal then reads as success at
@@ -31,7 +33,8 @@
 //! own (only quinn's connection idle timeout ends it, and keepalives keep a
 //! connection alive). Every send the node makes goes through a
 //! `send_*_bounded` method ([`bounded`]), which also says whether a timed-out
-//! message may have been delivered.
+//! message may have been delivered; the forms without a deadline exist only
+//! in tests.
 //!
 //! Cancel safety: dropping a send future before it returns resets the
 //! stream ([`reset_code::SENDER_ABORTED`]), so the receiver sees
@@ -166,10 +169,12 @@ pub(crate) mod stop_code {
     /// The path carries control frames only (shadow mode): a Short or
     /// Stream frame is refused before anything is charged. Data may be sent
     /// on a path only after caps negotiation said the peer accepts it, so
-    /// this is a counter of a sender that did not, and not a signal to fall
-    /// back: a small message can be fully acknowledged before the stop
-    /// arrives, and the sender then sees `Sent` for what was discarded. A
-    /// retry on the same path fails the same way.
+    /// this is a counter of a sender that did not, and not a fallback signal
+    /// a sender can rely on: a small message can be fully acknowledged before
+    /// the stop arrives, and the sender then sees `Sent` for what was
+    /// discarded. A sender that does see the stop has wrong gating: it logs
+    /// it and sends on the UDP session, since a retry on the same path fails
+    /// the same way.
     pub(crate) const NOT_ACCEPTING_DATA: u32 = 0x19;
     /// Every stop code, for the range and duplicate checks in
     /// `super::error`. A source-scrape test checks that each `const` in this
@@ -653,7 +658,9 @@ impl QuicPath {
 
     /// Parse a control frame from [`QuicInbound::controls`]. A payload this
     /// node refuses (`ControlError`) is counted on the path
-    /// (`QuicInboundOutcome::Control*`) and gives `None`.
+    /// (`QuicInboundOutcome::Control*`) and gives `None`. This is the only
+    /// place refusals are counted, so a consumer must decode through it and
+    /// not through [`QuicControl::decode`].
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn decode_control(&self, payload: &[u8]) -> Option<QuicControl> {
         match QuicControl::decode(payload) {
@@ -667,13 +674,14 @@ impl QuicPath {
         }
     }
 
-    /// Send one serialized message.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) async fn send_short(&self, payload: &[u8]) -> Result<(), QuicSendError> {
+    /// Send one serialized message. Tests only, with no deadline; nodes use
+    /// [`Self::send_short_bounded`].
+    #[cfg(test)]
+    pub(super) async fn send_short(&self, payload: &[u8]) -> Result<(), QuicSendError> {
         self.send_short_with(payload, SendProgress::new()).await
     }
 
-    /// [`Self::send_short`], within `timeout` on `time` ([`bounded`]).
+    /// Send one serialized message, within `timeout` on `time` ([`bounded`]).
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn send_short_bounded<T: TimeSource>(
         &self,
@@ -698,9 +706,10 @@ impl QuicPath {
         send.finish().await
     }
 
-    /// Send one control frame.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) async fn send_control(&self, payload: &[u8]) -> Result<(), QuicSendError> {
+    /// Send one control frame. Tests only, with no deadline; nodes use
+    /// [`Self::send_control_bounded`].
+    #[cfg(test)]
+    pub(super) async fn send_control(&self, payload: &[u8]) -> Result<(), QuicSendError> {
         self.send_control_with(payload, SendProgress::new()).await
     }
 
@@ -731,12 +740,9 @@ impl QuicPath {
         .await
     }
 
-    /// Send stream `stream_id` (caller-named) with `payload`, announced by
-    /// `metadata` ([`frame_metadata`] says what goes in the frame). Takes
-    /// one of the path's streamed-message permits ([`STREAMED_SEND_LIMIT`]),
-    /// waiting for one if all are taken, and holds it until it returns.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) async fn send_stream(
+    /// [`Self::send_stream_bounded`] with no deadline. Tests only.
+    #[cfg(test)]
+    pub(super) async fn send_stream(
         &self,
         stream_id: StreamId,
         metadata: Option<&[u8]>,
@@ -746,7 +752,11 @@ impl QuicPath {
             .await
     }
 
-    /// [`Self::send_stream`], within `timeout` on `time` ([`bounded`]).
+    /// Send stream `stream_id` (caller-named) with `payload`, announced by
+    /// `metadata` ([`frame_metadata`] says what goes in the frame), within
+    /// `timeout` on `time` ([`bounded`]). Takes one of the path's
+    /// streamed-message permits ([`STREAMED_SEND_LIMIT`]), waiting for one if
+    /// all are taken, and holds it until it returns.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn send_stream_bounded<T: TimeSource>(
         &self,
@@ -777,16 +787,9 @@ impl QuicPath {
         send.finish().await
     }
 
-    /// Send stream `stream_id` (caller-named) of `total_len` bytes from
-    /// `chunks`, announced by `metadata` ([`frame_metadata`] says what goes
-    /// in the frame). If the source fails, or delivers
-    /// more or fewer than `total_len` bytes, the stream is reset
-    /// ([`reset_code::SENDER_ABORTED`], or [`reset_code::LENGTH_MISMATCH`]
-    /// for a wrong length) and the receiver cancels its handle.
-    /// No byte past `total_len` is written. Takes a streamed-message permit
-    /// as [`Self::send_stream`] does.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) async fn send_stream_chunks<S>(
+    /// [`Self::send_stream_chunks_bounded`] with no deadline. Tests only.
+    #[cfg(test)]
+    pub(super) async fn send_stream_chunks<S>(
         &self,
         stream_id: StreamId,
         total_len: u64,
@@ -800,8 +803,14 @@ impl QuicPath {
             .await
     }
 
-    /// [`Self::send_stream_chunks`], within `timeout` on `time`
-    /// ([`bounded`]).
+    /// Send stream `stream_id` (caller-named) of `total_len` bytes from
+    /// `chunks`, announced by `metadata` ([`frame_metadata`] says what goes
+    /// in the frame), within `timeout` on `time` ([`bounded`]). If the source
+    /// fails, or delivers more or fewer than `total_len` bytes, the stream is
+    /// reset ([`reset_code::SENDER_ABORTED`], or
+    /// [`reset_code::LENGTH_MISMATCH`] for a wrong length) and the receiver
+    /// cancels its handle. No byte past `total_len` is written. Takes a
+    /// streamed-message permit as [`Self::send_stream_bounded`] does.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn send_stream_chunks_bounded<T, S>(
         &self,

@@ -113,14 +113,14 @@ pub(crate) const MAX_UNI_STREAMS: u32 = 64;
 /// [`STREAMED_SEND_LIMIT`].
 pub(crate) const RESERVED_UNI_STREAMS: u32 = 8;
 
-/// Slots the receiver has freed but not yet announced, when no MAX_STREAMS
-/// frame is lost: quinn announces new stream credit only once more than
-/// `MAX_UNI_STREAMS / 8` streams have been freed (quinn-proto 0.11.19
-/// `queue_max_stream_id`), and the sender cannot use a slot until then.
+/// Slots the receiver has freed but has not yet written a MAX_STREAMS frame
+/// for: quinn writes one only once more than `MAX_UNI_STREAMS / 8` streams
+/// have been freed since the last (quinn-proto 0.11.19 `queue_max_stream_id`),
+/// and the sender cannot use a slot until the frame reaches it.
 pub(crate) const UNANNOUNCED_CREDIT_SLACK: u32 = MAX_UNI_STREAMS / 8;
 
-/// Streamed messages (`QuicPath::send_stream`, `send_stream_chunks` and
-/// their bounded forms) a path sends at once. The limit is divided as
+/// Streamed messages (`QuicPath::send_stream_bounded`,
+/// `send_stream_chunks_bounded`) a path sends at once. The limit is divided as
 /// `STREAMED_SEND_LIMIT + UNANNOUNCED_CREDIT_SLACK + RESERVED_UNI_STREAMS =
 /// MAX_UNI_STREAMS` (48 + 8 + 8 = 64). A streamed send past it waits for one
 /// of the path's permits before it opens its stream. Short messages and
@@ -128,8 +128,8 @@ pub(crate) const UNANNOUNCED_CREDIT_SLACK: u32 = MAX_UNI_STREAMS / 8;
 ///
 /// The reserve holds on a steady path: every streamed send still holds its
 /// permit or its stream has been freed at the receiver, no MAX_STREAMS frame
-/// is lost, and short messages and control frames hold no more than the
-/// reserve. A short message or control frame then finds a stream slot
+/// is lost, queued or in flight, and short messages and control frames hold
+/// no more than the reserve. A short message or control frame then finds a stream slot
 /// whatever the streamed messages are doing (pinned by
 /// `a_short_still_sends_while_streamed_messages_are_blocked`).
 ///
@@ -142,8 +142,11 @@ pub(crate) const UNANNOUNCED_CREDIT_SLACK: u32 = MAX_UNI_STREAMS / 8;
 ///   so does an acknowledgement, which can come before the receiver has
 ///   read the stream to its end. Decide there whether to hold the permit
 ///   until the stream is acknowledged.
-/// - Unannounced credit can exceed [`UNANNOUNCED_CREDIT_SLACK`] while a
-///   MAX_STREAMS frame is lost.
+/// - Credit the sender does not know about can exceed
+///   [`UNANNOUNCED_CREDIT_SLACK`] while a MAX_STREAMS frame is lost, queued
+///   or in flight. quinn counts credit as announced when it writes the frame
+///   (`sent_max_remote`), so 9 freed slots on their way plus 8 freed since
+///   are 17 the sender cannot use, with nothing lost.
 /// - Short messages are uncapped, and one can be as large as a stream, so
 ///   they can use up the reserve.
 /// - A slot is not send capacity: a control frame that has a slot still
