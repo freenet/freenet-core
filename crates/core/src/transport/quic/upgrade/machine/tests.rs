@@ -1571,12 +1571,58 @@ fn a_seed_arrives_with_the_promotion() {
     assert_eq!(equal_keys.machine.backoff_seed(), seed);
 }
 
-/// A stable path clears the count however it ends, also when the session ends
-/// under it, since the count now outlives the machine. A younger one does not.
+/// A stable path clears the count whatever ends the machine, since the count
+/// outlives it. A younger one keeps the count, and only a session end adds to
+/// it. The age counts to the event that ends the machine, recheck included.
 #[test]
-fn a_stable_path_ended_by_its_session_clears_the_count() {
-    for (age, failures) in [(STABLE_PATH, 0), (STABLE_PATH - Duration::from_nanos(1), 6)] {
-        for recheck_first in [false, true] {
+fn a_stable_path_clears_the_count_however_the_machine_ends() {
+    type End = fn(&mut Rig, u32);
+    let session: End = |rig, _| {
+        rig.step(Event::SessionEnded);
+    };
+    let down: End = |rig, _| {
+        rig.step(Event::EndpointNotUp(QuicAvailability::Down));
+    };
+    let released: End = |rig, _| {
+        rig.step(Event::EndpointNotUp(QuicAvailability::Released));
+    };
+    let disabled: End = |rig, _| {
+        rig.step(Event::EndpointNotUp(QuicAvailability::Disabled));
+    };
+    let down_as_error: End = |rig, attempt| {
+        rig.step(Event::PathFailed {
+            attempt,
+            kind: QuicErrorKind::EndpointDown,
+        });
+    };
+    let send_lost_while_down: End = |rig, attempt| {
+        rig.availability.send(QuicAvailability::Down).unwrap();
+        let outcome = send_failed(QuicSendError::ConnectionLost(
+            quinn::ConnectionError::LocallyClosed,
+        ));
+        rig.step(Event::ControlSent { attempt, outcome });
+    };
+    let recheck_reads_down: End = |rig, _| {
+        rig.availability.send(QuicAvailability::Down).unwrap();
+        rig.step(Event::Tick);
+    };
+    let cases: [(&str, S, End); 11] = [
+        ("session", S::Active, session),
+        ("session", S::Rechecking, session),
+        ("down", S::Active, down),
+        ("down", S::Rechecking, down),
+        ("released", S::Active, released),
+        ("released", S::Rechecking, released),
+        ("disabled", S::Active, disabled),
+        ("disabled", S::Rechecking, disabled),
+        ("down as an error", S::Active, down_as_error),
+        ("send lost while down", S::Active, send_lost_while_down),
+        ("recheck reads down", S::Rechecking, recheck_reads_down),
+    ];
+    let young = STABLE_PATH - Duration::from_nanos(1);
+    for (name, start, end) in cases {
+        for age in [STABLE_PATH, young] {
+            let case = format!("{name} from {start:?} at {age:?}");
             let mut rig = Rig::new(Role::Server);
             let seed = BackoffSeed {
                 failures: 5,
@@ -1584,16 +1630,26 @@ fn a_stable_path_ended_by_its_session_clears_the_count() {
             };
             rig.promote_with(Some(QUIC_UPGRADE_NEGOTIATES_IN), seed);
             let attempt = rig.activate();
-            rig.now += age;
-            if recheck_first {
+            if start == S::Rechecking {
+                rig.now += age - RECHECK_TIMEOUT;
                 rig.step(Event::PathFailed {
                     attempt,
                     kind: QuicErrorKind::Protocol { code: 1 },
                 });
-                assert_eq!(label(&rig.machine), S::Rechecking);
+                assert_eq!(label(&rig.machine), S::Rechecking, "{case}");
+                rig.now += RECHECK_TIMEOUT;
+            } else {
+                rig.now += age;
             }
-            rig.step(Event::SessionEnded);
-            assert_eq!(rig.machine.backoff_seed().failures, failures, "{age:?}");
+            end(&mut rig, attempt);
+            assert!(rig.machine.is_off(), "{case}");
+            let (failures, backoff) = match (age == STABLE_PATH, name == "session") {
+                (true, _) => (0, 0),
+                (false, true) => (6, 1920),
+                (false, false) => (5, 0),
+            };
+            assert_eq!(rig.machine.failures, failures, "{case}");
+            assert_eq!(rig.backoff(), Duration::from_secs(backoff), "{case}");
         }
     }
 }
@@ -1826,6 +1882,17 @@ fn an_offer_is_recorded_only_once_it_is_sent() {
         attempt: SERVER_ATTEMPT,
     };
     assert_eq!(rig.step(late), vec![]);
+
+    // A report that comes after the reply is one the caller was told not to
+    // make: it records nothing and moves nothing.
+    let mut rig = reach(Role::Server, S::Connecting);
+    let deadline = rig.machine.deadline();
+    let late = Event::OfferSent {
+        attempt: SERVER_ATTEMPT,
+    };
+    assert_eq!(rig.step(late), vec![]);
+    assert_eq!(label(&rig.machine), S::Connecting);
+    assert_eq!(rig.machine.deadline(), deadline);
 }
 
 /// The timeouts and windows, written out: the tests above read the constants,
@@ -1922,8 +1989,6 @@ const CLIENT: usize = 1;
 const LATENCY: Duration = Duration::from_millis(50);
 /// When a side learns of a path whose close was lost: quinn's idle timeout.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
-/// How long after a loss the two sides may still disagree.
-const SETTLES_WITHIN: Duration = Duration::from_secs(125);
 /// How long after the start they must be back up, the loss being a single one.
 const ACTIVE_WITHIN: Duration = Duration::from_secs(600);
 
@@ -1941,6 +2006,22 @@ enum Lost {
     /// is lost.
     CloseFromServer,
     CloseFromClient,
+}
+
+/// How long after a loss the two sides may still disagree. Only a lost close
+/// waits for the idle timeout. The others end at a setup deadline, and a lost
+/// `Decline` also waits for the late promotion [`Pair::new`] gives the client.
+fn settles_within(lost: Lost) -> Duration {
+    match lost {
+        Lost::CloseFromServer | Lost::CloseFromClient => IDLE_TIMEOUT + Duration::from_secs(5),
+        Lost::Nothing
+        | Lost::Offer
+        | Lost::Accept
+        | Lost::Decline
+        | Lost::Dial
+        | Lost::Ready
+        | Lost::ReadyAck => Duration::from_secs(30),
+    }
 }
 
 /// Two machines joined by a wire with a fixed delay, on one clock.
@@ -2151,7 +2232,7 @@ fn two_machines_agree_after_any_one_lost_message() {
                 let lost_at = pair.lost_at.unwrap_or_else(|| panic!("{case}: not lost"));
                 let settled_at = settled_at.unwrap_or_else(|| panic!("{case}: never settled"));
                 assert!(
-                    settled_at - lost_at <= SETTLES_WITHIN,
+                    settled_at - lost_at <= settles_within(lost),
                     "{case}: settled {:?} after the loss",
                     settled_at - lost_at
                 );
