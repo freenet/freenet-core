@@ -907,15 +907,26 @@ doc has the transition table.
   lasted STABLE_PATH (10 min) clears the failure count, also when the session
   or endpoint ends it, so a path that keeps dying soon after it comes up is
   retried less often.
+  Session end: from Setup, Rechecking or an Active path younger than
+  STABLE_PATH, SessionEnded takes a normal backoff, because the session of a
+  restarted peer is replaced before its old QUIC connection reports anything.
+  A failure that already charged left the machine in Idle, so it is not
+  charged twice. An endpoint ending, or a SessionEnded with the endpoint read
+  as Down, charges nothing.
   Uncharged: a Decline of Busy, NotReady or Backoff and a full allow-set retry
   after 60 s (jittered) and leave the failure count. So a peer that stays
   NotReady or in its own backoff is offered to once per 60 s while that lasts.
   Disabled and an unknown reason take the normal backoff.
   Across sessions: BackoffSeed { failures, retry_at } carries the count and the
-  next attempt's time. UpgradeMachine::backoff_seed reads it and with_backoff
-  starts from it; a promotion's first offer waits for the later of the seed
-  and its own delay. e5a-5b must carry it per peer key across a replaced
-  session, or a session that flaps retries at session rate.
+  next attempt's time. UpgradeMachine::backoff_seed reads it, after stepping
+  SessionEnded, and Event::Promoted takes it, since an inbound session has no
+  key until promotion and its machine must exist before that to answer an
+  early Offer. A later promotion's seed is ignored. retry_at is cut to
+  SEED_WAIT_MAX (72 min, the longest delay with the most jitter) and the count
+  is dropped once retry_at is more than BACKOFF_MAX in the past, since the
+  seed may come off a clock with another epoch. A promotion's first offer waits
+  for the later of the seed and its own delay. e5a-5b must carry it per peer key
+  across a replaced session, or a session that flaps retries at session rate.
   Failures: close codes 1, 3, 4 and 5, a lost connection, an idle timeout and a
   deadline each mean fallback plus normal backoff, then a new offer. Never a
   permanent downgrade. Identity: close code 2 received, or Event::IdentityMismatch
@@ -933,15 +944,23 @@ doc has the transition table.
   once with CONTROL_REFUSED and a normal backoff, so the sender does not wait
   for its setup timeout. WrongLength and Empty wait for the deadline. Once
   active, a refused frame leaves the path alone.
-  Off is final (endpoint Down, Released or Disabled, session ended, policy
-  refusing, below the version floor, equal keys): no charge to the peer, no
-  re-offer, and an Offer is answered with Disabled. A later Promoted changes
-  and records nothing.
+  Off is final for the session, also for a policy that later clears (endpoint
+  Down, Released or Disabled, session ended, policy refusing, below the version
+  floor, equal keys): no re-offer, and no charge to the peer except from a
+  session end (above). A client or a machine with no role answers an Offer in
+  Off with Disabled; a server records role_conflict and does not reply. A later
+  Promoted changes and records nothing.
   An Offer repeating or older than the highest seen gets no reply. An Offer
   while an attempt is in progress gets NotReady; a client never tears a path
   down because of an Offer, so offers cannot make it dial faster than its
   attempts finish. A server that receives an Offer records role_conflict and
   does not reply.
+  Caller contracts (e5a-5b): report OfferSent before stepping any reply to that
+  Offer; drop an Offer still deferred behind allow_peer once a TearDown names
+  its attempt; read backoff_seed after stepping SessionEnded; give the client
+  and server machines of a session the session's lifetime, since attempt ids
+  restart per session and a client ignores an Offer at or below the highest it
+  has seen, with no reply.
   Action::Record(Outcome) carries the outcomes for e5a-6. Local recycle closes
   reach the machine as ConnectionLost; their counts stay in quic_close_sent_*.
   Tests (machine/tests.rs, no simulation): every (role, state, event) against
@@ -950,7 +969,8 @@ doc has the transition table.
   backoff, jitter bounds, deadlines, each close code through the real error
   mapping, Down as terminal, and the permit count after every step. A harness
   (Pair) runs two machines on one clock and loses each message kind once, and
-  asserts both end up active, or both idle with no permits, within a bound.
+  asserts both end up active, or both idle with no permits, within a bound for
+  that kind (30 s, or 125 s for a lost close, which waits for the idle timeout).
   timeouts_and_windows_have_these_values pins the constants as literals, and
   negotiation_floor_stays_above_every_release_that_ignores_an_offer stops
   QUIC_UPGRADE_NEGOTIATES_IN going down to 0.2.152 or below.

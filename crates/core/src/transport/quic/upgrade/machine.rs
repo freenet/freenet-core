@@ -15,15 +15,21 @@
 //! ```text
 //! state       event                         next        actions
 //! ----------  ----------------------------  ----------  ----------------------
-//! Idle        Promoted, server, floor met   Idle        retry in 2-10 s
-//! Idle        Promoted, server, below floor Off         ineligible_version
-//! Idle        Promoted, equal keys          Off         role_conflict
+//! no role     Promoted, server, floor met   Idle        retry in 2-10 s
+//! no role     Promoted, server, below floor Off         ineligible_version
+//! no role     Promoted, client              Idle        -
+//! no role     Promoted, equal keys          Off         role_conflict
+//! no role     Offer                         no role     Decline{NotReady}
 //! Idle        Tick due, server              Offered     allow peer, then Offer
 //! Offered     OfferSent                     Offered     offered
 //! Idle        Tick due, server, no permit   Idle        retry in BACKOFF_MIN, uncharged
 //! Idle        Tick due, policy disabled     Off         -
 //! Idle        Offer, client, all checks ok  Connecting  Accept, dial
 //! Idle        Offer refused by a check      Idle        Decline{reason}
+//! setup       Offer, client                 same        Decline{NotReady}
+//! Active      Offer, client                 same        Decline{NotReady}
+//! Rechecking  Offer, client                 same        Decline{NotReady}
+//! Off         Offer, client or no role      Off         Decline{Disabled}
 //! any         stale or repeated Offer       same        -
 //! any         Offer, server                 same        role_conflict
 //! Offered     Accept                        Connecting  accepted
@@ -35,23 +41,31 @@
 //! Connecting  Ready, client                 Active      ReadyAck
 //! Confirming  Ready, client                 Active      ReadyAck
 //! Confirming  ReadyAck, server              Active      -
+//! setup       Ready, server                 same        role_conflict
 //! Offered     Tick past deadline            Idle        tear down, backoff (no_reply)
 //! Connecting  Tick past deadline            Idle        tear down, backoff (timeout)
 //! Confirming  Tick past deadline            Idle        tear down, backoff (timeout)
-//! setup       control frame refused         Idle        close CONTROL_REFUSED, backoff
+//! setup       control frame refused, new    Idle        close CONTROL_REFUSED, backoff
 //! setup or Active  send Failed, timed out   Idle        tear down, backoff
 //! setup or Active  send Failed, lost        as PathFailed
 //! setup or Active  send Failed, stopped     as PathFailed (one stream: no effect)
 //! setup or Active  IdentityMismatch         Idle        close IDENTITY_MISMATCH, 1 h
 //! setup or Active  PathFailed               see classify()
 //! Rechecking  Tick past deadline            Idle or Off backoff, or none if Down
-//! any         EndpointNotUp, SessionEnded   Off         tear down, no backoff
-//! Off         Offer                         Off         Decline{Disabled}
+//! any         EndpointNotUp, not Up         Off         tear down, no backoff
+//! setup       SessionEnded                  Off         tear down, backoff
+//! Active      SessionEnded, not yet stable  Off         tear down, backoff
+//! Active      SessionEnded, stable          Off         tear down, clear the count
+//! Rechecking  SessionEnded, not yet stable  Off         backoff
+//! Rechecking  SessionEnded, stable          Off         clear the count
+//! Idle or Off SessionEnded                  Off         -
 //! ```
 //!
-//! "setup" is `Offered`, `Connecting` or `Confirming` ([`Phase`]). An event
-//! for any attempt but the current one changes nothing, and so does every
-//! pair the table does not list.
+//! "setup" is `Offered`, `Connecting` or `Confirming` ([`Phase`]). "no role" is
+//! `Idle` with no promotion yet. "control frame refused, new" is one of an
+//! unknown version or type. An event for any attempt but the
+//! current one changes nothing, and so does every pair the table does not list.
+//! A `SessionEnded` that finds the endpoint down takes no backoff.
 //!
 //! Each side counts a path as established on its own evidence: the client on
 //! `Ready`, the server on `ReadyAck`. The two can disagree (a send may be
@@ -62,10 +76,13 @@
 //! or dialing through active, so leaving the state returns it.
 //!
 //! No failure downgrades a peer for good: every path to `Idle` leads to a new
-//! offer after the backoff. `Off` is final and is never charged to the peer;
-//! it follows the end of the endpoint or of the session, a policy that
-//! refuses, equal keys, or a peer below the version floor. `Off` still
-//! answers offers.
+//! offer after the backoff. `Off` is final for the session, also for a policy
+//! that refuses now and would allow later: only the next session's machine can
+//! offer. It follows the end of the endpoint or of the session, a policy that
+//! refuses, equal keys, or a peer below the version floor. Of these only the
+//! end of a session charges the peer, as the table says. In `Off` a client or
+//! a machine with no role answers an offer with `Disabled`, and a server records
+//! `role_conflict` and does not reply.
 //!
 //! A failure the peer is not to blame for does not raise the failure count:
 //! a `Decline` of `Busy`, `NotReady` or `Backoff`, and a full allow-set, retry
@@ -73,8 +90,24 @@
 //! is asked once per [`BACKOFF_MIN`] for as long as that lasts.
 //!
 //! The count and the time of the next attempt outlive a machine through
-//! [`BackoffSeed`]: the caller carries it to the machine of the session that
-//! replaces this one, so a session that flaps does not retry at session rate.
+//! [`BackoffSeed`]: the caller carries it per peer key to the machine of the
+//! session that replaces this one, in [`Event::Promoted`], so a session that
+//! flaps does not retry at session rate.
+//!
+//! What the caller must do:
+//!
+//! - Report [`Event::OfferSent`] before it steps any reply to that `Offer`. A
+//!   later report records nothing, so the offer goes uncounted.
+//! - Drop an `Offer` still deferred behind `allow_peer` once a
+//!   [`Action::TearDown`] names its attempt.
+//! - Read [`UpgradeMachine::backoff_seed`] after stepping
+//!   [`Event::SessionEnded`], since that step can charge or clear the count.
+//!   A machine that took no seed has none to hand on: a promotion that comes
+//!   after `Off` is ignored, seed included.
+//! - Give the client and server machines of a session one lifetime, the
+//!   session's. Attempt ids restart with each session, and a client ignores
+//!   with no reply an `Offer` at or below the highest it has seen, so a client
+//!   machine that outlived its server's would not answer the new one.
 
 #[cfg(test)]
 mod tests;
