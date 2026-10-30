@@ -461,6 +461,9 @@ LedbatConfig {
 2. Verify the receiving peer has sufficient bandwidth
 3. Check if too many connections are sharing the global pool
 4. **For high-latency paths (>100ms RTT):** Configure `min_ssthresh` (see above)
+5. Check for a `bandwidth-limit` in `config.toml`: it caps every connection's streaming
+   rate (the node logs the applied limit at startup), and a value set long ago that once
+   had no effect now does
 
 ### Connections getting starved
 

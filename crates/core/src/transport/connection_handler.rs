@@ -2866,8 +2866,10 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                                 .unwrap_or_default()
                                                 .build_arc_with_time_source(time_source.clone());
 
-                                            // Initialize token bucket at congestion controller's
-                                            // rate to avoid initial burst. See #3702.
+                                            // Initialize token bucket at the global share, else
+                                            // the controller's rate lowered to bandwidth-limit
+                                            // (`initial_paced_rate`), to avoid an initial
+                                            // burst. See #3702.
                                             let initial_rate = initial_paced_rate(
                                                 global_bandwidth
                                                     .as_ref()
@@ -3057,8 +3059,9 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                     .unwrap_or_default()
                                     .build_arc_with_time_source(time_source.clone());
 
-                                // Initialize token bucket at congestion controller's
-                                // rate to avoid initial burst. See #3702.
+                                // Initialize token bucket at the global share, else the
+                                // controller's rate lowered to bandwidth-limit
+                                // (`initial_paced_rate`), to avoid an initial burst. See #3702.
                                 let initial_rate = initial_paced_rate(
                                     global_bandwidth
                                         .as_ref()
@@ -5223,8 +5226,9 @@ pub mod mock_transport {
     /// A `bandwidth-limit` above the congestion controller's rate must not
     /// give a new connection a larger initial burst than no limit would. The
     /// bucket's capacity is set once from the initial rate (`rate / 10`), so
-    /// when the raw limit set the initial rate, a 10 MB/s limit under FixedRate gave every
-    /// connection a 1 MB burst for its whole life (the #3702 burst). Checked on
+    /// when the raw limit set the initial rate, a 10 MB/s limit under FixedRate
+    /// gave every connection a 1 MB burst for its whole life (the #3702 burst).
+    /// Checked on
     /// both the gateway's accept path and the joiner's path.
     #[tokio::test]
     async fn bandwidth_limit_above_the_controller_rate_keeps_the_default_burst()
@@ -5267,35 +5271,28 @@ pub mod mock_transport {
         Ok(())
     }
 
-    /// The same as `bandwidth_limit_reaches_gateway_and_joiner_connections`
-    /// for a peer-to-peer hole-punch, with each side forced onto a different
-    /// traversal arm so each arm's setup site is checked on every run. As in
-    /// `nat_traversal_ack_racer_learns_version_from_the_ack`, dropping B's
-    /// intro means A never parses one and completes on B's ack, while B
-    /// completes by answering A's intro (`RemoteInbound`). The arms are
-    /// asserted, so a change that moves either side to the other arm fails
-    /// here instead of silently testing one site twice. The limits are above
-    /// FixedRate's rate, so each connection must also keep the default burst
-    /// capacity (see `bandwidth_limit_above_the_controller_rate_keeps_the_default_burst`).
-    #[tokio::test]
-    async fn bandwidth_limit_reaches_hole_punched_connections() -> anyhow::Result<()> {
-        const A_LIMIT: usize = 10_000_000;
-        const B_LIMIT: usize = 20_000_000;
-        let expected_capacity = (crate::transport::fixed_rate::DEFAULT_RATE_BYTES_PER_SEC / 10)
-            .max(MIN_BUCKET_CAPACITY_BYTES);
+    /// Hole-punches A to B with B's intro dropped, so (as in
+    /// `nat_traversal_ack_racer_learns_version_from_the_ack`) A never parses an
+    /// intro and completes on B's ack, while B completes by answering A's intro
+    /// (`RemoteInbound`). Asserts each side's arm, then returns each side's
+    /// `(bandwidth_limit, pacing_capacity)`.
+    async fn hole_punch_with_limits(
+        a_limit: usize,
+        b_limit: usize,
+    ) -> anyhow::Result<((Option<usize>, usize), (Option<usize>, usize))> {
         let channels = Arc::new(DashMap::new());
         let (a_pub, mut peer_a, a_addr) = create_mock_peer_with_bandwidth(
             PacketDropPolicy::ReceiveAll,
             Default::default(),
             channels.clone(),
-            Some(A_LIMIT),
+            Some(a_limit),
         )
         .await?;
         let (b_pub, mut peer_b, b_addr) = create_mock_peer_with_bandwidth(
             PacketDropPolicy::Ranges(vec![0..1]),
             Default::default(),
             channels,
-            Some(B_LIMIT),
+            Some(b_limit),
         )
         .await?;
 
@@ -5320,12 +5317,37 @@ pub mod mock_transport {
             completed_in_remote_inbound(b_addr, a_addr),
             "premise: B completed in the RemoteInbound arm"
         );
-        assert_eq!(a, (Some(A_LIMIT), expected_capacity), "ack-arm connection");
-        assert_eq!(
-            b,
-            (Some(B_LIMIT), expected_capacity),
-            "RemoteInbound-arm connection"
-        );
+        Ok((a, b))
+    }
+
+    /// The same as `bandwidth_limit_reaches_gateway_and_joiner_connections`
+    /// for a peer-to-peer hole-punch, with each side forced onto a different
+    /// traversal arm (see `hole_punch_with_limits`), so a regression in either
+    /// arm's setup site fails every run. Run twice with the binding and the
+    /// non-binding limit swapped between the arms, so each arm is checked both
+    /// for a limit that sets its initial burst (capacity = limit / 10) and for
+    /// one above FixedRate's 1.25 MB/s that must keep the default burst
+    /// (125 000 bytes).
+    #[tokio::test]
+    async fn bandwidth_limit_reaches_hole_punched_connections() -> anyhow::Result<()> {
+        // (A's limit, B's limit, A's expected capacity, B's expected capacity)
+        let runs = [
+            (400_000, 20_000_000, 40_000, 125_000),
+            (10_000_000, 600_000, 125_000, 60_000),
+        ];
+        for (a_limit, b_limit, a_capacity, b_capacity) in runs {
+            let (a, b) = hole_punch_with_limits(a_limit, b_limit).await?;
+            assert_eq!(
+                a,
+                (Some(a_limit), a_capacity),
+                "ack-arm connection, limits ({a_limit}, {b_limit})"
+            );
+            assert_eq!(
+                b,
+                (Some(b_limit), b_capacity),
+                "RemoteInbound-arm connection, limits ({a_limit}, {b_limit})"
+            );
+        }
         Ok(())
     }
 

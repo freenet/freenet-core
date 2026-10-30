@@ -9704,6 +9704,9 @@ shutdown-drain-secs = 42
     #[tokio::test]
     async fn transport_bandwidth_limit_sanitizes_the_configured_limit() {
         use crate::transport::peer_connection::MIN_BANDWIDTH_LIMIT;
+        // The library default leaves the limit unset, as the CLI does: a value
+        // here would silently cap callers that pick a faster controller.
+        assert_eq!(ConfigArgs::default().network_api.bandwidth_limit, None);
         let temp_dir = tempfile::tempdir().unwrap();
         let mut api = clap_bare_args(temp_dir.path())
             .build()
