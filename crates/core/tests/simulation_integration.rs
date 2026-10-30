@@ -20716,3 +20716,494 @@ fn test_advertised_version_override_reaches_peers() {
         "the node records the gateway's advertised version (ack)"
     );
 }
+
+// =============================================================================
+// QUIC upgrades in shadow mode (#5940 step e5a-5b)
+// =============================================================================
+
+/// The release that first ships the negotiation, written out: if
+/// `QUIC_UPGRADE_NEGOTIATES_IN` stays parked above it, or moves, the runs below
+/// that read as this release stop upgrading and these tests go red.
+const QUIC_FIRST_NEGOTIATING_RELEASE: (u8, u8, u16) = (0, 2, 153);
+
+/// A virtual minute's worth of a run's second half, in `QUIC_EVENT_WAIT` steps.
+const QUIC_EVENT_WAIT: Duration = Duration::from_secs(10);
+
+struct QuicShadowRun {
+    trace: freenet::dev_tool::QuicUpgradeTrace,
+    /// Gateways first.
+    nodes: Vec<SocketAddr>,
+    logs_events: usize,
+}
+
+impl QuicShadowRun {
+    fn whats(&self, node: SocketAddr, prefix: &str) -> usize {
+        self.trace.matching(node, prefix).len()
+    }
+
+    fn total(&self, prefix: &str) -> usize {
+        self.nodes.iter().map(|n| self.whats(*n, prefix)).sum()
+    }
+
+    /// The node that offered: the server, the higher key.
+    fn server(&self) -> SocketAddr {
+        *self
+            .nodes
+            .iter()
+            .find(|n| self.whats(**n, "Offered") > 0)
+            .unwrap_or_else(|| panic!("nobody offered: {:#?}", self.trace.records()))
+    }
+
+    fn dump(&self) -> String {
+        format!("{:#?}", self.trace.records())
+    }
+}
+
+/// One direct-runner simulation of `gateways` plus `nodes`, in `QUIC_EVENT_WAIT`
+/// steps. `set_up` gets the network, the trace and the labels sorted gateways
+/// first; it picks each node's QUIC mode.
+fn run_quic_shadow_sim(
+    name: &str,
+    seed: u64,
+    (gateways, nodes): (usize, usize),
+    steps: usize,
+    set_up: impl FnOnce(
+        &mut SimNetwork,
+        &freenet::dev_tool::QuicUpgradeTrace,
+        &[freenet::dev_tool::NodeLabel],
+    ),
+) -> QuicShadowRun {
+    setup_deterministic_state(seed);
+    let rt = create_runtime();
+    let (sim, logs_handle, trace, addresses) = rt.block_on(async {
+        let mut sim = SimNetwork::new(name, gateways, nodes, 7, 3, 10, 2, seed).await;
+        let trace = sim.quic_upgrade_trace();
+        let mut labels: Vec<_> = sim.all_node_addresses().keys().cloned().collect();
+        labels.sort_by_key(|label| (!label.is_gateway(), label.number()));
+        set_up(&mut sim, &trace, &labels);
+        let addresses: Vec<_> = labels
+            .iter()
+            .map(|label| sim.all_node_addresses()[label])
+            .collect();
+        let logs_handle = sim.event_logs_handle();
+        (sim, logs_handle, trace, addresses)
+    });
+    drop(rt);
+    sim.run_simulation_direct::<rand::rngs::SmallRng>(seed, 1, steps, QUIC_EVENT_WAIT)
+        .expect("direct simulation should succeed");
+    let rt = create_runtime();
+    let logs_events = rt.block_on(async { logs_handle.lock().await.len() });
+    QuicShadowRun {
+        trace,
+        nodes: addresses,
+        logs_events,
+    }
+}
+
+/// Both nodes of a run count as the first negotiating release. See
+/// `QuicUpgradeTrace::run_as_release`.
+fn run_as_first_negotiating_release(trace: &freenet::dev_tool::QuicUpgradeTrace) {
+    let real = SimNetwork::real_protocol_version();
+    trace.run_as_release(real, real.max(QUIC_FIRST_NEGOTIATING_RELEASE));
+}
+
+/// Shadow on both ends: the whole negotiation runs over a real QUIC connection,
+/// each side counts it established on its own evidence, and no application
+/// traffic touches the path while the nodes carry on over UDP.
+#[test_log::test]
+fn test_quic_shadow_two_nodes_reach_established_with_traffic_on_udp() {
+    let run = run_quic_shadow_sim(
+        "quic-shadow-established",
+        0x5940_E5B0_0001,
+        (1, 1),
+        8,
+        |sim, trace, _| {
+            sim.with_transport_quic("shadow");
+            run_as_first_negotiating_release(trace);
+        },
+    );
+    let server = run.server();
+    let client = run.nodes.iter().copied().find(|n| *n != server).unwrap();
+    assert_eq!(run.whats(server, "Offered"), 1, "{}", run.dump());
+    assert_eq!(run.whats(server, "Accepted"), 1, "{}", run.dump());
+    assert_eq!(run.whats(client, "Accepted"), 1, "{}", run.dump());
+    assert_eq!(run.whats(client, "Offered"), 0, "only the server offers");
+    assert_eq!(run.whats(server, "Established"), 1, "{}", run.dump());
+    assert_eq!(run.whats(client, "Established"), 1, "{}", run.dump());
+    for node in &run.nodes {
+        for established in run.trace.matching(*node, "Established") {
+            assert_eq!(established.permits, 1, "an active path holds its permit");
+        }
+    }
+    // The first offer waits 2-10 s after promotion.
+    let offered = &run.trace.matching(server, "Offered")[0];
+    let established = &run.trace.matching(server, "Established")[0];
+    assert!(
+        established.at >= offered.at,
+        "established before offered: {}",
+        run.dump()
+    );
+    // Data would be refused and counted, or delivered to the path's channels.
+    assert_eq!(
+        run.total("path carried data: refused 0, delivered 0"),
+        2,
+        "both paths end carrying no data: {}",
+        run.dump()
+    );
+    assert!(
+        run.logs_events > 0,
+        "the nodes did work over UDP while the path was up"
+    );
+    for node in &run.nodes {
+        assert_eq!(run.trace.permits_in_use(*node), Some(0), "{}", run.dump());
+    }
+}
+
+/// With no help the floor applies to this tree's real version: a node never
+/// offers to a peer below the first release that answers, so until the release
+/// bump lifts the crate to that release this tree's nodes do not offer to one
+/// another, and after it they must. That second half is the test with no version
+/// override at all, and it goes red if the floor is left parked past the bump.
+#[test_log::test]
+fn test_quic_shadow_real_version_offers_only_from_the_first_negotiating_release() {
+    let real = SimNetwork::real_protocol_version();
+    let run = run_quic_shadow_sim(
+        "quic-shadow-real-version",
+        0x5940_E5B0_0002,
+        (1, 1),
+        4,
+        |sim, _, _| {
+            sim.with_transport_quic("shadow");
+        },
+    );
+    if real >= QUIC_FIRST_NEGOTIATING_RELEASE {
+        assert_eq!(run.total("Established"), 2, "{}", run.dump());
+    } else {
+        assert_eq!(run.total("Offered"), 0, "{}", run.dump());
+        assert_eq!(run.total("IneligibleVersion"), 1, "{}", run.dump());
+    }
+}
+
+/// A node with QUIC off answers an Offer with `Decline{Disabled}`, with no key
+/// and no machine, and the offering node takes the normal backoff. Which node is
+/// the server depends on the keys, so both assignments run: in exactly one is the
+/// shadow node the server.
+#[test_log::test]
+fn test_quic_off_peer_declines_with_disabled() {
+    let mut offers_seen = 0;
+    for shadow_index in [0, 1] {
+        let run = run_quic_shadow_sim(
+            &format!("quic-off-declines-{shadow_index}"),
+            0x5940_E5B0_0003,
+            (1, 1),
+            8,
+            |sim, trace, labels| {
+                sim.with_node_transport_quic(&labels[shadow_index], "shadow");
+                run_as_first_negotiating_release(trace);
+            },
+        );
+        let shadow = run.nodes[shadow_index];
+        let off = run.nodes[1 - shadow_index];
+        if run.whats(shadow, "Offered") == 0 {
+            // This node is the client: nobody offers, since the node with QUIC
+            // off has no upgrades at all.
+            assert_eq!(run.whats(off, "received Offer"), 0, "{}", run.dump());
+            continue;
+        }
+        offers_seen += 1;
+        assert!(run.whats(off, "received Offer") >= 1, "{}", run.dump());
+        // A reason of 1 is `Disabled` on the wire.
+        assert!(
+            run.whats(shadow, "received Decline { attempt: 1, reason: 1 }") >= 1,
+            "{}",
+            run.dump()
+        );
+        assert!(
+            run.whats(shadow, "Declined(Some(Disabled))") >= 1,
+            "{}",
+            run.dump()
+        );
+        assert_eq!(run.total("Established"), 0, "{}", run.dump());
+        for declined in run.trace.matching(shadow, "Declined") {
+            assert_eq!(declined.permits, 0, "a refused offer returns its permit");
+        }
+    }
+    assert_eq!(offers_seen, 1, "exactly one assignment makes shadow the server");
+}
+
+/// A peer below the decoder floor must not receive a single Upgrade byte, and one
+/// from the decoder floor up to the release that answers is never offered: both
+/// count as ineligible on the node that would have offered.
+#[test_log::test]
+fn test_quic_old_peers_are_never_offered() {
+    let (min, real) = (
+        SimNetwork::min_compatible_protocol_version(),
+        SimNetwork::real_protocol_version(),
+    );
+    for (version, label) in [((0, 2, 148), "decoder-floor"), ((0, 2, 149), "answer-floor")] {
+        if !(min <= version && version <= real) {
+            tracing::warn!(?version, "SKIPPED: not advertisable on this release");
+            continue;
+        }
+        let mut ineligible = 0;
+        for old_index in [0, 1] {
+            let run = run_quic_shadow_sim(
+                &format!("quic-old-peer-{label}-{old_index}"),
+                0x5940_E5B0_0004,
+                (1, 1),
+                3,
+                |sim, trace, labels| {
+                    sim.enable_gateway_ack_version();
+                    sim.with_node_transport_quic(&labels[1 - old_index], "shadow");
+                    sim.with_node_advertised_version(&labels[old_index], version);
+                    run_as_first_negotiating_release(trace);
+                },
+            );
+            let old = run.nodes[old_index];
+            let shadow = run.nodes[1 - old_index];
+            assert_eq!(run.whats(old, "received"), 0, "{version:?}: {}", run.dump());
+            assert_eq!(run.whats(shadow, "Offered"), 0, "{version:?}: {}", run.dump());
+            ineligible += run.whats(shadow, "IneligibleVersion");
+        }
+        assert_eq!(
+            ineligible, 1,
+            "{version:?}: the side with the higher key counts it, once"
+        );
+    }
+}
+
+/// QUIC datagrams between the two nodes are dropped from the start: the
+/// negotiation still runs over UDP, both sides time out, nothing is left held,
+/// and the server offers again after its backoff.
+#[test_log::test]
+fn test_quic_blackholed_path_falls_back_and_is_reoffered() {
+    let run = run_quic_shadow_sim(
+        "quic-blackhole",
+        0x5940_E5B0_0005,
+        (1, 1),
+        15,
+        |sim, trace, labels| {
+            sim.with_transport_quic("shadow");
+            run_as_first_negotiating_release(trace);
+            sim.drop_quic_datagrams_between(&labels[0], &labels[1], Duration::ZERO);
+        },
+    );
+    let server = run.server();
+    assert!(run.whats(server, "Offered") >= 2, "{}", run.dump());
+    assert_eq!(run.total("Established"), 0, "{}", run.dump());
+    for node in &run.nodes {
+        let timeouts = run.trace.matching(*node, "Timeout");
+        assert!(!timeouts.is_empty(), "{node}: {}", run.dump());
+        for timeout in timeouts {
+            assert_eq!(timeout.permits, 0, "a timeout returns the permit");
+        }
+    }
+    let offers = run.trace.matching(server, "Offered");
+    let first_timeout = &run.trace.matching(server, "Timeout")[0];
+    assert!(
+        offers[1].at >= first_timeout.at + Duration::from_secs(48),
+        "the second offer waits for the backoff: {}",
+        run.dump()
+    );
+}
+
+/// A path that goes quiet ends with the idle timeout, the session stays up, and
+/// the server offers again. Simulated time has no keepalive, so an idle timeout is
+/// what a path whose datagrams vanish looks like here.
+#[test_log::test]
+fn test_quic_established_path_that_idles_out_falls_back() {
+    let run = run_quic_shadow_sim(
+        "quic-idle-out",
+        0x5940_E5B0_0006,
+        (1, 1),
+        15,
+        |sim, trace, labels| {
+            sim.with_transport_quic("shadow");
+            run_as_first_negotiating_release(trace);
+            sim.with_quic_idle_timeout(Duration::from_secs(20));
+            sim.drop_quic_datagrams_between(&labels[0], &labels[1], Duration::from_secs(25));
+        },
+    );
+    let server = run.server();
+    assert!(run.total("Established") >= 2, "{}", run.dump());
+    assert!(
+        run.whats(server, "Fallback(Idle)") >= 1,
+        "{}",
+        run.dump()
+    );
+    assert!(run.whats(server, "Offered") >= 2, "{}", run.dump());
+}
+
+/// A key on the path that does not match the node's record closes the path with
+/// IDENTITY_MISMATCH. The peer reads that code too, and neither offers again for
+/// an hour.
+#[test_log::test]
+fn test_quic_wrong_key_closes_with_identity_mismatch() {
+    // One end's record is wrong; the other end must read it from the close.
+    for wrong_index in [0, 1] {
+        let run = run_quic_shadow_sim(
+            &format!("quic-wrong-key-{wrong_index}"),
+            0x5940_E5B0_0007,
+            (1, 1),
+            15,
+            |sim, trace, labels| {
+                sim.with_transport_quic("shadow");
+                run_as_first_negotiating_release(trace);
+                trace.make_record_wrong(sim.all_node_addresses()[&labels[wrong_index]]);
+            },
+        );
+        let wrong = run.nodes[wrong_index];
+        let other = run.nodes[1 - wrong_index];
+        assert_eq!(
+            run.whats(wrong, "closed path with IdentityMismatch"),
+            1,
+            "{}",
+            run.dump()
+        );
+        assert_eq!(run.whats(wrong, "IdentityMismatch"), 1, "{}", run.dump());
+        assert_eq!(run.whats(other, "IdentityMismatch"), 1, "{}", run.dump());
+        assert_eq!(run.whats(wrong, "Established"), 0, "{}", run.dump());
+        assert_eq!(run.total("Offered"), 1, "no new offer for an hour: {}", run.dump());
+    }
+}
+
+/// The endpoint's driver dies while a node holds several paths: every one of them
+/// closes, with no offer after it, and the node holds no permit. The other nodes'
+/// sessions and the UDP side carry on.
+#[test_log::test]
+fn test_quic_endpoint_down_closes_every_path() {
+    const DOWN_AT: Duration = Duration::from_secs(40);
+    let run = run_quic_shadow_sim(
+        "quic-endpoint-down",
+        0x5940_E5B0_0008,
+        (1, 3),
+        10,
+        |sim, trace, labels| {
+            sim.with_transport_quic("shadow");
+            run_as_first_negotiating_release(trace);
+            trace.fail_endpoint_at(sim.all_node_addresses()[&labels[0]], DOWN_AT);
+        },
+    );
+    let gateway = run.nodes[0];
+    let established = run.whats(gateway, "Established");
+    assert!(established >= 2, "needs several paths: {}", run.dump());
+    let fallbacks = run.trace.matching(gateway, "Fallback(EndpointDown)");
+    assert_eq!(fallbacks.len(), established, "{}", run.dump());
+    let last = fallbacks.last().unwrap();
+    assert_eq!(last.permits, 0, "{}", run.dump());
+    assert!(
+        run.trace
+            .matching(gateway, "Offered")
+            .iter()
+            .all(|offer| offer.at <= fallbacks[0].at),
+        "no offer after Down: {}",
+        run.dump()
+    );
+}
+
+/// The same run with the same seed gives the same upgrades at the same times.
+#[test_log::test]
+fn test_quic_shadow_upgrade_is_deterministic() {
+    const SEED: u64 = 0x5940_E5B0_0009;
+    let once = |name: &str| {
+        let run = run_quic_shadow_sim(name, SEED, (1, 2), 6, |sim, trace, _| {
+            sim.with_transport_quic("shadow");
+            run_as_first_negotiating_release(trace);
+        });
+        assert!(run.total("Established") >= 2, "{}", run.dump());
+        run.trace.records()
+    };
+    assert_eq!(once("quic-shadow-det-run1"), once("quic-shadow-det-run2"));
+}
+
+/// The client of an established path restarts, with its identity. The survivor's
+/// session is replaced, so its path closes, and the backoff of the session that
+/// ended carries over to the new one: a survivor that is the server waits for it
+/// before it offers, and one that is the client declines with `Backoff` first.
+#[test_log::test]
+fn test_quic_replaced_connection_closes_its_path_and_keeps_the_backoff() {
+    use freenet::config::SimulationIdleTimeout;
+    let mut roles_seen = std::collections::BTreeSet::new();
+    for (index, seed) in (0..8u64).map(|i| 0x5940_E5B0_0100 + i).enumerate() {
+        let name = format!("quic-replaced-{index}");
+        setup_deterministic_state(seed);
+        SimulationIdleTimeout::enable();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        let (trace, survivor, restarted, replaced_at) = rt.block_on(async {
+            let mut sim = SimNetwork::new(&name, 1, 1, 7, 3, 10, 2, seed).await;
+            sim.with_transport_quic("shadow");
+            let trace = sim.quic_upgrade_trace();
+            run_as_first_negotiating_release(&trace);
+            let labels = sim.all_node_addresses().clone();
+            let gateway = labels.keys().find(|l| l.is_gateway()).unwrap().clone();
+            let node = labels.keys().find(|l| !l.is_gateway()).unwrap().clone();
+            let time = sim.virtual_time().clone();
+            let driver = tokio::spawn(async move {
+                let start = tokio::time::Instant::now();
+                loop {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    time.advance_to(start.elapsed().as_nanos() as u64);
+                }
+            });
+            let _handles = sim
+                .start_with_rand_gen::<rand::rngs::SmallRng>(seed, 1, 1)
+                .await;
+            tokio::time::sleep(Duration::from_secs(40)).await;
+            assert!(sim.crash_node(&node));
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let replaced_at = trace.now();
+            sim.restart_node::<rand::rngs::SmallRng>(&node, seed + 1, 1, 1)
+                .await
+                .expect("the node restarts");
+            tokio::time::sleep(Duration::from_secs(120)).await;
+            driver.abort();
+            (trace, labels[&gateway], labels[&node], replaced_at)
+        });
+        drop(rt);
+        let dump = format!("{:#?}", trace.records());
+        let of = |prefix: &str| trace.matching(survivor, prefix);
+        assert_eq!(
+            of("Established").iter().filter(|e| e.at < replaced_at).count(),
+            1,
+            "path up before the restart: {dump}"
+        );
+        let old_session = of("Established")[0].session;
+        assert!(
+            trace
+                .of(survivor, restarted)
+                .iter()
+                .any(|r| r.session == old_session && r.what.starts_with("closed path")),
+            "the replaced connection's path closed: {dump}"
+        );
+        let survivor_was_server = of("Offered").iter().any(|o| o.at < replaced_at);
+        if survivor_was_server {
+            let next = of("Offered")
+                .into_iter()
+                .find(|o| o.at > replaced_at)
+                .unwrap_or_else(|| panic!("no new offer: {dump}"));
+            assert!(
+                next.at >= replaced_at + Duration::from_secs(48),
+                "the first offer of the new session waits for the backoff, \
+                 not its own 2-10 s: {dump}"
+            );
+        } else {
+            assert!(
+                !of("DeclineSent(Backoff)").is_empty(),
+                "the new session is still in the old one's backoff: {dump}"
+            );
+        }
+        roles_seen.insert(survivor_was_server);
+        assert!(
+            of("Established").iter().any(|e| e.at > replaced_at && e.session != old_session),
+            "the new session upgrades in the end: {dump}"
+        );
+        if roles_seen.len() == 2 {
+            return;
+        }
+    }
+    panic!("the seeds did not cover both roles: {roles_seen:?}");
+}

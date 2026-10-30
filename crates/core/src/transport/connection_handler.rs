@@ -170,6 +170,7 @@ pub async fn create_connection_handler<S: Socket>(
             // `create_connection_handler` is the test and tool entry point;
             // the node opens the transport through `open_udp_transport`.
             quic: None,
+            quic_policy: None,
             advertised_version_override: None,
             task_registrar: None,
         },
@@ -194,6 +195,10 @@ pub(crate) struct UdpTransportConfig {
     /// QUIC endpoint settings when `transport-quic` is on, `None` (no
     /// endpoint, no QUIC ingress) when it is off. See `transport::quic`.
     pub(crate) quic: Option<super::quic::QuicSettings>,
+    /// What the node's upgrade policy reads from its configuration. Without it,
+    /// or without [`Self::task_registrar`], the node never upgrades a session,
+    /// whatever `quic` says, as for tools and tests that open only an endpoint.
+    pub(crate) quic_policy: Option<super::quic::upgrade::policy::QuicPolicyConfig>,
     /// Simulation-only: the version this node advertises in its handshakes
     /// (the intro packet and `AckConnectionV2`), so a simulation can emulate
     /// an older peer. Only what the node TELLS its peers changes; the node
@@ -326,6 +331,44 @@ pub(super) async fn bind_udp_listener<S: Socket>(
     ))
 }
 
+/// The node's QUIC upgrades, when it has what they need: an endpoint, a policy
+/// and a registrar for the attempt router.
+fn build_quic_upgrades(
+    endpoint: Option<&super::quic::QuicEndpoint>,
+    policy: Option<super::quic::upgrade::policy::QuicPolicyConfig>,
+    registrar: Option<&crate::node::background_task_monitor::LateRegistrar>,
+    local_key: TransportPublicKey,
+    socket_addr: SocketAddr,
+    time_source: &RealTime,
+) -> Option<Arc<super::quic::upgrade::driver::QuicUpgrades>> {
+    use super::quic::upgrade::driver::{PathClock, QuicUpgrades};
+    let (endpoint, policy, _registrar) = (endpoint?, policy?, registrar?);
+    let policy = super::quic::upgrade::policy::QuicPolicy::from_config(policy, endpoint.availability());
+    // The clock quinn runs on (`bind_udp_listener`).
+    let path_clock = get_socket_virtual_time(&socket_addr)
+        .map_or_else(|| PathClock::Real(time_source.clone()), PathClock::Virtual);
+    #[cfg(any(test, feature = "testing"))]
+    let trace = super::in_memory_socket::quic_upgrade_trace_at(socket_addr);
+    #[cfg(any(test, feature = "testing"))]
+    if let Some(at) = trace.as_ref().and_then(|trace| trace.down_at()) {
+        let failing = endpoint.clone();
+        let clock = path_clock.clone();
+        // Bounded by `at`, and holds an endpoint share only until then.
+        drop(GlobalExecutor::spawn(async move {
+            clock.sleep(at).await;
+            failing.fail_driver();
+        }));
+    }
+    Some(QuicUpgrades::new(
+        endpoint.clone(),
+        policy,
+        local_key,
+        path_clock,
+        #[cfg(any(test, feature = "testing"))]
+        trace,
+    ))
+}
+
 /// A `GlobalRng` side-stream id for `addr`: the same address gives the same
 /// id in every run (FNV-1a over its text form).
 fn side_stream_of(addr: SocketAddr) -> u64 {
@@ -440,6 +483,8 @@ pub struct OutboundConnectionHandler<S = UdpSocket, TS: TimeSource = RealTime> {
     /// Whether this transport's QUIC endpoint is alive; `Disabled` when it
     /// has none (`transport-quic` off).
     quic_availability: super::quic::QuicAvailabilityWatch,
+    /// How a new connection joins the node's QUIC upgrades.
+    upgrade_site: super::quic::upgrade::driver::UpgradeSite,
     /// The listener's QUIC endpoint, so tests can fail its driver.
     #[cfg(test)]
     quic_endpoint: Option<super::quic::QuicEndpoint>,
@@ -451,6 +496,7 @@ impl<S, TS: TimeSource> Clone for OutboundConnectionHandler<S, TS> {
             send_queue: self.send_queue.clone(),
             expected_non_gateway: self.expected_non_gateway.clone(),
             quic_availability: self.quic_availability.clone(),
+            upgrade_site: self.upgrade_site.clone(),
             #[cfg(test)]
             quic_endpoint: self.quic_endpoint.clone(),
         }
@@ -537,6 +583,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
             ack_version_floor_override,
             // Used by `bind_udp_listener`, which built `quic_endpoint` from it.
             quic: _,
+            quic_policy,
             advertised_version_override,
             task_registrar,
         } = config;
@@ -549,10 +596,10 @@ impl<S: Socket> OutboundConnectionHandler<S> {
         );
         #[cfg(test)]
         let test_quic_endpoint = quic_endpoint.clone();
+        let local_key = keypair.public().clone();
         // The endpoint's accept loop runs from the start, registered with
         // the node's monitor. Its allow-set is empty until an upgrade allows
-        // a peer, so it hands on no attempts yet; the queue is held by the
-        // listener, which will consume it once upgrades are wired in.
+        // a peer. The upgrades' router consumes its queue.
         let quic_attempts = quic_endpoint
             .as_ref()
             .zip(task_registrar.as_ref())
@@ -567,6 +614,27 @@ impl<S: Socket> OutboundConnectionHandler<S> {
             });
 
         let time_source = RealTime::new();
+        let quic_upgrades = build_quic_upgrades(
+            quic_endpoint.as_ref(),
+            quic_policy,
+            task_registrar.as_ref(),
+            local_key,
+            socket_addr,
+            &time_source,
+        );
+        // With upgrades the router takes the queue; without them the listener
+        // holds it, so the accept loop still has a live consumer.
+        let quic_attempts = match (&quic_upgrades, task_registrar.as_ref(), quic_attempts) {
+            (Some(upgrades), Some(registrar), Some(attempts)) => {
+                upgrades.spawn_attempt_router(registrar, attempts);
+                None
+            }
+            (_, _, attempts) => attempts,
+        };
+        let upgrade_site = super::quic::upgrade::driver::UpgradeSite::new(
+            quic_upgrades.as_ref(),
+            socket_addr,
+        );
         let transport = UdpPacketsListener {
             is_gateway,
             socket_listener: socket,
@@ -599,11 +667,14 @@ impl<S: Socket> OutboundConnectionHandler<S> {
                 .map_or(PROTOC_VERSION, version_cmp::encode_version),
             _quic_endpoint: quic_endpoint,
             _quic_attempts: quic_attempts,
+            _quic_upgrades: quic_upgrades,
+            upgrade_site: upgrade_site.clone(),
         };
         let connection_handler = OutboundConnectionHandler {
             send_queue: conn_handler_sender,
             expected_non_gateway,
             quic_availability,
+            upgrade_site,
             #[cfg(test)]
             quic_endpoint: test_quic_endpoint,
         };
@@ -681,6 +752,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
         remote_addr: SocketAddr,
         origin: NatAttemptOrigin,
     ) -> Pin<Box<dyn Future<Output = Result<PeerConnection<S>, TransportError>> + Send>> {
+        let upgrade_site = self.upgrade_site.clone();
         if self.expected_non_gateway.insert(remote_addr.ip()) {
             tracing::debug!(
                 peer_addr = %remote_addr,
@@ -706,9 +778,11 @@ impl<S: Socket> OutboundConnectionHandler<S> {
             return async { Err(TransportError::ChannelClosed) }.boxed();
         }
         recv_connection
-            .map(|res| match res {
+            .map(move |res| match res {
                 Ok(Ok(remote_conn)) => {
-                    Ok(PeerConnection::new(remote_conn).with_dialled_key(dialled_key))
+                    Ok(PeerConnection::new(remote_conn)
+                        .with_upgrade_site(&upgrade_site)
+                        .with_dialled_key(dialled_key))
                 }
                 Ok(Err(e)) => Err(e),
                 Err(_) => Err(TransportError::ConnectionEstablishmentFailure {
@@ -852,6 +926,8 @@ impl<S: Socket> OutboundConnectionHandler<S, crate::simulation::VirtualTime> {
             gw_rate_limiter: GatewayConnectionRateLimiter::new(time_source.clone(), None),
             _quic_endpoint: None,
             _quic_attempts: None,
+            _quic_upgrades: None,
+            upgrade_site: Default::default(),
             time_source,
             congestion_config,
             // Benchmarks measure throughput, not handshake encoding; the real
@@ -863,6 +939,7 @@ impl<S: Socket> OutboundConnectionHandler<S, crate::simulation::VirtualTime> {
             send_queue: conn_handler_sender,
             expected_non_gateway,
             quic_availability: super::quic::QuicAvailabilityWatch::disabled(),
+            upgrade_site: Default::default(),
             #[cfg(test)]
             quic_endpoint: None,
         };
@@ -1052,6 +1129,11 @@ struct UdpPacketsListener<S = UdpSocket, T: TimeSource = RealTime> {
     /// yet: with an empty allow-set no attempt is handed on. Each queued
     /// attempt would keep quinn's endpoint alive until drained or dropped.
     _quic_attempts: Option<mpsc::Receiver<super::quic::QuicIncoming>>,
+    /// The node's upgrades. Holds an endpoint share, and every connection holds
+    /// these while it lives; the router and `upgrade_site` hold them weakly.
+    _quic_upgrades: Option<Arc<super::quic::upgrade::driver::QuicUpgrades>>,
+    /// How a new connection joins the upgrades.
+    upgrade_site: super::quic::upgrade::driver::UpgradeSite,
 }
 
 type OngoingConnectionResult<S, T> = Option<
@@ -2099,7 +2181,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
 
                             if self.connections.complete_gateway_handshake(remote_addr, inbound_remote_connection.inbound_packet_sender) {
                                 if self.new_connection_notifier
-                                    .send(PeerConnection::new(outbound_remote_conn))
+                                    .send(PeerConnection::new(outbound_remote_conn).with_upgrade_site(&self.upgrade_site))
                                     .await
                                     .is_err() {
                                     tracing::error!(peer_addr = %remote_addr, "Failed to notify new gateway connection");

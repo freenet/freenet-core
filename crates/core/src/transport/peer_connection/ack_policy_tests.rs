@@ -3025,13 +3025,12 @@ fn replies(sent: &[SymmetricMessage]) -> Vec<&SymmetricMessage> {
         .collect()
 }
 
-/// Every form of the upgrade message, received on an established connection,
-/// is counted and ignored: nothing is delivered to the application, nothing
-/// but a receipt is sent back, and the connection carries on and delivers the
-/// next message. This holds whatever version the remote reports, because the
-/// receiver never answers.
+/// Every form of the upgrade message, received on an established connection
+/// with QUIC off, is counted: nothing is delivered to the application, only an
+/// Offer is answered (a reply needs no version gate, so whatever version the
+/// remote reports), and the connection carries on and delivers the next message.
 #[tokio::test(start_paused = true)]
-async fn upgrade_control_is_counted_and_ignored_without_reply() {
+async fn upgrade_control_with_quic_off_is_counted_and_only_an_offer_is_answered() {
     for version in [CAPABLE, OLD, None] {
         let mut e = single(version);
         // Never reset, so another test's `take_snapshot` cannot disturb it;
@@ -3070,13 +3069,22 @@ async fn upgrade_control_is_counted_and_ignored_without_reply() {
 
         assert!(e.pump(Duration::from_secs(2)).await.is_none());
         let sent = e.drain_sent();
+        // QUIC is off here, so the Offer gets `Disabled` and the two answers to
+        // offers this node never made get nothing.
+        let answers: Vec<_> = replies(&sent)
+            .into_iter()
+            .map(|m| m.payload.clone())
+            .collect();
         assert!(
-            replies(&sent).is_empty(),
-            "{version:?}: the receiver must never answer an upgrade message, got {:?}",
-            replies(&sent)
-                .iter()
-                .map(|m| m.payload.to_string())
-                .collect::<Vec<_>>()
+            matches!(
+                answers.as_slice(),
+                [SymmetricMessagePayload::Upgrade(UpgradeControl::Decline {
+                    attempt: 1,
+                    reason,
+                })] if *reason == crate::transport::symmetric_message::DeclineReason::Disabled.wire()
+            ),
+            "{version:?}: the Offer and nothing else is answered, got {:?}",
+            answers.iter().map(ToString::to_string).collect::<Vec<_>>()
         );
         for id in 1..=3 {
             assert_eq!(

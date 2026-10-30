@@ -103,6 +103,8 @@ pub mod local_node {
 /// Exports for the dev tool.
 pub mod dev_tool {
     use super::*;
+    #[cfg(any(test, feature = "testing"))]
+    pub use crate::transport::quic::upgrade::sim_trace::{QuicUpgradeRecord, QuicUpgradeTrace};
     pub use crate::config::{
         Config, GlobalTestMetrics, KEK_SIZE, KekBackend, KekBackendKind, KekError, Secrets,
         ensure_kek_loaded, load_from_backend, read_backend_marker, replace_backend_marker,

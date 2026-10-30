@@ -481,6 +481,11 @@ pub(crate) struct QuicPath {
     /// ([`STREAMED_SEND_LIMIT`]), so the remaining uni stream slots stay
     /// for short messages and control frames. Never closed.
     stream_slots: tokio::sync::Semaphore,
+    /// Whether the path accepts data ([`QuicPathLimits::accept_data`]). A path
+    /// that does not (shadow) must not send data either: in shadow a fragment
+    /// taken from an inbound handle cannot outlive its charge because nothing
+    /// is ever forwarded.
+    accept_data: bool,
     #[cfg(test)]
     budget: SharedInboundBudget,
 }
@@ -604,6 +609,7 @@ impl QuicPath {
                 receive,
                 aborts,
                 stream_slots: tokio::sync::Semaphore::new(STREAMED_SEND_LIMIT as usize),
+                accept_data: limits.accept_data,
                 #[cfg(test)]
                 budget,
             },
@@ -657,21 +663,32 @@ impl QuicPath {
     }
 
     /// Parse a control frame from [`QuicInbound::controls`]. A payload this
-    /// node refuses (`ControlError`) is counted on the path
-    /// (`QuicInboundOutcome::Control*`) and gives `None`. This is the only
-    /// place refusals are counted, so a consumer must decode through it and
-    /// not through [`QuicControl::decode`].
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn decode_control(&self, payload: &[u8]) -> Option<QuicControl> {
-        match QuicControl::decode(payload) {
-            Ok(control) => Some(control),
-            Err(error) => {
-                self.stats
-                    .record(QuicInboundOutcome::of_control_error(&error));
-                tracing::debug!(%error, "QUIC path: refusing a control frame");
-                None
-            }
-        }
+    /// node refuses ([`ControlError`]) is counted on the path
+    /// (`QuicInboundOutcome::Control*`) and returned, for the upgrade machine.
+    /// This is the only place refusals are counted, so a consumer must decode
+    /// through it and not through [`QuicControl::decode`].
+    pub(crate) fn decode_control(&self, payload: &[u8]) -> Result<QuicControl, ControlError> {
+        QuicControl::decode(payload).inspect_err(|error| {
+            self.stats
+                .record(QuicInboundOutcome::of_control_error(error));
+            tracing::debug!(%error, "QUIC path: refusing a control frame");
+        })
+    }
+
+    /// Close the connection with `code`, which the peer reads in its connection
+    /// error.
+    pub(in crate::transport) fn close(&self, code: QuicCloseCode) {
+        self.connection.close(code);
+    }
+
+    /// The quinn connection, to wait for its end.
+    pub(in crate::transport) fn quinn_connection(&self) -> quinn::Connection {
+        self.connection.inner().clone()
+    }
+
+    /// A data send must not happen on a shadow path. See `accept_data`.
+    fn debug_assert_carries_data(&self) {
+        debug_assert!(self.accept_data, "a shadow QUIC path sends control frames only");
     }
 
     /// Send one serialized message. Tests only, with no deadline; nodes use
@@ -700,6 +717,7 @@ impl QuicPath {
         payload: &[u8],
         progress: SendProgress,
     ) -> Result<(), QuicSendError> {
+        self.debug_assert_carries_data();
         let header = FrameHeader::short(payload.len() as u64)?;
         let mut send = self.open(&header, &[], progress).await?;
         send.write_all(payload).await?;
@@ -779,6 +797,7 @@ impl QuicPath {
         payload: Bytes,
         progress: SendProgress,
     ) -> Result<(), QuicSendError> {
+        self.debug_assert_carries_data();
         let metadata = frame_metadata(metadata);
         let header = FrameHeader::stream(stream_id, payload.len() as u64, metadata.len())?;
         let _slot = self.stream_slot().await?;
@@ -842,6 +861,7 @@ impl QuicPath {
     where
         S: Stream<Item = Result<Bytes, StreamError>> + Unpin,
     {
+        self.debug_assert_carries_data();
         let metadata = frame_metadata(metadata);
         let header = FrameHeader::stream(stream_id, total_len, metadata.len())?;
         let _slot = self.stream_slot().await?;

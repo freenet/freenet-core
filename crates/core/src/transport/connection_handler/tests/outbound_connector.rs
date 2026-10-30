@@ -10,6 +10,7 @@ fn handler() -> (OutboundConnectionHandler<MockSocket>, Queue) {
         send_queue,
         expected_non_gateway: Arc::new(DashSet::new()),
         quic_availability: crate::transport::quic::QuicAvailabilityWatch::disabled(),
+        upgrade_site: Default::default(),
         quic_endpoint: None,
     };
     (handler, queue)

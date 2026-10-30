@@ -2066,6 +2066,14 @@ impl SimNetwork {
         self
     }
 
+    /// A record of what every node's QUIC upgrades do in this network, and the
+    /// faults a test can inject into them. Call it before the nodes start. The
+    /// handle stays readable after the run has consumed the network.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn quic_upgrade_trace(&self) -> crate::transport::quic::upgrade::sim_trace::QuicUpgradeTrace {
+        crate::transport::in_memory_socket::quic_upgrade_trace(&self.name)
+    }
+
     /// Gives every node's QUIC endpoint the idle timeout `timeout` instead
     /// of its clock's (24 h on `VirtualTime`), so a silent QUIC path times
     /// out within a simulation. No effect on a node with QUIC off.

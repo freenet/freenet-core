@@ -169,12 +169,13 @@ pub(crate) struct QuicSocket<S> {
     /// comes, since the endpoint's connections let their addresses go).
     receive_waker: futures::task::AtomicWaker,
     /// Test hooks: faults injected into quinn's drivers.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     faults: Arc<SocketFaults>,
 }
 
 /// Test hooks: faults injected into quinn's drivers through this socket.
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Default)]
 pub(crate) struct SocketFaults {
     /// What the endpoint's next receive does (`RECEIVE_*`).
@@ -193,28 +194,29 @@ pub(crate) struct SocketFaults {
     send_panics: AtomicU64,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 const RECEIVE_OK: u8 = 0;
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 const RECEIVE_ERROR: u8 = 1;
 /// A panic in the adapter's own code, which it catches.
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 const RECEIVE_PANIC: u8 = 2;
 /// A panic that unwinds through quinn, as one in quinn's own code would.
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 const RECEIVE_PANIC_IN_QUINN: u8 = 3;
 /// Every write-readiness poll panics in the adapter's own code.
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 const WRITABLE_PANIC: u8 = 1;
 /// The next write-readiness poll panics in the adapter's own code, once.
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 const WRITABLE_PANIC_ONCE: u8 = 2;
 /// Panics of a lasting write-readiness fault after which its hook reports
 /// `Pending` instead (tests only; see `QuicPoller::poll_ready`).
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 const WRITABLE_PANIC_LIMIT: u64 = 1000;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
+#[cfg_attr(not(test), allow(dead_code))]
 impl SocketFaults {
     /// Fail the endpoint's next receive with a socket error quinn's
     /// endpoint driver cannot get past, the way a socket that fails for
@@ -307,13 +309,13 @@ impl<S: Socket> QuicSocket<S> {
             ingress_closed_logged: AtomicBool::new(false),
             health,
             receive_waker: futures::task::AtomicWaker::new(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "testing"))]
             faults: Arc::default(),
         }
     }
 
     /// The hooks that inject faults through this socket (tests).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     pub(crate) fn faults(&self) -> Arc<SocketFaults> {
         self.faults.clone()
     }
@@ -413,7 +415,7 @@ impl<S: Socket> AsyncUdpSocket for QuicSocket<S> {
         bufs: &mut [IoSliceMut<'_>],
         meta: &mut [RecvMeta],
     ) -> Poll<io::Result<usize>> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "testing"))]
         if self
             .faults
             .receive
@@ -475,12 +477,12 @@ fn adapter_panicked_error() -> io::Error {
 impl<S: Socket> QuicSocket<S> {
     /// [`AsyncUdpSocket::try_send`], below the panic catch.
     fn send_one(&self, transmit: &Transmit) -> io::Result<()> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "testing"))]
         if self.faults.panic_sends.load(Ordering::Acquire) {
             self.faults.send_panics.fetch_add(1, Ordering::AcqRel);
             panic!("injected panic in the QUIC socket adapter (send)");
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "testing"))]
         if self.faults.block_sends.load(Ordering::Acquire) {
             return Err(io::ErrorKind::WouldBlock.into());
         }
@@ -530,7 +532,7 @@ impl<S: Socket> QuicSocket<S> {
         let (Some(buf), Some(slot)) = (bufs.first_mut(), meta.first_mut()) else {
             return Poll::Ready(Ok(0));
         };
-        #[cfg(test)]
+        #[cfg(any(test, feature = "testing"))]
         {
             match self.faults.receive.load(Ordering::Acquire) {
                 RECEIVE_ERROR => {
@@ -635,7 +637,7 @@ impl<S: Socket> UdpPoller for QuicPoller<S> {
 impl<S: Socket> QuicPoller<S> {
     /// [`UdpPoller::poll_writable`], below the panic catch.
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "testing"))]
         {
             let fault = self.socket.faults.writable.load(Ordering::Acquire);
             if fault == WRITABLE_PANIC_ONCE {

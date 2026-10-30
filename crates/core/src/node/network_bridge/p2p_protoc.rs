@@ -737,6 +737,8 @@ pub(in crate::node) struct P2pConnManager {
     /// breaker decided (for the upgrade policy, from e5a-3). The settings are
     /// used to open the transport.
     quic: crate::transport::quic::breaker::Gated<crate::transport::quic::QuicSettings>,
+    /// What the upgrade policy reads from the configuration and the breaker.
+    quic_policy: crate::transport::quic::upgrade::policy::QuicPolicyConfig,
     /// Test-only override for the #5161 version-carrying-ack floor, threaded
     /// into the transport handler. `None` in production.
     /// See `NodeConfig::ack_version_floor_override`.
@@ -1297,6 +1299,22 @@ impl P2pConnManager {
         // that is ignored or lowered (#5940).
         crate::transport::quic::upgrade::policy::log_startup(&config.config.network_api);
 
+        // The crash-loop breaker may keep QUIC off after a run with QUIC
+        // enabled ended abnormally (#5940); inert outside the binary. It
+        // gates this node's settings, simulation overrides included.
+        let quic = crate::transport::quic::breaker::gate(
+            config.quic_settings(),
+            &config.config.data_dir(),
+            config.config.network_api.quic_ignore_crash_breaker,
+            config.config.shutdown_drain_secs,
+            quic_breaker_now,
+        )
+        .await;
+        let quic_policy = crate::transport::quic::upgrade::policy::QuicPolicyConfig::new(
+            &config.config.network_api,
+            quic.breaker,
+        );
+
         Ok(P2pConnManager {
             gateways,
             bridge,
@@ -1352,17 +1370,8 @@ impl P2pConnManager {
                 }),
             ledbat_min_ssthresh: config.config.network_api.ledbat_min_ssthresh,
             congestion_config: config.config.network_api.build_congestion_config(),
-            // The crash-loop breaker may keep QUIC off after a run with QUIC
-            // enabled ended abnormally (#5940); inert outside the binary. It
-            // gates this node's settings, simulation overrides included.
-            quic: crate::transport::quic::breaker::gate(
-                config.quic_settings(),
-                &config.config.data_dir(),
-                config.config.network_api.quic_ignore_crash_breaker,
-                config.config.shutdown_drain_secs,
-                quic_breaker_now,
-            )
-            .await,
+            quic,
+            quic_policy,
             blocked_addresses: config.blocked_addresses.clone(),
             broadcast_retries: HashMap::new(),
             broadcast_no_target_streak: HashMap::new(),
@@ -1423,6 +1432,7 @@ impl P2pConnManager {
                 congestion_config: Some(self.congestion_config.clone()),
                 ack_version_floor_override: self.ack_version_floor_override,
                 quic: self.quic.settings,
+                quic_policy: Some(self.quic_policy),
                 advertised_version_override: self.advertised_version_override,
                 task_registrar: Some(self.task_registrar.clone()),
             },
@@ -1471,6 +1481,7 @@ impl P2pConnManager {
             congestion_config,
             ack_version_floor_override,
             quic,
+            quic_policy,
             advertised_version_override,
             task_registrar,
             transport_has_quic: _,
@@ -1572,6 +1583,7 @@ impl P2pConnManager {
             ack_version_floor_override,
             // Used by open_udp_transport like the fields above.
             quic,
+            quic_policy,
             advertised_version_override,
             task_registrar,
             transport_has_quic,
