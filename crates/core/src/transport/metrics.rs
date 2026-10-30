@@ -550,7 +550,7 @@ pub struct TransportMetrics {
     quic_endpoint_down: AtomicU64,
     /// QUIC endpoints whose socket adapter caught a panic, at most one per
     /// endpoint however often the fault repeats; each turns that endpoint
-    /// off (reset each snapshot). A panic in a path's receive task is not
+    /// off, unless the node had already released it (reset each snapshot). A panic in a path's receive task is not
     /// counted here (`receive_task_panicked`), and a panic in quinn's own
     /// driver code is not caught at all.
     quic_adapter_panicked: AtomicU64,
@@ -2572,8 +2572,8 @@ pub struct TransportSnapshot {
     /// then runs with QUIC off (#5940 e4).
     pub quic_endpoint_down: u64,
     /// QUIC endpoints whose socket adapter caught a panic (at most one per
-    /// endpoint); each turns that endpoint off (#5940). Not counted: a
-    /// panic in a path's receive task.
+    /// endpoint); each turns that endpoint off unless the node had already
+    /// released it (#5940). Not counted: a panic in a path's receive task.
     pub quic_adapter_panicked: u64,
     /// Times the QUIC crash-loop breaker tripped: a run with QUIC enabled
     /// ended abnormally, so this one started with QUIC off (#5940).
@@ -3162,8 +3162,8 @@ struct SnapshotExtras {
     /// then runs with QUIC off (#5940 e4).
     pub quic_endpoint_down: u64,
     /// QUIC endpoints whose socket adapter caught a panic (at most one per
-    /// endpoint); each turns that endpoint off (#5940). Not counted: a
-    /// panic in a path's receive task.
+    /// endpoint); each turns that endpoint off unless the node had already
+    /// released it (#5940). Not counted: a panic in a path's receive task.
     pub quic_adapter_panicked: u64,
     /// Times the QUIC crash-loop breaker tripped: a run with QUIC enabled
     /// ended abnormally, so this one started with QUIC off (#5940).

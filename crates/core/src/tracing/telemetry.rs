@@ -7741,7 +7741,7 @@ mod tests {
         }
     }
 
-    /// The event-log JSON carries the QUIC endpoint-down, task-panic and
+    /// The event-log JSON carries the QUIC endpoint-down, adapter-panic and
     /// close-code counts, with the same values serde gives.
     #[test]
     fn transport_snapshot_json_carries_quic_endpoint_and_close_counts() {

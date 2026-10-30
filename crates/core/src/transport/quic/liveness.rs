@@ -20,8 +20,9 @@
 //! - a driver task dropped without finishing (the runtime shutting down) is
 //!   not reported: the process is ending.
 //!
-//! Panics. The node relies on unwinding (`panic = "unwind"`, checked at
-//! compile time in `super`), and what a panic does depends on where it
+//! Panics. The node relies on unwinding (`panic = "unwind"`; a build that
+//! aborts on panic refuses to build the endpoint, `super::require_unwinding`,
+//! and runs with QUIC off), and what a panic does depends on where it
 //! starts:
 //!
 //! - In the node's socket adapter ([`QuicSocket`]: `poll_recv`, `try_send`,
@@ -31,34 +32,43 @@
 //!   [`EndpointHealth::adapter_panicked`]: the endpoint is `Down` (counted
 //!   in `quic_endpoint_down` and `quic_adapter_panicked`, logged once at
 //!   ERROR), and the adapter returns an I/O error, which ends the quinn
-//!   driver that called it cleanly. QUIC then stays off until the node
-//!   restarts: the endpoint driver ends at its next receive, a handshake in
-//!   progress is abandoned, connect is refused, and each connection is
-//!   closed by its watcher (`QuicConnection::new`), so callers get an error
-//!   instead of waiting on a driver that has stopped. A panic after the node
-//!   released the endpoint leaves it `Released` and closes nothing (see the
+//!   driver that called it cleanly. From then on every adapter call returns
+//!   that error without running the adapter's code. QUIC then stays off
+//!   until the node restarts: the endpoint driver ends at its next receive;
+//!   `connect` refuses at once (`QuicEndpoint::connect` checks for `Down`);
+//!   a handshake in progress ends with an error (quinn's implicit close, see
+//!   `QuicIncoming::establish`); and each connection is closed locally by
+//!   its watcher (`QuicConnection::new`), so callers get an error instead of
+//!   waiting on a driver that has stopped. Peers are not told: no
+//!   CONNECTION_CLOSE leaves (see `socket`), so they find out from their own
+//!   idle timeout. A panic after the node released the endpoint is counted
+//!   and logged but leaves it `Released`, and closes nothing (see the
 //!   watcher in `QuicConnection::new`).
 //! - In the node's own per-connection tasks (the path's receive task, see
 //!   `path::supervise_receive`): contained per connection, which is closed
 //!   with DOWNGRADE, and not counted in `quic_adapter_panicked`.
+//! - In the node's runtime adapter ([`QuicRuntime`]: `now`, and
+//!   `QuicTimer::reset` / `poll`, which call the `TimeSource`, including
+//!   `sleep_until`): NOT contained. quinn calls them from its drivers under
+//!   the same state lock, so a panic there behaves as one in quinn's own
+//!   code (below). They have no error to return a panic as (`now` must
+//!   return an `Instant`), so they are not wrapped like the socket adapter.
 //! - In quinn's own code inside its endpoint or connection driver: NOT
 //!   contained, and it can abort the process. quinn 0.11.12 polls each
 //!   driver holding a `std::sync::Mutex` it locks with `.lock().unwrap()`,
 //!   so the panic poisons it, and quinn's destructors unwrap the poisoned
 //!   lock. For the endpoint driver that happens on every such panic: quinn
 //!   spawns it inside its own `async` block, and the unwind out of that
-//!   block drops the driver right there (the backtrace shows
-//!   `drop_in_place::<EndpointDriver>` called from quinn's
-//!   `Instrumented::poll`, before any catch around the spawned future, and
-//!   tokio's own panic guard would drop it the same way).
-//!   `EndpointDriver::drop` (`endpoint.rs:403`) and then `EndpointRef::drop`
-//!   (`endpoint.rs:724`) lock the poisoned mutex during the unwind, and the
-//!   process aborts. For a connection driver, `SendStream`, `RecvStream` and
-//!   the last `Connection` handle lock in their `Drop`, so dropping one
-//!   afterwards panics in whatever task drops it, and aborts the process if
-//!   that drop runs during an unwind. The fix belongs in quinn: those
-//!   destructors must tolerate a poisoned lock (both `endpoint.rs:403` and
-//!   `:724` for the endpoint driver);
+//!   block drops the driver there, before any catch around the spawned
+//!   future (ours or tokio's) runs. `EndpointDriver::drop`
+//!   (`endpoint.rs:403`) and then `EndpointRef::drop` (`endpoint.rs:724`)
+//!   lock the poisoned mutex during the unwind, and the process aborts. For
+//!   a connection driver, `SendStream`, `RecvStream` and the last
+//!   `Connection` handle lock in their `Drop`, so dropping one afterwards
+//!   panics in whatever task drops it, and aborts the process if that drop
+//!   runs during an unwind. The fix belongs in quinn: those destructors
+//!   must tolerate a poisoned lock (both `endpoint.rs:403` and `:724` for
+//!   the endpoint driver);
 //!   `a_panic_unwinding_through_the_endpoint_driver_still_aborts` pins the
 //!   current behaviour.
 //!
@@ -197,6 +207,15 @@ impl EndpointHealth {
         self.released.load(Ordering::Acquire)
     }
 
+    /// Whether a CONNECTION_CLOSE made now can still be sent: not once the
+    /// endpoint is Down (its endpoint driver has ended, or is about to) or
+    /// the socket adapter caught a panic (which may have ended the
+    /// connection's driver, and makes every send fail; this holds after
+    /// Released too).
+    pub(crate) fn closes_can_be_sent(&self) -> bool {
+        !self.has_adapter_panicked() && *self.availability.borrow() != QuicAvailability::Down
+    }
+
     /// Whether the socket adapter caught a panic ([`Self::adapter_panicked`]).
     /// One atomic load: read on every receive.
     pub(crate) fn has_adapter_panicked(&self) -> bool {
@@ -204,10 +223,11 @@ impl EndpointHealth {
     }
 
     /// The socket adapter caught a panic in `call`, before it unwound into
-    /// quinn. The first one turns the endpoint `Down` (unless the node
-    /// already released it), counts `quic_adapter_panicked` and logs at ERROR;
-    /// a later one only logs at DEBUG, so a fault that repeats is counted
-    /// once per endpoint.
+    /// quinn. The first one counts `quic_adapter_panicked`, logs at ERROR and
+    /// turns the endpoint `Down`; if the node had already released the
+    /// endpoint it stays `Released` (nothing to turn off: the node is done
+    /// with it) and the log says so. A later one only logs at DEBUG, so a
+    /// fault that repeats is counted once per endpoint.
     pub(crate) fn adapter_panicked(
         &self,
         call: &'static str,
@@ -219,13 +239,23 @@ impl EndpointHealth {
             return;
         }
         TRANSPORT_METRICS.record_quic_adapter_panicked(self.local_addr);
-        tracing::error!(
-            local_addr = %self.local_addr,
-            call,
-            panic = message,
-            "The QUIC socket adapter panicked; the panic was caught. The QUIC endpoint is \
-             down: the node keeps running on the UDP transport, with QUIC off until it restarts"
-        );
+        if self.is_released() {
+            tracing::error!(
+                local_addr = %self.local_addr,
+                call,
+                panic = message,
+                "The QUIC socket adapter panicked; the panic was caught. The node had already \
+                 released this QUIC endpoint, so nothing else changes"
+            );
+        } else {
+            tracing::error!(
+                local_addr = %self.local_addr,
+                call,
+                panic = message,
+                "The QUIC socket adapter panicked; the panic was caught. The QUIC endpoint is \
+                 down: the node keeps running on the UDP transport, with QUIC off until it restarts"
+            );
+        }
         let went_down = self.availability.send_if_modified(|availability| {
             if *availability == QuicAvailability::Up {
                 *availability = QuicAvailability::Down;
@@ -319,5 +349,33 @@ mod tests {
         assert_eq!(health.watch().get(), QuicAvailability::Down);
         health.driver_ended();
         assert_eq!(TRANSPORT_METRICS.quic_endpoint_down_at(addr), 1);
+    }
+
+    /// A socket-adapter panic is counted and turns the endpoint Down once,
+    /// however often it repeats (a second, concurrent one only logs). One
+    /// after the node released the endpoint is counted but leaves it
+    /// `Released`, and is not counted as a death. Either way a close can no
+    /// longer be sent.
+    #[test]
+    fn an_adapter_panic_counts_once_and_keeps_released() {
+        let addr: SocketAddr = "10.201.35.3:1".parse().unwrap();
+        let health = EndpointHealth::new(addr);
+        assert!(health.closes_can_be_sent());
+        health.adapter_panicked("test", &"first");
+        health.adapter_panicked("test", &"second");
+        assert_eq!(health.watch().get(), QuicAvailability::Down);
+        assert_eq!(TRANSPORT_METRICS.quic_adapter_panicked_at(addr), 1);
+        assert_eq!(TRANSPORT_METRICS.quic_endpoint_down_at(addr), 1);
+        assert!(!health.closes_can_be_sent());
+
+        let addr: SocketAddr = "10.201.35.4:1".parse().unwrap();
+        let health = EndpointHealth::new(addr);
+        health.release();
+        assert!(health.closes_can_be_sent());
+        health.adapter_panicked("test", &"after release");
+        assert_eq!(health.watch().get(), QuicAvailability::Released);
+        assert_eq!(TRANSPORT_METRICS.quic_adapter_panicked_at(addr), 1);
+        assert_eq!(TRANSPORT_METRICS.quic_endpoint_down_at(addr), 0);
+        assert!(!health.closes_can_be_sent());
     }
 }

@@ -368,7 +368,8 @@ ignored (`upgrade_control_received`) and hole-punch handshake packets dropped,
 one count per packet, because they were not encrypted under the attempt's
 inbound session key (`handshake_unauthenticated_dropped`), QUIC endpoint deaths
 (`quic_endpoint_down`), panics the QUIC socket adapter caught
-(`quic_adapter_panicked`, once per endpoint), QUIC crash-loop breaker trips at startup
+(`quic_adapter_panicked`, once per endpoint; the process keeps running
+and no breaker state is left), QUIC crash-loop breaker trips at startup
 (`quic_breaker_trips`, counted for any abnormal end of a QUIC-enabled run, not
 only a QUIC fault; see `quic/breaker.rs`) and whether the breaker keeps QUIC
 off in this process (`quic_breaker_suppressed`, a state that is never reset and
@@ -1320,8 +1321,9 @@ Liveness ("alive" = the endpoint driver has not ENDED; it does not mean
   → quinn's driver returns only on a receive I/O error. QuicSocket returns
     one only after it caught a panic (below); tests inject one
     (socket::SocketFaults::fail_receive).
-  → PANICS. The node relies on panic = "unwind" (a compile-time assert in
-    quic.rs fails the build otherwise).
+  → PANICS. The node relies on panic = "unwind". A build with
+    panic = "abort" still compiles, but QuicEndpoint::bind refuses
+    (require_unwinding) and the node runs with QUIC off.
     CONTAINED: a panic in the socket adapter (QuicSocket::poll_recv,
     try_send, QuicPoller::poll_writable), which quinn calls holding its
     endpoint or connection state lock. The adapter catches it before it
@@ -1329,39 +1331,64 @@ Liveness ("alive" = the endpoint driver has not ENDED; it does not mean
     EndpointHealth::adapter_panicked turns the endpoint Down, counts
     quic_adapter_panicked once per endpoint and logs ERROR once. The call
     returns an io error (never Ready(Ok)/Ok, which would make a lasting
-    fault repeat on every transmit), ending that driver; every later
-    receive returns one too (one AtomicBool load), and the adapter wakes
-    the endpoint driver so it ends promptly. try_send and poll_writable do
-    NOT short-circuit on the flag: healthy connections still send their
-    CONNECTION_CLOSE, and a lasting send fault is hit once per live
-    connection. An adapter panic mid-handshake ends the driver with an
-    error (skipping quinn's terminate), but dropping the driver drops the
-    second-to-last connection reference and quinn's ConnectionRef::drop
-    closes it, so connect/establish return an error and release the permit
-    (pinned by the a_panic_during_*_ends_the_handshake_* tests; no race
-    needed, a mutation that removed one left them green). On EVERY Down (a returned driver too) each
-    connection's watcher closes it with DOWNGRADE, uncounted in
-    quic_close_sent_* because its driver may be gone; that is what fails
-    calls waiting on a driver that ended. Released closes nothing, and a
-    socket-adapter panic after Released leaves it Released. QUIC stays off
-    until the node restarts. Also contained, per connection: a panic in the
-    path's receive task (DOWNGRADE that connection, receive_task_panicked,
-    not quic_adapter_panicked).
-    NOT CONTAINED: a panic in quinn's own endpoint- or connection-driver
-    code. quinn 0.11.12 polls each driver holding a std Mutex it locks with
-    .lock().unwrap(), so the panic poisons it, and quinn's destructors
-    unwrap the poisoned lock: quinn spawns the endpoint driver inside its
-    own async block, the unwind drops it there (before any catch around the
-    spawned future), and EndpointDriver::drop (endpoint.rs:403) then
-    EndpointRef::drop (:724) lock the poisoned mutex: always an abort,
-    pinned by a_panic_unwinding_through_the_endpoint_driver_still_aborts;
-    and
-    SendStream, RecvStream and the last Connection handle lock in Drop, so
-    a connection-driver panic can abort when another task drops one. The
+    fault repeat on every transmit), ending that driver. From then on
+    every adapter call returns that error before the adapter's own code
+    runs (one AtomicBool load), so a lasting fault is hit once per
+    endpoint, and the adapter wakes the endpoint driver so it ends
+    promptly.
+  → After an adapter panic NOTHING more leaves the endpoint: no
+    CONNECTION_CLOSE reaches any peer, and peers find out from their own
+    idle timeout. Sending one would not work anyway: EndpointDriver::drop
+    drops each connection's event channel, and a connection driver that
+    sees that ends with INTERNAL_ERROR before it transmits (quinn 0.11.12
+    ConnectionDriver::poll). Pinned by
+    an_adapter_panic_ends_every_connection_and_counts_once.
+  → On EVERY Down (a returned driver too) each connection's watcher closes
+    it locally with DOWNGRADE; that is what fails calls waiting on a
+    driver that ended. QuicCloser counts a close in quic_close_sent_* only
+    while it can be sent (EndpointHealth::closes_can_be_sent: not Down,
+    no adapter panic), so the watcher's close and any close after an
+    adapter panic are not counted. Released closes nothing, and an adapter
+    panic after Released is counted and logged but leaves it Released.
+  → connect checks for Down before quinn sees the attempt. quinn refuses
+    on its own only after its endpoint driver has been dropped, which
+    happens some time after Down; on a multi-thread runtime a connect in
+    that window would send an Initial (pinned by
+    after_down_nothing_reaches_the_wire_before_quinn_notices).
+  → A handshake in flight ends with an error that reads as EndpointDown,
+    through quinn: an adapter panic in that connection's driver ends the
+    driver with an error, and dropping it drops the second-to-last
+    connection reference, so ConnectionRef::drop closes it; a panic
+    elsewhere ends the endpoint driver, whose drop ends the connection.
+    connect/establish release their permit. Pinned by the
+    a_panic_during_*_ends_the_handshake_* and
+    a_*_panic_during_connect_ends_the_handshake tests.
+  → QUIC stays off until the node restarts. Also contained, per
+    connection: a panic in the path's receive task (DOWNGRADE that
+    connection, receive_task_panicked, not quic_adapter_panicked).
+  → NOT CONTAINED: a panic in quinn's own endpoint- or connection-driver
+    code, or in the node's runtime adapter that quinn calls under the same
+    lock (QuicRuntime::now, QuicTimer::reset/poll and the TimeSource's
+    sleep_until; they have no error to return a panic as). quinn 0.11.12
+    polls each driver holding a std Mutex it locks with .lock().unwrap(),
+    so the panic poisons it, and quinn's destructors unwrap the poisoned
+    lock. quinn spawns the endpoint driver inside its own async block, the
+    unwind drops it there (before any catch around the spawned future),
+    and EndpointDriver::drop (endpoint.rs:403) then EndpointRef::drop
+    (:724) lock the poisoned mutex: always an abort, pinned by
+    a_panic_unwinding_through_the_endpoint_driver_still_aborts. SendStream,
+    RecvStream and the last Connection handle lock in Drop, so a
+    connection-driver panic can abort when another task drops one. The
     fix is upstream in quinn (tolerate a poisoned lock in those
-    destructors, both :403 and :724 for the endpoint driver); do not add catch-and-leak machinery around quinn here
-    (PR #6027 tried; its review found it cannot close the stream-drop
-    case).
+    destructors, both :403 and :724 for the endpoint driver). Do not add
+    catch-and-leak machinery around quinn here: it cannot cover the
+    stream and connection destructors, which run in the node's own tasks.
+  → Telling them apart: a caught adapter panic leaves the process running
+    (ERROR log, quic_adapter_panicked, quic_endpoint_down) and leaves no
+    crash-loop breaker state, so QUIC comes back on the next start, and a
+    deterministic fault recurs once per start. A panic that is not
+    contained aborts the process, and the next start trips the breaker
+    (quic_breaker_trips, see quic/breaker.rs).
   → When the node drops its last handle, the availability is Released
     (final; the first final state stored wins, so a release and a
     driver return racing never overwrite each other) and the driver's
@@ -1401,8 +1428,12 @@ Tests: one row per quinn variant and per stop/reset code in
   quic/error/tests.rs; each close code sent by either side and seen by
   the peer as that code and kind; the receive-task panic seen as
   DOWNGRADE; a panic in the socket adapter (receive; and a lasting one in
-  send or write readiness, hit exactly once) turns Down and leaves the
-  process running (child process, so an abort fails one test); a panic
+  send or write readiness, hit exactly once) turns Down, stops upgrades
+  (QuicPolicy) and leaves the process running (child process, so an
+  abort fails one test); with two connections both end, the fault is
+  counted once and nothing more leaves the endpoint; in the window before
+  quinn notices Down, sends and connects put nothing on the wire; a panic
+  during a handshake (write readiness, send, receive) ends it; a panic
   through quinn's endpoint driver still aborts (pinned); a driver ended by
   an injected receive error turns Down,
   counts once, attributes its connections' errors to EndpointDown,

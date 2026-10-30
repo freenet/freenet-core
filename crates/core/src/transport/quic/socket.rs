@@ -10,14 +10,20 @@
 //! it unwinds into quinn (where it would poison that lock), and reported
 //! ([`EndpointHealth::adapter_panicked`]): the endpoint goes `Down`. The call
 //! then returns an I/O error, which ends the quinn driver that made it
-//! without looping, and every later receive returns one too; the endpoint
-//! driver is woken for that receive, so it ends promptly. See `super::liveness` for what is and is
-//! not contained.
+//! without looping. Every later call returns one too (one atomic load,
+//! before the adapter's own code runs), so a fault that lasts is hit once
+//! per endpoint, and the endpoint driver is woken for its next receive, so
+//! it ends promptly. See `super::liveness` for what is and is not
+//! contained.
 //!
-//! `try_send` and `poll_writable` deliberately do NOT short-circuit once the
-//! flag is set: connections whose drivers are healthy still have to send
-//! their CONNECTION_CLOSE. A fault that lasts is then hit once per live
-//! connection (each hit ends that connection's driver), which is bounded.
+//! Sends fail too, so the endpoint's other connections do not send their
+//! CONNECTION_CLOSE: their peers learn of the end only from their own idle
+//! timeout. Sending it would not work anyway: once the endpoint driver
+//! ends, quinn's `EndpointDriver::drop` drops each connection's event
+//! channel, and a connection driver that sees that ends with
+//! INTERNAL_ERROR before it transmits (quinn 0.11.12,
+//! `ConnectionDriver::poll`), which is what usually happens first. Pinned
+//! by `an_adapter_panic_ends_every_connection_and_counts_once`.
 //!
 //! The catches use `AssertUnwindSafe`: the state a panic can interrupt here
 //! (the demux socket, its egress cap and allow-set) is shared with the UDP
@@ -379,8 +385,13 @@ impl<S: Socket> AsyncUdpSocket for QuicSocket<S> {
     /// socket's send buffer is full (the cap's bytes are given back). Every
     /// other error is counted and reported to quinn as sent, because quinn's
     /// connection driver stops the connection on a send error; a datagram
-    /// lost here is retransmitted like one lost on the path.
+    /// lost here is retransmitted like one lost on the path. The exception
+    /// is a panic, caught here, and every send after one: those return the
+    /// error, to end the driver (see the module docs).
     fn try_send(&self, transmit: &Transmit) -> io::Result<()> {
+        if self.health.has_adapter_panicked() {
+            return Err(adapter_panicked_error());
+        }
         self.caught("socket send", || self.send_one(transmit))
     }
 
@@ -411,10 +422,14 @@ impl<S: Socket> AsyncUdpSocket for QuicSocket<S> {
         {
             panic!("injected panic in the QUIC endpoint driver, unwinding through quinn");
         }
+        // Register before reading the flag: a panic caught on another
+        // thread between the two then wakes this waker, so the driver comes
+        // back and sees the flag. (Not testable deterministically: the tests
+        // run on one thread.)
+        self.receive_waker.register(cx.waker());
         if self.health.has_adapter_panicked() {
             return Poll::Ready(Err(adapter_panicked_error()));
         }
-        self.receive_waker.register(cx.waker());
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.receive_one(cx, bufs, meta)
         })) {
@@ -594,10 +609,14 @@ impl<S: Socket> UdpPoller for QuicPoller<S> {
     /// A panic is caught and returned as an I/O error, which ends the
     /// connection's driver (see the module docs). Never `Ready(Ok)`: quinn
     /// would then try to send, and a fault that persists would be hit on
-    /// every transmit.
+    /// every transmit. Once the adapter caught a panic, every poll returns
+    /// the error without running the adapter's code.
     fn poll_writable(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         let socket = this.socket.clone();
+        if socket.health.has_adapter_panicked() {
+            return Poll::Ready(Err(adapter_panicked_error()));
+        }
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| this.poll_ready(cx))) {
             Ok(polled) => polled,
             Err(payload) => {
