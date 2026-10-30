@@ -3342,6 +3342,25 @@ async fn an_inbound_connection_learns_its_key_at_promotion_not_from_its_request(
     assert_eq!(transport_keys(addr).await, vec![peer]);
 }
 
+/// A ConnectPeer for a connection with no identity promotes it and then
+/// binds the named key; the transport is given the key once bound, and
+/// nothing is counted as a mismatch.
+#[tokio::test]
+async fn a_connect_peer_on_an_unbound_connection_gives_its_transport_the_key() {
+    let mut h = Harness::new("transport-key-connect-peer-unbound").await;
+    let addr: SocketAddr = "203.0.113.217:6108".parse().unwrap();
+    h.watch(&[addr]);
+    let peer = key();
+
+    h.accept(addr).await;
+    assert_eq!(transport_keys(addr).await, vec![], "premise: unbound");
+    h.connect_peer(PeerKeyLocation::new(peer.clone(), addr))
+        .await;
+    assert_eq!(h.ring_key_at(addr).as_ref(), Some(&peer));
+    assert_eq!(transport_keys(addr).await, vec![peer]);
+    assert_eq!(seen(addr), vec![ConnIdentity::SetConnectPeer]);
+}
+
 /// A matched expected-inbound claim held back by a dial of the same key
 /// gives its transport no key while it waits, and the key once it is bound
 /// and promoted after the dial closes.

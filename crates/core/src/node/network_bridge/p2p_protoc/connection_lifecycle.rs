@@ -86,8 +86,12 @@ impl PendingClaimRetry {
 /// connection into the ring.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Promotion {
-    /// The ring took the connection, or already held it.
-    InRing,
+    /// The ring took the connection now. The caller gives the connection's
+    /// transport its key once the connection is bound to it
+    /// (`P2pConnManager::tell_transport_peer_identity`).
+    Promoted,
+    /// The ring already held the connection.
+    AlreadyInRing,
     /// The connection is not in the ring: the ring is at its cap, or the
     /// connection has no identity to promote it under.
     Refused,
@@ -198,6 +202,9 @@ impl P2pConnManager {
         } else {
             None
         };
+        if promotion == Some(Promotion::Promoted) {
+            self.tell_transport_peer_identity(claimant, key);
+        }
         tracing::info!(
             %claimant,
             pub_key = %key,
@@ -549,8 +556,11 @@ impl P2pConnManager {
     /// when `promoted` is not that key, or none is bound, nothing is sent and
     /// the mismatch is counted (`promotion_key_mismatch`).
     ///
-    /// Called only where a connection enters the ring, so a connection's
-    /// transport learns a key only at promotion. Does not wait: a full
+    /// Called only where a connection enters the ring (after
+    /// `handle_successful_connection` adds it, and when
+    /// `promote_existing_connection` returns `Promotion::Promoted`, once the
+    /// connection is bound), so a connection's transport learns a key only
+    /// at promotion. Does not wait: a full
     /// channel to the connection's task moves the send to a short task (see
     /// [`notify_connection_task`]).
     fn tell_transport_peer_identity(&self, addr: SocketAddr, promoted: &TransportPublicKey) {
@@ -675,7 +685,6 @@ impl P2pConnManager {
             {
                 return Promotion::Refused;
             }
-            self.tell_transport_peer_identity(peer_addr, &key);
 
             // Update the dashboard/network_status with the peer's location.
             // Without this, peers promoted via this path show no location on the
@@ -719,9 +728,10 @@ impl P2pConnManager {
             if just_became_ready {
                 self.handle_broadcast_ready_state(true).await;
             }
+            return Promotion::Promoted;
         }
 
-        Promotion::InRing
+        Promotion::AlreadyInRing
     }
 
     // `origin` is telemetry carried alongside the dial; bundling it with the
@@ -838,11 +848,12 @@ impl P2pConnManager {
             );
             let refused = match &check {
                 BindOutcome::Bound | BindOutcome::Same => {
-                    if self
+                    let promotion = self
                         .promote_existing_connection(peer_addr, peer.pub_key(), Some(tx))
-                        .await
-                        == Promotion::InRing
-                    {
+                        .await;
+                    if promotion == Promotion::Refused {
+                        true
+                    } else {
                         let outcome = self.bind_identity(
                             peer_addr,
                             peer.pub_key(),
@@ -852,9 +863,12 @@ impl P2pConnManager {
                         if let Some(kind) = identity_kind(&outcome, CONNECT_PEER_KINDS) {
                             TRANSPORT_METRICS.record_conn_identity(peer_addr, kind);
                         }
+                        // After the bind: a connection without an identity is
+                        // bound only once the ring has taken it.
+                        if promotion == Promotion::Promoted {
+                            self.tell_transport_peer_identity(peer_addr, peer.pub_key());
+                        }
                         false
-                    } else {
-                        true
                     }
                 }
                 BindOutcome::Mismatch(_)
