@@ -716,7 +716,8 @@ fn the_first_offer_waits_for_its_delay() {
 fn each_stage_times_out_at_its_deadline() {
     let accept = |attempt| Event::Upgrade(UpgradeControl::Accept { attempt });
     let established = |attempt| Event::PathEstablished { attempt };
-    let cases: Vec<(Role, Vec<fn(u32) -> Event>, Duration)> = vec![
+    type Stage = fn(u32) -> Event;
+    let cases: Vec<(Role, Vec<Stage>, Duration)> = vec![
         (Role::Server, vec![], OFFER_TIMEOUT),
         (Role::Server, vec![accept], CONNECT_TIMEOUT),
         (Role::Server, vec![accept, established], CONFIRM_TIMEOUT),
