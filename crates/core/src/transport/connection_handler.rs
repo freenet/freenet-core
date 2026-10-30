@@ -5275,7 +5275,9 @@ pub mod mock_transport {
     /// `nat_traversal_ack_racer_learns_version_from_the_ack`) A never parses an
     /// intro and completes on B's ack, while B completes by answering A's intro
     /// (`RemoteInbound`). Asserts each side's arm, then returns each side's
-    /// `(bandwidth_limit, pacing_capacity)`.
+    /// `(bandwidth_limit, pacing_capacity)`. Test-only: this module also builds
+    /// under the `bench` feature, where those accessors do not exist.
+    #[cfg(test)]
     async fn hole_punch_with_limits(
         a_limit: usize,
         b_limit: usize,
