@@ -327,3 +327,90 @@ fn quic_path_state_is_declared_before_the_budget() {
     };
     assert!(at("quic_path") < at("inbound_budget"));
 }
+
+/// A routed attempt becomes a path in shadow mode: the handshake finishes in a task,
+/// `Ready` goes out on it, and a data frame from the peer is refused, so nothing
+/// reaches the channels and the budget is not charged.
+#[test]
+fn a_routed_attempt_becomes_a_shadow_path() {
+    use crate::transport::quic::control::QuicControl;
+    use crate::transport::quic::path::QuicInboundOutcome;
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let h = Harness::server("quic-driver-path", 6).await;
+        let (session, mut inbox) = h.session();
+        session.promote(h.peer.clone());
+        h.set_now(Duration::from_nanos(session.deadline_nanos().unwrap()));
+        let sends = session.take(Event::Tick);
+        let [UdpSend::Offer { attempt, .. }] = sends[..] else {
+            panic!("{sends:?}");
+        };
+        let local_is_a = h.pair.a_keys.public() > h.pair.b_keys.public();
+        let (ours, theirs, our_addr, our_key) = if local_is_a {
+            (&h.pair.a, &h.pair.b, h.pair.a_addr, h.pair.a_keys.public())
+        } else {
+            (&h.pair.b, &h.pair.a, h.pair.b_addr, h.pair.b_keys.public())
+        };
+        let (ours, theirs, our_key) = (ours.clone(), theirs.clone(), our_key.clone());
+        let time = h.pair.time.clone();
+        let hub = Arc::clone(&h.hub);
+        let session_for_task = Arc::clone(&session);
+        let (peer_path, mut peer_inbound, refused, charged) =
+            drive(&h.pair.time, Duration::from_secs(60), async move {
+                let client = tokio::spawn(async move { theirs.connect(our_addr, &our_key).await });
+                hub.route(ours.accept().await.expect("an attempt"));
+                // The routed attempt, then its finished handshake.
+                while session_for_task
+                    .state
+                    .lock()
+                    .attempt
+                    .as_ref()
+                    .is_none_or(|held| held.path.is_none())
+                {
+                    let event = inbox.recv().await.expect("the session lives");
+                    assert!(session_for_task.handle(event).is_empty());
+                }
+                let client = client.await.unwrap().expect("client handshake");
+                let (peer_path, peer_inbound) = QuicPath::new(client, time.clone());
+                // Acked or stopped, it does not matter: a sent message is not
+                // a delivered one.
+                let _outcome = peer_path
+                    .send_short_bounded(&time, Duration::from_secs(5), b"data")
+                    .await;
+                time.sleep(Duration::from_secs(1)).await;
+                let state = session_for_task.state.lock();
+                let live = state.attempt.as_ref().unwrap().path.as_ref().unwrap();
+                let refused = live
+                    .path
+                    .stats()
+                    .count(QuicInboundOutcome::RefusedNotAcceptingData);
+                assert_eq!(live._shorts.len(), 0);
+                let charged = session_for_task.budget.lock().stream_count();
+                drop(state);
+                (peer_path, peer_inbound, refused, charged)
+            })
+            .await;
+        assert_eq!(refused, 1, "the data frame is refused, and counted");
+        assert_eq!(charged, 0, "and not charged");
+        let payload = peer_inbound.controls.try_recv().expect("Ready arrived");
+        assert_eq!(
+            peer_path.decode_control(&payload),
+            Ok(QuicControl::Ready {
+                attempt,
+                caps: crate::transport::quic::control::caps::KNOWN,
+            })
+        );
+    });
+}
+
+/// A session's path charges its connection's budget, so the peer has one allowance
+/// across UDP and QUIC.
+#[test]
+fn a_session_is_opened_on_the_connections_budget() {
+    let source = include_str!("../../../peer_connection.rs");
+    let (_, rest) = source
+        .split_once("    pub(super) fn with_upgrade_site(")
+        .expect("the function");
+    let (body, _) = rest.split_once("\n    }\n").expect("its end");
+    assert!(body.contains("self.inbound_budget.clone(),"), "{body}");
+}
