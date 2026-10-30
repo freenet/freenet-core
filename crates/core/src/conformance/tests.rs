@@ -2735,7 +2735,7 @@ fn a_corpus_of_steps_alone_is_not_empty() {
 /// one contract's step history crowd the interleave and decide which laws the case
 /// budget reaches — the thing the interleave exists to prevent.
 ///
-/// Strided, not truncated, for the same reason `paired_states` strides: steps arrive
+/// Strided, not truncated, for the same reason the state sample strides: steps arrive
 /// in time order, so the first N are all from the same few minutes.
 #[test]
 fn the_transition_branch_is_bounded_and_strided() {
@@ -2754,11 +2754,11 @@ fn the_transition_branch_is_bounded_and_strided() {
     // Strided over the whole history rather than the first four.
     //
     // The four selected steps are spread across the range, not the first four, and
-    // the last is the newest step (39), not the stride's 30 (#5705). Truncation
-    // would give `[0, 1, 2, 3]` and check a contract only against its own oldest few
-    // minutes.
+    // include the newest step (39), not the stride's 30 (#5705). They are queued
+    // newest first (#6053). Truncation would give `[0, 1, 2, 3]` and check a
+    // contract only against its own oldest few minutes.
     let bases: Vec<u8> = cases.iter().map(|c| c.states[0][0]).collect();
-    assert_eq!(bases, vec![0, 10, 20, 39]);
+    assert_eq!(bases, vec![39, 20, 10, 0]);
     assert_ne!(
         bases,
         vec![0, 1, 2, 3],
@@ -4392,6 +4392,449 @@ fn a_size_tie_keeps_the_later_largest_state() {
         .collect();
     assert!(picked.contains(&Bytes::from(states[14].clone())));
     assert!(!picked.contains(&Bytes::from(states[9].clone())));
+}
+
+/// The budget cuts older cases first (#6053): every property queues the cases
+/// of the last-supplied and the largest state ahead of the rest, so a budget
+/// smaller than the queue still runs them. Orientation is unchanged: every pair is
+/// still `(earlier, later)`.
+#[test]
+fn a_tight_budget_runs_the_newest_and_largest_pairs_first() {
+    let mut states: Vec<Vec<u8>> = (0..10u8).map(|i| vec![i]).collect();
+    states[3] = vec![3; 8];
+    let index = |s: &Bytes| {
+        states
+            .iter()
+            .position(|x| x.as_slice() == s.as_ref())
+            .unwrap()
+    };
+    let config = GeneratorConfig {
+        properties: vec![ConformanceProperty::StateCommutativity],
+        // The newest state's 9 pairs plus the largest state's other 8, out of 45.
+        max_cases: 17,
+        ..Default::default()
+    };
+    let generated = generate_cases_counted(&Corpus::from_states(states.clone()), &config);
+    assert_eq!(generated.budget_cut_total(), 45 - 17);
+    let with = |i: usize| {
+        generated
+            .cases
+            .iter()
+            .filter(|c| c.states.iter().any(|s| index(s) == i))
+            .count()
+    };
+    assert_eq!(with(9), 9, "every pair with the newest state must run");
+    assert_eq!(with(3), 9, "every pair with the largest state must run");
+    for c in &generated.cases {
+        assert!(
+            index(&c.states[0]) < index(&c.states[1]),
+            "pairs must stay (earlier, later)"
+        );
+    }
+}
+
+/// The last-supplied transition is queued first.
+#[test]
+fn a_tight_budget_runs_the_last_transition_first() {
+    let corpus = Corpus {
+        transitions: (0..5u8).map(|i| (bytes(&[i]), bytes(&[i, 1]))).collect(),
+        ..Corpus::from_states(vec![vec![1]])
+    };
+    let config = GeneratorConfig {
+        properties: vec![ConformanceProperty::TransitionPathAgreement],
+        max_cases: 1,
+        ..Default::default()
+    };
+    let cases = generate_cases_counted(&corpus, &config).cases;
+    assert_eq!(cases.len(), 1);
+    assert_eq!(cases[0].states[0], bytes(&[4]));
+}
+
+/// Delta laws queue the newest state first and, for it, the newest delta first.
+#[test]
+fn a_tight_budget_runs_the_newest_state_and_delta_first() {
+    let corpus = Corpus {
+        deltas: vec![bytes(&[50]), bytes(&[51]), bytes(&[52])],
+        ..Corpus::from_states(vec![vec![1], vec![2], vec![3]])
+    };
+    let config = GeneratorConfig {
+        properties: vec![ConformanceProperty::DeltaIdempotence],
+        max_cases: 1,
+        ..Default::default()
+    };
+    let cases = generate_cases_counted(&corpus, &config).cases;
+    assert_eq!(cases.len(), 1);
+    assert_eq!(cases[0].states, vec![bytes(&[3])]);
+    assert_eq!(cases[0].deltas, vec![bytes(&[52])]);
+}
+
+/// Associativity queues triples containing the newest state first; element order
+/// within a triple follows the existing `(i, j, (i + j + 1 + seed) % n)` rule, under
+/// which the newest state can only be the third element.
+#[test]
+fn a_tight_budget_runs_triples_with_the_newest_state_first() {
+    let states: Vec<Vec<u8>> = (0..10u8).map(|i| vec![i]).collect();
+    let config = GeneratorConfig {
+        properties: vec![ConformanceProperty::StateAssociativity],
+        max_cases: 3,
+        ..Default::default()
+    };
+    let cases = generate_cases_counted(&Corpus::from_states(states), &config).cases;
+    assert_eq!(cases.len(), 3);
+    for c in &cases {
+        assert!(c.states.contains(&bytes(&[9])), "{:?}", c.states);
+        let k = (c.states[0][0] as usize + c.states[1][0] as usize + 1) % 10;
+        assert_eq!(
+            c.states[2][0] as usize, k,
+            "the element order rule must hold"
+        );
+    }
+}
+
+/// The work done tracks the case budget, not the size of the queue: with a large
+/// state sample, building every pair up front would be quadratic in the sample.
+/// The counts of cut cases stay exact.
+#[test]
+fn a_large_sample_builds_only_the_cases_that_run() {
+    use super::generator::CASES_BUILT;
+    let states: Vec<Vec<u8>> = (0..200u32).map(|i| i.to_be_bytes().to_vec()).collect();
+    let config = GeneratorConfig {
+        properties: vec![ConformanceProperty::StateCommutativity],
+        max_states_paired: 200,
+        max_cases: 10,
+        ..Default::default()
+    };
+    CASES_BUILT.with(|n| n.set(0));
+    let generated = generate_cases_counted(&Corpus::from_states(states), &config);
+    let built = CASES_BUILT.with(|n| n.get());
+    assert_eq!(generated.cases.len(), 10);
+    assert_eq!(generated.budget_cut_total(), 200 * 199 / 2 - 10);
+    assert_eq!(built, 10, "only the cases that run may be constructed");
+}
+
+/// Every distinct triple the `(i, j, (i + j + 1 + seed) % n)` rule yields over `n`
+/// states, by brute force: an enumeration independent of the generator's own count.
+fn rule_triples(n: usize, seed: usize) -> std::collections::HashSet<[usize; 3]> {
+    let mut out = std::collections::HashSet::new();
+    for i in 0..n {
+        for j in 0..n {
+            let k = (i + j + 1 + seed) % n;
+            if i != j && k != i && k != j {
+                out.insert([i, j, k]);
+            }
+        }
+    }
+    out
+}
+
+/// Cases the samplers and the associativity cap never build are counted per
+/// property: what the property would have had over the whole corpus, minus what it
+/// was offered.
+#[test]
+fn cases_left_out_by_sampling_are_counted_per_property() {
+    use ConformanceProperty::*;
+    // 30 states and 30 transitions against caps of 24; two summaries; three deltas
+    // with no recorded base, so no delta pairs.
+    let corpus = Corpus {
+        summaries: vec![bytes(&[200]), bytes(&[201])],
+        deltas: vec![bytes(&[100]), bytes(&[101]), bytes(&[102])],
+        transitions: (0..30u8).map(|i| (bytes(&[i]), bytes(&[i, 1]))).collect(),
+        ..Corpus::from_states((0..30u8).map(|i| vec![i]).collect())
+    };
+    let config = GeneratorConfig {
+        max_cases: usize::MAX,
+        ..Default::default()
+    };
+    let generated = generate_cases_counted(&corpus, &config);
+    let count = |p| {
+        generated
+            .not_sampled
+            .iter()
+            .find(|(q, _)| *q == p)
+            .unwrap()
+            .1
+    };
+    assert_eq!(count(StateIdempotence), 30 - 24);
+    assert_eq!(count(StateCommutativity), 30 * 29 / 2 - 24 * 23 / 2);
+    assert_eq!(count(DeltaDeterminism), (30 - 24) * (1 + 2));
+    assert_eq!(count(DeltaIdempotence), (30 - 24) * 3);
+    assert_eq!(count(DeltaPermutationInvariance), 0);
+    assert_eq!(count(TransitionPathAgreement), 30 - 24);
+    // Every triple the associativity rule can yield over all 30 states, counted by
+    // brute force, minus the `2n` the capped walk over the 24-state sample offers.
+    assert_eq!(
+        count(StateAssociativity),
+        rule_triples(30, 0).len() - 2 * 24
+    );
+    // Nothing else was skipped here, so the run and unsampled pairs make up the
+    // corpus's pairs.
+    let ran = generated
+        .cases
+        .iter()
+        .filter(|c| c.property == StateCommutativity)
+        .count();
+    assert_eq!(ran + count(StateCommutativity), 30 * 29 / 2);
+}
+
+/// After the last-supplied and the largest state, the rest are queued newest first.
+#[test]
+fn the_remaining_states_are_queued_newest_first() {
+    // Equal sizes, so the largest is the last-supplied one (ties go to the later).
+    let states: Vec<Vec<u8>> = (0..10u8).map(|i| vec![i]).collect();
+    let config = GeneratorConfig {
+        properties: vec![ConformanceProperty::StateIdempotence],
+        max_cases: 3,
+        ..Default::default()
+    };
+    let cases = generate_cases_counted(&Corpus::from_states(states), &config).cases;
+    let order: Vec<u8> = cases.iter().map(|c| c.states[0][0]).collect();
+    assert_eq!(order, vec![9, 8, 7]);
+}
+
+/// The last-supplied state is queued before the largest when they differ, so a
+/// budget that ends inside the first state's queue runs only its cases.
+#[test]
+fn the_last_supplied_state_is_queued_before_the_largest() {
+    let mut states: Vec<Vec<u8>> = (0..10u8).map(|i| vec![i]).collect();
+    states[3] = vec![3; 8];
+    let newest = bytes(&[9]);
+    let config = GeneratorConfig {
+        properties: vec![ConformanceProperty::StateCommutativity],
+        // Inside the newest state's 9 pairs.
+        max_cases: 5,
+        ..Default::default()
+    };
+    let cases = generate_cases_counted(&Corpus::from_states(states), &config).cases;
+    assert_eq!(cases.len(), 5);
+    for c in &cases {
+        assert!(c.states.contains(&newest), "{:?}", c.states);
+    }
+}
+
+/// Uncapped, the triple walk yields exactly the triples the rule allows, once each,
+/// for any seed and any queue order; capped, the leading state appears in every
+/// slot the rule lets it hold.
+#[test]
+fn the_triple_walk_yields_the_rule_and_respects_the_queue() {
+    use super::generator::triple_walk;
+    for n in 3..=12usize {
+        // Newest first, oldest first, and a scrambled order.
+        let mut scrambled: Vec<usize> = (0..n).collect();
+        scrambled.sort_by_key(|&i| ((i * 7 + 3) % n, i));
+        let orders = [(0..n).rev().collect(), (0..n).collect(), scrambled];
+        for seed in 0..(2 * n as u64) {
+            for priority in &orders {
+                let walked = triple_walk(priority, seed, usize::MAX);
+                let set: std::collections::HashSet<[usize; 3]> = walked.iter().copied().collect();
+                assert_eq!(
+                    set.len(),
+                    walked.len(),
+                    "n={n} seed={seed}: a triple repeated"
+                );
+                assert_eq!(set, rule_triples(n, seed as usize), "n={n} seed={seed}");
+            }
+        }
+    }
+    // With a non-zero seed the newest state can hold every slot, and the capped
+    // walk leads with triples containing it, in each of those slots.
+    let n = 10;
+    let priority: Vec<usize> = (0..n).rev().collect();
+    let led = triple_walk(&priority, 1, 2 * n);
+    let newest = n - 1;
+    let led_by_newest: Vec<_> = led.iter().take_while(|t| t.contains(&newest)).collect();
+    for slot in 0..3 {
+        assert!(
+            led_by_newest.iter().any(|t| t[slot] == newest),
+            "slot {slot}: {led_by_newest:?}"
+        );
+    }
+}
+
+/// `delta_determinism` takes the newest summary first.
+#[test]
+fn delta_determinism_takes_the_newest_summary_first() {
+    let corpus = Corpus {
+        summaries: vec![bytes(&[200]), bytes(&[201]), bytes(&[202])],
+        ..Corpus::from_states(vec![vec![1], vec![2]])
+    };
+    let config = GeneratorConfig {
+        properties: vec![ConformanceProperty::DeltaDeterminism],
+        max_cases: 2,
+        ..Default::default()
+    };
+    let cases = generate_cases_counted(&corpus, &config).cases;
+    assert_eq!(cases[0].states, vec![bytes(&[2])]);
+    assert_eq!(cases[0].summary, None);
+    assert_eq!(cases[1].summary, Some(bytes(&[202])));
+}
+
+/// Delta pairs are queued newest first, and each keeps the order its deltas were
+/// observed in.
+#[test]
+fn delta_pairs_are_queued_newest_first_in_observed_order() {
+    let base = bytes(&[0xb0]);
+    let corpus = Corpus {
+        deltas: (0..4u8).map(|i| bytes(&[i])).collect(),
+        delta_bases: (0..4).map(|_| Some(base.clone())).collect(),
+        ..Corpus::from_states(vec![vec![1]])
+    };
+    let config = GeneratorConfig {
+        properties: vec![ConformanceProperty::DeltaPermutationInvariance],
+        max_cases: usize::MAX,
+        ..Default::default()
+    };
+    let pairs: Vec<Vec<u8>> = generate_cases_counted(&corpus, &config)
+        .cases
+        .iter()
+        .map(|c| c.deltas.iter().map(|d| d[0]).collect())
+        .collect();
+    assert_eq!(
+        pairs,
+        vec![
+            vec![2, 3],
+            vec![1, 3],
+            vec![0, 3],
+            vec![1, 2],
+            vec![0, 2],
+            vec![0, 1]
+        ]
+    );
+}
+
+/// Every case a property was offered counts against `not_sampled`, whether it ran,
+/// was too large, or was cut by the budget: with no sampling and no triple cap,
+/// nothing is left out.
+#[test]
+fn not_sampled_subtracts_size_and_budget_skips() {
+    let corpus = Corpus::from_states(vec![vec![1], vec![2], vec![3], vec![4], vec![9; 64]]);
+    let config = GeneratorConfig {
+        properties: vec![ConformanceProperty::StateCommutativity],
+        max_case_bytes: 16,
+        max_cases: 2,
+        ..Default::default()
+    };
+    let generated = generate_cases_counted(&corpus, &config);
+    // 10 pairs: 4 with the large state are over the limit, 2 run, 4 are cut.
+    assert_eq!(generated.oversized_total(), 4);
+    assert_eq!(generated.budget_cut_total(), 4);
+    assert_eq!(generated.not_sampled_total(), 0);
+}
+
+/// Oversized triples must not use up the associativity cap. They head the queue when
+/// the last-supplied and largest states are the big ones, so counting them against
+/// the cap would leave the law with no case at all.
+#[test]
+fn oversized_triples_do_not_consume_the_associativity_cap() {
+    use ConformanceProperty::StateAssociativity;
+    // 24 states, the last two far over the limit.
+    let mut states: Vec<Vec<u8>> = (0..22u8).map(|i| vec![i]).collect();
+    states.push(vec![22; 64]);
+    states.push(vec![23; 64]);
+    let n = states.len();
+    let config = GeneratorConfig {
+        properties: vec![StateAssociativity],
+        max_case_bytes: 16,
+        ..Default::default()
+    };
+    let generated = generate_cases_counted(&Corpus::from_states(states), &config);
+    assert_eq!(
+        generated.cases.len(),
+        2 * n,
+        "the law must run its full cap"
+    );
+    // `not_sampled` is defined by subtraction, so this sum cannot catch a miscount
+    // between it and `oversized`; it pins that the two do not exceed the total.
+    assert!(generated.oversized_total() > 0);
+    assert_eq!(generated.budget_cut_total(), 0);
+    assert_eq!(
+        generated.cases.len() + generated.oversized_total() + generated.not_sampled_total(),
+        rule_triples(n, 0).len()
+    );
+}
+
+/// When every triple is over the limit, the walk ends at the reachable total and
+/// counts them all.
+#[test]
+fn an_all_oversized_associativity_walk_is_bounded_and_counted() {
+    use ConformanceProperty::StateAssociativity;
+    let states: Vec<Vec<u8>> = (0..10u8).map(|i| vec![i; 64]).collect();
+    let config = GeneratorConfig {
+        properties: vec![StateAssociativity],
+        max_case_bytes: 16,
+        ..Default::default()
+    };
+    let generated = generate_cases_counted(&Corpus::from_states(states), &config);
+    assert!(generated.cases.is_empty());
+    assert_eq!(generated.oversized_total(), rule_triples(10, 0).len());
+    assert_eq!(generated.not_sampled_total(), 0);
+}
+
+/// A triple exactly at the size limit fits: it runs and it counts toward the cap.
+/// The walk's size check and the filter's must agree on the boundary.
+#[test]
+fn a_triple_exactly_at_the_limit_runs_and_counts_toward_the_cap() {
+    use ConformanceProperty::StateAssociativity;
+    // Six states of 5 bytes, so every triple is exactly 15. 20 are reachable, and
+    // the cap is 12.
+    let states: Vec<Vec<u8>> = (0..6u8).map(|i| vec![i; 5]).collect();
+    let corpus = Corpus::from_states(states);
+    let at_limit = GeneratorConfig {
+        properties: vec![StateAssociativity],
+        max_case_bytes: 15,
+        ..Default::default()
+    };
+    let generated = generate_cases_counted(&corpus, &at_limit);
+    assert_eq!(generated.cases.len(), 12);
+    assert_eq!(generated.oversized_total(), 0);
+    assert_eq!(generated.not_sampled_total(), 20 - 12);
+
+    let below = GeneratorConfig {
+        max_case_bytes: 14,
+        ..at_limit
+    };
+    let generated = generate_cases_counted(&corpus, &below);
+    assert!(generated.cases.is_empty());
+    assert_eq!(generated.oversized_total(), 20);
+}
+
+/// Every queue follows the priority order when the largest state is not the newest:
+/// the last-supplied state, then the largest, then the rest newest first.
+#[test]
+fn every_queue_puts_the_largest_state_second() {
+    use ConformanceProperty::{
+        DeltaDeterminism, DeltaIdempotence, StateAssociativity, StateIdempotence,
+    };
+    let mut states: Vec<Vec<u8>> = (0..10u8).map(|i| vec![i]).collect();
+    states[3] = vec![3; 8];
+    let corpus = Corpus {
+        deltas: vec![bytes(&[100])],
+        ..Corpus::from_states(states)
+    };
+    let run = |property, max_cases| {
+        let config = GeneratorConfig {
+            properties: vec![property],
+            max_cases,
+            ..Default::default()
+        };
+        generate_cases_counted(&corpus, &config).cases
+    };
+    let first_bytes = |cases: Vec<super::verifier::ConformanceCase>| -> Vec<u8> {
+        cases.iter().map(|c| c.states[0][0]).collect()
+    };
+    assert_eq!(first_bytes(run(StateIdempotence, 3)), vec![9, 3, 8]);
+    assert_eq!(first_bytes(run(DeltaIdempotence, 3)), vec![9, 3, 8]);
+    assert_eq!(first_bytes(run(DeltaDeterminism, 3)), vec![9, 3, 8]);
+    // At seed 0 the newest state is in 8 triples, all queued first; the largest
+    // state's come next, and they do not contain the newest.
+    let triples = run(StateAssociativity, 9);
+    let holds =
+        |c: &super::verifier::ConformanceCase, state: u8| c.states.iter().any(|s| s[0] == state);
+    assert_eq!(triples.len(), 9);
+    assert!(triples[..8].iter().all(|c| holds(c, 9)), "{triples:?}");
+    assert!(
+        holds(&triples[8], 3) && !holds(&triples[8], 9),
+        "{triples:?}"
+    );
 }
 
 /// Both counts at once: the size limit drops some cases and the budget cuts some

@@ -124,14 +124,28 @@ pub struct ConformanceConfig {
     ///
     /// Skipped cases never run, so a property can hold on the cases that ran
     /// while the cases that would break it were skipped. The report counts the
-    /// cases skipped for size and for the case budget per property; cases left
-    /// out by state sampling are reported only as states sampled of total.
+    /// cases skipped for size and for the case budget per property, and the
+    /// cases sampling never built.
     /// Skipped cases do not change the exit code, unless every case was skipped,
     /// which exits non-zero. Raise this to check a contract at its size ceiling:
     /// a merge that is wrong only for a full-size state is invisible below it.
-    /// Has no effect with `--evidence`, which re-checks one shipped case.
+    /// Raising it is not purely additive for `state_associativity`: its cap then
+    /// fills with triples containing the big states, so triples of small states that
+    /// ran before may no longer run. Has no effect with `--evidence`, which
+    /// re-checks one shipped case.
     #[arg(long)]
     pub(crate) max_case_bytes: Option<usize>,
+
+    /// How many states the state-based laws sample from a larger corpus, from 3
+    /// to 1000. Defaults to the generator's own default. The last-supplied and the
+    /// largest state are always sampled.
+    ///
+    /// Only the cases that run are built, but every pair of the sample is still
+    /// walked to keep the skip counts exact, so generation time is quadratic in
+    /// this value, and linear in the number of delta pairs. More pairs also compete
+    /// for the same `--max-cases` budget.
+    #[arg(long, value_parser = parse_max_states_paired)]
+    pub(crate) max_states_paired: Option<usize>,
 
     /// Restrict which laws to check, by name (e.g. `state_commutativity`).
     /// Repeat for multiple. Defaults to every property.
@@ -323,6 +337,9 @@ fn generator_config(
     if let Some(max_case_bytes) = config.max_case_bytes {
         generator_config.max_case_bytes = max_case_bytes;
     }
+    if let Some(max_states_paired) = config.max_states_paired {
+        generator_config.max_states_paired = max_states_paired;
+    }
     if !properties.is_empty() {
         generator_config.properties = properties;
     }
@@ -359,10 +376,19 @@ fn no_cases_message(
         return message;
     }
     message.push_str(&format!(
-        ". {skipped} case(s) were built and every one was skipped because its \
+        ". {skipped} case(s) were considered and every one was skipped because its \
          inputs exceeded --max-case-bytes ({max_case_bytes} bytes); raise \
          --max-case-bytes to check them."
     ));
+    if oversized
+        .iter()
+        .any(|(p, n)| *p == ConformanceProperty::StateAssociativity && *n > 0)
+    {
+        message.push_str(
+            " For state_associativity that count is the triples over the limit among \
+             those walked; at most two per sampled state can run.",
+        );
+    }
     if lacked_inputs {
         message.push_str(&format!(
             " The properties with no case at all need more inputs: {advice}"
@@ -546,6 +572,24 @@ fn exit_code<'a>(outcomes: impl IntoIterator<Item = &'a PropertyOutcome>) -> i32
         1
     } else {
         0
+    }
+}
+
+/// Upper bound on `--max-states-paired`. Generation walks every pair of the sample,
+/// so its cost is quadratic in it, and linear in the number of delta pairs. With
+/// every law and 8 deltas (28 delta pairs), generation took about 0.8 s at 1000 in a
+/// debug build (2026-10-30), 1.4 s when every case was over the size limit, and about
+/// 3 s at 2000.
+const MAX_STATES_PAIRED_LIMIT: usize = 1000;
+
+fn parse_max_states_paired(value: &str) -> Result<usize, String> {
+    let n: usize = value.parse().map_err(|e| format!("{e}"))?;
+    if (3..=MAX_STATES_PAIRED_LIMIT).contains(&n) {
+        Ok(n)
+    } else {
+        // Below 3 no triple can be built, so associativity would have no case and
+        // the report would blame the corpus.
+        Err(format!("must be from 3 to {MAX_STATES_PAIRED_LIMIT}"))
     }
 }
 
@@ -1456,11 +1500,27 @@ struct Report {
     /// Without it a property could read as held when the cases that would have
     /// broken it were the ones skipped: a contract that is wrong only near its size
     /// cap is exactly that shape (#5705).
+    ///
+    /// For associativity this is the triples over the limit among those walked, at
+    /// most `2n` of which could run with a higher limit. Raising the limit is not
+    /// purely additive there: the cap then fills with triples containing the big
+    /// states, so triples of small states that ran before may no longer run.
     cases_skipped_oversized: usize,
     /// Cases within the size limit that never ran because the `--max-cases` budget
     /// ran out first. Disjoint from `cases_skipped_oversized`. Summed over
     /// `properties[].cases_skipped_budget`.
     cases_skipped_budget: usize,
+    /// Cases never built because the state or transition sample left their inputs
+    /// out, or the associativity walk stopped at its cap. Summed over
+    /// `properties[].cases_not_sampled`. Reported only: like the budget, sampling
+    /// always leaves cases out of a large corpus, so it does not change a verdict.
+    ///
+    /// Associativity has a floor no flag can clear when no triple is over the size
+    /// limit: the walk is capped at `2n` of the `(n - 1)(n - 2)` triples the rule can
+    /// yield, so its row is then at least 2 at `n = 5` and 458 at `n = 24`. Triples
+    /// over the limit are counted in `cases_skipped_oversized` instead, so they lower
+    /// this count. A `--max-cases` below `2n` lowers the cap further and adds to it.
+    cases_not_sampled: usize,
     /// The `--max-case-bytes` limit this run used, so the count above says what it
     /// is relative to.
     max_case_bytes: usize,
@@ -1509,7 +1569,8 @@ struct PropertyCoverage {
     /// when no case was skipped for size and none was inconclusive, `held_partial`
     /// when some were, since those may be the cases that break it. Cases cut by the
     /// budget are counted but do not change the verdict, since on a large corpus the
-    /// budget always cuts some. It cuts the pairs of later states first; see #6053.
+    /// budget always cuts some. It cuts the cases of states earlier in the corpus
+    /// first.
     /// Otherwise
     /// `inconclusive` if any case was built (including a property whose cases were
     /// ALL skipped, which is not a pass), or `not_checked`, meaning the corpus could
@@ -1525,6 +1586,8 @@ struct PropertyCoverage {
     inconclusive: usize,
     cases_skipped_oversized: usize,
     cases_skipped_budget: usize,
+    /// See `Report::cases_not_sampled`. Does not change the verdict.
+    cases_not_sampled: usize,
 }
 
 impl PropertyCoverage {
@@ -1538,6 +1601,7 @@ impl PropertyCoverage {
             inconclusive: 0,
             cases_skipped_oversized: 0,
             cases_skipped_budget: 0,
+            cases_not_sampled: 0,
         }
     }
 
@@ -1589,6 +1653,10 @@ fn property_coverage(
     }
     for (property, skipped) in &generated.budget_cut {
         row(&mut rows, *property).cases_skipped_budget += skipped;
+    }
+    for (property, left_out) in &generated.not_sampled {
+        let r = row(&mut rows, *property);
+        r.cases_not_sampled = r.cases_not_sampled.saturating_add(*left_out);
     }
     for (case, outcome) in outcomes {
         let r = row(&mut rows, case.property);
@@ -1817,6 +1885,7 @@ impl Report {
             cases_run: outcomes.len(),
             cases_skipped_oversized: generated.oversized_total(),
             cases_skipped_budget: generated.budget_cut_total(),
+            cases_not_sampled: generated.not_sampled_total(),
             max_case_bytes: generator.max_case_bytes,
             states_sampled: generated.states_paired,
             corpus_transitions: corpus.transitions.len(),
@@ -1872,6 +1941,19 @@ impl Report {
                 self.states_sampled, self.corpus_states
             )?;
         }
+        // One line per law that sampling or the associativity cap left cases out
+        // of. Without it, a law can read `held` with no hint that most of its
+        // reachable cases were never built. Associativity prints this from 5 states
+        // up; see `Report::cases_not_sampled`.
+        for p in self.properties.iter().filter(|p| p.cases_not_sampled > 0) {
+            writeln!(
+                out,
+                "merge check: {}: {} case(s) left out by design (state or transition \
+                 sampling, the associativity cap, or a --max-cases below it); they do \
+                 not affect the verdict",
+                p.property, p.cases_not_sampled
+            )?;
+        }
         if self.transition_law_selected && self.transitions_sampled < self.corpus_transitions {
             writeln!(
                 out,
@@ -1903,7 +1985,7 @@ impl Report {
             writeln!(
                 out,
                 "merge check: {} case(s) not run because the case budget (--max-cases) \
-                 ran out; it cuts the pairs of later states first (see freenet-core#6053)",
+                 ran out; it cuts the cases of states earlier in the corpus first",
                 self.cases_skipped_budget
             )?;
         }
@@ -1934,11 +2016,21 @@ impl Report {
                     write!(out, " \u{2014} no case run")?;
                 }
                 if p.cases_skipped_oversized > 0 {
-                    write!(
-                        out,
-                        "; {} NOT run (inputs over --max-case-bytes)",
-                        case_count(p.cases_skipped_oversized)
-                    )?;
+                    if p.property == ConformanceProperty::StateAssociativity.as_str() {
+                        write!(
+                            out,
+                            "; {} over --max-case-bytes among the triples walked, at most \
+                             {} of which can run",
+                            case_count(p.cases_skipped_oversized),
+                            2 * self.states_sampled
+                        )?;
+                    } else {
+                        write!(
+                            out,
+                            "; {} NOT run (inputs over --max-case-bytes)",
+                            case_count(p.cases_skipped_oversized)
+                        )?;
+                    }
                 }
                 if p.cases_skipped_budget > 0 {
                     write!(
@@ -2112,7 +2204,7 @@ impl Report {
                 writeln!(
                     out,
                     "({} case(s) were left out by the case budget (--max-cases), which \
-                     cuts the pairs of later states first; see freenet-core#6053.)",
+                     cuts the cases of states earlier in the corpus first.)",
                     self.cases_skipped_budget
                 )?;
             }
@@ -2964,6 +3056,7 @@ mod tests {
             contract_store: None,
             max_cases: None,
             max_case_bytes: None,
+            max_states_paired: None,
             properties: Vec::new(),
             json: false,
             evidence_out: None,
@@ -3320,6 +3413,7 @@ mod tests {
             cases_run: 2,
             cases_skipped_oversized: 0,
             cases_skipped_budget: 0,
+            cases_not_sampled: 0,
             max_case_bytes: GeneratorConfig::default().max_case_bytes,
             states_sampled: 0,
             corpus_transitions: 0,
@@ -3442,6 +3536,7 @@ mod tests {
             cases_run: 1,
             cases_skipped_oversized: 0,
             cases_skipped_budget: 0,
+            cases_not_sampled: 0,
             max_case_bytes: GeneratorConfig::default().max_case_bytes,
             states_sampled: 0,
             corpus_transitions: 0,
@@ -3807,6 +3902,7 @@ mod tests {
             contract_store: None,
             max_cases: None,
             max_case_bytes: None,
+            max_states_paired: None,
             properties: Vec::new(),
             json: false,
             evidence_out: None,
@@ -4395,6 +4491,7 @@ mod tests {
             cases_run: 4,
             cases_skipped_oversized: 0,
             cases_skipped_budget: 0,
+            cases_not_sampled: 0,
             max_case_bytes: GeneratorConfig::default().max_case_bytes,
             states_sampled: 0,
             corpus_transitions: 0,
@@ -5304,6 +5401,7 @@ mod tests {
                 (ConformanceProperty::StateIdempotence, 0),
                 (ConformanceProperty::StateAssociativity, 0),
             ],
+            not_sampled: Vec::new(),
             states_paired: 0,
             transitions_sampled: 0,
         };
@@ -5365,7 +5463,7 @@ mod tests {
         let human = render_human(&report);
         for expected in [
             "47 case(s) NOT run because their inputs exceeded --max-case-bytes (1024 bytes)",
-            "3 case(s) not run because the case budget (--max-cases) ran out; it cuts the pairs of later states first (see freenet-core#6053)",
+            "3 case(s) not run because the case budget (--max-cases) ran out; it cuts the cases of states earlier in the corpus first",
             "state_commutativity: held_partial \u{2014} 2 cases run (2 held, 0 violated, 0 inconclusive); 42 cases NOT run (inputs over --max-case-bytes); 3 cases not run (case budget, --max-cases)",
             "(3 case(s) were left out by the case budget (--max-cases)",
             "state_idempotence: inconclusive \u{2014} no case run; 5 cases NOT run",
@@ -5585,6 +5683,60 @@ mod tests {
         );
     }
 
+    /// `--max-states-paired` is bounded: below 3 no triple can be built, and above
+    /// the limit generation time (quadratic in it) stops being a few seconds.
+    #[test]
+    fn max_states_paired_is_bounded() {
+        use clap::Parser;
+        let parse =
+            |v: &str| ConformanceConfig::try_parse_from(["verify-merge", "--max-states-paired", v]);
+        for rejected in ["0", "1", "2", "1001"] {
+            assert!(parse(rejected).is_err(), "{rejected} must be rejected");
+        }
+        for accepted in ["3", "1000"] {
+            assert!(parse(accepted).is_ok(), "{accepted} must be accepted");
+        }
+    }
+
+    /// The associativity size count is the triples over the limit among those walked,
+    /// not what the limit costs, and both messages say so.
+    #[test]
+    fn the_associativity_size_count_says_what_it_counts() {
+        use ConformanceProperty::{StateAssociativity, StateCommutativity};
+        let mut states: Vec<Vec<u8>> = (0..22u8).map(|i| vec![i]).collect();
+        states.push(vec![22; 64]);
+        states.push(vec![23; 64]);
+        let corpus = Corpus::from_states(states);
+        let generator = GeneratorConfig {
+            properties: vec![StateAssociativity],
+            max_case_bytes: 16,
+            ..Default::default()
+        };
+        let generated = generate_cases_counted(&corpus, &generator);
+        let skipped = generated.oversized_total();
+        let (report, _) = check_cases(
+            &mut GrowOnly,
+            &corpus,
+            &generator,
+            generated,
+            |_, _| Ok(None),
+            Vec::new(),
+        )
+        .expect("no evidence is written, so nothing can fail");
+        let human = render_human(&report);
+        let expected = format!(
+            "{} over --max-case-bytes among the triples walked, at most 48 of which can run",
+            case_count(skipped)
+        );
+        assert!(human.contains(&expected), "{human}");
+
+        let note = "that count is the triples over the limit among those walked";
+        let triples = no_cases_message(&corpus, &[(StateAssociativity, 5)], 16);
+        assert!(triples.contains(note), "{triples}");
+        let pairs = no_cases_message(&corpus, &[(StateCommutativity, 5)], 16);
+        assert!(!pairs.contains(note), "{pairs}");
+    }
+
     /// A repeated `--property` would generate, run and count its cases twice.
     #[test]
     fn a_repeated_property_is_checked_once() {
@@ -5652,7 +5804,7 @@ mod tests {
         let corpus = Corpus::from_states(vec![vec![0; 8], vec![1; 8]]);
         let sized = no_cases_message(&corpus, &[(StateCommutativity, 3)], 4 * 1024 * 1024);
         assert!(
-            sized.contains("3 case(s) were built and every one was skipped")
+            sized.contains("3 case(s) were considered and every one was skipped")
                 && sized.contains("--max-case-bytes (4194304 bytes)"),
             "{sized}"
         );
@@ -5689,6 +5841,12 @@ mod tests {
         assert_eq!(
             generator_config(&default, Vec::new()).max_case_bytes,
             GeneratorConfig::default().max_case_bytes
+        );
+        let wider = ConformanceConfig::parse_from(["verify-merge", "--max-states-paired", "60"]);
+        assert_eq!(generator_config(&wider, Vec::new()).max_states_paired, 60);
+        assert_eq!(
+            generator_config(&default, Vec::new()).max_states_paired,
+            GeneratorConfig::default().max_states_paired
         );
     }
 
@@ -5838,11 +5996,32 @@ mod tests {
             ),
             (&24.into(), &100.into(), &24.into(), &40.into())
         );
+        // What the samplers and the triple cap left out, per law.
+        let left_out = |law: &str| {
+            json["properties"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["property"] == law)
+                .unwrap()["cases_not_sampled"]
+                .as_u64()
+                .unwrap()
+        };
+        assert_eq!(left_out("transition_path_agreement"), 40 - 24);
+        // The rule `(i, j, (i + j + 1 + seed) % n)` yields (n - 1)(n - 2) triples
+        // over n states; the capped walk over the 24-state sample offers 2 * 24.
+        assert_eq!(left_out("state_associativity"), 99 * 98 - 2 * 24);
+        assert_eq!(json["cases_not_sampled"], 40 - 24 + 99 * 98 - 2 * 24);
         let human = render_human(&both);
         assert!(
             human.contains(states_line) && human.contains(transitions_line),
             "{human}"
         );
+        let unbuilt = format!(
+            "state_associativity: {} case(s) left out by design",
+            99 * 98 - 2 * 24
+        );
+        assert!(human.contains(&unbuilt), "{human}");
 
         let states_only = render_human(&report_for(vec![StateAssociativity]));
         assert!(states_only.contains(states_line), "{states_only}");
