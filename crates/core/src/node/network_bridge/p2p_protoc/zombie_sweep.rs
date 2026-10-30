@@ -2428,6 +2428,8 @@ mod tests {
     }
 
     impl PeerConnectionApi for QueuedConnection {
+        fn set_peer_identity(&mut self, _key: crate::transport::TransportPublicKey) {}
+
         fn remote_addr(&self) -> SocketAddr {
             self.addr
         }

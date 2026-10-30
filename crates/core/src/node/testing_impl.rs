@@ -2212,6 +2212,16 @@ impl SimNetwork {
         crate::transport::in_memory_socket::quic_endpoint_clock(&self.name, addr)
     }
 
+    /// Whether the transport of the node `label` started its QUIC accept
+    /// loop, which it does only when it has an endpoint and the node passed
+    /// it a task registrar.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn quic_accept_loop_started(&self, label: &NodeLabel) -> bool {
+        self.node_addresses.get(label).is_some_and(|addr| {
+            crate::transport::in_memory_socket::quic_accept_loop_started(&self.name, *addr)
+        })
+    }
+
     /// Panics if a QUIC endpoint probe is set: only `run_simulation_direct`
     /// sends one, and a probe that silently never ran would fail later
     /// with a misleading message.
@@ -8133,6 +8143,11 @@ mod tests {
         let virtual_clock = std::any::type_name::<crate::simulation::VirtualTime>();
         assert_eq!(sim.quic_endpoint_clock(&labels[0]), Some(virtual_clock));
         assert_eq!(sim.quic_endpoint_clock(&labels[1]), None);
+        // The node passes its task registrar to the transport, which then
+        // starts the endpoint's accept loop; a node without an endpoint
+        // starts none.
+        assert!(sim.quic_accept_loop_started(&labels[0]));
+        assert!(!sim.quic_accept_loop_started(&labels[1]));
     }
 
     /// Watches the QUIC ingress outcomes of some addresses for a test, and

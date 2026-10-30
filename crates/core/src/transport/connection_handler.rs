@@ -171,6 +171,7 @@ pub async fn create_connection_handler<S: Socket>(
             // the node opens the transport through `open_udp_transport`.
             quic: None,
             advertised_version_override: None,
+            task_registrar: None,
         },
     )
     .await
@@ -200,6 +201,10 @@ pub(crate) struct UdpTransportConfig {
     /// everything the real binary decodes. `None` (the real version) in
     /// production.
     pub(crate) advertised_version_override: Option<(u8, u8, u16)>,
+    /// Registers the tasks the transport starts once it is open (the QUIC
+    /// accept loop) with the node's background-task monitor. The node
+    /// passes one; `None` (tools and tests) starts no accept loop.
+    pub(crate) task_registrar: Option<crate::node::background_task_monitor::LateRegistrar>,
 }
 
 pub(super) type UdpListenerParts<S> = (
@@ -362,6 +367,8 @@ pub(crate) fn udp_transport_handle<S: Socket>(
     listen_task: tokio::task::JoinHandle<TransportError>,
 ) -> super::TransportHandle {
     super::TransportHandle {
+        quic_endpoint: outbound.quic_availability().get()
+            != super::quic::liveness::QuicAvailability::Disabled,
         expected_inbound: Arc::new(outbound.expected_inbound_tracker()),
         connector: Arc::new(outbound),
         acceptor: Box::new(inbound),
@@ -531,6 +538,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
             // Used by `bind_udp_listener`, which built `quic_endpoint` from it.
             quic: _,
             advertised_version_override,
+            task_registrar,
         } = config;
         let (conn_handler_sender, conn_handler_receiver) = mpsc::channel(100);
         let (new_connection_sender, new_connection_notifier) = mpsc::channel(10);
@@ -541,6 +549,22 @@ impl<S: Socket> OutboundConnectionHandler<S> {
         );
         #[cfg(test)]
         let test_quic_endpoint = quic_endpoint.clone();
+        // The endpoint's accept loop runs from the start, registered with
+        // the node's monitor. Its allow-set is empty until an upgrade allows
+        // a peer, so it hands on no attempts yet; the queue is held by the
+        // listener, which will consume it once upgrades are wired in.
+        let quic_attempts = quic_endpoint
+            .as_ref()
+            .zip(task_registrar.as_ref())
+            .and_then(|(endpoint, registrar)| {
+                let (attempts, attempts_rx) = mpsc::channel(super::quic::config::MAX_INCOMING);
+                let started = endpoint.spawn_accept_loop(registrar, attempts);
+                #[cfg(any(test, feature = "testing"))]
+                if started {
+                    super::in_memory_socket::record_quic_accept_loop(socket_addr);
+                }
+                started.then_some(attempts_rx)
+            });
 
         let time_source = RealTime::new();
         let transport = UdpPacketsListener {
@@ -574,6 +598,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
             advertised_version: advertised_version_override
                 .map_or(PROTOC_VERSION, version_cmp::encode_version),
             _quic_endpoint: quic_endpoint,
+            _quic_attempts: quic_attempts,
         };
         let connection_handler = OutboundConnectionHandler {
             send_queue: conn_handler_sender,
@@ -663,6 +688,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
                 "Awaiting outbound handshake response from remote IP"
             );
         }
+        let dialled_key = remote_public_key.clone();
         let (open_connection, recv_connection) = oneshot::channel();
         if self
             .send_queue
@@ -681,7 +707,9 @@ impl<S: Socket> OutboundConnectionHandler<S> {
         }
         recv_connection
             .map(|res| match res {
-                Ok(Ok(remote_conn)) => Ok(PeerConnection::new(remote_conn)),
+                Ok(Ok(remote_conn)) => {
+                    Ok(PeerConnection::new(remote_conn).with_dialled_key(dialled_key))
+                }
                 Ok(Err(e)) => Err(e),
                 Err(_) => Err(TransportError::ConnectionEstablishmentFailure {
                     cause: "Failed to establish connection".into(),
@@ -823,6 +851,7 @@ impl<S: Socket> OutboundConnectionHandler<S, crate::simulation::VirtualTime> {
             // clock needs no override.
             gw_rate_limiter: GatewayConnectionRateLimiter::new(time_source.clone(), None),
             _quic_endpoint: None,
+            _quic_attempts: None,
             time_source,
             congestion_config,
             // Benchmarks measure throughput, not handshake encoding; the real
@@ -910,6 +939,7 @@ impl<S: Socket> OutboundConnectionHandler<S, crate::simulation::VirtualTime> {
                 "Awaiting outbound handshake response from remote IP"
             );
         }
+        let dialled_key = remote_public_key.clone();
         let (open_connection, recv_connection) = oneshot::channel();
         if self
             .send_queue
@@ -928,7 +958,9 @@ impl<S: Socket> OutboundConnectionHandler<S, crate::simulation::VirtualTime> {
         }
         recv_connection
             .map(|res| match res {
-                Ok(Ok(remote_conn)) => Ok(PeerConnection::new(remote_conn)),
+                Ok(Ok(remote_conn)) => {
+                    Ok(PeerConnection::new(remote_conn).with_dialled_key(dialled_key))
+                }
                 Ok(Err(e)) => Err(e),
                 Err(_) => Err(TransportError::ConnectionEstablishmentFailure {
                     cause: "Failed to establish connection".into(),
@@ -1012,9 +1044,14 @@ struct UdpPacketsListener<S = UdpSocket, T: TimeSource = RealTime> {
     advertised_version: [u8; 8],
     /// The QUIC endpoint on this listener's socket, when `transport-quic`
     /// is on. Held here so it lives as long as the listener reading the
-    /// socket that feeds it. Nothing uses it yet (#5940): it accepts no
-    /// connections and its allow-set is empty.
+    /// socket that feeds it. Its allow-set is empty until upgrades are
+    /// wired in (#5940), so its accept loop accepts no connections yet.
     _quic_endpoint: Option<super::quic::QuicEndpoint>,
+    /// The connection attempts the endpoint's accept loop hands on, when it
+    /// runs (`UdpTransportConfig::task_registrar` was set). Nothing reads it
+    /// yet: with an empty allow-set no attempt is handed on. Each queued
+    /// attempt would keep quinn's endpoint alive until drained or dropped.
+    _quic_attempts: Option<mpsc::Receiver<super::quic::QuicIncoming>>,
 }
 
 type OngoingConnectionResult<S, T> = Option<
@@ -5166,6 +5203,61 @@ pub mod mock_transport {
             joiner_view.is_some(),
             crate_at_or_above_floor,
             "joiner's view of the gateway version must follow the production floor exactly"
+        );
+        Ok(())
+    }
+
+    /// The transport holds the peer key the node recorded: the key dialled
+    /// on the joiner's side, and none on the gateway's side until the node
+    /// gives it one at promotion. A key given when none is held is set; the
+    /// held key given again is confirmed; any other key is refused and
+    /// counted, and the held key is kept.
+    #[tokio::test]
+    async fn the_transport_keeps_the_dialled_or_promoted_key() -> anyhow::Result<()> {
+        use crate::transport::PeerConnectionApi;
+        use crate::transport::metrics::{ConnIdentity, TRANSPORT_METRICS};
+        let channels = Arc::new(DashMap::new());
+        let (peer_pub, mut peer, peer_addr) =
+            create_mock_peer(Default::default(), channels.clone()).await?;
+        let (gw_pub, (_oc, mut gw_conn), gw_addr) =
+            create_mock_gateway(Default::default(), channels).await?;
+        // Each side records under its remote's address.
+        TRANSPORT_METRICS.watch_conn_identity(gw_addr);
+        TRANSPORT_METRICS.watch_conn_identity(peer_addr);
+
+        let gw = GlobalExecutor::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(10), gw_conn.recv())
+                .await?
+                .ok_or(anyhow::anyhow!("no connection"))
+        });
+        let pending = peer.connect(gw_pub.clone(), gw_addr).await;
+        let mut joiner = tokio::time::timeout(Duration::from_secs(60), pending).await??;
+        let mut gateway = gw.await??;
+
+        let other = TransportKeypair::new().public().clone();
+        assert_eq!(joiner.peer_identity(), Some(&gw_pub), "the dialled key");
+        PeerConnectionApi::set_peer_identity(&mut joiner, gw_pub.clone());
+        PeerConnectionApi::set_peer_identity(&mut joiner, other.clone());
+        assert_eq!(joiner.peer_identity(), Some(&gw_pub), "kept");
+        assert_eq!(
+            TRANSPORT_METRICS.conn_identity_from(gw_addr),
+            vec![
+                ConnIdentity::TransportKeySame,
+                ConnIdentity::TransportKeyRefused
+            ]
+        );
+
+        assert_eq!(gateway.peer_identity(), None, "nothing dialled");
+        PeerConnectionApi::set_peer_identity(&mut gateway, peer_pub.clone());
+        assert_eq!(gateway.peer_identity(), Some(&peer_pub));
+        PeerConnectionApi::set_peer_identity(&mut gateway, other);
+        assert_eq!(gateway.peer_identity(), Some(&peer_pub), "kept");
+        assert_eq!(
+            TRANSPORT_METRICS.conn_identity_from(peer_addr),
+            vec![
+                ConnIdentity::TransportKeySet,
+                ConnIdentity::TransportKeyRefused
+            ]
         );
         Ok(())
     }
