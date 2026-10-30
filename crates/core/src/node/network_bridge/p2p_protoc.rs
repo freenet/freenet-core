@@ -749,6 +749,11 @@ pub(in crate::node) struct P2pConnManager {
     /// loop) with the node's background-task monitor. Used to open the
     /// transport, which happens after the monitor has started waiting.
     task_registrar: crate::node::background_task_monitor::LateRegistrar,
+    /// Whether the open transport has a QUIC endpoint
+    /// (`TransportHandle::quic_endpoint`). Only then is a connection's
+    /// transport given its peer key at promotion. False until the transport
+    /// is open.
+    transport_has_quic: bool,
     blocked_addresses: Option<HashSet<SocketAddr>>,
     /// Per-contract retry count for broadcasts that found no targets yet.
     broadcast_retries: HashMap<freenet_stdlib::prelude::ContractKey, u8>,
@@ -1311,6 +1316,7 @@ impl P2pConnManager {
             ack_version_floor_override: config.ack_version_floor_override,
             advertised_version_override: config.advertised_version_override,
             task_registrar: task_monitor.late_registrar(),
+            transport_has_quic: false,
             bandwidth_limit: config.config.network_api.bandwidth_limit,
             global_bandwidth: config
                 .config
@@ -1467,6 +1473,7 @@ impl P2pConnManager {
             quic,
             advertised_version_override,
             task_registrar,
+            transport_has_quic: _,
             blocked_addresses,
             broadcast_retries,
             broadcast_no_target_streak,
@@ -1479,6 +1486,7 @@ impl P2pConnManager {
             acceptor,
             expected_inbound,
             listener: mut listener_liveness,
+            quic_endpoint: transport_has_quic,
         } = transport;
 
         tracing::info!(
@@ -1566,6 +1574,7 @@ impl P2pConnManager {
             quic,
             advertised_version_override,
             task_registrar,
+            transport_has_quic,
             blocked_addresses,
             broadcast_retries,
             broadcast_no_target_streak,
@@ -2166,6 +2175,8 @@ impl P2pConnManager {
                                 }
                             }
                         }
+                        #[cfg(test)]
+                        ConnEvent::Barrier(_) => {}
                         ConnEvent::SetPeerIdentity(key) => {
                             // Sent only to a connection's task, never to the
                             // event loop.
@@ -3358,6 +3369,10 @@ pub(super) enum ConnEvent {
     /// transport (`PeerConnectionApi::set_peer_identity`). Sent only by
     /// `P2pConnManager::tell_transport_peer_identity`.
     SetPeerIdentity(TransportPublicKey),
+    /// To a connection's task, in tests: acknowledged once every event sent
+    /// before it has been handled.
+    #[cfg(test)]
+    Barrier(tokio::sync::oneshot::Sender<()>),
 }
 
 #[derive(Debug)]
@@ -3534,6 +3549,10 @@ async fn handle_peer_channel_message(
                         "[CONN_LIFECYCLE] Giving the transport the promoted peer key"
                     );
                     conn.set_peer_identity(key);
+                }
+                #[cfg(test)]
+                ConnEvent::Barrier(ack) => {
+                    ack.send(()).ok();
                 }
                 other @ ConnEvent::InboundMessage(_)
                 | other @ ConnEvent::OutboundMessage(_)
@@ -4058,6 +4077,8 @@ pub(crate) mod tests {
     }
 
     impl super::PeerConnectionApi for RecordingConnection {
+        fn set_peer_identity(&mut self, _key: crate::transport::TransportPublicKey) {}
+
         fn remote_addr(&self) -> std::net::SocketAddr {
             "192.0.2.1:4000".parse().unwrap()
         }

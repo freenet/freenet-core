@@ -8868,7 +8868,13 @@ async fn test_connection_growth_stall_regression() {
         delta("set_dialed") > 0,
         "premise: identity decisions were counted ({after:?})"
     );
-    for kind in ["changed_connect_request", "changed_connect_peer", "own_key"] {
+    for kind in [
+        "changed_connect_request",
+        "changed_connect_peer",
+        "own_key",
+        "promotion_key_mismatch",
+        "transport_key_refused",
+    ] {
         assert_eq!(
             delta(kind),
             0,
@@ -20521,10 +20527,46 @@ fn quic_mesh_peers_and_connected(
 /// is the only difference.
 #[test_log::test]
 fn test_quic_prefer_forms_a_mesh_of_the_same_peers_as_quic_off() {
+    // The key counters below are process-wide, so the runs must be alone.
+    if run_alone_in_child_process("test_quic_prefer_forms_a_mesh_of_the_same_peers_as_quic_off") {
+        return;
+    }
     const SEED: u64 = 0x5940_E5A1_0001;
     const NODES: usize = QUIC_HARNESS_NODES;
+    let totals = || -> std::collections::BTreeMap<&'static str, u64> {
+        freenet::dev_tool::conn_identity_totals()
+            .into_iter()
+            .collect()
+    };
+    let before = totals();
     let off = run_quic_harness_sim("quic-mesh-off", SEED, None);
+    let after_off = totals();
     let prefer = run_quic_harness_sim("quic-mesh-prefer", SEED, Some("prefer"));
+    let after_prefer = totals();
+    // A promoted connection's transport is given its peer key only with a
+    // QUIC endpoint, and never a key other than the one bound.
+    let off_delta = |kind: &str| after_off[kind] - before[kind];
+    let prefer_delta = |kind: &str| after_prefer[kind] - after_off[kind];
+    for kind in [
+        "transport_key_sent",
+        "transport_key_set",
+        "transport_key_same",
+    ] {
+        assert_eq!(off_delta(kind), 0, "QUIC off: {kind}");
+    }
+    assert!(
+        prefer_delta("transport_key_sent") > 0
+            && prefer_delta("transport_key_set") + prefer_delta("transport_key_same") > 0,
+        "premise: with QUIC on, promoted connections' transports were given \
+         their key ({after_off:?} -> {after_prefer:?})"
+    );
+    for kind in [
+        "promotion_key_mismatch",
+        "transport_key_refused",
+        "transport_key_undelivered",
+    ] {
+        assert_eq!(prefer_delta(kind), 0, "QUIC prefer: {kind}");
+    }
     off.assert_probe("no_ingress");
     prefer.assert_probe("not_allowed");
     let (off_peers, off_connected) = quic_mesh_peers_and_connected(&off.mesh);

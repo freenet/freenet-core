@@ -551,10 +551,14 @@ impl P2pConnManager {
 
     /// The connection at `addr` has just been promoted into the ring under
     /// `promoted`: give its transport the peer key, which the transport
-    /// holds from then on (`PeerConnectionApi::set_peer_identity`). The key
-    /// sent is the identity bound to the connection, the node's own record;
-    /// when `promoted` is not that key, or none is bound, nothing is sent and
-    /// the mismatch is counted (`promotion_key_mismatch`).
+    /// holds from then on (`PeerConnectionApi::set_peer_identity`). Only when
+    /// the transport has a QUIC endpoint, since only a QUIC upgrade reads the
+    /// key. The key sent is the identity bound to the connection, the node's
+    /// own record; when `promoted` is not that key, or none is bound, nothing
+    /// is sent and the mismatch is counted (`promotion_key_mismatch`). A key
+    /// handed to the connection's task is counted `transport_key_sent`, and
+    /// one that could not be handed over within the fallback's timeout
+    /// `transport_key_undelivered`.
     ///
     /// Called only where a connection enters the ring (after
     /// `handle_successful_connection` adds it, and when
@@ -564,6 +568,9 @@ impl P2pConnManager {
     /// channel to the connection's task moves the send to a short task (see
     /// [`notify_connection_task`]).
     fn tell_transport_peer_identity(&self, addr: SocketAddr, promoted: &TransportPublicKey) {
+        if !self.transport_has_quic {
+            return;
+        }
         let Some(entry) = self.connections.get(&addr) else {
             return;
         };
@@ -586,6 +593,10 @@ impl P2pConnManager {
             Right(ConnEvent::SetPeerIdentity(bound)),
             addr,
             "peer identity",
+            Some(DeliveryCounts {
+                delivered: ConnIdentity::TransportKeySent,
+                timed_out: ConnIdentity::TransportKeyUndelivered,
+            }),
         );
     }
 
@@ -656,6 +667,8 @@ impl P2pConnManager {
             // a cap-rejected promotion inflates `promoted_to_ring` in
             // exactly the saturation direction the counter is meant to
             // expose.
+            // `added` is also true when the ring re-adds an address it holds.
+            let was_in_ring = connection_manager.is_in_ring(peer_addr);
             let outcome = self
                 .bridge
                 .op_manager
@@ -685,6 +698,12 @@ impl P2pConnManager {
             {
                 return Promotion::Refused;
             }
+            // A promotion only when the ring took an address it did not hold.
+            let promotion = if outcome.added && !was_in_ring {
+                Promotion::Promoted
+            } else {
+                Promotion::AlreadyInRing
+            };
 
             // Update the dashboard/network_status with the peer's location.
             // Without this, peers promoted via this path show no location on the
@@ -728,7 +747,7 @@ impl P2pConnManager {
             if just_became_ready {
                 self.handle_broadcast_ready_state(true).await;
             }
-            return Promotion::Promoted;
+            return promotion;
         }
 
         Promotion::AlreadyInRing
@@ -1844,13 +1863,9 @@ impl P2pConnManager {
                 if outcome.added {
                     crate::node::network_status::record_bootstrap_promoted_to_ring();
                 }
-                if self
-                    .bridge
-                    .op_manager
-                    .ring
-                    .connection_manager
-                    .is_in_ring(peer_addr)
-                {
+                // The ring holds no entry for the address here: the reservation
+                // prune above removes one, so an add is a new entry.
+                if outcome.added {
                     self.tell_transport_peer_identity(peer_addr, peer.pub_key());
                 }
                 let just_became_ready = outcome.just_became_ready;
@@ -2232,34 +2247,54 @@ fn notify_connection_dropped(
     let event = Right(ConnEvent::NodeAction(NodeEvent::DropConnection(
         peer_addr, reason,
     )));
-    notify_connection_task(sender, event, peer_addr, "drop notice");
+    notify_connection_task(sender, event, peer_addr, "drop notice", None);
+}
+
+/// What [`notify_connection_task`] counts for an event (on the event's
+/// remote address): handed to the connection's task, or not handed over
+/// within the fallback's timeout.
+#[derive(Clone, Copy)]
+struct DeliveryCounts {
+    delivered: ConnIdentity,
+    timed_out: ConnIdentity,
 }
 
 /// Send `event` (`what`, for logs) to a connection's task without blocking
 /// the caller, which runs on the event loop: when the channel is full, the
-/// send is moved to a short task that waits up to 1 s.
+/// send is moved to a short task that waits up to 1 s. With `counts`, the
+/// outcome is counted on `peer_addr`; a connection task already gone counts
+/// nothing.
 fn notify_connection_task(
     sender: PeerConnChannelSender,
     event: Either<NetMessage, ConnEvent>,
     peer_addr: SocketAddr,
     what: &'static str,
+    counts: Option<DeliveryCounts>,
 ) {
+    let count = move |kind: fn(DeliveryCounts) -> ConnIdentity| {
+        if let Some(counts) = counts {
+            TRANSPORT_METRICS.record_conn_identity(peer_addr, kind(counts));
+        }
+    };
     match sender.try_send(event) {
-        Ok(()) => {}
+        Ok(()) => count(|c| c.delivered),
         Err(tokio::sync::mpsc::error::TrySendError::Full(event)) => {
             GlobalExecutor::spawn(async move {
                 match timeout(Duration::from_secs(1), sender.send(event)).await {
-                    Ok(Ok(())) => {}
+                    Ok(Ok(())) => count(|c| c.delivered),
                     Ok(Err(_)) => tracing::debug!(
                         %peer_addr,
                         what,
                         "Connection task gone before the notice was delivered"
                     ),
-                    Err(_) => tracing::warn!(
-                        %peer_addr,
-                        what,
-                        "Timeout while sending a notice to the connection task"
-                    ),
+                    Err(_) => {
+                        count(|c| c.timed_out);
+                        tracing::warn!(
+                            %peer_addr,
+                            what,
+                            "Timeout while sending a notice to the connection task"
+                        )
+                    }
                 }
             });
         }

@@ -2953,49 +2953,65 @@ fn the_transport_reports_quic_availability() {
 /// When the node opens the transport with an endpoint, the endpoint's
 /// accept loop is started and registered through the node's late
 /// registrar, so the monitor, already waiting by then, watches it. Without
-/// a registrar (tools and tests) no loop is started. On simulation sockets.
+/// a registrar (tools and tests) no loop is started, and without an
+/// endpoint (QUIC off) there is no loop to start. On simulation sockets.
 #[test]
 fn the_transport_starts_the_accept_loop_through_the_late_registrar() {
     bounded(|| async move {
         use crate::node::background_task_monitor::BackgroundTaskMonitor;
         use crate::transport::connection_handler::{UdpTransportConfig, bind_udp_listener};
         let network = "quic-transport-accept-loop";
-        let time = VirtualTime::new();
-        register_network_time_source(network, time.clone());
-        for (port, with_registrar) in [(5000, true), (5001, false)] {
+        let _clock = Registration::time_source(network, VirtualTime::new());
+        for (port, quic, with_registrar) in [
+            (5000, Some(settings()), true),
+            (5001, Some(settings()), false),
+            (5002, None, true),
+        ] {
             let local = SocketAddr::from(([10, 201, 35, 1], port));
-            register_address_network(local, network);
+            let _registered = Registration::address(local, network);
             let monitor = BackgroundTaskMonitor::new();
             // The node's order: the monitor waits before the transport opens.
             let registrar = monitor.late_registrar();
             let wait = tokio::spawn(monitor.wait_for_any_exit());
+            let has_endpoint = quic.is_some();
             let (outbound, _inbound, listener) = bind_udp_listener::<SimulationSocket>(
                 crate::transport::TransportKeypair::new(),
                 local.ip(),
                 port,
                 false,
                 UdpTransportConfig {
-                    quic: Some(settings()),
+                    quic,
                     task_registrar: with_registrar.then(|| registrar.clone()),
                     ..UdpTransportConfig::default()
                 },
             )
             .await
             .unwrap();
-            let endpoint = outbound.quic_endpoint().expect("an endpoint");
-            let expected: &[&str] = if with_registrar {
+            let expected: &[&str] = if with_registrar && has_endpoint {
                 &["quic_accept_loop"]
             } else {
                 &[]
             };
-            assert_eq!(registrar.registered(), expected);
-            let (attempts, _attempts_rx) = tokio::sync::mpsc::channel(1);
+            assert_eq!(registrar.registered(), expected, "port {port}");
             assert_eq!(
-                endpoint
-                    .spawn_accept_loop(&BackgroundTaskMonitor::new().late_registrar(), attempts),
-                !with_registrar,
-                "with a registrar the transport already started the endpoint's one loop"
+                crate::transport::in_memory_socket::quic_accept_loop_started(network, local),
+                !expected.is_empty(),
+                "port {port}"
             );
+            match outbound.quic_endpoint() {
+                Some(endpoint) => {
+                    let (attempts, _attempts_rx) = tokio::sync::mpsc::channel(1);
+                    assert_eq!(
+                        endpoint.spawn_accept_loop(
+                            &BackgroundTaskMonitor::new().late_registrar(),
+                            attempts
+                        ),
+                        !with_registrar,
+                        "with a registrar the transport already started the endpoint's one loop"
+                    );
+                }
+                None => assert!(!has_endpoint, "an endpoint is built with QUIC on"),
+            }
             for _ in 0..64 {
                 tokio::task::yield_now().await;
             }
@@ -3005,9 +3021,8 @@ fn the_transport_starts_the_accept_loop_through_the_late_registrar() {
             );
             wait.abort();
             listener.abort();
-            crate::transport::in_memory_socket::unregister_address_network(&local, network);
         }
-        unregister_network_time_source(network);
+        crate::transport::in_memory_socket::clear_quic_endpoint_clocks(network);
     })
 }
 

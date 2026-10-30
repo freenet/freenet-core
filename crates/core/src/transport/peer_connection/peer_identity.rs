@@ -1,11 +1,11 @@
 //! The peer key a connection's transport holds.
 //!
-//! The transport learns its peer's key from the node, never from anything
-//! the peer sends over the connection: the key it dialled, for an outbound
-//! connection, and the key the node promoted the connection into the ring
-//! under (`PeerConnectionApi::set_peer_identity`), which the node takes from
-//! the identity it bound to the connection at establishment. A QUIC upgrade
-//! of the connection (#5940) authenticates the peer against this key.
+//! The transport learns its peer's key from the node: the key it dialled,
+//! for an outbound connection, and the key the node promoted the connection
+//! into the ring under (`PeerConnectionApi::set_peer_identity`), which is the
+//! key the node bound to the connection (`identity::bind`), never a key from
+//! an upgrade message. A QUIC upgrade of the connection (#5940)
+//! authenticates the peer against this key.
 //!
 //! The key does not change once held: a later, different key is refused and
 //! the held key kept.

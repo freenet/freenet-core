@@ -246,9 +246,34 @@ pub(crate) fn quic_endpoint_clock(network: &str, addr: SocketAddr) -> Option<&'s
         .map(|clock| *clock)
 }
 
-/// Forgets every recorded QUIC endpoint clock of `network`.
+/// The simulated nodes whose transport started its QUIC endpoint's accept
+/// loop, keyed like [`QUIC_ENDPOINT_CLOCKS`]. Written by the transport when
+/// it starts the loop; read by tests to check the node passes its task
+/// registrar to the transport.
+#[cfg(any(test, feature = "testing"))]
+static QUIC_ACCEPT_LOOPS: LazyLock<dashmap::DashSet<(String, SocketAddr)>> =
+    LazyLock::new(dashmap::DashSet::new);
+
+/// Records that the transport at `addr` started its QUIC accept loop
+/// (resolved to its network as in [`record_quic_endpoint_clock`]).
+#[cfg(any(test, feature = "testing"))]
+pub(crate) fn record_quic_accept_loop(addr: SocketAddr) {
+    if let Ok(network) = resolve_address_network(&addr) {
+        QUIC_ACCEPT_LOOPS.insert((network, addr));
+    }
+}
+
+/// Whether the transport at `addr` in `network` started its QUIC accept
+/// loop.
+#[cfg(any(test, feature = "testing"))]
+pub(crate) fn quic_accept_loop_started(network: &str, addr: SocketAddr) -> bool {
+    QUIC_ACCEPT_LOOPS.contains(&(network.to_string(), addr))
+}
+
+/// Forgets every recorded QUIC endpoint clock and accept loop of `network`.
 #[cfg(any(test, feature = "testing"))]
 pub(crate) fn clear_quic_endpoint_clocks(network: &str) {
+    QUIC_ACCEPT_LOOPS.retain(|(owner, _)| owner != network);
     QUIC_ENDPOINT_CLOCKS.retain(|(owner, _), _| owner != network);
 }
 

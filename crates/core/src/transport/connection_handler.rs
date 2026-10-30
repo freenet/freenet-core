@@ -367,6 +367,8 @@ pub(crate) fn udp_transport_handle<S: Socket>(
     listen_task: tokio::task::JoinHandle<TransportError>,
 ) -> super::TransportHandle {
     super::TransportHandle {
+        quic_endpoint: outbound.quic_availability().get()
+            != super::quic::liveness::QuicAvailability::Disabled,
         expected_inbound: Arc::new(outbound.expected_inbound_tracker()),
         connector: Arc::new(outbound),
         acceptor: Box::new(inbound),
@@ -556,9 +558,12 @@ impl<S: Socket> OutboundConnectionHandler<S> {
             .zip(task_registrar.as_ref())
             .and_then(|(endpoint, registrar)| {
                 let (attempts, attempts_rx) = mpsc::channel(super::quic::config::MAX_INCOMING);
-                endpoint
-                    .spawn_accept_loop(registrar, attempts)
-                    .then_some(attempts_rx)
+                let started = endpoint.spawn_accept_loop(registrar, attempts);
+                #[cfg(any(test, feature = "testing"))]
+                if started {
+                    super::in_memory_socket::record_quic_accept_loop(socket_addr);
+                }
+                started.then_some(attempts_rx)
             });
 
         let time_source = RealTime::new();

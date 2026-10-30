@@ -215,6 +215,10 @@ pub(crate) struct TransportHandle {
     /// Resolves when the transport's listener stops. The node treats that as
     /// fatal.
     pub(crate) listener: ListenerLiveness,
+    /// Whether the transport built a QUIC endpoint (`transport-quic` on and
+    /// the endpoint bound). Only then does the node give a connection's
+    /// transport its peer key, which only a QUIC upgrade reads.
+    pub(crate) quic_endpoint: bool,
 }
 
 /// Registers peers the node expects to connect in, so the transport accepts
@@ -593,13 +597,13 @@ pub(crate) trait PeerConnectionApi: Send {
     fn set_inbound_stream_registry(&mut self, registry: std::sync::Arc<dyn InboundStreamRegistry>);
 
     /// Records the peer key the node promoted this connection into the ring
-    /// under. The node calls it at promotion, with the key it bound to the
-    /// connection at establishment, never with a key the peer sent. A
-    /// transport that already holds a different key (the one it dialled, or
-    /// one given earlier) keeps it, refuses this one and counts the refusal.
-    /// A QUIC upgrade of the connection authenticates the peer against the
-    /// held key. Ignored by test doubles.
-    fn set_peer_identity(&mut self, _key: TransportPublicKey) {}
+    /// under. The node calls it at promotion, when the transport has a QUIC
+    /// endpoint, with the key the node bound to the connection
+    /// (`identity::bind`), never a key from an upgrade message. A transport
+    /// that already holds a different key (the one it dialled, or one given
+    /// earlier) keeps it, refuses this one and counts the refusal. A QUIC
+    /// upgrade of the connection authenticates the peer against the held key.
+    fn set_peer_identity(&mut self, key: TransportPublicKey);
 
     /// Sends raw stream data to the remote peer as the stream `stream_id`
     /// (from [`StreamId::next`]), which the transport delivers with the

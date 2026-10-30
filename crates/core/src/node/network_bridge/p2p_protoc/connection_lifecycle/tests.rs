@@ -101,21 +101,6 @@ static TRANSPORT_KEYS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<SocketAddr, Vec<TransportPublicKey>>>,
 > = std::sync::LazyLock::new(Default::default);
 
-/// The keys the connection's transport at `addr` has been given, once its
-/// task has handled what was sent to it. The task runs on this test's
-/// runtime, so yielding lets it drain its channel.
-async fn transport_keys(addr: SocketAddr) -> Vec<TransportPublicKey> {
-    for _ in 0..64 {
-        tokio::task::yield_now().await;
-    }
-    TRANSPORT_KEYS
-        .lock()
-        .unwrap()
-        .get(&addr)
-        .cloned()
-        .unwrap_or_default()
-}
-
 /// A `P2pConnManager` built the way the node builds it, with the channels
 /// its handlers need kept alive.
 struct Harness {
@@ -203,6 +188,10 @@ impl Harness {
         .expect("build P2pConnManager");
         let (conn_events_tx, conn_events_rx) = mpsc::channel(64);
         mgr.conn_event_tx = Some(conn_events_tx);
+        // As a node whose transport has a QUIC endpoint, so promotions give
+        // the transport its key; `quic_off_gives_no_transport_a_key` turns it
+        // off.
+        mgr.transport_has_quic = true;
         let (handshake_tx, handshake_rx) = mpsc::channel(128);
         Self {
             token: NEXT_HARNESS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -241,6 +230,49 @@ impl Harness {
             owner, self.token,
             "{addr} is already used by another test; give this test its own address"
         );
+    }
+
+    /// Wait until the task of the open connection at `addr`, if any, has
+    /// handled every event sent to it so far: a barrier sent through the same
+    /// channel is acknowledged after them.
+    async fn settle(&self, addr: SocketAddr) {
+        let Some(entry) = self.mgr.connections.get(&addr) else {
+            return;
+        };
+        let (ack, acked) = tokio::sync::oneshot::channel();
+        entry
+            .sender
+            .send(Right(ConnEvent::Barrier(ack)))
+            .await
+            .expect("the connection's task is running");
+        acked
+            .await
+            .expect("the connection's task acknowledges the barrier");
+    }
+
+    /// The keys the transport of the connection at `addr` (an
+    /// `IdleConnection`) has been given, once its task has handled
+    /// everything sent to it.
+    async fn transport_keys(&self, addr: SocketAddr) -> Vec<TransportPublicKey> {
+        self.settle(addr).await;
+        TRANSPORT_KEYS
+            .lock()
+            .unwrap()
+            .get(&addr)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// The key decisions recorded for `addr` ([`is_transport_kind`]), once
+    /// the connection's task has handled everything sent to it, so a real
+    /// transport has recorded what it took.
+    async fn transport_seen(&self, addr: SocketAddr) -> Vec<ConnIdentity> {
+        self.settle(addr).await;
+        TRANSPORT_METRICS
+            .conn_identity_from(addr)
+            .into_iter()
+            .filter(|kind| is_transport_kind(*kind))
+            .collect()
     }
 
     fn own_key(&self) -> TransportPublicKey {
@@ -465,10 +497,10 @@ impl Harness {
     }
 }
 
-/// The identity decisions the node made for `addr`. Leaves out those the
-/// transport records when it is given a key ([`is_transport_kind`]): a real
-/// transport records them from its own task, so they may arrive after the
-/// handler returns; [`transport_seen`] reads them.
+/// The identity decisions the node made for `addr`. Leaves out the counts
+/// of a key given to the transport ([`is_transport_kind`]), which
+/// [`Harness::transport_seen`] reads: a real transport records its part from
+/// the connection's task, after the handler returns.
 fn seen(addr: SocketAddr) -> Vec<ConnIdentity> {
     TRANSPORT_METRICS
         .conn_identity_from(addr)
@@ -480,29 +512,12 @@ fn seen(addr: SocketAddr) -> Vec<ConnIdentity> {
 fn is_transport_kind(kind: ConnIdentity) -> bool {
     matches!(
         kind,
-        ConnIdentity::TransportKeySet
+        ConnIdentity::TransportKeySent
+            | ConnIdentity::TransportKeyUndelivered
+            | ConnIdentity::TransportKeySet
             | ConnIdentity::TransportKeySame
             | ConnIdentity::TransportKeyRefused
     )
-}
-
-/// The decisions a real transport recorded for `addr` when it was given a
-/// key, waiting up to 5 s for the first.
-async fn transport_seen(addr: SocketAddr) -> Vec<ConnIdentity> {
-    let read = || {
-        TRANSPORT_METRICS
-            .conn_identity_from(addr)
-            .into_iter()
-            .filter(|kind| is_transport_kind(*kind))
-            .collect::<Vec<_>>()
-    };
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while read().is_empty() && tokio::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    // Room for a second record, which none of these tests expects.
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    read()
 }
 
 fn is_set(kind: ConnIdentity) -> bool {
@@ -530,7 +545,9 @@ fn is_set(kind: ConnIdentity) -> bool {
         | ConnIdentity::PromotionKeyMismatch
         | ConnIdentity::TransportKeySet
         | ConnIdentity::TransportKeySame
-        | ConnIdentity::TransportKeyRefused => false,
+        | ConnIdentity::TransportKeyRefused
+        | ConnIdentity::TransportKeySent
+        | ConnIdentity::TransportKeyUndelivered => false,
     }
 }
 
@@ -1351,8 +1368,11 @@ async fn expected_inbound_matched_by_the_handshake_driver_gets_the_peer_key() {
         ]
     );
     assert_eq!(
-        transport_seen(peer_addr).await,
-        vec![ConnIdentity::TransportKeySet],
+        h.transport_seen(peer_addr).await,
+        vec![
+            ConnIdentity::TransportKeySent,
+            ConnIdentity::TransportKeySet
+        ],
         "the inbound transport learned the dialled key once, at the promotion \
          on arrival, and not again for the ConnectPeer"
     );
@@ -1410,8 +1430,11 @@ async fn expected_inbound_after_a_failed_dial_is_promoted_under_the_dialled_key(
     );
     assert_eq!(h_count(&h), 1);
     assert_eq!(
-        transport_seen(peer_addr).await,
-        vec![ConnIdentity::TransportKeySet],
+        h.transport_seen(peer_addr).await,
+        vec![
+            ConnIdentity::TransportKeySent,
+            ConnIdentity::TransportKeySet
+        ],
         "the inbound transport learned the dialled key at promotion"
     );
     h.assert_own_key_absent();
@@ -1526,8 +1549,11 @@ async fn inbound_after_a_successful_dial_is_unexpected() {
     assert_eq!(rig.handle_next_event(&mut h).await, "outbound_established");
     assert!(matches!(result.try_recv(), Ok(Ok(_))), "the dial succeeded");
     assert_eq!(
-        transport_seen(peer_addr).await,
-        vec![ConnIdentity::TransportKeySame],
+        h.transport_seen(peer_addr).await,
+        vec![
+            ConnIdentity::TransportKeySent,
+            ConnIdentity::TransportKeySame
+        ],
         "the dialled transport already held the key it is promoted under"
     );
     // The drop the dial sent reaches the driver before what follows.
@@ -3043,6 +3069,9 @@ async fn a_dial_replacing_a_quiet_holder_leaves_no_reservation() {
             .get_reserved_connections(),
         0
     );
+    // Promoted in the replaced holder's place on arrival, before its task
+    // started: the key sent then is still delivered.
+    assert_eq!(h.transport_keys(dialled).await, vec![peer]);
 }
 
 /// A transient dial left out of the ring for being transient, with no other
@@ -3276,12 +3305,12 @@ async fn a_dial_gives_its_transport_the_key_once_at_promotion() {
         Some(&peer),
         "premise: promoted"
     );
-    assert_eq!(transport_keys(addr).await, vec![peer.clone()]);
+    assert_eq!(h.transport_keys(addr).await, vec![peer.clone()]);
 
     h.connect_peer(PeerKeyLocation::new(peer.clone(), addr))
         .await;
     assert_eq!(
-        transport_keys(addr).await,
+        h.transport_keys(addr).await,
         vec![peer.clone()],
         "no second key for a connection already in the ring"
     );
@@ -3305,12 +3334,16 @@ async fn an_unpromoted_connection_gives_its_transport_no_key_until_promoted() {
         "premise: bound"
     );
     assert_eq!(h.ring_key_at(addr), None, "premise: not promoted");
-    assert_eq!(transport_keys(addr).await, vec![], "bound is not promoted");
+    assert_eq!(
+        h.transport_keys(addr).await,
+        vec![],
+        "bound is not promoted"
+    );
 
     h.connect_peer(PeerKeyLocation::new(peer.clone(), addr))
         .await;
     assert_eq!(h.ring_key_at(addr).as_ref(), Some(&peer));
-    assert_eq!(transport_keys(addr).await, vec![peer]);
+    assert_eq!(h.transport_keys(addr).await, vec![peer]);
 }
 
 /// An inbound connection that names itself in a ConnectRequest is bound to
@@ -3332,14 +3365,14 @@ async fn an_inbound_connection_learns_its_key_at_promotion_not_from_its_request(
         "premise: bound"
     );
     assert_eq!(
-        transport_keys(addr).await,
+        h.transport_keys(addr).await,
         vec![],
         "a request does not promote"
     );
 
     h.connect_peer(PeerKeyLocation::new(peer.clone(), addr))
         .await;
-    assert_eq!(transport_keys(addr).await, vec![peer]);
+    assert_eq!(h.transport_keys(addr).await, vec![peer]);
 }
 
 /// A ConnectPeer for a connection with no identity promotes it and then
@@ -3353,11 +3386,11 @@ async fn a_connect_peer_on_an_unbound_connection_gives_its_transport_the_key() {
     let peer = key();
 
     h.accept(addr).await;
-    assert_eq!(transport_keys(addr).await, vec![], "premise: unbound");
+    assert_eq!(h.transport_keys(addr).await, vec![], "premise: unbound");
     h.connect_peer(PeerKeyLocation::new(peer.clone(), addr))
         .await;
     assert_eq!(h.ring_key_at(addr).as_ref(), Some(&peer));
-    assert_eq!(transport_keys(addr).await, vec![peer]);
+    assert_eq!(h.transport_keys(addr).await, vec![peer]);
     assert_eq!(seen(addr), vec![ConnIdentity::SetConnectPeer]);
 }
 
@@ -3375,11 +3408,11 @@ async fn a_pending_claim_gives_its_transport_the_key_when_promoted() {
     h.dial(dialled_at, &peer).await;
     h.accept_expected(claimed_at, &peer).await;
     assert_eq!(seen(claimed_at), vec![ConnIdentity::ClaimHeld], "premise");
-    assert_eq!(transport_keys(claimed_at).await, vec![]);
+    assert_eq!(h.transport_keys(claimed_at).await, vec![]);
 
     h.transport_closed(dialled_at).await;
     assert_eq!(h.ring_key_at(claimed_at).as_ref(), Some(&peer), "premise");
-    assert_eq!(transport_keys(claimed_at).await, vec![peer]);
+    assert_eq!(h.transport_keys(claimed_at).await, vec![peer]);
 }
 
 /// The key a transport is given is the one bound to its connection. A
@@ -3395,13 +3428,13 @@ async fn a_promotion_under_a_key_not_bound_is_refused_and_counted() {
 
     h.dial(bound_at, &peer).await;
     assert_eq!(
-        transport_keys(bound_at).await,
+        h.transport_keys(bound_at).await,
         vec![peer.clone()],
         "premise"
     );
     h.mgr.tell_transport_peer_identity(bound_at, &other);
     assert_eq!(
-        transport_keys(bound_at).await,
+        h.transport_keys(bound_at).await,
         vec![peer.clone()],
         "the other key is not sent"
     );
@@ -3409,9 +3442,126 @@ async fn a_promotion_under_a_key_not_bound_is_refused_and_counted() {
         seen(bound_at),
         vec![ConnIdentity::SetDialed, ConnIdentity::PromotionKeyMismatch]
     );
+    assert_eq!(
+        h.transport_seen(bound_at).await,
+        vec![ConnIdentity::TransportKeySent],
+        "only the promotion's key was sent"
+    );
 
     h.accept(unbound_at).await;
     h.mgr.tell_transport_peer_identity(unbound_at, &other);
-    assert_eq!(transport_keys(unbound_at).await, vec![]);
+    assert_eq!(h.transport_keys(unbound_at).await, vec![]);
     assert_eq!(seen(unbound_at), vec![ConnIdentity::PromotionKeyMismatch]);
+}
+
+/// A node whose transport has no QUIC endpoint gives no transport a key: no
+/// promotion path sends one, and nothing is counted.
+#[tokio::test]
+async fn quic_off_gives_no_transport_a_key() {
+    let mut h = Harness::new("transport-key-quic-off").await;
+    h.mgr.transport_has_quic = false;
+    let dialled: SocketAddr = "203.0.113.218:6109".parse().unwrap();
+    let requested: SocketAddr = "203.0.113.219:6110".parse().unwrap();
+    let matched: SocketAddr = "203.0.113.220:6111".parse().unwrap();
+    h.watch(&[dialled, requested, matched]);
+    let (a, b, c) = (key(), key(), key());
+
+    h.dial(dialled, &a).await;
+    h.accept(requested).await;
+    h.connect_peer(PeerKeyLocation::new(b.clone(), requested))
+        .await;
+    h.accept_expected(matched, &c).await;
+    for (addr, peer) in [(dialled, &a), (requested, &b), (matched, &c)] {
+        assert_eq!(
+            h.ring_key_at(addr).as_ref(),
+            Some(peer),
+            "premise: promoted"
+        );
+        assert_eq!(h.transport_keys(addr).await, vec![], "{addr}");
+        assert_eq!(h.transport_seen(addr).await, vec![], "{addr}");
+    }
+}
+
+/// A key the node cannot hand to a connection's task at once (its channel
+/// is full) is sent from a short task and counted when it gets through; one
+/// still not handed over after the 1 s fallback is counted as undelivered.
+#[tokio::test(start_paused = true)]
+async fn a_key_for_a_full_channel_is_counted_sent_or_undelivered() {
+    let counts = Some(super::DeliveryCounts {
+        delivered: ConnIdentity::TransportKeySent,
+        timed_out: ConnIdentity::TransportKeyUndelivered,
+    });
+    let filler = || {
+        Right(ConnEvent::NodeAction(NodeEvent::DropConnection(
+            "198.51.100.48:6232".parse().unwrap(),
+            crate::tracing::DisconnectReason::Explicit("filler".into()),
+        )))
+    };
+    for (addr, drain, expected) in [
+        ("198.51.100.49:6233", true, ConnIdentity::TransportKeySent),
+        (
+            "198.51.100.50:6234",
+            false,
+            ConnIdentity::TransportKeyUndelivered,
+        ),
+    ] {
+        let addr: SocketAddr = addr.parse().unwrap();
+        TRANSPORT_METRICS.watch_conn_identity(addr);
+        let (sender, mut receiver) = mpsc::channel(1);
+        sender.try_send(filler()).expect("room for one");
+        super::notify_connection_task(
+            sender,
+            Right(ConnEvent::SetPeerIdentity(key())),
+            addr,
+            "peer identity",
+            counts,
+        );
+        assert_eq!(seen_all(addr), vec![], "nothing handed over yet");
+        if drain {
+            assert!(receiver.recv().await.is_some(), "the filler");
+            let delivered = tokio::time::timeout(Duration::from_millis(500), receiver.recv())
+                .await
+                .expect("delivered once there is room");
+            assert!(matches!(
+                delivered,
+                Some(Right(ConnEvent::SetPeerIdentity(_)))
+            ));
+        }
+        // Past the 1 s fallback; also lets the sending task count.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(seen_all(addr), vec![expected], "{addr}");
+        drop(receiver);
+    }
+}
+
+/// Every identity decision recorded for `addr`, unfiltered.
+fn seen_all(addr: SocketAddr) -> Vec<ConnIdentity> {
+    TRANSPORT_METRICS.conn_identity_from(addr)
+}
+
+/// A promotion of a connection the ring already holds adds nothing, so it
+/// is not a promotion: it reports `AlreadyInRing` and gives the transport
+/// no second key. Here the address is also still tracked as transient,
+/// which makes `promote_existing_connection` ask the ring again.
+#[tokio::test]
+async fn promoting_a_connection_already_in_the_ring_sends_no_second_key() {
+    let mut h = Harness::new("transport-key-already-in-ring").await;
+    let addr: SocketAddr = "203.0.113.221:6112".parse().unwrap();
+    h.watch(&[addr]);
+    let peer = key();
+
+    h.dial(addr, &peer).await;
+    assert_eq!(h.transport_keys(addr).await, vec![peer.clone()], "premise");
+    let connection_manager = &h.mgr.bridge.op_manager.ring.connection_manager;
+    assert!(connection_manager.try_register_transient(addr, None));
+    assert!(connection_manager.is_in_ring(addr), "premise: in the ring");
+
+    let promotion = h.mgr.promote_existing_connection(addr, &peer, None).await;
+    assert_eq!(promotion, Promotion::AlreadyInRing);
+    assert_eq!(h.transport_keys(addr).await, vec![peer]);
+    assert_eq!(
+        h.transport_seen(addr).await,
+        vec![ConnIdentity::TransportKeySent],
+        "one key sent, at the dial's promotion"
+    );
 }

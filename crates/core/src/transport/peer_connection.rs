@@ -913,6 +913,8 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
 
     /// The peer's key as the node recorded it, if the transport holds one
     /// yet (see the `peer_identity` field). Read by the QUIC upgrade.
+    /// Holding a key does not mean the connection was promoted: an outbound
+    /// connection holds the key it dialled from the start.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn peer_identity(&self) -> Option<&TransportPublicKey> {
         self.peer_identity.key()

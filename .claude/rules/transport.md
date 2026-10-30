@@ -1033,17 +1033,22 @@ no extra message, no exporter proof.
     gets a connection from an unexpected key.
   → The expected key comes from the node's own record, never from an
     upgrade message. A connection's transport (PeerConnection) holds its
-    peer's key: the key it dialled, for an outbound connection, and the
-    key the node promoted the connection into the ring under, sent by the
-    bridge as ConnEvent::SetPeerIdentity at promotion
-    (P2pConnManager::tell_transport_peer_identity, called only where a
-    connection enters the ring) and taken from the identity bound to the
-    connection at establishment (p2p_protoc/identity.rs). A promotion
-    under a key that is not the bound one sends nothing
-    (conn_identity_promotion_key_mismatch); a transport given a key other
-    than the one it holds keeps its key (conn_identity_transport_key_refused).
-    conn_identity_transport_key_set / _same count the keys given. Both
-    mismatch counters are expected to stay at 0.
+    peer's key: the key it dialled, for an outbound connection, and, only
+    when the transport has a QUIC endpoint (TransportHandle::quic_endpoint),
+    the key the node promoted the connection into the ring under. The
+    bridge sends that as ConnEvent::SetPeerIdentity when the ring takes the
+    connection (P2pConnManager::tell_transport_peer_identity: after
+    handle_successful_connection adds it, and when
+    promote_existing_connection returns Promoted, once the connection is
+    bound), with the key the node bound to it (identity::bind). With QUIC
+    off nothing is sent. Counters (conn_identity_*): transport_key_sent
+    (handed to the connection's task), transport_key_undelivered (not handed
+    over within the 1 s fallback; not re-sent), transport_key_set / _same
+    (the transport took it), and promotion_key_mismatch (promoted under a key
+    that is not the bound one; nothing sent) and transport_key_refused (the
+    transport holds another key and keeps it), which must stay at 0 (the
+    simulation tripwire and test_quic_prefer_forms_a_mesh_of_the_same_peers_as_quic_off
+    assert it).
 Tests: conversion vs curve25519-dalek 5 (random keys, bit 255 set, u = -1),
 signer key == verifier key over many keypairs with both natural sign bits,
 signatures verified by ed25519-dalek and refused with any bit flipped,
