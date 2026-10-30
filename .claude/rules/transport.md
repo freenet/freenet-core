@@ -638,7 +638,8 @@ SymmetricMessagePayload::Upgrade(UpgradeControl) is bincode index 7,
 appended after AckConnectionV2. UpgradeControl is Offer { attempt, caps },
 Accept { attempt } or Decline { attempt, reason }.
 
-Decode-only until step e5: nothing sends it. A node that receives one acks
+Decode-only until step e5a-5b wires quic/upgrade/machine.rs in: nothing sends
+it. A node that receives one acks
 it like a ShortMessage, counts it (upgrade_control_received in
 transport_snapshot) and ignores it. It never replies and never closes the
 connection.
@@ -650,6 +651,16 @@ cannot decode and 0.2.148 drops it, so the decoder must ship in a release
 before any release sends the message. A reply to a received Offer needs no
 gate. The floor follows the wire-gated-floor rule in docs/RELEASING.md
 (QUIC_UPGRADE_SHIPPED_IN marker).
+
+An Offer also needs may_offer_upgrade(remote_version): the remote is at or
+above QUIC_UPGRADE_NEGOTIATES_IN, the first release that answers one (a peer
+below it decodes an Offer and ignores it). Parked at (0, 3, 0), above every
+release, until e5a-5b sets it to the release that first ships the negotiation
+and records it in QUIC_UPGRADE_NEGOTIATES_SHIPPED_IN.
+
+Decline reasons (DeclineReason, wire values): 1 Disabled, 2 Backoff, 3 Busy,
+4 NotReady (no peer key from a promotion yet, or an attempt in progress). Any
+other value is a decline with no stated reason.
 
 Append only, at both levels: a new SymmetricMessagePayload variant goes
 after the last one, and existing variants keep their bytes
@@ -868,6 +879,101 @@ reaches it and it sends nothing; the listener holds it, with the queue of
 its accept loop (below), which hands on no attempt while the allow-set is
 empty. Upgrading a UDP session to QUIC comes later, so only tests open
 QUIC connections.
+
+Upgrade state machine (`quic/upgrade/machine.rs`, #5940 step e5a-5a, not yet
+wired in): UpgradeMachine::step(Inputs { now, sample, policy }, Event) returns
+the Actions for the caller to carry out. It does no I/O and reads no clock:
+now comes from the connection's TimeSource, sample is a GlobalRng draw in
+0..1. The caller sends Event::Tick at UpgradeMachine::deadline(). The module
+doc has the transition table.
+  Roles: the higher key is the server and the only side that offers. A role
+  comes only from Event::Promoted, so a transport holding no peer key, or one
+  whose promotion sent no key, is not eligible (it answers an Offer with
+  NotReady). Equal keys have no role and the machine is Off.
+  Offer: after promotion plus 2 to 10 s, only if may_offer_upgrade, and only
+  with a permit from QuicPolicy::admit. allow_peer runs before the Offer is
+  sent, and the caller then reports Event::OfferSent, which is what records
+  Outcome::Offered, so a refused allow_peer is not counted as an offer. A
+  permit is held inside the Setup and Active states, so leaving them returns
+  it. At the path limit the server does not offer and is not charged (retry
+  after 60 s, jittered); a client answers Busy.
+  Timeouts: Offer 10 s, connecting 10 s, waiting for the other side's control
+  frame 10 s (two Ready/ReadyAck sends of 5 s each), Protocol{0x1} recheck 1 s.
+  Established: the client on Ready, the server on ReadyAck. Ready carries the
+  attempt id; a frame or report for any other attempt changes nothing.
+  Backoff: 60 s doubling to 1 h, 1 h after an identity mismatch, all +/-20%
+  (util::backoff::ExponentialBackoff; TrackedBackoff reads the clock, so it is
+  not used here). A longer pending backoff is not shortened. Only a path that
+  lasted STABLE_PATH (10 min) clears the failure count, also when the session
+  or endpoint ends it, so a path that keeps dying soon after it comes up is
+  retried less often.
+  Session end: from Setup, Rechecking or an Active path younger than
+  STABLE_PATH, SessionEnded takes a normal backoff, because the session of a
+  restarted peer is replaced before its old QUIC connection reports anything.
+  A failure that already charged left the machine in Idle, so it is not
+  charged twice. An endpoint ending, or a SessionEnded with the endpoint read
+  as Down, charges nothing.
+  Uncharged: a Decline of Busy, NotReady or Backoff and a full allow-set retry
+  after 60 s (jittered) and leave the failure count. So a peer that stays
+  NotReady or in its own backoff is offered to once per 60 s while that lasts.
+  Disabled and an unknown reason take the normal backoff.
+  Across sessions: BackoffSeed { failures, retry_at } carries the count and the
+  next attempt's time. UpgradeMachine::backoff_seed reads it, after stepping
+  SessionEnded, and Event::Promoted takes it, since an inbound session has no
+  key until promotion and its machine must exist before that to answer an
+  early Offer. A later promotion's seed is ignored. retry_at is cut to
+  SEED_WAIT_MAX (72 min, the longest delay with the most jitter) and the count
+  is dropped once retry_at is more than BACKOFF_MAX in the past, since the
+  seed may come off a clock with another epoch. A promotion's first offer waits
+  for the later of the seed and its own delay. e5a-5b must carry it per peer key
+  across a replaced session, or a session that flaps retries at session rate.
+  Failures: close codes 1, 3, 4 and 5, a lost connection, an idle timeout and a
+  deadline each mean fallback plus normal backoff, then a new offer. Never a
+  permanent downgrade. Identity: close code 2 received, or Event::IdentityMismatch
+  (closes with IDENTITY_MISMATCH). A TLS failure during the handshake
+  (Refused{Handshake}) takes the normal backoff.
+  A failed Ready or ReadyAck send: a lost connection takes the path of
+  Event::PathFailed, attributed against the endpoint first (the kind in
+  BoundedSend is not attributed; a PathFailed's is), and a stop from the peer
+  is one stream's and changes nothing. A send that timed out or never left the
+  node is a normal failure.
+  Protocol{0x1}: the attempt's resources go at once, then up to 1 s for the
+  endpoint to read Down. If it does, fallback_endpoint_down and no backoff; if
+  not, a normal backoff.
+  Control frames refused during setup: UnknownVersion and UnknownType close at
+  once with CONTROL_REFUSED and a normal backoff, so the sender does not wait
+  for its setup timeout. WrongLength and Empty wait for the deadline. Once
+  active, a refused frame leaves the path alone.
+  Off is final for the session, also for a policy that later clears (endpoint
+  Down, Released or Disabled, session ended, policy refusing, below the version
+  floor, equal keys): no re-offer, and no charge to the peer except from a
+  session end (above). A client or a machine with no role answers an Offer in
+  Off with Disabled; a server records role_conflict and does not reply. A later
+  Promoted changes and records nothing.
+  An Offer repeating or older than the highest seen gets no reply. An Offer
+  while an attempt is in progress gets NotReady; a client never tears a path
+  down because of an Offer, so offers cannot make it dial faster than its
+  attempts finish. A server that receives an Offer records role_conflict and
+  does not reply.
+  Caller contracts (e5a-5b): report OfferSent before stepping any reply to that
+  Offer; drop an Offer still deferred behind allow_peer once a TearDown names
+  its attempt; read backoff_seed after stepping SessionEnded (None when the machine took no seed: file nothing); end and file any older session for the peer key BEFORE stepping Promoted on the new one, and never let an older session's seed replace a newer one's (a max merge undoes a stable path's clear, so track session order); give every session the listener's clock clone (RealTime::new() starts its own epoch); give the client
+  and server machines of a session the session's lifetime, since attempt ids
+  restart per session and a client ignores an Offer at or below the highest it
+  has seen, with no reply.
+  Action::Record(Outcome) carries the outcomes for e5a-6. Local recycle closes
+  reach the machine as ConnectionLost; their counts stay in quic_close_sent_*.
+  Tests (machine/tests.rs, no simulation): every (role, state, event) against
+  a table where anything unlisted must change nothing, including failures,
+  retry_at, last_attempt and last_offer, the same for stale attempts, plus
+  backoff, jitter bounds, deadlines, each close code through the real error
+  mapping, Down as terminal, and the permit count after every step. A harness
+  (Pair) runs two machines on one clock and loses each message kind once, and
+  asserts both end up active, or both idle with no permits, within a bound for
+  that kind (30 s, or 125 s for a lost close, which waits for the idle timeout).
+  timeouts_and_windows_have_these_values pins the constants as literals, and
+  negotiation_floor_stays_above_every_release_that_ignores_an_offer stops
+  QUIC_UPGRADE_NEGOTIATES_IN going down to 0.2.152 or below.
 
 Upgrade policy (`quic/upgrade/policy.rs`, not yet wired in):
 `QuicPolicy::new(network_api, breaker, availability)` takes the config, the
@@ -1407,7 +1513,10 @@ Application error codes, one range per QUIC frame type, all one-byte
     0x00..=0x0f CONNECTION_CLOSE: close_code::NODE_DROPPED_PEER 0,
                 DOWNGRADE 1 (fall back to UDP), IDENTITY_MISMATCH 2,
                 SEND_ABORT_LIMIT 3 and PEER_NOT_ACKNOWLEDGING 4 (path
-                recycling, M6; the peer reads both as Downgrade)
+                recycling, M6; the peer reads both as Downgrade),
+                CONTROL_REFUSED 5 (a control frame of an unknown version or
+                type arrived during path setup; the peer reads it as
+                Downgrade, a node without this code as ConnectionLost)
     0x10..=0x1f STOP_SENDING: path::stop_code (receiver refusals;
                 NOT_ACCEPTING_DATA 0x19 is a shadow path refusing data. Data
                 may be sent only after caps negotiation, so it is a counter

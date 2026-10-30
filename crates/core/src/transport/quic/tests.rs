@@ -2569,8 +2569,8 @@ fn the_cap_wakes_waiters_per_quic_datagram() {
 }
 
 /// Each close code reaches the peer as that code, and the peer maps it to
-/// the kind its handling depends on: `Downgrade` (and the two recycle
-/// codes, which also ask the peer to fall back to UDP) and
+/// the kind its handling depends on: `Downgrade` (and the recycle codes and
+/// `ControlRefused`, which also ask the peer to fall back to UDP) and
 /// `IdentityMismatch` are refusals, `NodeDroppedPeer` (also what dropping a connection sends) is a
 /// lost connection. Either side can close. Each close is counted once, by
 /// code; a second close of an ended connection sends and counts nothing.
@@ -2591,7 +2591,8 @@ fn close_codes_reach_the_peer() {
             QuicCloseCode::NodeDroppedPeer => QuicErrorKind::ConnectionLost,
             QuicCloseCode::Downgrade
             | QuicCloseCode::SendAbortLimit
-            | QuicCloseCode::PeerNotAcknowledging => QuicErrorKind::Refused {
+            | QuicCloseCode::PeerNotAcknowledging
+            | QuicCloseCode::ControlRefused => QuicErrorKind::Refused {
                 reason: QuicRefusal::Downgrade,
             },
             QuicCloseCode::IdentityMismatch => QuicErrorKind::Refused {

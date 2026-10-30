@@ -614,6 +614,7 @@ fn close_codes_have_fixed_distinct_wire_values() {
         (QuicCloseCode::IdentityMismatch, 2),
         (QuicCloseCode::SendAbortLimit, 3),
         (QuicCloseCode::PeerNotAcknowledging, 4),
+        (QuicCloseCode::ControlRefused, 5),
     ];
     assert_eq!(expected.len(), QuicCloseCode::COUNT);
     for (code, wire) in expected {
@@ -621,7 +622,7 @@ fn close_codes_have_fixed_distinct_wire_values() {
         assert_eq!(QuicCloseCode::from_code(u64::from(wire)), Some(code));
         assert!(!code.reason().is_empty());
     }
-    for unknown in [5_u64, 0x0f, 0x11, 0x21, u64::from(u32::MAX)] {
+    for unknown in [6_u64, 0x0f, 0x11, 0x21, u64::from(u32::MAX)] {
         assert_eq!(QuicCloseCode::from_code(unknown), None, "{unknown:#x}");
     }
 }

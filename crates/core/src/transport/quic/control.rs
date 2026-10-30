@@ -27,8 +27,11 @@
 //! - An unknown version, an unknown type, or a length other than
 //!   [`CONTROL_LEN`] is refused ([`ControlError`]), never a panic. The
 //!   receiving path counts each, only through `QuicPath::decode_control`
-//!   ([`QuicControl::decode`] counts nothing). The sender
-//!   learns nothing: its send reports `Sent`.
+//!   ([`QuicControl::decode`] counts nothing). The sender's send reports
+//!   `Sent`. During path setup, an unknown version or type also makes the
+//!   receiver close the path with `close_code::CONTROL_REFUSED`, which the
+//!   sender reads as a downgrade (`upgrade::machine`); otherwise the sender
+//!   learns nothing.
 //! - A new type or field needs a new version. Bytes past the end are refused,
 //!   so a field cannot be appended silently. `UpgradeControl` is different:
 //!   bincode tolerates trailing bytes there, so a field appended to it would

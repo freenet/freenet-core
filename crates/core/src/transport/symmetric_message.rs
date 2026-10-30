@@ -482,6 +482,70 @@ pub(crate) const QUIC_UPGRADE_MIN_VERSION: (u8, u8, u16) = (0, 2, 149);
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const QUIC_UPGRADE_SHIPPED_IN: Option<(u8, u8, u16)> = Some((0, 2, 149));
 
+/// First release that ANSWERS an `Offer` (#5940 e5a). A peer from
+/// [`QUIC_UPGRADE_MIN_VERSION`] up to this release decodes an `Offer` and
+/// ignores it, so it is never offered: the offer could only time out, which
+/// would count against the upgrade success rate.
+///
+/// Parked above every release until the negotiation is wired in (e5a-5b),
+/// which must set this to the release that first ships it and then record
+/// that in [`QUIC_UPGRADE_NEGOTIATES_SHIPPED_IN`], per the wire-gated-floor
+/// rule in `docs/RELEASING.md`. Too high only delays upgrades.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const QUIC_UPGRADE_NEGOTIATES_IN: (u8, u8, u16) = (0, 3, 0);
+
+/// Has the release [`QUIC_UPGRADE_NEGOTIATES_IN`] names shipped? Same use as
+/// [`QUIC_UPGRADE_SHIPPED_IN`]; checked by
+/// `negotiation_floor_tracks_the_shipping_release`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const QUIC_UPGRADE_NEGOTIATES_SHIPPED_IN: Option<(u8, u8, u16)> = None;
+
+/// May an `Offer` be sent to a remote of `remote_version`? Fails closed like
+/// [`may_send_upgrade`], which this implies: the floor is above that one's
+/// (`negotiation_floor_is_not_below_the_decoder_floor`).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn may_offer_upgrade(remote_version: Option<(u8, u8, u16)>) -> bool {
+    may_send_upgrade(remote_version)
+        && remote_version.is_some_and(|v| v >= QUIC_UPGRADE_NEGOTIATES_IN)
+}
+
+/// Why a client declined an `Offer`, as [`UpgradeControl::Decline`]'s
+/// `reason`. Wire values: never renumber, add at the next free value. A
+/// value [`Self::from_wire`] does not know is a decline with no stated
+/// reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum DeclineReason {
+    /// This node's `QuicPolicy` refuses upgrades.
+    Disabled = 1,
+    /// This node is backing off from an upgrade with this peer.
+    Backoff = 2,
+    /// This node holds its `quic-max-paths` paths.
+    Busy = 3,
+    /// This transport cannot take the offer now: it holds no peer key from a
+    /// promotion, or an attempt is still in progress on it.
+    NotReady = 4,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl DeclineReason {
+    /// The `reason` byte on the wire.
+    pub(crate) const fn wire(self) -> u8 {
+        self as u8
+    }
+
+    /// The reason a `reason` byte names, if this node knows it.
+    pub(crate) const fn from_wire(reason: u8) -> Option<Self> {
+        match reason {
+            1 => Some(Self::Disabled),
+            2 => Some(Self::Backoff),
+            3 => Some(Self::Busy),
+            4 => Some(Self::NotReady),
+            _ => None,
+        }
+    }
+}
+
 /// May an [`SymmetricMessagePayload::Upgrade`] be sent to a remote of
 /// `remote_version`? Fails closed: an unknown version (`None`) or one below
 /// [`QUIC_UPGRADE_MIN_VERSION`] is `false`.
@@ -1118,6 +1182,79 @@ mod test {
         assert!(may_send_upgrade(Some((major, minor, patch + 1))));
         assert!(may_send_upgrade(Some((major, minor + 1, 0))));
         assert!(may_send_upgrade(Some((major + 1, 0, 0))));
+    }
+
+    /// Same check as `upgrade_floor_tracks_the_shipping_release`, for the
+    /// release that first answers an `Offer`.
+    #[test]
+    fn negotiation_floor_tracks_the_shipping_release() {
+        let mut parts = env!("CARGO_PKG_VERSION")
+            .split(|c: char| !c.is_ascii_digit())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.parse::<u16>().expect("numeric version component"));
+        let crate_version = (
+            parts.next().expect("major") as u8,
+            parts.next().expect("minor") as u8,
+            parts.next().expect("patch"),
+        );
+        match QUIC_UPGRADE_NEGOTIATES_SHIPPED_IN {
+            Some(shipped) => assert_eq!(shipped, QUIC_UPGRADE_NEGOTIATES_IN),
+            None => assert!(
+                crate_version < QUIC_UPGRADE_NEGOTIATES_IN,
+                "floor {QUIC_UPGRADE_NEGOTIATES_IN:?} is a PREDICTION, but the crate is \
+                 already at {crate_version:?}: record the release or raise the floor"
+            ),
+        }
+    }
+
+    /// Companion, like `upgrade_floor_stays_above_every_release_without_the_decoder`:
+    /// the floor must never drop to a release that decodes an `Offer` and
+    /// ignores it. Every release up to this one is such a release.
+    #[test]
+    fn negotiation_floor_stays_above_every_release_that_ignores_an_offer() {
+        const LAST_RELEASE_THAT_IGNORES_AN_OFFER: (u8, u8, u16) = (0, 2, 152);
+        assert!(
+            QUIC_UPGRADE_NEGOTIATES_IN > LAST_RELEASE_THAT_IGNORES_AN_OFFER,
+            "0.2.152 and older ignore an Offer, so the offer could only time out"
+        );
+    }
+
+    #[test]
+    fn negotiation_floor_is_not_below_the_decoder_floor() {
+        assert!(QUIC_UPGRADE_NEGOTIATES_IN >= QUIC_UPGRADE_MIN_VERSION);
+    }
+
+    /// `Offer` goes only to a known version at or above the floor.
+    #[test]
+    fn may_offer_upgrade_gates_on_the_negotiation_floor() {
+        let (major, minor, patch) = QUIC_UPGRADE_NEGOTIATES_IN;
+        assert!(!may_offer_upgrade(None));
+        assert!(!may_offer_upgrade(Some(QUIC_UPGRADE_MIN_VERSION)));
+        assert!(!may_offer_upgrade(Some((
+            major,
+            minor.saturating_sub(1),
+            u16::MAX
+        ))));
+        assert!(may_offer_upgrade(Some((major, minor, patch))));
+        assert!(may_offer_upgrade(Some((major, minor, patch + 1))));
+    }
+
+    /// The decline reasons are wire values, written out; anything else is a
+    /// decline with no stated reason.
+    #[test]
+    fn decline_reasons_have_fixed_wire_values() {
+        for (reason, wire) in [
+            (DeclineReason::Disabled, 1),
+            (DeclineReason::Backoff, 2),
+            (DeclineReason::Busy, 3),
+            (DeclineReason::NotReady, 4),
+        ] {
+            assert_eq!(reason.wire(), wire);
+            assert_eq!(DeclineReason::from_wire(wire), Some(reason));
+        }
+        for unknown in [0, 5, u8::MAX] {
+            assert_eq!(DeclineReason::from_wire(unknown), None);
+        }
     }
 
     /// Mirrors `untracked_noop_floor_tracks_the_shipping_release`: the moment
