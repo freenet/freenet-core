@@ -318,7 +318,9 @@ impl Default for ConfigArgs {
                 gateways: None,
                 gateway: None,
                 location: None,
-                bandwidth_limit: Some(3_000_000), // 3 MB/s default for streaming transfers only
+                // Library/test default only: the CLI leaves this unset (see
+                // NetworkArgs::bandwidth_limit), and it only seeds the initial rate (#6047).
+                bandwidth_limit: Some(3_000_000),
                 total_bandwidth_limit: None,
                 min_bandwidth_per_connection: None,
                 blocked_addresses: None,
