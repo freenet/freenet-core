@@ -471,6 +471,14 @@ Current wire-gated floors:
   `upgrade_floor_stays_above_every_release_without_the_decoder` catches the
   floor being lowered.
 
+- `QUIC_UPGRADE_NEGOTIATES_IN` in the same file (the first release that answers
+  a QUIC upgrade `Offer`, #5940 step e5a). Parked at `(0, 3, 0)`: nothing sends
+  an `Offer` until the negotiation is wired in (e5a-5b), which must set this to
+  the release that first ships it and then freeze it. Guarded by
+  `QUIC_UPGRADE_NEGOTIATES_SHIPPED_IN`, checked by
+  `symmetric_message.rs::negotiation_floor_tracks_the_shipping_release`. Too high
+  only delays upgrades.
+
 When a NEW wire-gated feature first ships (not this one), set its floor to
 **exactly that release version** and freeze it, as described above.
 

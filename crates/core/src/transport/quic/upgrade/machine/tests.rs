@@ -1,0 +1,1275 @@
+//! Every (role, state, event) of the machine. [`expected`] writes out what
+//! changes; anything it does not list must change nothing, so a transition
+//! nobody meant to have fails too. The other tests cover what needs more than
+//! one step: backoff, deadlines, permits, close codes and the end of the
+//! endpoint.
+
+use bytes::Bytes;
+use quinn::VarInt;
+
+use super::*;
+use crate::config::NetworkApiConfig;
+use crate::transport::crypto::TransportKeypair;
+use crate::transport::quic::breaker::BreakerOutcome;
+use crate::transport::quic::liveness::QuicAvailabilityWatch;
+use crate::transport::quic::path::SendFailure;
+use crate::transport::symmetric_message::{QUIC_UPGRADE_MIN_VERSION, QUIC_UPGRADE_NEGOTIATES_IN};
+
+const SERVER_ATTEMPT: u32 = 1;
+const CLIENT_ATTEMPT: u32 = 5;
+const STALE: u32 = 7;
+/// With this draw, jitter multiplies by exactly 1 (and the offer delay is 6 s).
+const NO_JITTER: f64 = 0.5;
+
+fn keys() -> (TransportPublicKey, TransportPublicKey) {
+    let a = TransportKeypair::new().public().clone();
+    let b = TransportKeypair::new().public().clone();
+    assert_ne!(a, b);
+    if a > b { (a, b) } else { (b, a) }
+}
+
+/// A machine, its policy and the time.
+struct Rig {
+    machine: UpgradeMachine,
+    policy: QuicPolicy,
+    availability: tokio::sync::watch::Sender<QuicAvailability>,
+    /// What `Promoted` carries: the other side's key.
+    peer: TransportPublicKey,
+    now: Duration,
+    sample: f64,
+}
+
+impl Rig {
+    fn with_config(role: Role, mode: &str, max_paths: usize) -> Self {
+        let (high, low) = keys();
+        let (local, peer) = match role {
+            Role::Server => (high, low),
+            Role::Client => (low, high),
+        };
+        let (availability, watch) = QuicAvailabilityWatch::for_test(QuicAvailability::Up);
+        let mut config: NetworkApiConfig = toml::from_str("").expect("default network config");
+        config.transport_quic = Some(mode.to_string());
+        config.quic_max_paths = Some(max_paths.to_string());
+        Self {
+            machine: UpgradeMachine::new(local),
+            policy: QuicPolicy::new(&config, BreakerOutcome::NotConsulted, watch),
+            availability,
+            peer,
+            now: Duration::from_secs(1000),
+            sample: NO_JITTER,
+        }
+    }
+
+    fn new(role: Role) -> Self {
+        Self::with_config(role, "shadow", 4)
+    }
+
+    fn promoted(role: Role) -> Self {
+        let mut rig = Self::new(role);
+        rig.promote(Some(QUIC_UPGRADE_NEGOTIATES_IN));
+        rig
+    }
+
+    fn promote(&mut self, remote_version: Option<(u8, u8, u16)>) -> Vec<Action> {
+        let peer_key = self.peer.clone();
+        self.step(Event::Promoted {
+            peer_key,
+            remote_version,
+        })
+    }
+
+    fn step(&mut self, event: Event) -> Vec<Action> {
+        let cx = Inputs {
+            now: self.now,
+            sample: self.sample,
+            policy: &self.policy,
+        };
+        self.machine.step(cx, event)
+    }
+
+    fn tick_at(&mut self, now: Duration) -> Vec<Action> {
+        self.now = now;
+        self.step(Event::Tick)
+    }
+
+    /// Past every deadline the machine holds.
+    fn tick_due(&mut self) -> Vec<Action> {
+        let due = self.machine.deadline().unwrap_or(self.now);
+        self.tick_at(due.max(self.now))
+    }
+
+    fn offer(&mut self, attempt: u32) -> Vec<Action> {
+        self.step(Event::Upgrade(UpgradeControl::Offer { attempt, caps: 0 }))
+    }
+
+    fn in_use(&self) -> usize {
+        self.policy.permits().in_use()
+    }
+
+    /// The delay until `retry_at`.
+    fn backoff(&self) -> Duration {
+        self.machine.retry_at.saturating_sub(self.now)
+    }
+
+    /// A path of `attempt` up on either side, from a promoted machine.
+    fn activate(&mut self) -> u32 {
+        if self.machine.role == Some(Role::Server) {
+            self.tick_due();
+            let attempt = self.machine.last_attempt;
+            self.step(Event::Upgrade(UpgradeControl::Accept { attempt }));
+            self.step(Event::PathEstablished { attempt });
+            self.step(Event::Control(QuicControl::ReadyAck { attempt, caps: 0 }));
+            attempt
+        } else {
+            let attempt = self
+                .machine
+                .last_offer
+                .map_or(CLIENT_ATTEMPT, |last| last + 1);
+            self.offer(attempt);
+            self.step(Event::PathEstablished { attempt });
+            self.step(Event::Control(QuicControl::Ready { attempt, caps: 0 }));
+            attempt
+        }
+    }
+
+    fn close_with(&mut self, attempt: u32, code: u64) -> Vec<Action> {
+        let kind = QuicErrorKind::from(quinn::ConnectionError::ApplicationClosed(
+            quinn::ApplicationClose {
+                error_code: VarInt::from_u64(code).unwrap(),
+                reason: Bytes::new(),
+            },
+        ));
+        self.step(Event::PathFailed { attempt, kind })
+    }
+}
+
+/// The states, by name, for the table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum S {
+    Unpromoted,
+    Idle,
+    Offered,
+    Connecting,
+    Confirming,
+    Active,
+    Rechecking,
+    Off,
+}
+
+fn label(machine: &UpgradeMachine) -> S {
+    match &machine.state {
+        State::Idle => match machine.role {
+            Some(_) => S::Idle,
+            None => S::Unpromoted,
+        },
+        State::Setup { phase, .. } => match phase {
+            Phase::Offered => S::Offered,
+            Phase::Connecting => S::Connecting,
+            Phase::Confirming => S::Confirming,
+        },
+        State::Active { .. } => S::Active,
+        State::Rechecking { .. } => S::Rechecking,
+        State::Off => S::Off,
+    }
+}
+
+fn attempt_of(role: Role) -> u32 {
+    match role {
+        Role::Server => SERVER_ATTEMPT,
+        Role::Client => CLIENT_ATTEMPT,
+    }
+}
+
+/// A rig in `state`.
+fn reach(role: Role, state: S) -> Rig {
+    if state == S::Unpromoted {
+        return Rig::new(role);
+    }
+    let mut rig = Rig::promoted(role);
+    let attempt = attempt_of(role);
+    let go = |rig: &mut Rig, event: fn(u32) -> Event| {
+        rig.step(event(attempt));
+    };
+    match (role, state) {
+        (_, S::Unpromoted | S::Idle) => {}
+        (_, S::Off) => go(&mut rig, |_| Event::SessionEnded),
+        (Role::Server, S::Offered) => {
+            rig.tick_due();
+        }
+        (Role::Server, S::Connecting) => {
+            rig.tick_due();
+            go(&mut rig, |attempt| {
+                Event::Upgrade(UpgradeControl::Accept { attempt })
+            });
+        }
+        (Role::Server, S::Confirming) => {
+            rig.tick_due();
+            go(&mut rig, |attempt| Event::PathEstablished { attempt });
+        }
+        (Role::Server, S::Active | S::Rechecking) | (Role::Client, S::Active | S::Rechecking) => {
+            assert_eq!(rig.activate(), attempt);
+            if state == S::Rechecking {
+                go(&mut rig, |attempt| Event::PathFailed {
+                    attempt,
+                    kind: QuicErrorKind::Protocol { code: 1 },
+                });
+            }
+        }
+        (Role::Client, S::Connecting) => {
+            rig.offer(attempt);
+        }
+        (Role::Client, S::Confirming) => {
+            rig.offer(attempt);
+            go(&mut rig, |attempt| Event::PathEstablished { attempt });
+        }
+        (Role::Client, S::Offered) => unreachable!("a client does not offer"),
+    }
+    assert_eq!(label(&rig.machine), state, "reach {role:?}");
+    rig
+}
+
+const ATTEMPT_EVENTS: [&str; 19] = [
+    "accept",
+    "decline",
+    "ready",
+    "ready_ack",
+    "established",
+    "sent_ok",
+    "sent_maybe",
+    "sent_failed",
+    "refused_version",
+    "refused_type",
+    "refused_length",
+    "refused_empty",
+    "identity",
+    "path_lost",
+    "path_timed_out",
+    "path_protocol",
+    "path_protocol_1",
+    "path_endpoint_down",
+    "path_stream",
+];
+
+const OTHER_EVENTS: [&str; 10] = [
+    "promoted",
+    "tick",
+    "offer",
+    "offer_next",
+    "offer_older",
+    "up",
+    "down",
+    "released",
+    "disabled",
+    "session_ended",
+];
+
+fn event(name: &str, attempt: u32, peer: &TransportPublicKey) -> Event {
+    let failed = |kind| Event::PathFailed { attempt, kind };
+    let refused = |error| Event::ControlRefused { attempt, error };
+    match name {
+        "promoted" => Event::Promoted {
+            peer_key: peer.clone(),
+            remote_version: Some(QUIC_UPGRADE_NEGOTIATES_IN),
+        },
+        "tick" => Event::Tick,
+        "offer" => Event::Upgrade(UpgradeControl::Offer { attempt, caps: 0 }),
+        "offer_next" => Event::Upgrade(UpgradeControl::Offer {
+            attempt: attempt + 1,
+            caps: 0,
+        }),
+        "offer_older" => Event::Upgrade(UpgradeControl::Offer {
+            attempt: attempt - 1,
+            caps: 0,
+        }),
+        "accept" => Event::Upgrade(UpgradeControl::Accept { attempt }),
+        "decline" => Event::Upgrade(UpgradeControl::Decline {
+            attempt,
+            reason: DeclineReason::Busy.wire(),
+        }),
+        "ready" => Event::Control(QuicControl::Ready { attempt, caps: 0 }),
+        "ready_ack" => Event::Control(QuicControl::ReadyAck { attempt, caps: 0 }),
+        "established" => Event::PathEstablished { attempt },
+        "sent_ok" => Event::ControlSent {
+            attempt,
+            outcome: BoundedSend::Sent,
+        },
+        "sent_maybe" => Event::ControlSent {
+            attempt,
+            outcome: BoundedSend::MaybeDelivered(
+                crate::transport::quic::path::MaybeDelivered::TimedOut,
+            ),
+        },
+        "sent_failed" => Event::ControlSent {
+            attempt,
+            outcome: BoundedSend::Failed(SendFailure::TimedOut),
+        },
+        "refused_version" => refused(ControlError::UnknownVersion(2)),
+        "refused_type" => refused(ControlError::UnknownType(9)),
+        "refused_length" => refused(ControlError::WrongLength(3)),
+        "refused_empty" => refused(ControlError::Empty),
+        "identity" => Event::IdentityMismatch { attempt },
+        "path_lost" => failed(QuicErrorKind::ConnectionLost),
+        "path_timed_out" => failed(QuicErrorKind::TimedOut),
+        "path_protocol" => failed(QuicErrorKind::Protocol { code: 0xa }),
+        "path_protocol_1" => failed(QuicErrorKind::Protocol { code: 1 }),
+        "path_endpoint_down" => failed(QuicErrorKind::EndpointDown),
+        "path_stream" => failed(QuicErrorKind::StreamClosed),
+        "up" => Event::EndpointNotUp(QuicAvailability::Up),
+        "down" => Event::EndpointNotUp(QuicAvailability::Down),
+        "released" => Event::EndpointNotUp(QuicAvailability::Released),
+        "disabled" => Event::EndpointNotUp(QuicAvailability::Disabled),
+        "session_ended" => Event::SessionEnded,
+        other => panic!("no event {other}"),
+    }
+}
+
+/// The next state and actions, or `None` when nothing may change.
+fn expected(role: Role, state: S, name: &str) -> Option<(S, Vec<Action>)> {
+    use Action::{Record, SendControl, SendUpgrade, TearDown};
+    let attempt = attempt_of(role);
+    let setup = matches!(state, S::Offered | S::Connecting | S::Confirming);
+    let live = setup || state == S::Active;
+    let tear_down = |code| TearDown { attempt, code };
+    let fail = |code, outcome| Some((S::Idle, vec![tear_down(code), Record(outcome)]));
+    let fail_setup_or_active = |in_setup, active| {
+        fail(
+            QuicCloseCode::Downgrade,
+            if setup { in_setup } else { active },
+        )
+    };
+    let fallback = |cause| Outcome::Fallback(cause);
+    let decline = |attempt, reason: DeclineReason| {
+        vec![
+            SendUpgrade(UpgradeControl::Decline {
+                attempt,
+                reason: reason.wire(),
+            }),
+            Record(Outcome::DeclineSent(reason)),
+        ]
+    };
+    match (role, state, name) {
+        // Before a key, there is no role.
+        (_, S::Unpromoted, "promoted") => Some((S::Idle, vec![])),
+        (_, S::Unpromoted, "offer") => Some((state, decline(attempt, DeclineReason::NotReady))),
+        (_, S::Unpromoted, "offer_next") => {
+            Some((state, decline(attempt + 1, DeclineReason::NotReady)))
+        }
+        (_, S::Unpromoted, "offer_older") => {
+            Some((state, decline(attempt - 1, DeclineReason::NotReady)))
+        }
+
+        // A server never takes an offer, in any state.
+        (Role::Server, _, "offer" | "offer_next" | "offer_older") => {
+            Some((state, vec![Record(Outcome::RoleConflict)]))
+        }
+        // A client's offers.
+        (Role::Client, S::Idle, "offer" | "offer_next" | "offer_older") => {
+            let attempt = match name {
+                "offer" => attempt,
+                "offer_next" => attempt + 1,
+                _ => attempt - 1,
+            };
+            Some((
+                S::Connecting,
+                vec![
+                    SendUpgrade(UpgradeControl::Accept { attempt }),
+                    Action::Dial { attempt },
+                    Record(Outcome::Accepted),
+                ],
+            ))
+        }
+        (Role::Client, S::Off, "offer") => Some((state, decline(attempt, DeclineReason::Disabled))),
+        (Role::Client, S::Off, "offer_next") => {
+            Some((state, decline(attempt + 1, DeclineReason::Disabled)))
+        }
+        (Role::Client, S::Off, "offer_older") => {
+            Some((state, decline(attempt - 1, DeclineReason::Disabled)))
+        }
+        // `offer` and `offer_older` repeat or precede the one in progress.
+        (Role::Client, _, "offer_next") => {
+            Some((state, decline(attempt + 1, DeclineReason::NotReady)))
+        }
+
+        // The server's way up.
+        (Role::Server, S::Idle, "tick") => Some((
+            S::Offered,
+            vec![
+                Action::AllowPeerThenOffer { attempt, caps: 0 },
+                Record(Outcome::Offered),
+            ],
+        )),
+        (Role::Server, S::Offered, "accept") => {
+            Some((S::Connecting, vec![Record(Outcome::Accepted)]))
+        }
+        (Role::Server, S::Offered, "decline") => fail(
+            QuicCloseCode::Downgrade,
+            Outcome::Declined(Some(DeclineReason::Busy)),
+        ),
+        (Role::Server, S::Offered | S::Connecting, "established") => Some((
+            S::Confirming,
+            vec![SendControl(QuicControl::Ready {
+                attempt,
+                caps: caps::KNOWN,
+            })],
+        )),
+        (Role::Server, S::Confirming, "ready_ack") => {
+            Some((S::Active, vec![Record(Outcome::Established)]))
+        }
+        (Role::Server, S::Offered | S::Connecting | S::Confirming, "ready") => {
+            Some((state, vec![Record(Outcome::RoleConflict)]))
+        }
+
+        // The client's way up.
+        (Role::Client, S::Connecting, "established") => Some((S::Confirming, vec![])),
+        (Role::Client, S::Connecting | S::Confirming, "ready") => Some((
+            S::Active,
+            vec![
+                SendControl(QuicControl::ReadyAck {
+                    attempt,
+                    caps: caps::KNOWN,
+                }),
+                Record(Outcome::Established),
+            ],
+        )),
+
+        // Deadlines, on either side.
+        (Role::Server, S::Offered, "tick") => fail(QuicCloseCode::Downgrade, Outcome::NoReply),
+        (_, S::Connecting | S::Confirming, "tick") => {
+            fail(QuicCloseCode::Downgrade, Outcome::Timeout)
+        }
+        // Reached from Active. The endpoint stayed up, so the peer is charged.
+        (_, S::Rechecking, "tick") => Some((
+            S::Idle,
+            vec![Record(Outcome::Fallback(FallbackCause::Protocol))],
+        )),
+
+        // Failures of the attempt.
+        (_, _, "sent_failed") if live => {
+            fail_setup_or_active(Outcome::HandshakeFailed, fallback(FallbackCause::Reset))
+        }
+        (_, _, "refused_version" | "refused_type") if setup => {
+            fail(QuicCloseCode::ControlRefused, Outcome::ControlRefused)
+        }
+        (_, _, "identity") if live => {
+            fail(QuicCloseCode::IdentityMismatch, Outcome::IdentityMismatch)
+        }
+        (_, _, "path_lost") if live => {
+            fail_setup_or_active(Outcome::HandshakeFailed, fallback(FallbackCause::Reset))
+        }
+        (_, _, "path_timed_out") if live => {
+            fail_setup_or_active(Outcome::Timeout, fallback(FallbackCause::Idle))
+        }
+        (_, _, "path_protocol") if live => {
+            fail_setup_or_active(Outcome::HandshakeFailed, fallback(FallbackCause::Protocol))
+        }
+        (_, _, "path_protocol_1") if live => {
+            Some((S::Rechecking, vec![tear_down(QuicCloseCode::Downgrade)]))
+        }
+        (_, _, "path_endpoint_down" | "down") if live => Some((
+            S::Off,
+            vec![
+                tear_down(QuicCloseCode::Downgrade),
+                Record(fallback(FallbackCause::EndpointDown)),
+            ],
+        )),
+
+        // Final events.
+        (_, S::Rechecking, "down") => {
+            Some((S::Off, vec![Record(fallback(FallbackCause::EndpointDown))]))
+        }
+        (_, _, "released" | "disabled" | "session_ended") if live => {
+            Some((S::Off, vec![tear_down(QuicCloseCode::Downgrade)]))
+        }
+        (_, S::Unpromoted | S::Idle | S::Rechecking, "released" | "disabled" | "session_ended") => {
+            Some((S::Off, vec![]))
+        }
+        (_, S::Unpromoted | S::Idle, "down") => Some((S::Off, vec![])),
+
+        _ => None,
+    }
+}
+
+fn holds_a_permit(state: S) -> bool {
+    matches!(
+        state,
+        S::Offered | S::Connecting | S::Confirming | S::Active
+    )
+}
+
+/// One row: the event moves the machine as [`expected`] says, and the path
+/// permit is held exactly while the next state needs it.
+fn check(role: Role, state: S, name: &str, attempt: u32, want: Option<(S, Vec<Action>)>) {
+    let case = format!("{role:?} {state:?} {name} attempt {attempt}");
+    let mut rig = reach(role, state);
+    let before_deadline = rig.machine.deadline();
+    // Past every deadline, so "tick" is due wherever it can be.
+    rig.now = rig.machine.deadline().unwrap_or(rig.now).max(rig.now);
+    let peer = rig.peer.clone();
+    let actions = rig.step(event(name, attempt, &peer));
+    let (next, want_actions) = want.unwrap_or_else(|| (state, Vec::new()));
+    assert_eq!(actions, want_actions, "{case}: actions");
+    assert_eq!(label(&rig.machine), next, "{case}: next state");
+    assert_eq!(
+        rig.in_use(),
+        usize::from(holds_a_permit(next)),
+        "{case}: permit"
+    );
+    if next == state && !actions.iter().any(|a| matches!(a, Action::SendControl(_))) {
+        assert_eq!(rig.machine.deadline(), before_deadline, "{case}: deadline");
+    }
+}
+
+const ALL_STATES: [S; 8] = [
+    S::Unpromoted,
+    S::Idle,
+    S::Offered,
+    S::Connecting,
+    S::Confirming,
+    S::Active,
+    S::Rechecking,
+    S::Off,
+];
+
+fn pairs() -> impl Iterator<Item = (Role, S)> {
+    [Role::Server, Role::Client].into_iter().flat_map(|role| {
+        ALL_STATES
+            .into_iter()
+            .filter(move |state| (role, *state) != (Role::Client, S::Offered))
+            .map(move |state| (role, state))
+    })
+}
+
+/// Every event in every state, for the current attempt.
+#[test]
+fn every_transition_for_the_current_attempt() {
+    for (role, state) in pairs() {
+        for name in ATTEMPT_EVENTS.into_iter().chain(OTHER_EVENTS) {
+            check(
+                role,
+                state,
+                name,
+                attempt_of(role),
+                expected(role, state, name),
+            );
+        }
+    }
+}
+
+/// Every event that names an attempt, for an attempt that is not the current
+/// one, changes nothing in any state.
+#[test]
+fn a_stale_attempt_changes_nothing() {
+    for (role, state) in pairs() {
+        for name in ATTEMPT_EVENTS {
+            check(role, state, name, attempt_of(role) + STALE, None);
+            check(role, state, name, attempt_of(role) - 1, None);
+        }
+    }
+}
+
+/// Running both sides against each other reaches Active on both, each on its
+/// own evidence: the client on `Ready`, the server on `ReadyAck`.
+#[test]
+fn a_server_and_a_client_reach_active_together() {
+    let mut server = Rig::promoted(Role::Server);
+    let mut client = Rig::promoted(Role::Client);
+
+    let actions = server.tick_due();
+    assert_eq!(
+        actions[0],
+        Action::AllowPeerThenOffer {
+            attempt: 1,
+            caps: 0
+        }
+    );
+    let actions = client.offer(1);
+    assert_eq!(
+        actions[..2],
+        [
+            Action::SendUpgrade(UpgradeControl::Accept { attempt: 1 }),
+            Action::Dial { attempt: 1 },
+        ]
+    );
+    server.step(Event::Upgrade(UpgradeControl::Accept { attempt: 1 }));
+    client.step(Event::PathEstablished { attempt: 1 });
+    let actions = server.step(Event::PathEstablished { attempt: 1 });
+    let [Action::SendControl(ready)] = actions[..] else {
+        panic!("server sends Ready: {actions:?}");
+    };
+    assert_eq!(ready.attempt(), 1);
+    assert!(!client.machine.is_active());
+    let actions = client.step(Event::Control(ready));
+    let Action::SendControl(ack) = actions[0] else {
+        panic!("client sends ReadyAck: {actions:?}");
+    };
+    assert!(client.machine.is_active());
+    assert!(!server.machine.is_active());
+    server.step(Event::Control(ack));
+    assert!(server.machine.is_active());
+    assert_eq!(server.machine.deadline(), None);
+    assert_eq!(client.machine.deadline(), None);
+}
+
+/// The higher key is the server: it offers and the lower never does, at any
+/// time. Equal keys have no role and never upgrade.
+#[test]
+fn the_higher_key_is_the_server() {
+    let (high, low) = keys();
+    assert_eq!(Role::of(&high, &low), Some(Role::Server));
+    assert_eq!(Role::of(&low, &high), Some(Role::Client));
+    assert_eq!(Role::of(&high, &high), None);
+
+    let mut client = Rig::promoted(Role::Client);
+    assert_eq!(client.machine.deadline(), None);
+    assert_eq!(client.tick_at(Duration::from_secs(1 << 30)), vec![]);
+
+    let mut rig = Rig::new(Role::Server);
+    rig.peer = rig.machine.local_key.clone();
+    let actions = rig.promote(Some(QUIC_UPGRADE_NEGOTIATES_IN));
+    assert_eq!(actions, vec![Action::Record(Outcome::RoleConflict)]);
+    assert!(rig.machine.is_off());
+}
+
+/// A transport holding no peer key is not eligible: it has no deadline, never
+/// offers however long it waits, and declines an offer. It takes the key from
+/// promotion only, and a later promotion cannot change its role.
+#[test]
+fn no_peer_key_means_no_upgrade() {
+    for role in [Role::Server, Role::Client] {
+        let mut rig = Rig::new(role);
+        assert_eq!(rig.machine.deadline(), None);
+        assert_eq!(rig.tick_at(Duration::from_secs(1 << 30)), vec![]);
+        assert_eq!(rig.in_use(), 0);
+        let actions = rig.offer(1);
+        assert_eq!(
+            actions[0],
+            Action::SendUpgrade(UpgradeControl::Decline {
+                attempt: 1,
+                reason: DeclineReason::NotReady.wire(),
+            })
+        );
+        assert_eq!(rig.in_use(), 0);
+    }
+
+    let mut rig = Rig::promoted(Role::Server);
+    let other = rig.machine.local_key.clone();
+    assert_eq!(rig.machine.role, Some(Role::Server));
+    rig.peer = other; // Equal to the local key: would be no role if it applied.
+    assert_eq!(rig.promote(Some(QUIC_UPGRADE_NEGOTIATES_IN)), vec![]);
+    assert_eq!(rig.machine.role, Some(Role::Server));
+    assert!(!rig.machine.is_off());
+}
+
+/// A server offers only to a peer known to be at or above the floor, and
+/// counts the rest apart. A client may take an offer from any version.
+#[test]
+fn the_version_floor_gates_the_offer() {
+    let below_floor = [None, Some(QUIC_UPGRADE_MIN_VERSION), Some((0, 0, 1))];
+    for version in below_floor {
+        let mut rig = Rig::new(Role::Server);
+        assert_eq!(
+            rig.promote(version),
+            vec![Action::Record(Outcome::IneligibleVersion)],
+            "{version:?}"
+        );
+        assert_eq!(rig.tick_at(Duration::from_secs(1 << 30)), vec![]);
+        assert_eq!(rig.in_use(), 0);
+
+        let mut client = Rig::new(Role::Client);
+        assert_eq!(client.promote(version), vec![]);
+        assert_eq!(client.machine.deadline(), None);
+        assert_eq!(client.offer(1)[2], Action::Record(Outcome::Accepted));
+    }
+    let mut rig = Rig::new(Role::Server);
+    assert_eq!(rig.promote(Some(QUIC_UPGRADE_NEGOTIATES_IN)), vec![]);
+    assert!(rig.machine.deadline().is_some());
+}
+
+/// The first offer comes 2 to 10 s after promotion, by the draw.
+#[test]
+fn the_first_offer_waits_for_its_delay() {
+    for (sample, delay) in [
+        (0.0, OFFER_DELAY_MIN),
+        (NO_JITTER, Duration::from_secs(6)),
+        (1.0, OFFER_DELAY_MAX),
+        (-3.0, OFFER_DELAY_MIN),
+        (f64::NAN, Duration::from_secs(6)),
+    ] {
+        let mut rig = Rig::new(Role::Server);
+        rig.sample = sample;
+        rig.promote(Some(QUIC_UPGRADE_NEGOTIATES_IN));
+        let promoted_at = rig.now;
+        assert_eq!(rig.machine.deadline(), Some(promoted_at + delay));
+        assert_eq!(
+            rig.tick_at(promoted_at + delay - Duration::from_nanos(1)),
+            vec![]
+        );
+        assert_eq!(label(&rig.machine), S::Idle);
+        rig.tick_at(promoted_at + delay);
+        assert_eq!(label(&rig.machine), S::Offered);
+    }
+}
+
+/// Each stage has its own timeout, restarted when the stage begins. It does
+/// not fire a nanosecond early, and does at the deadline.
+#[test]
+fn each_stage_times_out_at_its_deadline() {
+    let accept = |attempt| Event::Upgrade(UpgradeControl::Accept { attempt });
+    let established = |attempt| Event::PathEstablished { attempt };
+    let cases: Vec<(Role, Vec<fn(u32) -> Event>, Duration)> = vec![
+        (Role::Server, vec![], OFFER_TIMEOUT),
+        (Role::Server, vec![accept], CONNECT_TIMEOUT),
+        (Role::Server, vec![accept, established], CONFIRM_TIMEOUT),
+        (Role::Client, vec![], CONNECT_TIMEOUT),
+        (Role::Client, vec![established], CONFIRM_TIMEOUT),
+    ];
+    for (role, stages, timeout) in cases {
+        let case = format!("{role:?}, {} stages", stages.len());
+        let mut rig = Rig::promoted(role);
+        let attempt = match role {
+            Role::Server => {
+                rig.tick_due();
+                SERVER_ATTEMPT
+            }
+            Role::Client => {
+                rig.offer(CLIENT_ATTEMPT);
+                CLIENT_ATTEMPT
+            }
+        };
+        for stage in stages {
+            rig.now += Duration::from_secs(1);
+            rig.step(stage(attempt));
+        }
+        let deadline = rig.now + timeout;
+        assert_eq!(rig.machine.deadline(), Some(deadline), "{case}");
+        assert_eq!(
+            rig.tick_at(deadline - Duration::from_nanos(1)),
+            vec![],
+            "{case}"
+        );
+        assert_eq!(rig.in_use(), 1, "{case}");
+        assert!(rig.tick_at(deadline).contains(&Action::TearDown {
+            attempt,
+            code: QuicCloseCode::Downgrade,
+        }));
+        assert_eq!(rig.in_use(), 0, "{case}");
+        assert_eq!(rig.backoff(), BACKOFF_MIN, "{case}");
+    }
+}
+
+/// Each close code the peer can send, through the real error mapping, ends an
+/// active path on both roles: fallback, normal backoff, permit back, and then
+/// a new upgrade. Never a permanent downgrade. A code this node does not know
+/// is what an older node sees for a newer code, and behaves the same.
+#[test]
+fn every_close_code_falls_back_then_upgrades_again() {
+    let unknown = u64::from(u32::MAX);
+    let codes = QuicCloseCode::ALL
+        .iter()
+        .map(|code| u64::from(code.code()))
+        .chain([unknown]);
+    for code in codes {
+        for role in [Role::Server, Role::Client] {
+            let case = format!("{role:?} close code {code:#x}");
+            let mut rig = Rig::promoted(role);
+            let first = rig.activate();
+            let actions = rig.close_with(first, code);
+            assert_eq!(rig.in_use(), 0, "{case}");
+            assert_eq!(label(&rig.machine), S::Idle, "{case}");
+            assert!(
+                actions.contains(&Action::TearDown {
+                    attempt: first,
+                    code: QuicCloseCode::Downgrade,
+                }),
+                "{case}"
+            );
+            let want = if code == u64::from(QuicCloseCode::IdentityMismatch.code()) {
+                IDENTITY_BACKOFF
+            } else {
+                BACKOFF_MIN
+            };
+            assert_eq!(rig.backoff(), want, "{case}");
+            rig.now = rig.machine.retry_at;
+            let second = rig.activate();
+            assert!(second > first, "{case}");
+            assert!(rig.machine.is_active(), "{case}");
+        }
+    }
+}
+
+/// Close codes 1, 3, 4 and 5 read as a downgrade, and record that cause. An
+/// unknown one, which is how an older node reads code 5, is a lost connection.
+#[test]
+fn close_codes_record_their_cause() {
+    let downgrade = Outcome::Fallback(FallbackCause::DowngradeReceived);
+    let lost = Outcome::Fallback(FallbackCause::Reset);
+    for (code, want) in [
+        (QuicCloseCode::NodeDroppedPeer.code(), lost),
+        (QuicCloseCode::Downgrade.code(), downgrade),
+        (
+            QuicCloseCode::IdentityMismatch.code(),
+            Outcome::IdentityMismatch,
+        ),
+        (QuicCloseCode::SendAbortLimit.code(), downgrade),
+        (QuicCloseCode::PeerNotAcknowledging.code(), downgrade),
+        (QuicCloseCode::ControlRefused.code(), downgrade),
+        (0x0f, lost),
+    ] {
+        let mut rig = Rig::promoted(Role::Server);
+        let attempt = rig.activate();
+        let actions = rig.close_with(attempt, u64::from(code));
+        assert_eq!(actions[1], Action::Record(want), "code {code:#x}");
+    }
+}
+
+/// A refused frame closes at once rather than at the deadline, with the new
+/// code and a normal backoff, on both roles; a frame of the known version with
+/// a wrong length waits for the deadline; and once active, a frame a newer
+/// peer may send leaves the path alone.
+#[test]
+fn a_refused_control_frame_closes_only_during_setup() {
+    for role in [Role::Server, Role::Client] {
+        for error in [
+            ControlError::UnknownVersion(2),
+            ControlError::UnknownType(7),
+        ] {
+            let mut rig = reach(role, S::Confirming);
+            let attempt = attempt_of(role);
+            let actions = rig.step(Event::ControlRefused { attempt, error });
+            assert_eq!(
+                actions,
+                vec![
+                    Action::TearDown {
+                        attempt,
+                        code: QuicCloseCode::ControlRefused,
+                    },
+                    Action::Record(Outcome::ControlRefused),
+                ]
+            );
+            assert_eq!(rig.backoff(), BACKOFF_MIN);
+            assert_eq!(rig.in_use(), 0);
+
+            let mut rig = reach(role, S::Active);
+            assert_eq!(rig.step(Event::ControlRefused { attempt, error }), vec![]);
+            assert!(rig.machine.is_active());
+        }
+    }
+}
+
+/// `Protocol{0x1}` costs the peer nothing while the endpoint may be the cause:
+/// the permit returns at once, and for up to a second the machine waits. If
+/// the endpoint is reported or read as down there is no backoff; if a second
+/// passes with it up, the peer is charged a normal backoff.
+#[test]
+fn protocol_0x1_rechecks_the_endpoint_before_charging_the_peer() {
+    let protocol_1 = QuicErrorKind::Protocol { code: 1 };
+    for start in [S::Connecting, S::Confirming, S::Active] {
+        let attempt = attempt_of(Role::Client);
+
+        // Reported down inside the window.
+        let mut rig = reach(Role::Client, start);
+        rig.step(Event::PathFailed {
+            attempt,
+            kind: protocol_1,
+        });
+        assert_eq!(rig.in_use(), 0);
+        assert_eq!(rig.machine.deadline(), Some(rig.now + RECHECK_TIMEOUT));
+        rig.now += RECHECK_TIMEOUT - Duration::from_nanos(1);
+        assert_eq!(rig.step(Event::Tick), vec![]);
+        assert_eq!(label(&rig.machine), S::Rechecking);
+        let actions = rig.step(Event::EndpointNotUp(QuicAvailability::Down));
+        assert_eq!(
+            actions,
+            vec![Action::Record(Outcome::Fallback(
+                FallbackCause::EndpointDown
+            ))]
+        );
+        assert!(rig.machine.is_off());
+        assert_eq!(rig.machine.failures, 0, "no charge");
+        assert_eq!(rig.machine.retry_at, Duration::ZERO, "no charge");
+
+        // Read as down when the second is up, with no report yet.
+        let mut rig = reach(Role::Client, start);
+        rig.step(Event::PathFailed {
+            attempt,
+            kind: protocol_1,
+        });
+        rig.availability.send(QuicAvailability::Down).unwrap();
+        rig.now += RECHECK_TIMEOUT;
+        let actions = rig.step(Event::Tick);
+        assert_eq!(
+            actions,
+            vec![Action::Record(Outcome::Fallback(
+                FallbackCause::EndpointDown
+            ))]
+        );
+        assert!(rig.machine.is_off());
+        assert_eq!(rig.machine.failures, 0, "no charge");
+
+        // Up when the second is up.
+        let mut rig = reach(Role::Client, start);
+        rig.step(Event::PathFailed {
+            attempt,
+            kind: protocol_1,
+        });
+        rig.now += RECHECK_TIMEOUT;
+        let want = if start == S::Active {
+            Outcome::Fallback(FallbackCause::Protocol)
+        } else {
+            Outcome::HandshakeFailed
+        };
+        assert_eq!(rig.step(Event::Tick), vec![Action::Record(want)]);
+        assert_eq!(label(&rig.machine), S::Idle);
+        assert_eq!(rig.machine.failures, 1);
+        assert_eq!(rig.backoff(), BACKOFF_MIN);
+    }
+
+    // Any other code is charged at once, with no wait.
+    let mut rig = reach(Role::Client, S::Active);
+    rig.step(Event::PathFailed {
+        attempt: attempt_of(Role::Client),
+        kind: QuicErrorKind::Protocol { code: 2 },
+    });
+    assert_eq!(label(&rig.machine), S::Idle);
+    assert_eq!(rig.machine.failures, 1);
+}
+
+/// Down is final from every state: no deadline, no offer at any later time,
+/// no charge, and an offer gets `Disabled`. Every permit comes back, and a
+/// stale report of the old path does nothing.
+#[test]
+fn down_is_terminal() {
+    for (role, state) in pairs() {
+        let case = format!("{role:?} {state:?}");
+        let mut rig = reach(role, state);
+        let failures = rig.machine.failures;
+        let retry_at = rig.machine.retry_at;
+        let was_off = state == S::Off;
+        rig.step(Event::EndpointNotUp(QuicAvailability::Down));
+        if !was_off {
+            assert!(rig.machine.is_off(), "{case}");
+        }
+        assert_eq!(rig.in_use(), 0, "{case}");
+        assert_eq!(rig.machine.failures, failures, "{case}");
+        assert_eq!(rig.machine.retry_at, retry_at, "{case}");
+        assert_eq!(rig.machine.deadline(), None, "{case}");
+        assert_eq!(rig.tick_at(rig.now + BACKOFF_MAX * 10), vec![], "{case}");
+        let peer = rig.peer.clone();
+        for name in ATTEMPT_EVENTS {
+            assert_eq!(
+                rig.step(event(name, attempt_of(role), &peer)),
+                vec![],
+                "{case} {name}"
+            );
+        }
+        rig.step(Event::Upgrade(UpgradeControl::Offer {
+            attempt: 1000,
+            caps: 0,
+        }));
+        assert!(rig.machine.is_off(), "{case}");
+        assert_eq!(rig.in_use(), 0, "{case}");
+    }
+
+    let mut rig = Rig::new(Role::Client);
+    rig.promote(Some(QUIC_UPGRADE_NEGOTIATES_IN));
+    rig.step(Event::EndpointNotUp(QuicAvailability::Down));
+    assert_eq!(
+        rig.offer(1)[0],
+        Action::SendUpgrade(UpgradeControl::Decline {
+            attempt: 1,
+            reason: DeclineReason::Disabled.wire(),
+        })
+    );
+}
+
+/// `PathFailed` with `EndpointDown` is the same as the watch reporting Down.
+#[test]
+fn endpoint_down_as_an_error_is_terminal_and_free() {
+    let mut rig = reach(Role::Server, S::Active);
+    rig.step(Event::PathFailed {
+        attempt: SERVER_ATTEMPT,
+        kind: QuicErrorKind::EndpointDown,
+    });
+    assert!(rig.machine.is_off());
+    assert_eq!(rig.machine.failures, 0);
+    assert_eq!(rig.in_use(), 0);
+}
+
+/// A policy that refuses: a server shuts off at its first offer without taking
+/// a permit, and a client declines with `Disabled`, for each cause.
+#[test]
+fn a_refusing_policy_stops_the_server_and_declines_for_the_client() {
+    let mut rig = Rig::with_config(Role::Server, "off", 4);
+    rig.promote(Some(QUIC_UPGRADE_NEGOTIATES_IN));
+    assert_eq!(rig.tick_due(), vec![]);
+    assert!(rig.machine.is_off());
+
+    let mut rig = Rig::promoted(Role::Server);
+    rig.availability.send(QuicAvailability::Down).unwrap();
+    assert_eq!(rig.tick_due(), vec![]);
+    assert!(rig.machine.is_off());
+    assert_eq!(rig.machine.failures, 0);
+
+    let refused = [
+        Rig::with_config(Role::Client, "off", 4),
+        Rig::with_config(Role::Client, "shadow", 0),
+    ];
+    for mut rig in refused {
+        rig.promote(Some(QUIC_UPGRADE_NEGOTIATES_IN));
+        assert_eq!(
+            rig.offer(1)[1],
+            Action::Record(Outcome::DeclineSent(DeclineReason::Disabled))
+        );
+        assert_eq!(rig.in_use(), 0);
+    }
+}
+
+/// At the path limit a server does not offer and a client declines `Busy`.
+/// Neither is charged, and each works once a permit is free.
+#[test]
+fn at_the_path_limit_no_one_is_charged() {
+    let mut rig = Rig::with_config(Role::Server, "shadow", 1);
+    rig.promote(Some(QUIC_UPGRADE_NEGOTIATES_IN));
+    let held = rig.policy.admit().expect("the one permit");
+    assert_eq!(rig.tick_due(), vec![]);
+    assert_eq!(label(&rig.machine), S::Idle);
+    assert_eq!(rig.machine.failures, 0);
+    assert_eq!(rig.backoff(), BACKOFF_MIN);
+    drop(held);
+    rig.tick_due();
+    assert_eq!(label(&rig.machine), S::Offered);
+
+    let mut rig = Rig::with_config(Role::Client, "shadow", 1);
+    rig.promote(Some(QUIC_UPGRADE_NEGOTIATES_IN));
+    let held = rig.policy.admit().expect("the one permit");
+    assert_eq!(
+        rig.offer(1)[1],
+        Action::Record(Outcome::DeclineSent(DeclineReason::Busy))
+    );
+    assert_eq!(rig.machine.failures, 0);
+    drop(held);
+    assert_eq!(rig.offer(2)[2], Action::Record(Outcome::Accepted));
+}
+
+/// A client in backoff declines, and takes the next offer once it is over.
+/// An offer it has already seen gets no reply, in any state.
+#[test]
+fn a_client_declines_while_backing_off_and_ignores_old_offers() {
+    let mut rig = reach(Role::Client, S::Connecting);
+    rig.tick_due();
+    assert_eq!(rig.backoff(), BACKOFF_MIN);
+
+    assert_eq!(rig.offer(CLIENT_ATTEMPT), vec![], "seen");
+    assert_eq!(rig.offer(CLIENT_ATTEMPT - 1), vec![], "older");
+    assert_eq!(
+        rig.offer(CLIENT_ATTEMPT + 1)[1],
+        Action::Record(Outcome::DeclineSent(DeclineReason::Backoff))
+    );
+    assert_eq!(rig.in_use(), 0);
+    rig.now = rig.machine.retry_at - Duration::from_nanos(1);
+    assert_eq!(
+        rig.offer(CLIENT_ATTEMPT + 2)[1],
+        Action::Record(Outcome::DeclineSent(DeclineReason::Backoff))
+    );
+    rig.now = rig.machine.retry_at;
+    assert_eq!(
+        rig.offer(CLIENT_ATTEMPT + 3)[2],
+        Action::Record(Outcome::Accepted)
+    );
+}
+
+/// A `Decline` reason this node does not know still ends the attempt, with no
+/// stated reason.
+#[test]
+fn an_unknown_decline_reason_is_a_decline() {
+    let mut rig = reach(Role::Server, S::Offered);
+    let actions = rig.step(Event::Upgrade(UpgradeControl::Decline {
+        attempt: SERVER_ATTEMPT,
+        reason: 200,
+    }));
+    assert_eq!(actions[1], Action::Record(Outcome::Declined(None)));
+    assert_eq!(rig.in_use(), 0);
+    assert_eq!(label(&rig.machine), S::Idle);
+}
+
+/// Each `allow_peer` refusal ends the attempt with its own outcome and a
+/// normal backoff.
+#[test]
+fn allow_peer_refusals_end_the_attempt() {
+    for (reason, outcome) in [
+        (QuicRefusal::AllowSetFull, Outcome::AllowSetFull),
+        (QuicRefusal::KeyConflict, Outcome::KeyConflict),
+        (QuicRefusal::UnusableKey, Outcome::HandshakeFailed),
+    ] {
+        let mut rig = reach(Role::Server, S::Offered);
+        let actions = rig.step(Event::PathFailed {
+            attempt: SERVER_ATTEMPT,
+            kind: QuicErrorKind::Refused { reason },
+        });
+        assert_eq!(actions[1], Action::Record(outcome));
+        assert_eq!(rig.backoff(), BACKOFF_MIN);
+        assert_eq!(rig.in_use(), 0);
+    }
+}
+
+/// The delays double from 60 s to the 1 h cap, and stay there.
+#[test]
+fn backoff_doubles_to_its_cap() {
+    let mut rig = Rig::promoted(Role::Server);
+    for seconds in [60, 120, 240, 480, 960, 1920, 3600, 3600, 3600] {
+        rig.now = rig.machine.retry_at.max(rig.now);
+        rig.tick_due();
+        assert_eq!(label(&rig.machine), S::Offered);
+        rig.step(Event::Upgrade(UpgradeControl::Decline {
+            attempt: rig.machine.last_attempt,
+            reason: DeclineReason::Busy.wire(),
+        }));
+        assert_eq!(rig.backoff(), Duration::from_secs(seconds));
+    }
+}
+
+/// Jitter is +/-20%, whatever the draw, and a draw outside the range does not
+/// panic. Pinned at both ends, so a narrower or wider range fails.
+#[test]
+fn jitter_is_bounded() {
+    let base = Duration::from_secs(100);
+    assert_eq!(jittered(base, 0.0), Duration::from_secs(80));
+    assert_eq!(jittered(base, 1.0), Duration::from_secs(120));
+    assert_eq!(jittered(base, NO_JITTER), base);
+    for sample in [
+        -1.0,
+        0.0,
+        0.1,
+        0.9,
+        1.0,
+        2.0,
+        f64::NAN,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+    ] {
+        let delay = jittered(base, sample);
+        assert!(
+            (Duration::from_secs(80)..=Duration::from_secs(120)).contains(&delay),
+            "{sample}: {delay:?}"
+        );
+
+        let mut rig = reach(Role::Server, S::Offered);
+        rig.sample = sample;
+        rig.step(Event::Upgrade(UpgradeControl::Decline {
+            attempt: SERVER_ATTEMPT,
+            reason: 1,
+        }));
+        let backoff = rig.backoff();
+        assert!(
+            backoff >= BACKOFF_MIN.mul_f64(0.8) && backoff <= BACKOFF_MIN.mul_f64(1.2),
+            "{sample}: {backoff:?}"
+        );
+    }
+}
+
+/// An identity mismatch, seen here or reported by the peer, backs off for an
+/// hour on the first failure. Jitter applies. Seen here, it closes with its
+/// own code. It does not shorten a longer backoff, and the upgrade still comes
+/// back after it.
+#[test]
+fn identity_mismatch_backs_off_for_an_hour() {
+    for (sample, factor) in [(0.0, 0.8), (NO_JITTER, 1.0), (1.0, 1.2)] {
+        for role in [Role::Server, Role::Client] {
+            let mut rig = Rig::promoted(role);
+            let attempt = rig.activate();
+            rig.sample = sample;
+            let actions = rig.step(Event::IdentityMismatch { attempt });
+            assert_eq!(
+                actions,
+                vec![
+                    Action::TearDown {
+                        attempt,
+                        code: QuicCloseCode::IdentityMismatch,
+                    },
+                    Action::Record(Outcome::IdentityMismatch),
+                ]
+            );
+            assert_eq!(rig.backoff(), IDENTITY_BACKOFF.mul_f64(factor), "{sample}");
+            assert_eq!(rig.in_use(), 0);
+            rig.now = rig.machine.retry_at;
+            rig.activate();
+            assert!(rig.machine.is_active());
+        }
+    }
+
+    let mut rig = reach(Role::Server, S::Active);
+    let held = rig.now + BACKOFF_MAX * 2;
+    rig.machine.retry_at = held;
+    rig.step(Event::IdentityMismatch {
+        attempt: SERVER_ATTEMPT,
+    });
+    assert_eq!(rig.machine.retry_at, held, "not shortened");
+}
+
+/// A path that lasted [`STABLE_PATH`] clears the count when it ends. One that
+/// ends sooner does not, so a path that keeps dying soon after it comes up is
+/// retried less and less often.
+#[test]
+fn only_a_stable_path_clears_the_failure_count() {
+    let mut rig = Rig::promoted(Role::Server);
+    for seconds in [60, 120, 240] {
+        rig.now = rig.machine.retry_at.max(rig.now);
+        let attempt = rig.activate();
+        rig.now += STABLE_PATH - Duration::from_nanos(1);
+        rig.step(Event::PathFailed {
+            attempt,
+            kind: QuicErrorKind::ConnectionLost,
+        });
+        assert_eq!(rig.backoff(), Duration::from_secs(seconds));
+    }
+    rig.now = rig.machine.retry_at;
+    let attempt = rig.activate();
+    rig.now += STABLE_PATH;
+    rig.step(Event::PathFailed {
+        attempt,
+        kind: QuicErrorKind::ConnectionLost,
+    });
+    assert_eq!(rig.machine.failures, 1);
+    assert_eq!(rig.backoff(), BACKOFF_MIN);
+}
+
+/// Stream-scope errors do not end the path, which is also what the table says
+/// for one of them; this covers the rest.
+#[test]
+fn stream_errors_leave_the_path_alone() {
+    for kind in [
+        QuicErrorKind::Reset { code: 1 },
+        QuicErrorKind::Stopped { code: 1 },
+        QuicErrorKind::InvalidFrame,
+        QuicErrorKind::StreamClosed,
+    ] {
+        let mut rig = reach(Role::Server, S::Active);
+        assert_eq!(
+            rig.step(Event::PathFailed {
+                attempt: SERVER_ATTEMPT,
+                kind
+            }),
+            vec![]
+        );
+        assert!(rig.machine.is_active());
+        assert_eq!(rig.in_use(), 1);
+    }
+}
+
+/// A new attempt gets a new id, and an event for the old one is stale.
+#[test]
+fn attempt_ids_increase_and_the_old_one_goes_stale() {
+    let mut rig = reach(Role::Server, S::Offered);
+    rig.tick_due();
+    assert_eq!(label(&rig.machine), S::Idle);
+    rig.tick_due();
+    assert_eq!(rig.machine.last_attempt, SERVER_ATTEMPT + 1);
+    assert_eq!(
+        rig.step(Event::Upgrade(UpgradeControl::Accept {
+            attempt: SERVER_ATTEMPT
+        })),
+        vec![]
+    );
+    assert_eq!(label(&rig.machine), S::Offered);
+    assert_eq!(rig.in_use(), 1);
+}

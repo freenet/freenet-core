@@ -3068,6 +3068,10 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 serde_json::json!(snapshot.quic_close_sent_peer_not_acknowledging),
             );
             m.insert(
+                "quic_close_sent_control_refused".into(),
+                serde_json::json!(snapshot.quic_close_sent_control_refused),
+            );
+            m.insert(
                 "nat_fail_samples".into(),
                 serde_json::json!(snapshot.nat_fail_samples),
             );
@@ -7773,6 +7777,7 @@ mod tests {
             quic_close_sent_identity_mismatch: 4,
             quic_close_sent_send_abort_limit: 5,
             quic_close_sent_peer_not_acknowledging: 6,
+            quic_close_sent_control_refused: 8,
             quic_breaker_trips: 7,
             quic_breaker_suppressed: true,
             ..Default::default()
@@ -7789,6 +7794,7 @@ mod tests {
             ("quic_close_sent_identity_mismatch", 4),
             ("quic_close_sent_send_abort_limit", 5),
             ("quic_close_sent_peer_not_acknowledging", 6),
+            ("quic_close_sent_control_refused", 8),
             ("quic_breaker_trips", 7),
         ] {
             assert_eq!(json[key], expected, "event-log value for {key}");
