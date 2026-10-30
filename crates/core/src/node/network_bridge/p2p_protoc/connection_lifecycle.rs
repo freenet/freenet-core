@@ -542,6 +542,43 @@ impl P2pConnManager {
         }
     }
 
+    /// The connection at `addr` has just been promoted into the ring under
+    /// `promoted`: give its transport the peer key, which the transport
+    /// holds from then on (`PeerConnectionApi::set_peer_identity`). The key
+    /// sent is the identity bound to the connection, the node's own record;
+    /// when `promoted` is not that key, or none is bound, nothing is sent and
+    /// the mismatch is counted (`promotion_key_mismatch`).
+    ///
+    /// Called only where a connection enters the ring, so a connection's
+    /// transport learns a key only at promotion. Does not wait: a full
+    /// channel to the connection's task moves the send to a short task (see
+    /// [`notify_connection_task`]).
+    fn tell_transport_peer_identity(&self, addr: SocketAddr, promoted: &TransportPublicKey) {
+        let Some(entry) = self.connections.get(&addr) else {
+            return;
+        };
+        let bound = match entry.pub_key() {
+            Some(bound) if bound == promoted => bound.clone(),
+            bound => {
+                TRANSPORT_METRICS.record_conn_identity(addr, ConnIdentity::PromotionKeyMismatch);
+                tracing::error!(
+                    %addr,
+                    %promoted,
+                    ?bound,
+                    "Connection promoted under a key other than the one bound to it; \
+                     not giving its transport a key"
+                );
+                return;
+            }
+        };
+        notify_connection_task(
+            entry.sender.clone(),
+            Right(ConnEvent::SetPeerIdentity(bound)),
+            addr,
+            "peer identity",
+        );
+    }
+
     /// Promote the open connection at `peer_addr` into the ring under `key`,
     /// unless the ring already holds it. Used when a ConnectPeer names an
     /// existing connection (which is bound to `key` after a promotion) and
@@ -638,6 +675,7 @@ impl P2pConnManager {
             {
                 return Promotion::Refused;
             }
+            self.tell_transport_peer_identity(peer_addr, &key);
 
             // Update the dashboard/network_status with the peer's location.
             // Without this, peers promoted via this path show no location on the
@@ -1792,6 +1830,15 @@ impl P2pConnManager {
                 if outcome.added {
                     crate::node::network_status::record_bootstrap_promoted_to_ring();
                 }
+                if self
+                    .bridge
+                    .op_manager
+                    .ring
+                    .connection_manager
+                    .is_in_ring(peer_addr)
+                {
+                    self.tell_transport_peer_identity(peer_addr, peer.pub_key());
+                }
                 let just_became_ready = outcome.just_became_ready;
                 let pkl = crate::ring::PeerKeyLocation::new(peer.pub_key().clone(), peer_addr);
                 crate::node::network_status::record_peer_connected(
@@ -2161,9 +2208,8 @@ impl P2pConnManager {
 
 /// Tell the per-connection task of a dropped connection to close, without
 /// blocking the caller, which runs on the event loop: a full per-peer
-/// channel must not stall it (`.claude/rules/channel-safety.md`). When the
-/// channel is full, the send is moved to a short task that waits up to 1 s,
-/// as the inline send used to.
+/// channel must not stall it (`.claude/rules/channel-safety.md`). See
+/// [`notify_connection_task`].
 fn notify_connection_dropped(
     sender: PeerConnChannelSender,
     peer_addr: SocketAddr,
@@ -2172,6 +2218,18 @@ fn notify_connection_dropped(
     let event = Right(ConnEvent::NodeAction(NodeEvent::DropConnection(
         peer_addr, reason,
     )));
+    notify_connection_task(sender, event, peer_addr, "drop notice");
+}
+
+/// Send `event` (`what`, for logs) to a connection's task without blocking
+/// the caller, which runs on the event loop: when the channel is full, the
+/// send is moved to a short task that waits up to 1 s.
+fn notify_connection_task(
+    sender: PeerConnChannelSender,
+    event: Either<NetMessage, ConnEvent>,
+    peer_addr: SocketAddr,
+    what: &'static str,
+) {
     match sender.try_send(event) {
         Ok(()) => {}
         Err(tokio::sync::mpsc::error::TrySendError::Full(event)) => {
@@ -2180,17 +2238,19 @@ fn notify_connection_dropped(
                     Ok(Ok(())) => {}
                     Ok(Err(_)) => tracing::debug!(
                         %peer_addr,
-                        "Connection task gone before the drop notice was delivered"
+                        what,
+                        "Connection task gone before the notice was delivered"
                     ),
                     Err(_) => tracing::warn!(
                         %peer_addr,
-                        "Timeout while sending drop connection message"
+                        what,
+                        "Timeout while sending a notice to the connection task"
                     ),
                 }
             });
         }
         Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-            tracing::debug!(%peer_addr, "Connection task gone before the drop notice");
+            tracing::debug!(%peer_addr, what, "Connection task gone before the notice");
         }
     }
 }

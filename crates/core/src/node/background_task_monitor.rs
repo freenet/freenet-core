@@ -40,6 +40,58 @@ pub(crate) struct BackgroundTaskMonitor {
     /// Set by `wait_for_any_exit`, after which a registration is not
     /// monitored.
     drained: Arc<AtomicBool>,
+    /// Tasks registered through a [`LateRegistrar`], which the future
+    /// returned by `wait_for_any_exit` picks up while it runs.
+    late: Arc<LateTasks>,
+}
+
+/// Tasks handed to a [`LateRegistrar`] and not yet picked up by the wait.
+#[derive(Default)]
+struct LateTasks {
+    pending: Mutex<Vec<TrackedTask>>,
+    /// Names of every task registered, for tests.
+    #[cfg(test)]
+    registered: Mutex<Vec<&'static str>>,
+    /// Signalled on each registration. `Notify` keeps one permit when no one
+    /// is waiting, so a registration made between the wait taking `pending`
+    /// and starting to wait again is not missed.
+    added: tokio::sync::Notify,
+}
+
+/// Registers tasks with a [`BackgroundTaskMonitor`] at any time, including
+/// after [`BackgroundTaskMonitor::wait_for_any_exit`] has drained it: the
+/// future that call returned also watches these tasks, and resolves when
+/// one of them exits, as for a task registered before the wait.
+///
+/// For tasks started after the node's event loop begins. `run_node` starts
+/// waiting on its monitor before the event listener opens the transport, so
+/// a task started from the transport's open path (the QUIC accept loop) is
+/// registered here; `BackgroundTaskMonitor::register` at that point would
+/// leave it unmonitored.
+///
+/// A task registered after the wait future has resolved or been dropped is
+/// not watched by anything; the node is stopping by then.
+#[derive(Clone)]
+pub(crate) struct LateRegistrar {
+    late: Arc<LateTasks>,
+}
+
+impl LateRegistrar {
+    /// Register a named background task, watched by the monitor's wait
+    /// whether or not it has started (see [`LateRegistrar`]).
+    pub fn register(&self, name: &'static str, handle: JoinHandle<()>) {
+        #[cfg(test)]
+        self.late.registered.lock().push(name);
+        self.late.pending.lock().push(TrackedTask { name, handle });
+        self.late.added.notify_one();
+    }
+
+    /// The names of the tasks registered through this monitor's late
+    /// registrars, in order.
+    #[cfg(test)]
+    pub fn registered(&self) -> Vec<&'static str> {
+        self.late.registered.lock().clone()
+    }
 }
 
 impl BackgroundTaskMonitor {
@@ -47,6 +99,15 @@ impl BackgroundTaskMonitor {
         Self {
             inner: Arc::new(Mutex::new(Vec::new())),
             drained: Arc::new(AtomicBool::new(false)),
+            late: Arc::new(LateTasks::default()),
+        }
+    }
+
+    /// A handle that registers tasks with this monitor at any time,
+    /// including after `wait_for_any_exit` (see [`LateRegistrar`]).
+    pub fn late_registrar(&self) -> LateRegistrar {
+        LateRegistrar {
+            late: self.late.clone(),
         }
     }
 
@@ -84,40 +145,60 @@ impl BackgroundTaskMonitor {
     /// when the first tracked task exits (for any reason).
     ///
     /// This method drains all registered tasks out of the monitor. After
-    /// calling this, the monitor is empty and should not be reused.
+    /// calling this, the monitor is empty and should not be reused. The
+    /// future also watches every task registered through a
+    /// [`LateRegistrar`] of this monitor, before or after this call.
     pub fn wait_for_any_exit(self) -> impl std::future::Future<Output = anyhow::Error> + Send {
         let tasks: Vec<TrackedTask> = {
             let mut inner = self.inner.lock();
             self.drained.store(true, Ordering::Release);
             std::mem::take(&mut *inner)
         };
+        let late = self.late;
 
         async move {
-            if tasks.is_empty() {
-                // No tasks registered; park forever so the select! arm never fires.
-                std::future::pending::<()>().await;
-                unreachable!();
-            }
-
-            // Use a JoinSet to wait for the first task to exit.
+            // Each entry in the JoinSet wraps one tracked JoinHandle. When
+            // the underlying task exits, the wrapper completes.
             let mut join_set = tokio::task::JoinSet::new();
-            let names: Vec<&'static str> = tasks.iter().map(|t| t.name).collect();
-
-            for (idx, task) in tasks.into_iter().enumerate() {
-                // Each entry in the JoinSet wraps one tracked JoinHandle.
-                // When the underlying task exits, the wrapper completes.
+            let mut names: Vec<&'static str> = Vec::new();
+            let mut watch = |task: TrackedTask, join_set: &mut tokio::task::JoinSet<_>| {
+                let idx = names.len();
+                names.push(task.name);
                 join_set.spawn(async move {
                     let result = task.handle.await;
                     (idx, result)
                 });
+            };
+            for task in tasks {
+                watch(task, &mut join_set);
             }
 
-            // Wait for the first completion.
-            let (idx, result) = join_set
-                .join_next()
-                .await
-                .expect("JoinSet is non-empty")
-                .expect("wrapper task should not panic");
+            // Wait for the first completion, picking up late registrations
+            // as they arrive.
+            let (idx, result) = loop {
+                let added = std::mem::take(&mut *late.pending.lock());
+                for task in added {
+                    watch(task, &mut join_set);
+                }
+                if join_set.is_empty() {
+                    // Nothing to watch yet; wait for a late registration.
+                    late.added.notified().await;
+                    continue;
+                }
+                // `biased`: an exit already reported wins over a new
+                // registration. Both arms are cancel-safe: `join_next` keeps
+                // unreported exits in the set, and a lost `notified` leaves
+                // the registration in `pending` for the next pass.
+                tokio::select! {
+                    biased;
+                    joined = join_set.join_next() => {
+                        break joined
+                            .expect("JoinSet is non-empty")
+                            .expect("wrapper task should not panic");
+                    }
+                    () = late.added.notified() => {}
+                }
+            };
 
             let name = names[idx];
 
@@ -263,5 +344,74 @@ mod tests {
         );
         let fired = tokio::time::timeout(Duration::from_millis(100), wait).await;
         assert!(fired.is_err(), "a late registration is not watched");
+    }
+
+    /// A task registered through a late registrar AFTER the wait started is
+    /// still watched: its exit resolves the wait. Also with nothing
+    /// registered before the wait, the path the node takes when the
+    /// transport's accept loop is the first late task.
+    #[tokio::test]
+    async fn late_registration_after_the_wait_is_watched() {
+        for with_early_task in [true, false] {
+            let monitor = BackgroundTaskMonitor::new();
+            if with_early_task {
+                monitor.register(
+                    "sleeper",
+                    tokio::spawn(async {
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                    }),
+                );
+            }
+            let registrar = monitor.late_registrar();
+            let wait = tokio::spawn(monitor.wait_for_any_exit());
+            // Let the wait start and park before the registration.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert!(!wait.is_finished());
+            let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+            registrar.register(
+                "late_task",
+                tokio::spawn(async move {
+                    // Ends when `stop` is dropped; the value is irrelevant.
+                    stopped.await.ok();
+                }),
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert!(
+                !wait.is_finished(),
+                "a running late task does not resolve the wait"
+            );
+            drop(stop);
+            let err = tokio::time::timeout(Duration::from_secs(5), wait)
+                .await
+                .expect("the late task's exit resolves the wait")
+                .expect("wait task");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("late_task") && msg.contains("exited unexpectedly"),
+                "with_early_task={with_early_task}: {msg}"
+            );
+        }
+    }
+
+    /// A task registered through a late registrar BEFORE the wait started
+    /// is watched too, and a late task that panics is reported as a panic.
+    #[tokio::test]
+    async fn late_registration_before_the_wait_is_watched() {
+        let monitor = BackgroundTaskMonitor::new();
+        monitor.late_registrar().register(
+            "late_panicker",
+            tokio::spawn(async {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                panic!("late task panic");
+            }),
+        );
+        let err = tokio::time::timeout(Duration::from_secs(5), monitor.wait_for_any_exit())
+            .await
+            .expect("the late task's panic resolves the wait");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("late_panicker") && msg.contains("panicked"),
+            "{msg}"
+        );
     }
 }

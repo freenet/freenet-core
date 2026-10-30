@@ -745,6 +745,10 @@ pub(in crate::node) struct P2pConnManager {
     /// the real one. `None` in production. Only used to open the transport.
     /// See `NodeConfig::advertised_version_override`.
     advertised_version_override: Option<(u8, u8, u16)>,
+    /// Registers the transport's own long-lived tasks (the QUIC accept
+    /// loop) with the node's background-task monitor. Used to open the
+    /// transport, which happens after the monitor has started waiting.
+    task_registrar: crate::node::background_task_monitor::LateRegistrar,
     blocked_addresses: Option<HashSet<SocketAddr>>,
     /// Per-contract retry count for broadcasts that found no targets yet.
     broadcast_retries: HashMap<freenet_stdlib::prelude::ContractKey, u8>,
@@ -1213,6 +1217,7 @@ impl P2pConnManager {
         config: &NodeConfig,
         op_manager: Arc<OpManager>,
         event_listener: impl NetEventRegister + Clone,
+        task_monitor: &crate::node::background_task_monitor::BackgroundTaskMonitor,
     ) -> anyhow::Result<Self> {
         let listen_port = config.network_listener_port;
         let listener_ip = config.network_listener_ip;
@@ -1305,6 +1310,7 @@ impl P2pConnManager {
             check_version: !config.config.network_api.ignore_protocol_version,
             ack_version_floor_override: config.ack_version_floor_override,
             advertised_version_override: config.advertised_version_override,
+            task_registrar: task_monitor.late_registrar(),
             bandwidth_limit: config.config.network_api.bandwidth_limit,
             global_bandwidth: config
                 .config
@@ -1412,6 +1418,7 @@ impl P2pConnManager {
                 ack_version_floor_override: self.ack_version_floor_override,
                 quic: self.quic.settings,
                 advertised_version_override: self.advertised_version_override,
+                task_registrar: Some(self.task_registrar.clone()),
             },
         )
         .await?;
@@ -1459,6 +1466,7 @@ impl P2pConnManager {
             ack_version_floor_override,
             quic,
             advertised_version_override,
+            task_registrar,
             blocked_addresses,
             broadcast_retries,
             broadcast_no_target_streak,
@@ -1557,6 +1565,7 @@ impl P2pConnManager {
             // Used by open_udp_transport like the fields above.
             quic,
             advertised_version_override,
+            task_registrar,
             blocked_addresses,
             broadcast_retries,
             broadcast_no_target_streak,
@@ -2156,6 +2165,14 @@ impl P2pConnManager {
                                     });
                                 }
                             }
+                        }
+                        ConnEvent::SetPeerIdentity(key) => {
+                            // Sent only to a connection's task, never to the
+                            // event loop.
+                            tracing::warn!(
+                                pub_key = %key,
+                                "SetPeerIdentity reached the event loop; ignoring it"
+                            );
                         }
                         ConnEvent::TransportClosed {
                             remote_addr,
@@ -3336,6 +3353,11 @@ pub(super) enum ConnEvent {
         inbound_handle: crate::transport::IncomingStream,
         metadata: Option<bytes::Bytes>,
     },
+    /// To a connection's task: the connection was promoted into the ring
+    /// under this key, the identity bound to it. The task hands it to the
+    /// transport (`PeerConnectionApi::set_peer_identity`). Sent only by
+    /// `P2pConnManager::tell_transport_peer_identity`.
+    SetPeerIdentity(TransportPublicKey),
 }
 
 #[derive(Debug)]
@@ -3504,6 +3526,14 @@ async fn handle_peer_channel_message(
                         );
                         return Err(error);
                     }
+                }
+                ConnEvent::SetPeerIdentity(key) => {
+                    tracing::debug!(
+                        to = %conn.remote_addr(),
+                        pub_key = %key,
+                        "[CONN_LIFECYCLE] Giving the transport the promoted peer key"
+                    );
+                    conn.set_peer_identity(key);
                 }
                 other @ ConnEvent::InboundMessage(_)
                 | other @ ConnEvent::OutboundMessage(_)

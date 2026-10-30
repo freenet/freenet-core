@@ -953,8 +953,13 @@ impl NodeP2P {
             .await
             .map_err(|e| anyhow::anyhow!(e))?;
 
-        let conn_manager =
-            P2pConnManager::build(&config, op_manager.clone(), event_register).await?;
+        let conn_manager = P2pConnManager::build(
+            &config,
+            op_manager.clone(),
+            event_register,
+            &background_task_monitor,
+        )
+        .await?;
 
         let parent_span = tracing::Span::current();
         let contract_executor_handle = GlobalExecutor::spawn({

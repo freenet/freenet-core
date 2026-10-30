@@ -124,6 +124,7 @@ impl<ER> Builder<ER> {
             &self.config,
             op_manager.clone(),
             self.event_register.clone(),
+            &task_monitor,
         )
         .await?;
 
@@ -268,6 +269,7 @@ impl<ER> Builder<ER> {
             &self.config,
             op_manager.clone(),
             self.event_register.clone(),
+            &task_monitor,
         )
         .await?;
 
@@ -411,6 +413,7 @@ impl<ER> Builder<ER> {
             &self.config,
             op_manager.clone(),
             self.event_register.clone(),
+            &task_monitor,
         )
         .await?;
 

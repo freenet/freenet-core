@@ -7712,6 +7712,10 @@ mod tests {
             conn_identity_teardown_key_elsewhere: 73,
             conn_identity_teardown_unidentified: 74,
             conn_identity_teardown_key_unmapped: 79,
+            conn_identity_promotion_key_mismatch: 181,
+            conn_identity_transport_key_set: 182,
+            conn_identity_transport_key_same: 183,
+            conn_identity_transport_key_refused: 184,
             ..Default::default()
         };
         let reference = serde_json::to_value(&snapshot).unwrap();
@@ -7739,6 +7743,10 @@ mod tests {
             ("conn_identity_teardown_key_elsewhere", 73),
             ("conn_identity_teardown_unidentified", 74),
             ("conn_identity_teardown_key_unmapped", 79),
+            ("conn_identity_promotion_key_mismatch", 181),
+            ("conn_identity_transport_key_set", 182),
+            ("conn_identity_transport_key_same", 183),
+            ("conn_identity_transport_key_refused", 184),
         ] {
             assert_eq!(json[key], expected, "event-log value for {key}");
             assert_eq!(json[key], reference[key], "serde value for {key}");

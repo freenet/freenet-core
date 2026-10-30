@@ -167,6 +167,7 @@ async fn udp_transport_config_reaches_the_listener_by_name() {
             ack_version_floor_override: Some((9, 8, 7)),
             quic: None,
             advertised_version_override: Some((0, 2, 148)),
+            task_registrar: None,
         },
         None,
     );

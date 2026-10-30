@@ -846,8 +846,10 @@ configs start carrying data. Off: no endpoint, no QUIC ingress, nothing
 changes. QUIC must stay off by default on Windows until the crash-loop
 breaker works there (#6031). Shadow or prefer: the endpoint is built
 with the node's QUIC identity (below) and an EMPTY allow-set, so nothing
-reaches it and it sends nothing; the listener holds it. Upgrading a UDP
-session to QUIC comes later, so only tests open QUIC connections.
+reaches it and it sends nothing; the listener holds it, with the queue of
+its accept loop (below), which hands on no attempt while the allow-set is
+empty. Upgrading a UDP session to QUIC comes later, so only tests open
+QUIC connections.
 
 Upgrade policy (`quic/upgrade/policy.rs`, not yet wired in):
 `QuicPolicy::new(network_api, breaker, availability)` takes the config, the
@@ -1029,6 +1031,19 @@ no extra message, no exporter proof.
     succeed: TLS 1.3 lets it finish before the server's verdict, and the
     server's CONNECTION_CLOSE ends the connection at once. The server never
     gets a connection from an unexpected key.
+  → The expected key comes from the node's own record, never from an
+    upgrade message. A connection's transport (PeerConnection) holds its
+    peer's key: the key it dialled, for an outbound connection, and the
+    key the node promoted the connection into the ring under, sent by the
+    bridge as ConnEvent::SetPeerIdentity at promotion
+    (P2pConnManager::tell_transport_peer_identity, called only where a
+    connection enters the ring) and taken from the identity bound to the
+    connection at establishment (p2p_protoc/identity.rs). A promotion
+    under a key that is not the bound one sends nothing
+    (conn_identity_promotion_key_mismatch); a transport given a key other
+    than the one it holds keeps its key (conn_identity_transport_key_refused).
+    conn_identity_transport_key_set / _same count the keys given. Both
+    mismatch counters are expected to stay at 0.
 Tests: conversion vs curve25519-dalek 5 (random keys, bit 255 set, u = -1),
 signer key == verifier key over many keypairs with both natural sign bits,
 signatures verified by ed25519-dalek and refused with any bit flipped,
@@ -1342,8 +1357,10 @@ Liveness ("alive" = the endpoint driver has not ENDED; it does not mean
     Released are final, and not_up() returns them at once every time.
     Availability is per endpoint, one per node (so per process in
     production, per node in simulation).
-  → QuicEndpoint::spawn_accept_loop registers the accept loop with
-    BackgroundTaskMonitor as quic_accept_loop. It holds an EndpointCore
+  → QuicEndpoint::spawn_accept_loop registers the accept loop through a
+    LateRegistrar as quic_accept_loop. The node starts it when it opens the
+    transport with an endpoint (UdpTransportConfig::task_registrar; tools
+    and tests that pass none start no loop). It holds an EndpointCore
     (no owner share), so it does not keep the endpoint alive: when the
     node drops its last handle it sees Released, drops the core (quinn's
     driver ends, the socket is let go) and stops. It also stops when
@@ -1360,9 +1377,11 @@ Liveness ("alive" = the endpoint driver has not ENDED; it does not mean
     an owner share; only the accept loop holds one.
   → run_node drains the monitor (wait_for_any_exit) BEFORE the event
     listener opens the transport, so a task registered from the
-    transport's open path is not monitored. register() now logs that at
-    ERROR. e5 must register the accept loop through a monitor that is
-    still live (not yet waited on) at that point.
+    transport's open path with register() is not monitored (logged at
+    ERROR). BackgroundTaskMonitor::late_registrar() gives a handle whose
+    registrations, before or after the drain, the future returned by
+    wait_for_any_exit also watches; use it for any task started from the
+    transport's open path.
 Tests: one row per quinn variant and per stop/reset code in
   quic/error/tests.rs; each close code sent by either side and seen by
   the peer as that code and kind; the receive-task panic seen as
