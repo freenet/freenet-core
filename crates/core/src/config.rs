@@ -318,10 +318,10 @@ impl Default for ConfigArgs {
                 gateways: None,
                 gateway: None,
                 location: None,
-                // Library/test default only: the CLI leaves this unset (see
-                // NetworkArgs::bandwidth_limit). Above FixedRate's 1.25 MB/s, so
-                // it binds only under a faster congestion controller.
-                bandwidth_limit: Some(3_000_000),
+                // Unset, as a bare CLI parse leaves it (NetworkArgs::bandwidth_limit).
+                // Since #6047 the limit caps every rate update, so a library default
+                // here would silently cap callers that pick a faster controller.
+                bandwidth_limit: None,
                 total_bandwidth_limit: None,
                 min_bandwidth_per_connection: None,
                 blocked_addresses: None,

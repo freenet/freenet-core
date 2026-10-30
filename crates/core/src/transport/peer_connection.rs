@@ -215,7 +215,9 @@ pub(super) fn initial_paced_rate(
 /// within `length / that rate`, and at least 5 minutes). Pacing at exactly that
 /// rate would leave a long stream no margin, and every stream on a connection
 /// shares its bucket. The floor reduces that failure; it does not remove it for
-/// several long streams at once on one connection, and low limits still slow
+/// two or more long streams at once on one connection (two at the floor each
+/// get exactly the receiver's rate), and it assumes receivers use the current
+/// `MIN_INBOUND_STREAM_RATE_BYTES_PER_SEC`. Low limits still slow
 /// large transfers past other deadlines (the 10-minute streaming PUT/GET
 /// attempt ceiling, the 120 s broadcast completion wait).
 pub(crate) const MIN_BANDWIDTH_LIMIT: usize =

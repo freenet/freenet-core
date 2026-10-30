@@ -705,8 +705,8 @@ Rate calculation on every rate update (peer_connection::paced_rate; #6047):
   The bucket's INITIAL rate comes from peer_connection::initial_paced_rate at
   the three connection setup sites (global share as is, else cc_rate lowered
   to bandwidth_limit) and fixes the bucket's capacity (initial_rate / 10) for
-  the connection's life, so a limit above cc_rate must NOT raise it (#3702
-  burst). Only stream fragments draw on the bucket; short messages, ACKs and
+  the connection's life, so a bandwidth-limit above cc_rate must NOT raise it
+  (#3702 burst). The global share is still taken as is, as before #6047. Only stream fragments draw on the bucket; short messages, ACKs and
   retransmits are unpaced.
 
 Token reservation:

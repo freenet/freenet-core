@@ -133,7 +133,9 @@ pub(crate) const MAX_INBOUND_STREAMS_PER_CONNECTION: usize = 1024;
 
 /// Rate an inbound stream's age limit is computed at: 32 KiB/s, below the
 /// 70-160 KB/s seen from slow residential peers. A stream's age limit is its
-/// length at this rate.
+/// length at this rate. Senders derive their lowest `bandwidth-limit` from it
+/// (`peer_connection::MIN_BANDWIDTH_LIMIT`); raising it can strand peers whose
+/// limit sits near that floor.
 pub(crate) const MIN_INBOUND_STREAM_RATE_BYTES_PER_SEC: u64 = 32 * 1024;
 
 /// Age limit for small streams, whatever their length.

@@ -2427,8 +2427,9 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                 .build_arc_with_time_source(time_source.clone());
 
             // Initialize token bucket for smooth packet pacing.
-            // Use global bandwidth manager if configured, otherwise use the
-            // congestion controller's configured rate. Previously defaulted to
+            // Use global bandwidth manager if configured, otherwise the
+            // congestion controller's rate, lowered to `bandwidth-limit` if set
+            // (`initial_paced_rate`). Previously defaulted to
             // 10 MB/s which is 8x higher than FixedRate's 1.25 MB/s — the
             // initial burst triggered packet loss and immediate loss_pause,
             // collapsing throughput. See #3702.
@@ -5204,13 +5205,25 @@ pub mod mock_transport {
 
         assert_eq!(joiner_conn.bandwidth_limit(), Some(JOINER_LIMIT));
         assert_eq!(gw_conn.bandwidth_limit(), Some(GATEWAY_LIMIT));
+        // Both limits bind (below FixedRate's rate), so each connection's
+        // initial rate, and with it the bucket's capacity, comes from its limit.
+        assert_eq!(
+            joiner_conn.pacing_capacity(),
+            (JOINER_LIMIT / 10).max(MIN_BUCKET_CAPACITY_BYTES),
+            "joiner initial burst"
+        );
+        assert_eq!(
+            gw_conn.pacing_capacity(),
+            (GATEWAY_LIMIT / 10).max(MIN_BUCKET_CAPACITY_BYTES),
+            "gateway initial burst"
+        );
         Ok(())
     }
 
     /// A `bandwidth-limit` above the congestion controller's rate must not
     /// give a new connection a larger initial burst than no limit would. The
     /// bucket's capacity is set once from the initial rate (`rate / 10`), so
-    /// before #6047's follow-up a 10 MB/s limit under FixedRate gave every
+    /// when the raw limit set the initial rate, a 10 MB/s limit under FixedRate gave every
     /// connection a 1 MB burst for its whole life (the #3702 burst). Checked on
     /// both the gateway's accept path and the joiner's path.
     #[tokio::test]
@@ -5297,6 +5310,8 @@ pub mod mock_transport {
             Ok::<_, anyhow::Error>((conn.bandwidth_limit(), conn.pacing_capacity()))
         });
         let (a, b) = tokio::try_join!(a_side, b_side)?;
+        // Unwrap first, so a failed connect is not reported as a wrong arm.
+        let (a, b) = (a?, b?);
         assert!(
             !completed_in_remote_inbound(a_addr, b_addr),
             "premise: A completed on the ack arm"
@@ -5305,9 +5320,9 @@ pub mod mock_transport {
             completed_in_remote_inbound(b_addr, a_addr),
             "premise: B completed in the RemoteInbound arm"
         );
-        assert_eq!(a?, (Some(A_LIMIT), expected_capacity), "ack-arm connection");
+        assert_eq!(a, (Some(A_LIMIT), expected_capacity), "ack-arm connection");
         assert_eq!(
-            b?,
+            b,
             (Some(B_LIMIT), expected_capacity),
             "RemoteInbound-arm connection"
         );

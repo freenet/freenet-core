@@ -363,7 +363,7 @@ rate update, so a value set in an old `config.toml` takes effect when it is belo
 controller's rate (1.25 MB/s under the default `fixedrate`). A value below 64 KiB/s is
 raised to 64 KiB/s with a startup warning: a receiver evicts a long stream that arrives
 slower than 32 KiB/s, and all streams on a connection share its limit. Even at 64 KiB/s,
-several large transfers at once on one connection can still fail, and a low limit slows
+two or more large transfers at once on one connection can still fail, and a low limit slows
 large transfers in proportion, past the 10-minute streaming PUT/GET attempt ceiling and
 the 120 s broadcast completion wait for multi-MB contract states. A low limit trades away
 large transfers. The node logs the limit it applies at startup.
