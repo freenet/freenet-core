@@ -593,6 +593,8 @@ mod tests {
     struct NullConnection(SocketAddr);
 
     impl PeerConnectionApi for NullConnection {
+        fn set_peer_identity(&mut self, _key: crate::transport::TransportPublicKey) {}
+
         fn remote_addr(&self) -> SocketAddr {
             self.0
         }

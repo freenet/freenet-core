@@ -213,6 +213,30 @@ labelled_counters! {
         /// map holds every bound key; the cleanup then runs the per-peer
         /// cleanup unless the key is in the ring at another address.
         TeardownKeyUnmapped => "teardown_key_unmapped",
+        /// A connection was promoted into the ring under a key other than
+        /// the one bound to it, or with no key bound. Its transport is not
+        /// given the key. Not expected to be recorded: a connection is
+        /// promoted only under the key bound to it.
+        PromotionKeyMismatch => "promotion_key_mismatch",
+        /// A connection's transport, holding no peer key, was given the key
+        /// the connection was promoted under (an inbound connection).
+        TransportKeySet => "transport_key_set",
+        /// A connection's transport was given, at promotion, the key it
+        /// already held (the key it dialled).
+        TransportKeySame => "transport_key_same",
+        /// A connection's transport was given, at promotion, a key other
+        /// than the one it holds. It keeps the key it holds. Not expected to
+        /// be recorded.
+        TransportKeyRefused => "transport_key_refused",
+        /// The node handed a promoted connection's peer key to the
+        /// connection's task, to give to its transport (only with a QUIC
+        /// endpoint). Compare with `transport_key_set` + `_same` + `_refused`,
+        /// which the transport counts when it takes the key.
+        TransportKeySent => "transport_key_sent",
+        /// A promoted connection's peer key could not be handed to the
+        /// connection's task within 1 s (its channel stayed full), so its
+        /// transport holds no key from the promotion. Not re-sent.
+        TransportKeyUndelivered => "transport_key_undelivered",
     }
 }
 
@@ -2275,6 +2299,24 @@ impl TransportMetrics {
             conn_identity_teardown_key_unmapped: get32(
                 &identity[ConnIdentity::TeardownKeyUnmapped as usize],
             ),
+            conn_identity_promotion_key_mismatch: get32(
+                &identity[ConnIdentity::PromotionKeyMismatch as usize],
+            ),
+            conn_identity_transport_key_set: get32(
+                &identity[ConnIdentity::TransportKeySet as usize],
+            ),
+            conn_identity_transport_key_same: get32(
+                &identity[ConnIdentity::TransportKeySame as usize],
+            ),
+            conn_identity_transport_key_refused: get32(
+                &identity[ConnIdentity::TransportKeyRefused as usize],
+            ),
+            conn_identity_transport_key_sent: get32(
+                &identity[ConnIdentity::TransportKeySent as usize],
+            ),
+            conn_identity_transport_key_undelivered: get32(
+                &identity[ConnIdentity::TransportKeyUndelivered as usize],
+            ),
             inbound_concurrency_conns_sampled: concurrency.conns_sampled,
             inbound_concurrency_conns_ge_8: concurrency_ge[0],
             inbound_concurrency_conns_ge_16: concurrency_ge[1],
@@ -2783,6 +2825,12 @@ pub struct TransportSnapshot {
     pub conn_identity_teardown_key_elsewhere: u32,
     pub conn_identity_teardown_unidentified: u32,
     pub conn_identity_teardown_key_unmapped: u32,
+    pub conn_identity_promotion_key_mismatch: u32,
+    pub conn_identity_transport_key_set: u32,
+    pub conn_identity_transport_key_same: u32,
+    pub conn_identity_transport_key_refused: u32,
+    pub conn_identity_transport_key_sent: u32,
+    pub conn_identity_transport_key_undelivered: u32,
     /// Inbound concurrency per connection during the period (one snapshot
     /// window, `transport_snapshot_interval_secs`, default 30 s): an
     /// estimate, at each inbound short message or admitted stream, of the
@@ -2861,6 +2909,12 @@ impl TransportSnapshot {
             ConnIdentity::TeardownKeyElsewhere => self.conn_identity_teardown_key_elsewhere,
             ConnIdentity::TeardownUnidentified => self.conn_identity_teardown_unidentified,
             ConnIdentity::TeardownKeyUnmapped => self.conn_identity_teardown_key_unmapped,
+            ConnIdentity::PromotionKeyMismatch => self.conn_identity_promotion_key_mismatch,
+            ConnIdentity::TransportKeySet => self.conn_identity_transport_key_set,
+            ConnIdentity::TransportKeySame => self.conn_identity_transport_key_same,
+            ConnIdentity::TransportKeyRefused => self.conn_identity_transport_key_refused,
+            ConnIdentity::TransportKeySent => self.conn_identity_transport_key_sent,
+            ConnIdentity::TransportKeyUndelivered => self.conn_identity_transport_key_undelivered,
         }
     }
 
@@ -3060,6 +3114,12 @@ impl TransportSnapshot {
             conn_identity_teardown_key_elsewhere,
             conn_identity_teardown_unidentified,
             conn_identity_teardown_key_unmapped,
+            conn_identity_promotion_key_mismatch,
+            conn_identity_transport_key_set,
+            conn_identity_transport_key_same,
+            conn_identity_transport_key_refused,
+            conn_identity_transport_key_sent,
+            conn_identity_transport_key_undelivered,
             inbound_concurrency_conns_sampled,
             inbound_concurrency_conns_ge_8,
             inbound_concurrency_conns_ge_16,
@@ -3178,6 +3238,12 @@ impl TransportSnapshot {
         self.conn_identity_teardown_key_elsewhere = conn_identity_teardown_key_elsewhere;
         self.conn_identity_teardown_unidentified = conn_identity_teardown_unidentified;
         self.conn_identity_teardown_key_unmapped = conn_identity_teardown_key_unmapped;
+        self.conn_identity_promotion_key_mismatch = conn_identity_promotion_key_mismatch;
+        self.conn_identity_transport_key_set = conn_identity_transport_key_set;
+        self.conn_identity_transport_key_same = conn_identity_transport_key_same;
+        self.conn_identity_transport_key_refused = conn_identity_transport_key_refused;
+        self.conn_identity_transport_key_sent = conn_identity_transport_key_sent;
+        self.conn_identity_transport_key_undelivered = conn_identity_transport_key_undelivered;
         self.inbound_concurrency_conns_sampled = inbound_concurrency_conns_sampled;
         self.inbound_concurrency_conns_ge_8 = inbound_concurrency_conns_ge_8;
         self.inbound_concurrency_conns_ge_16 = inbound_concurrency_conns_ge_16;
@@ -3389,6 +3455,12 @@ struct SnapshotExtras {
     pub conn_identity_teardown_key_elsewhere: u32,
     pub conn_identity_teardown_unidentified: u32,
     pub conn_identity_teardown_key_unmapped: u32,
+    pub conn_identity_promotion_key_mismatch: u32,
+    pub conn_identity_transport_key_set: u32,
+    pub conn_identity_transport_key_same: u32,
+    pub conn_identity_transport_key_refused: u32,
+    pub conn_identity_transport_key_sent: u32,
+    pub conn_identity_transport_key_undelivered: u32,
     /// Inbound concurrency per connection during the period; see the
     /// `inbound_concurrency_*` fields of [`TransportSnapshot`].
     pub inbound_concurrency_conns_sampled: u32,
@@ -3496,6 +3568,12 @@ impl SnapshotExtras {
             || self.conn_identity_teardown_key_elsewhere != 0
             || self.conn_identity_teardown_unidentified != 0
             || self.conn_identity_teardown_key_unmapped != 0
+            || self.conn_identity_promotion_key_mismatch != 0
+            || self.conn_identity_transport_key_set != 0
+            || self.conn_identity_transport_key_same != 0
+            || self.conn_identity_transport_key_refused != 0
+            || self.conn_identity_transport_key_sent != 0
+            || self.conn_identity_transport_key_undelivered != 0
             // The thresholds and the maximum are set only with a sampled
             // connection in the same period (`record_inbound_concurrency`
             // updates them under one lock), so `conns_sampled` alone decides.
@@ -5576,6 +5654,12 @@ mod tests {
             "conn_identity_teardown_key_elsewhere",
             "conn_identity_teardown_unidentified",
             "conn_identity_teardown_key_unmapped",
+            "conn_identity_promotion_key_mismatch",
+            "conn_identity_transport_key_set",
+            "conn_identity_transport_key_same",
+            "conn_identity_transport_key_refused",
+            "conn_identity_transport_key_sent",
+            "conn_identity_transport_key_undelivered",
             "inbound_concurrency_conns_sampled",
             "inbound_concurrency_conns_ge_8",
             "inbound_concurrency_conns_ge_16",

@@ -27,6 +27,7 @@ mod inbound_concurrency;
 mod inbound_stream;
 mod outbound_stream;
 pub(super) use outbound_stream::embeds_metadata;
+mod peer_identity;
 pub(crate) mod piped_stream;
 pub(crate) mod streaming;
 
@@ -41,7 +42,7 @@ pub mod streaming_buffer;
 pub(crate) mod streaming_buffer;
 
 use super::{
-    TransportError,
+    TransportError, TransportPublicKey,
     bbr::DeliveryRateToken,
     congestion_control::{CongestionControl, CongestionController},
     connection_handler::SerializedMessage,
@@ -482,6 +483,11 @@ pub struct PeerConnection<S = super::UdpSocket, T: TimeSource = RealTime> {
     /// `TRANSPORT_METRICS`, except in tests that need a private instance
     /// (the global one is drained by whichever test snapshots it).
     inbound_concurrency_metrics: &'static super::metrics::TransportMetrics,
+    /// The peer's key as the node recorded it: the key dialled, for an
+    /// outbound connection, then the key the connection was promoted into
+    /// the ring under (see `peer_identity`). A QUIC upgrade authenticates the
+    /// peer against it.
+    peer_identity: peer_identity::PeerIdentity,
 }
 
 impl<S, T: TimeSource> std::fmt::Debug for PeerConnection<S, T> {
@@ -1003,6 +1009,46 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         )
     }
 
+    /// This connection was dialled under `key`: the transport holds it as
+    /// the peer's key from the start.
+    pub(super) fn with_dialled_key(mut self, key: TransportPublicKey) -> Self {
+        self.peer_identity = peer_identity::PeerIdentity::dialled(key);
+        self
+    }
+
+    /// The peer's key as the node recorded it, if the transport holds one
+    /// yet (see the `peer_identity` field). Read by the QUIC upgrade.
+    /// Holding a key does not mean the connection was promoted: an outbound
+    /// connection holds the key it dialled from the start.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn peer_identity(&self) -> Option<&TransportPublicKey> {
+        self.peer_identity.key()
+    }
+
+    /// Record `key`, the key the node promoted this connection into the ring
+    /// under. A key other than the one held is refused, and counted
+    /// (`transport_key_refused`); the held key is kept.
+    fn set_peer_identity(&mut self, key: TransportPublicKey) {
+        let remote = self.remote_conn.remote_addr;
+        let kind = match self.peer_identity.update(key.clone()) {
+            peer_identity::PeerIdentityUpdate::Set => super::metrics::ConnIdentity::TransportKeySet,
+            peer_identity::PeerIdentityUpdate::Same => {
+                super::metrics::ConnIdentity::TransportKeySame
+            }
+            peer_identity::PeerIdentityUpdate::Refused => {
+                tracing::warn!(
+                    peer_addr = %remote,
+                    held = ?self.peer_identity.key(),
+                    promoted = %key,
+                    "Connection promoted under a key other than the one its \
+                     transport holds; keeping the held key"
+                );
+                super::metrics::ConnIdentity::TransportKeyRefused
+            }
+        };
+        super::metrics::TRANSPORT_METRICS.record_conn_identity(remote, kind);
+    }
+
     pub(super) fn new(remote_conn: RemoteConnection<S, T>) -> Self {
         // Start the keep-alive task before creating Self
         let remote_addr = remote_conn.remote_addr;
@@ -1211,6 +1257,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             stalled_fragment: None,
             #[cfg(test)]
             legacy_wire_behaviour: false,
+            peer_identity: peer_identity::PeerIdentity::default(),
             remote_conn,
             received_tracker: ReceivedPacketTracker::new(),
             inbound_streams: HashMap::new(),
@@ -3659,6 +3706,10 @@ impl<S: super::Socket> super::PeerConnectionApi for PeerConnection<S> {
         registry: std::sync::Arc<dyn super::InboundStreamRegistry>,
     ) {
         PeerConnection::set_inbound_stream_registry(self, registry);
+    }
+
+    fn set_peer_identity(&mut self, key: super::TransportPublicKey) {
+        PeerConnection::set_peer_identity(self, key);
     }
 
     fn send_stream_data(

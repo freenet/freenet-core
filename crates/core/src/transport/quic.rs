@@ -71,7 +71,7 @@ use super::crypto::{TransportKeypair, TransportPublicKey};
 use super::demux::{DemuxSocket, QuicSourcePermit};
 use super::metrics::{QuicCloseCode, TRANSPORT_METRICS};
 use crate::config::GlobalExecutor;
-use crate::node::background_task_monitor::BackgroundTaskMonitor;
+use crate::node::background_task_monitor::LateRegistrar;
 use crate::simulation::TimeSource;
 use identity::{PeerKey, QuicIdentity};
 use liveness::EndpointHealth;
@@ -608,8 +608,8 @@ impl QuicEndpoint {
         self.clock
     }
 
-    /// Accept connection attempts in a task registered with `monitor` as
-    /// `quic_accept_loop`, handing each to `attempts` without waiting. When
+    /// Accept connection attempts in a task registered through `registrar`
+    /// as `quic_accept_loop`, handing each to `attempts` without waiting. When
     /// `attempts` is full the attempt is ignored and counted
     /// ([`Self::accept_queue_full`], a WARN on the first and every 1024th):
     /// the client retransmits its Initial, as after a lost datagram.
@@ -627,11 +627,10 @@ impl QuicEndpoint {
     /// panic here is still a node failure, as for every monitored task; a
     /// quinn panic is not contained (see `liveness`).
     ///
-    /// `monitor` must not have started waiting yet
-    /// ([`BackgroundTaskMonitor::wait_for_any_exit`] drains it, and a task
-    /// registered after that is not monitored). In `run_node` that happens
-    /// before the event listener opens the transport, so e5 must register
-    /// this task through a monitor that is still live at that point.
+    /// The registrar is a [`LateRegistrar`] because in `run_node` the
+    /// monitor starts waiting before the event listener opens the transport,
+    /// which is where this is called; a task registered on the monitor
+    /// itself at that point would not be watched.
     ///
     /// Attempts already queued in `attempts` each hold a quinn `Incoming`,
     /// which holds the quinn endpoint: until the consumer drains or drops
@@ -642,11 +641,10 @@ impl QuicEndpoint {
     /// Call once per endpoint: two loops would split attempts between two
     /// consumers. A second call logs a WARN, starts nothing and returns
     /// `false`.
-    #[cfg_attr(not(test), allow(dead_code))]
     #[must_use = "false means no accept loop was started"]
     pub(crate) fn spawn_accept_loop(
         &self,
-        monitor: &BackgroundTaskMonitor,
+        registrar: &LateRegistrar,
         attempts: mpsc::Sender<QuicIncoming>,
     ) -> bool {
         if self
@@ -696,7 +694,7 @@ impl QuicEndpoint {
             drop(core);
             std::future::pending::<()>().await;
         });
-        monitor.register("quic_accept_loop", handle);
+        registrar.register("quic_accept_loop", handle);
         true
     }
 

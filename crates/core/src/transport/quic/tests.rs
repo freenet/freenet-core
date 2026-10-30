@@ -2687,7 +2687,10 @@ fn endpoint_death_turns_quic_off_without_stopping_the_node() {
 
         let monitor = BackgroundTaskMonitor::new();
         let (attempts, _attempts_rx) = tokio::sync::mpsc::channel(4);
-        assert!(pair.a.spawn_accept_loop(&monitor, attempts));
+        assert!(
+            pair.a
+                .spawn_accept_loop(&monitor.late_registrar(), attempts)
+        );
         let monitor_fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let wait = {
             let fired = monitor_fired.clone();
@@ -2808,10 +2811,10 @@ fn dropping_the_endpoint_is_not_a_death() {
         .unwrap();
         let monitor = BackgroundTaskMonitor::new();
         let (attempts, mut attempts_rx) = tokio::sync::mpsc::channel(4);
-        assert!(endpoint.spawn_accept_loop(&monitor, attempts));
+        assert!(endpoint.spawn_accept_loop(&monitor.late_registrar(), attempts));
         let (second, _second_rx) = tokio::sync::mpsc::channel(4);
         assert!(
-            !endpoint.spawn_accept_loop(&monitor, second),
+            !endpoint.spawn_accept_loop(&monitor.late_registrar(), second),
             "one accept loop per endpoint"
         );
         let mut availability = endpoint.availability();
@@ -2870,7 +2873,10 @@ fn a_full_accept_queue_ignores_and_counts_the_attempt() {
         let monitor = BackgroundTaskMonitor::new();
         // Room for one attempt, never taken.
         let (attempts, _attempts_rx) = tokio::sync::mpsc::channel(1);
-        assert!(pair.b.spawn_accept_loop(&monitor, attempts));
+        assert!(
+            pair.b
+                .spawn_accept_loop(&monitor.late_registrar(), attempts)
+        );
         let clients: Vec<_> = (0..2)
             .map(|_| {
                 let (a, b_addr, b_key) = (pair.a.clone(), pair.b_addr, pair.b_key());
@@ -2951,6 +2957,82 @@ fn the_transport_reports_quic_availability() {
             );
         }
         unregister_network_time_source(network);
+    })
+}
+
+/// When the node opens the transport with an endpoint, the endpoint's
+/// accept loop is started and registered through the node's late
+/// registrar, so the monitor, already waiting by then, watches it. Without
+/// a registrar (tools and tests) no loop is started, and without an
+/// endpoint (QUIC off) there is no loop to start. On simulation sockets.
+#[test]
+fn the_transport_starts_the_accept_loop_through_the_late_registrar() {
+    bounded(|| async move {
+        use crate::node::background_task_monitor::BackgroundTaskMonitor;
+        use crate::transport::connection_handler::{UdpTransportConfig, bind_udp_listener};
+        let network = "quic-transport-accept-loop";
+        let _clock = Registration::time_source(network, VirtualTime::new());
+        for (port, quic, with_registrar) in [
+            (5000, Some(settings()), true),
+            (5001, Some(settings()), false),
+            (5002, None, true),
+        ] {
+            let local = SocketAddr::from(([10, 201, 35, 1], port));
+            let _registered = Registration::address(local, network);
+            let monitor = BackgroundTaskMonitor::new();
+            // The node's order: the monitor waits before the transport opens.
+            let registrar = monitor.late_registrar();
+            let wait = tokio::spawn(monitor.wait_for_any_exit());
+            let has_endpoint = quic.is_some();
+            let (outbound, _inbound, listener) = bind_udp_listener::<SimulationSocket>(
+                crate::transport::TransportKeypair::new(),
+                local.ip(),
+                port,
+                false,
+                UdpTransportConfig {
+                    quic,
+                    task_registrar: with_registrar.then(|| registrar.clone()),
+                    ..UdpTransportConfig::default()
+                },
+            )
+            .await
+            .unwrap();
+            let expected: &[&str] = if with_registrar && has_endpoint {
+                &["quic_accept_loop"]
+            } else {
+                &[]
+            };
+            assert_eq!(registrar.registered(), expected, "port {port}");
+            assert_eq!(
+                crate::transport::in_memory_socket::quic_accept_loop_started(network, local),
+                !expected.is_empty(),
+                "port {port}"
+            );
+            match outbound.quic_endpoint() {
+                Some(endpoint) => {
+                    let (attempts, _attempts_rx) = tokio::sync::mpsc::channel(1);
+                    assert_eq!(
+                        endpoint.spawn_accept_loop(
+                            &BackgroundTaskMonitor::new().late_registrar(),
+                            attempts
+                        ),
+                        !with_registrar,
+                        "with a registrar the transport already started the endpoint's one loop"
+                    );
+                }
+                None => assert!(!has_endpoint, "an endpoint is built with QUIC on"),
+            }
+            for _ in 0..64 {
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                !wait.is_finished(),
+                "the running loop does not end the wait"
+            );
+            wait.abort();
+            listener.abort();
+        }
+        crate::transport::in_memory_socket::clear_quic_endpoint_clocks(network);
     })
 }
 
@@ -3360,7 +3442,10 @@ fn a_panic_in_the_socket_adapter_turns_quic_off_and_the_node_keeps_running() {
 
                 let monitor = BackgroundTaskMonitor::new();
                 let (attempts, _attempts_rx) = tokio::sync::mpsc::channel(4);
-                assert!(pair.a.spawn_accept_loop(&monitor, attempts));
+                assert!(
+                    pair.a
+                        .spawn_accept_loop(&monitor.late_registrar(), attempts)
+                );
                 let monitor_fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let wait = {
                     let fired = monitor_fired.clone();

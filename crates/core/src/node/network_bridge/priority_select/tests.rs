@@ -2788,6 +2788,8 @@ struct MockPeerConnection {
 }
 
 impl crate::transport::PeerConnectionApi for MockPeerConnection {
+    fn set_peer_identity(&mut self, _key: crate::transport::TransportPublicKey) {}
+
     fn remote_addr(&self) -> std::net::SocketAddr {
         self.addr
     }

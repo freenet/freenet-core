@@ -864,8 +864,10 @@ configs start carrying data. Off: no endpoint, no QUIC ingress, nothing
 changes. QUIC must stay off by default on Windows until the crash-loop
 breaker works there (#6031). Shadow or prefer: the endpoint is built
 with the node's QUIC identity (below) and an EMPTY allow-set, so nothing
-reaches it and it sends nothing; the listener holds it. Upgrading a UDP
-session to QUIC comes later, so only tests open QUIC connections.
+reaches it and it sends nothing; the listener holds it, with the queue of
+its accept loop (below), which hands on no attempt while the allow-set is
+empty. Upgrading a UDP session to QUIC comes later, so only tests open
+QUIC connections.
 
 Upgrade policy (`quic/upgrade/policy.rs`, not yet wired in):
 `QuicPolicy::new(network_api, breaker, availability)` takes the config, the
@@ -1047,6 +1049,31 @@ no extra message, no exporter proof.
     succeed: TLS 1.3 lets it finish before the server's verdict, and the
     server's CONNECTION_CLOSE ends the connection at once. The server never
     gets a connection from an unexpected key.
+  → The expected key comes from the node's own record, never from an
+    upgrade message. A connection's transport (PeerConnection) holds its
+    peer's key: the key it dialled, for an outbound connection, and, only
+    when the transport has a QUIC endpoint (TransportHandle::quic_endpoint),
+    the key the node promoted the connection into the ring under. The
+    bridge sends that as ConnEvent::SetPeerIdentity when the ring takes the
+    connection (P2pConnManager::tell_transport_peer_identity: after
+    handle_successful_connection adds it, and when
+    promote_existing_connection returns Promoted, once the connection is
+    bound), with the key the node bound to it (identity::bind). With QUIC
+    off nothing is sent. Counters (conn_identity_*): transport_key_sent
+    (handed to the connection's task), transport_key_undelivered (not handed
+    over within the 1 s fallback; not re-sent), transport_key_set / _same
+    (the transport took it), and promotion_key_mismatch (promoted under a key
+    that is not the bound one; nothing sent) and transport_key_refused (the
+    transport holds another key and keeps it), which must stay at 0 (the
+    simulation tripwire and test_quic_prefer_forms_a_mesh_of_the_same_peers_as_quic_off
+    assert it).
+    A ring member's transport can still hold no key: a key not handed
+    over within the fallback is not re-sent, and a promotion that finds
+    the address already in the ring (AlreadyInRing) sends none. The
+    upgrade (e5a-5b) must treat a transport with no key as not eligible,
+    never as "any key". An inbound transport's key is the key the node
+    bound from the peer's claim, not one the transport authenticated; the
+    QUIC handshake is what checks it.
 Tests: conversion vs curve25519-dalek 5 (random keys, bit 255 set, u = -1),
 signer key == verifier key over many keypairs with both natural sign bits,
 signatures verified by ed25519-dalek and refused with any bit flipped,
@@ -1470,15 +1497,22 @@ Liveness ("alive" = the endpoint driver has not ENDED; it does not mean
     Released are final, and not_up() returns them at once every time.
     Availability is per endpoint, one per node (so per process in
     production, per node in simulation).
-  → QuicEndpoint::spawn_accept_loop registers the accept loop with
-    BackgroundTaskMonitor as quic_accept_loop. It holds an EndpointCore
+  → QuicEndpoint::spawn_accept_loop registers the accept loop through a
+    LateRegistrar as quic_accept_loop. The node starts it when it opens the
+    transport with an endpoint (UdpTransportConfig::task_registrar; tools
+    and tests that pass none start no loop). It holds an EndpointCore
     (no owner share), so it does not keep the endpoint alive: when the
     node drops its last handle it sees Released, drops the core (quinn's
     driver ends, the socket is let go) and stops. It also stops when
     accept() returns None or the consumer is gone (WARN). It PARKS
     instead of returning, because the monitor treats any end of a task as
     a node failure, and drops its Sender first, so the consumer's recv()
-    returns None once drained. Attempts still queued each hold a quinn
+    returns None once drained. The parked task is aborted when the node
+    stops: when the monitor's wait future resolves or is dropped, it aborts
+    every task registered through a LateRegistrar (a JoinHandle dropped
+    alone only detaches its task), and one registered after that is
+    aborted at once. A monitor never waited on (in-memory simulation
+    nodes) aborts them when it and its last registrar are dropped. Attempts still queued each hold a quinn
     Incoming, which holds the endpoint: they keep quinn's driver and the
     socket alive until drained or dropped. Call it once per endpoint (a
     second call warns and starts nothing). It hands attempts on with
@@ -1488,9 +1522,11 @@ Liveness ("alive" = the endpoint driver has not ENDED; it does not mean
     an owner share; only the accept loop holds one.
   → run_node drains the monitor (wait_for_any_exit) BEFORE the event
     listener opens the transport, so a task registered from the
-    transport's open path is not monitored. register() now logs that at
-    ERROR. e5 must register the accept loop through a monitor that is
-    still live (not yet waited on) at that point.
+    transport's open path with register() is not monitored (logged at
+    ERROR). BackgroundTaskMonitor::late_registrar() gives a handle whose
+    registrations, before or after the drain, the future returned by
+    wait_for_any_exit also watches; use it for any task started from the
+    transport's open path.
 Tests: one row per quinn variant and per stop/reset code in
   quic/error/tests.rs; each close code sent by either side and seen by
   the peer as that code and kind; the receive-task panic seen as
