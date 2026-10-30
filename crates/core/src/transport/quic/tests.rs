@@ -3260,20 +3260,26 @@ fn run_child(name: &str) -> (String, std::process::Output) {
             .map(|p| Box::new(p) as Box<dyn std::io::Read + Send>),
     );
     // A hang guard on the wall clock; the tests inside run on virtual time
-    // under `bounded`'s own watchdog, so only a wedged child gets here.
-    let deadline = std::time::Instant::now() + 2 * WATCHDOG;
+    // under `bounded`'s own watchdog, so only a wedged child gets here. It
+    // counts poll intervals rather than reading a clock (the rule lint bans
+    // `std::time::Instant` here); each interval sleeps at least `POLL`, so
+    // the guard fires no earlier than `2 * WATCHDOG`.
+    const POLL: Duration = Duration::from_millis(20);
+    let max_polls = (2 * WATCHDOG).as_millis() / POLL.as_millis();
+    let mut polls = 0u128;
     let status = loop {
         if let Some(status) = child.try_wait().expect("wait for the child") {
             break status;
         }
-        if std::time::Instant::now() > deadline {
+        polls += 1;
+        if polls > max_polls {
             child.kill().ok();
             panic!(
                 "the child running {test} did not finish within {:?}",
                 2 * WATCHDOG
             );
         }
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(POLL);
     };
     let output = std::process::Output {
         status,
