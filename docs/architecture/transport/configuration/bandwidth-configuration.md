@@ -16,7 +16,8 @@ The Freenet transport layer supports two bandwidth configuration modes:
 # Each connection can use up to 1.25 MB/s (default, fixedrate controller)
 freenet
 
-# Custom per-connection limit
+# Custom per-connection limit. Currently only sets the initial rate: the
+# congestion controller's rate replaces it at the first rate update (#6047).
 freenet --bandwidth-limit 5000000  # 5 MB/s per connection
 ```
 
@@ -33,7 +34,7 @@ freenet --total-bandwidth-limit 50000000 --min-bandwidth-per-connection 1000000
 
 | Argument | Description | Default |
 |----------|-------------|---------|
-| `--bandwidth-limit <bytes/sec>` | Per-connection bandwidth limit | None (the congestion controller's rate: 1,250,000 (1.25 MB/s) for `fixedrate`) |
+| `--bandwidth-limit <bytes/sec>` | Per-connection bandwidth limit (currently only the initial rate, #6047) | None (the congestion controller's rate: 1,250,000 (1.25 MB/s) for `fixedrate`) |
 | `--total-bandwidth-limit <bytes/sec>` | Cap on everything the node sends over UDP, across ALL connections | None (disabled) |
 | `--min-bandwidth-per-connection <bytes/sec>` | Minimum per-connection pacing rate inside the total (clamped to the total) | 1,000,000 (1 MB/s) |
 | `--congestion-control <algorithm>` | Congestion control algorithm (`fixedrate`, `ledbat`, `bbr`) | `fixedrate` |

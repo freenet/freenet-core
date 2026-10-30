@@ -2356,8 +2356,9 @@ pub struct NetworkArgs {
     /// Bandwidth limit for large streaming data transfers, in bytes per second.
     /// Applies only to the streaming path used for large transfers; the general
     /// packet rate limiter is currently disabled for reliability reasons.
-    /// Applies to each connection separately, so N connections may send up to
-    /// N times this rate; use --total-bandwidth-limit to cap the node as a whole.
+    /// Currently this only sets a connection's initial pacing rate: the first
+    /// rate update replaces it with the congestion controller's rate (#6047).
+    /// To limit what the node sends, use --total-bandwidth-limit.
     /// Default: unset, so each connection is paced at the congestion
     /// controller's rate, 1.25 MB/s (1,250,000 bytes/second) for the default
     /// `fixedrate` controller.
@@ -2669,10 +2670,12 @@ pub struct NetworkApiConfig {
     pub ignore_protocol_version: bool,
 
     /// Bandwidth limit per connection for data transfers (in bytes per second).
-    /// NOTE: This applies to each connection independently - N connections may use N * bandwidth_limit total.
+    /// NOTE: Currently this only seeds a connection's initial token-bucket rate;
+    /// the first rate update replaces it with the congestion controller's rate (#6047).
     /// Default: None, so each connection is paced at the congestion controller's
     /// rate: 1.25 MB/s (`fixed_rate::DEFAULT_RATE_BYTES_PER_SEC`) for the default
-    /// `fixedrate` controller, which does not slow down for other traffic.
+    /// `fixedrate` controller, which does not adapt to queuing delay or other traffic.
+    /// N connections may therefore send up to N times that rate.
     ///
     /// If `total_bandwidth_limit` is set, this field is ignored and per-connection rates
     /// are derived from: `total_bandwidth_limit / active_connections`.
