@@ -76,7 +76,7 @@ const _: () = {
     let reset = reset_code::ALL;
     // No code is used twice, within or across the namespaces.
     let all_len = close.len() + stop.len() + reset.len();
-    let mut all = [0u32; 5 + 8 + 2];
+    let mut all = [0u32; 5 + 9 + 2];
     assert!(all.len() == all_len, "update the combined length");
     let mut n = 0;
     let mut i = 0;
@@ -247,8 +247,9 @@ pub(in crate::transport) fn attribute(
 /// Whether a stream the peer STOPPED with `code` may succeed on a retry
 /// (a new stream), like the UDP transport's `OutboundStreamFailed`. Not
 /// retryable, because the same message fails the same way every time:
-/// `HEADER_REFUSED`, `OVERLONG` and `FRAGMENT_REFUSED` (the receiver's
-/// buffer refused a fragment of this shape). Every other stop code is
+/// `HEADER_REFUSED`, `OVERLONG`, `FRAGMENT_REFUSED` (the receiver's buffer
+/// refused a fragment of this shape) and `NOT_ACCEPTING_DATA` (the path
+/// accepts no data for as long as it lives). Every other stop code is
 /// retryable: budget, channel-full, eviction, id-in-use, cancellation by
 /// the consumer, and stop codes this node does not know.
 pub(in crate::transport) fn stop_is_retryable(code: u64) -> bool {
@@ -256,6 +257,7 @@ pub(in crate::transport) fn stop_is_retryable(code: u64) -> bool {
         stop_code::HEADER_REFUSED,
         stop_code::OVERLONG,
         stop_code::FRAGMENT_REFUSED,
+        stop_code::NOT_ACCEPTING_DATA,
     ]
     .into_iter()
     .any(|deterministic| u64::from(deterministic) == code)
