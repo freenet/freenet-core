@@ -20,21 +20,62 @@
 //! - a driver task dropped without finishing (the runtime shutting down) is
 //!   not reported: the process is ending.
 //!
-//! What this does NOT cover: a PANIC in the driver. quinn's driver returns
-//! only on an I/O error from `drive_recv`, and [`QuicSocket`] never returns
-//! one, so in production today the driver cannot return at all; the only
-//! way it ends is a panic, and a panic is not contained. quinn 0.11.12 polls
-//! the driver while holding its endpoint state mutex
-//! (`EndpointDriver::poll`, `endpoint.rs` line 370: `state.lock().unwrap()`),
-//! so a panic there poisons it, and every later lock of it panics too:
-//! `EndpointDriver::drop` (line 403), `Accept::poll` (line 651, inside
-//! `quic_accept_loop`), `connect` (line 214) and the connection drivers. Where
-//! one of those runs while the first panic is still unwinding, the process
-//! aborts. So this circuit only reports a driver that RETURNED (tests inject
-//! that with a receive error, `socket::ReceiveFault`). Containing a quinn
-//! panic (catch the unwind, leak the driver instead of dropping it, guard
-//! the accept loop against the poisoned lock) is a separate prerequisite
-//! before QUIC is on by default.
+//! Panics. The node relies on unwinding (`panic = "unwind"`; a build that
+//! aborts on panic refuses to build the endpoint, `super::require_unwinding`,
+//! and runs with QUIC off), and what a panic does depends on where it
+//! starts:
+//!
+//! - In the node's socket adapter ([`QuicSocket`]: `poll_recv`, `try_send`,
+//!   `poll_writable`), which quinn calls while holding its endpoint or
+//!   connection state lock: CONTAINED. The adapter catches it before it
+//!   unwinds into quinn, so no lock is poisoned, and reports it through
+//!   [`EndpointHealth::adapter_panicked`]: the endpoint is `Down` (counted
+//!   in `quic_endpoint_down` and `quic_adapter_panicked`, and logged at
+//!   ERROR once by the node; quinn also logs its own ERROR "I/O error" for
+//!   each of its drivers that ends with the error, so a busy endpoint logs
+//!   one such line per connection whose driver ran into it), and the
+//!   adapter returns an I/O error, which ends the quinn driver that called
+//!   it cleanly. From then on every adapter call returns
+//!   that error without running the adapter's code. QUIC then stays off
+//!   until the node restarts: the endpoint driver ends at its next receive;
+//!   `connect` refuses at once (`QuicEndpoint::connect` checks);
+//!   a handshake in progress ends with an error (quinn's implicit close, see
+//!   `QuicIncoming::establish`); and each connection is closed locally by
+//!   its watcher (`QuicConnection::new`), so callers get an error instead of
+//!   waiting on a driver that has stopped. Peers are not told: no
+//!   CONNECTION_CLOSE leaves (see `socket`), so they find out from their own
+//!   idle timeout. A panic after the node released the endpoint is counted
+//!   and logged but leaves it `Released`; its connections (which the node
+//!   may still hold) are closed locally by their watchers all the same,
+//!   since every send of the endpoint now fails (see the watcher in
+//!   `QuicConnection::new`).
+//! - In the node's own per-connection tasks (the path's receive task, see
+//!   `path::supervise_receive`): contained per connection, which is closed
+//!   with DOWNGRADE, and not counted in `quic_adapter_panicked`.
+//! - In the node's runtime adapter ([`QuicRuntime`]: `now`, and
+//!   `QuicTimer::reset` / `poll`, which call the `TimeSource`, including
+//!   `sleep_until`): NOT contained. quinn calls them from its drivers under
+//!   the same state lock, so a panic there behaves as one in quinn's own
+//!   code (below). They have no error to return a panic as (`now` must
+//!   return an `Instant`), so they are not wrapped like the socket adapter.
+//! - In quinn's own code inside its endpoint or connection driver: NOT
+//!   contained, and it can abort the process. quinn 0.11.12 polls each
+//!   driver holding a `std::sync::Mutex` it locks with `.lock().unwrap()`,
+//!   so the panic poisons it, and quinn's destructors unwrap the poisoned
+//!   lock. For the endpoint driver that happens on every such panic: quinn
+//!   spawns it inside its own `async` block, and the unwind out of that
+//!   block drops the driver there, before any catch around the spawned
+//!   future (ours or tokio's) runs. `EndpointDriver::drop`
+//!   (`endpoint.rs:403`) and then `EndpointRef::drop` (`endpoint.rs:724`)
+//!   lock the poisoned mutex during the unwind, and the process aborts. For
+//!   a connection driver, `SendStream`, `RecvStream` and the last
+//!   `Connection` handle lock in their `Drop`, so dropping one afterwards
+//!   panics in whatever task drops it, and aborts the process if that drop
+//!   runs during an unwind. The fix belongs in quinn: those destructors
+//!   must tolerate a poisoned lock (both `endpoint.rs:403` and `:724` for
+//!   the endpoint driver);
+//!   `a_panic_unwinding_through_the_endpoint_driver_still_aborts` pins the
+//!   current behaviour.
 //!
 //! With `transport-quic = "off"` no endpoint exists, and the transport
 //! reports [`QuicAvailability::Disabled`].
@@ -125,6 +166,11 @@ pub(crate) struct EndpointHealth {
     /// Set when the node dropped its last handle to the endpoint; the
     /// driver ending after that is the normal shutdown.
     released: AtomicBool,
+    /// Set by the first panic the socket adapter caught; final.
+    adapter_panicked: AtomicBool,
+    /// `true` once the socket adapter caught a panic, for connection
+    /// watchers to wait on after Released ([`Self::adapter_panic_watch`]).
+    adapter_panic_signal: watch::Sender<bool>,
     local_addr: SocketAddr,
 }
 
@@ -134,6 +180,8 @@ impl EndpointHealth {
         Arc::new(Self {
             availability,
             released: AtomicBool::new(false),
+            adapter_panicked: AtomicBool::new(false),
+            adapter_panic_signal: watch::channel(false).0,
             local_addr,
         })
     }
@@ -168,6 +216,86 @@ impl EndpointHealth {
         self.released.load(Ordering::Acquire)
     }
 
+    /// A view that turns `true` once the socket adapter caught a panic. A
+    /// connection's watcher waits on it after Released, when no `Down`
+    /// will come (see `QuicConnection::new`).
+    pub(crate) fn adapter_panic_watch(&self) -> watch::Receiver<bool> {
+        self.adapter_panic_signal.subscribe()
+    }
+
+    /// Whether `connect` must refuse: the endpoint is Down, or the socket
+    /// adapter caught a panic (the flag is set before the availability
+    /// flips, so this also covers that gap).
+    pub(crate) fn refuses_connects(&self) -> bool {
+        self.has_adapter_panicked() || *self.availability.borrow() == QuicAvailability::Down
+    }
+
+    /// Whether a CONNECTION_CLOSE made now can still be sent: not once the
+    /// endpoint is Down (its endpoint driver has ended, or is about to) or
+    /// the socket adapter caught a panic (which may have ended the
+    /// connection's driver, and makes every send fail; this holds after
+    /// Released too).
+    pub(crate) fn closes_can_be_sent(&self) -> bool {
+        !self.has_adapter_panicked() && *self.availability.borrow() != QuicAvailability::Down
+    }
+
+    /// Whether the socket adapter caught a panic ([`Self::adapter_panicked`]).
+    /// One atomic load: read on every receive.
+    pub(crate) fn has_adapter_panicked(&self) -> bool {
+        self.adapter_panicked.load(Ordering::Acquire)
+    }
+
+    /// The socket adapter caught a panic in `call`, before it unwound into
+    /// quinn. The first one counts `quic_adapter_panicked`, turns the
+    /// endpoint `Down`, signals [`Self::adapter_panic_watch`] and logs at
+    /// ERROR; if the endpoint was no longer `Up` (the node had released it,
+    /// or its driver had returned) it stays as it was and the log says so,
+    /// choosing the message from the transition, so a release racing this
+    /// cannot make it wrong. A later one only logs at DEBUG, so a fault that
+    /// repeats is counted once per endpoint.
+    pub(crate) fn adapter_panicked(
+        &self,
+        call: &'static str,
+        payload: &(dyn std::any::Any + Send),
+    ) {
+        let message = panic_message(payload);
+        if self.adapter_panicked.swap(true, Ordering::AcqRel) {
+            tracing::debug!(local_addr = %self.local_addr, call, panic = message, "QUIC socket adapter panicked again");
+            return;
+        }
+        TRANSPORT_METRICS.record_quic_adapter_panicked(self.local_addr);
+        let mut was = QuicAvailability::Up;
+        let went_down = self.availability.send_if_modified(|availability| {
+            was = *availability;
+            if *availability == QuicAvailability::Up {
+                *availability = QuicAvailability::Down;
+                true
+            } else {
+                false
+            }
+        });
+        self.adapter_panic_signal.send_replace(true);
+        if went_down {
+            TRANSPORT_METRICS.record_quic_endpoint_down(self.local_addr);
+            tracing::error!(
+                local_addr = %self.local_addr,
+                call,
+                panic = message,
+                "The QUIC socket adapter panicked; the panic was caught. The QUIC endpoint is \
+                 down: the node keeps running on the UDP transport, with QUIC off until it restarts"
+            );
+        } else {
+            tracing::error!(
+                local_addr = %self.local_addr,
+                call,
+                panic = message,
+                availability = ?was,
+                "The QUIC socket adapter panicked; the panic was caught. The QUIC endpoint was \
+                 already not up; its connections are closed locally"
+            );
+        }
+    }
+
     /// The endpoint driver's future returned.
     fn driver_ended(&self) {
         if self.is_released() {
@@ -197,10 +325,21 @@ impl EndpointHealth {
     }
 }
 
+/// The text of a panic payload, when it has one.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        message
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message
+    } else {
+        "(not a string)"
+    }
+}
+
 /// Run quinn's endpoint driver and report to `health` when it returns.
 ///
-/// No panic handling: a panic in quinn's driver is not contained here (see
-/// the module docs) and is never reported as `Down`.
+/// No panic handling here: a panic in quinn's driver code is not contained
+/// (see the module docs), and the socket adapter catches its own.
 pub(crate) async fn watch_endpoint_driver(
     driver: Pin<Box<dyn Future<Output = ()> + Send>>,
     health: Arc<EndpointHealth>,
@@ -237,5 +376,33 @@ mod tests {
         assert_eq!(health.watch().get(), QuicAvailability::Down);
         health.driver_ended();
         assert_eq!(TRANSPORT_METRICS.quic_endpoint_down_at(addr), 1);
+    }
+
+    /// A socket-adapter panic is counted and turns the endpoint Down once,
+    /// however often it repeats (a second, concurrent one only logs). One
+    /// after the node released the endpoint is counted but leaves it
+    /// `Released`, and is not counted as a death. Either way a close can no
+    /// longer be sent.
+    #[test]
+    fn an_adapter_panic_counts_once_and_keeps_released() {
+        let addr: SocketAddr = "10.201.35.3:1".parse().unwrap();
+        let health = EndpointHealth::new(addr);
+        assert!(health.closes_can_be_sent());
+        health.adapter_panicked("test", &"first");
+        health.adapter_panicked("test", &"second");
+        assert_eq!(health.watch().get(), QuicAvailability::Down);
+        assert_eq!(TRANSPORT_METRICS.quic_adapter_panicked_at(addr), 1);
+        assert_eq!(TRANSPORT_METRICS.quic_endpoint_down_at(addr), 1);
+        assert!(!health.closes_can_be_sent());
+
+        let addr: SocketAddr = "10.201.35.4:1".parse().unwrap();
+        let health = EndpointHealth::new(addr);
+        health.release();
+        assert!(health.closes_can_be_sent());
+        health.adapter_panicked("test", &"after release");
+        assert_eq!(health.watch().get(), QuicAvailability::Released);
+        assert_eq!(TRANSPORT_METRICS.quic_adapter_panicked_at(addr), 1);
+        assert_eq!(TRANSPORT_METRICS.quic_endpoint_down_at(addr), 0);
+        assert!(!health.closes_can_be_sent());
     }
 }

@@ -3036,6 +3036,10 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 serde_json::json!(snapshot.quic_endpoint_down),
             );
             m.insert(
+                "quic_adapter_panicked".into(),
+                serde_json::json!(snapshot.quic_adapter_panicked),
+            );
+            m.insert(
                 "quic_breaker_trips".into(),
                 serde_json::json!(snapshot.quic_breaker_trips),
             );
@@ -7757,12 +7761,13 @@ mod tests {
         }
     }
 
-    /// The event-log JSON carries the QUIC endpoint-down and close-code
-    /// counts, with the same values serde gives.
+    /// The event-log JSON carries the QUIC endpoint-down, adapter-panic and
+    /// close-code counts, with the same values serde gives.
     #[test]
     fn transport_snapshot_json_carries_quic_endpoint_and_close_counts() {
         let snapshot = crate::transport::metrics::TransportSnapshot {
             quic_endpoint_down: 1,
+            quic_adapter_panicked: 5,
             quic_close_sent_node_dropped_peer: 2,
             quic_close_sent_downgrade: 3,
             quic_close_sent_identity_mismatch: 4,
@@ -7778,6 +7783,7 @@ mod tests {
         )));
         for (key, expected) in [
             ("quic_endpoint_down", 1),
+            ("quic_adapter_panicked", 5),
             ("quic_close_sent_node_dropped_peer", 2),
             ("quic_close_sent_downgrade", 3),
             ("quic_close_sent_identity_mismatch", 4),

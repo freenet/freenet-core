@@ -199,8 +199,18 @@ fn configured_mode(config: &NetworkApiConfig) -> QuicMode {
 /// Report the QUIC upgrade configuration once, at node startup: that
 /// `prefer` runs as `shadow` (INFO), and, with QUIC on, a `quic-max-paths`
 /// that cannot be parsed (WARN) or is lowered to `max-number-of-connections`
-/// (INFO).
+/// (INFO). In a build that aborts on panic QUIC stays off whatever the
+/// configuration (`QuicEndpoint::bind` refuses), and only that is reported
+/// (WARN).
 pub(crate) fn log_startup(config: &NetworkApiConfig) {
+    if configured_mode(config) != QuicMode::Off && !crate::transport::quic::UNWINDS {
+        tracing::warn!(
+            transport_quic = ?config.transport_quic,
+            "This build aborts on panic (panic = \"abort\"), so QUIC stays off: the QUIC \
+             transport needs panics to unwind to contain them"
+        );
+        return;
+    }
     if configured_mode(config) == QuicMode::Prefer {
         tracing::info!(
             "transport-quic = \"prefer\" runs as \"shadow\" in this release: QUIC paths \

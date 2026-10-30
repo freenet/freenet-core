@@ -638,9 +638,17 @@ pub struct TransportMetrics {
     conn_identity: [AtomicU32; ConnIdentity::COUNT],
 
     /// Times the QUIC endpoint went down while the node still held it (its
-    /// driver future returned), after which the node runs with QUIC off
-    /// (reset each snapshot). At most one per endpoint.
+    /// driver future returned, or the QUIC socket adapter caught a panic),
+    /// after which the node runs with QUIC off (reset each snapshot). At
+    /// most one per endpoint.
     quic_endpoint_down: AtomicU64,
+    /// QUIC endpoints whose socket adapter caught a panic, at most one per
+    /// endpoint however often the fault repeats; each turns that endpoint
+    /// off, unless the node had already released it (reset each snapshot).
+    /// A panic in a path's receive task is not counted here
+    /// (`receive_task_panicked`), and a panic in quinn's own driver code is
+    /// not caught at all.
+    quic_adapter_panicked: AtomicU64,
     /// Times the QUIC crash-loop breaker tripped at startup (reset each
     /// snapshot; at most one per process).
     quic_breaker_trips: AtomicU64,
@@ -648,7 +656,10 @@ pub struct TransportMetrics {
     /// state, never reset).
     quic_breaker_suppressed: AtomicBool,
     /// QUIC connections this node closed, by [`QuicCloseCode`] (reset each
-    /// snapshot).
+    /// snapshot). Counted when the close is queued, and only while it can
+    /// still be sent (not after the endpoint went Down or its socket adapter
+    /// caught a panic); a panic between the count and quinn's transmit can
+    /// still leave a counted close unsent, so this is an upper bound.
     quic_close_sent: [AtomicU64; QuicCloseCode::COUNT],
 
     /// The current snapshot period, starting at 1 and advanced by each
@@ -814,6 +825,11 @@ struct NatDetailCounters {
     /// down (bounded), one per `record_quic_endpoint_down`.
     #[cfg(test)]
     quic_endpoint_down_at: parking_lot::Mutex<std::collections::VecDeque<SocketAddr>>,
+    /// Test-only log of the local addresses of QUIC endpoints whose socket
+    /// adapter caught a panic (bounded), one per
+    /// `record_quic_adapter_panicked`.
+    #[cfg(test)]
+    quic_adapter_panicked_at: parking_lot::Mutex<std::collections::VecDeque<SocketAddr>>,
     /// Test-only log of QUIC closes this node sent, with the remote
     /// (bounded).
     #[cfg(test)]
@@ -1034,6 +1050,7 @@ impl TransportMetrics {
             handshake_unauthenticated_dropped: AtomicU64::new(0),
             conn_identity: Default::default(),
             quic_endpoint_down: AtomicU64::new(0),
+            quic_adapter_panicked: AtomicU64::new(0),
             quic_breaker_trips: AtomicU64::new(0),
             quic_breaker_suppressed: AtomicBool::new(false),
             quic_close_sent: Default::default(),
@@ -1470,6 +1487,28 @@ impl TransportMetrics {
         #[cfg(not(test))]
         let _ = local;
         self.quic_endpoint_down.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The socket adapter of the QUIC endpoint bound at `local` caught its
+    /// first panic (`local` is never exported).
+    pub(crate) fn record_quic_adapter_panicked(&self, local: SocketAddr) {
+        #[cfg(test)]
+        push_test_log(&self.nat_detail.quic_adapter_panicked_at, local);
+        #[cfg(not(test))]
+        let _ = local;
+        self.quic_adapter_panicked.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Test-only: how many times a socket-adapter panic was counted for the
+    /// QUIC endpoint bound at `local`.
+    #[cfg(test)]
+    pub(crate) fn quic_adapter_panicked_at(&self, local: SocketAddr) -> usize {
+        self.nat_detail
+            .quic_adapter_panicked_at
+            .lock()
+            .iter()
+            .filter(|addr| **addr == local)
+            .count()
     }
 
     /// The QUIC crash-loop breaker tripped at startup
@@ -2110,6 +2149,7 @@ impl TransportMetrics {
             upgrade_control_received: get64(&self.upgrade_control_received),
             handshake_unauthenticated_dropped: get64(&self.handshake_unauthenticated_dropped),
             quic_endpoint_down: get64(&self.quic_endpoint_down),
+            quic_adapter_panicked: get64(&self.quic_adapter_panicked),
             quic_breaker_trips: get64(&self.quic_breaker_trips),
             quic_breaker_suppressed: self.quic_breaker_suppressed.load(Ordering::Relaxed),
             quic_close_sent_node_dropped_peer: get64(
@@ -2657,6 +2697,10 @@ pub struct TransportSnapshot {
     /// Times the QUIC endpoint went down while the node held it; the node
     /// then runs with QUIC off (#5940 e4).
     pub quic_endpoint_down: u64,
+    /// QUIC endpoints whose socket adapter caught a panic (at most one per
+    /// endpoint); each turns that endpoint off unless the node had already
+    /// released it (#5940). Not counted: a panic in a path's receive task.
+    pub quic_adapter_panicked: u64,
     /// Times the QUIC crash-loop breaker tripped: a run with QUIC enabled
     /// ended abnormally, so this one started with QUIC off (#5940).
     pub quic_breaker_trips: u64,
@@ -2992,6 +3036,7 @@ impl TransportSnapshot {
             upgrade_control_received,
             handshake_unauthenticated_dropped,
             quic_endpoint_down,
+            quic_adapter_panicked,
             quic_breaker_trips,
             quic_breaker_suppressed,
             quic_close_sent_node_dropped_peer,
@@ -3115,6 +3160,7 @@ impl TransportSnapshot {
         self.upgrade_control_received = upgrade_control_received;
         self.handshake_unauthenticated_dropped = handshake_unauthenticated_dropped;
         self.quic_endpoint_down = quic_endpoint_down;
+        self.quic_adapter_panicked = quic_adapter_panicked;
         self.quic_breaker_trips = quic_breaker_trips;
         self.quic_breaker_suppressed = quic_breaker_suppressed;
         self.quic_close_sent_node_dropped_peer = quic_close_sent_node_dropped_peer;
@@ -3281,6 +3327,10 @@ struct SnapshotExtras {
     /// Times the QUIC endpoint went down while the node held it; the node
     /// then runs with QUIC off (#5940 e4).
     pub quic_endpoint_down: u64,
+    /// QUIC endpoints whose socket adapter caught a panic (at most one per
+    /// endpoint); each turns that endpoint off unless the node had already
+    /// released it (#5940). Not counted: a panic in a path's receive task.
+    pub quic_adapter_panicked: u64,
     /// Times the QUIC crash-loop breaker tripped: a run with QUIC enabled
     /// ended abnormally, so this one started with QUIC off (#5940).
     pub quic_breaker_trips: u64,
@@ -3445,6 +3495,7 @@ impl SnapshotExtras {
             || self.upgrade_control_received != 0
             || self.handshake_unauthenticated_dropped != 0
             || self.quic_endpoint_down != 0
+            || self.quic_adapter_panicked != 0
             || self.quic_breaker_trips != 0
             || self.quic_close_sent_node_dropped_peer != 0
             || self.quic_close_sent_downgrade != 0
@@ -4344,6 +4395,27 @@ mod tests {
         assert_eq!(json["quic_endpoint_down"], 1);
         assert!(metrics.take_snapshot().is_none(), "the counter must reset");
         assert_eq!(metrics.quic_endpoint_down_at(local), 1);
+    }
+
+    /// Socket-adapter panics reach the snapshot and its JSON, count as
+    /// activity on their own, and reset.
+    #[test]
+    fn quic_adapter_panicked_reaches_snapshot_and_resets() {
+        let metrics = TransportMetrics::new();
+        let local: SocketAddr = "10.255.10.2:7".parse().unwrap();
+        assert!(
+            metrics.take_snapshot().is_none(),
+            "a fresh instance is idle"
+        );
+        metrics.record_quic_adapter_panicked(local);
+        let snap = metrics
+            .take_snapshot()
+            .expect("a caught panic alone is activity");
+        assert_eq!(snap.quic_adapter_panicked, 1);
+        let json = serde_json::to_value(&snap).unwrap();
+        assert_eq!(json["quic_adapter_panicked"], 1);
+        assert!(metrics.take_snapshot().is_none(), "the counter must reset");
+        assert_eq!(metrics.quic_adapter_panicked_at(local), 1);
     }
 
     /// A breaker trip reaches the snapshot and its JSON, counts as activity
@@ -5504,6 +5576,7 @@ mod tests {
             "upgrade_control_received",
             "handshake_unauthenticated_dropped",
             "quic_endpoint_down",
+            "quic_adapter_panicked",
             "quic_breaker_trips",
             "quic_breaker_suppressed",
             "quic_close_sent_node_dropped_peer",
