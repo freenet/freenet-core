@@ -1305,7 +1305,7 @@ impl P2pConnManager {
             check_version: !config.config.network_api.ignore_protocol_version,
             ack_version_floor_override: config.ack_version_floor_override,
             advertised_version_override: config.advertised_version_override,
-            bandwidth_limit: config.config.network_api.bandwidth_limit,
+            bandwidth_limit: config.config.network_api.transport_bandwidth_limit(),
             global_bandwidth: config
                 .config
                 .network_api
