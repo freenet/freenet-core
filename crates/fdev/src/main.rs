@@ -308,6 +308,7 @@ mod tests {
             contract_store: None,
             max_cases: None,
             max_case_bytes: None,
+            max_states_paired: None,
             properties: Vec::new(),
             json: false,
             evidence_out: None,
