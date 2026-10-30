@@ -79,7 +79,7 @@ use parking_lot::RwLock;
 use tokio::time::Instant;
 
 use super::property::{IdempotenceSettling, Severity};
-use super::shadow::{Finding, JudgedContract};
+use super::shadow::{Finding, JudgedContract, ProbeSkips};
 
 /// How many recently-checked contracts to remember.
 ///
@@ -160,6 +160,10 @@ pub struct CheckedContract {
     pub verdicts: usize,
     /// Cases that came back `Inconclusive`, accumulated the same way.
     pub inconclusive: usize,
+    /// Cases this contract's probes left out, accumulated the same way. A clean
+    /// result is a statement about the cases that ran, so a page saying "no violation
+    /// found" needs this beside it (#6044).
+    pub skips: ProbeSkips,
     /// Findings for THIS contract, newest first. Deduplicated on the property that
     /// broke, so the length is bounded by the property count.
     ///
@@ -210,6 +214,7 @@ impl CheckedContract {
             contract,
             verdicts,
             inconclusive,
+            skips: ProbeSkips::default(),
             findings: Vec::new(),
             checked_at,
         }
@@ -1206,6 +1211,41 @@ mod tests {
             .record_for(&instance(1))
             .expect("contract is in the window");
         assert_eq!((record.verdicts, record.inconclusive), (5, 6));
+    }
+
+    /// The skip counts travel from the probe to the record and accumulate, in both of
+    /// `record`'s arms, so the page can say what a clean result leaves out (#6044).
+    #[test]
+    fn probe_skips_reach_the_record_and_accumulate() {
+        let skips = |oversized, budget_cut, not_sampled| ProbeSkips {
+            oversized,
+            budget_cut,
+            not_sampled,
+        };
+        let judged = |s| JudgedContract {
+            contract: instance(1),
+            verdicts: 1,
+            inconclusive: 0,
+            skips: s,
+        };
+        let mut status = MergeCheckStatus::default();
+        status.record(
+            checked_contracts(&[judged(skips(1, 2, 3))], &[]),
+            1,
+            0,
+            Instant::now(),
+        );
+        let first = status.record_for(&instance(1)).expect("in the window");
+        assert_eq!(first.skips, skips(1, 2, 3), "the insert arm");
+
+        status.record(
+            checked_contracts(&[judged(skips(10, 20, 30))], &[]),
+            1,
+            0,
+            Instant::now(),
+        );
+        let second = status.record_for(&instance(1)).expect("in the window");
+        assert_eq!(second.skips, skips(11, 22, 33), "the merge arm");
     }
 
     /// The unjudgeable count is carried, not inferred.

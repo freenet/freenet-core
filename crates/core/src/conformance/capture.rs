@@ -971,6 +971,12 @@ async fn run_writer(
                     // per-contract page must see the same two counts here.
                     judged = report.judged.len(),
                     without_verdict = report.without_verdict,
+                    // Cases the probes left out. A law held on the cases that ran, so
+                    // these bound what a clean result covers. Reporting only.
+                    cases_skipped_oversized = report.skips.oversized,
+                    cases_skipped_budget = report.skips.budget_cut,
+                    cases_not_sampled = report.skips.not_sampled,
+                    probed_all_oversized = report.probed_all_oversized,
                     "conformance shadow tick"
                 );
 

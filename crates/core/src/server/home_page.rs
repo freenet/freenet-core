@@ -4741,6 +4741,55 @@ mod tests {
         );
     }
 
+    /// #6044: "no violation found" is a statement about the cases that ran. The card
+    /// says what the probes left out, and when cases were too large to run it says the
+    /// result does not cover the contract's largest states.
+    #[test]
+    fn a_clean_card_says_what_the_probes_left_out() {
+        use crate::conformance::shadow::ProbeSkips;
+        let id = freenet_stdlib::prelude::ContractInstanceId::new([0x42; 32]);
+        let panel = |skips: ProbeSkips| {
+            let mut record = checked_record(id, 5, 0, Vec::new());
+            record.skips = skips;
+            let mut status = MergeCheckStatus::default();
+            status.record([record], 1, 0, tokio::time::Instant::now());
+            let view = merge_view(&status, &id);
+            merge_panel(&contract_detail_html_from(
+                &None,
+                &id.to_string(),
+                true,
+                Some(&view),
+            ))
+        };
+        let caveat = "does not cover";
+
+        let oversized = panel(ProbeSkips {
+            oversized: 7,
+            budget_cut: 8,
+            not_sampled: 9,
+        });
+        assert!(
+            oversized
+                .contains("7 over the size limit, 8 past the per-probe case cap, 9 not sampled"),
+            "{oversized}"
+        );
+        assert!(oversized.contains(caveat), "{oversized}");
+
+        let capped = panel(ProbeSkips {
+            oversized: 0,
+            budget_cut: 8,
+            not_sampled: 9,
+        });
+        assert!(capped.contains("8 past the per-probe case cap"), "{capped}");
+        assert!(
+            !capped.contains(caveat),
+            "the case cap is routine, so it gets the count and not the warning: {capped}"
+        );
+
+        let nothing = panel(ProbeSkips::default());
+        assert!(!nothing.contains("not run"), "{nothing}");
+    }
+
     /// A converging idempotence finding must not read the same as a
     /// non-convergent one.
     ///
