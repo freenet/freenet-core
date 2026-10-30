@@ -109,23 +109,31 @@ pub(crate) const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 /// real QUIC connections may justify raising it.
 pub(crate) const MAX_UNI_STREAMS: u32 = 64;
 
-/// Uni stream slots streamed messages never take: kept for short messages
-/// and control frames, so they do not wait behind long transfers.
+/// Uni stream slots kept for short messages and control frames, so they do
+/// not wait behind long transfers.
 pub(crate) const RESERVED_UNI_STREAMS: u32 = 8;
 
+/// Slots the receiver has freed but not yet announced: quinn announces new
+/// stream credit only once more than `MAX_UNI_STREAMS / 8` streams have
+/// been freed (quinn-proto 0.11.19 `queue_max_stream_id`), so up to that
+/// many freed slots can be unusable by the sender at any time.
+pub(crate) const UNANNOUNCED_CREDIT_SLACK: u32 = MAX_UNI_STREAMS / 8;
+
 /// Streamed messages (`QuicPath::send_stream`, `send_stream_chunks`) a path
-/// sends at once: [`MAX_UNI_STREAMS`] - [`RESERVED_UNI_STREAMS`], 56. A
-/// streamed send past it waits for one of the path's permits before it
-/// opens its stream. Short messages and control frames take no permit.
+/// sends at once: [`MAX_UNI_STREAMS`] - [`RESERVED_UNI_STREAMS`] -
+/// [`UNANNOUNCED_CREDIT_SLACK`], 48. A streamed send past it waits for one
+/// of the path's permits before it opens its stream. Short messages and
+/// control frames take no permit, so with every permit held and the
+/// slack unannounced they still have [`RESERVED_UNI_STREAMS`] slots.
+/// Without the slack term (a cap of 56) they can have none: 8 freed slots
+/// unannounced plus 56 streamed messages open is the whole limit.
 ///
-/// What the reservation does not cover: the receiver returns stream credit
-/// in batches (above), so up to `MAX_UNI_STREAMS / 8` (8) slots the
-/// receiver has freed can still be unannounced. With 56 streamed messages
-/// open at the receiver and 8 freed slots unannounced, a short message
-/// waits until the receiver frees one more stream. And a permit is
-/// returned when the peer has acknowledged every byte, which can be before
-/// the receiver has read the stream to its end and freed it.
-pub(crate) const STREAMED_SEND_LIMIT: u32 = MAX_UNI_STREAMS - RESERVED_UNI_STREAMS;
+/// What it does not cover: a permit is returned when the peer has
+/// acknowledged every byte, which can be before the receiver has read the
+/// stream to its end and freed it, so for that moment the receiver can
+/// hold more than 48 streamed messages.
+pub(crate) const STREAMED_SEND_LIMIT: u32 =
+    MAX_UNI_STREAMS - RESERVED_UNI_STREAMS - UNANNOUNCED_CREDIT_SLACK;
 const _: () = assert!(RESERVED_UNI_STREAMS > 0 && STREAMED_SEND_LIMIT > 0);
 
 /// Concurrent bidirectional streams a peer may open: one. Nothing uses it:

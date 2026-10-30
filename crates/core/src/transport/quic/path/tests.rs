@@ -2632,22 +2632,30 @@ fn refused_control_payloads_are_counted() {
     })
 }
 
-/// Streamed messages take at most `STREAMED_SEND_LIMIT` (56) of the
-/// `MAX_UNI_STREAMS` (64) slots: with more streamed sends than that blocked
-/// on a source that never delivers, 56 streams are open at the receiver,
-/// the rest wait for a permit without opening one, and a short message and
-/// a control frame still go through on the reserved slots.
+/// Streamed messages take at most `STREAMED_SEND_LIMIT` (48) of the
+/// `MAX_UNI_STREAMS` (64) slots, so short messages and control frames
+/// still go through when every permit is held by a send blocked on a
+/// source that never delivers, even in the worst case for quinn's batched
+/// credit: 8 slots freed by earlier short messages and not yet announced.
+/// 48 streams are open at the receiver; the other streamed sends wait for a
+/// permit without opening a stream.
 #[test]
 fn a_short_still_sends_while_streamed_messages_are_blocked() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
         let mut p = paths("quic-path-reserved", 63, QuicPathLimits::DEFAULT).await;
         let limit = super::super::config::STREAMED_SEND_LIMIT as usize;
-        assert_eq!(limit, 56);
+        assert_eq!(limit, 48);
+        let slack = super::super::config::UNANNOUNCED_CREDIT_SLACK as usize;
         let streamed = super::super::config::MAX_UNI_STREAMS as usize + 6;
         let (a, time) = (p.a.clone(), p.time());
         let (short, control, still_blocked) = p
             .drive(async move {
+                // Freed at the receiver, too few for quinn to announce.
+                for _ in 0..slack {
+                    a.send_short(b"earlier").await.expect("earlier short");
+                }
+                time.sleep(Duration::from_secs(1)).await;
                 let mut blocked = futures::stream::FuturesUnordered::new();
                 for _ in 0..streamed {
                     let a = a.clone();
@@ -2694,10 +2702,12 @@ fn a_short_still_sends_while_streamed_messages_are_blocked() {
             limit,
             "streamed sends past the limit wait without opening a stream"
         );
-        assert_eq!(
-            &p.b_in.shorts.try_recv().expect("short").into_payload()[..],
-            b"through"
-        );
+        let mut shorts = Vec::new();
+        while let Ok(short) = p.b_in.shorts.try_recv() {
+            shorts.push(short.into_payload());
+        }
+        assert_eq!(shorts.len(), slack + 1);
+        assert_eq!(&shorts[slack][..], b"through");
         assert!(p.b_in.controls.try_recv().is_ok());
     })
 }

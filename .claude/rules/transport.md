@@ -1086,14 +1086,15 @@ Sending (QuicPath::send_short / send_stream / send_stream_chunks /
   uni streams are the back-pressure (open_uni waits; quinn returns
   credit only after more than an eighth of the limit is freed).
   Slot reservation: send_stream / send_stream_chunks each hold one of
-  the path's STREAMED_SEND_LIMIT (56 = MAX_UNI_STREAMS -
-  RESERVED_UNI_STREAMS) semaphore permits from before open_uni until they
-  return; a streamed send past 56 waits for a permit without opening a
-  stream. Short and control sends take no permit, so 8 slots stay for
-  them. Not a strict guarantee: up to MAX_UNI_STREAMS / 8 (8) slots the
-  receiver freed can be unannounced (credit batching), and a permit is
-  returned on the peer's ack, which can come before the receiver frees
-  the stream; then a short message waits for the next freed stream.
+  the path's STREAMED_SEND_LIMIT (48 = MAX_UNI_STREAMS 64 -
+  RESERVED_UNI_STREAMS 8 - UNANNOUNCED_CREDIT_SLACK 8) semaphore permits
+  from before open_uni until they return; a streamed send past 48 waits
+  for a permit without opening a stream. Short and control sends take no
+  permit. The slack term is needed: quinn leaves up to MAX_UNI_STREAMS / 8
+  freed slots unannounced, and with a cap of 56 those 8 plus 56 streamed
+  messages fill the limit, so a short message waits (measured). Not
+  covered: a permit is returned on the peer's ack, which can come before
+  the receiver frees the stream.
   Sends have no deadline of their own: open_uni, a flow-blocked write
   and the final wait for acks can wait as long as the connection lives
   against a peer that does not cooperate. Every node send MUST go through
