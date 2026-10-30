@@ -21,6 +21,9 @@ pub(crate) enum ValidateOverride {
     EmptyRequestRelated,
     /// `Valid` exactly when the predicate holds for the state bytes.
     ValidWhen(fn(&[u8]) -> bool),
+    /// Always `Valid`, recording the bytes of every state validated, so a test
+    /// can assert which states were (and were not) validated.
+    Record(std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>),
 }
 
 /// Configurable `update_state` behavior for testing related contract flows.
@@ -284,6 +287,12 @@ impl ContractRuntimeInterface for MockWasmRuntime {
                     } else {
                         ValidateResult::Invalid
                     }
+                }
+                ValidateOverride::Record(seen) => {
+                    seen.lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(_state.as_ref().to_vec());
+                    ValidateResult::Valid
                 }
             });
         }

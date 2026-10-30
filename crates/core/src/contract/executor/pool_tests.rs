@@ -7,6 +7,7 @@ mod delegate_notification_wasm_tests;
 mod disk_budget_gate_tests;
 mod identical_input_probe_tests;
 mod merge_rejected_tests;
+mod no_change_validation_tests;
 mod non_idempotent_detector_tests;
 #[cfg(feature = "wasmtime-backend")]
 mod params_integrity_wasm_tests;
