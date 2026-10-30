@@ -1249,6 +1249,7 @@ mod tests {
             TransportError::from(QuicErrorKind::Stopped { code: 0x13 }),
             TransportError::from(QuicErrorKind::Stopped { code: 0x17 }),
             TransportError::from(QuicErrorKind::Stopped { code: 0x18 }),
+            TransportError::from(QuicErrorKind::Stopped { code: 0x19 }),
             TransportError::from(QuicErrorKind::Reset { code: 0x22 }),
             TransportError::from(QuicErrorKind::Stopped { code: 0x1f }),
             // Cross-namespace values: a reset carrying a deterministic stop
