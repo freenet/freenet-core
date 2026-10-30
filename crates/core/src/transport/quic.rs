@@ -76,7 +76,6 @@ use identity::{PeerKey, QuicIdentity};
 use liveness::EndpointHealth;
 
 pub(crate) use config::QuicSettings;
-#[cfg(test)]
 pub(crate) use liveness::QuicAvailability;
 pub(crate) use liveness::QuicAvailabilityWatch;
 
@@ -202,11 +201,14 @@ pub(crate) struct EndpointCore {
     identity: Arc<QuicIdentity>,
     /// The transport key each allowed client must present.
     expected_clients: Arc<ExpectedClients>,
+    /// The endpoint's health, handed to each connection (its watcher, and
+    /// its closer, which does not count a close after an adapter panic).
+    health: Arc<EndpointHealth>,
     /// The QUIC transmits the egress cap holds (`socket::CapHolds`).
     cap_holds: Arc<socket::CapHolds>,
-    /// Test hook that ends quinn's endpoint driver.
+    /// Test hooks that inject faults into quinn's drivers.
     #[cfg(test)]
-    receive_fault: Arc<socket::ReceiveFault>,
+    faults: Arc<socket::SocketFaults>,
     /// The type name of the clock quinn runs on (tests).
     #[cfg(any(test, feature = "testing"))]
     clock: &'static str,
@@ -383,6 +385,30 @@ pub(crate) enum QuicConnectError {
     Connection(#[from] quinn::ConnectionError),
 }
 
+/// The QUIC transport contains a panic in its socket adapter by catching
+/// the unwind (`socket`, `liveness`). A build with `panic = "abort"` cannot
+/// do that: the first such panic would end the process. So the endpoint is
+/// refused there, and the node runs with QUIC off (`bind_or_warn` logs it).
+/// A runtime check rather than a compile-time one, so such a build still
+/// compiles and runs with QUIC off. It covers a build whose profile sets
+/// `panic = "abort"`; this crate built to unwind and then linked into an
+/// aborting binary passes it.
+fn require_unwinding(unwinds: bool) -> io::Result<()> {
+    if unwinds {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "this build aborts on panic (panic = \"abort\"), and the QUIC transport \
+             needs panics to unwind to contain them",
+        ))
+    }
+}
+
+/// Whether this build unwinds on panic, which the QUIC transport needs
+/// ([`require_unwinding`]).
+pub(crate) const UNWINDS: bool = cfg!(panic = "unwind");
+
 impl QuicEndpoint {
     /// Build an endpoint over `socket`, which must be the socket the
     /// listener reads (it fills the QUIC ingress queue), bound at
@@ -398,7 +424,9 @@ impl QuicEndpoint {
     /// endpoint receives nothing until a peer is allowed
     /// ([`Self::allow_peer`], or a connection this endpoint opens). Fails if
     /// the socket's ingress was already enabled, or if the TLS
-    /// configuration cannot be built.
+    /// configuration cannot be built, or if the build aborts on panic
+    /// ([`require_unwinding`]).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn bind<S: Socket, T: TimeSource>(
         socket: Arc<DemuxSocket<S>>,
         local_addr: SocketAddr,
@@ -406,6 +434,20 @@ impl QuicEndpoint {
         settings: &QuicSettings,
         keypair: &TransportKeypair,
     ) -> io::Result<Self> {
+        Self::bind_checked(UNWINDS, socket, local_addr, time, settings, keypair)
+    }
+
+    /// [`Self::bind`] for a build that does (`unwinds`) or does not unwind
+    /// on panic; tests drive the aborting case through it.
+    fn bind_checked<S: Socket, T: TimeSource>(
+        unwinds: bool,
+        socket: Arc<DemuxSocket<S>>,
+        local_addr: SocketAddr,
+        time: T,
+        settings: &QuicSettings,
+        keypair: &TransportKeypair,
+    ) -> io::Result<Self> {
+        require_unwinding(unwinds)?;
         Self::bind_with(
             socket,
             local_addr,
@@ -416,8 +458,9 @@ impl QuicEndpoint {
         )
     }
 
-    /// [`Self::bind`], or `None` with a WARN when it fails, so a node with
-    /// `transport-quic = "prefer"` still starts, with QUIC off.
+    /// Build the endpoint as [`Self::bind`] describes, for this build
+    /// ([`UNWINDS`], through [`Self::bind_checked`]), or `None` with a WARN
+    /// when it fails, so a node with QUIC on still starts, with QUIC off.
     pub(crate) fn bind_or_warn<S: Socket, T: TimeSource>(
         socket: Arc<DemuxSocket<S>>,
         local_addr: SocketAddr,
@@ -425,13 +468,25 @@ impl QuicEndpoint {
         settings: &QuicSettings,
         keypair: &TransportKeypair,
     ) -> Option<Self> {
-        match Self::bind(socket, local_addr, time, settings, keypair) {
+        Self::bind_or_warn_checked(UNWINDS, socket, local_addr, time, settings, keypair)
+    }
+
+    /// [`Self::bind_or_warn`] through [`Self::bind_checked`].
+    fn bind_or_warn_checked<S: Socket, T: TimeSource>(
+        unwinds: bool,
+        socket: Arc<DemuxSocket<S>>,
+        local_addr: SocketAddr,
+        time: T,
+        settings: &QuicSettings,
+        keypair: &TransportKeypair,
+    ) -> Option<Self> {
+        match Self::bind_checked(unwinds, socket, local_addr, time, settings, keypair) {
             Ok(endpoint) => Some(endpoint),
             Err(error) => {
                 tracing::warn!(
                     %error,
                     %local_addr,
-                    "Could not build the QUIC endpoint (transport-quic = prefer); running with QUIC off"
+                    "Could not build the QUIC endpoint; running with QUIC off"
                 );
                 None
             }
@@ -463,18 +518,22 @@ impl QuicEndpoint {
         )?);
         let health = EndpointHealth::new(local_addr);
         #[cfg(test)]
-        let mut receive_fault = None;
+        let mut faults = None;
         let mut cap_holds = None;
         // If quinn refuses the socket after the ingress is enabled, the
         // ingress is disabled again, so the node is left as with QUIC off.
         let endpoint = socket
             .with_quic_ingress(|ingress| {
-                let quic_socket =
-                    Arc::new(socket::QuicSocket::new(socket.clone(), ingress, local_addr));
+                let quic_socket = Arc::new(socket::QuicSocket::new(
+                    socket.clone(),
+                    ingress,
+                    local_addr,
+                    health.clone(),
+                ));
                 cap_holds = Some(quic_socket.cap_holds());
                 #[cfg(test)]
                 {
-                    receive_fault = Some(quic_socket.receive_fault());
+                    faults = Some(quic_socket.faults());
                 }
                 let runtime = Arc::new(runtime::QuicRuntime::new(time, health.clone()));
                 // The server configuration is set so quinn hands every
@@ -501,7 +560,7 @@ impl QuicEndpoint {
         );
         Ok(Self {
             owner: Arc::new(EndpointOwner {
-                health,
+                health: health.clone(),
                 accept_queue_full: Arc::default(),
                 accept_loop_started: std::sync::atomic::AtomicBool::new(false),
             }),
@@ -512,10 +571,11 @@ impl QuicEndpoint {
                 server,
                 identity,
                 expected_clients: Arc::new(ExpectedClients::default()),
+                health: health.clone(),
                 // Set by the closure, which ran: `endpoint` is built.
                 cap_holds: cap_holds.expect("the QUIC socket's cap holds"),
                 #[cfg(test)]
-                receive_fault: receive_fault.unwrap_or_default(),
+                faults: faults.unwrap_or_default(),
                 #[cfg(any(test, feature = "testing"))]
                 clock: std::any::type_name::<T>(),
             },
@@ -532,7 +592,13 @@ impl QuicEndpoint {
     /// as a socket that fails for good would (tests).
     #[cfg(test)]
     pub(crate) fn fail_driver(&self) {
-        self.receive_fault.trip();
+        self.faults.fail_receive();
+    }
+
+    /// The hooks that inject faults into quinn's drivers (tests).
+    #[cfg(test)]
+    pub(crate) fn faults(&self) -> &socket::SocketFaults {
+        &self.faults
     }
 
     /// The type name of the clock quinn runs on (tests).
@@ -714,6 +780,18 @@ impl QuicEndpoint {
     /// `expected` (the peer's transport key), and wait for the handshake.
     /// The peer's address is on the allow-set for the life of the
     /// connection.
+    ///
+    /// Fails as `EndpointDown` (read through [`Self::error_kind`]) if the
+    /// endpoint is Down or its socket adapter caught a panic when called:
+    /// checked here, before quinn sees the attempt. When the endpoint driver
+    /// returned, quinn already refuses (it dropped the driver before the
+    /// endpoint went Down). After an adapter panic it refuses only once the
+    /// woken endpoint driver has run again and been dropped, and on a
+    /// multi-thread runtime a connect in that window would otherwise send an
+    /// Initial. If the
+    /// endpoint goes Down during the handshake, the handshake ends with an
+    /// error that also reads as `EndpointDown` (see
+    /// [`QuicIncoming::establish`]).
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn connect(
         &self,
@@ -734,6 +812,9 @@ impl QuicEndpoint {
         config: quinn::ClientConfig,
         peer: PeerKey,
     ) -> Result<QuicConnection, QuicConnectError> {
+        if self.health.refuses_connects() {
+            return Err(quinn::ConnectError::EndpointStopping.into());
+        }
         let permit = self
             .sources
             .allow(addr)
@@ -747,6 +828,7 @@ impl QuicEndpoint {
             permit,
             None,
             peer,
+            self.health.clone(),
             self.cap_holds.clone(),
         ))
     }
@@ -790,6 +872,7 @@ impl EndpointCore {
             let mut config = (*self.server).clone();
             config.crypto = Arc::new(tls);
             return Some(QuicIncoming {
+                health: self.health.clone(),
                 incoming,
                 permit,
                 config: Arc::new(config),
@@ -805,6 +888,8 @@ impl EndpointCore {
 /// for its address until the handshake ends.
 pub(crate) struct QuicIncoming {
     incoming: quinn::Incoming,
+    /// The endpoint's health, for the connection's watcher and closer.
+    health: Arc<EndpointHealth>,
     permit: QuicSourcePermit,
     /// The endpoint's server settings with TLS pinned to the key the
     /// source was allowed with.
@@ -819,6 +904,20 @@ pub(crate) struct QuicIncoming {
 
 impl QuicIncoming {
     /// Complete the handshake. On failure the permit is dropped with it.
+    ///
+    /// A socket-adapter panic in this connection's driver during the
+    /// handshake (write readiness or send) ends the driver with an error,
+    /// which skips quinn's own terminate. The handshake still ends: dropping
+    /// the driver drops the second-to-last reference to the connection, and
+    /// quinn's `ConnectionRef::drop` (quinn 0.11.12, `connection.rs:946`)
+    /// then closes it implicitly, so this returns `LocallyClosed` (read as
+    /// `EndpointDown` through `QuicEndpoint::error_kind`) and the permit
+    /// goes with it. A panic anywhere else in the adapter (another
+    /// connection's driver, or the endpoint's receive) ends the endpoint
+    /// driver, whose drop ends this connection's driver with INTERNAL_ERROR,
+    /// which also reads as `EndpointDown`. `connect` ends the same ways.
+    /// Pinned by the `a_panic_during_*_ends_the_handshake_*` and
+    /// `a_*_panic_during_connect_ends_the_handshake` tests.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn establish(self) -> Result<QuicConnection, quinn::ConnectionError> {
         let connection = self.incoming.accept_with(self.config)?.await?;
@@ -827,6 +926,7 @@ impl QuicIncoming {
             self.permit,
             Some(self.hold),
             self.peer,
+            self.health,
             self.cap_holds,
         ))
     }
@@ -860,21 +960,55 @@ impl QuicConnection {
         permit: QuicSourcePermit,
         hold: Option<KeyHold>,
         peer: PeerKey,
+        health: Arc<EndpointHealth>,
         cap_holds: Arc<socket::CapHolds>,
     ) -> Self {
+        let mut availability = health.watch();
+        let mut adapter_panic = health.adapter_panic_watch();
+        let closer = QuicCloser::new(connection.clone(), health);
         // The watcher holds the permit, and on the server side the hold
         // binding the address to the client's key, until quinn reports the
         // connection closed, however it ends. Dropping this handle closes it
         // explicitly (see Drop), because the watcher's clone keeps quinn from
-        // closing it implicitly.
+        // closing it implicitly. On EVERY Down (a driver that returned, as
+        // well as a panic the socket adapter caught) the watcher closes the
+        // connection locally with DOWNGRADE: after an adapter panic this
+        // connection's driver may have ended without closing it, and a local
+        // close is what makes calls waiting on it return an error (quinn's
+        // close fails them at once, driver or not). The close is not
+        // counted (`QuicCloser::close`), and the peer is not told: nothing
+        // can be sent after Down (see `socket`). After a driver return quinn
+        // has usually ended the connection already, and the close does
+        // nothing. Released (the node dropped the endpoint) closes nothing
+        // by itself: the connections stay with their owners. A
+        // socket-adapter panic after Released leaves the availability
+        // Released but makes every send of the endpoint fail, which can end
+        // any of its connection drivers without closing the connection, so
+        // the watcher then closes it the same way.
         let watched = connection.clone();
+        let down_closer = closer.clone();
         GlobalExecutor::spawn(async move {
+            let close_now = async {
+                if availability.not_up().await != QuicAvailability::Down
+                    && adapter_panic.wait_for(|panicked| *panicked).await.is_err()
+                {
+                    // Unreachable while this task runs: `down_closer` holds
+                    // the health, whose sender therefore outlives this
+                    // receiver. Kept as a safe fallback (never close).
+                    std::future::pending::<()>().await;
+                }
+            };
+            tokio::select! {
+                _ = watched.closed() => {}
+                _ = close_now => {
+                    down_closer.close(QuicCloseCode::Downgrade);
+                }
+            }
             let reason = watched.closed().await;
             tracing::debug!(%reason, remote = %watched.remote_address(), "QUIC connection ended");
             drop(hold);
             drop(permit);
         });
-        let closer = QuicCloser::new(connection.clone());
         Self {
             connection,
             closer,
@@ -933,13 +1067,17 @@ pub(crate) struct QuicCloser {
     /// Set by the first close attempt, in one step: a second caller, on
     /// any thread, sends and counts nothing.
     closing: Arc<std::sync::atomic::AtomicBool>,
+    /// The endpoint's health: a close is counted only while it can still
+    /// be sent ([`EndpointHealth::closes_can_be_sent`]).
+    health: Arc<EndpointHealth>,
 }
 
 impl QuicCloser {
-    fn new(connection: quinn::Connection) -> Self {
+    fn new(connection: quinn::Connection, health: Arc<EndpointHealth>) -> Self {
         Self {
             connection,
             closing: Arc::default(),
+            health,
         }
     }
 
@@ -950,6 +1088,14 @@ impl QuicCloser {
     /// reports (the peer's close) with LocallyClosed. A peer close landing
     /// between the check and `close` is still reported as LocallyClosed and
     /// counted; two local closers can no longer both count.
+    ///
+    /// Not counted once the endpoint is Down or its socket adapter caught a
+    /// panic: quinn's drivers may have ended by then, so the close may never
+    /// leave. `quic_close_sent_*` counts closes queued while they could be
+    /// sent (an upper bound: a panic just after the count can still stop
+    /// one). That covers the
+    /// close the connection's watcher makes on Down, and a close after a
+    /// panic that left the endpoint Released.
     pub(crate) fn close(&self, code: QuicCloseCode) -> bool {
         if self.closing.swap(true, std::sync::atomic::Ordering::AcqRel) {
             return false;
@@ -957,7 +1103,9 @@ impl QuicCloser {
         if self.connection.close_reason().is_some() {
             return false;
         }
-        TRANSPORT_METRICS.record_quic_close_sent(code, self.connection.remote_address());
+        if self.health.closes_can_be_sent() {
+            TRANSPORT_METRICS.record_quic_close_sent(code, self.connection.remote_address());
+        }
         self.connection.close(code.code().into(), code.reason());
         true
     }
