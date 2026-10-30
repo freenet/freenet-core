@@ -171,8 +171,15 @@ pub struct GeneratorConfig {
     pub properties: Vec<ConformanceProperty>,
     /// Skip any case whose inputs exceed this. Keeps a handful of very large states
     /// from dominating the run.
+    ///
+    /// A skipped case never runs, so a property can read as held while the cases
+    /// that would break it were the ones skipped. A contract that is wrong only near
+    /// its size cap is exactly that shape (#5705). [`generate_cases_counted`]
+    /// counts the cases skipped for size and for the case budget per property, and
+    /// `fdev verify-merge` reports them. Cases left out by state sampling are not
+    /// counted; only the number of states sampled is. The shadow prober still uses the uncounted [`generate_cases`]; see #6044.
     pub max_case_bytes: usize,
-    /// Cap on states considered for pairing, since pairs grow quadratically.
+    /// Cap on states the state-based laws use, since pairs grow quadratically.
     pub max_states_paired: usize,
     /// Cap on recorded steps considered for `TransitionPathAgreement`.
     ///
@@ -199,14 +206,69 @@ impl Default for GeneratorConfig {
     }
 }
 
-/// Build cases from a corpus.
+/// What [`generate_cases_counted`] built, and what it refused to build.
+#[derive(Debug, Default, Clone)]
+pub struct GeneratedCases {
+    pub cases: Vec<ConformanceCase>,
+    /// One entry per entry of [`GeneratorConfig::properties`], in that order: how
+    /// many cases were built for the property and then dropped because their inputs
+    /// exceeded [`GeneratorConfig::max_case_bytes`].
+    ///
+    /// Zero entries are kept, so a consumer can tell "nothing was skipped" from
+    /// "this property was not counted".
+    pub oversized: Vec<(ConformanceProperty, usize)>,
+    /// Parallel to `oversized`: cases that passed the size limit and were then left
+    /// out because the [`GeneratorConfig::max_cases`] budget ran out first.
+    ///
+    /// Disjoint from `oversized`, so the two add up to every built case that did not
+    /// run. Raising the size limit can move cases from `oversized` to here, which is
+    /// why the budget needs its own count.
+    pub budget_cut: Vec<(ConformanceProperty, usize)>,
+    /// How many states the state-based laws used, out of `corpus.states.len()`.
+    /// Below the total when the corpus exceeds [`GeneratorConfig::max_states_paired`].
+    pub states_paired: usize,
+    /// How many recorded transitions were used, out of `corpus.transitions.len()`.
+    /// Below the total when the corpus exceeds [`GeneratorConfig::max_transitions`].
+    pub transitions_sampled: usize,
+}
+
+impl GeneratedCases {
+    /// Over-size cases across every property.
+    pub fn oversized_total(&self) -> usize {
+        self.oversized.iter().map(|(_, n)| n).sum()
+    }
+
+    /// Budget-cut cases across every property.
+    pub fn budget_cut_total(&self) -> usize {
+        self.budget_cut.iter().map(|(_, n)| n).sum()
+    }
+}
+
+/// Build cases from a corpus, discarding the count of over-size cases skipped.
+///
+/// A thin wrapper over [`generate_cases_counted`] for callers that only need the
+/// cases. A caller that reports a verdict to anyone must use the counted form:
+/// without the count, "every case held" cannot be told apart from "the cases that
+/// would have failed were too large to run" (#5705).
+pub fn generate_cases(corpus: &Corpus, config: &GeneratorConfig) -> Vec<ConformanceCase> {
+    generate_cases_counted(corpus, config).cases
+}
+
+/// Build cases from a corpus, and count the cases skipped for size and for budget.
 ///
 /// Deterministic given `(corpus, config)`: the same inputs produce the same cases in
 /// the same order, so a run that finds something can be re-run and a run that finds
 /// nothing can be compared against a later one.
-pub fn generate_cases(corpus: &Corpus, config: &GeneratorConfig) -> Vec<ConformanceCase> {
+pub fn generate_cases_counted(corpus: &Corpus, config: &GeneratorConfig) -> GeneratedCases {
+    let zeros = || config.properties.iter().map(|p| (*p, 0)).collect();
     if corpus.is_empty() {
-        return Vec::new();
+        return GeneratedCases {
+            cases: Vec::new(),
+            oversized: zeros(),
+            budget_cut: zeros(),
+            states_paired: 0,
+            transitions_sampled: 0,
+        };
     }
 
     // Per-property queues, filled independently and then interleaved. The
@@ -214,41 +276,68 @@ pub fn generate_cases(corpus: &Corpus, config: &GeneratorConfig) -> Vec<Conforma
     // commutativity alone would otherwise never reach associativity, and the
     // budget would silently decide which laws get checked.
     let mut queues: Vec<Vec<ConformanceCase>> = Vec::new();
+    let mut oversized = Vec::with_capacity(config.properties.len());
     for property in &config.properties {
-        queues.push(cases_for(*property, corpus, config));
+        let (queue, skipped) = cases_for(*property, corpus, config);
+        queues.push(queue);
+        oversized.push((*property, skipped));
     }
 
-    let mut out = Vec::new();
+    let mut cases = Vec::new();
+    let mut taken = vec![0usize; queues.len()];
     let mut round = 0usize;
-    loop {
+    'interleave: loop {
         let mut produced = false;
-        for queue in &mut queues {
+        for (queue, taken) in queues.iter().zip(&mut taken) {
             if round >= queue.len() {
                 continue;
             }
             produced = true;
-            out.push(queue[round].clone());
-            if out.len() >= config.max_cases {
-                return out;
+            cases.push(queue[round].clone());
+            *taken += 1;
+            if cases.len() >= config.max_cases {
+                break 'interleave;
             }
         }
         if !produced {
-            return out;
+            break;
         }
         round += 1;
     }
+
+    let budget_cut = config
+        .properties
+        .iter()
+        .zip(queues.iter().zip(&taken))
+        .map(|(p, (queue, taken))| (*p, queue.len() - taken))
+        .collect();
+    GeneratedCases {
+        cases,
+        oversized,
+        budget_cut,
+        states_paired: paired_states(corpus, config).len(),
+        transitions_sampled: sampled_transitions(corpus, config).len(),
+    }
 }
 
+/// The cases for one property, and how many were dropped for exceeding
+/// [`GeneratorConfig::max_case_bytes`].
 fn cases_for(
     property: ConformanceProperty,
     corpus: &Corpus,
     config: &GeneratorConfig,
-) -> Vec<ConformanceCase> {
+) -> (Vec<ConformanceCase>, usize) {
     let states = paired_states(corpus, config);
     let mut cases = Vec::new();
+    // Counted here, at the only place a case is dropped for size. A drop that is not
+    // counted renders as a clean zero: the report would show only the cases that ran,
+    // and a property would read as held when its breaking cases never ran (#5705).
+    let mut oversized = 0usize;
     let mut push = |case: ConformanceCase| {
         if case.input_bytes() <= config.max_case_bytes {
             cases.push(case);
+        } else {
+            oversized += 1;
         }
     };
 
@@ -271,7 +360,7 @@ fn cases_for(
                 push(build(vec![state.clone()]).with_summary(summary.clone()));
             }
         }
-        return cases;
+        return (cases, oversized);
     }
 
     // Transition cases come from recorded provenance, never from pairing states.
@@ -285,7 +374,7 @@ fn cases_for(
         for (base, result) in sampled_transitions(corpus, config) {
             push(build(vec![base, result]));
         }
-        return cases;
+        return (cases, oversized);
     }
 
     match property.state_arity() {
@@ -350,38 +439,78 @@ fn cases_for(
         _ => {}
     }
 
-    cases
+    (cases, oversized)
 }
 
-/// Deterministically choose which states to pair up.
+/// Deterministically choose which states the state-based laws use, in time order.
 ///
-/// When the corpus is larger than the pairing cap, take a strided sample rather than
-/// the first N: observations arrive in time order, so the first N are all from the
-/// same few minutes and would test a contract only against its own recent past.
+/// When the corpus is larger than the cap, take a strided sample rather than the
+/// first N: observations arrive in time order, so the first N are all from the same
+/// few minutes and would test a contract only against its own recent past.
+///
+/// The last-supplied state and the largest state are always in the sample. For a
+/// growing contract those are the states nearest its size cap, which a plain stride
+/// never reached (#5705).
+///
+/// Time order is load-bearing: pairs are built `(earlier, later)`, so a later state
+/// is the incoming side of the merge, which is the direction the network uses and
+/// the only one the one-directional laws check. Queue order is #6053.
 fn paired_states(corpus: &Corpus, config: &GeneratorConfig) -> Vec<Bytes> {
-    let n = corpus.states.len();
-    if n <= config.max_states_paired {
-        return corpus.states.clone();
-    }
-    let stride = n as f64 / config.max_states_paired as f64;
-    (0..config.max_states_paired)
-        .map(|i| corpus.states[((i as f64) * stride) as usize % n].clone())
+    let states = &corpus.states;
+    let Some(last) = states.len().checked_sub(1) else {
+        return Vec::new();
+    };
+    // Ties go to the later state.
+    let largest = (0..states.len())
+        .max_by_key(|&i| (states[i].len(), i))
+        .unwrap_or(last);
+    sample_indices(states.len(), config.max_states_paired, &[last, largest])
+        .into_iter()
+        .map(|i| states[i].clone())
         .collect()
+}
+
+/// Indices of a strided sample of at most `cap` of `n` items, ascending, that
+/// includes every index in `keep` that there is room for.
+///
+/// The plain stride `i * n / cap` never reaches `n - 1` once `n > cap`. Each kept
+/// index replaces the nearest stride index that is not itself kept, so the sample
+/// stays spread and stays distinct. With `cap` smaller than `keep`, not every kept
+/// index fits: one that is already on the stride stays, and the remaining slots go
+/// to the others in `keep` order (so `sample_indices(10, 1, &[9, 0])` is `[0]`).
+pub(super) fn sample_indices(n: usize, cap: usize, keep: &[usize]) -> Vec<usize> {
+    if n <= cap {
+        return (0..n).collect();
+    }
+    // Strictly increasing, since `n > cap`.
+    let mut picked: Vec<usize> = (0..cap).map(|i| i * n / cap).collect();
+    for &k in keep {
+        if picked.contains(&k) {
+            continue;
+        }
+        let slot = (0..picked.len())
+            .filter(|&p| !keep.contains(&picked[p]))
+            .min_by_key(|&p| picked[p].abs_diff(k));
+        if let Some(slot) = slot {
+            picked[slot] = k;
+        }
+    }
+    picked.sort_unstable();
+    picked
 }
 
 /// Deterministically choose which recorded steps to check.
 ///
 /// Strided rather than truncated, for the same reason [`paired_states`] strides:
 /// observations arrive in time order, so the first N steps are all from the same few
-/// minutes and would test a contract only against its own recent past.
+/// minutes and would test a contract only against its own recent past. The last
+/// supplied step is always included.
 fn sampled_transitions(corpus: &Corpus, config: &GeneratorConfig) -> Vec<(Bytes, Bytes)> {
     let n = corpus.transitions.len();
-    if n <= config.max_transitions {
-        return corpus.transitions.clone();
-    }
-    let stride = n as f64 / config.max_transitions as f64;
-    (0..config.max_transitions)
-        .map(|i| corpus.transitions[((i as f64) * stride) as usize % n].clone())
+    let keep = n.checked_sub(1).map(|last| vec![last]).unwrap_or_default();
+    sample_indices(n, config.max_transitions, &keep)
+        .into_iter()
+        .map(|i| corpus.transitions[i].clone())
         .collect()
 }
 

@@ -22,7 +22,9 @@ use super::evidence::{
     ConformanceEvidence, EvidenceError, EvidenceRejected, MAX_EVIDENCE_ENCODED_BYTES,
     MAX_EVIDENCE_INPUT_BYTES, MAX_EVIDENCE_RELATED, MAX_EVIDENCE_TEXT_BYTES,
 };
-use super::generator::{Corpus, GeneratorConfig, generate_cases};
+use super::generator::{
+    Corpus, GeneratedCases, GeneratorConfig, generate_cases, generate_cases_counted,
+};
 use super::oracle::{ConformanceOracle, OracleError};
 use super::property::{
     ConformanceProperty, IdempotenceSettling, Inconclusive, OutputDigest, PremiseSource,
@@ -2751,13 +2753,12 @@ fn the_transition_branch_is_bounded_and_strided() {
     assert_eq!(cases.len(), 4, "the cap must bind");
     // Strided over the whole history rather than the first four.
     //
-    // Say what this actually pins: the four selected steps are spread across the
-    // range, not the first four. Index 39 is NOT selected — a stride of 10 from 0
-    // reaches 30 — so this is not a claim that the newest step is reachable. What it
-    // rules out is truncation, under which the bases would be `[0, 1, 2, 3]` and a
-    // contract would only ever be checked against its own oldest few minutes.
+    // The four selected steps are spread across the range, not the first four, and
+    // the last is the newest step (39), not the stride's 30 (#5705). Truncation
+    // would give `[0, 1, 2, 3]` and check a contract only against its own oldest few
+    // minutes.
     let bases: Vec<u8> = cases.iter().map(|c| c.states[0][0]).collect();
-    assert_eq!(bases, vec![0, 10, 20, 30]);
+    assert_eq!(bases, vec![0, 10, 20, 39]);
     assert_ne!(
         bases,
         vec![0, 1, 2, 3],
@@ -4105,6 +4106,316 @@ fn a_tight_case_budget_still_covers_every_law() {
         seen.len(),
         ConformanceProperty::ALL.len(),
         "budget dropped whole properties instead of narrowing each one"
+    );
+}
+
+/// Regression (#5705): a case over `max_case_bytes` was dropped without a count.
+///
+/// The report counted only the cases that ran, so a property whose breaking cases
+/// were all too large read as held. The count must come from the filter itself and
+/// must equal exactly what the filter dropped: raising the limit must turn every
+/// counted case into a generated one, and no more.
+#[test]
+fn oversized_cases_are_counted_per_property_not_dropped_silently() {
+    // Three small states and one large one. Commutativity pairs all four: six pairs,
+    // three of which include the large state.
+    let corpus = Corpus::from_states(vec![vec![1, 1], vec![2, 2], vec![3, 3], vec![9; 64]]);
+    let limited = GeneratorConfig {
+        properties: vec![
+            ConformanceProperty::StateCommutativity,
+            ConformanceProperty::StateIdempotence,
+        ],
+        max_case_bytes: 16,
+        ..Default::default()
+    };
+    let generated = generate_cases_counted(&corpus, &limited);
+    assert_eq!(
+        generated.oversized,
+        vec![
+            (ConformanceProperty::StateCommutativity, 3),
+            (ConformanceProperty::StateIdempotence, 1),
+        ],
+        "every case dropped for size must be counted against its property"
+    );
+    assert_eq!(generated.oversized_total(), 4);
+    assert_eq!(generated.cases.len(), 3 + 3);
+
+    let unlimited = GeneratorConfig {
+        max_case_bytes: usize::MAX,
+        ..limited.clone()
+    };
+    let all = generate_cases_counted(&corpus, &unlimited);
+    assert_eq!(all.oversized_total(), 0);
+    assert_eq!(
+        all.cases.len(),
+        generated.cases.len() + generated.oversized_total(),
+        "the count must be exactly the cases the size limit removed"
+    );
+
+    // A property every one of whose cases is too large produces no case at all, and
+    // the count is the only thing that says why.
+    let huge = Corpus::from_states(vec![vec![7; 64], vec![8; 64]]);
+    let none = generate_cases_counted(&huge, &limited);
+    assert!(none.cases.is_empty());
+    assert_eq!(
+        none.oversized,
+        vec![
+            (ConformanceProperty::StateCommutativity, 1),
+            (ConformanceProperty::StateIdempotence, 2),
+        ]
+    );
+    // The uncounted wrapper still returns the same cases.
+    assert_eq!(
+        generate_cases(&corpus, &limited).len(),
+        generated.cases.len()
+    );
+}
+
+/// Every property's size count is exactly what the size limit removed.
+///
+/// One corpus that feeds every generator branch (pairs, triples, deltas with a shared
+/// base, summaries, a recorded transition), run over every property. Raising the size
+/// limit must turn each property's counted cases into generated ones and no more, so
+/// a branch that dropped a case without counting it fails here.
+#[test]
+fn every_property_counts_exactly_the_cases_the_size_limit_removed() {
+    let big = vec![9u8; 64];
+    let base = bytes(&[1, 1]);
+    let corpus = Corpus {
+        deltas: vec![bytes(&[5]), bytes(&[6]), bytes(&big)],
+        delta_bases: vec![Some(base.clone()), Some(base.clone()), Some(base)],
+        summaries: vec![bytes(&[7]), bytes(&big)],
+        transitions: vec![
+            (bytes(&[1, 1]), bytes(&[1, 1, 2])),
+            (bytes(&[2]), bytes(&big)),
+        ],
+        ..Corpus::from_states(vec![vec![1, 1], vec![2, 2], vec![3, 3], big.clone()])
+    };
+    let limited = GeneratorConfig {
+        properties: ConformanceProperty::ALL.to_vec(),
+        max_cases: usize::MAX,
+        max_case_bytes: 16,
+        ..Default::default()
+    };
+    let unlimited = GeneratorConfig {
+        max_case_bytes: usize::MAX,
+        ..limited.clone()
+    };
+    let small = generate_cases_counted(&corpus, &limited);
+    let all = generate_cases_counted(&corpus, &unlimited);
+    assert_eq!(all.oversized_total(), 0);
+    for (property, skipped) in &small.oversized {
+        let count = |g: &GeneratedCases| g.cases.iter().filter(|c| c.property == *property).count();
+        assert_eq!(
+            *skipped,
+            count(&all) - count(&small),
+            "{property:?}: the size count must equal the cases the limit removed"
+        );
+        if count(&all) > 0 {
+            assert!(
+                *skipped > 0,
+                "{property:?}: fixture must push some cases over the limit"
+            );
+        }
+    }
+    assert_eq!(small.budget_cut_total(), 0, "max_cases is unbounded here");
+}
+
+/// Cases the `max_cases` budget leaves out are counted per property, separately from
+/// the size count, and the two together cover every built case that did not run.
+#[test]
+fn cases_the_budget_cuts_are_counted_per_property() {
+    let corpus = Corpus::from_states(vec![vec![1], vec![2], vec![3], vec![4]]);
+    let config = GeneratorConfig {
+        properties: vec![
+            ConformanceProperty::StateCommutativity,
+            ConformanceProperty::StateIdempotence,
+        ],
+        max_cases: 5,
+        ..Default::default()
+    };
+    // 6 commutativity pairs and 4 idempotence cases, interleaved: the budget of 5
+    // takes 3 of the first and 2 of the second.
+    let generated = generate_cases_counted(&corpus, &config);
+    assert_eq!(generated.cases.len(), 5);
+    assert_eq!(
+        generated.budget_cut,
+        vec![
+            (ConformanceProperty::StateCommutativity, 3),
+            (ConformanceProperty::StateIdempotence, 2),
+        ]
+    );
+    assert_eq!(generated.oversized_total(), 0);
+}
+
+/// The newest state is always sampled for pairing, however many states there are.
+///
+/// The plain stride `floor(i * n / 24)` never reaches index `n - 1` once `n > 24`,
+/// and for a growing contract the newest state is the near-cap one #5705 is about,
+/// so it was never built, never run and never counted.
+#[test]
+fn the_newest_state_is_always_sampled_for_pairing() {
+    for n in [25usize, 30, 47, 100] {
+        let states: Vec<Vec<u8>> = (0..n).map(|i| (i as u32).to_be_bytes().to_vec()).collect();
+        let newest = Bytes::from(states[n - 1].clone());
+        let config = GeneratorConfig {
+            properties: vec![ConformanceProperty::StateIdempotence],
+            ..Default::default()
+        };
+        let generated = generate_cases_counted(&Corpus::from_states(states), &config);
+        assert_eq!(generated.states_paired, config.max_states_paired);
+        assert!(
+            generated.cases.iter().any(|c| c.states[0] == newest),
+            "n = {n}: the newest state was not sampled"
+        );
+    }
+}
+
+/// The state sample is distinct, spread over the whole corpus, and always includes
+/// the last-supplied and the largest state.
+///
+/// Idempotence builds one case per sampled state, so its cases are the sample.
+#[test]
+fn the_state_sample_is_distinct_spread_and_keeps_the_largest() {
+    let n = 100usize;
+    // Off the plain stride (`i * 100 / 24` gives 91, 95), and nearest to the slot the
+    // last-supplied state takes, so the largest state is only sampled if it is kept
+    // on purpose and without evicting the last-supplied one.
+    let largest_at = 97usize;
+    let states: Vec<Vec<u8>> = (0..n)
+        .map(|i| {
+            let mut s = (i as u32).to_be_bytes().to_vec();
+            if i == largest_at {
+                s.extend_from_slice(&[0; 64]);
+            }
+            s
+        })
+        .collect();
+    let config = GeneratorConfig {
+        properties: vec![ConformanceProperty::StateIdempotence],
+        ..Default::default()
+    };
+    let cap = config.max_states_paired;
+    let generated = generate_cases_counted(&Corpus::from_states(states), &config);
+    let mut picked: Vec<usize> = generated
+        .cases
+        .iter()
+        .map(|c| u32::from_be_bytes(c.states[0][..4].try_into().unwrap()) as usize)
+        .collect();
+    picked.sort_unstable();
+    let len = picked.len();
+    picked.dedup();
+    assert_eq!(picked.len(), len, "the sample must not repeat a state");
+    assert_eq!(picked.len(), cap);
+    assert!(
+        picked.contains(&(n - 1)),
+        "the last-supplied state must be sampled"
+    );
+    assert!(
+        picked.contains(&largest_at),
+        "the largest state must be sampled"
+    );
+    assert_eq!(picked[0], 0, "the sample must start at the oldest state");
+    let widest = picked.windows(2).map(|w| w[1] - w[0]).max().unwrap();
+    assert!(
+        widest <= 2 * n.div_ceil(cap),
+        "the sample must be spread across the corpus, widest gap {widest}: {picked:?}"
+    );
+}
+
+/// Pairs keep time order: the later state is the right-hand input, the incoming
+/// side of the merge, which is the direction the network uses and the only one
+/// `EmittedStateValidity` and `UpdateDeterminism` check. Sampling the last-supplied
+/// and largest states must not change that.
+#[test]
+fn the_newest_state_is_the_incoming_side_of_its_pairs() {
+    let mut states: Vec<Vec<u8>> = (0..30u8).map(|i| vec![i]).collect();
+    states[10] = vec![10; 8];
+    let newest = Bytes::from(states[29].clone());
+    let largest = Bytes::from(states[10].clone());
+    let config = GeneratorConfig {
+        properties: vec![ConformanceProperty::StateCommutativity],
+        max_cases: usize::MAX,
+        ..Default::default()
+    };
+    let cases = generate_cases_counted(&Corpus::from_states(states), &config).cases;
+    let with_newest: Vec<_> = cases
+        .iter()
+        .filter(|c| c.states.contains(&newest))
+        .collect();
+    assert_eq!(with_newest.len(), config.max_states_paired - 1);
+    assert!(
+        with_newest.iter().all(|c| c.states[1] == newest),
+        "the newest state must be the right-hand input of every pair containing it"
+    );
+    // The largest state is older than some sampled states and newer than others.
+    let with_largest: Vec<_> = cases
+        .iter()
+        .filter(|c| c.states.contains(&largest))
+        .collect();
+    assert!(with_largest.iter().any(|c| c.states[0] == largest));
+    assert!(with_largest.iter().any(|c| c.states[1] == largest));
+}
+
+/// `sample_indices` at the edges: below the cap it takes everything; at caps of
+/// 1 and 2 and below the number of kept indices, the earlier kept indices win, and
+/// the result stays ascending and distinct.
+#[test]
+fn sample_indices_edges() {
+    use super::generator::sample_indices;
+    assert_eq!(sample_indices(5, 10, &[4, 2]), vec![0, 1, 2, 3, 4]);
+    assert_eq!(sample_indices(10, 1, &[9, 4]), vec![9]);
+    // A kept index already on the stride stays, even when it is not first.
+    assert_eq!(sample_indices(10, 1, &[9, 0]), vec![0]);
+    assert_eq!(sample_indices(10, 2, &[9, 4]), vec![4, 9]);
+    assert_eq!(sample_indices(10, 2, &[9, 9]), vec![0, 9]);
+    assert_eq!(sample_indices(10, 0, &[9, 4]), Vec::<usize>::new());
+    // Fewer slots than kept indices: the first two of three win.
+    assert_eq!(sample_indices(10, 2, &[9, 4, 7]), vec![4, 9]);
+}
+
+/// When several states share the largest size, the latest of them is kept.
+#[test]
+fn a_size_tie_keeps_the_later_largest_state() {
+    let mut states: Vec<Vec<u8>> = (0..30u8).map(|i| vec![i]).collect();
+    // Indices 9 and 14 tie for largest; neither is on the stride (`i * 30 / 24`).
+    states[9] = vec![9; 8];
+    states[14] = vec![14; 8];
+    let config = GeneratorConfig {
+        properties: vec![ConformanceProperty::StateIdempotence],
+        ..Default::default()
+    };
+    let picked: Vec<Bytes> = generate_cases_counted(&Corpus::from_states(states.clone()), &config)
+        .cases
+        .into_iter()
+        .map(|c| c.states[0].clone())
+        .collect();
+    assert!(picked.contains(&Bytes::from(states[14].clone())));
+    assert!(!picked.contains(&Bytes::from(states[9].clone())));
+}
+
+/// Both counts at once: the size limit drops some cases and the budget cuts some
+/// of the rest, and neither count absorbs the other.
+#[test]
+fn size_and_budget_counts_are_both_reported() {
+    let corpus = Corpus::from_states(vec![vec![1], vec![2], vec![3], vec![9; 64]]);
+    let config = GeneratorConfig {
+        properties: vec![ConformanceProperty::StateCommutativity],
+        max_case_bytes: 16,
+        max_cases: 2,
+        ..Default::default()
+    };
+    // 6 pairs: the 3 with the large state are over the limit, and the budget runs
+    // 2 of the other 3.
+    let generated = generate_cases_counted(&corpus, &config);
+    assert_eq!(generated.cases.len(), 2);
+    assert_eq!(
+        generated.oversized,
+        vec![(ConformanceProperty::StateCommutativity, 3)]
+    );
+    assert_eq!(
+        generated.budget_cut,
+        vec![(ConformanceProperty::StateCommutativity, 1)]
     );
 }
 

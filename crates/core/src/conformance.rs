@@ -146,7 +146,7 @@ pub use evidence::{
     EvidenceRejected,
 };
 pub use focus::FocusSelector;
-pub use generator::{GeneratorConfig, generate_cases};
+pub use generator::{GeneratedCases, GeneratorConfig, generate_cases, generate_cases_counted};
 pub use host_clock::{
     HOST_CLOCK_DEPRECATION_DOC, HOST_CLOCK_IMPORT, HOST_CLOCK_NAMESPACE, imports_host_clock,
 };
