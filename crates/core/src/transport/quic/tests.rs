@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use super::config::{
     self, ALPN, INCOMING_BUFFER_BYTES, INCOMING_BUFFER_TOTAL_BYTES, KEEPALIVE_INTERVAL,
-    MAX_BIDI_STREAMS, MAX_INCOMING, MAX_UDP_PAYLOAD, MAX_WINDOW_BYTES, MIN_WINDOW_BYTES,
+    MAX_INCOMING, MAX_UDP_PAYLOAD, MAX_WINDOW_BYTES, MIN_WINDOW_BYTES,
 };
 use super::identity::{PeerKey, PinnedClientKey, PinnedServerKey, QuicIdentity};
 use super::test_tls::TestIdentity;
@@ -1499,9 +1499,9 @@ fn endpoint_config_pins_every_value() {
 /// each must render as, for a window of `window` bytes.
 fn pinned_transport_fields(window: u64) -> Vec<(&'static str, String)> {
     vec![
-        ("max_concurrent_bidi_streams", MAX_BIDI_STREAMS.to_string()),
-        // A literal, not `MAX_UNI_STREAMS`, so a change to the limit fails
-        // here; the value is set from field data (see its doc).
+        // Literals, not the constants, so a change to a limit fails here.
+        ("max_concurrent_bidi_streams", "0".into()),
+        // The uni value is set from field data (see its doc).
         ("max_concurrent_uni_streams", "64".into()),
         ("stream_receive_window", window.to_string()),
         ("receive_window", window.to_string()),

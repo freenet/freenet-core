@@ -2589,7 +2589,8 @@ fn bounded_sends_on_a_path_report_each_outcome() {
                 let mut held = Vec::new();
                 for _ in 0..super::super::config::MAX_UNI_STREAMS {
                     let mut send = conn.open_uni().await.unwrap();
-                    send.write_all(&[1, 0]).await.unwrap();
+                    let head = header(1, 1, StreamId::next().0, 1000, 0);
+                    send.write_all(&head).await.unwrap();
                     held.push(send);
                 }
                 let blocked = a.send_control_bounded(&time, timeout, ready).await;
@@ -2601,6 +2602,11 @@ fn bounded_sends_on_a_path_report_each_outcome() {
             "{blocked:?}"
         );
         assert_eq!(p.b.stats().count(QuicInboundOutcome::DeliveredControl), 0);
+        assert_eq!(
+            p.b.stats().count(QuicInboundOutcome::AnnouncedStream),
+            u64::from(super::super::config::MAX_UNI_STREAMS),
+            "b holds every stream, so the send was blocked by the limit"
+        );
         drop(held);
     })
 }
@@ -2632,13 +2638,41 @@ fn refused_control_payloads_are_counted() {
     })
 }
 
-/// Streamed messages take at most `STREAMED_SEND_LIMIT` (48) of the
-/// `MAX_UNI_STREAMS` (64) slots, so short messages and control frames
-/// still go through when every permit is held by a send blocked on a
-/// source that never delivers, even in the worst case for quinn's batched
-/// credit: 8 slots freed by earlier short messages and not yet announced.
-/// 48 streams are open at the receiver; the other streamed sends wait for a
-/// permit without opening a stream.
+/// quinn-proto 0.11.19 announces new stream credit only past 64 / 8 freed
+/// streams (`queue_max_stream_id`). Written out, not derived from
+/// `UNANNOUNCED_CREDIT_SLACK`, so a wrong slack is not checked against itself.
+const QUINN_UNANNOUNCED_CREDIT: usize = 8;
+
+/// `count` streamed sends on a source that never delivers, for a test to race
+/// against: each holds a permit and a stream, or waits for a permit.
+fn blocked_streamed_sends(
+    a: &Arc<QuicPath>,
+    count: usize,
+) -> futures::stream::FuturesUnordered<
+    impl std::future::Future<Output = Result<(), QuicSendError>> + use<>,
+> {
+    (0..count)
+        .map(|_| {
+            let a = a.clone();
+            async move {
+                a.send_stream_chunks(
+                    StreamId::next(),
+                    1000,
+                    None,
+                    futures::stream::pending::<Result<Bytes, StreamError>>(),
+                )
+                .await
+            }
+        })
+        .collect()
+}
+
+/// The reserve is exactly what the division of the limit says, in the worst
+/// case for quinn's batched credit: with 8 freed slots not yet announced and
+/// every permit held by a send blocked on a source that never delivers, 8
+/// slots are left. Seven are held here and a short message takes the eighth;
+/// a control frame goes through after it. The streamed sends past the limit
+/// wait for a permit without opening a stream.
 #[test]
 fn a_short_still_sends_while_streamed_messages_are_blocked() {
     bounded(|| async move {
@@ -2646,36 +2680,27 @@ fn a_short_still_sends_while_streamed_messages_are_blocked() {
         let mut p = paths("quic-path-reserved", 63, QuicPathLimits::DEFAULT).await;
         let limit = super::super::config::STREAMED_SEND_LIMIT as usize;
         assert_eq!(limit, 48);
-        let slack = super::super::config::UNANNOUNCED_CREDIT_SLACK as usize;
         let streamed = super::super::config::MAX_UNI_STREAMS as usize + 6;
-        let (a, time) = (p.a.clone(), p.time());
+        let (a, conn, time) = (p.a.clone(), p.a_raw(), p.time());
         let (short, control, still_blocked) = p
             .drive(async move {
                 // Freed at the receiver, too few for quinn to announce.
-                for _ in 0..slack {
+                for _ in 0..QUINN_UNANNOUNCED_CREDIT {
                     a.send_short(b"earlier").await.expect("earlier short");
                 }
                 time.sleep(Duration::from_secs(1)).await;
-                let mut blocked = futures::stream::FuturesUnordered::new();
-                for _ in 0..streamed {
-                    let a = a.clone();
-                    blocked.push(async move {
-                        a.send_stream_chunks(
-                            StreamId::next(),
-                            1000,
-                            None,
-                            futures::stream::pending::<Result<Bytes, StreamError>>(),
-                        )
-                        .await
-                    });
-                }
+                let mut blocked = blocked_streamed_sends(&a, streamed);
                 let timeout = Duration::from_secs(5);
                 let sends = async {
                     time.sleep(Duration::from_secs(2)).await;
-                    let short = bounded_send(&time, timeout, |progress| {
-                        a.send_short_with(b"through", progress)
-                    })
-                    .await;
+                    let mut held = Vec::new();
+                    for slot in 1..=7 {
+                        tokio::select! {
+                            send = conn.open_uni() => held.push(send.unwrap()),
+                            () = time.sleep(timeout) => panic!("reserved slot {slot} is missing"),
+                        }
+                    }
+                    let short = a.send_short_bounded(&time, timeout, b"through").await;
                     let control = a
                         .send_control_bounded(
                             &time,
@@ -2706,9 +2731,104 @@ fn a_short_still_sends_while_streamed_messages_are_blocked() {
         while let Ok(short) = p.b_in.shorts.try_recv() {
             shorts.push(short.into_payload());
         }
-        assert_eq!(shorts.len(), slack + 1);
-        assert_eq!(&shorts[slack][..], b"through");
+        assert_eq!(shorts.len(), QUINN_UNANNOUNCED_CREDIT + 1);
+        assert_eq!(&shorts[QUINN_UNANNOUNCED_CREDIT][..], b"through");
         assert!(p.b_in.controls.try_recv().is_ok());
+    })
+}
+
+/// A streamed send returns its permit however it ends: more sends than
+/// there are permits complete one after another, and after every permit was
+/// held by a send that timed out, the next streamed send still completes.
+#[test]
+fn streamed_sends_return_their_permits() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths("quic-path-permits", 66, QuicPathLimits::DEFAULT).await;
+        let limit = super::super::config::STREAMED_SEND_LIMIT as usize;
+        let (a, time) = (p.a.clone(), p.time());
+        let (completed, timed_out, later) = p
+            .drive(async move {
+                let timeout = Duration::from_secs(5);
+                let body = Bytes::from_static(b"body");
+                let mut completed = Vec::new();
+                for _ in 0..=limit {
+                    completed.push(
+                        a.send_stream_bounded(&time, timeout, StreamId::next(), None, body.clone())
+                            .await,
+                    );
+                }
+                let timed_out = futures::future::join_all((0..limit).map(|_| {
+                    a.send_stream_chunks_bounded(
+                        &time,
+                        Duration::from_secs(1),
+                        StreamId::next(),
+                        1000,
+                        None,
+                        futures::stream::pending::<Result<Bytes, StreamError>>(),
+                    )
+                }))
+                .await;
+                let later = a
+                    .send_stream_bounded(&time, timeout, StreamId::next(), None, body)
+                    .await;
+                (completed, timed_out, later)
+            })
+            .await;
+        for outcome in &completed {
+            assert!(matches!(outcome, BoundedSend::Sent), "{outcome:?}");
+        }
+        for outcome in &timed_out {
+            assert!(
+                matches!(outcome, BoundedSend::Failed(SendFailure::TimedOut)),
+                "{outcome:?}"
+            );
+        }
+        assert!(matches!(later, BoundedSend::Sent), "{later:?}");
+    })
+}
+
+/// A bounded send whose deadline passes while it waits for a permit is
+/// `Failed(TimedOut)`, and it opened no stream: the receiver announces only
+/// the streams holding permits, and nothing had to be reset.
+#[test]
+fn a_bounded_send_timing_out_on_a_permit_opens_no_stream() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths("quic-path-permit-wait", 67, QuicPathLimits::DEFAULT).await;
+        let limit = super::super::config::STREAMED_SEND_LIMIT as usize;
+        let (a, time) = (p.a.clone(), p.time());
+        let (outcome, aborts) = p
+            .drive(async move {
+                let mut blocked = blocked_streamed_sends(&a, limit);
+                let send = async {
+                    time.sleep(Duration::from_secs(2)).await;
+                    let outcome = a
+                        .send_stream_bounded(
+                            &time,
+                            Duration::from_secs(3),
+                            StreamId::next(),
+                            None,
+                            Bytes::from_static(b"body"),
+                        )
+                        .await;
+                    (outcome, a.send_aborts())
+                };
+                tokio::select! {
+                    done = blocked.next() => panic!("a blocked send returned: {done:?}"),
+                    result = send => result,
+                }
+            })
+            .await;
+        assert!(
+            matches!(outcome, BoundedSend::Failed(SendFailure::TimedOut)),
+            "{outcome:?}"
+        );
+        assert_eq!(aborts, 0, "no stream was opened, so none was reset");
+        assert_eq!(
+            p.b.stats().count(QuicInboundOutcome::AnnouncedStream) as usize,
+            limit
+        );
     })
 }
 
@@ -2736,16 +2856,16 @@ fn a_shadow_path_refuses_data_before_charging_the_budget() {
             let timeout = Duration::from_secs(5);
             let (short, stream, control) = p
                 .drive(async move {
-                    let short = bounded_send(&time, timeout, |progress| {
-                        let payload = over_window();
-                        let a = a.clone();
-                        async move { a.send_short_with(&payload, progress).await }
-                    })
-                    .await;
-                    let stream = bounded_send(&time, timeout, |progress| {
-                        a.send_stream_with(StreamId::next(), Some(b"meta"), over_window(), progress)
-                    })
-                    .await;
+                    let short = a.send_short_bounded(&time, timeout, &over_window()).await;
+                    let stream = a
+                        .send_stream_bounded(
+                            &time,
+                            timeout,
+                            StreamId::next(),
+                            Some(b"meta"),
+                            over_window(),
+                        )
+                        .await;
                     let control = a
                         .send_control_bounded(
                             &time,

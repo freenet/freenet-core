@@ -424,7 +424,7 @@ fn stream_kinds_keep_the_connection_and_the_rest_end_it() {
         (stop_code::EVICTED, true),
         (stop_code::CANCELLED, true),
         (stop_code::FRAGMENT_REFUSED, false),
-        (stop_code::NOT_ACCEPTING_DATA, true),
+        (stop_code::NOT_ACCEPTING_DATA, false),
         (reset_code::LENGTH_MISMATCH, true),
         (0x1f, true),
         (9, true),
@@ -437,6 +437,7 @@ fn stream_kinds_keep_the_connection_and_the_rest_end_it() {
         (stop_code::HEADER_REFUSED, true),
         (stop_code::OVERLONG, true),
         (stop_code::FRAGMENT_REFUSED, true),
+        (stop_code::NOT_ACCEPTING_DATA, true),
         (0x2f, true),
         (9, true),
     ];
@@ -447,7 +448,7 @@ fn stream_kinds_keep_the_connection_and_the_rest_end_it() {
     );
     assert_eq!(
         resets.len(),
-        reset_code::ALL.len() + 5,
+        reset_code::ALL.len() + 6,
         "every reset code has a row"
     );
     let scope = |retryable: bool| {

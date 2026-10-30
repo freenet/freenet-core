@@ -1,11 +1,10 @@
-//! The payload of a QUIC path control frame (#5940, step e5a).
+//! The payload of a QUIC path control frame (#5940).
 //!
-//! Dead code in this release: nothing sends or reads one yet. Step e5a-5b
-//! sends `Ready` and `ReadyAck` on a new QUIC connection to finish an
-//! upgrade, each as a `Control` frame ([`super::framing`]) on its own uni
-//! stream. Control frames do not take one of the slots kept for streamed
-//! messages (`config::STREAMED_SEND_LIMIT`), so they never wait behind a
-//! long transfer.
+//! `Ready` and `ReadyAck` finish an upgrade on a new QUIC connection, each as
+//! a `Control` frame ([`super::framing`]) on its own uni stream. Control
+//! frames take no streamed-message permit, so on a steady path
+//! (`config::STREAMED_SEND_LIMIT`) streamed messages do not keep them waiting
+//! for a stream slot.
 //!
 //! ```text
 //! offset  size  field
@@ -18,20 +17,26 @@
 //! [`CONTROL_LEN`] (10) bytes, exactly. `attempt` is the `attempt` of the
 //! `UpgradeControl` Offer this connection was made for, so a frame from an
 //! earlier attempt can be told apart. `caps` carries what the sender
-//! supports on this path; it is reserved for e5b's data negotiation and no
-//! bit is defined yet ([`caps::KNOWN`] is 0).
+//! supports on this path, for negotiating data; no bit is defined yet
+//! ([`caps::KNOWN`] is 0).
 //!
-//! Compatibility rules, the same as for the frame header and the UDP
-//! upgrade message:
+//! Compatibility rules:
 //! - Unknown caps bits are ignored: [`QuicControl::decode`] clears every bit
 //!   not in [`caps::KNOWN`], so nothing on this node can act on a bit it
 //!   does not know. A new bit is how a newer node says it supports more.
 //! - An unknown version, an unknown type, or a length other than
 //!   [`CONTROL_LEN`] is refused ([`ControlError`]), never a panic. The
-//!   receiving path counts each (`QuicPath::decode_control`). A new type or
-//!   field needs a new version (bytes past the end are refused, not
-//!   ignored, so a field cannot be appended silently), and a sender may use
-//!   one only with a peer whose caps said it reads it.
+//!   receiving path counts each (`QuicPath::decode_control`). The sender
+//!   learns nothing: its send reports `Sent`.
+//! - A new type or field needs a new version. Bytes past the end are refused,
+//!   so a field cannot be appended silently. `UpgradeControl` is different:
+//!   bincode tolerates trailing bytes there, so a field appended to it would
+//!   be ignored and it grows by caps-gated variants instead.
+//! - A sender cannot learn from these frames that the peer reads a new
+//!   version, because `caps` travels in `Ready` and `ReadyAck` themselves.
+//!   `Ready` stays at version 1 until the sender knows by another route: the
+//!   caps of the `UpgradeControl::Offer` it received (the client side only),
+//!   or a release floor on the peer's version, as `may_send_upgrade` is.
 
 /// The control payload version this node writes and the only one it reads.
 pub(crate) const CONTROL_VERSION: u8 = 1;
@@ -41,8 +46,7 @@ pub(crate) const CONTROL_LEN: usize = 10;
 
 /// Capability bits carried in [`QuicControl`].
 pub(crate) mod caps {
-    /// Every bit this node knows. None is defined yet; e5b defines the
-    /// first, for carrying data on the path.
+    /// Every bit this node knows. None is defined yet.
     pub(crate) const KNOWN: u32 = 0;
 }
 

@@ -1200,10 +1200,11 @@ mod tests {
                 TransportError::Quic(QuicError(kind)) => match kind {
                     // Codes that refuse the message itself, written out per
                     // namespace: stops 0x11 HEADER_REFUSED, 0x15 OVERLONG,
-                    // 0x18 FRAGMENT_REFUSED; resets 0x22 LENGTH_MISMATCH.
+                    // 0x18 FRAGMENT_REFUSED, 0x19 NOT_ACCEPTING_DATA; resets
+                    // 0x22 LENGTH_MISMATCH.
                     // Every other code in each namespace, known or not, is
                     // retryable.
-                    QuicErrorKind::Stopped { code } if ![0x11, 0x15, 0x18].contains(code) => {
+                    QuicErrorKind::Stopped { code } if ![0x11, 0x15, 0x18, 0x19].contains(code) => {
                         (ErrorScope::Transient, true, false)
                     }
                     QuicErrorKind::Reset { code } if *code != 0x22 => {

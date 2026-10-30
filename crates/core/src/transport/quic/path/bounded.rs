@@ -1,8 +1,9 @@
-//! Sends with a deadline (#5940, step e5a).
+//! Sends with a deadline (#5940).
 //!
 //! A path's sends wait without limit against a peer that does not
-//! cooperate (see the `path` module doc), so every send the node makes
-//! goes through [`bounded_send`]. Its outcome says what the sender can know:
+//! cooperate (see the `path` module doc), so every send the node makes goes
+//! through a `QuicPath::send_*_bounded` method, built on [`bounded_send`].
+//! The outcome says what the sender can know:
 //!
 //! - [`BoundedSend::Sent`]: the peer's QUIC stack acknowledged every byte.
 //!   Not a delivery (a full channel at the receiver drops an acknowledged
@@ -12,13 +13,13 @@
 //!   while waiting for the acknowledgement. The peer may have the whole
 //!   message. Nothing is reset: the stream is left to finish.
 //! - [`BoundedSend::Failed`]: the message did not reach the peer as a whole.
-//!   A deadline that passes earlier (waiting for a stream slot, a stream
-//!   credit, or flow control) drops the send, which resets its stream
+//!   A deadline that passes earlier drops the send: waiting for a
+//!   streamed-message permit or a stream credit, no stream was opened;
+//!   waiting for flow control, the stream is reset
 //!   (`reset_code::SENDER_ABORTED`), so the receiver discards what arrived.
 //!
-//! A caller must not treat `MaybeDelivered` as `Failed`. e5a-5 settles a
-//! Ready or ReadyAck that may or may not have arrived by closing the path
-//! with `close_code::DOWNGRADE` on a setup timeout, so both sides fall back.
+//! A caller must not treat `MaybeDelivered` as `Failed`: the two sides may
+//! disagree about whether the message arrived.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -65,19 +66,19 @@ pub(crate) enum SendFailure {
 /// stream: after that, the bytes may reach the peer whatever happens to
 /// the sender. Set by the path when it finishes the stream.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct SendProgress(Arc<AtomicBool>);
+pub(super) struct SendProgress(Arc<AtomicBool>);
 
 impl SendProgress {
-    pub(crate) fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self::default()
     }
 
     /// Every byte was written and the end of the stream sent.
-    pub(in crate::transport::quic) fn mark_finished(&self) {
+    pub(super) fn mark_finished(&self) {
         self.0.store(true, Ordering::Release);
     }
 
-    pub(crate) fn finished(&self) -> bool {
+    fn finished(&self) -> bool {
         self.0.load(Ordering::Acquire)
     }
 }
@@ -85,12 +86,13 @@ impl SendProgress {
 /// Run the send `send` builds, until it returns or `timeout` passes on
 /// `time`. `send` gets the [`SendProgress`] to pass to the path's `*_with`
 /// send, which is how a timeout during the wait for the acknowledgement is
-/// told apart from an earlier one.
+/// told apart from an earlier one. A closure that ignored it would report
+/// such a timeout as `Failed`, so this is private to the path, whose
+/// `send_*_bounded` methods pass it on.
 ///
 /// Cancel safety: dropping this future drops the send, with the same
 /// effect as a timeout at that point.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) async fn bounded_send<T, F, Fut>(time: &T, timeout: Duration, send: F) -> BoundedSend
+pub(super) async fn bounded_send<T, F, Fut>(time: &T, timeout: Duration, send: F) -> BoundedSend
 where
     T: TimeSource,
     F: FnOnce(SendProgress) -> Fut,

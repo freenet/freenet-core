@@ -28,8 +28,6 @@
 //! - send-side packet records and the buffers behind sent data;
 //! - allocators other than jemalloc on linux-gnu (macOS and Windows builds
 //!   round differently);
-//! - data on the one bidirectional stream ([`MAX_BIDI_STREAMS`]); the
-//!   measured streams are unidirectional;
 //! - CRYPTO-frame reassembly, quinn-proto's second assembler (its buffer is
 //!   `crypto_buffer_size`, 16 KiB here);
 //! - arrival orders other than a single gap at offset 0 of each stream.
@@ -79,9 +77,8 @@ pub(crate) const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 /// Short messages and control frames take slots from the same pool as
 /// streamed messages, and a streamed message holds its slot for its whole
 /// transfer. A path caps its outbound streamed messages at
-/// [`STREAMED_SEND_LIMIT`], so [`RESERVED_UNI_STREAMS`] slots stay for
-/// short messages and control frames (see there for what that does not
-/// cover).
+/// [`STREAMED_SEND_LIMIT`] to keep [`RESERVED_UNI_STREAMS`] slots for short
+/// messages and control frames on a steady path (see there).
 ///
 /// Set from the `inbound_concurrency` gauge (#5993), which estimates on
 /// the UDP transport how many inbound streams each connection would hold
@@ -105,41 +102,66 @@ pub(crate) const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 ///
 /// The estimate is built to err high (see
 /// `peer_connection::inbound_concurrency`), so it can justify lowering
-/// this value, never raising it. QUIC shadow-mode data (e5a, #5940) on
-/// real QUIC connections may justify raising it.
+/// this value, never raising it. Shadow mode carries no data, so it cannot
+/// confirm or justify the value either. Rollout stage 3 (#5940: data on
+/// QUIC, opt-in) is the first measurement on real QUIC that can.
 pub(crate) const MAX_UNI_STREAMS: u32 = 64;
 
-/// Uni stream slots kept for short messages and control frames, so they do
-/// not wait behind long transfers.
+/// Uni stream slots left for short messages and control frames when every
+/// streamed-message permit is held and the unannounced credit is at
+/// [`UNANNOUNCED_CREDIT_SLACK`]. What that holds under is on
+/// [`STREAMED_SEND_LIMIT`].
 pub(crate) const RESERVED_UNI_STREAMS: u32 = 8;
 
-/// Slots the receiver has freed but not yet announced: quinn announces new
-/// stream credit only once more than `MAX_UNI_STREAMS / 8` streams have
-/// been freed (quinn-proto 0.11.19 `queue_max_stream_id`), so up to that
-/// many freed slots can be unusable by the sender at any time.
+/// Slots the receiver has freed but not yet announced, when no MAX_STREAMS
+/// frame is lost: quinn announces new stream credit only once more than
+/// `MAX_UNI_STREAMS / 8` streams have been freed (quinn-proto 0.11.19
+/// `queue_max_stream_id`), and the sender cannot use a slot until then.
 pub(crate) const UNANNOUNCED_CREDIT_SLACK: u32 = MAX_UNI_STREAMS / 8;
 
-/// Streamed messages (`QuicPath::send_stream`, `send_stream_chunks`) a path
-/// sends at once: [`MAX_UNI_STREAMS`] - [`RESERVED_UNI_STREAMS`] -
-/// [`UNANNOUNCED_CREDIT_SLACK`], 48. A streamed send past it waits for one
+/// Streamed messages (`QuicPath::send_stream`, `send_stream_chunks` and
+/// their bounded forms) a path sends at once. The limit is divided as
+/// `STREAMED_SEND_LIMIT + UNANNOUNCED_CREDIT_SLACK + RESERVED_UNI_STREAMS =
+/// MAX_UNI_STREAMS` (48 + 8 + 8 = 64). A streamed send past it waits for one
 /// of the path's permits before it opens its stream. Short messages and
-/// control frames take no permit, so with every permit held and the
-/// slack unannounced they still have [`RESERVED_UNI_STREAMS`] slots.
-/// Without the slack term (a cap of 56) they can have none: 8 freed slots
-/// unannounced plus 56 streamed messages open is the whole limit.
+/// control frames take no permit.
 ///
-/// What it does not cover: a permit is returned when the peer has
-/// acknowledged every byte, which can be before the receiver has read the
-/// stream to its end and freed it, so for that moment the receiver can
-/// hold more than 48 streamed messages.
+/// The reserve holds on a steady path: every streamed send still holds its
+/// permit or its stream has been freed at the receiver, no MAX_STREAMS frame
+/// is lost, and short messages and control frames hold no more than the
+/// reserve. A short message or control frame then finds a stream slot
+/// whatever the streamed messages are doing (pinned by
+/// `a_short_still_sends_while_streamed_messages_are_blocked`).
+///
+/// Constraints for carrying data on a path, none of which arises on a shadow
+/// path because it sends only control frames:
+/// - A permit returns before the slot does. A send that times out after
+///   its stream's end was sent is not reset, so its stream holds its slot
+///   until the backlog drains, the worst case. A reset or a stop from the
+///   peer returns the permit before the receiver has freed the stream, and
+///   so does an acknowledgement, which can come before the receiver has
+///   read the stream to its end. Decide there whether to hold the permit
+///   until the stream is acknowledged.
+/// - Unannounced credit can exceed [`UNANNOUNCED_CREDIT_SLACK`] while a
+///   MAX_STREAMS frame is lost.
+/// - Short messages are uncapped, and one can be as large as a stream, so
+///   they can use up the reserve.
+/// - A slot is not send capacity: a control frame that has a slot still
+///   waits on the connection's shared flow control and send window
+///   (quinn-proto `write_limit`).
+/// - The division uses this node's [`MAX_UNI_STREAMS`], not the limit the
+///   peer advertised. A change to the limit needs a plan for peers still
+///   advertising the old one.
 pub(crate) const STREAMED_SEND_LIMIT: u32 =
     MAX_UNI_STREAMS - RESERVED_UNI_STREAMS - UNANNOUNCED_CREDIT_SLACK;
 const _: () = assert!(RESERVED_UNI_STREAMS > 0 && STREAMED_SEND_LIMIT > 0);
 
-/// Concurrent bidirectional streams a peer may open: one. Nothing uses it:
-/// messages and control frames ([`super::control`]) go on unidirectional
-/// streams.
-pub(crate) const MAX_BIDI_STREAMS: u32 = 1;
+/// Concurrent bidirectional streams a peer may open: none. Messages and
+/// control frames ([`super::control`]) go on unidirectional streams, and
+/// quinn buffers what arrives on a stream whether or not anything accepts
+/// it, so a stream nothing reads would hold unread data for the life of the
+/// connection.
+pub(crate) const MAX_BIDI_STREAMS: u32 = 0;
 
 /// Connection attempts quinn holds before they are accepted or refused.
 pub(crate) const MAX_INCOMING: usize = 64;
@@ -227,8 +249,7 @@ pub(crate) const QUIC_ASSEMBLER_HOLD_PER_STREAM_BYTES: usize = 44 * 1024;
 /// offset 0 of each stream. The tests check
 /// `streams x QUIC_ASSEMBLER_HOLD_PER_STREAM_BYTES +
 /// QUIC_ASSEMBLER_HOLD_WINDOW_MULTIPLE x W` against those shapes; `streams`
-/// counts the measured uni streams only (see `MAX_BIDI_STREAMS` in the
-/// not-measured list above).
+/// counts uni streams, the only kind a peer may open ([`MAX_BIDI_STREAMS`]).
 ///
 /// Above about 22 KB buffered on a stream the proportional waste threshold
 /// governs. At the 2 GiB window, with frames over about 460 B the

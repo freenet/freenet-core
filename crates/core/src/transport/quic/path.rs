@@ -29,9 +29,9 @@
 //! `open_uni` waits for a stream credit, a write waits for flow-control
 //! credit, and the final wait for acknowledgement has no deadline of its
 //! own (only quinn's connection idle timeout ends it, and keepalives keep a
-//! connection alive). Every send the node makes goes through
-//! [`bounded_send`], which also says whether a timed-out message may have
-//! been delivered.
+//! connection alive). Every send the node makes goes through a
+//! `send_*_bounded` method ([`bounded`]), which also says whether a timed-out
+//! message may have been delivered.
 //!
 //! Cancel safety: dropping a send future before it returns resets the
 //! stream ([`reset_code::SENDER_ABORTED`]), so the receiver sees
@@ -43,9 +43,10 @@
 //! [`bounded_send`] reports a timeout there as `MaybeDelivered`, not
 //! `Failed`.
 //!
-//! Streamed messages hold at most `config::STREAMED_SEND_LIMIT` of the uni
-//! stream slots at once (one permit each), so short messages and control
-//! frames keep slots of their own. A path in shadow mode
+//! Streamed messages take one permit each, at most
+//! `config::STREAMED_SEND_LIMIT` at once, which keeps uni stream slots for
+//! short messages and control frames on a steady path (see that constant for
+//! what steady means and where a slot can be missing). A path in shadow mode
 //! ([`QuicPathLimits::SHADOW`]) refuses inbound data with
 //! [`stop_code::NOT_ACCEPTING_DATA`] before charging anything.
 //!
@@ -111,6 +112,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
@@ -135,7 +137,8 @@ use crate::transport::peer_connection::streaming::{
 };
 
 #[cfg_attr(not(test), allow(unused_imports))]
-pub(crate) use bounded::{BoundedSend, MaybeDelivered, SendFailure, SendProgress, bounded_send};
+pub(crate) use bounded::{BoundedSend, MaybeDelivered, SendFailure};
+use bounded::{SendProgress, bounded_send};
 pub(crate) use inbound::{InboundShort, InboundStreamArrival};
 
 /// Application error codes a receiver stops a stream with (STOP_SENDING),
@@ -161,8 +164,12 @@ pub(crate) mod stop_code {
     /// hold; not expected). The same message fails the same way again.
     pub(crate) const FRAGMENT_REFUSED: u32 = 0x18;
     /// The path carries control frames only (shadow mode): a Short or
-    /// Stream frame is refused before anything is charged. The message
-    /// itself is fine; the sender should send it on the UDP session.
+    /// Stream frame is refused before anything is charged. Data may be sent
+    /// on a path only after caps negotiation said the peer accepts it, so
+    /// this is a counter of a sender that did not, and not a signal to fall
+    /// back: a small message can be fully acknowledged before the stop
+    /// arrives, and the sender then sees `Sent` for what was discarded. A
+    /// retry on the same path fails the same way.
     pub(crate) const NOT_ACCEPTING_DATA: u32 = 0x19;
     /// Every stop code, for the range and duplicate checks in
     /// `super::error`. A source-scrape test checks that each `const` in this
@@ -666,9 +673,21 @@ impl QuicPath {
         self.send_short_with(payload, SendProgress::new()).await
     }
 
-    /// [`Self::send_short`], reporting to `progress` (for [`bounded_send`]).
+    /// [`Self::send_short`], within `timeout` on `time` ([`bounded`]).
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) async fn send_short_with(
+    pub(crate) async fn send_short_bounded<T: TimeSource>(
+        &self,
+        time: &T,
+        timeout: Duration,
+        payload: &[u8],
+    ) -> BoundedSend {
+        bounded_send(time, timeout, |progress| {
+            self.send_short_with(payload, progress)
+        })
+        .await
+    }
+
+    async fn send_short_with(
         &self,
         payload: &[u8],
         progress: SendProgress,
@@ -685,10 +704,7 @@ impl QuicPath {
         self.send_control_with(payload, SendProgress::new()).await
     }
 
-    /// [`Self::send_control`], reporting to `progress` (for
-    /// [`bounded_send`]).
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) async fn send_control_with(
+    async fn send_control_with(
         &self,
         payload: &[u8],
         progress: SendProgress,
@@ -700,12 +716,12 @@ impl QuicPath {
     }
 
     /// Send `control` as a control frame, within `timeout` on `time`
-    /// ([`bounded_send`]).
+    /// ([`bounded`]).
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn send_control_bounded<T: TimeSource>(
         &self,
         time: &T,
-        timeout: std::time::Duration,
+        timeout: Duration,
         control: QuicControl,
     ) -> BoundedSend {
         let payload = control.encode();
@@ -730,10 +746,23 @@ impl QuicPath {
             .await
     }
 
-    /// [`Self::send_stream`], reporting to `progress` (for
-    /// [`bounded_send`]).
+    /// [`Self::send_stream`], within `timeout` on `time` ([`bounded`]).
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) async fn send_stream_with(
+    pub(crate) async fn send_stream_bounded<T: TimeSource>(
+        &self,
+        time: &T,
+        timeout: Duration,
+        stream_id: StreamId,
+        metadata: Option<&[u8]>,
+        payload: Bytes,
+    ) -> BoundedSend {
+        bounded_send(time, timeout, |progress| {
+            self.send_stream_with(stream_id, metadata, payload, progress)
+        })
+        .await
+    }
+
+    async fn send_stream_with(
         &self,
         stream_id: StreamId,
         metadata: Option<&[u8]>,
@@ -771,10 +800,29 @@ impl QuicPath {
             .await
     }
 
-    /// [`Self::send_stream_chunks`], reporting to `progress` (for
-    /// [`bounded_send`]).
+    /// [`Self::send_stream_chunks`], within `timeout` on `time`
+    /// ([`bounded`]).
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) async fn send_stream_chunks_with<S>(
+    pub(crate) async fn send_stream_chunks_bounded<T, S>(
+        &self,
+        time: &T,
+        timeout: Duration,
+        stream_id: StreamId,
+        total_len: u64,
+        metadata: Option<&[u8]>,
+        chunks: S,
+    ) -> BoundedSend
+    where
+        T: TimeSource,
+        S: Stream<Item = Result<Bytes, StreamError>> + Unpin,
+    {
+        bounded_send(time, timeout, |progress| {
+            self.send_stream_chunks_with(stream_id, total_len, metadata, chunks, progress)
+        })
+        .await
+    }
+
+    async fn send_stream_chunks_with<S>(
         &self,
         stream_id: StreamId,
         total_len: u64,

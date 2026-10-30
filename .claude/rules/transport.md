@@ -404,9 +404,9 @@ upper bound; the known undercounts (a sample skipped at a window boundary,
 arrivals older than the horizon or past the 1024 cap, streams the 1024-stream
 budget refused) are listed in the module doc. So `ge_T / conns_sampled` can
 support LOWERING `MAX_UNI_STREAMS` (`quic/config.rs`), never raising it; a
-limit that is too low costs only sender back-pressure, and QUIC shadow mode
-(e5a) is expected to confirm the value on real QUIC before any default
-changes. It says nothing about the memory a peer opening streams on purpose
+limit that is too low costs only sender back-pressure. Shadow mode carries no
+data, so it cannot confirm the value; rollout stage 3 (data on QUIC, opt-in)
+is the first measurement on real QUIC. It says nothing about the memory a peer opening streams on purpose
 can hold (the per-path ceiling's job). `inbound_concurrency_max` is diagnostic
 only (one peer can drive it to the cap with a burst or an inflated RTT). The
 counts sit under one mutex taken only on a connection's first sample of a
@@ -919,7 +919,7 @@ exposes (its module doc lists the few it does not):
   grease_quic_bit(false) (the demux rule depends on it), versions [1],
   max_udp_payload / initial and min MTU 1200, no MTU discovery, no GSO,
   keepalive 15 s (None when the TimeSource disables keepalive), idle = the
-  TimeSource's connection idle timeout, Cubic, 64 uni / 1 bidi streams,
+  TimeSource's connection idle timeout, Cubic, 64 uni / 0 bidi streams,
   stream / receive / send window = clamp(5% of memory / (2 x
   max-number-of-connections), 128 KiB, 2 MiB), no unreliable datagrams, no
   spin bit, migration off, max_incoming 64, incoming buffers 64 KiB / 1 MiB,
@@ -954,8 +954,7 @@ acknowledgement-only packets tracked after the last ack-eliciting send, up
 to quinn-proto's cap of 1000; M2 must re-check this term against
 quinn-proto's behaviour). Not measured: datagram sizes other than 1200 B,
 quinn's endpoint-to-connection datagram queue, send-side packet records and
-the buffers behind sent data, allocators other than jemalloc, the
-one bidirectional stream a peer may open (`MAX_BIDI_STREAMS`), CRYPTO-frame reassembly
+the buffers behind sent data, allocators other than jemalloc, CRYPTO-frame reassembly
 (quinn-proto's second assembler, `crypto_buffer_size` 16 KiB), and arrival
 orders other than a single gap at offset 0. Some quinn terms depend on
 traffic rate and time rather than configuration, as the UDP transport's
@@ -1113,20 +1112,39 @@ Sending (QuicPath::send_short / send_stream / send_stream_chunks /
   uni streams are the back-pressure (open_uni waits; quinn returns
   credit only after more than an eighth of the limit is freed).
   Slot reservation: send_stream / send_stream_chunks each hold one of
-  the path's STREAMED_SEND_LIMIT (48 = MAX_UNI_STREAMS 64 -
-  RESERVED_UNI_STREAMS 8 - UNANNOUNCED_CREDIT_SLACK 8) semaphore permits
-  from before open_uni until they return; a streamed send past 48 waits
-  for a permit without opening a stream. Short and control sends take no
-  permit. The slack term is needed: quinn leaves up to MAX_UNI_STREAMS / 8
-  freed slots unannounced, and with a cap of 56 those 8 plus 56 streamed
-  messages fill the limit, so a short message waits (measured). Not
-  covered: a permit is returned on the peer's ack, which can come before
-  the receiver frees the stream.
+  the path's STREAMED_SEND_LIMIT semaphore permits from before open_uni
+  until they return; a streamed send past the limit waits for a permit
+  without opening a stream. Short and control sends take no permit. The
+  limit divides as STREAMED_SEND_LIMIT 48 + UNANNOUNCED_CREDIT_SLACK 8 +
+  RESERVED_UNI_STREAMS 8 = MAX_UNI_STREAMS 64 (quinn leaves up to
+  MAX_UNI_STREAMS / 8 freed slots unannounced). The reserve holds on a
+  steady path: every streamed send still holds its permit or its stream
+  was freed at the receiver, no MAX_STREAMS frame is lost, and short and
+  control messages hold no more than the reserve (pinned by
+  a_short_still_sends_while_streamed_messages_are_blocked).
+  e5b constraints (none arises in shadow, which sends only control frames):
+  → A permit returns before the slot does: on a timeout after finish (the
+    stream is not reset, so it holds its slot until the backlog drains, the
+    worst case), on a reset or a stop from the peer, and on an ack that
+    comes before the receiver has read the stream to its end. Decide in
+    e5b whether to hold the permit until the stream is acked.
+  → Unannounced credit can exceed 8 while a MAX_STREAMS frame is lost.
+  → Short messages are uncapped, and one can be as large as a stream, so
+    they can use up the reserve.
+  → A slot is not send capacity: a control frame with a slot still waits on
+    the connection's shared flow control and send window (quinn-proto
+    write_limit).
+  → The division uses this node's MAX_UNI_STREAMS, not the limit the peer
+    advertised: a change to the limit needs a plan for peers still
+    advertising the old one.
+  → Each bounded send arms a timer that stays in VirtualTime's pending
+    wakeups until its deadline (VirtualSleep has no drop deregistration),
+    which matters in simulation once data sends run at volume.
   Sends have no deadline of their own: open_uni, a flow-blocked write
   and the final wait for acks can wait as long as the connection lives
   against a peer that does not cooperate. Every node send MUST go through
-  path::bounded_send(time, timeout, |progress| path.send_*_with(..,
-  progress)) (or QuicPath::send_control_bounded), which returns
+  a QuicPath::send_*_bounded method (short, control, stream, stream_chunks;
+  path/bounded.rs), which returns
   Sent (every byte acked), MaybeDelivered(TimedOut | ConnectionLost) (the
   whole message was written and FIN sent, SendProgress set in
   Outgoing::finish, then the deadline passed or the connection was lost
@@ -1290,16 +1308,23 @@ Path recycling (quic/recycle.rs, #5940 step M6): besides the send-reset
   fall back to UDP for THIS connection only. They are not a permanent
   downgrade: e5 must allow a new upgrade after its normal backoff.
 Control payload (quic/control.rs), the body of a Control frame, one per
-  uni stream (not the bidi stream):
+  uni stream:
     version u8 (CONTROL_VERSION 1) | type u8 (0 Ready, 1 ReadyAck) |
     attempt u32 BE (the UpgradeControl attempt) | caps u32 BE
   Exactly CONTROL_LEN (10) bytes. QuicControl::decode checks the version
   first (a later version is UnknownVersion at any length), refuses an
   unknown type and a v1 payload of any other length (bytes appended at the
   end too, so a field cannot be added without a version), and clears caps
-  bits outside caps::KNOWN (0: no bit defined; e5b defines the first). A
-  new type or field needs a new version, sent only to a peer whose caps
-  said it reads it. QuicPath::decode_control decodes a payload from
+  bits outside caps::KNOWN (0: no bit defined; e5b defines the first, and
+  settles whether Offer and QuicControl share one definition of the bits).
+  A new type or field needs a new version. UpgradeControl differs: bincode
+  tolerates trailing bytes there, so it grows by caps-gated variants. A
+  sender cannot learn from these frames that the peer reads a new version,
+  because caps travels in Ready and ReadyAck themselves: Ready stays at
+  version 1 until the sender knows by another route, the caps of the Offer
+  it received (client side only) or a release floor on the peer's version,
+  as may_send_upgrade is. A refused frame reports Sent at its sender.
+  QuicPath::decode_control decodes a payload from
   QuicInbound::controls and counts refusals per path
   (control_unknown_version, control_unknown_type, control_malformed).
 Not here: dedup (e5: is_duplicate_dispatch, completed_inbound_streams) and
@@ -1326,7 +1351,8 @@ Errors: TransportError::Quic(QuicError), beside TransportError::Udp and
     STOP_SENDING) are TRANSIENT, like UDP's OutboundStreamFailed, except
     the codes that refuse the message itself: HEADER_REFUSED, OVERLONG,
     FRAGMENT_REFUSED (the receiver's buffer refused a fragment; distinct
-    from CANCELLED, which means the consumer is gone) and LENGTH_MISMATCH
+    from CANCELLED, which means the consumer is gone), NOT_ACCEPTING_DATA
+    (the path accepts no data for as long as it lives) and LENGTH_MISMATCH
     (stop_is_retryable, reset_is_retryable: classified per namespace, so
     a reset carrying a deterministic stop value, or a stop carrying
     LENGTH_MISMATCH's value, is retryable).
@@ -1371,8 +1397,10 @@ Application error codes, one range per QUIC frame type, all one-byte
                 SEND_ABORT_LIMIT 3 and PEER_NOT_ACKNOWLEDGING 4 (path
                 recycling, M6; the peer reads both as Downgrade)
     0x10..=0x1f STOP_SENDING: path::stop_code (receiver refusals;
-                NOT_ACCEPTING_DATA 0x19 is a shadow path refusing data,
-                retryable: the UDP session carries the message)
+                NOT_ACCEPTING_DATA 0x19 is a shadow path refusing data. Data
+                may be sent only after caps negotiation, so it is a counter
+                and not a fallback signal: a small message can be fully
+                acked before the stop arrives)
     0x20..=0x2f RESET_STREAM: path::reset_code (sender gave up)
   The scrape test checks every constant by name against ALL, and
   close_code::ALL against the QuicCloseCode variants.
