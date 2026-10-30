@@ -180,6 +180,7 @@ impl QuicPolicy {
     }
 
     /// The path permits.
+    #[cfg(any(test, feature = "testing"))]
     pub(crate) fn permits(&self) -> &QuicPathPermits {
         &self.permits
     }

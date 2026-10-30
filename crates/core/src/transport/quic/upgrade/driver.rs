@@ -195,7 +195,7 @@ enum SessionEvent {
     /// An upgrade message arrived on the UDP session.
     Upgrade(UpgradeControl),
     /// A connection attempt from this session's address.
-    Incoming(QuicIncoming),
+    Incoming(Box<QuicIncoming>),
     /// The dial or the accepted attempt of `attempt` finished its handshake.
     Connected {
         attempt: u32,
@@ -371,13 +371,13 @@ impl QuicUpgrades {
         let sender = self.routes.get(&addr).map(|route| route.value().1.clone());
         let unrouted = match sender {
             None => Some(incoming),
-            Some(sender) => match sender.try_send(SessionEvent::Incoming(incoming)) {
+            Some(sender) => match sender.try_send(SessionEvent::Incoming(Box::new(incoming))) {
                 Ok(()) => None,
                 Err(
                     mpsc::error::TrySendError::Full(event)
                     | mpsc::error::TrySendError::Closed(event),
                 ) => match event {
-                    SessionEvent::Incoming(incoming) => Some(incoming),
+                    SessionEvent::Incoming(incoming) => Some(*incoming),
                     SessionEvent::Upgrade(_)
                     | SessionEvent::Connected { .. }
                     | SessionEvent::ConnectFailed { .. }
@@ -475,7 +475,7 @@ impl Session {
         let actions = match event {
             SessionEvent::Upgrade(control) => self.step(&mut state, Event::Upgrade(control)),
             SessionEvent::Incoming(incoming) => {
-                self.on_incoming(&mut state, incoming);
+                self.on_incoming(&mut state, *incoming);
                 Vec::new()
             }
             SessionEvent::Connected {
@@ -927,7 +927,7 @@ async fn drive<S: Socket, T: TimeSource>(
     let _end = EndOnExit(Arc::clone(&session));
     let mut availability = session.hub.endpoint.availability();
     let mut watching_endpoint = true;
-    let mut timer: Option<(u64, Pin<Box<dyn Future<Output = ()> + Send>>)> = None;
+    let mut timer: Option<(u64, crate::simulation::BoxedSleep)> = None;
     loop {
         let deadline = session.deadline_nanos();
         if timer.as_ref().map(|(at, _)| *at) != deadline {

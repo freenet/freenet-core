@@ -3510,7 +3510,6 @@ fn report_sent_tagged<T: crate::simulation::TimeSource>(
 
 /// Send one payload, unpaced by the node-wide egress cap (it is charged at
 /// the socket; see `packet_sending_paced`).
-#[allow(clippy::too_many_arguments)]
 /// Sends upgrade messages on one UDP session, as tracked packets (the receiver
 /// acks them like a short message). Holds only what a send needs, so what holds
 /// it can reach nothing of the session's receive state, its liveness included.
@@ -3549,6 +3548,7 @@ impl<S: super::Socket, T: TimeSource> UpgradeSender<S, T> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn packet_sending<S: super::Socket, T: crate::simulation::TimeSource>(
     remote_addr: SocketAddr,
     socket: &Arc<S>,
