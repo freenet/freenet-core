@@ -230,7 +230,7 @@ flowchart TB
     OutStream --> LEDBAT
     OutStream --> TokenBucket
     GlobalBW -.->|"provides rate"| TokenBucket
-    LEDBAT -->|"ledbat_rate"| RateCalc["rate = min(ledbat_rate, global_rate)"]
+    LEDBAT -->|"ledbat_rate"| RateCalc["rate = min(cc_rate, global_rate or bandwidth_limit)"]
     TokenBucket -->|"global_rate"| RateCalc
     RateCalc --> Assembly
     Assembly --> UDP

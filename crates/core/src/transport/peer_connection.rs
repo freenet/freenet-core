@@ -185,31 +185,60 @@ pub(super) fn paced_rate(
     global_rate: Option<usize>,
     bandwidth_limit: Option<usize>,
 ) -> usize {
-    match global_rate.or(bandwidth_limit) {
+    // 0 is unset here too: `create_connection_handler` callers can pass a raw
+    // value that never went through `effective_bandwidth_limit`.
+    match global_rate.or(bandwidth_limit.filter(|&limit| limit > 0)) {
         Some(cap) => cc_rate.min(cap),
         None => cc_rate,
     }
 }
+
+/// A new connection's initial token-bucket rate, which also fixes the bucket's
+/// capacity (`rate / 10`) for the connection's life: the node's fair share
+/// when `total-bandwidth-limit` is set (unchanged by #6047), otherwise the
+/// controller's rate, lowered to `bandwidth-limit` if set. So a per-connection
+/// limit never gives a connection a larger burst than no limit would (#3702).
+pub(super) fn initial_paced_rate(
+    global_share: Option<usize>,
+    bandwidth_limit: Option<usize>,
+    cc_rate: usize,
+) -> usize {
+    match global_share {
+        Some(share) => share,
+        None => paced_rate(cc_rate, None, bandwidth_limit),
+    }
+}
+
+/// The lowest per-connection `bandwidth-limit` the transport applies: twice
+/// [`streaming::MIN_INBOUND_STREAM_RATE_BYTES_PER_SEC`], the slowest stream
+/// rate a receiver allows a long stream (it evicts one that has not completed
+/// within `length / that rate`, and at least 5 minutes). Pacing at exactly that
+/// rate would leave a long stream no margin, and every stream on a connection
+/// shares its bucket. The floor reduces that failure; it does not remove it for
+/// several long streams at once on one connection, and low limits still slow
+/// large transfers past other deadlines (the 10-minute streaming PUT/GET
+/// attempt ceiling, the 120 s broadcast completion wait).
+pub(crate) const MIN_BANDWIDTH_LIMIT: usize =
+    2 * streaming::MIN_INBOUND_STREAM_RATE_BYTES_PER_SEC as usize;
 
 /// The per-connection `bandwidth-limit` the transport applies, given the
 /// configured one. Call it once, where the config enters the transport: it
 /// logs what it decided.
 ///
 /// - Ignored (`None`) when `total-bandwidth-limit` is set, which overrides it.
-/// - 0 means unset, as `total-bandwidth-limit = 0` does.
-/// - A value below [`streaming::MIN_INBOUND_STREAM_RATE_BYTES_PER_SEC`] is
-///   raised to it. A receiver gives a stream `length / that rate` to complete
-///   before evicting it, so a slower sender would fail every long stream, and
-///   the failure would show on the receiver, not here.
+/// - 0 means unset.
+/// - A value below [`MIN_BANDWIDTH_LIMIT`] is raised to it, with a warning: a
+///   value that low would make long streams fail, and the failure would show on
+///   the receiver, not here.
 pub(crate) fn effective_bandwidth_limit(
     configured: Option<usize>,
     total_limit_set: bool,
 ) -> Option<usize> {
-    let floor = streaming::MIN_INBOUND_STREAM_RATE_BYTES_PER_SEC as usize;
+    let floor = MIN_BANDWIDTH_LIMIT;
     match configured {
         None => None,
         Some(limit) if total_limit_set => {
-            tracing::info!(
+            tracing::warn!(
                 bandwidth_limit = limit,
                 "bandwidth-limit is ignored because total-bandwidth-limit is set"
             );
@@ -226,15 +255,17 @@ pub(crate) fn effective_bandwidth_limit(
             tracing::warn!(
                 configured = limit,
                 applied = floor,
-                "bandwidth-limit is below the slowest stream rate peers accept; raised \
-                 to it. Use total-bandwidth-limit to limit what the node sends"
+                "bandwidth-limit is too low for long transfers to complete; raised to \
+                 the minimum. Use total-bandwidth-limit to limit what the node sends"
             );
             Some(floor)
         }
         Some(limit) => {
             tracing::info!(
                 bandwidth_limit = limit,
-                "each connection is paced at no more than bandwidth-limit bytes/sec"
+                "each connection streams large transfers at no more than \
+                 bandwidth-limit bytes/sec (binds only below the congestion \
+                 controller's rate)"
             );
             Some(limit)
         }
@@ -2249,6 +2280,13 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
     #[cfg(test)]
     pub(crate) fn bandwidth_limit(&self) -> Option<usize> {
         self.remote_conn.bandwidth_limit
+    }
+
+    /// The token bucket's burst capacity, fixed when the connection was set up
+    /// from its initial rate, for tests of that initial rate (#6047).
+    #[cfg(test)]
+    pub(crate) fn pacing_capacity(&self) -> usize {
+        self.remote_conn.token_bucket.capacity()
     }
 
     /// Remote peer's negotiated protocol version, if known (None on joiner->gateway connections).
@@ -6195,11 +6233,15 @@ mod tests {
 
     /// `effective_bandwidth_limit` turns the configured `bandwidth-limit` into
     /// the one the transport applies: ignored under `total-bandwidth-limit`, 0
-    /// is unset, and a value below the slowest stream rate a receiver accepts is
-    /// raised to it, so a stray small value cannot make every long stream fail.
+    /// is unset, and a value below `MIN_BANDWIDTH_LIMIT` is raised to it, so a
+    /// stray small value cannot make every long stream fail.
     #[test]
     fn effective_bandwidth_limit_sanitizes_the_configured_value() {
-        let floor = streaming::MIN_INBOUND_STREAM_RATE_BYTES_PER_SEC as usize;
+        let floor = MIN_BANDWIDTH_LIMIT;
+        assert!(
+            floor > streaming::MIN_INBOUND_STREAM_RATE_BYTES_PER_SEC as usize,
+            "the floor must leave margin over the receiver's slowest accepted rate"
+        );
         let cases = [
             (None, false, None),
             (Some(0), false, None),
@@ -6216,6 +6258,29 @@ mod tests {
                 effective_bandwidth_limit(configured, total_limit_set),
                 expected,
                 "effective_bandwidth_limit({configured:?}, total set: {total_limit_set})"
+            );
+        }
+    }
+
+    /// `initial_paced_rate`: the global share is taken as is (main's behaviour),
+    /// otherwise a per-connection limit can lower the controller's rate but not
+    /// raise it, and 0 is unset.
+    #[test]
+    fn initial_paced_rate_never_raises_the_controller_rate() {
+        const CC: usize = 1_250_000;
+        let cases = [
+            (None, None, CC),
+            (None, Some(200_000), 200_000),
+            (None, Some(10_000_000), CC),
+            (None, Some(0), CC),
+            (Some(5_000_000), Some(200_000), 5_000_000),
+            (Some(300_000), None, 300_000),
+        ];
+        for (global_share, bandwidth_limit, expected) in cases {
+            assert_eq!(
+                initial_paced_rate(global_share, bandwidth_limit, CC),
+                expected,
+                "initial_paced_rate({global_share:?}, {bandwidth_limit:?}, {CC})"
             );
         }
     }

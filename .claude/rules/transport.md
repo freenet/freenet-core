@@ -697,13 +697,17 @@ Rate calculation on every rate update (peer_connection::paced_rate; #6047):
   final_rate = min(cc_rate, bandwidth_limit)         else, if bandwidth-limit set
   final_rate = cc_rate                               otherwise
   A configured limit only lowers the rate, never raises it above cc_rate.
-  bandwidth_limit is the config after effective_bandwidth_limit (called once
-  in p2p_protoc): 0 = unset, ignored under total-bandwidth-limit, and raised
-  to MIN_INBOUND_STREAM_RATE_BYTES_PER_SEC (32 KiB/s) if lower, since a
-  slower sender would fail every long stream at the receiver's age limit.
-  The bucket's INITIAL rate is set separately at the three connection setup
-  sites (global share, else bandwidth_limit, else cc_rate) and fixes the
-  bucket's capacity (initial_rate / 10) for the connection's life.
+  bandwidth_limit is the config after NetworkApiConfig::transport_bandwidth_limit
+  (effective_bandwidth_limit, called once in p2p_protoc and pinned there by a
+  config.rs test): 0 = unset, ignored under any total-bandwidth-limit, and
+  raised to MIN_BANDWIDTH_LIMIT (2 x MIN_INBOUND_STREAM_RATE_BYTES_PER_SEC,
+  64 KiB/s) if lower: near the receiver's age-limit rate, long streams fail.
+  The bucket's INITIAL rate comes from peer_connection::initial_paced_rate at
+  the three connection setup sites (global share as is, else cc_rate lowered
+  to bandwidth_limit) and fixes the bucket's capacity (initial_rate / 10) for
+  the connection's life, so a limit above cc_rate must NOT raise it (#3702
+  burst). Only stream fragments draw on the bucket; short messages, ACKs and
+  retransmits are unpaced.
 
 Token reservation:
   → Reserve BEFORE sending

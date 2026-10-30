@@ -38,7 +38,7 @@ use super::{
     packet_data::{
         MAX_PACKET_SIZE, MAX_RECV_PACKET_SIZE as RECV_BUF_SIZE, PacketData, SymmetricAES,
     },
-    peer_connection::{InboundPacket, PeerConnection, RemoteConnection},
+    peer_connection::{InboundPacket, PeerConnection, RemoteConnection, initial_paced_rate},
     sent_packet_tracker::SentPacketTracker,
     symmetric_message::{SymmetricMessage, SymmetricMessagePayload},
     token_bucket::TokenBucket,
@@ -2432,13 +2432,13 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
             // 10 MB/s which is 8x higher than FixedRate's 1.25 MB/s — the
             // initial burst triggered packet loss and immediate loss_pause,
             // collapsing throughput. See #3702.
-            let initial_rate = if let Some(ref global) = global_bandwidth {
-                global.register_connection()
-            } else if let Some(limit) = bandwidth_limit {
-                limit
-            } else {
-                congestion_controller.current_rate(TOKEN_BUCKET_WINDOW)
-            };
+            let initial_rate = initial_paced_rate(
+                global_bandwidth
+                    .as_ref()
+                    .map(|global| global.register_connection()),
+                bandwidth_limit,
+                congestion_controller.current_rate(TOKEN_BUCKET_WINDOW),
+            );
             // Capacity = one TOKEN_BUCKET_WINDOW worth of tokens at the configured rate.
             // Previously 1MB, which allowed an immediate burst 800x larger
             // than FixedRate's per-100ms budget, triggering loss. See #3702.
@@ -2867,15 +2867,14 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
 
                                             // Initialize token bucket at congestion controller's
                                             // rate to avoid initial burst. See #3702.
-                                            let initial_rate =
-                                                if let Some(ref global) = global_bandwidth {
-                                                    global.register_connection()
-                                                } else if let Some(limit) = bandwidth_limit {
-                                                    limit
-                                                } else {
-                                                    congestion_controller
-                                                        .current_rate(TOKEN_BUCKET_WINDOW)
-                                                };
+                                            let initial_rate = initial_paced_rate(
+                                                global_bandwidth
+                                                    .as_ref()
+                                                    .map(|global| global.register_connection()),
+                                                bandwidth_limit,
+                                                congestion_controller
+                                                    .current_rate(TOKEN_BUCKET_WINDOW),
+                                            );
                                             let bucket_capacity =
                                                 (initial_rate / 10).max(MIN_BUCKET_CAPACITY_BYTES);
                                             let token_bucket =
@@ -3059,13 +3058,13 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
 
                                 // Initialize token bucket at congestion controller's
                                 // rate to avoid initial burst. See #3702.
-                                let initial_rate = if let Some(ref global) = global_bandwidth {
-                                    global.register_connection()
-                                } else if let Some(limit) = bandwidth_limit {
-                                    limit
-                                } else {
-                                    congestion_controller.current_rate(TOKEN_BUCKET_WINDOW)
-                                };
+                                let initial_rate = initial_paced_rate(
+                                    global_bandwidth
+                                        .as_ref()
+                                        .map(|global| global.register_connection()),
+                                    bandwidth_limit,
+                                    congestion_controller.current_rate(TOKEN_BUCKET_WINDOW),
+                                );
                                 let bucket_capacity =
                                     (initial_rate / 10).max(MIN_BUCKET_CAPACITY_BYTES);
                                 let token_bucket = Arc::new(TokenBucket::new_with_time_source(
@@ -5208,24 +5207,79 @@ pub mod mock_transport {
         Ok(())
     }
 
+    /// A `bandwidth-limit` above the congestion controller's rate must not
+    /// give a new connection a larger initial burst than no limit would. The
+    /// bucket's capacity is set once from the initial rate (`rate / 10`), so
+    /// before #6047's follow-up a 10 MB/s limit under FixedRate gave every
+    /// connection a 1 MB burst for its whole life (the #3702 burst). Checked on
+    /// both the gateway's accept path and the joiner's path.
+    #[tokio::test]
+    async fn bandwidth_limit_above_the_controller_rate_keeps_the_default_burst()
+    -> anyhow::Result<()> {
+        const LIMIT: usize = 10_000_000;
+        let fixed_rate = crate::transport::fixed_rate::DEFAULT_RATE_BYTES_PER_SEC;
+        assert!(LIMIT > fixed_rate, "test premise: the limit must not bind");
+        let expected_capacity = (fixed_rate / 10).max(MIN_BUCKET_CAPACITY_BYTES);
+
+        let channels = Arc::new(DashMap::new());
+        let (_, (mut joiner, _joiner_inbound), _) = create_mock_peer_internal(
+            Default::default(),
+            Default::default(),
+            false,
+            channels.clone(),
+            Some(LIMIT),
+            None,
+        )
+        .await?;
+        let (gw_pub, (_gw_out, mut gw_inbound), gw_addr) = create_mock_peer_internal(
+            Default::default(),
+            Default::default(),
+            true,
+            channels,
+            Some(LIMIT),
+            None,
+        )
+        .await?;
+
+        let connecting = joiner.connect(gw_pub, gw_addr).await;
+        let (joiner_conn, gw_conn) = tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::join!(connecting, gw_inbound.recv())
+        })
+        .await?;
+        let joiner_conn = joiner_conn?;
+        let gw_conn = gw_conn.ok_or_else(|| anyhow::anyhow!("gateway accepted nothing"))?;
+
+        assert_eq!(joiner_conn.pacing_capacity(), expected_capacity, "joiner");
+        assert_eq!(gw_conn.pacing_capacity(), expected_capacity, "gateway");
+        Ok(())
+    }
+
     /// The same as `bandwidth_limit_reaches_gateway_and_joiner_connections`
-    /// for a peer-to-peer hole-punch, which builds its connection on either
-    /// traversal arm (the ack path or answering the remote's intro), so both
-    /// arms are exercised across runs.
+    /// for a peer-to-peer hole-punch, with each side forced onto a different
+    /// traversal arm so each arm's setup site is checked on every run. As in
+    /// `nat_traversal_ack_racer_learns_version_from_the_ack`, dropping B's
+    /// intro means A never parses one and completes on B's ack, while B
+    /// completes by answering A's intro (`RemoteInbound`). The arms are
+    /// asserted, so a change that moves either side to the other arm fails
+    /// here instead of silently testing one site twice. The limits are above
+    /// FixedRate's rate, so each connection must also keep the default burst
+    /// capacity (see `bandwidth_limit_above_the_controller_rate_keeps_the_default_burst`).
     #[tokio::test]
     async fn bandwidth_limit_reaches_hole_punched_connections() -> anyhow::Result<()> {
-        const A_LIMIT: usize = 400_000;
-        const B_LIMIT: usize = 600_000;
+        const A_LIMIT: usize = 10_000_000;
+        const B_LIMIT: usize = 20_000_000;
+        let expected_capacity = (crate::transport::fixed_rate::DEFAULT_RATE_BYTES_PER_SEC / 10)
+            .max(MIN_BUCKET_CAPACITY_BYTES);
         let channels = Arc::new(DashMap::new());
         let (a_pub, mut peer_a, a_addr) = create_mock_peer_with_bandwidth(
-            Default::default(),
+            PacketDropPolicy::ReceiveAll,
             Default::default(),
             channels.clone(),
             Some(A_LIMIT),
         )
         .await?;
         let (b_pub, mut peer_b, b_addr) = create_mock_peer_with_bandwidth(
-            Default::default(),
+            PacketDropPolicy::Ranges(vec![0..1]),
             Default::default(),
             channels,
             Some(B_LIMIT),
@@ -5235,16 +5289,28 @@ pub mod mock_transport {
         let a_side = GlobalExecutor::spawn(async move {
             let conn = peer_a.connect(b_pub, b_addr).await;
             let conn = tokio::time::timeout(Duration::from_secs(30), conn).await??;
-            Ok::<_, anyhow::Error>(conn.bandwidth_limit())
+            Ok::<_, anyhow::Error>((conn.bandwidth_limit(), conn.pacing_capacity()))
         });
         let b_side = GlobalExecutor::spawn(async move {
             let conn = peer_b.connect(a_pub, a_addr).await;
             let conn = tokio::time::timeout(Duration::from_secs(30), conn).await??;
-            Ok::<_, anyhow::Error>(conn.bandwidth_limit())
+            Ok::<_, anyhow::Error>((conn.bandwidth_limit(), conn.pacing_capacity()))
         });
         let (a, b) = tokio::try_join!(a_side, b_side)?;
-        assert_eq!(a?, Some(A_LIMIT));
-        assert_eq!(b?, Some(B_LIMIT));
+        assert!(
+            !completed_in_remote_inbound(a_addr, b_addr),
+            "premise: A completed on the ack arm"
+        );
+        assert!(
+            completed_in_remote_inbound(b_addr, a_addr),
+            "premise: B completed in the RemoteInbound arm"
+        );
+        assert_eq!(a?, (Some(A_LIMIT), expected_capacity), "ack-arm connection");
+        assert_eq!(
+            b?,
+            (Some(B_LIMIT), expected_capacity),
+            "RemoteInbound-arm connection"
+        );
         Ok(())
     }
 
