@@ -203,30 +203,36 @@ fn reach(role: Role, state: S) -> Rig {
         return Rig::new(role);
     }
     let mut rig = Rig::promoted(role);
+    advance_to(&mut rig, role, state);
+    rig
+}
+
+/// Takes a fresh promoted machine to `state`.
+fn advance_to(rig: &mut Rig, role: Role, state: S) {
     let attempt = attempt_of(role);
     let go = |rig: &mut Rig, event: fn(u32) -> Event| {
         rig.step(event(attempt));
     };
     match (role, state) {
         (_, S::Unpromoted | S::Idle) => {}
-        (_, S::Off) => go(&mut rig, |_| Event::SessionEnded),
+        (_, S::Off) => go(rig, |_| Event::SessionEnded),
         (Role::Server, S::Offered) => {
             rig.tick_due();
         }
         (Role::Server, S::Connecting) => {
             rig.tick_due();
-            go(&mut rig, |attempt| {
+            go(rig, |attempt| {
                 Event::Upgrade(UpgradeControl::Accept { attempt })
             });
         }
         (Role::Server, S::Confirming) => {
             rig.tick_due();
-            go(&mut rig, |attempt| Event::PathEstablished { attempt });
+            go(rig, |attempt| Event::PathEstablished { attempt });
         }
         (Role::Server, S::Active | S::Rechecking) | (Role::Client, S::Active | S::Rechecking) => {
             assert_eq!(rig.activate(), attempt);
             if state == S::Rechecking {
-                go(&mut rig, |attempt| Event::PathFailed {
+                go(rig, |attempt| Event::PathFailed {
                     attempt,
                     kind: QuicErrorKind::Protocol { code: 1 },
                 });
@@ -237,12 +243,11 @@ fn reach(role: Role, state: S) -> Rig {
         }
         (Role::Client, S::Confirming) => {
             rig.offer(attempt);
-            go(&mut rig, |attempt| Event::PathEstablished { attempt });
+            go(rig, |attempt| Event::PathEstablished { attempt });
         }
         (Role::Client, S::Offered) => unreachable!("a client does not offer"),
     }
     assert_eq!(label(&rig.machine), state, "reach {role:?}");
-    rig
 }
 
 const ATTEMPT_EVENTS: [&str; 26] = [
@@ -623,6 +628,16 @@ fn ledger_after(
             60
         };
         after.retry_at = before.retry_at.max(now + Duration::from_secs(delay));
+    }
+    // A session end charges an attempt under way; every row's path is young.
+    if name == "session_ended"
+        && matches!(
+            state,
+            S::Offered | S::Connecting | S::Confirming | S::Active | S::Rechecking
+        )
+    {
+        after.failures += 1;
+        after.retry_at = before.retry_at.max(now + Duration::from_secs(60));
     }
     after
 }
@@ -1467,7 +1482,7 @@ fn a_replaced_session_continues_the_backoff() {
 /// under it, since the count now outlives the machine. A younger one does not.
 #[test]
 fn a_stable_path_ended_by_its_session_clears_the_count() {
-    for (age, failures) in [(STABLE_PATH, 0), (STABLE_PATH - Duration::from_nanos(1), 5)] {
+    for (age, failures) in [(STABLE_PATH, 0), (STABLE_PATH - Duration::from_nanos(1), 6)] {
         for recheck_first in [false, true] {
             let mut rig = Rig::new(Role::Server);
             let seed = BackoffSeed {
@@ -1488,6 +1503,122 @@ fn a_stable_path_ended_by_its_session_clears_the_count() {
             rig.step(Event::SessionEnded);
             assert_eq!(rig.machine.backoff_seed().failures, failures, "{age:?}");
         }
+    }
+}
+
+/// A session that keeps ending is retried less and less often, whichever state
+/// it ends in and on both roles, and a stable path starts the count again.
+#[test]
+fn a_flapping_session_is_retried_less_and_less_often() {
+    let starts = [
+        (Role::Server, S::Offered),
+        (Role::Server, S::Connecting),
+        (Role::Server, S::Confirming),
+        (Role::Server, S::Active),
+        (Role::Server, S::Rechecking),
+        (Role::Client, S::Connecting),
+        (Role::Client, S::Confirming),
+        (Role::Client, S::Active),
+        (Role::Client, S::Rechecking),
+    ];
+    for (role, start) in starts {
+        let case = format!("{role:?} {start:?}");
+        let mut seed = BackoffSeed::default();
+        for seconds in [60, 120, 240, 480] {
+            let mut rig = Rig::new(role);
+            rig.now = rig.now.max(seed.retry_at);
+            rig.machine = UpgradeMachine::with_backoff(rig.machine.local_key.clone(), seed);
+            rig.promote(Some(QUIC_UPGRADE_NEGOTIATES_IN));
+            advance_to(&mut rig, role, start);
+            assert_eq!(
+                rig.step(Event::SessionEnded).len(),
+                usize::from(start != S::Rechecking),
+                "{case}"
+            );
+            assert_eq!(rig.backoff(), Duration::from_secs(seconds), "{case}");
+            seed = rig.machine.backoff_seed();
+        }
+        assert_eq!(seed.failures, 4, "{case}");
+
+        // A path that lasted clears the count and adds no wait.
+        if start == S::Active {
+            let mut rig = Rig::new(role);
+            rig.now = seed.retry_at;
+            rig.machine = UpgradeMachine::with_backoff(rig.machine.local_key.clone(), seed);
+            rig.promote(Some(QUIC_UPGRADE_NEGOTIATES_IN));
+            advance_to(&mut rig, role, start);
+            rig.now += STABLE_PATH;
+            rig.step(Event::SessionEnded);
+            assert_eq!(rig.machine.failures, 0, "{case}");
+            assert_eq!(rig.backoff(), Duration::ZERO, "{case}");
+        }
+    }
+}
+
+/// One failure is charged once. A session end after a failure that charged
+/// adds nothing, and a late report after a session end that charged adds
+/// nothing. A session end with the endpoint down charges nothing at all.
+#[test]
+fn a_session_end_does_not_charge_a_failure_twice() {
+    let attempt_lost = |attempt| Event::PathFailed {
+        attempt,
+        kind: QuicErrorKind::ConnectionLost,
+    };
+    for role in [Role::Server, Role::Client] {
+        let attempt = attempt_of(role);
+        for start in [S::Connecting, S::Confirming, S::Active] {
+            let case = format!("{role:?} {start:?}");
+
+            // The failure first.
+            let mut rig = reach(role, start);
+            rig.step(attempt_lost(attempt));
+            let charged = Ledger::of(&rig.machine);
+            assert_eq!(charged.failures, 1, "{case}");
+            rig.now += Duration::from_secs(1);
+            assert_eq!(rig.step(Event::SessionEnded), vec![], "{case}");
+            assert!(rig.machine.is_off(), "{case}");
+            assert_eq!(Ledger::of(&rig.machine), charged, "{case}");
+
+            // The session end first; the path's report comes after it.
+            let mut rig = reach(role, start);
+            rig.step(Event::SessionEnded);
+            let charged = Ledger::of(&rig.machine);
+            assert_eq!(charged.failures, 1, "{case}");
+            rig.now += Duration::from_secs(1);
+            assert_eq!(rig.step(attempt_lost(attempt)), vec![], "{case}");
+            assert_eq!(rig.step(Event::SessionEnded), vec![], "{case}");
+            assert_eq!(Ledger::of(&rig.machine), charged, "{case}");
+
+            // The endpoint read as down when the session ends.
+            let mut rig = reach(role, start);
+            let before = Ledger::of(&rig.machine);
+            rig.availability.send(QuicAvailability::Down).unwrap();
+            rig.step(Event::SessionEnded);
+            assert_eq!(Ledger::of(&rig.machine), before, "{case}");
+        }
+
+        // A recheck charges once, at its deadline or at the session's end.
+        let mut rig = reach(role, S::Rechecking);
+        rig.now += RECHECK_TIMEOUT;
+        rig.step(Event::Tick);
+        let charged = Ledger::of(&rig.machine);
+        assert_eq!(charged.failures, 1, "{role:?}");
+        rig.step(Event::SessionEnded);
+        assert_eq!(Ledger::of(&rig.machine), charged, "{role:?}");
+
+        let mut rig = reach(role, S::Rechecking);
+        rig.step(Event::SessionEnded);
+        let charged = Ledger::of(&rig.machine);
+        assert_eq!(charged.failures, 1, "{role:?}");
+        rig.now += RECHECK_TIMEOUT;
+        assert_eq!(rig.step(Event::Tick), vec![], "{role:?}");
+        assert_eq!(Ledger::of(&rig.machine), charged, "{role:?}");
+
+        let mut rig = reach(role, S::Rechecking);
+        let before = Ledger::of(&rig.machine);
+        rig.availability.send(QuicAvailability::Down).unwrap();
+        rig.step(Event::SessionEnded);
+        assert_eq!(Ledger::of(&rig.machine), before, "{role:?}");
     }
 }
 

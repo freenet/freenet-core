@@ -290,6 +290,19 @@ enum State {
     Off,
 }
 
+/// Why a machine goes [`State::Off`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ending {
+    /// This node's own decision: nothing is recorded and the peer is not charged.
+    Local,
+    /// The endpoint is down: the peer is not charged, and an attempt under way
+    /// records the fallback.
+    EndpointDown,
+    /// The UDP session ended. An attempt under way or a path that was not
+    /// stable is charged, so a session that flaps is retried less often.
+    Session,
+}
+
 /// Which backoff a failure takes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Penalty {
@@ -383,6 +396,11 @@ fn unit(sample: f64) -> f64 {
 pub(in crate::transport) struct BackoffSeed {
     pub(in crate::transport) failures: u32,
     pub(in crate::transport) retry_at: Duration,
+}
+
+/// Whether a path that became active at `active_since` lasted [`STABLE_PATH`].
+fn is_stable(cx: Inputs<'_>, active_since: Option<Duration>) -> bool {
+    active_since.is_some_and(|since| cx.now.saturating_sub(since) >= STABLE_PATH)
 }
 
 /// Whether the endpoint reads as down now. A connection-scope error of a dead
@@ -505,10 +523,12 @@ impl UpgradeMachine {
             Event::PathFailed { attempt, kind } => self.on_failed(cx, attempt, kind),
             Event::EndpointNotUp(availability) => match availability {
                 QuicAvailability::Up => Vec::new(),
-                QuicAvailability::Down => self.shut_off(cx, true),
-                QuicAvailability::Disabled | QuicAvailability::Released => self.shut_off(cx, false),
+                QuicAvailability::Down => self.shut_off(cx, Ending::EndpointDown),
+                QuicAvailability::Disabled | QuicAvailability::Released => {
+                    self.shut_off(cx, Ending::Local)
+                }
             },
-            Event::SessionEnded => self.shut_off(cx, false),
+            Event::SessionEnded => self.shut_off(cx, Ending::Session),
         }
     }
 
@@ -526,12 +546,12 @@ impl UpgradeMachine {
         self.role = Role::of(&self.local_key, peer_key);
         match self.role {
             None => {
-                self.shut_off(cx, false);
+                self.shut_off(cx, Ending::Local);
                 vec![Action::Record(Outcome::RoleConflict)]
             }
             Some(Role::Client) => Vec::new(),
             Some(Role::Server) if !may_offer_upgrade(remote_version) => {
-                self.shut_off(cx, false);
+                self.shut_off(cx, Ending::Local);
                 vec![Action::Record(Outcome::IneligibleVersion)]
             }
             Some(Role::Server) => {
@@ -579,7 +599,7 @@ impl UpgradeMachine {
                     return Vec::new();
                 }
                 if endpoint_is_down(cx) {
-                    return self.shut_off(cx, true);
+                    return self.shut_off(cx, Ending::EndpointDown);
                 }
                 self.state = State::Idle;
                 self.charge(cx, active_since, Penalty::Normal);
@@ -595,7 +615,7 @@ impl UpgradeMachine {
 
     fn try_offer(&mut self, cx: Inputs<'_>) -> Vec<Action> {
         match cx.policy.admit() {
-            Err(PathRefusal::Disabled(_)) => self.shut_off(cx, false),
+            Err(PathRefusal::Disabled(_)) => self.shut_off(cx, Ending::Local),
             // At the limit the server does not offer.
             Err(PathRefusal::Busy) => {
                 self.charge(cx, None, Penalty::Uncharged);
@@ -818,7 +838,7 @@ impl UpgradeMachine {
         }
         match classify(kind) {
             Verdict::NoEffect => Vec::new(),
-            Verdict::EndpointDown => self.shut_off(cx, true),
+            Verdict::EndpointDown => self.shut_off(cx, Ending::EndpointDown),
             Verdict::Recheck => {
                 let active_since = self.leave_attempt();
                 self.state = State::Rechecking {
@@ -885,14 +905,14 @@ impl UpgradeMachine {
     }
 
     fn clear_count_if_stable(&mut self, cx: Inputs<'_>, active_since: Option<Duration>) {
-        if active_since.is_some_and(|since| cx.now.saturating_sub(since) >= STABLE_PATH) {
+        if is_stable(cx, active_since) {
             self.failures = 0;
         }
     }
 
-    /// Final: no re-offer, and no charge against the peer. `endpoint_down`
-    /// records the fallback if an attempt was under way.
-    fn shut_off(&mut self, cx: Inputs<'_>, endpoint_down: bool) -> Vec<Action> {
+    /// Final: no re-offer for this session. See [`Ending`] for what each way
+    /// of getting here records and charges.
+    fn shut_off(&mut self, cx: Inputs<'_>, ending: Ending) -> Vec<Action> {
         let mut actions = Vec::new();
         let mut tear_down = |attempt| {
             actions.push(Action::TearDown {
@@ -915,10 +935,23 @@ impl UpgradeMachine {
             State::Idle | State::Off => (false, None),
         };
         self.clear_count_if_stable(cx, active_since);
-        if endpoint_down && was_attempting {
-            actions.push(Action::Record(Outcome::Fallback(
-                FallbackCause::EndpointDown,
-            )));
+        match ending {
+            Ending::EndpointDown if was_attempting => {
+                actions.push(Action::Record(Outcome::Fallback(
+                    FallbackCause::EndpointDown,
+                )));
+            }
+            // A peer restart replaces the UDP session at once, while the old
+            // QUIC connection waits for a close or an idle timeout, so this
+            // often comes first and is the only report of the failure. From
+            // `Idle` a failure has already charged, and from `Off` there is
+            // nothing left to charge for.
+            Ending::Session
+                if was_attempting && !is_stable(cx, active_since) && !endpoint_is_down(cx) =>
+            {
+                self.charge(cx, active_since, Penalty::Normal);
+            }
+            Ending::Local | Ending::EndpointDown | Ending::Session => {}
         }
         actions
     }
