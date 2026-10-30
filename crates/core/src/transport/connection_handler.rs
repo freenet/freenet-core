@@ -38,7 +38,7 @@ use super::{
     packet_data::{
         MAX_PACKET_SIZE, MAX_RECV_PACKET_SIZE as RECV_BUF_SIZE, PacketData, SymmetricAES,
     },
-    peer_connection::{InboundPacket, PeerConnection, RemoteConnection},
+    peer_connection::{InboundPacket, PeerConnection, RemoteConnection, paced_rate},
     sent_packet_tracker::SentPacketTracker,
     symmetric_message::{SymmetricMessage, SymmetricMessagePayload},
     token_bucket::TokenBucket,
@@ -2432,13 +2432,13 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
             // 10 MB/s which is 8x higher than FixedRate's 1.25 MB/s — the
             // initial burst triggered packet loss and immediate loss_pause,
             // collapsing throughput. See #3702.
-            let initial_rate = if let Some(ref global) = global_bandwidth {
-                global.register_connection()
-            } else if let Some(limit) = bandwidth_limit {
-                limit
-            } else {
-                congestion_controller.current_rate(TOKEN_BUCKET_WINDOW)
-            };
+            let initial_rate = paced_rate(
+                congestion_controller.current_rate(TOKEN_BUCKET_WINDOW),
+                global_bandwidth
+                    .as_ref()
+                    .map(|global| global.register_connection()),
+                bandwidth_limit,
+            );
             // Capacity = one TOKEN_BUCKET_WINDOW worth of tokens at the configured rate.
             // Previously 1MB, which allowed an immediate burst 800x larger
             // than FixedRate's per-100ms budget, triggering loss. See #3702.
@@ -2483,6 +2483,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                 inbound_symmetric_key: inbound_key,
                 inbound_symmetric_key_bytes: inbound_key_bytes,
                 global_bandwidth: global_bandwidth.clone(),
+                bandwidth_limit,
                 my_address: None,
                 remote_protoc_version,
                 transport_secret_key: secret,
@@ -2866,15 +2867,14 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
 
                                             // Initialize token bucket at congestion controller's
                                             // rate to avoid initial burst. See #3702.
-                                            let initial_rate =
-                                                if let Some(ref global) = global_bandwidth {
-                                                    global.register_connection()
-                                                } else if let Some(limit) = bandwidth_limit {
-                                                    limit
-                                                } else {
-                                                    congestion_controller
-                                                        .current_rate(TOKEN_BUCKET_WINDOW)
-                                                };
+                                            let initial_rate = paced_rate(
+                                                congestion_controller
+                                                    .current_rate(TOKEN_BUCKET_WINDOW),
+                                                global_bandwidth
+                                                    .as_ref()
+                                                    .map(|global| global.register_connection()),
+                                                bandwidth_limit,
+                                            );
                                             let bucket_capacity =
                                                 (initial_rate / 10).max(MIN_BUCKET_CAPACITY_BYTES);
                                             let token_bucket =
@@ -2925,6 +2925,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                                     token_bucket,
                                                     socket: socket.clone(),
                                                     global_bandwidth: global_bandwidth.clone(),
+                                                    bandwidth_limit,
                                                     rolling_rtt_stats,
                                                     time_source: time_source.clone(),
                                                 },
@@ -3057,13 +3058,13 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
 
                                 // Initialize token bucket at congestion controller's
                                 // rate to avoid initial burst. See #3702.
-                                let initial_rate = if let Some(ref global) = global_bandwidth {
-                                    global.register_connection()
-                                } else if let Some(limit) = bandwidth_limit {
-                                    limit
-                                } else {
-                                    congestion_controller.current_rate(TOKEN_BUCKET_WINDOW)
-                                };
+                                let initial_rate = paced_rate(
+                                    congestion_controller.current_rate(TOKEN_BUCKET_WINDOW),
+                                    global_bandwidth
+                                        .as_ref()
+                                        .map(|global| global.register_connection()),
+                                    bandwidth_limit,
+                                );
                                 let bucket_capacity =
                                     (initial_rate / 10).max(MIN_BUCKET_CAPACITY_BYTES);
                                 let token_bucket = Arc::new(TokenBucket::new_with_time_source(
@@ -3104,6 +3105,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                         token_bucket,
                                         socket: socket.clone(),
                                         global_bandwidth: global_bandwidth.clone(),
+                                        bandwidth_limit,
                                         rolling_rtt_stats,
                                         time_source: time_source.clone(),
                                     },

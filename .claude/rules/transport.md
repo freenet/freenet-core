@@ -64,8 +64,9 @@ MUST:
 
 ```
 Per-connection mode (default):
-  → Each connection gets independent limit
+  → Each connection is paced independently; no node-wide cap
   → Default: 10 Mbps (1,250,000 bytes/sec); see DEFAULT_RATE_BYTES_PER_SEC in fixed_rate/controller.rs
+  → bandwidth-limit caps each connection's rate (unset by default)
 
 Global pool mode:
   → total-bandwidth-limit enables this
@@ -691,8 +692,12 @@ Intro packet rate limiting:
 ### WHEN using token bucket
 
 ```
-Rate calculation:
-  final_rate = min(ledbat_rate, global_pool_rate)
+Rate calculation (peer_connection::paced_rate, at bucket creation AND every
+rate update, so the two cannot drift; #6047):
+  final_rate = min(cc_rate, global_pool_rate)        with total-bandwidth-limit
+  final_rate = min(cc_rate, bandwidth_limit)         else, if bandwidth-limit > 0
+  final_rate = cc_rate                               otherwise
+  A configured limit only lowers the rate, never raises it above cc_rate.
 
 Token reservation:
   → Reserve BEFORE sending

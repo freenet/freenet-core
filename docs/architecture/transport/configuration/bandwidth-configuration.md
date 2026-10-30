@@ -17,9 +17,9 @@ The Freenet transport layer supports two bandwidth configuration modes:
 # Each connection can use up to 1.25 MB/s (default, fixedrate controller)
 freenet
 
-# Custom per-connection limit. Currently only sets the initial rate: the
-# congestion controller's rate replaces it at the first rate update (#6047).
-freenet --bandwidth-limit 5000000  # 5 MB/s per connection
+# Custom per-connection limit: caps each connection's rate (it never raises it
+# above the congestion controller's rate)
+freenet --bandwidth-limit 500000  # 500 KB/s per connection
 ```
 
 ### Global Pool Mode (Recommended for bandwidth-constrained environments)
@@ -35,7 +35,7 @@ freenet --total-bandwidth-limit 50000000 --min-bandwidth-per-connection 1000000
 
 | Argument | Description | Default |
 |----------|-------------|---------|
-| `--bandwidth-limit <bytes/sec>` | Per-connection bandwidth limit (currently only the initial rate, #6047) | None (the congestion controller's rate: 1,250,000 (1.25 MB/s) for `fixedrate`) |
+| `--bandwidth-limit <bytes/sec>` | Per-connection cap on the congestion controller's rate (0 = unset) | None (the congestion controller's rate: 1,250,000 (1.25 MB/s) for `fixedrate`) |
 | `--total-bandwidth-limit <bytes/sec>` | Cap on everything the node sends over UDP, across ALL connections | None (disabled) |
 | `--min-bandwidth-per-connection <bytes/sec>` | Minimum per-connection pacing rate inside the total (clamped to the total) | 1,000,000 (1 MB/s) |
 | `--congestion-control <algorithm>` | Congestion control algorithm (`fixedrate`, `ledbat`, `bbr`) | `fixedrate` |
@@ -50,7 +50,7 @@ freenet --total-bandwidth-limit 50000000 --min-bandwidth-per-connection 1000000
 congestion-control = "fixedrate"  # Options: "fixedrate" (default), "ledbat", "bbr"
 
 # Per-connection mode (traditional)
-bandwidth-limit = 10000000  # 10 MB/s per connection (currently only the initial rate, #6047)
+bandwidth-limit = 500000  # 500 KB/s cap per connection
 
 # OR Global pool mode (recommended)
 total-bandwidth-limit = 50000000           # 50 MB/s total
@@ -111,7 +111,7 @@ freenet --ledbat-min-ssthresh 614400
 ledbat-min-ssthresh = 524288  # 500KB
 
 # Can combine with bandwidth limits
-bandwidth-limit = 10000000  # currently only the initial rate (#6047)
+bandwidth-limit = 10000000  # caps each connection at 10 MB/s
 ledbat-min-ssthresh = 750000
 ```
 
@@ -355,6 +355,11 @@ The default behavior (no `total-bandwidth-limit`) is unchanged:
   several times the upload capacity; set `total-bandwidth-limit` to stay below it
 - No egress cap exists
 
+Before #6047 was fixed, `bandwidth-limit` only set a connection's initial rate: the
+first rate update replaced it with the congestion controller's rate. It now caps every
+rate update, so a value set in an old `config.toml` takes effect when it is below the
+controller's rate.
+
 Before the egress cap, `total-bandwidth-limit` only divided a per-connection rate:
 `min-bandwidth-per-connection` could take the node above it, and control traffic was
 never counted against it.
@@ -383,10 +388,10 @@ min-bandwidth-per-connection = 500000      # 500 KB/s minimum
 
 ```toml
 [network-api]
-# Higher throughput for local testing. A connection's rate is
-# min(congestion controller rate, total share), so neither bandwidth-limit
-# (#6047) nor a large total-bandwidth-limit raises it above fixedrate's
-# 1.25 MB/s. Use a controller that adapts its rate instead:
+# Higher throughput for local testing. A connection's rate is the congestion
+# controller's rate capped by the configured limit, so neither a large
+# bandwidth-limit nor a large total-bandwidth-limit raises it above
+# fixedrate's 1.25 MB/s. Use a controller that adapts its rate instead:
 congestion-control = "bbr"
 ```
 

@@ -159,6 +159,9 @@ pub(crate) struct RemoteConnection<S = super::UdpSocket, T: TimeSource = RealTim
     /// Global bandwidth manager for fair sharing across connections.
     /// When Some, the token_bucket rate is periodically updated based on connection count.
     pub(super) global_bandwidth: Option<Arc<GlobalBandwidthManager>>,
+    /// Configured per-connection `bandwidth-limit` (bytes/sec), applied by
+    /// [`paced_rate`] on every rate update. Ignored while `global_bandwidth` is set.
+    pub(super) bandwidth_limit: Option<usize>,
     /// Shadow per-peer rolling RTT stats (issue #4074, Phase 1).
     /// Auto-registers with the global shadow registry on construction
     /// and removes itself on drop. Written here on each non-retransmitted
@@ -167,6 +170,25 @@ pub(crate) struct RemoteConnection<S = super::UdpSocket, T: TimeSource = RealTim
     pub(crate) rolling_rtt_stats: super::rolling_rtt_stats::RollingRttStatsHandle<T>,
     /// Time source for deterministic simulation support
     pub(super) time_source: T,
+}
+
+/// The rate a connection's token bucket is paced at: the congestion
+/// controller's rate, capped by the node's fair share when
+/// `total-bandwidth-limit` is set, and otherwise by the per-connection
+/// `bandwidth-limit`. A per-connection limit of 0 is treated as unset.
+///
+/// Used both when the bucket is created and on every rate update, so the
+/// configured limit holds for the life of the connection. Before #6047 the
+/// rate update ignored `bandwidth-limit`, which then only set the initial rate.
+pub(super) fn paced_rate(
+    cc_rate: usize,
+    global_rate: Option<usize>,
+    bandwidth_limit: Option<usize>,
+) -> usize {
+    match global_rate.or(bandwidth_limit.filter(|&limit| limit > 0)) {
+        Some(cap) => cc_rate.min(cap),
+        None => cc_rate,
+    }
 }
 
 impl<S, T: TimeSource> Drop for RemoteConnection<S, T> {
@@ -2117,27 +2139,24 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                     };
 
                     if should_update {
-                        let cc_rate = self.remote_conn.congestion_controller.current_rate(rtt) as u64;
+                        let cc_rate = self.remote_conn.congestion_controller.current_rate(rtt);
                         let cwnd = self.remote_conn.congestion_controller.current_cwnd();
                         let queuing_delay = self.remote_conn.congestion_controller.queuing_delay();
 
-                        // Apply global bandwidth limit if configured
-                        // Take minimum of congestion controller rate and global fair-share rate
-                        let (new_rate, global_limit) = if let Some(ref global) =
-                            self.remote_conn.global_bandwidth
-                        {
-                            let global_rate = global.current_per_connection_rate() as u64;
-                            (cc_rate.min(global_rate), Some(global_rate))
-                        } else {
-                            (cc_rate, None)
-                        };
+                        let global_limit = self
+                            .remote_conn
+                            .global_bandwidth
+                            .as_ref()
+                            .map(|global| global.current_per_connection_rate());
+                        let new_rate =
+                            paced_rate(cc_rate, global_limit, self.remote_conn.bandwidth_limit);
 
                         // Calculate time since last update for debugging RTT-adaptive timing
                         let since_last_update_ms = self.last_rate_update_nanos
                             .map(|last| Duration::from_nanos(now_nanos.saturating_sub(last)).as_millis())
                             .unwrap_or(0);
 
-                        self.remote_conn.token_bucket.set_rate(new_rate as usize);
+                        self.remote_conn.token_bucket.set_rate(new_rate);
                         self.last_rate_update_nanos = Some(now_nanos);
 
                         tracing::debug!(
@@ -5346,6 +5365,7 @@ mod tests {
             token_bucket,
             socket,
             global_bandwidth: None,
+            bandwidth_limit: None,
             rolling_rtt_stats,
             time_source,
         };
@@ -5476,6 +5496,7 @@ mod tests {
             token_bucket,
             socket,
             global_bandwidth: None,
+            bandwidth_limit: None,
             rolling_rtt_stats,
             time_source: time_source.clone(),
         };
@@ -5569,6 +5590,7 @@ mod tests {
             token_bucket,
             socket,
             global_bandwidth: None,
+            bandwidth_limit: None,
             rolling_rtt_stats,
             time_source,
         };
@@ -5687,6 +5709,7 @@ mod tests {
                 mpsc::channel::<(SocketAddr, Arc<[u8]>)>(16).0,
             )),
             global_bandwidth: None,
+            bandwidth_limit: None,
             rolling_rtt_stats: crate::transport::rolling_rtt_stats::RollingRttStatsHandle::new(
                 remote_addr,
                 time_source.clone(),
@@ -5869,6 +5892,7 @@ mod tests {
             token_bucket,
             socket,
             global_bandwidth: None,
+            bandwidth_limit: None,
             rolling_rtt_stats,
             time_source,
         };
@@ -5956,6 +5980,21 @@ mod tests {
         PeerConnection<TestSocket, crate::simulation::RealTime>,
         mpsc::Sender<InboundPacket>,
     ) {
+        test_conn_with_bandwidth_limit(remote_addr, None)
+    }
+
+    /// [`test_conn_for_outbound_stream_arm`] with a configured per-connection
+    /// `bandwidth-limit`. The token bucket starts at 10 MB/s, above both the
+    /// default FixedRate rate and any limit the tests use, so a rate below that
+    /// can only come from a rate update.
+    #[allow(clippy::type_complexity)]
+    fn test_conn_with_bandwidth_limit(
+        remote_addr: SocketAddr,
+        bandwidth_limit: Option<usize>,
+    ) -> (
+        PeerConnection<TestSocket, crate::simulation::RealTime>,
+        mpsc::Sender<InboundPacket>,
+    ) {
         use crate::simulation::RealTime;
         use crate::transport::crypto::TransportKeypair;
 
@@ -6001,10 +6040,100 @@ mod tests {
             token_bucket,
             socket,
             global_bandwidth: None,
+            bandwidth_limit,
             rolling_rtt_stats,
             time_source,
         });
         (conn, inbound_tx)
+    }
+
+    /// Runs `conn`'s real `recv()` loop until its token bucket's rate is
+    /// `expected` or `limit` passes, and returns the rate it ended at.
+    /// `rate_update_check` first fires after `ACK_CHECK_INTERVAL` (100 ms) on
+    /// this fixture; `limit` is a generous upper bound for a loaded machine, and
+    /// the wait ends as soon as the rate is reached.
+    async fn rate_after_updates(
+        conn: &mut PeerConnection<TestSocket, crate::simulation::RealTime>,
+        expected: usize,
+        limit: Duration,
+    ) -> usize {
+        let token_bucket = conn.remote_conn.token_bucket.clone();
+        let reached = async {
+            while token_bucket.rate() != expected {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::select! {
+            result = conn.recv() => panic!("recv() ended on an idle connection: {:?}", result.err()),
+            _ = reached => {}
+            _ = tokio::time::sleep(limit) => {}
+        }
+        token_bucket.rate()
+    }
+
+    /// Regression test for #6047: a configured `bandwidth-limit` must hold for
+    /// the life of the connection. Before the fix the first rate update replaced
+    /// it with the congestion controller's rate (1.25 MB/s for FixedRate), so the
+    /// flag only set the initial rate. Fails without the fix: the rate settles at
+    /// 1.25 MB/s, never at the limit.
+    #[tokio::test]
+    async fn rate_update_keeps_the_configured_bandwidth_limit() {
+        const LIMIT: usize = 200_000;
+        let fixed_rate = crate::transport::fixed_rate::DEFAULT_RATE_BYTES_PER_SEC;
+        assert!(LIMIT < fixed_rate, "test premise: the limit must bind");
+
+        let remote_addr = SocketAddr::new(Ipv4Addr::new(10, 99, 99, 60).into(), 50060);
+        let (mut conn, _inbound_tx) = test_conn_with_bandwidth_limit(remote_addr, Some(LIMIT));
+
+        let rate = rate_after_updates(&mut conn, LIMIT, Duration::from_secs(5)).await;
+        assert_eq!(
+            rate, LIMIT,
+            "the rate update must keep the configured per-connection limit (#6047)"
+        );
+    }
+
+    /// The other side of #6047: with no `bandwidth-limit`, a rate update still
+    /// paces at the congestion controller's rate, and a limit above that rate
+    /// does not raise it.
+    #[tokio::test]
+    async fn rate_update_uses_the_controller_rate_when_the_limit_does_not_bind() {
+        let fixed_rate = crate::transport::fixed_rate::DEFAULT_RATE_BYTES_PER_SEC;
+        for (port, limit) in [(50061, None), (50062, Some(fixed_rate * 4))] {
+            let remote_addr = SocketAddr::new(Ipv4Addr::new(10, 99, 99, 61).into(), port);
+            let (mut conn, _inbound_tx) = test_conn_with_bandwidth_limit(remote_addr, limit);
+
+            let rate = rate_after_updates(&mut conn, fixed_rate, Duration::from_secs(5)).await;
+            assert_eq!(
+                rate, fixed_rate,
+                "with bandwidth_limit = {limit:?}, the rate update must pace at the \
+                 congestion controller's rate"
+            );
+        }
+    }
+
+    /// `paced_rate` caps the controller's rate by the tighter configured limit:
+    /// the node's fair share when `total-bandwidth-limit` is set (the
+    /// per-connection limit is then ignored), otherwise `bandwidth-limit`. No
+    /// limit raises the rate, and a per-connection limit of 0 means unset.
+    #[test]
+    fn paced_rate_applies_the_configured_limit() {
+        const CC: usize = 1_250_000;
+        let cases = [
+            (None, None, CC),
+            (None, Some(200_000), 200_000),
+            (None, Some(10_000_000), CC),
+            (None, Some(0), CC),
+            (Some(500_000), None, 500_000),
+            (Some(500_000), Some(100_000), 500_000),
+            (Some(5_000_000), Some(100_000), CC),
+        ];
+        for (global_rate, bandwidth_limit, expected) in cases {
+            assert_eq!(
+                paced_rate(CC, global_rate, bandwidth_limit),
+                expected,
+                "paced_rate({CC}, {global_rate:?}, {bandwidth_limit:?})"
+            );
+        }
     }
 
     /// Serializes the #4827 `transfers_failed` tests. `TRANSPORT_METRICS` is a
@@ -6218,6 +6347,7 @@ mod tests {
             token_bucket,
             socket,
             global_bandwidth: None,
+            bandwidth_limit: None,
             rolling_rtt_stats,
             time_source: time_source.clone(),
         };
