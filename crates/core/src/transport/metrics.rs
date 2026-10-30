@@ -550,9 +550,10 @@ pub struct TransportMetrics {
     quic_endpoint_down: AtomicU64,
     /// QUIC endpoints whose socket adapter caught a panic, at most one per
     /// endpoint however often the fault repeats; each turns that endpoint
-    /// off, unless the node had already released it (reset each snapshot). A panic in a path's receive task is not
-    /// counted here (`receive_task_panicked`), and a panic in quinn's own
-    /// driver code is not caught at all.
+    /// off, unless the node had already released it (reset each snapshot).
+    /// A panic in a path's receive task is not counted here
+    /// (`receive_task_panicked`), and a panic in quinn's own driver code is
+    /// not caught at all.
     quic_adapter_panicked: AtomicU64,
     /// Times the QUIC crash-loop breaker tripped at startup (reset each
     /// snapshot; at most one per process).

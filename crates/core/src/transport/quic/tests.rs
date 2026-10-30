@@ -3283,6 +3283,7 @@ fn run_child(name: &str) -> (String, std::process::Output) {
         polls += 1;
         if polls > max_polls {
             child.kill().ok();
+            child.wait().ok();
             panic!(
                 "the child running {test} did not finish within {:?}",
                 2 * WATCHDOG
