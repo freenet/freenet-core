@@ -20561,6 +20561,15 @@ fn test_quic_prefer_forms_a_mesh_of_the_same_peers_as_quic_off() {
     ] {
         assert_eq!(prefer_delta(kind), 0, "QUIC prefer: {kind}");
     }
+    // A transport counts set / same / refused only on a key the bridge
+    // counted as sent, so the transport never takes more keys than were sent.
+    assert!(
+        prefer_delta("transport_key_set")
+            + prefer_delta("transport_key_same")
+            + prefer_delta("transport_key_refused")
+            <= prefer_delta("transport_key_sent"),
+        "QUIC prefer: keys taken without a send ({after_off:?} -> {after_prefer:?})"
+    );
     off.assert_probe("no_ingress");
     prefer.assert_probe("not_allowed");
     let (off_peers, off_connected) = quic_mesh_peers_and_connected(&off.mesh);

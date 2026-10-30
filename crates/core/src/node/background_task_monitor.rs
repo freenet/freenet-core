@@ -57,24 +57,41 @@ struct LateTasks {
     /// and starting to wait again is not missed.
     added: tokio::sync::Notify,
     /// Abort handles of every task registered, and whether the wait future
-    /// has been dropped (see [`AbortLateTasks`]). One lock, so a
-    /// registration is either aborted by the drop or aborted on arrival.
+    /// has resolved or been dropped (see [`AbortLateTasks`]). One lock, so
+    /// a registration is either aborted by the guard or aborted on arrival.
     aborts: Mutex<(bool, Vec<tokio::task::AbortHandle>)>,
 }
 
-/// Held by the future `wait_for_any_exit` returns. When that future is
-/// dropped (the node is stopping), aborts every task registered through a
-/// [`LateRegistrar`], and any registered later is aborted at once. Tasks
-/// registered before the wait stop on the ring's shutdown token; a late
-/// task (the QUIC accept loop) has no such token, and dropping its
-/// `JoinHandle` only detaches it.
+/// A monitor that is never waited on (in-memory simulation nodes) has no
+/// [`AbortLateTasks`]; its late tasks are aborted when the last monitor
+/// and registrar sharing them are dropped.
+impl Drop for LateTasks {
+    fn drop(&mut self) {
+        for abort in std::mem::take(&mut self.aborts.get_mut().1) {
+            abort.abort();
+        }
+    }
+}
+
+/// Held by the future `wait_for_any_exit` returns. When that future
+/// resolves (a watched task exited) or is dropped (the node is stopping),
+/// aborts every task registered through a [`LateRegistrar`], and any
+/// registered later is aborted at once. Either way the node is stopping:
+/// `run_node` ends on the first exit. A late task (the QUIC accept loop)
+/// has no shutdown token, and dropping its `JoinHandle` alone only
+/// detaches it. Tasks registered with
+/// [`BackgroundTaskMonitor::register`] are not aborted here; most stop on
+/// the ring's shutdown token.
 struct AbortLateTasks(Arc<LateTasks>);
 
 impl Drop for AbortLateTasks {
     fn drop(&mut self) {
-        let mut aborts = self.0.aborts.lock();
-        aborts.0 = true;
-        for abort in aborts.1.drain(..) {
+        let aborts = {
+            let mut aborts = self.0.aborts.lock();
+            aborts.0 = true;
+            std::mem::take(&mut aborts.1)
+        };
+        for abort in aborts {
             abort.abort();
         }
     }
@@ -91,10 +108,9 @@ impl Drop for AbortLateTasks {
 /// registered here; `BackgroundTaskMonitor::register` at that point would
 /// leave it unmonitored.
 ///
-/// A task registered after the wait future has resolved is not watched by
-/// anything; the node is stopping by then. Every task registered here is
-/// aborted when the wait future is dropped, or at once if it already has
-/// been.
+/// Every task registered here is aborted when the wait future resolves or
+/// is dropped, and one registered after that is aborted at once; the node
+/// is stopping by then.
 #[derive(Clone)]
 pub(crate) struct LateRegistrar {
     late: Arc<LateTasks>,
@@ -452,6 +468,65 @@ mod tests {
             "{msg}"
         );
     }
+    /// A monitor that is never waited on aborts its late tasks once it and
+    /// every registrar are dropped.
+    #[tokio::test]
+    async fn dropping_an_unwaited_monitor_aborts_late_tasks() {
+        let monitor = BackgroundTaskMonitor::new();
+        let registrar = monitor.late_registrar();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        registrar.register(
+            "parked",
+            tokio::spawn(async move {
+                let _tx = tx;
+                std::future::pending::<()>().await;
+            }),
+        );
+        drop(monitor);
+        tokio::task::yield_now().await;
+        let mut rx = rx;
+        assert!(
+            rx.try_recv()
+                .is_err_and(|e| e == tokio::sync::oneshot::error::TryRecvError::Empty),
+            "a live registrar keeps the task running"
+        );
+        drop(registrar);
+        tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .expect("the task is aborted once the monitor and registrar are gone")
+            .expect_err("the task never sends");
+    }
+
+    /// When the wait resolves because one task exited, the node stops, so
+    /// the other late tasks are aborted too.
+    #[tokio::test]
+    async fn the_wait_resolving_aborts_the_other_late_tasks() {
+        let monitor = BackgroundTaskMonitor::new();
+        let registrar = monitor.late_registrar();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        registrar.register(
+            "parked",
+            tokio::spawn(async move {
+                let _tx = tx;
+                std::future::pending::<()>().await;
+            }),
+        );
+        registrar.register(
+            "exits",
+            tokio::spawn(async {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }),
+        );
+        let err = tokio::time::timeout(Duration::from_secs(5), monitor.wait_for_any_exit())
+            .await
+            .expect("the exit resolves the wait");
+        assert!(err.to_string().contains("exits"), "{err}");
+        tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .expect("the parked task is aborted once the wait resolves")
+            .expect_err("the task never sends");
+    }
+
     /// Dropping the wait future (the node stopping) aborts the tasks
     /// registered through a late registrar, before or after the wait
     /// started, and a task registered after the drop is aborted at once.

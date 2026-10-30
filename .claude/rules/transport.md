@@ -1049,6 +1049,13 @@ no extra message, no exporter proof.
     transport holds another key and keeps it), which must stay at 0 (the
     simulation tripwire and test_quic_prefer_forms_a_mesh_of_the_same_peers_as_quic_off
     assert it).
+    A ring member's transport can still hold no key: a key not handed
+    over within the fallback is not re-sent, and a promotion that finds
+    the address already in the ring (AlreadyInRing) sends none. The
+    upgrade (e5a-5b) must treat a transport with no key as not eligible,
+    never as "any key". An inbound transport's key is the key the node
+    bound from the peer's claim, not one the transport authenticated; the
+    QUIC handshake is what checks it.
 Tests: conversion vs curve25519-dalek 5 (random keys, bit 255 set, u = -1),
 signer key == verifier key over many keypairs with both natural sign bits,
 signatures verified by ed25519-dalek and refused with any bit flipped,
@@ -1373,9 +1380,10 @@ Liveness ("alive" = the endpoint driver has not ENDED; it does not mean
     instead of returning, because the monitor treats any end of a task as
     a node failure, and drops its Sender first, so the consumer's recv()
     returns None once drained. The parked task is aborted when the node
-    stops: dropping the monitor's wait future aborts every task registered
-    through a LateRegistrar (a JoinHandle dropped alone only detaches its
-    task), and one registered after that is aborted at once. Attempts still queued each hold a quinn
+    stops: when the monitor's wait future resolves or is dropped, it aborts
+    every task registered through a LateRegistrar (a JoinHandle dropped
+    alone only detaches its task), and one registered after that is
+    aborted at once. Attempts still queued each hold a quinn
     Incoming, which holds the endpoint: they keep quinn's driver and the
     socket alive until drained or dropped. Call it once per endpoint (a
     second call warns and starts nothing). It hands attempts on with
