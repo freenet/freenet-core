@@ -1383,7 +1383,8 @@ Liveness ("alive" = the endpoint driver has not ENDED; it does not mean
     stops: when the monitor's wait future resolves or is dropped, it aborts
     every task registered through a LateRegistrar (a JoinHandle dropped
     alone only detaches its task), and one registered after that is
-    aborted at once. Attempts still queued each hold a quinn
+    aborted at once. A monitor never waited on (in-memory simulation
+    nodes) aborts them when it and its last registrar are dropped. Attempts still queued each hold a quinn
     Incoming, which holds the endpoint: they keep quinn's driver and the
     socket alive until drained or dropped. Call it once per endpoint (a
     second call warns and starts nothing). It hands attempts on with

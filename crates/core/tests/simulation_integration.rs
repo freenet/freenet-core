@@ -20562,7 +20562,9 @@ fn test_quic_prefer_forms_a_mesh_of_the_same_peers_as_quic_off() {
         assert_eq!(prefer_delta(kind), 0, "QUIC prefer: {kind}");
     }
     // A transport counts set / same / refused only on a key the bridge
-    // counted as sent, so the transport never takes more keys than were sent.
+    // counted as sent, so at quiescence the transport has taken no more keys
+    // than were sent (a live snapshot on a multi-thread runtime can briefly
+    // see a take before its send is counted).
     assert!(
         prefer_delta("transport_key_set")
             + prefer_delta("transport_key_same")
