@@ -15,6 +15,8 @@ use parking_lot::Mutex;
 
 use super::policy::QuicPathPermits;
 
+type Version = (u8, u8, u16);
+
 /// One thing a node's upgrades did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuicUpgradeRecord {
@@ -37,7 +39,8 @@ struct TraceData {
     wrong_record: Mutex<BTreeSet<SocketAddr>>,
     down_at: Mutex<BTreeMap<SocketAddr, Duration>>,
     permits: Mutex<BTreeMap<SocketAddr, QuicPathPermits>>,
-    release: Mutex<Option<((u8, u8, u16), (u8, u8, u16))>>,
+    /// The version a peer reports, and the release it then reads as.
+    release: Mutex<Option<(Version, Version)>>,
 }
 
 /// A network's upgrade records. Clones share them.
@@ -97,7 +100,7 @@ impl QuicUpgradeTrace {
     /// tree carries the negotiation and reports the last release, which is below
     /// the floor until the release bump. A peer advertising an older version is
     /// not affected.
-    pub fn run_as_release(&self, real: (u8, u8, u16), release: (u8, u8, u16)) {
+    pub fn run_as_release(&self, real: Version, release: Version) {
         *self.data.release.lock() = Some((real, release));
     }
 
@@ -142,7 +145,7 @@ impl NodeTrace {
     }
 
     /// The version the machine reads for a peer that reports `reported`.
-    pub(crate) fn peer_version(&self, reported: Option<(u8, u8, u16)>) -> Option<(u8, u8, u16)> {
+    pub(crate) fn peer_version(&self, reported: Option<Version>) -> Option<Version> {
         match *self.trace.data.release.lock() {
             Some((real, release)) if reported == Some(real) => Some(release),
             Some(_) | None => reported,
