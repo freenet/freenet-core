@@ -4101,6 +4101,14 @@ fn an_aborting_build_refuses_the_endpoint() {
 /// nothing reaches the socket.
 #[test]
 fn the_adapter_refuses_sends_after_a_panic_without_running() {
+    // In a child: it records global metrics and logs at ERROR.
+    in_child(
+        "the_adapter_refuses_sends_after_a_panic_without_running",
+        adapter_refuses_sends_after_a_panic,
+    );
+}
+
+fn adapter_refuses_sends_after_a_panic() {
     use quinn::AsyncUdpSocket;
     use std::task::{Context, Poll};
     let local: SocketAddr = "10.201.49.1:5000".parse().unwrap();
@@ -4191,7 +4199,14 @@ fn an_adapter_panic_after_release_closes_its_connections() {
                 })
                 .await
                 .expect_err("the connection was closed");
+                // This connection's driver was healthy, so quinn ends it with
+                // INTERNAL_ERROR when the endpoint driver (woken by the panic) is
+                // dropped; that is what this run shows, before its watcher gets to it.
                 assert!(ended_by_endpoint_down(&error), "{error:?}");
+                // The panicking connection's driver ended with the error and nothing
+                // else can close it (the path holds a handle, so quinn's implicit close
+                // does not run): only the watcher can, so LocallyClosed here is the
+                // watcher's close, and without it the send above waits forever.
                 assert_eq!(
                     first.close_reason(),
                     Some(quinn::ConnectionError::LocallyClosed)
@@ -4205,4 +4220,58 @@ fn an_adapter_panic_after_release_closes_its_connections() {
             });
         },
     );
+}
+
+/// The other side of `an_adapter_panic_after_release_closes_its_connections`:
+/// a release with NO adapter panic closes nothing. The node may keep using
+/// connections after dropping its endpoint handle, so 30 s on (virtual
+/// time), with keepalive and timers running, the connection is open on both
+/// sides, still carries a stream, and no close was counted. A panic on a
+/// different endpoint does not reach it either.
+#[test]
+fn a_release_without_a_panic_closes_nothing() {
+    bounded(|| async move {
+        use crate::transport::metrics::TRANSPORT_METRICS;
+        let _seed = GlobalRng::seed_guard(SEED);
+        let pair = pair(
+            "quic-release-no-panic",
+            "10.201.51.1:5000".parse().unwrap(),
+            "10.201.51.2:5000".parse().unwrap(),
+            None,
+        )
+        .await;
+        let elsewhere = super::liveness::EndpointHealth::new("10.201.51.3:5000".parse().unwrap());
+        let (_, client, server) = pair.transfer(payload(100), Duration::from_secs(60)).await;
+        pair.a.owner.health.release();
+        assert_eq!(pair.a.availability().get(), QuicAvailability::Released);
+        elsewhere.adapter_panicked("test", &"another endpoint");
+
+        let time = pair.time.clone();
+        drive(&pair.time, Duration::from_secs(60), async move {
+            time.sleep(Duration::from_secs(30)).await;
+        })
+        .await;
+        assert!(client.inner().close_reason().is_none());
+        assert!(server.inner().close_reason().is_none());
+
+        let (c, s) = (client.inner().clone(), server.inner().clone());
+        let received = drive(&pair.time, Duration::from_secs(10), async move {
+            let mut send = c.open_uni().await.expect("open a stream after the release");
+            let (_, received) = tokio::join!(
+                async {
+                    send.write_all(b"still here").await.expect("write");
+                    send.finish().expect("finish");
+                },
+                async {
+                    let mut recv = s.accept_uni().await.expect("accept the stream");
+                    recv.read_to_end(1024).await.expect("read")
+                }
+            );
+            received
+        })
+        .await;
+        assert_eq!(received, b"still here");
+        assert!(TRANSPORT_METRICS.quic_close_sent_to(pair.b_addr).is_empty());
+        drop((client, server));
+    });
 }

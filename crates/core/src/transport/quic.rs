@@ -458,8 +458,9 @@ impl QuicEndpoint {
         )
     }
 
-    /// [`Self::bind`], or `None` with a WARN when it fails, so a node with
-    /// QUIC on still starts, with QUIC off.
+    /// Build the endpoint as [`Self::bind`] describes, for this build
+    /// ([`UNWINDS`], through [`Self::bind_checked`]), or `None` with a WARN
+    /// when it fails, so a node with QUIC on still starts, with QUIC off.
     pub(crate) fn bind_or_warn<S: Socket, T: TimeSource>(
         socket: Arc<DemuxSocket<S>>,
         local_addr: SocketAddr,
@@ -991,7 +992,9 @@ impl QuicConnection {
                 if availability.not_up().await != QuicAvailability::Down
                     && adapter_panic.wait_for(|panicked| *panicked).await.is_err()
                 {
-                    // The health is gone, so no panic can be reported.
+                    // Unreachable while this task runs: `down_closer` holds
+                    // the health, whose sender therefore outlives this
+                    // receiver. Kept as a safe fallback (never close).
                     std::future::pending::<()>().await;
                 }
             };

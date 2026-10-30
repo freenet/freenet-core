@@ -127,7 +127,11 @@ rustls = { version = "0.23", default-features = false, features = ["std"] }
 # Pinned exactly: the panic containment in transport/quic relies on quinn
 # 0.11.12 internals (driver poll order, which destructors lock, respond()
 # sending without poll_writable). See .claude/rules/transport.md (PANICS)
-# and re-check those before bumping.
+# and re-check those before bumping. This freezes quinn only: quinn-proto and
+# quinn-udp still float, which is intended, as the internals relied on live
+# in quinn itself. It also stops `cargo update` (and automated bumps) from
+# taking quinn patch releases, security fixes included, so taking one is a
+# deliberate step: bump this pin and re-check the transport.md items.
 quinn = { version = "=0.11.12", default-features = false, features = ["rustls-ring"] }
 # quinn's protocol crate, already in the graph under quinn. Named directly only
 # for `InvalidCid`, which quinn does not re-export and a connection-ID
