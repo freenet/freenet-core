@@ -4211,16 +4211,6 @@ impl Ring {
         }
     }
 
-    pub fn update_connection_identity(&self, old_peer: &PeerId, new_peer: PeerId) {
-        if self.connection_manager.update_peer_identity(
-            old_peer.socket_addr(),
-            new_peer.socket_addr(),
-            new_peer.pub_key().clone(),
-        ) {
-            self.refresh_density_request_cache();
-        }
-    }
-
     fn refresh_density_request_cache(&self) {
         let cbl = self.connection_manager.get_connections_by_location();
         let topology_manager = &mut self.connection_manager.topology_manager.write();

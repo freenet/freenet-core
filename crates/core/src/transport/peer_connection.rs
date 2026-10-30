@@ -446,7 +446,7 @@ const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
 /// mapping refreshed comfortably under common UDP NAT idle timeouts (often
 /// 30 s). It was 60 s until #5795; the ack-only NoOp chatter that #5795
 /// removed used to mask that, so it must not be raised again.
-const MAX_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+pub(crate) const MAX_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
 /// Returns the keepalive interval for the given number of unanswered pings.
 ///
@@ -539,8 +539,8 @@ enum ReceiptPolicy {
     /// a retransmission, i.e. our receipt was lost, so ack it again.
     Ack { reack_duplicate: bool },
     /// Ack it (every time it arrives) but do NOT record its id for dedup.
-    /// For connection acks, whose id 0 is shared with the remote's first data
-    /// packet.
+    /// For connection acks, whose id 0 an older remote also gives its first
+    /// data packet.
     AckWithoutDedup,
 }
 
@@ -558,12 +558,14 @@ enum ReceiptPolicy {
 /// - `Upgrade`: like `ShortMessage`. Its sender tracks it for retransmission,
 ///   so it is acked, recorded for dedup (a retransmitted offer is not
 ///   processed twice) and re-acked on duplicate.
-/// - `AckConnection*`: acked WITHOUT dedup recording. The handshake's
-///   completion ack is TRACKED by its sender (`report_sent_packet` at
-///   `FIRST_PACKET_ID` in `connection_handler.rs`) and retransmitted until a
-///   receipt for id 0 arrives, so it must be acked. But id 0 is also the id of
-///   the remote's first data packet, so recording it for dedup would make that
-///   packet look like a duplicate and drop it. Replying to a connection ack is
+/// - `AckConnection*`: acked WITHOUT dedup recording. A gateway on an
+///   earlier release TRACKS its success ack at `FIRST_PACKET_ID` on the
+///   connection and retransmits it until a receipt for id 0 arrives, so it
+///   must be acked. Such a remote also gives its first data packet id 0, so
+///   recording the ack for dedup would make that packet look like a duplicate
+///   and drop it. (This release tracks no handshake ack on a connection and
+///   starts data at `FIRST_DATA_PACKET_ID`, 1, so the receipts this sends for
+///   id 0 cannot be credited to its own data.) Replying to a connection ack is
 ///   separately limited to once per connection (`answered_connection_ack`).
 fn receipt_policy(payload: &SymmetricMessagePayload, ack_remote_noops: bool) -> ReceiptPolicy {
     match payload {
@@ -886,6 +888,16 @@ fn sweep_streaming_handles_inner(
 
 #[allow(private_bounds)]
 impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
+    /// A [`super::ReceiptStamp`] for this connection: when it last received
+    /// an authenticated packet, on this connection's clock.
+    pub(crate) fn receipt_stamp_handle(&self) -> super::ReceiptStamp {
+        let time_source = self.remote_conn.time_source.clone();
+        super::ReceiptStamp::new(
+            self.last_inbound_nanos.clone(),
+            std::sync::Arc::new(move || time_source.now_nanos()),
+        )
+    }
+
     pub(super) fn new(remote_conn: RemoteConnection<S, T>) -> Self {
         // Start the keep-alive task before creating Self
         let remote_addr = remote_conn.remote_addr;
@@ -2745,8 +2757,9 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                 // the dedup window stopped that by accident (every connection
                 // ack has id 0, so the second one was dropped as a duplicate);
                 // connection acks are no longer recorded for dedup, so the
-                // limit is explicit. The remote's tracked handshake ack is
-                // still acked by receipt on every arrival (`receipt_policy`).
+                // limit is explicit. An earlier-release remote's tracked
+                // handshake ack is still acked by receipt on every arrival
+                // (`receipt_policy`).
                 if self.answered_connection_ack {
                     return Ok(None);
                 }
@@ -3496,6 +3509,15 @@ impl<S: super::Socket> super::PeerConnectionApi for PeerConnection<S> {
 
     fn close_reason(&self) -> Option<super::CloseReason> {
         close_reason_from_flags(self.closed_by_idle_timeout, self.closed_by_stream_refusals)
+    }
+
+    // The stamp is advanced only by authenticated packets on this UDP
+    // session. TODO(#5940, QUIC upgrade): once a connection's traffic moves
+    // to QUIC, packets received there must advance this stamp too, or a live
+    // upgraded connection looks quiet and loses its key to a newer claim
+    // (`node::network_bridge::p2p_protoc::identity::HOLD_WINDOW`).
+    fn receipt_stamp(&self) -> Option<super::ReceiptStamp> {
+        Some(self.receipt_stamp_handle())
     }
 
     fn send_bytes(
@@ -5313,7 +5335,7 @@ mod tests {
             outbound_symmetric_key: cipher.clone(),
             remote_addr,
             sent_tracker,
-            last_packet_id: Arc::new(AtomicU32::new(0)),
+            last_packet_id: crate::transport::connection_handler::data_packet_ids(),
             inbound_packet_recv: inbound_rx,
             inbound_symmetric_key: cipher.clone(),
             inbound_symmetric_key_bytes: key,
@@ -5443,7 +5465,7 @@ mod tests {
             outbound_symmetric_key: cipher.clone(),
             remote_addr,
             sent_tracker,
-            last_packet_id: Arc::new(AtomicU32::new(0)),
+            last_packet_id: crate::transport::connection_handler::data_packet_ids(),
             inbound_packet_recv: inbound_rx,
             inbound_symmetric_key: cipher,
             inbound_symmetric_key_bytes: key,
@@ -5536,7 +5558,7 @@ mod tests {
             outbound_symmetric_key: cipher.clone(),
             remote_addr,
             sent_tracker,
-            last_packet_id: Arc::new(AtomicU32::new(0)),
+            last_packet_id: crate::transport::connection_handler::data_packet_ids(),
             inbound_packet_recv: inbound_rx,
             inbound_symmetric_key: cipher.clone(),
             inbound_symmetric_key_bytes: key,
@@ -5616,6 +5638,134 @@ mod tests {
         );
 
         // Cleanup so the singleton doesn't leak our address into other tests.
+        crate::transport::TRANSPORT_METRICS.remove_peer(remote_addr);
+    }
+
+    /// The receipt stamp the bridge reads (`receipt_stamp`) advances only on
+    /// a packet that authenticates: a packet that fails decryption leaves it
+    /// where it was, and an authenticated one moves it to now.
+    // Two worker threads: `recv` runs in its own task, and while it has
+    // nothing to return it does not yield to the runtime (measured: on a
+    // `current_thread` runtime the test's own task never runs again).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn receipt_stamp_advances_only_on_an_authenticated_packet() {
+        use crate::transport::crypto::TransportKeypair;
+        use crate::transport::packet_data::PacketData;
+        use crate::transport::symmetric_message::SymmetricMessagePayload;
+        use crate::util::time_source::SharedMockTimeSource;
+        use bytes::Bytes;
+
+        let time_source = SharedMockTimeSource::new();
+        let (inbound_tx, inbound_rx) = mpsc::channel(16);
+        let remote_addr = SocketAddr::new(Ipv4Addr::new(10, 99, 99, 2).into(), 50002);
+        let mut key = [0u8; 16];
+        crate::config::GlobalRng::fill_bytes(&mut key);
+        let cipher = Aes128Gcm::new(&key.into());
+        let keypair = TransportKeypair::new();
+        let remote_conn = RemoteConnection {
+            outbound_symmetric_key: cipher.clone(),
+            remote_addr,
+            sent_tracker: Arc::new(parking_lot::Mutex::new(
+                SentPacketTracker::new_with_time_source(time_source.clone()),
+            )),
+            last_packet_id: Arc::new(AtomicU32::new(0)),
+            inbound_packet_recv: inbound_rx,
+            inbound_symmetric_key: cipher.clone(),
+            inbound_symmetric_key_bytes: key,
+            my_address: None,
+            remote_protoc_version: None,
+            transport_secret_key: keypair.secret,
+            congestion_controller:
+                crate::transport::congestion_control::CongestionControlConfig::default()
+                    .build_arc_with_time_source(time_source.clone()),
+            token_bucket: Arc::new(TokenBucket::new_with_time_source(
+                10_000,
+                10_000_000,
+                time_source.clone(),
+            )),
+            socket: Arc::new(TestSocket::new(
+                mpsc::channel::<(SocketAddr, Arc<[u8]>)>(16).0,
+            )),
+            global_bandwidth: None,
+            rolling_rtt_stats: crate::transport::rolling_rtt_stats::RollingRttStatsHandle::new(
+                remote_addr,
+                time_source.clone(),
+            ),
+            time_source: time_source.clone(),
+        };
+        let mut conn = PeerConnection::new(remote_conn);
+        let stamp = conn.receipt_stamp_handle();
+        assert_eq!(stamp.since_last_receipt(), Duration::ZERO);
+
+        // A packet under another key does not authenticate.
+        time_source.advance_time(Duration::from_secs(10));
+        let mut other_key = [0u8; 16];
+        crate::config::GlobalRng::fill_bytes(&mut other_key);
+        let other_cipher = Aes128Gcm::new(&other_key.into());
+        let undecryptable = SymmetricMessage::serialize_msg_to_packet_data(
+            1,
+            SymmetricMessagePayload::ShortMessage {
+                payload: Bytes::from_static(b"not under the session key"),
+            },
+            &other_cipher,
+            vec![],
+        )
+        .expect("encrypt");
+        inbound_tx
+            .send(InboundPacket::unstamped(PacketData::<
+                crate::transport::packet_data::UnknownEncryption,
+            >::from_buf(
+                undecryptable.data()
+            )))
+            .await
+            .expect("send");
+        let receiver = tokio::spawn(async move { conn.recv().await.map(|_| ()) });
+        // The channel is back to full capacity once `recv` has taken the
+        // packet off it; it then fails to decrypt it, drops it and waits for
+        // the next one, so it has not returned.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while inbound_tx.capacity() < inbound_tx.max_capacity() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("recv takes the packet off the channel");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !receiver.is_finished(),
+            "premise: the packet was not accepted"
+        );
+        assert_eq!(
+            stamp.since_last_receipt(),
+            Duration::from_secs(10),
+            "a packet that does not authenticate must not advance the stamp"
+        );
+
+        // An authenticated packet moves it to now.
+        time_source.advance_time(Duration::from_secs(5));
+        let genuine = SymmetricMessage::serialize_msg_to_packet_data(
+            2,
+            SymmetricMessagePayload::ShortMessage {
+                payload: Bytes::from_static(b"under the session key"),
+            },
+            &cipher,
+            vec![],
+        )
+        .expect("encrypt");
+        inbound_tx
+            .send(InboundPacket::unstamped(PacketData::<
+                crate::transport::packet_data::UnknownEncryption,
+            >::from_buf(
+                genuine.data()
+            )))
+            .await
+            .expect("send");
+        tokio::time::timeout(Duration::from_secs(10), receiver)
+            .await
+            .expect("recv returns on the authenticated packet")
+            .expect("recv task")
+            .expect("recv");
+        assert_eq!(stamp.since_last_receipt(), Duration::ZERO);
         crate::transport::TRANSPORT_METRICS.remove_peer(remote_addr);
     }
 
@@ -5708,7 +5858,7 @@ mod tests {
             outbound_symmetric_key: cipher.clone(),
             remote_addr,
             sent_tracker,
-            last_packet_id: Arc::new(AtomicU32::new(0)),
+            last_packet_id: crate::transport::connection_handler::data_packet_ids(),
             inbound_packet_recv: inbound_rx,
             inbound_symmetric_key: cipher,
             inbound_symmetric_key_bytes: key,
@@ -5840,7 +5990,7 @@ mod tests {
             outbound_symmetric_key: cipher.clone(),
             remote_addr,
             sent_tracker,
-            last_packet_id: Arc::new(AtomicU32::new(0)),
+            last_packet_id: crate::transport::connection_handler::data_packet_ids(),
             inbound_packet_recv: inbound_rx,
             inbound_symmetric_key: cipher,
             inbound_symmetric_key_bytes: key,
@@ -6057,7 +6207,7 @@ mod tests {
             outbound_symmetric_key: cipher.clone(),
             remote_addr,
             sent_tracker,
-            last_packet_id: Arc::new(AtomicU32::new(0)),
+            last_packet_id: crate::transport::connection_handler::data_packet_ids(),
             inbound_packet_recv: inbound_rx,
             inbound_symmetric_key: cipher.clone(),
             inbound_symmetric_key_bytes: key,

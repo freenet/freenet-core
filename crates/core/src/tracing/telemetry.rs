@@ -3036,6 +3036,14 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 serde_json::json!(snapshot.quic_endpoint_down),
             );
             m.insert(
+                "quic_breaker_trips".into(),
+                serde_json::json!(snapshot.quic_breaker_trips),
+            );
+            m.insert(
+                "quic_breaker_suppressed".into(),
+                serde_json::json!(snapshot.quic_breaker_suppressed),
+            );
+            m.insert(
                 "quic_close_sent_node_dropped_peer".into(),
                 serde_json::json!(snapshot.quic_close_sent_node_dropped_peer),
             );
@@ -7694,7 +7702,11 @@ mod tests {
             conn_identity_set_connect_peer: 67,
             conn_identity_same_connect_peer: 68,
             conn_identity_changed_connect_peer: 69,
-            conn_identity_changed_ring_promotion: 70,
+            conn_identity_changed_ring_promotion: 196,
+            conn_identity_claim_held: 70,
+            conn_identity_pending_claim_bound: 199,
+            conn_identity_quiet_holder_replaced: 198,
+            conn_identity_claim_held_long: 197,
             conn_identity_own_key: 71,
             conn_identity_duplicate_key: 72,
             conn_identity_teardown_key_elsewhere: 73,
@@ -7717,7 +7729,11 @@ mod tests {
             ("conn_identity_set_connect_peer", 67),
             ("conn_identity_same_connect_peer", 68),
             ("conn_identity_changed_connect_peer", 69),
-            ("conn_identity_changed_ring_promotion", 70),
+            ("conn_identity_changed_ring_promotion", 196),
+            ("conn_identity_claim_held", 70),
+            ("conn_identity_pending_claim_bound", 199),
+            ("conn_identity_quiet_holder_replaced", 198),
+            ("conn_identity_claim_held_long", 197),
             ("conn_identity_own_key", 71),
             ("conn_identity_duplicate_key", 72),
             ("conn_identity_teardown_key_elsewhere", 73),
@@ -7740,6 +7756,8 @@ mod tests {
             quic_close_sent_identity_mismatch: 4,
             quic_close_sent_send_abort_limit: 5,
             quic_close_sent_peer_not_acknowledging: 6,
+            quic_breaker_trips: 7,
+            quic_breaker_suppressed: true,
             ..Default::default()
         };
         let reference = serde_json::to_value(&snapshot).unwrap();
@@ -7753,10 +7771,16 @@ mod tests {
             ("quic_close_sent_identity_mismatch", 4),
             ("quic_close_sent_send_abort_limit", 5),
             ("quic_close_sent_peer_not_acknowledging", 6),
+            ("quic_breaker_trips", 7),
         ] {
             assert_eq!(json[key], expected, "event-log value for {key}");
             assert_eq!(json[key], reference[key], "serde value for {key}");
         }
+        assert_eq!(json["quic_breaker_suppressed"], true);
+        assert_eq!(
+            json["quic_breaker_suppressed"],
+            reference["quic_breaker_suppressed"]
+        );
     }
 
     /// Each connection identity key is in the event-log JSON exactly when its

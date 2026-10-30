@@ -487,6 +487,43 @@ pub(crate) trait InboundStreamRegistry: Send + Sync {
     );
 }
 
+/// When a connection last received an authenticated packet, readable from
+/// outside the task that owns the connection. Cheap to clone; every clone
+/// reads the same stamp.
+#[derive(Clone)]
+pub(crate) struct ReceiptStamp {
+    last_nanos: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    now_nanos: std::sync::Arc<dyn Fn() -> u64 + Send + Sync>,
+}
+
+impl ReceiptStamp {
+    /// `last_nanos` is the time of the last authenticated receipt and
+    /// `now_nanos` reads the clock it was stamped with.
+    pub(crate) fn new(
+        last_nanos: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        now_nanos: std::sync::Arc<dyn Fn() -> u64 + Send + Sync>,
+    ) -> Self {
+        Self {
+            last_nanos,
+            now_nanos,
+        }
+    }
+
+    /// Time since the connection last received an authenticated packet.
+    pub(crate) fn since_last_receipt(&self) -> std::time::Duration {
+        let last = self.last_nanos.load(std::sync::atomic::Ordering::Acquire);
+        std::time::Duration::from_nanos((self.now_nanos)().saturating_sub(last))
+    }
+}
+
+impl std::fmt::Debug for ReceiptStamp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReceiptStamp")
+            .field("since_last_receipt", &self.since_last_receipt())
+            .finish()
+    }
+}
+
 /// Type-erased interface for peer connections.
 ///
 /// This trait provides the minimal interface needed by `peer_connection_listener`
@@ -503,6 +540,13 @@ pub(crate) trait PeerConnectionApi: Send {
     /// path whose `AckConnection` carries no version). Callers must treat
     /// `None` as "unsupported" when gating version-dependent message types.
     fn remote_version(&self) -> Option<(u8, u8, u16)>;
+
+    /// When this connection last received an authenticated packet (any
+    /// packet that decrypted under the session key, keepalives included).
+    /// `None` when the connection does not track it, as for test doubles.
+    fn receipt_stamp(&self) -> Option<ReceiptStamp> {
+        None
+    }
 
     /// Why `recv` ended this connection, when the transport knows. Read
     /// after `recv` returns an error, to label the disconnect in telemetry.

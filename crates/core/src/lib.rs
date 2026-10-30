@@ -31,6 +31,12 @@ pub use node::{
     enable_abort_on_redb_poison, enable_fast_crash_exit_code, listener_exit_is_graceful,
     run_local_node, run_network_node,
 };
+pub use transport::quic::breaker::{
+    STOP_NOTE_ENV_VAR as QUIC_BREAKER_STOP_NOTE_ENV_VAR,
+    STOP_NOTE_FILE as QUIC_BREAKER_STOP_NOTE_FILE, enable_quic_crash_breaker,
+    quic_breaker_clean_exit, quic_breaker_signals_ready,
+    record_deliberate_stop as record_quic_breaker_deliberate_stop,
+};
 
 /// Network operation/transaction state machines.
 mod operations;
@@ -141,6 +147,11 @@ pub mod dev_tool {
     // benefit-test cleanup guard). No-op in production builds (compiled out).
     #[cfg(any(test, feature = "testing"))]
     pub use ring::{set_nn_lattice_enabled, set_nn_lattice_force_active};
+
+    // Test hook: connection identity decisions since process start, by kind
+    // (labels as in the `conn_identity_*` telemetry). Never reset.
+    #[cfg(any(test, feature = "testing"))]
+    pub use crate::transport::conn_identity_totals;
 
     // Test-only findability measurement harness (NOT for ship): scatter/cache
     // disable hook (guarantees a single copy) + per-op terminus tracing (rank /

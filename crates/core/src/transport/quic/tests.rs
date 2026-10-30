@@ -1764,8 +1764,8 @@ fn windows_never_exceed_the_reassembly_allowance() {
     }
 }
 
-/// `transport-quic` values: unset and `off` are off, `prefer` (any case)
-/// is prefer, and anything else is off, never an error, so a value a later
+/// `transport-quic` values: unset and `off` are off, `shadow` and `prefer`
+/// (any case) are themselves, and anything else is off, never an error, so a value a later
 /// release adds cannot stop this binary from starting.
 #[test]
 fn transport_quic_values_and_unknown_ones() {
@@ -1778,6 +1778,14 @@ fn transport_quic_values_and_unknown_ones() {
     assert_eq!(
         QuicMode::from_config_value(Some(" PREFER ")),
         QuicMode::Prefer
+    );
+    assert_eq!(
+        QuicMode::from_config_value(Some("shadow")),
+        QuicMode::Shadow
+    );
+    assert_eq!(
+        QuicMode::from_config_value(Some(" Shadow ")),
+        QuicMode::Shadow
     );
     assert_eq!(QuicMode::from_config_value(Some("force")), QuicMode::Off);
     assert_eq!(QuicMode::from_config_value(Some("")), QuicMode::Off);

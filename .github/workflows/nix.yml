@@ -13,7 +13,8 @@ name: Nix
 # reviews that PR, since a red run here is the only evidence the bump broke the
 # build. If it is ever promoted to required, add its context to
 # REQUIRED_CONTEXTS in .github/scripts/check_required_check_path_filters.py in
-# the same change.
+# the same change. It has two jobs, so two contexts: `Nix flake build` and
+# `NixOS module VM test`.
 #
 # Nix is a SUPPORTED DEPLOYMENT PATH (docs/nix.md), not a developer convenience,
 # which is why this exists at all rather than leaving the flake to rot.
@@ -126,19 +127,43 @@ jobs:
           fi
           echo "SOURCE_DATE_EPOCH is unset in the devShell"
 
-      # Boots NixOS VMs running `services.freenet-node` (nix/module-test.nix):
-      # the plain default, extraArgs escaping, and an isolated gateway that
-      # stays up for the process, restart and state-directory checks.
-      # Reuses the freenet build above. Last, so a VM failure cannot hide the
-      # devShell checks before it. Fails rather than skips without KVM:
-      # a skipped VM test would read as a passing one.
-      - name: NixOS module VM test
+  # Boots NixOS VMs running `services.freenet-node` (nix/module-test.nix): the
+  # plain default, extraArgs escaping, and an isolated gateway that stays up for
+  # the process, restart and state-directory checks.
+  #
+  # A separate job because it needs KVM, and ubicloud-standard-8 runners do not
+  # reliably expose /dev/kvm (#6024: the same commit passed or failed depending
+  # on which runner it landed on). GitHub-hosted x86_64 Linux runners have had
+  # /dev/kvm (root-only) since 2024; GitHub does not promise it per image, so the
+  # image is pinned and the job still FAILS when KVM is missing rather than
+  # skipping, because a skipped VM test would read as a passing one. It shares
+  # no store with the job above, so it builds freenet itself (a second cold
+  # build on every run of this workflow).
+  nixos-vm-test:
+    name: NixOS module VM test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      # First, so a runner without KVM fails before any expensive work.
+      # install-nix-action also opens up /dev/kvm, but only reports, and does
+      # not fail, when it is missing.
+      - name: Require KVM
         run: |
-          # Hosted runners often ship /dev/kvm root-only; nix only enables
-          # its `kvm` system feature when the build user can open it.
+          # /dev/kvm is root-only on hosted runners; nix only uses it when the
+          # build user can open it.
           if [ -e /dev/kvm ]; then sudo chmod a+rw /dev/kvm; fi
           if [ ! -w /dev/kvm ]; then
               echo "::error::/dev/kvm is not available on this runner, so the NixOS VM test cannot run"
               exit 1
           fi
-          nix build .#checks.x86_64-linux.nixos-module -L
+
+      - uses: actions/checkout@v7
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: NixOS module VM test
+        run: nix build .#checks.x86_64-linux.nixos-module -L

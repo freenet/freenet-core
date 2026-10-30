@@ -1215,8 +1215,8 @@ pub(crate) enum GetExhaustionReason {
     /// `k_closest_potentially_hosting` sources candidates only from
     /// `ConnectionManager::get_connections_by_location`, and every production
     /// write to `connections_by_location` stores a `PeerAddr::Known` —
-    /// `add_connection` and `update_peer_identity` both take a `SocketAddr`,
-    /// and `prune_connection` only removes. The getter hands back a clone, so
+    /// `add_connection` takes a `SocketAddr`, and `prune_connection` only
+    /// removes. The getter hands back a clone, so
     /// no caller can mutate a stored entry back to `PeerAddr::Unknown`
     /// either. `socket_addr()` is therefore always `Some`, which makes
     /// `k_closest_potentially_hosting`'s addressless branch — and this

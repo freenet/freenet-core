@@ -211,7 +211,8 @@ State lives in `/var/lib/freenet` (mode 0700, since the config directory holds
 the node's keys), which is also the `freenet` user's home. The default package
 is the flake's own, built with the pinned toolchain, not `pkgs.freenet-node`
 from the overlay. `nix build .#checks.x86_64-linux.nixos-module` boots a VM
-running the module (`nix/module-test.nix`).
+running the module (`nix/module-test.nix`). It needs KVM (`/dev/kvm` writable
+by the build user).
 
 ## Running it under systemd on NixOS
 
@@ -397,9 +398,12 @@ via `rust-overlay`, not from nixpkgs, so `cargo fmt` and
 
 ## CI
 
-`.github/workflows/nix.yml` builds both outputs and checks the devShell. It is
-path-filtered to the nix files and is **not a required check** — see the note in
-the workflow for why, and for who is expected to watch it.
+`.github/workflows/nix.yml` builds both outputs and checks the devShell. The
+NixOS module VM test runs in a separate job on a GitHub-hosted runner, because
+it needs KVM and the ubicloud runners do not reliably provide it (#6024). The
+workflow is path-filtered to the nix files and neither job is a **required
+check**; the note at the top of the workflow says why, and who is expected to
+watch it.
 
 `scripts/nix-node-wrapper_test.sh` drives `nix/freenet-node.sh` against a fake
 `freenet` and asserts, by execution:

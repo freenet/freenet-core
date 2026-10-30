@@ -29,11 +29,15 @@
 //!   codes (connection close, stream stop and reset), one range each.
 //! - [`liveness`]: whether the endpoint is alive ([`QuicAvailability`]);
 //!   endpoint death turns QUIC off for the node and never stops it.
+//! - [`upgrade`]: upgrading a UDP session to QUIC. So far only the policy
+//!   ([`upgrade::policy`]): whether the node may upgrade at all, and how
+//!   many paths it may hold.
 //!
 //! [`DemuxSocket`]: super::DemuxSocket
 //! [`TransportPublicKey`]: super::TransportPublicKey
 //! [`TimeSource`]: crate::simulation::TimeSource
 
+pub(crate) mod breaker;
 pub(crate) mod cid;
 pub(crate) mod config;
 pub(crate) mod error;
@@ -44,6 +48,7 @@ pub(crate) mod path;
 pub(crate) mod recycle;
 pub(crate) mod runtime;
 pub(crate) mod socket;
+pub(crate) mod upgrade;
 
 #[cfg(test)]
 mod memory_tests;
@@ -76,26 +81,39 @@ pub(crate) use liveness::QuicAvailability;
 pub(crate) use liveness::QuicAvailabilityWatch;
 
 /// Whether the node may use QUIC: the `transport-quic` config key.
+///
+/// Off is the default on every platform, and must stay the default on
+/// Windows until the crash-loop breaker works there (#6031): the breaker is
+/// unix-only ([`breaker`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum QuicMode {
     /// No QUIC endpoint is built and no QUIC datagram is read. The default.
     #[default]
     Off,
-    /// The node builds a QUIC endpoint on its UDP port. In this release
-    /// nothing in the node asks it to accept or open a connection. It still
-    /// differs from `Off`
-    /// in three ways: the demux socket has a QUIC ingress, so a QUIC-class
-    /// datagram is counted `quic_ingress_not_allowed` instead of
+    /// The node builds a QUIC endpoint on its UDP port and may upgrade a UDP
+    /// session to a QUIC path that carries only control frames: all
+    /// application traffic stays on UDP. In this release nothing in the node
+    /// upgrades yet ([`upgrade::policy`] is not wired in), so the endpoint
+    /// accepts and opens no connection. It still differs from `Off` in three
+    /// ways: the demux socket has a QUIC ingress, so a QUIC-class datagram is
+    /// counted `quic_ingress_not_allowed` instead of
     /// `quic_ingress_no_ingress`; quinn's endpoint driver runs as a task
     /// (idle, waiting on the empty ingress queue); and the endpoint's memory.
     /// If the endpoint cannot be built the node logs a warning and runs with
     /// QUIC off.
+    Shadow,
+    /// Meant to carry application data over QUIC. Until that ships it acts
+    /// as [`Self::Shadow`] (see [`Self::effective`]), so a node that sets it
+    /// early starts carrying data over QUIC once it runs a release where
+    /// `prefer` does. That release's notes must say so.
     Prefer,
 }
 
 impl QuicMode {
     /// The value written in `config.toml` and accepted on the command line.
     pub const OFF: &'static str = "off";
+    /// See [`QuicMode::Shadow`].
+    pub const SHADOW: &'static str = "shadow";
     /// See [`QuicMode::Prefer`].
     pub const PREFER: &'static str = "prefer";
 
@@ -107,14 +125,33 @@ impl QuicMode {
         match value.map(|v| v.trim().to_ascii_lowercase()) {
             None => Self::Off,
             Some(v) if v == Self::OFF => Self::Off,
+            Some(v) if v == Self::SHADOW => Self::Shadow,
             Some(v) if v == Self::PREFER => Self::Prefer,
             Some(other) => {
                 tracing::warn!(
                     transport_quic = %other,
-                    "Unknown transport-quic value; QUIC stays off. Known values: off, prefer"
+                    "Unknown transport-quic value; QUIC stays off. Known values: off, shadow, prefer"
                 );
                 Self::Off
             }
+        }
+    }
+
+    /// Whether the node builds a QUIC endpoint in this mode.
+    pub(crate) fn builds_endpoint(self) -> bool {
+        match self {
+            Self::Off => false,
+            Self::Shadow | Self::Prefer => true,
+        }
+    }
+
+    /// The mode this release runs: `Off` and `Shadow` are themselves, and
+    /// `Prefer` runs as `Shadow`. Startup says so at INFO
+    /// ([`upgrade::policy::log_startup`]).
+    pub(crate) fn effective(self) -> Self {
+        match self {
+            Self::Off => Self::Off,
+            Self::Shadow | Self::Prefer => Self::Shadow,
         }
     }
 }

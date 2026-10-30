@@ -367,7 +367,11 @@ plus `egress_bytes`, `egress_bytes_waited`, `egress_wait_us_sum` / `_max`,
 ignored (`upgrade_control_received`) and hole-punch handshake packets dropped,
 one count per packet, because they were not encrypted under the attempt's
 inbound session key (`handshake_unauthenticated_dropped`), QUIC endpoint deaths
-(`quic_endpoint_down`) and QUIC connections this node closed, by close code
+(`quic_endpoint_down`), QUIC crash-loop breaker trips at startup
+(`quic_breaker_trips`, counted for any abnormal end of a QUIC-enabled run, not
+only a QUIC fault; see `quic/breaker.rs`) and whether the breaker keeps QUIC
+off in this process (`quic_breaker_suppressed`, a state that is never reset and
+is not activity by itself) and QUIC connections this node closed, by close code
 (`quic_close_sent_<label>`, one per `QuicCloseCode`). Each label set is declared once in a
 `labelled_counters!` list, so a new variant needs a snapshot field. Hot
 path writes are single relaxed atomics; `SentPacketTracker` keeps an
@@ -586,11 +590,17 @@ peer_connection.rs. A receipt is only useful for a packet the SENDER
 tracks for retransmission:
   → Ping / Pong: never acked (every release sends them untracked).
   → AckConnection*: acked on every arrival but NOT recorded for dedup.
-    The handshake's completion ack is tracked at packet id 0 and must be
-    acked; id 0 is also the remote's first data packet, so recording it
-    would drop that packet as a duplicate. Answering a connection ack with
-    `ack_ok` happens at most ONCE per connection: the reply is itself an
-    AckConnection, so answering every one loops forever between two peers.
+    Earlier releases track a gateway's success ack at packet id 0 and need
+    the receipt; they also give their first data packet id 0, so recording
+    it would drop that packet as a duplicate. Our own data starts at
+    FIRST_DATA_PACKET_ID (1) on every path and no handshake ack is tracked
+    on a connection, because a receipt for id 0 (sent for every connection
+    ack, including a handshake ack resent across our completion) would
+    otherwise be credited to our first data packet: a false RTT sample and
+    a lost packet never retransmitted. DO NOT start data at 0 again.
+    Answering a connection ack with `ack_ok` happens at most ONCE per
+    connection: the reply is itself an AckConnection, so answering every
+    one loops forever between two peers.
   → ShortMessage / StreamFragment / Upgrade: acked within
     ACK_CHECK_INTERVAL (100 ms), and RE-ACKED when a duplicate arrives (a
     duplicate means our receipt was lost). A duplicate is never delivered
@@ -811,7 +821,7 @@ QUIC-class datagram is counted as `quic_ingress_forwarded`, `_not_allowed`,
 receiver gone, or disabled; every node with `transport-quic` off). The QUIC
 endpoint enables the ingress through `with_quic_ingress`, which disables it
 again (allow-set emptied and closed) if the endpoint cannot be built, so a
-failed `prefer` bind leaves the socket as with QUIC off.
+failed `shadow`/`prefer` bind leaves the socket as with QUIC off.
 
 Socket-health signal: the listener reads through `Socket::recv_classified`,
 which `DemuxSocket` answers with `Datagram` for a legacy datagram and
@@ -827,13 +837,46 @@ it must not wait unless it is a pacing point.
 
 #### QUIC endpoint (`transport/quic.rs`, #5940 step c2)
 
-`transport-quic` (config key, `off` by default, or `prefer`) decides whether
-`bind_udp_listener` builds a quinn endpoint over the DemuxSocket. Off: no
-endpoint, no QUIC ingress, nothing changes. Prefer: the endpoint is built
+`transport-quic` (config key, `off` by default, `shadow` or `prefer`) decides
+whether `bind_udp_listener` builds a quinn endpoint over the DemuxSocket.
+`prefer` runs as `shadow` until QUIC carries data (`QuicMode::effective`;
+`upgrade::policy::log_startup` says so at INFO once per node). The release
+that makes `prefer` carry data must say in its notes that existing `prefer`
+configs start carrying data. Off: no endpoint, no QUIC ingress, nothing
+changes. QUIC must stay off by default on Windows until the crash-loop
+breaker works there (#6031). Shadow or prefer: the endpoint is built
 with the node's QUIC identity (below) and an EMPTY allow-set, so nothing
 reaches it and it sends nothing; the listener holds it. Upgrading a UDP
-session to QUIC comes later, so only tests open QUIC connections. An unknown
-value is off with a warning, never an error: a crash-loop rollback
+session to QUIC comes later, so only tests open QUIC connections.
+
+Upgrade policy (`quic/upgrade/policy.rs`, not yet wired in):
+`QuicPolicy::new(network_api, breaker, availability)` takes the config, the
+breaker's decision (`breaker::gate` returns it beside the settings, as
+`Gated`) and the endpoint's availability. `disabled_by()` names the first
+rule that stops upgrades: `Mode` (off), `Breaker`, `NoPaths`
+(`quic-max-paths` = 0) or `Endpoint(availability)` (not `Up`); `allowed()` is
+true when none does. `admit()` returns a `QuicPathPermit` or
+`PathRefusal::{Disabled(cause), Busy}`; `Ok` does not prove the endpoint is
+still up. `QuicPathPermits` holds at most `quic-max-paths` paths, released on
+drop.
+
+`quic-max-paths` is stored as text (`lenient_count`), like `transport-quic`,
+so any value loads: an integer or string is kept as written, a bool or float
+as its text, and an array, table or datetime as a placeholder. A value that is
+not a whole number is ignored with a WARN at startup (only when
+`transport-quic` is not off) and reads as the default, so a typo or a later
+release's value cannot stop the node. On the command line a negative value
+needs `=` (`--quic-max-paths=-1`): with a space clap reads `-1` as a flag and
+refuses the command line, as for every numeric option.
+The default is `max-number-of-connections`, and a larger value is lowered to
+it, because the flow-control windows are sized for that many connections.
+At the default the limit rarely binds (a permit is held from the offer, so a
+path still closing can briefly hold a slot). A rollback to a release before
+the key drops it: the older binary rewrites `config.toml` without it. It is
+kebab-case from the start, so it has no `CONFIG_KEY_SPELLINGS` entry.
+
+An unknown `transport-quic` value is off with a warning, never an error: a
+crash-loop rollback
 reinstalls an older binary, which must start with a value a later release
 wrote, and keeps it in config.toml.
 
@@ -916,7 +959,7 @@ CI, so CI does not check that the test ran.
 
 Key material (stateless-reset key, token key, CID MAC key) comes from the OS
 entropy pool, never GlobalRng; quinn's rng_seed and the CID nonces stay on
-GlobalRng. With `prefer`, a failed endpoint build logs a WARN and the node
+GlobalRng. With `shadow` or `prefer`, a failed endpoint build logs a WARN and the node
 runs with QUIC off. `accept` returns the attempt without awaiting its
 handshake (QuicIncoming::establish), so one stalled handshake does not hold
 back the next. QUIC integration tests run under a watchdog thread

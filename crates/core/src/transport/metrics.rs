@@ -24,7 +24,7 @@
 use dashmap::DashMap;
 use std::net::SocketAddr;
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use tokio::sync::mpsc;
 
 use crate::tracing::{TransferDirection, TransferEvent};
@@ -34,6 +34,29 @@ use crate::tracing::{TransferDirection, TransferEvent};
 /// All peer connections report to this single instance, which aggregates
 /// metrics for periodic telemetry snapshots.
 pub static TRANSPORT_METRICS: LazyLock<TransportMetrics> = LazyLock::new(TransportMetrics::new);
+
+/// Test hook: connection identity decisions since the process started, by
+/// [`ConnIdentity`]. Unlike the period counters, never reset by
+/// `take_snapshot`, so a simulation can read its totals at the end.
+#[cfg(any(test, feature = "testing"))]
+static CONN_IDENTITY_TOTAL: [AtomicU64; ConnIdentity::COUNT] =
+    [const { AtomicU64::new(0) }; ConnIdentity::COUNT];
+
+/// Test hook: [`CONN_IDENTITY_TOTAL`] as `(label, count)` pairs, every kind
+/// included. Process-wide: under plain `cargo test` it also counts other
+/// tests running in the same process.
+#[cfg(any(test, feature = "testing"))]
+pub fn conn_identity_totals() -> Vec<(&'static str, u64)> {
+    ConnIdentity::ALL
+        .iter()
+        .map(|kind| {
+            (
+                kind.label(),
+                CONN_IDENTITY_TOTAL[*kind as usize].load(Ordering::Relaxed),
+            )
+        })
+        .collect()
+}
 
 /// Declares a telemetry label enum with `COUNT`, `ALL` and `label` generated
 /// from the one variant list, so a variant cannot be added without growing the
@@ -70,32 +93,41 @@ macro_rules! labelled_counters {
 }
 
 labelled_counters! {
-    /// A decision about the peer identity (public key) the node records for
-    /// a connection, counted where the node makes it, to measure how often a
-    /// connection's peer identity is set or changed after establishment.
-    /// Exported per period as `conn_identity_<label>`, each key only when its
-    /// count is non-zero. Each `set_*`, `same_*` and `changed_*` kind is one
-    /// per decision on its path; `connect_request_known_addr`, `own_key`,
-    /// `duplicate_key` and `changed_ring_promotion` (which accompanies a
-    /// `changed_connect_peer` on the same ConnectPeer) are counted in
-    /// addition to the kind of the decision they qualify.
+    /// A decision about the peer identity (public key) the node binds to a
+    /// connection, counted where the node makes it. A connection is bound at
+    /// most once and keeps its key until it closes. Exported per period as
+    /// `conn_identity_<label>`, each key only when its count is non-zero.
+    /// Each `set_*`, `same_*` and `changed_*` kind is one per decision on its
+    /// path; `connect_request_known_addr`, `own_key` and `duplicate_key` are
+    /// counted in addition to the kind of the decision they qualify.
     ///
-    /// An inbound connection that matched an expected-inbound registration
-    /// is recorded under the key the connect op dialled
+    /// An outbound connection is bound to the key it was dialled with
+    /// (`set_dialed`). An inbound connection that matched an expected-inbound
+    /// registration is bound to the key the connect op dialled
     /// (`expected_inbound_bound`), or, when the registration carried no key,
     /// starts with none (`expected_inbound_unbound`). Any other inbound
     /// connection starts with no key, so its first key is counted as
     /// `set_connect_peer` or `set_connect_request`, whichever names the peer
-    /// first. A connection is recorded under this node's own key only when a
-    /// dial, a registration, a ConnectRequest or a ConnectPeer names that
+    /// first. Both kinds of inbound match happen on a gateway, and on any
+    /// node that accepts a reconnection from an address it already has a
+    /// session with. A connection is bound to this node's own key only when
+    /// a dial, a registration, a ConnectRequest or a ConnectPeer names that
     /// key, so `own_key` is expected to stay at zero.
+    ///
+    /// `changed_connect_request` and `changed_connect_peer` changed meaning
+    /// when a connection's identity became fixed at establishment: they now
+    /// count a ConnectRequest that closed the connection and a ConnectPeer
+    /// that was refused. Before that change they counted a connection's key
+    /// being replaced or promoted under another key, so their values are not
+    /// comparable across node versions.
     pub(crate) enum ConnIdentity {
-        /// An outbound connection was established and recorded under the key
+        /// An outbound connection was established and bound to the key
         /// it was dialled with.
         SetDialed => "set_dialed",
         /// An inbound connection matched an expected-inbound registration and
-        /// was recorded under the key the connect op dialled, which the
-        /// registration carried.
+        /// was bound to the key the connect op dialled, which the
+        /// registration carried. The match is by address only, so this
+        /// binding is a claim (see `claim_held`).
         ExpectedInboundBound => "expected_inbound_bound",
         /// An inbound connection matched an expected-inbound registration
         /// that carried no key, so it starts with none, like an unexpected
@@ -105,12 +137,13 @@ labelled_counters! {
         SetConnectRequest => "set_connect_request",
         /// A ConnectRequest named the key the connection already had.
         SameConnectRequest => "same_connect_request",
-        /// A ConnectRequest named a key other than the one the connection had,
-        /// and the connection's key was replaced with it.
+        /// A ConnectRequest named a key other than the one the connection is
+        /// bound to or waiting for. The connection keeps its key: the request
+        /// is dropped and the connection closed.
         ChangedConnectRequest => "changed_connect_request",
-        /// The ConnectRequest counted by one of the three kinds above gave the
-        /// joiner a known address equal to the connection's remote address,
-        /// rather than an unknown one.
+        /// A ConnectRequest on an open connection gave the joiner a known
+        /// address equal to the connection's remote address, rather than an
+        /// unknown one, whatever the binding outcome.
         ConnectRequestKnownAddr => "connect_request_known_addr",
         /// A ConnectPeer for an existing connection gave the key of a
         /// connection that had none.
@@ -118,30 +151,67 @@ labelled_counters! {
         /// A ConnectPeer for an existing connection named the key it had.
         SameConnectPeer => "same_connect_peer",
         /// A ConnectPeer for an existing connection named a key other than the
-        /// one it had; the connection kept its key.
+        /// one it is bound to or waiting for. The connection keeps its key and
+        /// is not promoted; the connect op is told the connection failed.
         ChangedConnectPeer => "changed_connect_peer",
-        /// A ConnectPeer promoted an existing connection into the ring, and
-        /// the ring took it, under a key other than the one recorded for the
-        /// connection.
+        /// A ConnectPeer promoted a connection under a key other than the one
+        /// recorded for it. No longer recorded: a connection's key is bound
+        /// once and a ConnectPeer naming another is refused
+        /// (`changed_connect_peer`). Kept, always zero, so readers of the
+        /// snapshot that expect the field still parse it.
         ChangedRingPromotion => "changed_ring_promotion",
-        /// A connection was recorded under this node's own key, on any path.
+        /// An attempt to bind a key to a connection (a dial, an
+        /// expected-inbound match or a ConnectRequest) was refused because
+        /// another open connection, heard from within the last 30 s, is bound
+        /// to it. Counted per attempt, so
+        /// a connection whose peer repeats its ConnectRequest counts once per
+        /// request. The claiming connection stays without an identity, with
+        /// the claim kept pending until the holder closes or goes quiet
+        /// (`pending_claim_bound`); a ConnectRequest carrying the claim is
+        /// dropped.
+        ClaimHeld => "claim_held",
+        /// A claim held back by `claim_held` was bound later, on the
+        /// connection that made it, after the connection holding its key
+        /// closed (on its own, or replaced: `quiet_holder_replaced`).
+        PendingClaimBound => "pending_claim_bound",
+        /// A connection bound to a key that a newer connection claimed had not
+        /// been heard from within 30 s, and was closed so the claim could be
+        /// bound. Counted on the closed connection.
+        QuietHolderReplaced => "quiet_holder_replaced",
+        /// A claim held back by `claim_held` had waited more than three
+        /// times the 30 s hold window behind a holder that is still heard
+        /// from. Counted once per claim, on the waiting connection. Two
+        /// sessions with one peer established at the same time can stay
+        /// crossed this way (each side binds the one the other keeps
+        /// waiting). An upper bound on crossed sessions: any claim that
+        /// waits this long behind a live holder is counted, crossed or not.
+        ClaimHeldLong => "claim_held_long",
+        /// A connection was bound to this node's own key, on any path.
         OwnKey => "own_key",
-        /// A key was recorded for a connection while the key-to-address map
-        /// held it for another open connection that still has that key (the
-        /// newer one replaces it in the map).
+        /// A key was bound to a connection while another open connection was
+        /// still bound to it. No longer recorded: a key is bound to one
+        /// connection at a time, and a second one waits (`claim_held`). Kept,
+        /// reading zero, so readers of the snapshot that expect the field
+        /// still parse it; releases before the rule recorded it in the
+        /// hundreds per version, so its drop to zero is also the
+        /// before-and-after comparison for the rule. `changed_ring_promotion`
+        /// is kept, always zero, for the same reason.
         DuplicateKey => "duplicate_key",
         /// Cleanup ran for a connection whose key is mapped to a different
-        /// connection. Counted on transport close, on an explicit drop, on
-        /// the unpromoted-connection sweep and when a new connection at the
-        /// same address replaces the entry; not on the cleanup when the event
-        /// loop shuts down.
+        /// connection. That connection keeps the mapping and the peer's
+        /// state. Counted on transport close, on an explicit drop, on the
+        /// unpromoted-connection sweep and when a new connection at the same
+        /// address replaces the entry; not on the cleanup when the event loop
+        /// shuts down. Not expected to be recorded: a key is bound to one
+        /// connection at a time, and the map points at it.
         TeardownKeyElsewhere => "teardown_key_elsewhere",
-        /// Cleanup, on the same paths, ran for a connection with no recorded
+        /// Cleanup, on the same paths, ran for a connection with no bound
         /// key, so no per-peer cleanup ran for it.
         TeardownUnidentified => "teardown_unidentified",
         /// Cleanup, on the same paths, ran for a connection whose key is not
-        /// mapped to any connection (for example, an earlier cleanup of
-        /// another connection with the same key removed the mapping).
+        /// mapped to any connection. Not expected to be recorded, since the
+        /// map holds every bound key; the cleanup then runs the per-peer
+        /// cleanup unless the key is in the ring at another address.
         TeardownKeyUnmapped => "teardown_key_unmapped",
     }
 }
@@ -547,6 +617,12 @@ pub struct TransportMetrics {
     /// driver future returned), after which the node runs with QUIC off
     /// (reset each snapshot). At most one per endpoint.
     quic_endpoint_down: AtomicU64,
+    /// Times the QUIC crash-loop breaker tripped at startup (reset each
+    /// snapshot; at most one per process).
+    quic_breaker_trips: AtomicU64,
+    /// Whether the crash-loop breaker keeps QUIC off in this process (a
+    /// state, never reset).
+    quic_breaker_suppressed: AtomicBool,
     /// QUIC connections this node closed, by [`QuicCloseCode`] (reset each
     /// snapshot).
     quic_close_sent: [AtomicU64; QuicCloseCode::COUNT],
@@ -934,6 +1010,8 @@ impl TransportMetrics {
             handshake_unauthenticated_dropped: AtomicU64::new(0),
             conn_identity: Default::default(),
             quic_endpoint_down: AtomicU64::new(0),
+            quic_breaker_trips: AtomicU64::new(0),
+            quic_breaker_suppressed: AtomicBool::new(false),
             quic_close_sent: Default::default(),
             inbound_concurrency_epoch: AtomicU64::new(1),
             inbound_concurrency: Default::default(),
@@ -1335,6 +1413,8 @@ impl TransportMetrics {
         #[cfg(not(test))]
         let _ = remote;
         self.conn_identity[kind as usize].fetch_add(1, Ordering::Relaxed);
+        #[cfg(any(test, feature = "testing"))]
+        CONN_IDENTITY_TOTAL[kind as usize].fetch_add(1, Ordering::Relaxed);
     }
 
     /// Test-only: start recording the connection identity decisions for the
@@ -1366,6 +1446,18 @@ impl TransportMetrics {
         #[cfg(not(test))]
         let _ = local;
         self.quic_endpoint_down.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The QUIC crash-loop breaker tripped at startup
+    /// (`quic::breaker`).
+    pub(crate) fn record_quic_breaker_trip(&self) {
+        self.quic_breaker_trips.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Whether the crash-loop breaker keeps QUIC off in this process.
+    pub(crate) fn set_quic_breaker_suppressed(&self, suppressed: bool) {
+        self.quic_breaker_suppressed
+            .store(suppressed, Ordering::Relaxed);
     }
 
     /// Test-only: how many times the QUIC endpoint bound at `local` went
@@ -1994,6 +2086,8 @@ impl TransportMetrics {
             upgrade_control_received: get64(&self.upgrade_control_received),
             handshake_unauthenticated_dropped: get64(&self.handshake_unauthenticated_dropped),
             quic_endpoint_down: get64(&self.quic_endpoint_down),
+            quic_breaker_trips: get64(&self.quic_breaker_trips),
+            quic_breaker_suppressed: self.quic_breaker_suppressed.load(Ordering::Relaxed),
             quic_close_sent_node_dropped_peer: get64(
                 &self.quic_close_sent[QuicCloseCode::NodeDroppedPeer as usize],
             ),
@@ -2122,6 +2216,14 @@ impl TransportMetrics {
             conn_identity_changed_ring_promotion: get32(
                 &identity[ConnIdentity::ChangedRingPromotion as usize],
             ),
+            conn_identity_claim_held: get32(&identity[ConnIdentity::ClaimHeld as usize]),
+            conn_identity_pending_claim_bound: get32(
+                &identity[ConnIdentity::PendingClaimBound as usize],
+            ),
+            conn_identity_quiet_holder_replaced: get32(
+                &identity[ConnIdentity::QuietHolderReplaced as usize],
+            ),
+            conn_identity_claim_held_long: get32(&identity[ConnIdentity::ClaimHeldLong as usize]),
             conn_identity_own_key: get32(&identity[ConnIdentity::OwnKey as usize]),
             conn_identity_duplicate_key: get32(&identity[ConnIdentity::DuplicateKey as usize]),
             conn_identity_teardown_key_elsewhere: get32(
@@ -2513,6 +2615,11 @@ pub struct TransportSnapshot {
     /// Times the QUIC endpoint went down while the node held it; the node
     /// then runs with QUIC off (#5940 e4).
     pub quic_endpoint_down: u64,
+    /// Times the QUIC crash-loop breaker tripped: a run with QUIC enabled
+    /// ended abnormally, so this one started with QUIC off (#5940).
+    pub quic_breaker_trips: u64,
+    /// Whether the crash-loop breaker keeps QUIC off in this process.
+    pub quic_breaker_suppressed: bool,
     /// QUIC connections this node closed, by close code
     /// ([`QuicCloseCode`]).
     pub quic_close_sent_node_dropped_peer: u64,
@@ -2623,6 +2730,10 @@ pub struct TransportSnapshot {
     pub conn_identity_same_connect_peer: u32,
     pub conn_identity_changed_connect_peer: u32,
     pub conn_identity_changed_ring_promotion: u32,
+    pub conn_identity_claim_held: u32,
+    pub conn_identity_pending_claim_bound: u32,
+    pub conn_identity_quiet_holder_replaced: u32,
+    pub conn_identity_claim_held_long: u32,
     pub conn_identity_own_key: u32,
     pub conn_identity_duplicate_key: u32,
     pub conn_identity_teardown_key_elsewhere: u32,
@@ -2697,6 +2808,10 @@ impl TransportSnapshot {
             ConnIdentity::SameConnectPeer => self.conn_identity_same_connect_peer,
             ConnIdentity::ChangedConnectPeer => self.conn_identity_changed_connect_peer,
             ConnIdentity::ChangedRingPromotion => self.conn_identity_changed_ring_promotion,
+            ConnIdentity::ClaimHeld => self.conn_identity_claim_held,
+            ConnIdentity::PendingClaimBound => self.conn_identity_pending_claim_bound,
+            ConnIdentity::QuietHolderReplaced => self.conn_identity_quiet_holder_replaced,
+            ConnIdentity::ClaimHeldLong => self.conn_identity_claim_held_long,
             ConnIdentity::OwnKey => self.conn_identity_own_key,
             ConnIdentity::DuplicateKey => self.conn_identity_duplicate_key,
             ConnIdentity::TeardownKeyElsewhere => self.conn_identity_teardown_key_elsewhere,
@@ -2823,6 +2938,8 @@ impl TransportSnapshot {
             upgrade_control_received,
             handshake_unauthenticated_dropped,
             quic_endpoint_down,
+            quic_breaker_trips,
+            quic_breaker_suppressed,
             quic_close_sent_node_dropped_peer,
             quic_close_sent_downgrade,
             quic_close_sent_identity_mismatch,
@@ -2889,6 +3006,10 @@ impl TransportSnapshot {
             conn_identity_same_connect_peer,
             conn_identity_changed_connect_peer,
             conn_identity_changed_ring_promotion,
+            conn_identity_claim_held,
+            conn_identity_pending_claim_bound,
+            conn_identity_quiet_holder_replaced,
+            conn_identity_claim_held_long,
             conn_identity_own_key,
             conn_identity_duplicate_key,
             conn_identity_teardown_key_elsewhere,
@@ -2934,6 +3055,8 @@ impl TransportSnapshot {
         self.upgrade_control_received = upgrade_control_received;
         self.handshake_unauthenticated_dropped = handshake_unauthenticated_dropped;
         self.quic_endpoint_down = quic_endpoint_down;
+        self.quic_breaker_trips = quic_breaker_trips;
+        self.quic_breaker_suppressed = quic_breaker_suppressed;
         self.quic_close_sent_node_dropped_peer = quic_close_sent_node_dropped_peer;
         self.quic_close_sent_downgrade = quic_close_sent_downgrade;
         self.quic_close_sent_identity_mismatch = quic_close_sent_identity_mismatch;
@@ -3000,6 +3123,10 @@ impl TransportSnapshot {
         self.conn_identity_same_connect_peer = conn_identity_same_connect_peer;
         self.conn_identity_changed_connect_peer = conn_identity_changed_connect_peer;
         self.conn_identity_changed_ring_promotion = conn_identity_changed_ring_promotion;
+        self.conn_identity_claim_held = conn_identity_claim_held;
+        self.conn_identity_pending_claim_bound = conn_identity_pending_claim_bound;
+        self.conn_identity_quiet_holder_replaced = conn_identity_quiet_holder_replaced;
+        self.conn_identity_claim_held_long = conn_identity_claim_held_long;
         self.conn_identity_own_key = conn_identity_own_key;
         self.conn_identity_duplicate_key = conn_identity_duplicate_key;
         self.conn_identity_teardown_key_elsewhere = conn_identity_teardown_key_elsewhere;
@@ -3088,6 +3215,11 @@ struct SnapshotExtras {
     /// Times the QUIC endpoint went down while the node held it; the node
     /// then runs with QUIC off (#5940 e4).
     pub quic_endpoint_down: u64,
+    /// Times the QUIC crash-loop breaker tripped: a run with QUIC enabled
+    /// ended abnormally, so this one started with QUIC off (#5940).
+    pub quic_breaker_trips: u64,
+    /// Whether the crash-loop breaker keeps QUIC off in this process.
+    pub quic_breaker_suppressed: bool,
     /// QUIC connections this node closed, by close code
     /// ([`QuicCloseCode`]).
     pub quic_close_sent_node_dropped_peer: u64,
@@ -3198,6 +3330,10 @@ struct SnapshotExtras {
     pub conn_identity_same_connect_peer: u32,
     pub conn_identity_changed_connect_peer: u32,
     pub conn_identity_changed_ring_promotion: u32,
+    pub conn_identity_claim_held: u32,
+    pub conn_identity_pending_claim_bound: u32,
+    pub conn_identity_quiet_holder_replaced: u32,
+    pub conn_identity_claim_held_long: u32,
     pub conn_identity_own_key: u32,
     pub conn_identity_duplicate_key: u32,
     pub conn_identity_teardown_key_elsewhere: u32,
@@ -3237,6 +3373,7 @@ impl SnapshotExtras {
             || self.upgrade_control_received != 0
             || self.handshake_unauthenticated_dropped != 0
             || self.quic_endpoint_down != 0
+            || self.quic_breaker_trips != 0
             || self.quic_close_sent_node_dropped_peer != 0
             || self.quic_close_sent_downgrade != 0
             || self.quic_close_sent_identity_mismatch != 0
@@ -3299,6 +3436,10 @@ impl SnapshotExtras {
             || self.conn_identity_same_connect_peer != 0
             || self.conn_identity_changed_connect_peer != 0
             || self.conn_identity_changed_ring_promotion != 0
+            || self.conn_identity_claim_held != 0
+            || self.conn_identity_pending_claim_bound != 0
+            || self.conn_identity_quiet_holder_replaced != 0
+            || self.conn_identity_claim_held_long != 0
             || self.conn_identity_own_key != 0
             || self.conn_identity_duplicate_key != 0
             || self.conn_identity_teardown_key_elsewhere != 0
@@ -4125,6 +4266,40 @@ mod tests {
         assert_eq!(json["quic_endpoint_down"], 1);
         assert!(metrics.take_snapshot().is_none(), "the counter must reset");
         assert_eq!(metrics.quic_endpoint_down_at(local), 1);
+    }
+
+    /// A breaker trip reaches the snapshot and its JSON, counts as activity
+    /// on its own, and resets; the suppressed state is carried while it
+    /// holds and is not activity by itself.
+    #[test]
+    fn quic_breaker_reaches_snapshot_and_trips_reset() {
+        let metrics = TransportMetrics::new();
+        assert!(
+            metrics.take_snapshot().is_none(),
+            "a fresh instance is idle"
+        );
+        metrics.set_quic_breaker_suppressed(true);
+        assert!(
+            metrics.take_snapshot().is_none(),
+            "a suppressed state alone is not activity"
+        );
+        metrics.record_quic_breaker_trip();
+        let snap = metrics
+            .take_snapshot()
+            .expect("a breaker trip alone is activity");
+        assert_eq!(snap.quic_breaker_trips, 1);
+        assert!(snap.quic_breaker_suppressed);
+        let json = serde_json::to_value(&snap).unwrap();
+        assert_eq!(json["quic_breaker_trips"], 1);
+        assert_eq!(json["quic_breaker_suppressed"], true);
+        assert!(
+            metrics.take_snapshot().is_none(),
+            "the trip count must reset"
+        );
+        metrics.record_upgrade_control_received();
+        let snap = metrics.take_snapshot().expect("activity");
+        assert_eq!(snap.quic_breaker_trips, 0);
+        assert!(snap.quic_breaker_suppressed, "the state is not reset");
     }
 
     /// The snapshot field that carries the period count of closes sent
@@ -5251,6 +5426,8 @@ mod tests {
             "upgrade_control_received",
             "handshake_unauthenticated_dropped",
             "quic_endpoint_down",
+            "quic_breaker_trips",
+            "quic_breaker_suppressed",
             "quic_close_sent_node_dropped_peer",
             "quic_close_sent_downgrade",
             "quic_close_sent_identity_mismatch",
@@ -5317,6 +5494,10 @@ mod tests {
             "conn_identity_same_connect_peer",
             "conn_identity_changed_connect_peer",
             "conn_identity_changed_ring_promotion",
+            "conn_identity_claim_held",
+            "conn_identity_pending_claim_bound",
+            "conn_identity_quiet_holder_replaced",
+            "conn_identity_claim_held_long",
             "conn_identity_own_key",
             "conn_identity_duplicate_key",
             "conn_identity_teardown_key_elsewhere",

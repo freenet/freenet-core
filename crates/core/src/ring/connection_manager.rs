@@ -2394,82 +2394,6 @@ impl ConnectionManager {
         true
     }
 
-    pub fn update_peer_identity(
-        &self,
-        old_addr: SocketAddr,
-        new_addr: SocketAddr,
-        new_pub_key: TransportPublicKey,
-    ) -> bool {
-        if old_addr == new_addr {
-            tracing::debug!(
-                addr = %old_addr,
-                "update_peer_identity: same address; skipping"
-            );
-            return false;
-        }
-
-        let mut loc_for_peer = self.location_for_peer.write();
-        let Some(loc) = loc_for_peer.remove(&old_addr) else {
-            tracing::debug!(
-                old_addr = %old_addr,
-                new_addr = %new_addr,
-                "update_peer_identity: old peer entry not found"
-            );
-            return false;
-        };
-
-        tracing::debug!(
-            old_addr = %old_addr,
-            new_addr = %new_addr,
-            peer_location = %loc,
-            "Updating peer identity for active connection"
-        );
-        loc_for_peer.insert(new_addr, loc);
-        drop(loc_for_peer);
-
-        // Hold the cbl write lock for the mutation (including the
-        // placeholder-creation warning, emitted before the push it describes),
-        // then drop it before acquiring connected_since / peer_health
-        // (clippy: `significant_drop_tightening`).
-        {
-            let mut cbl = self.connections_by_location.write();
-            let entry = cbl.entry(loc).or_default();
-            if let Some(conn) = entry
-                .iter_mut()
-                .find(|conn| conn.location.socket_addr() == Some(old_addr))
-            {
-                // Update the public key and address to match the new peer
-                conn.location.pub_key = new_pub_key;
-                conn.location.set_addr(new_addr);
-            } else {
-                // Warn before push to preserve pre-#4129 ordering
-                // (observational only, but the order was intentional).
-                tracing::warn!(
-                    old_addr = %old_addr,
-                    peer_location = %loc,
-                    "update_peer_identity: connection entry missing; creating placeholder"
-                );
-                entry.push(Connection::new(PeerKeyLocation::new(new_pub_key, new_addr)));
-            }
-        }
-
-        // Migrate connected_since and peer_health to the new address.
-        {
-            let mut cs = self.connected_since.write();
-            if let Some(since) = cs.remove(&old_addr) {
-                cs.insert(new_addr, since);
-            }
-        }
-        {
-            let mut health = self.peer_health.lock();
-            if let Some(stats) = health.stats.remove(&old_addr) {
-                health.stats.insert(new_addr, stats);
-            }
-        }
-
-        true
-    }
-
     fn prune_connection(&self, addr: SocketAddr, is_alive: bool) -> Option<Location> {
         let connection_type = if is_alive { "active" } else { "in transit" };
         tracing::info!(
@@ -2563,8 +2487,8 @@ impl ConnectionManager {
     /// This is the ONLY way to stage an ADDRESSLESS ([`PeerAddr::Unknown`])
     /// connection, and that is precisely because production cannot: every
     /// other write to `connections_by_location` stores a known addr
-    /// (`add_connection` and `update_peer_identity` both take a
-    /// `SocketAddr`; `prune_connection` only removes), and the getter hands
+    /// (`add_connection` takes a `SocketAddr`; `prune_connection` only
+    /// removes), and the getter hands
     /// back a clone so no caller can mutate a stored entry back to
     /// `Unknown`. `Ring::k_closest_potentially_hosting` nonetheless carries
     /// an addressless-candidate branch, and the GET retry driver a matching
@@ -4885,9 +4809,10 @@ mod tests {
     /// Source-scrape pin (B1 regression guard, extended for #5827): EACH
     /// connection-lifecycle cap gate must refuse at the cap through the shared
     /// `refuses_connection_at_cap`, which carries the lattice exemption. The
-    /// gates are the transient-promotion gate and the outbound pre-flight check
-    /// in `handle_connect_peer`, and the promotion gate in
-    /// `handle_successful_connection`. Without the exemption a lattice edge is
+    /// gates are the transient-promotion gate in `promote_existing_connection`
+    /// (which `handle_connect_peer` calls for an existing connection), the
+    /// outbound pre-flight check in `handle_connect_peer`, and the promotion
+    /// gate in `handle_successful_connection`. Without the exemption a lattice edge is
     /// silently dropped at the cap on the real CONNECT path and mechanism 3's
     /// at-capacity displacement is inert: the exact defect the external review
     /// caught for the promotion gates (the over-max unit test passed only
@@ -4967,12 +4892,19 @@ mod tests {
 
         const CALL: &str = "connection_manager.refuses_connection_at_cap(loc)";
         let connect_peer = fn_body(LIFECYCLE_SRC, "async fn handle_connect_peer(");
+        let promote = fn_body(LIFECYCLE_SRC, "async fn promote_existing_connection(");
         let successful = fn_body(LIFECYCLE_SRC, "async fn handle_successful_connection(");
+        assert!(
+            // Without `self`: rustfmt may break the call before the dot.
+            code_calls(connect_peer, ".promote_existing_connection(peer_addr"),
+            "handle_connect_peer must promote an existing connection through \
+             promote_existing_connection, which holds the transient-promotion gate"
+        );
         let gates = [
             (
-                "handle_connect_peer transient-promotion gate",
+                "promote_existing_connection transient-promotion gate",
                 region(
-                    connect_peer,
+                    promote,
                     "connection_manager.drop_transient(peer_addr)",
                     "connect_peer: rejecting transient promotion to enforce cap",
                 ),
@@ -5432,119 +5364,6 @@ mod tests {
                  (see #4918)"
             );
         }
-    }
-
-    // ============ update_peer_identity tests ============
-
-    #[test]
-    fn test_update_peer_identity() {
-        let cm = make_connection_manager(Some(make_addr(8000)), 1, 10, false);
-        let keypair = TransportKeypair::new();
-        let new_keypair = TransportKeypair::new();
-
-        let old_addr = make_addr(8001);
-        let new_addr = make_addr(8002);
-        let loc = Location::new(0.5);
-
-        // Add initial connection
-        cm.add_connection(loc, old_addr, keypair.public().clone(), false);
-        assert_eq!(cm.connection_count(), 1);
-
-        // Update peer identity
-        let updated = cm.update_peer_identity(old_addr, new_addr, new_keypair.public().clone());
-        assert!(updated);
-        assert_eq!(cm.connection_count(), 1);
-
-        // Old address should no longer be connected
-        let connections = cm.get_connections_by_location();
-        let conns = connections.get(&loc).unwrap();
-        assert_eq!(conns[0].location.socket_addr(), Some(new_addr));
-    }
-
-    #[test]
-    fn test_update_peer_identity_same_addr() {
-        let cm = make_connection_manager(Some(make_addr(8000)), 1, 10, false);
-        let keypair = TransportKeypair::new();
-
-        let addr = make_addr(8001);
-        let loc = Location::new(0.5);
-
-        cm.add_connection(loc, addr, keypair.public().clone(), false);
-
-        // Same address should return false
-        let updated = cm.update_peer_identity(addr, addr, keypair.public().clone());
-        assert!(!updated);
-    }
-
-    #[test]
-    fn test_update_peer_identity_nonexistent() {
-        let cm = make_connection_manager(Some(make_addr(8000)), 1, 10, false);
-        let keypair = TransportKeypair::new();
-
-        let old_addr = make_addr(9999);
-        let new_addr = make_addr(9998);
-
-        let updated = cm.update_peer_identity(old_addr, new_addr, keypair.public().clone());
-        assert!(!updated);
-    }
-
-    #[test]
-    fn test_update_peer_identity_migrates_health_and_connected_since() {
-        let cm = make_connection_manager(Some(make_addr(8000)), 1, 10, false);
-        let keypair = TransportKeypair::new();
-        let new_keypair = TransportKeypair::new();
-
-        let old_addr = make_addr(8001);
-        let new_addr = make_addr(8002);
-        let loc = Location::new(0.5);
-
-        // Add connection (this sets connected_since and init_peer)
-        cm.add_connection(loc, old_addr, keypair.public().clone(), false);
-
-        // Record some health events on old address
-        cm.peer_health.lock().record_success(old_addr);
-        cm.peer_health.lock().record_failure(old_addr);
-        cm.peer_health.lock().record_success(old_addr);
-
-        // Verify old address has data
-        assert!(cm.connected_since.read().contains_key(&old_addr));
-        assert_eq!(
-            cm.peer_health
-                .lock()
-                .stats
-                .get(&old_addr)
-                .unwrap()
-                .successes,
-            2
-        );
-        assert_eq!(
-            cm.peer_health.lock().stats.get(&old_addr).unwrap().failures,
-            1
-        );
-
-        // Update identity
-        let updated = cm.update_peer_identity(old_addr, new_addr, new_keypair.public().clone());
-        assert!(updated);
-
-        // Old address should have no data
-        assert!(!cm.connected_since.read().contains_key(&old_addr));
-        assert!(!cm.peer_health.lock().stats.contains_key(&old_addr));
-
-        // New address should have migrated data
-        assert!(cm.connected_since.read().contains_key(&new_addr));
-        assert_eq!(
-            cm.peer_health
-                .lock()
-                .stats
-                .get(&new_addr)
-                .unwrap()
-                .successes,
-            2
-        );
-        assert_eq!(
-            cm.peer_health.lock().stats.get(&new_addr).unwrap().failures,
-            1
-        );
     }
 
     // ============ routing tests ============
