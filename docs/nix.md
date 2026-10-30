@@ -397,7 +397,10 @@ via `rust-overlay`, not from nixpkgs, so `cargo fmt` and
 
 ## CI
 
-`.github/workflows/nix.yml` builds both outputs and checks the devShell. It is
+`.github/workflows/nix.yml` builds both outputs and checks the devShell, and
+runs the NixOS module VM test in a separate job on a GitHub-hosted runner,
+because that test needs KVM and the ubicloud runners do not reliably provide it
+(#6024). It is
 path-filtered to the nix files and is **not a required check** — see the note in
 the workflow for why, and for who is expected to watch it.
 

@@ -126,19 +126,49 @@ jobs:
           fi
           echo "SOURCE_DATE_EPOCH is unset in the devShell"
 
-      # Boots NixOS VMs running `services.freenet-node` (nix/module-test.nix):
-      # the plain default, extraArgs escaping, and an isolated gateway that
-      # stays up for the process, restart and state-directory checks.
-      # Reuses the freenet build above. Last, so a VM failure cannot hide the
-      # devShell checks before it. Fails rather than skips without KVM:
-      # a skipped VM test would read as a passing one.
-      - name: NixOS module VM test
+  # Boots NixOS VMs running `services.freenet-node` (nix/module-test.nix): the
+  # plain default, extraArgs escaping, and an isolated gateway that stays up for
+  # the process, restart and state-directory checks.
+  #
+  # A separate job because it needs KVM, and ubicloud-standard-8 runners do not
+  # reliably expose /dev/kvm (#6024: the same commit passed or failed depending
+  # on which runner it landed on). GitHub-hosted Linux runners provide /dev/kvm.
+  # It still FAILS when KVM is missing rather than skipping, because a skipped
+  # VM test would read as a passing one. It shares no store with the job above,
+  # so it builds freenet itself.
+  nixos-vm-test:
+    name: NixOS module VM test
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      # The runner image ships about 14 GB free; a cold build of freenet plus
+      # the NixOS test closure needs more. These are preinstalled toolchains
+      # this job never uses.
+      - name: Free disk space for the cold Nix build
         run: |
-          # Hosted runners often ship /dev/kvm root-only; nix only enables
-          # its `kvm` system feature when the build user can open it.
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      # Before installing Nix, so the daemon starts with KVM usable.
+      - name: Require KVM
+        run: |
+          # /dev/kvm is root-only on hosted runners; nix only uses it when the
+          # build user can open it.
           if [ -e /dev/kvm ]; then sudo chmod a+rw /dev/kvm; fi
           if [ ! -w /dev/kvm ]; then
               echo "::error::/dev/kvm is not available on this runner, so the NixOS VM test cannot run"
               exit 1
           fi
-          nix build .#checks.x86_64-linux.nixos-module -L
+
+      - uses: actions/checkout@v7
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            system-features = nixos-test benchmark big-parallel kvm
+
+      - name: NixOS module VM test
+        run: nix build .#checks.x86_64-linux.nixos-module -L
