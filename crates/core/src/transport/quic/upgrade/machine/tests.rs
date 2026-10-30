@@ -5,14 +5,14 @@
 //! endpoint.
 
 use bytes::Bytes;
-use quinn::VarInt;
+use quinn::{TransportErrorCode, VarInt};
 
 use super::*;
 use crate::config::NetworkApiConfig;
 use crate::transport::crypto::TransportKeypair;
 use crate::transport::quic::breaker::BreakerOutcome;
 use crate::transport::quic::liveness::QuicAvailabilityWatch;
-use crate::transport::quic::path::SendFailure;
+use crate::transport::quic::path::{QuicSendError, SendFailure};
 use crate::transport::symmetric_message::{QUIC_UPGRADE_MIN_VERSION, QUIC_UPGRADE_NEGOTIATES_IN};
 
 const SERVER_ATTEMPT: u32 = 1;
@@ -133,14 +133,31 @@ impl Rig {
     }
 
     fn close_with(&mut self, attempt: u32, code: u64) -> Vec<Action> {
-        let kind = QuicErrorKind::from(quinn::ConnectionError::ApplicationClosed(
-            quinn::ApplicationClose {
-                error_code: VarInt::from_u64(code).unwrap(),
-                reason: Bytes::new(),
-            },
-        ));
+        let kind = QuicErrorKind::from(closed_by_peer(code));
         self.step(Event::PathFailed { attempt, kind })
     }
+
+    /// A server whose attempt ends with this `Decline` reason.
+    fn declined(&mut self, reason: u8) -> Vec<Action> {
+        self.now = self.machine.retry_at.max(self.now);
+        self.tick_due();
+        assert_eq!(label(&self.machine), S::Offered);
+        self.step(Event::Upgrade(UpgradeControl::Decline {
+            attempt: self.machine.last_attempt,
+            reason,
+        }))
+    }
+}
+
+fn closed_by_peer(code: u64) -> quinn::ConnectionError {
+    quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose {
+        error_code: VarInt::from_u64(code).unwrap(),
+        reason: Bytes::new(),
+    })
+}
+
+fn send_failed(error: QuicSendError) -> BoundedSend {
+    BoundedSend::Failed(SendFailure::Error(error))
 }
 
 /// The states, by name, for the table.
@@ -228,15 +245,21 @@ fn reach(role: Role, state: S) -> Rig {
     rig
 }
 
-const ATTEMPT_EVENTS: [&str; 19] = [
+const ATTEMPT_EVENTS: [&str; 26] = [
+    "offer_sent",
     "accept",
     "decline",
+    "decline_disabled",
     "ready",
     "ready_ack",
     "established",
     "sent_ok",
     "sent_maybe",
     "sent_failed",
+    "sent_lost",
+    "sent_identity",
+    "sent_protocol_1",
+    "sent_stopped",
     "refused_version",
     "refused_type",
     "refused_length",
@@ -248,6 +271,7 @@ const ATTEMPT_EVENTS: [&str; 19] = [
     "path_protocol_1",
     "path_endpoint_down",
     "path_stream",
+    "path_allow_set_full",
 ];
 
 const OTHER_EVENTS: [&str; 10] = [
@@ -266,6 +290,10 @@ const OTHER_EVENTS: [&str; 10] = [
 fn event(name: &str, attempt: u32, peer: &TransportPublicKey) -> Event {
     let failed = |kind| Event::PathFailed { attempt, kind };
     let refused = |error| Event::ControlRefused { attempt, error };
+    let sent = |error| Event::ControlSent {
+        attempt,
+        outcome: send_failed(error),
+    };
     match name {
         "promoted" => Event::Promoted {
             peer_key: peer.clone(),
@@ -281,10 +309,15 @@ fn event(name: &str, attempt: u32, peer: &TransportPublicKey) -> Event {
             attempt: attempt - 1,
             caps: 0,
         }),
+        "offer_sent" => Event::OfferSent { attempt },
         "accept" => Event::Upgrade(UpgradeControl::Accept { attempt }),
         "decline" => Event::Upgrade(UpgradeControl::Decline {
             attempt,
             reason: DeclineReason::Busy.wire(),
+        }),
+        "decline_disabled" => Event::Upgrade(UpgradeControl::Decline {
+            attempt,
+            reason: DeclineReason::Disabled.wire(),
         }),
         "ready" => Event::Control(QuicControl::Ready { attempt, caps: 0 }),
         "ready_ack" => Event::Control(QuicControl::ReadyAck { attempt, caps: 0 }),
@@ -303,6 +336,14 @@ fn event(name: &str, attempt: u32, peer: &TransportPublicKey) -> Event {
             attempt,
             outcome: BoundedSend::Failed(SendFailure::TimedOut),
         },
+        "sent_lost" => sent(QuicSendError::ConnectionLost(quinn::ConnectionError::Reset)),
+        "sent_identity" => sent(QuicSendError::ConnectionLost(closed_by_peer(u64::from(
+            QuicCloseCode::IdentityMismatch.code(),
+        )))),
+        "sent_protocol_1" => sent(QuicSendError::ConnectionLost(
+            quinn::ConnectionError::TransportError(TransportErrorCode::INTERNAL_ERROR.into()),
+        )),
+        "sent_stopped" => sent(QuicSendError::Stopped(0x10)),
         "refused_version" => refused(ControlError::UnknownVersion(2)),
         "refused_type" => refused(ControlError::UnknownType(9)),
         "refused_length" => refused(ControlError::WrongLength(3)),
@@ -314,6 +355,9 @@ fn event(name: &str, attempt: u32, peer: &TransportPublicKey) -> Event {
         "path_protocol_1" => failed(QuicErrorKind::Protocol { code: 1 }),
         "path_endpoint_down" => failed(QuicErrorKind::EndpointDown),
         "path_stream" => failed(QuicErrorKind::StreamClosed),
+        "path_allow_set_full" => failed(QuicErrorKind::Refused {
+            reason: QuicRefusal::AllowSetFull,
+        }),
         "up" => Event::EndpointNotUp(QuicAvailability::Up),
         "down" => Event::EndpointNotUp(QuicAvailability::Down),
         "released" => Event::EndpointNotUp(QuicAvailability::Released),
@@ -393,17 +437,19 @@ fn expected(role: Role, state: S, name: &str) -> Option<(S, Vec<Action>)> {
         // The server's way up.
         (Role::Server, S::Idle, "tick") => Some((
             S::Offered,
-            vec![
-                Action::AllowPeerThenOffer { attempt, caps: 0 },
-                Record(Outcome::Offered),
-            ],
+            vec![Action::AllowPeerThenOffer { attempt, caps: 0 }],
         )),
+        (Role::Server, S::Offered, "offer_sent") => Some((state, vec![Record(Outcome::Offered)])),
         (Role::Server, S::Offered, "accept") => {
             Some((S::Connecting, vec![Record(Outcome::Accepted)]))
         }
         (Role::Server, S::Offered, "decline") => fail(
             QuicCloseCode::Downgrade,
             Outcome::Declined(Some(DeclineReason::Busy)),
+        ),
+        (Role::Server, S::Offered, "decline_disabled") => fail(
+            QuicCloseCode::Downgrade,
+            Outcome::Declined(Some(DeclineReason::Disabled)),
         ),
         (Role::Server, S::Offered | S::Connecting, "established") => Some((
             S::Confirming,
@@ -444,8 +490,14 @@ fn expected(role: Role, state: S, name: &str) -> Option<(S, Vec<Action>)> {
         )),
 
         // Failures of the attempt.
-        (_, _, "sent_failed") if live => {
+        (_, _, "sent_failed" | "sent_lost") if live => {
             fail_setup_or_active(Outcome::HandshakeFailed, fallback(FallbackCause::Reset))
+        }
+        (_, _, "sent_identity") if live => {
+            fail(QuicCloseCode::Downgrade, Outcome::IdentityMismatch)
+        }
+        (_, _, "path_allow_set_full") if live => {
+            fail_setup_or_active(Outcome::AllowSetFull, fallback(FallbackCause::Reset))
         }
         (_, _, "refused_version" | "refused_type") if setup => {
             fail(QuicCloseCode::ControlRefused, Outcome::ControlRefused)
@@ -462,7 +514,7 @@ fn expected(role: Role, state: S, name: &str) -> Option<(S, Vec<Action>)> {
         (_, _, "path_protocol") if live => {
             fail_setup_or_active(Outcome::HandshakeFailed, fallback(FallbackCause::Protocol))
         }
-        (_, _, "path_protocol_1") if live => {
+        (_, _, "path_protocol_1" | "sent_protocol_1") if live => {
             Some((S::Rechecking, vec![tear_down(QuicCloseCode::Downgrade)]))
         }
         (_, _, "path_endpoint_down" | "down") if live => Some((
@@ -496,8 +548,88 @@ fn holds_a_permit(state: S) -> bool {
     )
 }
 
-/// One row: the event moves the machine as [`expected`] says, and the path
-/// permit is held exactly while the next state needs it.
+/// What the machine keeps besides its state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Ledger {
+    failures: u32,
+    retry_at: Duration,
+    last_attempt: u32,
+    last_offer: Option<u32>,
+}
+
+impl Ledger {
+    fn of(machine: &UpgradeMachine) -> Self {
+        Self {
+            failures: machine.failures,
+            retry_at: machine.retry_at,
+            last_attempt: machine.last_attempt,
+            last_offer: machine.last_offer,
+        }
+    }
+}
+
+/// The ledger after a row, from `before` at `now`, with no jitter. A row that
+/// is not listed in [`expected`] changes nothing. Written apart from the
+/// machine, with the delays as literals; every table row starts with a count
+/// of 0.
+fn ledger_after(
+    before: Ledger,
+    now: Duration,
+    role: Role,
+    state: S,
+    name: &str,
+    attempt: u32,
+    want: &Option<(S, Vec<Action>)>,
+) -> Ledger {
+    let Some((next, actions)) = want else {
+        return before;
+    };
+    let mut after = before;
+    match name {
+        "offer" => after.last_offer = Some(attempt),
+        "offer_next" => after.last_offer = Some(attempt + 1),
+        "offer_older" => after.last_offer = Some(attempt - 1),
+        "promoted" if role == Role::Server => after.retry_at = now + Duration::from_secs(6),
+        _ => {}
+    }
+    for action in actions {
+        if let Action::AllowPeerThenOffer { attempt, .. } = action {
+            after.last_attempt = *attempt;
+        }
+    }
+    // Leaving an attempt for Idle is what takes a backoff.
+    if *next == S::Idle && !matches!(state, S::Idle | S::Unpromoted) {
+        let recorded = |outcome: fn(&Outcome) -> bool| {
+            actions
+                .iter()
+                .any(|action| matches!(action, Action::Record(o) if outcome(o)))
+        };
+        let delay = if recorded(|o| matches!(o, Outcome::IdentityMismatch)) {
+            after.failures += 1;
+            3600
+        } else if name == "path_allow_set_full"
+            || recorded(|o| {
+                matches!(
+                    o,
+                    Outcome::Declined(Some(
+                        DeclineReason::Busy | DeclineReason::NotReady | DeclineReason::Backoff
+                    ))
+                )
+            })
+        {
+            60
+        } else {
+            after.failures += 1;
+            60
+        };
+        after.retry_at = before.retry_at.max(now + Duration::from_secs(delay));
+    }
+    after
+}
+
+/// One row: the event moves the machine as [`expected`] says, the path permit
+/// is held exactly while the next state needs it, and the ledger moves only as
+/// [`ledger_after`] says.
 fn check(role: Role, state: S, name: &str, attempt: u32, want: Option<(S, Vec<Action>)>) {
     let case = format!("{role:?} {state:?} {name} attempt {attempt}");
     let mut rig = reach(role, state);
@@ -505,7 +637,17 @@ fn check(role: Role, state: S, name: &str, attempt: u32, want: Option<(S, Vec<Ac
     // Past every deadline, so "tick" is due wherever it can be.
     rig.now = rig.machine.deadline().unwrap_or(rig.now).max(rig.now);
     let peer = rig.peer.clone();
+    let want_ledger = ledger_after(
+        Ledger::of(&rig.machine),
+        rig.now,
+        role,
+        state,
+        name,
+        attempt,
+        &want,
+    );
     let actions = rig.step(event(name, attempt, &peer));
+    assert_eq!(Ledger::of(&rig.machine), want_ledger, "{case}: ledger");
     let (next, want_actions) = want.unwrap_or_else(|| (state, Vec::new()));
     assert_eq!(actions, want_actions, "{case}: actions");
     assert_eq!(label(&rig.machine), next, "{case}: next state");
@@ -1094,13 +1236,13 @@ fn an_unknown_decline_reason_is_a_decline() {
 }
 
 /// Each `allow_peer` refusal ends the attempt with its own outcome and a
-/// normal backoff.
+/// 60 s delay. Only a full allow-set, this node's own limit, is not charged.
 #[test]
 fn allow_peer_refusals_end_the_attempt() {
-    for (reason, outcome) in [
-        (QuicRefusal::AllowSetFull, Outcome::AllowSetFull),
-        (QuicRefusal::KeyConflict, Outcome::KeyConflict),
-        (QuicRefusal::UnusableKey, Outcome::HandshakeFailed),
+    for (reason, outcome, failures) in [
+        (QuicRefusal::AllowSetFull, Outcome::AllowSetFull, 0),
+        (QuicRefusal::KeyConflict, Outcome::KeyConflict, 1),
+        (QuicRefusal::UnusableKey, Outcome::HandshakeFailed, 1),
     ] {
         let mut rig = reach(Role::Server, S::Offered);
         let actions = rig.step(Event::PathFailed {
@@ -1108,6 +1250,7 @@ fn allow_peer_refusals_end_the_attempt() {
             kind: QuicErrorKind::Refused { reason },
         });
         assert_eq!(actions[1], Action::Record(outcome));
+        assert_eq!(rig.machine.failures, failures);
         assert_eq!(rig.backoff(), BACKOFF_MIN);
         assert_eq!(rig.in_use(), 0);
     }
@@ -1119,12 +1262,7 @@ fn backoff_doubles_to_its_cap() {
     let mut rig = Rig::promoted(Role::Server);
     for seconds in [60, 120, 240, 480, 960, 1920, 3600, 3600, 3600] {
         rig.now = rig.machine.retry_at.max(rig.now);
-        rig.tick_due();
-        assert_eq!(label(&rig.machine), S::Offered);
-        rig.step(Event::Upgrade(UpgradeControl::Decline {
-            attempt: rig.machine.last_attempt,
-            reason: DeclineReason::Busy.wire(),
-        }));
+        rig.declined(DeclineReason::Disabled.wire());
         assert_eq!(rig.backoff(), Duration::from_secs(seconds));
     }
 }
@@ -1273,4 +1411,520 @@ fn attempt_ids_increase_and_the_old_one_goes_stale() {
     );
     assert_eq!(label(&rig.machine), S::Offered);
     assert_eq!(rig.in_use(), 1);
+}
+
+/// A replaced session's machine continues the backoff of the one before it:
+/// the wait, the count, and a client's refusal during the wait. A seed in the
+/// past leaves the promotion's own delay.
+#[test]
+fn a_replaced_session_continues_the_backoff() {
+    let mut old = Rig::promoted(Role::Server);
+    for _ in 0..3 {
+        old.declined(DeclineReason::Disabled.wire());
+    }
+    let seed = old.machine.backoff_seed();
+    assert_eq!(seed.failures, 3);
+    assert_eq!(seed.retry_at, old.now + Duration::from_secs(240));
+
+    let mut server = Rig::new(Role::Server);
+    server.machine = UpgradeMachine::with_backoff(server.machine.local_key.clone(), seed);
+    server.now = old.now;
+    server.promote(Some(QUIC_UPGRADE_NEGOTIATES_IN));
+    assert_eq!(server.machine.deadline(), Some(seed.retry_at));
+    assert_eq!(
+        server.tick_at(seed.retry_at - Duration::from_nanos(1)),
+        vec![]
+    );
+    server.declined(DeclineReason::Disabled.wire());
+    assert_eq!(
+        server.backoff(),
+        Duration::from_secs(480),
+        "the count went on"
+    );
+
+    let mut client = Rig::new(Role::Client);
+    client.machine = UpgradeMachine::with_backoff(client.machine.local_key.clone(), seed);
+    client.now = old.now;
+    client.promote(Some(QUIC_UPGRADE_NEGOTIATES_IN));
+    assert_eq!(
+        client.offer(1)[1],
+        Action::Record(Outcome::DeclineSent(DeclineReason::Backoff))
+    );
+    client.now = seed.retry_at;
+    assert_eq!(client.offer(2)[2], Action::Record(Outcome::Accepted));
+
+    let mut late = Rig::new(Role::Server);
+    late.machine = UpgradeMachine::with_backoff(late.machine.local_key.clone(), seed);
+    late.now = seed.retry_at + BACKOFF_MAX;
+    late.promote(Some(QUIC_UPGRADE_NEGOTIATES_IN));
+    assert_eq!(
+        late.machine.deadline(),
+        Some(late.now + Duration::from_secs(6))
+    );
+}
+
+/// A stable path clears the count however it ends, also when the session ends
+/// under it, since the count now outlives the machine. A younger one does not.
+#[test]
+fn a_stable_path_ended_by_its_session_clears_the_count() {
+    for (age, failures) in [(STABLE_PATH, 0), (STABLE_PATH - Duration::from_nanos(1), 5)] {
+        for recheck_first in [false, true] {
+            let mut rig = Rig::new(Role::Server);
+            let seed = BackoffSeed {
+                failures: 5,
+                retry_at: Duration::ZERO,
+            };
+            rig.machine = UpgradeMachine::with_backoff(rig.machine.local_key.clone(), seed);
+            rig.promote(Some(QUIC_UPGRADE_NEGOTIATES_IN));
+            let attempt = rig.activate();
+            rig.now += age;
+            if recheck_first {
+                rig.step(Event::PathFailed {
+                    attempt,
+                    kind: QuicErrorKind::Protocol { code: 1 },
+                });
+                assert_eq!(label(&rig.machine), S::Rechecking);
+            }
+            rig.step(Event::SessionEnded);
+            assert_eq!(rig.machine.backoff_seed().failures, failures, "{age:?}");
+        }
+    }
+}
+
+/// A failed `Ready` or `ReadyAck` send takes the path its error means: a
+/// peer's identity close takes the hour, `Protocol{0x1}` rechecks, and a
+/// connection lost to a dead endpoint is the endpoint's and not the peer's.
+#[test]
+fn a_failed_send_takes_the_path_its_error_means() {
+    let lost = |error| send_failed(QuicSendError::ConnectionLost(error));
+    for start in [S::Confirming, S::Active] {
+        let attempt = attempt_of(Role::Server);
+
+        let mut rig = reach(Role::Server, start);
+        let outcome = lost(closed_by_peer(u64::from(
+            QuicCloseCode::IdentityMismatch.code(),
+        )));
+        rig.step(Event::ControlSent { attempt, outcome });
+        assert_eq!(rig.backoff(), Duration::from_secs(3600));
+
+        let mut rig = reach(Role::Server, start);
+        let outcome = lost(quinn::ConnectionError::TransportError(
+            TransportErrorCode::INTERNAL_ERROR.into(),
+        ));
+        rig.step(Event::ControlSent { attempt, outcome });
+        assert_eq!(label(&rig.machine), S::Rechecking);
+        assert_eq!(rig.machine.failures, 0);
+
+        let mut rig = reach(Role::Server, start);
+        rig.availability.send(QuicAvailability::Down).unwrap();
+        let outcome = lost(quinn::ConnectionError::LocallyClosed);
+        let actions = rig.step(Event::ControlSent { attempt, outcome });
+        assert_eq!(
+            actions,
+            vec![
+                Action::TearDown {
+                    attempt,
+                    code: QuicCloseCode::Downgrade,
+                },
+                Action::Record(Outcome::Fallback(FallbackCause::EndpointDown)),
+            ]
+        );
+        assert!(rig.machine.is_off());
+        assert_eq!(rig.machine.failures, 0, "no charge");
+
+        // A stop is one stream's: the path stays, and a deadline settles it.
+        let mut rig = reach(Role::Server, start);
+        let outcome = send_failed(QuicSendError::Stopped(0x10));
+        assert_eq!(rig.step(Event::ControlSent { attempt, outcome }), vec![]);
+        assert_eq!(label(&rig.machine), start);
+        assert_eq!(rig.in_use(), 1);
+
+        // A send that never left this node is a normal failure.
+        let mut rig = reach(Role::Server, start);
+        let outcome = send_failed(QuicSendError::Closed);
+        rig.step(Event::ControlSent { attempt, outcome });
+        assert_eq!(label(&rig.machine), S::Idle);
+        assert_eq!(rig.machine.failures, 1);
+    }
+}
+
+/// `Busy`, `NotReady` and `Backoff` retry at the normal delay and leave the
+/// count where it was, whatever it was. `Disabled` and a reason this node does
+/// not know escalate.
+#[test]
+fn a_decline_that_names_no_fault_leaves_the_count() {
+    for reason in [
+        DeclineReason::Busy,
+        DeclineReason::NotReady,
+        DeclineReason::Backoff,
+    ] {
+        let mut rig = Rig::promoted(Role::Server);
+        rig.declined(DeclineReason::Disabled.wire());
+        rig.declined(DeclineReason::Disabled.wire());
+        assert_eq!(rig.machine.failures, 2);
+        for _ in 0..3 {
+            rig.declined(reason.wire());
+            assert_eq!(rig.machine.failures, 2, "{reason:?}");
+            assert_eq!(rig.backoff(), Duration::from_secs(60), "{reason:?}");
+            assert_eq!(rig.in_use(), 0);
+        }
+    }
+    for wire in [DeclineReason::Disabled.wire(), 200] {
+        let mut rig = Rig::promoted(Role::Server);
+        rig.declined(wire);
+        rig.declined(wire);
+        assert_eq!(rig.machine.failures, 2);
+        assert_eq!(rig.backoff(), Duration::from_secs(120));
+    }
+}
+
+/// `Offered` waits for the report that `allow_peer` worked, so a refused one
+/// is not counted as an offer, and a late or stale report counts nothing.
+#[test]
+fn an_offer_is_recorded_only_once_it_is_sent() {
+    let mut rig = Rig::promoted(Role::Server);
+    assert_eq!(
+        rig.tick_due(),
+        vec![Action::AllowPeerThenOffer {
+            attempt: SERVER_ATTEMPT,
+            caps: 0
+        }]
+    );
+    let stale = Event::OfferSent {
+        attempt: SERVER_ATTEMPT + 1,
+    };
+    assert_eq!(rig.step(stale), vec![]);
+    let actions = rig.step(Event::PathFailed {
+        attempt: SERVER_ATTEMPT,
+        kind: QuicErrorKind::Refused {
+            reason: QuicRefusal::KeyConflict,
+        },
+    });
+    assert!(!actions.contains(&Action::Record(Outcome::Offered)));
+    let late = Event::OfferSent {
+        attempt: SERVER_ATTEMPT,
+    };
+    assert_eq!(rig.step(late), vec![]);
+}
+
+/// The timeouts and windows, written out: the tests above read the constants,
+/// so they would follow a change to one.
+#[test]
+fn timeouts_and_windows_have_these_values() {
+    for (value, seconds) in [
+        (OFFER_TIMEOUT, 10),
+        (CONNECT_TIMEOUT, 10),
+        (CONTROL_SEND_TIMEOUT, 5),
+        (CONFIRM_TIMEOUT, 10),
+        (RECHECK_TIMEOUT, 1),
+        (BACKOFF_MIN, 60),
+        (BACKOFF_MAX, 3600),
+        (IDENTITY_BACKOFF, 3600),
+        (STABLE_PATH, 600),
+        (OFFER_DELAY_MIN, 2),
+        (OFFER_DELAY_MAX, 10),
+    ] {
+        assert_eq!(value, Duration::from_secs(seconds));
+    }
+}
+
+/// A second promotion with a key that would give the other role changes
+/// nothing, on either role.
+#[test]
+fn a_second_promotion_with_another_key_changes_nothing() {
+    let mut sorted = [
+        TransportKeypair::new().public().clone(),
+        TransportKeypair::new().public().clone(),
+        TransportKeypair::new().public().clone(),
+    ];
+    sorted.sort();
+    let [low, middle, high] = sorted;
+    for (first, second, role) in [
+        (low.clone(), high.clone(), Role::Server),
+        (high, low, Role::Client),
+    ] {
+        let mut rig = Rig::new(role);
+        rig.machine = UpgradeMachine::new(middle.clone());
+        rig.peer = first;
+        rig.promote(Some(QUIC_UPGRADE_NEGOTIATES_IN));
+        assert_eq!(rig.machine.role, Some(role));
+        let deadline = rig.machine.deadline();
+        let ledger = Ledger::of(&rig.machine);
+
+        rig.peer = second;
+        rig.now += Duration::from_secs(1);
+        assert_eq!(rig.promote(Some(QUIC_UPGRADE_NEGOTIATES_IN)), vec![]);
+        assert_eq!(rig.machine.role, Some(role));
+        assert_eq!(rig.machine.deadline(), deadline);
+        assert_eq!(Ledger::of(&rig.machine), ledger);
+    }
+}
+
+/// `Off` counts a promotion's verdict once: equal keys do not record a second
+/// conflict, and a session that ended first records nothing and stays `Off`.
+#[test]
+fn a_promotion_after_off_records_nothing() {
+    let mut rig = Rig::new(Role::Server);
+    rig.peer = rig.machine.local_key.clone();
+    assert_eq!(
+        rig.promote(Some(QUIC_UPGRADE_NEGOTIATES_IN)),
+        vec![Action::Record(Outcome::RoleConflict)]
+    );
+    assert_eq!(rig.promote(Some(QUIC_UPGRADE_NEGOTIATES_IN)), vec![]);
+
+    for version in [None, Some(QUIC_UPGRADE_NEGOTIATES_IN)] {
+        for role in [Role::Server, Role::Client] {
+            let mut rig = Rig::new(role);
+            rig.step(Event::SessionEnded);
+            assert_eq!(rig.promote(version), vec![], "{role:?} {version:?}");
+            assert!(rig.machine.is_off());
+            assert_eq!(rig.machine.role, None);
+            assert_eq!(rig.machine.deadline(), None);
+            assert_eq!(
+                rig.offer(1)[1],
+                Action::Record(Outcome::DeclineSent(DeclineReason::Disabled))
+            );
+        }
+    }
+}
+
+const SERVER: usize = 0;
+const CLIENT: usize = 1;
+const LATENCY: Duration = Duration::from_millis(50);
+/// When a side learns of a path whose close was lost: quinn's idle timeout.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long after a loss the two sides may still disagree.
+const SETTLES_WITHIN: Duration = Duration::from_secs(125);
+/// How long after the start they must be back up, the loss being a single one.
+const ACTIVE_WITHIN: Duration = Duration::from_secs(600);
+
+/// The one message a run of [`Pair`] loses, the first time it comes up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lost {
+    Nothing,
+    Offer,
+    Accept,
+    Decline,
+    Dial,
+    Ready,
+    ReadyAck,
+    /// Once both are active, the side named closes the path, and its close
+    /// is lost.
+    CloseFromServer,
+    CloseFromClient,
+}
+
+/// Two machines joined by a wire with a fixed delay, on one clock.
+struct Pair {
+    rigs: [Rig; 2],
+    wire: Vec<(Duration, usize, Event)>,
+    lost: Lost,
+    lost_at: Option<Duration>,
+    /// The attempt that has a QUIC connection between the two.
+    connection: Option<u32>,
+}
+
+impl Pair {
+    fn new(lost: Lost, samples: [f64; 2]) -> Self {
+        let mut pair = Self {
+            rigs: [Rig::new(Role::Server), Rig::new(Role::Client)],
+            wire: Vec::new(),
+            lost,
+            lost_at: None,
+            connection: None,
+        };
+        for side in [SERVER, CLIENT] {
+            pair.rigs[side].sample = samples[side];
+        }
+        let promoted = |rig: &Rig| Event::Promoted {
+            peer_key: rig.peer.clone(),
+            remote_version: Some(QUIC_UPGRADE_NEGOTIATES_IN),
+        };
+        let start = pair.now();
+        // A client not yet promoted is what declines, so a Decline can be lost.
+        let client_at = if lost == Lost::Decline {
+            start + Duration::from_secs(30)
+        } else {
+            start
+        };
+        pair.wire
+            .push((client_at, CLIENT, promoted(&pair.rigs[CLIENT])));
+        pair.step(SERVER, promoted(&pair.rigs[SERVER]));
+        pair
+    }
+
+    fn now(&self) -> Duration {
+        self.rigs[SERVER].now
+    }
+
+    fn lose(&mut self, kind: Lost) -> bool {
+        let lose = self.lost == kind && self.lost_at.is_none();
+        if lose {
+            self.lost_at = Some(self.now());
+        }
+        lose
+    }
+
+    fn send(&mut self, to: usize, kind: Lost, event: Event) {
+        if !self.lose(kind) {
+            self.wire.push((self.now() + LATENCY, to, event));
+        }
+    }
+
+    fn step(&mut self, side: usize, event: Event) {
+        let peer = 1 - side;
+        for action in self.rigs[side].step(event) {
+            match action {
+                Action::AllowPeerThenOffer { attempt, caps } => {
+                    let offer = UpgradeControl::Offer { attempt, caps };
+                    self.send(peer, Lost::Offer, Event::Upgrade(offer));
+                    self.step(side, Event::OfferSent { attempt });
+                }
+                Action::SendUpgrade(message) => {
+                    let kind = match message {
+                        UpgradeControl::Offer { .. } => Lost::Offer,
+                        UpgradeControl::Accept { .. } => Lost::Accept,
+                        UpgradeControl::Decline { .. } => Lost::Decline,
+                    };
+                    self.send(peer, kind, Event::Upgrade(message));
+                }
+                Action::SendControl(frame) => {
+                    let kind = match frame {
+                        QuicControl::Ready { .. } => Lost::Ready,
+                        QuicControl::ReadyAck { .. } => Lost::ReadyAck,
+                    };
+                    self.send(peer, kind, Event::Control(frame));
+                }
+                Action::Dial { attempt } => {
+                    if !self.lose(Lost::Dial) {
+                        self.connection = Some(attempt);
+                        let at = self.now() + LATENCY;
+                        for to in [SERVER, CLIENT] {
+                            self.wire.push((at, to, Event::PathEstablished { attempt }));
+                        }
+                    }
+                }
+                Action::TearDown { attempt, code } if self.connection == Some(attempt) => {
+                    self.connection = None;
+                    let kind = if side == SERVER {
+                        Lost::CloseFromServer
+                    } else {
+                        Lost::CloseFromClient
+                    };
+                    let (delay, kind) = if self.lose(kind) {
+                        (IDLE_TIMEOUT, QuicErrorKind::TimedOut)
+                    } else {
+                        let close = closed_by_peer(u64::from(code.code()));
+                        (LATENCY, QuicErrorKind::from(close))
+                    };
+                    let at = self.now() + delay;
+                    self.wire
+                        .push((at, peer, Event::PathFailed { attempt, kind }));
+                }
+                Action::TearDown { .. } | Action::Record(_) => {}
+            }
+        }
+    }
+
+    /// Nothing on its way, and both up or both down with no permits.
+    fn settled(&self) -> bool {
+        let [server, client] = &self.rigs;
+        let both = |state| label(&server.machine) == state && label(&client.machine) == state;
+        self.wire.is_empty()
+            && ((both(S::Active) && server.in_use() == 1 && client.in_use() == 1)
+                || (both(S::Idle) && server.in_use() == 0 && client.in_use() == 0))
+    }
+
+    /// Runs until nothing is left to happen, and returns when the two sides
+    /// first agreed after the loss.
+    fn run(&mut self) -> Option<Duration> {
+        let mut settled_at = None;
+        for _ in 0..10_000 {
+            if self.lost_at.is_some() && settled_at.is_none() && self.settled() {
+                settled_at = Some(self.now());
+            }
+            let closer = match self.lost {
+                Lost::CloseFromServer => Some(SERVER),
+                Lost::CloseFromClient => Some(CLIENT),
+                _ => None,
+            };
+            let both_active = self.settled() && self.rigs[SERVER].machine.is_active();
+            if let (Some(side), None, true) = (closer, self.lost_at, both_active) {
+                let attempt = self.connection.expect("both are active on a connection");
+                let outcome = BoundedSend::Failed(SendFailure::TimedOut);
+                self.step(side, Event::ControlSent { attempt, outcome });
+                continue;
+            }
+
+            let on_wire = self
+                .wire
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, (at, ..))| *at)
+                .map(|(index, (at, ..))| (*at, index));
+            let due = [SERVER, CLIENT]
+                .into_iter()
+                .filter_map(|side| Some((self.rigs[side].machine.deadline()?, side)))
+                .min();
+            let at = match (on_wire, due) {
+                (None, None) => return settled_at,
+                (Some((at, _)), None) | (None, Some((at, _))) => at,
+                (Some((wire, _)), Some((due, _))) => wire.min(due),
+            };
+            let at = at.max(self.now());
+            for rig in &mut self.rigs {
+                rig.now = at;
+            }
+            match on_wire {
+                Some((wire_at, index)) if wire_at <= at => {
+                    let (_, to, event) = self.wire.remove(index);
+                    self.step(to, event);
+                }
+                _ => {
+                    let (_, side) = due.expect("a time came from one of the two");
+                    self.step(side, Event::Tick);
+                }
+            }
+        }
+        panic!("the machines never went quiet: {:?}", self.lost);
+    }
+}
+
+/// Lose each kind of message once, at several draws of the jitter. The two
+/// sides end up both active or both idle with no permits within a bound, and
+/// the later attempts bring the path up on both.
+#[test]
+fn two_machines_agree_after_any_one_lost_message() {
+    for lost in [
+        Lost::Nothing,
+        Lost::Offer,
+        Lost::Accept,
+        Lost::Decline,
+        Lost::Dial,
+        Lost::Ready,
+        Lost::ReadyAck,
+        Lost::CloseFromServer,
+        Lost::CloseFromClient,
+    ] {
+        for samples in [[NO_JITTER, NO_JITTER], [0.0, 1.0], [1.0, 0.0]] {
+            let case = format!("{lost:?} {samples:?}");
+            let mut pair = Pair::new(lost, samples);
+            let start = pair.now();
+            let settled_at = pair.run();
+            if lost != Lost::Nothing {
+                let lost_at = pair.lost_at.unwrap_or_else(|| panic!("{case}: not lost"));
+                let settled_at = settled_at.unwrap_or_else(|| panic!("{case}: never settled"));
+                assert!(
+                    settled_at - lost_at <= SETTLES_WITHIN,
+                    "{case}: settled {:?} after the loss",
+                    settled_at - lost_at
+                );
+            }
+            assert!(pair.settled(), "{case}: not settled at the end");
+            for rig in &pair.rigs {
+                assert!(rig.machine.is_active(), "{case}");
+            }
+            assert!(pair.now() - start <= ACTIVE_WITHIN, "{case}");
+        }
+    }
 }

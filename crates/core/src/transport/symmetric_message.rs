@@ -1184,9 +1184,6 @@ mod test {
         assert!(may_send_upgrade(Some((major + 1, 0, 0))));
     }
 
-    /// Mirrors `untracked_noop_floor_tracks_the_shipping_release`: the moment
-    /// a release bump lifts the crate to the floor, this fails until someone
-    /// records that the release carries the decoder (or raises the floor).
     /// Same check as `upgrade_floor_tracks_the_shipping_release`, for the
     /// release that first answers an `Offer`.
     #[test]
@@ -1208,6 +1205,18 @@ mod test {
                  already at {crate_version:?}: record the release or raise the floor"
             ),
         }
+    }
+
+    /// Companion, like `upgrade_floor_stays_above_every_release_without_the_decoder`:
+    /// the floor must never drop to a release that decodes an `Offer` and
+    /// ignores it. Every release up to this one is such a release.
+    #[test]
+    fn negotiation_floor_stays_above_every_release_that_ignores_an_offer() {
+        const LAST_RELEASE_THAT_IGNORES_AN_OFFER: (u8, u8, u16) = (0, 2, 152);
+        assert!(
+            QUIC_UPGRADE_NEGOTIATES_IN > LAST_RELEASE_THAT_IGNORES_AN_OFFER,
+            "0.2.152 and older ignore an Offer, so the offer could only time out"
+        );
     }
 
     #[test]
@@ -1248,6 +1257,9 @@ mod test {
         }
     }
 
+    /// Mirrors `untracked_noop_floor_tracks_the_shipping_release`: the moment
+    /// a release bump lifts the crate to the floor, this fails until someone
+    /// records that the release carries the decoder (or raises the floor).
     #[test]
     fn upgrade_floor_tracks_the_shipping_release() {
         let mut parts = env!("CARGO_PKG_VERSION")

@@ -19,14 +19,16 @@
 //! Idle        Promoted, server, below floor Off         ineligible_version
 //! Idle        Promoted, equal keys          Off         role_conflict
 //! Idle        Tick due, server              Offered     allow peer, then Offer
+//! Offered     OfferSent                     Offered     offered
 //! Idle        Tick due, server, no permit   Idle        retry in BACKOFF_MIN, uncharged
 //! Idle        Tick due, policy disabled     Off         -
 //! Idle        Offer, client, all checks ok  Connecting  Accept, dial
 //! Idle        Offer refused by a check      Idle        Decline{reason}
 //! any         stale or repeated Offer       same        -
 //! any         Offer, server                 same        role_conflict
-//! Offered     Accept                        Connecting  -
-//! Offered     Decline                       Idle        tear down, backoff
+//! Offered     Accept                        Connecting  accepted
+//! Offered     Decline, Disabled or unknown  Idle        tear down, backoff
+//! Offered     Decline, any other reason     Idle        tear down, retry in BACKOFF_MIN, uncharged
 //! Offered     PathEstablished               Confirming  Ready (Accept still on its way)
 //! Connecting  PathEstablished, server       Confirming  Ready
 //! Connecting  PathEstablished, client       Confirming  -
@@ -37,8 +39,9 @@
 //! Connecting  Tick past deadline            Idle        tear down, backoff (timeout)
 //! Confirming  Tick past deadline            Idle        tear down, backoff (timeout)
 //! setup       control frame refused         Idle        close CONTROL_REFUSED, backoff
-//! Active      ReadyAck send Failed          Idle        tear down, backoff
-//! Confirming  Ready send Failed             Idle        tear down, backoff
+//! setup or Active  send Failed, timed out   Idle        tear down, backoff
+//! setup or Active  send Failed, lost        as PathFailed
+//! setup or Active  send Failed, stopped     as PathFailed (one stream: no effect)
 //! setup or Active  IdentityMismatch         Idle        close IDENTITY_MISMATCH, 1 h
 //! setup or Active  PathFailed               see classify()
 //! Rechecking  Tick past deadline            Idle or Off backoff, or none if Down
@@ -59,8 +62,19 @@
 //! or dialing through active, so leaving the state returns it.
 //!
 //! No failure downgrades a peer for good: every path to `Idle` leads to a new
-//! offer after the backoff. Only the end of the endpoint or of the session
-//! is final, and neither is charged to the peer. `Off` still answers offers.
+//! offer after the backoff. `Off` is final and is never charged to the peer;
+//! it follows the end of the endpoint or of the session, a policy that
+//! refuses, equal keys, or a peer below the version floor. `Off` still
+//! answers offers.
+//!
+//! A failure the peer is not to blame for does not raise the failure count:
+//! a `Decline` of `Busy`, `NotReady` or `Backoff`, and a full allow-set, retry
+//! after [`BACKOFF_MIN`]. So a peer that stays `NotReady` or in its own backoff
+//! is asked once per [`BACKOFF_MIN`] for as long as that lasts.
+//!
+//! The count and the time of the next attempt outlive a machine through
+//! [`BackoffSeed`]: the caller carries it to the machine of the session that
+//! replaces this one, so a session that flaps does not retry at session rate.
 
 #[cfg(test)]
 mod tests;
@@ -71,8 +85,9 @@ use super::policy::{DisabledBy, PathRefusal, QuicPathPermit, QuicPolicy};
 use crate::transport::TransportPublicKey;
 use crate::transport::metrics::QuicCloseCode;
 use crate::transport::quic::control::{ControlError, QuicControl, caps};
+use crate::transport::quic::error::attribute;
 use crate::transport::quic::liveness::QuicAvailability;
-use crate::transport::quic::path::BoundedSend;
+use crate::transport::quic::path::{BoundedSend, QuicSendError, SendFailure};
 use crate::transport::symmetric_message::{DeclineReason, UpgradeControl, may_offer_upgrade};
 use crate::transport::{QuicErrorKind, QuicRefusal};
 use crate::util::backoff::ExponentialBackoff;
@@ -132,6 +147,10 @@ pub(in crate::transport) enum Event {
     },
     /// [`UpgradeMachine::deadline`] may have passed.
     Tick,
+    /// `allow_peer` worked and the `Offer` of `attempt` is on its way. Report
+    /// it before taking the next event, so nothing can answer the `Offer`
+    /// first.
+    OfferSent { attempt: u32 },
     /// An upgrade message arrived on the UDP session.
     Upgrade(UpgradeControl),
     /// A control frame arrived on the path of its `attempt`.
@@ -158,7 +177,8 @@ pub(in crate::transport) enum Event {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::transport) enum Action {
     /// `allow_peer` for the promoted key, then, only if that worked, send
-    /// this `Offer`. If it did not, report [`Event::PathFailed`].
+    /// this `Offer` and report [`Event::OfferSent`]. If it did not, report
+    /// [`Event::PathFailed`].
     AllowPeerThenOffer { attempt: u32, caps: u32 },
     /// Send on the UDP session.
     SendUpgrade(UpgradeControl),
@@ -265,7 +285,8 @@ enum State {
         deadline: Duration,
         active_since: Option<Duration>,
     },
-    /// Final: the endpoint or the session ended, or the policy refuses.
+    /// Final: the endpoint or the session ended, the policy refuses, the keys
+    /// are equal, or the peer is below the version floor.
     Off,
 }
 
@@ -274,6 +295,9 @@ enum State {
 enum Penalty {
     Normal,
     Identity,
+    /// Nothing is wrong with the peer: the count stays, and the next try is
+    /// after [`BACKOFF_MIN`].
+    Uncharged,
 }
 
 /// What a [`QuicErrorKind`] means for the attempt.
@@ -322,7 +346,12 @@ fn classify(kind: QuicErrorKind) -> Verdict {
                 Outcome::Fallback(FallbackCause::DowngradeReceived),
                 FallbackCause::DowngradeReceived,
             ),
-            QuicRefusal::AllowSetFull => normal(Outcome::AllowSetFull, FallbackCause::Reset),
+            // This node's own limit, so the peer is not charged.
+            QuicRefusal::AllowSetFull => Verdict::Fail {
+                penalty: Penalty::Uncharged,
+                in_setup: Outcome::AllowSetFull,
+                when_active: Outcome::Fallback(FallbackCause::Reset),
+            },
             QuicRefusal::KeyConflict => normal(Outcome::KeyConflict, FallbackCause::Reset),
             QuicRefusal::Handshake
             | QuicRefusal::Version
@@ -347,6 +376,21 @@ fn unit(sample: f64) -> f64 {
     }
 }
 
+/// What a machine hands to the machine of the session that replaces it, so
+/// the backoff survives the replacement. `retry_at` is on the clock of
+/// [`Inputs::now`]; a time in the past means no wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(in crate::transport) struct BackoffSeed {
+    pub(in crate::transport) failures: u32,
+    pub(in crate::transport) retry_at: Duration,
+}
+
+/// Whether the endpoint reads as down now. A connection-scope error of a dead
+/// endpoint can arrive before [`Event::EndpointNotUp`].
+fn endpoint_is_down(cx: Inputs<'_>) -> bool {
+    cx.policy.disabled_by() == Some(DisabledBy::Endpoint(QuicAvailability::Down))
+}
+
 /// The upgrade of one UDP session. See the module docs.
 #[derive(Debug)]
 pub(in crate::transport) struct UpgradeMachine {
@@ -364,14 +408,30 @@ pub(in crate::transport) struct UpgradeMachine {
 
 impl UpgradeMachine {
     pub(in crate::transport) fn new(local_key: TransportPublicKey) -> Self {
+        Self::with_backoff(local_key, BackoffSeed::default())
+    }
+
+    /// A machine that continues the backoff of the session it replaces.
+    pub(in crate::transport) fn with_backoff(
+        local_key: TransportPublicKey,
+        seed: BackoffSeed,
+    ) -> Self {
         Self {
             local_key,
             role: None,
             state: State::Idle,
             last_attempt: 0,
             last_offer: None,
-            failures: 0,
-            retry_at: Duration::ZERO,
+            failures: seed.failures,
+            retry_at: seed.retry_at,
+        }
+    }
+
+    /// The backoff to carry to the next session's machine.
+    pub(in crate::transport) fn backoff_seed(&self) -> BackoffSeed {
+        BackoffSeed {
+            failures: self.failures,
+            retry_at: self.retry_at,
         }
     }
 
@@ -413,6 +473,13 @@ impl UpgradeMachine {
                 remote_version,
             } => self.on_promoted(cx, &peer_key, remote_version),
             Event::Tick => self.on_tick(cx),
+            Event::OfferSent { attempt } => {
+                if self.phase_of(attempt) == Some(Phase::Offered) {
+                    vec![Action::Record(Outcome::Offered)]
+                } else {
+                    Vec::new()
+                }
+            }
             Event::Upgrade(UpgradeControl::Offer { attempt, .. }) => self.on_offer(cx, attempt),
             Event::Upgrade(UpgradeControl::Accept { attempt }) => self.on_accept(cx, attempt),
             Event::Upgrade(UpgradeControl::Decline { attempt, reason }) => {
@@ -421,7 +488,7 @@ impl UpgradeMachine {
             Event::Control(QuicControl::Ready { attempt, .. }) => self.on_ready(cx, attempt),
             Event::Control(QuicControl::ReadyAck { attempt, .. }) => self.on_ready_ack(cx, attempt),
             Event::PathEstablished { attempt } => self.on_established(cx, attempt),
-            Event::ControlSent { attempt, outcome } => self.on_sent(cx, attempt, &outcome),
+            Event::ControlSent { attempt, outcome } => self.on_sent(cx, attempt, outcome),
             Event::ControlRefused { attempt, error } => self.on_refused(cx, attempt, error),
             Event::IdentityMismatch { attempt } => {
                 if self.live_attempt() != Some(attempt) {
@@ -438,10 +505,10 @@ impl UpgradeMachine {
             Event::PathFailed { attempt, kind } => self.on_failed(cx, attempt, kind),
             Event::EndpointNotUp(availability) => match availability {
                 QuicAvailability::Up => Vec::new(),
-                QuicAvailability::Down => self.shut_off(true),
-                QuicAvailability::Disabled | QuicAvailability::Released => self.shut_off(false),
+                QuicAvailability::Down => self.shut_off(cx, true),
+                QuicAvailability::Disabled | QuicAvailability::Released => self.shut_off(cx, false),
             },
-            Event::SessionEnded => self.shut_off(false),
+            Event::SessionEnded => self.shut_off(cx, false),
         }
     }
 
@@ -451,23 +518,27 @@ impl UpgradeMachine {
         peer_key: &TransportPublicKey,
         remote_version: Option<(u8, u8, u16)>,
     ) -> Vec<Action> {
-        if self.role.is_some() {
+        // Off covers what `role` cannot: equal keys leave no role, and a
+        // session can end before its promotion. Neither is counted again.
+        if self.role.is_some() || self.is_off() {
             return Vec::new();
         }
         self.role = Role::of(&self.local_key, peer_key);
         match self.role {
             None => {
-                self.shut_off(false);
+                self.shut_off(cx, false);
                 vec![Action::Record(Outcome::RoleConflict)]
             }
             Some(Role::Client) => Vec::new(),
             Some(Role::Server) if !may_offer_upgrade(remote_version) => {
-                self.shut_off(false);
+                self.shut_off(cx, false);
                 vec![Action::Record(Outcome::IneligibleVersion)]
             }
             Some(Role::Server) => {
                 let spread = OFFER_DELAY_MAX.saturating_sub(OFFER_DELAY_MIN);
-                self.retry_at = cx.now + OFFER_DELAY_MIN + spread.mul_f64(unit(cx.sample));
+                let first_offer = cx.now + OFFER_DELAY_MIN + spread.mul_f64(unit(cx.sample));
+                // A backoff carried from the replaced session may be longer.
+                self.retry_at = self.retry_at.max(first_offer);
                 Vec::new()
             }
         }
@@ -507,8 +578,8 @@ impl UpgradeMachine {
                 if cx.now < deadline {
                     return Vec::new();
                 }
-                if cx.policy.disabled_by() == Some(DisabledBy::Endpoint(QuicAvailability::Down)) {
-                    return self.shut_off(true);
+                if endpoint_is_down(cx) {
+                    return self.shut_off(cx, true);
                 }
                 self.state = State::Idle;
                 self.charge(cx, active_since, Penalty::Normal);
@@ -524,11 +595,10 @@ impl UpgradeMachine {
 
     fn try_offer(&mut self, cx: Inputs<'_>) -> Vec<Action> {
         match cx.policy.admit() {
-            Err(PathRefusal::Disabled(_)) => self.shut_off(false),
-            // At the limit the server does not offer. Nothing is wrong with
-            // this peer, so the failure count stays.
+            Err(PathRefusal::Disabled(_)) => self.shut_off(cx, false),
+            // At the limit the server does not offer.
             Err(PathRefusal::Busy) => {
-                self.retry_at = cx.now + jittered(BACKOFF_MIN, cx.sample);
+                self.charge(cx, None, Penalty::Uncharged);
                 Vec::new()
             }
             Ok(permit) => {
@@ -540,10 +610,7 @@ impl UpgradeMachine {
                     deadline: cx.now + OFFER_TIMEOUT,
                     _permit: permit,
                 };
-                vec![
-                    Action::AllowPeerThenOffer { attempt, caps: 0 },
-                    Action::Record(Outcome::Offered),
-                ]
+                vec![Action::AllowPeerThenOffer { attempt, caps: 0 }]
             }
         }
     }
@@ -605,12 +672,23 @@ impl UpgradeMachine {
         if self.phase_of(attempt) != Some(Phase::Offered) {
             return Vec::new();
         }
+        let reason = DeclineReason::from_wire(reason);
+        let penalty = match reason {
+            // These pass by themselves, so they do not lengthen the wait. A
+            // client that is busy for a while must not then wait an hour.
+            Some(DeclineReason::Busy | DeclineReason::NotReady | DeclineReason::Backoff) => {
+                Penalty::Uncharged
+            }
+            // A peer with QUIC off is asked at most hourly. An unknown reason
+            // is treated the same, as it may not pass.
+            Some(DeclineReason::Disabled) | None => Penalty::Normal,
+        };
         self.fail(
             cx,
             attempt,
             QuicCloseCode::Downgrade,
-            Penalty::Normal,
-            Outcome::Declined(DeclineReason::from_wire(reason)),
+            penalty,
+            Outcome::Declined(reason),
         )
     }
 
@@ -669,7 +747,7 @@ impl UpgradeMachine {
         vec![Action::Record(Outcome::Established)]
     }
 
-    fn on_sent(&mut self, cx: Inputs<'_>, attempt: u32, outcome: &BoundedSend) -> Vec<Action> {
+    fn on_sent(&mut self, cx: Inputs<'_>, attempt: u32, outcome: BoundedSend) -> Vec<Action> {
         if self.live_attempt() != Some(attempt) {
             return Vec::new();
         }
@@ -677,7 +755,28 @@ impl UpgradeMachine {
             // A `MaybeDelivered` may have reached the peer. A deadline or a
             // close from the side still waiting settles it.
             BoundedSend::Sent | BoundedSend::MaybeDelivered(_) => Vec::new(),
-            BoundedSend::Failed(_) => {
+            // A lost connection means what it means anywhere else. The kind
+            // is not attributed yet, unlike a `PathFailed`'s, and a stop is
+            // one stream's, which the deadline settles.
+            BoundedSend::Failed(SendFailure::Error(
+                error @ (QuicSendError::ConnectionLost(_) | QuicSendError::Stopped(_)),
+            )) => {
+                let availability = if endpoint_is_down(cx) {
+                    QuicAvailability::Down
+                } else {
+                    QuicAvailability::Up
+                };
+                self.on_failed(cx, attempt, attribute(availability, error.into()))
+            }
+            BoundedSend::Failed(
+                SendFailure::TimedOut
+                | SendFailure::Error(
+                    QuicSendError::InvalidFrame(_)
+                    | QuicSendError::LengthMismatch { .. }
+                    | QuicSendError::Source(_)
+                    | QuicSendError::Closed,
+                ),
+            ) => {
                 let outcome = if self.is_active() {
                     Outcome::Fallback(FallbackCause::Reset)
                 } else {
@@ -719,7 +818,7 @@ impl UpgradeMachine {
         }
         match classify(kind) {
             Verdict::NoEffect => Vec::new(),
-            Verdict::EndpointDown => self.shut_off(true),
+            Verdict::EndpointDown => self.shut_off(cx, true),
             Verdict::Recheck => {
                 let active_since = self.leave_attempt();
                 self.state = State::Rechecking {
@@ -770,32 +869,52 @@ impl UpgradeMachine {
     }
 
     fn charge(&mut self, cx: Inputs<'_>, active_since: Option<Duration>, penalty: Penalty) {
-        if active_since.is_some_and(|since| cx.now.saturating_sub(since) >= STABLE_PATH) {
-            self.failures = 0;
-        }
-        self.failures = self.failures.saturating_add(1);
+        self.clear_count_if_stable(cx, active_since);
         let delay = match penalty {
-            Penalty::Normal => BACKOFF.delay_for_failures(self.failures),
-            Penalty::Identity => IDENTITY_BACKOFF,
+            Penalty::Normal => {
+                self.failures = self.failures.saturating_add(1);
+                BACKOFF.delay_for_failures(self.failures)
+            }
+            Penalty::Identity => {
+                self.failures = self.failures.saturating_add(1);
+                IDENTITY_BACKOFF
+            }
+            Penalty::Uncharged => BACKOFF_MIN,
         };
         self.retry_at = self.retry_at.max(cx.now + jittered(delay, cx.sample));
     }
 
+    fn clear_count_if_stable(&mut self, cx: Inputs<'_>, active_since: Option<Duration>) {
+        if active_since.is_some_and(|since| cx.now.saturating_sub(since) >= STABLE_PATH) {
+            self.failures = 0;
+        }
+    }
+
     /// Final: no re-offer, and no charge against the peer. `endpoint_down`
     /// records the fallback if an attempt was under way.
-    fn shut_off(&mut self, endpoint_down: bool) -> Vec<Action> {
+    fn shut_off(&mut self, cx: Inputs<'_>, endpoint_down: bool) -> Vec<Action> {
         let mut actions = Vec::new();
-        let was_attempting = match std::mem::replace(&mut self.state, State::Off) {
-            State::Setup { attempt, .. } | State::Active { attempt, .. } => {
-                actions.push(Action::TearDown {
-                    attempt,
-                    code: QuicCloseCode::Downgrade,
-                });
-                true
-            }
-            State::Rechecking { .. } => true,
-            State::Idle | State::Off => false,
+        let mut tear_down = |attempt| {
+            actions.push(Action::TearDown {
+                attempt,
+                code: QuicCloseCode::Downgrade,
+            })
         };
+        // A stable path that ends here clears the count too, since the count
+        // can outlive this machine (`BackoffSeed`).
+        let (was_attempting, active_since) = match std::mem::replace(&mut self.state, State::Off) {
+            State::Setup { attempt, .. } => {
+                tear_down(attempt);
+                (true, None)
+            }
+            State::Active { attempt, since, .. } => {
+                tear_down(attempt);
+                (true, Some(since))
+            }
+            State::Rechecking { active_since, .. } => (true, active_since),
+            State::Idle | State::Off => (false, None),
+        };
+        self.clear_count_if_stable(cx, active_since);
         if endpoint_down && was_attempting {
             actions.push(Action::Record(Outcome::Fallback(
                 FallbackCause::EndpointDown,
