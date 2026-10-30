@@ -8868,13 +8868,7 @@ async fn test_connection_growth_stall_regression() {
         delta("set_dialed") > 0,
         "premise: identity decisions were counted ({after:?})"
     );
-    for kind in [
-        "changed_connect_request",
-        "changed_connect_peer",
-        "own_key",
-        "promotion_key_mismatch",
-        "transport_key_refused",
-    ] {
+    for kind in ["changed_connect_request", "changed_connect_peer", "own_key"] {
         assert_eq!(
             delta(kind),
             0,

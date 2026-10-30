@@ -56,6 +56,28 @@ struct LateTasks {
     /// is waiting, so a registration made between the wait taking `pending`
     /// and starting to wait again is not missed.
     added: tokio::sync::Notify,
+    /// Abort handles of every task registered, and whether the wait future
+    /// has been dropped (see [`AbortLateTasks`]). One lock, so a
+    /// registration is either aborted by the drop or aborted on arrival.
+    aborts: Mutex<(bool, Vec<tokio::task::AbortHandle>)>,
+}
+
+/// Held by the future `wait_for_any_exit` returns. When that future is
+/// dropped (the node is stopping), aborts every task registered through a
+/// [`LateRegistrar`], and any registered later is aborted at once. Tasks
+/// registered before the wait stop on the ring's shutdown token; a late
+/// task (the QUIC accept loop) has no such token, and dropping its
+/// `JoinHandle` only detaches it.
+struct AbortLateTasks(Arc<LateTasks>);
+
+impl Drop for AbortLateTasks {
+    fn drop(&mut self) {
+        let mut aborts = self.0.aborts.lock();
+        aborts.0 = true;
+        for abort in aborts.1.drain(..) {
+            abort.abort();
+        }
+    }
 }
 
 /// Registers tasks with a [`BackgroundTaskMonitor`] at any time, including
@@ -69,8 +91,10 @@ struct LateTasks {
 /// registered here; `BackgroundTaskMonitor::register` at that point would
 /// leave it unmonitored.
 ///
-/// A task registered after the wait future has resolved or been dropped is
-/// not watched by anything; the node is stopping by then.
+/// A task registered after the wait future has resolved is not watched by
+/// anything; the node is stopping by then. Every task registered here is
+/// aborted when the wait future is dropped, or at once if it already has
+/// been.
 #[derive(Clone)]
 pub(crate) struct LateRegistrar {
     late: Arc<LateTasks>,
@@ -82,6 +106,18 @@ impl LateRegistrar {
     pub fn register(&self, name: &'static str, handle: JoinHandle<()>) {
         #[cfg(test)]
         self.late.registered.lock().push(name);
+        {
+            let mut aborts = self.late.aborts.lock();
+            if aborts.0 {
+                tracing::debug!(
+                    task = name,
+                    "Node stopping; aborting a late-registered task"
+                );
+                handle.abort();
+                return;
+            }
+            aborts.1.push(handle.abort_handle());
+        }
         self.late.pending.lock().push(TrackedTask { name, handle });
         self.late.added.notify_one();
     }
@@ -155,8 +191,10 @@ impl BackgroundTaskMonitor {
             std::mem::take(&mut *inner)
         };
         let late = self.late;
+        let abort_late = AbortLateTasks(late.clone());
 
         async move {
+            let _abort_late = abort_late;
             // Each entry in the JoinSet wraps one tracked JoinHandle. When
             // the underlying task exits, the wrapper completes.
             let mut join_set = tokio::task::JoinSet::new();
@@ -413,5 +451,57 @@ mod tests {
             msg.contains("late_panicker") && msg.contains("panicked"),
             "{msg}"
         );
+    }
+    /// Dropping the wait future (the node stopping) aborts the tasks
+    /// registered through a late registrar, before or after the wait
+    /// started, and a task registered after the drop is aborted at once.
+    /// Dropping a `JoinHandle` only detaches its task, so without this a
+    /// late task that never returns (the QUIC accept loop parks) would
+    /// outlive the node.
+    #[tokio::test]
+    async fn dropping_the_wait_aborts_late_tasks() {
+        // A task that never returns; the receiver sees the sender dropped
+        // only when the task is aborted.
+        let parked = || {
+            let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+            let handle = tokio::spawn(async move {
+                let _tx = tx;
+                std::future::pending::<()>().await;
+            });
+            (handle, rx)
+        };
+        let monitor = BackgroundTaskMonitor::new();
+        let registrar = monitor.late_registrar();
+        let (before, before_rx) = parked();
+        registrar.register("before_wait", before);
+        let mut wait = Box::pin(monitor.wait_for_any_exit());
+        let (after, mut after_rx) = parked();
+        registrar.register("after_wait", after);
+        // Poll the wait so it picks up both tasks, then drop it.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut wait)
+                .await
+                .is_err(),
+            "parked tasks do not resolve the wait"
+        );
+        assert!(
+            after_rx
+                .try_recv()
+                .is_err_and(|e| e == tokio::sync::oneshot::error::TryRecvError::Empty),
+            "premise: the task runs while the wait is alive"
+        );
+        drop(wait);
+        for (name, rx) in [("before_wait", before_rx), ("after_wait", after_rx)] {
+            tokio::time::timeout(Duration::from_secs(5), rx)
+                .await
+                .unwrap_or_else(|_| panic!("{name} is aborted when the wait is dropped"))
+                .expect_err("the task never sends");
+        }
+        let (late, late_rx) = parked();
+        registrar.register("after_drop", late);
+        tokio::time::timeout(Duration::from_secs(5), late_rx)
+            .await
+            .expect("a task registered after the drop is aborted at once")
+            .expect_err("the task never sends");
     }
 }

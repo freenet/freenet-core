@@ -1372,7 +1372,10 @@ Liveness ("alive" = the endpoint driver has not ENDED; it does not mean
     accept() returns None or the consumer is gone (WARN). It PARKS
     instead of returning, because the monitor treats any end of a task as
     a node failure, and drops its Sender first, so the consumer's recv()
-    returns None once drained. Attempts still queued each hold a quinn
+    returns None once drained. The parked task is aborted when the node
+    stops: dropping the monitor's wait future aborts every task registered
+    through a LateRegistrar (a JoinHandle dropped alone only detaches its
+    task), and one registered after that is aborted at once. Attempts still queued each hold a quinn
     Incoming, which holds the endpoint: they keep quinn's driver and the
     socket alive until drained or dropped. Call it once per endpoint (a
     second call warns and starts nothing). It hands attempts on with
