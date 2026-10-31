@@ -18,7 +18,8 @@
 //! session with `try_send`. Nothing here waits inside `recv`, and the driver
 //! holds no reference to `recv`'s liveness state (`last_received_nanos`,
 //! `last_inbound_nanos`), so nothing that arrives over QUIC can refresh the UDP
-//! session.
+//! session. With QUIC off a received Offer sets a flag, and the reply goes out at
+//! the top of `recv`'s loop, where a cancelled send is tried again.
 //!
 //! # The caller contract of [`UpgradeMachine`]
 //!
@@ -33,6 +34,8 @@
 //! - [`Session::promote`] ends any older session of the peer key, which files
 //!   its seed, before it steps `Promoted` on this one. [`SeedStore`] compares
 //!   session numbers, so an older session's seed never replaces a newer one's.
+//!   The lock order is a `by_key` shard, then a session's state; nothing holding
+//!   a session's state takes `by_key`.
 //! - Every session reads `now` from its connection's `time_source`, the
 //!   listener's clock clone. A client and a server machine are one machine, with
 //!   the session's lifetime.
@@ -44,7 +47,7 @@
 //! out of reach of the driver.
 
 #[cfg(test)]
-mod tests;
+pub(in crate::transport) mod tests;
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -56,6 +59,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -74,7 +78,9 @@ use crate::transport::quic::identity::PeerKey;
 use crate::transport::quic::path::{BoundedSend, QuicInbound, QuicPath, QuicPathLimits};
 use crate::transport::quic::{QuicConnection, QuicEndpoint, QuicIncoming, QuicPeerPermit};
 use crate::transport::symmetric_message::UpgradeControl;
-use crate::transport::{QuicErrorKind, QuicRefusal, Socket, normalize_mapped_addr};
+use crate::transport::{
+    QuicErrorKind, QuicRefusal, Socket, TRANSPORT_METRICS, normalize_mapped_addr,
+};
 
 /// Pending events of one session. Peer-sent messages are dropped when it is full
 /// (`try_send`), and the session's own tasks wait for room.
@@ -86,6 +92,35 @@ const SESSION_INBOX_CAPACITY: usize = 32;
 /// first; losing one costs that peer one early offer, which the peer's own
 /// backoff then answers.
 const SEED_STORE_ENTRIES: NonZeroUsize = NonZeroUsize::new(4096).expect("not zero");
+
+/// A connection sends at most one `Decline` per this long. A `Decline` needs no
+/// operation state and is tracked and retransmitted, so without a bound a peer
+/// grows this node's memory and upload with its own, one Offer per packet id.
+const DECLINE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The bound on `Decline` replies, one per connection, on the connection's clock:
+/// a field of `PeerConnection` with QUIC off and of the driver with QUIC on. An
+/// offerer whose reply is held back times out as `NoReply`, the same penalty as
+/// `Disabled`.
+#[derive(Default)]
+pub(in crate::transport) struct DeclineGate {
+    last_nanos: Option<u64>,
+}
+
+impl DeclineGate {
+    /// Whether a `Decline` may be sent now. A `false` is counted here.
+    pub(in crate::transport) fn admit(&mut self, now_nanos: u64) -> bool {
+        let held_back = self.last_nanos.is_some_and(|last| {
+            now_nanos.saturating_sub(last) < DECLINE_INTERVAL.as_nanos() as u64
+        });
+        if held_back {
+            TRANSPORT_METRICS.record_upgrade_decline_suppressed();
+            return false;
+        }
+        self.last_nanos = Some(now_nanos);
+        true
+    }
+}
 
 /// The clock of the node's QUIC paths: the one quinn runs on. In production
 /// `RealTime`, in a simulation the network's `VirtualTime`.
@@ -783,21 +818,44 @@ impl Session {
     /// Not waiting: a session is reached through its lock, and every step here is
     /// a local close or a map update.
     fn promote(self: &Arc<Self>, key: TransportPublicKey) {
-        let held = self
-            .hub
-            .by_key
-            .insert(key.clone(), Arc::downgrade(self))
-            .and_then(|held| held.upgrade());
-        if let Some(held) = held.filter(|held| held.id != self.id) {
-            if held.id > self.id {
-                // A newer session of this key got here first, so this one is the
-                // older of the two, and it ends. This one's zeros file nothing:
-                // it has taken no seed.
-                self.hub.by_key.insert(key, Arc::downgrade(&held));
-                self.end();
+        // The compare and the write are one step under the entry's guard, so of
+        // any number of sessions of a key the newest stands. `peer_key` is set
+        // under the guard too: `end` finds this entry through it, and waits for
+        // the guard, so an entry written here is never left behind.
+        let entry = self.hub.by_key.entry(key.clone());
+        {
+            let mut state = self.state.lock();
+            if state.ended {
                 return;
             }
-            held.end();
+            state.peer_key = Some(key.clone());
+        }
+        let older = match entry {
+            Entry::Vacant(slot) => {
+                slot.insert(Arc::downgrade(self));
+                None
+            }
+            Entry::Occupied(mut slot) => {
+                let live = slot.get().upgrade().filter(|held| !held.state.lock().ended);
+                match live {
+                    Some(held) if held.id > self.id => {
+                        // A newer session of this key got here first, so this one
+                        // is the older of the two, and it ends. It files nothing:
+                        // it has taken no seed.
+                        drop(slot);
+                        self.end();
+                        return;
+                    }
+                    Some(held) if held.id == self.id => None,
+                    held => {
+                        slot.insert(Arc::downgrade(self));
+                        held
+                    }
+                }
+            }
+        };
+        if let Some(older) = older {
+            older.end();
         }
         let backoff = self.hub.seeds.lock().seed_for(&key);
         let sends = {
@@ -805,7 +863,6 @@ impl Session {
             if state.ended {
                 return;
             }
-            state.peer_key = Some(key.clone());
             let actions = self.step(
                 &mut state,
                 Event::Promoted {
@@ -928,6 +985,7 @@ async fn drive<S: Socket, T: TimeSource>(
     let mut availability = session.hub.endpoint.availability();
     let mut watching_endpoint = true;
     let mut timer: Option<(u64, crate::simulation::BoxedSleep)> = None;
+    let mut declines = DeclineGate::default();
     loop {
         let deadline = session.deadline_nanos();
         if timer.as_ref().map(|(at, _)| *at) != deadline {
@@ -960,7 +1018,10 @@ async fn drive<S: Socket, T: TimeSource>(
             match send {
                 UdpSend::Offer { attempt, caps } => {
                     // The session may have been ended by a newer one, from another
-                    // task, since the step that asked for this.
+                    // task, since the step that asked for this. The check is not
+                    // atomic with the send, so one Offer per attempt can still go
+                    // out for a session just ended. Its allow-set entry is gone,
+                    // so the peer's dial fails as after a lost datagram.
                     if !session.attempt_is_live(attempt) {
                         continue;
                     }
@@ -970,12 +1031,20 @@ async fn drive<S: Socket, T: TimeSource>(
                         // Before the driver reads the inbox again, so no reply
                         // to this offer can be stepped first.
                         Ok(()) => sends.extend(session.take(Event::OfferSent { attempt })),
+                        // No `OfferSent`, so the machine's Offer deadline still
+                        // runs: a send that failed here is charged as `NoReply`.
                         Err(error) => {
                             tracing::debug!(%error, attempt, "QUIC upgrade offer not sent");
                         }
                     }
                 }
                 UdpSend::Reply(control) => {
+                    if matches!(control, UpgradeControl::Decline { .. })
+                        && !declines.admit(time.now_nanos())
+                    {
+                        session.note(|| format!("held back {control:?}"));
+                        continue;
+                    }
                     session.note(|| format!("sent {control:?}"));
                     if let Err(error) = sender.send(control).await {
                         tracing::debug!(%error, ?control, "QUIC upgrade reply not sent");
@@ -1054,6 +1123,30 @@ impl QuicPathState {
     /// The node promoted this connection under `key` and the transport took it.
     pub(in crate::transport) fn promote(&self, key: TransportPublicKey) {
         self.session.promote(key);
+    }
+
+    /// Hand the driver what a path's pump hands it for a control frame, and the
+    /// path's end.
+    #[cfg(test)]
+    pub(in crate::transport) fn inject_quic_inbound(&self) {
+        for event in [
+            SessionEvent::ControlFrame {
+                attempt: 1,
+                payload: Bytes::from_static(&[1, 0, 0, 0, 0, 1, 0, 0, 0, 0]),
+            },
+            SessionEvent::PathClosed {
+                attempt: 1,
+                kind: QuicErrorKind::TimedOut,
+            },
+        ] {
+            assert!(self.session.inbox.try_send(event).is_ok());
+        }
+    }
+
+    /// The key this session was promoted under, if any.
+    #[cfg(test)]
+    pub(in crate::transport) fn promoted_key(&self) -> Option<TransportPublicKey> {
+        self.session.state.lock().peer_key.clone()
     }
 }
 

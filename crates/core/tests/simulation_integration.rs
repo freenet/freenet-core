@@ -20734,6 +20734,8 @@ struct QuicShadowRun {
     /// Gateways first.
     nodes: Vec<SocketAddr>,
     logs_events: usize,
+    /// Connections the run's event log reports as formed.
+    connections: usize,
 }
 
 impl QuicShadowRun {
@@ -20795,11 +20797,19 @@ fn run_quic_shadow_sim(
     sim.run_simulation_direct::<rand::rngs::SmallRng>(seed, 1, steps, QUIC_EVENT_WAIT)
         .expect("direct simulation should succeed");
     let rt = create_runtime();
-    let logs_events = rt.block_on(async { logs_handle.lock().await.len() });
+    let (logs_events, connections) = rt.block_on(async {
+        let logs = logs_handle.lock().await;
+        let connections = logs
+            .iter()
+            .filter(|log| log.kind.connect_connected_addrs().is_some())
+            .count();
+        (logs.len(), connections)
+    });
     QuicShadowRun {
         trace,
         nodes: addresses,
         logs_events,
+        connections,
     }
 }
 
@@ -20948,6 +20958,7 @@ fn test_quic_off_nodes_exchange_no_upgrade_messages() {
         4,
         |_, trace, _| run_as_first_negotiating_release(trace),
     );
+    assert!(run.connections > 0, "the nodes must have connected");
     assert!(run.trace.records().is_empty(), "{}", run.dump());
     for node in &run.nodes {
         assert_eq!(run.trace.permits_in_use(*node), None, "it has no upgrades");
@@ -20967,10 +20978,11 @@ fn test_quic_old_peers_are_never_offered() {
         ((0, 2, 148), "decoder-floor"),
         ((0, 2, 149), "answer-floor"),
     ] {
-        if !(min <= version && version <= real) {
-            tracing::warn!(?version, "SKIPPED: not advertisable on this release");
-            continue;
-        }
+        assert!(
+            min <= version && version <= real,
+            "{version:?} is no longer advertisable ({min:?} to {real:?}): \
+             move this test's versions"
+        );
         let mut ineligible = 0;
         for old_index in [0, 1] {
             let run = run_quic_shadow_sim(
@@ -21037,21 +21049,20 @@ fn test_quic_blackholed_path_falls_back_and_is_reoffered() {
     );
 }
 
-/// A path that goes quiet ends with the idle timeout, the session stays up, and
-/// the server offers again. Simulated time has no keepalive, so an idle timeout is
-/// what a path whose datagrams vanish looks like here.
+/// An established path with nothing on it ends with the idle timeout, the session
+/// stays up, and the server offers again. Simulated time has no keepalive, so the
+/// path idles out with no datagram dropped.
 #[test_log::test]
-fn test_quic_established_path_that_idles_out_falls_back() {
+fn test_quic_idle_established_path_falls_back_and_is_reoffered() {
     let run = run_quic_shadow_sim(
         "quic-idle-out",
         0x5940_E5B0_0006,
         (1, 1),
         15,
-        |sim, trace, labels| {
+        |sim, trace, _| {
             sim.with_transport_quic("shadow");
             run_as_first_negotiating_release(trace);
             sim.with_quic_idle_timeout(Duration::from_secs(20));
-            sim.drop_quic_datagrams_between(&labels[0], &labels[1], Duration::from_secs(25));
         },
     );
     let server = run.server();

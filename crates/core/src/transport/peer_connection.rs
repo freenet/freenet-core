@@ -473,6 +473,12 @@ pub struct PeerConnection<S = super::UdpSocket, T: TimeSource = RealTime> {
     /// before `inbound_budget`, which its path charges, so the path goes first
     /// (`quic_path_state_is_declared_before_the_budget`). `None` with QUIC off.
     quic_path: Option<super::quic::upgrade::driver::QuicPathState>,
+    /// With QUIC off, bounds the replies to upgrade offers. Fixed size.
+    decline_gate: super::quic::upgrade::driver::DeclineGate,
+    /// With QUIC off, the attempt of an Offer to decline, sent at the top of
+    /// `recv`'s loop and cleared only once that send has finished, so a
+    /// cancelled `recv` sends it on its next call.
+    pending_decline: Option<u32>,
     /// Where a test records this connection's upgrade messages.
     #[cfg(any(test, feature = "testing"))]
     upgrade_trace: Option<super::quic::upgrade::sim_trace::NodeTrace>,
@@ -1045,6 +1051,24 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         self
     }
 
+    /// Refuse the Offer of `attempt`, with QUIC off. A failed send costs what a
+    /// lost datagram costs, so it is not tried again. A cancelled one is: it
+    /// charged nothing, and at worst the peer reads a second `Decline`.
+    async fn send_pending_decline(&mut self, attempt: u32) {
+        let decline = UpgradeControl::Decline {
+            attempt,
+            reason: symmetric_message::DeclineReason::Disabled.wire(),
+        };
+        if let Err(error) = self.upgrade_sender().send(decline).await {
+            tracing::debug!(
+                peer_addr = %self.remote_conn.remote_addr,
+                %error,
+                "Could not decline a QUIC upgrade offer"
+            );
+        }
+        self.pending_decline = None;
+    }
+
     /// What sends this connection's upgrade messages on the UDP session.
     fn upgrade_sender(&self) -> UpgradeSender<S, T> {
         UpgradeSender {
@@ -1336,6 +1360,8 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             legacy_tokens: HashMap::new(),
             inbound_outcomes: [0; super::metrics::InboundStreamOutcome::COUNT],
             quic_path: None,
+            decline_gate: Default::default(),
+            pending_decline: None,
             #[cfg(any(test, feature = "testing"))]
             upgrade_trace: None,
             inbound_budget: inbound_budget::SharedInboundBudget::new(
@@ -1469,6 +1495,9 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             if self.receipts_flush_due {
                 self.receipts_flush_due = false;
                 self.flush_receipts_now().await?;
+            }
+            if let Some(attempt) = self.pending_decline {
+                self.send_pending_decline(attempt).await;
             }
             // The resend timer disarms when it fires; if the resend branch left it
             // unarmed (send error path), re-arm with a short delay rather than
@@ -2970,19 +2999,13 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                 }
                 // QUIC is off here, so an Offer can only be refused. A reply to
                 // a received Offer needs no version gate. Accept and Decline
-                // answer offers this node never made.
+                // answer offers this node never made. The reply is sent at the
+                // top of `recv`'s loop: this Offer is already in the dedup
+                // window, so a send cancelled here would lose it for good.
                 match control {
                     UpgradeControl::Offer { attempt, .. } => {
-                        let decline = UpgradeControl::Decline {
-                            attempt,
-                            reason: symmetric_message::DeclineReason::Disabled.wire(),
-                        };
-                        if let Err(error) = self.upgrade_sender().send(decline).await {
-                            tracing::debug!(
-                                peer_addr = %self.remote_conn.remote_addr,
-                                %error,
-                                "Could not decline a QUIC upgrade offer"
-                            );
+                        if self.decline_gate.admit(self.time_source.now_nanos()) {
+                            self.pending_decline = Some(attempt);
                         }
                     }
                     UpgradeControl::Accept { .. } | UpgradeControl::Decline { .. } => {}
@@ -3508,8 +3531,6 @@ fn report_sent_tagged<T: crate::simulation::TimeSource>(
     }
 }
 
-/// Send one payload, unpaced by the node-wide egress cap (it is charged at
-/// the socket; see `packet_sending_paced`).
 /// Sends upgrade messages on one UDP session, as tracked packets (the receiver
 /// acks them like a short message). Holds only what a send needs, so what holds
 /// it can reach nothing of the session's receive state, its liveness included.
@@ -3524,30 +3545,45 @@ pub(in crate::transport) struct UpgradeSender<S, T: TimeSource> {
 
 impl<S: super::Socket, T: TimeSource> UpgradeSender<S, T> {
     /// Send `control`. Its receipts go on the receive path's own packets.
+    ///
+    /// Cancellation safe: flight size is charged and the packet tracked only
+    /// after the socket took it, with no await between, so a send that fails or
+    /// is dropped leaves nothing in flight.
     pub(in crate::transport) async fn send(&self, control: UpgradeControl) -> Result<()> {
         /// A small upgrade message, with its packet overhead.
         const PACKET_SIZE: usize = 64;
         let packet_id = self
             .last_packet_id
             .fetch_add(1, std::sync::atomic::Ordering::Release);
-        let token = self.congestion_controller.on_send_with_token(PACKET_SIZE);
-        packet_sending(
-            self.remote_addr,
-            &self.socket,
+        let payload = SymmetricMessagePayload::Upgrade(control);
+        let outbound_class = super::shadow_demand::classify(&payload);
+        let packet = SymmetricMessage::serialize_msg_to_packet_data(
             packet_id,
+            payload,
             &self.outbound_symmetric_key,
             Vec::new(),
-            SymmetricMessagePayload::Upgrade(control),
-            &self.sent_tracker,
+        )?
+        .prepared_send();
+        self.socket
+            .send_to(&packet, self.remote_addr)
+            .await
+            .map_err(|e| TransportError::send_failed(self.remote_addr, e.kind()))?;
+        super::shadow_demand::record_outbound(outbound_class, packet.len());
+        let token = self.congestion_controller.on_send_with_token(PACKET_SIZE);
+        report_sent_tagged(
+            &mut self.sent_tracker.lock(),
+            packet_id,
+            packet,
             PACKET_SIZE,
             token,
             PacketStream::Control,
-            &self.last_packet_id,
-        )
-        .await
+        );
+        Ok(())
     }
 }
 
+/// Send one payload, unpaced by the node-wide egress cap (it is charged at
+/// the socket; see `packet_sending_paced`).
 #[allow(clippy::too_many_arguments)]
 async fn packet_sending<S: super::Socket, T: crate::simulation::TimeSource>(
     remote_addr: SocketAddr,

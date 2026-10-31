@@ -697,6 +697,12 @@ impl<T: TimeSource> SentPacketTracker<T> {
     /// before they explicitly release its `on_send` bytes (issue #4345) — which
     /// would otherwise double-release if a future multi-packet send path
     /// registered the packet and then failed.
+    /// Packets still tracked for a receipt.
+    #[cfg(test)]
+    pub(super) fn pending_len(&self) -> usize {
+        self.pending_receipts.len()
+    }
+
     pub(super) fn contains_packet(&self, packet_id: PacketId) -> bool {
         self.pending_receipts.contains_key(&packet_id)
     }

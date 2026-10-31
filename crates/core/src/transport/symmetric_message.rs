@@ -409,11 +409,10 @@ pub(crate) enum SymmetricMessagePayload {
     /// Control message for upgrading this UDP session to QUIC in place
     /// (#5940, step e). Bincode index 7.
     ///
-    /// Decode-only for now: a node counts one on receipt and otherwise
-    /// ignores it, and nothing sends it. It ships in a release before any
-    /// sender does, because a peer at or below 0.2.147 panics on a payload it
-    /// cannot decode and 0.2.148 drops it. A sender must first pass
-    /// [`may_send_upgrade`] for the remote's version.
+    /// Sent by the upgrade driver, or as a `Decline` by a node with QUIC off.
+    /// A peer at or below 0.2.147 panics on a payload it cannot decode and
+    /// 0.2.148 drops it, so a sender must first pass [`may_send_upgrade`] for
+    /// the remote's version. A reply to a received Offer needs no such check.
     Upgrade(UpgradeControl),
 }
 

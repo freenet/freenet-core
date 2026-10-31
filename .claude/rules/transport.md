@@ -364,8 +364,9 @@ plus `egress_bytes`, `egress_bytes_waited`, `egress_wait_us_sum` / `_max`,
 `egress_long_waits_<cause>`, `egress_streams_abandoned_<cause>`,
 `egress_streams_refused_<cause>`, `egress_debt_hwm_bytes`,
 `egress_debt_forgiven_bytes`; all zero without
-`total-bandwidth-limit`), QUIC upgrade control messages received and
-ignored (`upgrade_control_received`) and hole-punch handshake packets dropped,
+`total-bandwidth-limit`), QUIC upgrade control messages received
+(`upgrade_control_received`), Decline replies held back
+(`upgrade_decline_suppressed`) and hole-punch handshake packets dropped,
 one count per packet, because they were not encrypted under the attempt's
 inbound session key (`handshake_unauthenticated_dropped`), QUIC endpoint deaths
 (`quic_endpoint_down`), panics the QUIC socket adapter caught
@@ -643,6 +644,19 @@ A node that receives one acks it like a ShortMessage, counts it
 connection over it. With upgrades (see "Upgrade driver") it goes to the
 session's driver. Without them an Offer gets Decline{Disabled} and an Accept
 or a Decline is dropped.
+
+At most one Decline per connection per DECLINE_INTERVAL (60 s), on the
+connection's clock (quic/upgrade/driver.rs DeclineGate; the same type on
+PeerConnection with QUIC off and in the driver with QUIC on). A Decline is
+tracked and retransmitted, and each Offer under a new packet id would otherwise
+get its own. One held back is counted by the gate (upgrade_decline_suppressed)
+and costs the offerer NoReply after OFFER_TIMEOUT, which takes a normal backoff,
+including where the reason would have been uncharged (Busy, NotReady, Backoff).
+With QUIC off the reply is not sent in process_inbound: the Offer is already in
+the dedup window, so a cancelled send would lose it. pending_decline holds the
+attempt, the top of recv's loop sends it, and it is cleared only once that send
+has finished, so a cancelled recv sends it on its next call. A failed send is
+not tried again.
 
 Version gate: send it only when may_send_upgrade(remote_version) is true,
 i.e. the remote is at or above QUIC_UPGRADE_MIN_VERSION (0.2.149). None
@@ -983,7 +997,9 @@ task, no select arm and no GlobalRng draw. It owns one task per connection, whic
 runs the machine, so nothing of a negotiation runs inside `recv`, which only
 `try_send`s a received Upgrade to it.
   Sends: UDP Upgrade messages are tracked packets, sent by the driver through
-  UpgradeSender, which holds only what a send needs. Control frames go through
+  UpgradeSender, which holds only what a send needs. It charges flight size and
+  tracks the packet only after the socket took it, with no await between, so a
+  send that fails or is dropped leaves nothing in flight. Control frames go through
   send_control_bounded in a task per send, and nothing else is sent on a path.
   Paths: QuicPath::with_budget(.., QuicPathLimits::SHADOW, the connection's
   inbound budget), on the clock quinn runs on (PathClock: RealTime, or the
@@ -999,7 +1015,11 @@ runs the machine, so nothing of a negotiation runs inside `recv`, which only
   Same only, so a dialled key alone does not start an upgrade. It first ends any
   older session of the key, through that session's lock (never held across an
   await): its path closes and its seed is filed. An older session arriving after
-  a newer one ends itself. Session numbers order sessions in BackoffSeed filing.
+  a newer one ends itself. The compare and the write are one step inside
+  by_key.entry(), after checking that this session has not ended, so an ended
+  session adds no entry and an ended session's entry is replaced. Lock order: a
+  by_key shard, then a session's state; nothing holding a session's state takes
+  by_key. Session numbers order sessions in BackoffSeed filing.
   Backoff store: an LRU of SEED_STORE_ENTRIES (4096) peer keys with fixed-size
   values; the least recently used goes first.
   Attempts: the listener's attempt queue goes to a registered task

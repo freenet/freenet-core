@@ -60,19 +60,19 @@ use crate::transport::quic::upgrade::machine::{BACKOFF_MIN, OFFER_TIMEOUT};
 use crate::transport::quic::upgrade::policy::QuicPolicyConfig;
 use crate::transport::symmetric_message::QUIC_UPGRADE_NEGOTIATES_IN;
 
-struct Harness {
+pub(in crate::transport) struct Harness {
     pair: Pair,
     hub: Arc<QuicUpgrades>,
     /// The peer's address and key, as the hub's node knows them.
     remote: SocketAddr,
-    peer: TransportPublicKey,
+    pub(in crate::transport) peer: TransportPublicKey,
     /// The clock of every session of the hub, in nanoseconds.
     now: Arc<AtomicU64>,
 }
 
 impl Harness {
     /// A hub whose node has the higher key, so its sessions are servers.
-    async fn server(network: &str, subnet: u8) -> Self {
+    pub(in crate::transport) async fn server(network: &str, subnet: u8) -> Self {
         let a_addr: SocketAddr = format!("10.204.{subnet}.1:5000").parse().unwrap();
         let b_addr: SocketAddr = format!("10.204.{subnet}.2:5000").parse().unwrap();
         let pair = pair(network, a_addr, b_addr, None).await;
@@ -105,6 +105,11 @@ impl Harness {
             peer,
             now: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// How a connection joins this hub, with a driver of its own.
+    pub(in crate::transport) fn site(&self) -> UpgradeSite {
+        UpgradeSite::new(Some(&self.hub), self.remote)
     }
 
     fn session(&self) -> (Arc<Session>, mpsc::Receiver<SessionEvent>) {
@@ -413,4 +418,138 @@ fn a_session_is_opened_on_the_connections_budget() {
         .expect("the function");
     let (body, _) = rest.split_once("\n    }\n").expect("its end");
     assert!(body.contains("self.inbound_budget.clone(),"), "{body}");
+}
+
+/// One `Decline` per interval, measured from the last one let through, and a clock
+/// that steps back holds it back rather than opening the gate.
+#[test]
+fn the_decline_gate_admits_one_per_interval() {
+    const INTERVAL: u64 = 60_000_000_000;
+    let before = TRANSPORT_METRICS.cumulative_upgrade_decline_suppressed();
+    let mut gate = DeclineGate::default();
+    assert!(gate.admit(5), "the first one goes");
+    assert!(!gate.admit(5), "at the same instant");
+    assert!(!gate.admit(5 + INTERVAL - 1), "one nanosecond short");
+    assert!(!gate.admit(0), "a clock stepping back");
+    assert!(gate.admit(5 + INTERVAL), "exactly one interval later");
+    assert!(!gate.admit(5 + 2 * INTERVAL - 1), "the interval restarted");
+    // Other tests may only add to it.
+    assert!(
+        TRANSPORT_METRICS.cumulative_upgrade_decline_suppressed() - before >= 4,
+        "every `false` is counted where it is decided"
+    );
+    assert_eq!(DECLINE_INTERVAL, Duration::from_secs(60));
+}
+
+/// A repeat of a promotion on an ended session adds no entry: nothing would ever
+/// remove it.
+#[test]
+fn a_promotion_of_an_ended_session_adds_no_entry() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let h = Harness::server("quic-driver-ended", 7).await;
+        let (session, _rx) = h.session();
+        session.promote(h.peer.clone());
+        session.end();
+        assert!(h.hub.by_key.is_empty());
+        session.promote(h.peer.clone());
+        assert!(h.hub.by_key.is_empty(), "the session ended");
+    });
+}
+
+/// An ended session's entry does not stand in the way of a live one, even with a
+/// higher number.
+#[test]
+fn an_entry_of_an_ended_session_is_replaced() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let h = Harness::server("quic-driver-dead-entry", 8).await;
+        let (older, _older_rx) = h.session();
+        let (newer, _newer_rx) = h.session();
+        newer.end();
+        h.hub.by_key.insert(h.peer.clone(), Arc::downgrade(&newer));
+        older.promote(h.peer.clone());
+        assert!(!older.state.lock().ended, "nothing live is newer");
+        let held = h.hub.by_key.get(&h.peer).unwrap().upgrade().unwrap();
+        assert_eq!(held.id, older.id);
+    });
+}
+
+/// Three sessions of one key promoted at once: whatever the order, only the newest
+/// is left live and it holds the entry. Without one step for the compare and the
+/// write, two can stay live.
+#[test]
+fn of_three_sessions_promoted_at_once_only_the_newest_stays() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let h = Harness::server("quic-driver-three", 9).await;
+        for round in 0..2000 {
+            let (a, _a_rx) = h.session();
+            let (b, _b_rx) = h.session();
+            let (c, _c_rx) = h.session();
+            let barrier = std::sync::Barrier::new(3);
+            std::thread::scope(|scope| {
+                for session in [&a, &b, &c] {
+                    let (barrier, key) = (&barrier, h.peer.clone());
+                    scope.spawn(move || {
+                        barrier.wait();
+                        session.promote(key);
+                    });
+                }
+            });
+            assert!(a.state.lock().ended, "round {round}: the oldest");
+            assert!(b.state.lock().ended, "round {round}: the middle one");
+            assert!(!c.state.lock().ended, "round {round}: the newest");
+            let held = h.hub.by_key.get(&h.peer).unwrap().upgrade().unwrap();
+            assert_eq!(held.id, c.id, "round {round}");
+            drop(held);
+            c.end();
+            assert!(h.hub.by_key.is_empty(), "round {round}");
+        }
+    });
+}
+
+/// A full inbox drops what the peer sent, and counts it, and a helper's report of a
+/// path's end waits for room and arrives.
+#[test]
+fn a_full_inbox_drops_peer_messages_and_still_delivers_a_path_end() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let h = Harness::server("quic-driver-overflow", 10).await;
+        let (session, mut inbox) = h.session();
+        let state = QuicPathState {
+            session: Arc::clone(&session),
+            driver: tokio::spawn(std::future::pending()),
+        };
+        let offer = UpgradeControl::Offer {
+            attempt: 1,
+            caps: 0,
+        };
+        for _ in 0..SESSION_INBOX_CAPACITY {
+            state.on_upgrade(offer);
+        }
+        assert_eq!(h.hub.inbox_overflow.load(Ordering::Relaxed), 0);
+        state.on_upgrade(offer);
+        assert_eq!(h.hub.inbox_overflow.load(Ordering::Relaxed), 1);
+
+        let helper_inbox = session.inbox.clone();
+        let helper = tokio::spawn(async move {
+            let event = SessionEvent::PathClosed {
+                attempt: 1,
+                kind: QuicErrorKind::TimedOut,
+            };
+            report(&helper_inbox, event).await;
+        });
+        tokio::task::yield_now().await;
+        assert!(!helper.is_finished(), "the helper waits for room");
+        assert!(matches!(inbox.recv().await, Some(SessionEvent::Upgrade(_))));
+        helper
+            .await
+            .expect("the helper finishes once there is room");
+        let mut last = None;
+        for _ in 0..SESSION_INBOX_CAPACITY {
+            last = inbox.recv().await;
+        }
+        assert!(matches!(last, Some(SessionEvent::PathClosed { .. })));
+    });
 }
