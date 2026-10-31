@@ -8218,15 +8218,20 @@ mod tests {
             })
             .collect();
         // Directly, or through the QUIC crash-loop breaker's `gate` (#5940),
-        // which takes these settings as its first argument.
+        // which takes these settings as its first argument and whose result
+        // the upgrade policy also reads.
         let flat: String = code.concat().split_whitespace().collect();
         let assigned = flat.matches("quic:config.quic_settings(),").count()
             + flat
-                .matches("quic:crate::transport::quic::breaker::gate(config.quic_settings(),")
+                .matches("letquic=crate::transport::quic::breaker::gate(config.quic_settings(),")
                 .count();
         assert_eq!(
             assigned, 1,
             "`build` sets `quic` from `config.quic_settings()`"
+        );
+        assert!(
+            flat.contains("quic,quic_policy,"),
+            "`build` keeps that value"
         );
         assert!(
             code.iter()
