@@ -3025,13 +3025,12 @@ fn replies(sent: &[SymmetricMessage]) -> Vec<&SymmetricMessage> {
         .collect()
 }
 
-/// Every form of the upgrade message, received on an established connection,
-/// is counted and ignored: nothing is delivered to the application, nothing
-/// but a receipt is sent back, and the connection carries on and delivers the
-/// next message. This holds whatever version the remote reports, because the
-/// receiver never answers.
+/// Every form of the upgrade message, received on an established connection
+/// with QUIC off, is counted: nothing is delivered to the application, only an
+/// Offer is answered (a reply needs no version gate, so whatever version the
+/// remote reports), and the connection carries on and delivers the next message.
 #[tokio::test(start_paused = true)]
-async fn upgrade_control_is_counted_and_ignored_without_reply() {
+async fn upgrade_control_with_quic_off_is_counted_and_only_an_offer_is_answered() {
     for version in [CAPABLE, OLD, None] {
         let mut e = single(version);
         // Never reset, so another test's `take_snapshot` cannot disturb it;
@@ -3070,14 +3069,25 @@ async fn upgrade_control_is_counted_and_ignored_without_reply() {
 
         assert!(e.pump(Duration::from_secs(2)).await.is_none());
         let sent = e.drain_sent();
-        assert!(
-            replies(&sent).is_empty(),
-            "{version:?}: the receiver must never answer an upgrade message, got {:?}",
-            replies(&sent)
-                .iter()
-                .map(|m| m.payload.to_string())
-                .collect::<Vec<_>>()
-        );
+        // QUIC is off here, so the Offer gets `Disabled` and the two answers to
+        // offers this node never made get nothing. The Decline is a tracked
+        // packet, so unacked here it is retransmitted under its one id.
+        let answers = replies(&sent);
+        let ids: std::collections::BTreeSet<u32> = answers.iter().map(|m| m.packet_id).collect();
+        assert_eq!(ids.len(), 1, "{version:?}: one reply, under one packet id");
+        for answer in answers {
+            assert!(
+                matches!(
+                    answer.payload,
+                    SymmetricMessagePayload::Upgrade(UpgradeControl::Decline {
+                        attempt: 1,
+                        reason,
+                    }) if reason == crate::transport::symmetric_message::DeclineReason::Disabled.wire()
+                ),
+                "{version:?}: only the Offer is answered, got {}",
+                answer.payload
+            );
+        }
         for id in 1..=3 {
             assert_eq!(
                 receipts_for(&sent, id),
@@ -3099,7 +3109,12 @@ async fn duplicate_upgrade_control_is_reacked_and_not_recounted() {
     };
     e.deliver(5, upgrade(offer), vec![]).await;
     assert!(e.pump(Duration::from_millis(300)).await.is_none());
-    assert_eq!(receipts_for(&e.drain_sent(), 5), 1, "first ack");
+    let first = e.drain_sent();
+    assert_eq!(receipts_for(&first, 5), 1, "first ack");
+    let declined = replies(&first)
+        .first()
+        .expect("QUIC is off, so the offer is declined")
+        .packet_id;
     assert_eq!(e.conn.telemetry_test_counts.upgrade_controls_ignored, 1);
 
     tokio::time::advance(Duration::from_millis(700)).await;
@@ -3116,7 +3131,10 @@ async fn duplicate_upgrade_control_is_reacked_and_not_recounted() {
         1,
         "the duplicate must be re-acked so the sender stops retransmitting"
     );
-    assert!(replies(&sent).is_empty());
+    assert!(
+        replies(&sent).iter().all(|m| m.packet_id == declined),
+        "the duplicate gets no new reply; only the first one's retransmission"
+    );
     assert_eq!(
         e.conn.telemetry_test_counts.upgrade_controls_ignored, 1,
         "a duplicate is not processed again"
@@ -3379,4 +3397,227 @@ async fn queued_packets_count_toward_the_estimate() {
         "one short message plus four queued packets"
     );
     assert_eq!(metrics.read_snapshot().inbound_concurrency_max, 5);
+}
+
+// ---------------------------------------------------------------------------
+// Replies to upgrade offers (#5940)
+// ---------------------------------------------------------------------------
+
+fn offer(attempt: u32) -> SymmetricMessagePayload {
+    upgrade(UpgradeControl::Offer { attempt, caps: 0 })
+}
+
+/// The ids of the `Decline`s in `sent`; a retransmission keeps its id.
+fn decline_ids(sent: &[SymmetricMessage]) -> std::collections::BTreeSet<u32> {
+    sent.iter()
+        .filter(|m| {
+            matches!(
+                m.payload,
+                SymmetricMessagePayload::Upgrade(UpgradeControl::Decline { .. })
+            )
+        })
+        .map(|m| m.packet_id)
+        .collect()
+}
+
+impl End {
+    fn tracked_packets(&self) -> usize {
+        self.conn.remote_conn.sent_tracker.lock().pending_len()
+    }
+
+    fn flight(&self) -> usize {
+        self.conn.remote_conn.congestion_controller.flightsize()
+    }
+
+    /// `offers` rising Offers under new packet ids from `first`, none acked, with
+    /// the connection's task running between them.
+    async fn take_offers(&mut self, first: u32, offers: u32) {
+        for attempt in first..first + offers {
+            self.deliver(attempt, offer(attempt), vec![]).await;
+            assert!(self.pump(Duration::from_millis(1)).await.is_none());
+        }
+    }
+}
+
+/// N Offers under new packet ids, none acked, leave one tracked `Decline` with QUIC
+/// off, and the next one goes a full interval later. Without the gate each Offer
+/// costs a tracked packet retransmitted until abandoned.
+#[tokio::test(start_paused = true)]
+async fn rising_offers_with_quic_off_keep_one_tracked_decline() {
+    let mut e = single(CAPABLE);
+    let before = crate::transport::TRANSPORT_METRICS.cumulative_upgrade_decline_suppressed();
+    e.take_offers(1, 200).await;
+    assert_eq!(decline_ids(&e.drain_sent()).len(), 1);
+    assert_eq!(e.tracked_packets(), 1);
+    assert_eq!(e.flight(), 64);
+    // Other tests may only add to it.
+    assert!(
+        crate::transport::TRANSPORT_METRICS.cumulative_upgrade_decline_suppressed() - before >= 199
+    );
+    tokio::time::advance(Duration::from_secs(60)).await;
+    e.take_offers(201, 1).await;
+    assert_eq!(e.conn.pending_decline, None);
+    assert!(
+        e.tracked_packets() <= 2,
+        "the first may be abandoned by now"
+    );
+}
+
+/// The same with a session: the machine answers every rising Offer, the driver's
+/// gate lets one through per interval. An unpromoted session answers each one.
+#[tokio::test(start_paused = true)]
+async fn rising_offers_with_a_session_keep_one_tracked_decline() {
+    let hub = crate::transport::quic::upgrade::driver::tests::Harness::server(
+        "ack-policy-rising-offers",
+        20,
+    )
+    .await;
+    let mut e = single(CAPABLE);
+    e.conn = e.conn.with_upgrade_site(&hub.site());
+    e.take_offers(1, 200).await;
+    assert_eq!(decline_ids(&e.drain_sent()).len(), 1);
+    assert_eq!(e.tracked_packets(), 1);
+    assert_eq!(e.flight(), 64);
+    tokio::time::advance(Duration::from_secs(60)).await;
+    e.take_offers(201, 1).await;
+    assert_eq!(
+        decline_ids(&e.drain_sent()).len(),
+        2,
+        "its retransmissions keep their id, and the second has a new one"
+    );
+}
+
+/// A `recv` cancelled while the reply is blocked on the socket owes it still, with
+/// nothing in flight, and the next `recv` sends it: the Offer is already in the
+/// dedup window, so nothing else would bring it back.
+#[tokio::test(start_paused = true)]
+async fn a_decline_survives_cancellation_during_a_blocked_send() {
+    let mut e = end_with_wire_capacity(addr(1), addr(2), random_key(), random_key(), CAPABLE, 1);
+    e.conn.noop(vec![1]).await.expect("fill wire");
+    e.deliver(5, offer(3), vec![]).await;
+    assert!(e.pump(Duration::from_millis(50)).await.is_none());
+    assert_eq!(e.conn.pending_decline, Some(3), "still owed");
+    assert_eq!(
+        e.flight(),
+        0,
+        "the send was dropped, so nothing is in flight"
+    );
+    assert_eq!(e.tracked_packets(), 0);
+
+    let mut sent = Vec::new();
+    for _ in 0..10 {
+        sent.extend(e.drain_sent());
+        assert!(e.pump(Duration::from_millis(20)).await.is_none());
+    }
+    sent.extend(e.drain_sent());
+    assert_eq!(decline_ids(&sent).len(), 1, "sent, once");
+    assert_eq!(e.conn.pending_decline, None);
+    assert_eq!(e.flight(), 64, "charged once it was sent");
+    assert_eq!(e.tracked_packets(), 1);
+}
+
+/// A failed send of the reply leaves nothing in flight or tracked, is not owed any
+/// more, and does not end `recv`. Its ack, in the success case, gives the flight back.
+#[tokio::test(start_paused = true)]
+async fn a_failed_decline_send_leaves_nothing_in_flight() {
+    let mut e = single(CAPABLE);
+    e.fail_sends
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    e.deliver(5, offer(3), vec![]).await;
+    assert!(e.pump(Duration::from_millis(1)).await.is_none());
+    assert_eq!(e.conn.pending_decline, None);
+    assert_eq!(e.flight(), 0);
+    assert_eq!(e.tracked_packets(), 0);
+    e.fail_sends
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+
+    tokio::time::advance(Duration::from_secs(60)).await;
+    e.deliver(6, offer(4), vec![]).await;
+    assert!(e.pump(Duration::from_millis(1)).await.is_none());
+    let sent = e.drain_sent();
+    let ids = decline_ids(&sent);
+    assert_eq!(ids.len(), 1);
+    assert_eq!(e.flight(), 64);
+    e.deliver(7, SymmetricMessagePayload::NoOp, ids.into_iter().collect())
+        .await;
+    assert!(e.pump(Duration::from_millis(1)).await.is_none());
+    assert_eq!(e.flight(), 0, "an ack releases what the send charged");
+    assert_eq!(e.tracked_packets(), 0);
+}
+
+/// What arrives on the QUIC side reaches the session's driver and moves neither of
+/// the UDP session's clocks; a UDP packet moves both, so the check can fail. It
+/// hands the driver the events a path's pump sends, not a frame off a real path.
+#[tokio::test(start_paused = true)]
+async fn quic_inbound_does_not_move_the_udp_idle_clocks() {
+    let hub = crate::transport::quic::upgrade::driver::tests::Harness::server(
+        "ack-policy-idle-clocks",
+        21,
+    )
+    .await;
+    let mut e = single(CAPABLE);
+    e.conn = e.conn.with_upgrade_site(&hub.site());
+    e.deliver(1, short(b"first"), vec![]).await;
+    assert!(e.pump(Duration::from_millis(1)).await.is_some());
+    let clocks = |e: &End| {
+        (
+            e.conn.last_received_nanos,
+            e.conn
+                .last_inbound_nanos
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    };
+    let before = clocks(&e);
+
+    tokio::time::advance(Duration::from_secs(1)).await;
+    e.conn
+        .quic_path
+        .as_ref()
+        .expect("joined")
+        .inject_quic_inbound();
+    assert!(e.pump(Duration::from_millis(50)).await.is_none());
+    assert_eq!(clocks(&e), before);
+
+    e.deliver(2, short(b"second"), vec![]).await;
+    assert!(e.pump(Duration::from_millis(1)).await.is_some());
+    let after = clocks(&e);
+    assert!(after.0 > before.0 && after.1 > before.1, "{after:?}");
+}
+
+/// A session starts on `Set` and `Same`, the two outcomes of a promotion the
+/// transport takes. A key merely dialled starts nothing, and a promotion refused
+/// for another key starts nothing.
+#[tokio::test(start_paused = true)]
+async fn set_peer_identity_promotes_the_session_on_set_and_same_only() {
+    let hub =
+        crate::transport::quic::upgrade::driver::tests::Harness::server("ack-policy-identity", 22)
+            .await;
+    let key = hub.peer.clone();
+    let other = TransportKeypair::new().public().clone();
+    let promoted = |e: &End| e.conn.quic_path.as_ref().expect("joined").promoted_key();
+
+    // Set, with nothing held.
+    let mut e = single(CAPABLE);
+    e.conn = e.conn.with_upgrade_site(&hub.site());
+    assert_eq!(promoted(&e), None);
+    e.conn.set_peer_identity(key.clone());
+    assert_eq!(promoted(&e), Some(key.clone()), "Set");
+    drop(e);
+
+    // Dialled only, then Same.
+    let mut e = single(CAPABLE);
+    e.conn = e.conn.with_dialled_key(key.clone());
+    e.conn = e.conn.with_upgrade_site(&hub.site());
+    assert_eq!(promoted(&e), None, "a dialled key starts nothing");
+    e.conn.set_peer_identity(key.clone());
+    assert_eq!(promoted(&e), Some(key.clone()), "Same");
+    drop(e);
+
+    // Refused: the transport keeps the dialled key and the session stays out.
+    let mut e = single(CAPABLE);
+    e.conn = e.conn.with_dialled_key(key.clone());
+    e.conn = e.conn.with_upgrade_site(&hub.site());
+    e.conn.set_peer_identity(other);
+    assert_eq!(promoted(&e), None, "Refused");
+    assert_eq!(e.conn.peer_identity(), Some(&key));
 }

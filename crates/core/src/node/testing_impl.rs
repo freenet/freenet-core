@@ -2066,6 +2066,16 @@ impl SimNetwork {
         self
     }
 
+    /// A record of what every node's QUIC upgrades do in this network, and the
+    /// faults a test can inject into them. Call it before the nodes start. The
+    /// handle stays readable after the run has consumed the network.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn quic_upgrade_trace(
+        &self,
+    ) -> crate::transport::quic::upgrade::sim_trace::QuicUpgradeTrace {
+        crate::transport::in_memory_socket::quic_upgrade_trace(&self.name)
+    }
+
     /// Gives every node's QUIC endpoint the idle timeout `timeout` instead
     /// of its clock's (24 h on `VirtualTime`), so a silent QUIC path times
     /// out within a simulation. No effect on a node with QUIC off.
@@ -8208,15 +8218,20 @@ mod tests {
             })
             .collect();
         // Directly, or through the QUIC crash-loop breaker's `gate` (#5940),
-        // which takes these settings as its first argument.
+        // which takes these settings as its first argument and whose result
+        // the upgrade policy also reads.
         let flat: String = code.concat().split_whitespace().collect();
         let assigned = flat.matches("quic:config.quic_settings(),").count()
             + flat
-                .matches("quic:crate::transport::quic::breaker::gate(config.quic_settings(),")
+                .matches("letquic=crate::transport::quic::breaker::gate(config.quic_settings(),")
                 .count();
         assert_eq!(
             assigned, 1,
             "`build` sets `quic` from `config.quic_settings()`"
+        );
+        assert!(
+            flat.contains("quic,quic_policy,"),
+            "`build` keeps that value"
         );
         assert!(
             code.iter()

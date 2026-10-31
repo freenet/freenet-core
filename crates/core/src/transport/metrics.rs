@@ -623,11 +623,14 @@ pub struct TransportMetrics {
     inbound_queue_drops: AtomicU64,
 
     /// QUIC upgrade control messages received (#5940 e1, reset each
-    /// snapshot). Nothing sends them yet, so a non-zero value means a newer
-    /// peer is offering upgrades this node only decodes and ignores.
+    /// snapshot).
     upgrade_control_received: AtomicU64,
     /// Never-reset twin of `upgrade_control_received`.
     cumulative_upgrade_control_received: AtomicU64,
+    /// `Decline` replies `DeclineGate` held back (reset each snapshot).
+    upgrade_decline_suppressed: AtomicU64,
+    /// Never-reset twin of `upgrade_decline_suppressed`.
+    cumulative_upgrade_decline_suppressed: AtomicU64,
 
     /// Packets that would have completed a hole-punch handshake on the
     /// side that answered the remote's intro, dropped because they were not
@@ -1050,6 +1053,8 @@ impl TransportMetrics {
             inbound_queue_drops: AtomicU64::new(0),
             upgrade_control_received: AtomicU64::new(0),
             cumulative_upgrade_control_received: AtomicU64::new(0),
+            upgrade_decline_suppressed: AtomicU64::new(0),
+            cumulative_upgrade_decline_suppressed: AtomicU64::new(0),
             handshake_unauthenticated_dropped: AtomicU64::new(0),
             conn_identity: Default::default(),
             quic_endpoint_down: AtomicU64::new(0),
@@ -1359,11 +1364,19 @@ impl TransportMetrics {
     }
 
     /// A QUIC upgrade control message arrived on an established connection
-    /// and was ignored (#5940 e1). Counted once per distinct packet.
+    /// (#5940 e1). Counted once per distinct packet.
     pub(crate) fn record_upgrade_control_received(&self) {
         self.cumulative_upgrade_control_received
             .fetch_add(1, Ordering::Relaxed);
         self.upgrade_control_received
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `DeclineGate` held back a `Decline` reply to an upgrade offer.
+    pub(crate) fn record_upgrade_decline_suppressed(&self) {
+        self.cumulative_upgrade_decline_suppressed
+            .fetch_add(1, Ordering::Relaxed);
+        self.upgrade_decline_suppressed
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -1566,6 +1579,13 @@ impl TransportMetrics {
     #[cfg(test)]
     pub(crate) fn cumulative_upgrade_control_received(&self) -> u64 {
         self.cumulative_upgrade_control_received
+            .load(Ordering::Relaxed)
+    }
+
+    /// Never-reset count of `Decline` replies held back (tests only).
+    #[cfg(test)]
+    pub(crate) fn cumulative_upgrade_decline_suppressed(&self) -> u64 {
+        self.cumulative_upgrade_decline_suppressed
             .load(Ordering::Relaxed)
     }
 
@@ -2150,6 +2170,7 @@ impl TransportMetrics {
             inbound_queue_depth_hwm: get32(&self.inbound_queue_depth_hwm),
             inbound_queue_drops: get64(&self.inbound_queue_drops),
             upgrade_control_received: get64(&self.upgrade_control_received),
+            upgrade_decline_suppressed: get64(&self.upgrade_decline_suppressed),
             handshake_unauthenticated_dropped: get64(&self.handshake_unauthenticated_dropped),
             quic_endpoint_down: get64(&self.quic_endpoint_down),
             quic_adapter_panicked: get64(&self.quic_adapter_panicked),
@@ -2695,8 +2716,10 @@ pub struct TransportSnapshot {
     pub inbound_queue_depth_hwm: u32,
     /// Inbound packets the listener dropped because that channel was full.
     pub inbound_queue_drops: u64,
-    /// QUIC upgrade control messages received and ignored (#5940 e1).
+    /// QUIC upgrade control messages received (#5940 e1).
     pub upgrade_control_received: u64,
+    /// `Decline` replies to upgrade offers held back by the per-connection gate.
+    pub upgrade_decline_suppressed: u64,
     /// Hole-punch handshake packets dropped because they were not
     /// encrypted under the attempt's inbound session key (per packet).
     pub handshake_unauthenticated_dropped: u64,
@@ -3041,6 +3064,7 @@ impl TransportSnapshot {
             inbound_queue_depth_hwm,
             inbound_queue_drops,
             upgrade_control_received,
+            upgrade_decline_suppressed,
             handshake_unauthenticated_dropped,
             quic_endpoint_down,
             quic_adapter_panicked,
@@ -3166,6 +3190,7 @@ impl TransportSnapshot {
         self.inbound_queue_depth_hwm = inbound_queue_depth_hwm;
         self.inbound_queue_drops = inbound_queue_drops;
         self.upgrade_control_received = upgrade_control_received;
+        self.upgrade_decline_suppressed = upgrade_decline_suppressed;
         self.handshake_unauthenticated_dropped = handshake_unauthenticated_dropped;
         self.quic_endpoint_down = quic_endpoint_down;
         self.quic_adapter_panicked = quic_adapter_panicked;
@@ -3328,8 +3353,10 @@ struct SnapshotExtras {
     pub inbound_queue_depth_hwm: u32,
     /// Inbound packets the listener dropped because that channel was full.
     pub inbound_queue_drops: u64,
-    /// QUIC upgrade control messages received and ignored (#5940 e1).
+    /// QUIC upgrade control messages received (#5940 e1).
     pub upgrade_control_received: u64,
+    /// `Decline` replies to upgrade offers held back by the per-connection gate.
+    pub upgrade_decline_suppressed: u64,
     /// Hole-punch handshake packets dropped because they were not
     /// encrypted under the attempt's inbound session key (per packet).
     pub handshake_unauthenticated_dropped: u64,
@@ -3503,6 +3530,7 @@ impl SnapshotExtras {
             || self.transfers_acked != 0
             || self.inbound_queue_drops != 0
             || self.upgrade_control_received != 0
+            || self.upgrade_decline_suppressed != 0
             || self.handshake_unauthenticated_dropped != 0
             || self.quic_endpoint_down != 0
             || self.quic_adapter_panicked != 0
@@ -4344,6 +4372,22 @@ mod tests {
 
     /// Received QUIC upgrade control messages reach the snapshot, count as
     /// activity on their own, and reset.
+    #[test]
+    fn upgrade_decline_suppressed_reaches_snapshot_and_resets() {
+        let metrics = TransportMetrics::new();
+        metrics.record_upgrade_decline_suppressed();
+        metrics.record_upgrade_decline_suppressed();
+        let snap = metrics
+            .take_snapshot()
+            .expect("a held back reply is activity");
+        assert_eq!(snap.upgrade_decline_suppressed, 2);
+        assert_eq!(metrics.cumulative_upgrade_decline_suppressed(), 2);
+        let json = serde_json::to_value(&snap).unwrap();
+        assert_eq!(json["upgrade_decline_suppressed"], 2);
+        assert!(metrics.take_snapshot().is_none(), "the counter must reset");
+        assert_eq!(metrics.cumulative_upgrade_decline_suppressed(), 2);
+    }
+
     #[test]
     fn upgrade_control_received_reaches_snapshot_and_resets() {
         let metrics = TransportMetrics::new();
@@ -5586,6 +5630,7 @@ mod tests {
             "inbound_queue_depth_hwm",
             "inbound_queue_drops",
             "upgrade_control_received",
+            "upgrade_decline_suppressed",
             "handshake_unauthenticated_dropped",
             "quic_endpoint_down",
             "quic_adapter_panicked",

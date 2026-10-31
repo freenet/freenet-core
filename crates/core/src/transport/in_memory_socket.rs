@@ -270,9 +270,40 @@ pub(crate) fn quic_accept_loop_started(network: &str, addr: SocketAddr) -> bool 
     QUIC_ACCEPT_LOOPS.contains(&(network.to_string(), addr))
 }
 
+/// The QUIC upgrade trace a test asked for, per network
+/// (`SimNetwork::quic_upgrade_trace`).
+#[cfg(any(test, feature = "testing"))]
+static QUIC_UPGRADE_TRACES: LazyLock<
+    dashmap::DashMap<String, super::quic::upgrade::sim_trace::QuicUpgradeTrace>,
+> = LazyLock::new(dashmap::DashMap::new);
+
+/// The trace of `network`, created at the first call.
+#[cfg(any(test, feature = "testing"))]
+pub(crate) fn quic_upgrade_trace(
+    network: &str,
+) -> super::quic::upgrade::sim_trace::QuicUpgradeTrace {
+    QUIC_UPGRADE_TRACES
+        .entry(network.to_string())
+        .or_default()
+        .clone()
+}
+
+/// The trace of the network the node at `addr` joined (resolved as in
+/// [`record_quic_endpoint_clock`]), if a test asked for one.
+#[cfg(any(test, feature = "testing"))]
+pub(crate) fn quic_upgrade_trace_at(
+    addr: SocketAddr,
+) -> Option<super::quic::upgrade::sim_trace::NodeTrace> {
+    let network = resolve_address_network(&addr).ok()?;
+    QUIC_UPGRADE_TRACES
+        .get(&network)
+        .map(|trace| trace.node(addr))
+}
+
 /// Forgets every recorded QUIC endpoint clock and accept loop of `network`.
 #[cfg(any(test, feature = "testing"))]
 pub(crate) fn clear_quic_endpoint_clocks(network: &str) {
+    QUIC_UPGRADE_TRACES.remove(network);
     QUIC_ACCEPT_LOOPS.retain(|(owner, _)| owner != network);
     QUIC_ENDPOINT_CLOCKS.retain(|(owner, _), _| owner != network);
 }

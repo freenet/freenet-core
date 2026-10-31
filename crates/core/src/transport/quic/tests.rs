@@ -31,7 +31,7 @@ use crate::transport::in_memory_socket::{
 use crate::transport::metrics::DemuxClass;
 use crate::transport::packet_data::MAX_RECV_PACKET_SIZE;
 
-pub(super) const SEED: u64 = 0x0059_40C2;
+pub(in crate::transport::quic) const SEED: u64 = 0x0059_40C2;
 
 /// One datagram as a test socket saw it leave.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,7 +104,11 @@ fn pump<S: Socket>(socket: Arc<DemuxSocket<S>>) -> tokio::task::JoinHandle<()> {
 /// Run `fut` on the test runtime, letting every task run until nothing is
 /// ready and then moving `time` to its next wakeup. Fails if virtual time
 /// passes `limit` first.
-pub(super) async fn drive<F>(time: &VirtualTime, limit: Duration, fut: F) -> F::Output
+pub(in crate::transport::quic) async fn drive<F>(
+    time: &VirtualTime,
+    limit: Duration,
+    fut: F,
+) -> F::Output
 where
     F: std::future::Future + Send + 'static,
     F::Output: Send + 'static,
@@ -143,7 +147,7 @@ const WATCHDOG: Duration = Duration::from_secs(120);
 /// so a test on the test's own runtime would hang `cargo test` forever
 /// instead of failing; the spinning thread is left behind and dies with the
 /// test process.
-pub(super) fn bounded<F, Fut>(test: F)
+pub(in crate::transport::quic) fn bounded<F, Fut>(test: F)
 where
     F: FnOnce() -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()>,
@@ -204,7 +208,7 @@ fn settings() -> QuicSettings {
 }
 
 /// Two endpoints, `a` (client) and `b` (server), on one simulated network.
-pub(super) struct Pair {
+pub(in crate::transport::quic) struct Pair {
     pub(super) time: VirtualTime,
     network: String,
     pub(super) a: QuicEndpoint,
@@ -232,7 +236,7 @@ impl Drop for Pair {
 /// the simulated network registry is keyed by address), with an egress cap
 /// of `a_cap` bytes per second on `a`'s socket, on the same `VirtualTime`
 /// as the endpoints. `b` accepts connections from `a`.
-pub(super) async fn pair(
+pub(in crate::transport::quic) async fn pair(
     network: &str,
     a_addr: SocketAddr,
     b_addr: SocketAddr,

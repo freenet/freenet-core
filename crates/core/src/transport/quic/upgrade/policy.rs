@@ -19,9 +19,8 @@
 //! dialing through active, at `quic-max-paths`. A permit is released when it
 //! is dropped, so a path cannot keep one past its own end.
 //!
-//! Nothing in the node builds a policy yet: the upgrade negotiation that
-//! reads it comes in later steps (e5a-3 to e5a-5). [`log_startup`] already
-//! runs at node startup.
+//! [`super::driver`] reads the policy for each decision. [`log_startup`] runs
+//! at node startup.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -32,7 +31,6 @@ use crate::transport::quic::breaker::{BreakerOutcome, Verdict};
 use crate::transport::quic::liveness::{QuicAvailability, QuicAvailabilityWatch};
 
 /// The node's QUIC upgrade policy. See the module docs.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone)]
 pub(crate) struct QuicPolicy {
     /// The mode this release runs ([`QuicMode::effective`]): never `Prefer`.
@@ -42,8 +40,30 @@ pub(crate) struct QuicPolicy {
     permits: QuicPathPermits,
 }
 
+/// What a [`QuicPolicy`] takes from the node's configuration and its crash-loop
+/// breaker. The endpoint's availability comes when the transport opens.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct QuicPolicyConfig {
+    mode: QuicMode,
+    max_paths: usize,
+    breaker: BreakerOutcome,
+}
+
+impl QuicPolicyConfig {
+    /// The policy inputs for a node configured by `config`, whose crash-loop
+    /// breaker decided `breaker` ([`breaker::gate`]).
+    ///
+    /// [`breaker::gate`]: crate::transport::quic::breaker::gate
+    pub(crate) fn new(config: &NetworkApiConfig, breaker: BreakerOutcome) -> Self {
+        Self {
+            mode: configured_mode(config).effective(),
+            max_paths: config.quic_max_paths(),
+            breaker,
+        }
+    }
+}
+
 /// Why the policy refuses upgrades.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DisabledBy {
     /// `transport-quic` is off.
@@ -58,7 +78,6 @@ pub(crate) enum DisabledBy {
 }
 
 /// Why [`QuicPolicy::admit`] refused a new path.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PathRefusal {
     /// The policy refuses upgrades at all.
@@ -87,7 +106,6 @@ impl Drop for QuicPathPermit {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl QuicPolicy {
     /// The policy for a node configured by `config`, whose crash-loop
     /// breaker decided `breaker` ([`breaker::gate`]) and whose endpoint
@@ -95,20 +113,30 @@ impl QuicPolicy {
     /// configuration once.
     ///
     /// [`breaker::gate`]: crate::transport::quic::breaker::gate
+    #[cfg(test)]
     pub(crate) fn new(
         config: &NetworkApiConfig,
         breaker: BreakerOutcome,
         availability: QuicAvailabilityWatch,
     ) -> Self {
+        Self::from_config(QuicPolicyConfig::new(config, breaker), availability)
+    }
+
+    /// The policy for `config`, whose endpoint reports `availability`.
+    pub(crate) fn from_config(
+        config: QuicPolicyConfig,
+        availability: QuicAvailabilityWatch,
+    ) -> Self {
         Self {
-            mode: configured_mode(config).effective(),
-            breaker,
+            mode: config.mode,
+            breaker: config.breaker,
             availability,
-            permits: QuicPathPermits::new(config.quic_max_paths()),
+            permits: QuicPathPermits::new(config.max_paths),
         }
     }
 
     /// The mode the node runs: `Off` or `Shadow`.
+    #[cfg(test)]
     pub(crate) fn mode(&self) -> QuicMode {
         self.mode
     }
@@ -152,12 +180,12 @@ impl QuicPolicy {
     }
 
     /// The path permits.
+    #[cfg(any(test, feature = "testing"))]
     pub(crate) fn permits(&self) -> &QuicPathPermits {
         &self.permits
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl QuicPathPermits {
     /// Permits for at most `limit` paths at once. A limit of 0 admits none.
     pub(crate) fn new(limit: usize) -> Self {
@@ -180,6 +208,7 @@ impl QuicPathPermits {
     }
 
     /// The permits held now.
+    #[cfg_attr(not(any(test, feature = "testing")), allow(dead_code))]
     pub(crate) fn in_use(&self) -> usize {
         self.0.in_use.load(Ordering::Acquire)
     }

@@ -409,11 +409,10 @@ pub(crate) enum SymmetricMessagePayload {
     /// Control message for upgrading this UDP session to QUIC in place
     /// (#5940, step e). Bincode index 7.
     ///
-    /// Decode-only for now: a node counts one on receipt and otherwise
-    /// ignores it, and nothing sends it. It ships in a release before any
-    /// sender does, because a peer at or below 0.2.147 panics on a payload it
-    /// cannot decode and 0.2.148 drops it. A sender must first pass
-    /// [`may_send_upgrade`] for the remote's version.
+    /// Sent by the upgrade driver, or as a `Decline` by a node with QUIC off.
+    /// A peer at or below 0.2.147 panics on a payload it cannot decode and
+    /// 0.2.148 drops it, so a sender must first pass [`may_send_upgrade`] for
+    /// the remote's version. A reply to a received Offer needs no such check.
     Upgrade(UpgradeControl),
 }
 
@@ -487,12 +486,12 @@ pub(crate) const QUIC_UPGRADE_SHIPPED_IN: Option<(u8, u8, u16)> = Some((0, 2, 14
 /// ignores it, so it is never offered: the offer could only time out, which
 /// would count against the upgrade success rate.
 ///
-/// Parked above every release until the negotiation is wired in (e5a-5b),
-/// which must set this to the release that first ships it and then record
-/// that in [`QUIC_UPGRADE_NEGOTIATES_SHIPPED_IN`], per the wire-gated-floor
-/// rule in `docs/RELEASING.md`. Too high only delays upgrades.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) const QUIC_UPGRADE_NEGOTIATES_IN: (u8, u8, u16) = (0, 3, 0);
+/// A PREDICTION until [`QUIC_UPGRADE_NEGOTIATES_SHIPPED_IN`] records it: the
+/// release that first ships the negotiation (e5a-5b), per the wire-gated-floor
+/// rule in `docs/RELEASING.md`. Too high only delays upgrades. Until the crate
+/// reaches it, a node of this tree does not offer to another, because each
+/// reports a version below the floor.
+pub(crate) const QUIC_UPGRADE_NEGOTIATES_IN: (u8, u8, u16) = (0, 2, 154);
 
 /// Has the release [`QUIC_UPGRADE_NEGOTIATES_IN`] names shipped? Same use as
 /// [`QUIC_UPGRADE_SHIPPED_IN`]; checked by
@@ -503,7 +502,6 @@ pub(crate) const QUIC_UPGRADE_NEGOTIATES_SHIPPED_IN: Option<(u8, u8, u16)> = Non
 /// May an `Offer` be sent to a remote of `remote_version`? Fails closed like
 /// [`may_send_upgrade`], which this implies: the floor is above that one's
 /// (`negotiation_floor_is_not_below_the_decoder_floor`).
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn may_offer_upgrade(remote_version: Option<(u8, u8, u16)>) -> bool {
     may_send_upgrade(remote_version)
         && remote_version.is_some_and(|v| v >= QUIC_UPGRADE_NEGOTIATES_IN)
@@ -1212,10 +1210,10 @@ mod test {
     /// ignores it. Every release up to this one is such a release.
     #[test]
     fn negotiation_floor_stays_above_every_release_that_ignores_an_offer() {
-        const LAST_RELEASE_THAT_IGNORES_AN_OFFER: (u8, u8, u16) = (0, 2, 152);
+        const LAST_RELEASE_THAT_IGNORES_AN_OFFER: (u8, u8, u16) = (0, 2, 153);
         assert!(
             QUIC_UPGRADE_NEGOTIATES_IN > LAST_RELEASE_THAT_IGNORES_AN_OFFER,
-            "0.2.152 and older ignore an Offer, so the offer could only time out"
+            "0.2.153 and older ignore an Offer, so the offer could only time out"
         );
     }
 

@@ -51,7 +51,7 @@ use super::{
     received_packet_tracker::ReceivedPacketTracker,
     received_packet_tracker::ReportResult,
     sent_packet_tracker::{PacketStream, ResendAction, SentPacketTracker},
-    symmetric_message::{self, SymmetricMessage, SymmetricMessagePayload},
+    symmetric_message::{self, SymmetricMessage, SymmetricMessagePayload, UpgradeControl},
     token_bucket::TokenBucket,
 };
 use crate::util::time_source::InstantTimeSrc;
@@ -469,6 +469,19 @@ pub struct PeerConnection<S = super::UdpSocket, T: TimeSource = RealTime> {
     /// This connection's inbound stream outcomes, indexed by
     /// `InboundStreamOutcome` (also counted node-wide in `TRANSPORT_METRICS`).
     inbound_outcomes: [u64; super::metrics::InboundStreamOutcome::COUNT],
+    /// This connection's QUIC upgrade, when the node has upgrades. Declared
+    /// before `inbound_budget`, which its path charges, so the path goes first
+    /// (`quic_path_state_is_declared_before_the_budget`). `None` with QUIC off.
+    quic_path: Option<super::quic::upgrade::driver::QuicPathState>,
+    /// With QUIC off, bounds the replies to upgrade offers. Fixed size.
+    decline_gate: super::quic::upgrade::driver::DeclineGate,
+    /// With QUIC off, the attempt of an Offer to decline, sent at the top of
+    /// `recv`'s loop and cleared only once that send has finished, so a
+    /// cancelled `recv` sends it on its next call.
+    pending_decline: Option<u32>,
+    /// Where a test records this connection's upgrade messages.
+    #[cfg(any(test, feature = "testing"))]
+    upgrade_trace: Option<super::quic::upgrade::sim_trace::NodeTrace>,
     /// Charges for every inbound stream holding reassembly state on this
     /// connection, released when that state is gone. Shareable with a QUIC
     /// path to the same peer (see [`Self::inbound_budget`]), so the peer has
@@ -1016,8 +1029,63 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         self
     }
 
+    /// Join the node's QUIC upgrades, if it has any. The session uses this
+    /// connection's `time_source`, the listener's clock clone.
+    pub(super) fn with_upgrade_site(
+        mut self,
+        site: &super::quic::upgrade::driver::UpgradeSite,
+    ) -> Self {
+        #[cfg(any(test, feature = "testing"))]
+        {
+            self.upgrade_trace = site.trace();
+            if let Some(trace) = &self.upgrade_trace {
+                trace.connection_opened();
+            }
+        }
+        if let Some(upgrades) = site.upgrades() {
+            self.quic_path = Some(upgrades.open_session(
+                self.remote_conn.remote_addr,
+                self.remote_conn.remote_protoc_version,
+                self.inbound_budget.clone(),
+                self.upgrade_sender(),
+                self.remote_conn.time_source.clone(),
+            ));
+        }
+        self
+    }
+
+    /// Refuse the Offer of `attempt`, with QUIC off. A failed send costs what a
+    /// lost datagram costs, so it is not tried again. A cancelled one is: it
+    /// charged nothing, and at worst the peer reads a second `Decline`.
+    async fn send_pending_decline(&mut self, attempt: u32) {
+        let decline = UpgradeControl::Decline {
+            attempt,
+            reason: symmetric_message::DeclineReason::Disabled.wire(),
+        };
+        if let Err(error) = self.upgrade_sender().send(decline).await {
+            tracing::debug!(
+                peer_addr = %self.remote_conn.remote_addr,
+                %error,
+                "Could not decline a QUIC upgrade offer"
+            );
+        }
+        self.pending_decline = None;
+    }
+
+    /// What sends this connection's upgrade messages on the UDP session.
+    fn upgrade_sender(&self) -> UpgradeSender<S, T> {
+        UpgradeSender {
+            remote_addr: self.remote_conn.remote_addr,
+            socket: self.remote_conn.socket.clone(),
+            outbound_symmetric_key: self.remote_conn.outbound_symmetric_key.clone(),
+            sent_tracker: self.remote_conn.sent_tracker.clone(),
+            last_packet_id: self.remote_conn.last_packet_id.clone(),
+            congestion_controller: self.remote_conn.congestion_controller.clone(),
+        }
+    }
+
     /// The peer's key as the node recorded it, if the transport holds one
-    /// yet (see the `peer_identity` field). Read by the QUIC upgrade.
+    /// yet (see the `peer_identity` field).
     /// Holding a key does not mean the connection was promoted: an outbound
     /// connection holds the key it dialled from the start.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -1031,8 +1099,12 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
     fn set_peer_identity(&mut self, key: TransportPublicKey) {
         let remote = self.remote_conn.remote_addr;
         let kind = match self.peer_identity.update(key.clone()) {
-            peer_identity::PeerIdentityUpdate::Set => super::metrics::ConnIdentity::TransportKeySet,
+            peer_identity::PeerIdentityUpdate::Set => {
+                self.promote_quic_session(&key);
+                super::metrics::ConnIdentity::TransportKeySet
+            }
             peer_identity::PeerIdentityUpdate::Same => {
+                self.promote_quic_session(&key);
                 super::metrics::ConnIdentity::TransportKeySame
             }
             peer_identity::PeerIdentityUpdate::Refused => {
@@ -1047,6 +1119,14 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             }
         };
         super::metrics::TRANSPORT_METRICS.record_conn_identity(remote, kind);
+    }
+
+    /// The transport took `key` at a promotion, so the QUIC upgrade may start.
+    /// Only here: a key the connection merely dialled does not make it eligible.
+    fn promote_quic_session(&self, key: &TransportPublicKey) {
+        if let Some(quic_path) = &self.quic_path {
+            quic_path.promote(key.clone());
+        }
     }
 
     pub(super) fn new(remote_conn: RemoteConnection<S, T>) -> Self {
@@ -1282,6 +1362,11 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             completed_inbound_streams: lru::LruCache::new(COMPLETED_STREAM_MEMORY),
             legacy_tokens: HashMap::new(),
             inbound_outcomes: [0; super::metrics::InboundStreamOutcome::COUNT],
+            quic_path: None,
+            decline_gate: Default::default(),
+            pending_decline: None,
+            #[cfg(any(test, feature = "testing"))]
+            upgrade_trace: None,
             inbound_budget: inbound_budget::SharedInboundBudget::new(
                 streaming::MAX_INBOUND_STREAMS_PER_CONNECTION,
                 streaming::MAX_INBOUND_STREAM_BYTES_PER_CONNECTION,
@@ -1413,6 +1498,9 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             if self.receipts_flush_due {
                 self.receipts_flush_due = false;
                 self.flush_receipts_now().await?;
+            }
+            if let Some(attempt) = self.pending_decline {
+                self.send_pending_decline(attempt).await;
             }
             // The resend timer disarms when it fires; if the resend branch left it
             // unarmed (send error path), re-arm with a short delay rather than
@@ -2887,25 +2975,44 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             AckConnection { result: Err(cause) } => {
                 Err(TransportError::ConnectionEstablishmentFailure { cause })
             }
-            // QUIC upgrade control (#5940). Decode-only in this release:
-            // count it and ignore it. Never reply and never close: a newer
-            // peer may offer an upgrade this node does not perform, and the
-            // UDP session must carry on exactly as before. Reached only once
-            // per packet id, after dedup, so the count is of distinct messages.
-            // The global counter is checked by
-            // `upgrade_control_is_counted_and_ignored_without_reply` through
-            // the delta of its never-reset twin.
+            // QUIC upgrade control (#5940). Reached only once per packet id,
+            // after dedup, so the count is of distinct messages. The global
+            // counter is checked by
+            // `upgrade_control_with_quic_off_is_counted_and_only_an_offer_is_answered` through
+            // the delta of its never-reset twin. It never closes the
+            // connection: the UDP session carries on whatever the message says.
             Upgrade(control) => {
                 super::TRANSPORT_METRICS.record_upgrade_control_received();
+                #[cfg(any(test, feature = "testing"))]
+                if let Some(trace) = &self.upgrade_trace {
+                    trace.record(
+                        self.remote_conn.remote_addr,
+                        0,
+                        format!("received {control:?}"),
+                    );
+                }
                 #[cfg(test)]
                 {
                     self.telemetry_test_counts.upgrade_controls_ignored += 1;
                 }
-                tracing::debug!(
-                    peer_addr = %self.remote_conn.remote_addr,
-                    ?control,
-                    "Ignoring QUIC upgrade control message"
-                );
+                // `try_send` to the session's driver, which never waits here.
+                if let Some(quic_path) = &self.quic_path {
+                    quic_path.on_upgrade(control);
+                    return Ok(None);
+                }
+                // QUIC is off here, so an Offer can only be refused. A reply to
+                // a received Offer needs no version gate. Accept and Decline
+                // answer offers this node never made. The reply is sent at the
+                // top of `recv`'s loop: this Offer is already in the dedup
+                // window, so a send cancelled here would lose it for good.
+                match control {
+                    UpgradeControl::Offer { attempt, .. } => {
+                        if self.decline_gate.admit(self.time_source.now_nanos()) {
+                            self.pending_decline = Some(attempt);
+                        }
+                    }
+                    UpgradeControl::Accept { .. } | UpgradeControl::Decline { .. } => {}
+                }
                 Ok(None)
             }
             // A duplicate success ack on an ESTABLISHED connection, in either
@@ -3424,6 +3531,57 @@ fn report_sent_tagged<T: crate::simulation::TimeSource>(
                 packet_size,
             );
         }
+    }
+}
+
+/// Sends upgrade messages on one UDP session, as tracked packets (the receiver
+/// acks them like a short message). Holds only what a send needs, so what holds
+/// it can reach nothing of the session's receive state, its liveness included.
+pub(in crate::transport) struct UpgradeSender<S, T: TimeSource> {
+    remote_addr: SocketAddr,
+    socket: Arc<S>,
+    outbound_symmetric_key: Aes128Gcm,
+    sent_tracker: Arc<parking_lot::Mutex<SentPacketTracker<T>>>,
+    last_packet_id: Arc<AtomicU32>,
+    congestion_controller: Arc<CongestionController<T>>,
+}
+
+impl<S: super::Socket, T: TimeSource> UpgradeSender<S, T> {
+    /// Send `control`. Its receipts go on the receive path's own packets.
+    ///
+    /// Cancellation safe: flight size is charged and the packet tracked only
+    /// after the socket took it, with no await between, so a send that fails or
+    /// is dropped leaves nothing in flight.
+    pub(in crate::transport) async fn send(&self, control: UpgradeControl) -> Result<()> {
+        /// A small upgrade message, with its packet overhead.
+        const PACKET_SIZE: usize = 64;
+        let packet_id = self
+            .last_packet_id
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        let payload = SymmetricMessagePayload::Upgrade(control);
+        let outbound_class = super::shadow_demand::classify(&payload);
+        let packet = SymmetricMessage::serialize_msg_to_packet_data(
+            packet_id,
+            payload,
+            &self.outbound_symmetric_key,
+            Vec::new(),
+        )?
+        .prepared_send();
+        self.socket
+            .send_to(&packet, self.remote_addr)
+            .await
+            .map_err(|e| TransportError::send_failed(self.remote_addr, e.kind()))?;
+        super::shadow_demand::record_outbound(outbound_class, packet.len());
+        let token = self.congestion_controller.on_send_with_token(PACKET_SIZE);
+        report_sent_tagged(
+            &mut self.sent_tracker.lock(),
+            packet_id,
+            packet,
+            PACKET_SIZE,
+            token,
+            PacketStream::Control,
+        );
+        Ok(())
     }
 }
 

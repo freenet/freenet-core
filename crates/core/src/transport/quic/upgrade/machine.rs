@@ -5,7 +5,7 @@
 //! the caller to carry out. It does no I/O and reads no clock: time and the
 //! random draw for jitter come in through [`Inputs`], so a test fixes both.
 //! The caller sleeps until [`UpgradeMachine::deadline`] and then sends
-//! [`Event::Tick`]. Nothing in the node drives it yet (e5a-5b).
+//! [`Event::Tick`]. [`super::driver`] is that caller.
 //!
 //! The higher key is the QUIC server and the only side that offers. A key
 //! comes only from [`Event::Promoted`], never from an upgrade message, so a
@@ -1020,7 +1020,7 @@ impl UpgradeMachine {
     }
 
     /// The attempt in setup or active, if any.
-    fn live_attempt(&self) -> Option<u32> {
+    pub(in crate::transport) fn live_attempt(&self) -> Option<u32> {
         match self.state {
             State::Setup { attempt, .. } | State::Active { attempt, .. } => Some(attempt),
             State::Idle | State::Rechecking { .. } | State::Off => None,

@@ -3028,6 +3028,10 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 serde_json::json!(snapshot.upgrade_control_received),
             );
             m.insert(
+                "upgrade_decline_suppressed".into(),
+                serde_json::json!(snapshot.upgrade_decline_suppressed),
+            );
+            m.insert(
                 "handshake_unauthenticated_dropped".into(),
                 serde_json::json!(snapshot.handshake_unauthenticated_dropped),
             );

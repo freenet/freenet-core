@@ -2540,7 +2540,7 @@ fn bounded_sends_on_a_path_report_each_outcome() {
             .await;
         assert!(matches!(sent, BoundedSend::Sent), "{sent:?}");
         let payload = p.b_in.controls.try_recv().expect("delivered");
-        assert_eq!(p.b.decode_control(&payload), Some(ready));
+        assert_eq!(p.b.decode_control(&payload), Ok(ready));
 
         // Nothing from b reaches a: no acknowledgement.
         let silenced = DropFrom::new("quic-path-bounded", &[p.pair.b_addr]);
@@ -2556,7 +2556,7 @@ fn bounded_sends_on_a_path_report_each_outcome() {
             "{unacked:?}"
         );
         let payload = p.b_in.controls.try_recv().expect("it did arrive");
-        assert_eq!(p.b.decode_control(&payload), Some(ack));
+        assert_eq!(p.b.decode_control(&payload), Ok(ack));
 
         // Still no acknowledgements; a closes its side while waiting.
         let (a, time) = (p.a.clone(), p.time());
@@ -2623,14 +2623,23 @@ fn refused_control_payloads_are_counted() {
             caps: 0,
         }
         .encode();
-        assert!(p.b.decode_control(&ready).is_some());
+        assert!(p.b.decode_control(&ready).is_ok());
         ready[0] = 2;
-        assert_eq!(p.b.decode_control(&ready), None);
+        assert_eq!(
+            p.b.decode_control(&ready),
+            Err(ControlError::UnknownVersion(2))
+        );
         ready[0] = 1;
         ready[1] = 9;
-        assert_eq!(p.b.decode_control(&ready), None);
-        assert_eq!(p.b.decode_control(&[1, 0, 0]), None);
-        assert_eq!(p.b.decode_control(&[]), None);
+        assert_eq!(
+            p.b.decode_control(&ready),
+            Err(ControlError::UnknownType(9))
+        );
+        assert_eq!(
+            p.b.decode_control(&[1, 0, 0]),
+            Err(ControlError::WrongLength(3))
+        );
+        assert_eq!(p.b.decode_control(&[]), Err(ControlError::Empty));
         let stats = p.b.stats();
         assert_eq!(stats.count(QuicInboundOutcome::ControlUnknownVersion), 1);
         assert_eq!(stats.count(QuicInboundOutcome::ControlUnknownType), 1);
@@ -2832,6 +2841,20 @@ fn a_bounded_send_timing_out_on_a_permit_opens_no_stream() {
     })
 }
 
+/// A shadow path never sends data. Only a debug build checks.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "a shadow QUIC path sends control frames only")]
+fn a_shadow_path_does_not_send_data() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths("quic-path-shadow-sends", 66, QuicPathLimits::SHADOW).await;
+        let time = p.time();
+        p.b.send_short_bounded(&time, Duration::from_secs(5), b"data")
+            .await;
+    });
+}
+
 /// A path in shadow mode refuses a Short or Stream frame with
 /// `NOT_ACCEPTING_DATA` before anything is charged, and counts it: the
 /// inbound budget it shares with the UDP session is untouched (no charge,
@@ -2900,7 +2923,7 @@ fn a_shadow_path_refuses_data_before_charging_the_budget() {
             assert!(p.b_in.shorts.try_recv().is_err());
             assert!(p.b_in.streams.try_recv().is_err());
             let payload = p.b_in.controls.try_recv().expect("control arrives");
-            assert!(p.b.decode_control(&payload).is_some());
+            assert!(p.b.decode_control(&payload).is_ok());
         }
     })
 }

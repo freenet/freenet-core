@@ -3,10 +3,9 @@
 //! The endpoint reads only the QUIC-class datagrams the [`DemuxSocket`] queues
 //! for it, and sends through the same socket, so it shares the port, the
 //! node-wide egress cap and the simulation socket with the UDP transport.
-//! Nothing in the node connects to anyone yet: with `transport-quic =
-//! "prefer"` the node builds the endpoint at bind with an empty allow-set, so
-//! no datagram reaches it and it sends nothing. Upgrading a UDP transport
-//! session to QUIC comes later; until then only tests open QUIC connections.
+//! With `transport-quic` on, the node builds the endpoint at bind with an empty
+//! allow-set, so no datagram reaches it until an upgrade allows a peer
+//! ([`upgrade::driver`]). The paths it opens carry control frames only.
 //!
 //! Every connection is authenticated by the transport keys the two nodes
 //! already have ([`identity`]): [`QuicEndpoint::connect`] takes the server's
@@ -29,9 +28,9 @@
 //!   codes (connection close, stream stop and reset), one range each.
 //! - [`liveness`]: whether the endpoint is alive ([`QuicAvailability`]);
 //!   endpoint death turns QUIC off for the node and never stops it.
-//! - [`upgrade`]: upgrading a UDP session to QUIC. So far only the policy
-//!   ([`upgrade::policy`]): whether the node may upgrade at all, and how
-//!   many paths it may hold.
+//! - [`upgrade`]: upgrading a UDP session to QUIC: whether the node may
+//!   ([`upgrade::policy`]), the negotiation's decisions
+//!   ([`upgrade::machine`]) and carrying them out ([`upgrade::driver`]).
 //!
 //! [`DemuxSocket`]: super::DemuxSocket
 //! [`TransportPublicKey`]: super::TransportPublicKey
@@ -90,17 +89,16 @@ pub enum QuicMode {
     /// No QUIC endpoint is built and no QUIC datagram is read. The default.
     #[default]
     Off,
-    /// The node builds a QUIC endpoint on its UDP port and may upgrade a UDP
+    /// The node builds a QUIC endpoint on its UDP port and upgrades a UDP
     /// session to a QUIC path that carries only control frames: all
-    /// application traffic stays on UDP. In this release nothing in the node
-    /// upgrades yet ([`upgrade::policy`] is not wired in), so the endpoint
-    /// accepts and opens no connection. It still differs from `Off` in three
-    /// ways: the demux socket has a QUIC ingress, so a QUIC-class datagram is
-    /// counted `quic_ingress_not_allowed` instead of
-    /// `quic_ingress_no_ingress`; quinn's endpoint driver runs as a task
-    /// (idle, waiting on the empty ingress queue); and the endpoint's memory.
-    /// If the endpoint cannot be built the node logs a warning and runs with
-    /// QUIC off.
+    /// application traffic stays on UDP. Besides the path, it differs from
+    /// `Off` in that the demux socket has a QUIC ingress, so a QUIC-class
+    /// datagram from an address not allowed is counted
+    /// `quic_ingress_not_allowed` instead of `quic_ingress_no_ingress`; quinn's
+    /// endpoint driver and one upgrade task per connection run; a promoted
+    /// connection's higher key sends `Upgrade` messages on its UDP session; and
+    /// the endpoint's memory. If the endpoint cannot be built the node logs a
+    /// warning and runs with QUIC off.
     Shadow,
     /// Meant to carry application data over QUIC. Until that ships it acts
     /// as [`Self::Shadow`] (see [`Self::effective`]), so a node that sets it
@@ -208,7 +206,7 @@ pub(crate) struct EndpointCore {
     /// The QUIC transmits the egress cap holds (`socket::CapHolds`).
     cap_holds: Arc<socket::CapHolds>,
     /// Test hooks that inject faults into quinn's drivers.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     faults: Arc<socket::SocketFaults>,
     /// The type name of the clock quinn runs on (tests).
     #[cfg(any(test, feature = "testing"))]
@@ -518,7 +516,7 @@ impl QuicEndpoint {
             clock,
         )?);
         let health = EndpointHealth::new(local_addr);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "testing"))]
         let mut faults = None;
         let mut cap_holds = None;
         // If quinn refuses the socket after the ingress is enabled, the
@@ -532,7 +530,7 @@ impl QuicEndpoint {
                     health.clone(),
                 ));
                 cap_holds = Some(quic_socket.cap_holds());
-                #[cfg(test)]
+                #[cfg(any(test, feature = "testing"))]
                 {
                     faults = Some(quic_socket.faults());
                 }
@@ -557,7 +555,7 @@ impl QuicEndpoint {
         tracing::info!(
             %local_addr,
             window_bytes = settings.window_bytes(),
-            "QUIC endpoint built (transport-quic = prefer); nothing opens connections on it in this release"
+            "QUIC endpoint built; its paths carry control frames only, application traffic stays on UDP"
         );
         Ok(Self {
             owner: Arc::new(EndpointOwner {
@@ -575,7 +573,7 @@ impl QuicEndpoint {
                 health: health.clone(),
                 // Set by the closure, which ran: `endpoint` is built.
                 cap_holds: cap_holds.expect("the QUIC socket's cap holds"),
-                #[cfg(test)]
+                #[cfg(any(test, feature = "testing"))]
                 faults: faults.unwrap_or_default(),
                 #[cfg(any(test, feature = "testing"))]
                 clock: std::any::type_name::<T>(),
@@ -591,7 +589,7 @@ impl QuicEndpoint {
 
     /// Fail the endpoint's next receive, which ends quinn's endpoint driver
     /// as a socket that fails for good would (tests).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     pub(crate) fn fail_driver(&self) {
         self.faults.fail_receive();
     }
@@ -902,6 +900,17 @@ pub(crate) struct QuicIncoming {
 }
 
 impl QuicIncoming {
+    /// The address the attempt came from, normalized as the allow-set does.
+    pub(crate) fn source(&self) -> SocketAddr {
+        self.permit.addr()
+    }
+
+    /// Drop the attempt without answering it: the client retransmits its
+    /// Initial, as after a lost datagram.
+    pub(crate) fn ignore(self) {
+        self.incoming.ignore();
+    }
+
     /// Complete the handshake. On failure the permit is dropped with it.
     ///
     /// A socket-adapter panic in this connection's driver during the
