@@ -20724,7 +20724,7 @@ fn test_advertised_version_override_reaches_peers() {
 /// The release that first ships the negotiation, written out: if
 /// `QUIC_UPGRADE_NEGOTIATES_IN` stays parked above it, or moves, the runs below
 /// that read as this release stop upgrading and these tests go red.
-const QUIC_FIRST_NEGOTIATING_RELEASE: (u8, u8, u16) = (0, 2, 153);
+const QUIC_FIRST_NEGOTIATING_RELEASE: (u8, u8, u16) = (0, 2, 154);
 
 /// A virtual minute's worth of a run's second half, in `QUIC_EVENT_WAIT` steps.
 const QUIC_EVENT_WAIT: Duration = Duration::from_secs(10);

@@ -491,7 +491,7 @@ pub(crate) const QUIC_UPGRADE_SHIPPED_IN: Option<(u8, u8, u16)> = Some((0, 2, 14
 /// rule in `docs/RELEASING.md`. Too high only delays upgrades. Until the crate
 /// reaches it, a node of this tree does not offer to another, because each
 /// reports a version below the floor.
-pub(crate) const QUIC_UPGRADE_NEGOTIATES_IN: (u8, u8, u16) = (0, 2, 153);
+pub(crate) const QUIC_UPGRADE_NEGOTIATES_IN: (u8, u8, u16) = (0, 2, 154);
 
 /// Has the release [`QUIC_UPGRADE_NEGOTIATES_IN`] names shipped? Same use as
 /// [`QUIC_UPGRADE_SHIPPED_IN`]; checked by
@@ -1210,10 +1210,10 @@ mod test {
     /// ignores it. Every release up to this one is such a release.
     #[test]
     fn negotiation_floor_stays_above_every_release_that_ignores_an_offer() {
-        const LAST_RELEASE_THAT_IGNORES_AN_OFFER: (u8, u8, u16) = (0, 2, 152);
+        const LAST_RELEASE_THAT_IGNORES_AN_OFFER: (u8, u8, u16) = (0, 2, 153);
         assert!(
             QUIC_UPGRADE_NEGOTIATES_IN > LAST_RELEASE_THAT_IGNORES_AN_OFFER,
-            "0.2.152 and older ignore an Offer, so the offer could only time out"
+            "0.2.153 and older ignore an Offer, so the offer could only time out"
         );
     }
 
