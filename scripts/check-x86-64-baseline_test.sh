@@ -50,6 +50,33 @@ expect 1 'above baseline' 'an x86-64-v3 build fails' "$work/v3"
 expect 1 'no symbol matches' 'a stripped binary fails rather than passing' "$work/stripped"
 expect 1 'above baseline' 'one bad binary among several fails' "$work/baseline" "$work/v3"
 
+# Build a binary whose sentinel_fn contains exactly one instruction. The function
+# is never called, so it does not matter whether this host can run it.
+build_with_instruction() {
+    printf '__attribute__((used, noinline)) void sentinel_fn(void) { __asm__("%s"); }\nint main(void) { return 0; }\n' "$1" >"$work/one.c"
+    gcc -O1 -o "$work/one" "$work/one.c"
+}
+
+# One instruction from each group in FORBIDDEN, so removing a group fails here.
+for insn in \
+    'vmovd %eax,%xmm0' 'shlx %eax,%ecx,%edx' 'bextr %eax,%ecx,%edx' 'lzcnt %eax,%ecx' 'movbe (%rax),%ecx' \
+    'haddpd %xmm1,%xmm0' 'lddqu (%rax),%xmm0' \
+    'pshufb %xmm1,%xmm0' 'palignr $1,%xmm1,%xmm0' 'pabsw %xmm1,%xmm0' \
+    'pmulld %xmm1,%xmm0' 'ptest %xmm1,%xmm0' 'pmaxud %xmm1,%xmm0' 'pextrd $1,%xmm0,%eax' \
+    'crc32l %eax,%ecx' 'pcmpgtq %xmm1,%xmm0' 'popcnt %eax,%ecx'; do
+    build_with_instruction "$insn"
+    expect 1 'above baseline' "forbids: $insn" "$work/one"
+done
+
+# Baseline instructions with names close to forbidden ones must not be flagged.
+for insn in \
+    'pextrw $1,%xmm0,%eax' 'pinsrw $1,%eax,%xmm0' 'pminub %xmm1,%xmm0' 'pminsw %xmm1,%xmm0' \
+    'pmaxub %xmm1,%xmm0' 'pmaxsw %xmm1,%xmm0' 'pandn %xmm1,%xmm0' 'pshufd $1,%xmm1,%xmm0' \
+    'bswap %eax' 'tzcnt %eax,%ecx'; do
+    build_with_instruction "$insn"
+    expect 0 'ok   ' "allows: $insn" "$work/one"
+done
+
 output="$(bash "$check" 2>&1)"
 got=$?
 if [ "$got" -eq 64 ]; then

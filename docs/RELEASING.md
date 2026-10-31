@@ -603,8 +603,9 @@ Do not publish that build. It fails in one of two ways, and
 
 To stop a bad build that has already been published from reaching more nodes,
 mark the previous release as latest with `gh release edit <tag> --latest`.
-Nodes and gateways only move to a strictly newer version, so this does not
-downgrade anyone. It does not change the Docker `latest` tag.
+Without `--force`, nodes and gateways only move to a strictly newer version, so
+this does not downgrade anyone. It does not change the Docker `latest` tag. The
+next release takes the marker back automatically.
 
 ### `verify_publishable` failed
 

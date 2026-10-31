@@ -1022,11 +1022,19 @@ jobs:
           # --latest is explicit because an older release can have been marked
           # latest by hand to stop a bad build spreading (0.2.151 for 0.2.152).
           # Nodes only see the release that /releases/latest points at, so the
-          # new one must take that over.
+          # new one must take that over. A recovery run on an older tag must
+          # not move it backwards, so this applies only to the highest version.
+          LATEST_FLAG=()
+          HIGHEST=$(gh release list --repo ${{ github.repository }} --limit 30 \
+            --json tagName,isPrerelease \
+            --jq '.[] | select(.isPrerelease | not) | .tagName' | sort -V | tail -1 || true)
+          if [ "$HIGHEST" = "$TAG_NAME" ]; then
+            LATEST_FLAG=(--latest)
+          fi
           gh release edit "$TAG_NAME" \
             --repo ${{ github.repository }} \
             --draft=false \
-            --latest
+            "${LATEST_FLAG[@]}"
           echo "✅ Release $TAG_NAME published with all binaries attached"
 
   # -----------------------------------------------------------------------

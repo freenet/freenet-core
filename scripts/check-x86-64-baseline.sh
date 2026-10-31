@@ -31,7 +31,7 @@ read -r -a sentinels <<<"${BASELINE_SENTINELS:-$DEFAULT_SENTINELS}"
 # SSE3. tzcnt is left out on purpose: it encodes as `rep bsf`, which gcc emits at
 # baseline and which runs on every x86-64 CPU. pextrw, pinsrw and the pmin/pmax
 # forms left out of the list are SSE or SSE2, so they are baseline.
-AVX_BMI='v[a-z0-9]+|shlx|shrx|sarx|rorx|bzhi|andn|pext|pdep|mulx|blsr|blsi|blsmsk|lzcnt|adcx|adox|movbe'
+AVX_BMI='v[a-z0-9]+|shlx|shrx|sarx|rorx|bzhi|bextr|andn|pext|pdep|mulx|blsr|blsi|blsmsk|lzcnt|adcx|adox|movbe'
 SSE3_SSSE3='lddqu|movddup|movshdup|movsldup|haddp[sd]|hsubp[sd]|addsubp[sd]|pshufb|palignr|phadd[a-z]*|phsub[a-z]*|pmaddubsw|pmulhrsw|psign[bwd]|pabs[bwd]'
 SSE4='popcnt|crc32[bwlq]?|pmulld|pmuldq|ptest|pblend[a-z]*|blendv?p[sd]|pmovsx[a-z]*|pmovzx[a-z]*|pmins[bd]|pminu[wd]|pmaxs[bd]|pmaxu[wd]|pextr[bdq]|pinsr[bdq]|round[sp][sd]|pcmpeqq|pcmpgtq|pcmp[ei]str[im]|packusdw|dpp[sd]|mpsadbw|phminposuw|insertps|extractps'
 FORBIDDEN="^(${AVX_BMI}|${SSE3_SSSE3}|${SSE4})\$"
