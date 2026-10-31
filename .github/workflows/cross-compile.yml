@@ -16,8 +16,16 @@ concurrency:
 jobs:
   build-x86_64-linux:
     name: Build for x86_64-unknown-linux-musl
-    runs-on: ubuntu-latest
+    # Pinned, not ubuntu-latest. On Ubuntu 26.04 the runner's apt packages are
+    # the amd64v3 variant, and that gcc builds C dependencies (ring, zstd) with
+    # AVX2 and BMI2. 0.2.152 shipped that way and died with SIGILL on every CPU
+    # without AVX2.
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
+    env:
+      # States the baseline directly so the next runner change cannot alter it.
+      CFLAGS_x86_64_unknown_linux_musl: -march=x86-64 -mtune=generic
+      CXXFLAGS_x86_64_unknown_linux_musl: -march=x86-64 -mtune=generic
 
     steps:
       - uses: actions/checkout@v7
@@ -29,6 +37,10 @@ jobs:
           targets: x86_64-unknown-linux-musl
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          # New prefix so no cache from the amd64v3 builds is restored. Cargo
+          # would reuse those C objects, as 0.2.151's cache reused older ones.
+          prefix-key: v1-x86-64-baseline
 
       - name: Install musl toolchain
         run: sudo apt-get update && sudo apt-get install -y musl-tools musl-dev
@@ -47,6 +59,12 @@ jobs:
         run: |
           cargo build --release --target x86_64-unknown-linux-musl -p freenet
           cargo build --release --target x86_64-unknown-linux-musl -p fdev
+
+      - name: Check sampled C code for instructions above baseline x86-64
+        run: |
+          bash scripts/check-x86-64-baseline.sh \
+            target/x86_64-unknown-linux-musl/release/freenet \
+            target/x86_64-unknown-linux-musl/release/fdev
 
       - name: Upload freenet binary
         uses: actions/upload-artifact@v7
@@ -1004,6 +1022,22 @@ jobs:
           gh release edit "$TAG_NAME" \
             --repo ${{ github.repository }} \
             --draft=false
+          # An older release can have been marked latest by hand to stop a bad
+          # build spreading (0.2.151 for 0.2.152). Nodes only see the release
+          # that /releases/latest points at, so the new one must take that over.
+          # This is a separate call and cannot fail the step: the release is
+          # already published here, and GitHub does not allow a draft to be
+          # latest. A recovery run on an older tag must not move the marker
+          # backwards, so it applies only to the highest version.
+          HIGHEST=$(gh release list --repo ${{ github.repository }} --limit 30 --exclude-drafts \
+            --json tagName,isPrerelease \
+            --jq '.[] | select(.isPrerelease | not) | .tagName' | sort -V | tail -1 || true)
+          if [ -z "$HIGHEST" ]; then
+            echo "::warning::could not list releases; if $TAG_NAME is the newest, run: gh release edit $TAG_NAME --latest"
+          elif [ "$HIGHEST" = "$TAG_NAME" ]; then
+            gh release edit "$TAG_NAME" --repo ${{ github.repository }} --latest \
+              || echo "::warning::could not mark $TAG_NAME as latest; run: gh release edit $TAG_NAME --latest"
+          fi
           echo "✅ Release $TAG_NAME published with all binaries attached"
 
   # -----------------------------------------------------------------------
