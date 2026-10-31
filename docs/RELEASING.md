@@ -605,7 +605,9 @@ To stop a bad build that has already been published from reaching more nodes,
 mark the previous release as latest with `gh release edit <tag> --latest`.
 Without `--force`, nodes and gateways only move to a strictly newer version, so
 this does not downgrade anyone. It does not change the Docker `latest` tag. The
-next release takes the marker back automatically.
+next release takes the marker back automatically. While a bad build is demoted
+this way, do not re-run its `attach-to-release` job: that marks the highest
+version latest again.
 
 ### `verify_publishable` failed
 

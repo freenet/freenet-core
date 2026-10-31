@@ -60,7 +60,7 @@ build_with_instruction() {
 # One instruction from each group in FORBIDDEN, so removing a group fails here.
 # shellcheck disable=SC2016  # $1 is an assembler immediate, not a shell variable.
 for insn in \
-    'vmovd %eax,%xmm0' 'shlx %eax,%ecx,%edx' 'bextr %eax,%ecx,%edx' 'lzcnt %eax,%ecx' 'movbe (%rax),%ecx' \
+    'vmovd %eax,%xmm0' 'shlx %eax,%ecx,%edx' 'bextr %eax,%ecx,%edx' 'andn %eax,%ecx,%edx' 'lzcnt %eax,%ecx' 'movbe (%rax),%ecx' \
     'haddpd %xmm1,%xmm0' 'lddqu (%rax),%xmm0' \
     'pshufb %xmm1,%xmm0' 'palignr $1,%xmm1,%xmm0' 'pabsw %xmm1,%xmm0' \
     'pmulld %xmm1,%xmm0' 'ptest %xmm1,%xmm0' 'pmaxud %xmm1,%xmm0' 'pextrd $1,%xmm0,%eax' \

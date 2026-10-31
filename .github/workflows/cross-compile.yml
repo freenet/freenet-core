@@ -1029,10 +1029,12 @@ jobs:
           # already published here, and GitHub does not allow a draft to be
           # latest. A recovery run on an older tag must not move the marker
           # backwards, so it applies only to the highest version.
-          HIGHEST=$(gh release list --repo ${{ github.repository }} --limit 30 \
+          HIGHEST=$(gh release list --repo ${{ github.repository }} --limit 30 --exclude-drafts \
             --json tagName,isPrerelease \
             --jq '.[] | select(.isPrerelease | not) | .tagName' | sort -V | tail -1 || true)
-          if [ "$HIGHEST" = "$TAG_NAME" ]; then
+          if [ -z "$HIGHEST" ]; then
+            echo "::warning::could not list releases; if $TAG_NAME is the newest, run: gh release edit $TAG_NAME --latest"
+          elif [ "$HIGHEST" = "$TAG_NAME" ]; then
             gh release edit "$TAG_NAME" --repo ${{ github.repository }} --latest \
               || echo "::warning::could not mark $TAG_NAME as latest; run: gh release edit $TAG_NAME --latest"
           fi
