@@ -433,7 +433,7 @@ fn expected(role: Role, state: S, name: &str) -> Option<(S, Vec<Action>)> {
                 vec![
                     SendUpgrade(UpgradeControl::Accept { attempt }),
                     Action::Dial { attempt },
-                    Record(Outcome::Accepted),
+                    Record(Outcome::AcceptSent),
                 ],
             ))
         }
@@ -460,21 +460,32 @@ fn expected(role: Role, state: S, name: &str) -> Option<(S, Vec<Action>)> {
         }
         (Role::Server, S::Offered, "decline") => fail(
             QuicCloseCode::Downgrade,
-            Outcome::Declined(Some(DeclineReason::Busy)),
+            Outcome::Declined {
+                reason: Some(DeclineReason::Busy),
+                uncharged: true,
+            },
         ),
         (Role::Server, S::Offered, "decline_disabled") => fail(
             QuicCloseCode::Downgrade,
-            Outcome::Declined(Some(DeclineReason::Disabled)),
+            Outcome::Declined {
+                reason: Some(DeclineReason::Disabled),
+                uncharged: false,
+            },
         ),
-        (Role::Server, S::Offered | S::Connecting, "established") => Some((
-            S::Confirming,
-            vec![SendControl(QuicControl::Ready {
+        // A connection proves the peer accepted: counted once, here, when
+        // the `Accept` has not been seen.
+        (Role::Server, S::Offered | S::Connecting, "established") => {
+            let mut actions = vec![SendControl(QuicControl::Ready {
                 attempt,
                 caps: caps::KNOWN,
-            })],
-        )),
+            })];
+            if state == S::Offered {
+                actions.push(Record(Outcome::Accepted));
+            }
+            Some((S::Confirming, actions))
+        }
         (Role::Server, S::Confirming, "ready_ack") => {
-            Some((S::Active, vec![Record(Outcome::Established)]))
+            Some((S::Active, vec![Record(Outcome::Established(Role::Server))]))
         }
         (Role::Server, S::Offered | S::Connecting | S::Confirming, "ready") => {
             Some((state, vec![Record(Outcome::RoleConflict)]))
@@ -489,7 +500,7 @@ fn expected(role: Role, state: S, name: &str) -> Option<(S, Vec<Action>)> {
                     attempt,
                     caps: caps::KNOWN,
                 }),
-                Record(Outcome::Established),
+                Record(Outcome::Established(Role::Client)),
             ],
         )),
 
@@ -536,7 +547,11 @@ fn expected(role: Role, state: S, name: &str) -> Option<(S, Vec<Action>)> {
             S::Off,
             vec![
                 tear_down(QuicCloseCode::Downgrade),
-                Record(fallback(FallbackCause::EndpointDown)),
+                Record(if state == S::Active {
+                    fallback(FallbackCause::EndpointDown)
+                } else {
+                    Outcome::SetupEndpointDown
+                }),
             ],
         )),
 
@@ -544,12 +559,27 @@ fn expected(role: Role, state: S, name: &str) -> Option<(S, Vec<Action>)> {
         (_, S::Rechecking, "down") => {
             Some((S::Off, vec![Record(fallback(FallbackCause::EndpointDown))]))
         }
-        (_, _, "released" | "disabled" | "session_ended") if live => {
+        (_, _, "session_ended") if live => Some((
+            S::Off,
+            vec![
+                tear_down(QuicCloseCode::Downgrade),
+                Record(Outcome::SessionEnded {
+                    was_active: state == S::Active,
+                }),
+            ],
+        )),
+        // Reached from Active, so the path had been active.
+        (_, S::Rechecking, "session_ended") => Some((
+            S::Off,
+            vec![Record(Outcome::SessionEnded { was_active: true })],
+        )),
+        (_, _, "released" | "disabled") if live => {
             Some((S::Off, vec![tear_down(QuicCloseCode::Downgrade)]))
         }
-        (_, S::Unpromoted | S::Idle | S::Rechecking, "released" | "disabled" | "session_ended") => {
+        (_, S::Unpromoted | S::Idle | S::Rechecking, "released" | "disabled") => {
             Some((S::Off, vec![]))
         }
+        (_, S::Unpromoted | S::Idle, "session_ended") => Some((S::Off, vec![])),
         (_, S::Unpromoted | S::Idle, "down") => Some((S::Off, vec![])),
 
         _ => None,
@@ -626,9 +656,12 @@ fn ledger_after(
             || recorded(|o| {
                 matches!(
                     o,
-                    Outcome::Declined(Some(
-                        DeclineReason::Busy | DeclineReason::NotReady | DeclineReason::Backoff
-                    ))
+                    Outcome::Declined {
+                        reason: Some(
+                            DeclineReason::Busy | DeclineReason::NotReady | DeclineReason::Backoff
+                        ),
+                        ..
+                    }
                 )
             })
         {
@@ -845,7 +878,7 @@ fn the_version_floor_gates_the_offer() {
         let mut client = Rig::new(Role::Client);
         assert_eq!(client.promote(version), vec![]);
         assert_eq!(client.machine.deadline(), None);
-        assert_eq!(client.offer(1)[2], Action::Record(Outcome::Accepted));
+        assert_eq!(client.offer(1)[2], Action::Record(Outcome::AcceptSent));
     }
     let mut rig = Rig::new(Role::Server);
     assert_eq!(rig.promote(Some(QUIC_UPGRADE_NEGOTIATES_IN)), vec![]);
@@ -990,6 +1023,27 @@ fn close_codes_record_their_cause() {
     }
 }
 
+/// The same downgrade-class closes, before the path is active, are a setup
+/// outcome and not a path fallback.
+#[test]
+fn a_downgrade_close_in_setup_is_not_a_path_fallback() {
+    for code in [
+        QuicCloseCode::Downgrade,
+        QuicCloseCode::SendAbortLimit,
+        QuicCloseCode::PeerNotAcknowledging,
+        QuicCloseCode::ControlRefused,
+    ] {
+        let mut rig = reach(Role::Server, S::Confirming);
+        let actions = rig.close_with(attempt_of(Role::Server), u64::from(code.code()));
+        assert_eq!(
+            actions[1],
+            Action::Record(Outcome::SetupDowngraded),
+            "code {:#x}",
+            code.code()
+        );
+    }
+}
+
 /// A refused frame closes at once rather than at the deadline, with the new
 /// code and a normal backoff, on both roles; a frame of the known version with
 /// a wrong length waits for the deadline; and once active, a frame a newer
@@ -1048,9 +1102,11 @@ fn protocol_0x1_rechecks_the_endpoint_before_charging_the_peer() {
         let actions = rig.step(Event::EndpointNotUp(QuicAvailability::Down));
         assert_eq!(
             actions,
-            vec![Action::Record(Outcome::Fallback(
-                FallbackCause::EndpointDown
-            ))]
+            vec![Action::Record(if start == S::Active {
+                Outcome::Fallback(FallbackCause::EndpointDown)
+            } else {
+                Outcome::SetupEndpointDown
+            })]
         );
         assert!(rig.machine.is_off());
         assert_eq!(rig.machine.failures, 0, "no charge");
@@ -1067,9 +1123,11 @@ fn protocol_0x1_rechecks_the_endpoint_before_charging_the_peer() {
         let actions = rig.step(Event::Tick);
         assert_eq!(
             actions,
-            vec![Action::Record(Outcome::Fallback(
-                FallbackCause::EndpointDown
-            ))]
+            vec![Action::Record(if start == S::Active {
+                Outcome::Fallback(FallbackCause::EndpointDown)
+            } else {
+                Outcome::SetupEndpointDown
+            })]
         );
         assert!(rig.machine.is_off());
         assert_eq!(rig.machine.failures, 0, "no charge");
@@ -1216,7 +1274,7 @@ fn at_the_path_limit_no_one_is_charged() {
     );
     assert_eq!(rig.machine.failures, 0);
     drop(held);
-    assert_eq!(rig.offer(2)[2], Action::Record(Outcome::Accepted));
+    assert_eq!(rig.offer(2)[2], Action::Record(Outcome::AcceptSent));
 }
 
 /// A client in backoff declines, and takes the next offer once it is over.
@@ -1242,7 +1300,7 @@ fn a_client_declines_while_backing_off_and_ignores_old_offers() {
     rig.now = rig.machine.retry_at;
     assert_eq!(
         rig.offer(CLIENT_ATTEMPT + 3)[2],
-        Action::Record(Outcome::Accepted)
+        Action::Record(Outcome::AcceptSent)
     );
 }
 
@@ -1255,7 +1313,13 @@ fn an_unknown_decline_reason_is_a_decline() {
         attempt: SERVER_ATTEMPT,
         reason: 200,
     }));
-    assert_eq!(actions[1], Action::Record(Outcome::Declined(None)));
+    assert_eq!(
+        actions[1],
+        Action::Record(Outcome::Declined {
+            reason: None,
+            uncharged: false
+        })
+    );
     assert_eq!(rig.in_use(), 0);
     assert_eq!(label(&rig.machine), S::Idle);
 }
@@ -1474,7 +1538,7 @@ fn a_replaced_session_continues_the_backoff() {
         Action::Record(Outcome::DeclineSent(DeclineReason::Backoff))
     );
     client.now = seed.retry_at;
-    assert_eq!(client.offer(2)[2], Action::Record(Outcome::Accepted));
+    assert_eq!(client.offer(2)[2], Action::Record(Outcome::AcceptSent));
 
     let mut late = Rig::new(Role::Server);
     late.now = seed.retry_at + BACKOFF_MAX;
@@ -1522,7 +1586,7 @@ fn a_seed_is_bounded_when_it_is_taken() {
             Action::Record(Outcome::DeclineSent(DeclineReason::Backoff))
         );
         client.now = taken;
-        assert_eq!(client.offer(2)[2], Action::Record(Outcome::Accepted));
+        assert_eq!(client.offer(2)[2], Action::Record(Outcome::AcceptSent));
     }
 
     let hour_ago = now - Duration::from_secs(3600);
@@ -1677,9 +1741,10 @@ fn a_flapping_session_is_retried_less_and_less_often() {
             rig.now = rig.now.max(seed.retry_at);
             rig.promote_with(Some(QUIC_UPGRADE_NEGOTIATES_IN), seed);
             advance_to(&mut rig, role, start);
+            // The record, and a tear-down unless the path was already gone.
             assert_eq!(
                 rig.step(Event::SessionEnded).len(),
-                usize::from(start != S::Rechecking),
+                1 + usize::from(start != S::Rechecking),
                 "{case}"
             );
             assert_eq!(rig.backoff(), Duration::from_secs(seconds), "{case}");
@@ -1803,7 +1868,11 @@ fn a_failed_send_takes_the_path_its_error_means() {
                     attempt,
                     code: QuicCloseCode::Downgrade,
                 },
-                Action::Record(Outcome::Fallback(FallbackCause::EndpointDown)),
+                Action::Record(if start == S::Active {
+                    Outcome::Fallback(FallbackCause::EndpointDown)
+                } else {
+                    Outcome::SetupEndpointDown
+                }),
             ]
         );
         assert!(rig.machine.is_off());

@@ -35,7 +35,7 @@
 //! Offered     Accept                        Connecting  accepted
 //! Offered     Decline, Disabled or unknown  Idle        tear down, backoff
 //! Offered     Decline, any other reason     Idle        tear down, retry in BACKOFF_MIN, uncharged
-//! Offered     PathEstablished               Confirming  Ready (Accept still on its way)
+//! Offered     PathEstablished               Confirming  Ready, accepted (Accept still on its way)
 //! Connecting  PathEstablished, server       Confirming  Ready
 //! Connecting  PathEstablished, client       Confirming  -
 //! Connecting  Ready, client                 Active      ReadyAck
@@ -53,11 +53,11 @@
 //! setup or Active  PathFailed               see classify()
 //! Rechecking  Tick past deadline            Idle or Off backoff, or none if Down
 //! any         EndpointNotUp, not Up         Off         tear down, no backoff
-//! setup       SessionEnded                  Off         tear down, backoff
-//! Active      SessionEnded, not yet stable  Off         tear down, backoff
-//! Active      SessionEnded, stable          Off         tear down, clear the count
-//! Rechecking  SessionEnded, not yet stable  Off         backoff
-//! Rechecking  SessionEnded, stable          Off         clear the count
+//! setup       SessionEnded                  Off         tear down, backoff, session_ended
+//! Active      SessionEnded, not yet stable  Off         tear down, backoff, session_ended
+//! Active      SessionEnded, stable          Off         tear down, clear the count, session_ended
+//! Rechecking  SessionEnded, not yet stable  Off         backoff, session_ended
+//! Rechecking  SessionEnded, stable          Off         clear the count, session_ended
 //! Idle or Off SessionEnded                  Off         -
 //! ```
 //!
@@ -249,11 +249,19 @@ pub(in crate::transport) enum Action {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::transport) enum Outcome {
     Offered,
+    /// The peer accepted this node's `Offer`.
     Accepted,
-    Established,
+    /// This node accepted the peer's `Offer`.
+    AcceptSent,
+    /// The path is active on this side's evidence, as `Role`.
+    Established(Role),
     /// The peer's `Decline`, `None` when the reason is one this node does
-    /// not know.
-    Declined(Option<DeclineReason>),
+    /// not know. `uncharged` is whether the peer was spared the backoff
+    /// penalty (the machine's own decision, see `on_decline`).
+    Declined {
+        reason: Option<DeclineReason>,
+        uncharged: bool,
+    },
     /// This node declined.
     DeclineSent(DeclineReason),
     /// The peer below `QUIC_UPGRADE_NEGOTIATES_IN` is never offered.
@@ -269,8 +277,19 @@ pub(in crate::transport) enum Outcome {
     KeyConflict,
     /// A frame this node cannot read ended the setup.
     ControlRefused,
-    /// A path ended, or an attempt ended for a reason no setup outcome names.
+    /// A path ended after it was active. A setup that ends has its own outcome
+    /// ([`Outcome::SetupDowngraded`], [`Outcome::SetupEndpointDown`]).
     Fallback(FallbackCause),
+    /// The peer closed the connection of an attempt that was not yet active
+    /// with a downgrade-class code.
+    SetupDowngraded,
+    /// The endpoint went down under an attempt that was not yet active.
+    SetupEndpointDown,
+    /// The UDP session ended under an attempt or a path. `was_active` is
+    /// whether the path had been active.
+    SessionEnded {
+        was_active: bool,
+    },
 }
 
 /// Why a path ended.
@@ -406,10 +425,9 @@ fn classify(kind: QuicErrorKind) -> Verdict {
             },
             // Close codes DOWNGRADE, SEND_ABORT_LIMIT, PEER_NOT_ACKNOWLEDGING
             // and CONTROL_REFUSED: fall back for this connection only.
-            QuicRefusal::Downgrade => normal(
-                Outcome::Fallback(FallbackCause::DowngradeReceived),
-                FallbackCause::DowngradeReceived,
-            ),
+            QuicRefusal::Downgrade => {
+                normal(Outcome::SetupDowngraded, FallbackCause::DowngradeReceived)
+            }
             // This node's own limit, so the peer is not charged.
             QuicRefusal::AllowSetFull => Verdict::Fail {
                 penalty: Penalty::Uncharged,
@@ -729,7 +747,7 @@ impl UpgradeMachine {
                     return vec![
                         Action::SendUpgrade(UpgradeControl::Accept { attempt }),
                         Action::Dial { attempt },
-                        Action::Record(Outcome::Accepted),
+                        Action::Record(Outcome::AcceptSent),
                     ];
                 }
             },
@@ -771,7 +789,10 @@ impl UpgradeMachine {
             attempt,
             QuicCloseCode::Downgrade,
             penalty,
-            Outcome::Declined(reason),
+            Outcome::Declined {
+                reason,
+                uncharged: penalty == Penalty::Uncharged,
+            },
         )
     }
 
@@ -783,10 +804,17 @@ impl UpgradeMachine {
             // The connection can overtake an `Accept` on the UDP session.
             (Phase::Offered | Phase::Connecting, Some(Role::Server)) => {
                 self.advance(Phase::Confirming, cx.now + CONFIRM_TIMEOUT);
-                vec![Action::SendControl(QuicControl::Ready {
+                let mut actions = vec![Action::SendControl(QuicControl::Ready {
                     attempt,
                     caps: caps::KNOWN,
-                })]
+                })];
+                // A connection from the peer proves it accepted. Counted here
+                // because the `Accept` was lost or is late, and a late one is
+                // ignored once the phase has moved on.
+                if phase == Phase::Offered {
+                    actions.push(Action::Record(Outcome::Accepted));
+                }
+                actions
             }
             (Phase::Connecting, Some(Role::Client)) => {
                 self.advance(Phase::Confirming, cx.now + CONFIRM_TIMEOUT);
@@ -815,7 +843,7 @@ impl UpgradeMachine {
                         attempt,
                         caps: caps::KNOWN,
                     }),
-                    Action::Record(Outcome::Established),
+                    Action::Record(Outcome::Established(Role::Client)),
                 ]
             }
             (Some(Role::Client), Phase::Offered) | (None, _) => Vec::new(),
@@ -827,7 +855,7 @@ impl UpgradeMachine {
             return Vec::new();
         }
         self.activate(cx.now);
-        vec![Action::Record(Outcome::Established)]
+        vec![Action::Record(Outcome::Established(Role::Server))]
     }
 
     fn on_sent(&mut self, cx: Inputs<'_>, attempt: u32, outcome: BoundedSend) -> Vec<Action> {
@@ -1000,19 +1028,24 @@ impl UpgradeMachine {
         self.clear_count_if_stable(cx, active_since);
         match ending {
             Ending::EndpointDown if was_attempting => {
-                actions.push(Action::Record(Outcome::Fallback(
-                    FallbackCause::EndpointDown,
-                )));
+                actions.push(Action::Record(if active_since.is_some() {
+                    Outcome::Fallback(FallbackCause::EndpointDown)
+                } else {
+                    Outcome::SetupEndpointDown
+                }));
             }
             // A peer restart replaces the UDP session at once, while the old
             // QUIC connection waits for a close or an idle timeout, so this
             // often comes first and is the only report of the failure. From
             // `Idle` a failure has already charged, and from `Off` there is
             // nothing left to charge for.
-            Ending::Session
-                if was_attempting && !is_stable(cx, active_since) && !endpoint_is_down(cx) =>
-            {
-                self.charge(cx, active_since, Penalty::Normal);
+            Ending::Session if was_attempting => {
+                actions.push(Action::Record(Outcome::SessionEnded {
+                    was_active: active_since.is_some(),
+                }));
+                if !is_stable(cx, active_since) && !endpoint_is_down(cx) {
+                    self.charge(cx, active_since, Penalty::Normal);
+                }
             }
             Ending::Local | Ending::EndpointDown | Ending::Session => {}
         }

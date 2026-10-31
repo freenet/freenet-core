@@ -376,7 +376,8 @@ and no breaker state is left), QUIC crash-loop breaker trips at startup
 only a QUIC fault; see `quic/breaker.rs`) and whether the breaker keeps QUIC
 off in this process (`quic_breaker_suppressed`, a state that is never reset and
 is not activity by itself) and QUIC connections this node closed, by close code
-(`quic_close_sent_<label>`, one per `QuicCloseCode`). Each label set is declared once in a
+(`quic_close_sent_<label>`, one per `QuicCloseCode`) and the shadow-mode upgrade
+telemetry (below, "Upgrade telemetry"). Each label set is declared once in a
 `labelled_counters!` list, so a new variant needs a snapshot field. Hot
 path writes are single relaxed atomics; `SentPacketTracker` keeps an
 `rto_expiries` count and a bounded per-stream final-ACK watch, both
@@ -958,17 +959,20 @@ doc has the transition table.
   once with CONTROL_REFUSED and a normal backoff, so the sender does not wait
   for its setup timeout. WrongLength and Empty wait for the deadline. Once
   active, a refused frame leaves the path alone.
+
   Off is final for the session, also for a policy that later clears (endpoint
   Down, Released or Disabled, session ended, policy refusing, below the version
   floor, equal keys): no re-offer, and no charge to the peer except from a
   session end (above). A client or a machine with no role answers an Offer in
   Off with Disabled; a server records role_conflict and does not reply. A later
   Promoted changes and records nothing.
+
   An Offer repeating or older than the highest seen gets no reply. An Offer
   while an attempt is in progress gets NotReady; a client never tears a path
   down because of an Offer, so offers cannot make it dial faster than its
   attempts finish. A server that receives an Offer records role_conflict and
   does not reply.
+
   Caller contracts (e5a-5b): report OfferSent before stepping any reply to that
   Offer; drop an Offer still deferred behind allow_peer once a TearDown names
   its attempt; read backoff_seed after stepping SessionEnded (None when the machine took no seed: file nothing); end and file any older session for the peer key BEFORE stepping Promoted on the new one, and never let an older session's seed replace a newer one's (a max merge undoes a stable path's clear, so track session order); give every session the listener's clock clone (RealTime::new() starts its own epoch); give the client
@@ -988,6 +992,54 @@ doc has the transition table.
   timeouts_and_windows_have_these_values pins the constants as literals, and
   negotiation_floor_stays_above_every_release_that_ignores_an_offer stops
   QUIC_UPGRADE_NEGOTIATES_IN going down to 0.2.152 or below.
+
+Upgrade telemetry (#5940 e5a-6). The driver turns each machine `Outcome` into a
+counter at `Session::count`, which matches every `Outcome` variant, so a new
+outcome does not compile until it has one. All are per-period and reset with the
+snapshot except the two gauges.
+  `quic_upgrade_<label>` (`QuicUpgradeOutcome`): offered, accepted (the peer
+  accepted this node's Offer, by its Accept or, if that was lost, by its
+  connection, counted once either way), accept_sent, established (either role),
+  established_as_offerer, no_reply, timeout, handshake_failed, identity_mismatch,
+  role_conflict, allow_set_full, key_conflict, control_refused,
+  ineligible_version, declined_<reason> (the peer's Decline), declined_uncharged
+  (the same Decline when the machine spared the peer the penalty; the flag comes
+  from `on_decline`), decline_sent_<reason> (counted after the decline rate gate;
+  `upgrade_decline_suppressed` counts the held-back ones), setup_downgrade_rx and
+  setup_endpoint_down (the same causes as the fallbacks below, before the path
+  was active), session_ended_setup and session_ended_active (the UDP session
+  ended under an attempt or a path), inbox_overflow (a full inbox only),
+  attempt_unrouted (attempts that reached this node and found no session or no
+  attempt waiting; a client's retransmitted Initial can count again), and
+  task_panicked (a driver or pump panic, re-raised after counting).
+  `identity_mismatch` counts on both ends: a peer's close with code 2 ends this
+  node's attempt as `identity_mismatch` too.
+  Stage 2 gate denominator: established_as_offerer over accepted, reported beside
+  offered and declined_uncharged. Both sides count `established`; only the
+  offerer's is the numerator. Counts are node-wide; there is no per-pair series.
+  `quic_fallback_<label>` (`QuicFallback`): idle, reset, protocol, downgrade_rx,
+  endpoint_down. Paths that had been active only; an attempt that ends in setup
+  is counted in `quic_upgrade_*`. A close this node sent for send_abort_limit or
+  peer_not_acknowledging reaches the machine as a lost connection, so it counts
+  as `reset`; its count is `quic_close_sent_*`. A key mismatch is
+  `quic_upgrade_identity_mismatch`.
+  `quic_close_received_<label>`: one per QUIC connection quinn reports as closed
+  by a peer application close, by raw code (counted in `QuicConnection::new`'s
+  watcher, because `QuicErrorKind` merges codes 1, 3, 4 and 5); a code with no
+  name is `unknown_code`. A local close is not counted.
+  `quic_path_age_at_close_<lt_1m|lt_10m|lt_1h|lt_1d|ge_1d>`: age of an active
+  path at the teardown that ends it. `quic_establish_ms_p50`/`_p90`/`_samples`:
+  from this node's Offer or Accept to active, on the session clock, first 256
+  samples per period (`_samples` counts all). Both roles are mixed: a server
+  times to its `ReadyAck`, a client to its `Ready`.
+  Gauges `quic_paths_offered_or_dialing` and `quic_paths_active` are held by a
+  `PathGauge` guard inside the attempt, so dropping the attempt leaves the gauge.
+  `quic_paths_active` is also in `resource_utilization` beside
+  `memory_rss_bytes`.
+  Not built: stream-concurrency instruments on real QUIC (`quic_open_uni_waited`,
+  permit waits, ge_8..ge_48, control_* refusals) have no source until e5b and
+  read zero in shadow; the `transport=legacy|quic` connection attribute; a
+  per-path memory estimate.
 
 Upgrade driver (`quic/upgrade/driver.rs`, #5940 step e5a-5b): QuicUpgrades is
 per node (endpoint, policy, routes by address, live sessions by peer key, backoff
