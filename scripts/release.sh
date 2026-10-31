@@ -1497,9 +1497,12 @@ publish_draft_release() {
     fi
 
     echo -n "  Publishing draft release... "
-    # --latest: an older release may have been marked latest by hand to stop a
-    # bad build spreading. This path only ever publishes a new, higher version.
-    gh release edit "v$VERSION" --repo freenet/freenet-core --draft=false --latest > /dev/null
+    gh release edit "v$VERSION" --repo freenet/freenet-core --draft=false > /dev/null
+    # An older release may have been marked latest by hand to stop a bad build
+    # spreading. This path only publishes a new, higher version. A separate call,
+    # because the release is published by now and this must not undo that.
+    gh release edit "v$VERSION" --repo freenet/freenet-core --latest > /dev/null \
+        || echo "  warning: could not mark v$VERSION as latest; run: gh release edit v$VERSION --latest"
     echo "✓"
 }
 

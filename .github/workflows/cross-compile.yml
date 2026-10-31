@@ -1019,22 +1019,23 @@ jobs:
           # binary's updater has been verified. The release is created as a
           # draft by release.sh/release.yml to prevent the installer from
           # seeing a version before binaries exist.
-          # --latest is explicit because an older release can have been marked
-          # latest by hand to stop a bad build spreading (0.2.151 for 0.2.152).
-          # Nodes only see the release that /releases/latest points at, so the
-          # new one must take that over. A recovery run on an older tag must
-          # not move it backwards, so this applies only to the highest version.
-          LATEST_FLAG=()
+          gh release edit "$TAG_NAME" \
+            --repo ${{ github.repository }} \
+            --draft=false
+          # An older release can have been marked latest by hand to stop a bad
+          # build spreading (0.2.151 for 0.2.152). Nodes only see the release
+          # that /releases/latest points at, so the new one must take that over.
+          # This is a separate call and cannot fail the step: the release is
+          # already published here, and GitHub does not allow a draft to be
+          # latest. A recovery run on an older tag must not move the marker
+          # backwards, so it applies only to the highest version.
           HIGHEST=$(gh release list --repo ${{ github.repository }} --limit 30 \
             --json tagName,isPrerelease \
             --jq '.[] | select(.isPrerelease | not) | .tagName' | sort -V | tail -1 || true)
           if [ "$HIGHEST" = "$TAG_NAME" ]; then
-            LATEST_FLAG=(--latest)
+            gh release edit "$TAG_NAME" --repo ${{ github.repository }} --latest \
+              || echo "::warning::could not mark $TAG_NAME as latest; run: gh release edit $TAG_NAME --latest"
           fi
-          gh release edit "$TAG_NAME" \
-            --repo ${{ github.repository }} \
-            --draft=false \
-            "${LATEST_FLAG[@]}"
           echo "✅ Release $TAG_NAME published with all binaries attached"
 
   # -----------------------------------------------------------------------
