@@ -1023,6 +1023,27 @@ fn close_codes_record_their_cause() {
     }
 }
 
+/// The same downgrade-class closes, before the path is active, are a setup
+/// outcome and not a path fallback.
+#[test]
+fn a_downgrade_close_in_setup_is_not_a_path_fallback() {
+    for code in [
+        QuicCloseCode::Downgrade,
+        QuicCloseCode::SendAbortLimit,
+        QuicCloseCode::PeerNotAcknowledging,
+        QuicCloseCode::ControlRefused,
+    ] {
+        let mut rig = reach(Role::Server, S::Confirming);
+        let actions = rig.close_with(attempt_of(Role::Server), u64::from(code.code()));
+        assert_eq!(
+            actions[1],
+            Action::Record(Outcome::SetupDowngraded),
+            "code {:#x}",
+            code.code()
+        );
+    }
+}
+
 /// A refused frame closes at once rather than at the deadline, with the new
 /// code and a normal backoff, on both roles; a frame of the known version with
 /// a wrong length waits for the deadline; and once active, a frame a newer
