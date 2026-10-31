@@ -186,12 +186,29 @@ impl Drop for NodeProcess {
     }
 }
 
-/// Reserve an ephemeral port by binding then immediately freeing it. The kernel
-/// won't hand the same port back on the next `:0` request, so this races far
-/// less than a fixed port; the node binds it a moment later.
+/// A port free in both TCP and UDP right now, for the node to bind.
 fn reserve_port() -> anyhow::Result<u16> {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-    Ok(listener.local_addr()?.port())
+    use std::sync::atomic::{AtomicU32, Ordering};
+    /// Below Linux's default ephemeral range (32768-60999), so a socket the OS
+    /// assigns to another test cannot take the port before the node binds it.
+    /// An OS-assigned port here lost that race: the node then exits 42.
+    const FIRST: u32 = 20_000;
+    const COUNT: u32 = 10_000;
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    // Each test under nextest is its own process, so the pid spreads them apart.
+    let start = std::process::id().wrapping_mul(2_654_435_761);
+    for _ in 0..COUNT {
+        let offset = start.wrapping_add(NEXT.fetch_add(1, Ordering::Relaxed)) % COUNT;
+        let port = (FIRST + offset) as u16;
+        // The two ports serve TCP (WebSocket) and UDP (network), so a port must
+        // be free in both.
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+            && std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok()
+        {
+            return Ok(port);
+        }
+    }
+    anyhow::bail!("no free port below the ephemeral range")
 }
 
 async fn connect(ws_port: u16) -> anyhow::Result<WebApi> {
