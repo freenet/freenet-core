@@ -20829,7 +20829,7 @@ fn test_quic_shadow_two_nodes_reach_established_with_traffic_on_udp() {
     let client = run.nodes.iter().copied().find(|n| *n != server).unwrap();
     assert_eq!(run.whats(server, "Offered"), 1, "{}", run.dump());
     assert_eq!(run.whats(server, "Accepted"), 1, "{}", run.dump());
-    assert_eq!(run.whats(client, "Accepted"), 1, "{}", run.dump());
+    assert_eq!(run.whats(client, "AcceptSent"), 1, "{}", run.dump());
     assert_eq!(run.whats(client, "Offered"), 0, "only the server offers");
     assert_eq!(run.whats(server, "Established"), 1, "{}", run.dump());
     assert_eq!(run.whats(client, "Established"), 1, "{}", run.dump());

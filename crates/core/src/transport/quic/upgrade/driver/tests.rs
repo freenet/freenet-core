@@ -575,13 +575,13 @@ fn offer_outcomes_and_the_path_gauge_reach_telemetry() {
             panic!("{sends:?}");
         };
         session.take(Event::OfferSent { attempt });
-        assert_eq!(events(), ["path_attempting", "Offered"]);
+        assert_eq!(events(), ["\"path_attempting\"", "Offered"]);
         h.set_now(at + OFFER_TIMEOUT);
         assert!(session.take(Event::Tick).is_empty());
         assert_eq!(
             events(),
             [
-                "path_attempting",
+                "\"path_attempting\"",
                 "Offered",
                 "(\"path_left\", false)",
                 "NoReply"
@@ -683,12 +683,12 @@ fn an_established_path_is_counted_timed_and_aged() {
         assert_eq!(
             TRANSPORT_METRICS.quic_events_of(h.remote),
             [
-                "path_attempting",
+                "\"path_attempting\"",
                 "Offered",
                 "Established",
                 "EstablishedAsOfferer",
                 "(\"establish_ms\", 250)",
-                "path_activated",
+                "\"path_activated\"",
                 "Lt10M",
                 "(\"path_left\", true)",
             ]
