@@ -248,6 +248,12 @@ jobs:
       - name: Self-test release wait_for_binaries gh resilience
         run: bash scripts/release_wait_for_binaries_test.sh
 
+      # Regression gate for 0.2.152, whose C dependencies were built for
+      # x86-64-v3 and died with SIGILL on CPUs without AVX2. The check itself
+      # runs on the real binaries in cross-compile.yml; this tests the check.
+      - name: Self-test x86-64 baseline check
+        run: bash scripts/check-x86-64-baseline_test.sh
+
       # Release-driver RESUME state. Two regressions, both of the shape where a
       # resumed release is wrong in a way the operator cannot see: the v0.2.42
       # FDEV_VERSION double-bump, and the CRATES_PUBLISHED flag being set on
