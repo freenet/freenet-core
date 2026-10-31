@@ -588,6 +588,24 @@ gh run rerun --failed <RUN_ID> --repo freenet/freenet-core
 The re-run picks up where it left off — `wait_for_pr` will see the merged
 state and proceed to `verify_publishable`.
 
+### `Check sampled C code for instructions above baseline x86-64` failed
+
+Do not publish that build. It fails in one of two ways, and
+`scripts/check-x86-64-baseline.sh` explains both in its header:
+
+- **`uses instructions above baseline`:** the C compiler built for a newer CPU
+  than we support, as happened in 0.2.152, whose binaries crashed on every CPU
+  without AVX2. Check the job's `runs-on`, its `CFLAGS_*` variables and the
+  compiler in the log.
+- **`no symbol matches`:** a dependency update renamed or removed a sampled
+  function, or the release profile now strips symbols. Replace the name in
+  `DEFAULT_SENTINELS`.
+
+To stop a bad build that has already been published from reaching more nodes,
+mark the previous release as latest with `gh release edit <tag> --latest`.
+Nodes and gateways only move to a strictly newer version, so this does not
+downgrade anyone. It does not change the Docker `latest` tag.
+
 ### `verify_publishable` failed
 
 This job only runs `cargo publish -p freenet --dry-run`, so a failure here is a

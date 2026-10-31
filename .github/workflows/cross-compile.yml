@@ -25,6 +25,7 @@ jobs:
     env:
       # States the baseline directly so the next runner change cannot alter it.
       CFLAGS_x86_64_unknown_linux_musl: -march=x86-64 -mtune=generic
+      CXXFLAGS_x86_64_unknown_linux_musl: -march=x86-64 -mtune=generic
 
     steps:
       - uses: actions/checkout@v7
@@ -59,7 +60,7 @@ jobs:
           cargo build --release --target x86_64-unknown-linux-musl -p freenet
           cargo build --release --target x86_64-unknown-linux-musl -p fdev
 
-      - name: Check binaries run on baseline x86-64
+      - name: Check sampled C code for instructions above baseline x86-64
         run: |
           bash scripts/check-x86-64-baseline.sh \
             target/x86_64-unknown-linux-musl/release/freenet \
