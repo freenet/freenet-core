@@ -677,12 +677,9 @@ impl Session {
                     count(C::DeclinedUncharged);
                 }
             }
-            Outcome::DeclineSent(reason) => count(match reason {
-                DeclineReason::Disabled => C::DeclineSentDisabled,
-                DeclineReason::Backoff => C::DeclineSentBackoff,
-                DeclineReason::Busy => C::DeclineSentBusy,
-                DeclineReason::NotReady => C::DeclineSentNotReady,
-            }),
+            // Counted where the decline passes the rate gate, since the gate
+            // can hold it back after the machine decided (`count_decline_sent`).
+            Outcome::DeclineSent(_) => {}
             Outcome::IneligibleVersion => count(C::IneligibleVersion),
             Outcome::NoReply => count(C::NoReply),
             Outcome::Timeout => count(C::Timeout),
@@ -692,6 +689,13 @@ impl Session {
             Outcome::AllowSetFull => count(C::AllowSetFull),
             Outcome::KeyConflict => count(C::KeyConflict),
             Outcome::ControlRefused => count(C::ControlRefused),
+            Outcome::SetupDowngraded => count(C::SetupDowngraded),
+            Outcome::SetupEndpointDown => count(C::SetupEndpointDown),
+            Outcome::SessionEnded { was_active } => count(if was_active {
+                C::SessionEndedActive
+            } else {
+                C::SessionEndedSetup
+            }),
             Outcome::Fallback(cause) => TRANSPORT_METRICS.record_quic_fallback(
                 match cause {
                     FallbackCause::Idle => QuicFallback::Idle,
@@ -703,6 +707,21 @@ impl Session {
                 self.remote,
             ),
         }
+    }
+
+    /// Count a `Decline` this node sends, by reason. Called after the decline
+    /// rate gate admits it, so a held-back decline is not counted.
+    fn count_decline_sent(&self, reason: u8) {
+        use QuicUpgradeOutcome as C;
+        let counter = match DeclineReason::from_wire(reason) {
+            Some(DeclineReason::Disabled) => C::DeclineSentDisabled,
+            Some(DeclineReason::Backoff) => C::DeclineSentBackoff,
+            Some(DeclineReason::Busy) => C::DeclineSentBusy,
+            Some(DeclineReason::NotReady) => C::DeclineSentNotReady,
+            // This node only sends reasons it knows.
+            None => return,
+        };
+        TRANSPORT_METRICS.record_quic_upgrade(counter, self.remote);
     }
 
     /// Put the promoted key on the allow-set for `attempt`. The key comes only
@@ -1182,6 +1201,9 @@ async fn drive<S: Socket, T: TimeSource>(
                         session.note(|| format!("held back {control:?}"));
                         continue;
                     }
+                    if let UpgradeControl::Decline { reason, .. } = control {
+                        session.count_decline_sent(reason);
+                    }
                     session.note(|| format!("sent {control:?}"));
                     if let Err(error) = sender.send(control).await {
                         tracing::debug!(%error, ?control, "QUIC upgrade reply not sent");
@@ -1240,8 +1262,10 @@ impl QuicPathState {
     /// and the machine's deadlines cover that.
     pub(in crate::transport) fn on_upgrade(&self, control: UpgradeControl) {
         if let Err(error) = self.session.inbox.try_send(SessionEvent::Upgrade(control)) {
-            TRANSPORT_METRICS
-                .record_quic_upgrade(QuicUpgradeOutcome::InboxOverflow, self.session.remote);
+            if matches!(error, mpsc::error::TrySendError::Full(_)) {
+                TRANSPORT_METRICS
+                    .record_quic_upgrade(QuicUpgradeOutcome::InboxOverflow, self.session.remote);
+            }
             let count = self
                 .session
                 .hub

@@ -381,8 +381,9 @@ labelled_counters! {
     /// period as `quic_upgrade_<label>`.
     ///
     /// Success rate on eligible pairs: `established_as_offerer` over
-    /// `accepted` (attempts that got an Accept), reported beside `offered`
-    /// and `declined_uncharged`. Offers repeat every 60 s while a peer
+    /// `accepted` (attempts the peer accepted, by its Accept or, if that was
+    /// lost, by its connection), reported beside `offered` and
+    /// `declined_uncharged`. Offers repeat every 60 s while a peer
     /// answers Busy, NotReady or Backoff, so a per-offer rate is not
     /// meaningful. `accept_sent` and `established` also count the client
     /// side. Zero while QUIC is off.
@@ -403,7 +404,10 @@ labelled_counters! {
         Timeout => "timeout",
         /// The connection failed during setup, or a send of setup failed.
         HandshakeFailed => "handshake_failed",
-        /// The key proved on the path is not the key on record.
+        /// The key proved on the path is not the key on record. Counted on
+        /// both ends: a peer's close with the identity-mismatch code ends
+        /// this node's attempt as `identity_mismatch` too, so a sum across
+        /// the fleet counts one mismatch up to twice.
         IdentityMismatch => "identity_mismatch",
         /// Both sides acted as server, or the keys were equal.
         RoleConflict => "role_conflict",
@@ -425,24 +429,46 @@ labelled_counters! {
         /// A decline of any reason that the machine did not charge to the
         /// peer's backoff (Busy, NotReady, Backoff).
         DeclinedUncharged => "declined_uncharged",
-        /// This node declined the peer's Offer, by reason.
+        /// This node declined the peer's Offer, by reason. Counted when the
+        /// decline passes the rate gate; one the gate holds back is not.
         DeclineSentDisabled => "decline_sent_disabled",
         DeclineSentBackoff => "decline_sent_backoff",
         DeclineSentBusy => "decline_sent_busy",
         DeclineSentNotReady => "decline_sent_not_ready",
         /// A peer's upgrade message was dropped because the session's inbox
-        /// was full.
+        /// was full. A closed inbox (the session is ending) is not counted.
         InboxOverflow => "inbox_overflow",
-        /// A QUIC connection attempt reached no session and was ignored.
+        /// A QUIC connection attempt reached no session, a full or closed
+        /// session inbox, or no attempt waiting for it, and was ignored. It
+        /// counts attempts that reached this node, not dials: a client
+        /// retransmits its Initial, and each one that arrives can count.
         AttemptUnrouted => "attempt_unrouted",
         /// A session's driver or a path's pump panicked.
         TaskPanicked => "task_panicked",
+        /// The peer closed the connection of an attempt that was not yet
+        /// active with a downgrade-class code. After activation the same
+        /// close is `quic_fallback_downgrade_rx`.
+        SetupDowngraded => "setup_downgrade_rx",
+        /// The QUIC endpoint went down under an attempt that was not yet
+        /// active. After activation it is `quic_fallback_endpoint_down`.
+        SetupEndpointDown => "setup_endpoint_down",
+        /// The UDP session ended under an attempt that was not yet active
+        /// (a peer restart or a dropped connection). Together with the
+        /// setup outcomes above it accounts for an `accepted` that never
+        /// reached `established_as_offerer`.
+        SessionEndedSetup => "session_ended_setup",
+        /// The UDP session ended under a path that was active, or one
+        /// waiting out a protocol recheck after it was. Not a `quic_fallback`.
+        SessionEndedActive => "session_ended_active",
     }
 }
 
 labelled_counters! {
-    /// Why a QUIC path ended and traffic stayed on UDP, as the upgrade
-    /// machine decided. Exported per period as `quic_fallback_<label>`.
+    /// Why a QUIC path that had been active ended and traffic stayed on UDP,
+    /// as the upgrade machine decided. Exported per period as
+    /// `quic_fallback_<label>`. An attempt that ended before it was active is
+    /// not here; see `quic_upgrade_*`. The UDP session ending under a path is
+    /// `quic_upgrade_session_ended_active`.
     /// Not here: a close this node sent for `send_abort_limit` or
     /// `peer_not_acknowledging` reaches the machine as a lost connection
     /// (`reset`), and is counted by `quic_close_sent_*`; the same codes sent
@@ -1841,7 +1867,8 @@ impl TransportMetrics {
         } else {
             &self.quic_paths_offered_or_dialing
         };
-        gauge.fetch_sub(1, Ordering::Relaxed);
+        let before = gauge.fetch_sub(1, Ordering::Relaxed);
+        debug_assert!(before > 0, "a QUIC path gauge went below zero");
     }
 
     /// Paths active on this node's evidence now.
@@ -3052,6 +3079,9 @@ pub struct TransportSnapshot {
     pub quic_path_age_at_close: [u64; QuicPathAge::COUNT],
     /// Median and p90 of this period's establish latencies, in ms (the
     /// first `QUIC_ESTABLISH_SAMPLES_MAX` of them), and how many there were.
+    /// Both roles are mixed: a server times from its Offer to `ReadyAck`, a
+    /// client from its Accept to `Ready`, so the two measure different spans.
+    /// Past the cap, which samples are kept depends on arrival order.
     pub quic_establish_ms_p50: Option<u64>,
     pub quic_establish_ms_p90: Option<u64>,
     pub quic_establish_samples: u64,
@@ -3727,6 +3757,9 @@ struct SnapshotExtras {
     pub quic_path_age_at_close: [u64; QuicPathAge::COUNT],
     /// Median and p90 of this period's establish latencies, in ms (the
     /// first `QUIC_ESTABLISH_SAMPLES_MAX` of them), and how many there were.
+    /// Both roles are mixed: a server times from its Offer to `ReadyAck`, a
+    /// client from its Accept to `Ready`, so the two measure different spans.
+    /// Past the cap, which samples are kept depends on arrival order.
     pub quic_establish_ms_p50: Option<u64>,
     pub quic_establish_ms_p90: Option<u64>,
     pub quic_establish_samples: u64,

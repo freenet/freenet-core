@@ -70,13 +70,17 @@ impl ResourceUtilization {
 /// in-process [`TRANSPORT_METRICS`] cumulative byte counters. Never blocks on
 /// the network and never panics.
 pub(crate) fn sample() -> ResourceUtilization {
+    sample_from(&TRANSPORT_METRICS)
+}
+
+fn sample_from(transport: &crate::transport::metrics::TransportMetrics) -> ResourceUtilization {
     ResourceUtilization {
         memory_rss_bytes: rss_bytes(),
         memory_limit_bytes: crate::wasm_runtime::read_total_ram_bytes().map(|v| v as u64),
         cpu_time_seconds: cpu_time_seconds(),
-        cumulative_bytes_sent: TRANSPORT_METRICS.cumulative_bytes_sent(),
-        cumulative_bytes_received: TRANSPORT_METRICS.cumulative_bytes_received(),
-        quic_paths_active: TRANSPORT_METRICS.quic_paths_active(),
+        cumulative_bytes_sent: transport.cumulative_bytes_sent(),
+        cumulative_bytes_received: transport.cumulative_bytes_received(),
+        quic_paths_active: transport.quic_paths_active(),
     }
 }
 
@@ -164,6 +168,20 @@ mod tests {
                 sample.cpu_time_seconds
             );
         }
+    }
+
+    /// The sample reports the transport's active QUIC path count. Uses its own
+    /// metrics, since the process-wide ones are shared with other tests.
+    #[test]
+    fn sample_reports_the_active_quic_path_count() {
+        let metrics = crate::transport::metrics::TransportMetrics::new();
+        let remote: std::net::SocketAddr = "10.0.0.1:1".parse().unwrap();
+        assert_eq!(sample_from(&metrics).quic_paths_active, 0);
+        metrics.quic_path_attempting(remote);
+        metrics.quic_path_activated(remote);
+        assert_eq!(sample_from(&metrics).quic_paths_active, 1);
+        metrics.quic_path_left(true, remote);
+        assert_eq!(sample_from(&metrics).quic_paths_active, 0);
     }
 
     /// The telemetry JSON carries every axis as a populated key, so the

@@ -695,3 +695,117 @@ fn an_established_path_is_counted_timed_and_aged() {
         );
     });
 }
+
+/// A message dropped on a full inbox is counted as an overflow; one refused
+/// because the inbox is closed (the session is ending) is not.
+#[test]
+fn only_a_full_inbox_counts_as_an_overflow() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let h = Harness::server("quic-driver-overflow-count", 15).await;
+        let (session, inbox) = h.session();
+        let state = QuicPathState {
+            session: Arc::clone(&session),
+            driver: tokio::spawn(std::future::pending()),
+        };
+        let offer = UpgradeControl::Offer {
+            attempt: 1,
+            caps: 0,
+        };
+        let events = || TRANSPORT_METRICS.quic_events_of(h.remote);
+        for _ in 0..SESSION_INBOX_CAPACITY {
+            state.on_upgrade(offer);
+        }
+        assert!(events().is_empty());
+        state.on_upgrade(offer);
+        assert_eq!(events(), ["InboxOverflow"]);
+        drop(inbox);
+        state.on_upgrade(offer);
+        assert_eq!(events(), ["InboxOverflow"], "a closed inbox is not counted");
+    });
+}
+
+/// A connection attempt with no session, and one the session has no attempt
+/// waiting for, are each counted as unrouted.
+#[test]
+fn unrouted_connection_attempts_are_counted() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let h = Harness::server("quic-driver-unrouted", 16).await;
+        let local_is_a = h.pair.a_keys.public() > h.pair.b_keys.public();
+        let (ours, theirs, our_addr, our_key) = if local_is_a {
+            (&h.pair.a, &h.pair.b, h.pair.a_addr, h.pair.a_keys.public())
+        } else {
+            (&h.pair.b, &h.pair.a, h.pair.b_addr, h.pair.b_keys.public())
+        };
+        let (ours, theirs, our_key) = (ours.clone(), theirs.clone(), our_key.clone());
+        let remote = h.remote;
+        let events = move || TRANSPORT_METRICS.quic_events_of(remote);
+        // The peer is allowed, as it is when its session has just ended or
+        // its attempt is not the one waiting; otherwise the endpoint refuses
+        // the attempt before the router sees it.
+        let _permit = ours.allow_peer(remote, &h.peer).expect("allowed");
+
+        let hub = Arc::clone(&h.hub);
+        let (o, t, k) = (ours.clone(), theirs.clone(), our_key.clone());
+        drive(&h.pair.time, Duration::from_secs(60), async move {
+            let dial = tokio::spawn(async move { t.connect(our_addr, &k).await });
+            hub.route(o.accept().await.expect("an attempt"));
+            dial.abort();
+        })
+        .await;
+        assert_eq!(events(), ["AttemptUnrouted"], "no session for the address");
+
+        let (session, _rx) = h.session();
+        drive(&h.pair.time, Duration::from_secs(60), async move {
+            let dial = tokio::spawn(async move { theirs.connect(our_addr, &our_key).await });
+            let incoming = ours.accept().await.expect("an attempt");
+            session.handle(SessionEvent::Incoming(Box::new(incoming)));
+            dial.abort();
+        })
+        .await;
+        assert_eq!(
+            events(),
+            ["AttemptUnrouted", "AttemptUnrouted"],
+            "a session with no attempt waiting"
+        );
+    });
+}
+
+/// Each outcome that names how a setup or a session ended reaches its own
+/// counter, and a decline is counted where the send passes the rate gate, not
+/// where the machine decides.
+#[test]
+fn session_and_setup_endings_reach_their_own_counters() {
+    use crate::transport::quic::upgrade::machine::Outcome;
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let h = Harness::server("quic-driver-endings", 17).await;
+        let (session, _rx) = h.session();
+        let events = || TRANSPORT_METRICS.quic_events_of(h.remote);
+        let mut state = session.state.lock();
+        session.apply(
+            &mut state,
+            vec![
+                Action::Record(Outcome::SetupDowngraded),
+                Action::Record(Outcome::SetupEndpointDown),
+                Action::Record(Outcome::SessionEnded { was_active: false }),
+                Action::Record(Outcome::SessionEnded { was_active: true }),
+                Action::Record(Outcome::DeclineSent(DeclineReason::Busy)),
+            ],
+        );
+        drop(state);
+        assert_eq!(
+            events(),
+            [
+                "SetupDowngraded",
+                "SetupEndpointDown",
+                "SessionEndedSetup",
+                "SessionEndedActive"
+            ],
+            "a decline is not counted by the machine's record"
+        );
+        session.count_decline_sent(DeclineReason::Busy.wire());
+        assert_eq!(events().last().map(String::as_str), Some("DeclineSentBusy"));
+    });
+}

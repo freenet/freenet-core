@@ -472,13 +472,18 @@ fn expected(role: Role, state: S, name: &str) -> Option<(S, Vec<Action>)> {
                 uncharged: false,
             },
         ),
-        (Role::Server, S::Offered | S::Connecting, "established") => Some((
-            S::Confirming,
-            vec![SendControl(QuicControl::Ready {
+        // A connection proves the peer accepted: counted once, here, when
+        // the `Accept` has not been seen.
+        (Role::Server, S::Offered | S::Connecting, "established") => {
+            let mut actions = vec![SendControl(QuicControl::Ready {
                 attempt,
                 caps: caps::KNOWN,
-            })],
-        )),
+            })];
+            if state == S::Offered {
+                actions.push(Record(Outcome::Accepted));
+            }
+            Some((S::Confirming, actions))
+        }
         (Role::Server, S::Confirming, "ready_ack") => {
             Some((S::Active, vec![Record(Outcome::Established(Role::Server))]))
         }
@@ -542,7 +547,11 @@ fn expected(role: Role, state: S, name: &str) -> Option<(S, Vec<Action>)> {
             S::Off,
             vec![
                 tear_down(QuicCloseCode::Downgrade),
-                Record(fallback(FallbackCause::EndpointDown)),
+                Record(if state == S::Active {
+                    fallback(FallbackCause::EndpointDown)
+                } else {
+                    Outcome::SetupEndpointDown
+                }),
             ],
         )),
 
@@ -550,12 +559,27 @@ fn expected(role: Role, state: S, name: &str) -> Option<(S, Vec<Action>)> {
         (_, S::Rechecking, "down") => {
             Some((S::Off, vec![Record(fallback(FallbackCause::EndpointDown))]))
         }
-        (_, _, "released" | "disabled" | "session_ended") if live => {
+        (_, _, "session_ended") if live => Some((
+            S::Off,
+            vec![
+                tear_down(QuicCloseCode::Downgrade),
+                Record(Outcome::SessionEnded {
+                    was_active: state == S::Active,
+                }),
+            ],
+        )),
+        // Reached from Active, so the path had been active.
+        (_, S::Rechecking, "session_ended") => Some((
+            S::Off,
+            vec![Record(Outcome::SessionEnded { was_active: true })],
+        )),
+        (_, _, "released" | "disabled") if live => {
             Some((S::Off, vec![tear_down(QuicCloseCode::Downgrade)]))
         }
-        (_, S::Unpromoted | S::Idle | S::Rechecking, "released" | "disabled" | "session_ended") => {
+        (_, S::Unpromoted | S::Idle | S::Rechecking, "released" | "disabled") => {
             Some((S::Off, vec![]))
         }
+        (_, S::Unpromoted | S::Idle, "session_ended") => Some((S::Off, vec![])),
         (_, S::Unpromoted | S::Idle, "down") => Some((S::Off, vec![])),
 
         _ => None,
@@ -1057,9 +1081,11 @@ fn protocol_0x1_rechecks_the_endpoint_before_charging_the_peer() {
         let actions = rig.step(Event::EndpointNotUp(QuicAvailability::Down));
         assert_eq!(
             actions,
-            vec![Action::Record(Outcome::Fallback(
-                FallbackCause::EndpointDown
-            ))]
+            vec![Action::Record(if start == S::Active {
+                Outcome::Fallback(FallbackCause::EndpointDown)
+            } else {
+                Outcome::SetupEndpointDown
+            })]
         );
         assert!(rig.machine.is_off());
         assert_eq!(rig.machine.failures, 0, "no charge");
@@ -1076,9 +1102,11 @@ fn protocol_0x1_rechecks_the_endpoint_before_charging_the_peer() {
         let actions = rig.step(Event::Tick);
         assert_eq!(
             actions,
-            vec![Action::Record(Outcome::Fallback(
-                FallbackCause::EndpointDown
-            ))]
+            vec![Action::Record(if start == S::Active {
+                Outcome::Fallback(FallbackCause::EndpointDown)
+            } else {
+                Outcome::SetupEndpointDown
+            })]
         );
         assert!(rig.machine.is_off());
         assert_eq!(rig.machine.failures, 0, "no charge");
@@ -1692,9 +1720,10 @@ fn a_flapping_session_is_retried_less_and_less_often() {
             rig.now = rig.now.max(seed.retry_at);
             rig.promote_with(Some(QUIC_UPGRADE_NEGOTIATES_IN), seed);
             advance_to(&mut rig, role, start);
+            // The record, and a tear-down unless the path was already gone.
             assert_eq!(
                 rig.step(Event::SessionEnded).len(),
-                usize::from(start != S::Rechecking),
+                1 + usize::from(start != S::Rechecking),
                 "{case}"
             );
             assert_eq!(rig.backoff(), Duration::from_secs(seconds), "{case}");
@@ -1818,7 +1847,11 @@ fn a_failed_send_takes_the_path_its_error_means() {
                     attempt,
                     code: QuicCloseCode::Downgrade,
                 },
-                Action::Record(Outcome::Fallback(FallbackCause::EndpointDown)),
+                Action::Record(if start == S::Active {
+                    Outcome::Fallback(FallbackCause::EndpointDown)
+                } else {
+                    Outcome::SetupEndpointDown
+                }),
             ]
         );
         assert!(rig.machine.is_off());
