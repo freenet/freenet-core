@@ -20922,7 +20922,10 @@ fn test_quic_off_peer_declines_with_disabled() {
             run.dump()
         );
         assert!(
-            run.whats(shadow, "Declined(Some(Disabled))") >= 1,
+            run.whats(
+                shadow,
+                "Declined { reason: Some(Disabled), uncharged: false }"
+            ) >= 1,
             "{}",
             run.dump()
         );
