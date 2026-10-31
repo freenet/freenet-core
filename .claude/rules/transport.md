@@ -407,8 +407,8 @@ arrivals older than the horizon or past the 1024 cap, streams the 1024-stream
 budget refused) are listed in the module doc. So `ge_T / conns_sampled` can
 support LOWERING `MAX_UNI_STREAMS` (`quic/config.rs`), never raising it; a
 limit that is too low costs only sender back-pressure. Shadow mode carries no
-data, so it cannot confirm the value; rollout stage 3 (data on QUIC, opt-in)
-is the first measurement on real QUIC. The gauge says nothing about the memory
+data, so it measures nothing about the value; rollout step 3 (data on a slice
+of pairs, see "QUIC rollout") is the first measurement on real QUIC. The gauge says nothing about the memory
 a peer opening streams on purpose can hold (the per-path ceiling's job). `inbound_concurrency_max` is diagnostic
 only (one peer can drive it to the cap with a burst or an inflated RTT). The
 counts sit under one mutex taken only on a connection's first sample of a
@@ -1014,7 +1014,7 @@ snapshot except the two gauges.
   task_panicked (a driver or pump panic, re-raised after counting).
   `identity_mismatch` counts on both ends: a peer's close with code 2 ends this
   node's attempt as `identity_mismatch` too.
-  Stage 2 gate denominator: established_as_offerer over accepted, reported beside
+  Step 2 gate denominator: established_as_offerer over accepted, reported beside
   offered and declined_uncharged. Both sides count `established`; only the
   offerer's is the numerator. Counts are node-wide; there is no per-pair series.
   `quic_fallback_<label>` (`QuicFallback`): idle, reset, protocol, downgrade_rx,
@@ -1235,6 +1235,47 @@ QUIC-class datagrams, by the demux classifier, for one pair from a virtual
 time; `simulation::QuicDatagramDrop`, kept across `with_fault_injection`).
 `quic/test_tls.rs` holds only a plain Ed25519 identity for tests where a
 peer presents a key that is not its transport key.
+
+#### QUIC rollout (#5940)
+
+There are no opt-in stages; releases do the rollout. QUIC stays off on Windows
+throughout, until #6031. Every step watches: peers disappearing per version
+against the previous rollout (a node that dies before reporting is absent from
+every rate), endpoint-down, panics and breaker trips, RSS against
+`quic_paths_active`, CPU and egress, and NAT success, connections and transfers.
+
+- Step 0: the first negotiating release ships with QUIC off. Its nodes answer
+  offers (`Decline{disabled}` with the key off); `upgrade_control_received`
+  stays near 0 and UDP metrics do not change.
+- Step 1: nova gateways and framework in shadow for 24-48 h. The 24 h gateway
+  A/B runs only if something looks odd. Rollback: set the key to off and restart.
+- Step 2: shadow on by default, not on Windows. Gate: at least 95% upgrade
+  success by `established_as_offerer / accepted`; fewer than 1 fallback per
+  path-day excluding endpoint and restart causes; memory within the measured
+  terms (about 0.3 to 0.5 MiB per idle path). An abort spike stops the step.
+  Shadow carries no data, so it does not measure `MAX_UNI_STREAMS`.
+- Step 3 (e5b): data on a slice of pairs chosen by a hash of their two keys, so
+  both sides agree with no extra message: about 5%, then 25%, then 100%, one
+  release each. Pairs outside the slice are the control. Needs identity PR3, the
+  quinn pin decision and #6027. Keep the stream limits if permit waits plus
+  `quic_open_uni_waited` stay below 0.5% of sends and ge_48 below 0.2% of
+  path-windows.
+- Going to 100% is default-on. Per slice against its control: fewer transfers
+  that hit an RTO; p90 queueing at 1 MiB or more no worse than 262 ms; timeout
+  disconnects no worse; CPU per byte at most 1.5x; OS egress at most cap + 5%;
+  memory no worse than UDP; zero panics or endpoint-downs attributable to QUIC;
+  and the kill switch rehearsed once.
+- Rollback at any step is a default-off release through auto-update's 0-4 h
+  stagger. Per-path fallback to UDP and the breaker work without a release. A
+  node in a broken state may not self-update.
+
+Simulation scenarios (`tests/simulation_integration.rs`, `test_quic_*`): two
+nodes established with traffic on UDP; QUIC-off peers decline `Disabled`; peers
+below the version floor are never offered; blackholed and idle paths fall back
+and are re-offered; a wrong key closes with IDENTITY_MISMATCH; endpoint-down
+closes every path; a replaced or restarted session closes its path and keeps the
+backoff; a mixed shadow / off / below-floor network forms paths only between
+shadow nodes; `quic-max-paths` = 1 declines `Busy` without a charge.
 
 #### QUIC identity (`transport/quic/identity.rs`, #5940 step c3)
 

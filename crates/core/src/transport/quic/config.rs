@@ -102,9 +102,10 @@ pub(crate) const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 ///
 /// The estimate is built to err high (see
 /// `peer_connection::inbound_concurrency`), so it can justify lowering
-/// this value, never raising it. Shadow mode carries no data, so it cannot
-/// confirm or justify the value either. Rollout stage 3 (#5940: data on
-/// QUIC, opt-in) is the first measurement on real QUIC that can.
+/// this value, never raising it. Shadow mode carries no data, so it
+/// measures nothing about this value. The first measurement on real QUIC is
+/// step 3 of the rollout (#5940: data on a slice of pairs, chosen by a hash
+/// of the two keys).
 pub(crate) const MAX_UNI_STREAMS: u32 = 64;
 
 /// Uni stream slots left for short messages and control frames when every

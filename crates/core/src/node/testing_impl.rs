@@ -2087,6 +2087,17 @@ impl SimNetwork {
         self
     }
 
+    /// Sets `quic-max-paths` to `limit` on every node, as `config.toml` would.
+    /// Call before the simulation starts. No effect on a node with QUIC off.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_quic_max_paths(&mut self, limit: usize) -> &mut Self {
+        for label in self.pending_labels() {
+            let config = self.node_config_mut(&label);
+            Arc::make_mut(&mut config.config).network_api.quic_max_paths = Some(limit.to_string());
+        }
+        self
+    }
+
     /// Drops every QUIC-class datagram between the nodes `a` and `b`, both
     /// directions, from virtual time `from` on (the network's clock starts
     /// at zero). Every other datagram between them is delivered as before,
