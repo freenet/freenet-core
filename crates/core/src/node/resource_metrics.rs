@@ -49,6 +49,9 @@ pub(crate) struct ResourceUtilization {
     /// Cumulative bytes received at the UDP socket layer since start (never
     /// reset).
     pub cumulative_bytes_received: u64,
+    /// QUIC upgrade paths active now (shadow mode), sampled with the RSS so
+    /// the two can be regressed against each other for a per-path cost.
+    pub quic_paths_active: u64,
 }
 
 impl ResourceUtilization {
@@ -73,6 +76,7 @@ pub(crate) fn sample() -> ResourceUtilization {
         cpu_time_seconds: cpu_time_seconds(),
         cumulative_bytes_sent: TRANSPORT_METRICS.cumulative_bytes_sent(),
         cumulative_bytes_received: TRANSPORT_METRICS.cumulative_bytes_received(),
+        quic_paths_active: TRANSPORT_METRICS.quic_paths_active(),
     }
 }
 
@@ -178,6 +182,7 @@ mod tests {
             "cpu_time_seconds",
             "cumulative_bytes_sent",
             "cumulative_bytes_received",
+            "quic_paths_active",
         ] {
             assert!(obj.contains_key(key), "telemetry value missing key `{key}`");
         }

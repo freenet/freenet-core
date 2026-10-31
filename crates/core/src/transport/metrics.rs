@@ -375,6 +375,129 @@ labelled_counters! {
 }
 
 labelled_counters! {
+    /// What a QUIC upgrade negotiation decided, counted by the code making
+    /// the decision (`quic::upgrade::machine::Outcome`, recorded by the
+    /// driver) or, for the last three, where the event is seen. Exported per
+    /// period as `quic_upgrade_<label>`.
+    ///
+    /// Success rate on eligible pairs: `established_as_offerer` over
+    /// `accepted` (attempts that got an Accept), reported beside `offered`
+    /// and `declined_uncharged`. Offers repeat every 60 s while a peer
+    /// answers Busy, NotReady or Backoff, so a per-offer rate is not
+    /// meaningful. `accept_sent` and `established` also count the client
+    /// side. Zero while QUIC is off.
+    pub(crate) enum QuicUpgradeOutcome {
+        /// This node sent an Offer.
+        Offered => "offered",
+        /// The peer accepted this node's Offer.
+        Accepted => "accepted",
+        /// This node accepted the peer's Offer.
+        AcceptSent => "accept_sent",
+        /// A path became active on this node's evidence (either role).
+        Established => "established",
+        /// As `established`, for a path this node offered (the server).
+        EstablishedAsOfferer => "established_as_offerer",
+        /// An Offer got no reply in time.
+        NoReply => "no_reply",
+        /// A setup stage ran out of time.
+        Timeout => "timeout",
+        /// The connection failed during setup, or a send of setup failed.
+        HandshakeFailed => "handshake_failed",
+        /// The key proved on the path is not the key on record.
+        IdentityMismatch => "identity_mismatch",
+        /// Both sides acted as server, or the keys were equal.
+        RoleConflict => "role_conflict",
+        /// The `allow_peer` set was full.
+        AllowSetFull => "allow_set_full",
+        /// The key was already allowed for another address.
+        KeyConflict => "key_conflict",
+        /// A control frame this node cannot read ended the setup.
+        ControlRefused => "control_refused",
+        /// A peer below the version floor was not offered.
+        IneligibleVersion => "ineligible_version",
+        /// The peer declined this node's Offer, by reason.
+        DeclinedDisabled => "declined_disabled",
+        DeclinedBackoff => "declined_backoff",
+        DeclinedBusy => "declined_busy",
+        DeclinedNotReady => "declined_not_ready",
+        /// A reason this node does not know.
+        DeclinedUnknown => "declined_unknown",
+        /// A decline of any reason that the machine did not charge to the
+        /// peer's backoff (Busy, NotReady, Backoff).
+        DeclinedUncharged => "declined_uncharged",
+        /// This node declined the peer's Offer, by reason.
+        DeclineSentDisabled => "decline_sent_disabled",
+        DeclineSentBackoff => "decline_sent_backoff",
+        DeclineSentBusy => "decline_sent_busy",
+        DeclineSentNotReady => "decline_sent_not_ready",
+        /// A peer's upgrade message was dropped because the session's inbox
+        /// was full.
+        InboxOverflow => "inbox_overflow",
+        /// A QUIC connection attempt reached no session and was ignored.
+        AttemptUnrouted => "attempt_unrouted",
+        /// A session's driver or a path's pump panicked.
+        TaskPanicked => "task_panicked",
+    }
+}
+
+labelled_counters! {
+    /// Why a QUIC path ended and traffic stayed on UDP, as the upgrade
+    /// machine decided. Exported per period as `quic_fallback_<label>`.
+    /// Not here: a close this node sent for `send_abort_limit` or
+    /// `peer_not_acknowledging` reaches the machine as a lost connection
+    /// (`reset`), and is counted by `quic_close_sent_*`; the same codes sent
+    /// by the peer are `downgrade_rx`, with the raw code in
+    /// `quic_close_received_*`. A key mismatch is
+    /// `quic_upgrade_identity_mismatch`.
+    pub(crate) enum QuicFallback {
+        /// The path timed out idle.
+        Idle => "idle",
+        /// The connection was lost or reset, or a send on it failed.
+        Reset => "reset",
+        /// A QUIC protocol error ended it.
+        Protocol => "protocol",
+        /// The peer closed it with a downgrade-class code.
+        DowngradeReceived => "downgrade_rx",
+        /// The QUIC endpoint went down.
+        EndpointDown => "endpoint_down",
+    }
+}
+
+labelled_counters! {
+    /// How long an active QUIC path lasted when it ended. Exported per period
+    /// as `quic_path_age_at_close_<label>`.
+    pub(crate) enum QuicPathAge {
+        /// Under 1 minute.
+        Lt1M => "lt_1m",
+        /// 1 minute to under 10 minutes (`STABLE_PATH`).
+        Lt10M => "lt_10m",
+        /// 10 minutes to under 1 hour.
+        Lt1H => "lt_1h",
+        /// 1 hour to under 1 day.
+        Lt1D => "lt_1d",
+        /// 1 day or more.
+        Ge1D => "ge_1d",
+    }
+}
+
+impl QuicPathAge {
+    /// The bucket for a path that lasted `age`.
+    pub(crate) fn bucket(age: std::time::Duration) -> Self {
+        match age.as_secs() {
+            0..60 => Self::Lt1M,
+            60..600 => Self::Lt10M,
+            600..3600 => Self::Lt1H,
+            3600..86400 => Self::Lt1D,
+            _ => Self::Ge1D,
+        }
+    }
+}
+
+/// Most establish-latency samples kept per period; `quic_establish_samples`
+/// counts all of them.
+const QUIC_ESTABLISH_SAMPLES_MAX: usize = 256;
+
+labelled_counters! {
     /// What took most of a paced stream's gap between fragments, for a gap
     /// that reached the egress cap's long-wait threshold or its deadline.
     /// Exported per period as `egress_long_waits_<label>`,
@@ -667,6 +790,25 @@ pub struct TransportMetrics {
     /// caught a panic); a panic between the count and quinn's transmit can
     /// still leave a counted close unsent, so this is an upper bound.
     quic_close_sent: [AtomicU64; QuicCloseCode::COUNT],
+    /// QUIC connections the peer (or the transport) ended with an application
+    /// close, by [`QuicCloseCode`]; the last slot is a code this node does
+    /// not know. One per connection, counted where quinn reports the close
+    /// (reset each snapshot).
+    quic_close_received: [AtomicU64; QuicCloseCode::COUNT + 1],
+    /// Upgrade decisions this period, by [`QuicUpgradeOutcome`].
+    quic_upgrade: [AtomicU64; QuicUpgradeOutcome::COUNT],
+    /// Path fallbacks this period, by [`QuicFallback`].
+    quic_fallback: [AtomicU64; QuicFallback::COUNT],
+    /// Active paths that ended this period, by [`QuicPathAge`].
+    quic_path_age: [AtomicU64; QuicPathAge::COUNT],
+    /// Establish latencies this period in ms (bounded), and how many there
+    /// were.
+    quic_establish_ms: parking_lot::Mutex<Vec<u64>>,
+    quic_establish_samples: AtomicU64,
+    /// Paths with a live attempt that is not active yet (state, never reset).
+    quic_paths_offered_or_dialing: AtomicU64,
+    /// Paths active on this node's evidence (state, never reset).
+    quic_paths_active: AtomicU64,
 
     /// The current snapshot period, starting at 1 and advanced by each
     /// `take_snapshot`. A connection's [`InboundConcurrencyPeak`] from an
@@ -840,6 +982,10 @@ struct NatDetailCounters {
     /// (bounded).
     #[cfg(test)]
     quic_close_sent_to: parking_lot::Mutex<std::collections::VecDeque<(SocketAddr, QuicCloseCode)>>,
+    /// Test-only log of QUIC upgrade telemetry events, as `Debug` text with
+    /// the remote (bounded).
+    #[cfg(test)]
+    quic_events: parking_lot::Mutex<std::collections::VecDeque<(SocketAddr, String)>>,
     /// Test-only log of observed-address reporters (bounded).
     #[cfg(test)]
     observed_reporters: parking_lot::Mutex<std::collections::VecDeque<SocketAddr>>,
@@ -1062,6 +1208,14 @@ impl TransportMetrics {
             quic_breaker_trips: AtomicU64::new(0),
             quic_breaker_suppressed: AtomicBool::new(false),
             quic_close_sent: Default::default(),
+            quic_close_received: Default::default(),
+            quic_upgrade: Default::default(),
+            quic_fallback: Default::default(),
+            quic_path_age: Default::default(),
+            quic_establish_ms: Default::default(),
+            quic_establish_samples: AtomicU64::new(0),
+            quic_paths_offered_or_dialing: AtomicU64::new(0),
+            quic_paths_active: AtomicU64::new(0),
             inbound_concurrency_epoch: AtomicU64::new(1),
             inbound_concurrency: Default::default(),
             inbound_stream_outcomes: Default::default(),
@@ -1572,6 +1726,127 @@ impl TransportMetrics {
             .filter(|(addr, _)| *addr == remote)
             .map(|(_, code)| *code)
             .collect()
+    }
+
+    /// Test-only: log one QUIC upgrade telemetry event of `remote`.
+    #[cfg(test)]
+    fn note_quic_event(&self, remote: SocketAddr, event: impl std::fmt::Debug) {
+        push_test_log(&self.nat_detail.quic_events, (remote, format!("{event:?}")));
+    }
+
+    /// Test-only: the QUIC upgrade telemetry events recorded for `remote`, in
+    /// order, as `Debug` text.
+    #[cfg(test)]
+    pub(crate) fn quic_events_of(&self, remote: SocketAddr) -> Vec<String> {
+        self.nat_detail
+            .quic_events
+            .lock()
+            .iter()
+            .filter(|(addr, _)| *addr == remote)
+            .map(|(_, event)| event.clone())
+            .collect()
+    }
+
+    /// The upgrade machine of the session with `remote` decided `outcome`
+    /// (`remote` is never exported).
+    pub(crate) fn record_quic_upgrade(&self, outcome: QuicUpgradeOutcome, remote: SocketAddr) {
+        #[cfg(test)]
+        self.note_quic_event(remote, outcome);
+        #[cfg(not(test))]
+        let _ = remote;
+        self.quic_upgrade[outcome as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A path to `remote` ended, and the upgrade machine named why.
+    pub(crate) fn record_quic_fallback(&self, cause: QuicFallback, remote: SocketAddr) {
+        #[cfg(test)]
+        self.note_quic_event(remote, cause);
+        #[cfg(not(test))]
+        let _ = remote;
+        self.quic_fallback[cause as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// quinn reported a QUIC connection to `remote` closed by the peer's
+    /// application close with raw `code`: counted under its [`QuicCloseCode`],
+    /// or under `unknown_code` when this node has no name for it.
+    pub(crate) fn record_quic_close_received(&self, code: u64, remote: SocketAddr) {
+        let known = QuicCloseCode::from_code(code);
+        #[cfg(test)]
+        self.note_quic_event(remote, ("close_received", known, code));
+        #[cfg(not(test))]
+        let _ = remote;
+        let slot = known.map_or(QuicCloseCode::COUNT, |known| known as usize);
+        self.quic_close_received[slot].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// An active path to `remote` ended after `age`.
+    pub(crate) fn record_quic_path_closed(&self, age: std::time::Duration, remote: SocketAddr) {
+        let bucket = QuicPathAge::bucket(age);
+        #[cfg(test)]
+        self.note_quic_event(remote, bucket);
+        #[cfg(not(test))]
+        let _ = remote;
+        self.quic_path_age[bucket as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A path to `remote` went from the Offer (or Accept) to active in `took`.
+    pub(crate) fn record_quic_establish_latency(
+        &self,
+        took: std::time::Duration,
+        remote: SocketAddr,
+    ) {
+        #[cfg(test)]
+        self.note_quic_event(remote, ("establish_ms", took.as_millis()));
+        #[cfg(not(test))]
+        let _ = remote;
+        {
+            let mut samples = self.quic_establish_ms.lock();
+            if samples.len() < QUIC_ESTABLISH_SAMPLES_MAX {
+                samples.push(u64::try_from(took.as_millis()).unwrap_or(u64::MAX));
+            }
+        }
+        self.quic_establish_samples.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A path with `remote` got a live attempt (an Offer under way or a dial).
+    pub(crate) fn quic_path_attempting(&self, remote: SocketAddr) {
+        #[cfg(test)]
+        self.note_quic_event(remote, "path_attempting");
+        #[cfg(not(test))]
+        let _ = remote;
+        self.quic_paths_offered_or_dialing
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The path with `remote` became active.
+    pub(crate) fn quic_path_activated(&self, remote: SocketAddr) {
+        #[cfg(test)]
+        self.note_quic_event(remote, "path_activated");
+        #[cfg(not(test))]
+        let _ = remote;
+        self.quic_paths_offered_or_dialing
+            .fetch_sub(1, Ordering::Relaxed);
+        self.quic_paths_active.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The attempt or path with `remote` ended; `was_active` says which gauge
+    /// it leaves.
+    pub(crate) fn quic_path_left(&self, was_active: bool, remote: SocketAddr) {
+        #[cfg(test)]
+        self.note_quic_event(remote, ("path_left", was_active));
+        #[cfg(not(test))]
+        let _ = remote;
+        let gauge = if was_active {
+            &self.quic_paths_active
+        } else {
+            &self.quic_paths_offered_or_dialing
+        };
+        gauge.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Paths active on this node's evidence now.
+    pub(crate) fn quic_paths_active(&self) -> u64 {
+        self.quic_paths_active.load(Ordering::Relaxed)
     }
 
     /// QUIC upgrade control messages received since process start, never
@@ -2147,6 +2422,16 @@ impl TransportMetrics {
         // Indexed by position in INBOUND_CONCURRENCY_THRESHOLDS; the const
         // assertion next to that list pins the order these fields assume.
         let concurrency_ge = concurrency.conns_ge;
+        let (establish_p50, establish_p90) = {
+            let mut samples = self.quic_establish_ms.lock();
+            let mut sorted = if reset {
+                std::mem::take(&mut *samples)
+            } else {
+                samples.clone()
+            };
+            sorted.sort_unstable();
+            (percentile(&sorted, 50), percentile(&sorted, 90))
+        };
         SnapshotExtras {
             packets_sent: get64(&l.packets_sent),
             packets_retransmitted: get64(&l.packets_retransmitted),
@@ -2191,6 +2476,17 @@ impl TransportMetrics {
             quic_close_sent_control_refused: get64(
                 &self.quic_close_sent[QuicCloseCode::ControlRefused as usize],
             ),
+            quic_close_received: std::array::from_fn(|i| get64(&self.quic_close_received[i])),
+            quic_upgrade: std::array::from_fn(|i| get64(&self.quic_upgrade[i])),
+            quic_fallback: std::array::from_fn(|i| get64(&self.quic_fallback[i])),
+            quic_path_age_at_close: std::array::from_fn(|i| get64(&self.quic_path_age[i])),
+            quic_establish_ms_p50: establish_p50,
+            quic_establish_ms_p90: establish_p90,
+            quic_establish_samples: get64(&self.quic_establish_samples),
+            quic_paths_offered_or_dialing: self
+                .quic_paths_offered_or_dialing
+                .load(Ordering::Relaxed),
+            quic_paths_active: self.quic_paths_active.load(Ordering::Relaxed),
             quic_close_sent_peer_not_acknowledging: get64(
                 &self.quic_close_sent[QuicCloseCode::PeerNotAcknowledging as usize],
             ),
@@ -2743,6 +3039,26 @@ pub struct TransportSnapshot {
     pub quic_close_sent_send_abort_limit: u64,
     pub quic_close_sent_peer_not_acknowledging: u64,
     pub quic_close_sent_control_refused: u64,
+    /// QUIC connections closed by the peer's application close, by
+    /// [`QuicCloseCode`] in order; the last slot is a code this node does not
+    /// know (`quic_close_received_<label>`, `..._unknown_code`).
+    pub quic_close_received: [u64; QuicCloseCode::COUNT + 1],
+    /// Upgrade decisions by [`QuicUpgradeOutcome`] (`quic_upgrade_<label>`).
+    pub quic_upgrade: [u64; QuicUpgradeOutcome::COUNT],
+    /// Path fallbacks by [`QuicFallback`] (`quic_fallback_<label>`).
+    pub quic_fallback: [u64; QuicFallback::COUNT],
+    /// Active paths that ended, by [`QuicPathAge`]
+    /// (`quic_path_age_at_close_<label>`).
+    pub quic_path_age_at_close: [u64; QuicPathAge::COUNT],
+    /// Median and p90 of this period's establish latencies, in ms (the
+    /// first `QUIC_ESTABLISH_SAMPLES_MAX` of them), and how many there were.
+    pub quic_establish_ms_p50: Option<u64>,
+    pub quic_establish_ms_p90: Option<u64>,
+    pub quic_establish_samples: u64,
+    /// Gauges (never reset): paths with a live attempt not yet active, and
+    /// paths active on this node's evidence. Zero outside shadow mode.
+    pub quic_paths_offered_or_dialing: u64,
+    pub quic_paths_active: u64,
     /// Per-attempt records of the FIRST 8 failed outbound NAT traversals in
     /// the period (not a representative sample of a busy period);
     /// `nat_fail_samples_dropped` counts the rest. Read with the same
@@ -3076,6 +3392,15 @@ impl TransportSnapshot {
             quic_close_sent_send_abort_limit,
             quic_close_sent_peer_not_acknowledging,
             quic_close_sent_control_refused,
+            quic_close_received,
+            quic_upgrade,
+            quic_fallback,
+            quic_path_age_at_close,
+            quic_establish_ms_p50,
+            quic_establish_ms_p90,
+            quic_establish_samples,
+            quic_paths_offered_or_dialing,
+            quic_paths_active,
             nat_fail_samples,
             nat_fail_samples_dropped,
             inbound_stream_refused_invalid_length,
@@ -3202,6 +3527,15 @@ impl TransportSnapshot {
         self.quic_close_sent_send_abort_limit = quic_close_sent_send_abort_limit;
         self.quic_close_sent_peer_not_acknowledging = quic_close_sent_peer_not_acknowledging;
         self.quic_close_sent_control_refused = quic_close_sent_control_refused;
+        self.quic_close_received = quic_close_received;
+        self.quic_upgrade = quic_upgrade;
+        self.quic_fallback = quic_fallback;
+        self.quic_path_age_at_close = quic_path_age_at_close;
+        self.quic_establish_ms_p50 = quic_establish_ms_p50;
+        self.quic_establish_ms_p90 = quic_establish_ms_p90;
+        self.quic_establish_samples = quic_establish_samples;
+        self.quic_paths_offered_or_dialing = quic_paths_offered_or_dialing;
+        self.quic_paths_active = quic_paths_active;
         self.nat_fail_samples = nat_fail_samples;
         self.nat_fail_samples_dropped = nat_fail_samples_dropped;
         self.inbound_stream_refused_invalid_length = inbound_stream_refused_invalid_length;
@@ -3380,6 +3714,26 @@ struct SnapshotExtras {
     pub quic_close_sent_send_abort_limit: u64,
     pub quic_close_sent_peer_not_acknowledging: u64,
     pub quic_close_sent_control_refused: u64,
+    /// QUIC connections closed by the peer's application close, by
+    /// [`QuicCloseCode`] in order; the last slot is a code this node does not
+    /// know (`quic_close_received_<label>`, `..._unknown_code`).
+    pub quic_close_received: [u64; QuicCloseCode::COUNT + 1],
+    /// Upgrade decisions by [`QuicUpgradeOutcome`] (`quic_upgrade_<label>`).
+    pub quic_upgrade: [u64; QuicUpgradeOutcome::COUNT],
+    /// Path fallbacks by [`QuicFallback`] (`quic_fallback_<label>`).
+    pub quic_fallback: [u64; QuicFallback::COUNT],
+    /// Active paths that ended, by [`QuicPathAge`]
+    /// (`quic_path_age_at_close_<label>`).
+    pub quic_path_age_at_close: [u64; QuicPathAge::COUNT],
+    /// Median and p90 of this period's establish latencies, in ms (the
+    /// first `QUIC_ESTABLISH_SAMPLES_MAX` of them), and how many there were.
+    pub quic_establish_ms_p50: Option<u64>,
+    pub quic_establish_ms_p90: Option<u64>,
+    pub quic_establish_samples: u64,
+    /// Gauges (never reset): paths with a live attempt not yet active, and
+    /// paths active on this node's evidence. Zero outside shadow mode.
+    pub quic_paths_offered_or_dialing: u64,
+    pub quic_paths_active: u64,
     /// Per-attempt records of the FIRST 8 failed outbound NAT traversals in
     /// the period (not a representative sample of a busy period);
     /// `nat_fail_samples_dropped` counts the rest. Read with the same
@@ -3541,6 +3895,13 @@ impl SnapshotExtras {
             || self.quic_close_sent_send_abort_limit != 0
             || self.quic_close_sent_peer_not_acknowledging != 0
             || self.quic_close_sent_control_refused != 0
+            || self.quic_close_received.iter().any(|n| *n != 0)
+            || self.quic_upgrade.iter().any(|n| *n != 0)
+            || self.quic_fallback.iter().any(|n| *n != 0)
+            || self.quic_path_age_at_close.iter().any(|n| *n != 0)
+            || self.quic_establish_samples != 0
+            || self.quic_paths_offered_or_dialing != 0
+            || self.quic_paths_active != 0
             || !self.nat_fail_samples.is_empty()
             || self.inbound_stream_refused_invalid_length != 0
             || self.inbound_stream_refused_connection_bytes != 0
@@ -4547,6 +4908,135 @@ mod tests {
             assert!(metrics.take_snapshot().is_none(), "the counter must reset");
             assert_eq!(metrics.quic_close_sent_to(remote), vec![code; i + 1]);
         }
+    }
+
+    /// The slot counts of a family: one record per slot index plus one, so
+    /// each slot has its own value, alone counts as activity, and resets.
+    fn check_quic_family<const N: usize>(
+        record: impl Fn(&TransportMetrics, usize, SocketAddr),
+        read: impl Fn(&TransportSnapshot) -> [u64; N],
+    ) {
+        let remote: SocketAddr = "10.255.11.2:7".parse().unwrap();
+        for slot in 0..N {
+            let metrics = TransportMetrics::new();
+            for _ in 0..=slot {
+                record(&metrics, slot, remote);
+            }
+            let snap = metrics.take_snapshot().expect("a count alone is activity");
+            let mut expected = [0u64; N];
+            expected[slot] = slot as u64 + 1;
+            assert_eq!(read(&snap), expected, "slot {slot}");
+            assert!(metrics.take_snapshot().is_none(), "slot {slot} must reset");
+        }
+    }
+
+    #[test]
+    fn quic_upgrade_outcomes_count_snapshot_and_reset() {
+        check_quic_family(
+            |m, slot, remote| m.record_quic_upgrade(QuicUpgradeOutcome::ALL[slot], remote),
+            |snap| snap.quic_upgrade,
+        );
+    }
+
+    #[test]
+    fn quic_fallbacks_count_snapshot_and_reset() {
+        check_quic_family(
+            |m, slot, remote| m.record_quic_fallback(QuicFallback::ALL[slot], remote),
+            |snap| snap.quic_fallback,
+        );
+    }
+
+    /// A raw close code is counted under its name; one this node does not
+    /// know, under the last slot.
+    #[test]
+    fn quic_close_received_counts_by_raw_code_and_reset() {
+        let raw = |slot: usize| {
+            QuicCloseCode::ALL
+                .get(slot)
+                .map_or(0xAB, |code| u64::from(code.code()))
+        };
+        check_quic_family(
+            |m, slot, remote| m.record_quic_close_received(raw(slot), remote),
+            |snap| snap.quic_close_received,
+        );
+    }
+
+    #[test]
+    fn quic_path_age_buckets_count_snapshot_and_reset() {
+        let secs = [0, 59, 60, 599, 600, 3599, 3600, 86399, 86400];
+        let want = [2, 2, 2, 2, 1];
+        let metrics = TransportMetrics::new();
+        let remote: SocketAddr = "10.255.11.3:7".parse().unwrap();
+        for s in secs {
+            metrics.record_quic_path_closed(std::time::Duration::from_secs(s), remote);
+        }
+        let snap = metrics.take_snapshot().expect("a closed path is activity");
+        assert_eq!(snap.quic_path_age_at_close, want);
+        assert!(metrics.take_snapshot().is_none());
+        check_quic_family(
+            |m, slot, remote| {
+                let age = [0, 60, 600, 3600, 86400][slot];
+                m.record_quic_path_closed(std::time::Duration::from_secs(age), remote)
+            },
+            |snap| snap.quic_path_age_at_close,
+        );
+    }
+
+    #[test]
+    fn quic_establish_latency_reports_percentiles_and_resets() {
+        let metrics = TransportMetrics::new();
+        let remote: SocketAddr = "10.255.11.4:7".parse().unwrap();
+        assert!(metrics.take_snapshot().is_none());
+        for ms in 1..=10u64 {
+            metrics.record_quic_establish_latency(std::time::Duration::from_millis(ms), remote);
+        }
+        let snap = metrics.take_snapshot().expect("a sample is activity");
+        assert_eq!(
+            (
+                snap.quic_establish_ms_p50,
+                snap.quic_establish_ms_p90,
+                snap.quic_establish_samples
+            ),
+            (Some(5), Some(9), 10)
+        );
+        assert!(metrics.take_snapshot().is_none());
+        for _ in 0..QUIC_ESTABLISH_SAMPLES_MAX + 5 {
+            metrics.record_quic_establish_latency(std::time::Duration::from_millis(3), remote);
+        }
+        let snap = metrics.take_snapshot().unwrap();
+        assert_eq!(
+            snap.quic_establish_samples,
+            QUIC_ESTABLISH_SAMPLES_MAX as u64 + 5,
+            "the count includes samples past the bound"
+        );
+    }
+
+    /// The gauges follow attempts and paths, survive a snapshot, and are
+    /// activity while non-zero.
+    #[test]
+    fn quic_path_gauges_follow_paths_and_survive_snapshots() {
+        let metrics = TransportMetrics::new();
+        let remote: SocketAddr = "10.255.11.5:7".parse().unwrap();
+        metrics.quic_path_attempting(remote);
+        metrics.quic_path_attempting(remote);
+        let snap = metrics.take_snapshot().expect("a live attempt is activity");
+        assert_eq!(
+            (snap.quic_paths_offered_or_dialing, snap.quic_paths_active),
+            (2, 0)
+        );
+        metrics.quic_path_activated(remote);
+        let snap = metrics
+            .take_snapshot()
+            .expect("gauges stay across snapshots");
+        assert_eq!(
+            (snap.quic_paths_offered_or_dialing, snap.quic_paths_active),
+            (1, 1)
+        );
+        assert_eq!(metrics.quic_paths_active(), 1);
+        metrics.quic_path_left(true, remote);
+        metrics.quic_path_left(false, remote);
+        // The two leaves are activity of their own only through the gauges.
+        assert!(metrics.take_snapshot().is_none());
     }
 
     /// The snapshot field that carries `outcome`'s period count. Exhaustive
@@ -5642,6 +6132,15 @@ mod tests {
             "quic_close_sent_send_abort_limit",
             "quic_close_sent_peer_not_acknowledging",
             "quic_close_sent_control_refused",
+            "quic_close_received",
+            "quic_upgrade",
+            "quic_fallback",
+            "quic_path_age_at_close",
+            "quic_establish_ms_p50",
+            "quic_establish_ms_p90",
+            "quic_establish_samples",
+            "quic_paths_offered_or_dialing",
+            "quic_paths_active",
             "nat_fail_samples",
             "nat_fail_samples_dropped",
             "inbound_stream_refused_invalid_length",

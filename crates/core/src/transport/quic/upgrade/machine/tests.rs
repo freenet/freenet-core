@@ -433,7 +433,7 @@ fn expected(role: Role, state: S, name: &str) -> Option<(S, Vec<Action>)> {
                 vec![
                     SendUpgrade(UpgradeControl::Accept { attempt }),
                     Action::Dial { attempt },
-                    Record(Outcome::Accepted),
+                    Record(Outcome::AcceptSent),
                 ],
             ))
         }
@@ -460,11 +460,17 @@ fn expected(role: Role, state: S, name: &str) -> Option<(S, Vec<Action>)> {
         }
         (Role::Server, S::Offered, "decline") => fail(
             QuicCloseCode::Downgrade,
-            Outcome::Declined(Some(DeclineReason::Busy)),
+            Outcome::Declined {
+                reason: Some(DeclineReason::Busy),
+                uncharged: true,
+            },
         ),
         (Role::Server, S::Offered, "decline_disabled") => fail(
             QuicCloseCode::Downgrade,
-            Outcome::Declined(Some(DeclineReason::Disabled)),
+            Outcome::Declined {
+                reason: Some(DeclineReason::Disabled),
+                uncharged: false,
+            },
         ),
         (Role::Server, S::Offered | S::Connecting, "established") => Some((
             S::Confirming,
@@ -474,7 +480,7 @@ fn expected(role: Role, state: S, name: &str) -> Option<(S, Vec<Action>)> {
             })],
         )),
         (Role::Server, S::Confirming, "ready_ack") => {
-            Some((S::Active, vec![Record(Outcome::Established)]))
+            Some((S::Active, vec![Record(Outcome::Established(Role::Server))]))
         }
         (Role::Server, S::Offered | S::Connecting | S::Confirming, "ready") => {
             Some((state, vec![Record(Outcome::RoleConflict)]))
@@ -489,7 +495,7 @@ fn expected(role: Role, state: S, name: &str) -> Option<(S, Vec<Action>)> {
                     attempt,
                     caps: caps::KNOWN,
                 }),
-                Record(Outcome::Established),
+                Record(Outcome::Established(Role::Client)),
             ],
         )),
 
@@ -626,9 +632,12 @@ fn ledger_after(
             || recorded(|o| {
                 matches!(
                     o,
-                    Outcome::Declined(Some(
-                        DeclineReason::Busy | DeclineReason::NotReady | DeclineReason::Backoff
-                    ))
+                    Outcome::Declined {
+                        reason: Some(
+                            DeclineReason::Busy | DeclineReason::NotReady | DeclineReason::Backoff
+                        ),
+                        ..
+                    }
                 )
             })
         {
@@ -845,7 +854,7 @@ fn the_version_floor_gates_the_offer() {
         let mut client = Rig::new(Role::Client);
         assert_eq!(client.promote(version), vec![]);
         assert_eq!(client.machine.deadline(), None);
-        assert_eq!(client.offer(1)[2], Action::Record(Outcome::Accepted));
+        assert_eq!(client.offer(1)[2], Action::Record(Outcome::AcceptSent));
     }
     let mut rig = Rig::new(Role::Server);
     assert_eq!(rig.promote(Some(QUIC_UPGRADE_NEGOTIATES_IN)), vec![]);
@@ -1216,7 +1225,7 @@ fn at_the_path_limit_no_one_is_charged() {
     );
     assert_eq!(rig.machine.failures, 0);
     drop(held);
-    assert_eq!(rig.offer(2)[2], Action::Record(Outcome::Accepted));
+    assert_eq!(rig.offer(2)[2], Action::Record(Outcome::AcceptSent));
 }
 
 /// A client in backoff declines, and takes the next offer once it is over.
@@ -1242,7 +1251,7 @@ fn a_client_declines_while_backing_off_and_ignores_old_offers() {
     rig.now = rig.machine.retry_at;
     assert_eq!(
         rig.offer(CLIENT_ATTEMPT + 3)[2],
-        Action::Record(Outcome::Accepted)
+        Action::Record(Outcome::AcceptSent)
     );
 }
 
@@ -1255,7 +1264,13 @@ fn an_unknown_decline_reason_is_a_decline() {
         attempt: SERVER_ATTEMPT,
         reason: 200,
     }));
-    assert_eq!(actions[1], Action::Record(Outcome::Declined(None)));
+    assert_eq!(
+        actions[1],
+        Action::Record(Outcome::Declined {
+            reason: None,
+            uncharged: false
+        })
+    );
     assert_eq!(rig.in_use(), 0);
     assert_eq!(label(&rig.machine), S::Idle);
 }
@@ -1474,7 +1489,7 @@ fn a_replaced_session_continues_the_backoff() {
         Action::Record(Outcome::DeclineSent(DeclineReason::Backoff))
     );
     client.now = seed.retry_at;
-    assert_eq!(client.offer(2)[2], Action::Record(Outcome::Accepted));
+    assert_eq!(client.offer(2)[2], Action::Record(Outcome::AcceptSent));
 
     let mut late = Rig::new(Role::Server);
     late.now = seed.retry_at + BACKOFF_MAX;
@@ -1522,7 +1537,7 @@ fn a_seed_is_bounded_when_it_is_taken() {
             Action::Record(Outcome::DeclineSent(DeclineReason::Backoff))
         );
         client.now = taken;
-        assert_eq!(client.offer(2)[2], Action::Record(Outcome::Accepted));
+        assert_eq!(client.offer(2)[2], Action::Record(Outcome::AcceptSent));
     }
 
     let hour_ago = now - Duration::from_secs(3600);

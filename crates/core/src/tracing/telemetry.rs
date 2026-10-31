@@ -3075,6 +3075,49 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 "quic_close_sent_control_refused".into(),
                 serde_json::json!(snapshot.quic_close_sent_control_refused),
             );
+            {
+                use crate::transport::metrics::{
+                    QuicCloseCode, QuicFallback, QuicPathAge, QuicUpgradeOutcome,
+                };
+                for (i, count) in snapshot.quic_close_received.iter().enumerate() {
+                    let label = QuicCloseCode::ALL
+                        .get(i)
+                        .map_or("unknown_code", |code| code.label());
+                    m.insert(format!("quic_close_received_{label}"), (*count).into());
+                }
+                for (outcome, count) in QuicUpgradeOutcome::ALL.iter().zip(snapshot.quic_upgrade) {
+                    m.insert(format!("quic_upgrade_{}", outcome.label()), count.into());
+                }
+                for (cause, count) in QuicFallback::ALL.iter().zip(snapshot.quic_fallback) {
+                    m.insert(format!("quic_fallback_{}", cause.label()), count.into());
+                }
+                for (age, count) in QuicPathAge::ALL.iter().zip(snapshot.quic_path_age_at_close) {
+                    m.insert(
+                        format!("quic_path_age_at_close_{}", age.label()),
+                        count.into(),
+                    );
+                }
+            }
+            m.insert(
+                "quic_establish_ms_p50".into(),
+                serde_json::json!(snapshot.quic_establish_ms_p50),
+            );
+            m.insert(
+                "quic_establish_ms_p90".into(),
+                serde_json::json!(snapshot.quic_establish_ms_p90),
+            );
+            m.insert(
+                "quic_establish_samples".into(),
+                serde_json::json!(snapshot.quic_establish_samples),
+            );
+            m.insert(
+                "quic_paths_offered_or_dialing".into(),
+                serde_json::json!(snapshot.quic_paths_offered_or_dialing),
+            );
+            m.insert(
+                "quic_paths_active".into(),
+                serde_json::json!(snapshot.quic_paths_active),
+            );
             m.insert(
                 "nat_fail_samples".into(),
                 serde_json::json!(snapshot.nat_fail_samples),
@@ -5862,6 +5905,7 @@ mod tests {
             "cpu_time_seconds",
             "cumulative_bytes_sent",
             "cumulative_bytes_received",
+            "quic_paths_active",
         ] {
             assert!(obj.contains_key(key), "event_data missing key `{key}`");
         }
@@ -7809,6 +7853,72 @@ mod tests {
             json["quic_breaker_suppressed"],
             reference["quic_breaker_suppressed"]
         );
+    }
+
+    /// Every QUIC upgrade family reaches the event-log JSON under its flat
+    /// `<prefix>_<label>` key with the value the snapshot holds.
+    #[test]
+    fn transport_snapshot_json_carries_quic_upgrade_telemetry() {
+        use crate::transport::metrics::{
+            QuicCloseCode, QuicFallback, QuicPathAge, QuicUpgradeOutcome,
+        };
+        let mut snapshot = crate::transport::metrics::TransportSnapshot::default();
+        let mut next = 0u64;
+        let mut fill = |slots: &mut [u64]| {
+            for slot in slots {
+                next += 1;
+                *slot = next;
+            }
+        };
+        fill(&mut snapshot.quic_close_received);
+        fill(&mut snapshot.quic_upgrade);
+        fill(&mut snapshot.quic_fallback);
+        fill(&mut snapshot.quic_path_age_at_close);
+        snapshot.quic_establish_ms_p50 = Some(901);
+        snapshot.quic_establish_ms_p90 = Some(902);
+        snapshot.quic_establish_samples = 903;
+        snapshot.quic_paths_offered_or_dialing = 904;
+        snapshot.quic_paths_active = 905;
+        let json = event_kind_to_json(&super::super::EventKind::TransportSnapshot(Box::new(
+            snapshot.clone(),
+        )));
+        let mut expected = Vec::new();
+        for (i, count) in snapshot.quic_close_received.iter().enumerate() {
+            let label = QuicCloseCode::ALL
+                .get(i)
+                .map_or("unknown_code", |code| code.label());
+            expected.push((format!("quic_close_received_{label}"), *count));
+        }
+        for (outcome, count) in QuicUpgradeOutcome::ALL.iter().zip(snapshot.quic_upgrade) {
+            expected.push((format!("quic_upgrade_{}", outcome.label()), count));
+        }
+        for (cause, count) in QuicFallback::ALL.iter().zip(snapshot.quic_fallback) {
+            expected.push((format!("quic_fallback_{}", cause.label()), count));
+        }
+        for (age, count) in QuicPathAge::ALL.iter().zip(snapshot.quic_path_age_at_close) {
+            expected.push((format!("quic_path_age_at_close_{}", age.label()), count));
+        }
+        for (key, value) in [
+            ("quic_establish_ms_p50", 901),
+            ("quic_establish_ms_p90", 902),
+            ("quic_establish_samples", 903),
+            ("quic_paths_offered_or_dialing", 904),
+            ("quic_paths_active", 905),
+        ] {
+            expected.push((key.to_string(), value));
+        }
+        assert_eq!(
+            expected.len(),
+            QuicCloseCode::COUNT
+                + 1
+                + QuicUpgradeOutcome::COUNT
+                + QuicFallback::COUNT
+                + QuicPathAge::COUNT
+                + 5
+        );
+        for (key, value) in expected {
+            assert_eq!(json[&key], value, "event-log value for {key}");
+        }
     }
 
     /// Each connection identity key is in the event-log JSON exactly when its

@@ -249,11 +249,19 @@ pub(in crate::transport) enum Action {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::transport) enum Outcome {
     Offered,
+    /// The peer accepted this node's `Offer`.
     Accepted,
-    Established,
+    /// This node accepted the peer's `Offer`.
+    AcceptSent,
+    /// The path is active on this side's evidence, as `Role`.
+    Established(Role),
     /// The peer's `Decline`, `None` when the reason is one this node does
-    /// not know.
-    Declined(Option<DeclineReason>),
+    /// not know. `uncharged` is whether the peer was spared the backoff
+    /// penalty (the machine's own decision, see `on_decline`).
+    Declined {
+        reason: Option<DeclineReason>,
+        uncharged: bool,
+    },
     /// This node declined.
     DeclineSent(DeclineReason),
     /// The peer below `QUIC_UPGRADE_NEGOTIATES_IN` is never offered.
@@ -729,7 +737,7 @@ impl UpgradeMachine {
                     return vec![
                         Action::SendUpgrade(UpgradeControl::Accept { attempt }),
                         Action::Dial { attempt },
-                        Action::Record(Outcome::Accepted),
+                        Action::Record(Outcome::AcceptSent),
                     ];
                 }
             },
@@ -771,7 +779,10 @@ impl UpgradeMachine {
             attempt,
             QuicCloseCode::Downgrade,
             penalty,
-            Outcome::Declined(reason),
+            Outcome::Declined {
+                reason,
+                uncharged: penalty == Penalty::Uncharged,
+            },
         )
     }
 
@@ -815,7 +826,7 @@ impl UpgradeMachine {
                         attempt,
                         caps: caps::KNOWN,
                     }),
-                    Action::Record(Outcome::Established),
+                    Action::Record(Outcome::Established(Role::Client)),
                 ]
             }
             (Some(Role::Client), Phase::Offered) | (None, _) => Vec::new(),
@@ -827,7 +838,7 @@ impl UpgradeMachine {
             return Vec::new();
         }
         self.activate(cx.now);
-        vec![Action::Record(Outcome::Established)]
+        vec![Action::Record(Outcome::Established(Role::Server))]
     }
 
     fn on_sent(&mut self, cx: Inputs<'_>, attempt: u32, outcome: BoundedSend) -> Vec<Action> {

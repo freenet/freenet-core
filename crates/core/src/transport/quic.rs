@@ -1013,6 +1013,12 @@ impl QuicConnection {
                 }
             }
             let reason = watched.closed().await;
+            if let quinn::ConnectionError::ApplicationClosed(close) = &reason {
+                TRANSPORT_METRICS.record_quic_close_received(
+                    close.error_code.into_inner(),
+                    watched.remote_address(),
+                );
+            }
             tracing::debug!(%reason, remote = %watched.remote_address(), "QUIC connection ended");
             drop(hold);
             drop(permit);
