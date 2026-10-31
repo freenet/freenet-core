@@ -186,9 +186,7 @@ impl Drop for NodeProcess {
     }
 }
 
-/// Reserve an ephemeral port by binding then immediately freeing it. The kernel
-/// won't hand the same port back on the next `:0` request, so this races far
-/// less than a fixed port; the node binds it a moment later.
+/// A port free in both TCP and UDP right now, for the node to bind.
 fn reserve_port() -> anyhow::Result<u16> {
     use std::sync::atomic::{AtomicU32, Ordering};
     /// Below Linux's default ephemeral range (32768-60999), so a socket the OS
