@@ -96,12 +96,15 @@ const SEED_STORE_ENTRIES: NonZeroUsize = NonZeroUsize::new(4096).expect("not zer
 /// A connection sends at most one `Decline` per this long. A `Decline` needs no
 /// operation state and is tracked and retransmitted, so without a bound a peer
 /// grows this node's memory and upload with its own, one Offer per packet id.
-const DECLINE_INTERVAL: Duration = Duration::from_secs(60);
+/// Shorter than the shortest retry after an uncharged decline
+/// (`BACKOFF_MIN` less its 20% jitter, 48 s), so an honest offerer is never held
+/// back and charged for a decline that names no fault.
+const DECLINE_INTERVAL: Duration = Duration::from_secs(45);
 
 /// The bound on `Decline` replies, one per connection, on the connection's clock:
 /// a field of `PeerConnection` with QUIC off and of the driver with QUIC on. An
-/// offerer whose reply is held back times out as `NoReply`, the same penalty as
-/// `Disabled`.
+/// offerer whose reply is held back, which only a faster-than-honest one can be,
+/// times out as `NoReply`, the same penalty as `Disabled`.
 #[derive(Default)]
 pub(in crate::transport) struct DeclineGate {
     last_nanos: Option<u64>,

@@ -645,7 +645,7 @@ connection over it. With upgrades (see "Upgrade driver") it goes to the
 session's driver. Without them an Offer gets Decline{Disabled} and an Accept
 or a Decline is dropped.
 
-At most one Decline per connection per DECLINE_INTERVAL (60 s), on the
+At most one Decline per connection per DECLINE_INTERVAL (45 s, below the shortest uncharged retry of 48 s), on the
 connection's clock (quic/upgrade/driver.rs DeclineGate; the same type on
 PeerConnection with QUIC off and in the driver with QUIC on). A Decline is
 tracked and retransmitted, and each Offer under a new packet id would otherwise

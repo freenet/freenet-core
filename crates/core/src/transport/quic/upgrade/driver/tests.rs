@@ -424,7 +424,7 @@ fn a_session_is_opened_on_the_connections_budget() {
 /// that steps back holds it back rather than opening the gate.
 #[test]
 fn the_decline_gate_admits_one_per_interval() {
-    const INTERVAL: u64 = 60_000_000_000;
+    const INTERVAL: u64 = 45_000_000_000;
     let before = TRANSPORT_METRICS.cumulative_upgrade_decline_suppressed();
     let mut gate = DeclineGate::default();
     assert!(gate.admit(5), "the first one goes");
@@ -438,7 +438,9 @@ fn the_decline_gate_admits_one_per_interval() {
         TRANSPORT_METRICS.cumulative_upgrade_decline_suppressed() - before >= 4,
         "every `false` is counted where it is decided"
     );
-    assert_eq!(DECLINE_INTERVAL, Duration::from_secs(60));
+    assert_eq!(DECLINE_INTERVAL, Duration::from_secs(45));
+    // An uncharged decline's retry comes at BACKOFF_MIN (60 s) less 20% jitter.
+    assert!(DECLINE_INTERVAL < Duration::from_secs(48));
 }
 
 /// A repeat of a promotion on an ended session adds no entry: nothing would ever
