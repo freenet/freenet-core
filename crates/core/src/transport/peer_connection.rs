@@ -1038,6 +1038,9 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         #[cfg(any(test, feature = "testing"))]
         {
             self.upgrade_trace = site.trace();
+            if let Some(trace) = &self.upgrade_trace {
+                trace.connection_opened();
+            }
         }
         if let Some(upgrades) = site.upgrades() {
             self.quic_path = Some(upgrades.open_session(

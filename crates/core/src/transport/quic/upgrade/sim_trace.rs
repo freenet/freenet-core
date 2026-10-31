@@ -39,6 +39,7 @@ struct TraceData {
     wrong_record: Mutex<BTreeSet<SocketAddr>>,
     down_at: Mutex<BTreeMap<SocketAddr, Duration>>,
     permits: Mutex<BTreeMap<SocketAddr, QuicPathPermits>>,
+    connections: Mutex<BTreeMap<SocketAddr, usize>>,
     /// The version a peer reports, and the release it then reads as.
     release: Mutex<Option<(Version, Version)>>,
 }
@@ -76,6 +77,16 @@ impl QuicUpgradeTrace {
             .into_iter()
             .filter(|record| record.node == node && record.what.starts_with(prefix))
             .collect()
+    }
+
+    /// The UDP connections `node`'s transport opened, with QUIC on or off.
+    pub fn connections_opened(&self, node: SocketAddr) -> usize {
+        self.data
+            .connections
+            .lock()
+            .get(&node)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// The path permits `node` holds now; `None` when it has no upgrades.
@@ -125,6 +136,16 @@ pub(crate) struct NodeTrace {
 }
 
 impl NodeTrace {
+    pub(crate) fn connection_opened(&self) {
+        *self
+            .trace
+            .data
+            .connections
+            .lock()
+            .entry(self.addr)
+            .or_default() += 1;
+    }
+
     pub(crate) fn record(&self, peer: SocketAddr, session: u64, what: String) {
         let at = self.trace.now();
         let permits = self

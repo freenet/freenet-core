@@ -20734,8 +20734,6 @@ struct QuicShadowRun {
     /// Gateways first.
     nodes: Vec<SocketAddr>,
     logs_events: usize,
-    /// Connections the run's event log reports as formed.
-    connections: usize,
 }
 
 impl QuicShadowRun {
@@ -20797,19 +20795,11 @@ fn run_quic_shadow_sim(
     sim.run_simulation_direct::<rand::rngs::SmallRng>(seed, 1, steps, QUIC_EVENT_WAIT)
         .expect("direct simulation should succeed");
     let rt = create_runtime();
-    let (logs_events, connections) = rt.block_on(async {
-        let logs = logs_handle.lock().await;
-        let connections = logs
-            .iter()
-            .filter(|log| log.kind.connect_connected_addrs().is_some())
-            .count();
-        (logs.len(), connections)
-    });
+    let logs_events = rt.block_on(async { logs_handle.lock().await.len() });
     QuicShadowRun {
         trace,
         nodes: addresses,
         logs_events,
-        connections,
     }
 }
 
@@ -20958,7 +20948,12 @@ fn test_quic_off_nodes_exchange_no_upgrade_messages() {
         4,
         |_, trace, _| run_as_first_negotiating_release(trace),
     );
-    assert!(run.connections > 0, "the nodes must have connected");
+    for node in &run.nodes {
+        assert!(
+            run.trace.connections_opened(*node) > 0,
+            "{node} must have opened a connection, or the silence means nothing"
+        );
+    }
     assert!(run.trace.records().is_empty(), "{}", run.dump());
     for node in &run.nodes {
         assert_eq!(run.trace.permits_in_use(*node), None, "it has no upgrades");
