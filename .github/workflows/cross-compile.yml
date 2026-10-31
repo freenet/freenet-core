@@ -1019,9 +1019,14 @@ jobs:
           # binary's updater has been verified. The release is created as a
           # draft by release.sh/release.yml to prevent the installer from
           # seeing a version before binaries exist.
+          # --latest is explicit because an older release can have been marked
+          # latest by hand to stop a bad build spreading (0.2.151 for 0.2.152).
+          # Nodes only see the release that /releases/latest points at, so the
+          # new one must take that over.
           gh release edit "$TAG_NAME" \
             --repo ${{ github.repository }} \
-            --draft=false
+            --draft=false \
+            --latest
           echo "✅ Release $TAG_NAME published with all binaries attached"
 
   # -----------------------------------------------------------------------
