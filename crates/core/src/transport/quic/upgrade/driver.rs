@@ -64,19 +64,23 @@ use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use super::machine::{Action, BackoffSeed, CONTROL_SEND_TIMEOUT, Event, Inputs, UpgradeMachine};
+use super::machine::{
+    Action, BackoffSeed, CONTROL_SEND_TIMEOUT, Event, FallbackCause, Inputs, Outcome, Role,
+    UpgradeMachine,
+};
 use super::policy::QuicPolicy;
 use crate::config::{GlobalExecutor, GlobalRng};
 use crate::node::background_task_monitor::LateRegistrar;
 use crate::simulation::{RealTime, TimeSource, VirtualTime};
 use crate::transport::crypto::TransportPublicKey;
-use crate::transport::metrics::QuicCloseCode;
+use crate::transport::metrics::{QuicCloseCode, QuicFallback, QuicUpgradeOutcome};
 use crate::transport::peer_connection::UpgradeSender;
 use crate::transport::peer_connection::inbound_budget::SharedInboundBudget;
 use crate::transport::quic::control::ControlError;
 use crate::transport::quic::identity::PeerKey;
 use crate::transport::quic::path::{BoundedSend, QuicInbound, QuicPath, QuicPathLimits};
 use crate::transport::quic::{QuicConnection, QuicEndpoint, QuicIncoming, QuicPeerPermit};
+use crate::transport::symmetric_message::DeclineReason;
 use crate::transport::symmetric_message::UpgradeControl;
 use crate::transport::{
     QuicErrorKind, QuicRefusal, Socket, TRANSPORT_METRICS, normalize_mapped_addr,
@@ -271,9 +275,43 @@ struct LivePath {
     _streams: mpsc::Receiver<crate::transport::quic::path::InboundStreamArrival>,
 }
 
+/// An attempt's place in the `quic_paths_*` gauges: counted as offered or
+/// dialing from creation, as active once the machine reports the path
+/// established, and out again when the attempt is dropped. A guard, so no
+/// way of ending an attempt leaves a gauge high.
+struct PathGauge {
+    remote: SocketAddr,
+    /// When the path became active, on the session clock.
+    active_since: Option<Duration>,
+}
+
+impl PathGauge {
+    fn new(remote: SocketAddr) -> Self {
+        TRANSPORT_METRICS.quic_path_attempting(remote);
+        Self {
+            remote,
+            active_since: None,
+        }
+    }
+
+    fn activate(&mut self, now: Duration) {
+        if self.active_since.is_none() {
+            self.active_since = Some(now);
+            TRANSPORT_METRICS.quic_path_activated(self.remote);
+        }
+    }
+}
+
+impl Drop for PathGauge {
+    fn drop(&mut self) {
+        TRANSPORT_METRICS.quic_path_left(self.active_since.is_some(), self.remote);
+    }
+}
+
 /// What one attempt holds. Dropping it drops all of it.
 struct Attempt {
     id: u32,
+    gauge: PathGauge,
     /// The server's `allow_peer` permit.
     allow: Option<QuicPeerPermit>,
     /// A routed connection attempt is finishing its handshake.
@@ -284,9 +322,10 @@ struct Attempt {
 }
 
 impl Attempt {
-    fn new(id: u32) -> Self {
+    fn new(id: u32, remote: SocketAddr) -> Self {
         Self {
             id,
+            gauge: PathGauge::new(remote),
             allow: None,
             establishing: false,
             path: None,
@@ -309,6 +348,9 @@ struct SessionState {
     /// The key the node promoted the session under.
     peer_key: Option<TransportPublicKey>,
     ended: bool,
+    /// When this node sent its Offer or Accept, on the session clock, until
+    /// the path is established.
+    setup_started: Option<Duration>,
 }
 
 /// One UDP session's upgrade. The driver, the connection and a newer session of
@@ -341,10 +383,10 @@ pub(in crate::transport) struct QuicUpgrades {
     by_key: DashMap<TransportPublicKey, Weak<Session>>,
     seeds: Mutex<SeedStore>,
     next_session: AtomicU64,
-    /// Peer-sent upgrade messages dropped because the inbox was full.
+    /// Peer-sent upgrade messages dropped because an inbox was full. Only
+    /// throttles the warning; the exported count is
+    /// `quic_upgrade_inbox_overflow`.
     inbox_overflow: AtomicU64,
-    /// Attempts dropped because no session wanted them.
-    attempts_unrouted: AtomicU64,
     #[cfg(any(test, feature = "testing"))]
     trace: Option<super::sim_trace::NodeTrace>,
 }
@@ -371,7 +413,6 @@ impl QuicUpgrades {
             seeds: Mutex::new(SeedStore::new(SEED_STORE_ENTRIES)),
             next_session: AtomicU64::new(1),
             inbox_overflow: AtomicU64::new(0),
-            attempts_unrouted: AtomicU64::new(0),
             #[cfg(any(test, feature = "testing"))]
             trace,
         })
@@ -427,7 +468,7 @@ impl QuicUpgrades {
             },
         };
         if let Some(incoming) = unrouted {
-            self.attempts_unrouted.fetch_add(1, Ordering::Relaxed);
+            TRANSPORT_METRICS.record_quic_upgrade(QuicUpgradeOutcome::AttemptUnrouted, addr);
             tracing::debug!(%addr, "Ignoring a QUIC connection attempt no session wanted");
             incoming.ignore();
         }
@@ -462,9 +503,13 @@ impl QuicUpgrades {
                 attempt: None,
                 peer_key: None,
                 ended: false,
+                setup_started: None,
             }),
         });
-        let driver = GlobalExecutor::spawn(drive(Arc::clone(&session), inbox_rx, sender, time));
+        let driver = GlobalExecutor::spawn(report_panics(
+            remote,
+            drive(Arc::clone(&session), inbox_rx, sender, time),
+        ));
         QuicPathState { session, driver }
     }
 
@@ -583,10 +628,81 @@ impl Session {
                 Action::Record(outcome) => {
                     tracing::debug!(peer = %self.remote, session = self.id, ?outcome, "QUIC upgrade");
                     self.note(|| format!("{outcome:?}"));
+                    self.count(state, outcome);
                 }
             }
         }
         sends
+    }
+
+    /// Count what the machine decided. Exhaustive, so a new outcome does not
+    /// compile until it has a counter.
+    fn count(&self, state: &mut SessionState, outcome: Outcome) {
+        use QuicUpgradeOutcome as C;
+        let now = (self.now)();
+        let count = |counter| TRANSPORT_METRICS.record_quic_upgrade(counter, self.remote);
+        let declined = |reason: Option<DeclineReason>| match reason {
+            Some(DeclineReason::Disabled) => C::DeclinedDisabled,
+            Some(DeclineReason::Backoff) => C::DeclinedBackoff,
+            Some(DeclineReason::Busy) => C::DeclinedBusy,
+            Some(DeclineReason::NotReady) => C::DeclinedNotReady,
+            None => C::DeclinedUnknown,
+        };
+        match outcome {
+            Outcome::Offered => {
+                state.setup_started = Some(now);
+                count(C::Offered);
+            }
+            Outcome::Accepted => count(C::Accepted),
+            Outcome::AcceptSent => {
+                state.setup_started = Some(now);
+                count(C::AcceptSent);
+            }
+            Outcome::Established(role) => {
+                count(C::Established);
+                if role == Role::Server {
+                    count(C::EstablishedAsOfferer);
+                }
+                if let Some(started) = state.setup_started.take() {
+                    TRANSPORT_METRICS
+                        .record_quic_establish_latency(now.saturating_sub(started), self.remote);
+                }
+                if let Some(held) = state.attempt.as_mut() {
+                    held.gauge.activate(now);
+                }
+            }
+            Outcome::Declined { reason, uncharged } => {
+                count(declined(reason));
+                if uncharged {
+                    count(C::DeclinedUncharged);
+                }
+            }
+            Outcome::DeclineSent(reason) => count(match reason {
+                DeclineReason::Disabled => C::DeclineSentDisabled,
+                DeclineReason::Backoff => C::DeclineSentBackoff,
+                DeclineReason::Busy => C::DeclineSentBusy,
+                DeclineReason::NotReady => C::DeclineSentNotReady,
+            }),
+            Outcome::IneligibleVersion => count(C::IneligibleVersion),
+            Outcome::NoReply => count(C::NoReply),
+            Outcome::Timeout => count(C::Timeout),
+            Outcome::HandshakeFailed => count(C::HandshakeFailed),
+            Outcome::IdentityMismatch => count(C::IdentityMismatch),
+            Outcome::RoleConflict => count(C::RoleConflict),
+            Outcome::AllowSetFull => count(C::AllowSetFull),
+            Outcome::KeyConflict => count(C::KeyConflict),
+            Outcome::ControlRefused => count(C::ControlRefused),
+            Outcome::Fallback(cause) => TRANSPORT_METRICS.record_quic_fallback(
+                match cause {
+                    FallbackCause::Idle => QuicFallback::Idle,
+                    FallbackCause::Reset => QuicFallback::Reset,
+                    FallbackCause::Protocol => QuicFallback::Protocol,
+                    FallbackCause::DowngradeReceived => QuicFallback::DowngradeReceived,
+                    FallbackCause::EndpointDown => QuicFallback::EndpointDown,
+                },
+                self.remote,
+            ),
+        }
     }
 
     /// Put the promoted key on the allow-set for `attempt`. The key comes only
@@ -602,7 +718,7 @@ impl Session {
             .endpoint
             .allow_peer(self.remote, key)
             .map_err(|error| self.hub.endpoint.error_kind(error))?;
-        let mut held = Attempt::new(attempt);
+        let mut held = Attempt::new(attempt, self.remote);
         held.allow = Some(permit);
         state.attempt = Some(held);
         Ok(())
@@ -615,7 +731,7 @@ impl Session {
         let hub = Arc::clone(&self.hub);
         let inbox = self.inbox.clone();
         let remote = self.remote;
-        let mut held = Attempt::new(attempt);
+        let mut held = Attempt::new(attempt, self.remote);
         held.tasks.push(GlobalExecutor::spawn(async move {
             let event = match hub.endpoint.connect(remote, &key).await {
                 Ok(connection) => SessionEvent::Connected {
@@ -641,7 +757,7 @@ impl Session {
             .as_mut()
             .filter(|held| held.allow.is_some() && held.path.is_none() && !held.establishing);
         let Some(held) = waiting else {
-            self.hub.attempts_unrouted.fetch_add(1, Ordering::Relaxed);
+            TRANSPORT_METRICS.record_quic_upgrade(QuicUpgradeOutcome::AttemptUnrouted, self.remote);
             incoming.ignore();
             return;
         };
@@ -716,6 +832,7 @@ impl Session {
         } = inbound;
         let pump = spawn_pump(
             attempt,
+            self.remote,
             path.quinn_connection(),
             controls,
             Arc::clone(&self.hub),
@@ -781,6 +898,12 @@ impl Session {
         let Some(held) = state.attempt.take_if(|held| held.id == attempt) else {
             return;
         };
+        // Only the teardown of an active path ends one, so this is where its
+        // age is known.
+        if let Some(since) = held.gauge.active_since {
+            TRANSPORT_METRICS
+                .record_quic_path_closed((self.now)().saturating_sub(since), self.remote);
+        }
         if let Some(live) = &held.path {
             live.path.close(code);
             self.note(|| format!("closed path with {code:?}"));
@@ -937,15 +1060,26 @@ async fn report(inbox: &mpsc::Sender<SessionEvent>, event: SessionEvent) {
     }
 }
 
+/// Run `task`. If it panics, count that and raise the same panic again, so the
+/// runtime sees what it saw before.
+async fn report_panics(remote: SocketAddr, task: impl Future<Output = ()>) {
+    use futures::FutureExt;
+    if let Err(payload) = std::panic::AssertUnwindSafe(task).catch_unwind().await {
+        TRANSPORT_METRICS.record_quic_upgrade(QuicUpgradeOutcome::TaskPanicked, remote);
+        std::panic::resume_unwind(payload);
+    }
+}
+
 /// Forward a path's control frames, and its end, to the session's driver.
 fn spawn_pump(
     attempt: u32,
+    remote: SocketAddr,
     connection: quinn::Connection,
     mut controls: mpsc::Receiver<Bytes>,
     hub: Arc<QuicUpgrades>,
     inbox: mpsc::Sender<SessionEvent>,
 ) -> JoinHandle<()> {
-    GlobalExecutor::spawn(async move {
+    GlobalExecutor::spawn(report_panics(remote, async move {
         let mut open = true;
         loop {
             crate::deterministic_select! {
@@ -964,7 +1098,7 @@ fn spawn_pump(
                 },
             }
         }
-    })
+    }))
 }
 
 /// Ends the session when the driver stops for any reason: the connection dropped
@@ -1106,6 +1240,8 @@ impl QuicPathState {
     /// and the machine's deadlines cover that.
     pub(in crate::transport) fn on_upgrade(&self, control: UpgradeControl) {
         if let Err(error) = self.session.inbox.try_send(SessionEvent::Upgrade(control)) {
+            TRANSPORT_METRICS
+                .record_quic_upgrade(QuicUpgradeOutcome::InboxOverflow, self.session.remote);
             let count = self
                 .session
                 .hub

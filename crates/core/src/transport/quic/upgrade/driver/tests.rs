@@ -130,6 +130,7 @@ impl Harness {
                 attempt: None,
                 peer_key: None,
                 ended: false,
+                setup_started: None,
             }),
         });
         (session, inbox_rx)
@@ -553,5 +554,144 @@ fn a_full_inbox_drops_peer_messages_and_still_delivers_a_path_end() {
             last = inbox.recv().await;
         }
         assert!(matches!(last, Some(SessionEvent::PathClosed { .. })));
+    });
+}
+
+/// The machine's decisions reach the telemetry counters through the driver, and the
+/// path gauges follow the attempt: an offer is counted, an attempt is in the
+/// offered-or-dialing gauge until it ends, and a timeout is counted once.
+#[test]
+fn offer_outcomes_and_the_path_gauge_reach_telemetry() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let h = Harness::server("quic-driver-telemetry", 11).await;
+        let (session, _rx) = h.session();
+        session.promote(h.peer.clone());
+        let events = || TRANSPORT_METRICS.quic_events_of(h.remote);
+        let at = Duration::from_nanos(session.deadline_nanos().unwrap());
+        h.set_now(at);
+        let sends = session.take(Event::Tick);
+        let [UdpSend::Offer { attempt, .. }] = sends[..] else {
+            panic!("{sends:?}");
+        };
+        session.take(Event::OfferSent { attempt });
+        assert_eq!(events(), ["\"path_attempting\"", "Offered"]);
+        h.set_now(at + OFFER_TIMEOUT);
+        assert!(session.take(Event::Tick).is_empty());
+        assert_eq!(
+            events(),
+            [
+                "\"path_attempting\"",
+                "Offered",
+                "(\"path_left\", false)",
+                "NoReply"
+            ]
+        );
+    });
+}
+
+/// A decline reaches the counters under its reason and, when the machine spared
+/// the peer the penalty, as an uncharged decline; the one the node sends is counted
+/// by reason.
+#[test]
+fn declines_are_counted_by_reason_and_penalty() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let h = Harness::server("quic-driver-declines", 12).await;
+        let (session, _rx) = h.session();
+        session.promote(h.peer.clone());
+        let events = || TRANSPORT_METRICS.quic_events_of(h.remote);
+        for (reason, counted) in [
+            (
+                DeclineReason::Busy.wire(),
+                vec!["DeclinedBusy", "DeclinedUncharged"],
+            ),
+            (DeclineReason::Disabled.wire(), vec!["DeclinedDisabled"]),
+            (0xEE, vec!["DeclinedUnknown"]),
+        ] {
+            h.set_now(Duration::from_nanos(session.deadline_nanos().unwrap()));
+            let sends = session.take(Event::Tick);
+            let [UdpSend::Offer { attempt, .. }] = sends[..] else {
+                panic!("{sends:?}");
+            };
+            session.take(Event::OfferSent { attempt });
+            let before = events().len();
+            session.handle(SessionEvent::Upgrade(UpgradeControl::Decline {
+                attempt,
+                reason,
+            }));
+            let after = events();
+            let counted: Vec<_> = counted.into_iter().map(String::from).collect();
+            assert_eq!(after[before], "(\"path_left\", false)", "reason {reason}");
+            assert_eq!(after[before + 1..], counted[..], "reason {reason}");
+        }
+    });
+}
+
+/// A panic in a task the driver spawns is counted, and the same panic goes on.
+#[test]
+fn a_panicking_task_is_counted_and_still_panics() {
+    let remote: SocketAddr = "10.204.13.1:5000".parse().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let task = tokio::spawn(report_panics(remote, async { panic!("task failed") }));
+        let error = task.await.expect_err("the panic goes on");
+        assert!(error.is_panic());
+    });
+    assert_eq!(TRANSPORT_METRICS.quic_events_of(remote), ["TaskPanicked"]);
+}
+
+/// An established path is counted under both its role counters, its latency runs
+/// from the offer, the gauge moves from offered-or-dialing to active, and tearing
+/// the path down records its age and leaves the active gauge.
+#[test]
+fn an_established_path_is_counted_timed_and_aged() {
+    use crate::transport::quic::upgrade::machine::{Outcome, Role};
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let h = Harness::server("quic-driver-established", 14).await;
+        let (session, _rx) = h.session();
+        session.promote(h.peer.clone());
+        h.set_now(Duration::from_secs(100));
+        let mut state = session.state.lock();
+        session.apply(
+            &mut state,
+            vec![
+                Action::AllowPeerThenOffer {
+                    attempt: 1,
+                    caps: 0,
+                },
+                Action::Record(Outcome::Offered),
+            ],
+        );
+        h.set_now(Duration::from_secs(100) + Duration::from_millis(250));
+        session.apply(
+            &mut state,
+            vec![Action::Record(Outcome::Established(Role::Server))],
+        );
+        h.set_now(Duration::from_secs(100) + Duration::from_secs(90));
+        session.apply(
+            &mut state,
+            vec![Action::TearDown {
+                attempt: 1,
+                code: QuicCloseCode::Downgrade,
+            }],
+        );
+        drop(state);
+        assert_eq!(
+            TRANSPORT_METRICS.quic_events_of(h.remote),
+            [
+                "\"path_attempting\"",
+                "Offered",
+                "Established",
+                "EstablishedAsOfferer",
+                "(\"establish_ms\", 250)",
+                "\"path_activated\"",
+                "Lt10M",
+                "(\"path_left\", true)",
+            ]
+        );
     });
 }

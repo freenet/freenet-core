@@ -2637,6 +2637,29 @@ fn close_codes_reach_the_peer() {
                 drop((closer, peer));
             }
         }
+        // The side that did not close counts the raw code it received, once
+        // per connection (`quic_close_received_*`). The closer's own watcher
+        // sees a local close and counts nothing.
+        let time = pair.time.clone();
+        drive(&pair.time, Duration::from_secs(5), async move {
+            time.sleep(Duration::from_secs(1)).await
+        })
+        .await;
+        let received = |remote| -> Vec<String> {
+            TRANSPORT_METRICS
+                .quic_events_of(remote)
+                .into_iter()
+                .filter(|event| event.starts_with("(\"close_received\""))
+                .collect()
+        };
+        let want = |codes: &[QuicCloseCode]| -> Vec<String> {
+            codes
+                .iter()
+                .map(|code| format!("(\"close_received\", Some({code:?}), {})", code.code()))
+                .collect()
+        };
+        assert_eq!(received(pair.a_addr), want(&sent_by_a));
+        assert_eq!(received(pair.b_addr), want(&sent_by_b));
         assert_eq!(TRANSPORT_METRICS.quic_close_sent_to(pair.b_addr), sent_by_a);
         assert_eq!(TRANSPORT_METRICS.quic_close_sent_to(pair.a_addr), sent_by_b);
 

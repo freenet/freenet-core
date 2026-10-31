@@ -376,7 +376,8 @@ and no breaker state is left), QUIC crash-loop breaker trips at startup
 only a QUIC fault; see `quic/breaker.rs`) and whether the breaker keeps QUIC
 off in this process (`quic_breaker_suppressed`, a state that is never reset and
 is not activity by itself) and QUIC connections this node closed, by close code
-(`quic_close_sent_<label>`, one per `QuicCloseCode`). Each label set is declared once in a
+(`quic_close_sent_<label>`, one per `QuicCloseCode`) and the shadow-mode upgrade
+telemetry (below, "Upgrade telemetry"). Each label set is declared once in a
 `labelled_counters!` list, so a new variant needs a snapshot field. Hot
 path writes are single relaxed atomics; `SentPacketTracker` keeps an
 `rto_expiries` count and a bounded per-stream final-ACK watch, both
@@ -958,6 +959,44 @@ doc has the transition table.
   once with CONTROL_REFUSED and a normal backoff, so the sender does not wait
   for its setup timeout. WrongLength and Empty wait for the deadline. Once
   active, a refused frame leaves the path alone.
+
+Upgrade telemetry (#5940 e5a-6). The driver turns each machine `Outcome` into a
+counter at `Session::count`, which matches every `Outcome` variant, so a new
+outcome does not compile until it has one. All are per-period and reset with the
+snapshot except the two gauges.
+  `quic_upgrade_<label>` (`QuicUpgradeOutcome`): offered, accepted (the peer
+  accepted this node's Offer), accept_sent, established (either role),
+  established_as_offerer, no_reply, timeout, handshake_failed, identity_mismatch,
+  role_conflict, allow_set_full, key_conflict, control_refused,
+  ineligible_version, declined_<reason> (the peer's Decline), declined_uncharged
+  (the same Decline when the machine spared the peer the penalty; the flag comes
+  from `on_decline`), decline_sent_<reason>, and inbox_overflow,
+  attempt_unrouted, task_panicked (a driver or pump panic, re-raised after
+  counting).
+  Stage 2 gate denominator: established_as_offerer over accepted, reported beside
+  offered and declined_uncharged. Both sides count `established`; only the
+  offerer's is the numerator. Counts are node-wide; there is no per-pair series.
+  `quic_fallback_<label>` (`QuicFallback`): idle, reset, protocol, downgrade_rx,
+  endpoint_down. A close this node sent for send_abort_limit or
+  peer_not_acknowledging reaches the machine as a lost connection, so it counts
+  as `reset`; its count is `quic_close_sent_*`. A key mismatch is
+  `quic_upgrade_identity_mismatch`.
+  `quic_close_received_<label>`: one per QUIC connection quinn reports as closed
+  by a peer application close, by raw code (counted in `QuicConnection::new`'s
+  watcher, because `QuicErrorKind` merges codes 1, 3, 4 and 5); a code with no
+  name is `unknown_code`. A local close is not counted.
+  `quic_path_age_at_close_<lt_1m|lt_10m|lt_1h|lt_1d|ge_1d>`: age of an active
+  path at the teardown that ends it. `quic_establish_ms_p50`/`_p90`/`_samples`:
+  from this node's Offer or Accept to active, on the session clock, first 256
+  samples per period (`_samples` counts all).
+  Gauges `quic_paths_offered_or_dialing` and `quic_paths_active` are held by a
+  `PathGauge` guard inside the attempt, so dropping the attempt leaves the gauge.
+  `quic_paths_active` is also in `resource_utilization` beside
+  `memory_rss_bytes`.
+  Not built: stream-concurrency instruments on real QUIC (`quic_open_uni_waited`,
+  permit waits, ge_8..ge_48, control_* refusals) have no source until e5b and
+  read zero in shadow; the `transport=legacy|quic` connection attribute; a
+  per-path memory estimate.
   Off is final for the session, also for a policy that later clears (endpoint
   Down, Released or Disabled, session ended, policy refusing, below the version
   floor, equal keys): no re-offer, and no charge to the peer except from a
