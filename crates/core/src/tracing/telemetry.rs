@@ -7586,6 +7586,41 @@ mod tests {
             .cloned()
             .collect();
         expected.insert("type".to_string());
+        // The QUIC families are arrays in the snapshot and one key per label in
+        // the event.
+        use crate::transport::metrics::{
+            QuicCloseCode, QuicFallback, QuicPathAge, QuicUpgradeOutcome,
+        };
+        for family in [
+            "quic_close_received",
+            "quic_upgrade",
+            "quic_fallback",
+            "quic_path_age_at_close",
+        ] {
+            assert!(expected.remove(family), "{family} is in the snapshot");
+        }
+        expected.extend(
+            QuicCloseCode::ALL
+                .iter()
+                .map(|code| code.label())
+                .chain(["unknown_code"])
+                .map(|label| format!("quic_close_received_{label}")),
+        );
+        expected.extend(
+            QuicUpgradeOutcome::ALL
+                .iter()
+                .map(|outcome| format!("quic_upgrade_{}", outcome.label())),
+        );
+        expected.extend(
+            QuicFallback::ALL
+                .iter()
+                .map(|cause| format!("quic_fallback_{}", cause.label())),
+        );
+        expected.extend(
+            QuicPathAge::ALL
+                .iter()
+                .map(|age| format!("quic_path_age_at_close_{}", age.label())),
+        );
         let actual: std::collections::BTreeSet<String> = event_kind_to_json(
             &super::super::EventKind::TransportSnapshot(Box::new(snapshot)),
         )
