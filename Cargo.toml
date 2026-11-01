@@ -98,7 +98,7 @@ rand_core10 = { package = "rand_core", version = "0.10" }
 
 # Observability
 async-trait = "0.1"
-opentelemetry = "0.32"
+opentelemetry = "0.33"
 # Trait/types only (HttpClient for the per-request auth wrapper); its reqwest
 # integration targets reqwest 0.13 and the workspace is on 0.12, so no features.
 opentelemetry-http = "0.32"
