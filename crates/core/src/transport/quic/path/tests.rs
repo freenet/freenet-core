@@ -901,6 +901,157 @@ fn a_message_waiting_for_room_is_evicted_at_its_age_limit() {
     })
 }
 
+/// Waiters for room in a full channel are capped by quinn's stream limit:
+/// a Short waits BEFORE its end is read, so its stream stays open and its
+/// credit is held. With nothing draining, the sends that complete are those
+/// the channel holds plus the `MAX_UNI_STREAMS` readers waiting; the rest block
+/// in `open_uni`, and the memory held does not grow with the peer's upload.
+/// (Reading the end first frees the stream, so every send would complete and
+/// every one of the readers would be left waiting.) Once the consumer drains,
+/// all of them arrive.
+#[test]
+fn waiters_for_a_full_channel_are_capped_by_the_stream_limit() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let mut p = paths("quic-path-waiters", 80, QuicPathLimits::DEFAULT).await;
+        let limit = super::super::config::MAX_UNI_STREAMS as usize;
+        let count = SHORT_CHANNEL_CAPACITY + limit + 40;
+        let done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for i in 0..count {
+            let (a, done) = (p.a.clone(), done.clone());
+            tokio::spawn(async move {
+                a.send_short(&(i as u32).to_be_bytes()).await.unwrap();
+                done.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+        let time = p.time();
+        p.drive(async move { time.sleep(Duration::from_secs(5)).await })
+            .await;
+        let sent = done.load(Ordering::SeqCst);
+        assert!(
+            sent <= SHORT_CHANNEL_CAPACITY + limit,
+            "{sent} sends completed with nothing draining"
+        );
+        assert!(sent >= SHORT_CHANNEL_CAPACITY, "only {sent} completed");
+        let stats = p.b.stats();
+        assert_eq!(p.b_in.shorts.len(), SHORT_CHANNEL_CAPACITY);
+        assert_eq!(
+            stats.count(QuicInboundOutcome::DeliveredShort) as usize,
+            SHORT_CHANNEL_CAPACITY
+        );
+        let mut got = std::collections::BTreeSet::new();
+        for _ in 0..200 {
+            while let Ok(message) = p.b_in.shorts.try_recv() {
+                let bytes: [u8; 4] = message.payload()[..].try_into().unwrap();
+                got.insert(u32::from_be_bytes(bytes));
+            }
+            if got.len() == count {
+                break;
+            }
+            let time = p.time();
+            p.drive(async move { time.sleep(Duration::from_millis(10)).await })
+                .await;
+        }
+        assert_eq!(got.len(), count, "every message arrived once drained");
+        assert_eq!(stats.count(QuicInboundOutcome::ShortDroppedFull), 0);
+    })
+}
+
+/// After a wait for room, idleness applies again: a stream that waits longer
+/// than the idle timeout, then stalls, is evicted idle, not at its age limit.
+#[test]
+fn a_stream_that_waited_for_room_is_evicted_idle_when_it_stalls() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let limits = QuicPathLimits {
+            stream_capacity: 1,
+            ..QuicPathLimits::DEFAULT
+        };
+        let mut p = paths("quic-path-wait-idle", 81, limits).await;
+        let idle = streaming_handle_idle_timeout();
+        let total = 10_000u64;
+        assert!(
+            max_inbound_stream_age(total) > idle * 5,
+            "the wait and the stall must fit inside the age limit"
+        );
+        let a = p.a.clone();
+        let held = StreamId::next();
+        p.drive(async move {
+            a.send_stream(held, None, Bytes::from_static(b"held"))
+                .await
+                .unwrap();
+        })
+        .await;
+        // Announced behind the full channel; half its payload, never finished.
+        let conn = p.a_raw();
+        let sender = tokio::spawn(async move {
+            let mut send = conn.open_uni().await.unwrap();
+            let mut bytes = header(1, 1, StreamId::next().0, total, 0);
+            bytes.extend_from_slice(&payload(5000));
+            send.write_all(&bytes).await.unwrap();
+            send.stopped().await.unwrap().map(|c| c.into_inner())
+        });
+        let time = p.time();
+        let sleeper = time.clone();
+        p.drive(async move { sleeper.sleep(idle * 3).await }).await;
+        assert!(!sender.is_finished(), "waiting for room is not idleness");
+        let stats = p.b.stats();
+        assert_eq!(stats.shared_count(InboundStreamOutcome::EvictedIdle), 0);
+        assert_eq!(p.b_in.streams.try_recv().unwrap().stream_id, held);
+        let released = time.now_nanos();
+        let code = p.drive(async move { sender.await.unwrap() }).await;
+        assert_eq!(code, Some(u64::from(stop_code::EVICTED)));
+        let stalled = Duration::from_nanos(time.now_nanos() - released);
+        assert!(
+            stalled >= idle && stalled < idle * 2,
+            "evicted {stalled:?} after the wait ended, idle timeout {idle:?}"
+        );
+        assert_eq!(stats.shared_count(InboundStreamOutcome::EvictedIdle), 1);
+        assert_eq!(stats.shared_count(InboundStreamOutcome::EvictedAge), 0);
+    })
+}
+
+/// A reader still waiting for room when its path ends is dropped with the
+/// receive task; each is counted, per kind.
+#[test]
+fn readers_waiting_for_room_when_the_path_ends_are_counted() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let limits = QuicPathLimits {
+            short_capacity: 1,
+            stream_capacity: 1,
+            ..QuicPathLimits::DEFAULT
+        };
+        let p = paths("quic-path-abandoned", 82, limits).await;
+        let a = p.a.clone();
+        let second_id = StreamId::next();
+        let sent = tokio::spawn(async move {
+            a.send_short(b"one").await.unwrap();
+            a.send_short(b"two").await.unwrap();
+            a.send_stream(StreamId::next(), None, Bytes::from_static(b"held"))
+                .await
+                .unwrap();
+            a.send_stream(second_id, None, over_window()).await
+        });
+        let time = p.time();
+        let sleeper = time.clone();
+        p.drive(async move { sleeper.sleep(Duration::from_secs(1)).await })
+            .await;
+        let stats = p.b.stats_handle();
+        assert_eq!(stats.count(QuicInboundOutcome::ShortAbandonedWaiting), 0);
+        assert_eq!(stats.count(QuicInboundOutcome::StreamAbandonedWaiting), 0);
+        let Paths { pair, b, .. } = p;
+        drop(b);
+        drive(&pair.time, LIMIT, async move {
+            time.sleep(Duration::from_secs(1)).await
+        })
+        .await;
+        sent.abort();
+        assert_eq!(stats.count(QuicInboundOutcome::ShortAbandonedWaiting), 1);
+        assert_eq!(stats.count(QuicInboundOutcome::StreamAbandonedWaiting), 1);
+    })
+}
+
 /// A full budget still delivers a short message of one packet or less: it is
 /// not charged, so no refusal can race its acknowledgement.
 #[test]

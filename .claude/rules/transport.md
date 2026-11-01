@@ -1697,7 +1697,9 @@ QUIC receive flow (#5940 e5b-4):
   the order and no part in the random draw, so the poll order and the GlobalRng
   draws are those of the 7-branch select it replaced
   (nine_branches_with_the_extra_guards_off_poll_as_seven).
-  A message that arrived whole before its path ended is still delivered.
+  A message already in a channel when its path ends is still delivered; a reader
+  still waiting for room in a full channel is dropped with the receive task and
+  counted (short_abandoned_waiting, stream_abandoned_waiting).
   Short arm: put the hash in dispatched_msg_hashes, release the charge at once
   (release_if_gone on the key the short carries), return the bytes. A Short is never
   suppressed. Short after the same embedded metadata dispatches twice, as on UDP.
@@ -1715,8 +1717,11 @@ QUIC receive flow (#5940 e5b-4):
   or a reused QUIC id with that id is taken for a new stream instead of refused.
   Full channels: a Short or Stream whose channel is full waits in its own reader
   future (reserve, raced with the stream's age limit) and is stopped EVICTED past
-  it; Control is still dropped and counted. A Short of one packet or less
-  (fits_one_packet) is not charged, as on UDP. A Stream arm with no registry
+  it; Control is still dropped and counted. A Short waits BEFORE its end is read
+  (reading the end frees the stream and returns its credit), so waiters are
+  capped by MAX_UNI_STREAMS. A Short of one packet or less
+  (fits_one_packet) is not charged, as on UDP, and is bounded by that cap and
+  the channel. A Stream arm with no registry
   cancels the handle and releases its charge.
   When a stream's charge goes:
   → Reader ends with no consumer holding the buffer: at once (StreamGuard).

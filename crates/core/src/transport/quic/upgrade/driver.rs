@@ -48,8 +48,9 @@
 //! this node's data bit is set for the peer (`UpgradeMachine::accepts_data`). With
 //! the bit set it accepts data at once, and what arrives goes to the session's data
 //! channels ([`data_channels`]), which `PeerConnection::recv` reads. They live as
-//! long as the session, so a message that arrived before its path ended is still
-//! delivered. [`Action::EnableData`] lets the path send data once both bits are
+//! long as the session, so a message already in a channel when its path ends is
+//! still delivered. One still waiting for room in a full channel is dropped with
+//! the path and counted. [`Action::EnableData`] lets the path send data once both bits are
 //! set. Only `send_control_bounded` is called on it: no node code sends data yet,
 //! and a peer that sends none costs nothing here.
 

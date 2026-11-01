@@ -364,20 +364,30 @@ impl<T: TimeSource> BodyReader<T> {
     }
 
     /// Wait for `ready`, but not past the age deadline: `Err(Age)` if that
-    /// comes first. Idleness does not apply: the peer has sent everything and
-    /// the wait is on a consumer. Holding the reader (and so the
+    /// comes first. Idleness does not apply during the wait: the peer is not
+    /// the one being waited on, a consumer is. Holding the reader (and so the
     /// `RecvStream`) while waiting withholds the stream's credit, which is
-    /// the back-pressure on the sender. Arms one new sleep, so call it only
-    /// when `ready` is not already available.
+    /// the back-pressure on the sender. When the wait ends in `Ok`, idleness
+    /// restarts from that moment, so the rest of the stream is evicted idle
+    /// as any other (a stall after a long wait must not run to the age
+    /// limit). Arms one new sleep for the wait and, if the idle deadline is
+    /// earlier than the age deadline, another after it, so call it only when
+    /// `ready` is not already available.
     async fn until_age<F: Future>(&mut self, ready: F) -> Result<F::Output, ReadFailure> {
         if self.timer_at != self.age_deadline {
             self.timer_at = self.age_deadline;
             self.timer = self.time.sleep_until(self.timer_at);
         }
-        tokio::select! {
-            out = ready => Ok(out),
-            () = &mut self.timer => Err(ReadFailure::Age),
-        }
+        let out = tokio::select! {
+            out = ready => out,
+            () = &mut self.timer => return Err(ReadFailure::Age),
+        };
+        // Re-arming alone would fail a wait longer than the idle timeout as
+        // Idle at once, so progress is reset first.
+        self.last_progress = self.time.now_nanos();
+        self.timer_at = self.deadline();
+        self.timer = self.time.sleep_until(self.timer_at);
+        Ok(out)
     }
 
     /// Exactly `len` bytes (`len` > 0), copied into one buffer
@@ -420,6 +430,31 @@ impl<T: TimeSource> BodyReader<T> {
     /// ended.
     fn stop(&mut self, code: u32) {
         self.recv.stop(code.into()).ok();
+    }
+}
+
+/// Counts a reader dropped while it waits for room in a delivery channel.
+/// Teardown aborts the receive task, which drops every parked reader without
+/// running its code; this is the only record of those messages. Disarmed once
+/// the wait ends by any other route.
+struct WaitingGuard<'a> {
+    stats: &'a QuicPathStats,
+    outcome: QuicInboundOutcome,
+}
+
+impl<'a> WaitingGuard<'a> {
+    fn new(stats: &'a QuicPathStats, outcome: QuicInboundOutcome) -> Self {
+        Self { stats, outcome }
+    }
+
+    fn disarm(self) {
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for WaitingGuard<'_> {
+    fn drop(&mut self) {
+        self.stats.record(self.outcome);
     }
 }
 
@@ -766,20 +801,26 @@ impl<T: TimeSource> Receiver<T> {
                 return;
             }
         };
-        if let Err(failure) = reader.expect_end().await {
-            self.fail(&mut reader, failure, was_charged);
-            return;
-        }
         // Wait for room in the channel rather than drop the message: the sender
-        // has had every byte acknowledged, so a drop here would read as `Sent`.
-        // Only this reader waits (each reader is its own future), holding the
-        // stream's credit, so a slow consumer slows the sender and not the
-        // other streams. Past the age limit the stream is stopped, which the
-        // sender can count.
+        // may have had every byte acknowledged, so a drop here would read as
+        // `Sent`. The wait comes BEFORE `expect_end`: reading the stream to its
+        // end frees it in quinn and returns its MAX_STREAMS credit, so waiting
+        // after that would not slow the sender, and the number of waiters (and
+        // the memory they hold) would grow with the peer's upload. While the
+        // stream is unfinished its credit is held, so at most `MAX_UNI_STREAMS`
+        // readers wait, and a one-packet Short (uncharged) is capped the same
+        // way. Only this reader waits (each reader is its own future), so a slow
+        // consumer slows the sender and not the other streams. Past the age
+        // limit the stream is stopped, which reaches the sender because the
+        // stream is still open.
         let permit = match self.shorts.try_reserve() {
             Ok(permit) => permit,
             Err(mpsc::error::TrySendError::Full(())) => {
-                match reader.until_age(self.shorts.reserve()).await {
+                let waiting =
+                    WaitingGuard::new(&self.stats, QuicInboundOutcome::ShortAbandonedWaiting);
+                let waited = reader.until_age(self.shorts.reserve()).await;
+                waiting.disarm();
+                match waited {
                     Ok(Ok(permit)) => permit,
                     // The consumer is gone: the connection is ending.
                     Ok(Err(_)) => {
@@ -797,6 +838,10 @@ impl<T: TimeSource> Receiver<T> {
                 return;
             }
         };
+        if let Err(failure) = reader.expect_end().await {
+            self.fail(&mut reader, failure, was_charged);
+            return;
+        }
         let (key, charge) = match guard.as_mut() {
             Some(guard) => {
                 let Some(token) = guard.token.clone() else {
@@ -880,7 +925,11 @@ impl<T: TimeSource> Receiver<T> {
         let permit = match self.streams.try_reserve() {
             Ok(permit) => permit,
             Err(mpsc::error::TrySendError::Full(())) => {
-                match reader.until_age(self.streams.reserve()).await {
+                let waiting =
+                    WaitingGuard::new(&self.stats, QuicInboundOutcome::StreamAbandonedWaiting);
+                let waited = reader.until_age(self.streams.reserve()).await;
+                waiting.disarm();
+                match waited {
                     Ok(Ok(permit)) => permit,
                     Ok(Err(_)) => {
                         self.stats.record(QuicInboundOutcome::StreamDroppedFull);

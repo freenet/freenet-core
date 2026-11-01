@@ -91,11 +91,15 @@
 //!
 //! A Short or Stream whose channel is full waits for room in its own reader
 //! future (`reserve`, raced with the stream's age limit), not in the task: the
-//! other readers and the accept loop carry on, and the waiting reader keeps
-//! its `RecvStream`, which withholds stream credit, so a slow consumer slows
-//! the sender (`MAX_UNI_STREAMS`) instead of losing messages the sender has
-//! seen acknowledged. Past the age limit the stream is stopped
-//! (`stop_code::EVICTED`). A Control frame still uses `try_send` and is
+//! other readers and the accept loop carry on. A Short waits after its payload
+//! is read and BEFORE the stream's end is read (reading the end frees the
+//! stream in quinn and returns its credit), and the waiting reader keeps its
+//! `RecvStream`, so at most `MAX_UNI_STREAMS` readers wait on a path, charged
+//! or not, and a slow consumer slows the sender instead of losing messages the
+//! sender has seen acknowledged. Past the age limit the stream is stopped
+//! (`stop_code::EVICTED`), which the sender sees because the stream is still
+//! open. A reader that is waiting when the path ends is dropped with the
+//! receive task and counted (`ShortAbandonedWaiting`, `StreamAbandonedWaiting`). A Control frame still uses `try_send` and is
 //! dropped and counted (`QuicInboundOutcome`) when its channel is full.
 //!
 //! Not done here, on purpose:
@@ -211,8 +215,10 @@ pub(crate) mod reset_code {
     pub(crate) const ALL: [u32; 2] = [SENDER_ABORTED, LENGTH_MISMATCH];
 }
 
-/// Capacity of [`QuicDataInbox::shorts`]. Each queued message still holds its
-/// inbound budget charge, so the budget bounds the bytes queued.
+/// Capacity of [`QuicDataInbox::shorts`]. A queued message of more than one
+/// packet holds its inbound budget charge, so the budget bounds those bytes; a
+/// one-packet message is uncharged and bounded by this capacity (about one
+/// packet each) plus the readers waiting for room, at most `MAX_UNI_STREAMS`.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const SHORT_CHANNEL_CAPACITY: usize = 256;
 /// Capacity of [`QuicDataInbox::streams`]. Each queued stream holds its charge.
@@ -348,6 +354,12 @@ quic_outcomes! {
         ShortDroppedFull => "short_dropped_full",
         /// `streams` was full; the stream was refused.
         StreamDroppedFull => "stream_dropped_full",
+        /// The path ended while a Short waited for room in `shorts`; the
+        /// message was dropped with the receive task.
+        ShortAbandonedWaiting => "short_abandoned_waiting",
+        /// The path ended while a Stream waited for room in `streams`; the
+        /// announcement was dropped with the receive task.
+        StreamAbandonedWaiting => "stream_abandoned_waiting",
         /// `controls` was full; the frame was dropped.
         ControlDroppedFull => "control_dropped_full",
         /// The stream ended before its declared length.
@@ -438,7 +450,8 @@ impl QuicPathStats {
 
 /// Where the paths of one UDP session deliver data. The session holds these for
 /// its lifetime and each path it builds takes a clone, so a message that arrived
-/// before its path ended is still delivered.
+/// before its path ended is still delivered. A reader still waiting for room
+/// in a full channel when the path ends is not: it is dropped and counted.
 #[derive(Clone)]
 pub(in crate::transport) struct QuicDataSenders {
     shorts: mpsc::Sender<InboundShort>,
@@ -701,6 +714,12 @@ impl QuicPath {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn stats(&self) -> &QuicPathStats {
         &self.stats
+    }
+
+    /// The counters, outliving the path (tests read them after dropping it).
+    #[cfg(test)]
+    pub(crate) fn stats_handle(&self) -> Arc<QuicPathStats> {
+        self.stats.clone()
     }
 
     /// Sends this side reset on this path so far.
