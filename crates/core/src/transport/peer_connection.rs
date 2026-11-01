@@ -68,6 +68,13 @@ type OutboundStreamResult = std::result::Result<super::TransferStats, TransportE
 /// The extra byte vs. the original 40 comes from the Option discriminant of `metadata_bytes`.
 const MAX_DATA_SIZE: usize = packet_data::MAX_DATA_SIZE - 41;
 
+/// Whether a short message of `len` payload bytes fits one UDP packet, the
+/// rule the sender uses to choose a short message over a stream. UDP charges
+/// no inbound budget for such a message, and neither does the QUIC path.
+pub(in crate::transport) fn fits_one_packet(len: u64) -> bool {
+    len.saturating_add(SymmetricMessage::short_message_overhead() as u64) <= MAX_DATA_SIZE as u64
+}
+
 /// How often to check for pending ACKs and send them proactively.
 /// This prevents ACKs from being delayed when there's no outgoing traffic to piggyback on.
 ///
@@ -1094,7 +1101,9 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
     /// charge released at once. It moves neither of the UDP session's clocks.
     fn take_quic_short(&mut self, short: super::quic::path::InboundShort) -> Vec<u8> {
         let (payload, key) = short.into_parts();
-        self.inbound_budget.lock().release_if_gone(key);
+        if let Some(key) = key {
+            self.inbound_budget.lock().release_if_gone(key);
+        }
         let bytes = Vec::from(payload);
         // Only so that the same metadata embedded in a stream is suppressed; a
         // Short itself is always delivered, as on UDP.
@@ -1128,6 +1137,11 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             metadata,
             handle,
         } = arrival;
+        // The stream's payload length, counted here because the reader task
+        // completes the stream later, with no way to count it from there.
+        // UDP counts at completion; this counts at arrival, and a stream that
+        // later fails is counted too.
+        let total = handle.total_bytes();
         let seen_on_udp = self
             .inbound_budget
             .lock()
@@ -1167,6 +1181,10 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                 "A QUIC stream arrived but inbound_stream_registry is None; cancelling it"
             );
             handle.cancel();
+            drop(handle);
+            self.inbound_budget
+                .lock()
+                .release_if_gone(InboundKey::Quic(stream_id));
             return None;
         };
         registry.register_inbound_stream(
@@ -1174,6 +1192,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             stream_id,
             super::IncomingStream::from(handle),
         );
+        super::TRANSPORT_METRICS.record_inbound_completed(total);
         self.note_quic_delivery(|| format!("received a stream on the path, id {stream_id}"));
         let bytes = metadata?.to_vec();
         (!self.is_duplicate_dispatch(&bytes)).then_some(bytes)
@@ -1623,7 +1642,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             .upgrade_trace
             .as_ref()
             .is_some_and(|trace| trace.sends_shorts_on_paths());
-        let fits = data.len() + SymmetricMessage::short_message_overhead() <= MAX_DATA_SIZE;
+        let fits = fits_one_packet(data.len() as u64);
         match &self.quic_path {
             Some(quic_path) if wanted && fits => quic_path.send_short_on_path(data),
             Some(_) | None => Err(data),
@@ -2568,7 +2587,6 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                 },
                 arrival = next_on(&mut self.quic_streams), if self.quic_streams.is_some() => {
                     if let Some(msg) = self.take_quic_stream(arrival) {
-                        super::TRANSPORT_METRICS.record_inbound_completed(msg.len() as u64);
                         return Ok(msg);
                     }
                 },

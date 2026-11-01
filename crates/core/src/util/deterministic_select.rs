@@ -973,7 +973,8 @@ macro_rules! deterministic_select {
     // ==================== 7 BRANCHES ====================
 
     // 7 branches: first without guard, second and third with guards, rest without guards
-    // Pattern: peer_connection.rs recv loop
+    // Pattern: the recv loop's shape before the QUIC data arms; `recv` itself now
+    // uses the 9 branch shape below
     (
         $pat1:pat = $fut1:expr => $body1:expr,
         $pat2:pat = $fut2:expr, if $guard2:expr => $body2:expr,

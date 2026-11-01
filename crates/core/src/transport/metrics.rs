@@ -261,8 +261,10 @@ labelled_counters! {
         /// A QUIC stream cancelled because its id was already used, on either
         /// path. Only a faulty peer or a bug sends one.
         StreamIdOnBothPaths => "stream_id_on_both_paths",
-        /// Not a refusal: a complete stream, of either path, still held past its
-        /// age limit by a consumer that has not let go. Nothing evicts one.
+        /// Neither a refusal nor an eviction, and not a limit being hit: a
+        /// complete stream, of either path, still held past its age limit by a
+        /// consumer that has not let go. Nothing evicts one. Read it as a
+        /// consumer that is slow to take what it was given.
         CompleteChargePastAge => "complete_charge_past_age",
     }
 }
@@ -3137,6 +3139,8 @@ pub struct TransportSnapshot {
     /// Inbound streams refused or evicted during the period, by reason
     /// (see [`InboundStreamOutcome`]; the field suffix is its label). Counts
     /// only, no addresses. The never-reset twin feeds the OTel metric.
+    /// `inbound_stream_complete_charge_past_age` is neither a refusal nor an
+    /// eviction: complete streams a consumer still held past their age limit.
     pub inbound_stream_refused_invalid_length: u32,
     pub inbound_stream_refused_connection_bytes: u32,
     pub inbound_stream_refused_connection_streams: u32,
@@ -3827,6 +3831,8 @@ struct SnapshotExtras {
     /// Inbound streams refused or evicted during the period, by reason
     /// (see [`InboundStreamOutcome`]; the field suffix is its label). Counts
     /// only, no addresses. The never-reset twin feeds the OTel metric.
+    /// `inbound_stream_complete_charge_past_age` is neither a refusal nor an
+    /// eviction: complete streams a consumer still held past their age limit.
     pub inbound_stream_refused_invalid_length: u32,
     pub inbound_stream_refused_connection_bytes: u32,
     pub inbound_stream_refused_connection_streams: u32,

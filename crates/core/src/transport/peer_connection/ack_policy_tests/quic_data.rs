@@ -296,7 +296,7 @@ fn fill_budget(rig: &Rig) -> Vec<Arc<LegacyStreamToken>> {
     tokens
 }
 
-/// Plan case (b), and a Short on a full budget. With QUIC holding the room a Short
+/// Plan case (b), and a Short over one packet on a full budget (a smaller one is not charged). With QUIC holding the room a Short
 /// and a UDP stream are refused and counted, the UDP id stays refused, and the
 /// connection stays up. With the room back a Short is delivered.
 #[test]
@@ -313,7 +313,7 @@ fn a_budget_full_of_quic_charges_refuses_and_keeps_the_connection() {
             let _outcome = rig
                 .path
                 .peer()
-                .send_short_bounded(&rig.path.time, SEND_LIMIT, b"refused")
+                .send_short_bounded(&rig.path.time, SEND_LIMIT, &bytes_of(2000))
                 .await;
             rig.path.settle(Duration::from_secs(1)).await;
             assert_eq!(
@@ -466,8 +466,10 @@ fn a_stream_id_used_on_the_path_is_refused_on_udp_and_on_the_path_again() {
     );
 }
 
-/// `recv` is cancelled on every outbound message. A cancelled one loses nothing and
-/// repeats nothing.
+/// `recv` is dropped while it waits, then polled again once something has
+/// arrived. A cancelled one loses nothing and repeats nothing: Shorts and a
+/// Stream's metadata all come out, once each. The test counts the polls that
+/// were abandoned and requires some, so it cannot pass without a cancellation.
 #[test]
 fn a_cancelled_recv_loses_nothing() {
     run(
@@ -476,28 +478,67 @@ fn a_cancelled_recv_loses_nothing() {
         QuicPathLimits::DEFAULT,
         |mut rig| async move {
             const COUNT: usize = 40;
-            for i in 0..COUNT {
-                rig.path.send_short(format!("message {i}").as_bytes()).await;
-            }
+            let mut cancelled = 0usize;
             let mut got = Vec::new();
-            for _ in 0..100_000 {
-                // Cancelled after one poll, or it returned.
+            let mut want = Vec::new();
+            for i in 0..COUNT {
+                // Nothing has been sent: `recv` is polled, then dropped.
                 tokio::select! {
                     biased;
-                    message = rig.e.conn.recv() => got.push(message.unwrap()),
-                    () = tokio::task::yield_now() => {}
+                    message = rig.e.conn.recv() => panic!("unexpected message {message:?}"),
+                    () = tokio::task::yield_now() => cancelled += 1,
                 }
-                if got.len() == COUNT {
-                    break;
+                if i % 10 == 9 {
+                    let id = StreamId::next();
+                    let meta = format!("stream {i}").into_bytes();
+                    rig.path
+                        .send_stream(id, Some(meta.as_slice()), bytes_of(50))
+                        .await;
+                    want.push(meta);
+                } else {
+                    let message = format!("message {i}").into_bytes();
+                    rig.path.send_short(&message).await;
+                    want.push(message);
+                }
+                // The send is acknowledged before the reader task has delivered
+                // it, so `recv` waits and is dropped again before it returns.
+                for _ in 0..100_000 {
+                    tokio::select! {
+                        biased;
+                        message = rig.e.conn.recv() => {
+                            got.push(message.unwrap());
+                            break;
+                        }
+                        () = tokio::task::yield_now() => cancelled += 1,
+                    }
                 }
             }
+            assert!(cancelled > 0, "no recv was ever cancelled");
             got.sort();
-            let mut want: Vec<_> = (0..COUNT)
-                .map(|i| format!("message {i}").into_bytes())
-                .collect();
             want.sort();
             assert_eq!(got, want);
             assert!(rig.recv_soon().await.is_none());
+        },
+    );
+}
+
+/// A Stream that arrives on a connection with no registry is cancelled and its
+/// charge released, as every other cancel branch releases it.
+#[test]
+fn a_stream_with_no_registry_is_cancelled_and_its_charge_released() {
+    run(
+        "quic-data-noregistry",
+        51,
+        QuicPathLimits::DEFAULT,
+        |mut rig| async move {
+            rig.e.conn.inbound_stream_registry = None;
+            rig.path
+                .send_stream(StreamId::next(), Some(b"meta"), bytes_of(50))
+                .await;
+            rig.path.settle(Duration::from_millis(100)).await;
+            assert!(rig.recv_soon().await.is_none());
+            assert_eq!(rig.budget(), (0, 0), "the charge was released");
+            assert_eq!(rig.registry.orphan_count(), 0);
         },
     );
 }
@@ -559,7 +600,8 @@ fn a_connection_drop_leaves_no_charge_and_no_registry_row() {
 
 /// The session ends before the walk over what is live, so the connection is closed
 /// first and a helper holding the path ends with it (plan 4.3). On one thread nothing
-/// can run between the two, so only the source can show the order.
+/// can run between the two, so no behaviour can see the order: this test is
+/// textual, a pin on the source and not a test of what happens.
 #[test]
 fn a_connection_drop_ends_the_session_before_it_walks_the_streams() {
     let source = include_str!("../../peer_connection.rs");
@@ -572,6 +614,27 @@ fn a_connection_drop_ends_the_session_before_it_walks_the_streams() {
         .expect("the session ends");
     let walk = body.find("live_buffer_streams()").expect("the walk");
     assert!(end < walk);
+}
+
+/// `recv`'s two QUIC data arms are guarded by whether the connection has the
+/// channel. The macro-level test uses literal `false` guards, so only the source
+/// shows that `recv` passes these two: without them a connection with no path
+/// would poll a channel that does not exist. A textual pin.
+#[test]
+fn recvs_data_arms_are_guarded_by_the_channels_they_read() {
+    let source = include_str!("../../peer_connection.rs");
+    let body =
+        inbound_budget::pin::fn_body(source, "pub async fn recv(&mut self) -> Result<Vec<u8>> {");
+    for arm in [
+        "next_on(&mut self.quic_shorts), if self.quic_shorts.is_some() =>",
+        "next_on(&mut self.quic_streams), if self.quic_streams.is_some() =>",
+    ] {
+        assert!(
+            body.lines()
+                .any(|line| !line.trim_start().starts_with("//") && line.contains(arm)),
+            "recv lost the guard `{arm}`"
+        );
+    }
 }
 
 /// A complete stream held past its age limit is counted from the connection's

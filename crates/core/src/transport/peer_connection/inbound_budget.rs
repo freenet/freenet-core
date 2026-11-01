@@ -520,6 +520,12 @@ impl InboundStreamBudget {
     /// age limit. Nothing evicts a complete stream, since only its consumers hold
     /// it, so this is what shows a consumer that never lets go. Each is counted
     /// once.
+    ///
+    /// `now_nanos` and `admitted_nanos` are on the same clock only if every
+    /// charger uses one. In production they do (the connection's clock,
+    /// shared by both paths). In simulation the QUIC path charges on the
+    /// virtual clock while a UDP sweep may pass another, so a count there
+    /// compares two clocks.
     pub(super) fn take_complete_past_age(&mut self, now_nanos: u64) -> usize {
         let mut held = 0;
         for charge in self.streams.values_mut() {

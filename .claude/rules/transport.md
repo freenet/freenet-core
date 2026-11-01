@@ -1347,7 +1347,8 @@ every rate), endpoint-down, panics and breaker trips, RSS against
 Simulation scenarios (`tests/simulation_integration.rs`, `test_quic_*`): two
 nodes established with traffic on UDP; data bits on each side, where only both
 enable data and nothing is sent; data at a test percentage with messages sent on
-the path, which come out of `recv` and decode as real messages; QUIC-off peers decline `Disabled`; peers
+the path, which come out of `recv` and decode as real messages (Shorts only; a Stream
+end to end is for e5b-5/6); QUIC-off peers decline `Disabled`; peers
 below the version floor are never offered; blackholed and idle paths fall back
 and are re-offered; a wrong key closes with IDENTITY_MISMATCH; endpoint-down
 closes every path; an Initial the peer did not send is retried and the real dial
@@ -1626,7 +1627,8 @@ One budget per peer (QUIC memory gate M3): QuicPath::with_budget charges
     too: the UDP sweep does not evict QUIC streams. An incomplete stream ends
     at the path's own timers. A complete one held by a stuck consumer also
     blocks on UDP. inbound_stream_complete_charge_past_age counts those, either
-    path, once per stream.
+    path, once per stream. It is not a refusal, an eviction or a limit being hit:
+    it counts consumers slow to take what they were given.
   → A gone UDP charge holds room against QUIC until UDP's next 5 s
     timeout_check sweep (or UDP's own admission under pressure), so QUIC
     can see BUDGET_REFUSED for up to about 5 s on room that is free.
@@ -1706,7 +1708,16 @@ QUIC receive flow (#5940 e5b-4):
   ended while it waited in the channel) is dropped with its charge. Otherwise it goes
   to the InboundStreamRegistry and its embedded metadata through
   is_duplicate_dispatch. The handle is not in streaming_handles: the reader task
-  pushes fragments and evicts by its own timer.
+  pushes fragments and evicts by its own timer. The id is put in
+  completed_inbound_streams at arrival, not at completion: that LRU holds
+  COMPLETED_STREAM_MEMORY (MAX_INBOUND_STREAMS_PER_CONNECTION) ids, so an id is
+  forgotten after that many newer ones, and an eviction means a late UDP fragment
+  or a reused QUIC id with that id is taken for a new stream instead of refused.
+  Full channels: a Short or Stream whose channel is full waits in its own reader
+  future (reserve, raced with the stream's age limit) and is stopped EVICTED past
+  it; Control is still dropped and counted. A Short of one packet or less
+  (fits_one_packet) is not charged, as on UDP. A Stream arm with no registry
+  cancels the handle and releases its charge.
   When a stream's charge goes:
   → Reader ends with no consumer holding the buffer: at once (StreamGuard).
   → Cancelled and registered, unclaimed: the orphan GC drops a cancelled row within
@@ -1718,7 +1729,13 @@ QUIC receive flow (#5940 e5b-4):
     unclaimed stream of both paths. Nothing needs the room after that.
   A UDP session's timers keep running: nothing here writes last_received_nanos or
   last_inbound_nanos. sample_inbound_concurrency does not run on these arms.
-  record_inbound_completed does.
+  record_inbound_completed does: a Short counts its payload at the arm, a Stream
+  counts its declared length at arrival (UDP counts at completion, so a QUIC stream
+  that later fails is counted too).
+  take_complete_past_age compares the sweep's clock with each charge's admission
+  clock. Production shares one (the connection's) across both paths; in
+  simulation the QUIC path charges on the virtual clock and a UDP sweep may pass
+  another, so there the comparison is across two clocks.
 ```
 
 #### QUIC errors, close codes and liveness (`quic/error.rs`, `quic/liveness.rs`, #5940 step e4)

@@ -190,7 +190,8 @@ fn assert_stopped(result: Result<(), QuicSendError>, code: u32) {
 /// send as a transport stream) arrive intact and in full, and the same
 /// message sent twice arrives twice: dedup is not this layer's (e5 does it
 /// in `PeerConnection`, where both transports meet). Short messages are
-/// charged to the budget until their payload is taken.
+/// charged to the budget until their payload is taken, except those of one
+/// packet or less, as on UDP.
 #[test]
 fn short_messages_round_trip_and_are_not_deduplicated() {
     bounded(|| async move {
@@ -211,7 +212,11 @@ fn short_messages_round_trip_and_are_not_deduplicated() {
             received.push(message);
         }
         assert_eq!(received.len(), 4);
-        assert_eq!(p.b.charged().0, 4, "queued messages hold their charge");
+        assert_eq!(
+            p.b.charged().0,
+            1,
+            "only the 200 KiB message is charged; the others fit one packet"
+        );
         let received: Vec<Vec<u8>> = received
             .into_iter()
             .map(|m| m.into_payload().to_vec())
@@ -643,7 +648,7 @@ fn a_sender_that_gives_up_resets_the_stream() {
                     )
                     .await;
                 // Let the resets reach the receiver.
-                a.send_short(b"after").await.expect("still connected");
+                a.send_short(&payload(2000)).await.expect("still connected");
                 (short, long, failed)
             })
             .await;
@@ -801,12 +806,13 @@ fn an_uncharged_stream_is_evicted_at_its_age_limit() {
     })
 }
 
-/// A full channel never makes the receiver wait: a short message or control
-/// frame is dropped and counted, a stream is stopped with `CHANNEL_FULL`
-/// and its charge released. A second stream with an id the path already
-/// holds is stopped with `STREAM_ID_IN_USE`.
+/// A full control channel drops and counts the frame (nothing is waiting on a
+/// control frame). A full short or stream channel makes only that message's
+/// reader wait, holding the stream's credit: nothing is lost, and the message
+/// arrives once the consumer takes one. A second stream with an id the path
+/// already holds is stopped with `STREAM_ID_IN_USE`.
 #[test]
-fn full_channels_and_reused_ids_are_refused_without_waiting() {
+fn full_channels_hold_data_and_drop_control_and_reused_ids_are_refused() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
         let limits = QuicPathLimits {
@@ -818,7 +824,7 @@ fn full_channels_and_reused_ids_are_refused_without_waiting() {
         let mut p = paths("quic-path-full", 9, limits).await;
         let a = p.a.clone();
         let held = StreamId::next();
-        let (reused, overflow) = p
+        let reused = p
             .drive(async move {
                 a.send_short(b"one").await.unwrap();
                 a.send_short(b"two").await.unwrap();
@@ -827,22 +833,102 @@ fn full_channels_and_reused_ids_are_refused_without_waiting() {
                 a.send_stream(held, None, Bytes::from_static(b"held"))
                     .await
                     .unwrap();
-                let reused = a.send_stream(held, None, over_window()).await;
-                let overflow = a.send_stream(StreamId::next(), None, over_window()).await;
-                (reused, overflow)
+                a.send_stream(held, None, over_window()).await
             })
             .await;
         assert_stopped(reused, stop_code::STREAM_ID_IN_USE);
-        assert_stopped(overflow, stop_code::CHANNEL_FULL);
+        // A stream announced behind a full channel is not stopped: its sender
+        // is blocked on flow control until the consumer takes the first.
+        let a = p.a.clone();
+        let second_id = StreamId::next();
+        let second =
+            tokio::spawn(async move { a.send_stream(second_id, None, over_window()).await });
+        let time = p.time();
+        p.drive(async move { time.sleep(Duration::from_secs(1)).await })
+            .await;
+        assert!(!second.is_finished(), "the second stream waits for room");
         let stats = p.b.stats();
-        assert_eq!(stats.count(QuicInboundOutcome::ShortDroppedFull), 1);
+        assert_eq!(stats.count(QuicInboundOutcome::ShortDroppedFull), 0);
+        assert_eq!(stats.count(QuicInboundOutcome::StreamDroppedFull), 0);
         assert_eq!(stats.count(QuicInboundOutcome::ControlDroppedFull), 1);
         assert_eq!(stats.count(QuicInboundOutcome::StreamIdInUse), 1);
-        assert_eq!(stats.count(QuicInboundOutcome::StreamDroppedFull), 1);
         assert_eq!(&p.b_in.shorts.try_recv().unwrap().payload()[..], b"one");
         assert_eq!(&p.b_in.controls.try_recv().unwrap()[..], b"one");
         assert_eq!(p.b_in.streams.try_recv().unwrap().stream_id, held);
-        assert_eq!(p.b.charged(), (0, 0));
+        let time = p.time();
+        let second = p
+            .drive(async move {
+                let sent = second.await.unwrap();
+                time.sleep(Duration::from_secs(1)).await;
+                sent
+            })
+            .await;
+        second.expect("sent once there was room");
+        assert_eq!(&p.b_in.shorts.try_recv().unwrap().payload()[..], b"two");
+        assert_eq!(p.b_in.streams.try_recv().unwrap().stream_id, second_id);
+        assert_eq!(stats.count(QuicInboundOutcome::ShortDroppedFull), 0);
+        assert_eq!(stats.count(QuicInboundOutcome::StreamDroppedFull), 0);
+    })
+}
+
+/// A message held for room in a full channel is stopped at its age limit, so
+/// the wait is bounded and the charge is released.
+#[test]
+fn a_message_waiting_for_room_is_evicted_at_its_age_limit() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let limits = QuicPathLimits {
+            short_capacity: 1,
+            ..QuicPathLimits::DEFAULT
+        };
+        let mut p = paths("quic-path-full-age", 70, limits).await;
+        let a = p.a.clone();
+        p.drive(async move {
+            a.send_short(b"one").await.unwrap();
+            a.send_short(b"two").await.unwrap();
+        })
+        .await;
+        let time = p.time();
+        let age = max_inbound_stream_age(0);
+        p.drive(async move { time.sleep(age + Duration::from_secs(1)).await })
+            .await;
+        assert_eq!(&p.b_in.shorts.try_recv().unwrap().payload()[..], b"one");
+        let time = p.time();
+        p.drive(async move { time.sleep(Duration::from_secs(1)).await })
+            .await;
+        assert!(p.b_in.shorts.try_recv().is_err(), "the second was evicted");
+        assert_eq!(p.b.stats().count(QuicInboundOutcome::ShortDroppedFull), 0);
+    })
+}
+
+/// A full budget still delivers a short message of one packet or less: it is
+/// not charged, so no refusal can race its acknowledgement.
+#[test]
+fn a_full_budget_still_delivers_a_one_packet_short() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let limits = QuicPathLimits {
+            max_streams: 1,
+            max_bytes: ChargeOverhead::DEFAULT.cost(10_000),
+            ..QuicPathLimits::DEFAULT
+        };
+        let mut p = paths("quic-path-full-budget", 71, limits).await;
+        let a = p.a.clone();
+        p.drive(async move {
+            a.send_stream(StreamId::next(), None, Bytes::from_static(b"held"))
+                .await
+                .expect("fits");
+            a.send_short(b"small").await.expect("sent");
+        })
+        .await;
+        assert_eq!(p.b.charged().0, 1, "the held stream fills the budget");
+        assert_eq!(&p.b_in.shorts.try_recv().unwrap().payload()[..], b"small");
+        let stats = p.b.stats();
+        assert_eq!(stats.count(QuicInboundOutcome::DeliveredShort), 1);
+        assert_eq!(
+            stats.shared_count(InboundStreamOutcome::RefusedConnectionStreams),
+            0
+        );
     })
 }
 
@@ -903,14 +989,14 @@ fn the_stream_limit_is_back_pressure() {
     })
 }
 
-/// A receiver that never drains its channel loses what does not fit and
-/// counts it, while every send reports success: the bytes were acknowledged
-/// (a successful send is not a delivery).
+/// A flood into a full channel loses nothing: the readers that find it full
+/// wait, and every message arrives as the consumer drains. Sends read as
+/// success once acknowledged, which they now are for what is delivered later.
 #[test]
-fn a_flood_into_an_undrained_receiver_is_dropped_and_counted() {
+fn a_flood_into_a_slow_receiver_is_held_and_all_delivered() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let p = paths("quic-path-flood", 12, QuicPathLimits::DEFAULT).await;
+        let mut p = paths("quic-path-flood", 12, QuicPathLimits::DEFAULT).await;
         let count = SHORT_CHANNEL_CAPACITY + 44;
         let a = p.a.clone();
         let results = p
@@ -922,16 +1008,27 @@ fn a_flood_into_an_undrained_receiver_is_dropped_and_counted() {
                 .await
             })
             .await;
-        assert!(
-            results.iter().all(Result::is_ok),
-            "every send reads as success"
-        );
+        assert!(results.iter().all(Result::is_ok), "every send is acked");
+        let mut got = std::collections::BTreeSet::new();
+        for _ in 0..100 {
+            while let Ok(message) = p.b_in.shorts.try_recv() {
+                let bytes: [u8; 4] = message.payload()[..].try_into().unwrap();
+                got.insert(u32::from_be_bytes(bytes));
+            }
+            if got.len() == count {
+                break;
+            }
+            let time = p.time();
+            p.drive(async move { time.sleep(Duration::from_millis(10)).await })
+                .await;
+        }
+        assert_eq!(got.len(), count, "every message arrived");
         let stats = p.b.stats();
         assert_eq!(
             stats.count(QuicInboundOutcome::DeliveredShort) as usize,
-            SHORT_CHANNEL_CAPACITY
+            count
         );
-        assert_eq!(stats.count(QuicInboundOutcome::ShortDroppedFull), 44);
+        assert_eq!(stats.count(QuicInboundOutcome::ShortDroppedFull), 0);
     })
 }
 
@@ -998,7 +1095,7 @@ fn a_stream_id_is_free_again_once_its_state_is_gone() {
         })
         .await;
         let a = p.a.clone();
-        p.drive(async move { a.send_short(b"sync").await.unwrap() })
+        p.drive(async move { a.send_short(&payload(2000)).await.unwrap() })
             .await;
         assert!(p.b_in.streams.try_recv().is_err(), "neither was announced");
         assert_eq!(p.b.stats().count(QuicInboundOutcome::Truncated), 2);
@@ -1258,7 +1355,7 @@ fn a_locally_cancelled_stream_is_stopped() {
                 let mut bytes = header(1, 1, id, total as u64, 0);
                 bytes.extend_from_slice(&payload(10));
                 send.write_all(&bytes).await.unwrap();
-                a.send_short(b"sync").await.unwrap();
+                a.send_short(&payload(2000)).await.unwrap();
                 send
             })
             .await;
@@ -1334,7 +1431,7 @@ fn dropping_the_path_cancels_streams_in_progress() {
             .await;
         // Let the header and metadata reach the receiver.
         let a = p.a.clone();
-        p.drive(async move { a.send_short(b"sync").await.unwrap() })
+        p.drive(async move { a.send_short(&payload(2000)).await.unwrap() })
             .await;
         let arrival = p.b_in.streams.try_recv().expect("announced");
         assert!(!arrival.handle.is_cancelled());
@@ -1482,7 +1579,7 @@ fn quic_keys_never_collide_with_udp_ids() {
             a.send_stream(id, None, Bytes::from_static(b"same id"))
                 .await
                 .expect("admitted beside the UDP charge");
-            a.send_short(b"short").await.expect("short");
+            a.send_short(&payload(2000)).await.expect("short");
         })
         .await;
         let arrival = p.b_in.streams.try_recv().expect("announced");
@@ -1546,7 +1643,7 @@ fn a_quic_guard_releases_only_its_own_charge() {
         let conn = p.a_raw();
         p.drive(raw_stream(conn, cut)).await;
         let a = p.a.clone();
-        p.drive(async move { a.send_short(b"sync").await.unwrap() })
+        p.drive(async move { a.send_short(&payload(2000)).await.unwrap() })
             .await;
         assert!(p.b_in.streams.try_recv().is_err(), "not announced");
         assert_eq!(p.b.stats().count(QuicInboundOutcome::Truncated), 1);

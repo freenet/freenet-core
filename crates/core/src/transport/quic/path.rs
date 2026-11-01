@@ -89,9 +89,14 @@
 //!   [`QuicDataInbox::streams`];
 //! - `Control` → the path's control channel, bounded.
 //!
-//! The task only ever uses `try_send`: a full channel drops the message and
-//! counts it (`QuicInboundOutcome`), it never waits, so a slow consumer
-//! cannot stall the other streams of the connection.
+//! A Short or Stream whose channel is full waits for room in its own reader
+//! future (`reserve`, raced with the stream's age limit), not in the task: the
+//! other readers and the accept loop carry on, and the waiting reader keeps
+//! its `RecvStream`, which withholds stream credit, so a slow consumer slows
+//! the sender (`MAX_UNI_STREAMS`) instead of losing messages the sender has
+//! seen acknowledged. Past the age limit the stream is stopped
+//! (`stop_code::EVICTED`). A Control frame still uses `try_send` and is
+//! dropped and counted (`QuicInboundOutcome`) when its channel is full.
 //!
 //! Not done here, on purpose:
 //! - Dedup. The same message sent twice (once on UDP, once on QUIC after a

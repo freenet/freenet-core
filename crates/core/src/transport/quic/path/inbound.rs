@@ -101,15 +101,19 @@ use crate::transport::peer_connection::inbound_budget::{
 };
 use crate::transport::peer_connection::streaming::{StreamError, StreamHandle};
 use crate::transport::peer_connection::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
-use crate::transport::peer_connection::{inbound_stream_age_limit, streaming_handle_idle_timeout};
+use crate::transport::peer_connection::{
+    fits_one_packet, inbound_stream_age_limit, streaming_handle_idle_timeout,
+};
 
 /// A short message from the peer. It holds its inbound budget charge until
 /// its payload is taken.
 pub(crate) struct InboundShort {
     payload: Bytes,
     /// What the charge is held under, so the consumer can release it at once.
-    key: InboundKey,
-    _charge: Arc<LegacyStreamToken>,
+    /// `None` for a message of one packet or less, which is not charged (as
+    /// on UDP).
+    key: Option<InboundKey>,
+    _charge: Option<Arc<LegacyStreamToken>>,
 }
 
 impl std::fmt::Debug for InboundShort {
@@ -132,10 +136,10 @@ impl InboundShort {
         self.payload
     }
 
-    /// The payload and the key of its charge, whose state is then gone: release
-    /// it with `release_if_gone`. Otherwise it holds room until something needs
+    /// The payload and the key of its charge, if it holds one; the state is
+    /// then gone: release it with `release_if_gone`. Otherwise it holds room until something needs
     /// room or the UDP sweep runs.
-    pub(in crate::transport) fn into_parts(self) -> (Bytes, InboundKey) {
+    pub(in crate::transport) fn into_parts(self) -> (Bytes, Option<InboundKey>) {
         (self.payload, self.key)
     }
 }
@@ -198,8 +202,9 @@ impl<T: TimeSource> Receiver<T> {
 
 /// Accept every uni stream of `connection` and read them all concurrently
 /// in this one task, until the connection ends; then let the readers see the
-/// loss and end. Reading never waits on a consumer (only `try_send`), so one
-/// stream cannot hold up another.
+/// loss and end. A reader may wait for room in a full channel, but only that
+/// reader: the readers are separate futures, so one stream cannot hold up
+/// another.
 pub(in crate::transport::quic) async fn receive<T: TimeSource>(
     connection: quinn::Connection,
     receiver: Arc<Receiver<T>>,
@@ -355,6 +360,23 @@ impl<T: TimeSource> BodyReader<T> {
                     self.timer = self.time.sleep_until(self.timer_at);
                 }
             }
+        }
+    }
+
+    /// Wait for `ready`, but not past the age deadline: `Err(Age)` if that
+    /// comes first. Idleness does not apply: the peer has sent everything and
+    /// the wait is on a consumer. Holding the reader (and so the
+    /// `RecvStream`) while waiting withholds the stream's credit, which is
+    /// the back-pressure on the sender. Arms one new sleep, so call it only
+    /// when `ready` is not already available.
+    async fn until_age<F: Future>(&mut self, ready: F) -> Result<F::Output, ReadFailure> {
+        if self.timer_at != self.age_deadline {
+            self.timer_at = self.age_deadline;
+            self.timer = self.time.sleep_until(self.timer_at);
+        }
+        tokio::select! {
+            out = ready => Ok(out),
+            () = &mut self.timer => Err(ReadFailure::Age),
         }
     }
 
@@ -690,36 +712,45 @@ impl<T: TimeSource> Receiver<T> {
 
     async fn read_short(&self, mut reader: BodyReader<T>, header: FrameHeader) {
         let total = header.total_len();
-        let token = LegacyStreamToken::new();
-        let key = {
-            let mut budget = self.budget.lock();
-            if let Err(rejection) = budget.check(total, Releaser::Quic) {
-                drop(budget);
-                self.refuse(&mut reader, rejection, total);
-                return;
-            }
-            let key = self.short_key(&budget);
-            budget.charge(
+        // A message of one packet or less is not charged, as on UDP: the
+        // sender may see it acknowledged before any refusal arrives, so a
+        // refusal could lose it with the sender reading `Sent`. Its cost is
+        // bounded by the stream limit and the channel's capacity.
+        let charged = !fits_one_packet(total);
+        let mut guard = None;
+        if charged {
+            let token = LegacyStreamToken::new();
+            let key = {
+                let mut budget = self.budget.lock();
+                if let Err(rejection) = budget.check(total, Releaser::Quic) {
+                    drop(budget);
+                    self.refuse(&mut reader, rejection, total);
+                    return;
+                }
+                let key = self.short_key(&budget);
+                budget.charge(
+                    key,
+                    total,
+                    self.time.now_nanos(),
+                    inbound_stream_age_limit(total),
+                    Liveness::Task(Arc::downgrade(&token)),
+                );
+                key
+            };
+            // The guard holds the reader's only reference to the token.
+            guard = Some(StreamGuard {
+                budget: self.budget.clone(),
                 key,
-                total,
-                self.time.now_nanos(),
-                inbound_stream_age_limit(total),
-                Liveness::Task(Arc::downgrade(&token)),
-            );
-            key
-        };
-        // The guard holds the reader's only reference to the token.
-        let mut guard = StreamGuard {
-            budget: self.budget.clone(),
-            key,
-            handle: None,
-            token: Some(token),
-            complete: false,
-        };
-        reader.set_age_limit(inbound_stream_age_limit(total));
+                handle: None,
+                token: Some(token),
+                complete: false,
+            });
+            reader.set_age_limit(inbound_stream_age_limit(total));
+        }
+        let was_charged = if charged { Charged::Yes } else { Charged::No };
         // One buffer of the charged length (see `read_exact`).
         let read = {
-            let token = guard.token.as_ref();
+            let token = guard.as_ref().and_then(|guard| guard.token.as_ref());
             reader
                 .read_exact_with(clamp(total), |held| {
                     if let Some(token) = token {
@@ -731,31 +762,58 @@ impl<T: TimeSource> Receiver<T> {
         let payload = match read {
             Ok(payload) => payload,
             Err(failure) => {
-                self.fail(&mut reader, failure, Charged::Yes);
+                self.fail(&mut reader, failure, was_charged);
                 return;
             }
         };
         if let Err(failure) = reader.expect_end().await {
-            self.fail(&mut reader, failure, Charged::Yes);
+            self.fail(&mut reader, failure, was_charged);
             return;
         }
-        let Some(token) = guard.token.clone() else {
-            return;
+        // Wait for room in the channel rather than drop the message: the sender
+        // has had every byte acknowledged, so a drop here would read as `Sent`.
+        // Only this reader waits (each reader is its own future), holding the
+        // stream's credit, so a slow consumer slows the sender and not the
+        // other streams. Past the age limit the stream is stopped, which the
+        // sender can count.
+        let permit = match self.shorts.try_reserve() {
+            Ok(permit) => permit,
+            Err(mpsc::error::TrySendError::Full(())) => {
+                match reader.until_age(self.shorts.reserve()).await {
+                    Ok(Ok(permit)) => permit,
+                    // The consumer is gone: the connection is ending.
+                    Ok(Err(_)) => {
+                        self.stats.record(QuicInboundOutcome::ShortDroppedFull);
+                        return;
+                    }
+                    Err(failure) => {
+                        self.fail(&mut reader, failure, was_charged);
+                        return;
+                    }
+                }
+            }
+            Err(mpsc::error::TrySendError::Closed(())) => {
+                self.stats.record(QuicInboundOutcome::ShortDroppedFull);
+                return;
+            }
         };
-        token.mark_complete();
-        guard.complete = true;
-        let message = InboundShort {
+        let (key, charge) = match guard.as_mut() {
+            Some(guard) => {
+                let Some(token) = guard.token.clone() else {
+                    return;
+                };
+                token.mark_complete();
+                guard.complete = true;
+                (Some(guard.key), Some(token))
+            }
+            None => (None, None),
+        };
+        permit.send(InboundShort {
             payload,
             key,
-            _charge: token,
-        };
-        match self.shorts.try_send(message) {
-            Ok(()) => self.stats.record(QuicInboundOutcome::DeliveredShort),
-            Err(_) => {
-                self.stats.record(QuicInboundOutcome::ShortDroppedFull);
-                tracing::debug!(total, "QUIC path: short message channel full; dropping");
-            }
-        }
+            _charge: charge,
+        });
+        self.stats.record(QuicInboundOutcome::DeliveredShort);
     }
 
     async fn read_stream(&self, mut reader: BodyReader<T>, header: FrameHeader) {
@@ -816,11 +874,32 @@ impl<T: TimeSource> Receiver<T> {
             metadata,
             handle: guard.handle().clone(),
         };
-        if self.streams.try_send(arrival).is_err() {
-            self.stats.record(QuicInboundOutcome::StreamDroppedFull);
-            reader.stop(stop_code::CHANNEL_FULL);
-            return;
-        }
+        // Wait for room rather than refuse: a small stream can be fully
+        // acknowledged before this point, and a refusal would then read as
+        // `Sent` at the sender. Only this reader waits (see `read_short`).
+        let permit = match self.streams.try_reserve() {
+            Ok(permit) => permit,
+            Err(mpsc::error::TrySendError::Full(())) => {
+                match reader.until_age(self.streams.reserve()).await {
+                    Ok(Ok(permit)) => permit,
+                    Ok(Err(_)) => {
+                        self.stats.record(QuicInboundOutcome::StreamDroppedFull);
+                        reader.stop(stop_code::CHANNEL_FULL);
+                        return;
+                    }
+                    Err(failure) => {
+                        self.fail(&mut reader, failure, Charged::Yes);
+                        return;
+                    }
+                }
+            }
+            Err(mpsc::error::TrySendError::Closed(())) => {
+                self.stats.record(QuicInboundOutcome::StreamDroppedFull);
+                reader.stop(stop_code::CHANNEL_FULL);
+                return;
+            }
+        };
+        permit.send(arrival);
         self.stats.record(QuicInboundOutcome::AnnouncedStream);
 
         let mut rechunker = Rechunker::new(total);

@@ -20893,7 +20893,9 @@ fn test_quic_data_needs_both_bits_and_carries_nothing_yet() {
 /// Data on a test percentage, end to end: both nodes negotiate it and send their
 /// messages as Shorts on the path, and those messages come out of `recv` and decode
 /// as real network messages. No node code sends on a path yet, so the run asks for
-/// it (`send_shorts_on_paths`).
+/// it (`send_shorts_on_paths`). Only Shorts are covered here: a Stream through
+/// `recv` is tested at the connection (`ack_policy_tests/quic_data.rs`) and goes
+/// end to end in e5b-5/6.
 #[test_log::test]
 fn test_quic_data_delivers_a_real_message_through_recv() {
     let run = run_quic_shadow_sim(
