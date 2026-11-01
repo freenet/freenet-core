@@ -516,6 +516,20 @@ mod tests {
         const { assert!(!QUIC_DATA_RECEIVER_READY, "flip with the receive side") };
         assert!(!data_bit_allowed(false));
         assert!(data_bit_allowed(true));
+        // Tests build with the testing cfg, so only the source can show that
+        // `own_caps` consults the gate before anything else.
+        let source = include_str!("policy.rs");
+        let body = source
+            .split("fn own_caps(")
+            .nth(1)
+            .expect("own_caps exists");
+        let gate = body
+            .find("if !data_bit_allowed(cfg!(any(test, feature = \"testing\")))")
+            .expect("own_caps consults the gate");
+        let mode = body
+            .find("match self.mode")
+            .expect("own_caps reads the mode");
+        assert!(gate < mode, "the gate comes first");
     }
 
     /// Permits stop at the limit, a dropped permit frees its slot, and the
