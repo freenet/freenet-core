@@ -159,6 +159,13 @@ impl TimeSource for PathClock {
         }
     }
 
+    fn sleep_cancelable(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        match self {
+            Self::Real(time) => time.sleep_cancelable(duration),
+            Self::Virtual(time) => time.sleep_cancelable(duration),
+        }
+    }
+
     fn timeout<F, T>(
         &self,
         duration: Duration,
