@@ -42,6 +42,8 @@ struct TraceData {
     connections: Mutex<BTreeMap<SocketAddr, usize>>,
     /// Nodes that receive an extra Initial each time they allow a peer.
     initial_on_attempt: Mutex<BTreeSet<SocketAddr>>,
+    /// Nodes that send each short message on a path that may carry data.
+    shorts_on_paths: Mutex<BTreeSet<SocketAddr>>,
     /// The version a peer reports, and the release it then reads as.
     release: Mutex<Option<(Version, Version)>>,
 }
@@ -113,6 +115,14 @@ impl QuicUpgradeTrace {
     /// so the Initial gets there before anything the peer sends.
     pub fn send_initial_on_each_attempt(&self, node: SocketAddr) {
         self.data.initial_on_attempt.lock().insert(node);
+    }
+
+    /// `node` sends each message that fits a packet as a Short on the connection's
+    /// path, when that path may carry data. Nothing else calls a path's data sends
+    /// yet, so this is how a simulation gets real messages onto one. If the send
+    /// fails the message is lost, since there is no fallback to UDP here.
+    pub fn send_shorts_on_paths(&self, node: SocketAddr) {
+        self.data.shorts_on_paths.lock().insert(node);
     }
 
     /// A peer that reports `real` is treated as running `release` when the machine
@@ -202,6 +212,10 @@ impl NodeTrace {
         if crate::transport::in_memory_socket::deliver_packet_at(self.addr, datagram, source) {
             self.record(source, 0, "injected an Initial".to_string());
         }
+    }
+
+    pub(crate) fn sends_shorts_on_paths(&self) -> bool {
+        self.trace.data.shorts_on_paths.lock().contains(&self.addr)
     }
 
     pub(crate) fn wrong_record(&self) -> bool {

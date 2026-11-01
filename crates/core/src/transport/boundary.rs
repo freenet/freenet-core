@@ -427,16 +427,14 @@ impl futures::Stream for IncomingChunks {
 /// [`IncomingStream`]s that are the same stream (clones or forks) both match
 /// its identity; any other stream does not.
 ///
-/// The representation is private: today it is a weak reference to the UDP
-/// transport's reassembly buffer.
+/// The representation is private: today it is a weak reference to the
+/// reassembly buffer, which both paths fill.
 #[derive(Clone, Debug)]
 pub struct StreamIdentity(std::sync::Weak<LockFreeStreamBuffer>);
 
 impl StreamIdentity {
-    /// The identity of the UDP stream reassembled into `buffer`.
-    pub(in crate::transport) fn from_udp_buffer(
-        buffer: std::sync::Weak<LockFreeStreamBuffer>,
-    ) -> Self {
+    /// The identity of the stream reassembled into `buffer`.
+    pub(in crate::transport) fn from_buffer(buffer: std::sync::Weak<LockFreeStreamBuffer>) -> Self {
         Self(buffer)
     }
 }

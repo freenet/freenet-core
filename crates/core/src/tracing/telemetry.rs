@@ -3155,6 +3155,14 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 serde_json::json!(snapshot.inbound_stream_evicted_age),
             );
             m.insert(
+                "inbound_stream_stream_id_on_both_paths".into(),
+                serde_json::json!(snapshot.inbound_stream_stream_id_on_both_paths),
+            );
+            m.insert(
+                "inbound_stream_complete_charge_past_age".into(),
+                serde_json::json!(snapshot.inbound_stream_complete_charge_past_age),
+            );
+            m.insert(
                 "nat_attempts_connect_joiner".into(),
                 serde_json::json!(snapshot.nat_attempts_connect_joiner),
             );
@@ -7750,6 +7758,8 @@ mod tests {
             inbound_stream_closed_too_many_refusals: 4,
             inbound_stream_evicted_idle: 5,
             inbound_stream_evicted_age: 6,
+            inbound_stream_stream_id_on_both_paths: 61,
+            inbound_stream_complete_charge_past_age: 62,
             ..Default::default()
         };
         let reference = serde_json::to_value(&snapshot).unwrap();
@@ -7763,6 +7773,8 @@ mod tests {
             ("inbound_stream_closed_too_many_refusals", 4),
             ("inbound_stream_evicted_idle", 5),
             ("inbound_stream_evicted_age", 6),
+            ("inbound_stream_stream_id_on_both_paths", 61),
+            ("inbound_stream_complete_charge_past_age", 62),
         ] {
             assert_eq!(json[key], expected, "event-log value for {key}");
             assert_eq!(json[key], reference[key], "serde value for {key}");

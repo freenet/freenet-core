@@ -83,15 +83,24 @@
 //!
 //! Receiving: one task per connection accepts every uni stream and reads all
 //! of them concurrently (no task per stream), parsing the header and then:
-//! - `Short` → [`QuicInbound::shorts`], a bounded channel;
+//! - `Short` → [`QuicDataInbox::shorts`], a bounded channel;
 //! - `Stream` → the inbound adapter ([`inbound`]), which feeds the payload
 //!   into an ordinary [`StreamHandle`] and announces it on
-//!   [`QuicInbound::streams`];
-//! - `Control` → [`QuicInbound::controls`], a bounded channel.
+//!   [`QuicDataInbox::streams`];
+//! - `Control` → the path's control channel, bounded.
 //!
-//! The task only ever uses `try_send`: a full channel drops the message and
-//! counts it (`QuicInboundOutcome`), it never waits, so a slow consumer
-//! cannot stall the other streams of the connection.
+//! A Short or Stream whose channel is full waits for room in its own reader
+//! future (`reserve`, raced with the stream's age limit), not in the task: the
+//! other readers and the accept loop carry on. A Short waits after its payload
+//! is read and BEFORE the stream's end is read (reading the end frees the
+//! stream in quinn and returns its credit), and the waiting reader keeps its
+//! `RecvStream`, so at most `MAX_UNI_STREAMS` readers wait on a path, charged
+//! or not, and a slow consumer slows the sender instead of losing messages the
+//! sender has seen acknowledged. Past the age limit the stream is stopped
+//! (`stop_code::EVICTED`), which the sender sees because the stream is still
+//! open. A reader that is waiting when the path ends is dropped with the
+//! receive task and counted (`ShortAbandonedWaiting`, `StreamAbandonedWaiting`). A Control frame still uses `try_send` and is
+//! dropped and counted (`QuicInboundOutcome`) when its channel is full.
 //!
 //! Not done here, on purpose:
 //! - Dedup. The same message sent twice (once on UDP, once on QUIC after a
@@ -206,14 +215,16 @@ pub(crate) mod reset_code {
     pub(crate) const ALL: [u32; 2] = [SENDER_ABORTED, LENGTH_MISMATCH];
 }
 
-/// Capacity of [`QuicInbound::shorts`]. Each queued message still holds its
-/// inbound budget charge, so the budget bounds the bytes queued.
+/// Capacity of [`QuicDataInbox::shorts`]. A queued message of more than one
+/// packet holds its inbound budget charge, so the budget bounds those bytes; a
+/// one-packet message is uncharged and bounded by this capacity (about one
+/// packet each) plus the readers waiting for room, at most `MAX_UNI_STREAMS`.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const SHORT_CHANNEL_CAPACITY: usize = 256;
-/// Capacity of [`QuicInbound::streams`]. Each queued stream holds its charge.
+/// Capacity of [`QuicDataInbox::streams`]. Each queued stream holds its charge.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const STREAM_CHANNEL_CAPACITY: usize = 256;
-/// Capacity of [`QuicInbound::controls`]; control frames are at most
+/// Capacity of the path's control channel; control frames are at most
 /// `MAX_CONTROL_BYTES` each.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const CONTROL_CHANNEL_CAPACITY: usize = 16;
@@ -230,7 +241,12 @@ pub(crate) struct QuicPathLimits {
     /// Bytes of inbound budget charges at once; see `max_streams`.
     #[cfg(test)]
     pub(crate) max_bytes: u64,
+    /// Capacity of a test path's own short channel. A node's data channels
+    /// belong to its session ([`data_channels`]).
+    #[cfg(test)]
     pub(crate) short_capacity: usize,
+    /// Capacity of a test path's own stream channel; see `short_capacity`.
+    #[cfg(test)]
     pub(crate) stream_capacity: usize,
     pub(crate) control_capacity: usize,
     /// Sends this side may reset before the path is closed
@@ -258,7 +274,9 @@ impl QuicPathLimits {
         max_streams: MAX_INBOUND_STREAMS_PER_CONNECTION,
         #[cfg(test)]
         max_bytes: MAX_INBOUND_STREAM_BYTES_PER_CONNECTION,
+        #[cfg(test)]
         short_capacity: SHORT_CHANNEL_CAPACITY,
+        #[cfg(test)]
         stream_capacity: STREAM_CHANNEL_CAPACITY,
         control_capacity: CONTROL_CHANNEL_CAPACITY,
         max_send_aborts: recycle::SEND_ABORT_LIMIT,
@@ -336,6 +354,12 @@ quic_outcomes! {
         ShortDroppedFull => "short_dropped_full",
         /// `streams` was full; the stream was refused.
         StreamDroppedFull => "stream_dropped_full",
+        /// The path ended while a Short waited for room in `shorts`; the
+        /// message was dropped with the receive task.
+        ShortAbandonedWaiting => "short_abandoned_waiting",
+        /// The path ended while a Stream waited for room in `streams`; the
+        /// announcement was dropped with the receive task.
+        StreamAbandonedWaiting => "stream_abandoned_waiting",
         /// `controls` was full; the frame was dropped.
         ControlDroppedFull => "control_dropped_full",
         /// The stream ended before its declared length.
@@ -424,9 +448,45 @@ impl QuicPathStats {
     }
 }
 
-/// The receiving ends of a path. Dropping one makes its messages count as
-/// dropped (`*DroppedFull`), as a full channel does.
-#[cfg_attr(not(test), allow(dead_code))]
+/// Where the paths of one UDP session deliver data. The session holds these for
+/// its lifetime and each path it builds takes a clone, so a message that arrived
+/// before its path ended is still delivered. A reader still waiting for room
+/// in a full channel when the path ends is not: it is dropped and counted.
+#[derive(Clone)]
+pub(in crate::transport) struct QuicDataSenders {
+    shorts: mpsc::Sender<InboundShort>,
+    streams: mpsc::Sender<InboundStreamArrival>,
+}
+
+/// The receiving ends of [`QuicDataSenders`], held by the connection's `recv`.
+/// Dropping one makes later messages count as dropped (`*DroppedFull`), as a
+/// full channel does.
+pub(in crate::transport) struct QuicDataInbox {
+    pub(in crate::transport) shorts: mpsc::Receiver<InboundShort>,
+    pub(in crate::transport) streams: mpsc::Receiver<InboundStreamArrival>,
+}
+
+/// The data channels of one UDP session.
+pub(in crate::transport) fn data_channels() -> (QuicDataSenders, QuicDataInbox) {
+    channels_of(SHORT_CHANNEL_CAPACITY, STREAM_CHANNEL_CAPACITY)
+}
+
+fn channels_of(short_capacity: usize, stream_capacity: usize) -> (QuicDataSenders, QuicDataInbox) {
+    let (shorts_tx, shorts) = mpsc::channel(short_capacity);
+    let (streams_tx, streams) = mpsc::channel(stream_capacity);
+    (
+        QuicDataSenders {
+            shorts: shorts_tx,
+            streams: streams_tx,
+        },
+        QuicDataInbox { shorts, streams },
+    )
+}
+
+/// The receiving ends of a test path, which has channels of its own. Dropping
+/// one makes its messages count as dropped (`*DroppedFull`), as a full channel
+/// does.
+#[cfg(test)]
 pub(crate) struct QuicInbound {
     pub(crate) shorts: mpsc::Receiver<InboundShort>,
     pub(crate) streams: mpsc::Receiver<InboundStreamArrival>,
@@ -529,7 +589,7 @@ impl QuicPath {
         limits: QuicPathLimits,
     ) -> (Self, QuicInbound) {
         let budget = SharedInboundBudget::new(limits.max_streams, limits.max_bytes);
-        let (path, inbound) = Self::with_budget(connection, time, limits, budget);
+        let (path, inbound) = Self::with_budget_and_own_channels(connection, time, limits, budget);
         // A test path has no negotiation: one that accepts data sends it too.
         if limits.accept_data {
             path.enable_data();
@@ -537,8 +597,30 @@ impl QuicPath {
         (path, inbound)
     }
 
-    /// [`Self::with_limits`], charging inbound streams to `budget` instead
-    /// of a budget of its own: pass the peer's UDP connection's
+    /// [`Self::with_budget`] with channels of the path's own, for tests.
+    #[cfg(test)]
+    pub(in crate::transport) fn with_budget_and_own_channels<T: TimeSource>(
+        connection: QuicConnection,
+        time: T,
+        limits: QuicPathLimits,
+        budget: SharedInboundBudget,
+    ) -> (Self, QuicInbound) {
+        let (data, inbox) = channels_of(limits.short_capacity, limits.stream_capacity);
+        let (path, controls) = Self::with_budget(connection, time, limits, budget, data);
+        let QuicDataInbox { shorts, streams } = inbox;
+        (
+            path,
+            QuicInbound {
+                shorts,
+                streams,
+                controls,
+            },
+        )
+    }
+
+    /// A path over `connection`, charging inbound streams to `budget` and
+    /// delivering data to `data`, the session's channels; returns the receiver of
+    /// its control frames. For `budget`, pass the peer's UDP connection's
     /// (`PeerConnection::inbound_budget`), so the peer has one reassembly
     /// allowance across both paths (the QUIC memory gate). `budget` brings
     /// its own limits; `limits.max_streams` and `limits.max_bytes` are not
@@ -547,14 +629,10 @@ impl QuicPath {
     /// (its admission releases gone QUIC charges only; see
     /// `inbound_budget::Releaser`).
     ///
-    /// For e5, the effects of sharing across the two paths' lifetimes:
+    /// The effects of sharing across the two paths' lifetimes:
     /// - Two QUIC paths on one budget at once (a replacement built before
     ///   the old one is gone) share the `Quic` namespace: a stream id held
     ///   by one is refused on the other as `StreamIdInUse`.
-    /// - If the UDP `PeerConnection` is replaced (reconnect or fallback)
-    ///   while this path lives, the new connection gets a fresh budget and
-    ///   the peer has two allowances again. Hand the path the new handle or
-    ///   rebuild it on the new connection's budget.
     /// - A UDP stream refused because this path filled the budget is
     ///   remembered as refused (`RefusedStreams`), and
     ///   `MAX_REMEMBERED_REFUSALS` outstanding refusals close the UDP
@@ -562,38 +640,36 @@ impl QuicPath {
     ///   path can cause it.
     /// - A QUIC charge whose consumer never lets go blocks UDP admissions
     ///   too: the UDP sweep evicts only UDP streams, and the QUIC path's own
-    ///   eviction cannot end a charge a consumer still holds.
+    ///   eviction cannot end a charge a consumer still holds. It is counted
+    ///   (`InboundStreamOutcome::CompleteChargePastAge`).
     /// - A gone UDP charge holds room against this path until the UDP
     ///   connection's next 5 s `timeout_check` sweep (or its own admission
     ///   under pressure), so this path can refuse with `BUDGET_REFUSED` for
     ///   up to about 5 s on room that is free.
     /// - The path may close itself (`recycle`: `close_code::SEND_ABORT_LIMIT`
     ///   or `close_code::PEER_NOT_ACKNOWLEDGING`). That is a request to fall
-    ///   back to UDP for this connection, not a permanent downgrade: e5 must
-    ///   allow a new upgrade after its normal backoff.
+    ///   back to UDP for this connection, not a permanent downgrade.
     /// - The shared `Arc` outlives either owner: this path keeps the UDP
     ///   connection's charges (and their room) after the `PeerConnection`
     ///   drops, and gone UDP charges are then released by nobody, since a
-    ///   QUIC path never releases a UDP charge. Do not keep a path on the
-    ///   handle of a connection that has gone.
-    #[cfg_attr(not(test), allow(dead_code))]
+    ///   QUIC path never releases a UDP charge. A session's path does not
+    ///   outlive its connection: dropping the connection ends the session.
     pub(in crate::transport) fn with_budget<T: TimeSource>(
         connection: QuicConnection,
         time: T,
         limits: QuicPathLimits,
         budget: SharedInboundBudget,
-    ) -> (Self, QuicInbound) {
+        data: QuicDataSenders,
+    ) -> (Self, mpsc::Receiver<Bytes>) {
         let stats = Arc::new(QuicPathStats::new());
-        let (shorts_tx, shorts) = mpsc::channel(limits.short_capacity);
-        let (streams_tx, streams) = mpsc::channel(limits.stream_capacity);
         let (controls_tx, controls) = mpsc::channel(limits.control_capacity);
         #[cfg_attr(not(test), allow(unused_mut))]
         let mut receiver = inbound::Receiver::new(
             time.clone(),
             budget.clone(),
             stats.clone(),
-            shorts_tx,
-            streams_tx,
+            data.shorts,
+            data.streams,
             controls_tx,
             limits.accept_data,
         );
@@ -624,11 +700,7 @@ impl QuicPath {
                 #[cfg(test)]
                 budget,
             },
-            QuicInbound {
-                shorts,
-                streams,
-                controls,
-            },
+            controls,
         )
     }
 
@@ -642,6 +714,12 @@ impl QuicPath {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn stats(&self) -> &QuicPathStats {
         &self.stats
+    }
+
+    /// The counters, outliving the path (tests read them after dropping it).
+    #[cfg(test)]
+    pub(crate) fn stats_handle(&self) -> Arc<QuicPathStats> {
+        self.stats.clone()
     }
 
     /// Sends this side reset on this path so far.
@@ -673,7 +751,7 @@ impl QuicPath {
         &self.connection
     }
 
-    /// Parse a control frame from [`QuicInbound::controls`]. A payload this
+    /// Parse a control frame from the path's control channel. A payload this
     /// node refuses ([`ControlError`]) is counted on the path
     /// (`QuicInboundOutcome::Control*`) and returned, for the upgrade machine.
     /// This is the only place refusals are counted, so a consumer must decode
@@ -711,7 +789,7 @@ impl QuicPath {
     }
 
     /// Whether this path may send data.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     pub(in crate::transport) fn sends_data(&self) -> bool {
         self.send_data.load(std::sync::atomic::Ordering::Acquire)
     }

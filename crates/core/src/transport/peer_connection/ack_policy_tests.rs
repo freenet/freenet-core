@@ -9,6 +9,8 @@ use std::net::Ipv4Addr;
 use aes_gcm::KeyInit;
 use bytes::Bytes;
 
+mod quic_data;
+
 use super::*;
 use crate::transport::crypto::TransportKeypair;
 use crate::transport::packet_data::{PacketData, UnknownEncryption};

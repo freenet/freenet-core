@@ -27,7 +27,7 @@
 //!
 //! # Supported features
 //!
-//! - Up to 5 branches
+//! - Up to 5 branches, plus the 7 and 9 branch shapes of the connection's `recv`
 //! - Optional `if` guards: `pat = fut, if condition => body`
 //! - Optional `else` branch: `else => body` (runs when all guards are false)
 //!
@@ -110,6 +110,36 @@ pub enum Out7<A, B, C, D, E, F, G, H> {
     _Else(H),
 }
 
+/// Output enum for the 9-branch select.
+pub enum Out9<A, B, C, D, E, F, G, H, I> {
+    _0(A),
+    _1(B),
+    _2(C),
+    _3(D),
+    _4(E),
+    _5(F),
+    _6(G),
+    _7(H),
+    _8(I),
+}
+
+/// The polling order of the 9-branch select, and how many branches it holds.
+/// `guarded` is whether branches 1, 2, 7 and 8 are enabled. A disabled branch takes
+/// no place in the order and no part in the random draw.
+pub fn nine_branch_order(guarded: [bool; 4]) -> ([usize; 9], usize) {
+    let mut order = [0, 3, 4, 5, 6, 0, 0, 0, 0];
+    let mut enabled_count = 5;
+    for (enabled, branch) in guarded.into_iter().zip([1, 2, 7, 8]) {
+        if enabled {
+            order[enabled_count] = branch;
+            enabled_count += 1;
+        }
+    }
+    let start = deterministic_start_index(enabled_count);
+    order[..enabled_count].rotate_left(start);
+    (order, enabled_count)
+}
+
 /// The `deterministic_select!` macro waits on multiple async operations simultaneously,
 /// returning when one of them completes. Branch ordering is determined by `GlobalRng`
 /// for deterministic but fair selection.
@@ -118,7 +148,7 @@ pub enum Out7<A, B, C, D, E, F, G, H> {
 ///
 /// - Supports `if` guards: `pat = fut, if condition => body`
 /// - Supports `else` branch: runs when all branches are disabled by guards
-/// - Up to 5 branches are supported
+/// - Up to 5 branches, plus the 7 and 9 branch shapes of the connection's `recv`
 #[macro_export]
 macro_rules! deterministic_select {
     // ==================== 2 BRANCHES ====================
@@ -943,7 +973,8 @@ macro_rules! deterministic_select {
     // ==================== 7 BRANCHES ====================
 
     // 7 branches: first without guard, second and third with guards, rest without guards
-    // Pattern: peer_connection.rs recv loop
+    // Pattern: the recv loop's shape before the QUIC data arms; `recv` itself now
+    // uses the 9 branch shape below
     (
         $pat1:pat = $fut1:expr => $body1:expr,
         $pat2:pat = $fut2:expr, if $guard2:expr => $body2:expr,
@@ -1063,10 +1094,212 @@ macro_rules! deterministic_select {
             Out7::_Else(()) => unreachable!(),
         }
     }};
+
+    // ==================== 9 BRANCHES ====================
+
+    // 9 branches: the 7 branch shape above, then two more with guards.
+    // Pattern: peer_connection.rs recv loop. The last two are the QUIC data arms:
+    // with both guards false the order and the random draw are the 7 branch shape's
+    // exactly, so a node with QUIC off polls as it did before they existed.
+    (
+        $pat1:pat = $fut1:expr => $body1:expr,
+        $pat2:pat = $fut2:expr, if $guard2:expr => $body2:expr,
+        $pat3:pat = $fut3:expr, if $guard3:expr => $body3:expr,
+        $pat4:pat = $fut4:expr => $body4:expr,
+        $pat5:pat = $fut5:expr => $body5:expr,
+        $pat6:pat = $fut6:expr => $body6:expr,
+        $pat7:pat = $fut7:expr => $body7:expr,
+        $pat8:pat = $fut8:expr, if $guard8:expr => $body8:expr,
+        $pat9:pat = $fut9:expr, if $guard9:expr => $body9:expr $(,)?
+    ) => {{
+        use std::future::Future;
+        use std::task::Poll;
+        use $crate::util::deterministic_select::Out9;
+
+        // IMPORTANT: Evaluate guards FIRST, before creating futures!
+        let enabled = [$guard2, $guard3, $guard8, $guard9];
+        let order_and_count = $crate::util::deterministic_select::nine_branch_order(enabled);
+        let order: [usize; 9] = order_and_count.0;
+        let enabled_count: usize = order_and_count.1;
+
+        let output = {
+            let fut1 = $fut1;
+            let fut2 = $fut2;
+            let fut3 = $fut3;
+            let fut4 = $fut4;
+            let fut5 = $fut5;
+            let fut6 = $fut6;
+            let fut7 = $fut7;
+            let fut8 = $fut8;
+            let fut9 = $fut9;
+            tokio::pin!(fut1);
+            tokio::pin!(fut2);
+            tokio::pin!(fut3);
+            tokio::pin!(fut4);
+            tokio::pin!(fut5);
+            tokio::pin!(fut6);
+            tokio::pin!(fut7);
+            tokio::pin!(fut8);
+            tokio::pin!(fut9);
+
+            std::future::poll_fn(|cx| {
+                for i in 0..enabled_count {
+                    match order[i] {
+                        0 => {
+                            if let Poll::Ready(val) = fut1.as_mut().poll(cx) {
+                                return Poll::Ready(Out9::_0(val));
+                            }
+                        }
+                        1 => {
+                            if let Poll::Ready(val) = fut2.as_mut().poll(cx) {
+                                return Poll::Ready(Out9::_1(val));
+                            }
+                        }
+                        2 => {
+                            if let Poll::Ready(val) = fut3.as_mut().poll(cx) {
+                                return Poll::Ready(Out9::_2(val));
+                            }
+                        }
+                        3 => {
+                            if let Poll::Ready(val) = fut4.as_mut().poll(cx) {
+                                return Poll::Ready(Out9::_3(val));
+                            }
+                        }
+                        4 => {
+                            if let Poll::Ready(val) = fut5.as_mut().poll(cx) {
+                                return Poll::Ready(Out9::_4(val));
+                            }
+                        }
+                        5 => {
+                            if let Poll::Ready(val) = fut6.as_mut().poll(cx) {
+                                return Poll::Ready(Out9::_5(val));
+                            }
+                        }
+                        6 => {
+                            if let Poll::Ready(val) = fut7.as_mut().poll(cx) {
+                                return Poll::Ready(Out9::_6(val));
+                            }
+                        }
+                        7 => {
+                            if let Poll::Ready(val) = fut8.as_mut().poll(cx) {
+                                return Poll::Ready(Out9::_7(val));
+                            }
+                        }
+                        8 => {
+                            if let Poll::Ready(val) = fut9.as_mut().poll(cx) {
+                                return Poll::Ready(Out9::_8(val));
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                Poll::Pending
+            })
+            .await
+        };
+
+        match output {
+            Out9::_0($pat1) => $body1,
+            Out9::_1($pat2) => $body2,
+            Out9::_2($pat3) => $body3,
+            Out9::_3($pat4) => $body4,
+            Out9::_4($pat5) => $body5,
+            Out9::_5($pat6) => $body6,
+            Out9::_6($pat7) => $body7,
+            Out9::_7($pat8) => $body8,
+            Out9::_8($pat9) => $body9,
+        }
+    }};
 }
 
 #[cfg(test)]
 mod tests {
+    /// With its two extra guards off, the 9 branch shape takes the same random draw
+    /// and picks the same branch as the 7 branch shape, whichever are ready: a node
+    /// with QUIC off polls as it did before those arms existed.
+    #[test]
+    fn nine_branches_with_the_extra_guards_off_poll_as_seven() {
+        use crate::config::GlobalRng;
+        use std::future::ready;
+        for (guard2, guard3) in [(false, false), (true, false), (false, true), (true, true)] {
+            let draw = |nine: bool| {
+                let _seed = GlobalRng::seed_guard(0x5940);
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap();
+                let mut picked = Vec::new();
+                for _ in 0..200 {
+                    picked.push(runtime.block_on(async {
+                        if nine {
+                            crate::deterministic_select! {
+                                _ = ready(()) => 0,
+                                _ = ready(()), if guard2 => 1,
+                                _ = ready(()), if guard3 => 2,
+                                _ = ready(()) => 3,
+                                _ = ready(()) => 4,
+                                _ = ready(()) => 5,
+                                _ = ready(()) => 6,
+                                _ = ready(()), if false => 7,
+                                _ = ready(()), if false => 8,
+                            }
+                        } else {
+                            crate::deterministic_select! {
+                                _ = ready(()) => 0,
+                                _ = ready(()), if guard2 => 1,
+                                _ = ready(()), if guard3 => 2,
+                                _ = ready(()) => 3,
+                                _ = ready(()) => 4,
+                                _ = ready(()) => 5,
+                                _ = ready(()) => 6,
+                            }
+                        }
+                    }));
+                }
+                picked.push(GlobalRng::random_range(0..u32::MAX) as i32);
+                picked
+            };
+            assert_eq!(draw(true), draw(false), "{guard2} {guard3}");
+        }
+    }
+
+    /// Each extra branch is polled when its guard is on and can be picked. One poll
+    /// only, so a branch that is not polled fails here and does not hang.
+    #[test]
+    fn nine_branches_poll_the_extra_guarded_branches() {
+        use crate::config::GlobalRng;
+        use futures::FutureExt;
+        use std::future::{pending, ready};
+        let _seed = GlobalRng::seed_guard(0x5941);
+        let last = async {
+            crate::deterministic_select! {
+                _ = pending::<()>() => 0,
+                _ = pending::<()>(), if false => 1,
+                _ = pending::<()>(), if false => 2,
+                _ = pending::<()>() => 3,
+                _ = pending::<()>() => 4,
+                _ = pending::<()>() => 5,
+                _ = pending::<()>() => 6,
+                _ = pending::<()>(), if true => 7,
+                _ = ready(()), if true => 8,
+            }
+        };
+        assert_eq!(last.now_or_never(), Some(8));
+        let eighth = async {
+            crate::deterministic_select! {
+                _ = pending::<()>() => 0,
+                _ = pending::<()>(), if false => 1,
+                _ = pending::<()>(), if false => 2,
+                _ = pending::<()>() => 3,
+                _ = pending::<()>() => 4,
+                _ = pending::<()>() => 5,
+                _ = pending::<()>() => 6,
+                _ = ready(()), if true => 7,
+                _ = pending::<()>(), if false => 8,
+            }
+        };
+        assert_eq!(eighth.now_or_never(), Some(7));
+    }
+
     use super::*;
 
     #[tokio::test(flavor = "current_thread")]

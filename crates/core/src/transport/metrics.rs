@@ -258,6 +258,14 @@ labelled_counters! {
         EvictedIdle => "evicted_idle",
         /// Evicted: past its age limit.
         EvictedAge => "evicted_age",
+        /// A QUIC stream cancelled because its id was already used, on either
+        /// path. Only a faulty peer or a bug sends one.
+        StreamIdOnBothPaths => "stream_id_on_both_paths",
+        /// Neither a refusal nor an eviction, and not a limit being hit: a
+        /// complete stream, of either path, still held past its age limit by a
+        /// consumer that has not let go. Nothing evicts one. Read it as a
+        /// consumer that is slow to take what it was given.
+        CompleteChargePastAge => "complete_charge_past_age",
     }
 }
 
@@ -2562,6 +2570,12 @@ impl TransportMetrics {
             inbound_stream_evicted_age: get32(
                 &self.inbound_stream_outcomes[InboundStreamOutcome::EvictedAge as usize],
             ),
+            inbound_stream_stream_id_on_both_paths: get32(
+                &self.inbound_stream_outcomes[InboundStreamOutcome::StreamIdOnBothPaths as usize],
+            ),
+            inbound_stream_complete_charge_past_age: get32(
+                &self.inbound_stream_outcomes[InboundStreamOutcome::CompleteChargePastAge as usize],
+            ),
             nat_attempts_connect_joiner: get32(&attempts[NatAttemptOrigin::ConnectJoiner as usize]),
             nat_attempts_connect_acceptor: get32(
                 &attempts[NatAttemptOrigin::ConnectAcceptor as usize],
@@ -3125,12 +3139,16 @@ pub struct TransportSnapshot {
     /// Inbound streams refused or evicted during the period, by reason
     /// (see [`InboundStreamOutcome`]; the field suffix is its label). Counts
     /// only, no addresses. The never-reset twin feeds the OTel metric.
+    /// `inbound_stream_complete_charge_past_age` is neither a refusal nor an
+    /// eviction: complete streams a consumer still held past their age limit.
     pub inbound_stream_refused_invalid_length: u32,
     pub inbound_stream_refused_connection_bytes: u32,
     pub inbound_stream_refused_connection_streams: u32,
     pub inbound_stream_closed_too_many_refusals: u32,
     pub inbound_stream_evicted_idle: u32,
     pub inbound_stream_evicted_age: u32,
+    pub inbound_stream_stream_id_on_both_paths: u32,
+    pub inbound_stream_complete_charge_past_age: u32,
     /// Outbound NAT traversals started during the period, by
     /// [`NatAttemptOrigin`] (the field suffix is its label). They sum to
     /// `nat_traversal_attempts`, up to a snapshot race.
@@ -3463,6 +3481,8 @@ impl TransportSnapshot {
             inbound_stream_closed_too_many_refusals,
             inbound_stream_evicted_idle,
             inbound_stream_evicted_age,
+            inbound_stream_stream_id_on_both_paths,
+            inbound_stream_complete_charge_past_age,
             nat_attempts_connect_joiner,
             nat_attempts_connect_acceptor,
             nat_attempts_gateway,
@@ -3599,6 +3619,8 @@ impl TransportSnapshot {
         self.inbound_stream_closed_too_many_refusals = inbound_stream_closed_too_many_refusals;
         self.inbound_stream_evicted_idle = inbound_stream_evicted_idle;
         self.inbound_stream_evicted_age = inbound_stream_evicted_age;
+        self.inbound_stream_stream_id_on_both_paths = inbound_stream_stream_id_on_both_paths;
+        self.inbound_stream_complete_charge_past_age = inbound_stream_complete_charge_past_age;
         self.nat_attempts_connect_joiner = nat_attempts_connect_joiner;
         self.nat_attempts_connect_acceptor = nat_attempts_connect_acceptor;
         self.nat_attempts_gateway = nat_attempts_gateway;
@@ -3809,12 +3831,16 @@ struct SnapshotExtras {
     /// Inbound streams refused or evicted during the period, by reason
     /// (see [`InboundStreamOutcome`]; the field suffix is its label). Counts
     /// only, no addresses. The never-reset twin feeds the OTel metric.
+    /// `inbound_stream_complete_charge_past_age` is neither a refusal nor an
+    /// eviction: complete streams a consumer still held past their age limit.
     pub inbound_stream_refused_invalid_length: u32,
     pub inbound_stream_refused_connection_bytes: u32,
     pub inbound_stream_refused_connection_streams: u32,
     pub inbound_stream_closed_too_many_refusals: u32,
     pub inbound_stream_evicted_idle: u32,
     pub inbound_stream_evicted_age: u32,
+    pub inbound_stream_stream_id_on_both_paths: u32,
+    pub inbound_stream_complete_charge_past_age: u32,
     /// Outbound NAT traversals started during the period, by
     /// [`NatAttemptOrigin`] (the field suffix is its label). They sum to
     /// `nat_traversal_attempts`, up to a snapshot race.
@@ -3972,6 +3998,8 @@ impl SnapshotExtras {
             || self.inbound_stream_closed_too_many_refusals != 0
             || self.inbound_stream_evicted_idle != 0
             || self.inbound_stream_evicted_age != 0
+            || self.inbound_stream_stream_id_on_both_paths != 0
+            || self.inbound_stream_complete_charge_past_age != 0
             || self.nat_attempts_connect_joiner != 0
             || self.nat_attempts_connect_acceptor != 0
             || self.nat_attempts_gateway != 0
@@ -5135,6 +5163,12 @@ mod tests {
             }
             InboundStreamOutcome::EvictedIdle => snap.inbound_stream_evicted_idle,
             InboundStreamOutcome::EvictedAge => snap.inbound_stream_evicted_age,
+            InboundStreamOutcome::StreamIdOnBothPaths => {
+                snap.inbound_stream_stream_id_on_both_paths
+            }
+            InboundStreamOutcome::CompleteChargePastAge => {
+                snap.inbound_stream_complete_charge_past_age
+            }
         }
     }
 
@@ -6227,6 +6261,8 @@ mod tests {
             "inbound_stream_closed_too_many_refusals",
             "inbound_stream_evicted_idle",
             "inbound_stream_evicted_age",
+            "inbound_stream_stream_id_on_both_paths",
+            "inbound_stream_complete_charge_past_age",
             "nat_attempts_connect_joiner",
             "nat_attempts_connect_acceptor",
             "nat_attempts_gateway",

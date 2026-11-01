@@ -1342,7 +1342,10 @@ fn register_transport_metrics(meter: &opentelemetry::metrics::Meter) {
 
     let _inbound_streams = meter
         .u64_observable_counter("freenet.transport.inbound_stream_limits")
-        .with_description("Inbound streams refused or evicted, by reason")
+        .with_description(
+            "Inbound streams refused or evicted, by reason; complete_charge_past_age is \
+neither: a complete stream its consumer still holds past the age limit",
+        )
         .with_callback(|observer| {
             for (outcome, count) in TRANSPORT_METRICS.cumulative_inbound_stream_outcomes() {
                 observer.observe(count, &[KeyValue::new("reason", outcome.label())]);
@@ -3127,6 +3130,14 @@ mod tests {
             (
                 "freenet.transport.inbound_stream_limits",
                 "reason=evicted_age",
+            ),
+            (
+                "freenet.transport.inbound_stream_limits",
+                "reason=stream_id_on_both_paths",
+            ),
+            (
+                "freenet.transport.inbound_stream_limits",
+                "reason=complete_charge_past_age",
             ),
             // Every `HostingReason::as_str` value: its own rustdoc calls these
             // a metrics contract where renaming one empties a panel.

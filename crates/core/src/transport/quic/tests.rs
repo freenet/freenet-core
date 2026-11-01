@@ -31,7 +31,7 @@ use crate::transport::in_memory_socket::{
 use crate::transport::metrics::DemuxClass;
 use crate::transport::packet_data::MAX_RECV_PACKET_SIZE;
 
-pub(in crate::transport::quic) const SEED: u64 = 0x0059_40C2;
+pub(in crate::transport) const SEED: u64 = 0x0059_40C2;
 
 /// One datagram as a test socket saw it leave.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -142,6 +142,8 @@ struct Charge {
     liveness: Liveness,
     /// Eviction has been requested; the charge stays until the state is gone.
     evicted: bool,
+    /// Counted by [`InboundStreamBudget::take_complete_past_age`].
+    counted_past_age: bool,
 }
 
 /// Why a new stream could not be charged.
@@ -334,15 +336,18 @@ impl InboundStreamBudget {
         self.streams.contains_key(&key)
     }
 
-    /// The UDP connection's operations streams whose buffers are still held
-    /// somewhere.
+    /// The operations streams of both paths whose buffers are still held
+    /// somewhere. The two paths can hold one id at once, so match a stream by
+    /// its buffer, never by its id alone.
     pub(super) fn live_buffer_streams(
         &self,
     ) -> impl Iterator<Item = (StreamId, Weak<LockFreeStreamBuffer>)> + '_ {
         self.streams
             .iter()
             .filter_map(|(key, charge)| match (key, &charge.liveness) {
-                (InboundKey::Udp(id), Liveness::Buffer(weak)) if weak.strong_count() > 0 => {
+                (InboundKey::Udp(id) | InboundKey::Quic(id), Liveness::Buffer(weak))
+                    if weak.strong_count() > 0 =>
+                {
                     Some((*id, weak.clone()))
                 }
                 _ => None,
@@ -410,6 +415,7 @@ impl InboundStreamBudget {
                 seen_bytes: liveness.received_bytes().unwrap_or(0),
                 liveness,
                 evicted: false,
+                counted_past_age: false,
             },
         );
         if let Some(previous) = previous {
@@ -508,6 +514,30 @@ impl InboundStreamBudget {
             expired.push((*stream_id, reason));
         }
         expired
+    }
+
+    /// How many complete streams, of either path, have newly been held past their
+    /// age limit. Nothing evicts a complete stream, since only its consumers hold
+    /// it, so this is what shows a consumer that never lets go. Each is counted
+    /// once.
+    ///
+    /// `now_nanos` and `admitted_nanos` are on the same clock only if every
+    /// charger uses one. In production they do (the connection's clock,
+    /// shared by both paths). In simulation the QUIC path charges on the
+    /// virtual clock while a UDP sweep may pass another, so a count there
+    /// compares two clocks.
+    pub(super) fn take_complete_past_age(&mut self, now_nanos: u64) -> usize {
+        let mut held = 0;
+        for charge in self.streams.values_mut() {
+            if !charge.counted_past_age
+                && now_nanos.saturating_sub(charge.admitted_nanos) > charge.max_age_nanos
+                && charge.liveness.is_complete() == Some(true)
+            {
+                charge.counted_past_age = true;
+                held += 1;
+            }
+        }
+        held
     }
 }
 
@@ -870,7 +900,7 @@ mod tests {
         budget.charge(InboundKey::QuicShort(id.0), 100, 0, AGE, quic_task);
 
         let live: Vec<_> = budget.live_buffer_streams().map(|(id, _)| id).collect();
-        assert_eq!(live, vec![id], "only the UDP buffer");
+        assert_eq!(live, vec![id, id], "both buffers, and no short");
         assert_eq!(
             budget.take_expired(3600 * SECS, IDLE),
             vec![(id, EvictionReason::Idle)],
@@ -879,6 +909,37 @@ mod tests {
         assert_eq!(budget.take_expired(3600 * SECS, IDLE), vec![]);
         assert_eq!(budget.stream_count(), 3);
         assert_eq!(budget.charged_bytes(), 300);
+    }
+
+    /// A complete stream past its age limit is counted once, on either path. An
+    /// incomplete one is left to eviction, and a gone one to release.
+    #[test]
+    fn a_complete_charge_past_its_age_is_counted_once_on_either_path() {
+        const AGE: Duration = Duration::from_secs(10);
+        let complete_at = |id: u32| {
+            let token = LegacyStreamToken::new();
+            assert!(token.mark_complete());
+            (id, token)
+        };
+        let mut budget = budget(8, 1 << 20);
+        let (udp, udp_token) = complete_at(1);
+        let (quic, quic_token) = complete_at(2);
+        let (gone, gone_token) = complete_at(3);
+        let active = LegacyStreamToken::new();
+        let streams = [
+            (InboundKey::Udp(StreamId(udp | 0x8000_0000)), &udp_token),
+            (InboundKey::QuicShort(quic), &quic_token),
+            (InboundKey::QuicShort(gone), &gone_token),
+            (InboundKey::QuicShort(4), &active),
+        ];
+        for (key, token) in streams {
+            budget.charge(key, 10, 0, AGE, Liveness::Task(Arc::downgrade(token)));
+        }
+        drop(gone_token);
+        assert_eq!(budget.take_complete_past_age(AGE.as_nanos() as u64), 0);
+        let later = AGE.as_nanos() as u64 + 1;
+        assert_eq!(budget.take_complete_past_age(later), 2);
+        assert_eq!(budget.take_complete_past_age(later), 0, "once");
     }
 
     /// A QUIC path's admission releases only gone QUIC charges: a gone UDP

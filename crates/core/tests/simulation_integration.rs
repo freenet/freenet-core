@@ -20890,6 +20890,61 @@ fn test_quic_data_needs_both_bits_and_carries_nothing_yet() {
     }
 }
 
+/// Data on a test percentage, end to end: both nodes negotiate it and send their
+/// messages as Shorts on the path, and those messages come out of `recv` and decode
+/// as real network messages. No node code sends on a path yet, so the run asks for
+/// it (`send_shorts_on_paths`). Only Shorts are covered here: a Stream through
+/// `recv` is tested at the connection (`ack_policy_tests/quic_data.rs`) and goes
+/// end to end in e5b-5/6.
+#[test_log::test]
+fn test_quic_data_delivers_a_real_message_through_recv() {
+    let run = run_quic_shadow_sim(
+        "quic-data-delivers",
+        0x5940_E5B4_0001,
+        (1, 1),
+        30,
+        |sim, trace, labels| {
+            let addresses: Vec<_> = labels
+                .iter()
+                .map(|label| sim.all_node_addresses()[label])
+                .collect();
+            for (label, address) in labels.iter().zip(addresses) {
+                sim.with_node_transport_quic(label, "prefer");
+                sim.with_node_quic_data_percent(label, 100);
+                trace.send_shorts_on_paths(address);
+            }
+            run_as_first_negotiating_release(trace);
+        },
+    );
+    for node in &run.nodes {
+        assert_eq!(run.whats(*node, "DataEnabled"), 1, "{}", run.dump());
+    }
+    let received = run.total("received a short on the path");
+    assert!(received > 0, "{}", run.dump());
+    assert_eq!(
+        run.total("sent a short on the path: Sent"),
+        received,
+        "each send arrived once: {}",
+        run.dump()
+    );
+    assert_eq!(
+        run.trace
+            .records()
+            .iter()
+            .filter(|record| record.what.contains("a real message"))
+            .count(),
+        received,
+        "{}",
+        run.dump()
+    );
+    assert_eq!(
+        run.total("path carried data: refused 0, delivered 0"),
+        0,
+        "{}",
+        run.dump()
+    );
+}
+
 /// Shadow on both ends: the whole negotiation runs over a real QUIC connection,
 /// each side counts it established on its own evidence, and no application
 /// traffic touches the path while the nodes carry on over UDP.
