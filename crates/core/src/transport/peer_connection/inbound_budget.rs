@@ -905,6 +905,37 @@ mod tests {
         assert_eq!(budget.charged_bytes(), 300);
     }
 
+    /// A complete stream past its age limit is counted once, on either path. An
+    /// incomplete one is left to eviction, and a gone one to release.
+    #[test]
+    fn a_complete_charge_past_its_age_is_counted_once_on_either_path() {
+        const AGE: Duration = Duration::from_secs(10);
+        let complete_at = |id: u32| {
+            let token = LegacyStreamToken::new();
+            assert!(token.mark_complete());
+            (id, token)
+        };
+        let mut budget = budget(8, 1 << 20);
+        let (udp, udp_token) = complete_at(1);
+        let (quic, quic_token) = complete_at(2);
+        let (gone, gone_token) = complete_at(3);
+        let active = LegacyStreamToken::new();
+        let streams = [
+            (InboundKey::Udp(StreamId(udp | 0x8000_0000)), &udp_token),
+            (InboundKey::QuicShort(quic), &quic_token),
+            (InboundKey::QuicShort(gone), &gone_token),
+            (InboundKey::QuicShort(4), &active),
+        ];
+        for (key, token) in streams {
+            budget.charge(key, 10, 0, AGE, Liveness::Task(Arc::downgrade(token)));
+        }
+        drop(gone_token);
+        assert_eq!(budget.take_complete_past_age(AGE.as_nanos() as u64), 0);
+        let later = AGE.as_nanos() as u64 + 1;
+        assert_eq!(budget.take_complete_past_age(later), 2);
+        assert_eq!(budget.take_complete_past_age(later), 0, "once");
+    }
+
     /// A QUIC path's admission releases only gone QUIC charges: a gone UDP
     /// charge stays until UDP code releases it, at the points it always
     /// did. The UDP side releases gone charges of both, so a gone QUIC

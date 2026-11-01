@@ -1107,7 +1107,18 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         // Only so that the same metadata embedded in a stream is suppressed; a
         // Short itself is always delivered, as on UDP.
         self.dispatched_msg_hashes.put(Self::msg_hash(&bytes), ());
-        self.note_quic_delivery(|| format!("received a short on the path, {} B", bytes.len()));
+        self.note_quic_delivery(|| {
+            let decoded = bincode::deserialize::<crate::message::NetMessage>(&bytes).is_ok();
+            format!(
+                "received a short on the path, {} B, {}",
+                bytes.len(),
+                if decoded {
+                    "a real message"
+                } else {
+                    "not decoded"
+                }
+            )
+        });
         bytes
     }
 

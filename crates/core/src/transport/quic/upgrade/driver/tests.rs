@@ -179,6 +179,86 @@ impl Harness {
     }
 }
 
+/// A raw connection between two endpoints, with a path on each end. `ours` is
+/// built as a node builds one, on the given budget and channels; `peer` is a test
+/// path with no negotiation, so it sends data. For tests of what a path delivers.
+pub(in crate::transport) struct DataPath {
+    pub(in crate::transport) time: VirtualTime,
+    _pair: Pair,
+    peer: QuicPath,
+    _peer_inbound: QuicInbound,
+    ours: Option<Arc<QuicPath>>,
+    _controls: mpsc::Receiver<Bytes>,
+}
+
+impl DataPath {
+    pub(in crate::transport) fn peer(&self) -> &QuicPath {
+        &self.peer
+    }
+
+    pub(in crate::transport) fn ours(&self) -> &QuicPath {
+        self.ours.as_ref().expect("the path has not ended")
+    }
+
+    /// Close the node's path and let go of it, as a session does.
+    pub(in crate::transport) fn end_ours(&mut self) {
+        let path = self.ours.take().expect("the path has not ended");
+        path.close(QuicCloseCode::Downgrade);
+    }
+}
+
+pub(in crate::transport) async fn data_path(
+    network: &str,
+    subnet: u8,
+    limits: QuicPathLimits,
+    budget: SharedInboundBudget,
+    data: QuicDataSenders,
+) -> DataPath {
+    let a_addr: SocketAddr = format!("10.205.{subnet}.1:5000").parse().unwrap();
+    let b_addr: SocketAddr = format!("10.205.{subnet}.2:5000").parse().unwrap();
+    let pair = pair(network, a_addr, b_addr, None).await;
+    let permit = pair
+        .b
+        .allow_peer(a_addr, pair.a_keys.public())
+        .expect("allowed");
+    let (a, b) = (pair.a.clone(), pair.b.clone());
+    let b_key = pair.b_keys.public().clone();
+    let (client, server) = drive(&pair.time, Duration::from_secs(30), async move {
+        let (client, server) = tokio::join!(a.connect(b_addr, &b_key), async {
+            b.accept().await.expect("an attempt").establish().await
+        });
+        (client.expect("client"), server.expect("server"))
+    })
+    .await;
+    drop(permit);
+    let time = pair.time.clone();
+    let (peer, peer_inbound) = QuicPath::new(client, time.clone());
+    let (ours, controls) = QuicPath::with_budget(server, time.clone(), limits, budget, data);
+    DataPath {
+        time,
+        _pair: pair,
+        peer,
+        _peer_inbound: peer_inbound,
+        ours: Some(Arc::new(ours)),
+        _controls: controls,
+    }
+}
+
+/// Set up with `prepare`, then drive its test on the virtual clock it returns, under
+/// the QUIC tests' watchdog.
+pub(in crate::transport) fn run_bounded<P, PF, F>(prepare: P)
+where
+    P: FnOnce() -> PF + Send + 'static,
+    PF: Future<Output = (VirtualTime, F)>,
+    F: Future<Output = ()> + Send + 'static,
+{
+    bounded(move || async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let (time, test) = prepare().await;
+        drive(&time, Duration::from_secs(600), test).await;
+    });
+}
+
 /// The promotion of a new session of a key ends the older one first, which closes
 /// out its attempt and files its seed, so the new machine starts with that backoff.
 /// Dropping the older session's connection may come later than this, or never.

@@ -1213,6 +1213,79 @@ macro_rules! deterministic_select {
 
 #[cfg(test)]
 mod tests {
+    /// With its two extra guards off, the 9 branch shape takes the same random draw
+    /// and picks the same branch as the 7 branch shape, whichever are ready: a node
+    /// with QUIC off polls as it did before those arms existed.
+    #[test]
+    fn nine_branches_with_the_extra_guards_off_poll_as_seven() {
+        use crate::config::GlobalRng;
+        use std::future::ready;
+        for (guard2, guard3) in [(false, false), (true, false), (false, true), (true, true)] {
+            let draw = |nine: bool| {
+                let _seed = GlobalRng::seed_guard(0x5940);
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap();
+                let mut picked = Vec::new();
+                for _ in 0..200 {
+                    picked.push(runtime.block_on(async {
+                        if nine {
+                            crate::deterministic_select! {
+                                _ = ready(()) => 0,
+                                _ = ready(()), if guard2 => 1,
+                                _ = ready(()), if guard3 => 2,
+                                _ = ready(()) => 3,
+                                _ = ready(()) => 4,
+                                _ = ready(()) => 5,
+                                _ = ready(()) => 6,
+                                _ = ready(()), if false => 7,
+                                _ = ready(()), if false => 8,
+                            }
+                        } else {
+                            crate::deterministic_select! {
+                                _ = ready(()) => 0,
+                                _ = ready(()), if guard2 => 1,
+                                _ = ready(()), if guard3 => 2,
+                                _ = ready(()) => 3,
+                                _ = ready(()) => 4,
+                                _ = ready(()) => 5,
+                                _ = ready(()) => 6,
+                            }
+                        }
+                    }));
+                }
+                picked.push(GlobalRng::random_range(0..u32::MAX) as i32);
+                picked
+            };
+            assert_eq!(draw(true), draw(false), "{guard2} {guard3}");
+        }
+    }
+
+    /// Each extra branch is polled when its guard is on and can be picked.
+    #[test]
+    fn nine_branches_poll_the_extra_guarded_branches() {
+        use crate::config::GlobalRng;
+        use std::future::{pending, ready};
+        let _seed = GlobalRng::seed_guard(0x5941);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let picked = runtime.block_on(async {
+            crate::deterministic_select! {
+                _ = pending::<()>() => 0,
+                _ = pending::<()>(), if false => 1,
+                _ = pending::<()>(), if false => 2,
+                _ = pending::<()>() => 3,
+                _ = pending::<()>() => 4,
+                _ = pending::<()>() => 5,
+                _ = pending::<()>() => 6,
+                _ = pending::<()>(), if true => 7,
+                _ = ready(()), if true => 8,
+            }
+        });
+        assert_eq!(picked, 8);
+    }
+
     use super::*;
 
     #[tokio::test(flavor = "current_thread")]

@@ -611,14 +611,10 @@ impl QuicPath {
     /// (its admission releases gone QUIC charges only; see
     /// `inbound_budget::Releaser`).
     ///
-    /// For e5, the effects of sharing across the two paths' lifetimes:
+    /// The effects of sharing across the two paths' lifetimes:
     /// - Two QUIC paths on one budget at once (a replacement built before
     ///   the old one is gone) share the `Quic` namespace: a stream id held
     ///   by one is refused on the other as `StreamIdInUse`.
-    /// - If the UDP `PeerConnection` is replaced (reconnect or fallback)
-    ///   while this path lives, the new connection gets a fresh budget and
-    ///   the peer has two allowances again. Hand the path the new handle or
-    ///   rebuild it on the new connection's budget.
     /// - A UDP stream refused because this path filled the budget is
     ///   remembered as refused (`RefusedStreams`), and
     ///   `MAX_REMEMBERED_REFUSALS` outstanding refusals close the UDP
@@ -626,20 +622,20 @@ impl QuicPath {
     ///   path can cause it.
     /// - A QUIC charge whose consumer never lets go blocks UDP admissions
     ///   too: the UDP sweep evicts only UDP streams, and the QUIC path's own
-    ///   eviction cannot end a charge a consumer still holds.
+    ///   eviction cannot end a charge a consumer still holds. It is counted
+    ///   (`InboundStreamOutcome::CompleteChargePastAge`).
     /// - A gone UDP charge holds room against this path until the UDP
     ///   connection's next 5 s `timeout_check` sweep (or its own admission
     ///   under pressure), so this path can refuse with `BUDGET_REFUSED` for
     ///   up to about 5 s on room that is free.
     /// - The path may close itself (`recycle`: `close_code::SEND_ABORT_LIMIT`
     ///   or `close_code::PEER_NOT_ACKNOWLEDGING`). That is a request to fall
-    ///   back to UDP for this connection, not a permanent downgrade: e5 must
-    ///   allow a new upgrade after its normal backoff.
+    ///   back to UDP for this connection, not a permanent downgrade.
     /// - The shared `Arc` outlives either owner: this path keeps the UDP
     ///   connection's charges (and their room) after the `PeerConnection`
     ///   drops, and gone UDP charges are then released by nobody, since a
-    ///   QUIC path never releases a UDP charge. Do not keep a path on the
-    ///   handle of a connection that has gone.
+    ///   QUIC path never releases a UDP charge. A session's path does not
+    ///   outlive its connection: dropping the connection ends the session.
     pub(in crate::transport) fn with_budget<T: TimeSource>(
         connection: QuicConnection,
         time: T,

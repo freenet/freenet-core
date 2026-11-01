@@ -1004,8 +1004,9 @@ pair is in the slice when its bucket is below the percentage, so 0 holds none,
   `quic-max-paths`; anything but a whole number from 0 to 100 reads as unset, with
   a WARN when QUIC is on) replaces it on one node. Only `prefer` uses it.
   `QuicPolicy::own_caps` gives `caps::DATA` when the mode is `prefer` and the pair
-  is in the slice, otherwise 0 (and always 0 outside `cfg(test)` and the `testing`
-  feature while `QUIC_DATA_RECEIVER_READY` is false; the receive side flips it), and the driver passes that in `Event::Promoted`.
+  is in the slice, otherwise 0, and the driver passes that in `Event::Promoted`.
+  `QUIC_DATA_RECEIVER_READY` is true: `recv` reads the path's data ("QUIC receive
+  flow" below).
   The machine reads no key to decide it.
   A path carries data only with both bits. `Ready` and `ReadyAck` carry the
   sender's own bit. The peer's bit is read from the frame that activates the
@@ -1022,11 +1023,8 @@ pair is in the slice when its bucket is below the percentage, so 0 holds none,
   overtake the frame carrying its bit. Sending is `QuicPath::send_data`, which
   `debug_assert_carries_data` reads. The Offer's caps stay 0. A release before the
   bit clears it on decode and sends 0, so its pairs stay in shadow.
-  No code sends data on a path yet, and frames a peer sends to a node with its own
-  bit set wait in the path's channels, charged to the peer's budget, until the path
-  ends. Nothing reads them. So a node of this release with the bit set (only through
-  `quic-data-percent`, and only in a `testing` build) says it reads data when it does not: do not set the key on a
-  node that can meet a release which sends data.
+  No node code sends data on a path yet. Frames a peer sends to a node with its own
+  bit set reach `recv` ("QUIC receive flow" below).
 
 Receipt stamp (#6028, e5b-3): `ReceiptStamp` reads the later of two values,
 `last_inbound_nanos` (UDP) and `quic_receipt_nanos`, on the connection's clock. The
@@ -1105,12 +1103,13 @@ runs the machine, so nothing of a negotiation runs inside `recv`, which only
   send that fails or is dropped leaves nothing in flight. Control frames go through
   send_control_bounded in a task per send, and nothing else is sent on a path.
   Paths: QuicPath::with_budget(.., SHADOW or DEFAULT by this node's data bit, the
-  connection's inbound budget), on the clock quinn runs on (PathClock: RealTime, or
+  connection's inbound budget, the session's data channels), on the clock quinn runs on (PathClock: RealTime, or
   the network's VirtualTime in simulation). The machine reads the connection's
   time_source, the listener's clock. A data send on a path without both data bits
   is a debug assertion. The field is declared before inbound_budget.
-  Liveness: nothing on the QUIC side can reach last_received_nanos or
-  last_inbound_nanos, so QUIC inbound does not refresh the UDP session. An active
+  Liveness: nothing on the QUIC side, the two data arms of `recv` included, writes
+  last_received_nanos or last_inbound_nanos, so QUIC inbound does not refresh the
+  UDP session. An active
   path writes only quic_receipt_nanos ("Receipt stamp" above).
   With QUIC on, a UDP session differs by those Upgrade packets: they use packet
   ids, enter the sent tracker and flight size, are retransmitted and earn
@@ -1290,7 +1289,9 @@ node a stranger's QUIC datagram during a direct-runner run, so a test can
 check every endpoint was live (`not_allowed`) rather than failed to bind.
 `SimNetwork::quic_upgrade_trace` returns a handle (`quic/upgrade/sim_trace.rs`,
 tests only) with what each node's upgrades did, readable after the run. It also
-injects: `send_initial_on_each_attempt` (the node receives an Initial with the
+injects: `send_shorts_on_paths` (the node sends each message that fits a packet as
+a Short on the connection's path, when that path may carry data, with no fallback
+to UDP; nothing else sends data on a path yet), `send_initial_on_each_attempt` (the node receives an Initial with the
 peer's address as its source each time it allows that address, and records
 `injected an Initial`), `make_record_wrong` (the key compared after the
 handshake disagrees, so the path closes with IDENTITY_MISMATCH),
@@ -1345,7 +1346,8 @@ every rate), endpoint-down, panics and breaker trips, RSS against
 
 Simulation scenarios (`tests/simulation_integration.rs`, `test_quic_*`): two
 nodes established with traffic on UDP; data bits on each side, where only both
-enable data and nothing is sent; QUIC-off peers decline `Disabled`; peers
+enable data and nothing is sent; data at a test percentage with messages sent on
+the path, which come out of `recv` and decode as real messages; QUIC-off peers decline `Disabled`; peers
 below the version floor are never offered; blackholed and idle paths fall back
 and are re-offered; a wrong key closes with IDENTITY_MISMATCH; endpoint-down
 closes every path; an Initial the peer did not send is retried and the real dial
@@ -1586,8 +1588,10 @@ One budget per peer (QUIC memory gate M3): QuicPath::with_budget charges
   limits.max_streams/max_bytes. Charges are keyed by InboundKey:
   Udp(StreamId), Quic(StreamId), QuicShort(u32). The same numeric id on
   both paths is two charges; never charge, test or release one path's
-  stream under another path's variant. UDP's take_expired and
-  live_buffer_streams see only Udp keys (QUIC evicts by its own timers).
+  stream under another path's variant. UDP's take_expired sees only Udp keys
+  (QUIC evicts by its own timers). live_buffer_streams yields Udp and Quic keys,
+  so connection drop cancels unclaimed streams of both; the same id can appear
+  twice, and StreamIdentity tells them apart.
   A gone UDP charge is released ONLY by UDP code (its check and sweep,
   Releaser::Udp), so UDP's release timing is exactly main's; a UDP-only
   node releases as before. (The dedup against restarting a stream is
@@ -1609,22 +1613,26 @@ One budget per peer (QUIC memory gate M3): QuicPath::with_budget charges
   admission holds it from check to charge, so a QUIC charge cannot take
   the room between (pinned by
   udp_admission_holds_one_budget_lock_from_check_to_charge).
-  e5 MUST build node paths with with_budget, and MUST handle:
-  → If the UDP PeerConnection is replaced (reconnect or fallback) while a
-    QUIC path lives, the new connection gets a fresh budget and the peer
-    has two allowances again: hand the path the new handle or rebuild it.
+  Node paths are built with with_budget. What sharing costs, each accepted as
+  stated:
+  → If the UDP PeerConnection is replaced (reconnect or fallback), its session
+    ends and closes the path, so the path never outlives its connection's
+    budget handle.
   → A UDP stream refused because QUIC filled the budget is remembered as
     refused (sticky), and MAX_REMEMBERED_REFUSALS (4096) outstanding
     refusals close the UDP connection. Same as UDP's own overload, but the
-    other path can now cause it.
+    other path can now cause it. The operation retries with a fresh id.
   → A QUIC charge whose consumer never releases it blocks UDP admissions
-    too: the UDP sweep does not evict QUIC streams.
+    too: the UDP sweep does not evict QUIC streams. An incomplete stream ends
+    at the path's own timers. A complete one held by a stuck consumer also
+    blocks on UDP. inbound_stream_complete_charge_past_age counts those, either
+    path, once per stream.
   → A gone UDP charge holds room against QUIC until UDP's next 5 s
     timeout_check sweep (or UDP's own admission under pressure), so QUIC
     can see BUDGET_REFUSED for up to about 5 s on room that is free.
   → The shared Arc can keep UDP charges (and their room) alive after the
-    PeerConnection drops, and no QUIC code releases them: do not keep a
-    path on a gone connection's handle.
+    PeerConnection drops, and no QUIC code releases them. Its drop ends the
+    session first and then releases what is gone.
   Telemetry and logs that read the budget (sample_inbound_concurrency's
   outstanding count, the refusal warning's open_streams/charged_bytes)
   are peer-wide once shared and include QUIC charges.
@@ -1676,8 +1684,41 @@ Control payload (quic/control.rs), the body of a Control frame, one per
   QuicInbound::controls and counts refusals per path
   (control_unknown_version, control_unknown_type, control_malformed); they
   are counted only through it, not by QuicControl::decode.
-Not here: dedup (e5: is_duplicate_dispatch, completed_inbound_streams) and
-  export of the QUIC-only counters (per path, QuicPath::stats).
+Not here: export of the QUIC-only counters (per path, QuicPath::stats).
+QUIC receive flow (#5940 e5b-4):
+  The session owns one pair of data channels for its lifetime (data_channels; 256
+  each) and every path it builds delivers to them, always with try_send. The
+  connection holds the receivers (quic_shorts, quic_streams), read by two guarded
+  arms of recv's select, so nothing waits in the connection's task. Each channel's
+  recv is cancel-safe and each arm's body runs to its end with no await. With QUIC
+  off the guards are false: the 9-branch select gives a disabled branch no place in
+  the order and no part in the random draw, so the poll order and the GlobalRng
+  draws are those of the 7-branch select it replaced
+  (nine_branches_with_the_extra_guards_off_poll_as_seven).
+  A message that arrived whole before its path ended is still delivered.
+  Short arm: put the hash in dispatched_msg_hashes, release the charge at once
+  (release_if_gone on the key the short carries), return the bytes. A Short is never
+  suppressed. Short after the same embedded metadata dispatches twice, as on UDP.
+  Stream arm: an id the budget holds as Udp, or in completed_inbound_streams, is
+  cancelled and counted (inbound_stream_stream_id_on_both_paths). Otherwise the id
+  goes in completed_inbound_streams, so a later UDP fragment is dropped as
+  AlreadyCompleted, and quietly: only the arm counts. A handle already cancelled (it
+  ended while it waited in the channel) is dropped with its charge. Otherwise it goes
+  to the InboundStreamRegistry and its embedded metadata through
+  is_duplicate_dispatch. The handle is not in streaming_handles: the reader task
+  pushes fragments and evicts by its own timer.
+  When a stream's charge goes:
+  → Reader ends with no consumer holding the buffer: at once (StreamGuard).
+  → Cancelled and registered, unclaimed: the orphan GC drops a cancelled row within
+    its 5 s interval, then the UDP sweep (5 s) or the next admission short of room.
+  → Consumer lets go later: the UDP sweep or the next admission short of room.
+  → Complete and unclaimed with the path gone and the connection alive: the orphan
+    timeout (60 s), as for UDP.
+  → Connection drop: PeerConnection::drop ends the session, cancels every unclaimed
+    stream of both paths, and releases what is gone.
+  A UDP session's timers keep running: nothing here writes last_received_nanos or
+  last_inbound_nanos. sample_inbound_concurrency does not run on these arms.
+  record_inbound_completed does.
 ```
 
 #### QUIC errors, close codes and liveness (`quic/error.rs`, `quic/liveness.rs`, #5940 step e4)
