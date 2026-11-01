@@ -179,7 +179,8 @@ pub(super) enum BindOutcome {
 /// connection here costs it, so the window must not be shorter than a single
 /// lost keepalive round trip. The receipt stamp records when the
 /// connection's task processed a packet, not when it arrived, so a backlog
-/// on that task also counts toward the window.
+/// on that task also counts toward the window. Frames on an active QUIC path
+/// count too, stamped at the path's next 2 s watch tick.
 pub(super) const HOLD_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The connection, other than `exclude`, bound to `key`, and whether it was
