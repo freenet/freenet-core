@@ -884,10 +884,11 @@ it must not wait unless it is a pacing point.
 
 `transport-quic` (config key, `off` by default, `shadow` or `prefer`) decides
 whether `bind_udp_listener` builds a quinn endpoint over the DemuxSocket.
-`prefer` runs as `shadow` until QUIC carries data (`QuicMode::effective`;
-`upgrade::policy::log_startup` says so at INFO once per node). The release
-that makes `prefer` carry data must say in its notes that existing `prefer`
-configs start carrying data. Off: no endpoint, no QUIC ingress, nothing
+`prefer` negotiates data with the release's share of pairs ("Data slice" below;
+`upgrade::policy::log_startup` reports the share at INFO once per node). No code
+sends data on a path yet, so `prefer` differs from `shadow` only by that bit. The
+release that makes `prefer` carry data must say in its notes that existing
+`prefer` configs start carrying data. Off: no endpoint, no QUIC ingress, nothing
 changes. QUIC must stay off by default on Windows until the crash-loop
 breaker works there (#6031). Shadow or prefer: the endpoint is built
 with the node's QUIC identity (below) and an EMPTY allow-set, so nothing
@@ -993,6 +994,52 @@ doc has the transition table.
   negotiation_floor_stays_above_every_release_that_ignores_an_offer stops
   QUIC_UPGRADE_NEGOTIATES_IN going down to 0.2.152 or below.
 
+Data slice (#5940 e5b-3): `upgrade/slice.rs`. bucket(a, b) = first 8 bytes of
+BLAKE3("freenet-quic-data-slice-v1" || min(a, b) || max(a, b)), big-endian, mod
+100, over the two transport public keys, the peer's from the node's record. A
+pair is in the slice when its bucket is below the percentage, so 0 holds none,
+100 holds all, and slices nest. A test vector pins the function.
+  The percentage: `QUIC_DATA_PERCENT` in `upgrade/policy.rs`, one value per
+  release, 0 today; the config key `quic-data-percent` (lenient text like
+  `quic-max-paths`; anything but a whole number from 0 to 100 reads as unset, with
+  a WARN when QUIC is on) replaces it on one node. Only `prefer` uses it.
+  `QuicPolicy::own_caps` gives `caps::DATA` when the mode is `prefer` and the pair
+  is in the slice, otherwise 0, and the driver passes that in `Event::Promoted`.
+  The machine reads no key to decide it.
+  A path carries data only with both bits. `Ready` and `ReadyAck` carry the
+  sender's own bit. The peer's bit is read from the frame that activates the
+  attempt and held in `State::Active` for that attempt, so a later frame changes
+  nothing and the next attempt negotiates again. With both set the machine emits
+  `Action::EnableData` and `Outcome::DataEnabled`, which has no counter yet:
+  `QuicUpgradeOutcome` is at 32, the longest array serde and `Default` take, so a
+  new upgrade count needs a labelled set of its own.
+    own 0, peer any: refuses inbound data with NOT_ACCEPTING_DATA, may not send.
+    own 1, peer 0: accepts inbound data, may not send.
+    own 1, peer 1: accepts inbound data, may send (`QuicPath::enable_data`).
+  Accepting is set when the path is built, from the own bit alone
+  (`QuicPathLimits::SHADOW` or `DEFAULT`), because the peer's first stream can
+  overtake the frame carrying its bit. Sending is `QuicPath::send_data`, which
+  `debug_assert_carries_data` reads. The Offer's caps stay 0. A release before the
+  bit clears it on decode and sends 0, so its pairs stay in shadow.
+  No code sends data on a path yet, and frames a peer sends to a node with its own
+  bit set wait in the path's channels, charged to the peer's budget, until the path
+  ends. Nothing reads them. So a node of this release with the bit set (only through
+  `quic-data-percent`) says it reads data when it does not: do not set the key on a
+  node that can meet a release which sends data.
+
+Receipt stamp (#6028, e5b-3): `ReceiptStamp` reads the later of two values,
+`last_inbound_nanos` (UDP) and `quic_receipt_nanos`, on the connection's clock. The
+second is written only by the path's `watch_acknowledgements`, at a tick
+(ACK_WATCH_TICK, 2 s) that saw `frames_received` grow, so PINGs count, and only
+once the machine reports the path established (`PeerHeard` stays empty before
+that). With no active path, as always with QUIC off, it stays 0 and the stamp reads
+as the UDP value alone. Only `identity::key_holder` reads the stamp: a holder heard
+from on its active path within HOLD_WINDOW (30 s) keeps its key against a newer
+claim. A holder can read as heard from up to one tick longer than it really was.
+`last_inbound_nanos` and `last_received_nanos` stay UDP-only, so the keepalive
+backoff and the idle timeout are unchanged, and a holder whose UDP is dead is still
+closed by the idle timeout at 120 s.
+
 Upgrade telemetry (#5940 e5a-6). The driver turns each machine `Outcome` into a
 counter at `Session::count`, which matches every `Outcome` variant, so a new
 outcome does not compile until it has one. All are per-period and reset with the
@@ -1055,13 +1102,14 @@ runs the machine, so nothing of a negotiation runs inside `recv`, which only
   tracks the packet only after the socket took it, with no await between, so a
   send that fails or is dropped leaves nothing in flight. Control frames go through
   send_control_bounded in a task per send, and nothing else is sent on a path.
-  Paths: QuicPath::with_budget(.., QuicPathLimits::SHADOW, the connection's
-  inbound budget), on the clock quinn runs on (PathClock: RealTime, or the
-  network's VirtualTime in simulation). The machine reads the connection's
-  time_source, the listener's clock. A data send on a shadow path is a debug
-  assertion. The field is declared before inbound_budget.
+  Paths: QuicPath::with_budget(.., SHADOW or DEFAULT by this node's data bit, the
+  connection's inbound budget), on the clock quinn runs on (PathClock: RealTime, or
+  the network's VirtualTime in simulation). The machine reads the connection's
+  time_source, the listener's clock. A data send on a path without both data bits
+  is a debug assertion. The field is declared before inbound_budget.
   Liveness: nothing on the QUIC side can reach last_received_nanos or
-  last_inbound_nanos, so QUIC inbound does not refresh the UDP session.
+  last_inbound_nanos, so QUIC inbound does not refresh the UDP session. An active
+  path writes only quic_receipt_nanos ("Receipt stamp" above).
   With QUIC on, a UDP session differs by those Upgrade packets: they use packet
   ids, enter the sent tracker and flight size, are retransmitted and earn
   receipts.
@@ -1294,7 +1342,8 @@ every rate), endpoint-down, panics and breaker trips, RSS against
   node in a broken state may not self-update.
 
 Simulation scenarios (`tests/simulation_integration.rs`, `test_quic_*`): two
-nodes established with traffic on UDP; QUIC-off peers decline `Disabled`; peers
+nodes established with traffic on UDP; data bits on each side, where only both
+enable data and nothing is sent; QUIC-off peers decline `Disabled`; peers
 below the version floor are never offered; blackholed and idle paths fall back
 and are re-offered; a wrong key closes with IDENTITY_MISMATCH; endpoint-down
 closes every path; an Initial the peer did not send is retried and the real dial
@@ -1371,8 +1420,8 @@ either side, and a man in the middle with its own key on either leg.
 
 #### QUIC framing and path (`quic/framing.rs`, `quic/path.rs`, #5940 step e3)
 
-The upgrade driver builds a `QuicPath` in shadow, and sends only control frames
-on it; data sends are for e5b.
+The upgrade driver builds a `QuicPath` and sends only control frames on it; data
+sends are for e5b.
 
 ```
 One message per QUIC uni stream: an 18-byte header, then metadata, then
@@ -1612,8 +1661,8 @@ Control payload (quic/control.rs), the body of a Control frame, one per
   first (a later version is UnknownVersion at any length), refuses an
   unknown type and a v1 payload of any other length (bytes appended at the
   end too, so a field cannot be added without a version), and clears caps
-  bits outside caps::KNOWN (0: no bit defined; e5b defines the first, and
-  settles whether Offer and QuicControl share one definition of the bits).
+  bits outside caps::KNOWN (caps::DATA = 1, the only bit, see "Data slice").
+  The Offer's caps field is separate and stays 0.
   A new type or field needs a new version. UpgradeControl differs: bincode
   tolerates trailing bytes there, so it grows by caps-gated variants. A
   sender cannot learn from these frames that the peer reads a new version,

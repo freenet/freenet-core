@@ -491,31 +491,42 @@ pub(crate) trait InboundStreamRegistry: Send + Sync {
     );
 }
 
-/// When a connection last received an authenticated packet, readable from
-/// outside the task that owns the connection. Cheap to clone; every clone
-/// reads the same stamp.
+/// When a connection last received an authenticated packet, on its UDP session
+/// or on its active QUIC path, readable from outside the task that owns the
+/// connection. Cheap to clone; every clone reads the same stamp.
 #[derive(Clone)]
 pub(crate) struct ReceiptStamp {
     last_nanos: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    quic_last_nanos: std::sync::Arc<std::sync::atomic::AtomicU64>,
     now_nanos: std::sync::Arc<dyn Fn() -> u64 + Send + Sync>,
 }
 
 impl ReceiptStamp {
-    /// `last_nanos` is the time of the last authenticated receipt and
-    /// `now_nanos` reads the clock it was stamped with.
+    /// `last_nanos` and `quic_last_nanos` are the times of the last
+    /// authenticated receipt on each side, and `now_nanos` reads the clock
+    /// both were stamped with. `quic_last_nanos` stays 0 with no active path.
     pub(crate) fn new(
         last_nanos: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        quic_last_nanos: std::sync::Arc<std::sync::atomic::AtomicU64>,
         now_nanos: std::sync::Arc<dyn Fn() -> u64 + Send + Sync>,
     ) -> Self {
         Self {
             last_nanos,
+            quic_last_nanos,
             now_nanos,
         }
     }
 
-    /// Time since the connection last received an authenticated packet.
+    /// Time since the connection last received an authenticated packet, on
+    /// either side.
     pub(crate) fn since_last_receipt(&self) -> std::time::Duration {
-        let last = self.last_nanos.load(std::sync::atomic::Ordering::Acquire);
+        let last = self
+            .last_nanos
+            .load(std::sync::atomic::Ordering::Acquire)
+            .max(
+                self.quic_last_nanos
+                    .load(std::sync::atomic::Ordering::Acquire),
+            );
         std::time::Duration::from_nanos((self.now_nanos)().saturating_sub(last))
     }
 }
@@ -546,7 +557,8 @@ pub(crate) trait PeerConnectionApi: Send {
     fn remote_version(&self) -> Option<(u8, u8, u16)>;
 
     /// When this connection last received an authenticated packet (any
-    /// packet that decrypted under the session key, keepalives included).
+    /// packet that decrypted under the session key, keepalives included, or
+    /// frames on its active QUIC path, within a tick of the path's watch).
     /// `None` when the connection does not track it, as for test doubles.
     fn receipt_stamp(&self) -> Option<ReceiptStamp> {
         None

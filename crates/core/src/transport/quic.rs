@@ -100,10 +100,11 @@ pub enum QuicMode {
     /// the endpoint's memory. If the endpoint cannot be built the node logs a
     /// warning and runs with QUIC off.
     Shadow,
-    /// Meant to carry application data over QUIC. Until that ships it acts
-    /// as [`Self::Shadow`] (see [`Self::effective`]), so a node that sets it
-    /// early starts carrying data over QUIC once it runs a release where
-    /// `prefer` does. That release's notes must say so.
+    /// Negotiates data on a path to a peer in the release's slice
+    /// (`upgrade::slice`). This release sends no data on any path, so it acts as
+    /// [`Self::Shadow`] on the wire apart from the caps bit. A node that sets it
+    /// early starts carrying data over QUIC once it runs a release that sends it.
+    /// That release's notes must say so.
     Prefer,
 }
 
@@ -140,16 +141,6 @@ impl QuicMode {
         match self {
             Self::Off => false,
             Self::Shadow | Self::Prefer => true,
-        }
-    }
-
-    /// The mode this release runs: `Off` and `Shadow` are themselves, and
-    /// `Prefer` runs as `Shadow`. Startup says so at INFO
-    /// ([`upgrade::policy::log_startup`]).
-    pub(crate) fn effective(self) -> Self {
-        match self {
-            Self::Off => Self::Off,
-            Self::Shadow | Self::Prefer => Self::Shadow,
         }
     }
 }

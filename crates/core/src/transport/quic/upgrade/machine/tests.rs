@@ -37,6 +37,10 @@ struct Rig {
     peer: TransportPublicKey,
     now: Duration,
     sample: f64,
+    /// What `Promoted` carries as this node's caps.
+    own_caps: u32,
+    /// What the peer's `Ready` and `ReadyAck` carry in the table.
+    peer_caps: u32,
 }
 
 impl Rig {
@@ -57,6 +61,8 @@ impl Rig {
             peer,
             now: Duration::from_secs(1000),
             sample: NO_JITTER,
+            own_caps: 0,
+            peer_caps: 0,
         }
     }
 
@@ -80,10 +86,12 @@ impl Rig {
         backoff: BackoffSeed,
     ) -> Vec<Action> {
         let peer_key = self.peer.clone();
+        let own_caps = self.own_caps;
         self.step(Event::Promoted {
             peer_key,
             remote_version,
             backoff,
+            own_caps,
         })
     }
 
@@ -127,7 +135,8 @@ impl Rig {
             let attempt = self.machine.last_attempt;
             self.step(Event::Upgrade(UpgradeControl::Accept { attempt }));
             self.step(Event::PathEstablished { attempt });
-            self.step(Event::Control(QuicControl::ReadyAck { attempt, caps: 0 }));
+            let caps = self.peer_caps;
+            self.step(Event::Control(QuicControl::ReadyAck { attempt, caps }));
             attempt
         } else {
             let attempt = self
@@ -136,7 +145,8 @@ impl Rig {
                 .map_or(CLIENT_ATTEMPT, |last| last + 1);
             self.offer(attempt);
             self.step(Event::PathEstablished { attempt });
-            self.step(Event::Control(QuicControl::Ready { attempt, caps: 0 }));
+            let caps = self.peer_caps;
+            self.step(Event::Control(QuicControl::Ready { attempt, caps }));
             attempt
         }
     }
@@ -208,11 +218,18 @@ fn attempt_of(role: Role) -> u32 {
 
 /// A rig in `state`.
 fn reach(role: Role, state: S) -> Rig {
-    if state == S::Unpromoted {
-        return Rig::new(role);
+    reach_with(role, state, 0, 0)
+}
+
+/// A rig in `state`, with these caps on each side.
+fn reach_with(role: Role, state: S, own_caps: u32, peer_caps: u32) -> Rig {
+    let mut rig = Rig::new(role);
+    rig.own_caps = own_caps;
+    rig.peer_caps = peer_caps;
+    if state != S::Unpromoted {
+        rig.promote(Some(QUIC_UPGRADE_NEGOTIATES_IN));
+        advance_to(&mut rig, role, state);
     }
-    let mut rig = Rig::promoted(role);
-    advance_to(&mut rig, role, state);
     rig
 }
 
@@ -301,7 +318,8 @@ const OTHER_EVENTS: [&str; 10] = [
     "session_ended",
 ];
 
-fn event(name: &str, attempt: u32, peer: &TransportPublicKey) -> Event {
+fn event(name: &str, attempt: u32, rig: &Rig) -> Event {
+    let peer_caps = rig.peer_caps;
     let failed = |kind| Event::PathFailed { attempt, kind };
     let refused = |error| Event::ControlRefused { attempt, error };
     let sent = |error| Event::ControlSent {
@@ -310,9 +328,10 @@ fn event(name: &str, attempt: u32, peer: &TransportPublicKey) -> Event {
     };
     match name {
         "promoted" => Event::Promoted {
-            peer_key: peer.clone(),
+            peer_key: rig.peer.clone(),
             remote_version: Some(QUIC_UPGRADE_NEGOTIATES_IN),
             backoff: BackoffSeed::default(),
+            own_caps: rig.own_caps,
         },
         "tick" => Event::Tick,
         "offer" => Event::Upgrade(UpgradeControl::Offer { attempt, caps: 0 }),
@@ -334,8 +353,14 @@ fn event(name: &str, attempt: u32, peer: &TransportPublicKey) -> Event {
             attempt,
             reason: DeclineReason::Disabled.wire(),
         }),
-        "ready" => Event::Control(QuicControl::Ready { attempt, caps: 0 }),
-        "ready_ack" => Event::Control(QuicControl::ReadyAck { attempt, caps: 0 }),
+        "ready" => Event::Control(QuicControl::Ready {
+            attempt,
+            caps: peer_caps,
+        }),
+        "ready_ack" => Event::Control(QuicControl::ReadyAck {
+            attempt,
+            caps: peer_caps,
+        }),
         "established" => Event::PathEstablished { attempt },
         "sent_ok" => Event::ControlSent {
             attempt,
@@ -475,10 +500,7 @@ fn expected(role: Role, state: S, name: &str) -> Option<(S, Vec<Action>)> {
         // A connection proves the peer accepted: counted once, here, when
         // the `Accept` has not been seen.
         (Role::Server, S::Offered | S::Connecting, "established") => {
-            let mut actions = vec![SendControl(QuicControl::Ready {
-                attempt,
-                caps: caps::KNOWN,
-            })];
+            let mut actions = vec![SendControl(QuicControl::Ready { attempt, caps: 0 })];
             if state == S::Offered {
                 actions.push(Record(Outcome::Accepted));
             }
@@ -496,10 +518,7 @@ fn expected(role: Role, state: S, name: &str) -> Option<(S, Vec<Action>)> {
         (Role::Client, S::Connecting | S::Confirming, "ready") => Some((
             S::Active,
             vec![
-                SendControl(QuicControl::ReadyAck {
-                    attempt,
-                    caps: caps::KNOWN,
-                }),
+                SendControl(QuicControl::ReadyAck { attempt, caps: 0 }),
                 Record(Outcome::Established(Role::Client)),
             ],
         )),
@@ -584,6 +603,39 @@ fn expected(role: Role, state: S, name: &str) -> Option<(S, Vec<Action>)> {
 
         _ => None,
     }
+}
+
+/// [`expected`] for a machine with these caps: its frames carry its own, and
+/// the frame that activates the path, carrying the peer's, adds what follows
+/// when both have the data bit.
+fn expected_with(
+    role: Role,
+    state: S,
+    name: &str,
+    own_caps: u32,
+    peer_caps: u32,
+) -> Option<(S, Vec<Action>)> {
+    let (next, mut actions) = expected(role, state, name)?;
+    for action in &mut actions {
+        if let Action::SendControl(
+            QuicControl::Ready { caps, .. } | QuicControl::ReadyAck { caps, .. },
+        ) = action
+        {
+            *caps = own_caps;
+        }
+    }
+    let activates = matches!(
+        (role, state, name),
+        (Role::Client, S::Connecting | S::Confirming, "ready")
+            | (Role::Server, S::Confirming, "ready_ack")
+    );
+    if activates && own_caps & peer_caps & caps::DATA != 0 {
+        actions.push(Action::EnableData {
+            attempt: attempt_of(role),
+        });
+        actions.push(Action::Record(Outcome::DataEnabled));
+    }
+    Some((next, actions))
 }
 
 fn holds_a_permit(state: S) -> bool {
@@ -689,12 +741,27 @@ fn ledger_after(
 /// is held exactly while the next state needs it, and the ledger moves only as
 /// [`ledger_after`] says.
 fn check(role: Role, state: S, name: &str, attempt: u32, want: Option<(S, Vec<Action>)>) {
-    let case = format!("{role:?} {state:?} {name} attempt {attempt}");
-    let mut rig = reach(role, state);
+    check_with(role, state, name, attempt, want, 0, 0);
+}
+
+/// [`check`], with these caps on each side. Also checks that the path carries
+/// data exactly when it is active and both have the bit.
+fn check_with(
+    role: Role,
+    state: S,
+    name: &str,
+    attempt: u32,
+    want: Option<(S, Vec<Action>)>,
+    own_caps: u32,
+    peer_caps: u32,
+) {
+    let case = format!(
+        "{role:?} {state:?} {name} attempt {attempt}, caps {own_caps} own, {peer_caps} peer"
+    );
+    let mut rig = reach_with(role, state, own_caps, peer_caps);
     let before_deadline = rig.machine.deadline();
     // Past every deadline, so "tick" is due wherever it can be.
     rig.now = rig.machine.deadline().unwrap_or(rig.now).max(rig.now);
-    let peer = rig.peer.clone();
     let want_ledger = ledger_after(
         Ledger::of(&rig.machine),
         rig.now,
@@ -704,11 +771,17 @@ fn check(role: Role, state: S, name: &str, attempt: u32, want: Option<(S, Vec<Ac
         attempt,
         &want,
     );
-    let actions = rig.step(event(name, attempt, &peer));
+    let happened = event(name, attempt, &rig);
+    let actions = rig.step(happened);
     assert_eq!(Ledger::of(&rig.machine), want_ledger, "{case}: ledger");
     let (next, want_actions) = want.unwrap_or_else(|| (state, Vec::new()));
     assert_eq!(actions, want_actions, "{case}: actions");
     assert_eq!(label(&rig.machine), next, "{case}: next state");
+    assert_eq!(
+        rig.machine.carries_data(),
+        next == S::Active && own_caps & peer_caps & caps::DATA != 0,
+        "{case}: carries data"
+    );
     assert_eq!(
         rig.in_use(),
         usize::from(holds_a_permit(next)),
@@ -753,6 +826,155 @@ fn every_transition_for_the_current_attempt() {
             );
         }
     }
+}
+
+/// The same table for every (own bit, peer bit), so each row of it is also
+/// checked with the data bit on either side, and stale attempts too: a peer's bit
+/// counts only in the frame that activates its own attempt.
+#[test]
+fn every_transition_for_every_pair_of_data_bits() {
+    let bits = [0, caps::DATA];
+    for own_caps in bits {
+        // A bit this node does not know is no data bit.
+        for peer_caps in [0, caps::DATA, 0x8000_0000] {
+            for (role, state) in pairs() {
+                for name in ATTEMPT_EVENTS.into_iter().chain(OTHER_EVENTS) {
+                    check_with(
+                        role,
+                        state,
+                        name,
+                        attempt_of(role),
+                        expected_with(role, state, name, own_caps, peer_caps),
+                        own_caps,
+                        peer_caps,
+                    );
+                }
+                for name in ATTEMPT_EVENTS {
+                    let stale = attempt_of(role) + STALE;
+                    check_with(role, state, name, stale, None, own_caps, peer_caps);
+                }
+            }
+        }
+    }
+}
+
+/// Written out once, apart from the table: each role with both bits gets
+/// `EnableData` for its attempt, and a pair with either bit clear stays shadow,
+/// though each side's frame says what it has.
+#[test]
+fn a_path_carries_data_only_with_both_bits() {
+    let data = caps::DATA;
+    for (own, peer, carries) in [
+        (0, 0, false),
+        (0, data, false),
+        (data, 0, false),
+        (data, data, true),
+    ] {
+        let case = format!("own {own}, peer {peer}");
+        let mut server = reach_with(Role::Server, S::Connecting, own, peer);
+        let attempt = SERVER_ATTEMPT;
+        assert_eq!(server.machine.accepts_data(), own == data, "{case}");
+        assert_eq!(
+            server.step(Event::PathEstablished { attempt }),
+            [Action::SendControl(QuicControl::Ready {
+                attempt,
+                caps: own
+            })],
+            "{case}: Ready says what this node has"
+        );
+        let mut want = vec![Action::Record(Outcome::Established(Role::Server))];
+        if carries {
+            want.push(Action::EnableData { attempt });
+            want.push(Action::Record(Outcome::DataEnabled));
+        }
+        assert_eq!(
+            server.step(Event::Control(QuicControl::ReadyAck {
+                attempt,
+                caps: peer
+            })),
+            want,
+            "{case}: server"
+        );
+        assert_eq!(server.machine.carries_data(), carries, "{case}");
+
+        let mut client = reach_with(Role::Client, S::Connecting, own, peer);
+        let attempt = CLIENT_ATTEMPT;
+        let mut want = vec![
+            Action::SendControl(QuicControl::ReadyAck { attempt, caps: own }),
+            Action::Record(Outcome::Established(Role::Client)),
+        ];
+        if carries {
+            want.push(Action::EnableData { attempt });
+            want.push(Action::Record(Outcome::DataEnabled));
+        }
+        assert_eq!(
+            client.step(Event::Control(QuicControl::Ready {
+                attempt,
+                caps: peer
+            })),
+            want,
+            "{case}: client"
+        );
+        assert_eq!(client.machine.carries_data(), carries, "{case}");
+    }
+}
+
+/// A frame repeated on an active path changes nothing, in either direction, so a
+/// peer cannot turn data on or off after the path is up.
+#[test]
+fn a_later_frame_does_not_change_an_active_path() {
+    for (own, first, later) in [(caps::DATA, 0, caps::DATA), (caps::DATA, caps::DATA, 0)] {
+        let mut server = reach_with(Role::Server, S::Active, own, first);
+        let carried = server.machine.carries_data();
+        let again = server.step(Event::Control(QuicControl::ReadyAck {
+            attempt: SERVER_ATTEMPT,
+            caps: later,
+        }));
+        assert!(again.is_empty(), "{again:?}");
+        assert_eq!(server.machine.carries_data(), carried);
+
+        let mut client = reach_with(Role::Client, S::Active, own, first);
+        let carried = client.machine.carries_data();
+        let again = client.step(Event::Control(QuicControl::Ready {
+            attempt: CLIENT_ATTEMPT,
+            caps: later,
+        }));
+        assert!(again.is_empty(), "{again:?}");
+        assert_eq!(client.machine.carries_data(), carried);
+    }
+}
+
+/// A path that ends takes the peer's bit with it: the next attempt reads the
+/// peer's new frame, and a peer that stopped setting the bit stays shadow. This
+/// node's own bit stays, as it comes from the promotion. A later promotion
+/// cannot change it.
+#[test]
+fn each_attempt_negotiates_data_again() {
+    let mut server = reach_with(Role::Server, S::Active, caps::DATA, caps::DATA);
+    assert!(server.machine.carries_data());
+    server.step(Event::PathFailed {
+        attempt: SERVER_ATTEMPT,
+        kind: QuicErrorKind::TimedOut,
+    });
+    assert!(!server.machine.carries_data(), "no path");
+    assert!(server.machine.accepts_data());
+    let peer = server.peer.clone();
+    server.step(Event::Promoted {
+        peer_key: peer,
+        remote_version: Some(QUIC_UPGRADE_NEGOTIATES_IN),
+        backoff: BackoffSeed::default(),
+        own_caps: 0,
+    });
+    assert!(
+        server.machine.accepts_data(),
+        "a later promotion is ignored"
+    );
+    server.now = server.machine.retry_at;
+    server.peer_caps = 0;
+    let attempt = server.activate();
+    assert_eq!(attempt, SERVER_ATTEMPT + 1);
+    assert_eq!(label(&server.machine), S::Active);
+    assert!(!server.machine.carries_data(), "the new frame has no bit");
 }
 
 /// Every event that names an attempt, for an attempt that is not the current
@@ -1180,13 +1402,9 @@ fn down_is_terminal() {
         assert_eq!(rig.machine.retry_at, retry_at, "{case}");
         assert_eq!(rig.machine.deadline(), None, "{case}");
         assert_eq!(rig.tick_at(rig.now + BACKOFF_MAX * 10), vec![], "{case}");
-        let peer = rig.peer.clone();
         for name in ATTEMPT_EVENTS {
-            assert_eq!(
-                rig.step(event(name, attempt_of(role), &peer)),
-                vec![],
-                "{case} {name}"
-            );
+            let happened = event(name, attempt_of(role), &rig);
+            assert_eq!(rig.step(happened), vec![], "{case} {name}");
         }
         rig.step(Event::Upgrade(UpgradeControl::Offer {
             attempt: 1000,
@@ -2119,6 +2337,7 @@ impl Pair {
             peer_key: rig.peer.clone(),
             remote_version: Some(QUIC_UPGRADE_NEGOTIATES_IN),
             backoff: BackoffSeed::default(),
+            own_caps: 0,
         };
         let start = pair.now();
         // A client not yet promoted is what declines, so a Decline can be lost.
@@ -2201,7 +2420,7 @@ impl Pair {
                     self.wire
                         .push((at, peer, Event::PathFailed { attempt, kind }));
                 }
-                Action::TearDown { .. } | Action::Record(_) => {}
+                Action::TearDown { .. } | Action::EnableData { .. } | Action::Record(_) => {}
             }
         }
     }

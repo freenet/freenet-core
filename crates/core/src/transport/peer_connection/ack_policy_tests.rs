@@ -3584,6 +3584,41 @@ async fn quic_inbound_does_not_move_the_udp_idle_clocks() {
     assert!(after.0 > before.0 && after.1 > before.1, "{after:?}");
 }
 
+/// What a session's active path writes reaches the connection's receipt stamp,
+/// the session and the connection sharing the one value, and moves neither of the
+/// UDP clocks that the keepalive backoff and the idle timeout read.
+#[tokio::test(start_paused = true)]
+async fn a_quic_receipt_moves_the_stamp_and_no_udp_clock() {
+    use std::sync::atomic::Ordering;
+    let hub =
+        crate::transport::quic::upgrade::driver::tests::Harness::server("ack-policy-stamp", 23)
+            .await;
+    let mut e = single(CAPABLE);
+    e.conn = e.conn.with_upgrade_site(&hub.site());
+    let time = e.conn.remote_conn.time_source.clone();
+    let stamp = e.conn.receipt_stamp_handle();
+    let udp_clocks = |e: &End| {
+        (
+            e.conn.last_received_nanos,
+            e.conn.last_inbound_nanos.load(Ordering::Relaxed),
+        )
+    };
+    let before = udp_clocks(&e);
+    tokio::time::advance(Duration::from_secs(40)).await;
+    assert!(
+        stamp.since_last_receipt() >= Duration::from_secs(40),
+        "the premise: nothing heard yet"
+    );
+    e.conn
+        .quic_path
+        .as_ref()
+        .expect("joined")
+        .quic_receipt_nanos()
+        .store(time.now_nanos(), Ordering::Release);
+    assert_eq!(stamp.since_last_receipt(), Duration::ZERO);
+    assert_eq!(udp_clocks(&e), before);
+}
+
 /// A session starts on `Set` and `Same`, the two outcomes of a promotion the
 /// transport takes. A key merely dialled starts nothing, and a promotion refused
 /// for another key starts nothing.

@@ -482,11 +482,13 @@ pub(crate) struct QuicPath {
     /// ([`STREAMED_SEND_LIMIT`]), so the remaining uni stream slots stay
     /// for short messages and control frames. Never closed.
     stream_slots: tokio::sync::Semaphore,
-    /// Whether the path accepts data ([`QuicPathLimits::accept_data`]). A path
-    /// that does not (shadow) must not send data either: in shadow a fragment
-    /// taken from an inbound handle cannot outlive its charge because nothing
-    /// is ever forwarded.
-    accept_data: bool,
+    /// Whether this path may send data: both sides set the data bit
+    /// ([`Self::enable_data`]). Off for a path in shadow, where a fragment taken
+    /// from an inbound handle cannot outlive its charge because nothing is ever
+    /// forwarded.
+    send_data: std::sync::atomic::AtomicBool,
+    /// Where the path's watch reports that the peer was heard from.
+    heard: Arc<recycle::PeerHeard>,
     #[cfg(test)]
     budget: SharedInboundBudget,
 }
@@ -527,7 +529,12 @@ impl QuicPath {
         limits: QuicPathLimits,
     ) -> (Self, QuicInbound) {
         let budget = SharedInboundBudget::new(limits.max_streams, limits.max_bytes);
-        Self::with_budget(connection, time, limits, budget)
+        let (path, inbound) = Self::with_budget(connection, time, limits, budget);
+        // A test path has no negotiation: one that accepts data sends it too.
+        if limits.accept_data {
+            path.enable_data();
+        }
+        (path, inbound)
     }
 
     /// [`Self::with_limits`], charging inbound streams to `budget` instead
@@ -595,6 +602,7 @@ impl QuicPath {
             receiver.panic_on_stream = limits.panic_in_receive;
         }
         let aborts = Arc::new(SendAborts::new(limits.max_send_aborts, connection.closer()));
+        let heard = Arc::new(recycle::PeerHeard::default());
         let receive = GlobalExecutor::spawn(supervise_receive(
             connection.inner().clone(),
             connection.closer(),
@@ -602,6 +610,7 @@ impl QuicPath {
             stats.clone(),
             time,
             connection.cap_holds(),
+            heard.clone(),
         ));
         (
             Self {
@@ -610,7 +619,8 @@ impl QuicPath {
                 receive,
                 aborts,
                 stream_slots: tokio::sync::Semaphore::new(STREAMED_SEND_LIMIT as usize),
-                accept_data: limits.accept_data,
+                send_data: std::sync::atomic::AtomicBool::new(false),
+                heard,
                 #[cfg(test)]
                 budget,
             },
@@ -687,10 +697,29 @@ impl QuicPath {
         self.connection.inner().clone()
     }
 
-    /// A data send must not happen on a shadow path. See `accept_data`.
+    /// Both sides set the data bit: this path may send data. Accepting data is
+    /// separate, set by [`QuicPathLimits::accept_data`] when the path is built.
+    pub(in crate::transport) fn enable_data(&self) {
+        self.send_data
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// From now on, call `report` when the peer is heard from on this path
+    /// ([`recycle::watch_acknowledgements`]).
+    pub(in crate::transport) fn report_receipts_to(&self, report: Box<dyn Fn() + Send + Sync>) {
+        self.heard.report_to(report);
+    }
+
+    /// Whether this path may send data.
+    #[cfg(test)]
+    pub(in crate::transport) fn sends_data(&self) -> bool {
+        self.send_data.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// A data send must not happen on a shadow path. See `send_data`.
     fn debug_assert_carries_data(&self) {
         debug_assert!(
-            self.accept_data,
+            self.send_data.load(std::sync::atomic::Ordering::Acquire),
             "a shadow QUIC path sends control frames only"
         );
     }
@@ -978,6 +1007,7 @@ async fn supervise_receive<T: TimeSource>(
     stats: Arc<QuicPathStats>,
     time: T,
     cap_holds: Arc<super::socket::CapHolds>,
+    heard: Arc<recycle::PeerHeard>,
 ) {
     use futures::FutureExt;
     let mut receive = std::pin::pin!(
@@ -988,6 +1018,7 @@ async fn supervise_receive<T: TimeSource>(
         closer.clone(),
         time,
         cap_holds,
+        heard,
     ))
     .catch_unwind();
     let ended = tokio::select! {

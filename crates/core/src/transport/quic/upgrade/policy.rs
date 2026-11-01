@@ -4,8 +4,7 @@
 //! [`QuicPolicy::disabled_by`] names the first rule that stops upgrades, and
 //! [`QuicPolicy::allowed`] is true when none does:
 //!
-//! - `transport-quic` is not `off` ([`QuicMode`]; `prefer` runs as `shadow`
-//!   in this release);
+//! - `transport-quic` is not `off` ([`QuicMode`]);
 //! - the crash-loop breaker is not keeping QUIC off ([`BreakerOutcome`]).
 //!   Today a suppressing breaker also stops the endpoint being built, so the
 //!   availability is `Disabled` anyway; the policy checks the breaker itself
@@ -19,6 +18,9 @@
 //! dialing through active, at `quic-max-paths`. A permit is released when it
 //! is dropped, so a path cannot keep one past its own end.
 //!
+//! [`QuicPolicy::own_caps`] is this node's half of the data negotiation: the
+//! data bit for a peer in the slice, in `prefer` mode only.
+//!
 //! [`super::driver`] reads the policy for each decision. [`log_startup`] runs
 //! at node startup.
 
@@ -26,15 +28,24 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::config::{NetworkApiConfig, QuicMaxPathsSetting};
+use crate::transport::TransportPublicKey;
 use crate::transport::quic::QuicMode;
 use crate::transport::quic::breaker::{BreakerOutcome, Verdict};
+use crate::transport::quic::control::caps;
 use crate::transport::quic::liveness::{QuicAvailability, QuicAvailabilityWatch};
+
+/// The share of pairs, in percent, that carry data on QUIC in this release, for
+/// a node in `prefer` mode. One value per release, changed in its own PR: 0, 5,
+/// 25, 100. Both sides must set their bit, so a pair moves only once both run a
+/// release that puts it in the slice. `quic-data-percent` replaces it on one node.
+pub(in crate::transport) const QUIC_DATA_PERCENT: u8 = 0;
 
 /// The node's QUIC upgrade policy. See the module docs.
 #[derive(Debug, Clone)]
 pub(crate) struct QuicPolicy {
-    /// The mode this release runs ([`QuicMode::effective`]): never `Prefer`.
     mode: QuicMode,
+    /// `quic-data-percent`, or [`QUIC_DATA_PERCENT`].
+    data_percent: u8,
     breaker: BreakerOutcome,
     availability: QuicAvailabilityWatch,
     permits: QuicPathPermits,
@@ -45,6 +56,7 @@ pub(crate) struct QuicPolicy {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct QuicPolicyConfig {
     mode: QuicMode,
+    data_percent: u8,
     max_paths: usize,
     breaker: BreakerOutcome,
 }
@@ -56,7 +68,8 @@ impl QuicPolicyConfig {
     /// [`breaker::gate`]: crate::transport::quic::breaker::gate
     pub(crate) fn new(config: &NetworkApiConfig, breaker: BreakerOutcome) -> Self {
         Self {
-            mode: configured_mode(config).effective(),
+            mode: configured_mode(config),
+            data_percent: config.quic_data_percent().unwrap_or(QUIC_DATA_PERCENT),
             max_paths: config.quic_max_paths(),
             breaker,
         }
@@ -129,13 +142,14 @@ impl QuicPolicy {
     ) -> Self {
         Self {
             mode: config.mode,
+            data_percent: config.data_percent,
             breaker: config.breaker,
             availability,
             permits: QuicPathPermits::new(config.max_paths),
         }
     }
 
-    /// The mode the node runs: `Off` or `Shadow`.
+    /// The mode the node runs.
     #[cfg(test)]
     pub(crate) fn mode(&self) -> QuicMode {
         self.mode
@@ -177,6 +191,22 @@ impl QuicPolicy {
             return Err(PathRefusal::Disabled(cause));
         }
         self.permits.try_acquire().ok_or(PathRefusal::Busy)
+    }
+
+    /// What this node says it supports on a path to `peer`
+    /// ([`crate::transport::quic::control::caps`]). The peer's key comes from the
+    /// node's record, never from a message, so a peer cannot choose its bucket.
+    pub(in crate::transport) fn own_caps(
+        &self,
+        local: &TransportPublicKey,
+        peer: &TransportPublicKey,
+    ) -> u32 {
+        match self.mode {
+            QuicMode::Prefer if super::slice::in_slice(local, peer, self.data_percent) => {
+                caps::DATA
+            }
+            QuicMode::Off | QuicMode::Shadow | QuicMode::Prefer => 0,
+        }
     }
 
     /// The path permits.
@@ -225,10 +255,11 @@ fn configured_mode(config: &NetworkApiConfig) -> QuicMode {
     QuicMode::from_config_value(config.transport_quic.as_deref())
 }
 
-/// Report the QUIC upgrade configuration once, at node startup: that
-/// `prefer` runs as `shadow` (INFO), and, with QUIC on, a `quic-max-paths`
-/// that cannot be parsed (WARN) or is lowered to `max-number-of-connections`
-/// (INFO). In a build that aborts on panic QUIC stays off whatever the
+/// Report the QUIC upgrade configuration once, at node startup: the share of
+/// pairs `prefer` negotiates data with (INFO), and, with QUIC on, a
+/// `quic-data-percent` (WARN) or `quic-max-paths` (WARN) that cannot be parsed, or
+/// a `quic-max-paths` lowered to `max-number-of-connections` (INFO). In a build
+/// that aborts on panic QUIC stays off whatever the
 /// configuration (`QuicEndpoint::bind` refuses), and only that is reported
 /// (WARN).
 pub(crate) fn log_startup(config: &NetworkApiConfig) {
@@ -242,13 +273,26 @@ pub(crate) fn log_startup(config: &NetworkApiConfig) {
     }
     if configured_mode(config) == QuicMode::Prefer {
         tracing::info!(
-            "transport-quic = \"prefer\" runs as \"shadow\" in this release: QUIC paths \
-             carry only control frames and all application traffic stays on UDP"
+            data_percent = config.quic_data_percent().unwrap_or(QUIC_DATA_PERCENT),
+            "transport-quic = \"prefer\" negotiates data with this share of pairs; this \
+             release sends no data on QUIC paths: they carry only control frames and all \
+             application traffic stays on UDP"
         );
     }
-    // `quic-max-paths` matters only with QUIC on.
+    // These keys matter only with QUIC on.
     if configured_mode(config) == QuicMode::Off {
         return;
+    }
+    if let (Some(raw), None) = (
+        config.quic_data_percent.as_deref(),
+        config.quic_data_percent(),
+    ) {
+        tracing::warn!(
+            quic_data_percent = %raw,
+            default = QUIC_DATA_PERCENT,
+            "quic-data-percent is not a whole number from 0 to 100 and is ignored; using \
+             this release's share of pairs"
+        );
     }
     match config.quic_max_paths_setting() {
         QuicMaxPathsSetting::Unset => {}
@@ -369,8 +413,8 @@ mod tests {
         assert_eq!(policy.permits().in_use(), 0);
     }
 
-    /// The policy takes its mode and limit from the config: `prefer` runs as
-    /// shadow, the limit is `quic-max-paths` lowered to
+    /// The policy takes its mode and limit from the config: the limit is
+    /// `quic-max-paths` lowered to
     /// `max-number-of-connections`, and an unparsable value means the
     /// default.
     #[test]
@@ -384,7 +428,7 @@ mod tests {
         for (mode, effective) in [
             ("off", QuicMode::Off),
             ("shadow", QuicMode::Shadow),
-            ("prefer", QuicMode::Shadow),
+            ("prefer", QuicMode::Prefer),
             ("a-later-mode", QuicMode::Off),
         ] {
             assert_eq!(build(mode, None).mode(), effective, "{mode}");
@@ -409,6 +453,41 @@ mod tests {
             max_connections,
             "lowered to max-number-of-connections"
         );
+    }
+
+    /// The data bit needs `prefer`, the peer in the slice, and the key or the
+    /// release's share to say so. `shadow` never sets it, whatever the key says,
+    /// and at this release's share `prefer` does not either.
+    #[test]
+    fn own_caps_needs_prefer_and_the_peer_in_the_slice() {
+        use crate::transport::TransportKeypair;
+        let local = TransportKeypair::new().public().clone();
+        let peer = TransportKeypair::new().public().clone();
+        let bucket = crate::transport::quic::upgrade::slice::bucket(&local, &peer);
+        let caps_with = |mode: &str, percent: Option<String>| {
+            let mut config = config(mode, None);
+            config.quic_data_percent = percent;
+            let up = QuicAvailabilityWatch::for_test(QuicAvailability::Up).1;
+            QuicPolicy::new(&config, BreakerOutcome::NotConsulted, up).own_caps(&local, &peer)
+        };
+        assert_eq!(QUIC_DATA_PERCENT, 0, "this release carries no data");
+        assert_eq!(caps_with("prefer", None), 0);
+        assert_eq!(caps_with("prefer", Some("lots".to_string())), 0);
+        assert_eq!(caps_with("prefer", Some("100".to_string())), caps::DATA);
+        assert_eq!(caps_with("prefer", Some("0".to_string())), 0);
+        assert_eq!(
+            caps_with("prefer", Some(bucket.to_string())),
+            0,
+            "a bucket equal to the percentage is out"
+        );
+        assert_eq!(
+            caps_with("prefer", Some((bucket + 1).to_string())),
+            caps::DATA,
+            "the bucket below the percentage is in"
+        );
+        for mode in ["shadow", "off"] {
+            assert_eq!(caps_with(mode, Some("100".to_string())), 0, "{mode}");
+        }
     }
 
     /// Permits stop at the limit, a dropped permit frees its slot, and the
@@ -447,6 +526,28 @@ mod tests {
         );
     }
 
+    /// A `quic-data-percent` that cannot be read is reported with QUIC on, and
+    /// says nothing with QUIC off, where it does nothing.
+    #[test]
+    fn startup_warns_about_an_unreadable_data_percent() {
+        const INVALID: &str = "quic-data-percent is not a whole number";
+        for (mode, value, warned) in [
+            ("shadow", "101", true),
+            ("prefer", "lots", true),
+            ("off", "lots", false),
+            ("shadow", "100", false),
+        ] {
+            let mut config = config(mode, None);
+            config.quic_data_percent = Some(value.to_string());
+            let (logs, guard) = crate::util::test_log_capture::install();
+            log_startup(&config);
+            drop(guard);
+            let logs = logs.lock().unwrap().clone();
+            let hits: Vec<_> = logs.iter().filter(|l| l.contains(INVALID)).collect();
+            assert_eq!(hits.len(), usize::from(warned), "{mode} {value}: {logs:?}");
+        }
+    }
+
     /// Threads released together race for permits while each holds its
     /// permit across a yield. The count never passes the limit, reaches it
     /// (so the race really happened), and returns to zero.
@@ -481,12 +582,12 @@ mod tests {
         assert_eq!(permits.in_use(), 0);
     }
 
-    /// Startup says that `prefer` runs as `shadow` (INFO), warns about a
+    /// Startup says what `prefer` negotiates (INFO), warns about a
     /// `quic-max-paths` it cannot parse, and says when it lowers one, the
     /// last two only with QUIC on; a plain configuration logs none of it.
     #[test]
     fn startup_reports_prefer_and_max_paths() {
-        const PREFER: &str = "runs as \"shadow\" in this release";
+        const PREFER: &str = "negotiates data with this share of pairs";
         const INVALID: &str = "quic-max-paths is not a whole number";
         const LOWERED: &str = "quic-max-paths is above max-number-of-connections";
         let above = (config("off", None).max_connections + 1).to_string();

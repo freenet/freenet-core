@@ -99,7 +99,13 @@ async fn paths_with(
     drop(permit);
     let (a, a_in) = QuicPath::new(client, pair.time.clone());
     let (b, b_in) = match b_budget {
-        Some(budget) => QuicPath::with_budget(server, pair.time.clone(), b_limits, budget),
+        Some(budget) => {
+            let (b, b_in) = QuicPath::with_budget(server, pair.time.clone(), b_limits, budget);
+            if b_limits.accept_data {
+                b.enable_data();
+            }
+            (b, b_in)
+        }
         None => QuicPath::with_limits(server, pair.time.clone(), b_limits),
     };
     Paths {
