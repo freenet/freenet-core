@@ -44,12 +44,8 @@ mod tests {
     use super::*;
 
     fn key(seed: u32) -> TransportPublicKey {
-        let mut bytes = [0u8; 32];
-        bytes[..4].copy_from_slice(&seed.to_be_bytes());
-        // Spread over the bytes, so the order of two keys is not the seed's.
-        let spread = blake3::hash(&seed.to_be_bytes());
-        bytes[4..].copy_from_slice(&spread.as_bytes()[..28]);
-        TransportPublicKey::from_bytes(bytes)
+        // Hashed, so the order of two keys is not the order of their seeds.
+        TransportPublicKey::from_bytes(*blake3::hash(&seed.to_be_bytes()).as_bytes())
     }
 
     fn pairs() -> impl Iterator<Item = (TransportPublicKey, TransportPublicKey)> {
