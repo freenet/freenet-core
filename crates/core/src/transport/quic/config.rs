@@ -140,16 +140,19 @@ pub(crate) const UNANNOUNCED_CREDIT_SLACK: u32 = MAX_UNI_STREAMS / 8;
 /// - A permit can return before the slot does. A stream holds its permit
 ///   until it is acknowledged, also past a deadline after its end was sent,
 ///   so that case holds. A reset or a stop from the peer returns the permit
-///   about one round trip before the receiver has freed the stream, and an
-///   acknowledgement can come before the receiver has read the stream to its
-///   end, which is short because the receive side reads without waiting on
-///   any consumer.
+///   about one round trip before the receiver has freed the stream. An
+///   acknowledgement is about receipt, so it returns the permit while the
+///   receiver may not have read the stream to its end. That is short while the
+///   consumer keeps up. With a full channel the readers wait for room, up to
+///   the age limit, each holding a slot, so a slow consumer can use up the
+///   reserve: one-packet messages then fail to open within their deadline and
+///   go another way. Measured by `quic_open_uni_waited`.
 /// - Credit the sender does not know about can exceed
 ///   [`UNANNOUNCED_CREDIT_SLACK`] while a MAX_STREAMS frame is lost, queued
 ///   or in flight. quinn counts credit as announced when it writes the frame
 ///   (`sent_max_remote`), so 9 freed slots on their way plus 8 freed since
 ///   are 17 the sender cannot use, with nothing lost.
-/// - Short messages are uncapped, and one can be as large as a stream, so
+/// - One-packet short messages are uncapped, so many at once
 ///   they can use up the reserve.
 /// - A slot is not send capacity: a control frame that has a slot still
 ///   waits on the connection's shared flow control and send window

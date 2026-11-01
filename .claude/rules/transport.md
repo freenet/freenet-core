@@ -1476,9 +1476,12 @@ Sending (QuicPath::send_short_bounded / send_stream_bounded /
   a_short_still_sends_while_streamed_messages_are_blocked).
   e5b constraints (none arises in shadow, which sends only control frames):
   → A permit can return before the slot does: on a reset or a stop from the
-    peer (about one round trip), and on an ack that comes before the receiver
-    has read the stream to its end (short: the receive side reads without
-    waiting on any consumer). Both accepted.
+    peer (about one round trip), and on an ack, which is about receipt and can
+    come before the receiver has read the stream to its end. That is short
+    while the consumer keeps up. With a full channel the readers wait for room,
+    up to the age limit, each holding a slot, so a slow consumer can use up the
+    reserve: one-packet messages then fail to open and go another way. Accepted;
+    quic_open_uni_waited measures it.
   → Credit the sender does not know about can exceed 8 while a MAX_STREAMS
     frame is lost, queued or in flight: quinn counts credit as announced
     when it writes the frame (sent_max_remote), so 9 freed slots on their way
@@ -1514,18 +1517,26 @@ Sending (QuicPath::send_short_bounded / send_stream_bounded /
   a stream's for a message past one packet; ::stream(len) is 2 s, 5 s
   (STREAM_INACTIVITY_TIMEOUT) and inbound_stream_age_limit(len); a plain
   Duration is one deadline for all of it. A send from a source waits for the
-  first chunk for the gap, outside these. One timer per send, re-armed when it
-  fires, as BodyReader. Messages are written in pieces of at most
-  FRAGMENT_PAYLOAD_SIZE, each returning when quinn has buffered it, and each is
-  a step of the gap and one StreamProgressObserver tick, so a slow upload does
-  not read as stalled. A send returns
+  first chunk for the gap, counted in total, and open runs from when it arrives.
+  One timer per send, re-armed when it fires, as BodyReader. Messages are
+  written in pieces of at most FRAGMENT_PAYLOAD_SIZE, each returning when quinn
+  has buffered it, and each is a step of the gap and one StreamProgressObserver
+  tick, so a slow upload does not read as stalled. A message that fits the send
+  window is buffered at once, so its gap never applies and only total ends its
+  wait. quinn gives a write all the free credit without yielding, and send
+  fairness orders packets, not writes, so the writers yield between fragments
+  (path.rs take_turns): without it streams run one after another and one waits
+  past the 5 s the receiver allows, pinned by
+  streams_on_a_path_take_turns_with_their_fragments. A send returns
   Sent (every byte acked), MaybeDelivered(TimedOut | ConnectionLost) (the
   whole message was written and FIN sent, SendProgress set in
   Outgoing::finish, then the deadline passed or the connection was lost
   during the ack wait: the peer may have it, do not treat it as Failed),
   Failed(NotOpened(TimedOut | ConnectionLost)) (no stream ever existed, so the
   message can go another way), or Failed(TimedOut | Error) (the stream was open
-  and did not finish, or a stop from the peer).
+  and did not finish, or a stop from the peer). After those two the receiver
+  remembers the id and may have dispatched the metadata, so a resend needs a
+  fresh id: the receiver drops one under the same id, and acks it.
   Dropping a send future resets its stream (Drop on Outgoing; quinn's own
   drop would FINISH it, which the receiver reads as a stream that ended
   early). A send dropped while waiting for acks after finish is not reset

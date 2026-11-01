@@ -10,7 +10,7 @@
 //!   Not a delivery (a full channel at the receiver drops an acknowledged
 //!   message), as on UDP.
 //! - [`BoundedSend::MaybeDelivered`]: every byte was written and the end of
-//!   the stream sent, then the deadline passed or the connection was lost
+//!   the stream queued, then the deadline passed or the connection was lost
 //!   while waiting for the acknowledgement. The peer may have the whole
 //!   message. Nothing is reset: the stream is left to finish, and a
 //!   streamed-message permit stays held until it does.
@@ -18,7 +18,9 @@
 //!   [`SendFailure::NotOpened`] means no stream ever existed, so the message
 //!   can safely go another way. A deadline that passes later drops the send:
 //!   the stream is reset (`reset_code::SENDER_ABORTED`), so the receiver
-//!   discards what arrived.
+//!   discards what arrived. The peer has still seen the stream: it remembers
+//!   the id, so a resend under that id is dropped, and it may have dispatched
+//!   the stream's metadata. Only a fresh id may send the data again.
 //!
 //! A caller must not treat `MaybeDelivered` as `Failed`: the two sides may
 //! disagree about whether the message arrived.
@@ -126,7 +128,8 @@ pub(crate) enum MaybeDelivered {
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum SendFailure {
     /// No stream was opened, so the peer holds nothing of the message and the
-    /// message can go another way.
+    /// message can go another way. Covers the waits before `open_uni` returns;
+    /// once it has returned, a failure writing the header is not this.
     NotOpened(NotOpened),
     /// A deadline passed after the stream was opened and before its end was
     /// sent. The stream was reset.
@@ -242,8 +245,8 @@ fn nanos(duration: Duration) -> u64 {
 /// deadline and, when it fires, re-armed if progress has moved the deadline.
 /// So a send costs one sleep per gap, not one per fragment. A step only moves
 /// the deadline later, so the armed timer is never too late. The move from
-/// `open` to `gap` can make it earlier only with a gap shorter than the time
-/// left of `open`, and the send's deadlines never have one.
+/// `open` to `gap` could make it earlier only with a gap shorter than `open`,
+/// which is asserted against below.
 ///
 /// Cancel safety: dropping this future drops the send, with the same
 /// effect as a timeout at that point.
@@ -258,6 +261,10 @@ where
     Fut: Future<Output = Result<(), QuicSendError>>,
 {
     let deadlines = deadlines.into();
+    debug_assert!(
+        deadlines.gap.is_none_or(|gap| gap >= deadlines.open),
+        "a gap shorter than `open` could leave the timer armed too late"
+    );
     let started = time.now_nanos();
     let progress = SendProgress::on_clock(time);
     let send = send(progress.clone());

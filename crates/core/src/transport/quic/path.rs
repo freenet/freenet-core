@@ -110,8 +110,10 @@
 //! `RecvStream`, so at most `MAX_UNI_STREAMS` readers wait on a path, charged
 //! or not, and a slow consumer slows the sender instead of losing messages the
 //! sender has seen acknowledged. Past the age limit the stream is stopped
-//! (`stop_code::EVICTED`), which the sender sees because the stream is still
-//! open. A reader that is waiting when the path ends is dropped with the
+//! (`stop_code::EVICTED`). A sender still waiting for its acknowledgement sees
+//! the stop; one whose bytes were all acknowledged has already reported `Sent`,
+//! and the message is lost, as a message dropped from a full channel is on UDP.
+//! A reader that is waiting when the path ends is dropped with the
 //! receive task and counted (`ShortAbandonedWaiting`, `StreamAbandonedWaiting`). A Control frame still uses `try_send` and is
 //! dropped and counted (`QuicInboundOutcome`) when its channel is full.
 //!
@@ -861,6 +863,7 @@ impl QuicPath {
         let mut send = self.open(&header, &[], slot, progress).await?;
         for piece in payload.chunks(FRAGMENT_PAYLOAD_SIZE) {
             send.write_all(piece).await?;
+            take_turns().await;
         }
         send.finish().await
     }
@@ -987,12 +990,15 @@ impl QuicPath {
     /// [`Self::send_stream_bounded`] does, and tells `observer` the same.
     ///
     /// Waits for the first chunk before anything else, for as long as
-    /// [`SendDeadlines::gap`] allows, so a source that has nothing yet holds no
-    /// permit and no stream; `open` and `total` run from when it arrives. A
-    /// source that ends or fails before its first chunk opens no stream and
-    /// has nothing to reset. A later stall past the gap resets the stream.
-    /// A chunk taken before a [`SendFailure::NotOpened`] is lost, so a caller
-    /// sending another way starts again from a fresh source.
+    /// [`SendDeadlines::gap`] and `total` allow, so a source that has nothing
+    /// yet holds no permit and no stream. `open` runs from when it arrives;
+    /// `total` counts the wait. A wait that runs out or a connection lost
+    /// during it is [`SendFailure::NotOpened`]. A source that ends or fails
+    /// before its first chunk opens no stream and has nothing to reset, and is
+    /// [`SendFailure::Error`], since the message cannot go another way either.
+    /// A later stall past the gap resets the stream. A chunk taken before a
+    /// [`SendFailure::NotOpened`] is lost, so a caller sending another way
+    /// starts again from a fresh source.
     #[cfg_attr(not(test), allow(dead_code))]
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn send_stream_chunks_bounded<T, S>(
@@ -1010,11 +1016,24 @@ impl QuicPath {
         S: Stream<Item = Result<Bytes, StreamError>> + Unpin,
     {
         let deadlines = deadlines.into();
+        let started = time.now_nanos();
+        let connection = self.connection.inner();
+        let wait = deadlines
+            .gap
+            .map_or(deadlines.total, |gap| gap.min(deadlines.total));
         let first = tokio::select! {
             first = chunks.next() => first,
-            () = time.sleep_cancelable(deadlines.gap.unwrap_or(deadlines.total)) => {
+            () = time.sleep_cancelable(wait) => {
                 return BoundedSend::Failed(SendFailure::NotOpened(NotOpened::TimedOut));
             }
+            error = connection.closed() => {
+                return BoundedSend::Failed(SendFailure::NotOpened(NotOpened::ConnectionLost(error)));
+            }
+        };
+        let waited = Duration::from_nanos(time.now_nanos().saturating_sub(started));
+        let deadlines = SendDeadlines {
+            total: deadlines.total.saturating_sub(waited),
+            ..deadlines
         };
         bounded_send(time, deadlines, |progress| {
             self.send_stream_chunks_with(
@@ -1132,6 +1151,16 @@ impl QuicPath {
         }
         Ok(send)
     }
+}
+
+/// Let the path's other writers run between two fragments. quinn gives a
+/// write that fits the shared send window all of it without yielding, so a
+/// stream with more to send would otherwise take every byte of credit in turn
+/// and the others would wait for it to finish: longer than the 5 s the
+/// receiver gives a stream to make progress, on a slow link. With a yield,
+/// each stream takes a fragment.
+async fn take_turns() {
+    tokio::task::yield_now().await;
 }
 
 /// The metadata a `Stream` frame carries: `metadata` if the UDP transport
@@ -1291,6 +1320,7 @@ impl Outgoing {
             if let Some(observer) = observer {
                 observer.on_fragment_sent();
             }
+            take_turns().await;
         }
         Ok(())
     }
@@ -1396,11 +1426,13 @@ impl Drop for Outgoing {
         let Some(slot) = self.slot.take() else {
             return;
         };
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        // With no runtime the node is stopping, and the permit has no users.
+        if tokio::runtime::Handle::try_current().is_err() {
             return;
-        };
+        }
         let stopped = std::mem::replace(&mut self.stopped, Box::pin(std::future::pending()));
-        drop(runtime.spawn(async move {
+        // Short-lived and bounded as above, so the handle is not monitored.
+        drop(GlobalExecutor::spawn(async move {
             let _ended = stopped.await;
             drop(slot);
         }));
