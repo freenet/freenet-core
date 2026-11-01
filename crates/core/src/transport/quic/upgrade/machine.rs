@@ -38,9 +38,9 @@
 //! Offered     PathEstablished               Confirming  Ready, accepted (Accept still on its way)
 //! Connecting  PathEstablished, server       Confirming  Ready
 //! Connecting  PathEstablished, client       Confirming  -
-//! Connecting  Ready, client                 Active      ReadyAck
-//! Confirming  Ready, client                 Active      ReadyAck
-//! Confirming  ReadyAck, server              Active      -
+//! Connecting  Ready, client                 Active      ReadyAck, + data
+//! Confirming  Ready, client                 Active      ReadyAck, + data
+//! Confirming  ReadyAck, server              Active      + data
 //! setup       Ready, server                 same        role_conflict
 //! Offered     Tick past deadline            Idle        tear down, backoff (no_reply)
 //! Connecting  Tick past deadline            Idle        tear down, backoff (timeout)
@@ -60,6 +60,15 @@
 //! Rechecking  SessionEnded, stable          Off         clear the count, session_ended
 //! Idle or Off SessionEnded                  Off         -
 //! ```
+//!
+//! "+ data" is [`Action::EnableData`] and [`Outcome::DataEnabled`], when this
+//! node's bit and the bit in the peer's frame are both set; otherwise the path
+//! stays in shadow, with nothing more to do. The peer's bit is recorded in
+//! `Active` for that attempt alone, so a later path negotiates again. `Ready` and
+//! `ReadyAck` carry this node's bit, which comes in with [`Event::Promoted`]:
+//! the machine computes nothing from the keys. A side reads data as soon as
+//! its path exists if its own bit is set, because the peer's first stream can
+//! overtake the frame that says so.
 //!
 //! "setup" is `Offered`, `Connecting` or `Confirming` ([`Phase`]). "no role" is
 //! `Idle` with no promotion yet. "control frame refused, new" is one of an
@@ -191,10 +200,13 @@ pub(in crate::transport) enum Event {
     /// the default if none. It comes here and not at construction because an
     /// inbound session holds no key until promotion, and the seed is filed per
     /// key, while the machine must exist before that to answer an early Offer.
+    /// `own_caps` is what this node says it supports on a path to that peer
+    /// (`QuicPolicy::own_caps`), for the same reason.
     Promoted {
         peer_key: TransportPublicKey,
         remote_version: Option<(u8, u8, u16)>,
         backoff: BackoffSeed,
+        own_caps: u32,
     },
     /// [`UpgradeMachine::deadline`] may have passed.
     Tick,
@@ -238,6 +250,8 @@ pub(in crate::transport) enum Action {
     /// Send on the path, bounded by [`CONTROL_SEND_TIMEOUT`], and report
     /// [`Event::ControlSent`].
     SendControl(QuicControl),
+    /// Both sides set the data bit on the active path of `attempt`: it may send.
+    EnableData { attempt: u32 },
     /// Drop whatever `attempt` holds: the `allow_peer` permit, a dial, the
     /// connection. A connection still open closes with `code`.
     TearDown { attempt: u32, code: QuicCloseCode },
@@ -255,6 +269,8 @@ pub(in crate::transport) enum Outcome {
     AcceptSent,
     /// The path is active on this side's evidence, as `Role`.
     Established(Role),
+    /// The active path has both sides' data bit.
+    DataEnabled,
     /// The peer's `Decline`, `None` when the reason is one this node does
     /// not know. `uncharged` is whether the peer was spared the backoff
     /// penalty (the machine's own decision, see `on_decline`).
@@ -347,6 +363,8 @@ enum State {
     Active {
         attempt: u32,
         since: Duration,
+        /// What the peer's `Ready` or `ReadyAck` carried, for this attempt alone.
+        peer_caps: u32,
         _permit: QuicPathPermit,
     },
     /// The path ended with `Protocol{0x1}`. Decide at `deadline` whether to
@@ -495,6 +513,8 @@ pub(in crate::transport) struct UpgradeMachine {
     retry_at: Duration,
     /// Whether a seed came in through [`Event::Promoted`].
     seeded: bool,
+    /// What this node says it supports on a path, from [`Event::Promoted`].
+    own_caps: u32,
 }
 
 impl UpgradeMachine {
@@ -508,6 +528,7 @@ impl UpgradeMachine {
             failures: 0,
             retry_at: Duration::ZERO,
             seeded: false,
+            own_caps: 0,
         }
     }
 
@@ -542,6 +563,20 @@ impl UpgradeMachine {
         }
     }
 
+    /// Whether this node reads data on a path, from the moment the path exists.
+    pub(in crate::transport) fn accepts_data(&self) -> bool {
+        self.own_caps & caps::DATA != 0
+    }
+
+    /// Whether the active path has both sides' data bit. `false` in any other
+    /// state.
+    pub(in crate::transport) fn carries_data(&self) -> bool {
+        match self.state {
+            State::Active { peer_caps, .. } => self.accepts_data() && peer_caps & caps::DATA != 0,
+            State::Idle | State::Setup { .. } | State::Rechecking { .. } | State::Off => false,
+        }
+    }
+
     /// Whether this machine is finished for good.
     pub(in crate::transport) fn is_off(&self) -> bool {
         match self.state {
@@ -559,7 +594,8 @@ impl UpgradeMachine {
                 peer_key,
                 remote_version,
                 backoff,
-            } => self.on_promoted(cx, &peer_key, remote_version, backoff),
+                own_caps,
+            } => self.on_promoted(cx, &peer_key, remote_version, backoff, own_caps),
             Event::Tick => self.on_tick(cx),
             Event::OfferSent { attempt } => {
                 if self.phase_of(attempt) == Some(Phase::Offered) {
@@ -573,8 +609,12 @@ impl UpgradeMachine {
             Event::Upgrade(UpgradeControl::Decline { attempt, reason }) => {
                 self.on_decline(cx, attempt, reason)
             }
-            Event::Control(QuicControl::Ready { attempt, .. }) => self.on_ready(cx, attempt),
-            Event::Control(QuicControl::ReadyAck { attempt, .. }) => self.on_ready_ack(cx, attempt),
+            Event::Control(QuicControl::Ready { attempt, caps }) => {
+                self.on_ready(cx, attempt, caps)
+            }
+            Event::Control(QuicControl::ReadyAck { attempt, caps }) => {
+                self.on_ready_ack(cx, attempt, caps)
+            }
             Event::PathEstablished { attempt } => self.on_established(cx, attempt),
             Event::ControlSent { attempt, outcome } => self.on_sent(cx, attempt, outcome),
             Event::ControlRefused { attempt, error } => self.on_refused(cx, attempt, error),
@@ -608,6 +648,7 @@ impl UpgradeMachine {
         peer_key: &TransportPublicKey,
         remote_version: Option<(u8, u8, u16)>,
         backoff: BackoffSeed,
+        own_caps: u32,
     ) -> Vec<Action> {
         // Off covers what `role` cannot: equal keys leave no role, and a
         // session can end before its promotion. Neither is counted again.
@@ -617,6 +658,7 @@ impl UpgradeMachine {
         // Before the role's verdict, so a machine that goes `Off` here still
         // hands the backoff on.
         self.take_seed(cx, backoff);
+        self.own_caps = own_caps;
         self.role = Role::of(&self.local_key, peer_key);
         match self.role {
             None => {
@@ -806,7 +848,7 @@ impl UpgradeMachine {
                 self.advance(Phase::Confirming, cx.now + CONFIRM_TIMEOUT);
                 let mut actions = vec![Action::SendControl(QuicControl::Ready {
                     attempt,
-                    caps: caps::KNOWN,
+                    caps: self.own_caps,
                 })];
                 // A connection from the peer proves it accepted. Counted here
                 // because the `Accept` was lost or is late, and a late one is
@@ -826,7 +868,7 @@ impl UpgradeMachine {
         }
     }
 
-    fn on_ready(&mut self, cx: Inputs<'_>, attempt: u32) -> Vec<Action> {
+    fn on_ready(&mut self, cx: Inputs<'_>, attempt: u32, peer_caps: u32) -> Vec<Action> {
         let Some(phase) = self.phase_of(attempt) else {
             return Vec::new();
         };
@@ -837,25 +879,41 @@ impl UpgradeMachine {
             // `Ready` can only come over the attempt's connection, so it also
             // proves one if the report of the connection is still on its way.
             (Some(Role::Client), Phase::Connecting | Phase::Confirming) => {
-                self.activate(cx.now);
-                vec![
+                self.activate(cx.now, peer_caps);
+                let mut actions = vec![
                     Action::SendControl(QuicControl::ReadyAck {
                         attempt,
-                        caps: caps::KNOWN,
+                        caps: self.own_caps,
                     }),
                     Action::Record(Outcome::Established(Role::Client)),
-                ]
+                ];
+                actions.extend(self.data_actions(attempt));
+                actions
             }
             (Some(Role::Client), Phase::Offered) | (None, _) => Vec::new(),
         }
     }
 
-    fn on_ready_ack(&mut self, cx: Inputs<'_>, attempt: u32) -> Vec<Action> {
+    fn on_ready_ack(&mut self, cx: Inputs<'_>, attempt: u32, peer_caps: u32) -> Vec<Action> {
         if self.role != Some(Role::Server) || self.phase_of(attempt) != Some(Phase::Confirming) {
             return Vec::new();
         }
-        self.activate(cx.now);
-        vec![Action::Record(Outcome::Established(Role::Server))]
+        self.activate(cx.now, peer_caps);
+        let mut actions = vec![Action::Record(Outcome::Established(Role::Server))];
+        actions.extend(self.data_actions(attempt));
+        actions
+    }
+
+    /// What follows activation if both sides set the data bit.
+    fn data_actions(&self, attempt: u32) -> Vec<Action> {
+        if self.carries_data() {
+            vec![
+                Action::EnableData { attempt },
+                Action::Record(Outcome::DataEnabled),
+            ]
+        } else {
+            Vec::new()
+        }
     }
 
     fn on_sent(&mut self, cx: Inputs<'_>, attempt: u32, outcome: BoundedSend) -> Vec<Action> {
@@ -1088,7 +1146,7 @@ impl UpgradeMachine {
         }
     }
 
-    fn activate(&mut self, now: Duration) {
+    fn activate(&mut self, now: Duration, peer_caps: u32) {
         match std::mem::replace(&mut self.state, State::Idle) {
             State::Setup {
                 attempt, _permit, ..
@@ -1096,6 +1154,7 @@ impl UpgradeMachine {
                 self.state = State::Active {
                     attempt,
                     since: now,
+                    peer_caps,
                     _permit,
                 };
             }

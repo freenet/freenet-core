@@ -73,6 +73,16 @@ pub(in crate::transport) struct Harness {
 impl Harness {
     /// A hub whose node has the higher key, so its sessions are servers.
     pub(in crate::transport) async fn server(network: &str, subnet: u8) -> Self {
+        Self::server_with(network, subnet, "shadow", None).await
+    }
+
+    /// [`Self::server`] in this mode, with this `quic-data-percent`.
+    async fn server_with(
+        network: &str,
+        subnet: u8,
+        mode: &str,
+        data_percent: Option<&str>,
+    ) -> Self {
         let a_addr: SocketAddr = format!("10.204.{subnet}.1:5000").parse().unwrap();
         let b_addr: SocketAddr = format!("10.204.{subnet}.2:5000").parse().unwrap();
         let pair = pair(network, a_addr, b_addr, None).await;
@@ -84,7 +94,8 @@ impl Harness {
         };
         let config: crate::config::NetworkApiConfig = toml::from_str("").expect("defaults");
         let mut config = config;
-        config.transport_quic = Some("shadow".to_string());
+        config.transport_quic = Some(mode.to_string());
+        config.quic_data_percent = data_percent.map(str::to_string);
         let policy = QuicPolicy::from_config(
             QuicPolicyConfig::new(&config, BreakerOutcome::NotConsulted),
             endpoint.availability(),
@@ -124,7 +135,8 @@ impl Harness {
             hub: Arc::clone(&self.hub),
             inbox,
             budget: SharedInboundBudget::new(16, 1 << 20),
-            now: Box::new(move || Duration::from_nanos(now.load(Ordering::Relaxed))),
+            quic_receipt_nanos: Arc::new(AtomicU64::new(0)),
+            now: Arc::new(move || Duration::from_nanos(now.load(Ordering::Relaxed))),
             state: Mutex::new(SessionState {
                 machine: UpgradeMachine::new(self.hub.local_key.clone()),
                 attempt: None,
@@ -344,51 +356,14 @@ fn a_routed_attempt_becomes_a_shadow_path() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
         let h = Harness::server("quic-driver-path", 6).await;
-        let (session, mut inbox) = h.session();
-        session.promote(h.peer.clone());
-        h.set_now(Duration::from_nanos(session.deadline_nanos().unwrap()));
-        let sends = session.take(Event::Tick);
-        let [UdpSend::Offer { attempt, .. }] = sends[..] else {
-            panic!("{sends:?}");
-        };
-        let local_is_a = h.pair.a_keys.public() > h.pair.b_keys.public();
-        let (ours, theirs, our_addr, our_key) = if local_is_a {
-            (&h.pair.a, &h.pair.b, h.pair.a_addr, h.pair.a_keys.public())
-        } else {
-            (&h.pair.b, &h.pair.a, h.pair.b_addr, h.pair.b_keys.public())
-        };
-        let (ours, theirs, our_key) = (ours.clone(), theirs.clone(), our_key.clone());
+        let (session, inbox) = h.session();
+        let attempt = offered(&h, &session);
+        let up = path_up(&h, &session, inbox);
         let time = h.pair.time.clone();
-        let hub = Arc::clone(&h.hub);
         let session_for_task = Arc::clone(&session);
         let (peer_path, mut peer_inbound, refused, charged) =
             drive(&h.pair.time, Duration::from_secs(60), async move {
-                let client = tokio::spawn(async move { theirs.connect(our_addr, &our_key).await });
-                // The first Initial is answered with a Retry; the second carries
-                // the token.
-                hub.route(ours.accept().await.expect("an attempt"));
-                loop {
-                    let event = inbox.recv().await.expect("the session lives");
-                    let retried = matches!(event, SessionEvent::Incoming(_));
-                    assert!(session_for_task.handle(event).is_empty());
-                    if retried {
-                        break;
-                    }
-                }
-                hub.route(ours.accept().await.expect("the attempt with its token"));
-                // The routed attempt, then its finished handshake.
-                while session_for_task
-                    .state
-                    .lock()
-                    .attempt
-                    .as_ref()
-                    .is_none_or(|held| held.path.is_none())
-                {
-                    let event = inbox.recv().await.expect("the session lives");
-                    assert!(session_for_task.handle(event).is_empty());
-                }
-                let client = client.await.unwrap().expect("client handshake");
-                let (peer_path, peer_inbound) = QuicPath::new(client, time.clone());
+                let (peer_path, peer_inbound, _inbox) = up.await;
                 // Acked or stopped, it does not matter: a sent message is not
                 // a delivered one.
                 let _outcome = peer_path
@@ -412,11 +387,233 @@ fn a_routed_attempt_becomes_a_shadow_path() {
         let payload = peer_inbound.controls.try_recv().expect("Ready arrived");
         assert_eq!(
             peer_path.decode_control(&payload),
-            Ok(QuicControl::Ready {
-                attempt,
-                caps: crate::transport::quic::control::caps::KNOWN,
-            })
+            Ok(QuicControl::Ready { attempt, caps: 0 })
         );
+    });
+}
+
+/// Offers, routes the peer's dial through the Retry and returns the peer's path,
+/// with the session's in `Confirming`. Run it under `drive`.
+fn path_up(
+    h: &Harness,
+    session: &Arc<Session>,
+    mut inbox: mpsc::Receiver<SessionEvent>,
+) -> impl Future<Output = (QuicPath, QuicInbound, mpsc::Receiver<SessionEvent>)> + use<> {
+    let local_is_a = h.pair.a_keys.public() > h.pair.b_keys.public();
+    let (ours, theirs, our_addr, our_key) = if local_is_a {
+        (&h.pair.a, &h.pair.b, h.pair.a_addr, h.pair.a_keys.public())
+    } else {
+        (&h.pair.b, &h.pair.a, h.pair.b_addr, h.pair.b_keys.public())
+    };
+    let (ours, theirs, our_key) = (ours.clone(), theirs.clone(), our_key.clone());
+    let time = h.pair.time.clone();
+    let hub = Arc::clone(&h.hub);
+    let session = Arc::clone(session);
+    async move {
+        let client = tokio::spawn(async move { theirs.connect(our_addr, &our_key).await });
+        hub.route(ours.accept().await.expect("an attempt"));
+        loop {
+            let event = inbox.recv().await.expect("the session lives");
+            let retried = matches!(event, SessionEvent::Incoming(_));
+            assert!(session.handle(event).is_empty());
+            if retried {
+                break;
+            }
+        }
+        hub.route(ours.accept().await.expect("the attempt with its token"));
+        while session
+            .state
+            .lock()
+            .attempt
+            .as_ref()
+            .is_none_or(|held| held.path.is_none())
+        {
+            let event = inbox.recv().await.expect("the session lives");
+            assert!(session.handle(event).is_empty());
+        }
+        let client = client.await.unwrap().expect("client handshake");
+        let (peer_path, peer_inbound) = QuicPath::new(client, time.clone());
+        (peer_path, peer_inbound, inbox)
+    }
+}
+
+/// A promoted server session up to its first offer.
+fn offered(h: &Harness, session: &Arc<Session>) -> u32 {
+    session.promote(h.peer.clone());
+    h.set_now(Duration::from_nanos(session.deadline_nanos().unwrap()));
+    let sends = session.take(Event::Tick);
+    let [UdpSend::Offer { attempt, .. }] = sends[..] else {
+        panic!("{sends:?}");
+    };
+    attempt
+}
+
+/// The peer's `ReadyAck` reaches the session's driver.
+fn ready_ack(session: &Session, attempt: u32, caps: u32) {
+    use crate::transport::quic::control::QuicControl;
+    let payload = Bytes::copy_from_slice(&QuicControl::ReadyAck { attempt, caps }.encode());
+    let event = SessionEvent::ControlFrame { attempt, payload };
+    assert!(session.handle(event).is_empty());
+}
+
+/// The driver acts on every (own bit, peer bit): what the path accepts follows
+/// this node's bit from the moment the path exists, its `Ready` says so, and it
+/// may send only once the peer's frame has the bit too. Mode `shadow` sets no bit
+/// at any percentage, and neither does `prefer` at this release's share.
+#[test]
+fn a_path_follows_the_data_bits() {
+    use crate::transport::quic::control::{QuicControl, caps};
+    use crate::transport::quic::path::QuicInboundOutcome;
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        for (subnet, mode, percent, peer_caps, accepts, sends) in [
+            (30, "prefer", Some("100"), caps::DATA, true, true),
+            (31, "prefer", Some("100"), 0, true, false),
+            (32, "prefer", Some("0"), caps::DATA, false, false),
+            (33, "shadow", Some("100"), caps::DATA, false, false),
+            (34, "prefer", None, caps::DATA, false, false),
+        ] {
+            let case = format!("{mode} {percent:?}, peer {peer_caps}");
+            let h = Harness::server_with("quic-driver-bits", subnet, mode, percent).await;
+            let (session, inbox) = h.session();
+            let attempt = offered(&h, &session);
+            let up = path_up(&h, &session, inbox);
+            let time = h.pair.time.clone();
+            let session_for_task = Arc::clone(&session);
+            let (peer_path, mut peer_inbound, delivered, refused) =
+                drive(&h.pair.time, Duration::from_secs(60), async move {
+                    let (peer_path, peer_inbound, inbox) = up.await;
+                    let _outcome = peer_path
+                        .send_short_bounded(&time, Duration::from_secs(5), b"early")
+                        .await;
+                    time.sleep(Duration::from_secs(1)).await;
+                    let state = session_for_task.state.lock();
+                    let live = state.attempt.as_ref().unwrap().path.as_ref().unwrap();
+                    let refused = live
+                        .path
+                        .stats()
+                        .count(QuicInboundOutcome::RefusedNotAcceptingData);
+                    let delivered = live._shorts.len();
+                    drop(state);
+                    drop(inbox);
+                    (peer_path, peer_inbound, delivered, refused)
+                })
+                .await;
+            assert_eq!(
+                (delivered, refused),
+                if accepts { (1, 0) } else { (0, 1) },
+                "{case}: a frame before the peer's bit has arrived"
+            );
+            let want_caps = if accepts { caps::DATA } else { 0 };
+            let payload = peer_inbound.controls.try_recv().expect("Ready arrived");
+            assert_eq!(
+                peer_path.decode_control(&payload),
+                Ok(QuicControl::Ready {
+                    attempt,
+                    caps: want_caps,
+                }),
+                "{case}"
+            );
+            let sends_data = |session: &Session| {
+                let state = session.state.lock();
+                let live = state.attempt.as_ref().unwrap().path.as_ref().unwrap();
+                live.path.sends_data()
+            };
+            assert!(!sends_data(&session), "{case}: not before the peer's frame");
+            ready_ack(&session, attempt, peer_caps);
+            assert_eq!(sends_data(&session), sends, "{case}");
+        }
+    });
+}
+
+/// The two sides of the stamp on a real path: frames on an active path keep the
+/// receipt stamp fresh with the UDP clock frozen for 31 s, past the node's 30 s
+/// `HOLD_WINDOW`, so a newer claim stays held; a path still being set up writes
+/// nothing; and when the peer goes silent the stamp ages, so a quiet holder is
+/// still replaced. The stamp is on the session's clock, not the path's.
+#[test]
+fn an_active_path_keeps_the_receipt_stamp_fresh() {
+    use crate::transport::quic::control::QuicControl;
+    const HOLD_WINDOW: Duration = Duration::from_secs(30);
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let h = Harness::server("quic-driver-stamp", 35).await;
+        let (session, inbox) = h.session();
+        let attempt = offered(&h, &session);
+        let up = path_up(&h, &session, inbox);
+        let time = h.pair.time.clone();
+        let session_for_task = Arc::clone(&session);
+        let now = h.now.clone();
+        let frozen_udp = Arc::new(AtomicU64::new(now.load(Ordering::Relaxed)));
+        let stamp = crate::transport::ReceiptStamp::new(
+            frozen_udp,
+            session.quic_receipt_nanos.clone(),
+            Arc::new({
+                let now = now.clone();
+                move || now.load(Ordering::Relaxed)
+            }),
+        );
+        // Offset from the path's clock, to catch a write made on the wrong one.
+        let offset = Duration::from_secs(7_000);
+        let elapse = {
+            let time = time.clone();
+            let now = now.clone();
+            move |by: Duration| {
+                let time = time.clone();
+                let now = now.clone();
+                async move {
+                    time.sleep(by).await;
+                    now.store(
+                        time.now_nanos() + offset.as_nanos() as u64,
+                        Ordering::Relaxed,
+                    );
+                }
+            }
+        };
+        drive(&h.pair.time, Duration::from_secs(120), async move {
+            let (peer_path, _peer_inbound, _inbox) = up.await;
+            // A frame the machine ignores: it names another attempt.
+            let hello = QuicControl::ReadyAck {
+                attempt: attempt + 1,
+                caps: 0,
+            };
+            let sent = peer_path
+                .send_control_bounded(&time, Duration::from_secs(2), hello)
+                .await;
+            assert!(matches!(sent, BoundedSend::Sent), "{sent:?}");
+            elapse(Duration::from_secs(5)).await;
+            assert_eq!(
+                session_for_task.quic_receipt_nanos.load(Ordering::Acquire),
+                0,
+                "not active yet"
+            );
+
+            ready_ack(&session_for_task, attempt, 0);
+            let mut heard_for = Duration::ZERO;
+            while heard_for < Duration::from_secs(31) {
+                let sent = peer_path
+                    .send_control_bounded(&time, Duration::from_secs(2), hello)
+                    .await;
+                assert!(matches!(sent, BoundedSend::Sent), "{sent:?}");
+                elapse(Duration::from_secs(3)).await;
+                heard_for += Duration::from_secs(3);
+                assert!(
+                    stamp.since_last_receipt() <= Duration::from_secs(4),
+                    "after {heard_for:?}: {:?}",
+                    stamp.since_last_receipt()
+                );
+            }
+            assert!(stamp.since_last_receipt() <= HOLD_WINDOW);
+
+            elapse(HOLD_WINDOW + Duration::from_secs(5)).await;
+            assert!(
+                stamp.since_last_receipt() > HOLD_WINDOW,
+                "a silent peer goes quiet: {:?}",
+                stamp.since_last_receipt()
+            );
+            drop(peer_path);
+        })
+        .await;
     });
 }
 

@@ -17,8 +17,8 @@
 //! [`CONTROL_LEN`] (10) bytes, exactly. `attempt` is the `attempt` of the
 //! `UpgradeControl` Offer this connection was made for, so a frame from an
 //! earlier attempt can be told apart. `caps` carries what the sender
-//! supports on this path, for negotiating data; no bit is defined yet
-//! ([`caps::KNOWN`] is 0).
+//! supports on this path. [`caps::DATA`] is the only bit: a path carries data
+//! only if both sides set it (`upgrade::machine`).
 //!
 //! Compatibility rules:
 //! - Unknown caps bits are ignored: [`QuicControl::decode`] clears every bit
@@ -50,8 +50,13 @@ pub(crate) const CONTROL_LEN: usize = 10;
 
 /// Capability bits carried in [`QuicControl`].
 pub(crate) mod caps {
-    /// Every bit this node knows. None is defined yet.
-    pub(crate) const KNOWN: u32 = 0;
+    /// The sender reads application data on this path, and may send it to a
+    /// peer that sets this bit too. Each side sets it from its own release's
+    /// share of pairs (`upgrade::slice`). A node before this bit clears it on
+    /// decode and sends 0, so the pair stays in shadow.
+    pub(crate) const DATA: u32 = 1;
+    /// Every bit this node knows.
+    pub(crate) const KNOWN: u32 = DATA;
 }
 
 /// A control message on a QUIC path.
@@ -188,20 +193,35 @@ mod tests {
             .encode(),
             [1, 0, 0, 0, 0, 7, 0, 0, 0, 0]
         );
+        assert_eq!(
+            QuicControl::Ready {
+                attempt: 7,
+                caps: caps::DATA,
+            }
+            .encode(),
+            [1, 0, 0, 0, 0, 7, 0, 0, 0, 1],
+            "the data bit is the low bit of the field"
+        );
         const { assert!(CONTROL_LEN as u64 <= MAX_CONTROL_BYTES) };
     }
 
     /// A newer node may set caps bits this node does not know: the frame
-    /// still decodes, with those bits cleared.
+    /// still decodes, with those bits cleared and the known one kept.
     #[test]
     fn unknown_caps_bits_are_ignored() {
-        for (kind, raw_caps) in [(0u8, u32::MAX), (1, 0x8000_0001), (0, 1)] {
+        for (kind, raw_caps, kept) in [
+            (0u8, u32::MAX, caps::DATA),
+            (1, 0x8000_0001, caps::DATA),
+            (0, 1, caps::DATA),
+            (1, 0x8000_0000, 0),
+            (0, 2, 0),
+            (1, 0, 0),
+        ] {
             let mut bytes = [1, kind, 0, 0, 0, 9, 0, 0, 0, 0];
             bytes[6..10].copy_from_slice(&raw_caps.to_be_bytes());
             let control = QuicControl::decode(&bytes).expect("decodes");
             assert_eq!(control.attempt(), 9);
-            assert_eq!(control.caps(), raw_caps & caps::KNOWN);
-            assert_eq!(control.caps(), 0, "no bit is known yet");
+            assert_eq!(control.caps(), kept, "raw {raw_caps:#x}");
         }
     }
 

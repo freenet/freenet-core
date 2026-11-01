@@ -384,6 +384,13 @@ pub struct PeerConnection<S = super::UdpSocket, T: TimeSource = RealTime> {
     /// Time of the last authenticated inbound packet, shared with the
     /// keepalive task (resets its backoff).
     last_inbound_nanos: Arc<std::sync::atomic::AtomicU64>,
+    /// When the active QUIC path last heard from the peer, on the same clock. 0
+    /// until a path has been active, as always with QUIC off; after a path ends it
+    /// keeps its last write and ages out. Read only by
+    /// [`Self::receipt_stamp_handle`]: the keepalive backoff and the idle
+    /// timeout read the UDP clocks alone, so QUIC cannot stretch the NAT refresh
+    /// or keep a dead UDP session alive.
+    quic_receipt_nanos: Arc<std::sync::atomic::AtomicU64>,
     /// Whether the remote still tracks its ack-only NoOps, so we must ack them
     /// (true for a remote below [`UNTRACKED_ACK_NOOP_MIN_VERSION`] or of
     /// unknown version). Fixed at construction from the negotiated version.
@@ -1018,6 +1025,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         let time_source = self.remote_conn.time_source.clone();
         super::ReceiptStamp::new(
             self.last_inbound_nanos.clone(),
+            self.quic_receipt_nanos.clone(),
             std::sync::Arc::new(move || time_source.now_nanos()),
         )
     }
@@ -1047,6 +1055,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                 self.remote_conn.remote_addr,
                 self.remote_conn.remote_protoc_version,
                 self.inbound_budget.clone(),
+                self.quic_receipt_nanos.clone(),
                 self.upgrade_sender(),
                 self.remote_conn.time_source.clone(),
             ));
@@ -1325,6 +1334,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         let new_flight = remote_conn.sent_tracker.lock().new_flight_signal();
         Self {
             last_inbound_nanos,
+            quic_receipt_nanos: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             new_flight,
             ack_remote_noops,
             recv_timers,
@@ -3833,10 +3843,9 @@ impl<S: super::Socket> super::PeerConnectionApi for PeerConnection<S> {
         close_reason_from_flags(self.closed_by_idle_timeout, self.closed_by_stream_refusals)
     }
 
-    // The stamp is advanced only by authenticated packets on this UDP
-    // session. TODO(#5940, QUIC upgrade): once a connection's traffic moves
-    // to QUIC, packets received there must advance this stamp too, or a live
-    // upgraded connection looks quiet and loses its key to a newer claim
+    // The stamp is advanced by authenticated packets on this UDP session and
+    // by frames on its active QUIC path, or a live upgraded connection would look
+    // quiet and lose its key to a newer claim
     // (`node::network_bridge::p2p_protoc::identity::HOLD_WINDOW`).
     fn receipt_stamp(&self) -> Option<super::ReceiptStamp> {
         Some(self.receipt_stamp_handle())

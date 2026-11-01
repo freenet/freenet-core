@@ -179,7 +179,8 @@ pub(super) enum BindOutcome {
 /// connection here costs it, so the window must not be shorter than a single
 /// lost keepalive round trip. The receipt stamp records when the
 /// connection's task processed a packet, not when it arrived, so a backlog
-/// on that task also counts toward the window.
+/// on that task also counts toward the window. Frames on an active QUIC path
+/// count too, stamped at the path's next 2 s watch tick.
 pub(super) const HOLD_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The connection, other than `exclude`, bound to `key`, and whether it was
@@ -432,6 +433,7 @@ mod tests {
     struct Clock {
         now: Arc<AtomicU64>,
         last: Arc<AtomicU64>,
+        quic: Arc<AtomicU64>,
     }
 
     impl Clock {
@@ -439,6 +441,7 @@ mod tests {
             let now = self.now.clone();
             ReceiptStamp::new(
                 self.last.clone(),
+                self.quic.clone(),
                 Arc::new(move || now.load(Ordering::Relaxed)),
             )
         }
@@ -449,6 +452,11 @@ mod tests {
 
         fn receive(&self) {
             self.last
+                .store(self.now.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+
+        fn receive_on_quic(&self) {
+            self.quic
                 .store(self.now.load(Ordering::Relaxed), Ordering::Relaxed);
         }
     }
@@ -659,6 +667,44 @@ mod tests {
         assert_eq!(
             t.connections[&addr(2)].identity.pending().unwrap().since,
             first
+        );
+    }
+
+    /// A holder whose UDP has been silent past the window but whose QUIC path
+    /// heard from the peer keeps its key against a newer claim, and goes quiet
+    /// once both are silent. A later UDP receipt counts as well, so neither side
+    /// hides the other.
+    #[test]
+    fn a_holder_heard_only_on_its_quic_path_still_holds() {
+        let mut t = Table::new();
+        let k = key();
+        let clock = Clock::default();
+        t.open(addr(1), Some(clock.stamp()));
+        t.bind(addr(1), &k, IdentitySource::Claimed, None);
+        t.open(addr(2), None);
+        clock.advance(HOLD_WINDOW + std::time::Duration::from_secs(1));
+        assert_eq!(
+            t.bind(addr(2), &k, IdentitySource::Claimed, Some(true)),
+            BindOutcome::HeldByQuiet(addr(1)),
+            "the premise: UDP alone reads as quiet"
+        );
+        clock.receive_on_quic();
+        assert_eq!(
+            t.bind(addr(2), &k, IdentitySource::Claimed, Some(true)),
+            BindOutcome::Held(addr(1)),
+            "heard on the QUIC path"
+        );
+        clock.advance(HOLD_WINDOW + std::time::Duration::from_secs(1));
+        assert_eq!(
+            t.bind(addr(2), &k, IdentitySource::Claimed, Some(true)),
+            BindOutcome::HeldByQuiet(addr(1)),
+            "the QUIC path went silent too"
+        );
+        clock.receive();
+        assert_eq!(
+            t.bind(addr(2), &k, IdentitySource::Claimed, Some(true)),
+            BindOutcome::Held(addr(1)),
+            "a UDP receipt newer than the QUIC one"
         );
     }
 

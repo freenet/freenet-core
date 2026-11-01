@@ -488,6 +488,12 @@ Current wire-gated floors:
   requires real upgrades once the crate reaches 0.2.154, so raising the floor also
   means moving `QUIC_FIRST_NEGOTIATING_RELEASE` beside it.
 
+- `QUIC_DATA_PERCENT` in `crates/core/src/transport/quic/upgrade/policy.rs` (the
+  share of pairs that carry data on QUIC, #5940). It stays at its value unless
+  this release is a rollout step (0, 5, 25, 100), changed in its own PR. That PR also edits the expectations that pin 0:
+  `assert_eq!(QUIC_DATA_PERCENT, 0, ...)` in `policy.rs` and the
+  `quic-data-release-share` case in `simulation_integration.rs`.
+
 When a NEW wire-gated feature first ships (not this one), set its floor to
 **exactly that release version** and freeze it, as described above.
 

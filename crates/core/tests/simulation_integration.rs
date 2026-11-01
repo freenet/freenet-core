@@ -20821,6 +20821,75 @@ fn run_as_first_negotiating_release(trace: &freenet::dev_tool::QuicUpgradeTrace)
     trace.run_as_release(real, real.max(QUIC_FIRST_NEGOTIATING_RELEASE));
 }
 
+/// Each node's data bit, end to end over a real QUIC connection: a pair negotiates
+/// data only with both bits, a mismatch stays in shadow, and shadow or a share of 0
+/// sets no bit. Whatever the bits, nothing is sent on the path.
+#[test_log::test]
+fn test_quic_data_needs_both_bits_and_carries_nothing_yet() {
+    for (name, seed, modes, percents, carries) in [
+        (
+            "quic-data-both",
+            0x5940_E5B3_0001,
+            ["prefer", "prefer"],
+            [Some(100), Some(100)],
+            true,
+        ),
+        (
+            "quic-data-gateway-only",
+            0x5940_E5B3_0002,
+            ["prefer", "prefer"],
+            [Some(100), Some(0)],
+            false,
+        ),
+        (
+            "quic-data-node-only",
+            0x5940_E5B3_0003,
+            ["prefer", "prefer"],
+            [Some(0), Some(100)],
+            false,
+        ),
+        (
+            "quic-data-one-shadow",
+            0x5940_E5B3_0004,
+            ["prefer", "shadow"],
+            [Some(100), Some(100)],
+            false,
+        ),
+        (
+            "quic-data-release-share",
+            0x5940_E5B3_0005,
+            ["prefer", "prefer"],
+            [None, None],
+            false,
+        ),
+    ] {
+        let run = run_quic_shadow_sim(name, seed, (1, 1), 8, |sim, trace, labels| {
+            for (label, (mode, percent)) in labels.iter().zip(modes.iter().zip(percents)) {
+                sim.with_node_transport_quic(label, mode);
+                if let Some(percent) = percent {
+                    sim.with_node_quic_data_percent(label, percent);
+                }
+            }
+            run_as_first_negotiating_release(trace);
+        });
+        for node in &run.nodes {
+            assert_eq!(run.whats(*node, "Established"), 1, "{name}: {}", run.dump());
+            assert_eq!(
+                run.whats(*node, "DataEnabled"),
+                usize::from(carries),
+                "{name}: {}",
+                run.dump()
+            );
+        }
+        assert_eq!(
+            run.total("path carried data: refused 0, delivered 0"),
+            2,
+            "{name}: both paths end carrying no data: {}",
+            run.dump()
+        );
+    }
+}
+
 /// Shadow on both ends: the whole negotiation runs over a real QUIC connection,
 /// each side counts it established on its own evidence, and no application
 /// traffic touches the path while the nodes carry on over UDP.

@@ -18,7 +18,9 @@
 //! session with `try_send`. Nothing here waits inside `recv`, and the driver
 //! holds no reference to `recv`'s liveness state (`last_received_nanos`,
 //! `last_inbound_nanos`), so nothing that arrives over QUIC can refresh the UDP
-//! session. With QUIC off a received Offer sets a flag, and the reply goes out at
+//! session. An active path writes one other stamp, read only by the node's check
+//! of whether a key's holder has gone quiet ([`Session::quic_receipt_nanos`]).
+//! With QUIC off a received Offer sets a flag, and the reply goes out at
 //! the top of `recv`'s loop, where a cancelled send is tried again.
 //!
 //! # The caller contract of [`UpgradeMachine`]
@@ -40,11 +42,14 @@
 //!   listener's clock clone. A client and a server machine are one machine, with
 //!   the session's lifetime.
 //!
-//! # Shadow
+//! # Shadow and data
 //!
-//! Every path is built with [`QuicPathLimits::SHADOW`] on the peer's UDP budget,
-//! and only `send_control_bounded` is called on it. What else the path can do is
-//! out of reach of the driver.
+//! A path is built on the peer's UDP budget, with [`QuicPathLimits::SHADOW`] unless
+//! this node's data bit is set for the peer (`UpgradeMachine::accepts_data`). With
+//! the bit set it accepts data at once, and what arrives waits in the path's
+//! channels, since nothing reads them yet. [`Action::EnableData`] lets the path
+//! send data once both bits are set. Only `send_control_bounded` is called on it:
+//! no code sends data yet, and a peer that sends none costs nothing here.
 
 #[cfg(test)]
 pub(in crate::transport) mod tests;
@@ -274,8 +279,9 @@ enum UdpSend {
 }
 
 /// A path and the receiving ends of its channels. In shadow nothing arrives on
-/// `shorts` and `streams`: the path refuses data before it reaches them, and
-/// holding them keeps a frame that got through from being counted as dropped.
+/// `shorts` and `streams`: the path refuses data before it reaches them. With this
+/// node's data bit set a peer's frames wait here, charged to the peer's budget,
+/// until the path ends. Holding them keeps a frame from being counted as dropped.
 struct LivePath {
     path: Arc<QuicPath>,
     _shorts: mpsc::Receiver<crate::transport::quic::path::InboundShort>,
@@ -371,8 +377,12 @@ struct Session {
     hub: Arc<QuicUpgrades>,
     inbox: mpsc::Sender<SessionEvent>,
     budget: SharedInboundBudget,
+    /// When an active path of this session last heard from the peer, on [`Self::now`].
+    /// Half of the connection's `ReceiptStamp`. Written from the path's watch
+    /// because the path runs on another clock in simulation.
+    quic_receipt_nanos: Arc<AtomicU64>,
     /// The connection's `TimeSource::now`, the listener's clock.
-    now: Box<dyn Fn() -> Duration + Send + Sync>,
+    now: Arc<dyn Fn() -> Duration + Send + Sync>,
     state: Mutex<SessionState>,
 }
 
@@ -487,6 +497,7 @@ impl QuicUpgrades {
         remote: SocketAddr,
         remote_version: Option<(u8, u8, u16)>,
         budget: SharedInboundBudget,
+        quic_receipt_nanos: Arc<AtomicU64>,
         sender: UpgradeSender<S, T>,
         time: T,
     ) -> QuicPathState {
@@ -504,7 +515,8 @@ impl QuicUpgrades {
             hub: Arc::clone(self),
             inbox,
             budget,
-            now: Box::new(move || clock.now()),
+            quic_receipt_nanos,
+            now: Arc::new(move || clock.now()),
             state: Mutex::new(SessionState {
                 machine: UpgradeMachine::new(self.local_key.clone()),
                 attempt: None,
@@ -638,6 +650,7 @@ impl Session {
                 Action::SendUpgrade(control) => sends.push(UdpSend::Reply(control)),
                 Action::Dial { attempt } => self.dial(state, attempt),
                 Action::SendControl(control) => self.send_control(state, control),
+                Action::EnableData { attempt } => self.enable_data(state, attempt),
                 Action::TearDown { attempt, code } => {
                     // A later step of this same batch must not send it.
                     sends.retain(|send| {
@@ -689,8 +702,15 @@ impl Session {
                 }
                 if let Some(held) = state.attempt.as_mut() {
                     held.gauge.activate(now);
+                    if let Some(live) = &held.path {
+                        live.path.report_receipts_to(self.receipt_writer());
+                    }
                 }
             }
+            // No counter yet, and at a share of 0 it does not happen. Not in
+            // `QuicUpgradeOutcome`: that array is at 32, the longest serde and
+            // `Default` take, so a data count needs a labelled set of its own.
+            Outcome::DataEnabled => {}
             Outcome::Declined { reason, uncharged } => {
                 count(declined(reason));
                 if uncharged {
@@ -871,11 +891,37 @@ impl Session {
         self.step(state, event)
     }
 
+    /// What an active path calls when it hears from the peer.
+    fn receipt_writer(&self) -> Box<dyn Fn() + Send + Sync> {
+        let stamp = Arc::clone(&self.quic_receipt_nanos);
+        let now = Arc::clone(&self.now);
+        Box::new(move || stamp.store(now().as_nanos() as u64, Ordering::Release))
+    }
+
+    fn enable_data(&self, state: &SessionState, attempt: u32) {
+        debug_assert!(state.machine.carries_data(), "attempt {attempt}");
+        let live = state
+            .attempt
+            .as_ref()
+            .filter(|held| held.id == attempt)
+            .and_then(|held| held.path.as_ref());
+        if let Some(live) = live {
+            live.path.enable_data();
+        }
+    }
+
     fn build_path(&self, state: &mut SessionState, attempt: u32, connection: QuicConnection) {
+        // At once, not when the peer's bit arrives: the peer's first stream can
+        // overtake the frame that carries it.
+        let limits = if state.machine.accepts_data() {
+            QuicPathLimits::DEFAULT
+        } else {
+            QuicPathLimits::SHADOW
+        };
         let (path, inbound) = QuicPath::with_budget(
             connection,
             self.hub.path_clock.clone(),
-            QuicPathLimits::SHADOW,
+            limits,
             self.budget.clone(),
         );
         let QuicInbound {
@@ -1037,6 +1083,7 @@ impl Session {
             older.end();
         }
         let backoff = self.hub.seeds.lock().seed_for(&key);
+        let own_caps = self.hub.policy.own_caps(&self.hub.local_key, &key);
         let sends = {
             let mut state = self.state.lock();
             if state.ended {
@@ -1048,6 +1095,7 @@ impl Session {
                     peer_key: key,
                     remote_version: self.hub.peer_version(self.remote_version),
                     backoff,
+                    own_caps,
                 },
             );
             self.apply(&mut state, actions)
@@ -1338,6 +1386,12 @@ impl QuicPathState {
         ] {
             assert!(self.session.inbox.try_send(event).is_ok());
         }
+    }
+
+    /// The stamp the session's active path writes.
+    #[cfg(test)]
+    pub(in crate::transport) fn quic_receipt_nanos(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.session.quic_receipt_nanos)
     }
 
     /// The key this session was promoted under, if any.

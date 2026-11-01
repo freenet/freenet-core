@@ -336,6 +336,7 @@ impl Default for ConfigArgs {
                 bbr_startup_rate: None,    // Uses default from BBR config
                 transport_quic: None,      // Default: off
                 quic_max_paths: None,      // Default: max-number-of-connections
+                quic_data_percent: None,   // Default: this release's share of pairs
                 quic_ignore_crash_breaker: None,
             },
             ws_api: WebsocketApiArgs {
@@ -1032,6 +1033,9 @@ impl ConfigArgs {
             if let Some(limit) = cfg.network_api.quic_max_paths.clone() {
                 self.network_api.quic_max_paths.get_or_insert(limit);
             }
+            if let Some(percent) = cfg.network_api.quic_data_percent.clone() {
+                self.network_api.quic_data_percent.get_or_insert(percent);
+            }
             if cfg.network_api.quic_ignore_crash_breaker {
                 self.network_api
                     .quic_ignore_crash_breaker
@@ -1551,6 +1555,7 @@ impl ConfigArgs {
                 bbr_startup_rate: self.network_api.bbr_startup_rate,
                 transport_quic: self.network_api.transport_quic.clone(),
                 quic_max_paths: self.network_api.quic_max_paths.clone(),
+                quic_data_percent: self.network_api.quic_data_percent.clone(),
                 quic_ignore_crash_breaker: self
                     .network_api
                     .quic_ignore_crash_breaker
@@ -2492,7 +2497,8 @@ pub struct NetworkArgs {
     ///
     /// `shadow` builds a QUIC endpoint on the network port. In this release
     /// the endpoint accepts no connections and opens none, so the node
-    /// behaves as with `off`. `prefer` runs as `shadow` in this release. An
+    /// behaves as with `off`. `prefer` also negotiates data with a share of
+    /// pairs; this release sends none. An
     /// unknown value is treated as `off`, with a warning in the log.
     #[arg(long, env = "FREENET_TRANSPORT_QUIC", value_name = "off|shadow|prefer")]
     #[serde(rename = "transport-quic", skip_serializing_if = "Option::is_none")]
@@ -2517,6 +2523,27 @@ pub struct NetworkArgs {
         serialize_with = "lenient_count::serialize"
     )]
     pub quic_max_paths: Option<String>,
+
+    /// The share of pairs, from 0 to 100, that this node offers to carry data
+    /// on QUIC with (#5940), in place of this release's own share. Only this
+    /// node's own half: a pair carries data only if both sides say so. Takes
+    /// effect with `transport-quic = "prefer"`. A value that cannot be read is
+    /// ignored with a warning in the log. For test runs: setting it to 100 makes a
+    /// `prefer` node say it accepts data from every peer, which this release only
+    /// does in a build with the `testing` feature.
+    #[arg(
+        long = "quic-data-percent",
+        env = "FREENET_QUIC_DATA_PERCENT",
+        value_name = "PERCENT"
+    )]
+    #[serde(
+        default,
+        rename = "quic-data-percent",
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_count::deserialize",
+        serialize_with = "lenient_count::serialize"
+    )]
+    pub quic_data_percent: Option<String>,
 
     /// Run QUIC even when the crash-loop breaker would keep it off (unix
     /// only; the breaker is off on Windows).
@@ -2829,6 +2856,18 @@ pub struct NetworkApiConfig {
     )]
     pub quic_max_paths: Option<String>,
 
+    /// This node's share of pairs for carrying data on QUIC (#5940), stored as
+    /// text like [`Self::quic_max_paths`]. Read through
+    /// [`Self::quic_data_percent`].
+    #[serde(
+        default,
+        rename = "quic-data-percent",
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_count::deserialize",
+        serialize_with = "lenient_count::serialize"
+    )]
+    pub quic_data_percent: Option<String>,
+
     /// Run QUIC even when the crash-loop breaker would keep it off
     /// (`transport::quic::breaker`). Default false.
     #[serde(
@@ -2908,6 +2947,15 @@ impl NetworkApiConfig {
             QuicMaxPathsSetting::Set(limit) => limit.min(self.max_connections),
             QuicMaxPathsSetting::Unset | QuicMaxPathsSetting::Invalid(_) => self.max_connections,
         }
+    }
+
+    /// `quic-data-percent`, if it is set and reads as a whole number from 0 to
+    /// 100. Anything else reads as unset, and the release's share applies.
+    pub(crate) fn quic_data_percent(&self) -> Option<u8> {
+        self.quic_data_percent
+            .as_deref()
+            .and_then(|raw| raw.trim().parse::<u8>().ok())
+            .filter(|percent| *percent <= 100)
     }
 
     /// How `quic-max-paths` reads.
@@ -6938,6 +6986,7 @@ ledbat-min-ssthresh = 102401
 congestion-control = "bbr"
 bbr-startup-rate = 12345678
 quic-max-paths = 7
+quic-data-percent = 7
 skip_load_from_network = true
 ws-api-address = "127.0.0.1"
 ws-api-port = 7510
@@ -9497,6 +9546,40 @@ shutdown-drain-secs = 42
         }
     }
 
+    /// `quic-data-percent` (#5940) survives a bare restart as written, and only
+    /// a whole number from 0 to 100 reads as a share: anything else reads as
+    /// unset, so the release's share applies.
+    #[tokio::test]
+    async fn quic_data_percent_survives_a_bare_build_and_unknown_values_read_as_unset() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cfg = local_args(temp_dir.path()).build().await.unwrap();
+        assert_eq!(cfg.network_api.quic_data_percent, None);
+        assert_eq!(cfg.network_api.quic_data_percent(), None);
+
+        for (value, percent) in [
+            ("0", Some(0)),
+            ("5", Some(5)),
+            (" 25 ", Some(25)),
+            ("100", Some(100)),
+            ("101", None),
+            ("-1", None),
+            ("lots", None),
+            ("", None),
+        ] {
+            let mut first = local_args(temp_dir.path());
+            first.network_api.quic_data_percent = Some(value.to_string());
+            first.build().await.unwrap();
+            let cfg = local_args(temp_dir.path()).build().await.unwrap();
+            assert_eq!(
+                // A whole number is written back as an integer, without spaces.
+                cfg.network_api.quic_data_percent.as_deref().map(str::trim),
+                Some(value.trim()),
+                "bare build"
+            );
+            assert_eq!(cfg.network_api.quic_data_percent(), percent, "{value:?}");
+        }
+    }
+
     /// `quic-max-paths` (#5940) survives a bare restart, an unparsable value
     /// included (it reads as the default and does not stop the build), a
     /// value on the command line wins over the file, and unset reads as
@@ -9887,6 +9970,7 @@ shutdown-drain-secs = 42
                 bbr_startup_rate: Some(5_000),
                 transport_quic: Some("prefer".to_string()),
                 quic_max_paths: Some("17".to_string()),
+                quic_data_percent: Some("35".to_string()),
                 quic_ignore_crash_breaker: true,
                 skip_load_from_network: true,
                 // serde-skip: a per-boot migration record, never persisted.
@@ -10100,6 +10184,7 @@ shutdown-drain-secs = 42
             bbr_startup_rate,
             transport_quic,
             quic_max_paths,
+            quic_data_percent,
             quic_ignore_crash_breaker,
             skip_load_from_network,
             dropped_persisted_loopback: _, // serde-skip: per-boot migration record
@@ -10174,6 +10259,10 @@ shutdown-drain-secs = 42
         assert_eq!(
             quic_max_paths, seed.network_api.quic_max_paths,
             "quic_max_paths"
+        );
+        assert_eq!(
+            quic_data_percent, seed.network_api.quic_data_percent,
+            "quic_data_percent"
         );
         assert_eq!(
             skip_load_from_network, seed.network_api.skip_load_from_network,

@@ -618,15 +618,41 @@ impl AckWatch {
     }
 }
 
+/// Where a path's watch reports that the peer was heard from. Empty until the
+/// path is active, so a path still being set up reports nothing.
+#[derive(Default)]
+pub(crate) struct PeerHeard(std::sync::OnceLock<Box<dyn Fn() + Send + Sync>>);
+
+impl PeerHeard {
+    /// From now on, call `report` when the peer was heard from. A second call
+    /// changes nothing.
+    pub(crate) fn report_to(&self, report: Box<dyn Fn() + Send + Sync>) {
+        if self.0.set(report).is_err() {
+            tracing::debug!("QUIC path: its receipts already have somewhere to go");
+        }
+    }
+
+    fn report(&self) {
+        if let Some(report) = self.0.get() {
+            report();
+        }
+    }
+}
+
 /// Watch `connection` every [`ACK_WATCH_TICK`] on `time`, and close it with
 /// `close_code::PEER_NOT_ACKNOWLEDGING` when [`AckWatch`] says so. Returns
 /// once it closed the connection, or once the connection has closed. Runs
 /// beside the path's receive task, never in a task of its own.
+///
+/// Each sample with new frames from the peer also tells `heard`. Frames count
+/// only from authenticated packets, and PINGs are frames, so a quiet path with
+/// a live peer reports at its keepalive interval.
 pub(crate) async fn watch_acknowledgements<T: TimeSource>(
     connection: quinn::Connection,
     closer: QuicCloser,
     time: T,
     cap_holds: Arc<CapHolds>,
+    heard: Arc<PeerHeard>,
 ) {
     let Some(first) = AckSample::of(&connection, &cap_holds) else {
         tracing::warn!(
@@ -636,6 +662,7 @@ pub(crate) async fn watch_acknowledgements<T: TimeSource>(
         );
         return;
     };
+    let mut received = first.received;
     let mut watch = AckWatch::new(ACK_WATCH_WINDOW, first);
     loop {
         time.sleep(ACK_WATCH_TICK).await;
@@ -645,6 +672,10 @@ pub(crate) async fn watch_acknowledgements<T: TimeSource>(
         let Some(sample) = AckSample::of(&connection, &cap_holds) else {
             return;
         };
+        if sample.received != received {
+            received = sample.received;
+            heard.report();
+        }
         if watch.observe(time.now_nanos(), sample) {
             if closer.close(QuicCloseCode::PeerNotAcknowledging) {
                 tracing::warn!(

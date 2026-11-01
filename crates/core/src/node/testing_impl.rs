@@ -2087,6 +2087,18 @@ impl SimNetwork {
         self
     }
 
+    /// Sets `quic-data-percent` to `percent` on the node `label`, as `config.toml`
+    /// would. Call before the simulation starts. No effect unless the node is in
+    /// `prefer` mode.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_node_quic_data_percent(&mut self, label: &NodeLabel, percent: u8) -> &mut Self {
+        let config = self.node_config_mut(label);
+        Arc::make_mut(&mut config.config)
+            .network_api
+            .quic_data_percent = Some(percent.to_string());
+        self
+    }
+
     /// Sets `quic-max-paths` to `limit` on every node, as `config.toml` would.
     /// Call before the simulation starts. No effect on a node with QUIC off.
     #[cfg(any(test, feature = "testing"))]

@@ -2293,6 +2293,7 @@ impl ReceiptClock {
         let now = self.now.clone();
         crate::transport::ReceiptStamp::new(
             self.last.clone(),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
             Arc::new(move || now.load(std::sync::atomic::Ordering::Relaxed)),
         )
     }
