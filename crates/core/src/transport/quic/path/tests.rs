@@ -100,7 +100,8 @@ async fn paths_with(
     let (a, a_in) = QuicPath::new(client, pair.time.clone());
     let (b, b_in) = match b_budget {
         Some(budget) => {
-            let (b, b_in) = QuicPath::with_budget(server, pair.time.clone(), b_limits, budget);
+            let (b, b_in) =
+                QuicPath::with_budget_and_own_channels(server, pair.time.clone(), b_limits, budget);
             if b_limits.accept_data {
                 b.enable_data();
             }

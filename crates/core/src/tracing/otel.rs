@@ -3128,6 +3128,14 @@ mod tests {
                 "freenet.transport.inbound_stream_limits",
                 "reason=evicted_age",
             ),
+            (
+                "freenet.transport.inbound_stream_limits",
+                "reason=stream_id_on_both_paths",
+            ),
+            (
+                "freenet.transport.inbound_stream_limits",
+                "reason=complete_charge_past_age",
+            ),
             // Every `HostingReason::as_str` value: its own rustdoc calls these
             // a metrics contract where renaming one empties a panel.
             ("freenet.node.contracts.hosted", "reason=local_client"),

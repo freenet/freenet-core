@@ -55,6 +55,7 @@ fn the_store_is_bounded_and_evicts_the_least_recently_used() {
 use crate::config::GlobalRng;
 use crate::transport::quic::QuicAvailability;
 use crate::transport::quic::breaker::BreakerOutcome;
+use crate::transport::quic::path::QuicInbound;
 use crate::transport::quic::tests::{Pair, SEED, bounded, drive, pair};
 use crate::transport::quic::upgrade::machine::{BACKOFF_MIN, OFFER_TIMEOUT};
 use crate::transport::quic::upgrade::policy::QuicPolicyConfig;
@@ -68,6 +69,8 @@ pub(in crate::transport) struct Harness {
     pub(in crate::transport) peer: TransportPublicKey,
     /// The clock of every session of the hub, in nanoseconds.
     now: Arc<AtomicU64>,
+    /// What each session's paths deliver, kept open as a connection keeps it.
+    inboxes: std::sync::Mutex<Vec<QuicDataInbox>>,
 }
 
 impl Harness {
@@ -115,6 +118,7 @@ impl Harness {
             remote,
             peer,
             now: Arc::new(AtomicU64::new(0)),
+            inboxes: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -128,6 +132,8 @@ impl Harness {
         let id = self.hub.next_session.fetch_add(1, Ordering::Relaxed);
         self.hub.routes.insert(self.remote, (id, inbox.clone()));
         let now = self.now.clone();
+        let (data, data_inbox) = data_channels();
+        self.inboxes.lock().unwrap().push(data_inbox);
         let session = Arc::new(Session {
             id,
             remote: self.remote,
@@ -135,6 +141,7 @@ impl Harness {
             hub: Arc::clone(&self.hub),
             inbox,
             budget: SharedInboundBudget::new(16, 1 << 20),
+            data,
             quic_receipt_nanos: Arc::new(AtomicU64::new(0)),
             now: Arc::new(move || Duration::from_nanos(now.load(Ordering::Relaxed))),
             state: Mutex::new(SessionState {
@@ -373,10 +380,9 @@ fn a_routed_attempt_becomes_a_shadow_path() {
                 let state = session_for_task.state.lock();
                 let live = state.attempt.as_ref().unwrap().path.as_ref().unwrap();
                 let refused = live
-                    .path
                     .stats()
                     .count(QuicInboundOutcome::RefusedNotAcceptingData);
-                assert_eq!(live._shorts.len(), 0);
+                assert_eq!(live.stats().count(QuicInboundOutcome::DeliveredShort), 0);
                 let charged = session_for_task.budget.lock().stream_count();
                 drop(state);
                 (peer_path, peer_inbound, refused, charged)
@@ -490,10 +496,9 @@ fn a_path_follows_the_data_bits() {
                     let state = session_for_task.state.lock();
                     let live = state.attempt.as_ref().unwrap().path.as_ref().unwrap();
                     let refused = live
-                        .path
                         .stats()
                         .count(QuicInboundOutcome::RefusedNotAcceptingData);
-                    let delivered = live._shorts.len();
+                    let delivered = live.stats().count(QuicInboundOutcome::DeliveredShort);
                     drop(state);
                     drop(inbox);
                     (peer_path, peer_inbound, delivered, refused)
@@ -517,7 +522,7 @@ fn a_path_follows_the_data_bits() {
             let sends_data = |session: &Session| {
                 let state = session.state.lock();
                 let live = state.attempt.as_ref().unwrap().path.as_ref().unwrap();
-                live.path.sends_data()
+                live.sends_data()
             };
             assert!(!sends_data(&session), "{case}: not before the peer's frame");
             ready_ack(&session, attempt, peer_caps);

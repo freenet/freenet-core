@@ -46,10 +46,12 @@
 //!
 //! A path is built on the peer's UDP budget, with [`QuicPathLimits::SHADOW`] unless
 //! this node's data bit is set for the peer (`UpgradeMachine::accepts_data`). With
-//! the bit set it accepts data at once, and what arrives waits in the path's
-//! channels, since nothing reads them yet. [`Action::EnableData`] lets the path
-//! send data once both bits are set. Only `send_control_bounded` is called on it:
-//! no code sends data yet, and a peer that sends none costs nothing here.
+//! the bit set it accepts data at once, and what arrives goes to the session's data
+//! channels ([`data_channels`]), which `PeerConnection::recv` reads. They live as
+//! long as the session, so a message that arrived before its path ended is still
+//! delivered. [`Action::EnableData`] lets the path send data once both bits are
+//! set. Only `send_control_bounded` is called on it: no node code sends data yet,
+//! and a peer that sends none costs nothing here.
 
 #[cfg(test)]
 pub(in crate::transport) mod tests;
@@ -83,7 +85,9 @@ use crate::transport::peer_connection::UpgradeSender;
 use crate::transport::peer_connection::inbound_budget::SharedInboundBudget;
 use crate::transport::quic::control::ControlError;
 use crate::transport::quic::identity::PeerKey;
-use crate::transport::quic::path::{BoundedSend, QuicInbound, QuicPath, QuicPathLimits};
+use crate::transport::quic::path::{
+    BoundedSend, QuicDataInbox, QuicDataSenders, QuicPath, QuicPathLimits, data_channels,
+};
 use crate::transport::quic::{QuicConnection, QuicEndpoint, QuicIncoming, QuicPeerPermit};
 use crate::transport::symmetric_message::DeclineReason;
 use crate::transport::symmetric_message::UpgradeControl;
@@ -278,16 +282,6 @@ enum UdpSend {
     Reply(UpgradeControl),
 }
 
-/// A path and the receiving ends of its channels. In shadow nothing arrives on
-/// `shorts` and `streams`: the path refuses data before it reaches them. With this
-/// node's data bit set a peer's frames wait here, charged to the peer's budget,
-/// until the path ends. Holding them keeps a frame from being counted as dropped.
-struct LivePath {
-    path: Arc<QuicPath>,
-    _shorts: mpsc::Receiver<crate::transport::quic::path::InboundShort>,
-    _streams: mpsc::Receiver<crate::transport::quic::path::InboundStreamArrival>,
-}
-
 /// An attempt's place in the `quic_paths_*` gauges: counted as offered or
 /// dialing from creation, as active once the machine reports the path
 /// established, and out again when the attempt is dropped. A guard, so no
@@ -329,7 +323,7 @@ struct Attempt {
     allow: Option<QuicPeerPermit>,
     /// A routed connection attempt is finishing its handshake.
     establishing: bool,
-    path: Option<LivePath>,
+    path: Option<Arc<QuicPath>>,
     /// The dial or establish task, the control sends and the path's pump.
     tasks: Vec<JoinHandle<()>>,
 }
@@ -377,6 +371,8 @@ struct Session {
     hub: Arc<QuicUpgrades>,
     inbox: mpsc::Sender<SessionEvent>,
     budget: SharedInboundBudget,
+    /// Where every path of this session delivers data.
+    data: QuicDataSenders,
     /// When an active path of this session last heard from the peer, on [`Self::now`].
     /// Half of the connection's `ReceiptStamp`. Written from the path's watch
     /// because the path runs on another clock in simulation.
@@ -491,7 +487,8 @@ impl QuicUpgrades {
         }
     }
 
-    /// Start the upgrade of a new UDP session.
+    /// Start the upgrade of a new UDP session. The inbox is what its paths deliver
+    /// to, for the connection's `recv`.
     pub(in crate::transport) fn open_session<S: Socket, T: TimeSource>(
         self: &Arc<Self>,
         remote: SocketAddr,
@@ -500,7 +497,8 @@ impl QuicUpgrades {
         quic_receipt_nanos: Arc<AtomicU64>,
         sender: UpgradeSender<S, T>,
         time: T,
-    ) -> QuicPathState {
+    ) -> (QuicPathState, QuicDataInbox) {
+        let (data, data_inbox) = data_channels();
         let (inbox, inbox_rx) = mpsc::channel(SESSION_INBOX_CAPACITY);
         let id = self.next_session.fetch_add(1, Ordering::Relaxed);
         let remote = normalize_mapped_addr(remote);
@@ -515,6 +513,7 @@ impl QuicUpgrades {
             hub: Arc::clone(self),
             inbox,
             budget,
+            data,
             quic_receipt_nanos,
             now: Arc::new(move || clock.now()),
             state: Mutex::new(SessionState {
@@ -529,7 +528,7 @@ impl QuicUpgrades {
             remote,
             drive(Arc::clone(&session), inbox_rx, sender, time),
         ));
-        QuicPathState { session, driver }
+        (QuicPathState { session, driver }, data_inbox)
     }
 
     /// Whether a test made this node's record of its peers' keys wrong.
@@ -702,8 +701,8 @@ impl Session {
                 }
                 if let Some(held) = state.attempt.as_mut() {
                     held.gauge.activate(now);
-                    if let Some(live) = &held.path {
-                        live.path.report_receipts_to(self.receipt_writer());
+                    if let Some(path) = &held.path {
+                        path.report_receipts_to(self.receipt_writer());
                     }
                 }
             }
@@ -900,13 +899,13 @@ impl Session {
 
     fn enable_data(&self, state: &SessionState, attempt: u32) {
         debug_assert!(state.machine.carries_data(), "attempt {attempt}");
-        let live = state
+        let path = state
             .attempt
             .as_ref()
             .filter(|held| held.id == attempt)
             .and_then(|held| held.path.as_ref());
-        if let Some(live) = live {
-            live.path.enable_data();
+        if let Some(path) = path {
+            path.enable_data();
         }
     }
 
@@ -918,17 +917,13 @@ impl Session {
         } else {
             QuicPathLimits::SHADOW
         };
-        let (path, inbound) = QuicPath::with_budget(
+        let (path, controls) = QuicPath::with_budget(
             connection,
             self.hub.path_clock.clone(),
             limits,
             self.budget.clone(),
+            self.data.clone(),
         );
-        let QuicInbound {
-            shorts,
-            streams,
-            controls,
-        } = inbound;
         let pump = spawn_pump(
             attempt,
             self.remote,
@@ -939,11 +934,7 @@ impl Session {
         );
         if let Some(held) = state.attempt.as_mut() {
             held.tasks.push(pump);
-            held.path = Some(LivePath {
-                path: Arc::new(path),
-                _shorts: shorts,
-                _streams: streams,
-            });
+            held.path = Some(Arc::new(path));
         }
     }
 
@@ -961,7 +952,7 @@ impl Session {
         else {
             return Vec::new();
         };
-        let decoded: Result<_, ControlError> = path.path.decode_control(payload);
+        let decoded: Result<_, ControlError> = path.decode_control(payload);
         match decoded {
             Ok(control) => self.step(state, Event::Control(control)),
             Err(error) => self.step(state, Event::ControlRefused { attempt, error }),
@@ -979,10 +970,9 @@ impl Session {
         let Some(held) = state.attempt.as_mut().filter(|held| held.id == attempt) else {
             return;
         };
-        let Some(live) = held.path.as_ref() else {
+        let Some(path) = held.path.as_ref().map(Arc::clone) else {
             return;
         };
-        let path = Arc::clone(&live.path);
         let clock = self.hub.path_clock.clone();
         let inbox = self.inbox.clone();
         held.tasks.push(GlobalExecutor::spawn(async move {
@@ -1003,16 +993,16 @@ impl Session {
             TRANSPORT_METRICS
                 .record_quic_path_closed((self.now)().saturating_sub(since), self.remote);
         }
-        if let Some(live) = &held.path {
-            live.path.close(code);
+        if let Some(path) = &held.path {
+            path.close(code);
             self.note(|| format!("closed path with {code:?}"));
             self.note(|| {
-                let refused = live.path.stats().count(
-                    crate::transport::quic::path::QuicInboundOutcome::RefusedNotAcceptingData,
-                );
+                use crate::transport::quic::path::QuicInboundOutcome as Q;
+                let stats = path.stats();
                 format!(
-                    "path carried data: refused {refused}, delivered {}",
-                    live._shorts.len() + live._streams.len()
+                    "path carried data: refused {}, delivered {}",
+                    stats.count(Q::RefusedNotAcceptingData),
+                    stats.count(Q::DeliveredShort) + stats.count(Q::AnnouncedStream)
                 )
             });
         }
@@ -1386,6 +1376,36 @@ impl QuicPathState {
         ] {
             assert!(self.session.inbox.try_send(event).is_ok());
         }
+    }
+
+    /// Send `payload` as a Short on this session's path if it may carry data, and
+    /// otherwise hand it back. For a simulation to carry a real message before any
+    /// node code sends on a path (`QuicUpgradeTrace::send_shorts_on_paths`).
+    #[cfg(any(test, feature = "testing"))]
+    pub(in crate::transport) fn send_short_on_path(
+        &self,
+        payload: Vec<u8>,
+    ) -> std::result::Result<(), Vec<u8>> {
+        let path = self
+            .session
+            .state
+            .lock()
+            .attempt
+            .as_ref()
+            .and_then(|held| held.path.as_ref().map(Arc::clone))
+            .filter(|path| path.sends_data());
+        let Some(path) = path else {
+            return Err(payload);
+        };
+        let session = Arc::clone(&self.session);
+        drop(GlobalExecutor::spawn(async move {
+            let clock = session.hub.path_clock.clone();
+            let outcome = path
+                .send_short_bounded(&clock, Duration::from_secs(5), &payload)
+                .await;
+            session.note(|| format!("sent a short on the path: {outcome:?}"));
+        }));
+        Ok(())
     }
 
     /// The stamp the session's active path writes.

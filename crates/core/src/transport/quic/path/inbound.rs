@@ -44,8 +44,9 @@
 //!   its first byte and is judged afresh. `ClosedTooManyRefusals` cannot
 //!   happen here.
 //! - A `Stream` whose id is already held on the path is refused
-//!   (`StreamIdInUse`). Completed ids are not remembered: that dedup is e5's,
-//!   where it sees both transports (`completed_inbound_streams`).
+//!   (`StreamIdInUse`). Completed ids are not remembered here: that dedup is in
+//!   the connection's stream arm, which sees both transports
+//!   (`completed_inbound_streams`).
 //! - Header refusals, truncation, overlong streams, resets and full channels
 //!   are counted in the path's own `QuicInboundOutcome` counters. A refused
 //!   header with an invalid declared length is also counted as
@@ -106,6 +107,8 @@ use crate::transport::peer_connection::{inbound_stream_age_limit, streaming_hand
 /// its payload is taken.
 pub(crate) struct InboundShort {
     payload: Bytes,
+    /// What the charge is held under, so the consumer can release it at once.
+    key: InboundKey,
     _charge: Arc<LegacyStreamToken>,
 }
 
@@ -118,15 +121,22 @@ impl std::fmt::Debug for InboundShort {
 }
 
 impl InboundShort {
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(crate) fn payload(&self) -> &Bytes {
         &self.payload
     }
 
     /// The payload; its charge is released.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(crate) fn into_payload(self) -> Bytes {
         self.payload
+    }
+
+    /// The payload and the key of its charge, whose state is then gone: release
+    /// it with `release_if_gone`. Otherwise it holds room until something needs
+    /// room or the UDP sweep runs.
+    pub(in crate::transport) fn into_parts(self) -> (Bytes, InboundKey) {
+        (self.payload, self.key)
     }
 }
 
@@ -134,10 +144,9 @@ impl InboundShort {
 /// arrived and before its payload. Its bytes arrive in `handle` as they are
 /// received; the handle is cancelled if the stream fails.
 ///
-/// `handle` is the transport-internal `StreamHandle`; e5 must wrap it in a
-/// `boundary::IncomingStream` before anything above the transport sees it.
+/// `handle` is the transport-internal `StreamHandle`; the connection wraps it in
+/// a `boundary::IncomingStream` before anything above the transport sees it.
 #[derive(Debug)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct InboundStreamArrival {
     pub(crate) stream_id: StreamId,
     /// The message announcing the stream, if the sender sent one.
@@ -737,6 +746,7 @@ impl<T: TimeSource> Receiver<T> {
         guard.complete = true;
         let message = InboundShort {
             payload,
+            key,
             _charge: token,
         };
         match self.shorts.try_send(message) {

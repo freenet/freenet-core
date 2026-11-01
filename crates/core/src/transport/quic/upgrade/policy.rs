@@ -40,14 +40,12 @@ use crate::transport::quic::liveness::{QuicAvailability, QuicAvailabilityWatch};
 /// release that puts it in the slice. `quic-data-percent` replaces it on one node.
 pub(in crate::transport) const QUIC_DATA_PERCENT: u8 = 0;
 
-/// Whether this build reads data from a QUIC path. It does not yet: nothing
-/// drains the path's channels, so a node that said it accepts data would queue a
-/// peer's frames against the shared inbound budget for nothing. While this is
-/// `false`, [`QuicPolicy::own_caps`] returns 0 outside test builds (`cfg(test)`
-/// or the `testing` feature, which the simulations use). The receive side flips
-/// it to `true`. A sender must also require a peer at or above the first release
-/// that reads.
-pub(in crate::transport) const QUIC_DATA_RECEIVER_READY: bool = false;
+/// Whether this build reads data from a QUIC path. It does: `PeerConnection::recv`
+/// drains the session's data channels, so a node that says it accepts data delivers
+/// a peer's frames. While this is `false`, [`QuicPolicy::own_caps`] returns 0
+/// outside test builds (`cfg(test)` or the `testing` feature, which the simulations
+/// use). A sender must also require a peer at or above the first release that reads.
+pub(in crate::transport) const QUIC_DATA_RECEIVER_READY: bool = true;
 
 /// Whether `own_caps` may set the data bit in this build.
 const fn data_bit_allowed(testing_build: bool) -> bool {
@@ -509,12 +507,13 @@ mod tests {
         }
     }
 
-    /// A build without `cfg(test)` or the `testing` feature cannot set the data
-    /// bit until the receive side exists, whatever the mode and the key say.
+    /// The receive side exists, so a build without `cfg(test)` or the `testing`
+    /// feature may set the data bit. It still does so only through the mode and the
+    /// slice, and `QUIC_DATA_PERCENT` keeps a release's share at 0.
     #[test]
-    fn a_non_testing_build_cannot_set_the_data_bit() {
-        const { assert!(!QUIC_DATA_RECEIVER_READY, "flip with the receive side") };
-        assert!(!data_bit_allowed(false));
+    fn a_build_with_the_receive_side_may_set_the_data_bit() {
+        const { assert!(QUIC_DATA_RECEIVER_READY, "the receive side is in `recv`") };
+        assert!(data_bit_allowed(false));
         assert!(data_bit_allowed(true));
         // Tests build with the testing cfg, so only the source can show that
         // `own_caps` consults the gate before anything else.
