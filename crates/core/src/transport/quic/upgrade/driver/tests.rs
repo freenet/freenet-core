@@ -1018,6 +1018,10 @@ fn a_session_with_no_attempt_waiting_sends_no_retry() {
         let dial = rig.dial();
         let first = rig.next_attempt().await;
         session.handle(SessionEvent::Incoming(Box::new(first)));
+        // The client's next Initial would carry a token if a Retry had reached it.
+        let again = rig.next_attempt().await;
+        assert!(!again.address_validated(), "no Retry went out");
+        again.ignore();
         dial.abort();
         assert_eq!(retries(h.remote), 0);
         assert_eq!(
