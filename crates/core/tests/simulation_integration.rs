@@ -20734,6 +20734,8 @@ struct QuicShadowRun {
     /// Gateways first.
     nodes: Vec<SocketAddr>,
     logs_events: usize,
+    /// Each pair of nodes that connected, ordered.
+    mesh: std::collections::BTreeSet<(SocketAddr, SocketAddr)>,
 }
 
 impl QuicShadowRun {
@@ -20795,11 +20797,20 @@ fn run_quic_shadow_sim(
     sim.run_simulation_direct::<rand::rngs::SmallRng>(seed, 1, steps, QUIC_EVENT_WAIT)
         .expect("direct simulation should succeed");
     let rt = create_runtime();
-    let logs_events = rt.block_on(async { logs_handle.lock().await.len() });
+    let (logs_events, mesh) = rt.block_on(async {
+        let logs = logs_handle.lock().await;
+        let mesh = logs
+            .iter()
+            .filter_map(|log| log.kind.connect_connected_addrs())
+            .map(|(a, b)| if a <= b { (a, b) } else { (b, a) })
+            .collect();
+        (logs.len(), mesh)
+    });
     QuicShadowRun {
         trace,
         nodes: addresses,
         logs_events,
+        mesh,
     }
 }
 
@@ -21288,4 +21299,239 @@ fn run_quic_restart_sim(
         driver.abort();
         (trace, labels[&gateway], replaced_at)
     })
+}
+
+// =============================================================================
+// QUIC shadow scenarios (#5940 step e5a-7)
+// =============================================================================
+
+/// The peers in `mesh`.
+fn quic_mesh_peers(
+    mesh: &std::collections::BTreeSet<(SocketAddr, SocketAddr)>,
+) -> std::collections::BTreeSet<SocketAddr> {
+    quic_mesh_peers_and_connected(mesh).0
+}
+
+/// Six nodes: four in shadow, one with QUIC off and one with QUIC off that
+/// advertises a release below the floor. The mesh joins the same peers as with
+/// QUIC off everywhere, paths exist only between shadow nodes, a node with QUIC
+/// off is offered and declines, and the node below the floor is neither offered
+/// nor sent a single upgrade message.
+#[test_log::test]
+fn test_quic_mixed_modes_form_paths_only_between_shadow_nodes() {
+    const SEED: u64 = 0x5940_E5C0_1003;
+    const ANSWER_FLOOR: (u8, u8, u16) = (0, 2, 149);
+    let baseline = run_quic_shadow_sim("quic-mixed-off", SEED, (2, 4), 8, |_, _, _| {});
+    let mixed = run_quic_shadow_sim("quic-mixed", SEED, (2, 4), 8, |sim, trace, labels| {
+        for label in &labels[..4] {
+            sim.with_node_transport_quic(label, "shadow");
+        }
+        sim.with_node_advertised_version(&labels[5], ANSWER_FLOOR);
+        run_as_first_negotiating_release(trace);
+    });
+    let (shadow, off, below) = (&mixed.nodes[..4], mixed.nodes[4], mixed.nodes[5]);
+
+    // Premises: the mesh formed, and offers, answers and paths all happened.
+    let baseline_peers = quic_mesh_peers(&baseline.mesh);
+    assert_eq!(
+        baseline_peers.len(),
+        6,
+        "every node joined: {:?}",
+        baseline.mesh
+    );
+    for node in &mixed.nodes {
+        assert!(
+            mixed.trace.connections_opened(*node) > 0,
+            "{node} connected"
+        );
+    }
+    assert!(mixed.total("Offered") >= 1, "{}", mixed.dump());
+    assert!(
+        mixed.total("Established") >= 2,
+        "a path formed between shadow nodes: {}",
+        mixed.dump()
+    );
+    assert!(
+        mixed.whats(off, "received Offer") >= 1,
+        "a shadow node offered to the node with QUIC off: {}",
+        mixed.dump()
+    );
+    // Who it declined to depends on the keys, so this reads the whole run.
+    assert!(
+        mixed.total("Declined { reason: Some(Disabled)") >= 1,
+        "the node with QUIC off answers Disabled: {}",
+        mixed.dump()
+    );
+    assert!(
+        mixed.total("IneligibleVersion") >= 1,
+        "a shadow node met the node below the floor: {}",
+        mixed.dump()
+    );
+
+    // The mesh joins the same peers, and is connected.
+    let (peers, connected) = quic_mesh_peers_and_connected(&mixed.mesh);
+    assert_eq!(peers, baseline_peers, "the same peers join");
+    assert!(connected, "{:?}", mixed.mesh);
+
+    // Paths exist only between shadow nodes.
+    for record in mixed.trace.records() {
+        if record.what.starts_with("Established") {
+            assert!(
+                shadow.contains(&record.node) && shadow.contains(&record.peer),
+                "{record:?} is not between shadow nodes"
+            );
+        }
+    }
+    for node in [off, below] {
+        assert_eq!(mixed.whats(node, "Established"), 0, "{}", mixed.dump());
+        assert_eq!(mixed.trace.permits_in_use(node), None, "it has no upgrades");
+    }
+    // Nothing is offered to, or sent to, the node below the floor.
+    assert_eq!(mixed.whats(below, "received"), 0, "{}", mixed.dump());
+    assert!(
+        mixed
+            .trace
+            .records()
+            .iter()
+            .all(|r| r.peer != below || !r.what.starts_with("Offered")),
+        "{}",
+        mixed.dump()
+    );
+}
+
+/// With `quic-max-paths` = 1 a node holds one path at a time. An offer that finds
+/// the permit taken is declined `Busy`; the server's decline costs it no backoff
+/// (`uncharged`), it asks again after the short retry, and once idle timeouts free
+/// slots the declined pairs do establish.
+#[test_log::test]
+fn test_quic_max_paths_one_declines_busy_and_retries() {
+    let run = run_quic_shadow_sim(
+        "quic-max-paths-one",
+        0x5940_E5C0_0002,
+        (1, 3),
+        20,
+        |sim, trace, _| {
+            sim.with_transport_quic("shadow");
+            sim.with_quic_max_paths(1);
+            sim.with_quic_idle_timeout(Duration::from_secs(20));
+            run_as_first_negotiating_release(trace);
+        },
+    );
+    // Premises: paths formed, and the limit was the one in force.
+    assert!(run.total("Established") >= 2, "{}", run.dump());
+    for record in run.trace.records() {
+        assert!(record.permits <= 1, "over the limit: {record:?}");
+    }
+    let busy_sent = run.total("DeclineSent(Busy)");
+    assert!(
+        busy_sent >= 1,
+        "no offer found the permit taken: {}",
+        run.dump()
+    );
+    let busy_seen = run.total("Declined { reason: Some(Busy), uncharged: true }");
+    assert!(
+        busy_seen >= 1,
+        "the offerer saw Busy and was not charged: {}",
+        run.dump()
+    );
+    assert_eq!(
+        run.total("Declined { reason: Some(Busy), uncharged: false }"),
+        0,
+        "a Busy decline never costs the peer its backoff: {}",
+        run.dump()
+    );
+    // A pair that was declined Busy later establishes.
+    let declined: Vec<_> = run
+        .nodes
+        .iter()
+        .flat_map(|n| run.trace.matching(*n, "Declined { reason: Some(Busy)"))
+        .collect();
+    assert!(
+        declined.iter().any(|d| {
+            run.trace
+                .of(d.node, d.peer)
+                .iter()
+                .any(|r| r.what.starts_with("Established") && r.at > d.at)
+        }),
+        "a declined pair never upgraded: {}",
+        run.dump()
+    );
+}
+
+/// A node that restarts while its path is up comes back with the same identity.
+/// The survivor's session ends with the replacement and its permit goes with it;
+/// the path returns once the backoff the earlier session had carried passes; and
+/// the survivor then holds exactly the one permit of the new path.
+#[test_log::test]
+fn test_quic_restart_while_shadowed_returns_the_path_and_frees_the_permit() {
+    let mut roles_seen = std::collections::BTreeSet::new();
+    for (index, seed) in (0..16u64).map(|i| 0x5940_E5C0_0100 + i).enumerate() {
+        let (trace, survivor, replaced_at) = run_quic_restart_sim(
+            &format!("quic-restart-shadow-{index}"),
+            seed,
+            None,
+            Duration::from_secs(240),
+        );
+        let dump = format!("{:#?}", trace.records());
+        let of = |prefix: &str| trace.matching(survivor, prefix);
+        let first = &of("Established")[0];
+        assert!(first.at < replaced_at, "premise: the path was up: {dump}");
+        assert_eq!(first.permits, 1, "{dump}");
+        let ended = of("session ended")
+            .into_iter()
+            .find(|e| e.session == first.session)
+            .unwrap_or_else(|| panic!("the old session ended: {dump}"));
+        assert_eq!(ended.permits, 0, "the permit left with the session: {dump}");
+        let back = of("Established")
+            .into_iter()
+            .find(|e| e.at > replaced_at && e.session != first.session)
+            .unwrap_or_else(|| panic!("the path did not return: {dump}"));
+        assert_eq!(back.permits, 1, "{dump}");
+        // The restarted node reports the same path from its side.
+        let peer = back.peer;
+        assert!(
+            !trace.matching(peer, "Established").is_empty(),
+            "the restarted node established too: {dump}"
+        );
+        // The earlier session's backoff seed carries over: a server waits it out
+        // before its first offer, a client declines with `Backoff` until then.
+        let survivor_was_server = of("Offered").iter().any(|o| o.at < replaced_at);
+        if survivor_was_server {
+            let next = of("Offered")
+                .into_iter()
+                .find(|o| o.at > replaced_at)
+                .unwrap_or_else(|| panic!("no new offer: {dump}"));
+            assert!(
+                next.at >= ended.at + Duration::from_secs(48),
+                "the new session's first offer waits for the carried backoff: {dump}"
+            );
+        } else {
+            assert!(
+                !of("DeclineSent(Backoff)").is_empty(),
+                "the client is still in the earlier session's backoff: {dump}"
+            );
+        }
+        roles_seen.insert(survivor_was_server);
+        if roles_seen.len() == 2 {
+            return;
+        }
+    }
+    panic!("the seeds did not cover both roles: {roles_seen:?}");
+}
+
+/// The mixed run is deterministic: the same seed gives the same upgrade records.
+#[test_log::test]
+fn test_quic_mixed_modes_are_deterministic() {
+    const SEED: u64 = 0x5940_E5C0_0003;
+    let once = |name: &str| {
+        let run = run_quic_shadow_sim(name, SEED, (2, 4), 6, |sim, trace, labels| {
+            for label in &labels[..4] {
+                sim.with_node_transport_quic(label, "shadow");
+            }
+            run_as_first_negotiating_release(trace);
+        });
+        assert!(run.total("Established") >= 2, "{}", run.dump());
+        (run.trace.records(), run.mesh)
+    };
+    assert_eq!(once("quic-mixed-det-run1"), once("quic-mixed-det-run2"));
 }
