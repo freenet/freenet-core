@@ -994,6 +994,7 @@ impl QuicPath {
     /// A chunk taken before a [`SendFailure::NotOpened`] is lost, so a caller
     /// sending another way starts again from a fresh source.
     #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn send_stream_chunks_bounded<T, S>(
         &self,
         time: &T,
