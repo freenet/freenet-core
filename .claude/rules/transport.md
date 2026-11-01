@@ -669,9 +669,9 @@ gate. The floor follows the wire-gated-floor rule in docs/RELEASING.md
 
 An Offer also needs may_offer_upgrade(remote_version): the remote is at or
 above QUIC_UPGRADE_NEGOTIATES_IN, the first release that answers one (a peer
-below it decodes an Offer and ignores it). It is (0, 2, 154), a prediction until
-the release bump records it in QUIC_UPGRADE_NEGOTIATES_SHIPPED_IN. Until the
-crate reaches it, nodes of this tree report a version below the floor and do not
+below it decodes an Offer and ignores it). It is (0, 2, 154), recorded in
+QUIC_UPGRADE_NEGOTIATES_SHIPPED_IN. Nodes below it report a version below the
+floor and do not
 offer to each other.
 
 Decline reasons (DeclineReason, wire values): 1 Disabled, 2 Backoff, 3 Busy,
