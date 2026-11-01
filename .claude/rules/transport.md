@@ -1264,7 +1264,9 @@ every rate), endpoint-down, panics and breaker trips, RSS against
   that hit an RTO; p90 queueing at 1 MiB or more no worse than 262 ms; timeout
   disconnects no worse; CPU per byte at most 1.5x; OS egress at most cap + 5%;
   memory no worse than UDP; zero panics or endpoint-downs attributable to QUIC;
-  and the kill switch rehearsed once.
+  over the slice's release; and the kill switch rehearsed once (a default-off
+  release through the stagger). The stream-limit bars are re-derived from real
+  data, not loosened.
 - Rollback at any step is a default-off release through auto-update's 0-4 h
   stagger. Per-path fallback to UDP and the breaker work without a release. A
   node in a broken state may not self-update.

@@ -21353,7 +21353,13 @@ fn test_quic_mixed_modes_form_paths_only_between_shadow_nodes() {
     );
     assert!(
         mixed.whats(off, "received Offer") >= 1,
-        "the node with QUIC off was offered, so its silence is its decline: {}",
+        "a shadow node offered to the node with QUIC off: {}",
+        mixed.dump()
+    );
+    // Who it declined to depends on the keys, so this reads the whole run.
+    assert!(
+        mixed.total("Declined { reason: Some(Disabled)") >= 1,
+        "the node with QUIC off answers Disabled: {}",
         mixed.dump()
     );
     assert!(
