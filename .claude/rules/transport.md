@@ -1010,7 +1010,9 @@ snapshot except the two gauges.
   was active), session_ended_setup and session_ended_active (the UDP session
   ended under an attempt or a path), inbox_overflow (a full inbox only),
   attempt_unrouted (attempts that reached this node and found no session or no
-  attempt waiting; a client's retransmitted Initial can count again), and
+  attempt waiting; a client's retransmitted Initial can count again),
+  attempt_retried (attempts answered with a Retry; one per upgrade with no loss,
+  and every unvalidated Initial with the address as its source counts), and
   task_panicked (a driver or pump panic, re-raised after counting).
   `identity_mismatch` counts on both ends: a peer's close with code 2 ends this
   node's attempt as `identity_mismatch` too.
@@ -1078,6 +1080,23 @@ runs the machine, so nothing of a negotiation runs inside `recv`, which only
   (quic_attempt_router), which holds the upgrades weakly and routes by normalized
   address with try_send. An attempt nobody waits for is ignored and counted. The
   machine's deadline bounds a dial or an establish: its TearDown aborts the task.
+  Address validation: only an attempt that returned a Retry token takes the live
+  attempt's slot (Session::on_incoming, establishing). An attempt without one is
+  answered with a Retry (QuicIncoming::retry), counted (attempt_retried) and given
+  up with its permit and key hold; the session's own permit keeps the address on
+  the allow-set. An attempt with no slot to take is ignored before this check, so
+  no Retry goes out for it. Each upgrade costs one more round trip on the same
+  OFFER_TIMEOUT and CONNECT_TIMEOUT, and quic_establish_ms includes it. The Retry
+  and the token-bearing Initial are QUIC-class datagrams from an allowed source on
+  both sides, the client having allowed the server's address when it dialled.
+  Clients handle a Retry inside quinn, so any release can dial a node that sends
+  one. The token is sealed with the endpoint config's token_key and bound to the
+  source address, and is good for RETRY_TOKEN_LIFETIME (15 s, above
+  CONNECT_TIMEOUT); past that quinn answers with a close and no attempt appears.
+  quinn sends a Retry with try_send, so with the socket or the egress cap short it
+  is lost like any datagram and the client's retransmitted Initial is answered
+  again. A token proves the sender reads datagrams sent to that address; a sender
+  that does can still take the slot, and fails the key pin.
   A connection for anything but the live attempt is closed with DOWNGRADE.
   Cleanup: ending a session removes its route and its by-key entry, each only if
   it is that session's, and drops its attempt. It runs at connection drop and if
@@ -1137,7 +1156,7 @@ exposes (its module doc lists the few it does not):
   stream / receive / send window = clamp(5% of memory / (2 x
   max-number-of-connections), 128 KiB, 2 MiB), no unreliable datagrams, no
   spin bit, migration off, max_incoming 64, incoming buffers 64 KiB / 1 MiB,
-  no validation tokens, rustls ring, TLS 1.3, fixed ALPN, no SNI, no
+  no NEW_TOKEN tokens (Retry only), rustls ring, TLS 1.3, fixed ALPN, no SNI, no
   resumption, no early data. Keys and seeds (reset key, token key, CID key,
   quinn's rng_seed, initial destination CIDs): keys from the OS, seeds and
   CIDs from GlobalRng (see below).
@@ -1221,11 +1240,14 @@ node a stranger's QUIC datagram during a direct-runner run, so a test can
 check every endpoint was live (`not_allowed`) rather than failed to bind.
 `SimNetwork::quic_upgrade_trace` returns a handle (`quic/upgrade/sim_trace.rs`,
 tests only) with what each node's upgrades did, readable after the run. It also
-injects: `make_record_wrong` (the key compared after the handshake disagrees, so
-the path closes with IDENTITY_MISMATCH), `fail_endpoint_at` (the endpoint driver
-dies) and `run_as_release` (a peer reporting the crate's version reads as a given
-release, since this tree reports a version below the negotiation floor until the
-release bump). The first offer is 2-10 s after promotion, so give a run tens of
+injects: `send_initial_on_each_attempt` (the node receives an Initial with the
+peer's address as its source each time it allows that address, and records
+`injected an Initial`), `make_record_wrong` (the key compared after the
+handshake disagrees, so the path closes with IDENTITY_MISMATCH),
+`fail_endpoint_at` (the endpoint
+driver dies) and `run_as_release` (a peer reporting the crate's version reads
+as a given release, since this tree reports a version below the negotiation
+floor until the release bump). The first offer is 2-10 s after promotion, so give a run tens of
 virtual seconds.
 Other knobs: `with_node_advertised_version` (the version a node advertises
 in its intro and AckConnectionV2, to emulate an older peer of the same
@@ -1275,7 +1297,8 @@ Simulation scenarios (`tests/simulation_integration.rs`, `test_quic_*`): two
 nodes established with traffic on UDP; QUIC-off peers decline `Disabled`; peers
 below the version floor are never offered; blackholed and idle paths fall back
 and are re-offered; a wrong key closes with IDENTITY_MISMATCH; endpoint-down
-closes every path; a replaced or restarted session closes its path and keeps the
+closes every path; an Initial the peer did not send is retried and the real dial
+establishes; a replaced or restarted session closes its path and keeps the
 backoff; a mixed shadow / off / below-floor network forms paths only between
 shadow nodes; `quic-max-paths` = 1 declines `Busy` without a charge.
 

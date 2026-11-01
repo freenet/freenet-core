@@ -468,9 +468,14 @@ fn idle_timeout(timeout: Duration) -> IdleTimeout {
     IdleTimeout::try_from(timeout).unwrap_or_else(|_| IdleTimeout::from(VarInt::MAX))
 }
 
+/// How long a Retry token stays valid. A client uses one for at most its
+/// connect timeout (`upgrade::machine::CONNECT_TIMEOUT`), which this outlasts.
+pub(crate) const RETRY_TOKEN_LIFETIME: Duration = Duration::from_secs(15);
+
 /// A server configuration over `crypto`: no migration, no address
-/// validation tokens, few and small pending connection attempts, keys from
-/// [`GlobalRng`] and the clock from `time`.
+/// validation tokens from NEW_TOKEN frames (Retry tokens only), few and small
+/// pending connection attempts, keys from [`GlobalRng`] and the clock from
+/// `time`.
 pub(crate) fn server_config(
     crypto: Arc<dyn quinn::crypto::ServerConfig>,
     transport: Arc<TransportConfig>,
@@ -485,7 +490,7 @@ pub(crate) fn server_config(
     config
         .transport_config(transport)
         .validation_token_config(tokens)
-        .retry_token_lifetime(Duration::from_secs(15))
+        .retry_token_lifetime(RETRY_TOKEN_LIFETIME)
         // A migrated connection would change the remote address, which the
         // node uses as the peer's identity (#5940 decision 7).
         .migration(false)

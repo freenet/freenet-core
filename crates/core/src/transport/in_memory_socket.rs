@@ -300,6 +300,20 @@ pub(crate) fn quic_upgrade_trace_at(
         .map(|trace| trace.node(addr))
 }
 
+/// Delivers `data` to the node at `addr`, in the network it joined (resolved as
+/// in [`quic_upgrade_trace_at`]), as sent from `from`.
+///
+/// Returns whether the node's network was found; with none the datagram is
+/// not delivered.
+#[cfg(any(test, feature = "testing"))]
+pub(crate) fn deliver_packet_at(addr: SocketAddr, data: Vec<u8>, from: SocketAddr) -> bool {
+    let Ok(network) = resolve_address_network(&addr) else {
+        return false;
+    };
+    deliver_packet_to_network(&network, addr, data, from);
+    true
+}
+
 /// Forgets every recorded QUIC endpoint clock and accept loop of `network`.
 #[cfg(any(test, feature = "testing"))]
 pub(crate) fn clear_quic_endpoint_clocks(network: &str) {

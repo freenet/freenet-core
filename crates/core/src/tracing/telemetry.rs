@@ -3048,6 +3048,10 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 serde_json::json!(snapshot.quic_breaker_trips),
             );
             m.insert(
+                "quic_send_refused".into(),
+                serde_json::json!(snapshot.quic_send_refused),
+            );
+            m.insert(
                 "quic_breaker_suppressed".into(),
                 serde_json::json!(snapshot.quic_breaker_suppressed),
             );
@@ -7862,6 +7866,7 @@ mod tests {
             quic_close_sent_peer_not_acknowledging: 6,
             quic_close_sent_control_refused: 8,
             quic_breaker_trips: 7,
+            quic_send_refused: 9,
             quic_breaker_suppressed: true,
             ..Default::default()
         };
@@ -7879,6 +7884,7 @@ mod tests {
             ("quic_close_sent_peer_not_acknowledging", 6),
             ("quic_close_sent_control_refused", 8),
             ("quic_breaker_trips", 7),
+            ("quic_send_refused", 9),
         ] {
             assert_eq!(json[key], expected, "event-log value for {key}");
             assert_eq!(json[key], reference[key], "serde value for {key}");

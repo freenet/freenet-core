@@ -2188,6 +2188,7 @@ fn a_cap_short_of_the_datagram_is_would_block() {
     assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
     assert!(demux.inner_for_test().sent.lock().unwrap().is_empty());
     assert_eq!(cap.level_bytes(), level, "nothing was charged");
+    assert_eq!(socket.send_refused(), 1, "a cap refusal is counted");
 
     let mut poller = socket.clone().create_io_poller();
     let waker = futures::task::noop_waker();
@@ -2222,6 +2223,7 @@ fn a_full_socket_buffer_is_would_block_and_returns_the_take() {
     assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
     assert_eq!(cap.level_bytes(), level, "the take came back");
     assert_eq!(cap.stats().bytes, 0);
+    assert_eq!(socket.send_refused(), 1, "a full buffer is counted");
 }
 
 /// A send that fails with any other error is reported to quinn as sent
@@ -4387,4 +4389,102 @@ fn a_release_without_a_panic_closes_nothing() {
         assert!(TRANSPORT_METRICS.quic_close_sent_to(pair.b_addr).is_empty());
         drop((client, server));
     });
+}
+
+/// A Retry token comes back validated up to its lifetime, on the endpoint's clock,
+/// and past it the attempt is refused with a close and does not reach `accept`.
+#[test]
+fn a_retry_token_is_honoured_for_its_lifetime_on_the_endpoint_clock() {
+    use bytes::BytesMut;
+    use quinn_proto::{DatagramEvent, Endpoint};
+    let _seed = GlobalRng::seed_guard(SEED);
+    let time = VirtualTime::new();
+    let client_keys = TransportKeypair::new();
+    let server_keys = TransportKeypair::new();
+    let server_tls = QuicIdentity::new(&server_keys)
+        .unwrap()
+        .server_tls(&PeerKey::of(client_keys.public()).unwrap())
+        .unwrap();
+    let client_tls = QuicIdentity::new(&client_keys)
+        .unwrap()
+        .client_tls(&PeerKey::of(server_keys.public()).unwrap())
+        .unwrap();
+    let transport = Arc::new(config::transport_config(&settings(), &time));
+    let server_config = config::server_config(
+        Arc::new(server_tls),
+        transport.clone(),
+        config::system_clock(time.clone()),
+    )
+    .unwrap();
+    let endpoint_config = || Arc::new(config::endpoint_config().unwrap());
+    let mut server = Endpoint::new(endpoint_config(), Some(Arc::new(server_config)), true, None);
+    let mut client = Endpoint::new(endpoint_config(), None, true, None);
+    let client_addr: SocketAddr = "10.205.0.1:5000".parse().unwrap();
+    let server_addr: SocketAddr = "10.205.0.2:5000".parse().unwrap();
+    let now = tokio::time::Instant::now().into_std();
+
+    let (_, mut connection) = client
+        .connect(
+            now,
+            config::client_config(Arc::new(client_tls), transport),
+            server_addr,
+            config::SERVER_NAME,
+        )
+        .unwrap();
+    let mut first = Vec::new();
+    let sent = connection.poll_transmit(now, 1, &mut first).unwrap();
+    first.truncate(sent.size);
+    let mut scratch = Vec::new();
+    let Some(DatagramEvent::NewConnection(incoming)) = server.handle(
+        now,
+        client_addr,
+        None,
+        None,
+        BytesMut::from(&first[..]),
+        &mut scratch,
+    ) else {
+        panic!("the first Initial is a new attempt");
+    };
+    assert!(!incoming.remote_address_validated());
+    let mut retry = Vec::new();
+    let sent = server.retry(incoming, &mut retry).unwrap();
+    retry.truncate(sent.size);
+    let Some(DatagramEvent::ConnectionEvent(_, event)) = client.handle(
+        now,
+        server_addr,
+        None,
+        None,
+        BytesMut::from(&retry[..]),
+        &mut scratch,
+    ) else {
+        panic!("the Retry reaches the client's connection");
+    };
+    connection.handle_event(event);
+    let mut with_token = Vec::new();
+    let sent = connection.poll_transmit(now, 1, &mut with_token).unwrap();
+    with_token.truncate(sent.size);
+
+    let mut arrive = |server: &mut Endpoint| {
+        server.handle(
+            now,
+            client_addr,
+            None,
+            None,
+            BytesMut::from(&with_token[..]),
+            &mut scratch,
+        )
+    };
+    time.advance(config::RETRY_TOKEN_LIFETIME);
+    let Some(DatagramEvent::NewConnection(validated)) = arrive(&mut server) else {
+        panic!("the token holds for its whole lifetime");
+    };
+    assert!(validated.remote_address_validated());
+    assert!(!validated.may_retry());
+    server.ignore(validated);
+
+    time.advance(Duration::from_millis(1));
+    assert!(
+        matches!(arrive(&mut server), Some(DatagramEvent::Response(_))),
+        "past its lifetime the token is answered with a close"
+    );
 }

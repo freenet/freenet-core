@@ -801,6 +801,38 @@ impl QuicEndpoint {
         self.connect_with(addr, config, peer).await
     }
 
+    /// A client's first Initial to `to`, as bytes, built by a connection that
+    /// goes no further, for a test to deliver under any source address.
+    ///
+    /// # Panics
+    /// If `expected` is not a usable key.
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn initial_datagram(
+        &self,
+        to: SocketAddr,
+        expected: &TransportPublicKey,
+    ) -> Vec<u8> {
+        let peer = PeerKey::of(expected).expect("a usable key");
+        let tls = self.identity.client_tls(&peer).expect("client TLS");
+        let endpoint = config::endpoint_config().expect("endpoint configuration");
+        let mut client = quinn_proto::Endpoint::new(Arc::new(endpoint), None, true, None);
+        let now = tokio::time::Instant::now().into_std();
+        let (_, mut connection) = client
+            .connect(
+                now,
+                self.client_config(Arc::new(tls)),
+                to,
+                config::SERVER_NAME,
+            )
+            .expect("a connection to build the Initial with");
+        let mut datagram = Vec::new();
+        let sent = connection
+            .poll_transmit(now, 1, &mut datagram)
+            .expect("a new client connection has an Initial to send");
+        datagram.truncate(sent.size);
+        datagram
+    }
+
     /// [`Self::connect`] with a given client configuration, which must pin
     /// the server to `peer`.
     async fn connect_with(
@@ -909,6 +941,29 @@ impl QuicIncoming {
     /// Initial, as after a lost datagram.
     pub(crate) fn ignore(self) {
         self.incoming.ignore();
+    }
+
+    /// Whether the sender has shown it can read datagrams sent to this
+    /// address, by returning the token of a Retry this endpoint sent there.
+    pub(crate) fn address_validated(&self) -> bool {
+        self.incoming.remote_address_validated()
+    }
+
+    /// Answer with a Retry and give up the attempt, with its permit and key
+    /// hold. Stateless: the endpoint keeps nothing until the token comes back,
+    /// which arrives as a new attempt. The token is sealed with the endpoint's
+    /// `token_key` and checked against that key and this address when it comes
+    /// back, before `accept_with`'s per-attempt configuration is involved.
+    ///
+    /// quinn sends it with `try_send`, so it is lost if the socket or the
+    /// egress cap has no room for it, as any datagram can be lost: the client
+    /// retransmits its Initial and is answered again.
+    pub(crate) fn retry(self) {
+        if let Err(refused) = self.incoming.retry() {
+            // quinn refuses only an attempt that already carries a Retry
+            // token, and that one reads as validated.
+            refused.into_incoming().ignore();
+        }
     }
 
     /// Complete the handshake. On failure the permit is dropped with it.

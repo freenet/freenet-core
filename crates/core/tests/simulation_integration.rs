@@ -20844,6 +20844,13 @@ fn test_quic_shadow_two_nodes_reach_established_with_traffic_on_udp() {
     assert_eq!(run.whats(client, "Offered"), 0, "only the server offers");
     assert_eq!(run.whats(server, "Established"), 1, "{}", run.dump());
     assert_eq!(run.whats(client, "Established"), 1, "{}", run.dump());
+    assert_eq!(
+        run.whats(server, QUIC_RETRIED),
+        1,
+        "the client's first Initial is retried once: {}",
+        run.dump()
+    );
+    assert_eq!(run.whats(client, QUIC_RETRIED), 0, "{}", run.dump());
     for node in &run.nodes {
         for established in run.trace.matching(*node, "Established") {
             assert_eq!(established.permits, 1, "an active path holds its permit");
@@ -20870,6 +20877,58 @@ fn test_quic_shadow_two_nodes_reach_established_with_traffic_on_udp() {
     );
     for node in &run.nodes {
         assert_eq!(run.trace.permits_in_use(*node), Some(0), "{}", run.dump());
+    }
+}
+
+/// What a node's upgrade trace says when it answers an attempt with a Retry.
+const QUIC_RETRIED: &str = "retried an unvalidated attempt";
+
+/// An Initial with the client's address as its source reaches the server right
+/// after it allows that address, before anything the client sends. It is retried
+/// and leaves the attempt waiting, so the client's real dial establishes on the
+/// first offer, inside the setup deadlines, with one Retry of its own. If the first
+/// Initial for the address took the attempt, the real dial would be ignored until
+/// the attempt timed out.
+#[test_log::test]
+fn test_quic_shadow_initial_the_peer_did_not_send_leaves_the_attempt_open() {
+    let run = run_quic_shadow_sim(
+        "quic-shadow-retry",
+        0x5940_E5B0_0020,
+        (1, 1),
+        8,
+        |sim, trace, _| {
+            sim.with_transport_quic("shadow");
+            run_as_first_negotiating_release(trace);
+            for addr in sim.all_node_addresses().values() {
+                trace.send_initial_on_each_attempt(*addr);
+            }
+        },
+    );
+    let server = run.server();
+    let client = run.nodes.iter().copied().find(|n| *n != server).unwrap();
+    assert_eq!(run.whats(server, "Offered"), 1, "{}", run.dump());
+    assert!(
+        run.whats(server, "injected an Initial") >= 1,
+        "the extra Initial was delivered to the server: {}",
+        run.dump()
+    );
+    assert_eq!(
+        run.whats(server, QUIC_RETRIED),
+        2,
+        "the extra Initial and the client's first: {}",
+        run.dump()
+    );
+    assert_eq!(run.whats(server, "Established"), 1, "{}", run.dump());
+    assert_eq!(run.whats(client, "Established"), 1, "{}", run.dump());
+    assert_eq!(run.total("Timeout"), 0, "{}", run.dump());
+    let offered = run.trace.matching(server, "Offered")[0].at;
+    for node in &run.nodes {
+        let established = run.trace.matching(*node, "Established")[0].at;
+        assert!(
+            established.saturating_sub(offered) < Duration::from_secs(10),
+            "past the 10 s setup deadlines: {}",
+            run.dump()
+        );
     }
 }
 
