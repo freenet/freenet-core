@@ -12,7 +12,7 @@ use crate::config::NetworkApiConfig;
 use crate::transport::crypto::TransportKeypair;
 use crate::transport::quic::breaker::BreakerOutcome;
 use crate::transport::quic::liveness::QuicAvailabilityWatch;
-use crate::transport::quic::path::{QuicSendError, SendFailure};
+use crate::transport::quic::path::{NotOpened, QuicSendError, SendFailure};
 use crate::transport::symmetric_message::{QUIC_UPGRADE_MIN_VERSION, QUIC_UPGRADE_NEGOTIATES_IN};
 
 const SERVER_ATTEMPT: u32 = 1;
@@ -276,7 +276,7 @@ fn advance_to(rig: &mut Rig, role: Role, state: S) {
     assert_eq!(label(&rig.machine), state, "reach {role:?}");
 }
 
-const ATTEMPT_EVENTS: [&str; 26] = [
+const ATTEMPT_EVENTS: [&str; 28] = [
     "offer_sent",
     "accept",
     "decline",
@@ -287,7 +287,9 @@ const ATTEMPT_EVENTS: [&str; 26] = [
     "sent_ok",
     "sent_maybe",
     "sent_failed",
+    "sent_unopened",
     "sent_lost",
+    "sent_unopened_lost",
     "sent_identity",
     "sent_protocol_1",
     "sent_stopped",
@@ -376,7 +378,17 @@ fn event(name: &str, attempt: u32, rig: &Rig) -> Event {
             attempt,
             outcome: BoundedSend::Failed(SendFailure::TimedOut),
         },
+        "sent_unopened" => Event::ControlSent {
+            attempt,
+            outcome: BoundedSend::Failed(SendFailure::NotOpened(NotOpened::TimedOut)),
+        },
         "sent_lost" => sent(QuicSendError::ConnectionLost(quinn::ConnectionError::Reset)),
+        "sent_unopened_lost" => Event::ControlSent {
+            attempt,
+            outcome: BoundedSend::Failed(SendFailure::NotOpened(NotOpened::ConnectionLost(
+                quinn::ConnectionError::Reset,
+            ))),
+        },
         "sent_identity" => sent(QuicSendError::ConnectionLost(closed_by_peer(u64::from(
             QuicCloseCode::IdentityMismatch.code(),
         )))),
@@ -535,7 +547,7 @@ fn expected(role: Role, state: S, name: &str) -> Option<(S, Vec<Action>)> {
         )),
 
         // Failures of the attempt.
-        (_, _, "sent_failed" | "sent_lost") if live => {
+        (_, _, "sent_failed" | "sent_unopened" | "sent_lost" | "sent_unopened_lost") if live => {
             fail_setup_or_active(Outcome::HandshakeFailed, fallback(FallbackCause::Reset))
         }
         (_, _, "sent_identity") if live => {
