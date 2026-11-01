@@ -574,6 +574,30 @@ fn a_connection_drop_ends_the_session_before_it_walks_the_streams() {
     assert!(end < walk);
 }
 
+/// A complete stream held past its age limit is counted from the connection's
+/// sweep, on the connection's own counters, once.
+#[tokio::test(start_paused = true)]
+async fn the_sweep_counts_a_complete_stream_held_past_its_age() {
+    let mut e = single(CAPABLE);
+    let token = LegacyStreamToken::new();
+    assert!(token.mark_complete());
+    e.conn.inbound_budget.lock().charge(
+        InboundKey::QuicShort(1),
+        10,
+        0,
+        Duration::ZERO,
+        Liveness::Task(Arc::downgrade(&token)),
+    );
+    tokio::time::advance(Duration::from_secs(1)).await;
+    e.conn.sweep_streams();
+    e.conn.sweep_streams();
+    assert_eq!(
+        e.conn.inbound_outcomes[O::CompleteChargePastAge as usize],
+        1
+    );
+    assert_eq!(e.conn.inbound_budget.stream_count(), 1, "still held");
+}
+
 /// With QUIC off there is nothing to read and the two arms stay disabled.
 #[test]
 fn a_connection_without_upgrades_has_no_inbox() {

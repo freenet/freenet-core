@@ -1632,7 +1632,7 @@ One budget per peer (QUIC memory gate M3): QuicPath::with_budget charges
     can see BUDGET_REFUSED for up to about 5 s on room that is free.
   → The shared Arc can keep UDP charges (and their room) alive after the
     PeerConnection drops, and no QUIC code releases them. Its drop ends the
-    session first and then releases what is gone.
+    session first, so the path and the handle go with it.
   Telemetry and logs that read the budget (sample_inbound_concurrency's
   outstanding count, the refusal warning's open_streams/charged_bytes)
   are peer-wide once shared and include QUIC charges.
@@ -1714,8 +1714,8 @@ QUIC receive flow (#5940 e5b-4):
   → Consumer lets go later: the UDP sweep or the next admission short of room.
   → Complete and unclaimed with the path gone and the connection alive: the orphan
     timeout (60 s), as for UDP.
-  → Connection drop: PeerConnection::drop ends the session, cancels every unclaimed
-    stream of both paths, and releases what is gone.
+  → Connection drop: PeerConnection::drop ends the session and cancels every
+    unclaimed stream of both paths. Nothing needs the room after that.
   A UDP session's timers keep running: nothing here writes last_received_nanos or
   last_inbound_nanos. sample_inbound_concurrency does not run on these arms.
   record_inbound_completed does.

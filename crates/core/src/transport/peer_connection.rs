@@ -535,7 +535,7 @@ impl<S, T: TimeSource> Drop for PeerConnection<S, T> {
         }
         // End the session first: its connection closes, and whatever a helper holds
         // of the path ends with it, before the walk below looks at what is live.
-        let had_path = self.quic_path.take().is_some();
+        drop(self.quic_path.take());
         // Unclaimed buffers this connection charged (complete ones it already
         // retired, too) would otherwise wait out the orphan timeout with
         // nothing accounting for them. Both paths' streams: a QUIC path's reader
@@ -550,14 +550,6 @@ impl<S, T: TimeSource> Drop for PeerConnection<S, T> {
                     .into_iter()
                     .map(|(id, buffer)| (id, super::StreamIdentity::from_buffer(buffer))),
             );
-        }
-        // What is gone now goes now. The path's reader tasks release their own
-        // when they end. A consumer that drops later is not observed, and nothing
-        // needs its room by then.
-        if had_path {
-            self.inbound_budget
-                .lock()
-                .release_gone(inbound_budget::Releaser::Udp);
         }
         // Cancel all active streaming handles so that any operation blocked on
         // stream_handle.assemble().await will receive StreamError::Cancelled

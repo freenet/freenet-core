@@ -1261,16 +1261,15 @@ mod tests {
         }
     }
 
-    /// Each extra branch is polled when its guard is on and can be picked.
+    /// Each extra branch is polled when its guard is on and can be picked. One poll
+    /// only, so a branch that is not polled fails here and does not hang.
     #[test]
     fn nine_branches_poll_the_extra_guarded_branches() {
         use crate::config::GlobalRng;
+        use futures::FutureExt;
         use std::future::{pending, ready};
         let _seed = GlobalRng::seed_guard(0x5941);
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap();
-        let picked = runtime.block_on(async {
+        let last = async {
             crate::deterministic_select! {
                 _ = pending::<()>() => 0,
                 _ = pending::<()>(), if false => 1,
@@ -1282,8 +1281,22 @@ mod tests {
                 _ = pending::<()>(), if true => 7,
                 _ = ready(()), if true => 8,
             }
-        });
-        assert_eq!(picked, 8);
+        };
+        assert_eq!(last.now_or_never(), Some(8));
+        let eighth = async {
+            crate::deterministic_select! {
+                _ = pending::<()>() => 0,
+                _ = pending::<()>(), if false => 1,
+                _ = pending::<()>(), if false => 2,
+                _ = pending::<()>() => 3,
+                _ = pending::<()>() => 4,
+                _ = pending::<()>() => 5,
+                _ = pending::<()>() => 6,
+                _ = ready(()), if true => 7,
+                _ = pending::<()>(), if false => 8,
+            }
+        };
+        assert_eq!(eighth.now_or_never(), Some(7));
     }
 
     use super::*;
