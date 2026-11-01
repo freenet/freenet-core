@@ -9569,8 +9569,9 @@ shutdown-drain-secs = 42
             first.build().await.unwrap();
             let cfg = local_args(temp_dir.path()).build().await.unwrap();
             assert_eq!(
-                cfg.network_api.quic_data_percent.as_deref(),
-                Some(value),
+                // A whole number is written back as an integer, without spaces.
+                cfg.network_api.quic_data_percent.as_deref().map(str::trim),
+                Some(value.trim()),
                 "bare build"
             );
             assert_eq!(cfg.network_api.quic_data_percent(), percent, "{value:?}");
