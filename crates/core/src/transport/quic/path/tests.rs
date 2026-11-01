@@ -3421,17 +3421,22 @@ fn a_send_on_a_lost_connection_is_not_opened() {
 }
 
 /// A send waiting for a permit ends when the connection does, with no wait for
-/// its deadline: the semaphore never closes, so this needs its own race.
+/// its deadline. The permits here are held outside any send: a send holding one
+/// would end on the close and free it, which would wake the waiter whether or
+/// not it races the close, and the semaphore itself never closes.
 #[test]
 fn a_close_wakes_a_send_waiting_for_a_permit_at_once() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
         let p = paths("quic-path-permit-close", 71, QuicPathLimits::DEFAULT).await;
-        let limit = super::super::config::STREAMED_SEND_LIMIT as usize;
         let (a, time) = (p.a.clone(), p.time());
         let (outcome, waited) = p
             .drive(async move {
-                let mut blocked = blocked_streamed_sends(&a, limit);
+                let limit = super::super::config::STREAMED_SEND_LIMIT;
+                let _held = Arc::clone(&a.stream_slots)
+                    .acquire_many_owned(limit)
+                    .await
+                    .expect("never closed");
                 let closes = a.clone();
                 let close_time = time.clone();
                 let close = async move {
@@ -3440,7 +3445,6 @@ fn a_close_wakes_a_send_waiting_for_a_permit_at_once() {
                     futures::future::pending::<()>().await;
                 };
                 let send = async {
-                    time.sleep(Duration::from_millis(500)).await;
                     let start = time.now();
                     let outcome = a
                         .send_stream_bounded(
@@ -3454,15 +3458,9 @@ fn a_close_wakes_a_send_waiting_for_a_permit_at_once() {
                         .await;
                     (outcome, time.now() - start)
                 };
-                tokio::pin!(send);
-                let drain = async {
-                    while blocked.next().await.is_some() {}
-                    futures::future::pending::<()>().await
-                };
                 tokio::select! {
                     () = close => unreachable!("never returns"),
-                    () = drain => unreachable!("never returns"),
-                    result = &mut send => result,
+                    result = send => result,
                 }
             })
             .await;
@@ -3474,9 +3472,47 @@ fn a_close_wakes_a_send_waiting_for_a_permit_at_once() {
             "{outcome:?}"
         );
         assert!(
-            waited < Duration::from_secs(1),
-            "woken by the close, after {waited:?}"
+            waited < Duration::from_secs(2),
+            "woken by the close at 1 s, not by a deadline, after {waited:?}"
         );
+    })
+}
+
+/// A transfer slower than the gap but making progress is not a stall: each
+/// write on a real path moves the gap, so it ends `Sent` well past 5 s.
+#[test]
+fn a_slow_source_that_keeps_writing_outlives_the_gap() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths("quic-path-slow-source", 79, QuicPathLimits::DEFAULT).await;
+        let (a, time) = (p.a.clone(), p.time());
+        let (outcome, took) = p
+            .drive(async move {
+                let start = time.now();
+                let sleeps = time.clone();
+                let chunks = Box::pin(futures::stream::iter(0..4).then(move |_| {
+                    let sleeps = sleeps.clone();
+                    async move {
+                        sleeps.sleep(Duration::from_secs(3)).await;
+                        Ok(Bytes::from_static(b"body"))
+                    }
+                }));
+                let outcome = a
+                    .send_stream_chunks_bounded(
+                        &time,
+                        SendDeadlines::stream(16),
+                        StreamId::next(),
+                        16,
+                        None,
+                        chunks,
+                        None,
+                    )
+                    .await;
+                (outcome, time.now() - start)
+            })
+            .await;
+        assert!(matches!(outcome, BoundedSend::Sent), "{outcome:?}");
+        assert!(took >= Duration::from_secs(12), "{took:?}");
     })
 }
 
