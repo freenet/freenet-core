@@ -57,24 +57,16 @@
 //! one buffer that grows as data arrives and ends exactly the declared
 //! length (`ReadBuffer`), and keep no chunk. The payload of a `Stream` is
 //! copied into fragments by the `Rechunker`, each in a fresh buffer of
-//! exactly its length, except a chunk of at least a whole fragment, which
-//! is kept as a slice: it pins at most one datagram (1200 bytes) per
-//! fragment of `FRAGMENT_PAYLOAD_SIZE` (pinned by a const assertion).
-//!
-//! One exception: quinn-proto's `Assembler::defragment`, which the peer can
-//! trigger (by sending data out of order or in many small frames), merges
-//! buffered stream data into one allocation of up to the stream window,
-//! and whole-fragment slices taken from that chunk then share it. That
-//! memory is inside the stream's charge while its inbound state lives,
-//! but a slice keeps the whole allocation alive. e5 constraint: a fragment
-//! `Bytes` taken from an inbound `StreamHandle` must not outlive the
-//! inbound charge (for example, kept in an outbound pipe's retransmit
-//! state) without being copied.
+//! exactly its length, so a fragment pins only its own bytes whatever
+//! quinn's chunks were (including after quinn-proto's `Assembler::defragment`,
+//! which the peer can trigger and which merges buffered data into one large
+//! allocation). A fragment `Bytes` may therefore outlive the inbound charge.
 //!
 //! Simulation: `VirtualSleep` has no deregistration on drop, so each
 //! stream's last armed timer stays in `VirtualTime`'s pending wakeups until
 //! its deadline passes (one per ended stream; the timer is not replaced on
 //! progress, only when it fires).
+//!
 //! Streams with no budget charge (in the header phase, and control frames)
 //! get an age limit too ([`uncharged_age_limit`]), so a peer cannot hold
 //! one of its `MAX_UNI_STREAMS` stream slots by trickling bytes.
@@ -460,16 +452,6 @@ fn uncharged_age_limit() -> Duration {
 /// Numbered fragments, in order.
 type Fragments = Vec<(u32, Bytes)>;
 
-// The Rechunker keeps a payload chunk of at least a whole fragment as a
-// slice of its datagram, so a held fragment pins at most one datagram
-// (except after quinn defragments, see the module doc). That
-// is at most 1.2 x the fragment while a datagram is at most MAX_UDP_PAYLOAD;
-// raising MAX_UDP_PAYLOAD past that must revisit the zero-copy path.
-const _: () = assert!(
-    super::super::config::MAX_UDP_PAYLOAD as usize * 10 <= FRAGMENT_PAYLOAD_SIZE * 12,
-    "a kept datagram slice would pin more than 1.2 x a fragment"
-);
-
 /// Cuts a byte stream of `total` bytes into fragments of the UDP stream
 /// shape: fragment `i` holds bytes `[(i-1)F, iF)` with
 /// `F = FRAGMENT_PAYLOAD_SIZE`, so every fragment is full except the last,
@@ -505,7 +487,9 @@ impl Rechunker {
         self.total - self.received
     }
 
-    /// Take `chunk`, returning the fragments it completed, in order.
+    /// Take `chunk`, returning the fragments it completed, in order. Every
+    /// fragment is copied into a buffer of its own: none shares an
+    /// allocation with `chunk` or with another fragment.
     fn feed(&mut self, mut chunk: Bytes) -> Result<Fragments, ReadFailure> {
         let len = chunk.len() as u64;
         if len > self.remaining() {
@@ -517,10 +501,6 @@ impl Rechunker {
         while !chunk.is_empty() {
             // A fragment may go out only if it does not end the stream.
             let can_emit = self.emitted + (full as u64) < self.total;
-            if self.pending.is_empty() && chunk.len() >= full && can_emit {
-                out.push(self.emit(chunk.split_to(full)));
-                continue;
-            }
             if self.pending.is_empty() {
                 // A fresh buffer of exactly this fragment's length, so it
                 // never grows (a grown buffer would be kept, up to twice the
@@ -1065,6 +1045,33 @@ mod tests {
             let mut more = data.to_vec();
             more.push(0);
             assert_eq!(long_in_one.feed(more.into()), Err(ReadFailure::Overlong));
+        }
+    }
+
+    /// A fragment never points into the chunk it was cut from, even when the
+    /// chunk is a whole fragment or more (one large allocation).
+    #[test]
+    fn fragments_share_no_allocation_with_the_chunk_or_each_other() {
+        let total = 4 * F + 9;
+        let chunk = bytes(total, 5);
+        let range = chunk.as_ptr() as usize..chunk.as_ptr() as usize + chunk.len();
+        let mut rechunker = Rechunker::new(total as u64);
+        let mut all = rechunker.feed(chunk.clone()).unwrap();
+        all.push(rechunker.finish().unwrap());
+        assert_eq!(all.len(), 5);
+        let mut spans = Vec::new();
+        for (number, fragment) in &all {
+            let start = fragment.as_ptr() as usize;
+            let end = start + fragment.len();
+            assert!(
+                end <= range.start || start >= range.end,
+                "fragment {number} points into the chunk"
+            );
+            spans.push((start, end));
+        }
+        spans.sort_unstable();
+        for pair in spans.windows(2) {
+            assert!(pair[0].1 <= pair[1].0, "two fragments overlap");
         }
     }
 }

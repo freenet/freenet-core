@@ -109,6 +109,18 @@ pub trait TimeSource: Send + Sync + Clone + 'static {
     /// immediately if the deadline has passed.
     fn sleep_until(&self, deadline_nanos: u64) -> Pin<Box<dyn Future<Output = ()> + Send>>;
 
+    /// Like [`sleep`](Self::sleep), but dropping the future before it fires
+    /// leaves nothing behind on the clock.
+    ///
+    /// `VirtualTime`'s plain `sleep` keeps its wakeup in the pending set until
+    /// the deadline passes even when the future is dropped, and simulations
+    /// rely on that when advancing time, so it cannot change. Use this for a
+    /// timer that is usually dropped early (a timeout around a send). The
+    /// default is `sleep`, which is right for clocks with no such record.
+    fn sleep_cancelable(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        self.sleep(duration)
+    }
+
     /// Wraps a future with a timeout, returning None if the timeout expires.
     fn timeout<F, T>(
         &self,
@@ -507,6 +519,18 @@ impl TimeSource for VirtualTime {
         Box::pin(VirtualSleep { id, state })
     }
 
+    fn sleep_cancelable(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        let deadline = self.now_nanos().saturating_add(duration.as_nanos() as u64);
+        if deadline <= self.now_nanos() {
+            return Box::pin(std::future::ready(()));
+        }
+        let id = self.register_wakeup(deadline);
+        let state = self.state.clone();
+        Box::pin(CancelableVirtualSleep {
+            inner: VirtualSleep { id, state },
+        })
+    }
+
     fn timeout<F, T>(
         &self,
         duration: Duration,
@@ -583,6 +607,32 @@ impl Future for VirtualSleep {
 //    - Mutex<Vec<(WakeupId, Waker)>> where Waker is Send + Sync
 // All components are Send, so VirtualSleep is safe to send across threads.
 unsafe impl Send for VirtualSleep {}
+
+/// Future returned by `VirtualTime::sleep_cancelable()`: a [`VirtualSleep`]
+/// that removes its wakeup and waker when dropped.
+struct CancelableVirtualSleep {
+    inner: VirtualSleep,
+}
+
+impl Future for CancelableVirtualSleep {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.inner).poll(cx)
+    }
+}
+
+impl Drop for CancelableVirtualSleep {
+    fn drop(&mut self) {
+        let id = self.inner.id;
+        // Same lock order as `VirtualSleep::poll`. Both are already empty of
+        // `id` if the wakeup fired.
+        let mut pending = self.inner.state.pending_wakeups.lock().unwrap();
+        let mut pending_wakers = self.inner.state.pending_wakers.lock().unwrap();
+        pending.retain(|w| w.id != id);
+        pending_wakers.retain(|(wid, _)| *wid != id);
+    }
+}
 
 // ============================================================================
 // TimeSourceInterval - Interval implementation for TimeSource
@@ -703,6 +753,65 @@ mod tests {
 
     // Tests for the standard VirtualTime implementation (non-MadSim).
     // These use internal APIs like register_wakeup() that only exist in the standard impl.
+
+    fn pending_waker_count(vt: &VirtualTime) -> usize {
+        vt.state.pending_wakers.lock().unwrap().len()
+    }
+
+    /// A dropped cancelable sleep leaves no wakeup and no waker; a dropped
+    /// plain sleep still leaves its wakeup (simulations rely on that).
+    #[test]
+    fn dropped_cancelable_sleep_leaves_no_wakeup_and_no_waker() {
+        let vt = VirtualTime::new();
+        let waker = futures::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        let d = Duration::from_secs(5);
+
+        let mut plain = vt.sleep(d);
+        assert!(plain.as_mut().poll(&mut cx).is_pending());
+        drop(plain);
+        assert_eq!(vt.pending_wakeup_count(), 1, "plain sleep keeps its wakeup");
+        assert_eq!(pending_waker_count(&vt), 1, "and its waker");
+
+        let mut cancelable = vt.sleep_cancelable(d);
+        assert!(cancelable.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(vt.pending_wakeup_count(), 2);
+        assert_eq!(pending_waker_count(&vt), 2);
+        drop(cancelable);
+        assert_eq!(vt.pending_wakeup_count(), 1, "only the plain one remains");
+        assert_eq!(pending_waker_count(&vt), 1);
+
+        // Dropped before its first poll: no waker was registered yet.
+        drop(vt.sleep_cancelable(d));
+        assert_eq!(vt.pending_wakeup_count(), 1);
+        assert_eq!(pending_waker_count(&vt), 1);
+    }
+
+    /// A cancelable sleep still fires at its deadline, and dropping it after
+    /// that is harmless.
+    #[test]
+    fn cancelable_sleep_fires_at_its_deadline() {
+        let vt = VirtualTime::new();
+        let waker = futures::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        let mut sleep = vt.sleep_cancelable(Duration::from_millis(10));
+        assert!(sleep.as_mut().poll(&mut cx).is_pending());
+        vt.advance(Duration::from_millis(10));
+        assert!(sleep.as_mut().poll(&mut cx).is_ready());
+        drop(sleep);
+        assert_eq!(vt.pending_wakeup_count(), 0);
+        assert!(
+            vt.sleep_cancelable(Duration::ZERO)
+                .as_mut()
+                .poll(&mut cx)
+                .is_ready()
+        );
+        assert_eq!(
+            vt.pending_wakeup_count(),
+            0,
+            "zero duration registers nothing"
+        );
+    }
 
     /// `TimeSourceInterval` keeps ONE armed sleep per period however often it
     /// is polled (#5795), and keeps its skip semantics, under VirtualTime.

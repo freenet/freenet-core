@@ -102,7 +102,7 @@ where
     let send = send(progress.clone());
     tokio::select! {
         result = send => outcome(result, &progress),
-        () = time.sleep(timeout) => {
+        () = time.sleep_cancelable(timeout) => {
             if progress.finished() {
                 BoundedSend::MaybeDelivered(MaybeDelivered::TimedOut)
             } else {

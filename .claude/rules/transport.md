@@ -1409,9 +1409,11 @@ Sending (QuicPath::send_short_bounded / send_stream_bounded /
   → The division uses this node's MAX_UNI_STREAMS, not the limit the peer
     advertised: a change to the limit needs a plan for peers still
     advertising the old one.
-  → Each bounded send arms a timer that stays in VirtualTime's pending
-    wakeups until its deadline (VirtualSleep has no drop deregistration),
-    which matters in simulation once data sends run at volume.
+  → Each bounded send arms TimeSource::sleep_cancelable, which VirtualTime
+    removes (wakeup and waker) when the future is dropped; plain sleep
+    keeps its wakeup until the deadline (VirtualSleep has no drop
+    deregistration, and advance_to_next_wakeup relies on that). The trait
+    default is sleep; PathClock forwards it.
   → Failed(TimedOut) after the stream opened is a reset and counts toward
     SEND_ABORT_LIMIT, so repeated timeouts close the path.
   → A NOT_ACCEPTING_DATA stop means the sender's gating is wrong: log it and
@@ -1486,14 +1488,9 @@ Inbound adapter: a Stream's payload goes into an ordinary StreamHandle,
     buffer that grows as data arrives (from 64 KiB, never past the
     declared length, exact at the end; a declared length is not allocated
     up front). Stream payload goes into fragments, each a fresh buffer of
-    exactly its length; only a chunk of a whole fragment or more is kept
-    as a slice (const assert: MAX_UDP_PAYLOAD <= 1.2 x fragment), except
-    after quinn-proto's peer-triggerable Assembler::defragment merges data
-    into one allocation of up to the stream window, which such slices then
-    share (inside the charge while the inbound state lives). e5: a
-    fragment Bytes from an inbound StreamHandle must not outlive the
-    inbound charge (e.g. in an outbound pipe's retransmit state) without
-    being copied. Streams
+    exactly its length (Rechunker::feed always copies; no fragment shares
+    an allocation with a quinn chunk, so a fragment Bytes does not keep
+    a datagram or a defragmented allocation alive). Streams
     with no charge (header phase, control frames) have an age limit too
     (inbound_stream_age_limit(0)).
   → Idle and age eviction: streaming_handle_idle_timeout and

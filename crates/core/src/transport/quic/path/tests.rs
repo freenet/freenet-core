@@ -2513,6 +2513,22 @@ fn bounded_send_classifies_by_whether_the_stream_was_finished() {
     })
 }
 
+/// A send that finishes before its deadline leaves no timer on the clock
+/// (`bounded_send` uses the cancelable sleep).
+#[test]
+fn bounded_send_that_finishes_early_leaves_no_wakeup() {
+    bounded(|| async move {
+        let time = VirtualTime::new();
+        let clock = time.clone();
+        let sent = drive(&time, LIMIT, async move {
+            bounded_send(&clock, Duration::from_secs(60), |_| async { Ok(()) }).await
+        })
+        .await;
+        assert!(matches!(sent, BoundedSend::Sent), "{sent:?}");
+        assert_eq!(time.pending_wakeup_count(), 0);
+    })
+}
+
 /// The outcomes on a real path. A `Ready` sent and acknowledged is `Sent`,
 /// and the receiver decodes it. With every acknowledgement from the peer
 /// dropped, the next frame is written whole and arrives, but the sender
