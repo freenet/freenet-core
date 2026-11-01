@@ -513,7 +513,7 @@ mod tests {
     /// bit until the receive side exists, whatever the mode and the key say.
     #[test]
     fn a_non_testing_build_cannot_set_the_data_bit() {
-        assert!(!QUIC_DATA_RECEIVER_READY, "flip with the receive side");
+        const { assert!(!QUIC_DATA_RECEIVER_READY, "flip with the receive side") };
         assert!(!data_bit_allowed(false));
         assert!(data_bit_allowed(true));
     }
