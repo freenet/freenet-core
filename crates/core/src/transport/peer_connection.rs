@@ -385,7 +385,8 @@ pub struct PeerConnection<S = super::UdpSocket, T: TimeSource = RealTime> {
     /// keepalive task (resets its backoff).
     last_inbound_nanos: Arc<std::sync::atomic::AtomicU64>,
     /// When the active QUIC path last heard from the peer, on the same clock. 0
-    /// with no active path, as always with QUIC off. Read only by
+    /// until a path has been active, as always with QUIC off; after a path ends it
+    /// keeps its last write and ages out. Read only by
     /// [`Self::receipt_stamp_handle`]: the keepalive backoff and the idle
     /// timeout read the UDP clocks alone, so QUIC cannot stretch the NAT refresh
     /// or keep a dead UDP session alive.

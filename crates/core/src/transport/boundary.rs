@@ -504,7 +504,8 @@ pub(crate) struct ReceiptStamp {
 impl ReceiptStamp {
     /// `last_nanos` and `quic_last_nanos` are the times of the last
     /// authenticated receipt on each side, and `now_nanos` reads the clock
-    /// both were stamped with. `quic_last_nanos` stays 0 with no active path.
+    /// both were stamped with. `quic_last_nanos` is 0 until a path has been active; it then keeps its last
+    /// write when the path ends, and ages out against `now_nanos`.
     pub(crate) fn new(
         last_nanos: std::sync::Arc<std::sync::atomic::AtomicU64>,
         quic_last_nanos: std::sync::Arc<std::sync::atomic::AtomicU64>,

@@ -919,6 +919,31 @@ fn a_path_carries_data_only_with_both_bits() {
     }
 }
 
+/// A node with its bit clear says 0 in `Ready` and in `ReadyAck`, whatever bit
+/// the peer's frame carried.
+#[test]
+fn a_node_without_the_bit_sends_caps_zero() {
+    let mut server = reach_with(Role::Server, S::Connecting, 0, caps::DATA);
+    let attempt = SERVER_ATTEMPT;
+    assert_eq!(
+        server.step(Event::PathEstablished { attempt }),
+        [Action::SendControl(QuicControl::Ready { attempt, caps: 0 })]
+    );
+    let mut client = reach_with(Role::Client, S::Connecting, 0, caps::DATA);
+    let attempt = CLIENT_ATTEMPT;
+    let actions = client.step(Event::Control(QuicControl::Ready {
+        attempt,
+        caps: caps::DATA,
+    }));
+    assert!(
+        actions.contains(&Action::SendControl(QuicControl::ReadyAck {
+            attempt,
+            caps: 0
+        })),
+        "{actions:?}"
+    );
+}
+
 /// A frame repeated on an active path changes nothing, in either direction, so a
 /// peer cannot turn data on or off after the path is up.
 #[test]

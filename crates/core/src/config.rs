@@ -2528,7 +2528,9 @@ pub struct NetworkArgs {
     /// on QUIC with (#5940), in place of this release's own share. Only this
     /// node's own half: a pair carries data only if both sides say so. Takes
     /// effect with `transport-quic = "prefer"`. A value that cannot be read is
-    /// ignored with a warning in the log. For test runs.
+    /// ignored with a warning in the log. For test runs: setting it to 100 makes a
+    /// `prefer` node say it accepts data from every peer, which this release only
+    /// does in a build with the `testing` feature.
     #[arg(
         long = "quic-data-percent",
         env = "FREENET_QUIC_DATA_PERCENT",

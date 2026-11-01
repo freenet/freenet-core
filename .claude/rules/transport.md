@@ -1004,7 +1004,8 @@ pair is in the slice when its bucket is below the percentage, so 0 holds none,
   `quic-max-paths`; anything but a whole number from 0 to 100 reads as unset, with
   a WARN when QUIC is on) replaces it on one node. Only `prefer` uses it.
   `QuicPolicy::own_caps` gives `caps::DATA` when the mode is `prefer` and the pair
-  is in the slice, otherwise 0, and the driver passes that in `Event::Promoted`.
+  is in the slice, otherwise 0 (and always 0 outside `cfg(test)` and the `testing`
+  feature while `QUIC_DATA_RECEIVER_READY` is false; the receive side flips it), and the driver passes that in `Event::Promoted`.
   The machine reads no key to decide it.
   A path carries data only with both bits. `Ready` and `ReadyAck` carry the
   sender's own bit. The peer's bit is read from the frame that activates the
@@ -1024,7 +1025,7 @@ pair is in the slice when its bucket is below the percentage, so 0 holds none,
   No code sends data on a path yet, and frames a peer sends to a node with its own
   bit set wait in the path's channels, charged to the peer's budget, until the path
   ends. Nothing reads them. So a node of this release with the bit set (only through
-  `quic-data-percent`) says it reads data when it does not: do not set the key on a
+  `quic-data-percent`, and only in a `testing` build) says it reads data when it does not: do not set the key on a
   node that can meet a release which sends data.
 
 Receipt stamp (#6028, e5b-3): `ReceiptStamp` reads the later of two values,
@@ -1032,8 +1033,9 @@ Receipt stamp (#6028, e5b-3): `ReceiptStamp` reads the later of two values,
 second is written only by the path's `watch_acknowledgements`, at a tick
 (ACK_WATCH_TICK, 2 s) that saw `frames_received` grow, so PINGs count, and only
 once the machine reports the path established (`PeerHeard` stays empty before
-that). With no active path, as always with QUIC off, it stays 0 and the stamp reads
-as the UDP value alone. Only `identity::key_holder` reads the stamp: a holder heard
+that). Before any path has been active, as always with QUIC off, it is 0 and the stamp
+reads as the UDP value alone; after a path ends it keeps its last write and ages
+out. Only `identity::key_holder` reads the stamp: a holder heard
 from on its active path within HOLD_WINDOW (30 s) keeps its key against a newer
 claim. A holder can read as heard from up to one tick longer than it really was.
 `last_inbound_nanos` and `last_received_nanos` stay UDP-only, so the keepalive

@@ -40,6 +40,20 @@ use crate::transport::quic::liveness::{QuicAvailability, QuicAvailabilityWatch};
 /// release that puts it in the slice. `quic-data-percent` replaces it on one node.
 pub(in crate::transport) const QUIC_DATA_PERCENT: u8 = 0;
 
+/// Whether this build reads data from a QUIC path. It does not yet: nothing
+/// drains the path's channels, so a node that said it accepts data would queue a
+/// peer's frames against the shared inbound budget for nothing. While this is
+/// `false`, [`QuicPolicy::own_caps`] returns 0 outside test builds (`cfg(test)`
+/// or the `testing` feature, which the simulations use). The receive side flips
+/// it to `true`. A sender must also require a peer at or above the first release
+/// that reads.
+pub(in crate::transport) const QUIC_DATA_RECEIVER_READY: bool = false;
+
+/// Whether `own_caps` may set the data bit in this build.
+const fn data_bit_allowed(testing_build: bool) -> bool {
+    testing_build || QUIC_DATA_RECEIVER_READY
+}
+
 /// The node's QUIC upgrade policy. See the module docs.
 #[derive(Debug, Clone)]
 pub(crate) struct QuicPolicy {
@@ -195,12 +209,17 @@ impl QuicPolicy {
 
     /// What this node says it supports on a path to `peer`
     /// ([`crate::transport::quic::control::caps`]). The peer's key comes from the
-    /// node's record, never from a message, so a peer cannot choose its bucket.
+    /// node's record, never from a message, so no message can set the bucket. A
+    /// peer picks its own keypair and so its own bucket: the slice controls the
+    /// rollout, it is not a defence.
     pub(in crate::transport) fn own_caps(
         &self,
         local: &TransportPublicKey,
         peer: &TransportPublicKey,
     ) -> u32 {
+        if !data_bit_allowed(cfg!(any(test, feature = "testing"))) {
+            return 0;
+        }
         match self.mode {
             QuicMode::Prefer if super::slice::in_slice(local, peer, self.data_percent) => {
                 caps::DATA
@@ -488,6 +507,15 @@ mod tests {
         for mode in ["shadow", "off"] {
             assert_eq!(caps_with(mode, Some("100".to_string())), 0, "{mode}");
         }
+    }
+
+    /// A build without `cfg(test)` or the `testing` feature cannot set the data
+    /// bit until the receive side exists, whatever the mode and the key say.
+    #[test]
+    fn a_non_testing_build_cannot_set_the_data_bit() {
+        assert!(!QUIC_DATA_RECEIVER_READY, "flip with the receive side");
+        assert!(!data_bit_allowed(false));
+        assert!(data_bit_allowed(true));
     }
 
     /// Permits stop at the limit, a dropped permit frees its slot, and the
