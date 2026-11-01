@@ -906,11 +906,12 @@ async fn attempt_result(
 ) -> SessionEvent {
     drive(time, Duration::from_secs(30), async move {
         loop {
-            match inbox.recv().await.expect("the session lives") {
-                event @ (SessionEvent::Connected { .. } | SessionEvent::ConnectFailed { .. }) => {
-                    return event;
-                }
-                _ => {}
+            let event = inbox.recv().await.expect("the session lives");
+            if matches!(
+                event,
+                SessionEvent::Connected { .. } | SessionEvent::ConnectFailed { .. }
+            ) {
+                return event;
             }
         }
     })
