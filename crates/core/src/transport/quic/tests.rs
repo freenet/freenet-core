@@ -2188,6 +2188,7 @@ fn a_cap_short_of_the_datagram_is_would_block() {
     assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
     assert!(demux.inner_for_test().sent.lock().unwrap().is_empty());
     assert_eq!(cap.level_bytes(), level, "nothing was charged");
+    assert_eq!(socket.send_refused(), 1, "a cap refusal is counted");
 
     let mut poller = socket.clone().create_io_poller();
     let waker = futures::task::noop_waker();
@@ -2222,6 +2223,7 @@ fn a_full_socket_buffer_is_would_block_and_returns_the_take() {
     assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
     assert_eq!(cap.level_bytes(), level, "the take came back");
     assert_eq!(cap.stats().bytes, 0);
+    assert_eq!(socket.send_refused(), 1, "a full buffer is counted");
 }
 
 /// A send that fails with any other error is reported to quinn as sent

@@ -20907,6 +20907,11 @@ fn test_quic_shadow_initial_the_peer_did_not_send_leaves_the_attempt_open() {
     let server = run.server();
     let client = run.nodes.iter().copied().find(|n| *n != server).unwrap();
     assert_eq!(run.whats(server, "Offered"), 1, "{}", run.dump());
+    assert!(
+        run.whats(server, "injected an Initial") >= 1,
+        "the extra Initial was delivered to the server: {}",
+        run.dump()
+    );
     assert_eq!(
         run.whats(server, QUIC_RETRIED),
         2,

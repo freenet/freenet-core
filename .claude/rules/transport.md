@@ -1241,11 +1241,13 @@ check every endpoint was live (`not_allowed`) rather than failed to bind.
 `SimNetwork::quic_upgrade_trace` returns a handle (`quic/upgrade/sim_trace.rs`,
 tests only) with what each node's upgrades did, readable after the run. It also
 injects: `send_initial_on_each_attempt` (the node receives an Initial with the
-peer's address as its source each time it allows that address), `make_record_wrong` (the key compared after the handshake disagrees, so
-the path closes with IDENTITY_MISMATCH), `fail_endpoint_at` (the endpoint driver
-dies) and `run_as_release` (a peer reporting the crate's version reads as a given
-release, since this tree reports a version below the negotiation floor until the
-release bump). The first offer is 2-10 s after promotion, so give a run tens of
+peer's address as its source each time it allows that address, and records
+`injected an Initial`), `make_record_wrong` (the key compared after the
+handshake disagrees, so the path closes with IDENTITY_MISMATCH),
+`fail_endpoint_at` (the endpoint
+driver dies) and `run_as_release` (a peer reporting the crate's version reads
+as a given release, since this tree reports a version below the negotiation
+floor until the release bump). The first offer is 2-10 s after promotion, so give a run tens of
 virtual seconds.
 Other knobs: `with_node_advertised_version` (the version a node advertises
 in its intro and AckConnectionV2, to emulate an older peer of the same

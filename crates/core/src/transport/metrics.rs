@@ -444,9 +444,10 @@ labelled_counters! {
         /// retransmits its Initial, and each one that arrives can count.
         AttemptUnrouted => "attempt_unrouted",
         /// A QUIC connection attempt whose source address was not yet
-        /// validated was answered with a Retry and did not take the waiting
-        /// attempt's slot. An upgrade with no loss counts one. Each Initial
-        /// that arrives unvalidated counts, whoever sent it.
+        /// validated: a Retry was attempted and the attempt did not take the
+        /// waiting slot. The Retry is not known to have been sent; a refused
+        /// send is `quic_send_refused`. An upgrade with no loss counts one.
+        /// Each Initial that arrives unvalidated counts, whoever sent it.
         AttemptRetried => "attempt_retried",
         /// A session's driver or a path's pump panicked.
         TaskPanicked => "task_panicked",
@@ -812,6 +813,12 @@ pub struct TransportMetrics {
     /// Times the QUIC crash-loop breaker tripped at startup (reset each
     /// snapshot; at most one per process).
     quic_breaker_trips: AtomicU64,
+    /// Sends the QUIC socket refused with `WouldBlock`, at the egress cap or
+    /// a full socket buffer (reset each snapshot). A connection waits for
+    /// write readiness before it sends, so this is chiefly a datagram quinn's
+    /// endpoint made on its own (a Retry, a close, a reset): quinn drops it
+    /// without retrying, and the peer's own retransmit is what recovers.
+    quic_send_refused: AtomicU64,
     /// Whether the crash-loop breaker keeps QUIC off in this process (a
     /// state, never reset).
     quic_breaker_suppressed: AtomicBool,
@@ -1237,6 +1244,7 @@ impl TransportMetrics {
             quic_endpoint_down: AtomicU64::new(0),
             quic_adapter_panicked: AtomicU64::new(0),
             quic_breaker_trips: AtomicU64::new(0),
+            quic_send_refused: AtomicU64::new(0),
             quic_breaker_suppressed: AtomicBool::new(false),
             quic_close_sent: Default::default(),
             quic_close_received: Default::default(),
@@ -1716,6 +1724,11 @@ impl TransportMetrics {
     /// (`quic::breaker`).
     pub(crate) fn record_quic_breaker_trip(&self) {
         self.quic_breaker_trips.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The QUIC socket refused a send with `WouldBlock`.
+    pub(crate) fn record_quic_send_refused(&self) {
+        self.quic_send_refused.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Whether the crash-loop breaker keeps QUIC off in this process.
@@ -2492,6 +2505,7 @@ impl TransportMetrics {
             quic_endpoint_down: get64(&self.quic_endpoint_down),
             quic_adapter_panicked: get64(&self.quic_adapter_panicked),
             quic_breaker_trips: get64(&self.quic_breaker_trips),
+            quic_send_refused: get64(&self.quic_send_refused),
             quic_breaker_suppressed: self.quic_breaker_suppressed.load(Ordering::Relaxed),
             quic_close_sent_node_dropped_peer: get64(
                 &self.quic_close_sent[QuicCloseCode::NodeDroppedPeer as usize],
@@ -3061,6 +3075,10 @@ pub struct TransportSnapshot {
     /// Times the QUIC crash-loop breaker tripped: a run with QUIC enabled
     /// ended abnormally, so this one started with QUIC off (#5940).
     pub quic_breaker_trips: u64,
+    /// Sends the QUIC socket refused with `WouldBlock` (egress cap or full
+    /// socket buffer). Chiefly datagrams quinn's endpoint made on its own,
+    /// such as a Retry, which it drops without retrying.
+    pub quic_send_refused: u64,
     /// Whether the crash-loop breaker keeps QUIC off in this process.
     pub quic_breaker_suppressed: bool,
     /// QUIC connections this node closed, by close code
@@ -3420,6 +3438,7 @@ impl TransportSnapshot {
             quic_endpoint_down,
             quic_adapter_panicked,
             quic_breaker_trips,
+            quic_send_refused,
             quic_breaker_suppressed,
             quic_close_sent_node_dropped_peer,
             quic_close_sent_downgrade,
@@ -3555,6 +3574,7 @@ impl TransportSnapshot {
         self.quic_endpoint_down = quic_endpoint_down;
         self.quic_adapter_panicked = quic_adapter_panicked;
         self.quic_breaker_trips = quic_breaker_trips;
+        self.quic_send_refused = quic_send_refused;
         self.quic_breaker_suppressed = quic_breaker_suppressed;
         self.quic_close_sent_node_dropped_peer = quic_close_sent_node_dropped_peer;
         self.quic_close_sent_downgrade = quic_close_sent_downgrade;
@@ -3739,6 +3759,10 @@ struct SnapshotExtras {
     /// Times the QUIC crash-loop breaker tripped: a run with QUIC enabled
     /// ended abnormally, so this one started with QUIC off (#5940).
     pub quic_breaker_trips: u64,
+    /// Sends the QUIC socket refused with `WouldBlock` (egress cap or full
+    /// socket buffer). Chiefly datagrams quinn's endpoint made on its own,
+    /// such as a Retry, which it drops without retrying.
+    pub quic_send_refused: u64,
     /// Whether the crash-loop breaker keeps QUIC off in this process.
     pub quic_breaker_suppressed: bool,
     /// QUIC connections this node closed, by close code
@@ -3927,6 +3951,7 @@ impl SnapshotExtras {
             || self.quic_endpoint_down != 0
             || self.quic_adapter_panicked != 0
             || self.quic_breaker_trips != 0
+            || self.quic_send_refused != 0
             || self.quic_close_sent_node_dropped_peer != 0
             || self.quic_close_sent_downgrade != 0
             || self.quic_close_sent_identity_mismatch != 0
@@ -4904,6 +4929,20 @@ mod tests {
         let snap = metrics.take_snapshot().expect("activity");
         assert_eq!(snap.quic_breaker_trips, 0);
         assert!(snap.quic_breaker_suppressed, "the state is not reset");
+    }
+
+    #[test]
+    fn quic_send_refused_is_activity_reaches_snapshot_and_resets() {
+        let metrics = TransportMetrics::new();
+        assert!(metrics.take_snapshot().is_none());
+        metrics.record_quic_send_refused();
+        let snap = metrics
+            .take_snapshot()
+            .expect("a refused send alone is activity");
+        assert_eq!(snap.quic_send_refused, 1);
+        let json = serde_json::to_value(&snap).unwrap();
+        assert_eq!(json["quic_send_refused"], 1);
+        assert!(metrics.take_snapshot().is_none(), "the count must reset");
     }
 
     /// The snapshot field that carries the period count of closes sent
@@ -6163,6 +6202,7 @@ mod tests {
             "quic_endpoint_down",
             "quic_adapter_panicked",
             "quic_breaker_trips",
+            "quic_send_refused",
             "quic_breaker_suppressed",
             "quic_close_sent_node_dropped_peer",
             "quic_close_sent_downgrade",

@@ -47,6 +47,7 @@ use super::config::MAX_UDP_PAYLOAD;
 use super::liveness::EndpointHealth;
 use crate::transport::demux::{DemuxSocket, QuicIngressReceiver};
 use crate::transport::egress_cap::AdmissionWaiter;
+use crate::transport::metrics::TRANSPORT_METRICS;
 use crate::transport::{Socket, normalize_mapped_addr};
 
 /// QUIC transmits the egress cap is holding, node-wide: quinn has built
@@ -159,6 +160,8 @@ pub(crate) struct QuicSocket<S> {
     local_addr: SocketAddr,
     /// Sends that failed with an error other than `WouldBlock`.
     send_errors: AtomicU64,
+    /// Sends refused with `WouldBlock` (egress cap or full socket buffer).
+    send_refused: AtomicU64,
     /// Whether the ingress queue's sending side is gone has been logged.
     ingress_closed_logged: AtomicBool,
     /// Told of a panic caught here.
@@ -306,6 +309,7 @@ impl<S: Socket> QuicSocket<S> {
             ingress: parking_lot::Mutex::new(ingress),
             local_addr,
             send_errors: AtomicU64::new(0),
+            send_refused: AtomicU64::new(0),
             ingress_closed_logged: AtomicBool::new(false),
             health,
             receive_waker: futures::task::AtomicWaker::new(),
@@ -345,6 +349,12 @@ impl<S: Socket> QuicSocket<S> {
         self.send_errors.load(Ordering::Relaxed)
     }
 
+    /// Sends refused with `WouldBlock`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn send_refused(&self) -> u64 {
+        self.send_refused.load(Ordering::Relaxed)
+    }
+
     /// The address quinn sees for a datagram from `from`: on an IPv6 socket
     /// an IPv4 peer is written `::ffff:a.b.c.d`, the form quinn uses for the
     /// addresses it connects to there, so its replies and its connection
@@ -356,6 +366,13 @@ impl<S: Socket> QuicSocket<S> {
             }
             addr @ (SocketAddr::V4(_) | SocketAddr::V6(_)) => addr,
         }
+    }
+
+    /// A send was refused with `WouldBlock`: quinn waits and resends what a
+    /// connection sent, but drops a datagram its endpoint made on its own.
+    fn count_send_refused(&self) {
+        self.send_refused.fetch_add(1, Ordering::Relaxed);
+        TRANSPORT_METRICS.record_quic_send_refused();
     }
 
     fn count_send_error(&self, error: &io::Error, target: SocketAddr) {
@@ -508,13 +525,19 @@ impl<S: Socket> QuicSocket<S> {
                     Ok(take) => self
                         .socket
                         .try_send_to_paced(transmit.contents, target, take),
-                    Err(_) => return Err(io::ErrorKind::WouldBlock.into()),
+                    Err(_) => {
+                        self.count_send_refused();
+                        return Err(io::ErrorKind::WouldBlock.into());
+                    }
                 }
             }
         };
         match sent {
             Ok(_) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Err(e),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                self.count_send_refused();
+                Err(e)
+            }
             Err(e) => {
                 self.count_send_error(&e, target);
                 Ok(())

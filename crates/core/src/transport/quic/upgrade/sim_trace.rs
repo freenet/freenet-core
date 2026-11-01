@@ -194,9 +194,14 @@ impl NodeTrace {
             .contains(&self.addr)
     }
 
-    /// Deliver `datagram` to this node's socket, as sent from `source`.
+    /// Deliver `datagram` to this node's socket, as sent from `source`, and
+    /// record that it was (`injected an Initial`), so a test can check the
+    /// hook ran rather than infer it. Nothing is recorded when the node's
+    /// network cannot be found.
     pub(crate) fn deliver_to_node(&self, datagram: Vec<u8>, source: SocketAddr) {
-        crate::transport::in_memory_socket::deliver_packet_at(self.addr, datagram, source);
+        if crate::transport::in_memory_socket::deliver_packet_at(self.addr, datagram, source) {
+            self.record(source, 0, "injected an Initial".to_string());
+        }
     }
 
     pub(crate) fn wrong_record(&self) -> bool {
