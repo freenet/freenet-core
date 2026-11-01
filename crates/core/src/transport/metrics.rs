@@ -443,6 +443,11 @@ labelled_counters! {
         /// counts attempts that reached this node, not dials: a client
         /// retransmits its Initial, and each one that arrives can count.
         AttemptUnrouted => "attempt_unrouted",
+        /// A QUIC connection attempt whose source address was not yet
+        /// validated was answered with a Retry and did not take the waiting
+        /// attempt's slot. An upgrade with no loss counts one. Each Initial
+        /// that arrives unvalidated counts, whoever sent it.
+        AttemptRetried => "attempt_retried",
         /// A session's driver or a path's pump panicked.
         TaskPanicked => "task_panicked",
         /// The peer closed the connection of an attempt that was not yet

@@ -522,6 +522,19 @@ impl QuicUpgrades {
         false
     }
 
+    /// Deliver to this node an Initial with `source` as its source address,
+    /// when a test asked for one on each allowed attempt.
+    #[cfg(any(test, feature = "testing"))]
+    fn send_test_initial(&self, source: SocketAddr) {
+        let Some(trace) = self.trace.as_ref().filter(|t| t.initial_on_each_attempt()) else {
+            return;
+        };
+        let datagram = self
+            .endpoint
+            .initial_datagram(trace.addr(), &self.local_key);
+        trace.deliver_to_node(datagram, source);
+    }
+
     /// The peer's version as the machine reads it.
     fn peer_version(&self, reported: Option<(u8, u8, u16)>) -> Option<(u8, u8, u16)> {
         #[cfg(any(test, feature = "testing"))]
@@ -740,6 +753,8 @@ impl Session {
         let mut held = Attempt::new(attempt, self.remote);
         held.allow = Some(permit);
         state.attempt = Some(held);
+        #[cfg(any(test, feature = "testing"))]
+        self.hub.send_test_initial(self.remote);
         Ok(())
     }
 
@@ -770,6 +785,12 @@ impl Session {
     /// Finish the handshake of an attempt from this session's address, if the
     /// live attempt is waiting for one. The machine's deadline bounds the task:
     /// its `TearDown` drops the attempt, which aborts the task.
+    ///
+    /// A UDP source address proves nothing, and only one attempt can take the
+    /// slot, so an attempt that has not returned a Retry token is answered with
+    /// a Retry and leaves the slot open. The client answers the Retry inside
+    /// quinn, within its dial, and its next Initial arrives here validated. That
+    /// costs one round trip, on the same deadline.
     fn on_incoming(&self, state: &mut SessionState, incoming: QuicIncoming) {
         let waiting = state
             .attempt
@@ -780,6 +801,12 @@ impl Session {
             incoming.ignore();
             return;
         };
+        if !incoming.address_validated() {
+            TRANSPORT_METRICS.record_quic_upgrade(QuicUpgradeOutcome::AttemptRetried, self.remote);
+            self.note(|| "retried an unvalidated attempt".to_string());
+            incoming.retry();
+            return;
+        }
         held.establishing = true;
         let attempt = held.id;
         let hub = Arc::clone(&self.hub);

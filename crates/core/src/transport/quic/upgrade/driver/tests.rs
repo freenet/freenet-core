@@ -364,7 +364,18 @@ fn a_routed_attempt_becomes_a_shadow_path() {
         let (peer_path, mut peer_inbound, refused, charged) =
             drive(&h.pair.time, Duration::from_secs(60), async move {
                 let client = tokio::spawn(async move { theirs.connect(our_addr, &our_key).await });
+                // The first Initial is answered with a Retry; the second carries
+                // the token.
                 hub.route(ours.accept().await.expect("an attempt"));
+                loop {
+                    let event = inbox.recv().await.expect("the session lives");
+                    let retried = matches!(event, SessionEvent::Incoming(_));
+                    assert!(session_for_task.handle(event).is_empty());
+                    if retried {
+                        break;
+                    }
+                }
+                hub.route(ours.accept().await.expect("the attempt with its token"));
                 // The routed attempt, then its finished handshake.
                 while session_for_task
                     .state
@@ -808,4 +819,258 @@ fn session_and_setup_endings_reach_their_own_counters() {
         session.count_decline_sent(DeclineReason::Busy.wire());
         assert_eq!(events().last().map(String::as_str), Some("DeclineSentBusy"));
     });
+}
+
+/// What a retry test needs of a server harness.
+struct RetryRig {
+    ours: QuicEndpoint,
+    theirs: QuicEndpoint,
+    our_addr: SocketAddr,
+    our_key: TransportPublicKey,
+    time: VirtualTime,
+}
+
+impl RetryRig {
+    fn of(h: &Harness) -> Self {
+        let local_is_a = h.pair.a_keys.public() > h.pair.b_keys.public();
+        let (ours, theirs, our_addr, our_key) = if local_is_a {
+            (&h.pair.a, &h.pair.b, h.pair.a_addr, h.pair.a_keys.public())
+        } else {
+            (&h.pair.b, &h.pair.a, h.pair.b_addr, h.pair.b_keys.public())
+        };
+        Self {
+            ours: ours.clone(),
+            theirs: theirs.clone(),
+            our_addr,
+            our_key: our_key.clone(),
+            time: h.pair.time.clone(),
+        }
+    }
+
+    /// The peer dials this node, in a task.
+    fn dial(&self) -> JoinHandle<Result<QuicConnection, crate::transport::quic::QuicConnectError>> {
+        let (theirs, our_addr, our_key) =
+            (self.theirs.clone(), self.our_addr, self.our_key.clone());
+        tokio::spawn(async move { theirs.connect(our_addr, &our_key).await })
+    }
+
+    /// The next attempt the endpoint hands on, by the virtual clock.
+    async fn next_attempt(&self) -> QuicIncoming {
+        let ours = self.ours.clone();
+        drive(&self.time, Duration::from_secs(30), async move {
+            ours.accept().await.expect("an attempt")
+        })
+        .await
+    }
+}
+
+/// A session with a live attempt waiting for a connection, as after an Offer.
+fn waiting_session(h: &Harness) -> (Arc<Session>, mpsc::Receiver<SessionEvent>) {
+    let (session, inbox) = h.session();
+    session.promote(h.peer.clone());
+    let mut state = session.state.lock();
+    let sends = session.apply(
+        &mut state,
+        vec![Action::AllowPeerThenOffer {
+            attempt: 1,
+            caps: 0,
+        }],
+    );
+    assert_eq!(sends.len(), 1, "allowed, so the Offer goes out");
+    drop(state);
+    (session, inbox)
+}
+
+fn slot_is_taken(session: &Session) -> bool {
+    session
+        .state
+        .lock()
+        .attempt
+        .as_ref()
+        .expect("the attempt is live")
+        .establishing
+}
+
+fn retries(remote: SocketAddr) -> usize {
+    TRANSPORT_METRICS
+        .quic_events_of(remote)
+        .iter()
+        .filter(|event| *event == "AttemptRetried")
+        .count()
+}
+
+/// The next `Connected` or `ConnectFailed` in `inbox`, by the virtual clock.
+async fn attempt_result(
+    time: &VirtualTime,
+    mut inbox: mpsc::Receiver<SessionEvent>,
+) -> SessionEvent {
+    drive(time, Duration::from_secs(30), async move {
+        loop {
+            match inbox.recv().await.expect("the session lives") {
+                event @ (SessionEvent::Connected { .. } | SessionEvent::ConnectFailed { .. }) => {
+                    return event;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+}
+
+/// An Initial carrying the peer's address as its source, which the peer did not
+/// send, is answered with a Retry and leaves the attempt open. The real dial then
+/// takes the slot and connects, with one Retry of its own. Taking the first
+/// Initial for the address, as before, would leave the real dial ignored until
+/// the attempt's deadline.
+#[test]
+fn an_initial_the_peer_did_not_send_cannot_take_the_attempts_slot() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let network = "quic-driver-retry-stray";
+        let h = Harness::server(network, 18).await;
+        let rig = RetryRig::of(&h);
+        let (session, inbox) = waiting_session(&h);
+
+        for sent in 1..=3 {
+            let datagram = rig.theirs.initial_datagram(rig.our_addr, &rig.our_key);
+            assert!(
+                crate::transport::in_memory_socket::deliver_packet_to_network(
+                    network,
+                    rig.our_addr,
+                    datagram,
+                    h.remote,
+                ),
+                "the datagram reached the socket"
+            );
+            let stray = rig.next_attempt().await;
+            assert!(!stray.address_validated(), "it returned no token");
+            session.handle(SessionEvent::Incoming(Box::new(stray)));
+            assert!(!slot_is_taken(&session), "after {sent} of them");
+            assert_eq!(retries(h.remote), sent);
+        }
+        assert!(
+            session
+                .state
+                .lock()
+                .attempt
+                .as_ref()
+                .is_some_and(|held| held.allow.is_some()),
+            "the attempt keeps its allow-set permit"
+        );
+
+        let dial = rig.dial();
+        let first = rig.next_attempt().await;
+        session.handle(SessionEvent::Incoming(Box::new(first)));
+        assert!(!slot_is_taken(&session), "the dial's own first Initial");
+        let second = rig.next_attempt().await;
+        assert!(second.address_validated(), "it returned the token");
+        session.handle(SessionEvent::Incoming(Box::new(second)));
+        assert!(
+            slot_is_taken(&session),
+            "a validated attempt takes the slot"
+        );
+        assert_eq!(retries(h.remote), 4, "one Retry for the dial");
+
+        let event = attempt_result(&rig.time, inbox).await;
+        assert!(
+            matches!(event, SessionEvent::Connected { attempt: 1, .. }),
+            "the real dial connected"
+        );
+        dial.abort();
+    });
+}
+
+/// An attempt the Retry gave up holds nothing of the address: with its session's
+/// attempt gone, the address can be allowed again under another key, which a key
+/// hold left behind would refuse.
+#[test]
+fn a_retried_attempt_keeps_no_hold_on_the_address() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let h = Harness::server("quic-driver-retry-hold", 19).await;
+        let rig = RetryRig::of(&h);
+        let (session, _inbox) = waiting_session(&h);
+        let dial = rig.dial();
+        let first = rig.next_attempt().await;
+        session.handle(SessionEvent::Incoming(Box::new(first)));
+        assert_eq!(retries(h.remote), 1);
+        dial.abort();
+
+        session.state.lock().attempt = None;
+        let other = TransportKeypair::new().public().clone();
+        let _permit = rig
+            .ours
+            .allow_peer(h.remote, &other)
+            .expect("no hold on the address remains");
+    });
+}
+
+/// A session with no attempt waiting ignores an unvalidated attempt, as it does
+/// any other: no Retry goes out for an address with nothing to connect.
+#[test]
+fn a_session_with_no_attempt_waiting_sends_no_retry() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let h = Harness::server("quic-driver-retry-no-wait", 20).await;
+        let rig = RetryRig::of(&h);
+        let _permit = rig.ours.allow_peer(h.remote, &h.peer).expect("allowed");
+        let (session, _inbox) = h.session();
+        let dial = rig.dial();
+        let first = rig.next_attempt().await;
+        session.handle(SessionEvent::Incoming(Box::new(first)));
+        dial.abort();
+        assert_eq!(retries(h.remote), 0);
+        assert_eq!(
+            TRANSPORT_METRICS.quic_events_of(h.remote),
+            ["AttemptUnrouted"]
+        );
+    });
+}
+
+/// With the first answer lost, the dial still connects well inside the connect
+/// timeout, on the client's retransmission, and with one Retry. Losing the Initial
+/// and losing the Retry look the same to the client.
+#[test]
+fn a_lost_retry_still_connects_inside_the_connect_timeout() {
+    use crate::transport::quic::upgrade::machine::CONNECT_TIMEOUT;
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let h = Harness::server("quic-driver-retry-lost", 21).await;
+        let rig = RetryRig::of(&h);
+        let (session, inbox) = waiting_session(&h);
+        let started = rig.time.now_nanos();
+        let dial = rig.dial();
+
+        let lost = rig.next_attempt().await;
+        assert!(!lost.address_validated());
+        lost.ignore();
+        let resent = rig.next_attempt().await;
+        assert!(
+            rig.time.now_nanos() > started,
+            "the second came from the client's retransmission timer"
+        );
+        session.handle(SessionEvent::Incoming(Box::new(resent)));
+        assert_eq!(retries(h.remote), 1);
+        let validated = rig.next_attempt().await;
+        assert!(validated.address_validated());
+        session.handle(SessionEvent::Incoming(Box::new(validated)));
+
+        let event = attempt_result(&rig.time, inbox).await;
+        assert!(matches!(event, SessionEvent::Connected { .. }));
+        let took = Duration::from_nanos(rig.time.now_nanos() - started);
+        assert!(
+            took < CONNECT_TIMEOUT / 2,
+            "took {took:?} against {CONNECT_TIMEOUT:?}"
+        );
+        dial.abort();
+    });
+}
+
+/// A token stays valid for as long as a client can be using it.
+#[test]
+fn a_retry_token_outlasts_the_setup_deadlines() {
+    use crate::transport::quic::config::RETRY_TOKEN_LIFETIME;
+    use crate::transport::quic::upgrade::machine::CONNECT_TIMEOUT;
+    assert!(RETRY_TOKEN_LIFETIME > CONNECT_TIMEOUT);
+    assert!(RETRY_TOKEN_LIFETIME > OFFER_TIMEOUT);
 }

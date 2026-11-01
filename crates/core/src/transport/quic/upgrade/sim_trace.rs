@@ -40,6 +40,8 @@ struct TraceData {
     down_at: Mutex<BTreeMap<SocketAddr, Duration>>,
     permits: Mutex<BTreeMap<SocketAddr, QuicPathPermits>>,
     connections: Mutex<BTreeMap<SocketAddr, usize>>,
+    /// Nodes that receive an extra Initial each time they allow a peer.
+    initial_on_attempt: Mutex<BTreeSet<SocketAddr>>,
     /// The version a peer reports, and the release it then reads as.
     release: Mutex<Option<(Version, Version)>>,
 }
@@ -104,6 +106,13 @@ impl QuicUpgradeTrace {
     /// any other way from outside the node.
     pub fn make_record_wrong(&self, node: SocketAddr) {
         self.data.wrong_record.lock().insert(node);
+    }
+
+    /// Each time `node` allows a peer's address, it receives at once an Initial
+    /// with that address as its source and a connection ID the peer never used,
+    /// so the Initial gets there before anything the peer sends.
+    pub fn send_initial_on_each_attempt(&self, node: SocketAddr) {
+        self.data.initial_on_attempt.lock().insert(node);
     }
 
     /// A peer that reports `real` is treated as running `release` when the machine
@@ -171,6 +180,23 @@ impl NodeTrace {
             Some((real, release)) if reported == Some(real) => Some(release),
             Some(_) | None => reported,
         }
+    }
+
+    pub(crate) fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    pub(crate) fn initial_on_each_attempt(&self) -> bool {
+        self.trace
+            .data
+            .initial_on_attempt
+            .lock()
+            .contains(&self.addr)
+    }
+
+    /// Deliver `datagram` to this node's socket, as sent from `source`.
+    pub(crate) fn deliver_to_node(&self, datagram: Vec<u8>, source: SocketAddr) {
+        crate::transport::in_memory_socket::deliver_packet_at(self.addr, datagram, source);
     }
 
     pub(crate) fn wrong_record(&self) -> bool {
