@@ -70,7 +70,7 @@ impl DataPath {
     async fn send_stream(&self, id: StreamId, metadata: Option<&[u8]>, payload: Bytes) {
         let sent = self
             .peer()
-            .send_stream_bounded(&self.time, SEND_LIMIT, id, metadata, payload)
+            .send_stream_bounded(&self.time, SEND_LIMIT, id, metadata, payload, None)
             .await;
         assert!(matches!(sent, BoundedSend::Sent), "{sent:?}");
     }

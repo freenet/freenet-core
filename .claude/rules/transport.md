@@ -1452,15 +1452,21 @@ Sending (QuicPath::send_short_bounded / send_stream_bounded /
   before the receiver reads its header, so a refusal may read as success
   at the sender, as on UDP, and so may one dropped for a full channel:
   sent is NOT delivered. send_stream_chunks_bounded resets the stream if the
-  source fails or delivers a different length. quinn's MAX_UNI_STREAMS (64)
+  source fails or delivers a different length, and takes nothing before the
+  source's first chunk (no permit, no stream; a source that ends or fails first
+  opens no stream). quinn's MAX_UNI_STREAMS (64)
   uni streams are the back-pressure (open_uni waits; quinn returns
   credit only after more than an eighth of the limit is freed).
-  Slot reservation: send_stream_bounded / send_stream_chunks_bounded each
-  hold one of
-  the path's STREAMED_SEND_LIMIT semaphore permits from before open_uni
-  until they return; a streamed send past the limit waits for a permit
-  without opening a stream. Short and control sends take no permit. The
-  limit divides as STREAMED_SEND_LIMIT 48 + UNANNOUNCED_CREDIT_SLACK 8 +
+  Slot reservation: send_stream_bounded / send_stream_chunks_bounded, and
+  send_short_bounded for a message past one packet (fits_one_packet), each
+  take one of the path's STREAMED_SEND_LIMIT semaphore permits before
+  open_uni. The stream holds it until it is acknowledged, stopped or reset,
+  also past a deadline that reported MaybeDelivered: Outgoing's drop hands
+  the wait to a small task (at most 48 per path, each ending with the
+  connection). A streamed send past the limit waits for a permit without
+  opening a stream, and that wait races connection.closed(), because the
+  semaphore never closes. One-packet shorts and control sends take no
+  permit. The limit divides as STREAMED_SEND_LIMIT 48 + UNANNOUNCED_CREDIT_SLACK 8 +
   RESERVED_UNI_STREAMS 8 = MAX_UNI_STREAMS 64 (quinn leaves up to
   MAX_UNI_STREAMS / 8 freed slots with no MAX_STREAMS frame written). The
   reserve holds on a steady path: every streamed send still holds its permit
@@ -1469,17 +1475,17 @@ Sending (QuicPath::send_short_bounded / send_stream_bounded /
   control messages hold no more than the reserve (pinned by
   a_short_still_sends_while_streamed_messages_are_blocked).
   e5b constraints (none arises in shadow, which sends only control frames):
-  → A permit returns before the slot does: on a timeout after finish (the
-    stream is not reset, so it holds its slot until the backlog drains, the
-    worst case), on a reset or a stop from the peer, and on an ack that
-    comes before the receiver has read the stream to its end. Decide in
-    e5b whether to hold the permit until the stream is acked.
+  → A permit can return before the slot does: on a reset or a stop from the
+    peer (about one round trip), and on an ack that comes before the receiver
+    has read the stream to its end (short: the receive side reads without
+    waiting on any consumer). Both accepted.
   → Credit the sender does not know about can exceed 8 while a MAX_STREAMS
     frame is lost, queued or in flight: quinn counts credit as announced
     when it writes the frame (sent_max_remote), so 9 freed slots on their way
     plus 8 freed since are 17 the sender cannot use, with nothing lost.
-  → Short messages are uncapped, and one can be as large as a stream, so
-    they can use up the reserve.
+  → One-packet shorts are uncapped, so many at once can use up the reserve.
+    Each holds a slot for about one round trip, and SendDeadlines::short
+    gives one second to open.
   → A slot is not send capacity: a control frame with a slot still waits on
     the connection's shared flow control and send window (quinn-proto
     write_limit).
@@ -1491,8 +1497,9 @@ Sending (QuicPath::send_short_bounded / send_stream_bounded /
     keeps its wakeup until the deadline (VirtualSleep has no drop
     deregistration, and advance_to_next_wakeup relies on that). The trait
     default is sleep; PathClock forwards it.
-  → Failed(TimedOut) after the stream opened is a reset and counts toward
-    SEND_ABORT_LIMIT, so repeated timeouts close the path.
+  → Failed(TimedOut) is a reset and counts toward SEND_ABORT_LIMIT, so
+    repeated timeouts close the path. NotOpened opened nothing, so it does not
+    count.
   → A NOT_ACCEPTING_DATA stop means the sender's gating is wrong: log it and
     send the message on UDP, do not retry on this path. A sender cannot rely
     on seeing it (see the stop code).
@@ -1500,12 +1507,25 @@ Sending (QuicPath::send_short_bounded / send_stream_bounded /
   and the final wait for acks can wait as long as the connection lives
   against a peer that does not cooperate. Every node send MUST go through
   a QuicPath::send_*_bounded method (short, control, stream, stream_chunks;
-  path/bounded.rs), which returns
+  path/bounded.rs), under SendDeadlines: open (from the start of the send to
+  the stream being open, permit included), gap (between two writes or chunks
+  while the stream is open, and not during the ack wait, which includes a send
+  window of backlog) and total. SendDeadlines::short(len) is 1 s and 5 s, or
+  a stream's for a message past one packet; ::stream(len) is 2 s, 5 s
+  (STREAM_INACTIVITY_TIMEOUT) and inbound_stream_age_limit(len); a plain
+  Duration is one deadline for all of it. A send from a source waits for the
+  first chunk for the gap, outside these. One timer per send, re-armed when it
+  fires, as BodyReader. Messages are written in pieces of at most
+  FRAGMENT_PAYLOAD_SIZE, each returning when quinn has buffered it, and each is
+  a step of the gap and one StreamProgressObserver tick, so a slow upload does
+  not read as stalled. A send returns
   Sent (every byte acked), MaybeDelivered(TimedOut | ConnectionLost) (the
   whole message was written and FIN sent, SendProgress set in
   Outgoing::finish, then the deadline passed or the connection was lost
   during the ack wait: the peer may have it, do not treat it as Failed),
-  or Failed(TimedOut | Error) (earlier, or a stop from the peer).
+  Failed(NotOpened(TimedOut | ConnectionLost)) (no stream ever existed, so the
+  message can go another way), or Failed(TimedOut | Error) (the stream was open
+  and did not finish, or a stop from the peer).
   Dropping a send future resets its stream (Drop on Outgoing; quinn's own
   drop would FINISH it, which the receiver reads as a stream that ended
   early). A send dropped while waiting for acks after finish is not reset

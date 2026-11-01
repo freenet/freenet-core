@@ -47,10 +47,23 @@
 //! [`bounded_send`] reports a timeout there as `MaybeDelivered`, not
 //! `Failed`.
 //!
-//! Streamed messages take one permit each, at most
-//! `config::STREAMED_SEND_LIMIT` at once, which keeps uni stream slots for
-//! short messages and control frames on a steady path (see that constant for
-//! what steady means and where a slot can be missing). A path in shadow mode
+//! Streamed messages, and short messages that do not fit a packet, take one
+//! permit each, at most `config::STREAMED_SEND_LIMIT` at once, which keeps uni
+//! stream slots for short messages and control frames on a steady path (see
+//! that constant for what steady means and where a slot can be missing). The
+//! stream holds its permit until it is acknowledged or stopped, also past a
+//! deadline that reported `MaybeDelivered` (a task waits for the end), or
+//! until it is reset. A send waiting for a permit ends when the connection
+//! does, as `open_uni` does. A send from a source waits for the first chunk
+//! before it takes a permit or opens a stream, so a source with nothing yet
+//! holds neither.
+//!
+//! A message is written in pieces of at most `FRAGMENT_PAYLOAD_SIZE`, each
+//! returning once quinn has buffered it, so the gap deadline
+//! ([`SendDeadlines::gap`]) and a `StreamProgressObserver` follow flow control
+//! as they follow the UDP sender's fragments.
+//!
+//! A path in shadow mode
 //! ([`QuicPathLimits::SHADOW`]) refuses inbound data with
 //! [`stop_code::NOT_ACCEPTING_DATA`] before charging anything.
 //!
@@ -140,17 +153,19 @@ use super::recycle::{self, SendAborts};
 use crate::config::GlobalExecutor;
 use crate::simulation::TimeSource;
 use crate::transport::StreamId;
+use crate::transport::boundary::StreamProgressObserver;
 use crate::transport::metrics::{InboundStreamOutcome, QuicCloseCode};
-use crate::transport::peer_connection::embeds_metadata;
 use crate::transport::peer_connection::inbound_budget::SharedInboundBudget;
 use crate::transport::peer_connection::streaming::StreamError;
 #[cfg(test)]
 use crate::transport::peer_connection::streaming::{
     MAX_INBOUND_STREAM_BYTES_PER_CONNECTION, MAX_INBOUND_STREAMS_PER_CONNECTION,
 };
+use crate::transport::peer_connection::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
+use crate::transport::peer_connection::{embeds_metadata, fits_one_packet};
 
 #[cfg_attr(not(test), allow(unused_imports))]
-pub(crate) use bounded::{BoundedSend, MaybeDelivered, SendFailure};
+pub(crate) use bounded::{BoundedSend, MaybeDelivered, NotOpened, SendDeadlines, SendFailure};
 use bounded::{SendProgress, bounded_send};
 pub(crate) use inbound::{InboundShort, InboundStreamArrival};
 
@@ -541,7 +556,7 @@ pub(crate) struct QuicPath {
     /// One permit per streamed message in flight
     /// ([`STREAMED_SEND_LIMIT`]), so the remaining uni stream slots stay
     /// for short messages and control frames. Never closed.
-    stream_slots: tokio::sync::Semaphore,
+    stream_slots: Arc<tokio::sync::Semaphore>,
     /// Whether this path may send data: both sides set the data bit
     /// ([`Self::enable_data`]). Off for a path in shadow, where a fragment taken
     /// from an inbound handle cannot outlive its charge because nothing is ever
@@ -694,7 +709,7 @@ impl QuicPath {
                 stats,
                 receive,
                 aborts,
-                stream_slots: tokio::sync::Semaphore::new(STREAMED_SEND_LIMIT as usize),
+                stream_slots: Arc::new(tokio::sync::Semaphore::new(STREAMED_SEND_LIMIT as usize)),
                 send_data: std::sync::atomic::AtomicBool::new(false),
                 heard,
                 #[cfg(test)]
@@ -726,6 +741,12 @@ impl QuicPath {
     #[cfg(test)]
     pub(crate) fn send_aborts(&self) -> u64 {
         self.aborts.count()
+    }
+
+    /// Streamed-message permits free right now.
+    #[cfg(test)]
+    pub(crate) fn free_stream_slots(&self) -> usize {
+        self.stream_slots.available_permits()
     }
 
     /// Streams and bytes charged to the inbound budget (peer-wide when the
@@ -809,15 +830,17 @@ impl QuicPath {
         self.send_short_with(payload, SendProgress::new()).await
     }
 
-    /// Send one serialized message, within `timeout` on `time` ([`bounded`]).
+    /// Send one serialized message, within `deadlines` on `time` ([`bounded`];
+    /// a node passes [`SendDeadlines::short`]). One that does not fit a packet
+    /// takes a streamed-message permit, as [`Self::send_stream_bounded`] does.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn send_short_bounded<T: TimeSource>(
         &self,
         time: &T,
-        timeout: Duration,
+        deadlines: impl Into<SendDeadlines>,
         payload: &[u8],
     ) -> BoundedSend {
-        bounded_send(time, timeout, |progress| {
+        bounded_send(time, deadlines, |progress| {
             self.send_short_with(payload, progress)
         })
         .await
@@ -830,8 +853,15 @@ impl QuicPath {
     ) -> Result<(), QuicSendError> {
         self.debug_assert_carries_data();
         let header = FrameHeader::short(payload.len() as u64)?;
-        let mut send = self.open(&header, &[], progress).await?;
-        send.write_all(payload).await?;
+        let slot = if fits_one_packet(payload.len() as u64) {
+            None
+        } else {
+            Some(self.stream_slot().await?)
+        };
+        let mut send = self.open(&header, &[], slot, progress).await?;
+        for piece in payload.chunks(FRAGMENT_PAYLOAD_SIZE) {
+            send.write_all(piece).await?;
+        }
         send.finish().await
     }
 
@@ -848,7 +878,7 @@ impl QuicPath {
         progress: SendProgress,
     ) -> Result<(), QuicSendError> {
         let header = FrameHeader::control(payload.len() as u64)?;
-        let mut send = self.open(&header, &[], progress).await?;
+        let mut send = self.open(&header, &[], None, progress).await?;
         send.write_all(payload).await?;
         send.finish().await
     }
@@ -877,26 +907,29 @@ impl QuicPath {
         metadata: Option<&[u8]>,
         payload: Bytes,
     ) -> Result<(), QuicSendError> {
-        self.send_stream_with(stream_id, metadata, payload, SendProgress::new())
+        self.send_stream_with(stream_id, metadata, payload, None, SendProgress::new())
             .await
     }
 
     /// Send stream `stream_id` (caller-named) with `payload`, announced by
     /// `metadata` ([`frame_metadata`] says what goes in the frame), within
-    /// `timeout` on `time` ([`bounded`]). Takes one of the path's
-    /// streamed-message permits ([`STREAMED_SEND_LIMIT`]), waiting for one if
-    /// all are taken, and holds it until it returns.
+    /// `deadlines` on `time` ([`bounded`]; a node passes
+    /// [`SendDeadlines::stream`]). Takes one of the path's streamed-message
+    /// permits ([`STREAMED_SEND_LIMIT`]), waiting for one if all are taken, and
+    /// the stream holds it until it is acknowledged, stopped or reset.
+    /// `observer` hears of each fragment-sized piece quinn has buffered.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn send_stream_bounded<T: TimeSource>(
         &self,
         time: &T,
-        timeout: Duration,
+        deadlines: impl Into<SendDeadlines>,
         stream_id: StreamId,
         metadata: Option<&[u8]>,
         payload: Bytes,
+        observer: Option<&dyn StreamProgressObserver>,
     ) -> BoundedSend {
-        bounded_send(time, timeout, |progress| {
-            self.send_stream_with(stream_id, metadata, payload, progress)
+        bounded_send(time, deadlines, |progress| {
+            self.send_stream_with(stream_id, metadata, payload, observer, progress)
         })
         .await
     }
@@ -906,14 +939,15 @@ impl QuicPath {
         stream_id: StreamId,
         metadata: Option<&[u8]>,
         payload: Bytes,
+        observer: Option<&dyn StreamProgressObserver>,
         progress: SendProgress,
     ) -> Result<(), QuicSendError> {
         self.debug_assert_carries_data();
         let metadata = frame_metadata(metadata);
         let header = FrameHeader::stream(stream_id, payload.len() as u64, metadata.len())?;
-        let _slot = self.stream_slot().await?;
-        let mut send = self.open(&header, metadata, progress).await?;
-        send.write_chunk(payload).await?;
+        let slot = self.stream_slot().await?;
+        let mut send = self.open(&header, metadata, Some(slot), progress).await?;
+        send.write_fragments(payload, observer).await?;
         send.finish().await
     }
 
@@ -924,49 +958,80 @@ impl QuicPath {
         stream_id: StreamId,
         total_len: u64,
         metadata: Option<&[u8]>,
-        chunks: S,
+        mut chunks: S,
     ) -> Result<(), QuicSendError>
     where
         S: Stream<Item = Result<Bytes, StreamError>> + Unpin,
     {
-        self.send_stream_chunks_with(stream_id, total_len, metadata, chunks, SendProgress::new())
-            .await
+        let first = chunks.next().await;
+        self.send_stream_chunks_with(
+            stream_id,
+            total_len,
+            metadata,
+            first,
+            chunks,
+            None,
+            SendProgress::new(),
+        )
+        .await
     }
 
     /// Send stream `stream_id` (caller-named) of `total_len` bytes from
     /// `chunks`, announced by `metadata` ([`frame_metadata`] says what goes
-    /// in the frame), within `timeout` on `time` ([`bounded`]). If the source
-    /// fails, or delivers more or fewer than `total_len` bytes, the stream is
-    /// reset ([`reset_code::SENDER_ABORTED`], or
-    /// [`reset_code::LENGTH_MISMATCH`] for a wrong length) and the receiver
-    /// cancels its handle. No byte past `total_len` is written. Takes a
-    /// streamed-message permit as [`Self::send_stream_bounded`] does.
+    /// in the frame), within `deadlines` on `time` ([`bounded`]; a node passes
+    /// [`SendDeadlines::stream`]). If the source fails, or delivers more or
+    /// fewer than `total_len` bytes, the stream is reset
+    /// ([`reset_code::SENDER_ABORTED`], or [`reset_code::LENGTH_MISMATCH`] for a
+    /// wrong length) and the receiver cancels its handle. No byte past
+    /// `total_len` is written. Takes a streamed-message permit as
+    /// [`Self::send_stream_bounded`] does, and tells `observer` the same.
+    ///
+    /// Waits for the first chunk before anything else, for as long as
+    /// [`SendDeadlines::gap`] allows, so a source that has nothing yet holds no
+    /// permit and no stream; `open` and `total` run from when it arrives. A
+    /// source that ends or fails before its first chunk opens no stream and
+    /// has nothing to reset. A later stall past the gap resets the stream.
+    /// A chunk taken before a [`SendFailure::NotOpened`] is lost, so a caller
+    /// sending another way starts again from a fresh source.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn send_stream_chunks_bounded<T, S>(
         &self,
         time: &T,
-        timeout: Duration,
+        deadlines: impl Into<SendDeadlines>,
         stream_id: StreamId,
         total_len: u64,
         metadata: Option<&[u8]>,
-        chunks: S,
+        mut chunks: S,
+        observer: Option<&dyn StreamProgressObserver>,
     ) -> BoundedSend
     where
         T: TimeSource,
         S: Stream<Item = Result<Bytes, StreamError>> + Unpin,
     {
-        bounded_send(time, timeout, |progress| {
-            self.send_stream_chunks_with(stream_id, total_len, metadata, chunks, progress)
+        let deadlines = deadlines.into();
+        let first = tokio::select! {
+            first = chunks.next() => first,
+            () = time.sleep_cancelable(deadlines.gap.unwrap_or(deadlines.total)) => {
+                return BoundedSend::Failed(SendFailure::NotOpened(NotOpened::TimedOut));
+            }
+        };
+        bounded_send(time, deadlines, |progress| {
+            self.send_stream_chunks_with(
+                stream_id, total_len, metadata, first, chunks, observer, progress,
+            )
         })
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn send_stream_chunks_with<S>(
         &self,
         stream_id: StreamId,
         total_len: u64,
         metadata: Option<&[u8]>,
+        first: Option<Result<Bytes, StreamError>>,
         mut chunks: S,
+        observer: Option<&dyn StreamProgressObserver>,
         progress: SendProgress,
     ) -> Result<(), QuicSendError>
     where
@@ -975,11 +1040,26 @@ impl QuicPath {
         self.debug_assert_carries_data();
         let metadata = frame_metadata(metadata);
         let header = FrameHeader::stream(stream_id, total_len, metadata.len())?;
-        let _slot = self.stream_slot().await?;
-        let mut send = self.open(&header, metadata, progress).await?;
+        let first = match first {
+            Some(Ok(chunk)) => chunk,
+            Some(Err(error)) => return Err(QuicSendError::Source(error)),
+            None => {
+                return Err(QuicSendError::LengthMismatch {
+                    declared: total_len,
+                    delivered: 0,
+                });
+            }
+        };
+        let slot = self.stream_slot().await?;
+        let mut send = self.open(&header, metadata, Some(slot), progress).await?;
         let mut delivered: u64 = 0;
+        let mut next = Some(first);
         let failure = loop {
-            match send.race(chunks.next()).await? {
+            let item = match next.take() {
+                Some(chunk) => Some(Ok(chunk)),
+                None => send.race(chunks.next()).await?,
+            };
+            match item {
                 None if delivered == total_len => break None,
                 None => {
                     break Some(QuicSendError::LengthMismatch {
@@ -997,7 +1077,7 @@ impl QuicPath {
                         });
                     }
                     delivered += len;
-                    send.write_chunk(chunk).await?;
+                    send.write_fragments(chunk, observer).await?;
                 }
             }
         };
@@ -1019,29 +1099,32 @@ impl QuicPath {
     }
 
     /// One of the permits that cap streamed messages at
-    /// [`STREAMED_SEND_LIMIT`]; waits while all are taken.
-    async fn stream_slot(&self) -> Result<tokio::sync::SemaphorePermit<'_>, QuicSendError> {
-        // The semaphore is never closed, so acquire never fails.
-        self.stream_slots
-            .acquire()
-            .await
-            .map_err(|_| QuicSendError::Closed)
+    /// [`STREAMED_SEND_LIMIT`]; waits while all are taken, or until the
+    /// connection ends: the semaphore is never closed, so a waiter would
+    /// otherwise sit out its deadline holding on to a path that has ended.
+    async fn stream_slot(&self) -> Result<tokio::sync::OwnedSemaphorePermit, QuicSendError> {
+        let connection = self.connection.inner();
+        tokio::select! {
+            permit = Arc::clone(&self.stream_slots).acquire_owned() => {
+                permit.map_err(|_| QuicSendError::Closed)
+            }
+            error = connection.closed() => Err(error.into()),
+        }
     }
 
     /// Open a uni stream and write the header and metadata. Waits for a
     /// stream credit when the peer's [`super::config::MAX_UNI_STREAMS`] are
-    /// in use.
+    /// in use. The stream takes over `slot`.
     async fn open(
         &self,
         header: &FrameHeader,
         metadata: &[u8],
+        slot: Option<tokio::sync::OwnedSemaphorePermit>,
         progress: SendProgress,
     ) -> Result<Outgoing, QuicSendError> {
-        let mut send = Outgoing::new(
-            self.connection.inner().open_uni().await?,
-            self.aborts.clone(),
-            progress,
-        );
+        let stream = self.connection.inner().open_uni().await?;
+        progress.mark_opened();
+        let mut send = Outgoing::new(stream, self.aborts.clone(), slot, progress);
         send.write_all(&header.encode()).await?;
         if !metadata.is_empty() {
             send.write_all(metadata).await?;
@@ -1142,14 +1225,24 @@ struct Outgoing {
     closed: bool,
     /// The path's count of sends reset on this side.
     aborts: Arc<SendAborts>,
-    /// Set once the end of the stream is sent ([`bounded_send`]).
+    /// Told of each write, and of the end of the stream ([`bounded_send`]).
     progress: SendProgress,
+    /// The streamed-message permit, if this send takes one. Returned when the
+    /// stream is acknowledged, stopped or reset.
+    slot: Option<tokio::sync::OwnedSemaphorePermit>,
+    /// The end of the stream was sent and its outcome is not known yet.
+    awaiting_ack: bool,
 }
 
 type StoppedResult = Result<Option<quinn::VarInt>, quinn::StoppedError>;
 
 impl Outgoing {
-    fn new(send: quinn::SendStream, aborts: Arc<SendAborts>, progress: SendProgress) -> Self {
+    fn new(
+        send: quinn::SendStream,
+        aborts: Arc<SendAborts>,
+        slot: Option<tokio::sync::OwnedSemaphorePermit>,
+        progress: SendProgress,
+    ) -> Self {
         let stopped = Box::pin(send.stopped());
         Self {
             send,
@@ -1157,6 +1250,8 @@ impl Outgoing {
             closed: false,
             aborts,
             progress,
+            slot,
+            awaiting_ack: false,
         }
     }
 
@@ -1181,6 +1276,24 @@ impl Outgoing {
         self.written(written)
     }
 
+    /// Write `chunk` in pieces of at most `FRAGMENT_PAYLOAD_SIZE`, telling
+    /// `observer` of each. Each returns once quinn has buffered it, so they
+    /// follow flow control.
+    async fn write_fragments(
+        &mut self,
+        mut chunk: Bytes,
+        observer: Option<&dyn StreamProgressObserver>,
+    ) -> Result<(), QuicSendError> {
+        while !chunk.is_empty() {
+            let fragment = chunk.split_to(chunk.len().min(FRAGMENT_PAYLOAD_SIZE));
+            self.write_chunk(fragment).await?;
+            if let Some(observer) = observer {
+                observer.on_fragment_sent();
+            }
+        }
+        Ok(())
+    }
+
     async fn write_chunk(&mut self, chunk: Bytes) -> Result<(), QuicSendError> {
         let Self { send, stopped, .. } = self;
         let written = tokio::select! {
@@ -1198,7 +1311,10 @@ impl Outgoing {
     /// ([`SendAborts`]), which it is not.
     fn written(&mut self, written: Result<(), quinn::WriteError>) -> Result<(), QuicSendError> {
         match written {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.progress.step();
+                Ok(())
+            }
             Err(quinn::WriteError::Stopped(code)) => Err(self.stopped_early(Ok(Some(code)))),
             Err(
                 error @ (quinn::WriteError::ConnectionLost(_)
@@ -1248,7 +1364,10 @@ impl Outgoing {
         self.closed = true;
         self.send.finish().map_err(|_| QuicSendError::Closed)?;
         self.progress.mark_finished();
-        match (&mut self.stopped).await {
+        self.awaiting_ack = true;
+        let stopped = (&mut self.stopped).await;
+        self.awaiting_ack = false;
+        match stopped {
             Ok(None) => Ok(()),
             Ok(Some(code)) => Err(QuicSendError::Stopped(code.into_inner())),
             Err(quinn::StoppedError::ConnectionLost(error)) => {
@@ -1264,7 +1383,25 @@ impl Drop for Outgoing {
     /// mid-message, or an error return) is reset. quinn's own drop would
     /// FINISH it, and the receiver would take a cut-short message for one
     /// that simply ended early.
+    ///
+    /// A stream dropped while it waits for its acknowledgement goes on to the
+    /// end, so its permit waits with it, in a small task. There are at most
+    /// [`STREAMED_SEND_LIMIT`] per path, and each ends with the connection.
     fn drop(&mut self) {
         self.reset(reset_code::SENDER_ABORTED);
+        if !self.awaiting_ack {
+            return;
+        }
+        let Some(slot) = self.slot.take() else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let stopped = std::mem::replace(&mut self.stopped, Box::pin(std::future::pending()));
+        drop(runtime.spawn(async move {
+            let _ended = stopped.await;
+            drop(slot);
+        }));
     }
 }

@@ -1402,7 +1402,11 @@ impl QuicPathState {
         drop(GlobalExecutor::spawn(async move {
             let clock = session.hub.path_clock.clone();
             let outcome = path
-                .send_short_bounded(&clock, Duration::from_secs(5), &payload)
+                .send_short_bounded(
+                    &clock,
+                    crate::transport::quic::path::SendDeadlines::short(payload.len() as u64),
+                    &payload,
+                )
                 .await;
             session.note(|| format!("sent a short on the path: {outcome:?}"));
         }));
