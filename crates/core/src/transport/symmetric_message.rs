@@ -486,18 +486,17 @@ pub(crate) const QUIC_UPGRADE_SHIPPED_IN: Option<(u8, u8, u16)> = Some((0, 2, 14
 /// ignores it, so it is never offered: the offer could only time out, which
 /// would count against the upgrade success rate.
 ///
-/// A PREDICTION until [`QUIC_UPGRADE_NEGOTIATES_SHIPPED_IN`] records it: the
-/// release that first ships the negotiation (e5a-5b), per the wire-gated-floor
-/// rule in `docs/RELEASING.md`. Too high only delays upgrades. Until the crate
-/// reaches it, a node of this tree does not offer to another, because each
-/// reports a version below the floor.
+/// The release that first ships the negotiation (e5a-5b), frozen and recorded
+/// in [`QUIC_UPGRADE_NEGOTIATES_SHIPPED_IN`], per the wire-gated-floor rule in
+/// `docs/RELEASING.md`. Too high only delays upgrades.
 pub(crate) const QUIC_UPGRADE_NEGOTIATES_IN: (u8, u8, u16) = (0, 2, 154);
 
 /// Has the release [`QUIC_UPGRADE_NEGOTIATES_IN`] names shipped? Same use as
 /// [`QUIC_UPGRADE_SHIPPED_IN`]; checked by
 /// `negotiation_floor_tracks_the_shipping_release`.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) const QUIC_UPGRADE_NEGOTIATES_SHIPPED_IN: Option<(u8, u8, u16)> = None;
+pub(crate) const QUIC_UPGRADE_NEGOTIATES_SHIPPED_IN: Option<(u8, u8, u16)> =
+    Some(QUIC_UPGRADE_NEGOTIATES_IN);
 
 /// May an `Offer` be sent to a remote of `remote_version`? Fails closed like
 /// [`may_send_upgrade`], which this implies: the floor is above that one's

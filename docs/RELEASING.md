@@ -474,14 +474,11 @@ Current wire-gated floors:
 - `QUIC_UPGRADE_NEGOTIATES_IN` in the same file (the first release that answers
   a QUIC upgrade `Offer`, #5940 step e5a).
 
-  Set to **`(0, 2, 154)`**, the release intended to first ship the negotiation
-  (e5a-5b). Guarded by `QUIC_UPGRADE_NEGOTIATES_SHIPPED_IN`, now `None`, checked
-  by `symmetric_message.rs::negotiation_floor_tracks_the_shipping_release`. When
-  the 0.2.154 bump fails that test, set the marker to
-  `Some(QUIC_UPGRADE_NEGOTIATES_IN)` if the release carries the negotiation,
-  otherwise raise the floor; then freeze it. Too high only delays upgrades; too
-  low makes offers to peers that ignore them, which time out and count against
-  the upgrade success rate.
+  Frozen at **`(0, 2, 154)`**, the release that first ships the negotiation
+  (e5a-5b), recorded in `QUIC_UPGRADE_NEGOTIATES_SHIPPED_IN`, checked by
+  `symmetric_message.rs::negotiation_floor_tracks_the_shipping_release`. Too high
+  only delays upgrades; too low makes offers to peers that ignore them, which
+  time out and count against the upgrade success rate.
   `negotiation_floor_stays_above_every_release_that_ignores_an_offer` catches the
   floor being lowered. The simulation test
   `test_quic_shadow_real_version_offers_only_from_the_first_negotiating_release`
