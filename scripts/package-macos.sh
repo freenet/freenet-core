@@ -242,6 +242,19 @@ if [[ "$CREATE_DMG" == "true" ]]; then
             --wait
         xcrun stapler staple "$DMG_PATH"
         xcrun stapler validate "$DMG_PATH"
+
+        # A script's signature is held in extended attributes, so check that
+        # it survived into what users will actually install.
+        echo ">> Verifying the signature inside the DMG"
+        DMG_MOUNT="$(mktemp -d)"
+        hdiutil attach -nobrowse -readonly -mountpoint "$DMG_MOUNT" "$DMG_PATH" > /dev/null
+        verified=true
+        codesign --verify --deep --strict --verbose=2 "$DMG_MOUNT/Freenet.app" || verified=false
+        hdiutil detach "$DMG_MOUNT" > /dev/null
+        if [[ "$verified" != "true" ]]; then
+            echo "package-macos.sh: Freenet.app in the DMG fails verification" >&2
+            exit 1
+        fi
     fi
 
     echo ">> $DMG_PATH"

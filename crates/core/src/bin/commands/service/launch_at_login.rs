@@ -205,6 +205,9 @@ pub(super) fn launch_agent_plist_contents(program_arguments: &[String]) -> Strin
 /// Write the plist to disk, creating `~/Library/LaunchAgents` if needed.
 /// Does NOT activate the agent with launchctl: that's the caller's job
 /// (separated so the filesystem half is unit-testable on Linux).
+///
+/// Replaces the file atomically. launchd reads it at login, and a truncated
+/// plist would stop Freenet starting with nothing to repair it.
 #[allow(dead_code)]
 pub(super) fn write_launch_agent_plist_at(
     plist: &Path,
@@ -213,7 +216,9 @@ pub(super) fn write_launch_agent_plist_at(
     if let Some(parent) = plist.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(plist, launch_agent_plist_contents(program_arguments))
+    let temporary = plist.with_extension("plist.tmp");
+    std::fs::write(&temporary, launch_agent_plist_contents(program_arguments))?;
+    std::fs::rename(&temporary, plist)
 }
 
 /// Remove the plist. Idempotent: returns Ok if the file was already gone.

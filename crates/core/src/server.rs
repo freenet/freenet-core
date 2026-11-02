@@ -419,7 +419,7 @@ pub(crate) fn is_source_allowed(ip: IpAddr, allowed: &AllowedSourceCidrs) -> boo
 /// for a direct client. A forwarder that keeps the original `Host` needs
 /// `--allowed-host` instead. The lookup also costs a blocking `getaddrinfo`
 /// before the API starts listening, which took about 35 s on a macOS 26 CI
-/// runner and left the node unreachable for all of it (#5956).
+/// runner and left the node unreachable for all of it (see #5956).
 fn hostname_ips_are_reachable(bind_addr: IpAddr) -> bool {
     !bind_addr.is_loopback()
 }

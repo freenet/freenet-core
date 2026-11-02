@@ -1098,14 +1098,19 @@ mod tests {
     }
 
     #[test]
-    fn a_plist_rewrite_failure_is_reported_and_keeps_the_old_file() {
-        // The wrapper logs this. The old file still works through the script.
+    fn a_failed_plist_rewrite_keeps_the_old_file() {
+        // The old file still works through the script, so it must survive.
         let dir = tempfile::tempdir().unwrap();
-        let missing_parent = dir.path().join("file-not-dir");
-        std::fs::write(&missing_parent, "").unwrap();
-        let plist = missing_parent.join("agent.plist");
+        let plist = dir.path().join("agent.plist");
+        let old_args = vec!["/Applications/Freenet.app/Contents/MacOS/Freenet".to_string()];
+        write_launch_agent_plist_at(&plist, &old_args).unwrap();
+        let before = std::fs::read_to_string(&plist).unwrap();
+        // A directory where the temporary file goes makes the write fail.
+        std::fs::create_dir(plist.with_extension("plist.tmp")).unwrap();
+
         let exe = PathBuf::from("/Applications/Freenet.app/Contents/MacOS/freenet-bin");
         assert!(rewrite_launch_agent_plist_if_stale(&plist, &exe).is_err());
+        assert_eq!(std::fs::read_to_string(&plist).unwrap(), before);
     }
 
     #[test]

@@ -29,6 +29,11 @@ if [[ -z "${CI:-}" ]]; then
     exit 1
 fi
 
+# The wrapper, however it was started: LaunchServices passes no arguments,
+# launchd passes the subcommand. Must not match `freenet-bin network`.
+RUN_WRAPPER='Freenet.app/Contents/MacOS/freenet-bin( service run-wrapper)?$'
+NODE='Freenet.app/Contents/MacOS/freenet-bin network'
+
 cleanup() {
     for var in FREENET_OPEN_DRY_RUN FREENET_TELEMETRY_ENABLED DATA_DIR CONFIG_DIR; do
         launchctl unsetenv "$var" 2>/dev/null || true
@@ -37,11 +42,6 @@ cleanup() {
     pkill -f "$NODE" 2>/dev/null || true
 }
 trap cleanup EXIT
-
-# The wrapper, however it was started: LaunchServices passes no arguments,
-# launchd passes the subcommand. Must not match `freenet-bin network`.
-RUN_WRAPPER='Freenet.app/Contents/MacOS/freenet-bin( service run-wrapper)?$'
-NODE='Freenet.app/Contents/MacOS/freenet-bin network'
 
 BIN="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -134,7 +134,8 @@ stop_app() {
 }
 
 wait_for_status_item_count_above() {
-    for _ in $(seq 1 30); do
+    # A first launch of a debug build on a busy runner can take a while.
+    for _ in $(seq 1 60); do
         [[ "$("$OUT/status-item-count")" -gt "$1" ]] && return 0
         sleep 1
     done
@@ -151,52 +152,26 @@ wait_for_status_item_count_back_to() {
     return 1
 }
 
+# The icon checks below only mean anything on an OS with the bug (#6093). On
+# macOS 15 a broken bundle shows the icon as well.
 sw_vers
+[[ "$(sw_vers -productVersion | cut -d. -f1)" -ge 26 ]] \
+    || fail "this must run on macOS 26 or later, or the icon checks prove nothing"
 swiftc -O "$REPO/scripts/macos-status-item-count.swift" -o "$OUT/status-item-count"
-status_items_before="$("$OUT/status-item-count")"
+status_items_before="$("$OUT/status-item-count")" || fail "could not count the status items"
 
-# 2a. A Mac updated from before #6093 whose relaunch failed: nothing has
-# repaired its LaunchAgent, which runs the bundle's script, so its next login
-# looks like this. Freenet must start, show its icon, and repair the agent
-# without booting itself out.
 AGENT="gui/$(id -u)/org.freenet.Freenet"
 PLIST="$HOME/Library/LaunchAgents/org.freenet.Freenet.plist"
-mkdir -p "$(dirname "$PLIST")"
-cat > "$PLIST" <<XML
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-<key>Label</key><string>org.freenet.Freenet</string>
-<key>ProgramArguments</key><array><string>$APP/Contents/MacOS/Freenet</string></array>
-<key>RunAtLoad</key><true/>
-<key>KeepAlive</key><false/>
-<key>ProcessType</key><string>Interactive</string>
-</dict></plist>
-XML
-launchctl bootstrap "gui/$(id -u)" "$PLIST" || fail "could not load the old Launch-at-Login agent"
-wait_for_status_item_count_above "$status_items_before" \
-    || fail "the menu bar icon is not displayed when an old agent starts the app"
-migrated=false
-for _ in $(seq 1 15); do
-    if grep -qF "$APP/Contents/MacOS/freenet-bin" "$PLIST" && grep -qF run-wrapper "$PLIST"; then
-        migrated=true
-        break
-    fi
-    sleep 1
-done
-$migrated || fail "the app left a Launch-at-Login agent naming the script"
-wrapper_pid="$(pgrep -f "$RUN_WRAPPER" | sed -n 1p)"
-sleep 5
-kill -0 "$wrapper_pid" 2>/dev/null || fail "repairing its Launch-at-Login agent killed the wrapper"
-echo "ok - an old Launch-at-Login agent starts the app and is repaired"
-stop_app
-wait_for_status_item_count_back_to "$status_items_before" \
-    || fail "the status item outlived the app, so it was not Freenet's"
-launchctl bootout "$AGENT" >/dev/null 2>&1 || true
+rm -f "$PLIST"
 
-# 2b. Can the app start at all here? Launch it directly (no link) first, so a
-# failure below can be told apart: "the app cannot start in this environment"
-# vs "the link was not delivered".
+agent_starts_the_binary() {
+    grep -qF "$APP/Contents/MacOS/freenet-bin" "$PLIST" 2>/dev/null \
+        && grep -qF run-wrapper "$PLIST"
+}
+
+# 2b. A fresh install: can the app start at all here? Launch it directly (no
+# link) first, so a failure below can be told apart: "the app cannot start in
+# this environment" vs "the link was not delivered".
 open -a "$APP" || fail "open -a could not launch the app"
 started=false
 for _ in $(seq 1 30); do
@@ -222,10 +197,51 @@ echo "ok - Freenet.app starts via LaunchServices"
 wait_for_status_item_count_above "$status_items_before" \
     || fail "the menu bar icon is not displayed (before: $status_items_before)"
 echo "ok - the menu bar icon is displayed"
+agent_starts_the_binary || fail "the first launch did not register a Launch-at-Login agent"
+launchctl print "$AGENT" >/dev/null 2>&1 || fail "launchd did not load the new Launch-at-Login agent"
+echo "ok - the first launch registers a Launch-at-Login agent"
 stop_app
 wait_for_status_item_count_back_to "$status_items_before" \
     || fail "the status item outlived the app, so 2c did not observe Freenet's"
 echo "ok - the status item was Freenet's"
+launchctl bootout "$AGENT" >/dev/null 2>&1 || true
+
+# 2d. A Mac updated from before #6093 whose relaunch failed: nothing has
+# repaired its LaunchAgent, which runs the bundle's script, so its next login
+# looks like this. Freenet must start, show its icon, and repair the agent
+# without booting itself out.
+cat > "$PLIST" <<XML
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>org.freenet.Freenet</string>
+<key>ProgramArguments</key><array><string>$APP/Contents/MacOS/Freenet</string></array>
+<key>RunAtLoad</key><true/>
+<key>KeepAlive</key><false/>
+<key>ProcessType</key><string>Interactive</string>
+</dict></plist>
+XML
+launchctl bootstrap "gui/$(id -u)" "$PLIST" || fail "could not load the old Launch-at-Login agent"
+wait_for_status_item_count_above "$status_items_before" \
+    || fail "the menu bar icon is not displayed when an old agent starts the app"
+migrated=false
+for _ in $(seq 1 15); do
+    if agent_starts_the_binary; then
+        migrated=true
+        break
+    fi
+    sleep 1
+done
+$migrated || fail "the app left a Launch-at-Login agent naming the script"
+wrapper_pid="$(pgrep -f "$RUN_WRAPPER" | sed -n 1p || true)"
+[[ -n "$wrapper_pid" ]] || fail "repairing its Launch-at-Login agent ended the wrapper"
+sleep 5
+kill -0 "$wrapper_pid" 2>/dev/null || fail "repairing its Launch-at-Login agent killed the wrapper"
+echo "ok - an old Launch-at-Login agent starts the app and is repaired"
+stop_app
+wait_for_status_item_count_back_to "$status_items_before" \
+    || fail "the status item outlived the app, so it was not Freenet's"
+launchctl bootout "$AGENT" >/dev/null 2>&1 || true
 
 # 3. Clicking a link launches the app and the wrapper handles it. The dry run
 # stops the handler opening a browser; it is set for apps LaunchServices
@@ -288,7 +304,7 @@ grep -q 'outcome=invalid-link' "$LOG_DIR"/freenet-wrapper.*.log \
 echo "ok - a second link reaches the running instance, and a hostile one is refused"
 
 # 4. The instance started at login is launchd's, not LaunchServices'. Links
-# must reach that one too. Stop the app and load the agent repaired in 2a, as
+# must reach that one too. Stop the app and load the agent repaired in 2d, as
 # the next login will.
 stop_app
 wait_for_status_item_count_back_to "$status_items_before" \
@@ -302,6 +318,10 @@ wait_for_count 3 || fail "the launchd-started instance never handled the link"
 echo "ok - a link reaches the instance launchd started (as at login)"
 wait_for_status_item_count_above "$status_items_before" \
     || fail "the menu bar icon is not displayed when launchd starts the app"
+# launchd's copy, not a duplicate LaunchServices launched for the link, whose
+# command line has no subcommand.
+pgrep -f 'Freenet.app/Contents/MacOS/freenet-bin service run-wrapper$' >/dev/null \
+    || fail "launchd's wrapper is not the one running"
 echo "ok - the menu bar icon is displayed when launchd starts the app"
 launchctl bootout "$AGENT" >/dev/null 2>&1 || true
 
