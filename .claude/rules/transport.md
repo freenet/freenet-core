@@ -1520,8 +1520,9 @@ Sending (QuicPath::send_short_bounded / send_stream_bounded /
   first chunk for the gap, counted in total, and open runs from when it arrives.
   One timer per send, re-armed when it fires, as BodyReader. Messages are
   written in pieces of at most FRAGMENT_PAYLOAD_SIZE, each returning when quinn
-  has buffered it, and each is a step of the gap and one StreamProgressObserver
-  tick, so a slow upload does not read as stalled. A message that fits the send
+  has buffered it, and each is a step of the gap and, for a stream, one
+  StreamProgressObserver tick, so a slow upload does not read as stalled. A
+  message that fits the send
   window is buffered at once, so its gap never applies and only total ends its
   wait. quinn gives a write all the free credit without yielding, and send
   fairness orders packets, not writes, so a streamed send yields before each
@@ -1531,18 +1532,20 @@ Sending (QuicPath::send_short_bounded / send_stream_bounded /
   the driver would send the data before the end is queued, and the end would
   take a datagram of its own. Pinned on one thread by
   streams_on_a_path_take_turns_with_their_fragments, for streams and for shorts
-  past one packet; a multi-thread runtime is unmeasured. A send returns
+  past one packet; a multi-thread runtime is unmeasured, and more writers than
+  a step of credit has fragments can lag (quinn wakes blocked writers last in,
+  first out; about 14 fragments a step at the smallest window). A send returns
   Sent (every byte acked), MaybeDelivered(TimedOut | ConnectionLost) (the
   whole message was written and FIN queued, SendProgress set in
   Outgoing::finish, then the deadline passed or the connection was lost
   during the ack wait: the peer may have it, do not treat it as Failed),
   Failed(NotOpened(TimedOut | ConnectionLost)) (no stream ever existed, so the
-  message can go another way), or Failed(TimedOut | Error) (the stream was open
-  and did not finish, or a stop from the peer). After those two the receiver
+  message can go another way), or Failed(TimedOut | Error) (the stream did not
+  finish, or a stop from the peer, or a source that ended or failed before its
+  first chunk). After MaybeDelivered or any Failed but NotOpened the receiver
   may remember the id and may have dispatched the metadata, so a resend needs a
   fresh id: under the same id it drops UDP fragments while still acking them,
-  and cancels a QUIC stream. A source that ends or fails before its first chunk
-  is Failed(Error) and opened nothing, so its id is unused.
+  and cancels a QUIC stream.
   Dropping a send future resets its stream (Drop on Outgoing; quinn's own
   drop would FINISH it, which the receiver reads as a stream that ended
   early). A send dropped while waiting for acks after finish is not reset

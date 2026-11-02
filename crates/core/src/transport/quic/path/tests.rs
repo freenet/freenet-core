@@ -4053,44 +4053,48 @@ fn assert_writers_took_turns(log: &[u8], sends: u8, fragments: usize) {
 #[test]
 fn streams_on_a_path_take_turns_with_their_fragments() {
     bounded(|| async move {
-        let _seed = GlobalRng::seed_guard(SEED);
-        let streams: u8 = 4;
-        let mut p = paths("quic-path-turns", 83, QuicPathLimits::DEFAULT).await;
-        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let body = Bytes::from(payload(4 * MIB));
-        let mut sends = Vec::new();
-        for stream in 0..streams {
-            let (a, time, body, log) = (p.a.clone(), p.time(), body.clone(), log.clone());
-            sends.push(tokio::spawn(async move {
-                let turns = Turns(stream, log);
-                a.send_stream_bounded(
-                    &time,
-                    Duration::from_secs(300),
-                    StreamId::next(),
-                    None,
-                    body,
-                    Some(&turns),
-                )
-                .await
-            }));
+        for (streams, subnet, network) in
+            [(2u8, 88, "quic-path-turns-2"), (4, 83, "quic-path-turns-4")]
+        {
+            let _seed = GlobalRng::seed_guard(SEED);
+            let mut p = paths(network, subnet, QuicPathLimits::DEFAULT).await;
+            let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let body = Bytes::from(payload(4 * MIB));
+            let mut sends = Vec::new();
+            for stream in 0..streams {
+                let (a, time, body, log) = (p.a.clone(), p.time(), body.clone(), log.clone());
+                sends.push(tokio::spawn(async move {
+                    let turns = Turns(stream, log);
+                    a.send_stream_bounded(
+                        &time,
+                        Duration::from_secs(300),
+                        StreamId::next(),
+                        None,
+                        body,
+                        Some(&turns),
+                    )
+                    .await
+                }));
+            }
+            let mut arrivals =
+                std::mem::replace(&mut p.b_in.streams, tokio::sync::mpsc::channel(1).1);
+            let reader = tokio::spawn(async move {
+                let mut held = Vec::new();
+                while let Some(arrival) = arrivals.recv().await {
+                    held.push(arrival);
+                }
+            });
+            p.drive(async move {
+                for send in sends {
+                    let sent = send.await.expect("the send ran");
+                    assert!(matches!(sent, BoundedSend::Sent), "{sent:?}");
+                }
+            })
+            .await;
+            reader.abort();
+            let log = log.lock().unwrap();
+            assert_writers_took_turns(&log, streams, (4 * MIB).div_ceil(FRAGMENT_PAYLOAD_SIZE));
         }
-        let mut arrivals = std::mem::replace(&mut p.b_in.streams, tokio::sync::mpsc::channel(1).1);
-        let reader = tokio::spawn(async move {
-            let mut held = Vec::new();
-            while let Some(arrival) = arrivals.recv().await {
-                held.push(arrival);
-            }
-        });
-        p.drive(async move {
-            for send in sends {
-                let sent = send.await.expect("the send ran");
-                assert!(matches!(sent, BoundedSend::Sent), "{sent:?}");
-            }
-        })
-        .await;
-        reader.abort();
-        let log = log.lock().unwrap();
-        assert_writers_took_turns(&log, streams, (4 * MIB).div_ceil(FRAGMENT_PAYLOAD_SIZE));
     })
 }
 
@@ -4146,15 +4150,16 @@ fn a_one_packet_message_is_one_stream_frame() {
     })
 }
 
-/// So does the last fragment of a stream, with another stream active: the
-/// yield comes before a piece, never between the last piece and the end.
+/// So does the last fragment of a stream of two pieces while another send holds
+/// a permit, which is when pieces yield: the first piece goes in one STREAM
+/// frame, and the second leaves with the end of the stream, in another.
 #[test]
 fn the_end_of_a_stream_leaves_with_its_last_fragment() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
         let p = paths("quic-path-last-frame", 86, QuicPathLimits::DEFAULT).await;
         let (a, time) = (p.a.clone(), p.time());
-        let body = Bytes::from(payload(FRAGMENT_PAYLOAD_SIZE / 2));
+        let body = Bytes::from(payload(FRAGMENT_PAYLOAD_SIZE + 100));
         let frames = p
             .drive(async move {
                 let held = Arc::clone(&a.stream_slots)
@@ -4177,7 +4182,7 @@ fn the_end_of_a_stream_leaves_with_its_last_fragment() {
                 a.connection().inner().stats().frame_tx.stream - before
             })
             .await;
-        assert_eq!(frames, 1);
+        assert_eq!(frames, 2);
     })
 }
 

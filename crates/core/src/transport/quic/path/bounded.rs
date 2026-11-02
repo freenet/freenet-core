@@ -21,8 +21,6 @@
 //!   discards what arrived. The peer may still have seen the stream: it then
 //!   remembers the id, so a resend under that id is dropped, and it may have
 //!   dispatched the stream's metadata. Only a fresh id may send the data again.
-//!   A send that failed before opening a stream ([`SendFailure::Error`] from a
-//!   source with no first chunk) used nothing of the id.
 //!
 //! A caller must not treat `MaybeDelivered` as `Failed`: the two sides may
 //! disagree about whether the message arrived.
@@ -139,7 +137,9 @@ pub(crate) enum SendFailure {
     /// sent. The stream was reset.
     TimedOut,
     /// The send failed (`QuicSendError`), before the end of the stream was
-    /// sent, or after it with a stop from the peer.
+    /// sent, or after it with a stop from the peer. This includes a source that
+    /// ended or failed before its first chunk, where no stream was opened: such
+    /// a message cannot go another way either, so it is not `NotOpened`.
     Error(QuicSendError),
 }
 

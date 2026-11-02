@@ -1302,7 +1302,10 @@ impl Outgoing {
     /// yielding, so a stream with more to send would take every byte of credit
     /// in turn and the others would wait for it to finish: longer than the 5 s
     /// the receiver gives a stream to make progress, on a slow link. Yielding
-    /// gives each stream a fragment in turn.
+    /// gives each stream a fragment in turn, as far as a step of credit reaches:
+    /// quinn wakes blocked writers last in, first out, so with more writers than
+    /// a step of credit has fragments, some can lag. The smallest window is
+    /// about 14 fragments a step.
     ///
     /// Before a piece and not after it, and never before the first: a yield
     /// after the last piece lets the connection driver send the data before
