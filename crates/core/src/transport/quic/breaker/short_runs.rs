@@ -585,31 +585,42 @@ mod tests {
         );
     }
 
+    /// Run the timer against `time`.
+    fn run_timer(time: &VirtualTime, path: &Path) -> tokio::task::JoinHandle<()> {
+        let (time, path) = (time.clone(), path.to_path_buf());
+        tokio::spawn(async move { clear_after_short_run(&time, path, NONCE).await })
+    }
+
+    /// Wait until the timer has gone to sleep on `time`, so that an advance
+    /// reaches it. Bounded, so a timer that never sleeps fails the test.
+    async fn until_sleeping(time: &VirtualTime) {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while time.pending_wakeup_count() == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the timer never went to sleep");
+    }
+
     /// The timer clears the count at [`SHORT_RUN`], not before, and leaves a
     /// marker another run or a trip has replaced.
     #[tokio::test]
     async fn the_timer_clears_only_its_own_marker_after_a_short_run() {
         let dir = tempfile::tempdir().unwrap();
         let path = marker_path(dir.path());
-        let run_timer = |time: &VirtualTime| {
-            let time = time.clone();
-            let path = path.clone();
-            tokio::spawn(async move { clear_after_short_run(&time, path, NONCE).await })
-        };
-        let settle = || async {
-            for _ in 0..10 {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        };
 
         let time = VirtualTime::new();
         write_marker(&path, &marker_after(arm(1), T0, NONCE).unwrap()).unwrap();
-        let timer = run_timer(&time);
-        settle().await;
-        time.advance(SHORT_RUN - Duration::from_secs(1));
-        settle().await;
-        assert!(path.exists(), "one second before the limit");
-        time.advance(Duration::from_secs(1));
+        let timer = run_timer(&time, &path);
+        until_sleeping(&time).await;
+        assert_eq!(
+            time.next_wakeup_deadline(),
+            Some(SHORT_RUN.as_nanos() as u64),
+            "it wakes at the limit, not before"
+        );
+        assert!(path.exists());
+        time.advance(SHORT_RUN);
         timer.await.unwrap();
         assert!(!path.exists(), "the run has lasted the limit");
 
@@ -621,12 +632,26 @@ mod tests {
         ] {
             let time = VirtualTime::new();
             write_marker(&path, &marker).unwrap();
-            let timer = run_timer(&time);
-            settle().await;
+            let timer = run_timer(&time, &path);
+            until_sleeping(&time).await;
             time.advance(SHORT_RUN);
             timer.await.unwrap();
             assert!(path.exists(), "{marker:?} is not this run's");
         }
+    }
+
+    /// The real timer clears the count and then stays alive: the monitor reads
+    /// any end of a registered task as a node failure.
+    #[tokio::test(start_paused = true)]
+    async fn the_registered_timer_clears_the_count_and_does_not_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = marker_path(dir.path());
+        write_marker(&path, &marker_after(arm(1), T0, NONCE).unwrap()).unwrap();
+        let monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+        start_clear_timer(Some(&monitor.late_registrar()), path.clone(), NONCE);
+        let ended = tokio::time::timeout(100 * SHORT_RUN, monitor.wait_for_any_exit()).await;
+        assert!(ended.is_err(), "the monitor saw the timer end: {ended:?}");
+        assert!(!path.exists());
     }
 
     /// A removal that fails is tried again, and the tries are bounded.
@@ -637,28 +662,22 @@ mod tests {
         let path = marker_path(dir.path());
         std::fs::create_dir(&path).unwrap();
         let time = VirtualTime::new();
-        let timer = {
-            let (time, path) = (time.clone(), path.clone());
-            tokio::spawn(async move { clear_after_short_run(&time, path, NONCE).await })
-        };
+        let timer = run_timer(&time, &path);
         for _ in 0..CLEAR_ATTEMPTS {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            assert!(!timer.is_finished(), "still trying");
+            until_sleeping(&time).await;
             time.advance(SHORT_RUN);
         }
-        timer.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(30), timer)
+            .await
+            .expect("the tries are bounded")
+            .unwrap();
 
         // A failure, then the path is repaired: the second try clears it.
-        std::fs::remove_dir(&path).unwrap();
-        std::fs::create_dir(&path).unwrap();
         let time = VirtualTime::new();
-        let timer = {
-            let (time, path) = (time.clone(), path.clone());
-            tokio::spawn(async move { clear_after_short_run(&time, path, NONCE).await })
-        };
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        let timer = run_timer(&time, &path);
+        until_sleeping(&time).await;
         time.advance(SHORT_RUN);
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        until_sleeping(&time).await;
         std::fs::remove_dir(&path).unwrap();
         write_marker(&path, &marker_after(arm(0), T0, NONCE).unwrap()).unwrap();
         time.advance(SHORT_RUN);
