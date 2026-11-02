@@ -87,7 +87,7 @@ impl DataPath {
     }
 
     /// Let the virtual clock and every task run.
-    async fn settle(&self, by: Duration) {
+    pub(super) async fn settle(&self, by: Duration) {
         self.time.sleep(by).await;
     }
 }

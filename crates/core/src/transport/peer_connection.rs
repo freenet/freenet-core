@@ -1205,6 +1205,8 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
 
     /// Tell a test's trace what `recv` took from a path.
     #[cfg_attr(not(any(test, feature = "testing")), allow(unused_variables))]
+    /// Where a test's trace hears what data arrived by which route. At the
+    /// receiver, so it counts every send whichever code made it.
     fn note_quic_delivery(&self, what: impl FnOnce() -> String) {
         #[cfg(any(test, feature = "testing"))]
         if let Some(trace) = &self.upgrade_trace {
@@ -3170,6 +3172,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                 // redundant embedded-metadata copy, never the ShortMessage itself.
                 self.dispatched_msg_hashes.put(Self::msg_hash(&bytes), ());
                 self.sample_inbound_concurrency(true, queued_nanos);
+                self.note_quic_delivery(|| "received data on UDP, a short".to_string());
                 Ok(Some(bytes))
             }
             AckConnection { result: Err(cause) } => {
@@ -3261,6 +3264,9 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                 payload,
                 metadata_bytes,
             } => {
+                if fragment_number == 1 {
+                    self.note_quic_delivery(|| "received data on UDP, a stream".to_string());
+                }
                 let now_nanos = self.time_source.now_nanos();
                 if stream_id.is_caller_named() {
                     let accepted = self.process_operations_fragment(

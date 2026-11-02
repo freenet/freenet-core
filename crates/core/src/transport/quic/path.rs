@@ -167,8 +167,6 @@ use crate::transport::peer_connection::{embeds_metadata, fits_one_packet};
 pub(crate) use bounded::{BoundedSend, MaybeDelivered, NotOpened, SendDeadlines, SendFailure};
 use bounded::{SendProgress, bounded_send};
 pub(crate) use inbound::{InboundShort, InboundStreamArrival};
-#[cfg(test)]
-pub(crate) use route::{STALLED_SENDS_LIMIT, next_step};
 pub(crate) use route::{NextStep, QuicSendEvent, QuicSendResult, SendKind};
 
 /// Application error codes a receiver stops a stream with (STOP_SENDING),
@@ -408,7 +406,7 @@ quic_outcomes! {
 mod route;
 
 #[cfg(test)]
-mod tests;
+pub(in crate::transport) mod tests;
 
 impl QuicInboundOutcome {
     fn of_header_error(error: &HeaderError) -> Self {
@@ -1244,6 +1242,12 @@ impl QuicPath {
         }
         Ok(send)
     }
+}
+
+/// A frame that cannot be built, for `route`'s tests.
+#[cfg(test)]
+fn framing_error_for_tests() -> HeaderError {
+    FrameHeader::short(0).expect_err("a Short needs a length")
 }
 
 /// The first item of a chunk source: a source that ends or fails before it

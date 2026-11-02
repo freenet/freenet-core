@@ -71,6 +71,25 @@ pub(in crate::transport) struct Harness {
     now: Arc<AtomicU64>,
     /// What each session's paths deliver, kept open as a connection keeps it.
     inboxes: std::sync::Mutex<Vec<QuicDataInbox>>,
+    /// What each session sent on UDP from a path's queue.
+    udp: Arc<RecordingUdp>,
+}
+
+/// A UDP session that records the shorts it is given.
+#[derive(Default)]
+struct RecordingUdp {
+    shorts: std::sync::Mutex<Vec<Vec<u8>>>,
+}
+
+impl UdpShorts for RecordingUdp {
+    fn send_short(
+        &self,
+        payload: Vec<u8>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), crate::transport::TransportError>> + Send + '_>>
+    {
+        self.shorts.lock().unwrap().push(payload);
+        Box::pin(std::future::ready(Ok(())))
+    }
 }
 
 impl Harness {
@@ -119,6 +138,7 @@ impl Harness {
             peer,
             now: Arc::new(AtomicU64::new(0)),
             inboxes: std::sync::Mutex::new(Vec::new()),
+            udp: Arc::default(),
         }
     }
 
@@ -142,6 +162,7 @@ impl Harness {
             inbox,
             budget: SharedInboundBudget::new(16, 1 << 20),
             data,
+            udp: self.udp.clone(),
             quic_receipt_nanos: Arc::new(AtomicU64::new(0)),
             now: Arc::new(move || Duration::from_nanos(now.load(Ordering::Relaxed))),
             state: Mutex::new(SessionState {
@@ -186,7 +207,7 @@ pub(in crate::transport) struct DataPath {
     pub(in crate::transport) time: VirtualTime,
     _pair: Pair,
     peer: QuicPath,
-    _peer_inbound: QuicInbound,
+    peer_inbound: QuicInbound,
     ours: Option<Arc<QuicPath>>,
     _controls: mpsc::Receiver<Bytes>,
 }
@@ -194,6 +215,19 @@ pub(in crate::transport) struct DataPath {
 impl DataPath {
     pub(in crate::transport) fn peer(&self) -> &QuicPath {
         &self.peer
+    }
+
+    pub(in crate::transport) fn peer_inbound(&mut self) -> &mut QuicInbound {
+        &mut self.peer_inbound
+    }
+
+    /// The address the peer sends from.
+    pub(in crate::transport) fn peer_addr(&self) -> SocketAddr {
+        self._pair.a_addr
+    }
+
+    pub(in crate::transport) fn ours_handle(&self) -> Arc<QuicPath> {
+        Arc::clone(self.ours.as_ref().expect("the path has not ended"))
     }
 
     pub(in crate::transport) fn ours(&self) -> &QuicPath {
@@ -211,6 +245,26 @@ pub(in crate::transport) async fn data_path(
     network: &str,
     subnet: u8,
     limits: QuicPathLimits,
+    budget: SharedInboundBudget,
+    data: QuicDataSenders,
+) -> DataPath {
+    data_path_to(
+        network,
+        subnet,
+        limits,
+        QuicPathLimits::DEFAULT,
+        budget,
+        data,
+    )
+    .await
+}
+
+/// [`data_path`] to a peer with `peer_limits`.
+pub(in crate::transport) async fn data_path_to(
+    network: &str,
+    subnet: u8,
+    limits: QuicPathLimits,
+    peer_limits: QuicPathLimits,
     budget: SharedInboundBudget,
     data: QuicDataSenders,
 ) -> DataPath {
@@ -232,13 +286,13 @@ pub(in crate::transport) async fn data_path(
     .await;
     drop(permit);
     let time = pair.time.clone();
-    let (peer, peer_inbound) = QuicPath::new(client, time.clone());
+    let (peer, peer_inbound) = QuicPath::with_limits(client, time.clone(), peer_limits);
     let (ours, controls) = QuicPath::with_budget(server, time.clone(), limits, budget, data);
     DataPath {
         time,
         _pair: pair,
         peer,
-        _peer_inbound: peer_inbound,
+        peer_inbound,
         ours: Some(Arc::new(ours)),
         _controls: controls,
     }
@@ -605,9 +659,62 @@ fn a_path_follows_the_data_bits() {
                 live.sends_data()
             };
             assert!(!sends_data(&session), "{case}: not before the peer's frame");
+            assert!(session.data_route().is_none(), "{case}");
             ready_ack(&session, attempt, peer_caps);
             assert_eq!(sends_data(&session), sends, "{case}");
+            assert_eq!(session.data_route().is_some(), sends, "{case}");
         }
+    });
+}
+
+/// A path that ends stops taking sends at once, and what the session's route
+/// holds goes on UDP from a worker that outlives the attempt: the attempt's tasks
+/// are aborted, and nothing queued is lost. A peer's refusal takes the path off the
+/// route the same way, with the path up.
+#[test]
+fn a_route_ends_with_its_path_and_what_it_holds_goes_on_udp() {
+    use crate::transport::quic::control::caps;
+    use crate::transport::quic::path::{NextStep, SendKind, stop_code};
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let h = Harness::server_with("quic-driver-route", 35, "prefer", Some("100")).await;
+        let (session, inbox) = h.session();
+        let attempt = offered(&h, &session);
+        let up = path_up(&h, &session, inbox);
+        let time = h.pair.time.clone();
+        let (_peer_path, _peer_inbound, inbox) =
+            drive(&h.pair.time, Duration::from_secs(60), async move {
+                let up = up.await;
+                time.sleep(Duration::from_secs(1)).await;
+                up
+            })
+            .await;
+        ready_ack(&session, attempt, caps::DATA);
+        let route = session.data_route().expect("both bits");
+
+        let refused = crate::transport::quic::path::tests::stopped(stop_code::NOT_ACCEPTING_DATA);
+        assert_eq!(
+            route.path().settle(SendKind::Stream, &refused, false),
+            NextStep::SendOnUdp
+        );
+        assert!(session.data_route().is_none(), "a refused path takes no sends");
+        assert!(route.path().quinn_connection().close_reason().is_none());
+        // The route still takes what a connection read a moment ago.
+        for i in 0..10u8 {
+            route.queue_short(vec![i]).expect("the queue has room");
+        }
+        session.end();
+        assert!(session.data_route().is_none());
+        let time = h.pair.time.clone();
+        let udp = Arc::clone(&h.udp);
+        drive(&h.pair.time, Duration::from_secs(60), async move {
+            time.sleep(Duration::from_secs(1)).await;
+            drop(inbox);
+            let mut shorts = udp.shorts.lock().unwrap().clone();
+            shorts.sort();
+            assert_eq!(shorts, (0..10u8).map(|i| vec![i]).collect::<Vec<_>>());
+        })
+        .await;
     });
 }
 

@@ -23,6 +23,10 @@ use crate::transport::peer_connection::streaming::{
 use crate::transport::peer_connection::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
 use crate::transport::peer_connection::streaming_handle_idle_timeout;
 
+mod route;
+
+pub(in crate::transport) use route::stopped;
+
 /// How long, in virtual time, a test's traffic may take.
 const LIMIT: Duration = Duration::from_secs(600);
 
@@ -2077,10 +2081,10 @@ fn a_stop_from_the_peer_is_not_counted_as_a_reset() {
 
 /// Drops every datagram sent from the listed addresses on `network` while
 /// it lives.
-struct DropFrom(String);
+pub(in crate::transport) struct DropFrom(String);
 
 impl DropFrom {
-    fn new(network: &str, from: &[SocketAddr]) -> Self {
+    pub(in crate::transport) fn new(network: &str, from: &[SocketAddr]) -> Self {
         use crate::transport::in_memory_socket::{
             PacketDeliveryDecision, set_packet_delivery_callback,
         };
