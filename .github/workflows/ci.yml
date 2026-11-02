@@ -1196,6 +1196,12 @@ jobs:
       - name: Test freenet:// handler binary
         run: cargo nextest run -p freenet --profile ci --test url_scheme_handler
 
+      # The QUIC crash-loop breaker through the real process (#6031). Its
+      # decision is tested on every platform; only this reaches the Windows
+      # branch in the binary.
+      - name: Test QUIC breaker on Windows
+        run: cargo nextest run -p freenet --profile ci --test quic_breaker_windows
+
       # And through real protocol activation: Start-Process hands the link to
       # Windows, which looks up HKCU\Software\Classes\freenet and runs the
       # handler. No node runs here, so the handler writes its "not running"

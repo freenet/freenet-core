@@ -2545,8 +2545,7 @@ pub struct NetworkArgs {
     )]
     pub quic_data_percent: Option<String>,
 
-    /// Run QUIC even when the crash-loop breaker would keep it off (unix
-    /// only; the breaker is off on Windows).
+    /// Run QUIC even when the crash-loop breaker would keep it off.
     ///
     /// If a run with QUIC enabled ends abnormally, the node starts with QUIC
     /// off for 24 hours. Set this to run QUIC anyway. Default: false.

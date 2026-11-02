@@ -410,8 +410,8 @@ async fn run_network_node_with_signals(
         .context("failed to install SIGTERM handler")?;
     // The QUIC crash-loop breaker arms its marker only from here on (#5940):
     // a SIGTERM before the handler exists ends the node without its clean
-    // exit, which would read as a crash.
-    #[cfg(unix)]
+    // exit, which would read as a crash. Windows has no such handler and arms
+    // once the transport is up.
     freenet::quic_breaker_signals_ready();
 
     // Set when THIS process asks the node to stop because an operator signalled

@@ -390,6 +390,7 @@ pub(crate) async fn open_udp_transport<S: Socket>(
     is_gateway: bool,
     config: UdpTransportConfig,
 ) -> Result<super::TransportHandle, TransportError> {
+    let task_registrar = config.task_registrar.clone();
     let (outbound, inbound, listen_task) =
         bind_udp_listener::<S>(keypair, listen_host, listen_port, is_gateway, config).await?;
     // The QUIC crash-loop breaker (#5940) arms only now, with the socket
@@ -398,6 +399,7 @@ pub(crate) async fn open_udp_transport<S: Socket>(
     // arming follows the endpoint immediately.
     super::quic::breaker::arm_if_quic_up(
         outbound.quic_availability().get() == super::quic::liveness::QuicAvailability::Up,
+        task_registrar.as_ref(),
     );
     Ok(udp_transport_handle(outbound, inbound, listen_task))
 }

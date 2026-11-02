@@ -6,11 +6,14 @@
 //! the same failure; the breaker bounds that to one restart with QUIC per
 //! cooldown.
 //!
-//! **Unix only.** On Windows the breaker is off: QUIC runs exactly as
-//! configured and no marker is read or written. Every design tried for
-//! Windows read a normal stop (a logoff, a Fast Startup shutdown, a session
-//! end) as a crash or missed a real one, and none could be checked on a
-//! Windows machine; see the tracking issue linked from #6029.
+//! **This module doc describes unix.** Windows does not reliably tell a
+//! process that it is being stopped: every design that tried to tell a crash
+//! from a normal stop there (a logoff, a Fast Startup shutdown, a session end)
+//! got one of them wrong. So Windows does not ask. It counts runs that ended
+//! within ten minutes, for any reason, and three in a row keep QUIC off for
+//! the same cooldown, with the same state and telemetry. [`short_runs`]
+//! describes it. QUIC stays off by default on Windows until that has been
+//! confirmed on a real Windows machine (#6031).
 //!
 //! # The marker
 //!
@@ -122,6 +125,10 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
+use crate::node::background_task_monitor::LateRegistrar;
+
+mod short_runs;
+
 /// How long QUIC stays off after a run with QUIC enabled ended abnormally.
 pub(crate) const QUIC_BREAKER_COOLDOWN: Duration = Duration::from_secs(24 * 60 * 60);
 
@@ -161,6 +168,7 @@ static PENDING: parking_lot::Mutex<Pending> = parking_lot::Mutex::new(Pending {
     marker: None,
     quic_up: false,
     signals_ready: false,
+    registrar: None,
 });
 
 /// The marker this process armed and its nonce, for the clean exit.
@@ -226,6 +234,13 @@ pub(crate) enum Marker {
     },
     /// The breaker tripped at this time (seconds since the Unix epoch).
     Tripped { tripped_at_secs: u64 },
+    /// Windows: a run with QUIC enabled started at this time, after
+    /// `short_runs` short runs in a row. See [`short_runs`].
+    ShortRuns {
+        short_runs: u32,
+        started_at_secs: u64,
+        nonce: u64,
+    },
     /// A state this binary does not know, written by a later release.
     #[serde(other)]
     Unknown,
@@ -290,8 +305,8 @@ pub(crate) struct Gated<T> {
 /// What the breaker decided at this start.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BreakerOutcome {
-    /// The breaker did not run: it is not enabled (tests and embedders), the
-    /// platform is not unix, or `transport-quic` is off.
+    /// The breaker did not run: it is not enabled (tests and embedders) or
+    /// `transport-quic` is off.
     NotConsulted,
     /// The breaker ran and decided this.
     Decided(Verdict),
@@ -329,9 +344,12 @@ pub(crate) fn verdict(facts: &Facts<'_>) -> Verdict {
             }
         }
         Previous::Nothing
-        | Previous::Marker(Marker::Armed { .. } | Marker::Tripped { .. } | Marker::Unknown) => {
-            Verdict::Arm
-        }
+        | Previous::Marker(
+            Marker::Armed { .. }
+            | Marker::Tripped { .. }
+            | Marker::ShortRuns { .. }
+            | Marker::Unknown,
+        ) => Verdict::Arm,
     }
 }
 
@@ -449,8 +467,8 @@ fn observe_with(
 /// keeps QUIC off, and [`Gated::breaker`] says what it decided.
 /// Logs the outcome and updates the transport telemetry. `now` is the wall
 /// clock of the caller's `TimeSource`. May wait up to `drain_secs` plus
-/// [`HOLDER_EXIT_MARGIN`] for a previous node to exit. On Windows it returns
-/// `settings` unchanged.
+/// [`HOLDER_EXIT_MARGIN`] for a previous node to exit. Windows decides by
+/// [`short_runs::gate`] instead, and does not wait.
 pub(crate) async fn gate<T>(
     settings: Option<T>,
     data_dir: &Path,
@@ -462,8 +480,11 @@ pub(crate) async fn gate<T>(
         settings,
         breaker: BreakerOutcome::NotConsulted,
     };
-    if !ENABLED.load(Ordering::Relaxed) || cfg!(not(unix)) {
+    if !ENABLED.load(Ordering::Relaxed) {
         return not_consulted(settings);
+    }
+    if cfg!(not(unix)) {
+        return short_runs::gate(settings, data_dir, ignore_breaker, now);
     }
     // The wrapper's note when it passed one; otherwise the note at its fixed
     // place, which may be meant for another node (`shared`).
@@ -622,10 +643,11 @@ async fn wait_for_exit<Sleep: std::future::Future<Output = ()>>(
 /// The transport is up; `quic_up` says whether its QUIC endpoint was built.
 /// Arms a pending marker if the signal handlers are already installed. A
 /// start that fails to bind, or whose endpoint could not be built, leaves no
-/// marker.
-pub(crate) fn arm_if_quic_up(quic_up: bool) {
+/// marker. `registrar` registers the Windows short-run timer.
+pub(crate) fn arm_if_quic_up(quic_up: bool, registrar: Option<&LateRegistrar>) {
     let mut pending = PENDING.lock();
     pending.quic_up = quic_up;
+    pending.registrar = registrar.cloned();
     arm_when_ready(&mut pending);
 }
 
@@ -634,6 +656,7 @@ struct Pending {
     marker: Option<(PathBuf, Marker)>,
     quic_up: bool,
     signals_ready: bool,
+    registrar: Option<LateRegistrar>,
 }
 
 /// Write the pending marker once the endpoint is up and the signal handlers
@@ -643,16 +666,20 @@ fn arm_when_ready(pending: &mut Pending) {
     if !(pending.quic_up && pending.signals_ready) {
         return;
     }
-    if let Some(armed) = arm(pending.marker.take()) {
+    let counts_short_runs = matches!(pending.marker, Some((_, Marker::ShortRuns { .. })));
+    if let Some((path, nonce)) = arm(pending.marker.take()) {
+        if counts_short_runs {
+            short_runs::start_clear_timer(pending.registrar.as_ref(), path.clone(), nonce);
+        }
         // One node per process in production; a second keeps the first.
-        let _first_wins = ARMED.set(armed);
+        let _first_wins = ARMED.set((path, nonce));
     }
 }
 
 /// Write `pending`. Returns the marker's path and nonce when it was written.
 fn arm(pending: Option<(PathBuf, Marker)>) -> Option<(PathBuf, u64)> {
     let (path, marker) = pending?;
-    let Marker::Armed { nonce, .. } = marker else {
+    let (Marker::Armed { nonce, .. } | Marker::ShortRuns { nonce, .. }) = marker else {
         return None;
     };
     match write_marker(&path, &marker) {
@@ -703,8 +730,8 @@ fn cooling(tripped_at_secs: u64, now_secs: u64) -> bool {
         && tripped_at_secs <= now_secs.saturating_add(cooldown)
 }
 
-/// Remove the marker at `path` if it is Armed with `nonce`; otherwise leave
-/// it. See the module docs for the window between the read and the removal.
+/// Remove the marker at `path` if it is this run's, with `nonce`; otherwise
+/// leave it. See the module docs for the window between the read and the removal.
 fn clear_if_owned(path: &Path, nonce: u64) -> std::io::Result<()> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
@@ -712,7 +739,11 @@ fn clear_if_owned(path: &Path, nonce: u64) -> std::io::Result<()> {
         Err(error) => return Err(error),
     };
     match serde_json::from_slice::<Marker>(&bytes) {
-        Ok(Marker::Armed { nonce: owner, .. }) if owner == nonce => remove_if_exists(path),
+        Ok(Marker::Armed { nonce: owner, .. } | Marker::ShortRuns { nonce: owner, .. })
+            if owner == nonce =>
+        {
+            remove_if_exists(path)
+        }
         _ => Ok(()),
     }
 }
@@ -785,8 +816,8 @@ mod platform {
         (rc == 0 && boot.tv_sec > 0).then(|| format!("{}.{}", boot.tv_sec, boot.tv_usec))
     }
 
-    /// Unknown on other platforms (and unused on Windows, where the breaker
-    /// is off).
+    /// Unknown on other platforms (and unused on Windows, which counts short
+    /// runs instead).
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     pub(super) fn boot_id() -> Option<String> {
         None
@@ -808,7 +839,7 @@ mod platform {
         rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
 
-    /// Unused: the breaker is off where this applies.
+    /// Unused: Windows counts short runs instead.
     #[cfg(not(unix))]
     pub(super) fn pid_alive(_pid: u32) -> bool {
         false
@@ -1147,6 +1178,7 @@ mod tests {
             marker: Some((path.clone(), marker.clone())),
             quic_up,
             signals_ready,
+            registrar: None,
         };
         for (quic_up, signals_ready) in [(false, false), (true, false), (false, true)] {
             let mut p = pending(quic_up, signals_ready);
@@ -1159,6 +1191,41 @@ mod tests {
         assert_eq!(read_previous(&path), Previous::Marker(marker));
         assert!(p.marker.is_none(), "written once");
         assert_eq!(arm(None), None, "nothing pending");
+    }
+
+    /// A Windows marker gets the timer that clears it, registered with the
+    /// monitor, when it is written; a unix marker does not.
+    #[tokio::test]
+    async fn only_a_short_run_marker_starts_the_timer() {
+        let monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+        let registrar = monitor.late_registrar();
+        let dir = tempfile::tempdir().unwrap();
+        let path = marker_path(dir.path());
+        let short_run_marker = Marker::ShortRuns {
+            short_runs: 1,
+            started_at_secs: T0,
+            nonce: 7,
+        };
+        let arm_now = |marker: Marker, registrar: Option<LateRegistrar>| {
+            arm_when_ready(&mut Pending {
+                marker: Some((path.clone(), marker)),
+                quic_up: true,
+                signals_ready: true,
+                registrar,
+            })
+        };
+
+        arm_now(marker_of(armed(PID, Some(BOOT))), Some(registrar.clone()));
+        assert!(registrar.registered().is_empty());
+
+        arm_now(short_run_marker.clone(), Some(registrar.clone()));
+        assert_eq!(registrar.registered(), vec![short_runs::TIMER_TASK]);
+
+        // Without a registrar the run goes on, with no timer.
+        std::fs::remove_file(&path).unwrap();
+        arm_now(short_run_marker.clone(), None);
+        assert_eq!(read_previous(&path), Previous::Marker(short_run_marker));
+        assert_eq!(registrar.registered().len(), 1);
     }
 
     /// `gate` does nothing while the breaker is not enabled, which is every
@@ -1218,6 +1285,27 @@ mod tests {
             flat[after..].starts_with("(previous,armed_pid_alive)=reread_after_wait(&path,"),
             "gate must re-read the marker right after waiting for its holder"
         );
+    }
+
+    /// Windows is the one platform that decides by short runs, and it does so
+    /// only when the breaker is enabled. `gate` is inert in unit tests and the
+    /// branch cannot be taken on unix, so this pins the two lines; the
+    /// real-process test is `tests/quic_breaker_windows.rs`.
+    #[test]
+    fn gate_sends_windows_to_the_short_run_decision_after_the_enabled_check() {
+        let flat: String =
+            production_fn_body(include_str!("breaker.rs"), "pub(crate) async fn gate<T>(")
+                .split_whitespace()
+                .collect();
+        let enabled = flat
+            .find("if!ENABLED.load(Ordering::Relaxed){returnnot_consulted(settings);}")
+            .expect("the enabled check");
+        let windows = flat
+            .find(
+                "ifcfg!(not(unix)){returnshort_runs::gate(settings,data_dir,ignore_breaker,now);}",
+            )
+            .expect("the Windows branch");
+        assert!(enabled < windows);
     }
 
     /// The body of the production function whose definition starts with
@@ -1306,6 +1394,10 @@ mod tests {
         let src: String = include_str!("../connection_handler.rs")
             .split_whitespace()
             .collect();
+        assert!(
+            src.contains("QuicAvailability::Up,task_registrar.as_ref(),"),
+            "the transport must pass the node's registrar for the short-run timer"
+        );
         assert_eq!(
             src.matches("arm_if_quic_up(").count(),
             1,

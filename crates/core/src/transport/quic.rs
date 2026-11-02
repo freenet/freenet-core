@@ -82,8 +82,9 @@ pub(crate) use liveness::QuicAvailabilityWatch;
 /// Whether the node may use QUIC: the `transport-quic` config key.
 ///
 /// Off is the default on every platform, and must stay the default on
-/// Windows until the crash-loop breaker works there (#6031): the breaker is
-/// unix-only ([`breaker`]).
+/// Windows until the crash-loop breaker has been confirmed on a real Windows
+/// machine (#6031). That breaker counts short runs instead of detecting
+/// crashes ([`breaker`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum QuicMode {
     /// No QUIC endpoint is built and no QUIC datagram is read. The default.
