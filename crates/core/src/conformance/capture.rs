@@ -971,6 +971,13 @@ async fn run_writer(
                     // per-contract page must see the same two counts here.
                     judged = report.judged.len(),
                     without_verdict = report.without_verdict,
+                    // Cases the probes left out. A law held on the cases that ran, so
+                    // these bound what a clean result covers. Reporting only.
+                    cases_skipped_oversized = report.skips.oversized,
+                    cases_skipped_budget = report.skips.budget_cut,
+                    cases_not_sampled = report.skips.not_sampled,
+                    probed_all_oversized = report.probed_all_oversized,
+                    refused_too_large = report.refused_too_large,
                     "conformance shadow tick"
                 );
 
@@ -1011,6 +1018,10 @@ async fn run_writer(
                     report.judged.len(),
                     report.without_verdict,
                     tokio::time::Instant::now(),
+                );
+                // After the publish, which clears it. See `status::publish_skips`.
+                crate::conformance::status::publish_skips(
+                    crate::conformance::status::TickSkips::of(&report),
                 );
             }
         }
@@ -1100,7 +1111,7 @@ pub(crate) struct TrackedContract {
     /// observation was refused. The count comes from the filter that does the
     /// refusing rather than being inferred later from an empty result, because an
     /// empty corpus has several possible causes and they need telling apart.
-    refused_too_large: u64,
+    pub(crate) refused_too_large: u64,
     /// Most recent state seen for each related contract this one referenced.
     ///
     /// Keyed by instance, so a contract that references the same related contract
@@ -2682,6 +2693,30 @@ mod probe_wiring_pins {
 
     /// Index of the barren-tick publish in source order.
     const BARREN_PUBLISH: usize = 0;
+
+    /// #6044: the completed-probe tick hands the report's skip counts to the status
+    /// snapshot, AFTER the publish that clears them. Pinned because `run_writer` is a
+    /// select loop no test can call; the counts themselves are tested through
+    /// `ShadowReport` and `TickSkips::of`.
+    #[test]
+    fn the_probe_tick_publishes_its_skip_counts_after_the_publish() {
+        let body = run_writer_code_only();
+        let publish = publish_call_sites()[PROBE_PUBLISH];
+        let skips = body
+            .find("status::publish_skips(")
+            .expect("run_writer no longer publishes the tick's skip counts");
+        assert!(
+            skips > publish,
+            "the skip counts are published before `publish`, which clears them"
+        );
+        let call = &body[skips..];
+        let end = call.find(");").expect("unterminated call");
+        assert!(
+            call[..end].contains("TickSkips::of(&report)"),
+            "the skip counts must come from the tick's report, got: {}",
+            &call[..end]
+        );
+    }
 
     /// Every `status::publish` call site in `run_writer`, in source order.
     fn publish_call_sites() -> Vec<usize> {

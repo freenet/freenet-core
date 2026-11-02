@@ -178,8 +178,7 @@ pub struct GeneratorConfig {
     /// its size cap is exactly that shape (#5705). [`generate_cases_counted`]
     /// counts the cases skipped for size and for the case budget per property, and
     /// `fdev verify-merge` reports them, along with the cases sampling left out
-    /// ([`GeneratedCases::not_sampled`]). The shadow prober still uses the uncounted
-    /// [`generate_cases`]; see #6044.
+    /// ([`GeneratedCases::not_sampled`]), as does the shadow prober.
     ///
     /// Raising this is not purely additive for associativity: its cap then fills
     /// with triples containing the big states, which are queued first, so triples of
@@ -258,7 +257,9 @@ pub struct GeneratedCases {
 impl GeneratedCases {
     /// Over-size cases across every property.
     pub fn oversized_total(&self) -> usize {
-        self.oversized.iter().map(|(_, n)| n).sum()
+        self.oversized
+            .iter()
+            .fold(0usize, |total, (_, n)| total.saturating_add(*n))
     }
 
     /// Unsampled cases across every property.
@@ -270,7 +271,9 @@ impl GeneratedCases {
 
     /// Budget-cut cases across every property.
     pub fn budget_cut_total(&self) -> usize {
-        self.budget_cut.iter().map(|(_, n)| n).sum()
+        self.budget_cut
+            .iter()
+            .fold(0usize, |total, (_, n)| total.saturating_add(*n))
     }
 }
 
