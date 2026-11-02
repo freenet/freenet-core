@@ -411,6 +411,17 @@ pub(crate) fn is_source_allowed(ip: IpAddr, allowed: &AllowedSourceCidrs) -> boo
     allowed.contains_ip(&match_ip)
 }
 
+/// Whether a client could reach this bind address at the machine's own IPs.
+///
+/// A loopback listener cannot be reached at a LAN address, so resolving the
+/// machine's hostname to allow those addresses as `Host` values gains nothing.
+/// It also costs a blocking `getaddrinfo` before the API starts listening,
+/// which took about 35 s on a macOS 26 CI runner and left the node unreachable
+/// for all of it (#5956).
+fn hostname_ips_are_reachable(bind_addr: IpAddr) -> bool {
+    !bind_addr.is_loopback()
+}
+
 /// Builds the allowlist of hostnames/IPs for WebSocket `Host` header validation.
 ///
 /// Each entry is stored with and without the port suffix so both
@@ -423,7 +434,7 @@ fn build_allowed_hosts(
     let mut hosts = HostAllowlistBuilder::new(port);
 
     hosts.add_localhost();
-    hosts.add_machine_hostname();
+    hosts.add_machine_hostname(bind_addr);
 
     if !bind_addr.is_unspecified() {
         // Bracket IPv6 literals. A `Host` header carries `[::1]:7509`, never
@@ -471,14 +482,16 @@ impl HostAllowlistBuilder {
         self.add("[::1]");
     }
 
-    fn add_machine_hostname(&mut self) {
+    fn add_machine_hostname(&mut self, bind_addr: IpAddr) {
         let Ok(name) = hostname::get() else { return };
         let Some(name_str) = name.to_str() else {
             return;
         };
 
         self.add(name_str);
-        self.resolve_hostname_ips(name_str);
+        if hostname_ips_are_reachable(bind_addr) {
+            self.resolve_hostname_ips(name_str);
+        }
     }
 
     fn resolve_hostname_ips(&mut self, hostname: &str) {
@@ -867,6 +880,37 @@ mod tests {
         if let Ok(name) = hostname::get() {
             if let Some(name_str) = name.to_str() {
                 assert!(hosts.contains(&name_str.to_lowercase()));
+            }
+        }
+    }
+
+    #[test]
+    fn hostname_ips_are_only_resolved_for_a_bind_reachable_at_them() {
+        for loopback in [
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)),
+            IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+        ] {
+            assert!(!hostname_ips_are_reachable(loopback), "{loopback}");
+        }
+        for reachable in [
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 2)),
+        ] {
+            assert!(hostname_ips_are_reachable(reachable), "{reachable}");
+        }
+    }
+
+    #[test]
+    fn a_loopback_bind_still_allows_the_machine_hostname() {
+        // The name stays allowed: a hosts-file entry can map it to loopback,
+        // and such a client sends `Host: <hostname>:7509`.
+        let hosts = build_allowed_hosts(IpAddr::V4(Ipv4Addr::LOCALHOST), 7509, &[]);
+        if let Ok(name) = hostname::get() {
+            if let Some(name_str) = name.to_str() {
+                assert!(hosts.contains(&name_str.to_lowercase()));
+                assert!(hosts.contains(&format!("{}:7509", name_str.to_lowercase())));
             }
         }
     }
