@@ -82,10 +82,10 @@ trap cleanup EXIT
 #   $4 = marker file the launched process writes its version into on
 #        startup (so we can assert which version is running).
 build_bundle() {
-    # layout is `current`, what package-macos.sh ships now, or `script`, the
-    # layout of every release before #6093, whose CFBundleExecutable was a
-    # shell script. An installed `script` bundle is what the first update
-    # after that change replaces.
+    # layout is `current`, where CFBundleExecutable is the real binary as
+    # package-macos.sh now ships it, or `script`, the layout of every release
+    # before #6093, where it was a shell script. An installed `script` bundle
+    # is what the first update after that change replaces.
     local dest="$1" version="$2" lifetime="$3" marker="$4" layout="${5:-current}"
     local executable=freenet-bin
     [[ "$layout" == script ]] && executable=Freenet

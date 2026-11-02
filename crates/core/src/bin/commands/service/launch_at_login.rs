@@ -407,8 +407,8 @@ pub(crate) fn toggle_launch_at_login_outcome(
 /// upgraded via a new DMG install location, etc.), rewrite it. Idempotent:
 /// no-op when the plist is already current, or when Launch at Login is
 /// disabled, or when we can't figure out the expected location.
-#[allow(dead_code)]
-pub(super) fn refresh_launch_at_login_plist_if_stale() {
+#[cfg(target_os = "macos")]
+pub(super) fn refresh_launch_at_login_plist_if_stale(log_dir: &Path) {
     if !is_launch_at_login_enabled() {
         return;
     }
@@ -418,20 +418,33 @@ pub(super) fn refresh_launch_at_login_plist_if_stale() {
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
-    let args = launch_agent_program_arguments(&exe);
-    let Some(leader) = args.first() else {
-        return;
-    };
-    if launch_agent_plist_has_expected_leader(&plist, leader) {
-        return;
+    match rewrite_launch_agent_plist_if_stale(&plist, &exe) {
+        Ok(true) => log_wrapper_event(log_dir, "Refreshed stale Launch at Login agent"),
+        Ok(false) => {}
+        Err(e) => log_wrapper_event(
+            log_dir,
+            &format!("Failed to refresh Launch at Login agent: {e}"),
+        ),
     }
-    tracing::info!(
-        "Refreshing stale Launch at Login plist (was pointing elsewhere, now {})",
-        leader
-    );
-    if let Err(e) = enable_launch_at_login(&exe) {
-        tracing::warn!("Failed to refresh Launch at Login plist: {}", e);
+}
+
+/// Point the plist at `exe` if it names anything else, returning whether it
+/// changed. launchd reads the file at the next login.
+///
+/// Only writes the file. Going through `enable_launch_at_login` would boot the
+/// agent out, and this wrapper may be that agent: launchd would kill it on the
+/// spot, at every login, before anything was rewritten.
+#[allow(dead_code)]
+pub(super) fn rewrite_launch_agent_plist_if_stale(
+    plist: &Path,
+    exe: &Path,
+) -> std::io::Result<bool> {
+    let args = launch_agent_program_arguments(exe);
+    if launch_agent_plist_has_expected_leader(plist, &args[0]) {
+        return Ok(false);
     }
+    write_launch_agent_plist_at(plist, &args)?;
+    Ok(true)
 }
 
 /// Returns true if the legacy `org.freenet.node` LaunchAgent plist
@@ -969,7 +982,7 @@ pub(super) fn macos_launch_at_login_startup(log_dir: &Path) {
             // resurrect a rewrite cycle on a legacy-only install (own plist
             // absent), and don't fight a user who deliberately disabled it.
             if is_launch_at_login_enabled() {
-                refresh_launch_at_login_plist_if_stale();
+                refresh_launch_at_login_plist_if_stale(log_dir);
             }
         }
     }

@@ -141,15 +141,25 @@ wait_for_status_item_count_above() {
     return 1
 }
 
-# 2b. Can the app start at all here? Launch it directly (no link) first, so a
-# failure below can be told apart: "the app cannot start in this environment"
-# vs "the link was not delivered".
+# The item that appeared was Freenet's: it goes when Freenet goes. Without this
+# anything else adding a status item on the runner would satisfy the check.
+wait_for_status_item_count_back_to() {
+    for _ in $(seq 1 15); do
+        [[ "$("$OUT/status-item-count")" -le "$1" ]] && return 0
+        sleep 1
+    done
+    return 1
+}
+
 sw_vers
 swiftc -O "$REPO/scripts/macos-status-item-count.swift" -o "$OUT/status-item-count"
 status_items_before="$("$OUT/status-item-count")"
 
-# An install from before #6093 has a LaunchAgent naming the bundle's script,
-# which no longer exists. Seed one: the app must repair it when it starts.
+# 2a. A Mac updated from before #6093 whose relaunch failed: nothing has
+# repaired its LaunchAgent, which runs the bundle's script, so its next login
+# looks like this. Freenet must start, show its icon, and repair the agent
+# without booting itself out.
+AGENT="gui/$(id -u)/org.freenet.Freenet"
 PLIST="$HOME/Library/LaunchAgents/org.freenet.Freenet.plist"
 mkdir -p "$(dirname "$PLIST")"
 cat > "$PLIST" <<XML
@@ -163,7 +173,30 @@ cat > "$PLIST" <<XML
 <key>ProcessType</key><string>Interactive</string>
 </dict></plist>
 XML
+launchctl bootstrap "gui/$(id -u)" "$PLIST" || fail "could not load the old Launch-at-Login agent"
+wait_for_status_item_count_above "$status_items_before" \
+    || fail "the menu bar icon is not displayed when an old agent starts the app"
+migrated=false
+for _ in $(seq 1 15); do
+    if grep -qF "$APP/Contents/MacOS/freenet-bin" "$PLIST" && grep -qF run-wrapper "$PLIST"; then
+        migrated=true
+        break
+    fi
+    sleep 1
+done
+$migrated || fail "the app left a Launch-at-Login agent naming the script"
+wrapper_pid="$(pgrep -f "$RUN_WRAPPER" | sed -n 1p)"
+sleep 5
+kill -0 "$wrapper_pid" 2>/dev/null || fail "repairing its Launch-at-Login agent killed the wrapper"
+echo "ok - an old Launch-at-Login agent starts the app and is repaired"
+stop_app
+wait_for_status_item_count_back_to "$status_items_before" \
+    || fail "the status item outlived the app, so it was not Freenet's"
+launchctl bootout "$AGENT" >/dev/null 2>&1 || true
 
+# 2b. Can the app start at all here? Launch it directly (no link) first, so a
+# failure below can be told apart: "the app cannot start in this environment"
+# vs "the link was not delivered".
 open -a "$APP" || fail "open -a could not launch the app"
 started=false
 for _ in $(seq 1 30); do
@@ -189,32 +222,9 @@ echo "ok - Freenet.app starts via LaunchServices"
 wait_for_status_item_count_above "$status_items_before" \
     || fail "the menu bar icon is not displayed (before: $status_items_before)"
 echo "ok - the menu bar icon is displayed"
-
-# The plist seeded above now starts the binary with the wrapper subcommand.
-migrated=false
-for _ in $(seq 1 15); do
-    if grep -qF "$APP/Contents/MacOS/freenet-bin" "$PLIST" && grep -qF run-wrapper "$PLIST"; then
-        migrated=true
-        break
-    fi
-    sleep 1
-done
-$migrated || fail "the app left a Launch-at-Login agent naming the removed script"
-echo "ok - an old Launch-at-Login agent is migrated"
-
 stop_app
-
-# The item that appeared was Freenet's: it goes when Freenet goes. Without this
-# anything else adding a status item on the runner would satisfy 2c.
-icon_gone=false
-for _ in $(seq 1 15); do
-    if [[ "$("$OUT/status-item-count")" -le "$status_items_before" ]]; then
-        icon_gone=true
-        break
-    fi
-    sleep 1
-done
-$icon_gone || fail "the status item outlived the app, so 2c did not observe Freenet's"
+wait_for_status_item_count_back_to "$status_items_before" \
+    || fail "the status item outlived the app, so 2c did not observe Freenet's"
 echo "ok - the status item was Freenet's"
 
 # 3. Clicking a link launches the app and the wrapper handles it. The dry run
@@ -257,9 +267,8 @@ grep -q 'outcome=opened' "$LOG_DIR"/freenet-wrapper.*.log \
     || fail "the link was not opened against the running node"
 echo "ok - a link launches Freenet.app and is opened against its node"
 
-# First launch registers the Launch-at-Login agent, whose RunAtLoad starts a
-# second wrapper that exits after losing the lock. Let it go, so the next
-# link has only the settled app to go to.
+# Let any duplicate launch exit after losing the lock, so the next link has
+# only the settled app to go to.
 for _ in $(seq 1 30); do
     [[ "$(pgrep -f "$RUN_WRAPPER" | wc -l | tr -d ' ')" -le 1 ]] && break
     sleep 1
@@ -279,25 +288,21 @@ grep -q 'outcome=invalid-link' "$LOG_DIR"/freenet-wrapper.*.log \
 echo "ok - a second link reaches the running instance, and a hostile one is refused"
 
 # 4. The instance started at login is launchd's, not LaunchServices'. Links
-# must reach that one too. First run registered the Launch-at-Login agent;
-# stop the app and start it the way login does.
-AGENT="gui/$(id -u)/org.freenet.Freenet"
-if [[ -f "$PLIST" ]]; then
-    stop_app
-    status_items_before="$("$OUT/status-item-count")"
-    launchctl kickstart -k "$AGENT" || fail "could not start the Launch-at-Login agent"
-    # Click at once, without waiting for the new wrapper to settle: the link
-    # must be handled whether LaunchServices already sees the launchd-started
-    # instance or launches a duplicate for it (which handles it and exits).
-    open "freenet://$RIVER/"
-    wait_for_count 3 || fail "the launchd-started instance never handled the link"
-    echo "ok - a link reaches the instance launchd started (as at login)"
-    wait_for_status_item_count_above "$status_items_before" \
-        || fail "the menu bar icon is not displayed when launchd starts the app"
-    echo "ok - the menu bar icon is displayed when launchd starts the app"
-    launchctl bootout "$AGENT" >/dev/null 2>&1 || true
-else
-    echo "note - no Launch-at-Login agent was registered; skipped the launchd-started check"
-fi
+# must reach that one too. Stop the app and load the agent repaired in 2a, as
+# the next login will.
+stop_app
+wait_for_status_item_count_back_to "$status_items_before" \
+    || fail "the status item outlived the app"
+launchctl bootstrap "gui/$(id -u)" "$PLIST" || fail "could not start the Launch-at-Login agent"
+# Click at once, without waiting for the new wrapper to settle: the link must
+# be handled whether LaunchServices already sees the launchd-started instance
+# or launches a duplicate for it (which handles it and exits).
+open "freenet://$RIVER/"
+wait_for_count 3 || fail "the launchd-started instance never handled the link"
+echo "ok - a link reaches the instance launchd started (as at login)"
+wait_for_status_item_count_above "$status_items_before" \
+    || fail "the menu bar icon is not displayed when launchd starts the app"
+echo "ok - the menu bar icon is displayed when launchd starts the app"
+launchctl bootout "$AGENT" >/dev/null 2>&1 || true
 
 echo "All macOS freenet:// checks passed."

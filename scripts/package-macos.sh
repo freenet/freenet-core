@@ -129,6 +129,18 @@ if ! file -b "$APP_DIR/Contents/MacOS/freenet-bin" | grep -F 'Mach-O' > /dev/nul
     exit 1
 fi
 
+echo ">> Writing launchd target for older Launch at Login agents"
+# Not the bundle's executable. LaunchAgents written by earlier releases run this
+# path, and only a running new version repairs them, so without it a Mac whose
+# relaunch failed after an auto-update would not start Freenet at login either.
+# launchd is not affected by the exec problem above.
+cat > "$APP_DIR/Contents/MacOS/Freenet" <<'SH'
+#!/bin/bash
+DIR="$(cd "$(dirname "$0")" && pwd)"
+exec "$DIR/freenet-bin" service run-wrapper
+SH
+chmod +x "$APP_DIR/Contents/MacOS/Freenet"
+
 echo ">> Writing Info.plist"
 cat > "$APP_DIR/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

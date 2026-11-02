@@ -1078,20 +1078,34 @@ mod tests {
     }
 
     #[test]
-    fn an_old_launch_agent_plist_is_stale_after_the_script_is_removed() {
-        // Older installs pointed launchd at Contents/MacOS/Freenet, which a
-        // new bundle no longer contains. Left alone, such a plist would stop
-        // Freenet starting at login.
+    fn an_old_launch_agent_plist_is_rewritten_once() {
+        // Older installs pointed launchd at Contents/MacOS/Freenet. The first
+        // run of a new version points them at the binary, and later runs
+        // leave the file alone.
         let dir = tempfile::tempdir().unwrap();
         let plist = dir.path().join("agent.plist");
         let old_args = vec!["/Applications/Freenet.app/Contents/MacOS/Freenet".to_string()];
         write_launch_agent_plist_at(&plist, &old_args).unwrap();
         let exe = PathBuf::from("/Applications/Freenet.app/Contents/MacOS/freenet-bin");
-        let new_args = launch_agent_program_arguments(&exe);
-        assert!(!launch_agent_plist_has_expected_leader(
-            &plist,
-            &new_args[0]
-        ));
+
+        assert!(rewrite_launch_agent_plist_if_stale(&plist, &exe).unwrap());
+        let contents = std::fs::read_to_string(&plist).unwrap();
+        assert!(contents.contains(">/Applications/Freenet.app/Contents/MacOS/freenet-bin<"));
+        assert!(contents.contains(">run-wrapper<"));
+        assert!(!contents.contains("/MacOS/Freenet<"));
+
+        assert!(!rewrite_launch_agent_plist_if_stale(&plist, &exe).unwrap());
+    }
+
+    #[test]
+    fn a_plist_rewrite_failure_is_reported_and_keeps_the_old_file() {
+        // The wrapper logs this. The old file still works through the script.
+        let dir = tempfile::tempdir().unwrap();
+        let missing_parent = dir.path().join("file-not-dir");
+        std::fs::write(&missing_parent, "").unwrap();
+        let plist = missing_parent.join("agent.plist");
+        let exe = PathBuf::from("/Applications/Freenet.app/Contents/MacOS/freenet-bin");
+        assert!(rewrite_launch_agent_plist_if_stale(&plist, &exe).is_err());
     }
 
     #[test]
