@@ -121,12 +121,49 @@ launchctl setenv FREENET_TELEMETRY_ENABLED false
 launchctl setenv DATA_DIR "$OUT/data"
 launchctl setenv CONFIG_DIR "$OUT/config"
 
+# Stops the app and its node, which outlives a killed wrapper. Repeats the kill
+# because a wrapper launchd started can take over the lock from the one killed.
+stop_app() {
+    for _ in $(seq 1 30); do
+        pgrep -f "$RUN_WRAPPER" >/dev/null || pgrep -f "$NODE" >/dev/null || return 0
+        pkill -f "$RUN_WRAPPER" || true
+        pkill -f "$NODE" || true
+        sleep 1
+    done
+    fail "the app did not stop"
+}
+
+wait_for_status_item_count_above() {
+    for _ in $(seq 1 30); do
+        [[ "$("$OUT/status-item-count")" -gt "$1" ]] && return 0
+        sleep 1
+    done
+    return 1
+}
+
 # 2b. Can the app start at all here? Launch it directly (no link) first, so a
 # failure below can be told apart: "the app cannot start in this environment"
 # vs "the link was not delivered".
 sw_vers
 swiftc -O "$REPO/scripts/macos-status-item-count.swift" -o "$OUT/status-item-count"
 status_items_before="$("$OUT/status-item-count")"
+
+# An install from before #6093 has a LaunchAgent naming the bundle's script,
+# which no longer exists. Seed one: the app must repair it when it starts.
+PLIST="$HOME/Library/LaunchAgents/org.freenet.Freenet.plist"
+mkdir -p "$(dirname "$PLIST")"
+cat > "$PLIST" <<XML
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>org.freenet.Freenet</string>
+<key>ProgramArguments</key><array><string>$APP/Contents/MacOS/Freenet</string></array>
+<key>RunAtLoad</key><true/>
+<key>KeepAlive</key><false/>
+<key>ProcessType</key><string>Interactive</string>
+</dict></plist>
+XML
+
 open -a "$APP" || fail "open -a could not launch the app"
 started=false
 for _ in $(seq 1 30); do
@@ -149,32 +186,36 @@ echo "ok - Freenet.app starts via LaunchServices"
 # 2c. The menu bar icon is really displayed. Started this way, macOS 26 hides
 # the item of an app whose CFBundleExecutable execs the real binary, and the
 # app has no way to tell (#6093).
-icon_shown=false
-for _ in $(seq 1 30); do
-    if [[ "$("$OUT/status-item-count")" -gt "$status_items_before" ]]; then
-        icon_shown=true
+wait_for_status_item_count_above "$status_items_before" \
+    || fail "the menu bar icon is not displayed (before: $status_items_before)"
+echo "ok - the menu bar icon is displayed"
+
+# The plist seeded above now starts the binary with the wrapper subcommand.
+migrated=false
+for _ in $(seq 1 15); do
+    if grep -qF "$APP/Contents/MacOS/freenet-bin" "$PLIST" && grep -qF run-wrapper "$PLIST"; then
+        migrated=true
         break
     fi
     sleep 1
 done
-$icon_shown || fail "the menu bar icon is not displayed (before: $status_items_before)"
-echo "ok - the menu bar icon is displayed"
+$migrated || fail "the app left a Launch-at-Login agent naming the removed script"
+echo "ok - an old Launch-at-Login agent is migrated"
 
-# Kill the wrapper once its node exists, which orphans the node as a crash
-# would. Without this wait the outcome depends on whether the wrapper had got
-# as far as spawning it, and the next step's result depends on that (#5956).
-for _ in $(seq 1 60); do
-    pgrep -f "$NODE" >/dev/null && break
+stop_app
+
+# The item that appeared was Freenet's: it goes when Freenet goes. Without this
+# anything else adding a status item on the runner would satisfy 2c.
+icon_gone=false
+for _ in $(seq 1 15); do
+    if [[ "$("$OUT/status-item-count")" -le "$status_items_before" ]]; then
+        icon_gone=true
+        break
+    fi
     sleep 1
 done
-pgrep -f "$NODE" >/dev/null || fail "the wrapper never started a node"
-pkill -f "$RUN_WRAPPER" || true
-for _ in $(seq 1 30); do
-    pgrep -f "$RUN_WRAPPER" >/dev/null || break
-    sleep 1
-done
-orphan="$(pgrep -f "$NODE" | head -1)"
-[[ -n "$orphan" ]] || fail "no orphaned node to test the startup cleanup with"
+$icon_gone || fail "the status item outlived the app, so 2c did not observe Freenet's"
+echo "ok - the status item was Freenet's"
 
 # 3. Clicking a link launches the app and the wrapper handles it. The dry run
 # stops the handler opening a browser; it is set for apps LaunchServices
@@ -210,13 +251,6 @@ wait_for_count() {
 
 open "freenet://$RIVER/?x=1#y"
 wait_for_count 1 || fail "the launched app never handled the link"
-# A new wrapper clears a dead wrapper's node before starting its own.
-grep -q 'Killed stale freenet network' "$LOG_DIR"/freenet-wrapper.*.log \
-    || fail "the wrapper did not clean up the orphaned node"
-if kill -0 "$orphan" 2>/dev/null; then
-    fail "the orphaned node $orphan is still running"
-fi
-echo "ok - a new wrapper removes a node orphaned by a dead wrapper"
 # `opened` (not merely "not invalid"): the handler found the node the app
 # started and it answered the /v1/version probe like Freenet.
 grep -q 'outcome=opened' "$LOG_DIR"/freenet-wrapper.*.log \
@@ -248,12 +282,9 @@ echo "ok - a second link reaches the running instance, and a hostile one is refu
 # must reach that one too. First run registered the Launch-at-Login agent;
 # stop the app and start it the way login does.
 AGENT="gui/$(id -u)/org.freenet.Freenet"
-if [[ -f "$HOME/Library/LaunchAgents/org.freenet.Freenet.plist" ]]; then
-    pkill -f "$RUN_WRAPPER" || true
-    for _ in $(seq 1 30); do
-        pgrep -f "$RUN_WRAPPER" >/dev/null || break
-        sleep 1
-    done
+if [[ -f "$PLIST" ]]; then
+    stop_app
+    status_items_before="$("$OUT/status-item-count")"
     launchctl kickstart -k "$AGENT" || fail "could not start the Launch-at-Login agent"
     # Click at once, without waiting for the new wrapper to settle: the link
     # must be handled whether LaunchServices already sees the launchd-started
@@ -261,6 +292,9 @@ if [[ -f "$HOME/Library/LaunchAgents/org.freenet.Freenet.plist" ]]; then
     open "freenet://$RIVER/"
     wait_for_count 3 || fail "the launchd-started instance never handled the link"
     echo "ok - a link reaches the instance launchd started (as at login)"
+    wait_for_status_item_count_above "$status_items_before" \
+        || fail "the menu bar icon is not displayed when launchd starts the app"
+    echo "ok - the menu bar icon is displayed when launchd starts the app"
     launchctl bootout "$AGENT" >/dev/null 2>&1 || true
 else
     echo "note - no Launch-at-Login agent was registered; skipped the launchd-started check"

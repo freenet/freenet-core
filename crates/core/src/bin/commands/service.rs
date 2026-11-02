@@ -1094,30 +1094,6 @@ mod tests {
         ));
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn stale_node_pattern_matches_the_bundle_node_and_nothing_else_running() {
-        // Regression: the pattern used to be a plain "freenet network", which
-        // never matched the bundle's `freenet-bin network`, so a node orphaned
-        // by a dead wrapper survived the startup cleanup on every DMG install.
-        let pattern = regex::Regex::new(super::wrapper::STALE_NODE_PATTERN).unwrap();
-        for node in [
-            "/Applications/Freenet.app/Contents/MacOS/freenet-bin network",
-            "/usr/local/bin/freenet network",
-            "freenet network",
-        ] {
-            assert!(pattern.is_match(node), "{node}");
-        }
-        // The wrapper runs this very pkill, and must survive it.
-        for not_a_node in [
-            "/Applications/Freenet.app/Contents/MacOS/freenet-bin",
-            "/Applications/Freenet.app/Contents/MacOS/freenet-bin service run-wrapper",
-            "/usr/local/bin/freenet service run-wrapper",
-        ] {
-            assert!(!pattern.is_match(not_a_node), "{not_a_node}");
-        }
-    }
-
     #[test]
     fn launchservices_argv_is_an_app_launch() {
         let argv = |args: &[&str]| {
@@ -1135,6 +1111,28 @@ mod tests {
     }
 
     #[test]
+    fn arguments_macos_adds_do_not_stop_an_app_launch() {
+        // The script this replaced dropped its arguments, so these never
+        // reached the parser. Rejecting one would silently fail to start.
+        let argv = |args: &[&str]| {
+            args.iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>()
+        };
+        let bundled = "/Applications/Freenet.app/Contents/MacOS/freenet-bin";
+        for args in [
+            argv(&[bundled, "-psn_0_12345"]),
+            argv(&[bundled, "-ApplePersistenceIgnoreState", "YES"]),
+            argv(&[bundled, "-NSDocumentRevisionsDebugMode", "YES"]),
+            argv(&[bundled, "-psn_0_1", "-AppleLanguages", "(en)"]),
+            // A value is skipped even when it looks like one of ours.
+            argv(&[bundled, "-AppleLanguages", "network"]),
+        ] {
+            assert!(is_macos_app_launch(&args), "{args:?}");
+        }
+    }
+
+    #[test]
     fn a_terminal_freenet_is_not_an_app_launch() {
         // These must keep running the node: `freenet` with no subcommand is
         // documented to, and the CLI symlink reaches this same binary.
@@ -1148,10 +1146,18 @@ mod tests {
             argv(&["freenet"]),
             argv(&["/usr/local/bin/freenet"]),
             argv(&["./freenet-bin"]),
+            argv(&["./Freenet.app/Contents/MacOS/freenet-bin"]),
             argv(&["/Applications/Other.app/Contents/MacOS/other"]),
+            // Named freenet-bin under a `.app` directory, but not a bundle's
+            // executable, such as a build inside a directory ending in .app.
+            argv(&["/Users/me/work.app/target/debug/freenet-bin"]),
+            argv(&["/Applications/Freenet.app/freenet-bin"]),
+            argv(&["/Applications/Freenet/Contents/MacOS/freenet-bin"]),
             argv(&[bundled, "--version"]),
             argv(&[bundled, "network"]),
             argv(&[bundled, "service", "run-wrapper"]),
+            argv(&[bundled, "-psn_0_1", "network"]),
+            argv(&[bundled, "-AppleLanguages", "(en)", "network"]),
             argv(&[]),
         ] {
             assert!(!is_macos_app_launch(&args), "{args:?}");

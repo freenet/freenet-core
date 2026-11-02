@@ -1708,13 +1708,18 @@ fn quic_ignore_crash_breaker_from(matches: &clap::ArgMatches) -> Option<bool> {
 fn freenet_main() -> anyhow::Result<()> {
     // Parsed in two steps so the node arms can see where a value came from
     // (`quic_ignore_crash_breaker_from`); errors exit as `Cli::parse` does.
-    let matches = <Cli as clap::CommandFactory>::command().get_matches();
+    // Decided before parsing, which would reject arguments macOS adds (#6093).
+    let argv: Vec<_> = std::env::args_os().collect();
+    let app_launch = cfg!(target_os = "macos") && commands::service::is_macos_app_launch(&argv);
+    let parser = <Cli as clap::CommandFactory>::command();
+    let matches = if app_launch {
+        parser.get_matches_from(argv.iter().take(1))
+    } else {
+        parser.get_matches()
+    };
     let cli =
         <Cli as clap::FromArgMatches>::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
 
-    // LaunchServices starts Freenet.app with no arguments (#6093).
-    let app_launch = cfg!(target_os = "macos")
-        && commands::service::is_macos_app_launch(&std::env::args_os().collect::<Vec<_>>());
     let command = if app_launch {
         Some(Command::Service(ServiceCommand::RunWrapper))
     } else {

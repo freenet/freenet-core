@@ -81,8 +81,8 @@ pub(crate) fn macos_app_bundle_path(exe: &Path) -> Option<PathBuf> {
     None
 }
 
-/// Whether `argv` is the shape LaunchServices starts the app with: the
-/// absolute path of the bundle's executable and nothing else.
+/// Whether `argv` is how LaunchServices starts the app: the absolute path of
+/// the bundle's executable, with no arguments of ours.
 ///
 /// That executable is `freenet-bin` itself rather than a script that execs
 /// it with `service run-wrapper`, because macOS 26 does not display a status
@@ -91,14 +91,51 @@ pub(crate) fn macos_app_bundle_path(exe: &Path) -> Option<PathBuf> {
 /// arguments. A bare `freenet` from a terminal must still run the node: it
 /// arrives through the `/usr/local/bin` symlink, so `argv[0]` is outside any
 /// bundle and this returns false.
-#[allow(dead_code)]
+///
+/// Call this before parsing the command line. macOS can add arguments of its
+/// own, which the parser would reject, and the app would then fail to start
+/// with the error going nowhere a user could see it.
 pub(crate) fn is_macos_app_launch(argv: &[std::ffi::OsString]) -> bool {
-    let [argv0] = argv else {
+    let Some((argv0, rest)) = argv.split_first() else {
         return false;
     };
-    let path = Path::new(argv0);
-    path.file_name().is_some_and(|name| name == "freenet-bin")
-        && macos_app_bundle_path(path).is_some()
+    is_bundle_executable(argv0) && only_macos_injected_args(rest)
+}
+
+/// Whether `path` is the absolute path `<name>.app/Contents/MacOS/freenet-bin`.
+/// Checks for a leading `/` by hand: `Path::is_absolute` depends on the host
+/// OS, and this pure function also runs in the Windows unit tests.
+fn is_bundle_executable(path: &std::ffi::OsStr) -> bool {
+    let is_absolute = path.to_string_lossy().starts_with('/');
+    let mut components = Path::new(path)
+        .components()
+        .rev()
+        .map(|component| component.as_os_str());
+    is_absolute
+        && components.next().is_some_and(|c| c == "freenet-bin")
+        && components.next().is_some_and(|c| c == "MacOS")
+        && components.next().is_some_and(|c| c == "Contents")
+        && components
+            .next()
+            .and_then(|c| c.to_str())
+            .is_some_and(|bundle| bundle.ends_with(".app"))
+}
+
+/// Whether every argument is one macOS adds itself: `-psn_<serial>`, or a
+/// user-defaults override such as `-ApplePersistenceIgnoreState YES`, which is
+/// a key followed by its value.
+fn only_macos_injected_args(args: &[std::ffi::OsString]) -> bool {
+    let mut args = args.iter().map(|arg| arg.to_string_lossy());
+    while let Some(arg) = args.next() {
+        if arg.starts_with("-psn_") {
+            continue;
+        }
+        if !arg.starts_with("-Apple") && !arg.starts_with("-NS") {
+            return false;
+        }
+        args.next();
+    }
+    true
 }
 
 /// Compute the ProgramArguments array for the user LaunchAgent. launchd must

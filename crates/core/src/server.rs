@@ -411,15 +411,23 @@ pub(crate) fn is_source_allowed(ip: IpAddr, allowed: &AllowedSourceCidrs) -> boo
     allowed.contains_ip(&match_ip)
 }
 
-/// Whether a client could reach this bind address at the machine's own IPs.
+/// Whether a client could reach this bind address directly at the machine's
+/// own IPs.
 ///
 /// A loopback listener cannot be reached at a LAN address, so resolving the
-/// machine's hostname to allow those addresses as `Host` values gains nothing.
-/// It also costs a blocking `getaddrinfo` before the API starts listening,
-/// which took about 35 s on a macOS 26 CI runner and left the node unreachable
-/// for all of it (#5956).
+/// machine's hostname to allow those addresses as `Host` values gains nothing
+/// for a direct client. A forwarder that keeps the original `Host` needs
+/// `--allowed-host` instead. The lookup also costs a blocking `getaddrinfo`
+/// before the API starts listening, which took about 35 s on a macOS 26 CI
+/// runner and left the node unreachable for all of it (#5956).
 fn hostname_ips_are_reachable(bind_addr: IpAddr) -> bool {
     !bind_addr.is_loopback()
+}
+
+fn resolve_hostname_ips(hostname: &str, port: u16) -> Vec<IpAddr> {
+    std::net::ToSocketAddrs::to_socket_addrs(&(hostname, port))
+        .map(|addrs| addrs.map(|addr| addr.ip()).collect())
+        .unwrap_or_default()
 }
 
 /// Builds the allowlist of hostnames/IPs for WebSocket `Host` header validation.
@@ -488,18 +496,20 @@ impl HostAllowlistBuilder {
             return;
         };
 
-        self.add(name_str);
-        if hostname_ips_are_reachable(bind_addr) {
-            self.resolve_hostname_ips(name_str);
-        }
+        self.add_hostname(name_str, bind_addr, resolve_hostname_ips);
     }
 
-    fn resolve_hostname_ips(&mut self, hostname: &str) {
-        let Ok(addrs) = std::net::ToSocketAddrs::to_socket_addrs(&(hostname, self.port)) else {
-            return;
-        };
-        for addr in addrs {
-            self.add(&addr.ip().to_string());
+    fn add_hostname(
+        &mut self,
+        hostname: &str,
+        bind_addr: IpAddr,
+        resolve: impl FnOnce(&str, u16) -> Vec<IpAddr>,
+    ) {
+        self.add(hostname);
+        if hostname_ips_are_reachable(bind_addr) {
+            for ip in resolve(hostname, self.port) {
+                self.add(&ip.to_string());
+            }
         }
     }
 
@@ -900,6 +910,32 @@ mod tests {
         ] {
             assert!(hostname_ips_are_reachable(reachable), "{reachable}");
         }
+    }
+
+    #[test]
+    fn a_loopback_bind_does_not_look_up_the_machine_hostname() {
+        // The guard is what keeps a slow resolver from delaying the API.
+        let mut hosts = HostAllowlistBuilder::new(7509);
+        hosts.add_hostname("myhost", IpAddr::V4(Ipv4Addr::LOCALHOST), |_, _| {
+            panic!("a loopback bind must not resolve the hostname")
+        });
+        let hosts = hosts.build();
+        assert!(hosts.contains("myhost"));
+        assert!(hosts.contains("myhost:7509"));
+    }
+
+    #[test]
+    fn a_wildcard_bind_allows_the_machine_hostnames_ips() {
+        let lan_ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 2));
+        let mut hosts = HostAllowlistBuilder::new(7509);
+        hosts.add_hostname("myhost", IpAddr::V4(Ipv4Addr::UNSPECIFIED), |name, port| {
+            assert_eq!((name, port), ("myhost", 7509));
+            vec![lan_ip]
+        });
+        let hosts = hosts.build();
+        assert!(hosts.contains("myhost"));
+        assert!(hosts.contains("192.168.1.2"));
+        assert!(hosts.contains("192.168.1.2:7509"));
     }
 
     #[test]

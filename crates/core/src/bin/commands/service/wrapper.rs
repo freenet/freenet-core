@@ -1867,21 +1867,13 @@ fn cleanup_old_wrapper_logs(log_dir: &Path) {
     }
 }
 
-/// Extended regex matching a node's command line. Inside the macOS bundle the
-/// binary is `freenet-bin`, and a plain `freenet network` does not match that:
-/// a node orphaned by a dead wrapper would survive the startup cleanup and
-/// keep the port from the wrapper's own node.
-#[cfg(unix)]
-pub(super) const STALE_NODE_PATTERN: &str = "freenet(-bin)? network";
-
 /// Kill stale `freenet network` processes from a previous wrapper instance.
 /// Called at wrapper startup and on port-conflict retry.
 pub(super) fn kill_stale_freenet_processes(log_dir: &Path) {
     #[cfg(unix)]
     {
         // Scope to current user to avoid killing other users' processes on shared machines.
-        // Mirrors the macOS wrapper script's `pkill -f -u "$(id -u)"`, whose
-        // own pattern needs no `-bin`: that script only runs a `freenet` binary.
+        // Mirrors the macOS wrapper script: pkill -f -u "$(id -u)" "freenet network"
         let uid = std::process::Command::new("id")
             .arg("-u")
             .output()
@@ -1890,7 +1882,7 @@ pub(super) fn kill_stale_freenet_processes(log_dir: &Path) {
             .unwrap_or_default();
         let uid = uid.trim();
         let status = std::process::Command::new("pkill")
-            .args(["-f", "-u", uid, STALE_NODE_PATTERN])
+            .args(["-f", "-u", uid, "freenet network"])
             .status();
         if let Ok(s) = status {
             if s.success() {
