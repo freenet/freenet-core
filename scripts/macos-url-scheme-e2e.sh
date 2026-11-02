@@ -33,9 +33,13 @@ cleanup() {
     for var in FREENET_OPEN_DRY_RUN FREENET_TELEMETRY_ENABLED DATA_DIR CONFIG_DIR; do
         launchctl unsetenv "$var" 2>/dev/null || true
     done
-    pkill -f "Freenet.app/Contents/MacOS/freenet-bin service run-wrapper" 2>/dev/null || true
+    pkill -f "$RUN_WRAPPER" 2>/dev/null || true
 }
 trap cleanup EXIT
+
+# The wrapper, however it was started: LaunchServices passes no arguments,
+# launchd passes the subcommand. Must not match `freenet-bin network`.
+RUN_WRAPPER='Freenet.app/Contents/MacOS/freenet-bin( service run-wrapper)?$'
 
 BIN="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -118,7 +122,9 @@ launchctl setenv CONFIG_DIR "$OUT/config"
 # 2b. Can the app start at all here? Launch it directly (no link) first, so a
 # failure below can be told apart: "the app cannot start in this environment"
 # vs "the link was not delivered".
-RUN_WRAPPER="Freenet.app/Contents/MacOS/freenet-bin service run-wrapper"
+sw_vers
+swiftc -O "$REPO/scripts/macos-status-item-count.swift" -o "$OUT/status-item-count"
+status_items_before="$("$OUT/status-item-count")"
 open -a "$APP" || fail "open -a could not launch the app"
 started=false
 for _ in $(seq 1 30); do
@@ -127,7 +133,7 @@ for _ in $(seq 1 30); do
 done
 if ! $started; then
     echo "--- the app did not start via open -a; running its executable directly ---" >&2
-    ( DATA_DIR="$OUT/data" CONFIG_DIR="$OUT/config" "$APP/Contents/MacOS/Freenet" \
+    ( DATA_DIR="$OUT/data" CONFIG_DIR="$OUT/config" "$APP/Contents/MacOS/freenet-bin" \
         > "$OUT/direct.log" 2>&1 & echo $! > "$OUT/direct.pid" )
     sleep 15
     head -c 4000 "$OUT/direct.log" >&2 || true
@@ -137,6 +143,20 @@ if ! $started; then
     fail "Freenet.app does not start in this environment"
 fi
 echo "ok - Freenet.app starts via LaunchServices"
+
+# 2c. The menu bar icon is really displayed. Started this way, macOS 26 hides
+# the item of an app whose CFBundleExecutable execs the real binary, and the
+# app has no way to tell (#6093).
+icon_shown=false
+for _ in $(seq 1 30); do
+    if [[ "$("$OUT/status-item-count")" -gt "$status_items_before" ]]; then
+        icon_shown=true
+        break
+    fi
+    sleep 1
+done
+$icon_shown || fail "the menu bar icon is not displayed (before: $status_items_before)"
+echo "ok - the menu bar icon is displayed"
 pkill -f "$RUN_WRAPPER" || true
 for _ in $(seq 1 30); do
     pgrep -f "$RUN_WRAPPER" >/dev/null || break
@@ -187,7 +207,7 @@ echo "ok - a link launches Freenet.app and is opened against its node"
 # second wrapper that exits after losing the lock. Let it go, so the next
 # link has only the settled app to go to.
 for _ in $(seq 1 30); do
-    [[ "$(pgrep -f "Freenet.app/Contents/MacOS/freenet-bin service run-wrapper" | wc -l | tr -d ' ')" -le 1 ]] && break
+    [[ "$(pgrep -f "$RUN_WRAPPER" | wc -l | tr -d ' ')" -le 1 ]] && break
     sleep 1
 done
 
@@ -209,9 +229,9 @@ echo "ok - a second link reaches the running instance, and a hostile one is refu
 # stop the app and start it the way login does.
 AGENT="gui/$(id -u)/org.freenet.Freenet"
 if [[ -f "$HOME/Library/LaunchAgents/org.freenet.Freenet.plist" ]]; then
-    pkill -f "Freenet.app/Contents/MacOS/freenet-bin service run-wrapper" || true
+    pkill -f "$RUN_WRAPPER" || true
     for _ in $(seq 1 30); do
-        pgrep -f "Freenet.app/Contents/MacOS/freenet-bin service run-wrapper" >/dev/null || break
+        pgrep -f "$RUN_WRAPPER" >/dev/null || break
         sleep 1
     done
     launchctl kickstart -k "$AGENT" || fail "could not start the Launch-at-Login agent"

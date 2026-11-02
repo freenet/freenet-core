@@ -119,16 +119,15 @@ else
     echo ">> Skipping fdev (FREENET_ARM64_FDEV_BIN/FREENET_X86_FDEV_BIN not set)"
 fi
 
-echo ">> Writing shell wrapper as CFBundleExecutable"
-# When the user opens Freenet.app, macOS runs Contents/MacOS/Freenet (the
-# value of CFBundleExecutable). That script execs the real freenet binary
-# with "service run-wrapper" so the tray path is activated.
-cat > "$APP_DIR/Contents/MacOS/Freenet" <<'SH'
-#!/bin/bash
-DIR="$(cd "$(dirname "$0")" && pwd)"
-exec "$DIR/freenet-bin" service run-wrapper
-SH
-chmod +x "$APP_DIR/Contents/MacOS/Freenet"
+# CFBundleExecutable must be the real binary, not a script or launcher that
+# execs it: macOS 26 does not display a status item created after such an exec
+# when the app was launched through LaunchServices, so the menu bar icon is
+# silently missing (#6093). LaunchServices passes no arguments, so freenet-bin
+# enters the wrapper by itself when started that way (is_macos_app_launch).
+if ! file -b "$APP_DIR/Contents/MacOS/freenet-bin" | grep -F 'Mach-O' > /dev/null; then
+    echo "package-macos.sh: freenet-bin is not a Mach-O binary (#6093)" >&2
+    exit 1
+fi
 
 echo ">> Writing Info.plist"
 cat > "$APP_DIR/Contents/Info.plist" <<PLIST
@@ -142,7 +141,7 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
     <key>CFBundleVersion</key><string>$VERSION</string>
     <key>CFBundleShortVersionString</key><string>$VERSION</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleExecutable</key><string>Freenet</string>
+    <key>CFBundleExecutable</key><string>freenet-bin</string>
     <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
     <key>LSUIElement</key><true/>
     <key>LSMinimumSystemVersion</key><string>11.0</string>

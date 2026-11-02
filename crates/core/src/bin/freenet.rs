@@ -1712,7 +1712,16 @@ fn freenet_main() -> anyhow::Result<()> {
     let cli =
         <Cli as clap::FromArgMatches>::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
 
-    match cli.command {
+    // LaunchServices starts Freenet.app with no arguments (#6093).
+    let app_launch = cfg!(target_os = "macos")
+        && commands::service::is_macos_app_launch(&std::env::args_os().collect::<Vec<_>>());
+    let command = if app_launch {
+        Some(Command::Service(ServiceCommand::RunWrapper))
+    } else {
+        cli.command
+    };
+
+    match command {
         // The link-handler commands need no node directories: skip building
         // ConfigPaths, which creates them (and has no default in debug builds).
         Some(Command::Service(ServiceCommand::UrlHandler(cmd))) => cmd.run(),

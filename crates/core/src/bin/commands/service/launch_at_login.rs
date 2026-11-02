@@ -20,7 +20,7 @@ use super::{
 // itself: the .app bundle is just a folder in /Applications. To match
 // the Windows-installer experience (service registers with the OS and
 // starts on boot) we write a user LaunchAgent plist that points at the
-// .app bundle's CFBundleExecutable shell wrapper and sets RunAtLoad=true.
+// .app bundle's executable and sets RunAtLoad=true.
 //
 // The presence/absence of the plist file is the single source of truth
 // for the user's preference: plist exists means launch at login enabled.
@@ -81,40 +81,36 @@ pub(crate) fn macos_app_bundle_path(exe: &Path) -> Option<PathBuf> {
     None
 }
 
-/// The path to a `.app` bundle's CFBundleExecutable shell wrapper, by our
-/// packaging convention. See `scripts/package-macos.sh` for how this
-/// wrapper is produced: it execs the inner `freenet-bin` with the
-/// `service run-wrapper` subcommand.
+/// Whether `argv` is the shape LaunchServices starts the app with: the
+/// absolute path of the bundle's executable and nothing else.
 ///
-/// Builds the path with an explicit `/` join rather than `Path::join`:
-/// this always describes a macOS bundle layout (always `/`-separated,
-/// regardless of what OS actually executes this code — e.g. this pure
-/// function is exercised on Windows too, in `windows_unit` CI). `Path`
-/// inserts the HOST OS's separator for newly-appended components, which
-/// is `\` on Windows and would silently mix separators into a path that
-/// must always be macOS-shaped.
+/// That executable is `freenet-bin` itself rather than a script that execs
+/// it with `service run-wrapper`, because macOS 26 does not display a status
+/// item created after such an exec when the app was launched through
+/// LaunchServices (#6093). So the wrapper has to be reachable with no
+/// arguments. A bare `freenet` from a terminal must still run the node: it
+/// arrives through the `/usr/local/bin` symlink, so `argv[0]` is outside any
+/// bundle and this returns false.
 #[allow(dead_code)]
-fn macos_app_bundle_wrapper(bundle: &Path) -> String {
-    format!("{}/Contents/MacOS/Freenet", bundle.to_string_lossy())
+pub(crate) fn is_macos_app_launch(argv: &[std::ffi::OsString]) -> bool {
+    let [argv0] = argv else {
+        return false;
+    };
+    let path = Path::new(argv0);
+    path.file_name().is_some_and(|name| name == "freenet-bin")
+        && macos_app_bundle_path(path).is_some()
 }
 
-/// Compute the ProgramArguments array for the user LaunchAgent. If we're
-/// running from inside an `.app` bundle, launchd should relaunch the
-/// bundle's CFBundleExecutable shell wrapper (which in turn execs
-/// `freenet-bin service run-wrapper`, entering the tray path). Otherwise
-/// (cargo-run, raw binary install, dev build) launchd needs to invoke
-/// the binary with the explicit `service run-wrapper` subcommand or it
-/// would default to `Network` mode and skip the tray entirely.
+/// Compute the ProgramArguments array for the user LaunchAgent. launchd must
+/// pass the explicit `service run-wrapper` subcommand, or the binary would
+/// default to `Network` mode and skip the tray entirely.
 #[allow(dead_code)]
 pub(super) fn launch_agent_program_arguments(exe: &Path) -> Vec<String> {
-    match macos_app_bundle_path(exe) {
-        Some(bundle) => vec![macos_app_bundle_wrapper(&bundle)],
-        None => vec![
-            exe.to_string_lossy().into_owned(),
-            "service".to_string(),
-            "run-wrapper".to_string(),
-        ],
-    }
+    vec![
+        exe.to_string_lossy().into_owned(),
+        "service".to_string(),
+        "run-wrapper".to_string(),
+    ]
 }
 
 fn xml_escape(s: &str) -> String {
