@@ -51,8 +51,9 @@
 //! long as the session, so a message already in a channel when its path ends is
 //! still delivered. One still waiting for room in a full channel is dropped with
 //! the path and counted. [`Action::EnableData`] lets the path send data once both bits are
-//! set. Only `send_control_bounded` is called on it: no node code sends data yet,
-//! and a peer that sends none costs nothing here.
+//! set, and from then on the session's [`QuicPathState::data_route`] gives the
+//! connection the path to send its data on ([`super::data_route`]). With no route
+//! it sends on UDP, and the path carries control frames only.
 
 #[cfg(test)]
 pub(in crate::transport) mod tests;
@@ -937,6 +938,24 @@ impl Session {
         drop(GlobalExecutor::spawn(report_panics(self.remote, worker)));
     }
 
+    /// The path to send this connection's data on: the live attempt's, once both
+    /// sides set the data bit (the attempt holds a route only then), unless the
+    /// peer refused data. `None` in shadow and after a teardown, which takes the
+    /// attempt under this same lock in the step that leaves `Active`, so a path
+    /// that ended stops taking sends at once. The lock is short and never held
+    /// across an await. A route read just before a teardown still works: what it
+    /// takes goes on UDP.
+    fn data_route(&self) -> Option<DataRoute> {
+        self.state
+            .lock()
+            .attempt
+            .as_ref()?
+            .route
+            .as_ref()
+            .filter(|route| route.path().sends_data())
+            .cloned()
+    }
+
     /// Where a route records what its sends did, in a test.
     fn route_note(&self) -> RouteNote {
         #[cfg(any(test, feature = "testing"))]
@@ -998,7 +1017,7 @@ impl Session {
     }
 
     /// Send a control frame on the live attempt's path, bounded, in a task. The
-    /// only kind of send a shadow path makes.
+    /// only kind of send a path without both data bits makes.
     fn send_control(
         &self,
         state: &mut SessionState,
@@ -1427,24 +1446,9 @@ impl QuicPathState {
         }
     }
 
-    /// The path to send this connection's data on: the live path of an active
-    /// machine with both data bits, which has not refused data. `None` with QUIC
-    /// off, in shadow and after a teardown, which takes the attempt under this
-    /// same lock, so a path that ended stops taking sends at once. The lock is
-    /// short and never held across an await. A route read just before a teardown
-    /// still works: what it takes goes on UDP.
+    /// See [`Session::data_route`].
     pub(in crate::transport) fn data_route(&self) -> Option<DataRoute> {
-        let state = self.session.state.lock();
-        if !state.machine.carries_data() {
-            return None;
-        }
-        state
-            .attempt
-            .as_ref()?
-            .route
-            .as_ref()
-            .filter(|route| route.path().sends_data())
-            .cloned()
+        self.session.data_route()
     }
 
     /// The stamp the session's active path writes.

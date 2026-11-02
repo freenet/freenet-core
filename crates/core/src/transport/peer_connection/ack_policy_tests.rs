@@ -10,6 +10,7 @@ use aes_gcm::KeyInit;
 use bytes::Bytes;
 
 mod quic_data;
+mod quic_send;
 
 use super::*;
 use crate::transport::crypto::TransportKeypair;
