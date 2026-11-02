@@ -358,6 +358,52 @@ fn merge_law_card(merge_enabled: bool, merge_view: Option<&status::MergeCheckVie
             n = view.without_verdict_last_tick,
         ));
     }
+    let tick = view.skipped_last_tick;
+    // Each clause only when non-zero. The refused figure is a running total, so it can
+    // stay non-zero indefinitely and must not drag a string of zero counts along.
+    if tick.any() {
+        let mut left_out = Vec::new();
+        if tick.skips.oversized > 0 {
+            left_out.push(format!(
+                "{} case(s) over the size limit",
+                tick.skips.oversized
+            ));
+        }
+        if tick.skips.budget_cut > 0 {
+            left_out.push(format!(
+                "{} past the per-probe case cap",
+                tick.skips.budget_cut
+            ));
+        }
+        if tick.skips.not_sampled > 0 {
+            left_out.push(format!(
+                "{} that sampling never offered",
+                tick.skips.not_sampled
+            ));
+        }
+        let mut text = String::new();
+        if !left_out.is_empty() {
+            text.push_str(&format!(
+                "In its most recent tick the checker's probes left out {}. ",
+                left_out.join(", ")
+            ));
+        }
+        if tick.probed_all_oversized > 0 {
+            text.push_str(&format!(
+                "{} probe(s) ran nothing because every case was over the size limit. ",
+                tick.probed_all_oversized
+            ));
+        }
+        if tick.refused_too_large > 0 {
+            text.push_str(&format!(
+                "Since capture began the sampler has refused {} state(s) as too large, summed across the contracts checked in that tick. ",
+                tick.refused_too_large
+            ));
+        }
+        note.push_str(&format!(
+            r#"<p class="empty" style="margin-top:0.5rem">{text}A law that held did so on the cases that ran.</p>"#
+        ));
+    }
     if view.stale {
         note.push_str(&format!(
             r#"<p class="empty" style="margin-top:0.5rem"><strong>The checker has not published for {ago}.</strong> It runs every 15 minutes when healthy, so everything on this card may be stale — a probe that died, a probe still running (no later tick starts while one is in flight, and a probe that stalls outside contract code has no deadline of its own), or a capture writer that is gone, each leaves the previous result standing with nothing else to say so. The node's log is where to look next.</p>"#,
@@ -417,6 +463,29 @@ fn merge_law_card(merge_enabled: bool, merge_view: Option<&status::MergeCheckVie
             .unwrap_or_else(|| "an unknown time".to_string()),
         ago = format_duration(view.published_secs_ago),
     );
+
+    // What this contract's probes left out, beside the cases they ran. Shown only when
+    // something was, so a contract covered in full reads the same as before. Cases over
+    // the size limit and states the sampler refused are the ones that mean the result
+    // does not cover the contract's largest states; the case cap and sampling are
+    // routine, so they get the count without the warning.
+    let mut cases_row = cases_row;
+    if record.skips.any() || record.refused_too_large > 0 {
+        cases_row.push_str(&format!(
+            r#"
+                    <div class="info-label" title="Cases the case generator left out of the checker's latest probe of THIS contract. These counts come from case generation and do not include cases cut by the probe's time budget. A law that held did so on the cases that ran.">Cases left out</div><div class="info-value">{oversized} over the size limit, {budget_cut} past the per-probe case cap, {not_sampled} not sampled</div>
+                    <div class="info-label" title="States the sampler refused to keep because they exceed its per-state ceiling (FREENET_CONFORMANCE_CAPTURE_MAX_BYTES), counted since capture began. They never reach the checker.">States too large to sample</div><div class="info-value">{refused}</div>"#,
+            oversized = record.skips.oversized,
+            budget_cut = record.skips.budget_cut,
+            not_sampled = record.skips.not_sampled,
+            refused = record.refused_too_large,
+        ));
+        if record.skips.oversized > 0 || record.refused_too_large > 0 {
+            note.push_str(
+                r#"<p class="empty" style="margin-top:0.5rem">Some of this contract's states were too large to check, so this result does not cover its largest states.</p>"#,
+            );
+        }
+    }
 
     if record.findings().is_empty() {
         format!(

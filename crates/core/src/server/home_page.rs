@@ -4741,6 +4741,182 @@ mod tests {
         );
     }
 
+    /// #6044: "no violation found" is a statement about the cases that ran. The card
+    /// says what the probes left out, and when states were too large to check it says
+    /// the result does not cover them.
+    #[test]
+    fn a_clean_card_says_what_the_probes_left_out() {
+        use crate::conformance::shadow::ProbeSkips;
+        let id = freenet_stdlib::prelude::ContractInstanceId::new([0x42; 32]);
+        let panel = |skips: ProbeSkips, refused: u64| {
+            let mut record = checked_record(id, 5, 0, Vec::new());
+            record.skips = skips;
+            record.refused_too_large = refused;
+            let mut status = MergeCheckStatus::default();
+            status.record([record], 1, 0, tokio::time::Instant::now());
+            let view = merge_view(&status, &id);
+            merge_panel(&contract_detail_html_from(
+                &None,
+                &id.to_string(),
+                true,
+                Some(&view),
+            ))
+        };
+        let caveat = "does not cover its largest states";
+
+        let oversized = panel(
+            ProbeSkips {
+                oversized: 7,
+                budget_cut: 8,
+                not_sampled: 9,
+            },
+            0,
+        );
+        assert!(
+            oversized
+                .contains("7 over the size limit, 8 past the per-probe case cap, 9 not sampled"),
+            "{oversized}"
+        );
+        assert!(oversized.contains(caveat), "{oversized}");
+
+        let refused = panel(ProbeSkips::default(), 4);
+        assert!(
+            refused.contains("States too large to sample</div><div class=\"info-value\">4<"),
+            "{refused}"
+        );
+        assert!(refused.contains(caveat), "{refused}");
+
+        let capped = panel(
+            ProbeSkips {
+                oversized: 0,
+                budget_cut: 8,
+                not_sampled: 9,
+            },
+            0,
+        );
+        assert!(capped.contains("8 past the per-probe case cap"), "{capped}");
+        assert!(
+            !capped.contains(caveat),
+            "the case cap is routine, so it gets the count and not the warning: {capped}"
+        );
+
+        let nothing = panel(ProbeSkips::default(), 0);
+        assert!(!nothing.contains("Cases left out"), "{nothing}");
+        assert!(!nothing.contains(caveat), "{nothing}");
+    }
+
+    /// #6044: the node-wide counts from the last tick reach the card, whether or not
+    /// this contract's own record shows anything left out.
+    #[test]
+    fn the_card_carries_the_last_ticks_skip_counts() {
+        use crate::conformance::{shadow::ProbeSkips, status::TickSkips};
+        let id = freenet_stdlib::prelude::ContractInstanceId::new([0x43; 32]);
+        let mut status = MergeCheckStatus::default();
+        status.record(
+            [checked_record(id, 5, 0, Vec::new())],
+            1,
+            0,
+            tokio::time::Instant::now(),
+        );
+        status.skipped_last_tick = TickSkips {
+            skips: ProbeSkips {
+                oversized: 11,
+                budget_cut: 12,
+                not_sampled: 13,
+            },
+            refused_too_large: 14,
+            probed_all_oversized: 15,
+        };
+        let view = merge_view(&status, &id);
+        let html = contract_detail_html_from(&None, &id.to_string(), true, Some(&view));
+        let panel = merge_panel(&html);
+        for expected in [
+            "probes left out 11 case(s) over the size limit",
+            "12 past the per-probe case cap",
+            "13 that sampling never offered",
+            "refused 14 state(s) as too large",
+            "15 probe(s) ran nothing",
+        ] {
+            assert!(panel.contains(expected), "missing {expected:?}: {panel}");
+        }
+
+        // Only the running refusal total is non-zero: the card says so and does not
+        // print a string of zero counts, and does not claim a per-tick figure.
+        status.skipped_last_tick = TickSkips {
+            refused_too_large: 6,
+            ..Default::default()
+        };
+        let panel = merge_panel(&contract_detail_html_from(
+            &None,
+            &id.to_string(),
+            true,
+            Some(&merge_view(&status, &id)),
+        ));
+        assert!(
+            panel.contains("Since capture began the sampler has refused 6 state(s)"),
+            "{panel}"
+        );
+        for zero in [
+            "0 case(s)",
+            "0 past",
+            "0 that",
+            "probes left out",
+            "probe(s) ran nothing",
+        ] {
+            assert!(
+                !panel.contains(zero),
+                "{zero:?} rendered for a zero count: {panel}"
+            );
+        }
+
+        status.skipped_last_tick = TickSkips::default();
+        let html = contract_detail_html_from(
+            &None,
+            &id.to_string(),
+            true,
+            Some(&merge_view(&status, &id)),
+        );
+        assert!(
+            !merge_panel(&html).contains("probes left out"),
+            "{}",
+            merge_panel(&html)
+        );
+    }
+
+    /// #6044: a contract with NO record of its own still gets the node-wide note,
+    /// which is built before the no-record early return.
+    #[test]
+    fn a_card_without_a_record_still_carries_the_tick_skip_counts() {
+        use crate::conformance::{shadow::ProbeSkips, status::TickSkips};
+        let key_id = freenet_stdlib::prelude::ContractInstanceId::new([0x44; 32]);
+        let key = key_id.to_string();
+        let other = freenet_stdlib::prelude::ContractInstanceId::new([0x45; 32]);
+        let mut status = MergeCheckStatus::default();
+        status.record(
+            [checked_record(other, 5, 0, Vec::new())],
+            1,
+            0,
+            tokio::time::Instant::now(),
+        );
+        status.skipped_last_tick = TickSkips {
+            skips: ProbeSkips {
+                oversized: 21,
+                budget_cut: 0,
+                not_sampled: 0,
+            },
+            ..Default::default()
+        };
+        let view = merge_view(&status, &key_id);
+        assert!(
+            view.contract.is_none(),
+            "fixture: this contract has a record"
+        );
+        let html = contract_detail_html_from(&Some(hosted_snap(&key)), &key, true, Some(&view));
+        let panel = merge_panel(&html);
+        assert!(panel.contains("has not been checked recently"), "{panel}");
+        assert!(panel.contains("21 case(s) over the size limit"), "{panel}");
+    }
+
     /// A converging idempotence finding must not read the same as a
     /// non-convergent one.
     ///

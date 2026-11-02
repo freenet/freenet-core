@@ -44,7 +44,7 @@ use super::activity::MergeActivity;
 use super::bundle::ReplayBundle;
 use super::capture::RecordOutcome;
 use super::focus::{FocusSelector, FocusSlot};
-use super::generator::{GeneratorConfig, generate_cases};
+use super::generator::{GeneratedCases, GeneratorConfig, generate_cases_counted};
 use super::policy::{ConformanceAction, EnforcementMode, decide};
 use super::property::{ConformanceProperty, PropertyOutcome, Severity};
 use super::runtime_oracle::RuntimeOracle;
@@ -173,11 +173,77 @@ pub struct ShadowReport {
     pub judged: Vec<JudgedContract>,
     /// Focus contracts we formed NO opinion about: skipped before probing (no code, no
     /// samples), a probe whose blocking task died or whose time budget was exhausted
-    /// before any case ran, or a probe that ran cases but every one came back
-    /// `Inconclusive`. Complements `judged` over the focus set — every focus contract
-    /// lands in exactly one of the two, which is what makes them checkable against
-    /// each other.
+    /// before any case ran, a probe whose every case was over the size limit, or a
+    /// probe that ran cases but every one came back `Inconclusive`.
+    /// Complements `judged` over the focus set — every focus contract lands in exactly
+    /// one of the two, which is what makes them checkable against each other.
     pub without_verdict: usize,
+    /// Cases this tick's probes left out, summed over them. A law that held did so on
+    /// the cases that ran, so these say how much that claim leaves out.
+    pub skips: ProbeSkips,
+    /// Probes that ran nothing because every case was over the size limit, with none
+    /// left unsampled or cut by the budget. Also counted in `without_verdict`; this
+    /// says why. A probe that ran nothing for a mix of reasons is not counted here.
+    pub probed_all_oversized: usize,
+    /// Observations the SAMPLER refused for exceeding its per-state ceiling, summed
+    /// over the contracts probed this tick. Each contract's figure is a running count
+    /// since capture began, so this is a standing total and not a per-tick rate, and a
+    /// contract probed on two ticks contributes to both. These states never reach the
+    /// generator, so a law that held on the survivors says nothing about them and
+    /// [`Self::skips`] cannot count them. Also covers a contract whose states were all
+    /// refused (no samples, so `skipped_no_samples`).
+    pub refused_too_large: u64,
+}
+
+/// One contract's share of a tick: its bundle, plus the count of observations the
+/// sampler refused as too large, which the bundle does not carry.
+pub(crate) type ProbeWork = (ContractInstanceId, ReplayBundle, u64);
+
+/// Whether the size limit is the whole reason a probe ran nothing: no case was
+/// produced, some were over the limit, and none were left unsampled or cut by the
+/// budget. Otherwise "every case was over the size limit" would be untrue.
+fn ran_nothing_but_oversized(no_cases: bool, skips: ProbeSkips) -> bool {
+    no_cases && skips.oversized > 0 && skips.not_sampled == 0 && skips.budget_cut == 0
+}
+
+/// The cases one probe's generator left out, taken from the generator's own counts
+/// rather than worked out from what ran. Reporting only: nothing here affects which
+/// cases run or what is decided about them.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ProbeSkips {
+    /// Over `max_case_bytes`. See [`GeneratedCases::oversized`] for what this means
+    /// for associativity. With the default sampler ceilings no case can reach the
+    /// limit, so this is non-zero only when `FREENET_CONFORMANCE_CAPTURE_MAX_BYTES`
+    /// raises them.
+    pub oversized: usize,
+    /// Within the size limit, but past [`MAX_CASES_PER_PROBE`].
+    pub budget_cut: usize,
+    /// Never offered: left out by the state or transition sample, or by the
+    /// associativity cap. See [`GeneratedCases::not_sampled`].
+    pub not_sampled: usize,
+}
+
+impl ProbeSkips {
+    fn of(generated: &GeneratedCases) -> Self {
+        Self {
+            oversized: generated.oversized_total(),
+            budget_cut: generated.budget_cut_total(),
+            not_sampled: generated.not_sampled_total(),
+        }
+    }
+
+    /// Add `other`, saturating: these accumulate over a contract's residency in the
+    /// checked window, and `not_sampled` is large on a big corpus.
+    pub(crate) fn accumulate(&mut self, other: ProbeSkips) {
+        self.oversized = self.oversized.saturating_add(other.oversized);
+        self.budget_cut = self.budget_cut.saturating_add(other.budget_cut);
+        self.not_sampled = self.not_sampled.saturating_add(other.not_sampled);
+    }
+
+    /// Whether anything was left out.
+    pub fn any(&self) -> bool {
+        *self != Self::default()
+    }
 }
 
 /// Fold the focus contracts that had no samples yet into a tick's counts.
@@ -220,6 +286,11 @@ pub struct JudgedContract {
     pub verdicts: usize,
     /// Cases that came back `Inconclusive` for this contract this tick.
     pub inconclusive: usize,
+    /// Cases this contract's probe left out this tick.
+    pub skips: ProbeSkips,
+    /// Observations the sampler has refused for this contract as too large, since
+    /// capture began. See [`ShadowReport::refused_too_large`].
+    pub refused_too_large: u64,
 }
 
 impl ShadowReport {
@@ -922,7 +993,7 @@ impl ShadowRunner {
         &self,
         focus: &FocusTick,
         samplers: &HashMap<ContractInstanceId, super::capture::TrackedContract>,
-    ) -> (Vec<(ContractInstanceId, ReplayBundle)>, usize) {
+    ) -> (Vec<ProbeWork>, usize) {
         if self.mode == EnforcementMode::Disabled {
             return (Vec::new(), 0);
         }
@@ -931,7 +1002,11 @@ impl ShadowRunner {
             .iter()
             .filter_map(|instance| {
                 let tracked = samplers.get(instance)?;
-                Some((*instance, super::capture::bundle_for(*instance, tracked)))
+                Some((
+                    *instance,
+                    super::capture::bundle_for(*instance, tracked),
+                    tracked.refused_too_large,
+                ))
             })
             .collect();
         let awaiting_samples = focus.selected.len().saturating_sub(work.len());
@@ -1028,7 +1103,7 @@ pub(crate) struct Finding {
 /// which is also what makes it structurally impossible for a probe to change what the
 /// peer would have captured.
 pub(crate) async fn probe(
-    work: Vec<(ContractInstanceId, ReplayBundle)>,
+    work: Vec<ProbeWork>,
     store: Option<PathBuf>,
     mode: EnforcementMode,
 ) -> (ShadowReport, Vec<Finding>) {
@@ -1043,7 +1118,7 @@ pub(crate) async fn probe(
 /// seconds. Injecting it lets a test prove the check fires and stops the probe,
 /// which is the part that can regress; the constant itself is a tuning choice.
 pub(crate) async fn probe_with_budget(
-    work: Vec<(ContractInstanceId, ReplayBundle)>,
+    work: Vec<ProbeWork>,
     store: Option<PathBuf>,
     mode: EnforcementMode,
     budget: Duration,
@@ -1054,6 +1129,12 @@ pub(crate) async fn probe_with_budget(
     };
     let mut findings = Vec::new();
 
+    // Counted before any early return, so a probe that cannot start (no store) and a
+    // contract whose every state was refused (an empty bundle, no cases) still count.
+    report.refused_too_large = work
+        .iter()
+        .fold(0u64, |total, (_, _, n)| total.saturating_add(*n));
+
     let Some(store) = store else {
         // No store means no code, and no code means no question was asked. Recorded as
         // a skip rather than returned as an empty report, which would read as a clean
@@ -1063,10 +1144,11 @@ pub(crate) async fn probe_with_budget(
         return (report, findings);
     };
 
-    for (instance, bundle) in work {
+    for (instance, bundle, refused_too_large) in work {
         probe_one(
             &instance,
             &bundle,
+            refused_too_large,
             &store,
             mode,
             budget,
@@ -1091,6 +1173,7 @@ fn count_would_remove(report: &mut ShadowReport) {
 async fn probe_one(
     instance: &ContractInstanceId,
     bundle: &ReplayBundle,
+    refused_too_large: u64,
     store: &Path,
     mode: EnforcementMode,
     budget: Duration,
@@ -1143,7 +1226,18 @@ async fn probe_one(
         max_cases: MAX_CASES_PER_PROBE,
         ..Default::default()
     };
-    let cases = generate_cases(&corpus, &config);
+    let generated = generate_cases_counted(&corpus, &config);
+    // Counted here, from the generator's own counts, for reporting only: the cases are
+    // exactly what the uncounted form returned. Without this a law held on the cases
+    // that ran reads the same as one with nothing left out (#6044).
+    let skips = ProbeSkips::of(&generated);
+    report.skips.accumulate(skips);
+    // Only when the size limit is the whole reason nothing ran: a probe that also had
+    // cases left unsampled or cut by the budget did not have "every case" over the limit.
+    if ran_nothing_but_oversized(generated.cases.is_empty(), skips) {
+        report.probed_all_oversized += 1;
+    }
+    let cases = generated.cases;
     report.probed += 1;
 
     // The WASM runs here, on a blocking thread.
@@ -1218,6 +1312,8 @@ async fn probe_one(
             contract: instance_copy,
             verdicts: outcome.cases.saturating_sub(outcome.inconclusive),
             inconclusive: outcome.inconclusive,
+            skips,
+            refused_too_large,
         });
     } else {
         report.without_verdict += 1;
@@ -2539,11 +2635,15 @@ mod tests {
                 contract: a,
                 verdicts: 3,
                 inconclusive: 0,
+                skips: Default::default(),
+                refused_too_large: 0,
             },
             JudgedContract {
                 contract: b,
                 verdicts: 1,
                 inconclusive: 0,
+                skips: Default::default(),
+                refused_too_large: 0,
             },
         ]);
         assert_eq!(runner.focus_without_new_samples(), 1, "b has nothing new");
@@ -2589,6 +2689,8 @@ mod tests {
             contract,
             verdicts: 1,
             inconclusive: 0,
+            skips: Default::default(),
+            refused_too_large: 0,
         }
     }
 
@@ -2850,6 +2952,8 @@ mod tests {
             contract: focus[0],
             verdicts: 1,
             inconclusive: 0,
+            skips: Default::default(),
+            refused_too_large: 0,
         }]);
         drop(first);
 
@@ -2993,6 +3097,8 @@ mod tests {
             contract: focus[0],
             verdicts: 1,
             inconclusive: 0,
+            skips: Default::default(),
+            refused_too_large: 0,
         }]);
         assert!(
             runner.period_dirty,
@@ -3044,6 +3150,8 @@ mod tests {
                 contract: weighted,
                 verdicts: 1,
                 inconclusive: 0,
+                skips: Default::default(),
+                refused_too_large: 0,
             }]);
             let without_uniform: Vec<_> =
                 hosted.iter().copied().filter(|c| *c != uniform).collect();
@@ -3607,6 +3715,288 @@ mod tests {
             report.cases, 0,
             "cases ran after the budget was already exhausted: {report:?}"
         );
+        Ok(())
+    }
+
+    /// A probe of the conformance fixture contract over a bundle with `adjust` applied,
+    /// so a test can put states over the size limit without the sampler's ceilings.
+    async fn probe_adjusted(
+        adjust: impl FnOnce(&mut ReplayBundle),
+    ) -> Result<(ContractInstanceId, ShadowReport, ReplayBundle), Box<dyn std::error::Error>> {
+        use freenet_stdlib::prelude::{
+            ContractCode, ContractContainer, ContractWasmAPIVersion, Parameters, WrappedContract,
+        };
+        use std::sync::Arc;
+
+        let wasm = crate::wasm_runtime::tests::get_test_module("test_contract_conformance")?;
+        let code_hash = *blake3::hash(&wasm).as_bytes();
+        let store_dir = crate::util::tests::get_temp_dir();
+        std::fs::create_dir_all(store_dir.path())?;
+        let db = crate::contract::storages::Storage::new(store_dir.path()).await?;
+        let mut store =
+            crate::wasm_runtime::ContractStore::new(store_dir.path().into(), 10_000_000, db)?;
+        let parameters: Parameters<'static> = Parameters::from(vec![0u8]);
+        let contract = WrappedContract::new(Arc::new(ContractCode::from(wasm)), parameters.clone());
+        let id = *contract.key().id();
+        store.store_contract(ContractContainer::Wasm(ContractWasmAPIVersion::V1(
+            contract,
+        )))?;
+
+        let samplers = samplers_for(
+            id,
+            vec![0],
+            code_hash,
+            &[
+                (vec![1], vec![1, 2]),
+                (vec![2], vec![2, 3]),
+                (vec![3], vec![3, 4]),
+            ],
+        );
+        let dir = tempfile::TempDir::new()?;
+        let mut runner = ShadowRunner::new(dir.path(), EnforcementMode::Shadow);
+        let focus = runner.focus(None, &samplers.keys().copied().collect::<Vec<_>>());
+        let (mut work, _awaiting) = runner.select(&focus, &samplers);
+        assert_eq!(work.len(), 1, "the fixture contract was not selected");
+        adjust(&mut work[0].1);
+        let bundle = work[0].1.clone();
+        let (report, _) = probe(
+            work,
+            Some(store_dir.path().to_path_buf()),
+            EnforcementMode::Shadow,
+        )
+        .await;
+        Ok((id, report, bundle))
+    }
+
+    /// What the generator says this bundle's probe leaves out: the counts the report
+    /// has to carry, computed here from the generator directly.
+    fn expected_skips(bundle: &ReplayBundle) -> ProbeSkips {
+        let config = GeneratorConfig {
+            max_cases: MAX_CASES_PER_PROBE,
+            ..Default::default()
+        };
+        ProbeSkips::of(&generate_cases_counted(&bundle.to_corpus(), &config))
+    }
+
+    /// #6044: a contract judged clean on the cases that ran must not read the same as
+    /// one with nothing left out. The generator's counts reach the tick's totals and
+    /// the contract's own record.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_probe_reports_the_cases_it_left_out() -> Result<(), Box<dyn std::error::Error>> {
+        let over_the_limit = vec![9u8; 5 * 1024 * 1024];
+        let (id, report, bundle) =
+            probe_adjusted(|bundle| bundle.states.push(over_the_limit)).await?;
+        let expected = expected_skips(&bundle);
+        assert!(
+            expected.oversized > 0,
+            "fixture: nothing was over the limit"
+        );
+        assert!(
+            expected.budget_cut > 0,
+            "fixture: the case cap did not bind"
+        );
+        assert!(
+            expected.not_sampled > 0,
+            "fixture: nothing was left unsampled"
+        );
+
+        assert_eq!(report.skips, expected, "{report:?}");
+        let judged = report
+            .judged
+            .iter()
+            .find(|j| j.contract == id)
+            .expect("the small states' cases reach a verdict");
+        assert_eq!(judged.skips, expected);
+        assert_eq!(report.probed_all_oversized, 0);
+        Ok(())
+    }
+
+    /// #6044: a probe whose every case was over the size limit ran nothing. It forms no
+    /// opinion, and the report says why.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_probe_with_every_case_over_the_limit_says_so()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_, report, bundle) = probe_adjusted(|bundle| {
+            bundle.transitions.clear();
+            bundle.deltas.clear();
+            bundle.summaries.clear();
+            bundle.states = (0..3u8).map(|i| vec![i; 5 * 1024 * 1024]).collect();
+        })
+        .await?;
+        let expected = expected_skips(&bundle);
+        assert!(
+            expected.oversized > 0,
+            "fixture: nothing was over the limit"
+        );
+
+        assert_eq!(report.probed, 1);
+        assert_eq!(report.cases, 0);
+        assert!(report.judged.is_empty(), "{report:?}");
+        assert_eq!(report.without_verdict, 1);
+        assert_eq!(report.skips, expected);
+        assert_eq!(report.probed_all_oversized, 1);
+        Ok(())
+    }
+
+    /// "Every case was over the size limit" must be true: a probe that also left cases
+    /// unsampled, or cut by the budget, is not counted as one.
+    #[test]
+    fn all_oversized_requires_nothing_else_left_out() {
+        let skips = |oversized, budget_cut, not_sampled| ProbeSkips {
+            oversized,
+            budget_cut,
+            not_sampled,
+        };
+        assert!(ran_nothing_but_oversized(true, skips(3, 0, 0)));
+        assert!(
+            !ran_nothing_but_oversized(true, skips(3, 0, 1)),
+            "unsampled"
+        );
+        assert!(
+            !ran_nothing_but_oversized(true, skips(3, 1, 0)),
+            "budget cut"
+        );
+        assert!(
+            !ran_nothing_but_oversized(true, skips(0, 0, 0)),
+            "nothing oversized"
+        );
+        assert!(
+            !ran_nothing_but_oversized(false, skips(3, 0, 0)),
+            "cases ran"
+        );
+    }
+
+    /// A probe that left nothing out reports zero: the counts are not noise on a small
+    /// corpus the probe covers in full.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_probe_with_nothing_left_out_reports_zero() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (id, report, bundle) = probe_adjusted(|bundle| {
+            bundle.transitions.clear();
+            bundle.deltas.clear();
+            bundle.summaries.clear();
+            bundle.states = vec![vec![1], vec![1, 2]];
+        })
+        .await?;
+        assert!(
+            !expected_skips(&bundle).any(),
+            "fixture: something was left out"
+        );
+        assert!(!report.skips.any(), "{report:?}");
+        let judged = report
+            .judged
+            .iter()
+            .find(|j| j.contract == id)
+            .expect("judged");
+        assert!(!judged.skips.any());
+        Ok(())
+    }
+
+    /// Push one observation whose result state is `size` bytes through the real
+    /// admission path, so the sampler refuses it the way capture would.
+    fn observe_sized(
+        samplers: &mut HashMap<ContractInstanceId, TrackedContract>,
+        id: ContractInstanceId,
+        code_hash: [u8; 32],
+        size: usize,
+    ) {
+        let _evicted = record(
+            samplers,
+            &crate::conformance::capture::SamplingScope::Wide,
+            Observation {
+                contract: id,
+                code_hash,
+                parameters: vec![0],
+                base_state: vec![1],
+                incoming_state: Some(vec![7u8; size]),
+                delta: None,
+                result_state: vec![7u8; size],
+                related: Vec::new(),
+            },
+        );
+    }
+
+    /// #6044: states the sampler refused never reach the generator, so only the
+    /// sampler's own count can say they were left out. It must reach the tick's
+    /// report, the contract's judged record, the status snapshot and the view.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sampler_refusals_reach_the_report_and_the_status()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use freenet_stdlib::prelude::{
+            ContractCode, ContractContainer, ContractWasmAPIVersion, Parameters, WrappedContract,
+        };
+        use std::sync::Arc;
+
+        let wasm = crate::wasm_runtime::tests::get_test_module("test_contract_conformance")?;
+        let code_hash = *blake3::hash(&wasm).as_bytes();
+        let store_dir = crate::util::tests::get_temp_dir();
+        std::fs::create_dir_all(store_dir.path())?;
+        let db = crate::contract::storages::Storage::new(store_dir.path()).await?;
+        let mut store =
+            crate::wasm_runtime::ContractStore::new(store_dir.path().into(), 10_000_000, db)?;
+        let parameters: Parameters<'static> = Parameters::from(vec![0u8]);
+        let contract = WrappedContract::new(Arc::new(ContractCode::from(wasm)), parameters);
+        let id = *contract.key().id();
+        store.store_contract(ContractContainer::Wasm(ContractWasmAPIVersion::V1(
+            contract,
+        )))?;
+
+        let mut samplers = samplers_for(
+            id,
+            vec![0],
+            code_hash,
+            &[(vec![1], vec![1, 2]), (vec![2], vec![2, 3])],
+        );
+        let over_the_ceiling = 2 * 1024 * 1024;
+        for _ in 0..3 {
+            observe_sized(&mut samplers, id, code_hash, over_the_ceiling);
+        }
+        assert_eq!(samplers[&id].refused_too_large, 3, "fixture");
+
+        let dir = tempfile::TempDir::new()?;
+        let mut runner = ShadowRunner::new(dir.path(), EnforcementMode::Shadow);
+        let (report, findings) =
+            tick_with_findings(&mut runner, &samplers, Some(store_dir.path())).await;
+        assert_eq!(report.refused_too_large, 3, "{report:?}");
+        let judged = report
+            .judged
+            .iter()
+            .find(|j| j.contract == id)
+            .expect("the surviving states reach a verdict");
+        assert_eq!(judged.refused_too_large, 3);
+
+        let mut status = crate::conformance::status::MergeCheckStatus::default();
+        status.record(
+            crate::conformance::status::checked_contracts(&report.judged, &findings),
+            report.judged.len(),
+            report.without_verdict,
+            Instant::now(),
+        );
+        status.skipped_last_tick = crate::conformance::status::TickSkips::of(&report);
+        let view = status.view_for(Some(&id), Instant::now());
+        assert_eq!(view.skipped_last_tick.refused_too_large, 3);
+        assert_eq!(view.contract.expect("in the window").refused_too_large, 3);
+        Ok(())
+    }
+
+    /// A contract whose every observation was refused has no bundle states, reaches
+    /// no case, and has no record of its own. The tick's total is the only place its
+    /// refusals can show.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_contract_with_every_state_refused_still_counts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let id = instance(1);
+        let mut samplers = HashMap::new();
+        for _ in 0..2 {
+            observe_sized(&mut samplers, id, [0u8; 32], 2 * 1024 * 1024);
+        }
+        let dir = tempfile::TempDir::new()?;
+        let mut runner = ShadowRunner::new(dir.path(), EnforcementMode::Shadow);
+        let report = tick(&mut runner, &samplers, Some(dir.path())).await;
+        assert_eq!(report.focused, 1, "{report:?}");
+        assert!(report.judged.is_empty(), "{report:?}");
+        assert_eq!(report.without_verdict, 1, "{report:?}");
+        assert_eq!(report.refused_too_large, 2, "{report:?}");
         Ok(())
     }
 

@@ -79,7 +79,7 @@ use parking_lot::RwLock;
 use tokio::time::Instant;
 
 use super::property::{IdempotenceSettling, Severity};
-use super::shadow::{Finding, JudgedContract};
+use super::shadow::{Finding, JudgedContract, ProbeSkips, ShadowReport};
 
 /// How many recently-checked contracts to remember.
 ///
@@ -160,6 +160,17 @@ pub struct CheckedContract {
     pub verdicts: usize,
     /// Cases that came back `Inconclusive`, accumulated the same way.
     pub inconclusive: usize,
+    /// Cases this contract's latest probe left out (the newest replaces the last, as
+    /// each probe recounts the same states). A contract whose states were all
+    /// refused has no record, so only the node-wide counts show it. A clean
+    /// result is a statement about the cases that ran, so a page saying "no violation
+    /// found" needs this beside it (#6044).
+    pub skips: ProbeSkips,
+    /// Observations the sampler has refused for this contract as over its per-state
+    /// ceiling, since capture began. The latest figure, not a sum: each probe reports
+    /// a running total, so adding them would count the same refusals once per tick.
+    /// Those states never reached the generator, so [`Self::skips`] cannot count them.
+    pub refused_too_large: u64,
     /// Findings for THIS contract, newest first. Deduplicated on the property that
     /// broke, so the length is bounded by the property count.
     ///
@@ -210,6 +221,8 @@ impl CheckedContract {
             contract,
             verdicts,
             inconclusive,
+            skips: ProbeSkips::default(),
+            refused_too_large: 0,
             findings: Vec::new(),
             checked_at,
         }
@@ -302,6 +315,38 @@ pub(crate) fn settling_rank(settling: Option<IdempotenceSettling>) -> u8 {
     }
 }
 
+/// What the most recent tick's probes left out, node-wide. Reporting only.
+///
+/// Beside `judged_last_tick` and `without_verdict_last_tick` for the same reason they
+/// are there: a clean result is a statement about the cases that ran, and the page
+/// cannot say how much that leaves out from per-contract records that may be hours old.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct TickSkips {
+    /// See [`ShadowReport::skips`].
+    pub skips: ProbeSkips,
+    /// See [`ShadowReport::refused_too_large`].
+    pub refused_too_large: u64,
+    /// See [`ShadowReport::probed_all_oversized`].
+    pub probed_all_oversized: usize,
+}
+
+impl TickSkips {
+    /// Taken from the report as it stands, so a count added to the report has one
+    /// place to be added here.
+    pub(crate) fn of(report: &ShadowReport) -> Self {
+        Self {
+            skips: report.skips,
+            refused_too_large: report.refused_too_large,
+            probed_all_oversized: report.probed_all_oversized,
+        }
+    }
+
+    /// Whether the tick left anything out.
+    pub fn any(&self) -> bool {
+        *self != Self::default()
+    }
+}
+
 /// What the checker has established on this node.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MergeCheckStatus {
@@ -319,6 +364,9 @@ pub struct MergeCheckStatus {
     /// would be actively misleading — on the live capture peer 17% of hosted contracts
     /// could not be judged at all and nothing said so.
     pub without_verdict_last_tick: usize,
+    /// What the most recent tick's probes left out. Zero until a probing tick
+    /// publishes it, and reset by every other publish.
+    pub skipped_last_tick: TickSkips,
     /// Contracts checked, newest first, capped at [`MAX_REMEMBERED_CHECKED`].
     ///
     /// Without this a per-contract view cannot tell "checked, and clean" from "never
@@ -342,6 +390,7 @@ impl Default for MergeCheckStatus {
         Self {
             judged_last_tick: 0,
             without_verdict_last_tick: 0,
+            skipped_last_tick: TickSkips::default(),
             checked: Vec::new(),
             // Overwritten by the first `record`; a default-constructed status has
             // published nothing, and the global is only created by `publish`.
@@ -362,6 +411,8 @@ pub struct MergeCheckView {
     pub judged_last_tick: usize,
     /// See [`MergeCheckStatus::without_verdict_last_tick`].
     pub without_verdict_last_tick: usize,
+    /// See [`MergeCheckStatus::skipped_last_tick`].
+    pub skipped_last_tick: TickSkips,
     /// How long ago the checker last published a tick.
     pub published_secs_ago: u64,
     /// Whether that is long enough ago to distrust — see [`STALE_AFTER`].
@@ -422,6 +473,7 @@ impl MergeCheckStatus {
         MergeCheckView {
             judged_last_tick: self.judged_last_tick,
             without_verdict_last_tick: self.without_verdict_last_tick,
+            skipped_last_tick: self.skipped_last_tick,
             published_secs_ago: age.as_secs(),
             stale: age >= STALE_AFTER,
             contract: record,
@@ -479,6 +531,9 @@ impl MergeCheckStatus {
     ) {
         self.judged_last_tick = judged_last_tick;
         self.without_verdict_last_tick = without_verdict_last_tick;
+        // Cleared here so a publish that does not probe (a barren tick) cannot leave
+        // the previous tick's counts standing beside this tick's zero judged.
+        self.skipped_last_tick = TickSkips::default();
         self.published_at = published_at;
         for record in checked {
             // Move to the FRONT and merge, never dedup-and-leave-in-place. The old
@@ -498,6 +553,12 @@ impl MergeCheckStatus {
                 Some(mut prev) => {
                     prev.verdicts = prev.verdicts.saturating_add(record.verdicts);
                     prev.inconclusive = prev.inconclusive.saturating_add(record.inconclusive);
+                    // The latest probe's, not a sum: the same oversized states are
+                    // counted again by every probe, so a sum grows with time in the
+                    // window and says nothing about the contract.
+                    prev.skips = record.skips;
+                    // A running total on the sampler's side, so the newest wins.
+                    prev.refused_too_large = record.refused_too_large;
                     // Through `note_finding`, the same call `checked_contracts` makes.
                     // Open-coding the deduplication here and not there is #5403 H1:
                     // this arm cannot run until the contract is already in the window,
@@ -536,7 +597,13 @@ pub(crate) fn checked_contracts(
     let checked_at = Instant::now();
     let mut out: Vec<CheckedContract> = judged
         .iter()
-        .map(|j| CheckedContract::new(j.contract, j.verdicts, j.inconclusive, checked_at))
+        .map(|j| {
+            let mut record =
+                CheckedContract::new(j.contract, j.verdicts, j.inconclusive, checked_at);
+            record.skips = j.skips;
+            record.refused_too_large = j.refused_too_large;
+            record
+        })
         .collect();
     for finding in findings {
         let merge = MergeFinding {
@@ -615,6 +682,22 @@ pub(crate) fn publish(
             without_verdict_last_tick,
             published_at,
         );
+}
+
+/// Attach the tick's skip counts to the snapshot [`publish`] just wrote.
+///
+/// Separate from [`publish`] so that function's shape, which source pins in `capture`
+/// anchor on, does not change. It must follow `publish` for the same tick.
+pub(crate) fn publish_skips(skipped: TickSkips) {
+    publish_skips_to(&STATUS, skipped);
+}
+
+/// [`publish_skips`] against a given slot, so a test can prove the write without
+/// sharing the process-global snapshot with every other test that publishes.
+fn publish_skips_to(slot: &RwLock<Option<MergeCheckStatus>>, skipped: TickSkips) {
+    if let Some(status) = slot.write().as_mut() {
+        status.skipped_last_tick = skipped;
+    }
 }
 
 /// What the contract-detail page needs about ONE contract, or `None` if the checker
@@ -1206,6 +1289,110 @@ mod tests {
             .record_for(&instance(1))
             .expect("contract is in the window");
         assert_eq!((record.verdicts, record.inconclusive), (5, 6));
+    }
+
+    /// The skip counts travel from the probe to the record in both of `record`'s arms,
+    /// so the page can say what a clean result leaves out (#6044). The newest probe's
+    /// counts replace the last: each probe recounts the same oversized states, so a sum
+    /// would grow with time in the window. The sampler's refusal count is a running
+    /// total, so the same applies to it.
+    #[test]
+    fn probe_skips_reach_the_record_and_the_latest_replaces_the_last() {
+        let skips = |oversized, budget_cut, not_sampled| ProbeSkips {
+            oversized,
+            budget_cut,
+            not_sampled,
+        };
+        let judged = |s, refused_too_large| JudgedContract {
+            contract: instance(1),
+            verdicts: 1,
+            inconclusive: 0,
+            skips: s,
+            refused_too_large,
+        };
+        let mut status = MergeCheckStatus::default();
+        status.record(
+            checked_contracts(&[judged(skips(1, 2, 3), 4)], &[]),
+            1,
+            0,
+            Instant::now(),
+        );
+        let first = status.record_for(&instance(1)).expect("in the window");
+        assert_eq!(first.skips, skips(1, 2, 3), "the insert arm");
+        assert_eq!(first.refused_too_large, 4, "the insert arm");
+
+        status.record(
+            checked_contracts(&[judged(skips(10, 20, 30), 6)], &[]),
+            1,
+            0,
+            Instant::now(),
+        );
+        let second = status.record_for(&instance(1)).expect("in the window");
+        assert_eq!(
+            second.skips,
+            skips(10, 20, 30),
+            "the merge arm: the latest probe's counts, not 1 + 10"
+        );
+        assert_eq!(
+            second.refused_too_large, 6,
+            "a running total: the newest, not 4 + 6"
+        );
+    }
+
+    /// `publish_skips` writes the counts into the snapshot, and the view the page reads
+    /// carries them. Without a published snapshot it writes nothing.
+    #[test]
+    fn publish_skips_reaches_the_view() {
+        let slot = RwLock::new(None);
+        let counts = TickSkips {
+            skips: ProbeSkips {
+                oversized: 1,
+                budget_cut: 2,
+                not_sampled: 3,
+            },
+            refused_too_large: 4,
+            probed_all_oversized: 5,
+        };
+        publish_skips_to(&slot, counts);
+        assert!(
+            slot.read().is_none(),
+            "nothing published, nothing to attach to"
+        );
+
+        *slot.write() = Some(MergeCheckStatus::default());
+        publish_skips_to(&slot, counts);
+        let view = slot
+            .read()
+            .as_ref()
+            .map(|s| s.view_for(None, Instant::now()))
+            .expect("published");
+        assert_eq!(view.skipped_last_tick, counts);
+    }
+
+    /// The tick-wide counts are cleared by the next publish, so a barren tick cannot
+    /// leave the previous tick's skips standing beside its own zero judged.
+    #[test]
+    fn a_later_publish_clears_the_tick_skip_counts() {
+        let mut status = MergeCheckStatus {
+            skipped_last_tick: TickSkips {
+                skips: ProbeSkips {
+                    oversized: 1,
+                    budget_cut: 0,
+                    not_sampled: 0,
+                },
+                refused_too_large: 2,
+                probed_all_oversized: 3,
+            },
+            ..Default::default()
+        };
+        assert!(
+            status
+                .view_for(None, Instant::now())
+                .skipped_last_tick
+                .any()
+        );
+        status.record([], 0, 0, Instant::now());
+        assert!(!status.skipped_last_tick.any());
     }
 
     /// The unjudgeable count is carried, not inferred.
