@@ -20,6 +20,7 @@ pub use pool::RuntimePool;
 pub(crate) use pool::{ExportAdmission, ExportDone, MAX_CONCURRENT_EXPORTS};
 #[cfg(test)]
 pub(crate) use reapply_probe::{IdenticalIsNoOp, REAPPLY_PROBE_TIME_BUDGET};
+pub(crate) use reapply_probe::{ReapplyVerdict, reapply_verdict};
 
 /// Maximum number of related contracts a single validation can request.
 /// Bounds worst-case first-time cost: N GETs of up to 50MB each.

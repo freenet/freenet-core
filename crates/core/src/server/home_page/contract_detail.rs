@@ -455,6 +455,10 @@ fn merge_law_card(merge_enabled: bool, merge_view: Option<&status::MergeCheckVie
                 (Severity::Violation, Some(IdempotenceSettling::NeverSettled)) => {
                     ("fresh-stale", "Violation — never settles")
                 }
+                (Severity::Violation, Some(IdempotenceSettling::BudgetExhausted)) => (
+                    "fresh-stale",
+                    "Violation — no fixpoint within budget (report-only)",
+                ),
                 (Severity::Violation, Some(IdempotenceSettling::Indeterminate)) => {
                     ("fresh-stale", "Violation — settling unknown")
                 }

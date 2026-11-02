@@ -358,7 +358,14 @@ fn run<O: ConformanceOracle + ?Sized>(
             // kind, and must never turn the finding back into a pass.
             let mut current = once.clone();
             let mut rewrites: u32 = 1;
-            let mut settling = IdempotenceSettling::NeverSettled;
+            // Starts at budget exhaustion, which is report-only: not settling within
+            // a few applies does not prove the state never settles (a slow
+            // contract does the same). Only a repeated state proves it.
+            let mut settling = IdempotenceSettling::BudgetExhausted;
+            // Every state seen so far, `a` included. The merge is deterministic,
+            // so reaching one of them again, without having settled, means the
+            // sequence loops forever.
+            let mut seen: Vec<Vec<u8>> = vec![a.to_vec(), once.clone()];
             let mut classification_failure: Option<Inconclusive> = None;
             // One merge is already spent above, so the remaining budget is
             // `MAX_CANONICALIZATION_APPLIES - 1` and the total is unchanged.
@@ -366,12 +373,11 @@ fn run<O: ConformanceOracle + ?Sized>(
                 // Deliberately NOT `?`. Propagating here would return
                 // `Inconclusive` from the whole check and DISCARD the violation
                 // established above — reporting "we could not tell" about a
-                // contract already caught. The never-settling class grows its
-                // state on every apply, so it is the likeliest to hit a fuel or
-                // size ceiling on exactly these follow-up merges: the class
-                // enforcement can act on would be the one that silently
-                // disappeared, and a contract could arrange that in one line by
-                // trapping on the second identical merge.
+                // contract already caught. A merge that grows its state on every
+                // apply is the likeliest to hit a fuel or size ceiling on exactly
+                // these follow-up merges. Such a failure is recorded as
+                // `Indeterminate`, which is report-only, so a trap cannot be used
+                // to make a finding removable.
                 let merged = match merge(oracle, &current, &current) {
                     Ok(merged) => merged,
                     Err(reason) => {
@@ -392,8 +398,45 @@ fn run<O: ConformanceOracle + ?Sized>(
                     settling = IdempotenceSettling::SettledAfter(rewrites);
                     break;
                 }
+                if seen.contains(&merged) {
+                    settling = IdempotenceSettling::NeverSettled;
+                    break;
+                }
+                seen.push(merged.clone());
                 current = merged;
                 rewrites += 1;
+            }
+
+            // Second proof, for a walk that ran out of budget without a repeat: the
+            // re-delivery test the live probe and the heal step use. An additive
+            // merge (`sorted(a ++ b)`, a counter) never repeats a state and is
+            // commutative and strictly associative, so only this exposes it.
+            //
+            // The case holds one state, so `S` and `X` come from the walk itself:
+            // `X = A` and `S = merge(A, A)`, the walk's first intermediate. `S` is
+            // a state the contract produced from a valid input, it differs from
+            // `X` (the violation above), and it is checked valid below. Then
+            // `reapply_verdict` runs the probe's own rule: `merge(merge(S, X), X)`
+            // must not differ from `merge(S, X)`, a pure reordering is benign, and
+            // merges of identical bytes are answered as the node does. A contract
+            // error, trap or resource limit anywhere in it leaves the finding at
+            // `BudgetExhausted`.
+            let mut redelivery_moves = false;
+            if settling == IdempotenceSettling::BudgetExhausted
+                && matches!(
+                    oracle.validate_state(&once, &case.related),
+                    Ok(ValidateResult::Valid)
+                )
+            {
+                if let Ok(merged) = merge(oracle, &once, a) {
+                    redelivery_moves = matches!(
+                        crate::contract::reapply_verdict(oracle, None, &once, a, &merged,),
+                        crate::contract::ReapplyVerdict::NonSettling(_)
+                    );
+                }
+            }
+            if redelivery_moves {
+                settling = IdempotenceSettling::NeverSettled;
             }
 
             let mut detail = match settling {
@@ -403,10 +446,21 @@ fn run<O: ConformanceOracle + ?Sized>(
                      canonicalizing contract lands here because the install path \
                      stores raw client bytes without running update_state"
                 ),
-                IdempotenceSettling::NeverSettled => format!(
+                IdempotenceSettling::NeverSettled if redelivery_moves => String::from(
+                    "merge(A, A) != A, and merging the same state in a second time \
+                     moved the result again: for S = merge(A, A) and X = A, \
+                     merge(merge(S, X), X) differs from merge(S, X)",
+                ),
+                IdempotenceSettling::NeverSettled => String::from(
+                    "merge(A, A) != A and re-applying the state revisited an earlier \
+                     state without reaching a fixpoint",
+                ),
+                IdempotenceSettling::BudgetExhausted => format!(
                     "merge(A, A) != A and no fixpoint within \
-                     {MAX_CANONICALIZATION_APPLIES} applies: the state changes on \
-                     every re-apply, so redelivery of the same state keeps mutating it"
+                     {MAX_CANONICALIZATION_APPLIES} applies, no state repeated and \
+                     re-delivery did not move the result. That does not show the \
+                     state never settles (it may just need more applies), so this is \
+                     reported and never a removal ground"
                 ),
                 IdempotenceSettling::Indeterminate => {
                     // Name WHICH side failed. Saying "the contract errored" when the
@@ -545,12 +599,18 @@ fn run<O: ConformanceOracle + ?Sized>(
                      the state they converge to revisits an earlier state without reaching \
                      a fixpoint, so under re-delivery the merge cycles and peers never agree"
                     .to_string(),
-                Heal::Refused(reason) => format!(
-                    "merge(merge(A, B), C) differs from merge(A, merge(B, C)), and the \
-                     contract refused a merge needed to reconcile them ({reason}): both \
-                     sides are valid states it emitted itself, so the peers holding them \
-                     can never agree (#5725)"
-                ),
+                // Inconclusive, never a violation. No typed refusal exists, so the
+                // oracle cannot tell a deliberate refusal from a transient contract
+                // error, and a refused heal step proves nothing about whether the
+                // groupings converge. The same reason `StateCommutativity` leaves a
+                // contract error inconclusive. #5725 needs a convergence-based
+                // rule, not refusal-as-violation.
+                Heal::Refused(reason) => {
+                    return Err(Inconclusive::ContractError(format!(
+                        "the contract refused a merge needed to reconcile the groupings: \
+                         {reason}"
+                    )));
+                }
             };
             Ok(compare(case.property, &ab_c, &a_bc, &detail))
         }
@@ -895,13 +955,14 @@ pub(crate) enum Heal {
 ///   re-delivery check in front of it, what reaches it is a merge that absorbs every
 ///   re-delivery yet keeps moving across different inputs without repeating, which
 ///   is not proof of anything within a bounded budget.
-/// - A heal-step merge the CONTRACT rejects is [`Heal::Refused`], a violation. The
-///   strict check has already failed on valid inputs and both groupings are valid,
-///   so the contract is refusing to reconcile two states it emitted itself, which is
-///   the non-convergence #5725 describes. A RUNTIME or resource failure stays
-///   `Inconclusive` (#5509): it may be the harness, and a contract is never removed
-///   for that. This is a residual: a contract that traps or exhausts its budget on a
-///   heal-step merge escapes this law, as it escapes every other law here.
+/// - A heal-step merge the CONTRACT rejects is [`Heal::Refused`], which the caller
+///   treats as inconclusive. No typed refusal exists, so a deliberate refusal and a
+///   transient contract error look the same, and neither shows whether the
+///   groupings converge. A runtime or resource failure is inconclusive too (#5509).
+///   A cycle or a moving re-delivery found BEFORE any refusal is still a violation.
+///   A contract that refuses selectively can therefore hide a cycle as
+///   inconclusive. That stays open under #5725, which must land a convergence-based
+///   rule before Enforce.
 ///
 /// The visited set holds 32-byte digests rather than states, so a large state cannot
 /// make it expensive; it never holds more than `5 * MAX_HEAL_PASSES + 1` entries.
@@ -1296,10 +1357,9 @@ fn inconclusive_from(err: OracleError) -> Inconclusive {
         // violation would mean removing a contract for a bug in the runtime
         // executing it. The one exception is a caller that has already established
         // a violation's premise and then needs a merge the contract refuses:
-        // `heal_merge` turns a `ContractError` (never a runtime or resource one)
-        // into a `StateAssociativity` finding, because by then the contract is
-        // refusing to reconcile two valid states it emitted itself (#5725). Every
-        // other caller still gets the inconclusive below.
+        // `heal_merge` hands a `ContractError` back to its caller as
+        // `Heal::Refused`; the associativity check reports that as inconclusive too,
+        // for the same reason (no typed refusal, #5725).
         //
         // The two are also LABELLED apart: a trap in the host or the WASM module is
         // not the contract's fault, and folding it into

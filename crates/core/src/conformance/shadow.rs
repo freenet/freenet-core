@@ -1656,6 +1656,14 @@ mod settled_counter_tests {
                 ConformanceProperty::StateIdempotence,
                 Some(IdempotenceSettling::SettledAfter(1)),
             ),
+            violation_of(
+                ConformanceProperty::StateIdempotence,
+                Some(IdempotenceSettling::BudgetExhausted),
+            ),
+            violation_of(
+                ConformanceProperty::StateIdempotence,
+                Some(IdempotenceSettling::Indeterminate),
+            ),
             violation_of(ConformanceProperty::TransitionPathAgreement, None),
             violation_of(ConformanceProperty::DeltaPermutationInvariance, None),
             violation_of(ConformanceProperty::PathAgreement, None),
@@ -1666,9 +1674,9 @@ mod settled_counter_tests {
         let (report, findings) = tally(&report_only);
         assert_eq!(report.would_remove, 0, "{findings:?}");
         assert_eq!(report.reported, report_only.len());
-        // The first four are law breaks of a report-only tier, the last three
-        // diagnostics: only the four are report-only violations.
-        assert_eq!(report.report_only_violations, 4, "{findings:?}");
+        // The first six are law breaks of a report-only tier, the last three
+        // diagnostics: only the six are report-only violations.
+        assert_eq!(report.report_only_violations, 6, "{findings:?}");
 
         // Forged severity fields, each direction tallied ON ITS OWN (together,
         // reading the field would lose one and gain one, and the total would not
@@ -1694,7 +1702,7 @@ mod settled_counter_tests {
     }
 
     /// The counterpart: removal-eligible findings still reach `would_remove`, an
-    /// idempotence finding not shown to settle included. Without it, a tally that
+    /// idempotence finding proven never to settle included. Without it, a tally that
     /// counted everything as reported would pass the test above.
     #[test]
     fn removal_eligible_findings_still_reach_would_remove_in_shadow() {
@@ -1702,10 +1710,6 @@ mod settled_counter_tests {
             violation_of(
                 ConformanceProperty::StateIdempotence,
                 Some(IdempotenceSettling::NeverSettled),
-            ),
-            violation_of(
-                ConformanceProperty::StateIdempotence,
-                Some(IdempotenceSettling::Indeterminate),
             ),
             violation_of(ConformanceProperty::StateCommutativity, None),
         ];

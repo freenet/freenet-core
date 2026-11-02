@@ -4769,12 +4769,17 @@ mod tests {
                         property: "state_idempotence",
                         severity: Severity::Violation,
                         settling,
-                        // The decision `policy::removal_tier` gives the class: a
-                        // settled finding is report-only.
-                        would_remove: !matches!(
-                            settling,
-                            Some(IdempotenceSettling::SettledAfter(_))
-                        ),
+                        // The decision `policy::removal_tier` gives the class.
+                        would_remove: crate::conformance::removal_tier(
+                            &crate::conformance::property::Violation {
+                                property: crate::conformance::property::ConformanceProperty::StateIdempotence,
+                                severity: Severity::Violation,
+                                left: crate::conformance::property::OutputDigest::of(b"l"),
+                                right: crate::conformance::property::OutputDigest::of(b"r"),
+                                detail: String::new(),
+                                settling,
+                            },
+                        ) == crate::conformance::RemovalTier::RemovalEligible,
                     }],
                 )],
                 1,
@@ -4808,6 +4813,19 @@ mod tests {
         assert!(
             settled.contains(r#"<td class="right">no</td></tr>"#),
             "a settled finding must show 'would remove: no':\n{settled}"
+        );
+        let budget = rendered(Some(IdempotenceSettling::BudgetExhausted));
+        assert!(
+            budget.contains("Violation — no fixpoint within budget (report-only)"),
+            "the budget-exhausted row must say so:\n{budget}"
+        );
+        assert!(
+            budget.contains(r#"<td class="right">no</td></tr>"#),
+            "budget exhaustion must show 'would remove: no':\n{budget}"
+        );
+        assert!(
+            never.contains(r#"<td class="right">yes</td></tr>"#),
+            "a proven never-settling finding must show 'would remove: yes':\n{never}"
         );
     }
 

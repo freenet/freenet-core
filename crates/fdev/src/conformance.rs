@@ -4115,7 +4115,8 @@ mod tests {
             ) -> Result<UpdateModification<'static>, OracleError> {
                 let mut out = state.to_vec();
                 if out.len() > 4 {
-                    out.push(0);
+                    // Toggles a bit: the state repeats, a proven loop.
+                    out[0] ^= 1;
                 } else {
                     out.sort_unstable();
                 }
@@ -4190,7 +4191,8 @@ mod tests {
                 if self.sorts {
                     out.sort_unstable();
                 } else {
-                    out.push(0);
+                    // Toggles a bit: the state repeats, a proven loop.
+                    out[0] ^= 1;
                 }
                 Ok(UpdateModification::valid(State::from(out)))
             }

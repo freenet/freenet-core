@@ -134,6 +134,7 @@ pub(crate) use init_tracker::{
     MAX_QUEUED_OPS_PER_CONTRACT, SLOW_INIT_THRESHOLD, STALE_INIT_THRESHOLD, now_nanos,
 };
 pub(crate) use runtime::RuntimePool;
+pub(crate) use runtime::{ReapplyVerdict, reapply_verdict};
 
 /// Typed marker for queue-full errors so callers can downcast and
 /// distinguish transient per-contract queue saturation from real

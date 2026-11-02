@@ -703,6 +703,99 @@ fn a_cyclic_pick_one_merge_is_reported() {
     );
 }
 
+/// Averaging over `(0, 0, 8)`: the groupings are 4 and 2, and the heal step's
+/// merges are, in order, `(4,2)` first, `(2,4)` reverse, `(3,2)` absorb, `(2,2)`
+/// re-delivery. A refusal at each position is inconclusive.
+fn averaging_refusing(pair: (u8, u8)) -> Fake {
+    Fake::conforming()
+        .merging(move |a, b| {
+            let (x, y) = (a[0], b[0]);
+            if (x, y) == pair {
+                return Err(OracleError::contract("refuses"));
+            }
+            Ok(vec![((x as u16 + y as u16) / 2) as u8])
+        })
+        .validating(|state| {
+            if state.len() == 1 {
+                Ok(ValidateResult::Valid)
+            } else {
+                Ok(ValidateResult::Invalid)
+            }
+        })
+}
+
+#[test]
+fn a_refusal_at_each_heal_position_is_inconclusive() {
+    for (position, pair) in [
+        ("first", (4, 2)),
+        ("reverse", (2, 4)),
+        ("absorb", (3, 2)),
+        ("re-delivery", (2, 2)),
+    ] {
+        println!("refusal at the {position} heal merge");
+        assert_inconclusive(
+            verify_case(
+                &mut averaging_refusing(pair),
+                &case(ConformanceProperty::StateAssociativity, &[&[0], &[0], &[8]]),
+            ),
+            Inconclusive::ContractError(
+                "the contract refused a merge needed to reconcile the groupings: refuses".into(),
+            ),
+        );
+    }
+}
+
+/// The cyclic pick-one merge (#5924), driven through `associativity_heals`
+/// directly so the number of merges is exact. The cycle is found on the last
+/// merge. A refusal on ANY earlier merge hides it as `Refused` (inconclusive);
+/// this is the documented residual under #5725, pinned so it cannot widen. With
+/// no refusal it is `Cycle`, a violation.
+#[test]
+fn a_refusal_before_the_cycle_is_found_hides_it_and_none_after_is_possible() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use super::verifier::{Heal, associativity_heals};
+
+    fn newer(a: &[u8], b: &[u8]) -> Vec<u8> {
+        if (1..128).contains(&b[0].wrapping_sub(a[0])) {
+            b.to_vec()
+        } else {
+            a.to_vec()
+        }
+    }
+    let run = |refuse_at: Option<usize>| {
+        let calls = Rc::new(Cell::new(0usize));
+        let seen = calls.clone();
+        let mut fake = Fake::conforming()
+            .merging(move |a, b| {
+                seen.set(seen.get() + 1);
+                if Some(seen.get()) == refuse_at {
+                    return Err(OracleError::contract("refuses"));
+                }
+                Ok(newer(a, b))
+            })
+            .validating(|_| Ok(ValidateResult::Valid));
+        let verdict = associativity_heals(&mut fake, &[200], &[0], [&[0], &[100], &[200]])
+            .expect("no runtime failure");
+        (verdict, calls.get())
+    };
+    let (verdict, total) = run(None);
+    assert!(matches!(verdict, Heal::Cycle), "{verdict:?}");
+    for position in 1..=total {
+        let (verdict, _) = run(Some(position));
+        assert!(
+            matches!(verdict, Heal::Refused(_)),
+            "a refusal on merge {position} of {total} must hide the cycle: {verdict:?}"
+        );
+    }
+    let (verdict, _) = run(Some(total + 1));
+    assert!(
+        matches!(verdict, Heal::Cycle),
+        "no merge follows the cycle verdict, so a later refusal is never consulted"
+    );
+}
+
 /// Every strictly failing bounded-log triple heals, over a whole small state space,
 /// for both truncation orders.
 ///
@@ -777,13 +870,15 @@ fn every_bounded_log_triple_heals() {
 }
 
 /// After strict associativity has failed on valid inputs and valid groupings, the
-/// CONTRACT refusing a heal-step merge is a violation: it will not merge two states
-/// it emitted itself, so the peers holding them can never reconcile (#5725).
+/// CONTRACT refusing a heal-step merge is INCONCLUSIVE: no typed refusal exists, so
+/// the oracle cannot tell a deliberate refusal from a transient contract error, and
+/// the refusal shows nothing about whether the groupings converge. #5725 stays open
+/// and needs a convergence-based rule.
 ///
 /// Averaging, except that it rejects merging 4 with 2, which on `(0, 0, 8)` are
 /// exactly the two groupings and nothing the strict check merges.
 #[test]
-fn a_contract_refusing_to_reconcile_its_own_groupings_is_reported() {
+fn a_contract_refusing_to_reconcile_its_own_groupings_is_inconclusive() {
     let mut fake = Fake::conforming()
         .merging(|a, b| {
             let (x, y) = (a[0], b[0]);
@@ -799,12 +894,16 @@ fn a_contract_refusing_to_reconcile_its_own_groupings_is_reported() {
                 Ok(ValidateResult::Invalid)
             }
         });
-    assert_violates(
+    assert_inconclusive(
         verify_case(
             &mut fake,
             &case(ConformanceProperty::StateAssociativity, &[&[0], &[0], &[8]]),
         ),
-        ConformanceProperty::StateAssociativity,
+        Inconclusive::ContractError(
+            "the contract refused a merge needed to reconcile the groupings: \
+             refuses to merge"
+                .into(),
+        ),
     );
 }
 
@@ -1243,20 +1342,25 @@ fn the_evidence_schema_version_moved_with_the_violation_shape() {
 }
 
 /// The budget is 3 merges, and a contract that would settle on the 4th is
-/// `NeverSettled`.
+/// `BudgetExhausted`: report-only, because it never repeated a state and may just
+/// be slow.
 ///
 /// Added after mutation: widening the loop to `1..=MAX` (4 merges) passed the whole
 /// suite. The settling fixtures were budget-insensitive above the floor — the
 /// countdown from `[2]` pins the LOWER bound and the appending fake never settles at
 /// any budget — so nothing drew the boundary the property actually turns on.
 #[test]
-fn a_contract_that_would_settle_one_apply_late_is_never_settled() {
-    // [3] -> [2] -> [1] -> [0], so it needs FOUR merges to reach a fixpoint.
+fn a_contract_that_would_settle_one_apply_late_is_budget_exhausted() {
+    // [3] -> [2] -> [1] -> [0] on a self-merge, so it needs FOUR merges to reach a
+    // fixpoint. Merging two DIFFERENT states keeps the first, so re-delivery does
+    // not move it: neither proof applies.
     let mut fake = Fake::conforming()
-        .merging(|a, _b| {
+        .merging(|a, b| {
             let mut out = a.to_vec();
-            if let Some(first) = out.first_mut() {
-                *first = first.saturating_sub(1);
+            if a == b {
+                if let Some(first) = out.first_mut() {
+                    *first = first.saturating_sub(1);
+                }
             }
             Ok(out)
         })
@@ -1272,9 +1376,9 @@ fn a_contract_that_would_settle_one_apply_late_is_never_settled() {
     };
     assert_eq!(
         v.settling,
-        Some(IdempotenceSettling::NeverSettled),
-        "settling beyond the budget is NOT observed settling: within the 3 merges \
-         this check spends, the state changed every time"
+        Some(IdempotenceSettling::BudgetExhausted),
+        "settling beyond the budget is NOT observed settling, and no state repeated, \
+         so it is not proof of a loop either"
     );
 }
 
@@ -1311,7 +1415,7 @@ fn the_classification_loop_re_merges_the_state_with_itself() {
         v.settling,
         Some(IdempotenceSettling::SettledAfter(1)),
         "re-merging the rewritten state with ITSELF settles at once; merging it \
-         against the original would grow forever and report NeverSettled"
+         against the original would grow forever and report BudgetExhausted"
     );
 }
 
@@ -1407,8 +1511,9 @@ fn the_settled_after_count_reports_the_actual_number_of_rewrites() {
 /// the verifier reported them identically (both `Holds` if they settled within the
 /// budget, both a bare violation otherwise).
 #[test]
-fn a_never_settling_contract_is_flagged_as_never_settling() {
-    // Appends a byte every time it is merged, so it never reaches a fixpoint.
+fn an_appending_merge_is_never_settled_by_redelivery() {
+    // Appends a byte every time it is merged: it never reaches a fixpoint and
+    // never repeats a state, but merging the same state in again moves the result.
     let mut fake = Fake::conforming()
         .merging(|a, _b| {
             let mut out = a.to_vec();
@@ -1429,8 +1534,159 @@ fn a_never_settling_contract_is_flagged_as_never_settling() {
     assert_eq!(
         v.settling,
         Some(IdempotenceSettling::NeverSettled),
-        "never reaching a fixpoint must be recorded as such, since it is the case \
-         an enforcement policy can act on without waiting for the install path"
+        "a result that keeps moving when the same state is merged in again is a \
+         proof of non-settling even though no state repeated"
+    );
+}
+
+/// The case the second proof exists for: an additive merge is commutative and
+/// strictly associative and never repeats a state, so no other removal-eligible
+/// law sees it. Merging the same state in again moves the result.
+#[test]
+fn an_additive_merge_is_never_settled_by_redelivery() {
+    let mut fake = Fake::conforming()
+        .merging(|a, b| {
+            let mut out: Vec<u8> = a.iter().chain(b.iter()).copied().collect();
+            out.sort_unstable();
+            Ok(out)
+        })
+        .validating(|_| Ok(ValidateResult::Valid));
+    let PropertyOutcome::Violated(v) = verify_case(
+        &mut fake,
+        &case(ConformanceProperty::StateIdempotence, &[&[1u8]]),
+    ) else {
+        panic!("an additive merge breaks idempotence");
+    };
+    assert_eq!(v.settling, Some(IdempotenceSettling::NeverSettled));
+}
+
+/// A slow drift that moves on every merge but bottoms out (here a countdown to
+/// zero) is accepted as the same residual the associativity heal step has: the
+/// re-delivery test heals it ("settles"), so it stays `BudgetExhausted` and
+/// report-only.
+#[test]
+fn a_slow_drift_that_bottoms_out_is_budget_exhausted() {
+    let mut fake = Fake::conforming()
+        .merging(|a, _b| {
+            let mut out = a.to_vec();
+            if let Some(first) = out.first_mut() {
+                *first = first.saturating_sub(1);
+            }
+            Ok(out)
+        })
+        .validating(|_| Ok(ValidateResult::Valid));
+    let PropertyOutcome::Violated(v) = verify_case(
+        &mut fake,
+        &case(ConformanceProperty::StateIdempotence, &[&[3u8]]),
+    ) else {
+        panic!("a countdown breaks idempotence");
+    };
+    assert_eq!(v.settling, Some(IdempotenceSettling::BudgetExhausted));
+}
+
+/// A contract that fails only by a contract error in the re-delivery test stays
+/// report-only: the self-merge walk exhausts its budget, and merging the state
+/// with a different one is refused.
+#[test]
+fn a_refusal_in_the_re_delivery_test_leaves_the_finding_budget_exhausted() {
+    let mut fake = Fake::conforming()
+        .merging(|a, b| {
+            if a != b {
+                return Err(OracleError::contract("refuses"));
+            }
+            let mut out = a.to_vec();
+            out[0] = out[0].saturating_sub(1);
+            Ok(out)
+        })
+        .validating(|_| Ok(ValidateResult::Valid));
+    let PropertyOutcome::Violated(v) = verify_case(
+        &mut fake,
+        &case(ConformanceProperty::StateIdempotence, &[&[3u8]]),
+    ) else {
+        panic!("a countdown breaks idempotence");
+    };
+    assert_eq!(v.settling, Some(IdempotenceSettling::BudgetExhausted));
+}
+
+/// A pure reordering in the re-delivery test is benign, as the live probe treats
+/// it: the self-merge keeps changing, but merging `A` in again only permutes bytes.
+#[test]
+fn a_reordering_in_the_re_delivery_test_is_not_a_proof() {
+    let mut fake = Fake::conforming()
+        .merging(|a, b| {
+            let mut out = a.to_vec();
+            if a == b {
+                out[0] = out[0].saturating_sub(1);
+            } else {
+                out.rotate_left(1);
+            }
+            Ok(out)
+        })
+        .validating(|_| Ok(ValidateResult::Valid));
+    let PropertyOutcome::Violated(v) = verify_case(
+        &mut fake,
+        &case(ConformanceProperty::StateIdempotence, &[&[9u8, 8, 7]]),
+    ) else {
+        panic!("a countdown breaks idempotence");
+    };
+    assert_eq!(v.settling, Some(IdempotenceSettling::BudgetExhausted));
+}
+
+/// Repeated states, by where the loop closes: back to the original, and back to
+/// the first rewrite. The merge of two different states keeps the first, so
+/// re-delivery never moves and the repeat is the only evidence.
+#[test]
+fn a_repeated_state_is_never_settled_wherever_the_loop_closes() {
+    for (name, next) in [
+        ("period 2: back to the original", [1u8, 0, 2]),
+        ("period 3: back to the original", [1, 2, 0]),
+        ("back to the first rewrite", [1, 2, 1]),
+    ] {
+        let mut fake = Fake::conforming()
+            .merging(move |a, b| {
+                Ok(if a == b {
+                    vec![next[a[0] as usize]]
+                } else {
+                    a.to_vec()
+                })
+            })
+            .validating(|_| Ok(ValidateResult::Valid));
+        let PropertyOutcome::Violated(v) = verify_case(
+            &mut fake,
+            &case(ConformanceProperty::StateIdempotence, &[&[0u8]]),
+        ) else {
+            panic!("{name}: must be reported");
+        };
+        assert_eq!(
+            v.settling,
+            Some(IdempotenceSettling::NeverSettled),
+            "{name}"
+        );
+    }
+}
+
+/// A repeated state is proof of non-settling. The merge toggles `[0]` and `[1]`
+/// forever; the second re-apply returns to a state already seen, and the merge is
+/// deterministic, so re-delivery loops. This is the only class that is
+/// removal-eligible (`policy::removal_tier`).
+#[test]
+fn a_contract_that_revisits_a_state_is_never_settled() {
+    let mut fake = Fake::conforming()
+        .merging(|a, _b| Ok(vec![1 - a[0]]))
+        .validating(|_| Ok(ValidateResult::Valid));
+    let PropertyOutcome::Violated(v) = verify_case(
+        &mut fake,
+        &case(ConformanceProperty::StateIdempotence, &[&[0u8]]),
+    ) else {
+        panic!("a toggling merge must be reported");
+    };
+    assert_eq!(v.settling, Some(IdempotenceSettling::NeverSettled));
+    assert!(
+        super::policy::decide(
+            super::policy::EnforcementMode::Enforce,
+            &PropertyOutcome::Violated(v)
+        )
+        .removes(),
     );
 }
 

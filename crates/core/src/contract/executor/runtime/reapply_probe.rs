@@ -44,7 +44,8 @@
 //!   validated `merged`, so this rule does not ask again; it does not check the
 //!   re-apply's validity either, and does not flag for it.
 //! - A heal step the contract refuses, and running out of heal passes, are
-//!   inconclusive here. The verifier reports a refusal as a violation.
+//!   inconclusive here, and in the verifier too (#5725 is open for a rule that
+//!   handles refusals).
 //! - The work is bounded by [`REAPPLY_PROBE_MAX_CALLS`] and
 //!   [`REAPPLY_PROBE_TIME_BUDGET`]; past either the rule is inconclusive.
 //!

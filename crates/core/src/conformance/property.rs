@@ -843,8 +843,8 @@ pub struct Violation {
 /// consequence (#5462).
 ///
 /// The enforcement consequence is decided separately, by `policy::removal_tier`:
-/// [`IdempotenceSettling::SettledAfter`] is report-only, and every other class
-/// keeps the property's removal-eligible tier.
+/// only [`IdempotenceSettling::NeverSettled`] (a repeated state) is
+/// removal-eligible; every other class is report-only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum IdempotenceSettling {
@@ -861,16 +861,12 @@ pub enum IdempotenceSettling {
     /// Report-only in every mode (`policy::removal_tier`): the contract converges
     /// after a bounded cost, and anyone who can PUT can produce one.
     SettledAfter(u32),
-    /// No fixpoint within the budget: the state changes on every re-apply, so
-    /// redelivery of the same state keeps mutating it, at least for as long as the
-    /// budget looked. Keeps the property's removal-eligible tier. A bounded budget
-    /// running out is not a proof that the state never settles; replacing it with
-    /// one (a repeated state, or a re-delivery failure) is tracked in #5906.
-    ///
-    /// **Known gap, to close before Enforce can become reachable:** a contract
-    /// that settles after more rewrites than the budget lands here and is
-    /// removal-eligible. Pinned as current behaviour by
-    /// `policy::tests::known_gap_idempotence_not_shown_to_settle_stays_removal_eligible`.
+    /// Proof that the state does not settle, by either of two observations:
+    /// re-applying the state revisited an earlier state, or merging the same
+    /// state in a second time moved the result again
+    /// (`merge(merge(S, X), X) != merge(S, X)`, the test the live probe and the
+    /// associativity heal step use). The only class that keeps the property's
+    /// removal-eligible tier.
     NeverSettled,
     /// Classification could not complete, so whether the state settles is unknown.
     ///
@@ -887,26 +883,30 @@ pub enum IdempotenceSettling {
     ///
     /// This variant exists because the alternative was losing the finding. The
     /// classification merges used to propagate their error out of the whole check,
-    /// which turned an established violation into "we could not tell" — and the
-    /// never-settling class GROWS its state on every apply, so it is the most
-    /// likely to trip a fuel or size ceiling on the second or third one. The class
-    /// an enforcement policy can act on was the class that vanished, and a hostile
-    /// contract could arrange it in one line by trapping on the second identical
-    /// merge.
+    /// which turned an established violation into "we could not tell". A merge that
+    /// grows its state on every apply is the most likely to trip a fuel or size
+    /// ceiling on the second or third one, so the finding is kept and marked
+    /// `Indeterminate`, which is report-only.
     ///
     /// Deliberately not folded into `NeverSettled` (that is the harsher label and
     /// asserting it without evidence is exactly the sin this issue is about) nor
     /// into `settling: None` (ambiguous with "this property carries no settling
     /// data at all").
     ///
-    /// **Known gap, to close before Enforce can become reachable:** this class
-    /// keeps the property's removal-eligible tier, yet it can come from a fuel trap
-    /// or a resource ceiling on the follow-up merges, which a PUT of an unusual or
-    /// large state can reach. Removal must rest on proof that the state never
-    /// settles, not on classification failing. That proof is the next #5906 item;
-    /// until then this is pinned as current behaviour by
-    /// `policy::tests::known_gap_idempotence_not_shown_to_settle_stays_removal_eligible`.
+    /// Report-only in every mode: a fuel trap or resource ceiling on the follow-up
+    /// merges, which a PUT of an unusual or large state can reach, must not lead to
+    /// removal.
     Indeterminate,
+    /// No fixpoint within the budget, no repeated state, and merging the same
+    /// state in again did not move the result. A bounded budget running out
+    /// proves nothing (a slow contract does the same), so this is report-only in
+    /// every mode.
+    ///
+    /// Declared last so the bincode index of the variants above is unchanged
+    /// (`EVIDENCE_SCHEMA_VERSION` is not bumped). An older reader cannot decode
+    /// this variant, so a peer that does not know it rejects such evidence; it
+    /// is report-only and is never sent as removal evidence.
+    BudgetExhausted,
 }
 
 impl std::fmt::Display for Violation {

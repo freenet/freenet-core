@@ -169,8 +169,8 @@ pub fn property_tier(property: ConformanceProperty) -> RemovalTier {
         ConformanceProperty::PathAgreement | ConformanceProperty::TransitionPathAgreement => {
             RemovalTier::ReportOnly
         }
-        // `StateIdempotence` is refined per finding by `removal_tier`: a state that
-        // settles after a rewrite is report-only, anything else keeps this tier.
+        // `StateIdempotence` is refined per finding by `removal_tier`: only a
+        // proven never-settling state keeps this tier.
         ConformanceProperty::StateIdempotence
         | ConformanceProperty::StateCommutativity
         | ConformanceProperty::StateAssociativity
@@ -185,16 +185,16 @@ pub fn property_tier(property: ConformanceProperty) -> RemovalTier {
 /// The tier of one finding: [`property_tier`], refined by what this peer
 /// recomputed about the finding.
 ///
-/// The one refinement is idempotence. A `StateIdempotence` finding whose state
-/// was rewritten and then held still ([`IdempotenceSettling::SettledAfter`]) is
-/// report-only: the contract converges after a bounded cost, and the install path
-/// stores raw client bytes without running the merge, so anyone who can PUT can
-/// produce one. A finding that did not settle within the budget
-/// ([`IdempotenceSettling::NeverSettled`]) or whose classification could not
-/// complete ([`IdempotenceSettling::Indeterminate`]) keeps the property's tier.
-/// Neither is a proof that the state never settles, so both are a known gap that
-/// must be closed before Enforce can become reachable; replacing the bounded budget
-/// with a proof of non-settling is separate work (#5906).
+/// The one refinement is idempotence. A `StateIdempotence` finding is
+/// removal-eligible only when it carries one of the two proofs recorded as
+/// [`IdempotenceSettling::NeverSettled`]: re-applying the state revisited an
+/// earlier state, or merging the same state in a second time moved the result
+/// again. Every other class is report-only: settled after a
+/// rewrite ([`IdempotenceSettling::SettledAfter`], which anyone who can PUT can
+/// produce because the install path stores raw bytes), budget exhausted with
+/// neither proof ([`IdempotenceSettling::BudgetExhausted`], which a slow contract also
+/// does), classification failed ([`IdempotenceSettling::Indeterminate`], which a
+/// trap or resource ceiling can cause), or no classification.
 ///
 /// This tier governs conformance REMOVAL only. The live re-apply probe
 /// (`ring::broken_invariants`, fed by `contract::executor::runtime::reapply_probe`)
@@ -203,14 +203,19 @@ pub fn property_tier(property: ConformanceProperty) -> RemovalTier {
 ///
 /// `settling` is read from the `Violation` because nothing else carries it. That
 /// is sound for the same reason [`decide`] is: its caller re-executed the case
-/// itself, so the classification is local. It can also only LOWER the tier: the
-/// arm keys on the property, so a `settling` value on any other property is
-/// ignored, and every other settling class leaves the property's tier unchanged.
+/// itself, so the classification is local. It can only LOWER the tier below the
+/// property's: the arms key on the property, so a `settling` value on any other
+/// property is ignored.
 pub fn removal_tier(violation: &Violation) -> RemovalTier {
     match (violation.property, violation.settling) {
-        (ConformanceProperty::StateIdempotence, Some(IdempotenceSettling::SettledAfter(_))) => {
-            RemovalTier::ReportOnly
+        // Removal needs proof that the state never settles: a repeated state.
+        (ConformanceProperty::StateIdempotence, Some(IdempotenceSettling::NeverSettled)) => {
+            RemovalTier::RemovalEligible
         }
+        // Everything else about idempotence is report-only: settled after a
+        // rewrite, budget exhausted without a repeat, classification unknown, or
+        // no classification at all. None of them proves non-convergence.
+        (ConformanceProperty::StateIdempotence, _) => RemovalTier::ReportOnly,
         (property, _) => property_tier(property),
     }
 }
@@ -418,47 +423,45 @@ mod tests {
         assert_report_only_in_every_mode(&violation(ConformanceProperty::WholeStateSelfDelta));
     }
 
-    /// The counterpart to the settled case: an idempotence finding that is NOT shown
-    /// to settle keeps the property's tier. Without this, making all of
-    /// `StateIdempotence` report-only would pass the settled test above.
-    ///
-    /// KNOWN GAP, pinned on purpose. `NeverSettled` here means "did not settle
-    /// within the budget" and `Indeterminate` means "classification failed" (a trap
-    /// or a resource ceiling can cause it). Neither is a proof that the state never
-    /// settles, and both must be resolved before Enforce can become reachable
-    /// (#5906, proof of non-settling). When that lands this test changes with it;
-    /// until then it records what the policy does today.
+    /// Removal needs proof that the state never settles: a repeated state
+    /// (`NeverSettled`). Budget exhaustion, a failed classification and a missing
+    /// classification are report-only in every mode.
     #[test]
-    fn known_gap_idempotence_not_shown_to_settle_stays_removal_eligible() {
+    fn only_a_proven_never_settling_idempotence_finding_is_removal_eligible() {
+        let proven = idempotence_with(Some(IdempotenceSettling::NeverSettled));
+        assert!(matches!(
+            decide(EnforcementMode::Shadow, &proven),
+            ConformanceAction::WouldRemove(_)
+        ));
+        assert!(decide(EnforcementMode::Enforce, &proven).removes());
         for settling in [
-            Some(IdempotenceSettling::NeverSettled),
+            Some(IdempotenceSettling::BudgetExhausted),
             Some(IdempotenceSettling::Indeterminate),
             None,
         ] {
-            let outcome = idempotence_with(settling);
-            assert!(
-                matches!(
-                    decide(EnforcementMode::Shadow, &outcome),
-                    ConformanceAction::WouldRemove(_)
-                ),
-                "{settling:?} must stay would-remove in shadow"
-            );
-            assert!(
-                decide(EnforcementMode::Enforce, &outcome).removes(),
-                "{settling:?} must stay removable under enforcement"
-            );
+            assert_report_only_in_every_mode(&idempotence_with(settling));
         }
     }
 
-    /// `settling` refines idempotence only. A `SettledAfter` attached to any other
-    /// property must not buy it the report-only tier.
+    /// `settling` refines idempotence only. A settling value attached to any other
+    /// property must not buy it the report-only tier, nor change it any other way.
     #[test]
     fn a_settling_value_on_another_property_does_not_change_its_tier() {
-        let outcome = PropertyOutcome::Violated(Violation {
-            settling: Some(IdempotenceSettling::SettledAfter(1)),
-            ..violation_of(ConformanceProperty::StateCommutativity)
-        });
-        assert!(decide(EnforcementMode::Enforce, &outcome).removes());
+        for settling in [
+            IdempotenceSettling::SettledAfter(1),
+            IdempotenceSettling::BudgetExhausted,
+            IdempotenceSettling::NeverSettled,
+            IdempotenceSettling::Indeterminate,
+        ] {
+            let outcome = PropertyOutcome::Violated(Violation {
+                settling: Some(settling),
+                ..violation_of(ConformanceProperty::StateCommutativity)
+            });
+            assert!(
+                decide(EnforcementMode::Enforce, &outcome).removes(),
+                "{settling:?} on state_commutativity must stay removable"
+            );
+        }
     }
 
     /// The whole partition, stated once. A property moving between tiers is a
@@ -487,9 +490,15 @@ mod tests {
         // And each of them really does reach `WouldRemove`, so the list is a fact
         // about `decide` and not only about the table.
         for property in eligible {
+            let outcome = if property == ConformanceProperty::StateIdempotence {
+                // Idempotence is refined per finding: only a proven loop removes.
+                idempotence_with(Some(IdempotenceSettling::NeverSettled))
+            } else {
+                violation(property)
+            };
             assert!(
                 matches!(
-                    decide(EnforcementMode::Shadow, &violation(property)),
+                    decide(EnforcementMode::Shadow, &outcome),
                     ConformanceAction::WouldRemove(_)
                 ),
                 "{property} is listed removal-eligible but shadow did not propose it"

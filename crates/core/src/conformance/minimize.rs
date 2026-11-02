@@ -65,9 +65,10 @@ pub struct MinimizeReport {
 /// evidence no peer may act on.
 ///
 /// Tier equality is deliberately coarse. It does not pin the settling class, so
-/// a `NeverSettled` case may shrink to an `Indeterminate` one: both are
-/// removal-eligible today, and pinning the class would refuse shrinks that change
-/// nothing a receiving peer decides.
+/// a `BudgetExhausted` case may shrink to an `Indeterminate` one: both are
+/// report-only, and pinning the class would refuse shrinks that change
+/// nothing a receiving peer decides. A shrink that crosses the tier, such as
+/// `NeverSettled` to `BudgetExhausted`, is refused.
 ///
 /// Returns the case unchanged if it does not currently violate anything: shrinking
 /// a case that does not fail would be searching for a failure, which is a different
@@ -271,6 +272,7 @@ mod tests {
 
     use super::*;
     use crate::conformance::oracle::OracleError;
+    use crate::conformance::property::IdempotenceSettling;
 
     /// Last-write-wins over opaque bytes: commutative only when both sides already
     /// agree, so any two distinct states are a witness. That makes it a good subject
@@ -615,8 +617,8 @@ mod tests {
     }
 
     /// Short states are canonicalized by sorting (settles after one rewrite, so
-    /// report-only); longer ones grow on every merge (never settles, so
-    /// removal-eligible). Both are `StateIdempotence` violations.
+    /// report-only); longer ones toggle a bit on every merge (the state
+    /// repeats, so it never settles and is removal-eligible). Both are `StateIdempotence` violations.
     ///
     /// fdev's `minimisation_keeps_a_removal_eligible_finding_removal_eligible` has
     /// its own copy (fdev cannot reach this test module); keep the two in step.
@@ -638,7 +640,8 @@ mod tests {
         ) -> Result<UpdateModification<'static>, OracleError> {
             let mut out = state.to_vec();
             if out.len() > 4 {
-                out.push(0);
+                // Toggles one bit: the state repeats, which is proof of a loop.
+                out[0] ^= 1;
             } else {
                 out.sort_unstable();
             }
@@ -700,9 +703,86 @@ mod tests {
         assert_eq!(minimized.states, original.states);
     }
 
+    /// Long states toggle a bit on a self-merge (a repeated state: proof, so
+    /// removal-eligible); short ones count down on a self-merge only, so the budget
+    /// runs out with no repeat and no re-delivery movement (report-only).
+    struct LoopsOnlyWhenLong;
+
+    impl ConformanceOracle for LoopsOnlyWhenLong {
+        fn validate_state(
+            &mut self,
+            _state: &[u8],
+            _related: &RelatedContracts<'_>,
+        ) -> Result<ValidateResult, OracleError> {
+            Ok(ValidateResult::Valid)
+        }
+
+        fn update_state(
+            &mut self,
+            state: &[u8],
+            updates: &[UpdateData<'_>],
+        ) -> Result<UpdateModification<'static>, OracleError> {
+            let mut out = state.to_vec();
+            let same = matches!(updates, [UpdateData::State(other)] if other.as_ref() == state);
+            if same {
+                if out.len() > 4 {
+                    out[0] ^= 1;
+                } else {
+                    out[0] = out[0].saturating_sub(1);
+                }
+            }
+            Ok(UpdateModification::valid(State::from(out)))
+        }
+
+        fn summarize_state(&mut self, state: &[u8]) -> Result<Vec<u8>, OracleError> {
+            Ok(state.to_vec())
+        }
+
+        fn get_state_delta(
+            &mut self,
+            state: &[u8],
+            _summary: &[u8],
+        ) -> Result<Vec<u8>, OracleError> {
+            Ok(state.to_vec())
+        }
+    }
+
+    /// A shrink from a proven never-settling case to a budget-exhausted one crosses
+    /// the removal tier and is refused.
+    #[test]
+    fn shrinking_does_not_trade_never_settled_for_budget_exhausted() {
+        let original =
+            ConformanceCase::new(ConformanceProperty::StateIdempotence, vec![bytes(64, 7)]);
+        let short: Bytes = Arc::from(vec![3u8, 2, 1].as_slice());
+        let PropertyOutcome::Violated(smaller) = verify_case(
+            &mut LoopsOnlyWhenLong,
+            &ConformanceCase::new(ConformanceProperty::StateIdempotence, vec![short.clone()]),
+        ) else {
+            panic!("the short state must break idempotence");
+        };
+        assert_eq!(smaller.settling, Some(IdempotenceSettling::BudgetExhausted));
+        assert_eq!(removal_tier(&smaller), RemovalTier::ReportOnly);
+        assert_eq!(
+            violated_finding(&mut LoopsOnlyWhenLong, &original),
+            Some((
+                ConformanceProperty::StateIdempotence,
+                RemovalTier::RemovalEligible
+            ))
+        );
+        let (minimized, _) = minimize(
+            &mut LoopsOnlyWhenLong,
+            &original,
+            &[short],
+            &[],
+            &MinimizeConfig::default(),
+        );
+        assert_eq!(minimized.states, original.states);
+    }
+
     /// A contract whose verdict changes between runs: while `sorts`, every merge
     /// sorts (settles after one rewrite, report-only); otherwise every merge
-    /// grows the state (never settles, removal-eligible).
+    /// grows the state, and merging the same state in again moves it (proof of
+    /// non-settling, removal-eligible).
     struct Flips {
         sorts: bool,
     }

@@ -295,7 +295,8 @@ fn slot_rank(finding: &MergeFinding) -> (bool, u8) {
 /// `SettledAfter`, is report-only (`policy::removal_tier`).
 pub(crate) fn settling_rank(settling: Option<IdempotenceSettling>) -> u8 {
     match settling {
-        Some(IdempotenceSettling::NeverSettled) => 3,
+        Some(IdempotenceSettling::NeverSettled) => 4,
+        Some(IdempotenceSettling::BudgetExhausted) => 3,
         Some(IdempotenceSettling::Indeterminate) => 2,
         Some(IdempotenceSettling::SettledAfter(_)) => 1,
         None => 0,
