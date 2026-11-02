@@ -1524,19 +1524,25 @@ Sending (QuicPath::send_short_bounded / send_stream_bounded /
   tick, so a slow upload does not read as stalled. A message that fits the send
   window is buffered at once, so its gap never applies and only total ends its
   wait. quinn gives a write all the free credit without yielding, and send
-  fairness orders packets, not writes, so the writers yield between fragments
-  (path.rs take_turns): without it streams run one after another and one waits
-  past the 5 s the receiver allows, pinned by
-  streams_on_a_path_take_turns_with_their_fragments. A send returns
+  fairness orders packets, not writes, so a streamed send yields before each
+  piece but the first while another streamed send holds a permit
+  (Outgoing::take_turns). Without it streams run one after another and one
+  waits past the 5 s the receiver allows. Never yield after the last piece:
+  the driver would send the data before the end is queued, and the end would
+  take a datagram of its own. Pinned on one thread by
+  streams_on_a_path_take_turns_with_their_fragments, for streams and for shorts
+  past one packet; a multi-thread runtime is unmeasured. A send returns
   Sent (every byte acked), MaybeDelivered(TimedOut | ConnectionLost) (the
-  whole message was written and FIN sent, SendProgress set in
+  whole message was written and FIN queued, SendProgress set in
   Outgoing::finish, then the deadline passed or the connection was lost
   during the ack wait: the peer may have it, do not treat it as Failed),
   Failed(NotOpened(TimedOut | ConnectionLost)) (no stream ever existed, so the
   message can go another way), or Failed(TimedOut | Error) (the stream was open
   and did not finish, or a stop from the peer). After those two the receiver
-  remembers the id and may have dispatched the metadata, so a resend needs a
-  fresh id: the receiver drops one under the same id, and acks it.
+  may remember the id and may have dispatched the metadata, so a resend needs a
+  fresh id: under the same id it drops UDP fragments while still acking them,
+  and cancels a QUIC stream. A source that ends or fails before its first chunk
+  is Failed(Error) and opened nothing, so its id is unused.
   Dropping a send future resets its stream (Drop on Outgoing; quinn's own
   drop would FINISH it, which the receiver reads as a stream that ended
   early). A send dropped while waiting for acks after finish is not reset

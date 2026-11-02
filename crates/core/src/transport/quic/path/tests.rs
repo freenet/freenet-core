@@ -3268,6 +3268,11 @@ fn send_deadlines_have_these_values() {
     assert_eq!(one_packet.gap, None);
     assert_eq!(one_packet.total, Duration::from_secs(5));
 
+    for len in [1, 2000, MIB as u64] {
+        let deadlines = SendDeadlines::stream(len);
+        assert!(deadlines.gap.is_none_or(|gap| gap >= deadlines.open));
+    }
+
     let stream = SendDeadlines::stream(MIB as u64);
     assert_eq!(stream.open, Duration::from_secs(2));
     assert_eq!(stream.gap, Some(Duration::from_secs(5)));
@@ -4018,11 +4023,30 @@ impl StreamProgressObserver for Turns {
     }
 }
 
+/// How far apart two fragments of one send may be, on one thread. Round robin
+/// among `sends` writers is about `sends`; the margin is for the writers that
+/// wait on credit and rejoin in another order. Without the yield it is 3503.
+fn assert_writers_took_turns(log: &[u8], sends: u8, fragments: usize) {
+    assert_eq!(log.len(), usize::from(sends) * fragments);
+    for send in 0..sends {
+        let seen: Vec<usize> = log
+            .iter()
+            .enumerate()
+            .filter_map(|(at, of)| (*of == send).then_some(at))
+            .collect();
+        let widest = seen.windows(2).map(|at| at[1] - at[0]).max().unwrap_or(0);
+        assert!(
+            widest <= 4 * usize::from(sends),
+            "send {send} waited {widest} fragments between two of its own"
+        );
+    }
+}
+
 /// Concurrent streams on one path share its send window fragment by fragment.
 /// quinn gives a write all the free credit without yielding, so without the
 /// yield in `take_turns` the streams run one after another: 3503 fragments
-/// between two of one stream's in this shape, which at 1 Mbit/s is about 30 s
-/// against the 5 s gap the sender and the receiver allow.
+/// between two of one stream's in this shape, which at 1 Mbit/s would be about
+/// 30 s against the 5 s gap the sender and the receiver allow.
 ///
 /// On one thread only, because `drive` is. A multi-thread runtime wakes in
 /// another order, so this does not speak for it.
@@ -4066,21 +4090,132 @@ fn streams_on_a_path_take_turns_with_their_fragments() {
         .await;
         reader.abort();
         let log = log.lock().unwrap();
-        assert_eq!(
-            log.len(),
-            usize::from(streams) * (4 * MIB).div_ceil(FRAGMENT_PAYLOAD_SIZE)
-        );
-        for stream in 0..streams {
-            let seen: Vec<usize> = log
-                .iter()
-                .enumerate()
-                .filter_map(|(at, of)| (*of == stream).then_some(at))
-                .collect();
-            let widest = seen.windows(2).map(|at| at[1] - at[0]).max().unwrap_or(0);
-            assert!(
-                widest <= 16 * usize::from(streams),
-                "stream {stream} waited {widest} fragments between two of its own"
-            );
+        assert_writers_took_turns(&log, streams, (4 * MIB).div_ceil(FRAGMENT_PAYLOAD_SIZE));
+    })
+}
+
+/// The same for Shorts past one packet, which write through their own loop.
+#[test]
+fn shorts_past_one_packet_take_turns_with_their_fragments() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let shorts: u8 = 4;
+        let p = paths("quic-path-short-turns", 84, QuicPathLimits::DEFAULT).await;
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let body = Arc::new(payload(4 * MIB));
+        let mut sends = Vec::new();
+        for short in 0..shorts {
+            let (a, body, log) = (p.a.clone(), body.clone(), log.clone());
+            sends.push(tokio::spawn(async move {
+                let turns = Turns(short, log);
+                a.send_short_with(&body, Some(&turns), SendProgress::new())
+                    .await
+            }));
         }
+        p.drive(async move {
+            for send in sends {
+                send.await.expect("the send ran").expect("sent");
+            }
+        })
+        .await;
+        let log = log.lock().unwrap();
+        assert_writers_took_turns(&log, shorts, (4 * MIB).div_ceil(FRAGMENT_PAYLOAD_SIZE));
+    })
+}
+
+/// The end of a one-packet message leaves with its data, in one STREAM frame.
+/// A yield after the last piece would send them apart, two ack-eliciting
+/// datagrams for the commonest message on a path.
+#[test]
+fn a_one_packet_message_is_one_stream_frame() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths("quic-path-one-frame", 85, QuicPathLimits::DEFAULT).await;
+        let (a, time) = (p.a.clone(), p.time());
+        let frames = p
+            .drive(async move {
+                let before = a.connection().inner().stats().frame_tx.stream;
+                let sent = a
+                    .send_short_bounded(&time, SendDeadlines::short(5), b"small")
+                    .await;
+                assert!(matches!(sent, BoundedSend::Sent), "{sent:?}");
+                a.connection().inner().stats().frame_tx.stream - before
+            })
+            .await;
+        assert_eq!(frames, 1);
+    })
+}
+
+/// So does the last fragment of a stream, with another stream active: the
+/// yield comes before a piece, never between the last piece and the end.
+#[test]
+fn the_end_of_a_stream_leaves_with_its_last_fragment() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths("quic-path-last-frame", 86, QuicPathLimits::DEFAULT).await;
+        let (a, time) = (p.a.clone(), p.time());
+        let body = Bytes::from(payload(FRAGMENT_PAYLOAD_SIZE / 2));
+        let frames = p
+            .drive(async move {
+                let held = Arc::clone(&a.stream_slots)
+                    .acquire_owned()
+                    .await
+                    .expect("never closed");
+                let before = a.connection().inner().stats().frame_tx.stream;
+                let sent = a
+                    .send_stream_bounded(
+                        &time,
+                        SendDeadlines::stream(body.len() as u64),
+                        StreamId::next(),
+                        None,
+                        body,
+                        None,
+                    )
+                    .await;
+                assert!(matches!(sent, BoundedSend::Sent), "{sent:?}");
+                drop(held);
+                a.connection().inner().stats().frame_tx.stream - before
+            })
+            .await;
+        assert_eq!(frames, 1);
+    })
+}
+
+/// A first chunk that arrives with no time left opens nothing, whichever of
+/// the two the select took: the send had no deadline left to run under.
+#[test]
+fn a_first_chunk_at_the_deadline_opens_no_stream() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths("quic-path-first-late", 87, QuicPathLimits::DEFAULT).await;
+        let (a, time) = (p.a.clone(), p.time());
+        let outcome = p
+            .drive(async move {
+                let sleeps = time.clone();
+                let first = futures::stream::once(async move {
+                    sleeps.sleep(Duration::from_secs(5)).await;
+                    Ok(Bytes::from_static(b"late"))
+                });
+                a.send_stream_chunks_bounded(
+                    &time,
+                    Duration::from_secs(5),
+                    StreamId::next(),
+                    4,
+                    None,
+                    Box::pin(first),
+                    None,
+                )
+                .await
+            })
+            .await;
+        assert!(
+            matches!(
+                outcome,
+                BoundedSend::Failed(SendFailure::NotOpened(NotOpened::TimedOut))
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(p.a.send_aborts(), 0);
+        assert_eq!(p.b.stats().count(QuicInboundOutcome::AnnouncedStream), 0);
     })
 }

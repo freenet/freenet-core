@@ -18,9 +18,11 @@
 //!   [`SendFailure::NotOpened`] means no stream ever existed, so the message
 //!   can safely go another way. A deadline that passes later drops the send:
 //!   the stream is reset (`reset_code::SENDER_ABORTED`), so the receiver
-//!   discards what arrived. The peer has still seen the stream: it remembers
-//!   the id, so a resend under that id is dropped, and it may have dispatched
-//!   the stream's metadata. Only a fresh id may send the data again.
+//!   discards what arrived. The peer may still have seen the stream: it then
+//!   remembers the id, so a resend under that id is dropped, and it may have
+//!   dispatched the stream's metadata. Only a fresh id may send the data again.
+//!   A send that failed before opening a stream ([`SendFailure::Error`] from a
+//!   source with no first chunk) used nothing of the id.
 //!
 //! A caller must not treat `MaybeDelivered` as `Failed`: the two sides may
 //! disagree about whether the message arrived.
@@ -46,7 +48,9 @@ const STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(2);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SendDeadlines {
     /// From the start of the send to its stream being open, permit included.
-    /// A send past it fails with [`SendFailure::NotOpened`].
+    /// For a send from a source, the start is the first chunk arriving. A send
+    /// past it fails with [`SendFailure::NotOpened`]. At most `gap`, which
+    /// `bounded_send` asserts.
     pub(crate) open: Duration,
     /// The longest wait between two steps of progress once the stream is open,
     /// up to the end of the stream being sent. Not applied to the wait for the
@@ -197,7 +201,7 @@ impl SendProgress {
         self.0.last_step.store((self.0.now)(), Ordering::Release);
     }
 
-    /// Every byte was written and the end of the stream sent.
+    /// Every byte was written and the end of the stream queued.
     pub(super) fn mark_finished(&self) {
         self.0.stage.store(STAGE_FINISHED, Ordering::Release);
     }
