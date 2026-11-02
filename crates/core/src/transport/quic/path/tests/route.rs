@@ -8,7 +8,7 @@ fn lost() -> quinn::ConnectionError {
     quinn::ConnectionError::TimedOut
 }
 
-pub(in crate::transport) fn stopped(code: u32) -> BoundedSend {
+fn stopped(code: u32) -> BoundedSend {
     BoundedSend::Failed(SendFailure::Error(QuicSendError::Stopped(code.into())))
 }
 

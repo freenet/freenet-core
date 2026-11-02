@@ -1,9 +1,9 @@
 //! A QUIC connection used as a transport path to one peer (#5940, step e3).
 //!
-//! The upgrade driver ([`super::upgrade::driver`]) builds a [`QuicPath`] in shadow
-//! mode and sends only control frames on it; data sends wait for e5b.
-//! Step e5 moves a peer's traffic onto one once the connection is
-//! established, and keeps the UDP session as the fallback.
+//! The upgrade driver ([`super::upgrade::driver`]) builds a [`QuicPath`] and sends
+//! control frames on it. With both sides' data bit a peer's traffic moves onto
+//! the path ([`super::upgrade::data_route`]), and the UDP session stays up as the
+//! fallback ([`route`] says when a message goes back to it).
 //!
 //! Each message gets its own QUIC unidirectional stream in the format of
 //! [`super::framing`]. quinn allows the peer [`MAX_UNI_STREAMS`] streams at a
@@ -118,10 +118,9 @@
 //! dropped and counted (`QuicInboundOutcome`) when its channel is full.
 //!
 //! Not done here, on purpose:
-//! - Dedup. The same message sent twice (once on UDP, once on QUIC after a
-//!   fallback) is delivered twice. e5 dedups short messages with
-//!   `PeerConnection::is_duplicate_dispatch` and streams with
-//!   `completed_inbound_streams`, where both transports meet.
+//! - Dedup. A message goes on UDP only when the outcome proves the receiver
+//!   cannot deliver it ([`route`]), so a Short needs none. A stream id on both
+//!   paths is refused where both transports meet (`completed_inbound_streams`).
 //! - Exporting the QUIC-specific counters. They are per path
 //!   ([`QuicPath::stats`]); the refusals and evictions the UDP transport also
 //!   has are counted in `TRANSPORT_METRICS` as well, under the same

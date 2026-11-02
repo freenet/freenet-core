@@ -101,10 +101,10 @@ pub enum QuicMode {
     /// warning and runs with QUIC off.
     Shadow,
     /// Negotiates data on a path to a peer in the release's slice
-    /// (`upgrade::slice`). This release sends no data on any path, so it acts as
-    /// [`Self::Shadow`] on the wire apart from the caps bit. A node that sets it
-    /// early starts carrying data over QUIC once it runs a release that sends it.
-    /// That release's notes must say so.
+    /// (`upgrade::slice`), and sends its data on a path where both sides did. At a
+    /// share of 0, this release's, it acts as [`Self::Shadow`] on the wire. A node
+    /// that sets it early starts carrying data over QUIC once it runs a release
+    /// with a share above 0. That release's notes must say so.
     Prefer,
 }
 
