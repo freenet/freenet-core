@@ -136,7 +136,7 @@ use crate::transport::metrics::QuicCloseCode;
 use crate::transport::quic::control::{ControlError, QuicControl, caps};
 use crate::transport::quic::error::attribute;
 use crate::transport::quic::liveness::QuicAvailability;
-use crate::transport::quic::path::{BoundedSend, QuicSendError, SendFailure};
+use crate::transport::quic::path::{BoundedSend, NotOpened, QuicSendError, SendFailure};
 use crate::transport::symmetric_message::{DeclineReason, UpgradeControl, may_offer_upgrade};
 use crate::transport::{QuicErrorKind, QuicRefusal};
 use crate::util::backoff::ExponentialBackoff;
@@ -916,6 +916,20 @@ impl UpgradeMachine {
         }
     }
 
+    fn on_send_refused(
+        &mut self,
+        cx: Inputs<'_>,
+        attempt: u32,
+        error: QuicSendError,
+    ) -> Vec<Action> {
+        let availability = if endpoint_is_down(cx) {
+            QuicAvailability::Down
+        } else {
+            QuicAvailability::Up
+        };
+        self.on_failed(cx, attempt, attribute(availability, error.into()))
+    }
+
     fn on_sent(&mut self, cx: Inputs<'_>, attempt: u32, outcome: BoundedSend) -> Vec<Action> {
         if self.live_attempt() != Some(attempt) {
             return Vec::new();
@@ -927,18 +941,15 @@ impl UpgradeMachine {
             // A lost connection means what it means anywhere else. The kind
             // is not attributed yet, unlike a `PathFailed`'s, and a stop is
             // one stream's, which the deadline settles.
+            BoundedSend::Failed(SendFailure::NotOpened(NotOpened::ConnectionLost(error))) => {
+                self.on_send_refused(cx, attempt, QuicSendError::ConnectionLost(error))
+            }
             BoundedSend::Failed(SendFailure::Error(
                 error @ (QuicSendError::ConnectionLost(_) | QuicSendError::Stopped(_)),
-            )) => {
-                let availability = if endpoint_is_down(cx) {
-                    QuicAvailability::Down
-                } else {
-                    QuicAvailability::Up
-                };
-                self.on_failed(cx, attempt, attribute(availability, error.into()))
-            }
+            )) => self.on_send_refused(cx, attempt, error),
             BoundedSend::Failed(
-                SendFailure::TimedOut
+                SendFailure::NotOpened(NotOpened::TimedOut)
+                | SendFailure::TimedOut
                 | SendFailure::Error(
                     QuicSendError::InvalidFrame(_)
                     | QuicSendError::LengthMismatch { .. }

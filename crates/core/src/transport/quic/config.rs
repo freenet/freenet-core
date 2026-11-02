@@ -121,11 +121,12 @@ pub(crate) const RESERVED_UNI_STREAMS: u32 = 8;
 pub(crate) const UNANNOUNCED_CREDIT_SLACK: u32 = MAX_UNI_STREAMS / 8;
 
 /// Streamed messages (`QuicPath::send_stream_bounded`,
-/// `send_stream_chunks_bounded`) a path sends at once. The limit is divided as
+/// `send_stream_chunks_bounded`, and a short message that does not fit a
+/// packet) a path sends at once. The limit is divided as
 /// `STREAMED_SEND_LIMIT + UNANNOUNCED_CREDIT_SLACK + RESERVED_UNI_STREAMS =
 /// MAX_UNI_STREAMS` (48 + 8 + 8 = 64). A streamed send past it waits for one
-/// of the path's permits before it opens its stream. Short messages and
-/// control frames take no permit.
+/// of the path's permits before it opens its stream. Short messages of one
+/// packet and control frames take no permit.
 ///
 /// The reserve holds on a steady path: every streamed send still holds its
 /// permit or its stream has been freed at the receiver, no MAX_STREAMS frame
@@ -136,19 +137,22 @@ pub(crate) const UNANNOUNCED_CREDIT_SLACK: u32 = MAX_UNI_STREAMS / 8;
 ///
 /// Constraints for carrying data on a path, none of which arises on a shadow
 /// path because it sends only control frames:
-/// - A permit returns before the slot does. A send that times out after
-///   its stream's end was sent is not reset, so its stream holds its slot
-///   until the backlog drains, the worst case. A reset or a stop from the
-///   peer returns the permit before the receiver has freed the stream, and
-///   so does an acknowledgement, which can come before the receiver has
-///   read the stream to its end. Decide there whether to hold the permit
-///   until the stream is acknowledged.
+/// - A permit can return before the slot does. A stream holds its permit
+///   until it is acknowledged, also past a deadline after its end was sent,
+///   so that case holds. A reset or a stop from the peer returns the permit
+///   about one round trip before the receiver has freed the stream. An
+///   acknowledgement is about receipt, so it returns the permit while the
+///   receiver may not have read the stream to its end. That is short while the
+///   consumer keeps up. With a full channel the readers wait for room, up to
+///   the age limit, each holding a slot, so a slow consumer can use up the
+///   reserve: one-packet messages then fail to open within their deadline and
+///   go another way. Measured by `quic_open_uni_waited`.
 /// - Credit the sender does not know about can exceed
 ///   [`UNANNOUNCED_CREDIT_SLACK`] while a MAX_STREAMS frame is lost, queued
 ///   or in flight. quinn counts credit as announced when it writes the frame
 ///   (`sent_max_remote`), so 9 freed slots on their way plus 8 freed since
 ///   are 17 the sender cannot use, with nothing lost.
-/// - Short messages are uncapped, and one can be as large as a stream, so
+/// - One-packet short messages are uncapped, so many at once
 ///   they can use up the reserve.
 /// - A slot is not send capacity: a control frame that has a slot still
 ///   waits on the connection's shared flow control and send window
