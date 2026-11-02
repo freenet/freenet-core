@@ -463,7 +463,7 @@ fn a_udp_send_that_fails_charges_no_flight_and_is_counted() {
         "quic-send-udp-fails",
         56,
         QuicPathLimits::DEFAULT,
-        |mut rig| async move {
+        |rig| async move {
             rig.e
                 .fail_sends
                 .store(true, std::sync::atomic::Ordering::Relaxed);

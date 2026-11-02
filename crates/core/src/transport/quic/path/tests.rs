@@ -25,8 +25,6 @@ use crate::transport::peer_connection::streaming_handle_idle_timeout;
 
 mod route;
 
-pub(in crate::transport) use route::stopped;
-
 /// How long, in virtual time, a test's traffic may take.
 const LIMIT: Duration = Duration::from_secs(600);
 

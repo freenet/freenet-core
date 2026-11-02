@@ -674,7 +674,9 @@ fn a_path_follows_the_data_bits() {
 #[test]
 fn a_route_ends_with_its_path_and_what_it_holds_goes_on_udp() {
     use crate::transport::quic::control::caps;
-    use crate::transport::quic::path::{NextStep, SendKind, stop_code};
+    use crate::transport::quic::path::{
+        NextStep, QuicSendError, SendFailure, SendKind, stop_code,
+    };
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
         let h = Harness::server_with("quic-driver-route", 35, "prefer", Some("100")).await;
@@ -692,7 +694,9 @@ fn a_route_ends_with_its_path_and_what_it_holds_goes_on_udp() {
         ready_ack(&session, attempt, caps::DATA);
         let route = session.data_route().expect("both bits");
 
-        let refused = crate::transport::quic::path::tests::stopped(stop_code::NOT_ACCEPTING_DATA);
+        let refused = BoundedSend::Failed(SendFailure::Error(QuicSendError::Stopped(
+            stop_code::NOT_ACCEPTING_DATA.into(),
+        )));
         assert_eq!(
             route.path().settle(SendKind::Stream, &refused, false),
             NextStep::SendOnUdp
