@@ -29,6 +29,7 @@ mod outbound_stream;
 pub(super) use outbound_stream::embeds_metadata;
 mod peer_identity;
 pub(crate) mod piped_stream;
+mod quic_send;
 pub(crate) mod streaming;
 
 #[cfg(test)]
@@ -492,6 +493,10 @@ pub struct PeerConnection<S = super::UdpSocket, T: TimeSource = RealTime> {
     /// arms are then never polled.
     quic_shorts: Option<mpsc::Receiver<super::quic::path::InboundShort>>,
     quic_streams: Option<mpsc::Receiver<super::quic::path::InboundStreamArrival>>,
+    /// A route a test built around a path of its own, used in place of the
+    /// session's.
+    #[cfg(test)]
+    quic_route_for_test: Option<super::quic::upgrade::data_route::DataRoute>,
     /// With QUIC off, bounds the replies to upgrade offers. Fixed size.
     decline_gate: super::quic::upgrade::driver::DeclineGate,
     /// With QUIC off, the attempt of an Offer to decline, sent at the top of
@@ -1083,7 +1088,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                 self.remote_conn.remote_protoc_version,
                 self.inbound_budget.clone(),
                 self.quic_receipt_nanos.clone(),
-                self.upgrade_sender(),
+                self.udp_sender(),
                 self.remote_conn.time_source.clone(),
             );
             self.quic_path = Some(quic_path);
@@ -1215,7 +1220,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             attempt,
             reason: symmetric_message::DeclineReason::Disabled.wire(),
         };
-        if let Err(error) = self.upgrade_sender().send(decline).await {
+        if let Err(error) = self.udp_sender().send_upgrade(decline).await {
             tracing::debug!(
                 peer_addr = %self.remote_conn.remote_addr,
                 %error,
@@ -1225,9 +1230,10 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         self.pending_decline = None;
     }
 
-    /// What sends this connection's upgrade messages on the UDP session.
-    fn upgrade_sender(&self) -> UpgradeSender<S, T> {
-        UpgradeSender {
+    /// What sends one tracked packet on the UDP session from outside the
+    /// connection's task.
+    fn udp_sender(&self) -> UdpSender<S, T> {
+        UdpSender {
             remote_addr: self.remote_conn.remote_addr,
             socket: self.remote_conn.socket.clone(),
             outbound_symmetric_key: self.remote_conn.outbound_symmetric_key.clone(),
@@ -1517,6 +1523,8 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             legacy_tokens: HashMap::new(),
             inbound_outcomes: [0; super::metrics::InboundStreamOutcome::COUNT],
             quic_path: None,
+            #[cfg(test)]
+            quic_route_for_test: None,
             quic_shorts: None,
             quic_streams: None,
             decline_gate: Default::default(),
@@ -1609,44 +1617,37 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
     /// Hand an already-serialized message to the transport: as one short
     /// message when it fits in a packet, otherwise as a stream.
     pub(crate) async fn send_serialized(&mut self, data: SerializedMessage) -> Result<()> {
-        #[cfg(any(test, feature = "testing"))]
-        let data = match self.send_short_on_path_for_test(data) {
-            Ok(()) => return Ok(()),
-            Err(data) => data,
-        };
-        if data.len() + SymmetricMessage::short_message_overhead() > MAX_DATA_SIZE {
+        if !fits_one_packet(data.len() as u64) {
             tracing::trace!(
                 peer_addr = %self.remote_conn.remote_addr,
                 total_size_bytes = data.len(),
                 "Sending as stream"
             );
             self.outbound_stream(data).await;
-            Ok(())
-        } else {
-            tracing::trace!(
-                peer_addr = %self.remote_conn.remote_addr,
-                "Sending as short message"
-            );
-            self.outbound_short_message(data).await
+            return Ok(());
         }
+        tracing::trace!(
+            peer_addr = %self.remote_conn.remote_addr,
+            "Sending as short message"
+        );
+        // Never waits: this runs in the connection's task (`transport.md`).
+        let data = match self.quic_data_route() {
+            Some(route) => match route.queue_short(data) {
+                Ok(()) => return Ok(()),
+                Err(data) => data,
+            },
+            None => data,
+        };
+        self.outbound_short_message(data).await
     }
 
-    /// A simulation can ask for messages to go on the connection's path. See
-    /// `QuicUpgradeTrace::send_shorts_on_paths`.
-    #[cfg(any(test, feature = "testing"))]
-    fn send_short_on_path_for_test(
-        &self,
-        data: SerializedMessage,
-    ) -> std::result::Result<(), SerializedMessage> {
-        let wanted = self
-            .upgrade_trace
-            .as_ref()
-            .is_some_and(|trace| trace.sends_shorts_on_paths());
-        let fits = fits_one_packet(data.len() as u64);
-        match &self.quic_path {
-            Some(quic_path) if wanted && fits => quic_path.send_short_on_path(data),
-            Some(_) | None => Err(data),
+    /// The path that carries this connection's data right now, if one does.
+    fn quic_data_route(&self) -> Option<super::quic::upgrade::data_route::DataRoute> {
+        #[cfg(test)]
+        if let Some(route) = &self.quic_route_for_test {
+            return Some(route.clone());
         }
+        self.quic_path.as_ref()?.data_route()
     }
 
     /// Receive the next complete inbound message.
@@ -3620,10 +3621,39 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         Ok(())
     }
 
+    /// A message past one packet. On a path it is a Short, and only on UDP a
+    /// stream of its own, so the id is taken here for the UDP form either way.
     async fn outbound_stream(&mut self, data: SerializedMessage) {
         let stream_id = StreamId::next_transport_internal();
-        self.outbound_stream_with_id(stream_id, data.into(), None, None, None)
-            .await;
+        let Some(route) = self.quic_data_route() else {
+            self.outbound_stream_with_id(stream_id, data.into(), None, None, None)
+                .await;
+            return;
+        };
+        let task = GlobalExecutor::spawn(
+            quic_send::send_large_short_on_path(
+                route,
+                stream_id,
+                data.into(),
+                self.udp_stream_sender(),
+            )
+            .instrument(span!(tracing::Level::DEBUG, "outbound_stream")),
+        );
+        self.outbound_stream_futures.push(task);
+    }
+
+    /// What starts a stream on the UDP session.
+    fn udp_stream_sender(&self) -> quic_send::UdpStreamSender<S, T> {
+        quic_send::UdpStreamSender {
+            last_packet_id: self.remote_conn.last_packet_id.clone(),
+            socket: self.remote_conn.socket.clone(),
+            remote_addr: self.remote_conn.remote_addr,
+            outbound_symmetric_key: self.remote_conn.outbound_symmetric_key.clone(),
+            sent_tracker: self.remote_conn.sent_tracker.clone(),
+            token_bucket: self.remote_conn.token_bucket.clone(),
+            congestion_controller: self.remote_conn.congestion_controller.clone(),
+            time_source: self.time_source.clone(),
+        }
     }
 
     /// Send stream data with a caller-provided StreamId.
@@ -3642,24 +3672,25 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         completion_tx: Option<tokio::sync::oneshot::Sender<super::StreamSendOutcome>>,
         progress: Option<std::sync::Arc<dyn super::StreamProgressObserver>>,
     ) {
-        let task = GlobalExecutor::spawn(
-            outbound_stream::send_stream(
-                stream_id,
-                self.remote_conn.last_packet_id.clone(),
-                self.remote_conn.socket.clone(),
-                self.remote_conn.remote_addr,
-                data,
-                self.remote_conn.outbound_symmetric_key.clone(),
-                self.remote_conn.sent_tracker.clone(),
-                self.remote_conn.token_bucket.clone(),
-                self.remote_conn.congestion_controller.clone(),
-                self.time_source.clone(),
-                metadata,
-                completion_tx,
-                progress,
-            )
-            .instrument(span!(tracing::Level::DEBUG, "outbound_stream")),
-        );
+        let udp = self.udp_stream_sender();
+        let task = match self.quic_data_route() {
+            Some(route) => GlobalExecutor::spawn(
+                quic_send::send_stream_on_path(
+                    route,
+                    stream_id,
+                    data,
+                    metadata,
+                    completion_tx,
+                    progress,
+                    udp,
+                )
+                .instrument(span!(tracing::Level::DEBUG, "outbound_stream")),
+            ),
+            None => GlobalExecutor::spawn(
+                udp.send_stream(stream_id, data, metadata, completion_tx, progress)
+                    .instrument(span!(tracing::Level::DEBUG, "outbound_stream")),
+            ),
+        };
         self.outbound_stream_futures.push(task);
     }
 
@@ -3675,23 +3706,24 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         metadata: Option<bytes::Bytes>,
         progress: Option<std::sync::Arc<dyn super::StreamProgressObserver>>,
     ) {
-        let task = GlobalExecutor::spawn(
-            outbound_stream::pipe_stream(
-                inbound_handle,
-                outbound_stream_id,
-                self.remote_conn.last_packet_id.clone(),
-                self.remote_conn.socket.clone(),
-                self.remote_conn.remote_addr,
-                self.remote_conn.outbound_symmetric_key.clone(),
-                self.remote_conn.sent_tracker.clone(),
-                self.remote_conn.token_bucket.clone(),
-                self.remote_conn.congestion_controller.clone(),
-                self.time_source.clone(),
-                metadata,
-                progress,
-            )
-            .instrument(span!(tracing::Level::DEBUG, "pipe_stream")),
-        );
+        let udp = self.udp_stream_sender();
+        let task = match self.quic_data_route() {
+            Some(route) => GlobalExecutor::spawn(
+                quic_send::pipe_stream_on_path(
+                    route,
+                    outbound_stream_id,
+                    inbound_handle,
+                    metadata,
+                    progress,
+                    udp,
+                )
+                .instrument(span!(tracing::Level::DEBUG, "pipe_stream")),
+            ),
+            None => GlobalExecutor::spawn(
+                udp.pipe_stream(outbound_stream_id, inbound_handle, metadata, progress)
+                    .instrument(span!(tracing::Level::DEBUG, "pipe_stream")),
+            ),
+        };
         self.outbound_stream_futures.push(task);
     }
 }
@@ -3733,10 +3765,11 @@ fn report_sent_tagged<T: crate::simulation::TimeSource>(
     }
 }
 
-/// Sends upgrade messages on one UDP session, as tracked packets (the receiver
-/// acks them like a short message). Holds only what a send needs, so what holds
-/// it can reach nothing of the session's receive state, its liveness included.
-pub(in crate::transport) struct UpgradeSender<S, T: TimeSource> {
+/// Sends one tracked packet on one UDP session from outside the connection's
+/// task: an upgrade message, or a short message a QUIC path could not carry.
+/// Holds only what a send needs, so what holds it can reach nothing of the
+/// session's receive state, its liveness included.
+pub(in crate::transport) struct UdpSender<S, T: TimeSource> {
     remote_addr: SocketAddr,
     socket: Arc<S>,
     outbound_symmetric_key: Aes128Gcm,
@@ -3745,19 +3778,37 @@ pub(in crate::transport) struct UpgradeSender<S, T: TimeSource> {
     congestion_controller: Arc<CongestionController<T>>,
 }
 
-impl<S: super::Socket, T: TimeSource> UpgradeSender<S, T> {
-    /// Send `control`. Its receipts go on the receive path's own packets.
+impl<S: super::Socket, T: TimeSource> UdpSender<S, T> {
+    /// Send `control`.
+    pub(in crate::transport) async fn send_upgrade(&self, control: UpgradeControl) -> Result<()> {
+        /// A small upgrade message, with its packet overhead.
+        const PACKET_SIZE: usize = 64;
+        self.send_tracked(SymmetricMessagePayload::Upgrade(control), PACKET_SIZE)
+            .await
+    }
+
+    /// Send a short message of one packet (`fits_one_packet`), as
+    /// `outbound_short_message` does.
+    async fn send_short(&self, data: SerializedMessage) -> Result<()> {
+        let packet_size = data.len() + 40; // ShortMessage header overhead
+        self.send_tracked(symmetric_message::ShortMessage(data.into()).into(), packet_size)
+            .await
+    }
+
+    /// Send `payload` as one tracked packet. Its receipts go on the receive
+    /// path's own packets.
     ///
     /// Cancellation safe: flight size is charged and the packet tracked only
     /// after the socket took it, with no await between, so a send that fails or
-    /// is dropped leaves nothing in flight.
-    pub(in crate::transport) async fn send(&self, control: UpgradeControl) -> Result<()> {
-        /// A small upgrade message, with its packet overhead.
-        const PACKET_SIZE: usize = 64;
+    /// is dropped leaves nothing in flight (#4345).
+    async fn send_tracked(
+        &self,
+        payload: SymmetricMessagePayload,
+        packet_size: usize,
+    ) -> Result<()> {
         let packet_id = self
             .last_packet_id
             .fetch_add(1, std::sync::atomic::Ordering::Release);
-        let payload = SymmetricMessagePayload::Upgrade(control);
         let outbound_class = super::shadow_demand::classify(&payload);
         let packet = SymmetricMessage::serialize_msg_to_packet_data(
             packet_id,
@@ -3771,16 +3822,27 @@ impl<S: super::Socket, T: TimeSource> UpgradeSender<S, T> {
             .await
             .map_err(|e| TransportError::send_failed(self.remote_addr, e.kind()))?;
         super::shadow_demand::record_outbound(outbound_class, packet.len());
-        let token = self.congestion_controller.on_send_with_token(PACKET_SIZE);
+        let token = self.congestion_controller.on_send_with_token(packet_size);
         report_sent_tagged(
             &mut self.sent_tracker.lock(),
             packet_id,
             packet,
-            PACKET_SIZE,
+            packet_size,
             token,
             PacketStream::Control,
         );
         Ok(())
+    }
+}
+
+impl<S: super::Socket, T: TimeSource> super::quic::upgrade::data_route::UdpShorts
+    for UdpSender<S, T>
+{
+    fn send_short(
+        &self,
+        payload: SerializedMessage,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+        Box::pin(UdpSender::send_short(self, payload))
     }
 }
 

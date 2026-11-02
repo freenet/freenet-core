@@ -133,13 +133,10 @@
 pub(crate) mod bounded;
 pub(crate) mod inbound;
 
-#[cfg(test)]
-mod tests;
-
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -170,6 +167,9 @@ use crate::transport::peer_connection::{embeds_metadata, fits_one_packet};
 pub(crate) use bounded::{BoundedSend, MaybeDelivered, NotOpened, SendDeadlines, SendFailure};
 use bounded::{SendProgress, bounded_send};
 pub(crate) use inbound::{InboundShort, InboundStreamArrival};
+#[cfg(test)]
+pub(crate) use route::{STALLED_SENDS_LIMIT, next_step};
+pub(crate) use route::{NextStep, QuicSendEvent, QuicSendResult, SendKind};
 
 /// Application error codes a receiver stops a stream with (STOP_SENDING),
 /// and the sender sees as [`QuicSendError::Stopped`]. Range `0x10..=0x1f`,
@@ -405,6 +405,11 @@ quic_outcomes! {
     }
 }
 
+mod route;
+
+#[cfg(test)]
+mod tests;
+
 impl QuicInboundOutcome {
     fn of_header_error(error: &HeaderError) -> Self {
         match error {
@@ -434,6 +439,11 @@ impl QuicInboundOutcome {
 pub(crate) struct QuicPathStats {
     quic: [AtomicU64; QuicInboundOutcome::COUNT],
     shared: [AtomicU64; InboundStreamOutcome::COUNT],
+    /// Data sends by [`SendKind`] and [`QuicSendResult`].
+    sends: [[AtomicU64; QuicSendResult::COUNT]; SendKind::ALL.len()],
+    send_events: [AtomicU64; QuicSendEvent::COUNT],
+    /// Stops the peer sent to data sends, in the order of [`stop_code::ALL`].
+    stops: [AtomicU64; stop_code::ALL.len()],
 }
 
 impl QuicPathStats {
@@ -441,6 +451,9 @@ impl QuicPathStats {
         Self {
             quic: std::array::from_fn(|_| AtomicU64::new(0)),
             shared: std::array::from_fn(|_| AtomicU64::new(0)),
+            sends: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
+            send_events: std::array::from_fn(|_| AtomicU64::new(0)),
+            stops: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
 
@@ -452,6 +465,50 @@ impl QuicPathStats {
     fn record_shared(&self, outcome: InboundStreamOutcome) {
         crate::transport::TRANSPORT_METRICS.record_inbound_stream_outcome(outcome);
         self.shared[outcome as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_send(&self, kind: SendKind, result: QuicSendResult) {
+        self.sends[kind as usize][result as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count something else that happened to a data send.
+    pub(crate) fn record_send_event(&self, event: QuicSendEvent) {
+        self.send_events[event as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count a stop from the peer. A code this node does not know is counted only
+    /// as a dropped send.
+    fn record_stop(&self, code: u64) {
+        if let Some(index) = stop_code::ALL.iter().position(|c| u64::from(*c) == code) {
+            self.stops[index].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn send_count(&self, kind: SendKind, result: QuicSendResult) -> u64 {
+        self.sends[kind as usize][result as usize].load(Ordering::Relaxed)
+    }
+
+    /// Data sends of every kind that ended in `result`.
+    #[cfg_attr(not(any(test, feature = "testing")), allow(dead_code))]
+    pub(crate) fn send_total(&self, result: QuicSendResult) -> u64 {
+        SendKind::ALL
+            .iter()
+            .map(|kind| self.send_count(*kind, result))
+            .sum()
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn send_event_count(&self, event: QuicSendEvent) -> u64 {
+        self.send_events[event as usize].load(Ordering::Relaxed)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn stop_count(&self, code: u32) -> u64 {
+        stop_code::ALL
+            .iter()
+            .position(|c| *c == code)
+            .map_or(0, |index| self.stops[index].load(Ordering::Relaxed))
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -559,16 +616,26 @@ pub(crate) struct QuicPath {
     /// ([`STREAMED_SEND_LIMIT`]), so the remaining uni stream slots stay
     /// for short messages and control frames. Never closed.
     stream_slots: Arc<tokio::sync::Semaphore>,
-    /// Whether this path may send data: both sides set the data bit
-    /// ([`Self::enable_data`]). Off for a path in shadow, where a fragment taken
-    /// from an inbound handle cannot outlive its charge because nothing is ever
-    /// forwarded.
-    send_data: std::sync::atomic::AtomicBool,
+    /// Whether this path may send data, one of the `SEND_DATA_*` values. Off for a
+    /// path in shadow, where a fragment taken from an inbound handle cannot
+    /// outlive its charge because nothing is ever forwarded.
+    send_data: AtomicU8,
+    /// Sends that timed out since the last one that was acknowledged
+    /// ([`route::STALLED_SENDS_LIMIT`]).
+    stalled_sends: AtomicU32,
     /// Where the path's watch reports that the peer was heard from.
     heard: Arc<recycle::PeerHeard>,
     #[cfg(test)]
     budget: SharedInboundBudget,
 }
+
+/// The path never had both data bits: nothing may send data on it.
+const SEND_DATA_NEVER: u8 = 0;
+/// Both sides set the data bit ([`QuicPath::enable_data`]).
+const SEND_DATA_ON: u8 = 1;
+/// The peer refused data it had said it accepts ([`QuicPath::stop_sending_data`]).
+/// New sends stay off the path; a send already started finds out for itself.
+const SEND_DATA_REFUSED: u8 = 2;
 
 impl std::fmt::Debug for QuicPath {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -712,7 +779,8 @@ impl QuicPath {
                 receive,
                 aborts,
                 stream_slots: Arc::new(tokio::sync::Semaphore::new(STREAMED_SEND_LIMIT as usize)),
-                send_data: std::sync::atomic::AtomicBool::new(false),
+                send_data: AtomicU8::new(SEND_DATA_NEVER),
+                stalled_sends: AtomicU32::new(0),
                 heard,
                 #[cfg(test)]
                 budget,
@@ -801,8 +869,30 @@ impl QuicPath {
     /// Both sides set the data bit: this path may send data. Accepting data is
     /// separate, set by [`QuicPathLimits::accept_data`] when the path is built.
     pub(in crate::transport) fn enable_data(&self) {
-        self.send_data
-            .store(true, std::sync::atomic::Ordering::Release);
+        self.send_data.store(SEND_DATA_ON, Ordering::Release);
+    }
+
+    /// The peer said it accepts no data on this path, so this node's gating or
+    /// the peer's is wrong. Logged once per path. The path stays up: it costs
+    /// nothing, and the same send would fail the same way on a new one.
+    fn stop_sending_data(&self) {
+        self.stats.record_send_event(QuicSendEvent::DataRefused);
+        let was_on = self
+            .send_data
+            .compare_exchange(
+                SEND_DATA_ON,
+                SEND_DATA_REFUSED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok();
+        if was_on {
+            tracing::warn!(
+                remote = %self.connection.inner().remote_address(),
+                "QUIC path: the peer refused data after both sides set the data bit; \
+                 sending on UDP from now on"
+            );
+        }
     }
 
     /// From now on, call `report` when the peer is heard from on this path
@@ -811,16 +901,17 @@ impl QuicPath {
         self.heard.report_to(report);
     }
 
-    /// Whether this path may send data.
-    #[cfg(any(test, feature = "testing"))]
+    /// Whether a new data send may start on this path.
     pub(in crate::transport) fn sends_data(&self) -> bool {
-        self.send_data.load(std::sync::atomic::Ordering::Acquire)
+        self.send_data.load(Ordering::Acquire) == SEND_DATA_ON
     }
 
-    /// A data send must not happen on a shadow path. See `send_data`.
+    /// A data send must not happen on a shadow path. See `send_data`. One may
+    /// race a refusal, so a refused path passes.
     fn debug_assert_carries_data(&self) {
-        debug_assert!(
-            self.send_data.load(std::sync::atomic::Ordering::Acquire),
+        debug_assert_ne!(
+            self.send_data.load(Ordering::Acquire),
+            SEND_DATA_NEVER,
             "a shadow QUIC path sends control frames only"
         );
     }
