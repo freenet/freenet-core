@@ -41,7 +41,7 @@ fn reap_stale_freenet_processes_escalating(log_dir: &Path) -> usize {
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .unwrap_or_default();
-    let escalated = kill_pattern_escalating(uid.trim(), "freenet network", 12);
+    let escalated = kill_pattern_escalating(uid.trim(), super::wrapper::STALE_NODE_PATTERN, 12);
     if escalated > 0 {
         log_wrapper_event(
             log_dir,
@@ -54,13 +54,13 @@ fn reap_stale_freenet_processes_escalating(log_dir: &Path) -> usize {
 }
 
 /// SIGTERM a user-scoped process set matched by `pattern` (a `pgrep -f`
-/// substring), wait up to `grace_secs` for graceful exit polling once a second,
-/// then SIGKILL any survivor. Returns the count of survivors that needed the
-/// SIGKILL escalation.
+/// extended regex), wait up to `grace_secs` for graceful exit polling once a
+/// second, then SIGKILL any survivor. Returns the count of survivors that needed
+/// the SIGKILL escalation.
 ///
-/// Parameterized on `pattern` (not hardcoded to "freenet network") purely so the
-/// escalation timing/decision is unit-testable against a controllable child;
-/// production callers always pass "freenet network".
+/// Parameterized on `pattern` purely so the escalation timing/decision is
+/// unit-testable against a controllable child; production callers always pass
+/// `STALE_NODE_PATTERN`.
 #[cfg(unix)]
 pub(super) fn kill_pattern_escalating(uid: &str, pattern: &str, grace_secs: usize) -> usize {
     use std::time::Duration;
