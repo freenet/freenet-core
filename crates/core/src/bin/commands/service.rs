@@ -1094,6 +1094,30 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn stale_node_pattern_matches_the_bundle_node_and_nothing_else_running() {
+        // Regression: the pattern used to be a plain "freenet network", which
+        // never matched the bundle's `freenet-bin network`, so a node orphaned
+        // by a dead wrapper survived the startup cleanup on every DMG install.
+        let pattern = regex::Regex::new(super::wrapper::STALE_NODE_PATTERN).unwrap();
+        for node in [
+            "/Applications/Freenet.app/Contents/MacOS/freenet-bin network",
+            "/usr/local/bin/freenet network",
+            "freenet network",
+        ] {
+            assert!(pattern.is_match(node), "{node}");
+        }
+        // The wrapper runs this very pkill, and must survive it.
+        for not_a_node in [
+            "/Applications/Freenet.app/Contents/MacOS/freenet-bin",
+            "/Applications/Freenet.app/Contents/MacOS/freenet-bin service run-wrapper",
+            "/usr/local/bin/freenet service run-wrapper",
+        ] {
+            assert!(!pattern.is_match(not_a_node), "{not_a_node}");
+        }
+    }
+
     #[test]
     fn launchservices_argv_is_an_app_launch() {
         let argv = |args: &[&str]| {

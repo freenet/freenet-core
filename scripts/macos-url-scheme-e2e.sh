@@ -34,12 +34,14 @@ cleanup() {
         launchctl unsetenv "$var" 2>/dev/null || true
     done
     pkill -f "$RUN_WRAPPER" 2>/dev/null || true
+    pkill -f "$NODE" 2>/dev/null || true
 }
 trap cleanup EXIT
 
 # The wrapper, however it was started: LaunchServices passes no arguments,
 # launchd passes the subcommand. Must not match `freenet-bin network`.
 RUN_WRAPPER='Freenet.app/Contents/MacOS/freenet-bin( service run-wrapper)?$'
+NODE='Freenet.app/Contents/MacOS/freenet-bin network'
 
 BIN="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -157,11 +159,22 @@ for _ in $(seq 1 30); do
 done
 $icon_shown || fail "the menu bar icon is not displayed (before: $status_items_before)"
 echo "ok - the menu bar icon is displayed"
+
+# Kill the wrapper once its node exists, which orphans the node as a crash
+# would. Without this wait the outcome depends on whether the wrapper had got
+# as far as spawning it, and the next step's result depends on that (#5956).
+for _ in $(seq 1 60); do
+    pgrep -f "$NODE" >/dev/null && break
+    sleep 1
+done
+pgrep -f "$NODE" >/dev/null || fail "the wrapper never started a node"
 pkill -f "$RUN_WRAPPER" || true
 for _ in $(seq 1 30); do
     pgrep -f "$RUN_WRAPPER" >/dev/null || break
     sleep 1
 done
+orphan="$(pgrep -f "$NODE" | head -1)"
+[[ -n "$orphan" ]] || fail "no orphaned node to test the startup cleanup with"
 
 # 3. Clicking a link launches the app and the wrapper handles it. The dry run
 # stops the handler opening a browser; it is set for apps LaunchServices
@@ -197,6 +210,13 @@ wait_for_count() {
 
 open "freenet://$RIVER/?x=1#y"
 wait_for_count 1 || fail "the launched app never handled the link"
+# A new wrapper clears a dead wrapper's node before starting its own.
+grep -q 'Killed stale freenet network' "$LOG_DIR"/freenet-wrapper.*.log \
+    || fail "the wrapper did not clean up the orphaned node"
+if kill -0 "$orphan" 2>/dev/null; then
+    fail "the orphaned node $orphan is still running"
+fi
+echo "ok - a new wrapper removes a node orphaned by a dead wrapper"
 # `opened` (not merely "not invalid"): the handler found the node the app
 # started and it answered the /v1/version probe like Freenet.
 grep -q 'outcome=opened' "$LOG_DIR"/freenet-wrapper.*.log \
