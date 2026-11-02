@@ -4182,39 +4182,48 @@ fn the_end_of_a_stream_leaves_with_its_last_fragment() {
 }
 
 /// A first chunk that arrives with no time left opens nothing, whichever of
-/// the two the select took: the send had no deadline left to run under.
+/// the chunk and the timer the select took. Repeated, because the two land on
+/// the same instant and the select draws which to poll first.
 #[test]
 fn a_first_chunk_at_the_deadline_opens_no_stream() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
         let p = paths("quic-path-first-late", 87, QuicPathLimits::DEFAULT).await;
         let (a, time) = (p.a.clone(), p.time());
-        let outcome = p
+        let outcomes = p
             .drive(async move {
-                let sleeps = time.clone();
-                let first = futures::stream::once(async move {
-                    sleeps.sleep(Duration::from_secs(5)).await;
-                    Ok(Bytes::from_static(b"late"))
-                });
-                a.send_stream_chunks_bounded(
-                    &time,
-                    Duration::from_secs(5),
-                    StreamId::next(),
-                    4,
-                    None,
-                    Box::pin(first),
-                    None,
-                )
-                .await
+                let mut outcomes = Vec::new();
+                for _ in 0..32 {
+                    let sleeps = time.clone();
+                    let first = futures::stream::once(async move {
+                        sleeps.sleep(Duration::from_secs(5)).await;
+                        Ok(Bytes::from_static(b"late"))
+                    });
+                    outcomes.push(
+                        a.send_stream_chunks_bounded(
+                            &time,
+                            Duration::from_secs(5),
+                            StreamId::next(),
+                            4,
+                            None,
+                            Box::pin(first),
+                            None,
+                        )
+                        .await,
+                    );
+                }
+                outcomes
             })
             .await;
-        assert!(
-            matches!(
-                outcome,
-                BoundedSend::Failed(SendFailure::NotOpened(NotOpened::TimedOut))
-            ),
-            "{outcome:?}"
-        );
+        for outcome in &outcomes {
+            assert!(
+                matches!(
+                    outcome,
+                    BoundedSend::Failed(SendFailure::NotOpened(NotOpened::TimedOut))
+                ),
+                "{outcome:?}"
+            );
+        }
         assert_eq!(p.a.send_aborts(), 0);
         assert_eq!(p.b.stats().count(QuicInboundOutcome::AnnouncedStream), 0);
     })
