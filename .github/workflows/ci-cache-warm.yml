@@ -13,7 +13,10 @@ name: CI Cache Warm
 # only later pushes to that one branch could read.
 #
 # HOW THE KEYS LINE UP. Swatinem/rust-cache keys on
-#   <prefix>-<GITHUB_JOB>-<OS>-<arch>-<hash>-<lockfile hash>
+#   <prefix>-<key input>-<GITHUB_JOB>-<OS>-<arch>-<hash>-<lockfile hash>
+# The `key` input here is ci.yml's file hash on both sides, so a change to
+# what the PR jobs compile yields a new key that this workflow then fills
+# (rust-cache skips the save on an exact key hit).
 # where <hash> covers the rustc version and every env var whose name starts
 # with CARGO, CC, CFLAGS, CXX, CMAKE or RUST. A PR restores by the key minus
 # the lockfile hash. So each job below MUST keep:
@@ -32,10 +35,14 @@ name: CI Cache Warm
 # standard-8 is used throughout.
 
 on:
-  # Weekly backstop. PR restores bump an entry's last-access time, so a live
-  # entry is not evicted for disuse; this catches eviction under size pressure.
+  # Daily backstop, for what no path filter sees: eviction (Ubicloud's policy
+  # is not documented; this does not rely on PR restores keeping an entry
+  # alive), and a runner-image update. rust-cache hashes EVERY installed rustup
+  # toolchain into the key, so an image that bumps its preinstalled stable
+  # orphans the entries until the next warm. On an exact key hit a run only
+  # rebuilds the workspace crates and skips the save, so it is cheap.
   schedule:
-    - cron: "0 4 * * 1"
+    - cron: "0 4 * * *"
   # Re-warm when what the cached dependencies depend on changes on main: the
   # lockfile (dependency versions), the toolchain pin and job env (both in
   # ci.yml), and this file. Path filters are safe here because no job in this
@@ -44,6 +51,7 @@ on:
     branches: [main]
     paths:
       - "Cargo.lock"
+      - "**/Cargo.toml"
       - "rust-toolchain"
       - "rust-toolchain.toml"
       - ".cargo/config.toml"
@@ -51,10 +59,13 @@ on:
       - ".github/workflows/ci-cache-warm.yml"
   workflow_dispatch:
 
-# A burst of merges that each touch Cargo.lock needs only the last warm.
+# Finish the running warm, then run only the latest queued one (GitHub keeps
+# one pending run per group). Cancelling instead would discard a run just
+# before its post-job save, and a steady stream of merges could then keep
+# every run from saving.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -62,6 +73,10 @@ permissions:
 jobs:
   test_unit:
     name: "Warm cache: Unit & Integration"
+    # A release version bump touches Cargo.lock, but only workspace versions,
+    # which rust-cache leaves out of the key: the run would hit the existing
+    # entry and save nothing.
+    if: "github.event_name != 'push' || !startsWith(github.event.head_commit.message, 'build: release')"
     runs-on: ubicloud-standard-8
     timeout-minutes: 45
 
@@ -87,6 +102,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
+          key: ci-${{ hashFiles('.github/workflows/ci.yml') }}
 
       - name: Install nextest
         uses: taiki-e/install-action@v2
@@ -120,6 +136,10 @@ jobs:
 
   test_simulation:
     name: "Warm cache: Simulation"
+    # A release version bump touches Cargo.lock, but only workspace versions,
+    # which rust-cache leaves out of the key: the run would hit the existing
+    # entry and save nothing.
+    if: "github.event_name != 'push' || !startsWith(github.event.head_commit.message, 'build: release')"
     runs-on: ubicloud-standard-8
     timeout-minutes: 45
 
@@ -143,6 +163,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
+          key: ci-${{ hashFiles('.github/workflows/ci.yml') }}
 
       - name: Install nextest
         uses: taiki-e/install-action@v2
@@ -169,6 +190,10 @@ jobs:
 
   nat_validation:
     name: "Warm cache: NAT Validation"
+    # A release version bump touches Cargo.lock, but only workspace versions,
+    # which rust-cache leaves out of the key: the run would hit the existing
+    # entry and save nothing.
+    if: "github.event_name != 'push' || !startsWith(github.event.head_commit.message, 'build: release')"
     runs-on: ubicloud-standard-8
     timeout-minutes: 45
 
@@ -193,6 +218,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
+          key: ci-${{ hashFiles('.github/workflows/ci.yml') }}
 
       - name: Install nextest
         uses: taiki-e/install-action@v2

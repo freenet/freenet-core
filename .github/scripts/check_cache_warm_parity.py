@@ -25,14 +25,21 @@ SAME id:
    identical;
 3. the ``Swatinem/rust-cache`` reference and inputs are identical, except
    ``save-if``, which is expected to differ in spirit (the PR jobs never save);
-4. compile-affecting step env (``CARGO_TARGET_*``, ``CARGO_PROFILE_*``,
-   ``CARGO_BUILD_*``, ``RUSTFLAGS``, ``RUSTDOCFLAGS``) is identical as a set;
-5. the set of compile signatures is identical: each ``cargo build`` /
+4. the set of compile signatures is identical: each ``cargo build`` /
    ``cargo nextest run`` / ``cargo test`` reduced to the flags that decide
    what gets compiled (packages, features, targets, profile), plus every
-   ``make`` invocation. ``--no-run``, ``--locked``, ``-E`` filters, ``-j``
-   and the like are ignored, so a warm job that compiles without running
-   matches a CI job that compiles and runs.
+   ``make`` invocation, EACH paired with the compile-affecting env of its own
+   step (``CARGO_*`` except ``CARGO_TERM_*``, ``RUSTFLAGS``, ``RUSTC*``,
+   ``CC``/``CFLAGS``/``CXX``/``CMAKE``, including ``export``s in the script).
+   ``--no-run``, ``--locked``, ``-E`` filters, ``-j`` and the like are
+   ignored, so a warm job that compiles without running matches a CI job that
+   compiles and runs;
+5. the warm job runs on a Ubicloud runner of the same architecture, saves on
+   main, and its ci.yml twin still saves only from main.
+
+It also DISCOVERS which ci.yml jobs need a twin (a Ubicloud job whose
+rust-cache saves only from main and whose ``if:`` never admits a push) and
+fails if one has none, so a new heavy job cannot silently build cold.
 
 Standard library only, like the other Rule Lint scripts: the subset of YAML
 these two files use is parsed by indentation.
@@ -49,16 +56,19 @@ import shlex
 import sys
 from pathlib import Path
 
+# Step-level env that changes what cargo/rustc/cc produce, so a cached
+# artifact built without it is not reused. CARGO_TERM_* only colours output.
 COMPILE_ENV_RE = re.compile(
-    r"^(CARGO_TARGET_|CARGO_PROFILE_|CARGO_BUILD_|RUSTFLAGS$|RUSTDOCFLAGS$)"
+    r"^(CARGO_(?!TERM_)|RUSTFLAGS$|RUSTDOCFLAGS$|RUSTC|CC$|CC_|CFLAGS|CXX|CMAKE)"
 )
-CARGO_CMD_RE = re.compile(r"\bcargo\s+(build|nextest\s+run|test)\b(.*)")
+EXPORT_RE = re.compile(r"^\s*export\s+([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
+CARGO_CMD_RE = re.compile(r"\bcargo\s+(build|nextest\s+run|test|run|check|doc)\b(.*)")
 MAKE_CMD_RE = re.compile(r"(?:^|[;&|]\s*|\s)(make\s.*)$")
 
 # Flags that take a value and decide what is compiled.
 VALUE_FLAGS = {"-p", "--package", "--features", "-F", "--exclude", "--test",
                "--bin", "--example", "--bench", "--target", "--profile",
-               "--cargo-profile"}
+               "--cargo-profile", "--target-dir", "--config", "--manifest-path"}
 # nextest's --profile picks a TEST profile (retries, timeouts), not a cargo
 # profile, so it does not affect what is compiled.
 NEXTEST_IGNORED_VALUE_FLAGS = {"--profile"}
@@ -100,6 +110,20 @@ def _mapping(block: list[str]) -> dict[str, str]:
         key, _, value = line.strip().partition(":")
         out[key.strip()] = value.strip().strip('"').strip("'")
     return out
+
+
+def _defaults(lines: list[str], indent: int) -> list[str]:
+    """Normalised content of a `defaults:` block at ``indent`` (workflow: 0, job: 4)."""
+    for i, line in enumerate(lines):
+        if re.match(rf"^{' ' * indent}defaults:\s*(#.*)?$", line):
+            return [l.strip() for l in _block_after(lines, i) if _is_content(l)]
+    return []
+
+
+def _github_env_writes(job: list[str]) -> set[str]:
+    """Script lines that set env for later steps (they reach the cache step)."""
+    return {" ".join(l.split()) for l in _logical_lines(job)
+            if "GITHUB_ENV" in l and ">>" in l}
 
 
 def _top_level_env(text: str) -> dict[str, str]:
@@ -184,14 +208,64 @@ def _uses_inputs(job: list[str], action: str) -> list[tuple[str, dict]]:
     return found
 
 
-def _compile_env(job: list[str]) -> set[tuple[str, str]]:
-    out = set()
+def _step_compile_env(step: list[str]) -> frozenset[tuple[str, str]]:
+    """Compile-affecting env a step's commands see: its `env:` plus `export`s."""
+    _, env_block = _step_key(step, "env")
+    env = {k: v for k, v in _mapping(env_block).items() if COMPILE_ENV_RE.match(k)}
+    for line in step:
+        m = EXPORT_RE.match(line)
+        if m and COMPILE_ENV_RE.match(m.group(1)):
+            env[m.group(1)] = m.group(2).strip().strip('"').strip("'")
+    return frozenset(env.items())
+
+
+def _runs_on(job: list[str]) -> str:
+    for line in job:
+        m = re.match(r"^    runs-on:\s*(.*)$", line)
+        if m:
+            return m.group(1).strip()
+    return ""
+
+
+def _job_if(job: list[str]) -> str | None:
+    for i, line in enumerate(job):
+        m = re.match(r"^    if:\s*(.*)$", line)
+        if m:
+            return " ".join([m.group(1)] + [l.strip() for l in _block_after(job, i)])
+    return None
+
+
+def _cache_steps(job: list[str]) -> list[tuple[str, dict, dict]]:
+    """(uses, with-inputs, step env) for each Swatinem/rust-cache step."""
+    out = []
     for step in _steps(job):
-        _, env_block = _step_key(step, "env")
-        for k, v in _mapping(env_block).items():
-            if COMPILE_ENV_RE.match(k):
-                out.add((k, v))
+        uses, _ = _step_key(step, "uses")
+        if uses and uses.split("@")[0] == "Swatinem/rust-cache":
+            _, with_block = _step_key(step, "with")
+            _, env_block = _step_key(step, "env")
+            out.append((uses, _mapping(with_block), _mapping(env_block)))
     return out
+
+
+def _restore_only_on_prs(job: list[str]) -> bool:
+    """Every rust-cache step saves only from main."""
+    steps = _cache_steps(job)
+    return bool(steps) and all("refs/heads/main" in w.get("save-if", "")
+                               for _, w, _ in steps)
+
+
+def needs_warm_twin(job: list[str]) -> bool:
+    """A Ubicloud job that restores a cache it can never write itself.
+
+    It saves only from main but never runs on a push to main, so only a warm
+    job can produce its main-scoped entry. A job with no `if:` (Clippy) runs on
+    main pushes and saves its own; a GitHub-hosted job uses a different cache
+    backend that a Ubicloud warm job could not fill.
+    """
+    if "ubicloud" not in _runs_on(job) or not _restore_only_on_prs(job):
+        return False
+    cond = _job_if(job)
+    return cond is not None and "'push'" not in cond
 
 
 def _logical_lines(job: list[str]) -> list[str]:
@@ -242,15 +316,23 @@ def _cargo_signature(sub: str, rest: str) -> tuple:
 
 
 def compile_signatures(job: list[str]) -> set[tuple]:
+    """Each compile command, paired with the compile env of ITS step.
+
+    Pairing per step, not per job, matters: dropping the linker flags from the
+    one warm step that compiles the tests must fail even though another step in
+    the same job still sets them.
+    """
     sigs = set()
-    for line in _logical_lines(job):
-        m = CARGO_CMD_RE.search(line)
-        if m:
-            sigs.add(_cargo_signature(m.group(1), m.group(2)))
-            continue
-        m = MAKE_CMD_RE.search(line)
-        if m:
-            sigs.add(("make", " ".join(m.group(1).split())))
+    for step in _steps(job):
+        env = _step_compile_env(step)
+        for line in _logical_lines(step):
+            m = CARGO_CMD_RE.search(line)
+            if m:
+                sigs.add((_cargo_signature(m.group(1), m.group(2)), env))
+                continue
+            m = MAKE_CMD_RE.search(line)
+            if m:
+                sigs.add((("make", " ".join(m.group(1).split())), env))
     return sigs
 
 
@@ -282,10 +364,36 @@ def check(ci_text: str, warm_text: str, ci_name: str = "ci.yml",
     ci_wf_env, warm_wf_env = _top_level_env(ci_text), _top_level_env(warm_text)
     if ci_wf_env != warm_wf_env:
         differ("workflow-level env", "*", ci_wf_env, warm_wf_env, key_why)
+    ci_def = _defaults(ci_text.splitlines(), 0)
+    warm_def = _defaults(warm_text.splitlines(), 0)
+    if ci_def != warm_def:
+        differ("workflow-level defaults", "*", ci_def, warm_def, fp_why)
 
     ids = job_ids(warm_text)
     if not ids:
         errors.append(f"{warm_name}: no jobs found; the parity check would be vacuous.")
+
+    # Discovery, not a hardcoded list: a list catches a twin being removed but
+    # never a NEW job that needs one.
+    needed = [j for j in job_ids(ci_text)
+              if needs_warm_twin(extract_job(ci_text, j) or [])]
+    if not needed:
+        errors.append(
+            f"{ci_name}: no job looks like it needs a warm twin (Ubicloud, "
+            f"rust-cache saving only from main, never run on push). Either the "
+            f"discovery rule no longer matches ci.yml, or {warm_name} is dead "
+            f"weight; find out which before silencing this."
+        )
+    for job_id in needed:
+        if job_id not in ids:
+            errors.append(
+                f"{ci_name}: job `{job_id}` restores a Rust cache it can never "
+                f"write (it saves only from main but never runs on a push to "
+                f"main), and {warm_name} has no job `{job_id}` to write it. Every "
+                f"run of it builds its dependencies from scratch. Add a warm "
+                f"twin with the same job id."
+            )
+
     for job_id in ids:
         warm_job = extract_job(warm_text, job_id)
         ci_job = extract_job(ci_text, job_id)
@@ -298,18 +406,39 @@ def check(ci_text: str, warm_text: str, ci_name: str = "ci.yml",
             )
             continue
 
+        if job_id not in needed:
+            errors.append(
+                f"{warm_name}: job `{job_id}` warms a cache its {ci_name} twin "
+                f"does not need from it: the twin either runs on pushes to main "
+                f"(so it saves its own entry), saves from PRs, or is not on "
+                f"Ubicloud. Delete the warm job, or restore the twin's "
+                f"restore-only, PR-only shape."
+            )
         ci_env, warm_env = _job_env(ci_job), _job_env(warm_job)
         if ci_env != warm_env:
             differ("job-level env", job_id, ci_env, warm_env, key_why)
+        if _defaults(ci_job, 4) != _defaults(warm_job, 4):
+            differ("job-level defaults", job_id, _defaults(ci_job, 4),
+                   _defaults(warm_job, 4), fp_why)
+        ci_ge, warm_ge = _github_env_writes(ci_job), _github_env_writes(warm_job)
+        if ci_ge != warm_ge:
+            differ("writes to $GITHUB_ENV", job_id, ci_ge, warm_ge, key_why)
 
         ci_tc = _uses_inputs(ci_job, "dtolnay/rust-toolchain")
         warm_tc = _uses_inputs(warm_job, "dtolnay/rust-toolchain")
         if ci_tc != warm_tc:
             differ("dtolnay/rust-toolchain inputs", job_id, ci_tc, warm_tc, key_why)
 
+        if not ci_tc:
+            errors.append(
+                f"{ci_name}: job `{job_id}` has no dtolnay/rust-toolchain step, "
+                f"so the toolchain comparison would be vacuous. Teach this "
+                f"linter where the toolchain now comes from."
+            )
+
         def cache_inputs(job):
-            return [(u, {k: v for k, v in w.items() if k != "save-if"})
-                    for u, w in _uses_inputs(job, "Swatinem/rust-cache")]
+            return [(u, {k: v for k, v in w.items() if k != "save-if"}, e)
+                    for u, w, e in _cache_steps(job)]
         ci_rc, warm_rc = cache_inputs(ci_job), cache_inputs(warm_job)
         if not ci_rc:
             errors.append(
@@ -317,12 +446,37 @@ def check(ci_text: str, warm_text: str, ci_name: str = "ci.yml",
                 f"so its warm twin in {warm_name} is dead weight. Delete it."
             )
         elif ci_rc != warm_rc:
-            differ("Swatinem/rust-cache reference or inputs (save-if excluded)",
-                   job_id, ci_rc, warm_rc, key_why)
+            differ("Swatinem/rust-cache reference, inputs or step env "
+                   "(save-if excluded)", job_id, ci_rc, warm_rc, key_why)
 
-        ci_ce, warm_ce = _compile_env(ci_job), _compile_env(warm_job)
-        if ci_ce != warm_ce:
-            differ("compile-affecting step env", job_id, ci_ce, warm_ce, fp_why)
+        # save-if is excluded above because the two sides are MEANT to differ
+        # in spirit, but each side still has a job to do.
+        if ci_rc and not _restore_only_on_prs(ci_job):
+            errors.append(
+                f"{ci_name}: job `{job_id}` saves its Rust cache from PR runs "
+                f"again. Each PR then uploads a 1-2 GB entry only that branch can "
+                f"read, which is what {warm_name} replaced. Keep `save-if: "
+                f"${{{{ github.ref == 'refs/heads/main' }}}}`."
+            )
+        for _, w, _ in _cache_steps(warm_job):
+            save_if = w.get("save-if", "").strip()
+            if save_if and save_if != "true" and "refs/heads/main" not in save_if:
+                errors.append(
+                    f"{warm_name}: job `{job_id}`: `save-if: {save_if}` can stop "
+                    f"the warm job saving at all, which makes it pointless. It "
+                    f"should save on main."
+                )
+
+        ci_ro, warm_ro = _runs_on(ci_job), _runs_on(warm_job)
+        if "ubicloud" not in warm_ro:
+            errors.append(
+                f"{warm_name}: job `{job_id}` runs on `{warm_ro}`. Ubicloud "
+                f"serves its own cache backend, so an entry saved from any other "
+                f"runner is invisible to the Ubicloud PR job. Use a "
+                f"`ubicloud-standard-*` label."
+            )
+        if ("-arm" in ci_ro) != ("-arm" in warm_ro):
+            differ("runner architecture", job_id, ci_ro, warm_ro, key_why)
 
         ci_sig, warm_sig = compile_signatures(ci_job), compile_signatures(warm_job)
         if not ci_sig:
@@ -333,7 +487,8 @@ def check(ci_text: str, warm_text: str, ci_name: str = "ci.yml",
                 f"follow them."
             )
         elif ci_sig != warm_sig:
-            differ("compile commands (packages/features/targets/profile)",
+            differ("compile commands (packages/features/targets/profile, "
+                   "each with its step's compile env)",
                    job_id, ci_sig, warm_sig, fp_why)
     return errors
 
@@ -349,6 +504,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - run: cargo fmt -- --check
+  clippy_check:
+    runs-on: ubicloud-standard-8
+    steps:
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --locked
   test_unit:
     name: Unit & Integration
     runs-on: ubicloud-standard-16
@@ -458,7 +618,50 @@ def _cases() -> list[tuple[str, str, str, bool]]:
      _WARM, False),
     ("nextest --profile is a test profile, not a cargo profile",
      _sub(_CI, "--profile ci -E", "--profile default -E"), _WARM, False),
-]
+    ("linker env dropped from ONE warm step while another keeps it",
+     _CI, _sub(_WARM, """      - name: Compile tests
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
+""", """      - name: Compile tests
+"""), True),
+    ("a CI job that needs a twin has none",
+     _CI.replace("  test_unit:\n", "  test_sim:\n", 1) + _CI[_CI.index("  test_unit:\n"):],
+     _WARM, True),
+    ("warm save-if false", _CI, _sub(_WARM, "save-if: true", "save-if: false"), True),
+    ("CI job saves from PRs again",
+     _sub(_CI, "          save-if: ${{ github.ref == 'refs/heads/main' }}\n", "          cache-on-failure: true\n"),
+     _sub(_WARM, "          save-if: true\n", "          cache-on-failure: true\n"), True),
+    ("warm job on a GitHub-hosted runner",
+     _CI, _sub(_WARM, "runs-on: ubicloud-standard-8", "runs-on: ubuntu-latest"), True),
+    ("CI job moved to arm",
+     _sub(_CI, "runs-on: ubicloud-standard-16", "runs-on: ubicloud-standard-16-arm"), _WARM, True),
+    ("env on the rust-cache step in CI only",
+     _sub(_CI, "      - uses: Swatinem/rust-cache@v2\n        # a comment",
+          "      - uses: Swatinem/rust-cache@v2\n        env:\n          CARGO_HOME: /x\n        # a comment"),
+     _WARM, True),
+    ("--release added to one warm build",
+     _CI, _sub(_WARM, "          cargo build --locked\n", "          cargo build --locked --release\n"), True),
+    ("extra package in CI test command",
+     _sub(_CI, "--exclude ping-types", "-p extra --exclude ping-types"), _WARM, True),
+    ("RUSTFLAGS exported inside a CI script",
+     _sub(_CI, "          cargo build --locked\n", "          export RUSTFLAGS=-Dwarnings\n          cargo build --locked\n"),
+     _WARM, True),
+    ("CC set on a CI step",
+     _sub(_CI, '          FREENET_BACKOFF_BASE_SECS: "5"', '          FREENET_BACKOFF_BASE_SECS: "5"\n          CC: clang'),
+     _WARM, True),
+    ("--target-dir in CI only",
+     _sub(_CI, "          cargo build --locked\n", "          cargo build --locked --target-dir t2\n"), _WARM, True),
+    ("$GITHUB_ENV write in CI only",
+     _sub(_CI, "      - uses: actions/checkout@v7\n      - uses: dtolnay",
+          "      - uses: actions/checkout@v7\n      - run: echo CARGO_INCREMENTAL=1 >> $GITHUB_ENV\n      - uses: dtolnay"),
+     _WARM, True),
+    ("CI twin now runs on push (warm job is dead weight)",
+     _sub(_CI, "    if: github.event_name == 'pull_request'\n",
+          "    if: github.event_name == 'pull_request' || github.event_name == 'push'\n"),
+     _WARM, True),
+    ("workflow-level defaults in CI only",
+     _sub(_CI, "jobs:\n", "defaults:\n  run:\n    working-directory: crates\njobs:\n"), _WARM, True),
+    ]
 
 
 def self_test() -> int:

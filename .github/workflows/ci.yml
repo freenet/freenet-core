@@ -934,8 +934,14 @@ jobs:
         # no `v0-rust-test_unit-*` entry existed at all, so every PR run built
         # its dependencies from scratch. That workflow now writes the entry
         # under this job's id; see the note on test_simulation's cache step.
+        # `key` folds ci.yml's hash into the cache key. rust-cache skips the
+        # save on an exact key hit, so without it a change to this job's
+        # features or commands would re-run the warm job and then save
+        # nothing, leaving PRs to rebuild the difference until Cargo.lock
+        # next changed. Must match the twin in ci-cache-warm.yml.
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
+          key: ci-${{ hashFiles('.github/workflows/ci.yml') }}
 
       # nextest is installed by the maintained action on every platform, NOT by
       # a hand-rolled download. Worth not undoing: on 2026-08-12 the one-liners
@@ -1069,6 +1075,11 @@ jobs:
         # step, and a reader saw a plausible test regression instead of a
         # tool-acquisition problem. Require the install to have succeeded.
         if: ${{ !cancelled() && steps.install-nextest.conclusion == 'success' }}
+        # Same linker env as the other test steps, so its dependencies are not
+        # rebuilt with different flags (and so the warm cache applies).
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
         # freenet-ping-types tests need the std feature (default).
         # Run separately since the main step uses --no-default-features.
         run: cargo nextest run -p freenet-ping-types --profile ci
@@ -1333,6 +1344,8 @@ jobs:
         if: steps.skip_check.outputs.skip != 'true'
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
+          # See the `key` note on test_unit's cache step.
+          key: ci-${{ hashFiles('.github/workflows/ci.yml') }}
 
       # nextest via the maintained action, not a hand-rolled download.
       # Rationale at the first of these in ci.yml (test_unit job); see #5296.
@@ -1379,6 +1392,12 @@ jobs:
         if: steps.skip_check.outputs.skip != 'true'
         env:
           RUST_LOG: info,turmoil=warn
+          # The same linker env as the build step above, or cargo sees changed
+          # flags and recompiles `freenet` before running a single test: 3m04s
+          # of a standard-16 on every run, found by check_cache_warm_parity.py
+          # comparing env per command (run 41154587352, sim-logs/nextest.log).
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
         run: |
           # Each fdev sim runs under `timeout` so one hanging sim cannot eat the
           # entire 30m budget silently. Each sim writes to its own log file so
@@ -1595,6 +1614,8 @@ jobs:
         if: steps.skip_check.outputs.skip != 'true'
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
+          # See the `key` note on test_unit's cache step.
+          key: ci-${{ hashFiles('.github/workflows/ci.yml') }}
 
       - name: Pull Docker images for NAT simulation
         if: steps.skip_check.outputs.skip != 'true'

@@ -640,6 +640,11 @@ check_prerequisites() {
             #    is tracked separately.
             #  - "Notify Matrix on Failure" is a cascade notifier that fires
             #    whenever any other workflow fails — it's not itself a test.
+            #  - "Warm cache: *" (ci-cache-warm.yml) only refills the Rust
+            #    build cache. It runs on pushes to main that touch Cargo.lock,
+            #    which includes the release's own version bump, so without
+            #    this exclusion a release would wait up to 45 min on it and a
+            #    failed cache run would block the release outright.
             # If any of these are genuinely broken, fix them on their own
             # schedule; they should never gate a release of a PR-CI-green
             # merge commit.
@@ -652,8 +657,8 @@ check_prerequisites() {
             # filters so a Dependabot run in either state never gates a
             # release (release blocked by unrelated Dependabot cron,
             # 2026-04-14 v0.2.45 release).
-            in_progress_count=$(echo "$check_runs_json" | jq '[.check_runs[] | select(.status != "completed" and .name != "Dependabot" and (.name | startswith("Build for") | not) and .name != "claude" and .name != "Large Scale Simulation" and .name != "Simulation Tests (Nightly)" and .name != "Notify Matrix on Failure" and .name != "mirror / mirror")] | length')
-            failed_count=$(echo "$check_runs_json" | jq '[.check_runs[] | select(.status == "completed" and .conclusion != "success" and .conclusion != "skipped" and .name != "Dependabot" and (.name | startswith("Build for") | not) and .name != "claude" and .name != "Large Scale Simulation" and .name != "Simulation Tests (Nightly)" and .name != "Notify Matrix on Failure" and .name != "mirror / mirror")] | length')
+            in_progress_count=$(echo "$check_runs_json" | jq '[.check_runs[] | select(.status != "completed" and .name != "Dependabot" and (.name | startswith("Build for") | not) and (.name | startswith("Warm cache:") | not) and .name != "claude" and .name != "Large Scale Simulation" and .name != "Simulation Tests (Nightly)" and .name != "Notify Matrix on Failure" and .name != "mirror / mirror")] | length')
+            failed_count=$(echo "$check_runs_json" | jq '[.check_runs[] | select(.status == "completed" and .conclusion != "success" and .conclusion != "skipped" and .name != "Dependabot" and (.name | startswith("Build for") | not) and (.name | startswith("Warm cache:") | not) and .name != "claude" and .name != "Large Scale Simulation" and .name != "Simulation Tests (Nightly)" and .name != "Notify Matrix on Failure" and .name != "mirror / mirror")] | length')
 
             if [[ "$total_checks" == "0" ]]; then
                 echo "⚠️  (no checks found)"
