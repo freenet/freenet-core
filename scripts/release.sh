@@ -628,7 +628,11 @@ check_prerequisites() {
         while true; do
             echo -n "  Checking main branch CI status... "
             local check_runs_json
-            check_runs_json=$(gh api repos/freenet/freenet-core/commits/main/check-runs 2>/dev/null || echo "{}")
+            # per_page=100: the default page is 30, and main's HEAD commonly
+            # carries more (42 on 2026-11-03), so checks past the first page
+            # were never looked at. Scheduled runs (nightly sims, the cache
+            # warm) keep adding to HEAD while main sits still.
+            check_runs_json=$(gh api "repos/freenet/freenet-core/commits/main/check-runs?per_page=100" 2>/dev/null || echo "{}")
 
             # Exclude scheduled workflows and their cascade notifiers from the
             # release pre-flight check. These run on a cron (not on commit
@@ -641,10 +645,11 @@ check_prerequisites() {
             #  - "Notify Matrix on Failure" is a cascade notifier that fires
             #    whenever any other workflow fails — it's not itself a test.
             #  - "Warm cache: *" (ci-cache-warm.yml) only refills the Rust
-            #    build cache. It runs on pushes to main that touch Cargo.lock,
-            #    which includes the release's own version bump, so without
-            #    this exclusion a release would wait up to 45 min on it and a
-            #    failed cache run would block the release outright.
+            #    build cache, daily at 04:00 UTC and after pushes that touch
+            #    Cargo.lock, Cargo.toml or the CI workflow files. A warm run
+            #    still in progress would run this wait into ci_max_wait, and
+            #    a failed one would refuse the release; neither says anything
+            #    about the commit being released.
             # If any of these are genuinely broken, fix them on their own
             # schedule; they should never gate a release of a PR-CI-green
             # merge commit.

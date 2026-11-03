@@ -242,6 +242,16 @@ jobs:
       - name: Self-test required-check path-filter guard
         run: bash scripts/required_check_path_filters_test.sh
 
+      # Regression gate for the Rust cache warm (#6105). ci-cache-warm.yml
+      # writes the main-scoped caches the heavy PR jobs restore, and drift
+      # between the two files fails silently (green checks, cold builds).
+      # Pins that the parity linter fires on the real defect it found
+      # (Simulation's run step recompiling for want of the linker env), that
+      # the repo satisfies it, that it is wired into rule_lint, and that the
+      # release pre-flight ignores "Warm cache:" check runs.
+      - name: Self-test cache-warm parity guard
+        run: bash scripts/cache_warm_parity_test.sh
+
       # Regression gate for the release driver's cross-compile wait: under
       # `set -euo pipefail` a bare `var=$(gh ...)` aborts the whole driver on a
       # transient GitHub blip, AFTER the release publishes but BEFORE the
@@ -355,7 +365,7 @@ jobs:
       # clean when they landed but were not actually in this list, so nothing
       # held them to it. `-x` because the two test scripts `source` the canary.
       - name: Lint install/uninstall scripts (shellcheck)
-        run: shellcheck -x scripts/check-x86-64-baseline.sh scripts/check-x86-64-baseline_test.sh scripts/install.sh scripts/uninstall.sh scripts/test-install-sh.sh scripts/test-uninstall-sh.sh scripts/macos-url-scheme-e2e.sh scripts/auto-update-canary.sh scripts/auto-update-canary_test.sh scripts/auto-update-canary_lifecycle_test.sh scripts/release_wait_for_binaries_test.sh scripts/release_canary_wiring_test.sh scripts/rule_lint_shell_assertion_counter_test.sh scripts/release.sh scripts/pr-backlog-sweep.sh scripts/pr-backlog-sweep_test.sh scripts/release-rollback.sh scripts/release_rollback_test.sh scripts/resolve_release_mode.sh scripts/release_dry_run_test.sh nix/freenet-node.sh scripts/nix-node-wrapper_test.sh scripts/wan-bench-classify.sh scripts/wan-bench-classify_test.sh
+        run: shellcheck -x scripts/check-x86-64-baseline.sh scripts/check-x86-64-baseline_test.sh scripts/install.sh scripts/uninstall.sh scripts/test-install-sh.sh scripts/test-uninstall-sh.sh scripts/macos-url-scheme-e2e.sh scripts/auto-update-canary.sh scripts/auto-update-canary_test.sh scripts/auto-update-canary_lifecycle_test.sh scripts/release_wait_for_binaries_test.sh scripts/release_canary_wiring_test.sh scripts/rule_lint_shell_assertion_counter_test.sh scripts/release.sh scripts/pr-backlog-sweep.sh scripts/pr-backlog-sweep_test.sh scripts/release-rollback.sh scripts/release_rollback_test.sh scripts/resolve_release_mode.sh scripts/release_dry_run_test.sh nix/freenet-node.sh scripts/nix-node-wrapper_test.sh scripts/wan-bench-classify.sh scripts/wan-bench-classify_test.sh scripts/cache_warm_parity_test.sh
       # The PR-backlog sweep reports stalled PRs (see
       # .github/workflows/pr-backlog-sweep.yml). Its self-test drives the ABORT
       # paths -- failed query, empty listing the REST probe contradicts,
@@ -934,14 +944,16 @@ jobs:
         # no `v0-rust-test_unit-*` entry existed at all, so every PR run built
         # its dependencies from scratch. That workflow now writes the entry
         # under this job's id; see the note on test_simulation's cache step.
-        # `key` folds ci.yml's hash into the cache key. rust-cache skips the
-        # save on an exact key hit, so without it a change to this job's
-        # features or commands would re-run the warm job and then save
-        # nothing, leaving PRs to rebuild the difference until Cargo.lock
-        # next changed. Must match the twin in ci-cache-warm.yml.
+        # `key` folds ci-cache-warm.yml's hash into the cache key. rust-cache
+        # skips the save on an exact key hit, so without it a change to what
+        # this job compiles would re-run the warm job and then save nothing.
+        # Any such change must be mirrored in ci-cache-warm.yml (the parity
+        # linter enforces it), so hashing that file changes the key exactly
+        # when the cached work changes, while comment-only edits to ci.yml
+        # leave it alone. Must match the twin in ci-cache-warm.yml.
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-          key: ci-${{ hashFiles('.github/workflows/ci.yml') }}
+          key: ci-${{ hashFiles('.github/workflows/ci-cache-warm.yml') }}
 
       # nextest is installed by the maintained action on every platform, NOT by
       # a hand-rolled download. Worth not undoing: on 2026-08-12 the one-liners
@@ -1345,7 +1357,7 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           # See the `key` note on test_unit's cache step.
-          key: ci-${{ hashFiles('.github/workflows/ci.yml') }}
+          key: ci-${{ hashFiles('.github/workflows/ci-cache-warm.yml') }}
 
       # nextest via the maintained action, not a hand-rolled download.
       # Rationale at the first of these in ci.yml (test_unit job); see #5296.
@@ -1615,7 +1627,7 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           # See the `key` note on test_unit's cache step.
-          key: ci-${{ hashFiles('.github/workflows/ci.yml') }}
+          key: ci-${{ hashFiles('.github/workflows/ci-cache-warm.yml') }}
 
       - name: Pull Docker images for NAT simulation
         if: steps.skip_check.outputs.skip != 'true'

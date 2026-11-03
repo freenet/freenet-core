@@ -14,12 +14,12 @@ name: CI Cache Warm
 #
 # HOW THE KEYS LINE UP. Swatinem/rust-cache keys on
 #   <prefix>-<key input>-<GITHUB_JOB>-<OS>-<arch>-<hash>-<lockfile hash>
-# The `key` input here is ci.yml's file hash on both sides, so a change to
-# what the PR jobs compile yields a new key that this workflow then fills
-# (rust-cache skips the save on an exact key hit).
-# where <hash> covers the rustc version and every env var whose name starts
-# with CARGO, CC, CFLAGS, CXX, CMAKE or RUST. A PR restores by the key minus
-# the lockfile hash. So each job below MUST keep:
+# where <hash> covers the installed rustc versions and every env var whose
+# name starts with CARGO, CC, CFLAGS, CXX, CMAKE or RUST, and a PR restores by
+# the key minus the lockfile hash. The `key` input is THIS file's hash on both
+# sides: rust-cache skips the save on an exact key hit, so a change to what
+# the PR jobs compile (which must be mirrored here) has to yield a new key for
+# this workflow to fill. So each job below MUST keep:
 #   - the SAME job id as its ci.yml counterpart (test_unit, test_simulation,
 #     nat_validation) -- the display `name:` is deliberately different, so
 #     these never masquerade as the required status contexts;
@@ -73,10 +73,6 @@ permissions:
 jobs:
   test_unit:
     name: "Warm cache: Unit & Integration"
-    # A release version bump touches Cargo.lock, but only workspace versions,
-    # which rust-cache leaves out of the key: the run would hit the existing
-    # entry and save nothing.
-    if: "github.event_name != 'push' || !startsWith(github.event.head_commit.message, 'build: release')"
     runs-on: ubicloud-standard-8
     timeout-minutes: 45
 
@@ -102,7 +98,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-          key: ci-${{ hashFiles('.github/workflows/ci.yml') }}
+          key: ci-${{ hashFiles('.github/workflows/ci-cache-warm.yml') }}
 
       - name: Install nextest
         uses: taiki-e/install-action@v2
@@ -136,10 +132,6 @@ jobs:
 
   test_simulation:
     name: "Warm cache: Simulation"
-    # A release version bump touches Cargo.lock, but only workspace versions,
-    # which rust-cache leaves out of the key: the run would hit the existing
-    # entry and save nothing.
-    if: "github.event_name != 'push' || !startsWith(github.event.head_commit.message, 'build: release')"
     runs-on: ubicloud-standard-8
     timeout-minutes: 45
 
@@ -163,7 +155,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-          key: ci-${{ hashFiles('.github/workflows/ci.yml') }}
+          key: ci-${{ hashFiles('.github/workflows/ci-cache-warm.yml') }}
 
       - name: Install nextest
         uses: taiki-e/install-action@v2
@@ -190,10 +182,6 @@ jobs:
 
   nat_validation:
     name: "Warm cache: NAT Validation"
-    # A release version bump touches Cargo.lock, but only workspace versions,
-    # which rust-cache leaves out of the key: the run would hit the existing
-    # entry and save nothing.
-    if: "github.event_name != 'push' || !startsWith(github.event.head_commit.message, 'build: release')"
     runs-on: ubicloud-standard-8
     timeout-minutes: 45
 
@@ -218,7 +206,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-          key: ci-${{ hashFiles('.github/workflows/ci.yml') }}
+          key: ci-${{ hashFiles('.github/workflows/ci-cache-warm.yml') }}
 
       - name: Install nextest
         uses: taiki-e/install-action@v2
@@ -243,3 +231,22 @@ jobs:
         run: |
           cargo nextest run -p freenet-ping-app --features testing \
             --profile ci --no-run
+
+  # A failed warm leaves PRs building cold with every check green, so say so.
+  # Named "Warm cache: ..." like the jobs above: scripts/release.sh ignores
+  # main-branch check runs by that prefix, including this one while queued.
+  notify_failure:
+    name: "Warm cache: notify on failure"
+    runs-on: ubuntu-latest
+    needs: [test_unit, test_simulation, nat_validation]
+    if: failure() && github.ref == 'refs/heads/main'
+    # Best-effort, like ci.yml's notify_dev_room_main_failure.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/river-dev-notify
+        with:
+          message: "⚠️ CI cache warm failed — PRs will build cold until it succeeds — ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          bot-config: ${{ secrets.RIVER_DEV_BOT_CONFIG }}
+          room-id: ${{ secrets.RIVER_DEV_ROOM_ID }}
+          gateway-url: ${{ secrets.RIVER_GATEWAY_URL }}
