@@ -559,6 +559,8 @@ pub(crate) use launch_at_login::{
     ToggleLaunchAtLoginOutcome, disable_launch_at_login, enable_launch_at_login,
     is_launch_at_login_enabled, macos_app_bundle_path, toggle_launch_at_login_outcome,
 };
+// For freenet.rs, which has to run on every platform.
+pub(crate) use launch_at_login::is_macos_app_launch;
 
 // Re-exports for update.rs (macOS plist generation).
 #[cfg(target_os = "macos")]
@@ -1058,21 +1060,129 @@ mod tests {
     }
 
     #[test]
-    fn launch_agent_program_arguments_for_bundle_points_at_wrapper() {
-        // Inside a .app bundle, ProgramArguments must be the CFBundleExecutable
-        // shell wrapper (Contents/MacOS/Freenet). Launching it re-enters the
-        // tray path via the `exec freenet-bin service run-wrapper` line in
-        // scripts/package-macos.sh. If this regresses and ProgramArguments
-        // becomes just `freenet-bin`, launchd runs bare freenet which
-        // defaults to Network mode and the tray never appears: the exact
-        // shipping bug that Codex P2 and the code-first/big-picture reviews
-        // flagged on the first round of this commit.
+    fn launch_agent_program_arguments_for_bundle_passes_the_wrapper_subcommand() {
+        // Inside a .app bundle launchd runs the bundle's executable with the
+        // explicit subcommand. There is no script to point at any more: the
+        // leader differs from what older installs wrote, which is what makes
+        // `refresh_launch_at_login_plist_if_stale` migrate their plist.
         let exe = PathBuf::from("/Applications/Freenet.app/Contents/MacOS/freenet-bin");
         let args = launch_agent_program_arguments(&exe);
         assert_eq!(
             args,
-            vec!["/Applications/Freenet.app/Contents/MacOS/Freenet".to_string()]
+            vec![
+                "/Applications/Freenet.app/Contents/MacOS/freenet-bin".to_string(),
+                "service".to_string(),
+                "run-wrapper".to_string(),
+            ]
         );
+    }
+
+    #[test]
+    fn an_old_launch_agent_plist_is_rewritten_once() {
+        // Older installs pointed launchd at Contents/MacOS/Freenet. The first
+        // run of a new version points them at the binary, and later runs
+        // leave the file alone.
+        let dir = tempfile::tempdir().unwrap();
+        let plist = dir.path().join("agent.plist");
+        let old_args = vec!["/Applications/Freenet.app/Contents/MacOS/Freenet".to_string()];
+        write_launch_agent_plist_at(&plist, &old_args).unwrap();
+        let exe = PathBuf::from("/Applications/Freenet.app/Contents/MacOS/freenet-bin");
+
+        assert!(rewrite_launch_agent_plist_if_stale(&plist, &exe).unwrap());
+        let contents = std::fs::read_to_string(&plist).unwrap();
+        assert!(contents.contains(">/Applications/Freenet.app/Contents/MacOS/freenet-bin<"));
+        assert!(contents.contains(">run-wrapper<"));
+        assert!(!contents.contains("/MacOS/Freenet<"));
+
+        assert!(!rewrite_launch_agent_plist_if_stale(&plist, &exe).unwrap());
+    }
+
+    #[test]
+    fn a_failed_plist_rewrite_keeps_the_old_file() {
+        // The old file still works through the script, so it must survive.
+        let dir = tempfile::tempdir().unwrap();
+        let plist = dir.path().join("agent.plist");
+        let old_args = vec!["/Applications/Freenet.app/Contents/MacOS/Freenet".to_string()];
+        write_launch_agent_plist_at(&plist, &old_args).unwrap();
+        let before = std::fs::read_to_string(&plist).unwrap();
+        // A directory where the temporary file goes makes the write fail.
+        std::fs::create_dir(plist.with_extension("plist.tmp")).unwrap();
+
+        let exe = PathBuf::from("/Applications/Freenet.app/Contents/MacOS/freenet-bin");
+        assert!(rewrite_launch_agent_plist_if_stale(&plist, &exe).is_err());
+        assert_eq!(std::fs::read_to_string(&plist).unwrap(), before);
+    }
+
+    #[test]
+    fn launchservices_argv_is_an_app_launch() {
+        let argv = |args: &[&str]| {
+            args.iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>()
+        };
+        for path in [
+            "/Applications/Freenet.app/Contents/MacOS/freenet-bin",
+            "/Users/someone/Applications/Tools/Freenet.app/Contents/MacOS/freenet-bin",
+            "/private/var/folders/zz/abc/T/AppTranslocation/1-2/d/Freenet.app/Contents/MacOS/freenet-bin",
+        ] {
+            assert!(is_macos_app_launch(&argv(&[path])), "{path}");
+        }
+    }
+
+    #[test]
+    fn arguments_macos_adds_do_not_stop_an_app_launch() {
+        // The script this replaced dropped its arguments, so these never
+        // reached the parser. Rejecting one would silently fail to start.
+        let argv = |args: &[&str]| {
+            args.iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>()
+        };
+        let bundled = "/Applications/Freenet.app/Contents/MacOS/freenet-bin";
+        for args in [
+            argv(&[bundled, "-psn_0_12345"]),
+            argv(&[bundled, "-ApplePersistenceIgnoreState", "YES"]),
+            argv(&[bundled, "-NSDocumentRevisionsDebugMode", "YES"]),
+            argv(&[bundled, "-psn_0_1", "-AppleLanguages", "(en)"]),
+            // A value is skipped even when it looks like one of ours.
+            argv(&[bundled, "-AppleLanguages", "network"]),
+        ] {
+            assert!(is_macos_app_launch(&args), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn a_terminal_freenet_is_not_an_app_launch() {
+        // These must keep running the node: `freenet` with no subcommand is
+        // documented to, and the CLI symlink reaches this same binary.
+        let argv = |args: &[&str]| {
+            args.iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>()
+        };
+        let bundled = "/Applications/Freenet.app/Contents/MacOS/freenet-bin";
+        for args in [
+            argv(&["freenet"]),
+            argv(&["/usr/local/bin/freenet"]),
+            argv(&["./freenet-bin"]),
+            argv(&["./Freenet.app/Contents/MacOS/freenet-bin"]),
+            argv(&["/Applications/Other.app/Contents/MacOS/other"]),
+            // Named freenet-bin under a `.app` directory, but not a bundle's
+            // executable, such as a build inside a directory ending in .app.
+            argv(&["/Users/me/work.app/target/debug/freenet-bin"]),
+            argv(&["/Applications/Freenet.app/freenet-bin"]),
+            argv(&["/Applications/Freenet/Contents/MacOS/freenet-bin"]),
+            argv(&["/Applications/Freenet.app/Contents/Resources/freenet-bin"]),
+            argv(&["/Applications/Freenet.app/Other/MacOS/freenet-bin"]),
+            argv(&[bundled, "--version"]),
+            argv(&[bundled, "network"]),
+            argv(&[bundled, "service", "run-wrapper"]),
+            argv(&[bundled, "-psn_0_1", "network"]),
+            argv(&[bundled, "-AppleLanguages", "(en)", "network"]),
+            argv(&[]),
+        ] {
+            assert!(!is_macos_app_launch(&args), "{args:?}");
+        }
     }
 
     #[test]
@@ -1083,10 +1193,8 @@ mod tests {
         );
         let args = launch_agent_program_arguments(&exe);
         assert_eq!(
-            args,
-            vec![
-                "/Users/someone/Applications/Tools/Freenet.app/Contents/MacOS/Freenet".to_string()
-            ]
+            args[0],
+            "/Users/someone/Applications/Tools/Freenet.app/Contents/MacOS/freenet-bin"
         );
     }
 

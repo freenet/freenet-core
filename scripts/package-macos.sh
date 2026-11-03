@@ -119,10 +119,21 @@ else
     echo ">> Skipping fdev (FREENET_ARM64_FDEV_BIN/FREENET_X86_FDEV_BIN not set)"
 fi
 
-echo ">> Writing shell wrapper as CFBundleExecutable"
-# When the user opens Freenet.app, macOS runs Contents/MacOS/Freenet (the
-# value of CFBundleExecutable). That script execs the real freenet binary
-# with "service run-wrapper" so the tray path is activated.
+# CFBundleExecutable must be the real binary, not a script or launcher that
+# execs it: macOS 26 does not display a status item created after such an exec
+# when the app was launched through LaunchServices, so the menu bar icon is
+# silently missing (#6093). LaunchServices passes no arguments, so freenet-bin
+# enters the wrapper by itself when started that way (is_macos_app_launch).
+if ! file -b "$APP_DIR/Contents/MacOS/freenet-bin" | grep -F 'Mach-O' > /dev/null; then
+    echo "package-macos.sh: freenet-bin is not a Mach-O binary (#6093)" >&2
+    exit 1
+fi
+
+echo ">> Writing launchd target for older Launch at Login agents"
+# Not the bundle's executable. LaunchAgents written by earlier releases run this
+# path, and only a running new version repairs them, so without it a Mac whose
+# relaunch failed after an auto-update would not start Freenet at login either.
+# launchd is not affected by the exec problem above. Removal is tracked in #6099.
 cat > "$APP_DIR/Contents/MacOS/Freenet" <<'SH'
 #!/bin/bash
 DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -142,7 +153,7 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
     <key>CFBundleVersion</key><string>$VERSION</string>
     <key>CFBundleShortVersionString</key><string>$VERSION</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleExecutable</key><string>Freenet</string>
+    <key>CFBundleExecutable</key><string>freenet-bin</string>
     <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
     <key>LSUIElement</key><true/>
     <key>LSMinimumSystemVersion</key><string>11.0</string>
@@ -231,6 +242,23 @@ if [[ "$CREATE_DMG" == "true" ]]; then
             --wait
         xcrun stapler staple "$DMG_PATH"
         xcrun stapler validate "$DMG_PATH"
+
+        # A script's signature is held in extended attributes, so check that
+        # it survived into what users will actually install.
+        echo ">> Verifying the signature inside the DMG"
+        DMG_MOUNT="$(mktemp -d)"
+        hdiutil attach -nobrowse -readonly -mountpoint "$DMG_MOUNT" "$DMG_PATH" > /dev/null
+        verified=true
+        codesign --verify --deep --strict --verbose=2 "$DMG_MOUNT/Freenet.app" || verified=false
+        # Forced because the image is read-only, so no data is at risk, and a
+        # busy detach must not fail a release whose DMG just passed the check.
+        hdiutil detach -force "$DMG_MOUNT" > /dev/null \
+            || echo "package-macos.sh: could not detach $DMG_MOUNT" >&2
+        rmdir "$DMG_MOUNT" 2>/dev/null || true
+        if [[ "$verified" != "true" ]]; then
+            echo "package-macos.sh: Freenet.app in the DMG fails verification" >&2
+            exit 1
+        fi
     fi
 
     echo ">> $DMG_PATH"

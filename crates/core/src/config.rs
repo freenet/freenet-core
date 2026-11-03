@@ -3186,9 +3186,12 @@ pub struct WebsocketApiArgs {
     /// endpoints `/permission/pending`, `/permission/events`,
     /// `/permission/events/ws`, and
     /// `/permission/{nonce}/respond`).
-    /// Use when accessing the node via a custom domain (e.g., through a reverse proxy).
-    /// Can be specified multiple times. If omitted, only the machine's hostname and
-    /// bound IP are accepted.
+    /// Use when accessing the node via a custom domain (e.g., through a reverse proxy),
+    /// or through a forwarder that keeps the original `Host`. On a loopback bind that
+    /// includes the machine's own LAN address.
+    /// Can be specified multiple times. If omitted, only localhost, the machine's
+    /// hostname and the bound IP are accepted, plus the machine's IPs on a bind
+    /// reachable at them.
     #[arg(long, env = "FREENET_ALLOWED_HOST")]
     #[serde(rename = "allowed-host", skip_serializing_if = "Option::is_none")]
     pub allowed_host: Option<Vec<String>>,

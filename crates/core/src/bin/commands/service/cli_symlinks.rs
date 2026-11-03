@@ -34,9 +34,10 @@ pub(super) struct ManagedTool {
     pub bundle_binary_name: &'static str,
 }
 
-/// `freenet-bin` is the real multi-subcommand binary (`Contents/MacOS/Freenet`
-/// is just a wrapper script that execs it with `service run-wrapper`), so
-/// symlinking `freenet` straight to it gives a fully-functional CLI. `fdev`
+/// `freenet-bin` is the real multi-subcommand binary, so symlinking `freenet`
+/// straight to it gives a fully-functional CLI. It starts the wrapper only
+/// when LaunchServices launches it from the bundle (`is_macos_app_launch`),
+/// which a bare `freenet` through this symlink does not trigger. `fdev`
 /// is bundled as-is (see `package-macos.sh`); it may be ABSENT from an older
 /// DMG built before fdev was bundled, which `bundle_binary_exists` below
 /// handles as a no-op rather than an error.

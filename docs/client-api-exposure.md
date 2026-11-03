@@ -32,6 +32,7 @@ Pick the narrowest option that fits.
 | A VPN overlay you control (Tailscale, WireGuard) | `--allowed-source-cidrs 100.64.0.0/10` |
 | A reverse proxy on **this** machine | nothing — loopback already works; add `--allowed-host your.domain` so the proxy's `Host` header is accepted |
 | A reverse proxy on **another** machine | `--ws-api-address ::` **and** `--allowed-host your.domain` |
+| A forwarder on **this** machine that keeps the client's `Host` (`ssh -g -L`, socat) | `--allowed-host <LAN IP>:<forwarded port>`, the exact `Host` clients send, since a loopback bind does not allow the machine's LAN IP by default |
 
 `--allowed-source-cidrs` widens the bind on its own, in network mode. It is
 inert on a loopback socket — a non-private source can never reach `::1` — so

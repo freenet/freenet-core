@@ -20,7 +20,7 @@ use super::{
 // itself: the .app bundle is just a folder in /Applications. To match
 // the Windows-installer experience (service registers with the OS and
 // starts on boot) we write a user LaunchAgent plist that points at the
-// .app bundle's CFBundleExecutable shell wrapper and sets RunAtLoad=true.
+// .app bundle's executable and sets RunAtLoad=true.
 //
 // The presence/absence of the plist file is the single source of truth
 // for the user's preference: plist exists means launch at login enabled.
@@ -81,40 +81,73 @@ pub(crate) fn macos_app_bundle_path(exe: &Path) -> Option<PathBuf> {
     None
 }
 
-/// The path to a `.app` bundle's CFBundleExecutable shell wrapper, by our
-/// packaging convention. See `scripts/package-macos.sh` for how this
-/// wrapper is produced: it execs the inner `freenet-bin` with the
-/// `service run-wrapper` subcommand.
+/// Whether `argv` is how LaunchServices starts the app: the absolute path of
+/// the bundle's executable, with no arguments of ours.
 ///
-/// Builds the path with an explicit `/` join rather than `Path::join`:
-/// this always describes a macOS bundle layout (always `/`-separated,
-/// regardless of what OS actually executes this code — e.g. this pure
-/// function is exercised on Windows too, in `windows_unit` CI). `Path`
-/// inserts the HOST OS's separator for newly-appended components, which
-/// is `\` on Windows and would silently mix separators into a path that
-/// must always be macOS-shaped.
-#[allow(dead_code)]
-fn macos_app_bundle_wrapper(bundle: &Path) -> String {
-    format!("{}/Contents/MacOS/Freenet", bundle.to_string_lossy())
+/// That executable is `freenet-bin` itself rather than a script that execs
+/// it with `service run-wrapper`, because macOS 26 does not display a status
+/// item created after such an exec when the app was launched through
+/// LaunchServices (#6093). So the wrapper has to be reachable with no
+/// arguments. A bare `freenet` from a terminal must still run the node: it
+/// arrives through the `/usr/local/bin` symlink, so `argv[0]` is outside any
+/// bundle and this returns false.
+///
+/// Call this before parsing the command line. macOS can add arguments of its
+/// own, which the parser would reject, and the app would then fail to start
+/// with the error going nowhere a user could see it.
+pub(crate) fn is_macos_app_launch(argv: &[std::ffi::OsString]) -> bool {
+    let Some((argv0, rest)) = argv.split_first() else {
+        return false;
+    };
+    is_bundle_executable(argv0) && only_macos_injected_args(rest)
 }
 
-/// Compute the ProgramArguments array for the user LaunchAgent. If we're
-/// running from inside an `.app` bundle, launchd should relaunch the
-/// bundle's CFBundleExecutable shell wrapper (which in turn execs
-/// `freenet-bin service run-wrapper`, entering the tray path). Otherwise
-/// (cargo-run, raw binary install, dev build) launchd needs to invoke
-/// the binary with the explicit `service run-wrapper` subcommand or it
-/// would default to `Network` mode and skip the tray entirely.
+/// Whether `path` is the absolute path `<name>.app/Contents/MacOS/freenet-bin`.
+/// Checks for a leading `/` by hand: `Path::is_absolute` depends on the host
+/// OS, and this pure function also runs in the Windows unit tests.
+fn is_bundle_executable(path: &std::ffi::OsStr) -> bool {
+    let is_absolute = path.to_string_lossy().starts_with('/');
+    let mut components = Path::new(path)
+        .components()
+        .rev()
+        .map(|component| component.as_os_str());
+    is_absolute
+        && components.next().is_some_and(|c| c == "freenet-bin")
+        && components.next().is_some_and(|c| c == "MacOS")
+        && components.next().is_some_and(|c| c == "Contents")
+        && components
+            .next()
+            .and_then(|c| c.to_str())
+            .is_some_and(|bundle| bundle.ends_with(".app"))
+}
+
+/// Whether every argument is one macOS adds itself: `-psn_<serial>`, or a
+/// user-defaults override such as `-ApplePersistenceIgnoreState YES`, which is
+/// a key followed by its value.
+fn only_macos_injected_args(args: &[std::ffi::OsString]) -> bool {
+    let mut args = args.iter().map(|arg| arg.to_string_lossy());
+    while let Some(arg) = args.next() {
+        if arg.starts_with("-psn_") {
+            continue;
+        }
+        if !arg.starts_with("-Apple") && !arg.starts_with("-NS") {
+            return false;
+        }
+        args.next();
+    }
+    true
+}
+
+/// Compute the ProgramArguments array for the user LaunchAgent. launchd must
+/// pass the explicit `service run-wrapper` subcommand, or the binary would
+/// default to `Network` mode and skip the tray entirely.
 #[allow(dead_code)]
 pub(super) fn launch_agent_program_arguments(exe: &Path) -> Vec<String> {
-    match macos_app_bundle_path(exe) {
-        Some(bundle) => vec![macos_app_bundle_wrapper(&bundle)],
-        None => vec![
-            exe.to_string_lossy().into_owned(),
-            "service".to_string(),
-            "run-wrapper".to_string(),
-        ],
-    }
+    vec![
+        exe.to_string_lossy().into_owned(),
+        "service".to_string(),
+        "run-wrapper".to_string(),
+    ]
 }
 
 fn xml_escape(s: &str) -> String {
@@ -172,15 +205,33 @@ pub(super) fn launch_agent_plist_contents(program_arguments: &[String]) -> Strin
 /// Write the plist to disk, creating `~/Library/LaunchAgents` if needed.
 /// Does NOT activate the agent with launchctl: that's the caller's job
 /// (separated so the filesystem half is unit-testable on Linux).
+///
+/// Replaces the file atomically and durably: launchd reads it at login, and a
+/// truncated plist would stop Freenet starting until someone opened the app.
 #[allow(dead_code)]
 pub(super) fn write_launch_agent_plist_at(
     plist: &Path,
     program_arguments: &[String],
 ) -> std::io::Result<()> {
+    use std::io::Write;
+
     if let Some(parent) = plist.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(plist, launch_agent_plist_contents(program_arguments))
+    let temporary = plist.with_extension("plist.tmp");
+    let replaced = (|| {
+        let mut file = std::fs::File::create(&temporary)?;
+        file.write_all(launch_agent_plist_contents(program_arguments).as_bytes())?;
+        // Best effort: a network home directory may not support a full sync,
+        // and that must not stop the agent being written at all.
+        let _synced = file.sync_all();
+        drop(file);
+        std::fs::rename(&temporary, plist)
+    })();
+    if replaced.is_err() {
+        let _removed = std::fs::remove_file(&temporary);
+    }
+    replaced
 }
 
 /// Remove the plist. Idempotent: returns Ok if the file was already gone.
@@ -374,8 +425,8 @@ pub(crate) fn toggle_launch_at_login_outcome(
 /// upgraded via a new DMG install location, etc.), rewrite it. Idempotent:
 /// no-op when the plist is already current, or when Launch at Login is
 /// disabled, or when we can't figure out the expected location.
-#[allow(dead_code)]
-pub(super) fn refresh_launch_at_login_plist_if_stale() {
+#[cfg(target_os = "macos")]
+pub(super) fn refresh_launch_at_login_plist_if_stale(log_dir: &Path) {
     if !is_launch_at_login_enabled() {
         return;
     }
@@ -385,20 +436,33 @@ pub(super) fn refresh_launch_at_login_plist_if_stale() {
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
-    let args = launch_agent_program_arguments(&exe);
-    let Some(leader) = args.first() else {
-        return;
-    };
-    if launch_agent_plist_has_expected_leader(&plist, leader) {
-        return;
+    match rewrite_launch_agent_plist_if_stale(&plist, &exe) {
+        Ok(true) => log_wrapper_event(log_dir, "Refreshed stale Launch at Login agent"),
+        Ok(false) => {}
+        Err(e) => log_wrapper_event(
+            log_dir,
+            &format!("Failed to refresh Launch at Login agent: {e}"),
+        ),
     }
-    tracing::info!(
-        "Refreshing stale Launch at Login plist (was pointing elsewhere, now {})",
-        leader
-    );
-    if let Err(e) = enable_launch_at_login(&exe) {
-        tracing::warn!("Failed to refresh Launch at Login plist: {}", e);
+}
+
+/// Point the plist at `exe` if it names anything else, returning whether it
+/// changed. launchd reads the file at the next login.
+///
+/// Only writes the file. Going through `enable_launch_at_login` would boot the
+/// agent out, and this wrapper may be that agent: launchd would kill it on the
+/// spot, at every login, before anything was rewritten.
+#[allow(dead_code)]
+pub(super) fn rewrite_launch_agent_plist_if_stale(
+    plist: &Path,
+    exe: &Path,
+) -> std::io::Result<bool> {
+    let args = launch_agent_program_arguments(exe);
+    if launch_agent_plist_has_expected_leader(plist, &args[0]) {
+        return Ok(false);
     }
+    write_launch_agent_plist_at(plist, &args)?;
+    Ok(true)
 }
 
 /// Returns true if the legacy `org.freenet.node` LaunchAgent plist
@@ -936,7 +1000,7 @@ pub(super) fn macos_launch_at_login_startup(log_dir: &Path) {
             // resurrect a rewrite cycle on a legacy-only install (own plist
             // absent), and don't fight a user who deliberately disabled it.
             if is_launch_at_login_enabled() {
-                refresh_launch_at_login_plist_if_stale();
+                refresh_launch_at_login_plist_if_stale(log_dir);
             }
         }
     }

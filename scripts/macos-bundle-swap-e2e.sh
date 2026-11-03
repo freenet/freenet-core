@@ -82,7 +82,13 @@ trap cleanup EXIT
 #   $4 = marker file the launched process writes its version into on
 #        startup (so we can assert which version is running).
 build_bundle() {
-    local dest="$1" version="$2" lifetime="$3" marker="$4"
+    # layout is `current`, where CFBundleExecutable is the real binary as
+    # package-macos.sh now ships it, or `script`, the layout of every release
+    # before #6093, where it was a shell script. An installed `script` bundle
+    # is what the first update after that change replaces.
+    local dest="$1" version="$2" lifetime="$3" marker="$4" layout="${5:-current}"
+    local executable=freenet-bin
+    [[ "$layout" == script ]] && executable=Freenet
     mkdir -p "$dest/Contents/MacOS" "$dest/Contents/Resources"
 
     cat > "$dest/Contents/Info.plist" <<PLIST
@@ -96,28 +102,32 @@ build_bundle() {
     <key>CFBundleVersion</key><string>$version</string>
     <key>CFBundleShortVersionString</key><string>$version</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleExecutable</key><string>Freenet</string>
+    <key>CFBundleExecutable</key><string>$executable</string>
     <key>LSUIElement</key><true/>
 </dict>
 </plist>
 PLIST
 
-    # Outer wrapper matches the production package-macos.sh convention:
-    # CFBundleExecutable execs the inner binary with args. Using `exec`
-    # (not a plain call) is required so the running process's argv[0]
-    # is the Mach-O stub at the bundle path — that is what pgrep -f in
-    # the updater script matches against. A shell-script freenet-bin
-    # would appear as `/bin/bash /path/...` under ps and silently break
-    # the match.
-    cat > "$dest/Contents/MacOS/Freenet" <<SH
+    if [[ "$layout" == script ]]; then
+        # Using `exec` (not a plain call) is required so the running
+        # process's argv[0] is the Mach-O stub at the bundle path — that is
+        # what pgrep -f in the updater script matches against. A
+        # shell-script freenet-bin would appear as `/bin/bash /path/...`
+        # under ps and silently break the match.
+        cat > "$dest/Contents/MacOS/Freenet" <<SH
 #!/bin/bash
 DIR="\$(cd "\$(dirname "\$0")" && pwd)"
 exec "\$DIR/freenet-bin" "$marker" "$version" "$lifetime"
 SH
-    chmod +x "$dest/Contents/MacOS/Freenet"
+        chmod +x "$dest/Contents/MacOS/Freenet"
+    else
+        # Started with no arguments, as LaunchServices starts it.
+        printf '%s\n%s\n%s\n' "$marker" "$version" "$lifetime" \
+            > "$dest/Contents/Resources/stub-args"
+    fi
 
-    # Copy the compiled stub in place (not a shell script — see comment
-    # above and scripts/macos-bundle-swap-e2e-stub.c for the rationale).
+    # Copy the compiled stub in place (not a shell script — see
+    # scripts/macos-bundle-swap-e2e-stub.c for the rationale).
     cp "$STUB_BIN" "$dest/Contents/MacOS/freenet-bin"
     chmod +x "$dest/Contents/MacOS/freenet-bin"
 
@@ -208,8 +218,13 @@ V2_MARKER="$WORKDIR/running-v2.txt"
 # observes it exit well within the 120s deadline. v2 sleeps 30s so we
 # have a comfortable window to verify it relaunched before EXIT kills
 # it as part of cleanup.
-build_bundle "$INSTALL_APP" "v1" 4  "$V1_MARKER"
-build_bundle "$STAGED_APP"  "v2" 30 "$V2_MARKER"
+# v1 has the pre-#6093 layout and v2 the current one, so this is the update
+# every existing install takes. Registering v1 gives LaunchServices a record
+# naming the old executable, which the updater's `open` must not act on.
+build_bundle "$INSTALL_APP" "v1" 4  "$V1_MARKER" script
+build_bundle "$STAGED_APP"  "v2" 30 "$V2_MARKER" current
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
+    -f "$INSTALL_APP"
 
 echo "Launching v1 directly (background exec of CFBundleExecutable)..."
 # We deliberately bypass /usr/bin/open for spawning the "already-running
