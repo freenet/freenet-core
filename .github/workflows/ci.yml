@@ -7,8 +7,8 @@ name: CI
 #    permanently unmergeable, so it is confined to the trigger where no
 #    required check is at stake.
 #    This is a REAL cost increase, not a relocation: since #5571 a docs-only PR
-#    pays the full PR suite (Clippy on ubicloud-standard-8; Unit & Integration,
-#    Simulation and NAT Validation on ubicloud-standard-16; the macOS/Windows
+#    pays the full PR suite (Clippy and NAT Validation on ubicloud-standard-8;
+#    Unit & Integration and Simulation on ubicloud-standard-16; the macOS/Windows
 #    unit jobs) PLUS a paid Claude rule review, on top of the merge_group run it
 #    already paid. That was accepted because docs-only merges are rare (15 in
 #    the year to 2026-09-05) and the alternative — gating each expensive STEP on
@@ -30,6 +30,9 @@ name: CI
 #      protection happy without contending for ubicloud-standard-16 slots.
 #    - Release merge_group (commit message starts with "build: release") runs
 #      the full suite as the pre-publish gate, so what ships is known-green.
+# 8. Heavy jobs restore a main-scoped Rust cache and never save on PRs. The
+#    entries are written by ci-cache-warm.yml, which mirrors those jobs' ids,
+#    env and build commands; check_cache_warm_parity.py keeps them in step.
 
 on:
   push:
@@ -490,6 +493,17 @@ jobs:
       - name: Check release dry_run cannot push, merge, tag or publish
         run: python3 .github/scripts/check_release_dry_run.py .github/workflows
 
+      # Self-test the cache-warm parity linter, then run it. Not diff-scoped.
+      # ci-cache-warm.yml writes the main-scoped Rust caches that the heavy
+      # jobs here restore, and only helps while it produces the same cache
+      # keys and compiles the same things. Drift fails silently (PR jobs stay
+      # green and quietly go back to building cold), hence a linter.
+      - name: Cache-warm parity linter self-test
+        run: python3 .github/scripts/check_cache_warm_parity.py --self-test
+
+      - name: Check ci-cache-warm.yml mirrors the heavy jobs it warms
+        run: python3 .github/scripts/check_cache_warm_parity.py .github/workflows/ci.yml .github/workflows/ci-cache-warm.yml
+
       - name: Check for banned patterns in new code
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
@@ -914,6 +928,12 @@ jobs:
         # way is this action's own `cache-on-failure: true` input ("Cache even if
         # the build fails"), which its post hook honours -- NOT a resurrected
         # `if:` here, and NOT a separate step.
+        #
+        # `save-if` main-only means THIS job never saves: it does not run on
+        # pushes to main (see the job's `if:`). Until ci-cache-warm.yml existed
+        # no `v0-rust-test_unit-*` entry existed at all, so every PR run built
+        # its dependencies from scratch. That workflow now writes the entry
+        # under this job's id; see the note on test_simulation's cache step.
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
@@ -1301,8 +1321,18 @@ jobs:
         with:
           toolchain: 1.93.0
 
+      # Restore-only on PRs. This used to save on every PR run, which wrote a
+      # ~2.2 GB entry scoped to that PR's branch: readable by later pushes to
+      # the same PR and by nothing else, and uploaded in a post step costing
+      # ~0.5-0.9 min of standard-16 time per run. A PR's first run restored
+      # nothing, because this job never runs on main and so main had no entry
+      # to fall back on. ci-cache-warm.yml now writes the main-scoped entry
+      # every PR restores from; it reuses this job's id so the keys match, and
+      # check_cache_warm_parity.py (Rule Lint) fails if the two drift apart.
       - uses: Swatinem/rust-cache@v2
         if: steps.skip_check.outputs.skip != 'true'
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # nextest via the maintained action, not a hand-rolled download.
       # Rationale at the first of these in ci.yml (test_unit job); see #5296.
@@ -1495,12 +1525,19 @@ jobs:
 
   nat_validation:
     name: NAT Validation
-    # Run on the heavy runner for PRs (validates the change) and for release
+    # Run on a Ubicloud runner for PRs (validates the change) and for release
     # merge_group entries (the full-suite release gate). Skip the real steps on
-    # non-release merge_group entries to avoid contending for ubicloud-standard-16
-    # slots on every queue entry — the runner stays cheap there since every step
-    # is gated off (see skip_check below).
-    runs-on: "${{ (github.event_name == 'merge_group' && !startsWith(github.event.merge_group.head_commit.message, 'build: release')) && 'ubuntu-latest' || 'ubicloud-standard-16' }}"
+    # non-release merge_group entries to avoid contending for Ubicloud slots on
+    # every queue entry — the runner stays cheap there since every step is
+    # gated off (see skip_check below).
+    #
+    # standard-8, not standard-16 like Unit & Integration and Simulation. The
+    # job is off the PR's critical path: measured on Oct 2026 PR runs it took
+    # 6-11 min against 13-18 min for Unit & Integration, and its test step is a
+    # Docker NAT scenario that waits on the network, not the CPU. At
+    # standard-16 it was ~$55/month of Ubicloud spend; halving the per-minute
+    # rate costs a few minutes of wall clock nobody is waiting on.
+    runs-on: "${{ (github.event_name == 'merge_group' && !startsWith(github.event.merge_group.head_commit.message, 'build: release')) && 'ubuntu-latest' || 'ubicloud-standard-8' }}"
     timeout-minutes: 30
     # Skip on:
     # - push to main: PR already validated code before merge
@@ -1517,8 +1554,8 @@ jobs:
 
     steps:
       # Skip every real step on non-release merge_group entries. PR-level CI
-      # already exercised the same code; running heavy ubicloud-standard-16
-      # Docker NAT validation on every merge-queue entry contends for runner
+      # already exercised the same code; running Ubicloud Docker NAT
+      # validation on every merge-queue entry contends for runner
       # slots (issue #3973) without catching merge-time-specific regressions.
       # The release merge_group entry (commit message starts with
       # "build: release") still runs the full suite as the final pre-publish
@@ -1552,8 +1589,12 @@ jobs:
           toolchain: 1.93.0
           targets: wasm32-unknown-unknown
 
+      # Restore-only on PRs; the main-scoped entry is written by
+      # ci-cache-warm.yml. See the note on test_simulation's cache step.
       - uses: Swatinem/rust-cache@v2
         if: steps.skip_check.outputs.skip != 'true'
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Pull Docker images for NAT simulation
         if: steps.skip_check.outputs.skip != 'true'

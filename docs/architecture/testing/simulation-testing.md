@@ -343,7 +343,7 @@ when mid-simulation fault injection via closures is needed.
 
 ## Nightly Test Suite
 
-The nightly workflow (`.github/workflows/simulation-nightly.yml`) runs these simulation scenarios.
+The "nightly" workflow (`.github/workflows/simulation-nightly.yml`) runs these simulation scenarios. Despite its name it is scheduled weekly (Sundays, 03:00 UTC); trigger it with `workflow_dispatch` to run it on demand.
 All fdev tests include realistic network conditions and use 200ms default event spacing.
 
 | Test | Nodes | Events | Virtual Time | Fault Injection |
