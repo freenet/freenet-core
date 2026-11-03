@@ -146,6 +146,11 @@ impl NodeProcess {
             .arg("--is-gateway")
             .arg("--skip-load-from-network")
             .arg("--ignore-protocol-checking")
+            // These nodes are killed with SIGKILL and restarted on the same
+            // data dir. With QUIC on, the restart would find the crash-loop
+            // breaker armed and keep QUIC off; this test is about storage, so
+            // QUIC stays off.
+            .args(["--transport-quic", "off"])
             .args(["--location", "0.5"])
             .args(["--config-dir", &dir.to_string_lossy()])
             .args(["--data-dir", &dir.to_string_lossy()])

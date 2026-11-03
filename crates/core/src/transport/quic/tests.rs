@@ -1769,12 +1769,13 @@ fn windows_never_exceed_the_reassembly_allowance() {
     }
 }
 
-/// `transport-quic` values: unset and `off` are off, `shadow` and `prefer`
-/// (any case) are themselves, and anything else is off, never an error, so a value a later
-/// release adds cannot stop this binary from starting.
+/// `transport-quic` values: unset is the platform default, `off` is off,
+/// `shadow` and `prefer` (any case) are themselves, and anything else is off,
+/// never an error, so a value a later release adds cannot stop this binary from
+/// starting.
 #[test]
 fn transport_quic_values_and_unknown_ones() {
-    assert_eq!(QuicMode::from_config_value(None), QuicMode::Off);
+    assert_eq!(QuicMode::from_config_value(None), QuicMode::default_mode());
     assert_eq!(QuicMode::from_config_value(Some("off")), QuicMode::Off);
     assert_eq!(
         QuicMode::from_config_value(Some("prefer")),
@@ -1794,7 +1795,9 @@ fn transport_quic_values_and_unknown_ones() {
     );
     assert_eq!(QuicMode::from_config_value(Some("force")), QuicMode::Off);
     assert_eq!(QuicMode::from_config_value(Some("")), QuicMode::Off);
-    assert_eq!(QuicMode::default(), QuicMode::Off);
+    assert_eq!(QuicMode::default(), QuicMode::default_mode());
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    assert_eq!(QuicMode::from_config_value(None), QuicMode::Shadow);
 }
 
 /// The socket sends one datagram per transmit and receives one per call.

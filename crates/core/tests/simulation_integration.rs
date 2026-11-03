@@ -21134,7 +21134,8 @@ fn test_quic_off_peer_declines_with_disabled() {
     );
 }
 
-/// With QUIC off on both ends, as by default, no upgrade message moves at all, even
+/// With QUIC off on both ends, as the harness sets it unless a test asks, no
+/// upgrade message moves at all, even
 /// with both nodes counting as a release that negotiates.
 #[test_log::test]
 fn test_quic_off_nodes_exchange_no_upgrade_messages() {

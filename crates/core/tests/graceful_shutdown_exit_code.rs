@@ -158,6 +158,10 @@ impl NodeProcess {
             .env("RUST_LOG", "info")
             .env_remove("FREENET_LOG_TO_STDERR")
             .env_remove("FREENET_DISABLE_LOGS")
+            // The QUIC mode comes from the arguments alone: an inherited
+            // FREENET_TRANSPORT_QUIC would decide it for the test that runs
+            // with none.
+            .env_remove("FREENET_TRANSPORT_QUIC")
             .env_remove("FREENET_LOG_FORMAT")
             .args(["--ws-api-address", "127.0.0.1"])
             .args(["--ws-api-port", &ws_port.to_string()])
@@ -489,6 +493,50 @@ fn quic_breaker_marker_is_armed_and_cleared_by_a_clean_stop() -> anyhow::Result<
         None,
         "a clean stop must clear the marker, or the next start reads it as a \
          crash and runs without QUIC for the cooldown"
+    );
+    Ok(())
+}
+
+/// With no `transport-quic` flag, key or environment variable, the binary
+/// builds a QUIC endpoint and arms the breaker: shadow is the default on Linux
+/// and macOS. Every other test here sets the mode, so this is the one that sees
+/// what a node that never set it runs.
+///
+/// FALSIFY: make `QuicMode::default_mode` return `Off`; no endpoint is built
+/// and this test fails.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_node_with_no_quic_setting_runs_shadow_and_arms_the_breaker() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let log_dir = dir.path().join("logs");
+    std::fs::create_dir_all(&log_dir)?;
+    let mut node = NodeProcess::spawn_full(dir.path(), &log_dir, &[], None)?;
+    node.wait_for_logs(
+        &[READY_MARKER, TRANSPORT_BOUND_MARKER],
+        Duration::from_secs(120),
+    )?;
+    assert!(
+        node.logs().contains(QUIC_BUILT_MARKER),
+        "an unset transport-quic must build the endpoint. Logs:\n{}",
+        node.logs()
+    );
+    let logs = node.logs();
+    let mode_line = logs
+        .lines()
+        .find(|l| l.contains("QUIC transport mode configured"))
+        .unwrap_or_else(|| panic!("no QUIC mode line. Logs:\n{logs}"));
+    assert!(
+        mode_line.contains("Shadow") && mode_line.contains("default"),
+        "the mode line must say shadow, from the default: {mode_line}"
+    );
+    wait_for_armed_marker(dir.path(), &node)?;
+    node.send_sigterm()?;
+    let status = node.wait_for_exit(Duration::from_secs(45))?;
+    assert_eq!(status.code(), Some(0), "Logs:\n{}", node.logs());
+    assert_eq!(
+        read_quic_marker(dir.path())?,
+        None,
+        "a clean stop clears the marker"
     );
     Ok(())
 }

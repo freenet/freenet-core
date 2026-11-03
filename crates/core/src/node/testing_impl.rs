@@ -2004,8 +2004,9 @@ impl SimNetwork {
     }
 
     /// Sets `transport-quic` to `value`, as `config.toml` would (`"off"`,
-    /// `"shadow"`, `"prefer"`), on every node. Unset (off) by default. Call before the
-    /// simulation starts.
+    /// `"shadow"`, `"prefer"`), on every node. Without this call the harness
+    /// writes `off`, whatever the node default is. Call before the simulation
+    /// starts.
     ///
     /// # Panics
     /// On a value this binary does not know. A node would read it as off
@@ -3365,6 +3366,10 @@ impl SimNetwork {
                     // Default to usize::MAX so tests don't trigger streaming unless
                     // explicitly opted in via with_streaming_threshold().
                     streaming_threshold: Some(self.streaming_threshold.unwrap_or(usize::MAX)),
+                    // QUIC is off in a simulation unless the test turns it on
+                    // (`with_transport_quic`), whatever the node default is, so a
+                    // change of that default leaves every other run's trace as it was.
+                    transport_quic: Some(crate::transport::quic::QuicMode::OFF.to_string()),
                     ..Default::default()
                 },
                 ..Default::default()
@@ -3469,6 +3474,10 @@ impl SimNetwork {
                     // Default to usize::MAX so tests don't trigger streaming unless
                     // explicitly opted in via with_streaming_threshold().
                     streaming_threshold: Some(self.streaming_threshold.unwrap_or(usize::MAX)),
+                    // QUIC is off in a simulation unless the test turns it on
+                    // (`with_transport_quic`), whatever the node default is, so a
+                    // change of that default leaves every other run's trace as it was.
+                    transport_quic: Some(crate::transport::quic::QuicMode::OFF.to_string()),
                     ..Default::default()
                 },
                 ..Default::default()
@@ -7977,7 +7986,7 @@ mod tests {
             let config = sim.node_config_mut(label);
             assert!(
                 config.config.network_api.quic_settings().is_none(),
-                "QUIC is off by default"
+                "QUIC is off in a simulation unless the test turns it on"
             );
             assert_eq!(config.advertised_version_override, None);
             assert_eq!(config.quic_idle_timeout_override, None);

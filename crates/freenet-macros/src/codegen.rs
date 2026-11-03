@@ -288,6 +288,9 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
                             public_address: Some(node_ip.into()),
                             public_port: Some(network_port),
                             is_gateway: true,
+                            // QUIC off unless a test asks for it, whatever the
+                            // node default is, as the simulation harness does.
+                            transport_quic: Some("off".to_string()),
                             skip_load_from_network: true,
                             gateways: Some(vec![]),
                             location: Some(location),
@@ -440,6 +443,9 @@ fn generate_node_setup(args: &FreenetTestArgs) -> TokenStream {
                             public_address: Some(node_ip.into()),
                             public_port: Some(network_port),
                             is_gateway: false,
+                            // QUIC off unless a test asks for it, whatever the
+                            // node default is, as the simulation harness does.
+                            transport_quic: Some("off".to_string()),
                             skip_load_from_network: true,
                             gateways: #gateways_config,
                             location: Some(location),

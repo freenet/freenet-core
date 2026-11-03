@@ -272,14 +272,22 @@ fn configured_mode(config: &NetworkApiConfig) -> QuicMode {
     QuicMode::from_config_value(config.transport_quic.as_deref())
 }
 
-/// Report the QUIC upgrade configuration once, at node startup: the share of
+/// Report the QUIC upgrade configuration once, at node startup: the
+/// configured mode and whether it was set or is the platform default (INFO;
+/// the breaker, a failed bind or an abort build can still keep QUIC off, and
+/// each says so in its own line), the share of
 /// pairs `prefer` negotiates data with (INFO), and, with QUIC on, a
 /// `quic-data-percent` (WARN) or `quic-max-paths` (WARN) that cannot be parsed, or
 /// a `quic-max-paths` lowered to `max-number-of-connections` (INFO). In a build
 /// that aborts on panic QUIC stays off whatever the
-/// configuration (`QuicEndpoint::bind` refuses), and only that is reported
-/// (WARN).
+/// configuration (`QuicEndpoint::bind` refuses), and after the mode line only
+/// that is reported (WARN).
 pub(crate) fn log_startup(config: &NetworkApiConfig) {
+    tracing::info!(
+        mode = ?configured_mode(config),
+        source = if config.transport_quic.is_some() { "configured" } else { "default" },
+        "QUIC transport mode configured"
+    );
     if configured_mode(config) != QuicMode::Off && !crate::transport::quic::UNWINDS {
         tracing::warn!(
             transport_quic = ?config.transport_quic,
