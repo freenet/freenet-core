@@ -7,7 +7,9 @@
 //!   secret is the evidence.
 //! - An `ApplicationMessage` `b"record"` records the same way. A client cannot
 //!   send a `ContractNotification` (only the node delivers one), so this is how
-//!   a test makes a CLIENT run leave evidence that it ran.
+//!   a test makes a CLIENT run leave evidence that it ran. So `notified:` means
+//!   "a notification OR a `record` run happened": a test that reads it as proof
+//!   of a notification run must not also send `record`.
 //! - An `ApplicationMessage` `b"params?"` answers
 //!   `"client:<params>|notified:<recorded>"`, or `"...|notified:none"` before
 //!   any notification has run.

@@ -4967,8 +4967,11 @@ fn admit_unprompted_ops(
 /// Every client entry point applies this: [`dispatch_delegate_request`] for a
 /// network node, and `Executor::client_delegate_request` (called by
 /// `node::run_local_node` and `Executor::handle_request`) for local mode. The
-/// unchecked `Executor::delegate_request` is visible only inside `contract`,
-/// so code where client requests arrive cannot skip the check. The node's own
+/// unchecked inherent methods (`Executor::delegate_request`,
+/// `delegate_request_as`) are visible only inside `contract`, so code outside
+/// it cannot call them directly. `ContractExecutor::execute_delegate_request`
+/// is also unchecked; it is reached only from the contract loop's own
+/// chokepoint, below the check. The node's own
 /// deliveries (notifications, contract responses, prompts, inter-delegate
 /// hops, lifecycle runs) build their requests internally and never pass
 /// through those entry points.

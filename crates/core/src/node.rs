@@ -6312,6 +6312,12 @@ pub async fn run_local_node(
                 //
                 // `client_delegate_request` refuses node-only inbound messages
                 // (`contract::node_only_inbound`), as the network node does.
+                // Local mode has no contract-handling loop, so a delegate's
+                // `GetContractRequest` or `RequestUserInput` comes back to the
+                // client unanswered, and the client cannot answer it: the
+                // `GetContractResponse`/`UserResponse` it would send is exactly
+                // what the check refuses. Such a delegate does not continue in
+                // local mode.
                 executor.client_delegate_request(
                     op,
                     origin_contract.as_ref(),

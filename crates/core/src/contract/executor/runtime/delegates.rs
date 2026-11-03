@@ -183,7 +183,7 @@ impl Executor<Runtime> {
     /// A network node applies the same refusal in the contract loop's
     /// `dispatch_delegate_request`. Never use this for a node-built request:
     /// those carry node-only messages by design.
-    pub fn client_delegate_request(
+    pub(crate) fn client_delegate_request(
         &mut self,
         req: DelegateRequest<'_>,
         origin_contract: Option<&ContractInstanceId>,
@@ -207,9 +207,10 @@ impl Executor<Runtime> {
     /// Runs a delegate request WITHOUT the client refusal above, so node-built
     /// requests (contract responses, notifications, prompt answers,
     /// inter-delegate hops) can carry node-only messages. Visible only inside
-    /// `contract` so code outside it, where client requests arrive, cannot
-    /// reach it: a client request goes through [`Self::client_delegate_request`]
-    /// or the contract loop's `dispatch_delegate_request`.
+    /// `contract` (as is [`Self::delegate_request_as`]), so code outside it,
+    /// where client requests arrive, cannot call it directly: a client request
+    /// goes through [`Self::client_delegate_request`] or the contract loop's
+    /// `dispatch_delegate_request`.
     pub(in crate::contract) fn delegate_request(
         &mut self,
         req: DelegateRequest<'_>,
@@ -232,7 +233,7 @@ impl Executor<Runtime> {
     /// [`Self::delegate_request`], with the user whose delegate context the
     /// run uses given apart from `user_context`, which scopes its secrets.
     /// See `DelegateRuntimeInterface::inbound_app_message_as`.
-    pub(crate) fn delegate_request_as(
+    pub(in crate::contract) fn delegate_request_as(
         &mut self,
         req: DelegateRequest<'_>,
         origin_contract: Option<&ContractInstanceId>,
