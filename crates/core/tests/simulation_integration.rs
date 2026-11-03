@@ -20770,7 +20770,7 @@ impl QuicShadowRun {
         let late = |receiver, sender| {
             let enabled = self.trace.matching(sender, "DataEnabled")[0].at;
             self.trace
-                .matching(receiver, "received data on UDP")
+                .matching(receiver, "data arrived on UDP")
                 .iter()
                 .filter(|record| record.at > enabled + Duration::from_secs(1))
                 .count()
@@ -20928,14 +20928,9 @@ fn test_quic_data_delivers_a_real_message_through_recv() {
         (1, 1),
         30,
         |sim, trace, labels| {
-            let addresses: Vec<_> = labels
-                .iter()
-                .map(|label| sim.all_node_addresses()[label])
-                .collect();
-            for (label, address) in labels.iter().zip(addresses) {
+            for label in labels {
                 sim.with_node_transport_quic(label, "prefer");
                 sim.with_node_quic_data_percent(label, 100);
-                let _ = address;
             }
             run_as_first_negotiating_release(trace);
         },
@@ -21056,7 +21051,18 @@ fn test_quic_data_carries_a_stream_end_to_end() {
         run.dump()
     );
     assert_eq!(run.udp_data_once_on_the_path(), 0, "{}", run.dump());
-    assert_eq!(run.total("path carried data: refused 0"), 0, "{}", run.dump());
+    assert_eq!(
+        run.total("path carried data: refused 0"),
+        run.total("path carried data"),
+        "{}",
+        run.dump()
+    );
+    assert_eq!(
+        run.total("sent a stream on the path: Failed"),
+        0,
+        "{}",
+        run.dump()
+    );
     let stored = result
         .node_storages
         .get(&gateway)

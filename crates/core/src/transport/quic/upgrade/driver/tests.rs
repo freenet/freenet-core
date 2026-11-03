@@ -674,9 +674,7 @@ fn a_path_follows_the_data_bits() {
 #[test]
 fn a_route_ends_with_its_path_and_what_it_holds_goes_on_udp() {
     use crate::transport::quic::control::caps;
-    use crate::transport::quic::path::{
-        NextStep, QuicSendError, SendFailure, SendKind, stop_code,
-    };
+    use crate::transport::quic::path::{NextStep, QuicSendError, SendFailure, SendKind, stop_code};
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
         let h = Harness::server_with("quic-driver-route", 35, "prefer", Some("100")).await;
@@ -701,7 +699,10 @@ fn a_route_ends_with_its_path_and_what_it_holds_goes_on_udp() {
             route.path().settle(SendKind::Stream, &refused, false),
             NextStep::SendOnUdp
         );
-        assert!(session.data_route().is_none(), "a refused path takes no sends");
+        assert!(
+            session.data_route().is_none(),
+            "a refused path takes no sends"
+        );
         assert!(route.path().quinn_connection().close_reason().is_none());
         // The route still takes what a connection read a moment ago.
         for i in 0..10u8 {

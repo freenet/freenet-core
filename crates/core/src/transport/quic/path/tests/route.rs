@@ -1,6 +1,8 @@
 //! The table of `path::route` and what `QuicPath::settle` does with an outcome.
 
-use super::super::route::{NextStep, QuicSendEvent, QuicSendResult, STALLED_SENDS_LIMIT, next_step};
+use super::super::route::{
+    NextStep, QuicSendEvent, QuicSendResult, STALLED_SENDS_LIMIT, next_step,
+};
 use super::super::{SendKind, framing_error_for_tests};
 use super::*;
 
@@ -98,16 +100,16 @@ fn each_outcome_takes_its_row() {
             (GiveUp, R::Dropped),
         ),
     ];
-    rows.extend(other_stops.map(|code| {
-        (
-            stopped(code),
-            (GiveUp, R::Dropped),
-            (GiveUp, R::Dropped),
-        )
-    }));
+    rows.extend(
+        other_stops.map(|code| (stopped(code), (GiveUp, R::Dropped), (GiveUp, R::Dropped))),
+    );
     for (outcome, short, stream) in &rows {
         assert_eq!(next_step(SendKind::Short, outcome), *short, "{outcome:?}");
-        assert_eq!(next_step(SendKind::LargeShort, outcome), *short, "{outcome:?}");
+        assert_eq!(
+            next_step(SendKind::LargeShort, outcome),
+            *short,
+            "{outcome:?}"
+        );
         assert_eq!(next_step(SendKind::Stream, outcome), *stream, "{outcome:?}");
         assert_eq!(next_step(SendKind::Pipe, outcome), *stream, "{outcome:?}");
     }
@@ -129,13 +131,21 @@ fn eight_timeouts_in_a_row_close_the_path_and_a_sent_starts_again() {
         let closed = |path: &QuicPath| path.quinn_connection().close_reason().is_some();
         let settle = |outcome: &BoundedSend| p.a.settle(SendKind::Stream, outcome, false);
 
-        for outcome in timeouts.iter().cycle().take(STALLED_SENDS_LIMIT as usize - 1) {
+        for outcome in timeouts
+            .iter()
+            .cycle()
+            .take(STALLED_SENDS_LIMIT as usize - 1)
+        {
             settle(outcome);
         }
         assert!(!closed(&p.a), "seven are not enough");
 
         settle(&BoundedSend::Sent);
-        for outcome in timeouts.iter().cycle().take(STALLED_SENDS_LIMIT as usize - 1) {
+        for outcome in timeouts
+            .iter()
+            .cycle()
+            .take(STALLED_SENDS_LIMIT as usize - 1)
+        {
             settle(outcome);
         }
         assert!(!closed(&p.a), "a Sent started the count again");
@@ -150,7 +160,10 @@ fn eight_timeouts_in_a_row_close_the_path_and_a_sent_starts_again() {
 
         settle(&timeouts[1]);
         assert!(closed(&p.a), "the eighth of a kind that counts");
-        assert_eq!(p.a.stats().send_event_count(QuicSendEvent::StalledClosed), 1);
+        assert_eq!(
+            p.a.stats().send_event_count(QuicSendEvent::StalledClosed),
+            1
+        );
         settle(&timeouts[1]);
         assert_eq!(
             p.a.stats().send_event_count(QuicSendEvent::StalledClosed),

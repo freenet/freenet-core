@@ -1205,8 +1205,15 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
 
     /// Tell a test's trace what `recv` took from a path.
     #[cfg_attr(not(any(test, feature = "testing")), allow(unused_variables))]
-    /// Where a test's trace hears what data arrived by which route. At the
-    /// receiver, so it counts every send whichever code made it.
+    /// Tell a test's trace that data arrived on UDP on a connection with upgrades.
+    /// At the receiver, so it counts every send whichever code made it.
+    fn note_udp_data(&self, kind: &str) {
+        if self.quic_path.is_some() {
+            self.note_quic_delivery(|| format!("data arrived on UDP, {kind}"));
+        }
+    }
+
+    /// Where a test's trace hears what arrived on a path.
     fn note_quic_delivery(&self, what: impl FnOnce() -> String) {
         #[cfg(any(test, feature = "testing"))]
         if let Some(trace) = &self.upgrade_trace {
@@ -3172,7 +3179,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                 // redundant embedded-metadata copy, never the ShortMessage itself.
                 self.dispatched_msg_hashes.put(Self::msg_hash(&bytes), ());
                 self.sample_inbound_concurrency(true, queued_nanos);
-                self.note_quic_delivery(|| "received data on UDP, a short".to_string());
+                self.note_udp_data("a short");
                 Ok(Some(bytes))
             }
             AckConnection { result: Err(cause) } => {
@@ -3265,7 +3272,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                 metadata_bytes,
             } => {
                 if fragment_number == 1 {
-                    self.note_quic_delivery(|| "received data on UDP, a stream".to_string());
+                    self.note_udp_data("a stream");
                 }
                 let now_nanos = self.time_source.now_nanos();
                 if stream_id.is_caller_named() {
@@ -3797,8 +3804,11 @@ impl<S: super::Socket, T: TimeSource> UdpSender<S, T> {
     /// `outbound_short_message` does.
     async fn send_short(&self, data: SerializedMessage) -> Result<()> {
         let packet_size = data.len() + 40; // ShortMessage header overhead
-        self.send_tracked(symmetric_message::ShortMessage(data.into()).into(), packet_size)
-            .await
+        self.send_tracked(
+            symmetric_message::ShortMessage(data.into()).into(),
+            packet_size,
+        )
+        .await
     }
 
     /// Send `payload` as one tracked packet. Its receipts go on the receive
