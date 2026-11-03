@@ -81,14 +81,17 @@ pub(crate) use liveness::QuicAvailabilityWatch;
 
 /// Whether the node may use QUIC: the `transport-quic` config key.
 ///
-/// Off is the default on every platform, and must stay the default on
-/// Windows until the crash-loop breaker has been confirmed on a real Windows
-/// machine (#6031). That breaker counts short runs instead of detecting
-/// crashes ([`breaker`]).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// An unset key is [`QuicMode::default_mode`]: shadow, except on Windows,
+/// where it stays off until the crash-loop breaker has been confirmed on a
+/// real Windows machine (#6031). That breaker counts short runs instead of
+/// detecting crashes ([`breaker`]). The default is decided when the value is
+/// read and never written to `config.toml`, so a later release can change it
+/// for every node that did not set the key, which is how a default-off
+/// release turns QUIC off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuicMode {
-    /// No QUIC endpoint is built and no QUIC datagram is read. The default.
-    #[default]
+    /// No QUIC endpoint is built and no QUIC datagram is read. The default on
+    /// Windows.
     Off,
     /// The node builds a QUIC endpoint on its UDP port and upgrades a UDP
     /// session to a QUIC path that carries only control frames: all
@@ -99,7 +102,7 @@ pub enum QuicMode {
     /// endpoint driver and one upgrade task per connection run; a promoted
     /// connection's higher key sends `Upgrade` messages on its UDP session; and
     /// the endpoint's memory. If the endpoint cannot be built the node logs a
-    /// warning and runs with QUIC off.
+    /// warning and runs with QUIC off. The default, except on Windows.
     Shadow,
     /// Negotiates data on a path to a peer in the release's slice
     /// (`upgrade::slice`). This release sends no data on any path, so it acts as
@@ -107,6 +110,12 @@ pub enum QuicMode {
     /// early starts carrying data over QUIC once it runs a release that sends it.
     /// That release's notes must say so.
     Prefer,
+}
+
+impl Default for QuicMode {
+    fn default() -> Self {
+        Self::default_mode()
+    }
 }
 
 impl QuicMode {
@@ -117,13 +126,23 @@ impl QuicMode {
     /// See [`QuicMode::Prefer`].
     pub const PREFER: &'static str = "prefer";
 
-    /// The mode for a configured `transport-quic` value. Unset is `Off`. An
-    /// unknown value is `Off` with a warning, never an error: a value a
-    /// later release added must not stop an older binary (a crash-loop
-    /// rollback reinstalls one) from starting.
+    /// What an unset `transport-quic` means on this platform: shadow, and off
+    /// on Windows (#6031).
+    pub const fn default_mode() -> Self {
+        if cfg!(windows) {
+            Self::Off
+        } else {
+            Self::Shadow
+        }
+    }
+
+    /// The mode for a configured `transport-quic` value. Unset is
+    /// [`Self::default_mode`]. An unknown value is `Off` with a warning, never
+    /// an error: a value a later release added must not stop an older binary
+    /// (a crash-loop rollback reinstalls one) from starting.
     pub fn from_config_value(value: Option<&str>) -> Self {
         match value.map(|v| v.trim().to_ascii_lowercase()) {
-            None => Self::Off,
+            None => Self::default_mode(),
             Some(v) if v == Self::OFF => Self::Off,
             Some(v) if v == Self::SHADOW => Self::Shadow,
             Some(v) if v == Self::PREFER => Self::Prefer,

@@ -334,7 +334,7 @@ impl Default for ConfigArgs {
                 ledbat_min_ssthresh: None, // Uses default from NetworkApiConfig
                 congestion_control: None,  // Default: fixedrate (set in NetworkApiConfig)
                 bbr_startup_rate: None,    // Uses default from BBR config
-                transport_quic: None,      // Default: off
+                transport_quic: None,      // Default: shadow, off on Windows
                 quic_max_paths: None,      // Default: max-number-of-connections
                 quic_data_percent: None,   // Default: this release's share of pairs
                 quic_ignore_crash_breaker: None,
@@ -2493,13 +2493,15 @@ pub struct NetworkArgs {
     #[serde(rename = "bbr-startup-rate", skip_serializing_if = "Option::is_none")]
     pub bbr_startup_rate: Option<u64>,
 
-    /// QUIC transport (#5940): `off` (default), `shadow` or `prefer`.
+    /// QUIC transport (#5940): `off`, `shadow` or `prefer`. Unset means
+    /// `shadow`, except on Windows, where it means `off`.
     ///
-    /// `shadow` builds a QUIC endpoint on the network port. In this release
-    /// the endpoint accepts no connections and opens none, so the node
-    /// behaves as with `off`. `prefer` also negotiates data with a share of
-    /// pairs; this release sends none. An
-    /// unknown value is treated as `off`, with a warning in the log.
+    /// `shadow` builds a QUIC endpoint on the network port and upgrades
+    /// connections to peers that also run it to a QUIC path. The path carries
+    /// control frames only, so all traffic stays on the existing transport.
+    /// `prefer` also negotiates data with a share of pairs; this release sends
+    /// none. `off` builds no endpoint. An unknown value is treated as `off`,
+    /// with a warning in the log.
     #[arg(long, env = "FREENET_TRANSPORT_QUIC", value_name = "off|shadow|prefer")]
     #[serde(rename = "transport-quic", skip_serializing_if = "Option::is_none")]
     pub transport_quic: Option<String>,
@@ -2833,8 +2835,8 @@ pub struct NetworkApiConfig {
     )]
     pub bbr_startup_rate: Option<u64>,
 
-    /// QUIC transport (#5940): `off` (the default when unset), `shadow` or
-    /// `prefer`. Kept as written, so a value from a later release
+    /// QUIC transport (#5940): `off`, `shadow` or `prefer`; unset reads as
+    /// `QuicMode::default_mode` (shadow, off on Windows). Kept as written, so a value from a later release
     /// round-trips; see [`Self::quic_settings`] for how it is read.
     #[serde(
         default,
@@ -7179,20 +7181,30 @@ shutdown-drain-secs = 42
         assert_seeded_values_bound(&cfg);
     }
 
-    /// QUIC is off by default, and Windows must stay off until its crash-loop
-    /// breaker has been confirmed on a real Windows machine (#6031). A release
-    /// that changes the default on other platforms must keep Windows off and
-    /// keep this check for it: the lib tests do not compile on Windows, and
-    /// `tests/quic_breaker_windows.rs` is the same pin through the real binary.
+    /// An unset `transport-quic` is shadow, and off on Windows, which must stay
+    /// off until its crash-loop breaker has been confirmed on a real Windows
+    /// machine (#6031). The lib tests do not compile on Windows, so
+    /// `tests/quic_breaker_windows.rs` pins the Windows half through the real
+    /// binary. The default is not written into the config, so a default-off
+    /// release turns QUIC off on every node that did not set the key.
     #[test]
-    fn quic_stays_off_by_default() {
+    fn quic_is_shadow_by_default_except_on_windows() {
         use crate::transport::quic::QuicMode;
-        assert_eq!(QuicMode::default(), QuicMode::Off);
-        assert_eq!(QuicMode::from_config_value(None), QuicMode::Off);
+        let expected = if cfg!(windows) {
+            QuicMode::Off
+        } else {
+            QuicMode::Shadow
+        };
+        assert_eq!(QuicMode::default(), expected);
+        assert_eq!(QuicMode::from_config_value(None), expected);
         let args = ConfigArgs::default();
         assert_eq!(
+            args.network_api.transport_quic, None,
+            "the default is not stored"
+        );
+        assert_eq!(
             QuicMode::from_config_value(args.network_api.transport_quic.as_deref()),
-            QuicMode::Off
+            expected
         );
     }
 

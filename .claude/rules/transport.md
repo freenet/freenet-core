@@ -884,15 +884,17 @@ it must not wait unless it is a pacing point.
 
 #### QUIC endpoint (`transport/quic.rs`, #5940 step c2)
 
-`transport-quic` (config key, `off` by default, `shadow` or `prefer`) decides
-whether `bind_udp_listener` builds a quinn endpoint over the DemuxSocket.
+`transport-quic` (config key: `off`, `shadow` or `prefer`; unset is
+`QuicMode::default_mode`, shadow, and off on Windows) decides whether `bind_udp_listener` builds a quinn endpoint over the DemuxSocket.
 `prefer` negotiates data with the release's share of pairs ("Data slice" below;
 `upgrade::policy::log_startup` reports the share at INFO once per node). No code
 sends data on a path yet, so `prefer` differs from `shadow` only by that bit. The
 release that makes `prefer` carry data must say in its notes that existing
 `prefer` configs start carrying data. Off: no endpoint, no QUIC ingress, nothing
 changes. QUIC must stay off by default on Windows until the crash-loop
-breaker has been confirmed on a real Windows machine (#6031). Shadow or prefer: the endpoint is built
+breaker has been confirmed on a real Windows machine (#6031). The default is
+read, never written to config.toml: a node that did not set the key follows the
+release it runs, so a default-off release is the kill switch. Shadow or prefer: the endpoint is built
 with the node's QUIC identity (below) and an EMPTY allow-set, so nothing
 reaches it and it sends nothing; the listener holds it, with the queue of
 its accept loop (below), which hands on no attempt while the allow-set is
@@ -1274,7 +1276,8 @@ seeded GlobalRng repeat the same event trace; the bytes differ, because
 rustls's key exchange and the XEdDSA nonce use the OS RNG.
 
 In SimNetwork: `with_transport_quic` / `with_node_transport_quic` set the
-config value per node (off by default; an unknown value panics), and the
+config value per node (off unless set, whatever the node default: the
+harness writes `off` into every node's config; an unknown value panics), and the
 endpoint runs on the network's VirtualTime (`get_socket_virtual_time`;
 RealTime in production, pinned by
 `the_transport_endpoint_runs_on_virtual_time_only_in_simulation`). Its
@@ -1330,7 +1333,7 @@ every rate), endpoint-down, panics and breaker trips, RSS against
   stays near 0 and UDP metrics do not change.
 - Step 1: nova gateways and framework in shadow for 24-48 h. The 24 h gateway
   A/B runs only if something looks odd. Rollback: set the key to off and restart.
-- Step 2: shadow on by default, not on Windows. Gate: at least 95% upgrade
+- Step 2: shadow on by default, not on Windows (`QuicMode::default_mode`). Gate: at least 95% upgrade
   success by `established_as_offerer / accepted`; fewer than 1 fallback per
   path-day excluding endpoint and restart causes; memory within the measured
   terms (about 0.3 to 0.5 MiB per idle path). An abort spike stops the step.
