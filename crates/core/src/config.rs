@@ -7218,7 +7218,11 @@ shutdown-drain-secs = 42
     fn transport_quic_round_trips_and_unknown_values_are_off() {
         let unset: Config = toml::from_str(RELEASED_CONFIG_TOML).unwrap();
         assert_eq!(unset.network_api.transport_quic, None);
-        assert!(unset.network_api.quic_settings().is_none());
+        assert_eq!(
+            unset.network_api.quic_settings().is_some(),
+            crate::transport::quic::QuicMode::default_mode().builds_endpoint(),
+            "an unset key follows the platform default"
+        );
         assert!(
             !toml::to_string(&unset).unwrap().contains("transport-quic"),
             "an unset key is not written"
