@@ -683,7 +683,9 @@ check_prerequisites() {
             elif [[ "$failed_count" -gt 0 ]]; then
                 echo "✗ ($failed_count checks failed)"
                 local failed_names
-                failed_names=$(echo "$check_runs_json" | jq -r '[.check_runs[] | select(.status == "completed" and .conclusion != "success" and .conclusion != "skipped")] | .[].name' | head -5)
+                # Same exclusions as failed_count, or the message can name
+                # only checks the gate ignored and hide the one that failed.
+                failed_names=$(echo "$check_runs_json" | jq -r '[.check_runs[] | select(.status == "completed" and .conclusion != "success" and .conclusion != "skipped" and .name != "Dependabot" and (.name | startswith("Build for") | not) and (.name | startswith("Warm cache:") | not) and .name != "claude" and .name != "Large Scale Simulation" and .name != "Simulation Tests (Nightly)" and .name != "Notify Matrix on Failure" and .name != "mirror / mirror")] | .[].name' | head -5)
                 echo "  ✗ Main branch CI is failing - cannot release"
                 echo "     Failed checks: $failed_names"
                 exit 1

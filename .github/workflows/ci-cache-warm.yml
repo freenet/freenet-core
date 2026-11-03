@@ -44,9 +44,12 @@ on:
   schedule:
     - cron: "0 4 * * *"
   # Re-warm when what the cached dependencies depend on changes on main: the
-  # lockfile (dependency versions), the toolchain pin and job env (both in
-  # ci.yml), and this file. Path filters are safe here because no job in this
-  # workflow is a required status context (#5451 is about required ones).
+  # lockfile and manifests, the toolchain and cargo config, and this file.
+  # ci.yml is deliberately absent: any ci.yml change that matters to the cache
+  # (job env, toolchain, compile commands) must be mirrored here -- the parity
+  # linter enforces it -- and the cache `key` is this file's hash, so a
+  # ci.yml-only push would hit the existing key and save nothing. Path filters
+  # are safe because no job here is a required status context (#5451).
   push:
     branches: [main]
     paths:
@@ -55,7 +58,6 @@ on:
       - "rust-toolchain"
       - "rust-toolchain.toml"
       - ".cargo/config.toml"
-      - ".github/workflows/ci.yml"
       - ".github/workflows/ci-cache-warm.yml"
   workflow_dispatch:
 

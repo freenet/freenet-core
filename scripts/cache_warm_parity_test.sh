@@ -132,6 +132,18 @@ check "pre-flight ignores in-progress warm runs but not Clippy" \
     "$(jq "$IN_PROGRESS_JQ" "$TEST_TMP/runs.json")" "1"
 check "pre-flight ignores a failed warm run but not a failed test job" \
     "$(jq "$FAILED_JQ" "$TEST_TMP/runs.json")" "1"
+# The refusal message must apply the same exclusions as the count, or it can
+# name only ignored checks. Compare the two select() clauses directly.
+SELECTS=$(python3 - "$RELEASE_SH" <<'PY'
+import re, sys
+src = open(sys.argv[1]).read()
+def sel(var):
+    m = re.search(r"^\s*" + var + r"=\$\(echo \"\$check_runs_json\" \| jq (?:-r )?'\[\.check_runs\[\] \| (select\(.*?\))\]", src, re.M)
+    return m.group(1) if m else "MISSING:" + var
+print(int(sel("failed_count") == sel("failed_names")))
+PY
+)
+check "refusal message uses the same filter as the failure count" "$SELECTS" "1"
 check "pre-flight asks for 100 check runs per page" \
     "$(grep -cE '^[[:space:]]*check_runs_json=\$\(gh api "repos/freenet/freenet-core/commits/main/check-runs\?per_page=100"' "$RELEASE_SH" || true)" "1"
 
