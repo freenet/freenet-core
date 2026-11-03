@@ -154,6 +154,19 @@ load_agent() {
     fail "could not load the Launch-at-Login agent: $error"
 }
 
+# LaunchServices can still be tracking an instance that was just stopped, and
+# `open` then fails with -600 before the link reaches any of our code. That is
+# the click failing to happen, so repeat it. The checks that the link was
+# handled are what this test is for, and they stay as they are.
+click_link() {
+    local error=""
+    for _ in $(seq 1 5); do
+        error="$(open "$1" 2>&1)" && return 0
+        sleep 1
+    done
+    fail "open could not deliver $1: $error"
+}
+
 wait_for_status_item_count_above() {
     # A first launch of a debug build on a busy runner can take a while.
     for _ in $(seq 1 60); do
@@ -299,7 +312,7 @@ wait_for_count() {
     return 1
 }
 
-open "freenet://$RIVER/?x=1#y"
+click_link "freenet://$RIVER/?x=1#y"
 wait_for_count 1 || fail "the launched app never handled the link"
 # `opened` (not merely "not invalid"): the handler found the node the app
 # started and it answered the /v1/version probe like Freenet.
@@ -317,7 +330,7 @@ done
 # An all-'1' id is invalid on every platform. (Not a %2e%2e traversal: tao
 # parses the link into a url::Url before the handler sees it, which already
 # resolves dot segments, so that case is covered by the unit tests instead.)
-open "freenet://11111111111111111111111111111111/"
+click_link "freenet://11111111111111111111111111111111/"
 wait_for_count 2 || fail "the running app never handled the second link"
 # The app was already running and settled, so LaunchServices must have given
 # the link to it, not to a duplicate launch.
@@ -341,7 +354,7 @@ pgrep -f 'Freenet.app/Contents/MacOS/freenet-bin service run-wrapper$' >/dev/nul
     || fail "the icon appeared but launchd's wrapper is not running"
 echo "ok - the menu bar icon is displayed when launchd starts the app"
 # The usual case: a link clicked some time after login.
-open "freenet://$RIVER/"
+click_link "freenet://$RIVER/"
 wait_for_count 3 || fail "a link was not handled once launchd's wrapper had settled"
 echo "ok - a link works once the instance launchd started has settled"
 stop_app
@@ -353,7 +366,7 @@ load_agent
 # Click at once, without waiting for the new wrapper to settle: the link must
 # be handled whether LaunchServices already sees the launchd-started instance
 # or launches a duplicate for it, and either copy may win the lock.
-open "freenet://$RIVER/"
+click_link "freenet://$RIVER/"
 wait_for_count 4 || fail "the launchd-started instance never handled the link"
 echo "ok - a link reaches the instance launchd started (as at login)"
 launchctl bootout "$AGENT" >/dev/null 2>&1 || true
