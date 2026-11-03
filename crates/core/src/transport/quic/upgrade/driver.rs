@@ -73,11 +73,11 @@ use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use super::data_route::{DataRoute, RouteNote, UdpShorts};
 use super::machine::{
     Action, BackoffSeed, CONTROL_SEND_TIMEOUT, Event, FallbackCause, Inputs, Outcome, Role,
     UpgradeMachine,
 };
-use super::data_route::{DataRoute, RouteNote, UdpShorts};
 use super::policy::QuicPolicy;
 use crate::config::{GlobalExecutor, GlobalRng};
 use crate::node::background_task_monitor::LateRegistrar;

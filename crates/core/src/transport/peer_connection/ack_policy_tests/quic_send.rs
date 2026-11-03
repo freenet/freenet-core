@@ -550,7 +550,8 @@ fn a_large_short_that_never_opened_goes_on_udp_as_a_stream() {
             assert_eq!(udp.stream_bytes, bytes.to_vec());
             assert!(udp.stream_ids.iter().all(|id| !id.is_caller_named()));
             assert_eq!(
-                rig.stats().send_count(SendKind::LargeShort, R::NotOpenedUdp),
+                rig.stats()
+                    .send_count(SendKind::LargeShort, R::NotOpenedUdp),
                 1
             );
         },
@@ -593,13 +594,7 @@ fn data_the_peer_refuses_goes_on_udp_and_the_path_stays() {
             rig.route.queue_short(message(1)).ok();
             rig.path.settle(Duration::from_millis(50)).await;
             assert_eq!(rig.udp_data().shorts, vec![message(1)]);
-            assert_eq!(
-                rig.path
-                    .peer()
-                    .stats()
-                    .count(Q::RefusedNotAcceptingData),
-                1
-            );
+            assert_eq!(rig.path.peer().stats().count(Q::RefusedNotAcceptingData), 1);
         },
     );
 }
@@ -614,32 +609,33 @@ fn a_stream_refused_for_room_is_dropped_and_a_short_is_not() {
         max_bytes: 1024,
         ..QuicPathLimits::DEFAULT
     };
-    run(
-        "quic-send-budget",
-        61,
-        limits,
-        |mut rig| async move {
-            let (done, heard) = oneshot::channel();
-            rig.e
-                .conn
-                .outbound_stream_with_id(StreamId::next(), bytes_of(100_000), None, Some(done), None)
-                .await;
-            rig.path.settle(Duration::from_secs(1)).await;
-            rig.collect_tasks().await;
-            assert_eq!(heard.await.unwrap(), StreamSendOutcome::Dropped);
-            assert!(rig.udp_data().ids.is_empty(), "a stream that opened stays dropped");
-            assert_eq!(rig.stats().send_count(SendKind::Stream, R::Dropped), 1);
-            assert_eq!(rig.stats().stop_count(stop_code::BUDGET_REFUSED), 1);
-            assert_eq!(rig.e.conn.telemetry_test_counts.outbound_streams_failed, 1);
+    run("quic-send-budget", 61, limits, |mut rig| async move {
+        let (done, heard) = oneshot::channel();
+        rig.e
+            .conn
+            .outbound_stream_with_id(StreamId::next(), bytes_of(100_000), None, Some(done), None)
+            .await;
+        rig.path.settle(Duration::from_secs(1)).await;
+        rig.collect_tasks().await;
+        assert_eq!(heard.await.unwrap(), StreamSendOutcome::Dropped);
+        assert!(
+            rig.udp_data().ids.is_empty(),
+            "a stream that opened stays dropped"
+        );
+        assert_eq!(rig.stats().send_count(SendKind::Stream, R::Dropped), 1);
+        assert_eq!(rig.stats().stop_count(stop_code::BUDGET_REFUSED), 1);
+        assert_eq!(rig.e.conn.telemetry_test_counts.outbound_streams_failed, 1);
 
-            let bytes = bytes_of(100_000);
-            rig.e.conn.send_serialized(bytes.to_vec()).await.unwrap();
-            rig.path.settle(Duration::from_secs(1)).await;
-            tokio::task::yield_now().await;
-            assert_eq!(rig.udp_data().stream_bytes, bytes.to_vec());
-            assert_eq!(rig.stats().send_count(SendKind::LargeShort, R::FailedUdp), 1);
-        },
-    );
+        let bytes = bytes_of(100_000);
+        rig.e.conn.send_serialized(bytes.to_vec()).await.unwrap();
+        rig.path.settle(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(rig.udp_data().stream_bytes, bytes.to_vec());
+        assert_eq!(
+            rig.stats().send_count(SendKind::LargeShort, R::FailedUdp),
+            1
+        );
+    });
 }
 
 /// A stream that opened and stopped moving is reset and is `Dropped`, never resent

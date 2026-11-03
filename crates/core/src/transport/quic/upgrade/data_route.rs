@@ -100,13 +100,7 @@ impl DataRoute {
         note: RouteNote,
     ) -> (Self, impl Future<Output = ()> + Send + 'static) {
         let (shorts, queue) = mpsc::channel(SHORT_QUEUE_CAPACITY);
-        let worker = run_worker(
-            Arc::clone(&path),
-            clock.clone(),
-            queue,
-            udp,
-            note.clone(),
-        );
+        let worker = run_worker(Arc::clone(&path), clock.clone(), queue, udp, note.clone());
         (
             Self {
                 path,
@@ -221,8 +215,7 @@ async fn send_on_udp(
     match udp.send_short(payload).await {
         Ok(()) => note.note(|| "sent a short on UDP from the path's queue".to_string()),
         Err(error) => {
-            path.stats()
-                .record_send_event(QuicSendEvent::UdpSendFailed);
+            path.stats().record_send_event(QuicSendEvent::UdpSendFailed);
             tracing::debug!(%error, "A short message from a QUIC path was not sent on UDP");
         }
     }

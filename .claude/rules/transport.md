@@ -1294,7 +1294,7 @@ check every endpoint was live (`not_allowed`) rather than failed to bind.
 `SimNetwork::quic_upgrade_trace` returns a handle (`quic/upgrade/sim_trace.rs`,
 tests only) with what each node's upgrades did, readable after the run,
 including what arrived on the path and on UDP (`received a short on the path`,
-`received data on UDP`, noted at the receiver whichever code sent it) and what each
+`data arrived on UDP`, noted at the receiver whichever code sent it) and what each
 send ended as (`sent a short on the path: ...`). It also
 injects: `send_initial_on_each_attempt` (the node receives an Initial with the
 peer's address as its source each time it allows that address, and records

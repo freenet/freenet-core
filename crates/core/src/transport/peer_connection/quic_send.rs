@@ -194,10 +194,7 @@ impl<T: TimeSource> PathTransfer<T> {
 
 /// Tell the broadcast queue how a stream ended. It only reads whether the send
 /// happened: a `MaybeDelivered` did, and neither form is an end-to-end ack.
-fn complete(
-    completion_tx: Option<oneshot::Sender<StreamSendOutcome>>,
-    outcome: StreamSendOutcome,
-) {
+fn complete(completion_tx: Option<oneshot::Sender<StreamSendOutcome>>, outcome: StreamSendOutcome) {
     if let Some(tx) = completion_tx {
         // The receiver may be gone if the queue timed out.
         let _ignored = tx.send(outcome);
