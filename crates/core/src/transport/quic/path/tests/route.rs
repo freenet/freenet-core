@@ -34,7 +34,8 @@ fn each_outcome_takes_its_row() {
         stop_code::FRAGMENT_REFUSED,
         0x1f,
     ];
-    let mut rows: Vec<(BoundedSend, (NextStep, R), (NextStep, R))> = vec![
+    type Row = (BoundedSend, (NextStep, R), (NextStep, R));
+    let mut rows: Vec<Row> = vec![
         (BoundedSend::Sent, (Done, R::Sent), (Done, R::Sent)),
         (
             BoundedSend::MaybeDelivered(MaybeDelivered::TimedOut),
