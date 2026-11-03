@@ -372,8 +372,10 @@ inbound session key (`handshake_unauthenticated_dropped`), QUIC endpoint deaths
 (`quic_endpoint_down`), panics the QUIC socket adapter caught
 (`quic_adapter_panicked`, once per endpoint; the process keeps running
 and no breaker state is left), QUIC crash-loop breaker trips at startup
-(`quic_breaker_trips`, counted for any abnormal end of a QUIC-enabled run, not
-only a QUIC fault; see `quic/breaker.rs`) and whether the breaker keeps QUIC
+(`quic_breaker_trips`, on unix counted for any abnormal end of a QUIC-enabled
+run, not only a QUIC fault, and on Windows for three runs in a row that ended
+within ten minutes, for any reason, each starting within 24 h of the one before;
+see `quic/breaker.rs`) and whether the breaker keeps QUIC
 off in this process (`quic_breaker_suppressed`, a state that is never reset and
 is not activity by itself) and QUIC connections this node closed, by close code
 (`quic_close_sent_<label>`, one per `QuicCloseCode`) and the shadow-mode upgrade
@@ -890,7 +892,7 @@ sends data on a path yet, so `prefer` differs from `shadow` only by that bit. Th
 release that makes `prefer` carry data must say in its notes that existing
 `prefer` configs start carrying data. Off: no endpoint, no QUIC ingress, nothing
 changes. QUIC must stay off by default on Windows until the crash-loop
-breaker works there (#6031). Shadow or prefer: the endpoint is built
+breaker has been confirmed on a real Windows machine (#6031). Shadow or prefer: the endpoint is built
 with the node's QUIC identity (below) and an EMPTY allow-set, so nothing
 reaches it and it sends nothing; the listener holds it, with the queue of
 its accept loop (below), which hands on no attempt while the allow-set is
@@ -1311,8 +1313,14 @@ peer presents a key that is not its transport key.
 
 #### QUIC rollout (#5940)
 
-There are no opt-in stages; releases do the rollout. QUIC stays off on Windows
-throughout, until #6031. Every step watches: peers disappearing per version
+There are no opt-in stages; releases do the rollout. QUIC stays off by default
+on Windows throughout, until its breaker is confirmed on a real Windows machine
+(#6031). Before default-on there, run on real Windows 10 and 11: the
+`quic_breaker_windows` test; logoff, shutdown and restart with Fast Startup on
+and off; tray Restart, Stop and Quit; `freenet service stop` and `restart`; an
+update exit; a real abort; and sleep during a run. Then weigh what that breaker
+never catches: a crash loop with runs of 10 minutes or more, and a fault that
+crashes once a day. Every step watches: peers disappearing per version
 against the previous rollout (a node that dies before reporting is absent from
 every rate), endpoint-down, panics and breaker trips, RSS against
 `quic_paths_active`, CPU and egress, and NAT success, connections and transfers.
@@ -1964,8 +1972,12 @@ Liveness ("alive" = the endpoint driver has not ENDED; it does not mean
     (ERROR log, quic_adapter_panicked, quic_endpoint_down) and leaves no
     crash-loop breaker state, so QUIC comes back on the next start, and a
     deterministic fault recurs once per start. A panic that is not
-    contained aborts the process, and the next start trips the breaker
-    (quic_breaker_trips, see quic/breaker.rs).
+    contained aborts the process. On unix the next start trips the breaker
+    (quic_breaker_trips, see quic/breaker.rs). On Windows the breaker does
+    not look at how a run ended: it counts runs that lasted under 10 minutes,
+    so the fourth start after three such aborts in a row trips it, and an
+    abort after 10 minutes or more never does, nor do aborts a day apart
+    (quic/breaker/short_runs.rs).
   → When the node drops its last handle, the availability is Released
     (final; the first final state stored wins, so a release and a
     driver return racing never overwrite each other) and the driver's
