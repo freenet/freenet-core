@@ -9,7 +9,9 @@
 # failure notifiers (`failure()`) and the release pre-flight both treat as
 # healthy. So: every cron a job selects must be scheduled, and every
 # scheduled cron must be selected by some job (or it starts a run that does
-# nothing).
+# nothing). Set equality alone would pass if the two jobs SWAPPED crons, so the
+# cadence each job gets is pinned too: the large simulation weekly (daily cost
+# ~$42/month of Ubicloud, the reason it moved), WAN Bench R1 daily.
 #
 # Run manually with: bash scripts/simulation_schedule_test.sh
 
@@ -38,17 +40,33 @@ code = "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("#"))
 crons = set(re.findall(r"^\s*-\s*cron:\s*[\"']([^\"']+)[\"']", code, re.M))
 selected = set(re.findall(r"github\.event\.schedule\s*==\s*'([^']+)'", code))
 # '|'-separated: cron strings contain spaces.
+# Which cron each job selects: the literal in its own `if:`.
+def job_cron(job_id):
+    m = re.search(r"^  " + re.escape(job_id) + r":\n(.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
+                  code, re.M | re.S)
+    sel = re.findall(r"github\.event\.schedule\s*==\s*'([^']+)'", m.group(1)) if m else []
+    return sel[0] if len(sel) == 1 else "?"
+def cadence(cron):
+    f = cron.split()
+    if len(f) != 5:
+        return "?"
+    return "daily" if f[2:] == ["*", "*", "*"] else (
+        "weekly" if f[2:4] == ["*", "*"] and f[4] != "*" else "other")
 print("|".join([str(len(crons)), str(len(selected)),
                 "; ".join(sorted(selected - crons)) or "none",
-                "; ".join(sorted(crons - selected)) or "none"]))
+                "; ".join(sorted(crons - selected)) or "none",
+                cadence(job_cron("large-scale-simulation")),
+                cadence(job_cron("wan-bench-r1"))]))
 PY
 )
-IFS="|" read -r N_CRONS N_SELECTED UNSCHEDULED UNUSED <<<"$RESULT"
+IFS="|" read -r N_CRONS N_SELECTED UNSCHEDULED UNUSED LARGE_SIM WAN_BENCH <<<"$RESULT"
 
 check "the workflow has a schedule to check" "$([[ $N_CRONS -ge 1 ]] && echo yes || echo no)" "yes"
 check "jobs select their cron explicitly" "$([[ $N_SELECTED -ge 1 ]] && echo yes || echo no)" "yes"
 check "every cron a job selects is scheduled" "$UNSCHEDULED" "none"
 check "every scheduled cron is selected by a job" "$UNUSED" "none"
+check "the large simulation is scheduled weekly" "$LARGE_SIM" "weekly"
+check "WAN Bench R1 is scheduled daily" "$WAN_BENCH" "daily"
 
 if [[ $FAILURES -gt 0 ]]; then
     echo "$FAILURES check(s) failed" >&2
