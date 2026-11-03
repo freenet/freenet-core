@@ -4966,9 +4966,12 @@ fn admit_unprompted_ops(
 ///
 /// Every client entry point applies this: [`dispatch_delegate_request`] for a
 /// network node, and `Executor::client_delegate_request` (called by
-/// `node::run_local_node` and `Executor::handle_request`) for local mode. The node's own deliveries (notifications, contract responses,
-/// prompts, inter-delegate hops, lifecycle runs) build their requests
-/// internally and never pass through those entry points.
+/// `node::run_local_node` and `Executor::handle_request`) for local mode. The
+/// unchecked `Executor::delegate_request` is visible only inside `contract`,
+/// so code where client requests arrive cannot skip the check. The node's own
+/// deliveries (notifications, contract responses, prompts, inter-delegate
+/// hops, lifecycle runs) build their requests internally and never pass
+/// through those entry points.
 pub(crate) fn node_only_inbound(req: &DelegateRequest<'_>) -> Option<&'static str> {
     #[allow(clippy::wildcard_enum_match_arm)]
     match req {

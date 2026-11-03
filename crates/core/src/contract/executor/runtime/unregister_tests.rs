@@ -291,12 +291,13 @@ async fn handle_request_refuses_an_unregister() {
 /// (from `run_local_node` and `handle_request`), not the contract loop, so it
 /// needs the same refusal of node-only inbound messages
 /// (`contract::node_only_inbound`). Each forged request must be refused with
-/// that error. The fixture delegate is not real WASM, so a request that is NOT
-/// refused fails later with a different error, which the control checks.
+/// that error. The delegate is never registered, so a request that is NOT
+/// refused gets past the check and fails later as a missing delegate, which
+/// the control asserts.
 ///
 /// FALSIFY by deleting the `node_only_inbound` check in
-/// `client_delegate_request`: the forged requests fail on execution instead
-/// (missing delegate), and the message assertion fails.
+/// `client_delegate_request`: the forged requests fail as a missing delegate
+/// instead, and the message assertion fails.
 #[tokio::test(flavor = "multi_thread")]
 async fn handle_request_refuses_node_only_inbound_messages() {
     const REFUSAL: &str = "is delivered by the node";
@@ -327,8 +328,9 @@ async fn handle_request_refuses_node_only_inbound_messages() {
             "{label} must be refused as node-only, got {err}"
         );
     }
-    // Control: an ordinary message is not refused as node-only.
-    let ordinary = f
+    // Control: an ordinary message passes the check and reaches the executor,
+    // which answers that the (unregistered) delegate is missing.
+    let err = f
         .executor
         .handle_request(
             crate::client_events::ClientId::FIRST,
@@ -337,13 +339,12 @@ async fn handle_request_refuses_node_only_inbound_messages() {
             )]),
             None,
         )
-        .await;
-    if let Err(err) = ordinary {
-        assert!(
-            !err.to_string().contains(REFUSAL),
-            "an ApplicationMessage must not be refused as node-only, got {err}"
-        );
-    }
+        .await
+        .expect_err("the fixture delegate is not registered");
+    assert!(
+        err.is_missing_delegate() && !err.to_string().contains(REFUSAL),
+        "an ApplicationMessage must pass the node-only check and reach the executor, got {err}"
+    );
 }
 
 /// Only a delegate that holds a created-delegate slot releases one: a key

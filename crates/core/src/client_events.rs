@@ -1863,9 +1863,9 @@ async fn process_open_request(
                                     }
                                     InboundDelegateMsg::DelegateMessage(_) => "DelegateMessage",
                                     // Appended in stdlib 0.10.0. An app may
-                                    // still send one, which the contract loop
-                                    // refuses (`contract::node_only_inbound`);
-                                    // the log should name it, not say "Unknown".
+                                    // still send one, which the node refuses
+                                    // (`contract::node_only_inbound`); the log
+                                    // should name it, not say "Unknown".
                                     InboundDelegateMsg::UnsubscribeContractResponse(_) => {
                                         "UnsubscribeContractResponse"
                                     }

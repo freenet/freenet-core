@@ -204,7 +204,13 @@ impl Executor<Runtime> {
         self.delegate_request(req, origin_contract, None, connection_scope, user_context)
     }
 
-    pub fn delegate_request(
+    /// Runs a delegate request WITHOUT the client refusal above, so node-built
+    /// requests (contract responses, notifications, prompt answers,
+    /// inter-delegate hops) can carry node-only messages. Visible only inside
+    /// `contract` so code outside it, where client requests arrive, cannot
+    /// reach it: a client request goes through [`Self::client_delegate_request`]
+    /// or the contract loop's `dispatch_delegate_request`.
+    pub(in crate::contract) fn delegate_request(
         &mut self,
         req: DelegateRequest<'_>,
         origin_contract: Option<&ContractInstanceId>,

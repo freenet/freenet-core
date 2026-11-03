@@ -313,6 +313,11 @@ pub(crate) fn forged_node_only_messages(key: &DelegateKey) -> Vec<InboundDelegat
 
 /// The allowlist itself: every node-only variant is refused, alone and behind
 /// an ordinary message, and an ordinary message alone is not.
+///
+/// The reported kind must be the variant's own name, taken from its derived
+/// `Debug`, so an explicit arm that was deleted (and now falls into the
+/// `_ => "an unrecognised inbound message"` wildcard) or that returns the
+/// wrong name fails here, not only in the log.
 #[test]
 fn node_only_inbound_refuses_every_variant_but_application_message() {
     let key = DelegateKey::new([3; 32], CodeHash::new([3; 32]));
@@ -324,12 +329,19 @@ fn node_only_inbound_refuses_every_variant_but_application_message() {
     let ordinary = || InboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(vec![1]));
     for forged in forged_node_only_messages(&key) {
         let label = format!("{forged:?}");
-        assert!(
-            super::node_only_inbound(&req(vec![forged.clone()])).is_some(),
+        let variant = label
+            .split(['(', ' ', '{'])
+            .next()
+            .expect("Debug output starts with the variant name")
+            .to_string();
+        assert_eq!(
+            super::node_only_inbound(&req(vec![forged.clone()])),
+            Some(variant.as_str()),
             "a client must not be able to send {label}"
         );
-        assert!(
-            super::node_only_inbound(&req(vec![ordinary(), forged])).is_some(),
+        assert_eq!(
+            super::node_only_inbound(&req(vec![ordinary(), forged])),
+            Some(variant.as_str()),
             "a forged message behind an ordinary one must be refused too: {label}"
         );
     }
