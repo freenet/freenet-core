@@ -20,7 +20,8 @@ A "warm job" is a job in the warm workflow that uses Swatinem/rust-cache.
 Against the ci.yml job with the SAME id it checks:
 
 1. workflow-level ``env:``/``defaults:`` and job-level ``env:``/``defaults:``
-   are identical, and so are ``$GITHUB_ENV`` writes;
+   are identical, and so are ``$GITHUB_ENV`` writes and the ORDER of actions
+   up to the cache step (the toolchain action sets CARGO_* env the key hashes);
 2. the ``dtolnay/rust-toolchain`` inputs are identical (and present);
 3. the ``Swatinem/rust-cache`` reference, inputs and step env are identical,
    except ``save-if``, which is checked separately: the ci.yml twin must save
@@ -373,8 +374,26 @@ def _apt_packages(job: list[str]) -> set[str]:
 
 
 def _github_env_writes(job: list[str]) -> set[str]:
-    """Script lines that set env for later steps (they reach the cache step)."""
-    return {_norm(l) for l in _logical_lines(job) if "GITHUB_ENV" in l and ">>" in l}
+    """Script lines that touch $GITHUB_ENV (``>>``, ``tee -a``, ...); env set
+    there reaches every later step, including the cache step's key."""
+    return {_norm(l) for l in _logical_lines(job) if "GITHUB_ENV" in l}
+
+
+def _actions_before_cache(job: list[str]) -> list[str]:
+    """Actions (``uses:``) in order, up to and including the first rust-cache.
+
+    Order matters, not just presence: dtolnay/rust-toolchain writes CARGO_*
+    variables to $GITHUB_ENV, and rust-cache hashes CARGO_* env into the key
+    when it runs, so swapping the two steps changes the key.
+    """
+    out = []
+    for step in _steps(job):
+        uses, _ = _step_key(step, "uses")
+        if uses:
+            out.append(uses)
+            if uses.split("@")[0] == "Swatinem/rust-cache":
+                break
+    return out
 
 
 def _label_suffixes(runs_on: str) -> set[str]:
@@ -479,6 +498,11 @@ def check(ci_text: str, warm_text: str, ci_name: str = "ci.yml",
         ci_ge, warm_ge = _github_env_writes(ci_job), _github_env_writes(warm_job)
         if ci_ge != warm_ge:
             differ("writes to $GITHUB_ENV", job_id, ci_ge, warm_ge, key_why)
+
+        ci_ord, warm_ord = _actions_before_cache(ci_job), _actions_before_cache(warm_job)
+        if ci_ord != warm_ord:
+            differ("actions run before (and including) the rust-cache step, in "
+                   "order", job_id, ci_ord, warm_ord, key_why)
 
         ci_tc = _uses_inputs(ci_job, "dtolnay/rust-toolchain")
         warm_tc = _uses_inputs(warm_job, "dtolnay/rust-toolchain")
@@ -694,6 +718,28 @@ def _cases() -> list[tuple[str, str, str, str | None]]:
      _sub(_CI, "      - uses: actions/checkout@v7\n      - name: Install mold",
           "      - uses: actions/checkout@v7\n      - run: echo CARGO_INCREMENTAL=1 >> $GITHUB_ENV\n      - name: Install mold"),
      _WARM, "$GITHUB_ENV"),
+    ("$GITHUB_ENV written via tee in CI only",
+     _sub(_CI, "      - uses: actions/checkout@v7\n      - name: Install mold",
+          "      - uses: actions/checkout@v7\n      - run: echo CARGO_INCREMENTAL=1 | tee -a \"$GITHUB_ENV\"\n      - name: Install mold"),
+     _WARM, "$GITHUB_ENV"),
+    ("rust-cache moved before the toolchain step in warm only",
+     _CI, _sub(_WARM, """      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          key: ci-${{ hashFiles('.github/workflows/ci-cache-warm.yml') }}
+""", """      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          key: ci-${{ hashFiles('.github/workflows/ci-cache-warm.yml') }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
+          targets: wasm32-unknown-unknown
+"""), "in order"),
     ("toolchain bumped in CI only", _sub(_CI, "1.93.0", "1.94.0"), _WARM,
      "rust-toolchain inputs"),
     ("toolchain target dropped from warm",
