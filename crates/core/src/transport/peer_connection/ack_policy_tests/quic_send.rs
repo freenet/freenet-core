@@ -41,19 +41,16 @@ impl Rig {
     fn udp_data(&mut self) -> UdpData {
         let mut data = UdpData::default();
         for message in self.e.drain_sent() {
-            match message.payload {
-                SymmetricMessagePayload::ShortMessage { payload } => {
-                    data.ids.push(message.packet_id);
-                    data.shorts.push(payload.to_vec());
-                }
-                SymmetricMessagePayload::StreamFragment {
-                    stream_id, payload, ..
-                } => {
-                    data.ids.push(message.packet_id);
-                    data.stream_ids.push(stream_id);
-                    data.stream_bytes.extend_from_slice(&payload);
-                }
-                _ => {}
+            if let SymmetricMessagePayload::ShortMessage { payload } = &message.payload {
+                data.ids.push(message.packet_id);
+                data.shorts.push(payload.to_vec());
+            } else if let SymmetricMessagePayload::StreamFragment {
+                stream_id, payload, ..
+            } = &message.payload
+            {
+                data.ids.push(message.packet_id);
+                data.stream_ids.push(*stream_id);
+                data.stream_bytes.extend_from_slice(payload);
             }
         }
         data
