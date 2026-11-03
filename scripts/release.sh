@@ -628,7 +628,11 @@ check_prerequisites() {
         while true; do
             echo -n "  Checking main branch CI status... "
             local check_runs_json
-            check_runs_json=$(gh api repos/freenet/freenet-core/commits/main/check-runs 2>/dev/null || echo "{}")
+            # per_page=100: the default page is 30, and main's HEAD commonly
+            # carries more (42 on 2026-11-03), so checks past the first page
+            # were never looked at. Scheduled runs (nightly sims, the cache
+            # warm) keep adding to HEAD while main sits still.
+            check_runs_json=$(gh api "repos/freenet/freenet-core/commits/main/check-runs?per_page=100" 2>/dev/null || echo "{}")
 
             # Exclude scheduled workflows and their cascade notifiers from the
             # release pre-flight check. These run on a cron (not on commit
@@ -640,6 +644,13 @@ check_prerequisites() {
             #    is tracked separately.
             #  - "Notify Matrix on Failure" is a cascade notifier that fires
             #    whenever any other workflow fails — it's not itself a test.
+            #  - "Warm cache: *" (ci-cache-warm.yml) only refills the Rust
+            #    build cache, daily at 04:00 UTC and after pushes that touch
+            #    Cargo.lock, a Cargo.toml, the toolchain or cargo config, or
+            #    ci-cache-warm.yml itself. A warm run
+            #    still in progress would run this wait into ci_max_wait, and
+            #    a failed one would refuse the release; neither says anything
+            #    about the commit being released.
             # If any of these are genuinely broken, fix them on their own
             # schedule; they should never gate a release of a PR-CI-green
             # merge commit.
@@ -652,8 +663,8 @@ check_prerequisites() {
             # filters so a Dependabot run in either state never gates a
             # release (release blocked by unrelated Dependabot cron,
             # 2026-04-14 v0.2.45 release).
-            in_progress_count=$(echo "$check_runs_json" | jq '[.check_runs[] | select(.status != "completed" and .name != "Dependabot" and (.name | startswith("Build for") | not) and .name != "claude" and .name != "Large Scale Simulation" and .name != "Simulation Tests (Nightly)" and .name != "Notify Matrix on Failure" and .name != "mirror / mirror")] | length')
-            failed_count=$(echo "$check_runs_json" | jq '[.check_runs[] | select(.status == "completed" and .conclusion != "success" and .conclusion != "skipped" and .name != "Dependabot" and (.name | startswith("Build for") | not) and .name != "claude" and .name != "Large Scale Simulation" and .name != "Simulation Tests (Nightly)" and .name != "Notify Matrix on Failure" and .name != "mirror / mirror")] | length')
+            in_progress_count=$(echo "$check_runs_json" | jq '[.check_runs[] | select(.status != "completed" and .name != "Dependabot" and (.name | startswith("Build for") | not) and (.name | startswith("Warm cache:") | not) and .name != "claude" and .name != "Large Scale Simulation" and .name != "Simulation Tests (Nightly)" and .name != "Notify Matrix on Failure" and .name != "mirror / mirror")] | length')
+            failed_count=$(echo "$check_runs_json" | jq '[.check_runs[] | select(.status == "completed" and .conclusion != "success" and .conclusion != "skipped" and .name != "Dependabot" and (.name | startswith("Build for") | not) and (.name | startswith("Warm cache:") | not) and .name != "claude" and .name != "Large Scale Simulation" and .name != "Simulation Tests (Nightly)" and .name != "Notify Matrix on Failure" and .name != "mirror / mirror")] | length')
 
             if [[ "$total_checks" == "0" ]]; then
                 echo "⚠️  (no checks found)"
@@ -673,7 +684,9 @@ check_prerequisites() {
             elif [[ "$failed_count" -gt 0 ]]; then
                 echo "✗ ($failed_count checks failed)"
                 local failed_names
-                failed_names=$(echo "$check_runs_json" | jq -r '[.check_runs[] | select(.status == "completed" and .conclusion != "success" and .conclusion != "skipped")] | .[].name' | head -5)
+                # Same exclusions as failed_count, or the message can name
+                # only checks the gate ignored and hide the one that failed.
+                failed_names=$(echo "$check_runs_json" | jq -r '[.check_runs[] | select(.status == "completed" and .conclusion != "success" and .conclusion != "skipped" and .name != "Dependabot" and (.name | startswith("Build for") | not) and (.name | startswith("Warm cache:") | not) and .name != "claude" and .name != "Large Scale Simulation" and .name != "Simulation Tests (Nightly)" and .name != "Notify Matrix on Failure" and .name != "mirror / mirror")] | .[].name' | head -5)
                 echo "  ✗ Main branch CI is failing - cannot release"
                 echo "     Failed checks: $failed_names"
                 exit 1

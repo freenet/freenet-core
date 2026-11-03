@@ -1,0 +1,254 @@
+name: CI Cache Warm
+
+# Writes the main-scoped Rust caches that ci.yml's heavy PR jobs restore from.
+#
+# WHY THIS EXISTS. A PR can restore a cache saved on its own branch or on main,
+# nothing else. ci.yml's Unit & Integration, Simulation and NAT Validation jobs
+# do not run on pushes to main (the PR already validated the code), so none of
+# them ever wrote a main-scoped entry. Measured 2026-11-03 with
+# `ubi gh freenet/freenet-core list-cache-entries`: no `v0-rust-test_unit-*`
+# entry existed at all, so every Unit & Integration run compiled its whole
+# dependency tree on a standard-16 runner, and Simulation / NAT Validation
+# started cold on each PR's first run and then saved a 1.2-2.2 GB entry that
+# only later pushes to that one branch could read.
+#
+# HOW THE KEYS LINE UP. Swatinem/rust-cache keys on
+#   <prefix>-<key input>-<GITHUB_JOB>-<OS>-<arch>-<hash>-<lockfile hash>
+# where <hash> covers the installed rustc versions and every env var whose
+# name starts with CARGO, CC, CFLAGS, CXX, CMAKE or RUST, and a PR restores by
+# the key minus the lockfile hash. The `key` input is THIS file's hash on both
+# sides: rust-cache skips the save on an exact key hit, so a change to what
+# the PR jobs compile (which must be mirrored here) has to yield a new key for
+# this workflow to fill. So each job below MUST keep:
+#   - the SAME job id as its ci.yml counterpart (test_unit, test_simulation,
+#     nat_validation) -- the display `name:` is deliberately different, so
+#     these never masquerade as the required status contexts;
+#   - the SAME job-level `env:`, toolchain and toolchain targets;
+#   - the SAME linker env on its compile steps, and the same cargo features,
+#     or cargo's fingerprints differ and the restored deps are rebuilt anyway.
+# .github/scripts/check_cache_warm_parity.py enforces this from Rule Lint.
+# When you change one of those jobs in ci.yml, change its twin here.
+#
+# It must run on a Ubicloud runner: Ubicloud serves its own cache backend, so
+# an entry saved from a GitHub-hosted runner is invisible to Ubicloud jobs.
+# Runner size does not enter the key (only OS and arch do), so the cheaper
+# standard-8 is used throughout.
+
+on:
+  # Daily backstop, for what no path filter sees: eviction (Ubicloud's policy
+  # is not documented; this does not rely on PR restores keeping an entry
+  # alive), and a runner-image update. rust-cache hashes EVERY installed rustup
+  # toolchain into the key, so an image that bumps its preinstalled stable
+  # orphans the entries until the next warm. On an exact key hit a run only
+  # rebuilds the workspace crates and skips the save, so it is cheap.
+  schedule:
+    - cron: "0 4 * * *"
+  # Re-warm when what the cached dependencies depend on changes on main: the
+  # lockfile and manifests, the toolchain and cargo config, and this file.
+  # ci.yml is deliberately absent: any ci.yml change that matters to the cache
+  # (job env, toolchain, compile commands) must be mirrored here -- the parity
+  # linter enforces it -- and the cache `key` is this file's hash, so a
+  # ci.yml-only push would hit the existing key and save nothing. Path filters
+  # are safe because no job here is a required status context (#5451).
+  push:
+    branches: [main]
+    paths:
+      - "Cargo.lock"
+      - "**/Cargo.toml"
+      - "rust-toolchain"
+      - "rust-toolchain.toml"
+      - ".cargo/config.toml"
+      - ".github/workflows/ci-cache-warm.yml"
+  workflow_dispatch:
+
+# Finish the running warm, then run only the latest queued one (GitHub keeps
+# one pending run per group). Cancelling instead would discard a run just
+# before its post-job save, and a steady stream of merges could then keep
+# every run from saving.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  test_unit:
+    name: "Warm cache: Unit & Integration"
+    runs-on: ubicloud-standard-8
+    timeout-minutes: 45
+
+    # Must match ci.yml test_unit's job-level env exactly (cache key input).
+    env:
+      RUST_LOG: error
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      RUST_MIN_STACK: 268435456
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install mold linker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mold
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          key: ci-${{ hashFiles('.github/workflows/ci-cache-warm.yml') }}
+
+      - name: Install nextest
+        uses: taiki-e/install-action@v2
+        timeout-minutes: 5
+        with:
+          tool: cargo-nextest
+          fallback: none
+
+      - name: Build
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
+        run: |
+          cargo build --locked
+          export PATH="$PWD/target/debug:$PATH"
+          make -C apps/freenet-ping -f run-ping.mk build
+
+      # The three test invocations of ci.yml test_unit, compiled but not run.
+      - name: Compile tests
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
+        run: |
+          cargo nextest run --workspace --exclude freenet-ping-types \
+            --no-default-features \
+            --features trace,websocket,redb,wasmtime-backend,testing \
+            --profile ci --no-run
+          cargo nextest run -p freenet-ping-app \
+            --features testing --profile ci --no-run
+          cargo nextest run -p freenet-ping-types --profile ci --no-run
+
+  test_simulation:
+    name: "Warm cache: Simulation"
+    runs-on: ubicloud-standard-8
+    timeout-minutes: 45
+
+    # Must match ci.yml test_simulation's job-level env exactly (cache key input).
+    env:
+      RUST_LOG: error
+      RUST_MIN_STACK: 268435456
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install mold linker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mold
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          key: ci-${{ hashFiles('.github/workflows/ci-cache-warm.yml') }}
+
+      - name: Install nextest
+        uses: taiki-e/install-action@v2
+        timeout-minutes: 5
+        with:
+          tool: cargo-nextest
+          fallback: none
+
+      # Identical to ci.yml's "Build simulation tests and fdev" step, which is
+      # already compile-only.
+      - name: Build simulation tests and fdev
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
+        run: |
+          cargo nextest run -p freenet --locked --no-run \
+            --lib \
+            --test simulation_integration \
+            --test simulation_smoke \
+            --test streaming_e2e \
+            --test state_verification \
+            --features simulation_tests,testing --profile ci
+          cargo build -p fdev --release --locked
+
+  nat_validation:
+    name: "Warm cache: NAT Validation"
+    runs-on: ubicloud-standard-8
+    timeout-minutes: 45
+
+    # Must match ci.yml nat_validation's job-level env exactly (cache key input).
+    env:
+      RUST_LOG: error
+      RUST_MIN_STACK: 268435456
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mold liblzma-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          key: ci-${{ hashFiles('.github/workflows/ci-cache-warm.yml') }}
+
+      - name: Install nextest
+        uses: taiki-e/install-action@v2
+        timeout-minutes: 5
+        with:
+          tool: cargo-nextest
+          fallback: none
+
+      - name: Build
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
+        run: |
+          cargo build --locked
+          export PATH="$PWD/target/debug:$PATH"
+          make -C apps/freenet-ping -f run-ping.mk build
+
+      - name: Compile Docker NAT test
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
+        run: |
+          cargo nextest run -p freenet-ping-app --features testing \
+            --profile ci --no-run
+
+  # A failed warm leaves PRs building cold with every check green, so say so.
+  # Named "Warm cache: ..." like the jobs above: scripts/release.sh ignores
+  # main-branch check runs by that prefix, including this one while queued.
+  notify_failure:
+    name: "Warm cache: notify on failure"
+    runs-on: ubuntu-latest
+    needs: [test_unit, test_simulation, nat_validation]
+    if: failure() && github.ref == 'refs/heads/main'
+    # Best-effort, like ci.yml's notify_dev_room_main_failure.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/river-dev-notify
+        with:
+          message: "⚠️ CI cache warm failed — PRs will build cold until it succeeds — ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          bot-config: ${{ secrets.RIVER_DEV_BOT_CONFIG }}
+          room-id: ${{ secrets.RIVER_DEV_ROOM_ID }}
+          gateway-url: ${{ secrets.RIVER_GATEWAY_URL }}

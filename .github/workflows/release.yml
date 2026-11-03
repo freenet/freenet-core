@@ -492,8 +492,8 @@ jobs:
     name: Wait for PR to merge
     runs-on: ubuntu-latest
     # 75 min covers: merge-queue scheduling + full-suite release gate (test_unit
-    # + Simulation + NAT Validation in parallel, ~10-15 min each on a busy
-    # ubicloud-standard-16) + branch-protection check propagation. Bumped from
+    # + Simulation + NAT Validation in parallel, ~10-15 min each on busy
+    # Ubicloud runners) + branch-protection check propagation. Bumped from
     # 60 min when the release merge_group started running the full suite (#3973).
     timeout-minutes: 75
     needs: [validate, update_versions]

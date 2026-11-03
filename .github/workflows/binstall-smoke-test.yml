@@ -10,7 +10,7 @@ name: Binstall Smoke Test (Nightly)
 
 on:
   schedule:
-    # 5 AM UTC daily — staggered after simulation-nightly (3 AM UTC).
+    # 5 AM UTC daily — staggered after simulation-nightly (WAN bench 3 AM UTC daily, large sim 2 AM UTC Sundays).
     - cron: "0 5 * * *"
   workflow_dispatch:
 

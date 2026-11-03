@@ -6,9 +6,25 @@ name: Simulation Tests (Nightly)
 #   - Nightly-gated nextest tests (1h virtual time, 250-contract scale)
 #   - Large scale (500 nodes, 10000 events)
 
+# Despite the name, the large simulation runs WEEKLY; only WAN Bench R1 is
+# still nightly. The name stays because scripts/release.sh filters on the
+# check names "Simulation Tests (Nightly)" and "Large Scale Simulation", and
+# "nightly" also names the `nightly_tests` feature and nextest profile.
 on:
   schedule:
-    # Run at 3 AM UTC every day
+    # Each job runs on exactly ONE of these crons (see each job's `if:`), and
+    # the concurrency group includes the cron string, so the two never cancel
+    # each other.
+    #
+    # Large Scale Simulation: Sundays 02:00 UTC. Daily until 2026-11: at
+    # ~2.5 h on a ubicloud-standard-16 the daily run cost ~$42/month, about a
+    # tenth of the project's Ubicloud bill, and a daily cadence had not bought
+    # fast detection in practice -- the 500-node step was silently cancelled
+    # for weeks before anyone noticed (see the timeout note on the job below).
+    # Run it by hand (workflow_dispatch) to check a specific change.
+    - cron: "0 2 * * 0"
+    # WAN Bench R1: daily 03:00 UTC, unchanged. A short congestion-controller
+    # gate (~$1.30/month), so it keeps its nightly cadence.
     - cron: "0 3 * * *"
   workflow_dispatch:
     # Allow manual triggering from any branch
@@ -24,12 +40,14 @@ on:
 
 # Cancel in-progress runs when a new run is triggered
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event.schedule || 'manual' }}
   cancel-in-progress: true
 
 jobs:
   large-scale-simulation:
     name: Large Scale Simulation
+    # Weekly cron only (see `on.schedule`); always on a manual dispatch.
+    if: github.event_name != 'schedule' || github.event.schedule == '0 2 * * 0'
     runs-on: ubicloud-standard-16
     # This job runs the nextest suite (~109 min) then the 500-node step
     # (≤60 min, its own cap below) sequentially, plus ~4 min build/setup.
@@ -186,6 +204,8 @@ jobs:
   # Once the cause is fixed, add a seed that caught a real bug to GATE_SEEDS.
   wan-bench-r1:
     name: WAN Bench R1
+    # Daily cron only (see `on.schedule`); always on a manual dispatch.
+    if: github.event_name != 'schedule' || github.event.schedule == '0 3 * * *'
     runs-on: ubicloud-standard-16
     # Steps carry their own timeouts, and this cap is above their sum (5 + 40
     # + 30 + 40 = 115 min, plus setup), so a hang always trips a step first: a
