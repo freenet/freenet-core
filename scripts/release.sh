@@ -646,7 +646,8 @@ check_prerequisites() {
             #    whenever any other workflow fails — it's not itself a test.
             #  - "Warm cache: *" (ci-cache-warm.yml) only refills the Rust
             #    build cache, daily at 04:00 UTC and after pushes that touch
-            #    Cargo.lock, Cargo.toml or the CI workflow files. A warm run
+            #    Cargo.lock, a Cargo.toml, the toolchain or cargo config, or
+            #    ci-cache-warm.yml itself. A warm run
             #    still in progress would run this wait into ci_max_wait, and
             #    a failed one would refuse the release; neither says anything
             #    about the commit being released.

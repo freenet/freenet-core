@@ -30,11 +30,18 @@ jobs:
   check:
     name: Workflow steps that trigger downstream events must use RELEASE_PAT coalesce
     runs-on: ubuntu-latest
-    timeout-minutes: 2
+    # 5, not 2: the full-history fetch alone took 1m56s on 2026-11-03 (run
+    # 41688535376) and the job was killed two seconds into its grep, leaving a
+    # red required-looking check on a PR it had nothing to say about.
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          # Blobless partial clone: full history and trees (what the
+          # three-dot diff and merge-base need) without every file version;
+          # the few blobs the diff below reads are fetched on demand.
+          filter: blob:none
 
       - name: Grep workflow files for unsafe GITHUB_TOKEN usage
         env:

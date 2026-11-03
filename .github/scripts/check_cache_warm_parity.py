@@ -740,6 +740,18 @@ def _cases() -> list[tuple[str, str, str, str | None]]:
           toolchain: 1.93.0
           targets: wasm32-unknown-unknown
 """), "in order"),
+    ("checkout and toolchain swapped in warm only (same set, new order)",
+     _CI, _sub(_sub(_WARM, "      - uses: actions/checkout@v7\n      - name: Install mold linker\n",
+                    "      - name: Install mold linker\n"),
+               "      - uses: Swatinem/rust-cache@v2\n        with:\n          save-if",
+               "      - uses: actions/checkout@v7\n      - uses: Swatinem/rust-cache@v2\n        with:\n          save-if"),
+     "in order"),
+    ("a CI job that saves unconditionally does not need a twin",
+     _sub(_CI, "          save-if: ${{ github.ref == 'refs/heads/main' }}\n          key: ci-",
+          "          key: ci-"),
+     _sub(_WARM, "          save-if: ${{ github.ref == 'refs/heads/main' }}\n          key: ci-",
+          "          key: ci-"),
+     "does not need from it"),
     ("toolchain bumped in CI only", _sub(_CI, "1.93.0", "1.94.0"), _WARM,
      "rust-toolchain inputs"),
     ("toolchain target dropped from warm",
