@@ -257,28 +257,123 @@ fn answer(event: ContractHandlerEvent) -> Result<Vec<OutboundDelegateMsg>, Strin
     }
 }
 
-/// A client cannot hand a delegate a Lifecycle or WakeupFired message: the
-/// request is refused before the delegate runs. The delegate is scripted to
-/// answer, so without the refusal the client would get Ok and the call log
-/// would show an entry.
+/// Every inbound variant except `ApplicationMessage`, as a client might forge
+/// it. Each reports something only the node can know (a contract's state, the
+/// answer to a contract request, a prompt answer, another delegate's message,
+/// a lifecycle event, a wake-up), and none carries an origin the delegate
+/// could check.
+pub(crate) fn forged_node_only_messages(key: &DelegateKey) -> Vec<InboundDelegateMsg<'static>> {
+    let contract_id = ContractInstanceId::new([9; 32]);
+    let state = WrappedState::new(b"a state the contract never had".to_vec());
+    vec![
+        InboundDelegateMsg::ContractNotification(ContractNotification {
+            contract_id,
+            new_state: state.clone(),
+            context: DelegateContext::default(),
+        }),
+        InboundDelegateMsg::GetContractResponse(GetContractResponse {
+            contract_id,
+            state: Some(state),
+            context: DelegateContext::default(),
+        }),
+        InboundDelegateMsg::PutContractResponse(PutContractResponse {
+            contract_id,
+            result: Ok(()),
+            context: DelegateContext::default(),
+        }),
+        InboundDelegateMsg::UpdateContractResponse(UpdateContractResponse {
+            contract_id,
+            result: Ok(()),
+            context: DelegateContext::default(),
+        }),
+        InboundDelegateMsg::SubscribeContractResponse(SubscribeContractResponse {
+            contract_id,
+            result: Ok(()),
+            context: DelegateContext::default(),
+        }),
+        InboundDelegateMsg::UnsubscribeContractResponse(UnsubscribeContractResponse {
+            contract_id,
+            result: Ok(()),
+            context: DelegateContext::default(),
+        }),
+        InboundDelegateMsg::UserResponse(UserInputResponse {
+            request_id: 1,
+            response: ClientResponse::new(b"allow".to_vec()),
+            context: DelegateContext::default(),
+        }),
+        InboundDelegateMsg::DelegateMessage(DelegateMessage::new(
+            key.clone(),
+            DelegateKey::new([4; 32], CodeHash::new([4; 32])),
+            b"from another delegate".to_vec(),
+        )),
+        InboundDelegateMsg::Lifecycle(LifecycleEvent::Installed),
+        InboundDelegateMsg::WakeupFired { tag: vec![1] },
+    ]
+}
+
+/// The allowlist itself: every node-only variant is refused, alone and behind
+/// an ordinary message, and an ordinary message alone is not.
+///
+/// The reported kind must be the variant's own name, taken from its derived
+/// `Debug`, so an explicit arm that was deleted (and now falls into the
+/// `_ => "an unrecognised inbound message"` wildcard) or that returns the
+/// wrong name fails here, not only in the log.
+#[test]
+fn node_only_inbound_refuses_every_variant_but_application_message() {
+    let key = DelegateKey::new([3; 32], CodeHash::new([3; 32]));
+    let req = |inbound| DelegateRequest::ApplicationMessages {
+        key: key.clone(),
+        params: Parameters::from(Vec::new()),
+        inbound,
+    };
+    let ordinary = || InboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(vec![1]));
+    for forged in forged_node_only_messages(&key) {
+        let label = format!("{forged:?}");
+        let variant = label
+            .split(['(', ' ', '{'])
+            .next()
+            .expect("Debug output starts with the variant name")
+            .to_string();
+        assert_eq!(
+            super::node_only_inbound(&req(vec![forged.clone()])),
+            Some(variant.as_str()),
+            "a client must not be able to send {label}"
+        );
+        assert_eq!(
+            super::node_only_inbound(&req(vec![ordinary(), forged])),
+            Some(variant.as_str()),
+            "a forged message behind an ordinary one must be refused too: {label}"
+        );
+    }
+    assert_eq!(super::node_only_inbound(&req(vec![ordinary()])), None);
+    assert_eq!(super::node_only_inbound(&req(vec![])), None);
+}
+
+/// A client cannot hand a delegate any inbound message only the node delivers
+/// (`contract::node_only_inbound`): the request is refused before the delegate
+/// runs. The delegate is scripted to answer, so without the refusal the client
+/// would get Ok and the call log would show an entry.
 #[tokio::test]
-async fn a_client_cannot_forge_a_host_only_message() {
+async fn a_client_cannot_forge_a_node_only_message() {
     let caps = DelegateCapabilities::in_memory();
     let reply = ScriptedRun::from(vec![OutboundDelegateMsg::ApplicationMessage(
         ApplicationMessage::new(b"ran".to_vec()),
     )]);
+    let key = DelegateKey::new([3; 32], CodeHash::new([3; 32]));
+    let forged_all = forged_node_only_messages(&key);
+    let forged_count = forged_all.len();
     let lp = start(
-        "forged_lifecycle",
+        "forged_node_only",
         caps.clone(),
-        vec![reply.clone(), reply],
+        // One scripted reply per request, so a forged message that slipped
+        // through would run and be observed rather than fail for lack of a
+        // script.
+        vec![reply; forged_count + 1],
         CapabilityPrompter::answering(None),
     )
     .await;
-    let key = DelegateKey::new([3; 32], CodeHash::new([3; 32]));
-    for forged in [
-        InboundDelegateMsg::Lifecycle(LifecycleEvent::Installed),
-        InboundDelegateMsg::WakeupFired { tag: vec![1] },
-    ] {
+    for forged in forged_all {
+        let label = format!("{forged:?}");
         let resp = answer(
             lp.send
                 .send_to_handler(app_messages(&key, vec![forged]))
@@ -287,7 +382,7 @@ async fn a_client_cannot_forge_a_host_only_message() {
         );
         assert!(
             resp.is_err(),
-            "forged host-only message must be refused, got {resp:?}"
+            "forged node-only message must be refused: {label}, got {resp:?}"
         );
     }
     assert!(
@@ -295,8 +390,8 @@ async fn a_client_cannot_forge_a_host_only_message() {
         "the delegate must not have run"
     );
     assert_eq!(
-        caps.stats.forged_lifecycle_refused.load(Ordering::Relaxed),
-        2
+        caps.stats.forged_inbound_refused.load(Ordering::Relaxed),
+        forged_count as u64
     );
     // An ordinary message still runs.
     let ok = answer(

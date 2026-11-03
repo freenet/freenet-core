@@ -5,6 +5,11 @@
 //! - A `ContractNotification` records the parameters of that run in the
 //!   delegate's secrets. A notification run has no client to answer, so the
 //!   secret is the evidence.
+//! - An `ApplicationMessage` `b"record"` records the same way. A client cannot
+//!   send a `ContractNotification` (only the node delivers one), so this is how
+//!   a test makes a CLIENT run leave evidence that it ran. So `notified:` means
+//!   "a notification OR a `record` run happened": a test that reads it as proof
+//!   of a notification run must not also send `record`.
 //! - An `ApplicationMessage` `b"params?"` answers
 //!   `"client:<params>|notified:<recorded>"`, or `"...|notified:none"` before
 //!   any notification has run.
@@ -25,6 +30,10 @@ impl DelegateInterface for EchoParamsDelegate {
     ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
         match message {
             InboundDelegateMsg::ContractNotification(_) => {
+                ctx.set_secret(NOTIFIED_KEY, parameters.as_ref());
+                Ok(vec![])
+            }
+            InboundDelegateMsg::ApplicationMessage(msg) if msg.payload == b"record" => {
                 ctx.set_secret(NOTIFIED_KEY, parameters.as_ref());
                 Ok(vec![])
             }

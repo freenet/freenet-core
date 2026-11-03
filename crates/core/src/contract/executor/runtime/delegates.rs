@@ -176,7 +176,42 @@ impl Executor<Runtime> {
         }
     }
 
-    pub fn delegate_request(
+    /// A delegate request straight from a client in local mode
+    /// (`node::run_local_node`, [`Executor::handle_request`]): refuses a
+    /// request carrying an inbound message only the node may deliver
+    /// (`contract::node_only_inbound`), then runs it with no caller delegate.
+    /// A network node applies the same refusal in the contract loop's
+    /// `dispatch_delegate_request`. Never use this for a node-built request:
+    /// those carry node-only messages by design.
+    pub(crate) fn client_delegate_request(
+        &mut self,
+        req: DelegateRequest<'_>,
+        origin_contract: Option<&ContractInstanceId>,
+        connection_scope: crate::client_events::ConnectionScope,
+        user_context: Option<&UserSecretContext>,
+    ) -> Response {
+        if let Some(kind) = crate::contract::node_only_inbound(&req) {
+            tracing::warn!(
+                delegate_key = %req.key(),
+                kind,
+                "Refused a client delegate request carrying an inbound message only the \
+                 node delivers"
+            );
+            return Err(ExecutorError::other(
+                crate::contract::node_only_inbound_error(kind),
+            ));
+        }
+        self.delegate_request(req, origin_contract, None, connection_scope, user_context)
+    }
+
+    /// Runs a delegate request WITHOUT the client refusal above, so node-built
+    /// requests (contract responses, notifications, prompt answers,
+    /// inter-delegate hops) can carry node-only messages. Visible only inside
+    /// `contract` (as is [`Self::delegate_request_as`]), so code outside it,
+    /// where client requests arrive, cannot call it directly: a client request
+    /// goes through [`Self::client_delegate_request`] or the contract loop's
+    /// `dispatch_delegate_request`.
+    pub(in crate::contract) fn delegate_request(
         &mut self,
         req: DelegateRequest<'_>,
         origin_contract: Option<&ContractInstanceId>,
@@ -198,7 +233,7 @@ impl Executor<Runtime> {
     /// [`Self::delegate_request`], with the user whose delegate context the
     /// run uses given apart from `user_context`, which scopes its secrets.
     /// See `DelegateRuntimeInterface::inbound_app_message_as`.
-    pub(crate) fn delegate_request_as(
+    pub(in crate::contract) fn delegate_request_as(
         &mut self,
         req: DelegateRequest<'_>,
         origin_contract: Option<&ContractInstanceId>,

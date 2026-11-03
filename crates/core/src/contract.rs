@@ -4945,25 +4945,72 @@ fn admit_unprompted_ops(
     });
 }
 
-/// Inbound messages only the node may deliver. A client's `ApplicationMessages`
-/// carrying one is refused: a page must not be able to tell a delegate it was
-/// installed, that the node started, or that a wake-up fired. Those messages
-/// open work the delegate would otherwise only do with the user's Background
-/// grant, and the delegate cannot tell a forged one from a real one, because
-/// neither carries an origin.
-fn carries_host_only_inbound(req: &DelegateRequest<'_>) -> bool {
+/// The first inbound message in a client's request that only the node may
+/// deliver, or `None` if every message is one a client may send.
+///
+/// A client may send `ApplicationMessage` and nothing else. Every other
+/// variant reports something the NODE did or observed: a contract's state
+/// changed (`ContractNotification`), a contract request the delegate made was
+/// answered (`Get/Put/Update/Subscribe/UnsubscribeContractResponse`), the user
+/// answered a prompt the node showed (`UserResponse`), another delegate sent a
+/// message (`DelegateMessage`), the delegate was installed or the node started
+/// (`Lifecycle`), or a wake-up fired (`WakeupFired`). A delegate cannot tell a
+/// forged one from a real one: none of them carries an origin, and delegates
+/// reasonably act on them as facts from the runtime. So a page or an
+/// unattested client that could send one could hand a delegate, for example, a
+/// contract state the contract never had.
+///
+/// An ALLOWLIST, not a list of refused variants, so a variant added to
+/// `InboundDelegateMsg` later (it is `#[non_exhaustive]`) is refused until
+/// someone decides a client may send it.
+///
+/// Every client entry point applies this: [`dispatch_delegate_request`] for a
+/// network node, and `Executor::client_delegate_request` (called by
+/// `node::run_local_node` and `Executor::handle_request`) for local mode. The
+/// unchecked inherent methods (`Executor::delegate_request`,
+/// `delegate_request_as`) are visible only inside `contract`, so code outside
+/// it cannot call them directly. `ContractExecutor::execute_delegate_request`
+/// is also unchecked; it is reached only from the contract loop's own
+/// chokepoint, below the check. The node's own
+/// deliveries (notifications, contract responses, prompts, inter-delegate
+/// hops, lifecycle runs) build their requests internally and never pass
+/// through those entry points.
+pub(crate) fn node_only_inbound(req: &DelegateRequest<'_>) -> Option<&'static str> {
     #[allow(clippy::wildcard_enum_match_arm)]
     match req {
-        DelegateRequest::ApplicationMessages { inbound, .. } => inbound.iter().any(|msg| {
-            matches!(
-                msg,
-                InboundDelegateMsg::Lifecycle(_) | InboundDelegateMsg::WakeupFired { .. }
-            )
-        }),
+        DelegateRequest::ApplicationMessages { inbound, .. } => {
+            inbound.iter().find_map(|msg| match msg {
+                InboundDelegateMsg::ApplicationMessage(_) => None,
+                InboundDelegateMsg::UserResponse(_) => Some("UserResponse"),
+                InboundDelegateMsg::GetContractResponse(_) => Some("GetContractResponse"),
+                InboundDelegateMsg::PutContractResponse(_) => Some("PutContractResponse"),
+                InboundDelegateMsg::UpdateContractResponse(_) => Some("UpdateContractResponse"),
+                InboundDelegateMsg::SubscribeContractResponse(_) => {
+                    Some("SubscribeContractResponse")
+                }
+                InboundDelegateMsg::UnsubscribeContractResponse(_) => {
+                    Some("UnsubscribeContractResponse")
+                }
+                InboundDelegateMsg::ContractNotification(_) => Some("ContractNotification"),
+                InboundDelegateMsg::DelegateMessage(_) => Some("DelegateMessage"),
+                InboundDelegateMsg::Lifecycle(_) => Some("Lifecycle"),
+                InboundDelegateMsg::WakeupFired { .. } => Some("WakeupFired"),
+                // `#[non_exhaustive]`: a future variant is refused until
+                // someone decides a client may send it.
+                _ => Some("an unrecognised inbound message"),
+            })
+        }
         // Registration requests carry no inbound messages. The wildcard is for
         // `#[non_exhaustive]`.
-        _ => false,
+        _ => None,
     }
+}
+
+/// The error a client gets when [`node_only_inbound`] refuses its request.
+pub(crate) fn node_only_inbound_error(kind: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "a client may send a delegate only ApplicationMessage; {kind} is delivered by the node"
+    )
 }
 
 /// Capability work owed once a (un)registration has SUCCEEDED. Built before
@@ -5406,26 +5453,25 @@ async fn dispatch_delegate_request<CH, P>(
 {
     let delegate_key = req.key().clone();
 
-    // Refused before exclusion or queueing: a forged host-only message must
+    // Refused before exclusion or queueing: a forged node-only message must
     // not even wait behind a park to be refused later.
-    if carries_host_only_inbound(&req) {
+    if let Some(kind) = node_only_inbound(&req) {
         if let Some(caps) = contract_handler.executor().delegate_capabilities() {
             caps.stats
-                .forged_lifecycle_refused
+                .forged_inbound_refused
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         tracing::warn!(
             delegate_key = %delegate_key,
-            "Refused a client delegate request carrying a host-only inbound message \
-             (Lifecycle or WakeupFired); only the node delivers those"
+            kind,
+            "Refused a client delegate request carrying an inbound message only the \
+             node delivers"
         );
         send_delegate_response(
             contract_handler,
             id,
             &delegate_key,
-            Err(ExecutorError::other(anyhow::anyhow!(
-                "lifecycle and wake-up messages are delivered by the node and cannot be sent by a client"
-            ))),
+            Err(ExecutorError::other(node_only_inbound_error(kind))),
         )
         .await;
         return;

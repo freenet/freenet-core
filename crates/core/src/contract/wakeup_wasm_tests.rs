@@ -495,12 +495,13 @@ async fn a_notification_run_sees_the_same_params_as_a_client_run() {
 /// does not run. Driven through the production handler and pool against a
 /// real WASM delegate.
 ///
-/// "Does not run" is observed directly: the refused request carries a
-/// `ContractNotification`, which makes the fixture record the parameters of
-/// that run in its secrets. A later matching query must still report
-/// `notified:none`. The positive control at the end sends the same message
-/// with matching parameters and sees it recorded, so the probe can detect a
-/// run.
+/// "Does not run" is observed directly: the refused request carries an
+/// `ApplicationMessage` `b"record"`, which makes the fixture record the
+/// parameters of that run in its secrets (a client may not send the
+/// `ContractNotification` that also records, `contract::node_only_inbound`).
+/// A later matching query must still report `notified:none`. The positive
+/// control at the end sends the same message with matching parameters and
+/// sees it recorded, so the probe can detect a run.
 ///
 /// FALSIFY by removing the `key_derives_from` check in
 /// `Runtime::prepare_delegate_call`: the mismatched requests then succeed and
@@ -564,13 +565,8 @@ async fn a_client_request_whose_params_do_not_derive_the_key_is_refused() {
             }
         }
     };
-    let record_run = || {
-        InboundDelegateMsg::ContractNotification(ContractNotification {
-            contract_id: ContractInstanceId::new([0x33; 32]),
-            new_state: WrappedState::new(b"s".to_vec()),
-            context: DelegateContext::default(),
-        })
-    };
+    let record_run =
+        || InboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(b"record".to_vec()));
     let ask =
         || InboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(b"params?".to_vec()));
     #[allow(clippy::wildcard_enum_match_arm)]

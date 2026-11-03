@@ -927,7 +927,11 @@ pub(crate) struct CapabilityStats {
     pub refused_delegate_ops: AtomicU64,
     pub refused_node_ops: AtomicU64,
     pub refused_contract_writes: AtomicU64,
-    pub forged_lifecycle_refused: AtomicU64,
+    /// Client delegate requests refused for carrying an inbound message only
+    /// the node may deliver (`contract::node_only_inbound`). Counted on a
+    /// network node only: local mode has no capabilities, and its refusals
+    /// (`Executor::client_delegate_request`) are logged instead.
+    pub forged_inbound_refused: AtomicU64,
 }
 
 /// See `DelegateCapabilities::recorded`.
