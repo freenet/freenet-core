@@ -158,6 +158,10 @@ impl NodeProcess {
             .env("RUST_LOG", "info")
             .env_remove("FREENET_LOG_TO_STDERR")
             .env_remove("FREENET_DISABLE_LOGS")
+            // The QUIC mode comes from the arguments alone: an inherited
+            // FREENET_TRANSPORT_QUIC would decide it for the test that runs
+            // with none.
+            .env_remove("FREENET_TRANSPORT_QUIC")
             .env_remove("FREENET_LOG_FORMAT")
             .args(["--ws-api-address", "127.0.0.1"])
             .args(["--ws-api-port", &ws_port.to_string()])
@@ -500,6 +504,7 @@ fn quic_breaker_marker_is_armed_and_cleared_by_a_clean_stop() -> anyhow::Result<
 ///
 /// FALSIFY: make `QuicMode::default_mode` return `Off`; no endpoint is built
 /// and this test fails.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn a_node_with_no_quic_setting_runs_shadow_and_arms_the_breaker() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -514,6 +519,15 @@ fn a_node_with_no_quic_setting_runs_shadow_and_arms_the_breaker() -> anyhow::Res
         node.logs().contains(QUIC_BUILT_MARKER),
         "an unset transport-quic must build the endpoint. Logs:\n{}",
         node.logs()
+    );
+    let logs = node.logs();
+    let mode_line = logs
+        .lines()
+        .find(|l| l.contains("QUIC transport mode configured"))
+        .unwrap_or_else(|| panic!("no QUIC mode line. Logs:\n{logs}"));
+    assert!(
+        mode_line.contains("Shadow") && mode_line.contains("default"),
+        "the mode line must say shadow, from the default: {mode_line}"
     );
     wait_for_armed_marker(dir.path(), &node)?;
     node.send_sigterm()?;

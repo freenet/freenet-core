@@ -1295,8 +1295,9 @@ impl P2pConnManager {
         let uptime_clock: DynTimeSource = Arc::new(InstantTimeSrc::new());
         let started_at = uptime_clock.now();
         let quic_breaker_now = uptime_clock.system_time_now();
-        // Once per node: `prefer` running as shadow, and a `quic-max-paths`
-        // that is ignored or lowered (#5940).
+        // Once per node: the configured QUIC mode and where it came from,
+        // `prefer` running as shadow, and a `quic-max-paths` that is ignored
+        // or lowered (#5940).
         crate::transport::quic::upgrade::policy::log_startup(&config.config.network_api);
 
         // The crash-loop breaker may keep QUIC off after a run with QUIC

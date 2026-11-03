@@ -88,7 +88,9 @@ pub(crate) use liveness::QuicAvailabilityWatch;
 /// detecting crashes ([`breaker`]). The default is decided when the value is
 /// read and never written to `config.toml`, so a later release can change it
 /// for every node that did not set the key, which is how a default-off
-/// release turns QUIC off.
+/// release turns QUIC off. A value given with `--transport-quic` or
+/// `FREENET_TRANSPORT_QUIC` is saved to `config.toml` like any other setting,
+/// so a node that ever ran with one keeps it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuicMode {
     /// No QUIC endpoint is built and no QUIC datagram is read. The default on
