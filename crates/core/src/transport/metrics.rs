@@ -3086,8 +3086,9 @@ pub struct TransportSnapshot {
     /// endpoint); each turns that endpoint off unless the node had already
     /// released it (#5940). Not counted: a panic in a path's receive task.
     pub quic_adapter_panicked: u64,
-    /// Times the QUIC crash-loop breaker tripped: a run with QUIC enabled
-    /// ended abnormally, so this one started with QUIC off (#5940).
+    /// Times the QUIC crash-loop breaker tripped, so this run started with
+    /// QUIC off (#5940): on unix a run with QUIC enabled ended abnormally, on
+    /// Windows three runs in a row ended within ten minutes for any reason.
     pub quic_breaker_trips: u64,
     /// Sends the QUIC socket refused with `WouldBlock` (egress cap or full
     /// socket buffer). Chiefly datagrams quinn's endpoint made on its own,
@@ -3778,8 +3779,9 @@ struct SnapshotExtras {
     /// endpoint); each turns that endpoint off unless the node had already
     /// released it (#5940). Not counted: a panic in a path's receive task.
     pub quic_adapter_panicked: u64,
-    /// Times the QUIC crash-loop breaker tripped: a run with QUIC enabled
-    /// ended abnormally, so this one started with QUIC off (#5940).
+    /// Times the QUIC crash-loop breaker tripped, so this run started with
+    /// QUIC off (#5940): on unix a run with QUIC enabled ended abnormally, on
+    /// Windows three runs in a row ended within ten minutes for any reason.
     pub quic_breaker_trips: u64,
     /// Sends the QUIC socket refused with `WouldBlock` (egress cap or full
     /// socket buffer). Chiefly datagrams quinn's endpoint made on its own,

@@ -2547,8 +2547,11 @@ pub struct NetworkArgs {
 
     /// Run QUIC even when the crash-loop breaker would keep it off.
     ///
-    /// If a run with QUIC enabled ends abnormally, the node starts with QUIC
-    /// off for 24 hours. Set this to run QUIC anyway. Default: false.
+    /// On unix, if a run with QUIC enabled ends abnormally, the node starts
+    /// with QUIC off for 24 hours. On Windows the same happens after three
+    /// short runs in a row, whatever ended them. Set this to run QUIC anyway. A
+    /// start with this set erases the trip: removing it later does not bring
+    /// the 24 hours back. Default: false.
     ///
     /// Works as a bare flag after the subcommand: `--quic-ignore-crash-breaker`
     /// turns it on, `--quic-ignore-crash-breaker=false` turns it off. Before
@@ -7179,6 +7182,23 @@ shutdown-drain-secs = 42
     /// this binary does not know its value: a crash-loop rollback reinstalls
     /// an older binary, which must neither refuse to start nor drop a value
     /// a later release wrote. An unknown value turns QUIC off.
+    /// QUIC is off by default, and Windows must stay off until its crash-loop
+    /// breaker has been confirmed on a real Windows machine (#6031). A release
+    /// that changes the default on other platforms must keep Windows off and
+    /// keep this check for it: the lib tests do not compile on Windows, and
+    /// `tests/quic_breaker_windows.rs` is the same pin through the real binary.
+    #[test]
+    fn quic_stays_off_by_default() {
+        use crate::transport::quic::QuicMode;
+        assert_eq!(QuicMode::default(), QuicMode::Off);
+        assert_eq!(QuicMode::from_config_value(None), QuicMode::Off);
+        let args = ConfigArgs::default();
+        assert_eq!(
+            QuicMode::from_config_value(args.network_api.transport_quic.as_deref()),
+            QuicMode::Off
+        );
+    }
+
     #[test]
     fn transport_quic_round_trips_and_unknown_values_are_off() {
         let unset: Config = toml::from_str(RELEASED_CONFIG_TOML).unwrap();

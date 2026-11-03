@@ -4,7 +4,13 @@
 //! to answer that, so this one does not ask: a run with QUIC enabled that
 //! lasted less than [`SHORT_RUN`] counts, whatever ended it, and
 //! [`SHORT_RUNS_TO_TRIP`] of them in a row keep QUIC off for
-//! [`QUIC_BREAKER_COOLDOWN`].
+//! [`QUIC_BREAKER_COOLDOWN`]. A run that started more than the cooldown after
+//! the one before it starts the count again, so short runs do not add up over
+//! a week.
+//!
+//! This is weaker than the unix breaker. A crash loop whose runs each last
+//! [`SHORT_RUN`] or more never trips, and neither does a fault that crashes
+//! once a day. See [`super`].
 //!
 //! # The marker
 //!
@@ -16,10 +22,13 @@
 //! - **Removed** after the run has lasted [`SHORT_RUN`], by a task registered
 //!   as [`TIMER_TASK`] ([`start_clear_timer`]), or by a clean exit
 //!   ([`super::quic_breaker_clean_exit`]). The clean exit is the update exit
-//!   (code 42 from `run_network_node`) and a Ctrl+C, and neither can be
-//!   reached by a crash.
+//!   (code 42 from `run_network_node`) and a Ctrl+C. An abort or a kill does
+//!   not reach it. A panic in the update-check task does, as on unix: the run
+//!   then ends `Ok`. The Ctrl+C path is untested in a real process on Windows:
+//!   a test would have to send the console event, which can reach the runner.
 //! - **Still there at the next start** means the last run lasted less than
-//!   [`SHORT_RUN`] and did not reach a clean exit. [`decide`] counts it.
+//!   [`SHORT_RUN`] and did not reach a clean exit. [`decide`] counts it unless
+//!   that run started the cooldown or more ago.
 //!
 //! [`decide`] is a pure function of what was read and the clock. Everything
 //! here compiles and is tested on every platform: the one thing that is
@@ -52,9 +61,17 @@
 //!
 //! - **`quic-ignore-crash-breaker`** skips the trip and the cooldown. Runs are
 //!   still counted and cleared, so once the override is removed the last run,
-//!   if it was short, trips.
+//!   if it was short, trips. A start under the override replaces a trip's
+//!   marker, so it erases the trip: removing the override does not bring the
+//!   cooldown back.
 //! - **QUIC off by config**: no marker is read or written. A marker left by an
-//!   earlier run stays and is counted when QUIC is next turned on.
+//!   earlier run stays, and is counted if QUIC is turned on again within the
+//!   cooldown of that run's start.
+//! - **Fast Startup and sleep.** Fast Startup needs no handling: this breaker
+//!   uses no boot identity, so that shutdown is a stop like any other. A laptop
+//!   suspended during a run may read as a short run, or may clear the count
+//!   early, depending on whether the timer's clock counts suspended time. That
+//!   is unverified, and it costs at most a day on UDP.
 //! - **The marker path** is the node's own data directory. The start that
 //!   reads the marker and the run that writes it are the same process type
 //!   with the same configuration, so `freenet service`, which starts
@@ -79,13 +96,16 @@
 //!   short of a trip. The preflight in `run_network` exits 43 before that when
 //!   a live node answers, so this needs that check to miss it.
 //! - **A marker left behind counts once**: a rollback to a release that does
-//!   not clear it, followed by this release again, reads it as one short run.
+//!   not clear it, followed by this release again within the cooldown, reads
+//!   it as one short run.
 //! - **Known missed trips**: a crash loop whose runs each last [`SHORT_RUN`] or
-//!   more never trips; a crash before the marker is written is not counted; a
-//!   crash in a run whose marker could not be written is not counted.
+//!   more never trips; a fault that crashes once per cooldown or less often
+//!   never trips, because the gap resets the count; a crash before the marker
+//!   is written is not counted; a crash in a run whose marker could not be
+//!   written is not counted.
 //! - **A trip that cannot be written repeats** at the next start, with QUIC off
-//!   throughout, and the cooldown does not end while that lasts. Each start
-//!   logs a WARN.
+//!   throughout, until the marker it could not replace is a cooldown old. Each
+//!   start logs a WARN.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -121,7 +141,9 @@ pub(super) struct Decision {
 }
 
 /// The whole decision, as described in the module docs. Only
-/// [`Verdict::Arm`], [`Verdict::Trip`] and [`Verdict::Cool`] come out of it.
+/// [`Verdict::Arm`], [`Verdict::Trip`] and [`Verdict::Cool`] come out of it. A
+/// run counts only if it started within the cooldown, so a clock gone back past
+/// its start and a run from long ago both start the count again.
 pub(super) fn decide(previous: &Previous, now_secs: u64, ignore_breaker: bool) -> Decision {
     let arm = |short_runs| Decision {
         verdict: Verdict::Arm,
@@ -132,7 +154,7 @@ pub(super) fn decide(previous: &Previous, now_secs: u64, ignore_breaker: bool) -
             short_runs,
             started_at_secs,
             ..
-        }) if *started_at_secs <= now_secs => {
+        }) if within_cooldown(*started_at_secs, now_secs) => {
             let short_runs = short_runs.saturating_add(1);
             if short_runs >= SHORT_RUNS_TO_TRIP && !ignore_breaker {
                 Decision {
@@ -144,7 +166,7 @@ pub(super) fn decide(previous: &Previous, now_secs: u64, ignore_breaker: bool) -
             }
         }
         Previous::Marker(Marker::Tripped { tripped_at_secs })
-            if !ignore_breaker && cooling(*tripped_at_secs, now_secs) =>
+            if !ignore_breaker && within_cooldown(*tripped_at_secs, now_secs) =>
         {
             Decision {
                 verdict: Verdict::Cool {
@@ -164,11 +186,11 @@ pub(super) fn decide(previous: &Previous, now_secs: u64, ignore_breaker: bool) -
     }
 }
 
-/// Whether a trip at `tripped_at_secs` still holds at `now_secs`. Stricter than
-/// the unix `cooling`: a trip time ahead of the clock is not honoured at all.
-fn cooling(tripped_at_secs: u64, now_secs: u64) -> bool {
-    tripped_at_secs <= now_secs
-        && now_secs < tripped_at_secs.saturating_add(QUIC_BREAKER_COOLDOWN.as_secs())
+/// Whether `at_secs` is not ahead of `now_secs` and less than a cooldown before
+/// it. Stricter than the unix `cooling`: a time ahead of the clock does not
+/// count at all.
+fn within_cooldown(at_secs: u64, now_secs: u64) -> bool {
+    at_secs <= now_secs && now_secs < at_secs.saturating_add(QUIC_BREAKER_COOLDOWN.as_secs())
 }
 
 /// The marker a decision leaves behind; `None` leaves the file as it is.
@@ -289,8 +311,15 @@ async fn clear_after_short_run(time: &impl TimeSource, path: PathBuf, nonce: u64
         // The disk can be slow on Windows; this task must not hold a worker.
         let outcome = tokio::task::spawn_blocking(move || clear_if_owned(&target, nonce)).await;
         match outcome {
-            Ok(Ok(())) => {
+            Ok(Ok(true)) => {
                 tracing::info!("The run has passed the QUIC short-run limit; the count is clear");
+                return;
+            }
+            Ok(Ok(false)) => {
+                tracing::info!(
+                    "The run has passed the QUIC short-run limit; the marker is no longer this \
+                     run's, so it stays"
+                );
                 return;
             }
             Ok(Err(error)) => tracing::warn!(
@@ -474,12 +503,63 @@ mod tests {
         assert_eq!(decide(&tripped(u64::MAX), u64::MAX, false), arm(0));
     }
 
+    /// A run counts only if it started less than a cooldown ago.
+    #[test]
+    fn a_run_from_a_cooldown_ago_starts_the_count_again() {
+        assert_eq!(
+            decide(&running(2, T0), T0 + cooldown() - 1, false).verdict,
+            Verdict::Trip,
+            "one second inside"
+        );
+        assert_eq!(decide(&running(0, T0), T0 + cooldown() - 1, false), arm(1));
+        assert_eq!(decide(&running(2, T0), T0 + cooldown(), false), arm(0));
+        assert_eq!(decide(&running(2, T0), T0 + 30 * cooldown(), false), arm(0));
+        assert_eq!(decide(&running(2, T0), T0 + cooldown(), true), arm(0));
+    }
+
+    /// Three short sessions a week apart never trip, and neither does a crash
+    /// once a day. Two a day are close enough to add up.
+    #[test]
+    fn short_runs_do_not_add_up_across_gaps_of_a_cooldown() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = marker_path(dir.path());
+        for gap in [7 * cooldown(), cooldown()] {
+            for run in 0..10 {
+                let now = T0 + run * gap;
+                assert_eq!(
+                    start(&path, now, false),
+                    Verdict::Arm,
+                    "gap {gap} run {run}"
+                );
+                assert_eq!(read_previous(&path), running(0, now));
+            }
+            std::fs::remove_file(&path).unwrap();
+        }
+
+        let half_a_day = cooldown() / 2;
+        for run in 0..SHORT_RUNS_TO_TRIP {
+            let now = T0 + u64::from(run) * half_a_day;
+            assert_eq!(start(&path, now, false), Verdict::Arm);
+        }
+        let now = T0 + u64::from(SHORT_RUNS_TO_TRIP) * half_a_day;
+        assert_eq!(start(&path, now, false), Verdict::Trip);
+    }
+
     /// The override skips the trip and the cooldown, and the count goes on.
     #[test]
     fn the_override_runs_quic_and_keeps_counting() {
         assert_eq!(decide(&running(2, T0), T0, true), arm(3));
         assert_eq!(decide(&running(9, T0), T0, true), arm(10));
         assert_eq!(decide(&tripped(T0), T0, true), arm(0));
+        assert_eq!(
+            marker_after(decide(&tripped(T0), T0, true), T0, NONCE),
+            Some(Marker::ShortRuns {
+                short_runs: 0,
+                started_at_secs: T0,
+                nonce: NONCE,
+            }),
+            "the override's start replaces the trip, so the trip is gone"
+        );
         assert_eq!(
             decide(&running(3, T0), T0, false).verdict,
             Verdict::Trip,
