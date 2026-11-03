@@ -78,11 +78,32 @@ check "flags the run step that recompiled Simulation" "$RC" "1"
 check "names test_simulation's compile commands" \
     "$(grep -cF "job \`test_simulation\`: compile commands" <<<"$OUT")" "1"
 
-# Wiring: Rule Lint runs both the self-test and the real-file check.
-check "Rule Lint runs the linter self-test" \
-    "$(grep -c 'python3 .github/scripts/check_cache_warm_parity.py --self-test$' "$CI_YML")" "1"
-check "Rule Lint runs the linter on the real files" \
-    "$(grep -c 'python3 .github/scripts/check_cache_warm_parity.py .github/workflows/ci.yml .github/workflows/ci-cache-warm.yml$' "$CI_YML")" "1"
+# Wiring: Rule Lint runs both the self-test and the real-file check, as live
+# steps that can fail the job. Parsed with the linter's own YAML helpers rather
+# than grepped, so a commented-out step, an `if:` or `continue-on-error` on it,
+# or the command moving to another job all fail here.
+WIRING=$(python3 - "$LINTER" "$CI_YML" <<'PY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("parity", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+job = m.extract_job(open(sys.argv[2]).read(), "rule_lint") or []
+want = {
+    "python3 .github/scripts/check_cache_warm_parity.py --self-test": "self-test",
+    "python3 .github/scripts/check_cache_warm_parity.py .github/workflows/ci.yml "
+    ".github/workflows/ci-cache-warm.yml": "real-files",
+}
+live = set()
+for step in m._steps(job):
+    run, _ = m._step_key(step, "run")
+    gated = any(m._step_key(step, k)[0] is not None for k in ("if", "continue-on-error"))
+    if run in want and not gated:
+        live.add(want[run])
+print(" ".join(sorted(live)))
+PY
+)
+check "Rule Lint runs the self-test and the real-file check as live steps" \
+    "$WIRING" "real-files self-test"
 
 # --- the release pre-flight --------------------------------------------------
 
@@ -91,7 +112,7 @@ check "Rule Lint runs the linter on the real files" \
 extract_jq() {
     # extract_jq <variable name>
     grep -E "^[[:space:]]*$1=\\$\\(echo \"\\\$check_runs_json\" \\| jq '" "$RELEASE_SH" \
-        | sed -E "s/^.*\\| jq '(.*)'\\)\$/\\1/"
+        | sed -E "s/^.*\\| jq '(.*)'\\)\$/\\1/" || true
 }
 IN_PROGRESS_JQ=$(extract_jq in_progress_count)
 FAILED_JQ=$(extract_jq failed_count)
@@ -112,7 +133,7 @@ check "pre-flight ignores in-progress warm runs but not Clippy" \
 check "pre-flight ignores a failed warm run but not a failed test job" \
     "$(jq "$FAILED_JQ" "$TEST_TMP/runs.json")" "1"
 check "pre-flight asks for 100 check runs per page" \
-    "$(grep -c 'commits/main/check-runs?per_page=100' "$RELEASE_SH")" "1"
+    "$(grep -cE '^[[:space:]]*check_runs_json=\$\(gh api "repos/freenet/freenet-core/commits/main/check-runs\?per_page=100"' "$RELEASE_SH" || true)" "1"
 
 if [[ $FAILURES -gt 0 ]]; then
     echo "$FAILURES check(s) failed" >&2
