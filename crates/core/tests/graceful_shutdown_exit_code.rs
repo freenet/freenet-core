@@ -493,6 +493,40 @@ fn quic_breaker_marker_is_armed_and_cleared_by_a_clean_stop() -> anyhow::Result<
     Ok(())
 }
 
+/// With no `transport-quic` flag, key or environment variable, the binary
+/// builds a QUIC endpoint and arms the breaker: shadow is the default on Linux
+/// and macOS. Every other test here sets the mode, so this is the one that sees
+/// what a node that never set it runs.
+///
+/// FALSIFY: make `QuicMode::default_mode` return `Off`; no endpoint is built
+/// and this test fails.
+#[test]
+fn a_node_with_no_quic_setting_runs_shadow_and_arms_the_breaker() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let log_dir = dir.path().join("logs");
+    std::fs::create_dir_all(&log_dir)?;
+    let mut node = NodeProcess::spawn_full(dir.path(), &log_dir, &[], None)?;
+    node.wait_for_logs(
+        &[READY_MARKER, TRANSPORT_BOUND_MARKER],
+        Duration::from_secs(120),
+    )?;
+    assert!(
+        node.logs().contains(QUIC_BUILT_MARKER),
+        "an unset transport-quic must build the endpoint. Logs:\n{}",
+        node.logs()
+    );
+    wait_for_armed_marker(dir.path(), &node)?;
+    node.send_sigterm()?;
+    let status = node.wait_for_exit(Duration::from_secs(45))?;
+    assert_eq!(status.code(), Some(0), "Logs:\n{}", node.logs());
+    assert_eq!(
+        read_quic_marker(dir.path())?,
+        None,
+        "a clean stop clears the marker"
+    );
+    Ok(())
+}
+
 /// (c) A node with QUIC enabled that is SIGKILLed trips the breaker: the next
 /// start records the trip, warns, and runs with QUIC off. A clean stop of that
 /// run leaves the trip in place, the start after it is still inside the

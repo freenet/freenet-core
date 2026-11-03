@@ -897,7 +897,8 @@ NOT covered by the reassembly allowance: they come on top of it, the send
 window is outbound, and quinn's own per-connection state is unbounded by
 the windows. That memory (measurements of some of its terms, and a list of
 what was not measured, are in `quic/config.rs`) is not accounted in the
-aggregate and must be before QUIC is on by default. A node-wide share
+aggregate and must be before QUIC carries data by default (Step 3 at
+100%; shadow paths, on by default since Step 2, carry none). A node-wide share
 and fairness between connections are deferred to the transport redesign. Do
 not copy this shape for memory the node holds on its own initiative.
 

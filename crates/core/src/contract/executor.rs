@@ -2930,16 +2930,16 @@ mod tests {
             // MAX_STREAM_TOTAL_BYTES row). The memory one QUIC connection
             // holds (some of its terms are measured in quic::config) is NOT
             // accounted in this aggregate,
-            // and must be before QUIC is on by default (a gate in the #5940
-            // rollout plan). It is in addition to reassembly, not covered by
+            // and must be before QUIC carries data by default (Step 3 at 100%,
+            // a gate in the #5940 rollout plan; shadow paths carry none). It is in addition to reassembly, not covered by
             // it.
             (
                 "connection_window_bytes",
                 "one QUIC connection's flow-control window W: a per-connection \
                  exception like MAX_STREAM_TOTAL_BYTES; quinn holds received data \
                  beyond W and state W does not limit (measured terms in \
-                 quic::config); not accounted here, and must be before QUIC is on \
-                 by default",
+                 quic::config); not accounted here, and must be before QUIC \
+                 carries data by default",
             ),
             (
                 "MIN_WINDOW_BYTES",

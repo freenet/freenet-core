@@ -334,7 +334,7 @@ impl Default for ConfigArgs {
                 ledbat_min_ssthresh: None, // Uses default from NetworkApiConfig
                 congestion_control: None,  // Default: fixedrate (set in NetworkApiConfig)
                 bbr_startup_rate: None,    // Uses default from BBR config
-                transport_quic: None,      // Default: shadow, off on Windows
+                transport_quic: None,      // Default: shadow on Linux and macOS
                 quic_max_paths: None,      // Default: max-number-of-connections
                 quic_data_percent: None,   // Default: this release's share of pairs
                 quic_ignore_crash_breaker: None,
@@ -2494,7 +2494,7 @@ pub struct NetworkArgs {
     pub bbr_startup_rate: Option<u64>,
 
     /// QUIC transport (#5940): `off`, `shadow` or `prefer`. Unset means
-    /// `shadow`, except on Windows, where it means `off`.
+    /// `shadow` on Linux and macOS, and `off` elsewhere, Windows included.
     ///
     /// `shadow` builds a QUIC endpoint on the network port and upgrades
     /// connections to peers that also run it to a QUIC path. The path carries
@@ -2836,7 +2836,7 @@ pub struct NetworkApiConfig {
     pub bbr_startup_rate: Option<u64>,
 
     /// QUIC transport (#5940): `off`, `shadow` or `prefer`; unset reads as
-    /// `QuicMode::default_mode` (shadow, off on Windows). Kept as written, so a value from a later release
+    /// `QuicMode::default_mode` (shadow on Linux and macOS). Kept as written, so a value from a later release
     /// round-trips; see [`Self::quic_settings`] for how it is read.
     #[serde(
         default,
@@ -2920,8 +2920,9 @@ impl NetworkApiConfig {
     }
 
     /// The QUIC endpoint settings when `transport-quic` turns QUIC on, or
-    /// `None` when it is off, unset or a value this binary does not know
-    /// (which logs a warning). Reads the node's memory limit, since the
+    /// `None` when it reads as off: set to `off`, unset on a platform whose
+    /// default is off, or a value this binary does not know (which logs a
+    /// warning). Reads the node's memory limit, since the
     /// endpoint's flow-control windows are sized from it.
     pub(crate) fn quic_settings(&self) -> Option<crate::transport::quic::QuicSettings> {
         use crate::transport::quic::QuicMode;
@@ -7190,10 +7191,10 @@ shutdown-drain-secs = 42
     #[test]
     fn quic_is_shadow_by_default_except_on_windows() {
         use crate::transport::quic::QuicMode;
-        let expected = if cfg!(windows) {
-            QuicMode::Off
-        } else {
+        let expected = if cfg!(any(target_os = "linux", target_os = "macos")) {
             QuicMode::Shadow
+        } else {
+            QuicMode::Off
         };
         assert_eq!(QuicMode::default(), expected);
         assert_eq!(QuicMode::from_config_value(None), expected);
@@ -7220,8 +7221,8 @@ shutdown-drain-secs = 42
         assert_eq!(unset.network_api.transport_quic, None);
         assert_eq!(
             unset.network_api.quic_settings().is_some(),
-            crate::transport::quic::QuicMode::default_mode().builds_endpoint(),
-            "an unset key follows the platform default"
+            cfg!(any(target_os = "linux", target_os = "macos")),
+            "an unset key builds an endpoint on Linux and macOS only"
         );
         assert!(
             !toml::to_string(&unset).unwrap().contains("transport-quic"),

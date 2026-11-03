@@ -2004,8 +2004,9 @@ impl SimNetwork {
     }
 
     /// Sets `transport-quic` to `value`, as `config.toml` would (`"off"`,
-    /// `"shadow"`, `"prefer"`), on every node. Unset (off) by default. Call before the
-    /// simulation starts.
+    /// `"shadow"`, `"prefer"`), on every node. Without this call the harness
+    /// writes `off`, whatever the node default is. Call before the simulation
+    /// starts.
     ///
     /// # Panics
     /// On a value this binary does not know. A node would read it as off

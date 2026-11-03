@@ -353,8 +353,9 @@ impl QuicSettings {
 /// `contract::executor::declared_cache_ceiling` (see the "Recorded
 /// exception: inbound stream reassembly" note in
 /// `.claude/rules/bug-prevention-patterns.md`). That memory is NOT
-/// accounted in the node aggregate, and must be before QUIC is on by
-/// default (the rollout plan records that gate).
+/// accounted in the node aggregate, and must be before QUIC carries data by
+/// default (Step 3 at 100%; the rollout plan records that gate). Shadow
+/// paths, the default since Step 2, carry none.
 ///
 /// [`MAX_INBOUND_STREAM_BYTES_PER_CONNECTION`]: crate::transport::peer_connection::streaming::MAX_INBOUND_STREAM_BYTES_PER_CONNECTION
 pub(crate) fn connection_window_bytes(memory_limit: usize, max_connections: usize) -> u64 {

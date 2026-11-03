@@ -184,7 +184,8 @@ pub async fn base_node_test_config_with_rng<R: Rng>(
             ledbat_min_ssthresh: None,
             congestion_control: None,
             bbr_startup_rate: None,
-            transport_quic: None,
+            // Off whatever the node default is: these tests are not about QUIC.
+            transport_quic: Some("off".to_string()),
             quic_max_paths: None,
             quic_data_percent: None,
             quic_ignore_crash_breaker: None,

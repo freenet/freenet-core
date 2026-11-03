@@ -280,6 +280,11 @@ fn configured_mode(config: &NetworkApiConfig) -> QuicMode {
 /// configuration (`QuicEndpoint::bind` refuses), and only that is reported
 /// (WARN).
 pub(crate) fn log_startup(config: &NetworkApiConfig) {
+    tracing::info!(
+        mode = ?configured_mode(config),
+        source = if config.transport_quic.is_some() { "configured" } else { "default" },
+        "QUIC transport mode"
+    );
     if configured_mode(config) != QuicMode::Off && !crate::transport::quic::UNWINDS {
         tracing::warn!(
             transport_quic = ?config.transport_quic,

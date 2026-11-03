@@ -885,7 +885,8 @@ it must not wait unless it is a pacing point.
 #### QUIC endpoint (`transport/quic.rs`, #5940 step c2)
 
 `transport-quic` (config key: `off`, `shadow` or `prefer`; unset is
-`QuicMode::default_mode`, shadow, and off on Windows) decides whether `bind_udp_listener` builds a quinn endpoint over the DemuxSocket.
+`QuicMode::default_mode`, shadow on Linux and macOS and off elsewhere, since
+the breaker cannot trip without a boot identity) decides whether `bind_udp_listener` builds a quinn endpoint over the DemuxSocket.
 `prefer` negotiates data with the release's share of pairs ("Data slice" below;
 `upgrade::policy::log_startup` reports the share at INFO once per node). No code
 sends data on a path yet, so `prefer` differs from `shadow` only by that bit. The
@@ -1246,8 +1247,10 @@ orders other than a single gap at offset 0. Some quinn terms depend on
 traffic rate and time rather than configuration, as the UDP transport's
 dedup window and sent-packet tracker do, so the per-path ceiling (memory
 gate M2, #5940) cannot be the sum of these measurements alone. This
-memory is NOT accounted in the node aggregate and must be before QUIC is on
-by default (rollout gate). The fixed
+memory is NOT accounted in the node aggregate and must be before QUIC carries
+data by default (Step 3 at 100%, rollout gate; Ian, 2026-11-03: shadow being
+the default does not trigger it, and Step 2's gate watches RSS against
+`quic_paths_active`). The fixed
 node-wide endpoint buffers are summed whatever `transport-quic` says:
 `INCOMING_BUFFER_TOTAL_BYTES` (quinn's pending attempts) and
 `QUIC_INGRESS_QUEUE_BYTES`.
@@ -1333,7 +1336,7 @@ every rate), endpoint-down, panics and breaker trips, RSS against
   stays near 0 and UDP metrics do not change.
 - Step 1: nova gateways and framework in shadow for 24-48 h. The 24 h gateway
   A/B runs only if something looks odd. Rollback: set the key to off and restart.
-- Step 2: shadow on by default, not on Windows (`QuicMode::default_mode`). Gate: at least 95% upgrade
+- Step 2: shadow on by default on Linux and macOS (`QuicMode::default_mode`). Gate: at least 95% upgrade
   success by `established_as_offerer / accepted`; fewer than 1 fallback per
   path-day excluding endpoint and restart causes; memory within the measured
   terms (about 0.3 to 0.5 MiB per idle path). An abort spike stops the step.
@@ -1796,8 +1799,10 @@ QUIC receive flow (#5940 e5b-4):
 
 #### QUIC errors, close codes and liveness (`quic/error.rs`, `quic/liveness.rs`, #5940 step e4)
 
-Dead code in production while QUIC carries no traffic: with `transport-quic`
-off no endpoint is built and the transport reports `Disabled`.
+Live in production on Linux and macOS, where shadow is the default: the
+paths carry control frames only, but endpoints, connections and their errors
+are real. With `transport-quic` off no endpoint is built and the transport
+reports `Disabled`.
 
 ```
 Errors: TransportError::Quic(QuicError), beside TransportError::Udp and
