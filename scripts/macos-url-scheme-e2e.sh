@@ -154,14 +154,17 @@ load_agent() {
     fail "could not load the Launch-at-Login agent: $error"
 }
 
-# LaunchServices can still be tracking an instance that was just stopped, and
-# `open` then fails with -600 before the link reaches any of our code. That is
-# the click failing to happen, so repeat it. The checks that the link was
-# handled are what this test is for, and they stay as they are.
+# `open` has failed with LaunchServices error -600 (no such process) once in CI,
+# right after the previous instance was stopped, when LaunchServices can still
+# be tracking it. It could also mean a duplicate launch exited before taking
+# the link, which would be a lost link, so every repeat is logged where a
+# reader of the CI log will see it (#5956). Any other error fails at once.
 click_link() {
-    local error=""
-    for _ in $(seq 1 5); do
+    local attempt error=""
+    for attempt in 1 2 3 4 5; do
         error="$(open "$1" 2>&1)" && return 0
+        [[ "$error" == *"-600"* ]] || break
+        echo "note - open failed with -600 on attempt $attempt, repeating the click" >&2
         sleep 1
     done
     fail "open could not deliver $1: $error"
