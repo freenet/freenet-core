@@ -6309,10 +6309,12 @@ pub async fn run_local_node(
                 // ATTESTED application identity (GHSA-824h-7x5x-wfmf). It comes
                 // from the connection layer on the same forge-proof channel as
                 // `origin_contract` and `user_context`.
-                executor.delegate_request(
+                //
+                // `client_delegate_request` refuses node-only inbound messages
+                // (`contract::node_only_inbound`), as the network node does.
+                executor.client_delegate_request(
                     op,
                     origin_contract.as_ref(),
-                    None,
                     connection_scope,
                     user_context.as_ref(),
                 )

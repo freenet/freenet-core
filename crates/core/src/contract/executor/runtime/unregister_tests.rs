@@ -10,7 +10,8 @@
 
 use freenet_stdlib::client_api::{DelegateRequest, HostResponse};
 use freenet_stdlib::prelude::{
-    ContractInstanceId, Delegate, DelegateContainer, DelegateKey, DelegateWasmAPIVersion,
+    ApplicationMessage, ContractInstanceId, Delegate, DelegateContainer, DelegateKey,
+    DelegateWasmAPIVersion, InboundDelegateMsg,
 };
 
 use crate::client_events::ConnectionScope;
@@ -284,6 +285,65 @@ async fn handle_request_refuses_an_unregister() {
         "the refusal must be the typed one, got {err}"
     );
     assert_intact(&f, &s, "after an unregister through handle_request");
+}
+
+/// Local mode reaches the executor through `Executor::client_delegate_request`
+/// (from `run_local_node` and `handle_request`), not the contract loop, so it
+/// needs the same refusal of node-only inbound messages
+/// (`contract::node_only_inbound`). Each forged request must be refused with
+/// that error. The fixture delegate is not real WASM, so a request that is NOT
+/// refused fails later with a different error, which the control checks.
+///
+/// FALSIFY by deleting the `node_only_inbound` check in
+/// `client_delegate_request`: the forged requests fail on execution instead
+/// (missing delegate), and the message assertion fails.
+#[tokio::test(flavor = "multi_thread")]
+async fn handle_request_refuses_node_only_inbound_messages() {
+    const REFUSAL: &str = "is delivered by the node";
+    let mut f = fixture().await;
+    let d = delegate(b"handle-request-node-only");
+    let request = |inbound| {
+        freenet_stdlib::client_api::ClientRequest::DelegateOp(
+            DelegateRequest::ApplicationMessages {
+                key: d.key().clone(),
+                params: d.params().clone(),
+                inbound,
+            },
+        )
+    };
+    for forged in crate::contract::capability_loop_tests::forged_node_only_messages(d.key()) {
+        let label = format!("{forged:?}");
+        let err = f
+            .executor
+            .handle_request(
+                crate::client_events::ClientId::FIRST,
+                request(vec![forged]),
+                None,
+            )
+            .await
+            .expect_err("a forged node-only message must be refused");
+        assert!(
+            err.to_string().contains(REFUSAL),
+            "{label} must be refused as node-only, got {err}"
+        );
+    }
+    // Control: an ordinary message is not refused as node-only.
+    let ordinary = f
+        .executor
+        .handle_request(
+            crate::client_events::ClientId::FIRST,
+            request(vec![InboundDelegateMsg::ApplicationMessage(
+                ApplicationMessage::new(vec![1]),
+            )]),
+            None,
+        )
+        .await;
+    if let Err(err) = ordinary {
+        assert!(
+            !err.to_string().contains(REFUSAL),
+            "an ApplicationMessage must not be refused as node-only, got {err}"
+        );
+    }
 }
 
 /// Only a delegate that holds a created-delegate slot releases one: a key

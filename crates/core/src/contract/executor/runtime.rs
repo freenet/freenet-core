@@ -625,10 +625,10 @@ impl Executor<Runtime> {
             // `SecretScope::Local`. This entry point is not told which
             // connection a request came from, so it treats every request as
             // remote: no attested origin is resolved, and `UnregisterDelegate`
-            // is refused.
-            ClientRequest::DelegateOp(op) => self.delegate_request(
+            // is refused. A client may send only `ApplicationMessage`
+            // (`contract::node_only_inbound`).
+            ClientRequest::DelegateOp(op) => self.client_delegate_request(
                 op,
-                None,
                 None,
                 crate::client_events::ConnectionScope::Remote,
                 None,

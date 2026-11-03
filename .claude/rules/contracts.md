@@ -61,8 +61,16 @@ delivered only when the manifest lists the kind AND a bound app holds the
 user's Background grant; both are re-checked at delivery
 (contract::delegate_capabilities::delivery_params).
 
-A client may not send host-only inbound messages (Lifecycle, WakeupFired):
-dispatch_delegate_request refuses them before exclusion or queueing.
+A client may send a delegate ONLY InboundDelegateMsg::ApplicationMessage.
+Every other variant (contract notifications and responses, UserResponse,
+DelegateMessage, Lifecycle, WakeupFired) reports something only the node can
+know and carries no origin, so a forged one is indistinguishable from a real
+one. contract::node_only_inbound is an allowlist (a new variant is refused
+until someone decides otherwise), applied at EVERY client entry point:
+dispatch_delegate_request (before exclusion or queueing), and
+Executor::client_delegate_request for local mode (run_local_node,
+Executor::handle_request). Node deliveries build their requests internally and
+never pass those entry points; a new client entry point must call it too.
 
 Grants are per app (the web app's ContractInstanceId, attested only for LOCAL
 connections) and remembered; the prompt is node-authored (PromptAuthor::Node,

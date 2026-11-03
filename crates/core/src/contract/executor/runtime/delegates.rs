@@ -176,6 +176,34 @@ impl Executor<Runtime> {
         }
     }
 
+    /// A delegate request straight from a client in local mode
+    /// (`node::run_local_node`, [`Executor::handle_request`]): refuses a
+    /// request carrying an inbound message only the node may deliver
+    /// (`contract::node_only_inbound`), then runs it with no caller delegate.
+    /// A network node applies the same refusal in the contract loop's
+    /// `dispatch_delegate_request`. Never use this for a node-built request:
+    /// those carry node-only messages by design.
+    pub fn client_delegate_request(
+        &mut self,
+        req: DelegateRequest<'_>,
+        origin_contract: Option<&ContractInstanceId>,
+        connection_scope: crate::client_events::ConnectionScope,
+        user_context: Option<&UserSecretContext>,
+    ) -> Response {
+        if let Some(kind) = crate::contract::node_only_inbound(&req) {
+            tracing::warn!(
+                delegate_key = %req.key(),
+                kind,
+                "Refused a client delegate request carrying an inbound message only the \
+                 node delivers"
+            );
+            return Err(ExecutorError::other(
+                crate::contract::node_only_inbound_error(kind),
+            ));
+        }
+        self.delegate_request(req, origin_contract, None, connection_scope, user_context)
+    }
+
     pub fn delegate_request(
         &mut self,
         req: DelegateRequest<'_>,
