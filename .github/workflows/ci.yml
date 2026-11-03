@@ -1119,7 +1119,10 @@ jobs:
       # And through LaunchServices: build an unsigned Freenet.app with the real
       # package-macos.sh, register it, click links with `open`, and check the
       # menu-bar wrapper handled them, including the instance launchd starts at
-      # login. The app starts a real node, so this rebuilds the binary with
+      # login. It also checks that the menu bar icon is really on screen, which
+      # needs macOS 26 or later to mean anything (#6093), and that Launch at
+      # Login registers and repairs old agents. The app starts a real node, so
+      # this rebuilds the binary with
       # FREENET_GIT_IS_DIRTY=1 (auto-update off; only the freenet crate
       # recompiles): otherwise a release newer than this branch would make
       # the node exit 42 and the DMG-swap updater replace the test bundle

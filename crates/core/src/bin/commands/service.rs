@@ -1172,6 +1172,8 @@ mod tests {
             argv(&["/Users/me/work.app/target/debug/freenet-bin"]),
             argv(&["/Applications/Freenet.app/freenet-bin"]),
             argv(&["/Applications/Freenet/Contents/MacOS/freenet-bin"]),
+            argv(&["/Applications/Freenet.app/Contents/Resources/freenet-bin"]),
+            argv(&["/Applications/Freenet.app/Other/MacOS/freenet-bin"]),
             argv(&[bundled, "--version"]),
             argv(&[bundled, "network"]),
             argv(&[bundled, "service", "run-wrapper"]),

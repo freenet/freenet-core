@@ -133,7 +133,7 @@ echo ">> Writing launchd target for older Launch at Login agents"
 # Not the bundle's executable. LaunchAgents written by earlier releases run this
 # path, and only a running new version repairs them, so without it a Mac whose
 # relaunch failed after an auto-update would not start Freenet at login either.
-# launchd is not affected by the exec problem above.
+# launchd is not affected by the exec problem above. Removal is tracked in #6099.
 cat > "$APP_DIR/Contents/MacOS/Freenet" <<'SH'
 #!/bin/bash
 DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -250,7 +250,11 @@ if [[ "$CREATE_DMG" == "true" ]]; then
         hdiutil attach -nobrowse -readonly -mountpoint "$DMG_MOUNT" "$DMG_PATH" > /dev/null
         verified=true
         codesign --verify --deep --strict --verbose=2 "$DMG_MOUNT/Freenet.app" || verified=false
-        hdiutil detach "$DMG_MOUNT" > /dev/null
+        # Forced because the image is read-only, so no data is at risk, and a
+        # busy detach must not fail a release whose DMG just passed the check.
+        hdiutil detach -force "$DMG_MOUNT" > /dev/null \
+            || echo "package-macos.sh: could not detach $DMG_MOUNT" >&2
+        rmdir "$DMG_MOUNT" 2>/dev/null || true
         if [[ "$verified" != "true" ]]; then
             echo "package-macos.sh: Freenet.app in the DMG fails verification" >&2
             exit 1

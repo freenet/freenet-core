@@ -1,14 +1,25 @@
 #!/bin/bash
-# End-to-end check of the freenet:// scheme handler on macOS (#5726).
+# End-to-end check of Freenet.app on macOS: starting it, its menu bar icon,
+# Launch at Login, and the freenet:// scheme handler (#5726, #6093).
 #
 # Builds an unsigned single-architecture Freenet.app with the real
 # package-macos.sh, registers it with LaunchServices, and checks that:
 #   1. Info.plist declares the freenet URL scheme;
 #   2. LaunchServices resolves freenet:// links to this bundle;
+#   2b. a fresh install starts through LaunchServices;
+#   2c. its menu bar icon is really on screen, and it registers a
+#      Launch-at-Login agent;
+#   2d. an agent from before #6093 still starts the app with an icon, and is
+#      repaired without the wrapper killing itself;
 #   3. `open freenet://...` launches the app and the menu-bar wrapper
 #      handles the link (its log records the outcome), for a valid link and
 #      an invalid one, and that a second link reaches the RUNNING instance
-#      rather than a second copy.
+#      rather than a second copy;
+#   4. launchd's wrapper, started from the repaired agent, shows the icon and
+#      receives links.
+#
+# The icon checks only prove anything on macOS 26 or later, so it fails on
+# anything older.
 #
 # Usage: scripts/macos-url-scheme-e2e.sh <path-to-freenet-binary>
 # Runs on a macOS CI runner. It launches Freenet.app (which starts a node)
@@ -133,6 +144,15 @@ stop_app() {
     fail "the app did not stop"
 }
 
+# launchd can briefly refuse a label it is still tearing down after a bootout.
+load_agent() {
+    for _ in $(seq 1 10); do
+        launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null && return 0
+        sleep 1
+    done
+    fail "could not load the Launch-at-Login agent"
+}
+
 wait_for_status_item_count_above() {
     # A first launch of a debug build on a busy runner can take a while.
     for _ in $(seq 1 60); do
@@ -145,8 +165,11 @@ wait_for_status_item_count_above() {
 # The item that appeared was Freenet's: it goes when Freenet goes. Without this
 # anything else adding a status item on the runner would satisfy the check.
 wait_for_status_item_count_back_to() {
+    local count
     for _ in $(seq 1 15); do
-        [[ "$("$OUT/status-item-count")" -le "$1" ]] && return 0
+        # An empty count would compare as zero, so a failed helper must not pass.
+        count="$("$OUT/status-item-count")" || return 1
+        [[ -n "$count" && "$count" -le "$1" ]] && return 0
         sleep 1
     done
     return 1
@@ -221,7 +244,7 @@ cat > "$PLIST" <<XML
 <key>ProcessType</key><string>Interactive</string>
 </dict></plist>
 XML
-launchctl bootstrap "gui/$(id -u)" "$PLIST" || fail "could not load the old Launch-at-Login agent"
+load_agent
 wait_for_status_item_count_above "$status_items_before" \
     || fail "the menu bar icon is not displayed when an old agent starts the app"
 migrated=false
@@ -309,20 +332,25 @@ echo "ok - a second link reaches the running instance, and a hostile one is refu
 stop_app
 wait_for_status_item_count_back_to "$status_items_before" \
     || fail "the status item outlived the app"
-launchctl bootstrap "gui/$(id -u)" "$PLIST" || fail "could not start the Launch-at-Login agent"
+load_agent
+# Nothing else can be running here, so the icon is launchd's wrapper's.
+wait_for_status_item_count_above "$status_items_before" \
+    || fail "the menu bar icon is not displayed when launchd starts the app"
+pgrep -f 'Freenet.app/Contents/MacOS/freenet-bin service run-wrapper$' >/dev/null \
+    || fail "the icon appeared but launchd's wrapper is not running"
+echo "ok - the menu bar icon is displayed when launchd starts the app"
+stop_app
+wait_for_status_item_count_back_to "$status_items_before" \
+    || fail "the status item outlived the app"
+launchctl bootout "$AGENT" >/dev/null 2>&1 || true
+
+load_agent
 # Click at once, without waiting for the new wrapper to settle: the link must
 # be handled whether LaunchServices already sees the launchd-started instance
-# or launches a duplicate for it (which handles it and exits).
+# or launches a duplicate for it, and either copy may win the lock.
 open "freenet://$RIVER/"
 wait_for_count 3 || fail "the launchd-started instance never handled the link"
 echo "ok - a link reaches the instance launchd started (as at login)"
-wait_for_status_item_count_above "$status_items_before" \
-    || fail "the menu bar icon is not displayed when launchd starts the app"
-# launchd's copy, not a duplicate LaunchServices launched for the link, whose
-# command line has no subcommand.
-pgrep -f 'Freenet.app/Contents/MacOS/freenet-bin service run-wrapper$' >/dev/null \
-    || fail "launchd's wrapper is not the one running"
-echo "ok - the menu bar icon is displayed when launchd starts the app"
 launchctl bootout "$AGENT" >/dev/null 2>&1 || true
 
 echo "All macOS freenet:// checks passed."

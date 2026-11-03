@@ -439,10 +439,19 @@ fn build_allowed_hosts(
     port: u16,
     extra_allowed_hosts: &[String],
 ) -> HashSet<String> {
+    build_allowed_hosts_with(bind_addr, port, extra_allowed_hosts, resolve_hostname_ips)
+}
+
+fn build_allowed_hosts_with(
+    bind_addr: IpAddr,
+    port: u16,
+    extra_allowed_hosts: &[String],
+    resolve: impl FnOnce(&str, u16) -> Vec<IpAddr>,
+) -> HashSet<String> {
     let mut hosts = HostAllowlistBuilder::new(port);
 
     hosts.add_localhost();
-    hosts.add_machine_hostname(bind_addr);
+    hosts.add_machine_hostname(bind_addr, resolve);
 
     if !bind_addr.is_unspecified() {
         // Bracket IPv6 literals. A `Host` header carries `[::1]:7509`, never
@@ -490,13 +499,17 @@ impl HostAllowlistBuilder {
         self.add("[::1]");
     }
 
-    fn add_machine_hostname(&mut self, bind_addr: IpAddr) {
+    fn add_machine_hostname(
+        &mut self,
+        bind_addr: IpAddr,
+        resolve: impl FnOnce(&str, u16) -> Vec<IpAddr>,
+    ) {
         let Ok(name) = hostname::get() else { return };
         let Some(name_str) = name.to_str() else {
             return;
         };
 
-        self.add_hostname(name_str, bind_addr, resolve_hostname_ips);
+        self.add_hostname(name_str, bind_addr, resolve);
     }
 
     fn add_hostname(
@@ -922,6 +935,16 @@ mod tests {
         let hosts = hosts.build();
         assert!(hosts.contains("myhost"));
         assert!(hosts.contains("myhost:7509"));
+    }
+
+    #[test]
+    fn the_allowlist_passes_the_real_bind_address_to_the_hostname_check() {
+        // Through the same function production uses, so that passing the wrong
+        // address, or dropping the guard's input, fails here.
+        let hosts = build_allowed_hosts_with(IpAddr::V4(Ipv4Addr::LOCALHOST), 7509, &[], |_, _| {
+            panic!("a loopback bind must not resolve the hostname")
+        });
+        assert!(hosts.contains("localhost"));
     }
 
     #[test]
