@@ -60,8 +60,9 @@
 //! # Other inputs
 //!
 //! - **`quic-ignore-crash-breaker`** skips the trip and the cooldown. Runs are
-//!   still counted and cleared, so once the override is removed the last run,
-//!   if it was short, trips. A start under the override replaces a trip's
+//!   still counted and cleared, so the count stands when the override is
+//!   removed and a start then trips if it has reached the limit. A start under
+//!   the override replaces a trip's
 //!   marker, so it erases the trip: removing the override does not bring the
 //!   cooldown back.
 //! - **QUIC off by config**: no marker is read or written. A marker left by an

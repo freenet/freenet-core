@@ -7176,12 +7176,6 @@ shutdown-drain-secs = 42
         assert_seeded_values_bound(&cfg);
     }
 
-    /// `transport-quic` (#5940) is read from `config.toml` in kebab-case, is
-    /// absent from a file that does not set it (so a release that predates
-    /// it sees nothing new), and survives a rewrite of the file even when
-    /// this binary does not know its value: a crash-loop rollback reinstalls
-    /// an older binary, which must neither refuse to start nor drop a value
-    /// a later release wrote. An unknown value turns QUIC off.
     /// QUIC is off by default, and Windows must stay off until its crash-loop
     /// breaker has been confirmed on a real Windows machine (#6031). A release
     /// that changes the default on other platforms must keep Windows off and
@@ -7199,6 +7193,12 @@ shutdown-drain-secs = 42
         );
     }
 
+    /// `transport-quic` (#5940) is read from `config.toml` in kebab-case, is
+    /// absent from a file that does not set it (so a release that predates
+    /// it sees nothing new), and survives a rewrite of the file even when
+    /// this binary does not know its value: a crash-loop rollback reinstalls
+    /// an older binary, which must neither refuse to start nor drop a value
+    /// a later release wrote. An unknown value turns QUIC off.
     #[test]
     fn transport_quic_round_trips_and_unknown_values_are_off() {
         let unset: Config = toml::from_str(RELEASED_CONFIG_TOML).unwrap();
