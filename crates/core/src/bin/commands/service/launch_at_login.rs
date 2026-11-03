@@ -219,14 +219,19 @@ pub(super) fn write_launch_agent_plist_at(
         std::fs::create_dir_all(parent)?;
     }
     let temporary = plist.with_extension("plist.tmp");
-    {
+    let replaced = (|| {
         let mut file = std::fs::File::create(&temporary)?;
         file.write_all(launch_agent_plist_contents(program_arguments).as_bytes())?;
-        file.sync_all()?;
-    }
-    std::fs::rename(&temporary, plist).inspect_err(|_| {
+        // Best effort: a network home directory may not support a full sync,
+        // and that must not stop the agent being written at all.
+        let _synced = file.sync_all();
+        drop(file);
+        std::fs::rename(&temporary, plist)
+    })();
+    if replaced.is_err() {
         let _removed = std::fs::remove_file(&temporary);
-    })
+    }
+    replaced
 }
 
 /// Remove the plist. Idempotent: returns Ok if the file was already gone.

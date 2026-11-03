@@ -948,6 +948,19 @@ mod tests {
     }
 
     #[test]
+    fn the_allowlist_resolves_the_hostname_for_a_wildcard_bind() {
+        // The other direction: LAN clients of a wildcard bind need these IPs.
+        if hostname::get().is_err() {
+            return;
+        }
+        let hosts =
+            build_allowed_hosts_with(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 7509, &[], |_, _| {
+                vec![IpAddr::V4(Ipv4Addr::new(192, 168, 1, 2))]
+            });
+        assert!(hosts.contains("192.168.1.2"));
+    }
+
+    #[test]
     fn a_wildcard_bind_allows_the_machine_hostnames_ips() {
         let lan_ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 2));
         let mut hosts = HostAllowlistBuilder::new(7509);

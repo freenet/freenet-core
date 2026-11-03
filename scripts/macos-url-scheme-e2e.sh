@@ -146,11 +146,12 @@ stop_app() {
 
 # launchd can briefly refuse a label it is still tearing down after a bootout.
 load_agent() {
+    local error=""
     for _ in $(seq 1 10); do
-        launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null && return 0
+        error="$(launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>&1)" && return 0
         sleep 1
     done
-    fail "could not load the Launch-at-Login agent"
+    fail "could not load the Launch-at-Login agent: $error"
 }
 
 wait_for_status_item_count_above() {
@@ -339,6 +340,10 @@ wait_for_status_item_count_above "$status_items_before" \
 pgrep -f 'Freenet.app/Contents/MacOS/freenet-bin service run-wrapper$' >/dev/null \
     || fail "the icon appeared but launchd's wrapper is not running"
 echo "ok - the menu bar icon is displayed when launchd starts the app"
+# The usual case: a link clicked some time after login.
+open "freenet://$RIVER/"
+wait_for_count 3 || fail "a link was not handled once launchd's wrapper had settled"
+echo "ok - a link works once the instance launchd started has settled"
 stop_app
 wait_for_status_item_count_back_to "$status_items_before" \
     || fail "the status item outlived the app"
@@ -349,7 +354,7 @@ load_agent
 # be handled whether LaunchServices already sees the launchd-started instance
 # or launches a duplicate for it, and either copy may win the lock.
 open "freenet://$RIVER/"
-wait_for_count 3 || fail "the launchd-started instance never handled the link"
+wait_for_count 4 || fail "the launchd-started instance never handled the link"
 echo "ok - a link reaches the instance launchd started (as at login)"
 launchctl bootout "$AGENT" >/dev/null 2>&1 || true
 
