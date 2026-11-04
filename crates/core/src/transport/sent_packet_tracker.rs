@@ -102,7 +102,33 @@ const MAX_RTO_BACKOFF: u32 = 512;
 /// A still-progressing transfer is never abandoned: any ACK for the stuck
 /// packet resets its count, and a 12-consecutive-RTO black hole on an otherwise
 /// healthy path is a genuinely dead fragment.
+///
+/// Both figures assume retransmission credit (#6100, [`RETRANSMIT_CREDIT_CAP`])
+/// is available, which it is while other packets are being ACKed. A resend
+/// held back for credit does not count, so on a path delivering too little to
+/// earn it the 12 retransmits are spread over a longer time. Abandoning needs
+/// no credit.
 const MAX_PACKET_RETRANSMITS: u32 = 12;
+
+/// Most retransmission credit a connection can hold, in plaintext bytes
+/// (#6100).
+///
+/// Timer-driven retransmissions (RTO resends and TLP probes) spend credit,
+/// and every ACK of a tracked packet earns its size back. So once a loss
+/// burst has used up the credit, a connection retransmits only as fast as its
+/// path delivers. Without it nothing limits them: they are not paced, and any
+/// single ACK resets both the RTO backoff and FixedRate's loss pause. On an
+/// uplink shared by many connections and saturated, every lost packet was
+/// resent on its own 500 ms timer, up to `MAX_PACKET_RETRANSMITS` times, and
+/// the retransmissions kept the uplink saturated: field storms of ~90%
+/// retransmitted packets for 20-40 minutes, reproduced by
+/// `link_model::storm_tests`. This is the ACK clock that TCP's loss recovery
+/// gets from its congestion window (RFC 5681, RFC 6937), applied to
+/// retransmissions only: new data is still paced by the token bucket alone.
+///
+/// A connection starts full, and the cap is 64 full packets, so a healthy
+/// path resends a burst of up to that many lost packets at once, as before.
+const RETRANSMIT_CREDIT_CAP: usize = 64 * super::packet_data::MAX_PACKET_SIZE;
 
 /// Minimum RTO after RTT samples have been collected.
 ///
@@ -197,6 +223,20 @@ pub(super) struct SentPacketTracker<T: TimeSource> {
     /// cleared on ACK. An entry is removed when its packet is ACKed or
     /// abandoned, so this map tracks only currently-unacked packets.
     retransmit_counts: HashMap<PacketId, u32>,
+    /// Retransmission credit in plaintext bytes, at most
+    /// [`RETRANSMIT_CREDIT_CAP`] (#6100). Earned by ACKs of tracked packets,
+    /// spent by RTO resends and TLP probes.
+    retransmit_credit: usize,
+    /// Earliest time (time-source nanos) a retransmission may go out without
+    /// credit. One credit-free retransmission per effective RTO keeps a lone
+    /// loss on an otherwise quiet connection (no ACKs to earn credit from)
+    /// recovering, and probes a path that has stopped acknowledging at the
+    /// rate RFC 6298's single backed-off timer would.
+    next_uncredited_retransmit_nanos: u64,
+    /// Size of a due retransmission held back for lack of credit, 0 if none.
+    /// An ACK that brings the credit up to it raises `new_flight`, so the
+    /// recv loop resends it without waiting for the deadline it parked on.
+    deferred_retransmit_bytes: usize,
 
     /// Owning stream for each currently-tracked packet (issue #4345).
     ///
@@ -276,6 +316,10 @@ const MAX_STREAM_ACK_WATCHES: usize = 64;
 /// the per-hop stall shape of #2450/#3215. While packets are already in
 /// flight the armed deadline is the oldest packet's, which is no later than
 /// a newer packet's, so only the empty-to-non-empty transition needs a wake.
+///
+/// It is also raised when an ACK brings the retransmission credit up to a
+/// retransmission held back for lack of it (#6100): the loop parked on the
+/// next credit-free slot, up to an effective RTO away.
 #[derive(Default)]
 pub(super) struct NewFlightSignal {
     raised: std::sync::atomic::AtomicBool,
@@ -329,6 +373,9 @@ impl<T: TimeSource> SentPacketTracker<T> {
             rto_backoff: 1, // No backoff initially
             tlp_sent_packets: HashSet::new(),
             retransmit_counts: HashMap::new(),
+            retransmit_credit: RETRANSMIT_CREDIT_CAP,
+            next_uncredited_retransmit_nanos: 0,
+            deferred_retransmit_bytes: 0,
             packet_streams: HashMap::new(),
             new_flight: std::sync::Arc::new(NewFlightSignal::default()),
             backoff_round_end_nanos: 0,
@@ -735,6 +782,13 @@ impl<T: TimeSource> SentPacketTracker<T> {
                 self.pending_receipts.get(packet_id)
             {
                 let packet_size = *packet_size;
+                // Delivered bytes earn retransmission credit (#6100). Only a
+                // tracked packet earns it, so a receipt for an id we no
+                // longer track (a duplicate re-ack) cannot inflate it.
+                self.retransmit_credit = self
+                    .retransmit_credit
+                    .saturating_add(packet_size)
+                    .min(RETRANSMIT_CREDIT_CAP);
                 let token = *token; // Copy the token before removing
 
                 if is_retransmitted {
@@ -791,6 +845,13 @@ impl<T: TimeSource> SentPacketTracker<T> {
                     self.on_stream_packet_acked(stream_id, now_nanos);
                 }
             }
+        }
+
+        if self.deferred_retransmit_bytes > 0
+            && self.retransmit_credit >= self.deferred_retransmit_bytes
+        {
+            self.deferred_retransmit_bytes = 0;
+            self.new_flight.raise();
         }
 
         let loss_rate = if self.total_packets_sent > 0 {
@@ -908,6 +969,24 @@ impl<T: TimeSource> SentPacketTracker<T> {
         );
     }
 
+    /// Whether a due retransmission of `size` plaintext bytes may go out now
+    /// (#6100): it spends that much credit, or, with too little, it is the
+    /// one credit-free retransmission allowed per effective RTO. On refusal
+    /// the retransmission is recorded as deferred.
+    fn admit_retransmit(&mut self, size: usize, now_nanos: u64, effective_rto_nanos: u64) -> bool {
+        if self.retransmit_credit >= size {
+            self.retransmit_credit -= size;
+            return true;
+        }
+        if now_nanos >= self.next_uncredited_retransmit_nanos {
+            self.next_uncredited_retransmit_nanos = now_nanos.saturating_add(effective_rto_nanos);
+            return true;
+        }
+        self.deferred_retransmit_bytes = size;
+        super::TRANSPORT_METRICS.record_retransmit_deferred();
+        false
+    }
+
     /// Get the current backoff multiplier (for testing/debugging)
     #[allow(dead_code)]
     pub(super) fn rto_backoff(&self) -> u32 {
@@ -944,6 +1023,11 @@ impl<T: TimeSource> SentPacketTracker<T> {
     /// TLP (Tail Loss Probe) fires before RTO to detect tail loss earlier.
     /// - TLP returns TlpProbe action (no backoff applied, speculative)
     /// - RTO returns Resend action (backoff applied, definite loss)
+    ///
+    /// Both need retransmission credit (#6100, [`RETRANSMIT_CREDIT_CAP`]).
+    /// Without it a probe is skipped, and a resend waits, returning
+    /// `WaitUntil` the next credit-free slot; an ACK that covers it raises the
+    /// new-flight signal first.
     pub(super) fn get_resend(&mut self) -> ResendAction {
         let now_nanos = self.time_source.now_nanos();
         let pto = self.probe_timeout();
@@ -980,6 +1064,18 @@ impl<T: TimeSource> SentPacketTracker<T> {
             // Check if TLP should fire (before RTO)
             if let Some(tlp_at) = tlp_deadline {
                 if now_nanos >= tlp_at && now_nanos < rto_deadline {
+                    // A probe is a retransmission and needs credit (#6100).
+                    // Without it the probe is skipped, not delayed: the RTO
+                    // still covers the packet.
+                    let size = self
+                        .pending_receipts
+                        .get(&entry.packet_id)
+                        .map_or(0, |(_, _, _, size)| *size);
+                    if !self.admit_retransmit(size, now_nanos, effective_rto_nanos) {
+                        self.tlp_sent_packets.insert(entry.packet_id);
+                        self.resend_queue.push_front(entry);
+                        return ResendAction::WaitUntil(rto_deadline);
+                    }
                     // TLP fires! Clone packet data for the probe
                     if let Some((packet, _, _, _)) = self.pending_receipts.get(&entry.packet_id) {
                         let packet_clone = packet.clone();
@@ -1003,6 +1099,25 @@ impl<T: TimeSource> SentPacketTracker<T> {
             // Check if RTO should fire (only for a still-tracked packet —
             // get_resend keeps resent packets in pending_receipts since #4345).
             if now_nanos >= rto_deadline && self.pending_receipts.contains_key(&entry.packet_id) {
+                // A resend needs credit (#6100). Abandoning sends nothing, so
+                // it does not: a packet out of retransmissions is released
+                // whatever the credit. A resend held back keeps its place at
+                // the head and its retransmission count, and goes out when an
+                // ACK brings the credit up (which raises `new_flight`) or at
+                // the next credit-free slot, whichever comes first.
+                let will_abandon = self
+                    .retransmit_counts
+                    .get(&entry.packet_id)
+                    .map_or(0, |count| *count)
+                    >= MAX_PACKET_RETRANSMITS;
+                let size = self
+                    .pending_receipts
+                    .get(&entry.packet_id)
+                    .map_or(0, |(_, _, _, size)| *size);
+                if !will_abandon && !self.admit_retransmit(size, now_nanos, effective_rto_nanos) {
+                    self.resend_queue.push_front(entry);
+                    return ResendAction::WaitUntil(self.next_uncredited_retransmit_nanos);
+                }
                 // Update packet loss proportion for a lost packet
                 self.packet_loss_proportion = self.packet_loss_proportion
                     * (1.0 - PACKET_LOSS_DECAY_FACTOR)
@@ -3289,5 +3404,176 @@ pub(in crate::transport) mod tests {
             assert_eq!(tracker.watch_stream_ack(stream, 0), None);
         }
         assert_eq!(tracker.stream_ack_watches.len(), MAX_STREAM_ACK_WATCHES);
+    }
+
+    // ---- Retransmission credit (#6100) ----
+
+    const FULL: usize = super::super::packet_data::MAX_PACKET_SIZE;
+    /// Full-size retransmissions a full credit covers.
+    const CREDITED: usize = RETRANSMIT_CREDIT_CAP / FULL;
+
+    fn send_full(tracker: &mut SentPacketTracker<VirtualTime>, ids: std::ops::Range<PacketId>) {
+        for id in ids {
+            tracker.report_sent_packet_with_token_and_size(id, vec![id as u8].into(), None, FULL);
+        }
+    }
+
+    /// Takes every `Resend` the tracker offers now; returns how many, and the
+    /// action that ended the run.
+    fn take_resends(tracker: &mut SentPacketTracker<VirtualTime>) -> (usize, ResendAction) {
+        let mut n = 0;
+        loop {
+            match tracker.get_resend() {
+                ResendAction::Resend(..) => n += 1,
+                other => return (n, other),
+            }
+        }
+    }
+
+    /// Whether the new-flight signal was raised since the last call (clears it).
+    fn take_new_flight(tracker: &SentPacketTracker<VirtualTime>) -> bool {
+        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        tracker.new_flight_signal().poll_take(&mut cx).is_ready()
+    }
+
+    /// The storm shape: many packets time out together and few ACKs come
+    /// back. Only the credit's worth (plus one credit-free resend) goes out at
+    /// once; the rest waits, and each ACK releases one more packet's worth,
+    /// waking the recv loop rather than leaving it parked for an RTO. Before
+    /// #6100 the whole burst was resent every RTO whatever came back.
+    #[test]
+    fn rto_resends_beyond_the_credit_wait_for_acks() {
+        let mut tracker = mock_sent_packet_tracker();
+        let burst = CREDITED as PacketId + 20;
+        send_full(&mut tracker, 0..burst);
+        // No RTT sample yet, so no TLP; the initial RTO is 1 s, and the first
+        // expiry doubles it, so the rest of the burst is due at 2 s.
+        tracker.time_source.advance(Duration::from_millis(1_001));
+        let (first, _) = take_resends(&mut tracker);
+        tracker.time_source.advance(Duration::from_millis(1_000));
+        let (rest, next) = take_resends(&mut tracker);
+        assert_eq!(
+            first + rest,
+            CREDITED + 1,
+            "the credit, plus one credit-free resend"
+        );
+        let now = tracker.time_source.now_nanos();
+        assert_eq!(
+            next,
+            ResendAction::WaitUntil(now + tracker.effective_rto().as_nanos() as u64),
+            "the rest waits for the next credit-free slot, an effective RTO away"
+        );
+
+        let _ = take_new_flight(&tracker);
+        let _ = tracker.report_received_receipts(&[0]);
+        assert!(
+            take_new_flight(&tracker),
+            "an ACK covering the held-back resend must wake the recv loop"
+        );
+        let (resent, _) = take_resends(&mut tracker);
+        assert_eq!(resent, 1, "one ACKed packet earns one packet's resend");
+    }
+
+    /// With no ACKs at all (no credit to earn), one retransmission per
+    /// effective RTO still goes out: a lone loss on a quiet connection
+    /// recovers, and a silent path is probed at the backed-off rate.
+    #[test]
+    fn without_acks_one_retransmission_per_rto_still_goes_out() {
+        let mut tracker = mock_sent_packet_tracker();
+        send_full(&mut tracker, 0..CREDITED as PacketId + 20);
+        tracker.time_source.advance(Duration::from_millis(1_001));
+        let _ = take_resends(&mut tracker);
+        tracker.time_source.advance(Duration::from_millis(1_000));
+        let _ = take_resends(&mut tracker);
+        assert_eq!(tracker.retransmit_credit, 0, "premise: credit spent");
+        for _ in 0..3 {
+            let ResendAction::WaitUntil(at) = tracker.get_resend() else {
+                panic!("held back without credit");
+            };
+            let wait = at - tracker.time_source.now_nanos();
+            tracker.time_source.advance(Duration::from_nanos(wait));
+            let (resent, next) = take_resends(&mut tracker);
+            assert_eq!(resent, 1, "exactly one credit-free resend per slot");
+            assert!(matches!(next, ResendAction::WaitUntil(_)));
+        }
+    }
+
+    /// A packet out of retransmissions is released whatever the credit:
+    /// abandoning sends nothing, and holding it back would pin its bytes in
+    /// flight size (#4345).
+    #[test]
+    fn abandoning_needs_no_credit() {
+        let mut tracker = mock_sent_packet_tracker();
+        send_full(&mut tracker, 1..2);
+        for _ in 0..MAX_PACKET_RETRANSMITS {
+            tracker
+                .time_source
+                .advance(tracker.effective_rto() + Duration::from_millis(1));
+            assert!(matches!(tracker.get_resend(), ResendAction::Resend(1, _)));
+        }
+        tracker.retransmit_credit = 0;
+        tracker.next_uncredited_retransmit_nanos = u64::MAX;
+        tracker
+            .time_source
+            .advance(tracker.effective_rto() + Duration::from_millis(1));
+        assert_eq!(
+            tracker.get_resend(),
+            ResendAction::Abandon {
+                packet_id: 1,
+                payload_len: FULL
+            }
+        );
+    }
+
+    /// Only an ACK of a tracked packet earns credit, by its size, up to the
+    /// cap. A receipt for an id we no longer track (a duplicate re-ack, an old
+    /// peer acking an untracked NoOp) earns nothing.
+    #[test]
+    fn only_tracked_acks_earn_credit_up_to_the_cap() {
+        let mut tracker = mock_sent_packet_tracker();
+        send_full(&mut tracker, 1..3);
+        tracker.retransmit_credit = 0;
+        let _ = tracker.report_received_receipts(&[999]);
+        assert_eq!(tracker.retransmit_credit, 0, "untracked id earns nothing");
+        let _ = tracker.report_received_receipts(&[1]);
+        assert_eq!(tracker.retransmit_credit, FULL);
+        let _ = tracker.report_received_receipts(&[1]);
+        assert_eq!(
+            tracker.retransmit_credit, FULL,
+            "a repeat receipt earns nothing"
+        );
+        tracker.retransmit_credit = RETRANSMIT_CREDIT_CAP - 1;
+        let _ = tracker.report_received_receipts(&[2]);
+        assert_eq!(tracker.retransmit_credit, RETRANSMIT_CREDIT_CAP);
+    }
+
+    /// A tail-loss probe is a retransmission too. Without credit it is
+    /// skipped, not queued: the RTO still covers the packet.
+    #[test]
+    fn tail_loss_probe_is_skipped_without_credit() {
+        let mut tracker = mock_sent_packet_tracker();
+        send_full(&mut tracker, 1..2);
+        tracker.time_source.advance(Duration::from_millis(100));
+        let _ = tracker.report_received_receipts(&[1]);
+        assert!(tracker.probe_timeout().is_some(), "premise: TLP enabled");
+
+        tracker.retransmit_credit = 0;
+        tracker.next_uncredited_retransmit_nanos = u64::MAX;
+        send_full(&mut tracker, 2..3);
+        let sent = tracker.time_source.now_nanos();
+        let pto = tracker.probe_timeout().expect("srtt known");
+        tracker.time_source.advance(pto + Duration::from_millis(1));
+        let rto_deadline = sent + tracker.effective_rto().as_nanos() as u64;
+        assert_eq!(tracker.get_resend(), ResendAction::WaitUntil(rto_deadline));
+        assert!(
+            tracker.tlp_sent_packets.contains(&2),
+            "the probe is skipped"
+        );
+
+        tracker.retransmit_credit = RETRANSMIT_CREDIT_CAP;
+        tracker.time_source.advance(Duration::from_nanos(
+            rto_deadline - tracker.time_source.now_nanos(),
+        ));
+        assert!(matches!(tracker.get_resend(), ResendAction::Resend(2, _)));
     }
 }

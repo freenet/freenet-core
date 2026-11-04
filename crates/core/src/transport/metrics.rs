@@ -942,6 +942,10 @@ struct LossCounters {
     rto_expiries: AtomicU64,
     /// Tail-loss probes fired.
     tlp_probes: AtomicU64,
+    /// Due retransmissions (RTO resends and TLP probes) held back because
+    /// the connection had no retransmission credit (#6100). A packet held
+    /// back again on a later check counts again.
+    retransmits_deferred: AtomicU64,
     /// Standalone ack-only `NoOp` packets sent, and their on-wire bytes.
     standalone_ack_packets: AtomicU64,
     standalone_ack_bytes: AtomicU64,
@@ -1285,6 +1289,13 @@ impl TransportMetrics {
     /// A tail-loss probe fired on an established connection.
     pub(crate) fn record_tlp_probe(&self) {
         self.loss.tlp_probes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A due retransmission was held back for lack of credit (#6100).
+    pub(crate) fn record_retransmit_deferred(&self) {
+        self.loss
+            .retransmits_deferred
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// A retransmission (RTO resend or TLP probe) was handed to the socket.
@@ -2491,6 +2502,7 @@ impl TransportMetrics {
             packets_abandoned: get64(&l.packets_abandoned),
             rto_expiries: get64(&l.rto_expiries),
             tlp_probes: get64(&l.tlp_probes),
+            retransmits_deferred: get64(&l.retransmits_deferred),
             standalone_ack_packets: get64(&l.standalone_ack_packets),
             standalone_ack_bytes: get64(&l.standalone_ack_bytes),
             nat_fail_no_response: get32(&d.no_response),
@@ -3038,6 +3050,10 @@ pub struct TransportSnapshot {
     pub rto_expiries: u64,
     /// Tail-loss probes fired.
     pub tlp_probes: u64,
+    /// Due retransmissions (RTO resends and TLP probes) held back because
+    /// the connection had no retransmission credit (#6100). A packet held
+    /// back again on a later check counts again.
+    pub retransmits_deferred: u64,
     /// Standalone ack-only `NoOp` packets sent, and their on-wire bytes.
     pub standalone_ack_packets: u64,
     pub standalone_ack_bytes: u64,
@@ -3435,6 +3451,7 @@ impl TransportSnapshot {
             packets_abandoned,
             rto_expiries,
             tlp_probes,
+            retransmits_deferred,
             standalone_ack_packets,
             standalone_ack_bytes,
             nat_fail_no_response,
@@ -3573,6 +3590,7 @@ impl TransportSnapshot {
         self.packets_abandoned = packets_abandoned;
         self.rto_expiries = rto_expiries;
         self.tlp_probes = tlp_probes;
+        self.retransmits_deferred = retransmits_deferred;
         self.standalone_ack_packets = standalone_ack_packets;
         self.standalone_ack_bytes = standalone_ack_bytes;
         self.nat_fail_no_response = nat_fail_no_response;
@@ -3731,6 +3749,10 @@ struct SnapshotExtras {
     pub rto_expiries: u64,
     /// Tail-loss probes fired.
     pub tlp_probes: u64,
+    /// Due retransmissions (RTO resends and TLP probes) held back because
+    /// the connection had no retransmission credit (#6100). A packet held
+    /// back again on a later check counts again.
+    pub retransmits_deferred: u64,
     /// Standalone ack-only `NoOp` packets sent, and their on-wire bytes.
     pub standalone_ack_packets: u64,
     pub standalone_ack_bytes: u64,
@@ -3963,6 +3985,7 @@ impl SnapshotExtras {
             || self.packets_abandoned != 0
             || self.rto_expiries != 0
             || self.tlp_probes != 0
+            || self.retransmits_deferred != 0
             || self.standalone_ack_packets != 0
             || self.nat_fail_no_response != 0
             || self.nat_fail_undecryptable != 0
@@ -6209,6 +6232,7 @@ mod tests {
             "packets_abandoned",
             "rto_expiries",
             "tlp_probes",
+            "retransmits_deferred",
             "standalone_ack_packets",
             "standalone_ack_bytes",
             "conn_rtt_connections",

@@ -2960,6 +2960,10 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
             );
             m.insert("tlp_probes".into(), serde_json::json!(snapshot.tlp_probes));
             m.insert(
+                "retransmits_deferred".into(),
+                serde_json::json!(snapshot.retransmits_deferred),
+            );
+            m.insert(
                 "standalone_ack_packets".into(),
                 serde_json::json!(snapshot.standalone_ack_packets),
             );

@@ -283,6 +283,37 @@ next outage into a base-RTO retransmit burst that exhausts
 MAX_PACKET_RETRANSMITS in seconds.
 ```
 
+### Retransmission credit: retransmits are ACK-clocked (#6100)
+
+```
+Timer-driven retransmissions (RTO resends and TLP probes) are not paced by
+the token bucket, and any single ACK resets both rto_backoff and FixedRate's
+loss pause. So under heavy PARTIAL loss (a shared uplink saturated by many
+connections) nothing slowed them: every lost packet was resent on its own
+500 ms timer up to MAX_PACKET_RETRANSMITS times, and the retransmissions
+kept the uplink saturated (field: ~90% of packets retransmitted for 20-40
+minutes, 21% of peers in 2.25 days).
+
+SentPacketTracker::retransmit_credit (plaintext bytes, at most
+RETRANSMIT_CREDIT_CAP = 64 full packets, starts full):
+  → earned by the ACK of a TRACKED packet, by its size (a receipt for an id
+    no longer tracked earns nothing);
+  → spent by each RTO resend and TLP probe;
+  → without enough credit: a TLP is skipped (the RTO still covers the
+    packet); a resend waits at the head of the queue, keeping its
+    retransmit count, until an ACK covers it (raises new_flight) or the
+    next credit-free slot;
+  → one credit-free retransmission per effective RTO (a lone loss on a quiet
+    connection, or probing a silent path);
+  → abandoning needs no credit (it sends nothing and frees flight size).
+Deferrals are counted in transport_snapshot.retransmits_deferred.
+
+DO NOT remove the credit or let retransmissions bypass it: the storm comes
+back (link_model::storm_tests::shared_saturated_uplink_does_not_collapse).
+DO NOT earn credit from untracked receipts or on a timer. New data is still
+paced only by the token bucket; a node-wide default cap is #6045.
+```
+
 ### Shadow per-peer RTT registry (issue #4074, Phases 1 + 1.5)
 
 `transport/rolling_rtt_stats.rs` maintains a process-wide
@@ -739,7 +770,8 @@ Rate calculation on every rate update (peer_connection::paced_rate; #6047):
   the connection's life, so a bandwidth-limit above cc_rate must NOT raise it
   (#3702 burst). The global share is still taken as is, as before #6047.
   Only stream fragments draw on the bucket; short messages, ACKs and
-  retransmits are unpaced.
+  retransmits are unpaced (retransmits are ACK-clocked instead, see
+  "Retransmission credit" above).
 
 Token reservation:
   → Reserve BEFORE sending
