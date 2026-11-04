@@ -1103,6 +1103,58 @@ fn session_and_setup_endings_reach_their_own_counters() {
     });
 }
 
+/// A fallback and a fallback the session's end followed reach their two
+/// counter families under the same label, for every cause.
+#[test]
+fn fallbacks_and_churned_fallbacks_reach_their_own_counters() {
+    use crate::transport::metrics::QuicFallback;
+    use crate::transport::quic::upgrade::machine::{FallbackCause, Outcome};
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let h = Harness::server("quic-driver-churn", 36).await;
+        let (session, _rx) = h.session();
+        let causes = [
+            (FallbackCause::Idle, QuicFallback::Idle),
+            (FallbackCause::Reset, QuicFallback::Reset),
+            (FallbackCause::Protocol, QuicFallback::Protocol),
+            (
+                FallbackCause::DowngradeReceived,
+                QuicFallback::DowngradeReceived,
+            ),
+            (FallbackCause::EndpointDown, QuicFallback::EndpointDown),
+            (
+                FallbackCause::SessionEndedReceived,
+                QuicFallback::SessionEndedReceived,
+            ),
+        ];
+        assert_eq!(causes.len(), QuicFallback::COUNT);
+        let mut state = session.state.lock();
+        session.apply(
+            &mut state,
+            causes
+                .iter()
+                .flat_map(|(cause, _)| {
+                    [
+                        Action::Record(Outcome::Fallback(*cause)),
+                        Action::Record(Outcome::FallbackFollowedBySessionEnd(*cause)),
+                    ]
+                })
+                .collect(),
+        );
+        drop(state);
+        let want: Vec<String> = causes
+            .iter()
+            .flat_map(|(_, label)| {
+                [
+                    format!("{label:?}"),
+                    format!("(\"followed_by_session_end\", {label:?})"),
+                ]
+            })
+            .collect();
+        assert_eq!(TRANSPORT_METRICS.quic_events_of(h.remote), want);
+    });
+}
+
 /// What a retry test needs of a server harness.
 struct RetryRig {
     ours: QuicEndpoint,

@@ -615,6 +615,7 @@ fn close_codes_have_fixed_distinct_wire_values() {
         (QuicCloseCode::SendAbortLimit, 3),
         (QuicCloseCode::PeerNotAcknowledging, 4),
         (QuicCloseCode::ControlRefused, 5),
+        (QuicCloseCode::SessionEnded, 6),
     ];
     assert_eq!(expected.len(), QuicCloseCode::COUNT);
     for (code, wire) in expected {
@@ -622,7 +623,42 @@ fn close_codes_have_fixed_distinct_wire_values() {
         assert_eq!(QuicCloseCode::from_code(u64::from(wire)), Some(code));
         assert!(!code.reason().is_empty());
     }
-    for unknown in [6_u64, 0x0f, 0x11, 0x21, u64::from(u32::MAX)] {
+    for unknown in [7_u64, 0x0f, 0x11, 0x21, u64::from(u32::MAX)] {
         assert_eq!(QuicCloseCode::from_code(unknown), None, "{unknown:#x}");
+    }
+}
+
+/// SESSION_ENDED reads as its own refusal, a downgrade-class kind that the
+/// endpoint attributes like the others. A node that does not know a close code,
+/// which is how a release before code 6 reads it, sees a lost connection.
+#[test]
+fn a_session_ended_close_reads_as_its_own_refusal_and_unknown_codes_as_lost() {
+    use super::super::liveness::QuicAvailability;
+    let close = |code: u32| {
+        QuicErrorKind::from(quinn::ConnectionError::ApplicationClosed(
+            quinn::ApplicationClose {
+                error_code: quinn::VarInt::from_u32(code),
+                reason: Default::default(),
+            },
+        ))
+    };
+    let session_ended = QuicErrorKind::Refused {
+        reason: QuicRefusal::SessionEnded,
+    };
+    assert_eq!(close(super::close_code::SESSION_ENDED), session_ended);
+    assert_eq!(
+        attribute(QuicAvailability::Down, session_ended),
+        QuicErrorKind::EndpointDown
+    );
+    assert_eq!(
+        attribute(QuicAvailability::Up, session_ended),
+        session_ended
+    );
+    for unknown in [7, 0x0f] {
+        assert_eq!(
+            close(unknown),
+            QuicErrorKind::ConnectionLost,
+            "{unknown:#x}"
+        );
     }
 }

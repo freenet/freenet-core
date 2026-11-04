@@ -533,6 +533,10 @@ pub(in crate::transport) enum QuicRefusal {
     /// The peer closed with `close_code::DOWNGRADE`: fall back to UDP.
     #[error("the peer asked to fall back to UDP")]
     Downgrade,
+    /// The peer closed with `close_code::SESSION_ENDED`: its UDP session to
+    /// this node ended, so it dropped the path. Fall back to UDP.
+    #[error("the peer's UDP session to this node ended")]
+    SessionEnded,
     /// The peer closed with `close_code::IDENTITY_MISMATCH`: the key this
     /// node proved is not the one the peer has on record for it.
     #[error("the peer reported an identity mismatch")]

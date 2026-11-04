@@ -74,7 +74,11 @@
 //! `Idle` with no promotion yet. "control frame refused, new" is one of an
 //! unknown version or type. An event for any attempt but the
 //! current one changes nothing, and so does every pair the table does not list.
-//! A `SessionEnded` that finds the endpoint down takes no backoff.
+//! A `SessionEnded` that finds the endpoint down takes no backoff. Its tear
+//! down closes with `SESSION_ENDED`; every other tear down here closes with
+//! `DOWNGRADE`. At `SessionEnded` the machine also records
+//! [`Outcome::FallbackFollowedBySessionEnd`] for each fallback it recorded
+//! within [`FALLBACK_CHURN_WINDOW`] before, in any state.
 //!
 //! Each side counts a path as established on its own evidence: the client on
 //! `Ready`, the server on `ReadyAck`. The two can disagree (a send may be
@@ -163,6 +167,15 @@ pub(in crate::transport) const IDENTITY_BACKOFF: Duration = BACKOFF_MAX;
 /// that fails sooner keeps it, so one that establishes and then dies at once
 /// is retried less and less often.
 pub(in crate::transport) const STABLE_PATH: Duration = Duration::from_secs(10 * 60);
+/// A fallback followed by the end of the UDP session within this long is
+/// counted as churn (`Outcome::FallbackFollowedBySessionEnd`). Above the UDP
+/// idle timeout (120 s), so a peer that went silent and was timed out on UDP
+/// too is caught.
+pub(in crate::transport) const FALLBACK_CHURN_WINDOW: Duration = Duration::from_secs(150);
+/// The fallbacks a machine remembers for [`FALLBACK_CHURN_WINDOW`]. Each
+/// fallback is charged a backoff of at least 48 s before the next attempt, so
+/// at most four fit the window; this leaves room and keeps the memory fixed.
+const RECENT_FALLBACKS_MAX: usize = 8;
 /// The longest wait a carried [`BackoffSeed`] may impose: the longest delay with
 /// the most jitter. A seed read off a clock with another epoch cannot lock a
 /// peer out for longer than this.
@@ -306,6 +319,10 @@ pub(in crate::transport) enum Outcome {
     SessionEnded {
         was_active: bool,
     },
+    /// The UDP session ended within [`FALLBACK_CHURN_WINDOW`] of a
+    /// [`Outcome::Fallback`] of this cause: that fallback came with the
+    /// session's end. Recorded once per such fallback, at the session end.
+    FallbackFollowedBySessionEnd(FallbackCause),
 }
 
 /// Why a path ended.
@@ -316,6 +333,8 @@ pub(in crate::transport) enum FallbackCause {
     Protocol,
     DowngradeReceived,
     EndpointDown,
+    /// The peer closed with `close_code::SESSION_ENDED`.
+    SessionEndedReceived,
 }
 
 /// Which side of the QUIC connection this node is.
@@ -446,6 +465,14 @@ fn classify(kind: QuicErrorKind) -> Verdict {
             QuicRefusal::Downgrade => {
                 normal(Outcome::SetupDowngraded, FallbackCause::DowngradeReceived)
             }
+            // Close code SESSION_ENDED: the peer's UDP session ended. Charged
+            // like a downgrade, counted apart once the path was active. In
+            // setup it is `SetupDowngraded`, since `QuicUpgradeOutcome` has no
+            // room for another label.
+            QuicRefusal::SessionEnded => normal(
+                Outcome::SetupDowngraded,
+                FallbackCause::SessionEndedReceived,
+            ),
             // This node's own limit, so the peer is not charged.
             QuicRefusal::AllowSetFull => Verdict::Fail {
                 penalty: Penalty::Uncharged,
@@ -515,6 +542,10 @@ pub(in crate::transport) struct UpgradeMachine {
     seeded: bool,
     /// What this node says it supports on a path, from [`Event::Promoted`].
     own_caps: u32,
+    /// When each recent [`Outcome::Fallback`] was recorded, and its cause,
+    /// oldest first, at most [`RECENT_FALLBACKS_MAX`] within
+    /// [`FALLBACK_CHURN_WINDOW`].
+    recent_fallbacks: std::collections::VecDeque<(Duration, FallbackCause)>,
 }
 
 impl UpgradeMachine {
@@ -529,6 +560,7 @@ impl UpgradeMachine {
             retry_at: Duration::ZERO,
             seeded: false,
             own_caps: 0,
+            recent_fallbacks: std::collections::VecDeque::new(),
         }
     }
 
@@ -589,6 +621,47 @@ impl UpgradeMachine {
 
     /// Take one event.
     pub(in crate::transport) fn step(&mut self, cx: Inputs<'_>, event: Event) -> Vec<Action> {
+        let churned = if matches!(event, Event::SessionEnded) {
+            self.take_churned_fallbacks(cx.now)
+        } else {
+            Vec::new()
+        };
+        let mut actions = self.step_inner(cx, event);
+        for action in &actions {
+            if let Action::Record(Outcome::Fallback(cause)) = action {
+                self.note_fallback(cx.now, *cause);
+            }
+        }
+        actions.extend(
+            churned
+                .into_iter()
+                .map(|cause| Action::Record(Outcome::FallbackFollowedBySessionEnd(cause))),
+        );
+        actions
+    }
+
+    /// Remember a fallback recorded at `now`, forgetting any outside the
+    /// window and the oldest past the bound.
+    fn note_fallback(&mut self, now: Duration, cause: FallbackCause) {
+        self.recent_fallbacks
+            .retain(|(at, _)| now.saturating_sub(*at) <= FALLBACK_CHURN_WINDOW);
+        if self.recent_fallbacks.len() == RECENT_FALLBACKS_MAX {
+            self.recent_fallbacks.pop_front();
+        }
+        self.recent_fallbacks.push_back((now, cause));
+    }
+
+    /// The causes of the fallbacks recorded within [`FALLBACK_CHURN_WINDOW`]
+    /// before `now`, taken so a second session end counts none of them again.
+    fn take_churned_fallbacks(&mut self, now: Duration) -> Vec<FallbackCause> {
+        self.recent_fallbacks
+            .drain(..)
+            .filter(|(at, _)| now.saturating_sub(*at) <= FALLBACK_CHURN_WINDOW)
+            .map(|(_, cause)| cause)
+            .collect()
+    }
+
+    fn step_inner(&mut self, cx: Inputs<'_>, event: Event) -> Vec<Action> {
         match event {
             Event::Promoted {
                 peer_key,
@@ -1074,12 +1147,13 @@ impl UpgradeMachine {
     /// of getting here records and charges.
     fn shut_off(&mut self, cx: Inputs<'_>, ending: Ending) -> Vec<Action> {
         let mut actions = Vec::new();
-        let mut tear_down = |attempt| {
-            actions.push(Action::TearDown {
-                attempt,
-                code: QuicCloseCode::Downgrade,
-            })
+        // The peer counts a session end apart from a QUIC failure
+        // (`quic_fallback_session_ended_rx`).
+        let code = match ending {
+            Ending::Session => QuicCloseCode::SessionEnded,
+            Ending::Local | Ending::EndpointDown => QuicCloseCode::Downgrade,
         };
+        let mut tear_down = |attempt| actions.push(Action::TearDown { attempt, code });
         // A stable path that ends here clears the count too, since the count
         // can outlive this machine (`BackoffSeed`).
         let (was_attempting, active_since) = match std::mem::replace(&mut self.state, State::Off) {

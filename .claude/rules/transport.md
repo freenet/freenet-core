@@ -935,7 +935,8 @@ doc has the transition table.
   restarted peer is replaced before its old QUIC connection reports anything.
   A failure that already charged left the machine in Idle, so it is not
   charged twice. An endpoint ending, or a SessionEnded with the endpoint read
-  as Down, charges nothing.
+  as Down, charges nothing. A machine shut off by a session end closes its
+  path with SESSION_ENDED (code 6); every other shut-off closes with DOWNGRADE.
   Uncharged: a Decline of Busy, NotReady or Backoff and a full allow-set retry
   after 60 s (jittered) and leave the failure count. So a peer that stays
   NotReady or in its own backoff is offered to once per 60 s while that lasts.
@@ -950,7 +951,7 @@ doc has the transition table.
   seed may come off a clock with another epoch. A promotion's first offer waits
   for the later of the seed and its own delay. e5a-5b must carry it per peer key
   across a replaced session, or a session that flaps retries at session rate.
-  Failures: close codes 1, 3, 4 and 5, a lost connection, an idle timeout and a
+  Failures: close codes 1, 3, 4, 5 and 6, a lost connection, an idle timeout and a
   deadline each mean fallback plus normal backoff, then a new offer. Never a
   permanent downgrade. Identity: close code 2 received, or Event::IdentityMismatch
   (closes with IDENTITY_MISMATCH). A TLS failure during the handshake
@@ -1074,8 +1075,25 @@ snapshot except the two gauges.
   offered and declined_uncharged. Both sides count `established`; only the
   offerer's is the numerator. Counts are node-wide; there is no per-pair series.
   `quic_fallback_<label>` (`QuicFallback`): idle, reset, protocol, downgrade_rx,
-  endpoint_down. Paths that had been active only; an attempt that ends in setup
-  is counted in `quic_upgrade_*`. A close this node sent for send_abort_limit or
+  endpoint_down, session_ended_rx. Paths that had been active only; an attempt
+  that ends in setup is counted in `quic_upgrade_*` (a SESSION_ENDED close in
+  setup is `setup_downgrade_rx`, since `QuicUpgradeOutcome` is full).
+  session_ended_rx is the peer closing with SESSION_ENDED: its UDP session to
+  this node ended (a prune or a restart). It is charged like downgrade_rx. A
+  peer on a release before the code still closes with DOWNGRADE then
+  (downgrade_rx), and a node before the code reads 6 as an unknown code, a lost
+  connection (reset).
+  `quic_fallback_followed_by_session_end_<label>`, the same labels: the
+  fallbacks whose UDP session ended within FALLBACK_CHURN_WINDOW (150 s, above
+  the 120 s UDP idle timeout) after them, so peer churn rather than QUIC failing
+  while UDP worked. The machine remembers each fallback's time and cause (at
+  most RECENT_FALLBACKS_MAX, 8; each is followed by a backoff of at least 48 s,
+  so at most 4 fit the window) and at SessionEnded records
+  Outcome::FallbackFollowedBySessionEnd once for each within the window, the
+  boundary included; the list is then empty, so a later SessionEnded counts
+  none again. QUIC-specific fallbacks of a cause = quic_fallback_<c> minus
+  quic_fallback_followed_by_session_end_<c>, exact over a period except for a
+  fallback near a period boundary whose session end lands in the next period. A close this node sent for send_abort_limit or
   peer_not_acknowledging reaches the machine as a lost connection, so it counts
   as `reset`; its count is `quic_close_sent_*`. A key mismatch is
   `quic_upgrade_identity_mismatch`.
@@ -1871,7 +1889,12 @@ Application error codes, one range per QUIC frame type, all one-byte
                 recycling, M6; the peer reads both as Downgrade),
                 CONTROL_REFUSED 5 (a control frame of an unknown version or
                 type arrived during path setup; the peer reads it as
-                Downgrade, a node without this code as ConnectionLost)
+                Downgrade, a node without this code as ConnectionLost),
+                SESSION_ENDED 6 (the UDP session ended; sent only by the
+                upgrade machine's session-end shut-off; the peer reads it as
+                Refused{SessionEnded}, falls back and charges as for Downgrade,
+                and counts quic_fallback_session_ended_rx; a node without this
+                code reads ConnectionLost, quic_fallback_reset)
     0x10..=0x1f STOP_SENDING: path::stop_code (receiver refusals;
                 NOT_ACCEPTING_DATA 0x19 is a shadow path refusing data. Data
                 may be sent only after caps negotiation, so it is a counter

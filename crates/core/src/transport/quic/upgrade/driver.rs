@@ -568,6 +568,18 @@ impl QuicUpgrades {
     }
 }
 
+/// The counter label of a fallback cause.
+fn fallback_label(cause: FallbackCause) -> QuicFallback {
+    match cause {
+        FallbackCause::Idle => QuicFallback::Idle,
+        FallbackCause::Reset => QuicFallback::Reset,
+        FallbackCause::Protocol => QuicFallback::Protocol,
+        FallbackCause::DowngradeReceived => QuicFallback::DowngradeReceived,
+        FallbackCause::EndpointDown => QuicFallback::EndpointDown,
+        FallbackCause::SessionEndedReceived => QuicFallback::SessionEndedReceived,
+    }
+}
+
 impl Session {
     /// Take `event` on the machine. An ended session takes nothing.
     fn handle(&self, event: SessionEvent) -> Vec<UdpSend> {
@@ -736,16 +748,11 @@ impl Session {
             } else {
                 C::SessionEndedSetup
             }),
-            Outcome::Fallback(cause) => TRANSPORT_METRICS.record_quic_fallback(
-                match cause {
-                    FallbackCause::Idle => QuicFallback::Idle,
-                    FallbackCause::Reset => QuicFallback::Reset,
-                    FallbackCause::Protocol => QuicFallback::Protocol,
-                    FallbackCause::DowngradeReceived => QuicFallback::DowngradeReceived,
-                    FallbackCause::EndpointDown => QuicFallback::EndpointDown,
-                },
-                self.remote,
-            ),
+            Outcome::Fallback(cause) => {
+                TRANSPORT_METRICS.record_quic_fallback(fallback_label(cause), self.remote)
+            }
+            Outcome::FallbackFollowedBySessionEnd(cause) => TRANSPORT_METRICS
+                .record_quic_fallback_followed_by_session_end(fallback_label(cause), self.remote),
         }
     }
 
