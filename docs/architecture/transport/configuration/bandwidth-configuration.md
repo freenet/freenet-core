@@ -476,7 +476,8 @@ freenet --total-bandwidth-limit 50000000 --min-bandwidth-per-connection 2000000
 
 The egress cap holds the average at `total-bandwidth-limit`. Short bursts above it
 are the unpaced sends (ACKs, retransmissions, handshakes, keepalives, short
-messages); check `egress_unpaced`, `egress_debt_hwm_bytes` and
+messages; retransmissions are not paced but are limited to what the connection's
+ACKs pay for, #6100); check `egress_unpaced`, `egress_debt_hwm_bytes` and
 `egress_debt_forgiven_bytes` in the `transport_snapshot` telemetry. Forgiven bytes
 mean unpaced traffic alone exceeded the cap for more than a second: raise the total,
 or lower `max-number-of-connections`.

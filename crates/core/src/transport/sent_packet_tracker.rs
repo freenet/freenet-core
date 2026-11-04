@@ -114,9 +114,9 @@ const MAX_PACKET_RETRANSMITS: u32 = 12;
 /// (#6100).
 ///
 /// Timer-driven retransmissions (RTO resends and TLP probes) spend credit,
-/// and every ACK of a tracked packet earns its size back. So once a loss
-/// burst has used up the credit, a connection retransmits only as fast as its
-/// path delivers. Without it nothing limits them: they are not paced, and any
+/// and every ACK of a tracked packet earns some back
+/// ([`CREDIT_PER_ACKED_BYTE`]). So once a loss burst has used up the credit,
+/// a connection retransmits only in proportion to what its path delivers. Without it nothing limits them: they are not paced, and any
 /// single ACK resets both the RTO backoff and FixedRate's loss pause. On an
 /// uplink shared by many connections and saturated, every lost packet was
 /// resent on its own 500 ms timer, up to `MAX_PACKET_RETRANSMITS` times, and
@@ -3836,5 +3836,57 @@ pub(in crate::transport) mod tests {
             }
             tracker.time_source.advance(Duration::from_millis(100));
         }
+    }
+
+    /// Holds back one full-size resend: credit 0, the credit-free slot just
+    /// used. Returns the held packet's id.
+    fn hold_back_one_resend(tracker: &mut SentPacketTracker<VirtualTime>) -> PacketId {
+        send_full(tracker, 1..2);
+        tracker.retransmit_credit = 0;
+        tracker.time_source.advance(Duration::from_millis(1_001));
+        tracker.last_uncredited_retransmit_nanos = Some(tracker.time_source.now_nanos());
+        assert!(matches!(tracker.get_resend(), ResendAction::WaitUntil(_)));
+        assert_eq!(
+            tracker.deferred_resend,
+            Some((1, FULL)),
+            "premise: held back"
+        );
+        1
+    }
+
+    /// The wake is for an ACK that brings the credit up to the held resend,
+    /// not for every ACK: one too small to pay for it leaves the loop parked.
+    #[test]
+    fn an_ack_too_small_for_the_held_resend_does_not_wake_the_loop() {
+        let mut tracker = mock_sent_packet_tracker();
+        hold_back_one_resend(&mut tracker);
+        tracker.report_sent_packet(9, vec![9].into());
+        let _ = take_new_flight(&tracker);
+        let _ = tracker.report_received_receipts(&[9]);
+        assert!(
+            !take_new_flight(&tracker),
+            "1 byte earned cannot pay for {FULL}"
+        );
+        assert!(tracker.deferred_resend.is_some());
+    }
+
+    /// Once a resend is admitted the held marker is cleared, so a later ACK
+    /// does not wake the loop for a resend that already went out.
+    #[test]
+    fn an_admitted_resend_clears_the_held_marker() {
+        let mut tracker = mock_sent_packet_tracker();
+        let held = hold_back_one_resend(&mut tracker);
+        // Credit exactly the size admits it (the boundary).
+        tracker.retransmit_credit = FULL;
+        assert!(matches!(tracker.get_resend(), ResendAction::Resend(id, _) if id == held));
+        assert_eq!(tracker.retransmit_credit, 0);
+        assert_eq!(tracker.deferred_resend, None);
+        send_full(&mut tracker, 2..3);
+        let _ = take_new_flight(&tracker);
+        let _ = tracker.report_received_receipts(&[2]);
+        assert!(
+            !take_new_flight(&tracker),
+            "nothing is held, nothing to wake for"
+        );
     }
 }

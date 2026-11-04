@@ -9,10 +9,13 @@
 //! The run drives the real `PeerConnection` loops over `MockSocket` and the
 //! [`LinkModel`] on virtual time, as `r1_tests` does, with one sender and
 //! many receivers, and shares its `drive_virtual_time` and `connect_pair`.
-//! What remains after the fix (about 2x offered per first copy delivered)
-//! comes from the first transmissions themselves: every connection still
-//! offers new data at 10 Mbit/s with no node-wide cap, which is #6045, not
-//! this test's subject.
+//! What remains after the fix, about 3x offered per first copy delivered, has
+//! two parts. About 2.1x is the first transmissions themselves (it is what is
+//! left with credit earned one-for-one): every connection still offers new
+//! data at 10 Mbit/s with no node-wide cap, which is #6045, not this test's
+//! subject. The rest is the allowance of `CREDIT_PER_ACKED_BYTE` = 2, which
+//! lets retransmissions run at up to twice the rate they are delivered so a
+//! connection recovers from an outage in a few round trips.
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -205,13 +208,18 @@ fn seeds() -> Vec<u64> {
     }
 }
 
+/// Offered datagrams per first copy delivered above which the run counts as
+/// a collapse. With the credit, runs measure 2.9-3.0; with retransmissions
+/// unbounded (the credit disabled, or refilled whenever a connection's
+/// backoff resets) they measure 6.7-8.8.
+const MAX_AMPLIFICATION: f64 = 4.0;
+
 /// Sixteen connections share a 4 Mbit/s uplink, each offering FixedRate's
-/// 10 Mbit/s. The ideal is about 17 s for the 8 MiB total; before #6100 only
-/// 9 of the 16 streams finished in 60 s and the host offered 8.3 datagrams per
-/// first copy delivered, 88% of them retransmissions (seed 7), the shape of
-/// the field storms. With retransmissions ACK-clocked by
-/// `RETRANSMIT_CREDIT_CAP` every stream finishes and the waste stays near the
-/// queue's own drop rate.
+/// 10 Mbit/s. The ideal is about 17 s for the 8 MiB total. Before #6100, 6 to
+/// 9 of the 16 streams finished in 60 s and the host offered 7.9-8.8
+/// datagrams per first copy delivered, nearly all of the excess
+/// retransmissions: the shape of the field storms. With retransmissions
+/// ACK-clocked by the credit (`RETRANSMIT_CREDIT_CAP`), every stream finishes.
 #[test]
 fn shared_saturated_uplink_does_not_collapse() {
     const PEERS: usize = 16;
@@ -233,7 +241,7 @@ fn shared_saturated_uplink_does_not_collapse() {
             r.dropped_queue_full,
         );
         eprintln!("{summary}");
-        if r.completed != PEERS || r.amplification >= 3.0 {
+        if r.completed != PEERS || r.amplification >= MAX_AMPLIFICATION {
             failures.push(summary);
         }
     }

@@ -264,7 +264,8 @@ flowchart TB
 5. **Flightsize update**: Decrement flightsize on ACK. Flightsize has two
    additional release paths so a stream whose ACKs never arrive cannot pin
    flightsize for the connection's life (#4345): (a) when a packet is
-   permanently abandoned after `MAX_PACKET_RETRANSMITS`, and (b) when an
+   permanently abandoned after `MAX_PACKET_RETRANSMITS` (each retransmission
+   before that spends ACK-earned credit, #6100), and (b) when an
    outbound stream aborts (cwnd-wait timeout, upstream stall/error, or mid-send
    failure) — `SentPacketTracker::drop_stream(stream_id)` removes all of the
    aborted stream's still-tracked packets and the abort releases their byte

@@ -231,7 +231,9 @@ channel) cannot pin flight size at cwnd and stall every subsequent stream
   2. ABANDON — after MAX_PACKET_RETRANSMITS with no ACK, SentPacketTracker
      returns ResendAction::Abandon and the recv loop calls
      CongestionControl::release_flightsize(len). Bounds the worst case for a
-     black-holed individual packet.
+     black-holed individual packet. Abandoning needs no retransmission
+     credit, but each retransmit before it does, so on a path delivering
+     too little to earn credit it takes longer (see "Retransmission credit").
   3. STREAM ABORT (drop_stream) — when an outbound stream aborts (cwnd-wait
      timeout, upstream stall/error, or mid-send failure in
      outbound_stream.rs), release_aborted_stream_flightsize() calls
@@ -296,22 +298,40 @@ minutes, 21% of peers in 2.25 days).
 
 SentPacketTracker::retransmit_credit (plaintext bytes, at most
 RETRANSMIT_CREDIT_CAP = 64 full packets, starts full):
-  → earned by the ACK of a TRACKED packet, by its size (a receipt for an id
-    no longer tracked earns nothing);
+  → earned by the ACK of a TRACKED packet, CREDIT_PER_ACKED_BYTE (2) per
+    byte (a receipt for an id no longer tracked earns nothing). Two, not
+    one: after an outage each delivered resend pays for two more, so the
+    backlog drains in ~log2(backlog) round trips (RFC 6937 PRR-SSRB). With
+    one it drained at ~1 packet per RTT and streams timed out;
   → spent by each RTO resend and TLP probe;
-  → without enough credit: a TLP is skipped (the RTO still covers the
-    packet); a resend waits at the head of the queue, keeping its
-    retransmit count, until ACKs earn enough credit for it (raises
-    new_flight) or the next credit-free slot;
-  → one credit-free retransmission per effective RTO (a lone loss on a quiet
-    connection, or probing a silent path);
-  → abandoning needs no credit (it sends nothing and frees flight size).
-Deferrals are counted in transport_snapshot.retransmits_deferred.
+  → a TLP without credit is skipped (the RTO still covers the packet); it
+    never takes the credit-free slot and is not a deferral;
+  → a resend without credit waits at the head of the queue, keeping its
+    retransmit count, until ACKs earn enough credit for it or the held
+    packet leaves tracking (either raises new_flight), or the next
+    credit-free slot;
+  → one credit-free resend per effective RTO, measured from the last one
+    with the CURRENT effective RTO, so it comes back to the base RTO when an
+    ACK resets the backoff (a lone loss on a quiet connection, or probing a
+    silent path);
+  → abandoning needs no credit, including a packet behind a held-back head
+    (take_due_abandonable): it sends nothing and frees flight size.
+A resend held back is counted once in transport_snapshot.retransmits_deferred
+(until a resend is next admitted).
+On a path that delivers nothing while the connection stays open, abandoning
+takes longer than before: each packet still needs MAX_PACKET_RETRANSMITS
+admitted resends, and without credit the connection admits one per
+effective RTO. Stream packets are released earlier by drop_stream when the
+stream aborts, and a connection that receives nothing closes at the 120 s
+idle timeout.
 
 DO NOT remove the credit or let retransmissions bypass it: the storm comes
 back (link_model::storm_tests::shared_saturated_uplink_does_not_collapse).
-DO NOT earn credit from untracked receipts or on a timer. New data is still
-paced only by the token bucket; a node-wide default cap is #6045.
+DO NOT earn credit from untracked receipts or on a timer, and DO NOT refill
+it when a connection's backoff resets: in a storm single connections go a
+whole RTO without an ACK, and a refill measured 6.7-7.7x amplification, the
+storm back. New data is still paced only by the token bucket; a node-wide
+default cap is #6045.
 ```
 
 ### Shadow per-peer RTT registry (issue #4074, Phases 1 + 1.5)

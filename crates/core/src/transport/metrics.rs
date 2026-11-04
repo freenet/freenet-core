@@ -942,9 +942,9 @@ struct LossCounters {
     rto_expiries: AtomicU64,
     /// Tail-loss probes fired.
     tlp_probes: AtomicU64,
-    /// Due retransmissions (RTO resends and TLP probes) held back because
-    /// the connection had no retransmission credit (#6100). A packet held
-    /// back again on a later check counts again.
+    /// Due resends held back because the connection had no retransmission
+    /// credit (#6100), each counted once until a resend is next admitted on
+    /// that connection. Skipped tail-loss probes are not counted.
     retransmits_deferred: AtomicU64,
     /// Standalone ack-only `NoOp` packets sent, and their on-wire bytes.
     standalone_ack_packets: AtomicU64,
@@ -3050,9 +3050,9 @@ pub struct TransportSnapshot {
     pub rto_expiries: u64,
     /// Tail-loss probes fired.
     pub tlp_probes: u64,
-    /// Due retransmissions (RTO resends and TLP probes) held back because
-    /// the connection had no retransmission credit (#6100). A packet held
-    /// back again on a later check counts again.
+    /// Due resends held back because the connection had no retransmission
+    /// credit (#6100), each counted once until a resend is next admitted on
+    /// that connection. Skipped tail-loss probes are not counted.
     pub retransmits_deferred: u64,
     /// Standalone ack-only `NoOp` packets sent, and their on-wire bytes.
     pub standalone_ack_packets: u64,
@@ -3749,9 +3749,9 @@ struct SnapshotExtras {
     pub rto_expiries: u64,
     /// Tail-loss probes fired.
     pub tlp_probes: u64,
-    /// Due retransmissions (RTO resends and TLP probes) held back because
-    /// the connection had no retransmission credit (#6100). A packet held
-    /// back again on a later check counts again.
+    /// Due resends held back because the connection had no retransmission
+    /// credit (#6100), each counted once until a resend is next admitted on
+    /// that connection. Skipped tail-loss probes are not counted.
     pub retransmits_deferred: u64,
     /// Standalone ack-only `NoOp` packets sent, and their on-wire bytes.
     pub standalone_ack_packets: u64,

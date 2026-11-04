@@ -331,7 +331,9 @@ An outbound stream can abort mid-transfer. Triggers:
 
 A stream's already-sent, unacked fragments are still counted in the
 connection-wide flight size. Left pinned, they stay counted until each fragment is
-independently ACKed or ages out via `MAX_PACKET_RETRANSMITS` (~6s) — and FixedRate's
+independently ACKed or ages out via `MAX_PACKET_RETRANSMITS` (~6s while other packets
+are being ACKed; longer on a path that delivers too little to earn retransmission
+credit, #6100) — and FixedRate's
 loss-pause caps cwnd at the frozen flight size, so a single aborted stream starves
 every subsequent stream on the same connection (the #4345 symptom).
 
