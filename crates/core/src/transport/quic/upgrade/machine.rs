@@ -77,7 +77,7 @@
 //! A `SessionEnded` that finds the endpoint down takes no backoff. Its tear
 //! down closes with `SESSION_ENDED`; every other tear down here closes with
 //! `DOWNGRADE`. At `SessionEnded` the machine also records
-//! [`Outcome::FallbackFollowedBySessionEnd`] for each fallback it recorded
+//! [`Outcome::ChurnedFallback`] for each fallback it recorded
 //! within [`FALLBACK_CHURN_WINDOW`] before, in any state.
 //!
 //! Each side counts a path as established on its own evidence: the client on
@@ -168,9 +168,11 @@ pub(in crate::transport) const IDENTITY_BACKOFF: Duration = BACKOFF_MAX;
 /// is retried less and less often.
 pub(in crate::transport) const STABLE_PATH: Duration = Duration::from_secs(10 * 60);
 /// A fallback followed by the end of the UDP session within this long is
-/// counted as churn (`Outcome::FallbackFollowedBySessionEnd`). Above the UDP
-/// idle timeout (120 s), so a peer that went silent and was timed out on UDP
-/// too is caught.
+/// counted as churn (`Outcome::ChurnedFallback`). Longer than the time a UDP
+/// session takes to end after its peer goes silent: the 120 s idle timeout,
+/// plus up to one keepalive interval (`MAX_KEEPALIVE_INTERVAL`, 15 s) since the
+/// last packet that refreshed it, plus one timeout check (5 s). A test fails
+/// if any of those grows past it.
 pub(in crate::transport) const FALLBACK_CHURN_WINDOW: Duration = Duration::from_secs(150);
 /// The fallbacks a machine remembers for [`FALLBACK_CHURN_WINDOW`]. Each
 /// fallback is charged a backoff of at least 48 s before the next attempt, so
@@ -322,7 +324,7 @@ pub(in crate::transport) enum Outcome {
     /// The UDP session ended within [`FALLBACK_CHURN_WINDOW`] of a
     /// [`Outcome::Fallback`] of this cause: that fallback came with the
     /// session's end. Recorded once per such fallback, at the session end.
-    FallbackFollowedBySessionEnd(FallbackCause),
+    ChurnedFallback(FallbackCause),
 }
 
 /// Why a path ended.
@@ -635,7 +637,7 @@ impl UpgradeMachine {
         actions.extend(
             churned
                 .into_iter()
-                .map(|cause| Action::Record(Outcome::FallbackFollowedBySessionEnd(cause))),
+                .map(|cause| Action::Record(Outcome::ChurnedFallback(cause))),
         );
         actions
     }

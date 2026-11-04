@@ -2050,7 +2050,7 @@ fn a_session_end_does_not_charge_a_failure_twice() {
             // Charged nothing more; an active path's fallback is counted as
             // followed by the session's end.
             let churn = if start == S::Active {
-                vec![Action::Record(Outcome::FallbackFollowedBySessionEnd(
+                vec![Action::Record(Outcome::ChurnedFallback(
                     FallbackCause::Reset,
                 ))]
             } else {
@@ -2251,9 +2251,26 @@ fn timeouts_and_windows_have_these_values() {
         (STABLE_PATH, 600),
         (OFFER_DELAY_MIN, 2),
         (OFFER_DELAY_MAX, 10),
+        (FALLBACK_CHURN_WINDOW, 150),
     ] {
         assert_eq!(value, Duration::from_secs(seconds));
     }
+}
+
+/// The churn window outlasts the time a UDP session takes to end once its peer
+/// goes silent, so an idle path whose UDP session times out too counts as
+/// churn. A longer idle timeout, keepalive or check interval fails here
+/// instead of moving that churn into the QUIC-specific count.
+#[test]
+fn the_churn_window_outlasts_a_udp_idle_timeout() {
+    use crate::simulation::{RealTime, TimeSource};
+    use crate::transport::peer_connection::{MAX_KEEPALIVE_INTERVAL, TIMEOUT_CHECK_INTERVAL};
+    let udp_session_end =
+        RealTime::new().connection_idle_timeout() + MAX_KEEPALIVE_INTERVAL + TIMEOUT_CHECK_INTERVAL;
+    assert!(
+        FALLBACK_CHURN_WINDOW > udp_session_end,
+        "{FALLBACK_CHURN_WINDOW:?} <= {udp_session_end:?}"
+    );
 }
 
 /// A second promotion with a key that would give the other role changes
@@ -2636,7 +2653,7 @@ fn only_a_session_end_closes_with_session_ended() {
 /// nothing again.
 #[test]
 fn a_fallback_counts_as_churn_only_when_the_session_ends_within_the_window() {
-    let churn = |cause| Action::Record(Outcome::FallbackFollowedBySessionEnd(cause));
+    let churn = |cause| Action::Record(Outcome::ChurnedFallback(cause));
     let lost = Outcome::Fallback(FallbackCause::Reset);
     for role in [Role::Server, Role::Client] {
         for (after, counted) in [

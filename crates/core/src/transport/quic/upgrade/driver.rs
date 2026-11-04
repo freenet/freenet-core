@@ -587,8 +587,9 @@ impl Session {
         if state.ended {
             match event {
                 SessionEvent::Incoming(incoming) => incoming.ignore(),
+                // The session ended while this dial was out.
                 SessionEvent::Connected { connection, .. } => {
-                    connection.close(QuicCloseCode::Downgrade)
+                    connection.close(QuicCloseCode::SessionEnded)
                 }
                 SessionEvent::Upgrade(_)
                 | SessionEvent::ConnectFailed { .. }
@@ -751,8 +752,9 @@ impl Session {
             Outcome::Fallback(cause) => {
                 TRANSPORT_METRICS.record_quic_fallback(fallback_label(cause), self.remote)
             }
-            Outcome::FallbackFollowedBySessionEnd(cause) => TRANSPORT_METRICS
-                .record_quic_fallback_followed_by_session_end(fallback_label(cause), self.remote),
+            Outcome::ChurnedFallback(cause) => {
+                TRANSPORT_METRICS.record_quic_churned_fallback(fallback_label(cause), self.remote)
+            }
         }
     }
 

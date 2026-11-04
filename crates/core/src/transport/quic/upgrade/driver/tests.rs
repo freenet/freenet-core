@@ -417,6 +417,46 @@ fn a_connection_for_no_live_attempt_is_closed() {
     });
 }
 
+/// A dial that connects after its session ended is closed with SESSION_ENDED,
+/// as the session's own end closes a path.
+#[test]
+fn a_connection_after_the_session_ended_closes_with_session_ended() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let h = Harness::server("quic-driver-late-dial", 37).await;
+        let (session, _rx) = h.session();
+        session.promote(h.peer.clone());
+        let permit = h
+            .pair
+            .b
+            .allow_peer(h.pair.a_addr, h.pair.a_keys.public())
+            .unwrap();
+        let (a, b) = (h.pair.a.clone(), h.pair.b.clone());
+        let (b_addr, b_key) = (h.pair.b_addr, h.pair.b_keys.public().clone());
+        let (client, _server) = drive(&h.pair.time, Duration::from_secs(30), async move {
+            let (client, server) = tokio::join!(a.connect(b_addr, &b_key), async {
+                b.accept().await.expect("an attempt").establish().await
+            });
+            (client.expect("client"), server.expect("server"))
+        })
+        .await;
+        drop(permit);
+        session.end();
+        let quinn = client.inner().clone();
+        let sent_before = TRANSPORT_METRICS.quic_close_sent_to(b_addr).len();
+        let sends = session.handle(SessionEvent::Connected {
+            attempt: 1,
+            connection: client,
+        });
+        assert!(sends.is_empty());
+        assert!(quinn.close_reason().is_some(), "closed at once");
+        assert_eq!(
+            TRANSPORT_METRICS.quic_close_sent_to(b_addr)[sent_before..],
+            [QuicCloseCode::SessionEnded]
+        );
+    });
+}
+
 /// `PeerConnection` declares its QUIC path before the inbound budget the path
 /// charges, so its fields drop in that order (budget case (d)).
 #[test]
@@ -1136,7 +1176,7 @@ fn fallbacks_and_churned_fallbacks_reach_their_own_counters() {
                 .flat_map(|(cause, _)| {
                     [
                         Action::Record(Outcome::Fallback(*cause)),
-                        Action::Record(Outcome::FallbackFollowedBySessionEnd(*cause)),
+                        Action::Record(Outcome::ChurnedFallback(*cause)),
                     ]
                 })
                 .collect(),
@@ -1144,12 +1184,7 @@ fn fallbacks_and_churned_fallbacks_reach_their_own_counters() {
         drop(state);
         let want: Vec<String> = causes
             .iter()
-            .flat_map(|(_, label)| {
-                [
-                    format!("{label:?}"),
-                    format!("(\"followed_by_session_end\", {label:?})"),
-                ]
-            })
+            .flat_map(|(_, label)| [format!("{label:?}"), format!("(\"churned\", {label:?})")])
             .collect();
         assert_eq!(TRANSPORT_METRICS.quic_events_of(h.remote), want);
     });

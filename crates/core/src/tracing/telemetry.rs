@@ -3099,12 +3099,9 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 for (cause, count) in QuicFallback::ALL.iter().zip(snapshot.quic_fallback) {
                     m.insert(format!("quic_fallback_{}", cause.label()), count.into());
                 }
-                for (cause, count) in QuicFallback::ALL
-                    .iter()
-                    .zip(snapshot.quic_fallback_followed_by_session_end)
-                {
+                for (cause, count) in QuicFallback::ALL.iter().zip(snapshot.quic_churned_fallback) {
                     m.insert(
-                        format!("quic_fallback_followed_by_session_end_{}", cause.label()),
+                        format!("quic_churned_fallback_{}", cause.label()),
                         count.into(),
                     );
                 }
@@ -7620,7 +7617,7 @@ mod tests {
             "quic_close_received",
             "quic_upgrade",
             "quic_fallback",
-            "quic_fallback_followed_by_session_end",
+            "quic_churned_fallback",
             "quic_path_age_at_close",
         ] {
             assert!(expected.remove(family), "{family} is in the snapshot");
@@ -7645,7 +7642,7 @@ mod tests {
         expected.extend(
             QuicFallback::ALL
                 .iter()
-                .map(|cause| format!("quic_fallback_followed_by_session_end_{}", cause.label())),
+                .map(|cause| format!("quic_churned_fallback_{}", cause.label())),
         );
         expected.extend(
             QuicPathAge::ALL
@@ -7947,7 +7944,7 @@ mod tests {
         fill(&mut snapshot.quic_close_received);
         fill(&mut snapshot.quic_upgrade);
         fill(&mut snapshot.quic_fallback);
-        fill(&mut snapshot.quic_fallback_followed_by_session_end);
+        fill(&mut snapshot.quic_churned_fallback);
         fill(&mut snapshot.quic_path_age_at_close);
         snapshot.quic_establish_ms_p50 = Some(901);
         snapshot.quic_establish_ms_p90 = Some(902);
@@ -7970,14 +7967,8 @@ mod tests {
         for (cause, count) in QuicFallback::ALL.iter().zip(snapshot.quic_fallback) {
             expected.push((format!("quic_fallback_{}", cause.label()), count));
         }
-        for (cause, count) in QuicFallback::ALL
-            .iter()
-            .zip(snapshot.quic_fallback_followed_by_session_end)
-        {
-            expected.push((
-                format!("quic_fallback_followed_by_session_end_{}", cause.label()),
-                count,
-            ));
+        for (cause, count) in QuicFallback::ALL.iter().zip(snapshot.quic_churned_fallback) {
+            expected.push((format!("quic_churned_fallback_{}", cause.label()), count));
         }
         for (age, count) in QuicPathAge::ALL.iter().zip(snapshot.quic_path_age_at_close) {
             expected.push((format!("quic_path_age_at_close_{}", age.label()), count));
