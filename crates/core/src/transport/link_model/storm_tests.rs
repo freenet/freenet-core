@@ -252,6 +252,17 @@ fn shared_saturated_uplink_does_not_collapse() {
     );
 }
 
+/// Receipt loss for the reverse-path gate: 70% of the receiver's packets,
+/// which carry its receipts, are lost.
+const RECEIPT_LOSS: f64 = 0.7;
+/// Idle time after the last stream before the gate reads the flight size:
+/// the last data goes out around 15 s, a held resend is abandoned at most
+/// one RTO deadline plus `MAX_CREDIT_WAIT` (60 s) later, with room to spare.
+const IDLE_SECS: u64 = 180;
+/// In-flight bytes the gate allows after the idle time. Measured: 3 KB with
+/// the wait bound, 6.5 MB without it.
+const MAX_FLIGHT_AFTER_IDLE: usize = 64 * 1024;
+
 /// What one reverse-loss run did.
 struct ReverseLossReport {
     completed_after: Option<Duration>,
@@ -293,10 +304,7 @@ async fn run_reverse_loss(
         create_mock_peer_with_link_model(link.clone(), channels.clone(), vt.clone(), config)
             .await
             .expect("peer b");
-    let (ca, cb) = futures::join!(
-        peer_a.connect(pub_b, addr_b),
-        peer_b.connect(pub_a, addr_a)
-    );
+    let (ca, cb) = futures::join!(peer_a.connect(pub_b, addr_b), peer_b.connect(pub_a, addr_a));
     let (conn_a, conn_b) = connect_pair(ca, cb).await;
     let (mut conn_a, mut conn_b) = (conn_a.expect("connect a"), conn_b.expect("connect b"));
     link.set_host_link(
@@ -314,8 +322,9 @@ async fn run_reverse_loss(
     const STREAMS: usize = 3;
     let mut done = 0;
     'outer: while done < STREAMS {
-        let payload: Vec<u8> =
-            (0..payload_len).map(|i| (i * 7 + done + seed as usize) as u8).collect();
+        let payload: Vec<u8> = (0..payload_len)
+            .map(|i| (i * 7 + done + seed as usize) as u8)
+            .collect();
         conn_a.send(payload).await.expect("send");
         loop {
             tokio::select! {
@@ -334,7 +343,7 @@ async fn run_reverse_loss(
         }
     }
     // Idle 30 s with both loops running, then sample what is still in flight.
-    let mut idle = vt.sleep(Duration::from_secs(30));
+    let mut idle = vt.sleep(Duration::from_secs(IDLE_SECS));
     loop {
         tokio::select! {
             biased;
@@ -352,20 +361,41 @@ async fn run_reverse_loss(
     }
 }
 
+/// Receipts are not cumulative, so a path that loses most of the
+/// receiver's packets loses most of the sender's receipts while every data
+/// packet arrives. The retransmission credit must not slow delivery there
+/// (the streams finish on data, not on receipts), and the resends it holds
+/// back for credit, mostly of packets already delivered, must not stay in
+/// flight: with credit decaying, they once moved at one credit-free resend
+/// per effective RTO and 6.5 MB stayed pinned after 180 s idle, until
+/// `MAX_CREDIT_WAIT` bounded the wait.
 #[test]
-fn reverse_loss_exploration() {
-    for loss in [0.0, 0.1, 0.3, 0.5, 0.7] {
-        let r = block_on_seeded(
-            11,
-            run_reverse_loss(6 * 1024 * 1024, loss, Duration::from_secs(120), 11),
-        );
-        eprintln!(
-            "receipt_loss={loss}: 3 streams completed_after={:?} flightsize_after_idle={} rto={} abandoned={} failed_streams={}",
-            r.completed_after,
-            r.probe.flightsize,
-            r.probe.rto_expiries,
-            r.probe.abandoned_packets,
-            r.probe.outbound_streams_failed
-        );
-    }
+fn receipt_loss_neither_slows_delivery_nor_pins_flight() {
+    let r = block_on_seeded(
+        11,
+        run_reverse_loss(6 * 1024 * 1024, RECEIPT_LOSS, Duration::from_secs(120), 11),
+    );
+    let summary = format!(
+        "{RECEIPT_LOSS} receipt loss: 3 streams completed after {:?}, {} bytes in flight after \
+         {IDLE_SECS} s idle, {} RTO expiries, {} abandoned, {} streams failed",
+        r.completed_after,
+        r.probe.flightsize,
+        r.probe.rto_expiries,
+        r.probe.abandoned_packets,
+        r.probe.outbound_streams_failed,
+    );
+    eprintln!("{summary}");
+    // Three 6 MiB streams at FixedRate's 10 Mbit/s take 15.04 s with no loss.
+    let completed = r
+        .completed_after
+        .unwrap_or_else(|| panic!("not delivered: {summary}"));
+    assert!(
+        completed <= Duration::from_millis(16_500),
+        "delivery slowed: {summary}"
+    );
+    assert_eq!(r.probe.outbound_streams_failed, 0, "{summary}");
+    assert!(
+        r.probe.flightsize <= MAX_FLIGHT_AFTER_IDLE,
+        "held resends stayed in flight: {summary}"
+    );
 }

@@ -130,6 +130,22 @@ const MAX_PACKET_RETRANSMITS: u32 = 12;
 /// path resends a burst of up to that many lost packets at once, as before.
 const RETRANSMIT_CREDIT_CAP: usize = 64 * super::packet_data::MAX_PACKET_SIZE;
 
+/// Longest a due resend may wait for retransmission credit before it is
+/// abandoned (#6100).
+///
+/// Abandonment must stay bounded in time whatever the credit (#4345): on a
+/// path that loses most of OUR receipts, the packets still waiting are mostly
+/// ones the peer already has (each re-send of one earns credit only if its
+/// re-ack survives), so credit decays, the backlog moves at one credit-free
+/// resend per effective RTO, and without this bound it held megabytes in
+/// flight indefinitely (measured: 6.5 MB still pinned after 180 s idle at 70%
+/// receipt loss, where unbounded retransmission left 147 KB). 60 s is the RTO
+/// cap and far past the receiver's 5 s stream inactivity timeout, so a packet
+/// held that long was either delivered already or belongs to a stream the
+/// receiver gave up on. Applies only to a resend refused for credit, so a
+/// connection with credit never abandons early.
+const MAX_CREDIT_WAIT: Duration = Duration::from_secs(60);
+
 /// Credit earned per byte acknowledged (#6100).
 ///
 /// Two, so that after an outage the retransmissions in flight double every
@@ -1050,12 +1066,12 @@ impl<T: TimeSource> SentPacketTracker<T> {
     }
 
     /// With the head of the queue held back for credit, the first packet
-    /// behind it that is due and out of retransmissions, if any (#6100).
-    /// Abandoning needs no credit, so a held-back head must not keep such a
-    /// packet's bytes pinned in flight size (#4345). The queue is in deadline
-    /// order, so the search stops at the first packet not yet due; packets
-    /// already ACKed are passed over (`get_resend` drops them when they reach
-    /// the head).
+    /// behind it that is due and either out of retransmissions or overdue by
+    /// [`MAX_CREDIT_WAIT`], if any (#6100). Abandoning needs no credit, so a
+    /// held-back head must not keep such a packet's bytes pinned in flight
+    /// size (#4345). The queue is in deadline order, so the search stops at
+    /// the first packet not yet due; packets already ACKed are passed over
+    /// (`get_resend` drops them when they reach the head).
     fn take_due_abandonable(
         &mut self,
         now_nanos: u64,
@@ -1066,13 +1082,16 @@ impl<T: TimeSource> SentPacketTracker<T> {
             let Some((_, sent_nanos, _, _)) = self.pending_receipts.get(&entry.packet_id) else {
                 continue;
             };
-            if now_nanos < sent_nanos.saturating_add(effective_rto_nanos) {
+            let deadline = sent_nanos.saturating_add(effective_rto_nanos);
+            if now_nanos < deadline {
                 break;
             }
-            if self
-                .retransmit_counts
-                .get(&entry.packet_id)
-                .is_some_and(|&count| count >= MAX_PACKET_RETRANSMITS)
+            let overdue = now_nanos - deadline >= MAX_CREDIT_WAIT.as_nanos() as u64;
+            if overdue
+                || self
+                    .retransmit_counts
+                    .get(&entry.packet_id)
+                    .is_some_and(|&count| count >= MAX_PACKET_RETRANSMITS)
             {
                 found = Some(index);
                 break;
@@ -1249,6 +1268,10 @@ impl<T: TimeSource> SentPacketTracker<T> {
                 if !will_abandon
                     && !self.admit_resend(entry.packet_id, size, now_nanos, effective_rto_nanos)
                 {
+                    let give_up_at = rto_deadline.saturating_add(MAX_CREDIT_WAIT.as_nanos() as u64);
+                    if now_nanos >= give_up_at {
+                        return self.abandon(entry.packet_id);
+                    }
                     self.resend_queue.push_front(entry);
                     if let Some(packet_id) =
                         self.take_due_abandonable(now_nanos, effective_rto_nanos)
@@ -1256,7 +1279,8 @@ impl<T: TimeSource> SentPacketTracker<T> {
                         return self.abandon(packet_id);
                     }
                     return ResendAction::WaitUntil(
-                        self.next_uncredited_slot_nanos(effective_rto_nanos),
+                        self.next_uncredited_slot_nanos(effective_rto_nanos)
+                            .min(give_up_at),
                     );
                 }
                 // Update packet loss proportion for a lost packet
@@ -3888,5 +3912,68 @@ pub(in crate::transport) mod tests {
             !take_new_flight(&tracker),
             "nothing is held, nothing to wake for"
         );
+    }
+
+    /// A resend held back for credit is abandoned once it has waited
+    /// `MAX_CREDIT_WAIT` past its deadline, so a backlog the credit cannot
+    /// pay for (mostly packets the peer already has, their receipts lost)
+    /// does not stay in flight forever (#4345).
+    #[test]
+    fn a_resend_held_for_credit_too_long_is_abandoned() {
+        let mut tracker = mock_sent_packet_tracker();
+        send_full(&mut tracker, 1..2);
+        tracker.retransmit_credit = 0;
+        tracker.time_source.advance(Duration::from_millis(1_001));
+        let deadline = tracker.time_source.now_nanos() - 1_000_000;
+        let give_up_at = deadline + MAX_CREDIT_WAIT.as_nanos() as u64;
+        // Keep the credit-free slot taken, so the resend stays held.
+        tracker.last_uncredited_retransmit_nanos = Some(tracker.time_source.now_nanos());
+        let ResendAction::WaitUntil(at) = tracker.get_resend() else {
+            panic!("held back");
+        };
+        assert!(at <= give_up_at, "the loop must wake by the give-up time");
+        tracker.time_source.advance(Duration::from_nanos(
+            give_up_at - 1 - tracker.time_source.now_nanos(),
+        ));
+        tracker.last_uncredited_retransmit_nanos = Some(tracker.time_source.now_nanos());
+        assert!(
+            matches!(tracker.get_resend(), ResendAction::WaitUntil(_)),
+            "still held just before the bound"
+        );
+        tracker.time_source.advance(Duration::from_nanos(1));
+        tracker.last_uncredited_retransmit_nanos = Some(tracker.time_source.now_nanos());
+        assert_eq!(
+            tracker.get_resend(),
+            ResendAction::Abandon {
+                packet_id: 1,
+                payload_len: FULL
+            }
+        );
+    }
+
+    /// The same bound applies behind a held head: a packet that has been due
+    /// for `MAX_CREDIT_WAIT` is abandoned even while the head, resent more
+    /// recently, is still within it.
+    #[test]
+    fn an_overdue_packet_behind_a_held_head_is_abandoned() {
+        let mut tracker = mock_sent_packet_tracker();
+        send_full(&mut tracker, 1..3);
+        tracker.retransmit_credit = 0;
+        // Packet 1 was resent recently (refreshed in place, so it stays at
+        // the head); packet 2 has been due since the first RTO.
+        tracker
+            .time_source
+            .advance(MAX_CREDIT_WAIT + Duration::from_secs(1));
+        assert!(tracker.refresh_sent_packet(1, vec![1].into(), None));
+        tracker.time_source.advance(Duration::from_millis(1_001));
+        tracker.last_uncredited_retransmit_nanos = Some(tracker.time_source.now_nanos());
+        assert_eq!(
+            tracker.get_resend(),
+            ResendAction::Abandon {
+                packet_id: 2,
+                payload_len: FULL
+            }
+        );
+        assert!(tracker.contains_packet(1), "the head is within the bound");
     }
 }
