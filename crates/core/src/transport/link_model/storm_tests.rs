@@ -8,9 +8,11 @@
 //!
 //! The run drives the real `PeerConnection` loops over `MockSocket` and the
 //! [`LinkModel`] on virtual time, as `r1_tests` does, with one sender and
-//! many receivers. What remains of the 2x after the fix is the first
-//! transmissions themselves: every connection still offers new data at
-//! 10 Mbit/s with no node-wide cap, which is #6045, not this test's subject.
+//! many receivers, and shares its `drive_virtual_time` and `connect_pair`.
+//! What remains after the fix (about 2x offered per first copy delivered)
+//! comes from the first transmissions themselves: every connection still
+//! offers new data at 10 Mbit/s with no node-wide cap, which is #6045, not
+//! this test's subject.
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -19,13 +21,13 @@ use std::time::Duration;
 
 use dashmap::DashMap;
 
+use super::r1_tests::{connect_pair, drive_virtual_time};
 use super::{HostLink, LinkModel, Loss};
 use crate::config::GlobalRng;
 use crate::simulation::{TimeSource, VirtualTime};
 use crate::transport::congestion_control::{CongestionControlAlgorithm, CongestionControlConfig};
 use crate::transport::mock_transport::{Channels, create_mock_peer_with_link_model};
-use crate::transport::peer_connection::{CongestionProbe, PeerConnection};
-use crate::transport::{Socket, TransportError};
+use crate::transport::peer_connection::CongestionProbe;
 
 const ONE_WAY_DELAY: Duration = Duration::from_millis(40);
 const SENDER_UPLINK_BPS: u64 = 4_000_000;
@@ -34,14 +36,9 @@ const SENDER_QUEUE: usize = (SENDER_UPLINK_BPS / 8 / 10) as usize;
 /// Random loss after the sender's queue, so each seed is a different run.
 const RANDOM_LOSS: f64 = 0.01;
 
-async fn drive_virtual_time(vt: VirtualTime) {
-    loop {
-        tokio::time::sleep(Duration::from_millis(1)).await;
-        vt.trigger_expired();
-        vt.advance_to_next_wakeup();
-    }
-}
-
+/// Runs `f` to completion on a paused current-thread runtime with
+/// `GlobalRng` seeded from `seed`, as `r1_tests::block_on_seeded` does but
+/// with this module's own salt, so a seed shared with R1 is a different run.
 fn block_on_seeded<F: Future>(seed: u64, f: F) -> F::Output {
     let _rng = GlobalRng::seed_guard(seed ^ 0x36_31_30_30);
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -50,39 +47,6 @@ fn block_on_seeded<F: Future>(seed: u64, f: F) -> F::Output {
         .build()
         .expect("runtime");
     rt.block_on(f)
-}
-
-/// Drives both ends of a hole punch until both are established (see
-/// `r1_tests::connect_pair` for why both must be polled).
-async fn connect_pair<S: Socket>(
-    a: impl Future<Output = Result<PeerConnection<S, VirtualTime>, TransportError>>,
-    b: impl Future<Output = Result<PeerConnection<S, VirtualTime>, TransportError>>,
-) -> (
-    PeerConnection<S, VirtualTime>,
-    PeerConnection<S, VirtualTime>,
-) {
-    async fn serve<S: Socket>(
-        conn: &mut Option<PeerConnection<S, VirtualTime>>,
-    ) -> Result<Vec<u8>, TransportError> {
-        match conn {
-            Some(c) => c.recv().await,
-            None => std::future::pending().await,
-        }
-    }
-    let mut a = std::pin::pin!(a);
-    let mut b = std::pin::pin!(b);
-    let mut conn_a = None;
-    let mut conn_b = None;
-    while conn_a.is_none() || conn_b.is_none() {
-        tokio::select! {
-            biased;
-            r = &mut a, if conn_a.is_none() => conn_a = Some(r.expect("connect a")),
-            r = &mut b, if conn_b.is_none() => conn_b = Some(r.expect("connect b")),
-            r = serve(&mut conn_a) => panic!("a received {r:?} early"),
-            r = serve(&mut conn_b) => panic!("b received {r:?} early"),
-        }
-    }
-    (conn_a.expect("set"), conn_b.expect("set"))
 }
 
 /// What one run did, from the sender's side and the link's ground truth.
@@ -109,7 +73,7 @@ async fn run_storm(peers: usize, payload_len: usize, horizon: Duration, seed: u6
         one_way_delay: ONE_WAY_DELAY,
         loss: Loss::None,
     };
-    let link = Arc::new(LinkModel::new(fast.clone(), seed));
+    let link = Arc::new(LinkModel::new(fast, seed));
     let channels: Channels = Arc::new(DashMap::new());
     let config = Some(CongestionControlConfig::new(
         CongestionControlAlgorithm::FixedRate,
@@ -149,8 +113,8 @@ async fn run_storm(peers: usize, payload_len: usize, horizon: Duration, seed: u6
             peer_b.connect(pub_a.clone(), addr_a)
         );
         let (ca, cb) = connect_pair(ca, cb).await;
-        senders.push(ca);
-        receivers.push(cb);
+        senders.push(ca.expect("connect sender"));
+        receivers.push(cb.expect("connect receiver"));
         handlers.push(peer_b);
         addrs.push(addr_b);
     }

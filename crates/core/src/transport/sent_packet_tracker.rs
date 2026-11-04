@@ -233,9 +233,13 @@ pub(super) struct SentPacketTracker<T: TimeSource> {
     /// recovering, and probes a path that has stopped acknowledging at the
     /// rate RFC 6298's single backed-off timer would.
     next_uncredited_retransmit_nanos: u64,
-    /// Size of a due retransmission held back for lack of credit, 0 if none.
-    /// An ACK that brings the credit up to it raises `new_flight`, so the
-    /// recv loop resends it without waiting for the deadline it parked on.
+    /// Size of the last due retransmission held back for lack of credit, 0
+    /// if none or once an ACK has woken the recv loop for it. An ACK that
+    /// brings the credit up to it raises `new_flight`, so the recv loop
+    /// resends it without waiting for the deadline it parked on. It is not
+    /// cleared when that retransmission is resolved another way (sent in a
+    /// credit-free slot, or a probe that was skipped), so that wake can find
+    /// nothing to send.
     deferred_retransmit_bytes: usize,
 
     /// Owning stream for each currently-tracked packet (issue #4345).
@@ -1026,8 +1030,8 @@ impl<T: TimeSource> SentPacketTracker<T> {
     ///
     /// Both need retransmission credit (#6100, [`RETRANSMIT_CREDIT_CAP`]).
     /// Without it a probe is skipped, and a resend waits, returning
-    /// `WaitUntil` the next credit-free slot; an ACK that covers it raises the
-    /// new-flight signal first.
+    /// `WaitUntil` the next credit-free slot; if ACKs earn enough credit for
+    /// it before then, they raise the new-flight signal.
     pub(super) fn get_resend(&mut self) -> ResendAction {
         let now_nanos = self.time_source.now_nanos();
         let pto = self.probe_timeout();
@@ -1039,12 +1043,13 @@ impl<T: TimeSource> SentPacketTracker<T> {
                 continue;
             }
 
-            // Get the packet's sent time - this may have been updated by re-registration
-            let sent_time_nanos = self
+            // The packet's sent time (re-registration may have updated it) and
+            // its size, which a retransmission spends as credit (#6100)
+            let (sent_time_nanos, size) = self
                 .pending_receipts
                 .get(&entry.packet_id)
-                .map(|(_, ts, _, _)| *ts)
-                .unwrap_or(0);
+                .map(|(_, ts, _, size)| (*ts, *size))
+                .unwrap_or((0, 0));
 
             // Calculate RTO deadline from current sent_time (not stored value)
             // This handles re-registration after TLP correctly
@@ -1067,10 +1072,6 @@ impl<T: TimeSource> SentPacketTracker<T> {
                     // A probe is a retransmission and needs credit (#6100).
                     // Without it the probe is skipped, not delayed: the RTO
                     // still covers the packet.
-                    let size = self
-                        .pending_receipts
-                        .get(&entry.packet_id)
-                        .map_or(0, |(_, _, _, size)| *size);
                     if !self.admit_retransmit(size, now_nanos, effective_rto_nanos) {
                         self.tlp_sent_packets.insert(entry.packet_id);
                         self.resend_queue.push_front(entry);
@@ -1102,18 +1103,13 @@ impl<T: TimeSource> SentPacketTracker<T> {
                 // A resend needs credit (#6100). Abandoning sends nothing, so
                 // it does not: a packet out of retransmissions is released
                 // whatever the credit. A resend held back keeps its place at
-                // the head and its retransmission count, and goes out when an
-                // ACK brings the credit up (which raises `new_flight`) or at
-                // the next credit-free slot, whichever comes first.
+                // the head and its retransmission count, and goes out when
+                // ACKs earn enough credit for it (which raises `new_flight`)
+                // or at the next credit-free slot, whichever comes first.
                 let will_abandon = self
                     .retransmit_counts
                     .get(&entry.packet_id)
-                    .map_or(0, |count| *count)
-                    >= MAX_PACKET_RETRANSMITS;
-                let size = self
-                    .pending_receipts
-                    .get(&entry.packet_id)
-                    .map_or(0, |(_, _, _, size)| *size);
+                    .is_some_and(|&count| count >= MAX_PACKET_RETRANSMITS);
                 if !will_abandon && !self.admit_retransmit(size, now_nanos, effective_rto_nanos) {
                     self.resend_queue.push_front(entry);
                     return ResendAction::WaitUntil(self.next_uncredited_retransmit_nanos);

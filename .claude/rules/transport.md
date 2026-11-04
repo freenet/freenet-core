@@ -301,8 +301,8 @@ RETRANSMIT_CREDIT_CAP = 64 full packets, starts full):
   → spent by each RTO resend and TLP probe;
   → without enough credit: a TLP is skipped (the RTO still covers the
     packet); a resend waits at the head of the queue, keeping its
-    retransmit count, until an ACK covers it (raises new_flight) or the
-    next credit-free slot;
+    retransmit count, until ACKs earn enough credit for it (raises
+    new_flight) or the next credit-free slot;
   → one credit-free retransmission per effective RTO (a lone loss on a quiet
     connection, or probing a silent path);
   → abandoning needs no credit (it sends nothing and frees flight size).
