@@ -234,12 +234,12 @@ pub(super) struct SentPacketTracker<T: TimeSource> {
     /// rate RFC 6298's single backed-off timer would.
     next_uncredited_retransmit_nanos: u64,
     /// Size of the last due retransmission held back for lack of credit, 0
-    /// if none or once an ACK has woken the recv loop for it. An ACK that
-    /// brings the credit up to it raises `new_flight`, so the recv loop
-    /// resends it without waiting for the deadline it parked on. It is not
-    /// cleared when that retransmission is resolved another way (sent in a
-    /// credit-free slot, or a probe that was skipped), so that wake can find
-    /// nothing to send.
+    /// if none, once a retransmission is admitted, or once an ACK has woken
+    /// the recv loop for it. An ACK that brings the credit up to it raises
+    /// `new_flight`, so the recv loop resends it without waiting for the
+    /// deadline it parked on. A skipped probe also sets it, and its packet
+    /// may be ACKed before anything is admitted, so that wake can find
+    /// nothing to send; a spurious wake costs one `get_resend` call.
     deferred_retransmit_bytes: usize,
 
     /// Owning stream for each currently-tracked packet (issue #4345).
@@ -978,17 +978,24 @@ impl<T: TimeSource> SentPacketTracker<T> {
     /// one credit-free retransmission allowed per effective RTO. On refusal
     /// the retransmission is recorded as deferred.
     fn admit_retransmit(&mut self, size: usize, now_nanos: u64, effective_rto_nanos: u64) -> bool {
-        if self.retransmit_credit >= size {
+        let admitted = if self.retransmit_credit >= size {
             self.retransmit_credit -= size;
-            return true;
-        }
-        if now_nanos >= self.next_uncredited_retransmit_nanos {
+            true
+        } else if now_nanos >= self.next_uncredited_retransmit_nanos {
             self.next_uncredited_retransmit_nanos = now_nanos.saturating_add(effective_rto_nanos);
-            return true;
+            true
+        } else {
+            false
+        };
+        if admitted {
+            // Whatever was held back before has gone out, or is behind this
+            // one at the head of the queue and will be judged again.
+            self.deferred_retransmit_bytes = 0;
+        } else {
+            self.deferred_retransmit_bytes = size;
+            super::TRANSPORT_METRICS.record_retransmit_deferred();
         }
-        self.deferred_retransmit_bytes = size;
-        super::TRANSPORT_METRICS.record_retransmit_deferred();
-        false
+        admitted
     }
 
     /// Get the current backoff multiplier (for testing/debugging)
