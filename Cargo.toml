@@ -104,7 +104,7 @@ opentelemetry = "0.32"
 opentelemetry-http = "0.32"
 opentelemetry-jaeger = "0.22"
 opentelemetry-otlp = { version = "0.32.0", default-features = false }
-opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
+opentelemetry_sdk = { version = "0.33", features = ["rt-tokio"] }
 tracing = "0.1"
 # Bumping this? Re-read `rolling.rs`'s `impl io::Write for
 # RollingFileAppender` first. The log pruner's GC-exemption argument
