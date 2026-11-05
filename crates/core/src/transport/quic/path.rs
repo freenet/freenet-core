@@ -395,6 +395,9 @@ quic_outcomes! {
         /// A Short or Stream frame on a path that accepts no data (shadow
         /// mode); stopped before anything was charged.
         RefusedNotAcceptingData => "refused_not_accepting_data",
+        /// The first refused data frame closed the path with DOWNGRADE (once
+        /// per path).
+        ClosedRefusingData => "closed_refusing_data",
         /// A control payload of a version this node does not read.
         ControlUnknownVersion => "control_unknown_version",
         /// A control payload of a type this node does not know.
@@ -624,6 +627,11 @@ pub(crate) struct QuicPath {
     /// The connection's count of acknowledged packets, `None` if its controller
     /// does not keep one.
     ack_progress: Option<recycle::AckProgress>,
+    /// A send timed out with nothing acknowledged for the window: the path may
+    /// have gone dark, and new sends go on UDP until the count at
+    /// `suspect_acked` moves ([`Self::is_suspect`]).
+    suspect: std::sync::atomic::AtomicBool,
+    suspect_acked: AtomicU64,
     /// Where the path's watch reports that the peer was heard from.
     heard: Arc<recycle::PeerHeard>,
     #[cfg(test)]
@@ -757,6 +765,7 @@ impl QuicPath {
             data.streams,
             controls_tx,
             limits.accept_data,
+            connection.closer(),
         );
         #[cfg(test)]
         {
@@ -798,6 +807,8 @@ impl QuicPath {
                 send_data: AtomicU8::new(SEND_DATA_NEVER),
                 stall: parking_lot::Mutex::new(stall),
                 ack_progress,
+                suspect: std::sync::atomic::AtomicBool::new(false),
+                suspect_acked: AtomicU64::new(0),
                 heard,
                 #[cfg(test)]
                 budget,
@@ -916,6 +927,44 @@ impl QuicPath {
     /// ([`recycle::watch_acknowledgements`]).
     pub(in crate::transport) fn report_receipts_to(&self, report: Box<dyn Fn() + Send + Sync>) {
         self.heard.report_to(report);
+    }
+
+    /// A send timed out on this path with nothing acknowledged for the window
+    /// (`route::StallCount`), when the count read `acked`. A path that went dark
+    /// would otherwise take every new send until it is recycled: each short ends
+    /// `MaybeDelivered(TimedOut)`, is never resent and is lost, and an operation's
+    /// retry lands in the same place. Sends already on the path stay there, since
+    /// resending them could deliver a message twice.
+    pub(in crate::transport) fn become_suspect(&self, acked: u64) {
+        self.suspect_acked.store(acked, Ordering::Release);
+        if !self.suspect.swap(true, Ordering::AcqRel) {
+            self.stats.record_send_event(QuicSendEvent::SuspectEntered);
+            tracing::debug!(
+                remote = %self.connection.inner().remote_address(),
+                "QUIC path: sends time out and nothing is acknowledged; new data \
+                 goes on UDP until the peer acknowledges again"
+            );
+        }
+    }
+
+    /// Whether the path is suspect: new data goes on UDP. It stops being suspect
+    /// the first time this is asked after the connection acknowledged something
+    /// new, which quinn's keepalive brings within its interval on a live path.
+    /// A path that stays dark is recycled by the stall close or the idle timeout.
+    pub(in crate::transport) fn is_suspect(&self) -> bool {
+        if !self.suspect.load(Ordering::Acquire) {
+            return false;
+        }
+        let Some(progress) = &self.ack_progress else {
+            return false;
+        };
+        if progress.acked() == self.suspect_acked.load(Ordering::Acquire) {
+            return true;
+        }
+        if self.suspect.swap(false, Ordering::AcqRel) {
+            self.stats.record_send_event(QuicSendEvent::SuspectLeft);
+        }
+        false
     }
 
     /// Whether a new data send may start on this path.

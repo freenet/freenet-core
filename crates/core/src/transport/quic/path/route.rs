@@ -104,6 +104,12 @@ quic_outcomes! {
         StalledClosed => "stalled_closed",
         /// A message on its way to UDP could not be sent there, and is lost.
         UdpSendFailed => "udp_send_failed",
+        /// A send timed out with nothing acknowledged for the window, so new
+        /// sends went on UDP ([`QuicPath::is_suspect`]).
+        SuspectEntered => "suspect_entered",
+        /// The connection acknowledged something again, so the path took sends
+        /// again.
+        SuspectLeft => "suspect_left",
     }
 }
 
@@ -154,6 +160,15 @@ fn timed_out(outcome: &BoundedSend) -> bool {
 /// How long the path must have gone with no packet newly acknowledged before a
 /// timeout counts against it: the acknowledgement watch's window.
 pub(crate) const STALL_PROGRESS_WINDOW: Duration = ACK_WATCH_WINDOW;
+
+/// What [`StallCount::take`] decided.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct StallVerdict {
+    /// The eighth such timeout in a row: close the path.
+    pub(crate) close: bool,
+    /// A timeout that counted: the path made no progress for the window.
+    pub(crate) quiet_timeout: bool,
+}
 
 /// The path's count of send timeouts in a row, kept only while the path makes no
 /// forward progress.
@@ -209,8 +224,8 @@ impl StallCount {
 
     /// Take `outcome`, with the connection's acknowledged-packet count `acked`
     /// (`None` when the controller does not count them) and the egress cap's
-    /// holds `cap`, at `now_nanos`. Returns whether the path should close now:
-    /// once, at the limit.
+    /// holds `cap`, at `now_nanos`: whether it counted, and whether the path
+    /// should close now (once, at the limit).
     pub(crate) fn take(
         &mut self,
         outcome: &BoundedSend,
@@ -218,7 +233,7 @@ impl StallCount {
         acked: Option<u64>,
         cap: CapHoldReading,
         now_nanos: u64,
-    ) -> bool {
+    ) -> StallVerdict {
         let previous = self.cap.replace(cap).unwrap_or(cap);
         let held = cap_held(&mut self.hold_unchanged_since, now_nanos, &cap, &previous);
         let acknowledged = acked.is_some_and(|acked| self.acked != Some(acked));
@@ -231,15 +246,18 @@ impl StallCount {
         }
         if matches!(outcome, BoundedSend::Sent) {
             self.in_a_row = 0;
-            return false;
+            return StallVerdict::default();
         }
         let window = u64::try_from(STALL_PROGRESS_WINDOW.as_nanos()).unwrap_or(u64::MAX);
         let quiet = acked.is_none() || now_nanos.saturating_sub(self.progressed_at) >= window;
         if !timed_out(outcome) || source_stalled || !quiet {
-            return false;
+            return StallVerdict::default();
         }
         self.in_a_row += 1;
-        self.in_a_row == STALLED_SENDS_LIMIT
+        StallVerdict {
+            close: self.in_a_row == STALLED_SENDS_LIMIT,
+            quiet_timeout: true,
+        }
     }
     /// [`Self::take`] with no egress cap.
     #[cfg(test)]
@@ -256,6 +274,7 @@ impl StallCount {
             validity: Duration::ZERO,
         };
         self.take(outcome, source_stalled, acked, no_cap, now_nanos)
+            .close
     }
 }
 
@@ -283,11 +302,14 @@ impl QuicPath {
         }
         let acked = self.ack_progress.as_ref().map(recycle::AckProgress::acked);
         let cap = self.connection.cap_holds().read();
-        let close = self
+        let verdict = self
             .stall
             .lock()
             .take(outcome, source_stalled, acked, cap, now_nanos);
-        if close {
+        if let (true, Some(acked)) = (verdict.quiet_timeout, acked) {
+            self.become_suspect(acked);
+        }
+        if verdict.close {
             self.stats.record_send_event(QuicSendEvent::StalledClosed);
             tracing::warn!(
                 in_a_row = STALLED_SENDS_LIMIT,
