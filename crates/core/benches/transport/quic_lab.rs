@@ -213,10 +213,14 @@ fn quic_lab_fairness() {
     let rate_mbit: u64 = env_or("LAB_RATE_MBIT", 10);
     let delay_ms: u64 = env_or("LAB_DELAY_MS", 64);
     let queue_kib: usize = env_or("LAB_QUEUE_KIB", 256);
-    let link = (rate_mbit > 0).then(|| LinkSpec {
+    let loss: f64 = env_or("LAB_LOSS", 0.0);
+    let seed: u64 = env_or("LAB_SEED", 0);
+    let link = (rate_mbit > 0 || loss > 0.0).then(|| LinkSpec {
         rate_bps: rate_mbit * 1_000_000,
         one_way_delay: Duration::from_millis(delay_ms),
         queue_bytes: queue_kib * 1024,
+        loss,
+        seed,
     });
     // Twice the time the link needs, plus a minute.
     let limit = Duration::from_secs(
@@ -256,7 +260,7 @@ fn quic_lab_fairness() {
         let failed: Vec<&String> = run.outcomes.iter().filter(|o| *o != "Sent").collect();
         println!(
             "LAB_FAIRNESS threads={threads} streams={streams} stream_kib={} window_kib={} \
-             rate_mbit={rate_mbit} delay_ms={delay_ms} queue_kib={queue_kib} rep={rep} \
+             rate_mbit={rate_mbit} delay_ms={delay_ms} queue_kib={queue_kib} loss={loss} rep={rep} \
              all_sent={} received={} fragments={} elapsed_s={:.2} \
              worst_gap_frags={} median_gap_frags={} worst_gap_ms={:.0} max_first_ms={:.0} \
              min_share={:.3} starved_windows={} longest_starved_s={} windows={} \
@@ -436,6 +440,8 @@ fn quic_lab_cpu_per_byte() {
                 rate_bps: rate.parse::<u64>().unwrap() * 1_000_000,
                 one_way_delay: Duration::from_millis(delay.parse().unwrap()),
                 queue_bytes: env_or("LAB_QUEUE_KIB", 1024usize) * 1024,
+                loss: 0.0,
+                seed: 0,
             })
         }
     };
@@ -506,5 +512,174 @@ fn quic_lab_cpu_per_byte() {
             });
             rt.shutdown_timeout(Duration::from_secs(1));
         }
+    }
+}
+
+/// How one QUIC send in a lossy run ended, from its outcome and the
+/// fragment log: `gap` when it failed with fragments still unwritten and
+/// the wait since its last fragment reached the 5 s gap; `total` when every
+/// fragment was written (the wait for acknowledgements has only the total
+/// deadline); `open` when it never opened; `other` otherwise.
+fn quic_cause(
+    outcome: &str,
+    fragments: usize,
+    expected: usize,
+    since_last: Duration,
+) -> &'static str {
+    if outcome == "Sent" {
+        "sent"
+    } else if outcome.starts_with("MaybeDelivered") {
+        "maybe_delivered"
+    } else if outcome.contains("NotOpened") {
+        "open"
+    } else if outcome.contains("TimedOut") && fragments < expected {
+        if since_last >= Duration::from_millis(4900) {
+            "gap"
+        } else {
+            "timed_out_other"
+        }
+    } else if outcome.contains("TimedOut") {
+        "total"
+    } else {
+        "other"
+    }
+}
+
+/// Concurrent streams over a link that loses a share of datagrams both
+/// ways, on the QUIC path or (`LAB_TRANSPORT=udp`) on the UDP transport
+/// with its own sender, over the same link model and seed. One `LAB_LOSS`
+/// line per repetition. Settings: `LAB_TRANSPORT` (quic), `LAB_STREAMS` (48),
+/// `LAB_STREAM_KIB` (256), `LAB_WINDOW_KIB` (2048, QUIC only), `LAB_LOSS`
+/// (0.10), `LAB_SEED` (1), `LAB_DELAY_MS` (50 one way), `LAB_RATE_MBIT` (0,
+/// no bottleneck), `LAB_THREADS` (4), `LAB_REPS` (3).
+#[test]
+fn quic_lab_loss() {
+    if !enabled("quic_lab_loss") {
+        return;
+    }
+    let transport = std::env::var("LAB_TRANSPORT").unwrap_or_else(|_| "quic".into());
+    let streams: u16 = env_or("LAB_STREAMS", 48);
+    let stream_bytes = env_or("LAB_STREAM_KIB", 256usize) * 1024;
+    let window = env_or("LAB_WINDOW_KIB", 2048u64) * 1024;
+    let loss: f64 = env_or("LAB_LOSS", 0.10);
+    let seed: u64 = env_or("LAB_SEED", 1);
+    let delay_ms: u64 = env_or("LAB_DELAY_MS", 50);
+    let rate_mbit: u64 = env_or("LAB_RATE_MBIT", 0);
+    let threads: usize = env_or("LAB_THREADS", 4);
+    let reps: usize = env_or("LAB_REPS", 3);
+    let link = LinkSpec {
+        rate_bps: rate_mbit * 1_000_000,
+        one_way_delay: Duration::from_millis(delay_ms),
+        queue_bytes: env_or("LAB_QUEUE_KIB", 1024usize) * 1024,
+        loss,
+        seed,
+    };
+    let expected = stream_bytes.div_ceil(FRAGMENT_BYTES);
+    for rep in 0..reps {
+        let rt = runtime(threads);
+        let line = rt.block_on(async {
+            match transport.as_str() {
+                "quic" => {
+                    let mut pair = LabPair::connect(LabConfig {
+                        window_bytes: window,
+                        bandwidth_limit: None,
+                        link: Some(link),
+                    })
+                    .await;
+                    let run = pair
+                        .concurrent_streams(streams, stream_bytes, Duration::from_secs(900))
+                        .await;
+                    let mut per: Vec<Vec<Duration>> = vec![Vec::new(); usize::from(streams)];
+                    for (stream, at) in &run.log {
+                        per[usize::from(*stream)].push(*at);
+                    }
+                    let mut causes = std::collections::BTreeMap::<&str, usize>::new();
+                    let mut worst_gap = Duration::ZERO;
+                    let mut gaps = Vec::new();
+                    let mut sent_times = Vec::new();
+                    for (i, outcome) in run.outcomes.iter().enumerate() {
+                        let times = &per[i];
+                        let returned = run.returned_at.get(i).copied().unwrap_or(run.elapsed);
+                        // The wait before the first fragment counts too.
+                        let gap = times
+                            .windows(2)
+                            .map(|w| w[1] - w[0])
+                            .chain(times.first().copied())
+                            .max()
+                            .unwrap_or(returned);
+                        let since_last =
+                            returned.saturating_sub(times.last().copied().unwrap_or_default());
+                        // A send that failed mid-stream waited from its last
+                        // fragment to its end.
+                        let gap = if times.len() < expected {
+                            gap.max(since_last)
+                        } else {
+                            gap
+                        };
+                        worst_gap = worst_gap.max(gap);
+                        gaps.push(gap.as_millis());
+                        let cause = quic_cause(outcome, times.len(), expected, since_last);
+                        *causes.entry(cause).or_default() += 1;
+                        if cause == "sent" {
+                            sent_times.push(returned.as_secs_f64());
+                        }
+                    }
+                    gaps.sort_unstable();
+                    sent_times.sort_by(f64::total_cmp);
+                    format!(
+                        "received={} causes={causes:?} worst_gap_ms={} median_gap_ms={} \
+                         first_sent_s={:.1} last_sent_s={:.1} elapsed_s={:.1} {}",
+                        run.received,
+                        worst_gap.as_millis(),
+                        gaps.get(gaps.len() / 2).copied().unwrap_or(0),
+                        sent_times.first().copied().unwrap_or(f64::NAN),
+                        sent_times.last().copied().unwrap_or(f64::NAN),
+                        run.elapsed.as_secs_f64(),
+                        pair.describe()
+                    )
+                }
+                "udp" => {
+                    let (send, mut got, _tasks) = udp_pair(None, Some(link)).await;
+                    let start = Instant::now();
+                    for _ in 0..streams {
+                        send.send(vec![0x5Au8; stream_bytes])
+                            .await
+                            .expect("driver runs");
+                    }
+                    let mut arrivals = Vec::new();
+                    // Stop at the last message, or once nothing has arrived
+                    // for 30 s (six receiver gaps), or after 600 s.
+                    while arrivals.len() < usize::from(streams)
+                        && start.elapsed() < Duration::from_secs(600)
+                    {
+                        match tokio::time::timeout(Duration::from_secs(30), got.recv()).await {
+                            Ok(Some(len)) => {
+                                assert_eq!(len, stream_bytes + 8);
+                                arrivals.push(start.elapsed().as_secs_f64());
+                            }
+                            Ok(None) | Err(_) => break,
+                        }
+                    }
+                    let delivered = arrivals.len();
+                    format!(
+                        "received={delivered} not_delivered={} first_s={:.1} last_s={:.1} \
+                         elapsed_s={:.1}",
+                        usize::from(streams) - delivered,
+                        arrivals.first().copied().unwrap_or(f64::NAN),
+                        arrivals.last().copied().unwrap_or(f64::NAN),
+                        start.elapsed().as_secs_f64()
+                    )
+                }
+                other => panic!("unknown transport {other}"),
+            }
+        });
+        rt.shutdown_timeout(Duration::from_secs(1));
+        println!(
+            "LAB_LOSS transport={transport} threads={threads} streams={streams} stream_kib={} \
+             window_kib={} loss={loss} seed={seed} delay_ms={delay_ms} rate_mbit={rate_mbit} \
+             rep={rep} {line}",
+            stream_bytes / 1024,
+            window / 1024,
+        );
     }
 }
