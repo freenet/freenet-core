@@ -75,19 +75,14 @@ pub(in crate::transport) struct Harness {
 
 impl Harness {
     /// A hub whose node has the higher key, so its sessions are servers.
-    pub(in crate::transport) async fn server(network: &str, subnet: u8) -> Self {
-        Self::server_with(network, subnet, "shadow", None).await
+    pub(in crate::transport) async fn server(network: &str) -> Self {
+        Self::server_with(network, "shadow", None).await
     }
 
     /// [`Self::server`] in this mode, with this `quic-data-percent`.
-    async fn server_with(
-        network: &str,
-        subnet: u8,
-        mode: &str,
-        data_percent: Option<&str>,
-    ) -> Self {
-        let a_addr: SocketAddr = format!("10.204.{subnet}.1:5000").parse().unwrap();
-        let b_addr: SocketAddr = format!("10.204.{subnet}.2:5000").parse().unwrap();
+    async fn server_with(network: &str, mode: &str, data_percent: Option<&str>) -> Self {
+        let net = crate::transport::test_net::subnet();
+        let (a_addr, b_addr) = (net.addr(1), net.addr(2));
         let pair = pair(network, a_addr, b_addr, None).await;
         let a_is_higher = pair.a_keys.public() > pair.b_keys.public();
         let (endpoint, local, remote, peer) = if a_is_higher {
@@ -209,13 +204,12 @@ impl DataPath {
 
 pub(in crate::transport) async fn data_path(
     network: &str,
-    subnet: u8,
     limits: QuicPathLimits,
     budget: SharedInboundBudget,
     data: QuicDataSenders,
 ) -> DataPath {
-    let a_addr: SocketAddr = format!("10.205.{subnet}.1:5000").parse().unwrap();
-    let b_addr: SocketAddr = format!("10.205.{subnet}.2:5000").parse().unwrap();
+    let net = crate::transport::test_net::subnet();
+    let (a_addr, b_addr) = (net.addr(1), net.addr(2));
     let pair = pair(network, a_addr, b_addr, None).await;
     let permit = pair
         .b
@@ -266,7 +260,7 @@ where
 fn a_new_promotion_ends_the_older_session_and_takes_its_backoff() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let h = Harness::server("quic-driver-order", 1).await;
+        let h = Harness::server("quic-driver-order").await;
         let (older, _older_rx) = h.session();
         older.promote(h.peer.clone());
         h.fail_one_offer(&older);
@@ -297,7 +291,7 @@ fn a_new_promotion_ends_the_older_session_and_takes_its_backoff() {
 fn an_older_session_promoted_late_ends_itself() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let h = Harness::server("quic-driver-late", 2).await;
+        let h = Harness::server("quic-driver-late").await;
         let (older, _older_rx) = h.session();
         let (newer, _newer_rx) = h.session();
         newer.promote(h.peer.clone());
@@ -319,7 +313,7 @@ fn an_older_session_promoted_late_ends_itself() {
 fn ending_a_session_cleans_every_map_and_only_its_own_entries() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let h = Harness::server("quic-driver-clean", 3).await;
+        let h = Harness::server("quic-driver-clean").await;
         let (older, _older_rx) = h.session();
         let (newer, _newer_rx) = h.session();
         newer.promote(h.peer.clone());
@@ -348,7 +342,7 @@ fn ending_a_session_cleans_every_map_and_only_its_own_entries() {
 fn a_torn_down_attempt_sends_no_offer() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let h = Harness::server("quic-driver-deferred", 4).await;
+        let h = Harness::server("quic-driver-deferred").await;
         let (session, _rx) = h.session();
         session.promote(h.peer.clone());
         let mut state = session.state.lock();
@@ -387,7 +381,7 @@ fn a_torn_down_attempt_sends_no_offer() {
 fn a_connection_for_no_live_attempt_is_closed() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let h = Harness::server("quic-driver-stale", 5).await;
+        let h = Harness::server("quic-driver-stale").await;
         let (session, _rx) = h.session();
         session.promote(h.peer.clone());
         let permit = h
@@ -423,7 +417,7 @@ fn a_connection_for_no_live_attempt_is_closed() {
 fn a_connection_after_the_session_ended_closes_with_session_ended() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let h = Harness::server("quic-driver-late-dial", 37).await;
+        let h = Harness::server("quic-driver-late-dial").await;
         let (session, _rx) = h.session();
         session.promote(h.peer.clone());
         let permit = h
@@ -482,7 +476,7 @@ fn a_routed_attempt_becomes_a_shadow_path() {
     use crate::transport::quic::path::QuicInboundOutcome;
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let h = Harness::server("quic-driver-path", 6).await;
+        let h = Harness::server("quic-driver-path").await;
         let (session, inbox) = h.session();
         let attempt = offered(&h, &session);
         let up = path_up(&h, &session, inbox);
@@ -592,15 +586,15 @@ fn a_path_follows_the_data_bits() {
     use crate::transport::quic::path::QuicInboundOutcome;
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        for (subnet, mode, percent, peer_caps, accepts, sends) in [
-            (30, "prefer", Some("100"), caps::DATA, true, true),
-            (31, "prefer", Some("100"), 0, true, false),
-            (32, "prefer", Some("0"), caps::DATA, false, false),
-            (33, "shadow", Some("100"), caps::DATA, false, false),
-            (34, "prefer", None, caps::DATA, false, false),
+        for (mode, percent, peer_caps, accepts, sends) in [
+            ("prefer", Some("100"), caps::DATA, true, true),
+            ("prefer", Some("100"), 0, true, false),
+            ("prefer", Some("0"), caps::DATA, false, false),
+            ("shadow", Some("100"), caps::DATA, false, false),
+            ("prefer", None, caps::DATA, false, false),
         ] {
             let case = format!("{mode} {percent:?}, peer {peer_caps}");
-            let h = Harness::server_with("quic-driver-bits", subnet, mode, percent).await;
+            let h = Harness::server_with("quic-driver-bits", mode, percent).await;
             let (session, inbox) = h.session();
             let attempt = offered(&h, &session);
             let up = path_up(&h, &session, inbox);
@@ -662,7 +656,7 @@ fn an_active_path_keeps_the_receipt_stamp_fresh() {
     const HOLD_WINDOW: Duration = Duration::from_secs(30);
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let h = Harness::server("quic-driver-stamp", 35).await;
+        let h = Harness::server("quic-driver-stamp").await;
         let (session, inbox) = h.session();
         let attempt = offered(&h, &session);
         let up = path_up(&h, &session, inbox);
@@ -783,7 +777,7 @@ fn the_decline_gate_admits_one_per_interval() {
 fn a_promotion_of_an_ended_session_adds_no_entry() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let h = Harness::server("quic-driver-ended", 7).await;
+        let h = Harness::server("quic-driver-ended").await;
         let (session, _rx) = h.session();
         session.promote(h.peer.clone());
         session.end();
@@ -799,7 +793,7 @@ fn a_promotion_of_an_ended_session_adds_no_entry() {
 fn an_entry_of_an_ended_session_is_replaced() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let h = Harness::server("quic-driver-dead-entry", 8).await;
+        let h = Harness::server("quic-driver-dead-entry").await;
         let (older, _older_rx) = h.session();
         let (newer, _newer_rx) = h.session();
         newer.end();
@@ -818,7 +812,7 @@ fn an_entry_of_an_ended_session_is_replaced() {
 fn of_three_sessions_promoted_at_once_only_the_newest_stays() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let h = Harness::server("quic-driver-three", 9).await;
+        let h = Harness::server("quic-driver-three").await;
         for round in 0..2000 {
             let (a, _a_rx) = h.session();
             let (b, _b_rx) = h.session();
@@ -851,7 +845,7 @@ fn of_three_sessions_promoted_at_once_only_the_newest_stays() {
 fn a_full_inbox_drops_peer_messages_and_still_delivers_a_path_end() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let h = Harness::server("quic-driver-overflow", 10).await;
+        let h = Harness::server("quic-driver-overflow").await;
         let (session, mut inbox) = h.session();
         let state = QuicPathState {
             session: Arc::clone(&session),
@@ -897,7 +891,7 @@ fn a_full_inbox_drops_peer_messages_and_still_delivers_a_path_end() {
 fn offer_outcomes_and_the_path_gauge_reach_telemetry() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let h = Harness::server("quic-driver-telemetry", 11).await;
+        let h = Harness::server("quic-driver-telemetry").await;
         let (session, _rx) = h.session();
         session.promote(h.peer.clone());
         let events = || TRANSPORT_METRICS.quic_events_of(h.remote);
@@ -930,7 +924,7 @@ fn offer_outcomes_and_the_path_gauge_reach_telemetry() {
 fn declines_are_counted_by_reason_and_penalty() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let h = Harness::server("quic-driver-declines", 12).await;
+        let h = Harness::server("quic-driver-declines").await;
         let (session, _rx) = h.session();
         session.promote(h.peer.clone());
         let events = || TRANSPORT_METRICS.quic_events_of(h.remote);
@@ -964,7 +958,7 @@ fn declines_are_counted_by_reason_and_penalty() {
 /// A panic in a task the driver spawns is counted, and the same panic goes on.
 #[test]
 fn a_panicking_task_is_counted_and_still_panics() {
-    let remote: SocketAddr = "10.204.13.1:5000".parse().unwrap();
+    let remote: SocketAddr = crate::transport::test_net::subnet().addr(1);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap();
@@ -984,7 +978,7 @@ fn an_established_path_is_counted_timed_and_aged() {
     use crate::transport::quic::upgrade::machine::{Outcome, Role};
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let h = Harness::server("quic-driver-established", 14).await;
+        let h = Harness::server("quic-driver-established").await;
         let (session, _rx) = h.session();
         session.promote(h.peer.clone());
         h.set_now(Duration::from_secs(100));
@@ -1035,7 +1029,7 @@ fn an_established_path_is_counted_timed_and_aged() {
 fn only_a_full_inbox_counts_as_an_overflow() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let h = Harness::server("quic-driver-overflow-count", 15).await;
+        let h = Harness::server("quic-driver-overflow-count").await;
         let (session, inbox) = h.session();
         let state = QuicPathState {
             session: Arc::clone(&session),
@@ -1064,7 +1058,7 @@ fn only_a_full_inbox_counts_as_an_overflow() {
 fn unrouted_connection_attempts_are_counted() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let h = Harness::server("quic-driver-unrouted", 16).await;
+        let h = Harness::server("quic-driver-unrouted").await;
         let local_is_a = h.pair.a_keys.public() > h.pair.b_keys.public();
         let (ours, theirs, our_addr, our_key) = if local_is_a {
             (&h.pair.a, &h.pair.b, h.pair.a_addr, h.pair.a_keys.public())
@@ -1113,7 +1107,7 @@ fn session_and_setup_endings_reach_their_own_counters() {
     use crate::transport::quic::upgrade::machine::Outcome;
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let h = Harness::server("quic-driver-endings", 17).await;
+        let h = Harness::server("quic-driver-endings").await;
         let (session, _rx) = h.session();
         let events = || TRANSPORT_METRICS.quic_events_of(h.remote);
         let mut state = session.state.lock();
@@ -1151,7 +1145,7 @@ fn fallbacks_and_churned_fallbacks_reach_their_own_counters() {
     use crate::transport::quic::upgrade::machine::{FallbackCause, Outcome};
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let h = Harness::server("quic-driver-churn", 36).await;
+        let h = Harness::server("quic-driver-churn").await;
         let (session, _rx) = h.session();
         let causes = [
             (FallbackCause::Idle, QuicFallback::Idle),
@@ -1297,7 +1291,7 @@ fn an_initial_the_peer_did_not_send_cannot_take_the_attempts_slot() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
         let network = "quic-driver-retry-stray";
-        let h = Harness::server(network, 18).await;
+        let h = Harness::server(network).await;
         let rig = RetryRig::of(&h);
         let (session, inbox) = waiting_session(&h);
 
@@ -1357,7 +1351,7 @@ fn an_initial_the_peer_did_not_send_cannot_take_the_attempts_slot() {
 fn a_retried_attempt_keeps_no_hold_on_the_address() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let h = Harness::server("quic-driver-retry-hold", 19).await;
+        let h = Harness::server("quic-driver-retry-hold").await;
         let rig = RetryRig::of(&h);
         let (session, _inbox) = waiting_session(&h);
         let dial = rig.dial();
@@ -1381,7 +1375,7 @@ fn a_retried_attempt_keeps_no_hold_on_the_address() {
 fn a_session_with_no_attempt_waiting_sends_no_retry() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let h = Harness::server("quic-driver-retry-no-wait", 20).await;
+        let h = Harness::server("quic-driver-retry-no-wait").await;
         let rig = RetryRig::of(&h);
         let _permit = rig.ours.allow_peer(h.remote, &h.peer).expect("allowed");
         let (session, _inbox) = h.session();
@@ -1409,7 +1403,7 @@ fn a_lost_retry_still_connects_inside_the_connect_timeout() {
     use crate::transport::quic::upgrade::machine::CONNECT_TIMEOUT;
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let h = Harness::server("quic-driver-retry-lost", 21).await;
+        let h = Harness::server("quic-driver-retry-lost").await;
         let rig = RetryRig::of(&h);
         let (session, inbox) = waiting_session(&h);
         let started = rig.time.now_nanos();

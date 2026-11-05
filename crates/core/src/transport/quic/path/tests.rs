@@ -56,24 +56,21 @@ impl Paths {
     }
 }
 
-/// Build the pair on `10.203.<subnet>.1` and `.2` and connect it. Every
-/// test needs a subnet of its own: the simulated network maps each address
-/// to one network for the whole process, so two tests on one subnet send
-/// each other's packets into the wrong network.
-async fn paths(network: &str, subnet: u8, b_limits: QuicPathLimits) -> Paths {
-    paths_with(network, subnet, b_limits, None).await
+/// Build the pair on a subnet of its own ([`crate::transport::test_net`])
+/// and connect it.
+async fn paths(network: &str, b_limits: QuicPathLimits) -> Paths {
+    paths_with(network, b_limits, None).await
 }
 
 /// [`paths`], with `b`'s path charging `b_budget` if given
 /// ([`QuicPath::with_budget`]) instead of a budget of its own.
 async fn paths_with(
     network: &str,
-    subnet: u8,
     b_limits: QuicPathLimits,
     b_budget: Option<SharedInboundBudget>,
 ) -> Paths {
-    let a_addr: SocketAddr = format!("10.203.{subnet}.1:5000").parse().unwrap();
-    let b_addr: SocketAddr = format!("10.203.{subnet}.2:5000").parse().unwrap();
+    let net = crate::transport::test_net::subnet();
+    let (a_addr, b_addr) = (net.addr(1), net.addr(2));
     let pair = pair(network, a_addr, b_addr, None).await;
     let permit = pair
         .b
@@ -196,7 +193,7 @@ fn assert_stopped(result: Result<(), QuicSendError>, code: u32) {
 fn short_messages_round_trip_and_are_not_deduplicated() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let mut p = paths("quic-path-short", 1, QuicPathLimits::DEFAULT).await;
+        let mut p = paths("quic-path-short", QuicPathLimits::DEFAULT).await;
         let big = payload(200 * 1024);
         let a = p.a.clone();
         let sent = big.clone();
@@ -248,7 +245,7 @@ fn short_messages_round_trip_and_are_not_deduplicated() {
 fn a_one_mib_stream_round_trips_through_the_adapter() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let mut p = paths("quic-path-stream", 2, QuicPathLimits::DEFAULT).await;
+        let mut p = paths("quic-path-stream", QuicPathLimits::DEFAULT).await;
         let data = payload(MIB);
         let (id1, id2) = (StreamId::next(), StreamId::next());
         let a = p.a.clone();
@@ -321,7 +318,7 @@ fn a_one_mib_stream_round_trips_through_the_adapter() {
 fn metadata_and_control_frames_are_dispatched() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let mut p = paths("quic-path-meta", 3, QuicPathLimits::DEFAULT).await;
+        let mut p = paths("quic-path-meta", QuicPathLimits::DEFAULT).await;
         let metadata = payload(MAX_METADATA_BYTES as usize);
         let control = payload(MAX_CONTROL_BYTES as usize);
         let id = StreamId::next();
@@ -352,7 +349,7 @@ fn metadata_and_control_frames_are_dispatched() {
 fn oversized_or_empty_metadata_is_left_out() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let mut p = paths("quic-path-meta-big", 23, QuicPathLimits::DEFAULT).await;
+        let mut p = paths("quic-path-meta-big", QuicPathLimits::DEFAULT).await;
         let big = payload(MAX_METADATA_BYTES as usize + 1);
         let a = p.a.clone();
         p.drive(async move {
@@ -388,7 +385,7 @@ fn oversized_or_empty_metadata_is_left_out() {
 fn every_refused_header_is_stopped_and_counted() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let mut p = paths("quic-path-headers", 4, QuicPathLimits::DEFAULT).await;
+        let mut p = paths("quic-path-headers", QuicPathLimits::DEFAULT).await;
         use QuicInboundOutcome as O;
         let named = 0x8000_0001;
         let cases = vec![
@@ -475,7 +472,7 @@ fn a_stream_over_the_budget_is_stopped_and_counted() {
             max_bytes: ChargeOverhead::DEFAULT.cost(small),
             ..QuicPathLimits::DEFAULT
         };
-        let mut p = paths("quic-path-budget", 5, limits).await;
+        let mut p = paths("quic-path-budget", limits).await;
         let a = p.a.clone();
         let (big_stream, big_short) = p
             .drive(async move {
@@ -533,7 +530,7 @@ fn a_stream_over_the_budget_is_stopped_and_counted() {
 fn truncated_and_overlong_streams_fail_and_are_counted() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let mut p = paths("quic-path-bounds", 6, QuicPathLimits::DEFAULT).await;
+        let mut p = paths("quic-path-bounds", QuicPathLimits::DEFAULT).await;
         let f = FRAGMENT_PAYLOAD_SIZE;
         let cases: Vec<(u64, usize, QuicInboundOutcome)> = vec![
             // One byte short, at and off a fragment boundary.
@@ -618,7 +615,7 @@ fn truncated_and_overlong_streams_fail_and_are_counted() {
 fn a_sender_that_gives_up_resets_the_stream() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let mut p = paths("quic-path-reset", 7, QuicPathLimits::DEFAULT).await;
+        let mut p = paths("quic-path-reset", QuicPathLimits::DEFAULT).await;
         let a = p.a.clone();
         let (short, long, failed) = p
             .drive(async move {
@@ -695,7 +692,7 @@ fn a_sender_that_gives_up_resets_the_stream() {
 fn idle_and_old_streams_are_evicted() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let mut p = paths("quic-path-evict", 8, QuicPathLimits::DEFAULT).await;
+        let mut p = paths("quic-path-evict", QuicPathLimits::DEFAULT).await;
         let idle = streaming_handle_idle_timeout();
         let time = p.time();
 
@@ -771,7 +768,7 @@ fn idle_and_old_streams_are_evicted() {
 fn an_uncharged_stream_is_evicted_at_its_age_limit() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let p = paths("quic-path-uncharged-age", 17, QuicPathLimits::DEFAULT).await;
+        let p = paths("quic-path-uncharged-age", QuicPathLimits::DEFAULT).await;
         let idle = streaming_handle_idle_timeout();
         let age = max_inbound_stream_age(0);
         let (conn, time) = (p.a_raw(), p.time());
@@ -821,7 +818,7 @@ fn full_channels_hold_data_and_drop_control_and_reused_ids_are_refused() {
             control_capacity: 1,
             ..QuicPathLimits::DEFAULT
         };
-        let mut p = paths("quic-path-full", 9, limits).await;
+        let mut p = paths("quic-path-full", limits).await;
         let a = p.a.clone();
         let held = StreamId::next();
         let reused = p
@@ -881,7 +878,7 @@ fn a_message_waiting_for_room_is_evicted_at_its_age_limit() {
             short_capacity: 1,
             ..QuicPathLimits::DEFAULT
         };
-        let mut p = paths("quic-path-full-age", 70, limits).await;
+        let mut p = paths("quic-path-full-age", limits).await;
         let a = p.a.clone();
         p.drive(async move {
             a.send_short(b"one").await.unwrap();
@@ -913,7 +910,7 @@ fn a_message_waiting_for_room_is_evicted_at_its_age_limit() {
 fn waiters_for_a_full_channel_are_capped_by_the_stream_limit() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let mut p = paths("quic-path-waiters", 80, QuicPathLimits::DEFAULT).await;
+        let mut p = paths("quic-path-waiters", QuicPathLimits::DEFAULT).await;
         let limit = super::super::config::MAX_UNI_STREAMS as usize;
         let count = SHORT_CHANNEL_CAPACITY + limit + 40;
         let done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -967,7 +964,7 @@ fn a_stream_that_waited_for_room_is_evicted_idle_when_it_stalls() {
             stream_capacity: 1,
             ..QuicPathLimits::DEFAULT
         };
-        let mut p = paths("quic-path-wait-idle", 81, limits).await;
+        let mut p = paths("quic-path-wait-idle", limits).await;
         let idle = streaming_handle_idle_timeout();
         let total = 10_000u64;
         assert!(
@@ -1022,7 +1019,7 @@ fn readers_waiting_for_room_when_the_path_ends_are_counted() {
             stream_capacity: 1,
             ..QuicPathLimits::DEFAULT
         };
-        let p = paths("quic-path-abandoned", 82, limits).await;
+        let p = paths("quic-path-abandoned", limits).await;
         let a = p.a.clone();
         let second_id = StreamId::next();
         let sent = tokio::spawn(async move {
@@ -1063,7 +1060,7 @@ fn a_full_budget_still_delivers_a_one_packet_short() {
             max_bytes: ChargeOverhead::DEFAULT.cost(10_000),
             ..QuicPathLimits::DEFAULT
         };
-        let mut p = paths("quic-path-full-budget", 71, limits).await;
+        let mut p = paths("quic-path-full-budget", limits).await;
         let a = p.a.clone();
         p.drive(async move {
             a.send_stream(StreamId::next(), None, Bytes::from_static(b"held"))
@@ -1093,7 +1090,7 @@ fn a_full_budget_still_delivers_a_one_packet_short() {
 fn the_stream_limit_is_back_pressure() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let p = paths("quic-path-many", 10, QuicPathLimits::DEFAULT).await;
+        let p = paths("quic-path-many", QuicPathLimits::DEFAULT).await;
         let limit = super::super::config::MAX_UNI_STREAMS as usize;
         let batch = limit / 8 + 1;
         let (conn, a, time) = (p.a_raw(), p.a.clone(), p.time());
@@ -1147,7 +1144,7 @@ fn the_stream_limit_is_back_pressure() {
 fn a_flood_into_a_slow_receiver_is_held_and_all_delivered() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let mut p = paths("quic-path-flood", 12, QuicPathLimits::DEFAULT).await;
+        let mut p = paths("quic-path-flood", QuicPathLimits::DEFAULT).await;
         let count = SHORT_CHANNEL_CAPACITY + 44;
         let a = p.a.clone();
         let results = p
@@ -1194,7 +1191,7 @@ fn a_flood_into_a_slow_receiver_is_held_and_all_delivered() {
 fn a_stream_id_is_free_again_once_its_state_is_gone() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let mut p = paths("quic-path-reuse", 13, QuicPathLimits::DEFAULT).await;
+        let mut p = paths("quic-path-reuse", QuicPathLimits::DEFAULT).await;
         let id = StreamId::next();
         for round in 0..3 {
             let a = p.a.clone();
@@ -1269,7 +1266,7 @@ fn a_stalled_source_still_sees_the_stop() {
             max_bytes: ChargeOverhead::DEFAULT.cost(10_000),
             ..QuicPathLimits::DEFAULT
         };
-        let p = paths("quic-path-stall", 14, limits).await;
+        let p = paths("quic-path-stall", limits).await;
         let a = p.a.clone();
         let result = p
             .drive(async move {
@@ -1292,7 +1289,7 @@ fn a_stalled_source_still_sees_the_stop() {
 fn a_cancelled_send_resets_the_stream() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let mut p = paths("quic-path-cancel", 15, QuicPathLimits::DEFAULT).await;
+        let mut p = paths("quic-path-cancel", QuicPathLimits::DEFAULT).await;
         let a = p.a.clone();
         let mut streams = std::mem::replace(&mut p.b_in.streams, tokio::sync::mpsc::channel(1).1);
         let time = p.time();
@@ -1331,7 +1328,7 @@ fn a_cancelled_send_resets_the_stream() {
 fn reads_keep_no_slice_of_a_datagram() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let mut p = paths("quic-path-copy", 16, QuicPathLimits::DEFAULT).await;
+        let mut p = paths("quic-path-copy", QuicPathLimits::DEFAULT).await;
         let (a, conn, time) = (p.a.clone(), p.a_raw(), p.time());
         p.drive(async move {
             a.send_stream(
@@ -1381,7 +1378,7 @@ fn reads_keep_no_slice_of_a_datagram() {
 fn payload_fragments_hold_at_most_one_datagram() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let mut p = paths("quic-path-frag-mem", 18, QuicPathLimits::DEFAULT).await;
+        let mut p = paths("quic-path-frag-mem", QuicPathLimits::DEFAULT).await;
         let total = 4 * FRAGMENT_PAYLOAD_SIZE;
         let data = payload(total);
         let (conn, time) = (p.a_raw(), p.time());
@@ -1441,7 +1438,7 @@ fn payload_fragments_hold_at_most_one_datagram() {
 fn more_messages_than_the_stream_limit_all_arrive_when_drained() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let mut p = paths("quic-path-drained", 19, QuicPathLimits::DEFAULT).await;
+        let mut p = paths("quic-path-drained", QuicPathLimits::DEFAULT).await;
         let count = 2 * super::super::config::MAX_UNI_STREAMS as usize + 10;
         let a = p.a.clone();
         let mut shorts = std::mem::replace(&mut p.b_in.shorts, tokio::sync::mpsc::channel(1).1);
@@ -1478,7 +1475,7 @@ fn more_messages_than_the_stream_limit_all_arrive_when_drained() {
 fn a_silent_header_is_evicted_when_idle() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let p = paths("quic-path-idle-header", 20, QuicPathLimits::DEFAULT).await;
+        let p = paths("quic-path-idle-header", QuicPathLimits::DEFAULT).await;
         let conn = p.a_raw();
         let code = p
             .drive(raw_unfinished(conn, header(1, 0, 0, 10, 0)[..5].to_vec()))
@@ -1496,7 +1493,7 @@ fn a_silent_header_is_evicted_when_idle() {
 fn a_locally_cancelled_stream_is_stopped() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let mut p = paths("quic-path-local-cancel", 21, QuicPathLimits::DEFAULT).await;
+        let mut p = paths("quic-path-local-cancel", QuicPathLimits::DEFAULT).await;
         let total = 20 * FRAGMENT_PAYLOAD_SIZE;
         let (conn, a) = (p.a_raw(), p.a.clone());
         let id = StreamId::next().0;
@@ -1540,7 +1537,7 @@ fn a_panicking_receive_task_closes_the_connection() {
             panic_in_receive: true,
             ..QuicPathLimits::DEFAULT
         };
-        let p = paths("quic-path-panic", 22, limits).await;
+        let p = paths("quic-path-panic", limits).await;
         let (a, conn) = (p.a.clone(), p.a_raw());
         let closed = p
             .drive(async move {
@@ -1568,7 +1565,7 @@ fn a_panicking_receive_task_closes_the_connection() {
 fn dropping_the_path_cancels_streams_in_progress() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let mut p = paths("quic-path-drop", 11, QuicPathLimits::DEFAULT).await;
+        let mut p = paths("quic-path-drop", QuicPathLimits::DEFAULT).await;
         let conn = p.a_raw();
         let mut bytes = header(1, 1, StreamId::next().0, 10_000, 0);
         bytes.extend_from_slice(&payload(100));
@@ -1616,7 +1613,6 @@ fn udp_and_quic_paths_share_one_inbound_allowance() {
         let shared = SharedInboundBudget::new(4, ChargeOverhead::DEFAULT.cost(small));
         let mut p = paths_with(
             "quic-path-shared",
-            24,
             QuicPathLimits::DEFAULT,
             Some(shared.clone()),
         )
@@ -1703,7 +1699,6 @@ fn quic_keys_never_collide_with_udp_ids() {
         let shared = SharedInboundBudget::new(16, u64::MAX);
         let mut p = paths_with(
             "quic-path-keys",
-            25,
             QuicPathLimits::DEFAULT,
             Some(shared.clone()),
         )
@@ -1772,7 +1767,6 @@ fn a_quic_guard_releases_only_its_own_charge() {
         let shared = SharedInboundBudget::new(16, u64::MAX);
         let mut p = paths_with(
             "quic-path-guard",
-            26,
             QuicPathLimits::DEFAULT,
             Some(shared.clone()),
         )
@@ -1908,7 +1902,7 @@ fn a_path_closes_once_its_reset_sends_pass_the_limit() {
             max_send_aborts: ABORT_LIMIT,
             ..QuicPathLimits::DEFAULT
         };
-        let p = paths("quic-path-abort-limit", 40, limits).await;
+        let p = paths("quic-path-abort-limit", limits).await;
         let a_addr = p.pair.a_addr;
         for (aborts, total) in [(ABORT_LIMIT - 1, ABORT_LIMIT - 1), (1, ABORT_LIMIT)] {
             let b = p.b.clone();
@@ -1962,7 +1956,7 @@ fn a_dropped_send_counts_as_a_reset() {
             max_send_aborts: ABORT_LIMIT,
             ..QuicPathLimits::DEFAULT
         };
-        let p = paths("quic-path-abort-dropped", 41, limits).await;
+        let p = paths("quic-path-abort-dropped", limits).await;
         let a_addr = p.pair.a_addr;
         let drop_sends = |count: u64| {
             let (b, time) = (p.b.clone(), p.time());
@@ -2000,7 +1994,7 @@ fn a_dropped_send_counts_as_a_reset() {
 fn a_stop_reported_by_the_write_is_not_counted() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let p = paths("quic-path-written-stopped", 42, QuicPathLimits::DEFAULT).await;
+        let p = paths("quic-path-written-stopped", QuicPathLimits::DEFAULT).await;
         let a = p.a.clone();
         let (written, aborts) = p
             .drive(async move {
@@ -2042,7 +2036,7 @@ fn a_stop_from_the_peer_is_not_counted_as_a_reset() {
             max_bytes: ChargeOverhead::DEFAULT.cost(1000),
             ..QuicPathLimits::DEFAULT
         };
-        let p = paths("quic-path-abort-stops", 43, b_limits).await;
+        let p = paths("quic-path-abort-stops", b_limits).await;
         let b_addr = p.pair.b_addr;
         let a = p.a.clone();
         let stops = p
@@ -2138,13 +2132,13 @@ impl Drop for Scripted {
 }
 
 impl Scripted {
-    async fn connect(network: &str, subnet: u8) -> Self {
-        Self::connect_capped(network, subnet, None).await
+    async fn connect(network: &str) -> Self {
+        Self::connect_capped(network, None).await
     }
 
     /// [`Self::connect`] with a node-wide egress cap of `a_cap` bytes per
     /// second on `a`'s socket.
-    async fn connect_capped(network: &str, subnet: u8, a_cap: Option<u64>) -> Self {
+    async fn connect_capped(network: &str, a_cap: Option<u64>) -> Self {
         use super::super::config::{self, QuicSettings};
         use super::super::identity::{PeerKey, QuicIdentity};
         use crate::transport::Socket;
@@ -2157,8 +2151,8 @@ impl Scripted {
         use std::collections::VecDeque;
         use std::time::Instant;
 
-        let a_addr: SocketAddr = format!("10.206.{subnet}.1:5000").parse().unwrap();
-        let b_addr: SocketAddr = format!("10.206.{subnet}.2:5000").parse().unwrap();
+        let net = crate::transport::test_net::subnet();
+        let (a_addr, b_addr) = (net.addr(1), net.addr(2));
         let time = VirtualTime::new();
         register_network_time_source(network, time.clone());
         register_address_network(a_addr, network);
@@ -2332,7 +2326,7 @@ fn a_peer_that_keeps_sending_but_acknowledges_nothing_is_closed() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
         let network = "quic-path-ack-watch";
-        let mut s = Scripted::connect(network, 1).await;
+        let mut s = Scripted::connect(network).await;
         s.keep_sending();
         s.wait(Duration::from_secs(3)).await;
         assert!(s.a.connection().inner().close_reason().is_none());
@@ -2369,7 +2363,7 @@ fn packets_left_outstanding_when_the_peer_stops_acknowledging_close_the_path() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
         let network = "quic-path-ack-watch-partial";
-        let mut s = Scripted::connect(network, 2).await;
+        let mut s = Scripted::connect(network).await;
         s.keep_sending();
         s.a_sends(1024 * 1024);
         s.wait(Duration::from_millis(100)).await;
@@ -2405,7 +2399,7 @@ fn recovery_from_an_outage_in_both_directions_does_not_close() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
         let network = "quic-path-ack-watch-outage";
-        let mut s = Scripted::connect(network, 3).await;
+        let mut s = Scripted::connect(network).await;
         s.keep_sending();
         s.a_sends(1024 * 1024);
         s.wait(Duration::from_millis(100)).await;
@@ -2448,7 +2442,7 @@ fn a_send_held_by_the_egress_cap_does_not_close_the_path() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
         let network = "quic-path-ack-watch-capped";
-        let mut s = Scripted::connect_capped(network, 4, Some(50)).await;
+        let mut s = Scripted::connect_capped(network, Some(50)).await;
         s.keep_sending();
         s.wait(Duration::from_secs(5)).await;
         let cap_holds = s.a.connection().cap_holds();
@@ -2496,7 +2490,7 @@ fn a_slow_conforming_peer_is_not_closed() {
                 PacketDeliveryDecision::DelayedDelivery(one_way)
             })),
         );
-        let p = paths(network, 45, QuicPathLimits::DEFAULT).await;
+        let p = paths(network, QuicPathLimits::DEFAULT).await;
         let (a_addr, b_addr) = (p.pair.a_addr, p.pair.b_addr);
         let (a, b) = (p.a.clone(), p.b.clone());
         let time = p.time();
@@ -2593,7 +2587,7 @@ fn a_lossy_path_is_not_closed() {
         let _seed = GlobalRng::seed_guard(SEED);
         let network = "quic-path-ack-watch-lossy";
         let loss = seeded_loss(network, 25);
-        let p = paths(network, 46, QuicPathLimits::DEFAULT).await;
+        let p = paths(network, QuicPathLimits::DEFAULT).await;
         let (a_addr, b_addr) = (p.pair.a_addr, p.pair.b_addr);
         let (a, b, time) = (p.a.clone(), p.b.clone(), p.time());
         let (bulk_ab, bulk_ba, trickles) = p
@@ -2657,7 +2651,7 @@ fn a_bulk_transfer_at_a_long_round_trip_is_not_closed() {
                 PacketDeliveryDecision::DelayedDelivery(one_way)
             })),
         );
-        let p = paths(network, 47, QuicPathLimits::DEFAULT).await;
+        let p = paths(network, QuicPathLimits::DEFAULT).await;
         let (a_addr, b_addr) = (p.pair.a_addr, p.pair.b_addr);
         let (a, b, time) = (p.a.clone(), p.b.clone(), p.time());
         let (to_b, to_a, max) = p
@@ -2691,7 +2685,7 @@ fn a_bulk_transfer_at_a_long_round_trip_is_not_closed() {
 fn an_idle_path_is_not_closed() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let p = paths("quic-path-ack-watch-idle", 44, QuicPathLimits::DEFAULT).await;
+        let p = paths("quic-path-ack-watch-idle", QuicPathLimits::DEFAULT).await;
         let (a_addr, b_addr) = (p.pair.a_addr, p.pair.b_addr);
         let (a, b) = (p.a.clone(), p.b.clone());
         let time = p.time();
@@ -2830,7 +2824,7 @@ fn bounded_send_that_finishes_early_leaves_no_wakeup() {
 fn bounded_sends_on_a_path_report_each_outcome() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let mut p = paths("quic-path-bounded", 60, QuicPathLimits::DEFAULT).await;
+        let mut p = paths("quic-path-bounded", QuicPathLimits::DEFAULT).await;
         let (a, time) = (p.a.clone(), p.time());
         let ready = QuicControl::Ready {
             attempt: 7,
@@ -2888,7 +2882,7 @@ fn bounded_sends_on_a_path_report_each_outcome() {
         drop(silenced);
 
         // A fresh pair, every credit held by streams b is still reading.
-        let p = paths("quic-path-bounded-open", 61, QuicPathLimits::DEFAULT).await;
+        let p = paths("quic-path-bounded-open", QuicPathLimits::DEFAULT).await;
         let (conn, a, time) = (p.a_raw(), p.a.clone(), p.time());
         let (blocked, held) = p
             .drive(async move {
@@ -2926,7 +2920,7 @@ fn bounded_sends_on_a_path_report_each_outcome() {
 fn refused_control_payloads_are_counted() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let p = paths("quic-path-control-refused", 62, QuicPathLimits::DEFAULT).await;
+        let p = paths("quic-path-control-refused", QuicPathLimits::DEFAULT).await;
         let mut ready = QuicControl::Ready {
             attempt: 1,
             caps: 0,
@@ -2990,7 +2984,7 @@ fn blocked_streamed_sends(
 fn a_short_still_sends_while_streamed_messages_are_blocked() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let mut p = paths("quic-path-reserved", 63, QuicPathLimits::DEFAULT).await;
+        let mut p = paths("quic-path-reserved", QuicPathLimits::DEFAULT).await;
         let limit = super::super::config::STREAMED_SEND_LIMIT as usize;
         assert_eq!(limit, 48);
         let streamed = super::super::config::MAX_UNI_STREAMS as usize + 6;
@@ -3057,7 +3051,7 @@ fn a_short_still_sends_while_streamed_messages_are_blocked() {
 fn streamed_sends_return_their_permits() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let p = paths("quic-path-permits", 66, QuicPathLimits::DEFAULT).await;
+        let p = paths("quic-path-permits", QuicPathLimits::DEFAULT).await;
         let limit = super::super::config::STREAMED_SEND_LIMIT as usize;
         let (a, time) = (p.a.clone(), p.time());
         let (completed, timed_out, later) = p
@@ -3116,7 +3110,7 @@ fn streamed_sends_return_their_permits() {
 fn a_bounded_send_timing_out_on_a_permit_opens_no_stream() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let p = paths("quic-path-permit-wait", 67, QuicPathLimits::DEFAULT).await;
+        let p = paths("quic-path-permit-wait", QuicPathLimits::DEFAULT).await;
         let limit = super::super::config::STREAMED_SEND_LIMIT as usize;
         let (a, time) = (p.a.clone(), p.time());
         let (outcome, aborts) = p
@@ -3164,7 +3158,7 @@ fn a_bounded_send_timing_out_on_a_permit_opens_no_stream() {
 fn a_shadow_path_does_not_send_data() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let p = paths("quic-path-shadow-sends", 66, QuicPathLimits::SHADOW).await;
+        let p = paths("quic-path-shadow-sends", QuicPathLimits::SHADOW).await;
         let time = p.time();
         p.b.send_short_bounded(&time, Duration::from_secs(5), b"data")
             .await;
@@ -3186,7 +3180,6 @@ fn a_shadow_path_refuses_data_before_charging_the_budget() {
         ] {
             let mut p = paths_with(
                 &format!("quic-path-shadow-{subnet}"),
-                subnet,
                 QuicPathLimits::SHADOW,
                 Some(budget),
             )
@@ -3393,7 +3386,7 @@ fn the_gap_ends_at_the_end_of_the_stream_and_open_binds_first() {
 fn a_send_on_a_lost_connection_is_not_opened() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let p = paths("quic-path-lost-open", 70, QuicPathLimits::DEFAULT).await;
+        let p = paths("quic-path-lost-open", QuicPathLimits::DEFAULT).await;
         let (a, time) = (p.a.clone(), p.time());
         let (short, stream) = p
             .drive(async move {
@@ -3434,7 +3427,7 @@ fn a_send_on_a_lost_connection_is_not_opened() {
 fn a_close_wakes_a_send_waiting_for_a_permit_at_once() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let p = paths("quic-path-permit-close", 71, QuicPathLimits::DEFAULT).await;
+        let p = paths("quic-path-permit-close", QuicPathLimits::DEFAULT).await;
         let (a, time) = (p.a.clone(), p.time());
         let (outcome, waited) = p
             .drive(async move {
@@ -3490,7 +3483,7 @@ fn a_close_wakes_a_send_waiting_for_a_permit_at_once() {
 fn a_slow_source_that_keeps_writing_outlives_the_gap() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let p = paths("quic-path-slow-source", 79, QuicPathLimits::DEFAULT).await;
+        let p = paths("quic-path-slow-source", QuicPathLimits::DEFAULT).await;
         let (a, time) = (p.a.clone(), p.time());
         let (outcome, took) = p
             .drive(async move {
@@ -3528,7 +3521,7 @@ fn a_slow_source_that_keeps_writing_outlives_the_gap() {
 fn a_source_with_no_first_chunk_holds_nothing() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let p = paths("quic-path-first-chunk", 72, QuicPathLimits::DEFAULT).await;
+        let p = paths("quic-path-first-chunk", QuicPathLimits::DEFAULT).await;
         let limit = super::super::config::STREAMED_SEND_LIMIT as usize;
         let (a, time) = (p.a.clone(), p.time());
         let (waiting, free_while_waiting, waited, ended, failed) = p
@@ -3613,7 +3606,7 @@ fn a_source_with_no_first_chunk_holds_nothing() {
 fn a_source_stall_resets_at_the_gap_and_returns_the_permit() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let p = paths("quic-path-source-stall", 73, QuicPathLimits::DEFAULT).await;
+        let p = paths("quic-path-source-stall", QuicPathLimits::DEFAULT).await;
         let limit = super::super::config::STREAMED_SEND_LIMIT as usize;
         let (a, time) = (p.a.clone(), p.time());
         let (outcome, waited, held, free_after) = p
@@ -3658,7 +3651,7 @@ fn a_source_stall_resets_at_the_gap_and_returns_the_permit() {
 fn a_write_held_by_a_silent_peer_fails_at_the_gap() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let p = paths("quic-path-write-stall", 74, QuicPathLimits::DEFAULT).await;
+        let p = paths("quic-path-write-stall", QuicPathLimits::DEFAULT).await;
         let _silenced = DropFrom::new("quic-path-write-stall", &[p.pair.b_addr]);
         let (a, time) = (p.a.clone(), p.time());
         let body = over_window();
@@ -3696,7 +3689,7 @@ fn a_write_held_by_a_silent_peer_fails_at_the_gap() {
 fn a_permit_outlives_a_timed_out_send_until_the_ack() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let p = paths("quic-path-permit-ack", 75, QuicPathLimits::DEFAULT).await;
+        let p = paths("quic-path-permit-ack", QuicPathLimits::DEFAULT).await;
         let limit = super::super::config::STREAMED_SEND_LIMIT as usize;
         let silenced = DropFrom::new("quic-path-permit-ack", &[p.pair.b_addr]);
         let (a, time) = (p.a.clone(), p.time());
@@ -3754,7 +3747,7 @@ fn a_permit_outlives_a_timed_out_send_until_the_ack() {
 fn a_permit_held_past_a_timed_out_send_returns_on_close() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let p = paths("quic-path-permit-end", 76, QuicPathLimits::DEFAULT).await;
+        let p = paths("quic-path-permit-end", QuicPathLimits::DEFAULT).await;
         let limit = super::super::config::STREAMED_SEND_LIMIT as usize;
         let _silenced = DropFrom::new("quic-path-permit-end", &[p.pair.b_addr]);
         let (a, time) = (p.a.clone(), p.time());
@@ -3787,7 +3780,7 @@ fn a_permit_held_past_a_timed_out_send_returns_on_close() {
 fn only_a_short_past_one_packet_takes_a_permit() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let p = paths("quic-path-short-permit", 77, QuicPathLimits::DEFAULT).await;
+        let p = paths("quic-path-short-permit", QuicPathLimits::DEFAULT).await;
         let limit = super::super::config::STREAMED_SEND_LIMIT as usize;
         let (a, time) = (p.a.clone(), p.time());
         let (large, small) = p
@@ -3827,7 +3820,7 @@ fn only_a_short_past_one_packet_takes_a_permit() {
 fn ticks_equal_the_fragment_count() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let mut p = paths("quic-path-ticks", 78, QuicPathLimits::DEFAULT).await;
+        let mut p = paths("quic-path-ticks", QuicPathLimits::DEFAULT).await;
         let (a, time) = (p.a.clone(), p.time());
         let body = Bytes::from(payload(3 * FRAGMENT_PAYLOAD_SIZE + 1));
         let len = body.len() as u64;
@@ -3890,7 +3883,7 @@ fn ticks_equal_the_fragment_count() {
 fn a_duration_bounds_a_send_from_a_source_including_the_first_chunk() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let p = paths("quic-path-source-total", 80, QuicPathLimits::DEFAULT).await;
+        let p = paths("quic-path-source-total", QuicPathLimits::DEFAULT).await;
         let (a, time) = (p.a.clone(), p.time());
         let (outcome, took) = p
             .drive(async move {
@@ -3929,7 +3922,7 @@ fn a_duration_bounds_a_send_from_a_source_including_the_first_chunk() {
 fn a_close_ends_the_wait_for_the_first_chunk_at_once() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let p = paths("quic-path-first-close", 81, QuicPathLimits::DEFAULT).await;
+        let p = paths("quic-path-first-close", QuicPathLimits::DEFAULT).await;
         let (a, time) = (p.a.clone(), p.time());
         let (outcome, took) = p
             .drive(async move {
@@ -3982,7 +3975,7 @@ fn the_permit_for_a_short_starts_just_past_one_packet() {
             .take_while(|len| fits_one_packet(*len))
             .last()
             .expect("something fits a packet") as usize;
-        let p = paths("quic-path-short-boundary", 82, QuicPathLimits::DEFAULT).await;
+        let p = paths("quic-path-short-boundary", QuicPathLimits::DEFAULT).await;
         let (a, time) = (p.a.clone(), p.time());
         let (at, past) = p
             .drive(async move {
@@ -4054,11 +4047,9 @@ fn assert_writers_took_turns(log: &[u8], sends: u8, fragments: usize) {
 #[test]
 fn streams_on_a_path_take_turns_with_their_fragments() {
     bounded(|| async move {
-        for (streams, subnet, network) in
-            [(2u8, 88, "quic-path-turns-2"), (4, 83, "quic-path-turns-4")]
-        {
+        for (streams, network) in [(2u8, "quic-path-turns-2"), (4, "quic-path-turns-4")] {
             let _seed = GlobalRng::seed_guard(SEED);
-            let mut p = paths(network, subnet, QuicPathLimits::DEFAULT).await;
+            let mut p = paths(network, QuicPathLimits::DEFAULT).await;
             let log = Arc::new(std::sync::Mutex::new(Vec::new()));
             let body = Bytes::from(payload(4 * MIB));
             let mut sends = Vec::new();
@@ -4105,7 +4096,7 @@ fn shorts_past_one_packet_take_turns_with_their_fragments() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
         let shorts: u8 = 4;
-        let p = paths("quic-path-short-turns", 84, QuicPathLimits::DEFAULT).await;
+        let p = paths("quic-path-short-turns", QuicPathLimits::DEFAULT).await;
         let log = Arc::new(std::sync::Mutex::new(Vec::new()));
         let body = Arc::new(payload(4 * MIB));
         let mut sends = Vec::new();
@@ -4135,7 +4126,7 @@ fn shorts_past_one_packet_take_turns_with_their_fragments() {
 fn a_one_packet_message_is_one_stream_frame() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let p = paths("quic-path-one-frame", 85, QuicPathLimits::DEFAULT).await;
+        let p = paths("quic-path-one-frame", QuicPathLimits::DEFAULT).await;
         let (a, time) = (p.a.clone(), p.time());
         let frames = p
             .drive(async move {
@@ -4158,7 +4149,7 @@ fn a_one_packet_message_is_one_stream_frame() {
 fn the_end_of_a_stream_leaves_with_its_last_fragment() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let p = paths("quic-path-last-frame", 86, QuicPathLimits::DEFAULT).await;
+        let p = paths("quic-path-last-frame", QuicPathLimits::DEFAULT).await;
         let (a, time) = (p.a.clone(), p.time());
         let body = Bytes::from(payload(FRAGMENT_PAYLOAD_SIZE + 100));
         let frames = p
@@ -4194,7 +4185,7 @@ fn the_end_of_a_stream_leaves_with_its_last_fragment() {
 fn a_first_chunk_at_the_deadline_opens_no_stream() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let p = paths("quic-path-first-late", 87, QuicPathLimits::DEFAULT).await;
+        let p = paths("quic-path-first-late", QuicPathLimits::DEFAULT).await;
         let (a, time) = (p.a.clone(), p.time());
         let outcomes = p
             .drive(async move {

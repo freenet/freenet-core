@@ -362,14 +362,14 @@ mod tests {
     /// after the driver's watcher read `released` as false.
     #[test]
     fn the_first_final_state_wins() {
-        let addr: SocketAddr = "10.201.35.1:1".parse().unwrap();
+        let addr: SocketAddr = crate::transport::test_net::subnet().addr_port(1, 1);
         let health = EndpointHealth::new(addr);
         health.availability.send_replace(QuicAvailability::Released);
         health.driver_ended();
         assert_eq!(health.watch().get(), QuicAvailability::Released);
         assert_eq!(TRANSPORT_METRICS.quic_endpoint_down_at(addr), 0);
 
-        let addr: SocketAddr = "10.201.35.2:1".parse().unwrap();
+        let addr: SocketAddr = crate::transport::test_net::subnet().addr_port(1, 1);
         let health = EndpointHealth::new(addr);
         health.driver_ended();
         health.release();
@@ -385,7 +385,7 @@ mod tests {
     /// longer be sent.
     #[test]
     fn an_adapter_panic_counts_once_and_keeps_released() {
-        let addr: SocketAddr = "10.201.35.3:1".parse().unwrap();
+        let addr: SocketAddr = crate::transport::test_net::subnet().addr_port(1, 1);
         let health = EndpointHealth::new(addr);
         assert!(health.closes_can_be_sent());
         health.adapter_panicked("test", &"first");
@@ -395,7 +395,7 @@ mod tests {
         assert_eq!(TRANSPORT_METRICS.quic_endpoint_down_at(addr), 1);
         assert!(!health.closes_can_be_sent());
 
-        let addr: SocketAddr = "10.201.35.4:1".parse().unwrap();
+        let addr: SocketAddr = crate::transport::test_net::subnet().addr_port(1, 1);
         let health = EndpointHealth::new(addr);
         health.release();
         assert!(health.closes_can_be_sent());

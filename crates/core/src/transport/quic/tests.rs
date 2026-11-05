@@ -363,15 +363,10 @@ pub(super) const MIB: usize = 1024 * 1024;
 /// with the fixed bit set (greasing is off) and at most 1200 bytes.
 #[test]
 fn handshake_and_one_mib_stream_on_virtual_time() {
-    bounded(|| async move {
+    let net_1 = crate::transport::test_net::subnet();
+    bounded(move || async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let pair = pair(
-            "quic-handshake",
-            "10.201.1.1:5000".parse().unwrap(),
-            "10.201.1.2:5000".parse().unwrap(),
-            None,
-        )
-        .await;
+        let pair = pair("quic-handshake", net_1.addr(1), net_1.addr(2), None).await;
         let data = payload(MIB);
         let (received, client, server) = pair.transfer(data.clone(), Duration::from_secs(60)).await;
         assert_eq!(received.len(), data.len());
@@ -445,15 +440,10 @@ fn handshake_and_one_mib_stream_on_virtual_time() {
 /// handle (which closes the connection) and the server seeing the close.
 #[test]
 fn a_peer_leaves_the_allow_set_when_its_connection_ends() {
-    bounded(|| async move {
+    let net_13 = crate::transport::test_net::subnet();
+    bounded(move || async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let pair = pair(
-            "quic-allow-lifecycle",
-            "10.201.13.1:5000".parse().unwrap(),
-            "10.201.13.2:5000".parse().unwrap(),
-            None,
-        )
-        .await;
+        let pair = pair("quic-allow-lifecycle", net_13.addr(1), net_13.addr(2), None).await;
         let (received, client, server) =
             pair.transfer(payload(1000), Duration::from_secs(60)).await;
         assert_eq!(received.len(), 1000);
@@ -494,15 +484,10 @@ fn a_peer_leaves_the_allow_set_when_its_connection_ends() {
 /// both sides, and neither side keeps the other on its allow-set.
 #[test]
 fn a_client_with_another_alpn_is_refused() {
-    bounded(|| async move {
+    let net_2 = crate::transport::test_net::subnet();
+    bounded(move || async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let pair = pair(
-            "quic-alpn",
-            "10.201.2.1:5000".parse().unwrap(),
-            "10.201.2.2:5000".parse().unwrap(),
-            None,
-        )
-        .await;
+        let pair = pair("quic-alpn", net_2.addr(1), net_2.addr(2), None).await;
         let _permit = pair.b.allow_peer(pair.a_addr, &pair.a_key()).expect("room");
         let b_peer = PeerKey::of(pair.b_keys.public()).unwrap();
         let mut tls = config::rustls_client_config(
@@ -736,15 +721,10 @@ async fn assert_refused(
 /// so they fail because of the key and not the setup.
 #[test]
 fn handshakes_with_the_expected_keys_succeed_both_ways() {
-    bounded(|| async move {
+    let net_21 = crate::transport::test_net::subnet();
+    bounded(move || async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let pair = pair(
-            "quic-identity-ok",
-            "10.201.21.1:5000".parse().unwrap(),
-            "10.201.21.2:5000".parse().unwrap(),
-            None,
-        )
-        .await;
+        let pair = pair("quic-identity-ok", net_21.addr(1), net_21.addr(2), None).await;
         for (client, server, client_keys, server_keys, server_addr, client_addr) in [
             (
                 &pair.a,
@@ -803,12 +783,13 @@ fn handshakes_with_the_expected_keys_succeed_both_ways() {
 /// server, and the server's side fails too.
 #[test]
 fn a_server_without_the_expected_key_is_refused() {
-    bounded(|| async move {
+    let net_22 = crate::transport::test_net::subnet();
+    bounded(move || async move {
         let _seed = GlobalRng::seed_guard(SEED);
         let pair = pair(
             "quic-identity-wrong-server",
-            "10.201.22.1:5000".parse().unwrap(),
-            "10.201.22.2:5000".parse().unwrap(),
+            net_22.addr(1),
+            net_22.addr(2),
             None,
         )
         .await;
@@ -855,12 +836,13 @@ fn a_server_without_the_expected_key_is_refused() {
 /// refuses the client.
 #[test]
 fn a_client_without_the_expected_key_is_refused() {
-    bounded(|| async move {
+    let net_23 = crate::transport::test_net::subnet();
+    bounded(move || async move {
         let _seed = GlobalRng::seed_guard(SEED);
         let pair = pair(
             "quic-identity-wrong-client",
-            "10.201.23.1:5000".parse().unwrap(),
-            "10.201.23.2:5000".parse().unwrap(),
+            net_23.addr(1),
+            net_23.addr(2),
             None,
         )
         .await;
@@ -893,12 +875,13 @@ fn a_client_without_the_expected_key_is_refused() {
 /// key, signed by ring's own Ed25519) is refused on either side.
 #[test]
 fn a_foreign_ed25519_key_is_refused_on_either_side() {
-    bounded(|| async move {
+    let net_24 = crate::transport::test_net::subnet();
+    bounded(move || async move {
         let _seed = GlobalRng::seed_guard(SEED);
         let pair = pair(
             "quic-identity-foreign",
-            "10.201.24.1:5000".parse().unwrap(),
-            "10.201.24.2:5000".parse().unwrap(),
+            net_24.addr(1),
+            net_24.addr(2),
             None,
         )
         .await;
@@ -951,16 +934,11 @@ fn a_foreign_ed25519_key_is_refused_on_either_side() {
 /// presenting its own key, and presenting a's key it cannot sign as a.
 #[test]
 fn a_man_in_the_middle_with_its_own_key_fails_both_legs() {
-    bounded(|| async move {
+    let net_25 = crate::transport::test_net::subnet();
+    bounded(move || async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let pair = pair(
-            "quic-identity-mitm",
-            "10.201.25.1:5000".parse().unwrap(),
-            "10.201.25.2:5000".parse().unwrap(),
-            None,
-        )
-        .await;
-        let m_addr: SocketAddr = "10.201.25.3:5000".parse().unwrap();
+        let pair = pair("quic-identity-mitm", net_25.addr(1), net_25.addr(2), None).await;
+        let m_addr: SocketAddr = net_25.addr(3);
         register_address_network(m_addr, &pair.network);
         let m_socket = Arc::new(DemuxSocket::wrap(
             SimulationSocket::bind(m_addr).await.unwrap(),
@@ -1062,15 +1040,10 @@ fn a_man_in_the_middle_with_its_own_key_fails_both_legs() {
 /// a new key.
 #[test]
 fn a_live_attempt_or_connection_keeps_its_address_bound_to_its_key() {
-    bounded(|| async move {
+    let net_27 = crate::transport::test_net::subnet();
+    bounded(move || async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let pair = pair(
-            "quic-identity-hold",
-            "10.201.27.1:5000".parse().unwrap(),
-            "10.201.27.2:5000".parse().unwrap(),
-            None,
-        )
-        .await;
+        let pair = pair("quic-identity-hold", net_27.addr(1), net_27.addr(2), None).await;
         let other = TransportKeypair::new();
         let permit = pair.b.allow_peer(pair.a_addr, &pair.a_key()).unwrap();
         let (a, b, b_addr, b_key) = (pair.a.clone(), pair.b.clone(), pair.b_addr, pair.b_key());
@@ -1158,12 +1131,13 @@ fn a_live_attempt_or_connection_keeps_its_address_bound_to_its_key() {
 /// address takes a new key once every permit is gone.
 #[test]
 fn an_allowed_address_keeps_its_key_until_released() {
-    bounded(|| async move {
+    let net_26 = crate::transport::test_net::subnet();
+    bounded(move || async move {
         let _seed = GlobalRng::seed_guard(SEED);
         let pair = pair(
             "quic-identity-permits",
-            "10.201.26.1:5000".parse().unwrap(),
-            "10.201.26.2:5000".parse().unwrap(),
+            net_26.addr(1),
+            net_26.addr(2),
             None,
         )
         .await;
@@ -1213,8 +1187,8 @@ fn the_same_seed_gives_the_same_event_trace() {
                 tokio::task::yield_now().await;
             }
             let _seed = GlobalRng::seed_guard(SEED);
-            let a_addr: SocketAddr = format!("10.201.{subnet}.1:5000").parse().unwrap();
-            let b_addr: SocketAddr = format!("10.201.{subnet}.2:5000").parse().unwrap();
+            let net = crate::transport::test_net::subnet();
+            let (a_addr, b_addr) = (net.addr(1), net.addr(2));
             let pair = pair(&format!("quic-determinism-{subnet}"), a_addr, b_addr, None).await;
             let (received, _client, _server) = pair
                 .transfer(payload(256 * 1024), Duration::from_secs(60))
@@ -1248,7 +1222,9 @@ fn the_same_seed_gives_the_same_event_trace() {
 /// one any transfer passes.
 #[test]
 fn a_bulk_transfer_under_the_egress_cap_stays_within_its_bound() {
-    bounded(|| async move {
+    let net_5 = crate::transport::test_net::subnet();
+    let net_6 = crate::transport::test_net::subnet();
+    bounded(move || async move {
         const RATE: u64 = 2_000_000;
         let check = |sent: &[Sent], from: SocketAddr, burst: u64| -> Result<(), String> {
             let sends: Vec<(u64, u64)> = sent
@@ -1275,13 +1251,7 @@ fn a_bulk_transfer_under_the_egress_cap_stays_within_its_bound() {
         let burst = EgressCap::new(RATE, VirtualTime::new()).burst_bytes();
 
         let _seed = GlobalRng::seed_guard(SEED);
-        let capped = pair(
-            "quic-cap",
-            "10.201.5.1:5000".parse().unwrap(),
-            "10.201.5.2:5000".parse().unwrap(),
-            Some(RATE),
-        )
-        .await;
+        let capped = pair("quic-cap", net_5.addr(1), net_5.addr(2), Some(RATE)).await;
         let (received, _c, _s) = capped
             .transfer(payload(MIB), Duration::from_secs(120))
             .await;
@@ -1307,13 +1277,7 @@ fn a_bulk_transfer_under_the_egress_cap_stays_within_its_bound() {
         );
         drop(capped);
 
-        let uncapped = pair(
-            "quic-nocap",
-            "10.201.6.1:5000".parse().unwrap(),
-            "10.201.6.2:5000".parse().unwrap(),
-            None,
-        )
-        .await;
+        let uncapped = pair("quic-nocap", net_6.addr(1), net_6.addr(2), None).await;
         let (received, _c, _s) = uncapped
             .transfer(payload(MIB), Duration::from_secs(120))
             .await;
@@ -1805,6 +1769,7 @@ fn transport_quic_values_and_unknown_ones() {
 /// The socket sends one datagram per transmit and receives one per call.
 #[test]
 fn the_socket_never_batches() {
+    let net_7 = crate::transport::test_net::subnet();
     // Checked on the trait methods quinn reads; a value above 1 would let
     // quinn hand the cap a GSO batch larger than its burst.
     let check = |socket: &dyn quinn::AsyncUdpSocket| {
@@ -1818,7 +1783,7 @@ fn the_socket_never_batches() {
         .unwrap();
     rt.block_on(async {
         let network = "quic-segments";
-        let addr: SocketAddr = "10.201.7.1:5000".parse().unwrap();
+        let addr: SocketAddr = net_7.addr(1);
         register_network_time_source(network, VirtualTime::new());
         register_address_network(addr, network);
         let demux = Arc::new(DemuxSocket::wrap(
@@ -2057,13 +2022,14 @@ fn transmit(contents: &[u8], destination: SocketAddr) -> quinn::udp::Transmit<'_
 /// plain form.
 #[test]
 fn a_sent_datagram_is_charged_once() {
+    let net_8 = crate::transport::test_net::subnet();
     use crate::transport::metrics::EgressDecision;
     use quinn::AsyncUdpSocket;
     let time = VirtualTime::new();
-    let local: SocketAddr = "10.201.8.1:5000".parse().unwrap();
+    let local: SocketAddr = net_8.addr(1);
     let (socket, demux) = scripted(local, SendMode::Send, Vec::new(), Some((1_000_000, &time)));
-    let target_v4: SocketAddr = "10.201.8.2:5000".parse().unwrap();
-    let mapped = SocketAddr::new(Ipv4Addr::new(10, 201, 8, 2).to_ipv6_mapped().into(), 5000);
+    let target_v4: SocketAddr = net_8.addr(2);
+    let mapped = SocketAddr::new(net_8.ip(2).to_ipv6_mapped().into(), 5000);
     socket.try_send(&transmit(&[0xC0; 1000], mapped)).unwrap();
     let stats = demux.egress_cap().unwrap().stats();
     assert_eq!(stats.bytes, 1000);
@@ -2083,11 +2049,12 @@ fn a_sent_datagram_is_charged_once() {
 /// watch then runs and closes as usual.
 #[test]
 fn a_hold_left_by_an_ended_connection_stops_pausing_the_ack_watch() {
+    let net_40 = crate::transport::test_net::subnet();
     use super::recycle::{ACK_WATCH_TICK, ACK_WATCH_WINDOW, AckSample, AckWatch};
     use quinn::AsyncUdpSocket;
     use std::task::Context;
     let time = VirtualTime::new();
-    let local: SocketAddr = "10.201.40.1:5000".parse().unwrap();
+    let local: SocketAddr = net_40.addr(1);
     let rate = 1_000_000;
     let (socket, demux) = scripted(local, SendMode::Send, Vec::new(), Some((rate, &time)));
     let cap = demux.egress_cap().unwrap();
@@ -2178,15 +2145,16 @@ fn cap_hold_validity_bounds_the_longest_admission_wait() {
 /// `Pending` until the cap has a full datagram and `Ready` once it does.
 #[test]
 fn a_cap_short_of_the_datagram_is_would_block() {
+    let net_9 = crate::transport::test_net::subnet();
     use quinn::AsyncUdpSocket;
     use std::task::Context;
     let time = VirtualTime::new();
-    let local: SocketAddr = "10.201.9.1:5000".parse().unwrap();
+    let local: SocketAddr = net_9.addr(1);
     let (socket, demux) = scripted(local, SendMode::Send, Vec::new(), Some((1_000_000, &time)));
     let cap = demux.egress_cap().unwrap();
     cap.charge_unpaced(cap.burst_bytes() as usize);
     let level = cap.level_bytes();
-    let target: SocketAddr = "10.201.9.2:5000".parse().unwrap();
+    let target: SocketAddr = net_9.addr(2);
     let err = socket
         .try_send(&transmit(&[0xC0; 1200], target))
         .unwrap_err();
@@ -2208,9 +2176,10 @@ fn a_cap_short_of_the_datagram_is_would_block() {
 /// cap gets back everything it was charged for the attempt.
 #[test]
 fn a_full_socket_buffer_is_would_block_and_returns_the_take() {
+    let net_10 = crate::transport::test_net::subnet();
     use quinn::AsyncUdpSocket;
     let time = VirtualTime::new();
-    let local: SocketAddr = "10.201.10.1:5000".parse().unwrap();
+    let local: SocketAddr = net_10.addr(1);
     let (socket, demux) = scripted(
         local,
         SendMode::WouldBlock,
@@ -2220,10 +2189,7 @@ fn a_full_socket_buffer_is_would_block_and_returns_the_take() {
     let cap = demux.egress_cap().unwrap();
     let level = cap.level_bytes();
     let err = socket
-        .try_send(&transmit(
-            &[0xC0; 1200],
-            "10.201.10.2:5000".parse().unwrap(),
-        ))
+        .try_send(&transmit(&[0xC0; 1200], net_10.addr(2)))
         .unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
     assert_eq!(cap.level_bytes(), level, "the take came back");
@@ -2236,11 +2202,12 @@ fn a_full_socket_buffer_is_would_block_and_returns_the_take() {
 /// and not charged; with no cap the same holds.
 #[test]
 fn a_failed_send_is_counted_and_swallowed() {
+    let net_11 = crate::transport::test_net::subnet();
     use quinn::AsyncUdpSocket;
     let time = VirtualTime::new();
-    let target: SocketAddr = "10.201.11.2:5000".parse().unwrap();
+    let target: SocketAddr = net_11.addr(2);
     for cap in [Some((1_000_000, &time)), None] {
-        let local: SocketAddr = "10.201.11.1:5000".parse().unwrap();
+        let local: SocketAddr = net_11.addr(1);
         let (socket, demux) = scripted(local, SendMode::Fail, Vec::new(), cap);
         socket.try_send(&transmit(&[0xC0; 900], target)).unwrap();
         socket.try_send(&transmit(&[0xC0; 900], target)).unwrap();
@@ -2257,13 +2224,14 @@ fn a_failed_send_is_counted_and_swallowed() {
 /// on an IPv4 socket it is unchanged.
 #[tokio::test]
 async fn received_ipv4_sources_are_mapped_on_an_ipv6_socket() {
+    let net_12 = crate::transport::test_net::subnet();
     use quinn::AsyncUdpSocket;
     use std::io::IoSliceMut;
     use std::task::{Context, Poll};
-    let from: SocketAddr = "10.201.12.2:5000".parse().unwrap();
+    let from: SocketAddr = net_12.addr(2);
     let datagram = vec![0xC1, 7, 7, 7];
-    for local in ["[::]:5000", "10.201.12.1:5000"] {
-        let local: SocketAddr = local.parse().unwrap();
+    for local in ["[::]:5000".parse().unwrap(), net_12.addr(1)] {
+        let local: SocketAddr = local;
         let (socket, demux) = scripted(local, SendMode::Send, vec![(datagram.clone(), from)], None);
         let _permit = demux.allow_quic_source(from).unwrap();
         let mut buf = vec![0u8; MAX_RECV_PACKET_SIZE];
@@ -2278,7 +2246,7 @@ async fn received_ipv4_sources_are_mapped_on_an_ipv6_socket() {
             panic!("one datagram is ready");
         };
         let expected = if local.is_ipv6() {
-            SocketAddr::new(Ipv4Addr::new(10, 201, 12, 2).to_ipv6_mapped().into(), 5000)
+            SocketAddr::new(net_12.ip(2).to_ipv6_mapped().into(), 5000)
         } else {
             from
         };
@@ -2334,8 +2302,8 @@ fn a_short_header_packet_with_a_forged_id_gets_no_reply() {
             let network = format!("quic-forged-cid-{subnet}");
             let time = VirtualTime::new();
             register_network_time_source(&network, time.clone());
-            let endpoint_addr: SocketAddr = format!("10.201.{subnet}.1:5000").parse().unwrap();
-            let prober_addr: SocketAddr = format!("10.201.{subnet}.2:5000").parse().unwrap();
+            let net = crate::transport::test_net::subnet();
+            let (endpoint_addr, prober_addr) = (net.addr(1), net.addr(2));
             register_address_network(endpoint_addr, &network);
             register_address_network(prober_addr, &network);
             let socket = Arc::new(DemuxSocket::wrap(
@@ -2384,15 +2352,10 @@ fn a_short_header_packet_with_a_forged_id_gets_no_reply() {
 /// time out and release their permits.
 #[test]
 fn an_idle_timeout_releases_the_allow_set() {
-    bounded(|| async move {
+    let net_16 = crate::transport::test_net::subnet();
+    bounded(move || async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let pair = pair(
-            "quic-idle",
-            "10.201.16.1:5000".parse().unwrap(),
-            "10.201.16.2:5000".parse().unwrap(),
-            None,
-        )
-        .await;
+        let pair = pair("quic-idle", net_16.addr(1), net_16.addr(2), None).await;
         let (_, client, server) = pair.transfer(payload(1000), Duration::from_secs(60)).await;
         pair.pumps[1].abort();
         let (c, s) = (client.inner().clone(), server.inner().clone());
@@ -2421,15 +2384,10 @@ fn an_idle_timeout_releases_the_allow_set() {
 /// their permits on both sides.
 #[test]
 fn closing_an_endpoint_releases_the_allow_set() {
-    bounded(|| async move {
+    let net_17 = crate::transport::test_net::subnet();
+    bounded(move || async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let pair = pair(
-            "quic-endpoint-close",
-            "10.201.17.1:5000".parse().unwrap(),
-            "10.201.17.2:5000".parse().unwrap(),
-            None,
-        )
-        .await;
+        let pair = pair("quic-endpoint-close", net_17.addr(1), net_17.addr(2), None).await;
         let (_, client, server) = pair.transfer(payload(1000), Duration::from_secs(60)).await;
         pair.a
             .endpoint
@@ -2458,15 +2416,10 @@ fn closing_an_endpoint_releases_the_allow_set() {
 /// it was.
 #[test]
 fn connect_with_a_full_allow_set_fails_and_leaks_nothing() {
-    bounded(|| async move {
+    let net_18 = crate::transport::test_net::subnet();
+    bounded(move || async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let pair = pair(
-            "quic-allow-full",
-            "10.201.18.1:5000".parse().unwrap(),
-            "10.201.18.2:5000".parse().unwrap(),
-            None,
-        )
-        .await;
+        let pair = pair("quic-allow-full", net_18.addr(1), net_18.addr(2), None).await;
         let max = crate::transport::demux::QUIC_ALLOWED_SOURCES_MAX;
         let fillers: Vec<_> = (0..max)
             .map(|i| {
@@ -2498,15 +2451,10 @@ fn connect_with_a_full_allow_set_fails_and_leaks_nothing() {
 /// demux unit test `quic_allow_set_bound_holds_under_concurrent_callers`.)
 #[test]
 fn accept_ignores_an_attempt_whose_source_was_released() {
-    bounded(|| async move {
+    let net_19 = crate::transport::test_net::subnet();
+    bounded(move || async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let pair = pair(
-            "quic-accept-released",
-            "10.201.19.1:5000".parse().unwrap(),
-            "10.201.19.2:5000".parse().unwrap(),
-            None,
-        )
-        .await;
+        let pair = pair("quic-accept-released", net_19.addr(1), net_19.addr(2), None).await;
         let permit = pair.b.allow_peer(pair.a_addr, &pair.a_key()).unwrap();
         let a = pair.a.clone();
         let (b_addr, b_key) = (pair.b_addr, pair.b_key());
@@ -2548,9 +2496,10 @@ fn accept_ignores_an_attempt_whose_source_was_released() {
 /// uses, turns that into no endpoint, so a node with `prefer` still starts.
 #[test]
 fn a_failed_bind_leaves_the_node_running_without_quic() {
-    bounded(|| async move {
+    let net_20 = crate::transport::test_net::subnet();
+    bounded(move || async move {
         let network = "quic-bind-twice";
-        let addr: SocketAddr = "10.201.20.1:5000".parse().unwrap();
+        let addr: SocketAddr = net_20.addr(1);
         let time = VirtualTime::new();
         register_network_time_source(network, time.clone());
         register_address_network(addr, network);
@@ -2587,17 +2536,12 @@ fn the_cap_wakes_waiters_per_quic_datagram() {
 /// code; a second close of an ended connection sends and counts nothing.
 #[test]
 fn close_codes_reach_the_peer() {
-    bounded(|| async move {
+    let net_30 = crate::transport::test_net::subnet();
+    bounded(move || async move {
         use crate::transport::metrics::{QuicCloseCode, TRANSPORT_METRICS};
         use crate::transport::{QuicErrorKind, QuicRefusal};
         let _seed = GlobalRng::seed_guard(SEED);
-        let pair = pair(
-            "quic-close-codes",
-            "10.201.30.1:5000".parse().unwrap(),
-            "10.201.30.2:5000".parse().unwrap(),
-            None,
-        )
-        .await;
+        let pair = pair("quic-close-codes", net_30.addr(1), net_30.addr(2), None).await;
         let expected = |code: QuicCloseCode| match code {
             QuicCloseCode::NodeDroppedPeer => QuicErrorKind::ConnectionLost,
             QuicCloseCode::Downgrade
@@ -2707,18 +2651,13 @@ fn close_codes_reach_the_peer() {
 /// and new ones fail as `EndpointDown`.
 #[test]
 fn endpoint_death_turns_quic_off_without_stopping_the_node() {
-    bounded(|| async move {
+    let net_31 = crate::transport::test_net::subnet();
+    bounded(move || async move {
         use crate::node::background_task_monitor::BackgroundTaskMonitor;
         use crate::transport::QuicErrorKind;
         use crate::transport::metrics::TRANSPORT_METRICS;
         let _seed = GlobalRng::seed_guard(SEED);
-        let pair = pair(
-            "quic-endpoint-death",
-            "10.201.31.1:5000".parse().unwrap(),
-            "10.201.31.2:5000".parse().unwrap(),
-            None,
-        )
-        .await;
+        let pair = pair("quic-endpoint-death", net_31.addr(1), net_31.addr(2), None).await;
         let (_, client, _server) = pair.transfer(payload(100), Duration::from_secs(60)).await;
         let mut availability = pair.a.availability();
         assert_eq!(availability.get(), QuicAvailability::Up);
@@ -2811,10 +2750,7 @@ fn endpoint_death_turns_quic_off_without_stopping_the_node() {
         // Dropping every handle afterwards counts nothing more.
         drop(client);
         drop(pair);
-        assert_eq!(
-            TRANSPORT_METRICS.quic_endpoint_down_at("10.201.31.1:5000".parse().unwrap()),
-            1
-        );
+        assert_eq!(TRANSPORT_METRICS.quic_endpoint_down_at(net_31.addr(1)), 1);
         wait.abort();
     });
 }
@@ -2827,11 +2763,12 @@ fn endpoint_death_turns_quic_off_without_stopping_the_node() {
 /// around `not_up` cannot spin on a stale `Up`.
 #[test]
 fn dropping_the_endpoint_is_not_a_death() {
-    bounded(|| async move {
+    let net_32 = crate::transport::test_net::subnet();
+    bounded(move || async move {
         use crate::node::background_task_monitor::BackgroundTaskMonitor;
         use crate::transport::metrics::TRANSPORT_METRICS;
         let network = "quic-endpoint-drop";
-        let addr: SocketAddr = "10.201.32.1:5000".parse().unwrap();
+        let addr: SocketAddr = net_32.addr(1);
         let time = VirtualTime::new();
         register_network_time_source(network, time.clone());
         register_address_network(addr, network);
@@ -2897,16 +2834,11 @@ fn dropping_the_endpoint_is_not_a_death() {
 /// An attempt that finds the accept queue full is ignored and counted.
 #[test]
 fn a_full_accept_queue_ignores_and_counts_the_attempt() {
-    bounded(|| async move {
+    let net_33 = crate::transport::test_net::subnet();
+    bounded(move || async move {
         use crate::node::background_task_monitor::BackgroundTaskMonitor;
         let _seed = GlobalRng::seed_guard(SEED);
-        let pair = pair(
-            "quic-accept-full",
-            "10.201.33.1:5000".parse().unwrap(),
-            "10.201.33.2:5000".parse().unwrap(),
-            None,
-        )
-        .await;
+        let pair = pair("quic-accept-full", net_33.addr(1), net_33.addr(2), None).await;
         let _permit = pair.b.allow_peer(pair.a_addr, &pair.a_key()).unwrap();
         let monitor = BackgroundTaskMonitor::new();
         // Room for one attempt, never taken.
@@ -3240,16 +3172,11 @@ fn a_simulated_node_with_quic_and_an_egress_cap_is_refused() {
 /// progress sends and counts nothing, so the connection stays open.
 #[test]
 fn concurrent_closers_close_and_count_once() {
-    bounded(|| async move {
+    let net_36 = crate::transport::test_net::subnet();
+    bounded(move || async move {
         use crate::transport::metrics::{QuicCloseCode, TRANSPORT_METRICS};
         let _seed = GlobalRng::seed_guard(SEED);
-        let pair = pair(
-            "quic-close-once",
-            "10.201.36.1:5000".parse().unwrap(),
-            "10.201.36.2:5000".parse().unwrap(),
-            None,
-        )
-        .await;
+        let pair = pair("quic-close-once", net_36.addr(1), net_36.addr(2), None).await;
 
         // Deterministic: a close already in progress wins.
         let (_, client, _server) = pair.transfer(payload(100), Duration::from_secs(60)).await;
@@ -3450,6 +3377,7 @@ fn a_panic_in_the_socket_adapter_turns_quic_off_and_the_node_keeps_running() {
         "a_panic_in_the_socket_adapter_turns_quic_off_and_the_node_keeps_running",
         || {
             bounded(|| async move {
+                let net_37 = crate::transport::test_net::subnet();
                 use super::path::QuicPath;
                 use crate::node::background_task_monitor::BackgroundTaskMonitor;
                 use crate::transport::QuicErrorKind;
@@ -3457,8 +3385,8 @@ fn a_panic_in_the_socket_adapter_turns_quic_off_and_the_node_keeps_running() {
                 let _seed = GlobalRng::seed_guard(SEED);
                 let pair = pair(
                     "quic-panic-adapter-receive",
-                    "10.201.37.1:5000".parse().unwrap(),
-                    "10.201.37.2:5000".parse().unwrap(),
+                    net_37.addr(1),
+                    net_37.addr(2),
                     None,
                 )
                 .await;
@@ -3723,17 +3651,12 @@ fn a_persistent_panic_in_socket_send_is_caught_once_and_does_not_loop() {
 /// lock.
 #[test]
 fn a_panic_unwinding_through_the_endpoint_driver_still_aborts() {
+    let net_39 = crate::transport::test_net::subnet();
     const NAME: &str = "a_panic_unwinding_through_the_endpoint_driver_still_aborts";
     if std::env::var_os(PANIC_CHILD_ENV).is_some() {
-        bounded(|| async move {
+        bounded(move || async move {
             let _seed = GlobalRng::seed_guard(SEED);
-            let pair = pair(
-                "quic-panic-in-quinn",
-                "10.201.39.1:5000".parse().unwrap(),
-                "10.201.39.2:5000".parse().unwrap(),
-                None,
-            )
-            .await;
+            let pair = pair("quic-panic-in-quinn", net_39.addr(1), net_39.addr(2), None).await;
             pair.a.faults().panic_receive_in_quinn();
             let mut availability = pair.a.availability();
             drive(&pair.time, Duration::from_secs(1), async move {
@@ -3772,13 +3695,14 @@ fn a_panic_unwinding_through_the_endpoint_driver_still_aborts() {
 fn connect_right_after_an_adapter_panic_is_refused() {
     in_child("connect_right_after_an_adapter_panic_is_refused", || {
         bounded(|| async move {
+            let net_41 = crate::transport::test_net::subnet();
             use super::path::QuicPath;
             use crate::transport::QuicErrorKind;
             let _seed = GlobalRng::seed_guard(SEED);
             let pair = pair(
                 "quic-panic-connect-guard",
-                "10.201.41.1:5000".parse().unwrap(),
-                "10.201.41.2:5000".parse().unwrap(),
+                net_41.addr(1),
+                net_41.addr(2),
                 None,
             )
             .await;
@@ -3829,15 +3753,10 @@ fn a_panic_during_connect_ends_the_handshake_and_releases_its_permit() {
         "a_panic_during_connect_ends_the_handshake_and_releases_its_permit",
         || {
             bounded(|| async move {
+                let net_42 = crate::transport::test_net::subnet();
                 use crate::transport::QuicErrorKind;
                 let _seed = GlobalRng::seed_guard(SEED);
-                let pair = pair(
-                    "quic-panic-connect",
-                    "10.201.42.1:5000".parse().unwrap(),
-                    "10.201.42.2:5000".parse().unwrap(),
-                    None,
-                )
-                .await;
+                let pair = pair("quic-panic-connect", net_42.addr(1), net_42.addr(2), None).await;
                 let _permit = pair.b.allow_peer(pair.a_addr, &pair.a_key()).unwrap();
                 pair.a.faults().panic_every_writable();
                 let (a, b_addr, b_key) = (pair.a.clone(), pair.b_addr, pair.b_key());
@@ -3875,15 +3794,10 @@ fn a_panic_during_establish_ends_the_handshake_and_releases_its_permit() {
         "a_panic_during_establish_ends_the_handshake_and_releases_its_permit",
         || {
             bounded(|| async move {
+                let net_43 = crate::transport::test_net::subnet();
                 use crate::transport::QuicErrorKind;
                 let _seed = GlobalRng::seed_guard(SEED);
-                let pair = pair(
-                    "quic-panic-establish",
-                    "10.201.43.1:5000".parse().unwrap(),
-                    "10.201.43.2:5000".parse().unwrap(),
-                    None,
-                )
-                .await;
+                let pair = pair("quic-panic-establish", net_43.addr(1), net_43.addr(2), None).await;
                 let permit = pair.b.allow_peer(pair.a_addr, &pair.a_key()).unwrap();
                 let (a, b_addr, b_key) = (pair.a.clone(), pair.b_addr, pair.b_key());
                 let client =
@@ -3928,14 +3842,15 @@ fn an_adapter_panic_ends_every_connection_and_counts_once() {
         "an_adapter_panic_ends_every_connection_and_counts_once",
         || {
             bounded(|| async move {
+                let net_44 = crate::transport::test_net::subnet();
                 use super::path::QuicPath;
                 use crate::transport::QuicErrorKind;
                 use crate::transport::metrics::TRANSPORT_METRICS;
                 let _seed = GlobalRng::seed_guard(SEED);
                 let pair = pair(
                     "quic-panic-two-connections",
-                    "10.201.44.1:5000".parse().unwrap(),
-                    "10.201.44.2:5000".parse().unwrap(),
+                    net_44.addr(1),
+                    net_44.addr(2),
                     None,
                 )
                 .await;
@@ -4014,16 +3929,11 @@ fn after_down_nothing_reaches_the_wire_before_quinn_notices() {
         "after_down_nothing_reaches_the_wire_before_quinn_notices",
         || {
             bounded(|| async move {
+                let net_45 = crate::transport::test_net::subnet();
                 use crate::transport::QuicErrorKind;
                 use crate::transport::metrics::TRANSPORT_METRICS;
                 let _seed = GlobalRng::seed_guard(SEED);
-                let pair = pair(
-                    "quic-panic-window",
-                    "10.201.45.1:5000".parse().unwrap(),
-                    "10.201.45.2:5000".parse().unwrap(),
-                    None,
-                )
-                .await;
+                let pair = pair("quic-panic-window", net_45.addr(1), net_45.addr(2), None).await;
                 let (_, client, _server) =
                     pair.transfer(payload(100), Duration::from_secs(60)).await;
                 let conn = client.inner().clone();
@@ -4173,11 +4083,12 @@ fn a_receive_panic_during_connect_ends_the_handshake() {
 /// is only checked to be `true` here.
 #[test]
 fn an_aborting_build_refuses_the_endpoint() {
+    let net_48 = crate::transport::test_net::subnet();
     const { assert!(UNWINDS, "the tests run unwinding") };
-    bounded(|| async move {
+    bounded(move || async move {
         let _seed = GlobalRng::seed_guard(SEED);
         let network = "quic-abort-build";
-        let addr: SocketAddr = "10.201.48.1:5000".parse().unwrap();
+        let addr: SocketAddr = net_48.addr(1);
         let time = VirtualTime::new();
         register_network_time_source(network, time.clone());
         register_address_network(addr, network);
@@ -4232,9 +4143,10 @@ fn the_adapter_refuses_sends_after_a_panic_without_running() {
 }
 
 fn adapter_refuses_sends_after_a_panic() {
+    let net_49 = crate::transport::test_net::subnet();
     use quinn::AsyncUdpSocket;
     use std::task::{Context, Poll};
-    let local: SocketAddr = "10.201.49.1:5000".parse().unwrap();
+    let local: SocketAddr = net_49.addr(1);
     let health = super::liveness::EndpointHealth::new(local);
     let demux = Arc::new(DemuxSocket::wrap(
         ScriptedSocket::new(SendMode::Send, Vec::new()),
@@ -4252,7 +4164,7 @@ fn adapter_refuses_sends_after_a_panic() {
     faults.panic_every_writable();
     health.adapter_panicked("test", &"reported by the test");
 
-    let to: SocketAddr = "10.201.49.2:5000".parse().unwrap();
+    let to: SocketAddr = net_49.addr(2);
     let error = socket
         .try_send(&transmit(&[0xC0; 100], to))
         .expect_err("the adapter caught a panic");
@@ -4291,13 +4203,14 @@ fn an_adapter_panic_after_release_closes_its_connections() {
         "an_adapter_panic_after_release_closes_its_connections",
         || {
             bounded(|| async move {
+                let net_50 = crate::transport::test_net::subnet();
                 use super::path::QuicPath;
                 use crate::transport::metrics::TRANSPORT_METRICS;
                 let _seed = GlobalRng::seed_guard(SEED);
                 let pair = pair(
                     "quic-panic-after-release",
-                    "10.201.50.1:5000".parse().unwrap(),
-                    "10.201.50.2:5000".parse().unwrap(),
+                    net_50.addr(1),
+                    net_50.addr(2),
                     None,
                 )
                 .await;
@@ -4353,17 +4266,18 @@ fn an_adapter_panic_after_release_closes_its_connections() {
 /// different endpoint does not reach it either.
 #[test]
 fn a_release_without_a_panic_closes_nothing() {
-    bounded(|| async move {
+    let net_51 = crate::transport::test_net::subnet();
+    bounded(move || async move {
         use crate::transport::metrics::TRANSPORT_METRICS;
         let _seed = GlobalRng::seed_guard(SEED);
         let pair = pair(
             "quic-release-no-panic",
-            "10.201.51.1:5000".parse().unwrap(),
-            "10.201.51.2:5000".parse().unwrap(),
+            net_51.addr(1),
+            net_51.addr(2),
             None,
         )
         .await;
-        let elsewhere = super::liveness::EndpointHealth::new("10.201.51.3:5000".parse().unwrap());
+        let elsewhere = super::liveness::EndpointHealth::new(net_51.addr(3));
         let (_, client, server) = pair.transfer(payload(100), Duration::from_secs(60)).await;
         pair.a.owner.health.release();
         assert_eq!(pair.a.availability().get(), QuicAvailability::Released);
@@ -4427,8 +4341,8 @@ fn a_retry_token_is_honoured_for_its_lifetime_on_the_endpoint_clock() {
     let endpoint_config = || Arc::new(config::endpoint_config().unwrap());
     let mut server = Endpoint::new(endpoint_config(), Some(Arc::new(server_config)), true, None);
     let mut client = Endpoint::new(endpoint_config(), None, true, None);
-    let client_addr: SocketAddr = "10.205.0.1:5000".parse().unwrap();
-    let server_addr: SocketAddr = "10.205.0.2:5000".parse().unwrap();
+    let net = crate::transport::test_net::subnet();
+    let (client_addr, server_addr) = (net.addr(1), net.addr(2));
     let now = tokio::time::Instant::now().into_std();
 
     let (_, mut connection) = client

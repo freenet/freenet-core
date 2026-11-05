@@ -116,10 +116,10 @@ async fn settle(time: &VirtualTime) {
 ///   acknowledged are not here.
 /// - socket buffers. `SimulationSocket` has none; a real UDP socket's
 ///   kernel buffers are per endpoint, not per connection.
-async fn measure(network: &str, subnet: u8, n: usize) -> Cost {
+async fn measure(network: &str, n: usize) -> Cost {
     let _seed = GlobalRng::seed_guard(SEED);
-    let a_addr: SocketAddr = format!("10.204.{subnet}.1:5000").parse().unwrap();
-    let b_addr: SocketAddr = format!("10.204.{subnet}.2:5000").parse().unwrap();
+    let net = crate::transport::test_net::subnet();
+    let (a_addr, b_addr) = (net.addr(1), net.addr(2));
     let time = VirtualTime::new();
     register_network_time_source(network, time.clone());
     register_address_network(a_addr, network);
@@ -226,7 +226,7 @@ async fn measure(network: &str, subnet: u8, n: usize) -> Cost {
 #[test]
 fn an_idle_connection_measures_within_the_fixed_pin() {
     bounded(|| async move {
-        let cost = measure("quic-memory-fixed", 1, 16).await;
+        let cost = measure("quic-memory-fixed", 16).await;
         assert!(
             cost.settle_drift.rounded.abs() <= SETTLE_DRIFT_BYTES,
             "premise: nothing was running before the baseline: {cost:?}"
@@ -465,6 +465,7 @@ fn connected_pair_with_factory(
 ) -> (ProtoPeer, ProtoPeer, Instant) {
     use crate::simulation::RealTime;
 
+    let net = crate::transport::test_net::subnet();
     let (a_keys, b_keys) = (TransportKeypair::new(), TransportKeypair::new());
     let a_identity = super::identity::QuicIdentity::new(&a_keys).expect("a's identity");
     let b_identity = super::identity::QuicIdentity::new(&b_keys).expect("b's identity");
@@ -480,7 +481,7 @@ fn connected_pair_with_factory(
     )
     .expect("server config");
     let mut receiver = ProtoPeer {
-        addr: "10.205.0.2:5000".parse().unwrap(),
+        addr: net.addr(2),
         endpoint: quinn_proto::Endpoint::new(
             Arc::new(super::config::endpoint_config().expect("endpoint config")),
             Some(Arc::new(server)),
@@ -499,7 +500,7 @@ fn connected_pair_with_factory(
         Arc::new(sender_transport),
     );
     let mut sender = ProtoPeer {
-        addr: "10.205.0.1:5000".parse().unwrap(),
+        addr: net.addr(1),
         endpoint: quinn_proto::Endpoint::new(
             Arc::new(super::config::endpoint_config().expect("endpoint config")),
             None,

@@ -256,28 +256,20 @@ struct Link {
 const ONE_WAY: Duration = Duration::from_millis(20);
 
 impl Link {
-    async fn new(network: &str, subnet: u8, rate: QuicRateLimit, a_cap: Option<u64>) -> Self {
-        Self::with(
-            network,
-            subnet,
-            [rate, QuicRateLimit::default()],
-            a_cap,
-            ONE_WAY,
-        )
-        .await
+    async fn new(network: &str, rate: QuicRateLimit, a_cap: Option<u64>) -> Self {
+        Self::with(network, [rate, QuicRateLimit::default()], a_cap, ONE_WAY).await
     }
 
     /// [`Self::new`] with `rates` for `a` and `b`, and `one_way` of delay.
     async fn with(
         network: &str,
-        subnet: u8,
         rates: [QuicRateLimit; 2],
         a_cap: Option<u64>,
         one_way: Duration,
     ) -> Self {
         let [a_rate, b_rate] = rates;
-        let a_addr: SocketAddr = format!("10.207.{subnet}.1:5000").parse().unwrap();
-        let b_addr: SocketAddr = format!("10.207.{subnet}.2:5000").parse().unwrap();
+        let net = crate::transport::test_net::subnet();
+        let (a_addr, b_addr) = (net.addr(1), net.addr(2));
         let time = VirtualTime::new();
         register_network_time_source(network, time.clone());
         register_address_network(a_addr, network);
@@ -423,7 +415,6 @@ fn a_path_under_a_bandwidth_limit_keeps_to_it() {
         const LEN: usize = 2_000_000;
         let link = Link::new(
             "quic-cap-bandwidth-limit",
-            1,
             QuicRateLimit::new(Some(LIMIT), None),
             None,
         )
@@ -453,7 +444,6 @@ fn the_floor_keeps_two_datagrams_in_flight_both_ways() {
             let rate = || QuicRateLimit::new(Some(LIMIT), None);
             let link = Link::with(
                 &format!("quic-cap-floor-{subnet}"),
-                subnet,
                 [rate(), rate()],
                 None,
                 ONE_WAY_SHORT,
@@ -490,7 +480,6 @@ fn a_quic_path_and_udp_streams_both_progress_under_an_egress_cap() {
         let link = Arc::new(
             Link::new(
                 "quic-cap-shared",
-                2,
                 QuicRateLimit::new(None, Some(manager)),
                 Some(CAP),
             )
@@ -604,7 +593,6 @@ fn a_quic_path_and_udp_streams_each_get_their_fair_share_under_a_saturated_egres
         let link = Arc::new(
             Link::new(
                 "quic-cap-fair-share",
-                7,
                 QuicRateLimit::new(None, Some(manager.clone())),
                 Some(CAP),
             )
@@ -745,7 +733,7 @@ fn a_limit_does_not_delay_a_control_sized_exchange() {
             (4, QuicRateLimit::new(Some(MIN_BANDWIDTH_LIMIT), None)),
         ] {
             let _seed = crate::config::GlobalRng::seed_guard(0x5940_E5B7);
-            let link = Link::new(&format!("quic-cap-control-{subnet}"), subnet, rate, None).await;
+            let link = Link::new(&format!("quic-cap-control-{subnet}"), rate, None).await;
             let elapsed = link.send(32, Duration::from_secs(10)).await;
             finished.push((elapsed, link.time.now_nanos()));
         }

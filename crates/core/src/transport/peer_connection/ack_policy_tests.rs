@@ -144,8 +144,11 @@ fn end_with_wire_capacity(
     }
 }
 
+/// The ends below are connection objects fed by hand, on no simulated
+/// network, and no test here reads an address-keyed log for them, so one
+/// fixed address is safe (see `transport::test_net`).
 fn addr(port: u16) -> SocketAddr {
-    SocketAddr::new(Ipv4Addr::new(10, 77, 0, 1).into(), port)
+    SocketAddr::new(Ipv4Addr::new(10, 77, 0, 1).into(), port) // test_net: exempt (no network)
 }
 
 /// A single connection end facing a remote of the given version.
@@ -3469,11 +3472,9 @@ async fn rising_offers_with_quic_off_keep_one_tracked_decline() {
 /// gate lets one through per interval. An unpromoted session answers each one.
 #[tokio::test(start_paused = true)]
 async fn rising_offers_with_a_session_keep_one_tracked_decline() {
-    let hub = crate::transport::quic::upgrade::driver::tests::Harness::server(
-        "ack-policy-rising-offers",
-        20,
-    )
-    .await;
+    let hub =
+        crate::transport::quic::upgrade::driver::tests::Harness::server("ack-policy-rising-offers")
+            .await;
     let mut e = single(CAPABLE);
     e.conn = e.conn.with_upgrade_site(&hub.site());
     e.take_offers(1, 200).await;
@@ -3552,11 +3553,9 @@ async fn a_failed_decline_send_leaves_nothing_in_flight() {
 /// hands the driver the events a path's pump sends, not a frame off a real path.
 #[tokio::test(start_paused = true)]
 async fn quic_inbound_does_not_move_the_udp_idle_clocks() {
-    let hub = crate::transport::quic::upgrade::driver::tests::Harness::server(
-        "ack-policy-idle-clocks",
-        21,
-    )
-    .await;
+    let hub =
+        crate::transport::quic::upgrade::driver::tests::Harness::server("ack-policy-idle-clocks")
+            .await;
     let mut e = single(CAPABLE);
     e.conn = e.conn.with_upgrade_site(&hub.site());
     e.deliver(1, short(b"first"), vec![]).await;
@@ -3593,8 +3592,7 @@ async fn quic_inbound_does_not_move_the_udp_idle_clocks() {
 async fn a_quic_receipt_moves_the_stamp_and_no_udp_clock() {
     use std::sync::atomic::Ordering;
     let hub =
-        crate::transport::quic::upgrade::driver::tests::Harness::server("ack-policy-stamp", 23)
-            .await;
+        crate::transport::quic::upgrade::driver::tests::Harness::server("ack-policy-stamp").await;
     let mut e = single(CAPABLE);
     e.conn = e.conn.with_upgrade_site(&hub.site());
     let time = e.conn.remote_conn.time_source.clone();
@@ -3627,7 +3625,7 @@ async fn a_quic_receipt_moves_the_stamp_and_no_udp_clock() {
 #[tokio::test(start_paused = true)]
 async fn set_peer_identity_promotes_the_session_on_set_and_same_only() {
     let hub =
-        crate::transport::quic::upgrade::driver::tests::Harness::server("ack-policy-identity", 22)
+        crate::transport::quic::upgrade::driver::tests::Harness::server("ack-policy-identity")
             .await;
     let key = hub.peer.clone();
     let other = TransportKeypair::new().public().clone();
