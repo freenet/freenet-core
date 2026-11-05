@@ -83,7 +83,13 @@ impl Partition {
 /// demux would hand it to the QUIC endpoint (its first byte, the same
 /// classifier the demux uses); every other datagram between the pair, and
 /// every datagram before `from_nanos`, is delivered as without the rule.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// With [`Self::after_bytes`], the rule first lets that many bytes of the
+/// pair's QUIC-class datagrams through from `from_nanos`, both directions
+/// counted together, and drops from the next datagram on. A test cuts a
+/// pair in the middle of a transfer this way, by how much has moved rather
+/// than by a time that depends on when the transfer started.
+#[derive(Debug, Clone)]
 pub struct QuicDatagramDrop {
     /// One peer of the pair.
     pub a: SocketAddr,
@@ -91,22 +97,58 @@ pub struct QuicDatagramDrop {
     pub b: SocketAddr,
     /// Virtual time (nanos) from which the rule drops.
     pub from_nanos: u64,
+    /// Bytes delivered from `from_nanos` before the rule drops.
+    pub after_bytes: u64,
+    /// Bytes delivered so far under `after_bytes`.
+    seen_bytes: u64,
 }
+
+/// Two rules are the same rule whatever they have counted.
+impl PartialEq for QuicDatagramDrop {
+    fn eq(&self, other: &Self) -> bool {
+        (self.a, self.b, self.from_nanos, self.after_bytes)
+            == (other.a, other.b, other.from_nanos, other.after_bytes)
+    }
+}
+
+impl Eq for QuicDatagramDrop {}
 
 impl QuicDatagramDrop {
     /// A rule for the pair `a`, `b` from virtual time `from_nanos`.
     pub fn new(a: SocketAddr, b: SocketAddr, from_nanos: u64) -> Self {
-        Self { a, b, from_nanos }
+        Self {
+            a,
+            b,
+            from_nanos,
+            after_bytes: 0,
+            seen_bytes: 0,
+        }
+    }
+
+    /// The rule drops only once `bytes` of the pair's QUIC-class datagrams
+    /// have been delivered from its start time.
+    pub fn after_bytes(mut self, bytes: u64) -> Self {
+        self.after_bytes = bytes;
+        self
     }
 
     /// Whether this rule drops `datagram` sent from `from` to `to` at
-    /// virtual time `now`.
-    pub fn drops(&self, from: &SocketAddr, to: &SocketAddr, datagram: &[u8], now: u64) -> bool {
+    /// virtual time `now`. A datagram it lets through under `after_bytes`
+    /// is counted.
+    pub fn drops(&mut self, from: &SocketAddr, to: &SocketAddr, datagram: &[u8], now: u64) -> bool {
         use crate::transport::demux::classify;
         use crate::transport::metrics::DemuxClass;
-        now >= self.from_nanos
+        let applies = now >= self.from_nanos
             && ((*from == self.a && *to == self.b) || (*from == self.b && *to == self.a))
-            && classify(datagram) == DemuxClass::Quic
+            && classify(datagram) == DemuxClass::Quic;
+        if !applies {
+            return false;
+        }
+        if self.seen_bytes >= self.after_bytes {
+            return true;
+        }
+        self.seen_bytes += datagram.len() as u64;
+        false
     }
 }
 
@@ -192,15 +234,18 @@ impl FaultConfig {
     /// Checks if a QUIC-class datagram rule drops `datagram` from `from` to
     /// `to` at virtual time `now`.
     pub fn drops_quic_datagram(
-        &self,
+        &mut self,
         from: &SocketAddr,
         to: &SocketAddr,
         datagram: &[u8],
         now: u64,
     ) -> bool {
+        // Every rule sees the datagram, so each one's byte count stays true.
         self.quic_datagram_drops
-            .iter()
-            .any(|rule| rule.drops(from, to, datagram, now))
+            .iter_mut()
+            .fold(false, |dropped, rule| {
+                rule.drops(from, to, datagram, now) | dropped
+            })
     }
 
     /// Adds a rule that drops QUIC-class datagrams between a pair of peers.
@@ -345,7 +390,7 @@ mod tests {
     #[test]
     fn quic_datagram_drop_is_scoped_by_class_pair_and_time() {
         const T: u64 = 5_000;
-        let config = FaultConfig::builder()
+        let mut config = FaultConfig::builder()
             .quic_datagram_drop(QuicDatagramDrop::new(addr(1), addr(2), T))
             .build();
         // A QUIC long header, a QUIC short header, and the UDP transport's
@@ -375,6 +420,41 @@ mod tests {
             );
         }
         assert!(!FaultConfig::new().drops_quic_datagram(&addr(1), &addr(2), &quic_long, T));
+    }
+
+    /// With `after_bytes`, the rule lets that many bytes of the pair's QUIC
+    /// datagrams through from its start time, both directions together, and
+    /// drops every one after. Datagrams before the start, of another class or
+    /// of another pair are neither dropped nor counted.
+    #[test]
+    fn quic_datagram_drop_after_bytes_counts_only_what_it_governs() {
+        const T: u64 = 5_000;
+        let mut config = FaultConfig::builder()
+            .quic_datagram_drop(QuicDatagramDrop::new(addr(1), addr(2), T).after_bytes(250))
+            .build();
+        let quic = [0x40u8; 100];
+        let legacy = [0x02u8; 100];
+        // Not counted: too early, not QUIC, not the pair.
+        assert!(!config.drops_quic_datagram(&addr(1), &addr(2), &quic, T - 1));
+        assert!(!config.drops_quic_datagram(&addr(1), &addr(2), &legacy, T));
+        assert!(!config.drops_quic_datagram(&addr(1), &addr(3), &quic, T));
+        // 100, 200, then 300: the third crosses 250 and is still delivered.
+        assert!(!config.drops_quic_datagram(&addr(1), &addr(2), &quic, T));
+        assert!(!config.drops_quic_datagram(&addr(2), &addr(1), &quic, T));
+        assert!(!config.drops_quic_datagram(&addr(1), &addr(2), &quic, T));
+        for _ in 0..3 {
+            assert!(config.drops_quic_datagram(&addr(2), &addr(1), &quic, T + 1));
+            assert!(!config.drops_quic_datagram(&addr(2), &addr(1), &legacy, T + 1));
+        }
+        // The count is not part of what makes two rules the same.
+        assert_eq!(
+            config.quic_datagram_drops[0],
+            QuicDatagramDrop::new(addr(1), addr(2), T).after_bytes(250)
+        );
+        assert_ne!(
+            config.quic_datagram_drops[0],
+            QuicDatagramDrop::new(addr(1), addr(2), T)
+        );
     }
 
     #[test]

@@ -433,6 +433,27 @@ impl ScheduledOperation {
     }
 }
 
+/// `turmoil::Sim::run`, with the network's `VirtualTime` moved to turmoil's
+/// elapsed time after every step, the way the direct runner's time driver
+/// follows tokio's clock.
+///
+/// The node tasks run on turmoil's clock, but some parts of a node read the
+/// network's `VirtualTime` instead: each QUIC endpoint and path (quinn's timers,
+/// the path's send deadlines and ack watch, `get_socket_virtual_time`), and the
+/// fault injector's time-based rules. Without this the clock stayed at zero for
+/// the whole run, so none of those timers ever fired and a rule starting after
+/// zero never applied.
+#[cfg(any(test, feature = "testing"))]
+fn run_turmoil_on_virtual_time(sim: &mut turmoil::Sim<'_>, time: &VirtualTime) -> turmoil::Result {
+    loop {
+        let finished = sim.step()?;
+        time.advance_to(u64::try_from(sim.elapsed().as_nanos()).unwrap_or(u64::MAX));
+        if finished {
+            return Ok(());
+        }
+    }
+}
+
 /// Packet-delivery decision consulted by every `SimulationSocket` (via the
 /// per-network delivery callback installed by `run_controlled_simulation` and
 /// `run_simulation_direct`) so an injected node crash or partition actually
@@ -2124,6 +2145,21 @@ impl SimNetwork {
         b: &NodeLabel,
         from: Duration,
     ) -> &mut Self {
+        self.drop_quic_datagrams_between_after(a, b, from, 0)
+    }
+
+    /// As [`Self::drop_quic_datagrams_between`], but the rule first lets
+    /// `after_bytes` of the pair's QUIC datagrams through from `from`, so a
+    /// test can cut the pair in the middle of a transfer
+    /// (`QuicDatagramDrop::after_bytes`).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn drop_quic_datagrams_between_after(
+        &mut self,
+        a: &NodeLabel,
+        b: &NodeLabel,
+        from: Duration,
+        after_bytes: u64,
+    ) -> &mut Self {
         let address = |label: &NodeLabel| {
             *self
                 .node_addresses
@@ -2134,7 +2170,8 @@ impl SimNetwork {
             address(a),
             address(b),
             u64::try_from(from.as_nanos()).unwrap_or(u64::MAX),
-        );
+        )
+        .after_bytes(after_bytes);
         let injector = crate::node::network_bridge::get_fault_injector(&self.name)
             .expect("SimNetwork::new registers a fault injector");
         let has_clock = {
@@ -5964,7 +6001,7 @@ impl SimNetwork {
         });
 
         // Run the simulation
-        let turmoil_result = sim.run();
+        let turmoil_result = run_turmoil_on_virtual_time(&mut sim, &self.virtual_time);
 
         // Capture topology snapshots BEFORE self is dropped (which clears them)
         let topology_snapshots = get_all_topology_snapshots(&network_name);
@@ -6262,7 +6299,7 @@ impl SimNetwork {
         });
 
         // Run the simulation
-        sim.run()
+        run_turmoil_on_virtual_time(&mut sim, &self.virtual_time)
             .map_err(|e| anyhow::anyhow!("Turmoil simulation failed: {:?}", e))
     }
 
