@@ -1833,7 +1833,9 @@ fn transport_quic_values_and_unknown_ones() {
     assert_eq!(QuicMode::from_config_value(Some("")), QuicMode::Off);
     assert_eq!(QuicMode::default(), QuicMode::default_mode());
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    assert_eq!(QuicMode::from_config_value(None), QuicMode::Shadow);
+    assert_eq!(QuicMode::from_config_value(None), QuicMode::Prefer);
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    assert_eq!(QuicMode::from_config_value(None), QuicMode::Off);
 }
 
 /// The socket sends one datagram per transmit and receives one per call.

@@ -149,6 +149,17 @@ pub(in crate::transport) enum PathClock {
     Virtual(VirtualTime),
 }
 
+impl PathClock {
+    /// The wall clock: the system's, or in a simulation the Unix epoch plus the
+    /// network's virtual time, so a simulation can place a ramp start on it.
+    pub(in crate::transport) fn wall_now(&self) -> std::time::SystemTime {
+        match self {
+            Self::Real(_) => std::time::SystemTime::now(),
+            Self::Virtual(time) => std::time::UNIX_EPOCH + Duration::from_nanos(time.now_nanos()),
+        }
+    }
+}
+
 impl TimeSource for PathClock {
     fn now_nanos(&self) -> u64 {
         match self {
@@ -586,6 +597,19 @@ impl QuicUpgrades {
             return trace.peer_version(reported);
         }
         reported
+    }
+
+    /// This node's caps on a path to `peer`, from the share at the wall clock now
+    /// ([`QuicPolicy::own_caps`]). A test's trace may give the ramp a start of
+    /// its own.
+    fn own_caps(&self, peer: &TransportPublicKey) -> u32 {
+        let now = self.path_clock.wall_now();
+        #[cfg(any(test, feature = "testing"))]
+        if let Some(start_unix_secs) = self.trace.as_ref().and_then(|t| t.data_ramp_start()) {
+            let share = super::policy::DataShare::Ramp { start_unix_secs };
+            return self.policy.own_caps_with(share, &self.local_key, peer, now);
+        }
+        self.policy.own_caps(&self.local_key, peer, now)
     }
 
     fn file_seed(&self, key: &TransportPublicKey, session: u64, seed: BackoffSeed) {
@@ -1182,7 +1206,7 @@ impl Session {
             older.end();
         }
         let backoff = self.hub.seeds.lock().seed_for(&key);
-        let own_caps = self.hub.policy.own_caps(&self.hub.local_key, &key);
+        let own_caps = self.hub.own_caps(&key);
         let sends = {
             let mut state = self.state.lock();
             if state.ended {
