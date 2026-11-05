@@ -32,10 +32,10 @@ iframe {
 #fnbar .fn:hover {
   text-decoration: underline;
 }
-/* The bar's own "Install" pointer: the next step for a visitor who arrived
-   from a shared link, always visible rather than buried in the popover. */
+/* The bar's own "Install Freenet" pointer, inline in the disclosure: the next
+   step for a visitor who arrived from a shared link, always visible rather than
+   buried in the popover. */
 #fnbar a.fnbarinstall {
-  flex: 0 0 auto;
   color: #222;
   text-decoration: underline;
 }
@@ -98,6 +98,8 @@ iframe {
      (landscape phone) viewport would be clipped with no way to reach its
      lower sections. */
   max-height: calc(100vh - 50px);
+  /* dvh excludes a mobile browser's dynamic URL bar; 100vh is the fallback. */
+  max-height: calc(100dvh - 50px);
   overflow-y: auto;
   box-sizing: border-box;
 }
@@ -168,9 +170,9 @@ iframe {
 }
 
 /* Phone width: let the disclosure wrap instead of truncating, so the whole
-   sentence ("stored on this server" is also the answer to "how is this
-   peer-to-peer with nothing installed?") survives alongside "Not private".
-   Three lines covers a 320px screen; at 360px and up it takes two. */
+   sentence survives, including its inline install link ("on this server" is
+   also the answer to "how is this peer-to-peer with nothing installed?").
+   Three lines covers a 320px screen. */
 @media (max-width: 560px) {
   #fnbar {
     height: auto;
@@ -229,6 +231,7 @@ iframe {
     border-color: #3a3a3e;
     box-shadow: 0 6px 20px rgba(0, 0, 0, 0.5);
     color: #c2c2c6;
+    color-scheme: dark;
   }
   #fnpop h4 {
     color: #88888c;

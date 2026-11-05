@@ -6782,17 +6782,19 @@ mod tests {
             hosted.contains(r#"id="fnbar""#),
             "hosted bar missing: {hosted}"
         );
-        // The always-visible disclosure must say both halves: it is not
-        // private, and the data is held by this server (the operator can see
-        // it). "Not private" leads so it survives truncation on a phone.
+        // The always-visible disclosure must say both halves: the data is held
+        // (encrypted) by this server, and full privacy needs your own peer.
+        // Located via the bar's own `.nt` span, so the text cannot pass by
+        // appearing somewhere else (the popover, a script) instead.
         let disclosure = hosted
-            .find("Not private:")
-            .map(|i| &hosted[i..])
-            .and_then(|rest| rest.split_once("</span").map(|(d, _)| d))
-            .expect("always-visible 'Not private:' disclosure missing");
+            .split_once(r#"class="nt""#)
+            .and_then(|(_, rest)| rest.split_once('>'))
+            .and_then(|(_, rest)| rest.split_once("for full privacy."))
+            .map(|(d, _)| d.trim())
+            .expect("the bar's .nt disclosure must end 'for full privacy.'");
         assert!(
-            disclosure.contains("stored on this server"),
-            "disclosure must say the data is stored on this server: {disclosure}"
+            disclosure.starts_with("Encrypted on this server."),
+            "disclosure must lead with where the data lives: {disclosure}"
         );
         assert!(
             hosted.contains("Access key") && hosted.contains("Restore from key"),
