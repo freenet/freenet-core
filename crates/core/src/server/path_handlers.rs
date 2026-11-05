@@ -2236,7 +2236,7 @@ fn shell_page(
     // the sandboxed app iframe. It is the only place a per-user-data action
     // (export to your own peer) can live — the durable user token is held by
     // the shell and must never reach the sandbox — and the only place the
-    // "this is a hosted proxy, not private" disclosure cannot be hidden or
+    // "stored encrypted on this server" privacy disclosure cannot be hidden or
     // spoofed by the contract app. Empty (and the layout unchanged) when hosted
     // mode is off. The export control is a placeholder until the node-side
     // export endpoint lands (P3 `secrets export` over HTTP, scoped to the
@@ -2478,7 +2478,7 @@ const SHELL_USER_TOKEN_JS: &str = include_str!("path_handlers/assets/shell_user_
 /// only when hosted mode is on; the bar lives OUTSIDE the sandboxed app iframe.
 const HOSTED_BAR_STYLES: &str = include_str!("path_handlers/assets/hosted_bar.css");
 
-/// Markup for the hosted-mode bar: the always-visible "not private" disclosure
+/// Markup for the hosted-mode bar: the always-visible privacy disclosure (with an inline install link)
 /// plus an Account popover with the access-key backup/restore, a "New ID"
 /// control to start over with a fresh identity, and the export-to-your-own-peer
 /// action. The access key is the per-user token, read from the shell-only
@@ -6769,7 +6769,7 @@ mod tests {
     #[tokio::test]
     async fn shell_page_hosted_mode_renders_proxy_chrome_bar() {
         // The hosted-mode "shell chrome" bar lives OUTSIDE the sandboxed iframe
-        // and carries the "not private" disclosure plus the Account popover
+        // and carries the privacy disclosure plus the Account popover
         // (access-key backup/restore + export-to-your-own-peer). It must render
         // in hosted mode and be ABSENT in non-hosted mode so a normal
         // single-user node is unaffected.
@@ -6782,9 +6782,24 @@ mod tests {
             hosted.contains(r#"id="fnbar""#),
             "hosted bar missing: {hosted}"
         );
+        // The always-visible disclosure must say both halves: the data is held
+        // (encrypted) by this server, and full privacy needs your own peer.
+        // Located via the bar's own `.nt` span, so the text cannot pass by
+        // appearing somewhere else (the popover, a script) instead.
+        let disclosure = hosted
+            .split_once(r#"class="nt""#)
+            .and_then(|(_, rest)| rest.split_once('>'))
+            .and_then(|(_, rest)| rest.split_once("for full privacy."))
+            .map(|(d, _)| d.trim())
+            .expect("the bar's .nt disclosure must end 'for full privacy.'");
         assert!(
-            hosted.contains("not private"),
-            "always-visible disclosure missing"
+            disclosure.starts_with("Stored encrypted on this server."),
+            "disclosure must lead with where the data lives: {disclosure}"
+        );
+        assert!(
+            disclosure.contains("https://freenet.org/quickstart/"),
+            "the install link must sit inside the disclosure, before \
+             'for full privacy.': {disclosure}"
         );
         assert!(
             hosted.contains("Access key") && hosted.contains("Restore from key"),
@@ -8484,6 +8499,77 @@ mod tests {
         assert!(clear < reload, "must clear the token before reloading");
     }
 
+    /// A hosted visitor who has no peer must be told how to get one. Before
+    /// this, the bar never said what Freenet is or how to install it, and the
+    /// popover offered "Move to my peer" and a loopback import link with no
+    /// install pointer, so a try.freenet.org visitor (typically arriving cold
+    /// from a shared link) had no way forward.
+    #[test]
+    fn hosted_bar_points_visitors_without_a_peer_at_the_installer() {
+        const QUICKSTART: &str = "href=\"https://freenet.org/quickstart/\"";
+        let section = HOSTED_BAR_HTML
+            .find("<h4>Your own peer</h4>")
+            .expect("hosted bar must have a 'Your own peer' section");
+        let migrate = HOSTED_BAR_HTML
+            .find("id=\"fnmigrate\"")
+            .expect("Move-to-my-peer button present");
+        let reveal = HOSTED_BAR_HTML
+            .find("id=\"fnmigrateout\"")
+            .expect("migration hint block present");
+        let open = HOSTED_BAR_HTML
+            .find("id=\"fnmigrateopen\"")
+            .expect("primary open control present");
+        let acct = HOSTED_BAR_HTML
+            .find("id=\"fnacct\"")
+            .expect("Account control present");
+
+        // (0) The always-visible bar itself, before the Account popover: the
+        // brand links to what Freenet is, and an install pointer is one click
+        // away without opening any menu.
+        let bar = &HOSTED_BAR_HTML[..acct];
+        assert!(
+            bar.contains("href=\"https://freenet.org/\""),
+            "the bar's Freenet brand must link to what Freenet is"
+        );
+        assert!(
+            bar.contains(QUICKSTART),
+            "the always-visible bar must carry an install link"
+        );
+
+        // (a) Visible BEFORE the user clicks "Move to my peer": in the section
+        // intro, not only in the block revealed afterwards.
+        let intro = &HOSTED_BAR_HTML[section..migrate];
+        assert!(
+            intro.contains(QUICKSTART),
+            "the 'Your own peer' intro must link to the install quickstart"
+        );
+        // (b) Also in the post-click hint, which is where a visitor lands after
+        // the peer tab failed to connect.
+        let hint = &HOSTED_BAR_HTML[reveal..open];
+        assert!(
+            hint.contains(QUICKSTART),
+            "the post-click migration hint must link to the install quickstart"
+        );
+        // (c) Each install link (and the brand link) opens in a new tab (leaving the hosted session
+        // in place) with the opener severed.
+        let mut links: Vec<_> = HOSTED_BAR_HTML.match_indices(QUICKSTART).collect();
+        assert_eq!(
+            links.len(),
+            3,
+            "expected the bar link plus the two popover links"
+        );
+        links.extend(HOSTED_BAR_HTML.match_indices("href=\"https://freenet.org/\""));
+        for (i, _) in links {
+            let tag_start = HOSTED_BAR_HTML[..i].rfind("<a").expect("inside an anchor");
+            let tag_end = i + HOSTED_BAR_HTML[i..].find('>').expect("anchor closes");
+            let tag = &HOSTED_BAR_HTML[tag_start..tag_end];
+            assert!(
+                tag.contains("target=\"_blank\"") && tag.contains("rel=\"noopener\""),
+                "install link must open a new tab with rel=noopener: {tag}"
+            );
+        }
+    }
+
     /// The hosted "Move to my peer" migration (#4592) must default to a
     /// ONE-CLICK open against the user's local peer, keeping copy-the-URL only
     /// as a SECONDARY fallback. Before this, the only affordance was a link the
@@ -8505,8 +8591,12 @@ mod tests {
         // plain click (or cmd/middle-click into another profile) opens the peer
         // import page directly — the "direct link" the friction complaint asked
         // for. Assert the target belongs to this control (nearby), not anywhere.
-        let target_idx = HOSTED_BAR_HTML
+        // Search FROM the control, not from the start of the document: other
+        // anchors (the "Install Freenet" pointer) legitimately carry
+        // target=_blank earlier in the popover.
+        let target_idx = HOSTED_BAR_HTML[open_idx..]
             .find("target=\"_blank\"")
+            .map(|o| o + open_idx)
             .expect("the primary open control must target a new browsing context");
         assert!(
             target_idx > open_idx && target_idx - open_idx < 120,

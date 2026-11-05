@@ -27,10 +27,24 @@ iframe {
   font-weight: 600;
   color: #222;
   letter-spacing: 0.02em;
+  text-decoration: none;
+}
+#fnbar .fn:hover {
+  text-decoration: underline;
+}
+/* The bar's own "Install Freenet" pointer, inline in the disclosure: the next
+   step for a visitor who arrived from a shared link, always visible rather than
+   buried in the popover. */
+#fnbar a.fnbarinstall {
+  color: #222;
+  text-decoration: underline;
 }
 #fnbar .nt {
   flex: 1 1 auto;
   min-width: 0;
+  /* Not the bar's line-height 1: the inline install link's underline and focus
+     ring would be clipped by this span's overflow:hidden. */
+  line-height: 1.4;
   color: #777;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -83,6 +97,14 @@ iframe {
   cursor: auto;
   display: none;
   z-index: 10;
+  /* The shell body is overflow:hidden, so a popover taller than a short
+     (landscape phone) viewport would be clipped with no way to reach its
+     lower sections. */
+  max-height: calc(100vh - 50px);
+  /* dvh excludes a mobile browser's dynamic URL bar; 100vh is the fallback. */
+  max-height: calc(100dvh - 50px);
+  overflow-y: auto;
+  box-sizing: border-box;
 }
 #fnpop.open {
   display: block;
@@ -101,6 +123,13 @@ iframe {
 }
 #fnpop .sec {
   margin-bottom: 14px;
+}
+/* Inline "Install Freenet" pointer for visitors who have no peer yet. A plain
+   underlined link in the text colour, so it stays inside the popover's
+   near-monochrome palette rather than shouting in default link blue. */
+#fnpop a.fninstall {
+  color: #222;
+  text-decoration: underline;
 }
 #fnpop .sec:last-child {
   margin-bottom: 0;
@@ -143,6 +172,28 @@ iframe {
   font-size: 12px;
 }
 
+/* Phone width: let the disclosure wrap instead of truncating, so the whole
+   sentence survives, including its inline install link ("on this server" is
+   also the answer to "how is this peer-to-peer with nothing installed?").
+   Three lines covers a 320px screen. */
+@media (max-width: 560px) {
+  #fnbar {
+    height: auto;
+    min-height: 34px;
+    padding-top: 4px;
+    padding-bottom: 4px;
+  }
+  #fnbar .nt {
+    white-space: normal;
+    line-height: 1.25;
+    font-size: 12px;
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 3;
+    line-clamp: 3;
+  }
+}
+
 /* Respect the OS dark-mode preference. Same restrained, near-monochrome
    character as the light theme: charcoal bar, light-grey text, hairline
    borders. */
@@ -152,7 +203,8 @@ iframe {
     border-bottom-color: #303032;
     color: #98989c;
   }
-  #fnbar .fn {
+  #fnbar .fn,
+  #fnbar a.fnbarinstall {
     color: #ececee;
   }
   #fnbar .nt {
@@ -182,12 +234,16 @@ iframe {
     border-color: #3a3a3e;
     box-shadow: 0 6px 20px rgba(0, 0, 0, 0.5);
     color: #c2c2c6;
+    color-scheme: dark;
   }
   #fnpop h4 {
     color: #88888c;
   }
   #fnpop p {
     color: #a0a0a4;
+  }
+  #fnpop a.fninstall {
+    color: #e6e6e8;
   }
   #fnok {
     color: #5cbd83;

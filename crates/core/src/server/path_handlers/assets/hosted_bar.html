@@ -1,7 +1,21 @@
-<div id="fnbar" role="region" aria-label="Hosted proxy notice">
-  <span class="fn">Freenet</span
+<div id="fnbar" role="region" aria-label="Hosted privacy notice">
+  <a
+    class="fn"
+    href="https://freenet.org/"
+    target="_blank"
+    rel="noopener"
+    title="What is Freenet?"
+    >Freenet</a
   ><span class="nt"
-    >Hosted proxy, not private. Your data is stored on this server.</span
+    >Stored encrypted on this server.
+    <a
+      class="fninstall fnbarinstall"
+      href="https://freenet.org/quickstart/"
+      target="_blank"
+      rel="noopener"
+      >Install Freenet</a
+    >
+    for full privacy.</span
   ><span id="fnacct"
     ><button id="fnacctbtn" type="button">Account</button>
     <div id="fnpop">
@@ -23,7 +37,14 @@
         <h4>Your own peer</h4>
         <p>
           Move your data to a Freenet peer you run yourself, fully
-          decentralized.
+          decentralized. Don't have one yet?
+          <a
+            class="fninstall"
+            href="https://freenet.org/quickstart/"
+            target="_blank"
+            rel="noopener"
+            >Install Freenet</a
+          >, then come back here.
         </p>
         <div class="row">
           <button class="act" id="fnmigrate">Move to my peer</button
@@ -32,7 +53,15 @@
         <div id="fnmigrateout" hidden>
           <p class="mhint">
             This opens a one-time confirmation page on the Freenet peer running
-            on this computer. It expires in a few minutes.
+            on this computer. It expires in a few minutes. If that page can't
+            connect, your peer isn't running, or Freenet isn't installed yet:
+            <a
+              class="fninstall"
+              href="https://freenet.org/quickstart/"
+              target="_blank"
+              rel="noopener"
+              >install Freenet</a
+            >, then try again.
           </p>
           <div class="row">
             <a
