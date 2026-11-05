@@ -244,6 +244,29 @@ impl AckState {
     }
 }
 
+/// The count of packets a connection's peer newly acknowledged, read without
+/// waiting: `AckCounting`'s record, which every clone of the controller shares.
+#[derive(Clone)]
+pub(crate) struct AckProgress(Arc<Mutex<AckState>>);
+
+impl AckProgress {
+    /// `None` if the connection's controller is not an [`AckCounting`].
+    pub(crate) fn of(connection: &quinn::Connection) -> Option<Self> {
+        let record = connection
+            .congestion_state()
+            .into_any()
+            .downcast::<AckCounting>()
+            .ok()?
+            .state;
+        Some(Self(record))
+    }
+
+    /// Ack-eliciting packets the peer has newly acknowledged so far.
+    pub(crate) fn acked(&self) -> u64 {
+        self.0.lock().acked
+    }
+}
+
 /// A congestion controller that records the acknowledgements the peer
 /// sends ([`AckState`]) and passes every call to `inner` unchanged. Its
 /// clones (quinn's `Connection::congestion_state`) share the record.

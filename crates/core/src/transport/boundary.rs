@@ -196,9 +196,9 @@ pub(crate) enum StreamSendOutcome {
     /// NOT after a receiver ACK — this path has no end-to-end delivery
     /// acknowledgement. It is the strongest "the send actually happened" signal
     /// the broadcast queue can observe, as distinct from the message being
-    /// dropped before/while transmitting. On a QUIC path the send also counts as
-    /// this when the end of the stream went out and its acknowledgement did not
-    /// come back, since the peer may hold the whole message.
+    /// dropped before/while transmitting. On a QUIC path this is a stream the
+    /// peer acknowledged whole; one whose acknowledgement did not come back is
+    /// `Dropped`, though it is not sent again.
     Delivered,
     /// The stream fragment was dropped before/while transferring (channel
     /// closed, congestion timeout, no connection, transport send error). The

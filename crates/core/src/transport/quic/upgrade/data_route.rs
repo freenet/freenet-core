@@ -25,6 +25,7 @@ use futures::stream::FuturesUnordered;
 use tokio::sync::mpsc;
 
 use super::driver::PathClock;
+use crate::simulation::TimeSource;
 use crate::transport::TransportError;
 use crate::transport::connection_handler::SerializedMessage;
 use crate::transport::quic::config::MAX_UNI_STREAMS;
@@ -116,6 +117,18 @@ impl DataRoute {
         &self.path
     }
 
+    /// The path, for a test that watches when it is let go.
+    #[cfg(test)]
+    pub(in crate::transport) fn path_handle(&self) -> Arc<QuicPath> {
+        Arc::clone(&self.path)
+    }
+
+    /// Whether `other` is this route, sharing its queue.
+    #[cfg(test)]
+    pub(in crate::transport) fn is(&self, other: &Self) -> bool {
+        self.shorts.same_channel(&other.shorts)
+    }
+
     pub(in crate::transport) fn clock(&self) -> &PathClock {
         &self.clock
     }
@@ -175,7 +188,8 @@ async fn run_worker(
             settled = in_flight.next(), if !in_flight.is_empty() => {
                 if let Some((payload, outcome)) = settled {
                     note.note(|| format!("sent a short on the path: {outcome:?}"));
-                    if path.settle(SendKind::Short, &outcome, false) == NextStep::SendOnUdp {
+                    let step = path.settle(SendKind::Short, &outcome, false, clock.now_nanos());
+                    if step == NextStep::SendOnUdp {
                         send_on_udp(&path, udp.as_ref(), &note, payload).await;
                     }
                 }

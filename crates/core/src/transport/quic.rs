@@ -55,7 +55,7 @@ mod memory_tests;
 #[cfg(test)]
 pub(crate) mod test_tls;
 #[cfg(test)]
-mod tests;
+pub(in crate::transport) mod tests;
 
 use std::collections::HashMap;
 use std::io;

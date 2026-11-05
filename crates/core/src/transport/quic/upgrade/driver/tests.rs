@@ -163,6 +163,7 @@ impl Harness {
             budget: SharedInboundBudget::new(16, 1 << 20),
             data,
             udp: self.udp.clone(),
+            routed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             quic_receipt_nanos: Arc::new(AtomicU64::new(0)),
             now: Arc::new(move || Duration::from_nanos(now.load(Ordering::Relaxed))),
             state: Mutex::new(SessionState {
@@ -268,6 +269,29 @@ pub(in crate::transport) async fn data_path_to(
     budget: SharedInboundBudget,
     data: QuicDataSenders,
 ) -> DataPath {
+    data_path_with(network, subnet, limits, peer_limits, budget, data, false).await
+}
+
+/// [`data_path`] on a multi-thread runtime.
+pub(in crate::transport) async fn data_path_on_threads(
+    network: &str,
+    subnet: u8,
+    budget: SharedInboundBudget,
+    data: QuicDataSenders,
+) -> DataPath {
+    let limits = QuicPathLimits::DEFAULT;
+    data_path_with(network, subnet, limits, limits, budget, data, true).await
+}
+
+async fn data_path_with(
+    network: &str,
+    subnet: u8,
+    limits: QuicPathLimits,
+    peer_limits: QuicPathLimits,
+    budget: SharedInboundBudget,
+    data: QuicDataSenders,
+    on_threads: bool,
+) -> DataPath {
     let a_addr: SocketAddr = format!("10.205.{subnet}.1:5000").parse().unwrap();
     let b_addr: SocketAddr = format!("10.205.{subnet}.2:5000").parse().unwrap();
     let pair = pair(network, a_addr, b_addr, None).await;
@@ -277,13 +301,18 @@ pub(in crate::transport) async fn data_path_to(
         .expect("allowed");
     let (a, b) = (pair.a.clone(), pair.b.clone());
     let b_key = pair.b_keys.public().clone();
-    let (client, server) = drive(&pair.time, Duration::from_secs(30), async move {
+    let handshake = async move {
         let (client, server) = tokio::join!(a.connect(b_addr, &b_key), async {
             b.accept().await.expect("an attempt").establish().await
         });
         (client.expect("client"), server.expect("server"))
-    })
-    .await;
+    };
+    let limit = Duration::from_secs(30);
+    let (client, server) = if on_threads {
+        crate::transport::quic::tests::drive_on_threads(&pair.time, limit, handshake).await
+    } else {
+        drive(&pair.time, limit, handshake).await
+    };
     drop(permit);
     let time = pair.time.clone();
     let (peer, peer_inbound) = QuicPath::with_limits(client, time.clone(), peer_limits);
@@ -691,17 +720,22 @@ fn a_route_ends_with_its_path_and_what_it_holds_goes_on_udp() {
             .await;
         ready_ack(&session, attempt, caps::DATA);
         let route = session.data_route().expect("both bits");
+        let path = Arc::downgrade(&route.path_handle());
 
         let refused = BoundedSend::Failed(SendFailure::Error(QuicSendError::Stopped(
             stop_code::NOT_ACCEPTING_DATA.into(),
         )));
         assert_eq!(
-            route.path().settle(SendKind::Stream, &refused, false),
+            route.path().settle(SendKind::Stream, &refused, false, 0),
             NextStep::SendOnUdp
         );
         assert!(
             session.data_route().is_none(),
             "a refused path takes no sends"
+        );
+        assert!(
+            data_route_takes_no_lock(&session),
+            "a refused route is off the fast path"
         );
         assert!(route.path().quinn_connection().close_reason().is_none());
         // The route still takes what a connection read a moment ago.
@@ -720,7 +754,139 @@ fn a_route_ends_with_its_path_and_what_it_holds_goes_on_udp() {
             assert_eq!(shorts, (0..10u8).map(|i| vec![i]).collect::<Vec<_>>());
         })
         .await;
+        drop(route);
+        let time = h.pair.time.clone();
+        drive(&h.pair.time, Duration::from_secs(60), async move {
+            time.sleep(Duration::from_secs(1)).await;
+        })
+        .await;
+        assert!(
+            path.upgrade().is_none(),
+            "the worker ended and let the path go"
+        );
     });
+}
+
+/// Whether `session.data_route()` returns while another holder has the session's
+/// lock, so it took none.
+fn data_route_takes_no_lock(session: &Arc<Session>) -> bool {
+    let held = session.state.lock();
+    let session = Arc::clone(session);
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let route = session.data_route();
+        done.send(route.is_none()).ok();
+    });
+    let took_none = finished.recv_timeout(Duration::from_secs(2));
+    drop(held);
+    took_none == Ok(true)
+}
+
+/// With no route, as on a path without both data bits, a send reads one atomic
+/// and never waits for the session's lock, which the driver also takes. Shadow is
+/// the default on Linux and macOS, so this is every connection there.
+#[test]
+fn a_connection_without_a_route_takes_no_lock_to_send() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let h = Harness::server_with("quic-driver-fast", 36, "prefer", Some("100")).await;
+        let (session, inbox) = h.session();
+        assert!(data_route_takes_no_lock(&session), "before any path");
+        let attempt = offered(&h, &session);
+        let up = path_up(&h, &session, inbox);
+        let time = h.pair.time.clone();
+        let _up = drive(&h.pair.time, Duration::from_secs(60), async move {
+            let up = up.await;
+            time.sleep(Duration::from_secs(1)).await;
+            up
+        })
+        .await;
+        ready_ack(&session, attempt, 0);
+        assert!(session.data_route().is_none(), "the peer set no bit");
+        assert!(
+            data_route_takes_no_lock(&session),
+            "an active path in shadow"
+        );
+    });
+}
+
+/// `EnableData` builds one route per activation: a frame repeated by the peer
+/// changes nothing, and a second call is a bug the debug build catches.
+#[test]
+fn data_is_enabled_once_per_activation() {
+    use crate::transport::quic::control::caps;
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let h = Harness::server_with("quic-driver-once", 37, "prefer", Some("100")).await;
+        let (session, inbox) = h.session();
+        let attempt = offered(&h, &session);
+        let up = path_up(&h, &session, inbox);
+        let time = h.pair.time.clone();
+        let _up = drive(&h.pair.time, Duration::from_secs(60), async move {
+            let up = up.await;
+            time.sleep(Duration::from_secs(1)).await;
+            up
+        })
+        .await;
+        ready_ack(&session, attempt, caps::DATA);
+        let first = session.data_route().expect("both bits");
+        ready_ack(&session, attempt, caps::DATA);
+        assert!(session.data_route().expect("still").is(&first));
+        let again = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            session.enable_data(&mut session.state.lock(), attempt)
+        }));
+        assert!(again.is_err(), "a second route must not be built");
+        assert!(session.data_route().expect("still").is(&first));
+        // A route that was never refused: its attempt's end clears the fast path.
+        session.end();
+        assert!(
+            data_route_takes_no_lock(&session),
+            "an ended attempt clears the fast path"
+        );
+    });
+}
+
+/// A connection's view of a session in shadow: its path is up and carries
+/// control frames, and neither side set the data bit.
+pub(in crate::transport) struct ShadowPath {
+    pub(in crate::transport) state: QuicPathState,
+    pub(in crate::transport) path: Arc<QuicPath>,
+    pub(in crate::transport) time: VirtualTime,
+    _keep: (Harness, QuicPath, QuicInbound, mpsc::Receiver<SessionEvent>),
+}
+
+/// [`ShadowPath`], on a network of its own.
+pub(in crate::transport) async fn shadow_path(network: &str, subnet: u8) -> ShadowPath {
+    let h = Harness::server_with(network, subnet, "shadow", None).await;
+    let (session, inbox) = h.session();
+    let attempt = offered(&h, &session);
+    let up = path_up(&h, &session, inbox);
+    let time = h.pair.time.clone();
+    let clock = time.clone();
+    let (peer_path, peer_inbound, inbox) = drive(&time, Duration::from_secs(60), async move {
+        let up = up.await;
+        clock.sleep(Duration::from_secs(1)).await;
+        up
+    })
+    .await;
+    ready_ack(&session, attempt, 0);
+    let path = session
+        .state
+        .lock()
+        .attempt
+        .as_ref()
+        .and_then(|held| held.path.clone())
+        .expect("the path is up");
+    let state = QuicPathState {
+        session,
+        driver: tokio::spawn(std::future::pending()),
+    };
+    ShadowPath {
+        state,
+        path,
+        time,
+        _keep: (h, peer_path, peer_inbound, inbox),
+    }
 }
 
 /// The two sides of the stamp on a real path: frames on an active path keep the

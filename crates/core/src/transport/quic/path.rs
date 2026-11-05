@@ -135,7 +135,7 @@ pub(crate) mod inbound;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -166,6 +166,8 @@ use crate::transport::peer_connection::{embeds_metadata, fits_one_packet};
 pub(crate) use bounded::{BoundedSend, MaybeDelivered, NotOpened, SendDeadlines, SendFailure};
 use bounded::{SendProgress, bounded_send};
 pub(crate) use inbound::{InboundShort, InboundStreamArrival};
+#[cfg(test)]
+pub(crate) use route::STALLED_SENDS_LIMIT;
 pub(crate) use route::{NextStep, QuicSendEvent, QuicSendResult, SendKind};
 
 /// Application error codes a receiver stops a stream with (STOP_SENDING),
@@ -617,9 +619,11 @@ pub(crate) struct QuicPath {
     /// path in shadow, where a fragment taken from an inbound handle cannot
     /// outlive its charge because nothing is ever forwarded.
     send_data: AtomicU8,
-    /// Sends that timed out since the last one that was acknowledged
-    /// ([`route::STALLED_SENDS_LIMIT`]).
-    stalled_sends: AtomicU32,
+    /// Send timeouts while nothing is acknowledged ([`route::StallCount`]).
+    stall: parking_lot::Mutex<route::StallCount>,
+    /// The connection's count of acknowledged packets, `None` if its controller
+    /// does not keep one.
+    ack_progress: Option<recycle::AckProgress>,
     /// Where the path's watch reports that the peer was heard from.
     heard: Arc<recycle::PeerHeard>,
     #[cfg(test)]
@@ -759,6 +763,11 @@ impl QuicPath {
             receiver.panic_on_stream = limits.panic_in_receive;
         }
         let aborts = Arc::new(SendAborts::new(limits.max_send_aborts, connection.closer()));
+        let ack_progress = recycle::AckProgress::of(connection.inner());
+        let stall = route::StallCount::new(
+            ack_progress.as_ref().map(recycle::AckProgress::acked),
+            time.now_nanos(),
+        );
         let heard = Arc::new(recycle::PeerHeard::default());
         let receive = GlobalExecutor::spawn(supervise_receive(
             connection.inner().clone(),
@@ -777,7 +786,8 @@ impl QuicPath {
                 aborts,
                 stream_slots: Arc::new(tokio::sync::Semaphore::new(STREAMED_SEND_LIMIT as usize)),
                 send_data: AtomicU8::new(SEND_DATA_NEVER),
-                stalled_sends: AtomicU32::new(0),
+                stall: parking_lot::Mutex::new(stall),
+                ack_progress,
                 heard,
                 #[cfg(test)]
                 budget,

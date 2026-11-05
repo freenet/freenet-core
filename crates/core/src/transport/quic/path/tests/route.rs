@@ -1,8 +1,7 @@
 //! The table of `path::route` and what `QuicPath::settle` does with an outcome.
 
-use super::super::route::{
-    NextStep, QuicSendEvent, QuicSendResult, STALLED_SENDS_LIMIT, next_step,
-};
+use super::super::STALLED_SENDS_LIMIT;
+use super::super::route::{NextStep, QuicSendEvent, QuicSendResult, StallCount, next_step};
 use super::super::{SendKind, framing_error_for_tests};
 use super::*;
 
@@ -116,60 +115,120 @@ fn each_outcome_takes_its_row() {
     }
 }
 
-/// `settle` closes the path at the eighth timeout in a row, whichever kind of
-/// timeout it is; any `Sent` starts the count again; and an outcome that is no
-/// timeout leaves the count alone. A send waiting for its source does not count.
+const SECOND: u64 = 1_000_000_000;
+
+/// Past the window with no acknowledgement, from a count made at 0.
+const QUIET: u64 = 11 * SECOND;
+
+fn timeouts() -> [BoundedSend; 3] {
+    [
+        BoundedSend::Failed(SendFailure::NotOpened(NotOpened::TimedOut)),
+        BoundedSend::MaybeDelivered(MaybeDelivered::TimedOut),
+        BoundedSend::Failed(SendFailure::TimedOut),
+    ]
+}
+
+/// The eighth timeout in a row closes once nothing has been acknowledged for the
+/// window, whichever kind of timeout each is; a `Sent` starts the count again;
+/// and an outcome that is no timeout leaves the count alone. A send waiting for
+/// its source does not count.
 #[test]
-fn eight_timeouts_in_a_row_close_the_path_and_a_sent_starts_again() {
+fn timeouts_on_a_quiet_path_close_it_and_a_sent_starts_again() {
+    let mut count = StallCount::new(Some(5), 0);
+    let mut take = |outcome: &BoundedSend| count.take(outcome, false, Some(5), QUIET);
+    for outcome in timeouts()
+        .iter()
+        .cycle()
+        .take(STALLED_SENDS_LIMIT as usize - 1)
+    {
+        assert!(!take(outcome), "seven are not enough");
+    }
+    assert!(!take(&BoundedSend::Sent));
+    for outcome in timeouts()
+        .iter()
+        .cycle()
+        .take(STALLED_SENDS_LIMIT as usize - 1)
+    {
+        assert!(!take(outcome), "a Sent started the count again");
+    }
+    assert!(!take(&stopped(stop_code::CHANNEL_FULL)));
+    assert!(!take(&BoundedSend::MaybeDelivered(
+        MaybeDelivered::ConnectionLost
+    )));
+    assert!(
+        !count.take(&timeouts()[2], true, Some(5), QUIET),
+        "a stalled source"
+    );
+    let mut take = |outcome: &BoundedSend| count.take(outcome, false, Some(5), QUIET);
+    assert!(take(&timeouts()[0]), "the eighth, a send that never opened");
+    assert!(!take(&timeouts()[1]), "the close comes once");
+}
+
+/// While acknowledgements arrive, no timeout counts: a busy path is not a stalled
+/// one. Each acknowledgement starts the count again, and the window runs from it.
+#[test]
+fn timeouts_count_only_once_nothing_is_acknowledged_for_the_window() {
+    let mut count = StallCount::new(Some(0), 0);
+    // Inside the window after the path was built.
+    for _ in 0..2 * STALLED_SENDS_LIMIT {
+        assert!(!count.take(&timeouts()[0], false, Some(0), 9 * SECOND));
+    }
+    // Packets acknowledged every second: never quiet.
+    for second in 0..40u64 {
+        assert!(!count.take(
+            &timeouts()[0],
+            false,
+            Some(second + 1),
+            (10 + second) * SECOND
+        ));
+    }
+    // Seven quiet timeouts, then an acknowledgement, then seven more: no close.
+    let last = 49 * SECOND;
+    for _ in 1..STALLED_SENDS_LIMIT {
+        assert!(!count.take(&timeouts()[1], false, Some(40), last + QUIET));
+    }
+    assert!(!count.take(&timeouts()[1], false, Some(41), last + QUIET));
+    let quiet_again = last + 2 * QUIET;
+    for _ in 1..STALLED_SENDS_LIMIT {
+        assert!(!count.take(&timeouts()[1], false, Some(41), quiet_again));
+    }
+    assert!(count.take(&timeouts()[1], false, Some(41), quiet_again));
+}
+
+/// A connection whose controller counts no acknowledgements cannot tell a busy
+/// path from a stalled one, so every timeout counts, as before the window.
+#[test]
+fn with_no_acknowledgement_count_every_timeout_counts() {
+    let mut count = StallCount::new(None, 0);
+    for _ in 1..STALLED_SENDS_LIMIT {
+        assert!(!count.take(&timeouts()[0], false, None, 0));
+    }
+    assert!(count.take(&timeouts()[0], false, None, 0));
+}
+
+/// On a real path, with nothing acknowledged since it was built: eight timeouts
+/// past the window close it, counted once, and the path reads the connection's
+/// own acknowledgement count.
+#[test]
+fn a_quiet_path_closes_after_eight_timeouts() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
         let p = paths("quic-route-stall", 70, QuicPathLimits::DEFAULT).await;
-        let timeouts = [
-            BoundedSend::Failed(SendFailure::NotOpened(NotOpened::TimedOut)),
-            BoundedSend::MaybeDelivered(MaybeDelivered::TimedOut),
-            BoundedSend::Failed(SendFailure::TimedOut),
-        ];
-        let closed = |path: &QuicPath| path.quinn_connection().close_reason().is_some();
-        let settle = |outcome: &BoundedSend| p.a.settle(SendKind::Stream, outcome, false);
-
-        for outcome in timeouts
-            .iter()
-            .cycle()
-            .take(STALLED_SENDS_LIMIT as usize - 1)
-        {
-            settle(outcome);
+        assert!(
+            p.a.ack_progress.is_some(),
+            "the connection counts acknowledgements"
+        );
+        let later = p.time().now_nanos() + QUIET;
+        for _ in 1..STALLED_SENDS_LIMIT {
+            p.a.settle(SendKind::Stream, &timeouts()[2], false, later);
         }
-        assert!(!closed(&p.a), "seven are not enough");
-
-        settle(&BoundedSend::Sent);
-        for outcome in timeouts
-            .iter()
-            .cycle()
-            .take(STALLED_SENDS_LIMIT as usize - 1)
-        {
-            settle(outcome);
-        }
-        assert!(!closed(&p.a), "a Sent started the count again");
-
-        // Neither of these is a timeout, and neither resets the count.
-        settle(&stopped(stop_code::CHANNEL_FULL));
-        settle(&BoundedSend::MaybeDelivered(MaybeDelivered::ConnectionLost));
-        assert!(!closed(&p.a));
-        p.a.settle(SendKind::Pipe, &timeouts[0], true);
-        p.a.settle(SendKind::Pipe, &timeouts[2], true);
-        assert!(!closed(&p.a), "a stalled source is not the path's");
-
-        settle(&timeouts[1]);
-        assert!(closed(&p.a), "the eighth of a kind that counts");
+        assert!(p.a.quinn_connection().close_reason().is_none());
+        p.a.settle(SendKind::Stream, &timeouts()[2], false, later);
+        assert!(p.a.quinn_connection().close_reason().is_some());
+        p.a.settle(SendKind::Stream, &timeouts()[2], false, later);
         assert_eq!(
             p.a.stats().send_event_count(QuicSendEvent::StalledClosed),
             1
-        );
-        settle(&timeouts[1]);
-        assert_eq!(
-            p.a.stats().send_event_count(QuicSendEvent::StalledClosed),
-            1,
-            "counted once"
         );
     });
 }
@@ -183,13 +242,19 @@ fn a_refusal_stops_new_sends_on_the_path() {
         let _seed = GlobalRng::seed_guard(SEED);
         let p = paths("quic-route-refused", 71, QuicPathLimits::DEFAULT).await;
         assert!(p.a.sends_data());
-        p.a.settle(SendKind::Stream, &stopped(stop_code::BUDGET_REFUSED), false);
+        p.a.settle(
+            SendKind::Stream,
+            &stopped(stop_code::BUDGET_REFUSED),
+            false,
+            0,
+        );
         assert!(p.a.sends_data());
         for _ in 0..2 {
             p.a.settle(
                 SendKind::Short,
                 &stopped(stop_code::NOT_ACCEPTING_DATA),
                 false,
+                0,
             );
         }
         assert!(!p.a.sends_data());

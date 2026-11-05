@@ -192,8 +192,22 @@ impl<T: TimeSource> PathTransfer<T> {
     }
 }
 
-/// Tell the broadcast queue how a stream ended. It only reads whether the send
-/// happened: a `MaybeDelivered` did, and neither form is an end-to-end ack.
+/// What the broadcast queue hears of a stream that is not sent again. Only `Sent`
+/// is `Delivered`. A `MaybeDelivered` is not resent (the peer may hold it), and it
+/// is `Dropped`: on `Delivered` the queue records the peer as holding this state,
+/// and quinn may still have held part of the stream unsent when the deadline
+/// passed or the connection closed. Nothing would correct that belief but
+/// anti-entropy, since the UDP session stays up. `Dropped` costs at most one
+/// full-state send that was not needed.
+fn stream_send_outcome(outcome: &BoundedSend) -> StreamSendOutcome {
+    match outcome {
+        BoundedSend::Sent => StreamSendOutcome::Delivered,
+        BoundedSend::MaybeDelivered(_) | BoundedSend::Failed(_) => StreamSendOutcome::Dropped,
+    }
+}
+
+/// Tell the broadcast queue how a stream ended. Neither outcome is an end-to-end
+/// acknowledgement.
 fn complete(completion_tx: Option<oneshot::Sender<StreamSendOutcome>>, outcome: StreamSendOutcome) {
     if let Some(tx) = completion_tx {
         // The receiver may be gone if the queue timed out.
@@ -217,7 +231,12 @@ pub(super) async fn send_large_short_on_path<S: Socket, T: TimeSource>(
         .send_short_bounded(route.clock(), SendDeadlines::short(bytes), &data)
         .await;
     route.note(|| format!("sent a large short on the path: {outcome:?}"));
-    match route.path().settle(SendKind::LargeShort, &outcome, false) {
+    match route.path().settle(
+        SendKind::LargeShort,
+        &outcome,
+        false,
+        route.clock().now_nanos(),
+    ) {
         NextStep::Done => transfer.completed(),
         NextStep::SendOnUdp => udp.send_stream(stream_id, data, None, None, None).await,
         NextStep::GiveUp => transfer.failed(&outcome),
@@ -249,9 +268,12 @@ pub(super) async fn send_stream_on_path<S: Socket, T: TimeSource>(
         )
         .await;
     route.note(|| format!("sent a stream on the path: {outcome:?}"));
-    match route.path().settle(SendKind::Stream, &outcome, false) {
+    match route
+        .path()
+        .settle(SendKind::Stream, &outcome, false, route.clock().now_nanos())
+    {
         NextStep::Done => {
-            complete(completion_tx, StreamSendOutcome::Delivered);
+            complete(completion_tx, stream_send_outcome(&outcome));
             transfer.completed()
         }
         NextStep::SendOnUdp => {
@@ -294,7 +316,10 @@ pub(super) async fn pipe_stream_on_path<S: Socket, T: TimeSource>(
         .await;
     route.note(|| format!("sent a pipe on the path: {outcome:?}"));
     let stalled = source.stalled();
-    match route.path().settle(SendKind::Pipe, &outcome, stalled) {
+    match route
+        .path()
+        .settle(SendKind::Pipe, &outcome, stalled, route.clock().now_nanos())
+    {
         NextStep::Done => transfer.completed(),
         NextStep::SendOnUdp => {
             udp.pipe_stream(stream_id, inbound_handle, metadata, progress)

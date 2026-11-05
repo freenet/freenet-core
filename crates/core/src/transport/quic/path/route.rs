@@ -29,16 +29,19 @@
 //! Every outcome goes through [`QuicPath::settle`], which also counts it and
 //! keeps the path's stall count.
 
-use std::sync::atomic::Ordering;
+use std::time::Duration;
 
+use super::super::recycle::{self, ACK_WATCH_WINDOW};
 use super::bounded::{BoundedSend, MaybeDelivered, NotOpened, SendFailure};
 use super::{QuicPath, QuicSendError, stop_code};
 use crate::transport::metrics::QuicCloseCode;
 
-/// Send timeouts in a row that close a path with `DOWNGRADE`. A send that opens
-/// nothing costs no reset, so `recycle::SEND_ABORT_LIMIT` does not see it, and
-/// that limit is too slow to catch a path that has stopped moving. This costs a
-/// normal backoff and is never permanent.
+/// Send timeouts in a row, with no acknowledgement on the path, that close it
+/// with `DOWNGRADE` ([`StallCount`]). A send that never opens or that waits for
+/// its acknowledgement past its deadline costs no reset, so
+/// `recycle::SEND_ABORT_LIMIT` does not see it, and that limit is too slow to catch
+/// a path that has stopped moving. This costs a normal backoff and is never
+/// permanent.
 pub(crate) const STALLED_SENDS_LIMIT: u32 = 8;
 
 /// Which kind of data send an outcome belongs to.
@@ -132,7 +135,9 @@ pub(crate) fn next_step(kind: SendKind, outcome: &BoundedSend) -> (NextStep, Qui
     (step, result)
 }
 
-/// Whether `outcome` is a deadline running out on this path.
+/// Whether `outcome` is a send deadline running out: before the stream opened,
+/// with the stream open and not moving, or waiting for the acknowledgement of
+/// its end. Whether it counts against the path is [`StallCount`]'s decision.
 fn timed_out(outcome: &BoundedSend) -> bool {
     match outcome {
         BoundedSend::MaybeDelivered(MaybeDelivered::TimedOut)
@@ -145,17 +150,94 @@ fn timed_out(outcome: &BoundedSend) -> bool {
     }
 }
 
+/// How long the path must have gone with no packet newly acknowledged before a
+/// timeout counts against it: the acknowledgement watch's window.
+pub(crate) const STALL_PROGRESS_WINDOW: Duration = ACK_WATCH_WINDOW;
+
+/// The path's count of send timeouts in a row, kept only while the path makes no
+/// forward progress.
+///
+/// Decision (e5b-5 review, kept in the e5b-6 review): every kind of timeout can
+/// count, `NotOpened(TimedOut)` and `MaybeDelivered(TimedOut)` included. A path
+/// whose permits are all held by sends stuck waiting for acknowledgements past
+/// `MaybeDelivered` costs every streamed send its 2 s open deadline, and only this
+/// close recycles it. But a timeout counts only when no packet on the connection
+/// was newly acknowledged within [`STALL_PROGRESS_WINDOW`] (quinn's acknowledged
+/// packets, read from `recycle::AckCounting`). So a busy relay whose 48 permits
+/// are held by transfers that are being acknowledged, or a receiver whose consumer
+/// is slow while its QUIC stack keeps acknowledging, never closes, and a path with
+/// no acknowledgements does. Any acknowledgement, like any `Sent`, starts the
+/// count again. Do not drop a kind of timeout from the count, and do not count
+/// one while acknowledgements arrive.
+///
+/// The acknowledgement count is read when a send settles, so progress is seen at
+/// the next settle after it, within one send's deadline. A receiver whose
+/// consumer stays stalled past the window while nothing else on the path is
+/// acknowledged reads as a stalled path.
+#[derive(Debug)]
+pub(crate) struct StallCount {
+    in_a_row: u32,
+    /// The acknowledged-packet count at the last settle.
+    acked: Option<u64>,
+    /// When the count last moved, on the path's clock.
+    progressed_at: u64,
+}
+
+impl StallCount {
+    /// A count for a path built at `now_nanos`, when the connection had
+    /// acknowledged `acked` packets: the path counts as having moved then.
+    pub(crate) fn new(acked: Option<u64>, now_nanos: u64) -> Self {
+        Self {
+            in_a_row: 0,
+            acked,
+            progressed_at: now_nanos,
+        }
+    }
+
+    /// Take `outcome`, with the connection's acknowledged-packet count `acked`
+    /// (`None` when the controller does not count them) at `now_nanos`. Returns
+    /// whether the path should close now: once, at the limit.
+    pub(crate) fn take(
+        &mut self,
+        outcome: &BoundedSend,
+        source_stalled: bool,
+        acked: Option<u64>,
+        now_nanos: u64,
+    ) -> bool {
+        if let Some(acked) = acked {
+            if self.acked != Some(acked) {
+                self.acked = Some(acked);
+                self.progressed_at = now_nanos;
+                self.in_a_row = 0;
+            }
+        }
+        if matches!(outcome, BoundedSend::Sent) {
+            self.in_a_row = 0;
+            return false;
+        }
+        let window = u64::try_from(STALL_PROGRESS_WINDOW.as_nanos()).unwrap_or(u64::MAX);
+        let quiet = acked.is_none() || now_nanos.saturating_sub(self.progressed_at) >= window;
+        if !timed_out(outcome) || source_stalled || !quiet {
+            return false;
+        }
+        self.in_a_row += 1;
+        self.in_a_row == STALLED_SENDS_LIMIT
+    }
+}
+
 impl QuicPath {
     /// Count `outcome` of a send of `kind` and say what to do with the message.
     /// Every data send of the node ends here.
     ///
     /// `source_stalled`: the send was waiting for its source when it timed out.
     /// That says nothing about the path, so the stall count does not move.
+    /// `now_nanos` is on the path's clock ([`StallCount`]).
     pub(crate) fn settle(
         &self,
         kind: SendKind,
         outcome: &BoundedSend,
         source_stalled: bool,
+        now_nanos: u64,
     ) -> NextStep {
         let (step, result) = next_step(kind, outcome);
         self.stats.record_send(kind, result);
@@ -165,19 +247,19 @@ impl QuicPath {
                 self.stop_sending_data();
             }
         }
-        if matches!(outcome, BoundedSend::Sent) {
-            self.stalled_sends.store(0, Ordering::Relaxed);
-        } else if timed_out(outcome) && !source_stalled {
-            let in_a_row = self.stalled_sends.fetch_add(1, Ordering::Relaxed) + 1;
-            if in_a_row == STALLED_SENDS_LIMIT {
-                self.stats.record_send_event(QuicSendEvent::StalledClosed);
-                tracing::warn!(
-                    in_a_row,
-                    "QUIC path: sends keep timing out; closing the path, and the \
-                     connection stays on UDP"
-                );
-                self.close(QuicCloseCode::Downgrade);
-            }
+        let acked = self.ack_progress.as_ref().map(recycle::AckProgress::acked);
+        let close = self
+            .stall
+            .lock()
+            .take(outcome, source_stalled, acked, now_nanos);
+        if close {
+            self.stats.record_send_event(QuicSendEvent::StalledClosed);
+            tracing::warn!(
+                in_a_row = STALLED_SENDS_LIMIT,
+                "QUIC path: sends keep timing out and nothing is acknowledged; closing \
+                 the path, and the connection stays on UDP"
+            );
+            self.close(QuicCloseCode::Downgrade);
         }
         step
     }

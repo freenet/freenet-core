@@ -1772,7 +1772,11 @@ QUIC send route (#5940 e5b-6, quic/upgrade/data_route.rs,
   Fallback: QuicPath::settle counts an outcome and path::route::next_step says what
   happens next. A message goes on UDP only when the outcome proves the receiver
   cannot deliver it:
-    Sent, MaybeDelivered: done, never resent (StreamSendOutcome::Delivered).
+    Sent: done (StreamSendOutcome::Delivered).
+    MaybeDelivered: never resent, the peer may hold it. A stream reports
+      StreamSendOutcome::Dropped: quinn may still have held part of it unsent, and
+      Delivered would make the broadcast queue record a state the peer may lack,
+      with only anti-entropy to correct it. Dropped costs one spare full-state send.
     Failed(NotOpened), a frame that cannot be built: UDP, a stream under its id with
       its completion_tx. A pipe reads its stream again from the start.
     Failed(TimedOut), a connection lost before the end: a Short goes on UDP, as it
@@ -1794,11 +1798,23 @@ QUIC send route (#5940 e5b-6, quic/upgrade/data_route.rs,
   before the close is seen fails to open and goes the same way. The UDP send of a
   session that has already ended goes nowhere, as on a dropped connection.
   A path that stops moving: STALLED_SENDS_LIMIT (8) timeouts in a row close it with
-  DOWNGRADE (stalled_closed), reset by any Sent. All three kinds count:
-  Failed(NotOpened(TimedOut)), Failed(TimedOut), MaybeDelivered(TimedOut). A pipe
-  that timed out waiting for its source does not (WatchedSource): the path did
-  nothing wrong. Concurrent sends count, so a burst of 8 shorts that all miss their
-  1 s open deadline closes a path too. It costs a normal backoff.
+  DOWNGRADE (stalled_closed), but only timeouts while nothing on the connection was
+  newly acknowledged within STALL_PROGRESS_WINDOW (ACK_WATCH_WINDOW, 10 s), read
+  from AckCounting's record (recycle::AckProgress) when a send settles
+  (route::StallCount). Any acknowledgement or any Sent starts the count again. All
+  three kinds count: Failed(NotOpened(TimedOut)), Failed(TimedOut),
+  MaybeDelivered(TimedOut). NotOpened must count: a path whose permits are all
+  held by sends stuck waiting for acknowledgements is recycled only by this close.
+  The window must stay: without it a busy relay whose 48 permits hold transfers
+  that are being acknowledged, or a receiver whose consumer is slow while its QUIC
+  stack acknowledges, is closed and loses what the receiver's readers hold. Known
+  gap: a consumer stalled past the window while nothing else on the path is
+  acknowledged reads as a stalled path. A pipe that timed out waiting for its
+  source does not count (WatchedSource). It costs a normal backoff.
+  Fast path: Session::routed is an atomic set only while the live attempt holds a
+  route, so a connection with no route (shadow, the default on Linux and macOS)
+  sends without taking the session's lock. enable_data runs once per activation
+  (debug assertion); a second route would orphan the first one's worker.
   NOT_ACCEPTING_DATA: this node's gating or the peer's is wrong. Logged once per
   path, counted (data_refused, and every time), new sends go on UDP and the path
   stays up. send_data has three states so a send racing the refusal does not trip

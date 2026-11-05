@@ -62,7 +62,7 @@ use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -331,6 +331,9 @@ struct Attempt {
     /// data bit. The route's worker is not in `tasks`: it outlives the attempt
     /// to hand what it holds to UDP.
     route: Option<DataRoute>,
+    /// The session's [`Session::routed`], set while `route` is held. Cleared when
+    /// the attempt goes, which happens only under the session's lock.
+    routed: Option<Arc<AtomicBool>>,
     /// The dial or establish task, the control sends and the path's pump.
     tasks: Vec<JoinHandle<()>>,
 }
@@ -344,6 +347,7 @@ impl Attempt {
             establishing: false,
             path: None,
             route: None,
+            routed: None,
             tasks: Vec::new(),
         }
     }
@@ -353,6 +357,9 @@ impl Drop for Attempt {
     fn drop(&mut self) {
         for task in &self.tasks {
             task.abort();
+        }
+        if let Some(routed) = &self.routed {
+            routed.store(false, Ordering::Release);
         }
     }
 }
@@ -383,6 +390,12 @@ struct Session {
     data: QuicDataSenders,
     /// What a path's short queue falls back on.
     udp: Arc<dyn UdpShorts>,
+    /// Whether the live attempt may hold a data route, read without the lock by
+    /// every send of the connection ([`Self::data_route`]). Set only after the
+    /// route is in place and cleared when the attempt goes, both under the lock,
+    /// so `false` is always true of the route: a node without one never takes
+    /// the lock to send. `true` may be stale, and the lock then decides.
+    routed: Arc<AtomicBool>,
     /// When an active path of this session last heard from the peer, on [`Self::now`].
     /// Half of the connection's `ReceiptStamp`. Written from the path's watch
     /// because the path runs on another clock in simulation.
@@ -526,6 +539,7 @@ impl QuicUpgrades {
             budget,
             data,
             udp: sender.clone(),
+            routed: Arc::new(AtomicBool::new(false)),
             quic_receipt_nanos,
             now: Arc::new(move || clock.now()),
             state: Mutex::new(SessionState {
@@ -925,6 +939,15 @@ impl Session {
         let Some(path) = held.path.as_ref() else {
             return;
         };
+        // The machine enables data once per activation. A second route would
+        // leave the first one's worker and queue with nobody sending to them.
+        debug_assert!(
+            held.route.is_none(),
+            "attempt {attempt} has a route already"
+        );
+        if held.route.is_some() {
+            return;
+        }
         path.enable_data();
         let (route, worker) = DataRoute::new(
             Arc::clone(path),
@@ -933,6 +956,8 @@ impl Session {
             self.route_note(),
         );
         held.route = Some(route);
+        held.routed = Some(Arc::clone(&self.routed));
+        self.routed.store(true, Ordering::Release);
         // Bounded by the path: it ends when the connection does and what it holds
         // is gone, so the handle is not monitored and is not in `held.tasks`.
         drop(GlobalExecutor::spawn(report_panics(self.remote, worker)));
@@ -945,15 +970,22 @@ impl Session {
     /// that ended stops taking sends at once. The lock is short and never held
     /// across an await. A route read just before a teardown still works: what it
     /// takes goes on UDP.
+    ///
+    /// With no route, as in shadow and with QUIC off on the peer, it reads one
+    /// atomic and takes no lock.
     fn data_route(&self) -> Option<DataRoute> {
-        self.state
-            .lock()
-            .attempt
-            .as_ref()?
-            .route
-            .as_ref()
-            .filter(|route| route.path().sends_data())
-            .cloned()
+        if !self.routed.load(Ordering::Acquire) {
+            return None;
+        }
+        let state = self.state.lock();
+        let route = state.attempt.as_ref()?.route.as_ref()?;
+        if !route.path().sends_data() {
+            // A refusal is for good on this path, so its route is off the fast
+            // path too. A new attempt sets the flag again under this lock.
+            self.routed.store(false, Ordering::Release);
+            return None;
+        }
+        Some(route.clone())
     }
 
     /// Where a route records what its sends did, in a test.

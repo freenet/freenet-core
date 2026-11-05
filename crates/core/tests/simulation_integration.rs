@@ -20939,6 +20939,11 @@ fn test_quic_data_delivers_a_real_message_through_recv() {
         assert_eq!(run.whats(*node, "DataEnabled"), 1, "{}", run.dump());
     }
     assert_eq!(run.udp_data_once_on_the_path(), 0, "{}", run.dump());
+    assert!(
+        run.total("data arrived on UDP") > 0,
+        "data seen on UDP before the path carried it, so the count works: {}",
+        run.dump()
+    );
     let received = run.total("received a short on the path");
     assert!(received > 0, "{}", run.dump());
     assert_eq!(
@@ -21051,6 +21056,11 @@ fn test_quic_data_carries_a_stream_end_to_end() {
         run.dump()
     );
     assert_eq!(run.udp_data_once_on_the_path(), 0, "{}", run.dump());
+    assert!(
+        run.total("data arrived on UDP") > 0,
+        "data seen on UDP before the path carried it, so the count works: {}",
+        run.dump()
+    );
     assert_eq!(
         run.total("path carried data: refused 0"),
         run.total("path carried data"),

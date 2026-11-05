@@ -1203,8 +1203,6 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         (!self.is_duplicate_dispatch(&bytes)).then_some(bytes)
     }
 
-    /// Tell a test's trace what `recv` took from a path.
-    #[cfg_attr(not(any(test, feature = "testing")), allow(unused_variables))]
     /// Tell a test's trace that data arrived on UDP on a connection with upgrades.
     /// At the receiver, so it counts every send whichever code made it.
     fn note_udp_data(&self, kind: &str) {
@@ -1213,7 +1211,8 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         }
     }
 
-    /// Where a test's trace hears what arrived on a path.
+    /// Tell a test's trace what `recv` took from a path.
+    #[cfg_attr(not(any(test, feature = "testing")), allow(unused_variables))]
     fn note_quic_delivery(&self, what: impl FnOnce() -> String) {
         #[cfg(any(test, feature = "testing"))]
         if let Some(trace) = &self.upgrade_trace {
