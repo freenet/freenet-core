@@ -179,9 +179,11 @@ fn with_a_limit_the_window_is_the_lower_of_cubics_and_the_rates() {
     );
     fast.srtt = Some(Duration::from_millis(40));
     assert_eq!(fast.window(), fast.inner.window());
-    // And a low one at the same RTT lowers it.
+    assert_eq!(fast.metrics().congestion_window, fast.inner.window());
+    // And a low one at the same RTT lowers it, and the metrics report it.
     fast.rate = QuicRateLimit::new(Some(100_000), None);
     assert_eq!(fast.window(), 4000);
+    assert_eq!(fast.metrics().congestion_window, 4000);
 }
 
 /// A socket that delivers each datagram `delay` after it is sent, on
@@ -356,6 +358,12 @@ impl Link {
 
     /// [`Self::send`], from `a` to `b` when `from_a`, else from `b` to `a`.
     async fn send_from(&self, from_a: bool, len: usize, limit: Duration) -> Duration {
+        self.send_timed(from_a, len, limit).await.1
+    }
+
+    /// [`Self::send_from`], also returning when the transfer started (ns on
+    /// the link's clock, once the connection was up).
+    async fn send_timed(&self, from_a: bool, len: usize, limit: Duration) -> (u64, Duration) {
         let _permit = self
             .b
             .allow_peer(self.a_addr, self.a_keys.public())
@@ -388,7 +396,7 @@ impl Link {
             assert_eq!(read.len(), len);
             let elapsed = Duration::from_nanos(time.now_nanos() - start);
             drop((client, server));
-            elapsed
+            (start, elapsed)
         })
         .await
     }
@@ -463,16 +471,10 @@ fn the_floor_keeps_two_datagrams_in_flight_both_ways() {
 }
 
 /// A no-starvation check. Under a node-wide egress cap, a QUIC path and a
-/// sender that takes from the cap as the UDP transport's stream senders do
-/// both finish, no UDP fragment waits past a stream's 5 s gap deadline, and
-/// everything the node sends stays within the cap.
-///
-/// It does not show the QUIC path keeping to its fair share, because it does
-/// not: the cap's holds add to the RTT quinn measures, and the window cap is
-/// `rate x RTT`, so it loosens as the egress cap binds. Measured here: the
-/// QUIC path ran at about 390 kB/s against a share of 250 kB/s, and at about
-/// 400 kB/s with the window cap removed. The egress cap is what holds the
-/// node's total, and this test checks that it does.
+/// sender that takes from the cap greedily, with no bucket of its own, both
+/// finish, no UDP fragment waits past a stream's 5 s gap deadline, and
+/// everything the node sends stays within the cap. Fair shares are
+/// `a_quic_path_and_udp_streams_each_get_their_fair_share_under_a_saturated_egress_cap`.
 #[test]
 fn a_quic_path_and_udp_streams_both_progress_under_an_egress_cap() {
     use crate::transport::egress_cap::{PACED_WAIT_DEADLINE, try_take};
@@ -480,7 +482,9 @@ fn a_quic_path_and_udp_streams_both_progress_under_an_egress_cap() {
         const CAP: u64 = 500_000;
         const QUIC_LEN: usize = 1_000_000;
         const UDP_LEN: usize = 1_000_000;
-        let manager = Arc::new(GlobalBandwidthManager::new(CAP as usize, None));
+        // A minimum below the share, or the default minimum (1 MB/s, clamped
+        // to the total) makes each connection's share the whole cap.
+        let manager = Arc::new(GlobalBandwidthManager::new(CAP as usize, Some(1000)));
         manager.register_connection();
         manager.register_connection();
         let link = Arc::new(
@@ -556,6 +560,110 @@ fn a_quic_path_and_udp_streams_both_progress_under_an_egress_cap() {
             sent as usize >= QUIC_LEN + UDP_LEN,
             "both transfers went out: {sent}"
         );
+    })
+}
+
+/// Under a saturated egress cap shared by two connections, with the minimum
+/// per connection set below the share, a QUIC path and a UDP stream sender on
+/// the other connection each get their fair share, half the cap, within 15%.
+/// The UDP sender is paced as the UDP transport paces a stream fragment: it
+/// reserves from its own connection's token bucket at the share
+/// (`TokenBucket::reserve`), then takes from the egress cap. Each side's rate
+/// is the bytes it put on the wire while the QUIC transfer ran, from when its
+/// connection was up.
+///
+/// What it covers is narrow: two connections, the same RTT, one flow each,
+/// and a minimum below the share. With the default minimum the share is the
+/// whole cap and the window cap does not apportion it (see `transport.md`).
+/// Seeded; over 40 seeds the rates ranged 239354 to 239658 B/s for QUIC and
+/// 249990 to 250105 B/s for UDP.
+///
+/// Measured: QUIC about 239 kB/s and UDP about 250 kB/s of a 250 kB/s share.
+/// With the window cap removed (and Cubic no longer told about it) QUIC took
+/// about 491 kB/s and UDP about 12 kB/s, so the window cap is what holds QUIC
+/// to its share here.
+///
+/// #6112 measured QUIC at about 390 kB/s against what it took for a 250 kB/s
+/// share. With the default minimum per connection (1 MB/s, which
+/// `GlobalBandwidthManager::new` clamps to the total) the share is the whole
+/// cap, so the window cap does not apportion it; that case is the open part
+/// of #6112, and this test sets a minimum below the share.
+#[test]
+fn a_quic_path_and_udp_streams_each_get_their_fair_share_under_a_saturated_egress_cap() {
+    use crate::transport::egress_cap::{jittered, try_take};
+    use crate::transport::token_bucket::TokenBucket;
+    bounded(|| async move {
+        let _seed = crate::config::GlobalRng::seed_guard(0x5940_6112);
+        const CAP: u64 = 500_000;
+        const QUIC_LEN: usize = 2_000_000;
+        let share = CAP as f64 / 2.0;
+        // A minimum below the share, as above.
+        let manager = Arc::new(GlobalBandwidthManager::new(CAP as usize, Some(1000)));
+        manager.register_connection();
+        manager.register_connection();
+        let link = Arc::new(
+            Link::new(
+                "quic-cap-fair-share",
+                7,
+                QuicRateLimit::new(None, Some(manager.clone())),
+                Some(CAP),
+            )
+            .await,
+        );
+        let udp = {
+            let link = link.clone();
+            let share = manager.current_per_connection_rate();
+            tokio::spawn(async move {
+                // The connection's bucket, as `initial_paced_rate` builds it:
+                // the global share, a tenth of it as capacity.
+                let bucket =
+                    TokenBucket::new_with_time_source(share / 10, share, link.time.clone());
+                let fragment = [0x02u8; 1200];
+                loop {
+                    let wait = bucket.reserve(fragment.len());
+                    if !wait.is_zero() {
+                        link.time.sleep(wait).await;
+                    }
+                    loop {
+                        match try_take(link.a_socket.as_ref(), Duration::ZERO) {
+                            Ok(Some(take)) => {
+                                link.a_socket
+                                    .try_send_to_paced(&fragment, link.b_addr, take)
+                                    .expect("sent");
+                                break;
+                            }
+                            Ok(None) => unreachable!("the socket has a cap"),
+                            // As `StreamPacing` sleeps a refused take.
+                            Err(deficit) => link.time.sleep(jittered(deficit)).await,
+                        }
+                    }
+                }
+            })
+        };
+        let (start, elapsed) = link
+            .send_timed(true, QUIC_LEN, Duration::from_secs(120))
+            .await;
+        udp.abort();
+        let end = start + elapsed.as_nanos() as u64;
+        let (mut quic, mut udp_bytes) = (0u64, 0u64);
+        for (at, len, is_quic) in link.sent.lock().unwrap().iter() {
+            if (start..=end).contains(at) {
+                if *is_quic {
+                    quic += *len as u64;
+                } else {
+                    udp_bytes += *len as u64;
+                }
+            }
+        }
+        let seconds = elapsed.as_secs_f64();
+        let (quic_rate, udp_rate) = (quic as f64 / seconds, udp_bytes as f64 / seconds);
+        for (name, rate) in [("QUIC", quic_rate), ("UDP", udp_rate)] {
+            assert!(
+                (rate - share).abs() <= 0.15 * share,
+                "{name} ran at {rate:.0} B/s, the share is {share:.0} (QUIC {quic_rate:.0}, \
+                 UDP {udp_rate:.0}, over {seconds:.2} s)"
+            );
+        }
     })
 }
 

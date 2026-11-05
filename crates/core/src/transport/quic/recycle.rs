@@ -352,6 +352,16 @@ impl CappedCubic {
         }
     }
 
+    /// `cubic` (Cubic's window) lowered to the rate's window, when there is a
+    /// limit and an RTT; otherwise `cubic`. The one place the cap is applied,
+    /// for [`Controller::window`] and [`Controller::metrics`].
+    fn capped(&self, cubic: u64) -> u64 {
+        match (self.rate.rate(), self.srtt) {
+            (Some(rate), Some(srtt)) => cubic.min(rate_window(rate, srtt, self.mtu)),
+            (None, _) | (_, None) => cubic,
+        }
+    }
+
     /// Whether the wrapped controller is a `C`.
     #[cfg(test)]
     pub(crate) fn wraps<C: Controller + 'static>(&self) -> bool {
@@ -423,15 +433,17 @@ impl Controller for CappedCubic {
     }
 
     fn window(&self) -> u64 {
-        let window = self.inner.window();
-        match (self.rate.rate(), self.srtt) {
-            (Some(rate), Some(srtt)) => window.min(rate_window(rate, srtt, self.mtu)),
-            (None, _) | (_, None) => window,
-        }
+        self.capped(self.inner.window())
     }
 
+    /// Cubic's metrics, with the window this controller gives quinn (the
+    /// capped one) in place of Cubic's own.
     fn metrics(&self) -> ControllerMetrics {
-        self.inner.metrics()
+        let mut metrics = self.inner.metrics();
+        // Cubic's `congestion_window` is its window; lower it as `window`
+        // does, without asking Cubic again.
+        metrics.congestion_window = self.capped(metrics.congestion_window);
+        metrics
     }
 
     fn clone_box(&self) -> Box<dyn Controller> {
