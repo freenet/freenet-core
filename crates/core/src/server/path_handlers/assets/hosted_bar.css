@@ -42,6 +42,9 @@ iframe {
 #fnbar .nt {
   flex: 1 1 auto;
   min-width: 0;
+  /* Not the bar's line-height 1: the inline install link's underline and focus
+     ring would be clipped by this span's overflow:hidden. */
+  line-height: 1.4;
   color: #777;
   overflow: hidden;
   text-overflow: ellipsis;

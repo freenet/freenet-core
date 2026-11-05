@@ -2236,7 +2236,7 @@ fn shell_page(
     // the sandboxed app iframe. It is the only place a per-user-data action
     // (export to your own peer) can live — the durable user token is held by
     // the shell and must never reach the sandbox — and the only place the
-    // "not private: your data is stored on this server" disclosure cannot be hidden or
+    // "stored encrypted on this server" privacy disclosure cannot be hidden or
     // spoofed by the contract app. Empty (and the layout unchanged) when hosted
     // mode is off. The export control is a placeholder until the node-side
     // export endpoint lands (P3 `secrets export` over HTTP, scoped to the
@@ -2478,7 +2478,7 @@ const SHELL_USER_TOKEN_JS: &str = include_str!("path_handlers/assets/shell_user_
 /// only when hosted mode is on; the bar lives OUTSIDE the sandboxed app iframe.
 const HOSTED_BAR_STYLES: &str = include_str!("path_handlers/assets/hosted_bar.css");
 
-/// Markup for the hosted-mode bar: the always-visible "not private" disclosure
+/// Markup for the hosted-mode bar: the always-visible privacy disclosure (with an inline install link)
 /// plus an Account popover with the access-key backup/restore, a "New ID"
 /// control to start over with a fresh identity, and the export-to-your-own-peer
 /// action. The access key is the per-user token, read from the shell-only
@@ -6769,7 +6769,7 @@ mod tests {
     #[tokio::test]
     async fn shell_page_hosted_mode_renders_proxy_chrome_bar() {
         // The hosted-mode "shell chrome" bar lives OUTSIDE the sandboxed iframe
-        // and carries the "not private" disclosure plus the Account popover
+        // and carries the privacy disclosure plus the Account popover
         // (access-key backup/restore + export-to-your-own-peer). It must render
         // in hosted mode and be ABSENT in non-hosted mode so a normal
         // single-user node is unaffected.
@@ -6793,8 +6793,13 @@ mod tests {
             .map(|(d, _)| d.trim())
             .expect("the bar's .nt disclosure must end 'for full privacy.'");
         assert!(
-            disclosure.starts_with("Encrypted on this server."),
+            disclosure.starts_with("Stored encrypted on this server."),
             "disclosure must lead with where the data lives: {disclosure}"
+        );
+        assert!(
+            disclosure.contains("https://freenet.org/quickstart/"),
+            "the install link must sit inside the disclosure, before \
+             'for full privacy.': {disclosure}"
         );
         assert!(
             hosted.contains("Access key") && hosted.contains("Restore from key"),
