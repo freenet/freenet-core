@@ -1061,6 +1061,43 @@ fn a_pipe_that_fails_after_sending_part_gives_up() {
     );
 }
 
+/// A pipe that opened, sent its first chunk and then stopped getting more from
+/// its source past the 5 s gap gives up. Its source is alive, so reading it again
+/// for UDP would put the first chunk on UDP under an id the receiver may hold.
+#[test]
+fn a_pipe_that_stalls_after_opening_gives_up() {
+    run(
+        "quic-send-pipe-stall-open",
+        74,
+        QuicPathLimits::DEFAULT,
+        |mut rig| async move {
+            let source = StreamHandle::new(StreamId::next(), 4000);
+            source
+                .push_fragment(1, bytes_of(FRAGMENT_PAYLOAD_SIZE))
+                .unwrap();
+            rig.e
+                .conn
+                .pipe_stream_to_remote(
+                    StreamId::next(),
+                    crate::transport::IncomingStream::from(source.clone()),
+                    None,
+                    None,
+                )
+                .await;
+            rig.path.settle(Duration::from_millis(200)).await;
+            assert!(
+                rig.path.peer_inbound().streams.try_recv().is_ok(),
+                "the stream reached the peer with its first chunk"
+            );
+            rig.path.settle(Duration::from_secs(7)).await;
+            rig.collect_tasks().await;
+            assert_eq!(rig.stats().send_count(SendKind::Pipe, R::Dropped), 1);
+            assert!(rig.udp_data().ids.is_empty(), "not read again for UDP");
+            drop(source);
+        },
+    );
+}
+
 /// The connection's own route, with no test override: a session whose path is up in
 /// shadow takes none of the connection's data. A short, a large message, a stream
 /// and a pipe all go on UDP, and the path counts no data send.
