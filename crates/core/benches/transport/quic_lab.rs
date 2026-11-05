@@ -32,9 +32,9 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use freenet::transport::quic_lab::{
-    Competitor, ConnSample, FRAGMENT_BYTES, LabConfig, LabController, LabPair, LabSocket, LinkSpec,
-    StreamsRun, link_report, set_controller, set_gap_on_connection_progress, set_min_window,
-    set_send_window, shape_port,
+    Competitor, ConnSample, FRAGMENT_BYTES, LabConfig, LabController, LabMany, LabPair, LabSocket,
+    LinkSpec, StreamsRun, link_report, set_controller, set_gap_on_connection_progress,
+    set_min_window, set_send_window, shape_port,
 };
 use freenet::transport::{TRANSPORT_METRICS, TransportKeypair, create_connection_handler};
 use tokio::sync::mpsc;
@@ -814,6 +814,262 @@ fn quic_lab_loss() {
              controller={controller} gap={gap_rule} send_window_kib={send_window_kib} min_window_kib={min_window_kib} rep={rep} {line}",
             stream_bytes / 1024,
             window / 1024,
+        );
+    }
+}
+
+/// `LAB_CONNS` UDP-transport connections from one sender socket to as many
+/// receivers, all over the same link spec: the sender's uplink is one model,
+/// so the connections share it.
+async fn udp_many(
+    n: usize,
+    link: LinkSpec,
+) -> (
+    Vec<mpsc::Sender<Vec<u8>>>,
+    mpsc::UnboundedReceiver<(usize, usize)>,
+    Vec<tokio::task::JoinHandle<()>>,
+    u16,
+) {
+    let free_port = || {
+        std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    };
+    let host = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    let a_port = free_port();
+    shape_port(a_port, link);
+    let (mut a_out, _a_in, _a_listener) = create_connection_handler::<LabSocket>(
+        TransportKeypair::new(),
+        host,
+        a_port,
+        false,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("bind a");
+    let (got_tx, got_rx) = mpsc::unbounded_channel();
+    let mut senders = Vec::new();
+    let mut tasks = Vec::new();
+    let mut keep_b = Vec::new();
+    for index in 0..n {
+        let b_port = free_port();
+        shape_port(b_port, link);
+        let b_keys = TransportKeypair::new();
+        let b_pub = b_keys.public().clone();
+        let (b_out, mut b_in, _b_listener) = create_connection_handler::<LabSocket>(
+            b_keys, host, b_port, true, None, None, None, None, None,
+        )
+        .await
+        .expect("bind b");
+        let connecting = a_out.connect(b_pub, SocketAddr::new(host, b_port)).await;
+        let (a_conn, b_conn) = tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::join!(connecting, b_in.next_connection())
+        })
+        .await
+        .expect("connect within 30 s");
+        let (mut a_conn, mut b_conn) = (a_conn.expect("a"), b_conn.expect("b accepts"));
+        let (send_tx, mut send_rx) = mpsc::channel::<Vec<u8>>(64);
+        tasks.push(tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    msg = send_rx.recv() => match msg {
+                        Some(msg) => { a_conn.send(msg).await.expect("send"); }
+                        None => break,
+                    },
+                    got = a_conn.recv() => if got.is_err() { break },
+                }
+            }
+        }));
+        let got_tx = got_tx.clone();
+        tasks.push(tokio::spawn(async move {
+            while let Ok(msg) = b_conn.recv().await {
+                if got_tx.send((index, msg.len())).is_err() {
+                    break;
+                }
+            }
+        }));
+        senders.push(send_tx);
+        keep_b.push((b_out, b_in));
+    }
+    tasks.push(tokio::spawn(async move {
+        let _keep = (a_out, _a_in, keep_b);
+        std::future::pending::<()>().await;
+    }));
+    (senders, got_rx, tasks, a_port)
+}
+
+/// Many connections from one node over one slow uplink: `LAB_CONNS` (20)
+/// connections, each sending `LAB_STREAMS` (1) messages of `LAB_STREAM_KIB`
+/// (256) at once, on the QUIC path (`LAB_TRANSPORT=quic`, with the
+/// controller and gap switches of [`quic_lab_loss`]) or the UDP transport.
+/// Link: `LAB_RATE_MBIT` (5), `LAB_DELAY_MS` (50) one way, `LAB_QUEUE_KIB`
+/// (32), `LAB_LOSS` (0). `LAB_COMPETITOR=1` runs the competing flow on the
+/// sender's uplink. One `LAB_MANY` line per repetition.
+///
+/// With `LAB_GAP=connection` the lab's acknowledgement clock is one per
+/// process, so a send's gap counts an acknowledgement on any of the
+/// connections: lenient against a per-connection rule.
+#[test]
+fn quic_lab_many() {
+    if !enabled("quic_lab_many") {
+        return;
+    }
+    let transport = std::env::var("LAB_TRANSPORT").unwrap_or_else(|_| "quic".into());
+    let conns: usize = env_or("LAB_CONNS", 20);
+    let per: usize = env_or("LAB_STREAMS", 1);
+    let stream_bytes = env_or("LAB_STREAM_KIB", 256usize) * 1024;
+    let window = env_or("LAB_WINDOW_KIB", 384u64) * 1024;
+    let loss: f64 = env_or("LAB_LOSS", 0.0);
+    let threads: usize = env_or("LAB_THREADS", 4);
+    let reps: usize = env_or("LAB_REPS", 3);
+    let rate_mbit: u64 = env_or("LAB_RATE_MBIT", 5);
+    let link = LinkSpec {
+        rate_bps: rate_mbit * 1_000_000,
+        one_way_delay: Duration::from_millis(env_or("LAB_DELAY_MS", 50)),
+        queue_bytes: env_or("LAB_QUEUE_KIB", 32usize) * 1024,
+        loss,
+        seed: env_or("LAB_SEED", 1),
+    };
+    let controller = std::env::var("LAB_CONTROLLER").unwrap_or_else(|_| "cubic".into());
+    set_controller(match controller.as_str() {
+        "cubic" => LabController::Cubic,
+        "bbr" => LabController::Bbr,
+        "veno" => LabController::Veno,
+        other => panic!("unknown controller {other}"),
+    });
+    let gap_rule = std::env::var("LAB_GAP").unwrap_or_else(|_| "stream".into());
+    set_gap_on_connection_progress(gap_rule == "connection");
+    let min_window_kib: u64 = env_or("LAB_MIN_WINDOW_KIB", 0);
+    set_min_window((min_window_kib > 0).then_some(min_window_kib * 1024));
+    let competitor = std::env::var("LAB_COMPETITOR").as_deref() == Ok("1");
+    let limit = Duration::from_secs(env_or("LAB_LIMIT_S", 400));
+    for rep in 0..reps {
+        let rt = runtime(threads);
+        let line = rt.block_on(async {
+            // `elapsed` runs to the last delivery, and the competing flow's
+            // bytes are read then, so a wait for messages that never come
+            // does not count.
+            let (sent, last, outcomes, received, elapsed, port, comp, comp_bytes) =
+                match transport.as_str() {
+                    "quic" => {
+                        let mut many = LabMany::connect(
+                            LabConfig {
+                                window_bytes: window,
+                                bandwidth_limit: None,
+                                link: Some(link),
+                            },
+                            conns,
+                        )
+                        .await;
+                        let comp = competitor
+                            .then(|| many.sender_port().and_then(Competitor::start))
+                            .flatten();
+                        let run = many.send_all(per, stream_bytes, limit).await;
+                        let comp_bytes = comp.as_ref().map(Competitor::delivered);
+                        (
+                            run.sent,
+                            run.last_returned,
+                            format!("{:?}", run.outcomes),
+                            run.received,
+                            run.elapsed,
+                            many.sender_port(),
+                            comp,
+                            comp_bytes,
+                        )
+                    }
+                    "udp" => {
+                        let (senders, mut got, _tasks, a_port) = udp_many(conns, link).await;
+                        let comp = competitor.then(|| Competitor::start(a_port)).flatten();
+                        let start = Instant::now();
+                        for sender in &senders {
+                            for _ in 0..per {
+                                sender
+                                    .send(vec![0x5Au8; stream_bytes])
+                                    .await
+                                    .expect("driver runs");
+                            }
+                        }
+                        let mut sent = vec![0usize; conns];
+                        let mut last = vec![Duration::ZERO; conns];
+                        let mut received = 0;
+                        let mut active = Duration::ZERO;
+                        let mut comp_bytes = comp.as_ref().map(|_| 0);
+                        while received < conns * per && start.elapsed() < limit {
+                            match tokio::time::timeout(Duration::from_secs(120), got.recv()).await {
+                                Ok(Some((index, _))) => {
+                                    sent[index] += 1;
+                                    last[index] = start.elapsed();
+                                    active = start.elapsed();
+                                    comp_bytes = comp.as_ref().map(Competitor::delivered);
+                                    received += 1;
+                                }
+                                Ok(None) | Err(_) => break,
+                            }
+                        }
+                        (
+                            sent,
+                            last,
+                            String::new(),
+                            received,
+                            active,
+                            Some(a_port),
+                            comp,
+                            comp_bytes,
+                        )
+                    }
+                    other => panic!("unknown transport {other}"),
+                };
+            let total = conns * per;
+            let delivered: usize = sent.iter().sum();
+            let complete = sent.iter().filter(|s| **s == per).count();
+            let mut done: Vec<f64> = last
+                .iter()
+                .zip(&sent)
+                .filter(|(_, s)| **s == per)
+                .map(|(t, _)| t.as_secs_f64())
+                .collect();
+            done.sort_by(f64::total_cmp);
+            let pick = |p: f64| {
+                if done.is_empty() {
+                    f64::NAN
+                } else {
+                    done[((done.len() - 1) as f64 * p).round() as usize]
+                }
+            };
+            let comp_line = comp.as_ref().map_or(String::new(), |c| {
+                format!(
+                    "competitor_bytes_per_s={:.0} {} ",
+                    comp_bytes.unwrap_or(0) as f64 / elapsed.as_secs_f64().max(0.001),
+                    c.report()
+                )
+            });
+            let link_line = port
+                .and_then(link_report)
+                .map_or(String::new(), |l| format!("sender_link[{l}]"));
+            format!(
+                "delivered={delivered}/{total} connections_complete={complete}/{conns} \
+                 conn_done_s_p50={:.1} conn_done_s_max={:.1} received={received} elapsed_s={:.1} \
+                 outcomes={outcomes} {comp_line}{link_line}",
+                pick(0.5),
+                pick(1.0),
+                elapsed.as_secs_f64(),
+            )
+        });
+        rt.shutdown_timeout(Duration::from_secs(1));
+        println!(
+            "LAB_MANY transport={transport} controller={controller} gap={gap_rule} \
+             min_window_kib={min_window_kib} conns={conns} per={per} stream_kib={} \
+             window_kib={} rate_mbit={rate_mbit} queue_kib={} loss={loss} competitor={competitor} \
+             rep={rep} {line}",
+            stream_bytes / 1024,
+            window / 1024,
+            link.queue_bytes / 1024,
         );
     }
 }
