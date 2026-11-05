@@ -1330,9 +1330,16 @@ gap at offset 0 of each stream (quinn keeps a whole datagram per STREAM
 frame until its assembler compacts), and `QUIC_ACK_TAIL_BYTES` (240 KiB, the
 acknowledgement-only packets tracked after the last ack-eliciting send, up
 to quinn-proto's cap of 1000; M2 must re-check this term against
-quinn-proto's behaviour). Not measured: datagram sizes other than 1200 B,
-quinn's endpoint-to-connection datagram queue, send-side packet records and
-the buffers behind sent data, allocators other than jemalloc, CRYPTO-frame
+quinn-proto's behaviour). The send side, measured with 0 to 10% loss both
+ways on a 100 ms round trip and the link cut mid-transfer:
+`QUIC_SEND_HOLD_WINDOW_PERCENT` (150% of W), `QUIC_SEND_SETTLED_BYTES`
+(44 KiB, also what a sender keeps above idle after its sends end) and
+`QUIC_SEND_HOLD_PER_STREAM_BYTES` (4 KiB per open uni stream); a full short
+queue adds its messages (256 queued plus 64 in flight, 1280 B each in
+jemalloc). Not measured: datagram sizes other than 1200 B,
+quinn's endpoint-to-connection datagram queue, send-side round trips other
+than 100 ms and acknowledgement patterns other than random loss and a cut,
+allocators other than jemalloc, CRYPTO-frame
 reassembly (quinn-proto's second assembler, `crypto_buffer_size` 16 KiB), and arrival
 orders other than a single gap at offset 0. Some quinn terms depend on
 traffic rate and time rather than configuration, as the UDP transport's
