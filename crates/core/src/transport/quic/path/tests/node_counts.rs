@@ -75,8 +75,8 @@ fn a_paths_sends_and_receives_reach_the_node() {
         assert!(keys["quic_bytes_sent"] > 0);
         assert!(keys["quic_bytes_received"] > 0);
         assert_eq!(
-            keys["quic_streams_open_paths_sampled"], 2,
-            "both ends read streams"
+            keys["quic_streams_open_paths_sampled"], 1,
+            "only b read streams"
         );
     });
 }

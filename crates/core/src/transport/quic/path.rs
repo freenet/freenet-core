@@ -121,10 +121,11 @@
 //! - Dedup. A message goes on UDP only when the outcome proves the receiver
 //!   cannot deliver it ([`route`]), so a Short needs none. A stream id on both
 //!   paths is refused where both transports meet (`completed_inbound_streams`).
-//! - Exporting the QUIC-specific counters. They are per path
-//!   ([`QuicPath::stats`]); the refusals and evictions the UDP transport also
-//!   has are counted in `TRANSPORT_METRICS` as well, under the same
-//!   `InboundStreamOutcome` labels. Telemetry for the rest is e2/e5.
+//!
+//! Counts: per path ([`QuicPath::stats`]), and node-wide in the same step, in
+//! `metrics::quic_data` (exported as `quic_data_*`, `quic_inbound_*` and the
+//! rest listed there). The refusals and evictions the UDP transport also has are
+//! also counted under the shared `InboundStreamOutcome` labels.
 //!
 //! [`MAX_UNI_STREAMS`]: super::config::MAX_UNI_STREAMS
 //! [`StreamHandle`]: crate::transport::peer_connection::streaming::StreamHandle
