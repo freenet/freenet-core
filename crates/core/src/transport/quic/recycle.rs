@@ -407,8 +407,18 @@ impl Controller for CappedCubic {
         }
     }
 
+    /// Cubic's metrics, with the window this controller gives quinn (the
+    /// capped one) in place of Cubic's own.
     fn metrics(&self) -> ControllerMetrics {
-        self.inner.metrics()
+        let mut metrics = self.inner.metrics();
+        // Cubic's `congestion_window` is its window; lower it as `window`
+        // does, without asking Cubic again.
+        if let (Some(rate), Some(srtt)) = (self.rate.rate(), self.srtt) {
+            metrics.congestion_window = metrics
+                .congestion_window
+                .min(rate_window(rate, srtt, self.mtu));
+        }
+        metrics
     }
 
     fn clone_box(&self) -> Box<dyn Controller> {
