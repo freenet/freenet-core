@@ -946,6 +946,10 @@ struct LossCounters {
     /// credit (#6100), each counted once until a resend is next admitted on
     /// that connection. Skipped tail-loss probes are not counted.
     retransmits_deferred: AtomicU64,
+    /// Packets abandoned because a resend of them waited `MAX_CREDIT_WAIT`
+    /// for retransmission credit (#6100); also counted in
+    /// `packets_abandoned`.
+    packets_abandoned_credit_wait: AtomicU64,
     /// Standalone ack-only `NoOp` packets sent, and their on-wire bytes.
     standalone_ack_packets: AtomicU64,
     standalone_ack_bytes: AtomicU64,
@@ -1289,6 +1293,13 @@ impl TransportMetrics {
     /// A tail-loss probe fired on an established connection.
     pub(crate) fn record_tlp_probe(&self) {
         self.loss.tlp_probes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A packet was abandoned after waiting too long for credit (#6100).
+    pub(crate) fn record_packet_abandoned_credit_wait(&self) {
+        self.loss
+            .packets_abandoned_credit_wait
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// A due retransmission was held back for lack of credit (#6100).
@@ -2503,6 +2514,7 @@ impl TransportMetrics {
             rto_expiries: get64(&l.rto_expiries),
             tlp_probes: get64(&l.tlp_probes),
             retransmits_deferred: get64(&l.retransmits_deferred),
+            packets_abandoned_credit_wait: get64(&l.packets_abandoned_credit_wait),
             standalone_ack_packets: get64(&l.standalone_ack_packets),
             standalone_ack_bytes: get64(&l.standalone_ack_bytes),
             nat_fail_no_response: get32(&d.no_response),
@@ -3054,6 +3066,10 @@ pub struct TransportSnapshot {
     /// credit (#6100), each counted once until a resend is next admitted on
     /// that connection. Skipped tail-loss probes are not counted.
     pub retransmits_deferred: u64,
+    /// Packets abandoned because a resend of them waited `MAX_CREDIT_WAIT`
+    /// for retransmission credit (#6100); also counted in
+    /// `packets_abandoned`.
+    pub packets_abandoned_credit_wait: u64,
     /// Standalone ack-only `NoOp` packets sent, and their on-wire bytes.
     pub standalone_ack_packets: u64,
     pub standalone_ack_bytes: u64,
@@ -3452,6 +3468,7 @@ impl TransportSnapshot {
             rto_expiries,
             tlp_probes,
             retransmits_deferred,
+            packets_abandoned_credit_wait,
             standalone_ack_packets,
             standalone_ack_bytes,
             nat_fail_no_response,
@@ -3591,6 +3608,7 @@ impl TransportSnapshot {
         self.rto_expiries = rto_expiries;
         self.tlp_probes = tlp_probes;
         self.retransmits_deferred = retransmits_deferred;
+        self.packets_abandoned_credit_wait = packets_abandoned_credit_wait;
         self.standalone_ack_packets = standalone_ack_packets;
         self.standalone_ack_bytes = standalone_ack_bytes;
         self.nat_fail_no_response = nat_fail_no_response;
@@ -3753,6 +3771,10 @@ struct SnapshotExtras {
     /// credit (#6100), each counted once until a resend is next admitted on
     /// that connection. Skipped tail-loss probes are not counted.
     pub retransmits_deferred: u64,
+    /// Packets abandoned because a resend of them waited `MAX_CREDIT_WAIT`
+    /// for retransmission credit (#6100); also counted in
+    /// `packets_abandoned`.
+    pub packets_abandoned_credit_wait: u64,
     /// Standalone ack-only `NoOp` packets sent, and their on-wire bytes.
     pub standalone_ack_packets: u64,
     pub standalone_ack_bytes: u64,
@@ -3986,6 +4008,7 @@ impl SnapshotExtras {
             || self.rto_expiries != 0
             || self.tlp_probes != 0
             || self.retransmits_deferred != 0
+            || self.packets_abandoned_credit_wait != 0
             || self.standalone_ack_packets != 0
             || self.nat_fail_no_response != 0
             || self.nat_fail_undecryptable != 0
@@ -4750,6 +4773,10 @@ mod tests {
         metrics.record_rto_expiry();
         metrics.record_rto_expiry();
         metrics.record_tlp_probe();
+        metrics.record_retransmit_deferred();
+        metrics.record_retransmit_deferred();
+        metrics.record_retransmit_deferred();
+        metrics.record_packet_abandoned_credit_wait();
         metrics.record_retransmission_sent();
         metrics.record_retransmission_sent();
         metrics.record_retransmission_sent();
@@ -4762,6 +4789,8 @@ mod tests {
             .expect("loss events alone must produce a snapshot");
         assert_eq!(snap.rto_expiries, 2);
         assert_eq!(snap.tlp_probes, 1);
+        assert_eq!(snap.retransmits_deferred, 3);
+        assert_eq!(snap.packets_abandoned_credit_wait, 1);
         assert_eq!(snap.packets_retransmitted, 3);
         assert_eq!(snap.packets_abandoned, 1);
         assert_eq!(snap.standalone_ack_packets, 2);
@@ -6233,6 +6262,7 @@ mod tests {
             "rto_expiries",
             "tlp_probes",
             "retransmits_deferred",
+            "packets_abandoned_credit_wait",
             "standalone_ack_packets",
             "standalone_ack_bytes",
             "conn_rtt_connections",

@@ -347,7 +347,8 @@ async fn run_reverse_loss(
             }
         }
     }
-    // Idle 30 s with both loops running, then sample what is still in flight.
+    // Idle `IDLE_SECS` with both loops running, then sample what is still in
+    // flight.
     let mut idle = vt.sleep(Duration::from_secs(IDLE_SECS));
     loop {
         tokio::select! {
