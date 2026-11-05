@@ -1053,3 +1053,37 @@ impl LabMany {
         }
     }
 }
+
+impl LabPair {
+    /// Send one message of each size in `sizes` at once, each from its own
+    /// task, under the node's deadlines. Returns each send's outcome,
+    /// `Debug`-rendered, and when it returned (`Sent` means every byte
+    /// acknowledged), in `sizes` order. The receiver's assembly counts are
+    /// left in its channel.
+    pub async fn send_batch(&self, sizes: &[usize]) -> Vec<(String, Duration)> {
+        let start = Instant::now();
+        let mut sends = Vec::new();
+        for &len in sizes {
+            let (a, time) = (self.a.clone(), self.time.clone());
+            sends.push(tokio::spawn(async move {
+                let body = Bytes::from(vec![0xA5u8; len]);
+                let outcome = a
+                    .send_stream_bounded(
+                        &time,
+                        SendDeadlines::stream(len as u64),
+                        StreamId::next(),
+                        None,
+                        body,
+                        None,
+                    )
+                    .await;
+                (format!("{outcome:?}"), start.elapsed())
+            }));
+        }
+        let mut out = Vec::new();
+        for send in sends {
+            out.push(send.await.expect("the send ran"));
+        }
+        out
+    }
+}
