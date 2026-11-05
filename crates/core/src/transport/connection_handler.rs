@@ -317,7 +317,7 @@ pub(super) async fn bind_udp_listener<S: Socket>(
     });
 
     if let (Some(_), Some(settings)) = (&quic_endpoint, &quic_settings) {
-        super::TRANSPORT_METRICS.set_quic_window_bytes(settings.window_bytes());
+        super::TRANSPORT_METRICS.set_quic_flow_control_window_bytes(settings.window_bytes());
     }
     #[cfg(any(test, feature = "testing"))]
     if let Some(endpoint) = &quic_endpoint {

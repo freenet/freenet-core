@@ -28,14 +28,16 @@ use crate::transport::packet_data::MAX_RECV_PACKET_SIZE;
 const MTU: u16 = 1200;
 
 #[test]
-fn the_rate_window_is_rate_times_srtt_with_a_floor_of_two_datagrams() {
+fn the_rate_window_is_rate_times_srtt_with_a_floor_that_admits_two_datagrams() {
     assert_eq!(
         rate_window(1_000_000, Duration::from_millis(50), MTU),
         50_000
     );
     assert_eq!(rate_window(400_000, Duration::from_millis(40), MTU), 16_000);
-    assert_eq!(rate_window(1_000, Duration::from_millis(10), MTU), 2400);
-    assert_eq!(rate_window(0, Duration::from_secs(1), MTU), 2400);
+    // quinn refuses a send at `in_flight + bytes >= window`, so two full
+    // datagrams need one byte more than their size.
+    assert_eq!(rate_window(1_000, Duration::from_millis(10), MTU), 2401);
+    assert_eq!(rate_window(0, Duration::from_secs(1), MTU), 2401);
     assert_eq!(
         rate_window(u64::MAX, Duration::from_secs(3600), MTU),
         u64::MAX
@@ -110,6 +112,43 @@ fn with_no_limit_the_window_is_cubics() {
         fresh.window(),
         fresh.inner.window(),
         "no RTT sample yet: Cubic's window"
+    );
+}
+
+/// While the cap binds, Cubic does not grow behind it: after a transfer held
+/// to the cap its window is still the initial one, where the same transfer
+/// with no limit grows it. Then, with the cap lifted above the path, a loss
+/// takes the window below where it started at once, so the path backs off.
+/// Before the fix Cubic grew on every acknowledgement while capped, and one
+/// loss left the window far above the start.
+#[test]
+fn cubic_does_not_grow_behind_the_cap_and_still_backs_off() {
+    let initial = Arc::new(quinn::congestion::CubicConfig::default())
+        .build(Instant::now(), MTU)
+        .initial_window();
+    let (_, uncapped) = after_a_transfer(QuicRateLimit::default());
+    assert!(
+        uncapped > initial,
+        "a free transfer grows Cubic: {uncapped}"
+    );
+
+    let (controller, cubic) = after_a_transfer(QuicRateLimit::new(Some(100_000), None));
+    assert_eq!(cubic, initial, "Cubic stayed where it was while capped");
+
+    let mut capped = controller
+        .into_any()
+        .downcast::<CappedCubic>()
+        .expect("the CappedCubic");
+    // The capacity is now below the cap: a far higher rate, a real RTT.
+    capped.rate = QuicRateLimit::new(Some(usize::MAX / 2), None);
+    capped.srtt = Some(Duration::from_millis(40));
+    assert_eq!(capped.window(), initial);
+    let now = Instant::now();
+    capped.on_congestion_event(now, now, false, u64::from(MTU));
+    assert!(
+        capped.window() < initial,
+        "one loss backs off: {} vs {initial}",
+        capped.window()
     );
 }
 
@@ -195,8 +234,9 @@ impl Socket for Delayed {
     }
 }
 
-/// Two endpoints on one `VirtualTime`, 20 ms apart each way, `a` sending
-/// with `rate` and an egress cap of `a_cap`. Unregisters on drop.
+/// Two endpoints on one `VirtualTime`, [`ONE_WAY`] apart each way unless
+/// given, `a` sending with `rate` and an egress cap of `a_cap`. Unregisters
+/// on drop.
 struct Link {
     network: String,
     time: VirtualTime,
@@ -215,6 +255,25 @@ const ONE_WAY: Duration = Duration::from_millis(20);
 
 impl Link {
     async fn new(network: &str, subnet: u8, rate: QuicRateLimit, a_cap: Option<u64>) -> Self {
+        Self::with(
+            network,
+            subnet,
+            [rate, QuicRateLimit::default()],
+            a_cap,
+            ONE_WAY,
+        )
+        .await
+    }
+
+    /// [`Self::new`] with `rates` for `a` and `b`, and `one_way` of delay.
+    async fn with(
+        network: &str,
+        subnet: u8,
+        rates: [QuicRateLimit; 2],
+        a_cap: Option<u64>,
+        one_way: Duration,
+    ) -> Self {
+        let [a_rate, b_rate] = rates;
         let a_addr: SocketAddr = format!("10.207.{subnet}.1:5000").parse().unwrap();
         let b_addr: SocketAddr = format!("10.207.{subnet}.2:5000").parse().unwrap();
         let time = VirtualTime::new();
@@ -230,7 +289,7 @@ impl Link {
                     Delayed {
                         inner,
                         time,
-                        delay: ONE_WAY,
+                        delay: one_way,
                         sent,
                     },
                     cap,
@@ -255,7 +314,7 @@ impl Link {
             a_socket.clone(),
             a_addr,
             time.clone(),
-            &settings(rate),
+            &settings(a_rate),
             &a_keys,
         )
         .expect("endpoint a");
@@ -263,7 +322,7 @@ impl Link {
             b_socket.clone(),
             b_addr,
             time.clone(),
-            &settings(QuicRateLimit::default()),
+            &settings(b_rate),
             &b_keys,
         )
         .expect("endpoint b");
@@ -292,6 +351,11 @@ impl Link {
     /// Connect and send `len` bytes on one stream from `a`. Returns the
     /// virtual time from the connection being up to `b` having read it all.
     async fn send(&self, len: usize, limit: Duration) -> Duration {
+        self.send_from(true, len, limit).await
+    }
+
+    /// [`Self::send`], from `a` to `b` when `from_a`, else from `b` to `a`.
+    async fn send_from(&self, from_a: bool, len: usize, limit: Duration) -> Duration {
         let _permit = self
             .b
             .allow_peer(self.a_addr, self.a_keys.public())
@@ -305,14 +369,19 @@ impl Link {
             });
             let (client, server) = (client.expect("client"), server.expect("server"));
             let start = time.now_nanos();
-            let mut send = client.inner().open_uni().await.expect("open");
+            let (sender, receiver) = if from_a {
+                (client.inner().clone(), server.inner().clone())
+            } else {
+                (server.inner().clone(), client.inner().clone())
+            };
+            let mut send = sender.open_uni().await.expect("open");
             let (_, read) = tokio::join!(
                 async {
                     send.write_all(&vec![7u8; len]).await.expect("write");
                     send.finish().expect("finish");
                 },
                 async {
-                    let mut recv = server.inner().accept_uni().await.expect("accept");
+                    let mut recv = receiver.accept_uni().await.expect("accept");
                     recv.read_to_end(len + 1).await.expect("read")
                 }
             );
@@ -360,12 +429,52 @@ fn a_path_under_a_bandwidth_limit_keeps_to_it() {
     })
 }
 
-/// Under a node-wide egress cap, a QUIC path (capped at its fair share) and a
-/// sender that takes from the cap as the UDP transport's stream senders do
-/// both finish, neither waits past a stream's 5 s gap deadline, and
-/// everything the node sends stays within the cap.
+/// Where `rate x RTT` is under the floor, a path keeps two datagrams in
+/// flight, in both directions: about two datagrams per round trip, well above
+/// the limit (the documented limit of the cap). With a floor of exactly two
+/// datagrams quinn would admit one, and each would wait for the peer's
+/// delayed acknowledgement, about 1200 B per RTT + 25 ms.
 #[test]
-fn a_quic_path_and_udp_streams_share_an_egress_cap() {
+fn the_floor_keeps_two_datagrams_in_flight_both_ways() {
+    bounded(|| async move {
+        const LIMIT: usize = 100_000;
+        const LEN: usize = 400_000;
+        const ONE_WAY_SHORT: Duration = Duration::from_millis(2);
+        let two_per_rtt = 2.0 * f64::from(MTU) / (2.0 * ONE_WAY_SHORT.as_secs_f64());
+        for (subnet, from_a) in [(5, true), (6, false)] {
+            let rate = || QuicRateLimit::new(Some(LIMIT), None);
+            let link = Link::with(
+                &format!("quic-cap-floor-{subnet}"),
+                subnet,
+                [rate(), rate()],
+                None,
+                ONE_WAY_SHORT,
+            )
+            .await;
+            let elapsed = link.send_from(from_a, LEN, Duration::from_secs(60)).await;
+            let achieved = LEN as f64 / elapsed.as_secs_f64();
+            assert!(
+                achieved >= 0.7 * two_per_rtt && achieved <= 1.3 * two_per_rtt,
+                "from a {from_a}: {achieved:.0} B/s, two datagrams per round trip is \
+                 {two_per_rtt:.0} B/s"
+            );
+        }
+    })
+}
+
+/// A no-starvation check. Under a node-wide egress cap, a QUIC path and a
+/// sender that takes from the cap as the UDP transport's stream senders do
+/// both finish, no UDP fragment waits past a stream's 5 s gap deadline, and
+/// everything the node sends stays within the cap.
+///
+/// It does not show the QUIC path keeping to its fair share, because it does
+/// not: the cap's holds add to the RTT quinn measures, and the window cap is
+/// `rate x RTT`, so it loosens as the egress cap binds. Measured here: the
+/// QUIC path ran at about 390 kB/s against a share of 250 kB/s, and at about
+/// 400 kB/s with the window cap removed. The egress cap is what holds the
+/// node's total, and this test checks that it does.
+#[test]
+fn a_quic_path_and_udp_streams_both_progress_under_an_egress_cap() {
     use crate::transport::egress_cap::{PACED_WAIT_DEADLINE, try_take};
     bounded(|| async move {
         const CAP: u64 = 500_000;
@@ -506,7 +615,7 @@ fn the_transport_gives_the_endpoint_its_bandwidth_settings() {
     );
     assert!(
         body.contains(
-            "if let(Some(_),Some(settings))=(&quic_endpoint,&quic_settings){super::TRANSPORT_METRICS.set_quic_window_bytes(settings.window_bytes());}"
+            "if let(Some(_),Some(settings))=(&quic_endpoint,&quic_settings){super::TRANSPORT_METRICS.set_quic_flow_control_window_bytes(settings.window_bytes());}"
                 .replace(' ', "")
                 .as_str()
         ),

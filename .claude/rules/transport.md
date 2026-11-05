@@ -742,17 +742,35 @@ Rate calculation on every rate update (peer_connection::paced_rate; #6047):
   retransmits are unpaced.
   QUIC has no bucket. The same rate (QuicRateLimit::rate, which calls
   paced_rate) caps each QUIC connection's congestion window instead:
-  recycle::CappedCubic::window = min(Cubic's window, rate x smoothed RTT),
-  never below two datagrams (2400 B), and Cubic's window with no limit or
-  before the first RTT sample. quinn's pacer and in-flight limit both read the
-  window, so a path averages about the rate (a_path_under_a_bandwidth_limit_
-  keeps_to_it: within 10% at 400 kB/s over a 40 ms round trip). It covers
-  everything the path sends, shorts and control frames included. It does not
-  hold where rate x RTT is under two datagrams: there a path can send two
-  datagrams per round trip, about 2400 B / RTT (at the 64 KiB/s floor, any
-  round trip under about 37 ms). The transport sets the rate when it binds
-  (bind_udp_listener, pinned by the_transport_gives_the_endpoint_its_
-  bandwidth_settings); QuicSettings from the config carries none.
+  recycle::CappedCubic::window = min(Cubic's window, rate x RTT), never
+  below window_floor (two full datagrams and one byte, 2401 B: quinn refuses
+  a send at in_flight + bytes >= window, so 2400 would admit one datagram, and
+  a lone packet waits for the peer's 25 ms delayed ack). With no limit, or
+  before the first acknowledgement, it is Cubic's window; for the first batch
+  of acknowledgements the RTT is still quinn's 333 ms initial estimate, so the
+  cap is loose for that batch. quinn's in-flight limit reads the window, which
+  holds a path to about the rate (a_path_under_a_bandwidth_limit_keeps_to_it:
+  within 10% at 400 kB/s over a 40 ms round trip); the pacer only spreads the
+  sends. While the cap is below Cubic's window, on_ack reports the path as
+  app-limited to Cubic, so Cubic does not grow behind the cap and still backs
+  off on loss once the cap rises above the capacity (RFC 7661 idea). It
+  covers everything the path sends, shorts and control frames included. It
+  does not hold where rate x RTT is under the floor: there a path keeps two
+  datagrams in flight, about 2400 B per round trip (at the 64 KiB/s minimum,
+  any round trip under about 37 ms; pinned by
+  the_floor_keeps_two_datagrams_in_flight_both_ways). A QUIC path is not a
+  connection to GlobalBandwidthManager: it rides on its UDP connection and
+  takes that connection's full share, so a peer whose traffic is split across
+  both transports can get up to twice its share (the egress cap still bounds
+  the node). e5b-6 decides whether one peer's streams stay on one transport.
+  Under a binding egress cap the window cap does not hold a path to its
+  share either: the cap's holds add to quinn's RTT samples, and rate x RTT
+  grows with them (a_quic_path_and_udp_streams_both_progress_under_an_
+  egress_cap measured about 390 kB/s against a 250 kB/s share, 400 kB/s with
+  no window cap). The egress cap still holds the node's total.
+  The transport sets the rate when it binds (bind_udp_listener, pinned by
+  the_transport_gives_the_endpoint_its_bandwidth_settings); QuicSettings
+  from the config carries none.
 
 Token reservation:
   → Reserve BEFORE sending
@@ -1141,7 +1159,7 @@ snapshot except the two gauges.
   `PathGauge` guard inside the attempt, so dropping the attempt leaves the gauge.
   `quic_paths_active` is also in `resource_utilization` beside
   `memory_rss_bytes`.
-  `quic_window_bytes`: the flow-control window of this node's QUIC
+  `quic_flow_control_window_bytes`: the flow-control window of this node's QUIC
   connections (per connection and direction), set when the endpoint is built,
   0 without one; a state, not reset and not activity. Throughput by window
   size shows whether nodes at the 128 KiB floor are slower on QUIC than on UDP.

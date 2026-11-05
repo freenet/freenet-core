@@ -112,11 +112,23 @@
 //! `bandwidth-limit` and the fair share under `total-bandwidth-limit` pace
 //! the UDP transport's streams through each connection's token bucket, which
 //! QUIC does not use. So [`CappedCubic::window`] returns Cubic's window,
-//! lowered to `rate x smoothed RTT` with a floor of two datagrams, where
+//! lowered to `rate x RTT` with a floor that admits two full datagrams, where
 //! `rate` follows the UDP rule (`QuicRateLimit`, which reuses
-//! `peer_connection::paced_rate`). quinn's pacer and its in-flight limit both
-//! read this window, so a path's sending rate averages about `rate`. With no
-//! limit configured, or before the first RTT sample, the window is Cubic's.
+//! `peer_connection::paced_rate`). quinn holds the bytes in flight under this
+//! window, which is what keeps a path's rate to about `rate`; its pacer reads
+//! the same window and only spreads the sends. With no limit configured, or
+//! before the first acknowledgement, the window is Cubic's. The RTT is the
+//! latest quinn reports to `on_ack`, which for the first batch of
+//! acknowledgements is still quinn's initial estimate (333 ms,
+//! `config::transport_config`), so the cap is loose for that one batch.
+//!
+//! While the cap binds, a send it holds back counts in quinn as blocked by
+//! congestion, not limited by the application, so Cubic would keep growing on
+//! every acknowledgement and stop answering loss once the cap later sat above
+//! the real capacity. So `on_ack` tells Cubic the path is limited whenever the
+//! cap is below Cubic's window (the idea of RFC 7661), and Cubic's window stays
+//! where it was.
+//!
 //! The limit covers everything the path sends, short messages and control
 //! frames included, where the UDP bucket paces only stream fragments.
 //!
@@ -247,14 +259,22 @@ impl ControllerFactory for CappedCubicFactory {
     }
 }
 
-/// The window [`CappedCubic`] allows at `rate` bytes per second over a
-/// smoothed RTT of `srtt`: `rate x srtt`, and never less than two datagrams
-/// of `mtu`, so a slow path still makes progress.
+/// The window [`CappedCubic`] allows at `rate` bytes per second over an RTT
+/// of `srtt`: `rate x srtt`, and never less than [`window_floor`], so a slow
+/// path still keeps two datagrams in flight.
 pub(crate) fn rate_window(rate: u64, srtt: Duration, mtu: u16) -> u64 {
     let bytes = u128::from(rate) * srtt.as_nanos() / 1_000_000_000;
     u64::try_from(bytes)
         .unwrap_or(u64::MAX)
-        .max(2 * u64::from(mtu))
+        .max(window_floor(mtu))
+}
+
+/// The smallest capped window: two full datagrams of `mtu` and one byte.
+/// quinn refuses a send when `in_flight + bytes >= window`, so a window of
+/// exactly two datagrams admits only one, and a lone packet then waits for
+/// the peer's delayed acknowledgement.
+pub(crate) fn window_floor(mtu: u16) -> u64 {
+    2 * u64::from(mtu) + 1
 }
 
 /// What [`CappedCubic`] records, under one lock so a reader sees one
@@ -331,7 +351,15 @@ impl Controller for CappedCubic {
     ) {
         self.state.lock().acked += 1;
         self.srtt = Some(rtt.get());
-        self.inner.on_ack(now, sent, bytes, app_limited, rtt);
+        // A send the cap holds back is not Cubic's doing: while the cap is
+        // below Cubic's window, do not let Cubic grow (see the module docs).
+        // Without a limit nothing more is asked of Cubic.
+        let capped = match self.rate.rate() {
+            Some(rate) => rate_window(rate, rtt.get(), self.mtu) < self.inner.window(),
+            None => false,
+        };
+        self.inner
+            .on_ack(now, sent, bytes, app_limited || capped, rtt);
     }
 
     fn on_end_acks(
