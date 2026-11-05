@@ -3277,6 +3277,12 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                 if fragment_number == 1 {
                     self.note_udp_data("a stream");
                 }
+                #[cfg(any(test, feature = "testing"))]
+                if u64::from(fragment_number)
+                    == total_length_bytes.div_ceil(streaming_buffer::FRAGMENT_PAYLOAD_SIZE as u64)
+                {
+                    self.note_udp_data("the last fragment of a stream");
+                }
                 let now_nanos = self.time_source.now_nanos();
                 if stream_id.is_caller_named() {
                     let accepted = self.process_operations_fragment(

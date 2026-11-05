@@ -99,11 +99,20 @@ pub struct QuicPathRecord {
     pub totals: QuicPathTotals,
 }
 
+/// A path a node built: node, peer, session, when, and its counters.
+struct BuiltPath {
+    node: SocketAddr,
+    peer: SocketAddr,
+    session: u64,
+    built_at: Duration,
+    stats: Arc<QuicPathStats>,
+}
+
 #[derive(Default)]
 struct TraceData {
     records: Mutex<Vec<QuicUpgradeRecord>>,
     /// Every path built, with its counters, which outlive it.
-    paths: Mutex<Vec<(SocketAddr, SocketAddr, u64, Duration, Arc<QuicPathStats>)>>,
+    paths: Mutex<Vec<BuiltPath>>,
     wrong_record: Mutex<BTreeSet<SocketAddr>>,
     down_at: Mutex<BTreeMap<SocketAddr, Duration>>,
     permits: Mutex<BTreeMap<SocketAddr, QuicPathPermits>>,
@@ -140,12 +149,12 @@ impl QuicUpgradeTrace {
             .paths
             .lock()
             .iter()
-            .map(|(node, peer, session, built_at, stats)| QuicPathRecord {
-                node: *node,
-                peer: *peer,
-                session: *session,
-                built_at: *built_at,
-                totals: QuicPathTotals::of(stats),
+            .map(|built| QuicPathRecord {
+                node: built.node,
+                peer: built.peer,
+                session: built.session,
+                built_at: built.built_at,
+                totals: QuicPathTotals::of(&built.stats),
             })
             .collect()
     }
@@ -285,11 +294,13 @@ impl NodeTrace {
     /// [`QuicUpgradeTrace::paths`].
     pub(crate) fn path_built(&self, peer: SocketAddr, session: u64, stats: Arc<QuicPathStats>) {
         let at = self.trace.now();
-        self.trace
-            .data
-            .paths
-            .lock()
-            .push((self.addr, peer, session, at, stats));
+        self.trace.data.paths.lock().push(BuiltPath {
+            node: self.addr,
+            peer,
+            session,
+            built_at: at,
+            stats,
+        });
     }
 
     /// The version the machine reads for a peer that reports `reported`.
