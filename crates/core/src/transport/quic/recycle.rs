@@ -800,11 +800,13 @@ pub(crate) async fn watch_acknowledgements<T: TimeSource>(
     };
     let mut received = first.received;
     let mut watch = AckWatch::new(ACK_WATCH_WINDOW, first);
+    let mut bytes = UdpBytes::of(&connection);
     loop {
         time.sleep(ACK_WATCH_TICK).await;
         if connection.close_reason().is_some() {
             return;
         }
+        bytes.report(&connection);
         let Some(sample) = AckSample::of(&connection, &cap_holds) else {
             return;
         };
@@ -828,5 +830,32 @@ pub(crate) async fn watch_acknowledgements<T: TimeSource>(
 
 #[cfg(test)]
 mod cap_tests;
+/// A path's UDP payload bytes as quinn counts them, reported node-wide by their
+/// change at each tick of the watch (`quic_bytes_sent`, `quic_bytes_received`).
+/// What a path moves in its last tick before it closes is not reported.
+struct UdpBytes {
+    sent: u64,
+    received: u64,
+}
+
+impl UdpBytes {
+    fn of(connection: &quinn::Connection) -> Self {
+        let stats = connection.stats();
+        Self {
+            sent: stats.udp_tx.bytes,
+            received: stats.udp_rx.bytes,
+        }
+    }
+
+    fn report(&mut self, connection: &quinn::Connection) {
+        let now = Self::of(connection);
+        crate::transport::TRANSPORT_METRICS.quic_data.record_bytes(
+            now.sent.saturating_sub(self.sent),
+            now.received.saturating_sub(self.received),
+        );
+        *self = now;
+    }
+}
+
 #[cfg(test)]
 mod tests;

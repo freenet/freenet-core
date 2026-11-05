@@ -202,6 +202,23 @@ pub(crate) mod stop_code {
     /// it and sends on the UDP session, since a retry on the same path fails
     /// the same way.
     pub(crate) const NOT_ACCEPTING_DATA: u32 = 0x19;
+    /// A code's name in telemetry (`quic_data_stop_<label>`); `unknown` for a
+    /// code not in [`ALL`].
+    pub(crate) fn label(code: u32) -> &'static str {
+        match code {
+            HEADER_REFUSED => "header_refused",
+            BUDGET_REFUSED => "budget_refused",
+            STREAM_ID_IN_USE => "stream_id_in_use",
+            CHANNEL_FULL => "channel_full",
+            OVERLONG => "overlong",
+            EVICTED => "evicted",
+            CANCELLED => "cancelled",
+            FRAGMENT_REFUSED => "fragment_refused",
+            NOT_ACCEPTING_DATA => "not_accepting_data",
+            _ => "unknown",
+        }
+    }
+
     /// Every stop code, for the range and duplicate checks in
     /// `super::error`. A source-scrape test checks that each `const` in this
     /// module is listed.
@@ -401,6 +418,11 @@ quic_outcomes! {
         ControlUnknownType => "control_unknown_type",
         /// A control payload that is empty or of the wrong length.
         ControlMalformed => "control_malformed",
+        /// A Short past one packet did not fit the inbound budget
+        /// (`stop_code::BUDGET_REFUSED`; also counted under the shared refusal).
+        ShortRefusedBudget => "short_refused_budget",
+        /// A Stream did not fit the inbound budget (as above).
+        StreamRefusedBudget => "stream_refused_budget",
     }
 }
 
@@ -456,7 +478,11 @@ impl QuicPathStats {
         }
     }
 
+    /// Count an outcome here and node-wide (`quic_inbound_<label>`).
     fn record(&self, outcome: QuicInboundOutcome) {
+        crate::transport::TRANSPORT_METRICS
+            .quic_data
+            .record_inbound(outcome);
         self.quic[outcome as usize].fetch_add(1, Ordering::Relaxed);
     }
 
@@ -466,18 +492,28 @@ impl QuicPathStats {
         self.shared[outcome as usize].fetch_add(1, Ordering::Relaxed);
     }
 
+    /// The data-send counts are kept here and node-wide (`metrics::quic_data`).
     fn record_send(&self, kind: SendKind, result: QuicSendResult) {
+        crate::transport::TRANSPORT_METRICS
+            .quic_data
+            .record_send(kind, result);
         self.sends[kind as usize][result as usize].fetch_add(1, Ordering::Relaxed);
     }
 
     /// Count something else that happened to a data send.
     pub(crate) fn record_send_event(&self, event: QuicSendEvent) {
+        crate::transport::TRANSPORT_METRICS
+            .quic_data
+            .record_event(event);
         self.send_events[event as usize].fetch_add(1, Ordering::Relaxed);
     }
 
     /// Count a stop from the peer. A code this node does not know is counted only
     /// as a dropped send.
     fn record_stop(&self, code: u64) {
+        crate::transport::TRANSPORT_METRICS
+            .quic_data
+            .record_stop(code);
         if let Some(index) = stop_code::ALL.iter().position(|c| u64::from(*c) == code) {
             self.stops[index].fetch_add(1, Ordering::Relaxed);
         }
@@ -1233,6 +1269,15 @@ impl QuicPath {
     /// connection ends: the semaphore is never closed, so a waiter would
     /// otherwise sit out its deadline holding on to a path that has ended.
     async fn stream_slot(&self) -> Result<tokio::sync::OwnedSemaphorePermit, QuicSendError> {
+        if let Ok(permit) = Arc::clone(&self.stream_slots).try_acquire_owned() {
+            crate::transport::TRANSPORT_METRICS
+                .quic_data
+                .record_permit(false);
+            return Ok(permit);
+        }
+        crate::transport::TRANSPORT_METRICS
+            .quic_data
+            .record_permit(true);
         let connection = self.connection.inner();
         tokio::select! {
             permit = Arc::clone(&self.stream_slots).acquire_owned() => {
@@ -1252,7 +1297,24 @@ impl QuicPath {
         slot: Option<tokio::sync::OwnedSemaphorePermit>,
         progress: SendProgress,
     ) -> Result<Outgoing, QuicSendError> {
-        let stream = self.connection.inner().open_uni().await?;
+        // Polled once by hand, to tell an open that had to wait for the peer's
+        // stream credit from one that did not (`quic_open_uni_waited`).
+        let mut open = std::pin::pin!(self.connection.inner().open_uni());
+        let opened = match futures::poll!(open.as_mut()) {
+            std::task::Poll::Ready(opened) => {
+                crate::transport::TRANSPORT_METRICS
+                    .quic_data
+                    .record_open(false);
+                opened
+            }
+            std::task::Poll::Pending => {
+                crate::transport::TRANSPORT_METRICS
+                    .quic_data
+                    .record_open(true);
+                open.await
+            }
+        };
+        let stream = opened?;
         progress.mark_opened();
         let mut send = Outgoing::new(stream, self.aborts.clone(), slot, progress);
         send.write_all(&header.encode()).await?;

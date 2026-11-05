@@ -360,6 +360,7 @@ impl Drop for Attempt {
         }
         if let Some(routed) = &self.routed {
             routed.store(false, Ordering::Release);
+            TRANSPORT_METRICS.quic_data.data_path_ended();
         }
     }
 }
@@ -745,10 +746,9 @@ impl Session {
                     }
                 }
             }
-            // No counter yet, and at a share of 0 it does not happen. Not in
-            // `QuicUpgradeOutcome`: that array is at 32, the longest serde and
-            // `Default` take, so a data count needs a labelled set of its own.
-            Outcome::DataEnabled => {}
+            // Not in `QuicUpgradeOutcome`, which is at 32, the longest array serde
+            // and `Default` take: `quic_data_enabled` (`metrics::quic_data`).
+            Outcome::DataEnabled => TRANSPORT_METRICS.quic_data.record_data_enabled(),
             Outcome::Declined { reason, uncharged } => {
                 count(declined(reason));
                 if uncharged {
@@ -967,6 +967,8 @@ impl Session {
         held.route = Some(route);
         held.routed = Some(Arc::clone(&self.routed));
         self.routed.store(true, Ordering::Release);
+        // Ended by the attempt's drop, which clears `routed`.
+        TRANSPORT_METRICS.quic_data.data_path_started();
         // Bounded by the path: it ends when the connection does and what it holds
         // is gone, so the handle is not monitored and is not in `held.tasks`.
         drop(GlobalExecutor::spawn(report_panics(self.remote, worker)));
@@ -1212,6 +1214,18 @@ impl Session {
             let mut state = self.state.lock();
             if state.ended {
                 return;
+            }
+            // A session that ends under a data path (`quic_session_ended_with_data_path_*`).
+            let data_path_age = state
+                .attempt
+                .as_ref()
+                .filter(|held| held.route.is_some())
+                .and_then(|held| held.gauge.active_since)
+                .map(|since| (self.now)().saturating_sub(since));
+            if let Some(age) = data_path_age {
+                TRANSPORT_METRICS
+                    .quic_data
+                    .record_session_ended_with_data_path(age);
             }
             let actions = self.step(&mut state, Event::SessionEnded);
             let sends = self.apply(&mut state, actions);

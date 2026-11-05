@@ -3136,6 +3136,10 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 "quic_flow_control_window_bytes".into(),
                 serde_json::json!(snapshot.quic_flow_control_window_bytes),
             );
+            // Flat, a key per non-zero count, as the upload carries them.
+            for (key, count) in snapshot.quic_data.nonzero_keys() {
+                m.insert(key, count.into());
+            }
             m.insert(
                 "nat_fail_samples".into(),
                 serde_json::json!(snapshot.nat_fail_samples),
@@ -7607,7 +7611,9 @@ mod tests {
             .unwrap()
             .keys()
             .filter(|key| {
-                !key.starts_with("conn_identity_") && !key.starts_with("inbound_concurrency_")
+                !key.starts_with("conn_identity_")
+                    && !key.starts_with("inbound_concurrency_")
+                    && *key != "quic_data"
             })
             .cloned()
             .collect();

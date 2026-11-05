@@ -61,6 +61,16 @@ pub(crate) enum SendKind {
 impl SendKind {
     pub(crate) const ALL: [Self; 4] = [Self::Short, Self::LargeShort, Self::Stream, Self::Pipe];
 
+    /// Its name in telemetry (`quic_data_send_<kind>_<result>`).
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Short => "short",
+            Self::LargeShort => "large_short",
+            Self::Stream => "stream",
+            Self::Pipe => "pipe",
+        }
+    }
+
     fn is_short(self) -> bool {
         match self {
             Self::Short | Self::LargeShort => true,

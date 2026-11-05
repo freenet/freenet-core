@@ -212,11 +212,17 @@ pub(in crate::transport::quic) async fn receive<T: TimeSource>(
     let mut readers = FuturesUnordered::new();
     // Kept across iterations, so a pending accept is never dropped.
     let mut accept = std::pin::pin!(connection.accept_uni());
+    // This path's peak of streams read at once (`quic_streams_open_*`).
+    let mut peak = crate::transport::metrics::StreamsOpenPeak::default();
     loop {
         tokio::select! {
             accepted = &mut accept => match accepted {
                 Ok(recv) => {
                     readers.push(read_one(recv, receiver.clone()));
+                    crate::transport::TRANSPORT_METRICS.quic_data.record_streams_open(
+                        &mut peak,
+                        u32::try_from(readers.len()).unwrap_or(u32::MAX),
+                    );
                     accept.set(connection.accept_uni());
                 }
                 Err(error) => {
@@ -721,13 +727,21 @@ impl<T: TimeSource> Receiver<T> {
         tracing::debug!(?failure, "QUIC path: inbound stream failed");
     }
 
-    /// Count a budget refusal as the UDP transport does, and stop the stream.
-    fn refuse(&self, reader: &mut BodyReader<T>, rejection: BudgetRejection, total: u64) {
+    /// Count a budget refusal as the UDP transport does, and by frame kind
+    /// (`kind`), and stop the stream.
+    fn refuse(
+        &self,
+        reader: &mut BodyReader<T>,
+        rejection: BudgetRejection,
+        total: u64,
+        kind: QuicInboundOutcome,
+    ) {
         let outcome = match rejection {
             BudgetRejection::Bytes { .. } => InboundStreamOutcome::RefusedConnectionBytes,
             BudgetRejection::Streams { .. } => InboundStreamOutcome::RefusedConnectionStreams,
         };
         self.stats.record_shared(outcome);
+        self.stats.record(kind);
         tracing::debug!(?rejection, total, "QUIC path: refusing an inbound stream");
         reader.stop(stop_code::BUDGET_REFUSED);
     }
@@ -759,7 +773,12 @@ impl<T: TimeSource> Receiver<T> {
                 let mut budget = self.budget.lock();
                 if let Err(rejection) = budget.check(total, Releaser::Quic) {
                     drop(budget);
-                    self.refuse(&mut reader, rejection, total);
+                    self.refuse(
+                        &mut reader,
+                        rejection,
+                        total,
+                        QuicInboundOutcome::ShortRefusedBudget,
+                    );
                     return;
                 }
                 let key = self.short_key(&budget);
@@ -879,7 +898,12 @@ impl<T: TimeSource> Receiver<T> {
             }
             if let Err(rejection) = budget.check(total, Releaser::Quic) {
                 drop(budget);
-                self.refuse(&mut reader, rejection, total);
+                self.refuse(
+                    &mut reader,
+                    rejection,
+                    total,
+                    QuicInboundOutcome::StreamRefusedBudget,
+                );
                 return;
             }
             // Allocates only the buffer's chunk table (see
