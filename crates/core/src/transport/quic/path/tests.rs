@@ -23,6 +23,8 @@ use crate::transport::peer_connection::streaming::{
 use crate::transport::peer_connection::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
 use crate::transport::peer_connection::streaming_handle_idle_timeout;
 
+mod route;
+
 /// How long, in virtual time, a test's traffic may take.
 const LIMIT: Duration = Duration::from_secs(600);
 
@@ -72,9 +74,24 @@ async fn paths_with(
     b_limits: QuicPathLimits,
     b_budget: Option<SharedInboundBudget>,
 ) -> Paths {
+    paths_built(network, subnet, b_limits, b_budget, None).await
+}
+
+/// [`paths`] with an egress cap of `a_cap` bytes per second on `a`'s socket.
+async fn paths_capped(network: &str, subnet: u8, a_cap: u64) -> Paths {
+    paths_built(network, subnet, QuicPathLimits::DEFAULT, None, Some(a_cap)).await
+}
+
+async fn paths_built(
+    network: &str,
+    subnet: u8,
+    b_limits: QuicPathLimits,
+    b_budget: Option<SharedInboundBudget>,
+    a_cap: Option<u64>,
+) -> Paths {
     let a_addr: SocketAddr = format!("10.203.{subnet}.1:5000").parse().unwrap();
     let b_addr: SocketAddr = format!("10.203.{subnet}.2:5000").parse().unwrap();
-    let pair = pair(network, a_addr, b_addr, None).await;
+    let pair = pair(network, a_addr, b_addr, a_cap).await;
     let permit = pair
         .b
         .allow_peer(pair.a_addr, pair.a_keys.public())
@@ -2077,10 +2094,10 @@ fn a_stop_from_the_peer_is_not_counted_as_a_reset() {
 
 /// Drops every datagram sent from the listed addresses on `network` while
 /// it lives.
-struct DropFrom(String);
+pub(in crate::transport) struct DropFrom(String);
 
 impl DropFrom {
-    fn new(network: &str, from: &[SocketAddr]) -> Self {
+    pub(in crate::transport) fn new(network: &str, from: &[SocketAddr]) -> Self {
         use crate::transport::in_memory_socket::{
             PacketDeliveryDecision, set_packet_delivery_callback,
         };

@@ -303,6 +303,29 @@ impl AckState {
     }
 }
 
+/// The count of packets a connection's peer newly acknowledged, read without
+/// waiting: `CappedCubic`'s record, which every clone of the controller shares.
+#[derive(Clone)]
+pub(crate) struct AckProgress(Arc<Mutex<AckState>>);
+
+impl AckProgress {
+    /// `None` if the connection's controller is not an [`CappedCubic`].
+    pub(crate) fn of(connection: &quinn::Connection) -> Option<Self> {
+        let record = connection
+            .congestion_state()
+            .into_any()
+            .downcast::<CappedCubic>()
+            .ok()?
+            .state;
+        Some(Self(record))
+    }
+
+    /// Ack-eliciting packets the peer has newly acknowledged so far.
+    pub(crate) fn acked(&self) -> u64 {
+        self.0.lock().acked
+    }
+}
+
 /// A congestion controller that lowers `inner`'s window to the configured
 /// bandwidth (see "The window cap" in the module docs), records the
 /// acknowledgements the peer sends ([`AckState`]), and otherwise passes every
@@ -631,6 +654,30 @@ pub(crate) struct AckWatch {
     hold_unchanged_since: Option<u64>,
 }
 
+/// Whether the egress cap holds, or held since `previous` was read, a QUIC
+/// transmit, at `now_nanos`. A hold reported for longer than its validity with
+/// no new hold event is a poller left behind by an ended connection and does not
+/// count ([`CapHolds`]). `hold_unchanged_since` is the caller's, kept across
+/// readings. The ack watch and the data sends' stall count (`path::route`) both
+/// use it, so the two agree on what a cap hold is.
+pub(crate) fn cap_held(
+    hold_unchanged_since: &mut Option<u64>,
+    now_nanos: u64,
+    cap: &CapHoldReading,
+    previous: &CapHoldReading,
+) -> bool {
+    let new_event = cap.holds != previous.holds;
+    if new_event || !cap.held_now {
+        *hold_unchanged_since = None;
+    }
+    let live_hold = cap.held_now && {
+        let since = *hold_unchanged_since.get_or_insert(now_nanos);
+        let validity = u64::try_from(cap.validity.as_nanos()).unwrap_or(u64::MAX);
+        now_nanos.saturating_sub(since) <= validity
+    };
+    new_event || live_hold
+}
+
 /// Samples in a row with nothing from the peer that end a window.
 const QUIET_SAMPLES_END_WINDOW: u32 = 2;
 
@@ -645,16 +692,7 @@ impl AckWatch {
         cap: &CapHoldReading,
         previous: &CapHoldReading,
     ) -> bool {
-        let new_event = cap.holds != previous.holds;
-        if new_event || !cap.held_now {
-            self.hold_unchanged_since = None;
-        }
-        let live_hold = cap.held_now && {
-            let since = *self.hold_unchanged_since.get_or_insert(now_nanos);
-            let validity = u64::try_from(cap.validity.as_nanos()).unwrap_or(u64::MAX);
-            now_nanos.saturating_sub(since) <= validity
-        };
-        new_event || live_hold
+        cap_held(&mut self.hold_unchanged_since, now_nanos, cap, previous)
     }
 
     pub(crate) fn new(window: Duration, first: AckSample) -> Self {

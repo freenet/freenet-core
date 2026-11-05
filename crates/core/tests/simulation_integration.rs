@@ -20759,6 +20759,24 @@ impl QuicShadowRun {
     fn dump(&self) -> String {
         format!("{:#?}", self.trace.records())
     }
+
+    /// Data each node received on UDP after its peer's path took the peer's data,
+    /// by at least a second, so a packet already on the wire is not counted. The
+    /// count is made where UDP data arrives, whichever code sent it.
+    fn udp_data_once_on_the_path(&self) -> usize {
+        let &[first, second] = &self.nodes[..] else {
+            panic!("two nodes: {:?}", self.nodes);
+        };
+        let late = |receiver, sender| {
+            let enabled = self.trace.matching(sender, "DataEnabled")[0].at;
+            self.trace
+                .matching(receiver, "data arrived on UDP")
+                .iter()
+                .filter(|record| record.at > enabled + Duration::from_secs(1))
+                .count()
+        };
+        late(first, second) + late(second, first)
+    }
 }
 
 /// One direct-runner simulation of `gateways` plus `nodes`, in `QUIC_EVENT_WAIT`
@@ -20823,9 +20841,9 @@ fn run_as_first_negotiating_release(trace: &freenet::dev_tool::QuicUpgradeTrace)
 
 /// Each node's data bit, end to end over a real QUIC connection: a pair negotiates
 /// data only with both bits, a mismatch stays in shadow, and shadow or a share of 0
-/// sets no bit. Whatever the bits, nothing is sent on the path.
+/// sets no bit. A pair without both bits sends nothing on its path.
 #[test_log::test]
-fn test_quic_data_needs_both_bits_and_carries_nothing_yet() {
+fn test_quic_data_needs_both_bits() {
     for (name, seed, modes, percents, carries) in [
         (
             "quic-data-both",
@@ -20881,21 +20899,27 @@ fn test_quic_data_needs_both_bits_and_carries_nothing_yet() {
                 run.dump()
             );
         }
-        assert_eq!(
-            run.total("path carried data: refused 0, delivered 0"),
-            2,
-            "{name}: both paths end carrying no data: {}",
-            run.dump()
-        );
+        if !carries {
+            assert_eq!(
+                run.total("path carried data: refused 0, delivered 0"),
+                2,
+                "{name}: both paths end carrying no data: {}",
+                run.dump()
+            );
+            assert_eq!(
+                run.total("path sent data: sent 0, maybe 0, on udp 0, dropped 0"),
+                2,
+                "{name}: {}",
+                run.dump()
+            );
+        }
     }
 }
 
-/// Data on a test percentage, end to end: both nodes negotiate it and send their
-/// messages as Shorts on the path, and those messages come out of `recv` and decode
-/// as real network messages. No node code sends on a path yet, so the run asks for
-/// it (`send_shorts_on_paths`). Only Shorts are covered here: a Stream through
-/// `recv` is tested at the connection (`ack_policy_tests/quic_data.rs`) and goes
-/// end to end in e5b-5/6.
+/// Data on a test percentage, end to end: both nodes negotiate it and their
+/// messages go on the path, come out of `recv` and decode as real network messages.
+/// The counts come from each end: what the receiver took off the path, what the
+/// sender heard, and what arrived on UDP once the peer had data on.
 #[test_log::test]
 fn test_quic_data_delivers_a_real_message_through_recv() {
     let run = run_quic_shadow_sim(
@@ -20904,14 +20928,9 @@ fn test_quic_data_delivers_a_real_message_through_recv() {
         (1, 1),
         30,
         |sim, trace, labels| {
-            let addresses: Vec<_> = labels
-                .iter()
-                .map(|label| sim.all_node_addresses()[label])
-                .collect();
-            for (label, address) in labels.iter().zip(addresses) {
+            for label in labels {
                 sim.with_node_transport_quic(label, "prefer");
                 sim.with_node_quic_data_percent(label, 100);
-                trace.send_shorts_on_paths(address);
             }
             run_as_first_negotiating_release(trace);
         },
@@ -20919,6 +20938,12 @@ fn test_quic_data_delivers_a_real_message_through_recv() {
     for node in &run.nodes {
         assert_eq!(run.whats(*node, "DataEnabled"), 1, "{}", run.dump());
     }
+    assert_eq!(run.udp_data_once_on_the_path(), 0, "{}", run.dump());
+    assert!(
+        run.total("data arrived on UDP") > 0,
+        "data seen on UDP before the path carried it, so the count works: {}",
+        run.dump()
+    );
     let received = run.total("received a short on the path");
     assert!(received > 0, "{}", run.dump());
     assert_eq!(
@@ -20943,6 +20968,117 @@ fn test_quic_data_delivers_a_real_message_through_recv() {
         "{}",
         run.dump()
     );
+    assert_eq!(run.total("sent a short on UDP"), 0, "{}", run.dump());
+}
+
+/// A stream end to end: a state too large for a message goes on the path as a
+/// Stream, the receiver assembles it through `recv` and the registry, and stores
+/// it. UDP carries no data once the path does.
+#[test_log::test]
+fn test_quic_data_carries_a_stream_end_to_end() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation};
+    const NETWORK: &str = "quic-data-stream";
+    const SEED: u64 = 0x5940_E5B6_0001;
+    const STATE_LEN: usize = 512 * 1024;
+    setup_deterministic_state(SEED);
+    let contract = SimOperation::create_test_contract(0x61);
+    let key = contract.key();
+    let warm_up = SimOperation::create_test_contract(0x62);
+    let state: Vec<u8> = (0..STATE_LEN).map(|i| (i % 251) as u8).collect();
+
+    let rt = create_runtime();
+    let (sim, trace, nodes) = rt.block_on(async {
+        let mut sim = SimNetwork::new(NETWORK, 1, 1, 7, 3, 10, 2, SEED).await;
+        sim.enable_gateway_ack_version();
+        sim.with_streaming_threshold(64 * 1024);
+        sim.with_controlled_op_interval(Duration::from_secs(40));
+        sim.wait_for_join_convergence_before_ops(1.0, Duration::from_secs(60));
+        let trace = sim.quic_upgrade_trace();
+        let labels: Vec<_> = sim.all_node_addresses().keys().cloned().collect();
+        for label in &labels {
+            sim.with_node_transport_quic(label, "prefer");
+            sim.with_node_quic_data_percent(label, 100);
+        }
+        run_as_first_negotiating_release(&trace);
+        let nodes: Vec<_> = sim.all_node_addresses().values().copied().collect();
+        (sim, trace, nodes)
+    });
+    drop(rt);
+    let node = NodeLabel::node(NETWORK, 1);
+    let gateway = NodeLabel::gateway(NETWORK, 0);
+    let operations = vec![
+        // Gives the path the time to come up: the first offer waits 2-10 s.
+        ScheduledOperation::new(
+            node.clone(),
+            SimOperation::Put {
+                contract: warm_up,
+                state: vec![1; 64],
+                subscribe: false,
+            },
+        ),
+        ScheduledOperation::new(
+            node,
+            SimOperation::Put {
+                contract,
+                state: state.clone(),
+                subscribe: false,
+            },
+        ),
+    ];
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(300),
+        Duration::from_secs(60),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "simulation failed: {:?}",
+        result.turmoil_result.err()
+    );
+    let run = QuicShadowRun {
+        trace,
+        nodes,
+        logs_events: 0,
+        mesh: Default::default(),
+    };
+    for address in &run.nodes {
+        assert_eq!(run.whats(*address, "DataEnabled"), 1, "{}", run.dump());
+    }
+    assert!(
+        run.total("sent a stream on the path: Sent") >= 1,
+        "{}",
+        run.dump()
+    );
+    assert!(
+        run.total("received a stream on the path") >= 1,
+        "{}",
+        run.dump()
+    );
+    assert_eq!(run.udp_data_once_on_the_path(), 0, "{}", run.dump());
+    assert!(
+        run.total("data arrived on UDP") > 0,
+        "data seen on UDP before the path carried it, so the count works: {}",
+        run.dump()
+    );
+    assert_eq!(
+        run.total("path carried data: refused 0"),
+        run.total("path carried data"),
+        "{}",
+        run.dump()
+    );
+    assert_eq!(
+        run.total("sent a stream on the path: Failed"),
+        0,
+        "{}",
+        run.dump()
+    );
+    let stored = result
+        .node_storages
+        .get(&gateway)
+        .and_then(|storage| storage.get_stored_state(&key))
+        .expect("the gateway stored the state");
+    assert_eq!(stored.as_ref(), state.as_slice());
 }
 
 /// Shadow on both ends: the whole negotiation runs over a real QUIC connection,

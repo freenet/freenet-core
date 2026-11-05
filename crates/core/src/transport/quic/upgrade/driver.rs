@@ -51,8 +51,9 @@
 //! long as the session, so a message already in a channel when its path ends is
 //! still delivered. One still waiting for room in a full channel is dropped with
 //! the path and counted. [`Action::EnableData`] lets the path send data once both bits are
-//! set. Only `send_control_bounded` is called on it: no node code sends data yet,
-//! and a peer that sends none costs nothing here.
+//! set, and from then on the session's [`QuicPathState::data_route`] gives the
+//! connection the path to send its data on ([`super::data_route`]). With no route
+//! it sends on UDP, and the path carries control frames only.
 
 #[cfg(test)]
 pub(in crate::transport) mod tests;
@@ -61,7 +62,7 @@ use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -72,6 +73,7 @@ use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use super::data_route::{DataRoute, RouteNote, UdpShorts};
 use super::machine::{
     Action, BackoffSeed, CONTROL_SEND_TIMEOUT, Event, FallbackCause, Inputs, Outcome, Role,
     UpgradeMachine,
@@ -82,7 +84,7 @@ use crate::node::background_task_monitor::LateRegistrar;
 use crate::simulation::{RealTime, TimeSource, VirtualTime};
 use crate::transport::crypto::TransportPublicKey;
 use crate::transport::metrics::{QuicCloseCode, QuicFallback, QuicUpgradeOutcome};
-use crate::transport::peer_connection::UpgradeSender;
+use crate::transport::peer_connection::UdpSender;
 use crate::transport::peer_connection::inbound_budget::SharedInboundBudget;
 use crate::transport::quic::control::ControlError;
 use crate::transport::quic::identity::PeerKey;
@@ -325,6 +327,13 @@ struct Attempt {
     /// A routed connection attempt is finishing its handshake.
     establishing: bool,
     path: Option<Arc<QuicPath>>,
+    /// What a connection reads to send data on `path`, once both sides set the
+    /// data bit. The route's worker is not in `tasks`: it outlives the attempt
+    /// to hand what it holds to UDP.
+    route: Option<DataRoute>,
+    /// The session's [`Session::routed`], set while `route` is held. Cleared when
+    /// the attempt goes, which happens only under the session's lock.
+    routed: Option<Arc<AtomicBool>>,
     /// The dial or establish task, the control sends and the path's pump.
     tasks: Vec<JoinHandle<()>>,
 }
@@ -337,6 +346,8 @@ impl Attempt {
             allow: None,
             establishing: false,
             path: None,
+            route: None,
+            routed: None,
             tasks: Vec::new(),
         }
     }
@@ -346,6 +357,9 @@ impl Drop for Attempt {
     fn drop(&mut self) {
         for task in &self.tasks {
             task.abort();
+        }
+        if let Some(routed) = &self.routed {
+            routed.store(false, Ordering::Release);
         }
     }
 }
@@ -374,6 +388,14 @@ struct Session {
     budget: SharedInboundBudget,
     /// Where every path of this session delivers data.
     data: QuicDataSenders,
+    /// What a path's short queue falls back on.
+    udp: Arc<dyn UdpShorts>,
+    /// Whether the live attempt may hold a data route, read without the lock by
+    /// every send of the connection ([`Self::data_route`]). Set only after the
+    /// route is in place and cleared when the attempt goes, both under the lock,
+    /// so `false` is always true of the route: a node without one never takes
+    /// the lock to send. `true` may be stale, and the lock then decides.
+    routed: Arc<AtomicBool>,
     /// When an active path of this session last heard from the peer, on [`Self::now`].
     /// Half of the connection's `ReceiptStamp`. Written from the path's watch
     /// because the path runs on another clock in simulation.
@@ -496,9 +518,10 @@ impl QuicUpgrades {
         remote_version: Option<(u8, u8, u16)>,
         budget: SharedInboundBudget,
         quic_receipt_nanos: Arc<AtomicU64>,
-        sender: UpgradeSender<S, T>,
+        sender: UdpSender<S, T>,
         time: T,
     ) -> (QuicPathState, QuicDataInbox) {
+        let sender = Arc::new(sender);
         let (data, data_inbox) = data_channels();
         let (inbox, inbox_rx) = mpsc::channel(SESSION_INBOX_CAPACITY);
         let id = self.next_session.fetch_add(1, Ordering::Relaxed);
@@ -515,6 +538,8 @@ impl QuicUpgrades {
             inbox,
             budget,
             data,
+            udp: sender.clone(),
+            routed: Arc::new(AtomicBool::new(false)),
             quic_receipt_nanos,
             now: Arc::new(move || clock.now()),
             state: Mutex::new(SessionState {
@@ -907,16 +932,79 @@ impl Session {
         Box::new(move || stamp.store(now().as_nanos() as u64, Ordering::Release))
     }
 
-    fn enable_data(&self, state: &SessionState, attempt: u32) {
+    /// Both sides set the data bit, so the path takes the connection's data.
+    ///
+    /// No check of the peer's version: the bit it sent proves it reads. The
+    /// first release to read (0.2.154) is the first that can set the bit, since
+    /// every earlier one has no known caps, clears the bit on decode and sends 0,
+    /// and a build that cannot read sets no bit (`QUIC_DATA_RECEIVER_READY`). A
+    /// node rolled back has restarted, so its paths are gone and it negotiates
+    /// again from what it runs now.
+    fn enable_data(&self, state: &mut SessionState, attempt: u32) {
         debug_assert!(state.machine.carries_data(), "attempt {attempt}");
-        let path = state
-            .attempt
-            .as_ref()
-            .filter(|held| held.id == attempt)
-            .and_then(|held| held.path.as_ref());
-        if let Some(path) = path {
-            path.enable_data();
+        let Some(held) = state.attempt.as_mut().filter(|held| held.id == attempt) else {
+            return;
+        };
+        let Some(path) = held.path.as_ref() else {
+            return;
+        };
+        // The machine enables data once per activation. A second route would
+        // leave the first one's worker and queue with nobody sending to them.
+        debug_assert!(
+            held.route.is_none(),
+            "attempt {attempt} has a route already"
+        );
+        if held.route.is_some() {
+            return;
         }
+        path.enable_data();
+        let (route, worker) = DataRoute::new(
+            Arc::clone(path),
+            self.hub.path_clock.clone(),
+            Arc::clone(&self.udp),
+            self.route_note(),
+        );
+        held.route = Some(route);
+        held.routed = Some(Arc::clone(&self.routed));
+        self.routed.store(true, Ordering::Release);
+        // Bounded by the path: it ends when the connection does and what it holds
+        // is gone, so the handle is not monitored and is not in `held.tasks`.
+        drop(GlobalExecutor::spawn(report_panics(self.remote, worker)));
+    }
+
+    /// The path to send this connection's data on: the live attempt's, once both
+    /// sides set the data bit (the attempt holds a route only then), unless the
+    /// peer refused data. `None` in shadow and after a teardown, which takes the
+    /// attempt under this same lock in the step that leaves `Active`, so a path
+    /// that ended stops taking sends at once. The lock is short and never held
+    /// across an await. A route read just before a teardown still works: what it
+    /// takes goes on UDP.
+    ///
+    /// With no route, as in shadow and with QUIC off on the peer, it reads one
+    /// atomic and takes no lock.
+    fn data_route(&self) -> Option<DataRoute> {
+        if !self.routed.load(Ordering::Acquire) {
+            return None;
+        }
+        let state = self.state.lock();
+        let route = state.attempt.as_ref()?.route.as_ref()?;
+        if !route.path().sends_data() {
+            // A refusal is for good on this path, so its route is off the fast
+            // path too. A new attempt sets the flag again under this lock.
+            self.routed.store(false, Ordering::Release);
+            return None;
+        }
+        Some(route.clone())
+    }
+
+    /// Where a route records what its sends did, in a test.
+    fn route_note(&self) -> RouteNote {
+        #[cfg(any(test, feature = "testing"))]
+        {
+            RouteNote::new(self.hub.trace.clone(), self.remote, self.id)
+        }
+        #[cfg(not(any(test, feature = "testing")))]
+        RouteNote::default()
     }
 
     fn build_path(&self, state: &mut SessionState, attempt: u32, connection: QuicConnection) {
@@ -970,7 +1058,7 @@ impl Session {
     }
 
     /// Send a control frame on the live attempt's path, bounded, in a task. The
-    /// only kind of send a shadow path makes.
+    /// only kind of send a path without both data bits makes.
     fn send_control(
         &self,
         state: &mut SessionState,
@@ -1013,6 +1101,17 @@ impl Session {
                     "path carried data: refused {}, delivered {}",
                     stats.count(Q::RefusedNotAcceptingData),
                     stats.count(Q::DeliveredShort) + stats.count(Q::AnnouncedStream)
+                )
+            });
+            self.note(|| {
+                use crate::transport::quic::path::QuicSendResult as R;
+                let stats = path.stats();
+                format!(
+                    "path sent data: sent {}, maybe {}, on udp {}, dropped {}",
+                    stats.send_total(R::Sent),
+                    stats.send_total(R::MaybeDelivered),
+                    stats.send_total(R::NotOpenedUdp) + stats.send_total(R::FailedUdp),
+                    stats.send_total(R::Dropped)
                 )
             });
         }
@@ -1216,7 +1315,7 @@ impl Drop for EndOnExit {
 async fn drive<S: Socket, T: TimeSource>(
     session: Arc<Session>,
     mut inbox: mpsc::Receiver<SessionEvent>,
-    sender: UpgradeSender<S, T>,
+    sender: Arc<UdpSender<S, T>>,
     time: T,
 ) {
     let _end = EndOnExit(Arc::clone(&session));
@@ -1265,7 +1364,7 @@ async fn drive<S: Socket, T: TimeSource>(
                     }
                     let offer = UpgradeControl::Offer { attempt, caps };
                     session.note(|| format!("sent {offer:?}"));
-                    match sender.send(offer).await {
+                    match sender.send_upgrade(offer).await {
                         // Before the driver reads the inbox again, so no reply
                         // to this offer can be stepped first.
                         Ok(()) => sends.extend(session.take(Event::OfferSent { attempt })),
@@ -1287,7 +1386,7 @@ async fn drive<S: Socket, T: TimeSource>(
                         session.count_decline_sent(reason);
                     }
                     session.note(|| format!("sent {control:?}"));
-                    if let Err(error) = sender.send(control).await {
+                    if let Err(error) = sender.send_upgrade(control).await {
                         tracing::debug!(%error, ?control, "QUIC upgrade reply not sent");
                     }
                 }
@@ -1388,38 +1487,9 @@ impl QuicPathState {
         }
     }
 
-    /// Send `payload` as a Short on this session's path if it may carry data, and
-    /// otherwise hand it back. For a simulation to carry a real message before any
-    /// node code sends on a path (`QuicUpgradeTrace::send_shorts_on_paths`).
-    #[cfg(any(test, feature = "testing"))]
-    pub(in crate::transport) fn send_short_on_path(
-        &self,
-        payload: Vec<u8>,
-    ) -> std::result::Result<(), Vec<u8>> {
-        let path = self
-            .session
-            .state
-            .lock()
-            .attempt
-            .as_ref()
-            .and_then(|held| held.path.as_ref().map(Arc::clone))
-            .filter(|path| path.sends_data());
-        let Some(path) = path else {
-            return Err(payload);
-        };
-        let session = Arc::clone(&self.session);
-        drop(GlobalExecutor::spawn(async move {
-            let clock = session.hub.path_clock.clone();
-            let outcome = path
-                .send_short_bounded(
-                    &clock,
-                    crate::transport::quic::path::SendDeadlines::short(payload.len() as u64),
-                    &payload,
-                )
-                .await;
-            session.note(|| format!("sent a short on the path: {outcome:?}"));
-        }));
-        Ok(())
+    /// See [`Session::data_route`].
+    pub(in crate::transport) fn data_route(&self) -> Option<DataRoute> {
+        self.session.data_route()
     }
 
     /// The stamp the session's active path writes.

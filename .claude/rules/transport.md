@@ -932,10 +932,11 @@ it must not wait unless it is a pacing point.
 `QuicMode::default_mode`, shadow on Linux and macOS and off elsewhere, since
 the breaker cannot trip without a boot identity) decides whether `bind_udp_listener` builds a quinn endpoint over the DemuxSocket.
 `prefer` negotiates data with the release's share of pairs ("Data slice" below;
-`upgrade::policy::log_startup` reports the share at INFO once per node). No code
-sends data on a path yet, so `prefer` differs from `shadow` only by that bit. The
-release that makes `prefer` carry data must say in its notes that existing
-`prefer` configs start carrying data. Off: no endpoint, no QUIC ingress, nothing
+`upgrade::policy::log_startup` reports the share at INFO once per node), and a pair
+with both bits sends its data on the path ("QUIC send route" below). At a share of
+0, with no `quic-data-percent`, `prefer` differs from `shadow` only by the bit, which
+stays 0. The release that raises the share above 0 must say in its notes that
+existing `prefer` configs start carrying data. Off: no endpoint, no QUIC ingress, nothing
 changes. QUIC must stay off by default on Windows until the crash-loop
 breaker has been confirmed on a real Windows machine (#6031). The default is
 read, never written to config.toml: a node that did not set the key follows the
@@ -1075,8 +1076,11 @@ pair is in the slice when its bucket is below the percentage, so 0 holds none,
   overtake the frame carrying its bit. Sending is `QuicPath::send_data`, which
   `debug_assert_carries_data` reads. The Offer's caps stay 0. A release before the
   bit clears it on decode and sends 0, so its pairs stay in shadow.
-  No node code sends data on a path yet. Frames a peer sends to a node with its own
-  bit set reach `recv` ("QUIC receive flow" below).
+  With both bits the connection sends on the path ("QUIC send route" below). Frames
+  a peer sends to a node with its own bit set reach `recv` ("QUIC receive flow"
+  below). A sender needs no version check: 0.2.154 is the first release that can
+  set the bit and the first that reads, every earlier one clears the bit on decode
+  and sends 0, and a node rolled back has restarted and negotiates again.
 
 Receipt stamp (#6028, e5b-3): `ReceiptStamp` reads the later of two values,
 `last_inbound_nanos` (UDP) and `quic_receipt_nanos`, on the connection's clock. The
@@ -1189,10 +1193,10 @@ task, no select arm and no GlobalRng draw. It owns one task per connection, whic
 runs the machine, so nothing of a negotiation runs inside `recv`, which only
 `try_send`s a received Upgrade to it.
   Sends: UDP Upgrade messages are tracked packets, sent by the driver through
-  UpgradeSender, which holds only what a send needs. It charges flight size and
+  UdpSender, which holds only what a send needs. It charges flight size and
   tracks the packet only after the socket took it, with no await between, so a
   send that fails or is dropped leaves nothing in flight. Control frames go through
-  send_control_bounded in a task per send, and nothing else is sent on a path.
+  send_control_bounded in a task per send. Data goes by "QUIC send route" below.
   Paths: QuicPath::with_budget(.., SHADOW or DEFAULT by this node's data bit, the
   connection's inbound budget, the session's data channels), on the clock quinn runs on (PathClock: RealTime, or
   the network's VirtualTime in simulation). The machine reads the connection's
@@ -1386,10 +1390,11 @@ that join, not by the exact edge set. `probe_quic_endpoints_at` sends each
 node a stranger's QUIC datagram during a direct-runner run, so a test can
 check every endpoint was live (`not_allowed`) rather than failed to bind.
 `SimNetwork::quic_upgrade_trace` returns a handle (`quic/upgrade/sim_trace.rs`,
-tests only) with what each node's upgrades did, readable after the run. It also
-injects: `send_shorts_on_paths` (the node sends each message that fits a packet as
-a Short on the connection's path, when that path may carry data, with no fallback
-to UDP; nothing else sends data on a path yet), `send_initial_on_each_attempt` (the node receives an Initial with the
+tests only) with what each node's upgrades did, readable after the run,
+including what arrived on the path and on UDP (`received a short on the path`,
+`data arrived on UDP`, noted at the receiver whichever code sent it) and what each
+send ended as (`sent a short on the path: ...`). It also
+injects: `send_initial_on_each_attempt` (the node receives an Initial with the
 peer's address as its source each time it allows that address, and records
 `injected an Initial`), `make_record_wrong` (the key compared after the
 handshake disagrees, so the path closes with IDENTITY_MISMATCH),
@@ -1450,9 +1455,10 @@ every rate), endpoint-down, panics and breaker trips, RSS against
 
 Simulation scenarios (`tests/simulation_integration.rs`, `test_quic_*`): two
 nodes established with traffic on UDP; data bits on each side, where only both
-enable data and nothing is sent; data at a test percentage with messages sent on
-the path, which come out of `recv` and decode as real messages (Shorts only; a Stream
-end to end is for e5b-5/6); QUIC-off peers decline `Disabled`; peers
+enable data; data at a test percentage, where messages go on the path, come out of
+`recv` and decode as real messages, with no data on UDP once the path carries it; a
+state past the streaming threshold as a Stream end to end, stored by the receiver;
+QUIC-off peers decline `Disabled`; peers
 below the version floor are never offered; blackholed and idle paths fall back
 and are re-offered; a wrong key closes with IDENTITY_MISMATCH; endpoint-down
 closes every path; an Initial the peer did not send is retried and the real dial
@@ -1529,8 +1535,8 @@ either side, and a man in the middle with its own key on either leg.
 
 #### QUIC framing and path (`quic/framing.rs`, `quic/path.rs`, #5940 step e3)
 
-The upgrade driver builds a `QuicPath` and sends only control frames on it; data
-sends are for e5b.
+The upgrade driver builds a `QuicPath` and sends control frames on it. Data goes on
+it by "QUIC send route" below.
 
 ```
 One message per QUIC uni stream: an 18-byte header, then metadata, then
@@ -1578,7 +1584,8 @@ Sending (QuicPath::send_short_bounded / send_stream_bounded /
   queued or in flight, and short and
   control messages hold no more than the reserve (pinned by
   a_short_still_sends_while_streamed_messages_are_blocked).
-  e5b constraints (none arises in shadow, which sends only control frames):
+  Constraints on a path that carries data (none arises in shadow, which sends only
+  control frames):
   → A permit can return before the slot does: on a reset or a stop from the
     peer (about one round trip), and on an ack, which is about receipt and can
     come before the receiver has read the stream to its end. That is short
@@ -1831,6 +1838,84 @@ Control payload (quic/control.rs), the body of a Control frame, one per
   (control_unknown_version, control_unknown_type, control_malformed); they
   are counted only through it, not by QuicControl::decode.
 Not here: export of the QUIC-only counters (per path, QuicPath::stats).
+QUIC send route (#5940 e5b-6, quic/upgrade/data_route.rs,
+  peer_connection/quic_send.rs, quic/path/route.rs):
+  A message has one route, chosen when it is sent, from
+  QuicPathState::data_route: the live attempt's DataRoute, held only once both
+  sides set the data bit (Action::EnableData), unless the peer refused data. None
+  with QUIC off, in shadow and after a teardown, which takes the attempt under the
+  same lock. With QUIC off no task, arm or GlobalRng draw is added. Streams already
+  running on UDP when a path comes up finish on UDP.
+  NOTHING HERE WAITS IN THE CONNECTION'S TASK. A message of one packet goes through
+  DataRoute::queue_short, a try_send into a per-path queue of 256 (full: on UDP at
+  once, counted short_overflow_udp; closed: on UDP). One worker per path holds a
+  FuturesUnordered of at most MAX_UNI_STREAMS send_short_bounded calls: without
+  that cap the queue would never fill. A larger message, a Stream and a pipe each
+  run as a task in outbound_stream_futures, the arm that accounts for a UDP stream.
+  A larger message is a Short on the path and a stream of its own on UDP, under an
+  id taken when it is sent.
+  Fallback: QuicPath::settle counts an outcome and path::route::next_step says what
+  happens next. A message goes on UDP only when the outcome proves the receiver
+  cannot deliver it:
+    Sent: done (StreamSendOutcome::Delivered).
+    MaybeDelivered: never resent, the peer may hold it. A stream reports
+      StreamSendOutcome::Dropped: quinn may still have held part of it unsent, and
+      Delivered would make the broadcast queue record a state the peer may lack,
+      with only anti-entropy to correct it. Dropped costs one spare full-state send.
+    Failed(NotOpened), a frame that cannot be built: UDP, a stream under its id with
+      its completion_tx. A pipe reads its stream again from the start.
+    Failed(TimedOut), a connection lost before the end: a Short goes on UDP, as it
+      needs its end to be delivered. A Stream is Dropped.
+    NOT_ACCEPTING_DATA: UDP for both.
+    BUDGET_REFUSED: a Short goes on UDP, which charges none. A Stream is Dropped.
+    Any other stop, Source, LengthMismatch: Dropped, counted (stops by code).
+  A stream that opened never goes again under its id: the receiver may remember it
+  and drops UDP fragments under it while still acking them. The operation layer
+  retries with a fresh id, as after a UDP stream failure, so a Dropped stream ends
+  as OutboundStreamFailed, which is stream-scoped. A source that ends or fails before
+  its first chunk is Dropped too: it has nothing to send on any route.
+  UdpSender sends a Short from the worker, and UdpStreamSender is what send_stream
+  and pipe_stream take of a connection, so flight size is charged by the same code
+  and rules as on UDP (#4345). A send that stays on the path charges none.
+  The worker is not one of the attempt's tasks, which are aborted. It watches
+  connection.closed(), closes the queue and hands what it holds to UDP, so a path
+  that ends costs only what may already have arrived. A message taken in the gap
+  before the close is seen fails to open and goes the same way. The UDP send of a
+  session that has already ended goes nowhere, as on a dropped connection.
+  A path that stops moving: STALLED_SENDS_LIMIT (8) timeouts in a row close it with
+  DOWNGRADE (stalled_closed), but only timeouts while nothing on the connection was
+  newly acknowledged within STALL_PROGRESS_WINDOW (ACK_WATCH_WINDOW, 10 s), read
+  from CappedCubic's record (recycle::AckProgress) when a send settles
+  (route::StallCount). Any acknowledgement or any Sent starts the count again. All
+  three kinds count: Failed(NotOpened(TimedOut)), Failed(TimedOut),
+  MaybeDelivered(TimedOut). NotOpened must count: a path whose permits are all
+  held by sends stuck waiting for acknowledgements is recycled only by this close.
+  The window must stay: without it a busy relay whose 48 permits hold transfers
+  that are being acknowledged, or a receiver whose consumer is slow while its QUIC
+  stack acknowledges, is closed and loses what the receiver's readers hold. Known
+  gap: a consumer stalled past the window while nothing else on the path is
+  acknowledged reads as a stalled path. An egress cap hold counts as progress,
+  by the ack watch's rule (recycle::cap_held, shared): while
+  total-bandwidth-limit holds QUIC transmits nothing can be acknowledged, and at
+  a low cap one held transmit waits longer than the window. A pipe that timed out
+  waiting for its source does not count (WatchedSource). It costs a normal
+  backoff.
+  Fast path: Session::routed is an atomic set only while the live attempt holds a
+  route, so a connection with no route (shadow, the default on Linux and macOS)
+  sends without taking the session's lock. enable_data runs once per activation
+  (debug assertion); a second route would orphan the first one's worker.
+  NOT_ACCEPTING_DATA: this node's gating or the peer's is wrong. Logged once per
+  path, counted (data_refused, and every time), new sends go on UDP and the path
+  stays up. send_data has three states so a send racing the refusal does not trip
+  debug_assert_carries_data. A small send acked before the stop is lost, and that
+  count is the only sign of it.
+  Telemetry: a transfer on a path emits transfer_started, _completed and _failed
+  and reports through the same arm. What comes from the UDP congestion controller
+  and sent tracker does not exist there: those fields are None or 0. A send that
+  falls back reports two starts under one id. The counts are per path
+  (QuicPathStats::send_count, send_event_count, stop_count).
+  Clocks: a send's deadlines are on the path's clock (DataRoute::clock), a transfer's
+  duration on the connection's. They differ in simulation.
 QUIC receive flow (#5940 e5b-4):
   The session owns one pair of data channels for its lifetime (data_channels; 256
   each) and every path it builds delivers to them, always with try_send. The

@@ -44,7 +44,8 @@ pub(in crate::transport) const QUIC_DATA_PERCENT: u8 = 0;
 /// drains the session's data channels, so a node that says it accepts data delivers
 /// a peer's frames. While this is `false`, [`QuicPolicy::own_caps`] returns 0
 /// outside test builds (`cfg(test)` or the `testing` feature, which the simulations
-/// use). A sender must also require a peer at or above the first release that reads.
+/// use). A peer's data bit proves it reads, so a sender needs no version check
+/// (`Session::enable_data`).
 pub(in crate::transport) const QUIC_DATA_RECEIVER_READY: bool = true;
 
 /// Whether `own_caps` may set the data bit in this build.
@@ -299,9 +300,9 @@ pub(crate) fn log_startup(config: &NetworkApiConfig) {
     if configured_mode(config) == QuicMode::Prefer {
         tracing::info!(
             data_percent = config.quic_data_percent().unwrap_or(QUIC_DATA_PERCENT),
-            "transport-quic = \"prefer\" negotiates data with this share of pairs; this \
-             release sends no data on QUIC paths: they carry only control frames and all \
-             application traffic stays on UDP"
+            "transport-quic = \"prefer\" negotiates data with this share of pairs: a pair \
+             sends its data on QUIC only if both sides set their data bit, and all other \
+             traffic stays on UDP"
         );
     }
     // These keys matter only with QUIC on.

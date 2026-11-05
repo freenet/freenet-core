@@ -1,7 +1,7 @@
 //! What a QUIC path delivers reaches the connection's `recv` as UDP's messages
 //! do (#5940 e5b-4). A real path on `VirtualTime`, built on the connection's
-//! budget and channels, with a raw test peer on the other end: no node code sends
-//! data on a path yet. The connection itself runs on `RealTime`, which barely moves
+//! budget and channels, with a raw test peer on the other end, so a test can send
+//! what a node would not. The connection itself runs on `RealTime`, which barely moves
 //! here, so its idle timers do not fire and an age limit is not reached.
 
 use std::time::Duration;
@@ -87,7 +87,7 @@ impl DataPath {
     }
 
     /// Let the virtual clock and every task run.
-    async fn settle(&self, by: Duration) {
+    pub(super) async fn settle(&self, by: Duration) {
         self.time.sleep(by).await;
     }
 }

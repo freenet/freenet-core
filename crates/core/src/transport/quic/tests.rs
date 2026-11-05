@@ -138,6 +138,40 @@ where
     }
 }
 
+/// [`drive`] on a multi-thread runtime. There, a task can still be running on
+/// another worker when this one runs out of things to poll, so after its turns it
+/// pauses briefly in real time, and moves the clock only to a wakeup that is
+/// armed. A stuck test is caught by the caller's real-time limit.
+pub(in crate::transport) async fn drive_on_threads<F>(
+    time: &VirtualTime,
+    limit: Duration,
+    fut: F,
+) -> F::Output
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let task = tokio::spawn(fut);
+    let limit_ns = time.now_nanos() + limit.as_nanos() as u64;
+    loop {
+        for _ in 0..64 {
+            if task.is_finished() {
+                return task.await.expect("the driven future panicked");
+            }
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        if task.is_finished() {
+            return task.await.expect("the driven future panicked");
+        }
+        time.advance_to_next_wakeup();
+        assert!(
+            time.now_nanos() <= limit_ns,
+            "virtual time passed {limit:?} before the future finished"
+        );
+    }
+}
+
 /// How long a QUIC test may run, in real time, before it is failed.
 const WATCHDOG: Duration = Duration::from_secs(120);
 
