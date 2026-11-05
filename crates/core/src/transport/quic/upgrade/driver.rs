@@ -989,7 +989,9 @@ impl Session {
 
     /// The path to send this connection's data on: the live attempt's, once both
     /// sides set the data bit (the attempt holds a route only then), unless the
-    /// peer refused data. `None` in shadow and after a teardown, which takes the
+    /// peer refused data or the path is suspect ([`QuicPath::is_suspect`]: a send
+    /// timed out with nothing acknowledged, so new data goes on UDP until the peer
+    /// acknowledges again). `None` in shadow and after a teardown, which takes the
     /// attempt under this same lock in the step that leaves `Active`, so a path
     /// that ended stops taking sends at once. The lock is short and never held
     /// across an await. A route read just before a teardown still works: what it
@@ -1133,6 +1135,22 @@ impl Session {
                     "path carried data: refused {}, delivered {}",
                     stats.count(Q::RefusedNotAcceptingData),
                     stats.count(Q::DeliveredShort) + stats.count(Q::AnnouncedStream)
+                )
+            });
+            self.note(|| {
+                use crate::transport::quic::path::QuicInboundOutcome as Q;
+                format!(
+                    "path closed refusing data: {}",
+                    path.stats().count(Q::ClosedRefusingData)
+                )
+            });
+            self.note(|| {
+                use crate::transport::quic::path::QuicSendEvent as E;
+                let stats = path.stats();
+                format!(
+                    "path was suspect: entered {}, left {}",
+                    stats.send_event_count(E::SuspectEntered),
+                    stats.send_event_count(E::SuspectLeft)
                 )
             });
             self.note(|| {

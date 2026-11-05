@@ -675,10 +675,13 @@ pub(crate) struct QuicPath {
     /// does not keep one.
     ack_progress: Option<recycle::AckProgress>,
     /// A send timed out with nothing acknowledged for the window: the path may
-    /// have gone dark, and new sends go on UDP until the count at
-    /// `suspect_acked` moves ([`Self::is_suspect`]).
+    /// have gone dark, and new sends go on UDP until the connection's count of
+    /// acknowledged packets moves from the one held here ([`Self::is_suspect`]).
+    /// Under one lock, so entering and leaving cannot interleave.
+    suspect_since_acked: parking_lot::Mutex<Option<u64>>,
+    /// Whether `suspect_since_acked` is set, so a path that is not suspect is
+    /// told so without the lock.
     suspect: std::sync::atomic::AtomicBool,
-    suspect_acked: AtomicU64,
     /// Where the path's watch reports that the peer was heard from.
     heard: Arc<recycle::PeerHeard>,
     #[cfg(test)]
@@ -858,8 +861,8 @@ impl QuicPath {
                 counted_as_data_path: std::sync::atomic::AtomicBool::new(false),
                 stall: parking_lot::Mutex::new(stall),
                 ack_progress,
+                suspect_since_acked: parking_lot::Mutex::new(None),
                 suspect: std::sync::atomic::AtomicBool::new(false),
-                suspect_acked: AtomicU64::new(0),
                 heard,
                 #[cfg(test)]
                 budget,
@@ -952,8 +955,10 @@ impl QuicPath {
     }
 
     /// The peer said it accepts no data on this path, so this node's gating or
-    /// the peer's is wrong. Logged once per path. The path stays up: it costs
-    /// nothing, and the same send would fail the same way on a new one.
+    /// the peer's is wrong. Logged once per path. New sends go on UDP from now
+    /// on. This side does not close the path: the refusing receiver does, with
+    /// DOWNGRADE, [`inbound::REFUSAL_CLOSE_DELAY`] after its first refusal, and
+    /// this side falls back on that close.
     fn stop_sending_data(&self) {
         self.stats.record_send_event(QuicSendEvent::DataRefused);
         // No longer a path that carries data.
@@ -1005,8 +1010,11 @@ impl QuicPath {
     /// retry lands in the same place. Sends already on the path stay there, since
     /// resending them could deliver a message twice.
     pub(in crate::transport) fn become_suspect(&self, acked: u64) {
-        self.suspect_acked.store(acked, Ordering::Release);
-        if !self.suspect.swap(true, Ordering::AcqRel) {
+        let mut since = self.suspect_since_acked.lock();
+        let entered = since.replace(acked).is_none();
+        self.suspect.store(true, Ordering::Release);
+        drop(since);
+        if entered {
             self.stats.record_send_event(QuicSendEvent::SuspectEntered);
             tracing::debug!(
                 remote = %self.connection.inner().remote_address(),
@@ -1019,7 +1027,12 @@ impl QuicPath {
     /// Whether the path is suspect: new data goes on UDP. It stops being suspect
     /// the first time this is asked after the connection acknowledged something
     /// new, which quinn's keepalive brings within its interval on a live path.
-    /// A path that stays dark is recycled by the stall close or the idle timeout.
+    ///
+    /// A path that stays dark ends on quinn's idle timeout (120 s in
+    /// production), not on the stall close: once it is suspect no new send
+    /// reaches it, so `route::STALLED_SENDS_LIMIT` timeouts in a row happen only
+    /// if that many sends were already on it. Nothing is lost meanwhile, since
+    /// new data goes on UDP.
     pub(in crate::transport) fn is_suspect(&self) -> bool {
         if !self.suspect.load(Ordering::Acquire) {
             return false;
@@ -1027,13 +1040,18 @@ impl QuicPath {
         let Some(progress) = &self.ack_progress else {
             return false;
         };
-        if progress.acked() == self.suspect_acked.load(Ordering::Acquire) {
-            return true;
+        let mut since = self.suspect_since_acked.lock();
+        match *since {
+            Some(acked) if progress.acked() == acked => true,
+            Some(_) => {
+                *since = None;
+                self.suspect.store(false, Ordering::Release);
+                drop(since);
+                self.stats.record_send_event(QuicSendEvent::SuspectLeft);
+                false
+            }
+            None => false,
         }
-        if self.suspect.swap(false, Ordering::AcqRel) {
-            self.stats.record_send_event(QuicSendEvent::SuspectLeft);
-        }
-        false
     }
 
     /// Whether a new data send may start on this path.

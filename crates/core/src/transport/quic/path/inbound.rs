@@ -172,8 +172,6 @@ pub(in crate::transport::quic) struct Receiver<T> {
     accept_data: bool,
     /// Closes the path on the first data frame it refuses ([`Self::accept_data`]).
     closer: super::super::QuicCloser,
-    /// The close on a refusal has been started.
-    closing: std::sync::atomic::AtomicBool,
     /// Panic on the next stream, to test the supervisor.
     #[cfg(test)]
     pub(in crate::transport::quic) panic_on_stream: bool,
@@ -200,7 +198,6 @@ impl<T: TimeSource> Receiver<T> {
             next_short_key: AtomicU32::new(1),
             accept_data,
             closer,
-            closing: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             panic_on_stream: false,
         }
@@ -702,18 +699,20 @@ async fn read_one<T: TimeSource>(recv: quinn::RecvStream, receiver: Arc<Receiver
         // The close waits, in this reader alone, so the stops already sent reach
         // the sender first: a sender that sees the close before a stream's stop
         // reads the stream as lost and drops it, where the stop sends it on UDP.
-        if !receiver.closing.swap(true, Ordering::Relaxed) {
-            receiver.time.sleep(REFUSAL_CLOSE_DELAY).await;
-            if receiver.closer.close(QuicCloseCode::Downgrade) {
-                receiver
-                    .stats
-                    .record(QuicInboundOutcome::ClosedRefusingData);
-                tracing::warn!(
-                    kind = ?header.kind(),
-                    "QUIC path: the peer sent data on a path where this node did not \
-                     set its data bit; closing the path so the peer falls back to UDP"
-                );
-            }
+        // Every refused frame's reader waits and then asks; `QuicCloser::close`
+        // is at most once per connection and a no-op once it has ended, so the
+        // first close is the only one counted and logged. The waits are bounded
+        // by the peer's stream credit and end with the connection.
+        receiver.time.sleep(REFUSAL_CLOSE_DELAY).await;
+        if receiver.closer.close(QuicCloseCode::Downgrade) {
+            receiver
+                .stats
+                .record(QuicInboundOutcome::ClosedRefusingData);
+            tracing::warn!(
+                kind = ?header.kind(),
+                "QUIC path: the peer sent data on a path where this node did not \
+                 set its data bit; closing the path so the peer falls back to UDP"
+            );
         }
         return;
     }

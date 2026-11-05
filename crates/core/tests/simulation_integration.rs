@@ -21169,31 +21169,59 @@ fn test_quic_data_path_cut_mid_transfer_falls_back_to_udp() {
         assert!(run.whats(*address, "DataEnabled") >= 1, "{}", run.dump());
     }
     let records = run.trace.records();
-    let fell_back = records
-        .iter()
-        .find(|r| r.what.starts_with("Fallback(") || r.what.starts_with("ChurnedFallback("))
-        .unwrap_or_else(|| panic!("the dark path fell back: {}", run.dump()));
-    // Suspect: after the last data the path delivered, and before it fell back,
-    // data arrived on UDP. Without it every message went on the dark path and
-    // was lost until the idle timeout.
-    let last_on_path = records
-        .iter()
-        .filter(|r| {
-            r.what.starts_with("received a short on the path")
-                || r.what.starts_with("received a stream on the path")
-        })
-        .map(|r| r.at)
-        .max()
-        .expect("the path delivered data before the cut");
-    assert!(
-        records
+    let mut on_udp_while_dark = false;
+    // Each end: its path went suspect before it closed, and fell back on the
+    // idle timeout. Times are compared per node: each host's trace clock starts
+    // on its own.
+    for address in &run.nodes {
+        let of_node = |what: &str| {
+            records
+                .iter()
+                .filter(|r| r.node == *address && r.what.starts_with(what))
+                .collect::<Vec<_>>()
+        };
+        let fell_back = of_node("Fallback(");
+        assert_eq!(
+            fell_back
+                .iter()
+                .map(|r| r.what.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Fallback(Idle)"],
+            "{address} fell back on the idle timeout: {}",
+            run.dump()
+        );
+        let fell_back_at = fell_back[0].at;
+        assert!(
+            of_node("path was suspect: entered ")
+                .iter()
+                .any(|r| !r.what.starts_with("path was suspect: entered 0")),
+            "{address}'s path went suspect: {}",
+            run.dump()
+        );
+        // Suspect: after the last data its path delivered here, and before it
+        // fell back, data arrived here on UDP.
+        let last_on_path = of_node("received a short on the path")
             .iter()
-            .any(|r| r.what.starts_with("data arrived on UDP")
-                && r.at > last_on_path
-                && r.at < fell_back.at),
-        "data went on UDP while the dark path was up: {}",
+            .chain(of_node("received a stream on the path").iter())
+            .map(|r| r.at)
+            .max();
+        if let Some(last_on_path) = last_on_path {
+            on_udp_while_dark |= of_node("data arrived on UDP")
+                .iter()
+                .any(|r| r.at > last_on_path && r.at < fell_back_at);
+        }
+    }
+    // At least one end had data for the other while the path was dark, and it
+    // went on UDP: without suspect routing it went on the dark path and was lost.
+    assert!(
+        on_udp_while_dark,
+        "data came on UDP while the dark path was up: {}",
         run.dump()
     );
+    let fell_back = records
+        .iter()
+        .find(|r| r.what.starts_with("Fallback("))
+        .unwrap_or_else(|| panic!("the dark path fell back: {}", run.dump()));
     let offered_again = records
         .iter()
         .find(|r| r.what == "Offered" && r.at > fell_back.at)
@@ -21309,6 +21337,19 @@ fn test_quic_data_refused_by_the_peer_closes_the_path_and_falls_back_to_udp() {
     assert!(
         run.total("Fallback(DowngradeReceived)") >= 1,
         "the node fell back on the gateway's close: {}",
+        run.dump()
+    );
+    assert!(
+        run.total("path closed refusing data: 1") >= 1,
+        "the gateway closed the path on its refusal: {}",
+        run.dump()
+    );
+    // The backoff after each DOWNGRADE (60 s, doubling) bounds the renegotiation
+    // over the run's ~6 minutes: a tight loop of offers and closes fails here.
+    assert!(run.total("Offered") <= 5, "offers: {}", run.dump());
+    assert!(
+        run.total("Fallback(DowngradeReceived)") <= 4,
+        "fallbacks: {}",
         run.dump()
     );
     let stored = result

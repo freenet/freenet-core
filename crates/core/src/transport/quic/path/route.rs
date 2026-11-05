@@ -196,6 +196,12 @@ pub(crate) struct StallVerdict {
 /// count again. Do not drop a kind of timeout from the count, and do not count
 /// one while acknowledgements arrive.
 ///
+/// The first counted timeout also makes the path suspect
+/// ([`QuicPath::become_suspect`]), which keeps new sends off it. So on a path
+/// that went dark the close fires only if `STALLED_SENDS_LIMIT` sends were
+/// already on it; otherwise the path ends on quinn's idle timeout, with its new
+/// data on UDP meanwhile.
+///
 /// The acknowledgement count is read when a send settles, so progress is seen at
 /// the next settle after it, within one send's deadline. A receiver whose
 /// consumer stays stalled past the window while nothing else on the path is

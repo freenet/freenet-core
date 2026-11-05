@@ -1953,8 +1953,12 @@ QUIC send route (#5940 e5b-6, quic/upgrade/data_route.rs,
   within 15 s on a live path), the path takes data again (suspect_left). Without
   it every short into a dark path ends MaybeDelivered(TimedOut), is never resent
   and is lost, and an operation's retry lands in the same place until quinn's
-  idle timeout. The stall close and the idle timeout still recycle a path that
-  stays dark.
+  idle timeout. A path that stays dark ends on quinn's idle timeout (120 s in
+  production, Fallback(Idle)), not on the stall close: once suspect no new send
+  reaches it, so the stall close fires only when STALLED_SENDS_LIMIT sends were
+  already on it. New data goes on UDP meanwhile, so nothing is lost. Entering
+  and leaving are under one lock. Fallback is a testing-period crutch: this
+  routing goes with it when the legacy transport is removed.
   Receiver side: a path whose own data bit is 0 stops the first data frame with
   NOT_ACCEPTING_DATA and closes the path with DOWNGRADE REFUSAL_CLOSE_DELAY (2 s)
   later (closed_refusing_data, a WARN once per path). The delay lets the stops
@@ -1962,7 +1966,8 @@ QUIC send route (#5940 e5b-6, quic/upgrade/data_route.rs,
   drops the stream, where the stop sends it on UDP. Without the close, a Short of
   one packet is acknowledged before its stop arrives, so its sender reads Sent,
   never clears send_data and loses every short on the path. The pair then
-  negotiates again after the normal backoff.
+  negotiates again after the normal backoff. Residual: a one-packet short sent
+  in the 2 s window is acknowledged before its stop is seen and is lost.
   NOT_ACCEPTING_DATA at the sender: this node's gating or the peer's is wrong.
   Logged once per path, counted (data_refused, and every time), and new sends go
   on UDP; the receiver closes the path. send_data has three states so a send racing the refusal does not trip

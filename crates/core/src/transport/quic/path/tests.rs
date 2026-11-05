@@ -3278,6 +3278,41 @@ fn a_shadow_path_refuses_data_before_charging_the_budget_and_closes() {
     })
 }
 
+/// A path that ends inside the refusal's close delay is not closed again: no
+/// `ClosedRefusingData` is counted, and the receiver's reader for the refused
+/// frame ends with the connection.
+#[test]
+fn a_path_that_ends_inside_the_refusal_delay_is_not_closed_again() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths_with("quic-path-refused-end", 66, QuicPathLimits::SHADOW, None).await;
+        let (a, time) = (p.a.clone(), p.time());
+        let short = p
+            .drive(async move {
+                let short = a
+                    .send_short_bounded(&time, Duration::from_secs(5), &over_window())
+                    .await;
+                // Inside the delay, the path ends from the sender's side.
+                time.sleep(inbound::REFUSAL_CLOSE_DELAY / 2).await;
+                a.close(QuicCloseCode::NodeDroppedPeer);
+                time.sleep(inbound::REFUSAL_CLOSE_DELAY * 2).await;
+                short
+            })
+            .await;
+        assert!(
+            matches!(
+                short,
+                BoundedSend::Failed(SendFailure::Error(QuicSendError::Stopped(_)))
+            ),
+            "{short:?}"
+        );
+        let stats = p.b.stats();
+        assert_eq!(stats.count(QuicInboundOutcome::RefusedNotAcceptingData), 1);
+        assert_eq!(stats.count(QuicInboundOutcome::ClosedRefusingData), 0);
+        assert!(p.b.quinn_connection().close_reason().is_some());
+    })
+}
+
 /// Counts `on_fragment_sent` calls.
 #[derive(Default)]
 struct Fragments(std::sync::atomic::AtomicUsize);
