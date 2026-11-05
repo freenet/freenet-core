@@ -1386,7 +1386,11 @@ once connections open, quinn's connection-ID draws
 inside quinn's tasks. With endpoints idle, the one difference from QUIC off
 is scheduling (one endpoint driver task per node), which changes some
 connection choices, so a QUIC-on run is compared with QUIC off by the peers
-that join, not by the exact edge set. `probe_quic_endpoints_at` sends each
+that join, not by the exact edge set. Every runner moves that VirtualTime: the
+direct runner from tokio's clock, the turmoil runners after each step
+(`run_turmoil_on_virtual_time`); before that the turmoil runners left it at 0, so
+no QUIC timer fired there. A record's `at` is on its host's own clock; under
+turmoil each host's starts when its runtime is built. `probe_quic_endpoints_at` sends each
 node a stranger's QUIC datagram during a direct-runner run, so a test can
 check every endpoint was live (`not_allowed`) rather than failed to bind.
 `SimNetwork::quic_upgrade_trace` returns a handle (`quic/upgrade/sim_trace.rs`,
@@ -1399,7 +1403,7 @@ peer's address as its source each time it allows that address, and records
 `injected an Initial`), `make_record_wrong` (the key compared after the
 handshake disagrees, so the path closes with IDENTITY_MISMATCH),
 `fail_endpoint_at` (the endpoint
-driver dies) and `run_as_release` (a peer reporting the crate's version reads
+driver dies, recorded as `failed the endpoint at <ms> ms` on VirtualTime) and `run_as_release` (a peer reporting the crate's version reads
 as a given release, since this tree reports a version below the negotiation
 floor until the release bump). The first offer is 2-10 s after promotion, so give a run tens of
 virtual seconds.

@@ -339,6 +339,7 @@ Scale > 50 nodes or virtual time > 5 minutes?
 
 - **Direct runner** (`run_simulation_direct`): Single `current_thread` + `start_paused(true)` tokio runtime. 100% deterministic. Scales to 500+ nodes. Supports `ChurnConfig` for automated crash/recover cycles via fault injection. Used by fdev CLI and nightly tests.
 - **Turmoil runner** (`run_simulation`): Turmoil scheduler. ~99% deterministic. Supports mid-simulation fault injection via closures (partitions, targeted crashes). Better for fine-grained fault tolerance tests.
+- Both kinds move the network's `VirtualTime`, which QUIC endpoints and paths and the fault injector's time-based rules run on: the direct runner from tokio's clock, the turmoil runners (`run_simulation`, `run_controlled_simulation`, `run_fdev_test`, `run_turmoil_simulation`) through `run_turmoil_on_virtual_time` after each step. A test that drives turmoil itself with `sim.run()` leaves VirtualTime at 0, so no timer on it fires.
 
 ## Fault Injection in Turmoil Tests
 

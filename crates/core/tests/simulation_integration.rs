@@ -1688,6 +1688,8 @@ fn test_high_latency_timeout_regression() {
 
 /// Test: Use actual SimulationSocket inside Turmoil.
 /// This verifies that the real in-memory socket works with Turmoil's deterministic scheduler.
+/// It drives turmoil itself with `sim.run()`, so the VirtualTime it registers stays
+/// at 0: nothing here (no QUIC endpoint, no time-based fault rule) runs on it.
 #[test]
 fn test_turmoil_with_real_simulation_socket() -> turmoil::Result {
     let network_name = "turmoil-test";
@@ -21497,7 +21499,8 @@ fn test_controlled_simulation_advances_virtual_time() {
         (sim, trace, time, gateway_addr)
     });
     drop(rt);
-    let result = sim.run_controlled_simulation(SEED, Vec::new(), Duration::from_secs(60), WAIT);
+    let (no_operations, max_duration) = (Vec::new(), Duration::from_secs(60));
+    let result = sim.run_controlled_simulation(SEED, no_operations, max_duration, WAIT);
     assert!(
         result.turmoil_result.is_ok(),
         "simulation failed: {:?}",
@@ -21510,18 +21513,26 @@ fn test_controlled_simulation_advances_virtual_time() {
         now >= WAIT + Duration::from_secs(3),
         "VirtualTime followed the run: {now:?}"
     );
-    let failed = trace.matching(gateway_addr, "failed the endpoint");
+    let failed = trace.matching(gateway_addr, "failed the endpoint at ");
     assert_eq!(
         failed.len(),
         1,
         "the 5 s timer fired once: {:#?}",
         trace.records()
     );
+    // The time the record carries is on the path clock, VirtualTime itself; a
+    // record's `at` is on its host's own clock, which under turmoil does not
+    // start at the run's start.
+    let fired_ms: u64 = failed[0]
+        .what
+        .trim_start_matches("failed the endpoint at ")
+        .trim_end_matches(" ms")
+        .parse()
+        .expect("the record carries its time");
+    let fired = Duration::from_millis(fired_ms);
     assert!(
-        failed[0].at >= FAIL_AT - Duration::from_millis(100)
-            && failed[0].at <= FAIL_AT + Duration::from_secs(1),
-        "it fired at 5 s: {:?}",
-        failed[0].at
+        fired >= FAIL_AT && fired <= FAIL_AT + Duration::from_secs(1),
+        "it fired at 5 s on VirtualTime: {fired:?}"
     );
 }
 
