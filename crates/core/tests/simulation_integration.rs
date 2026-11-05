@@ -21856,3 +21856,104 @@ fn test_quic_mixed_modes_are_deterministic() {
     };
     assert_eq!(once("quic-mixed-det-run1"), once("quic-mixed-det-run2"));
 }
+
+/// A subscriber that misses a 1 MiB contract's update (crashed while it was
+/// broadcast) is healed by anti-entropy, and the heal never holds a node's event
+/// loop. Before the fix, the simulation build awaited the heal's send inside the
+/// event loop, and that send waits for its stream's completion, which the blocked
+/// loop could not dispatch: each heal held the loop for STREAM_COMPLETION_TIMEOUT
+/// (120 s), and every message the node received waited behind it.
+#[test_log::test]
+fn test_heal_of_a_streamed_state_does_not_block_the_event_loop() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation, register_crdt_contract};
+    const NETWORK: &str = "heal-event-loop";
+    const SEED: u64 = 0x5842_E5B9_0001;
+    const STATE_LEN: usize = 1024 * 1024;
+    setup_deterministic_state(SEED);
+    let contract = SimOperation::create_test_contract(0x91);
+    let key = contract.key();
+    register_crdt_contract(*key.id());
+    let state = |version: u64| {
+        let mut bytes = version.to_le_bytes().to_vec();
+        bytes.extend((0..STATE_LEN).map(|i| (i % 251) as u8 ^ version as u8));
+        bytes
+    };
+    let (initial, updated) = (state(1), state(2));
+
+    let rt = create_runtime();
+    let sim = rt.block_on(async {
+        let mut sim = SimNetwork::new(NETWORK, 1, 2, 7, 3, 10, 2, SEED).await;
+        sim.with_streaming_threshold(64 * 1024);
+        sim.with_controlled_op_interval(Duration::from_secs(10));
+        sim.wait_for_join_convergence_before_ops(1.0, Duration::from_secs(60));
+        sim
+    });
+    drop(rt);
+    let gateway = NodeLabel::gateway(NETWORK, 0);
+    let stale = NodeLabel::node(NETWORK, 1);
+    let other = NodeLabel::node(NETWORK, 2);
+    let subscribe = |label: &NodeLabel| {
+        ScheduledOperation::new(
+            label.clone(),
+            SimOperation::Get {
+                contract_id: *key.id(),
+                return_contract_code: true,
+                subscribe: true,
+            },
+        )
+    };
+    let operations = vec![
+        ScheduledOperation::new(
+            gateway.clone(),
+            SimOperation::Put {
+                contract: contract.clone(),
+                state: initial,
+                subscribe: true,
+            },
+        ),
+        subscribe(&stale),
+        subscribe(&other),
+        ScheduledOperation::new(stale.clone(), SimOperation::CrashNode),
+        ScheduledOperation::new(
+            gateway.clone(),
+            SimOperation::Update {
+                key,
+                data: updated.clone(),
+            },
+        ),
+        ScheduledOperation::new(stale.clone(), SimOperation::RecoverNode),
+    ];
+    // Long enough for anti-entropy (about 5 minutes) to find and heal the
+    // stale copy.
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(1200),
+        Duration::from_secs(600),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "simulation failed: {:?}",
+        result.turmoil_result.err()
+    );
+    let longest = GlobalTestMetrics::longest_event_loop_event();
+    let stored = |label: &NodeLabel| {
+        result
+            .node_storages
+            .get(label)
+            .and_then(|storage| storage.get_stored_state(&key))
+            .map(|state| state.as_ref().to_vec())
+    };
+    assert!(
+        stored(&other).as_deref() == Some(updated.as_slice()),
+        "premise: the subscriber that stayed up got the update"
+    );
+    assert!(
+        stored(&stale).as_deref() == Some(updated.as_slice()),
+        "the crashed subscriber was healed (longest event-loop event {longest:?})"
+    );
+    assert!(
+        longest < Duration::from_secs(10),
+        "a node's event loop was held for {longest:?} by one event"
+    );
+}

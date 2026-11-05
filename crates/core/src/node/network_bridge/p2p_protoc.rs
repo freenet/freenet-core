@@ -1785,6 +1785,10 @@ impl P2pConnManager {
                     .await;
             }
 
+            // How long this event holds the loop, for tests: nothing else the
+            // node receives is handled until it ends.
+            #[cfg(any(test, feature = "testing"))]
+            let _event_timer = EventLoopTimer(tokio::time::Instant::now());
             match event {
                 EventResult::Continue => continue,
                 EventResult::Event(event) => {
@@ -4007,6 +4011,18 @@ fn extract_sender_from_message_mut(msg: &mut NetMessage) -> Option<&mut PeerKeyL
 }
 
 // TODO: add testing for the network loop, now it should be possible to do since we don't depend upon having real connections
+
+/// Records, when dropped, how long the event loop spent on one event
+/// (`GlobalTestMetrics::longest_event_loop_event`).
+#[cfg(any(test, feature = "testing"))]
+struct EventLoopTimer(tokio::time::Instant);
+
+#[cfg(any(test, feature = "testing"))]
+impl Drop for EventLoopTimer {
+    fn drop(&mut self) {
+        crate::config::GlobalTestMetrics::record_event_loop_event(self.0.elapsed());
+    }
+}
 
 #[cfg(test)]
 pub(crate) mod tests {

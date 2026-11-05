@@ -302,9 +302,22 @@ mod tests {
         );
         assert!(
             heal.contains("op_manager.broadcast_spacing.try_begin(key.id(), &peer_key)")
-                && heal.contains("Ok(_claim) =>"),
-            "the simulation heal path must apply the spacing and hold the claim \
-             across its send"
+                && heal.contains("Ok(claim) =>"),
+            "the simulation heal path must apply the spacing"
+        );
+        // The send runs in a spawned task, not on the event loop: it waits for
+        // its stream's completion, which only the event loop dispatches. The
+        // claim moves into that task and is bound there before the send, so it
+        // stays held until the send ends.
+        let task = heal
+            .split_once("GlobalExecutor::spawn(async move {")
+            .map(|(_, task)| task)
+            .expect("the simulation heal sends from a spawned task, not the event loop");
+        let held = task.find("let _claim = claim;");
+        let sent = task.find("broadcast_to_single_peer(");
+        assert!(
+            matches!((held, sent), (Some(held), Some(sent)) if held < sent),
+            "the spawned heal must hold the claim across its send"
         );
     }
 

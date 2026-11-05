@@ -5685,6 +5685,7 @@ std::thread_local! {
     static GLOBAL_FULL_STATE_SEND_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_PENDING_OP_INSERTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_PENDING_OP_REMOVES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static GLOBAL_LONGEST_EVENT_LOOP_EVENT_NANOS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_PENDING_OP_HWM: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_PENDING_OP_SKIPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_NEIGHBOR_HOSTING_UPDATES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -5801,6 +5802,7 @@ impl GlobalTestMetrics {
         GLOBAL_PENDING_OP_INSERTS.with(|c| c.set(0));
         GLOBAL_PENDING_OP_SKIPS.with(|c| c.set(0));
         GLOBAL_PENDING_OP_REMOVES.with(|c| c.set(0));
+        GLOBAL_LONGEST_EVENT_LOOP_EVENT_NANOS.with(|c| c.set(0));
         GLOBAL_PENDING_OP_HWM.with(|c| c.set(0));
         GLOBAL_NEIGHBOR_HOSTING_UPDATES.with(|c| c.set(0));
         GLOBAL_NOTIFICATION_COHOSTS_SKIPPED.with(|c| c.set(0));
@@ -6068,6 +6070,19 @@ impl GlobalTestMetrics {
 
     pub fn pending_op_inserts() -> u64 {
         GLOBAL_PENDING_OP_INSERTS.with(|c| c.get())
+    }
+
+    /// Records how long a node's event loop spent handling one event, keeping
+    /// the longest. Every node's event loop on this thread shares the figure.
+    pub fn record_event_loop_event(elapsed: std::time::Duration) {
+        let nanos = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        GLOBAL_LONGEST_EVENT_LOOP_EVENT_NANOS.with(|c| c.set(c.get().max(nanos)));
+    }
+
+    /// The longest time any node's event loop on this thread spent on one event
+    /// since the last reset. A loop busy that long received nothing else.
+    pub fn longest_event_loop_event() -> std::time::Duration {
+        std::time::Duration::from_nanos(GLOBAL_LONGEST_EVENT_LOOP_EVENT_NANOS.with(|c| c.get()))
     }
 
     pub fn record_pending_op_remove() {
