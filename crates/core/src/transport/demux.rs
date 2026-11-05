@@ -258,9 +258,9 @@ impl<S> DemuxSocket<S> {
         self
     }
 
-    /// Wrap an already-bound socket. Test-only: the transport binds through
-    /// [`Socket::bind`].
-    #[cfg(test)]
+    /// Wrap an already-bound socket. Tests and the bench lab only: the
+    /// transport binds through [`Socket::bind`].
+    #[cfg(any(test, feature = "bench"))]
     pub(crate) fn wrap(inner: S, egress: Option<EgressCap>) -> Self {
         Self::new(inner, egress)
     }

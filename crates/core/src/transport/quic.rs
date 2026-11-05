@@ -43,6 +43,8 @@ pub(crate) mod control;
 pub(crate) mod error;
 pub(crate) mod framing;
 pub(crate) mod identity;
+#[cfg(feature = "bench")]
+pub mod lab;
 pub(crate) mod liveness;
 pub(crate) mod path;
 pub(crate) mod recycle;
