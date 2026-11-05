@@ -77,7 +77,7 @@ pub(crate) struct QuicDataCounters {
 }
 
 impl QuicDataCounters {
-    pub(super) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let zero = || AtomicU64::new(0);
         Self {
             sends: std::array::from_fn(|_| std::array::from_fn(|_| zero())),
@@ -189,7 +189,7 @@ impl QuicDataCounters {
     }
 
     /// The period's counts, reset when `reset`. The gauge is read, never reset.
-    pub(super) fn snapshot(&self, reset: bool) -> QuicDataSnapshot {
+    pub(crate) fn snapshot(&self, reset: bool) -> QuicDataSnapshot {
         let get = |a: &AtomicU64| {
             if reset {
                 a.swap(0, Ordering::Relaxed)

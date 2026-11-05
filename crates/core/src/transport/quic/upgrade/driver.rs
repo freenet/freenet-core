@@ -83,7 +83,9 @@ use crate::config::{GlobalExecutor, GlobalRng};
 use crate::node::background_task_monitor::LateRegistrar;
 use crate::simulation::{RealTime, TimeSource, VirtualTime};
 use crate::transport::crypto::TransportPublicKey;
-use crate::transport::metrics::{QuicCloseCode, QuicFallback, QuicUpgradeOutcome};
+use crate::transport::metrics::{
+    QuicCloseCode, QuicDataCounters, QuicFallback, QuicUpgradeOutcome,
+};
 use crate::transport::peer_connection::UdpSender;
 use crate::transport::peer_connection::inbound_budget::SharedInboundBudget;
 use crate::transport::quic::control::ControlError;
@@ -332,8 +334,9 @@ struct Attempt {
     /// to hand what it holds to UDP.
     route: Option<DataRoute>,
     /// The session's [`Session::routed`], set while `route` is held. Cleared when
-    /// the attempt goes, which happens only under the session's lock.
-    routed: Option<Arc<AtomicBool>>,
+    /// the attempt goes, which happens only under the session's lock, as is the
+    /// node's `quic_data_paths` gauge this route raised.
+    routed: Option<(Arc<AtomicBool>, &'static QuicDataCounters)>,
     /// The dial or establish task, the control sends and the path's pump.
     tasks: Vec<JoinHandle<()>>,
 }
@@ -358,9 +361,9 @@ impl Drop for Attempt {
         for task in &self.tasks {
             task.abort();
         }
-        if let Some(routed) = &self.routed {
+        if let Some((routed, counters)) = &self.routed {
             routed.store(false, Ordering::Release);
-            TRANSPORT_METRICS.quic_data.data_path_ended();
+            counters.data_path_ended();
         }
     }
 }
@@ -426,6 +429,10 @@ pub(in crate::transport) struct QuicUpgrades {
     inbox_overflow: AtomicU64,
     #[cfg(any(test, feature = "testing"))]
     trace: Option<super::sim_trace::NodeTrace>,
+    /// Where a test's paths keep their node-wide counts in place of
+    /// `TRANSPORT_METRICS`.
+    #[cfg(test)]
+    test_counters: Option<&'static QuicDataCounters>,
 }
 
 impl QuicUpgrades {
@@ -452,6 +459,8 @@ impl QuicUpgrades {
             inbox_overflow: AtomicU64::new(0),
             #[cfg(any(test, feature = "testing"))]
             trace,
+            #[cfg(test)]
+            test_counters: None,
         })
     }
 
@@ -748,7 +757,11 @@ impl Session {
             }
             // Not in `QuicUpgradeOutcome`, which is at 32, the longest array serde
             // and `Default` take: `quic_data_enabled` (`metrics::quic_data`).
-            Outcome::DataEnabled => TRANSPORT_METRICS.quic_data.record_data_enabled(),
+            Outcome::DataEnabled => {
+                if let Some(path) = state.attempt.as_ref().and_then(|held| held.path.as_ref()) {
+                    path.stats().node().record_data_enabled();
+                }
+            }
             Outcome::Declined { reason, uncharged } => {
                 count(declined(reason));
                 if uncharged {
@@ -965,10 +978,11 @@ impl Session {
             self.route_note(),
         );
         held.route = Some(route);
-        held.routed = Some(Arc::clone(&self.routed));
+        let counters = path.stats().node();
+        held.routed = Some((Arc::clone(&self.routed), counters));
         self.routed.store(true, Ordering::Release);
         // Ended by the attempt's drop, which clears `routed`.
-        TRANSPORT_METRICS.quic_data.data_path_started();
+        counters.data_path_started();
         // Bounded by the path: it ends when the connection does and what it holds
         // is gone, so the handle is not monitored and is not in `held.tasks`.
         drop(GlobalExecutor::spawn(report_panics(self.remote, worker)));
@@ -1012,11 +1026,16 @@ impl Session {
     fn build_path(&self, state: &mut SessionState, attempt: u32, connection: QuicConnection) {
         // At once, not when the peer's bit arrives: the peer's first stream can
         // overtake the frame that carries it.
-        let limits = if state.machine.accepts_data() {
+        #[cfg_attr(not(test), allow(unused_mut))]
+        let mut limits = if state.machine.accepts_data() {
             QuicPathLimits::DEFAULT
         } else {
             QuicPathLimits::SHADOW
         };
+        #[cfg(test)]
+        {
+            limits.counters = self.hub.test_counters;
+        }
         let (path, controls) = QuicPath::with_budget(
             connection,
             self.hub.path_clock.clone(),
@@ -1216,16 +1235,13 @@ impl Session {
                 return;
             }
             // A session that ends under a data path (`quic_session_ended_with_data_path_*`).
-            let data_path_age = state
-                .attempt
-                .as_ref()
-                .filter(|held| held.route.is_some())
-                .and_then(|held| held.gauge.active_since)
-                .map(|since| (self.now)().saturating_sub(since));
-            if let Some(age) = data_path_age {
-                TRANSPORT_METRICS
-                    .quic_data
-                    .record_session_ended_with_data_path(age);
+            let data_path = state.attempt.as_ref().and_then(|held| {
+                let since = held.gauge.active_since?;
+                held.route.as_ref()?;
+                Some((held.path.as_ref()?.stats().node(), since))
+            });
+            if let Some((counters, since)) = data_path {
+                counters.record_session_ended_with_data_path((self.now)().saturating_sub(since));
             }
             let actions = self.step(&mut state, Event::SessionEnded);
             let sends = self.apply(&mut state, actions);

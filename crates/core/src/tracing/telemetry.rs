@@ -7670,6 +7670,61 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
+    /// The QUIC data counts go out flat, one key per non-zero count with its own
+    /// value, in the event log and in the upload alike, and the nested field
+    /// does not.
+    #[test]
+    fn transport_snapshot_json_carries_quic_data_values() {
+        use crate::transport::metrics::{QuicDataCounters, TransportSnapshot};
+        let mut snapshot = TransportSnapshot {
+            quic_data: QuicDataCounters::new().snapshot(false),
+            ..Default::default()
+        };
+        let mut next = 0u64;
+        let mut fill = |values: &mut Vec<u64>| {
+            for value in values.iter_mut() {
+                next += 1;
+                *value = next;
+            }
+        };
+        let data = &mut snapshot.quic_data;
+        fill(&mut data.sends);
+        fill(&mut data.events);
+        fill(&mut data.stops);
+        fill(&mut data.inbound);
+        fill(&mut data.session_ended_with_data_path);
+        data.data_enabled = 1001;
+        data.data_paths = 1002;
+        data.sends_opened = 1003;
+        data.open_uni_waited = 1004;
+        data.permit_takes = 1005;
+        data.permit_waited = 1006;
+        data.bytes_sent = 1007;
+        data.bytes_received = 1008;
+        data.streams_open_paths_sampled = 1009;
+        data.streams_open_ge = vec![1010, 1011, 1012, 1013];
+        data.streams_open_max = 1014;
+        let want: std::collections::BTreeMap<String, u64> =
+            snapshot.quic_data.keys().into_iter().collect();
+        assert!(want.values().all(|value| *value != 0));
+        let distinct: std::collections::BTreeSet<_> = want.values().collect();
+        assert_eq!(distinct.len(), want.len(), "each value tells its key apart");
+
+        let event = event_kind_to_json(&super::super::EventKind::TransportSnapshot(Box::new(
+            snapshot.clone(),
+        )));
+        let upload = snapshot.upload_json().expect("serializes");
+        for json in [event, upload] {
+            let map = json.as_object().unwrap();
+            assert!(!map.contains_key("quic_data"));
+            for (key, value) in &want {
+                assert_eq!(map.get(key), Some(&serde_json::json!(value)), "{key}");
+            }
+            let sent = map.keys().filter(|key| want.contains_key(*key)).count();
+            assert_eq!(sent, want.len());
+        }
+    }
+
     /// As below, for the NAT-origin, stray-intro and dial-queue counts:
     /// each is distinct and non-zero, so a swapped or mis-keyed one is caught.
     #[test]

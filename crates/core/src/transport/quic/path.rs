@@ -152,7 +152,7 @@ use crate::config::GlobalExecutor;
 use crate::simulation::TimeSource;
 use crate::transport::StreamId;
 use crate::transport::boundary::StreamProgressObserver;
-use crate::transport::metrics::{InboundStreamOutcome, QuicCloseCode};
+use crate::transport::metrics::{InboundStreamOutcome, QuicCloseCode, QuicDataCounters};
 use crate::transport::peer_connection::inbound_budget::SharedInboundBudget;
 use crate::transport::peer_connection::streaming::StreamError;
 #[cfg(test)]
@@ -290,6 +290,10 @@ pub(crate) struct QuicPathLimits {
     /// refuses data with [`stop_code::NOT_ACCEPTING_DATA`] right after the
     /// header, before anything is charged to the inbound budget.
     pub(crate) accept_data: bool,
+    /// Where the path's counts are also kept node-wide; `None` is
+    /// `TRANSPORT_METRICS`. A test passes its own, since every test in a process
+    /// writes the global one.
+    pub(crate) counters: Option<&'static QuicDataCounters>,
     /// The receive task panics on its first stream (supervisor test).
     #[cfg(test)]
     pub(crate) panic_in_receive: bool,
@@ -314,6 +318,7 @@ impl QuicPathLimits {
         control_capacity: CONTROL_CHANNEL_CAPACITY,
         max_send_aborts: recycle::SEND_ABORT_LIMIT,
         accept_data: true,
+        counters: None,
         #[cfg(test)]
         panic_in_receive: false,
     };
@@ -458,6 +463,9 @@ impl QuicInboundOutcome {
 /// Per-path counters. Tests read these, never the process-wide ones, which
 /// every test in the process writes.
 pub(crate) struct QuicPathStats {
+    /// Where the counts are also kept node-wide: `TRANSPORT_METRICS`, or a
+    /// test's own ([`QuicPathLimits::counters`]).
+    node: &'static QuicDataCounters,
     quic: [AtomicU64; QuicInboundOutcome::COUNT],
     shared: [AtomicU64; InboundStreamOutcome::COUNT],
     /// Data sends by [`SendKind`] and [`QuicSendResult`].
@@ -468,8 +476,9 @@ pub(crate) struct QuicPathStats {
 }
 
 impl QuicPathStats {
-    fn new() -> Self {
+    fn new(node: &'static QuicDataCounters) -> Self {
         Self {
+            node,
             quic: std::array::from_fn(|_| AtomicU64::new(0)),
             shared: std::array::from_fn(|_| AtomicU64::new(0)),
             sends: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
@@ -480,9 +489,7 @@ impl QuicPathStats {
 
     /// Count an outcome here and node-wide (`quic_inbound_<label>`).
     fn record(&self, outcome: QuicInboundOutcome) {
-        crate::transport::TRANSPORT_METRICS
-            .quic_data
-            .record_inbound(outcome);
+        self.node.record_inbound(outcome);
         self.quic[outcome as usize].fetch_add(1, Ordering::Relaxed);
     }
 
@@ -494,26 +501,20 @@ impl QuicPathStats {
 
     /// The data-send counts are kept here and node-wide (`metrics::quic_data`).
     fn record_send(&self, kind: SendKind, result: QuicSendResult) {
-        crate::transport::TRANSPORT_METRICS
-            .quic_data
-            .record_send(kind, result);
+        self.node.record_send(kind, result);
         self.sends[kind as usize][result as usize].fetch_add(1, Ordering::Relaxed);
     }
 
     /// Count something else that happened to a data send.
     pub(crate) fn record_send_event(&self, event: QuicSendEvent) {
-        crate::transport::TRANSPORT_METRICS
-            .quic_data
-            .record_event(event);
+        self.node.record_event(event);
         self.send_events[event as usize].fetch_add(1, Ordering::Relaxed);
     }
 
     /// Count a stop from the peer. A code this node does not know is counted only
     /// as a dropped send.
     fn record_stop(&self, code: u64) {
-        crate::transport::TRANSPORT_METRICS
-            .quic_data
-            .record_stop(code);
+        self.node.record_stop(code);
         if let Some(index) = stop_code::ALL.iter().position(|c| u64::from(*c) == code) {
             self.stops[index].fetch_add(1, Ordering::Relaxed);
         }
@@ -544,6 +545,11 @@ impl QuicPathStats {
             .iter()
             .position(|c| *c == code)
             .map_or(0, |index| self.stops[index].load(Ordering::Relaxed))
+    }
+
+    /// The node-wide counts this path's are added to.
+    pub(crate) fn node(&self) -> &'static QuicDataCounters {
+        self.node
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -782,7 +788,11 @@ impl QuicPath {
         budget: SharedInboundBudget,
         data: QuicDataSenders,
     ) -> (Self, mpsc::Receiver<Bytes>) {
-        let stats = Arc::new(QuicPathStats::new());
+        let stats = Arc::new(QuicPathStats::new(
+            limits
+                .counters
+                .unwrap_or(&crate::transport::TRANSPORT_METRICS.quic_data),
+        ));
         let (controls_tx, controls) = mpsc::channel(limits.control_capacity);
         #[cfg_attr(not(test), allow(unused_mut))]
         let mut receiver = inbound::Receiver::new(
@@ -1270,14 +1280,10 @@ impl QuicPath {
     /// otherwise sit out its deadline holding on to a path that has ended.
     async fn stream_slot(&self) -> Result<tokio::sync::OwnedSemaphorePermit, QuicSendError> {
         if let Ok(permit) = Arc::clone(&self.stream_slots).try_acquire_owned() {
-            crate::transport::TRANSPORT_METRICS
-                .quic_data
-                .record_permit(false);
+            self.stats.node.record_permit(false);
             return Ok(permit);
         }
-        crate::transport::TRANSPORT_METRICS
-            .quic_data
-            .record_permit(true);
+        self.stats.node.record_permit(true);
         let connection = self.connection.inner();
         tokio::select! {
             permit = Arc::clone(&self.stream_slots).acquire_owned() => {
@@ -1302,15 +1308,11 @@ impl QuicPath {
         let mut open = std::pin::pin!(self.connection.inner().open_uni());
         let opened = match futures::poll!(open.as_mut()) {
             std::task::Poll::Ready(opened) => {
-                crate::transport::TRANSPORT_METRICS
-                    .quic_data
-                    .record_open(false);
+                self.stats.node.record_open(false);
                 opened
             }
             std::task::Poll::Pending => {
-                crate::transport::TRANSPORT_METRICS
-                    .quic_data
-                    .record_open(true);
+                self.stats.node.record_open(true);
                 open.await
             }
         };
@@ -1388,12 +1390,14 @@ async fn supervise_receive<T: TimeSource>(
     let mut receive = std::pin::pin!(
         std::panic::AssertUnwindSafe(inbound::receive(connection.clone(), receiver)).catch_unwind()
     );
+    let node = stats.node();
     let watch = std::panic::AssertUnwindSafe(recycle::watch_acknowledgements(
         connection.clone(),
         closer.clone(),
         time,
         cap_holds,
         heard,
+        node,
     ))
     .catch_unwind();
     let ended = tokio::select! {

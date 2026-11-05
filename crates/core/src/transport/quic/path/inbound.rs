@@ -219,7 +219,7 @@ pub(in crate::transport::quic) async fn receive<T: TimeSource>(
             accepted = &mut accept => match accepted {
                 Ok(recv) => {
                     readers.push(read_one(recv, receiver.clone()));
-                    crate::transport::TRANSPORT_METRICS.quic_data.record_streams_open(
+                    receiver.stats.node().record_streams_open(
                         &mut peak,
                         u32::try_from(readers.len()).unwrap_or(u32::MAX),
                     );

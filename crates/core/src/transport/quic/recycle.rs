@@ -789,6 +789,7 @@ pub(crate) async fn watch_acknowledgements<T: TimeSource>(
     time: T,
     cap_holds: Arc<CapHolds>,
     heard: Arc<PeerHeard>,
+    node: &'static crate::transport::metrics::QuicDataCounters,
 ) {
     let Some(first) = AckSample::of(&connection, &cap_holds) else {
         tracing::warn!(
@@ -806,7 +807,7 @@ pub(crate) async fn watch_acknowledgements<T: TimeSource>(
         if connection.close_reason().is_some() {
             return;
         }
-        bytes.report(&connection);
+        bytes.report(&connection, node);
         let Some(sample) = AckSample::of(&connection, &cap_holds) else {
             return;
         };
@@ -847,9 +848,13 @@ impl UdpBytes {
         }
     }
 
-    fn report(&mut self, connection: &quinn::Connection) {
+    fn report(
+        &mut self,
+        connection: &quinn::Connection,
+        node: &crate::transport::metrics::QuicDataCounters,
+    ) {
         let now = Self::of(connection);
-        crate::transport::TRANSPORT_METRICS.quic_data.record_bytes(
+        node.record_bytes(
             now.sent.saturating_sub(self.sent),
             now.received.saturating_sub(self.received),
         );
