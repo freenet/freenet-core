@@ -1894,8 +1894,12 @@ QUIC send route (#5940 e5b-6, quic/upgrade/data_route.rs,
   that are being acknowledged, or a receiver whose consumer is slow while its QUIC
   stack acknowledges, is closed and loses what the receiver's readers hold. Known
   gap: a consumer stalled past the window while nothing else on the path is
-  acknowledged reads as a stalled path. A pipe that timed out waiting for its
-  source does not count (WatchedSource). It costs a normal backoff.
+  acknowledged reads as a stalled path. An egress cap hold counts as progress,
+  by the ack watch's rule (recycle::cap_held, shared): while
+  total-bandwidth-limit holds QUIC transmits nothing can be acknowledged, and at
+  a low cap one held transmit waits longer than the window. A pipe that timed out
+  waiting for its source does not count (WatchedSource). It costs a normal
+  backoff.
   Fast path: Session::routed is an atomic set only while the live attempt holds a
   route, so a connection with no route (shadow, the default on Linux and macOS)
   sends without taking the session's lock. enable_data runs once per activation

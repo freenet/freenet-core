@@ -748,10 +748,12 @@ fn a_pipe_with_no_first_chunk_is_dropped() {
     );
 }
 
-/// A receiver whose consumer is slow holds its stream credit by design, so a
-/// sender's shorts cannot open for a while. They go on UDP, and the path stays up:
-/// closing it would drop what the receiver's waiting readers hold. Every message
-/// arrives once, by one route or the other, once the consumer catches up.
+/// A receiver whose consumer is slow holds its stream credit by design, so most of
+/// a sender's shorts cannot open. They go on UDP. The consumer takes a few at a
+/// time, which frees credit, and the shorts that then open are acknowledged, so
+/// the path stays up for as long as that goes on, past the window. Closing it would
+/// drop what the receiver's waiting readers hold. Every message arrives once, by
+/// one route or the other, once the consumer catches up.
 #[test]
 fn shorts_held_back_by_a_slow_consumer_do_not_close_the_path() {
     let limits = QuicPathLimits {
@@ -763,33 +765,51 @@ fn shorts_held_back_by_a_slow_consumer_do_not_close_the_path() {
         65,
         limits,
         |mut rig| async move {
-            let total = 120u32;
-            for i in 0..total {
-                if i % 32 == 0 {
-                    tokio::task::yield_now().await;
+            let mut sent = 0u32;
+            let mut send = async |rig: &mut Rig, count: u32| {
+                for _ in 0..count {
+                    if sent % 32 == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                    rig.e.conn.send_serialized(message(sent)).await.unwrap();
+                    sent += 1;
                 }
-                rig.e.conn.send_serialized(message(i)).await.unwrap();
+            };
+            // Enough to use up the peer's credit, which its readers then hold.
+            send(&mut rig, 120).await;
+            rig.path.settle(Duration::from_secs(2)).await;
+            let mut seen = Vec::new();
+            // Every 3 s for 33 s the consumer takes ten, which frees credit
+            // (quinn announces it in steps of eight), and a burst follows. A few of
+            // the burst open and are acknowledged; at least eight time out at once,
+            // so only the acknowledgements keep the path from counting them.
+            for _ in 0..11 {
+                for _ in 0..10 {
+                    seen.extend(rig.delivered_shorts());
+                    rig.path.settle(Duration::from_millis(5)).await;
+                }
+                rig.path.settle(Duration::from_millis(50)).await;
+                send(&mut rig, 2 * STALLED_SENDS_LIMIT + 2).await;
+                rig.path.settle(Duration::from_secs(3)).await;
             }
-            rig.path.settle(Duration::from_secs(3)).await;
             assert!(
                 rig.stats().send_count(SendKind::Short, R::NotOpenedUdp)
-                    >= u64::from(STALLED_SENDS_LIMIT),
-                "enough sends could not open to have closed it under the old rule"
+                    >= u64::from(10 * STALLED_SENDS_LIMIT),
+                "many sends could not open"
             );
             assert_eq!(rig.stats().send_event_count(E::StalledClosed), 0);
             assert!(rig.route.path().quinn_connection().close_reason().is_none());
 
-            // The consumer catches up.
-            // The channel holds one, so each turn lets one waiting reader in.
-            let mut seen = Vec::new();
-            for _ in 0..400 {
+            // The consumer catches up. The channel holds one, so each turn lets
+            // one waiting reader in.
+            for _ in 0..1000 {
                 seen.extend(rig.delivered_shorts());
                 rig.path.settle(Duration::from_millis(5)).await;
             }
             seen.extend(rig.udp_data().shorts);
             assert_eq!(
                 sorted(seen),
-                sorted((0..total).map(message).collect::<Vec<_>>()),
+                sorted((0..sent).map(message).collect::<Vec<_>>()),
                 "each message once"
             );
         },
@@ -1024,6 +1044,13 @@ fn a_pipe_that_fails_after_sending_part_gives_up() {
                 )
                 .await;
             rig.path.settle(Duration::from_millis(200)).await;
+            // The pipe opened on QUIC with its first chunk: the peer announced it,
+            // and nothing has settled yet.
+            assert!(
+                rig.path.peer_inbound().streams.try_recv().is_ok(),
+                "the stream reached the peer before its source failed"
+            );
+            assert_eq!(rig.stats().send_total(R::Dropped), 0);
             source.cancel();
             rig.path.settle(Duration::from_millis(200)).await;
             rig.collect_tasks().await;

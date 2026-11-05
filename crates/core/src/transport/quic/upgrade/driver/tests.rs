@@ -872,10 +872,16 @@ fn data_is_enabled_once_per_activation() {
         let first = session.data_route().expect("both bits");
         ready_ack(&session, attempt, caps::DATA);
         assert!(session.data_route().expect("still").is(&first));
-        let again = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            session.enable_data(&mut session.state.lock(), attempt)
-        }));
-        assert!(again.is_err(), "a second route must not be built");
+        // The debug assertion is the check; a release build returns at the guard.
+        #[cfg(debug_assertions)]
+        {
+            let again = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                session.enable_data(&mut session.state.lock(), attempt)
+            }));
+            assert!(again.is_err(), "a second route must not be built");
+        }
+        #[cfg(not(debug_assertions))]
+        session.enable_data(&mut session.state.lock(), attempt);
         assert!(session.data_route().expect("still").is(&first));
         // A route that was never refused: its attempt's end clears the fast path.
         session.end();

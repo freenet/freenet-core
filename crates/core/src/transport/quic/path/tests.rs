@@ -74,9 +74,24 @@ async fn paths_with(
     b_limits: QuicPathLimits,
     b_budget: Option<SharedInboundBudget>,
 ) -> Paths {
+    paths_built(network, subnet, b_limits, b_budget, None).await
+}
+
+/// [`paths`] with an egress cap of `a_cap` bytes per second on `a`'s socket.
+async fn paths_capped(network: &str, subnet: u8, a_cap: u64) -> Paths {
+    paths_built(network, subnet, QuicPathLimits::DEFAULT, None, Some(a_cap)).await
+}
+
+async fn paths_built(
+    network: &str,
+    subnet: u8,
+    b_limits: QuicPathLimits,
+    b_budget: Option<SharedInboundBudget>,
+    a_cap: Option<u64>,
+) -> Paths {
     let a_addr: SocketAddr = format!("10.203.{subnet}.1:5000").parse().unwrap();
     let b_addr: SocketAddr = format!("10.203.{subnet}.2:5000").parse().unwrap();
-    let pair = pair(network, a_addr, b_addr, None).await;
+    let pair = pair(network, a_addr, b_addr, a_cap).await;
     let permit = pair
         .b
         .allow_peer(pair.a_addr, pair.a_keys.public())

@@ -31,7 +31,8 @@
 
 use std::time::Duration;
 
-use super::super::recycle::{self, ACK_WATCH_WINDOW};
+use super::super::recycle::{self, ACK_WATCH_WINDOW, cap_held};
+use super::super::socket::CapHoldReading;
 use super::bounded::{BoundedSend, MaybeDelivered, NotOpened, SendFailure};
 use super::{QuicPath, QuicSendError, stop_code};
 use crate::transport::metrics::QuicCloseCode;
@@ -174,13 +175,23 @@ pub(crate) const STALL_PROGRESS_WINDOW: Duration = ACK_WATCH_WINDOW;
 /// the next settle after it, within one send's deadline. A receiver whose
 /// consumer stays stalled past the window while nothing else on the path is
 /// acknowledged reads as a stalled path.
+///
+/// An egress cap hold counts as progress, as it does for the acknowledgement
+/// watch (`recycle::cap_held`): while `total-bandwidth-limit` holds the node's
+/// QUIC transmits nothing can be acknowledged, one held transmit can wait for
+/// longer than the window at a low cap, and the path itself is not stalled.
 #[derive(Debug)]
 pub(crate) struct StallCount {
     in_a_row: u32,
     /// The acknowledged-packet count at the last settle.
     acked: Option<u64>,
-    /// When the count last moved, on the path's clock.
+    /// When the count last moved, or the cap last held a transmit, on the
+    /// path's clock.
     progressed_at: u64,
+    /// The cap's holds at the last settle, and since when a hold has been
+    /// reported with no new hold event (`recycle::cap_held`).
+    cap: Option<CapHoldReading>,
+    hold_unchanged_since: Option<u64>,
 }
 
 impl StallCount {
@@ -191,25 +202,32 @@ impl StallCount {
             in_a_row: 0,
             acked,
             progressed_at: now_nanos,
+            cap: None,
+            hold_unchanged_since: None,
         }
     }
 
     /// Take `outcome`, with the connection's acknowledged-packet count `acked`
-    /// (`None` when the controller does not count them) at `now_nanos`. Returns
-    /// whether the path should close now: once, at the limit.
+    /// (`None` when the controller does not count them) and the egress cap's
+    /// holds `cap`, at `now_nanos`. Returns whether the path should close now:
+    /// once, at the limit.
     pub(crate) fn take(
         &mut self,
         outcome: &BoundedSend,
         source_stalled: bool,
         acked: Option<u64>,
+        cap: CapHoldReading,
         now_nanos: u64,
     ) -> bool {
-        if let Some(acked) = acked {
-            if self.acked != Some(acked) {
-                self.acked = Some(acked);
-                self.progressed_at = now_nanos;
-                self.in_a_row = 0;
-            }
+        let previous = self.cap.replace(cap).unwrap_or(cap);
+        let held = cap_held(&mut self.hold_unchanged_since, now_nanos, &cap, &previous);
+        let acknowledged = acked.is_some_and(|acked| self.acked != Some(acked));
+        if acknowledged {
+            self.acked = acked;
+        }
+        if acknowledged || held {
+            self.progressed_at = now_nanos;
+            self.in_a_row = 0;
         }
         if matches!(outcome, BoundedSend::Sent) {
             self.in_a_row = 0;
@@ -222,6 +240,22 @@ impl StallCount {
         }
         self.in_a_row += 1;
         self.in_a_row == STALLED_SENDS_LIMIT
+    }
+    /// [`Self::take`] with no egress cap.
+    #[cfg(test)]
+    pub(crate) fn take_uncapped(
+        &mut self,
+        outcome: &BoundedSend,
+        source_stalled: bool,
+        acked: Option<u64>,
+        now_nanos: u64,
+    ) -> bool {
+        let no_cap = CapHoldReading {
+            holds: 0,
+            held_now: false,
+            validity: Duration::ZERO,
+        };
+        self.take(outcome, source_stalled, acked, no_cap, now_nanos)
     }
 }
 
@@ -248,10 +282,11 @@ impl QuicPath {
             }
         }
         let acked = self.ack_progress.as_ref().map(recycle::AckProgress::acked);
+        let cap = self.connection.cap_holds().read();
         let close = self
             .stall
             .lock()
-            .take(outcome, source_stalled, acked, now_nanos);
+            .take(outcome, source_stalled, acked, cap, now_nanos);
         if close {
             self.stats.record_send_event(QuicSendEvent::StalledClosed);
             tracing::warn!(

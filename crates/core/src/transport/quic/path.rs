@@ -763,7 +763,17 @@ impl QuicPath {
             receiver.panic_on_stream = limits.panic_in_receive;
         }
         let aborts = Arc::new(SendAborts::new(limits.max_send_aborts, connection.closer()));
+        // Read once: quinn keeps one controller per connection while migration is
+        // off (`config`), so the record stays the connection's. The ack watch
+        // compares records by pointer because it samples, and does not need to here.
         let ack_progress = recycle::AckProgress::of(connection.inner());
+        if ack_progress.is_none() {
+            tracing::warn!(
+                remote = %connection.inner().remote_address(),
+                "QUIC path: the congestion controller counts no acknowledgements; every \
+                 send timeout counts toward the stall close"
+            );
+        }
         let stall = route::StallCount::new(
             ack_progress.as_ref().map(recycle::AckProgress::acked),
             time.now_nanos(),
