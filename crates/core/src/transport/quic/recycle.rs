@@ -253,6 +253,17 @@ impl CappedCubicFactory {
 impl ControllerFactory for CappedCubicFactory {
     fn build(self: Arc<Self>, now: Instant, current_mtu: u16) -> Box<dyn Controller> {
         #[cfg(feature = "bench")]
+        if lab::INNER_CONTROLLER.load(Ordering::Relaxed) == lab::VENO {
+            return Box::new(CappedCubic::new(
+                Box::new(lab::VenoCubic::new(
+                    self.cubic.clone().build(now, current_mtu),
+                    current_mtu,
+                )),
+                self.rate.clone(),
+                current_mtu,
+            ));
+        }
+        #[cfg(feature = "bench")]
         if lab::INNER_CONTROLLER.load(Ordering::Relaxed) == lab::BBR {
             return Box::new(CappedCubic::new(
                 Arc::new(quinn::congestion::BbrConfig::default()).build(now, current_mtu),
@@ -280,6 +291,141 @@ pub(crate) mod lab {
     pub(crate) static INNER_CONTROLLER: AtomicU8 = AtomicU8::new(CUBIC);
     pub(crate) const CUBIC: u8 = 0;
     pub(crate) const BBR: u8 = 1;
+    /// Cubic inside [`VenoCubic`].
+    pub(crate) const VENO: u8 = 2;
+
+    use std::any::Any;
+    use std::time::{Duration, Instant};
+
+    use quinn::congestion::{Controller, ControllerMetrics};
+
+    /// Lab prototype, not for a node: Cubic that backs off less on a loss
+    /// that does not look like congestion, in the manner of TCP Veno.
+    ///
+    /// At each loss it estimates the bytes this connection has queued in the
+    /// network, `window x (srtt - min_rtt) / srtt` (Veno's backlog, N). Below
+    /// three datagrams the loss is taken as random: no queue is building, so
+    /// the path did not ask for less. Then only every other window reduction
+    /// Cubic would make is passed to it, an effective multiplicative decrease
+    /// of sqrt(0.7), about 0.84, instead of Cubic's 0.7. At three datagrams
+    /// or more every reduction is passed, so on a filling queue it is Cubic.
+    /// quinn's Cubic has no settable decrease, so whether a loss would reduce
+    /// the window is found on a clone of it.
+    pub(crate) struct VenoCubic {
+        inner: Box<dyn Controller>,
+        mtu: u16,
+        srtt: Option<Duration>,
+        min_rtt: Option<Duration>,
+        /// The next reduction a random loss would cause is skipped.
+        skip_next: bool,
+    }
+
+    impl VenoCubic {
+        pub(crate) fn new(inner: Box<dyn Controller>, mtu: u16) -> Self {
+            Self {
+                inner,
+                mtu,
+                srtt: None,
+                min_rtt: None,
+                skip_next: true,
+            }
+        }
+
+        /// Whether the connection's queued bytes are under three datagrams.
+        fn loss_looks_random(&self) -> bool {
+            let (Some(srtt), Some(min)) = (self.srtt, self.min_rtt) else {
+                return false;
+            };
+            if srtt.is_zero() {
+                return false;
+            }
+            let queued = self.inner.window() as f64 * srtt.saturating_sub(min).as_secs_f64()
+                / srtt.as_secs_f64();
+            queued < 3.0 * f64::from(self.mtu)
+        }
+    }
+
+    impl Controller for VenoCubic {
+        fn on_sent(&mut self, now: Instant, bytes: u64, last_packet_number: u64) {
+            self.inner.on_sent(now, bytes, last_packet_number);
+        }
+
+        fn on_ack(
+            &mut self,
+            now: Instant,
+            sent: Instant,
+            bytes: u64,
+            app_limited: bool,
+            rtt: &quinn_proto::RttEstimator,
+        ) {
+            self.srtt = Some(rtt.get());
+            self.min_rtt = Some(rtt.min());
+            self.inner.on_ack(now, sent, bytes, app_limited, rtt);
+        }
+
+        fn on_end_acks(
+            &mut self,
+            now: Instant,
+            in_flight: u64,
+            app_limited: bool,
+            largest_packet_num_acked: Option<u64>,
+        ) {
+            self.inner
+                .on_end_acks(now, in_flight, app_limited, largest_packet_num_acked);
+        }
+
+        fn on_congestion_event(
+            &mut self,
+            now: Instant,
+            sent: Instant,
+            is_persistent_congestion: bool,
+            lost_bytes: u64,
+        ) {
+            if !is_persistent_congestion && self.loss_looks_random() {
+                let mut probe = self.inner.clone_box();
+                probe.on_congestion_event(now, sent, false, lost_bytes);
+                if probe.window() < self.inner.window() {
+                    self.skip_next = !self.skip_next;
+                    if !self.skip_next {
+                        return;
+                    }
+                }
+            }
+            self.inner
+                .on_congestion_event(now, sent, is_persistent_congestion, lost_bytes);
+        }
+
+        fn on_mtu_update(&mut self, new_mtu: u16) {
+            self.mtu = new_mtu;
+            self.inner.on_mtu_update(new_mtu);
+        }
+
+        fn window(&self) -> u64 {
+            self.inner.window()
+        }
+
+        fn metrics(&self) -> ControllerMetrics {
+            self.inner.metrics()
+        }
+
+        fn clone_box(&self) -> Box<dyn Controller> {
+            Box::new(Self {
+                inner: self.inner.clone_box(),
+                mtu: self.mtu,
+                srtt: self.srtt,
+                min_rtt: self.min_rtt,
+                skip_next: self.skip_next,
+            })
+        }
+
+        fn initial_window(&self) -> u64 {
+            self.inner.initial_window()
+        }
+
+        fn into_any(self: Box<Self>) -> Box<dyn Any> {
+            self
+        }
+    }
 
     /// A floor under the inner controller's window, in bytes, applied before
     /// the cap: a loss-tolerant variant to try against random loss. 0 is
