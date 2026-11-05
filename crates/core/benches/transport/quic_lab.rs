@@ -22,15 +22,17 @@
 //! CPU settings: `LAB_SIZES_KIB` (64,1024,16384), `LAB_LIMITS` (bytes per
 //! second per connection, `none` for no `bandwidth-limit`; default
 //! `none,500000`), `LAB_MIN_MIB` per measurement (16), `LAB_THREADS` (4),
-//! `LAB_REPS` (3), `LAB_TRANSPORTS` (udp,quic).
+//! `LAB_REPS` (3), `LAB_TRANSPORTS` (udp,quic), `LAB_LINK` (`none` for plain
+//! loopback, or `rate_mbit:one_way_ms` for the same shaped link under both
+//! transports, with a queue of `LAB_QUEUE_KIB`, 1024).
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
-use freenet::transport::quic_lab::{FRAGMENT_BYTES, LabConfig, LabPair, LinkSpec, StreamsRun};
-use freenet::transport::{
-    TRANSPORT_METRICS, TransportKeypair, UdpTransportSocket, create_connection_handler,
+use freenet::transport::quic_lab::{
+    FRAGMENT_BYTES, LabConfig, LabPair, LabSocket, LinkSpec, StreamsRun, shape_port,
 };
+use freenet::transport::{TRANSPORT_METRICS, TransportKeypair, create_connection_handler};
 use tokio::sync::mpsc;
 
 fn enabled(test: &str) -> bool {
@@ -275,6 +277,7 @@ fn quic_lab_fairness() {
 /// assembled message's length from the receiver.
 async fn udp_pair(
     limit: Option<usize>,
+    link: Option<LinkSpec>,
 ) -> (
     mpsc::Sender<Vec<u8>>,
     mpsc::UnboundedReceiver<usize>,
@@ -289,14 +292,18 @@ async fn udp_pair(
     };
     let host = IpAddr::V4(Ipv4Addr::LOCALHOST);
     let (b_port, a_port) = (free_port(), free_port());
+    if let Some(link) = link {
+        shape_port(b_port, link);
+        shape_port(a_port, link);
+    }
     let b_keys = TransportKeypair::new();
     let b_pub = b_keys.public().clone();
-    let (_b_out, mut b_in, b_listener) = create_connection_handler::<UdpTransportSocket>(
+    let (_b_out, mut b_in, b_listener) = create_connection_handler::<LabSocket>(
         b_keys, host, b_port, true, limit, None, None, None, None,
     )
     .await
     .expect("bind b");
-    let (mut a_out, _a_in, a_listener) = create_connection_handler::<UdpTransportSocket>(
+    let (mut a_out, _a_in, a_listener) = create_connection_handler::<LabSocket>(
         TransportKeypair::new(),
         host,
         a_port,
@@ -405,20 +412,33 @@ fn quic_lab_cpu_per_byte() {
     let threads: usize = env_or("LAB_THREADS", 4);
     let reps: usize = env_or("LAB_REPS", 3);
     let window = env_or("LAB_WINDOW_KIB", 2048u64) * 1024;
+    // `rate_mbit:one_way_ms`, the same shaped link under both transports.
+    let link_spec = std::env::var("LAB_LINK").unwrap_or_else(|_| "none".into());
+    let link = match link_spec.as_str() {
+        "none" => None,
+        spec => {
+            let (rate, delay) = spec.split_once(':').expect("rate_mbit:one_way_ms");
+            Some(LinkSpec {
+                rate_bps: rate.parse::<u64>().unwrap() * 1_000_000,
+                one_way_delay: Duration::from_millis(delay.parse().unwrap()),
+                queue_bytes: env_or("LAB_QUEUE_KIB", 1024usize) * 1024,
+            })
+        }
+    };
     for transport in &transports {
         for limit in &limits {
             let rt = runtime(threads);
             rt.block_on(async {
                 let mut pair = match transport.as_str() {
                     "udp" => {
-                        let (send, got, _tasks) = udp_pair(*limit).await;
+                        let (send, got, _tasks) = udp_pair(*limit, link).await;
                         Pair::Udp { send, got, _tasks }
                     }
                     "quic" => Pair::Quic(
                         LabPair::connect(LabConfig {
                             window_bytes: window,
                             bandwidth_limit: *limit,
-                            link: None,
+                            link,
                         })
                         .await,
                     ),
@@ -437,7 +457,7 @@ fn quic_lab_cpu_per_byte() {
                         let bytes = (size * count) as f64;
                         println!(
                             "LAB_CPU transport={transport} threads={threads} window_kib={} \
-                             limit={} size_kib={} rep={rep} count={count} wall_s={:.3} \
+                             link={link_spec} limit={} size_kib={} rep={rep} count={count} wall_s={:.3} \
                              bytes_per_s={:.0} cpu_s={:.3} cpu_ns_per_byte={:.2}",
                             window / 1024,
                             limit.map_or("none".to_string(), |l| l.to_string()),
