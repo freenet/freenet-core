@@ -789,6 +789,7 @@ pub(crate) async fn watch_acknowledgements<T: TimeSource>(
     time: T,
     cap_holds: Arc<CapHolds>,
     heard: Arc<PeerHeard>,
+    node: &'static crate::transport::metrics::QuicDataCounters,
 ) {
     let Some(first) = AckSample::of(&connection, &cap_holds) else {
         tracing::warn!(
@@ -800,11 +801,15 @@ pub(crate) async fn watch_acknowledgements<T: TimeSource>(
     };
     let mut received = first.received;
     let mut watch = AckWatch::new(ACK_WATCH_WINDOW, first);
+    let mut bytes = UdpBytes::of(&connection);
     loop {
         time.sleep(ACK_WATCH_TICK).await;
         if connection.close_reason().is_some() {
             return;
         }
+        let (next, sent, got) = bytes.step(UdpBytes::of(&connection));
+        node.record_bytes(sent, got);
+        bytes = next;
         let Some(sample) = AckSample::of(&connection, &cap_holds) else {
             return;
         };
@@ -828,5 +833,35 @@ pub(crate) async fn watch_acknowledgements<T: TimeSource>(
 
 #[cfg(test)]
 mod cap_tests;
+/// A path's UDP payload bytes as quinn counts them, reported node-wide by their
+/// change at each tick of the watch (`quic_bytes_sent`, `quic_bytes_received`).
+/// What a path moves in its last tick before it closes is not reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UdpBytes {
+    sent: u64,
+    received: u64,
+}
+
+impl UdpBytes {
+    fn of(connection: &quinn::Connection) -> Self {
+        let stats = connection.stats();
+        Self {
+            sent: stats.udp_tx.bytes,
+            received: stats.udp_rx.bytes,
+        }
+    }
+
+    /// The bytes sent and received from `self` to `now`, and the state to report
+    /// the next change from, which is `now`. Pure, so the report is tested.
+    #[must_use]
+    fn step(self, now: Self) -> (Self, u64, u64) {
+        (
+            now,
+            now.sent.saturating_sub(self.sent),
+            now.received.saturating_sub(self.received),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests;

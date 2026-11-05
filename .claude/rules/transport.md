@@ -1180,10 +1180,46 @@ snapshot except the two gauges.
   connections (per connection and direction), set when the endpoint is built,
   0 without one; a state, not reset and not activity. Throughput by window
   size shows whether nodes at the 128 KiB floor are slower on QUIC than on UDP.
-  Not built: stream-concurrency instruments on real QUIC (`quic_open_uni_waited`,
-  permit waits, ge_8..ge_48, control_* refusals) have no source until e5b and
-  read zero in shadow; the `transport=legacy|quic` connection attribute; a
-  per-path memory estimate.
+  Not built: the `transport=legacy|quic` attribute on connection, transfer and
+  disconnect events; quinn's RTT, min RTT and lost bytes on a QUIC transfer's
+  events (those fields are None today); the per-peer byte counters and the
+  dashboard for QUIC traffic; a per-path memory estimate.
+
+QUIC data telemetry (#5940 e5b-8, `transport/metrics/quic_data.rs`): node-wide
+counts of what paths' data sends and receives did, in one nested
+`TransportSnapshot::quic_data` and uploaded flat, a key per non-zero count and the
+gauge every period, 0 included (`QuicDataSnapshot::upload_keys`). Each is
+recorded where the path decides it, into the path's `QuicPathStats` and the node's
+`QuicDataCounters` together (`QuicPathLimits::counters`, `TRANSPORT_METRICS` unless
+a test passes its own; tests read their own, never the global).
+  quic_data_send_<short|large_short|stream|pipe>_<sent|maybe_delivered|
+  not_opened_udp|failed_udp|dropped>; quic_data_event_<short_overflow_udp|
+  data_refused|stalled_closed|udp_send_failed>; quic_data_stop_<code> (stops a
+  peer sent to data sends); quic_inbound_<QuicInboundOutcome> (every receive
+  outcome, refusals by frame kind as short_refused_budget and
+  stream_refused_budget); quic_enabled_data_paths; quic_live_data_paths (a gauge of
+  paths with a route the peer has not refused data on, not reset, not activity;
+  lowered once, at the refusal or when the attempt goes); quic_sends and quic_open_uni_waited (opens a
+  path tried, data and control, and those that waited for stream credit);
+  quic_streamed_sends and quic_stream_permit_waited; quic_bytes_sent and
+  quic_bytes_received (quinn's UDP payload counts, reported by change at each 2 s
+  tick of the acknowledgement watch, so a path's last tick before it closes is
+  lost); quic_session_ended_with_data_path_<age> (sessions that ended while their
+  path's route still carried data); quic_streams_sampled_paths,
+  quic_streams_open_ge_<8|16|32|48> and quic_streams_peak_max (per path and period,
+  the peak of inbound streams read at once, counted as inbound_concurrency counts
+  connections).
+  A family is the keys of one label list under one prefix
+  (`QuicDataSnapshot::keys_by_family`). No other key starts with a family's
+  prefix or with the prefix sibling families share (`quic_data_` for the send,
+  event and stop families, `quic_streams_open_` for the levels), and no key starts
+  with a prefix two of the snapshot's other keys share (`quic_send_`,
+  `quic_paths_` and the rest), so a prefix sum never adds two kinds of count. The
+  tests read the families from the keys and the other keys from the snapshot's
+  serde fields, not from a list (`no_key_is_under_another_family`). The step-3
+  stream-limit bars read quic_open_uni_waited over quic_sends,
+  quic_stream_permit_waited over quic_streamed_sends (both counts of attempts),
+  and quic_streams_open_ge_48 over quic_streams_sampled_paths.
 
 Upgrade driver (`quic/upgrade/driver.rs`, #5940 step e5a-5b): QuicUpgrades is
 per node (endpoint, policy, routes by address, live sessions by peer key, backoff
@@ -1841,7 +1877,7 @@ Control payload (quic/control.rs), the body of a Control frame, one per
   QuicInbound::controls and counts refusals per path
   (control_unknown_version, control_unknown_type, control_malformed); they
   are counted only through it, not by QuicControl::decode.
-Not here: export of the QUIC-only counters (per path, QuicPath::stats).
+Counts: per path (QuicPath::stats) and node-wide ("QUIC data telemetry" above).
 QUIC send route (#5940 e5b-6, quic/upgrade/data_route.rs,
   peer_connection/quic_send.rs, quic/path/route.rs):
   A message has one route, chosen when it is sent, from

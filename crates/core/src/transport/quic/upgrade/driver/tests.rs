@@ -71,6 +71,8 @@ pub(in crate::transport) struct Harness {
     now: Arc<AtomicU64>,
     /// What each session's paths deliver, kept open as a connection keeps it.
     inboxes: std::sync::Mutex<Vec<QuicDataInbox>>,
+    /// Where the hub's paths keep their node-wide counts.
+    counters: &'static crate::transport::metrics::QuicDataCounters,
     /// What each session sent on UDP from a path's queue.
     udp: Arc<RecordingUdp>,
 }
@@ -123,13 +125,18 @@ impl Harness {
             endpoint.availability(),
         );
         assert_eq!(endpoint.availability().get(), QuicAvailability::Up);
-        let hub = QuicUpgrades::new(
+        let mut hub = QuicUpgrades::new(
             endpoint.clone(),
             policy,
             local.public().clone(),
             PathClock::Virtual(pair.time.clone()),
             None,
         );
+        let counters: &'static _ =
+            Box::leak(Box::new(crate::transport::metrics::QuicDataCounters::new()));
+        Arc::get_mut(&mut hub)
+            .expect("the hub is not shared yet")
+            .test_counters = Some(counters);
         let peer = peer.clone();
         Self {
             pair,
@@ -138,6 +145,7 @@ impl Harness {
             peer,
             now: Arc::new(AtomicU64::new(0)),
             inboxes: std::sync::Mutex::new(Vec::new()),
+            counters,
             udp: Arc::default(),
         }
     }
@@ -803,6 +811,94 @@ fn a_route_ends_with_its_path_and_what_it_holds_goes_on_udp() {
         assert!(
             path.upgrade().is_none(),
             "the worker ended and let the path go"
+        );
+    });
+}
+
+/// A path with both data bits counts once in `quic_enabled_data_paths` and in the
+/// `quic_live_data_paths` gauge while its route lives, and a session that ends under it
+/// counts by the path's age. A shadow path counts none of them.
+#[test]
+fn data_paths_are_counted_while_they_carry_data() {
+    use crate::transport::quic::control::caps;
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        for (subnet, peer_caps, carries) in [(94, caps::DATA, true), (95, 0, false)] {
+            let h = Harness::server_with("quic-driver-data-counts", subnet, "prefer", Some("100"))
+                .await;
+            let (session, inbox) = h.session();
+            let attempt = offered(&h, &session);
+            let up = path_up(&h, &session, inbox);
+            let time = h.pair.time.clone();
+            let _up = drive(&h.pair.time, Duration::from_secs(60), async move {
+                let up = up.await;
+                time.sleep(Duration::from_secs(1)).await;
+                up
+            })
+            .await;
+            ready_ack(&session, attempt, peer_caps);
+            let snap = h.counters.snapshot(false);
+            assert_eq!(snap.data_enabled, u64::from(carries), "{peer_caps}");
+            assert_eq!(snap.data_paths, u64::from(carries), "{peer_caps}");
+            h.set_now(Duration::from_secs(120));
+            session.end();
+            let snap = h.counters.snapshot(true);
+            assert_eq!(snap.data_paths, 0, "the route went with the session");
+            let ended: u64 = snap.session_ended_with_data_path.iter().sum();
+            assert_eq!(ended, u64::from(carries), "{peer_caps}");
+            if carries {
+                let lt_10m = crate::transport::metrics::QuicPathAge::Lt10M as usize;
+                assert_eq!(snap.session_ended_with_data_path[lt_10m], 1);
+            }
+        }
+    });
+}
+
+/// A path the peer refuses data on leaves the `quic_live_data_paths` gauge at the
+/// refusal, and only once: a second refusal and the attempt's drop lower nothing
+/// more, and a session that ends after the refusal did not end under a data path.
+#[test]
+fn a_refused_path_leaves_the_gauge_once_and_does_not_end_with_data() {
+    use crate::transport::quic::control::caps;
+    use crate::transport::quic::path::{QuicSendError, SendFailure, SendKind, stop_code};
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let h = Harness::server_with("quic-driver-refused-gauge", 96, "prefer", Some("100")).await;
+        let (session, inbox) = h.session();
+        let attempt = offered(&h, &session);
+        let up = path_up(&h, &session, inbox);
+        let time = h.pair.time.clone();
+        let _up = drive(&h.pair.time, Duration::from_secs(60), async move {
+            let up = up.await;
+            time.sleep(Duration::from_secs(1)).await;
+            up
+        })
+        .await;
+        ready_ack(&session, attempt, caps::DATA);
+        // A second data path on the node, so a double decrement would show.
+        h.counters.data_path_started();
+        assert_eq!(h.counters.snapshot(false).data_paths, 2);
+        let route = session.data_route().expect("both bits");
+        let refused = BoundedSend::Failed(SendFailure::Error(QuicSendError::Stopped(
+            stop_code::NOT_ACCEPTING_DATA.into(),
+        )));
+        route.path().settle(SendKind::Stream, &refused, false, 0);
+        assert_eq!(
+            h.counters.snapshot(false).data_paths,
+            1,
+            "lowered at the refusal"
+        );
+        route.path().settle(SendKind::Short, &refused, false, 0);
+        assert_eq!(h.counters.snapshot(false).data_paths, 1, "and only once");
+        h.set_now(Duration::from_secs(120));
+        session.end();
+        drop(route);
+        let snap = h.counters.snapshot(true);
+        assert_eq!(snap.data_paths, 1, "the drop lowered nothing more");
+        assert_eq!(
+            snap.session_ended_with_data_path.iter().sum::<u64>(),
+            0,
+            "the session ended under a refused path"
         );
     });
 }

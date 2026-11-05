@@ -23,6 +23,7 @@ use crate::transport::peer_connection::streaming::{
 use crate::transport::peer_connection::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
 use crate::transport::peer_connection::streaming_handle_idle_timeout;
 
+mod node_counts;
 mod route;
 
 /// How long, in virtual time, a test's traffic may take.
@@ -114,7 +115,12 @@ async fn paths_built(
     })
     .await;
     drop(permit);
-    let (a, a_in) = QuicPath::new(client, pair.time.clone());
+    // `a` keeps its node-wide counts where `b` does.
+    let a_limits = QuicPathLimits {
+        counters: b_limits.counters,
+        ..QuicPathLimits::DEFAULT
+    };
+    let (a, a_in) = QuicPath::with_limits(client, pair.time.clone(), a_limits);
     let (b, b_in) = match b_budget {
         Some(budget) => {
             let (b, b_in) =
