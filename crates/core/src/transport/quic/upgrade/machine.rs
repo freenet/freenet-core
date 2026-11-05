@@ -202,6 +202,10 @@ pub(in crate::transport) struct Inputs<'a> {
     /// A uniform draw in `0.0..1.0` (`GlobalRng`). Anything else is clamped.
     pub(in crate::transport) sample: f64,
     pub(in crate::transport) policy: &'a QuicPolicy,
+    /// This node's caps on a path to the peer now (`QuicPolicy::own_caps`), read
+    /// when an attempt starts, so a pair the data share reaches while its session
+    /// lives takes data from its next attempt. 0 before promotion.
+    pub(in crate::transport) own_caps: &'a dyn Fn() -> u32,
 }
 
 /// What happened.
@@ -216,7 +220,8 @@ pub(in crate::transport) enum Event {
     /// inbound session holds no key until promotion, and the seed is filed per
     /// key, while the machine must exist before that to answer an early Offer.
     /// `own_caps` is what this node says it supports on a path to that peer
-    /// (`QuicPolicy::own_caps`), for the same reason.
+    /// (`QuicPolicy::own_caps`), for the same reason; each attempt reads it
+    /// again when it starts ([`Inputs::own_caps`]).
     Promoted {
         peer_key: TransportPublicKey,
         remote_version: Option<(u8, u8, u16)>,
@@ -820,6 +825,7 @@ impl UpgradeMachine {
                 Vec::new()
             }
             Ok(permit) => {
+                self.own_caps = (cx.own_caps)();
                 self.last_attempt = self.last_attempt.wrapping_add(1);
                 let attempt = self.last_attempt;
                 self.state = State::Setup {
@@ -855,6 +861,7 @@ impl UpgradeMachine {
                 Err(PathRefusal::Disabled(_)) => DeclineReason::Disabled,
                 Err(PathRefusal::Busy) => DeclineReason::Busy,
                 Ok(permit) => {
+                    self.own_caps = (cx.own_caps)();
                     self.state = State::Setup {
                         phase: Phase::Connecting,
                         attempt,

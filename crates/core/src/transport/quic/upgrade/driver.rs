@@ -686,10 +686,13 @@ impl Session {
     }
 
     fn step(&self, state: &mut SessionState, event: Event) -> Vec<Action> {
+        let key = state.peer_key.clone();
+        let own_caps = || key.as_ref().map_or(0, |key| self.hub.own_caps(key));
         let inputs = Inputs {
             now: (self.now)(),
             sample: GlobalRng::random_range(0.0..1.0),
             policy: &self.hub.policy,
+            own_caps: &own_caps,
         };
         state.machine.step(inputs, event)
     }

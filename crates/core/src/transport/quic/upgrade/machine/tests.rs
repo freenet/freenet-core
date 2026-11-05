@@ -96,10 +96,13 @@ impl Rig {
     }
 
     fn step(&mut self, event: Event) -> Vec<Action> {
+        let caps = self.own_caps;
+        let own_caps = move || caps;
         let cx = Inputs {
             now: self.now,
             sample: self.sample,
             policy: &self.policy,
+            own_caps: &own_caps,
         };
         self.machine.step(cx, event)
     }
@@ -2723,4 +2726,50 @@ fn the_recent_fallbacks_are_bounded() {
         FallbackCause::Reset,
     );
     assert_eq!(machine.recent_fallbacks.len(), 1);
+}
+
+/// Each attempt reads this node's caps when it starts (a server's Offer, a
+/// client's Accept), not once at promotion: a pair the data share reaches while
+/// its session lives carries data from its next attempt, and a change while an
+/// attempt is under way waits for the next one.
+#[test]
+fn each_attempt_reads_its_own_caps_when_it_starts() {
+    for role in [Role::Server, Role::Client] {
+        let mut rig = Rig::new(role);
+        rig.peer_caps = caps::DATA;
+        rig.promote(Some(QUIC_UPGRADE_NEGOTIATES_IN));
+        // Promoted without the bit, which comes before the first attempt.
+        rig.own_caps = caps::DATA;
+        rig.activate();
+        assert!(rig.machine.carries_data(), "{role:?}: read at the attempt");
+
+        let mut rig = Rig::new(role);
+        rig.peer_caps = caps::DATA;
+        rig.own_caps = caps::DATA;
+        rig.promote(Some(QUIC_UPGRADE_NEGOTIATES_IN));
+        if role == Role::Server {
+            rig.tick_due();
+            let attempt = rig.machine.last_attempt;
+            rig.own_caps = 0;
+            rig.step(Event::Upgrade(UpgradeControl::Accept { attempt }));
+            rig.step(Event::PathEstablished { attempt });
+            let caps = rig.peer_caps;
+            rig.step(Event::Control(QuicControl::ReadyAck { attempt, caps }));
+        } else {
+            rig.offer(CLIENT_ATTEMPT);
+            rig.own_caps = 0;
+            rig.step(Event::PathEstablished {
+                attempt: CLIENT_ATTEMPT,
+            });
+            let caps = rig.peer_caps;
+            rig.step(Event::Control(QuicControl::Ready {
+                attempt: CLIENT_ATTEMPT,
+                caps,
+            }));
+        }
+        assert!(
+            rig.machine.carries_data(),
+            "{role:?}: a change mid-attempt waits for the next attempt"
+        );
+    }
 }
