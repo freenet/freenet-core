@@ -60,6 +60,9 @@ pub enum LabController {
     Cubic,
     /// quinn's BBR, under the same cap.
     Bbr,
+    /// Cubic that backs off less on loss with no queue building
+    /// (`recycle::lab::VenoCubic`, a lab prototype).
+    Veno,
 }
 
 /// Choose the controller for connections built from now on.
@@ -68,6 +71,7 @@ pub fn set_controller(controller: LabController) {
     let value = match controller {
         LabController::Cubic => lab::CUBIC,
         LabController::Bbr => lab::BBR,
+        LabController::Veno => lab::VENO,
     };
     lab::INNER_CONTROLLER.store(value, Ordering::Relaxed);
 }

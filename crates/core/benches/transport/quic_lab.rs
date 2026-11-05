@@ -583,7 +583,7 @@ fn sample_at(samples: &[ConnSample], at: Duration) -> Option<ConnSample> {
 /// `LAB_STREAM_KIB` (256), `LAB_WINDOW_KIB` (2048, QUIC only), `LAB_LOSS`
 /// (0.10), `LAB_SEED` (1), `LAB_DELAY_MS` (50 one way), `LAB_RATE_MBIT` (0,
 /// no bottleneck), `LAB_THREADS` (4), `LAB_REPS` (3), `LAB_CONTROLLER`
-/// (cubic or bbr, QUIC only), `LAB_GAP` (stream, the node's rule, or
+/// (cubic, bbr or veno, QUIC only), `LAB_GAP` (stream, the node's rule, or
 /// connection: the gap runs from the later of the send's last step and the
 /// connection's last newly acknowledged packet), `LAB_FAILURES` (1 prints
 /// one `LAB_LOSS_FAILURE` line per failed QUIC send), `LAB_COMPETITOR` (1 runs
@@ -619,6 +619,7 @@ fn quic_lab_loss() {
     set_controller(match controller.as_str() {
         "cubic" => LabController::Cubic,
         "bbr" => LabController::Bbr,
+        "veno" => LabController::Veno,
         other => panic!("unknown controller {other}"),
     });
     let gap_rule = std::env::var("LAB_GAP").unwrap_or_else(|_| "stream".into());
