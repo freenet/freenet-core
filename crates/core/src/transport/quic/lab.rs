@@ -134,9 +134,185 @@ pub struct LabConfig {
 
 struct Shaper {
     model: LinkModel,
+    link: LinkSpec,
     epoch: Instant,
     local: SocketAddr,
     out: mpsc::UnboundedSender<(u64, Vec<u8>, SocketAddr)>,
+    /// Queueing delay of each datagram this socket's traffic got through the
+    /// bottleneck, in microseconds. The competing flow keeps its own.
+    queued_us: parking_lot::Mutex<Vec<u32>>,
+}
+
+/// Every shaped socket, by local port, for [`link_report`] and
+/// [`Competitor::start`].
+static SHAPERS: std::sync::Mutex<Vec<(u16, Arc<Shaper>)>> = std::sync::Mutex::new(Vec::new());
+
+fn shaper_on(port: u16) -> Option<Arc<Shaper>> {
+    SHAPERS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .rev()
+        .find(|(p, _)| *p == port)
+        .map(|(_, shaper)| shaper.clone())
+}
+
+/// The link's ground truth for the shaped socket on `port`: the measured
+/// loss (queue drops plus random loss, over what this socket offered) and its
+/// datagrams' queueing delay at the bottleneck.
+pub fn link_report(port: u16) -> Option<String> {
+    shaper_on(port).map(|shaper| shaper.stats())
+}
+
+/// Queueing delay of one datagram given when the model says it arrives: the
+/// arrival less the send time, the propagation delay and the datagram's own
+/// serialization.
+fn queueing_us(link: &LinkSpec, now: u64, arrives: u64, len: usize) -> u32 {
+    let serialization = if link.rate_bps == 0 {
+        0
+    } else {
+        (len as u128 * 8 * 1_000_000_000 / link.rate_bps as u128) as u64
+    };
+    let wait = arrives
+        .saturating_sub(now)
+        .saturating_sub(link.one_way_delay.as_nanos() as u64)
+        .saturating_sub(serialization);
+    u32::try_from(wait / 1000).unwrap_or(u32::MAX)
+}
+
+fn percentile(sorted: &[u32], p: f64) -> f64 {
+    if sorted.is_empty() {
+        return f64::NAN;
+    }
+    let at = ((sorted.len() - 1) as f64 * p).round() as usize;
+    f64::from(sorted[at]) / 1000.0
+}
+
+fn queue_summary(samples: &[u32]) -> String {
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    format!(
+        "queue_ms_p50={:.1} queue_ms_p90={:.1} queue_ms_max={:.1}",
+        percentile(&sorted, 0.5),
+        percentile(&sorted, 0.9),
+        percentile(&sorted, 1.0)
+    )
+}
+
+/// A loss-based flow standing in for the user's own traffic on the same
+/// uplink: Reno-style AIMD in whole datagrams of 1200 bytes, driven by the
+/// sender's link model, so it shares the bottleneck queue and the random loss
+/// with whatever else that socket sends. It does not send real datagrams:
+/// the model decides each one's fate, an acknowledgement is taken to come
+/// back one propagation delay after the datagram arrives (the reverse path
+/// is not lossy for it, as cumulative TCP acknowledgements mostly are not),
+/// and a loss is detected one round trip plus the datagram's queueing after
+/// it was sent. Slow start to the first loss, then +1 datagram per window
+/// per round trip, halving at most once per round trip.
+pub struct Competitor {
+    delivered: Arc<std::sync::atomic::AtomicU64>,
+    queued_us: Arc<parking_lot::Mutex<Vec<u32>>>,
+    lost: Arc<std::sync::atomic::AtomicU64>,
+    offered: Arc<std::sync::atomic::AtomicU64>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Competitor {
+    /// Start one on the shaped socket bound on `port`. `None` if that socket
+    /// is not shaped.
+    pub fn start(port: u16) -> Option<Self> {
+        use std::sync::atomic::AtomicU64;
+        let shaper = shaper_on(port)?;
+        let delivered = Arc::new(AtomicU64::new(0));
+        let lost = Arc::new(AtomicU64::new(0));
+        let offered = Arc::new(AtomicU64::new(0));
+        let queued_us = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let (d, l, o, q) = (
+            delivered.clone(),
+            lost.clone(),
+            offered.clone(),
+            queued_us.clone(),
+        );
+        let task = tokio::spawn(async move {
+            const LEN: usize = 1200;
+            let target: SocketAddr = (Ipv4Addr::new(127, 0, 0, 1), 9).into();
+            let one_way = shaper.link.one_way_delay.as_nanos() as u64;
+            let mut events = std::collections::BinaryHeap::new();
+            let (mut cwnd, mut ssthresh) = (10.0f64, f64::INFINITY);
+            let mut inflight = 0usize;
+            let mut recovery_until = 0u64;
+            let mut seq = 0u64;
+            loop {
+                let now = shaper.epoch.elapsed().as_nanos() as u64;
+                while (inflight as f64) < cwnd {
+                    seq += 1;
+                    let mut packet = [0u8; LEN];
+                    packet[..8].copy_from_slice(&seq.to_be_bytes());
+                    o.fetch_add(1, Ordering::Relaxed);
+                    let arrivals = shaper.model.on_send(now, shaper.local, target, &packet);
+                    inflight += 1;
+                    match arrivals.first() {
+                        Some(arrival) => {
+                            q.lock()
+                                .push(queueing_us(&shaper.link, now, arrival.at_nanos, LEN));
+                            events.push(std::cmp::Reverse((arrival.at_nanos + one_way, false)));
+                        }
+                        None => {
+                            events.push(std::cmp::Reverse((now + 2 * one_way, true)));
+                        }
+                    }
+                }
+                let Some(std::cmp::Reverse((at, was_lost))) = events.pop() else {
+                    continue;
+                };
+                tokio::time::sleep_until((shaper.epoch + Duration::from_nanos(at)).into()).await;
+                inflight -= 1;
+                if was_lost {
+                    l.fetch_add(1, Ordering::Relaxed);
+                    if at >= recovery_until {
+                        ssthresh = (cwnd / 2.0).max(2.0);
+                        cwnd = ssthresh;
+                        recovery_until = at + 2 * one_way;
+                    }
+                } else {
+                    d.fetch_add(LEN as u64, Ordering::Relaxed);
+                    if cwnd < ssthresh {
+                        cwnd += 1.0;
+                    } else {
+                        cwnd += 1.0 / cwnd;
+                    }
+                }
+            }
+        });
+        Some(Self {
+            delivered,
+            queued_us,
+            lost,
+            offered,
+            task,
+        })
+    }
+
+    /// Bytes acknowledged so far.
+    pub fn delivered(&self) -> u64 {
+        self.delivered.load(Ordering::Relaxed)
+    }
+
+    /// Its measured loss and queueing so far.
+    pub fn report(&self) -> String {
+        let offered = self.offered.load(Ordering::Relaxed).max(1);
+        format!(
+            "competitor_loss={:.3} {}",
+            self.lost.load(Ordering::Relaxed) as f64 / offered as f64,
+            queue_summary(&self.queued_us.lock())
+        )
+    }
+}
+
+impl Drop for Competitor {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 /// A loopback UDP socket that, when shaped, sends through a link model on
@@ -195,14 +371,21 @@ impl LabSocket {
                 Socket::send_to(&*sender, &bytes, to).await.ok();
             }
         });
+        let shaper = Arc::new(Shaper {
+            model,
+            link,
+            epoch,
+            local,
+            out,
+            queued_us: parking_lot::Mutex::new(Vec::new()),
+        });
+        SHAPERS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push((local.port(), shaper.clone()));
         Ok(Self {
             inner,
-            shaper: Some(Arc::new(Shaper {
-                model,
-                epoch,
-                local,
-                out,
-            })),
+            shaper: Some(shaper),
         })
     }
 
@@ -215,6 +398,12 @@ impl LabSocket {
         let shaper = self.shaper.as_ref()?;
         let now = shaper.epoch.elapsed().as_nanos() as u64;
         for arrival in shaper.model.on_send(now, shaper.local, target, buf) {
+            shaper.queued_us.lock().push(queueing_us(
+                &shaper.link,
+                now,
+                arrival.at_nanos,
+                buf.len(),
+            ));
             shaper
                 .out
                 .send((arrival.at_nanos, buf.to_vec(), target))
@@ -227,13 +416,20 @@ impl LabSocket {
 impl Shaper {
     /// The link's ground truth for this socket's uplink.
     fn stats(&self) -> String {
+        // Host counters include a competing flow on the same uplink; the
+        // queueing figures are this socket's own datagrams only.
         let stats = self.model.host_stats(self.local);
+        let lost = stats.dropped_queue_full + stats.dropped_random;
         format!(
-            "offered={} delivered={} dropped_queue_full={} max_queueing_ms={:.1}",
+            "offered={} delivered={} dropped_queue_full={} dropped_random={} \
+             measured_loss={:.3} max_queueing_ms={:.1} {}",
             stats.offered,
             stats.delivered,
             stats.dropped_queue_full,
-            stats.max_queueing_delay.as_secs_f64() * 1000.0
+            stats.dropped_random,
+            lost as f64 / stats.offered.max(1) as f64,
+            stats.max_queueing_delay.as_secs_f64() * 1000.0,
+            queue_summary(&self.queued_us.lock())
         )
     }
 }
@@ -454,6 +650,11 @@ impl LabPair {
             shapers: [a_shaper, b_shaper],
             _keep: Box::new(keep),
         }
+    }
+
+    /// The sender's local port, for [`Competitor::start`] and [`link_report`].
+    pub fn sender_port(&self) -> Option<u16> {
+        self.shapers[0].as_ref().map(|shaper| shaper.local.port())
     }
 
     /// The flow-control window both sides run with.

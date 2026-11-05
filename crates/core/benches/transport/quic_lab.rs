@@ -32,8 +32,9 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use freenet::transport::quic_lab::{
-    ConnSample, FRAGMENT_BYTES, LabConfig, LabController, LabPair, LabSocket, LinkSpec, StreamsRun,
-    set_controller, set_gap_on_connection_progress, set_send_window, shape_port,
+    Competitor, ConnSample, FRAGMENT_BYTES, LabConfig, LabController, LabPair, LabSocket, LinkSpec,
+    StreamsRun, link_report, set_controller, set_gap_on_connection_progress, set_send_window,
+    shape_port,
 };
 use freenet::transport::{TRANSPORT_METRICS, TransportKeypair, create_connection_handler};
 use tokio::sync::mpsc;
@@ -307,6 +308,7 @@ async fn udp_pair(
     mpsc::Sender<Vec<u8>>,
     mpsc::UnboundedReceiver<usize>,
     Vec<tokio::task::JoinHandle<()>>,
+    u16,
 ) {
     let free_port = || {
         std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
@@ -376,7 +378,7 @@ async fn udp_pair(
     // The listeners' handles only report how they ended; dropping them
     // leaves the tasks running.
     drop((a_listener, b_listener));
-    (send_tx, got_rx, vec![a_task, b_task, keep])
+    (send_tx, got_rx, vec![a_task, b_task, keep], a_port)
 }
 
 enum Pair {
@@ -458,7 +460,7 @@ fn quic_lab_cpu_per_byte() {
             rt.block_on(async {
                 let mut pair = match transport.as_str() {
                     "udp" => {
-                        let (send, got, _tasks) = udp_pair(*limit, link).await;
+                        let (send, got, _tasks, _) = udp_pair(*limit, link).await;
                         Pair::Udp { send, got, _tasks }
                     }
                     "quic" => Pair::Quic(
@@ -584,7 +586,10 @@ fn sample_at(samples: &[ConnSample], at: Duration) -> Option<ConnSample> {
 /// (cubic or bbr, QUIC only), `LAB_GAP` (stream, the node's rule, or
 /// connection: the gap runs from the later of the send's last step and the
 /// connection's last newly acknowledged packet), `LAB_FAILURES` (1 prints
-/// one `LAB_LOSS_FAILURE` line per failed QUIC send), `LAB_SEND_WINDOW_KIB`
+/// one `LAB_LOSS_FAILURE` line per failed QUIC send), `LAB_COMPETITOR` (1 runs
+/// a loss-based flow on the sender's uplink during the transfer, see
+/// `quic_lab::Competitor`; `LAB_TRANSPORT=none` runs it alone for
+/// `LAB_ALONE_S`, 30), `LAB_SEND_WINDOW_KIB`
 /// (0, the node's: quinn's send window is W).
 #[test]
 fn quic_lab_loss() {
@@ -625,10 +630,44 @@ fn quic_lab_loss() {
     // quinn's send window in KiB, QUIC only; 0 keeps the node's (W).
     let send_window_kib: u64 = env_or("LAB_SEND_WINDOW_KIB", 0);
     set_send_window((send_window_kib > 0).then_some(send_window_kib * 1024));
+    let competitor = std::env::var("LAB_COMPETITOR").as_deref() == Ok("1");
+    // Throughput of the competing flow over `elapsed`, its loss and
+    // queueing, and the sender uplink's own figures.
+    let side = |comp: &Option<Competitor>, port: Option<u16>, elapsed: Duration| {
+        let comp = comp.as_ref().map_or(String::new(), |c| {
+            format!(
+                "competitor_bytes_per_s={:.0} {} ",
+                c.delivered() as f64 / elapsed.as_secs_f64(),
+                c.report()
+            )
+        });
+        let link = port
+            .and_then(link_report)
+            .map_or(String::new(), |l| format!("sender_link[{l}]"));
+        format!("{comp}{link}")
+    };
     for rep in 0..reps {
         let rt = runtime(threads);
         let line = rt.block_on(async {
             match transport.as_str() {
+                "none" => {
+                    // The competing flow alone on the same link.
+                    let port = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+                        .unwrap()
+                        .local_addr()
+                        .unwrap()
+                        .port();
+                    shape_port(port, link);
+                    let _socket = <LabSocket as freenet::transport::Socket>::bind(
+                        (Ipv4Addr::LOCALHOST, port).into(),
+                    )
+                    .await
+                    .expect("bind");
+                    let start = Instant::now();
+                    let comp = Competitor::start(port);
+                    tokio::time::sleep(Duration::from_secs(env_or("LAB_ALONE_S", 30))).await;
+                    format!("alone {}", side(&comp, None, start.elapsed()))
+                }
                 "quic" => {
                     let mut pair = LabPair::connect(LabConfig {
                         window_bytes: window,
@@ -636,9 +675,15 @@ fn quic_lab_loss() {
                         link: Some(link),
                     })
                     .await;
+                    let comp_start = Instant::now();
+                    let comp = competitor
+                        .then(|| pair.sender_port().and_then(Competitor::start))
+                        .flatten();
                     let run = pair
                         .concurrent_streams(streams, stream_bytes, Duration::from_secs(900))
                         .await;
+                    let side_line = side(&comp, pair.sender_port(), comp_start.elapsed());
+                    drop(comp);
                     let mut per: Vec<Vec<Duration>> = vec![Vec::new(); usize::from(streams)];
                     for (stream, at) in &run.log {
                         per[usize::from(*stream)].push(*at);
@@ -705,7 +750,7 @@ fn quic_lab_loss() {
                         "received={} causes={causes:?} failures_conn_acking={starved} \
                          failures_conn_silent={silent} longest_ack_silence_ms={} \
                          worst_gap_ms={} median_gap_ms={} \
-                         first_sent_s={:.1} last_sent_s={:.1} elapsed_s={:.1} {}",
+                         first_sent_s={:.1} last_sent_s={:.1} elapsed_s={:.1} {} {side_line}",
                         run.received,
                         longest_silence.as_millis(),
                         worst_gap.as_millis(),
@@ -717,8 +762,9 @@ fn quic_lab_loss() {
                     )
                 }
                 "udp" => {
-                    let (send, mut got, _tasks) = udp_pair(None, Some(link)).await;
+                    let (send, mut got, _tasks, a_port) = udp_pair(None, Some(link)).await;
                     let start = Instant::now();
+                    let comp = competitor.then(|| Competitor::start(a_port)).flatten();
                     for _ in 0..streams {
                         send.send(vec![0x5Au8; stream_bytes])
                             .await
@@ -742,9 +788,11 @@ fn quic_lab_loss() {
                         }
                     }
                     let delivered = arrivals.len();
+                    let side_line = side(&comp, Some(a_port), start.elapsed());
+                    drop(comp);
                     format!(
                         "received={delivered} not_delivered={} first_s={:.1} last_s={:.1} \
-                         elapsed_s={:.1}",
+                         elapsed_s={:.1} {side_line}",
                         usize::from(streams) - delivered,
                         arrivals.first().copied().unwrap_or(f64::NAN),
                         arrivals.last().copied().unwrap_or(f64::NAN),
