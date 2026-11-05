@@ -17,7 +17,8 @@
 //! (4096), `LAB_WINDOW_KIB` (2048), `LAB_THREADS` (4; 0 is a current-thread
 //! runtime), `LAB_REPS` (3), and the link: `LAB_RATE_MBIT` (10; 0 is plain
 //! loopback), `LAB_DELAY_MS` one way (64, so 128 ms RTT), `LAB_QUEUE_KIB`
-//! (256).
+//! (256). `LAB_DUMP` names a directory to write each run's fragment log to,
+//! as `stream,microseconds` rows.
 //!
 //! CPU settings: `LAB_SIZES_KIB` (64,1024,16384), `LAB_LIMITS` (bytes per
 //! second per connection, `none` for no `bandwidth-limit`; default
@@ -239,6 +240,18 @@ fn quic_lab_fairness() {
         let (source_full, queue_full) = ingress_drops();
         rt.shutdown_timeout(Duration::from_secs(1));
         let f = analyse(&run.log, streams);
+        if let Ok(dir) = std::env::var("LAB_DUMP") {
+            let path = format!(
+                "{dir}/fairness-t{threads}-s{streams}-w{}-r{rep}.csv",
+                window / 1024
+            );
+            let rows: String = run
+                .log
+                .iter()
+                .map(|(stream, at)| format!("{stream},{}\n", at.as_micros()))
+                .collect();
+            std::fs::write(&path, rows).expect("write the fragment log");
+        }
         let failed: Vec<&String> = run.outcomes.iter().filter(|o| *o != "Sent").collect();
         println!(
             "LAB_FAIRNESS threads={threads} streams={streams} stream_kib={} window_kib={} \
