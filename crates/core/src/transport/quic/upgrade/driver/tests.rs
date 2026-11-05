@@ -746,7 +746,7 @@ fn a_route_ends_with_its_path_and_what_it_holds_goes_on_udp() {
     use crate::transport::quic::path::{NextStep, QuicSendError, SendFailure, SendKind, stop_code};
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let h = Harness::server_with("quic-driver-route", 35, "prefer", Some("100")).await;
+        let h = Harness::server_with("quic-driver-route", 90, "prefer", Some("100")).await;
         let (session, inbox) = h.session();
         let attempt = offered(&h, &session);
         let up = path_up(&h, &session, inbox);
@@ -829,7 +829,7 @@ fn data_route_takes_no_lock(session: &Arc<Session>) -> bool {
 fn a_connection_without_a_route_takes_no_lock_to_send() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let h = Harness::server_with("quic-driver-fast", 36, "prefer", Some("100")).await;
+        let h = Harness::server_with("quic-driver-fast", 91, "prefer", Some("100")).await;
         let (session, inbox) = h.session();
         assert!(data_route_takes_no_lock(&session), "before any path");
         let attempt = offered(&h, &session);
@@ -857,7 +857,7 @@ fn data_is_enabled_once_per_activation() {
     use crate::transport::quic::control::caps;
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let h = Harness::server_with("quic-driver-once", 37, "prefer", Some("100")).await;
+        let h = Harness::server_with("quic-driver-once", 92, "prefer", Some("100")).await;
         let (session, inbox) = h.session();
         let attempt = offered(&h, &session);
         let up = path_up(&h, &session, inbox);

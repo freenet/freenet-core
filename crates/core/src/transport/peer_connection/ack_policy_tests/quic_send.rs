@@ -1041,7 +1041,7 @@ fn a_pipe_that_fails_after_sending_part_gives_up() {
 fn a_session_in_shadow_sends_everything_on_udp() {
     use crate::transport::quic::upgrade::driver::tests::shadow_path;
     crate::transport::quic::upgrade::driver::tests::run_bounded(|| async move {
-        let shadow = shadow_path("quic-send-inert", 71).await;
+        let shadow = shadow_path("quic-send-inert", 93).await;
         let mut e = single(CAPABLE);
         let path = Arc::clone(&shadow.path);
         let time = shadow.time.clone();
