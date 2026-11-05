@@ -829,9 +829,13 @@ struct RecvTimers<T: TimeSource> {
     resend_yield: Duration,
 }
 
+/// Interval for the timeout check / sweep of [`RecvTimers`]: the idle timeout
+/// is noticed up to this long after it passes.
+pub(crate) const TIMEOUT_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+
 impl<T: TimeSource> RecvTimers<T> {
     /// Interval for the timeout check / sweep.
-    const TIMEOUT_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+    const TIMEOUT_CHECK_INTERVAL: Duration = TIMEOUT_CHECK_INTERVAL;
 
     fn new(time_source: &T) -> Self {
         // When SimulationTransportOpt is enabled, use relaxed timer intervals to reduce

@@ -60,15 +60,24 @@ pub(crate) mod close_code {
     /// session. A node that does not know this code reads it as
     /// `QuicErrorKind::ConnectionLost`, which also falls back.
     pub(crate) const CONTROL_REFUSED: u32 = 0x05;
+    /// This node's UDP session to the peer ended (the connection was pruned,
+    /// or the peer restarted), so the path goes with it; fall back to the UDP
+    /// session if one is still up. Sent only by the upgrade machine on a
+    /// session end, so the peer can count it apart from a QUIC failure
+    /// (`quic_fallback_session_ended_rx`). A node that does not know this code
+    /// reads it as `QuicErrorKind::ConnectionLost`, which falls back and
+    /// counts as `quic_fallback_reset`.
+    pub(crate) const SESSION_ENDED: u32 = 0x06;
     /// Every close code, for the range and duplicate checks. A source-scrape
     /// test checks that each `const` in this module is listed.
-    pub(crate) const ALL: [u32; 6] = [
+    pub(crate) const ALL: [u32; 7] = [
         NODE_DROPPED_PEER,
         DOWNGRADE,
         IDENTITY_MISMATCH,
         SEND_ABORT_LIMIT,
         PEER_NOT_ACKNOWLEDGING,
         CONTROL_REFUSED,
+        SESSION_ENDED,
     ];
 }
 
@@ -83,7 +92,7 @@ const _: () = {
     let reset = reset_code::ALL;
     // No code is used twice, within or across the namespaces.
     let all_len = close.len() + stop.len() + reset.len();
-    let mut all = [0u32; 6 + 9 + 2];
+    let mut all = [0u32; 7 + 9 + 2];
     assert!(all.len() == all_len, "update the combined length");
     let mut n = 0;
     let mut i = 0;
@@ -146,6 +155,7 @@ impl QuicCloseCode {
             Self::SendAbortLimit => close_code::SEND_ABORT_LIMIT,
             Self::PeerNotAcknowledging => close_code::PEER_NOT_ACKNOWLEDGING,
             Self::ControlRefused => close_code::CONTROL_REFUSED,
+            Self::SessionEnded => close_code::SESSION_ENDED,
         }
     }
 
@@ -165,6 +175,7 @@ impl QuicCloseCode {
             Self::SendAbortLimit => b"send abort limit",
             Self::PeerNotAcknowledging => b"peer not acknowledging",
             Self::ControlRefused => b"control frame refused",
+            Self::SessionEnded => b"udp session ended",
         }
     }
 }
@@ -236,6 +247,7 @@ pub(in crate::transport) fn attribute(
                 | QuicRefusal::Version
                 | QuicRefusal::ConnectionRefused
                 | QuicRefusal::Downgrade
+                | QuicRefusal::SessionEnded
                 | QuicRefusal::AllowSetFull
                 | QuicRefusal::KeyConflict
                 | QuicRefusal::UnusableKey
@@ -308,6 +320,9 @@ impl From<quinn::ConnectionError> for QuicErrorKind {
                     },
                     Some(QuicCloseCode::IdentityMismatch) => Self::Refused {
                         reason: QuicRefusal::IdentityMismatch,
+                    },
+                    Some(QuicCloseCode::SessionEnded) => Self::Refused {
+                        reason: QuicRefusal::SessionEnded,
                     },
                     // A code a newer peer added still ends the connection.
                     Some(QuicCloseCode::NodeDroppedPeer) | None => Self::ConnectionLost,

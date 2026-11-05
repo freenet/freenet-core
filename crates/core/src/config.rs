@@ -2935,6 +2935,8 @@ impl NetworkApiConfig {
             memory_limit: crate::wasm_runtime::read_total_ram_bytes()
                 .unwrap_or(QUIC_FALLBACK_TOTAL_RAM),
             idle_timeout: None,
+            // The transport sets it from its bandwidth settings when it binds.
+            rate_limit: Default::default(),
         })
     }
 

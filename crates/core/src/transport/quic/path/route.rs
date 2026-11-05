@@ -163,7 +163,7 @@ pub(crate) const STALL_PROGRESS_WINDOW: Duration = ACK_WATCH_WINDOW;
 /// `MaybeDelivered` costs every streamed send its 2 s open deadline, and only this
 /// close recycles it. But a timeout counts only when no packet on the connection
 /// was newly acknowledged within [`STALL_PROGRESS_WINDOW`] (quinn's acknowledged
-/// packets, read from `recycle::AckCounting`). So a busy relay whose 48 permits
+/// packets, read from `recycle::CappedCubic`). So a busy relay whose 48 permits
 /// are held by transfers that are being acknowledged, or a receiver whose consumer
 /// is slow while its QUIC stack keeps acknowledging, never closes, and a path with
 /// no acknowledgements does. Any acknowledgement, like any `Sent`, starts the

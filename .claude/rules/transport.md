@@ -740,6 +740,37 @@ Rate calculation on every rate update (peer_connection::paced_rate; #6047):
   (#3702 burst). The global share is still taken as is, as before #6047.
   Only stream fragments draw on the bucket; short messages, ACKs and
   retransmits are unpaced.
+  QUIC has no bucket. The same rate (QuicRateLimit::rate, which calls
+  paced_rate) caps each QUIC connection's congestion window instead:
+  recycle::CappedCubic::window = min(Cubic's window, rate x RTT), never
+  below window_floor (two full datagrams and one byte, 2401 B: quinn refuses
+  a send at in_flight + bytes >= window, so 2400 would admit one datagram, and
+  a lone packet waits for the peer's 25 ms delayed ack). With no limit, or
+  before the first acknowledgement, it is Cubic's window; for the first batch
+  of acknowledgements the RTT is still quinn's 333 ms initial estimate, so the
+  cap is loose for that batch. quinn's in-flight limit reads the window, which
+  holds a path to about the rate (a_path_under_a_bandwidth_limit_keeps_to_it:
+  within 10% at 400 kB/s over a 40 ms round trip); the pacer only spreads the
+  sends. While the cap is below Cubic's window, on_ack reports the path as
+  app-limited to Cubic, so Cubic does not grow behind the cap and still backs
+  off on loss once the cap rises above the capacity (RFC 7661 idea). It
+  covers everything the path sends, shorts and control frames included. It
+  does not hold where rate x RTT is under the floor: there a path keeps two
+  datagrams in flight, about 2400 B per round trip (at the 64 KiB/s minimum,
+  any round trip under about 37 ms; pinned by
+  the_floor_keeps_two_datagrams_in_flight_both_ways). A QUIC path is not a
+  connection to GlobalBandwidthManager: it rides on its UDP connection and
+  takes that connection's full share, so a peer whose traffic is split across
+  both transports can get up to twice its share (the egress cap still bounds
+  the node). e5b-6 decides whether one peer's streams stay on one transport.
+  Under a binding egress cap the window cap does not hold a path to its
+  share either: the cap's holds add to quinn's RTT samples, and rate x RTT
+  grows with them (a_quic_path_and_udp_streams_both_progress_under_an_
+  egress_cap measured about 390 kB/s against a 250 kB/s share, 400 kB/s with
+  no window cap). The egress cap still holds the node's total.
+  The transport sets the rate when it binds (bind_udp_listener, pinned by
+  the_transport_gives_the_endpoint_its_bandwidth_settings); QuicSettings
+  from the config carries none.
 
 Token reservation:
   → Reserve BEFORE sending
@@ -936,7 +967,8 @@ doc has the transition table.
   restarted peer is replaced before its old QUIC connection reports anything.
   A failure that already charged left the machine in Idle, so it is not
   charged twice. An endpoint ending, or a SessionEnded with the endpoint read
-  as Down, charges nothing.
+  as Down, charges nothing. A machine shut off by a session end closes its
+  path with SESSION_ENDED (code 6); every other shut-off closes with DOWNGRADE.
   Uncharged: a Decline of Busy, NotReady or Backoff and a full allow-set retry
   after 60 s (jittered) and leave the failure count. So a peer that stays
   NotReady or in its own backoff is offered to once per 60 s while that lasts.
@@ -951,7 +983,7 @@ doc has the transition table.
   seed may come off a clock with another epoch. A promotion's first offer waits
   for the later of the seed and its own delay. e5a-5b must carry it per peer key
   across a replaced session, or a session that flaps retries at session rate.
-  Failures: close codes 1, 3, 4 and 5, a lost connection, an idle timeout and a
+  Failures: close codes 1, 3, 4, 5 and 6, a lost connection, an idle timeout and a
   deadline each mean fallback plus normal backoff, then a new offer. Never a
   permanent downgrade. Identity: close code 2 received, or Event::IdentityMismatch
   (closes with IDENTITY_MISMATCH). A TLS failure during the handshake
@@ -1078,15 +1110,50 @@ snapshot except the two gauges.
   offered and declined_uncharged. Both sides count `established`; only the
   offerer's is the numerator. Counts are node-wide; there is no per-pair series.
   `quic_fallback_<label>` (`QuicFallback`): idle, reset, protocol, downgrade_rx,
-  endpoint_down. Paths that had been active only; an attempt that ends in setup
-  is counted in `quic_upgrade_*`. A close this node sent for send_abort_limit or
-  peer_not_acknowledging reaches the machine as a lost connection, so it counts
-  as `reset`; its count is `quic_close_sent_*`. A key mismatch is
-  `quic_upgrade_identity_mismatch`.
+  endpoint_down, session_ended_rx. Paths that had been active only; an attempt
+  that ends in setup is counted in `quic_upgrade_*`. A close this node sent for
+  send_abort_limit or peer_not_acknowledging reaches the machine as a lost
+  connection, so it counts as `reset`; its count is `quic_close_sent_*`. A key
+  mismatch is `quic_upgrade_identity_mismatch`.
+  session_ended_rx is the peer closing with SESSION_ENDED (6): its UDP session
+  to this node ended (a prune or a restart). It is charged like downgrade_rx.
+  In setup this node counts the same close as `setup_downgrade_rx`, since
+  `QuicUpgradeOutcome` is full. A peer on a release before the code closes
+  with DOWNGRADE in that case (downgrade_rx). A node on a release before the
+  code reads 6 as an unknown code, a lost connection: `reset` for an active
+  path and `quic_upgrade_handshake_failed` in setup. So during a mixed
+  rollout, old nodes show more `reset` and `unknown_code` and fewer
+  `downgrade_rx` for the same closes, with nothing broken.
+  `quic_churned_fallback_<label>`, the same labels: fallbacks the UDP session's
+  end followed within FALLBACK_CHURN_WINDOW (150 s). The window is longer than
+  a UDP session takes to end once its peer goes silent (120 s idle timeout,
+  plus a keepalive interval, plus a timeout check), pinned by
+  the_churn_window_outlasts_a_udp_idle_timeout. The machine remembers each
+  fallback's time and cause (at most RECENT_FALLBACKS_MAX, 8; each is followed
+  by a backoff of at least 48 s, so at most 4 fit the window) and at
+  SessionEnded records Outcome::ChurnedFallback once for each within the
+  window, boundary included; the list is then empty, so a later SessionEnded
+  counts none again. It is a separate prefix so a sum over `quic_fallback_*`
+  does not add it in.
+  Reading them: a churned fallback is counted at the session's end, which can
+  come up to 150 s after the fallback, so with the default 30 s snapshot a
+  per-snapshot `quic_fallback_<c>` minus `quic_churned_fallback_<c>` can be
+  negative. Subtract only over windows much longer than 150 s (an hour or a
+  day). The Step 2 gate, fallbacks per path-day excluding endpoint and
+  restart causes, is then
+    (sum over c in idle, reset, protocol, downgrade_rx of
+       quic_fallback_<c> - quic_churned_fallback_<c>) / path-days,
+  with endpoint_down and session_ended_rx left out entirely (session_ended_rx
+  is churn by definition). It is a lower bound on fallbacks where QUIC failed
+  while UDP kept working: any session end within the window counts, including
+  one that the QUIC failure itself caused.
   `quic_close_received_<label>`: one per QUIC connection quinn reports as closed
   by a peer application close, by raw code (counted in `QuicConnection::new`'s
   watcher, because `QuicErrorKind` merges codes 1, 3, 4 and 5); a code with no
-  name is `unknown_code`. A local close is not counted.
+  name is `unknown_code`, always the last slot. A new code goes in before it,
+  so a reader must take the last slot as unknown and not use a fixed index
+  (SESSION_ENDED moved `unknown_code` from index 6 to 7). A local close is not
+  counted.
   `quic_path_age_at_close_<lt_1m|lt_10m|lt_1h|lt_1d|ge_1d>`: age of an active
   path at the teardown that ends it. `quic_establish_ms_p50`/`_p90`/`_samples`:
   from this node's Offer or Accept to active, on the session clock, first 256
@@ -1096,6 +1163,10 @@ snapshot except the two gauges.
   `PathGauge` guard inside the attempt, so dropping the attempt leaves the gauge.
   `quic_paths_active` is also in `resource_utilization` beside
   `memory_rss_bytes`.
+  `quic_flow_control_window_bytes`: the flow-control window of this node's QUIC
+  connections (per connection and direction), set when the endpoint is built,
+  0 without one; a state, not reset and not activity. Throughput by window
+  size shows whether nodes at the 128 KiB floor are slower on QUIC than on UDP.
   Not built: stream-concurrency instruments on real QUIC (`quic_open_uni_waited`,
   permit waits, ge_8..ge_48, control_* refusals) have no source until e5b and
   read zero in shadow; the `transport=legacy|quic` connection attribute; a
@@ -1212,7 +1283,8 @@ exposes (its module doc lists the few it does not):
   grease_quic_bit(false) (the demux rule depends on it), versions [1],
   max_udp_payload / initial and min MTU 1200, no MTU discovery, no GSO,
   keepalive 15 s (None when the TimeSource disables keepalive), idle = the
-  TimeSource's connection idle timeout, Cubic, 64 uni / 0 bidi streams,
+  TimeSource's connection idle timeout, Cubic with its window capped to the
+  configured bandwidth (recycle::CappedCubic), 64 uni / 0 bidi streams,
   stream / receive / send window = clamp(5% of memory / (2 x
   max-number-of-connections), 128 KiB, 2 MiB), no unreliable datagrams, no
   spin bit, migration off, max_incoming 64, incoming buffers 64 KiB / 1 MiB,
@@ -1714,7 +1786,7 @@ Path recycling (quic/recycle.rs, #5940 step M6): besides the send-reset
   the peer acknowledged none of them, and the peer kept sending (no two
   samples in a row without anything from it). A peer that keeps sending but
   acknowledges none of our packets is not a conforming QUIC peer (RFC 9000 13.2.1). Newly acknowledged packets
-  are counted by AckCounting, which wraps Cubic in transport_config;
+  are counted by CappedCubic, which wraps Cubic in transport_config;
   ConnectionStats has no such counter. Two samples in a row with nothing
   from the peer end the window, and so does a sample with nothing
   outstanding (in flight after the latest acknowledgements, minus losses,
@@ -1800,7 +1872,7 @@ QUIC send route (#5940 e5b-6, quic/upgrade/data_route.rs,
   A path that stops moving: STALLED_SENDS_LIMIT (8) timeouts in a row close it with
   DOWNGRADE (stalled_closed), but only timeouts while nothing on the connection was
   newly acknowledged within STALL_PROGRESS_WINDOW (ACK_WATCH_WINDOW, 10 s), read
-  from AckCounting's record (recycle::AckProgress) when a send settles
+  from CappedCubic's record (recycle::AckProgress) when a send settles
   (route::StallCount). Any acknowledgement or any Sent starts the count again. All
   three kinds count: Failed(NotOpened(TimedOut)), Failed(TimedOut),
   MaybeDelivered(TimedOut). NotOpened must count: a path whose permits are all
@@ -1921,8 +1993,8 @@ Errors: TransportError::Quic(QuicError), beside TransportError::Udp and
     buffer, so the code alone does not blame the endpoint),
     Refused{reason}:
     Handshake (a TLS alert, codes 0x100 to 0x1ff), Version,
-    ConnectionRefused (CONNECTION_REFUSED), Downgrade and
-    IdentityMismatch (the peer's close codes), AllowSetFull, KeyConflict,
+    ConnectionRefused (CONNECTION_REFUSED), Downgrade, IdentityMismatch and
+    SessionEnded (the peer's close codes), AllowSetFull, KeyConflict,
     UnusableKey, Local.
   → Attribution: error::attribute(availability, kind) turns every
     connection-scope kind into EndpointDown while the endpoint is Down,
@@ -1952,7 +2024,15 @@ Application error codes, one range per QUIC frame type, all one-byte
                 recycling, M6; the peer reads both as Downgrade),
                 CONTROL_REFUSED 5 (a control frame of an unknown version or
                 type arrived during path setup; the peer reads it as
-                Downgrade, a node without this code as ConnectionLost)
+                Downgrade, a node without this code as ConnectionLost),
+                SESSION_ENDED 6 (the UDP session ended; sent by the upgrade
+                machine's session-end shut-off and for a dial that connects
+                after the session ended; the peer reads it as
+                Refused{SessionEnded}, falls back and charges as for Downgrade,
+                and counts quic_fallback_session_ended_rx, or
+                setup_downgrade_rx in setup; a node without this code reads
+                ConnectionLost: quic_fallback_reset, or
+                quic_upgrade_handshake_failed in setup)
     0x10..=0x1f STOP_SENDING: path::stop_code (receiver refusals;
                 NOT_ACCEPTING_DATA 0x19 is a shadow path refusing data. Data
                 may be sent only after caps negotiation, so it is a counter

@@ -379,6 +379,9 @@ labelled_counters! {
         /// A control frame this node cannot read arrived while the path was
         /// being set up (an unknown version or type).
         ControlRefused => "control_refused",
+        /// This node's UDP session to the peer ended, so the path went with
+        /// it.
+        SessionEnded => "session_ended",
     }
 }
 
@@ -500,6 +503,11 @@ labelled_counters! {
         DowngradeReceived => "downgrade_rx",
         /// The QUIC endpoint went down.
         EndpointDown => "endpoint_down",
+        /// The peer closed it with `session_ended`: its UDP session to this
+        /// node ended (it pruned the connection or restarted). Peer churn,
+        /// not a QUIC failure. A peer on a release before the code sends
+        /// `downgrade` in the same case, which counts as `downgrade_rx`.
+        SessionEndedReceived => "session_ended_rx",
     }
 }
 
@@ -845,6 +853,9 @@ pub struct TransportMetrics {
     quic_upgrade: [AtomicU64; QuicUpgradeOutcome::COUNT],
     /// Path fallbacks this period, by [`QuicFallback`].
     quic_fallback: [AtomicU64; QuicFallback::COUNT],
+    /// Fallbacks this period that the UDP session's end followed, by the
+    /// fallback's [`QuicFallback`].
+    quic_churned_fallback: [AtomicU64; QuicFallback::COUNT],
     /// Active paths that ended this period, by [`QuicPathAge`].
     quic_path_age: [AtomicU64; QuicPathAge::COUNT],
     /// Establish latencies this period in ms (bounded), and how many there
@@ -855,6 +866,10 @@ pub struct TransportMetrics {
     quic_paths_offered_or_dialing: AtomicU64,
     /// Paths active on this node's evidence (state, never reset).
     quic_paths_active: AtomicU64,
+    /// The flow-control window of this node's QUIC connections, per
+    /// connection and direction (`quic::config::connection_window_bytes`):
+    /// a state set when the endpoint is built, 0 without one.
+    quic_flow_control_window_bytes: AtomicU64,
 
     /// The current snapshot period, starting at 1 and advanced by each
     /// `take_snapshot`. A connection's [`InboundConcurrencyPeak`] from an
@@ -1258,11 +1273,13 @@ impl TransportMetrics {
             quic_close_received: Default::default(),
             quic_upgrade: Default::default(),
             quic_fallback: Default::default(),
+            quic_churned_fallback: Default::default(),
             quic_path_age: Default::default(),
             quic_establish_ms: Default::default(),
             quic_establish_samples: AtomicU64::new(0),
             quic_paths_offered_or_dialing: AtomicU64::new(0),
             quic_paths_active: AtomicU64::new(0),
+            quic_flow_control_window_bytes: AtomicU64::new(0),
             inbound_concurrency_epoch: AtomicU64::new(1),
             inbound_concurrency: Default::default(),
             inbound_stream_outcomes: Default::default(),
@@ -1818,6 +1835,17 @@ impl TransportMetrics {
         self.quic_fallback[cause as usize].fetch_add(1, Ordering::Relaxed);
     }
 
+    /// The UDP session to `remote` ended within the upgrade machine's churn
+    /// window of a fallback of `cause`, which `record_quic_fallback` already
+    /// counted.
+    pub(crate) fn record_quic_churned_fallback(&self, cause: QuicFallback, remote: SocketAddr) {
+        #[cfg(test)]
+        self.note_quic_event(remote, ("churned", cause));
+        #[cfg(not(test))]
+        let _ = remote;
+        self.quic_churned_fallback[cause as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
     /// quinn reported a QUIC connection to `remote` closed by the peer's
     /// application close with raw `code`: counted under its [`QuicCloseCode`],
     /// or under `unknown_code` when this node has no name for it.
@@ -1900,6 +1928,12 @@ impl TransportMetrics {
     /// Paths active on this node's evidence now.
     pub(crate) fn quic_paths_active(&self) -> u64 {
         self.quic_paths_active.load(Ordering::Relaxed)
+    }
+
+    /// The QUIC endpoint was built with this flow-control window.
+    pub(crate) fn set_quic_flow_control_window_bytes(&self, window: u64) {
+        self.quic_flow_control_window_bytes
+            .store(window, Ordering::Relaxed);
     }
 
     /// QUIC upgrade control messages received since process start, never
@@ -2530,9 +2564,13 @@ impl TransportMetrics {
             quic_close_sent_control_refused: get64(
                 &self.quic_close_sent[QuicCloseCode::ControlRefused as usize],
             ),
+            quic_close_sent_session_ended: get64(
+                &self.quic_close_sent[QuicCloseCode::SessionEnded as usize],
+            ),
             quic_close_received: std::array::from_fn(|i| get64(&self.quic_close_received[i])),
             quic_upgrade: std::array::from_fn(|i| get64(&self.quic_upgrade[i])),
             quic_fallback: std::array::from_fn(|i| get64(&self.quic_fallback[i])),
+            quic_churned_fallback: std::array::from_fn(|i| get64(&self.quic_churned_fallback[i])),
             quic_path_age_at_close: std::array::from_fn(|i| get64(&self.quic_path_age[i])),
             quic_establish_ms_p50: establish_p50,
             quic_establish_ms_p90: establish_p90,
@@ -2541,6 +2579,9 @@ impl TransportMetrics {
                 .quic_paths_offered_or_dialing
                 .load(Ordering::Relaxed),
             quic_paths_active: self.quic_paths_active.load(Ordering::Relaxed),
+            quic_flow_control_window_bytes: self
+                .quic_flow_control_window_bytes
+                .load(Ordering::Relaxed),
             quic_close_sent_peer_not_acknowledging: get64(
                 &self.quic_close_sent[QuicCloseCode::PeerNotAcknowledging as usize],
             ),
@@ -3104,6 +3145,7 @@ pub struct TransportSnapshot {
     pub quic_close_sent_send_abort_limit: u64,
     pub quic_close_sent_peer_not_acknowledging: u64,
     pub quic_close_sent_control_refused: u64,
+    pub quic_close_sent_session_ended: u64,
     /// QUIC connections closed by the peer's application close, by
     /// [`QuicCloseCode`] in order; the last slot is a code this node does not
     /// know (`quic_close_received_<label>`, `..._unknown_code`).
@@ -3112,6 +3154,14 @@ pub struct TransportSnapshot {
     pub quic_upgrade: [u64; QuicUpgradeOutcome::COUNT],
     /// Path fallbacks by [`QuicFallback`] (`quic_fallback_<label>`).
     pub quic_fallback: [u64; QuicFallback::COUNT],
+    /// Fallbacks the UDP session's end followed within
+    /// `FALLBACK_CHURN_WINDOW` (150 s), by the label of the fallback
+    /// (`quic_churned_fallback_<label>`). Counted at the session's end, so in
+    /// a later snapshot than the fallback when the end comes after the
+    /// period closes: subtract it from `quic_fallback` only over windows much
+    /// longer than 150 s. The rule docs ("Upgrade telemetry") give the gate
+    /// formula.
+    pub quic_churned_fallback: [u64; QuicFallback::COUNT],
     /// Active paths that ended, by [`QuicPathAge`]
     /// (`quic_path_age_at_close_<label>`).
     pub quic_path_age_at_close: [u64; QuicPathAge::COUNT],
@@ -3127,6 +3177,12 @@ pub struct TransportSnapshot {
     /// paths active on this node's evidence. Zero outside shadow mode.
     pub quic_paths_offered_or_dialing: u64,
     pub quic_paths_active: u64,
+    /// The flow-control window of this node's QUIC connections, per
+    /// connection and direction (0 without an endpoint). A state, not reset,
+    /// and not activity by itself. Field data by window size shows whether
+    /// low-memory nodes, whose window is the 128 KiB floor, are slower on QUIC
+    /// than on UDP over long paths.
+    pub quic_flow_control_window_bytes: u64,
     /// Per-attempt records of the FIRST 8 failed outbound NAT traversals in
     /// the period (not a representative sample of a busy period);
     /// `nat_fail_samples_dropped` counts the rest. Read with the same
@@ -3465,15 +3521,18 @@ impl TransportSnapshot {
             quic_close_sent_send_abort_limit,
             quic_close_sent_peer_not_acknowledging,
             quic_close_sent_control_refused,
+            quic_close_sent_session_ended,
             quic_close_received,
             quic_upgrade,
             quic_fallback,
+            quic_churned_fallback,
             quic_path_age_at_close,
             quic_establish_ms_p50,
             quic_establish_ms_p90,
             quic_establish_samples,
             quic_paths_offered_or_dialing,
             quic_paths_active,
+            quic_flow_control_window_bytes,
             nat_fail_samples,
             nat_fail_samples_dropped,
             inbound_stream_refused_invalid_length,
@@ -3603,15 +3662,18 @@ impl TransportSnapshot {
         self.quic_close_sent_send_abort_limit = quic_close_sent_send_abort_limit;
         self.quic_close_sent_peer_not_acknowledging = quic_close_sent_peer_not_acknowledging;
         self.quic_close_sent_control_refused = quic_close_sent_control_refused;
+        self.quic_close_sent_session_ended = quic_close_sent_session_ended;
         self.quic_close_received = quic_close_received;
         self.quic_upgrade = quic_upgrade;
         self.quic_fallback = quic_fallback;
+        self.quic_churned_fallback = quic_churned_fallback;
         self.quic_path_age_at_close = quic_path_age_at_close;
         self.quic_establish_ms_p50 = quic_establish_ms_p50;
         self.quic_establish_ms_p90 = quic_establish_ms_p90;
         self.quic_establish_samples = quic_establish_samples;
         self.quic_paths_offered_or_dialing = quic_paths_offered_or_dialing;
         self.quic_paths_active = quic_paths_active;
+        self.quic_flow_control_window_bytes = quic_flow_control_window_bytes;
         self.nat_fail_samples = nat_fail_samples;
         self.nat_fail_samples_dropped = nat_fail_samples_dropped;
         self.inbound_stream_refused_invalid_length = inbound_stream_refused_invalid_length;
@@ -3797,6 +3859,7 @@ struct SnapshotExtras {
     pub quic_close_sent_send_abort_limit: u64,
     pub quic_close_sent_peer_not_acknowledging: u64,
     pub quic_close_sent_control_refused: u64,
+    pub quic_close_sent_session_ended: u64,
     /// QUIC connections closed by the peer's application close, by
     /// [`QuicCloseCode`] in order; the last slot is a code this node does not
     /// know (`quic_close_received_<label>`, `..._unknown_code`).
@@ -3805,6 +3868,14 @@ struct SnapshotExtras {
     pub quic_upgrade: [u64; QuicUpgradeOutcome::COUNT],
     /// Path fallbacks by [`QuicFallback`] (`quic_fallback_<label>`).
     pub quic_fallback: [u64; QuicFallback::COUNT],
+    /// Fallbacks the UDP session's end followed within
+    /// `FALLBACK_CHURN_WINDOW` (150 s), by the label of the fallback
+    /// (`quic_churned_fallback_<label>`). Counted at the session's end, so in
+    /// a later snapshot than the fallback when the end comes after the
+    /// period closes: subtract it from `quic_fallback` only over windows much
+    /// longer than 150 s. The rule docs ("Upgrade telemetry") give the gate
+    /// formula.
+    pub quic_churned_fallback: [u64; QuicFallback::COUNT],
     /// Active paths that ended, by [`QuicPathAge`]
     /// (`quic_path_age_at_close_<label>`).
     pub quic_path_age_at_close: [u64; QuicPathAge::COUNT],
@@ -3820,6 +3891,12 @@ struct SnapshotExtras {
     /// paths active on this node's evidence. Zero outside shadow mode.
     pub quic_paths_offered_or_dialing: u64,
     pub quic_paths_active: u64,
+    /// The flow-control window of this node's QUIC connections, per
+    /// connection and direction (0 without an endpoint). A state, not reset,
+    /// and not activity by itself. Field data by window size shows whether
+    /// low-memory nodes, whose window is the 128 KiB floor, are slower on QUIC
+    /// than on UDP over long paths.
+    pub quic_flow_control_window_bytes: u64,
     /// Per-attempt records of the FIRST 8 failed outbound NAT traversals in
     /// the period (not a representative sample of a busy period);
     /// `nat_fail_samples_dropped` counts the rest. Read with the same
@@ -3986,9 +4063,14 @@ impl SnapshotExtras {
             || self.quic_close_sent_send_abort_limit != 0
             || self.quic_close_sent_peer_not_acknowledging != 0
             || self.quic_close_sent_control_refused != 0
+            || self.quic_close_sent_session_ended != 0
             || self.quic_close_received.iter().any(|n| *n != 0)
             || self.quic_upgrade.iter().any(|n| *n != 0)
             || self.quic_fallback.iter().any(|n| *n != 0)
+            || self
+                .quic_churned_fallback
+                .iter()
+                .any(|n| *n != 0)
             || self.quic_path_age_at_close.iter().any(|n| *n != 0)
             || self.quic_establish_samples != 0
             || self.quic_paths_offered_or_dialing != 0
@@ -4927,6 +5009,26 @@ mod tests {
         assert_eq!(metrics.quic_adapter_panicked_at(local), 1);
     }
 
+    /// The QUIC flow-control window is a state: carried in every snapshot,
+    /// not reset, and not activity by itself.
+    #[test]
+    fn quic_flow_control_window_is_a_state_in_the_snapshot() {
+        let metrics = TransportMetrics::new();
+        metrics.set_quic_flow_control_window_bytes(128 * 1024);
+        assert!(
+            metrics.take_snapshot().is_none(),
+            "the window alone is not activity"
+        );
+        metrics.record_upgrade_control_received();
+        let snap = metrics.take_snapshot().expect("activity");
+        assert_eq!(snap.quic_flow_control_window_bytes, 128 * 1024);
+        let json = serde_json::to_value(&snap).unwrap();
+        assert_eq!(json["quic_flow_control_window_bytes"], 128 * 1024);
+        metrics.record_upgrade_control_received();
+        let snap = metrics.take_snapshot().expect("activity");
+        assert_eq!(snap.quic_flow_control_window_bytes, 128 * 1024, "not reset");
+    }
+
     /// A breaker trip reaches the snapshot and its JSON, counts as activity
     /// on its own, and resets; the suppressed state is carried while it
     /// holds and is not activity by itself.
@@ -4986,6 +5088,7 @@ mod tests {
             QuicCloseCode::SendAbortLimit => snap.quic_close_sent_send_abort_limit,
             QuicCloseCode::PeerNotAcknowledging => snap.quic_close_sent_peer_not_acknowledging,
             QuicCloseCode::ControlRefused => snap.quic_close_sent_control_refused,
+            QuicCloseCode::SessionEnded => snap.quic_close_sent_session_ended,
         }
     }
 
@@ -5050,6 +5153,14 @@ mod tests {
         check_quic_family(
             |m, slot, remote| m.record_quic_fallback(QuicFallback::ALL[slot], remote),
             |snap| snap.quic_fallback,
+        );
+    }
+
+    #[test]
+    fn quic_churned_fallbacks_count_snapshot_and_reset() {
+        check_quic_family(
+            |m, slot, remote| m.record_quic_churned_fallback(QuicFallback::ALL[slot], remote),
+            |snap| snap.quic_churned_fallback,
         );
     }
 
@@ -6246,15 +6357,18 @@ mod tests {
             "quic_close_sent_send_abort_limit",
             "quic_close_sent_peer_not_acknowledging",
             "quic_close_sent_control_refused",
+            "quic_close_sent_session_ended",
             "quic_close_received",
             "quic_upgrade",
             "quic_fallback",
+            "quic_churned_fallback",
             "quic_path_age_at_close",
             "quic_establish_ms_p50",
             "quic_establish_ms_p90",
             "quic_establish_samples",
             "quic_paths_offered_or_dialing",
             "quic_paths_active",
+            "quic_flow_control_window_bytes",
             "nat_fail_samples",
             "nat_fail_samples_dropped",
             "inbound_stream_refused_invalid_length",

@@ -238,6 +238,7 @@ fn settings() -> QuicSettings {
         max_connections: 4,
         memory_limit: 1024 * 1024 * 1024,
         idle_timeout: None,
+        rate_limit: Default::default(),
     }
 }
 
@@ -442,7 +443,7 @@ fn handshake_and_one_mib_stream_on_virtual_time() {
                 .inner()
                 .congestion_state()
                 .into_any()
-                .downcast::<super::recycle::AckCounting>()
+                .downcast::<super::recycle::CappedCubic>()
                 .expect("the acknowledgement-counting controller");
             assert!(
                 controller.wraps::<quinn::congestion::Cubic>(),
@@ -1781,6 +1782,7 @@ fn windows_never_exceed_the_reassembly_allowance() {
                 max_connections,
                 memory_limit,
                 idle_timeout: None,
+                rate_limit: Default::default(),
             };
             let window = settings.window_bytes();
             assert!(
@@ -1942,7 +1944,7 @@ fn the_transport_builds_an_endpoint_only_with_the_key_on() {
                 port,
                 false,
                 UdpTransportConfig {
-                    quic,
+                    quic: quic.clone(),
                     ..UdpTransportConfig::default()
                 },
             )
@@ -2641,6 +2643,9 @@ fn close_codes_reach_the_peer() {
             QuicCloseCode::IdentityMismatch => QuicErrorKind::Refused {
                 reason: QuicRefusal::IdentityMismatch,
             },
+            QuicCloseCode::SessionEnded => QuicErrorKind::Refused {
+                reason: QuicRefusal::SessionEnded,
+            },
         };
         let mut sent_by_a = Vec::new();
         let mut sent_by_b = Vec::new();
@@ -2988,7 +2993,7 @@ fn the_transport_reports_quic_availability() {
                 port,
                 false,
                 UdpTransportConfig {
-                    quic,
+                    quic: quic.clone(),
                     ..UdpTransportConfig::default()
                 },
             )
