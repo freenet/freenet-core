@@ -1003,6 +1003,9 @@ impl Session {
         }
         let state = self.state.lock();
         let route = state.attempt.as_ref()?.route.as_ref()?;
+        if route.path().is_suspect() {
+            return None;
+        }
         if !route.path().sends_data() {
             // A refusal is for good on this path, so its route is off the fast
             // path too. A new attempt sets the flag again under this lock.

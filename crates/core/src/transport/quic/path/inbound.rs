@@ -94,7 +94,7 @@ use super::super::framing::{FrameHeader, FrameKind, HEADER_LEN, HeaderError};
 use super::{QuicInboundOutcome, QuicPathStats, stop_code};
 use crate::simulation::TimeSource;
 use crate::transport::StreamId;
-use crate::transport::metrics::InboundStreamOutcome;
+use crate::transport::metrics::{InboundStreamOutcome, QuicCloseCode};
 use crate::transport::peer_connection::inbound_budget::{
     BudgetRejection, InboundKey, InboundStreamBudget, LegacyStreamToken, Liveness, Releaser,
     SharedInboundBudget,
@@ -170,6 +170,8 @@ pub(in crate::transport::quic) struct Receiver<T> {
     next_short_key: AtomicU32,
     /// Whether Short and Stream frames are read (`QuicPathLimits::accept_data`).
     accept_data: bool,
+    /// Closes the path on the first data frame it refuses ([`Self::accept_data`]).
+    closer: super::super::QuicCloser,
     /// Panic on the next stream, to test the supervisor.
     #[cfg(test)]
     pub(in crate::transport::quic) panic_on_stream: bool,
@@ -184,6 +186,7 @@ impl<T: TimeSource> Receiver<T> {
         streams: mpsc::Sender<InboundStreamArrival>,
         controls: mpsc::Sender<Bytes>,
         accept_data: bool,
+        closer: super::super::QuicCloser,
     ) -> Self {
         Self {
             time,
@@ -194,6 +197,7 @@ impl<T: TimeSource> Receiver<T> {
             controls,
             next_short_key: AtomicU32::new(1),
             accept_data,
+            closer,
             #[cfg(test)]
             panic_on_stream: false,
         }
@@ -677,15 +681,27 @@ async fn read_one<T: TimeSource>(recv: quinn::RecvStream, receiver: Arc<Receiver
     // Shadow mode: refuse data before the budget is looked at, so a data
     // frame neither takes room from the UDP session sharing the budget nor
     // leaves a refusal there.
+    //
+    // The path is then closed with DOWNGRADE, on the first such frame. A Short of
+    // one packet is acknowledged before the stop can reach its sender, which then
+    // reads `Sent`, keeps sending on the path and loses every such message. The
+    // close makes it fall back to UDP and negotiate the path again. Either side's
+    // gating is wrong here, and both bits are read again on the next attempt.
     if !receiver.accept_data && header.kind() != FrameKind::Control {
         receiver
             .stats
             .record(QuicInboundOutcome::RefusedNotAcceptingData);
-        tracing::debug!(
-            kind = ?header.kind(),
-            "QUIC path: refusing data on a path that accepts none"
-        );
         reader.stop(stop_code::NOT_ACCEPTING_DATA);
+        if receiver.closer.close(QuicCloseCode::Downgrade) {
+            receiver
+                .stats
+                .record(QuicInboundOutcome::ClosedRefusingData);
+            tracing::warn!(
+                kind = ?header.kind(),
+                "QUIC path: the peer sent data on a path where this node did not set \
+                 its data bit; closing the path so the peer falls back to UDP"
+            );
+        }
         return;
     }
     match header.kind() {
