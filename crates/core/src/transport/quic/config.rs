@@ -470,6 +470,31 @@ pub(crate) fn endpoint_config_with_cid_key(cid_key: [u8; 32]) -> std::io::Result
 /// `time` decides the keepalive and the idle timeout, as for the UDP
 /// transport: no keepalive and a long idle timeout where the time source
 /// says so (simulation).
+/// The send window: the flow-control window, or in a bench build the QUIC
+/// lab's override (`lab::SEND_WINDOW`, 0 for none).
+fn send_window(window: u64) -> u64 {
+    #[cfg(feature = "bench")]
+    {
+        let lab = lab::SEND_WINDOW.load(std::sync::atomic::Ordering::Relaxed);
+        if lab > 0 {
+            return lab;
+        }
+    }
+    window
+}
+
+/// Bench-only switches for the QUIC lab (`quic::lab`). Nothing in a node
+/// sets them.
+#[cfg(feature = "bench")]
+pub(crate) mod lab {
+    use std::sync::atomic::AtomicU64;
+
+    /// quinn's send window (bytes buffered and unacknowledged, across the
+    /// connection's streams) for connections built after it is set; 0 keeps
+    /// the flow-control window.
+    pub(crate) static SEND_WINDOW: AtomicU64 = AtomicU64::new(0);
+}
+
 pub(crate) fn transport_config<T: TimeSource>(
     settings: &QuicSettings,
     time: &T,
@@ -492,7 +517,7 @@ pub(crate) fn transport_config<T: TimeSource>(
         // A window is at most MAX_WINDOW_BYTES (2 MiB), far inside a VarInt.
         .stream_receive_window(VarInt::from_u32(window as u32))
         .receive_window(VarInt::from_u32(window as u32))
-        .send_window(window)
+        .send_window(send_window(window))
         .send_fairness(true)
         .initial_mtu(MAX_UDP_PAYLOAD)
         .min_mtu(MAX_UDP_PAYLOAD)
