@@ -184,12 +184,12 @@ impl<T: TimeSource> Receiver<T> {
         time: T,
         budget: SharedInboundBudget,
         stats: Arc<QuicPathStats>,
-        shorts: mpsc::Sender<InboundShort>,
-        streams: mpsc::Sender<InboundStreamArrival>,
+        data: super::QuicDataSenders,
         controls: mpsc::Sender<Bytes>,
         accept_data: bool,
         closer: super::super::QuicCloser,
     ) -> Self {
+        let super::QuicDataSenders { shorts, streams } = data;
         Self {
             time,
             budget,
