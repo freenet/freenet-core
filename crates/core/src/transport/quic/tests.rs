@@ -2609,6 +2609,9 @@ fn close_codes_reach_the_peer() {
             QuicCloseCode::IdentityMismatch => QuicErrorKind::Refused {
                 reason: QuicRefusal::IdentityMismatch,
             },
+            QuicCloseCode::SessionEnded => QuicErrorKind::Refused {
+                reason: QuicRefusal::SessionEnded,
+            },
         };
         let mut sent_by_a = Vec::new();
         let mut sent_by_b = Vec::new();

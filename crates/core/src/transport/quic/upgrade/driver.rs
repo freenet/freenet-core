@@ -568,6 +568,18 @@ impl QuicUpgrades {
     }
 }
 
+/// The counter label of a fallback cause.
+fn fallback_label(cause: FallbackCause) -> QuicFallback {
+    match cause {
+        FallbackCause::Idle => QuicFallback::Idle,
+        FallbackCause::Reset => QuicFallback::Reset,
+        FallbackCause::Protocol => QuicFallback::Protocol,
+        FallbackCause::DowngradeReceived => QuicFallback::DowngradeReceived,
+        FallbackCause::EndpointDown => QuicFallback::EndpointDown,
+        FallbackCause::SessionEndedReceived => QuicFallback::SessionEndedReceived,
+    }
+}
+
 impl Session {
     /// Take `event` on the machine. An ended session takes nothing.
     fn handle(&self, event: SessionEvent) -> Vec<UdpSend> {
@@ -575,8 +587,9 @@ impl Session {
         if state.ended {
             match event {
                 SessionEvent::Incoming(incoming) => incoming.ignore(),
+                // The session ended while this dial was out.
                 SessionEvent::Connected { connection, .. } => {
-                    connection.close(QuicCloseCode::Downgrade)
+                    connection.close(QuicCloseCode::SessionEnded)
                 }
                 SessionEvent::Upgrade(_)
                 | SessionEvent::ConnectFailed { .. }
@@ -736,16 +749,12 @@ impl Session {
             } else {
                 C::SessionEndedSetup
             }),
-            Outcome::Fallback(cause) => TRANSPORT_METRICS.record_quic_fallback(
-                match cause {
-                    FallbackCause::Idle => QuicFallback::Idle,
-                    FallbackCause::Reset => QuicFallback::Reset,
-                    FallbackCause::Protocol => QuicFallback::Protocol,
-                    FallbackCause::DowngradeReceived => QuicFallback::DowngradeReceived,
-                    FallbackCause::EndpointDown => QuicFallback::EndpointDown,
-                },
-                self.remote,
-            ),
+            Outcome::Fallback(cause) => {
+                TRANSPORT_METRICS.record_quic_fallback(fallback_label(cause), self.remote)
+            }
+            Outcome::ChurnedFallback(cause) => {
+                TRANSPORT_METRICS.record_quic_churned_fallback(fallback_label(cause), self.remote)
+            }
         }
     }
 
