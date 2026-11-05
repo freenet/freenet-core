@@ -2147,6 +2147,21 @@ impl SimNetwork {
         b: &NodeLabel,
         from: Duration,
     ) -> &mut Self {
+        self.drop_quic_datagrams_between_after(a, b, from, 0)
+    }
+
+    /// As [`Self::drop_quic_datagrams_between`], but the rule first lets
+    /// `after_bytes` of the pair's QUIC datagrams through from `from`, so a
+    /// test can cut the pair in the middle of a transfer
+    /// (`QuicDatagramDrop::after_bytes`).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn drop_quic_datagrams_between_after(
+        &mut self,
+        a: &NodeLabel,
+        b: &NodeLabel,
+        from: Duration,
+        after_bytes: u64,
+    ) -> &mut Self {
         let address = |label: &NodeLabel| {
             *self
                 .node_addresses
@@ -2157,7 +2172,8 @@ impl SimNetwork {
             address(a),
             address(b),
             u64::try_from(from.as_nanos()).unwrap_or(u64::MAX),
-        );
+        )
+        .after_bytes(after_bytes);
         let injector = crate::node::network_bridge::get_fault_injector(&self.name)
             .expect("SimNetwork::new registers a fault injector");
         let has_clock = {

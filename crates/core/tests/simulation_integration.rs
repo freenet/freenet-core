@@ -21081,6 +21081,141 @@ fn test_quic_data_carries_a_stream_end_to_end() {
     assert_eq!(stored.as_ref(), state.as_slice());
 }
 
+/// The path goes dark in the middle of a transfer: after 384 KiB of QUIC
+/// datagrams have moved between the node and the gateway, every later one is
+/// lost, while their UDP session carries on. Both ends stop putting new data on
+/// the path once its sends time out with nothing acknowledged (it is suspect),
+/// so data reaches the peer on UDP while the path is still up; the path falls
+/// back on its idle timeout with the UDP session up, the pair is offered a path
+/// again, and the gateway ends with the whole state.
+#[test_log::test]
+fn test_quic_data_path_cut_mid_transfer_falls_back_to_udp() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation};
+    const NETWORK: &str = "quic-data-cut";
+    const SEED: u64 = 0x5940_E5B6_0004;
+    const STATE_LEN: usize = 1024 * 1024;
+    const CUT_AFTER_BYTES: u64 = 384 * 1024;
+    setup_deterministic_state(SEED);
+    let contract = SimOperation::create_test_contract(0x63);
+    let key = contract.key();
+    let warm_up = SimOperation::create_test_contract(0x64);
+    let state: Vec<u8> = (0..STATE_LEN).map(|i| (i % 251) as u8).collect();
+
+    let node = NodeLabel::node(NETWORK, 1);
+    let gateway = NodeLabel::gateway(NETWORK, 0);
+    let rt = create_runtime();
+    let (sim, trace, nodes) = rt.block_on(async {
+        let mut sim = SimNetwork::new(NETWORK, 1, 1, 7, 3, 10, 2, SEED).await;
+        sim.enable_gateway_ack_version();
+        sim.with_streaming_threshold(64 * 1024);
+        sim.with_controlled_op_interval(Duration::from_secs(40));
+        sim.wait_for_join_convergence_before_ops(1.0, Duration::from_secs(60));
+        let trace = sim.quic_upgrade_trace();
+        let labels: Vec<_> = sim.all_node_addresses().keys().cloned().collect();
+        for label in &labels {
+            sim.with_node_transport_quic(label, "prefer");
+            sim.with_node_quic_data_percent(label, 100);
+        }
+        run_as_first_negotiating_release(&trace);
+        // A simulation has no keepalive and a QUIC idle timeout of a day; a
+        // production path that goes dark ends on its 120 s idle timeout.
+        sim.with_quic_idle_timeout(Duration::from_secs(60));
+        sim.drop_quic_datagrams_between_after(&node, &gateway, Duration::ZERO, CUT_AFTER_BYTES);
+        let nodes: Vec<_> = sim.all_node_addresses().values().copied().collect();
+        (sim, trace, nodes)
+    });
+    drop(rt);
+    let operations = vec![
+        // Gives the path the time to come up: the first offer waits 2-10 s.
+        ScheduledOperation::new(
+            node.clone(),
+            SimOperation::Put {
+                contract: warm_up,
+                state: vec![1; 64],
+                subscribe: false,
+            },
+        ),
+        ScheduledOperation::new(
+            node,
+            SimOperation::Put {
+                contract,
+                state: state.clone(),
+                subscribe: false,
+            },
+        ),
+    ];
+    // Long enough for the PUT's retry and the idle timeout.
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(600),
+        Duration::from_secs(300),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "simulation failed: {:?}",
+        result.turmoil_result.err()
+    );
+    let run = QuicShadowRun {
+        trace,
+        nodes,
+        logs_events: 0,
+        mesh: Default::default(),
+    };
+    // Premise: the path carried data before the cut.
+    for address in &run.nodes {
+        assert!(run.whats(*address, "DataEnabled") >= 1, "{}", run.dump());
+    }
+    let records = run.trace.records();
+    let fell_back = records
+        .iter()
+        .find(|r| r.what.starts_with("Fallback(") || r.what.starts_with("ChurnedFallback("))
+        .unwrap_or_else(|| panic!("the dark path fell back: {}", run.dump()));
+    // Suspect: after the last data the path delivered, and before it fell back,
+    // data arrived on UDP. Without it every message went on the dark path and
+    // was lost until the idle timeout.
+    let last_on_path = records
+        .iter()
+        .filter(|r| {
+            r.what.starts_with("received a short on the path")
+                || r.what.starts_with("received a stream on the path")
+        })
+        .map(|r| r.at)
+        .max()
+        .expect("the path delivered data before the cut");
+    assert!(
+        records
+            .iter()
+            .any(|r| r.what.starts_with("data arrived on UDP")
+                && r.at > last_on_path
+                && r.at < fell_back.at),
+        "data went on UDP while the dark path was up: {}",
+        run.dump()
+    );
+    let offered_again = records
+        .iter()
+        .find(|r| r.what == "Offered" && r.at > fell_back.at)
+        .unwrap_or_else(|| {
+            panic!(
+                "the pair was offered again after the fallback: {}",
+                run.dump()
+            )
+        });
+    assert!(
+        records
+            .iter()
+            .all(|r| !(r.what == "session ended" && r.at <= offered_again.at)),
+        "the UDP session stayed up through the fallback: {}",
+        run.dump()
+    );
+    let stored = result
+        .node_storages
+        .get(&gateway)
+        .and_then(|storage| storage.get_stored_state(&key))
+        .expect("the gateway stored the state");
+    assert_eq!(stored.as_ref(), state.as_slice());
+}
+
 /// A gateway with a gating bug: it advertises its data bit but refuses data. The
 /// first data the node sends on the path is refused, the gateway closes the path
 /// with DOWNGRADE, the node falls back to UDP, and the operations still succeed:
