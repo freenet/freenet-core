@@ -193,6 +193,9 @@ pub(crate) mod demux;
 pub(crate) mod egress_cap;
 pub mod in_memory_socket;
 pub(crate) mod quic;
+/// A real-time QUIC path pair for the transport benches (`quic::lab`).
+#[cfg(feature = "bench")]
+pub use quic::lab as quic_lab;
 
 /// Mock transport infrastructure for testing and benchmarking.
 /// Provides MockSocket and helper functions to create mock peer connections
