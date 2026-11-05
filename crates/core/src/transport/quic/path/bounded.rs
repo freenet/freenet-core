@@ -216,11 +216,10 @@ impl SendProgress {
         match self.stage() {
             STAGE_OPENING => started.saturating_add(nanos(deadlines.open)).min(total),
             STAGE_OPENED => deadlines.gap.map_or(total, |gap| {
-                self.0
-                    .last_step
-                    .load(Ordering::Acquire)
-                    .saturating_add(nanos(gap))
-                    .min(total)
+                let last = self.0.last_step.load(Ordering::Acquire);
+                #[cfg(feature = "bench")]
+                let last = last.max(lab::connection_progress());
+                last.saturating_add(nanos(gap)).min(total)
             }),
             _ => total,
         }
@@ -231,6 +230,29 @@ impl SendProgress {
             STAGE_OPENING => BoundedSend::Failed(SendFailure::NotOpened(NotOpened::TimedOut)),
             STAGE_OPENED => BoundedSend::Failed(SendFailure::TimedOut),
             _ => BoundedSend::MaybeDelivered(MaybeDelivered::TimedOut),
+        }
+    }
+}
+
+/// Bench-only: the QUIC lab can judge a streamed send's gap on the
+/// connection's progress instead of the send's own (`quic::lab`). Nothing
+/// in a node sets it.
+#[cfg(feature = "bench")]
+pub(crate) mod lab {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    /// When on, a send's gap runs from the later of its own last step and
+    /// [`LAST_CONNECTION_ACK`].
+    pub(crate) static GAP_ON_CONNECTION_PROGRESS: AtomicBool = AtomicBool::new(false);
+    /// When the lab's connection last had a packet newly acknowledged, on the
+    /// send's clock, in nanoseconds.
+    pub(crate) static LAST_CONNECTION_ACK: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn connection_progress() -> u64 {
+        if GAP_ON_CONNECTION_PROGRESS.load(Ordering::Relaxed) {
+            LAST_CONNECTION_ACK.load(Ordering::Relaxed)
+        } else {
+            0
         }
     }
 }

@@ -32,7 +32,8 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use freenet::transport::quic_lab::{
-    FRAGMENT_BYTES, LabConfig, LabPair, LabSocket, LinkSpec, StreamsRun, shape_port,
+    ConnSample, FRAGMENT_BYTES, LabConfig, LabController, LabPair, LabSocket, LinkSpec, StreamsRun,
+    set_controller, set_gap_on_connection_progress, shape_port,
 };
 use freenet::transport::{TRANSPORT_METRICS, TransportKeypair, create_connection_handler};
 use tokio::sync::mpsc;
@@ -551,13 +552,39 @@ fn quic_cause(
     }
 }
 
+/// The longest stretch in `samples` up to `until` with no packet newly
+/// acknowledged, and how long before `until` the last acknowledgement was.
+fn ack_silence(samples: &[ConnSample], until: Duration) -> (Duration, Duration) {
+    let mut longest = Duration::ZERO;
+    let mut last_change = Duration::ZERO;
+    let mut last_acked = 0;
+    for sample in samples.iter().take_while(|s| s.at <= until) {
+        if sample.acked > last_acked {
+            longest = longest.max(sample.at - last_change);
+            last_change = sample.at;
+            last_acked = sample.acked;
+        }
+    }
+    let since = until.saturating_sub(last_change);
+    (longest.max(since), since)
+}
+
+/// The sample at or just before `at`.
+fn sample_at(samples: &[ConnSample], at: Duration) -> Option<ConnSample> {
+    samples.iter().take_while(|s| s.at <= at).last().copied()
+}
+
 /// Concurrent streams over a link that loses a share of datagrams both
 /// ways, on the QUIC path or (`LAB_TRANSPORT=udp`) on the UDP transport
 /// with its own sender, over the same link model and seed. One `LAB_LOSS`
 /// line per repetition. Settings: `LAB_TRANSPORT` (quic), `LAB_STREAMS` (48),
 /// `LAB_STREAM_KIB` (256), `LAB_WINDOW_KIB` (2048, QUIC only), `LAB_LOSS`
 /// (0.10), `LAB_SEED` (1), `LAB_DELAY_MS` (50 one way), `LAB_RATE_MBIT` (0,
-/// no bottleneck), `LAB_THREADS` (4), `LAB_REPS` (3).
+/// no bottleneck), `LAB_THREADS` (4), `LAB_REPS` (3), `LAB_CONTROLLER`
+/// (cubic or bbr, QUIC only), `LAB_GAP` (stream, the node's rule, or
+/// connection: the gap runs from the later of the send's last step and the
+/// connection's last newly acknowledged packet), `LAB_FAILURES` (1 prints
+/// one `LAB_LOSS_FAILURE` line per failed QUIC send).
 #[test]
 fn quic_lab_loss() {
     if !enabled("quic_lab_loss") {
@@ -581,6 +608,19 @@ fn quic_lab_loss() {
         seed,
     };
     let expected = stream_bytes.div_ceil(FRAGMENT_BYTES);
+    let controller = std::env::var("LAB_CONTROLLER").unwrap_or_else(|_| "cubic".into());
+    set_controller(match controller.as_str() {
+        "cubic" => LabController::Cubic,
+        "bbr" => LabController::Bbr,
+        other => panic!("unknown controller {other}"),
+    });
+    let gap_rule = std::env::var("LAB_GAP").unwrap_or_else(|_| "stream".into());
+    set_gap_on_connection_progress(match gap_rule.as_str() {
+        "stream" => false,
+        "connection" => true,
+        other => panic!("unknown gap rule {other}"),
+    });
+    let print_failures = std::env::var("LAB_FAILURES").as_deref() == Ok("1");
     for rep in 0..reps {
         let rt = runtime(threads);
         let line = rt.block_on(async {
@@ -603,6 +643,11 @@ fn quic_lab_loss() {
                     let mut worst_gap = Duration::ZERO;
                     let mut gaps = Vec::new();
                     let mut sent_times = Vec::new();
+                    // Each failure: was the connection still being
+                    // acknowledged (one stream starved) or silent?
+                    let mut starved = 0;
+                    let mut silent = 0;
+                    let (longest_silence, _) = ack_silence(&run.samples, run.elapsed);
                     for (i, outcome) in run.outcomes.iter().enumerate() {
                         let times = &per[i];
                         let returned = run.returned_at.get(i).copied().unwrap_or(run.elapsed);
@@ -626,6 +671,26 @@ fn quic_lab_loss() {
                         gaps.push(gap.as_millis());
                         let cause = quic_cause(outcome, times.len(), expected, since_last);
                         *causes.entry(cause).or_default() += 1;
+                        if cause != "sent" {
+                            let (_, conn_since) = ack_silence(&run.samples, returned);
+                            if conn_since >= Duration::from_millis(4900) {
+                                silent += 1;
+                            } else {
+                                starved += 1;
+                            }
+                            if print_failures {
+                                let at = sample_at(&run.samples, returned);
+                                println!(
+                                    "LAB_LOSS_FAILURE rep={rep} stream={i} outcome={outcome} \
+                                     cause={cause} at_s={:.2} fragments={}/{expected} \
+                                     stream_gap_ms={} conn_last_ack_ms_ago={} sample={at:?}",
+                                    returned.as_secs_f64(),
+                                    times.len(),
+                                    since_last.as_millis(),
+                                    conn_since.as_millis(),
+                                );
+                            }
+                        }
                         if cause == "sent" {
                             sent_times.push(returned.as_secs_f64());
                         }
@@ -633,9 +698,12 @@ fn quic_lab_loss() {
                     gaps.sort_unstable();
                     sent_times.sort_by(f64::total_cmp);
                     format!(
-                        "received={} causes={causes:?} worst_gap_ms={} median_gap_ms={} \
+                        "received={} causes={causes:?} failures_conn_acking={starved} \
+                         failures_conn_silent={silent} longest_ack_silence_ms={} \
+                         worst_gap_ms={} median_gap_ms={} \
                          first_sent_s={:.1} last_sent_s={:.1} elapsed_s={:.1} {}",
                         run.received,
+                        longest_silence.as_millis(),
                         worst_gap.as_millis(),
                         gaps.get(gaps.len() / 2).copied().unwrap_or(0),
                         sent_times.first().copied().unwrap_or(f64::NAN),
@@ -686,7 +754,7 @@ fn quic_lab_loss() {
         println!(
             "LAB_LOSS transport={transport} threads={threads} streams={streams} stream_kib={} \
              window_kib={} loss={loss} seed={seed} delay_ms={delay_ms} rate_mbit={rate_mbit} \
-             rep={rep} {line}",
+             controller={controller} gap={gap_rule} rep={rep} {line}",
             stream_bytes / 1024,
             window / 1024,
         );

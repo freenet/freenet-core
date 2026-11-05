@@ -36,7 +36,7 @@ use tokio::sync::mpsc;
 use super::config::{QuicRateLimit, connection_window_bytes};
 use super::path::{BoundedSend, QuicPath, QuicPathLimits, SendDeadlines, data_channels};
 use super::{QuicEndpoint, QuicSettings};
-use crate::simulation::RealTime;
+use crate::simulation::{RealTime, TimeSource};
 use crate::transport::boundary::StreamProgressObserver;
 use crate::transport::demux::DemuxSocket;
 use crate::transport::link_model::{HostLink, LinkModel, Loss};
@@ -51,6 +51,49 @@ use crate::transport::{Socket, StreamId, TransportKeypair, UdpTransportSocket};
 /// [`LabPair::concurrent_streams`] logs.
 pub const FRAGMENT_BYTES: usize =
     crate::transport::peer_connection::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
+
+/// The congestion controller inside the window cap, for every connection
+/// built after the call (`recycle::lab`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LabController {
+    /// quinn's Cubic, what a node runs.
+    Cubic,
+    /// quinn's BBR, under the same cap.
+    Bbr,
+}
+
+/// Choose the controller for connections built from now on.
+pub fn set_controller(controller: LabController) {
+    use super::recycle::lab;
+    let value = match controller {
+        LabController::Cubic => lab::CUBIC,
+        LabController::Bbr => lab::BBR,
+    };
+    lab::INNER_CONTROLLER.store(value, Ordering::Relaxed);
+}
+
+/// Judge a streamed send's 5 s gap on the connection's progress (the last
+/// newly acknowledged packet, sampled every 20 ms by
+/// [`LabPair::concurrent_streams`]) as well as on the send's own, from now
+/// on. Off is what a node does.
+pub fn set_gap_on_connection_progress(on: bool) {
+    super::path::bounded::lab::GAP_ON_CONNECTION_PROGRESS.store(on, Ordering::Relaxed);
+}
+
+/// The connection's state at one moment of a run.
+#[derive(Debug, Clone, Copy)]
+pub struct ConnSample {
+    /// From the start of the run.
+    pub at: Duration,
+    /// Ack-eliciting packets newly acknowledged so far
+    /// (`recycle::AckProgress`).
+    pub acked: u64,
+    pub sent_packets: u64,
+    pub lost_packets: u64,
+    pub congestion_events: u64,
+    pub cwnd: u64,
+    pub rtt: Duration,
+}
 
 /// One host's uplink in the shaped link.
 #[derive(Debug, Clone, Copy)]
@@ -258,6 +301,8 @@ pub struct StreamsRun {
     pub outcomes: Vec<String>,
     /// When each send returned, from the start of the run, in stream order.
     pub returned_at: Vec<Duration>,
+    /// The connection every 20 ms.
+    pub samples: Vec<ConnSample>,
     /// Whether every send returned `Sent`.
     pub all_sent: bool,
     /// Messages the receiver assembled in full.
@@ -422,6 +467,39 @@ impl LabPair {
         let body = Bytes::from(vec![0xA5u8; bytes]);
         let start = Instant::now();
         let started = Arc::new(AtomicUsize::new(0));
+        let samples = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let sampler = {
+            let (connection, time, samples) = (
+                self.a.quinn_connection(),
+                self.time.clone(),
+                samples.clone(),
+            );
+            let progress = super::recycle::AckProgress::of(&connection);
+            tokio::spawn(async move {
+                let mut last_acked = 0;
+                super::path::bounded::lab::LAST_CONNECTION_ACK
+                    .store(time.now_nanos(), Ordering::Relaxed);
+                loop {
+                    let acked = progress.as_ref().map_or(0, |p| p.acked());
+                    if acked > last_acked {
+                        last_acked = acked;
+                        super::path::bounded::lab::LAST_CONNECTION_ACK
+                            .store(time.now_nanos(), Ordering::Relaxed);
+                    }
+                    let stats = connection.stats();
+                    samples.lock().push(ConnSample {
+                        at: start.elapsed(),
+                        acked,
+                        sent_packets: stats.path.sent_packets,
+                        lost_packets: stats.path.lost_packets,
+                        congestion_events: stats.path.congestion_events,
+                        cwnd: stats.path.cwnd,
+                        rtt: stats.path.rtt,
+                    });
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+        };
         let mut sends = Vec::new();
         for stream in 0..streams {
             let (a, time, body, log) =
@@ -475,11 +553,14 @@ impl LabPair {
             }
         }
         let elapsed = start.elapsed();
+        sampler.abort();
         let log = std::mem::take(&mut *log.lock());
+        let samples = std::mem::take(&mut *samples.lock());
         StreamsRun {
             log,
             outcomes,
             returned_at,
+            samples,
             all_sent,
             received,
             elapsed,
