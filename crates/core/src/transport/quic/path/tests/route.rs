@@ -1,5 +1,6 @@
 //! The table of `path::route` and what `QuicPath::settle` does with an outcome.
 
+use super::super::super::socket::CapHoldReading;
 use super::super::STALLED_SENDS_LIMIT;
 use super::super::route::{NextStep, QuicSendEvent, QuicSendResult, StallCount, next_step};
 use super::super::{SendKind, framing_error_for_tests};
@@ -135,7 +136,7 @@ fn timeouts() -> [BoundedSend; 3] {
 #[test]
 fn timeouts_on_a_quiet_path_close_it_and_a_sent_starts_again() {
     let mut count = StallCount::new(Some(5), 0);
-    let mut take = |outcome: &BoundedSend| count.take(outcome, false, Some(5), QUIET);
+    let mut take = |outcome: &BoundedSend| count.take_uncapped(outcome, false, Some(5), QUIET);
     for outcome in timeouts()
         .iter()
         .cycle()
@@ -156,10 +157,10 @@ fn timeouts_on_a_quiet_path_close_it_and_a_sent_starts_again() {
         MaybeDelivered::ConnectionLost
     )));
     assert!(
-        !count.take(&timeouts()[2], true, Some(5), QUIET),
+        !count.take_uncapped(&timeouts()[2], true, Some(5), QUIET),
         "a stalled source"
     );
-    let mut take = |outcome: &BoundedSend| count.take(outcome, false, Some(5), QUIET);
+    let mut take = |outcome: &BoundedSend| count.take_uncapped(outcome, false, Some(5), QUIET);
     assert!(take(&timeouts()[0]), "the eighth, a send that never opened");
     assert!(!take(&timeouts()[1]), "the close comes once");
 }
@@ -171,11 +172,11 @@ fn timeouts_count_only_once_nothing_is_acknowledged_for_the_window() {
     let mut count = StallCount::new(Some(0), 0);
     // Inside the window after the path was built.
     for _ in 0..2 * STALLED_SENDS_LIMIT {
-        assert!(!count.take(&timeouts()[0], false, Some(0), 9 * SECOND));
+        assert!(!count.take_uncapped(&timeouts()[0], false, Some(0), 9 * SECOND));
     }
     // Packets acknowledged every second: never quiet.
     for second in 0..40u64 {
-        assert!(!count.take(
+        assert!(!count.take_uncapped(
             &timeouts()[0],
             false,
             Some(second + 1),
@@ -185,14 +186,97 @@ fn timeouts_count_only_once_nothing_is_acknowledged_for_the_window() {
     // Seven quiet timeouts, then an acknowledgement, then seven more: no close.
     let last = 49 * SECOND;
     for _ in 1..STALLED_SENDS_LIMIT {
-        assert!(!count.take(&timeouts()[1], false, Some(40), last + QUIET));
+        assert!(!count.take_uncapped(&timeouts()[1], false, Some(40), last + QUIET));
     }
-    assert!(!count.take(&timeouts()[1], false, Some(41), last + QUIET));
+    assert!(!count.take_uncapped(&timeouts()[1], false, Some(41), last + QUIET));
     let quiet_again = last + 2 * QUIET;
     for _ in 1..STALLED_SENDS_LIMIT {
-        assert!(!count.take(&timeouts()[1], false, Some(41), quiet_again));
+        assert!(!count.take_uncapped(&timeouts()[1], false, Some(41), quiet_again));
     }
-    assert!(count.take(&timeouts()[1], false, Some(41), quiet_again));
+    assert!(count.take_uncapped(&timeouts()[1], false, Some(41), quiet_again));
+}
+
+/// A hold of the egress cap counts as progress, so a path the cap holds for longer
+/// than the window is not stalled; once the hold ends, timeouts past the window
+/// count again. A hold reported with no new event past its validity is a poller
+/// left behind and does not count.
+#[test]
+fn a_cap_hold_counts_as_progress() {
+    let reading = |holds, held_now| CapHoldReading {
+        holds,
+        held_now,
+        validity: Duration::from_secs(60),
+    };
+    let mut count = StallCount::new(Some(0), 0);
+    for second in 0..30u64 {
+        let now = QUIET + second * SECOND;
+        assert!(!count.take(&timeouts()[2], false, Some(0), reading(1, true), now));
+    }
+    // The hold ends: past the window, eight close the path.
+    let free = QUIET + 30 * SECOND + QUIET;
+    for _ in 1..STALLED_SENDS_LIMIT {
+        assert!(!count.take(&timeouts()[2], false, Some(0), reading(1, false), free));
+    }
+    assert!(count.take(&timeouts()[2], false, Some(0), reading(1, false), free));
+
+    // A hold that stays reported with no new event outlives its validity.
+    let mut count = StallCount::new(Some(0), 0);
+    assert!(!count.take(&timeouts()[2], false, Some(0), reading(7, true), 0));
+    let stale = 61 * SECOND + QUIET;
+    for _ in 1..STALLED_SENDS_LIMIT {
+        assert!(!count.take(&timeouts()[2], false, Some(0), reading(7, true), stale));
+    }
+    assert!(count.take(&timeouts()[2], false, Some(0), reading(7, true), stale));
+}
+
+/// A real path whose transmits a low egress cap holds, with nothing newly
+/// acknowledged for longer than the window: send timeouts do not close it.
+#[test]
+fn a_binding_cap_with_no_acknowledgements_keeps_the_path() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths_capped("quic-route-cap", 72, 50).await;
+        let (a, time) = (p.a.clone(), p.time());
+        p.drive(async move {
+            // A stream the cap holds for many minutes at 50 B/s.
+            let sender = {
+                let (a, time) = (a.clone(), time.clone());
+                tokio::spawn(async move {
+                    a.send_stream_bounded(
+                        &time,
+                        Duration::from_secs(3600),
+                        StreamId::next(),
+                        None,
+                        payload(64 * 1024).into(),
+                        None,
+                    )
+                    .await
+                })
+            };
+            let progress = a.ack_progress.clone().expect("counts acknowledgements");
+            let not_a_timeout = error(QuicSendError::Closed);
+            // Find a span past the window in which nothing was acknowledged and the
+            // cap held throughout. Without the exemption the timeouts below count.
+            let mut found = false;
+            for _ in 0..20 {
+                a.settle(SendKind::Stream, &not_a_timeout, false, time.now_nanos());
+                let acked = progress.acked();
+                time.sleep(Duration::from_secs(11)).await;
+                if progress.acked() == acked && a.connection.cap_holds().read().held_now {
+                    found = true;
+                    break;
+                }
+            }
+            assert!(found, "no quiet span with the cap holding");
+            for _ in 0..STALLED_SENDS_LIMIT {
+                a.settle(SendKind::Stream, &timeouts()[2], false, time.now_nanos());
+            }
+            assert!(a.quinn_connection().close_reason().is_none());
+            assert_eq!(a.stats().send_event_count(QuicSendEvent::StalledClosed), 0);
+            sender.abort();
+        })
+        .await;
+    });
 }
 
 /// A connection whose controller counts no acknowledgements cannot tell a busy
@@ -201,9 +285,9 @@ fn timeouts_count_only_once_nothing_is_acknowledged_for_the_window() {
 fn with_no_acknowledgement_count_every_timeout_counts() {
     let mut count = StallCount::new(None, 0);
     for _ in 1..STALLED_SENDS_LIMIT {
-        assert!(!count.take(&timeouts()[0], false, None, 0));
+        assert!(!count.take_uncapped(&timeouts()[0], false, None, 0));
     }
-    assert!(count.take(&timeouts()[0], false, None, 0));
+    assert!(count.take_uncapped(&timeouts()[0], false, None, 0));
 }
 
 /// On a real path, with nothing acknowledged since it was built: eight timeouts
