@@ -3476,7 +3476,7 @@ impl TransportSnapshot {
                     && !key.starts_with("inbound_concurrency_")
                     && key != "quic_data"
             });
-            for (key, count) in self.quic_data.nonzero_keys() {
+            for (key, count) in self.quic_data.upload_keys() {
                 map.insert(key, serde_json::json!(count));
             }
             for (key, count) in self.nonzero_conn_identity() {
@@ -5049,6 +5049,40 @@ mod tests {
         metrics.record_upgrade_control_received();
         let snap = metrics.take_snapshot().expect("activity");
         assert_eq!(snap.quic_flow_control_window_bytes, 128 * 1024, "not reset");
+    }
+
+    /// The QUIC data counts go through `take_snapshot` end to end: a count makes
+    /// the period active and reaches the upload under its key, the next period
+    /// is empty, the gauge alone is not activity and is not reset, and a read
+    /// that does not reset leaves the counts for the next snapshot.
+    #[test]
+    fn quic_data_counts_go_through_take_snapshot() {
+        use crate::transport::quic::path::{QuicSendResult, SendKind};
+        let metrics = TransportMetrics::new();
+        metrics.quic_data.data_path_started();
+        assert!(
+            metrics.take_snapshot().is_none(),
+            "the gauge alone is not activity"
+        );
+        metrics
+            .quic_data
+            .record_send(SendKind::Short, QuicSendResult::Sent);
+        let peek = metrics.read_snapshot();
+        assert_eq!(peek.quic_data.sends.iter().sum::<u64>(), 1);
+        let snap = metrics.take_snapshot().expect("a send is activity");
+        let json = snap.upload_json().unwrap();
+        assert_eq!(
+            json["quic_data_send_short_sent"], 1,
+            "the peek did not reset"
+        );
+        assert_eq!(json["quic_live_data_paths"], 1);
+        assert!(metrics.take_snapshot().is_none(), "the count was reset");
+        metrics.quic_data.record_open(false);
+        let snap = metrics.take_snapshot().expect("an open is activity");
+        let json = snap.upload_json().unwrap();
+        assert_eq!(json["quic_live_data_paths"], 1, "the gauge survives");
+        assert!(json.get("quic_data_send_short_sent").is_none());
+        assert_eq!(json["quic_sends"], 1);
     }
 
     /// A breaker trip reaches the snapshot and its JSON, counts as activity

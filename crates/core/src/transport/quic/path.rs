@@ -662,6 +662,10 @@ pub(crate) struct QuicPath {
     /// path in shadow, where a fragment taken from an inbound handle cannot
     /// outlive its charge because nothing is ever forwarded.
     send_data: AtomicU8,
+    /// Whether this path is counted in the node's `quic_live_data_paths` gauge:
+    /// from [`Self::count_as_data_path`] until the peer refuses data or
+    /// [`Self::uncount_as_data_path`], whichever is first, so it is lowered once.
+    counted_as_data_path: std::sync::atomic::AtomicBool,
     /// Send timeouts while nothing is acknowledged ([`route::StallCount`]).
     stall: parking_lot::Mutex<route::StallCount>,
     /// The connection's count of acknowledged packets, `None` if its controller
@@ -843,6 +847,7 @@ impl QuicPath {
                 aborts,
                 stream_slots: Arc::new(tokio::sync::Semaphore::new(STREAMED_SEND_LIMIT as usize)),
                 send_data: AtomicU8::new(SEND_DATA_NEVER),
+                counted_as_data_path: std::sync::atomic::AtomicBool::new(false),
                 stall: parking_lot::Mutex::new(stall),
                 ack_progress,
                 heard,
@@ -941,6 +946,8 @@ impl QuicPath {
     /// nothing, and the same send would fail the same way on a new one.
     fn stop_sending_data(&self) {
         self.stats.record_send_event(QuicSendEvent::DataRefused);
+        // No longer a path that carries data.
+        self.uncount_as_data_path();
         let was_on = self
             .send_data
             .compare_exchange(
@@ -956,6 +963,22 @@ impl QuicPath {
                 "QUIC path: the peer refused data after both sides set the data bit; \
                  sending on UDP from now on"
             );
+        }
+    }
+
+    /// Count this path in the node's `quic_live_data_paths` gauge, once: its
+    /// route was installed. Undone by [`Self::uncount_as_data_path`] or a refusal.
+    pub(in crate::transport) fn count_as_data_path(&self) {
+        if !self.counted_as_data_path.swap(true, Ordering::AcqRel) {
+            self.stats.node().data_path_started();
+        }
+    }
+
+    /// Take this path out of the gauge if it is in it: its attempt went. A path
+    /// the peer refused data on is out already, so nothing is lowered twice.
+    pub(in crate::transport) fn uncount_as_data_path(&self) {
+        if self.counted_as_data_path.swap(false, Ordering::AcqRel) {
+            self.stats.node().data_path_ended();
         }
     }
 

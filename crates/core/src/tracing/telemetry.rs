@@ -3137,7 +3137,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 serde_json::json!(snapshot.quic_flow_control_window_bytes),
             );
             // Flat, a key per non-zero count, as the upload carries them.
-            for (key, count) in snapshot.quic_data.nonzero_keys() {
+            for (key, count) in snapshot.quic_data.upload_keys() {
                 m.insert(key, count.into());
             }
             m.insert(
@@ -7618,6 +7618,8 @@ mod tests {
             .cloned()
             .collect();
         expected.insert("type".to_string());
+        // The QUIC data gauge goes out in every snapshot, 0 included.
+        expected.insert("quic_live_data_paths".to_string());
         // The QUIC families are arrays in the snapshot and one key per label in
         // the event.
         use crate::transport::metrics::{

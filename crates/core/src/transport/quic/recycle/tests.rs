@@ -839,3 +839,23 @@ fn ack_counting_implements_every_controller_method() {
     assert!(trait_methods.len() >= 10, "{trait_methods:?}");
     assert_eq!(ours, trait_methods);
 }
+
+/// Each report is the change since the last one, sent and received kept apart,
+/// and the next is taken from the state it hands back; a count that went down
+/// reports 0.
+#[test]
+fn udp_bytes_report_the_change_since_the_last_report() {
+    let at = |sent, received| UdpBytes { sent, received };
+    let start = at(10, 20);
+    let (next, sent, received) = start.step(at(15, 50));
+    assert_eq!((sent, received), (5, 30));
+    assert_eq!(next, at(15, 50));
+    let (next, sent, received) = next.step(at(115, 51));
+    assert_eq!(
+        (sent, received),
+        (100, 1),
+        "from the last report, not the start"
+    );
+    let (_, sent, received) = next.step(at(100, 51));
+    assert_eq!((sent, received), (0, 0));
+}

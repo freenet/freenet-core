@@ -1187,7 +1187,8 @@ snapshot except the two gauges.
 
 QUIC data telemetry (#5940 e5b-8, `transport/metrics/quic_data.rs`): node-wide
 counts of what paths' data sends and receives did, in one nested
-`TransportSnapshot::quic_data` and uploaded flat, a key per non-zero count. Each is
+`TransportSnapshot::quic_data` and uploaded flat, a key per non-zero count and the
+gauge every period, 0 included (`QuicDataSnapshot::upload_keys`). Each is
 recorded where the path decides it, into the path's `QuicPathStats` and the node's
 `QuicDataCounters` together (`QuicPathLimits::counters`, `TRANSPORT_METRICS` unless
 a test passes its own; tests read their own, never the global).
@@ -1196,23 +1197,29 @@ a test passes its own; tests read their own, never the global).
   data_refused|stalled_closed|udp_send_failed>; quic_data_stop_<code> (stops a
   peer sent to data sends); quic_inbound_<QuicInboundOutcome> (every receive
   outcome, refusals by frame kind as short_refused_budget and
-  stream_refused_budget); quic_data_enabled; quic_data_paths (a gauge of paths with
-  a route, not reset, not activity); quic_sends and quic_open_uni_waited (opens a
+  stream_refused_budget); quic_enabled_data_paths; quic_live_data_paths (a gauge of
+  paths with a route the peer has not refused data on, not reset, not activity;
+  lowered once, at the refusal or when the attempt goes); quic_sends and quic_open_uni_waited (opens a
   path tried, data and control, and those that waited for stream credit);
   quic_streamed_sends and quic_stream_permit_waited; quic_bytes_sent and
   quic_bytes_received (quinn's UDP payload counts, reported by change at each 2 s
   tick of the acknowledgement watch, so a path's last tick before it closes is
-  lost); quic_session_ended_with_data_path_<age>; quic_streams_open_paths_sampled,
-  quic_streams_open_ge_<8|16|32|48> and quic_streams_open_max (per path and period,
+  lost); quic_session_ended_with_data_path_<age> (sessions that ended while their
+  path's route still carried data); quic_streams_sampled_paths,
+  quic_streams_open_ge_<8|16|32|48> and quic_streams_peak_max (per path and period,
   the peak of inbound streams read at once, counted as inbound_concurrency counts
   connections).
-  No key starts with another family's prefix, and none starts with an existing
-  one (`quic_send_` is `quic_send_refused`'s, `quic_paths_` the gauges'), so a
-  prefix sum never adds two families
-  (`keys_are_distinct_and_no_family_contains_another`). The step-3 stream-limit
-  bars read quic_open_uni_waited over quic_sends, quic_stream_permit_waited over
-  quic_streamed_sends, and quic_streams_open_ge_48 over
-  quic_streams_open_paths_sampled.
+  A family is the keys of one label list under one prefix
+  (`QuicDataSnapshot::keys_by_family`). No other key starts with a family's
+  prefix or with the prefix sibling families share (`quic_data_` for the send,
+  event and stop families, `quic_streams_open_` for the levels), and no key starts
+  with a prefix two of the snapshot's other keys share (`quic_send_`,
+  `quic_paths_` and the rest), so a prefix sum never adds two kinds of count. The
+  tests read the families from the keys and the other keys from the snapshot's
+  serde fields, not from a list (`no_key_is_under_another_family`). The step-3
+  stream-limit bars read quic_open_uni_waited over quic_sends,
+  quic_stream_permit_waited over quic_streamed_sends (both counts of attempts),
+  and quic_streams_open_ge_48 over quic_streams_sampled_paths.
 
 Upgrade driver (`quic/upgrade/driver.rs`, #5940 step e5a-5b): QuicUpgrades is
 per node (endpoint, policy, routes by address, live sessions by peer key, backoff

@@ -74,10 +74,7 @@ fn a_paths_sends_and_receives_reach_the_node() {
         assert_eq!(keys["quic_open_uni_waited"], 0);
         assert!(keys["quic_bytes_sent"] > 0);
         assert!(keys["quic_bytes_received"] > 0);
-        assert_eq!(
-            keys["quic_streams_open_paths_sampled"], 1,
-            "only b read streams"
-        );
+        assert_eq!(keys["quic_streams_sampled_paths"], 1, "only b read streams");
     });
 }
 
@@ -146,5 +143,66 @@ fn waits_for_a_stream_and_for_a_permit_are_counted() {
             "the peer read 64 at once"
         );
         drop((permits, held));
+    });
+}
+
+/// Hands every short to nobody, for a route whose worker never runs.
+struct NoUdp;
+
+impl crate::transport::quic::upgrade::data_route::UdpShorts for NoUdp {
+    fn send_short(
+        &self,
+        _payload: Vec<u8>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<(), crate::transport::TransportError>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(std::future::ready(Ok(())))
+    }
+}
+
+/// A short that finds the route's queue full goes to UDP and is counted node-wide
+/// once, as is a path closed by sends that keep timing out with nothing
+/// acknowledged: both reach the node through the path's `record_send_event`.
+#[test]
+fn an_overflow_to_udp_and_a_stall_close_reach_the_node() {
+    use crate::transport::quic::upgrade::data_route::{DataRoute, RouteNote, SHORT_QUEUE_CAPACITY};
+    use crate::transport::quic::upgrade::driver::PathClock;
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let node = node_counters();
+        let limits = QuicPathLimits {
+            counters: Some(node),
+            ..QuicPathLimits::DEFAULT
+        };
+        let p = paths("quic-node-events", 82, limits).await;
+        p.a.enable_data();
+        // The worker is never run, so the queue only fills.
+        let (route, _worker) = DataRoute::new(
+            Arc::clone(&p.a),
+            PathClock::Virtual(p.time()),
+            Arc::new(NoUdp),
+            RouteNote::default(),
+        );
+        for i in 0..SHORT_QUEUE_CAPACITY {
+            route
+                .queue_short(vec![i as u8])
+                .expect("the queue has room");
+        }
+        assert!(route.queue_short(vec![0]).is_err(), "the queue is full");
+
+        // Past the window with nothing acknowledged, as `a_quiet_path_closes_after_eight_timeouts`.
+        let later = p.time().now_nanos() + 11 * 1_000_000_000;
+        let timeout = BoundedSend::Failed(SendFailure::TimedOut);
+        for _ in 0..super::super::STALLED_SENDS_LIMIT {
+            p.a.settle(SendKind::Stream, &timeout, false, later);
+        }
+        assert!(p.a.quinn_connection().close_reason().is_some(), "closed");
+        let keys = keys(node);
+        assert_eq!(keys["quic_data_event_short_overflow_udp"], 1);
+        assert_eq!(keys["quic_data_event_stalled_closed"], 1);
     });
 }

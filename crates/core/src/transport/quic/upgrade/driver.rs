@@ -83,9 +83,7 @@ use crate::config::{GlobalExecutor, GlobalRng};
 use crate::node::background_task_monitor::LateRegistrar;
 use crate::simulation::{RealTime, TimeSource, VirtualTime};
 use crate::transport::crypto::TransportPublicKey;
-use crate::transport::metrics::{
-    QuicCloseCode, QuicDataCounters, QuicFallback, QuicUpgradeOutcome,
-};
+use crate::transport::metrics::{QuicCloseCode, QuicFallback, QuicUpgradeOutcome};
 use crate::transport::peer_connection::UdpSender;
 use crate::transport::peer_connection::inbound_budget::SharedInboundBudget;
 use crate::transport::quic::control::ControlError;
@@ -335,8 +333,8 @@ struct Attempt {
     route: Option<DataRoute>,
     /// The session's [`Session::routed`], set while `route` is held. Cleared when
     /// the attempt goes, which happens only under the session's lock, as is the
-    /// node's `quic_data_paths` gauge this route raised.
-    routed: Option<(Arc<AtomicBool>, &'static QuicDataCounters)>,
+    /// node's `quic_live_data_paths` gauge the route's path raised.
+    routed: Option<Arc<AtomicBool>>,
     /// The dial or establish task, the control sends and the path's pump.
     tasks: Vec<JoinHandle<()>>,
 }
@@ -361,9 +359,11 @@ impl Drop for Attempt {
         for task in &self.tasks {
             task.abort();
         }
-        if let Some((routed, counters)) = &self.routed {
+        if let Some(routed) = &self.routed {
             routed.store(false, Ordering::Release);
-            counters.data_path_ended();
+        }
+        if let Some(route) = &self.route {
+            route.path().uncount_as_data_path();
         }
     }
 }
@@ -432,7 +432,7 @@ pub(in crate::transport) struct QuicUpgrades {
     /// Where a test's paths keep their node-wide counts in place of
     /// `TRANSPORT_METRICS`.
     #[cfg(test)]
-    test_counters: Option<&'static QuicDataCounters>,
+    test_counters: Option<&'static crate::transport::metrics::QuicDataCounters>,
 }
 
 impl QuicUpgrades {
@@ -756,7 +756,7 @@ impl Session {
                 }
             }
             // Not in `QuicUpgradeOutcome`, which is at 32, the longest array serde
-            // and `Default` take: `quic_data_enabled` (`metrics::quic_data`).
+            // and `Default` take: `quic_enabled_data_paths` (`metrics::quic_data`).
             Outcome::DataEnabled => {
                 if let Some(path) = state.attempt.as_ref().and_then(|held| held.path.as_ref()) {
                     path.stats().node().record_data_enabled();
@@ -978,11 +978,10 @@ impl Session {
             self.route_note(),
         );
         held.route = Some(route);
-        let counters = path.stats().node();
-        held.routed = Some((Arc::clone(&self.routed), counters));
+        held.routed = Some(Arc::clone(&self.routed));
         self.routed.store(true, Ordering::Release);
-        // Ended by the attempt's drop, which clears `routed`.
-        counters.data_path_started();
+        // Lowered by a refusal or by the attempt's drop, whichever is first.
+        path.count_as_data_path();
         // Bounded by the path: it ends when the connection does and what it holds
         // is gone, so the handle is not monitored and is not in `held.tasks`.
         drop(GlobalExecutor::spawn(report_panics(self.remote, worker)));
@@ -1234,11 +1233,15 @@ impl Session {
             if state.ended {
                 return;
             }
-            // A session that ends under a data path (`quic_session_ended_with_data_path_*`).
+            // A session that ends under a data path (`quic_session_ended_with_data_path_*`):
+            // one whose route the peer has not refused data on.
             let data_path = state.attempt.as_ref().and_then(|held| {
                 let since = held.gauge.active_since?;
-                held.route.as_ref()?;
-                Some((held.path.as_ref()?.stats().node(), since))
+                let route = held.route.as_ref()?;
+                route
+                    .path()
+                    .sends_data()
+                    .then(|| (route.path().stats().node(), since))
             });
             if let Some((counters, since)) = data_path {
                 counters.record_session_ended_with_data_path((self.now)().saturating_sub(since));
