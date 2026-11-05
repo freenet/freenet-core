@@ -8484,6 +8484,56 @@ mod tests {
         assert!(clear < reload, "must clear the token before reloading");
     }
 
+    /// The "Your own peer" section must tell a visitor who has no peer how to
+    /// get one. Before this, the popover offered "Move to my peer" and a
+    /// loopback import link but never said where to install Freenet, so a
+    /// try.freenet.org visitor without a peer hit a connection error with no
+    /// way forward.
+    #[test]
+    fn hosted_bar_points_visitors_without_a_peer_at_the_installer() {
+        const QUICKSTART: &str = "href=\"https://freenet.org/quickstart/\"";
+        let section = HOSTED_BAR_HTML
+            .find("<h4>Your own peer</h4>")
+            .expect("hosted bar must have a 'Your own peer' section");
+        let migrate = HOSTED_BAR_HTML
+            .find("id=\"fnmigrate\"")
+            .expect("Move-to-my-peer button present");
+        let reveal = HOSTED_BAR_HTML
+            .find("id=\"fnmigrateout\"")
+            .expect("migration hint block present");
+        let open = HOSTED_BAR_HTML
+            .find("id=\"fnmigrateopen\"")
+            .expect("primary open control present");
+
+        // (a) Visible BEFORE the user clicks "Move to my peer": in the section
+        // intro, not only in the block revealed afterwards.
+        let intro = &HOSTED_BAR_HTML[section..migrate];
+        assert!(
+            intro.contains(QUICKSTART),
+            "the 'Your own peer' intro must link to the install quickstart"
+        );
+        // (b) Also in the post-click hint, which is where a visitor lands after
+        // the peer tab failed to connect.
+        let hint = &HOSTED_BAR_HTML[reveal..open];
+        assert!(
+            hint.contains(QUICKSTART),
+            "the post-click migration hint must link to the install quickstart"
+        );
+        // (c) Each install link opens in a new tab (leaving the hosted session
+        // in place) with the opener severed.
+        let links: Vec<_> = HOSTED_BAR_HTML.match_indices(QUICKSTART).collect();
+        assert_eq!(links.len(), 2, "expected exactly the two install links");
+        for (i, _) in links {
+            let tag_start = HOSTED_BAR_HTML[..i].rfind("<a").expect("inside an anchor");
+            let tag_end = i + HOSTED_BAR_HTML[i..].find('>').expect("anchor closes");
+            let tag = &HOSTED_BAR_HTML[tag_start..tag_end];
+            assert!(
+                tag.contains("target=\"_blank\"") && tag.contains("rel=\"noopener\""),
+                "install link must open a new tab with rel=noopener: {tag}"
+            );
+        }
+    }
+
     /// The hosted "Move to my peer" migration (#4592) must default to a
     /// ONE-CLICK open against the user's local peer, keeping copy-the-URL only
     /// as a SECONDARY fallback. Before this, the only affordance was a link the
@@ -8505,8 +8555,12 @@ mod tests {
         // plain click (or cmd/middle-click into another profile) opens the peer
         // import page directly — the "direct link" the friction complaint asked
         // for. Assert the target belongs to this control (nearby), not anywhere.
-        let target_idx = HOSTED_BAR_HTML
+        // Search FROM the control, not from the start of the document: other
+        // anchors (the "Install Freenet" pointer) legitimately carry
+        // target=_blank earlier in the popover.
+        let target_idx = HOSTED_BAR_HTML[open_idx..]
             .find("target=\"_blank\"")
+            .map(|o| o + open_idx)
             .expect("the primary open control must target a new browsing context");
         assert!(
             target_idx > open_idx && target_idx - open_idx < 120,

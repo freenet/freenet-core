@@ -102,6 +102,13 @@ iframe {
 #fnpop .sec {
   margin-bottom: 14px;
 }
+/* Inline "Install Freenet" pointer for visitors who have no peer yet. A plain
+   underlined link in the text colour, so it stays inside the popover's
+   near-monochrome palette rather than shouting in default link blue. */
+#fnpop a.fninstall {
+  color: #222;
+  text-decoration: underline;
+}
 #fnpop .sec:last-child {
   margin-bottom: 0;
 }
@@ -188,6 +195,9 @@ iframe {
   }
   #fnpop p {
     color: #a0a0a4;
+  }
+  #fnpop a.fninstall {
+    color: #e6e6e8;
   }
   #fnok {
     color: #5cbd83;
