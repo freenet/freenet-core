@@ -91,10 +91,24 @@ pub struct LabSocket {
     shaper: Option<Arc<Shaper>>,
 }
 
+/// Links for sockets the UDP transport binds itself, by port
+/// ([`shape_port`]).
+static SHAPED_PORTS: std::sync::Mutex<Vec<(u16, LinkSpec)>> = std::sync::Mutex::new(Vec::new());
+
+/// Shape the next [`LabSocket`] bound through [`Socket::bind`] on `port` with
+/// `link`. For a UDP-transport pair (`create_connection_handler::<LabSocket>`),
+/// which binds its own socket, so it can run over the same link as a QUIC
+/// pair.
+pub fn shape_port(port: u16, link: LinkSpec) {
+    SHAPED_PORTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push((port, link));
+}
+
 impl LabSocket {
-    async fn bind_shaped(link: Option<LinkSpec>) -> io::Result<Self> {
-        let inner =
-            Arc::new(<UdpTransportSocket as Socket>::bind((Ipv4Addr::LOCALHOST, 0).into()).await?);
+    async fn bind_shaped(addr: SocketAddr, link: Option<LinkSpec>) -> io::Result<Self> {
+        let inner = Arc::new(<UdpTransportSocket as Socket>::bind(addr).await?);
         let Some(link) = link else {
             return Ok(Self {
                 inner,
@@ -167,10 +181,16 @@ impl Shaper {
 
 impl Socket for LabSocket {
     async fn bind(addr: SocketAddr) -> io::Result<Self> {
-        Ok(Self {
-            inner: Arc::new(<UdpTransportSocket as Socket>::bind(addr).await?),
-            shaper: None,
-        })
+        let link = {
+            let mut ports = SHAPED_PORTS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            ports
+                .iter()
+                .position(|(port, _)| *port == addr.port())
+                .map(|at| ports.remove(at).1)
+        };
+        Self::bind_shaped(addr, link).await
     }
 
     async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
@@ -279,7 +299,9 @@ impl LabPair {
             rate_limit: QuicRateLimit::new(config.bandwidth_limit, None),
         };
         let bind = || async {
-            let socket = LabSocket::bind_shaped(config.link).await.expect("bind");
+            let socket = LabSocket::bind_shaped((Ipv4Addr::LOCALHOST, 0).into(), config.link)
+                .await
+                .expect("bind");
             let addr = socket.local_addr().expect("bound");
             let shaper = socket.shaper.clone();
             (Arc::new(DemuxSocket::wrap(socket, None)), addr, shaper)
