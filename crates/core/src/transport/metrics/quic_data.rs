@@ -128,9 +128,13 @@ impl QuicDataCounters {
 
     pub(crate) fn data_path_ended(&self) {
         // A failed update means the gauge was already 0: nothing to undo.
-        let _ = self
+        if self
             .data_paths
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+            .is_err()
+        {
+            tracing::debug!("quic_data_paths was already 0 when a data path ended");
+        }
     }
 
     /// A stream was opened on a path, data or control; `waited` when the open did
