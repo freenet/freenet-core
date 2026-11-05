@@ -61,6 +61,10 @@ pub struct LinkSpec {
     pub one_way_delay: Duration,
     /// Drop-tail queue in front of the bottleneck, in bytes.
     pub queue_bytes: usize,
+    /// Share of datagrams lost at random after the queue, each way
+    /// (`Loss::Bernoulli`), from a generator seeded with `seed`.
+    pub loss: f64,
+    pub seed: u64,
 }
 
 /// What the lab pair is built with.
@@ -121,9 +125,13 @@ impl LabSocket {
                 uplink_bps: link.rate_bps,
                 queue_bytes: link.queue_bytes,
                 one_way_delay: link.one_way_delay,
-                loss: Loss::None,
+                loss: if link.loss > 0.0 {
+                    Loss::Bernoulli(link.loss)
+                } else {
+                    Loss::None
+                },
             },
-            0,
+            link.seed,
         );
         let epoch = Instant::now();
         let (out, mut queued) = mpsc::unbounded_channel::<(u64, Vec<u8>, SocketAddr)>();
@@ -248,6 +256,8 @@ pub struct StreamsRun {
     pub log: Vec<(u16, Duration)>,
     /// Each send's outcome, `Debug`-rendered, in stream order.
     pub outcomes: Vec<String>,
+    /// When each send returned, from the start of the run, in stream order.
+    pub returned_at: Vec<Duration>,
     /// Whether every send returned `Sent`.
     pub all_sent: bool,
     /// Messages the receiver assembled in full.
@@ -420,44 +430,56 @@ impl LabPair {
             sends.push(tokio::spawn(async move {
                 started.fetch_add(1, Ordering::Relaxed);
                 let observer = FragmentLog { stream, start, log };
-                a.send_stream_bounded(
-                    &time,
-                    SendDeadlines::stream(body.len() as u64),
-                    StreamId::next(),
-                    None,
-                    body,
-                    Some(&observer),
-                )
-                .await
+                let outcome = a
+                    .send_stream_bounded(
+                        &time,
+                        SendDeadlines::stream(body.len() as u64),
+                        StreamId::next(),
+                        None,
+                        body,
+                        Some(&observer),
+                    )
+                    .await;
+                (outcome, start.elapsed())
             }));
         }
+        let assembled = &mut self.assembled;
         let run = async {
             let mut outcomes = Vec::new();
+            let mut returned_at = Vec::new();
             let mut all_sent = true;
             for send in sends {
-                let outcome = send.await.expect("the send ran");
+                let (outcome, at) = send.await.expect("the send ran");
                 all_sent &= matches!(outcome, BoundedSend::Sent);
                 outcomes.push(format!("{outcome:?}"));
+                returned_at.push(at);
             }
-            let mut received = 0;
-            if all_sent {
-                while received < usize::from(streams) {
-                    match self.assembled.recv().await {
-                        Some(_) => received += 1,
-                        None => break,
-                    }
-                }
-            }
-            (outcomes, all_sent, received)
+            (outcomes, returned_at, all_sent)
         };
-        let (outcomes, all_sent, received) = tokio::time::timeout(limit, run)
+        let (outcomes, returned_at, all_sent) = tokio::time::timeout(limit, run)
             .await
-            .unwrap_or_else(|_| (vec!["run timed out".to_string()], false, 0));
+            .unwrap_or_else(|_| (vec!["run timed out".to_string()], Vec::new(), false));
+        // Every message the receiver assembled: all of them when every send
+        // returned Sent, and after a failure, those that still arrive within
+        // the receiver's 5 s gap.
+        let mut received = 0;
+        while received < usize::from(streams) {
+            let wait = if all_sent {
+                limit
+            } else {
+                Duration::from_secs(6)
+            };
+            match tokio::time::timeout(wait, assembled.recv()).await {
+                Ok(Some(_)) => received += 1,
+                Ok(None) | Err(_) => break,
+            }
+        }
         let elapsed = start.elapsed();
         let log = std::mem::take(&mut *log.lock());
         StreamsRun {
             log,
             outcomes,
+            returned_at,
             all_sent,
             received,
             elapsed,
