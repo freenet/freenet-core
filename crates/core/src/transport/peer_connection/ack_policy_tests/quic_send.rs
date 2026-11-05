@@ -828,13 +828,18 @@ fn a_busy_relay_whose_transfers_are_acknowledged_keeps_its_path() {
             rig.path.settle(Duration::from_millis(200)).await;
             assert_eq!(rig.route.path().free_stream_slots(), 0, "every permit held");
             // Every 2 s each transfer moves on by a piece, inside its 5 s gap, and is
-            // acknowledged; a large message waits for a permit and gives up.
+            // acknowledged; large messages wait for a permit and give up.
             for piece in 2..=PIECES {
-                rig.e
-                    .conn
-                    .send_serialized(bytes_of(4000).to_vec())
-                    .await
-                    .unwrap();
+                // Eight at once, so they time out together: only the window keeps
+                // them from closing the path, since the reset on an acknowledgement
+                // comes before the first of them.
+                for _ in 0..STALLED_SENDS_LIMIT {
+                    rig.e
+                        .conn
+                        .send_serialized(bytes_of(4000).to_vec())
+                        .await
+                        .unwrap();
+                }
                 rig.path.settle(Duration::from_secs(2)).await;
                 for source in &sources {
                     source
