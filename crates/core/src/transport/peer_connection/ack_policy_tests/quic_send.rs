@@ -1132,6 +1132,16 @@ fn a_suspect_path_sends_new_shorts_on_udp_until_it_is_acknowledged() {
             rig.e.conn.send_serialized(message(2)).await.unwrap();
             rig.path.settle(Duration::from_millis(50)).await;
             assert_eq!(rig.udp_data().shorts, vec![message(2)], "on UDP at once");
+            // A short the worker takes while the path is suspect goes on UDP too.
+            rig.route
+                .queue_short(message(4))
+                .expect("the queue is open");
+            rig.path.settle(Duration::from_millis(50)).await;
+            assert_eq!(
+                rig.udp_data().shorts,
+                vec![message(4)],
+                "the worker sends it on UDP"
+            );
             assert!(rig.route.path().quinn_connection().close_reason().is_none());
 
             // The peer acknowledges again (quinn's keepalive, at the latest).
