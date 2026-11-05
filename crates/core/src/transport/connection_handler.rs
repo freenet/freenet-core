@@ -281,7 +281,19 @@ pub(super) async fn bind_udp_listener<S: Socket>(
     // above; the simulation's `VirtualTime` in a simulation, which has no
     // cap), authenticates with this node's transport key, and has an empty
     // allow-set: nothing reaches it until an upgrade path allows a peer.
-    let quic_endpoint = config.quic.as_ref().and_then(|settings| {
+    // Each QUIC connection's window is capped at the rate the UDP token
+    // bucket paces a connection at (`quic::recycle::CappedCubic`).
+    let quic_settings = config
+        .quic
+        .clone()
+        .map(|settings| super::quic::QuicSettings {
+            rate_limit: super::quic::config::QuicRateLimit::new(
+                config.bandwidth_limit,
+                config.global_bandwidth.clone(),
+            ),
+            ..settings
+        });
+    let quic_endpoint = quic_settings.as_ref().and_then(|settings| {
         let socket = socket.clone();
         match quic_virtual_time {
             // Building the endpoint draws quinn's RNG seed from `GlobalRng`.
@@ -304,6 +316,9 @@ pub(super) async fn bind_udp_listener<S: Socket>(
         }
     });
 
+    if let (Some(_), Some(settings)) = (&quic_endpoint, &quic_settings) {
+        super::TRANSPORT_METRICS.set_quic_flow_control_window_bytes(settings.window_bytes());
+    }
     #[cfg(any(test, feature = "testing"))]
     if let Some(endpoint) = &quic_endpoint {
         super::in_memory_socket::record_quic_endpoint_clock(bind_addr, endpoint.clock_type());

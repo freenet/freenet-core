@@ -866,6 +866,10 @@ pub struct TransportMetrics {
     quic_paths_offered_or_dialing: AtomicU64,
     /// Paths active on this node's evidence (state, never reset).
     quic_paths_active: AtomicU64,
+    /// The flow-control window of this node's QUIC connections, per
+    /// connection and direction (`quic::config::connection_window_bytes`):
+    /// a state set when the endpoint is built, 0 without one.
+    quic_flow_control_window_bytes: AtomicU64,
 
     /// The current snapshot period, starting at 1 and advanced by each
     /// `take_snapshot`. A connection's [`InboundConcurrencyPeak`] from an
@@ -1275,6 +1279,7 @@ impl TransportMetrics {
             quic_establish_samples: AtomicU64::new(0),
             quic_paths_offered_or_dialing: AtomicU64::new(0),
             quic_paths_active: AtomicU64::new(0),
+            quic_flow_control_window_bytes: AtomicU64::new(0),
             inbound_concurrency_epoch: AtomicU64::new(1),
             inbound_concurrency: Default::default(),
             inbound_stream_outcomes: Default::default(),
@@ -1925,6 +1930,12 @@ impl TransportMetrics {
         self.quic_paths_active.load(Ordering::Relaxed)
     }
 
+    /// The QUIC endpoint was built with this flow-control window.
+    pub(crate) fn set_quic_flow_control_window_bytes(&self, window: u64) {
+        self.quic_flow_control_window_bytes
+            .store(window, Ordering::Relaxed);
+    }
+
     /// QUIC upgrade control messages received since process start, never
     /// reset (tests only).
     #[cfg(test)]
@@ -2568,6 +2579,9 @@ impl TransportMetrics {
                 .quic_paths_offered_or_dialing
                 .load(Ordering::Relaxed),
             quic_paths_active: self.quic_paths_active.load(Ordering::Relaxed),
+            quic_flow_control_window_bytes: self
+                .quic_flow_control_window_bytes
+                .load(Ordering::Relaxed),
             quic_close_sent_peer_not_acknowledging: get64(
                 &self.quic_close_sent[QuicCloseCode::PeerNotAcknowledging as usize],
             ),
@@ -3163,6 +3177,12 @@ pub struct TransportSnapshot {
     /// paths active on this node's evidence. Zero outside shadow mode.
     pub quic_paths_offered_or_dialing: u64,
     pub quic_paths_active: u64,
+    /// The flow-control window of this node's QUIC connections, per
+    /// connection and direction (0 without an endpoint). A state, not reset,
+    /// and not activity by itself. Field data by window size shows whether
+    /// low-memory nodes, whose window is the 128 KiB floor, are slower on QUIC
+    /// than on UDP over long paths.
+    pub quic_flow_control_window_bytes: u64,
     /// Per-attempt records of the FIRST 8 failed outbound NAT traversals in
     /// the period (not a representative sample of a busy period);
     /// `nat_fail_samples_dropped` counts the rest. Read with the same
@@ -3512,6 +3532,7 @@ impl TransportSnapshot {
             quic_establish_samples,
             quic_paths_offered_or_dialing,
             quic_paths_active,
+            quic_flow_control_window_bytes,
             nat_fail_samples,
             nat_fail_samples_dropped,
             inbound_stream_refused_invalid_length,
@@ -3652,6 +3673,7 @@ impl TransportSnapshot {
         self.quic_establish_samples = quic_establish_samples;
         self.quic_paths_offered_or_dialing = quic_paths_offered_or_dialing;
         self.quic_paths_active = quic_paths_active;
+        self.quic_flow_control_window_bytes = quic_flow_control_window_bytes;
         self.nat_fail_samples = nat_fail_samples;
         self.nat_fail_samples_dropped = nat_fail_samples_dropped;
         self.inbound_stream_refused_invalid_length = inbound_stream_refused_invalid_length;
@@ -3869,6 +3891,12 @@ struct SnapshotExtras {
     /// paths active on this node's evidence. Zero outside shadow mode.
     pub quic_paths_offered_or_dialing: u64,
     pub quic_paths_active: u64,
+    /// The flow-control window of this node's QUIC connections, per
+    /// connection and direction (0 without an endpoint). A state, not reset,
+    /// and not activity by itself. Field data by window size shows whether
+    /// low-memory nodes, whose window is the 128 KiB floor, are slower on QUIC
+    /// than on UDP over long paths.
+    pub quic_flow_control_window_bytes: u64,
     /// Per-attempt records of the FIRST 8 failed outbound NAT traversals in
     /// the period (not a representative sample of a busy period);
     /// `nat_fail_samples_dropped` counts the rest. Read with the same
@@ -4979,6 +5007,26 @@ mod tests {
         assert_eq!(json["quic_adapter_panicked"], 1);
         assert!(metrics.take_snapshot().is_none(), "the counter must reset");
         assert_eq!(metrics.quic_adapter_panicked_at(local), 1);
+    }
+
+    /// The QUIC flow-control window is a state: carried in every snapshot,
+    /// not reset, and not activity by itself.
+    #[test]
+    fn quic_flow_control_window_is_a_state_in_the_snapshot() {
+        let metrics = TransportMetrics::new();
+        metrics.set_quic_flow_control_window_bytes(128 * 1024);
+        assert!(
+            metrics.take_snapshot().is_none(),
+            "the window alone is not activity"
+        );
+        metrics.record_upgrade_control_received();
+        let snap = metrics.take_snapshot().expect("activity");
+        assert_eq!(snap.quic_flow_control_window_bytes, 128 * 1024);
+        let json = serde_json::to_value(&snap).unwrap();
+        assert_eq!(json["quic_flow_control_window_bytes"], 128 * 1024);
+        metrics.record_upgrade_control_received();
+        let snap = metrics.take_snapshot().expect("activity");
+        assert_eq!(snap.quic_flow_control_window_bytes, 128 * 1024, "not reset");
     }
 
     /// A breaker trip reaches the snapshot and its JSON, counts as activity
@@ -6320,6 +6368,7 @@ mod tests {
             "quic_establish_samples",
             "quic_paths_offered_or_dialing",
             "quic_paths_active",
+            "quic_flow_control_window_bytes",
             "nat_fail_samples",
             "nat_fail_samples_dropped",
             "inbound_stream_refused_invalid_length",

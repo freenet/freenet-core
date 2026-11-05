@@ -2167,6 +2167,7 @@ impl Scripted {
             max_connections: 4,
             memory_limit: 1024 * 1024 * 1024,
             idle_timeout: None,
+            rate_limit: Default::default(),
         };
         let (a_keys, b_keys) = (TransportKeypair::new(), TransportKeypair::new());
         let mut tasks = Vec::new();
@@ -2284,7 +2285,7 @@ impl Scripted {
             self.a.connection().inner(),
             &self.a.connection().cap_holds(),
         )
-        .expect("an AckCounting controller")
+        .expect("a CappedCubic controller")
     }
 
     fn keep_sending(&self) {

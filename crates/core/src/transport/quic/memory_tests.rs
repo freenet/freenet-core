@@ -52,6 +52,7 @@ fn settings() -> QuicSettings {
         max_connections: 200,
         memory_limit: 2 * 1024 * 1024 * 1024,
         idle_timeout: None,
+        rate_limit: Default::default(),
     }
 }
 
@@ -763,6 +764,7 @@ fn frames_filling_the_window_measure_within_the_window_multiple() {
             max_connections: 200,
             memory_limit,
             idle_timeout: None,
+            rate_limit: Default::default(),
         };
         let w = settings.window_bytes() as usize;
         assert_eq!(w, expected as usize, "premise: the window at its extreme");

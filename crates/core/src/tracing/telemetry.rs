@@ -3133,6 +3133,10 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 serde_json::json!(snapshot.quic_paths_active),
             );
             m.insert(
+                "quic_flow_control_window_bytes".into(),
+                serde_json::json!(snapshot.quic_flow_control_window_bytes),
+            );
+            m.insert(
                 "nat_fail_samples".into(),
                 serde_json::json!(snapshot.nat_fail_samples),
             );
@@ -7951,6 +7955,7 @@ mod tests {
         snapshot.quic_establish_samples = 903;
         snapshot.quic_paths_offered_or_dialing = 904;
         snapshot.quic_paths_active = 905;
+        snapshot.quic_flow_control_window_bytes = 906;
         let json = event_kind_to_json(&super::super::EventKind::TransportSnapshot(Box::new(
             snapshot.clone(),
         )));
@@ -7979,6 +7984,7 @@ mod tests {
             ("quic_establish_samples", 903),
             ("quic_paths_offered_or_dialing", 904),
             ("quic_paths_active", 905),
+            ("quic_flow_control_window_bytes", 906),
         ] {
             expected.push((key.to_string(), value));
         }
@@ -7989,7 +7995,7 @@ mod tests {
                 + QuicUpgradeOutcome::COUNT
                 + 2 * QuicFallback::COUNT
                 + QuicPathAge::COUNT
-                + 5
+                + 6
         );
         for (key, value) in expected {
             assert_eq!(json[&key], value, "event-log value for {key}");

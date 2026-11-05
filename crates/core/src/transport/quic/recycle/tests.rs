@@ -1,4 +1,4 @@
-//! Tests for [`super::AckWatch`], [`super::AckCounting`] and the recycle
+//! Tests for [`super::AckWatch`], [`super::CappedCubic`] and the recycle
 //! constants. The guards on a live path are tested in `path::tests`.
 
 use super::*;
@@ -510,8 +510,8 @@ impl Controller for Recorder {
     }
 }
 
-/// `outer` (a [`Recorder`] around an [`AckCounting`] around a [`Recorder`]
-/// around Cubic) and its two logs, and the `AckCounting`'s record.
+/// `outer` (a [`Recorder`] around an [`CappedCubic`] around a [`Recorder`]
+/// around Cubic) and its two logs, and the `CappedCubic`'s record.
 struct Stack {
     outer: Box<dyn Controller>,
     outer_log: Arc<Mutex<Vec<Call>>>,
@@ -523,7 +523,11 @@ impl Stack {
         let outer_log = Arc::default();
         let inner_log = Arc::default();
         let cubic = Arc::new(quinn::congestion::CubicConfig::default()).build(now, 1200);
-        let counting = Box::new(AckCounting::new(Recorder::wrap(&inner_log, cubic)));
+        let counting = Box::new(CappedCubic::new(
+            Recorder::wrap(&inner_log, cubic),
+            QuicRateLimit::default(),
+            1200,
+        ));
         Self {
             outer: Recorder::wrap(&outer_log, counting),
             outer_log,
@@ -531,8 +535,8 @@ impl Stack {
         }
     }
 
-    /// Every call reached `inner` exactly as it reached the `AckCounting`.
-    /// `clone_box` is not compared: the `AckCounting` clones its inner too.
+    /// Every call reached `inner` exactly as it reached the `CappedCubic`.
+    /// `clone_box` is not compared: the `CappedCubic` clones its inner too.
     fn assert_forwarded(&self) {
         let calls = |log: &Arc<Mutex<Vec<Call>>>| -> Vec<Call> {
             log.lock()
@@ -547,7 +551,7 @@ impl Stack {
     }
 }
 
-/// The `AckCounting` record inside a controller built by [`Stack`].
+/// The `CappedCubic` record inside a controller built by [`Stack`].
 fn record_of(outer: &dyn Controller) -> Arc<Mutex<AckState>> {
     let recorder = outer
         .clone_box()
@@ -557,12 +561,12 @@ fn record_of(outer: &dyn Controller) -> Arc<Mutex<AckState>> {
     recorder
         .inner
         .into_any()
-        .downcast::<AckCounting>()
-        .expect("the AckCounting")
+        .downcast::<CappedCubic>()
+        .expect("the CappedCubic")
         .state
 }
 
-/// Every method an `AckCounting` gets is forwarded to its inner controller
+/// Every method an `CappedCubic` gets is forwarded to its inner controller
 /// once, with the same arguments, and returns what the inner returns; a
 /// clone shares the record. (`on_ack` needs quinn's `RttEstimator`, which
 /// only quinn builds: see the next test.)
@@ -617,10 +621,11 @@ fn ack_counting_forwards_quinns_calls_and_counts_each_ack() {
         fn build(self: Arc<Self>, now: Instant, mtu: u16) -> Box<dyn Controller> {
             let mut cubic = quinn::congestion::CubicConfig::default();
             cubic.initial_window(1 << 30);
-            let counting = Box::new(AckCounting::new(Recorder::wrap(
-                &self.inner_log,
-                Arc::new(cubic).build(now, mtu),
-            )));
+            let counting = Box::new(CappedCubic::new(
+                Recorder::wrap(&self.inner_log, Arc::new(cubic).build(now, mtu)),
+                QuicRateLimit::default(),
+                mtu,
+            ));
             Recorder::wrap(&self.outer_log, counting)
         }
     }
@@ -817,7 +822,7 @@ fn quinn_proto_from_registry() -> Result<std::path::PathBuf, String> {
         .ok_or_else(|| format!("quinn-proto {version} is not under {}", registry.display()))
 }
 
-/// Pin: `impl Controller for AckCounting` implements every method of the
+/// Pin: `impl Controller for CappedCubic` implements every method of the
 /// linked quinn-proto's `Controller` trait. A method quinn adds with a
 /// default body would otherwise run quinn's default instead of reaching
 /// Cubic (and, for an acknowledgement method, the record), and nothing else
@@ -829,7 +834,7 @@ fn ack_counting_implements_every_controller_method() {
     let trait_methods = fn_names_in_block(&quinn, "pub trait Controller");
     let ours = fn_names_in_block(
         include_str!("../recycle.rs"),
-        "impl Controller for AckCounting",
+        "impl Controller for CappedCubic",
     );
     assert!(trait_methods.len() >= 10, "{trait_methods:?}");
     assert_eq!(ours, trait_methods);

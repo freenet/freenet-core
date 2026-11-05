@@ -740,6 +740,37 @@ Rate calculation on every rate update (peer_connection::paced_rate; #6047):
   (#3702 burst). The global share is still taken as is, as before #6047.
   Only stream fragments draw on the bucket; short messages, ACKs and
   retransmits are unpaced.
+  QUIC has no bucket. The same rate (QuicRateLimit::rate, which calls
+  paced_rate) caps each QUIC connection's congestion window instead:
+  recycle::CappedCubic::window = min(Cubic's window, rate x RTT), never
+  below window_floor (two full datagrams and one byte, 2401 B: quinn refuses
+  a send at in_flight + bytes >= window, so 2400 would admit one datagram, and
+  a lone packet waits for the peer's 25 ms delayed ack). With no limit, or
+  before the first acknowledgement, it is Cubic's window; for the first batch
+  of acknowledgements the RTT is still quinn's 333 ms initial estimate, so the
+  cap is loose for that batch. quinn's in-flight limit reads the window, which
+  holds a path to about the rate (a_path_under_a_bandwidth_limit_keeps_to_it:
+  within 10% at 400 kB/s over a 40 ms round trip); the pacer only spreads the
+  sends. While the cap is below Cubic's window, on_ack reports the path as
+  app-limited to Cubic, so Cubic does not grow behind the cap and still backs
+  off on loss once the cap rises above the capacity (RFC 7661 idea). It
+  covers everything the path sends, shorts and control frames included. It
+  does not hold where rate x RTT is under the floor: there a path keeps two
+  datagrams in flight, about 2400 B per round trip (at the 64 KiB/s minimum,
+  any round trip under about 37 ms; pinned by
+  the_floor_keeps_two_datagrams_in_flight_both_ways). A QUIC path is not a
+  connection to GlobalBandwidthManager: it rides on its UDP connection and
+  takes that connection's full share, so a peer whose traffic is split across
+  both transports can get up to twice its share (the egress cap still bounds
+  the node). e5b-6 decides whether one peer's streams stay on one transport.
+  Under a binding egress cap the window cap does not hold a path to its
+  share either: the cap's holds add to quinn's RTT samples, and rate x RTT
+  grows with them (a_quic_path_and_udp_streams_both_progress_under_an_
+  egress_cap measured about 390 kB/s against a 250 kB/s share, 400 kB/s with
+  no window cap). The egress cap still holds the node's total.
+  The transport sets the rate when it binds (bind_udp_listener, pinned by
+  the_transport_gives_the_endpoint_its_bandwidth_settings); QuicSettings
+  from the config carries none.
 
 Token reservation:
   → Reserve BEFORE sending
@@ -1128,6 +1159,10 @@ snapshot except the two gauges.
   `PathGauge` guard inside the attempt, so dropping the attempt leaves the gauge.
   `quic_paths_active` is also in `resource_utilization` beside
   `memory_rss_bytes`.
+  `quic_flow_control_window_bytes`: the flow-control window of this node's QUIC
+  connections (per connection and direction), set when the endpoint is built,
+  0 without one; a state, not reset and not activity. Throughput by window
+  size shows whether nodes at the 128 KiB floor are slower on QUIC than on UDP.
   Not built: stream-concurrency instruments on real QUIC (`quic_open_uni_waited`,
   permit waits, ge_8..ge_48, control_* refusals) have no source until e5b and
   read zero in shadow; the `transport=legacy|quic` connection attribute; a
@@ -1244,7 +1279,8 @@ exposes (its module doc lists the few it does not):
   grease_quic_bit(false) (the demux rule depends on it), versions [1],
   max_udp_payload / initial and min MTU 1200, no MTU discovery, no GSO,
   keepalive 15 s (None when the TimeSource disables keepalive), idle = the
-  TimeSource's connection idle timeout, Cubic, 64 uni / 0 bidi streams,
+  TimeSource's connection idle timeout, Cubic with its window capped to the
+  configured bandwidth (recycle::CappedCubic), 64 uni / 0 bidi streams,
   stream / receive / send window = clamp(5% of memory / (2 x
   max-number-of-connections), 128 KiB, 2 MiB), no unreliable datagrams, no
   spin bit, migration off, max_incoming 64, incoming buffers 64 KiB / 1 MiB,
@@ -1743,7 +1779,7 @@ Path recycling (quic/recycle.rs, #5940 step M6): besides the send-reset
   the peer acknowledged none of them, and the peer kept sending (no two
   samples in a row without anything from it). A peer that keeps sending but
   acknowledges none of our packets is not a conforming QUIC peer (RFC 9000 13.2.1). Newly acknowledged packets
-  are counted by AckCounting, which wraps Cubic in transport_config;
+  are counted by CappedCubic, which wraps Cubic in transport_config;
   ConnectionStats has no such counter. Two samples in a row with nothing
   from the peer end the window, and so does a sample with nothing
   outstanding (in flight after the latest acknowledgements, minus losses,
