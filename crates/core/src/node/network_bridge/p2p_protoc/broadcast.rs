@@ -792,7 +792,8 @@ impl P2pConnManager {
                     // the event loop through the bridge, so awaiting it here, on
                     // the event loop, would hold both until the timeout. The
                     // claim moves into the task: it records the send for the
-                    // #5842 spacing when the send ends.
+                    // #5842 spacing when the send ends. Unlike production's
+                    // queue lanes, nothing limits how many heals run at once.
                     let bridge = self.bridge.clone();
                     let op_manager = op_manager.clone();
                     GlobalExecutor::spawn(async move {
