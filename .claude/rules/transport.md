@@ -763,7 +763,9 @@ Rate calculation on every rate update (peer_connection::paced_rate; #6047):
   connection to GlobalBandwidthManager: it rides on its UDP connection and
   takes that connection's full share, so a peer whose traffic is split across
   both transports can get up to twice its share (the egress cap still bounds
-  the node). e5b-6 decides whether one peer's streams stay on one transport.
+  the node). Since e5b-6 a pair whose path carries data sends new data on the
+  path; UDP keeps only what had started on it before, queue overflow and
+  fallbacks, so the two shares overlap in those cases only.
   Under a saturated egress cap, the window cap apportions it only when the
   per-connection share is below the cap. With the minimum per connection set
   below the share (two connections, one flow each, equal RTT),
@@ -1393,13 +1395,19 @@ check every endpoint was live (`not_allowed`) rather than failed to bind.
 tests only) with what each node's upgrades did, readable after the run,
 including what arrived on the path and on UDP (`received a short on the path`,
 `data arrived on UDP`, noted at the receiver whichever code sent it) and what each
-send ended as (`sent a short on the path: ...`). It also
+send ended as (`sent a short on the path: ...`). `paths()` and `path_totals()`
+read each path's own counters (`QuicPathStats`) live, not only at teardown:
+refusals on either side, deliveries, and sends by outcome and kind. It also
+records the last fragment of a UDP stream on a connection with upgrades
+(`data arrived on UDP, the last fragment of a stream`). It also
 injects: `send_initial_on_each_attempt` (the node receives an Initial with the
 peer's address as its source each time it allows that address, and records
 `injected an Initial`), `make_record_wrong` (the key compared after the
 handshake disagrees, so the path closes with IDENTITY_MISMATCH),
 `fail_endpoint_at` (the endpoint
-driver dies) and `run_as_release` (a peer reporting the crate's version reads
+driver dies, recorded as `failed the endpoint`), `send_every_nth_on_udp` (of a
+node's data sends that could go on a path, every nth goes on UDP, recorded as
+`sent on UDP for the test`, so metadata and stream split either way) and `run_as_release` (a peer reporting the crate's version reads
 as a given release, since this tree reports a version below the negotiation
 floor until the release bump). The first offer is 2-10 s after promotion, so give a run tens of
 virtual seconds.
@@ -1409,6 +1417,15 @@ major.minor; compatibility checks keep the real version),
 `with_quic_idle_timeout`, and `drop_quic_datagrams_between` (drops
 QUIC-class datagrams, by the demux classifier, for one pair from a virtual
 time; `simulation::QuicDatagramDrop`, kept across `with_fault_injection`).
+`drop_quic_datagrams_between_after` first lets a byte count of the pair's QUIC
+datagrams through, so a test cuts a pair in the middle of a transfer by how
+much has moved rather than by a time.
+VirtualTime in the turmoil runners (`run_controlled_simulation`,
+`run_fdev_test`): they step turmoil and move the network's VirtualTime to
+turmoil's elapsed time after each step (`run_turmoil_on_virtual_time`). Before
+that it stayed at 0 for the whole run, so no QUIC timer and no time-based fault
+rule fired there. The turmoil runner repeats only about 99% of a long run (QUIC
+off as well), so a test that compares whole traces uses the direct runner.
 `quic/test_tls.rs` holds only a plain Ed25519 identity for tests where a
 peer presents a key that is not its transport key.
 
@@ -1465,6 +1482,19 @@ closes every path; an Initial the peer did not send is retried and the real dial
 establishes; a replaced or restarted session closes its path and keeps the
 backoff; a mixed shadow / off / below-floor network forms paths only between
 shadow nodes; `quic-max-paths` = 1 declines `Busy` without a charge.
+Data scenarios (#5940 e5b-9, `test_quic_data_*`, harness `run_quic_data_sim`):
+PUT, GET, GET with subscribe and UPDATE of an 8 KiB and a 1 MiB CRDT state on
+six nodes, each asserting GET and SUBSCRIBE success, the subscription tree,
+time to the first GET, no stale copies, no refused data on either side and no
+failed delta; health that is not complete must be no worse than the same seed
+with QUIC off. S1 every pair at 100% (each send kind on the paths, no data on
+UDP while a path carries it); S2 50% (control pairs carry nothing on their
+paths); S3 a mixed network where no pair's bits agree; S5 an endpoint failing
+under load (its peers drop their paths to it only on their own timers); S6 a
+restart while the path carries data; S8 every third send on UDP, so metadata
+and stream take different paths; S9 two direct-runner runs at 100% give one
+trace. A path cut in the middle of a transfer (S4) and a stream started on UDP
+as the path comes up (S7) are not in the tree yet: both expose open defects.
 
 #### QUIC identity (`transport/quic/identity.rs`, #5940 step c3)
 

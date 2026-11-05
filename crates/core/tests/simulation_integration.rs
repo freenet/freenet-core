@@ -21579,6 +21579,18 @@ fn run_quic_restart_sim(
     quiet_from: Option<Duration>,
     then: Duration,
 ) -> (freenet::dev_tool::QuicUpgradeTrace, SocketAddr, Duration) {
+    run_quic_restart_sim_with(name, seed, quiet_from, then, false)
+}
+
+/// [`run_quic_restart_sim`], with both nodes in `prefer` at a data percentage of
+/// 100 when `data` is set, so the path carries the pair's data.
+fn run_quic_restart_sim_with(
+    name: &str,
+    seed: u64,
+    quiet_from: Option<Duration>,
+    then: Duration,
+    data: bool,
+) -> (freenet::dev_tool::QuicUpgradeTrace, SocketAddr, Duration) {
     setup_deterministic_state(seed);
     freenet::config::SimulationIdleTimeout::enable();
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -21589,10 +21601,17 @@ fn run_quic_restart_sim(
     rt.block_on(async {
         let mut sim = SimNetwork::new(name, 1, 1, 7, 3, 10, 2, seed).await;
         sim.enable_gateway_ack_version();
-        sim.with_transport_quic("shadow");
         let trace = sim.quic_upgrade_trace();
         run_as_first_negotiating_release(&trace);
         let labels = sim.all_node_addresses().clone();
+        for label in labels.keys() {
+            if data {
+                sim.with_node_transport_quic(label, "prefer");
+                sim.with_node_quic_data_percent(label, 100);
+            } else {
+                sim.with_node_transport_quic(label, "shadow");
+            }
+        }
         let gateway = labels.keys().find(|l| l.is_gateway()).unwrap().clone();
         let node = labels.keys().find(|l| !l.is_gateway()).unwrap().clone();
         if let Some(from) = quiet_from {
@@ -22554,6 +22573,143 @@ fn test_quic_data_endpoint_down_under_load() {
             .into_iter()
             .find(|r| r.at >= first_down && r.what.starts_with("Fallback"));
         tracing::info!(peer = %peer.peer, ?theirs, "the peer's path to the failed endpoint");
+    }
+}
+
+/// S6: a peer whose path carries data restarts with its identity, so the
+/// survivor's UDP session is replaced while its path still holds sends. The old
+/// path ends with the restart (the restarting node's SESSION_ENDED, or the
+/// replacement), and so does the old session; the new session negotiates data
+/// again after the carried backoff, and the new path carries data with nothing
+/// refused on any path. Both roles, as in the shadow restart test.
+#[test_log::test]
+fn test_quic_data_restart_replaces_a_carrying_path() {
+    let mut roles_seen = std::collections::BTreeSet::new();
+    for (index, seed) in (0..16u64).map(|i| 0x5940_E5B9_0600 + i).enumerate() {
+        let (trace, survivor, replaced_at) = run_quic_restart_sim_with(
+            &format!("quic-data-restart-{index}"),
+            seed,
+            None,
+            Duration::from_secs(240),
+            true,
+        );
+        let dump = || format!("{:#?}\npaths: {:#?}", trace.records(), trace.paths());
+        let of = |prefix: &str| trace.matching(survivor, prefix);
+        let first = of("Established")[0].clone();
+        assert!(
+            first.at < replaced_at,
+            "premise: the path was up: {}",
+            dump()
+        );
+        assert!(
+            of("DataEnabled")
+                .iter()
+                .any(|e| e.session == first.session && e.at < replaced_at),
+            "premise: the first path carried data before the restart: {}",
+            dump()
+        );
+        let old_path = trace
+            .paths()
+            .into_iter()
+            .find(|p| p.node == survivor && p.session == first.session)
+            .unwrap_or_else(|| panic!("the survivor's first path: {}", dump()));
+        assert!(
+            old_path.totals.sent_total() + old_path.totals.delivered_shorts > 0,
+            "premise: data moved on the first path: {old_path:?}"
+        );
+        // The old path ends with the restart: by the restarting node's own
+        // SESSION_ENDED when it reaches the survivor, else by the replacement.
+        // `replaced_at` is a second after the crash.
+        let crashed_at = replaced_at.saturating_sub(Duration::from_secs(1));
+        assert!(
+            of("closed path with")
+                .iter()
+                .any(|c| c.session == first.session && c.at >= crashed_at),
+            "the old path closed with the restart: {}",
+            dump()
+        );
+        assert!(
+            of("Fallback")
+                .iter()
+                .filter(|f| f.session == first.session)
+                .all(|f| f.what == "Fallback(SessionEndedReceived)"),
+            "nothing but the restart ended the old path: {}",
+            dump()
+        );
+        assert!(
+            of("session ended")
+                .iter()
+                .any(|e| e.session == first.session && e.at >= crashed_at),
+            "the old session ended: {}",
+            dump()
+        );
+        // The new session's path negotiates data and carries it.
+        let back = of("DataEnabled")
+            .into_iter()
+            .find(|e| e.at > replaced_at && e.session != first.session)
+            .unwrap_or_else(|| panic!("data did not return: {}", dump()));
+        let new_path = trace
+            .paths()
+            .into_iter()
+            .find(|p| p.node == survivor && p.session == back.session)
+            .unwrap_or_else(|| panic!("the survivor's new path: {}", dump()));
+        assert!(
+            new_path.totals.sent_total() + new_path.totals.delivered_shorts > 0,
+            "the new path carried data: {new_path:?}"
+        );
+        let totals = trace.path_totals();
+        assert_eq!(totals.data_refused, 0, "{}", dump());
+        assert_eq!(totals.refused_not_accepting_data, 0, "{}", dump());
+        let survivor_was_server = of("Offered").iter().any(|o| o.at < replaced_at);
+        roles_seen.insert(survivor_was_server);
+        if roles_seen.len() == 2 {
+            return;
+        }
+    }
+    panic!("the seeds did not cover both roles: {roles_seen:?}");
+}
+
+/// S8: with every pair carrying data, every third data send of each node goes
+/// on UDP instead, whatever its kind. A message's metadata and its stream then
+/// travel on different paths, in either order, and adjacent shorts arrive out of
+/// order. No operation is left stuck: every GET ends and delivers, the tree
+/// forms, holders converge, and no delta fails to apply.
+#[test_log::test]
+fn test_quic_data_metadata_and_stream_on_different_paths() {
+    let data = run_quic_data_sim(
+        "quic-data-s8",
+        0x5940_E5B9_0008,
+        QuicDataSim::default(),
+        |sim, trace, labels| {
+            quic_data_everywhere(100)(sim, trace, labels);
+            for label in labels {
+                trace.send_every_nth_on_udp(sim.all_node_addresses()[label], 3);
+            }
+        },
+    );
+    data.assert_healthy();
+    let run = &data.run;
+    let totals = run.trace.path_totals();
+    assert!(
+        totals.sent_total() > 0 && totals.sent[2] > 0,
+        "premise: the paths carried shorts and streams: {totals:?}"
+    );
+    assert!(
+        run.total("sent on UDP for the test") > 0,
+        "premise: the hook sent some data on UDP"
+    );
+    // Both kinds went on UDP while their pair's path carried the rest, so a
+    // stream and its metadata were split both ways round.
+    let split = data.udp_data_while_on_the_path();
+    for kind in [
+        "data arrived on UDP, a short",
+        "data arrived on UDP, a stream",
+    ] {
+        assert!(
+            split.iter().any(|r| r.what == kind),
+            "premise: {kind} while on the path: {}",
+            data.dump()
+        );
     }
 }
 

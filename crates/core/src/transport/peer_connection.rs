@@ -1659,7 +1659,18 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         if let Some(route) = &self.quic_route_for_test {
             return Some(route.clone());
         }
-        self.quic_path.as_ref()?.data_route()
+        let route = self.quic_path.as_ref()?.data_route()?;
+        // A test can send some of the data on UDP while the path carries the
+        // rest (`QuicUpgradeTrace::send_every_nth_on_udp`).
+        #[cfg(any(test, feature = "testing"))]
+        if self
+            .upgrade_trace
+            .as_ref()
+            .is_some_and(|trace| trace.divert_to_udp())
+        {
+            return None;
+        }
+        Some(route)
     }
 
     /// Receive the next complete inbound message.

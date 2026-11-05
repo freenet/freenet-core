@@ -121,6 +121,9 @@ struct TraceData {
     initial_on_attempt: Mutex<BTreeSet<SocketAddr>>,
     /// The version a peer reports, and the release it then reads as.
     release: Mutex<Option<(Version, Version)>>,
+    /// Per node, `(n, sends seen)`: every nth data send that could go on a path
+    /// goes on UDP.
+    divert: Mutex<BTreeMap<SocketAddr, (u64, u64)>>,
 }
 
 /// A network's upgrade records. Clones share them.
@@ -240,6 +243,15 @@ impl QuicUpgradeTrace {
         *self.data.release.lock() = Some((real, release));
     }
 
+    /// Of `node`'s data sends that could go on a path, every `n`th goes on UDP
+    /// instead, whatever its kind, and is recorded (`sent on UDP for the test`).
+    /// So a message's metadata and its stream can take different paths, in
+    /// either order, and adjacent messages can arrive out of order.
+    pub fn send_every_nth_on_udp(&self, node: SocketAddr, n: u64) {
+        assert!(n > 0, "n is at least 1");
+        self.data.divert.lock().insert(node, (n, 0));
+    }
+
     /// `node`'s QUIC endpoint driver fails `at` after its transport opens.
     pub fn fail_endpoint_at(&self, node: SocketAddr, at: Duration) {
         self.data.down_at.lock().insert(node, at);
@@ -331,6 +343,22 @@ impl NodeTrace {
         if crate::transport::in_memory_socket::deliver_packet_at(self.addr, datagram, source) {
             self.record(source, 0, "injected an Initial".to_string());
         }
+    }
+
+    /// Whether this data send goes on UDP for [`QuicUpgradeTrace::send_every_nth_on_udp`].
+    pub(crate) fn divert_to_udp(&self) -> bool {
+        let divert = {
+            let mut divert = self.trace.data.divert.lock();
+            let Some((n, seen)) = divert.get_mut(&self.addr) else {
+                return false;
+            };
+            *seen += 1;
+            *seen % *n == 0
+        };
+        if divert {
+            self.record(self.addr, 0, "sent on UDP for the test".to_string());
+        }
+        divert
     }
 
     pub(crate) fn wrong_record(&self) -> bool {
