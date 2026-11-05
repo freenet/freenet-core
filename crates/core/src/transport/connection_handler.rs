@@ -369,10 +369,15 @@ fn build_quic_upgrades(
     if let Some(at) = trace.as_ref().and_then(|trace| trace.down_at()) {
         let failing = endpoint.clone();
         let clock = path_clock.clone();
+        let noted = trace.clone();
         // Bounded by `at`, and holds an endpoint share only until then.
         drop(GlobalExecutor::spawn(async move {
             clock.sleep(at).await;
             failing.fail_driver();
+            // Recorded so a test can check the fault ran rather than infer it.
+            if let Some(trace) = noted {
+                trace.record(trace.addr(), 0, "failed the endpoint".to_string());
+            }
         }));
     }
     Some(QuicUpgrades::new(

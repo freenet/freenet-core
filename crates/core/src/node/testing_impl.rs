@@ -433,6 +433,29 @@ impl ScheduledOperation {
     }
 }
 
+/// `turmoil::Sim::run`, with the network's `VirtualTime` moved to turmoil's
+/// elapsed time after every step, the way the direct runner's time driver
+/// follows tokio's clock.
+///
+/// The node tasks run on turmoil's clock, but some parts of a node read the
+/// network's `VirtualTime` instead: each QUIC endpoint and path (quinn's timers,
+/// the path's send deadlines and ack watch, `get_socket_virtual_time`), and the
+/// fault injector's time-based rules. Without this the clock stayed at zero for
+/// the whole run, so none of those timers ever fired and a rule starting after
+/// zero never applied.
+pub(crate) fn run_turmoil_on_virtual_time(
+    sim: &mut turmoil::Sim<'_>,
+    time: &VirtualTime,
+) -> turmoil::Result {
+    loop {
+        let finished = sim.step()?;
+        time.advance_to(u64::try_from(sim.elapsed().as_nanos()).unwrap_or(u64::MAX));
+        if finished {
+            return Ok(());
+        }
+    }
+}
+
 /// Packet-delivery decision consulted by every `SimulationSocket` (via the
 /// per-network delivery callback installed by `run_controlled_simulation` and
 /// `run_simulation_direct`) so an injected node crash or partition actually
@@ -5275,7 +5298,7 @@ impl SimNetwork {
         });
 
         // Run the simulation
-        sim.run()
+        run_turmoil_on_virtual_time(&mut sim, &self.virtual_time)
     }
 
     /// Run a deterministic simulation with controlled events using Turmoil.
@@ -5964,7 +5987,7 @@ impl SimNetwork {
         });
 
         // Run the simulation
-        let turmoil_result = sim.run();
+        let turmoil_result = run_turmoil_on_virtual_time(&mut sim, &self.virtual_time);
 
         // Capture topology snapshots BEFORE self is dropped (which clears them)
         let topology_snapshots = get_all_topology_snapshots(&network_name);
@@ -6262,7 +6285,7 @@ impl SimNetwork {
         });
 
         // Run the simulation
-        sim.run()
+        run_turmoil_on_virtual_time(&mut sim, &self.virtual_time)
             .map_err(|e| anyhow::anyhow!("Turmoil simulation failed: {:?}", e))
     }
 
