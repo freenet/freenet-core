@@ -2236,7 +2236,7 @@ fn shell_page(
     // the sandboxed app iframe. It is the only place a per-user-data action
     // (export to your own peer) can live — the durable user token is held by
     // the shell and must never reach the sandbox — and the only place the
-    // "this is a hosted proxy, not private" disclosure cannot be hidden or
+    // "not private: this preview runs on our server" disclosure cannot be hidden or
     // spoofed by the contract app. Empty (and the layout unchanged) when hosted
     // mode is off. The export control is a placeholder until the node-side
     // export endpoint lands (P3 `secrets export` over HTTP, scoped to the
@@ -6782,9 +6782,11 @@ mod tests {
             hosted.contains(r#"id="fnbar""#),
             "hosted bar missing: {hosted}"
         );
+        // The disclosure leads the bar text so it survives truncation on a
+        // phone-width screen.
         assert!(
-            hosted.contains("not private"),
-            "always-visible disclosure missing"
+            hosted.contains(r#"<span class="nt">Not private:"#),
+            "always-visible disclosure missing, or no longer leads the bar text"
         );
         assert!(
             hosted.contains("Access key") && hosted.contains("Restore from key"),
@@ -8484,11 +8486,11 @@ mod tests {
         assert!(clear < reload, "must clear the token before reloading");
     }
 
-    /// The "Your own peer" section must tell a visitor who has no peer how to
-    /// get one. Before this, the popover offered "Move to my peer" and a
-    /// loopback import link but never said where to install Freenet, so a
-    /// try.freenet.org visitor without a peer hit a connection error with no
-    /// way forward.
+    /// A hosted visitor who has no peer must be told how to get one. Before
+    /// this, the bar never said what Freenet is or how to install it, and the
+    /// popover offered "Move to my peer" and a loopback import link with no
+    /// install pointer, so a try.freenet.org visitor (typically arriving cold
+    /// from a shared link) had no way forward.
     #[test]
     fn hosted_bar_points_visitors_without_a_peer_at_the_installer() {
         const QUICKSTART: &str = "href=\"https://freenet.org/quickstart/\"";
@@ -8504,6 +8506,22 @@ mod tests {
         let open = HOSTED_BAR_HTML
             .find("id=\"fnmigrateopen\"")
             .expect("primary open control present");
+        let acct = HOSTED_BAR_HTML
+            .find("id=\"fnacct\"")
+            .expect("Account control present");
+
+        // (0) The always-visible bar itself, before the Account popover: the
+        // brand links to what Freenet is, and an install pointer is one click
+        // away without opening any menu.
+        let bar = &HOSTED_BAR_HTML[..acct];
+        assert!(
+            bar.contains("href=\"https://freenet.org/\""),
+            "the bar's Freenet brand must link to what Freenet is"
+        );
+        assert!(
+            bar.contains(QUICKSTART),
+            "the always-visible bar must carry an install link"
+        );
 
         // (a) Visible BEFORE the user clicks "Move to my peer": in the section
         // intro, not only in the block revealed afterwards.
@@ -8519,10 +8537,15 @@ mod tests {
             hint.contains(QUICKSTART),
             "the post-click migration hint must link to the install quickstart"
         );
-        // (c) Each install link opens in a new tab (leaving the hosted session
+        // (c) Each install link (and the brand link) opens in a new tab (leaving the hosted session
         // in place) with the opener severed.
-        let links: Vec<_> = HOSTED_BAR_HTML.match_indices(QUICKSTART).collect();
-        assert_eq!(links.len(), 2, "expected exactly the two install links");
+        let mut links: Vec<_> = HOSTED_BAR_HTML.match_indices(QUICKSTART).collect();
+        assert_eq!(
+            links.len(),
+            3,
+            "expected the bar link plus the two popover links"
+        );
+        links.extend(HOSTED_BAR_HTML.match_indices("href=\"https://freenet.org/\""));
         for (i, _) in links {
             let tag_start = HOSTED_BAR_HTML[..i].rfind("<a").expect("inside an anchor");
             let tag_end = i + HOSTED_BAR_HTML[i..].find('>').expect("anchor closes");
