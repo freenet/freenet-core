@@ -25,7 +25,8 @@
 //! `none,500000`), `LAB_MIN_MIB` per measurement (16), `LAB_THREADS` (4),
 //! `LAB_REPS` (3), `LAB_TRANSPORTS` (udp,quic), `LAB_LINK` (`none` for plain
 //! loopback, or `rate_mbit:one_way_ms` for the same shaped link under both
-//! transports, with a queue of `LAB_QUEUE_KIB`, 1024).
+//! transports, with a queue of `LAB_QUEUE_KIB`, 1024), `LAB_IDLE_S` (0; when
+//! set, the CPU an idle connected pair uses over that many seconds).
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
@@ -457,6 +458,23 @@ fn quic_lab_cpu_per_byte() {
                     ),
                     other => panic!("unknown transport {other}"),
                 };
+                // CPU the connected pair uses with nothing to send (keepalives,
+                // timers, the runtime), so a slower transfer's idle cost can
+                // be told apart from its per-byte cost.
+                let idle_s: u64 = env_or("LAB_IDLE_S", 0);
+                if idle_s > 0 {
+                    pair.transfer(1024).await;
+                    let cpu0 = process_cpu();
+                    tokio::time::sleep(Duration::from_secs(idle_s)).await;
+                    let cpu = process_cpu() - cpu0;
+                    println!(
+                        "LAB_CPU_IDLE transport={transport} threads={threads} link={link_spec} \
+                         limit={} idle_s={idle_s} cpu_s={:.3} cpu_ms_per_s={:.2}",
+                        limit.map_or("none".to_string(), |l| l.to_string()),
+                        cpu.as_secs_f64(),
+                        cpu.as_secs_f64() * 1000.0 / idle_s as f64,
+                    );
+                }
                 for &size in &sizes {
                     // One transfer to warm up the path at this size.
                     pair.transfer(size).await;
