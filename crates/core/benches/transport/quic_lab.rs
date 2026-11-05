@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 
 use freenet::transport::quic_lab::{
     ConnSample, FRAGMENT_BYTES, LabConfig, LabController, LabPair, LabSocket, LinkSpec, StreamsRun,
-    set_controller, set_gap_on_connection_progress, shape_port,
+    set_controller, set_gap_on_connection_progress, set_send_window, shape_port,
 };
 use freenet::transport::{TRANSPORT_METRICS, TransportKeypair, create_connection_handler};
 use tokio::sync::mpsc;
@@ -584,7 +584,8 @@ fn sample_at(samples: &[ConnSample], at: Duration) -> Option<ConnSample> {
 /// (cubic or bbr, QUIC only), `LAB_GAP` (stream, the node's rule, or
 /// connection: the gap runs from the later of the send's last step and the
 /// connection's last newly acknowledged packet), `LAB_FAILURES` (1 prints
-/// one `LAB_LOSS_FAILURE` line per failed QUIC send).
+/// one `LAB_LOSS_FAILURE` line per failed QUIC send), `LAB_SEND_WINDOW_KIB`
+/// (0, the node's: quinn's send window is W).
 #[test]
 fn quic_lab_loss() {
     if !enabled("quic_lab_loss") {
@@ -621,6 +622,9 @@ fn quic_lab_loss() {
         other => panic!("unknown gap rule {other}"),
     });
     let print_failures = std::env::var("LAB_FAILURES").as_deref() == Ok("1");
+    // quinn's send window in KiB, QUIC only; 0 keeps the node's (W).
+    let send_window_kib: u64 = env_or("LAB_SEND_WINDOW_KIB", 0);
+    set_send_window((send_window_kib > 0).then_some(send_window_kib * 1024));
     for rep in 0..reps {
         let rt = runtime(threads);
         let line = rt.block_on(async {
@@ -754,7 +758,7 @@ fn quic_lab_loss() {
         println!(
             "LAB_LOSS transport={transport} threads={threads} streams={streams} stream_kib={} \
              window_kib={} loss={loss} seed={seed} delay_ms={delay_ms} rate_mbit={rate_mbit} \
-             controller={controller} gap={gap_rule} rep={rep} {line}",
+             controller={controller} gap={gap_rule} send_window_kib={send_window_kib} rep={rep} {line}",
             stream_bytes / 1024,
             window / 1024,
         );

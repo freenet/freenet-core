@@ -80,6 +80,14 @@ pub fn set_gap_on_connection_progress(on: bool) {
     super::path::bounded::lab::GAP_ON_CONNECTION_PROGRESS.store(on, Ordering::Relaxed);
 }
 
+/// quinn's send window for connections built from now on, or `None` for the
+/// node's (the flow-control window). The send window bounds the bytes the
+/// connection's streams have buffered and not yet had acknowledged, so it is
+/// how far ahead of the peer a write can get.
+pub fn set_send_window(bytes: Option<u64>) {
+    super::config::lab::SEND_WINDOW.store(bytes.unwrap_or(0), Ordering::Relaxed);
+}
+
 /// The connection's state at one moment of a run.
 #[derive(Debug, Clone, Copy)]
 pub struct ConnSample {
