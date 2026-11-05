@@ -1073,3 +1073,224 @@ fn quic_lab_many() {
         );
     }
 }
+
+/// Field size buckets of streamed sends (count weights, per mille, from the
+/// 24 h of `transfer_completed` events on 2026-11-05), each drawn
+/// log-uniform within its bounds.
+const FIELD_BUCKETS: [(u32, usize, usize); 8] = [
+    (226, 600, 1_400),
+    (345, 1_400, 16 << 10),
+    (304, 16 << 10, 64 << 10),
+    (108, 64 << 10, 256 << 10),
+    (11, 256 << 10, 1 << 20),
+    (5, 1 << 20, 4 << 20),
+    (1, 4 << 20, 12 << 20),
+    (1, 12 << 20, 30 << 20),
+];
+
+/// Streams in flight at a start, per mille: K = 1, 2, 3, 4 and 5+ (taken as 6).
+const FIELD_CONCURRENCY: [(u32, usize); 5] = [(957, 1), (39, 2), (2, 3), (1, 4), (1, 6)];
+
+struct Draw(u64);
+
+impl Draw {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    fn unit(&mut self) -> f64 {
+        (self.next() >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    fn pick<T: Copy>(&mut self, table: &[(u32, T)]) -> T {
+        let total: u32 = table.iter().map(|(w, _)| w).sum();
+        let mut at = (self.next() % u64::from(total)) as u32;
+        for (w, v) in table {
+            if at < *w {
+                return *v;
+            }
+            at -= w;
+        }
+        table[table.len() - 1].1
+    }
+
+    fn size(&mut self) -> usize {
+        let buckets: Vec<(u32, (usize, usize))> = FIELD_BUCKETS
+            .iter()
+            .map(|(w, lo, hi)| (*w, (*lo, *hi)))
+            .collect();
+        let (lo, hi) = self.pick(&buckets);
+        let (lo, hi) = ((lo as f64).ln(), (hi as f64).ln());
+        (lo + (hi - lo) * self.unit()).exp() as usize
+    }
+}
+
+fn bucket_of(len: usize) -> &'static str {
+    match len {
+        0..=1_400 => "<=1.4KB",
+        1_401..=16_383 => "1.4-16KiB",
+        16_384..=65_535 => "16-64KiB",
+        65_536..=262_143 => "64-256KiB",
+        262_144..=1_048_575 => "256KiB-1MiB",
+        1_048_576..=4_194_303 => "1-4MiB",
+        4_194_304..=12_582_911 => "4-12MiB",
+        _ => ">=12MiB",
+    }
+}
+
+/// Replay the field's streamed-send mix on one QUIC path (or the UDP
+/// transport) over a lossy link: `LAB_STARTS` (300) starts in a row, each
+/// `K` concurrent messages drawn from the field's concurrency and sizes
+/// (`FIELD_CONCURRENCY`, `FIELD_BUCKETS`). `LAB_STRESS=1` makes every start
+/// one message of 12 to 30 MiB with one or two small ones beside it, for
+/// `LAB_STARTS` starts. Prints one `LAB_MIX` line per size bucket with
+/// per-message completion times. Link and controller switches as in
+/// [`quic_lab_loss`] (default 5% loss, 50 ms one way, no bottleneck).
+#[test]
+fn quic_lab_mix() {
+    if !enabled("quic_lab_mix") {
+        return;
+    }
+    let transport = std::env::var("LAB_TRANSPORT").unwrap_or_else(|_| "quic".into());
+    let starts: usize = env_or("LAB_STARTS", 300);
+    let stress = std::env::var("LAB_STRESS").as_deref() == Ok("1");
+    let window = env_or("LAB_WINDOW_KIB", 384u64) * 1024;
+    let loss: f64 = env_or("LAB_LOSS", 0.05);
+    let seed: u64 = env_or("LAB_SEED", 1);
+    let link = LinkSpec {
+        rate_bps: env_or("LAB_RATE_MBIT", 0u64) * 1_000_000,
+        one_way_delay: Duration::from_millis(env_or("LAB_DELAY_MS", 50)),
+        queue_bytes: env_or("LAB_QUEUE_KIB", 1024usize) * 1024,
+        loss,
+        seed,
+    };
+    let controller = std::env::var("LAB_CONTROLLER").unwrap_or_else(|_| "cubic".into());
+    set_controller(match controller.as_str() {
+        "cubic" => LabController::Cubic,
+        "bbr" => LabController::Bbr,
+        "veno" => LabController::Veno,
+        other => panic!("unknown controller {other}"),
+    });
+    let gap_rule = std::env::var("LAB_GAP").unwrap_or_else(|_| "stream".into());
+    set_gap_on_connection_progress(gap_rule == "connection");
+    let min_window_kib: u64 = env_or("LAB_MIN_WINDOW_KIB", 0);
+    set_min_window((min_window_kib > 0).then_some(min_window_kib * 1024));
+    let mut draw = Draw(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+    let batches: Vec<Vec<usize>> = (0..starts)
+        .map(|_| {
+            if stress {
+                let big = (12usize << 20) + (draw.next() % (18 << 20)) as usize;
+                let small = 1 + (draw.next() % 2) as usize;
+                std::iter::once(big)
+                    .chain((0..small).map(|_| draw.size().min(256 << 10)))
+                    .collect()
+            } else {
+                let k = draw.pick(&FIELD_CONCURRENCY);
+                (0..k).map(|_| draw.size()).collect()
+            }
+        })
+        .collect();
+    let rt = runtime(env_or("LAB_THREADS", 4));
+    // (size, outcome, seconds from the batch start to the message's end)
+    let results: Vec<(usize, String, f64)> = rt.block_on(async {
+        let mut results = Vec::new();
+        match transport.as_str() {
+            "quic" => {
+                let pair = LabPair::connect(LabConfig {
+                    window_bytes: window,
+                    bandwidth_limit: None,
+                    link: Some(link),
+                })
+                .await;
+                for batch in &batches {
+                    for (len, (outcome, at)) in batch.iter().zip(pair.send_batch(batch).await) {
+                        results.push((*len, outcome, at.as_secs_f64()));
+                    }
+                }
+            }
+            "udp" => {
+                let (send, mut got, _tasks, _) = udp_pair(None, Some(link)).await;
+                for batch in &batches {
+                    let start = Instant::now();
+                    for len in batch {
+                        send.send(vec![0x5Au8; *len]).await.expect("driver runs");
+                    }
+                    let mut pending: Vec<usize> = batch.clone();
+                    while !pending.is_empty() {
+                        match tokio::time::timeout(Duration::from_secs(60), got.recv()).await {
+                            Ok(Some(len)) => {
+                                if let Some(at) = pending.iter().position(|p| p + 8 == len) {
+                                    let len = pending.swap_remove(at);
+                                    results.push((
+                                        len,
+                                        "Sent".into(),
+                                        start.elapsed().as_secs_f64(),
+                                    ));
+                                }
+                            }
+                            Ok(None) | Err(_) => break,
+                        }
+                    }
+                    for len in pending {
+                        results.push((len, "NotDelivered".into(), start.elapsed().as_secs_f64()));
+                    }
+                }
+            }
+            other => panic!("unknown transport {other}"),
+        }
+        results
+    });
+    rt.shutdown_timeout(Duration::from_secs(1));
+    let order = [
+        "<=1.4KB",
+        "1.4-16KiB",
+        "16-64KiB",
+        "64-256KiB",
+        "256KiB-1MiB",
+        "1-4MiB",
+        "4-12MiB",
+        ">=12MiB",
+    ];
+    for bucket in order {
+        let rows: Vec<&(usize, String, f64)> = results
+            .iter()
+            .filter(|r| bucket_of(r.0) == bucket)
+            .collect();
+        if rows.is_empty() {
+            continue;
+        }
+        let mut times: Vec<f64> = rows.iter().filter(|r| r.1 == "Sent").map(|r| r.2).collect();
+        times.sort_by(f64::total_cmp);
+        let pick = |p: f64| {
+            if times.is_empty() {
+                f64::NAN
+            } else {
+                times[((times.len() - 1) as f64 * p).round() as usize]
+            }
+        };
+        let failed: std::collections::BTreeMap<&str, usize> = rows
+            .iter()
+            .filter(|r| r.1 != "Sent")
+            .fold(Default::default(), |mut m, r| {
+                *m.entry(r.1.as_str()).or_default() += 1;
+                m
+            });
+        println!(
+            "LAB_MIX transport={transport} controller={controller} gap={gap_rule} \
+             min_window_kib={min_window_kib} stress={stress} loss={loss} window_kib={} \
+             bucket={bucket} n={} sent={} p50_s={:.2} p99_s={:.2} max_s={:.2} over_120s={} \
+             over_300s={} failed={failed:?}",
+            window / 1024,
+            rows.len(),
+            times.len(),
+            pick(0.5),
+            pick(0.99),
+            pick(1.0),
+            times.iter().filter(|t| **t > 120.0).count(),
+            times.iter().filter(|t| **t > 300.0).count(),
+        );
+    }
+}
