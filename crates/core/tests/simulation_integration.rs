@@ -21353,7 +21353,8 @@ fn test_quic_shadow_upgrade_is_deterministic() {
 
 /// The client or server of an established path restarts, with its identity, and
 /// its old path's datagrams no longer arrive. The survivor's session is replaced,
-/// so its live path closes by that alone, and the backoff of the session that ended
+/// so its live path closes by that alone, with SESSION_ENDED, and the backoff of the
+/// session that ended
 /// carries over to the new one: a survivor that is the server waits for it before
 /// it offers, and one that is the client declines with `Backoff`.
 #[test_log::test]
@@ -21378,10 +21379,10 @@ fn test_quic_replaced_connection_closes_its_path_and_keeps_the_backoff() {
         assert!(ended.at >= replaced_at, "{dump}");
         assert_eq!(ended.permits, 0, "{dump}");
         assert!(
-            of("closed path with Downgrade")
+            of("closed path with SessionEnded")
                 .iter()
                 .any(|c| c.session == old && c.at >= replaced_at),
-            "the session's end closed the live path: {dump}"
+            "the session's end closed the live path with SESSION_ENDED: {dump}"
         );
         assert!(
             of("Fallback").iter().all(|f| f.session != old),

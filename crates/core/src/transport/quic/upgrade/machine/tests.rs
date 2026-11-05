@@ -593,7 +593,7 @@ fn expected(role: Role, state: S, name: &str) -> Option<(S, Vec<Action>)> {
         (_, _, "session_ended") if live => Some((
             S::Off,
             vec![
-                tear_down(QuicCloseCode::Downgrade),
+                tear_down(QuicCloseCode::SessionEnded),
                 Record(Outcome::SessionEnded {
                     was_active: state == S::Active,
                 }),
@@ -1257,7 +1257,8 @@ fn every_close_code_falls_back_then_upgrades_again() {
     }
 }
 
-/// Close codes 1, 3, 4 and 5 read as a downgrade, and record that cause. An
+/// Close codes 1, 3, 4 and 5 read as a downgrade, and record that cause; code 6
+/// records `session_ended_rx`. An
 /// unknown one, which is how an older node reads code 5, is a lost connection.
 #[test]
 fn close_codes_record_their_cause() {
@@ -1273,6 +1274,10 @@ fn close_codes_record_their_cause() {
         (QuicCloseCode::SendAbortLimit.code(), downgrade),
         (QuicCloseCode::PeerNotAcknowledging.code(), downgrade),
         (QuicCloseCode::ControlRefused.code(), downgrade),
+        (
+            QuicCloseCode::SessionEnded.code(),
+            Outcome::Fallback(FallbackCause::SessionEndedReceived),
+        ),
         (0x0f, lost),
     ] {
         let mut rig = Rig::promoted(Role::Server);
@@ -1291,6 +1296,7 @@ fn a_downgrade_close_in_setup_is_not_a_path_fallback() {
         QuicCloseCode::SendAbortLimit,
         QuicCloseCode::PeerNotAcknowledging,
         QuicCloseCode::ControlRefused,
+        QuicCloseCode::SessionEnded,
     ] {
         let mut rig = reach(Role::Server, S::Confirming);
         let actions = rig.close_with(attempt_of(Role::Server), u64::from(code.code()));
@@ -2041,7 +2047,16 @@ fn a_session_end_does_not_charge_a_failure_twice() {
             let charged = Ledger::of(&rig.machine);
             assert_eq!(charged.failures, 1, "{case}");
             rig.now += Duration::from_secs(1);
-            assert_eq!(rig.step(Event::SessionEnded), vec![], "{case}");
+            // Charged nothing more; an active path's fallback is counted as
+            // followed by the session's end.
+            let churn = if start == S::Active {
+                vec![Action::Record(Outcome::ChurnedFallback(
+                    FallbackCause::Reset,
+                ))]
+            } else {
+                vec![]
+            };
+            assert_eq!(rig.step(Event::SessionEnded), churn, "{case}");
             assert!(rig.machine.is_off(), "{case}");
             assert_eq!(Ledger::of(&rig.machine), charged, "{case}");
 
@@ -2236,9 +2251,26 @@ fn timeouts_and_windows_have_these_values() {
         (STABLE_PATH, 600),
         (OFFER_DELAY_MIN, 2),
         (OFFER_DELAY_MAX, 10),
+        (FALLBACK_CHURN_WINDOW, 150),
     ] {
         assert_eq!(value, Duration::from_secs(seconds));
     }
+}
+
+/// The churn window outlasts the time a UDP session takes to end once its peer
+/// goes silent, so an idle path whose UDP session times out too counts as
+/// churn. A longer idle timeout, keepalive or check interval fails here
+/// instead of moving that churn into the QUIC-specific count.
+#[test]
+fn the_churn_window_outlasts_a_udp_idle_timeout() {
+    use crate::simulation::{RealTime, TimeSource};
+    use crate::transport::peer_connection::{MAX_KEEPALIVE_INTERVAL, TIMEOUT_CHECK_INTERVAL};
+    let udp_session_end =
+        RealTime::new().connection_idle_timeout() + MAX_KEEPALIVE_INTERVAL + TIMEOUT_CHECK_INTERVAL;
+    assert!(
+        FALLBACK_CHURN_WINDOW > udp_session_end,
+        "{FALLBACK_CHURN_WINDOW:?} <= {udp_session_end:?}"
+    );
 }
 
 /// A second promotion with a key that would give the other role changes
@@ -2582,4 +2614,113 @@ fn a_machine_that_took_no_seed_has_none_to_hand_on() {
     let mut rig = Rig::promoted(Role::Server);
     rig.step(Event::SessionEnded);
     assert!(rig.machine.backoff_seed().is_some());
+}
+
+/// A session end closes the path with SESSION_ENDED, and only a session end
+/// does: the other ways of shutting off keep DOWNGRADE.
+#[test]
+fn only_a_session_end_closes_with_session_ended() {
+    let event = |ending: Option<QuicAvailability>| match ending {
+        None => Event::SessionEnded,
+        Some(availability) => Event::EndpointNotUp(availability),
+    };
+    for role in [Role::Server, Role::Client] {
+        for (ending, code) in [
+            (None, QuicCloseCode::SessionEnded),
+            (Some(QuicAvailability::Down), QuicCloseCode::Downgrade),
+            (Some(QuicAvailability::Released), QuicCloseCode::Downgrade),
+            (Some(QuicAvailability::Disabled), QuicCloseCode::Downgrade),
+        ] {
+            for start in [S::Connecting, S::Confirming, S::Active] {
+                let case = format!("{role:?} {start:?} {ending:?}");
+                let mut rig = reach(role, start);
+                let actions = rig.step(event(ending));
+                assert!(
+                    actions.contains(&Action::TearDown {
+                        attempt: attempt_of(role),
+                        code,
+                    }),
+                    "{case}: {actions:?}"
+                );
+            }
+        }
+    }
+}
+
+/// A fallback is counted as followed by the session's end when the session
+/// ends within FALLBACK_CHURN_WINDOW of it, boundary included, and not later.
+/// Each fallback in the window counts once, and a second session end counts
+/// nothing again.
+#[test]
+fn a_fallback_counts_as_churn_only_when_the_session_ends_within_the_window() {
+    let churn = |cause| Action::Record(Outcome::ChurnedFallback(cause));
+    let lost = Outcome::Fallback(FallbackCause::Reset);
+    for role in [Role::Server, Role::Client] {
+        for (after, counted) in [
+            (Duration::from_secs(1), true),
+            (Duration::from_secs(149), true),
+            (FALLBACK_CHURN_WINDOW, true),
+            (Duration::from_secs(151), false),
+            (Duration::from_secs(3600), false),
+        ] {
+            let case = format!("{role:?} after {after:?}");
+            let mut rig = Rig::promoted(role);
+            let attempt = rig.activate();
+            let actions = rig.close_with(attempt, u64::from(QuicCloseCode::NodeDroppedPeer.code()));
+            assert!(actions.contains(&Action::Record(lost)), "{case}");
+            rig.now += after;
+            let actions = rig.step(Event::SessionEnded);
+            assert_eq!(
+                actions.contains(&churn(FallbackCause::Reset)),
+                counted,
+                "{case}: {actions:?}"
+            );
+            rig.now += Duration::from_secs(1);
+            assert_eq!(rig.step(Event::SessionEnded), vec![], "{case}: again");
+        }
+
+        // Two fallbacks inside the window, one before it.
+        let case = format!("{role:?} several");
+        let mut rig = Rig::promoted(role);
+        let fallback = |rig: &mut Rig, code: QuicCloseCode| {
+            rig.now = rig.now.max(rig.machine.retry_at);
+            let attempt = rig.activate();
+            rig.close_with(attempt, u64::from(code.code()));
+            rig.now
+        };
+        fallback(&mut rig, QuicCloseCode::NodeDroppedPeer);
+        rig.now += BACKOFF_MAX;
+        let first_in_window = fallback(&mut rig, QuicCloseCode::Downgrade);
+        let second_in_window = fallback(&mut rig, QuicCloseCode::SessionEnded);
+        assert!(
+            second_in_window - first_in_window <= FALLBACK_CHURN_WINDOW,
+            "{case}"
+        );
+        rig.now = first_in_window + FALLBACK_CHURN_WINDOW;
+        assert_eq!(
+            rig.step(Event::SessionEnded),
+            vec![
+                churn(FallbackCause::DowngradeReceived),
+                churn(FallbackCause::SessionEndedReceived),
+            ],
+            "{case}"
+        );
+    }
+}
+
+/// The memory of recent fallbacks is bounded: past the bound the oldest goes.
+#[test]
+fn the_recent_fallbacks_are_bounded() {
+    let mut machine = Rig::promoted(Role::Server).machine;
+    let now = Duration::from_secs(100);
+    for _ in 0..RECENT_FALLBACKS_MAX + 3 {
+        machine.note_fallback(now, FallbackCause::Idle);
+    }
+    assert_eq!(machine.recent_fallbacks.len(), RECENT_FALLBACKS_MAX);
+    // Entries outside the window are dropped when the next one is noted.
+    machine.note_fallback(
+        now + FALLBACK_CHURN_WINDOW + Duration::from_secs(1),
+        FallbackCause::Reset,
+    );
+    assert_eq!(machine.recent_fallbacks.len(), 1);
 }

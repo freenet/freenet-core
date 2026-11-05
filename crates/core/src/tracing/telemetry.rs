@@ -3079,6 +3079,10 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 "quic_close_sent_control_refused".into(),
                 serde_json::json!(snapshot.quic_close_sent_control_refused),
             );
+            m.insert(
+                "quic_close_sent_session_ended".into(),
+                serde_json::json!(snapshot.quic_close_sent_session_ended),
+            );
             {
                 use crate::transport::metrics::{
                     QuicCloseCode, QuicFallback, QuicPathAge, QuicUpgradeOutcome,
@@ -3094,6 +3098,12 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 }
                 for (cause, count) in QuicFallback::ALL.iter().zip(snapshot.quic_fallback) {
                     m.insert(format!("quic_fallback_{}", cause.label()), count.into());
+                }
+                for (cause, count) in QuicFallback::ALL.iter().zip(snapshot.quic_churned_fallback) {
+                    m.insert(
+                        format!("quic_churned_fallback_{}", cause.label()),
+                        count.into(),
+                    );
                 }
                 for (age, count) in QuicPathAge::ALL.iter().zip(snapshot.quic_path_age_at_close) {
                     m.insert(
@@ -7607,6 +7617,7 @@ mod tests {
             "quic_close_received",
             "quic_upgrade",
             "quic_fallback",
+            "quic_churned_fallback",
             "quic_path_age_at_close",
         ] {
             assert!(expected.remove(family), "{family} is in the snapshot");
@@ -7627,6 +7638,11 @@ mod tests {
             QuicFallback::ALL
                 .iter()
                 .map(|cause| format!("quic_fallback_{}", cause.label())),
+        );
+        expected.extend(
+            QuicFallback::ALL
+                .iter()
+                .map(|cause| format!("quic_churned_fallback_{}", cause.label())),
         );
         expected.extend(
             QuicPathAge::ALL
@@ -7877,6 +7893,7 @@ mod tests {
             quic_close_sent_send_abort_limit: 5,
             quic_close_sent_peer_not_acknowledging: 6,
             quic_close_sent_control_refused: 8,
+            quic_close_sent_session_ended: 10,
             quic_breaker_trips: 7,
             quic_send_refused: 9,
             quic_breaker_suppressed: true,
@@ -7895,6 +7912,7 @@ mod tests {
             ("quic_close_sent_send_abort_limit", 5),
             ("quic_close_sent_peer_not_acknowledging", 6),
             ("quic_close_sent_control_refused", 8),
+            ("quic_close_sent_session_ended", 10),
             ("quic_breaker_trips", 7),
             ("quic_send_refused", 9),
         ] {
@@ -7926,6 +7944,7 @@ mod tests {
         fill(&mut snapshot.quic_close_received);
         fill(&mut snapshot.quic_upgrade);
         fill(&mut snapshot.quic_fallback);
+        fill(&mut snapshot.quic_churned_fallback);
         fill(&mut snapshot.quic_path_age_at_close);
         snapshot.quic_establish_ms_p50 = Some(901);
         snapshot.quic_establish_ms_p90 = Some(902);
@@ -7948,6 +7967,9 @@ mod tests {
         for (cause, count) in QuicFallback::ALL.iter().zip(snapshot.quic_fallback) {
             expected.push((format!("quic_fallback_{}", cause.label()), count));
         }
+        for (cause, count) in QuicFallback::ALL.iter().zip(snapshot.quic_churned_fallback) {
+            expected.push((format!("quic_churned_fallback_{}", cause.label()), count));
+        }
         for (age, count) in QuicPathAge::ALL.iter().zip(snapshot.quic_path_age_at_close) {
             expected.push((format!("quic_path_age_at_close_{}", age.label()), count));
         }
@@ -7965,7 +7987,7 @@ mod tests {
             QuicCloseCode::COUNT
                 + 1
                 + QuicUpgradeOutcome::COUNT
-                + QuicFallback::COUNT
+                + 2 * QuicFallback::COUNT
                 + QuicPathAge::COUNT
                 + 5
         );
