@@ -835,3 +835,221 @@ impl LabPair {
         )
     }
 }
+
+/// One run of [`LabMany::send_all`].
+#[derive(Debug)]
+pub struct ManyRun {
+    /// Per connection: how many of its sends returned `Sent`.
+    pub sent: Vec<usize>,
+    /// Per connection: when its last send returned, from the start.
+    pub last_returned: Vec<Duration>,
+    /// Every send's outcome, `Debug`-rendered, counted.
+    pub outcomes: std::collections::BTreeMap<String, usize>,
+    /// Messages the receivers assembled.
+    pub received: usize,
+    pub elapsed: Duration,
+}
+
+/// `n` QUIC connections from one sender socket, so they share its uplink
+/// (one link model), each to a receiver of its own. For the many-connection
+/// bottleneck test: a node holds tens of connections, and what each
+/// connection's controller does adds up on one uplink.
+pub struct LabMany {
+    senders: Vec<Arc<QuicPath>>,
+    time: RealTime,
+    assembled: mpsc::UnboundedReceiver<usize>,
+    sender_shaper: Option<Arc<Shaper>>,
+    _keep: Box<dyn std::any::Any + Send>,
+}
+
+impl LabMany {
+    /// Bind the sender and `n` receivers on loopback, every socket shaped
+    /// with `config.link`, connect them, and build the paths.
+    ///
+    /// # Panics
+    /// As [`LabPair::connect`].
+    pub async fn connect(config: LabConfig, n: usize) -> Self {
+        let memory_limit = config.window_bytes as usize * 40;
+        assert_eq!(
+            connection_window_bytes(memory_limit, 1),
+            config.window_bytes
+        );
+        let settings = QuicSettings {
+            max_connections: 1,
+            memory_limit,
+            idle_timeout: None,
+            rate_limit: QuicRateLimit::new(config.bandwidth_limit, None),
+        };
+        let bind = || async {
+            let socket = LabSocket::bind_shaped((Ipv4Addr::LOCALHOST, 0).into(), config.link)
+                .await
+                .expect("bind");
+            let addr = socket.local_addr().expect("bound");
+            let shaper = socket.shaper.clone();
+            (Arc::new(DemuxSocket::wrap(socket, None)), addr, shaper)
+        };
+        let time = RealTime::new();
+        let (a_socket, a_addr, sender_shaper) = bind().await;
+        let a_keys = TransportKeypair::new();
+        let a_end = QuicEndpoint::bind(a_socket.clone(), a_addr, time.clone(), &settings, &a_keys)
+            .expect("endpoint a");
+        let mut pumps = vec![pump(a_socket.clone())];
+        let budget = || {
+            SharedInboundBudget::new(
+                MAX_INBOUND_STREAMS_PER_CONNECTION,
+                MAX_INBOUND_STREAM_BYTES_PER_CONNECTION,
+            )
+        };
+        let (assembled_tx, assembled) = mpsc::unbounded_channel();
+        let mut senders = Vec::new();
+        let mut keep: Vec<Box<dyn std::any::Any + Send>> = Vec::new();
+        for _ in 0..n {
+            let (b_socket, b_addr, _) = bind().await;
+            pumps.push(pump(b_socket.clone()));
+            let b_keys = TransportKeypair::new();
+            let b_end =
+                QuicEndpoint::bind(b_socket.clone(), b_addr, time.clone(), &settings, &b_keys)
+                    .expect("endpoint b");
+            let permit = b_end
+                .allow_peer(a_addr, a_keys.public())
+                .expect("allow-set has room");
+            let (client, server) = tokio::time::timeout(Duration::from_secs(20), async {
+                tokio::join!(a_end.connect(b_addr, b_keys.public()), async {
+                    b_end
+                        .accept()
+                        .await
+                        .expect("an incoming attempt")
+                        .establish()
+                        .await
+                })
+            })
+            .await
+            .expect("handshake within 20 s");
+            let (client, server) = (client.expect("client"), server.expect("server"));
+            drop(permit);
+            let (a_data, a_inbox) = data_channels();
+            let (a, a_controls) = QuicPath::with_budget(
+                client,
+                time.clone(),
+                QuicPathLimits::DEFAULT,
+                budget(),
+                a_data,
+            );
+            a.enable_data();
+            let (b_data, b_inbox) = data_channels();
+            let (b, b_controls) = QuicPath::with_budget(
+                server,
+                time.clone(),
+                QuicPathLimits::DEFAULT,
+                budget(),
+                b_data,
+            );
+            b.enable_data();
+            let mut arrivals = b_inbox.streams;
+            let assembled_tx = assembled_tx.clone();
+            let reader = tokio::spawn(async move {
+                while let Some(arrival) = arrivals.recv().await {
+                    let assembled_tx = assembled_tx.clone();
+                    tokio::spawn(async move {
+                        if let Ok(body) = arrival.handle.assemble().await {
+                            assembled_tx.send(body.len()).ok();
+                        }
+                    });
+                }
+            });
+            senders.push(Arc::new(a));
+            keep.push(Box::new((
+                b_socket,
+                b_end,
+                Arc::new(b),
+                a_inbox.shorts,
+                a_inbox.streams,
+                b_inbox.shorts,
+                a_controls,
+                b_controls,
+                reader,
+            )));
+        }
+        Self {
+            senders,
+            time,
+            assembled,
+            sender_shaper,
+            _keep: Box::new((a_socket, a_end, pumps, keep)),
+        }
+    }
+
+    /// The sender's local port, for [`Competitor::start`] and [`link_report`].
+    pub fn sender_port(&self) -> Option<u16> {
+        self.sender_shaper
+            .as_ref()
+            .map(|shaper| shaper.local.port())
+    }
+
+    /// Send `per_connection` messages of `bytes` on every connection at
+    /// once, each from its own task, under the node's deadlines.
+    pub async fn send_all(
+        &mut self,
+        per_connection: usize,
+        bytes: usize,
+        limit: Duration,
+    ) -> ManyRun {
+        let body = Bytes::from(vec![0xA5u8; bytes]);
+        let start = Instant::now();
+        let mut sends = Vec::new();
+        for (index, path) in self.senders.iter().enumerate() {
+            for _ in 0..per_connection {
+                let (path, time, body) = (path.clone(), self.time.clone(), body.clone());
+                sends.push((
+                    index,
+                    tokio::spawn(async move {
+                        let outcome = path
+                            .send_stream_bounded(
+                                &time,
+                                SendDeadlines::stream(body.len() as u64),
+                                StreamId::next(),
+                                None,
+                                body,
+                                None,
+                            )
+                            .await;
+                        (outcome, start.elapsed())
+                    }),
+                ));
+            }
+        }
+        let n = self.senders.len();
+        let mut sent = vec![0; n];
+        let mut last_returned = vec![Duration::ZERO; n];
+        let mut outcomes = std::collections::BTreeMap::new();
+        let collect = async {
+            for (index, send) in sends {
+                let (outcome, at) = send.await.expect("the send ran");
+                if matches!(outcome, BoundedSend::Sent) {
+                    sent[index] += 1;
+                }
+                last_returned[index] = last_returned[index].max(at);
+                let name = format!("{outcome:?}");
+                *outcomes.entry(name).or_insert(0) += 1;
+            }
+        };
+        if tokio::time::timeout(limit, collect).await.is_err() {
+            *outcomes.entry("run timed out".to_string()).or_insert(0) += 1;
+        }
+        let total: usize = sent.iter().sum();
+        let mut received = 0;
+        while received < total {
+            match tokio::time::timeout(Duration::from_secs(6), self.assembled.recv()).await {
+                Ok(Some(_)) => received += 1,
+                Ok(None) | Err(_) => break,
+            }
+        }
+        ManyRun {
+            sent,
+            last_returned,
+            outcomes,
+            received,
+            elapsed: start.elapsed(),
+        }
+    }
+}
