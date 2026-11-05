@@ -14,6 +14,7 @@ use std::time::Duration;
 use parking_lot::Mutex;
 
 use super::policy::QuicPathPermits;
+use crate::transport::quic::path::QuicPathStats;
 
 type Version = (u8, u8, u16);
 
@@ -33,9 +34,76 @@ pub struct QuicUpgradeRecord {
     pub permits: usize,
 }
 
+/// What one path's own counters read when asked, live or ended. Each count is
+/// made where the path decides it (`QuicPathStats`), not derived from the
+/// records.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QuicPathTotals {
+    /// Data frames this side refused with NOT_ACCEPTING_DATA (its own bit 0).
+    pub refused_not_accepting_data: u64,
+    /// Data sends the peer refused with NOT_ACCEPTING_DATA (`quic_data_refused`).
+    pub data_refused: u64,
+    /// Shorts this side took off the path.
+    pub delivered_shorts: u64,
+    /// Streams this side announced to `recv`.
+    pub announced_streams: u64,
+    /// Data sends that ended `Sent`, by kind: short, large short, stream, pipe.
+    pub sent: [u64; 4],
+    /// Data sends that ended `MaybeDelivered`, all kinds.
+    pub maybe_delivered: u64,
+    /// Data sends that went to UDP after the path (not opened, or failed before
+    /// the end), all kinds.
+    pub on_udp: u64,
+    /// Data sends that were dropped, all kinds.
+    pub dropped: u64,
+    /// Shorts sent on UDP because the path's queue was full.
+    pub short_overflow_udp: u64,
+    /// Whether the path was closed after its sends kept timing out.
+    pub stalled_closed: u64,
+}
+
+impl QuicPathTotals {
+    /// Data sends that ended `Sent`, all kinds.
+    pub fn sent_total(&self) -> u64 {
+        self.sent.iter().sum()
+    }
+
+    fn of(stats: &QuicPathStats) -> Self {
+        use crate::transport::quic::path::{
+            QuicInboundOutcome as In, QuicSendEvent as Event, QuicSendResult as Result, SendKind,
+        };
+        Self {
+            refused_not_accepting_data: stats.count(In::RefusedNotAcceptingData),
+            data_refused: stats.send_event_count(Event::DataRefused),
+            delivered_shorts: stats.count(In::DeliveredShort),
+            announced_streams: stats.count(In::AnnouncedStream),
+            sent: SendKind::ALL.map(|kind| stats.send_count(kind, Result::Sent)),
+            maybe_delivered: stats.send_total(Result::MaybeDelivered),
+            on_udp: stats.send_total(Result::NotOpenedUdp) + stats.send_total(Result::FailedUdp),
+            dropped: stats.send_total(Result::Dropped),
+            short_overflow_udp: stats.send_event_count(Event::ShortOverflowUdp),
+            stalled_closed: stats.send_event_count(Event::StalledClosed),
+        }
+    }
+}
+
+/// One path a node built, with its counters as they read now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuicPathRecord {
+    pub node: SocketAddr,
+    pub peer: SocketAddr,
+    /// The session's number in its node, as in [`QuicUpgradeRecord::session`].
+    pub session: u64,
+    /// When the path was built, on the clock of [`QuicUpgradeRecord::at`].
+    pub built_at: Duration,
+    pub totals: QuicPathTotals,
+}
+
 #[derive(Default)]
 struct TraceData {
     records: Mutex<Vec<QuicUpgradeRecord>>,
+    /// Every path built, with its counters, which outlive it.
+    paths: Mutex<Vec<(SocketAddr, SocketAddr, u64, Duration, Arc<QuicPathStats>)>>,
     wrong_record: Mutex<BTreeSet<SocketAddr>>,
     down_at: Mutex<BTreeMap<SocketAddr, Duration>>,
     permits: Mutex<BTreeMap<SocketAddr, QuicPathPermits>>,
@@ -63,6 +131,45 @@ impl QuicUpgradeTrace {
     pub fn now(&self) -> Duration {
         let now = tokio::time::Instant::now();
         now.saturating_duration_since(*self.epoch.lock().get_or_insert(now))
+    }
+
+    /// Every path any node built, in the order they were built, with what its
+    /// counters read now.
+    pub fn paths(&self) -> Vec<QuicPathRecord> {
+        self.data
+            .paths
+            .lock()
+            .iter()
+            .map(|(node, peer, session, built_at, stats)| QuicPathRecord {
+                node: *node,
+                peer: *peer,
+                session: *session,
+                built_at: *built_at,
+                totals: QuicPathTotals::of(stats),
+            })
+            .collect()
+    }
+
+    /// The counters of every path summed, field by field.
+    pub fn path_totals(&self) -> QuicPathTotals {
+        self.paths()
+            .iter()
+            .fold(QuicPathTotals::default(), |mut sum, path| {
+                let t = &path.totals;
+                sum.refused_not_accepting_data += t.refused_not_accepting_data;
+                sum.data_refused += t.data_refused;
+                sum.delivered_shorts += t.delivered_shorts;
+                sum.announced_streams += t.announced_streams;
+                for (total, sent) in sum.sent.iter_mut().zip(t.sent) {
+                    *total += sent;
+                }
+                sum.maybe_delivered += t.maybe_delivered;
+                sum.on_udp += t.on_udp;
+                sum.dropped += t.dropped;
+                sum.short_overflow_udp += t.short_overflow_udp;
+                sum.stalled_closed += t.stalled_closed;
+                sum
+            })
     }
 
     /// What `node` recorded about `peer`, in order.
@@ -172,6 +279,17 @@ impl NodeTrace {
             what,
             permits,
         });
+    }
+
+    /// Keep `stats` of a path this node built to `peer` in `session`, for
+    /// [`QuicUpgradeTrace::paths`].
+    pub(crate) fn path_built(&self, peer: SocketAddr, session: u64, stats: Arc<QuicPathStats>) {
+        let at = self.trace.now();
+        self.trace
+            .data
+            .paths
+            .lock()
+            .push((self.addr, peer, session, at, stats));
     }
 
     /// The version the machine reads for a peer that reports `reported`.

@@ -109,7 +109,9 @@ pub mod dev_tool {
         write_backend_marker,
     };
     #[cfg(any(test, feature = "testing"))]
-    pub use crate::transport::quic::upgrade::sim_trace::{QuicUpgradeRecord, QuicUpgradeTrace};
+    pub use crate::transport::quic::upgrade::sim_trace::{
+        QuicPathRecord, QuicPathTotals, QuicUpgradeRecord, QuicUpgradeTrace,
+    };
     // Backend constructors live in the `kek` submodule rather than the
     // top-level `config` re-export to keep `Config`'s public surface
     // free of platform-specific concrete types.

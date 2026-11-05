@@ -21856,3 +21856,426 @@ fn test_quic_mixed_modes_are_deterministic() {
     };
     assert_eq!(once("quic-mixed-det-run1"), once("quic-mixed-det-run2"));
 }
+
+// =============================================================================
+// QUIC data scenarios (#5940 step e5b-9)
+// =============================================================================
+//
+// Each scenario runs PUT, GET, SUBSCRIBE and UPDATE through a network whose
+// pairs carry data on QUIC (all, some, or none of them), and checks the health
+// metrics of `.claude/rules/test-philosophy.md` (GET and SUBSCRIBE success, the
+// subscription tree, time to the first operation) plus what the paths did, from
+// each path's own counters (`QuicUpgradeTrace::paths`).
+
+/// A contract a data scenario writes: CRDT-mode states, so the update is the
+/// state every holder ends with, and it travels as a delta.
+struct QuicDataContract {
+    container: freenet_stdlib::prelude::ContractContainer,
+    key: freenet_stdlib::prelude::ContractKey,
+    initial: Vec<u8>,
+    updated: Vec<u8>,
+}
+
+impl QuicDataContract {
+    /// Registers the contract for CRDT mode, so call it after
+    /// `setup_deterministic_state`, which clears the registrations.
+    fn new(seed: u8, data_len: usize) -> Self {
+        let container = freenet::dev_tool::SimOperation::create_test_contract(seed);
+        let key = container.key();
+        freenet::dev_tool::register_crdt_contract(*key.id());
+        let state = |version: u64, salt: u8| {
+            let mut bytes = version.to_le_bytes().to_vec();
+            bytes.extend((0..data_len).map(|i| (i % 251) as u8 ^ salt));
+            bytes
+        };
+        Self {
+            container,
+            key,
+            initial: state(1, seed),
+            updated: state(2, seed.wrapping_add(1)),
+        }
+    }
+}
+
+/// Who does what in [`quic_data_ops`], by index into the labels sorted gateways
+/// first.
+const QUIC_DATA_PUTTER: usize = 2;
+const QUIC_DATA_GETTER: usize = 3;
+const QUIC_DATA_SUBSCRIBERS: [usize; 2] = [4, 5];
+
+/// One small PUT to give the paths time to come up, then for each contract a PUT
+/// with subscribe, a GET, two GETs with subscribe and an UPDATE from the putter.
+fn quic_data_ops(
+    labels: &[freenet::dev_tool::NodeLabel],
+    contracts: &[QuicDataContract],
+) -> Vec<freenet::dev_tool::ScheduledOperation> {
+    use freenet::dev_tool::{ScheduledOperation, SimOperation};
+    let mut ops = vec![ScheduledOperation::new(
+        labels[QUIC_DATA_PUTTER].clone(),
+        SimOperation::Put {
+            contract: SimOperation::create_test_contract(0xEE),
+            state: vec![1; 64],
+            subscribe: false,
+        },
+    )];
+    for contract in contracts {
+        let id = *contract.key.id();
+        ops.push(ScheduledOperation::new(
+            labels[QUIC_DATA_PUTTER].clone(),
+            SimOperation::Put {
+                contract: contract.container.clone(),
+                state: contract.initial.clone(),
+                subscribe: true,
+            },
+        ));
+        ops.push(ScheduledOperation::new(
+            labels[QUIC_DATA_GETTER].clone(),
+            SimOperation::Get {
+                contract_id: id,
+                return_contract_code: true,
+                subscribe: false,
+            },
+        ));
+        // A node subscribes only to a contract it holds, so a subscriber GETs
+        // with subscribe.
+        for subscriber in QUIC_DATA_SUBSCRIBERS {
+            ops.push(ScheduledOperation::new(
+                labels[subscriber].clone(),
+                SimOperation::Get {
+                    contract_id: id,
+                    return_contract_code: true,
+                    subscribe: true,
+                },
+            ));
+        }
+        ops.push(ScheduledOperation::new(
+            labels[QUIC_DATA_PUTTER].clone(),
+            SimOperation::Update {
+                key: contract.key,
+                data: contract.updated.clone(),
+            },
+        ));
+    }
+    ops
+}
+
+/// What a data scenario's run left to check.
+struct QuicDataRun {
+    run: QuicShadowRun,
+    labels: Vec<freenet::dev_tool::NodeLabel>,
+    result: freenet::dev_tool::ControlledSimulationResult,
+    contracts: Vec<QuicDataContract>,
+    client_gets: freenet::tracing::ClientGetOutcomeSummary,
+    /// Elapsed time of each successful GET, ascending.
+    get_elapsed_ms: Vec<u64>,
+    subscribes_ok: usize,
+    subscribes_failed: usize,
+    converged: bool,
+    delta_failure_resyncs: u64,
+}
+
+/// Options for [`run_quic_data_sim`].
+struct QuicDataSim {
+    gateways: usize,
+    nodes: usize,
+    /// `(contract seed, state length)`; a state over the streaming threshold goes
+    /// as a stream.
+    contracts: Vec<(u8, usize)>,
+    op_interval: Duration,
+    duration: Duration,
+    wait_after: Duration,
+}
+
+impl Default for QuicDataSim {
+    fn default() -> Self {
+        Self {
+            gateways: 2,
+            nodes: 4,
+            // One state of a few packets, sent as one message, and one over 1 MiB,
+            // sent as a stream.
+            contracts: vec![(0x71, 8 * 1024), (0x72, 1024 * 1024 + 4096)],
+            op_interval: Duration::from_secs(20),
+            // The last subscriber can miss the 1 MiB update's broadcast, on UDP as
+            // on QUIC, and then converges by anti-entropy (about 5 minutes), so the
+            // run waits long enough for that.
+            duration: Duration::from_secs(1200),
+            wait_after: Duration::from_secs(480),
+        }
+    }
+}
+
+/// Runs [`quic_data_ops`] on a controlled simulation. `set_up` picks each node's
+/// QUIC mode and percentage, and any fault.
+fn run_quic_data_sim(
+    name: &str,
+    seed: u64,
+    options: QuicDataSim,
+    set_up: impl FnOnce(
+        &mut SimNetwork,
+        &freenet::dev_tool::QuicUpgradeTrace,
+        &[freenet::dev_tool::NodeLabel],
+    ),
+) -> QuicDataRun {
+    setup_deterministic_state(seed);
+    let contracts: Vec<_> = options
+        .contracts
+        .iter()
+        .map(|(seed, len)| QuicDataContract::new(*seed, *len))
+        .collect();
+    let rt = create_runtime();
+    let (sim, logs_handle, trace, labels, addresses) = rt.block_on(async {
+        let mut sim =
+            SimNetwork::new(name, options.gateways, options.nodes, 7, 3, 10, 2, seed).await;
+        sim.enable_gateway_ack_version();
+        sim.with_streaming_threshold(64 * 1024);
+        sim.with_controlled_op_interval(options.op_interval);
+        sim.wait_for_join_convergence_before_ops(1.0, Duration::from_secs(60));
+        let trace = sim.quic_upgrade_trace();
+        let mut labels: Vec<_> = sim.all_node_addresses().keys().cloned().collect();
+        labels.sort_by_key(|label| (!label.is_gateway(), label.number()));
+        set_up(&mut sim, &trace, &labels);
+        let addresses: Vec<_> = labels
+            .iter()
+            .map(|label| sim.all_node_addresses()[label])
+            .collect();
+        let logs_handle = sim.event_logs_handle();
+        (sim, logs_handle, trace, labels, addresses)
+    });
+    let operations = quic_data_ops(&labels, &contracts);
+    let result =
+        sim.run_controlled_simulation(seed, operations, options.duration, options.wait_after);
+    let delta_failure_resyncs = GlobalTestMetrics::delta_failure_resyncs();
+    let (mesh, client_gets, get_elapsed_ms, subscribes_ok, subscribes_failed, converged) = rt
+        .block_on(async {
+            let converged = check_convergence_from_logs(&logs_handle)
+                .await
+                .is_converged();
+            let logs = logs_handle.lock().await;
+            let mesh = logs
+                .iter()
+                .filter_map(|log| log.kind.connect_connected_addrs())
+                .map(|(a, b)| if a <= b { (a, b) } else { (b, a) })
+                .collect();
+            let client_gets = freenet::tracing::summarize_client_get_outcomes(&logs);
+            let mut get_elapsed_ms: Vec<u64> = logs
+                .iter()
+                .filter_map(|log| log.kind.client_get_success_elapsed_ms())
+                .collect();
+            get_elapsed_ms.sort_unstable();
+            let outcomes: Vec<bool> = logs
+                .iter()
+                .filter_map(|log| log.kind.subscribe_outcome())
+                .collect();
+            let ok = outcomes.iter().filter(|ok| **ok).count();
+            (
+                mesh,
+                client_gets,
+                get_elapsed_ms,
+                ok,
+                outcomes.len() - ok,
+                converged,
+            )
+        });
+    QuicDataRun {
+        run: QuicShadowRun {
+            trace,
+            nodes: addresses,
+            logs_events: 0,
+            mesh,
+        },
+        labels,
+        result,
+        contracts,
+        client_gets,
+        get_elapsed_ms,
+        subscribes_ok,
+        subscribes_failed,
+        converged,
+        delta_failure_resyncs,
+    }
+}
+
+impl QuicDataRun {
+    fn dump(&self) -> String {
+        format!("{}\npaths: {:#?}", self.run.dump(), self.run.trace.paths())
+    }
+
+    fn stored(
+        &self,
+        label: &freenet::dev_tool::NodeLabel,
+        contract: &QuicDataContract,
+    ) -> Option<Vec<u8>> {
+        self.result
+            .node_storages
+            .get(label)
+            .and_then(|storage| storage.get_stored_state(&contract.key))
+            .map(|state| state.as_ref().to_vec())
+    }
+
+    /// The health metrics every scenario asserts, and the two counts that must be
+    /// zero whatever the paths did: data refused (on either side of a path) and
+    /// deltas that failed to apply.
+    fn assert_healthy(&self) {
+        assert!(
+            self.result.turmoil_result.is_ok(),
+            "simulation failed: {:?}",
+            self.result.turmoil_result.as_ref().err()
+        );
+        let contracts = self.contracts.len() as u64;
+        let gets = contracts * (1 + QUIC_DATA_SUBSCRIBERS.len() as u64);
+        // GET success, as the client saw it.
+        assert_eq!(
+            self.client_gets.successes, gets,
+            "every GET delivered: {:?}",
+            self.client_gets
+        );
+        assert_eq!(self.client_gets.total(), gets, "{:?}", self.client_gets);
+        // SUBSCRIBE success. The outcomes include renewals over the run, of which
+        // the same seed with QUIC off also loses one now and then.
+        assert!(
+            self.subscribes_ok >= QUIC_DATA_SUBSCRIBERS.len() * self.contracts.len(),
+            "every subscriber subscribed: {} ok",
+            self.subscribes_ok
+        );
+        assert!(
+            self.subscribes_failed * 10 <= self.subscribes_ok + self.subscribes_failed,
+            "subscribe success under 90%: {} ok, {} failed",
+            self.subscribes_ok,
+            self.subscribes_failed
+        );
+        // Time to the first operation: the first GET came back promptly.
+        let first = *self
+            .get_elapsed_ms
+            .first()
+            .expect("a GET succeeded, so it has an elapsed time");
+        assert!(first <= 10_000, "first GET took {first} ms");
+        // The subscription tree: the putter and every subscriber host each
+        // contract and hold its update; the getter stored a copy.
+        for contract in &self.contracts {
+            for index in std::iter::once(QUIC_DATA_PUTTER).chain(QUIC_DATA_SUBSCRIBERS) {
+                let label = &self.labels[index];
+                assert!(
+                    self.result.is_node_hosting(label, &contract.key),
+                    "{label} hosts {}",
+                    contract.key
+                );
+                assert!(
+                    self.stored(label, contract).as_deref() == Some(contract.updated.as_slice()),
+                    "{label} holds the update of {}",
+                    contract.key
+                );
+            }
+            assert!(
+                self.stored(&self.labels[QUIC_DATA_GETTER], contract)
+                    .is_some(),
+                "the getter stored {}",
+                contract.key
+            );
+        }
+        assert!(self.converged, "every holder converged");
+        let totals = self.run.trace.path_totals();
+        assert_eq!(totals.data_refused, 0, "quic_data_refused: {}", self.dump());
+        assert_eq!(
+            totals.refused_not_accepting_data,
+            0,
+            "refused_not_accepting_data: {}",
+            self.dump()
+        );
+        assert_eq!(self.delta_failure_resyncs, 0, "a delta failed to apply");
+    }
+
+    /// Data a node received on UDP from a peer whose path to it carried data at
+    /// the time: more than a second after the sender enabled data, so a packet
+    /// already on the wire is not counted, and before that session's path ended.
+    fn udp_data_while_on_the_path(&self) -> Vec<freenet::dev_tool::QuicUpgradeRecord> {
+        let records = self.run.trace.records();
+        let mut late = Vec::new();
+        for enabled in records.iter().filter(|r| r.what == "DataEnabled") {
+            let (sender, receiver) = (enabled.node, enabled.peer);
+            let from = enabled.at + Duration::from_secs(1);
+            let until = records
+                .iter()
+                .filter(|r| {
+                    r.node == sender
+                        && r.session == enabled.session
+                        && r.at >= enabled.at
+                        && (r.what.starts_with("closed path")
+                            || r.what.starts_with("Fallback")
+                            || r.what == "session ended")
+                })
+                .map(|r| r.at)
+                .next()
+                .unwrap_or(Duration::MAX);
+            late.extend(
+                records
+                    .iter()
+                    .filter(|r| {
+                        r.node == receiver
+                            && r.peer == sender
+                            && r.what.starts_with("data arrived on UDP")
+                            && r.at > from
+                            && r.at < until
+                    })
+                    .cloned(),
+            );
+        }
+        late
+    }
+}
+
+/// Every node in `prefer` with a data percentage of `percent`.
+fn quic_data_everywhere(
+    percent: u8,
+) -> impl FnOnce(&mut SimNetwork, &freenet::dev_tool::QuicUpgradeTrace, &[freenet::dev_tool::NodeLabel])
+{
+    move |sim, trace, labels| {
+        for label in labels {
+            sim.with_node_transport_quic(label, "prefer");
+            sim.with_node_quic_data_percent(label, percent);
+        }
+        run_as_first_negotiating_release(trace);
+    }
+}
+
+/// S1: six nodes with every pair carrying data. PUT, GET, SUBSCRIBE and UPDATE
+/// of a state of a few packets and of one over 1 MiB all go on the paths: each
+/// kind of send happens, UDP carries no data once a pair's path does, and no send
+/// falls back.
+#[test_log::test]
+fn test_quic_data_six_nodes_all_pairs_on_the_path() {
+    let data = run_quic_data_sim(
+        "quic-data-s1",
+        0x5940_E5B9_0001,
+        QuicDataSim::default(),
+        quic_data_everywhere(100),
+    );
+    data.assert_healthy();
+    let run = &data.run;
+    for node in &run.nodes {
+        assert!(run.whats(*node, "Established") > 0, "{}", data.dump());
+        assert_eq!(
+            run.whats(*node, "DataEnabled"),
+            run.whats(*node, "Established"),
+            "at 100% every path carries data: {}",
+            data.dump()
+        );
+    }
+    let totals = run.trace.path_totals();
+    let [shorts, large_shorts, streams, _pipes] = totals.sent;
+    assert!(shorts > 0, "{totals:?}");
+    assert!(large_shorts > 0, "a state of a few packets: {totals:?}");
+    assert!(streams > 0, "the 1 MiB state: {totals:?}");
+    assert!(
+        totals.delivered_shorts > 0 && totals.announced_streams > 0,
+        "{totals:?}"
+    );
+    assert_eq!(totals.on_udp, 0, "{totals:?}");
+    assert_eq!(totals.dropped, 0, "{totals:?}");
+    assert_eq!(totals.stalled_closed, 0, "{totals:?}");
+    let late = data.udp_data_while_on_the_path();
+    assert!(late.is_empty(), "data on UDP while on the path: {late:#?}");
+    assert!(
+        run.total("data arrived on UDP") > 0,
+        "data seen on UDP before the paths carried it, so the count works"
+    );
+}

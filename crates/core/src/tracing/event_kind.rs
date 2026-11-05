@@ -326,6 +326,23 @@ impl EventKind {
     ///
     /// Returns `Some(ms)` for `GetSuccess`, `GetNotFound`, or `GetFailure`,
     /// `None` for all other events.
+    /// The elapsed time of a client GET that delivered state, streamed or not,
+    /// from its `ClientTerminal` event. `None` for anything else, a sub-op GET
+    /// included. Unlike [`Self::get_elapsed_ms`], this sees streamed successes.
+    // Only one variant matters; a new one is not a client GET success.
+    #[allow(clippy::wildcard_enum_match_arm)]
+    pub fn client_get_success_elapsed_ms(&self) -> Option<u64> {
+        match self {
+            EventKind::Get(GetEvent::ClientTerminal {
+                outcome: GetTerminalOutcome::Success,
+                is_sub_op: false,
+                elapsed_ms,
+                ..
+            }) => Some(*elapsed_ms),
+            _ => None,
+        }
+    }
+
     pub fn get_elapsed_ms(&self) -> Option<u64> {
         match self {
             EventKind::Get(GetEvent::GetSuccess { elapsed_ms, .. })

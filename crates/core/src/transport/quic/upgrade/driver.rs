@@ -1022,6 +1022,10 @@ impl Session {
             self.budget.clone(),
             self.data.clone(),
         );
+        #[cfg(any(test, feature = "testing"))]
+        if let Some(trace) = &self.hub.trace {
+            trace.path_built(self.remote, self.id, path.stats_handle());
+        }
         let pump = spawn_pump(
             attempt,
             self.remote,

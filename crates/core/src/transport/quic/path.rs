@@ -808,8 +808,9 @@ impl QuicPath {
         &self.stats
     }
 
-    /// The counters, outliving the path (tests read them after dropping it).
-    #[cfg(test)]
+    /// The counters, outliving the path (tests read them after dropping it, and
+    /// a simulation's trace keeps them for every path it built).
+    #[cfg(any(test, feature = "testing"))]
     pub(crate) fn stats_handle(&self) -> Arc<QuicPathStats> {
         self.stats.clone()
     }
