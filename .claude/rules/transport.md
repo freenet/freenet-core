@@ -117,9 +117,20 @@ EgressCap::poll_admit, the SAME queue the QUIC endpoint waits in); if it had
 to wait, start again from the cwnd check, which the queue then admits at
 once; then cwnd check and egress_cap::try_take back to back with no await
 before the send (a take that still fails, because another sender took the
-refill first, queues again). NODE-CAP ADMISSION IS FIFO: each waiting
-stream and each waiting QUIC connection is one entry, served in the order
-it queued (staggered timers, woken by give-backs). The queue holds a waker
+refill first, queues again). NODE-CAP ADMISSION IS IN ORDER: each waiting
+stream and each waiting QUIC connection is one entry, and poll_admit admits
+a waiter only when the bucket holds its datagram PLUS one for every waiter
+queued ahead of it (counted up to MAX_ADMISSION_WAKERS), so a waiter that
+polls first cannot take another's turn. Nothing is set aside: a waiter
+ahead that has not polled yet takes its datagram from the same level when
+it does. Timers (staggered by place) decide only when a waiter looks; a late
+timer delays that waiter, never reorders. Without the level check, waiters
+due on one tick were admitted in poll order and a re-armed waiter lost every
+tie (one stream in three sent nothing in 2 s at 1524 streams). After
+Admission::Waited the stream re-checks cwnd and calls again; that call
+takes its turn without queueing within ADMISSION_PASS (1 ms). Without the
+pass it re-queued at the back on every turn and never sent. A stream held
+by cwnd past the pass queues again. The queue holds a waker
 and a place, never bytes. So connections share the cap by their number of
 waiting senders (no isolation between connections). The wait races the
 stream's deadline (cut at LONG_WAIT and at PACED_WAIT_DEADLINE, check()
@@ -127,7 +138,12 @@ after each cut), so abandonment and its counters mean what they did. Past
 MAX_ADMISSION_WAKERS (1024) queued waiters, newer ones hold no waker but
 keep their place and their staggered timer; no waiter is evicted (evicting
 the oldest sent the longest waiters to the back, and 500 of 1524 streams
-sent once in 2 s). The kept connection
+sent once in 2 s). A waiter's place is counted under the queue lock up to
+MAX_ADMISSION_WAKERS + 1 (so at most 1025 steps per poll, however long the
+queue), and its timer's stagger is clamped to MAX_ADMISSION_WAKERS so
+quic::socket::cap_hold_validity still bounds a QUIC transmit's next poll; a
+waiter further back wakes early, finds the level short of what it owes,
+and waits again. The kept connection
 payment can be stale after a cwnd or cap wait (the bucket refills under
 it): a connection may then exceed its bucket by one datagram per waiting
 stream. That moves capacity between connections only; the node cap is
@@ -194,20 +210,25 @@ the cap's TimeSource, kept in the caller's AdmissionWaiter. The timer is
 STAGGERED: deficit plus one WAKE_DATAGRAM_BYTES of refill per waiter queued
 ahead, so N waiters with one deficit wake one per datagram of refill, oldest
 first, not all N at once. While Pending the cap also holds the caller's
-waker (at most MAX_ADMISSION_WAKERS; past it an entry is dropped WITHOUT
-waking, its waiter keeps its timer); a waiter keeps its queue place across
+waker (at most MAX_ADMISSION_WAKERS; past it a newer waiter is queued with
+no waker and relies on its timer, and no entry is dropped); a waiter keeps its queue place across
 polls, and dropping an AdmissionWaiter removes its entry, so a closed
 connection cannot absorb a wake. Bytes given back (a take that sent less, or a failed send)
 wake one held waker per WAKE_DATAGRAM_BYTES (1200, the QUIC datagram) the
 bucket then holds, and none if it holds less, so legacy give-backs cost N
 waiting QUIC connections nothing until a datagram fits; wakers are woken
-after the lock is released, oldest registration first (a FIFO; overflow
-drops the oldest). An admitted waiter took the slot reserved for it, so
+after the lock is released, oldest holder first; the woken keep their
+places. An admission wakes the oldest waiter still holding a waker (the
+next in line, AdmissionQueue::forget), one wake per admission: a waiter's
+timer is set from its place when it last polled, and waiters that left
+ahead of it since (streams failing at their deadline) make it late. Without
+that wake, 300 streams on a 64 KiB/s cap, failing at their deadline and
+retrying, used 18% of the refill; with it, 100%. An admitted waiter took the slot reserved for it, so
 nobody behind it moves; a waiter dropped while queued wakes the next
 MAX_FOLLOWERS_WOKEN_PER_LEAVE (8) behind it so each re-polls to its new
 place (AdmissionQueue::leave), so N closes cost at most 8 N wakes. Waiters
 further back stay up to one datagram late per such drop until they next
-poll. An entry evicted at MAX_ADMISSION_WAKERS wakes nobody. No waiter wakes before
+poll. No waiter wakes before
 the bucket can admit it. It takes
 nothing; the QUIC socket takes with
 try_take and sends with DemuxSocket::try_send_to_paced, so its datagram is
@@ -802,6 +823,14 @@ Rate calculation on every rate update (peer_connection::paced_rate; #6047):
   With the minimum below the share the connection buckets bound each side:
   QUIC 239332 to 240057 B/s, UDP 249943 to 250106 B/s, with one or four
   streams. No fragment reached the stream deadline in any case.
+  KNOWN LIMITATION on capped nodes: a QUIC connection is one sender in that
+  queue, so its ACKs wait their turn behind queued UDP stream fragments. With
+  100 UDP streams queued on a 500 kB/s cap, the peer sending to this node over
+  QUIC measured srtt 123 ms (41 ms on main, where QUIC won nearly every refill)
+  and a 300 kB transfer took 0.74 s (0.21 s); no losses or congestion events.
+  No ACK priority: quinn does not mark ACK-only transmits and the poller does
+  not know a transmit's size when it polls, so a size rule would be a guess.
+  Only nodes with total-bandwidth-limit are affected.
   CappedCubic::metrics reports the capped window as congestion_window.
   The transport sets the rate when it binds (bind_udp_listener, pinned by
   the_transport_gives_the_endpoint_its_bandwidth_settings); QuicSettings

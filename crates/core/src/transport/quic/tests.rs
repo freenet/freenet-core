@@ -2134,9 +2134,9 @@ fn a_hold_left_by_an_ended_connection_stops_pausing_the_ack_watch() {
 
 /// #5940 step M6: `socket::cap_hold_validity`, without its margin, bounds
 /// the longest wait the real cap gives a QUIC transmit before its poller is
-/// polled again: with the cap at its deepest debt (`DEBT_LIMIT`) and the
-/// most waiters it queues (`MAX_ADMISSION_WAKERS`), the last waiter's timer
-/// is no later than that.
+/// polled again: with the cap at its deepest debt (`DEBT_LIMIT`) and 500
+/// more waiters queued than it holds wakers for (`MAX_ADMISSION_WAKERS`),
+/// the last waiter's timer is no later than that.
 #[test]
 fn cap_hold_validity_bounds_the_longest_admission_wait() {
     use super::socket::{CAP_HOLD_VALIDITY_MARGIN, cap_hold_validity};
@@ -2150,7 +2150,9 @@ fn cap_hold_validity_bounds_the_longest_admission_wait() {
         // Past the debt limit: the rest is forgiven.
         let deepest = cap.burst_bytes() + 2 * rate * DEBT_LIMIT.as_secs();
         cap.charge_unpaced(deepest as usize);
-        let mut waiters: Vec<AdmissionWaiter> = (0..MAX_ADMISSION_WAKERS)
+        // More than the queue holds wakers for: the queue keeps every place,
+        // and the stagger counts at most `MAX_ADMISSION_WAKERS` ahead.
+        let mut waiters: Vec<AdmissionWaiter> = (0..MAX_ADMISSION_WAKERS + 500)
             .map(|_| AdmissionWaiter::default())
             .collect();
         for waiter in &mut waiters {

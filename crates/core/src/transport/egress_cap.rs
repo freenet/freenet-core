@@ -85,7 +85,14 @@
 //!
 //! When the cap binds, the `n` waiters are served in turn, so each gets a
 //! datagram about every `n * 1200 / r` seconds at a cap of `r` bytes per
-//! second, without the geometric tail of the earlier race.
+//! second, without the geometric tail of the earlier race. The order does
+//! not depend on which waiter polls first: [`EgressCap::poll_admit`] admits
+//! a waiter only when the bucket also holds a datagram for every waiter
+//! queued ahead of it. Timers decide only when a waiter looks, so a late
+//! timer (tokio's are 1 ms) delays that waiter, never reorders. Two limits:
+//! the queue counts at most [`MAX_ADMISSION_WAKERS`] ahead, and a stream the
+//! queue admitted keeps its turn for [`ADMISSION_PASS`] while it re-checks
+//! its congestion window.
 //! (When only a connection's own bucket binds, its streams are served in
 //! order and a stream's gap is about one round of that connection's
 //! waiting streams.) A stream whose next fragment has not been sent
@@ -348,11 +355,12 @@ struct AdmissionQueue {
 #[derive(Default)]
 struct QueuedWaiters {
     next_ticket: u64,
-    /// Every queued waiter by ticket, so iteration is oldest first, with its
-    /// waker if the queue holds one for it.
-    places: std::collections::BTreeMap<u64, Option<std::task::Waker>>,
-    /// How many entries of `places` hold a waker.
-    held: usize,
+    /// Every queued waiter's ticket; the smallest is the oldest.
+    places: std::collections::BTreeSet<u64>,
+    /// The wakers held, by ticket, at most [`MAX_ADMISSION_WAKERS`]. Kept
+    /// apart from `places` so waking the oldest holders never walks past
+    /// waiters that hold none.
+    wakers: std::collections::BTreeMap<u64, std::task::Waker>,
 }
 
 impl QueuedWaiters {
@@ -360,71 +368,98 @@ impl QueuedWaiters {
         waiting.store(self.places.len(), Ordering::Release);
     }
 
-    fn take_waker(&mut self, ticket: u64) -> Option<std::task::Waker> {
-        let waker = self.places.get_mut(&ticket)?.take();
-        if waker.is_some() {
-            self.held -= 1;
-        }
-        waker
+    /// How many waiters are queued ahead of `ticket`, counted exactly up to
+    /// [`MAX_ADMISSION_WAKERS`] `+ 1`, which means "more than the bound".
+    /// The count stops there, so it costs at most that many steps under the
+    /// lock however long the queue is.
+    fn ahead_of(&self, ticket: u64) -> usize {
+        self.places
+            .range(..ticket)
+            .take(MAX_ADMISSION_WAKERS + 1)
+            .count()
     }
 }
 
 impl AdmissionQueue {
     /// Queue the waiter holding `ticket` (a new one gets the next ticket, at
-    /// the back) with `waker`, and return how many waiters are ahead of it.
-    /// A waiter keeps its place across polls, so its staggered timer stays
-    /// consistent with its position. The queue holds at most
-    /// [`MAX_ADMISSION_WAKERS`] wakers: past that, a waiter is queued with
-    /// no waker, WITHOUT any other being dropped, and relies on its timer,
-    /// which its place still staggers; it holds a waker on a later poll once
-    /// one is free. A count over the waiters ahead, only while someone is
-    /// short of bytes.
+    /// the back) with `waker`, and return how many waiters are ahead of it
+    /// ([`QueuedWaiters::ahead_of`], so at most [`MAX_ADMISSION_WAKERS`]
+    /// `+ 1`). A waiter keeps its place across polls,
+    /// so its staggered timer stays consistent with its position. The queue
+    /// holds at most [`MAX_ADMISSION_WAKERS`] wakers: past that, a waiter is
+    /// queued with no waker, WITHOUT any other being dropped, and relies on
+    /// its timer; it holds a waker on a later poll once one is free.
     fn register(&self, ticket: &mut Option<u64>, waker: &std::task::Waker) -> usize {
         let mut queue = self.inner.lock();
         let t = match *ticket {
-            Some(t) if queue.places.contains_key(&t) => t,
+            Some(t) if queue.places.contains(&t) => t,
             _ => {
                 let t = queue.next_ticket;
                 queue.next_ticket += 1;
-                queue.places.insert(t, None);
+                queue.places.insert(t);
                 *ticket = Some(t);
                 t
             }
         };
-        let held = queue.held;
-        let slot = queue.places.get_mut(&t).expect("queued above");
-        match slot {
-            Some(held_waker) => {
-                if !held_waker.will_wake(waker) {
-                    *held_waker = waker.clone();
+        let room = queue.wakers.len() < MAX_ADMISSION_WAKERS;
+        match queue.wakers.get_mut(&t) {
+            Some(held) => {
+                if !held.will_wake(waker) {
+                    *held = waker.clone();
                 }
             }
-            None if held < MAX_ADMISSION_WAKERS => {
-                *slot = Some(waker.clone());
-                queue.held += 1;
+            None if room => {
+                queue.wakers.insert(t, waker.clone());
             }
             None => {}
         }
         queue.sync(&self.waiting);
-        queue.places.range(..t).count()
+        queue.ahead_of(t)
     }
 
+    /// How many waiters are queued ahead of the one holding `ticket`
+    /// ([`QueuedWaiters::ahead_of`]); for a waiter not queued, every queued
+    /// one is ahead of it. No lock when nobody waits.
+    fn ahead(&self, ticket: Option<u64>) -> usize {
+        if self.waiting.load(Ordering::Acquire) == 0 {
+            return 0;
+        }
+        let queue = self.inner.lock();
+        match ticket {
+            Some(t) if queue.places.contains(&t) => queue.ahead_of(t),
+            _ => queue.places.len().min(MAX_ADMISSION_WAKERS + 1),
+        }
+    }
+
+    /// Remove an admitted waiter's place, and wake the oldest waiter still
+    /// holding a waker: the next in line. Its timer was set from its place
+    /// when it last polled, and waiters ahead that left since (streams
+    /// failing at their deadline) made that timer late; woken now, it
+    /// re-polls from its current place, so the bucket's refill is not left
+    /// unused while it sleeps. One wake per admission. Woken after the lock
+    /// is released.
     fn forget(&self, ticket: &mut Option<u64>) {
         let Some(t) = ticket.take() else {
             return;
         };
-        let mut queue = self.inner.lock();
-        queue.take_waker(t);
-        queue.places.remove(&t);
-        queue.sync(&self.waiting);
+        let next = {
+            let mut queue = self.inner.lock();
+            queue.wakers.remove(&t);
+            queue.places.remove(&t);
+            queue.sync(&self.waiting);
+            queue.wakers.pop_first().map(|(_, waker)| waker)
+        };
+        if let Some(waker) = next {
+            waker.wake();
+        }
     }
 
     /// Remove a waiter that is gone without taking its slot (its connection
     /// closed) and wake the next [`MAX_FOLLOWERS_WOKEN_PER_LEAVE`] waiters
-    /// queued behind it, so each re-polls and moves its staggered timer one
-    /// datagram earlier, to its new place. Bounded so connections closing
-    /// one by one in a long queue cost a constant number of wakes each, not
-    /// one per follower.
+    /// holding wakers behind it, so each re-polls and moves its staggered
+    /// timer to its new place. Bounded so connections closing one by one in
+    /// a long queue cost a constant number of wakes each, not one per
+    /// follower.
     ///
     /// Residual: a waiter further back keeps its old deadline, at most one
     /// datagram late per drop ahead of it since it last polled; it fixes
@@ -433,16 +468,16 @@ impl AdmissionQueue {
     fn leave(&self, ticket: u64) {
         let followers: Vec<std::task::Waker> = {
             let mut queue = self.inner.lock();
-            queue.take_waker(ticket);
-            if queue.places.remove(&ticket).is_none() {
+            queue.wakers.remove(&ticket);
+            if !queue.places.remove(&ticket) {
                 return;
             }
             queue.sync(&self.waiting);
             queue
-                .places
+                .wakers
                 .range(ticket..)
                 .take(MAX_FOLLOWERS_WOKEN_PER_LEAVE)
-                .filter_map(|(_, waker)| waker.clone())
+                .map(|(_, waker)| waker.clone())
                 .collect()
         };
         for waker in followers {
@@ -450,20 +485,17 @@ impl AdmissionQueue {
         }
     }
 
-    /// Take up to `n` wakers, oldest waiter first. The woken keep their
+    /// Take up to `n` wakers, oldest holder first. The woken keep their
     /// places.
     fn take_oldest_wakers(&self, n: usize) -> Vec<std::task::Waker> {
         let mut queue = self.inner.lock();
-        let mut woken = Vec::new();
-        for waker in queue.places.values_mut() {
-            if woken.len() == n {
+        let mut woken = Vec::with_capacity(n.min(queue.wakers.len()));
+        while woken.len() < n {
+            let Some((_, waker)) = queue.wakers.pop_first() else {
                 break;
-            }
-            if let Some(waker) = waker.take() {
-                woken.push(waker);
-            }
+            };
+            woken.push(waker);
         }
-        queue.held -= woken.len();
         woken
     }
 }
@@ -710,10 +742,12 @@ impl EgressCap {
 
     /// Poll form of the admission check, for a sender that is polled rather
     /// than one that can sleep and retry (a QUIC endpoint's
-    /// `UdpPoller::poll_writable`, #5940). `Ready` when [`Self::try_take`] of
-    /// `bytes` would succeed now (the same predicate at the same instant);
-    /// otherwise `Pending`, with `waiter` holding a timer on the cap's time
-    /// source that wakes `cx` when the rate has made up the deficit. Takes
+    /// `UdpPoller::poll_writable`, #5940). `Ready` when the bucket holds
+    /// `bytes` plus one [`WAKE_DATAGRAM_BYTES`] for every waiter queued ahead
+    /// of `waiter` (so [`Self::try_take`] of `bytes` would succeed at the same
+    /// instant, and no waiter ahead loses its turn); otherwise `Pending`,
+    /// with `waiter` holding a timer on the cap's time source that wakes `cx`
+    /// when the rate has made up the deficit. Takes
     /// nothing: the sender then takes or is charged as it sends, and another
     /// sender may take the bytes first, in which case the next poll is
     /// `Pending` again.
@@ -731,8 +765,8 @@ impl EgressCap {
     /// of refill for every waiter registered ahead of it, so when N waiters
     /// share one deficit, each datagram's worth of refill wakes one of them,
     /// oldest first, instead of all N. A waiter keeps its place in the queue
-    /// across polls. An admitted waiter takes the slot the stagger reserved
-    /// for it, so nobody behind it moves. A waiter dropped while queued
+    /// across polls. An admitted waiter takes the datagram owed to it, so
+    /// nobody behind it moves. A waiter dropped while queued
     /// (its connection closed) wakes the next
     /// [`MAX_FOLLOWERS_WOKEN_PER_LEAVE`] waiters behind it, which re-poll and
     /// move their timers to their new places; waiters further back stay up
@@ -756,9 +790,24 @@ impl EgressCap {
             "an admission of {bytes} bytes is larger than the burst and could never be Ready"
         );
         let cost = self.cost_ns(bytes as u64);
+        // What the waiters ahead are owed: one datagram each, clamped so
+        // `quic::socket::cap_hold_validity` bounds the time to a QUIC
+        // transmit's next poll however long the queue is.
+        let owed = |ahead: usize| {
+            i64::try_from(ahead.min(MAX_ADMISSION_WAKERS))
+                .unwrap_or(i64::MAX)
+                .saturating_mul(self.cost_ns(WAKE_DATAGRAM_BYTES as u64))
+        };
         loop {
             let now = self.now();
-            let deficit = match self.admits(self.empty_at_ns.load(Ordering::Acquire), now, cost) {
+            let ahead = self.admission.ahead(waiter.ticket);
+            // Admitted only when the bucket also holds a datagram for every
+            // waiter ahead, so a waiter that polls first cannot take a
+            // datagram that is another's turn. Nothing is set aside: a
+            // waiter ahead that has not polled yet takes its datagram when
+            // it does, from the same level.
+            let need = cost.saturating_add(owed(ahead));
+            let deficit = match self.admits(self.empty_at_ns.load(Ordering::Acquire), now, need) {
                 Ok(_) => {
                     waiter.timer = None;
                     self.admission.forget(&mut waiter.ticket);
@@ -770,19 +819,23 @@ impl EgressCap {
             self.stats.refusals.fetch_add(1, Ordering::Relaxed);
             let ahead = self.admission.register(&mut waiter.ticket, cx.waker());
             waiter.queue = Some(Arc::downgrade(&self.admission));
+            let need = cost.saturating_add(owed(ahead));
             // Bytes given back between the check above and the registration
             // woke nobody; check once more so they are not missed.
             if self
-                .admits(self.empty_at_ns.load(Ordering::Acquire), self.now(), cost)
+                .admits(self.empty_at_ns.load(Ordering::Acquire), self.now(), need)
                 .is_ok()
             {
                 continue;
             }
-            let stagger = i64::try_from(ahead)
-                .unwrap_or(i64::MAX)
-                .saturating_mul(self.cost_ns(WAKE_DATAGRAM_BYTES as u64));
-            let wake_at = u64::try_from(now.saturating_add(deficit).saturating_add(stagger))
-                .unwrap_or(u64::MAX);
+            // When the bucket will hold this waiter's datagram and one for
+            // each waiter ahead: the stagger, from the level now.
+            let deficit = deficit.max(
+                self.admits(self.empty_at_ns.load(Ordering::Acquire), now, need)
+                    .err()
+                    .unwrap_or(0),
+            );
+            let wake_at = u64::try_from(now.saturating_add(deficit)).unwrap_or(u64::MAX);
             if !matches!(&waiter.timer, Some((at, _)) if *at <= wake_at) {
                 waiter.timer = None;
             }
@@ -822,7 +875,7 @@ impl EgressCap {
     /// How many `Pending` [`Self::poll_admit`] wakers the cap holds.
     #[cfg(test)]
     pub(crate) fn admission_waker_count(&self) -> usize {
-        self.admission.inner.lock().held
+        self.admission.inner.lock().wakers.len()
     }
 
     /// How many [`Self::poll_admit`] callers are queued, with or without a
@@ -1096,7 +1149,21 @@ pub(crate) struct StreamPacing {
     /// place is given up when the fragment is admitted, so the next fragment
     /// queues at the back.
     waiter: AdmissionWaiter,
+    /// When [`Self::wait_for_admission`] last returned [`Admission::Waited`]
+    /// (ns on the caller's clock): the queue admitted this fragment, and its
+    /// caller re-checks cwnd before taking. See [`ADMISSION_PASS`].
+    admitted_at_ns: Option<u64>,
 }
+
+/// How long an admission after a wait stays good for the take
+/// ([`StreamPacing::wait_for_admission`]). `poll_admit` gives up the
+/// waiter's place when it admits it, and the stream re-checks its
+/// congestion window before taking, so without a pass the next poll would
+/// queue it again at the back, behind every waiter, and it would never reach
+/// the front. One tokio timer tick: a stream whose window was open takes
+/// within it; one held up longer by its window queues again, since it could
+/// not use its turn.
+pub(crate) const ADMISSION_PASS: Duration = Duration::from_millis(1);
 
 /// How [`StreamPacing::wait_for_admission`] ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1117,6 +1184,7 @@ impl StreamPacing {
             connection_slept: Duration::ZERO,
             long_reported: false,
             waiter: AdmissionWaiter::default(),
+            admitted_at_ns: None,
         }
     }
 
@@ -1217,20 +1285,31 @@ impl StreamPacing {
     /// abandoned) while it waits. One waiter per stream, so streams and QUIC
     /// connections are admitted in the order they queued (see "Node-wide
     /// egress cap" in `.claude/rules/transport.md` for why this replaced the
-    /// race of jittered sleeps).
+    /// race of jittered sleeps). After [`Admission::Waited`] the caller
+    /// re-checks cwnd and calls again; that call takes the turn it was given
+    /// without queueing, within [`ADMISSION_PASS`].
     pub(crate) async fn wait_for_admission<T: TimeSource>(
         &mut self,
         time_source: &T,
         cap: &EgressCap,
         bytes: usize,
     ) -> Result<Admission, Duration> {
+        if let Some(at) = self.admitted_at_ns.take() {
+            let since = time_source.now_nanos().saturating_sub(at);
+            // The take that follows checks the bucket itself; if another
+            // sender took the datagram meanwhile, the stream queues again.
+            if since <= ADMISSION_PASS.as_nanos() as u64 {
+                return Ok(Admission::Now);
+            }
+        }
         let mut waited = false;
         loop {
             let limit = self.sleep_limit(time_source);
             let before = time_source.now_nanos();
-            // Dropped when the cap admits first: a cancelable sleep leaves
-            // nothing behind on a `VirtualTime`.
-            let mut cut = time_source.sleep_cancelable(limit);
+            // Built at the first `Pending`, so a fragment admitted at once
+            // allocates no timer. Dropped when the cap admits first: a
+            // cancelable sleep leaves nothing behind on a `VirtualTime`.
+            let mut cut = None;
             let waiter = &mut self.waiter;
             let mut polled = false;
             let admitted = std::future::poll_fn(|cx| {
@@ -1238,18 +1317,21 @@ impl StreamPacing {
                     return Poll::Ready(true);
                 }
                 polled = true;
-                cut.as_mut().poll(cx).map(|()| false)
+                cut.get_or_insert_with(|| time_source.sleep_cancelable(limit))
+                    .as_mut()
+                    .poll(cx)
+                    .map(|()| false)
             })
             .await;
             waited |= polled;
             self.cap_slept += Duration::from_nanos(time_source.now_nanos().saturating_sub(before));
             self.check(time_source, cap)?;
             if admitted {
-                return Ok(if waited {
-                    Admission::Waited
-                } else {
-                    Admission::Now
-                });
+                if !waited {
+                    return Ok(Admission::Now);
+                }
+                self.admitted_at_ns = Some(time_source.now_nanos());
+                return Ok(Admission::Waited);
             }
         }
     }

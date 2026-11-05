@@ -95,8 +95,9 @@ pub(crate) const CAP_HOLD_VALIDITY_MARGIN: u32 = 2;
 /// `rate_bytes_per_sec`: [`CAP_HOLD_VALIDITY_MARGIN`] times the longest the
 /// cap makes one waiting transmit wait before its poller is polled again.
 /// That is the cap's debt limit (unpaced sends may run the bucket that far
-/// into debt) plus one datagram's refill for every waiter that can be queued
-/// ahead of it (`MAX_ADMISSION_WAKERS`) and for its own. A held poller of a
+/// into debt) plus one datagram's refill for every waiter its timer counts
+/// ahead of it (at most `MAX_ADMISSION_WAKERS`, however long the queue: the
+/// stagger is clamped there) and for its own. A held poller of a
 /// live connection is polled again within that, at its timer; one that is
 /// not was left behind by a connection that ended.
 ///
