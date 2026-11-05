@@ -22706,7 +22706,7 @@ fn test_quic_data_metadata_and_stream_on_different_paths() {
         "data arrived on UDP, a stream",
     ] {
         assert!(
-            split.iter().any(|r| r.what == kind),
+            split.iter().any(|r| r.what.starts_with(kind)),
             "premise: {kind} while on the path: {}",
             data.dump()
         );
@@ -22751,4 +22751,73 @@ fn test_quic_data_determinism_at_100_percent() {
     assert_eq!(first.0.len(), second.0.len(), "same number of records");
     assert_eq!(first.1, second.1, "same path counters");
     assert_eq!(first.2, second.2, "same mesh");
+}
+
+/// S7: a stream that started on UDP before its pair's path took data finishes on
+/// UDP, and the pair's next stream goes on the path. The first operation is a PUT
+/// of a 4 MiB state fired at 4 s, without waiting for the ring to form, while paths
+/// are still coming up (2 to 10 s after promotion), at UDP's rate of about 1.25 MB/s.
+/// The other operations follow a second apart, so they overlap it.
+#[test_log::test]
+fn test_quic_data_stream_started_on_udp_finishes_on_udp() {
+    let data = run_quic_data_sim(
+        "quic-data-s7",
+        0x5940_E5B9_0007,
+        QuicDataSim {
+            contracts: vec![(0x73, 4 * 1024 * 1024)],
+            warm_up: false,
+            wait_for_join: false,
+            // The client waits one interval before the first operation too.
+            op_interval: Duration::from_secs(1),
+            ..QuicDataSim::default()
+        },
+        quic_data_everywhere(100),
+    );
+    data.assert_healthy();
+    let records = data.run.trace.records();
+    // Premise and claim: a pair whose receiver saw a UDP stream begin before the
+    // sender enabled data and end after it, the stream not resent on the path.
+    let straddling: Vec<_> = records
+        .iter()
+        .filter(|r| r.what == "DataEnabled")
+        .filter(|enabled| {
+            let (sender, receiver) = (enabled.node, enabled.peer);
+            let of = data.run.trace.of(receiver, sender);
+            let began = of
+                .iter()
+                .any(|r| r.what == "data arrived on UDP, a stream" && r.at < enabled.at);
+            let ended = of.iter().any(|r| {
+                r.what == "data arrived on UDP, the last fragment of a stream" && r.at > enabled.at
+            });
+            began && ended
+        })
+        .collect();
+    assert!(
+        !straddling.is_empty(),
+        "premise: a UDP stream was in flight when its pair's path took data: {}",
+        data.dump()
+    );
+    for enabled in &straddling {
+        // The pair's later streams went on the path.
+        let path = data
+            .run
+            .trace
+            .paths()
+            .into_iter()
+            .find(|p| {
+                p.node == enabled.node && p.peer == enabled.peer && p.session == enabled.session
+            })
+            .expect("the sender's path");
+        assert_eq!(path.totals.on_udp + path.totals.dropped, 0, "{path:?}");
+    }
+    let totals = data.run.trace.path_totals();
+    assert!(
+        totals.sent[2] > 0,
+        "later streams went on the paths: {totals:?}"
+    );
+    let late = data.udp_data_while_on_the_path();
+    assert!(
+        late.is_empty(),
+        "a stream began on UDP while on the path: {late:#?}"
+    );
 }

@@ -1118,14 +1118,16 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         // Short itself is always delivered, as on UDP.
         self.dispatched_msg_hashes.put(Self::msg_hash(&bytes), ());
         self.note_quic_delivery(|| {
-            let decoded = bincode::deserialize::<crate::message::NetMessage>(&bytes).is_ok();
+            let decoded = bincode::deserialize::<crate::message::NetMessage>(&bytes);
             format!(
                 "received a short on the path, {} B, {}",
                 bytes.len(),
-                if decoded {
-                    "a real message"
-                } else {
-                    "not decoded"
+                match &decoded {
+                    Ok(message) => format!(
+                        "a real message, tx {}",
+                        crate::message::MessageStats::id(message)
+                    ),
+                    Err(_) => "not decoded".to_string(),
                 }
             )
         });
@@ -3193,7 +3195,14 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                 // redundant embedded-metadata copy, never the ShortMessage itself.
                 self.dispatched_msg_hashes.put(Self::msg_hash(&bytes), ());
                 self.sample_inbound_concurrency(true, queued_nanos);
-                self.note_udp_data("a short");
+                if self.quic_path.is_some() {
+                    self.note_quic_delivery(|| {
+                        let tx = bincode::deserialize::<crate::message::NetMessage>(&bytes)
+                            .map(|message| crate::message::MessageStats::id(&message).to_string())
+                            .unwrap_or_default();
+                        format!("data arrived on UDP, a short, tx {tx}")
+                    });
+                }
                 Ok(Some(bytes))
             }
             AckConnection { result: Err(cause) } => {
