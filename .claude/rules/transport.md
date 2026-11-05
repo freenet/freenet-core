@@ -1904,9 +1904,28 @@ QUIC send route (#5940 e5b-6, quic/upgrade/data_route.rs,
   route, so a connection with no route (shadow, the default on Linux and macOS)
   sends without taking the session's lock. enable_data runs once per activation
   (debug assertion); a second route would orphan the first one's worker.
-  NOT_ACCEPTING_DATA: this node's gating or the peer's is wrong. Logged once per
-  path, counted (data_refused, and every time), new sends go on UDP and the path
-  stays up. send_data has three states so a send racing the refusal does not trip
+  A path gone dark: the first send timeout that counts toward the stall close
+  (nothing acknowledged for the window, no cap hold) makes the path suspect
+  (QuicPath::is_suspect, suspect_entered). data_route() then gives no route and
+  the worker sends what it takes on UDP, so new data goes on UDP while sends
+  already on the path stay there (a resend could deliver twice). The first time
+  it is asked after the acknowledgement count moved (quinn's keepalive brings one
+  within 15 s on a live path), the path takes data again (suspect_left). Without
+  it every short into a dark path ends MaybeDelivered(TimedOut), is never resent
+  and is lost, and an operation's retry lands in the same place until quinn's
+  idle timeout. The stall close and the idle timeout still recycle a path that
+  stays dark.
+  Receiver side: a path whose own data bit is 0 stops the first data frame with
+  NOT_ACCEPTING_DATA and closes the path with DOWNGRADE REFUSAL_CLOSE_DELAY (2 s)
+  later (closed_refusing_data, a WARN once per path). The delay lets the stops
+  reach the sender first: a sender that sees the close before a stream's stop
+  drops the stream, where the stop sends it on UDP. Without the close, a Short of
+  one packet is acknowledged before its stop arrives, so its sender reads Sent,
+  never clears send_data and loses every short on the path. The pair then
+  negotiates again after the normal backoff.
+  NOT_ACCEPTING_DATA at the sender: this node's gating or the peer's is wrong.
+  Logged once per path, counted (data_refused, and every time), and new sends go
+  on UDP; the receiver closes the path. send_data has three states so a send racing the refusal does not trip
   debug_assert_carries_data. A small send acked before the stop is lost, and that
   count is the only sign of it.
   Telemetry: a transfer on a path emits transfer_started, _completed and _failed
