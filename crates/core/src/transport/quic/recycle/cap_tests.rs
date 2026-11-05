@@ -513,3 +513,25 @@ fn the_transport_gives_the_endpoint_its_bandwidth_settings() {
         "the window is reported once the endpoint is built"
     );
 }
+
+/// Shadow paths carry only control frames, a few dozen bytes each, below the
+/// cap's two-datagram floor. So a limit, even at the 64 KiB/s floor, does not
+/// change when a handshake and a control-sized message complete: the virtual
+/// times match exactly with and without it.
+#[test]
+fn a_limit_does_not_delay_a_control_sized_exchange() {
+    bounded(|| async move {
+        use crate::transport::peer_connection::MIN_BANDWIDTH_LIMIT;
+        let mut finished = Vec::new();
+        for (subnet, rate) in [
+            (3, QuicRateLimit::default()),
+            (4, QuicRateLimit::new(Some(MIN_BANDWIDTH_LIMIT), None)),
+        ] {
+            let _seed = crate::config::GlobalRng::seed_guard(0x5940_E5B7);
+            let link = Link::new(&format!("quic-cap-control-{subnet}"), subnet, rate, None).await;
+            let elapsed = link.send(32, Duration::from_secs(10)).await;
+            finished.push((elapsed, link.time.now_nanos()));
+        }
+        assert_eq!(finished[0], finished[1], "with and without a limit");
+    })
+}
