@@ -1688,6 +1688,8 @@ fn test_high_latency_timeout_regression() {
 
 /// Test: Use actual SimulationSocket inside Turmoil.
 /// This verifies that the real in-memory socket works with Turmoil's deterministic scheduler.
+/// It drives turmoil itself with `sim.run()`, so the VirtualTime it registers stays
+/// at 0: nothing here (no QUIC endpoint, no time-based fault rule) runs on it.
 #[test]
 fn test_turmoil_with_real_simulation_socket() -> turmoil::Result {
     let network_name = "turmoil-test";
@@ -21469,6 +21471,68 @@ fn test_quic_endpoint_down_closes_every_path() {
             .all(|offer| offer.at <= fallbacks[0].at),
         "no offer after Down: {}",
         run.dump()
+    );
+}
+
+/// The controlled (turmoil) runner moves the network's VirtualTime with its own
+/// clock, so a timer on that clock fires: the gateway's endpoint failure, set for
+/// 5 s on the path clock, happens at 5 s, and VirtualTime ends near the run's
+/// length. Before the runner moved it, VirtualTime read 0 for the whole run and
+/// the failure never happened.
+#[test_log::test]
+fn test_controlled_simulation_advances_virtual_time() {
+    use freenet::dev_tool::NodeLabel;
+    const NETWORK: &str = "controlled-virtual-time";
+    const SEED: u64 = 0x5940_7117_0001;
+    const FAIL_AT: Duration = Duration::from_secs(5);
+    const WAIT: Duration = Duration::from_secs(20);
+    setup_deterministic_state(SEED);
+    let rt = create_runtime();
+    let gateway = NodeLabel::gateway(NETWORK, 0);
+    let (sim, trace, time, gateway_addr) = rt.block_on(async {
+        let mut sim = SimNetwork::new(NETWORK, 1, 1, 7, 3, 10, 2, SEED).await;
+        sim.with_transport_quic("shadow");
+        let trace = sim.quic_upgrade_trace();
+        let gateway_addr = sim.all_node_addresses()[&gateway];
+        trace.fail_endpoint_at(gateway_addr, FAIL_AT);
+        let time = sim.virtual_time().clone();
+        (sim, trace, time, gateway_addr)
+    });
+    drop(rt);
+    let (no_operations, max_duration) = (Vec::new(), Duration::from_secs(60));
+    let result = sim.run_controlled_simulation(SEED, no_operations, max_duration, WAIT);
+    assert!(
+        result.turmoil_result.is_ok(),
+        "simulation failed: {:?}",
+        result.turmoil_result.err()
+    );
+    // The client sleeps 3 s, fires no operation and waits `WAIT`, so the run
+    // lasts at least that long, and VirtualTime with it.
+    let now = Duration::from_nanos(time.now_nanos());
+    assert!(
+        now >= WAIT + Duration::from_secs(3),
+        "VirtualTime followed the run: {now:?}"
+    );
+    let failed = trace.matching(gateway_addr, "failed the endpoint at ");
+    assert_eq!(
+        failed.len(),
+        1,
+        "the 5 s timer fired once: {:#?}",
+        trace.records()
+    );
+    // The time the record carries is on the path clock, VirtualTime itself; a
+    // record's `at` is on its host's own clock, which under turmoil does not
+    // start at the run's start.
+    let fired_ms: u64 = failed[0]
+        .what
+        .trim_start_matches("failed the endpoint at ")
+        .trim_end_matches(" ms")
+        .parse()
+        .expect("the record carries its time");
+    let fired = Duration::from_millis(fired_ms);
+    assert!(
+        fired >= FAIL_AT && fired <= FAIL_AT + Duration::from_secs(1),
+        "it fired at 5 s on VirtualTime: {fired:?}"
     );
 }
 

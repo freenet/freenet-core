@@ -274,7 +274,7 @@ where
     }
 
     // Run the simulation
-    let result = sim.run();
+    let result = super::run_turmoil_on_virtual_time(&mut sim, &virtual_time);
 
     // Cleanup
     unregister_network_time_source(&network_name);

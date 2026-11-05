@@ -433,6 +433,34 @@ impl ScheduledOperation {
     }
 }
 
+/// Steps turmoil to the end of the run, as `turmoil::Sim::run` does, and moves
+/// the network's `VirtualTime` to turmoil's elapsed time after every step, the way
+/// the direct runner's time driver follows tokio's clock.
+///
+/// Two differences from `Sim::run`: it steps once even with no client registered
+/// (`run` returns at once then, and `step` reports the run finished after one
+/// tick), and VirtualTime trails each host's tokio clock by up to one tick, since
+/// it moves after the step (1 ms at turmoil's default tick; deterministic).
+///
+/// The node tasks run on turmoil's clock, but some parts of a node read the
+/// network's `VirtualTime` instead: each QUIC endpoint and path (quinn's timers,
+/// the path's send deadlines and ack watch, `get_socket_virtual_time`), and the
+/// fault injector's time-based rules. Without this the clock stayed at zero for
+/// the whole run, so none of those timers ever fired and a rule starting after
+/// zero never applied.
+pub(crate) fn run_turmoil_on_virtual_time(
+    sim: &mut turmoil::Sim<'_>,
+    time: &VirtualTime,
+) -> turmoil::Result {
+    loop {
+        let finished = sim.step()?;
+        time.advance_to(u64::try_from(sim.elapsed().as_nanos()).unwrap_or(u64::MAX));
+        if finished {
+            return Ok(());
+        }
+    }
+}
+
 /// Packet-delivery decision consulted by every `SimulationSocket` (via the
 /// per-network delivery callback installed by `run_controlled_simulation` and
 /// `run_simulation_direct`) so an injected node crash or partition actually
@@ -5275,7 +5303,7 @@ impl SimNetwork {
         });
 
         // Run the simulation
-        sim.run()
+        run_turmoil_on_virtual_time(&mut sim, &self.virtual_time)
     }
 
     /// Run a deterministic simulation with controlled events using Turmoil.
@@ -5540,7 +5568,7 @@ impl SimNetwork {
             HashMap::new();
         // Pre-seeded contract stores for nodes with SeedContract operations.
         // Wrapped in Arc<Mutex> so closures can look up their store at
-        // startup (after seed_ops populates the map, before sim.run()).
+        // startup (after seed_ops populates the map, before the run).
         let contract_stores: Arc<
             Mutex<HashMap<NodeLabel, crate::wasm_runtime::InMemoryContractStore>>,
         > = Arc::new(Mutex::new(HashMap::new()));
@@ -5776,7 +5804,7 @@ impl SimNetwork {
         let label_to_key: HashMap<NodeLabel, _> = labels.into_iter().collect();
 
         // Clone the network name for the client closure (the outer
-        // `network_name` is still needed after `sim.run()` for topology capture).
+        // `network_name` is still needed after the run for topology capture).
         let network_name_for_client = network_name.clone();
 
         // Optional pre-operation join-convergence barrier (see
@@ -5964,7 +5992,7 @@ impl SimNetwork {
         });
 
         // Run the simulation
-        let turmoil_result = sim.run();
+        let turmoil_result = run_turmoil_on_virtual_time(&mut sim, &self.virtual_time);
 
         // Capture topology snapshots BEFORE self is dropped (which clears them)
         let topology_snapshots = get_all_topology_snapshots(&network_name);
@@ -6262,7 +6290,7 @@ impl SimNetwork {
         });
 
         // Run the simulation
-        sim.run()
+        run_turmoil_on_virtual_time(&mut sim, &self.virtual_time)
             .map_err(|e| anyhow::anyhow!("Turmoil simulation failed: {:?}", e))
     }
 
@@ -7440,6 +7468,94 @@ use crate::contract::OperationMode;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The helper moves VirtualTime with turmoil's clock: after a run whose client
+    /// sleeps 5 s, VirtualTime reads 5 s, within a tick or two.
+    #[test]
+    fn run_turmoil_on_virtual_time_moves_the_clock_with_the_run() {
+        use crate::simulation::TimeSource;
+        let time = VirtualTime::new();
+        let mut sim = turmoil::Builder::new()
+            .simulation_duration(Duration::from_secs(60))
+            .build();
+        sim.client("sleeper", async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            Ok(())
+        });
+        run_turmoil_on_virtual_time(&mut sim, &time).expect("the run succeeds");
+        let now = Duration::from_nanos(time.now_nanos());
+        assert!(
+            now >= Duration::from_secs(5)
+                && now <= Duration::from_secs(5) + Duration::from_millis(10),
+            "VirtualTime followed the run: {now:?}"
+        );
+    }
+
+    /// Every turmoil runner goes through `run_turmoil_on_virtual_time`, checked in
+    /// each runner's own body. A runner that stepped turmoil any other way
+    /// (`sim.run()`, `turmoil::Sim::run(&mut sim)`) would leave the network's
+    /// VirtualTime at 0, and no QUIC timer or time-based fault rule would fire in
+    /// its runs.
+    #[test]
+    fn turmoil_runners_move_virtual_time() {
+        /// The body of the function whose definition starts with `signature`, by
+        /// brace matching from its first `{`, with comments stripped. The
+        /// signature must occur once, so the scan cannot land on another one.
+        fn fn_body(src: &str, signature: &str) -> String {
+            assert_eq!(
+                src.matches(signature).count(),
+                1,
+                "`{signature}` must occur exactly once in the scraped source"
+            );
+            let start = src.find(signature).expect("counted above");
+            let open = start + src[start..].find('{').expect("the function has a body");
+            let mut depth = 0usize;
+            for (i, byte) in src.bytes().enumerate().skip(open) {
+                match byte {
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return crate::contract::source_pin_util::strip_comments(
+                                &src[open + 1..i],
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            panic!("unbalanced braces in `{signature}`");
+        }
+        // The code before the first test module, so this test's own literals
+        // are not scanned.
+        let production = |src: &'static str| {
+            src.split("\n#[cfg(test)]\nmod ")
+                .next()
+                .expect("split yields at least one part")
+        };
+        let runners = production(include_str!("testing_impl.rs"));
+        let standalone = production(include_str!("testing_impl/turmoil_runner.rs"));
+        for (source, signature) in [
+            (runners, "    pub fn run_simulation<R, F, Fut>("),
+            (runners, "    pub fn run_controlled_simulation("),
+            (runners, "    pub fn run_fdev_test<R>("),
+            (
+                standalone,
+                "pub fn run_turmoil_simulation<R>(config: TurmoilConfig)",
+            ),
+        ] {
+            let body = fn_body(source, signature);
+            assert_eq!(
+                body.matches("run_turmoil_on_virtual_time(&mut sim").count(),
+                1,
+                "`{signature}` steps turmoil through the helper, once"
+            );
+            assert!(
+                !body.contains(".run()") && !body.contains("Sim::run("),
+                "`{signature}` steps turmoil some other way"
+            );
+        }
+    }
 
     #[test]
     fn next_free_sim_port_skips_taken_ports_and_wraps() {

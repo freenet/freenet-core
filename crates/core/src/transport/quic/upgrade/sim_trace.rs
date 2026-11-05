@@ -20,14 +20,19 @@ type Version = (u8, u8, u16);
 /// One thing a node's upgrades did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuicUpgradeRecord {
-    /// On the runtime's clock, which every node shares.
+    /// Since the first record, on the clock of the runtime that recorded it. The
+    /// direct runner has one runtime, so times compare across nodes. Under turmoil
+    /// each host's clock starts when its runtime is built, so compare times only
+    /// within one node.
     pub at: Duration,
     pub node: SocketAddr,
     pub peer: SocketAddr,
-    /// The session's number in its node; 0 for a node with QUIC off.
+    /// The session's number in its node; 0 for a node with QUIC off, and for a
+    /// record about no session (an injected fault, with the node as `peer`).
     pub session: u64,
     /// An `Outcome` in its `Debug` form, or `received ...`, `sent ...`,
-    /// `closed path with ...`, `stale connection ...`, `session ended`.
+    /// `closed path with ...`, `stale connection ...`, `session ended`,
+    /// `injected an Initial`, `failed the endpoint at <ms> ms`.
     pub what: String,
     /// The path permits the node held just after this.
     pub permits: usize,
@@ -124,7 +129,9 @@ impl QuicUpgradeTrace {
         *self.data.release.lock() = Some((real, release));
     }
 
-    /// `node`'s QUIC endpoint driver fails `at` after its transport opens.
+    /// `node`'s QUIC endpoint driver fails `at` after its transport opens, on the
+    /// path clock (the network's VirtualTime in simulation). The node records
+    /// `failed the endpoint at <ms> ms` with that clock's time.
     pub fn fail_endpoint_at(&self, node: SocketAddr, at: Duration) {
         self.data.down_at.lock().insert(node, at);
     }
