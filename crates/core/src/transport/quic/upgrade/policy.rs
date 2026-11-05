@@ -286,7 +286,7 @@ impl QuicPolicy {
         match self.mode {
             QuicMode::Prefer => {
                 let percent = share.percent_at(now);
-                self.log_band(percent);
+                self.log_band(percent, share);
                 if super::slice::in_slice(local, peer, percent) {
                     caps::DATA
                 } else {
@@ -299,7 +299,7 @@ impl QuicPolicy {
 
     /// Report the share at INFO when it enters a new band, so an operator can see
     /// the ramp move.
-    fn log_band(&self, percent: u8) {
+    fn log_band(&self, percent: u8, share: DataShare) {
         let band = log_band(percent);
         let before = self
             .logged_band
@@ -307,7 +307,7 @@ impl QuicPolicy {
         if before != band {
             tracing::info!(
                 data_percent = percent,
-                share = ?self.share,
+                share = ?share,
                 "QUIC data: this node offers data to this share of its pairs"
             );
         }

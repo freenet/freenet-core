@@ -21081,6 +21081,83 @@ fn test_quic_data_carries_a_stream_end_to_end() {
     assert_eq!(stored.as_ref(), state.as_slice());
 }
 
+/// The data ramp over a virtual day: nodes in `prefer` with no
+/// `quic-data-percent` take their share from a ramp that starts with the run.
+/// Churn restarts nodes, so pairs are promoted again through the day, and each
+/// promotion reads the share at its own time: paths set up in the first hours
+/// mostly carry no data (5%), and every path set up after 24 h carries data on
+/// both sides (100%).
+#[test_log::test]
+fn test_quic_data_ramp_turns_on_more_pairs_as_virtual_time_passes() {
+    use freenet::dev_tool::ChurnConfig;
+    const SEED: u64 = 0x5940_7A00_0001;
+    const HOUR: Duration = Duration::from_secs(3600);
+    setup_deterministic_state(SEED);
+    let rt = create_runtime();
+    let (mut sim, trace, nodes) = rt.block_on(async {
+        let mut sim = SimNetwork::new("quic-data-ramp", 1, 5, 7, 3, 10, 2, SEED).await;
+        sim.enable_gateway_ack_version();
+        let trace = sim.quic_upgrade_trace();
+        sim.with_transport_quic("prefer");
+        trace.ramp_data_from(Duration::ZERO);
+        run_as_first_negotiating_release(&trace);
+        let nodes: Vec<_> = sim.all_node_addresses().values().copied().collect();
+        (sim, trace, nodes)
+    });
+    drop(rt);
+    sim.with_churn(ChurnConfig {
+        crash_probability: 0.5,
+        tick_interval: HOUR,
+        recovery_delay: Duration::from_secs(60),
+        max_simultaneous_crashes: Some(2),
+        permanent_crash_rate: 0.0,
+        warmup_delay: Duration::from_secs(60),
+    });
+    sim.run_simulation_direct::<rand::rngs::SmallRng>(SEED, 1, 30, HOUR)
+        .expect("direct simulation should succeed");
+    let run = QuicShadowRun {
+        trace,
+        nodes,
+        logs_events: 0,
+        mesh: Default::default(),
+    };
+    let records = run.trace.records();
+    let established = |from: Duration, to: Duration| {
+        records
+            .iter()
+            .filter(|r| r.what.starts_with("Established(") && r.at >= from && r.at < to)
+            .collect::<Vec<_>>()
+    };
+    let carries = |r: &freenet::dev_tool::QuicUpgradeRecord| {
+        records.iter().any(|d| {
+            d.what == "DataEnabled"
+                && d.node == r.node
+                && d.peer == r.peer
+                && d.session == r.session
+        })
+    };
+    let early = established(Duration::ZERO, 6 * HOUR);
+    let late = established(25 * HOUR, 40 * HOUR);
+    assert!(!early.is_empty(), "paths came up early: {}", run.dump());
+    assert!(
+        !late.is_empty(),
+        "churn brought paths up after a day: {}",
+        run.dump()
+    );
+    let early_data = early.iter().filter(|r| carries(r)).count();
+    assert!(
+        early_data * 4 < early.len(),
+        "early paths are mostly without data ({early_data} of {}): {}",
+        early.len(),
+        run.dump()
+    );
+    assert!(
+        late.iter().all(|r| carries(r)),
+        "every path after 24 h carries data: {}",
+        run.dump()
+    );
+}
+
 /// Shadow on both ends: the whole negotiation runs over a real QUIC connection,
 /// each side counts it established on its own evidence, and no application
 /// traffic touches the path while the nodes carry on over UDP.
