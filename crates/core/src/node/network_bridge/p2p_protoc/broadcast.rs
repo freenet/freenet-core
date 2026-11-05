@@ -744,7 +744,9 @@ impl P2pConnManager {
                     // for its stream's completion (up to
                     // STREAM_COMPLETION_TIMEOUT), and that stream is handed to
                     // the event loop through the bridge, so awaiting it here, on
-                    // the event loop, would hold both until the timeout.
+                    // the event loop, would hold both until the timeout. Unlike
+                    // production's queue lanes, nothing limits how many heals run
+                    // at once.
                     Self::spawn_leg(
                         self.bridge.clone(),
                         op_manager.clone(),
