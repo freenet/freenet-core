@@ -252,12 +252,34 @@ impl CappedCubicFactory {
 
 impl ControllerFactory for CappedCubicFactory {
     fn build(self: Arc<Self>, now: Instant, current_mtu: u16) -> Box<dyn Controller> {
+        #[cfg(feature = "bench")]
+        if lab::INNER_CONTROLLER.load(Ordering::Relaxed) == lab::BBR {
+            return Box::new(CappedCubic::new(
+                Arc::new(quinn::congestion::BbrConfig::default()).build(now, current_mtu),
+                self.rate.clone(),
+                current_mtu,
+            ));
+        }
         Box::new(CappedCubic::new(
             self.cubic.clone().build(now, current_mtu),
             self.rate.clone(),
             current_mtu,
         ))
     }
+}
+
+/// Bench-only switches for the QUIC lab (`quic::lab`). Nothing in a node
+/// sets them.
+#[cfg(feature = "bench")]
+pub(crate) mod lab {
+    use std::sync::atomic::AtomicU8;
+
+    /// The controller [`super::CappedCubicFactory`] wraps: [`CUBIC`] (the
+    /// node's) or [`BBR`]. The cap and the acknowledgement record wrap
+    /// either one the same way.
+    pub(crate) static INNER_CONTROLLER: AtomicU8 = AtomicU8::new(CUBIC);
+    pub(crate) const CUBIC: u8 = 0;
+    pub(crate) const BBR: u8 = 1;
 }
 
 /// The window [`CappedCubic`] allows at `rate` bytes per second over an RTT
