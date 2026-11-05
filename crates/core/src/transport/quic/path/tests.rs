@@ -3195,12 +3195,13 @@ fn a_shadow_path_does_not_send_data() {
 }
 
 /// A path in shadow mode refuses a Short or Stream frame with
-/// `NOT_ACCEPTING_DATA` before anything is charged, and counts it: the
-/// inbound budget it shares with the UDP session is untouched (no charge,
-/// no budget refusal), even when that budget is full. Control frames still
-/// arrive. The sender sees the stop as a failed send.
+/// `NOT_ACCEPTING_DATA` before anything is charged, counts it, and closes the
+/// path with DOWNGRADE after its first refusal, once: the inbound budget it shares
+/// with the UDP session is untouched (no charge, no budget refusal), even when
+/// that budget is full. A control frame sent first still arrives. The close waits
+/// `REFUSAL_CLOSE_DELAY`, so each refused send sees its stop.
 #[test]
-fn a_shadow_path_refuses_data_before_charging_the_budget() {
+fn a_shadow_path_refuses_data_before_charging_the_budget_and_closes() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
         for (subnet, budget) in [
@@ -3216,8 +3217,18 @@ fn a_shadow_path_refuses_data_before_charging_the_budget() {
             .await;
             let (a, time) = (p.a.clone(), p.time());
             let timeout = Duration::from_secs(5);
-            let (short, stream, control) = p
+            let (control, short, stream) = p
                 .drive(async move {
+                    let control = a
+                        .send_control_bounded(
+                            &time,
+                            timeout,
+                            QuicControl::Ready {
+                                attempt: 3,
+                                caps: 0,
+                            },
+                        )
+                        .await;
                     let short = a.send_short_bounded(&time, timeout, &over_window()).await;
                     let stream = a
                         .send_stream_bounded(
@@ -3229,19 +3240,14 @@ fn a_shadow_path_refuses_data_before_charging_the_budget() {
                             None,
                         )
                         .await;
-                    let control = a
-                        .send_control_bounded(
-                            &time,
-                            timeout,
-                            QuicControl::Ready {
-                                attempt: 3,
-                                caps: 0,
-                            },
-                        )
+                    // The close follows the first refusal after the delay.
+                    time.sleep(inbound::REFUSAL_CLOSE_DELAY + Duration::from_secs(1))
                         .await;
-                    (short, stream, control)
+                    (control, short, stream)
                 })
                 .await;
+            assert!(matches!(control, BoundedSend::Sent), "{control:?}");
+            // Both are refused before the close, so each sender sees its stop.
             for (what, outcome) in [("short", short), ("stream", stream)] {
                 let BoundedSend::Failed(SendFailure::Error(QuicSendError::Stopped(code))) = outcome
                 else {
@@ -3249,9 +3255,13 @@ fn a_shadow_path_refuses_data_before_charging_the_budget() {
                 };
                 assert_eq!(code, u64::from(stop_code::NOT_ACCEPTING_DATA), "{what}");
             }
-            assert!(matches!(control, BoundedSend::Sent), "{control:?}");
+            assert!(
+                p.a.quinn_connection().close_reason().is_some(),
+                "the path closed"
+            );
             let stats = p.b.stats();
             assert_eq!(stats.count(QuicInboundOutcome::RefusedNotAcceptingData), 2);
+            assert_eq!(stats.count(QuicInboundOutcome::ClosedRefusingData), 1);
             assert_eq!(p.b.charged_streams_now(), 0, "nothing was charged");
             assert_eq!(p.b.charged(), (0, 0));
             for outcome in [

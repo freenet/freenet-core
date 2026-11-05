@@ -979,6 +979,30 @@ fn data_is_enabled_once_per_activation() {
         #[cfg(not(debug_assertions))]
         session.enable_data(&mut session.state.lock(), attempt);
         assert!(session.data_route().expect("still").is(&first));
+        // A send that timed out with nothing acknowledged for the window makes the
+        // path suspect, and the route gives no path for new data.
+        // The first settle reads what the setup had acknowledged.
+        let now = h.pair.time.now_nanos();
+        first.path().settle(
+            crate::transport::quic::path::SendKind::Short,
+            &BoundedSend::Sent,
+            false,
+            now,
+        );
+        let quiet = now + 11_000_000_000;
+        let timed_out = BoundedSend::Failed(crate::transport::quic::path::SendFailure::NotOpened(
+            crate::transport::quic::path::NotOpened::TimedOut,
+        ));
+        first.path().settle(
+            crate::transport::quic::path::SendKind::Short,
+            &timed_out,
+            false,
+            quiet,
+        );
+        assert!(
+            session.data_route().is_none(),
+            "a suspect path takes no new data"
+        );
         // A route that was never refused: its attempt's end clears the fast path.
         session.end();
         assert!(
