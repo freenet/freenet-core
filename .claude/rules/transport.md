@@ -1204,7 +1204,13 @@ a test passes its own; tests read their own, never the global).
   quic_streamed_sends and quic_stream_permit_waited; quic_bytes_sent and
   quic_bytes_received (quinn's UDP payload counts, reported by change at each 2 s
   tick of the acknowledgement watch, so a path's last tick before it closes is
-  lost); quic_session_ended_with_data_path_<age> (sessions that ended while their
+  lost); quic_sent_packets, quic_lost_packets, quic_lost_bytes and
+  quic_congestion_events (quinn's PathStats, every path including shadow ones, by
+  the same tick); quic_loss_rate_<zero|lt_0_5pct|lt_1pct|lt_2pct|lt_5pct|lt_10pct|
+  lt_20pct|ge_20pct> (paths that sent at least 200 packets in the period, each in
+  the one bucket of its own lost/sent, moved as it changes; a field loss rate
+  without the legacy retransmit ratio's overstatement, and no per-path values);
+  quic_session_ended_with_data_path_<age> (sessions that ended while their
   path's route still carried data); quic_streams_sampled_paths,
   quic_streams_open_ge_<8|16|32|48> and quic_streams_peak_max (per path and period,
   the peak of inbound streams read at once, counted as inbound_concurrency counts

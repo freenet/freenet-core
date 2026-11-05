@@ -20,6 +20,8 @@
 //! | `quic_streamed_sends`, `quic_stream_permit_waited` | streamed-send permits taken, and those that waited |
 //! | `quic_bytes_sent`, `quic_bytes_received` | UDP payload bytes of QUIC paths, from quinn's counts |
 //! | `quic_session_ended_with_data_path_<age>` | sessions that ended under a data path, by the path's age |
+//! | `quic_sent_packets`, `quic_lost_packets`, `quic_lost_bytes`, `quic_congestion_events` | quinn's per-path counts (`PathStats`), shadow paths included, summed over the node's paths |
+//! | `quic_loss_rate_<bucket>` | paths that sent at least 200 packets in the period, by their own lost/sent: `zero`, `lt_0_5pct`, `lt_1pct`, `lt_2pct`, `lt_5pct`, `lt_10pct`, `lt_20pct`, `ge_20pct` |
 //! | `quic_streams_sampled_paths`, `quic_streams_open_ge_<n>`, `quic_streams_peak_max` | per path and period, the peak of inbound streams read at once: the paths sampled, those whose peak reached each level, and the highest peak |
 //!
 //! The waits are the step-3 stream-limit bars: `quic_open_uni_waited` over
@@ -38,6 +40,57 @@ use crate::transport::quic::path::{
 
 /// The gauge's key, uploaded in every snapshot ([`QuicDataSnapshot::upload_keys`]).
 const LIVE_DATA_PATHS: &str = "quic_live_data_paths";
+
+/// A path's loss rate is bucketed once it has sent this many packets in the
+/// period; below it the rate says too little.
+pub(crate) const LOSS_RATE_MIN_SENT: u64 = 200;
+
+/// The upper bounds of the loss-rate buckets after `zero`, in lost packets per
+/// 1000 sent; the last bucket is `ge_20pct`.
+const LOSS_RATE_BOUNDS_PER_MILLE: [u64; 6] = [5, 10, 20, 50, 100, 200];
+
+/// The loss-rate buckets' labels (`quic_loss_rate_<label>`), in order.
+pub(crate) const LOSS_RATE_LABELS: [&str; 8] = [
+    "zero",
+    "lt_0_5pct",
+    "lt_1pct",
+    "lt_2pct",
+    "lt_5pct",
+    "lt_10pct",
+    "lt_20pct",
+    "ge_20pct",
+];
+
+/// The bucket of `lost` packets out of `sent`. Losses found in a window can
+/// be of packets sent before it, so `lost` may pass `sent`: `ge_20pct`.
+fn loss_rate_bucket(lost: u64, sent: u64) -> usize {
+    if lost == 0 {
+        return 0;
+    }
+    let per_mille_times_sent = lost.saturating_mul(1000);
+    1 + LOSS_RATE_BOUNDS_PER_MILLE
+        .iter()
+        .take_while(|bound| per_mille_times_sent >= sent.saturating_mul(**bound))
+        .count()
+}
+
+/// One path's packets in the current period, and the loss-rate bucket it is
+/// counted in. Owned by the path's acknowledgement watch.
+#[derive(Debug, Default)]
+pub(crate) struct PathLossWindow {
+    /// The period the counts belong to; 0 before the first report.
+    epoch: u64,
+    sent: u64,
+    lost: u64,
+    bucket: Option<usize>,
+}
+
+/// The loss counts of one period, under one lock with its period.
+#[derive(Debug, Clone, Copy)]
+struct LossCounts {
+    epoch: u64,
+    rates: [u32; LOSS_RATE_LABELS.len()],
+}
 
 /// The levels `quic_streams_open_ge_<n>` reports, up to the streamed-send limit
 /// (`quic::config::STREAMED_SEND_LIMIT`), which is the bar.
@@ -78,6 +131,11 @@ pub(crate) struct QuicDataCounters {
     bytes_sent: AtomicU64,
     bytes_received: AtomicU64,
     session_ended: [AtomicU64; QuicPathAge::COUNT],
+    sent_packets: AtomicU64,
+    lost_packets: AtomicU64,
+    lost_bytes: AtomicU64,
+    congestion_events: AtomicU64,
+    loss: Mutex<LossCounts>,
     streams_epoch: AtomicU64,
     streams: Mutex<StreamsOpenCounts>,
 }
@@ -99,6 +157,14 @@ impl QuicDataCounters {
             bytes_sent: zero(),
             bytes_received: zero(),
             session_ended: std::array::from_fn(|_| zero()),
+            sent_packets: zero(),
+            lost_packets: zero(),
+            lost_bytes: zero(),
+            congestion_events: zero(),
+            loss: Mutex::new(LossCounts {
+                epoch: 1,
+                rates: [0; LOSS_RATE_LABELS.len()],
+            }),
             streams_epoch: AtomicU64::new(1),
             streams: Mutex::new(StreamsOpenCounts::default()),
         }
@@ -166,6 +232,47 @@ impl QuicDataCounters {
         self.bytes_received.fetch_add(received, Ordering::Relaxed);
     }
 
+    /// A path's packet counts changed by `delta` since its last report. Summed
+    /// node-wide, and added to the path's own window for the period: once the
+    /// window holds [`LOSS_RATE_MIN_SENT`] sent packets the path is counted in
+    /// the bucket of its lost/sent, and moved when that changes, so each path is
+    /// in at most one bucket a period.
+    pub(crate) fn record_path_loss(
+        &self,
+        window: &mut PathLossWindow,
+        delta: crate::transport::quic::recycle::PathLoss,
+    ) {
+        self.sent_packets
+            .fetch_add(delta.sent_packets, Ordering::Relaxed);
+        self.lost_packets
+            .fetch_add(delta.lost_packets, Ordering::Relaxed);
+        self.lost_bytes
+            .fetch_add(delta.lost_bytes, Ordering::Relaxed);
+        self.congestion_events
+            .fetch_add(delta.congestion_events, Ordering::Relaxed);
+        let mut counts = self.loss.lock();
+        if window.epoch != counts.epoch {
+            // A new period: the old bucket was reported and reset with it.
+            *window = PathLossWindow {
+                epoch: counts.epoch,
+                ..PathLossWindow::default()
+            };
+        }
+        window.sent = window.sent.saturating_add(delta.sent_packets);
+        window.lost = window.lost.saturating_add(delta.lost_packets);
+        let bucket =
+            (window.sent >= LOSS_RATE_MIN_SENT).then(|| loss_rate_bucket(window.lost, window.sent));
+        if bucket != window.bucket {
+            if let Some(old) = window.bucket {
+                counts.rates[old] = counts.rates[old].saturating_sub(1);
+            }
+            if let Some(new) = bucket {
+                counts.rates[new] += 1;
+            }
+            window.bucket = bucket;
+        }
+    }
+
     /// A session ended while its path carried data, `age` after it became active.
     pub(crate) fn record_session_ended_with_data_path(&self, age: std::time::Duration) {
         self.session_ended[QuicPathAge::bucket(age) as usize].fetch_add(1, Ordering::Relaxed);
@@ -207,6 +314,15 @@ impl QuicDataCounters {
                 a.load(Ordering::Relaxed)
             }
         };
+        let loss_rate = {
+            let mut counts = self.loss.lock();
+            let rates = counts.rates;
+            if reset {
+                counts.epoch += 1;
+                counts.rates = [0; LOSS_RATE_LABELS.len()];
+            }
+            rates
+        };
         let streams = {
             let mut counts = self.streams.lock();
             if reset {
@@ -230,6 +346,11 @@ impl QuicDataCounters {
             bytes_sent: get(&self.bytes_sent),
             bytes_received: get(&self.bytes_received),
             session_ended_with_data_path: self.session_ended.iter().map(get).collect(),
+            sent_packets: get(&self.sent_packets),
+            lost_packets: get(&self.lost_packets),
+            lost_bytes: get(&self.lost_bytes),
+            congestion_events: get(&self.congestion_events),
+            loss_rate: loss_rate.to_vec(),
             streams_open_paths_sampled: streams.paths_sampled,
             streams_open_ge: streams.ge.to_vec(),
             streams_open_max: streams.max,
@@ -258,6 +379,12 @@ pub struct QuicDataSnapshot {
     pub bytes_received: u64,
     /// By `QuicPathAge`.
     pub session_ended_with_data_path: Vec<u64>,
+    pub sent_packets: u64,
+    pub lost_packets: u64,
+    pub lost_bytes: u64,
+    pub congestion_events: u64,
+    /// Paths by loss-rate bucket, in the order of `LOSS_RATE_LABELS`.
+    pub loss_rate: Vec<u32>,
     pub streams_open_paths_sampled: u32,
     /// By `QUIC_STREAMS_OPEN_THRESHOLDS`.
     pub streams_open_ge: Vec<u32>,
@@ -294,6 +421,11 @@ impl QuicDataSnapshot {
             bytes_sent,
             bytes_received,
             session_ended_with_data_path,
+            sent_packets,
+            lost_packets,
+            lost_bytes,
+            congestion_events,
+            loss_rate,
             streams_open_paths_sampled,
             streams_open_ge,
             streams_open_max,
@@ -352,6 +484,11 @@ impl QuicDataSnapshot {
             session_ended_with_data_path.clone(),
         );
         family(
+            "quic_loss_rate_",
+            LOSS_RATE_LABELS.iter().map(|l| l.to_string()).collect(),
+            loss_rate.iter().map(|n| u64::from(*n)).collect(),
+        );
+        family(
             "quic_streams_open_ge_",
             QUIC_STREAMS_OPEN_THRESHOLDS
                 .iter()
@@ -368,6 +505,10 @@ impl QuicDataSnapshot {
             ("quic_stream_permit_waited", *permit_waited),
             ("quic_bytes_sent", *bytes_sent),
             ("quic_bytes_received", *bytes_received),
+            ("quic_sent_packets", *sent_packets),
+            ("quic_lost_packets", *lost_packets),
+            ("quic_lost_bytes", *lost_bytes),
+            ("quic_congestion_events", *congestion_events),
             (
                 "quic_streams_sampled_paths",
                 u64::from(*streams_open_paths_sampled),
@@ -404,6 +545,11 @@ impl QuicDataSnapshot {
             bytes_sent,
             bytes_received,
             session_ended_with_data_path,
+            sent_packets,
+            lost_packets,
+            lost_bytes,
+            congestion_events,
+            loss_rate,
             streams_open_paths_sampled,
             streams_open_ge: _,
             streams_open_max: _,
@@ -414,6 +560,7 @@ impl QuicDataSnapshot {
             || any(stops)
             || any(inbound)
             || any(session_ended_with_data_path)
+            || loss_rate.iter().any(|n| *n != 0)
             || [
                 *data_enabled,
                 *sends_opened,
@@ -422,6 +569,10 @@ impl QuicDataSnapshot {
                 *permit_waited,
                 *bytes_sent,
                 *bytes_received,
+                *sent_packets,
+                *lost_packets,
+                *lost_bytes,
+                *congestion_events,
                 u64::from(*streams_open_paths_sampled),
             ]
             .iter()
@@ -662,6 +813,77 @@ mod tests {
         assert_eq!(snap.streams_open_paths_sampled, 1);
         assert_eq!(snap.streams_open_ge, vec![1, 0, 0, 0]);
         assert_eq!(snap.streams_open_max, 9);
+    }
+
+    fn loss(sent: u64, lost: u64) -> crate::transport::quic::recycle::PathLoss {
+        crate::transport::quic::recycle::PathLoss {
+            sent_packets: sent,
+            lost_packets: lost,
+            lost_bytes: lost * 1200,
+            congestion_events: u64::from(lost > 0),
+        }
+    }
+
+    /// Each bucket's bounds: a rate at a bound is in the bucket above it, and
+    /// more losses than sends (losses of packets sent earlier) is `ge_20pct`.
+    #[test]
+    fn loss_rate_buckets_have_these_bounds() {
+        for (lost, bucket) in [
+            (0, "zero"),
+            (1, "lt_0_5pct"),
+            (4, "lt_0_5pct"),
+            (5, "lt_1pct"),
+            (9, "lt_1pct"),
+            (10, "lt_2pct"),
+            (19, "lt_2pct"),
+            (20, "lt_5pct"),
+            (49, "lt_5pct"),
+            (50, "lt_10pct"),
+            (99, "lt_10pct"),
+            (100, "lt_20pct"),
+            (199, "lt_20pct"),
+            (200, "ge_20pct"),
+            (5000, "ge_20pct"),
+        ] {
+            assert_eq!(
+                LOSS_RATE_LABELS[loss_rate_bucket(lost, 1000)],
+                bucket,
+                "{lost}"
+            );
+        }
+    }
+
+    /// The sums take every report. A path is in no bucket until it has sent 200
+    /// packets in the period, then in exactly one, moved as its rate changes; a
+    /// new period starts its window again.
+    #[test]
+    fn a_path_is_in_one_loss_bucket_once_it_has_sent_enough() {
+        let counters = QuicDataCounters::new();
+        let mut path = PathLossWindow::default();
+        let mut quiet = PathLossWindow::default();
+        counters.record_path_loss(&mut path, loss(150, 0));
+        counters.record_path_loss(&mut quiet, loss(199, 3));
+        assert_eq!(counters.snapshot(false).loss_rate.iter().sum::<u32>(), 0);
+        counters.record_path_loss(&mut path, loss(50, 0));
+        let snap = counters.snapshot(false);
+        assert_eq!(
+            snap.loss_rate,
+            vec![1, 0, 0, 0, 0, 0, 0, 0],
+            "200 sent, none lost"
+        );
+        // 3 lost of 400: under 1%.
+        counters.record_path_loss(&mut path, loss(200, 3));
+        let snap = counters.snapshot(true);
+        assert_eq!(snap.loss_rate, vec![0, 0, 1, 0, 0, 0, 0, 0]);
+        assert_eq!(snap.sent_packets, 599);
+        assert_eq!(snap.lost_packets, 6);
+        assert_eq!(snap.lost_bytes, 6 * 1200);
+        assert_eq!(snap.congestion_events, 2);
+        // The next period starts again: 100 sent is not enough.
+        counters.record_path_loss(&mut path, loss(100, 50));
+        let snap = counters.snapshot(true);
+        assert_eq!(snap.loss_rate.iter().sum::<u32>(), 0);
+        assert_eq!(snap.lost_packets, 50);
     }
 
     /// The snapshot round-trips through bincode, as the event log stores it.

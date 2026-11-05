@@ -802,6 +802,8 @@ pub(crate) async fn watch_acknowledgements<T: TimeSource>(
     let mut received = first.received;
     let mut watch = AckWatch::new(ACK_WATCH_WINDOW, first);
     let mut bytes = UdpBytes::of(&connection);
+    let mut loss = PathLoss::of(&connection);
+    let mut window = crate::transport::metrics::PathLossWindow::default();
     loop {
         time.sleep(ACK_WATCH_TICK).await;
         if connection.close_reason().is_some() {
@@ -810,6 +812,9 @@ pub(crate) async fn watch_acknowledgements<T: TimeSource>(
         let (next, sent, got) = bytes.step(UdpBytes::of(&connection));
         node.record_bytes(sent, got);
         bytes = next;
+        let (next, delta) = loss.step(PathLoss::of(&connection));
+        node.record_path_loss(&mut window, delta);
+        loss = next;
         let Some(sample) = AckSample::of(&connection, &cap_holds) else {
             return;
         };
@@ -860,6 +865,44 @@ impl UdpBytes {
             now.sent.saturating_sub(self.sent),
             now.received.saturating_sub(self.received),
         )
+    }
+}
+
+/// A path's packet counts as quinn's `PathStats` keeps them, reported
+/// node-wide by their change at each tick of the watch (`quic_sent_packets`,
+/// `quic_lost_packets`, `quic_lost_bytes`, `quic_congestion_events`, and the
+/// path's own loss rate in `quic_loss_rate_<bucket>`). What a path does in its
+/// last tick before it closes is not reported, as for [`UdpBytes`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct PathLoss {
+    pub(crate) sent_packets: u64,
+    pub(crate) lost_packets: u64,
+    pub(crate) lost_bytes: u64,
+    pub(crate) congestion_events: u64,
+}
+
+impl PathLoss {
+    fn of(connection: &quinn::Connection) -> Self {
+        let path = connection.stats().path;
+        Self {
+            sent_packets: path.sent_packets,
+            lost_packets: path.lost_packets,
+            lost_bytes: path.lost_bytes,
+            congestion_events: path.congestion_events,
+        }
+    }
+
+    /// The change from `self` to `now`, and the state to report the next change
+    /// from, which is `now`. Pure, so the report is tested.
+    #[must_use]
+    fn step(self, now: Self) -> (Self, Self) {
+        let delta = Self {
+            sent_packets: now.sent_packets.saturating_sub(self.sent_packets),
+            lost_packets: now.lost_packets.saturating_sub(self.lost_packets),
+            lost_bytes: now.lost_bytes.saturating_sub(self.lost_bytes),
+            congestion_events: now.congestion_events.saturating_sub(self.congestion_events),
+        };
+        (now, delta)
     }
 }
 
