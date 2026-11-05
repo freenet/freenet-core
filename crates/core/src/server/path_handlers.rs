@@ -2236,7 +2236,7 @@ fn shell_page(
     // the sandboxed app iframe. It is the only place a per-user-data action
     // (export to your own peer) can live — the durable user token is held by
     // the shell and must never reach the sandbox — and the only place the
-    // "not private: this preview runs on our server" disclosure cannot be hidden or
+    // "not private: your data is stored on this server" disclosure cannot be hidden or
     // spoofed by the contract app. Empty (and the layout unchanged) when hosted
     // mode is off. The export control is a placeholder until the node-side
     // export endpoint lands (P3 `secrets export` over HTTP, scoped to the
@@ -6782,11 +6782,17 @@ mod tests {
             hosted.contains(r#"id="fnbar""#),
             "hosted bar missing: {hosted}"
         );
-        // The disclosure leads the bar text so it survives truncation on a
-        // phone-width screen.
+        // The always-visible disclosure must say both halves: it is not
+        // private, and the data is held by this server (the operator can see
+        // it). "Not private" leads so it survives truncation on a phone.
+        let disclosure = hosted
+            .find("Not private:")
+            .map(|i| &hosted[i..])
+            .and_then(|rest| rest.split_once("</span").map(|(d, _)| d))
+            .expect("always-visible 'Not private:' disclosure missing");
         assert!(
-            hosted.contains(r#"<span class="nt">Not private:"#),
-            "always-visible disclosure missing, or no longer leads the bar text"
+            disclosure.contains("stored on this server"),
+            "disclosure must say the data is stored on this server: {disclosure}"
         );
         assert!(
             hosted.contains("Access key") && hosted.contains("Restore from key"),

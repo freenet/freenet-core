@@ -94,6 +94,12 @@ iframe {
   cursor: auto;
   display: none;
   z-index: 10;
+  /* The shell body is overflow:hidden, so a popover taller than a short
+     (landscape phone) viewport would be clipped with no way to reach its
+     lower sections. */
+  max-height: calc(100vh - 50px);
+  overflow-y: auto;
+  box-sizing: border-box;
 }
 #fnpop.open {
   display: block;
@@ -161,9 +167,10 @@ iframe {
   font-size: 12px;
 }
 
-/* Phone width: let the disclosure wrap to two lines instead of truncating, so
-   "runs on our server" (the answer to "how is this peer-to-peer with nothing
-   installed?") survives alongside "Not private". */
+/* Phone width: let the disclosure wrap instead of truncating, so the whole
+   sentence ("stored on this server" is also the answer to "how is this
+   peer-to-peer with nothing installed?") survives alongside "Not private".
+   Three lines covers a 320px screen; at 360px and up it takes two. */
 @media (max-width: 560px) {
   #fnbar {
     height: auto;
@@ -177,8 +184,8 @@ iframe {
     font-size: 12px;
     display: -webkit-box;
     -webkit-box-orient: vertical;
-    -webkit-line-clamp: 2;
-    line-clamp: 2;
+    -webkit-line-clamp: 3;
+    line-clamp: 3;
   }
 }
 
