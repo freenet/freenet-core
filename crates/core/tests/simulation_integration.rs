@@ -21081,39 +21081,36 @@ fn test_quic_data_carries_a_stream_end_to_end() {
     assert_eq!(stored.as_ref(), state.as_slice());
 }
 
-/// The data ramp over a virtual day: nodes in `prefer` with no
-/// `quic-data-percent` take their share from a ramp that starts with the run.
-/// Churn restarts nodes, so pairs are promoted again through the day, and each
-/// promotion reads the share at its own time: paths set up in the first hours
-/// mostly carry no data (5%), and every path set up after 24 h carries data on
-/// both sides (100%).
+/// The first release that takes a RECYCLE_FOR_DATA close as no fault
+/// (`upgrade::machine::QUIC_RECYCLE_FOR_DATA_IN`); a path is recycled only to a
+/// peer at it or later.
+const QUIC_FIRST_RECYCLING_RELEASE: (u8, u8, u16) = (0, 2, 156);
+
+/// The data ramp over a virtual day, on paths that stay up: nodes in `prefer`
+/// with no `quic-data-percent` take their share from a ramp that starts with
+/// the run. A path that came up without data is recycled when the share reaches
+/// its pair, so by 24 h, plus a recheck and the time to set up again, every
+/// pair with a path carries data. Nothing is recycled during the first 6 h,
+/// when the share stays at 5%, and no node recycles a pair twice.
 #[test_log::test]
-fn test_quic_data_ramp_turns_on_more_pairs_as_virtual_time_passes() {
-    use freenet::dev_tool::ChurnConfig;
-    const SEED: u64 = 0x5940_7A00_0001;
+fn test_quic_data_ramp_turns_on_every_pair_within_a_day() {
+    const SEED: u64 = 0x5940_7A00_0002;
     const HOUR: Duration = Duration::from_secs(3600);
     setup_deterministic_state(SEED);
     let rt = create_runtime();
-    let (mut sim, trace, nodes) = rt.block_on(async {
-        let mut sim = SimNetwork::new("quic-data-ramp", 1, 5, 7, 3, 10, 2, SEED).await;
+    let (sim, trace, nodes) = rt.block_on(async {
+        let mut sim = SimNetwork::new("quic-data-ramp", 1, 3, 7, 3, 10, 2, SEED).await;
         sim.enable_gateway_ack_version();
         let trace = sim.quic_upgrade_trace();
         sim.with_transport_quic("prefer");
         trace.ramp_data_from(Duration::ZERO);
-        run_as_first_negotiating_release(&trace);
+        let real = SimNetwork::real_protocol_version();
+        trace.run_as_release(real, real.max(QUIC_FIRST_RECYCLING_RELEASE));
         let nodes: Vec<_> = sim.all_node_addresses().values().copied().collect();
         (sim, trace, nodes)
     });
     drop(rt);
-    sim.with_churn(ChurnConfig {
-        crash_probability: 0.5,
-        tick_interval: HOUR,
-        recovery_delay: Duration::from_secs(60),
-        max_simultaneous_crashes: Some(2),
-        permanent_crash_rate: 0.0,
-        warmup_delay: Duration::from_secs(60),
-    });
-    sim.run_simulation_direct::<rand::rngs::SmallRng>(SEED, 1, 30, HOUR)
+    sim.run_simulation_direct::<rand::rngs::SmallRng>(SEED, 1, 26, HOUR)
         .expect("direct simulation should succeed");
     let run = QuicShadowRun {
         trace,
@@ -21122,40 +21119,57 @@ fn test_quic_data_ramp_turns_on_more_pairs_as_virtual_time_passes() {
         mesh: Default::default(),
     };
     let records = run.trace.records();
-    let established = |from: Duration, to: Duration| {
-        records
-            .iter()
-            .filter(|r| r.what.starts_with("Established(") && r.at >= from && r.at < to)
-            .collect::<Vec<_>>()
-    };
-    let carries = |r: &freenet::dev_tool::QuicUpgradeRecord| {
-        records.iter().any(|d| {
-            d.what == "DataEnabled"
-                && d.node == r.node
-                && d.peer == r.peer
-                && d.session == r.session
-        })
-    };
-    let early = established(Duration::ZERO, 6 * HOUR);
-    let late = established(25 * HOUR, 40 * HOUR);
-    assert!(!early.is_empty(), "paths came up early: {}", run.dump());
+    let pair = |r: &freenet::dev_tool::QuicUpgradeRecord| (r.node, r.peer);
+    let established: std::collections::BTreeSet<_> = records
+        .iter()
+        .filter(|r| r.what.starts_with("Established("))
+        .map(pair)
+        .collect();
+    assert!(established.len() >= 4, "paths came up: {}", run.dump());
+    // A recheck (45 s +20%), a first-offer delay (10 s at most) and the set-up.
+    let by = 24 * HOUR + Duration::from_secs(3 * 60);
+    for (node, peer) in &established {
+        assert!(
+            records.iter().any(|r| r.what == "DataEnabled"
+                && r.node == *node
+                && r.peer == *peer
+                && r.at <= by),
+            "{node} and {peer} carry data by {by:?}: {}",
+            run.dump()
+        );
+    }
+    let recycles: Vec<_> = records
+        .iter()
+        .filter(|r| r.what == "RecycledForData { by_peer: false }")
+        .collect();
     assert!(
-        !late.is_empty(),
-        "churn brought paths up after a day: {}",
+        !recycles.is_empty(),
+        "premise: a path came up before the share reached its pair: {}",
         run.dump()
     );
-    let early_data = early.iter().filter(|r| carries(r)).count();
     assert!(
-        early_data * 4 < early.len(),
-        "early paths are mostly without data ({early_data} of {}): {}",
-        early.len(),
+        recycles.iter().all(|r| r.at >= 6 * HOUR),
+        "nothing is recycled at 5%: {}",
         run.dump()
     );
-    assert!(
-        late.iter().all(|r| carries(r)),
-        "every path after 24 h carries data: {}",
+    let distinct: std::collections::BTreeSet<_> = recycles.iter().map(|r| pair(r)).collect();
+    assert_eq!(
+        distinct.len(),
+        recycles.len(),
+        "no node recycles a pair twice: {}",
         run.dump()
     );
+    // Paths also end with their sessions as the topology changes; none of those
+    // fallbacks comes with a recycle, on either side of the pair.
+    for recycle in &recycles {
+        assert!(
+            !records.iter().any(|r| r.what.starts_with("Fallback(")
+                && ((r.node, r.peer) == pair(recycle) || (r.peer, r.node) == pair(recycle))
+                && r.at.abs_diff(recycle.at) <= Duration::from_secs(1)),
+            "a recycle is not a fallback: {}",
+            run.dump()
+        );
+    }
 }
 
 /// Shadow on both ends: the whole negotiation runs over a real QUIC connection,
