@@ -1224,11 +1224,13 @@ fn each_stage_times_out_at_its_deadline() {
 /// active path on both roles: fallback, normal backoff, permit back, and then
 /// a new upgrade. Never a permanent downgrade. A code this node does not know
 /// is what an older node sees for a newer code, and behaves the same.
+/// RECYCLE_FOR_DATA is no fallback (`a_recycle_close_from_the_peer_is_no_fault`).
 #[test]
 fn every_close_code_falls_back_then_upgrades_again() {
     let unknown = u64::from(u32::MAX);
     let codes = QuicCloseCode::ALL
         .iter()
+        .filter(|code| **code != QuicCloseCode::RecycleForData)
         .map(|code| u64::from(code.code()))
         .chain([unknown]);
     for code in codes {
@@ -2771,5 +2773,119 @@ fn each_attempt_reads_its_own_caps_when_it_starts() {
             rig.machine.carries_data(),
             "{role:?}: a change mid-attempt waits for the next attempt"
         );
+    }
+}
+
+/// A rig promoted with a peer that takes a recycle close as no fault, its path
+/// active without this node's data bit and with the peer's.
+fn active_without_own_bit(role: Role) -> (Rig, u32) {
+    use crate::transport::quic::upgrade::machine::QUIC_RECYCLE_FOR_DATA_IN;
+    let mut rig = Rig::new(role);
+    rig.peer_caps = caps::DATA;
+    rig.promote(Some(QUIC_RECYCLE_FOR_DATA_IN));
+    let attempt = rig.activate();
+    assert!(rig.machine.is_active() && !rig.machine.carries_data());
+    (rig, attempt)
+}
+
+/// When this node's data bit for the pair comes on while a path without data is
+/// up, the next recheck closes the path with RECYCLE_FOR_DATA: no fallback, no
+/// charge, a server offers again at once, and the next attempt carries data and
+/// is never rechecked. A recheck before the bit comes on changes nothing.
+#[test]
+fn a_path_without_data_is_recycled_once_when_the_bit_comes_on() {
+    use crate::transport::quic::upgrade::machine::DATA_RECHECK_INTERVAL;
+    for role in [Role::Server, Role::Client] {
+        let (mut rig, attempt) = active_without_own_bit(role);
+        let due = rig.machine.deadline().expect("a recheck is due");
+        assert!(
+            due >= rig.now + DATA_RECHECK_INTERVAL.mul_f64(0.8),
+            "{role:?}"
+        );
+        assert!(
+            due <= rig.now + DATA_RECHECK_INTERVAL.mul_f64(1.2),
+            "{role:?}"
+        );
+        // The share has not reached the pair: ask again later.
+        assert_eq!(rig.tick_at(due), vec![], "{role:?}");
+        let next = rig.machine.deadline().expect("asked again");
+        assert!(next > due, "{role:?}");
+        assert!(rig.machine.is_active());
+
+        rig.own_caps = caps::DATA;
+        let failures = rig.machine.failures;
+        let actions = rig.tick_at(next);
+        assert_eq!(
+            actions,
+            vec![
+                Action::TearDown {
+                    attempt,
+                    code: QuicCloseCode::RecycleForData,
+                },
+                Action::Record(Outcome::RecycledForData { by_peer: false }),
+            ],
+            "{role:?}"
+        );
+        assert_eq!(label(&rig.machine), S::Idle);
+        assert_eq!(rig.in_use(), 0, "the permit is back");
+        assert_eq!(rig.machine.failures, failures, "nothing is charged");
+        if role == Role::Server {
+            assert_eq!(rig.machine.retry_at, rig.now, "offers again at once");
+        }
+        rig.activate();
+        assert!(rig.machine.carries_data(), "{role:?}");
+        assert_eq!(
+            rig.machine.deadline(),
+            None,
+            "a path with data is not rechecked"
+        );
+    }
+}
+
+/// No recheck on a path with this node's bit already set, nor on a path to a
+/// peer older than the recycle close, which would read it as a lost connection.
+#[test]
+fn only_a_path_without_the_bit_to_a_recent_peer_is_rechecked() {
+    for role in [Role::Server, Role::Client] {
+        let mut rig = Rig::new(role);
+        rig.peer_caps = 0;
+        rig.own_caps = caps::DATA;
+        rig.promote(Some(
+            crate::transport::quic::upgrade::machine::QUIC_RECYCLE_FOR_DATA_IN,
+        ));
+        rig.activate();
+        assert_eq!(rig.machine.deadline(), None, "{role:?}: own bit set");
+
+        let mut rig = Rig::promoted(role);
+        rig.peer_caps = caps::DATA;
+        rig.activate();
+        assert_eq!(rig.machine.deadline(), None, "{role:?}: an older peer");
+    }
+}
+
+/// The peer's RECYCLE_FOR_DATA close, through the real error mapping, ends the
+/// path with no fault: nothing charged, no fallback, and a server offers again
+/// within the first-offer delay.
+#[test]
+fn a_recycle_close_from_the_peer_is_no_fault() {
+    for role in [Role::Server, Role::Client] {
+        let (mut rig, attempt) = active_without_own_bit(role);
+        let failures = rig.machine.failures;
+        let actions = rig.close_with(attempt, u64::from(QuicCloseCode::RecycleForData.code()));
+        assert!(
+            actions.contains(&Action::Record(Outcome::RecycledForData { by_peer: true })),
+            "{role:?}: {actions:?}"
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::Record(Outcome::Fallback(_)))),
+            "{role:?}"
+        );
+        assert_eq!(label(&rig.machine), S::Idle);
+        assert_eq!(rig.machine.failures, failures);
+        if role == Role::Server {
+            assert!(rig.backoff() <= OFFER_DELAY_MAX, "{:?}", rig.backoff());
+        }
     }
 }

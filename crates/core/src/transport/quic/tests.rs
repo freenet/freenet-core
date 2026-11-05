@@ -2648,6 +2648,9 @@ fn close_codes_reach_the_peer() {
             QuicCloseCode::SessionEnded => QuicErrorKind::Refused {
                 reason: QuicRefusal::SessionEnded,
             },
+            QuicCloseCode::RecycleForData => QuicErrorKind::Refused {
+                reason: QuicRefusal::RecycleForData,
+            },
         };
         let mut sent_by_a = Vec::new();
         let mut sent_by_b = Vec::new();

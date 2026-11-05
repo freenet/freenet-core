@@ -776,6 +776,9 @@ impl Session {
             // `QuicUpgradeOutcome`: that array is at 32, the longest serde and
             // `Default` take, so a data count needs a labelled set of its own.
             Outcome::DataEnabled => {}
+            // Not a fallback, and counted by its close code
+            // (`quic_close_sent_recycle_for_data`, `quic_close_received_recycle_for_data`).
+            Outcome::RecycledForData { .. } => {}
             Outcome::Declined { reason, uncharged } => {
                 count(declined(reason));
                 if uncharged {

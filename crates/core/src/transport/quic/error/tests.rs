@@ -616,6 +616,7 @@ fn close_codes_have_fixed_distinct_wire_values() {
         (QuicCloseCode::PeerNotAcknowledging, 4),
         (QuicCloseCode::ControlRefused, 5),
         (QuicCloseCode::SessionEnded, 6),
+        (QuicCloseCode::RecycleForData, 7),
     ];
     assert_eq!(expected.len(), QuicCloseCode::COUNT);
     for (code, wire) in expected {
@@ -623,7 +624,7 @@ fn close_codes_have_fixed_distinct_wire_values() {
         assert_eq!(QuicCloseCode::from_code(u64::from(wire)), Some(code));
         assert!(!code.reason().is_empty());
     }
-    for unknown in [7_u64, 0x0f, 0x11, 0x21, u64::from(u32::MAX)] {
+    for unknown in [8_u64, 0x0f, 0x11, 0x21, u64::from(u32::MAX)] {
         assert_eq!(QuicCloseCode::from_code(unknown), None, "{unknown:#x}");
     }
 }
@@ -654,7 +655,13 @@ fn a_session_ended_close_reads_as_its_own_refusal_and_unknown_codes_as_lost() {
         attribute(QuicAvailability::Up, session_ended),
         session_ended
     );
-    for unknown in [7, 0x0f] {
+    assert_eq!(
+        close(super::close_code::RECYCLE_FOR_DATA),
+        QuicErrorKind::Refused {
+            reason: QuicRefusal::RecycleForData,
+        }
+    );
+    for unknown in [8, 0x0f] {
         assert_eq!(
             close(unknown),
             QuicErrorKind::ConnectionLost,

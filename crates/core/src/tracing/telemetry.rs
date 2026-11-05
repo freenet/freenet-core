@@ -3083,6 +3083,10 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 "quic_close_sent_session_ended".into(),
                 serde_json::json!(snapshot.quic_close_sent_session_ended),
             );
+            m.insert(
+                "quic_close_sent_recycle_for_data".into(),
+                serde_json::json!(snapshot.quic_close_sent_recycle_for_data),
+            );
             {
                 use crate::transport::metrics::{
                     QuicCloseCode, QuicFallback, QuicPathAge, QuicUpgradeOutcome,
@@ -7898,6 +7902,7 @@ mod tests {
             quic_close_sent_peer_not_acknowledging: 6,
             quic_close_sent_control_refused: 8,
             quic_close_sent_session_ended: 10,
+            quic_close_sent_recycle_for_data: 12,
             quic_breaker_trips: 7,
             quic_send_refused: 9,
             quic_breaker_suppressed: true,
@@ -7917,6 +7922,7 @@ mod tests {
             ("quic_close_sent_peer_not_acknowledging", 6),
             ("quic_close_sent_control_refused", 8),
             ("quic_close_sent_session_ended", 10),
+            ("quic_close_sent_recycle_for_data", 12),
             ("quic_breaker_trips", 7),
             ("quic_send_refused", 9),
         ] {

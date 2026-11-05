@@ -145,6 +145,20 @@ use crate::transport::symmetric_message::{DeclineReason, UpgradeControl, may_off
 use crate::transport::{QuicErrorKind, QuicRefusal};
 use crate::util::backoff::ExponentialBackoff;
 
+/// How often an active path without this node's data bit asks whether the
+/// data share has reached the pair, jittered by +/-20% per path.
+pub(in crate::transport) const DATA_RECHECK_INTERVAL: Duration = Duration::from_secs(45);
+
+/// The first release that takes a [`QuicCloseCode::RecycleForData`] close as
+/// no fault. An older peer reads the unknown code as a lost connection and
+/// charges it, so a path to one is never recycled. Too high only delays.
+pub(in crate::transport) const QUIC_RECYCLE_FOR_DATA_IN: (u8, u8, u16) = (0, 2, 156);
+
+/// May a path to a peer of `remote_version` be recycled for data? Fails closed.
+fn may_recycle_for_data(remote_version: Option<(u8, u8, u16)>) -> bool {
+    remote_version.is_some_and(|version| version >= QUIC_RECYCLE_FOR_DATA_IN)
+}
+
 /// How long the server waits for a reply to its `Offer`.
 pub(in crate::transport) const OFFER_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a side waits for the connection, from `Accept` to established.
@@ -291,6 +305,12 @@ pub(in crate::transport) enum Outcome {
     Established(Role),
     /// The active path has both sides' data bit.
     DataEnabled,
+    /// A path with no data closed so the next attempt carries this node's data
+    /// bit, which came on while it was up (`by_peer`: the peer's did). Not a
+    /// fallback.
+    RecycledForData {
+        by_peer: bool,
+    },
     /// The peer's `Decline`, `None` when the reason is one this node does
     /// not know. `uncharged` is whether the peer was spared the backoff
     /// penalty (the machine's own decision, see `on_decline`).
@@ -434,6 +454,8 @@ enum Verdict {
     NoEffect,
     EndpointDown,
     Recheck,
+    /// The peer recycled the path for data ([`QuicRefusal::RecycleForData`]).
+    Recycled,
     Fail {
         penalty: Penalty,
         in_setup: Outcome,
@@ -480,6 +502,10 @@ fn classify(kind: QuicErrorKind) -> Verdict {
                 Outcome::SetupDowngraded,
                 FallbackCause::SessionEndedReceived,
             ),
+            // Close code RECYCLE_FOR_DATA: the peer's data bit for this pair
+            // came on, and it closed a path that carried no data so the next
+            // attempt carries it. No fault: nothing is charged.
+            QuicRefusal::RecycleForData => Verdict::Recycled,
             // This node's own limit, so the peer is not charged.
             QuicRefusal::AllowSetFull => Verdict::Fail {
                 penalty: Penalty::Uncharged,
@@ -547,8 +573,15 @@ pub(in crate::transport) struct UpgradeMachine {
     retry_at: Duration,
     /// Whether a seed came in through [`Event::Promoted`].
     seeded: bool,
-    /// What this node says it supports on a path, from [`Event::Promoted`].
+    /// What this node says it supports on a path, from [`Event::Promoted`] and
+    /// again at the start of each attempt.
     own_caps: u32,
+    /// Whether the peer runs a release that takes a [`QuicCloseCode::RecycleForData`]
+    /// close as no fault ([`QUIC_RECYCLE_FOR_DATA_IN`]).
+    peer_recycles: bool,
+    /// While a path is active without this node's data bit, when to ask again
+    /// whether the data share has reached the pair ([`DATA_RECHECK_INTERVAL`]).
+    data_recheck_at: Option<Duration>,
     /// When each recent [`Outcome::Fallback`] was recorded, and its cause,
     /// oldest first, at most [`RECENT_FALLBACKS_MAX`] within
     /// [`FALLBACK_CHURN_WINDOW`].
@@ -567,6 +600,8 @@ impl UpgradeMachine {
             retry_at: Duration::ZERO,
             seeded: false,
             own_caps: 0,
+            peer_recycles: false,
+            data_recheck_at: None,
             recent_fallbacks: std::collections::VecDeque::new(),
         }
     }
@@ -590,7 +625,8 @@ impl UpgradeMachine {
                 Some(Role::Client) | None => None,
             },
             State::Setup { deadline, .. } | State::Rechecking { deadline, .. } => Some(*deadline),
-            State::Active { .. } | State::Off => None,
+            State::Active { .. } => self.data_recheck_at,
+            State::Off => None,
         }
     }
 
@@ -739,6 +775,7 @@ impl UpgradeMachine {
         // hands the backoff on.
         self.take_seed(cx, backoff);
         self.own_caps = own_caps;
+        self.peer_recycles = may_recycle_for_data(remote_version);
         self.role = Role::of(&self.local_key, peer_key);
         match self.role {
             None => {
@@ -812,8 +849,39 @@ impl UpgradeMachine {
                 };
                 vec![Action::Record(outcome)]
             }
-            State::Active { .. } | State::Off => Vec::new(),
+            State::Active { attempt, .. } => self.recheck_data(cx, attempt),
+            State::Off => Vec::new(),
         }
+    }
+
+    /// The path is active without this node's data bit, and the recheck is due:
+    /// if the data share has since reached the pair, close the path so the next
+    /// attempt carries the bit; otherwise ask again later. Only a path with no
+    /// data is closed, and only once per change of this node's bit, since the
+    /// next attempt reads the bit as set. Not a fallback: nothing is charged, no
+    /// fallback is counted, and a server offers again at once.
+    fn recheck_data(&mut self, cx: Inputs<'_>, attempt: u32) -> Vec<Action> {
+        let Some(at) = self.data_recheck_at else {
+            return Vec::new();
+        };
+        if cx.now < at {
+            return Vec::new();
+        }
+        if self.accepts_data() || (cx.own_caps)() & caps::DATA == 0 {
+            self.data_recheck_at = Some(cx.now + jittered(DATA_RECHECK_INTERVAL, cx.sample));
+            return Vec::new();
+        }
+        self.leave_attempt();
+        if self.role == Some(Role::Server) {
+            self.retry_at = cx.now;
+        }
+        vec![
+            Action::TearDown {
+                attempt,
+                code: QuicCloseCode::RecycleForData,
+            },
+            Action::Record(Outcome::RecycledForData { by_peer: false }),
+        ]
     }
 
     fn try_offer(&mut self, cx: Inputs<'_>) -> Vec<Action> {
@@ -961,7 +1029,7 @@ impl UpgradeMachine {
             // `Ready` can only come over the attempt's connection, so it also
             // proves one if the report of the connection is still on its way.
             (Some(Role::Client), Phase::Connecting | Phase::Confirming) => {
-                self.activate(cx.now, peer_caps);
+                self.activate(cx, peer_caps);
                 let mut actions = vec![
                     Action::SendControl(QuicControl::ReadyAck {
                         attempt,
@@ -980,7 +1048,7 @@ impl UpgradeMachine {
         if self.role != Some(Role::Server) || self.phase_of(attempt) != Some(Phase::Confirming) {
             return Vec::new();
         }
-        self.activate(cx.now, peer_caps);
+        self.activate(cx, peer_caps);
         let mut actions = vec![Action::Record(Outcome::Established(Role::Server))];
         actions.extend(self.data_actions(attempt));
         actions
@@ -1081,6 +1149,20 @@ impl UpgradeMachine {
         match classify(kind) {
             Verdict::NoEffect => Vec::new(),
             Verdict::EndpointDown => self.shut_off(cx, Ending::EndpointDown),
+            Verdict::Recycled => {
+                self.leave_attempt();
+                if self.role == Some(Role::Server) {
+                    let spread = OFFER_DELAY_MAX.saturating_sub(OFFER_DELAY_MIN);
+                    self.retry_at = cx.now + OFFER_DELAY_MIN + spread.mul_f64(unit(cx.sample));
+                }
+                vec![
+                    Action::TearDown {
+                        attempt,
+                        code: QuicCloseCode::RecycleForData,
+                    },
+                    Action::Record(Outcome::RecycledForData { by_peer: true }),
+                ]
+            }
             Verdict::Recheck => {
                 let active_since = self.leave_attempt();
                 self.state = State::Rechecking {
@@ -1124,6 +1206,7 @@ impl UpgradeMachine {
     /// Back to `Idle`, which returns any permit. Returns when the path that
     /// just ended became active, if it did.
     fn leave_attempt(&mut self) -> Option<Duration> {
+        self.data_recheck_at = None;
         match std::mem::replace(&mut self.state, State::Idle) {
             State::Active { since, .. } => Some(since),
             State::Idle | State::Setup { .. } | State::Rechecking { .. } | State::Off => None,
@@ -1240,17 +1323,22 @@ impl UpgradeMachine {
         }
     }
 
-    fn activate(&mut self, now: Duration, peer_caps: u32) {
+    fn activate(&mut self, cx: Inputs<'_>, peer_caps: u32) {
         match std::mem::replace(&mut self.state, State::Idle) {
             State::Setup {
                 attempt, _permit, ..
             } => {
                 self.state = State::Active {
                     attempt,
-                    since: now,
+                    since: cx.now,
                     peer_caps,
                     _permit,
                 };
+                // Without this node's bit, ask from time to time whether the
+                // data share has reached the pair ([`Self::recheck_data`]),
+                // jittered so a node does not close many paths at once.
+                self.data_recheck_at = (self.peer_recycles && !self.accepts_data())
+                    .then(|| cx.now + jittered(DATA_RECHECK_INTERVAL, cx.sample));
             }
             other
             @ (State::Idle | State::Active { .. } | State::Rechecking { .. } | State::Off) => {
