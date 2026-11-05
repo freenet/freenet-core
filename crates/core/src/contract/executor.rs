@@ -2985,6 +2985,26 @@ mod tests {
                  behaviour, plus the unmeasured terms in the quic::config module \
                  doc; summed once a QUIC path cap exists (M4, #5940)",
             ),
+            // QUIC_SEND_HOLD_WINDOW_PERCENT (a percentage of the window, so
+            // not a `_BYTES` name the discovery scan finds) is the window
+            // half of the send-side term: percent x W + settled + streams x
+            // per-stream.
+            (
+                "QUIC_SEND_HOLD_PER_STREAM_BYTES",
+                "a measurement of one QUIC connection term (send-side state per \
+                 open uni stream, with loss; with QUIC_SEND_HOLD_WINDOW_PERCENT x W \
+                 and QUIC_SEND_SETTLED_BYTES), not a ceiling; an input to the \
+                 per-path ceiling (memory gate M2, #5940), plus the unmeasured terms \
+                 in the quic::config module doc; per connection, so not summed \
+                 until the node aggregate accounts QUIC paths",
+            ),
+            (
+                "QUIC_SEND_SETTLED_BYTES",
+                "a measurement of one QUIC connection term (what a sender keeps \
+                 above idle once its sends are done), not a ceiling; an input to the \
+                 per-path ceiling (memory gate M2, #5940); per connection, so not \
+                 summed until the node aggregate accounts QUIC paths",
+            ),
             (
                 "READ_START_BYTES",
                 "initial allocation of ONE QUIC stream read (quic::path::inbound), \

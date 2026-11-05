@@ -19,13 +19,22 @@
 //! stateless-reset key, `min_reset_interval` and the server's system clock.
 //!
 //! Memory: [`QUIC_CONNECTION_FIXED_BYTES`], [`QUIC_ASSEMBLER_HOLD_PER_STREAM_BYTES`],
-//! [`QUIC_ASSEMBLER_HOLD_WINDOW_MULTIPLE`] and [`QUIC_ACK_TAIL_BYTES`] are
-//! measurements of named terms under stated conditions (`quic::memory_tests`),
-//! not a ceiling on what one connection can hold. Not measured:
+//! [`QUIC_ASSEMBLER_HOLD_WINDOW_MULTIPLE`] and [`QUIC_ACK_TAIL_BYTES`] on the
+//! receive side, and [`QUIC_SEND_HOLD_WINDOW_PERCENT`],
+//! [`QUIC_SEND_HOLD_PER_STREAM_BYTES`] and [`QUIC_SEND_SETTLED_BYTES`] on the
+//! send side, are measurements of named terms under stated conditions
+//! (`quic::memory_tests`), not a ceiling on what one connection can hold.
+//! The send side is measured with loss: quinn's buffers behind sent data,
+//! its packet records and resend state, and the path's own state per send
+//! (permits, tasks, deadline wrappers, a send's task past its deadline, the
+//! short queue). Not measured:
 //! - datagram sizes other than 1200 B (every stream shape measured pads its
 //!   datagrams to the 1200-byte MTU);
 //! - quinn's queue of datagrams from the endpoint driver to each connection;
-//! - send-side packet records and the buffers behind sent data;
+//! - on the send side, round trips other than 100 ms, and acknowledgement
+//!   patterns other than random loss both ways and a full cut (quinn bounds
+//!   the data behind them by the send window either way; the records and
+//!   resend state for other patterns were not measured);
 //! - allocators other than jemalloc on linux-gnu (macOS and Windows builds
 //!   round differently);
 //! - CRYPTO-frame reassembly, quinn-proto's second assembler (its buffer is
@@ -191,7 +200,8 @@ pub(crate) const INCOMING_BUFFER_TOTAL_BYTES: u64 = 1024 * 1024;
 // in this module's doc were not measured, and some quinn terms depend on
 // traffic rate and time rather than on configuration. The per-path ceiling
 // (memory gate M2, #5940) must account for those separately; none of these
-// is in `declared_cache_ceiling` yet (memory gate M4, #5940).
+// is in `declared_cache_ceiling` yet (memory gate M4, #5940). Receive-side
+// terms first, then the send side's.
 //
 // A bump of quinn, quinn-proto or rustls fails `QUIC_MEMORY_MEASURED_WITH`'s
 // test until someone re-measures.
@@ -291,6 +301,82 @@ pub(crate) const QUIC_ASSEMBLER_HOLD_WINDOW_MULTIPLE: usize = 5;
 /// #5940) must re-check this term against quinn-proto's behaviour.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const QUIC_ACK_TAIL_BYTES: usize = 240 * 1024;
+
+/// What a sending side held above an idle connection with its path while
+/// sends ran, as a percentage of the send window W, in
+/// `QUIC_SEND_HOLD_WINDOW_PERCENT / 100 x W + QUIC_SEND_SETTLED_BYTES +
+/// streams x QUIC_SEND_HOLD_PER_STREAM_BYTES`, where `streams` counts the
+/// uni streams the sends hold open (at most [`MAX_UNI_STREAMS`]).
+///
+/// quinn buffers at most W of unacknowledged stream data per connection
+/// (`send_window`) and keeps a record of each packet in flight until it is
+/// acknowledged or declared lost. The data is a copy when the message is a
+/// short (quinn copies what it is given) or comes from a source that
+/// allocates each fragment, as a forwarded stream's does (the receiving
+/// path copies each fragment into a buffer of its own length,
+/// `path::inbound`): a 1130-byte fragment takes 1280 B in jemalloc, 13%
+/// over. A stream from a payload the
+/// caller holds costs about the records alone, because quinn keeps slices
+/// of the caller's buffer (measured: 75,512 B at W = 268,435 B; the buffer
+/// itself is the caller's and not counted). Records grow with the frames a
+/// packet carries, so many streams sharing the window hold more per byte in
+/// flight than one stream does.
+///
+/// Measured (`quic::memory_tests`): two endpoints on `SimulationSocket` and
+/// one `VirtualTime`, every datagram delayed 50 ms each way and a seeded
+/// share lost both ways (0, 2% and 10%). At one of 12 points from 100 ms
+/// to 2.5 s into the transfer the link is cut, which stops every
+/// acknowledgement; the sender writes until its window is full, the sample
+/// is taken 300 ms later, and the sending side is then dropped and drained
+/// and what it frees is counted, less an idle connection's figure from the
+/// same harness. The largest sample of each shape, from sources (as large
+/// shorts the same shapes held up to 1% less with one stream and 21% less
+/// with 48), with the pinned figure:
+///
+/// | shape                                         | W         | held      | held / W | pinned    |
+/// |-----------------------------------------------|-----------|-----------|----------|-----------|
+/// | 1 stream of 3 W                               | 131,072   | 197,560   | 1.51     | 245,760   |
+/// | 1 stream of 3 W                               | 268,435   | 381,016   | 1.42     | 451,804   |
+/// | 1 stream of 3 W                               | 2,097,152 | 2,635,512 | 1.26     | 3,194,880 |
+/// | 48 streams of W / 8, 16 shorts at the cut     | 131,072   | 414,248   | 3.16     | 503,808   |
+/// | 48 streams of W / 8, 16 shorts at the cut     | 2,097,152 | 3,050,848 | 1.45     | 3,452,928 |
+///
+/// Lossy runs held less than lossless ones: their congestion window kept
+/// fewer packets in flight, and the cut fills the window either way. Set to
+/// 150, so the three terms are 13% (64 streams at 2 MiB) to 24% (one stream
+/// at 128 KiB) over the largest measurement of each shape.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const QUIC_SEND_HOLD_WINDOW_PERCENT: usize = 150;
+
+/// What a sending side held per uni stream its sends hold open, beside the
+/// window term ([`QUIC_SEND_HOLD_WINDOW_PERCENT`]): quinn's per-stream send
+/// state and the stream's `stopped` registration, and the path's state for
+/// the send (its task, the deadline wrapper, `Outgoing` and the permit), or
+/// for a send past its deadline the task that holds the permit until the
+/// stream ends. Not separable from the other terms by these measurements:
+/// 64 streams at the smallest window held 414,248 B, which leaves about
+/// 2,700 B per stream after the window and settled terms. 48 sends written
+/// in full and held past their 300 s deadline held 242,784 B at W =
+/// 131,072 B and 1,956,000 B at W = 2,097,152 B, both under the pin. Set to
+/// 4 KiB.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const QUIC_SEND_HOLD_PER_STREAM_BYTES: usize = 4 * 1024;
+
+/// What a sending side held above an idle connection with its path once
+/// every send had returned and a 30 s settle had passed: capacity its
+/// connection keeps after traffic (quinn's stream and packet tables at the
+/// size the transfer grew them to, and a `stopped` entry per stream this
+/// side reset, which a send timed out under loss leaves). Also the constant
+/// term of [`QUIC_SEND_HOLD_WINDOW_PERCENT`]'s sum.
+///
+/// Measured after one stream of 3 W and after 48 streams of W / 8, from
+/// sources, lossless and at 10% loss both ways, at W = 131,072 and
+/// 2,097,152 B: 12,728 B to 36,448 B, the largest after 48 streams at 2 MiB,
+/// lossless. That includes up to 21,952 B that was still allocated after
+/// both sides closed, which dropping the endpoints frees: endpoint capacity,
+/// charged here to the connection. Set to 44 KiB, 24% over 36,448 B.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const QUIC_SEND_SETTLED_BYTES: usize = 44 * 1024;
 
 /// The quinn, quinn-proto and rustls versions the figures above were
 /// measured with, checked against `Cargo.lock` by `quic::memory_tests`.
