@@ -280,6 +280,12 @@ pub(crate) mod lab {
     pub(crate) static INNER_CONTROLLER: AtomicU8 = AtomicU8::new(CUBIC);
     pub(crate) const CUBIC: u8 = 0;
     pub(crate) const BBR: u8 = 1;
+
+    /// A floor under the inner controller's window, in bytes, applied before
+    /// the cap: a loss-tolerant variant to try against random loss. 0 is
+    /// none (the node's).
+    pub(crate) static MIN_WINDOW: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
 }
 
 /// The window [`CappedCubic`] allows at `rate` bytes per second over an RTT
@@ -468,7 +474,14 @@ impl Controller for CappedCubic {
     }
 
     fn window(&self) -> u64 {
-        self.capped(self.inner.window())
+        #[cfg(feature = "bench")]
+        let inner = self
+            .inner
+            .window()
+            .max(lab::MIN_WINDOW.load(Ordering::Relaxed));
+        #[cfg(not(feature = "bench"))]
+        let inner = self.inner.window();
+        self.capped(inner)
     }
 
     /// Cubic's metrics, with the window this controller gives quinn (the
