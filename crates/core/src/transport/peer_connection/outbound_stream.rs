@@ -185,9 +185,13 @@ enum CappedAttempt<'a> {
 /// wait is checked: a fragment can still fail on the node cap at the
 /// deadline. If it had to sleep, the attempt ends (`Retry`),
 /// so the cwnd check and the node-wide take of the next attempt are back to
-/// back. Then it takes from the node-wide cap with `try_take`: on a refusal
-/// it sleeps for the jittered deficit and retries, keeping the connection
-/// payment. Nothing is reserved on the node-wide cap.
+/// back. Then it waits in the node-wide cap's admission queue, the one the
+/// QUIC endpoint waits in (`StreamPacing::wait_for_admission`), racing the
+/// stream's deadline; if it had to wait the attempt ends (`Retry`) so the
+/// cwnd check comes again right before the take. Then it takes with
+/// `try_take`; a take that still fails (another sender took the refill
+/// first) retries, keeping the connection payment. Nothing is reserved on
+/// the node-wide cap: the queue holds a waker, not bytes.
 async fn capped_attempt<'a, S: super::super::Socket, T: TimeSource>(
     socket: &'a S,
     cap: &'a super::super::egress_cap::EgressCap,
@@ -227,6 +231,19 @@ async fn capped_attempt<'a, S: super::super::Socket, T: TimeSource>(
             };
         }
     }
+    match pacing
+        .wait_for_admission(time_source, cap, super::super::egress_cap::PACED_TAKE_BYTES)
+        .await
+    {
+        Ok(super::super::egress_cap::Admission::Now) => {}
+        Ok(super::super::egress_cap::Admission::Waited) => return CappedAttempt::Retry,
+        Err(gap) => {
+            return CappedAttempt::Abandon {
+                gap,
+                refused: false,
+            };
+        }
+    }
     match super::super::egress_cap::try_take(socket, pacing.slept()) {
         Ok(take) => {
             if let Some(payment) = payment.take() {
@@ -234,13 +251,8 @@ async fn capped_attempt<'a, S: super::super::Socket, T: TimeSource>(
             }
             CappedAttempt::Send(take)
         }
-        Err(deficit) => match pacing.sleep(time_source, cap, deficit).await {
-            Ok(()) => CappedAttempt::Retry,
-            Err(gap) => CappedAttempt::Abandon {
-                gap,
-                refused: false,
-            },
-        },
+        // Another sender took the refill first: queue again.
+        Err(_) => CappedAttempt::Retry,
     }
 }
 
@@ -4656,9 +4668,9 @@ mod egress_cap_tests {
         // A round holds ROUND_LIMIT reservations, so at most about
         // ROUND_LIMIT streams can keep a reservation within the deadline at
         // once; streams admitted past that are refused at a later fragment.
-        // Measured: 20 of 30, send and pipe. The run draws no randomness
-        // (the node cap never refuses, so no jittered sleep happens; checked
-        // below), so the count does not vary with the seed. The floor leaves
+        // Measured: 20 of 30, send and pipe. The node cap never binds here
+        // (checked below), so the count does not vary with the seed. The
+        // floor leaves
         // 4 streams for rounding at the round boundary.
         const MIN_SURVIVORS: usize = ROUND_LIMIT - 4;
         const FRAGMENTS: usize = 8;

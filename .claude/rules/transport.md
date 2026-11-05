@@ -111,13 +111,23 @@ refill also covered: capacity moves between connections, the node cap
 holds; so no timer-slack margin is needed), and a send error after the
 take does not refund it (as uncapped). Rate updates every RTT can
 reorder waiters slightly, as on the uncapped reserve path; order is not
-a correctness property of the cap. Then each attempt is:
-cwnd check, node-wide egress_cap::try_take, back to back with no await
-before the send; if the cap is short, sleep through StreamPacing (deficit x
-U[1.0, 1.4) + U[0, 2 ms)) and start again from the cwnd check. NODE-CAP
-ADMISSION IS A RACE: nothing is held on the cap while waiting, the order
-among waiters is random, so connections share the cap by their number of
-waiting streams (no isolation between connections). The kept connection
+a correctness property of the cap. Then each attempt is: wait in the
+node-wide cap's admission queue (StreamPacing::wait_for_admission over
+EgressCap::poll_admit, the SAME queue the QUIC endpoint waits in); if it had
+to wait, start again from the cwnd check, which the queue then admits at
+once; then cwnd check and egress_cap::try_take back to back with no await
+before the send (a take that still fails, because another sender took the
+refill first, queues again). NODE-CAP ADMISSION IS FIFO: each waiting
+stream and each waiting QUIC connection is one entry, served in the order
+it queued (staggered timers, woken by give-backs). The queue holds a waker
+and a place, never bytes. So connections share the cap by their number of
+waiting senders (no isolation between connections). The wait races the
+stream's deadline (cut at LONG_WAIT and at PACED_WAIT_DEADLINE, check()
+after each cut), so abandonment and its counters mean what they did. Past
+MAX_ADMISSION_WAKERS (1024) queued waiters, newer ones hold no waker but
+keep their place and their staggered timer; no waiter is evicted (evicting
+the oldest sent the longest waiters to the back, and 500 of 1524 streams
+sent once in 2 s). The kept connection
 payment can be stale after a cwnd or cap wait (the bucket refills under
 it): a connection may then exceed its bucket by one datagram per waiting
 stream. That moves capacity between connections only; the node cap is
@@ -126,7 +136,14 @@ NEVER put a reservation on the NODE cap (earlier reservation/hold models
 there leaked capacity). 0.2.148 used try_take + jittered retry on
 the per-connection bucket too; the race starved streams on busy connections
 past 5 s (every abandonment on capped peers was `connection`, failures
-doubled on the busiest capped peer). StreamPacing (one per stream, only with
+doubled on the busiest capped peer). The node cap kept that race (try_take
++ jittered retry) until #6112, on the reasoning that its waiters were all
+streams, equally unordered. It stopped being neutral once QUIC shared the
+cap: QUIC waits in the queue, so it won contended refills, and with the
+default minimum (below) a QUIC path took about 462 kB/s and a UDP stream
+38 kB/s of a 500 kB/s cap (40 seeds). The 0.2.148 lesson applies: a random
+race among waiters starves the unlucky ones, so stream waiters now queue
+too (249 and 251 kB/s measured the same way). StreamPacing (one per stream, only with
 a cap) measures the gap since the stream's previous fragment was sent, the
 gap the receiver's STREAM_INACTIVITY_TIMEOUT times, and is checked BEFORE
 every take and after every sleep, and on every poll of the cwnd wait: at
@@ -774,12 +791,17 @@ Rate calculation on every rate update (peer_connection::paced_rate; #6047):
   1 MB/s, which GlobalBandwidthManager clamps to the total), a total below
   n x 1 MB/s, so nearly every residential cap, gives every connection a share
   of min(1 MB/s, total): each QUIC window cap is total x RTT and apportions
-  nothing, and the egress cap itself is not neutral between the transports.
-  QUIC waits in poll_admit (a queued waker, woken in order as the bucket
-  refills); a UDP stream sender takes with try_take and sleeps jittered
-  deficits, so QUIC wins contended refills. Measured the same way with the
-  default minimum: QUIC about 462 kB/s, UDP about 38 kB/s (40 seeds). #6112
-  tracks the fix.
+  nothing. The egress cap's admission queue apportions it instead: QUIC and
+  UDP stream senders wait in the same FIFO (see "Node-wide egress cap"), so
+  each waiting sender gets a turn. Measured the same way with the default
+  minimum: QUIC 249362 to 249363 B/s, one UDP stream 250568 B/s (40 seeds;
+  before #6112 QUIC 461 to 463 kB/s, UDP 37 to 39 kB/s). With four UDP
+  streams on the other connection: QUIC about 100 kB/s, the streams about
+  400 kB/s, since the queue serves senders, not connections (with no QUIC
+  path, one stream against four on another connection: 100 and 400 kB/s).
+  With the minimum below the share the connection buckets bound each side:
+  QUIC 239332 to 240057 B/s, UDP 249943 to 250106 B/s, with one or four
+  streams. No fragment reached the stream deadline in any case.
   CappedCubic::metrics reports the capped window as congestion_window.
   The transport sets the rate when it binds (bind_udp_listener, pinned by
   the_transport_gives_the_endpoint_its_bandwidth_settings); QuicSettings
