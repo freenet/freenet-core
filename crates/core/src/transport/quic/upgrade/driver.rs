@@ -1013,11 +1013,21 @@ impl Session {
     fn build_path(&self, state: &mut SessionState, attempt: u32, connection: QuicConnection) {
         // At once, not when the peer's bit arrives: the peer's first stream can
         // overtake the frame that carries it.
-        let limits = if state.machine.accepts_data() {
+        #[cfg_attr(not(any(test, feature = "testing")), allow(unused_mut))]
+        let mut limits = if state.machine.accepts_data() {
             QuicPathLimits::DEFAULT
         } else {
             QuicPathLimits::SHADOW
         };
+        #[cfg(any(test, feature = "testing"))]
+        if self
+            .hub
+            .trace
+            .as_ref()
+            .is_some_and(|trace| trace.refuses_data_while_advertising())
+        {
+            limits = QuicPathLimits::SHADOW;
+        }
         let (path, controls) = QuicPath::with_budget(
             connection,
             self.hub.path_clock.clone(),
