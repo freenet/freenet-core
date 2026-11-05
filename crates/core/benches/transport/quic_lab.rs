@@ -33,8 +33,8 @@ use std::time::{Duration, Instant};
 
 use freenet::transport::quic_lab::{
     Competitor, ConnSample, FRAGMENT_BYTES, LabConfig, LabController, LabPair, LabSocket, LinkSpec,
-    StreamsRun, link_report, set_controller, set_gap_on_connection_progress, set_send_window,
-    shape_port,
+    StreamsRun, link_report, set_controller, set_gap_on_connection_progress, set_min_window,
+    set_send_window, shape_port,
 };
 use freenet::transport::{TRANSPORT_METRICS, TransportKeypair, create_connection_handler};
 use tokio::sync::mpsc;
@@ -590,7 +590,8 @@ fn sample_at(samples: &[ConnSample], at: Duration) -> Option<ConnSample> {
 /// a loss-based flow on the sender's uplink during the transfer, see
 /// `quic_lab::Competitor`; `LAB_TRANSPORT=none` runs it alone for
 /// `LAB_ALONE_S`, 30), `LAB_SEND_WINDOW_KIB`
-/// (0, the node's: quinn's send window is W).
+/// (0, the node's: quinn's send window is W), `LAB_MIN_WINDOW_KIB` (0, no
+/// floor under the controller's window).
 #[test]
 fn quic_lab_loss() {
     if !enabled("quic_lab_loss") {
@@ -630,6 +631,9 @@ fn quic_lab_loss() {
     // quinn's send window in KiB, QUIC only; 0 keeps the node's (W).
     let send_window_kib: u64 = env_or("LAB_SEND_WINDOW_KIB", 0);
     set_send_window((send_window_kib > 0).then_some(send_window_kib * 1024));
+    // A floor under the controller's window in KiB, QUIC only; 0 is none.
+    let min_window_kib: u64 = env_or("LAB_MIN_WINDOW_KIB", 0);
+    set_min_window((min_window_kib > 0).then_some(min_window_kib * 1024));
     let competitor = std::env::var("LAB_COMPETITOR").as_deref() == Ok("1");
     // Throughput of the competing flow over `elapsed`, its loss and
     // queueing, and the sender uplink's own figures.
@@ -806,7 +810,7 @@ fn quic_lab_loss() {
         println!(
             "LAB_LOSS transport={transport} threads={threads} streams={streams} stream_kib={} \
              window_kib={} loss={loss} seed={seed} delay_ms={delay_ms} rate_mbit={rate_mbit} \
-             controller={controller} gap={gap_rule} send_window_kib={send_window_kib} rep={rep} {line}",
+             controller={controller} gap={gap_rule} send_window_kib={send_window_kib} min_window_kib={min_window_kib} rep={rep} {line}",
             stream_bytes / 1024,
             window / 1024,
         );
