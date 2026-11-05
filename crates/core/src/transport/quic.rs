@@ -879,6 +879,13 @@ impl QuicEndpoint {
 }
 
 impl EndpointCore {
+    /// Connections quinn still holds on this endpoint, draining ones included
+    /// (`quic::memory_tests` checks a closed side is gone before counting it).
+    #[cfg(test)]
+    pub(crate) fn open_connections(&self) -> usize {
+        self.endpoint.open_connections()
+    }
+
     /// The next incoming connection attempt from an allowed source, with its
     /// handshake NOT awaited: the caller drives it with
     /// [`QuicIncoming::establish`], so one stalled handshake does not hold

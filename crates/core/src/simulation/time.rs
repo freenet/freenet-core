@@ -297,6 +297,23 @@ impl VirtualTime {
         }
     }
 
+    /// Reserves room for `additional` more pending wakeups, so a test that
+    /// counts heap bytes (`transport::quic::memory_tests`) is not charged the
+    /// growth of these tables, which keep their capacity.
+    #[cfg(test)]
+    pub(crate) fn reserve_wakeups(&self, additional: usize) {
+        self.state
+            .pending_wakeups
+            .lock()
+            .unwrap()
+            .reserve(additional);
+        self.state
+            .pending_wakers
+            .lock()
+            .unwrap()
+            .reserve(additional);
+    }
+
     /// Returns the number of pending wakeups.
     pub fn pending_wakeup_count(&self) -> usize {
         self.state.pending_wakeups.lock().unwrap().len()
