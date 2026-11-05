@@ -44,6 +44,7 @@ use ring_crypto::{hkdf, hmac};
 use super::cid::MacConnectionIdGenerator;
 use crate::config::GlobalRng;
 use crate::simulation::TimeSource;
+use crate::transport::global_bandwidth::GlobalBandwidthManager;
 
 /// The largest UDP payload the endpoint sends or advertises it accepts: the
 /// UDP transport's packet size and QUIC's minimum (RFC 9000 section 14), so
@@ -310,8 +311,52 @@ pub(crate) const MAX_WINDOW_BYTES: u64 = 2 * 1024 * 1024;
 /// divisor: one twentieth, 5%.
 const WINDOW_MEMORY_DIVISOR: usize = 20;
 
+/// The rate a QUIC connection's window is capped at
+/// (`recycle::CappedCubic`): the fair share of `total-bandwidth-limit` when
+/// that is set, otherwise `bandwidth-limit`, otherwise none. The same rule as
+/// the UDP transport's token bucket (`peer_connection::paced_rate`), which it
+/// calls, so the two cannot drift. `bandwidth_limit` is the value after
+/// `peer_connection::effective_bandwidth_limit`, as on the UDP side.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct QuicRateLimit {
+    bandwidth_limit: Option<usize>,
+    global: Option<Arc<GlobalBandwidthManager>>,
+}
+
+impl QuicRateLimit {
+    pub(crate) fn new(
+        bandwidth_limit: Option<usize>,
+        global: Option<Arc<GlobalBandwidthManager>>,
+    ) -> Self {
+        Self {
+            bandwidth_limit,
+            global,
+        }
+    }
+
+    /// The cap in bytes per second now, or `None` for no cap. The fair
+    /// share is read on each call, so it follows the connection count.
+    pub(crate) fn rate(&self) -> Option<u64> {
+        // `paced_rate` lowers a controller's rate to the cap; given no
+        // controller rate (`usize::MAX`) it returns the cap itself, or
+        // `usize::MAX` when there is none.
+        let global = self
+            .global
+            .as_ref()
+            .map(|global| global.current_per_connection_rate());
+        match crate::transport::peer_connection::paced_rate(
+            usize::MAX,
+            global,
+            self.bandwidth_limit,
+        ) {
+            usize::MAX => None,
+            rate => Some(rate as u64),
+        }
+    }
+}
+
 /// What the endpoint's settings are derived from.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct QuicSettings {
     /// `max-number-of-connections`: the windows are split between this many.
     pub max_connections: usize,
@@ -321,6 +366,10 @@ pub(crate) struct QuicSettings {
     /// source's connection idle timeout (24 h on `VirtualTime`), so a
     /// simulation can see a silent QUIC path time out. `None` in production.
     pub idle_timeout: Option<Duration>,
+    /// The rate each connection's window is capped at. Set by the transport
+    /// from its bandwidth settings when it binds (`bind_udp_listener`);
+    /// none in what the config produces.
+    pub rate_limit: QuicRateLimit,
 }
 
 impl QuicSettings {
@@ -450,9 +499,12 @@ pub(crate) fn transport_config<T: TimeSource>(
         .mtu_discovery_config(None::<MtuDiscoveryConfig>)
         .pad_to_mtu(false)
         .enable_segmentation_offload(false)
-        // Cubic, wrapped to count the packets the peer acknowledges (the
-        // path's acknowledgement watch, `recycle`).
-        .congestion_controller_factory(Arc::new(super::recycle::AckCountingFactory::default()))
+        // Cubic, wrapped to cap the window to the configured bandwidth and to
+        // count the packets the peer acknowledges (the path's acknowledgement
+        // watch), `recycle::CappedCubic`.
+        .congestion_controller_factory(Arc::new(super::recycle::CappedCubicFactory::new(
+            settings.rate_limit.clone(),
+        )))
         .initial_rtt(Duration::from_millis(333))
         .packet_threshold(3)
         .time_threshold(9.0 / 8.0)

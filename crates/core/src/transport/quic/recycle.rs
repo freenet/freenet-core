@@ -46,8 +46,9 @@
 //! each batch of acknowledgements, the bytes still in flight
 //! (`Controller::on_end_acks`); packets later declared lost are reported
 //! through `on_congestion_event`. So the transport config wraps Cubic in
-//! [`AckCounting`], which records those and otherwise passes every call
-//! through. The other two inputs are from `ConnectionStats`:
+//! [`CappedCubic`], which records those and passes every call through,
+//! except that it lowers the window to the configured bandwidth (below). The
+//! other two inputs are from `ConnectionStats`:
 //! - sent: the ack-eliciting frames this side sent (`frame_tx`, every frame
 //!   kind except ACK and CONNECTION_CLOSE), [`ack_eliciting_frames`];
 //! - the peer sent: every frame received from it (`frame_rx`), which counts
@@ -106,6 +107,19 @@
 //! happen while migration is off: quinn validates a path only when the
 //! peer's address changes, and this node does not accept that.
 //!
+//! # The window cap
+//!
+//! `bandwidth-limit` and the fair share under `total-bandwidth-limit` pace
+//! the UDP transport's streams through each connection's token bucket, which
+//! QUIC does not use. So [`CappedCubic::window`] returns Cubic's window,
+//! lowered to `rate x smoothed RTT` with a floor of two datagrams, where
+//! `rate` follows the UDP rule (`QuicRateLimit`, which reuses
+//! `peer_connection::paced_rate`). quinn's pacer and its in-flight limit both
+//! read this window, so a path's sending rate averages about `rate`. With no
+//! limit configured, or before the first RTT sample, the window is Cubic's.
+//! The limit covers everything the path sends, short messages and control
+//! frames included, where the UDP bucket paces only stream fragments.
+//!
 //! [`QuicCloseCode`]: crate::transport::metrics::QuicCloseCode
 
 use std::any::Any;
@@ -118,6 +132,7 @@ use quinn::FrameStats;
 use quinn::congestion::{Controller, ControllerFactory, ControllerMetrics};
 
 use super::QuicCloser;
+use super::config::QuicRateLimit;
 #[cfg(doc)]
 use super::error::close_code;
 use super::socket::{CapHoldReading, CapHolds};
@@ -206,19 +221,43 @@ impl SendAborts {
     }
 }
 
-/// Builds [`AckCounting`] controllers around Cubic.
+/// Builds [`CappedCubic`] controllers around Cubic, capped by `rate`.
 #[derive(Debug, Default)]
-pub(crate) struct AckCountingFactory {
+pub(crate) struct CappedCubicFactory {
     cubic: Arc<quinn::congestion::CubicConfig>,
+    rate: QuicRateLimit,
 }
 
-impl ControllerFactory for AckCountingFactory {
-    fn build(self: Arc<Self>, now: Instant, current_mtu: u16) -> Box<dyn Controller> {
-        Box::new(AckCounting::new(self.cubic.clone().build(now, current_mtu)))
+impl CappedCubicFactory {
+    pub(crate) fn new(rate: QuicRateLimit) -> Self {
+        Self {
+            cubic: Arc::default(),
+            rate,
+        }
     }
 }
 
-/// What [`AckCounting`] records, under one lock so a reader sees one
+impl ControllerFactory for CappedCubicFactory {
+    fn build(self: Arc<Self>, now: Instant, current_mtu: u16) -> Box<dyn Controller> {
+        Box::new(CappedCubic::new(
+            self.cubic.clone().build(now, current_mtu),
+            self.rate.clone(),
+            current_mtu,
+        ))
+    }
+}
+
+/// The window [`CappedCubic`] allows at `rate` bytes per second over a
+/// smoothed RTT of `srtt`: `rate x srtt`, and never less than two datagrams
+/// of `mtu`, so a slow path still makes progress.
+pub(crate) fn rate_window(rate: u64, srtt: Duration, mtu: u16) -> u64 {
+    let bytes = u128::from(rate) * srtt.as_nanos() / 1_000_000_000;
+    u64::try_from(bytes)
+        .unwrap_or(u64::MAX)
+        .max(2 * u64::from(mtu))
+}
+
+/// What [`CappedCubic`] records, under one lock so a reader sees one
 /// consistent state.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AckState {
@@ -244,19 +283,29 @@ impl AckState {
     }
 }
 
-/// A congestion controller that records the acknowledgements the peer
-/// sends ([`AckState`]) and passes every call to `inner` unchanged. Its
-/// clones (quinn's `Connection::congestion_state`) share the record.
-pub(crate) struct AckCounting {
+/// A congestion controller that lowers `inner`'s window to the configured
+/// bandwidth (see "The window cap" in the module docs), records the
+/// acknowledgements the peer sends ([`AckState`]), and otherwise passes every
+/// call to `inner` unchanged. Its clones (quinn's
+/// `Connection::congestion_state`) share the record.
+pub(crate) struct CappedCubic {
     inner: Box<dyn Controller>,
     state: Arc<Mutex<AckState>>,
+    rate: QuicRateLimit,
+    /// The latest smoothed RTT quinn reported (`on_ack`); `None` before the
+    /// first.
+    srtt: Option<Duration>,
+    mtu: u16,
 }
 
-impl AckCounting {
-    fn new(inner: Box<dyn Controller>) -> Self {
+impl CappedCubic {
+    pub(crate) fn new(inner: Box<dyn Controller>, rate: QuicRateLimit, mtu: u16) -> Self {
         Self {
             inner,
             state: Arc::default(),
+            rate,
+            srtt: None,
+            mtu,
         }
     }
 
@@ -267,7 +316,7 @@ impl AckCounting {
     }
 }
 
-impl Controller for AckCounting {
+impl Controller for CappedCubic {
     fn on_sent(&mut self, now: Instant, bytes: u64, last_packet_number: u64) {
         self.inner.on_sent(now, bytes, last_packet_number);
     }
@@ -281,6 +330,7 @@ impl Controller for AckCounting {
         rtt: &quinn_proto::RttEstimator,
     ) {
         self.state.lock().acked += 1;
+        self.srtt = Some(rtt.get());
         self.inner.on_ack(now, sent, bytes, app_limited, rtt);
     }
 
@@ -317,11 +367,16 @@ impl Controller for AckCounting {
     }
 
     fn on_mtu_update(&mut self, new_mtu: u16) {
+        self.mtu = new_mtu;
         self.inner.on_mtu_update(new_mtu);
     }
 
     fn window(&self) -> u64 {
-        self.inner.window()
+        let window = self.inner.window();
+        match (self.rate.rate(), self.srtt) {
+            (Some(rate), Some(srtt)) => window.min(rate_window(rate, srtt, self.mtu)),
+            (None, _) | (_, None) => window,
+        }
     }
 
     fn metrics(&self) -> ControllerMetrics {
@@ -332,6 +387,9 @@ impl Controller for AckCounting {
         Box::new(Self {
             inner: self.inner.clone_box(),
             state: self.state.clone(),
+            rate: self.rate.clone(),
+            srtt: self.srtt,
+            mtu: self.mtu,
         })
     }
 
@@ -404,7 +462,7 @@ pub(crate) struct AckSample {
 
 impl AckSample {
     /// The connection's counts now, or `None` if its controller is not an
-    /// [`AckCounting`] (a config that does not install it).
+    /// [`CappedCubic`] (a config that does not install it).
     ///
     /// Read in this order: the record, then the stats, then `cap_holds`.
     /// The controller callbacks that write the record, the frame counts in
@@ -418,7 +476,7 @@ impl AckSample {
         let record = connection
             .congestion_state()
             .into_any()
-            .downcast::<AckCounting>()
+            .downcast::<CappedCubic>()
             .ok()?
             .state;
         let state = *record.lock();
@@ -690,5 +748,7 @@ pub(crate) async fn watch_acknowledgements<T: TimeSource>(
     }
 }
 
+#[cfg(test)]
+mod cap_tests;
 #[cfg(test)]
 mod tests;
