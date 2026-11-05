@@ -654,11 +654,14 @@ fn quic_lab_loss() {
                     }
                     let mut arrivals = Vec::new();
                     // Stop at the last message, or once nothing has arrived
-                    // for 30 s (six receiver gaps), or after 600 s.
+                    // for `LAB_UDP_IDLE_S` (30 s, six receiver gaps; streams
+                    // that share a slow link all finish near the end, so
+                    // raise it there), or after 600 s.
+                    let idle = Duration::from_secs(env_or("LAB_UDP_IDLE_S", 30));
                     while arrivals.len() < usize::from(streams)
                         && start.elapsed() < Duration::from_secs(600)
                     {
-                        match tokio::time::timeout(Duration::from_secs(30), got.recv()).await {
+                        match tokio::time::timeout(idle, got.recv()).await {
                             Ok(Some(len)) => {
                                 assert_eq!(len, stream_bytes + 8);
                                 arrivals.push(start.elapsed().as_secs_f64());
