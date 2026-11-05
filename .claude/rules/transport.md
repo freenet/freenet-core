@@ -315,15 +315,18 @@ RETRANSMIT_CREDIT_CAP = 64 full packets, starts full):
     ACK resets the backoff (a lone loss on a quiet connection, or probing a
     silent path);
   → abandoning needs no credit, including a packet behind a held-back head
-    (take_due_abandonable): it sends nothing and frees flight size.
+    (take_due_abandonable): it sends nothing and frees flight size;
+  → a resend refused for credit is abandoned once MAX_CREDIT_WAIT (60 s) past
+    its deadline, the head or a due packet behind it. Without this, a path
+    losing most of OUR receipts pinned MBs in flight indefinitely (the held
+    packets are mostly delivered ones, and their re-sends earn credit only
+    if the re-ack survives, so credit decays). Applies only on refusal.
 A resend held back is counted once in transport_snapshot.retransmits_deferred
 (until a resend is next admitted).
-On a path that delivers nothing while the connection stays open, abandoning
-takes longer than before: each packet still needs MAX_PACKET_RETRANSMITS
-admitted resends, and without credit the connection admits one per
-effective RTO. Stream packets are released earlier by drop_stream when the
-stream aborts, and a connection that receives nothing closes at the 120 s
-idle timeout.
+Receipt loss does not slow delivery (streams complete on data, not on
+receipts): link_model::storm_tests::receipt_loss_neither_slows_delivery_nor_pins_flight
+checks it at 70% loss of the receiver's packets, and that the held resends
+leave flight within MAX_CREDIT_WAIT.
 
 DO NOT remove the credit or let retransmissions bypass it: the storm comes
 back (link_model::storm_tests::shared_saturated_uplink_does_not_collapse).

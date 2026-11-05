@@ -16,6 +16,11 @@
 //! subject. The rest is the allowance of `CREDIT_PER_ACKED_BYTE` = 2, which
 //! lets retransmissions run at up to twice the rate they are delivered so a
 //! connection recovers from an outage in a few round trips.
+//!
+//! `receipt_loss_neither_slows_delivery_nor_pins_flight` covers the other
+//! side of the credit: on a path that loses most of the receiver's packets,
+//! and so most of the sender's receipts, delivery must not slow and the
+//! resends held for credit must not stay in flight.
 
 use std::future::Future;
 use std::net::SocketAddr;
