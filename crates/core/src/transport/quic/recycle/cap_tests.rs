@@ -358,6 +358,12 @@ impl Link {
 
     /// [`Self::send`], from `a` to `b` when `from_a`, else from `b` to `a`.
     async fn send_from(&self, from_a: bool, len: usize, limit: Duration) -> Duration {
+        self.send_timed(from_a, len, limit).await.1
+    }
+
+    /// [`Self::send_from`], also returning when the transfer started (ns on
+    /// the link's clock, once the connection was up).
+    async fn send_timed(&self, from_a: bool, len: usize, limit: Duration) -> (u64, Duration) {
         let _permit = self
             .b
             .allow_peer(self.a_addr, self.a_keys.public())
@@ -390,7 +396,7 @@ impl Link {
             assert_eq!(read.len(), len);
             let elapsed = Duration::from_nanos(time.now_nanos() - start);
             drop((client, server));
-            elapsed
+            (start, elapsed)
         })
         .await
     }
@@ -557,29 +563,37 @@ fn a_quic_path_and_udp_streams_both_progress_under_an_egress_cap() {
     })
 }
 
-/// Under a saturated egress cap shared by two connections, a QUIC path and a
-/// UDP stream sender on the other connection each get their fair share, half
-/// the cap, within 15%. The UDP sender is paced as the UDP transport paces a
-/// stream fragment: it reserves from its own connection's token bucket at the
-/// share (`TokenBucket::reserve`), then takes from the egress cap. Both
-/// transfers run for the whole measured window, the QUIC transfer's time, and
-/// each side's rate is the bytes it put on the wire in that window.
+/// Under a saturated egress cap shared by two connections, with the minimum
+/// per connection set below the share, a QUIC path and a UDP stream sender on
+/// the other connection each get their fair share, half the cap, within 15%.
+/// The UDP sender is paced as the UDP transport paces a stream fragment: it
+/// reserves from its own connection's token bucket at the share
+/// (`TokenBucket::reserve`), then takes from the egress cap. Each side's rate
+/// is the bytes it put on the wire while the QUIC transfer ran, from when its
+/// connection was up.
 ///
-/// Measured: QUIC about 239 kB/s and UDP about 253 kB/s of a 250 kB/s share.
+/// What it covers is narrow: two connections, the same RTT, one flow each,
+/// and a minimum below the share. With the default minimum the share is the
+/// whole cap and the window cap does not apportion it (see `transport.md`).
+/// Seeded; over 40 seeds the rates ranged 239354 to 239658 B/s for QUIC and
+/// 249990 to 250105 B/s for UDP.
+///
+/// Measured: QUIC about 239 kB/s and UDP about 250 kB/s of a 250 kB/s share.
 /// With the window cap removed (and Cubic no longer told about it) QUIC took
 /// about 491 kB/s and UDP about 12 kB/s, so the window cap is what holds QUIC
 /// to its share here.
 ///
-/// #6112 reported QUIC at about 390 kB/s against a 250 kB/s share. That share
-/// was wrong: the test built its manager with the default minimum per
-/// connection (1 MB/s), which `GlobalBandwidthManager::new` clamps to the
-/// total, so each connection's share was the whole 500 kB/s cap, and 390 kB/s
-/// was within it. The share here sets a minimum below it.
+/// #6112 measured QUIC at about 390 kB/s against what it took for a 250 kB/s
+/// share. With the default minimum per connection (1 MB/s, which
+/// `GlobalBandwidthManager::new` clamps to the total) the share is the whole
+/// cap, so the window cap does not apportion it; that case is the open part
+/// of #6112, and this test sets a minimum below the share.
 #[test]
 fn a_quic_path_and_udp_streams_each_get_their_fair_share_under_a_saturated_egress_cap() {
     use crate::transport::egress_cap::{jittered, try_take};
     use crate::transport::token_bucket::TokenBucket;
     bounded(|| async move {
+        let _seed = crate::config::GlobalRng::seed_guard(0x5940_6112);
         const CAP: u64 = 500_000;
         const QUIC_LEN: usize = 2_000_000;
         let share = CAP as f64 / 2.0;
@@ -626,8 +640,9 @@ fn a_quic_path_and_udp_streams_each_get_their_fair_share_under_a_saturated_egres
                 }
             })
         };
-        let start = link.time.now_nanos();
-        let elapsed = link.send(QUIC_LEN, Duration::from_secs(120)).await;
+        let (start, elapsed) = link
+            .send_timed(true, QUIC_LEN, Duration::from_secs(120))
+            .await;
         udp.abort();
         let end = start + elapsed.as_nanos() as u64;
         let (mut quic, mut udp_bytes) = (0u64, 0u64);

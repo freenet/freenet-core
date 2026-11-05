@@ -764,15 +764,22 @@ Rate calculation on every rate update (peer_connection::paced_rate; #6047):
   takes that connection's full share, so a peer whose traffic is split across
   both transports can get up to twice its share (the egress cap still bounds
   the node). e5b-6 decides whether one peer's streams stay on one transport.
-  Under a saturated egress cap the window cap still holds a QUIC path to its
-  share: a_quic_path_and_udp_streams_each_get_their_fair_share_under_a_
-  saturated_egress_cap measured QUIC about 239 kB/s and a UDP stream sender
-  about 253 kB/s of a 250 kB/s share (491 and 12 kB/s with the window cap
-  removed). The earlier report of 390 kB/s against 250 kB/s (#6112) came from
-  a share that was really the whole cap: GlobalBandwidthManager clamps the
-  default minimum per connection (DEFAULT_MIN_PER_CONNECTION, 1 MB/s) to the
-  total, so with a total below n x 1 MB/s every connection's share, UDP's and
-  QUIC's alike, is min(1 MB/s, total) and the egress cap arbitrates.
+  Under a saturated egress cap, the window cap apportions it only when the
+  per-connection share is below the cap. With the minimum per connection set
+  below the share (two connections, one flow each, equal RTT),
+  a_quic_path_and_udp_streams_each_get_their_fair_share_under_a_saturated_
+  egress_cap measured QUIC about 239 kB/s and a UDP stream sender about
+  250 kB/s of a 250 kB/s share, over 40 seeds (491 and 12 kB/s with the
+  window cap removed). With the DEFAULT minimum (DEFAULT_MIN_PER_CONNECTION,
+  1 MB/s, which GlobalBandwidthManager clamps to the total), a total below
+  n x 1 MB/s, so nearly every residential cap, gives every connection a share
+  of min(1 MB/s, total): each QUIC window cap is total x RTT and apportions
+  nothing, and the egress cap itself is not neutral between the transports.
+  QUIC waits in poll_admit (a queued waker, woken in order as the bucket
+  refills); a UDP stream sender takes with try_take and sleeps jittered
+  deficits, so QUIC wins contended refills. Measured the same way with the
+  default minimum: QUIC about 462 kB/s, UDP about 38 kB/s (40 seeds). #6112
+  tracks the fix.
   CappedCubic::metrics reports the capped window as congestion_window.
   The transport sets the rate when it binds (bind_udp_listener, pinned by
   the_transport_gives_the_endpoint_its_bandwidth_settings); QuicSettings
