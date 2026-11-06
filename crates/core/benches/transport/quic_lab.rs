@@ -31,6 +31,7 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
+use freenet::transport::quic_lab::set_connection_gap;
 use freenet::transport::quic_lab::{
     Competitor, ConnSample, FRAGMENT_BYTES, LabConfig, LabController, LabMany, LabPair, LabSocket,
     LinkSpec, StreamsRun, link_report, set_controller, set_gap_on_connection_progress,
@@ -628,6 +629,8 @@ fn quic_lab_loss() {
         "connection" => true,
         other => panic!("unknown gap rule {other}"),
     });
+    let conn_gap_s: u64 = env_or("LAB_CONN_GAP_S", 0);
+    set_connection_gap((conn_gap_s > 0).then(|| Duration::from_secs(conn_gap_s)));
     let print_failures = std::env::var("LAB_FAILURES").as_deref() == Ok("1");
     // quinn's send window in KiB, QUIC only; 0 keeps the node's (W).
     let send_window_kib: u64 = env_or("LAB_SEND_WINDOW_KIB", 0);
@@ -811,7 +814,7 @@ fn quic_lab_loss() {
         println!(
             "LAB_LOSS transport={transport} threads={threads} streams={streams} stream_kib={} \
              window_kib={} loss={loss} seed={seed} delay_ms={delay_ms} rate_mbit={rate_mbit} \
-             controller={controller} gap={gap_rule} send_window_kib={send_window_kib} min_window_kib={min_window_kib} rep={rep} {line}",
+             controller={controller} gap={gap_rule} conn_gap_s={conn_gap_s} send_window_kib={send_window_kib} min_window_kib={min_window_kib} rep={rep} {line}",
             stream_bytes / 1024,
             window / 1024,
         );
@@ -945,6 +948,8 @@ fn quic_lab_many() {
     });
     let gap_rule = std::env::var("LAB_GAP").unwrap_or_else(|_| "stream".into());
     set_gap_on_connection_progress(gap_rule == "connection");
+    let conn_gap_s: u64 = env_or("LAB_CONN_GAP_S", 0);
+    set_connection_gap((conn_gap_s > 0).then(|| Duration::from_secs(conn_gap_s)));
     let min_window_kib: u64 = env_or("LAB_MIN_WINDOW_KIB", 0);
     set_min_window((min_window_kib > 0).then_some(min_window_kib * 1024));
     let competitor = std::env::var("LAB_COMPETITOR").as_deref() == Ok("1");
@@ -1176,6 +1181,8 @@ fn quic_lab_mix() {
     });
     let gap_rule = std::env::var("LAB_GAP").unwrap_or_else(|_| "stream".into());
     set_gap_on_connection_progress(gap_rule == "connection");
+    let conn_gap_s: u64 = env_or("LAB_CONN_GAP_S", 0);
+    set_connection_gap((conn_gap_s > 0).then(|| Duration::from_secs(conn_gap_s)));
     let min_window_kib: u64 = env_or("LAB_MIN_WINDOW_KIB", 0);
     set_min_window((min_window_kib > 0).then_some(min_window_kib * 1024));
     let mut draw = Draw(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
@@ -1244,6 +1251,28 @@ fn quic_lab_mix() {
         results
     });
     rt.shutdown_timeout(Duration::from_secs(1));
+    // Each message of 1 MiB or more, against the fixed 120 s broadcast
+    // deadline and a size-scaled one (120 s + size / 64 KB/s).
+    for (len, outcome, at) in results.iter().filter(|r| r.0 >= 1 << 20) {
+        let scaled = 120.0 + *len as f64 / 64_000.0;
+        let sent = outcome == "Sent";
+        println!(
+            "LAB_MIX_MSG transport={transport} controller={controller} gap={gap_rule} \
+             conn_gap_s={conn_gap_s} stress={stress} loss={loss} size_mib={:.2} outcome={outcome} \
+             at_s={at:.1} fixed_120s={} scaled_s={scaled:.0} scaled={}",
+            *len as f64 / f64::from(1 << 20),
+            if sent && *at <= 120.0 {
+                "met"
+            } else {
+                "missed"
+            },
+            if sent && *at <= scaled {
+                "met"
+            } else {
+                "missed"
+            },
+        );
+    }
     let order = [
         "<=1.4KB",
         "1.4-16KiB",
@@ -1280,7 +1309,8 @@ fn quic_lab_mix() {
             });
         println!(
             "LAB_MIX transport={transport} controller={controller} gap={gap_rule} \
-             min_window_kib={min_window_kib} stress={stress} loss={loss} window_kib={} \
+             min_window_kib={min_window_kib} conn_gap_s={conn_gap_s} stress={stress} loss={loss} \
+             window_kib={} \
              bucket={bucket} n={} sent={} p50_s={:.2} p99_s={:.2} max_s={:.2} over_120s={} \
              over_300s={} failed={failed:?}",
             window / 1024,

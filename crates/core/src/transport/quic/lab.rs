@@ -84,6 +84,14 @@ pub fn set_gap_on_connection_progress(on: bool) {
     super::path::bounded::lab::GAP_ON_CONNECTION_PROGRESS.store(on, Ordering::Relaxed);
 }
 
+/// The window after the connection's last acknowledgement that keeps a
+/// send's gap from running out, under [`set_gap_on_connection_progress`];
+/// `None` is the send's own gap (5 s).
+pub fn set_connection_gap(window: Option<Duration>) {
+    let nanos = window.map_or(0, |w| u64::try_from(w.as_nanos()).unwrap_or(u64::MAX));
+    super::path::bounded::lab::CONNECTION_GAP.store(nanos, Ordering::Relaxed);
+}
+
 /// A floor under the controller's window (before the bandwidth cap), for
 /// every connection from now on; `None` for the node's (no floor).
 pub fn set_min_window(bytes: Option<u64>) {
