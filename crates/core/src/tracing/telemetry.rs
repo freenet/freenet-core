@@ -7711,6 +7711,8 @@ mod tests {
         data.lost_bytes = 1017;
         data.congestion_events = 1018;
         data.loss_rate = (1019..1027).collect();
+        data.ended_loss_rate = (1027..1035).collect();
+        data.ended_below_floor = 1035;
         let want: std::collections::BTreeMap<String, u64> =
             snapshot.quic_data.keys().into_iter().collect();
         assert!(want.values().all(|value| *value != 0));
