@@ -244,7 +244,7 @@ async fn capped_attempt<'a, S: super::super::Socket, T: TimeSource>(
             };
         }
     }
-    match super::super::egress_cap::try_take(socket, pacing.slept()) {
+    match super::super::egress_cap::try_take(socket, pacing) {
         Ok(take) => {
             if let Some(payment) = payment.take() {
                 payment.spent();

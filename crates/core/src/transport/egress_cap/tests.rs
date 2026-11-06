@@ -427,7 +427,10 @@ fn target() -> std::net::SocketAddr {
 #[test]
 fn try_take_without_a_cap_admits_at_once() {
     assert!(matches!(
-        try_take(&Sink::new(false), Duration::ZERO),
+        try_take(
+            &Sink::new(false),
+            &mut StreamPacing::new(&VirtualTime::new())
+        ),
         Ok(None)
     ));
 }
@@ -441,7 +444,9 @@ async fn the_socket_charges_every_datagram_once() {
     let socket = DemuxSocket::wrap(Sink::new(false), Some(EgressCap::new(RATE, time.clone())));
     socket.send_to(&[1; 100], target()).await.unwrap();
     socket.send_to_blocking(&[1; 50], target()).unwrap();
-    let take = try_take(&socket, Duration::ZERO).unwrap().expect("take");
+    let take = try_take(&socket, &mut StreamPacing::new(&time))
+        .unwrap()
+        .expect("take");
     socket
         .send_to_paced(&[2; 700], target(), take)
         .await
@@ -462,7 +467,9 @@ async fn failed_sends_are_not_charged() {
     let socket = DemuxSocket::wrap(Sink::new(true), Some(EgressCap::new(RATE, time.clone())));
     assert!(socket.send_to(&[1; 900], target()).await.is_err());
     assert!(socket.send_to_blocking(&[1; 900], target()).is_err());
-    let take = try_take(&socket, Duration::ZERO).unwrap().expect("take");
+    let take = try_take(&socket, &mut StreamPacing::new(&time))
+        .unwrap()
+        .expect("take");
     assert!(
         socket
             .send_to_paced(&[2; 700], target(), take)
@@ -518,7 +525,7 @@ fn simulate(
                     if time.now_nanos() >= end {
                         return;
                     }
-                    let Ok(take) = cap.try_take(PACKET, pacing.slept()) else {
+                    let Ok(take) = pacing.take(&cap, PACKET) else {
                         continue;
                     };
                     take.sent(PACKET);
@@ -1322,7 +1329,7 @@ fn simulate_restarting(rate: u64, streams: usize, duration: Duration) -> (u64, u
                     if time.now_nanos() >= end {
                         return;
                     }
-                    let Ok(take) = cap.try_take(PACKET, pacing.slept()) else {
+                    let Ok(take) = pacing.take(&cap, PACKET) else {
                         continue;
                     };
                     take.sent(PACKET);
@@ -1423,16 +1430,26 @@ async fn an_admission_is_kept_for_the_pass_and_then_queues_again() {
 }
 
 /// On a real multi-thread runtime, a sender admitted by `poll_admit` always
-/// gets its take: while its take is pending its admission counts ahead of
-/// everyone, so a sender polling on another thread in that gap is not
-/// admitted on the same datagram. Each sender yields its thread between
-/// `Ready` and the take, as a preempted task would, to widen that gap.
-/// Before admissions were counted until their take, and counted and
-/// recorded under one lock, the second sender saw nobody ahead, both were
-/// admitted on one datagram, and one take failed. An admission whose take
-/// comes later than `ADMISSION_PASS` (the thread was descheduled that long)
-/// has lapsed by design and may lose its datagram; those are counted
-/// apart.
+/// gets its take while its admission holds ([`ADMISSION_PASS`]): its
+/// admission counts ahead of everyone until its take, and every other take
+/// leaves its datagram in the bucket, so a sender polling or taking on
+/// another thread in that gap cannot use it. Each sender yields its thread
+/// between `Ready` and the take, as a preempted task would, to widen that
+/// gap; with many tests running at once, about a third of the takes come
+/// after the pass.
+///
+/// Two earlier versions lost 2 to 37 of 3200 takes here. Admissions were
+/// counted but not named, so a sender whose admission had lapsed (it was
+/// descheduled for more than the pass) still took, used the datagram owed
+/// to a newer admission, and cleared that admission as if it were its own.
+/// And the admission's time was read before the queue lock, so it could
+/// lapse before the pass had run.
+///
+/// A take after its admission lapsed may fail by design; those are counted
+/// apart, measured from just before the poll that admitted the sender, which
+/// is never later than the admission's own time. How many takes come after
+/// the pass depends on the machine's load, so the test only requires that
+/// most came within it, so that what it asserts was tested at all.
 #[test]
 fn an_admitted_take_is_not_lost_to_another_thread() {
     use crate::simulation::RealTime;
@@ -1444,25 +1461,38 @@ fn an_admitted_take_is_not_lost_to_another_thread() {
         .enable_all()
         .build()
         .unwrap();
-    let (lost, lapsed) = runtime.block_on(async {
+    let (lost, lapsed, late, outstanding) = runtime.block_on(async {
         // 4 MB/s: a datagram of refill every 300 us, so senders contend for
         // nearly every one.
         let cap = std::sync::Arc::new(EgressCap::new(4_000_000, RealTime::new()));
         cap.charge_unpaced(cap.burst_bytes() as usize);
         let lost = std::sync::Arc::new(AtomicU64::new(0));
         let lapsed = std::sync::Arc::new(AtomicU64::new(0));
+        let late = std::sync::Arc::new(AtomicU64::new(0));
         let tasks: Vec<_> = (0..SENDERS)
             .map(|_| {
-                let (cap, lost, lapsed) = (cap.clone(), lost.clone(), lapsed.clone());
+                let (cap, lost, lapsed, late) =
+                    (cap.clone(), lost.clone(), lapsed.clone(), late.clone());
                 tokio::spawn(async move {
-                    let mut waiter = AdmissionWaiter::default();
+                    let mut waiter = AdmissionWaiter::named();
                     for _ in 0..TAKES {
-                        std::future::poll_fn(|cx| cap.poll_admit(PACKET, &mut waiter, cx)).await;
-                        let admitted = std::time::Instant::now();
+                        // Read before each poll, so it is never later than
+                        // the admission's own time, read under the lock.
+                        let mut admitted = std::time::Instant::now();
+                        std::future::poll_fn(|cx| {
+                            admitted = std::time::Instant::now();
+                            cap.poll_admit(PACKET, &mut waiter, cx)
+                        })
+                        .await;
                         std::thread::yield_now();
-                        match cap.try_take(PACKET, Duration::ZERO) {
+                        let taken = cap.try_take_admitted(PACKET, Duration::ZERO, &mut waiter);
+                        let after_pass = admitted.elapsed() > ADMISSION_PASS;
+                        if after_pass {
+                            late.fetch_add(1, Ordering::Relaxed);
+                        }
+                        match taken {
                             Ok(take) => take.sent(PACKET),
-                            Err(_) if admitted.elapsed() > ADMISSION_PASS => {
+                            Err(_) if after_pass => {
                                 lapsed.fetch_add(1, Ordering::Relaxed);
                             }
                             Err(_) => {
@@ -1476,18 +1506,26 @@ fn an_admitted_take_is_not_lost_to_another_thread() {
         for task in tasks {
             task.await.unwrap();
         }
-        (lost.load(Ordering::Relaxed), lapsed.load(Ordering::Relaxed))
+        (
+            lost.load(Ordering::Relaxed),
+            lapsed.load(Ordering::Relaxed),
+            late.load(Ordering::Relaxed),
+            cap.admission.outstanding(),
+        )
     });
+    let total = (SENDERS * TAKES) as u64;
     assert_eq!(
-        lost,
-        0,
-        "{lost} of {} admitted takes found the bucket short within the pass \
-         ({lapsed} more after it lapsed)",
-        SENDERS * TAKES
+        lost, 0,
+        "{lost} of {total} admitted takes found the bucket short within the pass \
+         ({lapsed} more after it lapsed)"
+    );
+    assert_eq!(
+        outstanding, 0,
+        "every take that succeeded used its admission, and a failed one's lapsed"
     );
     assert!(
-        lapsed * 50 <= (SENDERS * TAKES) as u64,
-        "{lapsed} of {} takes came after their admission lapsed",
-        SENDERS * TAKES
+        late * 2 < total,
+        "{late} of {total} takes came after the pass: too few were within it \
+         for the test to say anything"
     );
 }

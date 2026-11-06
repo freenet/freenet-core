@@ -477,7 +477,7 @@ fn the_floor_keeps_two_datagrams_in_flight_both_ways() {
 /// `a_quic_path_and_udp_streams_each_get_their_fair_share_under_a_saturated_egress_cap`.
 #[test]
 fn a_quic_path_and_udp_streams_both_progress_under_an_egress_cap() {
-    use crate::transport::egress_cap::{PACED_WAIT_DEADLINE, try_take};
+    use crate::transport::egress_cap::{PACED_WAIT_DEADLINE, StreamPacing, try_take};
     bounded(|| async move {
         const CAP: u64 = 500_000;
         const QUIC_LEN: usize = 1_000_000;
@@ -504,8 +504,10 @@ fn a_quic_path_and_udp_streams_both_progress_under_an_egress_cap() {
                 // the cap, send at once, or sleep the deficit and try again.
                 let fragment = [0x02u8; 1200];
                 let (mut sent, mut last, mut longest) = (0, link.time.now_nanos(), 0u64);
+                // Never admitted: each take is a newcomer's.
+                let mut pacing = StreamPacing::new(&link.time);
                 while sent < UDP_LEN {
-                    match try_take(link.a_socket.as_ref(), Duration::ZERO) {
+                    match try_take(link.a_socket.as_ref(), &mut pacing) {
                         Ok(Some(take)) => {
                             let n = link
                                 .a_socket
@@ -597,7 +599,7 @@ async fn paced_udp_stream(
                 pacing = StreamPacing::new(&link.time);
                 continue;
             }
-            match try_take(link.a_socket.as_ref(), pacing.slept()) {
+            match try_take(link.a_socket.as_ref(), &mut pacing) {
                 Ok(Some(take)) => {
                     link.a_socket
                         .try_send_to_paced(&fragment, link.b_addr, take)
