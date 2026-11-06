@@ -113,6 +113,7 @@
       id="req"
       data-approve-id="{{APPROVE_ID}}"
       data-nonce="{{NONCE}}"
+      data-allow-delay-ms="{{ALLOW_DELAY_MS}}"
       hidden
     ></div>
     <script nonce="{{SCRIPT_NONCE}}">
@@ -123,7 +124,7 @@
         var result = document.getElementById('result');
         setTimeout(function () {
           allow.disabled = false;
-        }, {{ALLOW_DELAY_MS}});
+        }, Number(req.dataset.allowDelayMs));
         function answer(yes) {
           allow.disabled = true;
           deny.disabled = true;
