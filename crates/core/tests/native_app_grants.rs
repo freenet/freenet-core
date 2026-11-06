@@ -254,18 +254,23 @@ async fn native_app_grant_end_to_end() -> TestResult {
         .await?;
     assert_eq!(resp.status(), 200, "{}", resp.text().await?);
 
-    // 3. The client collects the token, once.
+    // 3. The client collects the token. A repeated poll (a lost response)
+    // returns the same token until the token is first used.
     let poll_url = format!("{base}/v1/app-grants/request/{request_id}");
-    let polled: serde_json::Value = http
-        .get(&poll_url)
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-    assert_eq!(polled["status"], "approved");
-    let token = polled["token"].as_str().unwrap().to_string();
-    assert_eq!(http.get(&poll_url).send().await?.status(), 404);
+    let mut tokens = Vec::new();
+    for _ in 0..2 {
+        let polled: serde_json::Value = http
+            .get(&poll_url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        assert_eq!(polled["status"], "approved");
+        tokens.push(polled["token"].as_str().unwrap().to_string());
+    }
+    assert_eq!(tokens[0], tokens[1], "re-collection returns the same token");
+    let token = tokens.remove(0);
 
     // 4. A connection with the token is attested as the app.
     let delegate = load_delegate(TEST_DELEGATE, Parameters::from(vec![]))?;
@@ -276,6 +281,8 @@ async fn native_app_grant_end_to_end() -> TestResult {
         MessageOrigin::WebApp(id) => assert_eq!(id, app, "wrong contract attested"),
         other => panic!("expected MessageOrigin::WebApp, got {other:?}"),
     }
+    // Used once, the token can no longer be collected.
+    assert_eq!(http.get(&poll_url).send().await?.status(), 404);
 
     // The same token in the query string is not honoured.
     let url = format!(
