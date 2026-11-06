@@ -239,7 +239,15 @@ pub(crate) struct ContractHandlerChannel<End: sealed::ChannelHalve> {
 pub(crate) struct ContractHandlerHalve {
     event_receiver: mpsc::UnboundedReceiver<InternalCHEvent>,
     waiting_response: BTreeMap<u64, tokio::sync::oneshot::Sender<(EventId, ContractHandlerEvent)>>,
+    /// Shared with the [`SenderHalve`]: `contract_handling` installs the
+    /// delegate lane's intake here once it has started the lane.
+    delegate_lane: DelegateLaneSlot,
 }
+
+/// Where client delegate requests go instead of the contract loop, once the
+/// loop has started a delegate lane (`contract::delegate_lane`). Empty until
+/// then, and for executors that do not provide a delegate runner.
+type DelegateLaneSlot = Arc<std::sync::OnceLock<mpsc::Sender<super::delegate_lane::LaneRequest>>>;
 
 /// Ownership of a client's response oneshot, removed from `waiting_response`
 /// so it can outlive a single `handle_contract_event` call.
@@ -280,6 +288,7 @@ impl StashedResponder {
 pub(crate) struct SenderHalve {
     event_sender: mpsc::UnboundedSender<InternalCHEvent>,
     wait_for_res_tx: mpsc::Sender<(ClientId, WaitingTransaction)>,
+    delegate_lane: DelegateLaneSlot,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -361,11 +370,13 @@ pub(crate) fn contract_handler_channel() -> (
     // 30s producer-side timeouts on the production gateway under realistic
     // mirror traffic. See issue #4056.
     let (wait_for_res_tx, wait_for_res_rx) = mpsc::channel(1000);
+    let delegate_lane: DelegateLaneSlot = Arc::new(std::sync::OnceLock::new());
     (
         ContractHandlerChannel {
             end: SenderHalve {
                 event_sender,
                 wait_for_res_tx,
+                delegate_lane: delegate_lane.clone(),
             },
             session_adapter_tx: None,
         },
@@ -373,6 +384,7 @@ pub(crate) fn contract_handler_channel() -> (
             end: ContractHandlerHalve {
                 event_receiver,
                 waiting_response: BTreeMap::new(),
+                delegate_lane,
             },
             session_adapter_tx: None,
         },
@@ -454,18 +466,88 @@ impl ContractHandlerChannel<SenderHalve> {
             v
         });
         let (result, result_receiver) = tokio::sync::oneshot::channel();
-        self.end
-            .event_sender
-            .send(InternalCHEvent {
+        let internal = InternalCHEvent {
+            ev,
+            id,
+            priority,
+            result,
+        };
+        // Client delegate requests go to the delegate lane when one is
+        // running, so they do not wait behind contract WASM on the loop.
+        if let Some(internal) = self.offer_to_delegate_lane(internal) {
+            self.end
+                .event_sender
+                .send(internal)
+                .map_err(|err| ContractError::ChannelDropped(Box::new(err.0.ev)))?;
+        }
+        match tokio::time::timeout(timeout, result_receiver).await {
+            Ok(Ok((_, res))) => Ok(res),
+            Ok(Err(_)) | Err(_) => Err(ContractError::NoEvHandlerResponse),
+        }
+    }
+
+    /// Hand a `DelegateRequest` to the delegate lane. Returns the event back
+    /// when it is not a delegate request, when no lane is installed, or when
+    /// the lane has exited, so the caller sends it to the loop as before.
+    ///
+    /// A FULL lane refuses the request: the responder is dropped, so the
+    /// client sees an error at once, the same shape the fair queue's own
+    /// refusal produces. Falling back to the loop instead would let a later
+    /// request for the same delegate overtake it on the lane.
+    fn offer_to_delegate_lane(&self, internal: InternalCHEvent) -> Option<InternalCHEvent> {
+        use super::delegate_lane::LaneRequest;
+        let Some(lane) = self.end.delegate_lane.get() else {
+            return Some(internal);
+        };
+        let InternalCHEvent {
+            ev,
+            id,
+            priority,
+            result,
+        } = internal;
+        let ContractHandlerEvent::DelegateRequest {
+            req,
+            origin_contract,
+            connection_scope,
+            user_context,
+        } = ev
+        else {
+            return Some(InternalCHEvent {
                 ev,
                 id,
                 priority,
                 result,
-            })
-            .map_err(|err| ContractError::ChannelDropped(Box::new(err.0.ev)))?;
-        match tokio::time::timeout(timeout, result_receiver).await {
-            Ok(Ok((_, res))) => Ok(res),
-            Ok(Err(_)) | Err(_) => Err(ContractError::NoEvHandlerResponse),
+            });
+        };
+        let request = LaneRequest {
+            id,
+            responder: result,
+            req,
+            origin_contract,
+            connection_scope,
+            user_context,
+        };
+        match lane.try_send(request) {
+            Ok(()) => None,
+            Err(mpsc::error::TrySendError::Full(request)) => {
+                tracing::warn!(
+                    delegate_key = %request.req.key(),
+                    capacity = super::delegate_lane::LANE_INTAKE_CAPACITY,
+                    "Refused a delegate request: the delegate lane is full"
+                );
+                None
+            }
+            Err(mpsc::error::TrySendError::Closed(request)) => Some(InternalCHEvent {
+                ev: ContractHandlerEvent::DelegateRequest {
+                    req: request.req,
+                    origin_contract: request.origin_contract,
+                    connection_scope: request.connection_scope,
+                    user_context: request.user_context,
+                },
+                id: request.id,
+                priority,
+                result: request.responder,
+            }),
         }
     }
 
@@ -676,6 +758,29 @@ impl ContractHandlerChannel<ContractHandlerHalve> {
             .waiting_response
             .remove(&id.id)
             .map(|sender| StashedResponder { id: id.id, sender })
+    }
+
+    /// Register a responder the delegate lane received directly, so the loop
+    /// can answer a request the lane handed it exactly as it answers one it
+    /// received itself.
+    pub(crate) fn insert_waiting_response(
+        &mut self,
+        id: u64,
+        responder: tokio::sync::oneshot::Sender<(EventId, ContractHandlerEvent)>,
+    ) -> EventId {
+        self.end.waiting_response.insert(id, responder);
+        EventId { id }
+    }
+
+    /// Route client delegate requests to `lane` from now on. Called once by
+    /// `contract_handling`; a second call is ignored.
+    pub(crate) fn install_delegate_lane(
+        &mut self,
+        lane: mpsc::Sender<super::delegate_lane::LaneRequest>,
+    ) {
+        if self.end.delegate_lane.set(lane).is_err() {
+            tracing::warn!("A delegate lane is already installed; ignoring the second one");
+        }
     }
 
     /// Check if a waiting_response entry exists for the given event ID.

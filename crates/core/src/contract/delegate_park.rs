@@ -1145,6 +1145,10 @@ pub(super) struct Continuation {
 
 /// One parked delegate.
 struct ParkEntry {
+    /// Keeps the delegate lane off this delegate for as long as it is parked
+    /// (`super::delegate_lane`). Released by the entry's drop, so every way a
+    /// park ends releases it. `None` when no lane is running.
+    _lane_claim: Option<super::delegate_lane::LoopClaim>,
     continuation: Continuation,
     /// Identity of THIS park; see [`DelegateResume::epoch`].
     epoch: u64,
@@ -1753,6 +1757,10 @@ pub(super) struct DelegateParkCtx {
     /// Kept here rather than threaded separately so every call site needs only
     /// a single `&mut DelegateParkCtx`.
     resume_tx: tokio::sync::mpsc::UnboundedSender<DelegateResume>,
+    /// The per-delegate exclusion shared with the delegate lane, when one is
+    /// running. Kept here because every loop path that starts a delegate run
+    /// already holds `&mut DelegateParkCtx`.
+    gate: Option<std::sync::Arc<super::delegate_lane::DelegateGate>>,
 }
 
 /// Why parked work was turned away, counted rather than only logged (L9).
@@ -1782,7 +1790,19 @@ impl DelegateParkCtx {
             next_epoch: 0,
             refused: RefusalCounts::default(),
             resume_tx,
+            gate: None,
         }
+    }
+
+    /// Share `gate` with the delegate lane. Called once by `contract_handling`
+    /// when it starts a lane.
+    pub(super) fn set_gate(&mut self, gate: std::sync::Arc<super::delegate_lane::DelegateGate>) {
+        self.gate = Some(gate);
+    }
+
+    /// The gate shared with the delegate lane, if one is running.
+    pub(super) fn gate(&self) -> Option<std::sync::Arc<super::delegate_lane::DelegateGate>> {
+        self.gate.clone()
     }
 
     /// The byte budget this registry is enforcing. Tests assert against THIS
@@ -1881,9 +1901,11 @@ impl DelegateParkCtx {
         self.parked_bytes = self.parked_bytes.saturating_add(bytes);
         let epoch = self.next_epoch;
         self.next_epoch = self.next_epoch.wrapping_add(1);
+        let lane_claim = self.gate.as_ref().map(|gate| gate.hold(&key));
         self.parked.insert(
             key,
             ParkEntry {
+                _lane_claim: lane_claim,
                 continuation,
                 epoch,
                 task_bytes: task_bytes.get(),
