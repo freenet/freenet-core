@@ -111,6 +111,10 @@ pub struct FaultInjectorState {
     /// and `SimNetwork::run_simulation_direct` (churn driver crashes, #4694) set it
     /// so their injected faults are real packet drops rather than silent no-ops.
     pub enforce_fault_drops: bool,
+    /// QUIC datagram cuts (`SimNetwork::drop_quic_datagrams_between_after`),
+    /// each with the bytes it has let through so far. Kept here rather than in
+    /// [`FaultConfig`], whose rules are values.
+    pub quic_datagram_cuts: Vec<(crate::simulation::QuicDatagramCut, u64)>,
 }
 
 impl FaultInjectorState {
@@ -124,6 +128,7 @@ impl FaultInjectorState {
             stats: NetworkStats::default(),
             network_name: None,
             enforce_fault_drops: false,
+            quic_datagram_cuts: Vec::new(),
         }
     }
 

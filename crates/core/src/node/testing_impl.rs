@@ -505,7 +505,7 @@ fn fault_injection_delivery_decision(
                 }
             }
         }
-        if !inj.config.quic_datagram_drops.is_empty() {
+        if !inj.config.quic_datagram_drops.is_empty() || !inj.quic_datagram_cuts.is_empty() {
             use crate::simulation::TimeSource;
             // `drop_quic_datagrams_between` and `with_fault_injection` give
             // an injector with rules a VirtualTime. One replaced by hand
@@ -523,11 +523,18 @@ fn fault_injection_delivery_decision(
                     );
                 }
             }
-            if let Some(now) = now
-                && inj.config.drops_quic_datagram(&from, &to, datagram, now)
-            {
-                inj.stats.messages_dropped_quic_datagram += 1;
-                return PacketDeliveryDecision::Drop;
+            if let Some(now) = now {
+                // Every cut sees the datagram, so each one's count stays true.
+                let cut = inj
+                    .quic_datagram_cuts
+                    .iter_mut()
+                    .fold(false, |dropped, (cut, seen)| {
+                        cut.drops(seen, &from, &to, datagram, now) | dropped
+                    });
+                if cut || inj.config.drops_quic_datagram(&from, &to, datagram, now) {
+                    inj.stats.messages_dropped_quic_datagram += 1;
+                    return PacketDeliveryDecision::Drop;
+                }
             }
         }
     }
@@ -1696,6 +1703,10 @@ pub struct SimNetwork {
     /// here so replacing the fault injector (`with_fault_injection`,
     /// `clear_fault_injection`) carries them over.
     quic_datagram_drops: Vec<crate::simulation::QuicDatagramDrop>,
+    /// QUIC datagram cuts added by `drop_quic_datagrams_between_after`. Their
+    /// byte counts live in the fault injector; a replaced injector takes them
+    /// over ([`Self::carry_quic_datagram_cuts`]).
+    quic_datagram_cuts: Vec<crate::simulation::QuicDatagramCut>,
     /// When `probe_quic_endpoints_at` asked for it: the virtual time at which
     /// `run_simulation_direct` sends each node a stranger's QUIC datagram,
     /// with the node and stranger addresses.
@@ -1879,6 +1890,7 @@ impl SimNetwork {
             shared_rings: HashMap::new(),
             node_port_override,
             quic_datagram_drops: Vec::new(),
+            quic_datagram_cuts: Vec::new(),
             quic_endpoint_probe: None,
         };
         net.config_gateways(
@@ -1906,6 +1918,7 @@ impl SimNetwork {
             fault_seed,
         )
         .with_virtual_time(self.virtual_time.clone());
+        let state = self.carry_quic_datagram_cuts(state);
         set_fault_injector(
             &self.name,
             Some(std::sync::Arc::new(std::sync::Mutex::new(state))),
@@ -2152,33 +2165,7 @@ impl SimNetwork {
         b: &NodeLabel,
         from: Duration,
     ) -> &mut Self {
-        self.drop_quic_datagrams_between_after(a, b, from, 0)
-    }
-
-    /// As [`Self::drop_quic_datagrams_between`], but the rule first lets
-    /// `after_bytes` of the pair's QUIC datagrams through from `from`, so a
-    /// test can cut the pair in the middle of a transfer
-    /// (`QuicDatagramDrop::after_bytes`).
-    #[cfg(any(test, feature = "testing"))]
-    pub fn drop_quic_datagrams_between_after(
-        &mut self,
-        a: &NodeLabel,
-        b: &NodeLabel,
-        from: Duration,
-        after_bytes: u64,
-    ) -> &mut Self {
-        let address = |label: &NodeLabel| {
-            *self
-                .node_addresses
-                .get(label)
-                .unwrap_or_else(|| panic!("no node {label}"))
-        };
-        let rule = crate::simulation::QuicDatagramDrop::new(
-            address(a),
-            address(b),
-            u64::try_from(from.as_nanos()).unwrap_or(u64::MAX),
-        )
-        .after_bytes(after_bytes);
+        let rule = self.quic_datagram_rule(a, b, from);
         let injector = crate::node::network_bridge::get_fault_injector(&self.name)
             .expect("SimNetwork::new registers a fault injector");
         let has_clock = {
@@ -2200,6 +2187,88 @@ impl SimNetwork {
         }
         self.install_fault_delivery_callback();
         self
+    }
+
+    /// As [`Self::drop_quic_datagrams_between`], but the rule first lets
+    /// `after_bytes` of the pair's QUIC datagrams through from `from`, so a
+    /// test can cut the pair in the middle of a transfer
+    /// ([`crate::simulation::QuicDatagramCut`]). The count lives in the fault
+    /// injector and survives its replacement.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn drop_quic_datagrams_between_after(
+        &mut self,
+        a: &NodeLabel,
+        b: &NodeLabel,
+        from: Duration,
+        after_bytes: u64,
+    ) -> &mut Self {
+        let cut = crate::simulation::QuicDatagramCut {
+            rule: self.quic_datagram_rule(a, b, from),
+            after_bytes,
+        };
+        let injector = crate::node::network_bridge::get_fault_injector(&self.name)
+            .expect("SimNetwork::new registers a fault injector");
+        let has_clock = {
+            let mut state = injector.lock().unwrap();
+            let has_clock = state.virtual_time.is_some();
+            if has_clock && !self.quic_datagram_cuts.contains(&cut) {
+                state.quic_datagram_cuts.push((cut.clone(), 0));
+            }
+            has_clock
+        };
+        assert!(
+            has_clock,
+            "a QUIC datagram cut needs the fault injector's VirtualTime"
+        );
+        if !self.quic_datagram_cuts.contains(&cut) {
+            self.quic_datagram_cuts.push(cut);
+        }
+        self.install_fault_delivery_callback();
+        self
+    }
+
+    /// The rule for the pair `a`, `b` from `from`.
+    fn quic_datagram_rule(
+        &self,
+        a: &NodeLabel,
+        b: &NodeLabel,
+        from: Duration,
+    ) -> crate::simulation::QuicDatagramDrop {
+        let address = |label: &NodeLabel| {
+            *self
+                .node_addresses
+                .get(label)
+                .unwrap_or_else(|| panic!("no node {label}"))
+        };
+        crate::simulation::QuicDatagramDrop::new(
+            address(a),
+            address(b),
+            u64::try_from(from.as_nanos()).unwrap_or(u64::MAX),
+        )
+    }
+
+    /// Give `state`, about to replace this network's fault injector, every
+    /// QUIC datagram cut with the count the current injector holds for it (0
+    /// for a cut it does not hold), so a replaced injector does not reopen a cut.
+    fn carry_quic_datagram_cuts(
+        &self,
+        mut state: crate::node::network_bridge::FaultInjectorState,
+    ) -> crate::node::network_bridge::FaultInjectorState {
+        let current = crate::node::network_bridge::get_fault_injector(&self.name)
+            .map(|injector| injector.lock().unwrap().quic_datagram_cuts.clone())
+            .unwrap_or_default();
+        state.quic_datagram_cuts = self
+            .quic_datagram_cuts
+            .iter()
+            .map(|cut| {
+                let seen = current
+                    .iter()
+                    .find(|(held, _)| held == cut)
+                    .map_or(0, |(_, seen)| *seen);
+                (cut.clone(), seen)
+            })
+            .collect();
+        state
     }
 
     /// Makes `run_simulation_direct` send every node, at virtual time `at`,
@@ -2923,6 +2992,7 @@ impl SimNetwork {
         // Always use VirtualTime for deterministic behavior
         let state = FaultInjectorState::new(self.with_quic_datagram_drops(config), fault_seed)
             .with_virtual_time(self.virtual_time.clone());
+        let state = self.carry_quic_datagram_cuts(state);
         set_fault_injector(
             &self.name,
             Some(std::sync::Arc::new(std::sync::Mutex::new(state))),
@@ -2974,6 +3044,7 @@ impl SimNetwork {
         let fault_seed = self.seed.wrapping_add(0xFA01_7777);
         let state = FaultInjectorState::new(self.with_quic_datagram_drops(config), fault_seed)
             .with_virtual_time(virtual_time);
+        let state = self.carry_quic_datagram_cuts(state);
         set_fault_injector(
             &self.name,
             Some(std::sync::Arc::new(std::sync::Mutex::new(state))),
@@ -8264,6 +8335,45 @@ mod tests {
             stats.messages_dropped_crash + stats.messages_dropped_partition,
             0
         );
+    }
+
+    /// `drop_quic_datagrams_between_after` lets its bytes through and then
+    /// drops the pair's QUIC datagrams, and a replaced fault injector takes the
+    /// count over: the cut stays where it was, it does not reopen.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_quic_datagram_cut_keeps_its_count_across_a_replaced_injector() {
+        use crate::transport::in_memory_socket::SimulationSocket;
+        use futures::FutureExt;
+        const NETWORK: &str = "quic-datagram-cut-e5b6";
+        let mut sim = SimNetwork::new(NETWORK, 1, 1, 7, 3, 6, 2, 0x5940_E5B6_0021).await;
+        let labels = labels_in_order(&sim);
+        let addr = |label: &NodeLabel| sim.all_node_addresses()[label];
+        let (a, b) = (addr(&labels[0]), addr(&labels[1]));
+        let quic = [0xC0u8; 100];
+        sim.drop_quic_datagrams_between_after(&labels[0], &labels[1], Duration::ZERO, 250);
+        let mut sockets = HashMap::new();
+        for at in [a, b] {
+            crate::transport::in_memory_socket::register_address_network(at, NETWORK);
+            sockets.insert(at, SimulationSocket::bind(at).await.unwrap());
+        }
+        let delivered = |from: SocketAddr, to: SocketAddr| {
+            sockets[&from]
+                .send_to(&quic, to)
+                .now_or_never()
+                .expect("an in-memory send never waits")
+                .unwrap();
+            let mut buf = [0u8; 128];
+            matches!(sockets[&to].recv_from(&mut buf).now_or_never(), Some(Ok(_)))
+        };
+        // 100 and 200 through, then the injector is replaced twice.
+        assert!(delivered(a, b));
+        assert!(delivered(b, a));
+        sim.with_fault_injection(crate::simulation::FaultConfig::default());
+        sim.clear_fault_injection();
+        // 300 crosses 250 and is still delivered; every one after is dropped.
+        assert!(delivered(a, b));
+        assert!(!delivered(b, a), "the count carried over");
+        assert!(!delivered(a, b));
     }
 
     /// In a running simulation a node with `transport-quic = "shadow"`
