@@ -11,6 +11,7 @@ use freenet_stdlib::prelude::*;
 mod capability_loop_tests;
 pub(crate) mod delegate_app_registry;
 pub(crate) mod delegate_capabilities;
+mod delegate_lane;
 mod delegate_park;
 mod delegate_restore;
 mod executor;
@@ -1417,6 +1418,11 @@ struct RunSeed {
     /// which is correct — and is also why #5558, a delegate notified of its own
     /// writes, is a separate unbounded loop that this does not close.
     self_heal_fetches_started: usize,
+    /// What the delegate lane's `process()` call already returned for this
+    /// round-trip's first leg, when the lane handed the round-trip to the
+    /// loop (`delegate_lane`). The first iteration uses it instead of calling
+    /// the executor, and counts as an iteration all the same.
+    first_values: Option<Vec<OutboundDelegateMsg>>,
 }
 
 /// Outcome of one delegate run.
@@ -1442,6 +1448,101 @@ enum DelegateRunOutcome {
     /// delegate is told. This is the synchronous execution failing outright,
     /// and the CLIENT is told.
     Failed(ExecutorError),
+}
+
+/// What one delegate `process()` call answered, as the messages it emitted or
+/// the error the client gets, logged once at the level its cause deserves.
+///
+/// Shared by the contract loop's round-trip
+/// (`handle_delegate_with_contract_requests`) and the delegate lane
+/// (`delegate_lane::serve`), so the two cannot classify the same executor
+/// answer differently.
+fn delegate_response_values(
+    result: Result<freenet_stdlib::client_api::HostResponse, ExecutorError>,
+    delegate_key: &DelegateKey,
+) -> Result<Vec<OutboundDelegateMsg>, ExecutorError> {
+    match result {
+        Ok(freenet_stdlib::client_api::HostResponse::DelegateResponse { key: _, values }) => {
+            Ok(values)
+        }
+        Ok(freenet_stdlib::client_api::HostResponse::Ok) => Ok(Vec::new()),
+        Ok(_other) => {
+            tracing::error!(
+                delegate_key = %delegate_key,
+                phase = "unexpected_response",
+                "Unexpected response type from delegate request"
+            );
+            // An internal invariant violation, not a delegate outcome: the
+            // executor answered a delegate request with a variant that is
+            // not a delegate response at all. Reporting it as an empty
+            // success is the same lie #5263 removes from the failure arm
+            // below -- the client cannot tell "the delegate said nothing"
+            // from "this node is confused". Nothing legitimate reaches
+            // here, so there is no working behaviour to regress.
+            //
+            // #5544 keeps this prohibition and re-expresses it in the
+            // outcome enum: this `Err` becomes `Failed`, never `Completed`.
+            Err(ExecutorError::other(anyhow::anyhow!(
+                "unexpected response variant for a delegate request on {delegate_key}"
+            )))
+        }
+        Err(err) => {
+            // Downgrade "not found" to warn — expected during legacy
+            // migration probes when old delegate WASM isn't on this node.
+            //
+            // The LOG is downgraded, the ANSWER is not (#5727): the client
+            // gets the typed `DelegateError::Missing`, exactly what
+            // `freenet local` answers. This used to return
+            // `Completed(accumulated_messages)` — an empty successful
+            // `DelegateResponse` — so a migration walk could not tell "not
+            // registered here" from "registered and said nothing", and a
+            // rehearsal on `freenet local` did not show what network users
+            // hit (freenet/harvest#150). `Failed` carries the typed error
+            // to the client; `client_events` keeps it typed rather than
+            // flattening it to an `OperationError` string.
+            if err.is_missing_delegate() {
+                tracing::warn!(
+                    delegate_key = %delegate_key,
+                    "Delegate not found in store (expected for migration probes)"
+                );
+                return Err(err);
+            }
+            // Caused by the request; the executor already logged it once
+            // at warn with the key.
+            if err.is_params_mismatch() {
+                tracing::debug!(
+                    delegate_key = %delegate_key,
+                    "Delegate request refused: parameters do not match the delegate key"
+                );
+                return Err(err);
+            }
+            if err.is_unregister_not_local() || err.is_unregister_hosted() {
+                tracing::debug!(
+                    delegate_key = %delegate_key,
+                    error = %err,
+                    "Delegate request refused: UnregisterDelegate not allowed for this client"
+                );
+                return Err(err);
+            }
+            // A node path that did not supply the run's user; the executor
+            // already logged it with the key (at warn the first time).
+            if err.is_hosted_run_without_user() {
+                tracing::debug!(
+                    delegate_key = %delegate_key,
+                    "Delegate run refused: a hosted node runs a delegate only on \
+                     behalf of a user"
+                );
+                return Err(err);
+            }
+            tracing::error!(
+                delegate_key = %delegate_key,
+                error = %err,
+                phase = "execution_failed",
+                "Failed executing delegate request"
+            );
+            Err(err)
+        }
+    }
 }
 
 /// Handle a delegate request, including any contract request messages in the response.
@@ -1514,6 +1615,7 @@ where
         accumulated: mut accumulated_messages,
         mut iterations,
         mut self_heal_fetches_started,
+        mut first_values,
     } = seed;
 
     loop {
@@ -1564,98 +1666,29 @@ where
             return DelegateRunOutcome::Completed(accumulated_messages);
         }
 
-        // Execute the delegate request
-        let values = match contract_handler
-            .executor()
-            .execute_delegate_request(
-                current_req,
-                origin_contract,
-                None,
-                connection_scope,
-                user_context,
-            )
-            .await
-        {
-            Ok(freenet_stdlib::client_api::HostResponse::DelegateResponse { key: _, values }) => {
-                values
-            }
-            Ok(freenet_stdlib::client_api::HostResponse::Ok) => Vec::new(),
-            Ok(_other) => {
-                tracing::error!(
-                    delegate_key = %delegate_key,
-                    phase = "unexpected_response",
-                    "Unexpected response type from delegate request"
-                );
-                // An internal invariant violation, not a delegate outcome: the
-                // executor answered a delegate request with a variant that is
-                // not a delegate response at all. Reporting it as an empty
-                // success is the same lie #5263 removes from the failure arm
-                // below -- the client cannot tell "the delegate said nothing"
-                // from "this node is confused". Nothing legitimate reaches
-                // here, so there is no working behaviour to regress.
-                //
-                // #5544 keeps this prohibition and re-expresses it in the
-                // outcome enum: `Failed`, never `Completed`.
-                return DelegateRunOutcome::Failed(ExecutorError::other(anyhow::anyhow!(
-                    "unexpected response variant for a delegate request on {delegate_key}"
-                )));
-            }
-            Err(err) => {
-                // Downgrade "not found" to warn — expected during legacy
-                // migration probes when old delegate WASM isn't on this node.
-                //
-                // The LOG is downgraded, the ANSWER is not (#5727): the client
-                // gets the typed `DelegateError::Missing`, exactly what
-                // `freenet local` answers. This used to return
-                // `Completed(accumulated_messages)` — an empty successful
-                // `DelegateResponse` — so a migration walk could not tell "not
-                // registered here" from "registered and said nothing", and a
-                // rehearsal on `freenet local` did not show what network users
-                // hit (freenet/harvest#150). `Failed` carries the typed error
-                // to the client; `client_events` keeps it typed rather than
-                // flattening it to an `OperationError` string.
-                if err.is_missing_delegate() {
-                    tracing::warn!(
-                        delegate_key = %delegate_key,
-                        "Delegate not found in store (expected for migration probes)"
-                    );
-                    return DelegateRunOutcome::Failed(err);
-                }
-                // Caused by the request; the executor already logged it once
-                // at warn with the key.
-                if err.is_params_mismatch() {
-                    tracing::debug!(
-                        delegate_key = %delegate_key,
-                        "Delegate request refused: parameters do not match the delegate key"
-                    );
-                    return DelegateRunOutcome::Failed(err);
-                }
-                if err.is_unregister_not_local() || err.is_unregister_hosted() {
-                    tracing::debug!(
-                        delegate_key = %delegate_key,
-                        error = %err,
-                        "Delegate request refused: UnregisterDelegate not allowed for this client"
-                    );
-                    return DelegateRunOutcome::Failed(err);
-                }
-                // A node path that did not supply the run's user; the executor
-                // already logged it with the key (at warn the first time).
-                if err.is_hosted_run_without_user() {
-                    tracing::debug!(
-                        delegate_key = %delegate_key,
-                        "Delegate run refused: a hosted node runs a delegate only on \
-                         behalf of a user"
-                    );
-                    return DelegateRunOutcome::Failed(err);
-                }
-                tracing::error!(
-                    delegate_key = %delegate_key,
-                    error = %err,
-                    phase = "execution_failed",
-                    "Failed executing delegate request"
-                );
-                return DelegateRunOutcome::Failed(err);
-            }
+        // Execute the delegate request, unless the delegate lane already ran
+        // this first call and handed the round-trip to the loop with its
+        // result (`delegate_lane`): then continue from that result, so
+        // `process()` is not entered twice for one inbound batch.
+        let result = match first_values.take() {
+            Some(values) => Ok(values),
+            None => delegate_response_values(
+                contract_handler
+                    .executor()
+                    .execute_delegate_request(
+                        current_req,
+                        origin_contract,
+                        None,
+                        connection_scope,
+                        user_context,
+                    )
+                    .await,
+                delegate_key,
+            ),
+        };
+        let values = match result {
+            Ok(values) => values,
+            Err(err) => return DelegateRunOutcome::Failed(err),
         };
 
         // Check for contract request messages (GET, PUT, UPDATE, SUBSCRIBE), delegate messages,
@@ -2606,6 +2639,30 @@ where
                     continue;
                 }
 
+                // The same exclusion against the DELEGATE LANE
+                // (`delegate_lane`): wait out a lane `process()` call of the
+                // target, and hold it off the target for this hop. A target
+                // with a round-trip the lane handed to the loop is mid-round-
+                // trip in exactly the sense above, and this hop cannot run that
+                // round-trip first (it is itself inside one), so it is dropped
+                // for the same reason and logged the same way.
+                let _hop_claim = match parking.as_ref().and_then(|ctx| ctx.park.gate()) {
+                    Some(gate) => match gate.claim_unless_pending(&target_key).await {
+                        Some(claim) => Some(claim),
+                        None => {
+                            tracing::info!(
+                                from_delegate = %delegate_key,
+                                target_delegate = %target_key,
+                                "Dropped an inter-delegate message: the target has a \
+                                 round-trip the delegate lane handed to the loop, and \
+                                 running it now would clobber that round-trip's context"
+                            );
+                            continue;
+                        }
+                    },
+                    None => None,
+                };
+
                 // The TARGET's registered params (#5616): see the design notes
                 // above. Same rule as the notification path, for the same
                 // reason: no established params, no run.
@@ -3274,7 +3331,41 @@ where
     let mut delegate_resumes: std::collections::VecDeque<delegate_park::DelegateResume> =
         std::collections::VecDeque::new();
 
+    // The DELEGATE LANE (`delegate_lane`): client delegate requests are served
+    // by their own task, so they do not wait behind contract WASM on this
+    // loop. Started only for an executor that provides a delegate runner (the
+    // production `RuntimePool`); otherwise every delegate request comes here,
+    // as before. The task is aborted with this loop. If it dies, its intake
+    // closes and the sender routes requests back to this loop.
+    let delegate_gate = contract_handler.executor().delegate_runner().map(|runner| {
+        let gate = delegate_lane::DelegateGate::new();
+        let (intake_tx, intake_rx) =
+            tokio::sync::mpsc::channel(delegate_lane::LANE_INTAKE_CAPACITY);
+        let handle =
+            GlobalExecutor::spawn(delegate_lane::run_lane(runner, gate.clone(), intake_rx));
+        let mut abort = crate::util::AbortOnDrop::new();
+        abort.push(handle.abort_handle());
+        contract_handler.channel().install_delegate_lane(intake_tx);
+        park_ctx.set_gate(gate.clone());
+        // The abort guard rides with the gate for the loop's lifetime.
+        (gate, abort)
+    });
+
     loop {
+        // Work the delegate lane handed over: the rest of a round-trip whose
+        // output needs this loop, or a request the lane does not run. Each is
+        // a full delegate run, so bounded per iteration like the resumes
+        // below. Ahead of new queued work for the same reason as resumes: a
+        // client is waiting on it and the delegate is held for it.
+        if let Some((gate, _)) = &delegate_gate {
+            for _ in 0..MAX_RESUME_DRAIN_BATCH {
+                let Some((_claim, unit)) = gate.take_next_unit() else {
+                    break;
+                };
+                run_lane_unit(&mut contract_handler, &mut park_ctx, &prompter, unit).await;
+            }
+        }
+
         // Drain resumed (deferred) upserts so a completed off-loop fetch is
         // applied promptly and its client answered, ahead of new queued work —
         // but cap the batch (each resume is a full WASM upsert) and interleave
@@ -3567,7 +3658,16 @@ where
         // still blocks indefinitely rather than spinning on a timer.
         let park_deadline = park_ctx.next_sweep_deadline();
         let lifecycle_deadline = lifecycle_schedule.next_deadline();
+        let lane_gate = delegate_gate.as_ref().map(|(gate, _)| gate.clone());
         tokio::select! {
+            // A unit from the delegate lane. Wake only: units run at the top
+            // of the next iteration.
+            () = async {
+                match &lane_gate {
+                    Some(gate) => gate.units_ready().await,
+                    None => std::future::pending().await,
+                }
+            } => {}
             result = contract_handler.channel().recv_from_sender() => {
                 let (id, event, priority) = result?;
                 push_with_background_eviction(
@@ -4608,6 +4708,14 @@ async fn handle_delegate_notification<CH, P>(
         inbound,
     };
 
+    // Fence the delegate lane off this delegate before the park check below,
+    // and run a round-trip the lane handed over for it first: it started
+    // before this notification and must not be overtaken (`delegate_lane`).
+    let _claim = match park.as_deref_mut() {
+        Some(park) => claim_delegate(contract_handler, park, prompter, &delegate_key).await,
+        None => None,
+    };
+
     // PER-DELEGATE EXCLUSION, first door (#5544 B1).
     //
     // A notification is a THIRD way into a delegate, alongside the client
@@ -5295,6 +5403,11 @@ where
         }
     };
 
+    // Fence the delegate lane off it first, running any round-trip the lane
+    // handed over for it (`delegate_lane`); then the park check sees the
+    // state that round-trip left.
+    let _claim = claim_delegate(contract_handler, park, prompter, &key).await;
+
     // Per-delegate exclusion (#5544): never re-enter a parked delegate. And
     // the duty budget: a delegate that has spent its loop time waits.
     let parked = park.is_parked(&key);
@@ -5432,6 +5545,76 @@ where
     LifecycleOutcome::Ran
 }
 
+/// Claim `key` against the delegate lane before the loop runs it, and first
+/// run the lane's pending unit for it if there is one (`delegate_lane`).
+///
+/// Every loop entry into a delegate goes through this (the client-request
+/// arm, contract notifications, lifecycle runs and park resumes; the
+/// inter-delegate hop uses `DelegateGate::claim_unless_pending` instead,
+/// because it is already inside a round-trip). Holding the returned claim is
+/// what stops the lane running the delegate in the middle of the loop's
+/// round-trip. `None` when no lane is running.
+async fn claim_delegate<CH, P>(
+    contract_handler: &mut CH,
+    park: &mut delegate_park::DelegateParkCtx,
+    prompter: &std::sync::Arc<P>,
+    key: &DelegateKey,
+) -> Option<delegate_lane::LoopClaim>
+where
+    CH: ContractHandler + Send + 'static,
+    P: UserInputPrompter + 'static,
+{
+    let gate = park.gate()?;
+    let (claim, unit) = gate.claim(key).await;
+    if let Some(unit) = unit {
+        run_lane_unit(contract_handler, park, prompter, unit).await;
+    }
+    Some(claim)
+}
+
+/// Run work the delegate lane handed to the loop: a request it forwarded
+/// (registration, unregistration, a forged node-only inbound message) or the
+/// rest of a round-trip whose first `process()` call it already made. The
+/// caller holds the delegate's claim.
+async fn run_lane_unit<CH, P>(
+    contract_handler: &mut CH,
+    park: &mut delegate_park::DelegateParkCtx,
+    prompter: &std::sync::Arc<P>,
+    unit: delegate_lane::LaneUnit,
+) where
+    CH: ContractHandler + Send + 'static,
+    P: UserInputPrompter + 'static,
+{
+    let delegate_lane::LaneUnit {
+        key: _,
+        id,
+        responder,
+        req,
+        origin_contract,
+        connection_scope,
+        user_context,
+        first_values,
+    } = unit;
+    // Into the loop's own waiting-response map, so every answer below takes
+    // the path an event received from the channel takes, including being
+    // queued behind a park with its id.
+    let id = contract_handler
+        .channel()
+        .insert_waiting_response(id, responder);
+    dispatch_delegate_request(
+        contract_handler,
+        Some(park),
+        prompter,
+        id,
+        req,
+        origin_contract,
+        connection_scope,
+        user_context,
+        first_values,
+    )
+    .await;
+}
+
 /// Run one client-driven delegate request, honouring per-delegate exclusion.
 ///
 /// Shared by the `ContractHandlerEvent::DelegateRequest` arm and by the drain
@@ -5447,6 +5630,9 @@ async fn dispatch_delegate_request<CH, P>(
     origin_contract: Option<ContractInstanceId>,
     connection_scope: crate::client_events::ConnectionScope,
     user_context: Option<UserSecretContext>,
+    // `Some` for a round-trip the delegate lane started and handed to the
+    // loop: what its first `process()` call returned. See `RunSeed`.
+    first_values: Option<Vec<OutboundDelegateMsg>>,
 ) where
     CH: ContractHandler + Send + 'static,
     P: UserInputPrompter + 'static,
@@ -5535,7 +5721,10 @@ async fn dispatch_delegate_request<CH, P>(
             &delegate_key,
             prompter,
             None,
-            RunSeed::default(),
+            RunSeed {
+                first_values,
+                ..RunSeed::default()
+            },
         )
         .await;
         let response = match outcome {
@@ -5567,6 +5756,28 @@ async fn dispatch_delegate_request<CH, P>(
     // the parked continuation and it would resume reading the wrong bytes.
     // Queue instead, and drain on resume.
     if park.is_parked(&delegate_key) {
+        if first_values.is_some() {
+            // Unreachable by construction: the lane ran this delegate's first
+            // leg only while it was clear of every loop claim, a park entry
+            // holds one, and the claim that took this unit was held from
+            // then until here. Queueing it would re-run `process()` from the
+            // start for an inbound batch the delegate already consumed, so
+            // answer with an error instead.
+            tracing::error!(
+                delegate_key = %delegate_key,
+                "A delegate-lane continuation found its delegate parked; refusing it"
+            );
+            send_delegate_response(
+                contract_handler,
+                id,
+                &delegate_key,
+                Err(ExecutorError::other(anyhow::anyhow!(
+                    "internal error: delegate continuation found the delegate parked"
+                ))),
+            )
+            .await;
+            return;
+        }
         let pending = delegate_park::PendingRun::Client {
             id,
             req,
@@ -5632,7 +5843,10 @@ async fn dispatch_delegate_request<CH, P>(
             node_wide_duty: false,
             carried_responder: &mut carried_responder,
         }),
-        RunSeed::default(),
+        RunSeed {
+            first_values,
+            ..RunSeed::default()
+        },
     )
     .await;
 
@@ -5877,6 +6091,12 @@ where
         unresolved_contract_ops,
     } = resume;
 
+    // Fence the delegate lane off this delegate for the whole resume,
+    // including the pending runs drained behind it. The park entry's own
+    // claim ends inside `take_matching`; this one has to be live before it
+    // does, or the lane could run the delegate between the context being put
+    // back and the resumed leg reading it.
+    let _claim = claim_delegate(contract_handler, park, prompter, &delegate_key).await;
     let Some((continuation, pending)) = park.take_matching(&delegate_key, epoch) else {
         // REACHABLE, and the previous comment here claiming otherwise was
         // wrong. It said "the ParkGuard delivers exactly one resume per park,
@@ -6082,6 +6302,7 @@ where
                 accumulated,
                 iterations,
                 self_heal_fetches_started,
+                first_values: None,
             },
         )
         .await
@@ -6164,6 +6385,7 @@ where
                     origin_contract,
                     connection_scope,
                     user_context,
+                    None,
                 )
                 .await;
             }
@@ -6617,6 +6839,15 @@ where
                 "Processing delegate request"
             );
 
+            // Reached with a delegate lane running only if the lane's intake
+            // closed (the request then falls back to the loop); claim the
+            // delegate all the same so the lane cannot be inside it.
+            let mut park = park;
+            let _claim = match park.as_deref_mut() {
+                Some(park) => claim_delegate(contract_handler, park, prompter, &delegate_key).await,
+                None => None,
+            };
+
             // Execute the delegate and handle any contract request messages.
             // Routed through the shared dispatcher so the #5544 per-delegate
             // exclusion applies identically here and on the post-resume drain.
@@ -6629,6 +6860,7 @@ where
                 origin_contract,
                 connection_scope,
                 user_context,
+                None,
             )
             .await;
         }

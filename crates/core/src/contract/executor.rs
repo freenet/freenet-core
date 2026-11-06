@@ -1330,6 +1330,14 @@ pub(crate) trait ContractExecutor: Send + 'static {
         None
     }
 
+    /// The runner every delegate `process()` of this executor goes through,
+    /// shared with the delegate lane (`contract::delegate_lane`). `None`
+    /// keeps every delegate run on the contract loop, as before the lane
+    /// existed; mock executors answer `None` unless a test opts in.
+    fn delegate_runner(&self) -> Option<Arc<dyn crate::contract::delegate_lane::DelegateRunner>> {
+        None
+    }
+
     /// The raw WASM of a delegate this node stores, if it has it. Used at
     /// start-up to re-read manifests (`refresh_capability_manifests`); `None`
     /// for executors without a delegate store.
