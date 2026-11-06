@@ -2589,6 +2589,58 @@ fn seeded_loss(network: &str, percent: u64) -> Arc<LossCount> {
     count
 }
 
+/// A path's watch reports its last counts when it ends, here dropped because
+/// the receive task ended with the connection, so the node's packet sums end at
+/// quinn's final counts. The short
+/// is sent and the path closed between two ticks (2 s and 4 s), so without that
+/// last report what they sent is missing.
+#[test]
+fn a_closed_path_reports_its_last_tick() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let counters: &'static crate::transport::metrics::QuicDataCounters =
+            Box::leak(Box::new(crate::transport::metrics::QuicDataCounters::new()));
+        let limits = QuicPathLimits {
+            counters: Some(counters),
+            ..QuicPathLimits::DEFAULT
+        };
+        let p = paths("quic-path-last-tick", 75, limits).await;
+        let (a, b, time) = (p.a.clone(), p.b.clone(), p.time());
+        let totals = |a: &QuicPath, b: &QuicPath| {
+            let (a, b) = (
+                a.connection().inner().stats(),
+                b.connection().inner().stats(),
+            );
+            (
+                a.path.sent_packets + b.path.sent_packets,
+                a.udp_tx.bytes + b.udp_tx.bytes,
+            )
+        };
+        // The watches count from when the paths were built, before the drive.
+        let before = totals(&a, &b);
+        let after = p
+            .drive(async move {
+                time.sleep(Duration::from_millis(2500)).await;
+                a.send_short(&[7u8; 600]).await.expect("sent");
+                a.connection().close(QuicCloseCode::Downgrade);
+                time.sleep(Duration::from_secs(5)).await;
+                totals(&a, &b)
+            })
+            .await;
+        let (sent, udp_sent) = (after.0 - before.0, after.1 - before.1);
+        let snap = counters.snapshot(false);
+        assert!(sent > 1, "{sent}: the short and the close were sent");
+        assert_eq!(snap.sent_packets, sent, "every packet up to the close");
+        // A close quinn sends again after the watch has ended is in quinn's
+        // byte count and nobody's report; the short's bytes are in the report.
+        assert!(
+            snap.bytes_sent >= 600 && snap.bytes_sent <= udp_sent,
+            "{} of {udp_sent}",
+            snap.bytes_sent
+        );
+    })
+}
+
 /// Sample `paths`' connections every 500 ms until `end` (virtual nanos);
 /// the largest `outstanding_after_acks` seen on either.
 async fn max_outstanding(paths: [Arc<QuicPath>; 2], time: VirtualTime, end: u64) -> u64 {

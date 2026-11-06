@@ -801,20 +801,16 @@ pub(crate) async fn watch_acknowledgements<T: TimeSource>(
     };
     let mut received = first.received;
     let mut watch = AckWatch::new(ACK_WATCH_WINDOW, first);
-    let mut bytes = UdpBytes::of(&connection);
-    let mut loss = PathLoss::of(&connection);
-    let mut window = crate::transport::metrics::PathLossWindow::new(node);
+    let mut report = PathReport::new(connection.clone(), node);
     loop {
         time.sleep(ACK_WATCH_TICK).await;
-        if connection.close_reason().is_some() {
+        // Read before the counts, so a closed connection's counts are its
+        // final ones.
+        let closed = connection.close_reason().is_some();
+        report.report();
+        if closed {
             return;
         }
-        let (next, sent, got) = bytes.step(UdpBytes::of(&connection));
-        node.record_bytes(sent, got);
-        bytes = next;
-        let (next, delta) = loss.step(PathLoss::of(&connection));
-        node.record_path_loss(&mut window, delta);
-        loss = next;
         let Some(sample) = AckSample::of(&connection, &cap_holds) else {
             return;
         };
@@ -838,9 +834,59 @@ pub(crate) async fn watch_acknowledgements<T: TimeSource>(
 
 #[cfg(test)]
 mod cap_tests;
+
+/// A path's byte and loss counts, reported node-wide by their change at each
+/// tick of the watch, and once more when the report is dropped: the watch is
+/// dropped when the receive task ends first (as it does when the connection
+/// closes) or the path's task is aborted, and the counts up to that point,
+/// often the losses that ended the path, are still reported. Then the window
+/// is dropped, which counts the path among the ended ones by its final bucket.
+struct PathReport {
+    connection: quinn::Connection,
+    node: &'static crate::transport::metrics::QuicDataCounters,
+    bytes: UdpBytes,
+    loss: PathLoss,
+    window: crate::transport::metrics::PathLossWindow,
+}
+
+impl PathReport {
+    fn new(
+        connection: quinn::Connection,
+        node: &'static crate::transport::metrics::QuicDataCounters,
+    ) -> Self {
+        let stats = connection.stats();
+        Self {
+            bytes: UdpBytes::of(&stats),
+            loss: PathLoss::of(&stats),
+            window: crate::transport::metrics::PathLossWindow::new(node),
+            connection,
+            node,
+        }
+    }
+
+    /// Report the change since the last report, from one read of the stats.
+    fn report(&mut self) {
+        let stats = self.connection.stats();
+        let (next, sent, got) = self.bytes.step(UdpBytes::of(&stats));
+        self.node.record_bytes(sent, got);
+        self.bytes = next;
+        let (next, delta) = self.loss.step(PathLoss::of(&stats));
+        self.node.record_path_loss(&mut self.window, delta);
+        self.loss = next;
+    }
+}
+
+impl Drop for PathReport {
+    fn drop(&mut self) {
+        // Not while unwinding: quinn's state lock may be what panicked.
+        if !std::thread::panicking() {
+            self.report();
+        }
+    }
+}
 /// A path's UDP payload bytes as quinn counts them, reported node-wide by their
-/// change at each tick of the watch (`quic_bytes_sent`, `quic_bytes_received`).
-/// What a path moves in its last tick before it closes is not reported.
+/// change at each tick of the watch (`quic_bytes_sent`, `quic_bytes_received`)
+/// and when the watch ends ([`PathReport`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct UdpBytes {
     sent: u64,
@@ -848,8 +894,7 @@ struct UdpBytes {
 }
 
 impl UdpBytes {
-    fn of(connection: &quinn::Connection) -> Self {
-        let stats = connection.stats();
+    fn of(stats: &quinn::ConnectionStats) -> Self {
         Self {
             sent: stats.udp_tx.bytes,
             received: stats.udp_rx.bytes,
@@ -871,8 +916,7 @@ impl UdpBytes {
 /// A path's packet counts as quinn's `PathStats` keeps them, reported
 /// node-wide by their change at each tick of the watch (`quic_sent_packets`,
 /// `quic_lost_packets`, `quic_lost_bytes`, `quic_congestion_events`, and the
-/// path's own loss rate in `quic_loss_rate_<bucket>`). What a path does in its
-/// last tick before it closes is not reported, as for [`UdpBytes`].
+/// path's own loss rate in `quic_loss_rate_<bucket>`), as for [`UdpBytes`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct PathLoss {
     pub(crate) sent_packets: u64,
@@ -882,8 +926,8 @@ pub(crate) struct PathLoss {
 }
 
 impl PathLoss {
-    fn of(connection: &quinn::Connection) -> Self {
-        let path = connection.stats().path;
+    fn of(stats: &quinn::ConnectionStats) -> Self {
+        let path = stats.path;
         Self {
             sent_packets: path.sent_packets,
             lost_packets: path.lost_packets,

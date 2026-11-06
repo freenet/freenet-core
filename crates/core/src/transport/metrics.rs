@@ -5111,7 +5111,11 @@ mod tests {
         assert_eq!(json["quic_lost_bytes"], 8400);
         assert_eq!(json["quic_congestion_events"], 3);
         assert_eq!(json["quic_loss_rate_lt_1pct"], 1);
-        assert!(json.get("quic_loss_rate_zero").is_none(), "a 0 is not sent");
+        assert_eq!(json["quic_loss_rate_zero"], 0, "a gauge of 0 is sent");
+        assert!(
+            json.get("quic_ended_loss_rate_zero").is_none(),
+            "a count of 0 is not"
+        );
         assert!(
             metrics.take_snapshot().is_none(),
             "the sums were reset, and the bucket alone is not activity"
