@@ -1766,17 +1766,32 @@ fn a_take_after_its_admission_lapsed_leaves_a_newer_admission_its_datagram() {
 /// stream's gap past the 5 s deadline.
 #[test]
 fn a_failed_take_keeps_its_place_ahead_of_later_waiters() {
+    a_failed_take_keeps_its_place(false);
+    a_failed_take_keeps_its_place(true);
+}
+
+/// `first_poll`: the sender is admitted on its first poll, with no place given
+/// up, and the later sender queues after that.
+fn a_failed_take_keeps_its_place(first_poll: bool) {
     let (cap, time) = cap_at(RATE);
     cap.charge_unpaced(BURST as usize);
     let (waker, _) = counting_waker();
     let mut cx = Context::from_waker(&waker);
     let mut first = AdmissionWaiter::named();
     let mut second = AdmissionWaiter::named();
-    assert!(cap.poll_admit(PACKET, &mut first, &mut cx).is_pending());
-    assert!(cap.poll_admit(PACKET, &mut second, &mut cx).is_pending());
-    // One datagram: the first is admitted, and an unpaced send takes it.
-    time.advance(Duration::from_micros(PACKET as u64));
-    assert!(cap.poll_admit(PACKET, &mut first, &mut cx).is_ready());
+    if first_poll {
+        // One datagram: the first is admitted at once, then the second queues.
+        time.advance(Duration::from_micros(PACKET as u64));
+        assert!(cap.poll_admit(PACKET, &mut first, &mut cx).is_ready());
+        assert!(cap.poll_admit(PACKET, &mut second, &mut cx).is_pending());
+    } else {
+        assert!(cap.poll_admit(PACKET, &mut first, &mut cx).is_pending());
+        assert!(cap.poll_admit(PACKET, &mut second, &mut cx).is_pending());
+        // One datagram: the first is admitted.
+        time.advance(Duration::from_micros(PACKET as u64));
+        assert!(cap.poll_admit(PACKET, &mut first, &mut cx).is_ready());
+    }
+    // An unpaced send takes it.
     cap.charge_unpaced(PACKET);
     assert!(
         cap.try_take_admitted(PACKET, Duration::ZERO, &mut first)
@@ -1798,19 +1813,62 @@ fn a_failed_take_keeps_its_place_ahead_of_later_waiters() {
         .sent(PACKET);
 }
 
-/// A QUIC take that fails leaves its poller's admission unused, and the take
-/// withdraws it, so the poller's next poll does not count it ahead.
+/// A QUIC take that fails leaves its poller's admission in place; the poller
+/// withdraws it when it polls again, so it is not counted ahead of itself.
+/// A failed take nobody was admitted for (quinn's `respond` path: a stateless
+/// reset, a Retry, a version negotiation, sent with no `poll_writable`)
+/// leaves the live admission of another poller alone.
 #[test]
-fn a_failed_anonymous_take_withdraws_its_admission() {
-    let (cap, _time) = cap_at(RATE);
+fn a_failed_quic_take_leaves_the_admission_to_its_poller() {
+    let (cap, time) = cap_at(RATE);
     cap.charge_unpaced(BURST as usize - PACKET - 100);
     let (waker, _) = counting_waker();
     let mut cx = Context::from_waker(&waker);
     let mut poller = AdmissionWaiter::default();
     assert!(cap.poll_admit(PACKET, &mut poller, &mut cx).is_ready());
-    cap.charge_unpaced(PACKET);
-    assert!(cap.try_take(PACKET, Duration::ZERO).is_err());
-    assert_eq!(cap.admission.outstanding(), 0);
+    cap.charge_unpaced(500);
+    assert!(
+        cap.try_take(PACKET, Duration::ZERO).is_err(),
+        "a respond-path send, with the bucket short"
+    );
+    assert_eq!(
+        cap.admission.outstanding(),
+        1,
+        "the poller's admission is still there"
+    );
+    assert!(cap.poll_admit(PACKET, &mut poller, &mut cx).is_pending());
+    assert_eq!(cap.admission.outstanding(), 0, "withdrawn by its poller");
+    time.advance(Duration::from_micros(PACKET as u64));
+    assert!(cap.poll_admit(PACKET, &mut poller, &mut cx).is_ready());
+}
+
+/// A follower that polled while an admission was outstanding counted that
+/// admission's datagram. When the admission lapses unused, nothing wakes the
+/// follower, so its timer is set no later than the lapse; when it is
+/// withdrawn (its waiter dropped), the follower is woken.
+#[test]
+fn a_follower_is_not_left_asleep_by_an_admission_that_goes_unused() {
+    // 10 kB/s: two datagrams' refill is 240 ms, the pass 1 ms.
+    let (cap, time) = cap_at(10_000);
+    cap.charge_unpaced(cap.burst_bytes() as usize - PACKET - 50);
+    let (waker, counter) = counting_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut admitted = AdmissionWaiter::named();
+    let mut follower = AdmissionWaiter::named();
+    let at = time.now_nanos();
+    assert!(cap.poll_admit(PACKET, &mut admitted, &mut cx).is_ready());
+    assert!(cap.poll_admit(PACKET, &mut follower, &mut cx).is_pending());
+    let pass = ADMISSION_PASS.as_nanos() as u64;
+    assert!(
+        follower.wake_at_ns().expect("a timer") <= at + pass + 1,
+        "the follower looks again when the admission lapses"
+    );
+    let before = woken(&counter);
+    drop(admitted);
+    assert!(
+        woken(&counter) > before,
+        "dropping the admitted waiter wakes the follower"
+    );
 }
 
 /// A named waiter that polls again before it takes withdraws the admission it
@@ -1858,4 +1916,29 @@ fn live_admissions_are_bounded_and_none_is_dropped() {
         .sent(PACKET);
     time.advance(ADMISSION_PASS + Duration::from_micros(1));
     assert!(cap.poll_admit(PACKET, &mut next, &mut cx).is_ready());
+}
+
+/// A sender whose take succeeded has no place to keep: if the same waiter
+/// polls again for its next datagram, it queues behind a sender that queued
+/// meanwhile.
+#[test]
+fn a_sender_that_sent_queues_behind_later_waiters() {
+    let (cap, time) = cap_at(RATE);
+    cap.charge_unpaced(BURST as usize - PACKET - 100);
+    let (waker, _) = counting_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut sender = AdmissionWaiter::named();
+    let mut later = AdmissionWaiter::named();
+    assert!(cap.poll_admit(PACKET, &mut sender, &mut cx).is_ready());
+    cap.try_take_admitted(PACKET, Duration::ZERO, &mut sender)
+        .expect("its turn")
+        .sent(PACKET);
+    assert!(cap.poll_admit(PACKET, &mut later, &mut cx).is_pending());
+    assert!(cap.poll_admit(PACKET, &mut sender, &mut cx).is_pending());
+    time.advance(Duration::from_micros(PACKET as u64));
+    assert!(
+        cap.poll_admit(PACKET, &mut sender, &mut cx).is_pending(),
+        "the sender that already sent waits its turn"
+    );
+    assert!(cap.poll_admit(PACKET, &mut later, &mut cx).is_ready());
 }

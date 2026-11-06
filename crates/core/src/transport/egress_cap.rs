@@ -417,18 +417,14 @@ struct Admitted {
     /// When it was made: ns on the cap's clock, read under the queue lock,
     /// so a later admission never has an earlier time.
     at: i64,
-    /// Its number, kept by its waiter, when the waiter takes by name
-    /// ([`EgressCap::try_take_admitted`], a paced UDP stream); `None` when
-    /// the take cannot name it ([`EgressCap::try_take`] from the QUIC socket,
-    /// which does not know which connection's poller was admitted).
-    id: Option<u64>,
-}
-
-/// A named waiter's two slots ([`AdmissionWaiter::named`]): the number of the
-/// admission it holds, and the place it was admitted from until it sends.
-struct NamedSlots<'a> {
-    admission: &'a mut Option<u64>,
-    held_place: &'a mut Option<u64>,
+    /// Its number, kept by its waiter: the waiter withdraws it if it polls
+    /// again before a take used it, or is dropped.
+    id: u64,
+    /// The waiter takes by name ([`EgressCap::try_take_admitted`], a paced
+    /// UDP stream). An unnamed one's take cannot name it
+    /// ([`EgressCap::try_take`] from the QUIC socket, which does not know which
+    /// connection's poller was admitted), so it uses the oldest unnamed one.
+    named: bool,
 }
 
 /// Who is taking, so the take knows which admission it uses.
@@ -463,9 +459,9 @@ impl QueuedWaiters {
     /// if it has one.
     fn admission_of(&self, taker: Taker) -> Option<usize> {
         match taker {
-            Taker::Anonymous => self.admitted.iter().position(|a| a.id.is_none()),
+            Taker::Anonymous => self.admitted.iter().position(|a| !a.named),
             Taker::Named(None) => None,
-            Taker::Named(Some(id)) => self.admitted.iter().position(|a| a.id == Some(id)),
+            Taker::Named(Some(id)) => self.admitted.iter().position(|a| a.id == id),
         }
     }
 
@@ -490,7 +486,7 @@ impl AdmissionQueue {
     /// holds at most [`MAX_ADMISSION_WAKERS`] wakers: past that, a waiter is
     /// queued with no waker, WITHOUT any other being dropped, and relies on
     /// its timer; it holds a waker on a later poll once one is free.
-    fn register(&self, ticket: &mut Option<u64>, waker: &std::task::Waker) -> usize {
+    fn register(&self, ticket: &mut Option<u64>, waker: &std::task::Waker) -> (usize, Option<i64>) {
         let mut queue = self.inner.lock();
         let t = match *ticket {
             Some(t) if queue.places.contains(&t) => t,
@@ -515,16 +511,24 @@ impl AdmissionQueue {
             None => {}
         }
         queue.sync(&self.waiting);
-        // The same count as `Self::ahead`, so `poll_admit`'s check after
+        // When the oldest outstanding admission lapses: the waiter's timer
+        // counted its datagram, which is free from then on.
+        let pass = i64::try_from(ADMISSION_PASS.as_nanos()).unwrap_or(i64::MAX);
+        let lapses_at = queue
+            .admitted
+            .front()
+            .map(|admitted| admitted.at.saturating_add(pass).saturating_add(1));
+        // The same count as `try_admit`'s, so `poll_admit`'s check after
         // registering agrees with its check before.
         if queue.admitted.len() >= MAX_ADMISSION_WAKERS {
             // `try_admit` admits nobody until one lapses or is taken.
-            return MAX_ADMISSION_WAKERS + 1;
+            return (MAX_ADMISSION_WAKERS + 1, lapses_at);
         }
-        queue
+        let ahead = queue
             .ahead_of(t)
             .saturating_add(queue.admitted.len())
-            .min(MAX_ADMISSION_WAKERS + 1)
+            .min(MAX_ADMISSION_WAKERS + 1);
+        (ahead, lapses_at)
     }
 
     /// Admit the waiter holding `ticket` if `fits(ahead)` says the bucket
@@ -557,28 +561,29 @@ impl AdmissionQueue {
     fn try_admit(
         &self,
         ticket: &mut Option<u64>,
-        mut named: Option<NamedSlots<'_>>,
+        admission: &mut Option<u64>,
+        mut held_place: Option<&mut Option<u64>>,
         clock: impl Fn() -> i64,
         fits: impl FnOnce(usize, i64) -> bool,
     ) -> Result<(), (usize, i64)> {
-        let next = {
+        let (next, admitted) = {
             let mut queue = self.inner.lock();
             let now = clock();
             queue.lapse(now);
-            if let Some(slots) = named.as_mut() {
-                if let Some(held) = slots.admission.take() {
-                    if let Some(i) = queue.admission_of(Taker::Named(Some(held))) {
-                        queue.admitted.remove(i);
-                    }
-                }
-                // Admitted before and not sent since (its take failed, or its
-                // window held it past the pass): it queues at the place it
-                // was admitted from, not at the back.
-                if ticket.is_none() {
-                    if let Some(place) = *slots.held_place {
-                        queue.places.insert(place);
-                        *ticket = Some(place);
-                    }
+            // A waiter that polls again did not use the admission it holds
+            // (or, unnamed, its take may have used another's; see `named`).
+            let withdrew = admission
+                .take()
+                .and_then(|held| queue.admission_of(Taker::Named(Some(held))))
+                .map(|i| queue.admitted.remove(i))
+                .is_some();
+            // Admitted before and not sent since (its take failed, or its
+            // window held it past the pass): it queues at the place it was
+            // admitted from, not at the back.
+            if ticket.is_none() {
+                if let Some(place) = held_place.as_deref().copied().flatten() {
+                    queue.places.insert(place);
+                    *ticket = Some(place);
                 }
             }
             let queued = match *ticket {
@@ -592,46 +597,68 @@ impl AdmissionQueue {
             // within their pass after `lapse`: a waiter past that waits, as one
             // too far back does, and none is dropped while its owner may
             // still take.
-            if queue.admitted.len() >= MAX_ADMISSION_WAKERS {
+            let refused = if queue.admitted.len() >= MAX_ADMISSION_WAKERS {
+                Some(MAX_ADMISSION_WAKERS + 1)
+            } else if !fits(ahead, now) {
+                Some(ahead)
+            } else {
+                None
+            };
+            if let Some(ahead) = refused {
+                // A withdrawn admission frees the datagram the next waiter's
+                // timer counted on: wake it to look again.
+                let next = withdrew
+                    .then(|| queue.wakers.pop_first().map(|(_, waker)| waker))
+                    .flatten();
                 queue.sync(&self.waiting);
-                return Err((MAX_ADMISSION_WAKERS + 1, now));
-            }
-            if !fits(ahead, now) {
-                queue.sync(&self.waiting);
-                return Err((ahead, now));
-            }
-            let id = named.as_mut().map(|slots| {
+                (next, Err((ahead, now)))
+            } else {
                 let id = queue.next_ticket;
                 queue.next_ticket += 1;
-                *slots.admission = Some(id);
-                id
-            });
-            queue.admitted.push_back(Admitted { at: now, id });
-            let given_up = ticket.take();
-            if let (Some(slots), Some(place)) = (named.as_mut(), given_up) {
-                *slots.held_place = Some(place);
+                *admission = Some(id);
+                queue.admitted.push_back(Admitted {
+                    at: now,
+                    id,
+                    named: held_place.is_some(),
+                });
+                let given_up = ticket.take();
+                // A named waiter keeps a place until it sends: the one it gave
+                // up, or, admitted on its first poll, the admission's own number,
+                // which is behind every waiter queued now and ahead of every
+                // later one.
+                if let Some(slot) = held_place.as_deref_mut() {
+                    *slot = Some(given_up.unwrap_or(id));
+                }
+                let next = given_up.and_then(|t| {
+                    queue.wakers.remove(&t);
+                    queue.places.remove(&t);
+                    queue.wakers.pop_first().map(|(_, waker)| waker)
+                });
+                queue.sync(&self.waiting);
+                (next, Ok(()))
             }
-            let next = given_up.and_then(|t| {
-                queue.wakers.remove(&t);
-                queue.places.remove(&t);
-                queue.wakers.pop_first().map(|(_, waker)| waker)
-            });
-            queue.sync(&self.waiting);
-            next
         };
         if let Some(waker) = next {
             waker.wake();
         }
-        Ok(())
+        admitted
     }
 
     /// Withdraw the admission numbered `id` (its waiter was dropped before
     /// its take), if it has not lapsed.
     fn withdraw(&self, id: u64) {
-        let mut queue = self.inner.lock();
-        if let Some(i) = queue.admission_of(Taker::Named(Some(id))) {
+        let next = {
+            let mut queue = self.inner.lock();
+            let Some(i) = queue.admission_of(Taker::Named(Some(id))) else {
+                return;
+            };
             queue.admitted.remove(i);
             queue.sync(&self.waiting);
+            // The next waiter's timer counted on this admission's datagram.
+            queue.wakers.pop_first().map(|(_, waker)| waker)
+        };
+        if let Some(waker) = next {
+            waker.wake();
         }
     }
 
@@ -1007,12 +1034,6 @@ impl EgressCap {
         });
         // The same predicate on the value the last attempt saw.
         if let Err(deficit) = self.admits(old, now, need) {
-            // A QUIC take that failed leaves its poller's admission unused:
-            // the poller polls again, and that admission must not count ahead
-            // of it then. A named waiter withdraws its own when it polls.
-            if let (Taker::Anonymous, Some(i)) = (taker, own) {
-                queue.admitted.remove(i);
-            }
             queue.sync(&self.admission.waiting);
             drop(queue);
             #[cfg(test)]
@@ -1103,13 +1124,11 @@ impl EgressCap {
             // same level. A waiter with more than `MAX_ADMISSION_WAKERS`
             // ahead is never admitted, whatever the level: the clamp in
             // `owed` is for its timer only.
-            let named = waiter.named.then_some(NamedSlots {
-                admission: &mut waiter.admission,
-                held_place: &mut waiter.held_place,
-            });
+            let held_place = waiter.named.then_some(&mut waiter.held_place);
             let refused = self.admission.try_admit(
                 &mut waiter.ticket,
-                named,
+                &mut waiter.admission,
+                held_place,
                 || self.now(),
                 |ahead, now| {
                     ahead <= MAX_ADMISSION_WAKERS
@@ -1124,10 +1143,8 @@ impl EgressCap {
             );
             let Err((ahead, now)) = refused else {
                 waiter.timer = None;
-                if waiter.named {
-                    // So dropping the waiter withdraws its admission.
-                    waiter.queue = Some(Arc::downgrade(&self.admission));
-                }
+                // So dropping the waiter withdraws its admission.
+                waiter.queue = Some(Arc::downgrade(&self.admission));
                 return Poll::Ready(());
             };
             let need = cost.saturating_add(owed(ahead));
@@ -1138,7 +1155,7 @@ impl EgressCap {
                 .unwrap_or_else(|| self.cost_ns(WAKE_DATAGRAM_BYTES as u64));
             #[cfg(test)]
             self.stats.refusals.fetch_add(1, Ordering::Relaxed);
-            let ahead = self.admission.register(&mut waiter.ticket, cx.waker());
+            let (ahead, lapses_at) = self.admission.register(&mut waiter.ticket, cx.waker());
             waiter.queue = Some(Arc::downgrade(&self.admission));
             let need = cost.saturating_add(owed(ahead));
             // Bytes given back between the check above and the registration
@@ -1157,7 +1174,12 @@ impl EgressCap {
                     .err()
                     .unwrap_or(0),
             );
-            let wake_at = u64::try_from(now.saturating_add(deficit)).unwrap_or(u64::MAX);
+            // No later than the oldest outstanding admission lapses: the deficit
+            // counted its datagram, and nothing else wakes this waiter then.
+            let wake_at = now
+                .saturating_add(deficit)
+                .min(lapses_at.unwrap_or(i64::MAX));
+            let wake_at = u64::try_from(wake_at).unwrap_or(u64::MAX);
             if !matches!(&waiter.timer, Some((at, _)) if *at <= wake_at) {
                 waiter.timer = None;
             }
