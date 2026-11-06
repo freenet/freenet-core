@@ -2033,17 +2033,59 @@ impl ReDb {
         })
     }
 
-    pub(crate) fn put_native_app_grant(
+    /// Insert unless the table already holds `max` rows; count and insert in
+    /// one write transaction. `Ok(false)` when refused.
+    pub(crate) fn insert_native_app_grant_capped(
         &self,
         token_hash: &[u8; 32],
         value: &[u8],
+        max: usize,
+    ) -> Result<bool, redb::Error> {
+        let txn = self.begin_write()?;
+        let inserted = {
+            let mut tbl = txn.open_table(NATIVE_APP_GRANTS_TABLE)?;
+            if tbl.len()? >= max as u64 {
+                false
+            } else {
+                tbl.insert(token_hash.as_slice(), value)?;
+                true
+            }
+        };
+        if inserted {
+            Self::commit_guarded(txn)?;
+        } else {
+            txn.abort()?;
+        }
+        Ok(inserted)
+    }
+
+    /// Rewrite an existing row with `update(old)` in one write transaction;
+    /// never recreates an absent (revoked) row.
+    pub(crate) fn update_native_app_grant_if_present(
+        &self,
+        token_hash: &[u8; 32],
+        update: &mut dyn FnMut(&[u8]) -> Option<Vec<u8>>,
     ) -> Result<(), redb::Error> {
         let txn = self.begin_write()?;
-        {
+        let changed = {
             let mut tbl = txn.open_table(NATIVE_APP_GRANTS_TABLE)?;
-            tbl.insert(token_hash.as_slice(), value)?;
+            let new = tbl
+                .get(token_hash.as_slice())?
+                .and_then(|old| update(old.value()));
+            match new {
+                Some(new) => {
+                    tbl.insert(token_hash.as_slice(), new.as_slice())?;
+                    true
+                }
+                None => false,
+            }
+        };
+        if changed {
+            Self::commit_guarded(txn)?;
+        } else {
+            txn.abort()?;
         }
-        Self::commit_guarded(txn)
+        Ok(())
     }
 
     pub(crate) fn get_native_app_grant(

@@ -11,7 +11,9 @@ use dashmap::DashMap;
 /// Tracks auth tokens that have already been warned about to avoid log spam.
 /// When a client repeatedly tries to use an invalid token (e.g., after node restart),
 /// we only want to log the warning once per token rather than flooding the logs.
-static WARNED_INVALID_TOKENS: OnceLock<StdMutex<HashSet<String>>> = OnceLock::new();
+/// Holds a SHA-256 of each token, not the token: a revoked native app grant
+/// token (#5264) lands here too, and is still a credential-shaped secret.
+static WARNED_INVALID_TOKENS: OnceLock<StdMutex<HashSet<[u8; 32]>>> = OnceLock::new();
 
 /// Maximum number of warned tokens to track before clearing the set.
 /// This prevents unbounded memory growth if many invalid tokens are tried.
@@ -32,6 +34,29 @@ pub const AUTH_TOKEN_INVALID_ERROR: &str = "AUTH_TOKEN_INVALID";
 /// (see `shell_bridge.js`). 4401 is in the WebSocket private-use application
 /// range (4000-4999) and deliberately mirrors HTTP 401 Unauthorized.
 pub const AUTH_TOKEN_INVALID_CLOSE_CODE: u16 = 4401;
+
+/// Error prefix sent before a [`AUTH_TOKEN_UNAVAILABLE_CLOSE_CODE`] close.
+pub const AUTH_TOKEN_UNAVAILABLE_ERROR: &str = "AUTH_TOKEN_UNAVAILABLE";
+
+/// WebSocket close code for a token the node could not check right now: it is
+/// not a shell-page token, and the native app grant store (#5264) was not
+/// available (the node is still starting, or a storage read failed). Unlike
+/// [`AUTH_TOKEN_INVALID_CLOSE_CODE`] this does NOT mean the token is invalid,
+/// so a native client must keep its durable grant token and retry later.
+/// Mirrors HTTP 503.
+pub const AUTH_TOKEN_UNAVAILABLE_CLOSE_CODE: u16 = 4503;
+
+/// What the upgrade found out about the connection's auth token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TokenCheck {
+    /// No token, or a token that resolved to an app.
+    Valid,
+    /// A token that names nothing: stale shell-page token, revoked grant.
+    Invalid,
+    /// A token that could not be checked right now; see
+    /// [`AUTH_TOKEN_UNAVAILABLE_CLOSE_CODE`].
+    Unavailable,
+}
 
 /// Interval for sending WebSocket ping frames to keep connection alive.
 /// Idle TCP connections may be closed by the OS, browser, or intermediate
@@ -221,7 +246,9 @@ use crate::{
 use super::{ClientError, ClientEventsProxy, ClientId, ConnectionScope, HostResult, OpenRequest};
 use crate::client_events::user_op_rate_limit::UserOpRateLimiter;
 use crate::server::client_api::OriginContractMap;
-use crate::server::client_api::app_grants::{AppGrantState, LiveGrantGuard};
+use crate::server::client_api::app_grants::{
+    AppGrantState, GrantLookup, LiveGrantGuard, has_forwarding_headers,
+};
 use crate::wasm_runtime::UserSecretContext;
 
 /// Checks if a WebSocket Origin header value refers to localhost.
@@ -1259,6 +1286,7 @@ async fn websocket_commands(
     // WebSocket routes, so standalone test routers honour no grants.
     app_grants: Option<Extension<AppGrantState>>,
     token_from_header: Option<Extension<AuthTokenFromHeader>>,
+    headers: axum::http::HeaderMap,
 ) -> Response {
     // A hosted node serves its client API only to a connection that presented
     // a user token: every request on it runs under that user's namespace, and
@@ -1281,64 +1309,87 @@ async fn websocket_commands(
     }
     let op_rate_limiter = op_rate_limiter.map(|Extension(l)| l);
     let activity_secrets_dir = activity_secrets_dir.map(|Extension(d)| d);
-    // A grant is never honoured on a hosted node (whose connections run under a
-    // per-user namespace), nor for a token taken from the query string.
-    let app_grants = app_grants
-        .map(|Extension(g)| g)
-        .filter(|_| !hosted_mode.0 && token_from_header.is_some_and(|Extension(h)| h.0));
+    // A grant is consulted only where it could be honoured: not on a hosted
+    // node (whose connections run under a per-user namespace), not for a token
+    // taken from the query string, not when the upgrade came through a reverse
+    // proxy (the same refusal the grant's HTTP routes make), and only for a
+    // connection classified as local, the only kind that can carry an attested
+    // app identity. Anything else skips the lookup entirely: no store read, no
+    // live registration.
+    let app_grants = app_grants.map(|Extension(g)| g).filter(|_| {
+        !hosted_mode.0
+            && token_from_header.is_some_and(|Extension(h)| h.0)
+            && !has_forwarding_headers(&headers)
+            && connection_scope == ConnectionScope::Local
+    });
     let on_upgrade = move |ws: WebSocket| async move {
         // Held for the connection's life when it was opened with a native app
         // grant; revoking the grant cancels it and closes the connection.
         let mut live_grant: Option<LiveGrantGuard> = None;
         // Get the data we need from the DashMap
         // Track whether a token was provided but is invalid (stale/expired)
-        let (auth_and_instance, token_is_invalid) = if let Some(token) = auth_token.as_ref() {
+        let (auth_and_instance, token_check) = if let Some(token) = auth_token.as_ref() {
             // Tokens are credentials: never log them (`AuthToken`'s Debug is
             // redacted, and nothing here prints the raw value).
-            if let Some(entry) = origin_contracts.get(token) {
+            let grant = if let Some(entry) = origin_contracts.get(token) {
                 let origin = entry.value();
                 tracing::trace!(contract_id = ?origin.contract_id, "Found token in origin_contracts map");
-                (Some((token.clone(), origin.contract_id)), false)
-            } else if let Some(grant) = app_grants
-                .as_ref()
-                .and_then(|g| g.resolve_connection(token))
-            {
-                // A user-approved native app grant (#5264). From here on the
-                // connection is handled exactly as a shell-page token for the
-                // same app: same `(token, contract)` pair, same scope gate.
-                tracing::debug!(contract_id = %grant.contract_id, "Connection opened with a native app grant");
-                live_grant = Some(grant.guard);
-                (Some((token.clone(), grant.contract_id)), false)
+                Ok(origin.contract_id)
             } else {
-                // Rate-limit warnings: only log once per unique token to avoid log spam
-                // when clients repeatedly retry with the same stale token
-                let warned_tokens =
-                    WARNED_INVALID_TOKENS.get_or_init(|| StdMutex::new(HashSet::new()));
-                let token_str = token.as_str().to_string();
-                let mut warned = warned_tokens.lock().unwrap();
-
-                // Clear set if it gets too large to prevent unbounded memory growth
-                if warned.len() >= MAX_WARNED_TOKENS {
-                    warned.clear();
+                match app_grants.as_ref().map(|g| g.resolve_connection(token)) {
+                    // A user-approved native app grant (#5264). From here on the
+                    // connection is handled exactly as a shell-page token for
+                    // the same app: same `(token, contract)` pair, same scope
+                    // gate.
+                    Some(GrantLookup::Granted(grant)) => {
+                        tracing::debug!(contract_id = %grant.contract_id, "Connection opened with a native app grant");
+                        live_grant = Some(grant.guard);
+                        Ok(grant.contract_id)
+                    }
+                    Some(GrantLookup::Unavailable) => Err(TokenCheck::Unavailable),
+                    Some(GrantLookup::NotFound) | None => Err(TokenCheck::Invalid),
                 }
-
-                if warned.insert(token_str) {
-                    // First time seeing this invalid token - log it
-                    tracing::warn!(
-                        "Auth token not found in origin_contracts map or among app grants. \
-                         This usually means the node was restarted and the client has a stale token, \
-                         or an app grant was revoked. \
-                         Client should refresh the page to get a new token."
+            };
+            match grant {
+                Ok(contract_id) => (Some((token.clone(), contract_id)), TokenCheck::Valid),
+                Err(TokenCheck::Unavailable) => {
+                    tracing::info!(
+                        "Could not check an auth token against app grants now; asking the client to retry"
                     );
-                } else {
-                    // Already warned about this token - use debug level to reduce noise
-                    tracing::debug!("Auth token still not found (already warned)");
+                    (None, TokenCheck::Unavailable)
                 }
-                (None, true) // Token was provided but is invalid
+                Err(check) => {
+                    // Rate-limit warnings: only log once per unique token to avoid log spam
+                    // when clients repeatedly retry with the same stale token
+                    let warned_tokens =
+                        WARNED_INVALID_TOKENS.get_or_init(|| StdMutex::new(HashSet::new()));
+                    let token_hash: [u8; 32] =
+                        <sha2::Sha256 as sha2::Digest>::digest(token.as_str().as_bytes()).into();
+                    let mut warned = warned_tokens.lock().unwrap();
+
+                    // Clear set if it gets too large to prevent unbounded memory growth
+                    if warned.len() >= MAX_WARNED_TOKENS {
+                        warned.clear();
+                    }
+
+                    if warned.insert(token_hash) {
+                        // First time seeing this invalid token - log it
+                        tracing::warn!(
+                            "Auth token not found in origin_contracts map or among app grants. \
+                             This usually means the node was restarted and the client has a stale token, \
+                             or an app grant was revoked. \
+                             Client should refresh the page to get a new token."
+                        );
+                    } else {
+                        // Already warned about this token - use debug level to reduce noise
+                        tracing::debug!("Auth token still not found (already warned)");
+                    }
+                    (None, check) // Token was provided but is invalid
+                }
             }
         } else {
             tracing::trace!("No auth token provided in WebSocket request");
-            (None, false) // No token provided - not an error
+            (None, TokenCheck::Valid) // No token provided - not an error
         };
 
         // Only evaluate auth_and_instance for trace when trace is enabled
@@ -1354,7 +1405,7 @@ async fn websocket_commands(
             connection_scope,
             op_rate_limiter,
             activity_secrets_dir,
-            token_is_invalid,
+            token_check,
             live_grant,
             encoding_protoc,
             api_version,
@@ -1446,7 +1497,7 @@ async fn websocket_interface(
     // on standalone/test paths; an empty path also disables stamping. Used only
     // when this connection carries a `user_context` (hosted mode).
     activity_secrets_dir: Option<crate::server::ActivitySecretsDir>,
-    token_is_invalid: bool,
+    token_check: TokenCheck,
     // Set when the connection was opened with a native app grant (#5264).
     // Revoking the grant cancels it, and the loop below then closes the
     // connection. Dropped (deregistered) when this function returns.
@@ -1481,14 +1532,27 @@ async fn websocket_interface(
         next_stream_id: 0,
     };
 
-    // If a token was provided but is invalid (stale/expired), immediately send an error
-    // to the client so it can refresh and get a new token. This prevents endless retry loops.
-    if token_is_invalid {
-        let error_msg = format!(
-            "{}: The auth token is no longer valid. This usually happens after a node restart. \
-             Please refresh the page to get a new token.",
-            AUTH_TOKEN_INVALID_ERROR
-        );
+    // If a token was provided but is invalid (stale/expired), or could not be
+    // checked right now, immediately send an error to the client and close, so
+    // it can refresh (invalid) or retry later (unavailable). This prevents
+    // endless retry loops on a stale token, and keeps a native client from
+    // discarding a valid grant token while the node is starting.
+    if token_check != TokenCheck::Valid {
+        let (prefix, explanation, close_code) = if token_check == TokenCheck::Unavailable {
+            (
+                AUTH_TOKEN_UNAVAILABLE_ERROR,
+                "The node could not check this token right now. Keep the token and retry shortly.",
+                AUTH_TOKEN_UNAVAILABLE_CLOSE_CODE,
+            )
+        } else {
+            (
+                AUTH_TOKEN_INVALID_ERROR,
+                "The auth token is no longer valid. This usually happens after a node restart. \
+                 Please refresh the page to get a new token.",
+                AUTH_TOKEN_INVALID_CLOSE_CODE,
+            )
+        };
+        let error_msg = format!("{prefix}: {explanation}");
         let error: ClientError = ErrorKind::Unhandled {
             cause: std::borrow::Cow::Owned(error_msg),
         }
@@ -1505,7 +1569,10 @@ async fn websocket_interface(
 
         send_response_message(&mut server_sink, serialized_error, &mut conn_state, None).await?;
 
-        tracing::debug!("Sent AUTH_TOKEN_INVALID error to client, closing connection");
+        tracing::debug!(
+            prefix,
+            "Sent auth token error to client, closing connection"
+        );
         // Close the connection after sending the error. Keeping it open causes delegate
         // failures: all subsequent messages would be processed with origin_contract=None
         // (since auth_token=None), so the delegate receives origin=None and fails with
@@ -1525,8 +1592,8 @@ async fn websocket_interface(
         // error above is still sent first (unchanged) for clients that decode it.
         if let Err(e) = server_sink
             .send(Message::Close(Some(CloseFrame {
-                code: AUTH_TOKEN_INVALID_CLOSE_CODE,
-                reason: AUTH_TOKEN_INVALID_ERROR.into(),
+                code: close_code,
+                reason: prefix.into(),
             })))
             .await
         {
@@ -1580,6 +1647,23 @@ async fn websocket_interface(
                     }
                     Ok(v) => v,
                 };
+                // The select is unbiased, so a request already pipelined behind
+                // a revocation can win the race against the revoked arm. Never
+                // act on it: the grant it would run under is gone.
+                if grant_revoked.is_cancelled() {
+                    tracing::info!(%client_id, "Dropping a request on a connection whose app grant was revoked");
+                    notify_disconnect(&request_sender, client_id, &auth_token, connection_scope, api_version).await;
+                    if let Err(e) = server_sink
+                        .send(Message::Close(Some(CloseFrame {
+                            code: AUTH_TOKEN_INVALID_CLOSE_CODE,
+                            reason: "app grant revoked".into(),
+                        })))
+                        .await
+                    {
+                        tracing::debug!(error = %e, "Failed to send WebSocket close frame after grant revocation");
+                    }
+                    return Ok(());
+                }
                 // Process the request outside the select — runs to completion
                 match process_client_request(
                     client_id,
@@ -3150,7 +3234,7 @@ mod tests {
                         ConnectionScope::Local,
                         None,
                         None,
-                        true,
+                        TokenCheck::Invalid,
                         None,
                         EncodingProtocol::Native,
                         ApiVersion::V1,
@@ -3203,6 +3287,106 @@ mod tests {
             observed_close_code,
             Some(AUTH_TOKEN_INVALID_CLOSE_CODE),
             "an invalid auth token must close the socket with the trusted 4401 code"
+        );
+    }
+
+    /// A token the node could not check (native app grant store unavailable,
+    /// #5264) closes with 4503 so a native client keeps its durable token and
+    /// retries, instead of the 4401 that means the token is invalid.
+    #[tokio::test]
+    async fn unavailable_grant_store_closes_with_4503_code() {
+        use axum::{Extension, Router, response::IntoResponse, routing::get};
+        use std::time::Duration;
+
+        // Fake node backend: answer every NewConnection with a fresh id so
+        // `new_client_connection` resolves and `websocket_interface` reaches the
+        // `token_is_invalid` close path.
+        let (req_tx, mut req_rx) = mpsc::channel::<ClientConnection>(4);
+        tokio::spawn(async move {
+            while let Some(conn) = req_rx.recv().await {
+                if let ClientConnection::NewConnection { callbacks, .. } = conn {
+                    if callbacks
+                        .send(HostCallbackResult::NewId {
+                            id: ClientId::next(),
+                        })
+                        .is_err()
+                    {
+                        // The connection under test hung up; nothing left to serve.
+                        break;
+                    }
+                }
+            }
+        });
+
+        async fn ws_handler(
+            ws: WebSocketUpgrade,
+            Extension(rs): Extension<WebSocketRequest>,
+        ) -> impl IntoResponse {
+            ws.on_upgrade(move |socket| async move {
+                // `token_is_invalid = true` drives the stale-token close path.
+                // The interface's own return value is not the signal under test:
+                // the assertion is the close CODE the client observes.
+                drop(
+                    websocket_interface(
+                        rs,
+                        None,
+                        None,
+                        ConnectionScope::Local,
+                        None,
+                        None,
+                        TokenCheck::Unavailable,
+                        None,
+                        EncodingProtocol::Native,
+                        ApiVersion::V1,
+                        socket,
+                    )
+                    .await,
+                );
+            })
+        }
+
+        let app = Router::new()
+            .route("/ws", get(ws_handler))
+            .layer(Extension(WebSocketRequest(req_tx)));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            // Serving ends when the test drops the listener task; its result is
+            // teardown noise, not a signal.
+            drop(axum::serve(listener, app).await);
+        });
+
+        let (mut client, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .expect("ws connect");
+
+        // The node sends the serialized error frame first, then the close frame;
+        // skip anything that is not a Close and read the close code.
+        let observed_close_code = tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(frame) = client.next().await {
+                #[allow(
+                    clippy::wildcard_enum_match_arm,
+                    reason = "the test reads the CLOSE frame only; every other tungstenite frame kind is deliberately skipped, and that stays right for any variant tungstenite adds"
+                )]
+                match frame.expect("ws frame") {
+                    tokio_tungstenite::tungstenite::Message::Close(Some(cf)) => {
+                        return Some(u16::from(cf.code));
+                    }
+                    tokio_tungstenite::tungstenite::Message::Close(None) => return None,
+                    _ => continue,
+                }
+            }
+            None
+        })
+        .await
+        .expect("timed out waiting for the close frame");
+
+        assert_eq!(
+            observed_close_code,
+            Some(AUTH_TOKEN_UNAVAILABLE_CLOSE_CODE),
+            "a token that could not be checked must close with 4503, not the invalid-token 4401"
         );
     }
 
@@ -5148,7 +5332,7 @@ mod tests {
                         ConnectionScope::Local,
                         None,
                         None,
-                        false,
+                        TokenCheck::Valid,
                         None,
                         EncodingProtocol::Native,
                         ApiVersion::V1,

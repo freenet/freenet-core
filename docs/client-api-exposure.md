@@ -130,9 +130,10 @@ under the originating user, and the node runs no delegate on its own), so a
 prompt with no user is refused rather than shown to anyone. One user token holds
 at most 8 pending prompts; the node-wide limit of 32 is shared by all tokens.
 The legacy `/permission/events` stream, the standalone
-`/permission/{nonce}` page and the capability-grant routes
-(`/permission/grants`, `/permission/grants/revoke`, `/permission/apps`) are not
-served on a hosted node. The 64 permission-socket slots are node-wide and
+`/permission/{nonce}` page, the capability-grant routes
+(`/permission/grants`, `/permission/grants/revoke`, `/permission/apps`) and the
+native app grant routes (`/v1/app-grants/*`, `/permission/native-grants`,
+`/permission/native-grants/revoke`) are not served on a hosted node. The 64 permission-socket slots are node-wide and
 shared by all users; a tab that gets no slot falls back to polling
 `/permission/pending`. On a node that is not hosted these routes take no
 token and behave as before.
@@ -146,3 +147,32 @@ query strings.
 On a loopback bind with hosted mode on, no exposure warning fires, including
 when a reverse proxy is in front of the node: every client-API connection
 there presents its own user token.
+
+## Native app grants
+
+A program on the node's own machine (for example a desktop app) can ask to
+act as one web app's identity when it talks to delegates (#5264). It calls
+`POST /v1/app-grants/request` and `GET /v1/app-grants/request/<id>`, the user
+approves on `/v1/app-grants/approve/<id>` in the browser, and the program
+receives a durable token. Grants are listed, and revoked, on the Apps and
+permissions page (`/permission/native-grants`,
+`/permission/native-grants/revoke`).
+
+All of these routes are loopback-only: the connection must come from loopback,
+the `Host` must name loopback (`localhost`, `127.0.0.1` or `[::1]`), and a
+request carrying a forwarding header (`X-Forwarded-*`, `Forwarded`,
+`X-Real-IP`) is refused. The request and poll routes also refuse anything a
+browser sends (`Origin`, `Sec-Fetch-*`), and approving needs the page's
+single-use nonce and an `Origin` equal to the node's own. So the grant routes
+are unaffected by `--ws-api-address` and `allowed-host`, and cannot be used
+through a reverse proxy that identifies itself with forwarding headers. A
+proxy that adds none and rewrites `Host` to loopback is indistinguishable from
+a local client, which is the same limit the shell-page tokens have.
+
+The node honours a grant token only from the `Authorization: Bearer` header of
+a WebSocket upgrade, never from the `authToken` query parameter, and only on a
+connection from loopback with no forwarding headers. Only `sha256(token)` is
+stored.
+
+Approval does not protect against a malicious program already running as the
+same user, which can open and answer the approval page itself.

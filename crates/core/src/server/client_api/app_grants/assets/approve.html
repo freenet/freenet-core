@@ -140,6 +140,10 @@
                 result.textContent = yes
                   ? 'Allowed. You can close this tab and return to the program.'
                   : 'Denied. You can close this tab.';
+              } else if (r.status === 409) {
+                result.textContent =
+                  'Freenet already has the most programs allowed to use apps. ' +
+                  'Revoke one on the Apps and permissions page, then reload this page.';
               } else {
                 result.textContent =
                   'Freenet could not record your answer (HTTP ' +

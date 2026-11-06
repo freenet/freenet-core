@@ -230,9 +230,19 @@
           var what = document.createElement('div');
           what.className = 'what';
           var line = document.createElement('div');
-          line.textContent = g.client_name
-            ? 'A program calling itself "' + g.client_name + '" (unverified)'
-            : 'A program that did not name itself';
+          if (g.client_name) {
+            // <bdi> keeps the self-reported name from reordering the text
+            // around it.
+            var name = document.createElement('bdi');
+            name.textContent = g.client_name;
+            line.appendChild(
+              document.createTextNode('A program calling itself "'),
+            );
+            line.appendChild(name);
+            line.appendChild(document.createTextNode('" (not verified)'));
+          } else {
+            line.textContent = 'A program that did not name itself';
+          }
           var app = document.createElement('div');
           app.className = 'app';
           app.textContent =

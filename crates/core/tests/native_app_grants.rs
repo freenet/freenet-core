@@ -29,7 +29,7 @@ use freenet_stdlib::{
     client_api::{ClientRequest, DelegateRequest, HostResponse, WebApi},
     prelude::*,
 };
-use futures::StreamExt;
+use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use testresult::TestResult;
 use tokio::time::timeout;
@@ -125,12 +125,14 @@ async fn connect_with_token(port: u16, token: &str) -> anyhow::Result<Ws> {
     Ok(connect_async(request).await?.0)
 }
 
-/// Read frames until the server closes; returns the close code.
-async fn close_code(ws: &mut Ws) -> anyhow::Result<Option<u16>> {
+/// Read frames until the server closes; returns the close code and reason.
+async fn close_frame(ws: &mut Ws) -> anyhow::Result<Option<(u16, String)>> {
     timeout(Duration::from_secs(10), async {
         while let Some(frame) = ws.next().await {
             match frame? {
-                Message::Close(Some(cf)) => return Ok(Some(u16::from(cf.code))),
+                Message::Close(Some(cf)) => {
+                    return Ok(Some((u16::from(cf.code), cf.reason.to_string())));
+                }
                 Message::Close(None) => return Ok(None),
                 _ => continue,
             }
@@ -138,6 +140,10 @@ async fn close_code(ws: &mut Ws) -> anyhow::Result<Option<u16>> {
         Ok(None)
     })
     .await?
+}
+
+async fn close_code(ws: &mut Ws) -> anyhow::Result<Option<u16>> {
+    Ok(close_frame(ws).await?.map(|(code, _)| code))
 }
 
 /// Register the delegate if asked, then ask it to echo the `MessageOrigin` it
@@ -283,6 +289,27 @@ async fn native_app_grant_end_to_end() -> TestResult {
 
     // 5. Revoke from the Apps and permissions page while a connection is open.
     let mut held = connect_with_token(ws_port, &token).await?;
+    // Prove the connection is fully set up (and so registered under the grant)
+    // before revoking: the client sees the upgrade complete before the node has
+    // looked the token up. A request answered on it has passed that point.
+    let probe = ClientRequest::DelegateOp(DelegateRequest::ApplicationMessages {
+        key: delegate.key().clone(),
+        params: Parameters::from(vec![]),
+        inbound: vec![InboundDelegateMsg::ApplicationMessage(
+            ApplicationMessage::new(bincode::serialize(&InboundAppMessage::CheckAttested)?),
+        )],
+    });
+    held.send(Message::Binary(bincode::serialize(&probe)?.into()))
+        .await?;
+    timeout(Duration::from_secs(20), async {
+        while let Some(frame) = held.next().await {
+            if let Message::Binary(_) = frame? {
+                return anyhow::Ok(());
+            }
+        }
+        anyhow::bail!("the held connection closed before answering")
+    })
+    .await??;
     let list: serde_json::Value = http
         .get(format!("{base}/permission/native-grants"))
         .send()
@@ -301,10 +328,15 @@ async fn native_app_grant_end_to_end() -> TestResult {
         .send()
         .await?;
     assert_eq!(resp.status(), 200);
+    // The reason tells the revocation path apart from the invalid-token path,
+    // which uses the same code.
     assert_eq!(
-        close_code(&mut held).await?,
-        Some(AUTH_TOKEN_INVALID_CLOSE_CODE),
-        "the live connection is closed on revocation"
+        close_frame(&mut held).await?,
+        Some((
+            AUTH_TOKEN_INVALID_CLOSE_CODE,
+            "app grant revoked".to_string()
+        )),
+        "the live connection is closed by the revocation"
     );
 
     // 6. The revoked token is refused.

@@ -145,11 +145,41 @@ impl NativeGrant {
     }
 }
 
-/// Keep a requester-supplied name short and printable. It is still untrusted
-/// text: callers must escape it for HTML.
+/// Unicode format characters (general category Cf) that can reorder or hide
+/// surrounding text: bidi embeddings, overrides and isolates, zero-width
+/// characters, and similar. Stripped from a requester-supplied name so it
+/// cannot visually rearrange the "not verified" text displayed beside it.
+fn is_format_char(c: char) -> bool {
+    matches!(c as u32,
+        0x00AD
+        | 0x0600..=0x0605
+        | 0x061C
+        | 0x06DD
+        | 0x070F
+        | 0x0890..=0x0891
+        | 0x08E2
+        | 0x180E
+        | 0x200B..=0x200F
+        | 0x202A..=0x202E
+        | 0x2060..=0x2064
+        | 0x2066..=0x206F
+        | 0xFEFF
+        | 0xFFF9..=0xFFFB
+        | 0x110BD
+        | 0x110CD
+        | 0x13430..=0x1343F
+        | 0x1BCA0..=0x1BCA3
+        | 0x1D173..=0x1D17A
+        | 0xE0001
+        | 0xE0020..=0xE007F)
+}
+
+/// Keep a requester-supplied name short and printable: control and format
+/// characters are removed. It is still untrusted text: callers must escape it
+/// for HTML.
 pub(crate) fn sanitize_client_name(name: &str) -> String {
     name.chars()
-        .filter(|c| !c.is_control())
+        .filter(|c| !c.is_control() && !is_format_char(*c))
         .take(MAX_CLIENT_NAME_CHARS)
         .collect::<String>()
         .trim()
@@ -157,19 +187,15 @@ pub(crate) fn sanitize_client_name(name: &str) -> String {
 }
 
 impl DelegateCapabilities {
-    /// Store a new grant for `token_hash`. Refused once [`MAX_NATIVE_GRANTS`]
-    /// grants exist.
+    /// Store a new grant for `token_hash`. `Ok(false)` when
+    /// [`MAX_NATIVE_GRANTS`] grants already exist; the count and the insert
+    /// are one storage transaction, so concurrent callers cannot exceed it.
     pub(crate) fn create_native_grant(
         &self,
         token_hash: GrantTokenHash,
         app: AppIdentity,
         client_name: &str,
-    ) -> anyhow::Result<()> {
-        if self.storage.all_native_grants()?.len() >= MAX_NATIVE_GRANTS {
-            anyhow::bail!(
-                "too many app grants ({MAX_NATIVE_GRANTS}); revoke one on the Apps and permissions page"
-            );
-        }
+    ) -> anyhow::Result<bool> {
         let now = self.now_ms();
         let grant = NativeGrant {
             app,
@@ -178,12 +204,22 @@ impl DelegateCapabilities {
             last_used_at_ms: now,
         };
         self.storage
-            .put_native_grant(&token_hash.0, &grant.encode())
+            .insert_native_grant_capped(&token_hash.0, &grant.encode(), MAX_NATIVE_GRANTS)
+    }
+
+    /// Number of stored grants.
+    pub(crate) fn native_grant_count(&self) -> anyhow::Result<usize> {
+        Ok(self.storage.all_native_grants()?.len())
     }
 
     /// The grant a presented token names, if any. Refreshes `last_used_at`
-    /// (at most once per [`LAST_USED_WRITE_INTERVAL_MS`]); a failed refresh is
-    /// logged and does not refuse the connection.
+    /// at most once per [`LAST_USED_WRITE_INTERVAL_MS`].
+    ///
+    /// The refresh is a conditional update of the EXISTING row in one write
+    /// transaction. It must never be a plain write of the record read above: a
+    /// revocation landing between that read and the write would be undone, and
+    /// the revoked token would work again. A failed refresh is logged and does
+    /// not refuse the connection.
     pub(crate) fn native_grant_for(
         &self,
         token_hash: GrantTokenHash,
@@ -191,17 +227,20 @@ impl DelegateCapabilities {
         let Some(bytes) = self.storage.get_native_grant(&token_hash.0)? else {
             return Ok(None);
         };
-        let Some(mut grant) = NativeGrant::decode(&bytes) else {
+        let Some(grant) = NativeGrant::decode(&bytes) else {
             tracing::warn!("Unreadable native app grant record; treating it as absent");
             return Ok(None);
         };
         let now = self.now_ms();
         if now.saturating_sub(grant.last_used_at_ms) >= LAST_USED_WRITE_INTERVAL_MS {
-            grant.last_used_at_ms = now;
-            if let Err(e) = self
-                .storage
-                .put_native_grant(&token_hash.0, &grant.encode())
-            {
+            let refreshed =
+                self.storage
+                    .update_native_grant_if_present(&token_hash.0, &mut |current| {
+                        let mut g = NativeGrant::decode(current)?;
+                        g.last_used_at_ms = now;
+                        Some(g.encode())
+                    });
+            if let Err(e) = refreshed {
                 tracing::debug!(error = %e, "Could not refresh a native app grant's last use");
             }
         }
@@ -231,7 +270,10 @@ impl DelegateCapabilities {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contract::delegate_capabilities::{CapabilityStorage, MemoryCapabilityStorage};
+    use crate::contract::delegate_capabilities::{
+        CapabilityStorage, FlakyCapabilityStorage, MemoryCapabilityStorage,
+    };
+    use crate::util::time_source::SharedMockTimeSource;
     use freenet_stdlib::prelude::ContractInstanceId;
     use std::sync::Arc;
 
@@ -289,12 +331,77 @@ mod tests {
     }
 
     #[test]
+    fn client_name_loses_format_characters() {
+        // Right-to-left override, isolates, zero-width space, BOM.
+        assert_eq!(
+            sanitize_client_name("a\u{202E}b\u{2066}c\u{2069}d\u{200B}e\u{FEFF}"),
+            "abcde"
+        );
+        assert!(is_format_char('\u{E0041}'));
+        assert!(!is_format_char('a'));
+        assert!(!is_format_char('\u{00E9}'));
+    }
+
+    fn mock_caps(
+        storage: Arc<dyn CapabilityStorage>,
+    ) -> (Arc<DelegateCapabilities>, SharedMockTimeSource) {
+        let time = SharedMockTimeSource::new();
+        let c = DelegateCapabilities::with_time_source(
+            storage,
+            Arc::new(time.clone()),
+            crate::contract::delegate_capabilities::BudgetLimits::default(),
+        );
+        (c, time)
+    }
+
+    #[test]
+    fn last_used_is_refreshed_after_the_interval() {
+        let (c, time) = mock_caps(Arc::new(MemoryCapabilityStorage::default()));
+        let t = GrantToken::generate();
+        assert!(c.create_native_grant(t.hash(), app(1), "x").unwrap());
+        let created = c.native_grants().unwrap()[0].1.created_at_ms;
+        time.advance_time(std::time::Duration::from_millis(
+            LAST_USED_WRITE_INTERVAL_MS + 1,
+        ));
+        c.native_grant_for(t.hash()).unwrap().unwrap();
+        let g = &c.native_grants().unwrap()[0].1;
+        assert!(g.last_used_at_ms > created, "{g:?}");
+    }
+
+    /// A revocation landing between the lookup's read and its last-used
+    /// refresh must stay revoked. With a plain write-back of the record read,
+    /// the refresh recreated the row and the revoked token worked again.
+    #[test]
+    fn revocation_between_read_and_refresh_is_not_undone() {
+        let storage = Arc::new(FlakyCapabilityStorage::default());
+        let (c, time) = mock_caps(storage.clone());
+        let t = GrantToken::generate();
+        assert!(c.create_native_grant(t.hash(), app(1), "x").unwrap());
+        // Old enough that the lookup will try to refresh it.
+        time.advance_time(std::time::Duration::from_millis(
+            LAST_USED_WRITE_INTERVAL_MS + 1,
+        ));
+        let hash = t.hash();
+        *storage.after_native_get.lock() = Some(Box::new(move |inner| {
+            assert!(inner.remove_native_grant(&hash.0).unwrap());
+        }));
+        // This lookup read the row before the revocation, so it may still
+        // answer with it; what matters is what is left in storage.
+        drop(c.native_grant_for(t.hash()).unwrap());
+        assert!(storage.after_native_get.lock().is_none(), "the hook ran");
+        assert!(c.native_grants().unwrap().is_empty(), "revocation undone");
+        assert_eq!(c.native_grant_for(t.hash()).unwrap(), None);
+    }
+
+    #[test]
     fn create_lookup_revoke() {
         let storage = Arc::new(MemoryCapabilityStorage::default());
         let c = DelegateCapabilities::new(storage.clone());
         let t = GrantToken::generate();
-        c.create_native_grant(t.hash(), app(1), "River desktop")
-            .unwrap();
+        assert!(
+            c.create_native_grant(t.hash(), app(1), "River desktop")
+                .unwrap()
+        );
         let g = c.native_grant_for(t.hash()).unwrap().unwrap();
         assert_eq!(g.app, app(1));
         assert_eq!(g.client_name, "River desktop");
@@ -313,13 +420,16 @@ mod tests {
     fn creation_is_capped() {
         let c = DelegateCapabilities::new(Arc::new(MemoryCapabilityStorage::default()));
         for _ in 0..MAX_NATIVE_GRANTS {
-            c.create_native_grant(GrantToken::generate().hash(), app(1), "x")
-                .unwrap();
+            assert!(
+                c.create_native_grant(GrantToken::generate().hash(), app(1), "x")
+                    .unwrap()
+            );
         }
         assert!(
-            c.create_native_grant(GrantToken::generate().hash(), app(1), "x")
-                .is_err()
+            !c.create_native_grant(GrantToken::generate().hash(), app(1), "x")
+                .unwrap()
         );
+        assert_eq!(c.native_grant_count().unwrap(), MAX_NATIVE_GRANTS);
         assert_eq!(c.native_grants().unwrap().len(), MAX_NATIVE_GRANTS);
     }
 
