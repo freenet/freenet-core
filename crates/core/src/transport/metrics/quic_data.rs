@@ -22,7 +22,8 @@
 //! | `quic_session_ended_with_data_path_<age>` | sessions that ended under a data path, by the path's age |
 //! | `quic_sent_packets`, `quic_lost_packets`, `quic_lost_bytes`, `quic_congestion_events` | quinn's per-path counts (`PathStats`), shadow paths included, summed over the node's paths up to each path's last tick |
 //! | `quic_loss_rate_<bucket>` | live paths that have sent at least 200 packets since they started, by their own lost/sent over that time (a gauge, not reset, every bucket sent every period, 0 included): `zero`, `lt_0_5pct`, `lt_1pct`, `lt_2pct`, `lt_5pct`, `lt_10pct`, `lt_20pct`, `ge_20pct` |
-//! | `quic_ended_loss_rate_<bucket>` | paths that ended in the period, by the bucket they were in at the end (same buckets; a path that never reached 200 packets is not counted) |
+//! | `quic_ended_loss_rate_<bucket>` | paths that ended in the period, by the bucket they were in at the end (same buckets) |
+//! | `quic_ended_paths_below_floor` | paths that ended in the period before sending 200 packets, so in no bucket |
 //!
 //! What the loss rate is: quinn's lost over sent (quinn-proto 0.11.19). `sent`
 //! counts every packet quinn built, acknowledgement-only ones included. `lost`
@@ -30,8 +31,10 @@
 //! declared lost that is later acknowledged is not taken back, so spurious
 //! declarations count as losses. Lost PLPMTUD probes are left out of `lost` while
 //! sent probes are in `sent`; MTU discovery is off (`quic::config`), so no path
-//! sends any. It is quinn's view of loss, not a measurement of the link. A shadow
-//! path's packets are mostly keepalives and acknowledgements, so its rate is of
+//! sends any. Packets still in flight when a connection closes are dropped
+//! by quinn, not declared lost, so a path's final bucket can understate its
+//! loss at the moment it ended. It is quinn's view of loss, not a measurement
+//! of the link. A shadow path's packets are mostly keepalives and acknowledgements, so its rate is of
 //! small packets and may not hold for data-sized ones.
 //! | `quic_streams_sampled_paths`, `quic_streams_open_ge_<n>`, `quic_streams_peak_max` | per path and period, the peak of inbound streams read at once: the paths sampled, those whose peak reached each level, and the highest peak |
 //!
@@ -111,14 +114,28 @@ impl PathLossWindow {
     }
 }
 
+impl PathLossWindow {
+    /// Whether the path is in a loss-rate bucket. Tests only.
+    #[cfg(test)]
+    pub(crate) fn is_bucketed(&self) -> bool {
+        self.bucket.is_some()
+    }
+}
+
 impl Drop for PathLossWindow {
     /// The path ended: out of its bucket, and counted among the period's ended
-    /// paths by that bucket, so paths that fail lossy still show.
+    /// paths by that bucket, so paths that fail lossy still show; a path that
+    /// never reached the floor is counted as ended below it.
     fn drop(&mut self) {
-        if let Some(bucket) = self.bucket.take() {
-            let mut counts = self.node.loss.lock();
-            counts.rates[bucket] = counts.rates[bucket].saturating_sub(1);
-            counts.ended[bucket] = counts.ended[bucket].saturating_add(1);
+        let mut counts = self.node.loss.lock();
+        match self.bucket.take() {
+            Some(bucket) => {
+                counts.rates[bucket] = counts.rates[bucket].saturating_sub(1);
+                counts.ended[bucket] = counts.ended[bucket].saturating_add(1);
+            }
+            None => {
+                counts.ended_below_floor = counts.ended_below_floor.saturating_add(1);
+            }
         }
     }
 }
@@ -138,6 +155,8 @@ struct LossCounts {
     rates: [u32; LOSS_RATE_LABELS.len()],
     /// Paths that ended in the period, by their last bucket.
     ended: [u64; LOSS_RATE_LABELS.len()],
+    /// Paths that ended in the period before reaching the floor.
+    ended_below_floor: u64,
 }
 
 /// The levels `quic_streams_open_ge_<n>` reports, up to the streamed-send limit
@@ -389,6 +408,7 @@ impl QuicDataCounters {
             congestion_events: loss.congestion_events,
             loss_rate: loss.rates.to_vec(),
             ended_loss_rate: loss.ended.to_vec(),
+            ended_below_floor: loss.ended_below_floor,
             streams_open_paths_sampled: streams.paths_sampled,
             streams_open_ge: streams.ge.to_vec(),
             streams_open_max: streams.max,
@@ -426,6 +446,9 @@ pub struct QuicDataSnapshot {
     pub loss_rate: Vec<u32>,
     /// Paths that ended in the period, by their last loss-rate bucket.
     pub ended_loss_rate: Vec<u64>,
+    /// Paths that ended in the period before sending
+    /// [`LOSS_RATE_MIN_SENT`] packets, so in no bucket.
+    pub ended_below_floor: u64,
     pub streams_open_paths_sampled: u32,
     /// By `QUIC_STREAMS_OPEN_THRESHOLDS`.
     pub streams_open_ge: Vec<u32>,
@@ -468,6 +491,7 @@ impl QuicDataSnapshot {
             congestion_events,
             loss_rate,
             ended_loss_rate,
+            ended_below_floor,
             streams_open_paths_sampled,
             streams_open_ge,
             streams_open_max,
@@ -556,6 +580,7 @@ impl QuicDataSnapshot {
             ("quic_lost_packets", *lost_packets),
             ("quic_lost_bytes", *lost_bytes),
             ("quic_congestion_events", *congestion_events),
+            ("quic_ended_paths_below_floor", *ended_below_floor),
             (
                 "quic_streams_sampled_paths",
                 u64::from(*streams_open_paths_sampled),
@@ -602,6 +627,7 @@ impl QuicDataSnapshot {
             congestion_events,
             loss_rate: _,
             ended_loss_rate,
+            ended_below_floor,
             streams_open_paths_sampled,
             streams_open_ge: _,
             streams_open_max: _,
@@ -625,6 +651,7 @@ impl QuicDataSnapshot {
                 *lost_packets,
                 *lost_bytes,
                 *congestion_events,
+                *ended_below_floor,
                 u64::from(*streams_open_paths_sampled),
             ]
             .iter()
@@ -958,7 +985,7 @@ mod tests {
 
     /// A path that ends leaves the gauge and is counted once among the period's
     /// ended paths by the bucket it was in; one that never reached 200 packets
-    /// is in neither. The ended counts are of the period.
+    /// is counted as ended below the floor. The ended counts are of the period.
     #[test]
     fn a_path_that_ends_is_counted_by_its_last_bucket() {
         let counters: &'static QuicDataCounters = Box::leak(Box::new(QuicDataCounters::new()));
@@ -975,11 +1002,14 @@ mod tests {
         let snap = counters.snapshot(true);
         assert_eq!(snap.loss_rate.iter().sum::<u32>(), 0);
         assert_eq!(snap.ended_loss_rate, vec![0, 0, 0, 0, 0, 0, 0, 1]);
+        assert_eq!(snap.ended_below_floor, 1, "the short path");
         assert!(snap.has_activity(), "an ended path is activity");
-        assert_eq!(
-            counters.snapshot(true).ended_loss_rate.iter().sum::<u64>(),
-            0
-        );
+        let next = counters.snapshot(true);
+        assert_eq!(next.ended_loss_rate.iter().sum::<u64>(), 0);
+        assert_eq!(next.ended_below_floor, 0);
+        // Ended below the floor is activity on its own.
+        drop(PathLossWindow::new(counters));
+        assert!(counters.snapshot(true).has_activity());
     }
 
     /// Every loss-rate gauge is uploaded each period, an emptied bucket as 0,

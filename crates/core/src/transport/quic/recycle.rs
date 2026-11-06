@@ -789,7 +789,7 @@ pub(crate) async fn watch_acknowledgements<T: TimeSource>(
     time: T,
     cap_holds: Arc<CapHolds>,
     heard: Arc<PeerHeard>,
-    node: &'static crate::transport::metrics::QuicDataCounters,
+    report: &mut PathReport,
 ) {
     let Some(first) = AckSample::of(&connection, &cap_holds) else {
         tracing::warn!(
@@ -801,7 +801,6 @@ pub(crate) async fn watch_acknowledgements<T: TimeSource>(
     };
     let mut received = first.received;
     let mut watch = AckWatch::new(ACK_WATCH_WINDOW, first);
-    let mut report = PathReport::new(connection.clone(), node);
     loop {
         time.sleep(ACK_WATCH_TICK).await;
         // Read before the counts, so a closed connection's counts are its
@@ -836,21 +835,41 @@ pub(crate) async fn watch_acknowledgements<T: TimeSource>(
 mod cap_tests;
 
 /// A path's byte and loss counts, reported node-wide by their change at each
-/// tick of the watch, and once more when the report is dropped: the watch is
-/// dropped when the receive task ends first (as it does when the connection
-/// closes) or the path's task is aborted, and the counts up to that point,
-/// often the losses that ended the path, are still reported. Then the window
-/// is dropped, which counts the path among the ended ones by its final bucket.
-struct PathReport {
+/// tick of the watch, and once more when the report is dropped. It is owned
+/// by the path's receive supervisor and lent to the watch, so it is dropped
+/// when the path's task ends (the connection closed and the receive task
+/// returned, or the task was aborted with the path), and the counts up to
+/// then, often the losses that ended the path, are still reported. Then the
+/// window is dropped, which counts the path among the ended ones. A panic in
+/// the watch, which the supervisor contains while the path stays up, does
+/// not drop it: the path stays in its live bucket until it really ends.
+/// What a path's receive supervisor keeps for its acknowledgement watch.
+pub(crate) struct AckWatchParts {
+    pub(crate) cap_holds: Arc<CapHolds>,
+    pub(crate) heard: Arc<PeerHeard>,
+    pub(crate) report: PathReport,
+}
+
+/// Watch panics `PathReport::panic_once_bucketed` raised. Tests only; only
+/// the one test that sets it raises any.
+#[cfg(test)]
+pub(crate) static TEST_WATCH_PANICS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) struct PathReport {
     connection: quinn::Connection,
     node: &'static crate::transport::metrics::QuicDataCounters,
     bytes: UdpBytes,
     loss: PathLoss,
     window: crate::transport::metrics::PathLossWindow,
+    /// The next report that finds the path in a bucket panics, once
+    /// (supervisor test).
+    #[cfg(test)]
+    pub(crate) panic_once_bucketed: bool,
 }
 
 impl PathReport {
-    fn new(
+    pub(crate) fn new(
         connection: quinn::Connection,
         node: &'static crate::transport::metrics::QuicDataCounters,
     ) -> Self {
@@ -861,6 +880,8 @@ impl PathReport {
             window: crate::transport::metrics::PathLossWindow::new(node),
             connection,
             node,
+            #[cfg(test)]
+            panic_once_bucketed: false,
         }
     }
 
@@ -873,6 +894,12 @@ impl PathReport {
         let (next, delta) = self.loss.step(PathLoss::of(&stats));
         self.node.record_path_loss(&mut self.window, delta);
         self.loss = next;
+        #[cfg(test)]
+        if self.panic_once_bucketed && self.window.is_bucketed() {
+            self.panic_once_bucketed = false;
+            TEST_WATCH_PANICS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            panic!("test: the acknowledgement watch panics");
+        }
     }
 }
 
