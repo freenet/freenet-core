@@ -602,6 +602,11 @@ impl Executor<Runtime> {
                     cause: over.to_string().into(),
                 }));
             }
+            // A store, not a merge: the applied-payload record no longer
+            // describes the state (`crate::ring::applied_payloads`). Covers
+            // both callers, the fresh install and the re-store from a fetched
+            // copy. Reset before the write; clearing early only loses skips.
+            op_manager.ring.applied_payloads.reset(&key);
         }
         self.state_store
             .store(key, state, params)
@@ -665,6 +670,9 @@ impl Executor<Runtime> {
                 // only in this PR. No-op until the tracker is seeded.
                 if let Some(op_manager) = &self.op_manager {
                     op_manager.ring.record_state_removed(key);
+                    // The state is gone: no recorded payload describes what a
+                    // later install will hold (`crate::ring::applied_payloads`).
+                    op_manager.ring.applied_payloads.reset(key);
                 }
                 Ok(())
             }

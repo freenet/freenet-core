@@ -121,10 +121,11 @@
 //! - Dedup. A message goes on UDP only when the outcome proves the receiver
 //!   cannot deliver it ([`route`]), so a Short needs none. A stream id on both
 //!   paths is refused where both transports meet (`completed_inbound_streams`).
-//! - Exporting the QUIC-specific counters. They are per path
-//!   ([`QuicPath::stats`]); the refusals and evictions the UDP transport also
-//!   has are counted in `TRANSPORT_METRICS` as well, under the same
-//!   `InboundStreamOutcome` labels. Telemetry for the rest is e2/e5.
+//!
+//! Counts: per path ([`QuicPath::stats`]), and node-wide in the same step, in
+//! `metrics::quic_data` (exported as `quic_data_*`, `quic_inbound_*` and the
+//! rest listed there). The refusals and evictions the UDP transport also has are
+//! also counted under the shared `InboundStreamOutcome` labels.
 //!
 //! [`MAX_UNI_STREAMS`]: super::config::MAX_UNI_STREAMS
 //! [`StreamHandle`]: crate::transport::peer_connection::streaming::StreamHandle
@@ -152,7 +153,7 @@ use crate::config::GlobalExecutor;
 use crate::simulation::TimeSource;
 use crate::transport::StreamId;
 use crate::transport::boundary::StreamProgressObserver;
-use crate::transport::metrics::{InboundStreamOutcome, QuicCloseCode};
+use crate::transport::metrics::{InboundStreamOutcome, QuicCloseCode, QuicDataCounters};
 use crate::transport::peer_connection::inbound_budget::SharedInboundBudget;
 use crate::transport::peer_connection::streaming::StreamError;
 #[cfg(test)]
@@ -202,6 +203,23 @@ pub(crate) mod stop_code {
     /// it and sends on the UDP session, since a retry on the same path fails
     /// the same way.
     pub(crate) const NOT_ACCEPTING_DATA: u32 = 0x19;
+    /// A code's name in telemetry (`quic_data_stop_<label>`); `unknown` for a
+    /// code not in [`ALL`].
+    pub(crate) fn label(code: u32) -> &'static str {
+        match code {
+            HEADER_REFUSED => "header_refused",
+            BUDGET_REFUSED => "budget_refused",
+            STREAM_ID_IN_USE => "stream_id_in_use",
+            CHANNEL_FULL => "channel_full",
+            OVERLONG => "overlong",
+            EVICTED => "evicted",
+            CANCELLED => "cancelled",
+            FRAGMENT_REFUSED => "fragment_refused",
+            NOT_ACCEPTING_DATA => "not_accepting_data",
+            _ => "unknown",
+        }
+    }
+
     /// Every stop code, for the range and duplicate checks in
     /// `super::error`. A source-scrape test checks that each `const` in this
     /// module is listed.
@@ -273,9 +291,17 @@ pub(crate) struct QuicPathLimits {
     /// refuses data with [`stop_code::NOT_ACCEPTING_DATA`] right after the
     /// header, before anything is charged to the inbound budget.
     pub(crate) accept_data: bool,
+    /// Where the path's counts are also kept node-wide; `None` is
+    /// `TRANSPORT_METRICS`. A test passes its own, since every test in a process
+    /// writes the global one.
+    pub(crate) counters: Option<&'static QuicDataCounters>,
     /// The receive task panics on its first stream (supervisor test).
     #[cfg(test)]
     pub(crate) panic_in_receive: bool,
+    /// The acknowledgement watch panics once the path is in a loss-rate bucket
+    /// (supervisor test).
+    #[cfg(test)]
+    pub(crate) panic_in_watch: bool,
 }
 
 impl QuicPathLimits {
@@ -297,8 +323,11 @@ impl QuicPathLimits {
         control_capacity: CONTROL_CHANNEL_CAPACITY,
         max_send_aborts: recycle::SEND_ABORT_LIMIT,
         accept_data: true,
+        counters: None,
         #[cfg(test)]
         panic_in_receive: false,
+        #[cfg(test)]
+        panic_in_watch: false,
     };
 
     /// [`Self::DEFAULT`] for a path in shadow mode: control frames only.
@@ -395,12 +424,20 @@ quic_outcomes! {
         /// A Short or Stream frame on a path that accepts no data (shadow
         /// mode); stopped before anything was charged.
         RefusedNotAcceptingData => "refused_not_accepting_data",
+        /// The first refused data frame closed the path with DOWNGRADE (once
+        /// per path).
+        ClosedRefusingData => "closed_refusing_data",
         /// A control payload of a version this node does not read.
         ControlUnknownVersion => "control_unknown_version",
         /// A control payload of a type this node does not know.
         ControlUnknownType => "control_unknown_type",
         /// A control payload that is empty or of the wrong length.
         ControlMalformed => "control_malformed",
+        /// A Short past one packet did not fit the inbound budget
+        /// (`stop_code::BUDGET_REFUSED`; also counted under the shared refusal).
+        ShortRefusedBudget => "short_refused_budget",
+        /// A Stream did not fit the inbound budget (as above).
+        StreamRefusedBudget => "stream_refused_budget",
     }
 }
 
@@ -436,6 +473,9 @@ impl QuicInboundOutcome {
 /// Per-path counters. Tests read these, never the process-wide ones, which
 /// every test in the process writes.
 pub(crate) struct QuicPathStats {
+    /// Where the counts are also kept node-wide: `TRANSPORT_METRICS`, or a
+    /// test's own ([`QuicPathLimits::counters`]).
+    node: &'static QuicDataCounters,
     quic: [AtomicU64; QuicInboundOutcome::COUNT],
     shared: [AtomicU64; InboundStreamOutcome::COUNT],
     /// Data sends by [`SendKind`] and [`QuicSendResult`].
@@ -446,8 +486,9 @@ pub(crate) struct QuicPathStats {
 }
 
 impl QuicPathStats {
-    fn new() -> Self {
+    fn new(node: &'static QuicDataCounters) -> Self {
         Self {
+            node,
             quic: std::array::from_fn(|_| AtomicU64::new(0)),
             shared: std::array::from_fn(|_| AtomicU64::new(0)),
             sends: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
@@ -456,7 +497,9 @@ impl QuicPathStats {
         }
     }
 
+    /// Count an outcome here and node-wide (`quic_inbound_<label>`).
     fn record(&self, outcome: QuicInboundOutcome) {
+        self.node.record_inbound(outcome);
         self.quic[outcome as usize].fetch_add(1, Ordering::Relaxed);
     }
 
@@ -466,18 +509,22 @@ impl QuicPathStats {
         self.shared[outcome as usize].fetch_add(1, Ordering::Relaxed);
     }
 
+    /// The data-send counts are kept here and node-wide (`metrics::quic_data`).
     fn record_send(&self, kind: SendKind, result: QuicSendResult) {
+        self.node.record_send(kind, result);
         self.sends[kind as usize][result as usize].fetch_add(1, Ordering::Relaxed);
     }
 
     /// Count something else that happened to a data send.
     pub(crate) fn record_send_event(&self, event: QuicSendEvent) {
+        self.node.record_event(event);
         self.send_events[event as usize].fetch_add(1, Ordering::Relaxed);
     }
 
     /// Count a stop from the peer. A code this node does not know is counted only
     /// as a dropped send.
     fn record_stop(&self, code: u64) {
+        self.node.record_stop(code);
         if let Some(index) = stop_code::ALL.iter().position(|c| u64::from(*c) == code) {
             self.stops[index].fetch_add(1, Ordering::Relaxed);
         }
@@ -508,6 +555,11 @@ impl QuicPathStats {
             .iter()
             .position(|c| *c == code)
             .map_or(0, |index| self.stops[index].load(Ordering::Relaxed))
+    }
+
+    /// The node-wide counts this path's are added to.
+    pub(crate) fn node(&self) -> &'static QuicDataCounters {
+        self.node
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -619,11 +671,23 @@ pub(crate) struct QuicPath {
     /// path in shadow, where a fragment taken from an inbound handle cannot
     /// outlive its charge because nothing is ever forwarded.
     send_data: AtomicU8,
+    /// Whether this path is counted in the node's `quic_live_data_paths` gauge:
+    /// from [`Self::count_as_data_path`] until the peer refuses data or
+    /// [`Self::uncount_as_data_path`], whichever is first, so it is lowered once.
+    counted_as_data_path: std::sync::atomic::AtomicBool,
     /// Send timeouts while nothing is acknowledged ([`route::StallCount`]).
     stall: parking_lot::Mutex<route::StallCount>,
     /// The connection's count of acknowledged packets, `None` if its controller
     /// does not keep one.
     ack_progress: Option<recycle::AckProgress>,
+    /// A send timed out with nothing acknowledged for the window: the path may
+    /// have gone dark, and new sends go on UDP until the connection's count of
+    /// acknowledged packets moves from the one held here ([`Self::is_suspect`]).
+    /// Under one lock, so entering and leaving cannot interleave.
+    suspect_since_acked: parking_lot::Mutex<Option<u64>>,
+    /// Whether `suspect_since_acked` is set, so a path that is not suspect is
+    /// told so without the lock.
+    suspect: std::sync::atomic::AtomicBool,
     /// Where the path's watch reports that the peer was heard from.
     heard: Arc<recycle::PeerHeard>,
     #[cfg(test)]
@@ -746,17 +810,21 @@ impl QuicPath {
         budget: SharedInboundBudget,
         data: QuicDataSenders,
     ) -> (Self, mpsc::Receiver<Bytes>) {
-        let stats = Arc::new(QuicPathStats::new());
+        let stats = Arc::new(QuicPathStats::new(
+            limits
+                .counters
+                .unwrap_or(&crate::transport::TRANSPORT_METRICS.quic_data),
+        ));
         let (controls_tx, controls) = mpsc::channel(limits.control_capacity);
         #[cfg_attr(not(test), allow(unused_mut))]
         let mut receiver = inbound::Receiver::new(
             time.clone(),
             budget.clone(),
             stats.clone(),
-            data.shorts,
-            data.streams,
+            data,
             controls_tx,
             limits.accept_data,
+            connection.closer(),
         );
         #[cfg(test)]
         {
@@ -779,14 +847,23 @@ impl QuicPath {
             time.now_nanos(),
         );
         let heard = Arc::new(recycle::PeerHeard::default());
+        #[cfg_attr(not(test), allow(unused_mut))]
+        let mut report = recycle::PathReport::new(connection.inner().clone(), stats.node());
+        #[cfg(test)]
+        {
+            report.panic_once_bucketed = limits.panic_in_watch;
+        }
         let receive = GlobalExecutor::spawn(supervise_receive(
             connection.inner().clone(),
             connection.closer(),
             Arc::new(receiver),
             stats.clone(),
             time,
-            connection.cap_holds(),
-            heard.clone(),
+            recycle::AckWatchParts {
+                cap_holds: connection.cap_holds(),
+                heard: heard.clone(),
+                report,
+            },
         ));
         (
             Self {
@@ -796,8 +873,11 @@ impl QuicPath {
                 aborts,
                 stream_slots: Arc::new(tokio::sync::Semaphore::new(STREAMED_SEND_LIMIT as usize)),
                 send_data: AtomicU8::new(SEND_DATA_NEVER),
+                counted_as_data_path: std::sync::atomic::AtomicBool::new(false),
                 stall: parking_lot::Mutex::new(stall),
                 ack_progress,
+                suspect_since_acked: parking_lot::Mutex::new(None),
+                suspect: std::sync::atomic::AtomicBool::new(false),
                 heard,
                 #[cfg(test)]
                 budget,
@@ -890,10 +970,14 @@ impl QuicPath {
     }
 
     /// The peer said it accepts no data on this path, so this node's gating or
-    /// the peer's is wrong. Logged once per path. The path stays up: it costs
-    /// nothing, and the same send would fail the same way on a new one.
+    /// the peer's is wrong. Logged once per path. New sends go on UDP from now
+    /// on. This side does not close the path: the refusing receiver does, with
+    /// DOWNGRADE, [`inbound::REFUSAL_CLOSE_DELAY`] after its first refusal, and
+    /// this side falls back on that close.
     fn stop_sending_data(&self) {
         self.stats.record_send_event(QuicSendEvent::DataRefused);
+        // No longer a path that carries data.
+        self.uncount_as_data_path();
         let was_on = self
             .send_data
             .compare_exchange(
@@ -912,10 +996,77 @@ impl QuicPath {
         }
     }
 
+    /// Count this path in the node's `quic_live_data_paths` gauge, once: its
+    /// route was installed. Undone by [`Self::uncount_as_data_path`] or a refusal.
+    pub(in crate::transport) fn count_as_data_path(&self) {
+        if !self.counted_as_data_path.swap(true, Ordering::AcqRel) {
+            self.stats.node().data_path_started();
+        }
+    }
+
+    /// Take this path out of the gauge if it is in it: its attempt went. A path
+    /// the peer refused data on is out already, so nothing is lowered twice.
+    pub(in crate::transport) fn uncount_as_data_path(&self) {
+        if self.counted_as_data_path.swap(false, Ordering::AcqRel) {
+            self.stats.node().data_path_ended();
+        }
+    }
+
     /// From now on, call `report` when the peer is heard from on this path
     /// ([`recycle::watch_acknowledgements`]).
     pub(in crate::transport) fn report_receipts_to(&self, report: Box<dyn Fn() + Send + Sync>) {
         self.heard.report_to(report);
+    }
+
+    /// A send timed out on this path with nothing acknowledged for the window
+    /// (`route::StallCount`), when the count read `acked`. A path that went dark
+    /// would otherwise take every new send until it is recycled: each short ends
+    /// `MaybeDelivered(TimedOut)`, is never resent and is lost, and an operation's
+    /// retry lands in the same place. Sends already on the path stay there, since
+    /// resending them could deliver a message twice.
+    pub(in crate::transport) fn become_suspect(&self, acked: u64) {
+        let mut since = self.suspect_since_acked.lock();
+        let entered = since.replace(acked).is_none();
+        self.suspect.store(true, Ordering::Release);
+        drop(since);
+        if entered {
+            self.stats.record_send_event(QuicSendEvent::SuspectEntered);
+            tracing::debug!(
+                remote = %self.connection.inner().remote_address(),
+                "QUIC path: sends time out and nothing is acknowledged; new data \
+                 goes on UDP until the peer acknowledges again"
+            );
+        }
+    }
+
+    /// Whether the path is suspect: new data goes on UDP. It stops being suspect
+    /// the first time this is asked after the connection acknowledged something
+    /// new, which quinn's keepalive brings within its interval on a live path.
+    ///
+    /// A path that stays dark ends on quinn's idle timeout (120 s in
+    /// production), not on the stall close: once it is suspect no new send
+    /// reaches it, so `route::STALLED_SENDS_LIMIT` timeouts in a row happen only
+    /// if that many sends were already on it. Nothing is lost meanwhile, since
+    /// new data goes on UDP.
+    pub(in crate::transport) fn is_suspect(&self) -> bool {
+        if !self.suspect.load(Ordering::Acquire) {
+            return false;
+        }
+        let Some(progress) = &self.ack_progress else {
+            return false;
+        };
+        let mut since = self.suspect_since_acked.lock();
+        match *since {
+            Some(acked) if progress.acked() == acked => true,
+            Some(_) => {
+                *since = None;
+                self.suspect.store(false, Ordering::Release);
+                drop(since);
+                self.stats.record_send_event(QuicSendEvent::SuspectLeft);
+                false
+            }
+            None => false,
+        }
     }
 
     /// Whether a new data send may start on this path.
@@ -1233,6 +1384,11 @@ impl QuicPath {
     /// connection ends: the semaphore is never closed, so a waiter would
     /// otherwise sit out its deadline holding on to a path that has ended.
     async fn stream_slot(&self) -> Result<tokio::sync::OwnedSemaphorePermit, QuicSendError> {
+        if let Ok(permit) = Arc::clone(&self.stream_slots).try_acquire_owned() {
+            self.stats.node.record_permit(false);
+            return Ok(permit);
+        }
+        self.stats.node.record_permit(true);
         let connection = self.connection.inner();
         tokio::select! {
             permit = Arc::clone(&self.stream_slots).acquire_owned() => {
@@ -1252,7 +1408,20 @@ impl QuicPath {
         slot: Option<tokio::sync::OwnedSemaphorePermit>,
         progress: SendProgress,
     ) -> Result<Outgoing, QuicSendError> {
-        let stream = self.connection.inner().open_uni().await?;
+        // Polled once by hand, to tell an open that had to wait for the peer's
+        // stream credit from one that did not (`quic_open_uni_waited`).
+        let mut open = std::pin::pin!(self.connection.inner().open_uni());
+        let opened = match futures::poll!(open.as_mut()) {
+            std::task::Poll::Ready(opened) => {
+                self.stats.node.record_open(false);
+                opened
+            }
+            std::task::Poll::Pending => {
+                self.stats.node.record_open(true);
+                open.await
+            }
+        };
+        let stream = opened?;
         progress.mark_opened();
         let mut send = Outgoing::new(stream, self.aborts.clone(), slot, progress);
         send.write_all(&header.encode()).await?;
@@ -1319,19 +1488,26 @@ async fn supervise_receive<T: TimeSource>(
     receiver: Arc<inbound::Receiver<T>>,
     stats: Arc<QuicPathStats>,
     time: T,
-    cap_holds: Arc<super::socket::CapHolds>,
-    heard: Arc<recycle::PeerHeard>,
+    watch: recycle::AckWatchParts,
 ) {
     use futures::FutureExt;
     let mut receive = std::pin::pin!(
         std::panic::AssertUnwindSafe(inbound::receive(connection.clone(), receiver)).catch_unwind()
     );
+    // Outside the watch, so a panic the watch contains does not end the path's
+    // report: it ends with this task ([`recycle::PathReport`]).
+    let recycle::AckWatchParts {
+        cap_holds,
+        heard,
+        mut report,
+    } = watch;
     let watch = std::panic::AssertUnwindSafe(recycle::watch_acknowledgements(
         connection.clone(),
         closer.clone(),
         time,
         cap_holds,
         heard,
+        &mut report,
     ))
     .catch_unwind();
     let ended = tokio::select! {

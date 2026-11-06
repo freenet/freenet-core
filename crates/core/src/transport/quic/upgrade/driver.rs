@@ -343,7 +343,8 @@ struct Attempt {
     /// to hand what it holds to UDP.
     route: Option<DataRoute>,
     /// The session's [`Session::routed`], set while `route` is held. Cleared when
-    /// the attempt goes, which happens only under the session's lock.
+    /// the attempt goes, which happens only under the session's lock, as is the
+    /// node's `quic_live_data_paths` gauge the route's path raised.
     routed: Option<Arc<AtomicBool>>,
     /// The dial or establish task, the control sends and the path's pump.
     tasks: Vec<JoinHandle<()>>,
@@ -371,6 +372,9 @@ impl Drop for Attempt {
         }
         if let Some(routed) = &self.routed {
             routed.store(false, Ordering::Release);
+        }
+        if let Some(route) = &self.route {
+            route.path().uncount_as_data_path();
         }
     }
 }
@@ -436,6 +440,10 @@ pub(in crate::transport) struct QuicUpgrades {
     inbox_overflow: AtomicU64,
     #[cfg(any(test, feature = "testing"))]
     trace: Option<super::sim_trace::NodeTrace>,
+    /// Where a test's paths keep their node-wide counts in place of
+    /// `TRANSPORT_METRICS`.
+    #[cfg(test)]
+    test_counters: Option<&'static crate::transport::metrics::QuicDataCounters>,
 }
 
 impl QuicUpgrades {
@@ -462,6 +470,8 @@ impl QuicUpgrades {
             inbox_overflow: AtomicU64::new(0),
             #[cfg(any(test, feature = "testing"))]
             trace,
+            #[cfg(test)]
+            test_counters: None,
         })
     }
 
@@ -772,10 +782,13 @@ impl Session {
                     }
                 }
             }
-            // No counter yet, and at a share of 0 it does not happen. Not in
-            // `QuicUpgradeOutcome`: that array is at 32, the longest serde and
-            // `Default` take, so a data count needs a labelled set of its own.
-            Outcome::DataEnabled => {}
+            // Not in `QuicUpgradeOutcome`, which is at 32, the longest array serde
+            // and `Default` take: `quic_enabled_data_paths` (`metrics::quic_data`).
+            Outcome::DataEnabled => {
+                if let Some(path) = state.attempt.as_ref().and_then(|held| held.path.as_ref()) {
+                    path.stats().node().record_data_enabled();
+                }
+            }
             // Not a fallback, and counted by its close code
             // (`quic_close_sent_recycle_for_data`, `quic_close_received_recycle_for_data`).
             Outcome::RecycledForData { .. } => {}
@@ -997,6 +1010,8 @@ impl Session {
         held.route = Some(route);
         held.routed = Some(Arc::clone(&self.routed));
         self.routed.store(true, Ordering::Release);
+        // Lowered by a refusal or by the attempt's drop, whichever is first.
+        path.count_as_data_path();
         // Bounded by the path: it ends when the connection does and what it holds
         // is gone, so the handle is not monitored and is not in `held.tasks`.
         drop(GlobalExecutor::spawn(report_panics(self.remote, worker)));
@@ -1004,7 +1019,9 @@ impl Session {
 
     /// The path to send this connection's data on: the live attempt's, once both
     /// sides set the data bit (the attempt holds a route only then), unless the
-    /// peer refused data. `None` in shadow and after a teardown, which takes the
+    /// peer refused data or the path is suspect ([`QuicPath::is_suspect`]: a send
+    /// timed out with nothing acknowledged, so new data goes on UDP until the peer
+    /// acknowledges again). `None` in shadow and after a teardown, which takes the
     /// attempt under this same lock in the step that leaves `Active`, so a path
     /// that ended stops taking sends at once. The lock is short and never held
     /// across an await. A route read just before a teardown still works: what it
@@ -1018,6 +1035,9 @@ impl Session {
         }
         let state = self.state.lock();
         let route = state.attempt.as_ref()?.route.as_ref()?;
+        if route.path().is_suspect() {
+            return None;
+        }
         if !route.path().sends_data() {
             // A refusal is for good on this path, so its route is off the fast
             // path too. A new attempt sets the flag again under this lock.
@@ -1040,11 +1060,25 @@ impl Session {
     fn build_path(&self, state: &mut SessionState, attempt: u32, connection: QuicConnection) {
         // At once, not when the peer's bit arrives: the peer's first stream can
         // overtake the frame that carries it.
-        let limits = if state.machine.accepts_data() {
+        #[cfg_attr(not(any(test, feature = "testing")), allow(unused_mut))]
+        let mut limits = if state.machine.accepts_data() {
             QuicPathLimits::DEFAULT
         } else {
             QuicPathLimits::SHADOW
         };
+        #[cfg(any(test, feature = "testing"))]
+        if self
+            .hub
+            .trace
+            .as_ref()
+            .is_some_and(|trace| trace.refuses_data_while_advertising())
+        {
+            limits = QuicPathLimits::SHADOW;
+        }
+        #[cfg(test)]
+        {
+            limits.counters = self.hub.test_counters;
+        }
         let (path, controls) = QuicPath::with_budget(
             connection,
             self.hub.path_clock.clone(),
@@ -1131,6 +1165,22 @@ impl Session {
                     "path carried data: refused {}, delivered {}",
                     stats.count(Q::RefusedNotAcceptingData),
                     stats.count(Q::DeliveredShort) + stats.count(Q::AnnouncedStream)
+                )
+            });
+            self.note(|| {
+                use crate::transport::quic::path::QuicInboundOutcome as Q;
+                format!(
+                    "path closed refusing data: {}",
+                    path.stats().count(Q::ClosedRefusingData)
+                )
+            });
+            self.note(|| {
+                use crate::transport::quic::path::QuicSendEvent as E;
+                let stats = path.stats();
+                format!(
+                    "path was suspect: entered {}, left {}",
+                    stats.send_event_count(E::SuspectEntered),
+                    stats.send_event_count(E::SuspectLeft)
                 )
             });
             self.note(|| {
@@ -1242,6 +1292,19 @@ impl Session {
             let mut state = self.state.lock();
             if state.ended {
                 return;
+            }
+            // A session that ends under a data path (`quic_session_ended_with_data_path_*`):
+            // one whose route the peer has not refused data on.
+            let data_path = state.attempt.as_ref().and_then(|held| {
+                let since = held.gauge.active_since?;
+                let route = held.route.as_ref()?;
+                route
+                    .path()
+                    .sends_data()
+                    .then(|| (route.path().stats().node(), since))
+            });
+            if let Some((counters, since)) = data_path {
+                counters.record_session_ended_with_data_path((self.now)().saturating_sub(since));
             }
             let actions = self.step(&mut state, Event::SessionEnded);
             let sends = self.apply(&mut state, actions);

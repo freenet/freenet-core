@@ -569,10 +569,11 @@ fn a_large_short_that_never_opened_goes_on_udp_as_a_stream() {
     );
 }
 
-/// The peer refuses data on a path both sides set up for it: the message goes on
-/// UDP under its id, it is counted, and new sends stay off a path that stays up.
+/// The peer refuses data on a path this node set up for it: the message goes on
+/// UDP under its id, it is counted, and the peer closes the path, so new sends go
+/// on UDP.
 #[test]
-fn data_the_peer_refuses_goes_on_udp_and_the_path_stays() {
+fn data_the_peer_refuses_goes_on_udp_and_the_peer_closes_the_path() {
     run(
         "quic-send-refused",
         60,
@@ -596,14 +597,15 @@ fn data_the_peer_refuses_goes_on_udp_and_the_path_stays() {
             assert_eq!(rig.stats().send_event_count(E::DataRefused), 1);
             assert_eq!(rig.stats().stop_count(stop_code::NOT_ACCEPTING_DATA), 1);
             assert!(!rig.route.path().sends_data());
+            // The receiver closed the path on its refusal, so the queue goes to
+            // UDP too, and no send reaches the path again.
             assert!(
-                rig.route.path().quinn_connection().close_reason().is_none(),
-                "the path stays up"
+                rig.route.path().quinn_connection().close_reason().is_some(),
+                "the receiver closed the path"
             );
-
-            // The queue goes straight to UDP, and no send reaches the path again.
-            rig.route.queue_short(message(1)).ok();
+            assert_eq!(rig.path.peer().stats().count(Q::ClosedRefusingData), 1);
             rig.path.settle(Duration::from_millis(50)).await;
+            rig.e.conn.send_serialized(message(1)).await.unwrap();
             assert_eq!(rig.udp_data().shorts, vec![message(1)]);
             assert_eq!(rig.path.peer().stats().count(Q::RefusedNotAcceptingData), 1);
         },
@@ -798,6 +800,11 @@ fn shorts_held_back_by_a_slow_consumer_do_not_close_the_path() {
                 "many sends could not open"
             );
             assert_eq!(rig.stats().send_event_count(E::StalledClosed), 0);
+            assert_eq!(
+                rig.stats().send_event_count(E::SuspectEntered),
+                0,
+                "an acknowledged path is never suspect"
+            );
             assert!(rig.route.path().quinn_connection().close_reason().is_none());
 
             // The consumer catches up. The channel holds one, so each turn lets
@@ -874,6 +881,11 @@ fn a_busy_relay_whose_transfers_are_acknowledged_keeps_its_path() {
                 "enough timed out to close it if they counted"
             );
             assert_eq!(rig.stats().send_event_count(E::StalledClosed), 0);
+            assert_eq!(
+                rig.stats().send_event_count(E::SuspectEntered),
+                0,
+                "an acknowledged path is never suspect"
+            );
             assert!(rig.route.path().quinn_connection().close_reason().is_none());
         },
     );
@@ -1094,6 +1106,81 @@ fn a_pipe_that_stalls_after_opening_gives_up() {
             assert_eq!(rig.stats().send_count(SendKind::Pipe, R::Dropped), 1);
             assert!(rig.udp_data().ids.is_empty(), "not read again for UDP");
             drop(source);
+        },
+    );
+}
+
+/// A path whose sends time out with nothing acknowledged takes no new data: a
+/// short queued to it then goes on UDP, though the path is up. Once the peer
+/// acknowledges again, data goes on the path again. Across
+/// the switch no message is lost or sent twice: the short already on the path
+/// stays there (delivered or counted `MaybeDelivered`, never resent on UDP), and
+/// each later one goes exactly once.
+#[test]
+fn a_suspect_path_sends_new_shorts_on_udp_until_it_is_acknowledged() {
+    run(
+        "quic-send-suspect",
+        75,
+        QuicPathLimits::DEFAULT,
+        |mut rig| async move {
+            let silenced = DropFrom::new("quic-send-suspect", &[rig.path.peer_addr()]);
+            let mut on_udp: Vec<Vec<u8>> = Vec::new();
+            let mut on_path: Vec<Vec<u8>> = Vec::new();
+            rig.path.settle(Duration::from_secs(9)).await;
+            rig.e.conn.send_serialized(message(1)).await.unwrap();
+            // Its 1 s open passes with nothing acknowledged since the path was
+            // built 10 s before: a short that opens is held for its 5 s total.
+            rig.path.settle(Duration::from_secs(6)).await;
+            assert_eq!(rig.stats().send_event_count(E::SuspectEntered), 1);
+            assert!(rig.route.path().is_suspect());
+            on_udp.extend(rig.udp_data().shorts);
+            rig.e.conn.send_serialized(message(2)).await.unwrap();
+            rig.path.settle(Duration::from_millis(50)).await;
+            let udp = rig.udp_data().shorts;
+            assert_eq!(udp, vec![message(2)], "on UDP at once");
+            on_udp.extend(udp);
+            // A short the worker takes while the path is suspect goes on UDP too.
+            rig.route
+                .queue_short(message(4))
+                .expect("the queue is open");
+            rig.path.settle(Duration::from_millis(50)).await;
+            let udp = rig.udp_data().shorts;
+            assert_eq!(udp, vec![message(4)], "the worker sends it on UDP");
+            on_udp.extend(udp);
+            assert!(rig.route.path().quinn_connection().close_reason().is_none());
+
+            // The peer acknowledges again (quinn's keepalive, at the latest).
+            drop(silenced);
+            rig.path.settle(Duration::from_secs(16)).await;
+            assert!(!rig.route.path().is_suspect());
+            assert_eq!(rig.stats().send_event_count(E::SuspectLeft), 1);
+            on_udp.extend(rig.udp_data().shorts);
+            on_path.extend(rig.delivered_shorts());
+            rig.e.conn.send_serialized(message(3)).await.unwrap();
+            rig.path.settle(Duration::from_secs(1)).await;
+            let udp = rig.udp_data().shorts;
+            assert!(udp.is_empty(), "back on the path");
+            on_udp.extend(udp);
+            on_path.extend(rig.delivered_shorts());
+            assert!(on_path.contains(&message(3)));
+
+            // Nothing lost or sent twice across the switch.
+            assert!(
+                !on_udp.contains(&message(1)),
+                "the short on the path is not resent"
+            );
+            assert!(
+                on_path.contains(&message(1)) || rig.stats().send_total(R::MaybeDelivered) >= 1,
+                "the short on the path was delivered or counted as maybe"
+            );
+            for i in [2, 3, 4] {
+                let times = on_udp
+                    .iter()
+                    .chain(&on_path)
+                    .filter(|m| **m == message(i))
+                    .count();
+                assert_eq!(times, 1, "message {i}: {on_udp:?} {on_path:?}");
+            }
         },
     );
 }

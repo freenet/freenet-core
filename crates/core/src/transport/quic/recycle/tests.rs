@@ -839,3 +839,44 @@ fn ack_counting_implements_every_controller_method() {
     assert!(trait_methods.len() >= 10, "{trait_methods:?}");
     assert_eq!(ours, trait_methods);
 }
+
+/// Each report is the change since the last one, sent and received kept apart,
+/// and the next is taken from the state it hands back; a count that went down
+/// reports 0.
+#[test]
+fn udp_bytes_report_the_change_since_the_last_report() {
+    let at = |sent, received| UdpBytes { sent, received };
+    let start = at(10, 20);
+    let (next, sent, received) = start.step(at(15, 50));
+    assert_eq!((sent, received), (5, 30));
+    assert_eq!(next, at(15, 50));
+    let (next, sent, received) = next.step(at(115, 51));
+    assert_eq!(
+        (sent, received),
+        (100, 1),
+        "from the last report, not the start"
+    );
+    let (_, sent, received) = next.step(at(100, 51));
+    assert_eq!((sent, received), (0, 0));
+}
+
+/// Each loss report is the change since the last one, field by field, and the
+/// next is taken from the state it hands back; a count that went down reports 0.
+#[test]
+fn path_loss_reports_the_change_since_the_last_report() {
+    let at = |sent, lost, bytes, events| PathLoss {
+        sent_packets: sent,
+        lost_packets: lost,
+        lost_bytes: bytes,
+        congestion_events: events,
+    };
+    let (next, delta) = at(100, 2, 2400, 1).step(at(350, 5, 6000, 3));
+    assert_eq!(delta, at(250, 3, 3600, 2));
+    assert_eq!(next, at(350, 5, 6000, 3));
+    let (_, delta) = next.step(at(360, 4, 6000, 3));
+    assert_eq!(
+        delta,
+        at(10, 0, 0, 0),
+        "from the last report, not the start"
+    );
+}

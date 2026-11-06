@@ -23,6 +23,7 @@ use crate::transport::peer_connection::streaming::{
 use crate::transport::peer_connection::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
 use crate::transport::peer_connection::streaming_handle_idle_timeout;
 
+mod node_counts;
 mod route;
 
 /// How long, in virtual time, a test's traffic may take.
@@ -114,7 +115,12 @@ async fn paths_built(
     })
     .await;
     drop(permit);
-    let (a, a_in) = QuicPath::new(client, pair.time.clone());
+    // `a` keeps its node-wide counts where `b` does.
+    let a_limits = QuicPathLimits {
+        counters: b_limits.counters,
+        ..QuicPathLimits::DEFAULT
+    };
+    let (a, a_in) = QuicPath::with_limits(client, pair.time.clone(), a_limits);
     let (b, b_in) = match b_budget {
         Some(budget) => {
             let (b, b_in) =
@@ -2583,6 +2589,122 @@ fn seeded_loss(network: &str, percent: u64) -> Arc<LossCount> {
     count
 }
 
+/// A path's watch reports its last counts when it ends, here dropped because
+/// the receive task ended with the connection, so the node's packet sums end at
+/// quinn's final counts. The short
+/// is sent and the path closed between two ticks (2 s and 4 s), so without that
+/// last report what they sent is missing.
+#[test]
+fn a_closed_path_reports_its_last_tick() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let counters: &'static crate::transport::metrics::QuicDataCounters =
+            Box::leak(Box::new(crate::transport::metrics::QuicDataCounters::new()));
+        let limits = QuicPathLimits {
+            counters: Some(counters),
+            ..QuicPathLimits::DEFAULT
+        };
+        let p = paths("quic-path-last-tick", 75, limits).await;
+        let (a, b, time) = (p.a.clone(), p.b.clone(), p.time());
+        let totals = |a: &QuicPath, b: &QuicPath| {
+            let (a, b) = (
+                a.connection().inner().stats(),
+                b.connection().inner().stats(),
+            );
+            (
+                a.path.sent_packets + b.path.sent_packets,
+                a.udp_tx.bytes + b.udp_tx.bytes,
+            )
+        };
+        // The watches count from when the paths were built, before the drive.
+        let before = totals(&a, &b);
+        let (at_short, after) = p
+            .drive(async move {
+                time.sleep(Duration::from_millis(2500)).await;
+                a.send_short(&[7u8; 600]).await.expect("sent");
+                let at_short = totals(&a, &b);
+                a.connection().close(QuicCloseCode::Downgrade);
+                time.sleep(Duration::from_secs(5)).await;
+                (at_short, totals(&a, &b))
+            })
+            .await;
+        let snap = counters.snapshot(false);
+        // Every packet up to the short, which went after the 2 s tick, is in
+        // the report. A close quinn sends again after a watch has ended is in
+        // quinn's counts and in no report, so the report can be below them.
+        let (up_to_short, sent) = (at_short.0 - before.0, after.0 - before.0);
+        assert!(
+            snap.sent_packets >= up_to_short && snap.sent_packets <= sent,
+            "{} reported, {up_to_short} up to the short, {sent} in all",
+            snap.sent_packets
+        );
+        let (up_to_short, udp_sent) = (at_short.1 - before.1, after.1 - before.1);
+        assert!(
+            snap.bytes_sent >= up_to_short && snap.bytes_sent <= udp_sent,
+            "{} reported, {up_to_short} up to the short, {udp_sent} in all",
+            snap.bytes_sent
+        );
+        // Both paths ended, each counted once, here below the floor.
+        let ended = snap.ended_loss_rate.iter().sum::<u64>() + snap.ended_below_floor;
+        assert_eq!(ended, 2);
+        assert_eq!(snap.loss_rate.iter().sum::<u32>(), 0);
+    })
+}
+
+/// A panic in the acknowledgement watch, which the receive supervisor
+/// contains while the path stays up, leaves the path in its live loss-rate
+/// bucket; it is counted as ended only when the path really ends.
+#[test]
+fn a_watch_panic_does_not_end_the_path_in_the_loss_counts() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let counters: &'static crate::transport::metrics::QuicDataCounters =
+            Box::leak(Box::new(crate::transport::metrics::QuicDataCounters::new()));
+        let limits = QuicPathLimits {
+            counters: Some(counters),
+            panic_in_watch: true,
+            ..QuicPathLimits::DEFAULT
+        };
+        // Only `b` panics: `paths` gives `a` the default limits.
+        let p = paths("quic-path-watch-panic", 78, limits).await;
+        let panics = recycle::TEST_WATCH_PANICS.load(std::sync::atomic::Ordering::Relaxed);
+        // `b` sends, so its own packet count passes the floor.
+        let (b, time) = (p.b.clone(), p.time());
+        let (live, ended) = p
+            .drive(async move {
+                b.send_stream(StreamId::next(), None, payload(2 * MIB).into())
+                    .await
+                    .expect("sent");
+                time.sleep(Duration::from_secs(5)).await;
+                let snap = counters.snapshot(false);
+                (
+                    snap.loss_rate.iter().sum::<u32>(),
+                    snap.ended_loss_rate.iter().sum::<u64>() + snap.ended_below_floor,
+                )
+            })
+            .await;
+        assert!(
+            recycle::TEST_WATCH_PANICS.load(std::sync::atomic::Ordering::Relaxed) > panics,
+            "b's watch panicked"
+        );
+        assert!(p.b.connection().inner().close_reason().is_none(), "b is up");
+        // `a` only acknowledged, below the floor; `b` is in a bucket.
+        assert_eq!(live, 1, "b is still in its live bucket");
+        assert_eq!(ended, 0, "nothing ended");
+        let (a, b, time) = (p.a.clone(), p.b.clone(), p.time());
+        p.drive(async move {
+            a.connection().close(QuicCloseCode::Downgrade);
+            time.sleep(Duration::from_secs(5)).await;
+            drop(b);
+        })
+        .await;
+        let snap = counters.snapshot(false);
+        assert_eq!(snap.loss_rate.iter().sum::<u32>(), 0);
+        assert_eq!(snap.ended_loss_rate.iter().sum::<u64>(), 1, "b ended");
+        assert_eq!(snap.ended_below_floor, 1, "a ended");
+    })
+}
+
 /// Sample `paths`' connections every 500 ms until `end` (virtual nanos);
 /// the largest `outstanding_after_acks` seen on either.
 async fn max_outstanding(paths: [Arc<QuicPath>; 2], time: VirtualTime, end: u64) -> u64 {
@@ -3189,12 +3311,13 @@ fn a_shadow_path_does_not_send_data() {
 }
 
 /// A path in shadow mode refuses a Short or Stream frame with
-/// `NOT_ACCEPTING_DATA` before anything is charged, and counts it: the
-/// inbound budget it shares with the UDP session is untouched (no charge,
-/// no budget refusal), even when that budget is full. Control frames still
-/// arrive. The sender sees the stop as a failed send.
+/// `NOT_ACCEPTING_DATA` before anything is charged, counts it, and closes the
+/// path with DOWNGRADE after its first refusal, once: the inbound budget it shares
+/// with the UDP session is untouched (no charge, no budget refusal), even when
+/// that budget is full. A control frame sent first still arrives. The close waits
+/// `REFUSAL_CLOSE_DELAY`, so each refused send sees its stop.
 #[test]
-fn a_shadow_path_refuses_data_before_charging_the_budget() {
+fn a_shadow_path_refuses_data_before_charging_the_budget_and_closes() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
         for (subnet, budget) in [
@@ -3210,8 +3333,18 @@ fn a_shadow_path_refuses_data_before_charging_the_budget() {
             .await;
             let (a, time) = (p.a.clone(), p.time());
             let timeout = Duration::from_secs(5);
-            let (short, stream, control) = p
+            let (control, short, stream) = p
                 .drive(async move {
+                    let control = a
+                        .send_control_bounded(
+                            &time,
+                            timeout,
+                            QuicControl::Ready {
+                                attempt: 3,
+                                caps: 0,
+                            },
+                        )
+                        .await;
                     let short = a.send_short_bounded(&time, timeout, &over_window()).await;
                     let stream = a
                         .send_stream_bounded(
@@ -3223,19 +3356,14 @@ fn a_shadow_path_refuses_data_before_charging_the_budget() {
                             None,
                         )
                         .await;
-                    let control = a
-                        .send_control_bounded(
-                            &time,
-                            timeout,
-                            QuicControl::Ready {
-                                attempt: 3,
-                                caps: 0,
-                            },
-                        )
+                    // The close follows the first refusal after the delay.
+                    time.sleep(inbound::REFUSAL_CLOSE_DELAY + Duration::from_secs(1))
                         .await;
-                    (short, stream, control)
+                    (control, short, stream)
                 })
                 .await;
+            assert!(matches!(control, BoundedSend::Sent), "{control:?}");
+            // Both are refused before the close, so each sender sees its stop.
             for (what, outcome) in [("short", short), ("stream", stream)] {
                 let BoundedSend::Failed(SendFailure::Error(QuicSendError::Stopped(code))) = outcome
                 else {
@@ -3243,9 +3371,13 @@ fn a_shadow_path_refuses_data_before_charging_the_budget() {
                 };
                 assert_eq!(code, u64::from(stop_code::NOT_ACCEPTING_DATA), "{what}");
             }
-            assert!(matches!(control, BoundedSend::Sent), "{control:?}");
+            assert!(
+                p.a.quinn_connection().close_reason().is_some(),
+                "the path closed"
+            );
             let stats = p.b.stats();
             assert_eq!(stats.count(QuicInboundOutcome::RefusedNotAcceptingData), 2);
+            assert_eq!(stats.count(QuicInboundOutcome::ClosedRefusingData), 1);
             assert_eq!(p.b.charged_streams_now(), 0, "nothing was charged");
             assert_eq!(p.b.charged(), (0, 0));
             for outcome in [
@@ -3259,6 +3391,41 @@ fn a_shadow_path_refuses_data_before_charging_the_budget() {
             let payload = p.b_in.controls.try_recv().expect("control arrives");
             assert!(p.b.decode_control(&payload).is_ok());
         }
+    })
+}
+
+/// A path that ends inside the refusal's close delay is not closed again: no
+/// `ClosedRefusingData` is counted, and the receiver's reader for the refused
+/// frame ends with the connection.
+#[test]
+fn a_path_that_ends_inside_the_refusal_delay_is_not_closed_again() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths_with("quic-path-refused-end", 66, QuicPathLimits::SHADOW, None).await;
+        let (a, time) = (p.a.clone(), p.time());
+        let short = p
+            .drive(async move {
+                let short = a
+                    .send_short_bounded(&time, Duration::from_secs(5), &over_window())
+                    .await;
+                // Inside the delay, the path ends from the sender's side.
+                time.sleep(inbound::REFUSAL_CLOSE_DELAY / 2).await;
+                a.close(QuicCloseCode::NodeDroppedPeer);
+                time.sleep(inbound::REFUSAL_CLOSE_DELAY * 2).await;
+                short
+            })
+            .await;
+        assert!(
+            matches!(
+                short,
+                BoundedSend::Failed(SendFailure::Error(QuicSendError::Stopped(_)))
+            ),
+            "{short:?}"
+        );
+        let stats = p.b.stats();
+        assert_eq!(stats.count(QuicInboundOutcome::RefusedNotAcceptingData), 1);
+        assert_eq!(stats.count(QuicInboundOutcome::ClosedRefusingData), 0);
+        assert!(p.b.quinn_connection().close_reason().is_some());
     })
 }
 

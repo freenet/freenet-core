@@ -29,6 +29,10 @@ use tokio::sync::mpsc;
 
 use crate::tracing::{TransferDirection, TransferEvent};
 
+mod quic_data;
+pub use quic_data::QuicDataSnapshot;
+pub(crate) use quic_data::{PathLossWindow, QuicDataCounters, StreamsOpenPeak};
+
 /// Global transport metrics instance.
 ///
 /// All peer connections report to this single instance, which aggregates
@@ -873,6 +877,8 @@ pub struct TransportMetrics {
     /// connection and direction (`quic::config::connection_window_bytes`):
     /// a state set when the endpoint is built, 0 without one.
     quic_flow_control_window_bytes: AtomicU64,
+    /// What QUIC paths' data sends and receives did (`quic_data`).
+    pub(crate) quic_data: QuicDataCounters,
 
     /// The current snapshot period, starting at 1 and advanced by each
     /// `take_snapshot`. A connection's [`InboundConcurrencyPeak`] from an
@@ -1283,6 +1289,7 @@ impl TransportMetrics {
             quic_paths_offered_or_dialing: AtomicU64::new(0),
             quic_paths_active: AtomicU64::new(0),
             quic_flow_control_window_bytes: AtomicU64::new(0),
+            quic_data: QuicDataCounters::new(),
             inbound_concurrency_epoch: AtomicU64::new(1),
             inbound_concurrency: Default::default(),
             inbound_stream_outcomes: Default::default(),
@@ -2588,6 +2595,7 @@ impl TransportMetrics {
             quic_flow_control_window_bytes: self
                 .quic_flow_control_window_bytes
                 .load(Ordering::Relaxed),
+            quic_data: self.quic_data.snapshot(reset),
             quic_close_sent_peer_not_acknowledging: get64(
                 &self.quic_close_sent[QuicCloseCode::PeerNotAcknowledging as usize],
             ),
@@ -3190,6 +3198,9 @@ pub struct TransportSnapshot {
     /// low-memory nodes, whose window is the 128 KiB floor, are slower on QUIC
     /// than on UDP over long paths.
     pub quic_flow_control_window_bytes: u64,
+    /// What QUIC paths' data sends and receives did (`metrics::quic_data`).
+    /// Uploaded flat, a key per non-zero count ([`QuicDataSnapshot::keys`]).
+    pub quic_data: QuicDataSnapshot,
     /// Per-attempt records of the FIRST 8 failed outbound NAT traversals in
     /// the period (not a representative sample of a busy period);
     /// `nat_fail_samples_dropped` counts the rest. Read with the same
@@ -3468,8 +3479,13 @@ impl TransportSnapshot {
         let mut json = serde_json::to_value(self)?;
         if let Some(map) = json.as_object_mut() {
             map.retain(|key, _| {
-                !key.starts_with("conn_identity_") && !key.starts_with("inbound_concurrency_")
+                !key.starts_with("conn_identity_")
+                    && !key.starts_with("inbound_concurrency_")
+                    && key != "quic_data"
             });
+            for (key, count) in self.quic_data.upload_keys() {
+                map.insert(key, serde_json::json!(count));
+            }
             for (key, count) in self.nonzero_conn_identity() {
                 map.insert(key, serde_json::json!(count));
             }
@@ -3541,6 +3557,7 @@ impl TransportSnapshot {
             quic_paths_offered_or_dialing,
             quic_paths_active,
             quic_flow_control_window_bytes,
+            quic_data,
             nat_fail_samples,
             nat_fail_samples_dropped,
             inbound_stream_refused_invalid_length,
@@ -3683,6 +3700,7 @@ impl TransportSnapshot {
         self.quic_paths_offered_or_dialing = quic_paths_offered_or_dialing;
         self.quic_paths_active = quic_paths_active;
         self.quic_flow_control_window_bytes = quic_flow_control_window_bytes;
+        self.quic_data = quic_data;
         self.nat_fail_samples = nat_fail_samples;
         self.nat_fail_samples_dropped = nat_fail_samples_dropped;
         self.inbound_stream_refused_invalid_length = inbound_stream_refused_invalid_length;
@@ -3907,6 +3925,9 @@ struct SnapshotExtras {
     /// low-memory nodes, whose window is the 128 KiB floor, are slower on QUIC
     /// than on UDP over long paths.
     pub quic_flow_control_window_bytes: u64,
+    /// What QUIC paths' data sends and receives did (`metrics::quic_data`).
+    /// Uploaded flat, a key per non-zero count ([`QuicDataSnapshot::keys`]).
+    pub quic_data: QuicDataSnapshot,
     /// Per-attempt records of the FIRST 8 failed outbound NAT traversals in
     /// the period (not a representative sample of a busy period);
     /// `nat_fail_samples_dropped` counts the rest. Read with the same
@@ -4086,6 +4107,7 @@ impl SnapshotExtras {
             || self.quic_establish_samples != 0
             || self.quic_paths_offered_or_dialing != 0
             || self.quic_paths_active != 0
+            || self.quic_data.has_activity()
             || !self.nat_fail_samples.is_empty()
             || self.inbound_stream_refused_invalid_length != 0
             || self.inbound_stream_refused_connection_bytes != 0
@@ -5038,6 +5060,87 @@ mod tests {
         metrics.record_upgrade_control_received();
         let snap = metrics.take_snapshot().expect("activity");
         assert_eq!(snap.quic_flow_control_window_bytes, 128 * 1024, "not reset");
+    }
+
+    /// The QUIC data counts go through `take_snapshot` end to end: a count makes
+    /// the period active and reaches the upload under its key, the next period
+    /// is empty, the gauge alone is not activity and is not reset, and a read
+    /// that does not reset leaves the counts for the next snapshot.
+    #[test]
+    fn quic_data_counts_go_through_take_snapshot() {
+        use crate::transport::quic::path::{QuicSendResult, SendKind};
+        let metrics = TransportMetrics::new();
+        metrics.quic_data.data_path_started();
+        assert!(
+            metrics.take_snapshot().is_none(),
+            "the gauge alone is not activity"
+        );
+        metrics
+            .quic_data
+            .record_send(SendKind::Short, QuicSendResult::Sent);
+        let peek = metrics.read_snapshot();
+        assert_eq!(peek.quic_data.sends.iter().sum::<u64>(), 1);
+        let snap = metrics.take_snapshot().expect("a send is activity");
+        let json = snap.upload_json().unwrap();
+        assert_eq!(
+            json["quic_data_send_short_sent"], 1,
+            "the peek did not reset"
+        );
+        assert_eq!(json["quic_live_data_paths"], 1);
+        assert!(metrics.take_snapshot().is_none(), "the count was reset");
+        metrics.quic_data.record_open(false);
+        let snap = metrics.take_snapshot().expect("an open is activity");
+        let json = snap.upload_json().unwrap();
+        assert_eq!(json["quic_live_data_paths"], 1, "the gauge survives");
+        assert!(json.get("quic_data_send_short_sent").is_none());
+        assert_eq!(json["quic_sends"], 1);
+    }
+
+    /// quinn's per-path loss counts go through `take_snapshot` end to end: a
+    /// report makes the period active and reaches the upload under its keys with
+    /// its own values, the loss-rate bucket included, a read that does not reset
+    /// leaves them, and the next period is empty.
+    #[test]
+    fn quic_path_loss_goes_through_take_snapshot() {
+        let metrics: &'static TransportMetrics = Box::leak(Box::new(TransportMetrics::new()));
+        let mut window = PathLossWindow::new(&metrics.quic_data);
+        metrics.quic_data.record_path_loss(
+            &mut window,
+            crate::transport::quic::recycle::PathLoss {
+                sent_packets: 1000,
+                lost_packets: 7,
+                lost_bytes: 8400,
+                congestion_events: 3,
+            },
+        );
+        let peek = metrics.read_snapshot();
+        assert_eq!(peek.quic_data.lost_packets, 7);
+        let snap = metrics.take_snapshot().expect("a report is activity");
+        let json = snap.upload_json().unwrap();
+        assert_eq!(json["quic_sent_packets"], 1000, "the peek did not reset");
+        assert_eq!(json["quic_lost_packets"], 7);
+        assert_eq!(json["quic_lost_bytes"], 8400);
+        assert_eq!(json["quic_congestion_events"], 3);
+        assert_eq!(json["quic_loss_rate_lt_1pct"], 1);
+        assert_eq!(json["quic_loss_rate_zero"], 0, "a gauge of 0 is sent");
+        assert!(
+            json.get("quic_ended_loss_rate_zero").is_none(),
+            "a count of 0 is not"
+        );
+        assert!(json.get("quic_ended_paths_below_floor").is_none());
+        assert!(
+            metrics.take_snapshot().is_none(),
+            "the sums were reset, and the bucket alone is not activity"
+        );
+        assert_eq!(metrics.read_snapshot().quic_data.loss_rate[2], 1, "a gauge");
+        // A path that ends below the floor reaches the JSON by its own key.
+        drop(PathLossWindow::new(&metrics.quic_data));
+        let json = metrics
+            .take_snapshot()
+            .expect("an ended path is activity")
+            .upload_json()
+            .unwrap();
+        assert_eq!(json["quic_ended_paths_below_floor"], 1);
     }
 
     /// A breaker trip reaches the snapshot and its JSON, counts as activity

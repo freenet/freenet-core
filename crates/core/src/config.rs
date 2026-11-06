@@ -5681,6 +5681,10 @@ std::thread_local! {
     /// a merge that moved no state (#5147).
     static GLOBAL_REDUNDANT_BROADCAST_DELIVERIES: std::cell::Cell<u64> =
         const { std::cell::Cell::new(0) };
+    /// Received payloads skipped because they were already merged into the
+    /// node's current state (`crate::ring::applied_payloads`).
+    static GLOBAL_ALREADY_APPLIED_SKIPS: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
     static GLOBAL_FULL_STATE_SENDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_FULL_STATE_SEND_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_PENDING_OP_INSERTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -5796,6 +5800,7 @@ impl GlobalTestMetrics {
         GLOBAL_BROADCAST_LEGS_SPACED.with(|c| c.set(0));
         GLOBAL_BROADCAST_DELIVERIES.with(|c| c.set(0));
         GLOBAL_REDUNDANT_BROADCAST_DELIVERIES.with(|c| c.set(0));
+        GLOBAL_ALREADY_APPLIED_SKIPS.with(|c| c.set(0));
         GLOBAL_FULL_STATE_SENDS.with(|c| c.set(0));
         GLOBAL_FULL_STATE_SEND_BYTES.with(|c| c.set(0));
         GLOBAL_PENDING_OP_INSERTS.with(|c| c.set(0));
@@ -6016,6 +6021,18 @@ impl GlobalTestMetrics {
         if redundant {
             GLOBAL_REDUNDANT_BROADCAST_DELIVERIES.with(|c| c.set(c.get() + 1));
         }
+    }
+
+    /// Count one received payload skipped because it was already merged into
+    /// the node's current state. Called only from
+    /// `PayloadMix::record_already_applied`, at the skip decision.
+    pub fn record_already_applied_skip() {
+        GLOBAL_ALREADY_APPLIED_SKIPS.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Received payloads skipped as already applied since reset.
+    pub fn already_applied_skips() -> u64 {
+        GLOBAL_ALREADY_APPLIED_SKIPS.with(|c| c.get())
     }
 
     /// Inbound broadcast payloads that reached a terminal outcome since reset.

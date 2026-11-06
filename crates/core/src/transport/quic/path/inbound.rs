@@ -94,7 +94,7 @@ use super::super::framing::{FrameHeader, FrameKind, HEADER_LEN, HeaderError};
 use super::{QuicInboundOutcome, QuicPathStats, stop_code};
 use crate::simulation::TimeSource;
 use crate::transport::StreamId;
-use crate::transport::metrics::InboundStreamOutcome;
+use crate::transport::metrics::{InboundStreamOutcome, QuicCloseCode};
 use crate::transport::peer_connection::inbound_budget::{
     BudgetRejection, InboundKey, InboundStreamBudget, LegacyStreamToken, Liveness, Releaser,
     SharedInboundBudget,
@@ -170,6 +170,8 @@ pub(in crate::transport::quic) struct Receiver<T> {
     next_short_key: AtomicU32,
     /// Whether Short and Stream frames are read (`QuicPathLimits::accept_data`).
     accept_data: bool,
+    /// Closes the path on the first data frame it refuses ([`Self::accept_data`]).
+    closer: super::super::QuicCloser,
     /// Panic on the next stream, to test the supervisor.
     #[cfg(test)]
     pub(in crate::transport::quic) panic_on_stream: bool,
@@ -180,11 +182,12 @@ impl<T: TimeSource> Receiver<T> {
         time: T,
         budget: SharedInboundBudget,
         stats: Arc<QuicPathStats>,
-        shorts: mpsc::Sender<InboundShort>,
-        streams: mpsc::Sender<InboundStreamArrival>,
+        data: super::QuicDataSenders,
         controls: mpsc::Sender<Bytes>,
         accept_data: bool,
+        closer: super::super::QuicCloser,
     ) -> Self {
+        let super::QuicDataSenders { shorts, streams } = data;
         Self {
             time,
             budget,
@@ -194,11 +197,16 @@ impl<T: TimeSource> Receiver<T> {
             controls,
             next_short_key: AtomicU32::new(1),
             accept_data,
+            closer,
             #[cfg(test)]
             panic_on_stream: false,
         }
     }
 }
+
+/// How long after its first refused data frame a path that accepts no data
+/// closes: long enough for the stops it sent to reach the sender first.
+pub(in crate::transport::quic) const REFUSAL_CLOSE_DELAY: Duration = Duration::from_secs(2);
 
 /// Accept every uni stream of `connection` and read them all concurrently
 /// in this one task, until the connection ends; then let the readers see the
@@ -212,11 +220,17 @@ pub(in crate::transport::quic) async fn receive<T: TimeSource>(
     let mut readers = FuturesUnordered::new();
     // Kept across iterations, so a pending accept is never dropped.
     let mut accept = std::pin::pin!(connection.accept_uni());
+    // This path's peak of streams read at once (`quic_streams_open_*`).
+    let mut peak = crate::transport::metrics::StreamsOpenPeak::default();
     loop {
         tokio::select! {
             accepted = &mut accept => match accepted {
                 Ok(recv) => {
                     readers.push(read_one(recv, receiver.clone()));
+                    receiver.stats.node().record_streams_open(
+                        &mut peak,
+                        u32::try_from(readers.len()).unwrap_or(u32::MAX),
+                    );
                     accept.set(connection.accept_uni());
                 }
                 Err(error) => {
@@ -671,15 +685,35 @@ async fn read_one<T: TimeSource>(recv: quinn::RecvStream, receiver: Arc<Receiver
     // Shadow mode: refuse data before the budget is looked at, so a data
     // frame neither takes room from the UDP session sharing the budget nor
     // leaves a refusal there.
+    //
+    // The path is then closed with DOWNGRADE, on the first such frame. A Short of
+    // one packet is acknowledged before the stop can reach its sender, which then
+    // reads `Sent`, keeps sending on the path and loses every such message. The
+    // close makes it fall back to UDP and negotiate the path again. Either side's
+    // gating is wrong here, and both bits are read again on the next attempt.
     if !receiver.accept_data && header.kind() != FrameKind::Control {
         receiver
             .stats
             .record(QuicInboundOutcome::RefusedNotAcceptingData);
-        tracing::debug!(
-            kind = ?header.kind(),
-            "QUIC path: refusing data on a path that accepts none"
-        );
         reader.stop(stop_code::NOT_ACCEPTING_DATA);
+        // The close waits, in this reader alone, so the stops already sent reach
+        // the sender first: a sender that sees the close before a stream's stop
+        // reads the stream as lost and drops it, where the stop sends it on UDP.
+        // Every refused frame's reader waits and then asks; `QuicCloser::close`
+        // is at most once per connection and a no-op once it has ended, so the
+        // first close is the only one counted and logged. The waits are bounded
+        // by the peer's stream credit and end with the connection.
+        receiver.time.sleep(REFUSAL_CLOSE_DELAY).await;
+        if receiver.closer.close(QuicCloseCode::Downgrade) {
+            receiver
+                .stats
+                .record(QuicInboundOutcome::ClosedRefusingData);
+            tracing::warn!(
+                kind = ?header.kind(),
+                "QUIC path: the peer sent data on a path where this node did not \
+                 set its data bit; closing the path so the peer falls back to UDP"
+            );
+        }
         return;
     }
     match header.kind() {
@@ -721,13 +755,21 @@ impl<T: TimeSource> Receiver<T> {
         tracing::debug!(?failure, "QUIC path: inbound stream failed");
     }
 
-    /// Count a budget refusal as the UDP transport does, and stop the stream.
-    fn refuse(&self, reader: &mut BodyReader<T>, rejection: BudgetRejection, total: u64) {
+    /// Count a budget refusal as the UDP transport does, and by frame kind
+    /// (`kind`), and stop the stream.
+    fn refuse(
+        &self,
+        reader: &mut BodyReader<T>,
+        rejection: BudgetRejection,
+        total: u64,
+        kind: QuicInboundOutcome,
+    ) {
         let outcome = match rejection {
             BudgetRejection::Bytes { .. } => InboundStreamOutcome::RefusedConnectionBytes,
             BudgetRejection::Streams { .. } => InboundStreamOutcome::RefusedConnectionStreams,
         };
         self.stats.record_shared(outcome);
+        self.stats.record(kind);
         tracing::debug!(?rejection, total, "QUIC path: refusing an inbound stream");
         reader.stop(stop_code::BUDGET_REFUSED);
     }
@@ -759,7 +801,12 @@ impl<T: TimeSource> Receiver<T> {
                 let mut budget = self.budget.lock();
                 if let Err(rejection) = budget.check(total, Releaser::Quic) {
                     drop(budget);
-                    self.refuse(&mut reader, rejection, total);
+                    self.refuse(
+                        &mut reader,
+                        rejection,
+                        total,
+                        QuicInboundOutcome::ShortRefusedBudget,
+                    );
                     return;
                 }
                 let key = self.short_key(&budget);
@@ -879,7 +926,12 @@ impl<T: TimeSource> Receiver<T> {
             }
             if let Err(rejection) = budget.check(total, Releaser::Quic) {
                 drop(budget);
-                self.refuse(&mut reader, rejection, total);
+                self.refuse(
+                    &mut reader,
+                    rejection,
+                    total,
+                    QuicInboundOutcome::StreamRefusedBudget,
+                );
                 return;
             }
             // Allocates only the buffer's chunk table (see
