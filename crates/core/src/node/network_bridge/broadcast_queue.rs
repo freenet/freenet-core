@@ -70,12 +70,15 @@ pub(super) fn no_fanout() -> FanoutTargets {
 const STREAM_COMPLETION_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Rate a streamed broadcast's completion wait allows for beyond
-/// [`STREAM_COMPLETION_TIMEOUT`]: 64 KiB/s, twice the rate the receiver's own
-/// age limit allows (`streaming::MIN_INBOUND_STREAM_RATE_BYTES_PER_SEC`, 32 KiB/s)
-/// and below the 70-160 KB/s seen from slow residential peers. A 31 MiB
-/// broadcast needs about 271 KB/s to finish in a flat 120 s, which an uplink
-/// under about 2.2 Mbit/s cannot give on any transport.
-const STREAM_COMPLETION_FLOOR_RATE_BYTES_PER_SEC: u64 = 64 * 1024;
+/// [`STREAM_COMPLETION_TIMEOUT`]: the lowest per-connection `bandwidth-limit` a
+/// node may configure (`peer_connection::MIN_BANDWIDTH_LIMIT`, 64 KiB/s), so a
+/// node at that limit still gets a large broadcast through. That is twice the
+/// rate the receiver's own age limit allows (32 KiB/s) and below the
+/// 70-160 KB/s seen from slow residential peers. A 31 MiB broadcast needs about
+/// 271 KB/s to finish in a flat 120 s, which an uplink under about 2.2 Mbit/s
+/// cannot give on any transport.
+const STREAM_COMPLETION_FLOOR_RATE_BYTES_PER_SEC: u64 =
+    crate::transport::peer_connection::MIN_BANDWIDTH_LIMIT as u64;
 
 /// How long a streamed broadcast of `payload_bytes` waits for its completion:
 /// [`STREAM_COMPLETION_TIMEOUT`] plus the payload at
@@ -90,6 +93,19 @@ pub(super) fn stream_completion_timeout(payload_bytes: u64) -> Duration {
     let scaled = STREAM_COMPLETION_TIMEOUT
         + Duration::from_secs(payload_bytes / STREAM_COMPLETION_FLOOR_RATE_BYTES_PER_SEC);
     scaled.min(crate::transport::peer_connection::streaming::max_inbound_stream_age(payload_bytes))
+}
+
+/// Wait up to `timeout` for a stream's completion signal, counting a timed-out
+/// wait (`GlobalTestMetrics::stream_completion_timeouts`).
+async fn await_stream_completion<T>(
+    completion_rx: tokio::sync::oneshot::Receiver<T>,
+    timeout: Duration,
+) -> Result<Result<T, tokio::sync::oneshot::error::RecvError>, tokio::time::error::Elapsed> {
+    let completion = tokio::time::timeout(timeout, completion_rx).await;
+    if completion.is_err() {
+        crate::config::GlobalTestMetrics::record_stream_completion_timeout();
+    }
+    completion
 }
 
 /// Payload size, in bytes, at or above which a send is rate-limited by the
@@ -4623,10 +4639,7 @@ pub(super) async fn broadcast_to_single_peer(
                 // distinguish a real delivery from a drop (#4235); a drop still
                 // releases the permit but must NOT be recorded as a send.
                 let completion_timeout = stream_completion_timeout(payload_size as u64);
-                let completion = tokio::time::timeout(completion_timeout, completion_rx).await;
-                if completion.is_err() {
-                    crate::config::GlobalTestMetrics::record_stream_completion_timeout();
-                }
+                let completion = await_stream_completion(completion_rx, completion_timeout).await;
                 // Classify AND apply the delivery gate in one production call
                 // (#4235): only a real `Delivered` refreshes interest / caches
                 // the summary. See `record_streaming_delivery`.
@@ -4834,6 +4847,91 @@ mod stream_completion_timeout_tests {
         assert!(
             stream_completion_timeout(MAX_STREAM_TOTAL_BYTES)
                 <= max_inbound_stream_age(MAX_STREAM_TOTAL_BYTES)
+        );
+    }
+
+    /// A 16 MiB stream on a link at 96 KiB/s completes about 170 s after it
+    /// starts. The flat 120 s wait gave up on it, so the send counted as not
+    /// delivered (no summary cached, interest not refreshed, the next update
+    /// resending the whole state); the size-scaled wait sees it delivered.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_large_stream_completes_inside_the_wait() {
+        const SIZE: u64 = 16 * MIB;
+        let arrives = Duration::from_secs(SIZE / (96 * 1024));
+        assert_eq!(arrives, Duration::from_secs(170), "premise");
+
+        let wait = |timeout: Duration| async move {
+            let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+            let sender = tokio::spawn(async move {
+                tokio::time::sleep(arrives).await;
+                let _ = tx.send(());
+            });
+            let completion = super::await_stream_completion(rx, timeout).await;
+            sender.abort();
+            completion.is_ok_and(|received| received.is_ok())
+        };
+        crate::config::GlobalTestMetrics::reset();
+        assert!(
+            !wait(STREAM_COMPLETION_TIMEOUT).await,
+            "the flat 120 s gives up before the stream ends"
+        );
+        assert_eq!(
+            crate::config::GlobalTestMetrics::stream_completion_timeouts(),
+            1
+        );
+        assert!(
+            wait(stream_completion_timeout(SIZE)).await,
+            "the scaled wait sees the stream end"
+        );
+        assert_eq!(
+            crate::config::GlobalTestMetrics::stream_completion_timeouts(),
+            1,
+            "and does not count a timeout"
+        );
+    }
+
+    /// `broadcast_to_single_peer` waits through `await_stream_completion` with
+    /// the size-scaled timeout, not the flat base.
+    #[test]
+    fn the_broadcast_waits_with_the_scaled_timeout() {
+        const SOURCE: &str = include_str!("broadcast_queue.rs");
+        let production = SOURCE
+            .split("\n#[cfg(test)]\nmod ")
+            .next()
+            .expect("split yields a part");
+        let signature = "pub(super) async fn broadcast_to_single_peer(";
+        assert_eq!(production.matches(signature).count(), 1);
+        let start = production.find(signature).expect("counted above");
+        let open = start + production[start..].find('{').expect("has a body");
+        let mut depth = 0usize;
+        let mut end = None;
+        for (i, byte) in production.bytes().enumerate().skip(open) {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let body = crate::contract::source_pin_util::strip_comments(
+            &production[open..end.expect("balanced braces")],
+        );
+        assert!(
+            body.contains("stream_completion_timeout(payload_size as u64)"),
+            "the wait is sized by the payload"
+        );
+        assert!(
+            body.contains("await_stream_completion(completion_rx, completion_timeout)"),
+            "the wait goes through the counted helper"
+        );
+        assert!(
+            !body.contains("timeout(STREAM_COMPLETION_TIMEOUT"),
+            "no flat 120 s wait remains"
         );
     }
 

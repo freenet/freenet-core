@@ -2128,6 +2128,21 @@ impl SimNetwork {
         self
     }
 
+    /// Sets `bandwidth-limit` (bytes per second, per connection) to
+    /// `bytes_per_sec` on every node, as `config.toml` would, so a test can run
+    /// on a slow uplink. Values below the transport's 64 KiB/s floor are raised
+    /// to it. Call before the simulation starts.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_bandwidth_limit(&mut self, bytes_per_sec: usize) -> &mut Self {
+        for label in self.pending_labels() {
+            let config = self.node_config_mut(&label);
+            Arc::make_mut(&mut config.config)
+                .network_api
+                .bandwidth_limit = Some(bytes_per_sec);
+        }
+        self
+    }
+
     /// Sets `quic-max-paths` to `limit` on every node, as `config.toml` would.
     /// Call before the simulation starts. No effect on a node with QUIC off.
     #[cfg(any(test, feature = "testing"))]
