@@ -593,6 +593,8 @@ pub(crate) struct FlakyCapabilityStorage {
     pub after_native_get: Mutex<Option<Box<dyn FnOnce(&MemoryCapabilityStorage) + Send>>>,
     /// Calls to `insert_native_grant_capped`.
     pub native_inserts: std::sync::atomic::AtomicUsize,
+    /// Calls to `remove_native_grant` that reached the inner storage.
+    pub native_removes: std::sync::atomic::AtomicUsize,
     /// The next native insert commits and then reports an error.
     pub native_insert_commits_then_errs: std::sync::atomic::AtomicBool,
     /// Native removes report an error (and remove nothing).
@@ -679,7 +681,9 @@ impl CapabilityStorage for FlakyCapabilityStorage {
         if self.fail_native_remove.load(Ordering::SeqCst) {
             anyhow::bail!("injected remove failure");
         }
-        self.inner.remove_native_grant(token_hash)
+        let removed = self.inner.remove_native_grant(token_hash);
+        self.native_removes.fetch_add(1, Ordering::SeqCst);
+        removed
     }
     fn all_native_grants(&self) -> anyhow::Result<Vec<([u8; 32], Vec<u8>)>> {
         self.inner.all_native_grants()

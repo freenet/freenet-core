@@ -6257,7 +6257,24 @@ pub async fn run_local_node(
         crate::config::PCK_VERSION.to_string(),
     );
 
+    let hosted_mode = socket.hosted_mode;
     let (mut gw, mut ws_proxy) = crate::server::serve_client_api_in(socket).await?;
+
+    // Native app grants (#5264). A network node reaches its grant store
+    // through the `OpManager` (`set_op_manager`), which local mode never has,
+    // so give the grant routes a store over this node's own database. Not on a
+    // hosted node, which serves no grants.
+    if !hosted_mode {
+        #[cfg(feature = "redb")]
+        let storage: Arc<dyn crate::contract::delegate_capabilities::CapabilityStorage> =
+            Arc::new(executor.state_store.inner().clone());
+        #[cfg(not(feature = "redb"))]
+        let storage: Arc<dyn crate::contract::delegate_capabilities::CapabilityStorage> =
+            Arc::new(crate::contract::delegate_capabilities::MemoryCapabilityStorage::default());
+        gw.app_grants().set_local_capabilities(
+            crate::contract::delegate_capabilities::DelegateCapabilities::new(storage),
+        );
+    }
 
     // TODO: use combinator instead
     // let mut all_clients =

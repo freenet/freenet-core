@@ -219,6 +219,49 @@ async fn native_app_grant_end_to_end() -> TestResult {
     let run = tokio::spawn(async move { node.run().await });
     wait_ws_ready(ws_port, Duration::from_secs(60)).await?;
 
+    grant_flow(ws_port).await?;
+
+    shutdown.shutdown().await;
+    if timeout(Duration::from_secs(30), run).await.is_err() {
+        tracing::info!("node run loop did not exit within 30s of shutdown (cleanup only)");
+    }
+    Ok(())
+}
+
+/// The same flow on a node started the way `freenet local` starts one: an
+/// `Executor::from_config_local` driven by `run_local_node`, which has no
+/// `OpManager`. Grants must work there too.
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn native_app_grant_end_to_end_local_mode() -> TestResult {
+    let data_dir = tempfile::tempdir()?;
+    let data_path = data_dir.path().to_path_buf();
+    let key = freenet::dev_tool::TransportKeypair::new();
+    let keypair_path = data_path.join("private.pem");
+    key.save(&keypair_path)?;
+    key.public().save(data_path.join("public.pem"))?;
+
+    let ws_port = reserve_port()?;
+    let net_port = reserve_port()?;
+    let cfg = node_config(&data_path, ws_port, net_port, &keypair_path)
+        .build()
+        .await?;
+    let socket = cfg.ws_api.clone();
+    let executor =
+        freenet::local_node::Executor::from_config_local(std::sync::Arc::new(cfg)).await?;
+    let run = tokio::spawn(async move { freenet::run_local_node(executor, socket).await });
+    wait_ws_ready(ws_port, Duration::from_secs(60)).await?;
+
+    grant_flow(ws_port).await?;
+
+    run.abort();
+    drop(run.await);
+    Ok(())
+}
+
+/// Request, approve and collect a grant; connect with it and have a real
+/// delegate echo the attested origin; check the query-string form is refused;
+/// revoke while a connection is open; check the revoked token is refused.
+async fn grant_flow(ws_port: u16) -> TestResult {
     let base = format!("http://127.0.0.1:{ws_port}");
     let http = reqwest::Client::new();
     let app = ContractInstanceId::new([42u8; 32]);
@@ -352,10 +395,5 @@ async fn native_app_grant_end_to_end() -> TestResult {
         close_code(&mut after).await?,
         Some(AUTH_TOKEN_INVALID_CLOSE_CODE)
     );
-
-    shutdown.shutdown().await;
-    if timeout(Duration::from_secs(30), run).await.is_err() {
-        tracing::info!("node run loop did not exit within 30s of shutdown (cleanup only)");
-    }
     Ok(())
 }

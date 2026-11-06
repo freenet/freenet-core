@@ -163,7 +163,9 @@ non-loopback bind, the private-network source filter (`allowed-source-cidrs`)
 and the `Host` checks (`allowed-host`) run first. On top of those, every grant
 route is loopback-only: the connection must come from loopback, the `Host` must
 name loopback (`localhost`, `127.0.0.1` or `[::1]`), and a request carrying a
-forwarding header (`X-Forwarded-*`, `Forwarded`, `X-Real-IP`) is refused. The
+forwarding header (`X-Forwarded-*`, `Forwarded`, `X-Real-IP`, `Via`,
+`True-Client-IP`, `CF-Connecting-IP` or `X-Client-IP`) is refused. A local
+program that reaches the node through an HTTP proxy is refused too. The
 request and poll routes also refuse anything a browser sends (`Origin`,
 `Sec-Fetch-*`), and approving needs the page's single-use nonce and an `Origin`
 equal to the node's own. So widening `--ws-api-address`, `allowed-host` or
@@ -176,8 +178,24 @@ tokens have.
 The node honours a grant token only from the `Authorization: Bearer` header of
 a WebSocket upgrade, never from the `authToken` query parameter, and only on a
 connection from loopback, with a loopback `Host` and no forwarding headers.
-Only `sha256(token)` is stored. The request and approval ids in the grant
-routes' paths are redacted from the request trace log.
+Only `sha256(token)` is stored. Request logs record paths only, never query
+strings, and the request and approval ids in the grant routes' paths are
+redacted.
+
+Grants work in `freenet local` as well as on a network node; a hosted node
+serves none.
+
+How a WebSocket connection presenting a token is closed when the node does not
+accept the token:
+
+| Close code | Meaning | What a native client should do |
+|---|---|---|
+| 4401 | The token names nothing: a stale page token, or an app grant that was revoked or never issued. | Discard the token and request a new grant. |
+| 4403 | A header token this connection cannot use as a grant: not a local connection, a non-loopback `Host`, forwarding headers, or a node that serves no grants (hosted). | Keep the token; connect to the node directly over loopback. |
+| 4503 | The node could not check the token right now (starting up, or a storage fault). | Keep the token and retry. |
+
+A connection open when its grant is revoked is closed with 4401 and the reason
+`app grant revoked`.
 
 Approval does not protect against a malicious program already running as the
 same user, which can open and answer the approval page itself.

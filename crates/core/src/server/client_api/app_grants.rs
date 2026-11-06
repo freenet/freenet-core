@@ -49,6 +49,11 @@
 //! token is first used to open a WebSocket connection, or the grant is
 //! revoked, whichever is first; after that the token exists only in the client.
 //!
+//! If a client never polls again after a response it did not receive, the
+//! grant stays stored, and listed on the Apps and permissions page, until the
+//! user revokes it; nothing removes it automatically. An approval that no poll
+//! ever collected stores nothing.
+//!
 //! A request expires [`REQUEST_TTL`] after it was made if it is not answered,
 //! and [`REQUEST_TTL`] after the answer once it is, so a late answer still
 //! leaves the client the full window to collect it. Expired requests are swept
@@ -98,6 +103,13 @@
 //!   cannot use as a grant (not a local connection, a non-loopback `Host`, or
 //!   forwarding headers). Keep the token; connect directly to the node over
 //!   loopback.
+//!
+//! # Where the grant store lives
+//!
+//! A network node reaches it through its `OpManager` (the delegate
+//! capabilities of its runtime pool). `freenet local` has no `OpManager`, so
+//! `node::run_local_node` gives this state a store over the same database
+//! ([`AppGrantState::set_local_capabilities`]). A hosted node has none.
 //!
 //! # Storage I/O
 //!
@@ -198,8 +210,10 @@ pub(crate) struct AppGrantState(Arc<Inner>);
 /// no storage I/O or `.await` happens while either lock is held.
 struct Inner {
     op_manager: ExportOpManagerHandle,
-    #[cfg(test)]
-    caps_override: Mutex<Option<Arc<DelegateCapabilities>>>,
+    /// The grant store when the node runs without an `OpManager`
+    /// (`freenet local`, and tests): set once at startup by
+    /// [`AppGrantState::set_local_capabilities`].
+    local_caps: std::sync::OnceLock<Arc<DelegateCapabilities>>,
     pending: Mutex<HashMap<String, PendingRequest>>,
     live: Mutex<HashMap<GrantTokenHash, Vec<(u64, CancellationToken)>>>,
     next_live_id: AtomicU64,
@@ -318,8 +332,7 @@ impl AppGrantState {
     pub(crate) fn new(op_manager: ExportOpManagerHandle) -> Self {
         Self(Arc::new(Inner {
             op_manager,
-            #[cfg(test)]
-            caps_override: Mutex::new(None),
+            local_caps: std::sync::OnceLock::new(),
             pending: Mutex::new(HashMap::new()),
             live: Mutex::new(HashMap::new()),
             next_live_id: AtomicU64::new(0),
@@ -330,19 +343,25 @@ impl AppGrantState {
     #[cfg(test)]
     pub(crate) fn with_capabilities(caps: Arc<DelegateCapabilities>) -> Self {
         let state = Self::new(ExportOpManagerHandle::default());
-        *state.0.caps_override.lock() = Some(caps);
+        state.set_local_capabilities(caps);
         state
     }
 
-    fn capabilities(&self) -> Option<Arc<DelegateCapabilities>> {
-        #[cfg(test)]
-        if let Some(caps) = self.0.caps_override.lock().clone() {
-            return Some(caps);
+    /// Give a node that has no `OpManager` (local mode) its grant store. The
+    /// network node's store is reached through the `OpManager` instead. A
+    /// second call is ignored.
+    pub(crate) fn set_local_capabilities(&self, caps: Arc<DelegateCapabilities>) {
+        if self.0.local_caps.set(caps).is_err() {
+            tracing::debug!("native app grant store already set; ignoring repeat wiring");
         }
+    }
+
+    pub(crate) fn capabilities(&self) -> Option<Arc<DelegateCapabilities>> {
         self.0
             .op_manager
             .current()
             .and_then(|om| om.delegate_capabilities())
+            .or_else(|| self.0.local_caps.get().cloned())
     }
 
     /// Resolve a token presented on a WebSocket upgrade to the app it was
@@ -420,12 +439,17 @@ impl AppGrantState {
     /// Runs as its own task, so it completes even if the HTTP request that
     /// asked for it goes away, and the part that closes connections runs even
     /// if the delete fails or panics (see [`FinishRevoke`]).
-    async fn revoke(
+    pub(crate) async fn revoke(
         &self,
         caps: Arc<DelegateCapabilities>,
         hash: GrantTokenHash,
     ) -> anyhow::Result<bool> {
         let state = self.clone();
+        // Not registered with the task monitor: the task is short (one store
+        // delete plus in-memory bookkeeping), awaited right here, and holds
+        // only an `Arc` to this state. Detached only so a dropped HTTP request
+        // cannot stop it half way; it does not outlive the node in any way
+        // that matters for shutdown.
         let task = crate::config::GlobalExecutor::spawn(async move {
             // Dropped at the end of this block, or while unwinding a panic.
             let _finish = FinishRevoke {
@@ -460,7 +484,7 @@ impl AppGrantState {
     }
 
     #[cfg(test)]
-    fn live_connections(&self, hash: GrantTokenHash) -> usize {
+    pub(crate) fn live_connections(&self, hash: GrantTokenHash) -> usize {
         self.0.live.lock().get(&hash).map_or(0, Vec::len)
     }
 }
@@ -522,6 +546,10 @@ pub(crate) fn make_request_span<B>(req: &axum::http::Request<B>) -> tracing::Spa
     )
 }
 
+/// Largest request body any grant route accepts; every body is a small JSON
+/// object.
+const MAX_BODY_BYTES: usize = 4096;
+
 pub(super) fn routes() -> Router {
     let refused = || axum::middleware::from_fn(refuse_when_hosted);
     Router::new()
@@ -533,6 +561,7 @@ pub(super) fn routes() -> Router {
         )
         .route(ROUTE_LIST, get(list_native_grants).layer(refused()))
         .route(ROUTE_REVOKE, post(revoke_native_grant).layer(refused()))
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
 }
 
 fn refuse(status: StatusCode, reason: &'static str) -> Response {
@@ -1107,6 +1136,9 @@ async fn store_and_answer(
     app: ContractInstanceId,
     client_name: String,
 ) -> Response {
+    // Not registered with the task monitor, for the same reasons as the
+    // revocation task: short (one store write plus bookkeeping), awaited right
+    // here, holding only an `Arc`; detached so a dropped poll cannot stop it.
     let task = crate::config::GlobalExecutor::spawn(store_task(
         state.clone(),
         request_id.to_string(),
@@ -1163,8 +1195,12 @@ fn render_approve_page(
 }
 
 /// The approval page. Rendering mints a fresh nonce for the POST, replacing
-/// any earlier one, so only the newest page can answer.
+/// any earlier one, so only the newest page can answer. A `HEAD` does not
+/// render, so it does not rotate the nonce. A browser prerendering the page
+/// does render it, and so rotates the nonce; the page then shown is the newest
+/// one only if it is the prerendered one.
 async fn approve_page(
+    method: axum::http::Method,
     connect_info: Option<Extension<ConnectInfo<SocketAddr>>>,
     Extension(state): Extension<AppGrantState>,
     headers: HeaderMap,
@@ -1172,6 +1208,9 @@ async fn approve_page(
 ) -> Response {
     if let Some(r) = local_gate(connect_info.as_ref(), &headers) {
         return r;
+    }
+    if method == axum::http::Method::HEAD {
+        return (page_headers(&random_id()), ()).into_response();
     }
     if !page_fetch_is_direct(&headers) {
         return refuse(

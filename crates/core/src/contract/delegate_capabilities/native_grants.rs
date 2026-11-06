@@ -254,9 +254,12 @@ impl DelegateCapabilities {
         let Some(bytes) = self.storage.get_native_grant(&token_hash.0)? else {
             return Ok(None);
         };
+        // An unreadable record (corruption, or a newer record version read by
+        // an older build) is an ERROR, not "no grant": the token may be valid,
+        // and "not found" would tell the client to discard it.
         let Some(grant) = NativeGrant::decode(&bytes) else {
-            tracing::warn!("Unreadable native app grant record; treating it as absent");
-            return Ok(None);
+            tracing::warn!("Unreadable native app grant record");
+            anyhow::bail!("unreadable native app grant record");
         };
         let now = self.now_ms();
         if now.saturating_sub(grant.last_used_at_ms) >= LAST_USED_WRITE_INTERVAL_MS {
@@ -437,6 +440,25 @@ mod tests {
         assert!(storage.after_native_get.lock().is_none(), "the hook ran");
         assert!(c.native_grants().unwrap().is_empty(), "revocation undone");
         assert_eq!(c.native_grant_for(t.hash()).unwrap(), None);
+    }
+
+    /// An unreadable record is an error (the caller reports "try again"), not
+    /// a missing grant (which would tell the client to discard its token).
+    #[test]
+    fn unreadable_record_is_an_error_not_absent() {
+        let storage = Arc::new(MemoryCapabilityStorage::default());
+        let c = DelegateCapabilities::new(storage.clone());
+        let t = GrantToken::generate();
+        assert!(
+            storage
+                .insert_native_grant_capped(&t.hash().0, b"\x09not a record", 64)
+                .unwrap()
+        );
+        assert!(c.native_grant_for(t.hash()).is_err());
+        assert_eq!(
+            c.native_grant_for(GrantToken::generate().hash()).unwrap(),
+            None
+        );
     }
 
     #[test]

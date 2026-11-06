@@ -5,7 +5,9 @@ use axum::http::Request;
 use tower::ServiceExt;
 
 use super::*;
-use crate::contract::delegate_capabilities::{FlakyCapabilityStorage, MemoryCapabilityStorage};
+use crate::contract::delegate_capabilities::{
+    CapabilityStorage, FlakyCapabilityStorage, MemoryCapabilityStorage,
+};
 use crate::server::HostedMode;
 
 const HOST: &str = "127.0.0.1:7509";
@@ -323,7 +325,7 @@ async fn concurrent_polls_get_the_same_token_and_store_it_once() {
     // With the `storing` mark the other three wait on the first writer; give
     // up after a while so a regression fails on the insert count below rather
     // than hanging.
-    let waited = wait_for_waiters(&state, &request_id, 3, Duration::from_secs(3)).await;
+    let waited = wait_for_waiters(&state, &request_id, 3, Duration::from_secs(10)).await;
     release.send(()).ok();
     let mut tokens = std::collections::HashSet::new();
     for p in std::iter::once(first).chain(others) {
@@ -1193,27 +1195,71 @@ fn page_scripts_match_the_routes_and_body_keys() {
     }
 }
 
-/// Source pins: every log site that records a request path, and both
-/// `TraceLayer`s, go through the redacting helper, which drops the query
-/// (credentials) and grant ids.
+/// A source file reduced for scanning: `//` comments dropped and all
+/// whitespace removed, so reflows and comments cannot hide or fake a match.
+fn scan_form(src: &str) -> String {
+    src.lines()
+        .map(|l| match l.find("//") {
+            Some(i) => &l[..i],
+            None => l,
+        })
+        .collect::<String>()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect()
+}
+
+/// Every use of `req.uri()` in `src`, with the text just before it.
+fn uri_uses(src: &str) -> Vec<String> {
+    let s = scan_form(src);
+    s.match_indices("req.uri()")
+        .map(|(i, _)| s[i.saturating_sub(30)..i].to_string())
+        .collect()
+}
+
+/// Source pins: every request URI that reaches a log goes through the
+/// redacting helper (path only, no query, grant ids redacted), and every
+/// `TraceLayer` uses the redacting span. The only other use allowed is
+/// parsing the query (`try_from_uri`), which logs nothing.
 #[test]
 fn request_logging_goes_through_the_redacting_helper() {
-    let ws = include_str!("../../../client_events/websocket.rs");
-    assert_eq!(
-        ws.matches("request_path = %redact_uri_for_log(req.uri())")
-            .count(),
-        2
+    let sources = [
+        (
+            "websocket.rs",
+            include_str!("../../../client_events/websocket.rs"),
+        ),
+        (
+            "permission_prompts.rs",
+            include_str!("../permission_prompts.rs"),
+        ),
+        ("server.rs", include_str!("../../../server.rs")),
+        ("app_grants.rs", include_str!("../app_grants.rs")),
+    ];
+    for (name, src) in sources {
+        for before in uri_uses(src) {
+            assert!(
+                before.ends_with("redact_uri_for_log(") || before.ends_with("try_from_uri("),
+                "{name}: a request URI is used outside the redacting helper: ...{before}req.uri()"
+            );
+        }
+    }
+    // The request span itself.
+    let ag = scan_form(include_str!("../app_grants.rs"));
+    let start = ag
+        .find("pub(crate)fnmake_request_span<B>")
+        .expect("make_request_span exists");
+    let body = &ag[start..start + ag[start..].find('}').expect("function body ends")];
+    assert!(
+        body.contains("uri=%redact_uri_for_log(req.uri())"),
+        "{body}"
     );
-    assert!(!ws.contains("request_path = req.uri()"));
-    let pp = include_str!("../permission_prompts.rs");
-    assert!(pp.contains("path = %super::app_grants::redact_uri_for_log(req.uri())"));
-    assert!(!pp.contains("path = req.uri()"));
-    let server = include_str!("../../../server.rs");
+    // Both TraceLayers use it.
+    let server = scan_form(include_str!("../../../server.rs"));
     let layers = server.matches("TraceLayer::new_for_http()").count();
     assert_eq!(layers, 2);
     assert_eq!(
         server
-            .matches(".make_span_with(client_api::app_grants::make_request_span)")
+            .matches("TraceLayer::new_for_http().make_span_with(client_api::app_grants::make_request_span)")
             .count(),
         layers,
         "every TraceLayer uses the redacting span"
@@ -1439,20 +1485,31 @@ async fn a_dropped_collecting_poll_revoked_mid_write_leaves_no_row() {
         // No row yet, so the revoke itself finds nothing to delete.
         assert!(!state.revoke(caps.clone(), hash).await.unwrap());
         release.send(()).ok();
+        // Two deletes: the revocation's (no row yet), then the write's own
+        // cleanup. Wait for that second one, then check what it left.
         let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let inserted = storage
-                .native_inserts
-                .load(std::sync::atomic::Ordering::SeqCst);
-            if inserted == 1 && caps.native_grant_count().unwrap() == 0 {
-                break;
-            }
+        while storage
+            .native_removes
+            .load(std::sync::atomic::Ordering::SeqCst)
+            < 2
+        {
             assert!(
                 Instant::now() < deadline,
-                "inserts {inserted}, commit_then_err {commit_then_err}"
+                "commit_then_err {commit_then_err}"
             );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+        assert_eq!(
+            storage
+                .native_inserts
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            caps.native_grant_count().unwrap(),
+            0,
+            "commit_then_err {commit_then_err}"
+        );
         assert_eq!(
             send(&r, poll_req(&request_id)).await.0,
             StatusCode::NOT_FOUND
@@ -1550,34 +1607,95 @@ async fn a_late_denial_gets_the_full_collection_window() {
     );
 }
 
-/// Bodies are parsed only after the gate: a refused caller's malformed body
-/// gets the gate's refusal, not a parse error.
+/// Bodies are parsed only after the gate, on every route that takes one: a
+/// refused caller's malformed body gets the gate's refusal, an admitted one
+/// gets 400, a non-JSON content type 415, and an oversized body 413.
 #[tokio::test]
 async fn bodies_are_parsed_after_the_gate() {
     let (state, _) = new_state();
-    let lan = router_with(&state, false, SocketAddr::from(([192, 168, 1, 7], 50000)));
-    let bad = Request::post(ROUTE_REQUEST)
-        .header("host", HOST)
-        .header("content-type", "application/json")
-        .body(Body::from("not json"))
-        .unwrap();
-    assert_eq!(send(&lan, bad).await.0, StatusCode::FORBIDDEN);
     let r = router(&state);
-    let bad = Request::post(ROUTE_REQUEST)
+    let lan = router_with(&state, false, SocketAddr::from(([192, 168, 1, 7], 50000)));
+    let (_, approve_id) = create(&r).await;
+    let approve_path = format!("/v1/app-grants/approve/{approve_id}");
+    for (path, origin) in [
+        (ROUTE_REQUEST, None),
+        (approve_path.as_str(), Some(SELF_ORIGIN)),
+        (ROUTE_REVOKE, Some(SELF_ORIGIN)),
+    ] {
+        let req = |content_type: &str, body: Body| {
+            let mut b = Request::post(path)
+                .header("host", HOST)
+                .header("content-type", content_type);
+            if let Some(o) = origin {
+                b = b.header("origin", o);
+            }
+            b.body(body).unwrap()
+        };
+        assert_eq!(
+            send(&lan, req("application/json", Body::from("not json")))
+                .await
+                .0,
+            StatusCode::FORBIDDEN,
+            "{path}: gate first"
+        );
+        assert_eq!(
+            send(&r, req("application/json", Body::from("not json")))
+                .await
+                .0,
+            StatusCode::BAD_REQUEST,
+            "{path}"
+        );
+        assert_eq!(
+            send(&r, req("text/plain", Body::from("{}"))).await.0,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "{path}"
+        );
+        assert_eq!(
+            send(&r, req("application/json", Body::from(vec![b' '; 8192])))
+                .await
+                .0,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "{path}"
+        );
+    }
+}
+
+/// A `HEAD` of the approval page does not rotate its nonce.
+#[tokio::test]
+async fn head_does_not_rotate_the_approval_nonce() {
+    let (state, _) = new_state();
+    let r = router(&state);
+    let (_, approve_id) = create(&r).await;
+    let nonce = open_page(&r, &approve_id).await;
+    let head = Request::head(format!("/v1/app-grants/approve/{approve_id}"))
         .header("host", HOST)
-        .header("content-type", "application/json")
-        .body(Body::from("not json"))
+        .body(Body::empty())
         .unwrap();
-    assert_eq!(send(&r, bad).await.0, StatusCode::BAD_REQUEST);
-    let not_json = Request::post(ROUTE_REQUEST)
-        .header("host", HOST)
-        .header("content-type", "text/plain")
-        .body(Body::from(
-            serde_json::json!({ "app": app_id().to_string() }).to_string(),
-        ))
-        .unwrap();
+    assert_eq!(send(&r, head).await.0, StatusCode::OK);
     assert_eq!(
-        send(&r, not_json).await.0,
-        StatusCode::UNSUPPORTED_MEDIA_TYPE
+        send(
+            &r,
+            approve_req(&approve_id, &nonce, true, Some(SELF_ORIGIN))
+        )
+        .await
+        .0,
+        StatusCode::OK
     );
+}
+
+/// An unreadable stored record makes the connect-time lookup report
+/// "unavailable" (keep the token), not "not found".
+#[tokio::test]
+async fn unreadable_record_resolves_to_unavailable() {
+    let (state, _, storage) = flaky_state();
+    let token = GrantToken::generate();
+    assert!(
+        storage
+            .insert_native_grant_capped(&token.hash().0, b"\x09garbage", 64)
+            .unwrap()
+    );
+    assert!(matches!(
+        resolve(&state, token.expose()).await,
+        GrantLookup::Unavailable
+    ));
 }
