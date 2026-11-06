@@ -260,7 +260,7 @@ fn hosted_flag(req: &axum::extract::Request) -> Option<bool> {
     let flag = req.extensions().get::<HostedMode>().map(|h| h.0);
     if flag.is_none() {
         tracing::error!(
-            path = req.uri().path(),
+            path = %super::app_grants::redact_uri_for_log(req.uri()),
             "Permission route reached without the HostedMode extension; \
              refusing. The router composition must inject HostedMode."
         );

@@ -159,8 +159,10 @@ async fn granted(router: &Router) -> (String, String) {
     (request_id, token)
 }
 
-fn resolve(state: &AppGrantState, token: &str) -> GrantLookup {
-    state.resolve_connection(&AuthToken::from(token.to_string()))
+async fn resolve(state: &AppGrantState, token: &str) -> GrantLookup {
+    state
+        .resolve_connection(&AuthToken::from(token.to_string()))
+        .await
 }
 
 fn fill_grants(caps: &DelegateCapabilities) {
@@ -213,7 +215,7 @@ async fn token_can_be_re_collected_until_first_use() {
     assert_eq!(caps.native_grant_count().unwrap(), 1, "stored once");
 
     // First use ends re-collection.
-    let GrantLookup::Granted(live) = resolve(&state, &token) else {
+    let GrantLookup::Granted(live) = resolve(&state, &token).await else {
         panic!("the grant resolves");
     };
     drop(live);
@@ -222,7 +224,9 @@ async fn token_can_be_re_collected_until_first_use() {
     assert!(!body.contains(&token));
 }
 
-#[tokio::test]
+/// Multi-thread, so the store runs on the blocking pool and the polls really
+/// overlap the write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_polls_get_the_same_token_and_store_it_once() {
     let (state, caps) = new_state();
     let r = router(&state);
@@ -319,6 +323,10 @@ async fn deny_is_reported_and_stores_nothing() {
     assert_eq!(json(&body)["status"], "denied");
     assert!(json(&body).get("token").is_none());
     assert!(caps.native_grants().unwrap().is_empty());
+    // A lost denial can be collected again, like an approval.
+    let (status, body) = send(&r, poll_req(&request_id)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json(&body)["status"], "denied");
 }
 
 #[tokio::test]
@@ -652,10 +660,10 @@ async fn grant_limit_is_reported_before_and_at_approval() {
 }
 
 /// The limit filled up between the click and the collection: the client gets
-/// the distinct status, and once the user revokes one, the same request can
-/// still be collected.
+/// the distinct status, its next poll waits for a change instead of retrying
+/// at once, and a revocation wakes it and lets the same request be collected.
 #[tokio::test]
-async fn grant_limit_at_collection_is_recoverable() {
+async fn grant_limit_at_collection_waits_and_recovers_on_revoke() {
     let (state, caps) = new_state();
     let r = router(&state);
     let (request_id, approve_id) = create(&r).await;
@@ -667,11 +675,167 @@ async fn grant_limit_at_collection_is_recoverable() {
     assert_eq!(json(&body)["status"], GRANT_LIMIT);
     assert!(json(&body).get("token").is_none());
 
+    // The next poll does not answer at once: it waits for a change.
+    let waiting = {
+        let r = r.clone();
+        let id = request_id.clone();
+        tokio::spawn(async move { send(&r, poll_req(&id)).await })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!waiting.is_finished(), "a poll at the limit must wait");
+
     let (victim, _) = caps.native_grants().unwrap()[0];
-    assert!(caps.revoke_native_grant(victim).unwrap());
-    let (status, body) = send(&r, poll_req(&request_id)).await;
+    assert_eq!(
+        send(&r, revoke_req(&victim.to_hex(), Some(SELF_ORIGIN)))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let (status, body) = tokio::time::timeout(Duration::from_secs(5), waiting)
+        .await
+        .expect("the revocation wakes the waiting poll")
+        .unwrap();
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(caps.native_grant_count().unwrap(), MAX_NATIVE_GRANTS);
+}
+
+/// With nothing changing, a poll at the limit answers again only after
+/// `POLL_WAIT`, so a re-polling client is paced to one try per wait.
+#[tokio::test(start_paused = true)]
+async fn grant_limit_re_polls_are_paced() {
+    let (state, caps) = new_state();
+    let r = router(&state);
+    let (request_id, approve_id) = create(&r).await;
+    approve(&r, &approve_id).await;
+    fill_grants(&caps);
+    assert_eq!(
+        send(&r, poll_req(&request_id)).await.0,
+        StatusCode::CONFLICT
+    );
+    let started = Instant::now();
+    assert_eq!(
+        send(&r, poll_req(&request_id)).await.0,
+        StatusCode::CONFLICT
+    );
+    assert!(started.elapsed() >= POLL_WAIT, "{:?}", started.elapsed());
+}
+
+/// Revoking drops the pending request too: a re-poll is 404 and can never
+/// store the grant again.
+#[tokio::test]
+async fn revoke_drops_the_pending_request() {
+    let (state, caps) = new_state();
+    let r = router(&state);
+    let (request_id, token) = granted(&r).await;
+    let hash = GrantTokenHash::of(&token);
+    assert_eq!(
+        send(&r, revoke_req(&hash.to_hex(), Some(SELF_ORIGIN)))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let (status, body) = send(&r, poll_req(&request_id)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(caps.native_grant_count().unwrap(), 0);
+    assert!(matches!(
+        resolve(&state, &token).await,
+        GrantLookup::NotFound
+    ));
+}
+
+/// Once stored, a re-poll returns the token even when the node has since
+/// reached the limit: the stored grant is not counted again.
+#[tokio::test]
+async fn re_poll_after_the_limit_fills_returns_the_same_token() {
+    let (state, caps) = new_state();
+    let r = router(&state);
+    let (request_id, token) = granted(&r).await;
+    fill_grants(&caps);
+    let (status, body) = send(&r, poll_req(&request_id)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(json(&body)["token"], token.as_str());
+}
+
+/// Once stored, a re-poll does not touch storage at all (here: a store whose
+/// reads fail still answers it).
+#[tokio::test]
+async fn re_poll_after_storing_does_no_storage_io() {
+    let storage = Arc::new(FlakyCapabilityStorage::default());
+    let caps = DelegateCapabilities::new(storage.clone());
+    let state = AppGrantState::with_capabilities(caps);
+    let r = router(&state);
+    let (request_id, token) = granted(&r).await;
+    storage
+        .fail_grants
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let (status, body) = send(&r, poll_req(&request_id)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(json(&body)["token"], token.as_str());
+}
+
+/// The request goes away (revoked or expired) while a poll is writing its
+/// grant: the row written is removed, since no client received the token.
+#[tokio::test]
+async fn a_request_dropped_while_storing_leaves_no_grant() {
+    let storage = Arc::new(FlakyCapabilityStorage::default());
+    let caps = DelegateCapabilities::new(storage.clone());
+    let state = AppGrantState::with_capabilities(caps.clone());
+    let r = router(&state);
+    let (request_id, approve_id) = create(&r).await;
+    approve(&r, &approve_id).await;
+    let hash = {
+        let pending = state.0.pending.lock();
+        match &pending[&request_id].outcome {
+            Outcome::Approved { token, .. } => token.hash(),
+            Outcome::Pending | Outcome::Denied => panic!("approved"),
+        }
+    };
+    // Runs inside the write's first read, i.e. after the poll marked the
+    // request `storing` and released the lock.
+    let dropper = state.clone();
+    *storage.after_native_get.lock() = Some(Box::new(move |_| {
+        dropper.forget_requests_for(hash);
+    }));
+    let (status, body) = send(&r, poll_req(&request_id)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert!(storage.after_native_get.lock().is_none(), "the hook ran");
+    assert_eq!(caps.native_grant_count().unwrap(), 0);
+}
+
+/// An answer given late in the request's life is still collectable for the
+/// full window after the answer.
+#[tokio::test(start_paused = true)]
+async fn a_late_answer_gets_the_full_collection_window() {
+    let (state, _) = new_state();
+    let r = router(&state);
+    let (request_id, approve_id) = create(&r).await;
+    tokio::time::advance(REQUEST_TTL - Duration::from_secs(5)).await;
+    approve(&r, &approve_id).await;
+    tokio::time::advance(REQUEST_TTL - Duration::from_secs(5)).await;
+    let (status, body) = send(&r, poll_req(&request_id)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    tokio::time::advance(Duration::from_secs(10)).await;
+    assert_eq!(
+        send(&r, poll_req(&request_id)).await.0,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[test]
+fn trace_uri_redacts_the_grant_capabilities() {
+    let u = |s: &str| s.parse::<axum::http::Uri>().unwrap();
+    let id = "a".repeat(64);
+    let redacted = redact_uri_for_log(&u(&format!("/v1/app-grants/request/{id}")));
+    assert_eq!(redacted, "/v1/app-grants/request/<redacted>");
+    assert!(!redact_uri_for_log(&u(&format!("/v1/app-grants/approve/{id}?x=1"))).contains(&id));
+    assert_eq!(
+        redact_uri_for_log(&u("/v1/app-grants/request")),
+        "/v1/app-grants/request"
+    );
+    assert_eq!(
+        redact_uri_for_log(&u("/permission/apps")),
+        "/permission/apps"
+    );
 }
 
 #[tokio::test]
@@ -774,7 +938,7 @@ async fn resolve_connection_attests_the_granted_app_and_revocation_closes_it() {
     let (_, token) = granted(&r).await;
     let hash = GrantTokenHash::of(&token);
 
-    let GrantLookup::Granted(live) = resolve(&state, &token) else {
+    let GrantLookup::Granted(live) = resolve(&state, &token).await else {
         panic!("the grant resolves");
     };
     assert_eq!(live.contract_id, app_id());
@@ -783,7 +947,10 @@ async fn resolve_connection_attests_the_granted_app_and_revocation_closes_it() {
     assert!(!revoked.is_cancelled());
 
     // An unknown token resolves to nothing and leaves no registration.
-    assert!(matches!(resolve(&state, "nope"), GrantLookup::NotFound));
+    assert!(matches!(
+        resolve(&state, "nope").await,
+        GrantLookup::NotFound
+    ));
     assert_eq!(state.0.live.lock().len(), 1);
 
     // Revoke through the dashboard route.
@@ -799,7 +966,7 @@ async fn resolve_connection_attests_the_granted_app_and_revocation_closes_it() {
     );
     assert!(caps.native_grants().unwrap().is_empty());
     assert!(
-        matches!(resolve(&state, &token), GrantLookup::NotFound),
+        matches!(resolve(&state, &token).await, GrantLookup::NotFound),
         "a revoked token is refused as not found"
     );
 
@@ -823,7 +990,7 @@ async fn unreadable_store_fails_closed_as_unavailable() {
         .fail_grants
         .store(true, std::sync::atomic::Ordering::Relaxed);
     assert!(matches!(
-        resolve(&state, token.expose()),
+        resolve(&state, token.expose()).await,
         GrantLookup::Unavailable
     ));
     assert!(state.0.live.lock().is_empty(), "no leaked registration");
@@ -831,13 +998,13 @@ async fn unreadable_store_fails_closed_as_unavailable() {
         .fail_grants
         .store(false, std::sync::atomic::Ordering::Relaxed);
     assert!(matches!(
-        resolve(&state, token.expose()),
+        resolve(&state, token.expose()).await,
         GrantLookup::Granted(_)
     ));
     // A node with no grant store yet (still starting) is also transient.
     let starting = AppGrantState::new(ExportOpManagerHandle::default());
     assert!(matches!(
-        resolve(&starting, token.expose()),
+        resolve(&starting, token.expose()).await,
         GrantLookup::Unavailable
     ));
 }
@@ -871,7 +1038,10 @@ async fn dashboard_revoke_needs_the_exact_origin_and_list_hides_the_token() {
             "{origin:?}"
         );
     }
-    assert!(matches!(resolve(&state, &token), GrantLookup::Granted(_)));
+    assert!(matches!(
+        resolve(&state, &token).await,
+        GrantLookup::Granted(_)
+    ));
 }
 
 #[test]

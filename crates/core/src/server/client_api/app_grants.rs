@@ -23,17 +23,36 @@
 //!
 //! `request_id` is known only to the client (it is never in a browser URL), so
 //! the page's URL alone cannot collect the token. The page is addressed by a
-//! separate `approve_id`.
+//! separate `approve_id`. Both are redacted from the request trace span
+//! ([`make_request_span`]).
+//!
+//! # What a polling client sees
+//!
+//! - `202 {"status":"pending"}`: the user has not answered yet; poll again.
+//! - `200 {"status":"approved","token",...}`: store the token and use it.
+//! - `200 {"status":"denied"}`: stop.
+//! - `409 {"status":"grant_limit"}`: the node already holds
+//!   [`MAX_NATIVE_GRANTS`] grants. Keep polling: the request is kept, and the
+//!   next poll waits (up to 30 s) for the user to revoke a grant before trying
+//!   again.
+//! - `503`: the grant could not be stored right now. Keep polling, with the
+//!   same pacing.
+//! - `404`: unknown, expired, revoked, or already used; start over.
 //!
 //! # Collecting the token more than once
 //!
 //! The grant is stored once, by the first poll that collects it. If that
 //! response is lost (the client crashed, the connection dropped), the holder of
 //! `request_id` may poll again and receives the SAME token, so an approval is
-//! not wasted and no orphaned grant is left behind. This stays possible until
-//! the request expires ([`REQUEST_TTL`]) or the token is first used to open a
-//! WebSocket connection, whichever is first; after either, the token exists
-//! only in the client.
+//! not wasted and no orphaned grant is left behind. A denial can be collected
+//! again the same way. This stays possible until the request expires, the
+//! token is first used to open a WebSocket connection, or the grant is
+//! revoked, whichever is first; after that the token exists only in the client.
+//!
+//! A request expires [`REQUEST_TTL`] after it was made if it is not answered,
+//! and [`REQUEST_TTL`] after the answer once it is, so a late answer still
+//! leaves the client the full window to collect it. Expired requests are swept
+//! on every access; nothing needs a timer.
 //!
 //! # Gates
 //!
@@ -48,10 +67,12 @@
 //!   page. The page may not be framed.
 //! - The Apps and permissions list and revoke routes use the same loopback
 //!   gate, so the list is shown exactly where Revoke works.
-//! - A request expires 10 minutes after it was made, approved or not.
 //! - On the WebSocket, a grant token is honoured only from the `Authorization`
-//!   header, only for a connection classified as local, and not when the
-//!   upgrade request carries forwarding headers.
+//!   header, only for a connection classified as local, only with a loopback
+//!   `Host`, and not when the upgrade request carries forwarding headers.
+//! - These routes sit behind the same router layers as the rest of the client
+//!   API (the LAN source filter on a non-loopback bind, and the `Host` checks),
+//!   and add their own loopback checks on top.
 //!
 //! The forwarding-header check is a heuristic. A reverse proxy that adds no
 //! forwarding headers and rewrites `Host` to a loopback name passes it. That is
@@ -61,8 +82,14 @@
 //! # Revocation
 //!
 //! Grants are listed on the Apps and permissions page with a Revoke button.
-//! Revoking deletes the stored row and closes every live connection that was
-//! opened with the token.
+//! Revoking deletes the stored row, drops any request still offering the token
+//! (so it can no longer be collected or stored again), and closes every live
+//! connection that was opened with the token.
+//!
+//! # Storage I/O
+//!
+//! Every read and write of the grant store runs off the async worker threads
+//! ([`off_thread`]) and never while the `pending` lock is held.
 //!
 //! # What this does NOT protect against
 //!
@@ -72,6 +99,13 @@
 //! between local processes of the same user. Closing that needs the
 //! authentication half of #5264 (for example passkey-gated approval), which
 //! can be added to the approval step without changing the native client's side.
+//!
+//! # Time
+//!
+//! This module reads `tokio::time::Instant` directly rather than a
+//! `TimeSource`, like the delegate permission prompts in
+//! `contract::user_input`: it is the HTTP layer, which the simulation harness
+//! does not drive, and tokio's clock is what its tests pause and advance.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -88,6 +122,7 @@ use freenet_stdlib::prelude::ContractInstanceId;
 use parking_lot::Mutex;
 use serde::Deserialize;
 use tokio::sync::watch;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use super::hosted_export::ExportOpManagerHandle;
@@ -101,10 +136,12 @@ use crate::contract::delegate_capabilities::{
     sanitize_client_name,
 };
 
-/// How long a request stays answerable, approved or not.
+/// How long a request stays answerable, and how long an answer stays
+/// collectable after it is given.
 pub(crate) const REQUEST_TTL: Duration = Duration::from_secs(10 * 60);
 
-/// How long one poll waits for the user before answering "pending".
+/// How long one poll waits for the user (or, after a grant-limit or storage
+/// refusal, for a change) before answering.
 pub(crate) const POLL_WAIT: Duration = Duration::from_secs(30);
 
 /// Requests waiting for an answer at once. A user approves one app at a time;
@@ -128,6 +165,10 @@ const ROUTE_APPROVE: &str = "/v1/app-grants/approve/{approve_id}";
 const ROUTE_LIST: &str = "/permission/native-grants";
 const ROUTE_REVOKE: &str = "/permission/native-grants/revoke";
 
+/// Path prefixes whose next segment is a capability (`request_id` collects a
+/// token; `approve_id` names the approval page) and must not be logged.
+const REDACTED_PATH_PREFIXES: [&str; 2] = ["/v1/app-grants/request/", "/v1/app-grants/approve/"];
+
 /// Per-node state for native app grants: requests awaiting the user, and the
 /// live connections opened with each grant (so revocation can close them).
 /// Persistent grants live in `DelegateCapabilities`, reached through the node's
@@ -135,6 +176,12 @@ const ROUTE_REVOKE: &str = "/permission/native-grants/revoke";
 #[derive(Clone)]
 pub(crate) struct AppGrantState(Arc<Inner>);
 
+/// `pending` and `live` are a `Mutex<HashMap>` rather than a `DashMap`: the
+/// operations on them are multi-entry (sweeping every expired request, finding
+/// a request by `approve_id`, dropping every request for one token hash, waking
+/// every waiter) and must see one consistent map. Both are tiny (at most
+/// [`MAX_PENDING_REQUESTS`] requests, one entry per live grant connection), and
+/// no storage I/O or `.await` happens while either lock is held.
 struct Inner {
     op_manager: ExportOpManagerHandle,
     #[cfg(test)]
@@ -149,22 +196,36 @@ struct PendingRequest {
     approve_id: String,
     app: ContractInstanceId,
     client_name: String,
-    created: tokio::time::Instant,
+    /// Creation + [`REQUEST_TTL`]; moved to answer + [`REQUEST_TTL`] when the
+    /// user answers.
+    expires: Instant,
     /// Nonce of the most recently rendered approval page. Taken (cleared) by
     /// the POST that uses it.
     page_nonce: Option<String>,
     outcome: Outcome,
-    /// Bumped when `outcome` changes, to wake pollers. Dropping the request
-    /// (expiry, first use, denial collected) closes it, which also wakes them.
+    /// Bumped when `outcome` changes (or a revocation frees a grant slot), to
+    /// wake pollers. Dropping the request (expiry, first use, revocation)
+    /// closes it, which also wakes them.
     changed: watch::Sender<()>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StoreFailure {
+    Limit,
+    Failed,
 }
 
 enum Outcome {
     Pending,
-    /// `stored` once the first collecting poll has written the grant.
     Approved {
         token: GrantToken,
+        /// Set once a poll has written the grant; later polls return the token
+        /// without touching storage.
         stored: bool,
+        /// A poll is writing the grant right now; others wait for it.
+        storing: bool,
+        /// Why the last write did not store it, if it did not.
+        last_failure: Option<StoreFailure>,
     },
     Denied,
 }
@@ -214,6 +275,31 @@ impl Drop for LiveGrantGuard {
     }
 }
 
+/// Run blocking storage work off the async worker threads.
+///
+/// On a multi-thread runtime (the node) this is `spawn_blocking`. On a
+/// current-thread runtime (unit tests, simulation) it runs inline, as the
+/// executor's own offload does (`contract::executor::runtime`), because there
+/// is no other worker to protect and the blocking pool may be outside the
+/// harness's control. `None` if the blocking task panicked or was cancelled.
+pub(crate) async fn off_thread<R: Send + 'static>(
+    f: impl FnOnce() -> R + Send + 'static,
+) -> Option<R> {
+    use tokio::runtime::RuntimeFlavor;
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
+            match tokio::task::spawn_blocking(f).await {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    tracing::warn!(error = %e, "native app grant storage task failed");
+                    None
+                }
+            }
+        }
+        _ => Some(f()),
+    }
+}
+
 impl AppGrantState {
     pub(crate) fn new(op_manager: ExportOpManagerHandle) -> Self {
         Self(Arc::new(Inner {
@@ -255,33 +341,45 @@ impl AppGrantState {
     /// deletes the row and THEN cancels registered connections, so either this
     /// read misses the row or the revocation sees the registration: a
     /// connection cannot slip between the two and outlive its grant.
-    pub(crate) fn resolve_connection(&self, token: &AuthToken) -> GrantLookup {
+    pub(crate) async fn resolve_connection(&self, token: &AuthToken) -> GrantLookup {
         let Some(caps) = self.capabilities() else {
             return GrantLookup::Unavailable;
         };
         let hash = GrantTokenHash::of(token.as_str());
         let guard = self.register_live(hash);
-        match caps.native_grant_for(hash) {
-            Ok(Some(grant)) => match grant.app {
+        // The read, and the hourly last-used refresh it may do, off the
+        // async workers.
+        match off_thread(move || caps.native_grant_for(hash)).await {
+            Some(Ok(Some(grant))) => match grant.app {
                 AppIdentity::WebApp(contract_id) => {
                     // The client demonstrably holds the token: stop offering it
                     // to pollers of the request it came from.
-                    self.forget_collected_request(hash);
+                    self.forget_requests_for(hash);
                     GrantLookup::Granted(LiveGrant { contract_id, guard })
                 }
             },
-            Ok(None) => GrantLookup::NotFound,
-            Err(e) => {
+            Some(Ok(None)) => GrantLookup::NotFound,
+            Some(Err(e)) => {
                 tracing::warn!(error = %e, "Could not read native app grants; refusing the token for now");
                 GrantLookup::Unavailable
             }
+            None => GrantLookup::Unavailable,
         }
     }
 
-    fn forget_collected_request(&self, hash: GrantTokenHash) {
+    /// Drop every request offering the token with this hash. Their pollers
+    /// wake (the watch closes) and see 404.
+    fn forget_requests_for(&self, hash: GrantTokenHash) {
         self.0.pending.lock().retain(
             |_, p| !matches!(&p.outcome, Outcome::Approved { token, .. } if token.hash() == hash),
         );
+    }
+
+    /// Wake every poller: a revocation may have freed a grant slot.
+    fn wake_all_pollers(&self) {
+        for p in self.0.pending.lock().values() {
+            p.changed.send_replace(());
+        }
     }
 
     fn register_live(&self, hash: GrantTokenHash) -> LiveGrantGuard {
@@ -301,16 +399,27 @@ impl AppGrantState {
         }
     }
 
-    /// Delete a grant and close its live connections. `Ok(false)` if there was
-    /// no such grant (live connections are closed regardless).
-    fn revoke(&self, caps: &DelegateCapabilities, hash: GrantTokenHash) -> anyhow::Result<bool> {
+    /// Delete a grant, drop any request still offering its token, and close
+    /// its live connections. `Ok(false)` if there was no such grant (the rest
+    /// happens regardless).
+    async fn revoke(
+        &self,
+        caps: Arc<DelegateCapabilities>,
+        hash: GrantTokenHash,
+    ) -> anyhow::Result<bool> {
         // Order matters, see `resolve_connection`: delete first, then cancel.
-        let removed = caps.revoke_native_grant(hash)?;
+        let removed = off_thread(move || caps.revoke_native_grant(hash))
+            .await
+            .unwrap_or_else(|| Err(anyhow::anyhow!("revocation task failed")));
+        // Even if the delete reported an error (it may still have committed),
+        // stop the token being collected or stored again.
+        self.forget_requests_for(hash);
         let conns = self.0.live.lock().remove(&hash).unwrap_or_default();
         for (_, cancel) in conns {
             cancel.cancel();
         }
-        Ok(removed)
+        self.wake_all_pollers();
+        removed
     }
 
     #[cfg(test)]
@@ -321,8 +430,8 @@ impl AppGrantState {
 
 /// Drop expired requests. Called under the lock on every access, so nothing
 /// needs a background task.
-fn sweep_expired(pending: &mut HashMap<String, PendingRequest>, now: tokio::time::Instant) {
-    pending.retain(|_, p| now.duration_since(p.created) < REQUEST_TTL);
+fn sweep_expired(pending: &mut HashMap<String, PendingRequest>, now: Instant) {
+    pending.retain(|_, p| now < p.expires);
 }
 
 /// A random hex id for request ids, page ids and nonces.
@@ -336,6 +445,29 @@ fn random_id() -> String {
     let mut bytes = [0u8; 32];
     OsRng.fill_bytes(&mut bytes);
     hex::encode(bytes)
+}
+
+/// A request URI for logging, with the capability segment of the grant routes
+/// replaced (their query, if any, is dropped too).
+pub(crate) fn redact_uri_for_log(uri: &axum::http::Uri) -> String {
+    let path = uri.path();
+    for prefix in REDACTED_PATH_PREFIXES {
+        if path.starts_with(prefix) && path.len() > prefix.len() {
+            return format!("{prefix}<redacted>");
+        }
+    }
+    uri.to_string()
+}
+
+/// The request span for the client API's `TraceLayer`: the default span's
+/// fields, with [`redact_uri_for_log`] applied to the URI.
+pub(crate) fn make_request_span<B>(req: &axum::http::Request<B>) -> tracing::Span {
+    tracing::debug_span!(
+        "request",
+        method = %req.method(),
+        uri = %redact_uri_for_log(req.uri()),
+        version = ?req.version(),
+    )
 }
 
 pub(super) fn routes() -> Router {
@@ -376,11 +508,23 @@ fn grant_limit_response() -> Response {
         .into_response()
 }
 
-/// Whether `caps` is already at [`MAX_NATIVE_GRANTS`]. A storage error reads
-/// as "not at the limit": the authoritative check is the capped insert.
-fn at_grant_limit(caps: &DelegateCapabilities) -> bool {
-    caps.native_grant_count()
-        .is_ok_and(|n| n >= MAX_NATIVE_GRANTS)
+fn store_failed_response() -> Response {
+    refuse(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "could not store the grant; poll again",
+    )
+}
+
+/// Whether the node is already at [`MAX_NATIVE_GRANTS`], read off the async
+/// workers. A storage error reads as "not at the limit": the authoritative
+/// check is the capped insert.
+async fn at_grant_limit(caps: Option<Arc<DelegateCapabilities>>) -> bool {
+    let Some(caps) = caps else {
+        return false;
+    };
+    off_thread(move || caps.native_grant_count())
+        .await
+        .is_some_and(|n| n.is_ok_and(|n| n >= MAX_NATIVE_GRANTS))
 }
 
 /// Any header a reverse proxy adds. A grant is handed out to, approved from,
@@ -391,6 +535,14 @@ pub(crate) fn has_forwarding_headers(headers: &HeaderMap) -> bool {
         let name = name.as_str();
         name.starts_with("x-forwarded-") || name == "forwarded" || name == "x-real-ip"
     })
+}
+
+/// Whether a WebSocket upgrade's headers allow honouring a grant token on it:
+/// no forwarding headers and a loopback `Host`, the same header checks as the
+/// grant's own HTTP routes. The caller separately requires a local connection
+/// scope and a header (not query) token.
+pub(crate) fn upgrade_may_use_grant(headers: &HeaderMap) -> bool {
+    !has_forwarding_headers(headers) && host_is_loopback(headers)
 }
 
 /// `Origin` is exactly this node: same authority as `Host` (see
@@ -525,7 +677,7 @@ async fn create_request(
         return refuse(StatusCode::SERVICE_UNAVAILABLE, "node not ready");
     };
     // Refuse up front rather than after the user has clicked Allow.
-    if at_grant_limit(&caps) {
+    if at_grant_limit(Some(caps)).await {
         return grant_limit_response();
     }
     let Some(authority) = loopback_authority(&headers) else {
@@ -536,7 +688,8 @@ async fn create_request(
     let approve_id = random_id();
     {
         let mut pending = state.0.pending.lock();
-        sweep_expired(&mut pending, tokio::time::Instant::now());
+        let now = Instant::now();
+        sweep_expired(&mut pending, now);
         if pending.len() >= MAX_PENDING_REQUESTS {
             return refuse(
                 StatusCode::TOO_MANY_REQUESTS,
@@ -550,7 +703,7 @@ async fn create_request(
                 approve_id: approve_id.clone(),
                 app,
                 client_name,
-                created: tokio::time::Instant::now(),
+                expires: now + REQUEST_TTL,
                 page_nonce: None,
                 outcome: Outcome::Pending,
                 changed,
@@ -579,55 +732,84 @@ impl Drop for PollSlot {
 }
 
 enum PollStep {
+    /// Wait for a change; answer "pending" at the deadline.
     Wait(watch::Receiver<()>),
+    /// The last write was refused; wait for a change before writing again.
+    WaitAfterFailure(watch::Receiver<()>),
+    /// This poll writes the grant (the request is marked `storing`).
+    Store {
+        token: GrantToken,
+        app: ContractInstanceId,
+        client_name: String,
+    },
     Approved(ContractInstanceId, GrantToken),
-    GrantLimit,
-    StoreFailed,
     Denied,
     Unknown,
 }
 
-/// Decide what a poll sees, under the pending lock. The first poll to see an
-/// approval stores the grant; later polls of the same request get the same
-/// token without storing it again (see the module docs on re-collection).
+/// Decide what a poll does, under the pending lock. Only decides: any storage
+/// write is returned as [`PollStep::Store`] and done after the lock is dropped.
 fn poll_step(
-    state: &AppGrantState,
     pending: &mut HashMap<String, PendingRequest>,
     request_id: &str,
+    waited_after_failure: bool,
 ) -> PollStep {
     let Some(p) = pending.get_mut(request_id) else {
         return PollStep::Unknown;
     };
     match &mut p.outcome {
         Outcome::Pending => PollStep::Wait(p.changed.subscribe()),
-        Outcome::Denied => {
-            pending.remove(request_id);
-            PollStep::Denied
-        }
-        Outcome::Approved { token, stored } => {
-            if !*stored {
-                // Stored under the pending lock, so two polls racing on the
-                // same request store it once.
-                let Some(caps) = state.capabilities() else {
-                    return PollStep::StoreFailed;
-                };
-                match caps.create_native_grant(
-                    token.hash(),
-                    AppIdentity::WebApp(p.app),
-                    &p.client_name,
-                ) {
-                    Ok(true) => {
-                        *stored = true;
-                        tracing::info!(contract_id = %p.app, "Native app grant approved and issued");
-                    }
-                    Ok(false) => return PollStep::GrantLimit,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "Could not store a native app grant");
-                        return PollStep::StoreFailed;
-                    }
-                }
-            }
+        // Kept until expiry, so a lost response can be collected again.
+        Outcome::Denied => PollStep::Denied,
+        Outcome::Approved { token, stored, .. } if *stored => {
             PollStep::Approved(p.app, token.clone())
+        }
+        Outcome::Approved { storing: true, .. } => PollStep::Wait(p.changed.subscribe()),
+        Outcome::Approved {
+            last_failure: Some(_),
+            ..
+        } if !waited_after_failure => PollStep::WaitAfterFailure(p.changed.subscribe()),
+        Outcome::Approved {
+            token,
+            storing,
+            last_failure,
+            ..
+        } => {
+            *storing = true;
+            *last_failure = None;
+            PollStep::Store {
+                token: token.clone(),
+                app: p.app,
+                client_name: p.client_name.clone(),
+            }
+        }
+    }
+}
+
+/// Write one grant, on a blocking thread. A grant already present (an earlier
+/// write that reported an error but committed) counts as stored. The limit is
+/// read first, so a client polling at the limit costs a read, not a write.
+fn store_grant(
+    caps: &DelegateCapabilities,
+    token_hash: GrantTokenHash,
+    app: ContractInstanceId,
+    client_name: &str,
+) -> Result<(), StoreFailure> {
+    let attempt = || -> anyhow::Result<bool> {
+        if caps.has_native_grant(token_hash)? {
+            return Ok(true);
+        }
+        if caps.native_grant_count()? >= MAX_NATIVE_GRANTS {
+            return Ok(false);
+        }
+        caps.create_native_grant(token_hash, AppIdentity::WebApp(app), client_name)
+    };
+    match attempt() {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(StoreFailure::Limit),
+        Err(e) => {
+            tracing::warn!(error = %e, "Could not store a native app grant");
+            Err(StoreFailure::Failed)
         }
     }
 }
@@ -646,12 +828,13 @@ async fn poll_request(
         return refuse(StatusCode::TOO_MANY_REQUESTS, "too many polls");
     }
     let _slot = PollSlot(state.clone());
-    let deadline = tokio::time::Instant::now() + POLL_WAIT;
+    let deadline = Instant::now() + POLL_WAIT;
+    let mut waited_after_failure = false;
     loop {
         let step = {
             let mut pending = state.0.pending.lock();
-            sweep_expired(&mut pending, tokio::time::Instant::now());
-            poll_step(&state, &mut pending, &request_id)
+            sweep_expired(&mut pending, Instant::now());
+            poll_step(&mut pending, &request_id, waited_after_failure)
         };
         match step {
             PollStep::Unknown => {
@@ -664,26 +847,7 @@ async fn poll_request(
                 )
                     .into_response();
             }
-            // The request is kept: once the user revokes another grant, a
-            // later poll (before the request expires) can still store this one.
-            PollStep::GrantLimit => return grant_limit_response(),
-            PollStep::StoreFailed => {
-                return refuse(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "could not store the grant; poll again",
-                );
-            }
-            PollStep::Approved(app, token) => {
-                return (
-                    [("Cache-Control", "no-store")],
-                    Json(serde_json::json!({
-                        "status": "approved",
-                        "app": app.to_string(),
-                        "token": token.expose(),
-                    })),
-                )
-                    .into_response();
-            }
+            PollStep::Approved(app, token) => return approved_response(app, &token),
             PollStep::Wait(mut changed) => {
                 match tokio::time::timeout_at(deadline, changed.changed()).await {
                     // Changed, or the request went away: look again.
@@ -698,7 +862,93 @@ async fn poll_request(
                     }
                 }
             }
+            // Pace a client polling at the limit (or after a storage error):
+            // wait for a change, such as a revocation, or the deadline, then
+            // write again once.
+            PollStep::WaitAfterFailure(mut changed) => {
+                drop(tokio::time::timeout_at(deadline, changed.changed()).await);
+                waited_after_failure = true;
+            }
+            PollStep::Store {
+                token,
+                app,
+                client_name,
+            } => {
+                return store_and_answer(&state, &request_id, token, app, client_name).await;
+            }
         }
+    }
+}
+
+fn approved_response(app: ContractInstanceId, token: &GrantToken) -> Response {
+    (
+        [("Cache-Control", "no-store")],
+        Json(serde_json::json!({
+            "status": "approved",
+            "app": app.to_string(),
+            "token": token.expose(),
+        })),
+    )
+        .into_response()
+}
+
+/// The write half of a collecting poll: store off the lock and off the async
+/// workers, then re-take the lock and record the result.
+async fn store_and_answer(
+    state: &AppGrantState,
+    request_id: &str,
+    token: GrantToken,
+    app: ContractInstanceId,
+    client_name: String,
+) -> Response {
+    let hash = token.hash();
+    let result = match state.capabilities() {
+        Some(caps) => off_thread(move || store_grant(&caps, hash, app, &client_name))
+            .await
+            .unwrap_or(Err(StoreFailure::Failed)),
+        None => Err(StoreFailure::Failed),
+    };
+    let still_offered = {
+        let mut pending = state.0.pending.lock();
+        sweep_expired(&mut pending, Instant::now());
+        match pending.get_mut(request_id) {
+            Some(p) => {
+                if let Outcome::Approved {
+                    stored,
+                    storing,
+                    last_failure,
+                    ..
+                } = &mut p.outcome
+                {
+                    *storing = false;
+                    match result {
+                        Ok(()) => *stored = true,
+                        Err(f) => *last_failure = Some(f),
+                    }
+                }
+                p.changed.send_replace(());
+                true
+            }
+            None => false,
+        }
+    };
+    if !still_offered {
+        // Revoked or expired while we were writing. Nobody received the token,
+        // so a row we just wrote would be a grant no client holds: remove it.
+        if result.is_ok()
+            && let Some(caps) = state.capabilities()
+        {
+            drop(off_thread(move || caps.revoke_native_grant(hash)).await);
+        }
+        return refuse(StatusCode::NOT_FOUND, "unknown or expired request");
+    }
+    match result {
+        Ok(()) => {
+            tracing::info!(contract_id = %app, "Native app grant approved and issued");
+            approved_response(app, &token)
+        }
+        Err(StoreFailure::Limit) => grant_limit_response(),
+        Err(StoreFailure::Failed) => store_failed_response(),
     }
 }
 
@@ -759,10 +1009,7 @@ async fn approve_page(
             "open this page directly from the program that asked",
         );
     }
-    if state
-        .capabilities()
-        .is_some_and(|caps| at_grant_limit(&caps))
-    {
+    if at_grant_limit(state.capabilities()).await {
         return message_page(
             StatusCode::CONFLICT,
             "Freenet already has the most programs allowed to use apps. Revoke one on the \
@@ -772,7 +1019,7 @@ async fn approve_page(
     let nonce = random_id();
     let (app, client_name) = {
         let mut pending = state.0.pending.lock();
-        sweep_expired(&mut pending, tokio::time::Instant::now());
+        sweep_expired(&mut pending, Instant::now());
         let Some(p) = pending
             .values_mut()
             .find(|p| p.approve_id == approve_id && matches!(p.outcome, Outcome::Pending))
@@ -822,9 +1069,11 @@ async fn approve_submit(
     if !origin_is_this_node(&headers) {
         return refuse(StatusCode::FORBIDDEN, "origin mismatch");
     }
-    let caps = state.capabilities();
+    // Read before the lock: no storage I/O happens under it.
+    let at_limit = body.allow && at_grant_limit(state.capabilities()).await;
     let mut pending = state.0.pending.lock();
-    sweep_expired(&mut pending, tokio::time::Instant::now());
+    let now = Instant::now();
+    sweep_expired(&mut pending, now);
     let Some(p) = pending.values_mut().find(|p| p.approve_id == approve_id) else {
         return refuse(StatusCode::GONE, "unknown or expired request");
     };
@@ -842,17 +1091,21 @@ async fn approve_submit(
     }
     // Tell the user now, not after they have been told "Allowed". The request
     // stays pending; the page has to be reopened (new nonce) to answer again.
-    if body.allow && caps.as_deref().is_some_and(at_grant_limit) {
+    if at_limit {
         return grant_limit_response();
     }
     p.outcome = if body.allow {
         Outcome::Approved {
             token: GrantToken::generate(),
             stored: false,
+            storing: false,
+            last_failure: None,
         }
     } else {
         Outcome::Denied
     };
+    // The client gets the full window to collect the answer.
+    p.expires = now + REQUEST_TTL;
     p.changed.send_replace(());
     tracing::info!(contract_id = %p.app, allowed = body.allow, "Native app grant request answered");
     (
@@ -884,8 +1137,8 @@ async fn list_native_grants(
     let Some(caps) = state.capabilities() else {
         return Json(empty).into_response();
     };
-    match caps.native_grants() {
-        Ok(grants) => {
+    match off_thread(move || caps.native_grants()).await {
+        Some(Ok(grants)) => {
             let rows: Vec<_> = grants
                 .into_iter()
                 .map(|(hash, g)| {
@@ -900,8 +1153,10 @@ async fn list_native_grants(
                 .collect();
             Json(serde_json::json!({ "grants": rows })).into_response()
         }
-        Err(e) => {
-            tracing::warn!(error = %e, "Failed to list native app grants");
+        failed => {
+            if let Some(Err(e)) = failed {
+                tracing::warn!(error = %e, "Failed to list native app grants");
+            }
             Json(serde_json::json!({ "grants": [], "error": "could not read the grant store" }))
                 .into_response()
         }
@@ -914,9 +1169,9 @@ struct RevokeNativeGrant {
     id: String,
 }
 
-/// Revoke a native app grant: delete it and close its live connections.
-/// State-changing, so the full local gate and an Origin exactly equal to the
-/// node's.
+/// Revoke a native app grant: delete it, drop any request still offering its
+/// token, and close its live connections. State-changing, so the full local
+/// gate and an Origin exactly equal to the node's.
 async fn revoke_native_grant(
     connect_info: Option<Extension<ConnectInfo<SocketAddr>>>,
     Extension(state): Extension<AppGrantState>,
@@ -935,7 +1190,7 @@ async fn revoke_native_grant(
     let Some(caps) = state.capabilities() else {
         return refuse(StatusCode::SERVICE_UNAVAILABLE, "node not ready");
     };
-    match state.revoke(&caps, hash) {
+    match state.revoke(caps, hash).await {
         Ok(true) => Json(serde_json::json!({ "ok": true })).into_response(),
         Ok(false) => refuse(StatusCode::NOT_FOUND, "no such grant"),
         Err(e) => {

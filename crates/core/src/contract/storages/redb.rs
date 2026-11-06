@@ -2034,7 +2034,8 @@ impl ReDb {
     }
 
     /// Insert unless the table already holds `max` rows; count and insert in
-    /// one write transaction. `Ok(false)` when refused.
+    /// one write transaction. `Ok(false)` when refused. A key already present
+    /// is left as it is and reported `Ok(true)`.
     pub(crate) fn insert_native_app_grant_capped(
         &self,
         token_hash: &[u8; 32],
@@ -2042,21 +2043,24 @@ impl ReDb {
         max: usize,
     ) -> Result<bool, redb::Error> {
         let txn = self.begin_write()?;
-        let inserted = {
+        let (stored, wrote) = {
             let mut tbl = txn.open_table(NATIVE_APP_GRANTS_TABLE)?;
-            if tbl.len()? >= max as u64 {
-                false
+            if tbl.get(token_hash.as_slice())?.is_some() {
+                // Idempotent: already stored, not counted against the cap.
+                (true, false)
+            } else if tbl.len()? >= max as u64 {
+                (false, false)
             } else {
                 tbl.insert(token_hash.as_slice(), value)?;
-                true
+                (true, true)
             }
         };
-        if inserted {
+        if wrote {
             Self::commit_guarded(txn)?;
         } else {
             txn.abort()?;
         }
-        Ok(inserted)
+        Ok(stored)
     }
 
     /// Rewrite an existing row with `update(old)` in one write transaction;

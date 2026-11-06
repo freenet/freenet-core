@@ -11,8 +11,10 @@
 //! `MessageOrigin::WebApp(<app>)`.
 //!
 //! What is stored: only the SHA-256 of the token, keyed to the grant record.
-//! The token itself exists in the node's memory only between approval and the
-//! one poll that hands it to the client.
+//! The token itself is held in the node's memory from approval until the
+//! request it answers expires, the token is first used to connect, or the
+//! grant is revoked, whichever is first, so a client whose poll response was
+//! lost can collect it again. After that it exists only in the client.
 //!
 //! The approval flow and its gates live in `server::client_api::app_grants`.
 //!
@@ -34,6 +36,10 @@ pub(crate) const MAX_NATIVE_GRANTS: usize = 64;
 /// Longest client name kept, in characters. The name is display-only and is
 /// never presented as verified.
 pub(crate) const MAX_CLIENT_NAME_CHARS: usize = 64;
+
+/// Longest client name kept, in UTF-8 bytes. Below the record's one-byte
+/// length field (255), so a stored name is never cut inside a character.
+pub(crate) const MAX_CLIENT_NAME_BYTES: usize = 192;
 
 /// A refresh of `last_used_at` is written at most this often per grant, so a
 /// client that reconnects in a loop does not turn every connect into a write.
@@ -113,8 +119,13 @@ pub(crate) struct NativeGrant {
 
 impl NativeGrant {
     fn encode(&self) -> Vec<u8> {
+        // Names come through `sanitize_client_name`, which keeps them under
+        // the length field; still never cut inside a UTF-8 character.
+        let mut name_len = self.client_name.len().min(u8::MAX as usize);
+        while !self.client_name.is_char_boundary(name_len) {
+            name_len -= 1;
+        }
         let name = self.client_name.as_bytes();
-        let name_len = name.len().min(u8::MAX as usize);
         let mut out = Vec::with_capacity(1 + AppIdentity::ENCODED_LEN + 16 + 1 + name_len);
         out.push(RECORD_VERSION);
         out.extend_from_slice(&self.app.encode());
@@ -178,18 +189,29 @@ fn is_format_char(c: char) -> bool {
 /// characters are removed. It is still untrusted text: callers must escape it
 /// for HTML.
 pub(crate) fn sanitize_client_name(name: &str) -> String {
-    name.chars()
-        .filter(|c| !c.is_control() && !is_format_char(*c))
-        .take(MAX_CLIENT_NAME_CHARS)
-        .collect::<String>()
-        .trim()
-        .to_string()
+    let mut out = String::new();
+    let mut chars = 0;
+    for c in name.chars() {
+        // Line and paragraph separators (U+2028, U+2029) are not control
+        // characters but break the line the name is shown on.
+        if c.is_control() || is_format_char(c) || matches!(c, '\u{2028}' | '\u{2029}') {
+            continue;
+        }
+        if chars == MAX_CLIENT_NAME_CHARS || out.len() + c.len_utf8() > MAX_CLIENT_NAME_BYTES {
+            break;
+        }
+        out.push(c);
+        chars += 1;
+    }
+    out.trim().to_string()
 }
 
 impl DelegateCapabilities {
     /// Store a new grant for `token_hash`. `Ok(false)` when
     /// [`MAX_NATIVE_GRANTS`] grants already exist; the count and the insert
     /// are one storage transaction, so concurrent callers cannot exceed it.
+    /// Idempotent: a grant already stored under `token_hash` is kept as it is
+    /// and reported as stored, whatever the count.
     pub(crate) fn create_native_grant(
         &self,
         token_hash: GrantTokenHash,
@@ -205,6 +227,11 @@ impl DelegateCapabilities {
         };
         self.storage
             .insert_native_grant_capped(&token_hash.0, &grant.encode(), MAX_NATIVE_GRANTS)
+    }
+
+    /// Whether a grant is stored for `token_hash`. A plain read: no refresh.
+    pub(crate) fn has_native_grant(&self, token_hash: GrantTokenHash) -> anyhow::Result<bool> {
+        Ok(self.storage.get_native_grant(&token_hash.0)?.is_some())
     }
 
     /// Number of stored grants.
@@ -328,6 +355,25 @@ mod tests {
             sanitize_client_name(&"x".repeat(500)).chars().count(),
             MAX_CLIENT_NAME_CHARS
         );
+    }
+
+    #[test]
+    fn client_name_is_capped_by_bytes_at_a_char_boundary() {
+        let wide = "\u{1F600}".repeat(100); // 4 bytes each
+        let s = sanitize_client_name(&wide);
+        assert!(s.len() <= MAX_CLIENT_NAME_BYTES, "{}", s.len());
+        assert_eq!(s.len() % 4, 0, "no partial character");
+        assert!(sanitize_client_name("a\u{2028}b\u{2029}c") == "abc");
+        // A record whose name exceeds the length field still decodes intact.
+        let g = NativeGrant {
+            app: app(1),
+            client_name: "\u{e9}".repeat(200),
+            created_at_ms: 0,
+            last_used_at_ms: 0,
+        };
+        let back = NativeGrant::decode(&g.encode()).unwrap();
+        assert!(back.client_name.chars().all(|c| c == '\u{e9}'));
+        assert_eq!(back.client_name.len(), 254);
     }
 
     #[test]
@@ -464,5 +510,63 @@ mod tests {
             c.native_grant_for(GrantToken::generate().hash()).unwrap(),
             None
         );
+    }
+
+    /// Storage-level contract of the redb table: the capped insert, the
+    /// conditional update, idempotence, and persistence across a reopen.
+    #[cfg(feature = "redb")]
+    #[tokio::test]
+    async fn redb_capped_insert_and_conditional_update() {
+        let dir = crate::util::tests::get_temp_dir();
+        let a = [1u8; 32];
+        let b = [2u8; 32];
+        let c = [3u8; 32];
+        {
+            let db = crate::contract::storages::Storage::new(dir.path())
+                .await
+                .unwrap();
+            assert!(db.insert_native_app_grant_capped(&a, b"one", 2).unwrap());
+            assert!(db.insert_native_app_grant_capped(&b, b"two", 2).unwrap());
+            // At the cap: refused, and nothing written.
+            assert!(!db.insert_native_app_grant_capped(&c, b"three", 2).unwrap());
+            assert_eq!(db.get_native_app_grant(&c).unwrap(), None);
+            assert_eq!(db.load_all_native_app_grants().unwrap().len(), 2);
+            // A key already present is stored, even at the cap, and kept as is.
+            assert!(db.insert_native_app_grant_capped(&a, b"other", 2).unwrap());
+            assert_eq!(
+                db.get_native_app_grant(&a).unwrap().as_deref(),
+                Some(&b"one"[..])
+            );
+            assert_eq!(db.load_all_native_app_grants().unwrap().len(), 2);
+            // Update of an absent key writes nothing.
+            let mut called = false;
+            db.update_native_app_grant_if_present(&c, &mut |_| {
+                called = true;
+                Some(b"made up".to_vec())
+            })
+            .unwrap();
+            assert!(!called);
+            assert_eq!(db.get_native_app_grant(&c).unwrap(), None);
+            // Update of a present key persists.
+            db.update_native_app_grant_if_present(&b, &mut |old| {
+                assert_eq!(old, b"two");
+                Some(b"two v2".to_vec())
+            })
+            .unwrap();
+            assert_eq!(
+                db.get_native_app_grant(&b).unwrap().as_deref(),
+                Some(&b"two v2"[..])
+            );
+            // `None` from the closure leaves the row alone.
+            db.update_native_app_grant_if_present(&b, &mut |_| None)
+                .unwrap();
+            assert!(db.remove_native_app_grant(&a).unwrap());
+            assert!(!db.remove_native_app_grant(&a).unwrap());
+        }
+        let db = crate::contract::storages::Storage::new(dir.path())
+            .await
+            .unwrap();
+        let rows = db.load_all_native_app_grants().unwrap();
+        assert_eq!(rows, vec![(b, b"two v2".to_vec())]);
     }
 }

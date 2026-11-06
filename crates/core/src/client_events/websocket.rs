@@ -58,6 +58,19 @@ pub(crate) enum TokenCheck {
     Unavailable,
 }
 
+/// How a token that is not a shell-page token is treated, given the native
+/// app grant lookup (`None` when the grant lookup did not apply to this
+/// connection). A store that could not be consulted must stay
+/// [`TokenCheck::Unavailable`] (4503, retry), never become
+/// [`TokenCheck::Invalid`] (4401), or a client would discard a valid token.
+fn token_check_for_grant(lookup: Option<&GrantLookup>) -> TokenCheck {
+    match lookup {
+        Some(GrantLookup::Granted(_)) => TokenCheck::Valid,
+        Some(GrantLookup::Unavailable) => TokenCheck::Unavailable,
+        Some(GrantLookup::NotFound) | None => TokenCheck::Invalid,
+    }
+}
+
 /// Interval for sending WebSocket ping frames to keep connection alive.
 /// Idle TCP connections may be closed by the OS, browser, or intermediate
 /// proxies after extended periods of inactivity. 30 seconds is a safe
@@ -247,7 +260,7 @@ use super::{ClientError, ClientEventsProxy, ClientId, ConnectionScope, HostResul
 use crate::client_events::user_op_rate_limit::UserOpRateLimiter;
 use crate::server::client_api::OriginContractMap;
 use crate::server::client_api::app_grants::{
-    AppGrantState, GrantLookup, LiveGrantGuard, has_forwarding_headers,
+    AppGrantState, GrantLookup, LiveGrantGuard, redact_uri_for_log, upgrade_may_use_grant,
 };
 use crate::wasm_runtime::UserSecretContext;
 
@@ -1203,7 +1216,7 @@ async fn connection_info(
             tracing::warn!(
                 source_ip = ?source_ip,
                 xfp_https,
-                request_path = req.uri().path(),
+                request_path = %redact_uri_for_log(req.uri()),
                 "Rejected hosted user token over an insecure connection \
                  (need a loopback source carrying X-Forwarded-Proto: https)"
             );
@@ -1226,7 +1239,7 @@ async fn connection_info(
         auth_token_present = auth_token.is_some(),
         hosted_mode = hosted_mode.0,
         ?user_context,
-        request_path = req.uri().path(),
+        request_path = %redact_uri_for_log(req.uri()),
         "connection_info middleware: resolved auth token, hosted-mode context, and encoding protocol",
     );
     // ATTESTED-ORIGIN scope (GHSA-824h-7x5x-wfmf). Classified HERE, from the
@@ -1319,7 +1332,7 @@ async fn websocket_commands(
     let app_grants = app_grants.map(|Extension(g)| g).filter(|_| {
         !hosted_mode.0
             && token_from_header.is_some_and(|Extension(h)| h.0)
-            && !has_forwarding_headers(&headers)
+            && upgrade_may_use_grant(&headers)
             && connection_scope == ConnectionScope::Local
     });
     let on_upgrade = move |ws: WebSocket| async move {
@@ -1336,24 +1349,30 @@ async fn websocket_commands(
                 tracing::trace!(contract_id = ?origin.contract_id, "Found token in origin_contracts map");
                 Ok(origin.contract_id)
             } else {
-                match app_grants.as_ref().map(|g| g.resolve_connection(token)) {
+                let lookup = match app_grants.as_ref() {
+                    Some(g) => Some(g.resolve_connection(token).await),
+                    None => None,
+                };
+                match (token_check_for_grant(lookup.as_ref()), lookup) {
                     // A user-approved native app grant (#5264). From here on the
                     // connection is handled exactly as a shell-page token for
                     // the same app: same `(token, contract)` pair, same scope
                     // gate.
-                    Some(GrantLookup::Granted(grant)) => {
+                    (TokenCheck::Valid, Some(GrantLookup::Granted(grant))) => {
                         tracing::debug!(contract_id = %grant.contract_id, "Connection opened with a native app grant");
                         live_grant = Some(grant.guard);
                         Ok(grant.contract_id)
                     }
-                    Some(GrantLookup::Unavailable) => Err(TokenCheck::Unavailable),
-                    Some(GrantLookup::NotFound) | None => Err(TokenCheck::Invalid),
+                    (TokenCheck::Valid, _) => Err(TokenCheck::Invalid),
+                    (check, _) => Err(check),
                 }
             };
             match grant {
                 Ok(contract_id) => (Some((token.clone(), contract_id)), TokenCheck::Valid),
                 Err(TokenCheck::Unavailable) => {
-                    tracing::info!(
+                    // Debug, not info: a client retrying through a node start
+                    // would otherwise log this once per attempt.
+                    tracing::debug!(
                         "Could not check an auth token against app grants now; asking the client to retry"
                     );
                     (None, TokenCheck::Unavailable)
@@ -3200,7 +3219,7 @@ mod tests {
 
         // Fake node backend: answer every NewConnection with a fresh id so
         // `new_client_connection` resolves and `websocket_interface` reaches the
-        // `token_is_invalid` close path.
+        // refused-token close path.
         let (req_tx, mut req_rx) = mpsc::channel::<ClientConnection>(4);
         tokio::spawn(async move {
             while let Some(conn) = req_rx.recv().await {
@@ -3223,7 +3242,8 @@ mod tests {
             Extension(rs): Extension<WebSocketRequest>,
         ) -> impl IntoResponse {
             ws.on_upgrade(move |socket| async move {
-                // `token_is_invalid = true` drives the stale-token close path.
+                // A `TokenCheck` other than `Valid` drives the refused-token
+                // close path.
                 // The interface's own return value is not the signal under test:
                 // the assertion is the close CODE the client observes.
                 drop(
@@ -3290,6 +3310,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn grant_lookup_maps_unavailable_to_retry_and_missing_to_invalid() {
+        use crate::server::client_api::app_grants::GrantLookup;
+        assert_eq!(
+            token_check_for_grant(Some(&GrantLookup::Unavailable)),
+            TokenCheck::Unavailable
+        );
+        assert_eq!(
+            token_check_for_grant(Some(&GrantLookup::NotFound)),
+            TokenCheck::Invalid
+        );
+        assert_eq!(token_check_for_grant(None), TokenCheck::Invalid);
+    }
+
     /// A token the node could not check (native app grant store unavailable,
     /// #5264) closes with 4503 so a native client keeps its durable token and
     /// retries, instead of the 4401 that means the token is invalid.
@@ -3300,7 +3334,7 @@ mod tests {
 
         // Fake node backend: answer every NewConnection with a fresh id so
         // `new_client_connection` resolves and `websocket_interface` reaches the
-        // `token_is_invalid` close path.
+        // refused-token close path.
         let (req_tx, mut req_rx) = mpsc::channel::<ClientConnection>(4);
         tokio::spawn(async move {
             while let Some(conn) = req_rx.recv().await {
@@ -3323,7 +3357,8 @@ mod tests {
             Extension(rs): Extension<WebSocketRequest>,
         ) -> impl IntoResponse {
             ws.on_upgrade(move |socket| async move {
-                // `token_is_invalid = true` drives the stale-token close path.
+                // A `TokenCheck` other than `Valid` drives the refused-token
+                // close path.
                 // The interface's own return value is not the signal under test:
                 // the assertion is the close CODE the client observes.
                 drop(

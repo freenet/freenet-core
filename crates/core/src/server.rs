@@ -664,7 +664,10 @@ async fn serve_client_api_in_impl(
             .layer(Extension(allowed_hosts))
             .layer(axum::middleware::from_fn(private_network_filter))
             .layer(Extension(allowed_source_cidrs))
-            .layer(TraceLayer::new_for_http())
+            .layer(
+                TraceLayer::new_for_http()
+                    .make_span_with(client_api::app_grants::make_request_span),
+            )
     } else {
         // Loopback binds still inject an (empty) `AllowedSourceCidrs` so
         // `connection_info` always finds the extractor; missing it would
@@ -675,7 +678,10 @@ async fn serve_client_api_in_impl(
             .layer(Extension(activity_secrets_dir))
             .layer(Extension(allowed_hosts))
             .layer(Extension(allowed_source_cidrs))
-            .layer(TraceLayer::new_for_http())
+            .layer(
+                TraceLayer::new_for_http()
+                    .make_span_with(client_api::app_grants::make_request_span),
+            )
     };
 
     serve_dual_stack(ws_socket, router, pre_bound, &mut server_aborts).await?;

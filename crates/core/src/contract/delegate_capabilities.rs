@@ -410,7 +410,9 @@ pub(crate) trait CapabilityStorage: Send + Sync {
     ///
     /// Insert a new grant unless `max` grants already exist. The count and the
     /// insert happen in ONE write transaction, so concurrent inserts cannot
-    /// exceed `max`. `Ok(false)` when the cap refused it.
+    /// exceed `max`. `Ok(false)` when the cap refused it. A key already present
+    /// is left as it is and reported as `Ok(true)`, without counting against
+    /// the cap.
     fn insert_native_grant_capped(
         &self,
         token_hash: &[u8; 32],
@@ -541,6 +543,9 @@ impl CapabilityStorage for MemoryCapabilityStorage {
         max: usize,
     ) -> anyhow::Result<bool> {
         let mut grants = self.native_grants.lock();
+        if grants.contains_key(token_hash) {
+            return Ok(true);
+        }
         if grants.len() >= max {
             return Ok(false);
         }

@@ -282,15 +282,28 @@
         function loadNative() {
           fetch('/permission/native-grants')
             .then(function (r) {
-              return r.json();
+              return r.json().then(function (body) {
+                return { ok: r.ok, body: body };
+              });
             })
             .then(
-              function (body) {
+              function (res) {
+                var body = res.body;
+                native.textContent = '';
+                if (!res.ok) {
+                  // Refused here (not this computer, or proxied): show only
+                  // why, not an empty list.
+                  var refused = document.createElement('div');
+                  refused.className = 'error';
+                  refused.textContent =
+                    (body && body.error) || 'Could not load programs.';
+                  native.appendChild(refused);
+                  return;
+                }
                 if (body && body.error) {
                   showError(body.error);
                 }
                 var grants = (body && body.grants) || [];
-                native.textContent = '';
                 if (!grants.length) {
                   var e = document.createElement('div');
                   e.className = 'empty';
