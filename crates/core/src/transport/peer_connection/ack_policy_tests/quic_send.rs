@@ -1472,9 +1472,8 @@ impl crate::transport::quic::path::pacer::SendPacer for RefusingPacer {
 }
 
 /// A Stream and a Short past one packet that the pacer refuses go on UDP, and
-/// their bytes are charged to the pacer as debt, so the path's next sends wait
-/// for them: without the charge, a binding limit that refuses QUIC sends runs
-/// at the limit on QUIC and again on UDP.
+/// their bytes are charged to the pacer as debt once UDP has sent them, so the
+/// path's next sends wait for them.
 #[test]
 fn messages_the_pacer_refuses_go_on_udp_and_are_charged_to_it() {
     run(
@@ -1516,10 +1515,11 @@ fn messages_the_pacer_refuses_go_on_udp_and_are_charged_to_it() {
 }
 
 /// A Short past one packet that the pacer refuses after its stream opened is
-/// reset and goes on UDP whole, and the pacer is charged only what QUIC had not
-/// already paid for: the writes made before the refusal stay paid once.
+/// reset and goes on UDP whole, and the whole message is charged to the
+/// pacer: UDP put all of it on the wire, on top of what the QUIC writes before
+/// the refusal already paid.
 #[test]
-fn a_large_short_the_pacer_refuses_after_opening_is_charged_only_the_rest() {
+fn a_large_short_the_pacer_refuses_after_opening_is_charged_in_full() {
     run(
         "quic-send-paced-open",
         141,
@@ -1544,11 +1544,11 @@ fn a_large_short_the_pacer_refuses_after_opening_is_charged_only_the_rest() {
             let granted = pacer.granted.load(std::sync::atomic::Ordering::Relaxed);
             assert!(
                 granted > crate::transport::quic::framing::HEADER_LEN,
-                "a payload write was made"
+                "a payload write was made on QUIC"
             );
             assert_eq!(
                 pacer.charged.load(std::sync::atomic::Ordering::Relaxed),
-                large.len() - granted
+                large.len()
             );
         },
     );

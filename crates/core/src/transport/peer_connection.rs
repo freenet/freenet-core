@@ -189,7 +189,7 @@ pub(crate) struct RemoteConnection<S = super::UdpSocket, T: TimeSource = RealTim
 /// Before #6047 the rate update ignored `bandwidth-limit`, which then only set
 /// the initial rate. `bandwidth_limit` is the value after
 /// [`effective_bandwidth_limit`].
-pub(super) fn paced_rate(
+pub(crate) fn paced_rate(
     cc_rate: usize,
     global_rate: Option<usize>,
     bandwidth_limit: Option<usize>,
@@ -6671,15 +6671,8 @@ mod tests {
             Some(500_000),
             "total-bandwidth-limit paces at the connection's share"
         );
-        // A total of 0 is no cap: the manager is still built, with its
-        // per-connection minimum, and must not pace.
-        let (mut no_total, _tx) = test_conn_with_bandwidth_limit(addr, None);
-        no_total.remote_conn.global_bandwidth =
-            Some(Arc::new(GlobalBandwidthManager::new(0, Some(1000))));
-        assert!(
-            no_total.path_rate_limit().is_none(),
-            "total-bandwidth-limit = 0 is no limit"
-        );
+        // A total of 0 builds no manager, so it reaches no connection
+        // (config::tests::a_total_of_zero_paces_neither_transport).
     }
 
     /// Runs `conn`'s real `recv()` loop until its token bucket's rate is

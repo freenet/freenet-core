@@ -1522,6 +1522,12 @@ impl QuicPathState {
         self.session.pacer.is_some()
     }
 
+    /// The pacer this session gives its paths, if any.
+    #[cfg(test)]
+    pub(in crate::transport) fn pacer(&self) -> Option<Arc<dyn SendPacer>> {
+        self.session.pacer.clone()
+    }
+
     /// An upgrade message arrived on the UDP session. Never waits: `recv` calls
     /// this. A message dropped on a full inbox costs what a lost datagram costs,
     /// and the machine's deadlines cover that.

@@ -68,7 +68,7 @@ fn each_outcome_takes_its_row() {
             (GiveUp, R::Dropped),
         ),
         (
-            BoundedSend::Failed(SendFailure::Paced { spent: 0 }),
+            BoundedSend::Failed(SendFailure::Paced),
             (SendOnUdp, R::FailedUdp),
             (GiveUp, R::Dropped),
         ),
@@ -406,7 +406,7 @@ fn pacer_refusals_never_count_and_a_dark_paced_path_still_closes() {
         let later = p.time().now_nanos() + QUIET;
         let refusals = [
             BoundedSend::Failed(SendFailure::NotOpened(NotOpened::Paced)),
-            BoundedSend::Failed(SendFailure::Paced { spent: 0 }),
+            BoundedSend::Failed(SendFailure::Paced),
         ];
         for refused in refusals
             .iter()

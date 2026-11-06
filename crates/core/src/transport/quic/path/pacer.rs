@@ -36,10 +36,18 @@
 //! message goes on UDP. After the stream opened it ends
 //! [`SendFailure::Paced`] and the stream is reset; a Stream or pipe is then
 //! dropped, and a Short goes on UDP. Once UDP has sent a message the pacer
-//! refused, what QUIC had not already paid for is charged to this bucket as
-//! debt ([`SendPacer::charge`]), so the next QUIC sends wait for it, up to
+//! refused, the whole message is charged to this bucket as debt
+//! ([`SendPacer::charge`]), so the next QUIC sends wait for it, up to
 //! [`FALLBACK_DEBT`] (half a second at the rate): a larger debt would fail the
-//! streams already open on the path. A UDP send that failed is charged nothing. Bytes taken for a write that
+//! streams already open on the path. A UDP send that failed is charged nothing.
+//!
+//! This does not hold the two transports to the limit together. The charge is
+//! booked when the UDP transfer ends, and it is capped, so for the whole
+//! transfer QUIC keeps sending at the pacer's rate beside UDP: the peer gets
+//! up to twice its share for that long (a 10 MB fallback at 100 kB/s runs
+//! about 100 s on the UDP bucket, then 50 kB is charged). That is the design-B
+//! residual, the same as for data that falls back for any other reason; only a
+//! budget shared by both transports would close it. Bytes taken for a write that
 //! is not made go back to the bucket.
 //!
 //! A refusal is never a timeout for the path's stall count (`route::StallCount`):
@@ -90,7 +98,8 @@ pub(in crate::transport) trait SendPacer: Send + Sync {
 /// charge does not make a stream already open fail; and QUIC sends again
 /// within half a second of an overload ending. Fallback bytes past the bound
 /// are not charged: while it binds QUIC stays held at it, and UDP runs at its
-/// own bucket.
+/// own bucket, so the peer can get up to twice its share meanwhile (module
+/// docs).
 pub(in crate::transport) const FALLBACK_DEBT: Duration = Duration::from_millis(500);
 
 /// The rate a pacer's bucket runs at for a limit of `rate`: `TokenBucket`
@@ -187,9 +196,9 @@ pub(super) struct PacedBytes {
 }
 
 impl PacedBytes {
-    /// The write was made: the bytes stay taken. Returns how many.
-    pub(super) fn spent(mut self) -> usize {
-        std::mem::take(&mut self.bytes)
+    /// The write was made: the bytes stay taken.
+    pub(super) fn spent(mut self) {
+        self.bytes = 0;
     }
 }
 

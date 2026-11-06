@@ -74,18 +74,6 @@ fn the_rate_follows_the_udp_rule() {
     assert_eq!(rate.rate(), Some(250_000), "four connections share it");
     manager.unregister_connection();
     assert_eq!(rate.rate(), Some(333_333));
-    // `total-bandwidth-limit = 0` is no cap, though the node still builds a
-    // manager for it with its per-connection minimum: no window cap from it,
-    // and a `bandwidth-limit` beside it still applies.
-    let no_total = Arc::new(GlobalBandwidthManager::new(0, Some(1_000)));
-    assert_eq!(
-        QuicRateLimit::new(None, Some(no_total.clone())).rate(),
-        None
-    );
-    assert_eq!(
-        QuicRateLimit::new(Some(80_000), Some(no_total)).rate(),
-        Some(80_000)
-    );
 }
 
 /// A live quinn-proto connection with `rate` as the sender's cap: the

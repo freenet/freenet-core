@@ -730,7 +730,7 @@ Rate calculation on every rate update (peer_connection::paced_rate; #6047):
   A configured limit only lowers the rate, never raises it above cc_rate.
   bandwidth_limit is the config after NetworkApiConfig::transport_bandwidth_limit
   (effective_bandwidth_limit, called once in p2p_protoc and pinned there by a
-  config.rs test): 0 = unset, ignored under any total-bandwidth-limit, and
+  config.rs test): 0 = unset, ignored under any non-zero total-bandwidth-limit (a total of 0 is unset), and
   raised to MIN_BANDWIDTH_LIMIT (2 x MIN_INBOUND_STREAM_RATE_BYTES_PER_SEC,
   64 KiB/s) if lower: near the receiver's age-limit rate, long streams fail.
   The bucket's INITIAL rate comes from peer_connection::initial_paced_rate at
@@ -781,23 +781,32 @@ Rate calculation on every rate update (peer_connection::paced_rate; #6047):
   nothing and ends the send NotOpened(Paced) before the stream opened
   (header and metadata are taken before open_uni) or Failed(Paced) after
   (the stream is reset). A message the pacer refused that UDP then sent is
-  charged to the pacer as debt (QuicPath::charge_fallback, after the UDP send
-  succeeds; a Short refused after open only for what QUIC had not paid), up
-  to FALLBACK_DEBT (half a second at the rate): an unbounded debt refused the
-  next fragment of every stream already open, and a refused open stream is
-  dropped. Each refusal counts quic_data_event_pacer_refused. A total of 0
-  is no cap, so QuicRateLimit::rate ignores the manager then (no pacer, no
-  window cap). Bytes taken for a write not made
-  go back. A refusal is never a timeout for the stall count (route.rs
+  charged to the pacer in full as debt (QuicPath::charge_fallback, after the
+  UDP send succeeds), up to FALLBACK_DEBT (half a second at the rate): an
+  unbounded debt refused the next fragment of every stream already open, and
+  a refused open stream is dropped. Each refusal counts
+  quic_data_event_pacer_refused. A total-bandwidth-limit of 0 is unset for
+  both transports (NetworkApiConfig::effective_total_bandwidth_limit: no
+  global pool, so no UDP share, no QUIC pacer, no window cap, and a
+  bandwidth-limit beside it applies to both). Bytes taken for a write not
+  made go back. A refusal is never a timeout for the stall count (route.rs
   timed_out); a pacer wait is NOT progress, so a dark paced path still goes
-  suspect and closes. Residual, accepted (lead, 2026-11-06): data that falls
-  back to UDP for any other reason (no stream credit, a deadline) is paced by
-  the UDP bucket only, so a peer whose data is on both transports at once
-  can get up to twice its share; the egress cap still bounds the node under
-  total-bandwidth-limit. Pinned by quic::path::tests::pacer,
+  suspect and closes. Residual, accepted (lead, 2026-11-06; the design-B
+  residual): a peer whose data is on both transports at once can get up to
+  twice its share, for as long as that lasts. That includes a message the
+  pacer refused: the charge is booked when its UDP transfer ends and is
+  capped at half a second, so for the whole transfer QUIC keeps sending at
+  the pacer's rate beside it (a 10 MB fallback at a 100 kB/s bandwidth-limit
+  runs about 100 s on the UDP bucket, then 50 kB is charged). Data that falls
+  back for any other reason (no stream credit, a deadline) is paced by the
+  UDP bucket only. Only a budget shared by both transports would close it;
+  the egress cap still bounds the node under total-bandwidth-limit. Pinned by quic::path::tests::pacer,
   pacer_refusals_never_count_and_a_dark_paced_path_still_closes,
+  a_paced_send_to_a_dark_peer_times_out_and_the_path_goes_suspect,
   messages_the_pacer_refuses_go_on_udp_and_are_charged_to_it,
   a_session_paces_its_data_only_under_a_limit,
+  a_sessions_pacer_runs_on_the_path_clock,
+  config::tests::a_total_of_zero_paces_neither_transport,
   a_data_route_is_paced_only_when_the_session_has_a_pacer and
   quic_data_is_paced_only_under_a_limit_and_at_that_limit.
   Under a saturated egress cap, the window cap apportions it only when the

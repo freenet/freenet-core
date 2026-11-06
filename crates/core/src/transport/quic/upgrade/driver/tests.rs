@@ -155,6 +155,11 @@ impl Harness {
     }
 
     /// How a connection joins this hub, with a driver of its own.
+    /// The virtual clock the hub's paths run on (`PathClock::Virtual`).
+    pub(in crate::transport) fn time(&self) -> VirtualTime {
+        self.pair.time.clone()
+    }
+
     pub(in crate::transport) fn site(&self) -> UpgradeSite {
         UpgradeSite::new(Some(&self.hub), self.remote)
     }

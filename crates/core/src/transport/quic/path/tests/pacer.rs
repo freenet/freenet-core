@@ -217,9 +217,8 @@ impl SendPacer for Scripted {
     }
 }
 
-/// A refusal after the stream opened ends the send `Failed(Paced)`, carrying
-/// what the writes made before it paid, and resets the stream, so the
-/// receiver drops what came.
+/// A refusal after the stream opened ends the send `Failed(Paced)` and resets
+/// the stream, so the receiver drops what came.
 /// Each reservation is limited to what the send's current deadline leaves: the
 /// first, before the stream opens, to the open deadline.
 #[test]
@@ -231,15 +230,9 @@ fn a_refusal_after_the_stream_opened_resets_it() {
         let pacer = Scripted::new(&p.time(), 3, Duration::ZERO);
         p.a.pace_with(pacer.clone());
         let (_, outcome) = time_a_stream(&p, 10 * FRAGMENT_PAYLOAD_SIZE).await;
-        // The outcome carries what the writes made before the refusal took:
-        // the header and two fragments.
-        let BoundedSend::Failed(SendFailure::Paced { spent }) = outcome else {
-            panic!("{outcome:?}");
-        };
-        assert_eq!(
-            spent,
-            pacer.asked.lock()[..3].iter().sum::<usize>() as u64,
-            "the header and two fragments were paid for"
+        assert!(
+            matches!(outcome, BoundedSend::Failed(SendFailure::Paced)),
+            "{outcome:?}"
         );
         assert_eq!(p.a.send_aborts(), 1, "the stream was reset");
         let limits = pacer.limits.lock().clone();
@@ -399,7 +392,7 @@ fn a_limit_pacer_burst_follows_the_share() {
 }
 
 /// Bytes charged for a message that went on UDP are debt: the next reservation
-/// waits them out at the limit, so QUIC and those UDP sends together keep to it.
+/// waits them out at the limit (up to `FALLBACK_DEBT` of them).
 #[test]
 fn a_charged_fallback_holds_the_next_send_to_the_limit() {
     let time = VirtualTime::new();
@@ -501,5 +494,82 @@ fn an_open_stream_survives_a_fallback_charge() {
         let (elapsed, outcome) = time_a_stream(&p, 5 * FRAGMENT_PAYLOAD_SIZE).await;
         assert!(matches!(outcome, BoundedSend::Sent), "{outcome:?}");
         assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+    });
+}
+
+/// A limit pacer that counts the reservations it made wait.
+struct CountsWaits {
+    inner: Arc<LimitPacer<VirtualTime>>,
+    waited: AtomicUsize,
+}
+
+impl SendPacer for CountsWaits {
+    fn reserve_within(&self, bytes: usize, limit: Duration) -> Result<Duration, Duration> {
+        let answer = self.inner.reserve_within(bytes, limit);
+        if matches!(answer, Ok(wait) if !wait.is_zero()) {
+            self.waited.fetch_add(1, Ordering::Relaxed);
+        }
+        answer
+    }
+
+    fn give_back(&self, bytes: usize) {
+        self.inner.give_back(bytes);
+    }
+
+    fn charge(&self, bytes: usize) -> usize {
+        self.inner.charge(bytes)
+    }
+
+    fn sleep(
+        &self,
+        wait: Duration,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        self.inner.sleep(wait)
+    }
+}
+
+/// A paced path whose peer goes dark: a real limit pacer holds the stream's
+/// writes, the writes then stall on the peer's flow control and the send ends
+/// `Failed(TimedOut)` at its gap, not `Paced`, since the pacer waited and
+/// refused nothing. The send ran past the stall window with nothing
+/// acknowledged, so its timeout makes the path suspect, as on an unpaced path:
+/// pacer waits are not progress.
+#[test]
+fn a_paced_send_to_a_dark_peer_times_out_and_the_path_goes_suspect() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let network = "quic-pacer-dark";
+        let p = paths(network, 127, QuicPathLimits::DEFAULT).await;
+        let pacer = Arc::new(CountsWaits {
+            inner: pacer_at(&p.time(), 400_000),
+            waited: AtomicUsize::new(0),
+        });
+        p.a.pace_with(pacer.clone());
+        let _dark = DropFrom::new(network, &[p.pair.b_addr]);
+        let (a, time) = (p.a.clone(), p.time());
+        let body = over_window();
+        let deadlines = SendDeadlines::stream(body.len() as u64);
+        let outcome = p
+            .drive(async move {
+                a.send_stream_bounded(&time, deadlines, StreamId::next(), None, body, None)
+                    .await
+            })
+            .await;
+        assert!(
+            matches!(outcome, BoundedSend::Failed(SendFailure::TimedOut)),
+            "{outcome:?}"
+        );
+        assert!(
+            pacer.waited.load(Ordering::Relaxed) > 0,
+            "the pacer held writes"
+        );
+        // The peer was dark from the start and the send ran past the stall
+        // window (the window's writes at 400 kB/s, then the 5 s gap).
+        let now = p.time().now_nanos();
+        p.a.settle(SendKind::Stream, &outcome, false, now);
+        assert!(
+            p.a.is_suspect(),
+            "nothing acknowledged for the window: the dark paced path is suspect"
+        );
     });
 }

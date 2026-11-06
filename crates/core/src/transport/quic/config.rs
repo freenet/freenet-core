@@ -340,12 +340,12 @@ impl QuicRateLimit {
         // `paced_rate` lowers a controller's rate to the cap; given no
         // controller rate (`usize::MAX`) it returns the cap itself, or
         // `usize::MAX` when there is none.
-        // A `total-bandwidth-limit` of 0 is no cap (the transport builds no
-        // egress cap for it), so its per-connection minimum is no rate either.
+        // The node builds no manager for a `total-bandwidth-limit` of 0
+        // (`NetworkApiConfig::global_bandwidth_manager`), for UDP and QUIC
+        // alike.
         let global = self
             .global
             .as_ref()
-            .filter(|global| global.total_limit() > 0)
             .map(|global| global.current_per_connection_rate());
         match crate::transport::peer_connection::paced_rate(
             usize::MAX,

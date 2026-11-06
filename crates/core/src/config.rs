@@ -2720,7 +2720,7 @@ pub struct NetworkApiConfig {
     /// rate: 1.25 MB/s (`fixed_rate::DEFAULT_RATE_BYTES_PER_SEC`) for the default
     /// `fixedrate` controller, which does not adapt to queuing delay or other traffic.
     ///
-    /// If `total_bandwidth_limit` is set, this field is ignored and per-connection rates
+    /// If `total_bandwidth_limit` is set and not 0, this field is ignored and per-connection rates
     /// are derived from: `total_bandwidth_limit / active_connections`.
     #[serde(alias = "bandwidth-limit", skip_serializing_if = "Option::is_none")]
     pub bandwidth_limit: Option<usize>,
@@ -2906,17 +2906,41 @@ pub struct NetworkApiConfig {
 }
 
 impl NetworkApiConfig {
+    /// The `total-bandwidth-limit` the node applies: the configured value, with
+    /// 0 read as unset. A total of 0 is no cap, so it builds no egress cap, no
+    /// global pool and no per-connection share, for UDP and QUIC alike, and a
+    /// `bandwidth-limit` beside it applies.
+    pub(crate) fn effective_total_bandwidth_limit(&self) -> Option<usize> {
+        self.total_bandwidth_limit.filter(|total| *total > 0)
+    }
+
+    /// The node's global bandwidth pool, when `total-bandwidth-limit` is set
+    /// ([`Self::effective_total_bandwidth_limit`]). Its per-connection share
+    /// paces UDP (`peer_connection::paced_rate`) and QUIC
+    /// (`quic::config::QuicRateLimit`) alike.
+    pub(crate) fn global_bandwidth_manager(
+        &self,
+    ) -> Option<std::sync::Arc<crate::transport::global_bandwidth::GlobalBandwidthManager>> {
+        self.effective_total_bandwidth_limit().map(|total| {
+            std::sync::Arc::new(
+                crate::transport::global_bandwidth::GlobalBandwidthManager::new(
+                    total,
+                    self.min_bandwidth_per_connection,
+                ),
+            )
+        })
+    }
+
     /// The per-connection `bandwidth-limit` the node hands its transport
     /// (#6047): the configured value after
     /// [`effective_bandwidth_limit`](crate::transport::peer_connection::effective_bandwidth_limit),
-    /// which ignores it whenever `total-bandwidth-limit` is set. That includes
-    /// a total of 0: a global pool is built for any configured total, and its
-    /// share overrides the per-connection limit anyway. Logs what it decided,
-    /// so call it once per node.
+    /// which ignores it whenever `total-bandwidth-limit` is set
+    /// ([`Self::effective_total_bandwidth_limit`]: a total of 0 is unset, so
+    /// the limit then applies). Logs what it decided, so call it once per node.
     pub(crate) fn transport_bandwidth_limit(&self) -> Option<usize> {
         crate::transport::peer_connection::effective_bandwidth_limit(
             self.bandwidth_limit,
-            self.total_bandwidth_limit.is_some(),
+            self.effective_total_bandwidth_limit().is_some(),
         )
     }
 
@@ -9823,9 +9847,9 @@ shutdown-drain-secs = 42
     }
 
     /// `transport_bandwidth_limit` is what a node hands its transport (#6047):
-    /// ignored under any `total-bandwidth-limit` (including 0, which still
-    /// builds a global pool), 0 means unset, and a value below the floor is
-    /// raised to it.
+    /// ignored under a non-zero `total-bandwidth-limit` (a total of 0 is unset
+    /// and builds no global pool), 0 means unset, and a value below the floor
+    /// is raised to it.
     #[tokio::test]
     async fn transport_bandwidth_limit_sanitizes_the_configured_limit() {
         use crate::transport::peer_connection::MIN_BANDWIDTH_LIMIT;
@@ -9844,7 +9868,8 @@ shutdown-drain-secs = 42
             (Some(0), None, None),
             (Some(1_000), None, Some(MIN_BANDWIDTH_LIMIT)),
             (Some(500_000), Some(10_000_000), None),
-            (Some(500_000), Some(0), None),
+            // A total of 0 is unset, so the per-connection limit applies.
+            (Some(500_000), Some(0), Some(500_000)),
         ];
         for (bandwidth_limit, total_bandwidth_limit, expected) in cases {
             api.bandwidth_limit = bandwidth_limit;
@@ -9855,6 +9880,73 @@ shutdown-drain-secs = 42
                 "bandwidth_limit {bandwidth_limit:?}, total {total_bandwidth_limit:?}"
             );
         }
+    }
+
+    /// `total-bandwidth-limit = 0` is no cap, on the path the node builds its
+    /// transport from: no global pool, so UDP paces at the controller's rate
+    /// and QUIC gets no pacer and no window cap, and a `bandwidth-limit` beside
+    /// it paces both transports alike. A non-zero total paces both at the
+    /// connection's share. Both transports read the same two values
+    /// (`global_bandwidth_manager`, `transport_bandwidth_limit`), so they
+    /// cannot differ.
+    #[tokio::test]
+    async fn a_total_of_zero_paces_neither_transport() {
+        use crate::transport::peer_connection::paced_rate;
+        use crate::transport::quic::config::QuicRateLimit;
+        const CC: usize = 1_250_000;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut api = clap_bare_args(temp_dir.path())
+            .build()
+            .await
+            .unwrap()
+            .network_api;
+        // (bandwidth-limit, total, a pool, the rate both transports pace at)
+        let cases = [
+            (None, Some(0), false, None),
+            (Some(500_000), Some(0), false, Some(500_000)),
+            (None, Some(800_000), true, Some(800_000)),
+            (Some(500_000), Some(800_000), true, Some(800_000)),
+        ];
+        for (bandwidth_limit, total, pool, expected) in cases {
+            api.bandwidth_limit = bandwidth_limit;
+            api.total_bandwidth_limit = total;
+            api.min_bandwidth_per_connection = Some(1_000);
+            let manager = api.global_bandwidth_manager();
+            let limit = api.transport_bandwidth_limit();
+            let udp = paced_rate(
+                CC,
+                manager.as_ref().map(|m| m.current_per_connection_rate()),
+                limit,
+            );
+            let quic = QuicRateLimit::new(limit, manager.clone()).rate();
+            let case = format!("bandwidth-limit {bandwidth_limit:?}, total {total:?}");
+            assert_eq!(manager.is_some(), pool, "{case}");
+            assert_eq!(udp, expected.unwrap_or(CC), "UDP: {case}");
+            assert_eq!(quic, expected.map(|rate| rate as u64), "QUIC: {case}");
+        }
+    }
+
+    /// The node builds its global pool from `global_bandwidth_manager`, which
+    /// reads a total of 0 as unset. A cross-file scrape of the field in
+    /// `P2pConnManager::build`, as the `bandwidth_limit` pin below.
+    #[test]
+    fn p2p_conn_manager_builds_the_pool_from_the_effective_total() {
+        let source = include_str!("node/network_bridge/p2p_protoc.rs");
+        let at = source
+            .find("Ok(P2pConnManager {")
+            .expect("P2pConnManager::build constructs the manager");
+        let literal = &source[at..];
+        let literal = &literal[..literal.find("\n        })").expect("end of the literal")];
+        let field = literal
+            .split("global_bandwidth: config")
+            .nth(1)
+            .expect("the manager's global_bandwidth field");
+        let compact: String = field.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            compact.starts_with(".config.network_api.global_bandwidth_manager()"),
+            "the pool must come from global_bandwidth_manager: {}",
+            &compact[..compact.len().min(80)]
+        );
     }
 
     /// The node hands its transport the sanitised limit, not the raw config
