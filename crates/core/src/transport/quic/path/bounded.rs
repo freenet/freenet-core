@@ -317,8 +317,10 @@ pub(crate) struct ConnectionProgress {
 /// and go between two settles. So the proof also says whether any reading
 /// during the send (its first, or a wake) saw a live hold, and the stall count
 /// uses only a proof whose send saw none. That is enough: a hold that starts
-/// during the send moves `holds`, and one live at any time after `since` that
-/// started before it was live at `since`, which is a reading of the send.
+/// during the send either moves `holds` past the proof's last reading, so the
+/// proof stops matching, or was read live by a wake, which set the flag; and
+/// one live at any time after `since` that started before it was live at
+/// `since`, which is a reading of the send.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct QuietProof {
     pub(crate) acked: u64,

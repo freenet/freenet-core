@@ -172,6 +172,10 @@ impl CapHolds {
     /// The hold events so far, whether a poller is held now, and how long a
     /// hold stays valid with no new event.
     pub(crate) fn read(&self) -> CapHoldReading {
+        // `holds` is read Relaxed before `held_now`, so on a weak memory model
+        // a reader on another thread can see a slightly stale `holds`. It only
+        // ever grows, so a stale value reads as "no new hold yet", which the
+        // next reading corrects.
         let holds = self.holds.load(Ordering::Relaxed);
         CapHoldReading {
             holds,

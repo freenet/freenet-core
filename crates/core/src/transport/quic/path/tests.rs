@@ -3770,6 +3770,62 @@ fn a_quiet_proof_says_whether_its_send_saw_a_live_hold() {
     })
 }
 
+/// A hold that starts during the send and is read live by a wake sets the
+/// proof's `live_hold_seen`, even though the proof's hold count then matches
+/// (the wake read the new count) and the hold is released before the settle.
+/// Starts at 3 s, the 5 s wake reads it, released at 6 s, timeout at 15 s.
+#[test]
+fn a_hold_read_live_by_a_wake_voids_the_proof() {
+    bounded(|| async move {
+        let time = VirtualTime::new();
+        let clock = time.clone();
+        let (sent, after, proof) = drive(&time, LIMIT, async move {
+            let cap = Arc::new(super::super::socket::CapHolds::new(None));
+            let quiet: Arc<parking_lot::Mutex<Option<bounded::QuietProof>>> = Arc::default();
+            let connection = bounded::ConnectionProgress {
+                acks: recycle::AckProgress::detached(),
+                cap_holds: cap.clone(),
+                quiet: quiet.clone(),
+            };
+            let deadlines = SendDeadlines {
+                open: Duration::from_secs(2),
+                gap: Some(Duration::from_secs(5)),
+                total: Duration::from_secs(120),
+            };
+            let start = clock.now();
+            let holding = clock.clone();
+            let hold = async move {
+                holding.sleep(Duration::from_secs(3)).await;
+                cap.hold_one();
+                holding.sleep(Duration::from_secs(3)).await;
+                cap.release_one();
+                std::future::pending::<()>().await
+            };
+            let send = bounded_send(&clock, deadlines, Some(connection), |progress| async move {
+                progress.mark_opened();
+                never().await
+            });
+            let sent = tokio::select! {
+                sent = send => sent,
+                () = hold => unreachable!("the hold never ends"),
+            };
+            let proof = quiet
+                .lock()
+                .take()
+                .expect("a timed-out send leaves a proof");
+            (sent, clock.now() - start, proof)
+        })
+        .await;
+        assert!(
+            matches!(sent, BoundedSend::Failed(SendFailure::TimedOut)),
+            "{sent:?}"
+        );
+        assert_eq!(after, Duration::from_secs(15), "the 5 s wake saw the hold");
+        assert_eq!((proof.holds, proof.since), (1, 5_000_000_000));
+        assert!(proof.live_hold_seen, "the 5 s wake read the hold live");
+    })
+}
+
 /// A wait for the source wakes the timer loop only when the connection's
 /// window has pushed the timer past the send's own gap: a send that reads
 /// its source many times with no window arms its timer only a few times, not
