@@ -5116,11 +5116,20 @@ mod tests {
             json.get("quic_ended_loss_rate_zero").is_none(),
             "a count of 0 is not"
         );
+        assert!(json.get("quic_ended_paths_below_floor").is_none());
         assert!(
             metrics.take_snapshot().is_none(),
             "the sums were reset, and the bucket alone is not activity"
         );
         assert_eq!(metrics.read_snapshot().quic_data.loss_rate[2], 1, "a gauge");
+        // A path that ends below the floor reaches the JSON by its own key.
+        drop(PathLossWindow::new(&metrics.quic_data));
+        let json = metrics
+            .take_snapshot()
+            .expect("an ended path is activity")
+            .upload_json()
+            .unwrap();
+        assert_eq!(json["quic_ended_paths_below_floor"], 1);
     }
 
     /// A breaker trip reaches the snapshot and its JSON, counts as activity

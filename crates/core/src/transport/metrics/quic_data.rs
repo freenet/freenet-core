@@ -24,6 +24,7 @@
 //! | `quic_loss_rate_<bucket>` | live paths that have sent at least 200 packets since they started, by their own lost/sent over that time (a gauge, not reset, every bucket sent every period, 0 included): `zero`, `lt_0_5pct`, `lt_1pct`, `lt_2pct`, `lt_5pct`, `lt_10pct`, `lt_20pct`, `ge_20pct` |
 //! | `quic_ended_loss_rate_<bucket>` | paths that ended in the period, by the bucket they were in at the end (same buckets) |
 //! | `quic_ended_paths_below_floor` | paths that ended in the period before sending 200 packets, so in no bucket |
+//! | `quic_streams_sampled_paths`, `quic_streams_open_ge_<n>`, `quic_streams_peak_max` | per path and period, the peak of inbound streams read at once: the paths sampled, those whose peak reached each level, and the highest peak |
 //!
 //! What the loss rate is: quinn's lost over sent (quinn-proto 0.11.19). `sent`
 //! counts every packet quinn built, acknowledgement-only ones included. `lost`
@@ -34,9 +35,11 @@
 //! sends any. Packets still in flight when a connection closes are dropped
 //! by quinn, not declared lost, so a path's final bucket can understate its
 //! loss at the moment it ended. It is quinn's view of loss, not a measurement
-//! of the link. A shadow path's packets are mostly keepalives and acknowledgements, so its rate is of
-//! small packets and may not hold for data-sized ones.
-//! | `quic_streams_sampled_paths`, `quic_streams_open_ge_<n>`, `quic_streams_peak_max` | per path and period, the peak of inbound streams read at once: the paths sampled, those whose peak reached each level, and the highest peak |
+//! of the link. A shadow path's packets are mostly keepalives and
+//! acknowledgements, so its rate is of small packets and may not hold for
+//! data-sized ones. After a contained panic in a path's acknowledgement
+//! watch the path stops ticking, so its counts from then on arrive in one
+//! report when it ends.
 //!
 //! The waits are the step-3 stream-limit bars: `quic_open_uni_waited` over
 //! `quic_sends` and `quic_stream_permit_waited` over `quic_streamed_sends` below 0.5%, and
@@ -1031,6 +1034,15 @@ mod tests {
         }
         assert_eq!(uploaded.get("quic_ended_loss_rate_ge_20pct"), Some(&1));
         assert!(!uploaded.contains_key("quic_ended_loss_rate_zero"));
+        assert!(
+            !uploaded.contains_key("quic_ended_paths_below_floor"),
+            "a count of 0 is not uploaded"
+        );
+        // A path that ends below the floor is uploaded under its key.
+        drop(PathLossWindow::new(counters));
+        let uploaded: std::collections::HashMap<String, u64> =
+            counters.snapshot(true).upload_keys().collect();
+        assert_eq!(uploaded.get("quic_ended_paths_below_floor"), Some(&1));
     }
 
     /// The snapshot round-trips through bincode, as the event log stores it.

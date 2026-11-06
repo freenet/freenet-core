@@ -834,15 +834,6 @@ pub(crate) async fn watch_acknowledgements<T: TimeSource>(
 #[cfg(test)]
 mod cap_tests;
 
-/// A path's byte and loss counts, reported node-wide by their change at each
-/// tick of the watch, and once more when the report is dropped. It is owned
-/// by the path's receive supervisor and lent to the watch, so it is dropped
-/// when the path's task ends (the connection closed and the receive task
-/// returned, or the task was aborted with the path), and the counts up to
-/// then, often the losses that ended the path, are still reported. Then the
-/// window is dropped, which counts the path among the ended ones. A panic in
-/// the watch, which the supervisor contains while the path stays up, does
-/// not drop it: the path stays in its live bucket until it really ends.
 /// What a path's receive supervisor keeps for its acknowledgement watch.
 pub(crate) struct AckWatchParts {
     pub(crate) cap_holds: Arc<CapHolds>,
@@ -856,6 +847,17 @@ pub(crate) struct AckWatchParts {
 pub(crate) static TEST_WATCH_PANICS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// A path's byte and loss counts, reported node-wide by their change at each
+/// tick of the watch, and once more when the report is dropped. It is owned
+/// by the path's receive supervisor and lent to the watch, so it is dropped
+/// when the path's task ends (the connection closed and the receive task
+/// returned, or the task was aborted with the path), and the counts up to
+/// then, often the losses that ended the path, are still reported. Then the
+/// window is dropped, which counts the path among the ended ones. A panic in
+/// the watch, which the supervisor contains while the path stays up, does
+/// not drop it: the path stays in its live bucket until it really ends.
+/// After a contained watch panic nothing ticks it any more, so the path's
+/// bytes and packets from then on arrive as one report when the path ends.
 pub(crate) struct PathReport {
     connection: quinn::Connection,
     node: &'static crate::transport::metrics::QuicDataCounters,
@@ -913,7 +915,7 @@ impl Drop for PathReport {
 }
 /// A path's UDP payload bytes as quinn counts them, reported node-wide by their
 /// change at each tick of the watch (`quic_bytes_sent`, `quic_bytes_received`)
-/// and when the watch ends ([`PathReport`]).
+/// and when the path's task ends ([`PathReport`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct UdpBytes {
     sent: u64,
