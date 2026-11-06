@@ -2418,7 +2418,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                                             ResendKind::Probe => super::TRANSPORT_METRICS
                                                 .record_egress_probe_skipped(),
                                         }
-                                        Err(wait)
+                                        Err(wait.max(super::egress_cap::retx_defer_min()))
                                     }
                                 }
                             });

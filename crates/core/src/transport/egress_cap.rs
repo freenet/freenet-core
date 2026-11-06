@@ -167,6 +167,25 @@ pub(crate) const DEBT_LIMIT: Duration = Duration::from_secs(1);
 /// run at whatever rate its timers produce.
 pub(crate) const RETX_DEBT_LIMIT: Duration = Duration::from_millis(100);
 
+/// The shortest a retransmit the cap refused is deferred for, however small
+/// the deficit: without it a connection whose resend is refused by a
+/// datagram's worth wakes its resend arm about once per datagram time while
+/// the cap stays full.
+pub(crate) const RETX_DEFER_MIN: Duration = Duration::from_millis(10);
+
+/// [`RETX_DEFER_MIN`], or in tests `FREENET_RETX_DEFER_MIN_US` when set, so a
+/// storm run can sweep it without a rebuild.
+pub(crate) fn retx_defer_min() -> Duration {
+    #[cfg(test)]
+    if let Some(us) = std::env::var("FREENET_RETX_DEFER_MIN_US")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        return Duration::from_micros(us);
+    }
+    RETX_DEFER_MIN
+}
+
 /// A gap between one stream's fragments at least this long is counted and
 /// logged: half the receiver's stream inactivity timeout, so it is reported
 /// before the receiver would give the stream up.
