@@ -88,7 +88,10 @@
 //! second, without the geometric tail of the earlier race. The order does
 //! not depend on which waiter polls first: [`EgressCap::poll_admit`] admits
 //! a waiter only when the bucket also holds a datagram for every waiter
-//! queued ahead of it. Timers decide only when a waiter looks, so a late
+//! queued ahead of it and every admission whose take has not happened yet,
+//! and every take leaves the datagrams owed to the other admissions, so on
+//! a multi-thread runtime a sender cannot use another's turn between its
+//! admission and its take. Timers decide only when a waiter looks, so a late
 //! timer (tokio's are 1 ms) delays that waiter, never reorders. Two limits:
 //! the queue counts at most [`MAX_ADMISSION_WAKERS`] ahead, and a stream the
 //! queue admitted keeps its turn for [`ADMISSION_PASS`] while it re-checks
@@ -947,8 +950,10 @@ impl EgressCap {
     /// than one that can sleep and retry (a QUIC endpoint's
     /// `UdpPoller::poll_writable`, #5940). `Ready` when the bucket holds
     /// `bytes` plus one [`WAKE_DATAGRAM_BYTES`] for every waiter queued ahead
-    /// of `waiter` (so [`Self::try_take`] of `bytes` would succeed at the same
-    /// instant, and no waiter ahead loses its turn); otherwise `Pending`,
+    /// of `waiter` and every admission whose take has not happened yet (so
+    /// the take of `bytes` that follows would succeed at the same instant,
+    /// and no waiter ahead loses its turn), and then records the admission
+    /// (see `QueuedWaiters::admitted`); otherwise `Pending`,
     /// with `waiter` holding a timer on the cap's time source that wakes `cx`
     /// when the rate has made up the deficit. Takes
     /// nothing: the sender then takes or is charged as it sends, and another

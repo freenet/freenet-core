@@ -130,7 +130,24 @@ tie (one stream in three sent nothing in 2 s at 1524 streams). After
 Admission::Waited the stream re-checks cwnd and calls again; that call
 takes its turn without queueing within ADMISSION_PASS (1 ms). Without the
 pass it re-queued at the back on every turn and never sent. A stream held
-by cwnd past the pass queues again. The queue holds a waker
+by cwnd past the pass queues again. An admission stays on the queue
+(QueuedWaiters::admitted) until its take or for ADMISSION_PASS, whichever
+comes first: it counts ahead of every waiter that polls, and every take
+leaves one datagram per outstanding admission but its own, so on a
+multi-thread runtime nobody can use a datagram admitted to another sender
+between its Ready and its take. Admission times are read under the queue
+lock. A stream's admission is NAMED (AdmissionWaiter::named, taken with
+try_take_admitted through StreamPacing::take): its take finds its own
+admission or, once that lapsed, takes as a newcomer that leaves the
+datagrams owed to the rest. Without names, a stream descheduled past the
+pass took the datagram of a newer admission and cleared that admission as
+its own (2 to 37 of 3200 takes lost in
+an_admitted_take_is_not_lost_to_another_thread). The QUIC socket's take
+cannot name its poller (quinn calls try_send on the shared socket), so a
+QUIC take uses the oldest unnamed admission. Residual: a QUIC transmit
+delayed past the pass between poll_writable and try_send (no await there,
+so only by preemption) can use another QUIC poller's admission; that
+poller then queues again. The queue holds a waker
 and a place, never bytes. So connections share the cap by their number of
 waiting senders (no isolation between connections). The wait races the
 stream's deadline (cut at LONG_WAIT and at PACED_WAIT_DEADLINE, check()
@@ -142,8 +159,10 @@ sent once in 2 s). A waiter's place is counted under the queue lock up to
 MAX_ADMISSION_WAKERS + 1 (so at most 1025 steps per poll, however long the
 queue), and its timer's stagger is clamped to MAX_ADMISSION_WAKERS so
 quic::socket::cap_hold_validity still bounds a QUIC transmit's next poll; a
-waiter further back wakes early, finds the level short of what it owes,
-and waits again. The kept connection
+waiter further back wakes early and waits again: it is never admitted while
+more than MAX_ADMISSION_WAKERS are ahead of it, whatever the level (the
+clamp is for the timer only, pinned by
+a_waiter_past_the_count_bound_is_not_admitted_by_a_large_burst). The kept connection
 payment can be stale after a cwnd or cap wait (the bucket refills under
 it): a connection may then exceed its bucket by one datagram per waiting
 stream. That moves capacity between connections only; the node cap is
@@ -219,7 +238,7 @@ bucket then holds, and none if it holds less, so legacy give-backs cost N
 waiting QUIC connections nothing until a datagram fits; wakers are woken
 after the lock is released, oldest holder first; the woken keep their
 places. An admission wakes the oldest waiter still holding a waker (the
-next in line, AdmissionQueue::forget), one wake per admission: a waiter's
+next in line, AdmissionQueue::try_admit), one wake per admission: a waiter's
 timer is set from its place when it last polled, and waiters that left
 ahead of it since (streams failing at their deadline) make it late. Without
 that wake, 300 streams on a 64 KiB/s cap, failing at their deadline and

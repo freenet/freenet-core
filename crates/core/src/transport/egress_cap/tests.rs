@@ -1529,3 +1529,114 @@ fn an_admitted_take_is_not_lost_to_another_thread() {
          for the test to say anything"
     );
 }
+
+/// A waiter with more than `MAX_ADMISSION_WAKERS` queued ahead of it is not
+/// admitted however full the bucket is: the clamp on its stagger is for its
+/// timer only. Before, the clamp also applied to what it owed, so in a burst
+/// of more than 1025 datagrams it needed only 1025 and was admitted ahead of
+/// waiters queued before it. The waiter exactly at the bound is admitted.
+#[test]
+fn a_waiter_past_the_count_bound_is_not_admitted_by_a_large_burst() {
+    // 60 MB/s: a 25 ms burst of 1.5 MB, 1250 datagrams.
+    let (cap, time) = cap_at(60_000_000);
+    let burst_datagrams = cap.burst_bytes() as usize / PACKET;
+    assert!(burst_datagrams > MAX_ADMISSION_WAKERS + 1);
+    cap.charge_unpaced(cap.burst_bytes() as usize);
+    let (waker, _counter) = counting_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut waiters: Vec<_> = (0..MAX_ADMISSION_WAKERS + 2)
+        .map(|_| {
+            let mut waiter = AdmissionWaiter::default();
+            assert!(cap.poll_admit(PACKET, &mut waiter, &mut cx).is_pending());
+            waiter
+        })
+        .collect();
+    // Refill the whole burst.
+    time.advance(Duration::from_millis(30));
+    assert_eq!(cap.level_bytes(), cap.burst_bytes() as i64);
+    let (at_bound, past_bound) = waiters.split_at_mut(MAX_ADMISSION_WAKERS + 1);
+    assert!(
+        cap.poll_admit(PACKET, &mut past_bound[0], &mut cx)
+            .is_pending(),
+        "{} waiters ahead, {burst_datagrams} datagrams in the bucket: not its turn",
+        MAX_ADMISSION_WAKERS + 1
+    );
+    assert!(
+        cap.poll_admit(PACKET, &mut at_bound[MAX_ADMISSION_WAKERS], &mut cx)
+            .is_ready(),
+        "{MAX_ADMISSION_WAKERS} ahead and the bucket holds a datagram for each and its own"
+    );
+}
+
+/// A take with no admission of its own (a QUIC endpoint's `respond` send, or
+/// a stream whose admission lapsed) leaves the datagram owed to an admission
+/// whose take has not happened yet, and that admission's own take still
+/// succeeds.
+#[test]
+fn a_take_without_an_admission_leaves_the_admitted_datagram() {
+    let (cap, _time) = cap_at(RATE);
+    // One datagram and a bit in the bucket.
+    cap.charge_unpaced(BURST as usize - PACKET - 100);
+    let (waker, _counter) = counting_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut waiter = AdmissionWaiter::named();
+    assert!(cap.poll_admit(PACKET, &mut waiter, &mut cx).is_ready());
+    assert!(
+        cap.try_take(PACKET, Duration::ZERO).is_err(),
+        "an anonymous take with no unnamed admission must leave the datagram"
+    );
+    let mut stranger = AdmissionWaiter::named();
+    assert!(
+        cap.try_take_admitted(PACKET, Duration::ZERO, &mut stranger)
+            .is_err(),
+        "a named waiter without an admission must leave it too"
+    );
+    cap.try_take_admitted(PACKET, Duration::ZERO, &mut waiter)
+        .expect("the admitted waiter takes its datagram")
+        .sent(PACKET);
+    assert_eq!(cap.admission.outstanding(), 0);
+}
+
+/// An unnamed admission (the QUIC poller's) is used by the anonymous take
+/// that follows it, and a named one is used only by its own waiter.
+#[test]
+fn an_anonymous_take_uses_the_unnamed_admission_only() {
+    let (cap, _time) = cap_at(RATE);
+    cap.charge_unpaced(BURST as usize - 2 * PACKET - 100);
+    let (waker, _counter) = counting_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut stream = AdmissionWaiter::named();
+    let mut quic = AdmissionWaiter::default();
+    assert!(cap.poll_admit(PACKET, &mut stream, &mut cx).is_ready());
+    assert!(cap.poll_admit(PACKET, &mut quic, &mut cx).is_ready());
+    assert_eq!(cap.admission.outstanding(), 2);
+    cap.try_take(PACKET, Duration::ZERO)
+        .expect("the QUIC take uses the unnamed admission")
+        .sent(PACKET);
+    assert!(
+        cap.try_take(PACKET, Duration::ZERO).is_err(),
+        "a second anonymous take finds no unnamed admission and must leave the stream's"
+    );
+    cap.try_take_admitted(PACKET, Duration::ZERO, &mut stream)
+        .expect("the stream takes its own")
+        .sent(PACKET);
+    assert_eq!(cap.admission.outstanding(), 0);
+}
+
+/// Dropping a named waiter between its admission and its take withdraws the
+/// admission, so it does not hold a datagram until it lapses.
+#[test]
+fn dropping_an_admitted_waiter_withdraws_its_admission() {
+    let (cap, _time) = cap_at(RATE);
+    cap.charge_unpaced(BURST as usize - PACKET - 100);
+    let (waker, _counter) = counting_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut waiter = AdmissionWaiter::named();
+    assert!(cap.poll_admit(PACKET, &mut waiter, &mut cx).is_ready());
+    assert_eq!(cap.admission.outstanding(), 1);
+    drop(waiter);
+    assert_eq!(cap.admission.outstanding(), 0);
+    cap.try_take(PACKET, Duration::ZERO)
+        .expect("the datagram is free again")
+        .sent(PACKET);
+}
