@@ -452,6 +452,7 @@ fn a_quiet_proof_dates_progress_only_while_its_counts_match() {
         acked: 9,
         holds: 3,
         since: SECOND,
+        live_hold_seen: false,
     };
     let now = SECOND + QUIET;
     let timeout = &timeouts()[2];
@@ -488,4 +489,40 @@ fn a_quiet_proof_dates_progress_only_while_its_counts_match() {
     assert!(!verdict.quiet_timeout, "dated at the earlier settle");
     let verdict = count.take(timeout, false, Some(9), free, Some(proof), now);
     assert!(verdict.quiet_timeout, "dated back to the proof's since");
+
+    // A send that saw a live hold proves nothing: a live hold is progress the
+    // counts do not show, and it may have been live after `since`.
+    let mut count = StallCount::new(Some(5), 0);
+    let _ = count.take(&BoundedSend::Sent, false, Some(9), free, None, early);
+    let saw_hold = QuietProof {
+        live_hold_seen: true,
+        ..proof
+    };
+    let verdict = count.take(timeout, false, Some(9), free, Some(saw_hold), now);
+    assert!(!verdict.quiet_timeout, "the proof's send saw a live hold");
+
+    // A hold still reported now, past its validity so not progress by itself,
+    // keeps the proof from applying.
+    let briefly = CapHoldReading {
+        held_now: true,
+        validity: SECOND_DURATION,
+        ..free
+    };
+    let mut count = StallCount::new(Some(5), 0);
+    let _ = count.take(&BoundedSend::Sent, false, Some(9), briefly, None, early);
+    let verdict = count.take(timeout, false, Some(9), briefly, Some(proof), now);
+    assert!(!verdict.quiet_timeout, "a hold is reported at the settle");
+
+    // The proof only ever moves the last progress earlier: an earlier settle
+    // that dated it before `since` keeps that date.
+    let mut count = StallCount::new(Some(5), 0);
+    let _ = count.take(&BoundedSend::Sent, false, Some(9), free, None, SECOND);
+    let later = QuietProof {
+        since: SECOND * 5,
+        ..proof
+    };
+    let verdict = count.take(timeout, false, Some(9), free, Some(later), SECOND * 12);
+    assert!(verdict.quiet_timeout, "kept at 1 s, not moved to 5 s");
 }
+
+const SECOND_DURATION: Duration = Duration::from_secs(1);

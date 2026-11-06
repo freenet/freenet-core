@@ -188,7 +188,15 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// Pollers built outside [`with_poller_holds`]; tests assert it stays 0.
+/// The record [`with_poller_holds`] has set on this thread now. Tests only.
+#[cfg(test)]
+pub(crate) fn next_poller_holds() -> Option<Arc<CapHolds>> {
+    NEXT_POLLER_HOLDS.with(|next| next.borrow().clone())
+}
+
+/// Pollers built outside [`with_poller_holds`]; tests assert it stays 0. It
+/// is process-wide, so every poller a test builds must go through
+/// `with_poller_holds`, or another test's assertion fails.
 #[cfg(test)]
 pub(crate) static FALLBACK_POLLERS: AtomicU64 = AtomicU64::new(0);
 
@@ -202,15 +210,17 @@ pub(crate) static FALLBACK_POLLERS: AtomicU64 = AtomicU64::new(0);
 /// before bumping quinn; a poller built with no record set logs a warning
 /// and is counted for the tests (`FALLBACK_POLLERS`).
 pub(crate) fn with_poller_holds<R>(holds: &Arc<CapHolds>, f: impl FnOnce() -> R) -> R {
-    /// Clears the slot however `f` ends, a panic included.
-    struct Clear;
-    impl Drop for Clear {
+    /// Puts back what the slot held before, however `f` ends, a panic
+    /// included, so a nested call does not lose the outer one's record.
+    struct Restore(Option<Arc<CapHolds>>);
+    impl Drop for Restore {
         fn drop(&mut self) {
-            NEXT_POLLER_HOLDS.with(|next| next.borrow_mut().take());
+            let previous = self.0.take();
+            NEXT_POLLER_HOLDS.with(|next| *next.borrow_mut() = previous);
         }
     }
-    NEXT_POLLER_HOLDS.with(|next| *next.borrow_mut() = Some(holds.clone()));
-    let _clear = Clear;
+    let previous = NEXT_POLLER_HOLDS.with(|next| next.borrow_mut().replace(holds.clone()));
+    let _restore = Restore(previous);
     f()
 }
 

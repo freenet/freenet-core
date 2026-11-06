@@ -279,6 +279,7 @@ impl StallCount {
         // it and dated it when it did. Both values are no earlier than the real
         // last move, so the smaller one still is.
         if let Some(proof) = quiet
+            && !proof.live_hold_seen
             && acked == Some(proof.acked)
             && cap.holds == proof.holds
             && !cap.held_now

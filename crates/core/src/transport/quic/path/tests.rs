@@ -3716,6 +3716,60 @@ fn progress_from_before_the_send_does_not_extend_its_gap() {
     })
 }
 
+/// A send's quiet proof says whether any of its readings saw a cap hold live
+/// ([`bounded::QuietProof::live_hold_seen`]): a hold live when the send starts
+/// sets it, and a send that saw none leaves it clear.
+#[test]
+fn a_quiet_proof_says_whether_its_send_saw_a_live_hold() {
+    bounded(|| async move {
+        let time = VirtualTime::new();
+        let clock = time.clone();
+        let proofs = drive(&time, LIMIT, async move {
+            let cap = Arc::new(super::super::socket::CapHolds::new(None));
+            let quiet: Arc<parking_lot::Mutex<Option<bounded::QuietProof>>> = Arc::default();
+            let deadlines = SendDeadlines {
+                open: Duration::from_secs(2),
+                gap: Some(Duration::from_secs(5)),
+                total: Duration::from_secs(120),
+            };
+            let mut proofs = Vec::new();
+            for live in [true, false] {
+                if live {
+                    cap.hold_one();
+                }
+                let connection = bounded::ConnectionProgress {
+                    acks: recycle::AckProgress::detached(),
+                    cap_holds: cap.clone(),
+                    quiet: quiet.clone(),
+                };
+                let sent =
+                    bounded_send(&clock, deadlines, Some(connection), |progress| async move {
+                        progress.mark_opened();
+                        never().await
+                    })
+                    .await;
+                assert!(
+                    matches!(sent, BoundedSend::Failed(SendFailure::TimedOut)),
+                    "{sent:?}"
+                );
+                if live {
+                    cap.release_one();
+                }
+                proofs.push(
+                    quiet
+                        .lock()
+                        .take()
+                        .expect("a timed-out send leaves a proof"),
+                );
+            }
+            proofs
+        })
+        .await;
+        assert!(proofs[0].live_hold_seen, "a hold was live at the start");
+        assert!(!proofs[1].live_hold_seen, "no hold was live");
+    })
+}
+
 /// A wait for the source wakes the timer loop only when the connection's
 /// window has pushed the timer past the send's own gap: a send that reads
 /// its source many times with no window arms its timer only a few times, not
@@ -4128,10 +4182,10 @@ fn a_write_held_by_a_silent_peer_fails_at_the_gap() {
 /// A path that goes dark mid-send, here once three quarters of the stream have
 /// been handed to quinn (past the first send window's worth, so writes have
 /// already waited for acknowledgements): the send's own earlier
-/// acknowledgements extend its gap, so
-/// it fails after its 5 s gap but within twice `STALL_PROGRESS_WINDOW` of the
-/// open deadline's wake (2 s), and the [`bounded::QuietProof`] it leaves makes
-/// that first timeout count, so the path goes suspect at once.
+/// acknowledgements extend its gap, so it fails after its 5 s gap but within
+/// twice `STALL_PROGRESS_WINDOW` of the open deadline's wake (2 s), so 12 to
+/// 22 s, here 12 s; and the [`bounded::QuietProof`] it leaves makes that first
+/// timeout count, so the path goes suspect at once.
 #[test]
 fn a_path_dark_mid_send_fails_within_two_windows_and_goes_suspect() {
     bounded(|| async move {
@@ -4184,9 +4238,10 @@ fn a_path_dark_mid_send_fails_within_two_windows_and_goes_suspect() {
 }
 
 /// Other sends settling around a timeout do not cost it its quiet proof
-/// (#6128 re-review). An unrelated `Sent` settles at 8 s, after the timed-out
-/// send's own acknowledgements, so the stall count dates progress at 8 s; after
-/// the timeout at 12 s another unrelated `Sent` settles first. The timed-out
+/// (#6128 re-review). An unrelated `Sent` settles at 8 s (4 s before the
+/// timeout), after the timed-out send's own acknowledgements, so the stall
+/// count dates progress at 8 s; after the timeout at 12 s another unrelated
+/// `Sent` settles first. The timed-out
 /// send's settle still finds the proof (it is read, not taken), and the proof
 /// dates the last progress back to 2 s although no settle sees a new
 /// acknowledgement, so the path goes suspect at that first timeout.
@@ -4210,10 +4265,16 @@ fn a_quiet_proof_survives_other_settles_and_dates_earlier_progress() {
         let deadlines = SendDeadlines::stream(body.len() as u64);
         let other = a.clone();
         let clock = time.clone();
-        let outcome = p
+        // The send's wakes: the open deadline at 2 s sees its acknowledgements,
+        // and the next, a window later, sees nothing and ends it. The unrelated
+        // settle falls between, after those acknowledgements.
+        let timeout_at = Duration::from_secs(2) + super::route::STALL_PROGRESS_WINDOW;
+        let unrelated_at = timeout_at - Duration::from_secs(4);
+        let (outcome, took) = p
             .drive(async move {
+                let start = time.now();
                 let unrelated = async {
-                    clock.sleep(Duration::from_secs(8)).await;
+                    clock.sleep(unrelated_at).await;
                     other.settle(
                         SendKind::Short,
                         &BoundedSend::Sent,
@@ -4232,12 +4293,16 @@ fn a_quiet_proof_survives_other_settles_and_dates_earlier_progress() {
                     ),
                     unrelated
                 );
-                outcome
+                (outcome, time.now() - start)
             })
             .await;
         assert!(
             matches!(outcome, BoundedSend::Failed(SendFailure::TimedOut)),
             "{outcome:?}"
+        );
+        assert_eq!(
+            took, timeout_at,
+            "the send timed out where the settles assume"
         );
         let now = p.time().now_nanos();
         p.a.settle(SendKind::Short, &BoundedSend::Sent, false, now);

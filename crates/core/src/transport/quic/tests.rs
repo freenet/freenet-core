@@ -2138,6 +2138,31 @@ fn a_sent_datagram_is_charged_once() {
     );
 }
 
+/// `with_poller_holds` puts back the slot it found, after a panic in its
+/// closure and after a nested call, so no later poller takes a stale record
+/// and an outer call keeps its own.
+#[test]
+fn with_poller_holds_puts_the_slot_back() {
+    use super::socket::{CapHolds, next_poller_holds, with_poller_holds};
+    let outer = Arc::new(CapHolds::new(None));
+    let inner = Arc::new(CapHolds::new(None));
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        with_poller_holds(&outer, || panic!("test: a connect that panics"))
+    }));
+    assert!(panicked.is_err());
+    assert!(next_poller_holds().is_none(), "cleared after a panic");
+    with_poller_holds(&outer, || {
+        with_poller_holds(&inner, || {
+            assert!(Arc::ptr_eq(&next_poller_holds().unwrap(), &inner));
+        });
+        assert!(
+            Arc::ptr_eq(&next_poller_holds().expect("the outer record"), &outer),
+            "the nested call put the outer record back"
+        );
+    });
+    assert!(next_poller_holds().is_none());
+}
+
 /// #5940 step M6, holds per connection since #6128: a poller's hold is
 /// counted in its own connection's record only (`socket::with_poller_holds`),
 /// so another connection's watch, stall count and send gaps never see it.

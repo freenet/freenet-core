@@ -1680,8 +1680,9 @@ Sending (QuicPath::send_short_bounded / send_stream_bounded /
   moving ends at its own gap or within 2 x STALL_PROGRESS_WINDOW of the last
   move, never past total. It gives nothing until a wake during the send has
   seen a move, so a path dark before the send fails it at 5 s; a path that
-  goes dark mid-send fails it at 12 to 20 s (its own early acknowledgements
-  are a move; pinned at 12 s by
+  goes dark mid-send fails it at 12 to 22 s (its own early acknowledgements
+  are a move; 22 s when one lands just after the 2 s first wake; pinned at
+  12 s by
   a_path_dark_mid_send_fails_within_two_windows_and_goes_suspect). Nothing
   while the send waits for its own source (the receiver sees no bytes and
   evicts at its own 5 s; a SeqCst flag handshake wakes the loop to re-arm when
@@ -1690,9 +1691,9 @@ Sending (QuicPath::send_short_bounded / send_stream_bounded /
   stream to its end whatever its consumer does (push_fragment does not wait);
   its one wait is announcing a stream into a full channel, bounded by
   inbound_stream_age_limit(len), the sender's total, so the two give up
-  together. Keepalive PINGs (15 s apart) alone extend a stopped send by at
-  most two windows: wakes are a window (10 s) apart, so at most two in a row
-  can each see a new PING acknowledged.
+  together. With keepalive PINGs (15 s apart) as its only acknowledgements, at
+  most two wakes in a row (10 s apart) can each see a new one, so they alone
+  extend a stopped send by at most two wakes. Argued, not tested.
   One timer per send, re-armed when it fires, as BodyReader. Messages are
   written in pieces of at most FRAGMENT_PAYLOAD_SIZE, each returning when quinn
   has buffered it, and each is a step of the gap and, for a stream, one

@@ -311,11 +311,21 @@ pub(crate) struct ConnectionProgress {
 /// instead of from when it reads it. Without it, the first timeout after a
 /// path goes dark mid-send sees that send's own early acknowledgements as new
 /// and does not count, which delays the path going suspect by a window.
+///
+/// The counts do not cover a cap hold that is already live: it counts as
+/// progress (`recycle::cap_held`) without moving either count, and can come
+/// and go between two settles. So the proof also says whether any reading
+/// during the send (its first, or a wake) saw a live hold, and the stall count
+/// uses only a proof whose send saw none. That is enough: a hold that starts
+/// during the send moves `holds`, and one live at any time after `since` that
+/// started before it was live at `since`, which is a reading of the send.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct QuietProof {
     pub(crate) acked: u64,
     pub(crate) holds: u64,
     pub(crate) since: u64,
+    /// Some reading during the send saw a hold live.
+    pub(crate) live_hold_seen: bool,
 }
 
 /// One send's view of [`ConnectionProgress`], sampled when its timer fires.
@@ -339,8 +349,9 @@ pub(crate) struct QuietProof {
 /// later, and never after `total`. So a path dark before the send started
 /// fails it at its own gap (5 s), and one that goes dark mid-send, whose last
 /// acknowledgements are of this send's own first flight, fails it between
-/// its gap and twice the window after those acknowledgements (12 to 20 s
-/// with the 2 s open deadline as the first wake). Such a send leaves a
+/// its gap and twice the window after those acknowledgements (12 to 22 s
+/// with the 2 s open deadline as the first wake: 12 s when they came before
+/// it, up to 22 s when one came just after it). Such a send leaves a
 /// [`QuietProof`], so its timeout counts toward the stall close and the
 /// path goes suspect at once.
 struct ConnectionWatch {
@@ -352,16 +363,20 @@ struct ConnectionWatch {
     started: u64,
     /// The wake that last saw the connection move; `None` before the first.
     moved_at: Option<u64>,
+    /// A reading saw a hold live ([`QuietProof::live_hold_seen`]).
+    live_hold_seen: bool,
 }
 
 impl ConnectionWatch {
     fn new(source: ConnectionProgress, now: u64) -> Self {
+        let cap = source.cap_holds.read();
         Self {
             acked: source.acks.acked(),
-            cap: source.cap_holds.read(),
+            cap,
             hold_unchanged_since: None,
             started: now,
             moved_at: None,
+            live_hold_seen: cap.held_now,
             source,
         }
     }
@@ -372,6 +387,7 @@ impl ConnectionWatch {
             acked: self.acked,
             holds: self.cap.holds,
             since: self.moved_at.unwrap_or(self.started),
+            live_hold_seen: self.live_hold_seen,
         });
     }
 
@@ -381,6 +397,7 @@ impl ConnectionWatch {
         let cap = self.source.cap_holds.read();
         let held = cap_held(&mut self.hold_unchanged_since, now, &cap, &self.cap);
         self.cap = cap;
+        self.live_hold_seen |= cap.held_now;
         if acked != self.acked || held {
             self.acked = acked;
             self.moved_at = Some(now);
