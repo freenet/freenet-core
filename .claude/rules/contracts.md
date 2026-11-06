@@ -324,7 +324,21 @@ State merging rules:
     TTL-bounded (`BROKEN_INVARIANT_TTL`, swept by the Ring reaper) so a
     false positive self-heals instead of bricking the contract forever; a
     genuine violation is re-detected after expiry (deterministically by the
-    identical-input probe when the echo re-pushes). There is deliberately NO
+    identical-input probe when the echo re-pushes a payload this node has not
+    already recorded as merged). A re-push of a payload the node already
+    merged is skipped before the executor by the applied-payload record
+    (`ring::applied_payloads`, for up to 15 minutes after it was recorded),
+    so it no longer reaches either probe. In the common case the stored state
+    came from a changing merge of the same full-state payload, which recorded
+    it, so the next identical re-push is skipped before the probe. The
+    identical-input probe still runs only when the stored state arrived by a
+    path that does not record (initial install, corrupted-state recovery) or
+    by a different payload with the same bytes; otherwise, for 15 minutes the
+    skip replaces it. When the record's precondition holds and when it does
+    not is in that module's "Precondition" section. For a
+    contract that replays a fixed set of payloads, that skip is now the
+    defence, not the flag: such contracts are flagged less often, and a lower
+    broken-flag count does NOT mean fewer broken contracts. There is deliberately NO
     automatic escalation to the contract ban list: a durable ban needs an
     aging/recovery story first (see PR #4902 review). Residual
     false-negative: a content change that coincidentally preserves the

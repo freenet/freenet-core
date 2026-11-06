@@ -1,4 +1,5 @@
 use super::*;
+use crate::config::GlobalRng;
 use crate::simulation::VirtualTime;
 use crate::transport::metrics::WaitCause;
 
@@ -183,7 +184,6 @@ fn extreme_values_never_panic() {
             cap.give_back(u64::MAX);
             time.advance(Duration::from_secs(1));
             let _ = cap.level_bytes();
-            let _ = jittered(Duration::MAX / 2);
         }
     }
 }
@@ -216,9 +216,9 @@ where
 
 /// A fragment that cannot be admitted fails its stream once the gap since
 /// the stream's previous fragment reaches `PACED_WAIT_DEADLINE`, no later
-/// (the last sleep is cut to the deadline), and the gap is reported once at
-/// `LONG_WAIT` on the way, from the waiting loop, although nothing was sent.
-/// Both are blamed on the cap, which took all the time.
+/// (the wait in the admission queue races the deadline), and the gap is
+/// reported once at `LONG_WAIT` on the way, although nothing was sent. Both
+/// are blamed on the cap, which took all the time.
 #[tokio::test(flavor = "current_thread")]
 async fn a_fragment_fails_its_stream_at_the_wait_deadline() {
     let time = VirtualTime::new();
@@ -229,22 +229,12 @@ async fn a_fragment_fails_its_stream_at_the_wait_deadline() {
         let (cap, time) = (cap.clone(), time.clone());
         drive_virtual(&time.clone(), async move {
             let mut pacing = StreamPacing::new(&time);
-            loop {
-                assert!(
-                    time.now_nanos() < 2 * PACED_WAIT_DEADLINE.as_nanos() as u64,
-                    "no deadline"
-                );
-                if let Err(gap) = pacing.check(&time, &cap) {
-                    break gap;
-                }
-                match cap.try_take(PACKET, pacing.slept()) {
-                    Ok(_) => panic!("admitted"),
-                    Err(deficit) => {
-                        if let Err(gap) = pacing.sleep(&time, &cap, deficit).await {
-                            break gap;
-                        }
-                    }
-                }
+            assert_eq!(pacing.check(&time, &cap), Ok(()));
+            // The wait itself runs to the deadline: it returns only on
+            // admission or at the deadline, never in between.
+            match pacing.wait_for_admission(&time, &cap, PACKET).await {
+                Err(gap) => gap,
+                Ok(admission) => panic!("admitted: {admission:?}"),
             }
         })
         .await
@@ -394,26 +384,6 @@ fn the_warnings_are_rate_limited_separately() {
     assert_eq!(cap.abandoned_since_warn.pending(WaitCause::Cap).0, 0);
 }
 
-#[test]
-fn jitter_is_never_shorter_than_the_deficit() {
-    GlobalRng::scoped_seed(11, || {
-        let wait = Duration::from_millis(100);
-        for _ in 0..1_000 {
-            let j = jittered(wait);
-            assert!(
-                j >= Duration::from_millis(100) && j < Duration::from_millis(142),
-                "{j:?}"
-            );
-        }
-        // At a tiny deficit the additive part still spreads wakeups over
-        // more than one 1 ms timer tick.
-        let spread: std::collections::BTreeSet<u128> = (0..100)
-            .map(|_| jittered(Duration::from_micros(10)).as_millis())
-            .collect();
-        assert!(spread.len() >= 2, "{spread:?}");
-    });
-}
-
 struct Sink {
     fail: std::sync::atomic::AtomicBool,
 }
@@ -457,7 +427,10 @@ fn target() -> std::net::SocketAddr {
 #[test]
 fn try_take_without_a_cap_admits_at_once() {
     assert!(matches!(
-        try_take(&Sink::new(false), Duration::ZERO),
+        try_take(
+            &Sink::new(false),
+            &mut StreamPacing::new(&VirtualTime::new())
+        ),
         Ok(None)
     ));
 }
@@ -471,7 +444,9 @@ async fn the_socket_charges_every_datagram_once() {
     let socket = DemuxSocket::wrap(Sink::new(false), Some(EgressCap::new(RATE, time.clone())));
     socket.send_to(&[1; 100], target()).await.unwrap();
     socket.send_to_blocking(&[1; 50], target()).unwrap();
-    let take = try_take(&socket, Duration::ZERO).unwrap().expect("take");
+    let take = try_take(&socket, &mut StreamPacing::new(&time))
+        .unwrap()
+        .expect("take");
     socket
         .send_to_paced(&[2; 700], target(), take)
         .await
@@ -492,7 +467,9 @@ async fn failed_sends_are_not_charged() {
     let socket = DemuxSocket::wrap(Sink::new(true), Some(EgressCap::new(RATE, time.clone())));
     assert!(socket.send_to(&[1; 900], target()).await.is_err());
     assert!(socket.send_to_blocking(&[1; 900], target()).is_err());
-    let take = try_take(&socket, Duration::ZERO).unwrap().expect("take");
+    let take = try_take(&socket, &mut StreamPacing::new(&time))
+        .unwrap()
+        .expect("take");
     assert!(
         socket
             .send_to_paced(&[2; 700], target(), take)
@@ -508,95 +485,146 @@ async fn failed_sends_are_not_charged() {
 /// with `None` for an unpaced send.
 type Sends = Vec<(u64, u64, Option<usize>)>;
 
-/// Simulate `streams` paced senders on one cap for `duration`: each tries to
-/// take a datagram as soon as its previous one is sent; a refused take
-/// sleeps for the deficit (jittered, unless `jitter` is false) plus a wake-up
-/// lateness drawn from `0..late_ns`, as a real timer can fire late. With
-/// `unpaced`, an unpaced datagram of that size is sent every `unpaced.0`.
-///
-/// It fails at once, rather than spinning, if the cap admits more than its
-/// bucket can give, if a refusal reports no deficit, or if many refusals in
-/// a row leave time where it was.
+/// A clock whose timers fire late by a random time below `late_ns`.
+#[derive(Clone)]
+struct LateTime {
+    inner: VirtualTime,
+    late_ns: u64,
+}
+
+impl LateTime {
+    fn late(&self) -> Duration {
+        if self.late_ns == 0 {
+            Duration::ZERO
+        } else {
+            Duration::from_nanos(GlobalRng::random_range(0..self.late_ns))
+        }
+    }
+}
+
+impl crate::simulation::TimeSource for LateTime {
+    fn now_nanos(&self) -> u64 {
+        self.inner.now_nanos()
+    }
+
+    fn sleep(
+        &self,
+        duration: Duration,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        self.inner.sleep(duration + self.late())
+    }
+
+    fn sleep_until(
+        &self,
+        deadline_nanos: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        self.inner
+            .sleep_until(deadline_nanos + self.late().as_nanos() as u64)
+    }
+
+    fn sleep_cancelable(
+        &self,
+        duration: Duration,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        self.inner.sleep_cancelable(duration + self.late())
+    }
+
+    fn timeout<F, T>(
+        &self,
+        duration: Duration,
+        future: F,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<T>> + Send>>
+    where
+        F: std::future::Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.inner.timeout(duration + self.late(), future)
+    }
+}
+
+/// Simulate `streams` paced senders on one cap for `duration`, each a task
+/// that sends its next datagram as the transport does under a cap: wait in
+/// the admission queue (`StreamPacing::wait_for_admission`, racing the
+/// deadline), take with `try_take`, send, start the next gap. With `unpaced`,
+/// an unpaced datagram of that size is sent every `unpaced.0`. Returns the
+/// sends and the cap's stats; a stream that reaches its deadline stops. With
+/// `late_ns`, every timer of the cap (the waiters' wakeups) fires late by a
+/// time drawn from `0..late_ns`, as a tokio timer can fire up to a tick late.
 fn simulate(
     rate: u64,
     streams: usize,
     duration: Duration,
     unpaced: Option<(Duration, usize)>,
     late_ns: u64,
-    jitter: bool,
 ) -> (Sends, EgressStats) {
-    let (cap, time) = cap_at(rate);
-    let end = duration.as_nanos() as u64;
-    // (next try ns, stream, slept so far for this datagram)
-    let mut next: Vec<(u64, usize, Duration)> =
-        (0..streams).map(|i| (0, i, Duration::ZERO)).collect();
-    let mut next_unpaced = unpaced.map(|(every, _)| every.as_nanos() as u64);
-    let mut sends = Sends::new();
-    let mut refusals_without_progress = 0u32;
-    loop {
-        let (i, &(at, stream, slept)) = next
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, n)| (n.0, n.1))
-            .unwrap();
-        if let (Some(u), Some((every, size))) = (next_unpaced, unpaced) {
-            if u <= at {
-                if u > end {
-                    break;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async move {
+        let time = VirtualTime::new();
+        let cap = std::sync::Arc::new(EgressCap::new(
+            rate,
+            LateTime {
+                inner: time.clone(),
+                late_ns,
+            },
+        ));
+        let end = duration.as_nanos() as u64;
+        let sends = std::sync::Arc::new(parking_lot::Mutex::new(Sends::new()));
+        let mut tasks = Vec::new();
+        for stream in 0..streams {
+            let (cap, time, sends) = (cap.clone(), time.clone(), sends.clone());
+            tasks.push(tokio::spawn(async move {
+                let mut pacing = StreamPacing::new(&time);
+                while time.now_nanos() < end {
+                    if pacing.check(&time, &cap).is_err()
+                        || pacing
+                            .wait_for_admission(&time, &cap, PACKET)
+                            .await
+                            .is_err()
+                    {
+                        return;
+                    }
+                    // The wait can end past the run's end; such a send is not
+                    // part of the run.
+                    if time.now_nanos() >= end {
+                        return;
+                    }
+                    let Ok(take) = pacing.take(&cap, PACKET) else {
+                        continue;
+                    };
+                    take.sent(PACKET);
+                    sends
+                        .lock()
+                        .push((time.now_nanos(), PACKET as u64, Some(stream)));
+                    pacing.sent(&time);
                 }
-                time.advance_to(u);
-                cap.charge_unpaced(size);
-                sends.push((u, size as u64, None));
-                next_unpaced = Some(u + every.as_nanos() as u64);
-                continue;
-            }
+            }));
         }
-        if at > end {
-            break;
-        }
-        time.advance_to(at);
-        match cap.try_take(PACKET, slept) {
-            Ok(take) => {
-                take.sent(PACKET);
-                sends.push((at, PACKET as u64, Some(stream)));
-                // A cap that admits more than the bucket can give would
-                // otherwise make the simulation spin at one instant.
-                let admissible = (cap.burst_bytes() as u128
-                    + at as u128 * rate as u128 / 1_000_000_000)
-                    / PACKET as u128
-                    + 1;
-                assert!(
-                    (sends.iter().filter(|s| s.2.is_some()).count() as u128) <= admissible,
-                    "more paced sends than the cap admits by {at} ns"
-                );
-                next[i] = (at, stream, Duration::ZERO);
-            }
-            Err(wait) => {
-                assert!(
-                    !wait.is_zero(),
-                    "a refused take reported no deficit at {at} ns"
-                );
-                let wait = if jitter { jittered(wait) } else { wait };
-                let late = if late_ns == 0 {
-                    0
-                } else {
-                    GlobalRng::random_range(0..late_ns)
-                };
-                let wake = at + wait.as_nanos() as u64 + late;
-                if wake == at {
-                    refusals_without_progress += 1;
-                    assert!(
-                        refusals_without_progress < 10_000,
-                        "time does not advance across refusals at {at} ns"
-                    );
-                } else {
-                    refusals_without_progress = 0;
+        if let Some((every, size)) = unpaced {
+            let (cap, time, sends) = (cap.clone(), time.clone(), sends.clone());
+            tasks.push(tokio::spawn(async move {
+                loop {
+                    time.sleep(every).await;
+                    if time.now_nanos() > end {
+                        return;
+                    }
+                    cap.charge_unpaced(size);
+                    sends.lock().push((time.now_nanos(), size as u64, None));
                 }
-                next[i] = (wake, stream, slept + wait);
-            }
+            }));
         }
-    }
-    (sends, cap.stats())
+        drive_virtual(&time.clone(), async move {
+            for task in tasks {
+                task.await.unwrap();
+            }
+        })
+        .await;
+        let mut sends = std::mem::take(&mut *sends.lock());
+        sends.sort_by_key(|s| s.0);
+        (sends, cap.stats())
+    })
 }
 
 /// Many concurrent paced streams with unpaced sends interleaved: over every
@@ -606,111 +634,149 @@ fn simulate(
 /// unpaced rate is low enough that nothing is forgiven, which is checked.
 #[test]
 fn every_interval_ending_at_a_paced_send_is_within_the_bucket_bound() {
-    for seed in [1u64, 7, 42] {
-        GlobalRng::scoped_seed(seed, || {
-            let (sends, stats) = simulate(
-                RATE,
-                30,
-                Duration::from_millis(400),
-                Some((Duration::from_millis(1), 150)),
-                1_000_000,
-                true,
+    let (sends, stats) = simulate(
+        RATE,
+        30,
+        Duration::from_millis(400),
+        Some((Duration::from_millis(1), 150)),
+        0,
+    );
+    assert_eq!(stats.forgiven_bytes, 0, "premise: nothing forgiven");
+    assert!(sends.iter().filter(|s| s.2.is_none()).count() > 300);
+    assert!(sends.iter().filter(|s| s.2.is_some()).count() > 100);
+    for j in 0..sends.len() {
+        if sends[j].2.is_none() {
+            continue;
+        }
+        let mut bytes = 0u128;
+        for i in (0..=j).rev() {
+            bytes += sends[i].1 as u128;
+            let interval = (sends[j].0 - sends[i].0) as u128;
+            let allowed = 25_000 + interval * RATE as u128 / 1_000_000_000;
+            assert!(
+                bytes <= allowed,
+                "{bytes} bytes in {interval} ns ending at a paced send, allowed {allowed}"
             );
-            assert_eq!(stats.forgiven_bytes, 0, "premise: nothing forgiven");
-            assert!(sends.iter().filter(|s| s.2.is_none()).count() > 300);
-            for j in 0..sends.len() {
-                if sends[j].2.is_none() {
-                    continue;
-                }
-                let mut bytes = 0u128;
-                for i in (0..=j).rev() {
-                    bytes += sends[i].1 as u128;
-                    let interval = (sends[j].0 - sends[i].0) as u128;
-                    let allowed = 25_000 + interval * RATE as u128 / 1_000_000_000;
-                    assert!(
-                        bytes <= allowed,
-                        "seed {seed}: {bytes} bytes in {interval} ns ending at a paced send, \
-                         allowed {allowed}"
-                    );
-                }
-            }
-        });
+        }
     }
 }
 
 /// With many streams and no other limit, paced traffic gets at least 99% of
 /// what the bucket allows over a long interval (the rate times the
 /// interval; the initial burst is subtracted, since it would hide a refill
-/// a few percent slow), even when every timer wakes up to 1 ms late. (A
-/// model that charged a datagram again for waking late fell to about 50 to
-/// 65% of the cap here.)
+/// a few percent slow), with timers on time and with every timer up to 1 ms
+/// late (a tokio timer fires up to a tick late). A late timer delays only its
+/// own waiter, and the bucket keeps the refill it missed up to the burst.
 #[test]
 fn paced_streams_reach_the_cap_even_when_timers_wake_late() {
-    for rate in [1_250_000u64, 12_500_000] {
-        GlobalRng::scoped_seed(rate, || {
+    for (rate, late_ns) in [
+        (1_250_000u64, 0u64),
+        (12_500_000, 0),
+        (1_250_000, 1_000_000),
+        (12_500_000, 1_000_000),
+    ] {
+        GlobalRng::scoped_seed(rate ^ late_ns, || {
             let duration = Duration::from_secs(2);
-            let (sends, _) = simulate(rate, 20, duration, None, 1_000_000, true);
+            let (sends, _) = simulate(rate, 20, duration, None, late_ns);
             let (cap, _) = cap_at(rate);
             let bytes = sends.iter().map(|s| s.1).sum::<u64>() - cap.burst_bytes();
             let allowed = rate as f64 * duration.as_secs_f64();
             assert!(
                 bytes as f64 >= 0.99 * allowed,
-                "{bytes} bytes beyond the burst in {duration:?} at a {rate} B/s cap \
-                 ({:.1}% of the refill)",
+                "{bytes} bytes beyond the burst in {duration:?} at a {rate} B/s cap, \
+                 timers up to {late_ns} ns late ({:.1}% of the refill)",
                 100.0 * bytes as f64 / allowed
             );
         });
     }
 }
 
-/// There is no order among waiting streams, but none starves: with jittered
-/// waits, every one of N streams gets each next datagram within a bounded
-/// multiple of the fair gap (N datagrams at the rate).
-///
-/// Without an order, each waiting stream wins a free datagram with
-/// probability about 1/N, so its gaps are geometric: the worst of the ~1 600
-/// gaps here is expected near ln(1 600), about 7 fair gaps, and measured at
-/// up to 8.4 over these seeds. The bound is 12. The control run without
-/// jitter shows why it is there: streams then wake together and are served
-/// in a fixed order, and some stream exceeds the bound.
+/// Waiting streams are served in turn: every one of N streams gets each next
+/// datagram within twice the fair gap (N datagrams at the rate), and after
+/// the first second every stream sent within two datagrams of every other.
+/// The race of jittered sleeps this replaced (#6112) gave each waiter a
+/// refill with probability about `1/N`, so its gaps had a geometric tail.
 #[test]
-fn no_stream_starves() {
+fn waiting_streams_are_served_in_turn() {
     const STREAMS: usize = 40;
     let rate = 200_000u64;
     let fair_gap_ns = STREAMS as u64 * PACKET as u64 * 1_000_000_000 / rate;
-    for seed in [3u64, 9, 27, 81, 243, 729] {
-        GlobalRng::scoped_seed(seed, || {
-            let (sends, _) = simulate(rate, STREAMS, Duration::from_secs(10), None, 0, true);
-            for stream in 0..STREAMS {
-                let times: Vec<u64> = sends
-                    .iter()
-                    .filter(|s| s.2 == Some(stream))
-                    .map(|s| s.0)
-                    .collect();
-                assert!(
-                    times.len() > 10,
-                    "seed {seed}: stream {stream} sent {}",
-                    times.len()
-                );
-                let worst = times.windows(2).map(|w| w[1] - w[0]).max().unwrap();
-                assert!(
-                    worst <= 12 * fair_gap_ns,
-                    "seed {seed}: stream {stream} waited {worst} ns, fair gap {fair_gap_ns} ns"
-                );
-            }
-        });
+    let (sends, stats) = simulate(rate, STREAMS, Duration::from_secs(10), None, 0);
+    assert_eq!(stats.streams_abandoned, [0, 0, 0]);
+    let per_stream: Vec<Vec<u64>> = (0..STREAMS)
+        .map(|stream| {
+            sends
+                .iter()
+                .filter(|s| s.2 == Some(stream))
+                .map(|s| s.0)
+                .collect()
+        })
+        .collect();
+    for (stream, times) in per_stream.iter().enumerate() {
+        assert!(times.len() > 10, "stream {stream} sent {}", times.len());
+        let worst = times.windows(2).map(|w| w[1] - w[0]).max().unwrap();
+        assert!(
+            worst <= 2 * fair_gap_ns,
+            "stream {stream} waited {worst} ns, fair gap {fair_gap_ns} ns"
+        );
     }
-    // Control: the same run without jitter starves some stream.
-    let (sends, _) = simulate(rate, STREAMS, Duration::from_secs(10), None, 0, false);
-    let starved = (0..STREAMS).any(|stream| {
-        let times: Vec<u64> = sends
-            .iter()
-            .filter(|s| s.2 == Some(stream))
-            .map(|s| s.0)
-            .collect();
-        times.len() < 2 || times.windows(2).any(|w| w[1] - w[0] > 12 * fair_gap_ns)
-    });
-    assert!(starved, "control: without jitter some stream must starve");
+    assert_served_evenly(&per_stream, 1_000_000_000);
+}
+
+/// More waiting streams than the queue holds wakers for
+/// (`MAX_ADMISSION_WAKERS`): the newer ones hold no waker, keep their
+/// places, and rely on their own timers. Every stream still sends, none reaches its deadline,
+/// no gap exceeds four fair gaps, and the cap never holds more wakers than
+/// its bound; with timers on time, and with every timer up to 1 ms late,
+/// which matters most to the waiters that have only their timer.
+#[test]
+fn more_waiting_streams_than_held_wakers_all_progress() {
+    let streams = MAX_ADMISSION_WAKERS + 500;
+    let rate = 12_500_000u64;
+    let fair_gap_ns = streams as u64 * PACKET as u64 * 1_000_000_000 / rate;
+    for late_ns in [0u64, 1_000_000] {
+        let (sends, stats) = GlobalRng::scoped_seed(late_ns + 1, || {
+            simulate(rate, streams, Duration::from_secs(2), None, late_ns)
+        });
+        assert_eq!(
+            stats.streams_abandoned,
+            [0, 0, 0],
+            "late {late_ns} ns: no stream reached its deadline"
+        );
+        let mut per_stream = vec![Vec::new(); streams];
+        for (at, _, stream) in &sends {
+            per_stream[stream.expect("paced")].push(*at);
+        }
+        for (stream, times) in per_stream.iter().enumerate() {
+            assert!(
+                times.len() >= 5,
+                "late {late_ns} ns: stream {stream} sent {}",
+                times.len()
+            );
+            let worst = times.windows(2).map(|w| w[1] - w[0]).max().unwrap();
+            assert!(
+                worst <= 4 * fair_gap_ns,
+                "late {late_ns} ns: stream {stream} waited {worst} ns, fair gap {fair_gap_ns} ns"
+            );
+        }
+        assert_served_evenly(&per_stream, 200_000_000);
+    }
+}
+
+/// After `from_ns` (past the initial burst, which the first stream to run
+/// drains alone since a simulated send does not yield), every stream sent
+/// within two datagrams of every other.
+fn assert_served_evenly(per_stream: &[Vec<u64>], from_ns: u64) {
+    let counts: Vec<usize> = per_stream
+        .iter()
+        .map(|times| times.iter().filter(|at| **at >= from_ns).count())
+        .collect();
+    let (min, max) = (*counts.iter().min().unwrap(), *counts.iter().max().unwrap());
+    assert!(min > 0, "a stream sent nothing after {from_ns} ns");
+    assert!(
+        max <= min + 2,
+        "sends per stream after {from_ns} ns ranged from {min} to {max}"
+    );
 }
 
 /// A gap that goes from below `LONG_WAIT` to the deadline in one step (a long
@@ -887,7 +953,7 @@ fn poll_admit_is_pending_until_the_deficit_and_ready_at_it() {
         "a Ready poll leaves no timer armed"
     );
     assert_eq!(cap.level_bytes(), PACKET as i64, "polling took nothing");
-    cap.try_take(PACKET, Duration::ZERO)
+    cap.try_take_handed(PACKET, Duration::ZERO, waiter.admission())
         .expect("try_take agrees with the Ready poll")
         .sent(PACKET);
 }
@@ -919,7 +985,9 @@ fn poll_admit_and_try_take_agree_at_the_same_instant() {
                 let mut waiter = AdmissionWaiter::default();
                 let polled = cap.poll_admit(bytes, &mut waiter, &mut cx);
                 let wake_at = waiter.wake_at_ns();
-                match cap.try_take(bytes, Duration::ZERO) {
+                // The take the QUIC socket makes after this poll: handed the
+                // poller's admission, if it got one.
+                match cap.try_take_handed(bytes, Duration::ZERO, waiter.admission()) {
                     Ok(take) => {
                         assert!(polled.is_ready(), "seed {seed}: try_take admitted {bytes}");
                         admitted += 1;
@@ -1048,45 +1116,54 @@ fn give_backs_wake_waiters_oldest_first() {
     );
 }
 
-/// The cap never holds more than `MAX_ADMISSION_WAKERS` wakers: past it an
-/// entry is dropped WITHOUT being woken (its waiter still has its timer).
-/// The waiters are kept alive, since dropping one removes its entry.
+/// The cap never holds more than `MAX_ADMISSION_WAKERS` wakers. Past it a
+/// new waiter is queued without a waker, no earlier waiter loses its waker
+/// or its place, nobody is woken, and the new waiter's timer is still
+/// staggered behind everyone ahead of it. The waiters are kept alive, since
+/// dropping one removes its entry.
 #[test]
 fn admission_wakers_are_bounded_without_waking() {
     let (cap, _time) = cap_at(RATE);
     cap.charge_unpaced(BURST as usize);
     let (waker, counter) = counting_waker();
     let mut cx = Context::from_waker(&waker);
-    let mut first_id = None;
     let mut held = Vec::with_capacity(MAX_ADMISSION_WAKERS);
     for _ in 0..MAX_ADMISSION_WAKERS {
         let mut waiter = AdmissionWaiter::default();
-        first_id.get_or_insert(waiter.id);
         assert!(cap.poll_admit(PACKET, &mut waiter, &mut cx).is_pending());
         held.push(waiter);
     }
-    let first_id = first_id.unwrap();
-    assert_eq!(
-        cap.admission.wakers.lock().front().map(|(id, _)| *id),
-        Some(first_id)
-    );
     assert_eq!(cap.admission_waker_count(), MAX_ADMISSION_WAKERS);
+    let last_held_at = held.last().unwrap().wake_at_ns().unwrap();
     let mut waiter = AdmissionWaiter::default();
     assert!(cap.poll_admit(PACKET, &mut waiter, &mut cx).is_pending());
     assert_eq!(cap.admission_waker_count(), MAX_ADMISSION_WAKERS, "bounded");
-    assert_ne!(
-        cap.admission.wakers.lock().front().map(|(id, _)| *id),
-        Some(first_id),
-        "the oldest entry was the one dropped"
+    assert_eq!(
+        cap.admission_queue_len(),
+        MAX_ADMISSION_WAKERS + 1,
+        "queued anyway"
     );
-    assert_eq!(woken(&counter), 0, "an evicted entry is not woken");
-    // The same waiter polling again holds one entry, not two.
+    assert_eq!(woken(&counter), 0, "nobody is woken");
+    assert!(
+        waiter.wake_at_ns().unwrap() > last_held_at,
+        "the waiter without a waker is still timed behind everyone ahead"
+    );
+    // The same waiter polling again holds one place, not two.
+    assert!(cap.poll_admit(PACKET, &mut waiter, &mut cx).is_pending());
+    assert_eq!(cap.admission_queue_len(), MAX_ADMISSION_WAKERS + 1);
+    // A give-back wakes the oldest, which keeps its place.
+    cap.give_back(PACKET as u64);
+    assert_eq!(woken(&counter), 1, "one datagram given back, one wake");
+    assert_eq!(cap.admission_queue_len(), MAX_ADMISSION_WAKERS + 1);
+    assert_eq!(cap.admission_waker_count(), MAX_ADMISSION_WAKERS - 1);
+    cap.charge_unpaced(PACKET);
+    // The freed waker slot goes to the next waiter that polls without one.
     assert!(cap.poll_admit(PACKET, &mut waiter, &mut cx).is_pending());
     assert_eq!(cap.admission_waker_count(), MAX_ADMISSION_WAKERS);
 }
 
-/// `poll_admit` of a full datagram being `Ready` means a `try_take` of any
-/// size up to it succeeds at the same instant, which is what the QUIC socket
+/// `poll_admit` of a full datagram being `Ready` means a take of any size up
+/// to it, using that admission, succeeds at the same instant, which is what the QUIC socket
 /// relies on: its poller asks for `WAKE_DATAGRAM_BYTES`, then takes the
 /// datagram's real size.
 #[test]
@@ -1110,8 +1187,9 @@ fn a_ready_poll_for_a_datagram_admits_any_smaller_take() {
                 {
                     ready += 1;
                     let n = GlobalRng::random_range(1..=WAKE_DATAGRAM_BYTES);
+                    // The take the socket makes: handed the poller's admission.
                     let take = cap
-                        .try_take(n, Duration::ZERO)
+                        .try_take_handed(n, Duration::ZERO, waiter.admission())
                         .unwrap_or_else(|_| panic!("seed {seed}: Ready for 1200, refused {n}"));
                     drop(take);
                 }
@@ -1123,8 +1201,10 @@ fn a_ready_poll_for_a_datagram_admits_any_smaller_take() {
 
 /// Waiters whose deficits are equal are staggered by one datagram of refill
 /// each, so the cap does not wake them as a herd: with N waiters on an
-/// empty bucket, each datagram's worth of refill wakes exactly one of them,
-/// oldest first, and that one is admitted.
+/// empty bucket, each datagram's worth of refill wakes the next one in line,
+/// oldest first, and that one is admitted. An admission also wakes the next
+/// waiter (`AdmissionQueue::forget`), so it may be woken twice; nobody
+/// further back is woken.
 #[test]
 fn waiting_connections_wake_one_per_datagram_of_refill() {
     const N: usize = 8;
@@ -1153,19 +1233,24 @@ fn waiting_connections_wake_one_per_datagram_of_refill() {
     for k in 0..N {
         time.advance(datagram);
         let woken_now: Vec<usize> = waiters.iter().map(|(_, _, c)| woken(c)).collect();
-        assert_eq!(
-            woken_now.iter().sum::<usize>(),
-            k + 1,
-            "after {} datagrams of refill: {woken_now:?}",
+        assert!(
+            woken_now[k] >= 1,
+            "waiter {k} is woken after {} datagrams: {woken_now:?}",
             k + 1
         );
-        assert_eq!(woken_now[k], 1, "waiter {k} is the one woken");
+        assert!(
+            woken_now[k + 1..].iter().all(|w| *w == 0),
+            "nobody behind waiter {k} is woken yet: {woken_now:?}"
+        );
         let (waiter, waker, _) = &mut waiters[k];
         let mut cx = Context::from_waker(waker);
         assert!(cap.poll_admit(PACKET, waiter, &mut cx).is_ready());
-        cap.try_take(PACKET, Duration::ZERO)
+        cap.try_take_handed(PACKET, Duration::ZERO, waiter.admission())
             .expect("the woken waiter is admitted")
             .sent(PACKET);
+        if let Some((_, _, next)) = waiters.get(k + 1) {
+            assert_eq!(woken(next), 1, "the admission woke the next in line");
+        }
     }
     assert_eq!(cap.admission_waker_count(), 0);
 }
@@ -1294,4 +1379,627 @@ fn a_run_of_drops_wakes_a_bounded_number_of_followers() {
     // The last waiter was never close enough to the front to be woken.
     assert_eq!(woken(counters.last().unwrap()), 0);
     assert_eq!(cap.admission_waker_count(), QUEUED - DROPS);
+}
+
+/// `streams` paced senders on one cap for `duration`, each starting a fresh
+/// stream when its current one reaches the deadline (as an operation retries).
+/// Returns the bytes sent and the streams abandoned.
+fn simulate_restarting(rate: u64, streams: usize, duration: Duration) -> (u64, u64) {
+    use std::sync::atomic::AtomicU64;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async move {
+        let time = VirtualTime::new();
+        let cap = std::sync::Arc::new(EgressCap::new(rate, time.clone()));
+        let end = duration.as_nanos() as u64;
+        let bytes = std::sync::Arc::new(AtomicU64::new(0));
+        let abandoned = std::sync::Arc::new(AtomicU64::new(0));
+        let mut tasks = Vec::new();
+        for _ in 0..streams {
+            let (cap, time) = (cap.clone(), time.clone());
+            let (bytes, abandoned) = (bytes.clone(), abandoned.clone());
+            tasks.push(tokio::spawn(async move {
+                let mut pacing = StreamPacing::new(&time);
+                while time.now_nanos() < end {
+                    if pacing.check(&time, &cap).is_err()
+                        || pacing
+                            .wait_for_admission(&time, &cap, PACKET)
+                            .await
+                            .is_err()
+                    {
+                        abandoned.fetch_add(1, Ordering::Relaxed);
+                        pacing = StreamPacing::new(&time);
+                        continue;
+                    }
+                    if time.now_nanos() >= end {
+                        return;
+                    }
+                    let Ok(take) = pacing.take(&cap, PACKET) else {
+                        continue;
+                    };
+                    take.sent(PACKET);
+                    bytes.fetch_add(PACKET as u64, Ordering::Relaxed);
+                    pacing.sent(&time);
+                }
+            }));
+        }
+        drive_virtual(&time.clone(), async move {
+            for task in tasks {
+                task.await.unwrap();
+            }
+        })
+        .await;
+        (
+            bytes.load(Ordering::Relaxed),
+            abandoned.load(Ordering::Relaxed),
+        )
+    })
+}
+
+/// More streams than one 5 s round of the cap can serve (300 at 64 KiB/s,
+/// a fair gap of about 5.5 s), so streams keep failing at their deadline and
+/// leaving the queue, and new ones join: the cap still sends at least 95% of
+/// its refill. A waiter's timer is set from its place when it last polled,
+/// and waiters that left ahead of it make that timer late; before an
+/// admission woke the next in line (`AdmissionQueue::forget`), the refill
+/// sat unused while the late waiters slept, and this run used 18% of it.
+#[test]
+fn the_cap_stays_busy_while_streams_fail_at_their_deadline() {
+    let rate = 65_536u64;
+    let duration = Duration::from_secs(30);
+    let (bytes, abandoned) = simulate_restarting(rate, 300, duration);
+    assert!(abandoned > 0, "premise: streams reach their deadline");
+    let (cap, _) = cap_at(rate);
+    let used = (bytes - cap.burst_bytes()) as f64 / (rate as f64 * duration.as_secs_f64());
+    assert!(
+        used >= 0.95,
+        "{:.1}% of the refill used, {abandoned} streams abandoned",
+        used * 100.0
+    );
+}
+
+/// After `Admission::Waited` the stream re-checks cwnd and calls again, while
+/// another sender queued behind it. Within `ADMISSION_PASS` that call takes
+/// the turn it was given without queueing. Past the pass (a long cwnd wait)
+/// it queues again, at the place it was admitted from, so it is still ahead
+/// of the sender that queued after it and takes the one datagram. Before the
+/// place was kept, it queued behind that sender and lost a whole turn of the
+/// queue on every cwnd wait.
+#[tokio::test(flavor = "current_thread")]
+async fn an_admitted_stream_keeps_its_place_within_and_past_the_pass() {
+    // 10 MB/s: one datagram of refill (120 us) fits in the pass.
+    const FAST: u64 = 10_000_000;
+    for recheck in [
+        Duration::from_micros(120),
+        ADMISSION_PASS + Duration::from_micros(120),
+    ] {
+        let (cap, time) = cap_at(FAST);
+        let cap = std::sync::Arc::new(cap);
+        cap.charge_unpaced(cap.burst_bytes() as usize);
+        let (first, mut pacing) = drive_virtual(&time.clone(), {
+            let (cap, time) = (cap.clone(), time.clone());
+            async move {
+                let mut pacing = StreamPacing::new(&time);
+                let first = pacing.wait_for_admission(&time, &cap, PACKET).await;
+                (first, pacing)
+            }
+        })
+        .await;
+        assert_eq!(first, Ok(Admission::Waited), "premise: it waited");
+        // Another sender queues while this stream re-checks its window.
+        cap.charge_unpaced(cap.level_bytes().max(0) as usize);
+        let (waker, _) = counting_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut other = AdmissionWaiter::default();
+        assert!(
+            cap.poll_admit(PACKET, &mut other, &mut cx).is_pending(),
+            "premise: the other sender queued"
+        );
+        time.advance(recheck);
+        // Exactly one datagram in the bucket: enough for one of the two.
+        let extra = cap.level_bytes() - PACKET as i64;
+        assert!(extra >= 0, "premise: a datagram has refilled");
+        cap.charge_unpaced(extra as usize);
+        let polled = std::pin::pin!(pacing.wait_for_admission(&time, &cap, PACKET)).poll(&mut cx);
+        assert_eq!(
+            polled,
+            Poll::Ready(Ok(Admission::Now)),
+            "after {recheck:?} the stream keeps its turn"
+        );
+        assert!(
+            cap.poll_admit(PACKET, &mut other, &mut cx).is_pending(),
+            "the sender that queued after it waits"
+        );
+        drop(other);
+    }
+}
+
+/// On a real multi-thread runtime, a sender admitted by `poll_admit` always
+/// gets its take while its admission holds ([`ADMISSION_PASS`]): its
+/// admission counts ahead of everyone until its take, and every other take
+/// leaves its datagram in the bucket, so a sender polling or taking on
+/// another thread in that gap cannot use it. Each sender yields its thread
+/// between `Ready` and the take, as a preempted task would, to widen that
+/// gap; with many tests running at once, about a third of the takes come
+/// after the pass.
+///
+/// Two earlier versions lost 2 to 37 of 3200 takes here. Admissions were
+/// counted but not named, so a sender whose admission had lapsed (it was
+/// descheduled for more than the pass) still took, used the datagram owed
+/// to a newer admission, and cleared that admission as if it were its own.
+/// And the admission's time was read before the queue lock, so it could
+/// lapse before the pass had run.
+///
+/// A take after its admission lapsed may fail by design; those are counted
+/// apart, measured from just before the poll that admitted the sender, which
+/// is never later than the admission's own time. How many takes come after
+/// the pass depends on the machine's load, so this test bounds nothing about
+/// them; the race itself is made to happen, on virtual time, by
+/// `a_take_after_its_admission_lapsed_leaves_a_newer_admission_its_datagram`.
+#[test]
+fn an_admitted_take_is_not_lost_to_another_thread() {
+    use crate::simulation::RealTime;
+    use std::sync::atomic::AtomicU64;
+    const SENDERS: usize = 8;
+    const TAKES: usize = 400;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (lost, lapsed, late, outstanding) = runtime.block_on(async {
+        // 4 MB/s: a datagram of refill every 300 us, so senders contend for
+        // nearly every one.
+        let cap = std::sync::Arc::new(EgressCap::new(4_000_000, RealTime::new()));
+        cap.charge_unpaced(cap.burst_bytes() as usize);
+        let lost = std::sync::Arc::new(AtomicU64::new(0));
+        let lapsed = std::sync::Arc::new(AtomicU64::new(0));
+        let late = std::sync::Arc::new(AtomicU64::new(0));
+        let tasks: Vec<_> = (0..SENDERS)
+            .map(|_| {
+                let (cap, lost, lapsed, late) =
+                    (cap.clone(), lost.clone(), lapsed.clone(), late.clone());
+                tokio::spawn(async move {
+                    let mut waiter = AdmissionWaiter::named();
+                    for _ in 0..TAKES {
+                        // Read before each poll, so it is never later than
+                        // the admission's own time, read under the lock.
+                        let mut admitted = std::time::Instant::now();
+                        std::future::poll_fn(|cx| {
+                            admitted = std::time::Instant::now();
+                            cap.poll_admit(PACKET, &mut waiter, cx)
+                        })
+                        .await;
+                        std::thread::yield_now();
+                        let taken = cap.try_take_admitted(PACKET, Duration::ZERO, &mut waiter);
+                        let after_pass = admitted.elapsed() > ADMISSION_PASS;
+                        if after_pass {
+                            late.fetch_add(1, Ordering::Relaxed);
+                        }
+                        match taken {
+                            Ok(take) => take.sent(PACKET),
+                            Err(_) if after_pass => {
+                                lapsed.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(_) => {
+                                lost.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+        for task in tasks {
+            task.await.unwrap();
+        }
+        (
+            lost.load(Ordering::Relaxed),
+            lapsed.load(Ordering::Relaxed),
+            late.load(Ordering::Relaxed),
+            cap.admission.outstanding(),
+        )
+    });
+    let total = (SENDERS * TAKES) as u64;
+    assert_eq!(
+        lost, 0,
+        "{lost} of {total} admitted takes found the bucket short within the pass \
+         ({lapsed} more after it lapsed)"
+    );
+    assert_eq!(
+        outstanding, 0,
+        "every take that succeeded used its admission, and a failed one's lapsed"
+    );
+    // How many takes came after the pass depends on the machine's load, so it
+    // is not bounded here: `a_take_after_its_admission_lapsed_leaves_a_newer_admission_its_datagram`
+    // makes that race happen on purpose, on virtual time.
+    let _ = late;
+}
+
+/// A waiter with more than `MAX_ADMISSION_WAKERS` queued ahead of it is not
+/// admitted however full the bucket is: the clamp on its stagger is for its
+/// timer only. Before, the clamp also applied to what it owed, so in a burst
+/// of more than 1025 datagrams it needed only 1025 and was admitted ahead of
+/// waiters queued before it. The waiter exactly at the bound is admitted.
+#[test]
+fn a_waiter_past_the_count_bound_is_not_admitted_by_a_large_burst() {
+    // 60 MB/s: a 25 ms burst of 1.5 MB, 1250 datagrams.
+    let (cap, time) = cap_at(60_000_000);
+    let burst_datagrams = cap.burst_bytes() as usize / PACKET;
+    assert!(burst_datagrams > MAX_ADMISSION_WAKERS + 1);
+    cap.charge_unpaced(cap.burst_bytes() as usize);
+    let (waker, _counter) = counting_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut waiters: Vec<_> = (0..MAX_ADMISSION_WAKERS + 2)
+        .map(|_| {
+            let mut waiter = AdmissionWaiter::default();
+            assert!(cap.poll_admit(PACKET, &mut waiter, &mut cx).is_pending());
+            waiter
+        })
+        .collect();
+    // Refill the whole burst.
+    time.advance(Duration::from_millis(30));
+    assert_eq!(cap.level_bytes(), cap.burst_bytes() as i64);
+    let (at_bound, past_bound) = waiters.split_at_mut(MAX_ADMISSION_WAKERS + 1);
+    assert!(
+        cap.poll_admit(PACKET, &mut past_bound[0], &mut cx)
+            .is_pending(),
+        "{} waiters ahead, {burst_datagrams} datagrams in the bucket: not its turn",
+        MAX_ADMISSION_WAKERS + 1
+    );
+    assert!(
+        cap.poll_admit(PACKET, &mut at_bound[MAX_ADMISSION_WAKERS], &mut cx)
+            .is_ready(),
+        "{MAX_ADMISSION_WAKERS} ahead and the bucket holds a datagram for each and its own"
+    );
+}
+
+/// A take with no admission of its own (a QUIC endpoint's `respond` send, or
+/// a stream whose admission lapsed) leaves the datagram owed to an admission
+/// whose take has not happened yet, and that admission's own take still
+/// succeeds.
+#[test]
+fn a_take_without_an_admission_leaves_the_admitted_datagram() {
+    let (cap, _time) = cap_at(RATE);
+    // One datagram and a bit in the bucket.
+    cap.charge_unpaced(BURST as usize - PACKET - 100);
+    let (waker, _counter) = counting_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut waiter = AdmissionWaiter::named();
+    assert!(cap.poll_admit(PACKET, &mut waiter, &mut cx).is_ready());
+    assert!(
+        cap.try_take(PACKET, Duration::ZERO).is_err(),
+        "a take naming no admission must leave the datagram"
+    );
+    let mut stranger = AdmissionWaiter::named();
+    assert!(
+        cap.try_take_admitted(PACKET, Duration::ZERO, &mut stranger)
+            .is_err(),
+        "a named waiter without an admission must leave it too"
+    );
+    cap.try_take_admitted(PACKET, Duration::ZERO, &mut waiter)
+        .expect("the admitted waiter takes its datagram")
+        .sent(PACKET);
+    assert_eq!(cap.admission.outstanding(), 0);
+}
+
+/// A take uses only the admission it names. One that names none (quinn's
+/// endpoint response, sent with no poll) leaves every admission's datagram in
+/// the bucket, the QUIC poller's included; the poller's handed take uses its
+/// own; and the stream's admission is used only by the stream.
+#[test]
+fn a_take_uses_only_the_admission_it_names() {
+    let (cap, _time) = cap_at(RATE);
+    cap.charge_unpaced(BURST as usize - 2 * PACKET - 100);
+    let (waker, _counter) = counting_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut stream = AdmissionWaiter::named();
+    let mut quic = AdmissionWaiter::default();
+    assert!(cap.poll_admit(PACKET, &mut stream, &mut cx).is_ready());
+    assert!(cap.poll_admit(PACKET, &mut quic, &mut cx).is_ready());
+    assert_eq!(cap.admission.outstanding(), 2);
+    assert!(
+        cap.try_take(PACKET, Duration::ZERO).is_err(),
+        "a take naming no admission must leave both admissions' datagrams"
+    );
+    assert_eq!(cap.admission.outstanding(), 2);
+    cap.try_take_handed(PACKET, Duration::ZERO, quic.admission())
+        .expect("the QUIC take uses the poller's admission")
+        .sent(PACKET);
+    assert_eq!(cap.admission.outstanding(), 1);
+    assert!(
+        cap.try_take_handed(PACKET, Duration::ZERO, quic.admission())
+            .is_err(),
+        "the poller's admission is used, so a second take with it is a take with none"
+    );
+    cap.try_take_admitted(PACKET, Duration::ZERO, &mut stream)
+        .expect("the stream takes its own")
+        .sent(PACKET);
+    assert_eq!(cap.admission.outstanding(), 0);
+}
+
+/// Dropping a named waiter between its admission and its take withdraws the
+/// admission, so it does not hold a datagram until it lapses.
+#[test]
+fn dropping_an_admitted_waiter_withdraws_its_admission() {
+    let (cap, _time) = cap_at(RATE);
+    cap.charge_unpaced(BURST as usize - PACKET - 100);
+    let (waker, _counter) = counting_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut waiter = AdmissionWaiter::named();
+    assert!(cap.poll_admit(PACKET, &mut waiter, &mut cx).is_ready());
+    assert_eq!(cap.admission.outstanding(), 1);
+    drop(waiter);
+    assert_eq!(cap.admission.outstanding(), 0);
+    cap.try_take(PACKET, Duration::ZERO)
+        .expect("the datagram is free again")
+        .sent(PACKET);
+}
+
+/// The race of `an_admitted_take_is_not_lost_to_another_thread`, made to
+/// happen: a sender is admitted, its admission lapses before its take (it was
+/// descheduled past `ADMISSION_PASS`), and a second sender is admitted on the
+/// same datagram. The late take must leave that datagram to the second
+/// sender's admission. When admissions were counted and not named, the late
+/// take used it and cleared the second admission as its own, and the second
+/// sender's take failed inside its pass.
+#[test]
+fn a_take_after_its_admission_lapsed_leaves_a_newer_admission_its_datagram() {
+    // 10 kB/s: the pass refills 10 bytes, far less than a datagram.
+    let (cap, time) = cap_at(10_000);
+    cap.charge_unpaced(cap.burst_bytes() as usize - PACKET - 50);
+    let (waker, _) = counting_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut late = AdmissionWaiter::named();
+    let mut newer = AdmissionWaiter::named();
+    assert!(cap.poll_admit(PACKET, &mut late, &mut cx).is_ready());
+    time.advance(ADMISSION_PASS + Duration::from_micros(100));
+    assert!(
+        cap.poll_admit(PACKET, &mut newer, &mut cx).is_ready(),
+        "the late admission has lapsed, so the datagram is the newer sender's"
+    );
+    assert!(
+        cap.try_take_admitted(PACKET, Duration::ZERO, &mut late)
+            .is_err(),
+        "the late take must not use the datagram admitted to the newer sender"
+    );
+    cap.try_take_admitted(PACKET, Duration::ZERO, &mut newer)
+        .expect("the newer admission takes its datagram")
+        .sent(PACKET);
+    assert_eq!(cap.admission.outstanding(), 0);
+}
+
+/// A take that fails after its admission (an unpaced send, an ACK or a
+/// retransmission charged on another thread, took the datagram first) keeps
+/// the sender's place: it queues again at the place it was admitted from, ahead
+/// of a sender that queued after it. Before, it went to the back, and on a
+/// relay whose queue takes about 3 s per turn one such take could push a
+/// stream's gap past the 5 s deadline.
+#[test]
+fn a_failed_take_keeps_its_place_ahead_of_later_waiters() {
+    a_failed_take_keeps_its_place(false);
+    a_failed_take_keeps_its_place(true);
+}
+
+/// `first_poll`: the sender is admitted on its first poll, with no place given
+/// up, and the later sender queues after that.
+fn a_failed_take_keeps_its_place(first_poll: bool) {
+    let (cap, time) = cap_at(RATE);
+    cap.charge_unpaced(BURST as usize);
+    let (waker, _) = counting_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut first = AdmissionWaiter::named();
+    let mut second = AdmissionWaiter::named();
+    if first_poll {
+        // One datagram: the first is admitted at once, then the second queues.
+        time.advance(Duration::from_micros(PACKET as u64));
+        assert!(cap.poll_admit(PACKET, &mut first, &mut cx).is_ready());
+        assert!(cap.poll_admit(PACKET, &mut second, &mut cx).is_pending());
+    } else {
+        assert!(cap.poll_admit(PACKET, &mut first, &mut cx).is_pending());
+        assert!(cap.poll_admit(PACKET, &mut second, &mut cx).is_pending());
+        // One datagram: the first is admitted.
+        time.advance(Duration::from_micros(PACKET as u64));
+        assert!(cap.poll_admit(PACKET, &mut first, &mut cx).is_ready());
+    }
+    // An unpaced send takes it.
+    cap.charge_unpaced(PACKET);
+    assert!(
+        cap.try_take_admitted(PACKET, Duration::ZERO, &mut first)
+            .is_err(),
+        "premise: the take failed"
+    );
+    assert!(cap.poll_admit(PACKET, &mut first, &mut cx).is_pending());
+    // The next datagram is the first sender's again.
+    time.advance(Duration::from_micros(2 * PACKET as u64));
+    let extra = cap.level_bytes() - PACKET as i64;
+    cap.charge_unpaced(extra.max(0) as usize);
+    assert!(
+        cap.poll_admit(PACKET, &mut second, &mut cx).is_pending(),
+        "the sender that queued later waits"
+    );
+    assert!(cap.poll_admit(PACKET, &mut first, &mut cx).is_ready());
+    cap.try_take_admitted(PACKET, Duration::ZERO, &mut first)
+        .expect("its turn")
+        .sent(PACKET);
+}
+
+/// A QUIC take that fails leaves its poller's admission in place; the poller
+/// withdraws it when it polls again, so it is not counted ahead of itself.
+/// A failed take nobody was admitted for (quinn's `respond` path: a stateless
+/// reset, a Retry, a version negotiation, sent with no `poll_writable`)
+/// leaves the live admission of another poller alone.
+#[test]
+fn a_failed_quic_take_leaves_the_admission_to_its_poller() {
+    let (cap, time) = cap_at(RATE);
+    cap.charge_unpaced(BURST as usize - PACKET - 100);
+    let (waker, _) = counting_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut poller = AdmissionWaiter::default();
+    assert!(cap.poll_admit(PACKET, &mut poller, &mut cx).is_ready());
+    cap.charge_unpaced(500);
+    assert!(
+        cap.try_take(PACKET, Duration::ZERO).is_err(),
+        "a respond-path send, with the bucket short"
+    );
+    assert_eq!(
+        cap.admission.outstanding(),
+        1,
+        "the poller's admission is still there"
+    );
+    assert!(cap.poll_admit(PACKET, &mut poller, &mut cx).is_pending());
+    assert_eq!(cap.admission.outstanding(), 0, "withdrawn by its poller");
+    time.advance(Duration::from_micros(PACKET as u64));
+    assert!(cap.poll_admit(PACKET, &mut poller, &mut cx).is_ready());
+}
+
+/// A follower that polled while an admission was outstanding counted that
+/// admission's datagram. When the admission lapses unused, nothing wakes the
+/// follower, so its timer is set no later than the lapse; when it is
+/// withdrawn (its waiter dropped), the follower is woken.
+#[test]
+fn a_follower_is_not_left_asleep_by_an_admission_that_goes_unused() {
+    // 10 kB/s: two datagrams' refill is 240 ms, the pass 1 ms.
+    let (cap, time) = cap_at(10_000);
+    cap.charge_unpaced(cap.burst_bytes() as usize - PACKET - 50);
+    let (waker, counter) = counting_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut admitted = AdmissionWaiter::named();
+    let mut follower = AdmissionWaiter::named();
+    let at = time.now_nanos();
+    assert!(cap.poll_admit(PACKET, &mut admitted, &mut cx).is_ready());
+    assert!(cap.poll_admit(PACKET, &mut follower, &mut cx).is_pending());
+    let pass = ADMISSION_PASS.as_nanos() as u64;
+    assert!(
+        follower.wake_at_ns().expect("a timer") <= at + pass + 1,
+        "the follower looks again when the admission lapses"
+    );
+    let before = woken(&counter);
+    drop(admitted);
+    assert!(
+        woken(&counter) > before,
+        "dropping the admitted waiter wakes the follower"
+    );
+}
+
+/// A named waiter that polls again before it takes withdraws the admission it
+/// did not use, so it holds at most one.
+#[test]
+fn polling_again_holds_one_admission() {
+    let (cap, _time) = cap_at(RATE);
+    let (waker, _) = counting_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut waiter = AdmissionWaiter::named();
+    assert!(cap.poll_admit(PACKET, &mut waiter, &mut cx).is_ready());
+    assert!(cap.poll_admit(PACKET, &mut waiter, &mut cx).is_ready());
+    assert_eq!(cap.admission.outstanding(), 1);
+}
+
+/// At most `MAX_ADMISSION_WAKERS` admissions are live at once. The next waiter
+/// waits, though the bucket holds a datagram for it, until one lapses; none is
+/// dropped while its owner can still take it.
+#[test]
+fn live_admissions_are_bounded_and_none_is_dropped() {
+    // 60 MB/s: a 1250-datagram burst covers 1025 admissions.
+    let (cap, time) = cap_at(60_000_000);
+    let (waker, _) = counting_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut waiters: Vec<_> = (0..MAX_ADMISSION_WAKERS)
+        .map(|_| {
+            let mut waiter = AdmissionWaiter::named();
+            assert!(cap.poll_admit(PACKET, &mut waiter, &mut cx).is_ready());
+            waiter
+        })
+        .collect();
+    assert_eq!(cap.admission.outstanding(), MAX_ADMISSION_WAKERS);
+    let mut next = AdmissionWaiter::named();
+    assert!(
+        cap.poll_admit(PACKET, &mut next, &mut cx).is_pending(),
+        "no room for another live admission"
+    );
+    assert_eq!(cap.admission.outstanding(), MAX_ADMISSION_WAKERS);
+    cap.try_take_admitted(PACKET, Duration::ZERO, &mut waiters[0])
+        .expect("the first admission is still there")
+        .sent(PACKET);
+    let last = waiters.last_mut().expect("many");
+    cap.try_take_admitted(PACKET, Duration::ZERO, last)
+        .expect("the last admission is still there")
+        .sent(PACKET);
+    time.advance(ADMISSION_PASS + Duration::from_micros(1));
+    assert!(cap.poll_admit(PACKET, &mut next, &mut cx).is_ready());
+}
+
+/// A sender whose take succeeded has no place to keep: if the same waiter
+/// polls again for its next datagram, it queues behind a sender that queued
+/// meanwhile.
+#[test]
+fn a_sender_that_sent_queues_behind_later_waiters() {
+    let (cap, time) = cap_at(RATE);
+    cap.charge_unpaced(BURST as usize - PACKET - 100);
+    let (waker, _) = counting_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut sender = AdmissionWaiter::named();
+    let mut later = AdmissionWaiter::named();
+    assert!(cap.poll_admit(PACKET, &mut sender, &mut cx).is_ready());
+    cap.try_take_admitted(PACKET, Duration::ZERO, &mut sender)
+        .expect("its turn")
+        .sent(PACKET);
+    assert!(cap.poll_admit(PACKET, &mut later, &mut cx).is_pending());
+    assert!(cap.poll_admit(PACKET, &mut sender, &mut cx).is_pending());
+    time.advance(Duration::from_micros(PACKET as u64));
+    assert!(
+        cap.poll_admit(PACKET, &mut sender, &mut cx).is_pending(),
+        "the sender that already sent waits its turn"
+    );
+    assert!(cap.poll_admit(PACKET, &mut later, &mut cx).is_ready());
+}
+
+/// A waiter that polls again holding an admission it did not use, and is
+/// refused, withdraws that admission and wakes the next waiter: its timer
+/// counted on that admission's datagram, which is free now.
+#[test]
+fn a_refused_re_poll_that_withdraws_its_admission_wakes_the_next_waiter() {
+    let (cap, _time) = cap_at(RATE);
+    // Room for one datagram, not two.
+    cap.charge_unpaced(BURST as usize - PACKET - 100);
+    let (first_waker, _first) = counting_waker();
+    let (next_waker, next) = counting_waker();
+    let mut admitted = AdmissionWaiter::default();
+    let mut follower = AdmissionWaiter::default();
+    assert!(
+        cap.poll_admit(
+            PACKET,
+            &mut admitted,
+            &mut Context::from_waker(&first_waker)
+        )
+        .is_ready()
+    );
+    assert!(
+        cap.poll_admit(PACKET, &mut follower, &mut Context::from_waker(&next_waker))
+            .is_pending(),
+        "the admitted waiter's datagram is owed"
+    );
+    assert_eq!(woken(&next), 0);
+    // The admitted waiter's send never happened, and the bucket is drained
+    // meanwhile, so its next poll is refused.
+    cap.charge_unpaced(PACKET);
+    assert!(
+        cap.poll_admit(
+            PACKET,
+            &mut admitted,
+            &mut Context::from_waker(&first_waker)
+        )
+        .is_pending()
+    );
+    assert_eq!(
+        cap.admission.outstanding(),
+        0,
+        "the unused admission is withdrawn"
+    );
+    assert_eq!(
+        woken(&next),
+        1,
+        "and the next waiter is woken to look again"
+    );
 }

@@ -512,6 +512,32 @@ where
 
         let is_new_contract = self.state_store.get(&key).await.is_err();
 
+        // Applied-payload record (`crate::ring::applied_payloads`). The hash is
+        // taken here, before `update` is consumed, and recorded ONLY at the
+        // commit points below: a merge that committed a changed state, and an
+        // incoming state byte-identical to the stored one, are recorded. A
+        // merge that left the state unchanged is NOT (it may be a silent
+        // refusal), nor is a refused, failed, deferred, init-queued or
+        // broken-suppressed merge, so all of those can be retried. A non-merge
+        // replacement (initial install, corrupted-state recovery) resets the
+        // record instead. Local-mode paths without an `op_manager` skip all of
+        // it.
+        let applied_payloads = self
+            .op_manager
+            .as_ref()
+            .map(|m| m.ring.applied_payloads.clone());
+        let applied_hash = applied_payloads.as_ref().map(|set| match &update {
+            Either::Left(state) => set.payload_hash(false, state.as_ref()),
+            Either::Right(delta) => set.payload_hash(true, delta.as_ref()),
+        });
+        let record_absorbed = |applied_payloads: &Option<
+            std::sync::Arc<crate::ring::applied_payloads::AppliedPayloads>,
+        >| {
+            if let (Some(set), Some(hash)) = (applied_payloads, applied_hash) {
+                set.record_absorbed(&key, hash);
+            }
+        };
+
         // Save the incoming full state (if any) for potential corrupted-state recovery.
         // When the stored state is corrupted, WASM merge fails. If we have a validated
         // incoming full state, we can replace the corrupted state with it.
@@ -680,6 +706,16 @@ where
                                         cause: over.to_string().into(),
                                     }));
                                 }
+                            }
+                            // Initial install: the state is about to be
+                            // replaced without a merge, so nothing recorded
+                            // before (for example ahead of an eviction whose
+                            // reset was missed) describes it. Reset BEFORE the
+                            // store: clearing early only loses skips, while a
+                            // reset after the store would leave a window in
+                            // which a stale record describes the new state.
+                            if let Some(set) = &applied_payloads {
+                                set.reset(&key);
                             }
                             self.state_store
                                 .store(key, state_to_store, params.clone())
@@ -974,6 +1010,8 @@ where
                     event = "merge_skipped_identical",
                     "Incoming state is byte-identical to stored state — skipping WASM update_state"
                 );
+                // The incoming state IS the stored state: absorbed.
+                record_absorbed(&applied_payloads);
                 return Ok(UpsertResult::NoChange);
             }
         }
@@ -1304,6 +1342,13 @@ where
                 !recovery_performed,
                 "a corrupted-state recovery produced the stored state"
             );
+            // Deliberately NOT recorded. A merge that leaves the state
+            // unchanged may be a silent refusal rather than an absorption: a
+            // contract can drop part of a payload under a condition that later
+            // clears (an entry whose prerequisite has not arrived yet) and
+            // return its old state instead of an error. Recording it would
+            // skip the same bytes when they are offered again after the
+            // condition cleared. See `crate::ring::applied_payloads`.
             return Ok(UpsertResult::NoChange);
         }
 
@@ -1361,12 +1406,27 @@ where
             return Ok(UpsertResult::NoChange);
         }
 
-        // Outcome discarded deliberately: a broken-contract suppression
-        // here is already reported to the caller as the `NoChange` above,
-        // and this path has no trailing fan-out to gate on it.
-        let _ = self
+        // A corrupted-state recovery replaces the stored state with the
+        // incoming one instead of merging, so the applied-payload record no
+        // longer describes it. Reset BEFORE the commit, like the initial
+        // install: clearing early only loses skips, and a reset after the
+        // write would leave a window in which a stale record describes the
+        // replaced state.
+        if recovery_performed {
+            if let Some(set) = &applied_payloads {
+                set.reset(&key);
+            }
+        }
+        // A broken-contract suppression here is reported to the caller as
+        // `Updated` exactly as before (this path has no trailing fan-out to gate
+        // on it); the outcome is read only to decide the applied-payload
+        // record, which must not claim a payload that was never stored.
+        let commit_outcome = self
             .commit_state_update(&key, &params, &updated_state)
             .await?;
+        if matches!(commit_outcome, StateCommitOutcome::Committed) && !recovery_performed {
+            record_absorbed(&applied_payloads);
+        }
         Ok(UpsertResult::Updated(updated_state))
     }
 
