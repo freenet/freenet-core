@@ -437,6 +437,16 @@ pub(crate) struct NetworkEfficiencyV1 {
     /// so the series is monotonically non-increasing and reads as "of the
     /// streaks that got to 1, how many got to 32".
     pub futile_ladder: [u64; crate::ring::futile_repair::LADDER_LEN],
+    /// Received payloads skipped because this node had already merged them
+    /// into its current state (`crate::ring::applied_payloads`): delta count,
+    /// full-state count, delta bytes, full-state bytes. Not included in
+    /// `recv_tn`/`recv_tb`. Added without bumping `v`: an older node simply
+    /// does not send the field. Kept LAST so positional bincode decoding of the
+    /// fields before it is unchanged; a buffered pre-upgrade record lacks it
+    /// and is skipped once, as `RouterSnapshotInfo::network_efficiency_v1`
+    /// documents.
+    #[serde(default)]
+    pub recv_ap: [u64; 4],
 }
 
 /// Periodic snapshot of the router model state for telemetry.
