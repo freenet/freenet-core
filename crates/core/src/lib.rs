@@ -239,8 +239,8 @@ pub mod dev_tool {
 
     // Re-export simulation types for test infrastructure
     pub use crate::simulation::{
-        FaultConfig, FaultConfigBuilder, Partition, QuicDatagramDrop, SimulationRng, TimeSource,
-        VirtualTime, WakeupId,
+        FaultConfig, FaultConfigBuilder, Partition, QuicDatagramCut, QuicDatagramDrop,
+        SimulationRng, TimeSource, VirtualTime, WakeupId,
     };
 
     // Re-export fault injector for mid-simulation fault injection in Turmoil tests
