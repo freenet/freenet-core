@@ -235,12 +235,13 @@ pub enum ConformanceProperty {
     /// exists to catch.
     ///
     /// Ian's call (2026-08-17) was to leave it removal-eligible and settle the
-    /// question when the active-but-not-enforcing phase is wired, with real shadow
-    /// telemetry rather than a five-contract sample. Do not quietly downgrade it
-    /// before then, and do not let Enforce become reachable without revisiting it.
+    /// question with real shadow telemetry rather than a five-contract sample.
     /// Reaffirmed 2026-10-22 (#5906) when [`ConformanceProperty::PathAgreement`]
     /// became report-only: this is the sync-loop check, and it stays
-    /// removal-eligible.
+    /// removal-eligible. The removal plan itself is now superseded and `Enforce`
+    /// is unreachable and not planned (see `policy`'s module docs), so the tier
+    /// only decides whether a finding is counted as `would_remove` or as reported
+    /// in the shadow diagnostics.
     ///
     /// What would settle it, in either direction:
     ///
@@ -331,8 +332,9 @@ pub enum ConformanceProperty {
     /// `ReconciliationCycle` this is a single step with no schedule to get wrong,
     /// which is the narrower assumption of the two.
     ///
-    /// Shadow-mode counts are what should settle whether it should ever become
-    /// removal-eligible again. Its findings are in the shadow `reported` count, not
+    /// Shadow-mode counts are what would settle whether it should count as
+    /// removal-eligible again (a diagnostic distinction only: nodes do not remove
+    /// contracts, see `policy`'s module docs). Its findings are in the shadow `reported` count, not
     /// `would_remove`; the number to read is contracts flagged by THIS property and
     /// by no removal-eligible one. If that number stays at zero the property adds
     /// nothing a removal could rest on; if it is the sole finding for real
@@ -867,7 +869,8 @@ pub enum IdempotenceSettling {
     /// running out is not a proof that the state never settles; replacing it with
     /// one (a repeated state, or a re-delivery failure) is tracked in #5906.
     ///
-    /// **Known gap, to close before Enforce can become reachable:** a contract
+    /// **Known gap** (it would have had to close before Enforce could become
+    /// reachable; Enforce is not planned, see `policy`'s module docs): a contract
     /// that settles after more rewrites than the budget lands here and is
     /// removal-eligible. Pinned as current behaviour by
     /// `policy::tests::known_gap_idempotence_not_shown_to_settle_stays_removal_eligible`.
@@ -899,12 +902,13 @@ pub enum IdempotenceSettling {
     /// into `settling: None` (ambiguous with "this property carries no settling
     /// data at all").
     ///
-    /// **Known gap, to close before Enforce can become reachable:** this class
+    /// **Known gap** (it would have had to close before Enforce could become
+    /// reachable; Enforce is not planned, see `policy`'s module docs): this class
     /// keeps the property's removal-eligible tier, yet it can come from a fuel trap
     /// or a resource ceiling on the follow-up merges, which a PUT of an unusual or
-    /// large state can reach. Removal must rest on proof that the state never
-    /// settles, not on classification failing. That proof is the next #5906 item;
-    /// until then this is pinned as current behaviour by
+    /// large state can reach. A removal would have had to rest on proof that the
+    /// state never settles, not on classification failing. Pinned as current
+    /// behaviour by
     /// `policy::tests::known_gap_idempotence_not_shown_to_settle_stays_removal_eligible`.
     Indeterminate,
 }

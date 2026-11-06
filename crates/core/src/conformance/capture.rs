@@ -598,7 +598,8 @@ async fn run_writer(
     // Shadow mode rides the capture task: it already owns the samples, and it is
     // already off the merge path, which is the property that matters most. The
     // mode is `default()` — Shadow — and there is deliberately no way to reach
-    // `Enforce` from here.
+    // `Enforce` from here. Enforce is retained, unreachable and not planned (see
+    // `policy`'s module docs).
     let mut shadow = crate::conformance::shadow::ShadowRunner::new(
         &dir,
         crate::conformance::policy::EnforcementMode::default(),
