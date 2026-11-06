@@ -2828,18 +2828,28 @@ fn bounded_send_classifies_by_whether_the_stream_was_finished() {
         let time = VirtualTime::new();
         let clock = time.clone();
         let (unopened, blocked, finished_then_blocked, timings) = drive(&time, LIMIT, async move {
-            let unopened = bounded_send(&clock, Duration::from_secs(1), |_| never()).await;
+            let unopened = bounded_send(&clock, Duration::from_secs(1), None, |_| never()).await;
             let start = clock.now();
-            let blocked = bounded_send(&clock, Duration::from_secs(5), |progress| async move {
-                progress.mark_opened();
-                never().await
-            })
+            let blocked = bounded_send(
+                &clock,
+                Duration::from_secs(5),
+                None,
+                |progress| async move {
+                    progress.mark_opened();
+                    never().await
+                },
+            )
             .await;
             let blocked_after = clock.now() - start;
-            let finished = bounded_send(&clock, Duration::from_secs(3), |progress| async move {
-                progress.mark_finished();
-                never().await
-            })
+            let finished = bounded_send(
+                &clock,
+                Duration::from_secs(3),
+                None,
+                |progress| async move {
+                    progress.mark_finished();
+                    never().await
+                },
+            )
             .await;
             (
                 unopened,
@@ -2904,7 +2914,7 @@ fn bounded_send_that_finishes_early_leaves_no_wakeup() {
         let time = VirtualTime::new();
         let clock = time.clone();
         let sent = drive(&time, LIMIT, async move {
-            bounded_send(&clock, Duration::from_secs(60), |_| async { Ok(()) }).await
+            bounded_send(&clock, Duration::from_secs(60), None, |_| async { Ok(()) }).await
         })
         .await;
         assert!(matches!(sent, BoundedSend::Sent), "{sent:?}");
@@ -3442,7 +3452,7 @@ fn the_gap_runs_from_the_last_step_and_total_still_binds() {
         let (stalled, stalled_after, steady, steady_after) = drive(&time, LIMIT, async move {
             let start = clock.now();
             let stepping = clock.clone();
-            let stalled = bounded_send(&clock, deadlines, |progress| async move {
+            let stalled = bounded_send(&clock, deadlines, None, |progress| async move {
                 progress.mark_opened();
                 for _ in 0..3 {
                     stepping.sleep(Duration::from_secs(3)).await;
@@ -3454,7 +3464,7 @@ fn the_gap_runs_from_the_last_step_and_total_still_binds() {
             let stalled_after = clock.now() - start;
             let start = clock.now();
             let stepping = clock.clone();
-            let steady = bounded_send(&clock, deadlines, |progress| async move {
+            let steady = bounded_send(&clock, deadlines, None, |progress| async move {
                 progress.mark_opened();
                 loop {
                     stepping.sleep(Duration::from_secs(3)).await;
@@ -3478,6 +3488,182 @@ fn the_gap_runs_from_the_last_step_and_total_still_binds() {
     })
 }
 
+/// A send stuck between two writes, on a connection acknowledged every second
+/// for its first 30 s, with deadlines of 2 s, 5 s and 120 s, timed on `clock`
+/// with `connection` read through `acks` and `cap`: what it ended as, after
+/// how long. `ack_until` 0 acknowledges nothing; `hold` has the cap hold a
+/// transmit every second instead of the peer acknowledging.
+async fn stuck_send(
+    clock: VirtualTime,
+    ack_until: u64,
+    hold: bool,
+    total: Duration,
+) -> (BoundedSend, Duration) {
+    let acks = recycle::AckProgress::detached();
+    let cap = Arc::new(super::super::socket::CapHolds::new(Some(10_000_000)));
+    let connection = bounded::ConnectionProgress {
+        acks: acks.clone(),
+        cap_holds: cap.clone(),
+    };
+    let deadlines = SendDeadlines {
+        open: Duration::from_secs(2),
+        gap: Some(Duration::from_secs(5)),
+        total,
+    };
+    let start = clock.now();
+    let ticking = clock.clone();
+    let peer = async move {
+        for _ in 0..ack_until {
+            ticking.sleep(Duration::from_secs(1)).await;
+            if hold {
+                cap.hold_one();
+            } else {
+                acks.ack();
+            }
+        }
+        never().await
+    };
+    let send = bounded_send(&clock, deadlines, Some(connection), |progress| async move {
+        progress.mark_opened();
+        never().await
+    });
+    let outcome = tokio::select! {
+        outcome = send => outcome,
+        _ = peer => unreachable!("the peer never ends"),
+    };
+    (outcome, clock.now() - start)
+}
+
+/// While the connection is acknowledged a send's gap does not run out, and
+/// once nothing is it ends within twice `STALL_PROGRESS_WINDOW` of the last
+/// acknowledgement. The timer is first armed for `open` (2 s), before the send
+/// marks its stream open; the wakes at 2, 12, 22 and 32 s each see a new
+/// acknowledgement, and the one at 42 s sees none, 12 s after the last (30 s).
+#[test]
+fn the_gap_runs_on_while_the_connection_is_acknowledged() {
+    bounded(|| async move {
+        let time = VirtualTime::new();
+        let clock = time.clone();
+        let (sent, after) = drive(&time, LIMIT, async move {
+            stuck_send(clock, 30, false, Duration::from_secs(120)).await
+        })
+        .await;
+        assert!(
+            matches!(sent, BoundedSend::Failed(SendFailure::TimedOut)),
+            "{sent:?}"
+        );
+        assert_eq!(after, Duration::from_secs(42));
+        assert!(after.as_secs() <= 30 + 2 * super::route::STALL_PROGRESS_WINDOW.as_secs());
+    })
+}
+
+/// With nothing acknowledged during the send, as on a path gone dark, the send
+/// fails at its own 5 s gap, as without the connection's progress.
+#[test]
+fn the_gap_runs_out_on_its_own_when_nothing_is_acknowledged() {
+    bounded(|| async move {
+        let time = VirtualTime::new();
+        let clock = time.clone();
+        let (sent, after) = drive(&time, LIMIT, async move {
+            stuck_send(clock, 0, false, Duration::from_secs(120)).await
+        })
+        .await;
+        assert!(
+            matches!(sent, BoundedSend::Failed(SendFailure::TimedOut)),
+            "{sent:?}"
+        );
+        assert_eq!(after, Duration::from_secs(5));
+    })
+}
+
+/// An egress cap holding the node's QUIC transmits counts as the connection
+/// moving, as for the stall count: nothing can be acknowledged meanwhile.
+#[test]
+fn a_cap_hold_counts_as_the_connection_moving() {
+    bounded(|| async move {
+        let time = VirtualTime::new();
+        let clock = time.clone();
+        let (sent, after) = drive(&time, LIMIT, async move {
+            stuck_send(clock, 30, true, Duration::from_secs(120)).await
+        })
+        .await;
+        assert!(
+            matches!(sent, BoundedSend::Failed(SendFailure::TimedOut)),
+            "{sent:?}"
+        );
+        assert_eq!(after, Duration::from_secs(42));
+    })
+}
+
+/// A send waiting for its own source gets no time from the connection's
+/// progress, even after the connection's window has pushed its timer out. The
+/// wake at 2 s sees acknowledgements and arms the timer for 12 s; a step at
+/// 3 s and then a wait for the source end the send at its own gap, 8 s.
+#[test]
+fn a_send_waiting_for_its_source_ends_at_its_own_gap() {
+    bounded(|| async move {
+        let time = VirtualTime::new();
+        let clock = time.clone();
+        let (sent, after) = drive(&time, LIMIT, async move {
+            let acks = recycle::AckProgress::detached();
+            let connection = bounded::ConnectionProgress {
+                acks: acks.clone(),
+                cap_holds: Arc::new(super::super::socket::CapHolds::new(None)),
+            };
+            let deadlines = SendDeadlines {
+                open: Duration::from_secs(2),
+                gap: Some(Duration::from_secs(5)),
+                total: Duration::from_secs(120),
+            };
+            let start = clock.now();
+            let ticking = clock.clone();
+            let peer = async move {
+                loop {
+                    ticking.sleep(Duration::from_secs(1)).await;
+                    acks.ack();
+                }
+            };
+            let stepping = clock.clone();
+            let send = bounded_send(&clock, deadlines, Some(connection), |progress| async move {
+                progress.mark_opened();
+                stepping.sleep(Duration::from_secs(3)).await;
+                progress.step();
+                progress.waiting_on_source(true);
+                never().await
+            });
+            let outcome = tokio::select! {
+                outcome = send => outcome,
+                () = peer => unreachable!("the peer never ends"),
+            };
+            (outcome, clock.now() - start)
+        })
+        .await;
+        assert!(
+            matches!(sent, BoundedSend::Failed(SendFailure::TimedOut)),
+            "{sent:?}"
+        );
+        assert_eq!(after, Duration::from_secs(8));
+    })
+}
+
+/// `total` still ends a send whose connection never stops moving.
+#[test]
+fn total_ends_a_send_on_a_connection_that_keeps_moving() {
+    bounded(|| async move {
+        let time = VirtualTime::new();
+        let clock = time.clone();
+        let (sent, after) = drive(&time, LIMIT, async move {
+            stuck_send(clock, 1000, false, Duration::from_secs(60)).await
+        })
+        .await;
+        assert!(
+            matches!(sent, BoundedSend::Failed(SendFailure::TimedOut)),
+            "{sent:?}"
+        );
+        assert_eq!(after, Duration::from_secs(60));
+    })
+}
+
 /// The wait for the acknowledgement has no gap: it includes a send window of
 /// backlog, so only `total` ends it. The open deadline ends a send that has
 /// not opened, however long `total` is.
@@ -3494,7 +3680,7 @@ fn the_gap_ends_at_the_end_of_the_stream_and_open_binds_first() {
         let (finished, finished_after, unopened, unopened_after) =
             drive(&time, LIMIT, async move {
                 let start = clock.now();
-                let finished = bounded_send(&clock, deadlines, |progress| async move {
+                let finished = bounded_send(&clock, deadlines, None, |progress| async move {
                     progress.mark_opened();
                     progress.mark_finished();
                     never().await
@@ -3502,7 +3688,7 @@ fn the_gap_ends_at_the_end_of_the_stream_and_open_binds_first() {
                 .await;
                 let finished_after = clock.now() - start;
                 let start = clock.now();
-                let unopened = bounded_send(&clock, deadlines, |_| never()).await;
+                let unopened = bounded_send(&clock, deadlines, None, |_| never()).await;
                 (finished, finished_after, unopened, clock.now() - start)
             })
             .await;

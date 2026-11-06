@@ -137,6 +137,13 @@ impl CapHolds {
         self.held_now.fetch_sub(1, Ordering::AcqRel);
     }
 
+    /// The cap starts holding one more poller, as a poll answered `Pending`
+    /// records it. Tests only.
+    #[cfg(test)]
+    pub(crate) fn hold_one(&self) {
+        self.waiting(false);
+    }
+
     /// The hold events so far, whether a poller is held now, and how long a
     /// hold stays valid with no new event.
     pub(crate) fn read(&self) -> CapHoldReading {

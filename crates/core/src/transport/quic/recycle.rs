@@ -324,6 +324,18 @@ impl AckProgress {
     pub(crate) fn acked(&self) -> u64 {
         self.0.lock().acked
     }
+
+    /// A record of no connection, moved by [`Self::ack`]. Tests only.
+    #[cfg(test)]
+    pub(crate) fn detached() -> Self {
+        Self(Arc::default())
+    }
+
+    /// The peer newly acknowledged one more packet. Tests only.
+    #[cfg(test)]
+    pub(crate) fn ack(&self) {
+        self.0.lock().acked += 1;
+    }
 }
 
 /// A congestion controller that lowers `inner`'s window to the configured

@@ -1669,6 +1669,20 @@ Sending (QuicPath::send_short_bounded / send_stream_bounded /
   (STREAM_INACTIVITY_TIMEOUT) and inbound_stream_age_limit(len); a plain
   Duration is one deadline for all of it. A send from a source waits for the
   first chunk for the gap, counted in total, and open runs from when it arrives.
+  The gap is judged on CONNECTION progress (bounded::ConnectionWatch): a node
+  send runs out of gap only once its own gap has passed AND nothing on the
+  connection was newly acknowledged (recycle::AckProgress) or held by the egress
+  cap (recycle::cap_held) for STALL_PROGRESS_WINDOW (10 s), the stall count's
+  rule. Under random loss the 384 KiB send window drains at Cubic's window per
+  round trip, so writes wait past 5 s while acks still arrive; failing them
+  reset streams the peer was receiving (E5B9-LAB, 8 MiB at 5% loss and 200 ms
+  failed). The connection is read at the timer's wakes, so a send that stops
+  moving ends at its own gap or within 2 x STALL_PROGRESS_WINDOW of the last
+  move, never past total. It gives nothing until a wake during the send has
+  seen a move (a dark path still fails at 5 s), nothing while the send waits
+  for its own source (the receiver sees no bytes and evicts at its own 5 s; the
+  loop is woken to re-arm when that drops an extended deadline), and nothing
+  without a CappedCubic controller. Control sends have no gap.
   One timer per send, re-armed when it fires, as BodyReader. Messages are
   written in pieces of at most FRAGMENT_PAYLOAD_SIZE, each returning when quinn
   has buffered it, and each is a step of the gap and, for a stream, one
