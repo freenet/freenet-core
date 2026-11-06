@@ -33,6 +33,13 @@ use tokio::time::Instant;
 /// When the same delta/state is broadcast to us by multiple peers (which is
 /// expected in the gossip topology), we skip the expensive WASM merge call
 /// for duplicates. Uses ahash for fast hashing of payload bytes.
+///
+/// Kept alongside [`crate::ring::applied_payloads`], which remembers payloads
+/// already merged into the current state with no time limit. The two differ in
+/// when they learn a payload: this cache inserts BEFORE the merge, so it also
+/// drops copies that arrive while the first copy is still queued for or inside
+/// the merge; the applied-payload record learns a payload only after its merge
+/// commits. The receive drivers check this cache first.
 pub(crate) struct BroadcastDedupCache {
     /// Per-contract dedup entries, newest at back.
     entries: DashMap<ContractKey, VecDeque<DedupEntry>>,
