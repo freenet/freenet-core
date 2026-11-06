@@ -5818,12 +5818,131 @@ async fn handle_interest_sync_message(
             }
 
             // Deliberately NOT gated by the applied-payload record
-            // (`crate::ring::applied_payloads`). This node requested this
-            // response because its state differs from the sender's, and a quiet
-            // sender re-sends the same bytes every round: skipping them because
-            // an earlier merge of the same bytes was recorded could leave the
-            // divergence in place for good.
-            apply_resync_response_state(op_manager, key, source, &state_bytes).await;
+            // (`crate::ring::applied_payloads`) either. This node requested
+            // this response because its state differs from the sender's, and a
+            // quiet sender re-sends the same bytes every round: skipping them
+            // because an earlier merge of the same bytes was recorded could
+            // leave the divergence in place. Pinned behaviourally by
+            // `resync_response_applies_even_when_its_bytes_are_recorded`.
+            //
+            // Apply the full state using an update.
+            //
+            // This full-state WASM merge is deliberately NOT gated by the
+            // merge-failure backoff (#4861): unlike the broadcast drivers, the
+            // resync path is already double-bounded — the emitter-side per- and
+            // per-(peer,contract) + global rate limits throttle how often
+            // ResyncRequests (and thus these responses) are produced at all, and
+            // epoch preemption caps the cost of each individual merge. Gating it
+            // here would also risk suppressing a genuine heal.
+            let state = freenet_stdlib::prelude::State::from(state_bytes.clone());
+            let update_data = freenet_stdlib::prelude::UpdateData::State(state);
+
+            // Send to contract handler
+            use crate::contract::ContractHandlerEvent;
+            match op_manager
+                .notify_contract_handler(ContractHandlerEvent::UpdateQuery {
+                    key,
+                    data: update_data,
+                    related_contracts: Default::default(),
+                })
+                .await
+            {
+                Ok(ContractHandlerEvent::UpdateResponse {
+                    new_value: Ok(_),
+                    state_changed: true,
+                    ..
+                }) => {
+                    // NOTE (#4861): deliberately do NOT reset the merge-failure
+                    // backoff here. A full-state resync apply "succeeds" (even
+                    // with changed=true) merely by REPLACING the local state — it
+                    // proves nothing about convergence. In the observed semantic
+                    // fork-oscillation poison class, two stable divergent states
+                    // reject each other's deltas and every resync apply just
+                    // flips the node to the other fork (~1 cycle/min forever); if
+                    // that reset the backoff, the backoff would never trip and the
+                    // storm would continue. The backoff is reset ONLY by a
+                    // genuine successful DELTA merge in the broadcast driver —
+                    // full-state merges (streaming broadcast included) never
+                    // reset, since they carry the same fork-flip ambiguity. See
+                    // the source-scrape pin
+                    // `resync_apply_does_not_reset_merge_backoff`.
+                    //
+                    // BUT this CHANGED apply advances the state, which
+                    // invalidates the failed-payload MEMO's premise (a delta that
+                    // failed against the old state may be valid against the new
+                    // one) — clear ONLY the memo (#4864 round-4 P2). Gated on
+                    // `state_changed: true` (#4864 round-5 item 8): the executor
+                    // returns `UpdateResponse { state_changed: false }` for a
+                    // redundant no-op apply (CurrentWon / NoChange-with-fetch),
+                    // and invalidating on THOSE would needlessly re-admit
+                    // known-bad payloads without a real state advance. This is NOT
+                    // a backoff reset: no cooldown channel is touched, so the
+                    // strictly-delta-only no-reset doctrine and the
+                    // `resync_apply_does_not_reset_merge_backoff` pin (which
+                    // forbids a backoff reset from any node.rs site) both still
+                    // hold — `invalidate_payload_memo` is a distinct method that
+                    // clears only the memo, never a cooldown.
+                    op_manager
+                        .ring
+                        .merge_backoff
+                        .invalidate_payload_memo(key.id());
+                    tracing::info!(
+                        from = %source,
+                        contract = %key,
+                        event = "resync_applied",
+                        changed = true,
+                        "ResyncResponse state applied successfully"
+                    );
+                }
+                Ok(ContractHandlerEvent::UpdateResponse {
+                    new_value: Ok(_),
+                    state_changed: false,
+                    ..
+                })
+                | Ok(ContractHandlerEvent::UpdateNoChange { .. }) => {
+                    // A no-op resync apply (CurrentWon / NoChange — the executor
+                    // returns either `UpdateResponse { state_changed: false }` or
+                    // `UpdateNoChange`) did NOT advance the state. As above
+                    // (#4861) it is not a convergence signal, so it must not reset
+                    // the backoff — AND it is not a memo-invalidation either
+                    // (#4864 round-5 item 8): the failed-payload memo's premise
+                    // still holds when the state did not change, so
+                    // `invalidate_payload_memo` is deliberately NOT called here,
+                    // and the log field is honestly `changed = false`.
+                    tracing::info!(
+                        from = %source,
+                        contract = %key,
+                        event = "resync_applied",
+                        changed = false,
+                        "ResyncResponse state unchanged (already had this state)"
+                    );
+                }
+                Ok(other) => {
+                    // Display, not Debug, for `other` — `?other` Debug-prints
+                    // the full UpdateResponse, expands the inner
+                    // anyhow::Error, and emits a ~15-line backtrace per call
+                    // under queue saturation (issue #4251).
+                    // ContractHandlerEvent's hand-written Display
+                    // (`contract/handler.rs:706`) gives a single-line variant
+                    // summary without expanding nested anyhow chains.
+                    tracing::debug!(
+                        from = %source,
+                        contract = %key,
+                        event = "resync_failed",
+                        response = %other,
+                        "Unexpected response to resync update"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        from = %source,
+                        contract = %key,
+                        event = "resync_failed",
+                        error = %e,
+                        "Failed to apply resync state"
+                    );
+                }
+            }
 
             // Update the peer's summary in our interest tracker
             let peer_key = get_peer_key_from_addr(op_manager, source);
@@ -5842,137 +5961,6 @@ async fn handle_interest_sync_message(
 
             // No response needed
             None
-        }
-    }
-}
-
-/// Apply a correlated `ResyncResponse` full state through the contract
-/// handler and log the outcome. Split out of `handle_interest_sync_message`'s
-/// `ResyncResponse` arm so the arm can skip it for an already-applied state.
-async fn apply_resync_response_state(
-    op_manager: &OpManager,
-    key: freenet_stdlib::prelude::ContractKey,
-    source: SocketAddr,
-    state_bytes: &[u8],
-) {
-    {
-        // Apply the full state using an update.
-        //
-        // This full-state WASM merge is deliberately NOT gated by the
-        // merge-failure backoff (#4861): unlike the broadcast drivers, the
-        // resync path is already double-bounded — the emitter-side per- and
-        // per-(peer,contract) + global rate limits throttle how often
-        // ResyncRequests (and thus these responses) are produced at all, and
-        // epoch preemption caps the cost of each individual merge. Gating it
-        // here would also risk suppressing a genuine heal.
-        let state = freenet_stdlib::prelude::State::from(state_bytes.to_vec());
-        let update_data = freenet_stdlib::prelude::UpdateData::State(state);
-
-        // Send to contract handler
-        use crate::contract::ContractHandlerEvent;
-        match op_manager
-            .notify_contract_handler(ContractHandlerEvent::UpdateQuery {
-                key,
-                data: update_data,
-                related_contracts: Default::default(),
-            })
-            .await
-        {
-            Ok(ContractHandlerEvent::UpdateResponse {
-                new_value: Ok(_),
-                state_changed: true,
-                ..
-            }) => {
-                // NOTE (#4861): deliberately do NOT reset the merge-failure
-                // backoff here. A full-state resync apply "succeeds" (even
-                // with changed=true) merely by REPLACING the local state — it
-                // proves nothing about convergence. In the observed semantic
-                // fork-oscillation poison class, two stable divergent states
-                // reject each other's deltas and every resync apply just
-                // flips the node to the other fork (~1 cycle/min forever); if
-                // that reset the backoff, the backoff would never trip and the
-                // storm would continue. The backoff is reset ONLY by a
-                // genuine successful DELTA merge in the broadcast driver —
-                // full-state merges (streaming broadcast included) never
-                // reset, since they carry the same fork-flip ambiguity. See
-                // the source-scrape pin
-                // `resync_apply_does_not_reset_merge_backoff`.
-                //
-                // BUT this CHANGED apply advances the state, which
-                // invalidates the failed-payload MEMO's premise (a delta that
-                // failed against the old state may be valid against the new
-                // one) — clear ONLY the memo (#4864 round-4 P2). Gated on
-                // `state_changed: true` (#4864 round-5 item 8): the executor
-                // returns `UpdateResponse { state_changed: false }` for a
-                // redundant no-op apply (CurrentWon / NoChange-with-fetch),
-                // and invalidating on THOSE would needlessly re-admit
-                // known-bad payloads without a real state advance. This is NOT
-                // a backoff reset: no cooldown channel is touched, so the
-                // strictly-delta-only no-reset doctrine and the
-                // `resync_apply_does_not_reset_merge_backoff` pin (which
-                // forbids a backoff reset from any node.rs site) both still
-                // hold — `invalidate_payload_memo` is a distinct method that
-                // clears only the memo, never a cooldown.
-                op_manager
-                    .ring
-                    .merge_backoff
-                    .invalidate_payload_memo(key.id());
-                tracing::info!(
-                    from = %source,
-                    contract = %key,
-                    event = "resync_applied",
-                    changed = true,
-                    "ResyncResponse state applied successfully"
-                );
-            }
-            Ok(ContractHandlerEvent::UpdateResponse {
-                new_value: Ok(_),
-                state_changed: false,
-                ..
-            })
-            | Ok(ContractHandlerEvent::UpdateNoChange { .. }) => {
-                // A no-op resync apply (CurrentWon / NoChange — the executor
-                // returns either `UpdateResponse { state_changed: false }` or
-                // `UpdateNoChange`) did NOT advance the state. As above
-                // (#4861) it is not a convergence signal, so it must not reset
-                // the backoff — AND it is not a memo-invalidation either
-                // (#4864 round-5 item 8): the failed-payload memo's premise
-                // still holds when the state did not change, so
-                // `invalidate_payload_memo` is deliberately NOT called here,
-                // and the log field is honestly `changed = false`.
-                tracing::info!(
-                    from = %source,
-                    contract = %key,
-                    event = "resync_applied",
-                    changed = false,
-                    "ResyncResponse state unchanged (already had this state)"
-                );
-            }
-            Ok(other) => {
-                // Display, not Debug, for `other` — `?other` Debug-prints
-                // the full UpdateResponse, expands the inner
-                // anyhow::Error, and emits a ~15-line backtrace per call
-                // under queue saturation (issue #4251).
-                // ContractHandlerEvent's hand-written Display
-                // (`contract/handler.rs:706`) gives a single-line variant
-                // summary without expanding nested anyhow chains.
-                tracing::debug!(
-                    from = %source,
-                    contract = %key,
-                    event = "resync_failed",
-                    response = %other,
-                    "Unexpected response to resync update"
-                );
-            }
-            Err(e) => {
-                tracing::error!(
-                    from = %source,
-                    contract = %key,
-                    event = "resync_failed",
-                    error = %e,
-                    "Failed to apply resync state"
-                );
-            }
         }
     }
 }
@@ -8280,6 +8268,106 @@ mod tests {
         );
     }
 
+    /// Applied-payload record: a correlated `ResyncResponse` is applied even when
+    /// its exact bytes are recorded as already merged. This node asked for the
+    /// response because the states differ, and a quiet sender re-sends the same
+    /// bytes every round, so a skip here could leave a divergence in place.
+    #[tokio::test]
+    async fn resync_response_applies_even_when_its_bytes_are_recorded() {
+        use crate::contract::ContractHandlerEvent;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let config_args = crate::config::ConfigArgs {
+            id: Some("resync-resp-applied-record".to_string()),
+            mode: Some(crate::contract::OperationMode::Local),
+            ..Default::default()
+        };
+        let node_config = NodeConfig::new(config_args.build().await.expect("build Config"))
+            .await
+            .expect("build NodeConfig");
+        let (_notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, mut ch_channel, _wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, _result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+        let op_manager = std::sync::Arc::new(
+            crate::node::OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        op_manager.ring.attach_op_manager(&op_manager);
+        op_manager
+            .ring
+            .connection_manager
+            .set_own_addr_local_for_test("127.0.0.1:14300".parse().unwrap());
+
+        let update_query_seen = std::sync::Arc::new(AtomicBool::new(false));
+        let handler_flag = update_query_seen.clone();
+        let _handler = tokio::spawn(async move {
+            while let Ok((id, ev, _priority)) = ch_channel.recv_from_sender().await {
+                #[allow(
+                    clippy::wildcard_enum_match_arm,
+                    reason = "a stand-in executor loop serving the one query this \
+                              test expects; any other event is unexpected"
+                )]
+                let response = match ev {
+                    ContractHandlerEvent::UpdateQuery { .. } => {
+                        handler_flag.store(true, Ordering::SeqCst);
+                        ContractHandlerEvent::UpdateResponse {
+                            new_value: Ok(freenet_stdlib::prelude::WrappedState::new(vec![
+                                7u8, 7, 7,
+                            ])),
+                            state_changed: true,
+                        }
+                    }
+                    other => panic!("unexpected handler event: {other:?}"),
+                };
+                if ch_channel.send_to_sender(id, response).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let key = freenet_stdlib::prelude::ContractKey::from_id_and_code(
+            freenet_stdlib::prelude::ContractInstanceId::new([204u8; 32]),
+            freenet_stdlib::prelude::CodeHash::new([205u8; 32]),
+        );
+        let source: SocketAddr = "127.0.0.1:15300".parse().unwrap();
+        let state_bytes = vec![7u8, 7, 7];
+        let set = &op_manager.ring.applied_payloads;
+        set.record_absorbed(&key, set.payload_hash(false, &state_bytes));
+        assert!(set.contains(&key, set.payload_hash(false, &state_bytes)));
+        let _correlated = op_manager
+            .ring
+            .outstanding_resync_requests
+            .record(*key.id(), source);
+
+        let response = handle_interest_sync_message(
+            &op_manager,
+            source,
+            crate::message::InterestMessage::ResyncResponse {
+                key,
+                state_bytes,
+                summary_bytes: vec![1u8],
+            },
+        )
+        .await;
+        assert!(response.is_none());
+        assert!(
+            update_query_seen.load(Ordering::SeqCst),
+            "a correlated ResyncResponse must reach the merge even when its bytes \
+             are recorded as applied"
+        );
+    }
+
     /// #4864 round-8 (Codex P1): a SOLICITED `ResyncResponse` — one that matches
     /// an outstanding `ResyncRequest` we recorded — passes the correlation gate
     /// and IS applied (reaches the contract handler's `UpdateQuery`). Crucially
@@ -10159,50 +10247,6 @@ mod tests {
                  fork-oscillation containment. Reset belongs only in the broadcast \
                  drivers on a genuine merge success."
             );
-        }
-
-        /// Pin (applied-payload record): the ResyncResponse arm must NOT
-        /// consult `ring.applied_payloads`. This node asked for the response
-        /// because the states differ, and a quiet sender re-sends the same
-        /// bytes every round, so skipping a recorded payload here could make a
-        /// divergence permanent. The arm must still consume the outstanding
-        /// request before applying.
-        #[test]
-        fn resync_response_does_not_consult_the_applied_payload_record() {
-            let start = SOURCE
-                .find(concat!("event = \"resync_response_", "received\""))
-                .expect("ResyncResponse receive arm not found");
-            let arm = &SOURCE[start..];
-            let arm_end = arm
-                .find(concat!("\n/// Apply a correlated ", "`ResyncResponse`"))
-                .expect("apply helper follows the arm");
-            let arm = &arm[..arm_end];
-            let helper_start = SOURCE
-                .find(concat!("async fn apply_resync_response_", "state("))
-                .expect("apply helper exists");
-            let helper = &SOURCE[helper_start..];
-            let helper = &helper[..helper.find("\n}\n").expect("helper end")];
-            for (name, region) in [("arm", arm), ("helper", helper)] {
-                assert!(
-                    !region.contains(concat!("applied_payloads", ".contains(")),
-                    "the ResyncResponse {name} must not skip on the applied-payload record"
-                );
-            }
-            let consume = arm
-                .find(".consume(*key.id(), source)")
-                .expect("outstanding-request consume gate");
-            let apply = arm
-                .lines()
-                .position(|l| {
-                    l.trim()
-                        == concat!(
-                            "apply_resync_response_",
-                            "state(op_manager, key, source, &state_bytes).await;"
-                        )
-                })
-                .expect("the arm must apply at statement position");
-            let apply_offset: usize = arm.lines().take(apply).map(|l| l.len() + 1).sum();
-            assert!(consume < apply_offset, "consume must precede the apply");
         }
 
         /// Pin (#4864 round-5 item 6): the CHANGED ResyncResponse apply arm MUST

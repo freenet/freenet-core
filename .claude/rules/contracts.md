@@ -327,7 +327,11 @@ State merging rules:
     identical-input probe when the echo re-pushes a payload this node has not
     already recorded as merged). A re-push of a payload the node already
     merged is skipped before the executor by the applied-payload record
-    (`ring::applied_payloads`), so it no longer reaches either probe. For a
+    (`ring::applied_payloads`, for up to 15 minutes after it was recorded),
+    so it no longer reaches either probe. The FIRST identical re-push is still
+    probed: the record is made after the probe runs. When the record's
+    precondition holds and when it does not is in that module's
+    "Precondition" section. For a
     contract that replays a fixed set of payloads, that skip is now the
     defence, not the flag: such contracts are flagged less often, and a lower
     broken-flag count does NOT mean fewer broken contracts. There is deliberately NO

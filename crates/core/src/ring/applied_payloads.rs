@@ -12,26 +12,36 @@
 //! remembers a payload for 60 s, so a replay with a longer period passes it.
 //!
 //! This set remembers, for every hosted contract, which payloads were merged
-//! into the state the node holds now, with no time limit. The network receive
-//! paths skip a payload whose hash is already present. There is no detector and
-//! no verdict about the contract: the same rule applies to every contract.
+//! into the state the node holds now, for up to [`APPLIED_PAYLOAD_MAX_AGE`]
+//! (15 minutes) after each was last recorded. The broadcast receive paths skip
+//! a payload whose hash is present and unexpired. There is no detector and no
+//! verdict about the contract: the same rule applies to every contract.
 //!
 //! ## Precondition
 //!
-//! The skip is sound for contracts whose merge forms a semilattice
-//! (commutative, associative, idempotent): merging a payload whose effect is
-//! already in the state cannot change it, so skipping it changes nothing.
+//! The skip is sound only for contracts whose merge forms a semilattice
+//! (commutative, associative, idempotent) AND that absorbed the whole payload
+//! when it was recorded. Neither is guaranteed:
 //!
-//! For a merge that is order-dependent the skip can delay a repair. If the
-//! repair arrives as bytes identical to a payload recorded earlier, it is
-//! skipped until the record for that contract is cleared by eviction, a
-//! restart, or 1024 newer payloads pushing it out. Anti-entropy does not
-//! necessarily bring different bytes: a heal is computed from the sender's
-//! state and this node's summary, so for a quiet contract every round can
-//! carry the same bytes.
+//! - A merge that CHANGED the state is not proof the payload was fully
+//!   absorbed. A contract can apply part of a payload and silently drop the
+//!   rest under a condition that later clears (an entry whose prerequisite has
+//!   not arrived yet). A full-state heal from a quiet peer then carries the
+//!   identical bytes every round, for example when the delta path is
+//!   unavailable (full state judged more efficient, a missing summary, a
+//!   failed delta).
+//! - A contract whose merge is not a semilattice can legitimately send earlier
+//!   bytes again as a new update (A, B, A).
+//!
+//! In both cases the skip would stop a needed payload one hop out. The age
+//! bound turns that into a delay of at most 15 minutes: an expired hash does
+//! not cause a skip, so the same bytes reach the merge again. Anti-entropy is
+//! not relied on to bring different bytes, because a heal is computed from the
+//! sender's state and this node's summary and can repeat exactly.
 //!
 //! For a merge that cycles among a fixed set of states, ending the replay is
-//! the intended effect.
+//! the intended effect. The age bound costs such a contract at most one extra
+//! replay cycle per 15 minutes, against a replay period of roughly 60 s.
 //!
 //! ## Rules
 //!
@@ -45,20 +55,24 @@
 //!   merge committed, was refused, or was suppressed for a contract flagged
 //!   broken. A refused, failed, deferred or suppressed merge is never recorded,
 //!   so it can be retried. Neither is a merge that ran and left the state
-//!   unchanged: that may be a silent refusal (a contract that drops part of a
-//!   payload under a condition that later clears, such as an entry whose
-//!   prerequisite has not arrived, and returns its old state), and the same
-//!   bytes must be able to reach the merge again once the condition clears.
+//!   unchanged, which may be a silent refusal. A changing merge is recorded
+//!   even though it may have dropped part of the payload (see Precondition);
+//!   the age bound is what limits the cost of that.
 //! - **Reset whenever the state is replaced by something other than a merge**:
 //!   an initial install on a node that held no copy, a corrupted-state
-//!   recovery that replaces the stored state, a re-store from a fetched copy,
-//!   and eviction or reclamation of the hosted contract. Resets happen before
-//!   the write where there is one. A restart resets everything because the
-//!   set is in memory.
+//!   recovery that replaces the stored state, a store through
+//!   `verify_and_store_contract`, and eviction or reclamation of the hosted
+//!   contract. Resets happen before the write where there is one. A restart
+//!   resets everything because the set is in memory.
 //!
 //! Clearing is always safe (it only loses skips). Recording a payload whose
-//! effect is not in the state is the one unsafe operation, which is why
-//! records are made only at the executor's commit points.
+//! effect is not fully in the state is the unsafe case, which is why records
+//! are made only at the executor's commit points and expire.
+//!
+//! A skipped payload never reaches the merge, so a skipped delta does not feed
+//! the per-sender merge-backoff reset (`merge_backoff.record_success_from_sender`)
+//! or the delta-compatibility memo (`delta_incompat.record_delta_success`).
+//! Both are signals about a merge that actually ran; a skip carries none.
 //!
 //! ## Bound
 //!
@@ -74,7 +88,8 @@
 //! The cap only has to hold the replayed set (a handful of payloads) across
 //! the unrelated traffic that arrives between replays. When it truncates, the
 //! oldest hash is forgotten and a later re-delivery of that payload is merged
-//! again.
+//! again. Expired hashes are dropped from the front of the queue the next time
+//! the contract records a payload.
 //!
 //! ## Hash
 //!
@@ -88,42 +103,67 @@
 //!
 //! [`BroadcastDedupCache`]: crate::operations::update::BroadcastDedupCache
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::hash::{BuildHasher, Hasher};
+use std::time::Duration;
 
 use dashmap::DashMap;
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
+use tokio::time::Instant;
+
+use crate::util::time_source::DynTimeSource;
 
 /// Hashes kept per contract, newest last. See the module docs, "Bound".
 pub(crate) const APPLIED_PAYLOADS_PER_CONTRACT: usize = 1024;
+
+/// How long a recorded hash causes a skip, measured from when it was last
+/// recorded. See the module docs, "Age bound": three anti-entropy heartbeats,
+/// well above the roughly 60 s replay period of a looping contract.
+pub(crate) const APPLIED_PAYLOAD_MAX_AGE: Duration = Duration::from_secs(15 * 60);
 
 struct ContractEntry {
     /// Kept so the reaper can ask the hosting layer about the contract, which
     /// takes a full key.
     key: ContractKey,
-    /// Insertion order, oldest first, for truncation at the cap.
+    /// Hashes in order of their last record, oldest first, for truncation at
+    /// the cap and for dropping expired hashes from the front.
     hashes: VecDeque<u64>,
-    /// The same hashes, for O(1) lookup on every inbound payload. Kept in
-    /// step with `hashes` by `record_absorbed`; `reset` drops both together.
-    members: HashSet<u64>,
+    /// The same hashes with the time each was last recorded, for O(1) lookup
+    /// on every inbound payload. Kept in step with `hashes` by
+    /// `record_absorbed`; `reset` drops both together.
+    recorded_at: HashMap<u64, Instant>,
 }
 
 pub(crate) struct AppliedPayloads {
     entries: DashMap<ContractInstanceId, ContractEntry>,
     hasher: ahash::RandomState,
     cap_per_contract: usize,
+    max_age: Duration,
+    /// The node's injected clock: the same source the interest manager, and
+    /// so the 60 s `BroadcastDedupCache`, read.
+    time_source: DynTimeSource,
 }
 
 impl AppliedPayloads {
-    pub(crate) fn new() -> Self {
-        Self::with_cap(APPLIED_PAYLOADS_PER_CONTRACT)
+    pub(crate) fn new(time_source: DynTimeSource) -> Self {
+        Self::with_limits(
+            APPLIED_PAYLOADS_PER_CONTRACT,
+            APPLIED_PAYLOAD_MAX_AGE,
+            time_source,
+        )
     }
 
-    pub(crate) fn with_cap(cap_per_contract: usize) -> Self {
+    pub(crate) fn with_limits(
+        cap_per_contract: usize,
+        max_age: Duration,
+        time_source: DynTimeSource,
+    ) -> Self {
         Self {
             entries: DashMap::new(),
             hasher: ahash::RandomState::new(),
             cap_per_contract: cap_per_contract.max(1),
+            max_age,
+            time_source,
         }
     }
 
@@ -136,48 +176,57 @@ impl AppliedPayloads {
         hasher.finish()
     }
 
-    /// Whether this payload was already merged into the current state lineage
-    /// of `key`.
+    /// Whether this payload was recorded as merged into `key`'s current state
+    /// within the age bound, so the receive path should skip it. An expired
+    /// hash does not cause a skip.
     pub(crate) fn contains(&self, key: &ContractKey, hash: u64) -> bool {
-        self.entries
-            .get(key.id())
-            .is_some_and(|entry| entry.members.contains(&hash))
+        let now = self.time_source.now();
+        self.entries.get(key.id()).is_some_and(|entry| {
+            entry
+                .recorded_at
+                .get(&hash)
+                .is_some_and(|at| now.saturating_duration_since(*at) < self.max_age)
+        })
     }
 
-    /// Record that a payload was merged into `key`'s current state. Call ONLY
-    /// after the merge committed (changed or unchanged), never for a refused,
-    /// failed, deferred, or suppressed merge.
+    /// Record that a merge of this payload committed a changed state, or that
+    /// it equalled the stored state byte for byte. Call ONLY at those commit
+    /// points, never for a refused, failed, deferred, suppressed or unchanged
+    /// merge. Re-recording a hash refreshes its age.
     pub(crate) fn record_absorbed(&self, key: &ContractKey, hash: u64) {
+        let now = self.time_source.now();
         let mut entry = self
             .entries
             .entry(*key.id())
             .or_insert_with(|| ContractEntry {
                 key: *key,
                 hashes: VecDeque::new(),
-                members: HashSet::new(),
+                recorded_at: HashMap::new(),
             });
         let entry = &mut *entry;
-        if entry.members.contains(&hash) {
-            // Already present (for example the same payload from a local
-            // client and later from the network): move it to the newest end so
-            // a payload that keeps arriving is the last one truncated. The
-            // linear scan runs only on this rare re-record, never on lookup.
+        if entry.recorded_at.insert(hash, now).is_some() {
+            // Already present: move it to the newest end, matching its
+            // refreshed time. The linear scan runs only on a re-record, never
+            // on lookup.
             if let Some(pos) = entry.hashes.iter().position(|h| *h == hash) {
                 entry.hashes.remove(pos);
             }
-        } else {
-            while entry.hashes.len() >= self.cap_per_contract {
-                match entry.hashes.pop_front() {
-                    Some(evicted) => {
-                        entry.members.remove(&evicted);
-                    }
-                    None => break,
-                }
-            }
-            entry.members.insert(hash);
         }
         entry.hashes.push_back(hash);
-        debug_assert_eq!(entry.hashes.len(), entry.members.len());
+        // Drop from the front: expired hashes (the queue is ordered by record
+        // time, so they are all at the front) and anything over the cap.
+        while let Some(front) = entry.hashes.front().copied() {
+            let expired = entry
+                .recorded_at
+                .get(&front)
+                .is_none_or(|at| now.saturating_duration_since(*at) >= self.max_age);
+            if !expired && entry.hashes.len() <= self.cap_per_contract {
+                break;
+            }
+            entry.hashes.pop_front();
+            entry.recorded_at.remove(&front);
+        }
+        debug_assert_eq!(entry.hashes.len(), entry.recorded_at.len());
     }
 
     /// Forget everything recorded for `key`. Called when its state was
@@ -207,10 +256,18 @@ impl AppliedPayloads {
 
     /// Both views of one contract's record, for tests that check they agree.
     #[cfg(test)]
-    pub(crate) fn views_for(&self, key: &ContractKey) -> (Vec<u64>, HashSet<u64>) {
+    pub(crate) fn views_for(
+        &self,
+        key: &ContractKey,
+    ) -> (Vec<u64>, std::collections::HashSet<u64>) {
         self.entries.get(key.id()).map_or_else(
-            || (Vec::new(), HashSet::new()),
-            |e| (e.hashes.iter().copied().collect(), e.members.clone()),
+            || (Vec::new(), std::collections::HashSet::new()),
+            |e| {
+                (
+                    e.hashes.iter().copied().collect(),
+                    e.recorded_at.keys().copied().collect(),
+                )
+            },
         )
     }
 
@@ -223,7 +280,20 @@ impl AppliedPayloads {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util::time_source::SharedMockTimeSource;
     use freenet_stdlib::prelude::{CodeHash, ContractInstanceId};
+
+    fn clock() -> SharedMockTimeSource {
+        SharedMockTimeSource::new()
+    }
+
+    fn set_with(clock: &SharedMockTimeSource) -> AppliedPayloads {
+        AppliedPayloads::new(std::sync::Arc::new(clock.clone()))
+    }
+
+    fn capped(cap: usize) -> AppliedPayloads {
+        AppliedPayloads::with_limits(cap, APPLIED_PAYLOAD_MAX_AGE, std::sync::Arc::new(clock()))
+    }
 
     fn key(n: u8) -> ContractKey {
         ContractKey::from_id_and_code(ContractInstanceId::new([n; 32]), CodeHash::new([n; 32]))
@@ -231,7 +301,7 @@ mod tests {
 
     #[test]
     fn a_recorded_payload_is_found_and_an_unrecorded_one_is_not() {
-        let set = AppliedPayloads::new();
+        let set = set_with(&clock());
         let k = key(1);
         let a = set.payload_hash(false, b"state-a");
         let b = set.payload_hash(false, b"state-b");
@@ -245,7 +315,7 @@ mod tests {
 
     #[test]
     fn delta_and_full_state_with_the_same_bytes_hash_differently() {
-        let set = AppliedPayloads::new();
+        let set = set_with(&clock());
         assert_ne!(
             set.payload_hash(true, b"same"),
             set.payload_hash(false, b"same")
@@ -261,8 +331,8 @@ mod tests {
         // Each RandomState::new() draws its own keys, so two sets disagree on
         // the hash of the same input with overwhelming probability. This is
         // what makes the hash unpredictable to a remote peer.
-        let a = AppliedPayloads::new();
-        let b = AppliedPayloads::new();
+        let a = set_with(&clock());
+        let b = set_with(&clock());
         let inputs: Vec<&[u8]> = vec![b"x", b"y", b"z", b"w"];
         assert!(
             inputs
@@ -275,7 +345,7 @@ mod tests {
 
     #[test]
     fn reset_forgets_the_contract() {
-        let set = AppliedPayloads::new();
+        let set = set_with(&clock());
         let k = key(1);
         let a = set.payload_hash(true, b"d");
         set.record_absorbed(&k, a);
@@ -286,7 +356,7 @@ mod tests {
 
     #[test]
     fn the_cap_drops_the_oldest_and_keeps_the_newest() {
-        let set = AppliedPayloads::with_cap(3);
+        let set = capped(3);
         let k = key(1);
         let hashes: Vec<u64> = (0u8..5).map(|i| set.payload_hash(true, &[i])).collect();
         for h in &hashes {
@@ -302,7 +372,7 @@ mod tests {
 
     #[test]
     fn re_recording_moves_a_hash_to_the_newest_end_without_duplicating() {
-        let set = AppliedPayloads::with_cap(3);
+        let set = capped(3);
         let k = key(1);
         let h: Vec<u64> = (0u8..4).map(|i| set.payload_hash(true, &[i])).collect();
         set.record_absorbed(&k, h[0]);
@@ -319,7 +389,7 @@ mod tests {
 
     #[test]
     fn the_default_cap_is_enforced() {
-        let set = AppliedPayloads::new();
+        let set = set_with(&clock());
         let k = key(1);
         for i in 0..(APPLIED_PAYLOADS_PER_CONTRACT as u32 + 10) {
             set.record_absorbed(&k, set.payload_hash(true, &i.to_le_bytes()));
@@ -331,7 +401,7 @@ mod tests {
     /// every kind of change: insert, re-record, eviction at the cap, reset.
     #[test]
     fn the_lookup_set_stays_in_step_with_the_queue() {
-        let set = AppliedPayloads::with_cap(3);
+        let set = capped(3);
         let k = key(1);
         let check = |label: &str| {
             let (queue, members) = set.views_for(&k);
@@ -357,9 +427,66 @@ mod tests {
         assert!(!set.contains(&k, h[4]));
     }
 
+    /// A recorded hash causes a skip until the age bound and not after it.
+    #[test]
+    fn a_hash_expires_at_the_age_bound() {
+        let clock = clock();
+        let set = set_with(&clock);
+        let k = key(1);
+        let h = set.payload_hash(false, b"s");
+        set.record_absorbed(&k, h);
+        clock.advance_time(APPLIED_PAYLOAD_MAX_AGE - Duration::from_secs(1));
+        assert!(set.contains(&k, h), "skipped just before the bound");
+        clock.advance_time(Duration::from_secs(1));
+        assert!(!set.contains(&k, h), "not skipped at the bound");
+    }
+
+    /// Re-recording a hash restarts its age, and moves it so that the
+    /// front-of-queue expiry pass does not drop it early.
+    #[test]
+    fn re_recording_refreshes_the_age() {
+        let clock = clock();
+        let set = set_with(&clock);
+        let k = key(1);
+        let (a, b) = (set.payload_hash(false, b"a"), set.payload_hash(false, b"b"));
+        set.record_absorbed(&k, a);
+        set.record_absorbed(&k, b);
+        clock.advance_time(APPLIED_PAYLOAD_MAX_AGE - Duration::from_secs(60));
+        set.record_absorbed(&k, a); // refresh a, not b
+        clock.advance_time(Duration::from_secs(120));
+        assert!(
+            set.contains(&k, a),
+            "a refreshed hash is still within its bound"
+        );
+        assert!(!set.contains(&k, b), "an unrefreshed hash has expired");
+        // The next record drops the expired hash from storage too.
+        set.record_absorbed(&k, set.payload_hash(false, b"c"));
+        let (queue, _) = set.views_for(&k);
+        assert!(!queue.contains(&b), "expired hashes are pruned on record");
+        assert!(queue.contains(&a));
+    }
+
+    /// Source pin: the ring reaper loop calls `reap_applied_payloads` at
+    /// statement position, so the backstop that bounds the map by the hosted
+    /// set actually runs.
+    #[test]
+    fn the_reaper_loop_calls_reap_applied_payloads() {
+        let src = include_str!("../ring.rs");
+        let start = src
+            .find("async fn governance_reaper_loop(")
+            .expect("reaper loop exists");
+        let body = &src[start..];
+        let body = &body[..body.find("\n    }\n").expect("reaper loop end")];
+        assert!(
+            body.lines()
+                .any(|l| l.trim() == "ring.reap_applied_payloads();"),
+            "the reaper loop must call ring.reap_applied_payloads()"
+        );
+    }
+
     #[test]
     fn retain_drops_only_rejected_contracts() {
-        let set = AppliedPayloads::new();
+        let set = set_with(&clock());
         let (k1, k2) = (key(1), key(2));
         set.record_absorbed(&k1, 1);
         set.record_absorbed(&k2, 2);

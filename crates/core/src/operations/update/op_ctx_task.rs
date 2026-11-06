@@ -4961,6 +4961,69 @@ mod tests {
             (rounds - 2) as u64,
             "every delivery after the first cycle is skipped and counted"
         );
+
+        // Past the age bound both hashes have expired: the replay runs exactly
+        // one more cycle, then stops again.
+        clock.advance_time(crate::ring::applied_payloads::APPLIED_PAYLOAD_MAX_AGE);
+        for round in 0..6 {
+            clock.advance_time(past_dedup_ttl);
+            deliver(
+                &op_manager,
+                key,
+                DeltaOrFullState::FullState(payloads[round % 2].clone()),
+            )
+            .await;
+        }
+        assert_eq!(
+            storage.store_count() - writes_before,
+            4,
+            "after the age bound the replay re-runs one cycle (two writes), no more"
+        );
+    }
+
+    /// The streaming receiver end to end, as for BroadcastTo: a full state
+    /// assembled from a stream reaches the executor once, and the same bytes
+    /// streamed again later (past the dedup cache's TTL) are skipped. Starts at
+    /// `apply_streaming_broadcast`, after stream claim and assembly, which need
+    /// transport plumbing and do not touch the record.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_replayed_streaming_state_reaches_the_executor_once() {
+        let (op_manager, clock, storage, key, _guard) =
+            build_applied_payload_e2e_node("applied-e2e-streaming").await;
+        let stream = |bytes: &[u8]| {
+            let op_manager = &op_manager;
+            let bytes = bytes.to_vec();
+            async move {
+                apply_streaming_broadcast(
+                    op_manager,
+                    Transaction::new::<UpdateMsg>(),
+                    key,
+                    bytes,
+                    Vec::new(),
+                    "127.0.0.1:12500".parse().unwrap(),
+                    crate::ring::broadcast_coverage::CoveredPeers::empty(),
+                )
+                .await
+                .expect("streaming delivery");
+            }
+        };
+        let writes_before = storage.store_count();
+        stream(b"streamed-state").await;
+        assert_eq!(storage.store_count() - writes_before, 1);
+        clock.advance_time(std::time::Duration::from_secs(61));
+        stream(b"streamed-state").await;
+        assert_eq!(
+            storage.store_count() - writes_before,
+            1,
+            "a replayed streaming state must not reach the executor again"
+        );
+        assert_eq!(
+            op_manager
+                .payload_mix
+                .receiver_apply_stats()
+                .already_applied[1],
+            1
+        );
     }
 
     /// Convenience wrapper: a node whose stand-in handler fails every delta with

@@ -1,7 +1,9 @@
 //! Executor-side rules of the applied-payload record
-//! (`crate::ring::applied_payloads`): a payload is recorded only after its
-//! merge commits (changed or unchanged), never after a refused or suppressed
-//! merge, and an initial install or corrupted-state recovery resets the record.
+//! (`crate::ring::applied_payloads`): a payload is recorded only after a merge
+//! committed a changed state, or when it equals the stored state byte for
+//! byte. It is never recorded after a refused, broken-suppressed or unchanged
+//! merge. An initial install, a corrupted-state recovery and a store through
+//! `verify_and_store_contract` reset the record, before their write.
 //!
 //! These run the real `bridged_upsert_contract_state` through
 //! `Executor<MockWasmRuntime, MockStateStorage>` with a real `OpManager`, so the
@@ -397,6 +399,32 @@ fn the_install_reset_precedes_the_store() {
         .position(|l| l.trim() == ".store(key, state_to_store, params.clone())")
         .expect("install branch stores the state");
     assert!(reset < store, "the reset must precede the store");
+}
+
+/// Source pin: the corrupted-state recovery reset runs BEFORE
+/// `commit_state_update`, so no window exists in which a stale record
+/// describes the replaced state.
+#[test]
+fn the_recovery_reset_precedes_the_commit() {
+    let src = include_str!("../runtime/executor_impl.rs");
+    let commit_at = src
+        .find("let commit_outcome = self")
+        .expect("final commit of the merge path");
+    let before = &src[..commit_at];
+    let gate = before
+        .rfind("if recovery_performed {")
+        .expect("a recovery-gated reset precedes the commit");
+    let block = &before[gate..];
+    assert!(
+        block.lines().any(|l| l.trim() == "set.reset(&key);"),
+        "the recovery-gated block before the commit must reset the record"
+    );
+    let after = &src[commit_at..];
+    let after = &after[..after.find("\n    }\n").expect("function end")];
+    assert!(
+        !after.contains("set.reset(&key);"),
+        "the recovery reset must not run after the commit"
+    );
 }
 
 /// Source pins for the reset hooks that the tests above cannot reach without

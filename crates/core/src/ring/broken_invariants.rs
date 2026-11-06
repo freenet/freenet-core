@@ -23,7 +23,10 @@
 //! the applied-payload record ([`crate::ring::applied_payloads`]), so a
 //! re-push of a recorded payload no longer re-triggers the identical-input
 //! probe: deterministic re-detection after a flag expires happens only when
-//! the echo re-pushes a payload not yet recorded. For a contract
+//! the echo re-pushes a payload not yet recorded, or recorded more than the
+//! record's age bound ago. The FIRST identical re-push is still probed,
+//! because the record is made after the probe runs. The record's precondition
+//! is stated in that module's "Precondition" section. For a
 //! that replays a fixed set of payloads, the skip itself is now the defence.
 //! Such contracts are flagged less often, so a lower broken-flag count does
 //! not mean fewer broken contracts.

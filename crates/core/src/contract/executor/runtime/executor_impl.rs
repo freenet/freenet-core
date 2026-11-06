@@ -1406,6 +1406,17 @@ where
             return Ok(UpsertResult::NoChange);
         }
 
+        // A corrupted-state recovery replaces the stored state with the
+        // incoming one instead of merging, so the applied-payload record no
+        // longer describes it. Reset BEFORE the commit, like the initial
+        // install: clearing early only loses skips, and a reset after the
+        // write would leave a window in which a stale record describes the
+        // replaced state.
+        if recovery_performed {
+            if let Some(set) = &applied_payloads {
+                set.reset(&key);
+            }
+        }
         // A broken-contract suppression here is reported to the caller as
         // `Updated` exactly as before (this path has no trailing fan-out to gate
         // on it); the outcome is read only to decide the applied-payload
@@ -1413,16 +1424,8 @@ where
         let commit_outcome = self
             .commit_state_update(&key, &params, &updated_state)
             .await?;
-        match commit_outcome {
-            StateCommitOutcome::Committed if recovery_performed => {
-                // The stored state was replaced by the incoming state, not
-                // merged with it.
-                if let Some(set) = &applied_payloads {
-                    set.reset(&key);
-                }
-            }
-            StateCommitOutcome::Committed => record_absorbed(&applied_payloads),
-            StateCommitOutcome::SuppressedBrokenContract => {}
+        if matches!(commit_outcome, StateCommitOutcome::Committed) && !recovery_performed {
+            record_absorbed(&applied_payloads);
         }
         Ok(UpsertResult::Updated(updated_state))
     }

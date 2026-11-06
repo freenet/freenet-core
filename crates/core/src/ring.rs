@@ -870,7 +870,15 @@ impl Ring {
                 max_connections,
             )),
             merge_backoff: Arc::new(merge_backoff::MergeBackoff::new(time_source.clone())),
-            applied_payloads: Arc::new(applied_payloads::AppliedPayloads::new()),
+            // Same injectable clock as the hosting manager and the interest
+            // manager (whose clock the 60 s broadcast dedup cache reads), so
+            // the age bound is deterministic in simulations and tests.
+            applied_payloads: Arc::new(applied_payloads::AppliedPayloads::new(
+                config
+                    .hosting_time_source_override
+                    .clone()
+                    .unwrap_or_else(|| time_source.clone()),
+            )),
             delta_incompat: Arc::new(delta_incompat::DeltaIncompat::new(time_source.clone())),
             resync_emit_limiter: Arc::new(resync_rate_limit::new_emit_limiter(time_source.clone())),
             resync_response_limiter: Arc::new(resync_rate_limit::new_response_limiter(
@@ -5528,10 +5536,6 @@ impl Ring {
         self.hosting_manager.record_contract_update(contract)
     }
 
-    /// True if `contract` has been flagged as violating a CRDT invariant
-    /// (e.g. non-idempotent `update_state`). Callers on the broadcast path
-    /// must skip emission when this returns true to prevent the broken
-    /// contract from generating a propagation storm.
     /// Drop applied-payload records (`crate::ring::applied_payloads`) for
     /// contracts this node neither hosts nor serves. Called by the ring
     /// reaper. Returns how many contracts were dropped.
@@ -5540,6 +5544,10 @@ impl Ring {
             .retain_contracts(|key| self.is_hosting_contract(key) || self.contract_in_use(key))
     }
 
+    /// True if `contract` has been flagged as violating a CRDT invariant
+    /// (e.g. non-idempotent `update_state`). Callers on the broadcast path
+    /// must skip emission when this returns true to prevent the broken
+    /// contract from generating a propagation storm.
     pub fn is_contract_broken(&self, contract: &ContractKey) -> bool {
         self.broken_invariants.is_broken(contract.id())
     }
