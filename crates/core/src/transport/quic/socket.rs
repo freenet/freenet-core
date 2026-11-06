@@ -188,16 +188,30 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+/// Pollers built outside [`with_poller_holds`]; tests assert it stays 0.
+#[cfg(test)]
+pub(crate) static FALLBACK_POLLERS: AtomicU64 = AtomicU64::new(0);
+
 /// Run `f`, which creates one quinn connection (`Endpoint::connect_with` or
 /// `Incoming::accept_with`), so that the poller quinn creates for it, on this
-/// thread inside the call (quinn 0.11.12 `ConnectionRef::new`), counts its
-/// holds in `holds`. A poller created any other way (a rebind, which needs
-/// migration, which is off) counts into a record nobody reads.
+/// thread inside the call, counts its holds in `holds`.
+///
+/// Depends on quinn 0.11.12 (pinned `=0.11.12`): `ConnectionRef::new` calls
+/// `create_io_poller` synchronously inside both calls, and the only other
+/// caller is a rebind, which needs migration, which is off. Re-check both
+/// before bumping quinn; a poller built with no record set logs a warning
+/// and is counted for the tests (`FALLBACK_POLLERS`).
 pub(crate) fn with_poller_holds<R>(holds: &Arc<CapHolds>, f: impl FnOnce() -> R) -> R {
+    /// Clears the slot however `f` ends, a panic included.
+    struct Clear;
+    impl Drop for Clear {
+        fn drop(&mut self) {
+            NEXT_POLLER_HOLDS.with(|next| next.borrow_mut().take());
+        }
+    }
     NEXT_POLLER_HOLDS.with(|next| *next.borrow_mut() = Some(holds.clone()));
-    let out = f();
-    NEXT_POLLER_HOLDS.with(|next| next.borrow_mut().take());
-    out
+    let _clear = Clear;
+    f()
 }
 
 /// The QUIC endpoint's socket. See the module docs.
@@ -447,7 +461,22 @@ impl<S: Socket> AsyncUdpSocket for QuicSocket<S> {
     fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
         let holds = NEXT_POLLER_HOLDS
             .with(|next| next.borrow_mut().take())
-            .unwrap_or_else(|| Arc::new(self.cap_holds.like()));
+            .unwrap_or_else(|| {
+                // Only a poller built outside `with_poller_holds`, which quinn
+                // 0.11.12 does only on a rebind (migration is off), gets here;
+                // its holds go into a record nobody reads, so the stall count,
+                // send gaps and ack watch of its connection would see none.
+                // Counted for the tests, not asserted: this runs under quinn's
+                // endpoint lock, and a panic there poisons it and aborts the
+                // process (see "NOT CONTAINED" in the transport rules).
+                #[cfg(test)]
+                FALLBACK_POLLERS.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    "QUIC: a connection's poller was built outside with_poller_holds; \
+                     its egress cap holds will not be seen"
+                );
+                Arc::new(self.cap_holds.like())
+            });
         Box::pin(QuicPoller {
             holds,
             socket: self,

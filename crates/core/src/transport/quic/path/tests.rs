@@ -4183,6 +4183,124 @@ fn a_path_dark_mid_send_fails_within_two_windows_and_goes_suspect() {
     })
 }
 
+/// Other sends settling around a timeout do not cost it its quiet proof
+/// (#6128 re-review). An unrelated `Sent` settles at 8 s, after the timed-out
+/// send's own acknowledgements, so the stall count dates progress at 8 s; after
+/// the timeout at 12 s another unrelated `Sent` settles first. The timed-out
+/// send's settle still finds the proof (it is read, not taken), and the proof
+/// dates the last progress back to 2 s although no settle sees a new
+/// acknowledgement, so the path goes suspect at that first timeout.
+#[test]
+fn a_quiet_proof_survives_other_settles_and_dates_earlier_progress() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let network = "quic-path-proof-survives";
+        let p = paths(network, 79, QuicPathLimits::DEFAULT).await;
+        let (a, time) = (p.a.clone(), p.time());
+        let body = over_window();
+        let fragments = body.len().div_ceil(FRAGMENT_PAYLOAD_SIZE);
+        let silencer = Arc::new(SilenceAfter {
+            network,
+            from: p.pair.b_addr,
+            after: fragments * 3 / 4,
+            sent: std::sync::atomic::AtomicUsize::new(0),
+            silenced: parking_lot::Mutex::new(None),
+        });
+        let watched = silencer.clone();
+        let deadlines = SendDeadlines::stream(body.len() as u64);
+        let other = a.clone();
+        let clock = time.clone();
+        let outcome = p
+            .drive(async move {
+                let unrelated = async {
+                    clock.sleep(Duration::from_secs(8)).await;
+                    other.settle(
+                        SendKind::Short,
+                        &BoundedSend::Sent,
+                        false,
+                        clock.now_nanos(),
+                    );
+                };
+                let (outcome, ()) = tokio::join!(
+                    a.send_stream_bounded(
+                        &time,
+                        deadlines,
+                        StreamId::next(),
+                        None,
+                        body,
+                        Some(&*watched),
+                    ),
+                    unrelated
+                );
+                outcome
+            })
+            .await;
+        assert!(
+            matches!(outcome, BoundedSend::Failed(SendFailure::TimedOut)),
+            "{outcome:?}"
+        );
+        let now = p.time().now_nanos();
+        p.a.settle(SendKind::Short, &BoundedSend::Sent, false, now);
+        assert!(!p.a.is_suspect(), "a Sent never makes the path suspect");
+        p.a.settle(SendKind::Stream, &outcome, false, now);
+        assert!(p.a.is_suspect(), "the first timeout makes the path suspect");
+        drop(silencer.silenced.lock().take());
+    })
+}
+
+/// An accepted connection on a capped endpoint counts its own holds: the
+/// server side's poller is built inside `establish` (`with_poller_holds`), not
+/// with an unread record.
+#[test]
+fn an_accepted_connection_on_a_capped_endpoint_records_its_holds() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let network = "quic-path-accepted-holds";
+        let mut p = paths_capped(network, 80, 100_000).await;
+        let c_addr: SocketAddr = "10.203.80.3:5000".parse().unwrap();
+        let (c_end, c_keys) = p.pair.third(c_addr).await;
+        let a_end = p.pair.a.clone();
+        let permit = a_end
+            .allow_peer(c_addr, c_keys.public())
+            .expect("allow-set has room");
+        let (a_addr, a_key) = (p.pair.a_addr, p.pair.a_keys.public().clone());
+        let time = p.time();
+        let holds = p
+            .drive(async move {
+                let (client, accepted) = tokio::join!(c_end.connect(a_addr, &a_key), async {
+                    a_end
+                        .accept()
+                        .await
+                        .expect("an incoming attempt")
+                        .establish()
+                        .await
+                });
+                let _client = client.expect("client handshake");
+                let accepted = accepted.expect("server accepted");
+                let mut send = accepted.inner().open_uni().await.expect("open stream");
+                let writing = async {
+                    send.write_all(&payload(MIB)).await.ok();
+                };
+                tokio::select! {
+                    () = writing => {}
+                    () = time.sleep(Duration::from_secs(2)) => {}
+                }
+                accepted.cap_holds().read().holds
+            })
+            .await;
+        drop(permit);
+        assert!(
+            holds > 0,
+            "the accepted connection's own record saw the cap hold it"
+        );
+        assert_eq!(
+            super::super::socket::FALLBACK_POLLERS.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "every poller got its connection's record"
+        );
+    })
+}
+
 /// Drops every datagram from `from` on `network` once `after` fragments of a
 /// send have been handed to quinn.
 struct SilenceAfter {
@@ -4292,6 +4410,11 @@ fn a_dark_path_beside_a_cap_held_one_times_out_and_goes_suspect() {
         );
         ac.settle(SendKind::Stream, &outcome, false, p.time().now_nanos());
         assert!(ac.is_suspect(), "the first timeout makes the path suspect");
+        assert_eq!(
+            super::super::socket::FALLBACK_POLLERS.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "every poller got its connection's record"
+        );
     })
 }
 

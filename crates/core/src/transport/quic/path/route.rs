@@ -251,9 +251,10 @@ impl StallCount {
     /// egress cap holds `cap`, at `now_nanos`: whether it counted, and whether
     /// the path should close now (once, at the limit).
     ///
-    /// Progress seen here is dated `now_nanos`, unless `quiet` (a send that
-    /// ran out of gap, [`QuietProof`]) still matches the counts: then nothing
-    /// moved after its `since`, and the progress is dated then.
+    /// Progress seen here is dated `now_nanos`. If `quiet` (a send that ran out
+    /// of gap, [`QuietProof`]) still matches the counts, nothing moved after its
+    /// `since`, and the last progress is dated no later than that, whether this
+    /// settle or an earlier one saw it.
     pub(crate) fn take(
         &mut self,
         outcome: &BoundedSend,
@@ -270,15 +271,19 @@ impl StallCount {
             self.acked = acked;
         }
         if acknowledged || held {
-            self.progressed_at = match quiet {
-                Some(proof)
-                    if acked == Some(proof.acked) && cap.holds == proof.holds && !cap.held_now =>
-                {
-                    proof.since.min(now_nanos)
-                }
-                _ => now_nanos,
-            };
+            self.progressed_at = now_nanos;
             self.in_a_row = 0;
+        }
+        // A proof that still matches says nothing moved after its `since`, so
+        // the last progress was no later than that, whichever settle first saw
+        // it and dated it when it did. Both values are no earlier than the real
+        // last move, so the smaller one still is.
+        if let Some(proof) = quiet
+            && acked == Some(proof.acked)
+            && cap.holds == proof.holds
+            && !cap.held_now
+        {
+            self.progressed_at = self.progressed_at.min(proof.since);
         }
         if matches!(outcome, BoundedSend::Sent) {
             self.in_a_row = 0;
@@ -336,13 +341,17 @@ impl QuicPath {
                 self.stop_sending_data();
             }
         }
-        let acked = self.ack_progress.as_ref().map(recycle::AckProgress::acked);
-        let cap = self.connection.cap_holds().read();
-        let quiet = self.quiet.lock().take();
-        let verdict = self
-            .stall
-            .lock()
-            .take(outcome, source_stalled, acked, cap, quiet, now_nanos);
+        // The counts are read under the stall lock, so concurrent settles take
+        // them in order. The proof is read, not taken: it checks itself against
+        // the counts, so one left for another send's settle stays usable.
+        let (verdict, acked) = {
+            let mut stall = self.stall.lock();
+            let acked = self.ack_progress.as_ref().map(recycle::AckProgress::acked);
+            let cap = self.connection.cap_holds().read();
+            let quiet = *self.quiet.lock();
+            let verdict = stall.take(outcome, source_stalled, acked, cap, quiet, now_nanos);
+            (verdict, acked)
+        };
         if let (true, Some(acked)) = (verdict.quiet_timeout, acked) {
             self.become_suspect(acked);
         }

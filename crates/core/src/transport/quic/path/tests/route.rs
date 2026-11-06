@@ -478,4 +478,14 @@ fn a_quiet_proof_dates_progress_only_while_its_counts_match() {
     let mut count = StallCount::new(Some(5), 0);
     let verdict = count.take(timeout, false, Some(9), free, None, now);
     assert!(!verdict.quiet_timeout);
+    // An earlier settle saw the acknowledgements and dated them late: the
+    // proof, still matching, dates them back although this settle sees nothing
+    // new.
+    let mut count = StallCount::new(Some(5), 0);
+    let early = SECOND * 5;
+    let _ = count.take(&BoundedSend::Sent, false, Some(9), free, None, early);
+    let verdict = count.take(timeout, false, Some(9), free, None, now);
+    assert!(!verdict.quiet_timeout, "dated at the earlier settle");
+    let verdict = count.take(timeout, false, Some(9), free, Some(proof), now);
+    assert!(verdict.quiet_timeout, "dated back to the proof's since");
 }

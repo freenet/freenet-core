@@ -651,7 +651,11 @@ async fn attempt(
                             quinn::crypto::rustls::QuicServerConfig::try_from(Arc::new(*tls))
                                 .unwrap(),
                         );
-                        let connection = incoming.incoming.accept_with(Arc::new(config))?.await?;
+                        let connection =
+                            super::socket::with_poller_holds(&incoming.cap_holds, || {
+                                incoming.incoming.accept_with(Arc::new(config))
+                            })?
+                            .await?;
                         Ok(QuicConnection::new(
                             connection,
                             incoming.permit,
@@ -2269,7 +2273,9 @@ fn a_cap_short_of_the_datagram_is_would_block() {
     assert_eq!(cap.level_bytes(), level, "nothing was charged");
     assert_eq!(socket.send_refused(), 1, "a cap refusal is counted");
 
-    let mut poller = socket.clone().create_io_poller();
+    let mut poller = super::socket::with_poller_holds(&Arc::new(socket.cap_holds().like()), || {
+        socket.clone().create_io_poller()
+    });
     let waker = futures::task::noop_waker();
     let mut cx = Context::from_waker(&waker);
     assert!(poller.as_mut().poll_writable(&mut cx).is_pending());
@@ -4333,7 +4339,9 @@ fn adapter_refuses_sends_after_a_panic() {
     assert!(error.to_string().contains("adapter panicked"), "{error}");
     let waker = futures::task::noop_waker();
     let mut cx = Context::from_waker(&waker);
-    let mut poller = socket.clone().create_io_poller();
+    let mut poller = super::socket::with_poller_holds(&Arc::new(socket.cap_holds().like()), || {
+        socket.clone().create_io_poller()
+    });
     assert!(matches!(
         poller.as_mut().poll_writable(&mut cx),
         Poll::Ready(Err(_))
