@@ -361,11 +361,33 @@ struct QueuedWaiters {
     /// apart from `places` so waking the oldest holders never walks past
     /// waiters that hold none.
     wakers: std::collections::BTreeMap<u64, std::task::Waker>,
+    /// When each admission whose take has not happened yet was made (ns on
+    /// the cap's clock), oldest first, at most [`MAX_ADMISSION_WAKERS`].
+    /// [`EgressCap::poll_admit`] gives up a waiter's place when it admits
+    /// it, and the caller takes afterwards; until then the admission still
+    /// counts ahead of every other waiter, so a waiter polling on another
+    /// thread in that gap cannot be admitted on the same datagram. A take
+    /// ([`EgressCap::try_take`]) clears the oldest. One whose take never
+    /// comes (the stream ended, or its window held it) lapses after
+    /// [`ADMISSION_PASS`], so none can owe the bucket for good.
+    admitted: std::collections::VecDeque<i64>,
 }
 
 impl QueuedWaiters {
     fn sync(&self, waiting: &std::sync::atomic::AtomicUsize) {
-        waiting.store(self.places.len(), Ordering::Release);
+        waiting.store(self.places.len() + self.admitted.len(), Ordering::Release);
+    }
+
+    /// Drop admissions older than [`ADMISSION_PASS`] at `now`.
+    fn lapse(&mut self, now: i64) {
+        let pass = i64::try_from(ADMISSION_PASS.as_nanos()).unwrap_or(i64::MAX);
+        while self
+            .admitted
+            .front()
+            .is_some_and(|at| now.saturating_sub(*at) > pass)
+        {
+            self.admitted.pop_front();
+        }
     }
 
     /// How many waiters are queued ahead of `ticket`, counted exactly up to
@@ -414,43 +436,79 @@ impl AdmissionQueue {
             None => {}
         }
         queue.sync(&self.waiting);
-        queue.ahead_of(t)
+        // The same count as `Self::ahead`, so `poll_admit`'s check after
+        // registering agrees with its check before.
+        queue
+            .ahead_of(t)
+            .saturating_add(queue.admitted.len())
+            .min(MAX_ADMISSION_WAKERS + 1)
     }
 
-    /// How many waiters are queued ahead of the one holding `ticket`
-    /// ([`QueuedWaiters::ahead_of`]); for a waiter not queued, every queued
-    /// one is ahead of it. No lock when nobody waits.
-    fn ahead(&self, ticket: Option<u64>) -> usize {
-        if self.waiting.load(Ordering::Acquire) == 0 {
-            return 0;
-        }
-        let queue = self.inner.lock();
-        match ticket {
-            Some(t) if queue.places.contains(&t) => queue.ahead_of(t),
-            _ => queue.places.len().min(MAX_ADMISSION_WAKERS + 1),
-        }
-    }
-
-    /// Remove an admitted waiter's place, and wake the oldest waiter still
-    /// holding a waker: the next in line. Its timer was set from its place
-    /// when it last polled, and waiters ahead that left since (streams
-    /// failing at their deadline) made that timer late; woken now, it
-    /// re-polls from its current place, so the bucket's refill is not left
-    /// unused while it sleeps. One wake per admission. Woken after the lock
-    /// is released.
-    fn forget(&self, ticket: &mut Option<u64>) {
-        let Some(t) = ticket.take() else {
-            return;
-        };
+    /// Admit the waiter holding `ticket` if `fits(ahead)` says the bucket
+    /// covers it, where `ahead` is how many waiters are ahead of it
+    /// ([`QueuedWaiters::ahead_of`]; every queued one, for a waiter not
+    /// queued) plus every admission whose take has not happened yet
+    /// (`QueuedWaiters::admitted`), at most [`MAX_ADMISSION_WAKERS`] `+ 1`.
+    /// Returns `None` when admitted, else `Some(ahead)`.
+    ///
+    /// The count, the check and the recording of the admission happen under
+    /// one lock, so two senders polling at once on different threads cannot
+    /// both count nobody ahead and both be admitted on one datagram.
+    ///
+    /// On admission it removes the waiter's place and wakes the oldest
+    /// waiter still holding a waker: the next in line. Its timer was set
+    /// from its place when it last polled, and waiters ahead that left
+    /// since (streams failing at their deadline) made that timer late;
+    /// woken now, it re-polls from its current place, so the bucket's refill
+    /// is not left unused while it sleeps. One wake per admission, after the
+    /// lock is released.
+    fn try_admit(
+        &self,
+        ticket: &mut Option<u64>,
+        now: i64,
+        fits: impl FnOnce(usize) -> bool,
+    ) -> Option<usize> {
         let next = {
             let mut queue = self.inner.lock();
-            queue.wakers.remove(&t);
-            queue.places.remove(&t);
+            queue.lapse(now);
+            let queued = match *ticket {
+                Some(t) if queue.places.contains(&t) => queue.ahead_of(t),
+                _ => queue.places.len(),
+            };
+            let ahead = queued
+                .saturating_add(queue.admitted.len())
+                .min(MAX_ADMISSION_WAKERS + 1);
+            if !fits(ahead) {
+                queue.sync(&self.waiting);
+                return Some(ahead);
+            }
+            if queue.admitted.len() >= MAX_ADMISSION_WAKERS {
+                queue.admitted.pop_front();
+            }
+            queue.admitted.push_back(now);
+            let next = ticket.take().and_then(|t| {
+                queue.wakers.remove(&t);
+                queue.places.remove(&t);
+                queue.wakers.pop_first().map(|(_, waker)| waker)
+            });
             queue.sync(&self.waiting);
-            queue.wakers.pop_first().map(|(_, waker)| waker)
+            next
         };
         if let Some(waker) = next {
             waker.wake();
+        }
+        None
+    }
+
+    /// A take happened: clear the oldest admission still waiting for its
+    /// take, if any. No lock when there is none.
+    fn took(&self) {
+        if self.waiting.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let mut queue = self.inner.lock();
+        if queue.admitted.pop_front().is_some() {
+            queue.sync(&self.waiting);
         }
     }
 
@@ -733,6 +791,8 @@ impl EgressCap {
             self.stats.refusals.fetch_add(1, Ordering::Relaxed);
             return Err(Duration::from_nanos(deficit as u64));
         }
+        // The admission this take follows, if there was one, has been used.
+        self.admission.took();
         Ok(EgressTake {
             cap: self,
             taken_bytes: bytes as u64,
@@ -800,21 +860,34 @@ impl EgressCap {
         };
         loop {
             let now = self.now();
-            let ahead = self.admission.ahead(waiter.ticket);
             // Admitted only when the bucket also holds a datagram for every
-            // waiter ahead, so a waiter that polls first cannot take a
-            // datagram that is another's turn. Nothing is set aside: a
-            // waiter ahead that has not polled yet takes its datagram when
-            // it does, from the same level.
-            let need = cost.saturating_add(owed(ahead));
-            let deficit = match self.admits(self.empty_at_ns.load(Ordering::Acquire), now, need) {
-                Ok(_) => {
-                    waiter.timer = None;
-                    self.admission.forget(&mut waiter.ticket);
-                    return Poll::Ready(());
-                }
-                Err(deficit) => deficit,
+            // waiter ahead and every admission not yet taken, so a waiter
+            // that polls first, on any thread, cannot take a datagram that
+            // is another's turn. Nothing is set aside: a waiter ahead that
+            // has not polled yet takes its datagram when it does, from the
+            // same level. A waiter with more than `MAX_ADMISSION_WAKERS`
+            // ahead is never admitted, whatever the level: the clamp in
+            // `owed` is for its timer only.
+            let refused = self.admission.try_admit(&mut waiter.ticket, now, |ahead| {
+                ahead <= MAX_ADMISSION_WAKERS
+                    && self
+                        .admits(
+                            self.empty_at_ns.load(Ordering::Acquire),
+                            now,
+                            cost.saturating_add(owed(ahead)),
+                        )
+                        .is_ok()
+            });
+            let Some(ahead) = refused else {
+                waiter.timer = None;
+                return Poll::Ready(());
             };
+            let need = cost.saturating_add(owed(ahead));
+            let deficit = self
+                .admits(self.empty_at_ns.load(Ordering::Acquire), now, need)
+                .err()
+                // Too far back: its timer is clamped, so it is early.
+                .unwrap_or_else(|| self.cost_ns(WAKE_DATAGRAM_BYTES as u64));
             #[cfg(test)]
             self.stats.refusals.fetch_add(1, Ordering::Relaxed);
             let ahead = self.admission.register(&mut waiter.ticket, cx.waker());
@@ -822,9 +895,10 @@ impl EgressCap {
             let need = cost.saturating_add(owed(ahead));
             // Bytes given back between the check above and the registration
             // woke nobody; check once more so they are not missed.
-            if self
-                .admits(self.empty_at_ns.load(Ordering::Acquire), self.now(), need)
-                .is_ok()
+            if ahead <= MAX_ADMISSION_WAKERS
+                && self
+                    .admits(self.empty_at_ns.load(Ordering::Acquire), self.now(), need)
+                    .is_ok()
             {
                 continue;
             }

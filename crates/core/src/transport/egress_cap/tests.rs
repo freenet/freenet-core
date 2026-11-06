@@ -1421,3 +1421,73 @@ async fn an_admission_is_kept_for_the_pass_and_then_queues_again() {
         drop(other);
     }
 }
+
+/// On a real multi-thread runtime, a sender admitted by `poll_admit` always
+/// gets its take: while its take is pending its admission counts ahead of
+/// everyone, so a sender polling on another thread in that gap is not
+/// admitted on the same datagram. Each sender yields its thread between
+/// `Ready` and the take, as a preempted task would, to widen that gap.
+/// Before admissions were counted until their take, and counted and
+/// recorded under one lock, the second sender saw nobody ahead, both were
+/// admitted on one datagram, and one take failed. An admission whose take
+/// comes later than `ADMISSION_PASS` (the thread was descheduled that long)
+/// has lapsed by design and may lose its datagram; those are counted
+/// apart.
+#[test]
+fn an_admitted_take_is_not_lost_to_another_thread() {
+    use crate::simulation::RealTime;
+    use std::sync::atomic::AtomicU64;
+    const SENDERS: usize = 8;
+    const TAKES: usize = 400;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (lost, lapsed) = runtime.block_on(async {
+        // 4 MB/s: a datagram of refill every 300 us, so senders contend for
+        // nearly every one.
+        let cap = std::sync::Arc::new(EgressCap::new(4_000_000, RealTime::new()));
+        cap.charge_unpaced(cap.burst_bytes() as usize);
+        let lost = std::sync::Arc::new(AtomicU64::new(0));
+        let lapsed = std::sync::Arc::new(AtomicU64::new(0));
+        let tasks: Vec<_> = (0..SENDERS)
+            .map(|_| {
+                let (cap, lost, lapsed) = (cap.clone(), lost.clone(), lapsed.clone());
+                tokio::spawn(async move {
+                    let mut waiter = AdmissionWaiter::default();
+                    for _ in 0..TAKES {
+                        std::future::poll_fn(|cx| cap.poll_admit(PACKET, &mut waiter, cx)).await;
+                        let admitted = std::time::Instant::now();
+                        std::thread::yield_now();
+                        match cap.try_take(PACKET, Duration::ZERO) {
+                            Ok(take) => take.sent(PACKET),
+                            Err(_) if admitted.elapsed() > ADMISSION_PASS => {
+                                lapsed.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(_) => {
+                                lost.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+        for task in tasks {
+            task.await.unwrap();
+        }
+        (lost.load(Ordering::Relaxed), lapsed.load(Ordering::Relaxed))
+    });
+    assert_eq!(
+        lost,
+        0,
+        "{lost} of {} admitted takes found the bucket short within the pass \
+         ({lapsed} more after it lapsed)",
+        SENDERS * TAKES
+    );
+    assert!(
+        lapsed * 50 <= (SENDERS * TAKES) as u64,
+        "{lapsed} of {} takes came after their admission lapsed",
+        SENDERS * TAKES
+    );
+}
