@@ -3830,8 +3830,14 @@ impl Ring {
             // no `.await` point. Push it onto a blocking thread so it can never
             // stall other tasks on the async reactor — the same discipline
             // `secrets_store/sweep.rs` uses for its "disk walk + ReDb reads".
+            //
+            // `offload_blocking`, not a bare `spawn_blocking`: on a simulation
+            // host (`current_thread`) it runs the walk inline. A pool thread
+            // finishes in wall-clock time, so the step at which this loop
+            // resumed depended on OS scheduling and one seed gave different
+            // results from run to run (#6123).
             let ring_for_disk = ring.clone();
-            if let Err(err) = tokio::task::spawn_blocking(move || {
+            if let Err(err) = crate::util::blocking::offload_blocking(move || {
                 #[cfg(feature = "redb")]
                 ring_for_disk.hosting_manager.seed_disk_tracker_if_absent();
                 ring_for_disk.hosting_manager.refresh_disk_usage();
