@@ -562,7 +562,7 @@ impl AdmissionQueue {
         &self,
         ticket: &mut Option<u64>,
         admission: &mut Option<u64>,
-        mut held_place: Option<&mut Option<u64>>,
+        held_place: Option<&mut Option<u64>>,
         clock: impl Fn() -> i64,
         fits: impl FnOnce(usize, i64) -> bool,
     ) -> Result<(), (usize, i64)> {
@@ -626,7 +626,7 @@ impl AdmissionQueue {
                 // up, or, admitted on its first poll, the admission's own number,
                 // which is behind every waiter queued now and ahead of every
                 // later one.
-                if let Some(slot) = held_place.as_deref_mut() {
+                if let Some(slot) = held_place {
                     *slot = Some(given_up.unwrap_or(id));
                 }
                 let next = given_up.and_then(|t| {
