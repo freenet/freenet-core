@@ -217,8 +217,9 @@ impl SendPacer for Scripted {
     }
 }
 
-/// A refusal after the stream opened ends the send `Failed(Paced)` and resets
-/// the stream, so the receiver drops what came.
+/// A refusal after the stream opened ends the send `Failed(Paced)`, carrying
+/// what the writes made before it paid, and resets the stream, so the
+/// receiver drops what came.
 /// Each reservation is limited to what the send's current deadline leaves: the
 /// first, before the stream opens, to the open deadline.
 #[test]
@@ -230,9 +231,15 @@ fn a_refusal_after_the_stream_opened_resets_it() {
         let pacer = Scripted::new(&p.time(), 3, Duration::ZERO);
         p.a.pace_with(pacer.clone());
         let (_, outcome) = time_a_stream(&p, 10 * FRAGMENT_PAYLOAD_SIZE).await;
-        assert!(
-            matches!(outcome, BoundedSend::Failed(SendFailure::Paced { .. })),
-            "{outcome:?}"
+        // The outcome carries what the writes made before the refusal took:
+        // the header and two fragments.
+        let BoundedSend::Failed(SendFailure::Paced { spent }) = outcome else {
+            panic!("{outcome:?}");
+        };
+        assert_eq!(
+            spent,
+            pacer.asked.lock()[..3].iter().sum::<usize>() as u64,
+            "the header and two fragments were paid for"
         );
         assert_eq!(p.a.send_aborts(), 1, "the stream was reset");
         let limits = pacer.limits.lock().clone();
