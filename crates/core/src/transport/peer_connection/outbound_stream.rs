@@ -5211,9 +5211,11 @@ mod egress_cap_tests {
     /// beside many streams on other connections. The window holds one fragment
     /// and an ACK takes 30 ms, so a stream the queue admits usually finds the
     /// window full and waits past `ADMISSION_PASS` before its take. It keeps
-    /// its place in the queue meanwhile; before, it went to the back each time
-    /// and lost a whole turn of the queue (about 0.8 s here), so its gaps
-    /// reached the 5 s deadline and streams failed.
+    /// its place in the queue meanwhile, so its worst gap between fragments is
+    /// about one turn of the queue (34 senders at 50 kB/s: 0.82 s; measured
+    /// 0.86 s). Before, it went to the back each time and lost a whole turn:
+    /// the worst gap was 1.61 s, two turns. At a queue turn of 3 s, two turns
+    /// miss the 5 s deadline.
     #[tokio::test(flavor = "current_thread")]
     async fn streams_sharing_a_window_keep_their_turn_under_a_binding_cap() {
         const RATE: u64 = 50_000;
@@ -5296,10 +5298,13 @@ mod egress_cap_tests {
             stats.streams_abandoned,
             worst_shared_gap / 1_000_000
         );
+        let turn = u64::from(SHARED + OTHERS) * 1_200 * 1_000_000_000 / RATE;
         assert!(
-            worst_shared_gap < 3_000_000_000,
-            "a stream on the shared window waited {} ms between fragments",
-            worst_shared_gap / 1_000_000
+            worst_shared_gap < turn * 3 / 2,
+            "a stream on the shared window waited {} ms between fragments, \
+             a turn of the queue is {} ms",
+            worst_shared_gap / 1_000_000,
+            turn / 1_000_000
         );
     }
 
