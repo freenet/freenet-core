@@ -4885,9 +4885,20 @@ mod tests {
             DeltaOrFullState::FullState(b"state-1".to_vec()),
         )
         .await;
+        // Move the stored state away from both payloads, so that a replay that
+        // wrongly reached the executor would change it and write. Without this
+        // the full-state replay would equal the stored state and hit the
+        // executor's byte-identical short-circuit, which writes nothing, and
+        // the store count could not tell a skip from an apply.
+        deliver(
+            &op_manager,
+            key,
+            DeltaOrFullState::FullState(b"state-2".to_vec()),
+        )
+        .await;
         assert_eq!(
             storage.store_count() - writes_before,
-            2,
+            3,
             "each first delivery must merge and commit"
         );
 
@@ -4907,7 +4918,7 @@ mod tests {
         .await;
         assert_eq!(
             storage.store_count() - writes_before,
-            2,
+            3,
             "a replayed delta or state must not reach the executor again"
         );
         assert_eq!(
@@ -5009,12 +5020,16 @@ mod tests {
         };
         let writes_before = storage.store_count();
         stream(b"streamed-state").await;
-        assert_eq!(storage.store_count() - writes_before, 1);
+        // Move the stored state away, so a replay that wrongly reached the
+        // executor would change it and write (an identical state would hit the
+        // byte-identical short-circuit and write nothing).
+        stream(b"streamed-other").await;
+        assert_eq!(storage.store_count() - writes_before, 2);
         clock.advance_time(std::time::Duration::from_secs(61));
         stream(b"streamed-state").await;
         assert_eq!(
             storage.store_count() - writes_before,
-            1,
+            2,
             "a replayed streaming state must not reach the executor again"
         );
         assert_eq!(

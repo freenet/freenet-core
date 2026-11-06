@@ -24,10 +24,15 @@
 //! re-push of a recorded payload no longer re-triggers the identical-input
 //! probe: deterministic re-detection after a flag expires happens only when
 //! the echo re-pushes a payload not yet recorded, or recorded more than the
-//! record's age bound ago. The FIRST identical re-push is still probed,
-//! because the record is made after the probe runs. The record's precondition
-//! is stated in that module's "Precondition" section. For a
-//! that replays a fixed set of payloads, the skip itself is now the defence.
+//! record's age bound ago. In the common case the stored state came from a
+//! changing merge of the same full-state payload, which recorded it, so the
+//! next identical re-push is skipped before it can reach the probe. The probe
+//! still runs on an identical re-push only when the stored state arrived by a
+//! path that does not record (initial install, corrupted-state recovery) or
+//! by a different payload with the same bytes; otherwise, for 15 minutes the
+//! skip replaces it. The record's precondition is stated in that module's
+//! "Precondition" section. For a contract that replays a fixed set of
+//! payloads, the skip itself is now the defence.
 //! Such contracts are flagged less often, so a lower broken-flag count does
 //! not mean fewer broken contracts.
 //!

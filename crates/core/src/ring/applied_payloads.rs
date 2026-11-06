@@ -34,10 +34,14 @@
 //!   bytes again as a new update (A, B, A).
 //!
 //! In both cases the skip would stop a needed payload one hop out. The age
-//! bound turns that into a delay of at most 15 minutes: an expired hash does
-//! not cause a skip, so the same bytes reach the merge again. Anti-entropy is
-//! not relied on to bring different bytes, because a heal is computed from the
-//! sender's state and this node's summary and can repeat exactly.
+//! bound turns that into a bounded delay. An expired hash only stops causing
+//! skips; nothing re-sends the bytes. So the delay is 15 minutes plus the time
+//! until those bytes next arrive, which can be the next anti-entropy revisit
+//! of the contract: each heartbeat advertises a rotating window of the shared
+//! set, so a contract is revisited within `2 * ceil(shared / 64) - 1`
+//! heartbeats. Anti-entropy is not relied on to bring different bytes,
+//! because a heal is computed from the sender's state and this node's summary
+//! and can repeat exactly.
 //!
 //! For a merge that cycles among a fixed set of states, ending the replay is
 //! the intended effect. The age bound costs such a contract at most one extra
@@ -76,14 +80,25 @@
 //!
 //! ## Bound
 //!
-//! Values are fixed-size `u64` hashes, so the per-contract count cap
-//! ([`APPLIED_PAYLOADS_PER_CONTRACT`]) is a real memory bound: 1024 hashes in
-//! a `VecDeque` plus the same hashes in a `HashSet` for O(1) lookup, about
-//! 30 KiB per contract at the cap, a few percent of the ~1 MB resident cost of
-//! a hosted contract that the hosting budget already accounts for. The number
-//! of contracts with an entry is bounded by the hosted set: entries are
+//! Values are fixed-size, so the per-contract count cap
+//! ([`APPLIED_PAYLOADS_PER_CONTRACT`]) is a real memory bound. At the cap of
+//! 1024 a contract holds:
+//!
+//! - the `VecDeque<u64>`: capacity 1024 x 8 B = 8 KiB. `record_absorbed`
+//!   prunes BEFORE it pushes, so the queue never reaches 1025 entries and
+//!   never doubles its capacity (pinned by `the_queue_never_grows_past_the_cap`);
+//! - the `HashMap<u64, Instant>`: hashbrown sizes 1024 entries at 2048
+//!   buckets (it keeps the load at or below 7/8), each bucket a 24-byte
+//!   `(u64, Instant)` pair (pinned by the same test) plus one control byte:
+//!   2048 x 25 B + 16 B = 51,216 B, about 50 KiB.
+//!
+//! About 58 KiB per contract at the cap, roughly 6% of the ~1 MB resident cost
+//! of a hosted contract that the hosting budget already accounts for. The
+//! number of contracts with an entry is bounded by the hosted set: entries are
 //! removed at eviction, and the ring reaper drops entries for contracts that
-//! are neither hosted nor in use ([`AppliedPayloads::retain_contracts`]).
+//! are neither hosted nor in use, and for contracts whose newest hash has
+//! expired, so a quiet contract does not keep up to 1024 expired hashes
+//! ([`AppliedPayloads::retain_contracts`]).
 //!
 //! The cap only has to hold the replayed set (a handful of payloads) across
 //! the unrelated traffic that arrives between replays. When it truncates, the
@@ -117,7 +132,7 @@ use crate::util::time_source::DynTimeSource;
 pub(crate) const APPLIED_PAYLOADS_PER_CONTRACT: usize = 1024;
 
 /// How long a recorded hash causes a skip, measured from when it was last
-/// recorded. See the module docs, "Age bound": three anti-entropy heartbeats,
+/// recorded. See the module docs, "Precondition": three anti-entropy heartbeats,
 /// well above the roughly 60 s replay period of a looping contract.
 pub(crate) const APPLIED_PAYLOAD_MAX_AGE: Duration = Duration::from_secs(15 * 60);
 
@@ -204,28 +219,33 @@ impl AppliedPayloads {
                 recorded_at: HashMap::new(),
             });
         let entry = &mut *entry;
-        if entry.recorded_at.insert(hash, now).is_some() {
-            // Already present: move it to the newest end, matching its
-            // refreshed time. The linear scan runs only on a re-record, never
-            // on lookup.
+        if entry.recorded_at.contains_key(&hash) {
+            // Already present: take it out of the queue so it moves to the
+            // newest end below, matching its refreshed time. The linear scan
+            // runs only on a re-record, never on lookup.
             if let Some(pos) = entry.hashes.iter().position(|h| *h == hash) {
                 entry.hashes.remove(pos);
             }
+            entry.recorded_at.remove(&hash);
         }
-        entry.hashes.push_back(hash);
-        // Drop from the front: expired hashes (the queue is ordered by record
-        // time, so they are all at the front) and anything over the cap.
+        // Prune BEFORE pushing, so neither the queue nor the map ever holds
+        // more than `cap_per_contract` entries (and the queue never doubles its
+        // capacity to fit a 1025th). Drop from the front: expired hashes (the
+        // queue is ordered by record time, so they are all at the front) and
+        // anything that would leave no room for this one.
         while let Some(front) = entry.hashes.front().copied() {
             let expired = entry
                 .recorded_at
                 .get(&front)
                 .is_none_or(|at| now.saturating_duration_since(*at) >= self.max_age);
-            if !expired && entry.hashes.len() <= self.cap_per_contract {
+            if !expired && entry.hashes.len() < self.cap_per_contract {
                 break;
             }
             entry.hashes.pop_front();
             entry.recorded_at.remove(&front);
         }
+        entry.recorded_at.insert(hash, now);
+        entry.hashes.push_back(hash);
         debug_assert_eq!(entry.hashes.len(), entry.recorded_at.len());
     }
 
@@ -235,14 +255,30 @@ impl AppliedPayloads {
         self.entries.remove(key.id());
     }
 
-    /// Drop entries for contracts `keep` rejects. Returns how many were
-    /// dropped. Keys are collected first so `keep` never runs under a shard
-    /// guard of this map.
+    /// Drop entries for contracts `keep` rejects, and for contracts whose
+    /// NEWEST hash has expired (then every hash has, since the queue is
+    /// ordered by record time), so a quiet contract does not keep up to 1024
+    /// expired hashes. One check per contract. Returns how many were dropped.
+    /// Keys are collected first so `keep` never runs under a shard guard of
+    /// this map.
     pub(crate) fn retain_contracts(&self, keep: impl Fn(&ContractKey) -> bool) -> usize {
-        let keys: Vec<ContractKey> = self.entries.iter().map(|e| e.value().key).collect();
+        let now = self.time_source.now();
+        let candidates: Vec<(ContractKey, bool)> = self
+            .entries
+            .iter()
+            .map(|e| {
+                let entry = e.value();
+                let all_expired = entry
+                    .hashes
+                    .back()
+                    .and_then(|newest| entry.recorded_at.get(newest))
+                    .is_none_or(|at| now.saturating_duration_since(*at) >= self.max_age);
+                (entry.key, all_expired)
+            })
+            .collect();
         let mut dropped = 0;
-        for key in keys {
-            if !keep(&key) && self.entries.remove(key.id()).is_some() {
+        for (key, all_expired) in candidates {
+            if (all_expired || !keep(&key)) && self.entries.remove(key.id()).is_some() {
                 dropped += 1;
             }
         }
@@ -269,6 +305,14 @@ impl AppliedPayloads {
                 )
             },
         )
+    }
+
+    /// Allocated queue capacity for one contract, for the memory pin.
+    #[cfg(test)]
+    pub(crate) fn queue_capacity_for(&self, key: &ContractKey) -> usize {
+        self.entries
+            .get(key.id())
+            .map_or(0, |e| e.hashes.capacity())
     }
 
     #[cfg(test)]
@@ -401,7 +445,12 @@ mod tests {
     /// every kind of change: insert, re-record, eviction at the cap, reset.
     #[test]
     fn the_lookup_set_stays_in_step_with_the_queue() {
-        let set = capped(3);
+        let clock = clock();
+        let set = AppliedPayloads::with_limits(
+            3,
+            APPLIED_PAYLOAD_MAX_AGE,
+            std::sync::Arc::new(clock.clone()),
+        );
         let k = key(1);
         let check = |label: &str| {
             let (queue, members) = set.views_for(&k);
@@ -411,7 +460,7 @@ mod tests {
                 "{label}: queue holds a hash the lookup set lacks"
             );
         };
-        let h: Vec<u64> = (0u8..5).map(|i| set.payload_hash(true, &[i])).collect();
+        let h: Vec<u64> = (0u8..7).map(|i| set.payload_hash(true, &[i])).collect();
         set.record_absorbed(&k, h[0]);
         set.record_absorbed(&k, h[1]);
         check("insert");
@@ -422,12 +471,63 @@ mod tests {
         set.record_absorbed(&k, h[4]);
         check("evict");
         assert!(!set.contains(&k, h[1]), "an evicted hash must not be found");
+        clock.advance_time(APPLIED_PAYLOAD_MAX_AGE);
+        set.record_absorbed(&k, h[5]);
+        check("expiry pruning");
+        assert_eq!(
+            set.views_for(&k).0,
+            vec![h[5]],
+            "the record after expiry prunes every expired hash from both views"
+        );
         set.reset(&k);
         check("reset");
-        assert!(!set.contains(&k, h[4]));
+        assert!(!set.contains(&k, h[5]));
     }
 
-    /// A recorded hash causes a skip until the age bound and not after it.
+    /// Memory pin for the figures in the module doc ("Bound"): the queue never
+    /// holds more than the cap and so never doubles its capacity, and the map
+    /// bucket is the 24-byte pair the doc's arithmetic assumes.
+    #[test]
+    fn the_queue_never_grows_past_the_cap() {
+        let set = set_with(&clock());
+        let k = key(1);
+        for i in 0..(APPLIED_PAYLOADS_PER_CONTRACT as u32 * 3) {
+            set.record_absorbed(&k, set.payload_hash(true, &i.to_le_bytes()));
+            assert!(set.len_for(&k) <= APPLIED_PAYLOADS_PER_CONTRACT);
+        }
+        assert!(
+            set.queue_capacity_for(&k) <= APPLIED_PAYLOADS_PER_CONTRACT,
+            "queue capacity grew to {} past the cap",
+            set.queue_capacity_for(&k)
+        );
+        assert_eq!(std::mem::size_of::<(u64, Instant)>(), 24);
+    }
+
+    /// The reaper drops a still-hosted contract's entry once its newest hash
+    /// has expired, and keeps it while the newest is fresh.
+    #[test]
+    fn retain_drops_a_contract_whose_newest_hash_expired() {
+        let clock = clock();
+        let set = set_with(&clock);
+        let (quiet, busy) = (key(1), key(2));
+        set.record_absorbed(&quiet, 1);
+        set.record_absorbed(&busy, 2);
+        clock.advance_time(APPLIED_PAYLOAD_MAX_AGE - Duration::from_secs(1));
+        set.record_absorbed(&busy, 3);
+        assert_eq!(set.retain_contracts(|_| true), 0, "nothing expired yet");
+        clock.advance_time(Duration::from_secs(1));
+        assert_eq!(
+            set.retain_contracts(|_| true),
+            1,
+            "a hosted contract whose newest hash expired is dropped"
+        );
+        assert_eq!(set.len_for(&quiet), 0);
+        assert!(
+            set.contains(&busy, 3),
+            "a contract with a fresh hash is kept"
+        );
+    }
+
     #[test]
     fn a_hash_expires_at_the_age_bound() {
         let clock = clock();
