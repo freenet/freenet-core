@@ -136,8 +136,15 @@ ticket it was admitted from, kept until a take succeeds), so neither costs
 it a turn of the queue (streams_sharing_a_window_keep_their_turn_under_a_binding_cap:
 worst gap one turn, 0.86 s, against two turns, 1.61 s, when it went to the
 back). At most MAX_ADMISSION_WAKERS admissions are live at once; the next
-waiter waits, and no live one is dropped. A failed QUIC take withdraws its
-poller's admission. An admission stays on the queue
+waiter waits, and no live one is dropped. Every admission has a number its
+waiter keeps; a waiter that polls again (a QUIC poller whose take failed, a
+stream past the pass) withdraws its own, and a take never withdraws one it
+did not use, so a failed send on quinn's respond path (no poll_writable)
+leaves every live admission alone. A named waiter admitted on its first poll
+keeps a place too (its admission's number). A withdrawn admission wakes the
+next held waker, and a waiter's timer is set no later than the oldest
+outstanding admission lapses, so a datagram counted for an admission that
+goes unused does not leave the bucket idle. An admission stays on the queue
 (QueuedWaiters::admitted) until its take or for ADMISSION_PASS, whichever
 comes first: it counts ahead of every waiter that polls, and every take
 leaves one datagram per outstanding admission but its own, so on a
