@@ -485,17 +485,77 @@ async fn failed_sends_are_not_charged() {
 /// with `None` for an unpaced send.
 type Sends = Vec<(u64, u64, Option<usize>)>;
 
+/// A clock whose timers fire late by a random time below `late_ns`.
+#[derive(Clone)]
+struct LateTime {
+    inner: VirtualTime,
+    late_ns: u64,
+}
+
+impl LateTime {
+    fn late(&self) -> Duration {
+        if self.late_ns == 0 {
+            Duration::ZERO
+        } else {
+            Duration::from_nanos(GlobalRng::random_range(0..self.late_ns))
+        }
+    }
+}
+
+impl crate::simulation::TimeSource for LateTime {
+    fn now_nanos(&self) -> u64 {
+        self.inner.now_nanos()
+    }
+
+    fn sleep(
+        &self,
+        duration: Duration,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        self.inner.sleep(duration + self.late())
+    }
+
+    fn sleep_until(
+        &self,
+        deadline_nanos: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        self.inner
+            .sleep_until(deadline_nanos + self.late().as_nanos() as u64)
+    }
+
+    fn sleep_cancelable(
+        &self,
+        duration: Duration,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        self.inner.sleep_cancelable(duration + self.late())
+    }
+
+    fn timeout<F, T>(
+        &self,
+        duration: Duration,
+        future: F,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<T>> + Send>>
+    where
+        F: std::future::Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.inner.timeout(duration + self.late(), future)
+    }
+}
+
 /// Simulate `streams` paced senders on one cap for `duration`, each a task
 /// that sends its next datagram as the transport does under a cap: wait in
 /// the admission queue (`StreamPacing::wait_for_admission`, racing the
 /// deadline), take with `try_take`, send, start the next gap. With `unpaced`,
 /// an unpaced datagram of that size is sent every `unpaced.0`. Returns the
-/// sends and the cap's stats; a stream that reaches its deadline stops.
+/// sends and the cap's stats; a stream that reaches its deadline stops. With
+/// `late_ns`, every timer of the cap (the waiters' wakeups) fires late by a
+/// time drawn from `0..late_ns`, as a tokio timer can fire up to a tick late.
 fn simulate(
     rate: u64,
     streams: usize,
     duration: Duration,
     unpaced: Option<(Duration, usize)>,
+    late_ns: u64,
 ) -> (Sends, EgressStats) {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -503,7 +563,13 @@ fn simulate(
         .unwrap();
     runtime.block_on(async move {
         let time = VirtualTime::new();
-        let cap = std::sync::Arc::new(EgressCap::new(rate, time.clone()));
+        let cap = std::sync::Arc::new(EgressCap::new(
+            rate,
+            LateTime {
+                inner: time.clone(),
+                late_ns,
+            },
+        ));
         let end = duration.as_nanos() as u64;
         let sends = std::sync::Arc::new(parking_lot::Mutex::new(Sends::new()));
         let mut tasks = Vec::new();
@@ -573,6 +639,7 @@ fn every_interval_ending_at_a_paced_send_is_within_the_bucket_bound() {
         30,
         Duration::from_millis(400),
         Some((Duration::from_millis(1), 150)),
+        0,
     );
     assert_eq!(stats.forgiven_bytes, 0, "premise: nothing forgiven");
     assert!(sends.iter().filter(|s| s.2.is_none()).count() > 300);
@@ -597,22 +664,30 @@ fn every_interval_ending_at_a_paced_send_is_within_the_bucket_bound() {
 /// With many streams and no other limit, paced traffic gets at least 99% of
 /// what the bucket allows over a long interval (the rate times the
 /// interval; the initial burst is subtracted, since it would hide a refill
-/// a few percent slow). Timers fire on time here; a late timer delays only
-/// its own waiter, and the bucket keeps the refill it missed up to the burst.
+/// a few percent slow), with timers on time and with every timer up to 1 ms
+/// late (a tokio timer fires up to a tick late). A late timer delays only its
+/// own waiter, and the bucket keeps the refill it missed up to the burst.
 #[test]
-fn paced_streams_reach_the_cap() {
-    for rate in [1_250_000u64, 12_500_000] {
-        let duration = Duration::from_secs(2);
-        let (sends, _) = simulate(rate, 20, duration, None);
-        let (cap, _) = cap_at(rate);
-        let bytes = sends.iter().map(|s| s.1).sum::<u64>() - cap.burst_bytes();
-        let allowed = rate as f64 * duration.as_secs_f64();
-        assert!(
-            bytes as f64 >= 0.99 * allowed,
-            "{bytes} bytes beyond the burst in {duration:?} at a {rate} B/s cap \
-             ({:.1}% of the refill)",
-            100.0 * bytes as f64 / allowed
-        );
+fn paced_streams_reach_the_cap_even_when_timers_wake_late() {
+    for (rate, late_ns) in [
+        (1_250_000u64, 0u64),
+        (12_500_000, 0),
+        (1_250_000, 1_000_000),
+        (12_500_000, 1_000_000),
+    ] {
+        GlobalRng::scoped_seed(rate ^ late_ns, || {
+            let duration = Duration::from_secs(2);
+            let (sends, _) = simulate(rate, 20, duration, None, late_ns);
+            let (cap, _) = cap_at(rate);
+            let bytes = sends.iter().map(|s| s.1).sum::<u64>() - cap.burst_bytes();
+            let allowed = rate as f64 * duration.as_secs_f64();
+            assert!(
+                bytes as f64 >= 0.99 * allowed,
+                "{bytes} bytes beyond the burst in {duration:?} at a {rate} B/s cap, \
+                 timers up to {late_ns} ns late ({:.1}% of the refill)",
+                100.0 * bytes as f64 / allowed
+            );
+        });
     }
 }
 
@@ -626,7 +701,7 @@ fn waiting_streams_are_served_in_turn() {
     const STREAMS: usize = 40;
     let rate = 200_000u64;
     let fair_gap_ns = STREAMS as u64 * PACKET as u64 * 1_000_000_000 / rate;
-    let (sends, stats) = simulate(rate, STREAMS, Duration::from_secs(10), None);
+    let (sends, stats) = simulate(rate, STREAMS, Duration::from_secs(10), None, 0);
     assert_eq!(stats.streams_abandoned, [0, 0, 0]);
     let per_stream: Vec<Vec<u64>> = (0..STREAMS)
         .map(|stream| {
@@ -652,31 +727,40 @@ fn waiting_streams_are_served_in_turn() {
 /// (`MAX_ADMISSION_WAKERS`): the newer ones hold no waker, keep their
 /// places, and rely on their own timers. Every stream still sends, none reaches its deadline,
 /// no gap exceeds four fair gaps, and the cap never holds more wakers than
-/// its bound.
+/// its bound; with timers on time, and with every timer up to 1 ms late,
+/// which matters most to the waiters that have only their timer.
 #[test]
 fn more_waiting_streams_than_held_wakers_all_progress() {
     let streams = MAX_ADMISSION_WAKERS + 500;
     let rate = 12_500_000u64;
     let fair_gap_ns = streams as u64 * PACKET as u64 * 1_000_000_000 / rate;
-    let (sends, stats) = simulate(rate, streams, Duration::from_secs(2), None);
-    assert_eq!(
-        stats.streams_abandoned,
-        [0, 0, 0],
-        "no stream reached its deadline"
-    );
-    let mut per_stream = vec![Vec::new(); streams];
-    for (at, _, stream) in &sends {
-        per_stream[stream.expect("paced")].push(*at);
-    }
-    for (stream, times) in per_stream.iter().enumerate() {
-        assert!(times.len() >= 5, "stream {stream} sent {}", times.len());
-        let worst = times.windows(2).map(|w| w[1] - w[0]).max().unwrap();
-        assert!(
-            worst <= 4 * fair_gap_ns,
-            "stream {stream} waited {worst} ns, fair gap {fair_gap_ns} ns"
+    for late_ns in [0u64, 1_000_000] {
+        let (sends, stats) = GlobalRng::scoped_seed(late_ns + 1, || {
+            simulate(rate, streams, Duration::from_secs(2), None, late_ns)
+        });
+        assert_eq!(
+            stats.streams_abandoned,
+            [0, 0, 0],
+            "late {late_ns} ns: no stream reached its deadline"
         );
+        let mut per_stream = vec![Vec::new(); streams];
+        for (at, _, stream) in &sends {
+            per_stream[stream.expect("paced")].push(*at);
+        }
+        for (stream, times) in per_stream.iter().enumerate() {
+            assert!(
+                times.len() >= 5,
+                "late {late_ns} ns: stream {stream} sent {}",
+                times.len()
+            );
+            let worst = times.windows(2).map(|w| w[1] - w[0]).max().unwrap();
+            assert!(
+                worst <= 4 * fair_gap_ns,
+                "late {late_ns} ns: stream {stream} waited {worst} ns, fair gap {fair_gap_ns} ns"
+            );
+        }
+        assert_served_evenly(&per_stream, 200_000_000);
     }
-    assert_served_evenly(&per_stream, 200_000_000);
 }
 
 /// After `from_ns` (past the initial burst, which the first stream to run
