@@ -2589,6 +2589,76 @@ fn seeded_loss(network: &str, percent: u64) -> Arc<LossCount> {
     count
 }
 
+/// [`seeded_loss`] with every delivered datagram also delayed by `one_way`.
+fn seeded_loss_with_delay(network: &str, percent: u64, one_way: Duration) -> Arc<LossCount> {
+    use crate::transport::in_memory_socket::{
+        PacketDeliveryDecision, set_packet_delivery_callback,
+    };
+    use std::sync::atomic::Ordering::Relaxed;
+    let state = Arc::new(std::sync::atomic::AtomicU64::new(0x5940_0007));
+    let count = Arc::new(LossCount::default());
+    let counted = count.clone();
+    set_packet_delivery_callback(
+        network,
+        Some(Arc::new(move |_, _, _, _| {
+            counted.seen.fetch_add(1, Relaxed);
+            let next = state
+                .fetch_update(Relaxed, Relaxed, |x| {
+                    Some(x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1))
+                })
+                .unwrap_or_default();
+            if (next >> 33) % 100 < percent {
+                counted.dropped.fetch_add(1, Relaxed);
+                PacketDeliveryDecision::Drop
+            } else {
+                PacketDeliveryDecision::DelayedDelivery(one_way)
+            }
+        })),
+    );
+    count
+}
+
+/// A streamed send over a path with 5% random loss and a 200 ms round trip:
+/// the 384 KiB send buffer drains at cwnd/RTT, so a write waits past the 5 s
+/// gap while the connection keeps acknowledging. The gap counts only when
+/// nothing on the connection was acknowledged for `STALL_PROGRESS_WINDOW`, so
+/// the send completes. Before, it timed out (`SendFailure::TimedOut`) and went
+/// to UDP from the start.
+#[test]
+fn a_lossy_path_finishes_a_stream_whose_writes_wait_past_the_gap() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let network = "quic-path-lossy-gap";
+        let loss = seeded_loss_with_delay(network, 5, Duration::from_millis(100));
+        let p = paths(network, 47, QuicPathLimits::DEFAULT).await;
+        let (a, time) = (p.a.clone(), p.time());
+        const LEN: usize = 8 * MIB;
+        let sent = p
+            .drive(async move {
+                a.send_stream_bounded(
+                    &time,
+                    SendDeadlines::stream(LEN as u64),
+                    StreamId::next(),
+                    None,
+                    payload(LEN).into(),
+                    None,
+                )
+                .await
+            })
+            .await;
+        let (seen, dropped) = (
+            loss.seen.load(std::sync::atomic::Ordering::Relaxed),
+            loss.dropped.load(std::sync::atomic::Ordering::Relaxed),
+        );
+        crate::transport::in_memory_socket::set_packet_delivery_callback(network, None);
+        assert!(
+            dropped * 100 >= seen * 3,
+            "the loss happened: {dropped} of {seen}"
+        );
+        assert!(matches!(sent, BoundedSend::Sent), "{sent:?}");
+    })
+}
+
 /// Sample `paths`' connections every 500 ms until `end` (virtual nanos);
 /// the largest `outstanding_after_acks` seen on either.
 async fn max_outstanding(paths: [Arc<QuicPath>; 2], time: VirtualTime, end: u64) -> u64 {
