@@ -34,7 +34,7 @@
 //! the same queue the QUIC endpoint waits in. If it had to wait it starts
 //! again from the cwnd check, keeping its connection payment and so its
 //! place on the connection, and the queue then admits it at once; right
-//! after the cwnd check it calls [`try_take`] and sends at once. The queue
+//! after the cwnd check it calls [`EgressCap::try_take_admitted`] and sends at once. The queue
 //! holds the stream's waker and its place, never bytes, so a waiting stream
 //! holds no node-wide capacity. An admitted sender holds one datagram from
 //! its admission to its take, at most [`ADMISSION_PASS`] (1 ms): every other
@@ -258,7 +258,7 @@ pub(crate) struct EgressStats {
     /// Streams failed at once because a connection reservation would have
     /// reached the deadline, by [`WaitCause`].
     pub streams_refused: [u64; WaitCause::COUNT],
-    /// Takes ([`EgressCap::try_take`]) and admission polls
+    /// Takes ([`EgressCap::try_take_handed`]) and admission polls
     /// ([`EgressCap::poll_admit`]) that found the bucket short.
     pub refusals: u64,
     /// Largest unpaced debt seen after a charge, in bytes.
@@ -872,7 +872,7 @@ impl EgressCap {
         empty_at.max(now.saturating_sub(self.burst_ns))
     }
 
-    /// The admission predicate shared by [`Self::try_take`] and
+    /// The admission predicate shared by [`Self::try_take_handed`] and
     /// [`Self::poll_admit`]: a take of `cost` at `now` is admitted when the
     /// bucket holds the whole amount. `Ok` is `empty_at_ns` after the take;
     /// `Err` is the deficit in nanoseconds at the rate.
@@ -953,7 +953,9 @@ impl EgressCap {
     /// The bucket must also keep one [`WAKE_DATAGRAM_BYTES`] for every
     /// admission whose take has not happened yet: this take uses none of
     /// them. See [`Self::try_take_handed`] and [`Self::try_take_admitted`]
-    /// for a sender that was admitted.
+    /// for a sender that was admitted. Production takes all go through one
+    /// of those two, so this is for tests.
+    #[cfg(test)]
     pub(crate) fn try_take(
         &self,
         bytes: usize,
@@ -962,7 +964,7 @@ impl EgressCap {
         self.try_take_handed(bytes, waited, None)
     }
 
-    /// [`Self::try_take`] using the admission numbered `admission`
+    /// A take using the admission numbered `admission`
     /// ([`AdmissionWaiter::admission`]), if it is still outstanding: the
     /// bucket keeps a datagram for every other admission, not for that one,
     /// which the take removes. The QUIC socket's take, handed the number by
@@ -979,7 +981,7 @@ impl EgressCap {
             .map(|(take, _)| take)
     }
 
-    /// [`Self::try_take`] for `waiter`, which takes by name
+    /// [`Self::try_take_handed`] for `waiter`, which takes by name
     /// ([`AdmissionWaiter::named`]): the take uses the waiter's own
     /// admission, if it has one that has not lapsed, and leaves the datagrams
     /// owed to every other admission. Without one (it lapsed, or the waiter
