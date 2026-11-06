@@ -208,6 +208,27 @@ mod tests {
             [1, 0, 0, 0, 0, 7, 0, 0, 0, 1],
             "the data bit is the low bit of the field"
         );
+        // RECYCLES is the next bit, with or without the data bit, in either frame.
+        for (control, last) in [
+            (
+                QuicControl::Ready {
+                    attempt: 7,
+                    caps: caps::RECYCLES,
+                },
+                2,
+            ),
+            (
+                QuicControl::ReadyAck {
+                    attempt: 7,
+                    caps: caps::DATA | caps::RECYCLES,
+                },
+                3,
+            ),
+        ] {
+            let bytes = control.encode();
+            assert_eq!(bytes[9], last, "{control:?}");
+            assert_eq!(QuicControl::decode(&bytes), Ok(control));
+        }
         const { assert!(CONTROL_LEN as u64 <= MAX_CONTROL_BYTES) };
     }
 
