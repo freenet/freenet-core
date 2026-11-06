@@ -527,6 +527,7 @@ impl QuicUpgrades {
 
     /// Start the upgrade of a new UDP session. The inbox is what its paths deliver
     /// to, for the connection's `recv`.
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::transport) fn open_session<S: Socket, T: TimeSource>(
         self: &Arc<Self>,
         remote: SocketAddr,
