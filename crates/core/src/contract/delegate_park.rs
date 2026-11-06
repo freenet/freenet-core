@@ -27,12 +27,12 @@
 //! # Why this needs per-delegate exclusion
 //!
 //! The context cache has one entry per delegate and hosted user, and each entry
-//! is last-write-wins. It is only sound while at most ONE `process()` per delegate is in flight,
-//! and — see that type's rustdoc, corrected in this same change — that
-//! property is supplied ENTIRELY by the serial loop, not by the runtime. There
-//! is no per-delegate lock in `prepare_delegate_call`, no per-delegate
-//! affinity in `RuntimePool::execute_delegate_request`, and no mutex anywhere
-//! in `wasm_runtime::delegate`.
+//! is last-write-wins. It is only sound while at most ONE round-trip per
+//! delegate is in flight, and nothing in the runtime supplies that: there is no
+//! per-delegate lock in `prepare_delegate_call` and no mutex in
+//! `wasm_runtime::delegate`. (The delegate executor's lock serializes single
+//! `process()` CALLS, not round-trips.) It is supplied by the loop, by this
+//! module's exclusion, and against the delegate lane by `DelegateGate`.
 //!
 //! So the moment a round-trip spans two loop iterations, that protection is
 //! gone: a second request for the same delegate would run `process()` in the
@@ -50,77 +50,64 @@
 //! # What parking does NOT relax: `process()` stays globally serial
 //!
 //! Parking releases the loop while a delegate is **suspended**, never while it
-//! is **running**. That distinction is load-bearing for code outside this
-//! module, so state it as an invariant:
+//! is **running**. The invariant this module relies on, stated in full:
 //!
 //! > **At most one delegate `process()` executes node-wide at any instant, and
-//! > it always executes on the `contract_handling` loop.**
+//! > every one runs on the node's one delegate executor, under its lock. A
+//! > delegate's round-trip is never interleaved with another run of the same
+//! > delegate.**
 //!
-//! What depends on it:
+//! Before the delegate lane (`super::delegate_lane`) the first sentence read
+//! "...and it always executes on the `contract_handling` loop", and was held
+//! by the shape of the call graph: every route to `process()` was awaited
+//! from that one task, with no lock anywhere. The lane is a second task that
+//! starts delegate runs (client `ApplicationMessages` requests), so the
+//! property is now held by a LOCK: every `process()`, lane or loop, goes
+//! through `PooledDelegateRunner`, one executor behind one mutex. That also
+//! keeps every delegate secret write on one `SecretsStore`, which its
+//! in-memory index and the hosted per-user quota counter assume
+//! (`secrets_store::quota`); the "third invariant resting on the serial loop
+//! by accident" this section used to predict turned out to be those two.
 //!
-//! * `DelegateContextCache` needs one `process()` **per delegate** — that is
-//!   the narrower guarantee, and it is the one [`DelegateParkCtx`]'s exclusion
-//!   supplies, because parking genuinely does let a delegate's round-trip span
-//!   loop iterations.
+//! What depends on the second sentence:
 //!
-//! Nothing documented needs the full NODE-wide property any more. The V2
-//! delegate write path's non-atomic read-then-write (#5490) did; it went with
-//! the delegate write host functions in #5637. The property is kept, and
-//! pinned in `contract.rs`, as a deliberate defensive margin.
+//! * `DelegateContextCache` needs one round-trip per **delegate** in flight.
+//!   On the loop, [`DelegateParkCtx`]'s exclusion supplies the parked half: a
+//!   request for a parked delegate is queued, not run. Between the loop and
+//!   the lane, `DelegateGate` supplies it: every loop entry into a delegate
+//!   claims it (waiting out a lane call in progress, and first running any
+//!   round-trip the lane handed over), every park entry holds a claim for as
+//!   long as it lives, and the lane runs only a delegate nobody has claimed.
 //!
-//! Why the global property still holds after #5544, by construction rather than
-//! by convention:
+//! On the loop the routes into `handle_delegate_with_contract_requests` are
+//! still all awaited from `contract_handling`:
 //!
-//! 1. `execute_delegate_request` and `execute_delegate_hop` (the
-//!    inter-delegate hop) are reached ONLY through
-//!    `handle_delegate_with_contract_requests`.
-//! 2. Every route into that function is awaited, directly or one hop removed,
-//!    from `contract_handling` — a single task per node:
+//! ```text
+//! contract_handling
+//!   ├─ run_lane_unit (lane hand-offs) ─► dispatch_delegate_request ─┐
+//!   ├─ handle_contract_event ─────────► dispatch_delegate_request ──┤
+//!   ├─ handle_delegate_notification ─────────────────────────────────┤
+//!   ├─ run_lifecycle ────────────────────────────────────────────────┤
+//!   └─ handle_delegate_resume ──┬────────────────────────────────────┤
+//!                               ├─► dispatch_delegate_request ───────┤
+//!                               └─► run_queued_notification ─────────┘
+//!                                                                    │
+//!                        handle_delegate_with_contract_requests ◄────┘
+//!                                    ├─► execute_delegate_request
+//!                                    └─► execute_delegate_hop
+//! ```
 //!
-//!    ```text
-//!    contract_handling
-//!      ├─ handle_contract_event ─────────► dispatch_delegate_request ─┐
-//!      ├─ handle_delegate_notification ────────────────────────────────┤
-//!      └─ handle_delegate_resume ──┬───────────────────────────────────┤
-//!                                  ├─► dispatch_delegate_request ──────┤
-//!                                  └─► run_queued_notification ────────┘
-//!                                                                      │
-//!                          handle_delegate_with_contract_requests ◄─────┘
-//!                                      ├─► execute_delegate_request
-//!                                      └─► execute_delegate_hop
-//!    ```
+//! The off-loop task this module spawns captures a `ParkGuard`, an
+//! `Arc<P: UserInputPrompter>`, an `Option<Arc<OpManager>>` and plain data, not
+//! the `ContractHandler` or an executor, so it cannot invoke a delegate. A
+//! resume re-enters the delegate from `handle_delegate_resume`, on the loop.
 //!
-//!    Stated as the PROPERTY — every route is awaited from the one loop — and
-//!    not as a count. An exact tally is a fact with an expiry date: this list
-//!    said "four call sites" until `run_queued_notification` was added for the
-//!    notification-coalescing fix, and was wrong the moment it was. The
-//!    property survives a new caller; the number does not. If you add a route,
-//!    it must be awaited from this loop or the invariant is gone.
-//! 3. The off-loop task this module spawns captures a `ParkGuard`, an
-//!    `Arc<P: UserInputPrompter>`, an `Option<Arc<OpManager>>` and plain data.
-//!    It does **not** capture the `ContractHandler` or an executor, so it
-//!    cannot invoke a delegate even by mistake. Its two jobs — waiting on a
-//!    human and driving a sub-op GET — need neither.
-//! 4. A resume re-enters the delegate from `handle_delegate_resume`, which runs
-//!    **on the loop**. The spawned task only ships a result back down a
-//!    channel; it never runs the continuation itself.
-//!
-//! So the window parking opens is a window in which a *different* delegate may
-//! **start**, not one in which two may **run**.
-//!
-//! **What would break it.** Spawning any work that holds the
-//! `ContractHandler`, or resuming a continuation anywhere other than the loop.
-//! If you are about to do either, first make sure two `process()` calls for
-//! one delegate still cannot overlap (the `DelegateContextCache` requirement
-//! above), and update this section and the pin in `contract.rs`. The
-//! nearest existing precedent is deliberately NOT a counter-example: #4531's
-//! hosted-secret export does run off-loop holding a pooled executor, but it
-//! enumerates and seals secrets and never invokes a delegate.
-//!
-//! **The pattern worth noticing.** This is the second documented-but-unenforced
-//! invariant found to be resting on the serial loop by accident rather than by
-//! design — the context cache was the first. Neither said so where it was
-//! relied upon. When touching this loop, assume there is a third.
+//! **What would break it.** Running a delegate on anything but the delegate
+//! runner; starting a loop run of a delegate without claiming it on the gate;
+//! resuming a continuation anywhere other than the loop. The pins are
+//! `every_delegate_run_is_reached_from_the_serial_loop` and
+//! `every_delegate_process_runs_on_the_one_delegate_executor` in
+//! `contract.rs`.
 //!
 //! # Ownership
 //!
