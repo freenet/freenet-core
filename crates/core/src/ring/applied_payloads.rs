@@ -16,50 +16,65 @@
 //! paths skip a payload whose hash is already present. There is no detector and
 //! no verdict about the contract: the same rule applies to every contract.
 //!
+//! ## Precondition
+//!
+//! The skip is sound for contracts whose merge forms a semilattice
+//! (commutative, associative, idempotent): merging a payload whose effect is
+//! already in the state cannot change it, so skipping it changes nothing.
+//!
+//! For a merge that is order-dependent the skip can delay a repair. If the
+//! repair arrives as bytes identical to a payload recorded earlier, it is
+//! skipped until the record for that contract is cleared by eviction, a
+//! restart, or 1024 newer payloads pushing it out. Anti-entropy does not
+//! necessarily bring different bytes: a heal is computed from the sender's
+//! state and this node's summary, so for a quiet contract every round can
+//! carry the same bytes.
+//!
+//! For a merge that cycles among a fixed set of states, ending the replay is
+//! the intended effect.
+//!
 //! ## Rules
 //!
-//! - **Check before the merge** on the network receive paths (the UPDATE
-//!   broadcast drivers, which also carry anti-entropy heals, and the
-//!   `ResyncResponse` arm in `node.rs`).
-//! - **Insert only after the merge committed**, including a merge that left
-//!   the state unchanged (the payload was absorbed). The executor does this in
+//! - **Check before the merge** on the UPDATE broadcast receive drivers, which
+//!   also carry anti-entropy heals. NOT on the `ResyncResponse` arm: this node
+//!   requested that response because the states differ, and a quiet sender
+//!   re-sends the same bytes every round.
+//! - **Record only after a merge committed a changed state**, plus an incoming
+//!   full state byte-identical to the stored one. The executor does this in
 //!   `bridged_upsert_contract_state_inner`, the only place that knows whether a
 //!   merge committed, was refused, or was suppressed for a contract flagged
-//!   broken. A refused or failed merge is never inserted, so it can be retried.
+//!   broken. A refused, failed, deferred or suppressed merge is never recorded,
+//!   so it can be retried. Neither is a merge that ran and left the state
+//!   unchanged: that may be a silent refusal (a contract that drops part of a
+//!   payload under a condition that later clears, such as an entry whose
+//!   prerequisite has not arrived, and returns its old state), and the same
+//!   bytes must be able to reach the merge again once the condition clears.
 //! - **Reset whenever the state is replaced by something other than a merge**:
 //!   an initial install on a node that held no copy, a corrupted-state
-//!   recovery that replaces the stored state, and eviction or reclamation of
-//!   the hosted contract. After such a replacement the node may need a payload
-//!   it saw before. A restart resets everything because the set is in memory.
+//!   recovery that replaces the stored state, a re-store from a fetched copy,
+//!   and eviction or reclamation of the hosted contract. Resets happen before
+//!   the write where there is one. A restart resets everything because the
+//!   set is in memory.
 //!
-//! Clearing is always safe (it only loses skips). Inserting a payload that was
-//! not merged is the one unsafe operation, which is why inserts happen only at
-//! the executor's commit points.
+//! Clearing is always safe (it only loses skips). Recording a payload whose
+//! effect is not in the state is the one unsafe operation, which is why
+//! records are made only at the executor's commit points.
 //!
 //! ## Bound
 //!
 //! Values are fixed-size `u64` hashes, so the per-contract count cap
-//! ([`APPLIED_PAYLOADS_PER_CONTRACT`]) is a real memory bound: 1024 hashes is
-//! 8 KiB per contract, under 1% of the ~1 MB resident cost of a hosted
-//! contract that the hosting budget already accounts for. The number of
-//! contracts with an entry is bounded by the hosted set: entries are removed
-//! at eviction, and the ring reaper drops entries for contracts that are
-//! neither hosted nor in use ([`AppliedPayloads::retain_contracts`]).
+//! ([`APPLIED_PAYLOADS_PER_CONTRACT`]) is a real memory bound: 1024 hashes in
+//! a `VecDeque` plus the same hashes in a `HashSet` for O(1) lookup, about
+//! 30 KiB per contract at the cap, a few percent of the ~1 MB resident cost of
+//! a hosted contract that the hosting budget already accounts for. The number
+//! of contracts with an entry is bounded by the hosted set: entries are
+//! removed at eviction, and the ring reaper drops entries for contracts that
+//! are neither hosted nor in use ([`AppliedPayloads::retain_contracts`]).
 //!
 //! The cap only has to hold the replayed set (a handful of payloads) across
 //! the unrelated traffic that arrives between replays. When it truncates, the
 //! oldest hash is forgotten and a later re-delivery of that payload is merged
-//! again, which a lawful contract absorbs and a non-converging one replays at
-//! most once more before it is recorded again.
-//!
-//! ## Known accepted edge
-//!
-//! Skipping assumes re-merging is a no-op. A contract with bounded retention
-//! that has already dropped part of a payload's effect (for example it keeps
-//! the newest N entries), and whose retention limit is later raised, could
-//! re-admit the dropped part if that payload were delivered again. The skip
-//! only delays this until anti-entropy carries a different payload (a full
-//! state from a peer that still holds the part). Not engineered around.
+//! again.
 //!
 //! ## Hash
 //!
@@ -73,7 +88,7 @@
 //!
 //! [`BroadcastDedupCache`]: crate::operations::update::BroadcastDedupCache
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::hash::{BuildHasher, Hasher};
 
 use dashmap::DashMap;
@@ -86,7 +101,11 @@ struct ContractEntry {
     /// Kept so the reaper can ask the hosting layer about the contract, which
     /// takes a full key.
     key: ContractKey,
+    /// Insertion order, oldest first, for truncation at the cap.
     hashes: VecDeque<u64>,
+    /// The same hashes, for O(1) lookup on every inbound payload. Kept in
+    /// step with `hashes` by `record_absorbed`; `reset` drops both together.
+    members: HashSet<u64>,
 }
 
 pub(crate) struct AppliedPayloads {
@@ -122,7 +141,7 @@ impl AppliedPayloads {
     pub(crate) fn contains(&self, key: &ContractKey, hash: u64) -> bool {
         self.entries
             .get(key.id())
-            .is_some_and(|entry| entry.hashes.contains(&hash))
+            .is_some_and(|entry| entry.members.contains(&hash))
     }
 
     /// Record that a payload was merged into `key`'s current state. Call ONLY
@@ -135,17 +154,30 @@ impl AppliedPayloads {
             .or_insert_with(|| ContractEntry {
                 key: *key,
                 hashes: VecDeque::new(),
+                members: HashSet::new(),
             });
-        if let Some(pos) = entry.hashes.iter().position(|h| *h == hash) {
+        let entry = &mut *entry;
+        if entry.members.contains(&hash) {
             // Already present (for example the same payload from a local
             // client and later from the network): move it to the newest end so
-            // a payload that keeps arriving is the last one truncated.
-            entry.hashes.remove(pos);
-        }
-        while entry.hashes.len() >= self.cap_per_contract {
-            entry.hashes.pop_front();
+            // a payload that keeps arriving is the last one truncated. The
+            // linear scan runs only on this rare re-record, never on lookup.
+            if let Some(pos) = entry.hashes.iter().position(|h| *h == hash) {
+                entry.hashes.remove(pos);
+            }
+        } else {
+            while entry.hashes.len() >= self.cap_per_contract {
+                match entry.hashes.pop_front() {
+                    Some(evicted) => {
+                        entry.members.remove(&evicted);
+                    }
+                    None => break,
+                }
+            }
+            entry.members.insert(hash);
         }
         entry.hashes.push_back(hash);
+        debug_assert_eq!(entry.hashes.len(), entry.members.len());
     }
 
     /// Forget everything recorded for `key`. Called when its state was
@@ -171,6 +203,15 @@ impl AppliedPayloads {
     #[cfg(test)]
     pub(crate) fn len_for(&self, key: &ContractKey) -> usize {
         self.entries.get(key.id()).map_or(0, |e| e.hashes.len())
+    }
+
+    /// Both views of one contract's record, for tests that check they agree.
+    #[cfg(test)]
+    pub(crate) fn views_for(&self, key: &ContractKey) -> (Vec<u64>, HashSet<u64>) {
+        self.entries.get(key.id()).map_or_else(
+            || (Vec::new(), HashSet::new()),
+            |e| (e.hashes.iter().copied().collect(), e.members.clone()),
+        )
     }
 
     #[cfg(test)]
@@ -284,6 +325,36 @@ mod tests {
             set.record_absorbed(&k, set.payload_hash(true, &i.to_le_bytes()));
         }
         assert_eq!(set.len_for(&k), APPLIED_PAYLOADS_PER_CONTRACT);
+    }
+
+    /// The lookup set and the ordered queue must hold the same hashes after
+    /// every kind of change: insert, re-record, eviction at the cap, reset.
+    #[test]
+    fn the_lookup_set_stays_in_step_with_the_queue() {
+        let set = AppliedPayloads::with_cap(3);
+        let k = key(1);
+        let check = |label: &str| {
+            let (queue, members) = set.views_for(&k);
+            assert_eq!(queue.len(), members.len(), "{label}: lengths differ");
+            assert!(
+                queue.iter().all(|h| members.contains(h)),
+                "{label}: queue holds a hash the lookup set lacks"
+            );
+        };
+        let h: Vec<u64> = (0u8..5).map(|i| set.payload_hash(true, &[i])).collect();
+        set.record_absorbed(&k, h[0]);
+        set.record_absorbed(&k, h[1]);
+        check("insert");
+        set.record_absorbed(&k, h[0]);
+        check("re-record");
+        set.record_absorbed(&k, h[2]);
+        set.record_absorbed(&k, h[3]);
+        set.record_absorbed(&k, h[4]);
+        check("evict");
+        assert!(!set.contains(&k, h[1]), "an evicted hash must not be found");
+        set.reset(&k);
+        check("reset");
+        assert!(!set.contains(&k, h[4]));
     }
 
     #[test]

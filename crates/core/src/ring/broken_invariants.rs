@@ -18,6 +18,16 @@
 //! (no sampling; a contract that canonicalizes once and then stabilizes is
 //! NOT flagged).
 //!
+//! Both detectors only see payloads that reach the executor. A payload this
+//! node has already merged into its current state is skipped before that by
+//! the applied-payload record ([`crate::ring::applied_payloads`]), so a
+//! re-push of a recorded payload no longer re-triggers the identical-input
+//! probe, and the "re-detected deterministically when the echo re-pushes"
+//! behaviour below holds only for payloads not yet recorded. For a contract
+//! that replays a fixed set of payloads, the skip itself is now the defence.
+//! Such contracts are flagged less often, so a lower broken-flag count does
+//! not mean fewer broken contracts.
+//!
 //! When a detector fires, it calls [`BrokenInvariantsTracker::record`] which:
 //!
 //! 1. Inserts the flag into an in-memory `DashMap` keyed on the contract

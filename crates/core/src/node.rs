@@ -5817,30 +5817,13 @@ async fn handle_interest_sync_message(
                 return None;
             }
 
-            // Skip a state this node has already merged into its current
-            // state lineage (`crate::ring::applied_payloads`): re-merging it is
-            // a no-op for a contract with an idempotent merge, and for one
-            // whose merge does not converge it would restart a replay. The
-            // outstanding request was consumed above either way.
-            if op_manager.ring.applied_payloads.contains(
-                &key,
-                op_manager
-                    .ring
-                    .applied_payloads
-                    .payload_hash(false, &state_bytes),
-            ) {
-                op_manager
-                    .payload_mix
-                    .record_already_applied(false, state_bytes.len());
-                tracing::debug!(
-                    from = %source,
-                    contract = %key,
-                    event = "resync_response_already_applied",
-                    "ResyncResponse skipped, state already merged into local state"
-                );
-            } else {
-                apply_resync_response_state(op_manager, key, source, &state_bytes).await;
-            }
+            // Deliberately NOT gated by the applied-payload record
+            // (`crate::ring::applied_payloads`). This node requested this
+            // response because its state differs from the sender's, and a quiet
+            // sender re-sends the same bytes every round: skipping them because
+            // an earlier merge of the same bytes was recorded could leave the
+            // divergence in place for good.
+            apply_resync_response_state(op_manager, key, source, &state_bytes).await;
 
             // Update the peer's summary in our interest tracker
             let peer_key = get_peer_key_from_addr(op_manager, source);
@@ -10178,37 +10161,48 @@ mod tests {
             );
         }
 
-        /// Pin (applied-payload record): the ResyncResponse arm checks
-        /// `ring.applied_payloads` after consuming the outstanding request and
-        /// only applies the state when it is NOT already merged. The apply
-        /// itself lives in `apply_resync_response_state`.
+        /// Pin (applied-payload record): the ResyncResponse arm must NOT
+        /// consult `ring.applied_payloads`. This node asked for the response
+        /// because the states differ, and a quiet sender re-sends the same
+        /// bytes every round, so skipping a recorded payload here could make a
+        /// divergence permanent. The arm must still consume the outstanding
+        /// request before applying.
         #[test]
-        fn resync_response_skips_an_already_applied_state() {
+        fn resync_response_does_not_consult_the_applied_payload_record() {
             let start = SOURCE
                 .find(concat!("event = \"resync_response_", "received\""))
                 .expect("ResyncResponse receive arm not found");
             let arm = &SOURCE[start..];
+            let arm_end = arm
+                .find(concat!("\n/// Apply a correlated ", "`ResyncResponse`"))
+                .expect("apply helper follows the arm");
+            let arm = &arm[..arm_end];
+            let helper_start = SOURCE
+                .find(concat!("async fn apply_resync_response_", "state("))
+                .expect("apply helper exists");
+            let helper = &SOURCE[helper_start..];
+            let helper = &helper[..helper.find("\n}\n").expect("helper end")];
+            for (name, region) in [("arm", arm), ("helper", helper)] {
+                assert!(
+                    !region.contains(concat!("applied_payloads", ".contains(")),
+                    "the ResyncResponse {name} must not skip on the applied-payload record"
+                );
+            }
             let consume = arm
                 .find(".consume(*key.id(), source)")
                 .expect("outstanding-request consume gate");
-            let check = arm
-                .find(concat!("if op_manager.ring.applied_payloads", ".contains("))
-                .expect("ResyncResponse arm must check the applied-payload record");
             let apply = arm
-                .find(concat!("apply_resync_response_", "state(op_manager"))
-                .expect("ResyncResponse arm must apply through the helper");
-            let else_pos = arm[check..]
-                .find("} else {")
-                .map(|o| check + o)
-                .expect("apply must be in the else branch of the check");
-            assert!(
-                consume < check && check < else_pos && else_pos < apply,
-                "order must be consume < applied check < else {{ apply }}"
-            );
-            assert!(
-                arm[check..else_pos].contains(concat!("record_already_", "applied(false")),
-                "the skip must be counted at the decision"
-            );
+                .lines()
+                .position(|l| {
+                    l.trim()
+                        == concat!(
+                            "apply_resync_response_",
+                            "state(op_manager, key, source, &state_bytes).await;"
+                        )
+                })
+                .expect("the arm must apply at statement position");
+            let apply_offset: usize = arm.lines().take(apply).map(|l| l.len() + 1).sum();
+            assert!(consume < apply_offset, "consume must precede the apply");
         }
 
         /// Pin (#4864 round-5 item 6): the CHANGED ResyncResponse apply arm MUST

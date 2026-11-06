@@ -966,8 +966,7 @@ impl PayloadMix {
     }
 
     /// Count one received payload skipped because it was already merged into
-    /// this node's current state. Called from the receiver terminal guard and
-    /// from the `ResyncResponse` arm, which has no guard.
+    /// this node's current state. Called from the receiver terminal guard.
     pub(crate) fn record_already_applied(&self, is_delta: bool, payload_bytes: usize) {
         crate::config::GlobalTestMetrics::record_already_applied_skip();
         let row = usize::from(!is_delta);

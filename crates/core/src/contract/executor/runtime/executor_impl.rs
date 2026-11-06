@@ -514,9 +514,11 @@ where
 
         // Applied-payload record (`crate::ring::applied_payloads`). The hash is
         // taken here, before `update` is consumed, and recorded ONLY at the
-        // commit points below: a merge that committed (changed or not) is
-        // absorbed; a refused, failed, deferred, init-queued or
-        // broken-suppressed merge is not, so it can be retried. A non-merge
+        // commit points below: a merge that committed a changed state, and an
+        // incoming state byte-identical to the stored one, are recorded. A
+        // merge that left the state unchanged is NOT (it may be a silent
+        // refusal), nor is a refused, failed, deferred, init-queued or
+        // broken-suppressed merge, so all of those can be retried. A non-merge
         // replacement (initial install, corrupted-state recovery) resets the
         // record instead. Local-mode paths without an `op_manager` skip all of
         // it.
@@ -705,6 +707,16 @@ where
                                     }));
                                 }
                             }
+                            // Initial install: the state is about to be
+                            // replaced without a merge, so nothing recorded
+                            // before (for example ahead of an eviction whose
+                            // reset was missed) describes it. Reset BEFORE the
+                            // store: clearing early only loses skips, while a
+                            // reset after the store would leave a window in
+                            // which a stale record describes the new state.
+                            if let Some(set) = &applied_payloads {
+                                set.reset(&key);
+                            }
                             self.state_store
                                 .store(key, state_to_store, params.clone())
                                 .await
@@ -717,13 +729,6 @@ where
                             // for the EvictContract re-host race this closes.
                             if let Some(op_manager) = &self.op_manager {
                                 op_manager.ring.commit_state_write(&key, written_bytes);
-                            }
-                            // Initial install: the stored state was replaced
-                            // without a merge, so nothing recorded before
-                            // (for example ahead of an eviction whose reset
-                            // was missed) describes this state.
-                            if let Some(set) = &applied_payloads {
-                                set.reset(&key);
                             }
 
                             let completion_now = now_nanos();
@@ -1337,10 +1342,13 @@ where
                 !recovery_performed,
                 "a corrupted-state recovery produced the stored state"
             );
-            // The merge ran and left the state unchanged: absorbed.
-            if !recovery_performed {
-                record_absorbed(&applied_payloads);
-            }
+            // Deliberately NOT recorded. A merge that leaves the state
+            // unchanged may be a silent refusal rather than an absorption: a
+            // contract can drop part of a payload under a condition that later
+            // clears (an entry whose prerequisite has not arrived yet) and
+            // return its old state instead of an error. Recording it would
+            // skip the same bytes when they are offered again after the
+            // condition cleared. See `crate::ring::applied_payloads`.
             return Ok(UpsertResult::NoChange);
         }
 
