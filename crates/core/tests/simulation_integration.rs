@@ -857,33 +857,93 @@ impl TraceFingerprint {
 /// in wall-clock time, so the step at which each node resumed depended on OS
 /// scheduling and one seed gave different results from run to run (#6123).
 /// `test_strict_determinism_exact_event_equality` runs 30 s of virtual time
-/// and never reaches the walk, which is how that got past CI. This run goes to
-/// 200 s, three walks per node, and compares every event's kind, transaction
+/// and never reaches the walk, which is how that got past CI.
+///
+/// The walk's timing only shows in the trace if operations are running when it
+/// resumes, so this keeps GETs and UPDATEs going every 2 s to about 240 s,
+/// across three walks per node, and compares every event's kind, transaction
 /// and peer, in order, across three runs.
 #[test_log::test]
 fn test_determinism_past_disk_maintenance() {
     const SEED: u64 = 0xD15C_6123;
+    const NODES: usize = 9;
+    const CONTRACTS: u8 = 4;
+    const ROUNDS: usize = 36;
 
     fn run_and_trace(name: &str) -> Vec<String> {
         setup_deterministic_state(SEED);
         let rt = create_runtime();
-        let (sim, logs_handle) = rt.block_on(async {
-            let sim = SimNetwork::new(name, 1, 9, 10, 3, 8, 3, SEED).await;
+        let (mut sim, logs_handle) = rt.block_on(async {
+            let sim = SimNetwork::new(name, 1, NODES, 10, 3, 8, 3, SEED).await;
             let logs_handle = sim.event_logs_handle();
             (sim, logs_handle)
         });
-        let result = sim.run_simulation::<rand::rngs::SmallRng, _, _>(
+
+        let contracts: Vec<_> = (0..CONTRACTS)
+            .map(|i| SimOperation::create_test_contract(0x60 + i))
+            .collect();
+        let mut operations = Vec::new();
+        for (i, contract) in contracts.iter().enumerate() {
+            operations.push(ScheduledOperation::new(
+                NodeLabel::gateway(name, 0),
+                SimOperation::Put {
+                    contract: contract.clone(),
+                    state: SimOperation::create_test_state(i as u8),
+                    subscribe: true,
+                },
+            ));
+        }
+        for node in 1..=NODES {
+            let contract = &contracts[node % contracts.len()];
+            operations.push(ScheduledOperation::new(
+                NodeLabel::node(name, node),
+                SimOperation::Subscribe {
+                    contract_id: *contract.key().id(),
+                },
+            ));
+        }
+        for round in 0..ROUNDS {
+            let contract = &contracts[round % contracts.len()];
+            operations.push(ScheduledOperation::new(
+                NodeLabel::node(name, 1 + round % NODES),
+                SimOperation::Update {
+                    key: contract.key(),
+                    data: SimOperation::create_test_state(16 + round as u8),
+                },
+            ));
+            operations.push(ScheduledOperation::new(
+                NodeLabel::node(name, 1 + (round * 5 + 3) % NODES),
+                SimOperation::Get {
+                    contract_id: *contract.key().id(),
+                    return_contract_code: false,
+                    subscribe: false,
+                },
+            ));
+            operations.push(ScheduledOperation::new(
+                NodeLabel::node(name, 1 + (round * 7 + 1) % NODES),
+                SimOperation::Get {
+                    contract_id: *contracts[(round + 1) % contracts.len()].key().id(),
+                    return_contract_code: false,
+                    subscribe: false,
+                },
+            ));
+        }
+        let op_interval = Duration::from_secs(2);
+        let op_seconds = operations.len() as u64 * op_interval.as_secs();
+        assert!(op_seconds > 220, "operations must outlast the third walk");
+        sim.with_controlled_op_interval(op_interval);
+
+        let result = sim.run_controlled_simulation(
             SEED,
-            6,
-            30,
-            Duration::from_secs(200),
-            Duration::from_millis(200),
-            || async {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                Ok(())
-            },
+            operations,
+            Duration::from_secs(op_seconds + 60),
+            Duration::from_secs(30),
         );
-        assert!(result.is_ok(), "{name}: simulation failed: {result:?}");
+        assert!(
+            result.turmoil_result.is_ok(),
+            "{name}: simulation failed: {:?}",
+            result.turmoil_result.err()
+        );
         rt.block_on(async {
             logs_handle
                 .lock()
