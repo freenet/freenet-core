@@ -3341,8 +3341,12 @@ where
         let gate = delegate_lane::DelegateGate::new();
         let (intake_tx, intake_rx) =
             tokio::sync::mpsc::channel(delegate_lane::LANE_INTAKE_CAPACITY);
-        let handle =
-            GlobalExecutor::spawn(delegate_lane::run_lane(runner, gate.clone(), intake_rx));
+        let lane_gate = gate.clone();
+        // A block, so the chokepoint pin's spawn scan can read the body: it
+        // runs delegates only through `runner`, never through the handler.
+        let handle = GlobalExecutor::spawn(async move {
+            delegate_lane::run_lane(runner, lane_gate, intake_rx).await;
+        });
         let mut abort = crate::util::AbortOnDrop::new();
         abort.push(handle.abort_handle());
         contract_handler.channel().install_delegate_lane(intake_tx);
@@ -5674,40 +5678,31 @@ async fn dispatch_delegate_request<CH, P>(
         user_context.is_some(),
     );
 
-    // INVARIANT this function is the chokepoint for, load-bearing for TWO
-    // separate changes and enforced by nothing but the shape of the call graph:
+    // INVARIANT (see `every_delegate_run_is_reached_from_the_serial_loop` and
+    // `every_delegate_process_runs_on_the_one_delegate_executor`):
     //
-    //   At most one delegate `process()` executes node-wide at any instant, and
-    //   it always executes on the `contract_handling` loop.
+    //   At most one delegate `process()` executes node-wide at any instant,
+    //   and every one runs on the node's ONE delegate executor, under its lock.
+    //   A delegate's round-trip is never interleaved with another run of the
+    //   same delegate.
+    //
+    // Since the delegate lane, the loop is no longer the only task that starts
+    // delegate runs: client `ApplicationMessages` requests normally arrive at
+    // the lane, not here. The first sentence is now held by the executor's
+    // lock (`PooledDelegateRunner`). The second, which `DelegateContextCache`'s
+    // last-write-wins keying needs, is held by `DelegateGate` between the
+    // lane and the loop (the caller of this function holds a claim on the
+    // delegate) and by `DelegateParkCtx` on the loop (below).
     //
     // #5544 parks a delegate mid-round-trip, which releases the loop while that
     // delegate is SUSPENDED (its WASM call has already returned) — never while
-    // it is RUNNING. So the window parking opens is one in which a DIFFERENT
-    // delegate may START, not one in which two may RUN:
+    // it is RUNNING. The park entry holds a gate claim, so the lane cannot run
+    // a parked delegate either, and a resume re-enters it ON the loop.
     //
-    //   * `execute_delegate_request` and `execute_delegate_hop` are reached
-    //     only via `handle_delegate_with_contract_requests`, whose every caller
-    //     (this function, `handle_delegate_notification` and
-    //     `handle_delegate_resume`) is awaited from `contract_handling`, one
-    //     task per node.
-    //   * The off-loop task #5544 spawns captures no `ContractHandler` and no
-    //     executor, so it cannot invoke a delegate. It waits on a human and
-    //     drives a sub-op GET; neither needs one.
-    //   * A resume re-enters the delegate from `handle_delegate_resume`, ON the
-    //     loop. The spawned task only ships a result back down a channel.
-    //
-    // Who depends on this: `DelegateContextCache`'s last-write-wins keying,
-    // which is safe only while one `process()` per delegate is in flight. The
-    // V2 delegate write path's non-atomic read-then-write (#5490) needed the
-    // stronger node-wide property as well; it went with the delegate write
-    // host functions in #5637.
-    //
-    // BREAKING IT: spawning any work that holds the `ContractHandler`, or
-    // resuming a continuation anywhere other than the loop. Do either and the
-    // context cache needs its own per-delegate exclusion first. (#4531's
-    // off-loop secret export is
-    // not a counter-example — it holds a pooled executor but never invokes a
-    // delegate.) See `delegate_park`'s module docs for the full argument.
+    // BREAKING IT: running a delegate on anything but the delegate runner,
+    // starting a loop run of a delegate without claiming it, or resuming a
+    // continuation anywhere other than the loop. See `delegate_lane`'s and
+    // `delegate_park`'s module docs for the full argument.
     let Some(park) = park else {
         // No loop behind us (direct unit-test calls): legacy inline behaviour,
         // stalls and all.
@@ -6942,14 +6937,13 @@ where
             // Live secret import (P3-live of #4592). Runs ON this serial contract
             // loop — DELIBERATELY, unlike the hosted EXPORT which is off-loop.
             //
-            // The import is the FIRST writer to the `SecretsStore` outside the
-            // serial loop's existing on-loop write path (delegate `store_secret`).
-            // The store's write path (fixed sibling `.tmp` + check-then-write
-            // collision handling) assumes node-wide write serialization; running
-            // the import off-loop on a separate pooled executor would let it race
-            // an on-loop delegate write (or another import) on the same secret
-            // file and corrupt it. Running it on the loop keeps every secret WRITE
-            // in one serialization domain, matching that assumption (Codex P1).
+            // The import WRITES to the `SecretsStore`, whose write path (fixed
+            // sibling `.tmp` + check-then-write collision handling) assumes
+            // node-wide write serialization. Delegate `store_secret` writes all
+            // run on the delegate executor under its lock, on the loop or the
+            // delegate lane; the pool runs the import under that same lock, so
+            // every secret WRITE stays in one serialization domain (Codex P1).
+            // A pooled contract executor would race them and corrupt the file.
             //
             // Blocking the loop for the import's duration is acceptable here
             // because — unlike the export — this endpoint is gated to LOOPBACK +
@@ -8155,29 +8149,35 @@ mod tests {
         assert_eq!(enclosing_fn(code, idx), "allowed");
     }
 
-    /// PIN: the NODE-WIDE "one delegate `process()` at a time" invariant, held
-    /// by the shape of the call graph and by nothing else.
+    /// PIN, half 1 of 2: the LOOP's delegate runs all go through one
+    /// chokepoint, and that chokepoint is entered only from the loop.
     ///
-    /// What rests on it today: `DelegateContextCache`'s last-write-wins keying,
-    /// which needs only one `process()` per DELEGATE (`DelegateParkCtx`'s
-    /// exclusion supplies the parked half — see
-    /// `a_parked_delegate_is_not_re_entered_until_it_resumes`).
+    /// The invariant, since the delegate lane (`delegate_lane`):
     ///
-    /// Nothing documented needs the full NODE-wide property any more. Two
-    /// things did: the V2 delegate write path's non-atomic read-then-write and
-    /// its broadcast marker (#5490), both removed with the delegate write host
-    /// functions in #5637. The pin is kept as a deliberate defensive margin:
-    /// the property costs nothing to hold, and code written while it held may
-    /// still assume it. Relax it on purpose, updating this doc, never as a side
-    /// effect of a performance change.
+    /// > At most one delegate `process()` executes node-wide at any instant,
+    /// > and every one executes on the node's ONE delegate executor, under its
+    /// > lock (`PooledDelegateRunner`). A delegate's round-trip is never
+    /// > interleaved with another run of the same delegate.
     ///
-    /// There is **no lock**: no
-    /// per-delegate mutex, no executor affinity, nothing in
-    /// `wasm_runtime::delegate` enforcing it. The property is supplied entirely
-    /// by every route to `process()` being awaited from the one
-    /// `contract_handling` task. That is exactly the shape a later performance
-    /// change breaks silently, and the breakage is state corruption rather than
-    /// a crash — so it gets a guard rather than a comment.
+    /// The first sentence is held by the LOCK, pinned by half 2,
+    /// `every_delegate_process_runs_on_the_one_delegate_executor`. It used to
+    /// be held by every route to `process()` being awaited from the one
+    /// `contract_handling` task, with no lock at all; the lane is a second task
+    /// that starts delegate runs, so the lock replaced that argument.
+    ///
+    /// The second sentence is what `DelegateContextCache`'s last-write-wins
+    /// keying needs. It is held between the lane and the loop by
+    /// `DelegateGate` (every loop entry claims the delegate, a park entry holds
+    /// a claim, the lane runs only a delegate with no claim), and on the loop
+    /// by this chokepoint plus `DelegateParkCtx`'s exclusion. The loop side is
+    /// what this test pins: a loop run that bypassed the chokepoint would also
+    /// bypass the claims taken by its callers.
+    ///
+    /// What else rests on the single executor: every delegate secret write
+    /// going through one `SecretsStore`, whose in-memory index and the hosted
+    /// per-user quota counter assume one serialized writer
+    /// (`secrets_store::quota`), and the live secret import, which takes the
+    /// same lock.
     ///
     /// Anchored on the PROPERTY, not on a helper's name: it asserts the
     /// chokepoint is still a chokepoint, and that the set of functions allowed
@@ -8318,6 +8318,107 @@ mod tests {
                      `DelegateContextCache` keying rests on. Body: {body}"
                 );
             }
+        }
+    }
+
+    /// PIN, half 2 of 2 (half 1 is
+    /// `every_delegate_run_is_reached_from_the_serial_loop`): every delegate
+    /// `process()` on a production node runs on the ONE delegate executor,
+    /// under its lock, whether the loop or the delegate lane started it.
+    ///
+    /// Scraped from `pool.rs` and `delegate_lane.rs` (comments stripped, test
+    /// modules cut off):
+    ///
+    ///  1. `pool.rs` calls `.delegate_request(` exactly once, inside the
+    ///     `DelegateRunner::run` impl of `PooledDelegateRunner`, which takes
+    ///     the lock (`with_executor`).
+    ///  2. The pool's `execute_delegate_request` and `execute_delegate_hop`
+    ///     go to `self.delegate_runner`, and neither pops a pooled executor.
+    ///  3. The live secret import runs under the same lock.
+    ///  4. The lane enters a delegate only through its runner (`.run(`, once,
+    ///     in `serve`) and names no contract handler or executor method that
+    ///     could run one another way.
+    ///
+    /// FALSIFY: in `execute_delegate_request`, go back to
+    /// `self.pop_executor().await` and `executor.delegate_request(..)`
+    /// (checks 1 and 2 fail); in `import_secrets`, pop a pooled executor
+    /// instead of `with_executor` (check 3); in `serve`, add a second
+    /// `runner.run(` call (check 4).
+    #[test]
+    fn every_delegate_process_runs_on_the_one_delegate_executor() {
+        fn cut_tests(src: &str, what: &str) -> String {
+            let cutoff = src
+                .find("\n#[cfg(test)]\nmod tests {")
+                .unwrap_or_else(|| panic!("{what} must have a `#[cfg(test)] mod tests` to cut at"));
+            strip_comments(&src[..cutoff])
+        }
+        let pool = cut_tests(include_str!("contract/executor/runtime/pool.rs"), "pool.rs");
+        let lane = cut_tests(
+            include_str!("contract/delegate_lane.rs"),
+            "delegate_lane.rs",
+        );
+
+        // 1.
+        assert_eq!(
+            pool.matches(".delegate_request(").count(),
+            1,
+            "pool.rs must run a delegate in exactly one place: PooledDelegateRunner::run"
+        );
+        let run = fn_region(&pool, "    fn run<'a>(");
+        assert!(
+            run.contains(".delegate_request(") && run.contains("self.with_executor("),
+            "PooledDelegateRunner::run must run the delegate inside `with_executor`, \
+             which holds the delegate executor's lock: {run}"
+        );
+        let with_executor = fn_region(&pool, "    async fn with_executor<R>(");
+        assert!(
+            with_executor.contains("self.executor.lock().await"),
+            "`with_executor` must take the delegate executor's lock"
+        );
+
+        // 2.
+        for signature in [
+            "    async fn execute_delegate_request(",
+            "    async fn execute_delegate_hop(",
+        ] {
+            let body = fn_region(&pool, signature);
+            assert!(
+                body.contains("self.delegate_runner") && !body.contains("pop_executor"),
+                "`{signature}` must run on the delegate executor, not a pooled one: {body}"
+            );
+        }
+
+        // 3.
+        let import = fn_region(&pool, "    async fn import_secrets(");
+        assert!(
+            import.contains("self.delegate_runner")
+                && import.contains(".with_executor(")
+                && !import.contains("pop_executor"),
+            "the secret import must write under the delegate executor's lock: {import}"
+        );
+
+        // 4.
+        assert_eq!(
+            lane.matches(".run(").count(),
+            1,
+            "the lane must enter a delegate in exactly one place"
+        );
+        let serve = fn_region(&lane, "async fn serve(");
+        assert!(
+            serve.contains(".run("),
+            "the lane's one delegate entry must be in `serve`"
+        );
+        for forbidden in [
+            "execute_delegate_request",
+            "execute_delegate_hop",
+            "ContractHandler +",
+            "ContractHandler>",
+            "delegate_request_as(",
+        ] {
+            assert!(
+                !lane.contains(forbidden),
+                "the lane must not reach a delegate except through its runner; found `{forbidden}`"
+            );
         }
     }
 
@@ -11320,6 +11421,354 @@ mod hol_4391_tests {
             connection_scope: crate::client_events::ConnectionScope::Local,
             user_context: None,
         }
+    }
+
+    // ---- Delegate lane (`delegate_lane`) ----------------------------------
+
+    fn app_out(payload: &[u8]) -> OutboundDelegateMsg {
+        OutboundDelegateMsg::ApplicationMessage(freenet_stdlib::prelude::ApplicationMessage::new(
+            payload.to_vec(),
+        ))
+    }
+
+    fn app_payloads(ev: &ContractHandlerEvent) -> Vec<Vec<u8>> {
+        match ev {
+            ContractHandlerEvent::DelegateResponse(Ok(values)) => values
+                .iter()
+                .filter_map(|m| match m {
+                    OutboundDelegateMsg::ApplicationMessage(msg) => Some(msg.payload.clone()),
+                    _ => None,
+                })
+                .collect(),
+            other => panic!("expected a successful DelegateResponse, got {other}"),
+        }
+    }
+
+    /// Releases a [`BlockingGate`] when dropped, so a test that panics while
+    /// the loop is held does not leave a runtime worker blocked forever (the
+    /// runtime's shutdown would wait for it, and the failure would read as a
+    /// hang with no message).
+    struct ReleaseOnDrop(Arc<crate::contract::executor::mock_wasm_runtime::BlockingGate>);
+
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+
+    /// Start the loop with a delegate lane, and hold it inside a contract
+    /// validate (standing in for a long contract WASM call) until the
+    /// returned gate is released. Returns once the loop is inside it.
+    async fn loop_held_in_contract_wasm(
+        extra: impl FnOnce(&mut MockWasmContractHandler),
+        lane: bool,
+    ) -> (
+        Arc<handler::ContractHandlerChannel<handler::SenderHalve>>,
+        Arc<crate::contract::executor::mock_wasm_runtime::BlockingGate>,
+        tokio::task::JoinHandle<Result<ContractHandlerEvent, ContractError>>,
+        tokio::task::JoinHandle<Result<(), ContractError>>,
+    ) {
+        let blocking = make_contract(b"lane_blocking_contract");
+        let gate = Arc::new(crate::contract::executor::mock_wasm_runtime::BlockingGate::default());
+        let (mut handler, send) = build_handler(vec![(
+            *blocking.key().id(),
+            ValidateOverride::Block(gate.clone()),
+        )])
+        .await;
+        if lane {
+            handler.runtime_mut().enable_delegate_lane();
+        }
+        extra(&mut handler);
+        let send = Arc::new(send);
+        let loop_handle = GlobalExecutor::spawn(contract_handling(
+            handler,
+            crate::contract::user_input::AutoApprovePrompter,
+        ));
+        let send_put = send.clone();
+        let put = GlobalExecutor::spawn(async move {
+            send_put
+                .send_to_handler(ContractHandlerEvent::PutQuery {
+                    key: blocking.key(),
+                    state: WrappedState::new(b"s".to_vec()),
+                    related_contracts: RelatedContracts::default(),
+                    contract: Some(blocking),
+                })
+                .await
+        });
+        let probe = gate.clone();
+        wait_until("the loop to enter the blocking contract validate", || {
+            probe.entered()
+        })
+        .await;
+        (send, gate, put, loop_handle)
+    }
+
+    /// THE REGRESSION TEST for the delegate lane: a client delegate request
+    /// is answered while the contract loop is stuck inside contract WASM.
+    ///
+    /// Production (2026-11-05): River chat-delegate signing requests that take
+    /// ~1.4 ms waited behind ~250 ms River room-contract calls on the one
+    /// `contract_handling` loop, p99 855 ms, max 6.2 s.
+    ///
+    /// The loop here is held inside a contract validate that BLOCKS ITS
+    /// THREAD until released, so nothing on the loop can answer the request
+    /// while the gate is closed. Decisive: with `lane = false` (every
+    /// delegate request on the loop, as on origin/main) the request times out
+    /// and this test fails; that is `the_same_request_waits_without_a_lane`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_delegate_request_is_answered_while_the_loop_is_inside_contract_wasm() {
+        let _guard = TEST_GUARD.lock().await;
+        let mut script = None;
+        let (send, gate, put, handle) = loop_held_in_contract_wasm(
+            |h| script = Some(h.runtime_mut().delegate_script.clone()),
+            true,
+        )
+        .await;
+        let _release = ReleaseOnDrop(gate.clone());
+        script.unwrap().lock().unwrap().push_back(ScriptedRun {
+            outbound: vec![app_out(b"signed")],
+            writes_context: None,
+        });
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            send.send_to_handler(delegate_event(&test_delegate_key())),
+        )
+        .await
+        .expect("the delegate request must not wait for the contract loop")
+        .expect("answered");
+        assert_eq!(app_payloads(&response), vec![b"signed".to_vec()]);
+        assert!(
+            !put.is_finished(),
+            "the contract op must still be blocked, or this measured nothing"
+        );
+
+        gate.release();
+        tokio::time::timeout(Duration::from_secs(5), put)
+            .await
+            .expect("the PUT completes once released")
+            .expect("join")
+            .expect("PUT answered");
+        handle.abort();
+    }
+
+    /// The counterfactual for the test above, kept as a test so the harness
+    /// stays decisive: with no lane, the same request is NOT answered while
+    /// the loop is held. If this ever passes trivially (the request answered
+    /// anyway), the harness stopped holding the loop and the test above
+    /// stopped measuring the lane.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_same_request_waits_without_a_lane() {
+        let _guard = TEST_GUARD.lock().await;
+        let mut script = None;
+        let (send, gate, put, handle) = loop_held_in_contract_wasm(
+            |h| script = Some(h.runtime_mut().delegate_script.clone()),
+            false,
+        )
+        .await;
+        let _release = ReleaseOnDrop(gate.clone());
+        script.unwrap().lock().unwrap().push_back(ScriptedRun {
+            outbound: vec![app_out(b"signed")],
+            writes_context: None,
+        });
+        let send_d = send.clone();
+        let request = GlobalExecutor::spawn(async move {
+            send_d
+                .send_to_handler(delegate_event(&test_delegate_key()))
+                .await
+        });
+        // A negative assertion: a sleep by necessity (see the park tests).
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            !request.is_finished(),
+            "without a lane the request must wait for the held loop"
+        );
+        gate.release();
+        let response = tokio::time::timeout(Duration::from_secs(5), request)
+            .await
+            .expect("answered once the loop is free")
+            .expect("join")
+            .expect("answered");
+        assert_eq!(app_payloads(&response), vec![b"signed".to_vec()]);
+        put.await.expect("join").expect("PUT answered");
+        handle.abort();
+    }
+
+    /// Requests from one client to one delegate are processed in the order
+    /// they were sent, and each gets its own answer.
+    ///
+    /// The three sends are polled in order by one `join!`, so they enter the
+    /// lane in that order; the script hands out answers in `process()` call
+    /// order, so a reordering shows as a mismatched payload.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_lane_keeps_one_clients_requests_in_order() {
+        let _guard = TEST_GUARD.lock().await;
+        let mut script = None;
+        let (send, gate, put, handle) = loop_held_in_contract_wasm(
+            |h| script = Some(h.runtime_mut().delegate_script.clone()),
+            true,
+        )
+        .await;
+        let _release = ReleaseOnDrop(gate.clone());
+        {
+            let script = script.unwrap();
+            let mut script = script.lock().unwrap();
+            for payload in [b"first", b"secnd", b"third"] {
+                script.push_back(ScriptedRun {
+                    outbound: vec![app_out(payload)],
+                    writes_context: None,
+                });
+            }
+        }
+        let key = test_delegate_key();
+        let (a, b, c) = tokio::time::timeout(Duration::from_secs(5), async {
+            futures::join!(
+                send.send_to_handler(delegate_event(&key)),
+                send.send_to_handler(delegate_event(&key)),
+                send.send_to_handler(delegate_event(&key)),
+            )
+        })
+        .await
+        .expect("all three answered while the loop is held");
+        assert_eq!(app_payloads(&a.unwrap()), vec![b"first".to_vec()]);
+        assert_eq!(app_payloads(&b.unwrap()), vec![b"secnd".to_vec()]);
+        assert_eq!(app_payloads(&c.unwrap()), vec![b"third".to_vec()]);
+        gate.release();
+        put.await.expect("join").expect("PUT answered");
+        handle.abort();
+    }
+
+    /// A round-trip the lane hands to the loop (its first `process()` asked
+    /// for something only the loop provides, here a user prompt) keeps the
+    /// delegate to itself until it finishes: a later request for the same
+    /// delegate must not run in between, or it would read and overwrite the
+    /// context the round-trip's next leg depends on.
+    ///
+    /// The context model in the mock is last-write-wins per delegate, like
+    /// the real cache, so the observations show any interleaving: B must
+    /// observe what A's LAST leg wrote.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_handed_off_round_trip_is_not_overtaken_by_the_next_request() {
+        let _guard = TEST_GUARD.lock().await;
+        let mut handles = None;
+        let (send, gate, put, handle) = loop_held_in_contract_wasm(
+            |h| {
+                let rt = h.runtime_mut();
+                handles = Some((
+                    rt.delegate_script.clone(),
+                    rt.delegate_calls.clone(),
+                    rt.delegate_observations.clone(),
+                ));
+            },
+            true,
+        )
+        .await;
+        let (script, calls, observations) = handles.unwrap();
+        {
+            let mut script = script.lock().unwrap();
+            // A, first leg (on the lane): prompts, so it needs the loop.
+            script.push_back(ScriptedRun {
+                outbound: prompt_outbound(),
+                writes_context: Some(b"a1".to_vec()),
+            });
+            // A, resumed leg (on the loop).
+            script.push_back(ScriptedRun {
+                outbound: vec![app_out(b"a-done")],
+                writes_context: Some(b"a2".to_vec()),
+            });
+            // B.
+            script.push_back(ScriptedRun {
+                outbound: vec![app_out(b"b-done")],
+                writes_context: Some(b"b".to_vec()),
+            });
+        }
+        let key = test_delegate_key();
+        let send_ab = send.clone();
+        let k = key.clone();
+        let both = GlobalExecutor::spawn(async move {
+            futures::join!(
+                send_ab.send_to_handler(delegate_event(&k)),
+                send_ab.send_to_handler(delegate_event(&k)),
+            )
+        });
+        let probe = calls.clone();
+        wait_until("A's first leg to run on the lane", || {
+            probe.lock().unwrap().len() == 1
+        })
+        .await;
+        // Negative assertion: sleep by necessity.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            1,
+            "B must wait for A's round-trip, which is waiting for the loop"
+        );
+
+        gate.release();
+        let (a, b) = tokio::time::timeout(Duration::from_secs(10), both)
+            .await
+            .expect("both answered once the loop is free")
+            .expect("join");
+        assert_eq!(app_payloads(&a.unwrap()), vec![b"a-done".to_vec()]);
+        assert_eq!(app_payloads(&b.unwrap()), vec![b"b-done".to_vec()]);
+        let seen: Vec<Option<Vec<u8>>> = observations
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|o| o.observed_context.clone())
+            .collect();
+        assert_eq!(
+            seen,
+            vec![None, Some(b"a1".to_vec()), Some(b"a2".to_vec())],
+            "A's resumed leg must read A's first leg, and B must run after A ended"
+        );
+        put.await.expect("join").expect("PUT answered");
+        handle.abort();
+    }
+
+    /// A client request carrying an inbound message only the node may deliver
+    /// is forwarded to the loop by the lane and refused there, as before the
+    /// lane: the delegate is never entered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_lane_forwards_a_forged_node_only_message_to_the_loops_refusal() {
+        let _guard = TEST_GUARD.lock().await;
+        let (mut handler, send) = build_handler(vec![]).await;
+        handler.runtime_mut().enable_delegate_lane();
+        let calls = handler.runtime_mut().delegate_calls.clone();
+        let handle = GlobalExecutor::spawn(contract_handling(
+            handler,
+            crate::contract::user_input::AutoApprovePrompter,
+        ));
+        let key = test_delegate_key();
+        let forged = ContractHandlerEvent::DelegateRequest {
+            req: DelegateRequest::ApplicationMessages {
+                key: key.clone(),
+                params: Parameters::from(Vec::new()),
+                inbound: vec![InboundDelegateMsg::UserResponse(
+                    freenet_stdlib::prelude::UserInputResponse {
+                        request_id: 1,
+                        response: ClientResponse::new(b"yes".to_vec()),
+                        context: DelegateContext::default(),
+                    },
+                )],
+            },
+            origin_contract: None,
+            connection_scope: crate::client_events::ConnectionScope::Local,
+            user_context: None,
+        };
+        let response = tokio::time::timeout(Duration::from_secs(5), send.send_to_handler(forged))
+            .await
+            .expect("answered")
+            .expect("answered");
+        assert!(
+            matches!(response, ContractHandlerEvent::DelegateResponse(Err(_))),
+            "a forged node-only message must be refused, got {response}"
+        );
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "the delegate must not run"
+        );
+        handle.abort();
     }
 
     /// THE #5544 REGRESSION TEST: unrelated contract work must keep draining

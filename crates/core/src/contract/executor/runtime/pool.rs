@@ -1650,19 +1650,16 @@ impl ContractExecutor for RuntimePool {
         result
     }
 
-    /// Run a live secret import ON the contract loop (#4592). DELIBERATELY
-    /// on-loop, NOT off-loop like the export: the import WRITES to the
+    /// Run a live secret import (#4592), awaited ON the contract loop, on the
+    /// DELEGATE executor under its lock. The import WRITES to the
     /// `SecretsStore`, whose write path (fixed sibling `.tmp` + check-then-write)
-    /// assumes node-wide write serialization. Checking out a pooled executor and
-    /// running the import here — awaited by the single-threaded contract loop —
-    /// keeps every secret write in one serialization domain (with delegate
-    /// `store_secret`), so an import can never race another writer on the same
-    /// secret file (Codex P1). The heavy work is acceptable on the loop because
-    /// the endpoint is loopback + dashboard-gated (operator's one-shot migration),
-    /// not the authenticated-remote DoS surface that justified off-loop export.
-    ///
-    /// `pop_executor().await` always succeeds promptly: an in-flight export holds
-    /// at most `pool_size-1` executors, so >=1 is always free for the loop.
+    /// assumes node-wide write serialization. Every delegate `set_secret` runs on
+    /// the same executor under the same lock (`PooledDelegateRunner`), so an
+    /// import can never race another writer on the same secret file (Codex P1),
+    /// including one from a delegate run on the delegate lane. The heavy work is
+    /// acceptable on the loop because the endpoint is loopback +
+    /// dashboard-gated (operator's one-shot migration), not the
+    /// authenticated-remote DoS surface that justified off-loop export.
     async fn import_secrets(
         &mut self,
         target_scope: crate::contract::handler::ImportTargetScope,
@@ -2255,16 +2252,17 @@ mod tests {
             let executor = slot.as_ref().expect("executor present");
             assert!(Arc::ptr_eq(
                 executor.summary_cache_handle(),
-                &pool.shared_summary_cache
+                &pool.delegate_runner.factory.shared_summary_cache
             ));
             assert!(Arc::ptr_eq(
                 executor.delta_cache_handle(),
-                &pool.shared_delta_cache
+                &pool.delegate_runner.factory.shared_delta_cache
             ));
             assert!(
                 executor
                     .delegate_notification_tx_handle()
-                    .is_some_and(|tx| tx.same_channel(&pool.delegate_notification_tx)),
+                    .is_some_and(|tx| tx
+                        .same_channel(&pool.delegate_runner.factory.delegate_notification_tx)),
                 "pool executor lacks the pool's delegate notification sender"
             );
         }
@@ -2274,24 +2272,26 @@ mod tests {
             .expect("replacement executor");
         assert!(Arc::ptr_eq(
             replacement.summary_cache_handle(),
-            &pool.shared_summary_cache
+            &pool.delegate_runner.factory.shared_summary_cache
         ));
         assert!(Arc::ptr_eq(
             replacement.delta_cache_handle(),
-            &pool.shared_delta_cache
+            &pool.delegate_runner.factory.shared_delta_cache
         ));
         assert!(
-            replacement
-                .delegate_notification_tx_handle()
-                .is_some_and(|tx| tx.same_channel(&pool.delegate_notification_tx)),
+            replacement.delegate_notification_tx_handle().is_some_and(
+                |tx| tx.same_channel(&pool.delegate_runner.factory.delegate_notification_tx)
+            ),
             "replacement executor lacks the pool's delegate notification sender"
         );
         drop(replacement);
 
         let summary_budget =
-            super::super::lock_fast_path_cache(&pool.shared_summary_cache).byte_budget();
+            super::super::lock_fast_path_cache(&pool.delegate_runner.factory.shared_summary_cache)
+                .byte_budget();
         let delta_budget =
-            super::super::lock_fast_path_cache(&pool.shared_delta_cache).byte_budget();
+            super::super::lock_fast_path_cache(&pool.delegate_runner.factory.shared_delta_cache)
+                .byte_budget();
         assert_eq!(
             summary_budget,
             super::super::pool_summary_cache_budget_bytes(POOL)
@@ -2307,11 +2307,13 @@ mod tests {
         assert_eq!(summary_budget, POOL * per_exec_summary);
         assert_eq!(delta_budget, POOL * per_exec_delta);
         assert_eq!(
-            super::super::lock_fast_path_cache(&pool.shared_summary_cache).max_entry_bytes(),
+            super::super::lock_fast_path_cache(&pool.delegate_runner.factory.shared_summary_cache)
+                .max_entry_bytes(),
             per_exec_summary
         );
         assert_eq!(
-            super::super::lock_fast_path_cache(&pool.shared_delta_cache).max_entry_bytes(),
+            super::super::lock_fast_path_cache(&pool.delegate_runner.factory.shared_delta_cache)
+                .max_entry_bytes(),
             per_exec_delta
         );
         let snap = op_manager

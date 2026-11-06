@@ -177,6 +177,11 @@ impl Inner {
 }
 
 /// Per-delegate exclusion between the lane and the loop. See the module docs.
+///
+/// One `std::sync::Mutex` over a `HashMap` rather than a `DashMap`: handing a
+/// unit off updates a delegate's entry and the cross-delegate unit queue
+/// together, and a claim reads both. The lock is never held across an
+/// `.await`, and each critical section is a few map operations.
 #[derive(Default)]
 pub(crate) struct DelegateGate {
     inner: std::sync::Mutex<Inner>,
@@ -206,10 +211,10 @@ impl DelegateGate {
         self: &Arc<Self>,
         key: &DelegateKey,
     ) -> (LoopClaim, Option<LaneUnit>) {
-        self.wait_for_lane(key).await;
+        let waiting = self.wait_for_lane(key).await;
         let mut inner = self.lock();
+        waiting.finish(&mut inner);
         let entry = inner.entries.entry(key.clone()).or_default();
-        entry.loop_waiting = entry.loop_waiting.saturating_sub(1);
         entry.loop_claims += 1;
         let unit = if entry.unit_pending {
             entry.unit_pending = false;
@@ -233,10 +238,10 @@ impl DelegateGate {
         self: &Arc<Self>,
         key: &DelegateKey,
     ) -> Option<LoopClaim> {
-        self.wait_for_lane(key).await;
+        let waiting = self.wait_for_lane(key).await;
         let mut inner = self.lock();
+        waiting.finish(&mut inner);
         let entry = inner.entries.entry(key.clone()).or_default();
-        entry.loop_waiting = entry.loop_waiting.saturating_sub(1);
         if entry.unit_pending {
             inner.remove_if_clear(key);
             drop(inner);
@@ -250,24 +255,32 @@ impl DelegateGate {
         })
     }
 
-    /// Wait until the lane is not running `key`, leaving `loop_waiting`
-    /// incremented for the caller to consume under the same lock it claims in.
-    async fn wait_for_lane(&self, key: &DelegateKey) {
-        let mut registered = false;
+    /// Wait until the lane is not running `key`. Returns with the caller
+    /// still registered as waiting (so the lane cannot start the delegate
+    /// again first); the caller ends that under the same lock it claims in.
+    /// Cancellation-safe: dropping the future, or the returned token, ends the
+    /// registration.
+    async fn wait_for_lane(self: &Arc<Self>, key: &DelegateKey) -> Waiting {
+        let waiting = {
+            let mut inner = self.lock();
+            inner.entries.entry(key.clone()).or_default().loop_waiting += 1;
+            Waiting {
+                gate: self.clone(),
+                key: key.clone(),
+                done: false,
+            }
+        };
         loop {
             let ended = self.lane_run_ended.notified();
             tokio::pin!(ended);
             ended.as_mut().enable();
+            if !self
+                .lock()
+                .entries
+                .get(key)
+                .is_some_and(|entry| entry.lane_running)
             {
-                let mut inner = self.lock();
-                let entry = inner.entries.entry(key.clone()).or_default();
-                if !registered {
-                    entry.loop_waiting += 1;
-                    registered = true;
-                }
-                if !entry.lane_running {
-                    return;
-                }
+                return waiting;
             }
             ended.await;
         }
@@ -358,6 +371,38 @@ impl DelegateGate {
     #[cfg(test)]
     pub(crate) fn is_tracking(&self, key: &DelegateKey) -> bool {
         self.lock().entries.contains_key(key)
+    }
+}
+
+/// A loop claim waiting for a lane run to end. See [`DelegateGate::wait_for_lane`].
+struct Waiting {
+    gate: Arc<DelegateGate>,
+    key: DelegateKey,
+    done: bool,
+}
+
+impl Waiting {
+    /// End the registration under a lock the caller already holds.
+    fn finish(mut self, inner: &mut Inner) {
+        self.done = true;
+        if let Some(entry) = inner.entries.get_mut(&self.key) {
+            entry.loop_waiting = entry.loop_waiting.saturating_sub(1);
+        }
+    }
+}
+
+impl Drop for Waiting {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        let mut inner = self.gate.lock();
+        if let Some(entry) = inner.entries.get_mut(&self.key) {
+            entry.loop_waiting = entry.loop_waiting.saturating_sub(1);
+        }
+        inner.remove_if_clear(&self.key);
+        drop(inner);
+        self.gate.lane_wake.notify_one();
     }
 }
 
@@ -720,6 +765,20 @@ mod tests {
         assert_eq!(u.key, k);
         drop(claim);
         assert!(gate.claim_unless_pending(&k).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_claim_does_not_keep_the_lane_off_the_delegate() {
+        let gate = DelegateGate::new();
+        let k = key(6);
+        let run = gate.try_begin_lane_run(&k).expect("free");
+        let waiting = tokio::time::timeout(Duration::from_millis(20), gate.claim(&k)).await;
+        assert!(waiting.is_err(), "the claim waits for the lane run");
+        run.finish();
+        assert!(
+            gate.try_begin_lane_run(&k).is_some(),
+            "a claim abandoned while waiting must not block the lane forever"
+        );
     }
 
     #[tokio::test]

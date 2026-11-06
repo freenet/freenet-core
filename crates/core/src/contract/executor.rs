@@ -1220,9 +1220,10 @@ pub(crate) trait ContractExecutor: Send + 'static {
     }
 
     /// Import delegate secrets from an encrypted `bundle` into the node's secrets
-    /// store at `target_scope`, LIVE (#4592). Runs ON the contract loop
-    /// (serialized with delegate `store_secret`) — DELIBERATELY not off-loop like
-    /// the export, because the import WRITES and the store write path assumes
+    /// store at `target_scope`, LIVE (#4592). Awaited on the contract loop and
+    /// serialized with delegate `store_secret` (the pool runs it under the
+    /// delegate executor's lock), DELIBERATELY not off-loop like the export,
+    /// because the import WRITES and the store write path assumes
     /// node-wide write serialization (see `RuntimePool::import_secrets` and the
     /// `ImportSecrets` arm in `contract.rs`).
     ///
