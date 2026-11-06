@@ -7708,6 +7708,13 @@ mod tests {
         data.streams_open_paths_sampled = 1009;
         data.streams_open_ge = vec![1010, 1011, 1012, 1013];
         data.streams_open_max = 1014;
+        data.sent_packets = 1015;
+        data.lost_packets = 1016;
+        data.lost_bytes = 1017;
+        data.congestion_events = 1018;
+        data.loss_rate = (1019..1027).collect();
+        data.ended_loss_rate = (1027..1035).collect();
+        data.ended_below_floor = 1035;
         let want: std::collections::BTreeMap<String, u64> =
             snapshot.quic_data.keys().into_iter().collect();
         assert!(want.values().all(|value| *value != 0));

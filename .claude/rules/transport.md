@@ -1292,8 +1292,32 @@ a test passes its own; tests read their own, never the global).
   path tried, data and control, and those that waited for stream credit);
   quic_streamed_sends and quic_stream_permit_waited; quic_bytes_sent and
   quic_bytes_received (quinn's UDP payload counts, reported by change at each 2 s
-  tick of the acknowledgement watch, so a path's last tick before it closes is
-  lost); quic_session_ended_with_data_path_<age> (sessions that ended while their
+  tick of the acknowledgement watch and once more when the path's task ends);
+  quic_sent_packets, quic_lost_packets, quic_lost_bytes and
+  quic_congestion_events (quinn's PathStats, every path including shadow ones, by
+  the same tick and once more when the path's task ends, so a path's last tick
+  before it closes is counted, sums of the period). A CONNECTION_CLOSE quinn sends
+  again after that report is in neither the byte nor the packet counts. A panic
+  in the watch, which the path survives, ends nothing: the report is the
+  receive supervisor's (recycle::PathReport); quic_loss_rate_<zero|lt_0_5pct|lt_1pct|
+  lt_2pct|lt_5pct|lt_10pct|lt_20pct|ge_20pct> (a gauge of live paths that have sent
+  at least 200 packets since they started, each in the one bucket of its own
+  lost/sent over its life, moved as it changes, out when the path ends; every
+  bucket uploaded every period, 0 included; no per-path values) and
+  quic_ended_loss_rate_<bucket> (paths that ended in the period, by their final
+  bucket, so paths that fail lossy still show) and quic_ended_paths_below_floor
+  (paths that ended in the period before 200 packets). Packets in flight at close
+  are dropped by quinn, not declared lost, so a final bucket can understate the
+  loss at the end. The rate is quinn's lost over
+  sent (quinn-proto 0.11.19), not a measurement of the link: sent counts every
+  packet quinn built, acknowledgement-only ones included; lost counts quinn's
+  loss declarations, and a packet declared lost and later acknowledged is not
+  taken back; lost PLPMTUD probes are left out of lost while sent ones are in
+  sent, and MTU discovery is off, so no path sends any. A shadow path's packets
+  are mostly keepalives and acknowledgements, so its rate may not hold for
+  data-sized packets. The sums and the buckets are updated and reset under one
+  lock;
+  quic_session_ended_with_data_path_<age> (sessions that ended while their
   path's route still carried data); quic_streams_sampled_paths,
   quic_streams_open_ge_<8|16|32|48> and quic_streams_peak_max (per path and period,
   the peak of inbound streams read at once, counted as inbound_concurrency counts
