@@ -895,7 +895,13 @@ impl QuicPath {
         let unpaid = match outcome {
             BoundedSend::Failed(SendFailure::NotOpened(NotOpened::Paced)) => bytes,
             BoundedSend::Failed(SendFailure::Paced { spent }) => bytes.saturating_sub(*spent),
-            _ => return 0,
+            BoundedSend::Sent
+            | BoundedSend::MaybeDelivered(_)
+            | BoundedSend::Failed(
+                SendFailure::NotOpened(NotOpened::TimedOut | NotOpened::ConnectionLost(_))
+                | SendFailure::TimedOut
+                | SendFailure::Error(_),
+            ) => return 0,
         };
         let Some(pacer) = self.pacer.get() else {
             return 0;
