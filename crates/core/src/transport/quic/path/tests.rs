@@ -3504,6 +3504,7 @@ async fn stuck_send(
     let connection = bounded::ConnectionProgress {
         acks: acks.clone(),
         cap_holds: cap.clone(),
+        quiet: Arc::default(),
     };
     let deadlines = SendDeadlines {
         open: Duration::from_secs(2),
@@ -3609,6 +3610,7 @@ fn a_send_waiting_for_its_source_ends_at_its_own_gap() {
             let connection = bounded::ConnectionProgress {
                 acks: acks.clone(),
                 cap_holds: Arc::new(super::super::socket::CapHolds::new(None)),
+                quiet: Arc::default(),
             };
             let deadlines = SendDeadlines {
                 open: Duration::from_secs(2),
@@ -4011,6 +4013,98 @@ fn a_write_held_by_a_silent_peer_fails_at_the_gap() {
         assert!(ticks > 0 && ticks < fragments, "{ticks} of {fragments}");
         assert_eq!(p.a.send_aborts(), 1);
         assert!(p.a.connection().inner().close_reason().is_none());
+    })
+}
+
+/// Egress cap holds count per connection (#6128 review): on a capped node
+/// whose cap a busy connection keeps saturated, a send on another connection
+/// to a peer that has gone dark still runs out of gap and its path goes
+/// suspect. With one node-wide record, the busy connection's holds read as
+/// the dark connection moving and the send ran to `total` (300 s).
+#[test]
+fn a_dark_path_beside_a_cap_held_one_times_out_and_goes_suspect() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let network = "quic-path-held-beside-dark";
+        let mut p = paths_capped(network, 76, 100_000).await;
+        let c_addr: SocketAddr = "10.203.76.3:5000".parse().unwrap();
+        let (c_end, c_keys) = p.pair.third(c_addr).await;
+        let permit = c_end
+            .allow_peer(p.pair.a_addr, p.pair.a_keys.public())
+            .expect("allow-set has room");
+        let a_end = p.pair.a.clone();
+        let c_key = c_keys.public().clone();
+        let time = p.time();
+        let (ac, _ca) = p
+            .drive(async move {
+                let (client, server) = tokio::join!(a_end.connect(c_addr, &c_key), async {
+                    c_end
+                        .accept()
+                        .await
+                        .expect("an incoming attempt")
+                        .establish()
+                        .await
+                });
+                (
+                    client.expect("client handshake"),
+                    server.expect("server accepted"),
+                )
+            })
+            .await;
+        drop(permit);
+        let (ac, _ac_in) = QuicPath::with_limits(ac, time.clone(), QuicPathLimits::DEFAULT);
+        let (_ca, _ca_in) = QuicPath::with_limits(_ca, time.clone(), QuicPathLimits::DEFAULT);
+        let ac = Arc::new(ac);
+        let ab = p.a.clone();
+        let ab_holds = ab.connection().cap_holds();
+        let ac_holds = ac.connection().cap_holds();
+        let busy = ab.clone();
+        let sender = ac.clone();
+        let (outcome, took, held_beside) = p
+            .drive(async move {
+                // Keep the cap saturated from the a-b connection.
+                let bulk = tokio::spawn(async move {
+                    let _ = busy
+                        .send_stream(StreamId::next(), None, payload(2 * MIB).into())
+                        .await;
+                });
+                time.sleep(Duration::from_secs(2)).await;
+                let before = ab_holds.read().holds;
+                let _silenced = DropFrom::new(network, &[c_addr]);
+                let start = time.now();
+                let body = over_window();
+                let outcome = sender
+                    .send_stream_bounded(
+                        &time,
+                        SendDeadlines::stream(body.len() as u64),
+                        StreamId::next(),
+                        None,
+                        body,
+                        None,
+                    )
+                    .await;
+                let took = time.now() - start;
+                let held_beside = ab_holds.read().holds - before;
+                bulk.abort();
+                (outcome, took, held_beside)
+            })
+            .await;
+        assert!(
+            held_beside > 0,
+            "the cap held the busy connection meanwhile"
+        );
+        assert!(
+            matches!(outcome, BoundedSend::Failed(SendFailure::TimedOut)),
+            "{outcome:?}"
+        );
+        let window = super::route::STALL_PROGRESS_WINDOW.as_secs();
+        assert!(
+            took.as_secs() <= 5 + 2 * window,
+            "took {took:?}; the dark connection's own holds were {:?}",
+            ac_holds.read()
+        );
+        ac.settle(SendKind::Stream, &outcome, false, p.time().now_nanos());
+        assert!(ac.is_suspect(), "the first timeout makes the path suspect");
     })
 }
 

@@ -50,10 +50,21 @@ use crate::transport::egress_cap::AdmissionWaiter;
 use crate::transport::metrics::TRANSPORT_METRICS;
 use crate::transport::{Socket, normalize_mapped_addr};
 
-/// QUIC transmits the egress cap is holding, node-wide: quinn has built
-/// them (their frames are counted in its stats) but they have not been
+/// One connection's QUIC transmits the egress cap is holding: quinn has
+/// built them (their frames are counted in its stats) but they have not been
 /// sent. The path's acknowledgement watch (`recycle`) runs no window while
-/// one is held, since a send it counted may not have left yet.
+/// one is held, since a send it counted may not have left yet, and the stall
+/// count and a send's gap (`path`) read a hold as the connection moving.
+///
+/// Per connection, never node-wide: on a node whose cap binds, some
+/// connection's transmit is held nearly all the time, and a node-wide count
+/// read as progress would keep every path, a dark one included, from ever
+/// timing out. quinn builds one poller per connection, inside
+/// `Endpoint::connect_with` or `Incoming::accept_with`; the endpoint makes
+/// the connection's record and hands it to that poller with
+/// [`with_poller_holds`]. A connection whose transmits are held still has
+/// holds of its own when it is dark (its probes wait for the cap too), but
+/// those are as sparse as its probes, which back off.
 ///
 /// A hold is a poller whose `poll_writable` the cap answered `Pending`.
 /// Waiting for the kernel's send buffer (`poll_send_ready` pending, no cap
@@ -123,6 +134,14 @@ impl CapHolds {
         }
     }
 
+    /// Empty records for the same cap: another connection's.
+    pub(crate) fn like(&self) -> Self {
+        Self {
+            validity: self.validity,
+            ..Self::default()
+        }
+    }
+
     /// The cap answered a poll `Pending`; `already_held` if the poller was
     /// already waiting.
     fn waiting(&self, already_held: bool) {
@@ -156,10 +175,30 @@ impl CapHolds {
     }
 }
 
+thread_local! {
+    /// The record [`with_poller_holds`] hands to the poller quinn creates in
+    /// its call.
+    static NEXT_POLLER_HOLDS: std::cell::RefCell<Option<Arc<CapHolds>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f`, which creates one quinn connection (`Endpoint::connect_with` or
+/// `Incoming::accept_with`), so that the poller quinn creates for it, on this
+/// thread inside the call (quinn 0.11.12 `ConnectionRef::new`), counts its
+/// holds in `holds`. A poller created any other way (a rebind, which needs
+/// migration, which is off) counts into a record nobody reads.
+pub(crate) fn with_poller_holds<R>(holds: &Arc<CapHolds>, f: impl FnOnce() -> R) -> R {
+    NEXT_POLLER_HOLDS.with(|next| *next.borrow_mut() = Some(holds.clone()));
+    let out = f();
+    NEXT_POLLER_HOLDS.with(|next| next.borrow_mut().take());
+    out
+}
+
 /// The QUIC endpoint's socket. See the module docs.
 pub(crate) struct QuicSocket<S> {
     socket: Arc<DemuxSocket<S>>,
-    /// Transmits the egress cap holds, shared with every connection's path.
+    /// Empty hold records for this socket's cap, copied for each connection
+    /// ([`CapHolds::like`]); never counted into.
     cap_holds: Arc<CapHolds>,
     /// Only quinn's endpoint driver receives, one call at a time; the lock
     /// is never contended.
@@ -296,7 +335,8 @@ impl<S> fmt::Debug for QuicSocket<S> {
 }
 
 impl<S: Socket> QuicSocket<S> {
-    /// The transmits the egress cap holds, for the paths' watches.
+    /// Empty hold records for this socket's cap, from which each connection's
+    /// own is made ([`CapHolds::like`], [`with_poller_holds`]).
     pub(crate) fn cap_holds(&self) -> Arc<CapHolds> {
         self.cap_holds.clone()
     }
@@ -399,7 +439,11 @@ impl<S: Socket> QuicSocket<S> {
 
 impl<S: Socket> AsyncUdpSocket for QuicSocket<S> {
     fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
+        let holds = NEXT_POLLER_HOLDS
+            .with(|next| next.borrow_mut().take())
+            .unwrap_or_else(|| Arc::new(self.cap_holds.like()));
         Box::pin(QuicPoller {
+            holds,
             socket: self,
             waiter: std::sync::Mutex::new(AdmissionWaiter::default()),
             held: false,
@@ -608,6 +652,8 @@ impl<S: Socket> QuicSocket<S> {
 /// can take a send and the egress cap holds a full datagram.
 struct QuicPoller<S> {
     socket: Arc<QuicSocket<S>>,
+    /// Its connection's hold records ([`with_poller_holds`]).
+    holds: Arc<CapHolds>,
     /// Behind a mutex only so the poller is `Sync`, which quinn requires;
     /// `poll_writable` has `&mut self` and uses `get_mut`, so it is never
     /// locked.
@@ -620,9 +666,9 @@ impl<S> QuicPoller<S> {
     /// Record the cap's answer to this poll ([`CapHolds`]).
     fn record_admission(&mut self, waiting: bool) {
         if waiting {
-            self.socket.cap_holds.waiting(self.held);
+            self.holds.waiting(self.held);
         } else if self.held {
-            self.socket.cap_holds.release();
+            self.holds.release();
         }
         self.held = waiting;
     }
@@ -631,7 +677,7 @@ impl<S> QuicPoller<S> {
 impl<S> Drop for QuicPoller<S> {
     fn drop(&mut self) {
         if self.held {
-            self.socket.cap_holds.release();
+            self.holds.release();
         }
     }
 }

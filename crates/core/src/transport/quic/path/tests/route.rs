@@ -212,7 +212,7 @@ fn a_cap_hold_counts_as_progress() {
         let now = QUIET + second * SECOND;
         assert!(
             !count
-                .take(&timeouts()[2], false, Some(0), reading(1, true), now)
+                .take(&timeouts()[2], false, Some(0), reading(1, true), None, now)
                 .close
         );
     }
@@ -221,13 +221,27 @@ fn a_cap_hold_counts_as_progress() {
     for _ in 1..STALLED_SENDS_LIMIT {
         assert!(
             !count
-                .take(&timeouts()[2], false, Some(0), reading(1, false), free)
+                .take(
+                    &timeouts()[2],
+                    false,
+                    Some(0),
+                    reading(1, false),
+                    None,
+                    free
+                )
                 .close
         );
     }
     assert!(
         count
-            .take(&timeouts()[2], false, Some(0), reading(1, false), free)
+            .take(
+                &timeouts()[2],
+                false,
+                Some(0),
+                reading(1, false),
+                None,
+                free
+            )
             .close
     );
 
@@ -235,20 +249,34 @@ fn a_cap_hold_counts_as_progress() {
     let mut count = StallCount::new(Some(0), 0);
     assert!(
         !count
-            .take(&timeouts()[2], false, Some(0), reading(7, true), 0)
+            .take(&timeouts()[2], false, Some(0), reading(7, true), None, 0)
             .close
     );
     let stale = 61 * SECOND + QUIET;
     for _ in 1..STALLED_SENDS_LIMIT {
         assert!(
             !count
-                .take(&timeouts()[2], false, Some(0), reading(7, true), stale)
+                .take(
+                    &timeouts()[2],
+                    false,
+                    Some(0),
+                    reading(7, true),
+                    None,
+                    stale
+                )
                 .close
         );
     }
     assert!(
         count
-            .take(&timeouts()[2], false, Some(0), reading(7, true), stale)
+            .take(
+                &timeouts()[2],
+                false,
+                Some(0),
+                reading(7, true),
+                None,
+                stale
+            )
             .close
     );
 }
