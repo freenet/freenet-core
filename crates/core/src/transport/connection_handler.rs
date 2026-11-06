@@ -249,8 +249,9 @@ pub(super) async fn bind_udp_listener<S: Socket>(
         .as_ref()
         .and_then(|_| get_socket_virtual_time(&bind_addr));
     // The node-wide egress cap exists only when `total-bandwidth-limit` is
-    // set and not 0 (`global_bandwidth` is set, and `from_total_limit`
-    // builds no cap for 0), so a node without it pays nothing. The cap runs
+    // set and not 0 (`global_bandwidth` is set; the node builds no pool for a
+    // total of 0, `NetworkApiConfig::global_bandwidth_manager`), so a node
+    // without it pays nothing. The cap runs
     // on `RealTime`, as the listener built below does, in production and in
     // simulation alike; waiters sleep on their own connection's time
     // source. A cap on the network's `VirtualTime` would compute deficits on

@@ -219,8 +219,9 @@ What this guarantees:
   that drives many streams through this node gets a proportional share of it.
 
 Without `total-bandwidth-limit` no bucket exists and nothing changes. A
-`total-bandwidth-limit` of 0 is ignored with a warning: no cap, no per-connection share
-for UDP or QUIC, and `bandwidth-limit` applies if set.
+`total-bandwidth-limit` of 0 is ignored with a warning: no cap and no per-connection
+share for UDP or QUIC (UDP no longer paces at the 1 MB/s per-connection minimum), and
+`bandwidth-limit` applies to both transports if set.
 
 At startup the node logs the cap, warns if `min-bandwidth-per-connection` was above
 the total (it is clamped), and warns if the total is below 4,800 bytes/s (four

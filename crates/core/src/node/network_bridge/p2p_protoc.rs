@@ -1316,13 +1316,10 @@ impl P2pConnManager {
             quic.breaker,
         );
 
-        if config.config.network_api.total_bandwidth_limit == Some(0) {
-            tracing::warn!(
-                "total-bandwidth-limit is 0, which is no limit: no node-wide egress cap \
-                 and no per-connection share is applied, and bandwidth-limit applies \
-                 if set"
-            );
-        }
+        config
+            .config
+            .network_api
+            .warn_if_total_bandwidth_limit_is_zero();
         Ok(P2pConnManager {
             gateways,
             bridge,

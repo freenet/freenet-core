@@ -573,3 +573,32 @@ fn a_paced_send_to_a_dark_peer_times_out_and_the_path_goes_suspect() {
         );
     });
 }
+
+/// A pacer wait is not progress (`StallCount`, the `pacer` module): neither
+/// function that waits on the pacer marks the send as having moved. Behaviour
+/// cannot show this, since every wait is followed by the write it paid for,
+/// which is itself a step, so it is pinned on the source. Each region is the
+/// function's own body (a free function ends at the first `}` in column 0, a
+/// method at the first in column 4) and must hold the pacer's sleep, so a
+/// moved signature fails instead of widening the region.
+#[test]
+fn a_pacer_wait_never_marks_a_step() {
+    let source = include_str!("../../path.rs");
+    for (signature, end) in [
+        ("\nasync fn pace(", "\n}\n"),
+        ("\n    async fn pace(&mut self", "\n    }\n"),
+    ] {
+        assert_eq!(source.matches(signature).count(), 1, "{signature:?}");
+        let start = source.find(signature).expect("counted above");
+        let body = &source[start..];
+        let body = &body[..body.find(end).expect("the function's end")];
+        assert!(
+            body.contains("pacer.sleep(wait)"),
+            "{signature:?} waits on the pacer"
+        );
+        assert!(
+            !body.contains("step("),
+            "{signature:?} must not count a pacer wait as progress"
+        );
+    }
+}

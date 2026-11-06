@@ -2368,7 +2368,7 @@ pub struct NetworkArgs {
     /// controller's rate: it can lower a connection's rate, never raise it, and
     /// N connections may send up to N times this. Short messages, ACKs and
     /// retransmits are not paced. To limit what the node sends as a whole, use
-    /// --total-bandwidth-limit, which overrides this.
+    /// --total-bandwidth-limit, which overrides this unless it is 0.
     /// 0 means unset; a value below 64 KiB/s (65,536 bytes/second) is raised to
     /// it with a warning. Low limits slow large transfers in proportion, and
     /// very large ones (multi-MB contract states) can miss their deadlines.
@@ -2382,7 +2382,9 @@ pub struct NetworkArgs {
     /// across all connections: data, handshakes, ACKs, keepalives and
     /// retransmissions. Each connection is also paced at
     /// total / active_connections (at least --min-bandwidth-per-connection).
-    /// Overrides the per-connection `--bandwidth-limit`.
+    /// Overrides the per-connection `--bandwidth-limit`. 0 means unset: no cap
+    /// and no per-connection share on UDP or QUIC, and `--bandwidth-limit`, if
+    /// set, then applies to both transports.
     #[arg(long)]
     #[serde(
         rename = "total-bandwidth-limit",
@@ -2914,10 +2916,28 @@ impl NetworkApiConfig {
         self.total_bandwidth_limit.filter(|total| *total > 0)
     }
 
+    /// Warn that a `total-bandwidth-limit` of 0 is no limit
+    /// ([`Self::effective_total_bandwidth_limit`]), so an operator who set it
+    /// expecting a cap sees why none applies. Call it once per node.
+    pub(crate) fn warn_if_total_bandwidth_limit_is_zero(&self) {
+        if self.total_bandwidth_limit == Some(0) {
+            tracing::warn!(
+                "total-bandwidth-limit is 0, which is no limit: no node-wide egress cap \
+                 and no per-connection share is applied, and bandwidth-limit applies \
+                 if set"
+            );
+        }
+    }
+
     /// The node's global bandwidth pool, when `total-bandwidth-limit` is set
     /// ([`Self::effective_total_bandwidth_limit`]). Its per-connection share
     /// paces UDP (`peer_connection::paced_rate`) and QUIC
     /// (`quic::config::QuicRateLimit`) alike.
+    ///
+    /// The node's only builder of the pool, and so the only thing keeping a
+    /// total of 0 from pacing: `QuicRateLimit::rate` and UDP's `paced_rate`
+    /// take any pool they are given, so a second builder that skipped this
+    /// would bring back pacing at the 1 MB/s minimum.
     pub(crate) fn global_bandwidth_manager(
         &self,
     ) -> Option<std::sync::Arc<crate::transport::global_bandwidth::GlobalBandwidthManager>> {
@@ -9924,6 +9944,45 @@ shutdown-drain-secs = 42
             assert_eq!(udp, expected.unwrap_or(CC), "UDP: {case}");
             assert_eq!(quic, expected.map(|rate| rate as u64), "QUIC: {case}");
         }
+    }
+
+    /// A total of 0 warns that it is no limit, and nothing else does: an unset
+    /// total and a non-zero one say nothing. The node calls the warning where
+    /// it builds its transport (pinned below).
+    #[tokio::test]
+    async fn a_total_of_zero_warns_that_it_is_no_limit() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut api = clap_bare_args(temp_dir.path())
+            .build()
+            .await
+            .unwrap()
+            .network_api;
+        for (total, warns) in [(Some(0), true), (None, false), (Some(800_000), false)] {
+            api.total_bandwidth_limit = total;
+            let (logs, guard) = crate::util::test_log_capture::install();
+            api.warn_if_total_bandwidth_limit_is_zero();
+            drop(guard);
+            let captured = logs.lock().unwrap().clone();
+            let warned = captured
+                .iter()
+                .any(|l| l.starts_with("WARN") && l.contains("total-bandwidth-limit is 0"));
+            assert_eq!(warned, warns, "total {total:?}; captured: {captured:?}");
+        }
+        let source = include_str!("node/network_bridge/p2p_protoc.rs");
+        let at = source
+            .find("Ok(P2pConnManager {")
+            .expect("P2pConnManager::build constructs the manager");
+        let start = source
+            .find("    pub async fn build(")
+            .expect("P2pConnManager::build");
+        assert!(start < at, "the literal is inside build");
+        let build = &source[start..at];
+        // Whitespace stripped, so a rustfmt reflow cannot disarm it.
+        let compact: String = build.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            compact.contains("config.config.network_api.warn_if_total_bandwidth_limit_is_zero();"),
+            "P2pConnManager::build must call the warning"
+        );
     }
 
     /// The node builds its global pool from `global_bandwidth_manager`, which
