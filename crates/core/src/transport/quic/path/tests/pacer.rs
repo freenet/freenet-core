@@ -379,10 +379,14 @@ fn a_limit_pacer_burst_follows_the_share() {
     .expect("a total limit paces");
     assert_eq!(shared.capacity(), 100_000);
     manager.register_connection();
-    let _ = shared.reserve_within(0, Duration::MAX);
+    shared
+        .reserve_within(0, Duration::MAX)
+        .expect("no limit to refuse at");
     assert_eq!(shared.capacity(), 50_000, "a tenth of the share of two");
     manager.unregister_connection();
-    let _ = shared.reserve_within(0, Duration::MAX);
+    shared
+        .reserve_within(0, Duration::MAX)
+        .expect("no limit to refuse at");
     assert_eq!(shared.capacity(), 100_000, "and back");
 }
 
