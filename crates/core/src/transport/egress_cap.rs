@@ -407,6 +407,13 @@ struct Admitted {
     id: Option<u64>,
 }
 
+/// A named waiter's two slots ([`AdmissionWaiter::named`]): the number of the
+/// admission it holds, and the place it was admitted from until it sends.
+struct NamedSlots<'a> {
+    admission: &'a mut Option<u64>,
+    held_place: &'a mut Option<u64>,
+}
+
 /// Who is taking, so the take knows which admission it uses.
 #[derive(Clone, Copy)]
 enum Taker {
@@ -493,6 +500,10 @@ impl AdmissionQueue {
         queue.sync(&self.waiting);
         // The same count as `Self::ahead`, so `poll_admit`'s check after
         // registering agrees with its check before.
+        if queue.admitted.len() >= MAX_ADMISSION_WAKERS {
+            // `try_admit` admits nobody until one lapses or is taken.
+            return MAX_ADMISSION_WAKERS + 1;
+        }
         queue
             .ahead_of(t)
             .saturating_add(queue.admitted.len())
@@ -529,7 +540,7 @@ impl AdmissionQueue {
     fn try_admit(
         &self,
         ticket: &mut Option<u64>,
-        mut named: Option<&mut Option<u64>>,
+        mut named: Option<NamedSlots<'_>>,
         clock: impl Fn() -> i64,
         fits: impl FnOnce(usize, i64) -> bool,
     ) -> Result<(), (usize, i64)> {
@@ -537,9 +548,20 @@ impl AdmissionQueue {
             let mut queue = self.inner.lock();
             let now = clock();
             queue.lapse(now);
-            if let Some(held) = named.as_deref_mut().and_then(Option::take) {
-                if let Some(i) = queue.admission_of(Taker::Named(Some(held))) {
-                    queue.admitted.remove(i);
+            if let Some(slots) = named.as_mut() {
+                if let Some(held) = slots.admission.take() {
+                    if let Some(i) = queue.admission_of(Taker::Named(Some(held))) {
+                        queue.admitted.remove(i);
+                    }
+                }
+                // Admitted before and not sent since (its take failed, or its
+                // window held it past the pass): it queues at the place it
+                // was admitted from, not at the back.
+                if ticket.is_none() {
+                    if let Some(place) = *slots.held_place {
+                        queue.places.insert(place);
+                        *ticket = Some(place);
+                    }
                 }
             }
             let queued = match *ticket {
@@ -549,21 +571,30 @@ impl AdmissionQueue {
             let ahead = queued
                 .saturating_add(queue.admitted.len())
                 .min(MAX_ADMISSION_WAKERS + 1);
+            // At most `MAX_ADMISSION_WAKERS` admissions are live at once, all
+            // within their pass after `lapse`: a waiter past that waits, as one
+            // too far back does, and none is dropped while its owner may
+            // still take.
+            if queue.admitted.len() >= MAX_ADMISSION_WAKERS {
+                queue.sync(&self.waiting);
+                return Err((MAX_ADMISSION_WAKERS + 1, now));
+            }
             if !fits(ahead, now) {
                 queue.sync(&self.waiting);
                 return Err((ahead, now));
             }
-            if queue.admitted.len() >= MAX_ADMISSION_WAKERS {
-                queue.admitted.pop_front();
-            }
-            let id = named.map(|slot| {
+            let id = named.as_mut().map(|slots| {
                 let id = queue.next_ticket;
                 queue.next_ticket += 1;
-                *slot = Some(id);
+                *slots.admission = Some(id);
                 id
             });
             queue.admitted.push_back(Admitted { at: now, id });
-            let next = ticket.take().and_then(|t| {
+            let given_up = ticket.take();
+            if let (Some(slots), Some(place)) = (named.as_mut(), given_up) {
+                *slots.held_place = Some(place);
+            }
+            let next = given_up.and_then(|t| {
                 queue.wakers.remove(&t);
                 queue.places.remove(&t);
                 queue.wakers.pop_first().map(|(_, waker)| waker)
@@ -653,6 +684,11 @@ pub(crate) struct AdmissionWaiter {
     /// The number of this waiter's admission while its take has not
     /// happened yet, for a waiter that takes by name.
     admission: Option<u64>,
+    /// The place (ticket) a named waiter gave up when it was admitted, until
+    /// a take of its succeeds. If it polls again first (its take failed, or
+    /// its congestion window held it past [`ADMISSION_PASS`]) it queues there
+    /// again, ahead of everyone who queued after it, instead of at the back.
+    held_place: Option<u64>,
     timer: Option<(u64, SleepFuture)>,
     /// The queue of the cap this waiter last registered with, so dropping
     /// the waiter removes its entry: a closed connection's entry must not
@@ -909,6 +945,7 @@ impl EgressCap {
         if used {
             waiter.admission = None;
         }
+        waiter.held_place = None;
         Ok(take)
     }
 
@@ -941,6 +978,12 @@ impl EgressCap {
         });
         // The same predicate on the value the last attempt saw.
         if let Err(deficit) = self.admits(old, now, need) {
+            // A QUIC take that failed leaves its poller's admission unused:
+            // the poller polls again, and that admission must not count ahead
+            // of it then. A named waiter withdraws its own when it polls.
+            if let (Taker::Anonymous, Some(i)) = (taker, own) {
+                queue.admitted.remove(i);
+            }
             queue.sync(&self.admission.waiting);
             drop(queue);
             #[cfg(test)]
@@ -1031,7 +1074,10 @@ impl EgressCap {
             // same level. A waiter with more than `MAX_ADMISSION_WAKERS`
             // ahead is never admitted, whatever the level: the clamp in
             // `owed` is for its timer only.
-            let named = waiter.named.then_some(&mut waiter.admission);
+            let named = waiter.named.then_some(NamedSlots {
+                admission: &mut waiter.admission,
+                held_place: &mut waiter.held_place,
+            });
             let refused = self.admission.try_admit(
                 &mut waiter.ticket,
                 named,
