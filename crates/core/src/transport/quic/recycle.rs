@@ -159,8 +159,10 @@ use crate::transport::metrics::QuicCloseCode;
 /// one does over a long life, and a path that gets there is closed and
 /// rebuilt with nothing lost but the upgrade. The `stopped` map entries the
 /// limit bounds are about 100 bytes each, so at most about 400 KiB per
-/// path, under one connection's flow-control window
-/// (`config::MAX_WINDOW_BYTES`, 2 MiB).
+/// path, about one connection's largest flow-control window
+/// (`config::MAX_WINDOW_BYTES`, 384 KiB), and counted among the derived
+/// terms of a connection's worst case (`quic::tests`,
+/// `a_connections_quic_memory_stays_under_udps_at_the_ceiling`).
 pub(crate) const SEND_ABORT_LIMIT: u64 = 4096;
 
 /// How long the peer may go on sending without acknowledging packets this

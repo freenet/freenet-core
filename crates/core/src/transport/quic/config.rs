@@ -263,16 +263,17 @@ pub(crate) const QUIC_ASSEMBLER_HOLD_PER_STREAM_BYTES: usize = 44 * 1024;
 /// Above about 22 KB buffered on a stream the proportional waste threshold
 /// governs. At the 2 GiB window, with frames over about 460 B the
 /// assembler did not compact, and with slightly shorter ones it copied
-/// while the old chunks were still alive. At the 2 MiB window the same
-/// lengths make over 2048 chunks, so the chunk-count trigger compacted
-/// them. A manual sweep (not in the tests), at the 2 GiB window only, of
+/// while the old chunks were still alive. At a 2 MiB window (the ceiling
+/// until the data ramp) the same lengths made over 2048 chunks, so the
+/// chunk-count trigger compacted them. A manual sweep (not in the tests), at the 2 GiB window only, of
 /// every frame length from 160 to 1100 B, and every third below, on one
 /// stream filling W (268,435 B) found 3.05 W between packets (470 B) and
 /// 4.115 W at any instant (444 B, 1,104,656 B, during compaction); 64
 /// streams of 460 B frames held 3.12 W. The tests run 444 and 470 B at the
 /// smallest window (131,072 B: 2.87 W and 3.04 W), at 2 GiB, and at the
-/// largest (2 MiB: 2.43 W and 2.42 W), plus 50 B frames, 64 streams and a
-/// mix. The version pin, not the tests, guards against quinn-proto changing
+/// largest ([`MAX_WINDOW_BYTES`]; at 2 MiB they held 2.43 W and 2.42 W, and
+/// an exploration run at 384 KiB held 2.1 to 3.0 W, M2-ACCOUNTING), plus 50 B
+/// frames, 64 streams and a mix. The version pin, not the tests, guards against quinn-proto changing
 /// which length is worst. Set to 5, 22% over 4.115.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const QUIC_ASSEMBLER_HOLD_WINDOW_MULTIPLE: usize = 5;
@@ -304,8 +305,15 @@ pub(crate) const QUIC_MEMORY_MEASURED_WITH: [(&str, &str); 3] = [
 /// The smallest flow-control window per connection and direction.
 pub(crate) const MIN_WINDOW_BYTES: u64 = 128 * 1024;
 
-/// The largest flow-control window per connection and direction.
-pub(crate) const MAX_WINDOW_BYTES: u64 = 2 * 1024 * 1024;
+/// The largest flow-control window per connection and direction: 384 KiB
+/// (Ian, 2026-11-05, the gate for QUIC data at 100%). At this ceiling a
+/// connection's worst-case QUIC memory stays under the UDP transport's
+/// per-connection state on every host size (pinned by
+/// `quic::tests::a_connections_quic_memory_stays_under_udps_at_the_ceiling`),
+/// and a connection still moves 3.07 MB/s at a 128 ms round trip, 2.5 times
+/// the UDP transport's 1.25 MB/s. It binds on hosts above about 2.93 GiB at
+/// 200 connections; the 2 GiB default host is below it. It was 2 MiB.
+pub(crate) const MAX_WINDOW_BYTES: u64 = 384 * 1024;
 
 /// The share of the node's memory all QUIC windows together may hold, as a
 /// divisor: one twentieth, 5%.
@@ -387,7 +395,7 @@ impl QuicSettings {
 /// receive window (so a stream's window is never above its connection's)
 /// and the send window.
 ///
-/// The cap does not bind today (the 2 MiB clamp is far below it); it only
+/// The cap does not bind today (the 384 KiB clamp is far below it); it only
 /// stops a future constant change from raising the windows past it. It does
 /// NOT mean a QUIC connection holds no more memory than a UDP-transport one:
 /// QUIC windows come on top of whatever the application reassembles, the
@@ -489,7 +497,7 @@ pub(crate) fn transport_config<T: TimeSource>(
                 .unwrap_or_else(|| time.connection_idle_timeout()),
         )))
         .keep_alive_interval(time.supports_keepalive().then_some(KEEPALIVE_INTERVAL))
-        // A window is at most MAX_WINDOW_BYTES (2 MiB), far inside a VarInt.
+        // A window is at most MAX_WINDOW_BYTES (384 KiB), far inside a VarInt.
         .stream_receive_window(VarInt::from_u32(window as u32))
         .receive_window(VarInt::from_u32(window as u32))
         .send_window(window)

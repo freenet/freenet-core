@@ -1448,7 +1448,7 @@ exposes (its module doc lists the few it does not):
   TimeSource's connection idle timeout, Cubic with its window capped to the
   configured bandwidth (recycle::CappedCubic), 64 uni / 0 bidi streams,
   stream / receive / send window = clamp(5% of memory / (2 x
-  max-number-of-connections), 128 KiB, 2 MiB), no unreliable datagrams, no
+  max-number-of-connections), 128 KiB, 384 KiB), no unreliable datagrams, no
   spin bit, migration off, max_incoming 64, incoming buffers 64 KiB / 1 MiB,
   no NEW_TOKEN tokens (Retry only), rustls ring, TLS 1.3, fixed ALPN, no SNI, no
   resumption, no early data. Keys and seeds (reset key, token key, CID key,
@@ -1462,7 +1462,7 @@ Connection IDs (quic/cid.rs) carry a keyed BLAKE3 MAC, so quinn drops a
 QUIC memory: the flow-control windows (connection receive, stream receive,
 send; all one value from `connection_window_bytes`) are clamped and capped
 at `MAX_INBOUND_STREAM_BYTES_PER_CONNECTION`; the stream window never
-exceeds the connection window. The cap does not bind today (2 MiB clamp);
+exceeds the connection window. The cap does not bind today (384 KiB clamp);
 `windows_never_exceed_the_reassembly_allowance` only guards future constant
 changes. The windows are the same class of per-connection exception as
 inbound stream reassembly and are in `NOT_SUMMED` in
