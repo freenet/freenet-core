@@ -7047,6 +7047,62 @@ mod tests {
         );
     }
 
+    /// Applied-payload record (`crate::ring::applied_payloads`): both
+    /// broadcast receive paths check it at statement position, AFTER the 60s
+    /// dedup cache (which keeps the in-flight protection this record cannot
+    /// give, since it learns of a payload only after its merge commits) and
+    /// BEFORE the WASM merge, and classify the skip for telemetry before the
+    /// early return. Insertion is the executor's job, never the driver's: a
+    /// driver that recorded a payload could record one whose merge was later
+    /// refused or suppressed.
+    #[test]
+    fn broadcast_paths_check_applied_payloads_between_dedup_and_merge() {
+        let full = include_str!("op_ctx_task.rs");
+        let src = production_source(full);
+        let at_statement = |body: &str, needle: &str| -> usize {
+            body.match_indices(needle)
+                .find(|(i, _)| {
+                    let line_start = body[..*i].rfind('\n').map_or(0, |n| n + 1);
+                    body[line_start..*i].trim().is_empty()
+                })
+                .map(|(i, _)| i)
+                .unwrap_or_else(|| panic!("`{needle}` is not at statement position"))
+        };
+        for sig in [
+            "async fn drive_relay_broadcast_to(",
+            "async fn apply_streaming_broadcast(",
+        ] {
+            let body = extract_fn_body(src, sig);
+            let dedup = at_statement(
+                body,
+                "if op_manager.broadcast_dedup_cache.check_and_insert(",
+            );
+            let check = at_statement(body, "if op_manager.ring.applied_payloads.contains(");
+            let merge = body
+                .find("super::update_contract(")
+                .unwrap_or_else(|| panic!("{sig} must merge via update_contract"));
+            assert!(
+                dedup < check && check < merge,
+                "{sig}: order must be dedup cache ({dedup}) < applied-payload \
+                 check ({check}) < merge ({merge})"
+            );
+            let mark = at_statement(body, "receiver_terminal.mark_already_applied();");
+            assert!(
+                check < mark && mark < merge,
+                "{sig} must classify the already-applied skip inside the check"
+            );
+            assert!(
+                body[mark..merge].contains("return Ok(());"),
+                "{sig} must return after an already-applied skip, before the merge"
+            );
+            assert!(
+                !body.contains("applied_payloads.record_absorbed("),
+                "{sig} must not record payloads; only the executor knows the \
+                 merge committed"
+            );
+        }
+    }
+
     /// #5090: every received payload is terminally classified by an RAII guard,
     /// and successful no-ops are marked before returning.
     #[test]

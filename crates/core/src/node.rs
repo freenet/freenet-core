@@ -10178,6 +10178,39 @@ mod tests {
             );
         }
 
+        /// Pin (applied-payload record): the ResyncResponse arm checks
+        /// `ring.applied_payloads` after consuming the outstanding request and
+        /// only applies the state when it is NOT already merged. The apply
+        /// itself lives in `apply_resync_response_state`.
+        #[test]
+        fn resync_response_skips_an_already_applied_state() {
+            let start = SOURCE
+                .find(concat!("event = \"resync_response_", "received\""))
+                .expect("ResyncResponse receive arm not found");
+            let arm = &SOURCE[start..];
+            let consume = arm
+                .find(".consume(*key.id(), source)")
+                .expect("outstanding-request consume gate");
+            let check = arm
+                .find(concat!("if op_manager.ring.applied_payloads", ".contains("))
+                .expect("ResyncResponse arm must check the applied-payload record");
+            let apply = arm
+                .find(concat!("apply_resync_response_", "state(op_manager"))
+                .expect("ResyncResponse arm must apply through the helper");
+            let else_pos = arm[check..]
+                .find("} else {")
+                .map(|o| check + o)
+                .expect("apply must be in the else branch of the check");
+            assert!(
+                consume < check && check < else_pos && else_pos < apply,
+                "order must be consume < applied check < else {{ apply }}"
+            );
+            assert!(
+                arm[check..else_pos].contains(concat!("record_already_", "applied(false")),
+                "the skip must be counted at the decision"
+            );
+        }
+
         /// Pin (#4864 round-5 item 6): the CHANGED ResyncResponse apply arm MUST
         /// call `invalidate_payload_memo` (presence — the no-reset pin above only
         /// asserts ABSENCE of a reset), and it must live in the `state_changed:
