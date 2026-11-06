@@ -4722,6 +4722,246 @@ mod tests {
         );
     }
 
+    /// A node whose contract handler is the REAL `contract_handling` loop over a
+    /// `MockWasmRuntime` executor wired to the same `OpManager`, so a payload
+    /// goes driver -> handler -> executor and the executor's record is what the
+    /// driver reads. The node's interest/hosting clock is a
+    /// `SharedMockTimeSource` the test advances past the 60s dedup-cache TTL, so
+    /// what the test observes is the applied-payload record and not that cache.
+    /// Returns the op_manager, the clock, the storage (its `store_count` is the
+    /// number of committed writes), the installed contract key, and a guard.
+    async fn build_applied_payload_e2e_node(
+        id: &str,
+    ) -> (
+        Arc<OpManager>,
+        crate::util::time_source::SharedMockTimeSource,
+        crate::wasm_runtime::MockStateStorage,
+        ContractKey,
+        Box<dyn std::any::Any>,
+    ) {
+        let clock = crate::util::time_source::SharedMockTimeSource::new();
+        let config_args = crate::config::ConfigArgs {
+            id: Some(id.to_string()),
+            mode: Some(crate::contract::OperationMode::Local),
+            ..Default::default()
+        };
+        let mut node_config =
+            crate::node::NodeConfig::new(config_args.build().await.expect("build Config"))
+                .await
+                .expect("build NodeConfig");
+        node_config.hosting_time_source_override =
+            Some(Arc::new(clock.clone()) as crate::util::time_source::DynTimeSource);
+        let (mut notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, ch_channel, wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+        let op_manager = Arc::new(
+            OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        op_manager.ring.attach_op_manager(&op_manager);
+        op_manager
+            .ring
+            .connection_manager
+            .set_own_addr_local_for_test("127.0.0.1:12000".parse().unwrap());
+
+        let storage = crate::wasm_runtime::MockStateStorage::new();
+        let handler = crate::contract::MockWasmContractHandler::new_test_with_storage(
+            ch_channel,
+            Some(op_manager.clone()),
+            id,
+            storage.clone(),
+        )
+        .await;
+        let contract_loop = GlobalExecutor::spawn(crate::contract::contract_handling(
+            handler,
+            crate::contract::user_input::AutoApprovePrompter,
+        ));
+        // Drain the event-loop notifications (fan-out of committed changes) so
+        // nothing upstream waits on a full channel.
+        let drain = GlobalExecutor::spawn(async move {
+            while notification_rx
+                .notifications_receiver
+                .recv()
+                .await
+                .is_some()
+            {}
+        });
+
+        let code = freenet_stdlib::prelude::ContractCode::from(id.as_bytes().to_vec());
+        let contract = freenet_stdlib::prelude::ContractContainer::Wasm(
+            freenet_stdlib::prelude::ContractWasmAPIVersion::V1(
+                freenet_stdlib::prelude::WrappedContract::new(
+                    Arc::new(code),
+                    freenet_stdlib::prelude::Parameters::from(vec![]),
+                ),
+            ),
+        );
+        let key = contract.key();
+        let installed = op_manager
+            .notify_contract_handler(ContractHandlerEvent::PutQuery {
+                key,
+                state: WrappedState::new(b"initial".to_vec()),
+                related_contracts: RelatedContracts::default(),
+                contract: Some(contract),
+            })
+            .await
+            .expect("install");
+        assert!(
+            matches!(
+                installed,
+                ContractHandlerEvent::PutResponse {
+                    new_value: Ok(_),
+                    ..
+                }
+            ),
+            "install failed: {installed}"
+        );
+        // Hosted, so the ring reaper keeps the record.
+        op_manager.ring.host_contract(
+            key,
+            16,
+            crate::ring::AccessType::Put,
+            crate::ring::HostingCause::Other,
+        );
+
+        let guard: Box<dyn std::any::Any> = Box::new((
+            contract_loop,
+            drain,
+            result_router_rx,
+            task_monitor,
+            wait_for_event,
+        ));
+        (op_manager, clock, storage, key, guard)
+    }
+
+    /// Deliver one broadcast payload through the real non-streaming driver.
+    async fn deliver(op_manager: &OpManager, key: ContractKey, payload: DeltaOrFullState) {
+        // The result is not asserted: a skip and an apply both return Ok, and
+        // what the tests measure is how many writes reached the store.
+        let _ = drive_relay_broadcast_to(
+            op_manager,
+            Transaction::new::<UpdateMsg>(),
+            key,
+            payload,
+            Vec::new(),
+            "127.0.0.1:12400".parse().unwrap(),
+            crate::ring::broadcast_coverage::CoveredPeers::empty(),
+        )
+        .await;
+    }
+
+    /// End to end through driver, real contract loop and executor: a delta and
+    /// a full state each reach the executor exactly once; replaying each later
+    /// (past the dedup cache's TTL) is skipped. This proves the executor records
+    /// the same hash the driver looks up, for both payload kinds.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_replayed_delta_and_state_reach_the_executor_once_each() {
+        let (op_manager, clock, storage, key, _guard) =
+            build_applied_payload_e2e_node("applied-e2e-once").await;
+        let past_dedup_ttl = std::time::Duration::from_secs(61);
+
+        let writes_before = storage.store_count();
+        deliver(
+            &op_manager,
+            key,
+            DeltaOrFullState::Delta(b"delta-1".to_vec()),
+        )
+        .await;
+        deliver(
+            &op_manager,
+            key,
+            DeltaOrFullState::FullState(b"state-1".to_vec()),
+        )
+        .await;
+        assert_eq!(
+            storage.store_count() - writes_before,
+            2,
+            "each first delivery must merge and commit"
+        );
+
+        clock.advance_time(past_dedup_ttl);
+        deliver(
+            &op_manager,
+            key,
+            DeltaOrFullState::Delta(b"delta-1".to_vec()),
+        )
+        .await;
+        clock.advance_time(past_dedup_ttl);
+        deliver(
+            &op_manager,
+            key,
+            DeltaOrFullState::FullState(b"state-1".to_vec()),
+        )
+        .await;
+        assert_eq!(
+            storage.store_count() - writes_before,
+            2,
+            "a replayed delta or state must not reach the executor again"
+        );
+        assert_eq!(
+            op_manager
+                .payload_mix
+                .receiver_apply_stats()
+                .already_applied[..2],
+            [1, 1],
+            "one delta skip and one full-state skip"
+        );
+    }
+
+    /// A contract whose merge moves between two states, fed the two payloads
+    /// over and over (each delivery past the dedup cache's TTL): without the
+    /// record every delivery would change the state and fan out again. With
+    /// it, the merge count stops growing after the first cycle and every later
+    /// delivery is counted as a skip.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_two_state_replay_stops_after_the_first_cycle() {
+        let (op_manager, clock, storage, key, _guard) =
+            build_applied_payload_e2e_node("applied-e2e-loop").await;
+        let past_dedup_ttl = std::time::Duration::from_secs(61);
+        let payloads = [b"state-a".to_vec(), b"state-b".to_vec()];
+
+        let writes_before = storage.store_count();
+        let skips_before = crate::config::GlobalTestMetrics::already_applied_skips();
+        let rounds = 10;
+        for round in 0..rounds {
+            clock.advance_time(past_dedup_ttl);
+            deliver(
+                &op_manager,
+                key,
+                DeltaOrFullState::FullState(payloads[round % 2].clone()),
+            )
+            .await;
+            if round == 1 {
+                assert_eq!(
+                    storage.store_count() - writes_before,
+                    2,
+                    "the first cycle moves the state twice"
+                );
+            }
+        }
+        assert_eq!(
+            storage.store_count() - writes_before,
+            2,
+            "after the first cycle no delivery may change the state again"
+        );
+        assert_eq!(
+            crate::config::GlobalTestMetrics::already_applied_skips() - skips_before,
+            (rounds - 2) as u64,
+            "every delivery after the first cycle is skipped and counted"
+        );
+    }
+
     /// Convenience wrapper: a node whose stand-in handler fails every delta with
     /// a contract-exec rejection (the common case for the backoff-gate tests).
     async fn build_exec_reject_test_node(

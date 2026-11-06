@@ -1783,6 +1783,20 @@ pub(super) mod in_memory {
             Self { channel, runtime }
         }
 
+        /// As [`Self::new_test`], over a caller-supplied `MockStateStorage` so the
+        /// test can count the writes the executor makes (`store_count`).
+        pub(crate) async fn new_test_with_storage(
+            channel: ContractHandlerChannel<ContractHandlerHalve>,
+            op_manager: Option<Arc<OpManager>>,
+            identifier: &str,
+            storage: MockStateStorage,
+        ) -> Self {
+            let runtime = Executor::new_mock_wasm(identifier, storage, None, op_manager)
+                .await
+                .expect("create MockWasmRuntime executor for test");
+            Self { channel, runtime }
+        }
+
         /// Mutable access to the executor's `MockWasmRuntime` so a test can
         /// install per-contract `validate_overrides` / `update_overrides`.
         pub(crate) fn runtime_mut(&mut self) -> &mut MockWasmRuntime {

@@ -352,15 +352,6 @@ impl Executor<Runtime> {
                                     // and this `store` another operation may
                                     // have advanced the state, and this clobbers
                                     // it rather than merging.
-                                    //
-                                    // Not a merge, so the applied-payload
-                                    // record no longer describes the state
-                                    // (`crate::ring::applied_payloads`).
-                                    // Reset before the write; clearing early
-                                    // only loses skips.
-                                    if let Some(op_manager) = &self.op_manager {
-                                        op_manager.ring.applied_payloads.reset(&key);
-                                    }
                                     self.verify_and_store_contract(
                                         state.clone(),
                                         contract.clone(),
@@ -611,6 +602,11 @@ impl Executor<Runtime> {
                     cause: over.to_string().into(),
                 }));
             }
+            // A store, not a merge: the applied-payload record no longer
+            // describes the state (`crate::ring::applied_payloads`). Covers
+            // both callers, the fresh install and the re-store from a fetched
+            // copy. Reset before the write; clearing early only loses skips.
+            op_manager.ring.applied_payloads.reset(&key);
         }
         self.state_store
             .store(key, state, params)

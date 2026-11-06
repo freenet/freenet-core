@@ -1622,8 +1622,7 @@ impl Ring {
             // this is the level-triggered backstop that keeps the map bounded
             // by the hosted set whatever path ended hosting. Dropping a record
             // only loses skips, so a race with a concurrent re-host is safe.
-            ring.applied_payloads
-                .retain_contracts(|key| ring.is_hosting_contract(key) || ring.contract_in_use(key));
+            ring.reap_applied_payloads();
 
             // Sweep stale delta-send attributions and idle unarmed entries in
             // the delta-incompatibility memo (HQk7 resync loop); an armed
@@ -5533,6 +5532,14 @@ impl Ring {
     /// (e.g. non-idempotent `update_state`). Callers on the broadcast path
     /// must skip emission when this returns true to prevent the broken
     /// contract from generating a propagation storm.
+    /// Drop applied-payload records (`crate::ring::applied_payloads`) for
+    /// contracts this node neither hosts nor serves. Called by the ring
+    /// reaper. Returns how many contracts were dropped.
+    pub(crate) fn reap_applied_payloads(&self) -> usize {
+        self.applied_payloads
+            .retain_contracts(|key| self.is_hosting_contract(key) || self.contract_in_use(key))
+    }
+
     pub fn is_contract_broken(&self, contract: &ContractKey) -> bool {
         self.broken_invariants.is_broken(contract.id())
     }

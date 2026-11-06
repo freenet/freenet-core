@@ -132,31 +132,139 @@ async fn a_committed_changing_merge_is_recorded() {
     );
 }
 
+thread_local! {
+    /// Calls of [`keeps_current`].
+    static KEEP_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// A merge that always returns the current state, counting its calls. Stands
+/// in for a contract that silently drops a payload it cannot use yet.
+fn keeps_current(current: &[u8], _incoming: &[u8]) -> Vec<u8> {
+    KEEP_CALLS.with(|calls| calls.set(calls.get() + 1));
+    current.to_vec()
+}
+
+/// A merge that ran and left the state unchanged is NOT recorded, and the same
+/// payload offered again reaches the merge again.
+///
+/// Why: an unchanged result may be a silent refusal rather than an
+/// absorption. A contract can drop part of a payload under a condition that
+/// later clears (an entry whose prerequisite has not arrived yet) and return
+/// its old state instead of an error. If that were recorded, the receive path
+/// would skip the same bytes when they are offered again after the condition
+/// cleared, and the divergence could stay for good. The cost is that a
+/// payload which genuinely changes nothing is merged again when re-offered.
 #[tokio::test(flavor = "current_thread")]
-async fn a_merge_that_leaves_the_state_unchanged_is_recorded() {
+async fn a_merge_that_leaves_the_state_unchanged_is_not_recorded() {
     let (op_manager, _guards) = build_op_manager("applied-unchanged").await;
     let (mut executor, key) = installed(&op_manager, b"applied_unchanged", b"keep").await;
-    // A merge that always keeps the current state: the incoming payload is
-    // absorbed without changing anything.
-    executor.runtime.update_overrides.insert(
+    executor
+        .runtime
+        .update_overrides
+        .insert(*key.id(), UpdateOverride::MergeWith(keeps_current));
+    KEEP_CALLS.with(|calls| calls.set(0));
+    for round in 1..=2 {
+        let result = executor
+            .upsert_contract_state(
+                key,
+                Either::Left(WrappedState::new(b"other".to_vec())),
+                RelatedContracts::default(),
+                None,
+            )
+            .await
+            .expect("merge");
+        assert!(matches!(result, crate::contract::UpsertResult::NoChange));
+        assert!(
+            !op_manager
+                .ring
+                .applied_payloads
+                .contains(&key, state_hash(&op_manager, b"other")),
+            "round {round}: an unchanged merge must not be recorded"
+        );
+        assert_eq!(
+            KEEP_CALLS.with(std::cell::Cell::get),
+            round,
+            "round {round}: the re-offered payload must reach the merge"
+        );
+    }
+}
+
+/// Refuses to merge into the stored state `[9]`, which the contract also
+/// considers invalid; otherwise the incoming state wins.
+fn refuses_corrupt_base(current: &[u8], incoming: &[u8]) -> Option<Vec<u8>> {
+    if current == [9] {
+        return None;
+    }
+    Some(incoming.to_vec())
+}
+
+/// A corrupted-state recovery replaces the stored state with the incoming one
+/// instead of merging, so it must reset the record rather than add to it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_corrupted_state_recovery_resets_the_record() {
+    use crate::contract::executor::mock_wasm_runtime::ValidateOverride;
+
+    let (op_manager, _guards) = build_op_manager("applied-recovery").await;
+    let (mut executor, key) = installed(&op_manager, b"applied_recovery", &[9]).await;
+    let set = &op_manager.ring.applied_payloads;
+    let stale = state_hash(&op_manager, b"recorded-before-recovery");
+    set.record_absorbed(&key, stale);
+
+    let runtime = executor.mock_runtime_mut();
+    runtime.update_overrides.insert(
         *key.id(),
-        UpdateOverride::MergeWith(|current: &[u8], _incoming: &[u8]| current.to_vec()),
+        UpdateOverride::TryMergeWith(refuses_corrupt_base),
     );
+    runtime
+        .validate_overrides
+        .insert(*key.id(), ValidateOverride::ValidWhen(|s| s != [9]));
+
     let result = executor
         .upsert_contract_state(
             key,
-            Either::Left(WrappedState::new(b"other".to_vec())),
+            Either::Left(WrappedState::new(vec![3])),
             RelatedContracts::default(),
             None,
         )
         .await
-        .expect("merge");
-    assert!(matches!(result, crate::contract::UpsertResult::NoChange));
+        .expect("recovery replaces the corrupted state");
+    assert!(matches!(result, crate::contract::UpsertResult::Updated(_)));
     assert!(
-        op_manager
-            .ring
-            .applied_payloads
-            .contains(&key, state_hash(&op_manager, b"other"))
+        !set.contains(&key, stale),
+        "the record from before the recovery must be gone"
+    );
+    assert_eq!(
+        set.len_for(&key),
+        0,
+        "a recovery is not a merge, so it records nothing"
+    );
+}
+
+/// The ring reaper keeps records only for contracts this node hosts or
+/// serves, and drops the rest.
+#[tokio::test(flavor = "current_thread")]
+async fn the_reaper_drops_records_for_contracts_no_longer_hosted() {
+    let (op_manager, _guards) = build_op_manager("applied-reaper").await;
+    let hosted = test_contract(b"applied_reaper_hosted").key();
+    let gone = test_contract(b"applied_reaper_gone").key();
+    let set = &op_manager.ring.applied_payloads;
+    set.record_absorbed(&hosted, 1);
+    set.record_absorbed(&gone, 2);
+    op_manager.ring.host_contract(
+        hosted,
+        16,
+        crate::ring::AccessType::Get,
+        crate::ring::HostingCause::Other,
+    );
+
+    assert_eq!(op_manager.ring.reap_applied_payloads(), 1);
+    assert!(
+        set.contains(&hosted, 1),
+        "a hosted contract keeps its record"
+    );
+    assert!(
+        !set.contains(&gone, 2),
+        "an unhosted, unused contract loses it"
     );
 }
 
@@ -270,6 +378,27 @@ async fn an_initial_install_resets_the_record() {
     );
 }
 
+/// Source pin: the initial-install reset runs BEFORE the state store, so no
+/// window exists in which a record from an earlier copy describes the newly
+/// installed state.
+#[test]
+fn the_install_reset_precedes_the_store() {
+    let src = include_str!("../runtime/executor_impl.rs");
+    let branch = src
+        .find("if is_new_contract {\n")
+        .expect("initial-install branch");
+    let region = &src[branch..];
+    let reset = region
+        .lines()
+        .position(|l| l.trim() == "set.reset(&key);")
+        .expect("install branch resets the record");
+    let store = region
+        .lines()
+        .position(|l| l.trim() == ".store(key, state_to_store, params.clone())")
+        .expect("install branch stores the state");
+    assert!(reset < store, "the reset must precede the store");
+}
+
 /// Source pins for the reset hooks that the tests above cannot reach without
 /// a full `Executor<Runtime>` and a `RuntimePool`.
 #[test]
@@ -303,9 +432,44 @@ fn eviction_and_reclamation_reset_the_record() {
         .expect("reclaim_contract_storage exists");
     let body = &ops2[start..];
     let body = &body[..body.find("\n    }\n").expect("method end")];
+    // The reset must sit in the `Ok` arm of the state delete, before its
+    // `Err` arm: a failed delete leaves the state in place.
+    let delete = body
+        .find("match self.state_store.delete(key).await {")
+        .expect("state delete");
+    let ok_arm = delete
+        + body[delete..]
+            .find("Ok(()) => {")
+            .expect("Ok arm of the delete");
+    let err_arm = ok_arm + body[ok_arm..].find("Err(e) => {").expect("Err arm");
+    let reset = body
+        .match_indices("op_manager.ring.applied_payloads.reset(key);")
+        .map(|(i, _)| i)
+        .find(|i| {
+            let line_start = body[..*i].rfind('\n').map_or(0, |n| n + 1);
+            body[line_start..*i].trim().is_empty()
+        })
+        .expect("deleting a contract's state must reset its applied-payload record");
     assert!(
-        body.lines()
-            .any(|l| l.trim() == "op_manager.ring.applied_payloads.reset(key);"),
-        "deleting a contract's state must reset its applied-payload record"
+        ok_arm < reset && reset < err_arm,
+        "the reset must be in the Ok arm after state_store.delete \
+         (ok {ok_arm}, reset {reset}, err {err_arm})"
     );
+
+    // Every non-merge store through `verify_and_store_contract` (the fresh
+    // install and the re-store from a fetched copy) resets before it writes.
+    let start = ops2
+        .find("async fn verify_and_store_contract(")
+        .expect("verify_and_store_contract exists");
+    let body = &ops2[start..];
+    let body = &body[..body.find("\n    }\n").expect("method end")];
+    let reset = body
+        .lines()
+        .position(|l| l.trim() == "op_manager.ring.applied_payloads.reset(&key);")
+        .expect("verify_and_store_contract must reset the applied-payload record");
+    let store = body
+        .lines()
+        .position(|l| l.trim() == ".store(key, state, params)")
+        .expect("state store call");
+    assert!(reset < store, "the reset must precede the state store");
 }
