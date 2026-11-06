@@ -2112,7 +2112,11 @@ impl ReDb {
             let mut tbl = txn.open_table(NATIVE_APP_GRANTS_TABLE)?;
             tbl.remove(token_hash.as_slice())?.is_some()
         };
-        Self::commit_guarded(txn)?;
+        if removed {
+            Self::commit_guarded(txn)?;
+        } else {
+            txn.abort()?;
+        }
         Ok(removed)
     }
 

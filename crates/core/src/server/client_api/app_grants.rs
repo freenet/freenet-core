@@ -82,9 +82,22 @@
 //! # Revocation
 //!
 //! Grants are listed on the Apps and permissions page with a Revoke button.
-//! Revoking deletes the stored row, drops any request still offering the token
-//! (so it can no longer be collected or stored again), and closes every live
-//! connection that was opened with the token.
+//! Revoking drops any request still offering the token (so it can no longer be
+//! collected or stored again), deletes the stored row, and closes every live
+//! connection that was opened with the token. It runs as its own task, so it
+//! completes even if the HTTP request that asked for it goes away, and it
+//! closes connections even if the delete fails.
+//!
+//! # WebSocket close codes for a token
+//!
+//! - 4401: the token names nothing (a stale shell-page token, or a revoked
+//!   grant). Discard it.
+//! - 4503: the grant store could not be consulted right now (node starting,
+//!   storage fault). Keep the token and retry.
+//! - 4403: a token sent in the `Authorization` header that this connection
+//!   cannot use as a grant (not a local connection, a non-loopback `Host`, or
+//!   forwarding headers). Keep the token; connect directly to the node over
+//!   loopback.
 //!
 //! # Storage I/O
 //!
@@ -105,7 +118,8 @@
 //! This module reads `tokio::time::Instant` directly rather than a
 //! `TimeSource`, like the delegate permission prompts in
 //! `contract::user_input`: it is the HTTP layer, which the simulation harness
-//! does not drive, and tokio's clock is what its tests pause and advance.
+//! does not drive, and tokio's clock is what its tests pause and advance. This
+//! is listed as an exception in `.claude/rules/code-style.md`.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -402,29 +416,65 @@ impl AppGrantState {
     /// Delete a grant, drop any request still offering its token, and close
     /// its live connections. `Ok(false)` if there was no such grant (the rest
     /// happens regardless).
+    ///
+    /// Runs as its own task, so it completes even if the HTTP request that
+    /// asked for it goes away, and the part that closes connections runs even
+    /// if the delete fails or panics (see [`FinishRevoke`]).
     async fn revoke(
         &self,
         caps: Arc<DelegateCapabilities>,
         hash: GrantTokenHash,
     ) -> anyhow::Result<bool> {
-        // Order matters, see `resolve_connection`: delete first, then cancel.
-        let removed = off_thread(move || caps.revoke_native_grant(hash))
-            .await
-            .unwrap_or_else(|| Err(anyhow::anyhow!("revocation task failed")));
-        // Even if the delete reported an error (it may still have committed),
-        // stop the token being collected or stored again.
+        let state = self.clone();
+        let task = crate::config::GlobalExecutor::spawn(async move {
+            // Dropped at the end of this block, or while unwinding a panic.
+            let _finish = FinishRevoke {
+                state: state.clone(),
+                hash,
+            };
+            // First, so no poll in the gap below can collect or store the
+            // token, and a write already in flight sees its request gone and
+            // removes its own row.
+            state.forget_requests_for(hash);
+            off_thread(move || caps.revoke_native_grant(hash))
+                .await
+                .unwrap_or_else(|| Err(anyhow::anyhow!("revocation task failed")))
+        });
+        match task.await {
+            Ok(removed) => removed,
+            Err(e) => Err(anyhow::anyhow!("revocation task failed: {e}")),
+        }
+    }
+
+    /// The part of a revocation that must happen whatever the delete did:
+    /// drop the requests again, close live connections, wake pollers.
+    /// Idempotent. Runs after the delete (see `resolve_connection` for why
+    /// the order matters).
+    fn finish_revoke(&self, hash: GrantTokenHash) {
         self.forget_requests_for(hash);
         let conns = self.0.live.lock().remove(&hash).unwrap_or_default();
         for (_, cancel) in conns {
             cancel.cancel();
         }
         self.wake_all_pollers();
-        removed
     }
 
     #[cfg(test)]
     fn live_connections(&self, hash: GrantTokenHash) -> usize {
         self.0.live.lock().get(&hash).map_or(0, Vec::len)
+    }
+}
+
+/// Runs [`AppGrantState::finish_revoke`] when dropped, so a revocation closes
+/// its connections even if the delete panicked.
+struct FinishRevoke {
+    state: AppGrantState,
+    hash: GrantTokenHash,
+}
+
+impl Drop for FinishRevoke {
+    fn drop(&mut self) {
+        self.state.finish_revoke(self.hash);
     }
 }
 
@@ -447,8 +497,9 @@ fn random_id() -> String {
     hex::encode(bytes)
 }
 
-/// A request URI for logging, with the capability segment of the grant routes
-/// replaced (their query, if any, is dropped too).
+/// A request URI for logging: the PATH only, with the capability segment of
+/// the grant routes replaced. Never the query: the client API carries
+/// credentials there (`authToken`, `userToken` on the WebSocket URL).
 pub(crate) fn redact_uri_for_log(uri: &axum::http::Uri) -> String {
     let path = uri.path();
     for prefix in REDACTED_PATH_PREFIXES {
@@ -456,11 +507,12 @@ pub(crate) fn redact_uri_for_log(uri: &axum::http::Uri) -> String {
             return format!("{prefix}<redacted>");
         }
     }
-    uri.to_string()
+    path.to_string()
 }
 
 /// The request span for the client API's `TraceLayer`: the default span's
-/// fields, with [`redact_uri_for_log`] applied to the URI.
+/// fields, with the URI reduced to [`redact_uri_for_log`] (path only, grant
+/// ids redacted, no query) for every route.
 pub(crate) fn make_request_span<B>(req: &axum::http::Request<B>) -> tracing::Span {
     tracing::debug_span!(
         "request",
@@ -533,7 +585,16 @@ async fn at_grant_limit(caps: Option<Arc<DelegateCapabilities>>) -> bool {
 pub(crate) fn has_forwarding_headers(headers: &HeaderMap) -> bool {
     headers.keys().any(|name| {
         let name = name.as_str();
-        name.starts_with("x-forwarded-") || name == "forwarded" || name == "x-real-ip"
+        name.starts_with("x-forwarded-")
+            || matches!(
+                name,
+                "forwarded"
+                    | "x-real-ip"
+                    | "via"
+                    | "true-client-ip"
+                    | "cf-connecting-ip"
+                    | "x-client-ip"
+            )
     })
 }
 
@@ -661,15 +722,45 @@ struct CreateRequest {
     client_name: Option<String>,
 }
 
+/// Parse a JSON body AFTER the route's gate has run, so a refused caller's
+/// body is never parsed. Requires `Content-Type: application/json`, as the
+/// `Json` extractor did (for a browser that also forces a CORS preflight on a
+/// cross-origin POST).
+fn parse_json_body<T: serde::de::DeserializeOwned>(
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<T, Box<Response>> {
+    let is_json = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            v.split(';')
+                .next()
+                .is_some_and(|m| m.trim().eq_ignore_ascii_case("application/json"))
+        });
+    if !is_json {
+        return Err(Box::new(refuse(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "expected application/json",
+        )));
+    }
+    serde_json::from_slice(body)
+        .map_err(|_| Box::new(refuse(StatusCode::BAD_REQUEST, "invalid body")))
+}
+
 async fn create_request(
     connect_info: Option<Extension<ConnectInfo<SocketAddr>>>,
     Extension(state): Extension<AppGrantState>,
     headers: HeaderMap,
-    Json(body): Json<CreateRequest>,
+    body: axum::body::Bytes,
 ) -> Response {
     if let Some(r) = native_client_gate(connect_info.as_ref(), &headers) {
         return r;
     }
+    let body: CreateRequest = match parse_json_body(&headers, &body) {
+        Ok(b) => b,
+        Err(r) => return *r,
+    };
     let Ok(app) = ContractInstanceId::from_base58(&body.app) else {
         return refuse(StatusCode::BAD_REQUEST, "invalid app");
     };
@@ -892,15 +983,85 @@ fn approved_response(app: ContractInstanceId, token: &GrantToken) -> Response {
         .into_response()
 }
 
-/// The write half of a collecting poll: store off the lock and off the async
-/// workers, then re-take the lock and record the result.
-async fn store_and_answer(
+/// Clears a request's `storing` mark if the store task ends without
+/// recording its result (a panic), so the request is not left waiting on a
+/// write that will never report. Records a storage failure, so the next poll
+/// tries again.
+struct StoringGuard {
+    state: AppGrantState,
+    request_id: String,
+    armed: bool,
+}
+
+impl Drop for StoringGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut pending = self.state.0.pending.lock();
+        if let Some(p) = pending.get_mut(&self.request_id) {
+            if let Outcome::Approved {
+                stored,
+                storing,
+                last_failure,
+                ..
+            } = &mut p.outcome
+            {
+                *storing = false;
+                if !*stored {
+                    *last_failure = Some(StoreFailure::Failed);
+                }
+            }
+            p.changed.send_replace(());
+        }
+    }
+}
+
+/// Record a store's result on its request. `false` if the request is no
+/// longer offered (revoked, expired, or used).
+fn record_store_result(
     state: &AppGrantState,
     request_id: &str,
+    result: Result<(), StoreFailure>,
+) -> bool {
+    let mut pending = state.0.pending.lock();
+    sweep_expired(&mut pending, Instant::now());
+    let Some(p) = pending.get_mut(request_id) else {
+        return false;
+    };
+    if let Outcome::Approved {
+        stored,
+        storing,
+        last_failure,
+        ..
+    } = &mut p.outcome
+    {
+        *storing = false;
+        match result {
+            Ok(()) => *stored = true,
+            Err(f) => *last_failure = Some(f),
+        }
+    }
+    p.changed.send_replace(());
+    true
+}
+
+/// The write half of a collecting poll: store off the lock and off the async
+/// workers, then record the result on the request. Runs as its own task (see
+/// [`store_and_answer`]). `None` when the request was no longer offered
+/// afterwards; then any row the write may have left is deleted.
+async fn store_task(
+    state: AppGrantState,
+    request_id: String,
     token: GrantToken,
     app: ContractInstanceId,
     client_name: String,
-) -> Response {
+) -> Option<Result<(), StoreFailure>> {
+    let mut guard = StoringGuard {
+        state: state.clone(),
+        request_id: request_id.clone(),
+        armed: true,
+    };
     let hash = token.hash();
     let result = match state.capabilities() {
         Some(caps) => off_thread(move || store_grant(&caps, hash, app, &client_name))
@@ -908,47 +1069,56 @@ async fn store_and_answer(
             .unwrap_or(Err(StoreFailure::Failed)),
         None => Err(StoreFailure::Failed),
     };
-    let still_offered = {
-        let mut pending = state.0.pending.lock();
-        sweep_expired(&mut pending, Instant::now());
-        match pending.get_mut(request_id) {
-            Some(p) => {
-                if let Outcome::Approved {
-                    stored,
-                    storing,
-                    last_failure,
-                    ..
-                } = &mut p.outcome
-                {
-                    *storing = false;
-                    match result {
-                        Ok(()) => *stored = true,
-                        Err(f) => *last_failure = Some(f),
-                    }
-                }
-                p.changed.send_replace(());
-                true
-            }
-            None => false,
-        }
-    };
-    if !still_offered {
-        // Revoked or expired while we were writing. Nobody received the token,
-        // so a row we just wrote would be a grant no client holds: remove it.
-        if result.is_ok()
-            && let Some(caps) = state.capabilities()
-        {
-            drop(off_thread(move || caps.revoke_native_grant(hash)).await);
-        }
-        return refuse(StatusCode::NOT_FOUND, "unknown or expired request");
-    }
-    match result {
-        Ok(()) => {
+    let still_offered = record_store_result(&state, &request_id, result);
+    guard.armed = false;
+    if still_offered {
+        if result.is_ok() {
             tracing::info!(contract_id = %app, "Native app grant approved and issued");
-            approved_response(app, &token)
         }
-        Err(StoreFailure::Limit) => grant_limit_response(),
-        Err(StoreFailure::Failed) => store_failed_response(),
+        return Some(result);
+    }
+    // Revoked, expired or used while we were writing. Nobody received the
+    // token, so any row this write left is a grant no client holds. Delete it
+    // whatever `result` says: a write can report an error and still commit.
+    let deleted = match state.capabilities() {
+        Some(caps) => off_thread(move || caps.revoke_native_grant(hash)).await,
+        None => Some(Err(anyhow::anyhow!("grant store unavailable"))),
+    };
+    match deleted {
+        Some(Ok(_)) => {}
+        Some(Err(e)) => tracing::warn!(
+            error = %e,
+            "Could not remove a native app grant written for a request that is gone"
+        ),
+        None => {
+            tracing::warn!("Removing a native app grant written for a request that is gone failed")
+        }
+    }
+    None
+}
+
+/// Run [`store_task`] detached and answer from its result. Detached so that a
+/// poll whose client disconnects mid-write does not leave the request marked
+/// `storing` for good: the task finishes, and the next poll collects.
+async fn store_and_answer(
+    state: &AppGrantState,
+    request_id: &str,
+    token: GrantToken,
+    app: ContractInstanceId,
+    client_name: String,
+) -> Response {
+    let task = crate::config::GlobalExecutor::spawn(store_task(
+        state.clone(),
+        request_id.to_string(),
+        token.clone(),
+        app,
+        client_name,
+    ));
+    match task.await {
+        Ok(Some(Ok(()))) => approved_response(app, &token),
+        Ok(Some(Err(StoreFailure::Limit))) => grant_limit_response(),
+        Ok(Some(Err(StoreFailure::Failed))) | Err(_) => store_failed_response(),
+        Ok(None) => refuse(StatusCode::NOT_FOUND, "unknown or expired request"),
     }
 }
 
@@ -1059,7 +1229,7 @@ async fn approve_submit(
     Extension(state): Extension<AppGrantState>,
     headers: HeaderMap,
     Path(approve_id): Path<String>,
-    Json(body): Json<ApproveSubmit>,
+    body: axum::body::Bytes,
 ) -> Response {
     if let Some(r) = local_gate(connect_info.as_ref(), &headers) {
         return r;
@@ -1069,6 +1239,10 @@ async fn approve_submit(
     if !origin_is_this_node(&headers) {
         return refuse(StatusCode::FORBIDDEN, "origin mismatch");
     }
+    let body: ApproveSubmit = match parse_json_body(&headers, &body) {
+        Ok(b) => b,
+        Err(r) => return *r,
+    };
     // Read before the lock: no storage I/O happens under it.
     let at_limit = body.allow && at_grant_limit(state.capabilities()).await;
     let mut pending = state.0.pending.lock();
@@ -1176,7 +1350,7 @@ async fn revoke_native_grant(
     connect_info: Option<Extension<ConnectInfo<SocketAddr>>>,
     Extension(state): Extension<AppGrantState>,
     headers: HeaderMap,
-    Json(body): Json<RevokeNativeGrant>,
+    body: axum::body::Bytes,
 ) -> Response {
     if let Some(r) = local_gate(connect_info.as_ref(), &headers) {
         return r;
@@ -1184,6 +1358,10 @@ async fn revoke_native_grant(
     if !origin_is_this_node(&headers) {
         return refuse(StatusCode::FORBIDDEN, "origin mismatch");
     }
+    let body: RevokeNativeGrant = match parse_json_body(&headers, &body) {
+        Ok(b) => b,
+        Err(r) => return *r,
+    };
     let Some(hash) = GrantTokenHash::from_hex(&body.id) else {
         return refuse(StatusCode::BAD_REQUEST, "invalid id");
     };

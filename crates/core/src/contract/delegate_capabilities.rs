@@ -591,6 +591,15 @@ pub(crate) struct FlakyCapabilityStorage {
     pub fail_grants: std::sync::atomic::AtomicBool,
     #[allow(clippy::type_complexity)]
     pub after_native_get: Mutex<Option<Box<dyn FnOnce(&MemoryCapabilityStorage) + Send>>>,
+    /// Calls to `insert_native_grant_capped`.
+    pub native_inserts: std::sync::atomic::AtomicUsize,
+    /// The next native insert commits and then reports an error.
+    pub native_insert_commits_then_errs: std::sync::atomic::AtomicBool,
+    /// Native removes report an error (and remove nothing).
+    pub fail_native_remove: std::sync::atomic::AtomicBool,
+    /// Runs once, before the next native remove (may block or panic).
+    #[allow(clippy::type_complexity)]
+    pub before_native_remove: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 #[cfg(test)]
@@ -631,8 +640,17 @@ impl CapabilityStorage for FlakyCapabilityStorage {
         value: &[u8],
         max: usize,
     ) -> anyhow::Result<bool> {
-        self.inner
-            .insert_native_grant_capped(token_hash, value, max)
+        self.native_inserts.fetch_add(1, Ordering::SeqCst);
+        let stored = self
+            .inner
+            .insert_native_grant_capped(token_hash, value, max)?;
+        if self
+            .native_insert_commits_then_errs
+            .swap(false, Ordering::SeqCst)
+        {
+            anyhow::bail!("injected error after the insert committed");
+        }
+        Ok(stored)
     }
     fn update_native_grant_if_present(
         &self,
@@ -655,6 +673,12 @@ impl CapabilityStorage for FlakyCapabilityStorage {
         row
     }
     fn remove_native_grant(&self, token_hash: &[u8; 32]) -> anyhow::Result<bool> {
+        if let Some(hook) = self.before_native_remove.lock().take() {
+            hook();
+        }
+        if self.fail_native_remove.load(Ordering::SeqCst) {
+            anyhow::bail!("injected remove failure");
+        }
         self.inner.remove_native_grant(token_hash)
     }
     fn all_native_grants(&self) -> anyhow::Result<Vec<([u8; 32], Vec<u8>)>> {

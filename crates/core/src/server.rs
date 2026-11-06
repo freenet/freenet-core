@@ -306,6 +306,16 @@ pub async fn serve_client_api_for_test(
     serve_client_api_in_impl(config, None).await
 }
 
+/// [`serve_client_api_in_impl`] on a pre-bound listener, returning the concrete
+/// types, for unit tests that drive the real router composition.
+#[cfg(test)]
+pub(crate) async fn serve_client_api_with_listener_for_unit_test(
+    config: WebsocketApiConfig,
+    listener: std::net::TcpListener,
+) -> std::io::Result<(HttpClientApi, WebSocketProxy)> {
+    serve_client_api_in_impl(config, Some(listener)).await
+}
+
 pub(crate) async fn serve_client_api_in(
     config: WebsocketApiConfig,
 ) -> std::io::Result<(HttpClientApi, WebSocketProxy)> {

@@ -224,33 +224,126 @@ async fn token_can_be_re_collected_until_first_use() {
     assert!(!body.contains(&token));
 }
 
-/// Multi-thread, so the store runs on the blocking pool and the polls really
-/// overlap the write.
+/// Wait until `n` polls are waiting on the request's change channel. `false`
+/// if that does not happen within `within`.
+async fn wait_for_waiters(
+    state: &AppGrantState,
+    request_id: &str,
+    n: usize,
+    within: Duration,
+) -> bool {
+    let deadline = Instant::now() + within;
+    loop {
+        let waiting = state
+            .0
+            .pending
+            .lock()
+            .get(request_id)
+            .map_or(0, |p| p.changed.receiver_count());
+        if waiting >= n {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+}
+
+/// A storage hook that reports when it is reached and then blocks until
+/// released. Returns `(hook, reached, release)`.
+#[allow(clippy::type_complexity)]
+fn blocking_hook() -> (
+    Box<dyn FnOnce() + Send>,
+    std::sync::mpsc::Receiver<()>,
+    std::sync::mpsc::Sender<()>,
+) {
+    let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let hook = Box::new(move || {
+        reached_tx.send(()).ok();
+        release_rx.recv_timeout(Duration::from_secs(10)).ok();
+    });
+    (hook, reached_rx, release_tx)
+}
+
+async fn wait_reached(reached: std::sync::mpsc::Receiver<()>) {
+    tokio::task::spawn_blocking(move || reached.recv_timeout(Duration::from_secs(10)))
+        .await
+        .unwrap()
+        .expect("the storage hook was reached");
+}
+
+fn flaky_state() -> (
+    AppGrantState,
+    Arc<DelegateCapabilities>,
+    Arc<FlakyCapabilityStorage>,
+) {
+    let storage = Arc::new(FlakyCapabilityStorage::default());
+    let caps = DelegateCapabilities::new(storage.clone());
+    (
+        AppGrantState::with_capabilities(caps.clone()),
+        caps,
+        storage,
+    )
+}
+
+fn approved_hash(state: &AppGrantState, request_id: &str) -> GrantTokenHash {
+    match &state.0.pending.lock()[request_id].outcome {
+        Outcome::Approved { token, .. } => token.hash(),
+        Outcome::Pending | Outcome::Denied => panic!("approved"),
+    }
+}
+
+/// Four polls race for one approval while the first writer is held inside
+/// the store: the others wait on it, and the grant is written exactly once.
+/// Multi-thread, so the write really runs on the blocking pool.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_polls_get_the_same_token_and_store_it_once() {
-    let (state, caps) = new_state();
+    let (state, caps, storage) = flaky_state();
     let r = router(&state);
     let (request_id, approve_id) = create(&r).await;
-    let polls: Vec<_> = (0..4)
+    approve(&r, &approve_id).await;
+    let (hook, reached, release) = blocking_hook();
+    *storage.after_native_get.lock() = Some(Box::new(move |_| hook()));
+
+    let first = {
+        let r = r.clone();
+        let id = request_id.clone();
+        tokio::spawn(async move { send(&r, poll_req(&id)).await })
+    };
+    wait_reached(reached).await;
+    let others: Vec<_> = (0..3)
         .map(|_| {
             let r = r.clone();
             let id = request_id.clone();
             tokio::spawn(async move { send(&r, poll_req(&id)).await })
         })
         .collect();
-    tokio::task::yield_now().await;
-    approve(&r, &approve_id).await;
+    // With the `storing` mark the other three wait on the first writer; give
+    // up after a while so a regression fails on the insert count below rather
+    // than hanging.
+    let waited = wait_for_waiters(&state, &request_id, 3, Duration::from_secs(3)).await;
+    release.send(()).ok();
     let mut tokens = std::collections::HashSet::new();
-    for p in polls {
-        let (status, body) = tokio::time::timeout(Duration::from_secs(5), p)
+    for p in std::iter::once(first).chain(others) {
+        let (status, body) = tokio::time::timeout(Duration::from_secs(10), p)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(status, StatusCode::OK, "{body}");
         tokens.insert(json(&body)["token"].as_str().unwrap().to_string());
     }
+    assert!(waited, "the other polls waited on the first writer");
     assert_eq!(tokens.len(), 1, "every poll sees the one token");
-    assert_eq!(caps.native_grant_count().unwrap(), 1, "stored once");
+    assert_eq!(
+        storage
+            .native_inserts
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "written exactly once"
+    );
+    assert_eq!(caps.native_grant_count().unwrap(), 1);
 }
 
 #[tokio::test(start_paused = true)]
@@ -681,8 +774,11 @@ async fn grant_limit_at_collection_waits_and_recovers_on_revoke() {
         let id = request_id.clone();
         tokio::spawn(async move { send(&r, poll_req(&id)).await })
     };
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    assert!(!waiting.is_finished(), "a poll at the limit must wait");
+    assert!(
+        wait_for_waiters(&state, &request_id, 1, Duration::from_secs(5)).await,
+        "a poll at the limit must wait for a change"
+    );
+    assert!(!waiting.is_finished());
 
     let (victim, _) = caps.native_grants().unwrap()[0];
     assert_eq!(
@@ -831,6 +927,13 @@ fn trace_uri_redacts_the_grant_capabilities() {
     assert_eq!(
         redact_uri_for_log(&u("/v1/app-grants/request")),
         "/v1/app-grants/request"
+    );
+    assert_eq!(
+        redact_uri_for_log(&u(
+            "/v1/contract/command?authToken=secret-a&userToken=secret-b"
+        )),
+        "/v1/contract/command",
+        "the query (credentials) is never logged"
     );
     assert_eq!(
         redact_uri_for_log(&u("/permission/apps")),
@@ -1088,4 +1191,393 @@ fn page_scripts_match_the_routes_and_body_keys() {
     ] {
         assert!(apps.contains(key), "{key}");
     }
+}
+
+/// Source pins: every log site that records a request path, and both
+/// `TraceLayer`s, go through the redacting helper, which drops the query
+/// (credentials) and grant ids.
+#[test]
+fn request_logging_goes_through_the_redacting_helper() {
+    let ws = include_str!("../../../client_events/websocket.rs");
+    assert_eq!(
+        ws.matches("request_path = %redact_uri_for_log(req.uri())")
+            .count(),
+        2
+    );
+    assert!(!ws.contains("request_path = req.uri()"));
+    let pp = include_str!("../permission_prompts.rs");
+    assert!(pp.contains("path = %super::app_grants::redact_uri_for_log(req.uri())"));
+    assert!(!pp.contains("path = req.uri()"));
+    let server = include_str!("../../../server.rs");
+    let layers = server.matches("TraceLayer::new_for_http()").count();
+    assert_eq!(layers, 2);
+    assert_eq!(
+        server
+            .matches(".make_span_with(client_api::app_grants::make_request_span)")
+            .count(),
+        layers,
+        "every TraceLayer uses the redacting span"
+    );
+}
+
+#[test]
+fn upgrade_grant_header_gate() {
+    let h = |pairs: &[(&str, &str)]| {
+        let mut m = HeaderMap::new();
+        for (k, v) in pairs {
+            m.insert(
+                axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                v.parse().unwrap(),
+            );
+        }
+        m
+    };
+    assert!(upgrade_may_use_grant(&h(&[("host", "127.0.0.1:7509")])));
+    assert!(upgrade_may_use_grant(&h(&[("host", "localhost:7509")])));
+    assert!(upgrade_may_use_grant(&h(&[("host", "[::1]:7509")])));
+    assert!(!upgrade_may_use_grant(&h(&[])), "missing Host");
+    assert!(!upgrade_may_use_grant(&h(&[("host", "evil.example:7509")])));
+    for fwd in [
+        "x-forwarded-for",
+        "forwarded",
+        "x-real-ip",
+        "via",
+        "true-client-ip",
+        "cf-connecting-ip",
+        "x-client-ip",
+    ] {
+        assert!(
+            !upgrade_may_use_grant(&h(&[("host", "127.0.0.1:7509"), (fwd, "1.2.3.4")])),
+            "{fwd}"
+        );
+    }
+}
+
+/// A write that commits but reports an error leaves a row; revoking it then
+/// removes the row and the request, and a re-poll can neither collect nor
+/// re-create the grant.
+#[tokio::test]
+async fn revoke_after_a_commit_that_reported_an_error() {
+    let (state, caps, storage) = flaky_state();
+    let r = router(&state);
+    let (request_id, approve_id) = create(&r).await;
+    approve(&r, &approve_id).await;
+    let hash = approved_hash(&state, &request_id);
+    let token = match &state.0.pending.lock()[&request_id].outcome {
+        Outcome::Approved { token, .. } => token.expose().to_string(),
+        Outcome::Pending | Outcome::Denied => panic!("approved"),
+    };
+    storage
+        .native_insert_commits_then_errs
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let (status, _) = send(&r, poll_req(&request_id)).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(caps.native_grant_count().unwrap(), 1, "the row did commit");
+    assert_eq!(
+        send(&r, revoke_req(&hash.to_hex(), Some(SELF_ORIGIN)))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        send(&r, poll_req(&request_id)).await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(caps.native_grant_count().unwrap(), 0);
+    assert!(
+        !state.0.pending.lock().contains_key(&request_id),
+        "the request is gone"
+    );
+    assert!(matches!(
+        resolve(&state, &token).await,
+        GrantLookup::NotFound
+    ));
+}
+
+/// The retry after a write that committed but reported an error finds its
+/// own row before counting, so it stores even when the table is now full.
+#[tokio::test(start_paused = true)]
+async fn retry_after_a_reported_error_finds_its_row_before_the_limit() {
+    let (state, caps, storage) = flaky_state();
+    let r = router(&state);
+    let (request_id, approve_id) = create(&r).await;
+    approve(&r, &approve_id).await;
+    storage
+        .native_insert_commits_then_errs
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        send(&r, poll_req(&request_id)).await.0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    fill_grants(&caps);
+    let (status, body) = send(&r, poll_req(&request_id)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(caps.native_grant_count().unwrap(), MAX_NATIVE_GRANTS);
+}
+
+/// A revocation whose HTTP request goes away mid-way still completes: the live
+/// connection is closed and the pending request is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dropped_revoke_still_completes() {
+    let (state, caps, storage) = flaky_state();
+    let r = router(&state);
+    let (request_id, token) = granted(&r).await;
+    let hash = GrantTokenHash::of(&token);
+    let live = state.register_live(hash);
+    let closed = live.revoked();
+    let (hook, reached, release) = blocking_hook();
+    *storage.before_native_remove.lock() = Some(hook);
+
+    // Boxed, so dropping it really drops the future.
+    let mut revoke = Box::pin(state.revoke(caps.clone(), hash));
+    tokio::select! {
+        biased;
+        _ = &mut revoke => panic!("the delete is held by the hook"),
+        _ = std::future::ready(()) => {}
+    }
+    drop(revoke);
+    wait_reached(reached).await;
+    release.send(()).ok();
+    tokio::time::timeout(Duration::from_secs(5), closed.cancelled())
+        .await
+        .expect("the live connection is closed");
+    assert!(!state.0.pending.lock().contains_key(&request_id));
+    assert_eq!(caps.native_grant_count().unwrap(), 0);
+}
+
+/// The delete failing or panicking does not stop the live connection being
+/// closed or the request being dropped. Multi-thread: the panic is in the
+/// blocking pool.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revoke_closes_connections_when_the_delete_fails_or_panics() {
+    for panics in [false, true] {
+        let (state, caps, storage) = flaky_state();
+        let r = router(&state);
+        let (request_id, token) = granted(&r).await;
+        let hash = GrantTokenHash::of(&token);
+        let live = state.register_live(hash);
+        if panics {
+            *storage.before_native_remove.lock() =
+                Some(Box::new(|| panic!("injected delete panic")));
+        } else {
+            storage
+                .fail_native_remove
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        assert!(state.revoke(caps.clone(), hash).await.is_err());
+        assert!(live.revoked().is_cancelled(), "panics: {panics}");
+        assert!(!state.0.pending.lock().contains_key(&request_id));
+    }
+}
+
+/// The same with the delete panicking inline (current-thread runtime): the
+/// revocation task unwinds, and its drop guard still closes the connection.
+#[tokio::test]
+async fn revoke_closes_connections_when_the_delete_panics_inline() {
+    let (state, caps, storage) = flaky_state();
+    let r = router(&state);
+    let (request_id, token) = granted(&r).await;
+    let hash = GrantTokenHash::of(&token);
+    let live = state.register_live(hash);
+    *storage.before_native_remove.lock() = Some(Box::new(|| panic!("injected delete panic")));
+    assert!(state.revoke(caps, hash).await.is_err());
+    assert!(live.revoked().is_cancelled());
+    assert!(!state.0.pending.lock().contains_key(&request_id));
+}
+
+/// A collecting poll whose client goes away mid-write does not wedge the
+/// request: the write finishes, and the next poll collects the token.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dropped_collecting_poll_does_not_wedge_the_request() {
+    let (state, caps, storage) = flaky_state();
+    let r = router(&state);
+    let (request_id, approve_id) = create(&r).await;
+    approve(&r, &approve_id).await;
+    let (hook, reached, release) = blocking_hook();
+    *storage.after_native_get.lock() = Some(Box::new(move |_| hook()));
+    let first = {
+        let r = r.clone();
+        let id = request_id.clone();
+        tokio::spawn(async move { send(&r, poll_req(&id)).await })
+    };
+    wait_reached(reached).await;
+    first.abort();
+    drop(first.await);
+    release.send(()).ok();
+    let (status, body) =
+        tokio::time::timeout(Duration::from_secs(10), send(&r, poll_req(&request_id)))
+            .await
+            .unwrap();
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(caps.native_grant_count().unwrap(), 1);
+}
+
+/// The same, revoked while the abandoned write is still running: the write's
+/// own cleanup removes the row it made, also when the write reported an error
+/// after committing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dropped_collecting_poll_revoked_mid_write_leaves_no_row() {
+    for commit_then_err in [false, true] {
+        let (state, caps, storage) = flaky_state();
+        let r = router(&state);
+        let (request_id, approve_id) = create(&r).await;
+        approve(&r, &approve_id).await;
+        let hash = approved_hash(&state, &request_id);
+        storage
+            .native_insert_commits_then_errs
+            .store(commit_then_err, std::sync::atomic::Ordering::SeqCst);
+        let (hook, reached, release) = blocking_hook();
+        *storage.after_native_get.lock() = Some(Box::new(move |_| hook()));
+        let first = {
+            let r = r.clone();
+            let id = request_id.clone();
+            tokio::spawn(async move { send(&r, poll_req(&id)).await })
+        };
+        wait_reached(reached).await;
+        first.abort();
+        drop(first.await);
+        // No row yet, so the revoke itself finds nothing to delete.
+        assert!(!state.revoke(caps.clone(), hash).await.unwrap());
+        release.send(()).ok();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let inserted = storage
+                .native_inserts
+                .load(std::sync::atomic::Ordering::SeqCst);
+            if inserted == 1 && caps.native_grant_count().unwrap() == 0 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "inserts {inserted}, commit_then_err {commit_then_err}"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            send(&r, poll_req(&request_id)).await.0,
+            StatusCode::NOT_FOUND
+        );
+    }
+}
+
+/// A poll arriving while a revocation's delete is still running gets 404: the
+/// request is dropped before the delete, so the token cannot be collected (or
+/// stored again) in that window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_poll_during_a_revocation_gets_404() {
+    let (state, caps, storage) = flaky_state();
+    let r = router(&state);
+    let (request_id, token) = granted(&r).await;
+    let hash = GrantTokenHash::of(&token);
+    let (hook, reached, release) = blocking_hook();
+    *storage.before_native_remove.lock() = Some(hook);
+    let revoking = {
+        let state = state.clone();
+        let caps = caps.clone();
+        tokio::spawn(async move { state.revoke(caps, hash).await })
+    };
+    wait_reached(reached).await;
+    let (status, body) = send(&r, poll_req(&request_id)).await;
+    release.send(()).ok();
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert!(revoking.await.unwrap().unwrap());
+    assert_eq!(caps.native_grant_count().unwrap(), 0);
+}
+
+/// The store task panicking inline (current-thread runtime) does not leave
+/// the request marked `storing`: the poll gets 503, and a later poll stores.
+#[tokio::test(start_paused = true)]
+async fn a_panicking_store_does_not_wedge_the_request() {
+    let (state, caps, storage) = flaky_state();
+    let r = router(&state);
+    let (request_id, approve_id) = create(&r).await;
+    approve(&r, &approve_id).await;
+    *storage.after_native_get.lock() = Some(Box::new(|_| panic!("injected store panic")));
+    assert_eq!(
+        send(&r, poll_req(&request_id)).await.0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    let (status, body) = send(&r, poll_req(&request_id)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(caps.native_grant_count().unwrap(), 1);
+}
+
+/// `off_thread` maps a panicking closure to `None`, and the connect-time
+/// lookup maps that to `Unavailable` (retry), not "not found".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn off_thread_panic_maps_to_none_and_to_unavailable() {
+    assert!(off_thread(|| -> u8 { panic!("injected") }).await.is_none());
+    assert_eq!(off_thread(|| 7u8).await, Some(7));
+    let (state, caps, storage) = flaky_state();
+    let token = GrantToken::generate();
+    assert!(
+        caps.create_native_grant(token.hash(), AppIdentity::WebApp(app_id()), "x")
+            .unwrap()
+    );
+    *storage.after_native_get.lock() = Some(Box::new(|_| panic!("injected read panic")));
+    assert!(matches!(
+        resolve(&state, token.expose()).await,
+        GrantLookup::Unavailable
+    ));
+    assert!(state.0.live.lock().is_empty(), "no leaked registration");
+}
+
+/// A denial given late is collectable for the full window after the answer.
+#[tokio::test(start_paused = true)]
+async fn a_late_denial_gets_the_full_collection_window() {
+    let (state, _) = new_state();
+    let r = router(&state);
+    let (request_id, approve_id) = create(&r).await;
+    tokio::time::advance(REQUEST_TTL - Duration::from_secs(5)).await;
+    let nonce = open_page(&r, &approve_id).await;
+    assert_eq!(
+        send(
+            &r,
+            approve_req(&approve_id, &nonce, false, Some(SELF_ORIGIN))
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    tokio::time::advance(REQUEST_TTL - Duration::from_secs(5)).await;
+    let (status, body) = send(&r, poll_req(&request_id)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json(&body)["status"], "denied");
+    tokio::time::advance(Duration::from_secs(10)).await;
+    assert_eq!(
+        send(&r, poll_req(&request_id)).await.0,
+        StatusCode::NOT_FOUND
+    );
+}
+
+/// Bodies are parsed only after the gate: a refused caller's malformed body
+/// gets the gate's refusal, not a parse error.
+#[tokio::test]
+async fn bodies_are_parsed_after_the_gate() {
+    let (state, _) = new_state();
+    let lan = router_with(&state, false, SocketAddr::from(([192, 168, 1, 7], 50000)));
+    let bad = Request::post(ROUTE_REQUEST)
+        .header("host", HOST)
+        .header("content-type", "application/json")
+        .body(Body::from("not json"))
+        .unwrap();
+    assert_eq!(send(&lan, bad).await.0, StatusCode::FORBIDDEN);
+    let r = router(&state);
+    let bad = Request::post(ROUTE_REQUEST)
+        .header("host", HOST)
+        .header("content-type", "application/json")
+        .body(Body::from("not json"))
+        .unwrap();
+    assert_eq!(send(&r, bad).await.0, StatusCode::BAD_REQUEST);
+    let not_json = Request::post(ROUTE_REQUEST)
+        .header("host", HOST)
+        .header("content-type", "text/plain")
+        .body(Body::from(
+            serde_json::json!({ "app": app_id().to_string() }).to_string(),
+        ))
+        .unwrap();
+    assert_eq!(
+        send(&r, not_json).await.0,
+        StatusCode::UNSUPPORTED_MEDIA_TYPE
+    );
 }

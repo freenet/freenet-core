@@ -46,6 +46,19 @@ pub const AUTH_TOKEN_UNAVAILABLE_ERROR: &str = "AUTH_TOKEN_UNAVAILABLE";
 /// Mirrors HTTP 503.
 pub const AUTH_TOKEN_UNAVAILABLE_CLOSE_CODE: u16 = 4503;
 
+/// Error prefix sent before a [`AUTH_TOKEN_NOT_USABLE_HERE_CLOSE_CODE`] close.
+pub const AUTH_TOKEN_NOT_USABLE_HERE_ERROR: &str = "AUTH_TOKEN_NOT_USABLE_HERE";
+
+/// WebSocket close code for a token sent in the `Authorization` header that
+/// this connection cannot use as a native app grant (#5264): the connection is
+/// not local, its `Host` is not loopback, or it carries forwarding headers, so
+/// the grant store is not consulted at all. Unlike
+/// [`AUTH_TOKEN_INVALID_CLOSE_CODE`] this says nothing about the token itself:
+/// a native client must keep it and connect to the node directly over
+/// loopback. A stale shell-page token (sent in the query string) still gets
+/// 4401. Mirrors HTTP 403.
+pub const AUTH_TOKEN_NOT_USABLE_HERE_CLOSE_CODE: u16 = 4403;
+
 /// What the upgrade found out about the connection's auth token.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TokenCheck {
@@ -56,18 +69,33 @@ pub(crate) enum TokenCheck {
     /// A token that could not be checked right now; see
     /// [`AUTH_TOKEN_UNAVAILABLE_CLOSE_CODE`].
     Unavailable,
+    /// A header token this connection cannot use as a grant; see
+    /// [`AUTH_TOKEN_NOT_USABLE_HERE_CLOSE_CODE`].
+    NotUsableHere,
 }
 
-/// How a token that is not a shell-page token is treated, given the native
-/// app grant lookup (`None` when the grant lookup did not apply to this
-/// connection). A store that could not be consulted must stay
-/// [`TokenCheck::Unavailable`] (4503, retry), never become
+/// Whether the native app grant lookup applies to an upgrade.
+enum GrantGate {
+    /// Look the token up in the grant store.
+    Applies(AppGrantState),
+    /// A header token on a connection that may not use a grant (not local,
+    /// non-loopback `Host`, forwarding headers).
+    NotHere,
+    /// No grant can apply: no grant state on this router, a hosted node, or a
+    /// token taken from the query string.
+    NoGrants,
+}
+
+/// The outcome of a grant lookup. A store that could not be consulted must
+/// stay [`TokenCheck::Unavailable`] (4503, retry), never become
 /// [`TokenCheck::Invalid`] (4401), or a client would discard a valid token.
-fn token_check_for_grant(lookup: Option<&GrantLookup>) -> TokenCheck {
+/// Returning the grant itself in `Ok` means only a found grant can open the
+/// connection.
+fn grant_outcome(lookup: GrantLookup) -> Result<LiveGrant, TokenCheck> {
     match lookup {
-        Some(GrantLookup::Granted(_)) => TokenCheck::Valid,
-        Some(GrantLookup::Unavailable) => TokenCheck::Unavailable,
-        Some(GrantLookup::NotFound) | None => TokenCheck::Invalid,
+        GrantLookup::Granted(grant) => Ok(grant),
+        GrantLookup::Unavailable => Err(TokenCheck::Unavailable),
+        GrantLookup::NotFound => Err(TokenCheck::Invalid),
     }
 }
 
@@ -260,7 +288,8 @@ use super::{ClientError, ClientEventsProxy, ClientId, ConnectionScope, HostResul
 use crate::client_events::user_op_rate_limit::UserOpRateLimiter;
 use crate::server::client_api::OriginContractMap;
 use crate::server::client_api::app_grants::{
-    AppGrantState, GrantLookup, LiveGrantGuard, redact_uri_for_log, upgrade_may_use_grant,
+    AppGrantState, GrantLookup, LiveGrant, LiveGrantGuard, redact_uri_for_log,
+    upgrade_may_use_grant,
 };
 use crate::wasm_runtime::UserSecretContext;
 
@@ -1329,12 +1358,16 @@ async fn websocket_commands(
     // connection classified as local, the only kind that can carry an attested
     // app identity. Anything else skips the lookup entirely: no store read, no
     // live registration.
-    let app_grants = app_grants.map(|Extension(g)| g).filter(|_| {
-        !hosted_mode.0
-            && token_from_header.is_some_and(|Extension(h)| h.0)
-            && upgrade_may_use_grant(&headers)
-            && connection_scope == ConnectionScope::Local
-    });
+    let grant_gate = match app_grants.map(|Extension(g)| g) {
+        Some(g) if !hosted_mode.0 && token_from_header.is_some_and(|Extension(h)| h.0) => {
+            if upgrade_may_use_grant(&headers) && connection_scope == ConnectionScope::Local {
+                GrantGate::Applies(g)
+            } else {
+                GrantGate::NotHere
+            }
+        }
+        _ => GrantGate::NoGrants,
+    };
     let on_upgrade = move |ws: WebSocket| async move {
         // Held for the connection's life when it was opened with a native app
         // grant; revoking the grant cancels it and closes the connection.
@@ -1349,22 +1382,22 @@ async fn websocket_commands(
                 tracing::trace!(contract_id = ?origin.contract_id, "Found token in origin_contracts map");
                 Ok(origin.contract_id)
             } else {
-                let lookup = match app_grants.as_ref() {
-                    Some(g) => Some(g.resolve_connection(token).await),
-                    None => None,
-                };
-                match (token_check_for_grant(lookup.as_ref()), lookup) {
-                    // A user-approved native app grant (#5264). From here on the
-                    // connection is handled exactly as a shell-page token for
-                    // the same app: same `(token, contract)` pair, same scope
-                    // gate.
-                    (TokenCheck::Valid, Some(GrantLookup::Granted(grant))) => {
-                        tracing::debug!(contract_id = %grant.contract_id, "Connection opened with a native app grant");
-                        live_grant = Some(grant.guard);
-                        Ok(grant.contract_id)
-                    }
-                    (TokenCheck::Valid, _) => Err(TokenCheck::Invalid),
-                    (check, _) => Err(check),
+                match &grant_gate {
+                    GrantGate::Applies(g) => match grant_outcome(g.resolve_connection(token).await)
+                    {
+                        // A user-approved native app grant (#5264). From here
+                        // on the connection is handled exactly as a shell-page
+                        // token for the same app: same `(token, contract)`
+                        // pair, same scope gate.
+                        Ok(grant) => {
+                            tracing::debug!(contract_id = %grant.contract_id, "Connection opened with a native app grant");
+                            live_grant = Some(grant.guard);
+                            Ok(grant.contract_id)
+                        }
+                        Err(check) => Err(check),
+                    },
+                    GrantGate::NotHere => Err(TokenCheck::NotUsableHere),
+                    GrantGate::NoGrants => Err(TokenCheck::Invalid),
                 }
             };
             match grant {
@@ -1376,6 +1409,12 @@ async fn websocket_commands(
                         "Could not check an auth token against app grants now; asking the client to retry"
                     );
                     (None, TokenCheck::Unavailable)
+                }
+                Err(TokenCheck::NotUsableHere) => {
+                    tracing::debug!(
+                        "Auth token is not a shell-page token, and this connection cannot use an app grant"
+                    );
+                    (None, TokenCheck::NotUsableHere)
                 }
                 Err(check) => {
                     // Rate-limit warnings: only log once per unique token to avoid log spam
@@ -1557,19 +1596,24 @@ async fn websocket_interface(
     // endless retry loops on a stale token, and keeps a native client from
     // discarding a valid grant token while the node is starting.
     if token_check != TokenCheck::Valid {
-        let (prefix, explanation, close_code) = if token_check == TokenCheck::Unavailable {
-            (
+        let (prefix, explanation, close_code) = match token_check {
+            TokenCheck::Unavailable => (
                 AUTH_TOKEN_UNAVAILABLE_ERROR,
                 "The node could not check this token right now. Keep the token and retry shortly.",
                 AUTH_TOKEN_UNAVAILABLE_CLOSE_CODE,
-            )
-        } else {
-            (
+            ),
+            TokenCheck::NotUsableHere => (
+                AUTH_TOKEN_NOT_USABLE_HERE_ERROR,
+                "This connection cannot use an app grant. Keep the token and connect to the \
+                 node directly over loopback.",
+                AUTH_TOKEN_NOT_USABLE_HERE_CLOSE_CODE,
+            ),
+            TokenCheck::Invalid | TokenCheck::Valid => (
                 AUTH_TOKEN_INVALID_ERROR,
                 "The auth token is no longer valid. This usually happens after a node restart. \
                  Please refresh the page to get a new token.",
                 AUTH_TOKEN_INVALID_CLOSE_CODE,
-            )
+            ),
         };
         let error_msg = format!("{prefix}: {explanation}");
         let error: ClientError = ErrorKind::Unhandled {
@@ -3313,15 +3357,92 @@ mod tests {
     #[test]
     fn grant_lookup_maps_unavailable_to_retry_and_missing_to_invalid() {
         use crate::server::client_api::app_grants::GrantLookup;
+        assert!(matches!(
+            grant_outcome(GrantLookup::Unavailable),
+            Err(TokenCheck::Unavailable)
+        ));
+        assert!(matches!(
+            grant_outcome(GrantLookup::NotFound),
+            Err(TokenCheck::Invalid)
+        ));
+    }
+
+    /// The token-check close codes through the REAL client-API composition
+    /// (`serve_client_api_in_impl`, all layers, a real listener): no node runs
+    /// behind it, so the grant store is unavailable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn grant_token_close_codes_through_the_real_upgrade() {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let config = crate::config::WebsocketApiConfig {
+            address: std::net::Ipv4Addr::LOCALHOST.into(),
+            port,
+            ..Default::default()
+        };
+        let (_gw, mut proxy) =
+            crate::server::serve_client_api_with_listener_for_unit_test(config, listener)
+                .await
+                .unwrap();
+        // Assign connection ids, as the node's client loop would.
+        tokio::spawn(async move { while proxy.recv().await.is_ok() {} });
+
+        async fn close_code(port: u16, host: &str, header_token: bool) -> Option<u16> {
+            let token = "a-token-that-is-not-a-shell-page-token";
+            let query = if header_token {
+                String::new()
+            } else {
+                format!("&authToken={token}")
+            };
+            let url =
+                format!("ws://127.0.0.1:{port}/v1/contract/command?encodingProtocol=native{query}");
+            let mut request = url.as_str().into_client_request().unwrap();
+            request
+                .headers_mut()
+                .insert(axum::http::header::HOST, host.parse().unwrap());
+            if header_token {
+                request.headers_mut().insert(
+                    axum::http::header::AUTHORIZATION,
+                    format!("Bearer {token}").parse().unwrap(),
+                );
+            }
+            let (mut client, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while let Some(frame) = client.next().await {
+                    #[allow(
+                        clippy::wildcard_enum_match_arm,
+                        reason = "only the close frame matters here"
+                    )]
+                    match frame.ok()? {
+                        tokio_tungstenite::tungstenite::Message::Close(Some(cf)) => {
+                            return Some(u16::from(cf.code));
+                        }
+                        tokio_tungstenite::tungstenite::Message::Close(None) => return None,
+                        _ => continue,
+                    }
+                }
+                None
+            })
+            .await
+            .expect("timed out waiting for the close frame")
+        }
+
+        let local = format!("127.0.0.1:{port}");
         assert_eq!(
-            token_check_for_grant(Some(&GrantLookup::Unavailable)),
-            TokenCheck::Unavailable
+            close_code(port, &local, true).await,
+            Some(AUTH_TOKEN_UNAVAILABLE_CLOSE_CODE),
+            "a header token on loopback, store unavailable: retry"
         );
         assert_eq!(
-            token_check_for_grant(Some(&GrantLookup::NotFound)),
-            TokenCheck::Invalid
+            close_code(port, "evil.example:7509", true).await,
+            Some(AUTH_TOKEN_NOT_USABLE_HERE_CLOSE_CODE),
+            "a header token with a non-loopback Host: the grant is not consulted"
         );
-        assert_eq!(token_check_for_grant(None), TokenCheck::Invalid);
+        assert_eq!(
+            close_code(port, &local, false).await,
+            Some(AUTH_TOKEN_INVALID_CLOSE_CODE),
+            "a query-string token is never a grant: the shell's stale-token code"
+        );
     }
 
     /// A token the node could not check (native app grant store unavailable,
