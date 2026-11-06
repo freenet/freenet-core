@@ -738,10 +738,11 @@ Rate calculation on every rate update (peer_connection::paced_rate; #6047):
   to bandwidth_limit) and fixes the bucket's capacity (initial_rate / 10) for
   the connection's life, so a bandwidth-limit above cc_rate must NOT raise it
   (#3702 burst). The global share is still taken as is, as before #6047.
-  Only stream fragments draw on the bucket; short messages, ACKs and
-  retransmits are unpaced.
-  QUIC has no bucket. The same rate (QuicRateLimit::rate, which calls
-  paced_rate) caps each QUIC connection's congestion window instead:
+  Only stream fragments draw on the bucket (and, with a limit set, QUIC data
+  writes); short messages, ACKs and retransmits are unpaced.
+  QUIC data is paced by the same bucket when a limit is set (the path
+  pacer, below). The same rate (QuicRateLimit::rate, which calls
+  paced_rate) also caps each QUIC connection's congestion window:
   recycle::CappedCubic::window = min(Cubic's window, max(rate x RTT,
   window_floor)): the cap never goes below window_floor (two full datagrams
   and one byte, 2401 B: quinn refuses
@@ -759,11 +760,30 @@ Rate calculation on every rate update (peer_connection::paced_rate; #6047):
   does not hold where rate x RTT is under the floor: there a path keeps two
   datagrams in flight, about 2400 B per round trip (at the 64 KiB/s minimum,
   any round trip under about 37 ms; pinned by
-  the_floor_keeps_two_datagrams_in_flight_both_ways). A QUIC path is not a
-  connection to GlobalBandwidthManager: it rides on its UDP connection and
-  takes that connection's full share, so a peer whose traffic is split across
-  both transports can get up to twice its share (the egress cap still bounds
-  the node). e5b-6 decides whether one peer's streams stay on one transport.
+  the_floor_keeps_two_datagrams_in_flight_both_ways). On loopback a path ran
+  at 3.4 to 34 MB/s with 500 kB/s set.
+  Path pacer (quic/path/pacer.rs): with bandwidth-limit or
+  total-bandwidth-limit set (PeerConnection::path_pacer), every path of the
+  connection draws its data writes from the connection's token bucket, the
+  one its UDP stream fragments draw on, so the limit holds at any round trip
+  and a peer's two transports share one rate. Charged: each write of a
+  Stream or pipe (header, metadata, payload) and of a Short past one packet.
+  Not charged, as on UDP: one-packet Shorts and control frames, which never
+  wait behind data. With no limit nothing is paced (the bucket then runs at
+  the controller's rate, which nobody set). A write reserves with
+  reserve_within, limited to what the send's current deadline leaves, and
+  waits in the send's own task; a refused reservation takes nothing and
+  ends the send as at that deadline: NotOpened(TimedOut) before the stream
+  opened (header and metadata are taken before open_uni), Failed(TimedOut)
+  after (the stream is reset). Bytes taken for a write not made go back. A
+  pacer wait or refusal counts as progress for the stall count
+  (StallCount::note_pacer), as a cap hold does, so a binding limit never
+  closes a busy path. The bucket and its waits run on the connection's
+  clock, the deadlines on the path's; in simulation those differ (real time
+  against the network's virtual time). Pinned by quic::path::tests::pacer,
+  timeouts_after_pacer_holds_do_not_close_a_busy_path,
+  a_data_route_is_paced_only_when_the_session_has_a_pacer and
+  quic_data_is_paced_by_the_connection_bucket_only_under_a_limit.
   Under a saturated egress cap, the window cap apportions it only when the
   per-connection share is below the cap. With the minimum per connection set
   below the share (two connections, one flow each, equal RTT),
