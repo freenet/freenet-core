@@ -21088,7 +21088,9 @@ fn test_quic_data_carries_a_stream_end_to_end() {
 /// the run. A path that came up without data is recycled when the share reaches
 /// its pair, so by 24 h, plus a recheck and the time to set up again, every
 /// pair with a path carries data. Nothing is recycled during the first 6 h,
-/// when the share stays at 5%, and no node recycles a pair twice.
+/// when the share stays at 5%, no node recycles a pair twice, and no pair is
+/// recycled before the share covers it (each node notes its data-share decisions
+/// in the trace: the pair's bucket and the percent).
 #[test_log::test]
 fn test_quic_data_ramp_turns_on_every_pair_within_a_day() {
     const SEED: u64 = 0x5940_7A00_0002;
@@ -21146,6 +21148,40 @@ fn test_quic_data_ramp_turns_on_every_pair_within_a_day() {
     assert!(
         recycles.iter().all(|r| r.at >= 6 * HOUR),
         "nothing is recycled at 5%: {}",
+        run.dump()
+    );
+    // Negative: a pair is recycled only once the share covers it. The node's
+    // latest data-share decision for the pair at or before the recycle had the
+    // pair's bucket below the percent; a pair above the share is never recycled.
+    let share_of = |what: &str| -> Option<(u8, u8)> {
+        let rest = what.strip_prefix("data share: bucket ")?;
+        let (bucket, rest) = rest.split_once(", percent ")?;
+        let (percent, _) = rest.split_once(", caps ")?;
+        Some((bucket.parse().ok()?, percent.parse().ok()?))
+    };
+    for recycle in &recycles {
+        let decided = records
+            .iter()
+            .filter(|r| pair(r) == pair(recycle) && r.at <= recycle.at)
+            .filter_map(|r| share_of(&r.what))
+            .last();
+        let Some((bucket, percent)) = decided else {
+            panic!("a recycle with no share decision before it: {}", run.dump());
+        };
+        assert!(
+            bucket < percent,
+            "{:?} recycled at {:?} with bucket {bucket} at {percent}%: {}",
+            pair(recycle),
+            recycle.at,
+            run.dump()
+        );
+    }
+    assert!(
+        records
+            .iter()
+            .filter_map(|r| share_of(&r.what))
+            .any(|(bucket, percent)| bucket >= percent),
+        "premise: some decision found a pair above the share: {}",
         run.dump()
     );
     let distinct: std::collections::BTreeSet<_> = recycles.iter().map(|r| pair(r)).collect();

@@ -485,11 +485,30 @@ Current wire-gated floors:
   requires real upgrades once the crate reaches 0.2.154, so raising the floor also
   means moving `QUIC_FIRST_NEGOTIATING_RELEASE` beside it.
 
-- `QUIC_DATA_PERCENT` in `crates/core/src/transport/quic/upgrade/policy.rs` (the
-  share of pairs that carry data on QUIC, #5940). It stays at its value unless
-  this release is a rollout step (0, 5, 25, 100), changed in its own PR. That PR also edits the expectations that pin 0:
-  `assert_eq!(QUIC_DATA_PERCENT, 0, ...)` in `policy.rs` and the
-  `quic-data-release-share` case in `simulation_integration.rs`.
+- `QUIC_DATA_RAMP_START` in `crates/core/src/transport/quic/upgrade/policy.rs`
+  (#5940): when the QUIC data ramp starts, in Unix seconds, or `None` (no pair
+  carries data). It is `None` in tree. For the ramp release, a small reviewed PR
+  sets it to the planned publish time (T0) just before the soak, and it stays set
+  afterwards: from T0 the share of pairs carrying data is 5% for 6 h, then rises
+  to 25% at 12 h and 100% at 24 h, and stays at 100% (see "Data slice" in
+  `.claude/rules/transport.md`). Publishing later than T0 only moves the curve
+  earlier for the nodes that update first; a node whose clock reads before T0
+  gets 5%. That PR also updates the expectation that pins the release's share,
+  the `quic-data-release-share` case in `simulation_integration.rs`.
+
+  Reading the ramp: each node logs at INFO when its share enters a new band
+  ("QUIC data: this node offers data to this share of its pairs", with
+  `data_percent`). In telemetry, `quic_enabled_data_paths` and
+  `quic_live_data_paths` count paths carrying data, the
+  `quic_close_sent_recycle_for_data` / `quic_close_received_recycle_for_data`
+  counts are paths recycled to take data as the share reaches them (expected,
+  not a fault), and the `quic_loss_rate_*` families give per-path loss.
+
+  Emergency stop: a default-off release, built, soaked and parked before the ramp
+  release is cut, is published through the normal auto-update stagger (0 to 4 h).
+  It turns QUIC off on every node that did not set `transport-quic` itself (the
+  default is read, never written to `config.toml`); nodes that set the key keep
+  their setting. Per-path fallback to UDP needs no release.
 
 When a NEW wire-gated feature first ships (not this one), set its floor to
 **exactly that release version** and freeze it, as described above.

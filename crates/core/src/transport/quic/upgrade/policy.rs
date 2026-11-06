@@ -271,6 +271,12 @@ impl QuicPolicy {
         self.own_caps_with(self.share, local, peer, now)
     }
 
+    /// The policy's data share. Tests only.
+    #[cfg(any(test, feature = "testing"))]
+    pub(in crate::transport) fn share(&self) -> DataShare {
+        self.share
+    }
+
     /// [`Self::own_caps`] with `share` in place of the policy's (a simulation's
     /// own ramp start).
     pub(in crate::transport) fn own_caps_with(

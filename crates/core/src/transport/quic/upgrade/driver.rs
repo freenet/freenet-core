@@ -612,6 +612,24 @@ impl QuicUpgrades {
     /// This node's caps on a path to `peer`, from the share at the wall clock now
     /// ([`QuicPolicy::own_caps`]). A test's trace may give the ramp a start of
     /// its own.
+    /// What a test's trace notes of a data-share decision for `peer`: the pair's
+    /// bucket and the share now (`slice`).
+    #[cfg(any(test, feature = "testing"))]
+    fn share_note(&self, peer: &TransportPublicKey, caps: u32) -> String {
+        let share = self
+            .trace
+            .as_ref()
+            .and_then(|t| t.data_ramp_start())
+            .map_or(self.policy.share(), |start_unix_secs| {
+                super::policy::DataShare::Ramp { start_unix_secs }
+            });
+        format!(
+            "data share: bucket {}, percent {}, caps {caps}",
+            super::slice::bucket(&self.local_key, peer),
+            share.percent_at(self.path_clock.wall_now()),
+        )
+    }
+
     fn own_caps(&self, peer: &TransportPublicKey) -> u32 {
         let now = self.path_clock.wall_now();
         #[cfg(any(test, feature = "testing"))]
@@ -697,7 +715,13 @@ impl Session {
 
     fn step(&self, state: &mut SessionState, event: Event) -> Vec<Action> {
         let key = state.peer_key.clone();
-        let own_caps = || key.as_ref().map_or(0, |key| self.hub.own_caps(key));
+        let own_caps = || {
+            key.as_ref().map_or(0, |key| {
+                let caps = self.hub.own_caps(key);
+                self.note_share(key, caps);
+                caps
+            })
+        };
         let inputs = Inputs {
             now: (self.now)(),
             sample: GlobalRng::random_range(0.0..1.0),
@@ -1263,6 +1287,7 @@ impl Session {
         }
         let backoff = self.hub.seeds.lock().seed_for(&key);
         let own_caps = self.hub.own_caps(&key);
+        self.note_share(&key, own_caps);
         let sends = {
             let mut state = self.state.lock();
             if state.ended {
@@ -1329,6 +1354,15 @@ impl Session {
             });
         }
         self.note(|| "session ended".to_string());
+    }
+
+    /// Note a data-share decision for the peer in a test's trace
+    /// (`data share: bucket B, percent P, caps C`).
+    fn note_share(&self, peer: &TransportPublicKey, caps: u32) {
+        #[cfg(any(test, feature = "testing"))]
+        self.note(|| self.hub.share_note(peer, caps));
+        #[cfg(not(any(test, feature = "testing")))]
+        let _ = (peer, caps);
     }
 
     /// Write a line to a test's trace, when it has one.
