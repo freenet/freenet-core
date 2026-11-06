@@ -5462,25 +5462,21 @@ mod egress_cap_tests {
             ),
         )
         .await;
-        let sent = match sent {
-            CappedAttempt::Retry => {
-                run_virtual(
-                    &time,
-                    capped_attempt(
-                        &socket,
-                        cap,
-                        &bucket,
-                        &time,
-                        &mut pacing,
-                        &mut payment,
-                        1_000,
-                    ),
-                )
-                .await
-            }
-            other => other,
-        };
-        assert!(matches!(sent, CappedAttempt::Send(Some(_))));
+        assert!(
+            matches!(sent, CappedAttempt::Retry),
+            "it waited for the refill at its place, then re-checks cwnd"
+        );
+        let sent = capped_attempt(
+            &socket,
+            cap,
+            &bucket,
+            &time,
+            &mut pacing,
+            &mut payment,
+            1_000,
+        )
+        .now_or_never();
+        assert!(matches!(sent, Some(CappedAttempt::Send(Some(_)))));
         assert!(
             cap.poll_admit(1_200, &mut other, &mut cx).is_pending(),
             "the later sender is still behind"
