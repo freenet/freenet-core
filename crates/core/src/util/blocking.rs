@@ -85,46 +85,6 @@ mod tests {
         assert!(err.to_string().contains("walk failed"), "{err}");
     }
 
-    /// `Ring`'s disk-usage maintenance loop awaits a blocking walk every tick.
-    /// Through a bare `spawn_blocking` its resume step followed OS scheduling,
-    /// and `hierarchical_routing_simulation_ab_seed_0002` gave a different
-    /// scarce-GET rate from run to run on one seed (#6123). Comment lines are
-    /// skipped, so commenting the call out fails this as well as reverting it.
-    #[test]
-    fn ring_disk_maintenance_goes_through_offload_blocking() {
-        const RING: &str = include_str!("../ring.rs");
-        let code: Vec<&str> = RING
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("//"))
-            .collect();
-        let bare: Vec<&&str> = code
-            .iter()
-            .filter(|line| line.contains("spawn_blocking("))
-            .collect();
-        assert!(
-            bare.is_empty(),
-            "ring.rs awaits a bare spawn_blocking; use offload_blocking (#6123): {bare:?}"
-        );
-        let offloaded = code
-            .iter()
-            .filter(|line| line.contains("offload_blocking(move ||"))
-            .count();
-        assert_eq!(
-            offloaded, 1,
-            "the disk-usage walk in ring.rs must run through offload_blocking"
-        );
-        let walk = RING
-            .split_once("offload_blocking(move ||")
-            .map(|(_, after)| after)
-            .and_then(|after| after.split_once(".await"))
-            .map(|(body, _)| body)
-            .expect("offload_blocking call has a body and an await");
-        assert!(
-            walk.contains("refresh_disk_usage()"),
-            "offload_blocking in ring.rs must wrap the disk-usage walk"
-        );
-    }
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_pool_panic_comes_back_as_an_error() {
         let outcome = offload_blocking(|| -> () { panic!("walk failed") }).await;

@@ -3859,10 +3859,17 @@ impl Ring {
             // du-walks above already ran OUTSIDE any cache lock (in the blocking
             // task); only the O(1) `set_budget_bytes` inside
             // `recompute_effective_budget` takes the cache write lock.
-            let available = ring
-                .hosting_manager
-                .disk_available_bytes()
-                .unwrap_or(u64::MAX);
+            let available = if topology_registry::get_current_network_name().is_some() {
+                // A simulation (only `SimNetwork` sets the network name): use
+                // the failed-read fallback, so free space on the machine
+                // running the tests cannot change eviction between runs of
+                // one seed (#6123).
+                u64::MAX
+            } else {
+                ring.hosting_manager
+                    .disk_available_bytes()
+                    .unwrap_or(u64::MAX)
+            };
             ring.hosting_manager.recompute_effective_budget(available);
         }
     }
@@ -8175,6 +8182,49 @@ mod k_closest_source_tests {
              is_peer_ready in the routability mapping): k_closest falls back to \
              not-ready peers, so a not-ready closer neighbor is still a valid route \
              target and must keep this node from short-circuiting its renewal (#4440)."
+        );
+    }
+
+    /// #6123: the hosting sweep's disk-usage walk goes through
+    /// `offload_blocking`, so a simulation host runs it inline. Through a bare
+    /// `spawn_blocking` it finished on a real OS thread in wall-clock time, the
+    /// step at which the sweep resumed followed OS scheduling, and one seed gave
+    /// different results from run to run. In a simulation the free-space read
+    /// is replaced by a fixed figure for the same reason. Comment lines are
+    /// dropped, so a commented-out call fails this pin too.
+    #[test]
+    fn sweep_disk_walk_runs_inline_in_simulations() {
+        let src = production_source();
+        let body = extract_fn_body(
+            src,
+            "async fn sweep_get_subscription_cache(ring: Arc<Self>, interval_duration: Duration) {",
+        );
+        let code: String = body
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .flat_map(|line| line.chars())
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            !code.contains("spawn_blocking("),
+            "the sweep awaits a bare spawn_blocking; use offload_blocking (#6123)"
+        );
+        let walk = code
+            .split_once("crate::util::blocking::offload_blocking(move||{")
+            .map(|(_, after)| after)
+            .and_then(|after| after.split_once("}).await"))
+            .map(|(walk, _)| walk)
+            .expect("the sweep runs a closure through offload_blocking");
+        assert!(
+            walk.contains("ring_for_disk.hosting_manager.refresh_disk_usage();"),
+            "offload_blocking must wrap the disk-usage walk"
+        );
+        assert!(
+            code.contains(concat!(
+                "letavailable=iftopology_registry::get_current_network_name().is_some(){",
+                "u64::MAX}else{"
+            )),
+            "a simulation must not read the real free space (#6123)"
         );
     }
 
