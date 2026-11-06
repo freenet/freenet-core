@@ -210,23 +210,47 @@ fn a_cap_hold_counts_as_progress() {
     let mut count = StallCount::new(Some(0), 0);
     for second in 0..30u64 {
         let now = QUIET + second * SECOND;
-        assert!(!count.take(&timeouts()[2], false, Some(0), reading(1, true), now));
+        assert!(
+            !count
+                .take(&timeouts()[2], false, Some(0), reading(1, true), now)
+                .close
+        );
     }
     // The hold ends: past the window, eight close the path.
     let free = QUIET + 30 * SECOND + QUIET;
     for _ in 1..STALLED_SENDS_LIMIT {
-        assert!(!count.take(&timeouts()[2], false, Some(0), reading(1, false), free));
+        assert!(
+            !count
+                .take(&timeouts()[2], false, Some(0), reading(1, false), free)
+                .close
+        );
     }
-    assert!(count.take(&timeouts()[2], false, Some(0), reading(1, false), free));
+    assert!(
+        count
+            .take(&timeouts()[2], false, Some(0), reading(1, false), free)
+            .close
+    );
 
     // A hold that stays reported with no new event outlives its validity.
     let mut count = StallCount::new(Some(0), 0);
-    assert!(!count.take(&timeouts()[2], false, Some(0), reading(7, true), 0));
+    assert!(
+        !count
+            .take(&timeouts()[2], false, Some(0), reading(7, true), 0)
+            .close
+    );
     let stale = 61 * SECOND + QUIET;
     for _ in 1..STALLED_SENDS_LIMIT {
-        assert!(!count.take(&timeouts()[2], false, Some(0), reading(7, true), stale));
+        assert!(
+            !count
+                .take(&timeouts()[2], false, Some(0), reading(7, true), stale)
+                .close
+        );
     }
-    assert!(count.take(&timeouts()[2], false, Some(0), reading(7, true), stale));
+    assert!(
+        count
+            .take(&timeouts()[2], false, Some(0), reading(7, true), stale)
+            .close
+    );
 }
 
 /// A real path whose transmits a low egress cap holds, with nothing newly
@@ -276,6 +300,42 @@ fn a_binding_cap_with_no_acknowledgements_keeps_the_path() {
             sender.abort();
         })
         .await;
+    });
+}
+
+/// A timeout that counts makes the path suspect: new sends go on UDP. It stops
+/// being suspect the first time it is asked after the connection acknowledged
+/// something new. A timeout inside the window does not make it suspect.
+#[test]
+fn a_path_with_a_quiet_timeout_is_suspect_until_the_peer_acknowledges() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths("quic-route-suspect", 73, QuicPathLimits::DEFAULT).await;
+        let (a, time) = (p.a.clone(), p.time());
+        let built = time.now_nanos();
+        a.settle(SendKind::Short, &timeouts()[0], false, built + SECOND);
+        assert!(!a.is_suspect(), "inside the window");
+        a.settle(SendKind::Short, &timeouts()[0], false, built + QUIET);
+        assert!(a.is_suspect());
+        assert!(a.is_suspect(), "until something is acknowledged");
+        assert_eq!(a.stats().send_event_count(QuicSendEvent::SuspectEntered), 1);
+        let control = p
+            .drive(async move {
+                a.send_control_bounded(
+                    &time,
+                    Duration::from_secs(5),
+                    QuicControl::Ready {
+                        attempt: 1,
+                        caps: 0,
+                    },
+                )
+                .await
+            })
+            .await;
+        assert!(matches!(control, BoundedSend::Sent), "{control:?}");
+        assert!(!p.a.is_suspect(), "acknowledged again");
+        assert_eq!(p.a.stats().send_event_count(QuicSendEvent::SuspectLeft), 1);
+        assert!(p.a.quinn_connection().close_reason().is_none());
     });
 }
 

@@ -196,7 +196,7 @@ async fn run_worker(
             },
             message = queue.recv(), if queue_open && in_flight.len() < SHORTS_IN_FLIGHT => {
                 match message {
-                    Some(payload) if connected && path.sends_data() => {
+                    Some(payload) if connected && path.sends_data() && !path.is_suspect() => {
                         in_flight.push(send_on_path(&path, &clock, payload));
                     }
                     Some(payload) => send_on_udp(&path, udp.as_ref(), &note, payload).await,
