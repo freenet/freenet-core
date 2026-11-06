@@ -2228,6 +2228,7 @@ impl SimNetwork {
     }
 
     /// The rule for the pair `a`, `b` from `from`.
+    #[cfg(any(test, feature = "testing"))]
     fn quic_datagram_rule(
         &self,
         a: &NodeLabel,
