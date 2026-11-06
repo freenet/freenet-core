@@ -4642,6 +4642,86 @@ mod tests {
         (op_manager, notification_rx, update_query_count, guard)
     }
 
+    /// Applied-payload record, behaviour on both receive drivers: a payload
+    /// already recorded as merged never reaches the contract handler, and the
+    /// skip is counted in the receiver telemetry. The payload is fresh to the
+    /// 60s dedup cache, which is the case this record exists for (a replay
+    /// whose period exceeds that cache's TTL). A payload NOT recorded still
+    /// reaches the handler.
+    #[tokio::test]
+    async fn an_already_applied_payload_never_reaches_the_merge() {
+        use std::sync::atomic::Ordering;
+        let (op_manager, _rx, update_queries, _guard) =
+            build_broadcast_test_node("applied-payload-skip", DeltaOutcome::Success).await;
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([41u8; 32]),
+            CodeHash::new([42u8; 32]),
+        );
+        let sender_addr: SocketAddr = "127.0.0.1:12300".parse().unwrap();
+        let set = &op_manager.ring.applied_payloads;
+
+        // Non-streaming delta, recorded as merged.
+        set.record_absorbed(&key, set.payload_hash(true, &[1, 1, 1]));
+        drive_relay_broadcast_to(
+            &op_manager,
+            Transaction::new::<UpdateMsg>(),
+            key,
+            DeltaOrFullState::Delta(vec![1, 1, 1]),
+            Vec::new(),
+            sender_addr,
+            crate::ring::broadcast_coverage::CoveredPeers::empty(),
+        )
+        .await
+        .expect("skip returns Ok");
+        assert_eq!(
+            update_queries.load(Ordering::Relaxed),
+            0,
+            "an already-applied delta must not be merged again"
+        );
+
+        // The same bytes as a FULL STATE were never merged: not skipped.
+        drive_relay_broadcast_to(
+            &op_manager,
+            Transaction::new::<UpdateMsg>(),
+            key,
+            DeltaOrFullState::FullState(vec![1, 1, 1]),
+            Vec::new(),
+            sender_addr,
+            crate::ring::broadcast_coverage::CoveredPeers::empty(),
+        )
+        .await
+        .expect("merge");
+        assert_eq!(update_queries.load(Ordering::Relaxed), 1);
+
+        // Streaming full state, recorded as merged.
+        set.record_absorbed(&key, set.payload_hash(false, &[2, 2, 2]));
+        apply_streaming_broadcast(
+            &op_manager,
+            Transaction::new::<UpdateMsg>(),
+            key,
+            vec![2, 2, 2],
+            Vec::new(),
+            sender_addr,
+            crate::ring::broadcast_coverage::CoveredPeers::empty(),
+        )
+        .await
+        .expect("skip returns Ok");
+        assert_eq!(
+            update_queries.load(Ordering::Relaxed),
+            1,
+            "an already-applied streaming state must not be merged again"
+        );
+
+        assert_eq!(
+            op_manager
+                .payload_mix
+                .receiver_apply_stats()
+                .already_applied,
+            [1, 1, 3, 3],
+            "each skip is counted once, at the decision, by kind and bytes"
+        );
+    }
+
     /// Convenience wrapper: a node whose stand-in handler fails every delta with
     /// a contract-exec rejection (the common case for the backoff-gate tests).
     async fn build_exec_reject_test_node(
