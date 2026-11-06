@@ -803,7 +803,7 @@ pub(crate) async fn watch_acknowledgements<T: TimeSource>(
     let mut watch = AckWatch::new(ACK_WATCH_WINDOW, first);
     let mut bytes = UdpBytes::of(&connection);
     let mut loss = PathLoss::of(&connection);
-    let mut window = crate::transport::metrics::PathLossWindow::default();
+    let mut window = crate::transport::metrics::PathLossWindow::new(node);
     loop {
         time.sleep(ACK_WATCH_TICK).await;
         if connection.close_reason().is_some() {

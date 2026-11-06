@@ -5091,8 +5091,8 @@ mod tests {
     /// leaves them, and the next period is empty.
     #[test]
     fn quic_path_loss_goes_through_take_snapshot() {
-        let metrics = TransportMetrics::new();
-        let mut window = PathLossWindow::default();
+        let metrics: &'static TransportMetrics = Box::leak(Box::new(TransportMetrics::new()));
+        let mut window = PathLossWindow::new(&metrics.quic_data);
         metrics.quic_data.record_path_loss(
             &mut window,
             crate::transport::quic::recycle::PathLoss {
@@ -5112,7 +5112,11 @@ mod tests {
         assert_eq!(json["quic_congestion_events"], 3);
         assert_eq!(json["quic_loss_rate_lt_1pct"], 1);
         assert!(json.get("quic_loss_rate_zero").is_none(), "a 0 is not sent");
-        assert!(metrics.take_snapshot().is_none(), "the counts were reset");
+        assert!(
+            metrics.take_snapshot().is_none(),
+            "the sums were reset, and the bucket alone is not activity"
+        );
+        assert_eq!(metrics.read_snapshot().quic_data.loss_rate[2], 1, "a gauge");
     }
 
     /// A breaker trip reaches the snapshot and its JSON, counts as activity

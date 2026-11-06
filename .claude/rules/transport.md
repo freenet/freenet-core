@@ -1206,10 +1206,14 @@ a test passes its own; tests read their own, never the global).
   tick of the acknowledgement watch, so a path's last tick before it closes is
   lost); quic_sent_packets, quic_lost_packets, quic_lost_bytes and
   quic_congestion_events (quinn's PathStats, every path including shadow ones, by
-  the same tick); quic_loss_rate_<zero|lt_0_5pct|lt_1pct|lt_2pct|lt_5pct|lt_10pct|
-  lt_20pct|ge_20pct> (paths that sent at least 200 packets in the period, each in
-  the one bucket of its own lost/sent, moved as it changes; a field loss rate
-  without the legacy retransmit ratio's overstatement, and no per-path values);
+  the same tick, sums of the period); quic_loss_rate_<zero|lt_0_5pct|lt_1pct|
+  lt_2pct|lt_5pct|lt_10pct|lt_20pct|ge_20pct> (a gauge of live paths that have sent
+  at least 200 packets since they started, each in the one bucket of its own
+  lost/sent over its life, moved as it changes, out when the path ends; a field
+  loss rate without the legacy retransmit ratio's overstatement, and no per-path
+  values). A shadow path's packets are mostly keepalives and probes, so its rate
+  is of small packets and may understate the loss of data-sized ones. The sums and
+  the buckets are updated and reset under one lock;
   quic_session_ended_with_data_path_<age> (sessions that ended while their
   path's route still carried data); quic_streams_sampled_paths,
   quic_streams_open_ge_<8|16|32|48> and quic_streams_peak_max (per path and period,
