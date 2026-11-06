@@ -780,9 +780,14 @@ Rate calculation on every rate update (peer_connection::paced_rate; #6047):
   leaves, and waits in the send's own task; a refused reservation takes
   nothing and ends the send NotOpened(Paced) before the stream opened
   (header and metadata are taken before open_uni) or Failed(Paced) after
-  (the stream is reset). A message the pacer refused that then goes on UDP
-  is charged to the pacer as debt (QuicPath::charge_fallback), so the two
-  transports together stay near the limit. Bytes taken for a write not made
+  (the stream is reset). A message the pacer refused that UDP then sent is
+  charged to the pacer as debt (QuicPath::charge_fallback, after the UDP send
+  succeeds; a Short refused after open only for what QUIC had not paid), up
+  to FALLBACK_DEBT (half a second at the rate): an unbounded debt refused the
+  next fragment of every stream already open, and a refused open stream is
+  dropped. Each refusal counts quic_data_event_pacer_refused. A total of 0
+  is no cap, so QuicRateLimit::rate ignores the manager then (no pacer, no
+  window cap). Bytes taken for a write not made
   go back. A refusal is never a timeout for the stall count (route.rs
   timed_out); a pacer wait is NOT progress, so a dark paced path still goes
   suspect and closes. Residual, accepted (lead, 2026-11-06): data that falls
@@ -1225,7 +1230,8 @@ recorded where the path decides it, into the path's `QuicPathStats` and the node
 a test passes its own; tests read their own, never the global).
   quic_data_send_<short|large_short|stream|pipe>_<sent|maybe_delivered|
   not_opened_udp|failed_udp|dropped>; quic_data_event_<short_overflow_udp|
-  data_refused|stalled_closed|udp_send_failed>; quic_data_stop_<code> (stops a
+  data_refused|stalled_closed|udp_send_failed|suspect_entered|suspect_left|
+  pacer_refused>; quic_data_stop_<code> (stops a
   peer sent to data sends); quic_inbound_<QuicInboundOutcome> (every receive
   outcome, refusals by frame kind as short_refused_budget and
   stream_refused_budget); quic_enabled_data_paths; quic_live_data_paths (a gauge of

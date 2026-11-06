@@ -204,8 +204,9 @@ impl SendPacer for Scripted {
         self.given_back.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    fn charge(&self, bytes: usize) {
+    fn charge(&self, bytes: usize) -> usize {
         self.charged.fetch_add(bytes, Ordering::Relaxed);
+        bytes
     }
 
     fn sleep(
@@ -230,7 +231,7 @@ fn a_refusal_after_the_stream_opened_resets_it() {
         p.a.pace_with(pacer.clone());
         let (_, outcome) = time_a_stream(&p, 10 * FRAGMENT_PAYLOAD_SIZE).await;
         assert!(
-            matches!(outcome, BoundedSend::Failed(SendFailure::Paced)),
+            matches!(outcome, BoundedSend::Failed(SendFailure::Paced { .. })),
             "{outcome:?}"
         );
         assert_eq!(p.a.send_aborts(), 1, "the stream was reset");
@@ -274,8 +275,8 @@ fn bytes_taken_for_a_write_not_made_go_back() {
             fn give_back(&self, bytes: usize) {
                 self.0.give_back(bytes);
             }
-            fn charge(&self, bytes: usize) {
-                self.0.charge(bytes);
+            fn charge(&self, bytes: usize) -> usize {
+                self.0.charge(bytes)
             }
             fn sleep(
                 &self,
@@ -402,7 +403,11 @@ fn a_charged_fallback_holds_the_next_send_to_the_limit() {
         pacer.reserve_within(10_000, Duration::MAX),
         Ok(Duration::ZERO)
     );
-    pacer.charge(50_000);
+    assert_eq!(
+        pacer.charge(50_000),
+        50_000,
+        "half a second of the rate: all of it"
+    );
     let wait = pacer
         .reserve_within(0, Duration::MAX)
         .expect("no limit to refuse at");
@@ -410,4 +415,84 @@ fn a_charged_fallback_holds_the_next_send_to_the_limit() {
         wait >= Duration::from_millis(490) && wait <= Duration::from_millis(510),
         "50 kB at 100 kB/s: {wait:?}"
     );
+}
+
+/// Fallback debt is bounded at `FALLBACK_DEBT`: under an overload that sends
+/// 50 MB on UDP, QUIC owes half a second, not 500 s, and takes a datagram
+/// again half a second after the overload ends.
+#[test]
+fn fallback_debt_is_bounded_and_quic_resumes_after_an_overload() {
+    use super::super::pacer::FALLBACK_DEBT;
+    let time = VirtualTime::new();
+    let pacer = pacer_at(&time, 100_000);
+    let mut charged = 0;
+    for _ in 0..100 {
+        charged += pacer.charge(500_000);
+    }
+    // The 10 kB burst, then half a second at 100 kB/s.
+    assert_eq!(charged, 60_000, "50 MB sent on UDP, 60 kB charged");
+    let owed = pacer
+        .reserve_within(0, Duration::MAX)
+        .expect("no limit to refuse at");
+    assert_eq!(owed, FALLBACK_DEBT);
+    time.advance(FALLBACK_DEBT);
+    assert_eq!(
+        pacer.reserve_within(1_200, Duration::from_millis(100)),
+        Ok(Duration::from_millis(12)),
+        "QUIC sends again once the bounded debt is paid, at the rate: 1200 B in 12 ms"
+    );
+}
+
+/// A pacer that charges a large fallback (10 MB, as a 1 MB stream refused at a
+/// small share would have) at its `at`th reservation, as a concurrent message
+/// going on UDP does, and otherwise is the limit pacer it wraps.
+struct ChargesMidway {
+    inner: Arc<LimitPacer<VirtualTime>>,
+    at: usize,
+    calls: AtomicUsize,
+}
+
+impl SendPacer for ChargesMidway {
+    fn reserve_within(&self, bytes: usize, limit: Duration) -> Result<Duration, Duration> {
+        if self.calls.fetch_add(1, Ordering::Relaxed) == self.at {
+            self.inner.charge(10_000_000);
+        }
+        self.inner.reserve_within(bytes, limit)
+    }
+
+    fn give_back(&self, bytes: usize) {
+        self.inner.give_back(bytes);
+    }
+
+    fn charge(&self, bytes: usize) -> usize {
+        self.inner.charge(bytes)
+    }
+
+    fn sleep(
+        &self,
+        wait: Duration,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        self.inner.sleep(wait)
+    }
+}
+
+/// A stream already open when another message's fallback is charged finishes:
+/// the charge adds at most half a second to its next write, inside its gap
+/// deadline. With the debt unbounded its next fragment would wait 100 s and
+/// be refused, and a refused open stream is dropped.
+#[test]
+fn an_open_stream_survives_a_fallback_charge() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths("quic-pacer-survives", 126, QuicPathLimits::DEFAULT).await;
+        // The charge comes at the second fragment, after the stream opened.
+        p.a.pace_with(Arc::new(ChargesMidway {
+            inner: pacer_at(&p.time(), 100_000),
+            at: 2,
+            calls: AtomicUsize::new(0),
+        }));
+        let (elapsed, outcome) = time_a_stream(&p, 5 * FRAGMENT_PAYLOAD_SIZE).await;
+        assert!(matches!(outcome, BoundedSend::Sent), "{outcome:?}");
+        assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+    });
 }

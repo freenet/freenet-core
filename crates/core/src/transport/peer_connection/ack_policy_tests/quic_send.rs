@@ -1440,15 +1440,18 @@ fn many_tasks_send_while_the_path_closes_and_nothing_goes_twice() {
 struct RefusingPacer {
     grant: usize,
     calls: std::sync::atomic::AtomicUsize,
+    granted: std::sync::atomic::AtomicUsize,
     charged: std::sync::atomic::AtomicUsize,
 }
 
 impl crate::transport::quic::path::pacer::SendPacer for RefusingPacer {
-    fn reserve_within(&self, _bytes: usize, limit: Duration) -> Result<Duration, Duration> {
+    fn reserve_within(&self, bytes: usize, limit: Duration) -> Result<Duration, Duration> {
         let call = self
             .calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if call < self.grant {
+            self.granted
+                .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
             Ok(Duration::ZERO)
         } else {
             Err(limit)
@@ -1457,9 +1460,10 @@ impl crate::transport::quic::path::pacer::SendPacer for RefusingPacer {
 
     fn give_back(&self, _bytes: usize) {}
 
-    fn charge(&self, bytes: usize) {
+    fn charge(&self, bytes: usize) -> usize {
         self.charged
             .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        bytes
     }
 
     fn sleep(&self, wait: Duration) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> {
@@ -1512,17 +1516,18 @@ fn messages_the_pacer_refuses_go_on_udp_and_are_charged_to_it() {
 }
 
 /// A Short past one packet that the pacer refuses after its stream opened is
-/// reset and goes on UDP whole, and the whole message is charged to the pacer.
+/// reset and goes on UDP whole, and the pacer is charged only what QUIC had not
+/// already paid for: the writes made before the refusal stay paid once.
 #[test]
-fn a_large_short_the_pacer_refuses_after_opening_is_charged_to_it() {
+fn a_large_short_the_pacer_refuses_after_opening_is_charged_only_the_rest() {
     run(
         "quic-send-paced-open",
         141,
         QuicPathLimits::DEFAULT,
         |mut rig| async move {
-            // The header goes; the first payload write is refused.
+            // The header and the first write go; the next write is refused.
             let pacer = Arc::new(RefusingPacer {
-                grant: 1,
+                grant: 2,
                 ..RefusingPacer::default()
             });
             rig.route.path().pace_with(pacer.clone());
@@ -1536,9 +1541,43 @@ fn a_large_short_the_pacer_refuses_after_opening_is_charged_to_it() {
                 rig.stats().send_count(SendKind::LargeShort, R::FailedUdp),
                 1
             );
+            let granted = pacer.granted.load(std::sync::atomic::Ordering::Relaxed);
+            assert!(
+                granted > crate::transport::quic::framing::HEADER_LEN,
+                "a payload write was made"
+            );
             assert_eq!(
                 pacer.charged.load(std::sync::atomic::Ordering::Relaxed),
-                large.len()
+                large.len() - granted
+            );
+        },
+    );
+}
+
+/// A message the pacer refused whose UDP send then fails leaves no debt: the
+/// pacer is charged only for what UDP sent.
+#[test]
+fn a_fallback_that_fails_on_udp_leaves_no_debt() {
+    run(
+        "quic-send-paced-udp-fails",
+        142,
+        QuicPathLimits::DEFAULT,
+        |mut rig| async move {
+            let pacer = Arc::new(RefusingPacer::default());
+            rig.route.path().pace_with(pacer.clone());
+            rig.e
+                .fail_sends
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            rig.e
+                .conn
+                .outbound_stream_with_id(StreamId::next(), bytes_of(3000), None, None, None)
+                .await;
+            rig.path.settle(Duration::from_secs(1)).await;
+            assert_eq!(rig.stats().send_count(SendKind::Stream, R::NotOpenedUdp), 1);
+            assert_eq!(
+                pacer.charged.load(std::sync::atomic::Ordering::Relaxed),
+                0,
+                "nothing went out, so nothing is owed"
             );
         },
     );

@@ -210,6 +210,21 @@ impl<T: TimeSource> TokenBucket<T> {
         state.rate = new_rate.max(1024);
     }
 
+    /// Deduct up to `bytes`, as [`Self::reserve`] does, but never past a debt
+    /// of `max_debt`: the bucket then ends at `-max_debt` and the rest is not
+    /// charged. Returns what was deducted.
+    pub fn charge_bounded(&self, bytes: usize, max_debt: usize) -> usize {
+        let mut state = self.state.lock();
+        self.refill_state(&mut state);
+        let room = state
+            .tokens
+            .saturating_add(isize::try_from(max_debt).unwrap_or(isize::MAX))
+            .max(0);
+        let charged = isize::try_from(bytes).unwrap_or(isize::MAX).min(room);
+        state.tokens -= charged;
+        charged as usize
+    }
+
     /// Change the burst capacity, dropping tokens above it.
     pub fn set_capacity(&self, capacity: usize) {
         let mut state = self.state.lock();

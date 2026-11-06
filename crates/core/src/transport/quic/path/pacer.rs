@@ -33,10 +33,13 @@
 //! deadline is not made, as on UDP (`TokenBucket::reserve_within`): a refused
 //! reservation takes no place, so it does not delay the sends behind it. The
 //! send then ends [`NotOpened::Paced`] before its stream opened, and the
-//! message goes on UDP; its bytes are then charged to this bucket as debt
-//! ([`SendPacer::charge`]), so the next QUIC sends wait for them and the two
-//! transports together stay near the limit. After the stream opened it ends
-//! [`SendFailure::Paced`] and the stream is reset. Bytes taken for a write that
+//! message goes on UDP. After the stream opened it ends
+//! [`SendFailure::Paced`] and the stream is reset; a Stream or pipe is then
+//! dropped, and a Short goes on UDP. Once UDP has sent a message the pacer
+//! refused, what QUIC had not already paid for is charged to this bucket as
+//! debt ([`SendPacer::charge`]), so the next QUIC sends wait for it, up to
+//! [`FALLBACK_DEBT`] (half a second at the rate): a larger debt would fail the
+//! streams already open on the path. A UDP send that failed is charged nothing. Bytes taken for a write that
 //! is not made go back to the bucket.
 //!
 //! A refusal is never a timeout for the path's stall count (`route::StallCount`):
@@ -72,11 +75,29 @@ pub(in crate::transport) trait SendPacer: Send + Sync {
 
     /// Charge `bytes` sent another way (a message the pacer refused, sent on
     /// UDP instead), as debt, without waiting: the next reservations wait for
-    /// them.
-    fn charge(&self, bytes: usize);
+    /// them. The debt is bounded ([`FALLBACK_DEBT`]); past it nothing more is
+    /// charged. Returns what was charged.
+    fn charge(&self, bytes: usize) -> usize;
 
     /// Sleep for `wait` on the pacer's clock. Dropping it ends the sleep.
     fn sleep(&self, wait: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>>;
+}
+
+/// The most a UDP fallback's charge may leave the pacer owing: half a second
+/// at its rate. The wait a charge adds to the next write is then at most half a
+/// second, well inside the gap deadline an open stream works to
+/// (`STREAM_INACTIVITY_TIMEOUT`) and the 1 s open deadline of a Short, so a
+/// charge does not make a stream already open fail; and QUIC sends again
+/// within half a second of an overload ending. Fallback bytes past the bound
+/// are not charged: while it binds QUIC stays held at it, and UDP runs at its
+/// own bucket.
+pub(in crate::transport) const FALLBACK_DEBT: Duration = Duration::from_millis(500);
+
+/// The rate a pacer's bucket runs at for a limit of `rate`: `TokenBucket`
+/// holds every rate at 1 KiB/s or more (`set_rate`), so a share below that is
+/// raised here too, and the bucket is not reset on every reservation.
+fn bucket_rate(rate: u64) -> usize {
+    usize::try_from(rate).unwrap_or(usize::MAX).max(1024)
 }
 
 /// The burst a pacer at `rate` holds: a tenth of a second of it, as a UDP
@@ -97,7 +118,7 @@ pub(in crate::transport) struct LimitPacer<T: TimeSource> {
 impl<T: TimeSource> LimitPacer<T> {
     /// A pacer at `limit`, or `None` when no limit is set.
     pub(in crate::transport) fn new(limit: QuicRateLimit, time: T) -> Option<Self> {
-        let rate = usize::try_from(limit.rate()?).unwrap_or(usize::MAX);
+        let rate = bucket_rate(limit.rate()?);
         Some(Self {
             bucket: TokenBucket::new_with_time_source(capacity_for(rate), rate, time.clone()),
             limit,
@@ -123,7 +144,7 @@ impl<T: TimeSource> SendPacer for LimitPacer<T> {
         // The share moves with the number of connections; the limit is never
         // unset once set, since the settings do not change while running.
         if let Some(rate) = self.limit.rate() {
-            let rate = usize::try_from(rate).unwrap_or(usize::MAX);
+            let rate = bucket_rate(rate);
             if rate != self.bucket.rate() {
                 self.bucket.set_rate(rate);
                 // The burst stays a tenth of the rate: a share that fell keeps
@@ -138,8 +159,13 @@ impl<T: TimeSource> SendPacer for LimitPacer<T> {
         self.bucket.give_back(bytes);
     }
 
-    fn charge(&self, bytes: usize) {
-        let _wait = self.bucket.reserve(bytes);
+    fn charge(&self, bytes: usize) -> usize {
+        let rate = self.bucket.rate();
+        let max_debt = usize::try_from(
+            (rate as u128).saturating_mul(FALLBACK_DEBT.as_nanos()) / 1_000_000_000,
+        )
+        .unwrap_or(usize::MAX);
+        self.bucket.charge_bounded(bytes, max_debt)
     }
 
     fn sleep(&self, wait: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> {
@@ -161,9 +187,9 @@ pub(super) struct PacedBytes {
 }
 
 impl PacedBytes {
-    /// The write was made: the bytes stay taken.
-    pub(super) fn spent(mut self) {
-        self.bytes = 0;
+    /// The write was made: the bytes stay taken. Returns how many.
+    pub(super) fn spent(mut self) -> usize {
+        std::mem::take(&mut self.bytes)
     }
 }
 

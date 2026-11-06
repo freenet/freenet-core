@@ -68,7 +68,7 @@ fn each_outcome_takes_its_row() {
             (GiveUp, R::Dropped),
         ),
         (
-            BoundedSend::Failed(SendFailure::Paced),
+            BoundedSend::Failed(SendFailure::Paced { spent: 0 }),
             (SendOnUdp, R::FailedUdp),
             (GiveUp, R::Dropped),
         ),
@@ -406,7 +406,7 @@ fn pacer_refusals_never_count_and_a_dark_paced_path_still_closes() {
         let later = p.time().now_nanos() + QUIET;
         let refusals = [
             BoundedSend::Failed(SendFailure::NotOpened(NotOpened::Paced)),
-            BoundedSend::Failed(SendFailure::Paced),
+            BoundedSend::Failed(SendFailure::Paced { spent: 0 }),
         ];
         for refused in refusals
             .iter()
@@ -417,6 +417,11 @@ fn pacer_refusals_never_count_and_a_dark_paced_path_still_closes() {
         }
         assert!(p.a.quinn_connection().close_reason().is_none());
         assert!(!p.a.is_suspect(), "a refusal is not a quiet timeout");
+        assert_eq!(
+            p.a.stats().send_event_count(QuicSendEvent::PacerRefused),
+            u64::from(STALLED_SENDS_LIMIT) + 2,
+            "each refusal is counted once"
+        );
         for _ in 1..STALLED_SENDS_LIMIT {
             p.a.settle(SendKind::Stream, &timeouts()[2], false, later);
         }

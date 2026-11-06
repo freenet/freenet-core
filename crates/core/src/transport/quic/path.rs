@@ -884,20 +884,23 @@ impl QuicPath {
         let _already = self.pacer.set(pacer);
     }
 
-    /// A message of `bytes` that `outcome` sends on UDP instead: if the pacer
-    /// refused it, charge its bytes to the pacer as debt, so the path's next
-    /// sends wait for them and the two transports together stay near the limit
-    /// (`pacer` module). For a Short refused after its stream opened, the bytes
-    /// already written were charged too; the whole message is charged again,
-    /// erring toward the limit.
-    pub(in crate::transport) fn charge_fallback(&self, outcome: &BoundedSend, bytes: u64) {
-        let refused = matches!(
-            outcome,
-            BoundedSend::Failed(SendFailure::NotOpened(NotOpened::Paced) | SendFailure::Paced)
-        );
-        if let (true, Some(pacer)) = (refused, self.pacer.get()) {
-            pacer.charge(usize::try_from(bytes).unwrap_or(usize::MAX));
-        }
+    /// A message of `bytes` that `outcome` sent on UDP instead, after the UDP
+    /// send succeeded: if the pacer refused it, charge the pacer what UDP sent
+    /// that QUIC had not, as debt, so the path's next sends wait for it and the
+    /// two transports together stay near the limit (`pacer` module). A Short
+    /// refused after its stream opened already paid for the writes it made, so
+    /// only the rest is charged. The debt is bounded
+    /// ([`pacer::FALLBACK_DEBT`]). Returns what was charged.
+    pub(in crate::transport) fn charge_fallback(&self, outcome: &BoundedSend, bytes: u64) -> u64 {
+        let unpaid = match outcome {
+            BoundedSend::Failed(SendFailure::NotOpened(NotOpened::Paced)) => bytes,
+            BoundedSend::Failed(SendFailure::Paced { spent }) => bytes.saturating_sub(*spent),
+            _ => return 0,
+        };
+        let Some(pacer) = self.pacer.get() else {
+            return 0;
+        };
+        pacer.charge(usize::try_from(unpaid).unwrap_or(usize::MAX)) as u64
     }
 
     /// The pacing for a data send, if the path is paced.
@@ -1473,7 +1476,7 @@ impl QuicPath {
             send.write_all(metadata).await?;
         }
         if let Some(paid) = paid {
-            paid.spent();
+            send.progress.spent(paid.spent());
         }
         Ok(send)
     }
@@ -1682,7 +1685,7 @@ impl Outgoing {
         let paid = self.pace(buf.len()).await?;
         self.write_all(buf).await?;
         if let Some(paid) = paid {
-            paid.spent();
+            self.progress.spent(paid.spent());
         }
         Ok(())
     }
@@ -1752,7 +1755,7 @@ impl Outgoing {
             let paid = self.pace(fragment.len()).await?;
             self.write_chunk(fragment).await?;
             if let Some(paid) = paid {
-                paid.spent();
+                self.progress.spent(paid.spent());
             }
             if let Some(observer) = observer {
                 observer.on_fragment_sent();

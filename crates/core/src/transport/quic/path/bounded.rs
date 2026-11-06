@@ -139,8 +139,9 @@ pub(crate) enum SendFailure {
     /// After the stream was opened, the connection's bandwidth-limit pacer
     /// refused a write whose wait would have reached the send's deadline
     /// (`pacer` module). The stream was reset. This side held the send back,
-    /// so it says nothing about the path.
-    Paced,
+    /// so it says nothing about the path. `spent`: the bytes the pacer was
+    /// charged for writes made before the refusal.
+    Paced { spent: u64 },
     /// The send failed (`QuicSendError`), before the end of the stream was
     /// sent, or after it with a stop from the peer. This includes a source that
     /// ended or failed before its first chunk, where no stream was opened: such
@@ -183,6 +184,8 @@ struct ProgressState {
     /// The path's pacer refused a write, so the send ends as at its current
     /// deadline (`pacer` module).
     refused: AtomicBool,
+    /// Bytes the pacer was charged for writes this send made.
+    paced: AtomicU64,
 }
 
 impl SendProgress {
@@ -195,6 +198,7 @@ impl SendProgress {
             now: Box::new(|| 0),
             deadlines: None,
             refused: AtomicBool::new(false),
+            paced: AtomicU64::new(0),
         }))
     }
 
@@ -206,6 +210,7 @@ impl SendProgress {
             now: Box::new(move || time.now_nanos()),
             deadlines: Some((deadlines, started)),
             refused: AtomicBool::new(false),
+            paced: AtomicU64::new(0),
         }))
     }
 
@@ -224,6 +229,11 @@ impl SendProgress {
     /// The pacer refused a write: the send ends as at its current deadline.
     pub(super) fn refuse(&self) {
         self.0.refused.store(true, Ordering::Release);
+    }
+
+    /// A paced write was made: its `bytes` stay charged to the pacer.
+    pub(super) fn spent(&self, bytes: usize) {
+        self.0.paced.fetch_add(bytes as u64, Ordering::Relaxed);
     }
 
     fn refused(&self) -> bool {
@@ -270,7 +280,9 @@ impl SendProgress {
     fn paced(&self) -> BoundedSend {
         match self.stage() {
             STAGE_OPENING => BoundedSend::Failed(SendFailure::NotOpened(NotOpened::Paced)),
-            _ => BoundedSend::Failed(SendFailure::Paced),
+            _ => BoundedSend::Failed(SendFailure::Paced {
+                spent: self.0.paced.load(Ordering::Relaxed),
+            }),
         }
     }
 

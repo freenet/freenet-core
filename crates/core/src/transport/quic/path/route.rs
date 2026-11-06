@@ -122,6 +122,10 @@ quic_outcomes! {
         /// The connection acknowledged something again, so the path took sends
         /// again.
         SuspectLeft => "suspect_left",
+        /// The connection's bandwidth-limit pacer refused a send, before or
+        /// after its stream opened (`pacer` module). Also counted under its
+        /// kind's result.
+        PacerRefused => "pacer_refused",
     }
 }
 
@@ -134,7 +138,7 @@ pub(crate) fn next_step(kind: SendKind, outcome: &BoundedSend) -> (NextStep, Qui
         BoundedSend::Sent => return (Done, R::Sent),
         BoundedSend::MaybeDelivered(_) => return (Done, R::MaybeDelivered),
         BoundedSend::Failed(SendFailure::NotOpened(_)) => (SendOnUdp, false),
-        BoundedSend::Failed(SendFailure::TimedOut | SendFailure::Paced) => {
+        BoundedSend::Failed(SendFailure::TimedOut | SendFailure::Paced { .. }) => {
             (short_goes_on_udp, true)
         }
         BoundedSend::Failed(SendFailure::Error(error)) => match error {
@@ -170,7 +174,7 @@ fn timed_out(outcome: &BoundedSend) -> bool {
         | BoundedSend::MaybeDelivered(MaybeDelivered::ConnectionLost)
         | BoundedSend::Failed(SendFailure::NotOpened(NotOpened::ConnectionLost(_)))
         | BoundedSend::Failed(SendFailure::NotOpened(NotOpened::Paced))
-        | BoundedSend::Failed(SendFailure::Paced)
+        | BoundedSend::Failed(SendFailure::Paced { .. })
         | BoundedSend::Failed(SendFailure::Error(_)) => false,
     }
 }
@@ -324,6 +328,14 @@ impl QuicPath {
     ) -> NextStep {
         let (step, result) = next_step(kind, outcome);
         self.stats.record_send(kind, result);
+        if matches!(
+            outcome,
+            BoundedSend::Failed(
+                SendFailure::NotOpened(NotOpened::Paced) | SendFailure::Paced { .. }
+            )
+        ) {
+            self.stats.record_send_event(QuicSendEvent::PacerRefused);
+        }
         if let BoundedSend::Failed(SendFailure::Error(QuicSendError::Stopped(code))) = outcome {
             self.stats.record_stop(*code);
             if *code == u64::from(stop_code::NOT_ACCEPTING_DATA) {
