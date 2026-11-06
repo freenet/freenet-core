@@ -1395,6 +1395,7 @@ impl Ring {
 
         let mut tick_interval = tokio::time::interval(interval);
         tick_interval.tick().await; // skip first immediate tick
+        let mut cursor = ContractConnectCursor::default();
 
         loop {
             if sleep_or_shutdown(&shutdown, async {
@@ -1421,11 +1422,14 @@ impl Ring {
             };
 
             let mut connects_this_cycle = 0;
+            let contracts = cursor.order(contracts);
+            let mut examined = 0;
 
             for contract_key in &contracts {
                 if connects_this_cycle >= Self::MAX_CONTRACT_CONNECTS_PER_CYCLE {
                     break;
                 }
+                examined += 1;
 
                 if !ring.is_subscription_root(contract_key) {
                     // No longer root — a closer connection now exists.
@@ -1528,6 +1532,7 @@ impl Ring {
                     }
                 }
             }
+            cursor.advance(examined, contracts.len());
         }
     }
 
@@ -7579,6 +7584,121 @@ fn read_fd_soft_limit() -> Option<u64> {
 #[cfg(not(unix))]
 fn read_fd_soft_limit() -> Option<u64> {
     None
+}
+
+/// Where the subscription-root loop (`Ring::contract_directed_connects`) starts
+/// each cycle. That loop stops after `MAX_CONTRACT_CONNECTS_PER_CYCLE` connects,
+/// so the order it walks the hosted contracts decides which ones it reaches.
+/// The hosting cache's own order is a HashMap's, different in every process, so
+/// a simulation seed did not repeat; a plain sort would repeat but always take
+/// the lowest keys and never reach the rest. This sorts by key bytes and starts
+/// where the previous cycle stopped, so the order is fixed for a given history
+/// and every hosted contract is reached within `ceil(n / cap)` cycles that each
+/// use the whole cap.
+#[derive(Debug, Default)]
+pub(crate) struct ContractConnectCursor {
+    next: usize,
+}
+
+impl ContractConnectCursor {
+    /// `contracts` in key-byte order, starting where the last cycle stopped.
+    pub(crate) fn order(&self, mut contracts: Vec<ContractKey>) -> Vec<ContractKey> {
+        contracts.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        if !contracts.is_empty() {
+            let start = self.next % contracts.len();
+            contracts.rotate_left(start);
+        }
+        contracts
+    }
+
+    /// The cycle looked at `examined` of the `len` contracts in the order given;
+    /// the next one starts after them.
+    pub(crate) fn advance(&mut self, examined: usize, len: usize) {
+        if len > 0 {
+            self.next = (self.next % len + examined) % len;
+        }
+    }
+}
+
+#[cfg(test)]
+mod contract_connect_cursor_tests {
+    use super::ContractConnectCursor;
+    use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey};
+
+    fn contract(seed: u8) -> ContractKey {
+        ContractKey::from_id_and_code(
+            ContractInstanceId::new([seed; 32]),
+            CodeHash::new([seed.wrapping_add(1); 32]),
+        )
+    }
+
+    /// One cycle of the subscription-root loop where every contract is a root
+    /// with no backoff, so each one it looks at is a connect: it takes the first
+    /// `cap` in the cursor's order and moves the cursor past them.
+    fn cycle(
+        cursor: &mut ContractConnectCursor,
+        keys: &[ContractKey],
+        cap: usize,
+    ) -> Vec<ContractKey> {
+        let order = cursor.order(keys.to_vec());
+        let taken: Vec<_> = order.iter().take(cap).copied().collect();
+        cursor.advance(taken.len(), order.len());
+        taken
+    }
+
+    /// With the per-cycle cap below the number of root contracts, every contract
+    /// is reached within `ceil(n / cap)` cycles, and each cycle reaches
+    /// different ones. A fixed sort with no cursor takes the same lowest keys
+    /// every cycle and fails this.
+    #[test]
+    fn the_capped_loop_reaches_every_contract_within_ceil_n_over_cap_cycles() {
+        for (n, cap) in [(10usize, 2usize), (10, 3), (7, 2), (2, 2), (1, 2), (5, 5)] {
+            let keys: Vec<_> = (0..n as u8).map(contract).collect();
+            let mut cursor = ContractConnectCursor::default();
+            let mut reached = std::collections::HashSet::new();
+            for _ in 0..n.div_ceil(cap) {
+                for key in cycle(&mut cursor, &keys, cap) {
+                    reached.insert(key);
+                }
+            }
+            assert_eq!(reached.len(), n, "n {n}, cap {cap}");
+        }
+    }
+
+    /// The order depends only on the keys and the cursor, not on the order the
+    /// hosting cache handed them over in (a HashMap's, different per process).
+    #[test]
+    fn the_order_does_not_depend_on_the_input_order() {
+        let keys: Vec<_> = (0..9u8).map(contract).collect();
+        let mut reversed = keys.clone();
+        reversed.reverse();
+        let mut shuffled = keys.clone();
+        shuffled.swap(0, 5);
+        shuffled.swap(2, 8);
+        let mut cursor = ContractConnectCursor::default();
+        cursor.advance(4, keys.len());
+        let expected = cursor.order(keys.clone());
+        assert_eq!(cursor.order(reversed), expected);
+        assert_eq!(cursor.order(shuffled), expected);
+        // And it is the sorted order, started at the cursor.
+        let mut sorted = keys;
+        sorted.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        sorted.rotate_left(4);
+        assert_eq!(expected, sorted);
+    }
+
+    /// A shrinking or growing hosted set keeps the cursor in range.
+    #[test]
+    fn the_cursor_survives_a_changing_set() {
+        let mut cursor = ContractConnectCursor::default();
+        cursor.advance(7, 9);
+        let few: Vec<_> = (0..3u8).map(contract).collect();
+        assert_eq!(cursor.order(few.clone()).len(), 3);
+        cursor.advance(2, 3);
+        assert_eq!(cursor.order(Vec::new()), Vec::<ContractKey>::new());
+        cursor.advance(0, 0);
+        assert_eq!(cursor.order(few).len(), 3);
+    }
 }
 
 #[cfg(test)]
