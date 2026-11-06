@@ -1959,6 +1959,33 @@ async fn drive_relay_broadcast_to(
         return Ok(());
     }
 
+    // ── Step 3a: already-applied check (BEFORE merge) ─────────────────────
+    //
+    // Skip a payload this node has already merged into its current state.
+    // For a contract whose merge is idempotent the merge would be a no-op;
+    // for one whose merge does not converge, re-merging a payload from a
+    // fixed replayed set is what keeps the replay going. Runs after the 60s
+    // dedup cache above, which also suppresses copies that arrive while the
+    // first is still being merged (this record learns of a payload only after
+    // its merge commits), so the skip count here is the suppression the dedup
+    // cache did not already provide. The executor records the payload; see
+    // `crate::ring::applied_payloads`.
+    if op_manager.ring.applied_payloads.contains(
+        &key,
+        op_manager
+            .ring
+            .applied_payloads
+            .payload_hash(is_delta, &payload_bytes),
+    ) {
+        receiver_terminal.mark_already_applied();
+        tracing::debug!(
+            tx = %incoming_tx,
+            %key,
+            "UPDATE relay: BroadcastTo skipped, payload already merged into local state"
+        );
+        return Ok(());
+    }
+
     // ── Step 3b: merge-failure backoff gate (#4861) ───────────────────────
     //
     // Quarantine "poison" contracts whose merges reliably fail/time out. While a
@@ -2900,6 +2927,24 @@ async fn apply_streaming_broadcast(
             tx = %incoming_tx,
             %key,
             "UPDATE relay (driver streaming): BroadcastToStreaming skipped — duplicate payload (dedup hit)"
+        );
+        return Ok(());
+    }
+
+    // Step 5a: already-applied check BEFORE merge. Same rule and ordering as
+    // the non-streaming driver's step 3a; streaming is always full state.
+    if op_manager.ring.applied_payloads.contains(
+        &key,
+        op_manager
+            .ring
+            .applied_payloads
+            .payload_hash(false, &state_bytes),
+    ) {
+        receiver_terminal.mark_already_applied();
+        tracing::debug!(
+            tx = %incoming_tx,
+            %key,
+            "UPDATE relay (driver streaming): BroadcastToStreaming skipped, payload already merged into local state"
         );
         return Ok(());
     }
@@ -4595,6 +4640,405 @@ mod tests {
         let guard: Box<dyn std::any::Any> =
             Box::new((handler, result_router_rx, task_monitor, wait_for_event));
         (op_manager, notification_rx, update_query_count, guard)
+    }
+
+    /// Applied-payload record, behaviour on both receive drivers: a payload
+    /// already recorded as merged never reaches the contract handler, and the
+    /// skip is counted in the receiver telemetry. The payload is fresh to the
+    /// 60s dedup cache, which is the case this record exists for (a replay
+    /// whose period exceeds that cache's TTL). A payload NOT recorded still
+    /// reaches the handler.
+    #[tokio::test]
+    async fn an_already_applied_payload_never_reaches_the_merge() {
+        use std::sync::atomic::Ordering;
+        let (op_manager, _rx, update_queries, _guard) =
+            build_broadcast_test_node("applied-payload-skip", DeltaOutcome::Success).await;
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([41u8; 32]),
+            CodeHash::new([42u8; 32]),
+        );
+        let sender_addr: SocketAddr = "127.0.0.1:12300".parse().unwrap();
+        let set = &op_manager.ring.applied_payloads;
+
+        // Non-streaming delta, recorded as merged.
+        set.record_absorbed(&key, set.payload_hash(true, &[1, 1, 1]));
+        drive_relay_broadcast_to(
+            &op_manager,
+            Transaction::new::<UpdateMsg>(),
+            key,
+            DeltaOrFullState::Delta(vec![1, 1, 1]),
+            Vec::new(),
+            sender_addr,
+            crate::ring::broadcast_coverage::CoveredPeers::empty(),
+        )
+        .await
+        .expect("skip returns Ok");
+        assert_eq!(
+            update_queries.load(Ordering::Relaxed),
+            0,
+            "an already-applied delta must not be merged again"
+        );
+
+        // The same bytes as a FULL STATE were never merged: not skipped.
+        drive_relay_broadcast_to(
+            &op_manager,
+            Transaction::new::<UpdateMsg>(),
+            key,
+            DeltaOrFullState::FullState(vec![1, 1, 1]),
+            Vec::new(),
+            sender_addr,
+            crate::ring::broadcast_coverage::CoveredPeers::empty(),
+        )
+        .await
+        .expect("merge");
+        assert_eq!(update_queries.load(Ordering::Relaxed), 1);
+
+        // Streaming full state, recorded as merged.
+        set.record_absorbed(&key, set.payload_hash(false, &[2, 2, 2]));
+        apply_streaming_broadcast(
+            &op_manager,
+            Transaction::new::<UpdateMsg>(),
+            key,
+            vec![2, 2, 2],
+            Vec::new(),
+            sender_addr,
+            crate::ring::broadcast_coverage::CoveredPeers::empty(),
+        )
+        .await
+        .expect("skip returns Ok");
+        assert_eq!(
+            update_queries.load(Ordering::Relaxed),
+            1,
+            "an already-applied streaming state must not be merged again"
+        );
+
+        assert_eq!(
+            op_manager
+                .payload_mix
+                .receiver_apply_stats()
+                .already_applied,
+            [1, 1, 3, 3],
+            "each skip is counted once, at the decision, by kind and bytes"
+        );
+    }
+
+    /// A node whose contract handler is the REAL `contract_handling` loop over a
+    /// `MockWasmRuntime` executor wired to the same `OpManager`, so a payload
+    /// goes driver -> handler -> executor and the executor's record is what the
+    /// driver reads. The node's interest/hosting clock is a
+    /// `SharedMockTimeSource` the test advances past the 60s dedup-cache TTL, so
+    /// what the test observes is the applied-payload record and not that cache.
+    /// Returns the op_manager, the clock, the storage (its `store_count` is the
+    /// number of committed writes), the installed contract key, and a guard.
+    async fn build_applied_payload_e2e_node(
+        id: &str,
+    ) -> (
+        Arc<OpManager>,
+        crate::util::time_source::SharedMockTimeSource,
+        crate::wasm_runtime::MockStateStorage,
+        ContractKey,
+        Box<dyn std::any::Any>,
+    ) {
+        let clock = crate::util::time_source::SharedMockTimeSource::new();
+        let config_args = crate::config::ConfigArgs {
+            id: Some(id.to_string()),
+            mode: Some(crate::contract::OperationMode::Local),
+            ..Default::default()
+        };
+        let mut node_config =
+            crate::node::NodeConfig::new(config_args.build().await.expect("build Config"))
+                .await
+                .expect("build NodeConfig");
+        node_config.hosting_time_source_override =
+            Some(Arc::new(clock.clone()) as crate::util::time_source::DynTimeSource);
+        let (mut notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, ch_channel, wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+        let op_manager = Arc::new(
+            OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        op_manager.ring.attach_op_manager(&op_manager);
+        op_manager
+            .ring
+            .connection_manager
+            .set_own_addr_local_for_test("127.0.0.1:12000".parse().unwrap());
+
+        let storage = crate::wasm_runtime::MockStateStorage::new();
+        let handler = crate::contract::MockWasmContractHandler::new_test_with_storage(
+            ch_channel,
+            Some(op_manager.clone()),
+            id,
+            storage.clone(),
+        )
+        .await;
+        let contract_loop = GlobalExecutor::spawn(crate::contract::contract_handling(
+            handler,
+            crate::contract::user_input::AutoApprovePrompter,
+        ));
+        // Drain the event-loop notifications (fan-out of committed changes) so
+        // nothing upstream waits on a full channel.
+        let drain = GlobalExecutor::spawn(async move {
+            while notification_rx
+                .notifications_receiver
+                .recv()
+                .await
+                .is_some()
+            {}
+        });
+
+        let code = freenet_stdlib::prelude::ContractCode::from(id.as_bytes().to_vec());
+        let contract = freenet_stdlib::prelude::ContractContainer::Wasm(
+            freenet_stdlib::prelude::ContractWasmAPIVersion::V1(
+                freenet_stdlib::prelude::WrappedContract::new(
+                    Arc::new(code),
+                    freenet_stdlib::prelude::Parameters::from(vec![]),
+                ),
+            ),
+        );
+        let key = contract.key();
+        let installed = op_manager
+            .notify_contract_handler(ContractHandlerEvent::PutQuery {
+                key,
+                state: WrappedState::new(b"initial".to_vec()),
+                related_contracts: RelatedContracts::default(),
+                contract: Some(contract),
+            })
+            .await
+            .expect("install");
+        assert!(
+            matches!(
+                installed,
+                ContractHandlerEvent::PutResponse {
+                    new_value: Ok(_),
+                    ..
+                }
+            ),
+            "install failed: {installed}"
+        );
+        // Hosted, so the ring reaper keeps the record.
+        op_manager.ring.host_contract(
+            key,
+            16,
+            crate::ring::AccessType::Put,
+            crate::ring::HostingCause::Other,
+        );
+
+        let guard: Box<dyn std::any::Any> = Box::new((
+            contract_loop,
+            drain,
+            result_router_rx,
+            task_monitor,
+            wait_for_event,
+        ));
+        (op_manager, clock, storage, key, guard)
+    }
+
+    /// Deliver one broadcast payload through the real non-streaming driver.
+    async fn deliver(op_manager: &OpManager, key: ContractKey, payload: DeltaOrFullState) {
+        // A skip and an apply both return Ok; what the tests measure is how
+        // many writes reached the store.
+        drive_relay_broadcast_to(
+            op_manager,
+            Transaction::new::<UpdateMsg>(),
+            key,
+            payload,
+            Vec::new(),
+            "127.0.0.1:12400".parse().unwrap(),
+            crate::ring::broadcast_coverage::CoveredPeers::empty(),
+        )
+        .await
+        .expect("broadcast delivery");
+    }
+
+    /// End to end through driver, real contract loop and executor: a delta and
+    /// a full state each reach the executor exactly once; replaying each later
+    /// (past the dedup cache's TTL) is skipped. This proves the executor records
+    /// the same hash the driver looks up, for both payload kinds.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_replayed_delta_and_state_reach_the_executor_once_each() {
+        let (op_manager, clock, storage, key, _guard) =
+            build_applied_payload_e2e_node("applied-e2e-once").await;
+        let past_dedup_ttl = std::time::Duration::from_secs(61);
+
+        let writes_before = storage.store_count();
+        deliver(
+            &op_manager,
+            key,
+            DeltaOrFullState::Delta(b"delta-1".to_vec()),
+        )
+        .await;
+        deliver(
+            &op_manager,
+            key,
+            DeltaOrFullState::FullState(b"state-1".to_vec()),
+        )
+        .await;
+        // Move the stored state away from both payloads, so that a replay that
+        // wrongly reached the executor would change it and write. Without this
+        // the full-state replay would equal the stored state and hit the
+        // executor's byte-identical short-circuit, which writes nothing, and
+        // the store count could not tell a skip from an apply.
+        deliver(
+            &op_manager,
+            key,
+            DeltaOrFullState::FullState(b"state-2".to_vec()),
+        )
+        .await;
+        assert_eq!(
+            storage.store_count() - writes_before,
+            3,
+            "each first delivery must merge and commit"
+        );
+
+        clock.advance_time(past_dedup_ttl);
+        deliver(
+            &op_manager,
+            key,
+            DeltaOrFullState::Delta(b"delta-1".to_vec()),
+        )
+        .await;
+        clock.advance_time(past_dedup_ttl);
+        deliver(
+            &op_manager,
+            key,
+            DeltaOrFullState::FullState(b"state-1".to_vec()),
+        )
+        .await;
+        assert_eq!(
+            storage.store_count() - writes_before,
+            3,
+            "a replayed delta or state must not reach the executor again"
+        );
+        assert_eq!(
+            op_manager
+                .payload_mix
+                .receiver_apply_stats()
+                .already_applied[..2],
+            [1, 1],
+            "one delta skip and one full-state skip"
+        );
+    }
+
+    /// A contract whose merge moves between two states, fed the two payloads
+    /// over and over (each delivery past the dedup cache's TTL): without the
+    /// record every delivery would change the state and fan out again. With
+    /// it, the merge count stops growing after the first cycle and every later
+    /// delivery is counted as a skip.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_two_state_replay_stops_after_the_first_cycle() {
+        let (op_manager, clock, storage, key, _guard) =
+            build_applied_payload_e2e_node("applied-e2e-loop").await;
+        let past_dedup_ttl = std::time::Duration::from_secs(61);
+        let payloads = [b"state-a".to_vec(), b"state-b".to_vec()];
+
+        let writes_before = storage.store_count();
+        let skips_before = crate::config::GlobalTestMetrics::already_applied_skips();
+        let rounds = 10;
+        for round in 0..rounds {
+            clock.advance_time(past_dedup_ttl);
+            deliver(
+                &op_manager,
+                key,
+                DeltaOrFullState::FullState(payloads[round % 2].clone()),
+            )
+            .await;
+            if round == 1 {
+                assert_eq!(
+                    storage.store_count() - writes_before,
+                    2,
+                    "the first cycle moves the state twice"
+                );
+            }
+        }
+        assert_eq!(
+            storage.store_count() - writes_before,
+            2,
+            "after the first cycle no delivery may change the state again"
+        );
+        assert_eq!(
+            crate::config::GlobalTestMetrics::already_applied_skips() - skips_before,
+            (rounds - 2) as u64,
+            "every delivery after the first cycle is skipped and counted"
+        );
+
+        // Past the age bound both hashes have expired: the replay runs exactly
+        // one more cycle, then stops again.
+        clock.advance_time(crate::ring::applied_payloads::APPLIED_PAYLOAD_MAX_AGE);
+        for round in 0..6 {
+            clock.advance_time(past_dedup_ttl);
+            deliver(
+                &op_manager,
+                key,
+                DeltaOrFullState::FullState(payloads[round % 2].clone()),
+            )
+            .await;
+        }
+        assert_eq!(
+            storage.store_count() - writes_before,
+            4,
+            "after the age bound the replay re-runs one cycle (two writes), no more"
+        );
+    }
+
+    /// The streaming receiver end to end, as for BroadcastTo: a full state
+    /// assembled from a stream reaches the executor once, and the same bytes
+    /// streamed again later (past the dedup cache's TTL) are skipped. Starts at
+    /// `apply_streaming_broadcast`, after stream claim and assembly, which need
+    /// transport plumbing and do not touch the record.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_replayed_streaming_state_reaches_the_executor_once() {
+        let (op_manager, clock, storage, key, _guard) =
+            build_applied_payload_e2e_node("applied-e2e-streaming").await;
+        let stream = |bytes: &[u8]| {
+            let op_manager = &op_manager;
+            let bytes = bytes.to_vec();
+            async move {
+                apply_streaming_broadcast(
+                    op_manager,
+                    Transaction::new::<UpdateMsg>(),
+                    key,
+                    bytes,
+                    Vec::new(),
+                    "127.0.0.1:12500".parse().unwrap(),
+                    crate::ring::broadcast_coverage::CoveredPeers::empty(),
+                )
+                .await
+                .expect("streaming delivery");
+            }
+        };
+        let writes_before = storage.store_count();
+        stream(b"streamed-state").await;
+        // Move the stored state away, so a replay that wrongly reached the
+        // executor would change it and write (an identical state would hit the
+        // byte-identical short-circuit and write nothing).
+        stream(b"streamed-other").await;
+        assert_eq!(storage.store_count() - writes_before, 2);
+        clock.advance_time(std::time::Duration::from_secs(61));
+        stream(b"streamed-state").await;
+        assert_eq!(
+            storage.store_count() - writes_before,
+            2,
+            "a replayed streaming state must not reach the executor again"
+        );
+        assert_eq!(
+            op_manager
+                .payload_mix
+                .receiver_apply_stats()
+                .already_applied[1],
+            1
+        );
     }
 
     /// Convenience wrapper: a node whose stand-in handler fails every delta with
@@ -7000,6 +7444,62 @@ mod tests {
              apply_streaming_broadcast (#4857). A direct call here would \
              double-count the streaming path. Issue #4828."
         );
+    }
+
+    /// Applied-payload record (`crate::ring::applied_payloads`): both
+    /// broadcast receive paths check it at statement position, AFTER the 60s
+    /// dedup cache (which keeps the in-flight protection this record cannot
+    /// give, since it learns of a payload only after its merge commits) and
+    /// BEFORE the WASM merge, and classify the skip for telemetry before the
+    /// early return. Insertion is the executor's job, never the driver's: a
+    /// driver that recorded a payload could record one whose merge was later
+    /// refused or suppressed.
+    #[test]
+    fn broadcast_paths_check_applied_payloads_between_dedup_and_merge() {
+        let full = include_str!("op_ctx_task.rs");
+        let src = production_source(full);
+        let at_statement = |body: &str, needle: &str| -> usize {
+            body.match_indices(needle)
+                .find(|(i, _)| {
+                    let line_start = body[..*i].rfind('\n').map_or(0, |n| n + 1);
+                    body[line_start..*i].trim().is_empty()
+                })
+                .map(|(i, _)| i)
+                .unwrap_or_else(|| panic!("`{needle}` is not at statement position"))
+        };
+        for sig in [
+            "async fn drive_relay_broadcast_to(",
+            "async fn apply_streaming_broadcast(",
+        ] {
+            let body = extract_fn_body(src, sig);
+            let dedup = at_statement(
+                body,
+                "if op_manager.broadcast_dedup_cache.check_and_insert(",
+            );
+            let check = at_statement(body, "if op_manager.ring.applied_payloads.contains(");
+            let merge = body
+                .find("super::update_contract(")
+                .unwrap_or_else(|| panic!("{sig} must merge via update_contract"));
+            assert!(
+                dedup < check && check < merge,
+                "{sig}: order must be dedup cache ({dedup}) < applied-payload \
+                 check ({check}) < merge ({merge})"
+            );
+            let mark = at_statement(body, "receiver_terminal.mark_already_applied();");
+            assert!(
+                check < mark && mark < merge,
+                "{sig} must classify the already-applied skip inside the check"
+            );
+            assert!(
+                body[mark..merge].contains("return Ok(());"),
+                "{sig} must return after an already-applied skip, before the merge"
+            );
+            assert!(
+                !body.contains("applied_payloads.record_absorbed("),
+                "{sig} must not record payloads; only the executor knows the \
+                 merge committed"
+            );
+        }
     }
 
     /// #5090: every received payload is terminally classified by an RAII guard,

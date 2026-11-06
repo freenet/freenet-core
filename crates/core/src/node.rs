@@ -5817,6 +5817,14 @@ async fn handle_interest_sync_message(
                 return None;
             }
 
+            // Deliberately NOT gated by the applied-payload record
+            // (`crate::ring::applied_payloads`) either. This node requested
+            // this response because its state differs from the sender's, and a
+            // quiet sender re-sends the same bytes every round: skipping them
+            // because an earlier merge of the same bytes was recorded could
+            // leave the divergence in place. Pinned behaviourally by
+            // `resync_response_applies_even_when_its_bytes_are_recorded`.
+            //
             // Apply the full state using an update.
             //
             // This full-state WASM merge is deliberately NOT gated by the
@@ -8257,6 +8265,106 @@ mod tests {
             crate::config::GlobalTestMetrics::resync_responses_unsolicited(),
             1,
             "the unsolicited-drop must be counted exactly once (#4864 round-8)"
+        );
+    }
+
+    /// Applied-payload record: a correlated `ResyncResponse` is applied even when
+    /// its exact bytes are recorded as already merged. This node asked for the
+    /// response because the states differ, and a quiet sender re-sends the same
+    /// bytes every round, so a skip here could leave a divergence in place.
+    #[tokio::test]
+    async fn resync_response_applies_even_when_its_bytes_are_recorded() {
+        use crate::contract::ContractHandlerEvent;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let config_args = crate::config::ConfigArgs {
+            id: Some("resync-resp-applied-record".to_string()),
+            mode: Some(crate::contract::OperationMode::Local),
+            ..Default::default()
+        };
+        let node_config = NodeConfig::new(config_args.build().await.expect("build Config"))
+            .await
+            .expect("build NodeConfig");
+        let (_notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, mut ch_channel, _wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, _result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+        let op_manager = std::sync::Arc::new(
+            crate::node::OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        op_manager.ring.attach_op_manager(&op_manager);
+        op_manager
+            .ring
+            .connection_manager
+            .set_own_addr_local_for_test("127.0.0.1:14300".parse().unwrap());
+
+        let update_query_seen = std::sync::Arc::new(AtomicBool::new(false));
+        let handler_flag = update_query_seen.clone();
+        let _handler = tokio::spawn(async move {
+            while let Ok((id, ev, _priority)) = ch_channel.recv_from_sender().await {
+                #[allow(
+                    clippy::wildcard_enum_match_arm,
+                    reason = "a stand-in executor loop serving the one query this \
+                              test expects; any other event is unexpected"
+                )]
+                let response = match ev {
+                    ContractHandlerEvent::UpdateQuery { .. } => {
+                        handler_flag.store(true, Ordering::SeqCst);
+                        ContractHandlerEvent::UpdateResponse {
+                            new_value: Ok(freenet_stdlib::prelude::WrappedState::new(vec![
+                                7u8, 7, 7,
+                            ])),
+                            state_changed: true,
+                        }
+                    }
+                    other => panic!("unexpected handler event: {other:?}"),
+                };
+                if ch_channel.send_to_sender(id, response).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let key = freenet_stdlib::prelude::ContractKey::from_id_and_code(
+            freenet_stdlib::prelude::ContractInstanceId::new([204u8; 32]),
+            freenet_stdlib::prelude::CodeHash::new([205u8; 32]),
+        );
+        let source: SocketAddr = "127.0.0.1:15300".parse().unwrap();
+        let state_bytes = vec![7u8, 7, 7];
+        let set = &op_manager.ring.applied_payloads;
+        set.record_absorbed(&key, set.payload_hash(false, &state_bytes));
+        assert!(set.contains(&key, set.payload_hash(false, &state_bytes)));
+        let _correlated = op_manager
+            .ring
+            .outstanding_resync_requests
+            .record(*key.id(), source);
+
+        let response = handle_interest_sync_message(
+            &op_manager,
+            source,
+            crate::message::InterestMessage::ResyncResponse {
+                key,
+                state_bytes,
+                summary_bytes: vec![1u8],
+            },
+        )
+        .await;
+        assert!(response.is_none());
+        assert!(
+            update_query_seen.load(Ordering::SeqCst),
+            "a correlated ResyncResponse must reach the merge even when its bytes \
+             are recorded as applied"
         );
     }
 
