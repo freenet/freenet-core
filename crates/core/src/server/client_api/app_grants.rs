@@ -1,0 +1,750 @@
+//! User-approved app grants for native (non-browser) clients (#5264).
+//!
+//! A browser tab gets its app identity from the shell page the node serves for
+//! that app. A native client, such as a desktop build of a Freenet app, has no
+//! shell page. This module lets it ask for the identity of one web app, have
+//! the user approve that in the browser, and receive a durable, revocable token.
+//! A WebSocket connection presenting the token (as `Authorization: Bearer`) is
+//! then treated exactly like a browser connection for that app, so delegates
+//! see `MessageOrigin::WebApp(<app>)` and the native client sees the same
+//! delegate data the app's web UI does.
+//!
+//! # Flow
+//!
+//! 1. `POST /v1/app-grants/request` `{ "app": "<contract instance id>",
+//!    "client_name": "..." }` returns `{ request_id, approve_url,
+//!    expires_in_secs }`.
+//! 2. The client opens `approve_url` in the user's browser and long-polls
+//!    `GET /v1/app-grants/request/<request_id>` (each poll waits up to 30 s).
+//! 3. The node-authored approval page shows the app's contract id, and the
+//!    client's self-reported name labelled as unverified, with Allow / Deny.
+//! 4. On Allow the node mints the token; the next poll stores `sha256(token)`
+//!    and returns the token, once.
+//!
+//! `request_id` is known only to the client (it is never in a browser URL), so
+//! the page's URL alone cannot collect the token. The page is addressed by a
+//! separate `approve_id`.
+//!
+//! # Gates
+//!
+//! - Request and poll: loopback peer and loopback `Host`; no `Origin` and no
+//!   `Sec-Fetch-*` header, so a browser (or web content) cannot call them;
+//!   refused on a hosted node and when any forwarding header is present.
+//! - Approval page and approve POST: loopback peer and loopback `Host` (so a
+//!   DNS-rebound page is refused), no forwarding headers, not hosted. The POST
+//!   additionally needs an `Origin` exactly equal to the node's own origin and
+//!   the single-use nonce minted for the page. The page may not be framed.
+//! - A request expires 10 minutes after it was made, approved or not.
+//!
+//! # Revocation
+//!
+//! Grants are listed on the Apps and permissions page with a Revoke button.
+//! Revoking deletes the stored row and closes every live connection that was
+//! opened with the token.
+//!
+//! # What this does NOT protect against
+//!
+//! A malicious program already running as the same user can fetch the approval
+//! page itself and click Allow. The approval step defends against web content
+//! and gives the user a visible, revocable record; it is not a boundary
+//! between local processes of the same user. Closing that needs the
+//! authentication half of #5264 (for example passkey-gated approval), which
+//! can be added to the approval step without changing the native client's side.
+
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::Duration;
+
+use axum::extract::{ConnectInfo, Path};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{Html, IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::{Extension, Json, Router};
+use freenet_stdlib::prelude::ContractInstanceId;
+use parking_lot::Mutex;
+use serde::Deserialize;
+use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
+
+use super::hosted_export::ExportOpManagerHandle;
+use super::permission_prompts::{
+    grants_read_trusted, host_is_loopback, html_escape, origin_is_exactly_same_origin,
+    peer_is_loopback, refuse_when_hosted,
+};
+use crate::client_events::AuthToken;
+use crate::contract::delegate_capabilities::{
+    AppIdentity, DelegateCapabilities, GrantToken, GrantTokenHash, sanitize_client_name,
+};
+use crate::server::{AllowedHosts, AllowedSourceCidrs};
+
+/// How long a request stays answerable, approved or not.
+pub(crate) const REQUEST_TTL: Duration = Duration::from_secs(10 * 60);
+
+/// How long one poll waits for the user before answering "pending".
+pub(crate) const POLL_WAIT: Duration = Duration::from_secs(30);
+
+/// Requests waiting for an answer at once. A user approves one app at a time;
+/// the cap bounds what a local caller can make the node hold.
+const MAX_PENDING_REQUESTS: usize = 16;
+
+/// Polls held open at once.
+const MAX_CONCURRENT_POLLS: usize = 32;
+
+/// The Allow button is enabled only after this delay, so a click aimed at
+/// something else the moment the page opens does not land on it.
+const ALLOW_DELAY_MS: u64 = 1500;
+
+const ROUTE_REQUEST: &str = "/v1/app-grants/request";
+const ROUTE_POLL: &str = "/v1/app-grants/request/{request_id}";
+const ROUTE_APPROVE: &str = "/v1/app-grants/approve/{approve_id}";
+const ROUTE_LIST: &str = "/permission/native-grants";
+const ROUTE_REVOKE: &str = "/permission/native-grants/revoke";
+
+/// Per-node state for native app grants: requests awaiting the user, and the
+/// live connections opened with each grant (so revocation can close them).
+/// Persistent grants live in `DelegateCapabilities`, reached through the node's
+/// `OpManager`; a hosted node has none, so it never honours a grant.
+#[derive(Clone)]
+pub(crate) struct AppGrantState(Arc<Inner>);
+
+struct Inner {
+    op_manager: ExportOpManagerHandle,
+    #[cfg(test)]
+    caps_override: Mutex<Option<Arc<DelegateCapabilities>>>,
+    pending: Mutex<HashMap<String, PendingRequest>>,
+    live: Mutex<HashMap<GrantTokenHash, Vec<(u64, CancellationToken)>>>,
+    next_live_id: AtomicU64,
+    polls: AtomicUsize,
+}
+
+struct PendingRequest {
+    approve_id: String,
+    app: ContractInstanceId,
+    client_name: String,
+    created: tokio::time::Instant,
+    /// Nonce of the most recently rendered approval page. Taken (cleared) by
+    /// the POST that uses it.
+    page_nonce: Option<String>,
+    outcome: Outcome,
+    /// Bumped when `outcome` changes, to wake pollers. Dropping the request
+    /// (expiry, collection) closes it, which also wakes them.
+    changed: watch::Sender<()>,
+}
+
+enum Outcome {
+    Pending,
+    Approved(GrantToken),
+    Denied,
+}
+
+/// A grant matched on connect. Hold [`LiveGrant::guard`] for the life of the
+/// connection: it is how revocation reaches it.
+pub(crate) struct LiveGrant {
+    pub contract_id: ContractInstanceId,
+    pub guard: LiveGrantGuard,
+}
+
+/// Registration of one live connection under a grant. Dropping it deregisters.
+pub(crate) struct LiveGrantGuard {
+    state: AppGrantState,
+    hash: GrantTokenHash,
+    id: u64,
+    cancel: CancellationToken,
+}
+
+impl LiveGrantGuard {
+    /// Cancelled when the grant is revoked.
+    pub(crate) fn revoked(&self) -> CancellationToken {
+        self.cancel.clone()
+    }
+}
+
+impl Drop for LiveGrantGuard {
+    fn drop(&mut self) {
+        let mut live = self.state.0.live.lock();
+        if let Some(conns) = live.get_mut(&self.hash) {
+            conns.retain(|(id, _)| *id != self.id);
+            if conns.is_empty() {
+                live.remove(&self.hash);
+            }
+        }
+    }
+}
+
+impl AppGrantState {
+    pub(crate) fn new(op_manager: ExportOpManagerHandle) -> Self {
+        Self(Arc::new(Inner {
+            op_manager,
+            #[cfg(test)]
+            caps_override: Mutex::new(None),
+            pending: Mutex::new(HashMap::new()),
+            live: Mutex::new(HashMap::new()),
+            next_live_id: AtomicU64::new(0),
+            polls: AtomicUsize::new(0),
+        }))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_capabilities(caps: Arc<DelegateCapabilities>) -> Self {
+        let state = Self::new(ExportOpManagerHandle::default());
+        *state.0.caps_override.lock() = Some(caps);
+        state
+    }
+
+    fn capabilities(&self) -> Option<Arc<DelegateCapabilities>> {
+        #[cfg(test)]
+        if let Some(caps) = self.0.caps_override.lock().clone() {
+            return Some(caps);
+        }
+        self.0
+            .op_manager
+            .current()
+            .and_then(|om| om.delegate_capabilities())
+    }
+
+    /// Resolve a token presented on a WebSocket upgrade to the app it was
+    /// granted for. `None` when the token names no grant, the node has no grant
+    /// store (hosted, or not started yet), or the store could not be read
+    /// (fail closed).
+    ///
+    /// The connection is registered BEFORE the store is read. Revocation
+    /// deletes the row and THEN cancels registered connections, so either this
+    /// read misses the row or the revocation sees the registration: a
+    /// connection cannot slip between the two and outlive its grant.
+    pub(crate) fn resolve_connection(&self, token: &AuthToken) -> Option<LiveGrant> {
+        let caps = self.capabilities()?;
+        let hash = GrantTokenHash::of(token.as_str());
+        let guard = self.register_live(hash);
+        match caps.native_grant_for(hash) {
+            Ok(Some(grant)) => match grant.app {
+                AppIdentity::WebApp(contract_id) => Some(LiveGrant { contract_id, guard }),
+            },
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(error = %e, "Could not read native app grants; refusing the token");
+                None
+            }
+        }
+    }
+
+    fn register_live(&self, hash: GrantTokenHash) -> LiveGrantGuard {
+        let id = self.0.next_live_id.fetch_add(1, Ordering::Relaxed);
+        let cancel = CancellationToken::new();
+        self.0
+            .live
+            .lock()
+            .entry(hash)
+            .or_default()
+            .push((id, cancel.clone()));
+        LiveGrantGuard {
+            state: self.clone(),
+            hash,
+            id,
+            cancel,
+        }
+    }
+
+    /// Delete a grant and close its live connections. `Ok(false)` if there was
+    /// no such grant (live connections are closed regardless).
+    fn revoke(&self, caps: &DelegateCapabilities, hash: GrantTokenHash) -> anyhow::Result<bool> {
+        // Order matters, see `resolve_connection`: delete first, then cancel.
+        let removed = caps.revoke_native_grant(hash)?;
+        let conns = self.0.live.lock().remove(&hash).unwrap_or_default();
+        for (_, cancel) in conns {
+            cancel.cancel();
+        }
+        Ok(removed)
+    }
+
+    #[cfg(test)]
+    fn live_connections(&self, hash: GrantTokenHash) -> usize {
+        self.0.live.lock().get(&hash).map_or(0, Vec::len)
+    }
+}
+
+/// Drop expired requests. Called under the lock on every access, so nothing
+/// needs a background task.
+fn sweep_expired(pending: &mut HashMap<String, PendingRequest>, now: tokio::time::Instant) {
+    pending.retain(|_, p| now.duration_since(p.created) < REQUEST_TTL);
+}
+
+/// A random hex id for request ids, page ids and nonces.
+///
+/// `OsRng`, not `GlobalRng`: `request_id` collects a credential and the nonce
+/// guards its approval, so neither may come from the simulation RNG, whose
+/// seed tests fix (`.claude/rules/code-style.md`, the OsRng exception for key
+/// material). Called once per request or page render, never on a hot path.
+fn random_id() -> String {
+    use chacha20poly1305::aead::{OsRng, rand_core::RngCore};
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
+pub(super) fn routes() -> Router {
+    let refused = || axum::middleware::from_fn(refuse_when_hosted);
+    Router::new()
+        .route(ROUTE_REQUEST, post(create_request).layer(refused()))
+        .route(ROUTE_POLL, get(poll_request).layer(refused()))
+        .route(
+            ROUTE_APPROVE,
+            get(approve_page).post(approve_submit).layer(refused()),
+        )
+        .route(ROUTE_LIST, get(list_native_grants).layer(refused()))
+        .route(ROUTE_REVOKE, post(revoke_native_grant).layer(refused()))
+}
+
+fn refuse(status: StatusCode, reason: &'static str) -> Response {
+    (
+        status,
+        [("Cache-Control", "no-store")],
+        Json(serde_json::json!({ "error": reason })),
+    )
+        .into_response()
+}
+
+/// Any header a reverse proxy adds. A grant is handed out to, and approved
+/// from, this machine only; behind a proxy every client looks like loopback.
+fn has_forwarding_headers(headers: &HeaderMap) -> bool {
+    headers.keys().any(|name| {
+        let name = name.as_str();
+        name.starts_with("x-forwarded-") || name == "forwarded" || name == "x-real-ip"
+    })
+}
+
+/// `Origin` is exactly this node: same authority as `Host` (see
+/// [`origin_is_exactly_same_origin`]) and the `http` scheme, which is what a
+/// page served by the node over loopback carries. Forwarding headers are
+/// refused before this is consulted, so no proxy can be in front of us.
+fn origin_is_this_node(headers: &HeaderMap) -> bool {
+    origin_is_exactly_same_origin(headers)
+        && headers
+            .get(axum::http::header::ORIGIN)
+            .and_then(|o| o.to_str().ok())
+            .is_some_and(|o| o.len() > 7 && o[..7].eq_ignore_ascii_case("http://"))
+}
+
+/// Gate shared by every route here: the direct peer and the `Host` it asked
+/// for are both this machine, and nothing proxied the request.
+fn local_gate(
+    connect_info: Option<&Extension<ConnectInfo<SocketAddr>>>,
+    headers: &HeaderMap,
+) -> Result<(), Response> {
+    if !peer_is_loopback(connect_info.map(|Extension(ci)| ci)) {
+        return Err(refuse(StatusCode::FORBIDDEN, "loopback only"));
+    }
+    if has_forwarding_headers(headers) {
+        return Err(refuse(
+            StatusCode::FORBIDDEN,
+            "proxied requests are refused",
+        ));
+    }
+    if !host_is_loopback(headers) {
+        return Err(refuse(StatusCode::FORBIDDEN, "loopback host only"));
+    }
+    Ok(())
+}
+
+/// Gate for the request and poll endpoints, which only a native program may
+/// call. A browser always sends `Sec-Fetch-*` on these requests and `Origin`
+/// on a cross-origin POST; a native client sends neither.
+fn native_client_gate(
+    connect_info: Option<&Extension<ConnectInfo<SocketAddr>>>,
+    headers: &HeaderMap,
+) -> Result<(), Response> {
+    local_gate(connect_info, headers)?;
+    if headers.contains_key(axum::http::header::ORIGIN) {
+        return Err(refuse(
+            StatusCode::FORBIDDEN,
+            "this endpoint is for native clients; requests with an Origin are refused",
+        ));
+    }
+    if headers.keys().any(|n| n.as_str().starts_with("sec-fetch-")) {
+        return Err(refuse(
+            StatusCode::FORBIDDEN,
+            "this endpoint is for native clients; browser requests are refused",
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct CreateRequest {
+    /// The web app's container contract instance id.
+    app: String,
+    /// Self-reported, display only, shown as unverified.
+    #[serde(default)]
+    client_name: Option<String>,
+}
+
+async fn create_request(
+    connect_info: Option<Extension<ConnectInfo<SocketAddr>>>,
+    Extension(state): Extension<AppGrantState>,
+    headers: HeaderMap,
+    Json(body): Json<CreateRequest>,
+) -> Response {
+    if let Err(r) = native_client_gate(connect_info.as_ref(), &headers) {
+        return r;
+    }
+    let Ok(app) = ContractInstanceId::from_base58(&body.app) else {
+        return refuse(StatusCode::BAD_REQUEST, "invalid app");
+    };
+    if state.capabilities().is_none() {
+        return refuse(StatusCode::SERVICE_UNAVAILABLE, "node not ready");
+    }
+    let Some(host) = headers
+        .get(axum::http::header::HOST)
+        .and_then(|h| h.to_str().ok())
+    else {
+        return refuse(StatusCode::BAD_REQUEST, "missing host");
+    };
+    let client_name = sanitize_client_name(body.client_name.as_deref().unwrap_or(""));
+    let request_id = random_id();
+    let approve_id = random_id();
+    {
+        let mut pending = state.0.pending.lock();
+        sweep_expired(&mut pending, tokio::time::Instant::now());
+        if pending.len() >= MAX_PENDING_REQUESTS {
+            return refuse(
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many requests are waiting for approval",
+            );
+        }
+        let (changed, _) = watch::channel(());
+        pending.insert(
+            request_id.clone(),
+            PendingRequest {
+                approve_id: approve_id.clone(),
+                app,
+                client_name,
+                created: tokio::time::Instant::now(),
+                page_nonce: None,
+                outcome: Outcome::Pending,
+                changed,
+            },
+        );
+    }
+    tracing::info!(contract_id = %app, "Native app grant requested; waiting for user approval");
+    (
+        [("Cache-Control", "no-store")],
+        Json(serde_json::json!({
+            "request_id": request_id,
+            "approve_url": format!("http://{host}/v1/app-grants/approve/{approve_id}"),
+            "expires_in_secs": REQUEST_TTL.as_secs(),
+        })),
+    )
+        .into_response()
+}
+
+/// Releases a poll slot on drop.
+struct PollSlot(AppGrantState);
+
+impl Drop for PollSlot {
+    fn drop(&mut self) {
+        self.0.0.polls.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+enum PollStep {
+    Wait(watch::Receiver<()>),
+    Approved(ContractInstanceId, String, GrantToken),
+    Denied,
+    Unknown,
+}
+
+async fn poll_request(
+    connect_info: Option<Extension<ConnectInfo<SocketAddr>>>,
+    Extension(state): Extension<AppGrantState>,
+    headers: HeaderMap,
+    Path(request_id): Path<String>,
+) -> Response {
+    if let Err(r) = native_client_gate(connect_info.as_ref(), &headers) {
+        return r;
+    }
+    if state.0.polls.fetch_add(1, Ordering::AcqRel) >= MAX_CONCURRENT_POLLS {
+        state.0.polls.fetch_sub(1, Ordering::AcqRel);
+        return refuse(StatusCode::TOO_MANY_REQUESTS, "too many polls");
+    }
+    let _slot = PollSlot(state.clone());
+    let deadline = tokio::time::Instant::now() + POLL_WAIT;
+    loop {
+        let step = {
+            let mut pending = state.0.pending.lock();
+            sweep_expired(&mut pending, tokio::time::Instant::now());
+            match pending.get(&request_id).map(|p| &p.outcome) {
+                None => PollStep::Unknown,
+                Some(Outcome::Pending) => PollStep::Wait(pending[&request_id].changed.subscribe()),
+                Some(Outcome::Approved(_) | Outcome::Denied) => {
+                    // Taken out under the lock: whichever poll gets here first
+                    // is the only one that sees the outcome.
+                    match pending.remove(&request_id) {
+                        Some(PendingRequest {
+                            app,
+                            client_name,
+                            outcome: Outcome::Approved(token),
+                            ..
+                        }) => PollStep::Approved(app, client_name, token),
+                        Some(_) => PollStep::Denied,
+                        None => PollStep::Unknown,
+                    }
+                }
+            }
+        };
+        match step {
+            PollStep::Unknown => {
+                return refuse(StatusCode::NOT_FOUND, "unknown or expired request");
+            }
+            PollStep::Denied => {
+                return (
+                    [("Cache-Control", "no-store")],
+                    Json(serde_json::json!({ "status": "denied" })),
+                )
+                    .into_response();
+            }
+            PollStep::Approved(app, client_name, token) => {
+                let Some(caps) = state.capabilities() else {
+                    return refuse(StatusCode::SERVICE_UNAVAILABLE, "node not ready");
+                };
+                if let Err(e) =
+                    caps.create_native_grant(token.hash(), AppIdentity::WebApp(app), &client_name)
+                {
+                    tracing::warn!(error = %e, "Could not store a native app grant");
+                    return refuse(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "could not store the grant",
+                    );
+                }
+                tracing::info!(contract_id = %app, "Native app grant approved and issued");
+                return (
+                    [("Cache-Control", "no-store")],
+                    Json(serde_json::json!({
+                        "status": "approved",
+                        "app": app.to_string(),
+                        "token": token.expose(),
+                    })),
+                )
+                    .into_response();
+            }
+            PollStep::Wait(mut changed) => {
+                match tokio::time::timeout_at(deadline, changed.changed()).await {
+                    // Changed, or the request went away: look again.
+                    Ok(_) => continue,
+                    Err(_) => {
+                        return (
+                            StatusCode::ACCEPTED,
+                            [("Cache-Control", "no-store")],
+                            Json(serde_json::json!({ "status": "pending" })),
+                        )
+                            .into_response();
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn page_headers(script_nonce: &str) -> [(&'static str, String); 5] {
+    [
+        ("X-Frame-Options", "DENY".to_string()),
+        (
+            "Content-Security-Policy",
+            format!(
+                "default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-{script_nonce}'; \
+                 connect-src 'self'; form-action 'none'; base-uri 'none'; frame-ancestors 'none'"
+            ),
+        ),
+        ("Cache-Control", "no-store".to_string()),
+        ("Referrer-Policy", "no-referrer".to_string()),
+        ("X-Content-Type-Options", "nosniff".to_string()),
+    ]
+}
+
+fn message_page(status: StatusCode, text: &str) -> Response {
+    let html = include_str!("app_grants/assets/message.html").replace("{{MESSAGE}}", text);
+    (status, page_headers(&random_id()), Html(html)).into_response()
+}
+
+/// The approval page. Rendering mints a fresh nonce for the POST, replacing
+/// any earlier one, so only the newest page can answer.
+async fn approve_page(
+    connect_info: Option<Extension<ConnectInfo<SocketAddr>>>,
+    Extension(state): Extension<AppGrantState>,
+    headers: HeaderMap,
+    Path(approve_id): Path<String>,
+) -> Response {
+    if let Err(r) = local_gate(connect_info.as_ref(), &headers) {
+        return r;
+    }
+    let nonce = random_id();
+    let (app, client_name) = {
+        let mut pending = state.0.pending.lock();
+        sweep_expired(&mut pending, tokio::time::Instant::now());
+        let Some(p) = pending
+            .values_mut()
+            .find(|p| p.approve_id == approve_id && matches!(p.outcome, Outcome::Pending))
+        else {
+            drop(pending);
+            return message_page(
+                StatusCode::GONE,
+                "This request has expired or was already answered. Start again from the program that asked.",
+            );
+        };
+        p.page_nonce = Some(nonce.clone());
+        (p.app, p.client_name.clone())
+    };
+    let client_line = if client_name.is_empty() {
+        "The program did not name itself.".to_string()
+    } else {
+        format!(
+            "The program calls itself <q>{}</q>. Freenet has not verified this name.",
+            html_escape(&client_name)
+        )
+    };
+    let script_nonce = random_id();
+    let html = include_str!("app_grants/assets/approve.html")
+        .replace("{{APP}}", &app.to_string())
+        .replace("{{CLIENT_LINE}}", &client_line)
+        .replace("{{APPROVE_ID}}", &approve_id)
+        .replace("{{NONCE}}", &nonce)
+        .replace("{{ALLOW_DELAY_MS}}", &ALLOW_DELAY_MS.to_string())
+        .replace("{{SCRIPT_NONCE}}", &script_nonce);
+    (page_headers(&script_nonce), Html(html)).into_response()
+}
+
+#[derive(Deserialize)]
+struct ApproveSubmit {
+    nonce: String,
+    allow: bool,
+}
+
+async fn approve_submit(
+    connect_info: Option<Extension<ConnectInfo<SocketAddr>>>,
+    Extension(state): Extension<AppGrantState>,
+    headers: HeaderMap,
+    Path(approve_id): Path<String>,
+    Json(body): Json<ApproveSubmit>,
+) -> Response {
+    if let Err(r) = local_gate(connect_info.as_ref(), &headers) {
+        return r;
+    }
+    // Exactly the node's own origin. Not the any-localhost-port check: another
+    // local web server's page must not be able to approve.
+    if !origin_is_this_node(&headers) {
+        return refuse(StatusCode::FORBIDDEN, "origin mismatch");
+    }
+    let mut pending = state.0.pending.lock();
+    sweep_expired(&mut pending, tokio::time::Instant::now());
+    let Some(p) = pending.values_mut().find(|p| p.approve_id == approve_id) else {
+        return refuse(StatusCode::GONE, "unknown or expired request");
+    };
+    if !matches!(p.outcome, Outcome::Pending) {
+        return refuse(StatusCode::GONE, "already answered");
+    }
+    // Single use: the nonce is taken whether or not it matches.
+    let Some(expected) = p.page_nonce.take() else {
+        return refuse(StatusCode::FORBIDDEN, "invalid nonce");
+    };
+    let matches: bool =
+        subtle::ConstantTimeEq::ct_eq(expected.as_bytes(), body.nonce.as_bytes()).into();
+    if !matches {
+        return refuse(StatusCode::FORBIDDEN, "invalid nonce");
+    }
+    p.outcome = if body.allow {
+        Outcome::Approved(GrantToken::generate())
+    } else {
+        Outcome::Denied
+    };
+    p.changed.send_replace(());
+    tracing::info!(contract_id = %p.app, allowed = body.allow, "Native app grant request answered");
+    (
+        [("Cache-Control", "no-store")],
+        Json(serde_json::json!({ "ok": true })),
+    )
+        .into_response()
+}
+
+/// Native app grants for the Apps and permissions page. Same read gate as
+/// `/permission/grants`.
+async fn list_native_grants(
+    connect_info: Option<Extension<ConnectInfo<SocketAddr>>>,
+    Extension(state): Extension<AppGrantState>,
+    headers: HeaderMap,
+    allowed_hosts: Option<Extension<AllowedHosts>>,
+    allowed_source_cidrs: Option<Extension<AllowedSourceCidrs>>,
+) -> Response {
+    if !peer_is_loopback(connect_info.as_ref().map(|Extension(ci)| ci)) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let allowed_hosts = allowed_hosts.as_ref().map(|Extension(v)| v);
+    let allowed_source_cidrs = allowed_source_cidrs.as_ref().map(|Extension(v)| v);
+    let empty = serde_json::json!({ "grants": [] });
+    if !grants_read_trusted(&headers, allowed_hosts, allowed_source_cidrs) {
+        return Json(empty).into_response();
+    }
+    let Some(caps) = state.capabilities() else {
+        return Json(empty).into_response();
+    };
+    match caps.native_grants() {
+        Ok(grants) => {
+            let rows: Vec<_> = grants
+                .into_iter()
+                .map(|(hash, g)| {
+                    serde_json::json!({
+                        "id": hash.to_hex(),
+                        "app": g.app.display(),
+                        "client_name": g.client_name,
+                        "created_at_ms": g.created_at_ms,
+                        "last_used_at_ms": g.last_used_at_ms,
+                    })
+                })
+                .collect();
+            Json(serde_json::json!({ "grants": rows })).into_response()
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to list native app grants");
+            Json(serde_json::json!({ "grants": [], "error": "could not read the grant store" }))
+                .into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct RevokeNativeGrant {
+    /// The grant id as `/permission/native-grants` lists it.
+    id: String,
+}
+
+/// Revoke a native app grant: delete it and close its live connections.
+/// State-changing, so loopback peer and an Origin exactly equal to the node's.
+async fn revoke_native_grant(
+    connect_info: Option<Extension<ConnectInfo<SocketAddr>>>,
+    Extension(state): Extension<AppGrantState>,
+    headers: HeaderMap,
+    Json(body): Json<RevokeNativeGrant>,
+) -> Response {
+    if !peer_is_loopback(connect_info.as_ref().map(|Extension(ci)| ci)) {
+        return refuse(StatusCode::FORBIDDEN, "forbidden");
+    }
+    if has_forwarding_headers(&headers) || !origin_is_this_node(&headers) {
+        return refuse(StatusCode::FORBIDDEN, "forbidden");
+    }
+    let Some(hash) = GrantTokenHash::from_hex(&body.id) else {
+        return refuse(StatusCode::BAD_REQUEST, "invalid id");
+    };
+    let Some(caps) = state.capabilities() else {
+        return refuse(StatusCode::SERVICE_UNAVAILABLE, "node not ready");
+    };
+    match state.revoke(&caps, hash) {
+        Ok(true) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Ok(false) => refuse(StatusCode::NOT_FOUND, "no such grant"),
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to revoke a native app grant");
+            refuse(StatusCode::INTERNAL_SERVER_ERROR, "could not revoke")
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;

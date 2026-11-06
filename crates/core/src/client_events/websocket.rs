@@ -221,6 +221,7 @@ use crate::{
 use super::{ClientError, ClientEventsProxy, ClientId, ConnectionScope, HostResult, OpenRequest};
 use crate::client_events::user_op_rate_limit::UserOpRateLimiter;
 use crate::server::client_api::OriginContractMap;
+use crate::server::client_api::app_grants::{AppGrantState, LiveGrantGuard};
 use crate::wasm_runtime::UserSecretContext;
 
 /// Checks if a WebSocket Origin header value refers to localhost.
@@ -959,6 +960,13 @@ pub(crate) fn decide_user_token(
     }
 }
 
+/// Whether the connection's auth token came from the `Authorization: Bearer`
+/// header (as opposed to the `authToken` query parameter). Set by
+/// [`connection_info`]; a native app grant (#5264) is honoured only from the
+/// header.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AuthTokenFromHeader(pub(crate) bool);
+
 async fn connection_info(
     Query(ConnectionInfo {
         auth_token: auth_token_q,
@@ -999,8 +1007,16 @@ async fn connection_info(
         }
     };
 
+    // Whether the token arrived in the `Authorization` header rather than the
+    // query string. A native app grant token (#5264) is honoured only from the
+    // header, so it never has to appear in a URL (where proxies, the trace
+    // layer and browser history would record it).
+    let mut token_from_header = false;
     let auth_token = match req.headers().typed_try_get::<Authorization<Bearer>>() {
-        Ok(Some(value)) => Some(AuthToken::from(value.token().to_owned())),
+        Ok(Some(value)) => {
+            token_from_header = true;
+            Some(AuthToken::from(value.token().to_owned()))
+        }
         Ok(None) => auth_token_q.clone(),
         Err(_error) => {
             return (
@@ -1198,6 +1214,8 @@ async fn connection_info(
     let connection_scope = ConnectionScope::from_source_ip(source_ip);
     req.extensions_mut().insert(encoding_protoc);
     req.extensions_mut().insert(auth_token);
+    req.extensions_mut()
+        .insert(AuthTokenFromHeader(token_from_header));
     req.extensions_mut().insert(user_context);
     req.extensions_mut().insert(connection_scope);
     // `streaming` query parameter is accepted but ignored — streaming is now
@@ -1236,6 +1254,11 @@ async fn websocket_commands(
     // standalone test paths install nothing, so absence ⇒ no activity stamping.
     activity_secrets_dir: Option<Extension<crate::server::ActivitySecretsDir>>,
     Extension(hosted_mode): Extension<crate::server::HostedMode>,
+    // Native app grants (#5264): consulted when the token is not a shell-page
+    // token. OPTIONAL: only `serve_client_api_in_impl` installs it on the
+    // WebSocket routes, so standalone test routers honour no grants.
+    app_grants: Option<Extension<AppGrantState>>,
+    token_from_header: Option<Extension<AuthTokenFromHeader>>,
 ) -> Response {
     // A hosted node serves its client API only to a connection that presented
     // a user token: every request on it runs under that user's namespace, and
@@ -1258,21 +1281,34 @@ async fn websocket_commands(
     }
     let op_rate_limiter = op_rate_limiter.map(|Extension(l)| l);
     let activity_secrets_dir = activity_secrets_dir.map(|Extension(d)| d);
+    // A grant is never honoured on a hosted node (whose connections run under a
+    // per-user namespace), nor for a token taken from the query string.
+    let app_grants = app_grants
+        .map(|Extension(g)| g)
+        .filter(|_| !hosted_mode.0 && token_from_header.is_some_and(|Extension(h)| h.0));
     let on_upgrade = move |ws: WebSocket| async move {
+        // Held for the connection's life when it was opened with a native app
+        // grant; revoking the grant cancels it and closes the connection.
+        let mut live_grant: Option<LiveGrantGuard> = None;
         // Get the data we need from the DashMap
         // Track whether a token was provided but is invalid (stale/expired)
         let (auth_and_instance, token_is_invalid) = if let Some(token) = auth_token.as_ref() {
-            // Only collect and log map contents when trace is enabled
-            if tracing::enabled!(tracing::Level::TRACE) {
-                let map_contents: Vec<_> =
-                    origin_contracts.iter().map(|e| e.key().clone()).collect();
-                tracing::trace!(?token, "origin_contracts map keys: {:?}", map_contents);
-            }
-
+            // Tokens are credentials: never log them (`AuthToken`'s Debug is
+            // redacted, and nothing here prints the raw value).
             if let Some(entry) = origin_contracts.get(token) {
                 let origin = entry.value();
-                tracing::trace!(?token, contract_id = ?origin.contract_id, "Found token in origin_contracts map");
+                tracing::trace!(contract_id = ?origin.contract_id, "Found token in origin_contracts map");
                 (Some((token.clone(), origin.contract_id)), false)
+            } else if let Some(grant) = app_grants
+                .as_ref()
+                .and_then(|g| g.resolve_connection(token))
+            {
+                // A user-approved native app grant (#5264). From here on the
+                // connection is handled exactly as a shell-page token for the
+                // same app: same `(token, contract)` pair, same scope gate.
+                tracing::debug!(contract_id = %grant.contract_id, "Connection opened with a native app grant");
+                live_grant = Some(grant.guard);
+                (Some((token.clone(), grant.contract_id)), false)
             } else {
                 // Rate-limit warnings: only log once per unique token to avoid log spam
                 // when clients repeatedly retry with the same stale token
@@ -1289,14 +1325,14 @@ async fn websocket_commands(
                 if warned.insert(token_str) {
                     // First time seeing this invalid token - log it
                     tracing::warn!(
-                        ?token,
-                        "Auth token not found in origin_contracts map. \
-                         This usually means the node was restarted and the client has a stale token. \
+                        "Auth token not found in origin_contracts map or among app grants. \
+                         This usually means the node was restarted and the client has a stale token, \
+                         or an app grant was revoked. \
                          Client should refresh the page to get a new token."
                     );
                 } else {
                     // Already warned about this token - use debug level to reduce noise
-                    tracing::debug!(?token, "Auth token still not found (already warned)");
+                    tracing::debug!("Auth token still not found (already warned)");
                 }
                 (None, true) // Token was provided but is invalid
             }
@@ -1319,6 +1355,7 @@ async fn websocket_commands(
             op_rate_limiter,
             activity_secrets_dir,
             token_is_invalid,
+            live_grant,
             encoding_protoc,
             api_version,
             ws,
@@ -1410,6 +1447,10 @@ async fn websocket_interface(
     // when this connection carries a `user_context` (hosted mode).
     activity_secrets_dir: Option<crate::server::ActivitySecretsDir>,
     token_is_invalid: bool,
+    // Set when the connection was opened with a native app grant (#5264).
+    // Revoking the grant cancels it, and the loop below then closes the
+    // connection. Dropped (deregistered) when this function returns.
+    live_grant: Option<LiveGrantGuard>,
     encoding_protoc: EncodingProtocol,
     api_version: ApiVersion,
     ws: WebSocket,
@@ -1496,6 +1537,12 @@ async fn websocket_interface(
 
     // Per-connection rate limiter for delegate operations (#3305, #3332)
     let mut delegate_rate_limiter = DelegateRateLimiter::new();
+
+    // Never cancelled for a connection that holds no grant.
+    let grant_revoked = live_grant
+        .as_ref()
+        .map(LiveGrantGuard::revoked)
+        .unwrap_or_default();
 
     // Create ping interval to keep connection alive and prevent idle timeout
     let mut ping_interval = tokio::time::interval(WEBSOCKET_PING_INTERVAL);
@@ -1629,6 +1676,24 @@ async fn websocket_interface(
                     notify_disconnect(&request_sender, client_id, &auth_token, connection_scope, api_version).await;
                     return Err(err.into());
                 }
+            }
+            // The native app grant this connection was opened with was revoked
+            // (#5264). Close with the same trusted code as an invalid token: the
+            // credential is no longer valid. `cancelled()` is cancel-safe and
+            // event-driven, so an idle connection does not wake for it.
+            _ = grant_revoked.cancelled() => {
+                tracing::info!(%client_id, "Closing a connection whose app grant was revoked");
+                notify_disconnect(&request_sender, client_id, &auth_token, connection_scope, api_version).await;
+                if let Err(e) = server_sink
+                    .send(Message::Close(Some(CloseFrame {
+                        code: AUTH_TOKEN_INVALID_CLOSE_CODE,
+                        reason: "app grant revoked".into(),
+                    })))
+                    .await
+                {
+                    tracing::debug!(error = %e, "Failed to send WebSocket close frame after grant revocation");
+                }
+                return Ok(());
             }
             // Send periodic pings to keep connection alive and prevent idle timeout
             _ = ping_interval.tick() => {
@@ -3086,6 +3151,7 @@ mod tests {
                         None,
                         None,
                         true,
+                        None,
                         EncodingProtocol::Native,
                         ApiVersion::V1,
                         socket,
@@ -5083,6 +5149,7 @@ mod tests {
                         None,
                         None,
                         false,
+                        None,
                         EncodingProtocol::Native,
                         ApiVersion::V1,
                         socket,

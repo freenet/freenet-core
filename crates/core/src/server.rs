@@ -637,6 +637,12 @@ async fn serve_client_api_in_impl(
     // connection never writes a marker even if a path is present.
     let activity_secrets_dir = ActivitySecretsDir(Arc::new(config.secrets_dir.clone()));
 
+    // Native app grants (#5264): the WebSocket routes need the same state the
+    // HTTP grant routes use, to resolve a grant token on upgrade and to be
+    // closed on revocation. The gw router has it already; this outer layer
+    // covers the WebSocket routes merged on top of it.
+    let ws_router = ws_router.layer(Extension(gw.app_grants()));
+
     let needs_lan_filter = !config.address.is_loopback();
     let router = if needs_lan_filter {
         // Layer ordering matters: axum executes layers bottom-to-top per

@@ -58,6 +58,11 @@
         font-weight: 600;
         margin-bottom: 8px;
       }
+      h2 {
+        font-size: 16px;
+        font-weight: 600;
+        margin: 24px 0 8px;
+      }
       p.intro {
         color: var(--muted);
         font-size: 14px;
@@ -125,6 +130,13 @@
       </p>
       <div id="list"><div class="empty">Loading...</div></div>
       <div id="error" class="error" hidden></div>
+      <h2>Programs using an app</h2>
+      <p class="intro">
+        Programs on this computer you allowed to use an app with your data, as
+        the app's own page can. Revoking disconnects the program at once; it
+        has to ask you again.
+      </p>
+      <div id="native"><div class="empty">Loading...</div></div>
       <details class="stats">
         <summary>Counters</summary>
         <pre id="stats"></pre>
@@ -211,7 +223,82 @@
               },
             );
         }
+        var native = document.getElementById('native');
+        function nativeRow(g) {
+          var r = document.createElement('div');
+          r.className = 'row';
+          var what = document.createElement('div');
+          what.className = 'what';
+          var line = document.createElement('div');
+          line.textContent = g.client_name
+            ? 'A program calling itself "' + g.client_name + '" (unverified)'
+            : 'A program that did not name itself';
+          var app = document.createElement('div');
+          app.className = 'app';
+          app.textContent =
+            'Freenet app ' +
+            g.app +
+            ' - allowed ' +
+            new Date(g.created_at_ms).toLocaleString() +
+            ', last used ' +
+            new Date(g.last_used_at_ms).toLocaleString();
+          what.appendChild(line);
+          what.appendChild(app);
+          var btn = document.createElement('button');
+          btn.textContent = 'Revoke';
+          btn.onclick = function () {
+            btn.disabled = true;
+            fetch('/permission/native-grants/revoke', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ id: g.id }),
+            }).then(
+              function (r) {
+                if (!r.ok) {
+                  showError('Could not revoke (HTTP ' + r.status + ').');
+                }
+                loadNative();
+              },
+              function () {
+                showError('Could not reach the node.');
+                loadNative();
+              },
+            );
+          };
+          r.appendChild(what);
+          r.appendChild(btn);
+          return r;
+        }
+        function loadNative() {
+          fetch('/permission/native-grants')
+            .then(function (r) {
+              return r.json();
+            })
+            .then(
+              function (body) {
+                if (body && body.error) {
+                  showError(body.error);
+                }
+                var grants = (body && body.grants) || [];
+                native.textContent = '';
+                if (!grants.length) {
+                  var e = document.createElement('div');
+                  e.className = 'empty';
+                  e.textContent = 'No program has been allowed to use an app.';
+                  native.appendChild(e);
+                  return;
+                }
+                grants.forEach(function (g) {
+                  native.appendChild(nativeRow(g));
+                });
+              },
+              function () {
+                native.textContent = 'Could not load programs.';
+              },
+            );
+        }
         load();
+        loadNative();
       })();
     </script>
   </body>

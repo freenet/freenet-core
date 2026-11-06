@@ -1,0 +1,358 @@
+//! Native app grants: a user-approved, durable, revocable credential that lets
+//! a non-browser client (for example a desktop app) act as a given web app's
+//! identity when it talks to delegates. This is the first "non-browser client"
+//! piece of #5264.
+//!
+//! A browser tab gets its app identity from the shell page the node serves for
+//! that app. A native client has no shell page, so it asks the node over plain
+//! HTTP, the user approves in the browser, and the node hands the client a
+//! token. A WebSocket connection presenting the token is then treated exactly
+//! like a browser connection for that app: delegate requests carry
+//! `MessageOrigin::WebApp(<app>)`.
+//!
+//! What is stored: only the SHA-256 of the token, keyed to the grant record.
+//! The token itself exists in the node's memory only between approval and the
+//! one poll that hands it to the client.
+//!
+//! The approval flow and its gates live in `server::client_api::app_grants`.
+//!
+//! What this does NOT protect against: a malicious program already running as
+//! the same user. The approval step defends against web content and gives the
+//! user a visible, revocable record; it is not a boundary between local
+//! processes of the same user. Closing that needs the authentication half of
+//! #5264.
+
+use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
+
+use super::{AppIdentity, DelegateCapabilities};
+
+/// Upper bound on stored native grants. Creating one more is refused until the
+/// user revokes one; a real user approves a handful.
+pub(crate) const MAX_NATIVE_GRANTS: usize = 64;
+
+/// Longest client name kept, in characters. The name is display-only and is
+/// never presented as verified.
+pub(crate) const MAX_CLIENT_NAME_CHARS: usize = 64;
+
+/// A refresh of `last_used_at` is written at most this often per grant, so a
+/// client that reconnects in a loop does not turn every connect into a write.
+const LAST_USED_WRITE_INTERVAL_MS: u64 = 60 * 60 * 1000;
+
+const RECORD_VERSION: u8 = 1;
+
+/// The bearer credential handed to a native client.
+///
+/// 32 bytes from the OS entropy pool, base58-encoded. `Debug` is redacted so the
+/// token cannot reach a log through a `?token` field; the buffer is wiped on
+/// drop.
+#[derive(Clone)]
+pub(crate) struct GrantToken(Zeroizing<String>);
+
+impl GrantToken {
+    /// Mint a fresh token.
+    ///
+    /// Uses `OsRng`, not `GlobalRng`: this is a durable credential, so it must
+    /// not come from the simulation RNG, whose seed tests fix for
+    /// reproducibility (`.claude/rules/code-style.md`, the OsRng exception for
+    /// key material). Called once per user approval, never on a hot path.
+    pub(crate) fn generate() -> Self {
+        use chacha20poly1305::aead::{OsRng, rand_core::RngCore};
+        let mut bytes = Zeroizing::new([0u8; 32]);
+        OsRng.fill_bytes(bytes.as_mut_slice());
+        Self(Zeroizing::new(bs58::encode(bytes.as_slice()).into_string()))
+    }
+
+    /// The token as the client must present it (`Authorization: Bearer ...`).
+    pub(crate) fn expose(&self) -> &str {
+        self.0.as_str()
+    }
+
+    pub(crate) fn hash(&self) -> GrantTokenHash {
+        GrantTokenHash::of(self.expose())
+    }
+}
+
+impl std::fmt::Debug for GrantToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("GrantToken(<redacted>)")
+    }
+}
+
+/// SHA-256 of a grant token: the storage key, and the id the dashboard uses to
+/// name a grant for revocation. Not a secret: it cannot be presented in place
+/// of the token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct GrantTokenHash(pub(crate) [u8; 32]);
+
+impl GrantTokenHash {
+    pub(crate) fn of(token: &str) -> Self {
+        Self(Sha256::digest(token.as_bytes()).into())
+    }
+
+    pub(crate) fn to_hex(self) -> String {
+        hex::encode(self.0)
+    }
+
+    pub(crate) fn from_hex(s: &str) -> Option<Self> {
+        let bytes = hex::decode(s).ok()?;
+        Some(Self(bytes.try_into().ok()?))
+    }
+}
+
+/// One stored grant.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct NativeGrant {
+    pub app: AppIdentity,
+    /// The name the requesting program gave itself. Display only, never
+    /// verified, and always labelled as such.
+    pub client_name: String,
+    pub created_at_ms: u64,
+    pub last_used_at_ms: u64,
+}
+
+impl NativeGrant {
+    fn encode(&self) -> Vec<u8> {
+        let name = self.client_name.as_bytes();
+        let name_len = name.len().min(u8::MAX as usize);
+        let mut out = Vec::with_capacity(1 + AppIdentity::ENCODED_LEN + 16 + 1 + name_len);
+        out.push(RECORD_VERSION);
+        out.extend_from_slice(&self.app.encode());
+        out.extend_from_slice(&self.created_at_ms.to_be_bytes());
+        out.extend_from_slice(&self.last_used_at_ms.to_be_bytes());
+        out.push(name_len as u8);
+        out.extend_from_slice(&name[..name_len]);
+        out
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        let (&version, rest) = bytes.split_first()?;
+        if version != RECORD_VERSION {
+            return None;
+        }
+        let (app, rest) = rest.split_at_checked(AppIdentity::ENCODED_LEN)?;
+        let app = AppIdentity::decode(app)?;
+        let (created, rest) = rest.split_at_checked(8)?;
+        let (last_used, rest) = rest.split_at_checked(8)?;
+        let (&name_len, rest) = rest.split_first()?;
+        let name = rest.get(..name_len as usize)?;
+        Some(Self {
+            app,
+            client_name: String::from_utf8_lossy(name).into_owned(),
+            created_at_ms: u64::from_be_bytes(created.try_into().ok()?),
+            last_used_at_ms: u64::from_be_bytes(last_used.try_into().ok()?),
+        })
+    }
+}
+
+/// Keep a requester-supplied name short and printable. It is still untrusted
+/// text: callers must escape it for HTML.
+pub(crate) fn sanitize_client_name(name: &str) -> String {
+    name.chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_CLIENT_NAME_CHARS)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+impl DelegateCapabilities {
+    /// Store a new grant for `token_hash`. Refused once [`MAX_NATIVE_GRANTS`]
+    /// grants exist.
+    pub(crate) fn create_native_grant(
+        &self,
+        token_hash: GrantTokenHash,
+        app: AppIdentity,
+        client_name: &str,
+    ) -> anyhow::Result<()> {
+        if self.storage.all_native_grants()?.len() >= MAX_NATIVE_GRANTS {
+            anyhow::bail!(
+                "too many app grants ({MAX_NATIVE_GRANTS}); revoke one on the Apps and permissions page"
+            );
+        }
+        let now = self.now_ms();
+        let grant = NativeGrant {
+            app,
+            client_name: sanitize_client_name(client_name),
+            created_at_ms: now,
+            last_used_at_ms: now,
+        };
+        self.storage
+            .put_native_grant(&token_hash.0, &grant.encode())
+    }
+
+    /// The grant a presented token names, if any. Refreshes `last_used_at`
+    /// (at most once per [`LAST_USED_WRITE_INTERVAL_MS`]); a failed refresh is
+    /// logged and does not refuse the connection.
+    pub(crate) fn native_grant_for(
+        &self,
+        token_hash: GrantTokenHash,
+    ) -> anyhow::Result<Option<NativeGrant>> {
+        let Some(bytes) = self.storage.get_native_grant(&token_hash.0)? else {
+            return Ok(None);
+        };
+        let Some(mut grant) = NativeGrant::decode(&bytes) else {
+            tracing::warn!("Unreadable native app grant record; treating it as absent");
+            return Ok(None);
+        };
+        let now = self.now_ms();
+        if now.saturating_sub(grant.last_used_at_ms) >= LAST_USED_WRITE_INTERVAL_MS {
+            grant.last_used_at_ms = now;
+            if let Err(e) = self
+                .storage
+                .put_native_grant(&token_hash.0, &grant.encode())
+            {
+                tracing::debug!(error = %e, "Could not refresh a native app grant's last use");
+            }
+        }
+        Ok(Some(grant))
+    }
+
+    /// Delete a grant. `true` if it existed.
+    pub(crate) fn revoke_native_grant(&self, token_hash: GrantTokenHash) -> anyhow::Result<bool> {
+        self.storage.remove_native_grant(&token_hash.0)
+    }
+
+    /// Every stored grant, oldest first. Unreadable rows are skipped.
+    pub(crate) fn native_grants(&self) -> anyhow::Result<Vec<(GrantTokenHash, NativeGrant)>> {
+        let mut out: Vec<_> = self
+            .storage
+            .all_native_grants()?
+            .into_iter()
+            .filter_map(|(hash, bytes)| {
+                NativeGrant::decode(&bytes).map(|g| (GrantTokenHash(hash), g))
+            })
+            .collect();
+        out.sort_by_key(|(_, g)| g.created_at_ms);
+        Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::contract::delegate_capabilities::{CapabilityStorage, MemoryCapabilityStorage};
+    use freenet_stdlib::prelude::ContractInstanceId;
+    use std::sync::Arc;
+
+    fn app(n: u8) -> AppIdentity {
+        AppIdentity::WebApp(ContractInstanceId::new([n; 32]))
+    }
+
+    #[test]
+    fn token_is_32_random_bytes_and_debug_is_redacted() {
+        let a = GrantToken::generate();
+        let b = GrantToken::generate();
+        assert_ne!(a.expose(), b.expose());
+        let raw = bs58::decode(a.expose()).into_vec().unwrap();
+        assert_eq!(raw.len(), 32);
+        let dbg = format!("{a:?} {:?}", Some(&a));
+        assert!(!dbg.contains(a.expose()), "Debug leaked the token: {dbg}");
+        assert!(dbg.contains("redacted"));
+    }
+
+    #[test]
+    fn hash_is_sha256_of_the_presented_string() {
+        let t = GrantToken::generate();
+        let expected: [u8; 32] = Sha256::digest(t.expose().as_bytes()).into();
+        assert_eq!(t.hash().0, expected);
+        assert_eq!(GrantTokenHash::of(t.expose()), t.hash());
+        let hex = t.hash().to_hex();
+        assert_eq!(GrantTokenHash::from_hex(&hex), Some(t.hash()));
+        assert_eq!(GrantTokenHash::from_hex("abcd"), None);
+    }
+
+    #[test]
+    fn record_round_trips_and_rejects_garbage() {
+        let g = NativeGrant {
+            app: app(3),
+            client_name: "River desktop".into(),
+            created_at_ms: 1,
+            last_used_at_ms: 2,
+        };
+        assert_eq!(NativeGrant::decode(&g.encode()), Some(g.clone()));
+        let bytes = g.encode();
+        assert_eq!(NativeGrant::decode(&bytes[..bytes.len() - 1]), None);
+        assert_eq!(NativeGrant::decode(&[]), None);
+        let mut wrong_version = bytes.clone();
+        wrong_version[0] = 9;
+        assert_eq!(NativeGrant::decode(&wrong_version), None);
+    }
+
+    #[test]
+    fn client_name_is_trimmed_and_stripped_of_controls() {
+        assert_eq!(sanitize_client_name("  a\u{7}b\n "), "ab");
+        assert_eq!(
+            sanitize_client_name(&"x".repeat(500)).chars().count(),
+            MAX_CLIENT_NAME_CHARS
+        );
+    }
+
+    #[test]
+    fn create_lookup_revoke() {
+        let storage = Arc::new(MemoryCapabilityStorage::default());
+        let c = DelegateCapabilities::new(storage.clone());
+        let t = GrantToken::generate();
+        c.create_native_grant(t.hash(), app(1), "River desktop")
+            .unwrap();
+        let g = c.native_grant_for(t.hash()).unwrap().unwrap();
+        assert_eq!(g.app, app(1));
+        assert_eq!(g.client_name, "River desktop");
+        // Only the hash is a key; the raw token appears nowhere in storage.
+        for (k, v) in storage.all_native_grants().unwrap() {
+            assert_eq!(k, t.hash().0);
+            let needle = t.expose().as_bytes();
+            assert!(!v.windows(needle.len()).any(|w| w == needle));
+        }
+        assert!(c.revoke_native_grant(t.hash()).unwrap());
+        assert!(!c.revoke_native_grant(t.hash()).unwrap());
+        assert_eq!(c.native_grant_for(t.hash()).unwrap(), None);
+    }
+
+    #[test]
+    fn creation_is_capped() {
+        let c = DelegateCapabilities::new(Arc::new(MemoryCapabilityStorage::default()));
+        for _ in 0..MAX_NATIVE_GRANTS {
+            c.create_native_grant(GrantToken::generate().hash(), app(1), "x")
+                .unwrap();
+        }
+        assert!(
+            c.create_native_grant(GrantToken::generate().hash(), app(1), "x")
+                .is_err()
+        );
+        assert_eq!(c.native_grants().unwrap().len(), MAX_NATIVE_GRANTS);
+    }
+
+    /// The grant (by token hash) survives a node restart: the redb table is
+    /// reopened from disk, and the token still resolves to its app.
+    #[cfg(feature = "redb")]
+    #[tokio::test]
+    async fn grant_survives_a_reopen_and_only_the_hash_is_on_disk() {
+        let dir = crate::util::tests::get_temp_dir();
+        let token = GrantToken::generate();
+        {
+            let db = crate::contract::storages::Storage::new(dir.path())
+                .await
+                .unwrap();
+            let c = DelegateCapabilities::new(Arc::new(db));
+            c.create_native_grant(token.hash(), app(7), "River desktop")
+                .unwrap();
+        }
+        let db = crate::contract::storages::Storage::new(dir.path())
+            .await
+            .unwrap();
+        let rows = db.load_all_native_app_grants().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, token.hash().0);
+        let needle = token.expose().as_bytes();
+        assert!(!rows[0].1.windows(needle.len()).any(|w| w == needle));
+        let c = DelegateCapabilities::new(Arc::new(db));
+        let g = c.native_grant_for(token.hash()).unwrap().unwrap();
+        assert_eq!(g.app, app(7));
+        // Nothing else resolves.
+        assert_eq!(
+            c.native_grant_for(GrantToken::generate().hash()).unwrap(),
+            None
+        );
+    }
+}

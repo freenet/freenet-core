@@ -102,6 +102,10 @@ use tokio::sync::mpsc;
 
 use crate::util::time_source::{DynTimeSource, InstantTimeSrc, TimeSource};
 
+mod native_grants;
+
+pub(crate) use native_grants::{GrantToken, GrantTokenHash, sanitize_client_name};
+
 /// Apps one delegate can be bound to. Above this a new binding is not recorded
 /// (the delegate keeps working in the foreground for that app).
 pub(crate) const MAX_APPS_PER_DELEGATE: usize = 8;
@@ -169,9 +173,9 @@ pub(crate) enum AppIdentity {
 
 impl AppIdentity {
     const TAG_WEBAPP: u8 = 1;
-    const ENCODED_LEN: usize = 33;
+    pub(crate) const ENCODED_LEN: usize = 33;
 
-    fn encode(&self) -> [u8; Self::ENCODED_LEN] {
+    pub(crate) fn encode(&self) -> [u8; Self::ENCODED_LEN] {
         let mut out = [0u8; Self::ENCODED_LEN];
         match self {
             AppIdentity::WebApp(id) => {
@@ -182,7 +186,7 @@ impl AppIdentity {
         out
     }
 
-    fn decode(bytes: &[u8]) -> Option<Self> {
+    pub(crate) fn decode(bytes: &[u8]) -> Option<Self> {
         if bytes.len() != Self::ENCODED_LEN {
             return None;
         }
@@ -399,6 +403,14 @@ pub(crate) trait CapabilityStorage: Send + Sync {
     fn get_grant(&self, key: &[u8]) -> anyhow::Result<Option<Vec<u8>>>;
     fn remove_grant(&self, key: &[u8]) -> anyhow::Result<()>;
     fn all_grants(&self) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>>;
+    /// Native app grants (#5264), keyed by the SHA-256 of the grant token.
+    /// Encoding is owned by `delegate_capabilities::native_grants`.
+    fn put_native_grant(&self, token_hash: &[u8; 32], value: &[u8]) -> anyhow::Result<()>;
+    fn get_native_grant(&self, token_hash: &[u8; 32]) -> anyhow::Result<Option<Vec<u8>>>;
+    /// Remove a native grant; `true` if a row was removed.
+    fn remove_native_grant(&self, token_hash: &[u8; 32]) -> anyhow::Result<bool>;
+    #[allow(clippy::type_complexity)]
+    fn all_native_grants(&self) -> anyhow::Result<Vec<([u8; 32], Vec<u8>)>>;
 }
 
 #[cfg(feature = "redb")]
@@ -427,6 +439,18 @@ impl CapabilityStorage for crate::contract::storages::redb::ReDb {
     fn all_grants(&self) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
         Ok(self.load_all_app_capability_grants()?)
     }
+    fn put_native_grant(&self, token_hash: &[u8; 32], value: &[u8]) -> anyhow::Result<()> {
+        Ok(self.put_native_app_grant(token_hash, value)?)
+    }
+    fn get_native_grant(&self, token_hash: &[u8; 32]) -> anyhow::Result<Option<Vec<u8>>> {
+        Ok(self.get_native_app_grant(token_hash)?)
+    }
+    fn remove_native_grant(&self, token_hash: &[u8; 32]) -> anyhow::Result<bool> {
+        Ok(self.remove_native_app_grant(token_hash)?)
+    }
+    fn all_native_grants(&self) -> anyhow::Result<Vec<([u8; 32], Vec<u8>)>> {
+        Ok(self.load_all_native_app_grants()?)
+    }
 }
 
 /// In-process storage. See [`CapabilityStorage`].
@@ -435,6 +459,7 @@ impl CapabilityStorage for crate::contract::storages::redb::ReDb {
 pub(crate) struct MemoryCapabilityStorage {
     records: Mutex<HashMap<DelegateKey, Vec<u8>>>,
     grants: Mutex<HashMap<Vec<u8>, Vec<u8>>>,
+    native_grants: Mutex<HashMap<[u8; 32], Vec<u8>>>,
 }
 
 #[cfg(any(test, not(feature = "redb")))]
@@ -475,6 +500,26 @@ impl CapabilityStorage for MemoryCapabilityStorage {
             .lock()
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
+            .collect())
+    }
+    fn put_native_grant(&self, token_hash: &[u8; 32], value: &[u8]) -> anyhow::Result<()> {
+        self.native_grants
+            .lock()
+            .insert(*token_hash, value.to_vec());
+        Ok(())
+    }
+    fn get_native_grant(&self, token_hash: &[u8; 32]) -> anyhow::Result<Option<Vec<u8>>> {
+        Ok(self.native_grants.lock().get(token_hash).cloned())
+    }
+    fn remove_native_grant(&self, token_hash: &[u8; 32]) -> anyhow::Result<bool> {
+        Ok(self.native_grants.lock().remove(token_hash).is_some())
+    }
+    fn all_native_grants(&self) -> anyhow::Result<Vec<([u8; 32], Vec<u8>)>> {
+        Ok(self
+            .native_grants
+            .lock()
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
             .collect())
     }
 }
@@ -520,6 +565,21 @@ impl CapabilityStorage for FlakyCapabilityStorage {
     }
     fn all_grants(&self) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
         self.inner.all_grants()
+    }
+    fn put_native_grant(&self, token_hash: &[u8; 32], value: &[u8]) -> anyhow::Result<()> {
+        self.inner.put_native_grant(token_hash, value)
+    }
+    fn get_native_grant(&self, token_hash: &[u8; 32]) -> anyhow::Result<Option<Vec<u8>>> {
+        if self.fail_grants.load(Ordering::Relaxed) {
+            anyhow::bail!("injected grant read failure");
+        }
+        self.inner.get_native_grant(token_hash)
+    }
+    fn remove_native_grant(&self, token_hash: &[u8; 32]) -> anyhow::Result<bool> {
+        self.inner.remove_native_grant(token_hash)
+    }
+    fn all_native_grants(&self) -> anyhow::Result<Vec<([u8; 32], Vec<u8>)>> {
+        self.inner.all_native_grants()
     }
 }
 
