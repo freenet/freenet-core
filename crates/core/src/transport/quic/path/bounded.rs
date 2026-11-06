@@ -180,6 +180,9 @@ struct ProgressState {
     extended: AtomicBool,
     /// Told when a wait for the source starts while `extended`.
     source_wait: tokio::sync::Notify,
+    /// Timers armed by [`bounded_send`]. Tests only.
+    #[cfg(test)]
+    arms: AtomicU64,
     now: Box<dyn Fn() -> u64 + Send + Sync>,
 }
 
@@ -193,6 +196,8 @@ impl SendProgress {
             on_source: AtomicBool::new(false),
             extended: AtomicBool::new(false),
             source_wait: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            arms: AtomicU64::new(0),
             now: Box::new(|| 0),
         }))
     }
@@ -205,6 +210,8 @@ impl SendProgress {
             on_source: AtomicBool::new(false),
             extended: AtomicBool::new(false),
             source_wait: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            arms: AtomicU64::new(0),
             now: Box::new(move || time.now_nanos()),
         }))
     }
@@ -223,11 +230,23 @@ impl SendProgress {
     /// The send starts (`true`) or stops waiting for its source's next chunk.
     /// The connection's progress does not extend the gap meanwhile: the
     /// receiver gets nothing and ends the stream at its own idle timeout.
+    ///
+    /// With [`bounded_send`]'s loop this is a store-then-load handshake on two
+    /// flags, both `SeqCst`: this side stores `on_source` then reads
+    /// `extended`, the loop stores `extended` then reads `on_source`, so at
+    /// least one sees the other's store, and either the loop arms its timer
+    /// for the send's own gap or this wakes it to re-arm.
     pub(super) fn waiting_on_source(&self, waiting: bool) {
-        self.0.on_source.store(waiting, Ordering::Release);
-        if waiting && self.0.extended.load(Ordering::Acquire) {
+        self.0.on_source.store(waiting, Ordering::SeqCst);
+        if waiting && self.0.extended.load(Ordering::SeqCst) {
             self.0.source_wait.notify_one();
         }
+    }
+
+    /// Timers [`bounded_send`] has armed for this send. Tests only.
+    #[cfg(test)]
+    pub(super) fn arms(&self) -> u64 {
+        self.0.arms.load(Ordering::Relaxed)
     }
 
     /// Every byte was written and the end of the stream queued.
@@ -252,7 +271,7 @@ impl SendProgress {
                     .last_step
                     .load(Ordering::Acquire)
                     .saturating_add(nanos(gap))
-                    .max(if self.0.on_source.load(Ordering::Acquire) {
+                    .max(if self.0.on_source.load(Ordering::SeqCst) {
                         0
                     } else {
                         connection_until
@@ -280,6 +299,23 @@ impl SendProgress {
 pub(crate) struct ConnectionProgress {
     pub(crate) acks: AckProgress,
     pub(crate) cap_holds: Arc<CapHolds>,
+    /// Where a send that ran out of gap leaves its [`QuietProof`]; the path's.
+    pub(crate) quiet: Arc<parking_lot::Mutex<Option<QuietProof>>>,
+}
+
+/// What a send that ran out of its gap saw of its connection: from `since`
+/// to the timeout the acknowledged count stayed `acked` and the cap's hold
+/// count `holds`. So if the connection still reads those counts, nothing on
+/// it has moved since `since`, whichever send left the proof, and the stall
+/// count (`route::StallCount::take`) dates the progress it sees from `since`
+/// instead of from when it reads it. Without it, the first timeout after a
+/// path goes dark mid-send sees that send's own early acknowledgements as new
+/// and does not count, which delays the path going suspect by a window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct QuietProof {
+    pub(crate) acked: u64,
+    pub(crate) holds: u64,
+    pub(crate) since: u64,
 }
 
 /// One send's view of [`ConnectionProgress`], sampled when its timer fires.
@@ -300,27 +336,43 @@ pub(crate) struct ConnectionProgress {
 /// the wake that saw it, which can come up to one window after it. A send
 /// that stops moving therefore ends at its own gap or at most twice
 /// [`STALL_PROGRESS_WINDOW`] after the connection's last move, whichever is
-/// later, and never after `total`. Until a wake sees a move during this send
-/// the window gives nothing, so on a path that has gone dark a send still
-/// fails at its own gap.
+/// later, and never after `total`. So a path dark before the send started
+/// fails it at its own gap (5 s), and one that goes dark mid-send, whose last
+/// acknowledgements are of this send's own first flight, fails it between
+/// its gap and twice the window after those acknowledgements (12 to 20 s
+/// with the 2 s open deadline as the first wake). Such a send leaves a
+/// [`QuietProof`], so its timeout counts toward the stall close and the
+/// path goes suspect at once.
 struct ConnectionWatch {
     source: ConnectionProgress,
     acked: u64,
     cap: CapHoldReading,
     hold_unchanged_since: Option<u64>,
+    /// When the watch began, on the send's clock.
+    started: u64,
     /// The wake that last saw the connection move; `None` before the first.
     moved_at: Option<u64>,
 }
 
 impl ConnectionWatch {
-    fn new(source: ConnectionProgress) -> Self {
+    fn new(source: ConnectionProgress, now: u64) -> Self {
         Self {
             acked: source.acks.acked(),
             cap: source.cap_holds.read(),
             hold_unchanged_since: None,
+            started: now,
             moved_at: None,
             source,
         }
+    }
+
+    /// The send ran out of gap: leave what it saw for the stall count.
+    fn prove_quiet(&self) {
+        *self.source.quiet.lock() = Some(QuietProof {
+            acked: self.acked,
+            holds: self.cap.holds,
+            since: self.moved_at.unwrap_or(self.started),
+        });
     }
 
     /// Read the connection at `now`.
@@ -347,20 +399,23 @@ fn nanos(duration: Duration) -> u64 {
 }
 
 /// Run the send `send` builds, until it returns or a deadline passes on
-/// `time`. With `connection`, a send whose stream is open runs out of gap only
-/// once its connection has also stopped moving ([`ConnectionWatch`]). `send` gets the [`SendProgress`] to pass to the path's `*_with`
-/// send, which is how a timeout is placed in the send. A closure that ignored
-/// it would report every timeout as `NotOpened`, so this is private to the
-/// path, whose `send_*_bounded` methods pass it on.
+/// `time`. With `connection`, a send whose stream is open runs out of gap
+/// only once its connection has also stopped moving ([`ConnectionWatch`]),
+/// and one that does leaves a [`QuietProof`] for the path's stall count.
+/// `send` gets the [`SendProgress`] to pass to the path's `*_with` send,
+/// which is how a timeout is placed in the send. A closure that ignored it
+/// would report every timeout as `NotOpened`, so this is private to the path,
+/// whose `send_*_bounded` methods pass it on.
 ///
 /// One timer at a time, as in `inbound::BodyReader`: armed for the current
 /// deadline and, when it fires, re-armed if progress has moved the deadline.
 /// So a send costs one sleep per gap, not one per fragment. A step only moves
 /// the deadline later, so the armed timer is never too late. A wait for the
 /// source can move it earlier (it drops the connection's window), so when the
-/// timer is armed past the send's own gap it wakes the loop to re-arm. The move from
-/// `open` to `gap` could make it earlier only with a gap shorter than `open`,
-/// which is asserted against below.
+/// timer is armed past the send's own gap it wakes the loop to re-arm
+/// (`SendProgress::waiting_on_source` says why no wait is missed). The move
+/// from `open` to `gap` could make it earlier only with a gap shorter than
+/// `open`, which is asserted against below.
 ///
 /// Cancel safety: dropping this future drops the send, with the same
 /// effect as a timeout at that point.
@@ -382,15 +437,23 @@ where
     );
     let started = time.now_nanos();
     // Only the gap reads the connection.
-    let mut watch = deadlines.gap.and(connection).map(ConnectionWatch::new);
+    let mut watch = deadlines
+        .gap
+        .and(connection)
+        .map(|connection| ConnectionWatch::new(connection, started));
     let until = |watch: &Option<ConnectionWatch>| watch.as_ref().map_or(0, ConnectionWatch::until);
     let progress = SendProgress::on_clock(time);
     let send = send(progress.clone());
     tokio::pin!(send);
     loop {
-        let deadline = progress.deadline(&deadlines, started, until(&watch));
+        // `extended` first, from the connection's window alone, then the
+        // deadline, which reads `on_source` (see `waiting_on_source`).
         let own = progress.deadline(&deadlines, started, 0);
-        progress.0.extended.store(deadline > own, Ordering::Release);
+        let window = until(&watch);
+        progress.0.extended.store(window > own, Ordering::SeqCst);
+        let deadline = progress.deadline(&deadlines, started, window);
+        #[cfg(test)]
+        progress.0.arms.fetch_add(1, Ordering::Relaxed);
         let wait = Duration::from_nanos(deadline.saturating_sub(time.now_nanos()));
         tokio::select! {
             result = &mut send => return outcome(result, &progress),
@@ -401,6 +464,11 @@ where
                     watch.observe(now);
                 }
                 if now >= progress.deadline(&deadlines, started, until(&watch)) {
+                    if progress.stage() == STAGE_OPENED
+                        && let Some(watch) = watch.as_ref()
+                    {
+                        watch.prove_quiet();
+                    }
                     return progress.timed_out();
                 }
             }

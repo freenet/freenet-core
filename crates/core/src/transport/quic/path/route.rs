@@ -33,7 +33,7 @@ use std::time::Duration;
 
 use super::super::recycle::{self, ACK_WATCH_WINDOW, cap_held};
 use super::super::socket::CapHoldReading;
-use super::bounded::{BoundedSend, MaybeDelivered, NotOpened, SendFailure};
+use super::bounded::{BoundedSend, MaybeDelivered, NotOpened, QuietProof, SendFailure};
 use super::{QuicPath, QuicSendError, stop_code};
 use crate::transport::metrics::QuicCloseCode;
 
@@ -207,10 +207,18 @@ pub(crate) struct StallVerdict {
 /// consumer stays stalled past the window while nothing else on the path is
 /// acknowledged reads as a stalled path.
 ///
-/// An egress cap hold counts as progress, as it does for the acknowledgement
-/// watch (`recycle::cap_held`): while `total-bandwidth-limit` holds the node's
-/// QUIC transmits nothing can be acknowledged, one held transmit can wait for
-/// longer than the window at a low cap, and the path itself is not stalled.
+/// An egress cap hold of this connection's transmit counts as progress, as it
+/// does for the acknowledgement watch (`recycle::cap_held`): while
+/// `total-bandwidth-limit` holds them nothing can be acknowledged, one held
+/// transmit can wait for longer than the window at a low cap, and the path
+/// itself is not stalled. The record is the connection's own
+/// (`socket::with_poller_holds`): a node-wide one would read as progress on
+/// every path whenever any connection is held, and on a node whose cap binds
+/// this count would never fire.
+///
+/// A [`QuietProof`] a timed-out send left dates the progress this sees
+/// ([`Self::take`]), so a path that went dark mid-send counts its first
+/// timeout.
 #[derive(Debug)]
 pub(crate) struct StallCount {
     in_a_row: u32,
@@ -239,15 +247,20 @@ impl StallCount {
     }
 
     /// Take `outcome`, with the connection's acknowledged-packet count `acked`
-    /// (`None` when the controller does not count them) and the egress cap's
-    /// holds `cap`, at `now_nanos`: whether it counted, and whether the path
-    /// should close now (once, at the limit).
+    /// (`None` when the controller does not count them) and the connection's
+    /// egress cap holds `cap`, at `now_nanos`: whether it counted, and whether
+    /// the path should close now (once, at the limit).
+    ///
+    /// Progress seen here is dated `now_nanos`, unless `quiet` (a send that
+    /// ran out of gap, [`QuietProof`]) still matches the counts: then nothing
+    /// moved after its `since`, and the progress is dated then.
     pub(crate) fn take(
         &mut self,
         outcome: &BoundedSend,
         source_stalled: bool,
         acked: Option<u64>,
         cap: CapHoldReading,
+        quiet: Option<QuietProof>,
         now_nanos: u64,
     ) -> StallVerdict {
         let previous = self.cap.replace(cap).unwrap_or(cap);
@@ -257,7 +270,14 @@ impl StallCount {
             self.acked = acked;
         }
         if acknowledged || held {
-            self.progressed_at = now_nanos;
+            self.progressed_at = match quiet {
+                Some(proof)
+                    if acked == Some(proof.acked) && cap.holds == proof.holds && !cap.held_now =>
+                {
+                    proof.since.min(now_nanos)
+                }
+                _ => now_nanos,
+            };
             self.in_a_row = 0;
         }
         if matches!(outcome, BoundedSend::Sent) {
@@ -289,7 +309,7 @@ impl StallCount {
             held_now: false,
             validity: Duration::ZERO,
         };
-        self.take(outcome, source_stalled, acked, no_cap, now_nanos)
+        self.take(outcome, source_stalled, acked, no_cap, None, now_nanos)
             .close
     }
 }
@@ -318,10 +338,11 @@ impl QuicPath {
         }
         let acked = self.ack_progress.as_ref().map(recycle::AckProgress::acked);
         let cap = self.connection.cap_holds().read();
+        let quiet = self.quiet.lock().take();
         let verdict = self
             .stall
             .lock()
-            .take(outcome, source_stalled, acked, cap, now_nanos);
+            .take(outcome, source_stalled, acked, cap, quiet, now_nanos);
         if let (true, Some(acked)) = (verdict.quiet_timeout, acked) {
             self.become_suspect(acked);
         }

@@ -671,6 +671,9 @@ pub(crate) struct QuicPath {
     counted_as_data_path: std::sync::atomic::AtomicBool,
     /// Send timeouts while nothing is acknowledged ([`route::StallCount`]).
     stall: parking_lot::Mutex<route::StallCount>,
+    /// The last [`bounded::QuietProof`] a send that ran out of gap left, taken
+    /// by the next settle.
+    quiet: Arc<parking_lot::Mutex<Option<bounded::QuietProof>>>,
     /// The connection's count of acknowledged packets, `None` if its controller
     /// does not keep one.
     ack_progress: Option<recycle::AckProgress>,
@@ -860,6 +863,7 @@ impl QuicPath {
                 send_data: AtomicU8::new(SEND_DATA_NEVER),
                 counted_as_data_path: std::sync::atomic::AtomicBool::new(false),
                 stall: parking_lot::Mutex::new(stall),
+                quiet: Arc::default(),
                 ack_progress,
                 suspect_since_acked: parking_lot::Mutex::new(None),
                 suspect: std::sync::atomic::AtomicBool::new(false),
@@ -1076,6 +1080,7 @@ impl QuicPath {
         self.ack_progress.clone().map(|acks| ConnectionProgress {
             acks,
             cap_holds: self.connection.cap_holds(),
+            quiet: self.quiet.clone(),
         })
     }
 

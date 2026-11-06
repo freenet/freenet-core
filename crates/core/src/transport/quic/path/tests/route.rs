@@ -212,7 +212,7 @@ fn a_cap_hold_counts_as_progress() {
         let now = QUIET + second * SECOND;
         assert!(
             !count
-                .take(&timeouts()[2], false, Some(0), reading(1, true), now)
+                .take(&timeouts()[2], false, Some(0), reading(1, true), None, now)
                 .close
         );
     }
@@ -221,13 +221,27 @@ fn a_cap_hold_counts_as_progress() {
     for _ in 1..STALLED_SENDS_LIMIT {
         assert!(
             !count
-                .take(&timeouts()[2], false, Some(0), reading(1, false), free)
+                .take(
+                    &timeouts()[2],
+                    false,
+                    Some(0),
+                    reading(1, false),
+                    None,
+                    free
+                )
                 .close
         );
     }
     assert!(
         count
-            .take(&timeouts()[2], false, Some(0), reading(1, false), free)
+            .take(
+                &timeouts()[2],
+                false,
+                Some(0),
+                reading(1, false),
+                None,
+                free
+            )
             .close
     );
 
@@ -235,20 +249,34 @@ fn a_cap_hold_counts_as_progress() {
     let mut count = StallCount::new(Some(0), 0);
     assert!(
         !count
-            .take(&timeouts()[2], false, Some(0), reading(7, true), 0)
+            .take(&timeouts()[2], false, Some(0), reading(7, true), None, 0)
             .close
     );
     let stale = 61 * SECOND + QUIET;
     for _ in 1..STALLED_SENDS_LIMIT {
         assert!(
             !count
-                .take(&timeouts()[2], false, Some(0), reading(7, true), stale)
+                .take(
+                    &timeouts()[2],
+                    false,
+                    Some(0),
+                    reading(7, true),
+                    None,
+                    stale
+                )
                 .close
         );
     }
     assert!(
         count
-            .take(&timeouts()[2], false, Some(0), reading(7, true), stale)
+            .take(
+                &timeouts()[2],
+                false,
+                Some(0),
+                reading(7, true),
+                None,
+                stale
+            )
             .close
     );
 }
@@ -405,4 +433,49 @@ fn a_refusal_stops_new_sends_on_the_path() {
         assert_eq!(p.a.stats().send_event_count(QuicSendEvent::DataRefused), 2);
         p.a.debug_assert_carries_data();
     });
+}
+
+/// A [`QuietProof`](super::super::bounded::QuietProof) dates the progress the
+/// stall count sees from its `since`, so a timeout right after a path went dark
+/// mid-send counts; one whose counts no longer match the connection's (an
+/// acknowledgement or a cap hold came after it) is ignored, and the progress is
+/// dated when it is seen.
+#[test]
+fn a_quiet_proof_dates_progress_only_while_its_counts_match() {
+    use super::super::bounded::QuietProof;
+    let free = CapHoldReading {
+        holds: 3,
+        held_now: false,
+        validity: Duration::from_secs(60),
+    };
+    let proof = QuietProof {
+        acked: 9,
+        holds: 3,
+        since: SECOND,
+    };
+    let now = SECOND + QUIET;
+    let timeout = &timeouts()[2];
+    // The acknowledgements it sees (5 to 9) came no later than `since`: quiet.
+    let mut count = StallCount::new(Some(5), 0);
+    let verdict = count.take(timeout, false, Some(9), free, Some(proof), now);
+    assert!(verdict.quiet_timeout, "counted from the proof's since");
+    // One more acknowledgement after the proof: progress now, not quiet.
+    let mut count = StallCount::new(Some(5), 0);
+    let verdict = count.take(timeout, false, Some(10), free, Some(proof), now);
+    assert!(
+        !verdict.quiet_timeout,
+        "the proof no longer matches the acked count"
+    );
+    // A cap hold after the proof: the same.
+    let mut count = StallCount::new(Some(5), 0);
+    let held_since = CapHoldReading { holds: 4, ..free };
+    let verdict = count.take(timeout, false, Some(9), held_since, Some(proof), now);
+    assert!(
+        !verdict.quiet_timeout,
+        "the proof no longer matches the hold count"
+    );
+    // Without a proof the same acknowledgements are dated when seen.
+    let mut count = StallCount::new(Some(5), 0);
+    let verdict = count.take(timeout, false, Some(9), free, None, now);
+    assert!(!verdict.quiet_timeout);
 }
