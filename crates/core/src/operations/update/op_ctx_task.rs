@@ -4847,9 +4847,9 @@ mod tests {
 
     /// Deliver one broadcast payload through the real non-streaming driver.
     async fn deliver(op_manager: &OpManager, key: ContractKey, payload: DeltaOrFullState) {
-        // The result is not asserted: a skip and an apply both return Ok, and
-        // what the tests measure is how many writes reached the store.
-        let _ = drive_relay_broadcast_to(
+        // A skip and an apply both return Ok; what the tests measure is how
+        // many writes reached the store.
+        drive_relay_broadcast_to(
             op_manager,
             Transaction::new::<UpdateMsg>(),
             key,
@@ -4858,7 +4858,8 @@ mod tests {
             "127.0.0.1:12400".parse().unwrap(),
             crate::ring::broadcast_coverage::CoveredPeers::empty(),
         )
-        .await;
+        .await
+        .expect("broadcast delivery");
     }
 
     /// End to end through driver, real contract loop and executor: a delta and
