@@ -752,12 +752,30 @@ mod tests {
     /// today; would hang on a regression.
     #[test]
     fn per_callsite_concurrent_writers_and_summary_no_deadlock() {
+        static CS_CONC: TestCallsite = TestCallsite { _tag: 12345 };
+        check_writers_and_summary(&CS_CONC, false);
+    }
+
+    /// The summary thread draws on the same per-callsite cap as the writers.
+    /// The test above used to count only the writers' allows, so when the
+    /// summary thread happened to run first it could take most of the first
+    /// window's 50 and leave the writers under the `CAP / 2` floor: seen once
+    /// under a loaded `cargo test` (`allowed=22`). Here the summary thread
+    /// takes the whole first window before any writer starts, which with the
+    /// old counting gave the writers 0 allows every time.
+    #[test]
+    fn per_callsite_summary_thread_ahead_of_the_writers() {
+        static CS_AHEAD: TestCallsite = TestCallsite { _tag: 12346 };
+        check_writers_and_summary(&CS_AHEAD, true);
+    }
+
+    /// Eight writers and a summary thread on one callsite. Every caller's
+    /// allows and calls are counted, since all of them draw on the same cap.
+    /// With `summary_first`, the writers start only once the summary thread
+    /// has made `CAP` calls.
+    fn check_writers_and_summary(callsite: &'static TestCallsite, summary_first: bool) {
         use std::sync::atomic::AtomicUsize;
         use std::thread;
-
-        // Single shared callsite — all writers contend on the same
-        // DashMap entry, maximising the chance of the bug surfacing.
-        static CS_CONC: TestCallsite = TestCallsite { _tag: 12345 };
 
         const CAP: u64 = 50;
         const THREADS: usize = 8;
@@ -769,33 +787,49 @@ mod tests {
         let limiter_arc = Arc::new(limiter);
 
         let allowed_total = Arc::new(AtomicUsize::new(0));
+        let calls_total = Arc::new(AtomicUsize::new(0));
+        let summary_calls = Arc::new(AtomicUsize::new(0));
         let stop = Arc::new(AtomicBool::new(false));
+
+        let summary_thread = {
+            let l = limiter_arc.clone();
+            let s = stop.clone();
+            let a = allowed_total.clone();
+            let c = calls_total.clone();
+            let own = summary_calls.clone();
+            thread::spawn(move || {
+                while !s.load(Ordering::SeqCst) {
+                    // Touch the summary path via a real should_allow call;
+                    // summary_interval=1ns means it runs every iteration.
+                    if l.should_allow_inner(Identifier(callsite), "concurrent") {
+                        a.fetch_add(1, Ordering::SeqCst);
+                    }
+                    c.fetch_add(1, Ordering::SeqCst);
+                    own.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+        };
+        if summary_first {
+            while summary_calls.load(Ordering::SeqCst) < CAP as usize {
+                thread::yield_now();
+            }
+        }
 
         let writers: Vec<_> = (0..THREADS)
             .map(|_| {
                 let l = limiter_arc.clone();
                 let a = allowed_total.clone();
+                let c = calls_total.clone();
                 thread::spawn(move || {
                     for _ in 0..EVENTS_PER_THREAD {
-                        if l.should_allow_inner(Identifier(&CS_CONC), "concurrent") {
+                        if l.should_allow_inner(Identifier(callsite), "concurrent") {
                             a.fetch_add(1, Ordering::SeqCst);
                         }
+                        c.fetch_add(1, Ordering::SeqCst);
                     }
                 })
             })
             .collect();
-
-        let summary_thread = {
-            let l = limiter_arc.clone();
-            let s = stop.clone();
-            thread::spawn(move || {
-                while !s.load(Ordering::SeqCst) {
-                    // Touch the summary path via a real should_allow call;
-                    // summary_interval=1ns means it runs every iteration.
-                    let _ = l.should_allow_inner(Identifier(&CS_CONC), "concurrent");
-                }
-            })
-        };
 
         for w in writers {
             w.join().expect("writer thread panicked");
@@ -805,8 +839,8 @@ mod tests {
             .join()
             .expect("summary thread panicked — likely deadlock with writers");
 
-        let allowed = allowed_total.load(Ordering::SeqCst);
-        let total_events = THREADS * EVENTS_PER_THREAD;
+        let allowed = allowed_total.load(Ordering::SeqCst) as u64;
+        let calls = calls_total.load(Ordering::SeqCst) as u64;
 
         // Allows must not exceed the cap-per-window, scaled by the number
         // of windows actually crossed. We can't easily measure window
@@ -814,22 +848,18 @@ mod tests {
         // CAP * (max plausible windows). Test runs in << 1 sec on any
         // CI; bound at CAP * 10 to allow slow CI scheduling.
         assert!(
-            (allowed as u64) <= CAP * 10,
+            allowed <= CAP * 10,
             "allowed={allowed} exceeded cap*10={} — counter atomicity broken",
             CAP * 10
         );
-        // And we must have done SOME meaningful work — at least CAP allows
-        // (otherwise the test is meaningless).
+        // The first window admits the first CAP calls, whoever makes them.
         assert!(
-            (allowed as u64) >= CAP / 2,
-            "allowed={allowed} suspiciously low — fewer than CAP/2={}",
-            CAP / 2
+            allowed >= CAP,
+            "allowed={allowed} below one window's cap {CAP} across {calls} calls"
         );
-        // Sanity: writers actually ran.
         assert!(
-            allowed < total_events,
-            "every event passed (allowed={allowed} = total={total_events}) — \
-             cap not enforced"
+            allowed < calls,
+            "every call passed (allowed={allowed} = calls={calls}) — cap not enforced"
         );
     }
 
