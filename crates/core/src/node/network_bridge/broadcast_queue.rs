@@ -111,9 +111,10 @@ const STREAM_WAIT_MIN_MARGIN: Duration = Duration::from_secs(30);
 /// 120 s is the flat wait this replaced, so lane concurrency is what it was:
 /// before, a stream still running at 120 s also released its permit (by timing
 /// out) and kept sending. The large lane has 2 permits per node; holding them
-/// for the full scaled wait (up to about 15 minutes) would stall every other
-/// full-state broadcast on the node behind two slow subscribers, and the
-/// mispredicted small sends that upgrade to it.
+/// for the full scaled wait (about 15 minutes for 31 MiB, over 24 for the
+/// largest stream) would stall every other full-state broadcast on the node
+/// behind two slow subscribers, and the mispredicted small sends that upgrade
+/// to it.
 pub(super) const STREAM_PERMIT_HOLD: Duration = Duration::from_secs(120);
 
 /// Wait up to `timeout` for a stream's completion signal, counting a timed-out
