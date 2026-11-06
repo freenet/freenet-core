@@ -75,6 +75,9 @@ pub(in crate::transport) struct Harness {
     counters: &'static crate::transport::metrics::QuicDataCounters,
     /// What each session sent on UDP from a path's queue.
     udp: Arc<RecordingUdp>,
+    /// What each new session paces its data with, as a connection under a
+    /// bandwidth limit passes it.
+    pacer: Option<Arc<dyn SendPacer>>,
 }
 
 /// A UDP session that records the shorts it is given.
@@ -147,6 +150,7 @@ impl Harness {
             inboxes: std::sync::Mutex::new(Vec::new()),
             counters,
             udp: Arc::default(),
+            pacer: None,
         }
     }
 
@@ -171,7 +175,7 @@ impl Harness {
             budget: SharedInboundBudget::new(16, 1 << 20),
             data,
             udp: self.udp.clone(),
-            pacer: None,
+            pacer: self.pacer.clone(),
             routed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             quic_receipt_nanos: Arc::new(AtomicU64::new(0)),
             now: Arc::new(move || Duration::from_nanos(now.load(Ordering::Relaxed))),
@@ -1852,4 +1856,48 @@ fn a_retry_token_outlasts_the_setup_deadlines() {
     use crate::transport::quic::upgrade::machine::CONNECT_TIMEOUT;
     assert!(RETRY_TOKEN_LIFETIME > CONNECT_TIMEOUT);
     assert!(RETRY_TOKEN_LIFETIME > OFFER_TIMEOUT);
+}
+
+/// A session opened with a pacer (a connection under a bandwidth limit) paces
+/// the path of every route it builds; one opened with none paces nothing.
+#[test]
+fn a_data_route_is_paced_only_when_the_session_has_a_pacer() {
+    use crate::transport::quic::control::caps;
+    use crate::transport::quic::path::pacer::BucketPacer;
+    use crate::transport::token_bucket::TokenBucket;
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        for (case, subnet, paced) in [("unpaced", 150, false), ("paced", 151, true)] {
+            let mut h = Harness::server_with(
+                &format!("quic-driver-paced-{case}"),
+                subnet,
+                "prefer",
+                Some("100"),
+            )
+            .await;
+            if paced {
+                let bucket = Arc::new(TokenBucket::new_with_time_source(
+                    10_000,
+                    100_000,
+                    h.pair.time.clone(),
+                ));
+                h.pacer = Some(Arc::new(BucketPacer::new(bucket, h.pair.time.clone())));
+            }
+            let (session, inbox) = h.session();
+            let attempt = offered(&h, &session);
+            let up = path_up(&h, &session, inbox);
+            let time = h.pair.time.clone();
+            let (_peer_path, _peer_inbound, _inbox) =
+                drive(&h.pair.time, Duration::from_secs(60), async move {
+                    let up = up.await;
+                    time.sleep(Duration::from_secs(1)).await;
+                    up
+                })
+                .await;
+            ready_ack(&session, attempt, caps::DATA);
+            let route = session.data_route().expect("both bits");
+            assert_eq!(route.path().is_paced(), paced, "{case}");
+            session.end();
+        }
+    });
 }

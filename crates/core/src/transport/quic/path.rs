@@ -896,6 +896,12 @@ impl QuicPath {
         })
     }
 
+    /// Whether the path's data sends are paced.
+    #[cfg(test)]
+    pub(in crate::transport) fn is_paced(&self) -> bool {
+        self.pacer.get().is_some()
+    }
+
     /// The pacer's waits and refusals so far.
     pub(super) fn pacer_holds(&self) -> u64 {
         self.pacer_holds.load(Ordering::Relaxed)
