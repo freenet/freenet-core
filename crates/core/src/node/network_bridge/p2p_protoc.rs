@@ -2226,7 +2226,7 @@ impl P2pConnManager {
                             // channel cannot drain within that window we drop the
                             // stream fragment and fire `completion_tx` so the
                             // broadcast queue releases its semaphore permit
-                            // immediately instead of waiting STREAM_COMPLETION_TIMEOUT
+                            // immediately instead of waiting out the stream completion timeout
                             // (120 s). Issue #4145. Using `reserve()` (rather than
                             // `timeout(send())`) lets us keep ownership of
                             // `completion_tx` when the timeout fires, so we can
@@ -5414,7 +5414,7 @@ pub(crate) mod tests {
     /// Load-bearing invariant for #4145: when the per-peer channel is
     /// saturated and the dispatch times out, the StreamSend branch MUST
     /// signal `completion_tx` so the broadcast queue's semaphore permit
-    /// releases immediately instead of waiting `STREAM_COMPLETION_TIMEOUT`
+    /// releases immediately instead of waiting out `stream_completion_timeout`
     /// (120 s). This is the entire reason the dispatch uses `reserve()`
     /// (so we retain ownership of `completion_tx`) instead of
     /// `timeout(send())` (which moves it into the dropped future).
@@ -5457,7 +5457,7 @@ pub(crate) mod tests {
             matches!(signal, Ok(Ok(StreamSendOutcome::Dropped))),
             "completion_tx must be fired on the dispatch timeout path so the \
              broadcast queue releases its permit immediately (not after \
-             120s STREAM_COMPLETION_TIMEOUT). Got {signal:?}"
+             stream completion timeout). Got {signal:?}"
         );
     }
 
@@ -5516,7 +5516,7 @@ pub(crate) mod tests {
         // Per-arm count instead of a single match: a refactor that
         // drops just the timeout arm's fire (the one #4145 added)
         // would otherwise silently reintroduce the 120 s
-        // STREAM_COMPLETION_TIMEOUT stall.
+        // stream completion timeout stall.
         //
         // Post-#4235 the signal carries a `StreamSendOutcome` instead
         // of `()`, and every drop arm reports `Dropped` so the broadcast queue
@@ -5532,7 +5532,7 @@ pub(crate) mod tests {
              StreamSendOutcome::Dropped in all three non-success arms \
              (closed / timeout / no-connection) — found {fire_count} such \
              occurrences, expected exactly 3. If you REMOVED one, a refactor \
-             reintroduced the 120 s STREAM_COMPLETION_TIMEOUT stall (#4145). \
+             reintroduced the stream completion timeout stall (#4145). \
              If you relabeled a drop arm as Delivered, you reintroduced the \
              delivery/permit conflation (#4235). If you ADDED a new arm with \
              its own fire, bump this count to match. Body:\n{body}"

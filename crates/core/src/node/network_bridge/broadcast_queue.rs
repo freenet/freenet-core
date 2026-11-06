@@ -61,38 +61,22 @@ pub(super) fn no_fanout() -> FanoutTargets {
     Arc::new(Vec::new())
 }
 
-/// Base of the wait for a stream's completion signal before releasing the
-/// permit anyway; the whole wait is [`stream_completion_timeout`], which adds
-/// time for the payload's size. Prevents a permanent permit leak if a stream
-/// task panics or hangs. Used by `broadcast_to_single_peer` under both
-/// `simulation_tests` and production, hence kept at module scope rather than
-/// inside the cfg-gated `queue` submodule.
-const STREAM_COMPLETION_TIMEOUT: Duration = Duration::from_secs(120);
-
-/// Rate a streamed broadcast's completion wait allows for beyond
-/// [`STREAM_COMPLETION_TIMEOUT`]: the lowest per-connection `bandwidth-limit` a
-/// node may configure (`peer_connection::MIN_BANDWIDTH_LIMIT`, 64 KiB/s), so a
-/// node at that limit still gets a large broadcast through. That is twice the
-/// rate the receiver's own age limit allows (32 KiB/s) and below the
-/// 70-160 KB/s seen from slow residential peers. A 31 MiB broadcast needs about
-/// 271 KB/s to finish in a flat 120 s, which an uplink under about 2.2 Mbit/s
-/// cannot give on any transport.
-const STREAM_COMPLETION_FLOOR_RATE_BYTES_PER_SEC: u64 =
-    crate::transport::peer_connection::MIN_BANDWIDTH_LIMIT as u64;
-
 /// How long a streamed broadcast of `payload_bytes` waits for its completion:
-/// [`STREAM_COMPLETION_TIMEOUT`] plus the payload at
-/// [`STREAM_COMPLETION_FLOOR_RATE_BYTES_PER_SEC`], and never longer than the
-/// receiver keeps such a stream (`streaming::max_inbound_stream_age`), so the
-/// sender does not wait on a stream the receiver has already dropped.
+/// as long as the receiver keeps such a stream, from the one function both ends
+/// use (`streaming::max_inbound_stream_age`: the payload at 32 KiB/s, and at
+/// least 5 minutes). So sender and receiver give up on a slow stream at the
+/// same point, and the sender never waits on a stream the receiver has dropped.
+/// A flat 120 s missed large broadcasts on slow or lossy uplinks on any
+/// transport: a 31 MiB broadcast needs about 271 KB/s to finish in 120 s.
 ///
 /// A timed-out wait does not stop the stream. It makes the send count as not
 /// delivered: the peer's summary is not cached and its interest is not
-/// refreshed, so the next update or repair sends the whole state again.
+/// refreshed, so the next update or repair sends the whole state again. The
+/// wait ends early on any completion signal, so its length matters only for a
+/// stream still in progress or one whose task never reports (which holds the
+/// queue permit up to this long).
 pub(super) fn stream_completion_timeout(payload_bytes: u64) -> Duration {
-    let scaled = STREAM_COMPLETION_TIMEOUT
-        + Duration::from_secs(payload_bytes / STREAM_COMPLETION_FLOOR_RATE_BYTES_PER_SEC);
-    scaled.min(crate::transport::peer_connection::streaming::max_inbound_stream_age(payload_bytes))
+    crate::transport::peer_connection::streaming::max_inbound_stream_age(payload_bytes)
 }
 
 /// Wait up to `timeout` for a stream's completion signal, counting a timed-out
@@ -392,7 +376,7 @@ pub(super) struct QueueScheduling {
 /// never landed), `send_stream_with_completion` returning `Err` (dispatch
 /// failed before any fragment), or a post-dispatch non-`Delivered`
 /// `StreamSendOutcome` (explicit `Dropped`, a dropped completion oneshot,
-/// or a `STREAM_COMPLETION_TIMEOUT`). All three are stream-assembly / transfer
+/// or a timed-out `stream_completion_timeout` wait). All three are stream-assembly / transfer
 /// failures — the exact signal that flagged the v0.2.73 incident, where
 /// nova/vega saw ~1500-2300 broadcast stream-assembly failures/hr against a ~0
 /// baseline and central telemetry had no gauge for it. (The two early-send
@@ -4801,7 +4785,7 @@ pub(super) async fn broadcast_to_single_peer(
 
 #[cfg(test)]
 mod stream_completion_timeout_tests {
-    use super::{STREAM_COMPLETION_TIMEOUT, stream_completion_timeout};
+    use super::stream_completion_timeout;
     use crate::transport::peer_connection::streaming::{
         MAX_STREAM_TOTAL_BYTES, max_inbound_stream_age,
     };
@@ -4809,45 +4793,32 @@ mod stream_completion_timeout_tests {
 
     const MIB: u64 = 1024 * 1024;
 
-    /// The wait is 120 s plus the payload at 64 KiB/s: about 120 s for a small
-    /// stream, and enough for a 31 MiB broadcast on a slow uplink.
+    /// The flat wait this replaced, for every payload size.
+    const STREAM_COMPLETION_TIMEOUT: Duration = Duration::from_secs(120);
+
+    /// The wait is the receiver's age limit for the size: 5 minutes for small
+    /// streams, the payload at 32 KiB/s above that.
     #[test]
-    fn the_wait_grows_with_the_payload_at_64_kib_per_second() {
-        assert_eq!(STREAM_COMPLETION_TIMEOUT, Duration::from_secs(120));
-        assert_eq!(stream_completion_timeout(0), Duration::from_secs(120));
-        assert_eq!(
-            stream_completion_timeout(64 * 1024),
-            Duration::from_secs(121)
-        );
-        assert_eq!(stream_completion_timeout(MIB), Duration::from_secs(136));
+    fn the_wait_is_the_receivers_age_limit() {
+        assert_eq!(stream_completion_timeout(0), Duration::from_secs(300));
+        assert_eq!(stream_completion_timeout(MIB), Duration::from_secs(300));
         assert_eq!(
             stream_completion_timeout(16 * MIB),
-            Duration::from_secs(376)
+            Duration::from_secs(512)
         );
         assert_eq!(
             stream_completion_timeout(31 * MIB),
-            Duration::from_secs(616)
+            Duration::from_secs(992)
         );
-    }
-
-    /// The sender never waits longer than the receiver keeps the stream, at any
-    /// size up to the largest a stream may be.
-    #[test]
-    fn the_wait_never_outlasts_the_receivers_age_limit() {
         let mut size = 1u64;
         while size <= MAX_STREAM_TOTAL_BYTES {
-            assert!(
-                stream_completion_timeout(size) <= max_inbound_stream_age(size),
-                "{size} B: wait {:?} against age limit {:?}",
+            assert_eq!(
                 stream_completion_timeout(size),
-                max_inbound_stream_age(size)
+                max_inbound_stream_age(size),
+                "{size} B"
             );
             size = size * 3 / 2 + 1;
         }
-        assert!(
-            stream_completion_timeout(MAX_STREAM_TOTAL_BYTES)
-                <= max_inbound_stream_age(MAX_STREAM_TOTAL_BYTES)
-        );
     }
 
     /// A 16 MiB stream on a link at 96 KiB/s completes about 170 s after it
@@ -4935,7 +4906,7 @@ mod stream_completion_timeout_tests {
         );
     }
 
-    /// Never shorter than the flat 120 s it replaces, and never shorter for a
+    /// Never shorter than the flat 120 s it replaced, and never shorter for a
     /// larger payload.
     #[test]
     fn the_wait_is_monotone_and_never_below_the_old_timeout() {
