@@ -95,8 +95,9 @@ pub(crate) const CAP_HOLD_VALIDITY_MARGIN: u32 = 2;
 /// `rate_bytes_per_sec`: [`CAP_HOLD_VALIDITY_MARGIN`] times the longest the
 /// cap makes one waiting transmit wait before its poller is polled again.
 /// That is the cap's debt limit (unpaced sends may run the bucket that far
-/// into debt) plus one datagram's refill for every waiter that can be queued
-/// ahead of it (`MAX_ADMISSION_WAKERS`) and for its own. A held poller of a
+/// into debt) plus one datagram's refill for every waiter its timer counts
+/// ahead of it (at most `MAX_ADMISSION_WAKERS`, however long the queue: the
+/// stagger is clamped there) and for its own. A held poller of a
 /// live connection is polled again within that, at its timer; one that is
 /// not was left behind by a connection that ended.
 ///
@@ -515,13 +516,19 @@ impl<S: Socket> QuicSocket<S> {
             Some(cap) => {
                 // One datagram per transmit keeps every take within the
                 // burst (at least 4 datagrams), so the bucket's bound holds
-                // exactly and the take can always be admitted eventually.
+                // exactly. The take also leaves one datagram per other
+                // outstanding admission, each lasting at most
+                // `ADMISSION_PASS`, so it is admitted eventually.
                 debug_assert!(
                     transmit.contents.len() as u64 <= cap.burst_bytes(),
                     "a {} byte transmit is larger than the egress burst",
                     transmit.contents.len()
                 );
-                match cap.try_take(transmit.contents.len(), Duration::ZERO) {
+                // The admission the poller handed over, if this transmit
+                // follows one; none for an endpoint response, which must
+                // leave every connection's admission alone.
+                let handed = take_handed_admission(cap);
+                match cap.try_take_handed(transmit.contents.len(), Duration::ZERO, handed) {
                     Ok(take) => self
                         .socket
                         .try_send_to_paced(transmit.contents, target, take),
@@ -595,6 +602,35 @@ impl<S: Socket> QuicSocket<S> {
         };
         Poll::Ready(Ok(1))
     }
+}
+
+thread_local! {
+    /// The admission a [`QuicPoller`] was just given, for the transmit that
+    /// follows it: `(cap, admission number)`. quinn 0.11.12 calls
+    /// `poll_writable` and, when it is `Ready`, `try_send` for the same
+    /// transmit back to back on one thread with nothing in between
+    /// (`quinn/src/connection.rs:1048-1057`), so the next `try_send` on this
+    /// thread is that connection's, and its take uses exactly that admission.
+    /// quinn's endpoint `respond` (`endpoint.rs:584`) sends with no poll, finds
+    /// nothing here, and leaves every admission alone. quinn is pinned; a
+    /// quinn bump must re-check this call order
+    /// (`a_poller_hands_its_admission_to_the_transmit_that_follows`).
+    static HANDED_ADMISSION: std::cell::Cell<Option<(usize, u64)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Which cap a handed admission belongs to: several nodes (and caps) can
+/// share a thread in a simulation.
+fn cap_key(cap: &crate::transport::egress_cap::EgressCap) -> usize {
+    std::ptr::from_ref(cap) as usize
+}
+
+/// Take the admission handed over on this thread for `cap`, if any.
+fn take_handed_admission(cap: &crate::transport::egress_cap::EgressCap) -> Option<u64> {
+    HANDED_ADMISSION
+        .take()
+        .filter(|(key, _)| *key == cap_key(cap))
+        .map(|(_, id)| id)
 }
 
 /// quinn's write-readiness check for one connection: ready when the socket
@@ -683,6 +719,10 @@ impl<S: Socket> QuicPoller<S> {
                 panic!("injected panic in the QUIC socket adapter (write readiness)");
             }
         }
+        // A handoff a poll left unused (its transmit never reached the cap)
+        // is stale: the admission it names is withdrawn below if this poller
+        // owns it, and must not go to another's transmit.
+        HANDED_ADMISSION.set(None);
         let this = self;
         let demux = &this.socket.socket;
         match demux.poll_send_ready(cx) {
@@ -701,6 +741,11 @@ impl<S: Socket> QuicPoller<S> {
             Err(poisoned) => poisoned.into_inner(),
         };
         let admitted = cap.poll_admit(usize::from(MAX_UDP_PAYLOAD), waiter, cx);
+        if admitted.is_ready() {
+            if let Some(id) = waiter.admission() {
+                HANDED_ADMISSION.set(Some((cap_key(cap), id)));
+            }
+        }
         this.record_admission(admitted.is_pending());
         admitted.map(Ok)
     }
