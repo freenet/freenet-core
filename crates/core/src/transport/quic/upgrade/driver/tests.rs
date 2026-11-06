@@ -171,6 +171,7 @@ impl Harness {
             budget: SharedInboundBudget::new(16, 1 << 20),
             data,
             udp: self.udp.clone(),
+            pacer: None,
             routed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             quic_receipt_nanos: Arc::new(AtomicU64::new(0)),
             now: Arc::new(move || Duration::from_nanos(now.load(Ordering::Relaxed))),

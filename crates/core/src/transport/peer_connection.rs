@@ -1252,7 +1252,10 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
     /// rate, which no one set as a limit (`quic::path::pacer`).
     fn path_pacer(&self) -> Option<Arc<dyn crate::transport::quic::path::pacer::SendPacer>> {
         let limited = self.remote_conn.global_bandwidth.is_some()
-            || self.remote_conn.bandwidth_limit.is_some_and(|limit| limit > 0);
+            || self
+                .remote_conn
+                .bandwidth_limit
+                .is_some_and(|limit| limit > 0);
         limited.then(|| {
             Arc::new(crate::transport::quic::path::pacer::BucketPacer::new(
                 self.remote_conn.token_bucket.clone(),
@@ -6648,6 +6651,43 @@ mod tests {
             time_source,
         });
         (conn, inbound_tx)
+    }
+
+    /// A connection paces its QUIC data sends only when a limit is set
+    /// (`bandwidth-limit`, or `total-bandwidth-limit`), and then with its own
+    /// token bucket, the one its UDP stream fragments draw on, so a peer's two
+    /// transports share one rate. With no limit the bucket runs at the
+    /// congestion controller's rate, which nobody set, and nothing is paced.
+    #[tokio::test]
+    async fn quic_data_is_paced_by_the_connection_bucket_only_under_a_limit() {
+        let addr: SocketAddr = "127.0.0.1:41000".parse().unwrap();
+        let (unlimited, _tx) = test_conn_with_bandwidth_limit(addr, None);
+        assert!(unlimited.path_pacer().is_none(), "no limit, no pacing");
+        let (zero, _tx) = test_conn_with_bandwidth_limit(addr, Some(0));
+        assert!(zero.path_pacer().is_none(), "0 is unset");
+
+        let (limited, _tx) = test_conn_with_bandwidth_limit(addr, Some(100_000));
+        let pacer = limited.path_pacer().expect("a limit paces");
+        let bucket = limited.remote_conn.token_bucket.clone();
+        // The bucket refills at 10 MB/s on real time, so allow it a little.
+        let before = bucket.available_tokens();
+        assert_eq!(
+            pacer.reserve_within(4_000, Duration::MAX),
+            Ok(Duration::ZERO)
+        );
+        let after = bucket.available_tokens();
+        assert!(
+            after + 3_000 < before,
+            "the pacer takes from the connection's own bucket: {before} then {after}"
+        );
+
+        let (mut shared, _tx) = test_conn_with_bandwidth_limit(addr, None);
+        shared.remote_conn.global_bandwidth =
+            Some(Arc::new(GlobalBandwidthManager::new(500_000, Some(1000))));
+        assert!(
+            shared.path_pacer().is_some(),
+            "total-bandwidth-limit paces at the connection's share"
+        );
     }
 
     /// Runs `conn`'s real `recv()` loop until its token bucket's rate is

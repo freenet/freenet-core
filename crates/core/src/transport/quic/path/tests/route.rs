@@ -377,6 +377,31 @@ fn a_quiet_path_closes_after_eight_timeouts() {
     });
 }
 
+/// A wait or a refusal of the path's pacer counts as progress, as a cap hold
+/// does: a `bandwidth-limit` that binds holds the sends on this side, and its
+/// refusals end as timeouts, but the path is not stalled. Eight timeouts past
+/// the window, each after a pacer hold, leave the path open; the same with no
+/// hold closes it (`a_quiet_path_closes_after_eight_timeouts`).
+#[test]
+fn timeouts_after_pacer_holds_do_not_close_a_busy_path() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths("quic-route-paced", 124, QuicPathLimits::DEFAULT).await;
+        let later = p.time().now_nanos() + QUIET;
+        for _ in 0..STALLED_SENDS_LIMIT + 2 {
+            p.a.pacer_holds
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            p.a.settle(SendKind::Stream, &timeouts()[0], false, later);
+        }
+        assert!(p.a.quinn_connection().close_reason().is_none());
+        assert_eq!(
+            p.a.stats().send_event_count(QuicSendEvent::StalledClosed),
+            0
+        );
+        assert!(!p.a.is_suspect(), "a held send is not a quiet timeout");
+    });
+}
+
 /// `NOT_ACCEPTING_DATA` turns sending off, and only that code does. The path may
 /// still take a send already on its way: the debug assertion for a path that never
 /// had the bits does not fire for one that lost them.
