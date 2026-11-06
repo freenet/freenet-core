@@ -596,7 +596,10 @@ fn a_routed_attempt_becomes_a_shadow_path() {
         let payload = peer_inbound.controls.try_recv().expect("Ready arrived");
         assert_eq!(
             peer_path.decode_control(&payload),
-            Ok(QuicControl::Ready { attempt, caps: 0 })
+            Ok(QuicControl::Ready {
+                attempt,
+                caps: crate::transport::quic::control::caps::RECYCLES
+            })
         );
     });
 }
@@ -712,7 +715,7 @@ fn a_path_follows_the_data_bits() {
                 if accepts { (1, 0) } else { (0, 1) },
                 "{case}: a frame before the peer's bit has arrived"
             );
-            let want_caps = if accepts { caps::DATA } else { 0 };
+            let want_caps = if accepts { caps::DATA } else { 0 } | caps::RECYCLES;
             let payload = peer_inbound.controls.try_recv().expect("Ready arrived");
             assert_eq!(
                 peer_path.decode_control(&payload),

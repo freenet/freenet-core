@@ -21081,11 +21081,6 @@ fn test_quic_data_carries_a_stream_end_to_end() {
     assert_eq!(stored.as_ref(), state.as_slice());
 }
 
-/// The first release that takes a RECYCLE_FOR_DATA close as no fault
-/// (`upgrade::machine::QUIC_RECYCLE_FOR_DATA_IN`); a path is recycled only to a
-/// peer at it or later.
-const QUIC_FIRST_RECYCLING_RELEASE: (u8, u8, u16) = (0, 2, 156);
-
 /// The data ramp over a virtual day, on paths that stay up: nodes in `prefer`
 /// with no `quic-data-percent` take their share from a ramp that starts with
 /// the run. A path that came up without data is recycled when the share reaches
@@ -21104,8 +21099,7 @@ fn test_quic_data_ramp_turns_on_every_pair_within_a_day() {
         let trace = sim.quic_upgrade_trace();
         sim.with_transport_quic("prefer");
         trace.ramp_data_from(Duration::ZERO);
-        let real = SimNetwork::real_protocol_version();
-        trace.run_as_release(real, real.max(QUIC_FIRST_RECYCLING_RELEASE));
+        run_as_first_negotiating_release(&trace);
         let nodes: Vec<_> = sim.all_node_addresses().values().copied().collect();
         (sim, trace, nodes)
     });

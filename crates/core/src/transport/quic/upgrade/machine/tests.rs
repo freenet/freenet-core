@@ -636,7 +636,7 @@ fn expected_with(
             QuicControl::Ready { caps, .. } | QuicControl::ReadyAck { caps, .. },
         ) = action
         {
-            *caps = own_caps;
+            *caps = own_caps | caps::RECYCLES;
         }
     }
     let activates = matches!(
@@ -837,7 +837,7 @@ fn every_transition_for_the_current_attempt() {
                 state,
                 name,
                 attempt_of(role),
-                expected(role, state, name),
+                expected_with(role, state, name, 0, 0),
             );
         }
     }
@@ -893,7 +893,7 @@ fn a_path_carries_data_only_with_both_bits() {
             server.step(Event::PathEstablished { attempt }),
             [Action::SendControl(QuicControl::Ready {
                 attempt,
-                caps: own
+                caps: own | caps::RECYCLES
             })],
             "{case}: Ready says what this node has"
         );
@@ -915,7 +915,10 @@ fn a_path_carries_data_only_with_both_bits() {
         let mut client = reach_with(Role::Client, S::Connecting, own, peer);
         let attempt = CLIENT_ATTEMPT;
         let mut want = vec![
-            Action::SendControl(QuicControl::ReadyAck { attempt, caps: own }),
+            Action::SendControl(QuicControl::ReadyAck {
+                attempt,
+                caps: own | caps::RECYCLES,
+            }),
             Action::Record(Outcome::Established(Role::Client)),
         ];
         if carries {
@@ -934,15 +937,18 @@ fn a_path_carries_data_only_with_both_bits() {
     }
 }
 
-/// A node with its bit clear says 0 in `Ready` and in `ReadyAck`, whatever bit
-/// the peer's frame carried.
+/// A node with its bit clear sends no data bit in `Ready` and in `ReadyAck`,
+/// whatever bit the peer's frame carried: only `caps::RECYCLES`.
 #[test]
 fn a_node_without_the_bit_sends_caps_zero() {
     let mut server = reach_with(Role::Server, S::Connecting, 0, caps::DATA);
     let attempt = SERVER_ATTEMPT;
     assert_eq!(
         server.step(Event::PathEstablished { attempt }),
-        [Action::SendControl(QuicControl::Ready { attempt, caps: 0 })]
+        [Action::SendControl(QuicControl::Ready {
+            attempt,
+            caps: caps::RECYCLES
+        })]
     );
     let mut client = reach_with(Role::Client, S::Connecting, 0, caps::DATA);
     let attempt = CLIENT_ATTEMPT;
@@ -953,7 +959,7 @@ fn a_node_without_the_bit_sends_caps_zero() {
     assert!(
         actions.contains(&Action::SendControl(QuicControl::ReadyAck {
             attempt,
-            caps: 0
+            caps: caps::RECYCLES
         })),
         "{actions:?}"
     );
@@ -1068,8 +1074,11 @@ fn a_server_and_a_client_reach_active_together() {
     assert!(!server.machine.is_active());
     server.step(Event::Control(ack));
     assert!(server.machine.is_active());
-    assert_eq!(server.machine.deadline(), None);
-    assert_eq!(client.machine.deadline(), None);
+    // Without data, each side rechecks whether its share has reached the pair.
+    for rig in [&server, &client] {
+        let due = rig.machine.deadline().expect("a recheck");
+        assert!(due > rig.now, "{due:?}");
+    }
 }
 
 /// The higher key is the server: it offers and the lower never does, at any
@@ -2398,7 +2407,12 @@ struct Pair {
 impl Pair {
     fn new(lost: Lost, samples: [f64; 2]) -> Self {
         let mut pair = Self {
-            rigs: [Rig::new(Role::Server), Rig::new(Role::Client)],
+            // With data on both, so an active path has nothing more to wait for
+            // (a path without it rechecks its share for good).
+            rigs: [Rig::new(Role::Server), Rig::new(Role::Client)].map(|mut rig| {
+                rig.own_caps = caps::DATA;
+                rig
+            }),
             wire: Vec::new(),
             lost,
             lost_at: None,
@@ -2779,10 +2793,9 @@ fn each_attempt_reads_its_own_caps_when_it_starts() {
 /// A rig promoted with a peer that takes a recycle close as no fault, its path
 /// active without this node's data bit and with the peer's.
 fn active_without_own_bit(role: Role) -> (Rig, u32) {
-    use crate::transport::quic::upgrade::machine::QUIC_RECYCLE_FOR_DATA_IN;
     let mut rig = Rig::new(role);
-    rig.peer_caps = caps::DATA;
-    rig.promote(Some(QUIC_RECYCLE_FOR_DATA_IN));
+    rig.peer_caps = caps::DATA | caps::RECYCLES;
+    rig.promote(Some(QUIC_UPGRADE_NEGOTIATES_IN));
     let attempt = rig.activate();
     assert!(rig.machine.is_active() && !rig.machine.carries_data());
     (rig, attempt)
@@ -2843,23 +2856,44 @@ fn a_path_without_data_is_recycled_once_when_the_bit_comes_on() {
 }
 
 /// No recheck on a path with this node's bit already set, nor on a path to a
-/// peer older than the recycle close, which would read it as a lost connection.
+/// peer that did not set `caps::RECYCLES`: a node before the bit reads the close
+/// as a lost connection and charges it. Each side advertises the bit in its
+/// `Ready` or `ReadyAck`, whatever its own data bit.
 #[test]
-fn only_a_path_without_the_bit_to_a_recent_peer_is_rechecked() {
+fn only_a_path_without_the_bit_to_a_recycling_peer_is_rechecked() {
     for role in [Role::Server, Role::Client] {
         let mut rig = Rig::new(role);
-        rig.peer_caps = 0;
+        rig.peer_caps = caps::RECYCLES;
         rig.own_caps = caps::DATA;
-        rig.promote(Some(
-            crate::transport::quic::upgrade::machine::QUIC_RECYCLE_FOR_DATA_IN,
-        ));
+        rig.promote(Some(QUIC_UPGRADE_NEGOTIATES_IN));
         rig.activate();
         assert_eq!(rig.machine.deadline(), None, "{role:?}: own bit set");
 
         let mut rig = Rig::promoted(role);
         rig.peer_caps = caps::DATA;
         rig.activate();
-        assert_eq!(rig.machine.deadline(), None, "{role:?}: an older peer");
+        assert_eq!(
+            rig.machine.deadline(),
+            None,
+            "{role:?}: a peer without RECYCLES"
+        );
+    }
+    // What this node sends: RECYCLES with or without its data bit.
+    for own in [0, caps::DATA] {
+        let mut rig = Rig::new(Role::Server);
+        rig.own_caps = own;
+        rig.promote(Some(QUIC_UPGRADE_NEGOTIATES_IN));
+        rig.tick_due();
+        let attempt = rig.machine.last_attempt;
+        rig.step(Event::Upgrade(UpgradeControl::Accept { attempt }));
+        let actions = rig.step(Event::PathEstablished { attempt });
+        assert!(
+            actions.contains(&Action::SendControl(QuicControl::Ready {
+                attempt,
+                caps: own | caps::RECYCLES,
+            })),
+            "{actions:?}"
+        );
     }
 }
 

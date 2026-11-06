@@ -149,16 +149,6 @@ use crate::util::backoff::ExponentialBackoff;
 /// data share has reached the pair, jittered by +/-20% per path.
 pub(in crate::transport) const DATA_RECHECK_INTERVAL: Duration = Duration::from_secs(45);
 
-/// The first release that takes a [`QuicCloseCode::RecycleForData`] close as
-/// no fault. An older peer reads the unknown code as a lost connection and
-/// charges it, so a path to one is never recycled. Too high only delays.
-pub(in crate::transport) const QUIC_RECYCLE_FOR_DATA_IN: (u8, u8, u16) = (0, 2, 156);
-
-/// May a path to a peer of `remote_version` be recycled for data? Fails closed.
-fn may_recycle_for_data(remote_version: Option<(u8, u8, u16)>) -> bool {
-    remote_version.is_some_and(|version| version >= QUIC_RECYCLE_FOR_DATA_IN)
-}
-
 /// How long the server waits for a reply to its `Offer`.
 pub(in crate::transport) const OFFER_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a side waits for the connection, from `Accept` to established.
@@ -576,9 +566,6 @@ pub(in crate::transport) struct UpgradeMachine {
     /// What this node says it supports on a path, from [`Event::Promoted`] and
     /// again at the start of each attempt.
     own_caps: u32,
-    /// Whether the peer runs a release that takes a [`QuicCloseCode::RecycleForData`]
-    /// close as no fault ([`QUIC_RECYCLE_FOR_DATA_IN`]).
-    peer_recycles: bool,
     /// While a path is active without this node's data bit, when to ask again
     /// whether the data share has reached the pair ([`DATA_RECHECK_INTERVAL`]).
     data_recheck_at: Option<Duration>,
@@ -600,7 +587,6 @@ impl UpgradeMachine {
             retry_at: Duration::ZERO,
             seeded: false,
             own_caps: 0,
-            peer_recycles: false,
             data_recheck_at: None,
             recent_fallbacks: std::collections::VecDeque::new(),
         }
@@ -775,7 +761,6 @@ impl UpgradeMachine {
         // hands the backoff on.
         self.take_seed(cx, backoff);
         self.own_caps = own_caps;
-        self.peer_recycles = may_recycle_for_data(remote_version);
         self.role = Role::of(&self.local_key, peer_key);
         match self.role {
             None => {
@@ -998,7 +983,7 @@ impl UpgradeMachine {
                 self.advance(Phase::Confirming, cx.now + CONFIRM_TIMEOUT);
                 let mut actions = vec![Action::SendControl(QuicControl::Ready {
                     attempt,
-                    caps: self.own_caps,
+                    caps: self.own_caps | caps::RECYCLES,
                 })];
                 // A connection from the peer proves it accepted. Counted here
                 // because the `Accept` was lost or is late, and a late one is
@@ -1033,7 +1018,7 @@ impl UpgradeMachine {
                 let mut actions = vec![
                     Action::SendControl(QuicControl::ReadyAck {
                         attempt,
-                        caps: self.own_caps,
+                        caps: self.own_caps | caps::RECYCLES,
                     }),
                     Action::Record(Outcome::Established(Role::Client)),
                 ];
@@ -1337,7 +1322,9 @@ impl UpgradeMachine {
                 // Without this node's bit, ask from time to time whether the
                 // data share has reached the pair ([`Self::recheck_data`]),
                 // jittered so a node does not close many paths at once.
-                self.data_recheck_at = (self.peer_recycles && !self.accepts_data())
+                // Only a peer that said it takes the close as no fault
+                // ([`caps::RECYCLES`]) is sent one.
+                self.data_recheck_at = (peer_caps & caps::RECYCLES != 0 && !self.accepts_data())
                     .then(|| cx.now + jittered(DATA_RECHECK_INTERVAL, cx.sample));
             }
             other
