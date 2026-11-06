@@ -1243,27 +1243,24 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         self.pending_decline = None;
     }
 
-    /// What sends one tracked packet on the UDP session from outside the
-    /// connection's task.
-    /// What paces this connection's QUIC data sends: its token bucket, the one
-    /// its UDP stream fragments draw on, when a bandwidth limit is set
-    /// (`bandwidth-limit`, or `total-bandwidth-limit` and its share). With
-    /// none, nothing: the bucket then runs at the congestion controller's
-    /// rate, which no one set as a limit (`quic::path::pacer`).
+    /// What paces this connection's QUIC data sends when a bandwidth limit is
+    /// set (`bandwidth-limit`, or `total-bandwidth-limit` and its share): a
+    /// bucket of the QUIC side's own at that limit, not the UDP stream bucket,
+    /// whose rate the UDP congestion controller can hold below the limit
+    /// (`quic::path::pacer`). With no limit, nothing.
     fn path_pacer(&self) -> Option<Arc<dyn crate::transport::quic::path::pacer::SendPacer>> {
-        let limited = self.remote_conn.global_bandwidth.is_some()
-            || self
-                .remote_conn
-                .bandwidth_limit
-                .is_some_and(|limit| limit > 0);
-        limited.then(|| {
-            Arc::new(crate::transport::quic::path::pacer::BucketPacer::new(
-                self.remote_conn.token_bucket.clone(),
-                self.remote_conn.time_source.clone(),
-            )) as Arc<dyn crate::transport::quic::path::pacer::SendPacer>
-        })
+        use crate::transport::quic::config::QuicRateLimit;
+        use crate::transport::quic::path::pacer::{LimitPacer, SendPacer};
+        let limit = QuicRateLimit::new(
+            self.remote_conn.bandwidth_limit,
+            self.remote_conn.global_bandwidth.clone(),
+        );
+        LimitPacer::new(limit, self.remote_conn.time_source.clone())
+            .map(|pacer| Arc::new(pacer) as Arc<dyn SendPacer>)
     }
 
+    /// What sends one tracked packet on the UDP session from outside the
+    /// connection's task.
     fn udp_sender(&self) -> UdpSender<S, T> {
         UdpSender {
             remote_addr: self.remote_conn.remote_addr,
@@ -6654,31 +6651,38 @@ mod tests {
     }
 
     /// A connection paces its QUIC data sends only when a limit is set
-    /// (`bandwidth-limit`, or `total-bandwidth-limit`), and then with its own
-    /// token bucket, the one its UDP stream fragments draw on, so a peer's two
-    /// transports share one rate. With no limit the bucket runs at the
-    /// congestion controller's rate, which nobody set, and nothing is paced.
+    /// (`bandwidth-limit`, or `total-bandwidth-limit`), and with a bucket of
+    /// its own at that limit, not the UDP stream bucket: a reservation on the
+    /// pacer leaves the UDP bucket as it was, and a limit above the UDP
+    /// controller's rate is the pacer's rate.
     #[tokio::test]
-    async fn quic_data_is_paced_by_the_connection_bucket_only_under_a_limit() {
+    async fn quic_data_is_paced_only_under_a_limit_and_at_that_limit() {
         let addr: SocketAddr = "127.0.0.1:41000".parse().unwrap();
         let (unlimited, _tx) = test_conn_with_bandwidth_limit(addr, None);
         assert!(unlimited.path_pacer().is_none(), "no limit, no pacing");
         let (zero, _tx) = test_conn_with_bandwidth_limit(addr, Some(0));
         assert!(zero.path_pacer().is_none(), "0 is unset");
 
-        let (limited, _tx) = test_conn_with_bandwidth_limit(addr, Some(100_000));
+        // 5 MB/s: a burst of 500 kB, then 5 000 bytes due in 1 ms. Paced by
+        // the UDP bucket (1.25 MB/s at most) they would be due in 4 ms.
+        let (limited, _tx) = test_conn_with_bandwidth_limit(addr, Some(5_000_000));
         let pacer = limited.path_pacer().expect("a limit paces");
-        let bucket = limited.remote_conn.token_bucket.clone();
-        // The bucket refills at 10 MB/s on real time, so allow it a little.
-        let before = bucket.available_tokens();
+        let udp = limited.remote_conn.token_bucket.clone();
+        let udp_before = udp.available_tokens();
         assert_eq!(
-            pacer.reserve_within(4_000, Duration::MAX),
+            pacer.reserve_within(500_000, Duration::MAX),
             Ok(Duration::ZERO)
         );
-        let after = bucket.available_tokens();
+        let wait = pacer
+            .reserve_within(5_000, Duration::MAX)
+            .expect("no limit to refuse at");
         assert!(
-            after + 3_000 < before,
-            "the pacer takes from the connection's own bucket: {before} then {after}"
+            wait <= Duration::from_millis(1),
+            "paced at the limit: {wait:?}"
+        );
+        assert!(
+            udp.available_tokens() >= udp_before,
+            "the UDP bucket is not drawn on"
         );
 
         let (mut shared, _tx) = test_conn_with_bandwidth_limit(addr, None);

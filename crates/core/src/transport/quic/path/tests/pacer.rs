@@ -8,19 +8,17 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::super::bounded::SendDeadlines;
-use super::super::pacer::{BucketPacer, SendPacer};
+use super::super::pacer::{LimitPacer, SendPacer};
 use super::*;
+use crate::transport::global_bandwidth::GlobalBandwidthManager;
+use crate::transport::quic::config::QuicRateLimit;
 use crate::transport::quic::control::QuicControl;
-use crate::transport::token_bucket::TokenBucket;
 
-/// A connection's bucket at `rate`, with the capacity a connection's bucket
-/// gets (`rate / 10`), starting full.
-fn bucket(time: &VirtualTime, rate: usize) -> Arc<TokenBucket<VirtualTime>> {
-    Arc::new(TokenBucket::new_with_time_source(
-        rate / 10,
-        rate,
-        time.clone(),
-    ))
+/// A connection's pacer at a `bandwidth-limit` of `rate`, starting full.
+fn pacer_at(time: &VirtualTime, rate: usize) -> Arc<LimitPacer<VirtualTime>> {
+    Arc::new(
+        LimitPacer::new(QuicRateLimit::new(Some(rate), None), time.clone()).expect("a limit paces"),
+    )
 }
 
 /// How long `len` bytes take as one Stream from `a` to `b`, and the outcome.
@@ -59,8 +57,7 @@ fn a_paced_path_keeps_to_the_limit_on_a_short_round_trip() {
             unpaced < Duration::from_millis(500),
             "unpaced, the link is fast: {unpaced:?}"
         );
-        let bucket = bucket(&p.time(), RATE);
-        p.a.pace_with(Arc::new(BucketPacer::new(bucket.clone(), p.time())));
+        p.a.pace_with(pacer_at(&p.time(), RATE));
         let (paced, outcome) = time_a_stream(&p, LEN).await;
         assert!(matches!(outcome, BoundedSend::Sent), "{outcome:?}");
         let floor = Duration::from_secs_f64((LEN - RATE / 10) as f64 / RATE as f64);
@@ -80,13 +77,16 @@ fn control_frames_and_one_packet_shorts_do_not_wait_behind_data() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
         let p = paths("quic-pacer-control", 121, QuicPathLimits::DEFAULT).await;
-        // At the bucket's lowest rate, 1 KiB/s, a 100 kB debt takes 100 s.
-        let bucket = bucket(&p.time(), 1024);
+        // At the bucket's lowest rate, 1 KiB/s, a 120 kB debt takes over 100 s.
+        let pacer = pacer_at(&p.time(), 1024);
         assert!(
-            bucket.reserve(100_000) > Duration::from_secs(90),
+            pacer
+                .reserve_within(120_000, Duration::MAX)
+                .expect("no limit")
+                > Duration::from_secs(100),
             "deep in debt"
         );
-        p.a.pace_with(Arc::new(BucketPacer::new(bucket.clone(), p.time())));
+        p.a.pace_with(pacer.clone());
         let (a, time) = (p.a.clone(), p.time());
         let (elapsed, control, short, stream) = p
             .drive(async move {
@@ -132,11 +132,11 @@ fn control_frames_and_one_packet_shorts_do_not_wait_behind_data() {
         );
         assert_eq!(p.a.send_aborts(), 0, "no stream was opened to reset");
         assert_eq!(p.a.pacer_holds(), 1, "the one refusal");
-        // The refusal took nothing: the debt is what it was, about 98 s.
-        let wait = bucket
+        // The refusal took nothing: the debt is what it was, about 109 s.
+        let wait = pacer
             .reserve_within(0, Duration::MAX)
             .expect("no limit to refuse at");
-        assert!(wait > Duration::from_secs(90), "{wait:?}");
+        assert!(wait > Duration::from_secs(100), "{wait:?}");
     });
 }
 
@@ -263,4 +263,35 @@ fn bytes_taken_for_a_write_not_made_go_back() {
             "the first fragment's bytes, taken and not written"
         );
     });
+}
+
+/// The pacer paces at the limit itself, read again at every reservation: under
+/// `total-bandwidth-limit` its rate follows the per-connection share as
+/// connections come and go. A `bandwidth-limit` above the UDP congestion
+/// controller's 1.25 MB/s is the pacer's rate too: QUIC is never paced below
+/// what the operator set.
+#[test]
+fn a_limit_pacer_paces_at_the_limit_and_follows_the_share() {
+    let time = VirtualTime::new();
+    let high = LimitPacer::new(QuicRateLimit::new(Some(5_000_000), None), time.clone())
+        .expect("a limit paces");
+    assert_eq!(high.rate(), 5_000_000);
+    assert!(
+        LimitPacer::new(QuicRateLimit::new(None, None), time.clone()).is_none(),
+        "no limit, no pacer"
+    );
+
+    let manager = Arc::new(GlobalBandwidthManager::new(1_000_000, Some(1_000)));
+    manager.register_connection();
+    let shared = LimitPacer::new(
+        QuicRateLimit::new(None, Some(manager.clone())),
+        time.clone(),
+    )
+    .expect("a total limit paces");
+    assert_eq!(shared.rate(), 1_000_000);
+    manager.register_connection();
+    shared
+        .reserve_within(1_200, Duration::MAX)
+        .expect("no limit to refuse at");
+    assert_eq!(shared.rate(), 500_000, "the share of two connections");
 }

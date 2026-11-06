@@ -1862,9 +1862,9 @@ fn a_retry_token_outlasts_the_setup_deadlines() {
 /// the path of every route it builds; one opened with none paces nothing.
 #[test]
 fn a_data_route_is_paced_only_when_the_session_has_a_pacer() {
+    use crate::transport::quic::config::QuicRateLimit;
     use crate::transport::quic::control::caps;
-    use crate::transport::quic::path::pacer::BucketPacer;
-    use crate::transport::token_bucket::TokenBucket;
+    use crate::transport::quic::path::pacer::LimitPacer;
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
         for (case, subnet, paced) in [("unpaced", 150, false), ("paced", 151, true)] {
@@ -1876,12 +1876,10 @@ fn a_data_route_is_paced_only_when_the_session_has_a_pacer() {
             )
             .await;
             if paced {
-                let bucket = Arc::new(TokenBucket::new_with_time_source(
-                    10_000,
-                    100_000,
-                    h.pair.time.clone(),
+                h.pacer = Some(Arc::new(
+                    LimitPacer::new(QuicRateLimit::new(Some(100_000), None), h.pair.time.clone())
+                        .expect("a limit paces"),
                 ));
-                h.pacer = Some(Arc::new(BucketPacer::new(bucket, h.pair.time.clone())));
             }
             let (session, inbox) = h.session();
             let attempt = offered(&h, &session);

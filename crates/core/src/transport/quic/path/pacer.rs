@@ -9,14 +9,23 @@
 //! peer whose data was split across both got up to twice its share.
 //!
 //! With a limit set (`bandwidth-limit`, or `total-bandwidth-limit` and its
-//! per-connection share), a path's data sends draw on the connection's token
-//! bucket, the one its UDP stream fragments draw on, so both transports of one
-//! peer share one rate. Charged: every write of a Stream or pipe (header,
-//! metadata and payload), and of a Short past one packet, which UDP sends as a
-//! stream. Not charged, as on UDP: Shorts of one packet, and control frames,
-//! which must never wait behind data. With no limit nothing is paced: the
-//! bucket then runs at the congestion controller's rate, which is not a limit
-//! anyone set.
+//! per-connection share), a path's data sends draw on a token bucket of the
+//! connection's own, kept on the QUIC side ([`LimitPacer`]), at the limit: the
+//! rate `recycle::CappedCubic` caps the window at (`QuicRateLimit::rate`),
+//! read again at every reservation so it follows the share as connections
+//! come and go. Not the UDP stream bucket: that one runs at the lower of the
+//! limit and the UDP congestion controller's rate (FixedRate's 1.25 MB/s by
+//! default), so a limit above that would have paced QUIC below what the
+//! operator set, slower than no limit at all. The cost, which stays: a peer
+//! whose data is on both transports at once (a QUIC path and UDP streams that
+//! fell back) can get up to twice its share, as before; the node's egress cap
+//! still bounds the node under `total-bandwidth-limit`. The bucket outlives
+//! the UDP transport's removal unchanged.
+//!
+//! Charged: every write of a Stream or pipe (header, metadata and payload),
+//! and of a Short past one packet, which UDP sends as a stream. Not charged,
+//! as on UDP: Shorts of one packet, and control frames, which must never wait
+//! behind data. With no limit nothing is paced.
 //!
 //! A write takes its bytes before it is made ([`SendPacer::reserve_within`])
 //! and waits out the bucket's deficit in the send's own task, never in the
@@ -47,6 +56,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::simulation::TimeSource;
+use crate::transport::connection_handler::MIN_BUCKET_CAPACITY_BYTES;
+use crate::transport::quic::config::QuicRateLimit;
 use crate::transport::token_bucket::TokenBucket;
 
 /// What paces a path's data sends.
@@ -63,20 +74,44 @@ pub(in crate::transport) trait SendPacer: Send + Sync {
     fn sleep(&self, wait: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>>;
 }
 
-/// A connection's token bucket as a path's pacer.
-pub(in crate::transport) struct BucketPacer<T: TimeSource> {
-    bucket: Arc<TokenBucket<T>>,
+/// A connection's QUIC pacer: a token bucket at the connection's limit
+/// ([`QuicRateLimit::rate`]). Its capacity is a tenth of the rate when it is
+/// built, as a UDP connection bucket's is, and fixed from then.
+pub(in crate::transport) struct LimitPacer<T: TimeSource> {
+    bucket: TokenBucket<T>,
+    limit: QuicRateLimit,
     time: T,
 }
 
-impl<T: TimeSource> BucketPacer<T> {
-    pub(in crate::transport) fn new(bucket: Arc<TokenBucket<T>>, time: T) -> Self {
-        Self { bucket, time }
+impl<T: TimeSource> LimitPacer<T> {
+    /// A pacer at `limit`, or `None` when no limit is set.
+    pub(in crate::transport) fn new(limit: QuicRateLimit, time: T) -> Option<Self> {
+        let rate = usize::try_from(limit.rate()?).unwrap_or(usize::MAX);
+        let capacity = (rate / 10).max(MIN_BUCKET_CAPACITY_BYTES);
+        Some(Self {
+            bucket: TokenBucket::new_with_time_source(capacity, rate, time.clone()),
+            limit,
+            time,
+        })
+    }
+
+    /// The rate it paces at now.
+    #[cfg(test)]
+    pub(in crate::transport) fn rate(&self) -> usize {
+        self.bucket.rate()
     }
 }
 
-impl<T: TimeSource> SendPacer for BucketPacer<T> {
+impl<T: TimeSource> SendPacer for LimitPacer<T> {
     fn reserve_within(&self, bytes: usize, limit: Duration) -> Result<Duration, Duration> {
+        // The share moves with the number of connections; the limit is never
+        // unset once set, since the settings do not change while running.
+        if let Some(rate) = self.limit.rate() {
+            let rate = usize::try_from(rate).unwrap_or(usize::MAX);
+            if rate != self.bucket.rate() {
+                self.bucket.set_rate(rate);
+            }
+        }
         self.bucket.reserve_within(bytes, limit)
     }
 

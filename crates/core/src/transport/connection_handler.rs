@@ -102,7 +102,7 @@ const TOKEN_BUCKET_WINDOW: Duration = Duration::from_millis(100);
 /// (~1200 bytes) cannot be admitted, stalling connections at very low rates.
 /// 8 KiB (~6–7 max-size packets) provides enough headroom for burst handling
 /// without allowing large uncontrolled bursts.
-const MIN_BUCKET_CAPACITY_BYTES: usize = 8192;
+pub(in crate::transport) const MIN_BUCKET_CAPACITY_BYTES: usize = 8192;
 
 pub type SerializedMessage = Vec<u8>;
 
