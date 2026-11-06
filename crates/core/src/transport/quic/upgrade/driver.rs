@@ -86,9 +86,10 @@ use crate::transport::crypto::TransportPublicKey;
 use crate::transport::metrics::{QuicCloseCode, QuicFallback, QuicUpgradeOutcome};
 use crate::transport::peer_connection::UdpSender;
 use crate::transport::peer_connection::inbound_budget::SharedInboundBudget;
+use crate::transport::quic::config::QuicRateLimit;
 use crate::transport::quic::control::ControlError;
 use crate::transport::quic::identity::PeerKey;
-use crate::transport::quic::path::pacer::SendPacer;
+use crate::transport::quic::path::pacer::{LimitPacer, SendPacer};
 use crate::transport::quic::path::{
     BoundedSend, QuicDataInbox, QuicDataSenders, QuicPath, QuicPathLimits, data_channels,
 };
@@ -535,7 +536,7 @@ impl QuicUpgrades {
         budget: SharedInboundBudget,
         quic_receipt_nanos: Arc<AtomicU64>,
         sender: UdpSender<S, T>,
-        pacer: Option<Arc<dyn SendPacer>>,
+        rate_limit: Option<QuicRateLimit>,
         time: T,
     ) -> (QuicPathState, QuicDataInbox) {
         let sender = Arc::new(sender);
@@ -556,7 +557,10 @@ impl QuicUpgrades {
             budget,
             data,
             udp: sender.clone(),
-            pacer,
+            // On the path's clock, the one a send's deadlines run on.
+            pacer: rate_limit
+                .and_then(|limit| LimitPacer::new(limit, self.path_clock.clone()))
+                .map(|pacer| Arc::new(pacer) as Arc<dyn SendPacer>),
             routed: Arc::new(AtomicBool::new(false)),
             quic_receipt_nanos,
             now: Arc::new(move || clock.now()),
@@ -1512,6 +1516,12 @@ pub(in crate::transport) struct QuicPathState {
 }
 
 impl QuicPathState {
+    /// Whether this session paces its paths' data sends.
+    #[cfg(test)]
+    pub(in crate::transport) fn paces_data(&self) -> bool {
+        self.session.pacer.is_some()
+    }
+
     /// An upgrade message arrived on the UDP session. Never waits: `recv` calls
     /// this. A message dropped on a full inbox costs what a lost datagram costs,
     /// and the machine's deadlines cover that.

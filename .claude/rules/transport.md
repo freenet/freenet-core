@@ -764,36 +764,37 @@ Rate calculation on every rate update (peer_connection::paced_rate; #6047):
   the_floor_keeps_two_datagrams_in_flight_both_ways). On loopback a path ran
   at 3.4 to 34 MB/s with 500 kB/s set.
   Path pacer (quic/path/pacer.rs): with bandwidth-limit or
-  total-bandwidth-limit set (PeerConnection::path_pacer), every path of the
-  connection draws its data writes from a LimitPacer, a token bucket of the
-  connection's QUIC side at QuicRateLimit::rate (the limit, or the share,
-  read again at every reservation; capacity rate / 10 when built, at least
-  MIN_BUCKET_CAPACITY_BYTES), so the limit holds at any round trip. NOT the
-  UDP stream bucket: that runs at min(UDP controller rate, limit), and
-  FixedRate's 1.25 MB/s would pace QUIC below a higher limit, slower than no
-  limit at all. Residual, accepted (lead, 2026-11-06): a peer whose data is on
-  both transports at once (a path and UDP streams that fell back) can get up
-  to twice its share; the egress cap still bounds the node under
-  total-bandwidth-limit. Do not charge UDP fragments to the LimitPacer
-  without measuring the fallback cost. Charged: each write of a
-  Stream or pipe (header, metadata, payload) and of a Short past one packet.
-  Not charged, as on UDP: one-packet Shorts and control frames, which never
-  wait behind data. With no limit nothing is paced (the bucket then runs at
-  the controller's rate, which nobody set). A write reserves with
-  reserve_within, limited to what the send's current deadline leaves, and
-  waits in the send's own task; a refused reservation takes nothing and
-  ends the send as at that deadline: NotOpened(TimedOut) before the stream
-  opened (header and metadata are taken before open_uni), Failed(TimedOut)
-  after (the stream is reset). Bytes taken for a write not made go back. A
-  pacer wait or refusal counts as progress for the stall count
-  (StallCount::note_pacer), as a cap hold does, so a binding limit never
-  closes a busy path. The bucket and its waits run on the connection's
-  clock, the deadlines on the path's; in simulation those differ (real time
-  against the network's virtual time). Pinned by quic::path::tests::pacer,
-  timeouts_after_pacer_holds_do_not_close_a_busy_path,
+  total-bandwidth-limit set (PeerConnection::path_rate_limit), the session
+  builds a LimitPacer on the path's clock (the one the send deadlines run
+  on), and every path of the connection draws its data writes from it: a
+  token bucket of the connection's QUIC side at QuicRateLimit::rate (the
+  limit, or the share, read again at every reservation; capacity rate / 10,
+  at least MIN_BUCKET_CAPACITY_BYTES, recomputed when the rate changes), so
+  the limit holds at any round trip. NOT the UDP stream bucket: that runs at
+  min(UDP controller rate, limit), and FixedRate's 1.25 MB/s would pace QUIC
+  below a higher limit, slower than no limit at all. Charged: each write of
+  a Stream or pipe (header, metadata, payload) and of a Short past one
+  packet. Not charged, as on UDP: one-packet Shorts and control frames,
+  which never wait behind data. With no limit nothing is paced. A write
+  reserves with reserve_within, limited to what the send's current deadline
+  leaves, and waits in the send's own task; a refused reservation takes
+  nothing and ends the send NotOpened(Paced) before the stream opened
+  (header and metadata are taken before open_uni) or Failed(Paced) after
+  (the stream is reset). A message the pacer refused that then goes on UDP
+  is charged to the pacer as debt (QuicPath::charge_fallback), so the two
+  transports together stay near the limit. Bytes taken for a write not made
+  go back. A refusal is never a timeout for the stall count (route.rs
+  timed_out); a pacer wait is NOT progress, so a dark paced path still goes
+  suspect and closes. Residual, accepted (lead, 2026-11-06): data that falls
+  back to UDP for any other reason (no stream credit, a deadline) is paced by
+  the UDP bucket only, so a peer whose data is on both transports at once
+  can get up to twice its share; the egress cap still bounds the node under
+  total-bandwidth-limit. Pinned by quic::path::tests::pacer,
+  pacer_refusals_never_count_and_a_dark_paced_path_still_closes,
+  messages_the_pacer_refuses_go_on_udp_and_are_charged_to_it,
+  a_session_paces_its_data_only_under_a_limit,
   a_data_route_is_paced_only_when_the_session_has_a_pacer and
-  quic_data_is_paced_only_under_a_limit_and_at_that_limit and
-  a_limit_pacer_paces_at_the_limit_and_follows_the_share.
+  quic_data_is_paced_only_under_a_limit_and_at_that_limit.
   Under a saturated egress cap, the window cap apportions it only when the
   per-connection share is below the cap. With the minimum per connection set
   below the share (two connections, one flow each, equal RTT),

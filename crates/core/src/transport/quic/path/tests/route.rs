@@ -58,7 +58,17 @@ fn each_outcome_takes_its_row() {
             (SendOnUdp, R::NotOpenedUdp),
         ),
         (
+            BoundedSend::Failed(SendFailure::NotOpened(NotOpened::Paced)),
+            (SendOnUdp, R::NotOpenedUdp),
+            (SendOnUdp, R::NotOpenedUdp),
+        ),
+        (
             BoundedSend::Failed(SendFailure::TimedOut),
+            (SendOnUdp, R::FailedUdp),
+            (GiveUp, R::Dropped),
+        ),
+        (
+            BoundedSend::Failed(SendFailure::Paced),
             (SendOnUdp, R::FailedUdp),
             (GiveUp, R::Dropped),
         ),
@@ -377,28 +387,46 @@ fn a_quiet_path_closes_after_eight_timeouts() {
     });
 }
 
-/// A wait or a refusal of the path's pacer counts as progress, as a cap hold
-/// does: a `bandwidth-limit` that binds holds the sends on this side, and its
-/// refusals end as timeouts, but the path is not stalled. Eight timeouts past
-/// the window, each after a pacer hold, leave the path open; the same with no
-/// hold closes it (`a_quiet_path_closes_after_eight_timeouts`).
+/// A send the pacer refused is held back on this side and is not a timeout:
+/// any number of them, past the window with nothing acknowledged, neither
+/// close the path nor make it suspect. A paced path whose sends really time out
+/// (it went dark) closes after eight, as an unpaced one does: pacing adds no
+/// exemption beyond the refusals themselves.
 #[test]
-fn timeouts_after_pacer_holds_do_not_close_a_busy_path() {
+fn pacer_refusals_never_count_and_a_dark_paced_path_still_closes() {
+    use super::super::pacer::LimitPacer;
+    use crate::transport::quic::config::QuicRateLimit;
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
         let p = paths("quic-route-paced", 124, QuicPathLimits::DEFAULT).await;
+        p.a.pace_with(Arc::new(
+            LimitPacer::new(QuicRateLimit::new(Some(100_000), None), p.time())
+                .expect("a limit paces"),
+        ));
         let later = p.time().now_nanos() + QUIET;
-        for _ in 0..STALLED_SENDS_LIMIT + 2 {
-            p.a.pacer_holds
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            p.a.settle(SendKind::Stream, &timeouts()[0], false, later);
+        let refusals = [
+            BoundedSend::Failed(SendFailure::NotOpened(NotOpened::Paced)),
+            BoundedSend::Failed(SendFailure::Paced),
+        ];
+        for refused in refusals
+            .iter()
+            .cycle()
+            .take(STALLED_SENDS_LIMIT as usize + 2)
+        {
+            p.a.settle(SendKind::Stream, refused, false, later);
         }
         assert!(p.a.quinn_connection().close_reason().is_none());
-        assert_eq!(
-            p.a.stats().send_event_count(QuicSendEvent::StalledClosed),
-            0
+        assert!(!p.a.is_suspect(), "a refusal is not a quiet timeout");
+        for _ in 1..STALLED_SENDS_LIMIT {
+            p.a.settle(SendKind::Stream, &timeouts()[2], false, later);
+        }
+        assert!(p.a.is_suspect(), "a dark paced path goes suspect");
+        assert!(p.a.quinn_connection().close_reason().is_none());
+        p.a.settle(SendKind::Stream, &timeouts()[2], false, later);
+        assert!(
+            p.a.quinn_connection().close_reason().is_some(),
+            "and closes at the eighth timeout"
         );
-        assert!(!p.a.is_suspect(), "a held send is not a quiet timeout");
     });
 }
 

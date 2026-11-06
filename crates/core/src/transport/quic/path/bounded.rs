@@ -136,6 +136,11 @@ pub(crate) enum SendFailure {
     /// A deadline passed after the stream was opened and before its end was
     /// sent. The stream was reset.
     TimedOut,
+    /// After the stream was opened, the connection's bandwidth-limit pacer
+    /// refused a write whose wait would have reached the send's deadline
+    /// (`pacer` module). The stream was reset. This side held the send back,
+    /// so it says nothing about the path.
+    Paced,
     /// The send failed (`QuicSendError`), before the end of the stream was
     /// sent, or after it with a stop from the peer. This includes a source that
     /// ended or failed before its first chunk, where no stream was opened: such
@@ -152,6 +157,10 @@ pub(crate) enum NotOpened {
     TimedOut,
     /// The connection was lost first.
     ConnectionLost(quinn::ConnectionError),
+    /// The connection's bandwidth-limit pacer refused the header's wait, which
+    /// would have reached the open deadline (`pacer` module). Held back on this
+    /// side, so it says nothing about the path.
+    Paced,
 }
 
 const STAGE_OPENING: u8 = 0;
@@ -257,6 +266,14 @@ impl SendProgress {
         }
     }
 
+    /// The outcome of a send the pacer refused, by how far it had got.
+    fn paced(&self) -> BoundedSend {
+        match self.stage() {
+            STAGE_OPENING => BoundedSend::Failed(SendFailure::NotOpened(NotOpened::Paced)),
+            _ => BoundedSend::Failed(SendFailure::Paced),
+        }
+    }
+
     fn timed_out(&self) -> BoundedSend {
         match self.stage() {
             STAGE_OPENING => BoundedSend::Failed(SendFailure::NotOpened(NotOpened::TimedOut)),
@@ -312,7 +329,7 @@ where
                 // A refusal returns an error only to end the send, which then
                 // ends as a deadline would at that stage.
                 if progress.refused() {
-                    return progress.timed_out();
+                    return progress.paced();
                 }
                 return outcome(result, &progress);
             }

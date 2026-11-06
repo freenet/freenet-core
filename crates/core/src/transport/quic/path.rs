@@ -689,9 +689,6 @@ pub(crate) struct QuicPath {
     /// once set ([`Self::pace_with`]); unset, as with no limit, nothing is
     /// paced. Control frames are never paced.
     pacer: std::sync::OnceLock<Arc<dyn pacer::SendPacer>>,
-    /// Waits and refusals of the pacer, which the stall count takes as
-    /// progress ([`route::StallCount`]).
-    pacer_holds: Arc<std::sync::atomic::AtomicU64>,
     #[cfg(test)]
     budget: SharedInboundBudget,
 }
@@ -873,7 +870,6 @@ impl QuicPath {
                 suspect: std::sync::atomic::AtomicBool::new(false),
                 heard,
                 pacer: std::sync::OnceLock::new(),
-                pacer_holds: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 #[cfg(test)]
                 budget,
             },
@@ -888,11 +884,26 @@ impl QuicPath {
         let _already = self.pacer.set(pacer);
     }
 
+    /// A message of `bytes` that `outcome` sends on UDP instead: if the pacer
+    /// refused it, charge its bytes to the pacer as debt, so the path's next
+    /// sends wait for them and the two transports together stay near the limit
+    /// (`pacer` module). For a Short refused after its stream opened, the bytes
+    /// already written were charged too; the whole message is charged again,
+    /// erring toward the limit.
+    pub(in crate::transport) fn charge_fallback(&self, outcome: &BoundedSend, bytes: u64) {
+        let refused = matches!(
+            outcome,
+            BoundedSend::Failed(SendFailure::NotOpened(NotOpened::Paced) | SendFailure::Paced)
+        );
+        if let (true, Some(pacer)) = (refused, self.pacer.get()) {
+            pacer.charge(usize::try_from(bytes).unwrap_or(usize::MAX));
+        }
+    }
+
     /// The pacing for a data send, if the path is paced.
     fn pacing(&self) -> Option<pacer::Pacing> {
         self.pacer.get().map(|pacer| pacer::Pacing {
             pacer: Arc::clone(pacer),
-            holds: Arc::clone(&self.pacer_holds),
         })
     }
 
@@ -900,11 +911,6 @@ impl QuicPath {
     #[cfg(test)]
     pub(in crate::transport) fn is_paced(&self) -> bool {
         self.pacer.get().is_some()
-    }
-
-    /// The pacer's waits and refusals so far.
-    pub(super) fn pacer_holds(&self) -> u64 {
-        self.pacer_holds.load(Ordering::Relaxed)
     }
 
     /// The key the peer proved in the handshake.

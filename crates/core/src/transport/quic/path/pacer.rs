@@ -32,27 +32,27 @@
 //! connection's task. A reservation whose wait would reach the send's current
 //! deadline is not made, as on UDP (`TokenBucket::reserve_within`): a refused
 //! reservation takes no place, so it does not delay the sends behind it. The
-//! send then ends as at that deadline: [`SendFailure::NotOpened`] before its
-//! stream opened (the message may go on UDP, where the same bucket decides),
-//! and [`SendFailure::TimedOut`] after (the stream is reset). Bytes taken for a
-//! write that is not made go back to the bucket.
+//! send then ends [`NotOpened::Paced`] before its stream opened, and the
+//! message goes on UDP; its bytes are then charged to this bucket as debt
+//! ([`SendPacer::charge`]), so the next QUIC sends wait for them and the two
+//! transports together stay near the limit. After the stream opened it ends
+//! [`SendFailure::Paced`] and the stream is reset. Bytes taken for a write that
+//! is not made go back to the bucket.
 //!
-//! A wait or a refusal is a local hold: the path's stall count takes it as
-//! progress (`route::StallCount`), as it does an egress cap hold, so a binding
-//! limit never closes a busy path.
+//! A refusal is never a timeout for the path's stall count (`route::StallCount`):
+//! this side held the send back. A wait is not progress either: it only holds
+//! writes into quinn's buffer, and acknowledgements still arrive on a live path,
+//! so a paced path that goes dark still goes suspect and closes.
 //!
-//! The bucket and its waits are on the connection's clock, as UDP's are. The
-//! send's deadlines are on the path's clock; the two run at one rate in
-//! production. In simulation the path runs on the network's virtual clock and
-//! the connection on real time, so a paced send there waits in real time.
+//! The bucket and its waits are on the path's clock, the one a send's
+//! deadlines run on (the network's virtual time in simulation).
 //!
-//! [`SendFailure::NotOpened`]: super::bounded::SendFailure::NotOpened
-//! [`SendFailure::TimedOut`]: super::bounded::SendFailure::TimedOut
+//! [`NotOpened::Paced`]: super::bounded::NotOpened::Paced
+//! [`SendFailure::Paced`]: super::bounded::SendFailure::Paced
 
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::simulation::TimeSource;
@@ -70,13 +70,24 @@ pub(in crate::transport) trait SendPacer: Send + Sync {
     /// Return `bytes` taken for a write that was not made.
     fn give_back(&self, bytes: usize);
 
+    /// Charge `bytes` sent another way (a message the pacer refused, sent on
+    /// UDP instead), as debt, without waiting: the next reservations wait for
+    /// them.
+    fn charge(&self, bytes: usize);
+
     /// Sleep for `wait` on the pacer's clock. Dropping it ends the sleep.
     fn sleep(&self, wait: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>>;
 }
 
+/// The burst a pacer at `rate` holds: a tenth of a second of it, as a UDP
+/// connection bucket's, and at least [`MIN_BUCKET_CAPACITY_BYTES`].
+fn capacity_for(rate: usize) -> usize {
+    (rate / 10).max(MIN_BUCKET_CAPACITY_BYTES)
+}
+
 /// A connection's QUIC pacer: a token bucket at the connection's limit
-/// ([`QuicRateLimit::rate`]). Its capacity is a tenth of the rate when it is
-/// built, as a UDP connection bucket's is, and fixed from then.
+/// ([`QuicRateLimit::rate`]), with a burst of a tenth of that rate, both
+/// following the share as it changes.
 pub(in crate::transport) struct LimitPacer<T: TimeSource> {
     bucket: TokenBucket<T>,
     limit: QuicRateLimit,
@@ -87,9 +98,8 @@ impl<T: TimeSource> LimitPacer<T> {
     /// A pacer at `limit`, or `None` when no limit is set.
     pub(in crate::transport) fn new(limit: QuicRateLimit, time: T) -> Option<Self> {
         let rate = usize::try_from(limit.rate()?).unwrap_or(usize::MAX);
-        let capacity = (rate / 10).max(MIN_BUCKET_CAPACITY_BYTES);
         Some(Self {
-            bucket: TokenBucket::new_with_time_source(capacity, rate, time.clone()),
+            bucket: TokenBucket::new_with_time_source(capacity_for(rate), rate, time.clone()),
             limit,
             time,
         })
@@ -99,6 +109,12 @@ impl<T: TimeSource> LimitPacer<T> {
     #[cfg(test)]
     pub(in crate::transport) fn rate(&self) -> usize {
         self.bucket.rate()
+    }
+
+    /// Its burst now.
+    #[cfg(test)]
+    pub(in crate::transport) fn capacity(&self) -> usize {
+        self.bucket.capacity()
     }
 }
 
@@ -110,6 +126,9 @@ impl<T: TimeSource> SendPacer for LimitPacer<T> {
             let rate = usize::try_from(rate).unwrap_or(usize::MAX);
             if rate != self.bucket.rate() {
                 self.bucket.set_rate(rate);
+                // The burst stays a tenth of the rate: a share that fell keeps
+                // no burst of the old share, and one that grew gets its own.
+                self.bucket.set_capacity(capacity_for(rate));
             }
         }
         self.bucket.reserve_within(bytes, limit)
@@ -119,16 +138,19 @@ impl<T: TimeSource> SendPacer for LimitPacer<T> {
         self.bucket.give_back(bytes);
     }
 
+    fn charge(&self, bytes: usize) {
+        let _wait = self.bucket.reserve(bytes);
+    }
+
     fn sleep(&self, wait: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         self.time.sleep_cancelable(wait)
     }
 }
 
-/// A path's pacer and its count of holds, which the stall count reads.
+/// A path's pacer, for one send.
 #[derive(Clone)]
 pub(super) struct Pacing {
     pub(super) pacer: Arc<dyn SendPacer>,
-    pub(super) holds: Arc<AtomicU64>,
 }
 
 /// Bytes taken from the pacer for a write not made yet. Dropped before
@@ -164,25 +186,17 @@ pub(super) enum Paced {
 impl Pacing {
     /// Take `bytes` with at most `limit` to wait. The wait itself is the
     /// caller's, so it can race whatever the caller must not miss; this only
-    /// reserves and counts the hold.
+    /// reserves.
     pub(super) fn take(&self, bytes: usize, limit: Duration) -> Paced {
         match self.pacer.reserve_within(bytes, limit) {
-            Ok(wait) => {
-                if !wait.is_zero() {
-                    self.holds.fetch_add(1, Ordering::Relaxed);
-                }
-                Paced::Taken {
-                    bytes: PacedBytes {
-                        pacer: Arc::clone(&self.pacer),
-                        bytes,
-                    },
-                    wait,
-                }
-            }
-            Err(_) => {
-                self.holds.fetch_add(1, Ordering::Relaxed);
-                Paced::Refused
-            }
+            Ok(wait) => Paced::Taken {
+                bytes: PacedBytes {
+                    pacer: Arc::clone(&self.pacer),
+                    bytes,
+                },
+                wait,
+            },
+            Err(_) => Paced::Refused,
         }
     }
 }

@@ -210,6 +210,13 @@ impl<T: TimeSource> TokenBucket<T> {
         state.rate = new_rate.max(1024);
     }
 
+    /// Change the burst capacity, dropping tokens above it.
+    pub fn set_capacity(&self, capacity: usize) {
+        let mut state = self.state.lock();
+        state.capacity = capacity;
+        state.tokens = state.tokens.min(capacity as isize);
+    }
+
     /// Get current rate (bytes/second)
     pub fn rate(&self) -> usize {
         self.state.lock().rate

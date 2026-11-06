@@ -238,7 +238,10 @@ pub(super) async fn send_large_short_on_path<S: Socket, T: TimeSource>(
         route.clock().now_nanos(),
     ) {
         NextStep::Done => transfer.completed(),
-        NextStep::SendOnUdp => udp.send_stream(stream_id, data, None, None, None).await,
+        NextStep::SendOnUdp => {
+            route.path().charge_fallback(&outcome, bytes);
+            udp.send_stream(stream_id, data, None, None, None).await
+        }
         NextStep::GiveUp => transfer.failed(&outcome),
     }
 }
@@ -277,6 +280,7 @@ pub(super) async fn send_stream_on_path<S: Socket, T: TimeSource>(
             transfer.completed()
         }
         NextStep::SendOnUdp => {
+            route.path().charge_fallback(&outcome, bytes);
             udp.send_stream(stream_id, data, metadata, completion_tx, progress)
                 .await
         }
@@ -322,6 +326,7 @@ pub(super) async fn pipe_stream_on_path<S: Socket, T: TimeSource>(
     {
         NextStep::Done => transfer.completed(),
         NextStep::SendOnUdp => {
+            route.path().charge_fallback(&outcome, bytes);
             udp.pipe_stream(stream_id, inbound_handle, metadata, progress)
                 .await
         }

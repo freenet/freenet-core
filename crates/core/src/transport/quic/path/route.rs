@@ -11,7 +11,9 @@
 //! | `Sent` | done | done |
 //! | `MaybeDelivered` | done | done |
 //! | `Failed(NotOpened)` | UDP | UDP, same id |
+//! | `Failed(NotOpened(Paced))` (the pacer refused it) | UDP, charged to the pacer | UDP, same id, charged to the pacer |
 //! | `Failed(TimedOut)` after open | UDP | give up |
+//! | `Failed(Paced)` after open | UDP, charged to the pacer | give up |
 //! | `ConnectionLost` before the end | UDP | give up |
 //! | Stopped `NOT_ACCEPTING_DATA` | UDP | UDP, same id |
 //! | Stopped `BUDGET_REFUSED` | UDP | give up |
@@ -132,7 +134,9 @@ pub(crate) fn next_step(kind: SendKind, outcome: &BoundedSend) -> (NextStep, Qui
         BoundedSend::Sent => return (Done, R::Sent),
         BoundedSend::MaybeDelivered(_) => return (Done, R::MaybeDelivered),
         BoundedSend::Failed(SendFailure::NotOpened(_)) => (SendOnUdp, false),
-        BoundedSend::Failed(SendFailure::TimedOut) => (short_goes_on_udp, true),
+        BoundedSend::Failed(SendFailure::TimedOut | SendFailure::Paced) => {
+            (short_goes_on_udp, true)
+        }
         BoundedSend::Failed(SendFailure::Error(error)) => match error {
             QuicSendError::InvalidFrame(_) => (SendOnUdp, false),
             QuicSendError::ConnectionLost(_) | QuicSendError::Closed => (short_goes_on_udp, true),
@@ -155,6 +159,8 @@ pub(crate) fn next_step(kind: SendKind, outcome: &BoundedSend) -> (NextStep, Qui
 /// Whether `outcome` is a send deadline running out: before the stream opened,
 /// with the stream open and not moving, or waiting for the acknowledgement of
 /// its end. Whether it counts against the path is [`StallCount`]'s decision.
+/// A send the pacer refused is not one: this side held it back, and the path
+/// said nothing (`pacer` module), so it never counts toward the stall close.
 fn timed_out(outcome: &BoundedSend) -> bool {
     match outcome {
         BoundedSend::MaybeDelivered(MaybeDelivered::TimedOut)
@@ -163,6 +169,8 @@ fn timed_out(outcome: &BoundedSend) -> bool {
         BoundedSend::Sent
         | BoundedSend::MaybeDelivered(MaybeDelivered::ConnectionLost)
         | BoundedSend::Failed(SendFailure::NotOpened(NotOpened::ConnectionLost(_)))
+        | BoundedSend::Failed(SendFailure::NotOpened(NotOpened::Paced))
+        | BoundedSend::Failed(SendFailure::Paced)
         | BoundedSend::Failed(SendFailure::Error(_)) => false,
     }
 }
@@ -212,10 +220,11 @@ pub(crate) struct StallVerdict {
 /// QUIC transmits nothing can be acknowledged, one held transmit can wait for
 /// longer than the window at a low cap, and the path itself is not stalled.
 ///
-/// A wait or a refusal of the path's pacer counts as progress too
-/// ([`Self::note_pacer`]): a `bandwidth-limit` that binds holds the path's sends
-/// on this side, and a send it refuses ends as a timeout, but nothing is wrong
-/// with the path.
+/// A send the path's pacer refused ([`NotOpened::Paced`], [`SendFailure::Paced`])
+/// is not a timeout and never counts: this side held it back. A pacer's waits
+/// are not progress: they only hold writes into quinn's buffer, and on a live
+/// path acknowledgements keep arriving meanwhile, so a paced path that goes
+/// dark still goes suspect and closes.
 #[derive(Debug)]
 pub(crate) struct StallCount {
     in_a_row: u32,
@@ -228,8 +237,6 @@ pub(crate) struct StallCount {
     /// reported with no new hold event (`recycle::cap_held`).
     cap: Option<CapHoldReading>,
     hold_unchanged_since: Option<u64>,
-    /// The pacer's count of waits and refusals at the last settle.
-    pacer_holds: u64,
 }
 
 impl StallCount {
@@ -242,18 +249,6 @@ impl StallCount {
             progressed_at: now_nanos,
             cap: None,
             hold_unchanged_since: None,
-            pacer_holds: 0,
-        }
-    }
-
-    /// Before [`Self::take`]: the path's pacer has made `holds` waits and
-    /// refusals so far. Any since the last settle count as progress at
-    /// `now_nanos`.
-    pub(crate) fn note_pacer(&mut self, holds: u64, now_nanos: u64) {
-        if holds != self.pacer_holds {
-            self.pacer_holds = holds;
-            self.progressed_at = now_nanos;
-            self.in_a_row = 0;
         }
     }
 
@@ -337,11 +332,10 @@ impl QuicPath {
         }
         let acked = self.ack_progress.as_ref().map(recycle::AckProgress::acked);
         let cap = self.connection.cap_holds().read();
-        let verdict = {
-            let mut stall = self.stall.lock();
-            stall.note_pacer(self.pacer_holds(), now_nanos);
-            stall.take(outcome, source_stalled, acked, cap, now_nanos)
-        };
+        let verdict = self
+            .stall
+            .lock()
+            .take(outcome, source_stalled, acked, cap, now_nanos);
         if let (true, Some(acked)) = (verdict.quiet_timeout, acked) {
             self.become_suspect(acked);
         }

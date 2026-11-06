@@ -3659,3 +3659,25 @@ async fn set_peer_identity_promotes_the_session_on_set_and_same_only() {
     assert_eq!(promoted(&e), None, "Refused");
     assert_eq!(e.conn.peer_identity(), Some(&key));
 }
+
+/// A connection opens its upgrade session with a pacer when it has a bandwidth
+/// limit, and without one when it has none: `open_session` builds the pacer
+/// from the connection's limit.
+#[tokio::test(start_paused = true)]
+async fn a_session_paces_its_data_only_under_a_limit() {
+    for (case, subnet, limit) in [("none", 30, None), ("limited", 31, Some(100_000))] {
+        let hub = crate::transport::quic::upgrade::driver::tests::Harness::server(
+            &format!("ack-policy-paced-{case}"),
+            subnet,
+        )
+        .await;
+        let mut e = single(CAPABLE);
+        e.conn.remote_conn.bandwidth_limit = limit;
+        e.conn = e.conn.with_upgrade_site(&hub.site());
+        assert_eq!(
+            e.conn.quic_path.as_ref().expect("a session").paces_data(),
+            limit.is_some(),
+            "{case}"
+        );
+    }
+}

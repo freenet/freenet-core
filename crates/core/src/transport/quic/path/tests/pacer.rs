@@ -65,7 +65,6 @@ fn a_paced_path_keeps_to_the_limit_on_a_short_round_trip() {
             paced >= floor && paced < floor + Duration::from_millis(500),
             "{LEN} bytes at {RATE} B/s took {paced:?}, expected about {floor:?}"
         );
-        assert!(p.a.pacer_holds() > 0, "the sends waited on the pacer");
     });
 }
 
@@ -88,7 +87,7 @@ fn control_frames_and_one_packet_shorts_do_not_wait_behind_data() {
         );
         p.a.pace_with(pacer.clone());
         let (a, time) = (p.a.clone(), p.time());
-        let (elapsed, control, short, stream) = p
+        let (elapsed, control, short, stream, large, pipe) = p
             .drive(async move {
                 let started = time.now();
                 let control = a
@@ -114,24 +113,45 @@ fn control_frames_and_one_packet_shorts_do_not_wait_behind_data() {
                         None,
                     )
                     .await;
-                (time.now() - started, control, short, stream)
+                // A Short past one packet and a pipe are charged too.
+                let large = a
+                    .send_short_bounded(&time, SendDeadlines::short(3_000), &payload(3_000))
+                    .await;
+                let chunks = vec![Ok(Bytes::from(payload(3_000)))];
+                let pipe = a
+                    .send_stream_chunks_bounded(
+                        &time,
+                        SendDeadlines::stream(3_000),
+                        StreamId::next(),
+                        3_000,
+                        None,
+                        futures::stream::iter(chunks),
+                        None,
+                    )
+                    .await;
+                (time.now() - started, control, short, stream, large, pipe)
             })
             .await;
         assert!(matches!(control, BoundedSend::Sent), "{control:?}");
         assert!(matches!(short, BoundedSend::Sent), "{short:?}");
-        assert!(
-            matches!(
-                stream,
-                BoundedSend::Failed(SendFailure::NotOpened(NotOpened::TimedOut))
-            ),
-            "{stream:?}"
-        );
+        for (kind, outcome) in [
+            ("stream", &stream),
+            ("large short", &large),
+            ("pipe", &pipe),
+        ] {
+            assert!(
+                matches!(
+                    outcome,
+                    BoundedSend::Failed(SendFailure::NotOpened(NotOpened::Paced))
+                ),
+                "{kind}: {outcome:?}"
+            );
+        }
         assert!(
             elapsed < Duration::from_secs(1),
             "nothing waited: {elapsed:?}"
         );
         assert_eq!(p.a.send_aborts(), 0, "no stream was opened to reset");
-        assert_eq!(p.a.pacer_holds(), 1, "the one refusal");
         // The refusal took nothing: the debt is what it was, about 109 s.
         let wait = pacer
             .reserve_within(0, Duration::MAX)
@@ -141,12 +161,15 @@ fn control_frames_and_one_packet_shorts_do_not_wait_behind_data() {
 }
 
 /// A pacer whose answers a test sets: from call `refuse_from` on it refuses,
-/// and before that it grants after `wait`. It counts what comes back.
+/// and before that it grants after `wait`. It records what each reservation
+/// asked for and counts what comes back.
 struct Scripted {
     refuse_from: usize,
     wait: Duration,
     calls: AtomicUsize,
     limits: parking_lot::Mutex<Vec<Duration>>,
+    asked: parking_lot::Mutex<Vec<usize>>,
+    charged: AtomicUsize,
     given_back: AtomicUsize,
     time: VirtualTime,
 }
@@ -158,6 +181,8 @@ impl Scripted {
             wait,
             calls: AtomicUsize::new(0),
             limits: parking_lot::Mutex::new(Vec::new()),
+            asked: parking_lot::Mutex::new(Vec::new()),
+            charged: AtomicUsize::new(0),
             given_back: AtomicUsize::new(0),
             time: time.clone(),
         })
@@ -165,8 +190,9 @@ impl Scripted {
 }
 
 impl SendPacer for Scripted {
-    fn reserve_within(&self, _bytes: usize, limit: Duration) -> Result<Duration, Duration> {
+    fn reserve_within(&self, bytes: usize, limit: Duration) -> Result<Duration, Duration> {
         self.limits.lock().push(limit);
+        self.asked.lock().push(bytes);
         if self.calls.fetch_add(1, Ordering::Relaxed) >= self.refuse_from {
             Err(limit)
         } else {
@@ -178,6 +204,10 @@ impl SendPacer for Scripted {
         self.given_back.fetch_add(bytes, Ordering::Relaxed);
     }
 
+    fn charge(&self, bytes: usize) {
+        self.charged.fetch_add(bytes, Ordering::Relaxed);
+    }
+
     fn sleep(
         &self,
         wait: Duration,
@@ -186,8 +216,8 @@ impl SendPacer for Scripted {
     }
 }
 
-/// A refusal after the stream opened ends the send as at its gap deadline,
-/// `Failed(TimedOut)`, and resets the stream, so the receiver drops what came.
+/// A refusal after the stream opened ends the send `Failed(Paced)` and resets
+/// the stream, so the receiver drops what came.
 /// Each reservation is limited to what the send's current deadline leaves: the
 /// first, before the stream opens, to the open deadline.
 #[test]
@@ -200,7 +230,7 @@ fn a_refusal_after_the_stream_opened_resets_it() {
         p.a.pace_with(pacer.clone());
         let (_, outcome) = time_a_stream(&p, 10 * FRAGMENT_PAYLOAD_SIZE).await;
         assert!(
-            matches!(outcome, BoundedSend::Failed(SendFailure::TimedOut)),
+            matches!(outcome, BoundedSend::Failed(SendFailure::Paced)),
             "{outcome:?}"
         );
         assert_eq!(p.a.send_aborts(), 1, "the stream was reset");
@@ -243,6 +273,9 @@ fn bytes_taken_for_a_write_not_made_go_back() {
             }
             fn give_back(&self, bytes: usize) {
                 self.0.give_back(bytes);
+            }
+            fn charge(&self, bytes: usize) {
+                self.0.charge(bytes);
             }
             fn sleep(
                 &self,
@@ -294,4 +327,61 @@ fn a_limit_pacer_paces_at_the_limit_and_follows_the_share() {
         .reserve_within(1_200, Duration::MAX)
         .expect("no limit to refuse at");
     assert_eq!(shared.rate(), 500_000, "the share of two connections");
+}
+
+/// What each write takes from the pacer: the header and the metadata, before
+/// the stream opens, then each fragment-sized piece of the payload.
+#[test]
+fn each_write_takes_its_own_bytes() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths("quic-pacer-bytes", 125, QuicPathLimits::DEFAULT).await;
+        let pacer = Scripted::new(&p.time(), usize::MAX, Duration::ZERO);
+        p.a.pace_with(pacer.clone());
+        let (a, time) = (p.a.clone(), p.time());
+        let outcome = p
+            .drive(async move {
+                a.send_stream_bounded(
+                    &time,
+                    SendDeadlines::stream(2 * FRAGMENT_PAYLOAD_SIZE as u64),
+                    StreamId::next(),
+                    Some(b"announce"),
+                    Bytes::from(payload(2 * FRAGMENT_PAYLOAD_SIZE)),
+                    None,
+                )
+                .await
+            })
+            .await;
+        assert!(matches!(outcome, BoundedSend::Sent), "{outcome:?}");
+        assert_eq!(
+            *pacer.asked.lock(),
+            vec![
+                HEADER_LEN + b"announce".len(),
+                FRAGMENT_PAYLOAD_SIZE,
+                FRAGMENT_PAYLOAD_SIZE
+            ]
+        );
+    });
+}
+
+/// The pacer's burst stays a tenth of its rate as the share changes, so a
+/// connection that opened alone does not keep a tenth of the whole total once
+/// it shares it, and one that opened among many gets its share's burst later.
+#[test]
+fn a_limit_pacer_burst_follows_the_share() {
+    let time = VirtualTime::new();
+    let manager = Arc::new(GlobalBandwidthManager::new(1_000_000, Some(1_000)));
+    manager.register_connection();
+    let shared = LimitPacer::new(
+        QuicRateLimit::new(None, Some(manager.clone())),
+        time.clone(),
+    )
+    .expect("a total limit paces");
+    assert_eq!(shared.capacity(), 100_000);
+    manager.register_connection();
+    let _ = shared.reserve_within(0, Duration::MAX);
+    assert_eq!(shared.capacity(), 50_000, "a tenth of the share of two");
+    manager.unregister_connection();
+    let _ = shared.reserve_within(0, Duration::MAX);
+    assert_eq!(shared.capacity(), 100_000, "and back");
 }
