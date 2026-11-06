@@ -1093,6 +1093,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                 self.inbound_budget.clone(),
                 self.quic_receipt_nanos.clone(),
                 self.udp_sender(),
+                self.path_pacer(),
                 self.remote_conn.time_source.clone(),
             );
             self.quic_path = Some(quic_path);
@@ -1244,6 +1245,22 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
 
     /// What sends one tracked packet on the UDP session from outside the
     /// connection's task.
+    /// What paces this connection's QUIC data sends: its token bucket, the one
+    /// its UDP stream fragments draw on, when a bandwidth limit is set
+    /// (`bandwidth-limit`, or `total-bandwidth-limit` and its share). With
+    /// none, nothing: the bucket then runs at the congestion controller's
+    /// rate, which no one set as a limit (`quic::path::pacer`).
+    fn path_pacer(&self) -> Option<Arc<dyn crate::transport::quic::path::pacer::SendPacer>> {
+        let limited = self.remote_conn.global_bandwidth.is_some()
+            || self.remote_conn.bandwidth_limit.is_some_and(|limit| limit > 0);
+        limited.then(|| {
+            Arc::new(crate::transport::quic::path::pacer::BucketPacer::new(
+                self.remote_conn.token_bucket.clone(),
+                self.remote_conn.time_source.clone(),
+            )) as Arc<dyn crate::transport::quic::path::pacer::SendPacer>
+        })
+    }
+
     fn udp_sender(&self) -> UdpSender<S, T> {
         UdpSender {
             remote_addr: self.remote_conn.remote_addr,

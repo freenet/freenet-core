@@ -88,6 +88,7 @@ use crate::transport::peer_connection::UdpSender;
 use crate::transport::peer_connection::inbound_budget::SharedInboundBudget;
 use crate::transport::quic::control::ControlError;
 use crate::transport::quic::identity::PeerKey;
+use crate::transport::quic::path::pacer::SendPacer;
 use crate::transport::quic::path::{
     BoundedSend, QuicDataInbox, QuicDataSenders, QuicPath, QuicPathLimits, data_channels,
 };
@@ -394,6 +395,10 @@ struct Session {
     data: QuicDataSenders,
     /// What a path's short queue falls back on.
     udp: Arc<dyn UdpShorts>,
+    /// What paces each path's data sends, when the connection has a bandwidth
+    /// limit (`path::pacer`): the connection's token bucket. `None` with no
+    /// limit.
+    pacer: Option<Arc<dyn SendPacer>>,
     /// Whether the live attempt may hold a data route, read without the lock by
     /// every send of the connection ([`Self::data_route`]). Set only after the
     /// route is in place and cleared when the attempt goes, both under the lock,
@@ -529,6 +534,7 @@ impl QuicUpgrades {
         budget: SharedInboundBudget,
         quic_receipt_nanos: Arc<AtomicU64>,
         sender: UdpSender<S, T>,
+        pacer: Option<Arc<dyn SendPacer>>,
         time: T,
     ) -> (QuicPathState, QuicDataInbox) {
         let sender = Arc::new(sender);
@@ -549,6 +555,7 @@ impl QuicUpgrades {
             budget,
             data,
             udp: sender.clone(),
+            pacer,
             routed: Arc::new(AtomicBool::new(false)),
             quic_receipt_nanos,
             now: Arc::new(move || clock.now()),
@@ -971,6 +978,9 @@ impl Session {
             return;
         }
         path.enable_data();
+        if let Some(pacer) = &self.pacer {
+            path.pace_with(Arc::clone(pacer));
+        }
         let (route, worker) = DataRoute::new(
             Arc::clone(path),
             self.hub.path_clock.clone(),

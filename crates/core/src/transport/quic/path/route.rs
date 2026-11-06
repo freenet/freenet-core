@@ -211,6 +211,11 @@ pub(crate) struct StallVerdict {
 /// watch (`recycle::cap_held`): while `total-bandwidth-limit` holds the node's
 /// QUIC transmits nothing can be acknowledged, one held transmit can wait for
 /// longer than the window at a low cap, and the path itself is not stalled.
+///
+/// A wait or a refusal of the path's pacer counts as progress too
+/// ([`Self::note_pacer`]): a `bandwidth-limit` that binds holds the path's sends
+/// on this side, and a send it refuses ends as a timeout, but nothing is wrong
+/// with the path.
 #[derive(Debug)]
 pub(crate) struct StallCount {
     in_a_row: u32,
@@ -223,6 +228,8 @@ pub(crate) struct StallCount {
     /// reported with no new hold event (`recycle::cap_held`).
     cap: Option<CapHoldReading>,
     hold_unchanged_since: Option<u64>,
+    /// The pacer's count of waits and refusals at the last settle.
+    pacer_holds: u64,
 }
 
 impl StallCount {
@@ -235,6 +242,18 @@ impl StallCount {
             progressed_at: now_nanos,
             cap: None,
             hold_unchanged_since: None,
+            pacer_holds: 0,
+        }
+    }
+
+    /// Before [`Self::take`]: the path's pacer has made `holds` waits and
+    /// refusals so far. Any since the last settle count as progress at
+    /// `now_nanos`.
+    pub(crate) fn note_pacer(&mut self, holds: u64, now_nanos: u64) {
+        if holds != self.pacer_holds {
+            self.pacer_holds = holds;
+            self.progressed_at = now_nanos;
+            self.in_a_row = 0;
         }
     }
 
@@ -318,10 +337,11 @@ impl QuicPath {
         }
         let acked = self.ack_progress.as_ref().map(recycle::AckProgress::acked);
         let cap = self.connection.cap_holds().read();
-        let verdict = self
-            .stall
-            .lock()
-            .take(outcome, source_stalled, acked, cap, now_nanos);
+        let verdict = {
+            let mut stall = self.stall.lock();
+            stall.note_pacer(self.pacer_holds(), now_nanos);
+            stall.take(outcome, source_stalled, acked, cap, now_nanos)
+        };
         if let (true, Some(acked)) = (verdict.quiet_timeout, acked) {
             self.become_suspect(acked);
         }
