@@ -207,10 +207,18 @@ pub(crate) struct StallVerdict {
 /// consumer stays stalled past the window while nothing else on the path is
 /// acknowledged reads as a stalled path.
 ///
-/// An egress cap hold counts as progress, as it does for the acknowledgement
-/// watch (`recycle::cap_held`): while `total-bandwidth-limit` holds the node's
-/// QUIC transmits nothing can be acknowledged, one held transmit can wait for
-/// longer than the window at a low cap, and the path itself is not stalled.
+/// An egress cap hold of this connection's transmit counts as progress, as it
+/// does for the acknowledgement watch (`recycle::cap_held`): while
+/// `total-bandwidth-limit` holds them nothing can be acknowledged, one held
+/// transmit can wait for longer than the window at a low cap, and the path
+/// itself is not stalled. The record is the connection's own
+/// (`socket::with_poller_holds`): a node-wide one would read as progress on
+/// every path whenever any connection is held, and on a node whose cap binds
+/// this count would never fire.
+///
+/// A [`QuietProof`] a timed-out send left dates the progress this sees
+/// ([`Self::take`]), so a path that went dark mid-send counts its first
+/// timeout.
 #[derive(Debug)]
 pub(crate) struct StallCount {
     in_a_row: u32,

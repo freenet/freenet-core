@@ -163,6 +163,12 @@ impl CapHolds {
         self.waiting(false);
     }
 
+    /// A held poller was admitted. Tests only.
+    #[cfg(test)]
+    pub(crate) fn release_one(&self) {
+        self.release();
+    }
+
     /// The hold events so far, whether a poller is held now, and how long a
     /// hold stays valid with no new event.
     pub(crate) fn read(&self) -> CapHoldReading {

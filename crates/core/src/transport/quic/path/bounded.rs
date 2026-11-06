@@ -399,11 +399,13 @@ fn nanos(duration: Duration) -> u64 {
 }
 
 /// Run the send `send` builds, until it returns or a deadline passes on
-/// `time`. With `connection`, a send whose stream is open runs out of gap only
-/// once its connection has also stopped moving ([`ConnectionWatch`]). `send` gets the [`SendProgress`] to pass to the path's `*_with`
-/// send, which is how a timeout is placed in the send. A closure that ignored
-/// it would report every timeout as `NotOpened`, so this is private to the
-/// path, whose `send_*_bounded` methods pass it on.
+/// `time`. With `connection`, a send whose stream is open runs out of gap
+/// only once its connection has also stopped moving ([`ConnectionWatch`]),
+/// and one that does leaves a [`QuietProof`] for the path's stall count.
+/// `send` gets the [`SendProgress`] to pass to the path's `*_with` send,
+/// which is how a timeout is placed in the send. A closure that ignored it
+/// would report every timeout as `NotOpened`, so this is private to the path,
+/// whose `send_*_bounded` methods pass it on.
 ///
 /// One timer at a time, as in `inbound::BodyReader`: armed for the current
 /// deadline and, when it fires, re-armed if progress has moved the deadline.
@@ -411,9 +413,9 @@ fn nanos(duration: Duration) -> u64 {
 /// the deadline later, so the armed timer is never too late. A wait for the
 /// source can move it earlier (it drops the connection's window), so when the
 /// timer is armed past the send's own gap it wakes the loop to re-arm
-/// (`SendProgress::waiting_on_source` says why no wait is missed). The move from
-/// `open` to `gap` could make it earlier only with a gap shorter than `open`,
-/// which is asserted against below.
+/// (`SendProgress::waiting_on_source` says why no wait is missed). The move
+/// from `open` to `gap` could make it earlier only with a gap shorter than
+/// `open`, which is asserted against below.
 ///
 /// Cancel safety: dropping this future drops the send, with the same
 /// effect as a timeout at that point.

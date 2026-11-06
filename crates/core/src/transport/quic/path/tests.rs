@@ -2559,11 +2559,22 @@ struct LossCount {
 /// A seeded loss of `percent` of datagrams in both directions on `network`;
 /// the counts of what it saw and dropped.
 fn seeded_loss(network: &str, percent: u64) -> Arc<LossCount> {
+    seeded_loss_from(network, percent, 0x5940_0006, None)
+}
+
+/// [`seeded_loss`] from draw state `seed`, with every delivered datagram
+/// delayed by `one_way` if given.
+fn seeded_loss_from(
+    network: &str,
+    percent: u64,
+    seed: u64,
+    one_way: Option<Duration>,
+) -> Arc<LossCount> {
     use crate::transport::in_memory_socket::{
         PacketDeliveryDecision, set_packet_delivery_callback,
     };
     use std::sync::atomic::Ordering::Relaxed;
-    let state = Arc::new(std::sync::atomic::AtomicU64::new(0x5940_0006));
+    let state = Arc::new(std::sync::atomic::AtomicU64::new(seed));
     let count = Arc::new(LossCount::default());
     let counted = count.clone();
     set_packet_delivery_callback(
@@ -2571,37 +2582,6 @@ fn seeded_loss(network: &str, percent: u64) -> Arc<LossCount> {
         Some(Arc::new(move |_, _, _, _| {
             counted.seen.fetch_add(1, Relaxed);
             // A fixed linear congruential sequence, one draw per datagram.
-            let next = state
-                .fetch_update(
-                    std::sync::atomic::Ordering::Relaxed,
-                    std::sync::atomic::Ordering::Relaxed,
-                    |x| Some(x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1)),
-                )
-                .unwrap_or_default();
-            if (next >> 33) % 100 < percent {
-                counted.dropped.fetch_add(1, Relaxed);
-                PacketDeliveryDecision::Drop
-            } else {
-                PacketDeliveryDecision::Deliver
-            }
-        })),
-    );
-    count
-}
-
-/// [`seeded_loss`] with every delivered datagram also delayed by `one_way`.
-fn seeded_loss_with_delay(network: &str, percent: u64, one_way: Duration) -> Arc<LossCount> {
-    use crate::transport::in_memory_socket::{
-        PacketDeliveryDecision, set_packet_delivery_callback,
-    };
-    use std::sync::atomic::Ordering::Relaxed;
-    let state = Arc::new(std::sync::atomic::AtomicU64::new(0x5940_0007));
-    let count = Arc::new(LossCount::default());
-    let counted = count.clone();
-    set_packet_delivery_callback(
-        network,
-        Some(Arc::new(move |_, _, _, _| {
-            counted.seen.fetch_add(1, Relaxed);
             let next = state
                 .fetch_update(Relaxed, Relaxed, |x| {
                     Some(x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1))
@@ -2611,7 +2591,10 @@ fn seeded_loss_with_delay(network: &str, percent: u64, one_way: Duration) -> Arc
                 counted.dropped.fetch_add(1, Relaxed);
                 PacketDeliveryDecision::Drop
             } else {
-                PacketDeliveryDecision::DelayedDelivery(one_way)
+                match one_way {
+                    Some(delay) => PacketDeliveryDecision::DelayedDelivery(delay),
+                    None => PacketDeliveryDecision::Deliver,
+                }
             }
         })),
     );
@@ -2629,10 +2612,12 @@ fn a_lossy_path_finishes_a_stream_whose_writes_wait_past_the_gap() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
         let network = "quic-path-lossy-gap";
-        let loss = seeded_loss_with_delay(network, 5, Duration::from_millis(100));
+        let loss = seeded_loss_from(network, 5, 0x5940_0007, Some(Duration::from_millis(100)));
         let p = paths(network, 47, QuicPathLimits::DEFAULT).await;
         let (a, time) = (p.a.clone(), p.time());
         const LEN: usize = 8 * MIB;
+        let gaps = Arc::new(WriteGaps::new(time.clone()));
+        let watched = gaps.clone();
         let sent = p
             .drive(async move {
                 a.send_stream_bounded(
@@ -2641,7 +2626,7 @@ fn a_lossy_path_finishes_a_stream_whose_writes_wait_past_the_gap() {
                     StreamId::next(),
                     None,
                     payload(LEN).into(),
-                    None,
+                    Some(&*watched),
                 )
                 .await
             })
@@ -2651,12 +2636,52 @@ fn a_lossy_path_finishes_a_stream_whose_writes_wait_past_the_gap() {
             loss.dropped.load(std::sync::atomic::Ordering::Relaxed),
         );
         crate::transport::in_memory_socket::set_packet_delivery_callback(network, None);
+        // The draw drops 5%; 3% is a floor with room for the draw's
+        // variation, so a change that left the run nearly lossless fails here.
         assert!(
             dropped * 100 >= seen * 3,
             "the loss happened: {dropped} of {seen}"
         );
+        // Without a write that waited past the 5 s gap this test would pass on
+        // main too.
+        let longest = gaps.longest();
+        assert!(
+            longest > super::super::super::peer_connection::streaming::STREAM_INACTIVITY_TIMEOUT,
+            "a write waited past the gap: longest {longest:?}"
+        );
         assert!(matches!(sent, BoundedSend::Sent), "{sent:?}");
     })
+}
+
+/// The longest wait between two fragments a send handed to quinn.
+struct WriteGaps {
+    time: VirtualTime,
+    last: std::sync::atomic::AtomicU64,
+    longest: std::sync::atomic::AtomicU64,
+}
+
+impl WriteGaps {
+    fn new(time: VirtualTime) -> Self {
+        let now = time.now_nanos();
+        Self {
+            time,
+            last: std::sync::atomic::AtomicU64::new(now),
+            longest: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn longest(&self) -> Duration {
+        Duration::from_nanos(self.longest.load(std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+impl crate::transport::boundary::StreamProgressObserver for WriteGaps {
+    fn on_fragment_sent(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let now = self.time.now_nanos();
+        let gap = now.saturating_sub(self.last.swap(now, Relaxed));
+        self.longest.fetch_max(gap, Relaxed);
+    }
 }
 
 /// Sample `paths`' connections every 500 ms until `end` (virtual nanos);
@@ -3648,6 +3673,90 @@ fn a_send_waiting_for_its_source_ends_at_its_own_gap() {
     })
 }
 
+/// The watch takes its baseline when the send starts: acknowledgements and
+/// cap holds from before the send are not progress during it, so a path that
+/// was dark when the send began fails it at its own gap.
+#[test]
+fn progress_from_before_the_send_does_not_extend_its_gap() {
+    bounded(|| async move {
+        let time = VirtualTime::new();
+        let clock = time.clone();
+        let (sent, after) = drive(&time, LIMIT, async move {
+            let acks = recycle::AckProgress::detached();
+            let cap = Arc::new(super::super::socket::CapHolds::new(Some(10_000_000)));
+            for _ in 0..3 {
+                acks.ack();
+            }
+            cap.hold_one();
+            cap.release_one();
+            let connection = bounded::ConnectionProgress {
+                acks,
+                cap_holds: cap,
+                quiet: Arc::default(),
+            };
+            let deadlines = SendDeadlines {
+                open: Duration::from_secs(2),
+                gap: Some(Duration::from_secs(5)),
+                total: Duration::from_secs(120),
+            };
+            let start = clock.now();
+            let sent = bounded_send(&clock, deadlines, Some(connection), |progress| async move {
+                progress.mark_opened();
+                never().await
+            })
+            .await;
+            (sent, clock.now() - start)
+        })
+        .await;
+        assert!(
+            matches!(sent, BoundedSend::Failed(SendFailure::TimedOut)),
+            "{sent:?}"
+        );
+        assert_eq!(after, Duration::from_secs(5));
+    })
+}
+
+/// A wait for the source wakes the timer loop only when the connection's
+/// window has pushed the timer past the send's own gap: a send that reads
+/// its source many times with no window arms its timer only a few times, not
+/// once per read.
+#[test]
+fn source_waits_do_not_rearm_the_timer_without_an_extension() {
+    bounded(|| async move {
+        let time = VirtualTime::new();
+        let clock = time.clone();
+        let arms = drive(&time, LIMIT, async move {
+            let connection = bounded::ConnectionProgress {
+                acks: recycle::AckProgress::detached(),
+                cap_holds: Arc::new(super::super::socket::CapHolds::new(None)),
+                quiet: Arc::default(),
+            };
+            let deadlines = SendDeadlines {
+                open: Duration::from_secs(2),
+                gap: Some(Duration::from_secs(5)),
+                total: Duration::from_secs(120),
+            };
+            let arms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let seen = arms.clone();
+            let _ = bounded_send(&clock, deadlines, Some(connection), |progress| async move {
+                progress.mark_opened();
+                for _ in 0..50 {
+                    progress.waiting_on_source(true);
+                    tokio::task::yield_now().await;
+                    progress.waiting_on_source(false);
+                    progress.step();
+                }
+                seen.store(progress.arms(), std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            })
+            .await;
+            arms.load(std::sync::atomic::Ordering::Relaxed)
+        })
+        .await;
+        assert!(arms <= 2, "{arms} timers armed for 50 source reads");
+    })
+}
+
 /// `total` still ends a send whose connection never stops moving.
 #[test]
 fn total_ends_a_send_on_a_connection_that_keeps_moving() {
@@ -4014,6 +4123,83 @@ fn a_write_held_by_a_silent_peer_fails_at_the_gap() {
         assert_eq!(p.a.send_aborts(), 1);
         assert!(p.a.connection().inner().close_reason().is_none());
     })
+}
+
+/// A path that goes dark mid-send, here once three quarters of the stream have
+/// been handed to quinn (past the first send window's worth, so writes have
+/// already waited for acknowledgements): the send's own earlier
+/// acknowledgements extend its gap, so
+/// it fails after its 5 s gap but within twice `STALL_PROGRESS_WINDOW` of the
+/// open deadline's wake (2 s), and the [`bounded::QuietProof`] it leaves makes
+/// that first timeout count, so the path goes suspect at once.
+#[test]
+fn a_path_dark_mid_send_fails_within_two_windows_and_goes_suspect() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let network = "quic-path-dark-mid-send";
+        let p = paths(network, 77, QuicPathLimits::DEFAULT).await;
+        let (a, time) = (p.a.clone(), p.time());
+        let body = over_window();
+        let fragments = body.len().div_ceil(FRAGMENT_PAYLOAD_SIZE);
+        let silencer = Arc::new(SilenceAfter {
+            network,
+            from: p.pair.b_addr,
+            after: fragments * 3 / 4,
+            sent: std::sync::atomic::AtomicUsize::new(0),
+            silenced: parking_lot::Mutex::new(None),
+        });
+        let watched = silencer.clone();
+        let deadlines = SendDeadlines::stream(body.len() as u64);
+        let (outcome, took) = p
+            .drive(async move {
+                let start = time.now();
+                let outcome = a
+                    .send_stream_bounded(
+                        &time,
+                        deadlines,
+                        StreamId::next(),
+                        None,
+                        body,
+                        Some(&*watched),
+                    )
+                    .await;
+                (outcome, time.now() - start)
+            })
+            .await;
+        assert!(silencer.silenced.lock().is_some(), "the path went dark");
+        assert!(
+            matches!(outcome, BoundedSend::Failed(SendFailure::TimedOut)),
+            "{outcome:?}"
+        );
+        let window = super::route::STALL_PROGRESS_WINDOW;
+        assert!(
+            took > Duration::from_secs(5) && took <= Duration::from_secs(2) + 2 * window,
+            "took {took:?}"
+        );
+        assert_eq!(took, Duration::from_secs(12));
+        p.a.settle(SendKind::Stream, &outcome, false, p.time().now_nanos());
+        assert!(p.a.is_suspect(), "the first timeout makes the path suspect");
+        drop(silencer.silenced.lock().take());
+    })
+}
+
+/// Drops every datagram from `from` on `network` once `after` fragments of a
+/// send have been handed to quinn.
+struct SilenceAfter {
+    network: &'static str,
+    from: SocketAddr,
+    after: usize,
+    sent: std::sync::atomic::AtomicUsize,
+    silenced: parking_lot::Mutex<Option<DropFrom>>,
+}
+
+impl crate::transport::boundary::StreamProgressObserver for SilenceAfter {
+    fn on_fragment_sent(&self) {
+        let sent = self.sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if sent == self.after {
+            *self.silenced.lock() = Some(DropFrom::new(self.network, &[self.from]));
+        }
+    }
 }
 
 /// Egress cap holds count per connection (#6128 review): on a capped node
