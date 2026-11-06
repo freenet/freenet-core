@@ -1348,7 +1348,7 @@ impl P2pConnManager {
                 .config
                 .network_api
                 .global_bandwidth_manager()
-                .map(|manager| {
+                .inspect(|manager| {
                     // The transport builds a node-wide egress cap from the
                     // same total (`transport::egress_cap`); say so at startup,
                     // and warn when it is low for the allowed connections.
@@ -1367,8 +1367,7 @@ impl P2pConnManager {
                     // effective aggregate rate R to the demand aggregator.
                     // Observation only — the manager is read, never written,
                     // by the shadow side. See transport/shadow_demand.rs.
-                    crate::transport::shadow_demand::register_global_bandwidth(&manager);
-                    manager
+                    crate::transport::shadow_demand::register_global_bandwidth(manager);
                 }),
             ledbat_min_ssthresh: config.config.network_api.ledbat_min_ssthresh,
             congestion_config: config.config.network_api.build_congestion_config(),
