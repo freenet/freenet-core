@@ -4835,7 +4835,9 @@ mod stream_completion_timeout_tests {
             let (tx, rx) = tokio::sync::oneshot::channel::<()>();
             let sender = tokio::spawn(async move {
                 tokio::time::sleep(arrives).await;
-                let _ = tx.send(());
+                // The flat wait drops `rx` before this fires, so the send
+                // can fail; only the receiving side matters here.
+                tx.send(()).ok();
             });
             let completion = super::await_stream_completion(rx, timeout).await;
             sender.abort();
