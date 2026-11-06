@@ -385,3 +385,25 @@ fn a_limit_pacer_burst_follows_the_share() {
     let _ = shared.reserve_within(0, Duration::MAX);
     assert_eq!(shared.capacity(), 100_000, "and back");
 }
+
+/// Bytes charged for a message that went on UDP are debt: the next reservation
+/// waits them out at the limit, so QUIC and those UDP sends together keep to it.
+#[test]
+fn a_charged_fallback_holds_the_next_send_to_the_limit() {
+    let time = VirtualTime::new();
+    let pacer = LimitPacer::new(QuicRateLimit::new(Some(100_000), None), time.clone())
+        .expect("a limit paces");
+    // Spend the 10 kB burst, then charge 50 kB sent on UDP.
+    assert_eq!(
+        pacer.reserve_within(10_000, Duration::MAX),
+        Ok(Duration::ZERO)
+    );
+    pacer.charge(50_000);
+    let wait = pacer
+        .reserve_within(0, Duration::MAX)
+        .expect("no limit to refuse at");
+    assert!(
+        wait >= Duration::from_millis(490) && wait <= Duration::from_millis(510),
+        "50 kB at 100 kB/s: {wait:?}"
+    );
+}

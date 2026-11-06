@@ -1434,15 +1434,25 @@ fn many_tasks_send_while_the_path_closes_and_nothing_goes_twice() {
     }
 }
 
-/// A pacer that refuses every reservation and records what is charged to it.
+/// A pacer that grants its first `grant` reservations at once, refuses every
+/// one after, and records what is charged to it.
 #[derive(Default)]
 struct RefusingPacer {
+    grant: usize,
+    calls: std::sync::atomic::AtomicUsize,
     charged: std::sync::atomic::AtomicUsize,
 }
 
 impl crate::transport::quic::path::pacer::SendPacer for RefusingPacer {
     fn reserve_within(&self, _bytes: usize, limit: Duration) -> Result<Duration, Duration> {
-        Err(limit)
+        let call = self
+            .calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if call < self.grant {
+            Ok(Duration::ZERO)
+        } else {
+            Err(limit)
+        }
     }
 
     fn give_back(&self, _bytes: usize) {}
@@ -1496,6 +1506,39 @@ fn messages_the_pacer_refuses_go_on_udp_and_are_charged_to_it() {
                 pacer.charged.load(std::sync::atomic::Ordering::Relaxed),
                 stream.len() + large.len(),
                 "every refused byte is charged to the pacer"
+            );
+        },
+    );
+}
+
+/// A Short past one packet that the pacer refuses after its stream opened is
+/// reset and goes on UDP whole, and the whole message is charged to the pacer.
+#[test]
+fn a_large_short_the_pacer_refuses_after_opening_is_charged_to_it() {
+    run(
+        "quic-send-paced-open",
+        141,
+        QuicPathLimits::DEFAULT,
+        |mut rig| async move {
+            // The header goes; the first payload write is refused.
+            let pacer = Arc::new(RefusingPacer {
+                grant: 1,
+                ..RefusingPacer::default()
+            });
+            rig.route.path().pace_with(pacer.clone());
+            let large = bytes_of(4000);
+            rig.e.conn.send_serialized(large.to_vec()).await.unwrap();
+            rig.path.settle(Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+            let udp = rig.udp_data();
+            assert_eq!(udp.stream_bytes, large.to_vec(), "it went on UDP whole");
+            assert_eq!(
+                rig.stats().send_count(SendKind::LargeShort, R::FailedUdp),
+                1
+            );
+            assert_eq!(
+                pacer.charged.load(std::sync::atomic::Ordering::Relaxed),
+                large.len()
             );
         },
     );
