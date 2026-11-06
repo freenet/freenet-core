@@ -110,6 +110,43 @@ impl QuicDatagramDrop {
     }
 }
 
+/// A [`QuicDatagramDrop`] that first lets `after_bytes` of the pair's
+/// QUIC-class datagrams through from the rule's start, both directions counted
+/// together, and drops from the next datagram on. A test cuts a pair in the
+/// middle of a transfer this way, by how much has moved rather than by a time
+/// that depends on when the transfer started. Its count is kept by whoever
+/// applies it (the network's fault injector), so the rule itself stays a value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuicDatagramCut {
+    /// Which datagrams the cut governs, and from when.
+    pub rule: QuicDatagramDrop,
+    /// Bytes delivered from the rule's start before it drops.
+    pub after_bytes: u64,
+}
+
+impl QuicDatagramCut {
+    /// Whether the cut drops `datagram` sent from `from` to `to` at virtual
+    /// time `now`, with `seen` the bytes it has let through so far, which a
+    /// datagram it lets through adds to.
+    pub fn drops(
+        &self,
+        seen: &mut u64,
+        from: &SocketAddr,
+        to: &SocketAddr,
+        datagram: &[u8],
+        now: u64,
+    ) -> bool {
+        if !self.rule.drops(from, to, datagram, now) {
+            return false;
+        }
+        if *seen >= self.after_bytes {
+            return true;
+        }
+        *seen += datagram.len() as u64;
+        false
+    }
+}
+
 /// Configuration for fault injection during simulation.
 #[derive(Debug, Clone)]
 pub struct FaultConfig {
@@ -375,6 +412,38 @@ mod tests {
             );
         }
         assert!(!FaultConfig::new().drops_quic_datagram(&addr(1), &addr(2), &quic_long, T));
+    }
+
+    /// A cut lets `after_bytes` of the pair's QUIC datagrams through from its
+    /// start, both directions together, and drops every one after. Datagrams
+    /// before the start, of another class or of another pair are neither
+    /// dropped nor counted.
+    #[test]
+    fn a_quic_datagram_cut_counts_only_what_it_governs() {
+        const T: u64 = 5_000;
+        let cut = QuicDatagramCut {
+            rule: QuicDatagramDrop::new(addr(1), addr(2), T),
+            after_bytes: 250,
+        };
+        let mut seen = 0;
+        let quic = [0x40u8; 100];
+        let legacy = [0x02u8; 100];
+        let mut drops = |from, to, datagram: &[u8], now| {
+            cut.drops(&mut seen, &addr(from), &addr(to), datagram, now)
+        };
+        // Not counted: too early, not QUIC, not the pair.
+        assert!(!drops(1, 2, &quic, T - 1));
+        assert!(!drops(1, 2, &legacy, T));
+        assert!(!drops(1, 3, &quic, T));
+        // 100, 200, then 300: the third crosses 250 and is still delivered.
+        assert!(!drops(1, 2, &quic, T));
+        assert!(!drops(2, 1, &quic, T));
+        assert!(!drops(1, 2, &quic, T));
+        for _ in 0..3 {
+            assert!(drops(2, 1, &quic, T + 1));
+            assert!(!drops(2, 1, &legacy, T + 1));
+        }
+        assert_eq!(seen, 300);
     }
 
     #[test]

@@ -47,6 +47,8 @@ struct TraceData {
     connections: Mutex<BTreeMap<SocketAddr, usize>>,
     /// Nodes that receive an extra Initial each time they allow a peer.
     initial_on_attempt: Mutex<BTreeSet<SocketAddr>>,
+    /// Nodes that build their paths to refuse data while they advertise the bit.
+    refuse_data: Mutex<BTreeSet<SocketAddr>>,
     /// The version a peer reports, and the release it then reads as.
     release: Mutex<Option<(Version, Version)>>,
 }
@@ -118,6 +120,13 @@ impl QuicUpgradeTrace {
     /// so the Initial gets there before anything the peer sends.
     pub fn send_initial_on_each_attempt(&self, node: SocketAddr) {
         self.data.initial_on_attempt.lock().insert(node);
+    }
+
+    /// `node` advertises its data bit but builds every path to refuse data, as a
+    /// node with a gating bug would. Its peer sends data, the node refuses it and
+    /// closes the path, and the pair's data goes on UDP.
+    pub fn refuse_data_while_advertising(&self, node: SocketAddr) {
+        self.data.refuse_data.lock().insert(node);
     }
 
     /// A peer that reports `real` is treated as running `release` when the machine
@@ -209,6 +218,10 @@ impl NodeTrace {
         if crate::transport::in_memory_socket::deliver_packet_at(self.addr, datagram, source) {
             self.record(source, 0, "injected an Initial".to_string());
         }
+    }
+
+    pub(crate) fn refuses_data_while_advertising(&self) -> bool {
+        self.trace.data.refuse_data.lock().contains(&self.addr)
     }
 
     pub(crate) fn wrong_record(&self) -> bool {

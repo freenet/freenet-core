@@ -989,7 +989,9 @@ impl Session {
 
     /// The path to send this connection's data on: the live attempt's, once both
     /// sides set the data bit (the attempt holds a route only then), unless the
-    /// peer refused data. `None` in shadow and after a teardown, which takes the
+    /// peer refused data or the path is suspect ([`QuicPath::is_suspect`]: a send
+    /// timed out with nothing acknowledged, so new data goes on UDP until the peer
+    /// acknowledges again). `None` in shadow and after a teardown, which takes the
     /// attempt under this same lock in the step that leaves `Active`, so a path
     /// that ended stops taking sends at once. The lock is short and never held
     /// across an await. A route read just before a teardown still works: what it
@@ -1003,6 +1005,9 @@ impl Session {
         }
         let state = self.state.lock();
         let route = state.attempt.as_ref()?.route.as_ref()?;
+        if route.path().is_suspect() {
+            return None;
+        }
         if !route.path().sends_data() {
             // A refusal is for good on this path, so its route is off the fast
             // path too. A new attempt sets the flag again under this lock.
@@ -1025,12 +1030,21 @@ impl Session {
     fn build_path(&self, state: &mut SessionState, attempt: u32, connection: QuicConnection) {
         // At once, not when the peer's bit arrives: the peer's first stream can
         // overtake the frame that carries it.
-        #[cfg_attr(not(test), allow(unused_mut))]
+        #[cfg_attr(not(any(test, feature = "testing")), allow(unused_mut))]
         let mut limits = if state.machine.accepts_data() {
             QuicPathLimits::DEFAULT
         } else {
             QuicPathLimits::SHADOW
         };
+        #[cfg(any(test, feature = "testing"))]
+        if self
+            .hub
+            .trace
+            .as_ref()
+            .is_some_and(|trace| trace.refuses_data_while_advertising())
+        {
+            limits = QuicPathLimits::SHADOW;
+        }
         #[cfg(test)]
         {
             limits.counters = self.hub.test_counters;
@@ -1121,6 +1135,22 @@ impl Session {
                     "path carried data: refused {}, delivered {}",
                     stats.count(Q::RefusedNotAcceptingData),
                     stats.count(Q::DeliveredShort) + stats.count(Q::AnnouncedStream)
+                )
+            });
+            self.note(|| {
+                use crate::transport::quic::path::QuicInboundOutcome as Q;
+                format!(
+                    "path closed refusing data: {}",
+                    path.stats().count(Q::ClosedRefusingData)
+                )
+            });
+            self.note(|| {
+                use crate::transport::quic::path::QuicSendEvent as E;
+                let stats = path.stats();
+                format!(
+                    "path was suspect: entered {}, left {}",
+                    stats.send_event_count(E::SuspectEntered),
+                    stats.send_event_count(E::SuspectLeft)
                 )
             });
             self.note(|| {
