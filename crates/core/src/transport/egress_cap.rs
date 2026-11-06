@@ -359,6 +359,22 @@ struct AdmissionQueue {
 struct QueuedWaiters {
     next_ticket: u64,
     /// Every queued waiter's ticket; the smallest is the oldest.
+    ///
+    /// Not capped by count, on purpose. An entry is one waiting sender: a
+    /// paced UDP stream fragment or a QUIC connection's poller. It leaves
+    /// when the sender is admitted or its waiter is dropped, and a stream
+    /// waits at most [`PACED_WAIT_DEADLINE`] (5 s) before it fails and drops
+    /// it, so the set holds the senders waiting in the last 5 s, at most.
+    /// Each entry costs about 20 bytes here (a `u64` in a 104-byte B-tree
+    /// leaf of 11 keys, about half full when keys arrive in order), against
+    /// the stream it stands for: a task, its `StreamPacing`, and a payload
+    /// larger than one packet (an operation's stream is at least the 64 KB
+    /// streaming threshold). 10 000 waiting streams are about 200 KB here,
+    /// against at least 12 MB of payload, and 640 MB if they are operation
+    /// streams. The work per call is bounded
+    /// however long the set is: `ahead_of` stops at [`MAX_ADMISSION_WAKERS`]
+    /// `+ 1` steps, and insert and remove are O(log n). A cap here would fail
+    /// streams that the queue could still serve in turn.
     places: std::collections::BTreeSet<u64>,
     /// The wakers held, by ticket, at most [`MAX_ADMISSION_WAKERS`]. Kept
     /// apart from `places` so waking the oldest holders never walks past
