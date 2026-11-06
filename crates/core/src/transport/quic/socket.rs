@@ -516,7 +516,9 @@ impl<S: Socket> QuicSocket<S> {
             Some(cap) => {
                 // One datagram per transmit keeps every take within the
                 // burst (at least 4 datagrams), so the bucket's bound holds
-                // exactly and the take can always be admitted eventually.
+                // exactly. The take also leaves one datagram per other
+                // outstanding admission, each lasting at most
+                // `ADMISSION_PASS`, so it is admitted eventually.
                 debug_assert!(
                     transmit.contents.len() as u64 <= cap.burst_bytes(),
                     "a {} byte transmit is larger than the egress burst",

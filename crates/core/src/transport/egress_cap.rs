@@ -36,7 +36,11 @@
 //! place on the connection, and the queue then admits it at once; right
 //! after the cwnd check it calls [`try_take`] and sends at once. The queue
 //! holds the stream's waker and its place, never bytes, so a waiting stream
-//! holds no node-wide capacity. Waiters are admitted in the order they
+//! holds no node-wide capacity. An admitted sender holds one datagram from
+//! its admission to its take, at most [`ADMISSION_PASS`] (1 ms): every other
+//! take leaves it in the bucket meanwhile. A sender that was admitted and has
+//! not sent (its take failed, or its congestion window held it past the pass)
+//! keeps its place: it queues again where it was admitted from. Waiters are admitted in the order they
 //! queued (QUIC connections and UDP streams alike, one entry each), so
 //! connections share the cap in proportion to their number of waiting
 //! streams and QUIC connections; there is no isolation between connections,
@@ -202,6 +206,19 @@ const NANOS_PER_SEC: u128 = 1_000_000_000;
 /// timer, which its place in the queue still staggers; no waiter loses its
 /// place. The QUIC endpoint has one waiter per connection that is short of
 /// bytes, and each paced UDP stream has one.
+///
+/// The same number bounds four things, and fits each:
+/// - Held wakers: at about 16 bytes each, 16 KiB; past it a waiter relies on
+///   its timer, which only makes it later, never lost.
+/// - The rank counted ahead of a waiter (`QueuedWaiters::ahead_of`): at most
+///   1025 steps under the queue lock per poll, a few microseconds.
+/// - The clamp on a waiter's timer stagger: 1024 datagrams of refill is what
+///   `quic::socket::cap_hold_validity` budgets for a QUIC transmit's wait, so
+///   the hold watch never takes a live hold for an abandoned one.
+/// - Live admissions (`QueuedWaiters::admitted`): each lasts at most
+///   [`ADMISSION_PASS`], and at the smallest cap (4 datagrams of burst) far
+///   fewer than 1024 can be admitted within one pass, so the bound binds only
+///   at large caps under overload, where the next waiter waits up to one pass.
 pub(crate) const MAX_ADMISSION_WAKERS: usize = 1024;
 
 /// How many waiters queued behind a dropped `poll_admit` waiter are woken to
@@ -914,7 +931,10 @@ impl EgressCap {
     /// Requiring the whole amount (rather than any positive level) keeps a
     /// paced send from ever putting the bucket into debt, so the bound in the
     /// module docs holds exactly. A take is at most one datagram, and the
-    /// burst holds at least four, so a take always succeeds eventually.
+    /// burst holds at least four. It also needs one datagram for every other
+    /// admission outstanding, which may be more than the burst holds, but an
+    /// admission lasts at most [`ADMISSION_PASS`], so the take still succeeds
+    /// eventually.
     ///
     /// The bucket must also keep one [`WAKE_DATAGRAM_BYTES`] for every
     /// admission whose take has not happened yet, except the one this take
@@ -953,6 +973,15 @@ impl EgressCap {
     /// made between the count of what is owed and the take (it would count
     /// the datagram this take is about to use). `Ok` says whether the take
     /// used `taker`'s admission.
+    ///
+    /// The lock is taken on every paced take, also with nobody waiting, where
+    /// the take was a lock-free compare-and-swap before. Measured in a release
+    /// build, uncontended: 14 ns for the lock in a 108 ns take, beside a UDP
+    /// send of microseconds. Only nodes with `total-bandwidth-limit` take it,
+    /// and each paced sender already takes the same lock to be admitted. A
+    /// fast path that skipped it while nobody waits would let an admission be
+    /// made between this take's check and its swap, which is the race the lock
+    /// is here to close.
     fn take_in_turn(
         &self,
         bytes: usize,
@@ -1449,14 +1478,14 @@ pub(crate) struct StreamPacing {
     admitted_at_ns: Option<u64>,
 }
 
-/// How long an admission after a wait stays good for the take
-/// ([`StreamPacing::wait_for_admission`]). `poll_admit` gives up the
-/// waiter's place when it admits it, and the stream re-checks its
-/// congestion window before taking, so without a pass the next poll would
-/// queue it again at the back, behind every waiter, and it would never reach
-/// the front. One tokio timer tick: a stream whose window was open takes
-/// within it; one held up longer by its window queues again, since it could
-/// not use its turn.
+/// How long an admission stays good for the take: the stream that waited for
+/// it calls again without queueing within it ([`StreamPacing::wait_for_admission`]),
+/// and the queue holds the admitted datagram that long (`QueuedWaiters::admitted`).
+/// One tokio timer tick: a stream whose window was open takes within it. One
+/// held up longer by its window queues again, at the place it was admitted
+/// from (`AdmissionWaiter::held_place`), so a cwnd wait costs it no turn of the
+/// queue. On `VirtualTime` it is 1 ms of virtual time, so a simulated send that
+/// does not yield between its admission and its take always takes within it.
 pub(crate) const ADMISSION_PASS: Duration = Duration::from_millis(1);
 
 /// How [`StreamPacing::wait_for_admission`] ended.
@@ -1591,7 +1620,8 @@ impl StreamPacing {
         if let Some(at) = self.admitted_at_ns.take() {
             let since = time_source.now_nanos().saturating_sub(at);
             // The take that follows checks the bucket itself; if another
-            // sender took the datagram meanwhile, the stream queues again.
+            // sender took the datagram meanwhile, the stream queues again at
+            // its place.
             if since <= ADMISSION_PASS.as_nanos() as u64 {
                 return Ok(Admission::Now);
             }

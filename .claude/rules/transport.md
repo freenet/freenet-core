@@ -130,7 +130,14 @@ tie (one stream in three sent nothing in 2 s at 1524 streams). After
 Admission::Waited the stream re-checks cwnd and calls again; that call
 takes its turn without queueing within ADMISSION_PASS (1 ms). Without the
 pass it re-queued at the back on every turn and never sent. A stream held
-by cwnd past the pass queues again. An admission stays on the queue
+by cwnd past the pass, or whose take failed (an unpaced send took the
+datagram first), queues again AT ITS PLACE (AdmissionWaiter::held_place, the
+ticket it was admitted from, kept until a take succeeds), so neither costs
+it a turn of the queue (streams_sharing_a_window_keep_their_turn_under_a_binding_cap:
+worst gap one turn, 0.86 s, against two turns, 1.61 s, when it went to the
+back). At most MAX_ADMISSION_WAKERS admissions are live at once; the next
+waiter waits, and no live one is dropped. A failed QUIC take withdraws its
+poller's admission. An admission stays on the queue
 (QueuedWaiters::admitted) until its take or for ADMISSION_PASS, whichever
 comes first: it counts ahead of every waiter that polls, and every take
 leaves one datagram per outstanding admission but its own, so on a
@@ -211,9 +218,11 @@ before it sends (answered_connection_ack, receipts taken before the NoOp).
 Unpaced debt is capped at DEBT_LIMIT (1 s at the cap); the rest is forgiven
 (sent uncharged) and counted. Over any interval ending at a paced send the
 node sends at most burst + rate x interval + bytes forgiven in the
-interval. Invariant: nothing is reserved on the NODE cap; a paced sender
-holds no node-wide capacity while it waits, and is charged there only at
-its send (it does hold its per-connection reservation, see above). Gaps
+interval. Invariant: nothing is reserved on the NODE cap while a sender
+waits; it holds no node-wide capacity in the queue, and is charged there only
+at its send (it does hold its per-connection reservation, see above). Between
+its admission and its take an admitted sender holds one datagram, for at most
+ADMISSION_PASS (1 ms): every other take leaves it in the bucket. Gaps
 that reach LONG_WAIT
 (2.5 s) and abandoned streams are counted by what took most of the gap
 (WaitCause: cap, connection = the connection's own bucket, other = cwnd, the

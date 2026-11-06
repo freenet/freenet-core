@@ -190,8 +190,10 @@ enum CappedAttempt<'a> {
 /// stream's deadline; if it had to wait the attempt ends (`Retry`) so the
 /// cwnd check comes again right before the take. Then it takes with
 /// `try_take`; a take that still fails (another sender took the refill
-/// first) retries, keeping the connection payment. Nothing is reserved on
-/// the node-wide cap: the queue holds a waker, not bytes.
+/// first) retries, keeping the connection payment and its place in the
+/// queue. Nothing is reserved on the node-wide cap while the fragment waits:
+/// the queue holds a waker and a place, not bytes. Once admitted, the fragment
+/// holds one datagram until its take, at most `ADMISSION_PASS` (1 ms).
 async fn capped_attempt<'a, S: super::super::Socket, T: TimeSource>(
     socket: &'a S,
     cap: &'a super::super::egress_cap::EgressCap,
@@ -442,9 +444,11 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
         // `capped_attempt`: the fragment pays the per-connection bucket once,
         // in order (reserve and sleep), and keeps that payment; then each
         // attempt checks cwnd and takes from the node-wide bucket back to
-        // back, with no await between them and the send. A refused node-wide
-        // take sleeps for the deficit with jitter and starts again from the
-        // cwnd check. Nothing is held on the node-wide bucket while waiting.
+        // back, with no await between them and the send. Before each take the
+        // fragment waits its turn in the node-wide admission queue
+        // (`StreamPacing::wait_for_admission`), and a take that fails queues
+        // again at its place. Nothing is held on the node-wide bucket while
+        // waiting; an admitted fragment holds its datagram for at most 1 ms.
         // `CWND_WAIT_TIMEOUT` counts only time spent waiting for cwnd, summed
         // over the attempts.
         let mut cwnd_waited = Duration::ZERO;
