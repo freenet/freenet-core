@@ -848,132 +848,169 @@ impl TraceFingerprint {
     }
 }
 
-/// Same seed, same trace, PAST the first disk-usage maintenance walks.
+/// Thread ids of the tokio blocking-pool threads alive now (Linux).
+#[cfg(target_os = "linux")]
+fn blocking_pool_threads() -> std::collections::BTreeSet<u64> {
+    let Ok(tasks) = std::fs::read_dir("/proc/self/task") else {
+        return Default::default();
+    };
+    tasks
+        .flatten()
+        .filter_map(|task| {
+            let tid = task.file_name().to_str()?.parse::<u64>().ok()?;
+            let name = std::fs::read_to_string(task.path().join("comm")).ok()?;
+            (name.trim_end() == "tokio-rt-worker").then_some(tid)
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+const NO_BLOCKING_POOL_CHILD_ENV: &str = "FREENET_NO_BLOCKING_POOL_CHILD";
+#[cfg(target_os = "linux")]
+const NO_BLOCKING_POOL_TEST: &str = "test_simulation_uses_no_blocking_pool_thread";
+
+/// No simulated node may hand work to tokio's blocking pool.
 ///
-/// Ring's disk-usage loop (`sweep_get_subscription_cache`) first walks the
-/// data dirs 70-90 s of virtual time into a run (a 10-30 s start delay, then a
-/// skipped first tick of a 60 s interval), and every 60 s after. When that walk
-/// was awaited through a bare `spawn_blocking`, it finished on a real OS thread
-/// in wall-clock time, so the step at which each node resumed depended on OS
-/// scheduling and one seed gave different results from run to run (#6123).
-/// `test_strict_determinism_exact_event_equality` runs 30 s of virtual time
-/// and never reaches the walk, which is how that got past CI.
+/// A blocking-pool thread finishes in wall-clock time, so the simulation step
+/// at which the awaiting task resumes follows OS scheduling, and one seed gives
+/// different results from run to run. That was #6123: Ring's disk-usage sweep
+/// awaited `spawn_blocking` (now `offload_blocking`, inline on a simulation
+/// host). The sweep first walks 70-90 s of virtual time into a run, so this run
+/// keeps operations going to about 140 s and watches, every 20 ms, for a
+/// `tokio-rt-worker` thread (tokio's name for its blocking-pool threads) that
+/// was not there before the simulation started. It catches any awaited
+/// `spawn_blocking` or `tokio::fs` call on a simulation path, not only the
+/// sweep's. The polling matters: an idle blocking thread exits after 10 s, so
+/// a check at the end alone could miss one used early.
 ///
-/// The walk's timing only shows in the trace if operations are running when it
-/// resumes, so this keeps GETs and UPDATEs going every 2 s to about 240 s,
-/// across three walks per node, and compares every event's kind, transaction
-/// and peer, in order, across three runs.
-#[test_log::test]
-fn test_determinism_past_disk_maintenance() {
+/// Runs in a child process (a re-exec of this binary filtered to this test), so
+/// no other test in the same `cargo test` process can create a blocking thread
+/// during the watch.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_simulation_uses_no_blocking_pool_thread() {
+    if std::env::var_os(NO_BLOCKING_POOL_CHILD_ENV).is_none() {
+        let output = std::process::Command::new("/proc/self/exe")
+            .args([
+                "--exact",
+                "--test-threads=1",
+                "--nocapture",
+                NO_BLOCKING_POOL_TEST,
+            ])
+            .env(NO_BLOCKING_POOL_CHILD_ENV, "1")
+            .output()
+            .expect("re-exec the test binary");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "child run of {NO_BLOCKING_POOL_TEST} failed.\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        );
+        // libtest exits 0 when its filter matches nothing; fail closed on a
+        // rename instead of passing vacuously.
+        assert!(
+            stdout.contains("1 passed"),
+            "the child must actually have run {NO_BLOCKING_POOL_TEST}; if it was \
+             renamed, update NO_BLOCKING_POOL_TEST.\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        );
+        return;
+    }
+
     const SEED: u64 = 0xD15C_6123;
+    const NAME: &str = "no-blocking-pool";
     const NODES: usize = 9;
     const CONTRACTS: u8 = 4;
-    const ROUNDS: usize = 36;
+    const ROUNDS: usize = 30;
 
-    fn run_and_trace(name: &str) -> Vec<String> {
-        setup_deterministic_state(SEED);
-        let rt = create_runtime();
-        let (mut sim, logs_handle) = rt.block_on(async {
-            let sim = SimNetwork::new(name, 1, NODES, 10, 3, 8, 3, SEED).await;
-            let logs_handle = sim.event_logs_handle();
-            (sim, logs_handle)
-        });
+    setup_deterministic_state(SEED);
+    let rt = create_runtime();
+    let mut sim = rt.block_on(SimNetwork::new(NAME, 1, NODES, 10, 3, 8, 3, SEED));
 
-        let contracts: Vec<_> = (0..CONTRACTS)
-            .map(|i| SimOperation::create_test_contract(0x60 + i))
-            .collect();
-        let mut operations = Vec::new();
-        for (i, contract) in contracts.iter().enumerate() {
-            operations.push(ScheduledOperation::new(
-                NodeLabel::gateway(name, 0),
-                SimOperation::Put {
-                    contract: contract.clone(),
-                    state: SimOperation::create_test_state(i as u8),
-                    subscribe: true,
-                },
-            ));
-        }
-        for node in 1..=NODES {
-            let contract = &contracts[node % contracts.len()];
-            operations.push(ScheduledOperation::new(
-                NodeLabel::node(name, node),
-                SimOperation::Subscribe {
-                    contract_id: *contract.key().id(),
-                },
-            ));
-        }
-        for round in 0..ROUNDS {
-            let contract = &contracts[round % contracts.len()];
-            operations.push(ScheduledOperation::new(
-                NodeLabel::node(name, 1 + round % NODES),
-                SimOperation::Update {
-                    key: contract.key(),
-                    data: SimOperation::create_test_state(16 + round as u8),
-                },
-            ));
-            operations.push(ScheduledOperation::new(
-                NodeLabel::node(name, 1 + (round * 5 + 3) % NODES),
-                SimOperation::Get {
-                    contract_id: *contract.key().id(),
-                    return_contract_code: false,
-                    subscribe: false,
-                },
-            ));
-            operations.push(ScheduledOperation::new(
-                NodeLabel::node(name, 1 + (round * 7 + 1) % NODES),
-                SimOperation::Get {
-                    contract_id: *contracts[(round + 1) % contracts.len()].key().id(),
-                    return_contract_code: false,
-                    subscribe: false,
-                },
-            ));
-        }
-        let op_interval = Duration::from_secs(2);
-        let op_seconds = operations.len() as u64 * op_interval.as_secs();
-        assert!(op_seconds > 220, "operations must outlast the third walk");
-        sim.with_controlled_op_interval(op_interval);
-
-        let result = sim.run_controlled_simulation(
-            SEED,
-            operations,
-            Duration::from_secs(op_seconds + 60),
-            Duration::from_secs(30),
-        );
-        assert!(
-            result.turmoil_result.is_ok(),
-            "{name}: simulation failed: {:?}",
-            result.turmoil_result.err()
-        );
-        rt.block_on(async {
-            logs_handle
-                .lock()
-                .await
-                .iter()
-                .map(|log| format!("{} {} {}", log.kind.variant_name(), log.tx, log.peer_id))
-                .collect()
-        })
+    let contracts: Vec<_> = (0..CONTRACTS)
+        .map(|i| SimOperation::create_test_contract(0x60 + i))
+        .collect();
+    let mut operations = Vec::new();
+    for (i, contract) in contracts.iter().enumerate() {
+        operations.push(ScheduledOperation::new(
+            NodeLabel::gateway(NAME, 0),
+            SimOperation::Put {
+                contract: contract.clone(),
+                state: SimOperation::create_test_state(i as u8),
+                subscribe: true,
+            },
+        ));
     }
-
-    let first = run_and_trace("disk-det-run1");
+    for node in 1..=NODES {
+        operations.push(ScheduledOperation::new(
+            NodeLabel::node(NAME, node),
+            SimOperation::Subscribe {
+                contract_id: *contracts[node % contracts.len()].key().id(),
+            },
+        ));
+    }
+    for round in 0..ROUNDS {
+        let contract = &contracts[round % contracts.len()];
+        operations.push(ScheduledOperation::new(
+            NodeLabel::node(NAME, 1 + round % NODES),
+            SimOperation::Update {
+                key: contract.key(),
+                data: SimOperation::create_test_state(16 + round as u8),
+            },
+        ));
+        operations.push(ScheduledOperation::new(
+            NodeLabel::node(NAME, 1 + (round * 5 + 3) % NODES),
+            SimOperation::Get {
+                contract_id: *contracts[(round + 1) % contracts.len()].key().id(),
+                return_contract_code: false,
+                subscribe: false,
+            },
+        ));
+    }
+    let op_interval = Duration::from_secs(2);
+    let op_seconds = operations.len() as u64 * op_interval.as_secs();
     assert!(
-        first.len() > 100,
-        "the run produced too few events ({}) to compare",
-        first.len()
+        op_seconds > 120,
+        "operations must run past the sweep's first disk walk (70-90 s)"
     );
-    for name in ["disk-det-run2", "disk-det-run3"] {
-        let other = run_and_trace(name);
-        let diverges_at = first.iter().zip(&other).position(|(a, b)| a != b);
-        assert!(
-            diverges_at.is_none() && first.len() == other.len(),
-            "same seed, different trace: {name} has {} events against {}, first \
-             difference at event {:?}: {:?} vs {:?}",
-            other.len(),
-            first.len(),
-            diverges_at,
-            diverges_at.map(|i| &first[i]),
-            diverges_at.map(|i| &other[i]),
-        );
-    }
+    sim.with_controlled_op_interval(op_interval);
+
+    let before = blocking_pool_threads();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watcher = {
+        let stop = stop.clone();
+        let before = before.clone();
+        std::thread::spawn(move || {
+            let mut seen = std::collections::BTreeSet::new();
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                seen.extend(blocking_pool_threads().difference(&before).copied());
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            seen.extend(blocking_pool_threads().difference(&before).copied());
+            seen
+        })
+    };
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(op_seconds + 30),
+        Duration::from_secs(20),
+    );
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let new_threads = watcher.join().expect("watcher thread");
+    assert!(
+        result.turmoil_result.is_ok(),
+        "simulation failed: {:?}",
+        result.turmoil_result.err()
+    );
+    assert!(
+        new_threads.is_empty(),
+        "a simulated node handed work to tokio's blocking pool ({} new \
+         tokio-rt-worker threads: {new_threads:?}). Its result then arrives in \
+         wall-clock time and the run stops being a function of its seed \
+         (#6123). Run blocking work inline on a simulation host, e.g. through \
+         crate::util::blocking::offload_blocking.",
+        new_threads.len()
+    );
 }
 
 /// **STRICT** determinism test: verifies that same seed produces EXACTLY identical events.
