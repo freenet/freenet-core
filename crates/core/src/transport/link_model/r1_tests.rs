@@ -403,7 +403,7 @@ fn distribution_failures(sc: &Scenario, reports: &[Report]) -> Vec<String> {
 /// runs on `vt`; the one tokio-clock reader on the path is the receiver's
 /// 60 s duplicate-retention window, which only decides how long dedup state
 /// is kept.
-async fn drive_virtual_time(vt: VirtualTime) {
+pub(super) async fn drive_virtual_time(vt: VirtualTime) {
     loop {
         tokio::time::sleep(Duration::from_millis(1)).await;
         vt.trigger_expired();
@@ -509,7 +509,7 @@ fn reoffered_share(deliveries: &[Delivery], offers: &[Offer], from: u64, to: u64
 /// connection to finish left the other side to run out its 3 s deadline:
 /// at 1% loss, about one seed in 30 failed with "max connection attempts
 /// reached" before the transfer began.
-async fn connect_pair<S: Socket>(
+pub(super) async fn connect_pair<S: Socket>(
     a: impl Future<Output = Result<PeerConnection<S, VirtualTime>, TransportError>>,
     b: impl Future<Output = Result<PeerConnection<S, VirtualTime>, TransportError>>,
 ) -> (

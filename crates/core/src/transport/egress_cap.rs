@@ -159,6 +159,14 @@ const MIN_BURST_PACKETS: u64 = 4;
 /// charge beyond it is forgiven.
 pub(crate) const DEBT_LIMIT: Duration = Duration::from_secs(1);
 
+/// A legacy UDP retransmit may put the bucket this far into debt, and no
+/// further ([`EgressCap::try_take_retransmit`]); past it the retransmit waits
+/// for the rate, and nothing retransmitted is forgiven. Well below
+/// [`DEBT_LIMIT`]: enough to send lost packets ahead of queued first copies,
+/// which then wait in the admission queue, without letting a retransmit storm
+/// run at whatever rate its timers produce.
+pub(crate) const RETX_DEBT_LIMIT: Duration = Duration::from_millis(100);
+
 /// A gap between one stream's fragments at least this long is counted and
 /// logged: half the receiver's stream inactivity timeout, so it is reported
 /// before the receiver would give the stream up.
@@ -348,6 +356,10 @@ pub struct EgressCap {
     refused_since_warn: WarnWindow,
     #[cfg(test)]
     stats: StatCounters,
+    /// Tests only: retransmits are sent and charged as unpaced sends, as
+    /// before they were capped, so one test binary can compare both.
+    #[cfg(test)]
+    retransmits_uncapped: std::sync::atomic::AtomicBool,
 }
 
 impl fmt::Debug for EgressCap {
@@ -778,6 +790,9 @@ pub struct EgressTake<'a> {
     taken_bytes: u64,
     /// How long the sender slept for the cap before this take.
     waited: Duration,
+    /// Taken without admission (a retransmit), so recorded as an unpaced
+    /// send, as retransmits were before they were capped.
+    unpaced: bool,
 }
 
 impl EgressCap {
@@ -815,6 +830,8 @@ impl EgressCap {
             refused_since_warn: WarnWindow::default(),
             #[cfg(test)]
             stats: StatCounters::default(),
+            #[cfg(test)]
+            retransmits_uncapped: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -905,6 +922,60 @@ impl EgressCap {
                 Err(current) => old = current,
             }
         }
+    }
+
+    /// Whether retransmits must take from this cap
+    /// ([`Self::try_take_retransmit`]). Always, outside tests.
+    pub(crate) fn caps_retransmits(&self) -> bool {
+        #[cfg(test)]
+        {
+            !self.retransmits_uncapped.load(Ordering::Relaxed)
+        }
+        #[cfg(not(test))]
+        {
+            true
+        }
+    }
+
+    /// Tests only: send retransmits uncapped, as before #6100's cap.
+    #[cfg(test)]
+    pub(crate) fn uncap_retransmits(&self) {
+        self.retransmits_uncapped.store(true, Ordering::Relaxed);
+    }
+
+    /// Take `bytes` for a legacy UDP retransmit (an RTO resend or a tail-loss
+    /// probe) if the bucket's debt after the take stays within
+    /// [`RETX_DEBT_LIMIT`]; otherwise take nothing and return how long the
+    /// rate needs until it would fit. Unlike [`Self::charge_unpaced`] nothing
+    /// is forgiven, so retransmits cannot exceed the cap by more than that
+    /// debt; unlike a paced take it needs no admission and may go into debt,
+    /// so a lost packet is repaired ahead of first copies waiting in the
+    /// admission queue. One atomic update: no lock, no await. Send the
+    /// datagram with `Socket::send_to_paced`, which charges it once.
+    pub(crate) fn try_take_retransmit(&self, bytes: usize) -> Result<EgressTake<'_>, Duration> {
+        let cost = self.cost_ns(bytes as u64);
+        let limit = i64::try_from(RETX_DEBT_LIMIT.as_nanos()).unwrap_or(i64::MAX);
+        let fits = |empty_at: i64, now: i64| {
+            let after = self.refilled(empty_at, now).saturating_add(cost);
+            let over = after.saturating_sub(now.saturating_add(limit));
+            if over <= 0 { Ok(after) } else { Err(over) }
+        };
+        let (old, new, now) = self.update(|empty_at, now| fits(empty_at, now).ok());
+        if let Err(over) = fits(old, now) {
+            return Err(Duration::from_nanos(over as u64));
+        }
+        let debt = self.bytes_for(new.saturating_sub(now));
+        if debt > 0 {
+            #[cfg(test)]
+            self.stats.debt_hwm_bytes.fetch_max(debt, Ordering::Relaxed);
+            TRANSPORT_METRICS.record_egress_debt(debt);
+        }
+        Ok(EgressTake {
+            cap: self,
+            taken_bytes: bytes as u64,
+            waited: Duration::ZERO,
+            unpaced: true,
+        })
     }
 
     /// Charge a datagram sent without pacing. The bucket may go into debt,
@@ -1055,6 +1126,7 @@ impl EgressCap {
                 cap: self,
                 taken_bytes: bytes as u64,
                 waited,
+                unpaced: false,
             },
             own.is_some(),
         ))
@@ -1418,7 +1490,9 @@ impl EgressTake<'_> {
         let this = ManuallyDrop::new(self);
         let sent = (sent_bytes as u64).min(this.taken_bytes);
         this.cap.give_back(this.taken_bytes - sent);
-        let decision = if this.waited.is_zero() {
+        let decision = if this.unpaced {
+            EgressDecision::Unpaced
+        } else if this.waited.is_zero() {
             EgressDecision::Immediate
         } else {
             EgressDecision::Waited

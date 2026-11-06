@@ -944,7 +944,29 @@ impl<T: TimeSource> SentPacketTracker<T> {
     /// TLP (Tail Loss Probe) fires before RTO to detect tail loss earlier.
     /// - TLP returns TlpProbe action (no backoff applied, speculative)
     /// - RTO returns Resend action (backoff applied, definite loss)
+    #[cfg(test)]
     pub(super) fn get_resend(&mut self) -> ResendAction {
+        self.get_resend_admitted(|_, _| Ok(()))
+    }
+
+    /// [`Self::get_resend`], asking `admit` before a packet is resent or
+    /// probed, with the kind and its size in bytes, and before any of the
+    /// packet's state changes (`admit` is the node-wide egress cap's
+    /// retransmit take, `EgressCap::try_take_retransmit`).
+    ///
+    /// - An RTO resend `admit` refuses (`Err(wait)`) keeps its place at the
+    ///   front of the queue with its retransmit count, its backoff and its
+    ///   send time unchanged, and the result is [`ResendAction::WaitUntil`]
+    ///   at `now + wait`. It is still abandoned at its count: the count moves
+    ///   only when a resend goes, and a packet due for abandonment is
+    ///   abandoned without asking, since nothing is sent.
+    /// - A tail-loss probe `admit` refuses is skipped: it is speculative, and
+    ///   the packet's RTO covers it. It is marked probed, as a sent probe is,
+    ///   so it does not ask again.
+    pub(super) fn get_resend_admitted(
+        &mut self,
+        mut admit: impl FnMut(ResendKind, usize) -> Result<(), Duration>,
+    ) -> ResendAction {
         let now_nanos = self.time_source.now_nanos();
         let pto = self.probe_timeout();
         let effective_rto_nanos = self.effective_rto().as_nanos() as u64;
@@ -982,6 +1004,13 @@ impl<T: TimeSource> SentPacketTracker<T> {
                 if now_nanos >= tlp_at && now_nanos < rto_deadline {
                     // TLP fires! Clone packet data for the probe
                     if let Some((packet, _, _, _)) = self.pending_receipts.get(&entry.packet_id) {
+                        if admit(ResendKind::Probe, packet.len()).is_err() {
+                            // Skipped: marked as probed so it does not ask
+                            // again, and its RTO still covers it.
+                            self.tlp_sent_packets.insert(entry.packet_id);
+                            self.resend_queue.push_front(entry);
+                            continue;
+                        }
                         let packet_clone = packet.clone();
                         let packet_id = entry.packet_id;
 
@@ -1003,6 +1032,26 @@ impl<T: TimeSource> SentPacketTracker<T> {
             // Check if RTO should fire (only for a still-tracked packet —
             // get_resend keeps resent packets in pending_receipts since #4345).
             if now_nanos >= rto_deadline && self.pending_receipts.contains_key(&entry.packet_id) {
+                // A resend that will go (not an abandonment) asks first, and
+                // changes nothing when refused.
+                let abandoning = self
+                    .retransmit_counts
+                    .get(&entry.packet_id)
+                    .copied()
+                    .unwrap_or(0)
+                    >= MAX_PACKET_RETRANSMITS;
+                if !abandoning {
+                    let len = self
+                        .pending_receipts
+                        .get(&entry.packet_id)
+                        .map_or(0, |(packet, _, _, _)| packet.len());
+                    if let Err(wait) = admit(ResendKind::Rto, len) {
+                        self.resend_queue.push_front(entry);
+                        return ResendAction::WaitUntil(
+                            now_nanos.saturating_add(wait.as_nanos() as u64),
+                        );
+                    }
+                }
                 // Update packet loss proportion for a lost packet
                 self.packet_loss_proportion = self.packet_loss_proportion
                     * (1.0 - PACKET_LOSS_DECAY_FACTOR)
@@ -1113,6 +1162,15 @@ impl<T: TimeSource> SentPacketTracker<T> {
         let deadline_nanos = self.time_source.now_nanos() + self.effective_rto().as_nanos() as u64;
         ResendAction::WaitUntil(deadline_nanos)
     }
+}
+
+/// What [`SentPacketTracker::get_resend_admitted`] asks to send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ResendKind {
+    /// An RTO resend: the packet is lost.
+    Rto,
+    /// A tail-loss probe: speculative.
+    Probe,
 }
 
 #[derive(Debug, PartialEq)]

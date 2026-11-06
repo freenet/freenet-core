@@ -945,6 +945,10 @@ struct EgressCounters {
     debt_hwm_bytes: AtomicU64,
     /// Unpaced bytes forgiven because the debt reached the debt limit.
     debt_forgiven_bytes: AtomicU64,
+    /// Legacy UDP retransmits (RTO resends) the node-wide egress cap deferred (`EgressCap::try_take_retransmit`).
+    retransmits_deferred: AtomicU64,
+    /// Legacy UDP tail-loss probes skipped because the egress cap had no room for them.
+    probes_skipped: AtomicU64,
 }
 
 /// Period counters for packet loss, retransmission and standalone-ACK
@@ -2185,6 +2189,18 @@ impl TransportMetrics {
             .fetch_add(bytes, Ordering::Relaxed);
     }
 
+    /// Record a legacy UDP retransmit the egress cap deferred.
+    pub(crate) fn record_egress_retransmit_deferred(&self) {
+        self.egress
+            .retransmits_deferred
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a legacy UDP tail-loss probe skipped for want of egress cap.
+    pub(crate) fn record_egress_probe_skipped(&self) {
+        self.egress.probes_skipped.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Record `n` recent traversal failures the listener forgot early
     /// because its table was full.
     pub(crate) fn record_stray_intro_failures_evicted(&self, n: u32) {
@@ -2683,6 +2699,8 @@ impl TransportMetrics {
             egress_streams_refused_other: get64(&egress.streams_refused[WaitCause::Other as usize]),
             egress_debt_hwm_bytes: get64(&egress.debt_hwm_bytes),
             egress_debt_forgiven_bytes: get64(&egress.debt_forgiven_bytes),
+            egress_retransmits_deferred: get64(&egress.retransmits_deferred),
+            egress_probes_skipped: get64(&egress.probes_skipped),
             conn_identity_set_dialed: get32(&identity[ConnIdentity::SetDialed as usize]),
             conn_identity_expected_inbound_bound: get32(
                 &identity[ConnIdentity::ExpectedInboundBound as usize],
@@ -3287,6 +3305,8 @@ pub struct TransportSnapshot {
     pub egress_streams_refused_other: u64,
     pub egress_debt_hwm_bytes: u64,
     pub egress_debt_forgiven_bytes: u64,
+    pub egress_retransmits_deferred: u64,
+    pub egress_probes_skipped: u64,
     /// Connection identity decisions during the period, by
     /// [`ConnIdentity`] (the field suffix is its label). Counts only, no
     /// addresses or keys.
@@ -3602,6 +3622,8 @@ impl TransportSnapshot {
             egress_streams_refused_other,
             egress_debt_hwm_bytes,
             egress_debt_forgiven_bytes,
+            egress_retransmits_deferred,
+            egress_probes_skipped,
             conn_identity_set_dialed,
             conn_identity_expected_inbound_bound,
             conn_identity_expected_inbound_unbound,
@@ -3744,6 +3766,8 @@ impl TransportSnapshot {
         self.egress_streams_refused_other = egress_streams_refused_other;
         self.egress_debt_hwm_bytes = egress_debt_hwm_bytes;
         self.egress_debt_forgiven_bytes = egress_debt_forgiven_bytes;
+        self.egress_retransmits_deferred = egress_retransmits_deferred;
+        self.egress_probes_skipped = egress_probes_skipped;
         self.conn_identity_set_dialed = conn_identity_set_dialed;
         self.conn_identity_expected_inbound_bound = conn_identity_expected_inbound_bound;
         self.conn_identity_expected_inbound_unbound = conn_identity_expected_inbound_unbound;
@@ -4011,6 +4035,8 @@ struct SnapshotExtras {
     pub egress_streams_refused_other: u64,
     pub egress_debt_hwm_bytes: u64,
     pub egress_debt_forgiven_bytes: u64,
+    pub egress_retransmits_deferred: u64,
+    pub egress_probes_skipped: u64,
     /// Connection identity decisions during the period, by
     /// [`ConnIdentity`] (the field suffix is its label). Counts only, no
     /// addresses or keys.
@@ -4145,6 +4171,8 @@ impl SnapshotExtras {
             || self.egress_streams_refused_connection != 0
             || self.egress_streams_refused_other != 0
             || self.egress_debt_forgiven_bytes != 0
+            || self.egress_retransmits_deferred != 0
+            || self.egress_probes_skipped != 0
             || self.conn_identity_set_dialed != 0
             || self.conn_identity_expected_inbound_bound != 0
             || self.conn_identity_expected_inbound_unbound != 0
@@ -6477,6 +6505,8 @@ mod tests {
             "egress_streams_refused_other",
             "egress_debt_hwm_bytes",
             "egress_debt_forgiven_bytes",
+            "egress_retransmits_deferred",
+            "egress_probes_skipped",
             "conn_identity_set_dialed",
             "conn_identity_expected_inbound_bound",
             "conn_identity_expected_inbound_unbound",

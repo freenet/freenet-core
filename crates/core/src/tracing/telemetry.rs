@@ -3345,6 +3345,14 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 "egress_debt_forgiven_bytes".into(),
                 serde_json::json!(snapshot.egress_debt_forgiven_bytes),
             );
+            m.insert(
+                "egress_retransmits_deferred".into(),
+                serde_json::json!(snapshot.egress_retransmits_deferred),
+            );
+            m.insert(
+                "egress_probes_skipped".into(),
+                serde_json::json!(snapshot.egress_probes_skipped),
+            );
             for (key, count) in snapshot.nonzero_conn_identity() {
                 m.insert(key, serde_json::json!(count));
             }
@@ -7776,6 +7784,8 @@ mod tests {
             egress_streams_refused_other: 119,
             egress_debt_hwm_bytes: 30,
             egress_debt_forgiven_bytes: 31,
+            egress_retransmits_deferred: 32,
+            egress_probes_skipped: 33,
             ..Default::default()
         };
         let reference = serde_json::to_value(&snapshot).unwrap();
@@ -7825,6 +7835,8 @@ mod tests {
             ("egress_streams_refused_other", 119),
             ("egress_debt_hwm_bytes", 30),
             ("egress_debt_forgiven_bytes", 31),
+            ("egress_retransmits_deferred", 32),
+            ("egress_probes_skipped", 33),
         ] {
             assert_eq!(json[key], expected, "event-log value for {key}");
             assert_eq!(json[key], reference[key], "serde value for {key}");
