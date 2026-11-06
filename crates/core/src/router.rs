@@ -279,6 +279,13 @@ pub(crate) struct NetworkEfficiencyV1 {
     /// five outcome rows come first, then full state's five rows.
     pub recv_tn: [[u64; STATE_SIZE_BUCKET_COUNT]; 10],
     pub recv_tb: [[u64; STATE_SIZE_BUCKET_COUNT]; 10],
+    /// Received payloads skipped because this node had already merged them
+    /// into its current state (`crate::ring::applied_payloads`): delta count,
+    /// full-state count, delta bytes, full-state bytes. Not included in
+    /// `recv_tn`/`recv_tb`. Added without bumping `v`: an older node simply
+    /// does not send the field.
+    #[serde(default)]
+    pub recv_ap: [u64; 4],
     /// Persisted state counts and bytes by fixed size bucket.
     pub state_n: [u64; STATE_SIZE_BUCKET_COUNT],
     pub state_b: [u64; STATE_SIZE_BUCKET_COUNT],

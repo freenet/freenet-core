@@ -173,6 +173,7 @@ pub(crate) use hosting::{GENUINE_ACCESS_RECENCY_BUCKETS, READ_COUNT_HIST_BUCKETS
 /// can bound itself by real disk headroom, not just RAM, without duplicating
 /// the `statvfs` FFI call or the walk.
 pub(crate) use hosting::{disk_available_bytes, disk_directory_size_bytes};
+pub(crate) mod applied_payloads;
 pub mod interest;
 mod live_tx;
 mod location;
@@ -387,6 +388,11 @@ pub(crate) struct Ring {
     /// inbound broadcast instead of O(WASM merge). Cleared the instant a merge
     /// succeeds. See `crate::ring::merge_backoff`.
     pub(crate) merge_backoff: Arc<merge_backoff::MergeBackoff>,
+    /// Per-contract hashes of payloads already merged into this node's
+    /// current state. The UPDATE receive paths skip a payload found here;
+    /// the executor records a payload only after its merge commits. See
+    /// `crate::ring::applied_payloads`.
+    pub(crate) applied_payloads: Arc<applied_payloads::AppliedPayloads>,
     /// SENDER-side memo of contracts whose deltas are known-doomed (the HQk7
     /// resync loop). Armed by repeated resync-after-our-delta signals or local
     /// `Invalid`-class delta-apply failures; while armed, the broadcast path
@@ -864,6 +870,7 @@ impl Ring {
                 max_connections,
             )),
             merge_backoff: Arc::new(merge_backoff::MergeBackoff::new(time_source.clone())),
+            applied_payloads: Arc::new(applied_payloads::AppliedPayloads::new()),
             delta_incompat: Arc::new(delta_incompat::DeltaIncompat::new(time_source.clone())),
             resync_emit_limiter: Arc::new(resync_rate_limit::new_emit_limiter(time_source.clone())),
             resync_response_limiter: Arc::new(resync_rate_limit::new_response_limiter(
@@ -1609,6 +1616,14 @@ impl Ring {
             // haven't failed a merge recently; a poison contract still in
             // cooldown is preserved.
             ring.merge_backoff.cleanup_expired();
+
+            // Drop applied-payload records for contracts this node no longer
+            // hosts or serves. Eviction already resets them at the decision;
+            // this is the level-triggered backstop that keeps the map bounded
+            // by the hosted set whatever path ended hosting. Dropping a record
+            // only loses skips, so a race with a concurrent re-host is safe.
+            ring.applied_payloads
+                .retain_contracts(|key| ring.is_hosting_contract(key) || ring.contract_in_use(key));
 
             // Sweep stale delta-send attributions and idle unarmed entries in
             // the delta-incompatibility memo (HQk7 resync loop); an armed
@@ -2708,6 +2723,7 @@ impl Ring {
                     recv_n: receiver.counts,
                     recv_tn: receiver.terminal_counts,
                     recv_tb: receiver.terminal_bytes,
+                    recv_ap: receiver.already_applied,
                     state_n: disk.state_size_bucket_counts,
                     state_b: disk.state_size_bucket_bytes,
                     state: [

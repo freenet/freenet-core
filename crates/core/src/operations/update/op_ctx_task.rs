@@ -1959,6 +1959,33 @@ async fn drive_relay_broadcast_to(
         return Ok(());
     }
 
+    // ── Step 3a: already-applied check (BEFORE merge) ─────────────────────
+    //
+    // Skip a payload this node has already merged into its current state.
+    // For a contract whose merge is idempotent the merge would be a no-op;
+    // for one whose merge does not converge, re-merging a payload from a
+    // fixed replayed set is what keeps the replay going. Runs after the 60s
+    // dedup cache above, which also suppresses copies that arrive while the
+    // first is still being merged (this record learns of a payload only after
+    // its merge commits), so the skip count here is the suppression the dedup
+    // cache did not already provide. The executor records the payload; see
+    // `crate::ring::applied_payloads`.
+    if op_manager.ring.applied_payloads.contains(
+        &key,
+        op_manager
+            .ring
+            .applied_payloads
+            .payload_hash(is_delta, &payload_bytes),
+    ) {
+        receiver_terminal.mark_already_applied();
+        tracing::debug!(
+            tx = %incoming_tx,
+            %key,
+            "UPDATE relay: BroadcastTo skipped, payload already merged into local state"
+        );
+        return Ok(());
+    }
+
     // ── Step 3b: merge-failure backoff gate (#4861) ───────────────────────
     //
     // Quarantine "poison" contracts whose merges reliably fail/time out. While a
@@ -2900,6 +2927,24 @@ async fn apply_streaming_broadcast(
             tx = %incoming_tx,
             %key,
             "UPDATE relay (driver streaming): BroadcastToStreaming skipped — duplicate payload (dedup hit)"
+        );
+        return Ok(());
+    }
+
+    // Step 5a: already-applied check BEFORE merge. Same rule and ordering as
+    // the non-streaming driver's step 3a; streaming is always full state.
+    if op_manager.ring.applied_payloads.contains(
+        &key,
+        op_manager
+            .ring
+            .applied_payloads
+            .payload_hash(false, &state_bytes),
+    ) {
+        receiver_terminal.mark_already_applied();
+        tracing::debug!(
+            tx = %incoming_tx,
+            %key,
+            "UPDATE relay (driver streaming): BroadcastToStreaming skipped, payload already merged into local state"
         );
         return Ok(());
     }

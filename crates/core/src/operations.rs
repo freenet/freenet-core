@@ -757,6 +757,13 @@ pub(crate) fn reclaim_evicted_contract(
     // hosting, that collapse-then-evict flows through this very funnel too.)
     retract_advertisement_for_evicted_contract(op_manager, &key);
 
+    // The node stopped hosting `key`: forget which payloads it had absorbed.
+    // If the contract is hosted again it may be from a different state, and
+    // the node must then accept payloads it saw before. Clearing only loses
+    // skips, so doing it here, before the bytes are (or are not) deleted, is
+    // safe. See `crate::ring::applied_payloads`.
+    op_manager.ring.applied_payloads.reset(&key);
+
     // Disk reclamation after hosting-cache eviction is best-effort GC —
     // background-tier so it yields the contract loop to client/relay work (#4534).
     op_manager.notify_contract_handler_fire_and_forget_prioritized(

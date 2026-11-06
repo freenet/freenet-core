@@ -4544,6 +4544,7 @@ mod tests {
             recv_n: [[value; 9]; 4],
             recv_tn: [[value; 9]; 10],
             recv_tb: [[value; 9]; 10],
+            recv_ap: [value; 4],
             state_n: [value; 9],
             state_b: [value; 9],
             state: [value; 9],
@@ -4576,7 +4577,7 @@ mod tests {
         let object = block
             .as_object()
             .expect("network_efficiency_v1 must remain a JSON object");
-        assert_eq!(object.len(), 39, "schema must remain fixed-cardinality");
+        assert_eq!(object.len(), 40, "schema must remain fixed-cardinality");
         let encoded = serde_json::to_vec(block).expect("serialize diagnostic block");
         assert!(
             encoded.len() <= MAX_BUSY_JSON_BYTES,

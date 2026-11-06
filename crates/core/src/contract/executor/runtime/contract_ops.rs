@@ -665,6 +665,9 @@ impl Executor<Runtime> {
                 // only in this PR. No-op until the tracker is seeded.
                 if let Some(op_manager) = &self.op_manager {
                     op_manager.ring.record_state_removed(key);
+                    // The state is gone: no recorded payload describes what a
+                    // later install will hold (`crate::ring::applied_payloads`).
+                    op_manager.ring.applied_payloads.reset(key);
                 }
                 Ok(())
             }

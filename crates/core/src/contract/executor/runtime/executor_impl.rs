@@ -512,6 +512,30 @@ where
 
         let is_new_contract = self.state_store.get(&key).await.is_err();
 
+        // Applied-payload record (`crate::ring::applied_payloads`). The hash is
+        // taken here, before `update` is consumed, and recorded ONLY at the
+        // commit points below: a merge that committed (changed or not) is
+        // absorbed; a refused, failed, deferred, init-queued or
+        // broken-suppressed merge is not, so it can be retried. A non-merge
+        // replacement (initial install, corrupted-state recovery) resets the
+        // record instead. Local-mode paths without an `op_manager` skip all of
+        // it.
+        let applied_payloads = self
+            .op_manager
+            .as_ref()
+            .map(|m| m.ring.applied_payloads.clone());
+        let applied_hash = applied_payloads.as_ref().map(|set| match &update {
+            Either::Left(state) => set.payload_hash(false, state.as_ref()),
+            Either::Right(delta) => set.payload_hash(true, delta.as_ref()),
+        });
+        let record_absorbed = |applied_payloads: &Option<
+            std::sync::Arc<crate::ring::applied_payloads::AppliedPayloads>,
+        >| {
+            if let (Some(set), Some(hash)) = (applied_payloads, applied_hash) {
+                set.record_absorbed(&key, hash);
+            }
+        };
+
         // Save the incoming full state (if any) for potential corrupted-state recovery.
         // When the stored state is corrupted, WASM merge fails. If we have a validated
         // incoming full state, we can replace the corrupted state with it.
@@ -693,6 +717,13 @@ where
                             // for the EvictContract re-host race this closes.
                             if let Some(op_manager) = &self.op_manager {
                                 op_manager.ring.commit_state_write(&key, written_bytes);
+                            }
+                            // Initial install: the stored state was replaced
+                            // without a merge, so nothing recorded before
+                            // (for example ahead of an eviction whose reset
+                            // was missed) describes this state.
+                            if let Some(set) = &applied_payloads {
+                                set.reset(&key);
                             }
 
                             let completion_now = now_nanos();
@@ -974,6 +1005,8 @@ where
                     event = "merge_skipped_identical",
                     "Incoming state is byte-identical to stored state — skipping WASM update_state"
                 );
+                // The incoming state IS the stored state: absorbed.
+                record_absorbed(&applied_payloads);
                 return Ok(UpsertResult::NoChange);
             }
         }
@@ -1304,6 +1337,10 @@ where
                 !recovery_performed,
                 "a corrupted-state recovery produced the stored state"
             );
+            // The merge ran and left the state unchanged: absorbed.
+            if !recovery_performed {
+                record_absorbed(&applied_payloads);
+            }
             return Ok(UpsertResult::NoChange);
         }
 
@@ -1361,12 +1398,24 @@ where
             return Ok(UpsertResult::NoChange);
         }
 
-        // Outcome discarded deliberately: a broken-contract suppression
-        // here is already reported to the caller as the `NoChange` above,
-        // and this path has no trailing fan-out to gate on it.
-        let _ = self
+        // A broken-contract suppression here is reported to the caller as
+        // `Updated` exactly as before (this path has no trailing fan-out to gate
+        // on it); the outcome is read only to decide the applied-payload
+        // record, which must not claim a payload that was never stored.
+        let commit_outcome = self
             .commit_state_update(&key, &params, &updated_state)
             .await?;
+        match commit_outcome {
+            StateCommitOutcome::Committed if recovery_performed => {
+                // The stored state was replaced by the incoming state, not
+                // merged with it.
+                if let Some(set) = &applied_payloads {
+                    set.reset(&key);
+                }
+            }
+            StateCommitOutcome::Committed => record_absorbed(&applied_payloads),
+            StateCommitOutcome::SuppressedBrokenContract => {}
+        }
         Ok(UpsertResult::Updated(updated_state))
     }
 
