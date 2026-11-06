@@ -2367,24 +2367,23 @@ mod queue {
                 "a newer state for a claimed pair must wait for the send ahead of it"
             );
 
+            // All three happen at the same instant; their order is the run
+            // queue's, so compare them as a set.
             tokio::time::sleep_until(start + slow_wait).await;
             let at_wait_end = sorted(vec![
-                next(&mut rx).await.expect("the first slow send ends"),
-                next(&mut rx).await.expect("the second slow send ends"),
+                next(&mut rx).await.expect("a slow send ends"),
+                next(&mut rx).await.expect("the other slow send ends"),
+                next(&mut rx).await.expect("the newer state goes"),
             ]);
             assert_eq!(
                 at_wait_end,
-                sorted(vec![("timed out", first), ("timed out", second)]),
-                "both slow sends end at the scaled wait, not at the hold"
-            );
-            assert_eq!(
-                next(&mut rx).await,
-                Some(("sending", first)),
-                "the newer state goes once the claim is released"
-            );
-            assert!(
-                start.elapsed() >= slow_wait,
-                "and not before the first send's wait ended"
+                sorted(vec![
+                    ("timed out", first),
+                    ("timed out", second),
+                    ("sending", first),
+                ]),
+                "both slow sends end at the scaled wait, not at the hold, and \
+                 the newer state goes once the first one's claim is released"
             );
 
             for worker in workers {
@@ -4408,7 +4407,7 @@ pub(super) async fn broadcast_to_single_peer(
     };
 
     // Get our summary for delta computation
-    let our_summary = op_manager
+    let mut our_summary = op_manager
         .interest_manager
         .get_contract_summary(op_manager, &key)
         .await;
@@ -4691,30 +4690,39 @@ pub(super) async fn broadcast_to_single_peer(
         // usually a handler timeout. Asking the same handler again would only
         // hold this leg's permit for a second timeout; there is no summary to
         // record either way.
-        DeltaOrFullState::FullState(_) if our_summary.is_none() => (
-            DeltaOrFullState::FullState(new_state.as_ref().to_vec()),
-            None,
-            new_state.size(),
-        ),
-        DeltaOrFullState::FullState(_) => match get_contract_snapshot(op_manager, &key).await {
-            Some((state, summary)) => (
-                DeltaOrFullState::FullState(state.as_ref().to_vec()),
-                Some(summary),
-                state.size(),
-            ),
-            // Without a snapshot we cannot say which state a summary describes,
-            // so send the queued state and record no summary for the peer. If
-            // the handler is too loaded to answer, the peer stays on full state
-            // until it is not; the previous fallback, recording a summary we
-            // could not vouch for, is the loss this replaces.
-            None => (
-                DeltaOrFullState::FullState(new_state.as_ref().to_vec()),
-                None,
-                new_state.size(),
-            ),
-        },
-        delta @ DeltaOrFullState::Delta(_) => (delta, our_summary, new_state.size()),
+        //
+        // Every full-state arm binds the queued copy (`queued`) and either
+        // sends it or drops it. A `FullState(_)` pattern would leave that copy
+        // alive until this function returns, which is after the completion
+        // wait below: a full private copy of the state per waiting send.
+        DeltaOrFullState::FullState(queued) if our_summary.is_none() => {
+            (DeltaOrFullState::FullState(queued), None, new_state.size())
+        }
+        DeltaOrFullState::FullState(queued) => {
+            match get_contract_snapshot(op_manager, &key).await {
+                Some((state, summary)) => {
+                    drop(queued);
+                    (
+                        DeltaOrFullState::FullState(state.as_ref().to_vec()),
+                        Some(summary),
+                        state.size(),
+                    )
+                }
+                // Without a snapshot we cannot say which state a summary describes,
+                // so send the queued state and record no summary for the peer. If
+                // the handler is too loaded to answer, the peer stays on full state
+                // until it is not; the previous fallback, recording a summary we
+                // could not vouch for, is the loss this replaces.
+                None => (DeltaOrFullState::FullState(queued), None, new_state.size()),
+            }
+        }
+        delta @ DeltaOrFullState::Delta(_) => (delta, our_summary.take(), new_state.size()),
     };
+    // Neither summary is needed past this point (`sent_summary` is what the
+    // bookkeeping records), and the peer's has no size bound. Free both before
+    // the completion wait below.
+    drop(our_summary);
+    drop(their_summary);
     let payload_size = payload.size();
     match (
         queued_class,
@@ -4804,7 +4812,9 @@ pub(super) async fn broadcast_to_single_peer(
         // of the state and of its summary now: the completion wait below can
         // last up to `stream_completion_timeout` (over 24 minutes for the
         // largest state), and every send still waiting would otherwise hold a
-        // private copy for that long. `sent_summary` stays, for the bookkeeping.
+        // private copy for that long. What stays alive across the wait is the
+        // bincoded `payload_bytes` the stream sends from (moved into the
+        // stream) and `sent_summary`, which the bookkeeping records.
         drop(streaming_payload);
         drop(new_state);
         let sid = StreamId::next();
@@ -5197,7 +5207,7 @@ mod stream_completion_timeout_tests {
         assert_eq!(pool.available_permits(), 1);
     }
 
-    /// No completion at all: the wait ends at the scaled timeout and counts it.
+    /// No completion at all: the wait ends at exactly the scaled timeout.
     #[tokio::test(start_paused = true)]
     async fn a_stream_that_never_reports_times_out_at_the_scaled_wait() {
         let pool = Arc::new(Semaphore::new(1));
@@ -5288,7 +5298,30 @@ mod stream_completion_timeout_tests {
             "the wait hands the lane permit to the helper that returns it early"
         );
         let wait_at = compact.find(wait).expect("counted above");
-        for drop_call in ["drop(streaming_payload);", "drop(new_state);"] {
+        // The queued full-state copy built while choosing the payload must be
+        // moved in every arm: a `FullState(_)` pattern binds nothing, so that
+        // copy would live until the function returns, after the wait.
+        for arm in [
+            "DeltaOrFullState::FullState(_)=>",
+            "DeltaOrFullState::FullState(_)if",
+        ] {
+            assert!(
+                !compact.contains(arm),
+                "a FullState(_) match arm leaves the queued copy alive across the wait"
+            );
+        }
+        assert!(
+            compact.contains("DeltaOrFullState::FullState(queued)ifour_summary.is_none()=>")
+                && compact
+                    .contains("DeltaOrFullState::FullState(queued)=>{matchget_contract_snapshot("),
+            "both full-state arms bind the queued copy"
+        );
+        for drop_call in [
+            "drop(streaming_payload);",
+            "drop(new_state);",
+            "drop(our_summary);",
+            "drop(their_summary);",
+        ] {
             let at = compact
                 .find(drop_call)
                 .unwrap_or_else(|| panic!("{drop_call} is missing"));
