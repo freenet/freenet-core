@@ -418,24 +418,11 @@ struct Admitted {
     /// so a later admission never has an earlier time.
     at: i64,
     /// Its number, kept by its waiter: the waiter withdraws it if it polls
-    /// again before a take used it, or is dropped.
+    /// again before a take used it, or is dropped. Only a take that names
+    /// this number uses it: a paced UDP stream's own
+    /// ([`EgressCap::try_take_admitted`]), or the QUIC socket's, handed the
+    /// number by the poller that was admitted ([`EgressCap::try_take_handed`]).
     id: u64,
-    /// The waiter takes by name ([`EgressCap::try_take_admitted`], a paced
-    /// UDP stream). An unnamed one's take cannot name it
-    /// ([`EgressCap::try_take`] from the QUIC socket, which does not know which
-    /// connection's poller was admitted), so it uses the oldest unnamed one.
-    named: bool,
-}
-
-/// Who is taking, so the take knows which admission it uses.
-#[derive(Clone, Copy)]
-enum Taker {
-    /// A take that cannot name its admission (the QUIC socket): it uses the
-    /// oldest admission that has no name, if any.
-    Anonymous,
-    /// A waiter that takes by name, with the number of its admission if it
-    /// has one. A number no longer in the list (it lapsed) is no admission.
-    Named(Option<u64>),
 }
 
 impl QueuedWaiters {
@@ -455,14 +442,11 @@ impl QueuedWaiters {
         }
     }
 
-    /// Where in [`Self::admitted`] the admission a take by `taker` uses is,
-    /// if it has one.
-    fn admission_of(&self, taker: Taker) -> Option<usize> {
-        match taker {
-            Taker::Anonymous => self.admitted.iter().position(|a| !a.named),
-            Taker::Named(None) => None,
-            Taker::Named(Some(id)) => self.admitted.iter().position(|a| a.id == id),
-        }
+    /// Where in [`Self::admitted`] the admission numbered `id` is, if it has
+    /// not lapsed or been used.
+    fn admission_of(&self, id: Option<u64>) -> Option<usize> {
+        let id = id?;
+        self.admitted.iter().position(|a| a.id == id)
     }
 
     /// How many waiters are queued ahead of `ticket`, counted exactly up to
@@ -546,10 +530,10 @@ impl AdmissionQueue {
     /// times of those recorded before it (a time read before the lock could
     /// be, and the admission would then lapse early).
     ///
-    /// `named` is the waiter's admission number when it takes by name
-    /// ([`AdmissionWaiter::named`]). A waiter that polls again did not use
-    /// the admission it holds, so that one is withdrawn first; when admitted
-    /// it gets a new number.
+    /// `admission` is the number of the waiter's admission, if it holds one.
+    /// A waiter that polls again did not use it, so it is withdrawn first;
+    /// when admitted the waiter gets a new number. `held_place` is given for
+    /// a waiter that keeps its place until it sends ([`AdmissionWaiter::named`]).
     ///
     /// On admission it removes the waiter's place and wakes the oldest
     /// waiter still holding a waker: the next in line. Its timer was set
@@ -570,11 +554,10 @@ impl AdmissionQueue {
             let mut queue = self.inner.lock();
             let now = clock();
             queue.lapse(now);
-            // A waiter that polls again did not use the admission it holds
-            // (or, unnamed, its take may have used another's; see `named`).
+            // A waiter that polls again did not use the admission it holds.
             let withdrew = admission
                 .take()
-                .and_then(|held| queue.admission_of(Taker::Named(Some(held))))
+                .and_then(|held| queue.admission_of(Some(held)))
                 .map(|i| queue.admitted.remove(i))
                 .is_some();
             // Admitted before and not sent since (its take failed, or its
@@ -616,11 +599,7 @@ impl AdmissionQueue {
                 let id = queue.next_ticket;
                 queue.next_ticket += 1;
                 *admission = Some(id);
-                queue.admitted.push_back(Admitted {
-                    at: now,
-                    id,
-                    named: held_place.is_some(),
-                });
+                queue.admitted.push_back(Admitted { at: now, id });
                 let given_up = ticket.take();
                 // A named waiter keeps a place until it sends: the one it gave
                 // up, or, admitted on its first poll, the admission's own number,
@@ -649,7 +628,7 @@ impl AdmissionQueue {
     fn withdraw(&self, id: u64) {
         let next = {
             let mut queue = self.inner.lock();
-            let Some(i) = queue.admission_of(Taker::Named(Some(id))) else {
+            let Some(i) = queue.admission_of(Some(id)) else {
                 return;
             };
             queue.admitted.remove(i);
@@ -723,10 +702,10 @@ impl AdmissionQueue {
 #[derive(Default)]
 pub(crate) struct AdmissionWaiter {
     ticket: Option<u64>,
-    /// Takes by name ([`Self::named`]).
+    /// Keeps its place until its take ([`Self::named`]).
     named: bool,
     /// The number of this waiter's admission while its take has not
-    /// happened yet, for a waiter that takes by name.
+    /// happened yet. Only a take naming it uses it.
     admission: Option<u64>,
     /// The place (ticket) a named waiter gave up when it was admitted, until
     /// a take of its succeeds. If it polls again first (its take failed, or
@@ -755,15 +734,23 @@ impl Drop for AdmissionWaiter {
 }
 
 impl AdmissionWaiter {
-    /// A waiter that takes by name, with [`EgressCap::try_take_admitted`].
-    /// Its admission then belongs to it: a take by any other sender leaves
-    /// that datagram in the bucket, and its own take uses it. For a sender
-    /// that can await between its admission and its take (a paced UDP
-    /// stream re-checks its congestion window).
+    /// A waiter that takes with [`EgressCap::try_take_admitted`], which
+    /// clears its held place, and so keeps its place until it sends. For a
+    /// sender that can await between its admission and its take (a paced UDP
+    /// stream re-checks its congestion window). Every waiter's admission is
+    /// its own: a take that does not name it leaves its datagram in the
+    /// bucket.
     pub(crate) fn named() -> Self {
         let mut waiter = Self::default();
         waiter.named = true;
         waiter
+    }
+
+    /// The number of this waiter's admission, if it was admitted and has
+    /// not polled again since. Handed to the take that uses it
+    /// ([`EgressCap::try_take_handed`]).
+    pub(crate) fn admission(&self) -> Option<u64> {
+        self.admission
     }
 
     /// When the armed timer fires (ns on the cap's clock), if one is armed.
@@ -964,16 +951,31 @@ impl EgressCap {
     /// eventually.
     ///
     /// The bucket must also keep one [`WAKE_DATAGRAM_BYTES`] for every
-    /// admission whose take has not happened yet, except the one this take
-    /// uses: the oldest admission with no name (the QUIC socket's, whose
-    /// poller was admitted just before this call). See
-    /// [`Self::try_take_admitted`] for a sender that names its admission.
+    /// admission whose take has not happened yet: this take uses none of
+    /// them. See [`Self::try_take_handed`] and [`Self::try_take_admitted`]
+    /// for a sender that was admitted.
     pub(crate) fn try_take(
         &self,
         bytes: usize,
         waited: Duration,
     ) -> Result<EgressTake<'_>, Duration> {
-        self.take_in_turn(bytes, waited, Taker::Anonymous)
+        self.try_take_handed(bytes, waited, None)
+    }
+
+    /// [`Self::try_take`] using the admission numbered `admission`
+    /// ([`AdmissionWaiter::admission`]), if it is still outstanding: the
+    /// bucket keeps a datagram for every other admission, not for that one,
+    /// which the take removes. The QUIC socket's take, handed the number by
+    /// the poller admitted just before it on the same thread
+    /// (`quic::socket`'s handoff). `None`, or a number that lapsed, is a take
+    /// with no admission.
+    pub(crate) fn try_take_handed(
+        &self,
+        bytes: usize,
+        waited: Duration,
+        admission: Option<u64>,
+    ) -> Result<EgressTake<'_>, Duration> {
+        self.take_in_turn(bytes, waited, admission)
             .map(|(take, _)| take)
     }
 
@@ -988,7 +990,7 @@ impl EgressCap {
         waited: Duration,
         waiter: &mut AdmissionWaiter,
     ) -> Result<EgressTake<'_>, Duration> {
-        let (take, used) = self.take_in_turn(bytes, waited, Taker::Named(waiter.admission))?;
+        let (take, used) = self.take_in_turn(bytes, waited, waiter.admission)?;
         if used {
             waiter.admission = None;
         }
@@ -996,10 +998,11 @@ impl EgressCap {
         Ok(take)
     }
 
-    /// A take by `taker`. Under the queue lock, so an admission cannot be
+    /// A take using the admission numbered `admission`, if outstanding.
+    /// Under the queue lock, so an admission cannot be
     /// made between the count of what is owed and the take (it would count
     /// the datagram this take is about to use). `Ok` says whether the take
-    /// used `taker`'s admission.
+    /// used that admission.
     ///
     /// The lock is taken on every paced take, also with nobody waiting, where
     /// the take was a lock-free compare-and-swap before. Measured in a release
@@ -1013,12 +1016,12 @@ impl EgressCap {
         &self,
         bytes: usize,
         waited: Duration,
-        taker: Taker,
+        admission: Option<u64>,
     ) -> Result<(EgressTake<'_>, bool), Duration> {
         let cost = self.cost_ns(bytes as u64);
         let mut queue = self.admission.inner.lock();
         queue.lapse(self.now());
-        let own = queue.admission_of(taker);
+        let own = queue.admission_of(admission);
         let others = queue.admitted.len() - usize::from(own.is_some());
         let need = cost.saturating_add(
             i64::try_from(others)
@@ -1361,6 +1364,18 @@ impl EgressCap {
         }
         last.compare_exchange(previous, now, Ordering::Relaxed, Ordering::Relaxed)
             .is_ok()
+    }
+
+    /// How many admissions are waiting for their take.
+    #[cfg(test)]
+    pub(crate) fn admissions_outstanding(&self) -> usize {
+        self.admission.outstanding()
+    }
+
+    /// Whether the admission numbered `id` is still waiting for its take.
+    #[cfg(test)]
+    pub(crate) fn admission_outstanding(&self, id: u64) -> bool {
+        self.admission.inner.lock().admission_of(Some(id)).is_some()
     }
 
     /// The bucket level in bytes now; negative while in debt.

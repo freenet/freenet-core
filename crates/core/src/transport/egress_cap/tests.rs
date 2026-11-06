@@ -953,7 +953,7 @@ fn poll_admit_is_pending_until_the_deficit_and_ready_at_it() {
         "a Ready poll leaves no timer armed"
     );
     assert_eq!(cap.level_bytes(), PACKET as i64, "polling took nothing");
-    cap.try_take(PACKET, Duration::ZERO)
+    cap.try_take_handed(PACKET, Duration::ZERO, waiter.admission())
         .expect("try_take agrees with the Ready poll")
         .sent(PACKET);
 }
@@ -985,7 +985,9 @@ fn poll_admit_and_try_take_agree_at_the_same_instant() {
                 let mut waiter = AdmissionWaiter::default();
                 let polled = cap.poll_admit(bytes, &mut waiter, &mut cx);
                 let wake_at = waiter.wake_at_ns();
-                match cap.try_take(bytes, Duration::ZERO) {
+                // The take the QUIC socket makes after this poll: handed the
+                // poller's admission, if it got one.
+                match cap.try_take_handed(bytes, Duration::ZERO, waiter.admission()) {
                     Ok(take) => {
                         assert!(polled.is_ready(), "seed {seed}: try_take admitted {bytes}");
                         admitted += 1;
@@ -1160,8 +1162,8 @@ fn admission_wakers_are_bounded_without_waking() {
     assert_eq!(cap.admission_waker_count(), MAX_ADMISSION_WAKERS);
 }
 
-/// `poll_admit` of a full datagram being `Ready` means a `try_take` of any
-/// size up to it succeeds at the same instant, which is what the QUIC socket
+/// `poll_admit` of a full datagram being `Ready` means a take of any size up
+/// to it, using that admission, succeeds at the same instant, which is what the QUIC socket
 /// relies on: its poller asks for `WAKE_DATAGRAM_BYTES`, then takes the
 /// datagram's real size.
 #[test]
@@ -1185,8 +1187,9 @@ fn a_ready_poll_for_a_datagram_admits_any_smaller_take() {
                 {
                     ready += 1;
                     let n = GlobalRng::random_range(1..=WAKE_DATAGRAM_BYTES);
+                    // The take the socket makes: handed the poller's admission.
                     let take = cap
-                        .try_take(n, Duration::ZERO)
+                        .try_take_handed(n, Duration::ZERO, waiter.admission())
                         .unwrap_or_else(|_| panic!("seed {seed}: Ready for 1200, refused {n}"));
                     drop(take);
                 }
@@ -1242,7 +1245,7 @@ fn waiting_connections_wake_one_per_datagram_of_refill() {
         let (waiter, waker, _) = &mut waiters[k];
         let mut cx = Context::from_waker(waker);
         assert!(cap.poll_admit(PACKET, waiter, &mut cx).is_ready());
-        cap.try_take(PACKET, Duration::ZERO)
+        cap.try_take_handed(PACKET, Duration::ZERO, waiter.admission())
             .expect("the woken waiter is admitted")
             .sent(PACKET);
         if let Some((_, _, next)) = waiters.get(k + 1) {
@@ -1667,7 +1670,7 @@ fn a_take_without_an_admission_leaves_the_admitted_datagram() {
     assert!(cap.poll_admit(PACKET, &mut waiter, &mut cx).is_ready());
     assert!(
         cap.try_take(PACKET, Duration::ZERO).is_err(),
-        "an anonymous take with no unnamed admission must leave the datagram"
+        "a take naming no admission must leave the datagram"
     );
     let mut stranger = AdmissionWaiter::named();
     assert!(
@@ -1681,10 +1684,12 @@ fn a_take_without_an_admission_leaves_the_admitted_datagram() {
     assert_eq!(cap.admission.outstanding(), 0);
 }
 
-/// An unnamed admission (the QUIC poller's) is used by the anonymous take
-/// that follows it, and a named one is used only by its own waiter.
+/// A take uses only the admission it names. One that names none (quinn's
+/// endpoint response, sent with no poll) leaves every admission's datagram in
+/// the bucket, the QUIC poller's included; the poller's handed take uses its
+/// own; and the stream's admission is used only by the stream.
 #[test]
-fn an_anonymous_take_uses_the_unnamed_admission_only() {
+fn a_take_uses_only_the_admission_it_names() {
     let (cap, _time) = cap_at(RATE);
     cap.charge_unpaced(BURST as usize - 2 * PACKET - 100);
     let (waker, _counter) = counting_waker();
@@ -1694,12 +1699,19 @@ fn an_anonymous_take_uses_the_unnamed_admission_only() {
     assert!(cap.poll_admit(PACKET, &mut stream, &mut cx).is_ready());
     assert!(cap.poll_admit(PACKET, &mut quic, &mut cx).is_ready());
     assert_eq!(cap.admission.outstanding(), 2);
-    cap.try_take(PACKET, Duration::ZERO)
-        .expect("the QUIC take uses the unnamed admission")
-        .sent(PACKET);
     assert!(
         cap.try_take(PACKET, Duration::ZERO).is_err(),
-        "a second anonymous take finds no unnamed admission and must leave the stream's"
+        "a take naming no admission must leave both admissions' datagrams"
+    );
+    assert_eq!(cap.admission.outstanding(), 2);
+    cap.try_take_handed(PACKET, Duration::ZERO, quic.admission())
+        .expect("the QUIC take uses the poller's admission")
+        .sent(PACKET);
+    assert_eq!(cap.admission.outstanding(), 1);
+    assert!(
+        cap.try_take_handed(PACKET, Duration::ZERO, quic.admission())
+            .is_err(),
+        "the poller's admission is used, so a second take with it is a take with none"
     );
     cap.try_take_admitted(PACKET, Duration::ZERO, &mut stream)
         .expect("the stream takes its own")
@@ -1941,4 +1953,53 @@ fn a_sender_that_sent_queues_behind_later_waiters() {
         "the sender that already sent waits its turn"
     );
     assert!(cap.poll_admit(PACKET, &mut later, &mut cx).is_ready());
+}
+
+/// A waiter that polls again holding an admission it did not use, and is
+/// refused, withdraws that admission and wakes the next waiter: its timer
+/// counted on that admission's datagram, which is free now.
+#[test]
+fn a_refused_re_poll_that_withdraws_its_admission_wakes_the_next_waiter() {
+    let (cap, _time) = cap_at(RATE);
+    // Room for one datagram, not two.
+    cap.charge_unpaced(BURST as usize - PACKET - 100);
+    let (first_waker, _first) = counting_waker();
+    let (next_waker, next) = counting_waker();
+    let mut admitted = AdmissionWaiter::default();
+    let mut follower = AdmissionWaiter::default();
+    assert!(
+        cap.poll_admit(
+            PACKET,
+            &mut admitted,
+            &mut Context::from_waker(&first_waker)
+        )
+        .is_ready()
+    );
+    assert!(
+        cap.poll_admit(PACKET, &mut follower, &mut Context::from_waker(&next_waker))
+            .is_pending(),
+        "the admitted waiter's datagram is owed"
+    );
+    assert_eq!(woken(&next), 0);
+    // The admitted waiter's send never happened, and the bucket is drained
+    // meanwhile, so its next poll is refused.
+    cap.charge_unpaced(PACKET);
+    assert!(
+        cap.poll_admit(
+            PACKET,
+            &mut admitted,
+            &mut Context::from_waker(&first_waker)
+        )
+        .is_pending()
+    );
+    assert_eq!(
+        cap.admission.outstanding(),
+        0,
+        "the unused admission is withdrawn"
+    );
+    assert_eq!(
+        woken(&next),
+        1,
+        "and the next waiter is woken to look again"
+    );
 }

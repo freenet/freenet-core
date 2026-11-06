@@ -156,12 +156,15 @@ admission or, once that lapsed, takes as a newcomer that leaves the
 datagrams owed to the rest. Without names, a stream descheduled past the
 pass took the datagram of a newer admission and cleared that admission as
 its own (2 to 37 of 3200 takes lost in
-an_admitted_take_is_not_lost_to_another_thread). The QUIC socket's take
-cannot name its poller (quinn calls try_send on the shared socket), so a
-QUIC take uses the oldest unnamed admission. Residual: a QUIC transmit
-delayed past the pass between poll_writable and try_send (no await there,
-so only by preemption) can use another QUIC poller's admission; that
-poller then queues again. The queue holds a waker
+an_admitted_take_is_not_lost_to_another_thread). A QUIC take is named too:
+QuicPoller::poll_ready hands its admission number to QuicSocket::try_send
+through a thread-local (quic/socket.rs HANDED_ADMISSION), relying on quinn
+0.11.12 calling poll_writable then try_send back to back on one thread
+(connection.rs:1048-1057; a quinn bump must re-check it,
+a_poller_hands_its_admission_to_the_transmit_that_follows). quinn's
+endpoint respond (endpoint.rs:584) sends with no poll, finds no handoff and
+leaves every admission alone. No take ever uses an admission it does not
+name. The queue holds a waker
 and a place, never bytes. So connections share the cap by their number of
 waiting senders (no isolation between connections). The wait races the
 stream's deadline (cut at LONG_WAIT and at PACED_WAIT_DEADLINE, check()
