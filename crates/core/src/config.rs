@@ -6074,6 +6074,10 @@ impl GlobalTestMetrics {
 
     /// Records a streamed broadcast whose completion wait timed out, so the
     /// send counted as not delivered.
+    ///
+    /// Thread-local, like the other counters here: it counts waits that ran on
+    /// the reading thread. A simulation reads it from the thread its hosts run
+    /// on; a reader on another thread sees 0.
     pub fn record_stream_completion_timeout() {
         GLOBAL_STREAM_COMPLETION_TIMEOUTS.with(|c| c.set(c.get() + 1));
     }

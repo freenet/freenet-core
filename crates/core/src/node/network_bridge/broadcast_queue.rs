@@ -61,23 +61,60 @@ pub(super) fn no_fanout() -> FanoutTargets {
     Arc::new(Vec::new())
 }
 
-/// How long a streamed broadcast of `payload_bytes` waits for its completion:
-/// as long as the receiver keeps such a stream, from the one function both ends
-/// use (`streaming::max_inbound_stream_age`: the payload at 32 KiB/s, and at
-/// least 5 minutes). So sender and receiver give up on a slow stream at the
-/// same point, and the sender never waits on a stream the receiver has dropped.
-/// A flat 120 s missed large broadcasts on slow or lossy uplinks on any
-/// transport: a 31 MiB broadcast needs about 271 KB/s to finish in 120 s.
+/// How long a streamed broadcast of `stream_bytes` waits for its completion.
+///
+/// `stream_bytes` is the stream's declared length (`total_size`, the serialized
+/// `BroadcastStreamingPayload`: state plus sender summary plus framing), the
+/// same number the receiver sizes its age limit from. The wait is that limit
+/// (`streaming::max_inbound_stream_age`: the stream at 32 KiB/s, and at least
+/// 5 minutes) minus a margin of a tenth of it, and at least
+/// [`STREAM_WAIT_MIN_MARGIN`]. A flat 120 s missed large broadcasts on slow or
+/// lossy uplinks on any transport: a 31 MiB broadcast needs about 271 KB/s to
+/// finish in 120 s.
+///
+/// The margin keeps the sender from recording a delivery the receiver may
+/// already have dropped. On UDP the completion fires when the last fragment is
+/// first handed to the socket, and lost fragments are resent after that; and
+/// the sender's clock starts at dispatch, before any queueing behind other
+/// streams to the peer, while the receiver's starts at the first fragment. A
+/// stream reported delivered right at the limit could cross it on the receiver,
+/// be evicted there, and still be recorded here as delivered, with no repair.
+/// The margin is a judgment, not a measurement: retransmit tails are seconds,
+/// and a tenth of the limit (30 s at the 5 minute floor) leaves room for them
+/// and for queueing behind one other stream.
 ///
 /// A timed-out wait does not stop the stream. It makes the send count as not
 /// delivered: the peer's summary is not cached and its interest is not
 /// refreshed, so the next update or repair sends the whole state again. The
 /// wait ends early on any completion signal, so its length matters only for a
-/// stream still in progress or one whose task never reports (which holds the
-/// queue permit up to this long).
-pub(super) fn stream_completion_timeout(payload_bytes: u64) -> Duration {
-    crate::transport::peer_connection::streaming::max_inbound_stream_age(payload_bytes)
+/// stream still in progress or one whose task never reports. The lane permit is
+/// held for at most [`STREAM_PERMIT_HOLD`] of it (see
+/// [`await_stream_completion_releasing_permit`]).
+///
+/// The interest refresh after a late completion can find the peer's interest
+/// already expired: `INTEREST_TTL` is 20 minutes, below the longest wait. That
+/// costs one full-state resend on the next update, which is what a timed-out
+/// wait would have cost anyway.
+pub(super) fn stream_completion_timeout(stream_bytes: u64) -> Duration {
+    let limit = crate::transport::peer_connection::streaming::max_inbound_stream_age(stream_bytes);
+    limit.saturating_sub((limit / 10).max(STREAM_WAIT_MIN_MARGIN))
 }
+
+/// The smallest margin [`stream_completion_timeout`] leaves below the
+/// receiver's age limit.
+const STREAM_WAIT_MIN_MARGIN: Duration = Duration::from_secs(30);
+
+/// How long a streamed broadcast holds its lane permit while it waits for the
+/// stream to complete. After that the permit goes back to the queue and the
+/// send keeps waiting without it, up to [`stream_completion_timeout`].
+///
+/// 120 s is the flat wait this replaced, so lane concurrency is what it was:
+/// before, a stream still running at 120 s also released its permit (by timing
+/// out) and kept sending. The large lane has 2 permits per node; holding them
+/// for the full scaled wait (up to about 15 minutes) would stall every other
+/// full-state broadcast on the node behind two slow subscribers, and the
+/// mispredicted small sends that upgrade to it.
+pub(super) const STREAM_PERMIT_HOLD: Duration = Duration::from_secs(120);
 
 /// Wait up to `timeout` for a stream's completion signal, counting a timed-out
 /// wait (`GlobalTestMetrics::stream_completion_timeouts`).
@@ -90,6 +127,31 @@ async fn await_stream_completion<T>(
         crate::config::GlobalTestMetrics::record_stream_completion_timeout();
     }
     completion
+}
+
+/// [`await_stream_completion`] holding `lane_permit` for at most
+/// [`STREAM_PERMIT_HOLD`] of the wait, then dropping it and waiting out the
+/// rest without it.
+///
+/// The caller keeps running for the whole wait, so whatever it holds besides
+/// the permit (in the queue, the `ActiveSendGuard` claim on the
+/// `(contract, peer)` pair, #5842) stays held until the delivery bookkeeping is
+/// done. Only the lane's concurrency slot comes back early.
+pub(super) async fn await_stream_completion_releasing_permit<T>(
+    mut completion_rx: tokio::sync::oneshot::Receiver<T>,
+    lane_permit: Option<SendLanePermit>,
+    timeout: Duration,
+) -> Result<Result<T, tokio::sync::oneshot::error::RecvError>, tokio::time::error::Elapsed> {
+    if timeout <= STREAM_PERMIT_HOLD {
+        let completion = await_stream_completion(completion_rx, timeout).await;
+        drop(lane_permit);
+        return completion;
+    }
+    if let Ok(done) = tokio::time::timeout(STREAM_PERMIT_HOLD, &mut completion_rx).await {
+        return Ok(done);
+    }
+    drop(lane_permit);
+    await_stream_completion(completion_rx, timeout - STREAM_PERMIT_HOLD).await
 }
 
 /// Payload size, in bytes, at or above which a send is rate-limited by the
@@ -2123,6 +2185,168 @@ mod queue {
                 large_permits,
                 dispatched: rx,
                 workers,
+            }
+        }
+
+        /// Review of #6127: a streamed broadcast waits up to its size-scaled
+        /// timeout (about 15 minutes for 31 MiB), but holds its lane permit for
+        /// at most `STREAM_PERMIT_HOLD` of that. Two slow full-state streams
+        /// fill the 2-permit large lane; small sends keep going out, and after
+        /// the hold both a third large send and a mispredicted small send that
+        /// upgrades get large capacity, while the two slow sends keep their
+        /// claim on their pairs (#5842) until their wait ends.
+        #[tokio::test(start_paused = true)]
+        #[serial_test::serial(broadcast_queue_depth_gauge)]
+        async fn slow_large_streams_return_their_permits_after_the_hold() {
+            use super::super::{
+                STREAM_PERMIT_HOLD, await_stream_completion_releasing_permit,
+                stream_completion_timeout,
+            };
+            const MIB: u64 = 1024 * 1024;
+
+            let queue = BroadcastQueue::new();
+            let large_permits = Arc::new(Semaphore::new(2));
+            let group = LaneGroup {
+                small_pool: Arc::new(Semaphore::new(12)),
+                large_pool: large_permits.clone(),
+                upgrade_slots: Arc::new(Semaphore::new(super::super::MAX_PARKED_LANE_UPGRADES)),
+                small_notify: queue.small_notify.clone(),
+                large_notify: queue.large_notify.clone(),
+                spacing: test_spacing(),
+            };
+            let (tx, mut rx) =
+                tokio::sync::mpsc::unbounded_channel::<(&'static str, ContractKey)>();
+            let workers: Vec<_> = [QueuedPayloadClass::Small, QueuedPayloadClass::Large]
+                .into_iter()
+                .map(|lane| {
+                    let tx = tx.clone();
+                    tokio::spawn(drain_lane(
+                        lane,
+                        queue.queue.clone(),
+                        group.clone(),
+                        move |entry: BroadcastEntry, scheduling: QueueScheduling| {
+                            let tx = tx.clone();
+                            async move {
+                                let mut permit = scheduling.permit;
+                                if entry.state_size >= BIG {
+                                    // Puts the payload on the wire only once it
+                                    // holds large-lane capacity, as production
+                                    // does for a mispredicted small send.
+                                    permit.ensure_capacity_for(entry.state_size).await;
+                                }
+                                tx.send(("sending", entry.key)).ok();
+                                if entry.state_size < BIG {
+                                    return;
+                                }
+                                // A stream that never reports: the sender of the
+                                // completion stays alive, so only the timeout
+                                // ends the wait.
+                                let (_completion_tx, completion_rx) =
+                                    tokio::sync::oneshot::channel::<()>();
+                                let completion = await_stream_completion_releasing_permit(
+                                    completion_rx,
+                                    Some(permit),
+                                    stream_completion_timeout(31 * MIB),
+                                )
+                                .await;
+                                assert!(completion.is_err());
+                                tx.send(("done", entry.key)).ok();
+                            }
+                        },
+                    ))
+                })
+                .collect();
+            async fn next(
+                rx: &mut tokio::sync::mpsc::UnboundedReceiver<(&'static str, ContractKey)>,
+            ) -> Option<(&'static str, ContractKey)> {
+                tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                    .await
+                    .ok()
+                    .flatten()
+            }
+
+            let (first, second) = (contract(1), contract(2));
+            let (first_target, second_target) =
+                (PeerKeyLocation::random(), PeerKeyLocation::random());
+            for (key, target) in [(first, &first_target), (second, &second_target)] {
+                queue
+                    .enqueue_in_lane(
+                        QueuedPayloadClass::Large,
+                        key,
+                        target.clone(),
+                        state(BIG),
+                        super::super::no_fanout(),
+                    )
+                    .await;
+                assert_eq!(next(&mut rx).await, Some(("sending", key)));
+            }
+            assert_eq!(
+                large_permits.available_permits(),
+                0,
+                "both slow streams hold one"
+            );
+
+            let third = contract(3);
+            queue
+                .enqueue_in_lane(
+                    QueuedPayloadClass::Large,
+                    third,
+                    PeerKeyLocation::random(),
+                    state(BIG),
+                    super::super::no_fanout(),
+                )
+                .await;
+            let upgrading = contract(4);
+            queue
+                .enqueue_in_lane(
+                    QueuedPayloadClass::Small,
+                    upgrading,
+                    PeerKeyLocation::random(),
+                    state(BIG),
+                    super::super::no_fanout(),
+                )
+                .await;
+            assert_eq!(next(&mut rx).await, None, "the large lane is full");
+
+            let small = contract(5);
+            queue
+                .enqueue_in_lane(
+                    QueuedPayloadClass::Small,
+                    small,
+                    PeerKeyLocation::random(),
+                    state(16),
+                    super::super::no_fanout(),
+                )
+                .await;
+            assert_eq!(
+                next(&mut rx).await,
+                Some(("sending", small)),
+                "a small send goes out while the large lane is full"
+            );
+
+            tokio::time::sleep(STREAM_PERMIT_HOLD).await;
+            let mut after_hold = vec![
+                next(&mut rx).await.expect("a large send after the hold"),
+                next(&mut rx).await.expect("a second one"),
+            ];
+            after_hold.sort_by_key(|(_, key)| key.id().as_bytes().to_vec());
+            let mut expected = vec![("sending", third), ("sending", upgrading)];
+            expected.sort_by_key(|(_, key)| key.id().as_bytes().to_vec());
+            assert_eq!(
+                after_hold, expected,
+                "the two slow streams returned their permits at the hold"
+            );
+
+            let q = queue.queue.lock().await;
+            assert!(
+                q.active.contains_key(&(first, first_target.clone()))
+                    && q.active.contains_key(&(second, second_target.clone())),
+                "the slow sends keep their claim on their pairs past the hold"
+            );
+            drop(q);
+
+            for worker in workers {
+                worker.abort();
             }
         }
 
@@ -4594,6 +4818,9 @@ pub(super) async fn broadcast_to_single_peer(
             // enqueues is drained by the loop, so it cannot self-stall it. The
             // #4001 `None` progress arg that brought this statement into the diff
             // does not change the send path.
+            // The stream's declared length, which the receiver sizes its age
+            // limit from: the state plus the sender summary plus framing.
+            let stream_bytes = payload_bytes.len() as u64;
             if let Err(err) = bridge
                 .send_stream_with_completion(
                     peer_addr,
@@ -4617,13 +4844,19 @@ pub(super) async fn broadcast_to_single_peer(
                 );
             } else {
                 // Wait for the stream transfer to actually complete before
-                // releasing back to the queue worker (semaphore permit is held
-                // by our caller). Timeout prevents permanent stall. The
+                // doing the delivery bookkeeping. The lane permit is held for
+                // at most `STREAM_PERMIT_HOLD` of the wait; the queue's claim on
+                // the pair (#5842) is held by our caller until we return. The
                 // completion signal carries a `StreamSendOutcome` so we
-                // distinguish a real delivery from a drop (#4235); a drop still
-                // releases the permit but must NOT be recorded as a send.
-                let completion_timeout = stream_completion_timeout(payload_size as u64);
-                let completion = await_stream_completion(completion_rx, completion_timeout).await;
+                // distinguish a real delivery from a drop (#4235); a drop must
+                // NOT be recorded as a send.
+                let completion_timeout = stream_completion_timeout(stream_bytes);
+                let completion = await_stream_completion_releasing_permit(
+                    completion_rx,
+                    lane_permit.take(),
+                    completion_timeout,
+                )
+                .await;
                 // Classify AND apply the delivery gate in one production call
                 // (#4235): only a real `Delivered` refreshes interest / caches
                 // the summary. See `record_streaming_delivery`.
@@ -4785,51 +5018,59 @@ pub(super) async fn broadcast_to_single_peer(
 
 #[cfg(test)]
 mod stream_completion_timeout_tests {
-    use super::stream_completion_timeout;
+    use super::{
+        STREAM_PERMIT_HOLD, STREAM_WAIT_MIN_MARGIN, SendLanePermit,
+        await_stream_completion_releasing_permit, stream_completion_timeout,
+    };
     use crate::transport::peer_connection::streaming::{
         MAX_STREAM_TOTAL_BYTES, max_inbound_stream_age,
     };
+    use std::sync::Arc;
     use std::time::Duration;
+    use tokio::sync::Semaphore;
 
     const MIB: u64 = 1024 * 1024;
 
     /// The flat wait this replaced, for every payload size.
-    const STREAM_COMPLETION_TIMEOUT: Duration = Duration::from_secs(120);
+    const FLAT_WAIT: Duration = Duration::from_secs(120);
 
-    /// The wait is the receiver's age limit for the size: 5 minutes for small
-    /// streams, the payload at 32 KiB/s above that.
+    /// The wait is the receiver's age limit for the size (5 minutes for small
+    /// streams, the stream at 32 KiB/s above that) less a tenth of it, and at
+    /// least 30 s.
     #[test]
-    fn the_wait_is_the_receivers_age_limit() {
-        assert_eq!(stream_completion_timeout(0), Duration::from_secs(300));
-        assert_eq!(stream_completion_timeout(MIB), Duration::from_secs(300));
+    fn the_wait_stops_short_of_the_receivers_age_limit() {
+        assert_eq!(stream_completion_timeout(0), Duration::from_secs(270));
+        assert_eq!(stream_completion_timeout(MIB), Duration::from_secs(270));
         assert_eq!(
             stream_completion_timeout(16 * MIB),
-            Duration::from_secs(512)
+            Duration::from_millis(460_800)
         );
         assert_eq!(
             stream_completion_timeout(31 * MIB),
-            Duration::from_secs(992)
+            Duration::from_millis(892_800)
         );
         let mut size = 1u64;
         while size <= MAX_STREAM_TOTAL_BYTES {
-            assert_eq!(
-                stream_completion_timeout(size),
-                max_inbound_stream_age(size),
-                "{size} B"
-            );
+            let limit = max_inbound_stream_age(size);
+            let wait = stream_completion_timeout(size);
+            let margin = limit - wait;
+            assert!(margin >= STREAM_WAIT_MIN_MARGIN, "{size} B: {margin:?}");
+            assert!(margin >= limit / 10, "{size} B: {margin:?} of {limit:?}");
             size = size * 3 / 2 + 1;
         }
     }
 
-    /// A 16 MiB stream on a link at 96 KiB/s completes about 170 s after it
-    /// starts. The flat 120 s wait gave up on it, so the send counted as not
-    /// delivered (no summary cached, interest not refreshed, the next update
-    /// resending the whole state); the size-scaled wait sees it delivered.
+    /// A 16 MiB stream arriving between the flat 120 s and the scaled wait:
+    /// the flat wait gave up on it, so the send counted as not delivered (no
+    /// summary cached, interest not refreshed, the next update resending the
+    /// whole state); the size-scaled wait sees it delivered. The arrival time
+    /// is derived from the formula, so it tracks a change to the rate.
     #[tokio::test(start_paused = true)]
     async fn a_slow_large_stream_completes_inside_the_wait() {
         const SIZE: u64 = 16 * MIB;
-        let arrives = Duration::from_secs(SIZE / (96 * 1024));
-        assert_eq!(arrives, Duration::from_secs(170), "premise");
+        let scaled = stream_completion_timeout(SIZE);
+        let arrives = (FLAT_WAIT + scaled) / 2;
+        assert!(arrives > FLAT_WAIT && arrives < scaled, "premise");
 
         let wait = |timeout: Duration| async move {
             let (tx, rx) = tokio::sync::oneshot::channel::<()>();
@@ -4845,17 +5086,14 @@ mod stream_completion_timeout_tests {
         };
         crate::config::GlobalTestMetrics::reset();
         assert!(
-            !wait(STREAM_COMPLETION_TIMEOUT).await,
+            !wait(FLAT_WAIT).await,
             "the flat 120 s gives up before the stream ends"
         );
         assert_eq!(
             crate::config::GlobalTestMetrics::stream_completion_timeouts(),
             1
         );
-        assert!(
-            wait(stream_completion_timeout(SIZE)).await,
-            "the scaled wait sees the stream end"
-        );
+        assert!(wait(scaled).await, "the scaled wait sees the stream end");
         assert_eq!(
             crate::config::GlobalTestMetrics::stream_completion_timeouts(),
             1,
@@ -4863,8 +5101,84 @@ mod stream_completion_timeout_tests {
         );
     }
 
-    /// `broadcast_to_single_peer` waits through `await_stream_completion` with
-    /// the size-scaled timeout, not the flat base.
+    fn large_permit(pool: &Arc<Semaphore>) -> SendLanePermit {
+        SendLanePermit::new(
+            super::QueuedPayloadClass::Large,
+            pool.clone()
+                .try_acquire_owned()
+                .expect("large pool has capacity"),
+            pool.clone(),
+            Arc::new(Semaphore::new(1)),
+        )
+    }
+
+    /// The lane permit comes back after `STREAM_PERMIT_HOLD`, while the wait
+    /// for the stream goes on and still sees a late completion.
+    #[tokio::test(start_paused = true)]
+    async fn the_permit_returns_at_the_hold_and_the_wait_goes_on() {
+        let pool = Arc::new(Semaphore::new(1));
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let timeout = stream_completion_timeout(31 * MIB);
+        let arrives = STREAM_PERMIT_HOLD + (timeout - STREAM_PERMIT_HOLD) / 2;
+        let waiter = tokio::spawn(await_stream_completion_releasing_permit(
+            rx,
+            Some(large_permit(&pool)),
+            timeout,
+        ));
+
+        tokio::time::sleep(STREAM_PERMIT_HOLD - Duration::from_secs(1)).await;
+        assert_eq!(pool.available_permits(), 0, "held during the hold");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(pool.available_permits(), 1, "returned after the hold");
+        assert!(!waiter.is_finished(), "the wait goes on without it");
+
+        tokio::time::sleep(arrives - STREAM_PERMIT_HOLD - Duration::from_secs(1)).await;
+        tx.send(()).expect("the waiter is still listening");
+        let completion = waiter.await.expect("waiter task");
+        assert!(
+            completion.is_ok_and(|received| received.is_ok()),
+            "a completion after the hold is still seen"
+        );
+    }
+
+    /// A completion inside the hold returns at once, with the permit.
+    #[tokio::test(start_paused = true)]
+    async fn an_early_completion_returns_the_permit_with_it() {
+        let pool = Arc::new(Semaphore::new(1));
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let waiter = tokio::spawn(await_stream_completion_releasing_permit(
+            rx,
+            Some(large_permit(&pool)),
+            stream_completion_timeout(31 * MIB),
+        ));
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        tx.send(()).expect("listening");
+        let completion = waiter.await.expect("waiter task");
+        assert!(completion.is_ok_and(|received| received.is_ok()));
+        assert_eq!(pool.available_permits(), 1);
+    }
+
+    /// No completion at all: the wait ends at the scaled timeout and counts it.
+    #[tokio::test(start_paused = true)]
+    async fn a_stream_that_never_reports_times_out_at_the_scaled_wait() {
+        let pool = Arc::new(Semaphore::new(1));
+        let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let timeout = stream_completion_timeout(31 * MIB);
+        crate::config::GlobalTestMetrics::reset();
+        let started = tokio::time::Instant::now();
+        let completion =
+            await_stream_completion_releasing_permit(rx, Some(large_permit(&pool)), timeout).await;
+        assert!(completion.is_err());
+        assert_eq!(started.elapsed(), timeout);
+        assert_eq!(pool.available_permits(), 1);
+        assert_eq!(
+            crate::config::GlobalTestMetrics::stream_completion_timeouts(),
+            1
+        );
+    }
+
+    /// `broadcast_to_single_peer` sizes the wait from the stream's declared
+    /// length and waits through the permit-releasing helper.
     #[test]
     fn the_broadcast_waits_with_the_scaled_timeout() {
         const SOURCE: &str = include_str!("broadcast_queue.rs");
@@ -4894,17 +5208,25 @@ mod stream_completion_timeout_tests {
         let body = crate::contract::source_pin_util::strip_comments(
             &production[open..end.expect("balanced braces")],
         );
+        let compact: String = body.chars().filter(|c| !c.is_whitespace()).collect();
         assert!(
-            body.contains("stream_completion_timeout(payload_size as u64)"),
-            "the wait is sized by the payload"
+            compact.contains("letstream_bytes=payload_bytes.len()asu64;"),
+            "the wait is sized from the stream's declared length"
+        );
+        assert_eq!(
+            compact.matches("stream_completion_timeout(").count(),
+            1,
+            "one scaled wait"
         );
         assert!(
-            body.contains("await_stream_completion(completion_rx, completion_timeout)"),
-            "the wait goes through the counted helper"
+            compact.contains("stream_completion_timeout(stream_bytes)"),
+            "the scaled wait takes the declared length, not the state size"
         );
         assert!(
-            !body.contains("timeout(STREAM_COMPLETION_TIMEOUT"),
-            "no flat 120 s wait remains"
+            compact.contains(
+                "await_stream_completion_releasing_permit(completion_rx,lane_permit.take(),completion_timeout,)"
+            ),
+            "the wait hands the lane permit to the helper that returns it early"
         );
     }
 
@@ -4915,7 +5237,7 @@ mod stream_completion_timeout_tests {
         let mut last = Duration::ZERO;
         for mib in 0..=50u64 {
             let wait = stream_completion_timeout(mib * MIB);
-            assert!(wait >= STREAM_COMPLETION_TIMEOUT, "{mib} MiB: {wait:?}");
+            assert!(wait >= FLAT_WAIT, "{mib} MiB: {wait:?}");
             assert!(wait >= last, "{mib} MiB: {wait:?} below {last:?}");
             last = wait;
         }
