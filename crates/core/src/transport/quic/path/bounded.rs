@@ -216,10 +216,14 @@ impl SendProgress {
         match self.stage() {
             STAGE_OPENING => started.saturating_add(nanos(deadlines.open)).min(total),
             STAGE_OPENED => deadlines.gap.map_or(total, |gap| {
-                let last = self.0.last_step.load(Ordering::Acquire);
+                let own = self
+                    .0
+                    .last_step
+                    .load(Ordering::Acquire)
+                    .saturating_add(nanos(gap));
                 #[cfg(feature = "bench")]
-                let last = last.max(lab::connection_progress());
-                last.saturating_add(nanos(gap)).min(total)
+                let own = own.max(lab::connection_deadline());
+                own.min(total)
             }),
             _ => total,
         }
@@ -241,19 +245,32 @@ impl SendProgress {
 pub(crate) mod lab {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-    /// When on, a send's gap runs from the later of its own last step and
-    /// [`LAST_CONNECTION_ACK`].
+    /// When on, a send's gap runs out only once both its own gap since its
+    /// last step and [`CONNECTION_GAP`] since [`LAST_CONNECTION_ACK`] have.
     pub(crate) static GAP_ON_CONNECTION_PROGRESS: AtomicBool = AtomicBool::new(false);
     /// When the lab's connection last had a packet newly acknowledged, on the
     /// send's clock, in nanoseconds.
     pub(crate) static LAST_CONNECTION_ACK: AtomicU64 = AtomicU64::new(0);
 
-    pub(super) fn connection_progress() -> u64 {
-        if GAP_ON_CONNECTION_PROGRESS.load(Ordering::Relaxed) {
-            LAST_CONNECTION_ACK.load(Ordering::Relaxed)
-        } else {
-            0
+    /// The window after the connection's last acknowledgement in which a
+    /// send's gap does not run out, in nanoseconds; 0 means the send's own
+    /// gap (5 s).
+    pub(crate) static CONNECTION_GAP: AtomicU64 = AtomicU64::new(0);
+
+    /// When the connection-progress rule ends a send's gap: the last
+    /// acknowledgement plus [`CONNECTION_GAP`] (or the send's own gap), or 0
+    /// when the rule is off.
+    pub(super) fn connection_deadline() -> u64 {
+        if !GAP_ON_CONNECTION_PROGRESS.load(Ordering::Relaxed) {
+            return 0;
         }
+        let window = match CONNECTION_GAP.load(Ordering::Relaxed) {
+            0 => super::nanos(super::STREAM_INACTIVITY_TIMEOUT),
+            window => window,
+        };
+        LAST_CONNECTION_ACK
+            .load(Ordering::Relaxed)
+            .saturating_add(window)
     }
 }
 
