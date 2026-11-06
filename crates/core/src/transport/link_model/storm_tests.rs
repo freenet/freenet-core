@@ -273,7 +273,11 @@ fn seeds() -> Vec<u64> {
 #[test]
 fn storm_under_a_cap_matches_or_beats_main() {
     const PEERS: usize = 16;
-    const CAP: u64 = 450_000;
+    // Override with `FREENET_STORM_CAP` (bytes per second) to explore.
+    let cap: u64 = std::env::var("FREENET_STORM_CAP")
+        .ok()
+        .map(|v| v.trim().parse().expect("decimal bytes per second"))
+        .unwrap_or(450_000);
     let mut failures = Vec::new();
     for seed in seeds() {
         let run = |cap| {
@@ -282,8 +286,8 @@ fn storm_under_a_cap_matches_or_beats_main() {
                 run_storm(PEERS, 512 * 1024, Duration::from_secs(60), seed, cap),
             )
         };
-        let main = run(Cap::Main(CAP));
-        let capped = run(Cap::Capped(CAP));
+        let main = run(Cap::Main(cap));
+        let capped = run(Cap::Capped(cap));
         let line = format!(
             "seed {seed}\n  {}\n  {}",
             main.summary("main  "),
