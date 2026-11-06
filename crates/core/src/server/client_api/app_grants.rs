@@ -327,47 +327,51 @@ fn origin_is_this_node(headers: &HeaderMap) -> bool {
 }
 
 /// Gate shared by every route here: the direct peer and the `Host` it asked
-/// for are both this machine, and nothing proxied the request.
+/// for are both this machine, and nothing proxied the request. Returns the
+/// refusal to send, or `None` to proceed.
 fn local_gate(
     connect_info: Option<&Extension<ConnectInfo<SocketAddr>>>,
     headers: &HeaderMap,
-) -> Result<(), Response> {
+) -> Option<Response> {
     if !peer_is_loopback(connect_info.map(|Extension(ci)| ci)) {
-        return Err(refuse(StatusCode::FORBIDDEN, "loopback only"));
+        return Some(refuse(StatusCode::FORBIDDEN, "loopback only"));
     }
     if has_forwarding_headers(headers) {
-        return Err(refuse(
+        return Some(refuse(
             StatusCode::FORBIDDEN,
             "proxied requests are refused",
         ));
     }
     if !host_is_loopback(headers) {
-        return Err(refuse(StatusCode::FORBIDDEN, "loopback host only"));
+        return Some(refuse(StatusCode::FORBIDDEN, "loopback host only"));
     }
-    Ok(())
+    None
 }
 
 /// Gate for the request and poll endpoints, which only a native program may
 /// call. A browser always sends `Sec-Fetch-*` on these requests and `Origin`
-/// on a cross-origin POST; a native client sends neither.
+/// on a cross-origin POST; a native client sends neither. Returns the refusal
+/// to send, or `None` to proceed.
 fn native_client_gate(
     connect_info: Option<&Extension<ConnectInfo<SocketAddr>>>,
     headers: &HeaderMap,
-) -> Result<(), Response> {
-    local_gate(connect_info, headers)?;
+) -> Option<Response> {
+    if let Some(refusal) = local_gate(connect_info, headers) {
+        return Some(refusal);
+    }
     if headers.contains_key(axum::http::header::ORIGIN) {
-        return Err(refuse(
+        return Some(refuse(
             StatusCode::FORBIDDEN,
             "this endpoint is for native clients; requests with an Origin are refused",
         ));
     }
     if headers.keys().any(|n| n.as_str().starts_with("sec-fetch-")) {
-        return Err(refuse(
+        return Some(refuse(
             StatusCode::FORBIDDEN,
             "this endpoint is for native clients; browser requests are refused",
         ));
     }
-    Ok(())
+    None
 }
 
 #[derive(Deserialize)]
@@ -385,7 +389,7 @@ async fn create_request(
     headers: HeaderMap,
     Json(body): Json<CreateRequest>,
 ) -> Response {
-    if let Err(r) = native_client_gate(connect_info.as_ref(), &headers) {
+    if let Some(r) = native_client_gate(connect_info.as_ref(), &headers) {
         return r;
     }
     let Ok(app) = ContractInstanceId::from_base58(&body.app) else {
@@ -460,7 +464,7 @@ async fn poll_request(
     headers: HeaderMap,
     Path(request_id): Path<String>,
 ) -> Response {
-    if let Err(r) = native_client_gate(connect_info.as_ref(), &headers) {
+    if let Some(r) = native_client_gate(connect_info.as_ref(), &headers) {
         return r;
     }
     if state.0.polls.fetch_add(1, Ordering::AcqRel) >= MAX_CONCURRENT_POLLS {
@@ -574,7 +578,7 @@ async fn approve_page(
     headers: HeaderMap,
     Path(approve_id): Path<String>,
 ) -> Response {
-    if let Err(r) = local_gate(connect_info.as_ref(), &headers) {
+    if let Some(r) = local_gate(connect_info.as_ref(), &headers) {
         return r;
     }
     let nonce = random_id();
@@ -626,7 +630,7 @@ async fn approve_submit(
     Path(approve_id): Path<String>,
     Json(body): Json<ApproveSubmit>,
 ) -> Response {
-    if let Err(r) = local_gate(connect_info.as_ref(), &headers) {
+    if let Some(r) = local_gate(connect_info.as_ref(), &headers) {
         return r;
     }
     // Exactly the node's own origin. Not the any-localhost-port check: another
