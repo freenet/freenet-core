@@ -5689,7 +5689,6 @@ std::thread_local! {
     static GLOBAL_FULL_STATE_SEND_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_PENDING_OP_INSERTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_PENDING_OP_REMOVES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    static GLOBAL_STREAM_COMPLETION_TIMEOUTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_PENDING_OP_HWM: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_PENDING_OP_SKIPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_NEIGHBOR_HOSTING_UPDATES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -5807,7 +5806,6 @@ impl GlobalTestMetrics {
         GLOBAL_PENDING_OP_INSERTS.with(|c| c.set(0));
         GLOBAL_PENDING_OP_SKIPS.with(|c| c.set(0));
         GLOBAL_PENDING_OP_REMOVES.with(|c| c.set(0));
-        GLOBAL_STREAM_COMPLETION_TIMEOUTS.with(|c| c.set(0));
         GLOBAL_PENDING_OP_HWM.with(|c| c.set(0));
         GLOBAL_NEIGHBOR_HOSTING_UPDATES.with(|c| c.set(0));
         GLOBAL_NOTIFICATION_COHOSTS_SKIPPED.with(|c| c.set(0));
@@ -6087,21 +6085,6 @@ impl GlobalTestMetrics {
 
     pub fn pending_op_inserts() -> u64 {
         GLOBAL_PENDING_OP_INSERTS.with(|c| c.get())
-    }
-
-    /// Records a streamed broadcast whose completion wait timed out, so the
-    /// send counted as not delivered.
-    ///
-    /// Thread-local, like the other counters here: it counts waits that ran on
-    /// the reading thread. A simulation reads it from the thread its hosts run
-    /// on; a reader on another thread sees 0.
-    pub fn record_stream_completion_timeout() {
-        GLOBAL_STREAM_COMPLETION_TIMEOUTS.with(|c| c.set(c.get() + 1));
-    }
-
-    /// Streamed broadcasts whose completion wait timed out since the last reset.
-    pub fn stream_completion_timeouts() -> u64 {
-        GLOBAL_STREAM_COMPLETION_TIMEOUTS.with(|c| c.get())
     }
 
     pub fn record_pending_op_remove() {
