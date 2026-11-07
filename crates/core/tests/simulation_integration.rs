@@ -21209,8 +21209,10 @@ fn test_quic_data_ramp_turns_on_every_pair_within_a_day() {
 /// lost, while their UDP session carries on. Both ends stop putting new data on
 /// the path once its sends time out with nothing acknowledged (it is suspect),
 /// so data reaches the peer on UDP while the path is still up; the path falls
-/// back on its idle timeout with the UDP session up, the pair is offered a path
-/// again, and the gateway ends with the whole state.
+/// back on its idle timeout (or, at the gateway, by the stall close, when enough
+/// of its sends were waiting on the path; see the assertion) with the UDP
+/// session up, the pair is offered a path again, and the gateway ends with the
+/// whole state.
 #[test_log::test]
 fn test_quic_data_path_cut_mid_transfer_falls_back_to_udp() {
     use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation};
@@ -21302,13 +21304,22 @@ fn test_quic_data_path_cut_mid_transfer_falls_back_to_udp() {
                 .collect::<Vec<_>>()
         };
         let fell_back = of_node("Fallback(");
-        assert_eq!(
-            fell_back
-                .iter()
-                .map(|r| r.what.as_str())
-                .collect::<Vec<_>>(),
-            vec!["Fallback(Idle)"],
-            "{address} fell back on the idle timeout: {}",
+        // Each end falls back once: on the idle timeout, or by the stall close
+        // (`QuicSendEvent::StalledClosed`, the path's DOWNGRADE close, which the
+        // machine reads as a lost connection: `Fallback(Reset)`), never by any
+        // other reset. transport.md, "QUIC send route": once suspect no new send
+        // reaches the path, "so the stall close fires only when
+        // STALLED_SENDS_LIMIT sends were already on it". With the 384 KiB window
+        // (the data ramp's memory gate) the gateway has that many sends waiting
+        // on the path when it goes dark, and they time out on their gap.
+        let ends: Vec<&str> = fell_back.iter().map(|r| r.what.as_str()).collect();
+        let stall_closed = of_node("path stall-closed: ")
+            .iter()
+            .any(|r| r.what != "path stall-closed: 0");
+        assert!(
+            ends == ["Fallback(Idle)"] || (ends == ["Fallback(Reset)"] && stall_closed),
+            "{address} fell back on the idle timeout or by the stall close, \
+             not {ends:?} (stall-closed: {stall_closed}): {}",
             run.dump()
         );
         let fell_back_at = fell_back[0].at;

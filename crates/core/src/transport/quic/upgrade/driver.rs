@@ -1208,6 +1208,13 @@ impl Session {
                 )
             });
             self.note(|| {
+                use crate::transport::quic::path::QuicSendEvent as E;
+                format!(
+                    "path stall-closed: {}",
+                    path.stats().send_event_count(E::StalledClosed)
+                )
+            });
+            self.note(|| {
                 use crate::transport::quic::path::QuicSendResult as R;
                 let stats = path.stats();
                 format!(
