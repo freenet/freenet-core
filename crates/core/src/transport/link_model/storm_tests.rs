@@ -509,3 +509,173 @@ fn receipt_loss_under_a_cap_matches_or_beats_main() {
         failures.join("\n")
     );
 }
+
+/// What one outage run did.
+#[derive(Debug)]
+struct OutageReport {
+    completed_after: Option<Duration>,
+    retransmits_during_outage: u32,
+    probe: CongestionProbe,
+}
+
+/// One connection, a `payload_len` stream from A to B; `outage_at` into it the
+/// link drops everything both ways for `outage`, then is clean again.
+async fn run_outage(
+    payload_len: usize,
+    outage_at: Duration,
+    outage: Duration,
+    horizon: Duration,
+    seed: u64,
+    cap: Cap,
+) -> OutageReport {
+    let vt = VirtualTime::new();
+    let driver = tokio::spawn(drive_virtual_time(vt.clone()));
+    let clean = HostLink {
+        uplink_bps: 0,
+        queue_bytes: 1 << 24,
+        one_way_delay: ONE_WAY_DELAY,
+        loss: Loss::None,
+    };
+    let link = Arc::new(LinkModel::new(clean.clone(), seed));
+    let channels: Channels = Arc::new(DashMap::new());
+    let config = Some(CongestionControlConfig::new(
+        CongestionControlAlgorithm::FixedRate,
+    ));
+    let (pub_a, mut peer_a, addr_a) = create_mock_peer_with_link_model_and_cap(
+        link.clone(),
+        channels.clone(),
+        vt.clone(),
+        config.clone(),
+        cap.rate(),
+    )
+    .await
+    .expect("peer a");
+    let (pub_b, mut peer_b, addr_b) = create_mock_peer_with_link_model_and_cap(
+        link.clone(),
+        channels.clone(),
+        vt.clone(),
+        config,
+        None,
+    )
+    .await
+    .expect("peer b");
+    let (ca, cb) = futures::join!(peer_a.connect(pub_b, addr_b), peer_b.connect(pub_a, addr_a));
+    let (conn_a, conn_b) = connect_pair(ca, cb).await;
+    let (mut conn_a, mut conn_b) = (conn_a.expect("connect a"), conn_b.expect("connect b"));
+    if let Cap::Main(_) = cap {
+        conn_a.egress_cap().expect("a cap").uncap_retransmits();
+    }
+    let start = vt.now_nanos();
+    let payload: Vec<u8> = (0..payload_len)
+        .map(|i| (i * 13 + seed as usize) as u8)
+        .collect();
+    conn_a.send(payload).await.expect("send");
+    let dark = HostLink {
+        loss: Loss::Bernoulli(1.0),
+        ..clean.clone()
+    };
+    let mut phase_end = vt.sleep_until(start + outage_at.as_nanos() as u64);
+    let mut phase = 0; // 0 before, 1 during, 2 after the outage
+    let mut retransmits_at_down = 0;
+    let mut retransmits_during_outage = 0;
+    let mut until = vt.sleep_until(start + horizon.as_nanos() as u64);
+    let mut completed_after = None;
+    loop {
+        tokio::select! {
+            biased;
+            r = conn_b.recv() => {
+                if r.is_ok() {
+                    completed_after = Some(Duration::from_nanos(vt.now_nanos() - start));
+                }
+                break;
+            }
+            r = conn_a.recv() => if r.is_err() { break; },
+            _ = &mut phase_end, if phase < 2 => {
+                if phase == 0 {
+                    link.set_host_link(addr_a, dark.clone());
+                    link.set_host_link(addr_b, dark.clone());
+                    retransmits_at_down = conn_a.congestion_probe().retransmissions;
+                    phase_end = vt.sleep_until(
+                        start + (outage_at + outage).as_nanos() as u64,
+                    );
+                } else {
+                    link.set_host_link(addr_a, clean.clone());
+                    link.set_host_link(addr_b, clean.clone());
+                    retransmits_during_outage =
+                        conn_a.congestion_probe().retransmissions - retransmits_at_down;
+                }
+                phase += 1;
+            }
+            _ = &mut until => break,
+        }
+    }
+    let probe = conn_a.congestion_probe();
+    driver.abort();
+    drop((peer_a, peer_b));
+    OutageReport {
+        completed_after,
+        retransmits_during_outage,
+        probe,
+    }
+}
+
+/// The outage row: a 6 MiB stream loses the link both ways for 2 s, 2 s in.
+/// Longer outages end the stream in main as well: past the sender's 3 s
+/// congestion-window wait (the outage pins flight) or the receiver's 5 s
+/// inactivity timeout, so they cannot tell the two apart.
+/// With the cap above the stream rate and at it, capped retransmits must
+/// finish no later than main (10% slack) and fail no more streams.
+#[test]
+fn an_outage_under_a_cap_matches_or_beats_main() {
+    let mut failures = Vec::new();
+    for rate in [2_500_000u64, 1_250_000] {
+        for seed in seeds() {
+            let run = |cap| {
+                block_on_seeded(
+                    seed,
+                    run_outage(
+                        6 * 1024 * 1024,
+                        Duration::from_secs(2),
+                        Duration::from_secs(2),
+                        Duration::from_secs(120),
+                        seed,
+                        cap,
+                    ),
+                )
+            };
+            let main = run(Cap::Main(rate));
+            let capped = run(Cap::Capped(rate));
+            let line = |label: &str, r: &OutageReport| {
+                format!(
+                    "{label}: done after {:?}, {} retransmits during the outage, {} RTO, \
+                     {} deferred, {} abandoned, {} streams failed",
+                    r.completed_after,
+                    r.retransmits_during_outage,
+                    r.probe.rto_expiries,
+                    r.probe.retransmits_deferred,
+                    r.probe.abandoned_packets,
+                    r.probe.outbound_streams_failed,
+                )
+            };
+            let summary = format!(
+                "outage, cap {rate} B/s, seed {seed}\n  {}\n  {}",
+                line("main  ", &main),
+                line("capped", &capped)
+            );
+            eprintln!("{summary}");
+            let late = match (main.completed_after, capped.completed_after) {
+                (Some(m), Some(c)) => c > m.mul_f64(1.1),
+                (Some(_), None) => true,
+                (None, _) => false,
+            };
+            if late || capped.probe.outbound_streams_failed > main.probe.outbound_streams_failed {
+                failures.push(summary);
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "capped retransmits did worse after an outage:\n{}",
+        failures.join("\n")
+    );
+}
