@@ -406,12 +406,15 @@ impl QuicPath {
                 self.last_acked
                     .fetch_max(at, std::sync::atomic::Ordering::AcqRel);
             } else {
-                let _ = self.last_acked.compare_exchange(
-                    seen,
-                    at,
-                    std::sync::atomic::Ordering::AcqRel,
-                    std::sync::atomic::Ordering::Acquire,
-                );
+                // Lost to a watch's later ack, the value is left as it is.
+                self.last_acked
+                    .compare_exchange(
+                        seen,
+                        at,
+                        std::sync::atomic::Ordering::AcqRel,
+                        std::sync::atomic::Ordering::Acquire,
+                    )
+                    .ok();
             }
             (verdict, acked)
         };
