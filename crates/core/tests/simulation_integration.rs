@@ -21087,7 +21087,8 @@ fn test_quic_data_carries_a_stream_end_to_end() {
 /// with no `quic-data-percent` take their share from a ramp that starts with
 /// the run. A path that came up without data is recycled when the share reaches
 /// its pair, so by 24 h, plus a recheck and the time to set up again, every
-/// pair with a path carries data. Nothing is recycled during the first 6 h,
+/// pair whose path came up by 24 h carries data (a pair first connecting later
+/// has had no time to). Nothing is recycled during the first 6 h,
 /// when the share stays at 5%, no node recycles a pair twice, and no pair is
 /// recycled before the share covers it (each node notes its data-share decisions
 /// in the trace: the pair's bucket and the percent).
@@ -21118,14 +21119,17 @@ fn test_quic_data_ramp_turns_on_every_pair_within_a_day() {
     };
     let records = run.trace.records();
     let pair = |r: &freenet::dev_tool::QuicUpgradeRecord| (r.node, r.peer);
+    // A recheck (45 s +20%), a first-offer delay (10 s at most) and the set-up.
+    let margin = Duration::from_secs(3 * 60);
+    let by = 24 * HOUR + margin;
+    // Only pairs whose path came up by 24 h: one that first connects later
+    // has had no margin to set data up, and the ramp is not what it tests.
     let established: std::collections::BTreeSet<_> = records
         .iter()
-        .filter(|r| r.what.starts_with("Established("))
+        .filter(|r| r.what.starts_with("Established(") && r.at <= by - margin)
         .map(pair)
         .collect();
     assert!(established.len() >= 4, "paths came up: {}", run.dump());
-    // A recheck (45 s +20%), a first-offer delay (10 s at most) and the set-up.
-    let by = 24 * HOUR + Duration::from_secs(3 * 60);
     for (node, peer) in &established {
         assert!(
             records.iter().any(|r| r.what == "DataEnabled"

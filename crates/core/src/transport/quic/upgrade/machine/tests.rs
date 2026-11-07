@@ -2803,7 +2803,8 @@ fn active_without_own_bit(role: Role) -> (Rig, u32) {
 
 /// When this node's data bit for the pair comes on while a path without data is
 /// up, the next recheck closes the path with RECYCLE_FOR_DATA: no fallback, no
-/// charge, a server offers again at once, and the next attempt carries data and
+/// charge, a server offers again after the first-offer delay (so its offer
+/// follows the close), and the next attempt carries data and
 /// is never rechecked. A recheck before the bit comes on changes nothing.
 #[test]
 fn a_path_without_data_is_recycled_once_when_the_bit_comes_on() {
@@ -2843,7 +2844,12 @@ fn a_path_without_data_is_recycled_once_when_the_bit_comes_on() {
         assert_eq!(rig.in_use(), 0, "the permit is back");
         assert_eq!(rig.machine.failures, failures, "nothing is charged");
         if role == Role::Server {
-            assert_eq!(rig.machine.retry_at, rig.now, "offers again at once");
+            assert!(
+                (rig.now + OFFER_DELAY_MIN..=rig.now + OFFER_DELAY_MAX)
+                    .contains(&rig.machine.retry_at),
+                "offers again within the first-offer delay, not with the close: {:?}",
+                rig.machine.retry_at - rig.now
+            );
         }
         rig.activate();
         assert!(rig.machine.carries_data(), "{role:?}");
@@ -2852,6 +2858,23 @@ fn a_path_without_data_is_recycled_once_when_the_bit_comes_on() {
             None,
             "a path with data is not rechecked"
         );
+    }
+}
+
+/// The data recheck is jittered +/-20%: a recheck that finds the share short
+/// asks again after `jittered(DATA_RECHECK_INTERVAL, sample)`, pinned at both
+/// ends of the draw, so an unjittered recheck (every node rechecking in step)
+/// fails.
+#[test]
+fn the_data_recheck_is_jittered() {
+    use crate::transport::quic::upgrade::machine::DATA_RECHECK_INTERVAL;
+    for (sample, factor) in [(0.0, 0.8), (1.0, 1.2)] {
+        let (mut rig, _) = active_without_own_bit(Role::Server);
+        rig.sample = sample;
+        let due = rig.machine.deadline().expect("a recheck is due");
+        assert_eq!(rig.tick_at(due), vec![]);
+        let next = rig.machine.deadline().expect("asked again");
+        assert_eq!(next - due, DATA_RECHECK_INTERVAL.mul_f64(factor), "{sample}");
     }
 }
 
@@ -2906,20 +2929,26 @@ fn a_recycle_close_from_the_peer_is_no_fault() {
         let (mut rig, attempt) = active_without_own_bit(role);
         let failures = rig.machine.failures;
         let actions = rig.close_with(attempt, u64::from(QuicCloseCode::RecycleForData.code()));
-        assert!(
-            actions.contains(&Action::Record(Outcome::RecycledForData { by_peer: true })),
-            "{role:?}: {actions:?}"
-        );
-        assert!(
-            !actions
-                .iter()
-                .any(|a| matches!(a, Action::Record(Outcome::Fallback(_)))),
+        assert_eq!(
+            actions,
+            vec![
+                Action::TearDown {
+                    attempt,
+                    code: QuicCloseCode::RecycleForData,
+                },
+                Action::Record(Outcome::RecycledForData { by_peer: true }),
+            ],
             "{role:?}"
         );
         assert_eq!(label(&rig.machine), S::Idle);
         assert_eq!(rig.machine.failures, failures);
+        assert_eq!(rig.in_use(), 0, "the permit is back");
         if role == Role::Server {
-            assert!(rig.backoff() <= OFFER_DELAY_MAX, "{:?}", rig.backoff());
+            assert!(
+                (OFFER_DELAY_MIN..=OFFER_DELAY_MAX).contains(&rig.backoff()),
+                "{:?}",
+                rig.backoff()
+            );
         }
     }
 }

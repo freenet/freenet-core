@@ -192,6 +192,13 @@ pub(in crate::transport) const OFFER_DELAY_MIN: Duration = Duration::from_secs(2
 /// The latest first offer after promotion.
 pub(in crate::transport) const OFFER_DELAY_MAX: Duration = Duration::from_secs(10);
 
+/// When a server offers again after a recycle for data, either side's: the
+/// first-offer spread from now, so the offer follows the close.
+fn recycle_reoffer_at(cx: Inputs<'_>) -> Duration {
+    let spread = OFFER_DELAY_MAX.saturating_sub(OFFER_DELAY_MIN);
+    cx.now + OFFER_DELAY_MIN + spread.mul_f64(unit(cx.sample))
+}
+
 const BACKOFF: ExponentialBackoff = ExponentialBackoff::new(BACKOFF_MIN, BACKOFF_MAX);
 
 /// QUIC transport error INTERNAL_ERROR: an endpoint whose driver was dropped
@@ -844,7 +851,10 @@ impl UpgradeMachine {
     /// attempt carries the bit; otherwise ask again later. Only a path with no
     /// data is closed, and only once per change of this node's bit, since the
     /// next attempt reads the bit as set. Not a fallback: nothing is charged, no
-    /// fallback is counted, and a server offers again at once.
+    /// fallback is counted, and a server offers again after the first-offer
+    /// delay (2 to 10 s, [`recycle_reoffer_at`]), as after a recycle by its
+    /// peer: an offer sent with the close could reach the client before the
+    /// close does and be declined `NotReady`.
     fn recheck_data(&mut self, cx: Inputs<'_>, attempt: u32) -> Vec<Action> {
         let Some(at) = self.data_recheck_at else {
             return Vec::new();
@@ -858,7 +868,7 @@ impl UpgradeMachine {
         }
         self.leave_attempt();
         if self.role == Some(Role::Server) {
-            self.retry_at = cx.now;
+            self.retry_at = recycle_reoffer_at(cx);
         }
         vec![
             Action::TearDown {
@@ -1137,8 +1147,7 @@ impl UpgradeMachine {
             Verdict::Recycled => {
                 self.leave_attempt();
                 if self.role == Some(Role::Server) {
-                    let spread = OFFER_DELAY_MAX.saturating_sub(OFFER_DELAY_MIN);
-                    self.retry_at = cx.now + OFFER_DELAY_MIN + spread.mul_f64(unit(cx.sample));
+                    self.retry_at = recycle_reoffer_at(cx);
                 }
                 vec![
                     Action::TearDown {
