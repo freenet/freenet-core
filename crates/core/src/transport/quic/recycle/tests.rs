@@ -10,6 +10,7 @@ const NO_CAP: CapHoldReading = CapHoldReading {
     holds: 0,
     held_now: false,
     validity: Duration::ZERO,
+    longest_wait: Duration::ZERO,
 };
 
 /// The ticks of the window (`window / tick`), and the tick a window
@@ -107,6 +108,7 @@ fn run(ticks: u64, mut at: impl FnMut(u64) -> Reading) -> Option<u64> {
                 holds: r.cap_holds,
                 held_now: r.cap_held_now,
                 validity: r.cap_validity,
+                longest_wait: Duration::ZERO,
             },
         )
     };

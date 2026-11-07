@@ -54,7 +54,8 @@ use crate::transport::{Socket, normalize_mapped_addr};
 /// built them (their frames are counted in its stats) but they have not been
 /// sent. The path's acknowledgement watch (`recycle`) runs no window while
 /// one is held, since a send it counted may not have left yet, and the stall
-/// count and a send's gap (`path`) read a hold as the connection moving.
+/// count and a send's gap (`path`) read a hold as the connection moving, but
+/// only within the window after the connection's last acknowledgement.
 ///
 /// Per connection, never node-wide: on a node whose cap binds, some
 /// connection's transmit is held nearly all the time, and a node-wide count
@@ -88,6 +89,8 @@ pub(crate) struct CapHolds {
     holds: AtomicU64,
     /// [`cap_hold_validity`] of the cap's rate; zero without a cap.
     validity: Duration,
+    /// [`cap_transmit_wait`] of the cap's rate; zero without a cap.
+    longest_wait: Duration,
 }
 
 /// What [`CapHolds::read`] returns.
@@ -96,20 +99,36 @@ pub(crate) struct CapHoldReading {
     pub(crate) holds: u64,
     pub(crate) held_now: bool,
     pub(crate) validity: Duration,
+    /// [`cap_transmit_wait`] of the cap's rate; zero without a cap.
+    pub(crate) longest_wait: Duration,
 }
 
 /// The margin [`cap_hold_validity`] puts on the longest wait the cap can
 /// give one QUIC transmit, for the time from a waiter's timer to its poll.
 pub(crate) const CAP_HOLD_VALIDITY_MARGIN: u32 = 2;
 
+/// The longest the cap makes one waiting transmit wait before its poller is
+/// polled again, for a cap of `rate_bytes_per_sec`: the cap's debt limit
+/// (unpaced sends may run the bucket that far into debt) plus one datagram's
+/// refill for every waiter that can be queued ahead of it
+/// (`MAX_ADMISSION_WAKERS`) and for its own. About 19.8 s at 64 KiB/s, 13.3 s
+/// at 100 kB/s, 2.2 s at 1 MB/s. The one derivation of that wait:
+/// [`cap_hold_validity`] puts a margin on it, and the stall count and a send's
+/// gap credit a hold for it after the connection's last acknowledgement
+/// (`path::route::hold_credit`).
+pub(crate) fn cap_transmit_wait(rate_bytes_per_sec: u64) -> Duration {
+    use crate::transport::egress_cap::{DEBT_LIMIT, MAX_ADMISSION_WAKERS, WAKE_DATAGRAM_BYTES};
+    let queued = (MAX_ADMISSION_WAKERS as u64 + 1) * WAKE_DATAGRAM_BYTES as u64;
+    let refill = Duration::from_secs_f64(queued as f64 / rate_bytes_per_sec.max(1) as f64);
+    DEBT_LIMIT + refill
+}
+
 /// How long a hold stays valid with no new hold event, for a cap of
-/// `rate_bytes_per_sec`: [`CAP_HOLD_VALIDITY_MARGIN`] times the longest the
-/// cap makes one waiting transmit wait before its poller is polled again.
-/// That is the cap's debt limit (unpaced sends may run the bucket that far
-/// into debt) plus one datagram's refill for every waiter that can be queued
-/// ahead of it (`MAX_ADMISSION_WAKERS`) and for its own. A held poller of a
-/// live connection is polled again within that, at its timer; one that is
-/// not was left behind by a connection that ended.
+/// `rate_bytes_per_sec`: [`CAP_HOLD_VALIDITY_MARGIN`] times
+/// [`cap_transmit_wait`], the longest the cap makes one waiting transmit wait
+/// before its poller is polled again. A held poller of a live connection is
+/// polled again within that, at its timer; one that is not was left behind by
+/// a connection that ended.
 ///
 /// The tail is long at low rates: about 4 min at 10 KB/s, 27 s at
 /// 100 KB/s, under 5 s at 1 MB/s. For that long a left-behind hold still
@@ -118,10 +137,7 @@ pub(crate) const CAP_HOLD_VALIDITY_MARGIN: u32 = 2;
 /// `connection_handler` already requires a QUIC endpoint to share the cap's
 /// clock before it uses the cap.
 pub(crate) fn cap_hold_validity(rate_bytes_per_sec: u64) -> Duration {
-    use crate::transport::egress_cap::{DEBT_LIMIT, MAX_ADMISSION_WAKERS, WAKE_DATAGRAM_BYTES};
-    let queued = (MAX_ADMISSION_WAKERS as u64 + 1) * WAKE_DATAGRAM_BYTES as u64;
-    let refill = Duration::from_secs_f64(queued as f64 / rate_bytes_per_sec.max(1) as f64);
-    (DEBT_LIMIT + refill).saturating_mul(CAP_HOLD_VALIDITY_MARGIN)
+    cap_transmit_wait(rate_bytes_per_sec).saturating_mul(CAP_HOLD_VALIDITY_MARGIN)
 }
 
 impl CapHolds {
@@ -130,6 +146,7 @@ impl CapHolds {
     pub(crate) fn new(cap_rate: Option<u64>) -> Self {
         Self {
             validity: cap_rate.map(cap_hold_validity).unwrap_or_default(),
+            longest_wait: cap_rate.map(cap_transmit_wait).unwrap_or_default(),
             ..Self::default()
         }
     }
@@ -138,6 +155,7 @@ impl CapHolds {
     pub(crate) fn like(&self) -> Self {
         Self {
             validity: self.validity,
+            longest_wait: self.longest_wait,
             ..Self::default()
         }
     }
@@ -181,6 +199,7 @@ impl CapHolds {
             holds,
             held_now: self.held_now.load(Ordering::Acquire) > 0,
             validity: self.validity,
+            longest_wait: self.longest_wait,
         }
     }
 }

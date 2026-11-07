@@ -33,7 +33,7 @@ use std::time::Duration;
 use super::super::recycle::{AckProgress, cap_held};
 use super::super::socket::{CapHoldReading, CapHolds};
 use super::QuicSendError;
-use super::route::STALL_PROGRESS_WINDOW;
+use super::route::{STALL_PROGRESS_WINDOW, hold_credit};
 use crate::simulation::TimeSource;
 use crate::transport::peer_connection::streaming::STREAM_INACTIVITY_TIMEOUT;
 use crate::transport::peer_connection::{fits_one_packet, inbound_stream_age_limit};
@@ -365,6 +365,9 @@ struct ConnectionWatch {
     started: u64,
     /// The wake that last saw the connection move; `None` before the first.
     moved_at: Option<u64>,
+    /// The wake that last saw the acknowledged count move; `None` before the
+    /// first. A cap hold is progress only within `route::hold_credit` of it.
+    acked_at: Option<u64>,
     /// A reading saw a hold live ([`QuietProof::live_hold_seen`]).
     live_hold_seen: bool,
 }
@@ -378,6 +381,7 @@ impl ConnectionWatch {
             hold_unchanged_since: None,
             started: now,
             moved_at: None,
+            acked_at: None,
             live_hold_seen: cap.held_now,
             source,
         }
@@ -400,7 +404,18 @@ impl ConnectionWatch {
         let held = cap_held(&mut self.hold_unchanged_since, now, &cap, &self.cap);
         self.cap = cap;
         self.live_hold_seen |= cap.held_now;
-        if acked != self.acked || held {
+        let acknowledged = acked != self.acked;
+        if acknowledged {
+            self.acked_at = Some(now);
+        }
+        // A held transmit on a connection nothing has acknowledged for the
+        // window is no evidence the path is alive: a dark connection's own
+        // probes wait for a saturated cap too.
+        let held = held
+            && self
+                .acked_at
+                .is_some_and(|at| now.saturating_sub(at) <= nanos(hold_credit(&cap)));
+        if acknowledged || held {
             self.acked = acked;
             self.moved_at = Some(now);
         }

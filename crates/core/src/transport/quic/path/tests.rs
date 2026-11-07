@@ -3522,6 +3522,7 @@ async fn stuck_send(
     clock: VirtualTime,
     ack_until: u64,
     hold: bool,
+    first_ack: bool,
     total: Duration,
 ) -> (BoundedSend, Duration) {
     let acks = recycle::AckProgress::detached();
@@ -3539,10 +3540,13 @@ async fn stuck_send(
     let start = clock.now();
     let ticking = clock.clone();
     let peer = async move {
-        for _ in 0..ack_until {
+        for second in 0..ack_until {
             ticking.sleep(Duration::from_secs(1)).await;
             if hold {
                 cap.hold_one();
+                if first_ack && second == 0 {
+                    acks.ack();
+                }
             } else {
                 acks.ack();
             }
@@ -3571,7 +3575,7 @@ fn the_gap_runs_on_while_the_connection_is_acknowledged() {
         let time = VirtualTime::new();
         let clock = time.clone();
         let (sent, after) = drive(&time, LIMIT, async move {
-            stuck_send(clock, 30, false, Duration::from_secs(120)).await
+            stuck_send(clock, 30, false, false, Duration::from_secs(120)).await
         })
         .await;
         assert!(
@@ -3591,7 +3595,7 @@ fn the_gap_runs_out_on_its_own_when_nothing_is_acknowledged() {
         let time = VirtualTime::new();
         let clock = time.clone();
         let (sent, after) = drive(&time, LIMIT, async move {
-            stuck_send(clock, 0, false, Duration::from_secs(120)).await
+            stuck_send(clock, 0, false, false, Duration::from_secs(120)).await
         })
         .await;
         assert!(
@@ -3602,22 +3606,47 @@ fn the_gap_runs_out_on_its_own_when_nothing_is_acknowledged() {
     })
 }
 
-/// An egress cap holding the node's QUIC transmits counts as the connection
-/// moving, as for the stall count: nothing can be acknowledged meanwhile.
+/// An egress cap holding this connection's transmits counts as the connection
+/// moving, as for the stall count, but only within `STALL_PROGRESS_WINDOW` of
+/// the connection's last acknowledgement: a held transmit on a connection
+/// nothing has acknowledged for the window is no evidence that it is alive
+/// (#6128 CI: a dark connection's own probes, held by a saturated cap, kept its
+/// send going). One acknowledgement at 1 s, then a hold every second to 30 s:
+/// the 2 s wake sees the acknowledgement, the 12 s wake counts the holds (10 s
+/// after it), the 22 s wake does not, and the send ends at 22 s.
 #[test]
 fn a_cap_hold_counts_as_the_connection_moving() {
     bounded(|| async move {
         let time = VirtualTime::new();
         let clock = time.clone();
         let (sent, after) = drive(&time, LIMIT, async move {
-            stuck_send(clock, 30, true, Duration::from_secs(120)).await
+            stuck_send(clock, 30, true, true, Duration::from_secs(120)).await
         })
         .await;
         assert!(
             matches!(sent, BoundedSend::Failed(SendFailure::TimedOut)),
             "{sent:?}"
         );
-        assert_eq!(after, Duration::from_secs(42));
+        assert_eq!(after, Duration::from_secs(22));
+    })
+}
+
+/// Holds with no acknowledgement during the send count for nothing: the send
+/// fails at its own gap, as on a path gone dark whose probes the cap holds.
+#[test]
+fn a_cap_hold_without_an_acknowledgement_is_not_progress() {
+    bounded(|| async move {
+        let time = VirtualTime::new();
+        let clock = time.clone();
+        let (sent, after) = drive(&time, LIMIT, async move {
+            stuck_send(clock, 30, true, false, Duration::from_secs(120)).await
+        })
+        .await;
+        assert!(
+            matches!(sent, BoundedSend::Failed(SendFailure::TimedOut)),
+            "{sent:?}"
+        );
+        assert_eq!(after, Duration::from_secs(5));
     })
 }
 
@@ -3773,7 +3802,9 @@ fn a_quiet_proof_says_whether_its_send_saw_a_live_hold() {
 /// A hold that starts during the send and is read live by a wake sets the
 /// proof's `live_hold_seen`, even though the proof's hold count then matches
 /// (the wake read the new count) and the hold is released before the settle.
-/// Starts at 3 s, the 5 s wake reads it, released at 6 s, timeout at 15 s.
+/// Starts at 3 s and the 5 s wake reads it; with nothing acknowledged during
+/// the send the hold extends nothing, so that wake also ends the send at its
+/// own gap, and the proof covers the whole send (`since` 0).
 #[test]
 fn a_hold_read_live_by_a_wake_voids_the_proof() {
     bounded(|| async move {
@@ -3820,8 +3851,12 @@ fn a_hold_read_live_by_a_wake_voids_the_proof() {
             matches!(sent, BoundedSend::Failed(SendFailure::TimedOut)),
             "{sent:?}"
         );
-        assert_eq!(after, Duration::from_secs(15), "the 5 s wake saw the hold");
-        assert_eq!((proof.holds, proof.since), (1, 5_000_000_000));
+        assert_eq!(
+            after,
+            Duration::from_secs(5),
+            "its own gap: no ack, so the hold is no progress"
+        );
+        assert_eq!((proof.holds, proof.since), (1, 0));
         assert!(proof.live_hold_seen, "the 5 s wake read the hold live");
     })
 }
@@ -3874,7 +3909,7 @@ fn total_ends_a_send_on_a_connection_that_keeps_moving() {
         let time = VirtualTime::new();
         let clock = time.clone();
         let (sent, after) = drive(&time, LIMIT, async move {
-            stuck_send(clock, 1000, false, Duration::from_secs(60)).await
+            stuck_send(clock, 1000, false, false, Duration::from_secs(60)).await
         })
         .await;
         assert!(
@@ -4235,6 +4270,52 @@ fn a_write_held_by_a_silent_peer_fails_at_the_gap() {
     })
 }
 
+/// A live, busy path on a node whose total cap binds (100 kB/s, where one held
+/// transmit can wait about 13.3 s, past the 10 s window), its peer reading and
+/// acknowledging: send timeouts settled on it every 2 s, while a bulk stream
+/// keeps the cap holding its transmits, neither stall-close it nor make it
+/// suspect.
+#[test]
+fn a_live_path_under_a_binding_cap_is_not_stall_closed() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths_capped("quic-path-live-capped", 82, 100_000).await;
+        let (a, time) = (p.a.clone(), p.time());
+        let holds = a.connection().cap_holds();
+        let (held, suspect) = p
+            .drive(async move {
+                let busy = a.clone();
+                let bulk = tokio::spawn(async move {
+                    busy.send_stream(StreamId::next(), None, payload(4 * MIB).into())
+                        .await
+                        .ok();
+                });
+                let before = holds.read().holds;
+                let mut suspect = false;
+                for _ in 0..20 {
+                    time.sleep(Duration::from_secs(2)).await;
+                    a.settle(
+                        SendKind::Stream,
+                        &BoundedSend::Failed(SendFailure::TimedOut),
+                        false,
+                        time.now_nanos(),
+                    );
+                    suspect |= a.is_suspect();
+                }
+                bulk.abort();
+                (holds.read().holds - before, suspect)
+            })
+            .await;
+        assert!(held > 0, "premise: the cap held the path's transmits");
+        assert!(!suspect, "a live path is never suspect");
+        assert!(p.a.connection().inner().close_reason().is_none());
+        assert_eq!(
+            p.a.stats().send_event_count(QuicSendEvent::StalledClosed),
+            0
+        );
+    })
+}
+
 /// A path that goes dark mid-send, here once three quarters of the stream have
 /// been handed to quinn (past the first send window's worth, so writes have
 /// already waited for acknowledgements): the send's own earlier
@@ -4441,11 +4522,15 @@ impl crate::transport::boundary::StreamProgressObserver for SilenceAfter {
     }
 }
 
-/// Egress cap holds count per connection (#6128 review): on a capped node
-/// whose cap a busy connection keeps saturated, a send on another connection
-/// to a peer that has gone dark still runs out of gap and its path goes
-/// suspect. With one node-wide record, the busy connection's holds read as
-/// the dark connection moving and the send ran to `total` (300 s).
+/// Egress cap holds count per connection (#6128 review), and a hold extends a
+/// send only within the window of an acknowledgement seen during it (#6128
+/// CI): on a capped node whose cap a busy connection keeps saturated, a send
+/// on another connection to a peer that has gone dark ends at its own 5 s gap,
+/// however its own probes are held, and a later send on that path, one hold
+/// credit (`route::hold_credit`) after the first, makes the path suspect. With one node-wide record, the
+/// busy connection's holds read as the dark connection moving and the send ran
+/// to `total` (300 s); with holds counted without an acknowledgement, its own
+/// held probes kept it going (32 s on CI).
 #[test]
 fn a_dark_path_beside_a_cap_held_one_times_out_and_goes_suspect() {
     bounded(|| async move {
@@ -4483,54 +4568,77 @@ fn a_dark_path_beside_a_cap_held_one_times_out_and_goes_suspect() {
         let ab = p.a.clone();
         let ab_holds = ab.connection().cap_holds();
         let ac_holds = ac.connection().cap_holds();
+        let dark_holds = ac_holds.clone();
         let busy = ab.clone();
         let sender = ac.clone();
-        let (outcome, took, held_beside) = p
+        let gap = Duration::from_secs(5);
+        let (first, second, held_beside) = p
             .drive(async move {
-                // Keep the cap saturated from the a-b connection.
+                // Keep the cap saturated from the a-b connection throughout.
                 let bulk = tokio::spawn(async move {
                     // Aborted before it ends; its outcome does not matter.
-                    busy.send_stream(StreamId::next(), None, payload(2 * MIB).into())
+                    busy.send_stream(StreamId::next(), None, payload(4 * MIB).into())
                         .await
                         .ok();
                 });
                 time.sleep(Duration::from_secs(2)).await;
                 let before = ab_holds.read().holds;
                 let _silenced = DropFrom::new(network, &[c_addr]);
-                let start = time.now();
-                let body = over_window();
-                let outcome = sender
-                    .send_stream_bounded(
-                        &time,
-                        SendDeadlines::stream(body.len() as u64),
-                        StreamId::next(),
-                        None,
-                        body,
-                        None,
-                    )
+                let send = || async {
+                    let start = time.now();
+                    let body = over_window();
+                    let outcome = sender
+                        .send_stream_bounded(
+                            &time,
+                            SendDeadlines::stream(body.len() as u64),
+                            StreamId::next(),
+                            None,
+                            body,
+                            None,
+                        )
+                        .await;
+                    let took = time.now() - start;
+                    sender.settle(SendKind::Stream, &outcome, false, time.now_nanos());
+                    (outcome, took, sender.is_suspect())
+                };
+                let first = send().await;
+                // A send one hold credit after the first settle (the window, or
+                // the longest one transmit can wait at this cap: about 13.3 s at
+                // 100 kB/s): its timeout comes that and a gap later, with nothing
+                // acknowledged, so the dark connection's own held probes no
+                // longer count and the timeout does.
+                time.sleep(super::route::hold_credit(&dark_holds.read()))
                     .await;
-                let took = time.now() - start;
+                let second = send().await;
                 let held_beside = ab_holds.read().holds - before;
                 bulk.abort();
-                (outcome, took, held_beside)
+                (first, second, held_beside)
             })
             .await;
         assert!(
             held_beside > 0,
             "the cap held the busy connection meanwhile"
         );
+        for (outcome, took, _) in [&first, &second] {
+            assert!(
+                matches!(outcome, BoundedSend::Failed(SendFailure::TimedOut)),
+                "{outcome:?}"
+            );
+            // Its own gap: no acknowledgement during the send, so the
+            // connection's own held probes extend nothing.
+            assert_eq!(
+                *took,
+                gap,
+                "the dark connection's own holds were {:?}",
+                ac_holds.read()
+            );
+        }
         assert!(
-            matches!(outcome, BoundedSend::Failed(SendFailure::TimedOut)),
-            "{outcome:?}"
+            second.2,
+            "suspect once a hold credit and a gap have passed with nothing \
+             acknowledged (first timeout suspect: {})",
+            first.2
         );
-        let window = super::route::STALL_PROGRESS_WINDOW.as_secs();
-        assert!(
-            took.as_secs() <= 5 + 2 * window,
-            "took {took:?}; the dark connection's own holds were {:?}",
-            ac_holds.read()
-        );
-        ac.settle(SendKind::Stream, &outcome, false, p.time().now_nanos());
-        assert!(ac.is_suspect(), "the first timeout makes the path suspect");
         assert_eq!(
             super::super::socket::FALLBACK_POLLERS.load(std::sync::atomic::Ordering::Relaxed),
             0,

@@ -171,6 +171,20 @@ fn timed_out(outcome: &BoundedSend) -> bool {
 /// timeout counts against it: the acknowledgement watch's window.
 pub(crate) const STALL_PROGRESS_WINDOW: Duration = ACK_WATCH_WINDOW;
 
+/// How long after a connection's last acknowledgement an egress cap hold of
+/// its transmits still counts as progress: the window, or the longest one
+/// transmit can wait at this cap ([`socket::cap_transmit_wait`]), whichever is
+/// longer. A live path whose transmits the cap holds is acknowledged again
+/// within that; a held transmit on a connection nothing has acknowledged for
+/// longer is no evidence it is alive (a dark connection's own probes wait for a
+/// saturated cap too, #6128 CI). 10 s (the window) at 1 MB/s, about 13.3 s at
+/// 100 kB/s, about 19.8 s at 64 KiB/s, longer at lower caps.
+///
+/// [`socket::cap_transmit_wait`]: super::super::socket::cap_transmit_wait
+pub(crate) fn hold_credit(cap: &CapHoldReading) -> Duration {
+    STALL_PROGRESS_WINDOW.max(cap.longest_wait)
+}
+
 /// What [`StallCount::take`] decided.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct StallVerdict {
@@ -208,10 +222,13 @@ pub(crate) struct StallVerdict {
 /// acknowledged reads as a stalled path.
 ///
 /// An egress cap hold of this connection's transmit counts as progress, as it
-/// does for the acknowledgement watch (`recycle::cap_held`): while
-/// `total-bandwidth-limit` holds them nothing can be acknowledged, one held
-/// transmit can wait for longer than the window at a low cap, and the path
-/// itself is not stalled. The record is the connection's own
+/// does for the acknowledgement watch (`recycle::cap_held`), while
+/// `total-bandwidth-limit` holds them nothing can be acknowledged; but only
+/// for [`hold_credit`] after the connection's last acknowledgement (the window,
+/// or the longest one transmit can wait at the cap if that is longer). A held
+/// transmit on a connection nothing has acknowledged for longer is no evidence
+/// it is alive: a dark connection's own probes wait for a saturated cap too
+/// (#6128 CI). The record is the connection's own
 /// (`socket::with_poller_holds`): a node-wide one would read as progress on
 /// every path whenever any connection is held, and on a node whose cap binds
 /// this count would never fire.
@@ -227,6 +244,9 @@ pub(crate) struct StallCount {
     /// When the count last moved, or the cap last held a transmit, on the
     /// path's clock.
     progressed_at: u64,
+    /// When the count last moved (or the path was built), on the path's clock.
+    /// A cap hold is progress only within [`hold_credit`] of it.
+    acked_at: u64,
     /// The cap's holds at the last settle, and since when a hold has been
     /// reported with no new hold event (`recycle::cap_held`).
     cap: Option<CapHoldReading>,
@@ -241,6 +261,7 @@ impl StallCount {
             in_a_row: 0,
             acked,
             progressed_at: now_nanos,
+            acked_at: now_nanos,
             cap: None,
             hold_unchanged_since: None,
         }
@@ -269,7 +290,14 @@ impl StallCount {
         let acknowledged = acked.is_some_and(|acked| self.acked != Some(acked));
         if acknowledged {
             self.acked = acked;
+            self.acked_at = now_nanos;
         }
+        let window = u64::try_from(STALL_PROGRESS_WINDOW.as_nanos()).unwrap_or(u64::MAX);
+        // A held transmit on a connection nothing has acknowledged for the
+        // window is no evidence the path is alive: a dark connection's own
+        // probes wait for a saturated cap too.
+        let credit = u64::try_from(hold_credit(&cap).as_nanos()).unwrap_or(u64::MAX);
+        let held = held && now_nanos.saturating_sub(self.acked_at) <= credit;
         if acknowledged || held {
             self.progressed_at = now_nanos;
             self.in_a_row = 0;
@@ -290,7 +318,6 @@ impl StallCount {
             self.in_a_row = 0;
             return StallVerdict::default();
         }
-        let window = u64::try_from(STALL_PROGRESS_WINDOW.as_nanos()).unwrap_or(u64::MAX);
         let quiet = acked.is_none() || now_nanos.saturating_sub(self.progressed_at) >= window;
         if !timed_out(outcome) || source_stalled || !quiet {
             return StallVerdict::default();
@@ -314,6 +341,7 @@ impl StallCount {
             holds: 0,
             held_now: false,
             validity: Duration::ZERO,
+            longest_wait: Duration::ZERO,
         };
         self.take(outcome, source_stalled, acked, no_cap, None, now_nanos)
             .close

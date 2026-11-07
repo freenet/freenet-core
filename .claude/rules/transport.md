@@ -1671,9 +1671,16 @@ Sending (QuicPath::send_short_bounded / send_stream_bounded /
   first chunk for the gap, counted in total, and open runs from when it arrives.
   The gap is judged on CONNECTION progress (bounded::ConnectionWatch): a node
   send runs out of gap only once its own gap has passed AND nothing on the
-  connection was newly acknowledged (recycle::AckProgress) or had a transmit
-  held by the egress cap (recycle::cap_held, this connection's record) for
-  STALL_PROGRESS_WINDOW (10 s), the stall count's rule. Under random loss the 384 KiB send window drains at Cubic's window per
+  connection was newly acknowledged (recycle::AckProgress) for
+  STALL_PROGRESS_WINDOW (10 s), the stall count's rule. An egress cap hold of
+  this connection's transmit (recycle::cap_held, its own record) also counts,
+  but only within route::hold_credit of an acknowledgement seen during the
+  send: the window, or socket::cap_transmit_wait (the longest one transmit can
+  wait at the cap, the derivation cap_hold_validity also uses) if longer. That
+  is 10 s at 1 MB/s, about 13.3 s at 100 kB/s, about 19.8 s at 64 KiB/s. A
+  send that has seen no acknowledgement gets nothing from holds: a dark
+  connection's own probes wait for a saturated cap too, and on #6128's CI they
+  kept a dark send going for 32 s. Under random loss the 384 KiB send window drains at Cubic's window per
   round trip, so writes wait past 5 s while acks still arrive; failing them
   reset streams the peer was receiving (E5B9-LAB, 8 MiB at 5% loss and 200 ms
   failed). The connection is read at the timer's wakes, so a send that stops
@@ -1965,8 +1972,22 @@ QUIC send route (#5940 e5b-6, quic/upgrade/data_route.rs,
   gap: a consumer stalled past the window while nothing else on the path is
   acknowledged reads as a stalled path. An egress cap hold of THIS connection's
   transmit counts as progress, by the ack watch's rule (recycle::cap_held,
-  shared): while total-bandwidth-limit holds them nothing can be acknowledged,
-  and at a low cap one held transmit waits longer than the window. A send that
+  shared), while total-bandwidth-limit holds them nothing can be acknowledged;
+  but only for route::hold_credit after the connection's last acknowledgement
+  (as seen at a settle): the window, or the longest one transmit can wait at
+  the cap if that is longer (10 s at 1 MB/s, about 13.3 s at 100 kB/s, about
+  19.8 s at 64 KiB/s). A live path whose transmit the cap holds is acknowledged
+  again within that, so it is not stall-closed (pinned at 50 B/s and at
+  100 kB/s); a dark connection whose own probes the cap holds stops counting
+  them after it. total-bandwidth-limit has no floor (MIN_BANDWIDTH_LIMIT only
+  floors the per-connection bandwidth-limit), so the credit grows without bound
+  as the cap falls. The real bound on a busy capped node: a path gone dark goes
+  suspect at a send timeout at least hold_credit after the last acknowledgement
+  a settle saw, so one credit plus one gap; until then new streams that time
+  out after opening are dropped (as before), a short that times out before its
+  end is written goes to UDP, and a one-packet short (written whole at once)
+  ends MaybeDelivered and is not resent, so on a dark path it can be lost in
+  that time, as before suspect existed. A send that
   ran out of its gap leaves a QuietProof (the acked count and hold count, and
   since when they stood still); while the counts still match, the stall count
   dates the progress it sees from then, so the first timeout after a path goes
