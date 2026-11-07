@@ -24,7 +24,7 @@
 //! | `quic_loss_rate_<bucket>` | live paths that have sent at least 200 packets since they started, by their own lost/sent over that time (a gauge, not reset, every bucket sent every period, 0 included): `zero`, `lt_0_5pct`, `lt_1pct`, `lt_2pct`, `lt_5pct`, `lt_10pct`, `lt_20pct`, `ge_20pct` |
 //! | `quic_ended_loss_rate_<bucket>` | paths that ended in the period, by the bucket they were in at the end (same buckets) |
 //! | `quic_ended_paths_below_floor` | paths that ended in the period before sending 200 packets, so in no bucket |
-//! | `quic_carried_packets_sent`, `quic_carried_packets_lost` | the period's packets sent, and declared lost, while their path carried data (a subset of `quic_sent_packets` and `quic_lost_packets`; the shadow share is the difference, both from one recording under one lock) |
+//! | `quic_carried_packets_sent`, `quic_carried_packets_lost` | the period's packets sent, and declared lost, while their path carried data (a subset of `quic_sent_packets` and `quic_lost_packets`; the shadow share is the difference, a reconciliation residual: both operands are recorded by `record_path_loss` under the one `loss` lock, the exception the bug-prevention rule "metric describing a filtering decision, re-derived at the call site" allows, as for `broadcast_payload_mix`) |
 //! | `quic_carrying_loss_rate_<bucket>`, `quic_carrying_ended_loss_rate_<bucket>`, `quic_carried_paths_ended_below_floor` | the same three as for every path, for paths that carry data, by their loss counted from the first report that found the path carrying (a path whose data bit came on after it started starts its carrying count then); every gauge bucket sent every period |
 //! | `quic_streams_sampled_paths`, `quic_streams_open_ge_<n>`, `quic_streams_peak_max` | per path and period, the peak of inbound streams read at once: the paths sampled, those whose peak reached each level, and the highest peak |
 //!
@@ -371,7 +371,10 @@ impl QuicDataCounters {
     /// so starts at the first report that finds the path carrying, however long
     /// after the path started; a path that stops carrying (the peer refused
     /// data) keeps its carrying bucket until it ends. The sums and the bucket
-    /// moves are written under the one lock ([`LossCounts`]).
+    /// moves are written under the one lock ([`LossCounts`]), the total and the
+    /// carrying subset in the same call, so the shadow share (total minus
+    /// carrying) is a reconciliation residual of two values one recording
+    /// produced, not a count re-derived from things another filter touched.
     pub(crate) fn record_path_loss(
         &self,
         window: &mut PathLossWindow,
@@ -1242,6 +1245,44 @@ mod tests {
         let snap = counters.snapshot(true);
         assert_eq!(snap.carrying_ended_below_floor, 1);
         assert_eq!(snap.ended_below_floor, 1);
+    }
+
+    /// A path that never carries data adds nothing to any carrying count, live
+    /// or ended, however lossy it is; one whose bit comes on mid-life adds only
+    /// what it sends from then (its carrying window starts at the flip).
+    #[test]
+    fn a_path_that_never_carries_adds_nothing_to_carrying() {
+        let counters: &'static QuicDataCounters = Box::leak(Box::new(QuicDataCounters::new()));
+        let mut shadow = PathLossWindow::new(counters);
+        counters.record_path_loss(&mut shadow, loss(400, 100), false);
+        counters.record_path_loss(&mut shadow, loss(400, 100), false);
+        drop(shadow);
+        let snap = counters.snapshot(true);
+        assert_eq!(snap.sent_packets, 800);
+        assert_eq!(
+            (snap.carrying_sent_packets, snap.carrying_lost_packets),
+            (0, 0)
+        );
+        assert_eq!(snap.carrying_loss_rate.iter().sum::<u32>(), 0);
+        assert_eq!(snap.carrying_ended_loss_rate.iter().sum::<u64>(), 0);
+        assert_eq!(snap.carrying_ended_below_floor, 0);
+        assert_eq!(snap.ended_loss_rate.iter().sum::<u64>(), 1, "it ended");
+
+        let mut flips = PathLossWindow::new(counters);
+        counters.record_path_loss(&mut flips, loss(400, 100), false);
+        counters.record_path_loss(&mut flips, loss(250, 0), true);
+        let snap = counters.snapshot(true);
+        assert_eq!(
+            (snap.carrying_sent_packets, snap.carrying_lost_packets),
+            (250, 0),
+            "only what it sent after the flip"
+        );
+        assert_eq!(
+            snap.carrying_loss_rate,
+            vec![1, 0, 0, 0, 0, 0, 0, 0],
+            "0 of 250 since the flip, not 100 of 650"
+        );
+        drop(flips);
     }
 
     /// The carrying gauges are uploaded at 0 like the all-paths ones, and the

@@ -1335,8 +1335,10 @@ a test passes its own; tests read their own, never the global).
   it ends): quic_carrying_loss_rate_<bucket> (gauge, uploaded at 0),
   quic_carrying_ended_loss_rate_<bucket> and quic_carried_paths_ended_below_floor,
   with quic_carried_packets_sent / _lost the subset of the period's sums sent
-  while carrying (shadow = total minus carried: both from one recording under one
-  lock). The single keys are not under quic_carrying_, which the two carrying
+  while carrying. Shadow = total minus carried is a reconciliation residual:
+  both are recorded in one record_path_loss call under the one loss lock, the
+  exception the bug-prevention rule on a metric re-derived at the call site
+  allows (as for broadcast_payload_mix). The single keys are not under quic_carrying_, which the two carrying
   families share. Packets in flight at close are dropped by quinn, not declared
   lost, so a final bucket can understate the loss at the end. The rate is quinn's lost over
   sent (quinn-proto 0.11.19), not a measurement of the link: sent counts every
