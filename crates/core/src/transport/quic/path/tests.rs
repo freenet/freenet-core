@@ -4499,7 +4499,8 @@ fn a_live_path_under_a_binding_cap_is_not_stall_closed() {
 /// send whose writes the cap queue holds for 8 s, past its 5 s gap, with the
 /// peer silenced so nothing more is acknowledged, starts from that record and
 /// is `Sent`. A send handed a fresh record, or a settle that wrote none, would
-/// time out at 5 s.
+/// time out at 5 s. The short goes a credit after the path is built, so only
+/// the settle's record can credit the holds.
 #[test]
 fn a_real_path_carries_its_last_acknowledgement_to_the_next_send() {
     bounded(|| async move {
@@ -4509,8 +4510,12 @@ fn a_real_path_carries_its_last_acknowledgement_to_the_next_send() {
         let b_addr = p.pair.b_addr;
         let (a, time) = (p.a.clone(), p.time());
         let holds = a.connection().cap_holds();
+        let credit = super::route::hold_credit(&holds.read());
         let sent = p
             .drive(async move {
+                // Past one credit after the build, so the record's starting
+                // value (the build time) no longer credits a hold.
+                time.sleep(credit + Duration::from_secs(2)).await;
                 a.send_short(b"live").await.expect("acknowledged");
                 a.settle(SendKind::Short, &BoundedSend::Sent, false, time.now_nanos());
                 let _silenced = DropFrom::new(network, &[b_addr]);
