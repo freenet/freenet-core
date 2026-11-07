@@ -1967,7 +1967,7 @@ impl Report {
         }
         writeln!(
             out,
-            "merge check: {} case(s) run \u{2014} {} held, {} violation(s) ({} merge-law break(s), {} of them removal-eligible; {} diagnostic-only), {} inconclusive",
+            "merge check: {} case(s) run \u{2014} {} held, {} violation(s) ({} merge-law break(s), {} of them serious; {} diagnostic-only), {} inconclusive",
             self.cases_run,
             self.holds,
             self.violations,
@@ -2056,10 +2056,10 @@ impl Report {
                     format!("{count} cases")
                 };
                 // The tier on each violation line, so the summary's "M of them
-                // removal-eligible" can be traced to the findings it counts. A
+                // serious" can be traced to the findings it counts. A
                 // diagnostic is always report-only and says so by its severity.
                 let label = match (f.severity, f.tier) {
-                    ("violation", "removal_eligible") => "violation, removal-eligible",
+                    ("violation", "removal_eligible") => "violation, serious",
                     ("violation", _) => "violation, report-only",
                     (severity, _) => severity,
                 };
@@ -4304,7 +4304,7 @@ mod tests {
                 .to_string()
         };
         assert!(
-            line("state_commutativity").contains("[violation, removal-eligible]"),
+            line("state_commutativity").contains("[violation, serious]"),
             "{rendered}"
         );
         assert!(
@@ -4349,7 +4349,7 @@ mod tests {
         // And the line and the JSON say the same thing as the counts.
         assert_eq!(report.findings[0].severity, "violation");
         assert!(
-            render_human(&report).contains("[violation, removal-eligible] state_commutativity"),
+            render_human(&report).contains("[violation, serious] state_commutativity"),
             "{}",
             render_human(&report)
         );
