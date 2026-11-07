@@ -2589,6 +2589,122 @@ fn seeded_loss(network: &str, percent: u64) -> Arc<LossCount> {
     count
 }
 
+/// A path's watch reports its last counts when it ends, here dropped because
+/// the receive task ended with the connection, so the node's packet sums end at
+/// quinn's final counts. The short
+/// is sent and the path closed between two ticks (2 s and 4 s), so without that
+/// last report what they sent is missing.
+#[test]
+fn a_closed_path_reports_its_last_tick() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let counters: &'static crate::transport::metrics::QuicDataCounters =
+            Box::leak(Box::new(crate::transport::metrics::QuicDataCounters::new()));
+        let limits = QuicPathLimits {
+            counters: Some(counters),
+            ..QuicPathLimits::DEFAULT
+        };
+        let p = paths("quic-path-last-tick", 75, limits).await;
+        let (a, b, time) = (p.a.clone(), p.b.clone(), p.time());
+        let totals = |a: &QuicPath, b: &QuicPath| {
+            let (a, b) = (
+                a.connection().inner().stats(),
+                b.connection().inner().stats(),
+            );
+            (
+                a.path.sent_packets + b.path.sent_packets,
+                a.udp_tx.bytes + b.udp_tx.bytes,
+            )
+        };
+        // The watches count from when the paths were built, before the drive.
+        let before = totals(&a, &b);
+        let (at_short, after) = p
+            .drive(async move {
+                time.sleep(Duration::from_millis(2500)).await;
+                a.send_short(&[7u8; 600]).await.expect("sent");
+                let at_short = totals(&a, &b);
+                a.connection().close(QuicCloseCode::Downgrade);
+                time.sleep(Duration::from_secs(5)).await;
+                (at_short, totals(&a, &b))
+            })
+            .await;
+        let snap = counters.snapshot(false);
+        // Every packet up to the short, which went after the 2 s tick, is in
+        // the report. A close quinn sends again after a watch has ended is in
+        // quinn's counts and in no report, so the report can be below them.
+        let (up_to_short, sent) = (at_short.0 - before.0, after.0 - before.0);
+        assert!(
+            snap.sent_packets >= up_to_short && snap.sent_packets <= sent,
+            "{} reported, {up_to_short} up to the short, {sent} in all",
+            snap.sent_packets
+        );
+        let (up_to_short, udp_sent) = (at_short.1 - before.1, after.1 - before.1);
+        assert!(
+            snap.bytes_sent >= up_to_short && snap.bytes_sent <= udp_sent,
+            "{} reported, {up_to_short} up to the short, {udp_sent} in all",
+            snap.bytes_sent
+        );
+        // Both paths ended, each counted once, here below the floor.
+        let ended = snap.ended_loss_rate.iter().sum::<u64>() + snap.ended_below_floor;
+        assert_eq!(ended, 2);
+        assert_eq!(snap.loss_rate.iter().sum::<u32>(), 0);
+    })
+}
+
+/// A panic in the acknowledgement watch, which the receive supervisor
+/// contains while the path stays up, leaves the path in its live loss-rate
+/// bucket; it is counted as ended only when the path really ends.
+#[test]
+fn a_watch_panic_does_not_end_the_path_in_the_loss_counts() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let counters: &'static crate::transport::metrics::QuicDataCounters =
+            Box::leak(Box::new(crate::transport::metrics::QuicDataCounters::new()));
+        let limits = QuicPathLimits {
+            counters: Some(counters),
+            panic_in_watch: true,
+            ..QuicPathLimits::DEFAULT
+        };
+        // Only `b` panics: `paths` gives `a` the default limits.
+        let p = paths("quic-path-watch-panic", 78, limits).await;
+        let panics = recycle::TEST_WATCH_PANICS.load(std::sync::atomic::Ordering::Relaxed);
+        // `b` sends, so its own packet count passes the floor.
+        let (b, time) = (p.b.clone(), p.time());
+        let (live, ended) = p
+            .drive(async move {
+                b.send_stream(StreamId::next(), None, payload(2 * MIB).into())
+                    .await
+                    .expect("sent");
+                time.sleep(Duration::from_secs(5)).await;
+                let snap = counters.snapshot(false);
+                (
+                    snap.loss_rate.iter().sum::<u32>(),
+                    snap.ended_loss_rate.iter().sum::<u64>() + snap.ended_below_floor,
+                )
+            })
+            .await;
+        assert!(
+            recycle::TEST_WATCH_PANICS.load(std::sync::atomic::Ordering::Relaxed) > panics,
+            "b's watch panicked"
+        );
+        assert!(p.b.connection().inner().close_reason().is_none(), "b is up");
+        // `a` only acknowledged, below the floor; `b` is in a bucket.
+        assert_eq!(live, 1, "b is still in its live bucket");
+        assert_eq!(ended, 0, "nothing ended");
+        let (a, b, time) = (p.a.clone(), p.b.clone(), p.time());
+        p.drive(async move {
+            a.connection().close(QuicCloseCode::Downgrade);
+            time.sleep(Duration::from_secs(5)).await;
+            drop(b);
+        })
+        .await;
+        let snap = counters.snapshot(false);
+        assert_eq!(snap.loss_rate.iter().sum::<u32>(), 0);
+        assert_eq!(snap.ended_loss_rate.iter().sum::<u64>(), 1, "b ended");
+        assert_eq!(snap.ended_below_floor, 1, "a ended");
+    })
+}
+
 /// Sample `paths`' connections every 500 ms until `end` (virtual nanos);
 /// the largest `outstanding_after_acks` seen on either.
 async fn max_outstanding(paths: [Arc<QuicPath>; 2], time: VirtualTime, end: u64) -> u64 {

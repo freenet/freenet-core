@@ -107,8 +107,19 @@ impl Display for ClientId {
 
 pub(crate) type HostIncomingMsg = Result<OpenRequest<'static>, ClientError>;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// A client-API auth token: either the ephemeral token a shell page is minted
+/// with, or a durable native app grant token (#5264).
+///
+/// `Debug` is redacted. Requests carry the token through `tracing` fields as
+/// `?token`, and a durable grant token in a log would be a usable credential.
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AuthToken(#[serde(deserialize_with = "AuthToken::deser_auth_token")] Arc<str>);
+
+impl std::fmt::Debug for AuthToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AuthToken(<redacted>)")
+    }
+}
 
 impl AuthToken {
     pub fn as_str(&self) -> &str {

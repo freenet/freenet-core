@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Freenet - Allow a program to use an app?</title>
+    <style>
+      :root {
+        --bg: #0f1419;
+        --fg: #e6e8eb;
+        --card: #1a2028;
+        --accent: #60a5fa;
+        --border: #2d3748;
+        --muted: #9ca3af;
+      }
+      @media (prefers-color-scheme: light) {
+        :root {
+          --bg: #f5f5f5;
+          --fg: #1a1a1a;
+          --card: #fff;
+          --accent: #2563eb;
+          --border: #d1d5db;
+          --muted: #4b5563;
+        }
+      }
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+      body {
+        font-family:
+          -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        background: var(--bg);
+        color: var(--fg);
+        padding: 24px 16px;
+      }
+      .card {
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 24px;
+        max-width: 560px;
+        margin: 0 auto;
+      }
+      h1 {
+        font-size: 18px;
+        font-weight: 600;
+        margin-bottom: 12px;
+      }
+      p {
+        font-size: 14px;
+        line-height: 1.5;
+        margin-bottom: 12px;
+      }
+      .muted {
+        color: var(--muted);
+      }
+      .app {
+        font-family: monospace;
+        font-size: 13px;
+        word-break: break-all;
+      }
+      .buttons {
+        display: flex;
+        gap: 12px;
+        margin-top: 16px;
+      }
+      button {
+        padding: 8px 16px;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        background: var(--card);
+        color: var(--fg);
+        cursor: pointer;
+        font-size: 14px;
+      }
+      button.allow {
+        background: var(--accent);
+        color: #fff;
+        border-color: var(--accent);
+      }
+      button:disabled {
+        opacity: 0.5;
+        cursor: default;
+      }
+      #result {
+        margin-top: 16px;
+        font-size: 14px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1>Allow a program to use a Freenet app?</h1>
+      <p>
+        A program on this computer wants to use this app with your data, as the
+        app's own page can:
+      </p>
+      <p class="app">Freenet app {{APP}}</p>
+      <p class="muted">{{CLIENT_LINE}}</p>
+      <p>
+        Only allow this if you just started that program and asked it to
+        connect. You can revoke access later on the Apps and permissions page.
+      </p>
+      <div class="buttons" id="buttons">
+        <button type="button" id="deny">Deny</button>
+        <button type="button" class="allow" id="allow" disabled>Allow</button>
+      </div>
+      <div id="result" hidden></div>
+    </div>
+    <div
+      id="req"
+      data-approve-id="{{APPROVE_ID}}"
+      data-nonce="{{NONCE}}"
+      data-allow-delay-ms="{{ALLOW_DELAY_MS}}"
+      hidden
+    ></div>
+    <script nonce="{{SCRIPT_NONCE}}">
+      (function () {
+        var req = document.getElementById('req');
+        var allow = document.getElementById('allow');
+        var deny = document.getElementById('deny');
+        var result = document.getElementById('result');
+        setTimeout(function () {
+          allow.disabled = false;
+        }, Number(req.dataset.allowDelayMs));
+        function answer(yes) {
+          allow.disabled = true;
+          deny.disabled = true;
+          fetch('/v1/app-grants/approve/' + req.dataset.approveId, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ nonce: req.dataset.nonce, allow: yes }),
+          }).then(
+            function (r) {
+              document.getElementById('buttons').hidden = true;
+              result.hidden = false;
+              if (r.ok) {
+                result.textContent = yes
+                  ? 'Allowed. You can close this tab and return to the program.'
+                  : 'Denied. You can close this tab.';
+              } else if (r.status === 409) {
+                result.textContent =
+                  'Freenet already has the most programs allowed to use apps. ' +
+                  'Revoke one on the Apps and permissions page, then reload this page.';
+              } else {
+                result.textContent =
+                  'Freenet could not record your answer (HTTP ' +
+                  r.status +
+                  '). Start again from the program.';
+              }
+            },
+            function () {
+              result.hidden = false;
+              result.textContent = 'Could not reach the Freenet node.';
+            },
+          );
+        }
+        allow.onclick = function () {
+          answer(true);
+        };
+        deny.onclick = function () {
+          answer(false);
+        };
+      })();
+    </script>
+  </body>
+</html>

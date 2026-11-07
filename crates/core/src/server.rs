@@ -306,10 +306,27 @@ pub async fn serve_client_api_for_test(
     serve_client_api_in_impl(config, None).await
 }
 
+/// [`serve_client_api_in_impl`] on a pre-bound listener, returning the concrete
+/// types, for unit tests that drive the real router composition.
+#[cfg(test)]
+pub(crate) async fn serve_client_api_with_listener_for_unit_test(
+    config: WebsocketApiConfig,
+    listener: std::net::TcpListener,
+) -> std::io::Result<(HttpClientApi, WebSocketProxy)> {
+    serve_client_api_in_impl(config, Some(listener)).await
+}
+
 pub(crate) async fn serve_client_api_in(
     config: WebsocketApiConfig,
 ) -> std::io::Result<(HttpClientApi, WebSocketProxy)> {
     serve_client_api_in_impl(config, None).await
+}
+
+pub(crate) async fn serve_client_api_in_with_listener(
+    config: WebsocketApiConfig,
+    listener: std::net::TcpListener,
+) -> std::io::Result<(HttpClientApi, WebSocketProxy)> {
+    serve_client_api_in_impl(config, Some(listener)).await
 }
 
 /// Hostnames and IPs accepted in the HTTP `Host` header for WebSocket connections.
@@ -637,6 +654,12 @@ async fn serve_client_api_in_impl(
     // connection never writes a marker even if a path is present.
     let activity_secrets_dir = ActivitySecretsDir(Arc::new(config.secrets_dir.clone()));
 
+    // Native app grants (#5264): the WebSocket routes need the same state the
+    // HTTP grant routes use, to resolve a grant token on upgrade and to be
+    // closed on revocation. The gw router has it already; this outer layer
+    // covers the WebSocket routes merged on top of it.
+    let ws_router = ws_router.layer(Extension(gw.app_grants()));
+
     let needs_lan_filter = !config.address.is_loopback();
     let router = if needs_lan_filter {
         // Layer ordering matters: axum executes layers bottom-to-top per
@@ -658,7 +681,10 @@ async fn serve_client_api_in_impl(
             .layer(Extension(allowed_hosts))
             .layer(axum::middleware::from_fn(private_network_filter))
             .layer(Extension(allowed_source_cidrs))
-            .layer(TraceLayer::new_for_http())
+            .layer(
+                TraceLayer::new_for_http()
+                    .make_span_with(client_api::app_grants::make_request_span),
+            )
     } else {
         // Loopback binds still inject an (empty) `AllowedSourceCidrs` so
         // `connection_info` always finds the extractor; missing it would
@@ -669,7 +695,10 @@ async fn serve_client_api_in_impl(
             .layer(Extension(activity_secrets_dir))
             .layer(Extension(allowed_hosts))
             .layer(Extension(allowed_source_cidrs))
-            .layer(TraceLayer::new_for_http())
+            .layer(
+                TraceLayer::new_for_http()
+                    .make_span_with(client_api::app_grants::make_request_span),
+            )
     };
 
     serve_dual_stack(ws_socket, router, pre_bound, &mut server_aborts).await?;
