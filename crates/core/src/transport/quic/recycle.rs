@@ -866,6 +866,11 @@ pub(crate) struct PathReport {
     bytes: UdpBytes,
     loss: PathLoss,
     window: crate::transport::metrics::PathLossWindow,
+    /// Whether the path carries data now: the path's own flag for the
+    /// `quic_live_data_paths` gauge, read at each report, so a report's
+    /// packets are counted as carrying by the path's state when it is taken
+    /// (a flip inside a 2 s tick goes to the side it reaches).
+    carrying: Arc<std::sync::atomic::AtomicBool>,
     /// The next report that finds the path in a bucket panics, once
     /// (supervisor test).
     #[cfg(test)]
@@ -876,6 +881,7 @@ impl PathReport {
     pub(crate) fn new(
         connection: quinn::Connection,
         node: &'static crate::transport::metrics::QuicDataCounters,
+        carrying: Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         let stats = connection.stats();
         Self {
@@ -884,6 +890,7 @@ impl PathReport {
             window: crate::transport::metrics::PathLossWindow::new(node),
             connection,
             node,
+            carrying,
             #[cfg(test)]
             panic_once_bucketed: false,
         }
@@ -896,7 +903,9 @@ impl PathReport {
         self.node.record_bytes(sent, got);
         self.bytes = next;
         let (next, delta) = self.loss.step(PathLoss::of(&stats));
-        self.node.record_path_loss(&mut self.window, delta);
+        let carrying = self.carrying.load(std::sync::atomic::Ordering::Acquire);
+        self.node
+            .record_path_loss(&mut self.window, delta, carrying);
         self.loss = next;
         #[cfg(test)]
         if self.panic_once_bucketed && self.window.is_bucketed() {

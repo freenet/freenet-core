@@ -674,7 +674,7 @@ pub(crate) struct QuicPath {
     /// Whether this path is counted in the node's `quic_live_data_paths` gauge:
     /// from [`Self::count_as_data_path`] until the peer refuses data or
     /// [`Self::uncount_as_data_path`], whichever is first, so it is lowered once.
-    counted_as_data_path: std::sync::atomic::AtomicBool,
+    counted_as_data_path: Arc<std::sync::atomic::AtomicBool>,
     /// Send timeouts while nothing is acknowledged ([`route::StallCount`]).
     stall: parking_lot::Mutex<route::StallCount>,
     /// The connection's count of acknowledged packets, `None` if its controller
@@ -847,8 +847,15 @@ impl QuicPath {
             time.now_nanos(),
         );
         let heard = Arc::new(recycle::PeerHeard::default());
+        // Shared with the loss report, which counts the path's packets as
+        // carrying data while it is in the gauge.
+        let counted_as_data_path = Arc::new(std::sync::atomic::AtomicBool::new(false));
         #[cfg_attr(not(test), allow(unused_mut))]
-        let mut report = recycle::PathReport::new(connection.inner().clone(), stats.node());
+        let mut report = recycle::PathReport::new(
+            connection.inner().clone(),
+            stats.node(),
+            counted_as_data_path.clone(),
+        );
         #[cfg(test)]
         {
             report.panic_once_bucketed = limits.panic_in_watch;
@@ -873,7 +880,7 @@ impl QuicPath {
                 aborts,
                 stream_slots: Arc::new(tokio::sync::Semaphore::new(STREAMED_SEND_LIMIT as usize)),
                 send_data: AtomicU8::new(SEND_DATA_NEVER),
-                counted_as_data_path: std::sync::atomic::AtomicBool::new(false),
+                counted_as_data_path,
                 stall: parking_lot::Mutex::new(stall),
                 ack_progress,
                 suspect_since_acked: parking_lot::Mutex::new(None),

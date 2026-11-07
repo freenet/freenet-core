@@ -5112,6 +5112,7 @@ mod tests {
                 lost_bytes: 8400,
                 congestion_events: 3,
             },
+            false,
         );
         let peek = metrics.read_snapshot();
         assert_eq!(peek.quic_data.lost_packets, 7);
