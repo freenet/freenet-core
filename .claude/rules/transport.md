@@ -1328,9 +1328,17 @@ a test passes its own; tests read their own, never the global).
   bucket uploaded every period, 0 included; no per-path values) and
   quic_ended_loss_rate_<bucket> (paths that ended in the period, by their final
   bucket, so paths that fail lossy still show) and quic_ended_paths_below_floor
-  (paths that ended in the period before 200 packets). Packets in flight at close
-  are dropped by quinn, not declared lost, so a final bucket can understate the
-  loss at the end. The rate is quinn's lost over
+  (paths that ended in the period before 200 packets). The same for paths that
+  carry data, counted from the first report that finds the path carrying (the
+  path's quic_live_data_paths flag, so a data bit that comes on after the watch
+  started starts the count then, and a path refused data keeps its bucket until
+  it ends): quic_carrying_loss_rate_<bucket> (gauge, uploaded at 0),
+  quic_carrying_ended_loss_rate_<bucket> and quic_carried_paths_ended_below_floor,
+  with quic_carried_packets_sent / _lost the subset of the period's sums sent
+  while carrying (shadow = total minus carried: both from one recording under one
+  lock). The single keys are not under quic_carrying_, which the two carrying
+  families share. Packets in flight at close are dropped by quinn, not declared
+  lost, so a final bucket can understate the loss at the end. The rate is quinn's lost over
   sent (quinn-proto 0.11.19), not a measurement of the link: sent counts every
   packet quinn built, acknowledgement-only ones included; lost counts quinn's
   loss declarations, and a packet declared lost and later acknowledged is not
