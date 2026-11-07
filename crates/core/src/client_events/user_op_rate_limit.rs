@@ -42,7 +42,6 @@
 
 use std::sync::{Arc, Mutex};
 
-use dashmap::DashMap;
 use tokio::time::Instant;
 
 use crate::wasm_runtime::UserId;
@@ -209,11 +208,11 @@ struct Inner {
     op_rate: u64,
     op_burst: u64,
     /// Per-user op token buckets, created lazily on first op from a user.
-    op_buckets: DashMap<UserId, TokenBucket>,
+    op_buckets: crate::util::DecisionDashMap<UserId, TokenBucket>,
     /// Minimum interval between exports per user; `0` disables export limiting.
     export_min_interval_secs: u64,
     /// Last successful-export instant per user. Created on first export.
-    last_export: DashMap<UserId, Instant>,
+    last_export: crate::util::DecisionDashMap<UserId, Instant>,
     /// Hard cap on entries in EACH per-user map. Defaults to
     /// [`MAX_TRACKED_USERS`]; lowered in tests via [`UserOpRateLimiter::with_cap`]
     /// so eviction can be exercised without inserting 100k entries.
@@ -389,9 +388,9 @@ impl UserOpRateLimiter {
                 // least 1 so an operator who sets only the rate still gets a
                 // working limiter rather than a deny-all.
                 op_burst: op_burst.max(1),
-                op_buckets: DashMap::new(),
+                op_buckets: Default::default(),
                 export_min_interval_secs,
-                last_export: DashMap::new(),
+                last_export: Default::default(),
                 max_tracked_users: max_tracked_users.max(1),
                 sweeps: std::sync::atomic::AtomicU64::new(0),
             }),

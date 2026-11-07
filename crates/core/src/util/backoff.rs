@@ -29,7 +29,6 @@
 //! assert!(tracker.is_in_backoff(&"peer1".to_string()));
 //! ```
 
-use std::collections::HashMap;
 use std::hash::Hash;
 use std::time::Duration;
 use tokio::time::Instant;
@@ -151,7 +150,7 @@ struct BackoffEntry {
 #[derive(Debug)]
 pub struct TrackedBackoff<K: Eq + Hash> {
     /// Backoff state per key
-    entries: HashMap<K, BackoffEntry>,
+    entries: crate::util::DecisionHashMap<K, BackoffEntry>,
     /// Backoff configuration
     config: ExponentialBackoff,
     /// Maximum number of entries before LRU eviction
@@ -162,7 +161,7 @@ impl<K: Eq + Hash + Clone> TrackedBackoff<K> {
     /// Create a new tracked backoff with the given configuration.
     pub fn new(config: ExponentialBackoff, max_entries: usize) -> Self {
         Self {
-            entries: HashMap::new(),
+            entries: Default::default(),
             config,
             max_entries,
         }

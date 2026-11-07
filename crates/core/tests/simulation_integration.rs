@@ -1040,6 +1040,141 @@ fn test_simulation_uses_no_blocking_pool_thread() {
     );
 }
 
+/// Same seed, same trace, five runs in one process, to about 240 s of
+/// virtual time.
+///
+/// std `RandomState` gives every new map fresh keys (per thread, from the OS,
+/// then incremented per instance), so a map iterated in a capped loop, for a
+/// tie-break, or to send or wake in order visited its entries in a different
+/// order in each run, and the runs diverged a few minutes in: event 7582 of
+/// 9908 (8612 pinned to one CPU), same event kind and peer, different
+/// transaction (#6132). Those maps now use `DecisionHasher`, which has fixed
+/// keys under `simulation_tests`. `test_strict_determinism_exact_event_equality`
+/// runs 30 s and saw none of it.
+///
+/// GETs and UPDATEs keep going every 2 s, so the runs are busy throughout, and
+/// every event's kind, transaction and peer are compared in order. Five runs,
+/// not three: with `DecisionHasher` reverted to `RandomState` a pair of runs
+/// diverged in about half of the tries, so four comparisons are what make a
+/// regression show.
+#[test_log::test]
+fn test_same_seed_same_trace_in_one_process_past_four_minutes() {
+    const SEED: u64 = 0xD15C_6123;
+    const NODES: usize = 9;
+    const CONTRACTS: u8 = 4;
+    const ROUNDS: usize = 36;
+
+    fn run_and_trace(name: &str) -> Vec<String> {
+        setup_deterministic_state(SEED);
+        let rt = create_runtime();
+        let (mut sim, logs_handle) = rt.block_on(async {
+            let sim = SimNetwork::new(name, 1, NODES, 10, 3, 8, 3, SEED).await;
+            let logs_handle = sim.event_logs_handle();
+            (sim, logs_handle)
+        });
+
+        let contracts: Vec<_> = (0..CONTRACTS)
+            .map(|i| SimOperation::create_test_contract(0x60 + i))
+            .collect();
+        let mut operations = Vec::new();
+        for (i, contract) in contracts.iter().enumerate() {
+            operations.push(ScheduledOperation::new(
+                NodeLabel::gateway(name, 0),
+                SimOperation::Put {
+                    contract: contract.clone(),
+                    state: SimOperation::create_test_state(i as u8),
+                    subscribe: true,
+                },
+            ));
+        }
+        for node in 1..=NODES {
+            let contract = &contracts[node % contracts.len()];
+            operations.push(ScheduledOperation::new(
+                NodeLabel::node(name, node),
+                SimOperation::Subscribe {
+                    contract_id: *contract.key().id(),
+                },
+            ));
+        }
+        for round in 0..ROUNDS {
+            let contract = &contracts[round % contracts.len()];
+            operations.push(ScheduledOperation::new(
+                NodeLabel::node(name, 1 + round % NODES),
+                SimOperation::Update {
+                    key: contract.key(),
+                    data: SimOperation::create_test_state(16 + round as u8),
+                },
+            ));
+            operations.push(ScheduledOperation::new(
+                NodeLabel::node(name, 1 + (round * 5 + 3) % NODES),
+                SimOperation::Get {
+                    contract_id: *contract.key().id(),
+                    return_contract_code: false,
+                    subscribe: false,
+                },
+            ));
+            operations.push(ScheduledOperation::new(
+                NodeLabel::node(name, 1 + (round * 7 + 1) % NODES),
+                SimOperation::Get {
+                    contract_id: *contracts[(round + 1) % contracts.len()].key().id(),
+                    return_contract_code: false,
+                    subscribe: false,
+                },
+            ));
+        }
+        let op_interval = Duration::from_secs(2);
+        let op_seconds = operations.len() as u64 * op_interval.as_secs();
+        assert!(op_seconds > 220, "operations must outlast the third walk");
+        sim.with_controlled_op_interval(op_interval);
+
+        let result = sim.run_controlled_simulation(
+            SEED,
+            operations,
+            Duration::from_secs(op_seconds + 60),
+            Duration::from_secs(30),
+        );
+        assert!(
+            result.turmoil_result.is_ok(),
+            "{name}: simulation failed: {:?}",
+            result.turmoil_result.err()
+        );
+        rt.block_on(async {
+            logs_handle
+                .lock()
+                .await
+                .iter()
+                .map(|log| format!("{} {} {}", log.kind.variant_name(), log.tx, log.peer_id))
+                .collect()
+        })
+    }
+
+    let first = run_and_trace("disk-det-run1");
+    assert!(
+        first.len() > 100,
+        "the run produced too few events ({}) to compare",
+        first.len()
+    );
+    for name in [
+        "disk-det-run2",
+        "disk-det-run3",
+        "disk-det-run4",
+        "disk-det-run5",
+    ] {
+        let other = run_and_trace(name);
+        let diverges_at = first.iter().zip(&other).position(|(a, b)| a != b);
+        assert!(
+            diverges_at.is_none() && first.len() == other.len(),
+            "same seed, different trace: {name} has {} events against {}, first \
+             difference at event {:?}: {:?} vs {:?}",
+            other.len(),
+            first.len(),
+            diverges_at,
+            diverges_at.map(|i| &first[i]),
+            diverges_at.map(|i| &other[i]),
+        );
+    }
+}
+
 /// **STRICT** determinism test: verifies that same seed produces EXACTLY identical events.
 ///
 /// This test uses Turmoil's deterministic scheduler to ensure reproducible execution.

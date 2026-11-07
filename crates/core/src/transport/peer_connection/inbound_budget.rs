@@ -305,7 +305,7 @@ impl SharedInboundBudget {
 }
 
 pub(in crate::transport) struct InboundStreamBudget {
-    streams: HashMap<InboundKey, Charge>,
+    streams: crate::util::DecisionHashMap<InboundKey, Charge>,
     charged_bytes: u64,
     max_streams: usize,
     max_bytes: u64,
@@ -323,7 +323,7 @@ impl InboundStreamBudget {
         overhead: ChargeOverhead,
     ) -> Self {
         Self {
-            streams: HashMap::new(),
+            streams: Default::default(),
             charged_bytes: 0,
             max_streams,
             max_bytes,

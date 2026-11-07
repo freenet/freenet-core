@@ -612,7 +612,7 @@ pub(crate) struct HostingManager {
     /// Holds the lease expiry plus enough history (subscribed_since,
     /// last_updated) for the local-peer dashboard to render this map
     /// directly without a parallel mirror.
-    active_subscriptions: DashMap<ContractKey, SubscriptionLease>,
+    active_subscriptions: crate::util::DecisionDashMap<ContractKey, SubscriptionLease>,
 
     /// Contracts a LOCAL client is subscribed to: a WebSocket client, or a
     /// delegate running on this node (#4669). Ranks the contract in the local
@@ -673,7 +673,8 @@ pub(crate) struct HostingManager {
     ///
     /// Must be kept in sync with `InterestManager::interested_peers`
     /// (see `InterestManager` docs for the dual-tracking relationship).
-    downstream_subscribers: DashMap<ContractKey, HashMap<PeerKey, Instant>>,
+    downstream_subscribers:
+        crate::util::DecisionDashMap<ContractKey, crate::util::DecisionHashMap<PeerKey, Instant>>,
 
     /// Time source for downstream subscriber lease tracking.
     ///
@@ -744,7 +745,7 @@ pub(crate) struct HostingManager {
     ///
     /// Behind an `Arc` so the periodic sweep snapshot can iterate
     /// without re-entering the `HostingManager` borrow.
-    pending_reclamation: std::sync::Arc<DashMap<ContractKey, u64>>,
+    pending_reclamation: std::sync::Arc<crate::util::DecisionDashMap<ContractKey, u64>>,
 
     /// Repair-fetch attempt tracking for phantom in-use contracts (#4612):
     /// contract is `contract_in_use` via downstream subscribers but holds NO
@@ -835,7 +836,7 @@ impl HostingManager {
         let backoff_config =
             ExponentialBackoff::new(INITIAL_SUBSCRIPTION_BACKOFF, MAX_SUBSCRIPTION_BACKOFF);
         Self {
-            active_subscriptions: DashMap::new(),
+            active_subscriptions: Default::default(),
             client_subscriptions: DashMap::new(),
             hosting_cache: RwLock::new(HostingCache::new(budget_bytes, time_source.clone())),
             demand_estimator: RwLock::new(ProximityPrior::new()),
@@ -845,7 +846,7 @@ impl HostingManager {
             notifications_dropped_channel_full: AtomicU64::new(0),
             notifications_dropped_channel_closed: AtomicU64::new(0),
             notifications_no_local_subscriber: AtomicU64::new(0),
-            downstream_subscribers: DashMap::new(),
+            downstream_subscribers: Default::default(),
             time_source,
             pending_subscription_requests: DashSet::new(),
             subscription_backoff: RwLock::new(TrackedBackoff::new(
@@ -854,7 +855,7 @@ impl HostingManager {
             )),
             storage: RwLock::new(None),
             state_generation: DashMap::new(),
-            pending_reclamation: std::sync::Arc::new(DashMap::new()),
+            pending_reclamation: std::sync::Arc::new(Default::default()),
             phantom_repair: DashMap::new(),
             disk_tracker: RwLock::new(None),
             ram_budget_bytes: AtomicU64::new(budget_bytes),

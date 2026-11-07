@@ -71,7 +71,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use dashmap::DashMap;
 use freenet_stdlib::prelude::ContractInstanceId;
 use tokio::time::Instant;
 
@@ -147,7 +146,7 @@ pub(crate) enum BanOutcome {
 /// dispatch site to drop inbound requests; written by the governance
 /// reaper loop on `BanTriggered` / `BanLifted` transitions.
 pub(crate) struct ContractBanList {
-    entries: DashMap<ContractInstanceId, BanEntry>,
+    entries: crate::util::DecisionDashMap<ContractInstanceId, BanEntry>,
     /// Authoritative size counter for capacity enforcement. Held in
     /// sync with `entries.len()` at every stable point: incremented by
     /// successful new-key inserts in [`Self::ban`], decremented by
@@ -183,7 +182,7 @@ impl ContractBanList {
     /// [`Self::new`] (cap = [`MAX_BANNED_CONTRACTS`]).
     pub fn with_max(time_source: Arc<dyn TimeSource + Send + Sync>, max_banned: usize) -> Self {
         Self {
-            entries: DashMap::new(),
+            entries: Default::default(),
             size: AtomicUsize::new(0),
             max_banned,
             capacity_rejected_total: AtomicU64::new(0),

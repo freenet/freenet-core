@@ -2006,7 +2006,7 @@ pub(crate) struct PeerSelectionCounts {
 
 #[derive(Debug, Clone)]
 struct PeerSelectionTable {
-    entries: HashMap<PeerKeyLocation, PeerSelectionEntry>,
+    entries: crate::util::DecisionHashMap<PeerKeyLocation, PeerSelectionEntry>,
     capacity: usize,
     use_clock: u64,
     evictions: u64,
@@ -2053,7 +2053,7 @@ impl PeerSelectionCounts {
     fn new(capacity: usize) -> Self {
         PeerSelectionCounts {
             table: parking_lot::Mutex::new(PeerSelectionTable {
-                entries: HashMap::new(),
+                entries: Default::default(),
                 capacity: capacity.max(1),
                 use_clock: 0,
                 evictions: 0,
@@ -10739,7 +10739,7 @@ mod tests {
     #[test]
     fn eviction_memory_holds_capacity_distinct_peers() {
         let mut table = PeerSelectionTable {
-            entries: HashMap::new(),
+            entries: Default::default(),
             capacity: 8,
             use_clock: 0,
             evictions: 0,

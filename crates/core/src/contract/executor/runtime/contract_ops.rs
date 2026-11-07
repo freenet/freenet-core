@@ -802,7 +802,8 @@ impl Executor<Runtime> {
                 cause: "contract cannot request itself as a related contract".into(),
             }));
         }
-        let unique_ids: HashSet<ContractInstanceId> = requested_ids.into_iter().collect();
+        let unique_ids: crate::util::DecisionHashSet<ContractInstanceId> =
+            requested_ids.into_iter().collect();
         if unique_ids.len() > MAX_RELATED_CONTRACTS_PER_REQUEST {
             return Err(ExecutorError::request(StdContractError::Put {
                 key: *key,

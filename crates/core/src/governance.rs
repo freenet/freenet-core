@@ -159,8 +159,8 @@ impl<K> OutlierResult<K> {
 /// `threshold = median + k × mad`, MAD computed on a top-trimmed
 /// sample (default 5%), and the threshold further clamped at
 /// `capacity_ceiling_log`.
-pub(crate) fn detect_outliers<K, S, F>(
-    samples: &HashMap<K, S>,
+pub(crate) fn detect_outliers<K, S, F, H>(
+    samples: &HashMap<K, S, H>,
     extract_log_ratio: F,
     config: &OutlierConfig,
     capacity_ceiling_log: f64,
@@ -168,6 +168,7 @@ pub(crate) fn detect_outliers<K, S, F>(
 where
     K: Clone + Eq + Hash,
     F: Fn(&S) -> Option<f64>,
+    H: std::hash::BuildHasher,
 {
     // Step 1: extract ratios, dropping any non-finite values
     // (NaN, ±inf). The extractor's contract is "return None for
