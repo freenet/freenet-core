@@ -67,7 +67,7 @@ type OutboundStreamResult = std::result::Result<super::TransferStats, TransportE
 /// since we need to account for the space overhead of SymmetricMessage::StreamFragment metadata.
 /// Measured overhead: 41 bytes (see symmetric_message::stream_fragment_overhead())
 /// The extra byte vs. the original 40 comes from the Option discriminant of `metadata_bytes`.
-const MAX_DATA_SIZE: usize = packet_data::MAX_DATA_SIZE - 41;
+pub(in crate::transport) const MAX_DATA_SIZE: usize = packet_data::MAX_DATA_SIZE - 41;
 
 /// Whether a short message of `len` payload bytes fits one UDP packet, the
 /// rule the sender uses to choose a short message over a stream. UDP charges
@@ -892,7 +892,7 @@ impl<T: TimeSource> RecvTimers<T> {
 const MAX_UNANSWERED_PINGS: usize = 5;
 
 /// Maximum number of metadata hashes to track for dedup.
-const DEDUP_CACHE_CAPACITY: NonZeroUsize = match NonZeroUsize::new(1000) {
+pub(in crate::transport) const DEDUP_CACHE_CAPACITY: NonZeroUsize = match NonZeroUsize::new(1000) {
     Some(v) => v,
     None => panic!("DEDUP_CACHE_CAPACITY must be non-zero"),
 };
@@ -900,7 +900,7 @@ const DEDUP_CACHE_CAPACITY: NonZeroUsize = match NonZeroUsize::new(1000) {
 /// How many completed inbound stream ids to remember, so late
 /// retransmissions of them are not taken for new streams. As many as a
 /// connection may have open at once.
-const COMPLETED_STREAM_MEMORY: NonZeroUsize =
+pub(in crate::transport) const COMPLETED_STREAM_MEMORY: NonZeroUsize =
     match NonZeroUsize::new(streaming::MAX_INBOUND_STREAMS_PER_CONNECTION) {
         Some(v) => v,
         None => panic!("COMPLETED_STREAM_MEMORY must be non-zero"),

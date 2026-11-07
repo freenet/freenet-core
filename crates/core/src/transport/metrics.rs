@@ -386,6 +386,9 @@ labelled_counters! {
         /// This node's UDP session to the peer ended, so the path went with
         /// it.
         SessionEnded => "session_ended",
+        /// A path with no data closed so the next attempt carries the data
+        /// bit that came on while it was up (the ramp). Not a fallback.
+        RecycleForData => "recycle_for_data",
     }
 }
 
@@ -2574,6 +2577,9 @@ impl TransportMetrics {
             quic_close_sent_session_ended: get64(
                 &self.quic_close_sent[QuicCloseCode::SessionEnded as usize],
             ),
+            quic_close_sent_recycle_for_data: get64(
+                &self.quic_close_sent[QuicCloseCode::RecycleForData as usize],
+            ),
             quic_close_received: std::array::from_fn(|i| get64(&self.quic_close_received[i])),
             quic_upgrade: std::array::from_fn(|i| get64(&self.quic_upgrade[i])),
             quic_fallback: std::array::from_fn(|i| get64(&self.quic_fallback[i])),
@@ -3154,6 +3160,7 @@ pub struct TransportSnapshot {
     pub quic_close_sent_peer_not_acknowledging: u64,
     pub quic_close_sent_control_refused: u64,
     pub quic_close_sent_session_ended: u64,
+    pub quic_close_sent_recycle_for_data: u64,
     /// QUIC connections closed by the peer's application close, by
     /// [`QuicCloseCode`] in order; the last slot is a code this node does not
     /// know (`quic_close_received_<label>`, `..._unknown_code`).
@@ -3538,6 +3545,7 @@ impl TransportSnapshot {
             quic_close_sent_peer_not_acknowledging,
             quic_close_sent_control_refused,
             quic_close_sent_session_ended,
+            quic_close_sent_recycle_for_data,
             quic_close_received,
             quic_upgrade,
             quic_fallback,
@@ -3680,6 +3688,7 @@ impl TransportSnapshot {
         self.quic_close_sent_peer_not_acknowledging = quic_close_sent_peer_not_acknowledging;
         self.quic_close_sent_control_refused = quic_close_sent_control_refused;
         self.quic_close_sent_session_ended = quic_close_sent_session_ended;
+        self.quic_close_sent_recycle_for_data = quic_close_sent_recycle_for_data;
         self.quic_close_received = quic_close_received;
         self.quic_upgrade = quic_upgrade;
         self.quic_fallback = quic_fallback;
@@ -3878,6 +3887,7 @@ struct SnapshotExtras {
     pub quic_close_sent_peer_not_acknowledging: u64,
     pub quic_close_sent_control_refused: u64,
     pub quic_close_sent_session_ended: u64,
+    pub quic_close_sent_recycle_for_data: u64,
     /// QUIC connections closed by the peer's application close, by
     /// [`QuicCloseCode`] in order; the last slot is a code this node does not
     /// know (`quic_close_received_<label>`, `..._unknown_code`).
@@ -4085,6 +4095,7 @@ impl SnapshotExtras {
             || self.quic_close_sent_peer_not_acknowledging != 0
             || self.quic_close_sent_control_refused != 0
             || self.quic_close_sent_session_ended != 0
+            || self.quic_close_sent_recycle_for_data != 0
             || self.quic_close_received.iter().any(|n| *n != 0)
             || self.quic_upgrade.iter().any(|n| *n != 0)
             || self.quic_fallback.iter().any(|n| *n != 0)
@@ -5101,6 +5112,7 @@ mod tests {
                 lost_bytes: 8400,
                 congestion_events: 3,
             },
+            false,
         );
         let peek = metrics.read_snapshot();
         assert_eq!(peek.quic_data.lost_packets, 7);
@@ -5192,6 +5204,7 @@ mod tests {
             QuicCloseCode::PeerNotAcknowledging => snap.quic_close_sent_peer_not_acknowledging,
             QuicCloseCode::ControlRefused => snap.quic_close_sent_control_refused,
             QuicCloseCode::SessionEnded => snap.quic_close_sent_session_ended,
+            QuicCloseCode::RecycleForData => snap.quic_close_sent_recycle_for_data,
         }
     }
 
@@ -6461,6 +6474,7 @@ mod tests {
             "quic_close_sent_peer_not_acknowledging",
             "quic_close_sent_control_refused",
             "quic_close_sent_session_ended",
+            "quic_close_sent_recycle_for_data",
             "quic_close_received",
             "quic_upgrade",
             "quic_fallback",

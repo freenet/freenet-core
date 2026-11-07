@@ -3083,6 +3083,10 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 "quic_close_sent_session_ended".into(),
                 serde_json::json!(snapshot.quic_close_sent_session_ended),
             );
+            m.insert(
+                "quic_close_sent_recycle_for_data".into(),
+                serde_json::json!(snapshot.quic_close_sent_recycle_for_data),
+            );
             {
                 use crate::transport::metrics::{
                     QuicCloseCode, QuicFallback, QuicPathAge, QuicUpgradeOutcome,
@@ -7715,6 +7719,11 @@ mod tests {
         data.loss_rate = (1019..1027).collect();
         data.ended_loss_rate = (1027..1035).collect();
         data.ended_below_floor = 1035;
+        data.carrying_sent_packets = 1036;
+        data.carrying_lost_packets = 1037;
+        data.carrying_loss_rate = (1038..1046).collect();
+        data.carrying_ended_loss_rate = (1046..1054).collect();
+        data.carrying_ended_below_floor = 1054;
         let want: std::collections::BTreeMap<String, u64> =
             snapshot.quic_data.keys().into_iter().collect();
         assert!(want.values().all(|value| *value != 0));
@@ -7970,6 +7979,7 @@ mod tests {
             quic_close_sent_peer_not_acknowledging: 6,
             quic_close_sent_control_refused: 8,
             quic_close_sent_session_ended: 10,
+            quic_close_sent_recycle_for_data: 12,
             quic_breaker_trips: 7,
             quic_send_refused: 9,
             quic_breaker_suppressed: true,
@@ -7989,6 +7999,7 @@ mod tests {
             ("quic_close_sent_peer_not_acknowledging", 6),
             ("quic_close_sent_control_refused", 8),
             ("quic_close_sent_session_ended", 10),
+            ("quic_close_sent_recycle_for_data", 12),
             ("quic_breaker_trips", 7),
             ("quic_send_refused", 9),
         ] {

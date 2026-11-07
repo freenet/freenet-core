@@ -55,7 +55,7 @@ const INITIAL_INTERVAL: Duration = Duration::from_millis(50);
 ///
 /// At FixedRate 10 Mbps (~892 packets/sec), 2048 packets provides ~2.3 seconds
 /// of buffer headroom, up from ~1.1 seconds at capacity 1000.
-const INBOUND_CHANNEL_CAPACITY: usize = 2048;
+pub(in crate::transport) const INBOUND_CHANNEL_CAPACITY: usize = 2048;
 
 /// Minimum interval between asymmetric decryption attempts for the same address.
 /// Prevents CPU exhaustion from attackers sending intro-sized packets.

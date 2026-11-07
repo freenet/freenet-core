@@ -159,8 +159,10 @@ use crate::transport::metrics::QuicCloseCode;
 /// one does over a long life, and a path that gets there is closed and
 /// rebuilt with nothing lost but the upgrade. The `stopped` map entries the
 /// limit bounds are about 100 bytes each, so at most about 400 KiB per
-/// path, under one connection's flow-control window
-/// (`config::MAX_WINDOW_BYTES`, 2 MiB).
+/// path, about one connection's largest flow-control window
+/// (`config::MAX_WINDOW_BYTES`, 384 KiB), and counted among the derived
+/// terms of a connection's worst case (`quic::tests`,
+/// `a_connections_quic_memory_stays_under_udps_at_the_ceiling`).
 pub(crate) const SEND_ABORT_LIMIT: u64 = 4096;
 
 /// How long the peer may go on sending without acknowledging packets this
@@ -864,6 +866,11 @@ pub(crate) struct PathReport {
     bytes: UdpBytes,
     loss: PathLoss,
     window: crate::transport::metrics::PathLossWindow,
+    /// Whether the path carries data now: the path's own flag for the
+    /// `quic_live_data_paths` gauge, read at each report, so a report's
+    /// packets are counted as carrying by the path's state when it is taken
+    /// (a flip inside a 2 s tick goes to the side it reaches).
+    carrying: Arc<std::sync::atomic::AtomicBool>,
     /// The next report that finds the path in a bucket panics, once
     /// (supervisor test).
     #[cfg(test)]
@@ -874,6 +881,7 @@ impl PathReport {
     pub(crate) fn new(
         connection: quinn::Connection,
         node: &'static crate::transport::metrics::QuicDataCounters,
+        carrying: Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         let stats = connection.stats();
         Self {
@@ -882,6 +890,7 @@ impl PathReport {
             window: crate::transport::metrics::PathLossWindow::new(node),
             connection,
             node,
+            carrying,
             #[cfg(test)]
             panic_once_bucketed: false,
         }
@@ -894,7 +903,9 @@ impl PathReport {
         self.node.record_bytes(sent, got);
         self.bytes = next;
         let (next, delta) = self.loss.step(PathLoss::of(&stats));
-        self.node.record_path_loss(&mut self.window, delta);
+        let carrying = self.carrying.load(std::sync::atomic::Ordering::Acquire);
+        self.node
+            .record_path_loss(&mut self.window, delta, carrying);
         self.loss = next;
         #[cfg(test)]
         if self.panic_once_bucketed && self.window.is_bucketed() {

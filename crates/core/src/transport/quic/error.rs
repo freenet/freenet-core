@@ -68,9 +68,13 @@ pub(crate) mod close_code {
     /// reads it as `QuicErrorKind::ConnectionLost`, which falls back and
     /// counts as `quic_fallback_reset`.
     pub(crate) const SESSION_ENDED: u32 = 0x06;
+    /// This node's data bit for the pair came on while a path with no data was
+    /// up; it closed the path so the next attempt carries the bit. No fault, and
+    /// not a fallback (`upgrade::machine::UpgradeMachine::recheck_data`).
+    pub(crate) const RECYCLE_FOR_DATA: u32 = 0x07;
     /// Every close code, for the range and duplicate checks. A source-scrape
     /// test checks that each `const` in this module is listed.
-    pub(crate) const ALL: [u32; 7] = [
+    pub(crate) const ALL: [u32; 8] = [
         NODE_DROPPED_PEER,
         DOWNGRADE,
         IDENTITY_MISMATCH,
@@ -78,6 +82,7 @@ pub(crate) mod close_code {
         PEER_NOT_ACKNOWLEDGING,
         CONTROL_REFUSED,
         SESSION_ENDED,
+        RECYCLE_FOR_DATA,
     ];
 }
 
@@ -92,7 +97,7 @@ const _: () = {
     let reset = reset_code::ALL;
     // No code is used twice, within or across the namespaces.
     let all_len = close.len() + stop.len() + reset.len();
-    let mut all = [0u32; 7 + 9 + 2];
+    let mut all = [0u32; 8 + 9 + 2];
     assert!(all.len() == all_len, "update the combined length");
     let mut n = 0;
     let mut i = 0;
@@ -156,6 +161,7 @@ impl QuicCloseCode {
             Self::PeerNotAcknowledging => close_code::PEER_NOT_ACKNOWLEDGING,
             Self::ControlRefused => close_code::CONTROL_REFUSED,
             Self::SessionEnded => close_code::SESSION_ENDED,
+            Self::RecycleForData => close_code::RECYCLE_FOR_DATA,
         }
     }
 
@@ -176,6 +182,7 @@ impl QuicCloseCode {
             Self::PeerNotAcknowledging => b"peer not acknowledging",
             Self::ControlRefused => b"control frame refused",
             Self::SessionEnded => b"udp session ended",
+            Self::RecycleForData => b"recycled to carry data",
         }
     }
 }
@@ -248,6 +255,7 @@ pub(in crate::transport) fn attribute(
                 | QuicRefusal::ConnectionRefused
                 | QuicRefusal::Downgrade
                 | QuicRefusal::SessionEnded
+                | QuicRefusal::RecycleForData
                 | QuicRefusal::AllowSetFull
                 | QuicRefusal::KeyConflict
                 | QuicRefusal::UnusableKey
@@ -323,6 +331,9 @@ impl From<quinn::ConnectionError> for QuicErrorKind {
                     },
                     Some(QuicCloseCode::SessionEnded) => Self::Refused {
                         reason: QuicRefusal::SessionEnded,
+                    },
+                    Some(QuicCloseCode::RecycleForData) => Self::Refused {
+                        reason: QuicRefusal::RecycleForData,
                     },
                     // A code a newer peer added still ends the connection.
                     Some(QuicCloseCode::NodeDroppedPeer) | None => Self::ConnectionLost,

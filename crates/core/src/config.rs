@@ -334,7 +334,7 @@ impl Default for ConfigArgs {
                 ledbat_min_ssthresh: None, // Uses default from NetworkApiConfig
                 congestion_control: None,  // Default: fixedrate (set in NetworkApiConfig)
                 bbr_startup_rate: None,    // Uses default from BBR config
-                transport_quic: None,      // Default: shadow on Linux and macOS
+                transport_quic: None,      // Default: prefer on Linux and macOS
                 quic_max_paths: None,      // Default: max-number-of-connections
                 quic_data_percent: None,   // Default: this release's share of pairs
                 quic_ignore_crash_breaker: None,
@@ -2837,7 +2837,7 @@ pub struct NetworkApiConfig {
     pub bbr_startup_rate: Option<u64>,
 
     /// QUIC transport (#5940): `off`, `shadow` or `prefer`; unset reads as
-    /// `QuicMode::default_mode` (shadow on Linux and macOS). Kept as written, so a value from a later release
+    /// `QuicMode::default_mode` (prefer on Linux and macOS). Kept as written, so a value from a later release
     /// round-trips; see [`Self::quic_settings`] for how it is read.
     #[serde(
         default,
@@ -7202,17 +7202,18 @@ shutdown-drain-secs = 42
         assert_seeded_values_bound(&cfg);
     }
 
-    /// An unset `transport-quic` is shadow, and off on Windows, which must stay
-    /// off until its crash-loop breaker has been confirmed on a real Windows
-    /// machine (#6031). The lib tests do not compile on Windows, so
-    /// `tests/quic_breaker_windows.rs` pins the Windows half through the real
-    /// binary. The default is not written into the config, so a default-off
-    /// release turns QUIC off on every node that did not set the key.
+    /// An unset `transport-quic` is prefer (the data ramp, #5940), and off on
+    /// Windows, which must stay off until its crash-loop breaker has been
+    /// confirmed on a real Windows machine (#6031). The lib tests do not compile
+    /// on Windows, so `tests/quic_breaker_windows.rs` pins the Windows half
+    /// through the real binary. The default is not written into the config, so
+    /// a default-off release turns QUIC off on every node that did not set the
+    /// key.
     #[test]
-    fn quic_is_shadow_by_default_except_on_windows() {
+    fn quic_is_prefer_by_default_except_on_windows() {
         use crate::transport::quic::QuicMode;
         let expected = if cfg!(any(target_os = "linux", target_os = "macos")) {
-            QuicMode::Shadow
+            QuicMode::Prefer
         } else {
             QuicMode::Off
         };

@@ -232,7 +232,7 @@ fn debug_field(debug: &str, name: &str) -> String {
     panic!("no field {name:?} in {debug}");
 }
 
-/// Settings with windows of [`MAX_WINDOW_BYTES`], so a 1 MiB stream fits.
+/// Settings with windows of [`MAX_WINDOW_BYTES`].
 fn settings() -> QuicSettings {
     QuicSettings {
         max_connections: 4,
@@ -1746,13 +1746,21 @@ fn tls_configs_pin_every_value() {
 }
 
 /// The window is 5% of memory split over every connection's receive and
-/// send windows, clamped to [128 KiB, 2 MiB].
+/// send windows, clamped to [128 KiB, 384 KiB].
 #[test]
 fn windows_are_a_clamped_share_of_memory() {
     const GIB: usize = 1024 * 1024 * 1024;
     let window = config::connection_window_bytes;
     // 4 GiB / 20 / (2 * 200) = 536 870 bytes: inside the clamp.
-    assert_eq!(window(4 * GIB, 200), (4 * GIB / 20 / 400) as u64);
+    assert_eq!(
+        MAX_WINDOW_BYTES,
+        384 * 1024,
+        "the ceiling the QUIC data ramp was cleared at (memory gate against UDP)"
+    );
+    // 2 GiB / 20 / (2 * 200) = 268 435 bytes: inside the clamp.
+    assert_eq!(window(2 * GIB, 200), (2 * GIB / 20 / 400) as u64);
+    // 4 GiB would be 536 870 bytes: the ceiling binds.
+    assert_eq!(window(4 * GIB, 200), MAX_WINDOW_BYTES);
     assert_eq!(window(256 * 1024 * 1024, 200), MIN_WINDOW_BYTES, "floor");
     assert_eq!(window(64 * GIB, 4), MAX_WINDOW_BYTES, "ceiling");
     assert_eq!(
@@ -1762,12 +1770,100 @@ fn windows_are_a_clamped_share_of_memory() {
     );
 }
 
+/// The memory gate for QUIC data at 100% (M2-ACCOUNTING, "Alternative gate"):
+/// at the window ceiling a connection's worst-case QUIC memory, the pinned
+/// terms plus the derived ones, is under the UDP transport's per-connection
+/// state bounded by a constant (outside the reassembly allowance both share).
+/// A pair that carries data on QUIC keeps its UDP session as the fallback, so
+/// this bounds what QUIC adds: a connection with both stays under twice UDP's
+/// figure, on any host (every host's window is at most the ceiling, and every
+/// term grows with it). The receive terms are this tree's measurements
+/// (`config`); the send terms are M2's, measured on f1a355968
+/// (`feat/quic-data-memory`, not in this tree yet, so nothing here re-measures
+/// them; #6141); UDP's figure is derived from its constants (UDP-WORST-CASE: A2, B1,
+/// C1 to C4), with each entry's size from that derivation.
+#[test]
+fn a_connections_quic_memory_stays_under_udps_at_the_ceiling() {
+    use super::config::{
+        MAX_UNI_STREAMS, QUIC_ACK_TAIL_BYTES, QUIC_ASSEMBLER_HOLD_PER_STREAM_BYTES,
+        QUIC_ASSEMBLER_HOLD_WINDOW_MULTIPLE, QUIC_CONNECTION_FIXED_BYTES,
+    };
+    use super::path::SHORT_CHANNEL_CAPACITY;
+    use super::recycle::SEND_ABORT_LIMIT;
+    use super::upgrade::data_route::SHORT_QUEUE_CAPACITY;
+    const KIB: usize = 1024;
+    const MIB: usize = 1024 * KIB;
+    const DATAGRAM: usize = 1280;
+    let streams = MAX_UNI_STREAMS as usize;
+    let worst = |w: usize| {
+        let receive = QUIC_CONNECTION_FIXED_BYTES
+            + streams * QUIC_ASSEMBLER_HOLD_PER_STREAM_BYTES
+            + QUIC_ASSEMBLER_HOLD_WINDOW_MULTIPLE * w
+            + QUIC_ACK_TAIL_BYTES;
+        // M2: 150% of the window, 44 KiB settled, 4 KiB per stream, and the
+        // short queue full with as many more in flight as there are streams.
+        let send =
+            w * 3 / 2 + 44 * KIB + streams * 4 * KIB + (SHORT_QUEUE_CAPACITY + streams) * DATAGRAM;
+        // M2, derived: quinn's `stopped` map up to the abort limit (about 100 B
+        // each), header and control reads held uncharged, the inbound short
+        // channel full.
+        let derived =
+            SEND_ABORT_LIMIT as usize * 100 + streams * 4 * KIB + SHORT_CHANNEL_CAPACITY * DATAGRAM;
+        receive + send + derived
+    };
+    let udp = udp_constant_bounded_bytes();
+    assert!(
+        (8 * MIB..=9 * MIB).contains(&udp),
+        "UDP-WORST-CASE puts it at about 8.4 MiB: {udp} B"
+    );
+    assert_eq!(
+        worst(0),
+        3_911_680 + 999_424,
+        "the terms add up to M2's formula, 3,911,680 B + 6.5 W, plus its derived 999,424 B"
+    );
+    let at_ceiling = worst(MAX_WINDOW_BYTES as usize);
+    assert!(
+        at_ceiling <= udp,
+        "QUIC worst case per connection {at_ceiling} B at the ceiling, UDP's {udp} B"
+    );
+}
+
+/// The UDP transport's per-connection state bounded by a constant, outside the
+/// reassembly allowance (UDP-WORST-CASE, section 1), from the constants that
+/// bound each term. A2: up to 31 B the per-fragment charge misses, for every
+/// fragment the allowance covers (the largest stream, plus 16 MiB of other
+/// streams' fragments at about 1490 B each). B1: the inbound packet channel.
+/// C1 to C3: hash maps at their capacity (a bucket per 8/7 of capacity, rounded
+/// to a power of two, at 17 B; plus 32 B per boxed LRU entry). C4: the RTT
+/// samples, 16 B each.
+fn udp_constant_bounded_bytes() -> usize {
+    use crate::transport::connection_handler::INBOUND_CHANNEL_CAPACITY;
+    use crate::transport::packet_data::{MAX_RECV_PACKET_SIZE, PacketData, UnknownEncryption};
+    use crate::transport::peer_connection::inbound_budget::MAX_REMEMBERED_REFUSALS;
+    use crate::transport::peer_connection::streaming::MAX_STREAM_TOTAL_BYTES;
+    use crate::transport::peer_connection::{
+        COMPLETED_STREAM_MEMORY, DEDUP_CACHE_CAPACITY, MAX_DATA_SIZE,
+    };
+    use crate::transport::rolling_rtt_stats::MAX_SAMPLES;
+    let buckets = |capacity: usize| (capacity * 8 / 7).next_power_of_two() * 17;
+    let fragments =
+        (MAX_STREAM_TOTAL_BYTES as usize).div_ceil(MAX_DATA_SIZE) + 1 + 16 * 1024 * 1024 / 1490;
+    let a2 = fragments * 31;
+    let b1 = INBOUND_CHANNEL_CAPACITY
+        * std::mem::size_of::<PacketData<UnknownEncryption, MAX_RECV_PACKET_SIZE>>();
+    let c1 = buckets(MAX_REMEMBERED_REFUSALS);
+    let c2 = buckets(COMPLETED_STREAM_MEMORY.get()) + COMPLETED_STREAM_MEMORY.get() * 32;
+    let c3 = buckets(DEDUP_CACHE_CAPACITY.get()) + DEDUP_CACHE_CAPACITY.get() * 32;
+    let c4 = MAX_SAMPLES * 16;
+    a2 + b1 + c1 + c2 + c3 + c4
+}
+
 /// The connection receive window, the stream receive window and the send
 /// window are at most `MAX_INBOUND_STREAM_BYTES_PER_CONNECTION` (read from
 /// the constant, not copied) at every memory limit and connection count, the
 /// stream window is at most the connection window, and the transport
 /// configuration quinn is given carries exactly those values. The cap does
-/// not bind with today's 2 MiB clamp, so this guards only a future change of
+/// not bind with today's 384 KiB clamp, so this guards only a future change of
 /// the window constants. It says nothing about a connection's total memory,
 /// which is not accounted (see `config::connection_window_bytes`).
 #[test]
@@ -1833,7 +1929,9 @@ fn transport_quic_values_and_unknown_ones() {
     assert_eq!(QuicMode::from_config_value(Some("")), QuicMode::Off);
     assert_eq!(QuicMode::default(), QuicMode::default_mode());
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    assert_eq!(QuicMode::from_config_value(None), QuicMode::Shadow);
+    assert_eq!(QuicMode::from_config_value(None), QuicMode::Prefer);
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    assert_eq!(QuicMode::from_config_value(None), QuicMode::Off);
 }
 
 /// The socket sends one datagram per transmit and receives one per call.
@@ -2647,6 +2745,9 @@ fn close_codes_reach_the_peer() {
             },
             QuicCloseCode::SessionEnded => QuicErrorKind::Refused {
                 reason: QuicRefusal::SessionEnded,
+            },
+            QuicCloseCode::RecycleForData => QuicErrorKind::Refused {
+                reason: QuicRefusal::RecycleForData,
             },
         };
         let mut sent_by_a = Vec::new();

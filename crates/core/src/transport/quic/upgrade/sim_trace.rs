@@ -47,6 +47,8 @@ struct TraceData {
     connections: Mutex<BTreeMap<SocketAddr, usize>>,
     /// Nodes that receive an extra Initial each time they allow a peer.
     initial_on_attempt: Mutex<BTreeSet<SocketAddr>>,
+    /// A data ramp start of the test's own, in seconds on the virtual clock.
+    ramp_start: Mutex<Option<u64>>,
     /// Nodes that build their paths to refuse data while they advertise the bit.
     refuse_data: Mutex<BTreeSet<SocketAddr>>,
     /// The version a peer reports, and the release it then reads as.
@@ -120,6 +122,13 @@ impl QuicUpgradeTrace {
     /// so the Initial gets there before anything the peer sends.
     pub fn send_initial_on_each_attempt(&self, node: SocketAddr) {
         self.data.initial_on_attempt.lock().insert(node);
+    }
+
+    /// Every node with no `quic-data-percent` ramps its data share from `start`
+    /// seconds of virtual time (`slice::ramp_percent`), in place of the release's
+    /// `QUIC_DATA_RAMP_START`.
+    pub fn ramp_data_from(&self, start: Duration) {
+        *self.data.ramp_start.lock() = Some(start.as_secs());
     }
 
     /// `node` advertises its data bit but builds every path to refuse data, as a
@@ -218,6 +227,10 @@ impl NodeTrace {
         if crate::transport::in_memory_socket::deliver_packet_at(self.addr, datagram, source) {
             self.record(source, 0, "injected an Initial".to_string());
         }
+    }
+
+    pub(crate) fn data_ramp_start(&self) -> Option<u64> {
+        *self.trace.data.ramp_start.lock()
     }
 
     pub(crate) fn refuses_data_while_advertising(&self) -> bool {
