@@ -50,6 +50,10 @@ When unsure which bucket a change is in, open an issue first.
 3. Check .claude/rules/git-workflow.md for PR requirements
 ```
 
+On a machine with more cores than roughly `RAM_GB / 3.5`, run step 1 with
+`CARGO_BUILD_JOBS` capped or it can exhaust memory. See "Build Resources" in
+[CONTRIBUTING.md](CONTRIBUTING.md).
+
 ### AFTER opening a PR — and before you stop
 
 **Do not open a PR you are not going to drive to a terminal state.** A terminal
@@ -187,6 +191,7 @@ Exemptions in GC deserve the same scrutiny as the original bug.
 cargo build                    # Build
 cargo test -p freenet          # Test all
 cargo fmt && cargo clippy -- -D warnings  # Lint (must match CI)
+CARGO_BUILD_JOBS=4 cargo clippy --all-targets  # Cap jobs on a high-core box
 ```
 
 Module and rule-file pointers are in "BEFORE modifying any file" above. Most
