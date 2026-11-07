@@ -88,6 +88,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_pool_panic_comes_back_as_an_error() {
         let outcome = offload_blocking(|| -> () { panic!("walk failed") }).await;
-        assert!(outcome.is_err());
+        let err = outcome.expect_err("the panic must be caught");
+        assert!(err.to_string().contains("walk failed"), "{err}");
     }
 }

@@ -3614,6 +3614,21 @@ impl Ring {
     /// When contracts are evicted (past max entries and beyond TTL), this task
     /// cleans up the local subscription state. The upstream peer will eventually
     /// prune us when updates fail to deliver.
+    /// The free-space figure the hosting sweep budgets disk against.
+    ///
+    /// `read_real` is the data-dir mount's free space (`statvfs`); a failed
+    /// read falls back to `u64::MAX`, so the disk budget clamps to its cap. In
+    /// a simulation (`SimNetwork` sets the network name on the thread its
+    /// nodes run on) the real read is skipped and the fallback used, so free
+    /// space on the machine running the tests cannot change eviction between
+    /// runs of one seed (#6123).
+    fn sweep_free_space_bytes(read_real: impl FnOnce() -> Option<u64>) -> u64 {
+        if topology_registry::get_current_network_name().is_some() {
+            return u64::MAX;
+        }
+        read_real().unwrap_or(u64::MAX)
+    }
+
     async fn sweep_get_subscription_cache(ring: Arc<Self>, interval_duration: Duration) {
         let shutdown = ring.shutdown_token();
         // Add random initial delay to prevent synchronized sweeps across peers
@@ -3882,17 +3897,8 @@ impl Ring {
             // du-walks above already ran OUTSIDE any cache lock (in the blocking
             // task); only the O(1) `set_budget_bytes` inside
             // `recompute_effective_budget` takes the cache write lock.
-            let available = if topology_registry::get_current_network_name().is_some() {
-                // A simulation (only `SimNetwork` sets the network name): use
-                // the failed-read fallback, so free space on the machine
-                // running the tests cannot change eviction between runs of
-                // one seed (#6123).
-                u64::MAX
-            } else {
-                ring.hosting_manager
-                    .disk_available_bytes()
-                    .unwrap_or(u64::MAX)
-            };
+            let available =
+                Self::sweep_free_space_bytes(|| ring.hosting_manager.disk_available_bytes());
             ring.hosting_manager.recompute_effective_budget(available);
         }
     }
@@ -8251,11 +8257,37 @@ mod k_closest_source_tests {
             "offload_blocking must wrap the disk-usage walk"
         );
         assert!(
-            code.contains(concat!(
-                "letavailable=iftopology_registry::get_current_network_name().is_some(){",
-                "u64::MAX}else{"
-            )),
-            "a simulation must not read the real free space (#6123)"
+            code.contains(
+                "letavailable=Self::sweep_free_space_bytes(||ring.hosting_manager.disk_available_bytes());"
+            ),
+            "the sweep's free space goes through the simulation gate (#6123)"
+        );
+    }
+
+    /// In a simulation the sweep's free-space figure is the fixed fallback and
+    /// the real read is never made; outside one it is the real read.
+    #[test]
+    fn sweep_free_space_ignores_the_real_read_in_a_simulation() {
+        use std::cell::Cell;
+        let reads = Cell::new(0);
+        let read = || {
+            reads.set(reads.get() + 1);
+            Some(1024)
+        };
+
+        super::topology_registry::clear_current_network_name();
+        assert_eq!(super::Ring::sweep_free_space_bytes(read), 1024);
+        assert_eq!(super::Ring::sweep_free_space_bytes(|| None), u64::MAX);
+        assert_eq!(reads.get(), 1);
+
+        super::topology_registry::set_current_network_name("free-space-gate");
+        let in_simulation = super::Ring::sweep_free_space_bytes(read);
+        super::topology_registry::clear_current_network_name();
+        assert_eq!(in_simulation, u64::MAX);
+        assert_eq!(
+            reads.get(),
+            1,
+            "a simulation must not read the real free space"
         );
     }
 

@@ -922,6 +922,31 @@ fn test_simulation_uses_no_blocking_pool_thread() {
     const CONTRACTS: u8 = 4;
     const ROUNDS: usize = 30;
 
+    // Positive control: a deliberate `spawn_blocking` on a runtime of its own
+    // must show up, or the detector is blind (tokio renamed its blocking
+    // threads, or something set a thread name) and an empty result below
+    // would mean nothing.
+    {
+        let control_before = blocking_pool_threads();
+        let control = create_runtime();
+        control
+            .block_on(tokio::task::spawn_blocking(|| {
+                std::thread::sleep(Duration::from_millis(50));
+            }))
+            .expect("control blocking task");
+        let seen = blocking_pool_threads();
+        assert!(
+            seen.difference(&control_before).next().is_some(),
+            "the detector did not see a deliberate spawn_blocking; tokio's \
+             blocking-pool thread name is no longer \"tokio-rt-worker\", so this \
+             test would pass without detecting anything"
+        );
+        drop(control);
+    }
+
+    // Taken before the network is built, so a blocking thread created while
+    // building it counts too.
+    let before = blocking_pool_threads();
     setup_deterministic_state(SEED);
     let rt = create_runtime();
     let mut sim = rt.block_on(SimNetwork::new(NAME, 1, NODES, 10, 3, 8, 3, SEED));
@@ -974,7 +999,6 @@ fn test_simulation_uses_no_blocking_pool_thread() {
     );
     sim.with_controlled_op_interval(op_interval);
 
-    let before = blocking_pool_threads();
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let watcher = {
         let stop = stop.clone();
