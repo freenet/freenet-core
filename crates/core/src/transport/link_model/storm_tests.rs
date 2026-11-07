@@ -442,46 +442,64 @@ async fn run_reverse_loss(
 #[test]
 fn receipt_loss_under_a_cap_matches_or_beats_main() {
     let mut failures = Vec::new();
-    for rate in [2_500_000u64, 1_250_000] {
+    // Override with `FREENET_RECEIPT_SEEDS` and `FREENET_RECEIPT_RATES`
+    // (comma-separated) to explore.
+    let list = |name: &str, default: &[u64]| -> Vec<u64> {
+        match std::env::var(name) {
+            Ok(v) if !v.trim().is_empty() => v
+                .split(',')
+                .map(|s| s.trim().parse().expect("decimal"))
+                .collect(),
+            _ => default.to_vec(),
+        }
+    };
+    for rate in list("FREENET_RECEIPT_RATES", &[2_500_000, 1_250_000]) {
         for loss in [0.5, 0.7, 0.9] {
-            let seed = 11;
-            let run = |cap| {
-                block_on_seeded(
-                    seed,
-                    run_reverse_loss(6 * 1024 * 1024, loss, Duration::from_secs(120), seed, cap),
-                )
-            };
-            let main = run(Cap::Main(rate));
-            let capped = run(Cap::Capped(rate));
-            let line = |label: &str, r: &ReverseLossReport| {
-                format!(
-                    "{label}: done after {:?}, {} B in flight after {IDLE_SECS} s idle, {} RTO, \
+            for seed in list("FREENET_RECEIPT_SEEDS", &[11]) {
+                let run = |cap| {
+                    block_on_seeded(
+                        seed,
+                        run_reverse_loss(
+                            6 * 1024 * 1024,
+                            loss,
+                            Duration::from_secs(120),
+                            seed,
+                            cap,
+                        ),
+                    )
+                };
+                let main = run(Cap::Main(rate));
+                let capped = run(Cap::Capped(rate));
+                let line = |label: &str, r: &ReverseLossReport| {
+                    format!(
+                        "{label}: done after {:?}, {} B in flight after {IDLE_SECS} s idle, {} RTO, \
                      {} retransmits, {} deferred, {} abandoned, {} streams failed",
-                    r.completed_after,
-                    r.probe.flightsize,
-                    r.probe.rto_expiries,
-                    r.probe.retransmissions,
-                    r.probe.retransmits_deferred,
-                    r.probe.abandoned_packets,
-                    r.probe.outbound_streams_failed,
-                )
-            };
-            let summary = format!(
-                "cap {rate} B/s, receipt loss {loss}\n  {}\n  {}",
-                line("main  ", &main),
-                line("capped", &capped)
-            );
-            eprintln!("{summary}");
-            let late = match (main.completed_after, capped.completed_after) {
-                (Some(m), Some(c)) => c > m.mul_f64(1.1),
-                (Some(_), None) => true,
-                (None, _) => false,
-            };
-            if late
-                || capped.probe.outbound_streams_failed > main.probe.outbound_streams_failed
-                || capped.probe.flightsize > main.probe.flightsize.max(64 * 1024)
-            {
-                failures.push(summary);
+                        r.completed_after,
+                        r.probe.flightsize,
+                        r.probe.rto_expiries,
+                        r.probe.retransmissions,
+                        r.probe.retransmits_deferred,
+                        r.probe.abandoned_packets,
+                        r.probe.outbound_streams_failed,
+                    )
+                };
+                let summary = format!(
+                    "cap {rate} B/s, receipt loss {loss}, seed {seed}\n  {}\n  {}",
+                    line("main  ", &main),
+                    line("capped", &capped)
+                );
+                eprintln!("{summary}");
+                let late = match (main.completed_after, capped.completed_after) {
+                    (Some(m), Some(c)) => c > m.mul_f64(1.1),
+                    (Some(_), None) => true,
+                    (None, _) => false,
+                };
+                if late
+                    || capped.probe.outbound_streams_failed > main.probe.outbound_streams_failed
+                    || capped.probe.flightsize > main.probe.flightsize.max(64 * 1024)
+                {
+                    failures.push(summary);
+                }
             }
         }
     }
