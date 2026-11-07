@@ -833,10 +833,8 @@ impl ConfigArgs {
                     Either::Right(dir) => (dir.clone(), dir, true),
                 }
             };
-            self.config_paths.config_dir = Some(config.clone());
-            if self.config_paths.data_dir.is_none() {
-                self.config_paths.data_dir = Some(data);
-            }
+            self.config_paths
+                .apply_default_dirs(config.clone(), data, is_temp_dir);
             // Skip reading config from temp directories (test scenarios) - they won't have config files
             // and may have permission issues from previous runs
             if is_temp_dir {
@@ -4500,6 +4498,24 @@ mod test_temp_root {
 }
 
 impl ConfigPathsArgs {
+    /// Fills in the directories for a run with no `--config-dir`, before
+    /// `config.toml` is read and merged.
+    ///
+    /// `data_dir` is pre-filled only for a temp dir. For a real install it is
+    /// left unset: [`Self::merge`] keeps any value already set, so a default
+    /// filled in here would beat the `data_dir` in `config.toml`, and the
+    /// persist step would then write the default back over the user's edit
+    /// (#6134). [`Self::build`] supplies the same `data_local_dir` default
+    /// when neither the command line nor the file sets one. A temp dir must be
+    /// pre-filled, because `build` can only derive a default from
+    /// `ProjectDirs`.
+    fn apply_default_dirs(&mut self, config: PathBuf, data: PathBuf, is_temp_dir: bool) {
+        self.config_dir = Some(config);
+        if is_temp_dir && self.data_dir.is_none() {
+            self.data_dir = Some(data);
+        }
+    }
+
     fn merge(&mut self, other: ConfigPaths) {
         self.config_dir.get_or_insert(other.config_dir);
         self.data_dir.get_or_insert(other.data_dir);
@@ -7812,6 +7828,109 @@ shutdown-drain-secs = 42
             "config.toml must win when both exact names are present; got the \
              config.json value instead"
         );
+    }
+
+    /// Writes the released `config.toml` with its `data_dir` line pointed at
+    /// `data_dir`, and returns the paths `read_config` parsed from it.
+    fn config_paths_from_toml_with_data_dir(dir: &Path, data_dir: &str) -> ConfigPaths {
+        let base = released_config_toml_without_secret_paths();
+        let doc = base.replace(
+            "data_dir = \"/tmp/freenet-5124\"",
+            &format!("data_dir = \"{data_dir}\""),
+        );
+        assert!(
+            doc != base,
+            "the fixture's data_dir line moved, so the file would not name {data_dir}"
+        );
+        std::fs::write(dir.join("config.toml"), doc).unwrap();
+        let cfg = ConfigArgs::read_config(&dir.to_path_buf())
+            .expect("the released config must load")
+            .expect("config.toml is present");
+        cfg.config_paths.as_ref().clone()
+    }
+
+    /// #6134. With no `--config-dir`, `data_dir` from `config.toml` must win
+    /// over the built-in default. The default used to be filled in before the
+    /// file was merged, and `merge` keeps a value that is already set, so the
+    /// file's `data_dir` was ignored and the persist step then wrote the
+    /// default back over the user's edit.
+    ///
+    /// Release builds take this branch with `is_temp_dir == false`. Test and
+    /// debug builds always get a temp dir from `default_dirs`, so the branch is
+    /// driven here through the same two calls `build_with_gateways_index`
+    /// makes, in the same order.
+    #[test]
+    fn config_toml_data_dir_beats_the_default_on_a_default_install() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_paths = config_paths_from_toml_with_data_dir(temp_dir.path(), "/srv/moved-data");
+
+        let mut args = ConfigPathsArgs::default();
+        args.apply_default_dirs(
+            PathBuf::from("/default/config"),
+            PathBuf::from("/default/data"),
+            false,
+        );
+        args.merge(file_paths);
+
+        assert_eq!(
+            args.data_dir.as_deref(),
+            Some(Path::new("/srv/moved-data")),
+            "config.toml's data_dir must not be overridden by the default"
+        );
+        assert_eq!(
+            args.config_dir.as_deref(),
+            Some(Path::new("/default/config")),
+            "the config dir is where config.toml was found, so it stays the default"
+        );
+    }
+
+    /// An explicit `--data-dir` / `DATA_DIR` still beats `config.toml`.
+    #[test]
+    fn explicit_data_dir_beats_config_toml_on_a_default_install() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_paths = config_paths_from_toml_with_data_dir(temp_dir.path(), "/srv/moved-data");
+
+        let mut args = ConfigPathsArgs {
+            data_dir: Some(PathBuf::from("/from/the/command/line")),
+            ..Default::default()
+        };
+        args.apply_default_dirs(
+            PathBuf::from("/default/config"),
+            PathBuf::from("/default/data"),
+            false,
+        );
+        args.merge(file_paths);
+
+        assert_eq!(
+            args.data_dir.as_deref(),
+            Some(Path::new("/from/the/command/line"))
+        );
+    }
+
+    /// A temp dir must still be pre-filled: `ConfigPathsArgs::build` can only
+    /// derive a default data dir from `ProjectDirs`, and reaches
+    /// `unreachable!` when there is none. The file is not read for a temp dir,
+    /// so pre-filling cannot hide a `data_dir` there.
+    #[test]
+    fn temp_dir_default_is_still_prefilled() {
+        let mut args = ConfigPathsArgs::default();
+        args.apply_default_dirs(
+            PathBuf::from("/tmp/freenet-x"),
+            PathBuf::from("/tmp/freenet-x"),
+            true,
+        );
+        assert_eq!(args.data_dir.as_deref(), Some(Path::new("/tmp/freenet-x")));
+
+        let mut args = ConfigPathsArgs {
+            data_dir: Some(PathBuf::from("/explicit")),
+            ..Default::default()
+        };
+        args.apply_default_dirs(
+            PathBuf::from("/tmp/freenet-x"),
+            PathBuf::from("/tmp/freenet-x"),
+            true,
+        );
+        assert_eq!(args.data_dir.as_deref(), Some(Path::new("/explicit")));
     }
 
     /// With no exact `config.toml` / `config.json`, the fuzzy fallback must
