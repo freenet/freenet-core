@@ -414,7 +414,12 @@ async fn run_reverse_loss(
             }
         }
     }
-    let mut idle = vt.sleep(Duration::from_secs(IDLE_SECS));
+    // `FREENET_RECEIPT_IDLE_SECS` overrides the idle time, to explore.
+    let idle_secs = std::env::var("FREENET_RECEIPT_IDLE_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(IDLE_SECS);
+    let mut idle = vt.sleep(Duration::from_secs(idle_secs));
     loop {
         tokio::select! {
             biased;
