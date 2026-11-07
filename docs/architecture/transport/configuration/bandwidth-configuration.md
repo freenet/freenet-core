@@ -551,8 +551,10 @@ megabytes. These are estimates from the slot-lottery model, not guarantees. The 
 is a higher limit; there is no per-stream admission control.
 
 A slow stream also holds broadcast capacity: the broadcast queue keeps a send's slot
-until its stream completes, up to `STREAM_COMPLETION_TIMEOUT` (120 s), so a cap that
-makes streams slow also slows contract update fan-out.
+until its stream completes, up to `STREAM_PERMIT_HOLD` (120 s), so a cap that makes
+streams slow also slows contract update fan-out. The send goes on waiting for the
+stream after that, without the slot, up to a size-scaled limit just under the
+receiver's age limit (`stream_completion_timeout`).
 
 ## Source Code
 

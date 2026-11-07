@@ -228,7 +228,9 @@ pub(super) fn initial_paced_rate(
 /// get at most the receiver's rate), and it assumes receivers use the current
 /// `MIN_INBOUND_STREAM_RATE_BYTES_PER_SEC`. Low limits still slow
 /// large transfers past other deadlines (the 10-minute streaming PUT/GET
-/// attempt ceiling, the 120 s broadcast completion wait).
+/// attempt ceiling). The broadcast completion wait stops a tenth short of the
+/// receiver's age limit (`broadcast_queue::stream_completion_timeout`), so it
+/// allows for a stream at about half this rate (about 55%).
 pub(crate) const MIN_BANDWIDTH_LIMIT: usize =
     2 * streaming::MIN_INBOUND_STREAM_RATE_BYTES_PER_SEC as usize;
 
