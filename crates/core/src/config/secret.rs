@@ -16,29 +16,6 @@ pub(super) const CIPHER_SIZE: usize = 32;
 /// reuse it across restarts.
 pub(crate) const DELEGATE_CIPHER_FILENAME: &str = "delegate_cipher";
 
-/// Filename (relative to `secrets_dir`) of the auto-persisted transport
-/// keypair.
-const TRANSPORT_KEYPAIR_FILENAME: &str = "transport_keypair";
-
-/// Keypair and cipher paths read from `config.toml` that are only the
-/// automatic location under that file's own secrets dir, rather than a path
-/// an operator chose.
-///
-/// `build()` writes the resolved secret paths into `config.toml` as absolute
-/// paths, so every install that has booted has them. If they were merged
-/// back as explicit paths, they would pin the identity and delegate cipher to
-/// the old data dir after `data_dir` is changed: a node whose data was moved
-/// would fail to open them, and one whose data was copied would keep reading
-/// the old copy (#6134). [`SecretArgs::merge`] returns them here instead, and
-/// [`SecretArgs::build_with_previous`] looks under the resolved secrets dir
-/// first and falls back to these, so an unchanged install loads the same files
-/// and a node pointed at a new, empty data dir keeps its identity as before.
-#[derive(Debug, Default)]
-pub(super) struct PreviousSecretPaths {
-    transport_keypair: Option<PathBuf>,
-    cipher: Option<PathBuf>,
-}
-
 /// Historical `DelegateRequest::DEFAULT_NONCE` value, retained in core
 /// purely for **read-side legacy decrypt** of on-disk delegate secret
 /// files that pre-date the per-write-nonce format (freenet-core PR #4143).
@@ -115,50 +92,28 @@ fn save_cipher_new(path: &Path, key: &[u8; CIPHER_SIZE]) -> std::io::Result<()> 
 }
 
 impl ConfigArgs {
-    pub(super) fn read_secrets(
+    /// The secret paths a config file names, WITHOUT opening them.
+    ///
+    /// Only the paths are used: [`SecretArgs::merge`] keeps the paths and drops
+    /// this value's key material, and [`SecretArgs::build`] opens the files
+    /// once the data dir has been resolved. Opening them here, as this function
+    /// used to, failed before a path inside a moved data dir could be rebased
+    /// onto the new one (#6134). A missing file still fails loudly: `build`
+    /// cannot open it. The key material here is ephemeral and random, never a
+    /// known key.
+    pub(super) fn secret_paths_from_file(
         path_to_key: Option<PathBuf>,
         path_to_nonce: Option<PathBuf>,
         path_to_cipher: Option<PathBuf>,
-    ) -> std::io::Result<Secrets> {
-        let transport_keypair = if let Some(ref path_to_key) = path_to_key {
-            read_transport_keypair(path_to_key)?
-        } else {
-            TransportKeypair::new()
-        };
-        // Nonces became per-write in PR #4143 — the file-based nonce is no
-        // longer used for encryption. If the operator still has an explicit
-        // `--nonce` path on their config, honor the file content for legacy
-        // decrypt; otherwise use the historical default so pre-#4143 on-disk
-        // files written under the old fallback path remain readable.
-        let nonce = if let Some(ref path_to_nonce) = path_to_nonce {
-            tracing::warn!(
-                "`nonce` config is deprecated since per-write nonces landed; the file at \
-                 {path:?} is used only as a legacy-decrypt nonce for pre-existing secrets.",
-                path = path_to_nonce
-            );
-            read_nonce(path_to_nonce)?
-        } else {
-            LEGACY_DEFAULT_NONCE
-        };
-        // No `--cipher` path → caller is using the legacy "read_secrets"
-        // entry that does not know about secrets_dir; preserve legacy
-        // semantics by populating with the historical default so existing
-        // ciphertexts remain decryptable. New nodes go through
-        // `SecretArgs::build`, which auto-generates a fresh cipher.
-        let cipher = if let Some(ref path_to_cipher) = path_to_cipher {
-            read_cipher(path_to_cipher)?
-        } else {
-            LEGACY_DEFAULT_CIPHER
-        };
-
-        Ok(Secrets {
-            transport_keypair,
+    ) -> Secrets {
+        Secrets {
+            transport_keypair: TransportKeypair::new(),
             transport_keypair_path: path_to_key,
-            nonce,
+            nonce: LEGACY_DEFAULT_NONCE,
             nonce_path: path_to_nonce,
-            cipher,
+            cipher: generate_cipher_key(),
             cipher_path: path_to_cipher,
-        })
+        }
     }
 }
 
@@ -179,25 +134,13 @@ pub struct SecretArgs {
 
 impl SecretArgs {
     pub(super) fn build(self, secrets_dir: Option<&Path>) -> std::io::Result<Secrets> {
-        self.build_with_previous(secrets_dir, &PreviousSecretPaths::default())
-    }
-
-    /// [`Self::build`], falling back to `previous` for an automatic keypair or
-    /// cipher that is not under `secrets_dir` (see [`PreviousSecretPaths`]).
-    pub(super) fn build_with_previous(
-        self,
-        secrets_dir: Option<&Path>,
-        previous: &PreviousSecretPaths,
-    ) -> std::io::Result<Secrets> {
-        let previous_keypair = previous.transport_keypair.as_ref().filter(|p| p.exists());
-        let previous_cipher = previous.cipher.as_ref().filter(|p| p.exists());
         let (transport_keypair_path, transport_keypair) =
             if let Some(ref explicit_path) = self.transport_keypair {
                 // Explicit --transport-keypair path provided: load from it
                 let keypair = read_transport_keypair(explicit_path)?;
                 (self.transport_keypair, keypair)
             } else if let Some(dir) = secrets_dir {
-                let default_path = dir.join(TRANSPORT_KEYPAIR_FILENAME);
+                let default_path = dir.join("transport_keypair");
                 if default_path.exists() {
                     // Auto-load persisted keypair
                     tracing::info!(
@@ -206,14 +149,6 @@ impl SecretArgs {
                     );
                     let keypair = read_transport_keypair(&default_path)?;
                     (Some(default_path), keypair)
-                } else if let Some(previous_path) = previous_keypair {
-                    tracing::warn!(
-                        path = %previous_path.display(),
-                        "No transport keypair in the configured data dir; loading it from \
-                         its previous location"
-                    );
-                    let keypair = read_transport_keypair(previous_path)?;
-                    (Some(previous_path.clone()), keypair)
                 } else {
                     // Generate new keypair and persist it
                     std::fs::create_dir_all(dir)?;
@@ -262,14 +197,6 @@ impl SecretArgs {
                 );
                 let cipher = read_cipher(&default_path)?;
                 (Some(default_path), cipher)
-            } else if let Some(previous_path) = previous_cipher {
-                tracing::warn!(
-                    path = %previous_path.display(),
-                    "No delegate cipher in the configured data dir; loading it from its \
-                     previous location"
-                );
-                let cipher = read_cipher(previous_path)?;
-                (Some(previous_path.clone()), cipher)
             } else {
                 std::fs::create_dir_all(dir)?;
                 let cipher = generate_cipher_key();
@@ -315,33 +242,12 @@ impl SecretArgs {
         })
     }
 
-    /// Merges the secret paths read from `config.toml`. `file_secrets_dirs`
-    /// are the secrets dirs that same file names; a keypair or cipher path
-    /// that is only the automatic file under one of them is returned in
-    /// [`PreviousSecretPaths`] instead of being merged as explicit.
-    pub(super) fn merge(
-        &mut self,
-        mut other: Secrets,
-        file_secrets_dirs: &[PathBuf],
-    ) -> PreviousSecretPaths {
-        let is_automatic = |path: &Path, filename: &str| {
-            path.file_name() == Some(std::ffi::OsStr::new(filename))
-                && path
-                    .parent()
-                    .is_some_and(|dir| file_secrets_dirs.iter().any(|d| d == dir))
-        };
-        let mut previous = PreviousSecretPaths::default();
-
+    pub(super) fn merge(&mut self, mut other: Secrets) {
         // `Secrets` is `Drop` (zeroizes cipher/nonce); we can't move
         // path fields out of `other` directly, so swap them out with
         // `mem::take` and let `other` drop with `None` placeholders.
         if self.transport_keypair.is_none() {
-            match std::mem::take(&mut other.transport_keypair_path) {
-                Some(path) if is_automatic(&path, TRANSPORT_KEYPAIR_FILENAME) => {
-                    previous.transport_keypair = Some(path);
-                }
-                path => self.transport_keypair = path,
-            }
+            self.transport_keypair = std::mem::take(&mut other.transport_keypair_path);
         }
 
         if self.nonce.is_none() {
@@ -349,14 +255,8 @@ impl SecretArgs {
         }
 
         if self.cipher.is_none() {
-            match std::mem::take(&mut other.cipher_path) {
-                Some(path) if is_automatic(&path, DELEGATE_CIPHER_FILENAME) => {
-                    previous.cipher = Some(path);
-                }
-                path => self.cipher = path,
-            }
+            self.cipher = std::mem::take(&mut other.cipher_path);
         }
-        previous
     }
 }
 
@@ -821,141 +721,5 @@ mod tests {
             seeded.transport_keypair.public(),
             "explicit path should override auto-persisted keypair"
         );
-    }
-
-    /// Builds secrets in `dir`, as a node's first boot does, and returns them
-    /// as `config.toml` would carry them on the next boot.
-    fn persisted_secrets_in(dir: &Path) -> Secrets {
-        SecretArgs::default().build(Some(dir)).unwrap()
-    }
-
-    /// #6134: the data dir was MOVED and `data_dir` edited. The persisted
-    /// keypair and cipher paths point at the old dir, which no longer exists.
-    /// They must be found under the new secrets dir rather than failing to
-    /// open the old path.
-    #[test]
-    fn moved_data_dir_loads_secrets_from_the_new_location() {
-        let tmp = tempfile::tempdir().unwrap();
-        let old = tmp.path().join("old/secrets");
-        let new = tmp.path().join("new/secrets");
-        let seeded = persisted_secrets_in(&old);
-        std::fs::create_dir_all(new.parent().unwrap()).unwrap();
-        std::fs::rename(&old, &new).unwrap();
-
-        let mut args = SecretArgs::default();
-        let previous = args.merge(
-            persisted_secrets_in_file(&seeded),
-            std::slice::from_ref(&old),
-        );
-        assert!(args.transport_keypair.is_none() && args.cipher.is_none());
-        let loaded = args.build_with_previous(Some(&new), &previous).unwrap();
-
-        assert_eq!(
-            loaded.transport_keypair_path.as_deref(),
-            Some(new.join(TRANSPORT_KEYPAIR_FILENAME).as_path())
-        );
-        assert_eq!(
-            loaded.cipher_path.as_deref(),
-            Some(new.join(DELEGATE_CIPHER_FILENAME).as_path())
-        );
-        assert_eq!(
-            loaded.transport_keypair.public(),
-            seeded.transport_keypair.public()
-        );
-        assert_eq!(loaded.cipher, seeded.cipher);
-    }
-
-    /// The data dir was COPIED: both copies exist. The node must use the copy
-    /// in the configured dir, so deleting the old one later breaks nothing.
-    #[test]
-    fn copied_data_dir_prefers_the_configured_copy() {
-        let tmp = tempfile::tempdir().unwrap();
-        let old = tmp.path().join("old/secrets");
-        let new = tmp.path().join("new/secrets");
-        let seeded = persisted_secrets_in(&old);
-        std::fs::create_dir_all(&new).unwrap();
-        for name in [TRANSPORT_KEYPAIR_FILENAME, DELEGATE_CIPHER_FILENAME] {
-            std::fs::copy(old.join(name), new.join(name)).unwrap();
-        }
-
-        let mut args = SecretArgs::default();
-        let previous = args.merge(
-            persisted_secrets_in_file(&seeded),
-            std::slice::from_ref(&old),
-        );
-        let loaded = args.build_with_previous(Some(&new), &previous).unwrap();
-
-        assert_eq!(
-            loaded.transport_keypair_path.as_deref(),
-            Some(new.join(TRANSPORT_KEYPAIR_FILENAME).as_path())
-        );
-        assert_eq!(
-            loaded.cipher_path.as_deref(),
-            Some(new.join(DELEGATE_CIPHER_FILENAME).as_path())
-        );
-    }
-
-    /// `data_dir` pointed at a new, EMPTY dir while the old secrets still
-    /// exist: the node keeps its identity and cipher from the old location,
-    /// as it did before #6134, rather than silently generating new ones.
-    #[test]
-    fn empty_new_data_dir_keeps_the_previous_identity() {
-        let tmp = tempfile::tempdir().unwrap();
-        let old = tmp.path().join("old/secrets");
-        let new = tmp.path().join("new/secrets");
-        let seeded = persisted_secrets_in(&old);
-
-        let mut args = SecretArgs::default();
-        let previous = args.merge(
-            persisted_secrets_in_file(&seeded),
-            std::slice::from_ref(&old),
-        );
-        let loaded = args.build_with_previous(Some(&new), &previous).unwrap();
-
-        assert_eq!(
-            loaded.transport_keypair_path.as_deref(),
-            Some(old.join(TRANSPORT_KEYPAIR_FILENAME).as_path())
-        );
-        assert_eq!(
-            loaded.transport_keypair.public(),
-            seeded.transport_keypair.public()
-        );
-        assert_eq!(loaded.cipher, seeded.cipher);
-        assert!(!new.join(TRANSPORT_KEYPAIR_FILENAME).exists());
-    }
-
-    /// A keypair or cipher path an operator chose (not the automatic file
-    /// under the file's own secrets dir) stays explicit and wins.
-    #[test]
-    fn operator_chosen_secret_paths_stay_explicit() {
-        let tmp = tempfile::tempdir().unwrap();
-        let chosen = tmp.path().join("keys");
-        let file_secrets_dir = tmp.path().join("data/secrets");
-        let seeded = persisted_secrets_in(&chosen);
-
-        let mut args = SecretArgs::default();
-        let previous = args.merge(persisted_secrets_in_file(&seeded), &[file_secrets_dir]);
-        assert_eq!(
-            args.transport_keypair.as_deref(),
-            Some(chosen.join(TRANSPORT_KEYPAIR_FILENAME).as_path())
-        );
-        assert_eq!(
-            args.cipher.as_deref(),
-            Some(chosen.join(DELEGATE_CIPHER_FILENAME).as_path())
-        );
-        assert!(previous.transport_keypair.is_none() && previous.cipher.is_none());
-    }
-
-    /// A copy of `secrets`' paths, the way `read_config` hands them to
-    /// `merge` (the key material itself is re-read from disk by `build`).
-    fn persisted_secrets_in_file(secrets: &Secrets) -> Secrets {
-        Secrets {
-            transport_keypair: TransportKeypair::new(),
-            transport_keypair_path: secrets.transport_keypair_path.clone(),
-            nonce: LEGACY_DEFAULT_NONCE,
-            nonce_path: None,
-            cipher: [0; CIPHER_SIZE],
-            cipher_path: secrets.cipher_path.clone(),
-        }
     }
 }

@@ -722,11 +722,11 @@ impl ConfigArgs {
                                 .try_into::<Config>()
                                 .map_err(invalid_data)?
                         };
-                        let secrets = Self::read_secrets(
+                        let secrets = Self::secret_paths_from_file(
                             config.secrets.transport_keypair_path.clone(),
                             config.secrets.nonce_path.clone(),
                             config.secrets.cipher_path.clone(),
-                        )?;
+                        );
                         config.secrets = secrets;
                         Ok(Some(config))
                     }
@@ -781,11 +781,11 @@ impl ConfigArgs {
                         } else {
                             serde_json::from_str::<Config>(&content)?
                         };
-                        let secrets = Self::read_secrets(
+                        let secrets = Self::secret_paths_from_file(
                             config.secrets.transport_keypair_path.clone(),
                             config.secrets.nonce_path.clone(),
                             config.secrets.cipher_path.clone(),
-                        )?;
+                        );
                         config.secrets = secrets;
                         Ok(Some(config))
                     }
@@ -866,17 +866,24 @@ impl ConfigArgs {
         // treatment; the grant that widens it has to match.
         let cidrs_granted_this_boot = self.ws_api.allowed_source_cidrs.clone();
 
-        // Keypair/cipher paths from the file that are only the automatic
-        // location under its own secrets dir; see `PreviousSecretPaths`.
-        let mut previous_secrets = secret::PreviousSecretPaths::default();
+        // The data dir the boot that wrote `config.toml` used, and which secret
+        // paths the command line already set; see `rebase_file_secret_paths`.
+        let mut file_secret_paths: Option<(PathBuf, [bool; 3])> = None;
 
         // merge the configuration from the file with the command line arguments
         if let Some(cfg) = cfg {
-            let file_secrets_dirs = [
-                cfg.config_paths.secrets_dir(OperationMode::Network),
-                cfg.config_paths.secrets_dir(OperationMode::Local),
+            let from_cli = [
+                self.secrets.transport_keypair.is_some(),
+                self.secrets.nonce.is_some(),
+                self.secrets.cipher.is_some(),
             ];
-            previous_secrets = self.secrets.merge(cfg.secrets, &file_secrets_dirs);
+            // The file's `secrets_dir` is never read back as a setting, so it
+            // still records `<data dir>/secrets` from the boot that wrote it,
+            // even after the user edits `data_dir`.
+            if let Some(previous_data_dir) = cfg.config_paths.secrets_dir.parent() {
+                file_secret_paths = Some((previous_data_dir.to_path_buf(), from_cli));
+            }
+            self.secrets.merge(cfg.secrets);
             self.mode.get_or_insert(cfg.mode);
             // GHSA-824h-7x5x-wfmf upgrade migration. `build()` persists the
             // RESOLVED config, so every node that has ever booted in network
@@ -1184,9 +1191,15 @@ impl ConfigArgs {
         let mode = self.mode.unwrap_or(OperationMode::Network);
         let config_paths = self.config_paths.build(self.id.as_deref())?;
 
-        let secrets = self
-            .secrets
-            .build_with_previous(Some(&config_paths.secrets_dir(mode)), &previous_secrets)?;
+        if let Some((previous_data_dir, from_cli)) = &file_secret_paths {
+            rebase_file_secret_paths(
+                &mut self.secrets,
+                from_cli,
+                previous_data_dir,
+                &config_paths.data_dir,
+            );
+        }
+        let secrets = self.secrets.build(Some(&config_paths.secrets_dir(mode)))?;
 
         let peer_id = self
             .network_api
@@ -4503,6 +4516,55 @@ mod test_temp_root {
             // Held until the process exits; the kernel releases it then.
             std::mem::forget(file);
             Ok(())
+        }
+    }
+}
+
+/// Moves secret paths that `config.toml` placed inside the previous boot's
+/// data dir to the same place inside the data dir this boot resolved, when the
+/// two differ and the file exists at the new location.
+///
+/// `build()` writes the keypair, nonce and cipher into `config.toml` as
+/// absolute paths under the data dir. When a user moves their data and edits
+/// `data_dir` (#6134), those paths would otherwise keep the node reading the
+/// old location: failing to open it after a move, or reading the stale copy
+/// after a copy.
+///
+/// A path is rebased only when the file is already there, so this never
+/// creates key material and never changes which file is used except to its
+/// moved copy. The previous data dir is the parent of the file's persisted
+/// `secrets_dir`. Paths given on the command line (`from_cli`), paths outside
+/// the previous data dir, and paths with nothing at the new location are left alone and
+/// stay explicit, so a missing file still fails loudly in `SecretArgs::build`
+/// instead of generating a new identity. A relative path under the data dir,
+/// such as `secrets/local/transport_keypair`, keeps its suffix.
+fn rebase_file_secret_paths(
+    secrets: &mut SecretArgs,
+    from_cli: &[bool; 3],
+    previous_data_dir: &Path,
+    data_dir: &Path,
+) {
+    if previous_data_dir == data_dir {
+        return;
+    }
+    let paths = [
+        &mut secrets.transport_keypair,
+        &mut secrets.nonce,
+        &mut secrets.cipher,
+    ];
+    for (path, set_on_cli) in paths.into_iter().zip(from_cli) {
+        if *set_on_cli {
+            continue;
+        }
+        let Some(current) = path.as_ref() else {
+            continue;
+        };
+        let Ok(relative) = current.strip_prefix(previous_data_dir) else {
+            continue;
+        };
+        let moved = data_dir.join(relative);
+        if moved.exists() {
+            *path = Some(moved);
         }
     }
 }
@@ -7899,42 +7961,314 @@ shutdown-drain-secs = 42
         );
     }
 
-    /// The tests above drive `apply_default_dirs` then `merge` by hand,
-    /// because test builds never reach the release branch. This pins that
-    /// `build_with_gateways_index` really does the same: the default branch
-    /// goes through `apply_default_dirs` (no direct `data_dir` pre-fill), it
-    /// runs before the file is merged, and the file's automatic secret paths
-    /// are handed to the build as fallbacks rather than merged as explicit.
+    /// `body` with `//` comments removed and all whitespace dropped, so a pin
+    /// matches live code only and is not defeated by rustfmt rewrapping a
+    /// call across lines.
+    fn live_code_compact(body: &str) -> String {
+        body.lines()
+            .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+            .collect::<String>()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect()
+    }
+
+    /// The tests above drive `apply_default_dirs`, `merge` and
+    /// `rebase_file_secret_paths` by hand, because test builds never reach the
+    /// release branch of `build_with_gateways_index`. This pins that the real
+    /// function does the same, in the same order, with nothing commented out:
+    /// the default branch goes through `apply_default_dirs` with the computed
+    /// `is_temp_dir` and makes no direct `data_dir` assignment, the defaults
+    /// are applied before the file is merged, and the file's secret paths are
+    /// rebased before the secrets are built.
     #[test]
     fn build_resolves_the_default_data_dir_through_apply_default_dirs() {
-        let build = extract_fn_body(
+        let build = live_code_compact(extract_fn_body(
             production_source(),
             "async fn build_with_gateways_index(mut self, gateways_index: &str)",
-        );
-        let apply = build
-            .find(".apply_default_dirs(")
-            .expect("the default-dir branch must go through apply_default_dirs (#6134)");
-        assert!(
-            !build.contains("config_paths.data_dir = Some("),
-            "build_with_gateways_index pre-fills data_dir directly again, so the \
-             default would beat config.toml's data_dir (#6134)"
-        );
-        let merge = build
-            .find("self.config_paths.merge(")
-            .expect("build_with_gateways_index must merge the file's paths");
+        ));
+        let find = |needle: &str| {
+            build
+                .find(needle)
+                .unwrap_or_else(|| panic!("build_with_gateways_index no longer has `{needle}`"))
+        };
+        let apply = find("self.config_paths.apply_default_dirs(config.clone(),data,is_temp_dir);");
+        for forbidden in [
+            ".data_dir=Some(",
+            ".data_dir.get_or_insert",
+            ".data_dir.replace(",
+            ".data_dir.insert(",
+        ] {
+            assert!(
+                !build.contains(forbidden),
+                "build_with_gateways_index sets data_dir directly (`{forbidden}`), so a \
+                 default could beat config.toml's data_dir again (#6134)"
+            );
+        }
+        let merge = find("self.config_paths.merge(cfg.config_paths.as_ref().clone());");
         assert!(
             apply < merge,
             "the defaults must be applied before the file is merged"
         );
+
+        let from_cli = find("letfrom_cli=[self.secrets.transport_keypair.is_some(),");
+        let secrets_merge = find("self.secrets.merge(cfg.secrets);");
         assert!(
-            build.contains("self.secrets.merge(cfg.secrets, &file_secrets_dirs)"),
-            "the file's secret paths must be merged against the file's own secrets dirs"
+            from_cli < secrets_merge,
+            "which secret paths came from the command line must be recorded before the \
+             file is merged into them"
+        );
+        let rebase = find(
+            "rebase_file_secret_paths(&mutself.secrets,from_cli,previous_data_dir,&config_paths.data_dir,);",
+        );
+        let secrets_build = find("self.secrets.build(Some(&config_paths.secrets_dir(mode)))?;");
+        assert!(
+            rebase < secrets_build,
+            "secret paths must be rebased onto the resolved data dir before they are opened"
+        );
+    }
+
+    /// Writes `config.toml` into `config_dir` as a boot whose data dir was
+    /// `previous_data_dir` left it, secret paths included, with `data_dir`
+    /// then edited to `edited_data_dir`. The deprecated `nonce` line is
+    /// dropped: no node writes one unless an operator supplied it.
+    fn write_config_as_left_by(
+        config_dir: &Path,
+        previous_data_dir: &Path,
+        edited_data_dir: &Path,
+    ) {
+        let previous = previous_data_dir.to_str().unwrap();
+        let doc: String = RELEASED_CONFIG_TOML
+            .lines()
+            .filter(|line| !line.starts_with("nonce = "))
+            .map(|line| line.replace("/tmp/freenet-5124", previous) + "\n")
+            .collect();
+        let edited = doc.replace(
+            &format!("data_dir = \"{previous}\""),
+            &format!("data_dir = \"{}\"", edited_data_dir.to_str().unwrap()),
         );
         assert!(
-            build.contains(
-                ".build_with_previous(Some(&config_paths.secrets_dir(mode)), &previous_secrets)"
-            ),
-            "the secrets must be built with the file's automatic paths as fallbacks"
+            edited != doc || previous_data_dir == edited_data_dir,
+            "the fixture's data_dir line moved"
+        );
+        std::fs::create_dir_all(config_dir).unwrap();
+        std::fs::write(config_dir.join("config.toml"), edited).unwrap();
+    }
+
+    /// Resolves the secrets for a boot whose data dir is `data_dir`, through
+    /// the same steps as `build_with_gateways_index` (pinned by
+    /// `build_resolves_the_default_data_dir_through_apply_default_dirs`).
+    fn secrets_after_boot(config_dir: &Path, data_dir: &Path) -> std::io::Result<Secrets> {
+        let cfg =
+            ConfigArgs::read_config(&config_dir.to_path_buf())?.expect("config.toml is present");
+        let mut secrets = SecretArgs::default();
+        let from_cli = [false; 3];
+        let previous_data_dir = cfg.config_paths.secrets_dir.parent().unwrap().to_path_buf();
+        secrets.merge(cfg.secrets);
+        rebase_file_secret_paths(&mut secrets, &from_cli, &previous_data_dir, data_dir);
+        secrets.build(Some(&data_dir.join("secrets")))
+    }
+
+    /// #6134: the user MOVED their data dir and edited `data_dir`. The
+    /// keypair and cipher paths in `config.toml` still name the old location,
+    /// which is gone. Reading the config must not fail on them, and the node
+    /// must load the moved files, keeping its identity and cipher.
+    #[test]
+    fn moved_data_dir_loads_the_moved_keypair_and_cipher() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (old, new, config_dir) = (
+            tmp.path().join("old"),
+            tmp.path().join("new"),
+            tmp.path().join("config"),
+        );
+        let seeded = SecretArgs::default()
+            .build(Some(&old.join("secrets")))
+            .unwrap();
+        write_config_as_left_by(&config_dir, &old, &new);
+        std::fs::rename(&old, &new).unwrap();
+
+        let secrets = secrets_after_boot(&config_dir, &new)
+            .expect("a moved data dir must boot, not fail on the old secret paths");
+        assert_eq!(
+            secrets.transport_keypair_path.as_deref(),
+            Some(new.join("secrets/transport_keypair").as_path())
+        );
+        assert_eq!(
+            secrets.cipher_path.as_deref(),
+            Some(new.join("secrets/delegate_cipher").as_path())
+        );
+        assert_eq!(
+            secrets.transport_keypair.public(),
+            seeded.transport_keypair.public()
+        );
+        assert_eq!(secrets.cipher, seeded.cipher);
+    }
+
+    /// The data dir was COPIED, so both copies exist: the node must use the
+    /// copy in the configured dir, so that deleting the old one breaks nothing.
+    #[test]
+    fn copied_data_dir_uses_the_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (old, new, config_dir) = (
+            tmp.path().join("old"),
+            tmp.path().join("new"),
+            tmp.path().join("config"),
+        );
+        SecretArgs::default()
+            .build(Some(&old.join("secrets")))
+            .unwrap();
+        write_config_as_left_by(&config_dir, &old, &new);
+        std::fs::create_dir_all(new.join("secrets")).unwrap();
+        for name in ["transport_keypair", "delegate_cipher"] {
+            std::fs::copy(
+                old.join("secrets").join(name),
+                new.join("secrets").join(name),
+            )
+            .unwrap();
+        }
+
+        let secrets = secrets_after_boot(&config_dir, &new).unwrap();
+        assert_eq!(
+            secrets.transport_keypair_path.as_deref(),
+            Some(new.join("secrets/transport_keypair").as_path())
+        );
+        assert_eq!(
+            secrets.cipher_path.as_deref(),
+            Some(new.join("secrets/delegate_cipher").as_path())
+        );
+    }
+
+    /// `data_dir` now names an EMPTY dir and the old secrets still exist: the
+    /// node keeps reading them, exactly as before #6134, and generates nothing
+    /// in the new dir.
+    #[test]
+    fn empty_new_data_dir_keeps_the_existing_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (old, new, config_dir) = (
+            tmp.path().join("old"),
+            tmp.path().join("new"),
+            tmp.path().join("config"),
+        );
+        let seeded = SecretArgs::default()
+            .build(Some(&old.join("secrets")))
+            .unwrap();
+        write_config_as_left_by(&config_dir, &old, &new);
+
+        let secrets = secrets_after_boot(&config_dir, &new).unwrap();
+        assert_eq!(
+            secrets.transport_keypair_path.as_deref(),
+            Some(old.join("secrets/transport_keypair").as_path())
+        );
+        assert_eq!(
+            secrets.transport_keypair.public(),
+            seeded.transport_keypair.public()
+        );
+        assert_eq!(secrets.cipher, seeded.cipher);
+        assert!(!new.join("secrets/transport_keypair").exists());
+        assert!(!new.join("secrets/delegate_cipher").exists());
+    }
+
+    /// The keys exist NOWHERE, e.g. the data dir is on a drive that is not
+    /// mounted yet. That must stay a hard error, never a new identity.
+    #[test]
+    fn missing_secrets_fail_loudly_instead_of_regenerating() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (old, new, config_dir) = (
+            tmp.path().join("old"),
+            tmp.path().join("new"),
+            tmp.path().join("config"),
+        );
+        SecretArgs::default()
+            .build(Some(&old.join("secrets")))
+            .unwrap();
+        write_config_as_left_by(&config_dir, &old, &new);
+        std::fs::remove_dir_all(&old).unwrap();
+
+        secrets_after_boot(&config_dir, &new)
+            .expect_err("missing key files must fail, not be regenerated");
+        assert!(!new.join("secrets/transport_keypair").exists());
+        assert!(!new.join("secrets/delegate_cipher").exists());
+
+        // Same when data_dir was not edited at all.
+        let unedited = tmp.path().join("config-unedited");
+        write_config_as_left_by(&unedited, &old, &old);
+        secrets_after_boot(&unedited, &old).expect_err("missing key files must fail");
+        assert!(!old.join("secrets/transport_keypair").exists());
+    }
+
+    /// A node whose keypair lives under `secrets/local/` (an install first
+    /// booted in local mode) keeps that suffix when the data dir moves.
+    #[test]
+    fn moved_data_dir_keeps_a_local_mode_suffix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (old, new, config_dir) = (
+            tmp.path().join("old"),
+            tmp.path().join("new"),
+            tmp.path().join("config"),
+        );
+        let seeded = SecretArgs::default()
+            .build(Some(&old.join("secrets/local")))
+            .unwrap();
+        write_config_as_left_by(&config_dir, &old, &new);
+        let doc = std::fs::read_to_string(config_dir.join("config.toml")).unwrap();
+        let local_doc = doc
+            .replace(
+                "secrets/transport_keypair\"",
+                "secrets/local/transport_keypair\"",
+            )
+            .replace(
+                "secrets/delegate_cipher\"",
+                "secrets/local/delegate_cipher\"",
+            );
+        assert!(local_doc != doc);
+        std::fs::write(config_dir.join("config.toml"), local_doc).unwrap();
+        std::fs::rename(&old, &new).unwrap();
+
+        let secrets = secrets_after_boot(&config_dir, &new).unwrap();
+        assert_eq!(
+            secrets.transport_keypair_path.as_deref(),
+            Some(new.join("secrets/local/transport_keypair").as_path())
+        );
+        assert_eq!(
+            secrets.transport_keypair.public(),
+            seeded.transport_keypair.public()
+        );
+    }
+
+    /// Paths from the command line, and paths outside the previous data dir,
+    /// are never rebased, even when a file exists at the would-be new path.
+    #[test]
+    fn cli_and_outside_secret_paths_are_not_rebased() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (old, new) = (tmp.path().join("old"), tmp.path().join("new"));
+        std::fs::create_dir_all(new.join("secrets")).unwrap();
+        for name in ["transport_keypair", "nonce", "delegate_cipher"] {
+            std::fs::write(new.join("secrets").join(name), b"x").unwrap();
+        }
+        let outside = tmp.path().join("keys/delegate_cipher");
+        let mut secrets = SecretArgs {
+            transport_keypair: Some(old.join("secrets/transport_keypair")),
+            nonce: Some(old.join("secrets/nonce")),
+            cipher: Some(outside.clone()),
+        };
+        rebase_file_secret_paths(&mut secrets, &[true, false, false], &old, &new);
+        assert_eq!(
+            secrets.transport_keypair,
+            Some(old.join("secrets/transport_keypair"))
+        );
+        assert_eq!(secrets.nonce, Some(new.join("secrets/nonce")));
+        assert_eq!(secrets.cipher, Some(outside));
+
+        // Nothing moves when the data dir did not change.
+        let mut unchanged = SecretArgs {
+            transport_keypair: Some(old.join("secrets/transport_keypair")),
+            nonce: None,
+            cipher: None,
+        };
+        rebase_file_secret_paths(&mut unchanged, &[false; 3], &old, &old);
+        assert_eq!(
+            unchanged.transport_keypair,
+            Some(old.join("secrets/transport_keypair"))
         );
     }
 
