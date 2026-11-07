@@ -1025,6 +1025,9 @@ impl UpgradeMachine {
             BoundedSend::Failed(
                 SendFailure::NotOpened(NotOpened::TimedOut)
                 | SendFailure::TimedOut
+                // Control frames are never paced; read as a deadline if one were.
+                | SendFailure::NotOpened(NotOpened::Paced)
+                | SendFailure::Paced
                 | SendFailure::Error(
                     QuicSendError::InvalidFrame(_)
                     | QuicSendError::LengthMismatch { .. }

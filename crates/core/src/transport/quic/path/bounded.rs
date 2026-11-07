@@ -27,7 +27,7 @@
 
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::Duration;
 
 use super::QuicSendError;
@@ -136,6 +136,11 @@ pub(crate) enum SendFailure {
     /// A deadline passed after the stream was opened and before its end was
     /// sent. The stream was reset.
     TimedOut,
+    /// After the stream was opened, the connection's bandwidth-limit pacer
+    /// refused a write whose wait would have reached the send's deadline
+    /// (`pacer` module). The stream was reset. This side held the send back,
+    /// so it says nothing about the path.
+    Paced,
     /// The send failed (`QuicSendError`), before the end of the stream was
     /// sent, or after it with a stop from the peer. This includes a source that
     /// ended or failed before its first chunk, where no stream was opened: such
@@ -152,6 +157,10 @@ pub(crate) enum NotOpened {
     TimedOut,
     /// The connection was lost first.
     ConnectionLost(quinn::ConnectionError),
+    /// The connection's bandwidth-limit pacer refused the header's wait, which
+    /// would have reached the open deadline (`pacer` module). Held back on this
+    /// side, so it says nothing about the path.
+    Paced,
 }
 
 const STAGE_OPENING: u8 = 0;
@@ -168,6 +177,12 @@ struct ProgressState {
     /// When the send last made progress, on `now`.
     last_step: AtomicU64,
     now: Box<dyn Fn() -> u64 + Send + Sync>,
+    /// The send's deadlines and its start on `now`, so a pacer can refuse a
+    /// wait that would reach the current one. `None`: no deadline.
+    deadlines: Option<(SendDeadlines, u64)>,
+    /// The path's pacer refused a write, so the send ends as at its current
+    /// deadline (`pacer` module).
+    refused: AtomicBool,
 }
 
 impl SendProgress {
@@ -178,16 +193,41 @@ impl SendProgress {
             stage: AtomicU8::new(STAGE_OPENING),
             last_step: AtomicU64::new(0),
             now: Box::new(|| 0),
+            deadlines: None,
+            refused: AtomicBool::new(false),
         }))
     }
 
-    fn on_clock<T: TimeSource>(time: &T) -> Self {
+    fn on_clock<T: TimeSource>(time: &T, deadlines: SendDeadlines, started: u64) -> Self {
         let time = time.clone();
         Self(Arc::new(ProgressState {
             stage: AtomicU8::new(STAGE_OPENING),
             last_step: AtomicU64::new(time.now_nanos()),
             now: Box::new(move || time.now_nanos()),
+            deadlines: Some((deadlines, started)),
+            refused: AtomicBool::new(false),
         }))
+    }
+
+    /// How long until the send's current deadline. `Duration::MAX` for a send
+    /// with none.
+    pub(super) fn time_left(&self) -> Duration {
+        match &self.0.deadlines {
+            Some((deadlines, started)) => Duration::from_nanos(
+                self.deadline(deadlines, *started)
+                    .saturating_sub((self.0.now)()),
+            ),
+            None => Duration::MAX,
+        }
+    }
+
+    /// The pacer refused a write: the send ends as at its current deadline.
+    pub(super) fn refuse(&self) {
+        self.0.refused.store(true, Ordering::Release);
+    }
+
+    fn refused(&self) -> bool {
+        self.0.refused.load(Ordering::Acquire)
     }
 
     /// The stream exists.
@@ -223,6 +263,14 @@ impl SendProgress {
                     .min(total)
             }),
             _ => total,
+        }
+    }
+
+    /// The outcome of a send the pacer refused, by how far it had got.
+    fn paced(&self) -> BoundedSend {
+        match self.stage() {
+            STAGE_OPENING => BoundedSend::Failed(SendFailure::NotOpened(NotOpened::Paced)),
+            _ => BoundedSend::Failed(SendFailure::Paced),
         }
     }
 
@@ -270,14 +318,21 @@ where
         "a gap shorter than `open` could leave the timer armed too late"
     );
     let started = time.now_nanos();
-    let progress = SendProgress::on_clock(time);
+    let progress = SendProgress::on_clock(time, deadlines, started);
     let send = send(progress.clone());
     tokio::pin!(send);
     loop {
         let deadline = progress.deadline(&deadlines, started);
         let wait = Duration::from_nanos(deadline.saturating_sub(time.now_nanos()));
         tokio::select! {
-            result = &mut send => return outcome(result, &progress),
+            result = &mut send => {
+                // A refusal returns an error only to end the send, which then
+                // ends as a deadline would at that stage.
+                if progress.refused() {
+                    return progress.paced();
+                }
+                return outcome(result, &progress);
+            }
             () = time.sleep_cancelable(wait) => {
                 if time.now_nanos() >= progress.deadline(&deadlines, started) {
                     return progress.timed_out();

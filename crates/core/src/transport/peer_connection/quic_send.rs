@@ -238,7 +238,11 @@ pub(super) async fn send_large_short_on_path<S: Socket, T: TimeSource>(
         route.clock().now_nanos(),
     ) {
         NextStep::Done => transfer.completed(),
-        NextStep::SendOnUdp => udp.send_stream(stream_id, data, None, None, None).await,
+        NextStep::SendOnUdp => {
+            let sent = udp.send_stream(stream_id, data, None, None, None).await;
+            charge_fallback_if_sent(&route, &outcome, bytes, &sent);
+            sent
+        }
         NextStep::GiveUp => transfer.failed(&outcome),
     }
 }
@@ -277,8 +281,11 @@ pub(super) async fn send_stream_on_path<S: Socket, T: TimeSource>(
             transfer.completed()
         }
         NextStep::SendOnUdp => {
-            udp.send_stream(stream_id, data, metadata, completion_tx, progress)
-                .await
+            let sent = udp
+                .send_stream(stream_id, data, metadata, completion_tx, progress)
+                .await;
+            charge_fallback_if_sent(&route, &outcome, bytes, &sent);
+            sent
         }
         NextStep::GiveUp => {
             complete(completion_tx, StreamSendOutcome::Dropped);
@@ -322,10 +329,28 @@ pub(super) async fn pipe_stream_on_path<S: Socket, T: TimeSource>(
     {
         NextStep::Done => transfer.completed(),
         NextStep::SendOnUdp => {
-            udp.pipe_stream(stream_id, inbound_handle, metadata, progress)
-                .await
+            let sent = udp
+                .pipe_stream(stream_id, inbound_handle, metadata, progress)
+                .await;
+            charge_fallback_if_sent(&route, &outcome, bytes, &sent);
+            sent
         }
         NextStep::GiveUp => transfer.failed(&outcome),
+    }
+}
+
+/// After a message the pacer refused went on UDP: charge the path's pacer for
+/// it if UDP sent it (`QuicPath::charge_fallback`). A UDP send that failed is
+/// charged nothing, so a fallback that sent nothing leaves no debt; one that
+/// failed partway is charged nothing either, which errs below the limit.
+fn charge_fallback_if_sent(
+    route: &DataRoute,
+    outcome: &BoundedSend,
+    bytes: u64,
+    sent: &OutboundStreamResult,
+) {
+    if sent.is_ok() {
+        route.path().charge_fallback(outcome, bytes);
     }
 }
 

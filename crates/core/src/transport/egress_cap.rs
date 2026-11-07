@@ -783,9 +783,9 @@ pub struct EgressTake<'a> {
 impl EgressCap {
     /// A cap of `rate_bytes_per_sec`, starting with a full bucket.
     pub(crate) fn new<T: TimeSource>(rate_bytes_per_sec: u64, time_source: T) -> Self {
-        // A rate of 0 cannot be met by anything; callers do not build a cap
-        // for it (see `from_total_limit`). Treat it as 1 B/s rather than
-        // dividing by zero.
+        // A rate of 0 cannot be met by anything, and the node never builds a
+        // cap for it (no pool is built for a total of 0). Treat it as 1 B/s
+        // rather than dividing by zero.
         let rate = rate_bytes_per_sec.max(1);
         let burst_bytes = (rate as u128 * BURST_WINDOW.as_nanos() / NANOS_PER_SEC) as u64;
         let burst_bytes = burst_bytes.max(MIN_BURST_PACKETS * MAX_PACKET_SIZE as u64);
@@ -818,17 +818,15 @@ impl EgressCap {
         }
     }
 
-    /// The cap for a configured `total-bandwidth-limit`, or `None` when the
-    /// value cannot be a cap (0).
+    /// The cap for a configured `total-bandwidth-limit`, or `None` for 0,
+    /// which cannot be a cap. The node never passes 0 (it builds no pool for
+    /// it, and warns at startup, `P2pConnManager::build`), so this is only a
+    /// guard.
     pub(crate) fn from_total_limit<T: TimeSource>(
         total_bytes_per_sec: usize,
         time_source: T,
     ) -> Option<Self> {
         if total_bytes_per_sec == 0 {
-            tracing::warn!(
-                "total-bandwidth-limit is 0; no node-wide egress cap is applied \
-                 (a cap of 0 bytes per second cannot be met)"
-            );
             return None;
         }
         Some(Self::new(total_bytes_per_sec as u64, time_source))

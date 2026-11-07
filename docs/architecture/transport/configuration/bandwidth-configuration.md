@@ -35,7 +35,7 @@ freenet --total-bandwidth-limit 50000000 --min-bandwidth-per-connection 1000000
 
 | Argument | Description | Default |
 |----------|-------------|---------|
-| `--bandwidth-limit <bytes/sec>` | Per-connection cap on the congestion controller's rate for streamed transfers (0 = unset; values below 64 KiB/s are raised to it; ignored when `--total-bandwidth-limit` is set) | None (the congestion controller's rate: 1,250,000 (1.25 MB/s) for `fixedrate`) |
+| `--bandwidth-limit <bytes/sec>` | Per-connection cap on the congestion controller's rate for streamed transfers (0 = unset; values below 64 KiB/s are raised to it; ignored when `--total-bandwidth-limit` is set and not 0) | None (the congestion controller's rate: 1,250,000 (1.25 MB/s) for `fixedrate`) |
 | `--total-bandwidth-limit <bytes/sec>` | Cap on everything the node sends over UDP, across ALL connections | None (disabled) |
 | `--min-bandwidth-per-connection <bytes/sec>` | Minimum per-connection pacing rate inside the total (clamped to the total) | 1,000,000 (1 MB/s) |
 | `--congestion-control <algorithm>` | Congestion control algorithm (`fixedrate`, `ledbat`, `bbr`) | `fixedrate` |
@@ -221,7 +221,9 @@ What this guarantees:
   that drives many streams through this node gets a proportional share of it.
 
 Without `total-bandwidth-limit` no bucket exists and nothing changes. A
-`total-bandwidth-limit` of 0 is ignored with a warning.
+`total-bandwidth-limit` of 0 is ignored with a warning: no cap and no per-connection
+share for UDP or QUIC (UDP no longer paces at the 1 MB/s per-connection minimum), and
+`bandwidth-limit` applies to both transports if set.
 
 At startup the node logs the cap, warns if `min-bandwidth-per-connection` was above
 the total (it is clamped), and warns if the total is below 4,800 bytes/s (four
