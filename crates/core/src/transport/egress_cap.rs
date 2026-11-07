@@ -173,16 +173,27 @@ pub(crate) const RETX_DEBT_LIMIT: Duration = Duration::from_millis(100);
 /// the cap stays full.
 pub(crate) const RETX_DEFER_MIN: Duration = Duration::from_millis(10);
 
-/// [`RETX_DEFER_MIN`], or in tests `FREENET_RETX_DEFER_MIN_US` when set, so a
-/// storm run can sweep it without a rebuild.
-pub(crate) fn retx_defer_min() -> Duration {
+/// The shortest deferral of a refused retransmit on a connection whose
+/// effective RTO is `rto`: [`RETX_DEFER_MIN`]. In tests,
+/// `FREENET_RETX_DEFER_MIN_US` sets a fixed floor and
+/// `FREENET_RETX_DEFER_RTO_DIV` a floor of `rto / div`, so a storm run can
+/// sweep it without a rebuild.
+pub(crate) fn retx_defer_min(rto: Duration) -> Duration {
     #[cfg(test)]
-    if let Some(us) = std::env::var("FREENET_RETX_DEFER_MIN_US")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
     {
-        return Duration::from_micros(us);
+        let var = |name: &str| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+        };
+        if let Some(div) = var("FREENET_RETX_DEFER_RTO_DIV") {
+            return rto / u32::try_from(div.max(1)).unwrap_or(u32::MAX);
+        }
+        if let Some(us) = var("FREENET_RETX_DEFER_MIN_US") {
+            return Duration::from_micros(us);
+        }
     }
+    let _ = rto;
     RETX_DEFER_MIN
 }
 

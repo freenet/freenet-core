@@ -2396,10 +2396,11 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                         let cap = socket.egress_cap().filter(|cap| cap.caps_retransmits());
                         let mut take = None;
                         let mut deferred = false;
-                        let maybe_resend = self.remote_conn
-                            .sent_tracker
-                            .lock()
-                            .get_resend_admitted(|kind, len| {
+                        let maybe_resend = {
+                            let mut tracker = self.remote_conn.sent_tracker.lock();
+                            let defer_min =
+                                super::egress_cap::retx_defer_min(tracker.effective_rto());
+                            tracker.get_resend_admitted(|kind, len| {
                                 let Some(cap) = cap else {
                                     return Ok(());
                                 };
@@ -2418,10 +2419,11 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                                             ResendKind::Probe => super::TRANSPORT_METRICS
                                                 .record_egress_probe_skipped(),
                                         }
-                                        Err(wait.max(super::egress_cap::retx_defer_min()))
+                                        Err(wait.max(defer_min))
                                     }
                                 }
-                            });
+                            })
+                        };
                         // Extract (idx, packet) from the resend action, applying
                         // action-specific side effects (congestion notification, logging).
                         // Abandon releases flight size and is handled inline (it neither
