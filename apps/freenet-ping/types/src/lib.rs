@@ -120,9 +120,10 @@ impl Ping {
     /// cannot satisfy any of them except by luck. Concretely, with a wall clock two
     /// peers handed the SAME pair of states reach different states whenever a TTL
     /// boundary falls between the moments they each ran the merge. `fdev
-    /// verify-merge` reports that as `update_determinism`, which is an ENFORCEABLE
-    /// property — the tier that is eventually meant to justify removing a contract
-    /// from the network.
+    /// verify-merge` reports that as `update_determinism`, a merge-law break that
+    /// fails the check and is not report-only. Nodes do not remove contracts for
+    /// it (the removal plan is superseded, freenet-core #5906); it is a defect the
+    /// author is told about.
     ///
     /// Be precise about how bad that is, because overstating it is its own kind of
     /// wrong. This particular divergence is TRANSIENT, not permanent. The wall-clock
@@ -135,7 +136,7 @@ impl Ping {
     ///
     /// What it repairs is that the merge was not a function of its inputs. That
     /// costs three things worth having: the reference contract stops producing
-    /// removal-eligible evidence against itself, the divergence window (however
+    /// merge-law violations against itself, the divergence window (however
     /// short) disappears rather than being reasoned about, and — the part that
     /// matters most for a file people copy — the example stops demonstrating that
     /// reading the clock in a merge is acceptable if you argue carefully enough
