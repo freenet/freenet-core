@@ -21,6 +21,7 @@
 //! }
 //! ```
 
+#[cfg(any(test, feature = "testing"))]
 use dashmap::DashMap;
 use std::net::SocketAddr;
 use std::sync::LazyLock;
