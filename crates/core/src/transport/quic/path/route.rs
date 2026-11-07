@@ -394,10 +394,25 @@ impl QuicPath {
             let acked = self.ack_progress.as_ref().map(recycle::AckProgress::acked);
             let cap = self.connection.cap_holds().read();
             let quiet = *self.quiet.lock();
-            stall.note_acked_at(self.last_acked.load(std::sync::atomic::Ordering::Acquire));
+            let seen = self.last_acked.load(std::sync::atomic::Ordering::Acquire);
+            stall.note_acked_at(seen);
             let verdict = stall.take(outcome, source_stalled, acked, cap, quiet, now_nanos);
-            self.last_acked
-                .store(stall.acked_at(), std::sync::atomic::Ordering::Release);
+            // Forward with `fetch_max`, as the send watches write it without
+            // the stall lock, so an ack a watch saw since the load is kept. A
+            // proof may move it back; that only replaces the value loaded, so a
+            // watch's later ack wins.
+            let at = stall.acked_at();
+            if at >= seen {
+                self.last_acked
+                    .fetch_max(at, std::sync::atomic::Ordering::AcqRel);
+            } else {
+                let _ = self.last_acked.compare_exchange(
+                    seen,
+                    at,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                );
+            }
             (verdict, acked)
         };
         if let (true, Some(acked)) = (verdict.quiet_timeout, acked) {

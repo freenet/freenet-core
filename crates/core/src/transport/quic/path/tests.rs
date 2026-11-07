@@ -3704,8 +3704,10 @@ fn the_gap_runs_on_while_the_connection_is_acknowledged() {
     })
 }
 
-/// With nothing acknowledged during the send, as on a path gone dark, the send
-/// fails at its own 5 s gap, as without the connection's progress.
+/// With nothing acknowledged during the send and no acknowledgement on record
+/// (`NO_ACK`), the send fails at its own 5 s gap, as without the connection's
+/// progress. A real path's record starts at its build time, so a path dark from
+/// its start is credited for one hold credit after it is built first.
 #[test]
 fn the_gap_runs_out_on_its_own_when_nothing_is_acknowledged() {
     bounded(|| async move {
@@ -4446,7 +4448,107 @@ fn a_write_held_by_a_silent_peer_fails_at_the_gap() {
     })
 }
 
-/// A live path on a node whose total cap binds (100 kB/s, where one held
+/// A live, busy path on a node whose total cap binds (100 kB/s, where one held
+/// transmit can wait about 13.3 s, past the 10 s window), its peer reading and
+/// acknowledging: send timeouts settled on it every 2 s, while a bulk stream
+/// keeps the cap holding its transmits, neither stall-close it nor make it
+/// suspect.
+#[test]
+fn a_live_path_under_a_binding_cap_is_not_stall_closed() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths_capped("quic-path-live-capped", 82, 100_000).await;
+        let (a, time) = (p.a.clone(), p.time());
+        let holds = a.connection().cap_holds();
+        let (held, suspect) = p
+            .drive(async move {
+                let busy = a.clone();
+                let bulk = tokio::spawn(async move {
+                    busy.send_stream(StreamId::next(), None, payload(4 * MIB).into())
+                        .await
+                        .ok();
+                });
+                let before = holds.read().holds;
+                let mut suspect = false;
+                for _ in 0..20 {
+                    time.sleep(Duration::from_secs(2)).await;
+                    a.settle(
+                        SendKind::Stream,
+                        &BoundedSend::Failed(SendFailure::TimedOut),
+                        false,
+                        time.now_nanos(),
+                    );
+                    suspect |= a.is_suspect();
+                }
+                bulk.abort();
+                (holds.read().holds - before, suspect)
+            })
+            .await;
+        assert!(held > 0, "premise: the cap held the path's transmits");
+        assert!(!suspect, "a live path is never suspect");
+        assert!(p.a.connection().inner().close_reason().is_none());
+        assert_eq!(
+            p.a.stats().send_event_count(QuicSendEvent::StalledClosed),
+            0
+        );
+    })
+}
+
+/// How a real path carries its last acknowledgement to its next send: a settle
+/// that sees the peer's acknowledgement records it on the path, and a later
+/// send whose writes the cap queue holds for 8 s, past its 5 s gap, with the
+/// peer silenced so nothing more is acknowledged, starts from that record and
+/// is `Sent`. A send handed a fresh record, or a settle that wrote none, would
+/// time out at 5 s.
+#[test]
+fn a_real_path_carries_its_last_acknowledgement_to_the_next_send() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let network = "quic-path-last-acked";
+        let p = paths_capped(network, 83, 100_000).await;
+        let b_addr = p.pair.b_addr;
+        let (a, time) = (p.a.clone(), p.time());
+        let holds = a.connection().cap_holds();
+        let sent = p
+            .drive(async move {
+                a.send_short(b"live").await.expect("acknowledged");
+                a.settle(SendKind::Short, &BoundedSend::Sent, false, time.now_nanos());
+                let _silenced = DropFrom::new(network, &[b_addr]);
+                let deadlines = SendDeadlines {
+                    open: Duration::from_secs(2),
+                    gap: Some(Duration::from_secs(5)),
+                    total: Duration::from_secs(120),
+                };
+                let ticking = time.clone();
+                let queue = async move {
+                    loop {
+                        ticking.sleep(Duration::from_secs(1)).await;
+                        holds.hold_one();
+                    }
+                };
+                let stepping = time.clone();
+                let send = bounded_send(
+                    &time,
+                    deadlines,
+                    a.connection_progress(),
+                    |progress| async move {
+                        progress.mark_opened();
+                        stepping.sleep(Duration::from_secs(8)).await;
+                        progress.step();
+                        Ok(())
+                    },
+                );
+                tokio::select! {
+                    sent = send => sent,
+                    _ = queue => unreachable!("the queue never ends"),
+                }
+            })
+            .await;
+        assert!(matches!(sent, BoundedSend::Sent), "{sent:?}");
+    })
+}
+
+/// A path on a node whose total cap binds (100 kB/s, where one held
 /// transmit can wait about 13.3 s, past the 10 s window) is not made suspect
 /// while the cap holds its transmits and nothing is acknowledged for longer
 /// than the window but less than the hold credit; once past the credit it is.
@@ -4457,10 +4559,10 @@ fn a_write_held_by_a_silent_peer_fails_at_the_gap() {
 /// From the credit on the hold counts for nothing, and a window after the last
 /// credited progress the path is suspect.
 #[test]
-fn a_live_path_under_a_binding_cap_is_not_stall_closed() {
+fn an_unacknowledged_path_under_a_binding_cap_is_held_for_the_credit() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let network = "quic-path-live-capped";
+        let network = "quic-path-unacked-capped";
         let p = paths_capped(network, 82, 100_000).await;
         let b_addr = p.pair.b_addr;
         let (a, time) = (p.a.clone(), p.time());

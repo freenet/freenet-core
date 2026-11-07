@@ -682,7 +682,9 @@ pub(crate) struct QuicPath {
     quiet: Arc<parking_lot::Mutex<Option<bounded::QuietProof>>>,
     /// When the connection was last seen acknowledged, on the path's clock
     /// ([`bounded::ConnectionProgress::last_acked`]); the path's build time to
-    /// start, as for the stall count.
+    /// start, as for the stall count, so a path dark from its start has its
+    /// first sends' cap holds credited for one `route::hold_credit` after it
+    /// is built (seconds at a high cap, minutes at a low one).
     last_acked: Arc<std::sync::atomic::AtomicU64>,
     /// The connection's count of acknowledged packets, `None` if its controller
     /// does not keep one.
