@@ -843,7 +843,10 @@ mod tests {
         std::fs::rename(&old, &new).unwrap();
 
         let mut args = SecretArgs::default();
-        let previous = args.merge(persisted_secrets_in_file(&seeded), &[old.clone()]);
+        let previous = args.merge(
+            persisted_secrets_in_file(&seeded),
+            std::slice::from_ref(&old),
+        );
         assert!(args.transport_keypair.is_none() && args.cipher.is_none());
         let loaded = args.build_with_previous(Some(&new), &previous).unwrap();
 
@@ -876,7 +879,10 @@ mod tests {
         }
 
         let mut args = SecretArgs::default();
-        let previous = args.merge(persisted_secrets_in_file(&seeded), &[old.clone()]);
+        let previous = args.merge(
+            persisted_secrets_in_file(&seeded),
+            std::slice::from_ref(&old),
+        );
         let loaded = args.build_with_previous(Some(&new), &previous).unwrap();
 
         assert_eq!(
@@ -900,7 +906,10 @@ mod tests {
         let seeded = persisted_secrets_in(&old);
 
         let mut args = SecretArgs::default();
-        let previous = args.merge(persisted_secrets_in_file(&seeded), &[old.clone()]);
+        let previous = args.merge(
+            persisted_secrets_in_file(&seeded),
+            std::slice::from_ref(&old),
+        );
         let loaded = args.build_with_previous(Some(&new), &previous).unwrap();
 
         assert_eq!(
