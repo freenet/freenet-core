@@ -954,9 +954,9 @@ async fn run_writer(
                     probed = report.probed,
                     cases = report.cases,
                     inconclusive = report.inconclusive,
-                    // Removal-eligible findings only; report-only ones, the
-                    // idempotence class that settles after a rewrite included,
-                    // are in `reported`.
+                    // Findings whose law is not report-only; report-only ones,
+                    // the idempotence class that settles after a rewrite
+                    // included, are in `reported`. Nothing is removed for either.
                     would_remove = report.would_remove,
                     reported = report.reported,
                     // The report-only violations inside `reported`; the rest of

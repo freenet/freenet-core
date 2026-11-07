@@ -1545,10 +1545,12 @@ struct Report {
     violations: usize,
     /// Law breaks (`Severity::Violation`), which fail this command, report-only
     /// ones included. The name is kept for compatibility with existing `--json`
-    /// consumers; what the network may act on is `removal_eligible_violations`.
+    /// consumers. Nodes act on no verdict; the tier split is
+    /// `removal_eligible_violations`.
     enforceable_violations: usize,
-    /// The subset of `enforceable_violations` the network may act on
-    /// (`policy::removal_tier` is `RemovalEligible`).
+    /// The subset of `enforceable_violations` that is not report-only
+    /// (`policy::removal_tier` is `RemovalEligible`). The name is kept for
+    /// `--json` compatibility; nothing is removed for any finding.
     removal_eligible_violations: usize,
     diagnostic_violations: usize,
     inconclusive: usize,
@@ -1967,12 +1969,16 @@ impl Report {
         }
         writeln!(
             out,
-            "merge check: {} case(s) run \u{2014} {} held, {} violation(s) ({} merge-law break(s), {} of them serious; {} diagnostic-only), {} inconclusive",
+            "merge check: {} case(s) run \u{2014} {} held, {} violation(s) ({} merge-law break(s), {} of them report-only; {} diagnostic-only), {} inconclusive",
             self.cases_run,
             self.holds,
             self.violations,
             self.enforceable_violations,
-            self.removal_eligible_violations,
+            // Every law break has exactly one of the two tiers
+            // (`policy::RemovalTier`), so the breaks that are not in the
+            // removal-eligible tier are the report-only ones.
+            self.enforceable_violations
+                .saturating_sub(self.removal_eligible_violations),
             self.diagnostic_violations,
             self.inconclusive
         )?;
@@ -2056,10 +2062,10 @@ impl Report {
                     format!("{count} cases")
                 };
                 // The tier on each violation line, so the summary's "M of them
-                // serious" can be traced to the findings it counts. A
+                // report-only" can be traced to the findings it counts. A
                 // diagnostic is always report-only and says so by its severity.
                 let label = match (f.severity, f.tier) {
-                    ("violation", "removal_eligible") => "violation, serious",
+                    ("violation", "removal_eligible") => "violation",
                     ("violation", _) => "violation, report-only",
                     (severity, _) => severity,
                 };
@@ -4304,7 +4310,7 @@ mod tests {
                 .to_string()
         };
         assert!(
-            line("state_commutativity").contains("[violation, serious]"),
+            line("state_commutativity").contains("[violation]"),
             "{rendered}"
         );
         assert!(
@@ -4349,7 +4355,7 @@ mod tests {
         // And the line and the JSON say the same thing as the counts.
         assert_eq!(report.findings[0].severity, "violation");
         assert!(
-            render_human(&report).contains("[violation, serious] state_commutativity"),
+            render_human(&report).contains("[violation] state_commutativity"),
             "{}",
             render_human(&report)
         );

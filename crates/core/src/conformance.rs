@@ -72,9 +72,10 @@
 //! This module does not replace or disable that probe. The node can run this verifier
 //! in an opt-in shadow mode: set `FREENET_CONFORMANCE_CAPTURE_DIR` (see [`capture`] and
 //! [`shadow`]) and it samples observed states and records what it *would* remove.
-//! Those results are diagnostics recorded locally. Nothing is ever removed:
-//! [`EnforcementMode::Enforce`] is not reachable from configuration and enabling it
-//! is not planned, and with the variable unset none of this runs.
+//! Those results are diagnostics recorded locally. The node never removes a
+//! contract on a conformance verdict: the [`EnforcementMode::Enforce`] path exists
+//! in the code but is unreachable from configuration, and enabling it is not
+//! planned. With the variable unset none of this runs.
 //!
 //! # Removal is not the plan
 //!
