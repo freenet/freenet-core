@@ -46,9 +46,11 @@ use serde::Serialize;
 /// `freenet::conformance` for why the two must never be allowed to drift.
 /// Diagnostics (efficiency reports, e.g. a self-delta as large as the state
 /// it is against) never fail this command. Every merge-law break
-/// (`Severity::Violation`) does, including a break of a law the network only
-/// reports and never acts on (`freenet::conformance::policy::removal_tier`): an
-/// author should hear about every broken law, whatever the network does about it.
+/// (`Severity::Violation`) does, whatever its tier
+/// (`freenet::conformance::policy::removal_tier`): an author should hear about
+/// every broken law. Nodes remove nothing for a violation; the removal plan is
+/// superseded (see `freenet::conformance::policy`), and the tier only separates
+/// the report's counts.
 /// Cases skipped for size or for the case budget do not change the exit code while
 /// any case runs; the report counts them per property. A run where every case was
 /// skipped checked nothing and exits non-zero.
@@ -159,9 +161,10 @@ pub struct ConformanceConfig {
     /// Write a framed evidence file per distinct removal-eligible
     /// violation into this directory (created if it does not exist).
     ///
-    /// Report-only findings (`freenet::conformance::policy::removal_tier`) are
-    /// not written: a peer receiving one would only report it. They are counted
-    /// in the summary, and they still fail the command.
+    /// "Removal-eligible" is a tier name kept from the superseded removal plan;
+    /// nothing is removed for any finding. Report-only findings
+    /// (`freenet::conformance::policy::removal_tier`) are not written. They are
+    /// counted in the summary, and they still fail the command.
     #[arg(long = "evidence-out")]
     pub(crate) evidence_out: Option<PathBuf>,
 
@@ -545,8 +548,9 @@ fn write_bundle(
 /// distinction CI needs and a single exit code cannot express.
 #[derive(Debug, thiserror::Error)]
 #[error(
-    "{count} merge-law violation(s) found. Most laws are removal-eligible under \
-     enforcement and some are report-only; see each finding for what it means. \
+    "{count} merge-law violation(s) found. These are laws a contract must satisfy \
+     for its state to converge across peers; nothing is removed for a violation. \
+     See each finding for what it means. \
      NOTE: `state_idempotence` reporting `settled_after` is a real break whose harm \
      is redundant anti-entropy rather than divergence, and is report-only \
      \u{2014} expected against correct canonicalizing contracts until the PUT \
@@ -4379,7 +4383,7 @@ mod tests {
     /// command, only a `Severity::Violation` finding may (report-only or not).
     #[test]
     fn exit_code_treats_diagnostic_violation_as_success() {
-        // DeltaIdempotence is diagnostic-only: contested, and never removal-eligible.
+        // DeltaIdempotence is diagnostic-only, and never removal-eligible.
         let outcome =
             PropertyOutcome::Violated(violation_of(ConformanceProperty::DeltaIdempotence));
         assert_eq!(exit_code([&outcome]), 0);

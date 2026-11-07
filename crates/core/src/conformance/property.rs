@@ -93,23 +93,19 @@ pub enum ConformanceProperty {
     DeltaDeterminism,
     /// `apply(apply(A, D), D) == apply(A, D)` — at-least-once delivery must be harmless.
     ///
-    /// **This property is contested, and the disagreement is not resolved here.**
-    /// The existing sampled probe in
-    /// `contract::executor::runtime::executor_impl::maybe_probe_idempotency`
-    /// deliberately exempts delta inputs, on the stated grounds that
-    /// operation-based CRDTs (counters, append-logs) legitimately break byte
-    /// equality on re-apply: an "increment by 1" delta yields `S+1` then `S+2`.
-    /// The RFC takes the opposite position, and explicitly requires delta
-    /// idempotence, because Freenet delivery is at-least-once — under which a
-    /// contract that double-counts a redelivered increment is not a valid CmRDT,
-    /// it is a contract that will silently corrupt its own state.
+    /// **Settled: deltas must be idempotent.** Ian ruled on 2026-11-06 (recorded
+    /// in <https://github.com/freenet/freenet-core/issues/5906#issuecomment-6677346389>).
+    /// Freenet delivery is at-least-once, so a contract that double-counts a
+    /// redelivered increment is not a valid CmRDT under this transport: it will
+    /// silently corrupt its own state. That was the RFC's position. The sampled
+    /// probe in `contract::executor::runtime::executor_impl::maybe_probe_idempotency`
+    /// still exempts delta inputs; it is a storm detector for full-state merges and
+    /// does not state the law.
     ///
-    /// The RFC is the newer and more specific document, so the check exists. But
-    /// whether any deployed first-party contract actually relies on non-idempotent
-    /// deltas is an empirical question that cannot be settled by reading code, and
-    /// it must be answered by running `fdev verify-merge` against deployed WASM
-    /// before this property is ever allowed to influence anything on the network.
-    /// Until then it is a reporting signal for contract authors.
+    /// The property stays [`Severity::Diagnostic`] and report-only only because
+    /// nodes act on no conformance verdict (the removal plan is superseded, see
+    /// `policy`'s module docs). The severity is not a judgment that non-idempotent
+    /// deltas are acceptable: a finding here is a bug the author should fix.
     ///
     /// # Why this one stays [`PremiseSource::EvidenceBytes`], and what makes that safe
     ///
@@ -143,8 +139,8 @@ pub enum ConformanceProperty {
     /// `policy::decide` never maps to a removal: a fabricated delta buys an attacker
     /// a report and nothing else. That coupling is NOT incidental. This is the only
     /// property that both travels as evidence and consumes delta bytes, so making it
-    /// removal-eligible (a `Violation` with a `RemovalEligible` tier) — which the
-    /// contested empirical question above may one day justify — must revisit this
+    /// removal-eligible (a `Violation` with a `RemovalEligible` tier), which nothing
+    /// plans since nodes act on no verdict, would have to revisit this
     /// classification in the same change. `no_shippable_removal_eligible_property_consumes_unvalidated_bytes`
     /// is the test that forces it to.
     DeltaIdempotence,
@@ -180,8 +176,8 @@ pub enum ConformanceProperty {
     /// assumes a base can be applied out of order in production too.
     ///
     /// Re-delivery is deliberately not checked here; that is
-    /// [`ConformanceProperty::DeltaIdempotence`], which is contested and reports at
-    /// a lower severity. Folding it in would accuse a counter-style contract under
+    /// [`ConformanceProperty::DeltaIdempotence`], which reports at a lower
+    /// severity for the reason given there. Folding it in would accuse a counter-style contract under
     /// this property's name regardless of that.
     ///
     /// # Local provenance only: this property is NOT self-verifying

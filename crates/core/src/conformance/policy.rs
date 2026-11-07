@@ -165,7 +165,8 @@ pub enum RemovalTier {
 /// and never removed.
 pub fn property_tier(property: ConformanceProperty) -> RemovalTier {
     match property {
-        // Diagnostics: wasteful or contested, never a proof of non-convergence.
+        // Diagnostics: wasteful, or (delta idempotence) a law nodes act on no
+        // verdict for. Never a proof of non-convergence.
         // `decide` also refuses them by severity; listing them here keeps the tier
         // table a complete answer on its own.
         ConformanceProperty::DeltaIdempotence
