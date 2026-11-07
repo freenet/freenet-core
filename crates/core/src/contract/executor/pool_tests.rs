@@ -1,5 +1,6 @@
 //! Tests for the contract executor module.
 
+mod applied_payloads_tests;
 mod conformance_tests;
 mod delegate_notification_tests;
 #[cfg(feature = "wasmtime-backend")]

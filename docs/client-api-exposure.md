@@ -130,10 +130,11 @@ under the originating user, and the node runs no delegate on its own), so a
 prompt with no user is refused rather than shown to anyone. One user token holds
 at most 8 pending prompts; the node-wide limit of 32 is shared by all tokens.
 The legacy `/permission/events` stream, the standalone
-`/permission/{nonce}` page and the capability-grant routes
-(`/permission/grants`, `/permission/grants/revoke`, `/permission/apps`) are not
-served on a hosted node. The 64 permission-socket slots are node-wide and
-shared by all users; a tab that gets no slot falls back to polling
+`/permission/{nonce}` page, the capability-grant routes
+(`/permission/grants`, `/permission/grants/revoke`, `/permission/apps`) and the
+native app grant routes (`/v1/app-grants/*`, `/permission/native-grants`,
+`/permission/native-grants/revoke`) are not served on a hosted node. The 64
+permission-socket slots are node-wide and shared by all users; a tab that gets no slot falls back to polling
 `/permission/pending`. On a node that is not hosted these routes take no
 token and behave as before.
 
@@ -146,3 +147,56 @@ query strings.
 On a loopback bind with hosted mode on, no exposure warning fires, including
 when a reverse proxy is in front of the node: every client-API connection
 there presents its own user token.
+
+## Native app grants
+
+A program on the node's own machine (for example a desktop app) can ask to
+act as one web app's identity when it talks to delegates (#5264). It calls
+`POST /v1/app-grants/request` and `GET /v1/app-grants/request/<id>`, the user
+approves on `/v1/app-grants/approve/<id>` in the browser, and the program
+receives a durable token. Grants are listed, and revoked, on the Apps and
+permissions page (`/permission/native-grants`,
+`/permission/native-grants/revoke`).
+
+These routes sit behind the same layers as the rest of the client API: on a
+non-loopback bind, the private-network source filter (`allowed-source-cidrs`)
+and the `Host` checks (`allowed-host`) run first. On top of those, every grant
+route is loopback-only: the connection must come from loopback, the `Host` must
+name loopback (`localhost`, `127.0.0.1` or `[::1]`), and a request carrying a
+forwarding header (`X-Forwarded-*`, `Forwarded`, `X-Real-IP`, `Via`,
+`True-Client-IP`, `CF-Connecting-IP` or `X-Client-IP`) is refused. A local
+program that reaches the node through an HTTP proxy is refused too. The
+request and poll routes also refuse anything a browser sends (`Origin`,
+`Sec-Fetch-*`), and approving needs the page's single-use nonce and an `Origin`
+equal to the node's own. So widening `--ws-api-address`, `allowed-host` or
+`allowed-source-cidrs` does not open the grant routes to other machines, and
+they cannot be used through a reverse proxy that identifies itself with
+forwarding headers. A proxy that adds none and rewrites `Host` to loopback is
+indistinguishable from a local client, which is the same limit the shell-page
+tokens have.
+
+The node honours a grant token only from the `Authorization: Bearer` header of
+a WebSocket upgrade, never from the `authToken` query parameter, and only on a
+connection from loopback, with a loopback `Host` and no forwarding headers.
+Only `sha256(token)` is stored. Request logs record paths only, never query
+strings, and the request and approval ids in the grant routes' paths are
+redacted.
+
+Grants work in `freenet local` as well as on a network node; a hosted node
+serves none. They persist across restarts in the redb store; a build without
+the `redb` feature keeps them in memory and loses them on restart.
+
+How a WebSocket connection presenting a token is closed when the node does not
+accept the token:
+
+| Close code | Meaning | What a native client should do |
+|---|---|---|
+| 4401 | The token names nothing: a stale page token, or an app grant that was revoked or never issued. | Discard the token and request a new grant. |
+| 4403 | A header token this connection cannot use as a grant: not a local connection, a non-loopback `Host`, forwarding headers, or a node that serves no grants (hosted). | Keep the token; connect to the node directly over loopback. |
+| 4503 | The node could not check the token right now (starting up, or a storage fault). | Keep the token and retry. |
+
+A connection open when its grant is revoked is closed with 4401 and the reason
+`app grant revoked`.
+
+Approval does not protect against a malicious program already running as the
+same user, which can open and answer the approval page itself.

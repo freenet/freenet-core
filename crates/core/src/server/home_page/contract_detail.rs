@@ -300,7 +300,8 @@ pub fn contract_detail_html_from(
 ///    explicitly NOT reported as fine.
 /// 3. Checked, no findings for this contract.
 /// 4. Checked, with one or more findings, each carrying the property that
-///    broke, its severity, and whether enforcement would remove it.
+///    broke, its severity, and whether its law is report-only (the retained
+///    `would_remove` decision, inverted; nothing is removed).
 ///
 /// `without_verdict_last_tick` — focus contracts the checker formed no opinion
 /// about in its most recent tick — is surfaced
@@ -527,26 +528,26 @@ fn merge_law_card(merge_enabled: bool, merge_view: Option<&status::MergeCheckVie
                 (Severity::Violation, Some(IdempotenceSettling::Indeterminate)) => {
                     ("fresh-stale", "Violation — settling unknown")
                 }
-                (Severity::Violation, _) if f.would_remove => {
-                    ("fresh-stale", "Violation — removal-eligible")
-                }
-                (Severity::Violation, _) => ("fresh-stale", "Violation — report-only"),
+                (Severity::Violation, _) if f.would_remove => ("fresh-stale", "Violation"),
+                (Severity::Violation, _) => ("fresh-stale", "Violation (report-only)"),
                 (Severity::Diagnostic, _) => ("use-idle", "Diagnostic — legal but wasteful"),
             };
             rows.push_str(&format!(
-                r#"<tr><td>{property}</td><td><span class="fresh-pill {pill_class}">{label}</span></td><td class="right">{would_remove}</td></tr>"#,
+                r#"<tr><td>{property}</td><td><span class="fresh-pill {pill_class}">{label}</span></td><td class="right">{report_only}</td></tr>"#,
                 property = html_escape(f.property),
-                would_remove = if f.would_remove { "yes" } else { "no" },
+                // `would_remove` is the retained tier decision: false for every
+                // report-only law and every diagnostic.
+                report_only = if f.would_remove { "no" } else { "yes" },
             ));
         }
         format!(
             r#"<div class="card">
                 <h2>Merge laws</h2>
-                <div class="table-wrap"><table><thead><tr><th>Property</th><th>Severity</th><th class="right">Would remove</th></tr></thead><tbody>{rows}</tbody></table></div>
+                <div class="table-wrap"><table><thead><tr><th>Property</th><th>Severity</th><th class="right">Report-only</th></tr></thead><tbody>{rows}</tbody></table></div>
                 <div class="info-grid" style="margin-top:0.75rem">
                     {cases_row}
                 </div>
-                <p class="empty" style="margin-top:0.75rem"><strong>Violation</strong> means the contract broke an algebraic law. Most are removal-eligible under enforcement; some laws are report-only, because their findings can be produced by inputs anyone may supply or describe a contract that converges after a bounded cost. A contract that normalises a stored state once and then holds still breaks idempotence and still agrees with its peers — those rows say <em>settles after a rewrite</em> and are report-only. <strong>Diagnostic</strong> is legal but wasteful — it never justifies removal on its own.</p>
+                <p class="empty" style="margin-top:0.75rem"><strong>Violation</strong> means the contract broke a law a contract must satisfy for its state to converge across peers. Nothing is removed for a violation. Some laws are <em>report-only</em> (the column says which): their findings can be produced by inputs anyone may supply, or describe a contract that converges after a bounded cost. A report-only violation is still a broken law. A contract that normalises a stored state once and then holds still breaks idempotence and still agrees with its peers; those rows say <em>settles after a rewrite</em> and are report-only. <strong>Diagnostic</strong> is legal but wasteful.</p>
                 {note}
             </div>"#,
             rows = rows,

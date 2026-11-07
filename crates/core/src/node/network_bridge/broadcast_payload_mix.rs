@@ -841,6 +841,14 @@ pub(crate) struct ReceiverApplyStats {
     /// whether a 49 MiB no-op was a full state or an oversized delta.
     pub(crate) terminal_counts: [[u64; STATE_SIZE_BUCKET_COUNT]; 10],
     pub(crate) terminal_bytes: [[u64; STATE_SIZE_BUCKET_COUNT]; 10],
+    /// Received payloads skipped because this node had already merged them
+    /// into its current state (`crate::ring::applied_payloads`): delta count,
+    /// full-state count, delta bytes, full-state bytes. Counted at the skip
+    /// decision. Kept apart from `terminal_*` so that array's documented
+    /// ten-row layout does not move, and without size buckets to keep the
+    /// telemetry block small. A payload counted here is not also counted in
+    /// `terminal_*`.
+    pub(crate) already_applied: [u64; 4],
 }
 
 #[derive(Clone, Copy)]
@@ -850,6 +858,8 @@ enum ReceiverTerminalOutcome {
     Dedup,
     Backoff,
     Failed,
+    /// Recorded in `already_applied_*`, not in `terminal_*`.
+    AlreadyApplied,
 }
 
 impl ReceiverTerminalOutcome {
@@ -872,6 +882,12 @@ impl ReceiverTerminalGuard<'_> {
 
     pub(crate) fn mark_backoff(&mut self) {
         self.outcome = ReceiverTerminalOutcome::Backoff;
+    }
+
+    /// The payload was skipped because it is already merged into this node's
+    /// current state (`crate::ring::applied_payloads`).
+    pub(crate) fn mark_already_applied(&mut self) {
+        self.outcome = ReceiverTerminalOutcome::AlreadyApplied;
     }
 
     pub(crate) fn mark_applied(&mut self, changed: bool, state_size: usize) {
@@ -930,8 +946,14 @@ impl PayloadMix {
         // redundancy count cannot drift from the decision it describes.
         crate::config::GlobalTestMetrics::record_broadcast_delivery(matches!(
             outcome,
-            ReceiverTerminalOutcome::Dedup | ReceiverTerminalOutcome::NoOp
+            ReceiverTerminalOutcome::Dedup
+                | ReceiverTerminalOutcome::NoOp
+                | ReceiverTerminalOutcome::AlreadyApplied
         ));
+        if matches!(outcome, ReceiverTerminalOutcome::AlreadyApplied) {
+            self.record_already_applied(is_delta, payload_bytes);
+            return;
+        }
         let outcome_index = outcome.index();
         let kind_index = usize::from(!is_delta) * 5 + outcome_index;
         let bucket = state_size_bucket(payload_bytes as u64);
@@ -941,6 +963,17 @@ impl PayloadMix {
             stats.terminal_counts[kind_index][bucket].saturating_add(1);
         stats.terminal_bytes[kind_index][bucket] =
             stats.terminal_bytes[kind_index][bucket].saturating_add(bytes);
+    }
+
+    /// Count one received payload skipped because it was already merged into
+    /// this node's current state. Called from the receiver terminal guard.
+    pub(crate) fn record_already_applied(&self, is_delta: bool, payload_bytes: usize) {
+        crate::config::GlobalTestMetrics::record_already_applied_skip();
+        let row = usize::from(!is_delta);
+        let bytes = u64::try_from(payload_bytes).unwrap_or(u64::MAX);
+        let mut stats = self.receiver_applies.lock();
+        stats.already_applied[row] = stats.already_applied[row].saturating_add(1);
+        stats.already_applied[2 + row] = stats.already_applied[2 + row].saturating_add(bytes);
     }
 
     /// Read cumulative receiver totals without resetting them.
@@ -1709,6 +1742,34 @@ mod tests {
         assert_eq!(stats.terminal_bytes[8][bucket], (large + 1) as u64);
         assert_eq!(stats.terminal_counts[9][bucket], 1);
         assert_eq!(stats.terminal_bytes[9][bucket], (large + 2) as u64);
+    }
+
+    #[test]
+    fn already_applied_skips_are_counted_apart_from_the_terminal_rows() {
+        let mix = PayloadMix::new();
+        let size = 300;
+
+        let mut delta = mix.receiver_terminal_guard(true, size);
+        delta.mark_already_applied();
+        drop(delta);
+        let mut full = mix.receiver_terminal_guard(false, size + 1);
+        full.mark_already_applied();
+        drop(full);
+        mix.record_already_applied(false, size + 2);
+
+        let stats = mix.receiver_apply_stats();
+        assert_eq!(
+            stats.already_applied,
+            [1, 2, size as u64, (2 * size + 3) as u64]
+        );
+        // Not counted a second time as a failure or anything else.
+        assert!(
+            stats
+                .terminal_counts
+                .iter()
+                .all(|row| row.iter().all(|n| *n == 0)),
+            "an already-applied skip leaked into the terminal rows"
+        );
     }
 
     /// #4979 / #5056: a contract whose entire cost sits in the `delta` arm must

@@ -298,6 +298,10 @@ pub(crate) struct QuicPathLimits {
     /// The receive task panics on its first stream (supervisor test).
     #[cfg(test)]
     pub(crate) panic_in_receive: bool,
+    /// The acknowledgement watch panics once the path is in a loss-rate bucket
+    /// (supervisor test).
+    #[cfg(test)]
+    pub(crate) panic_in_watch: bool,
 }
 
 impl QuicPathLimits {
@@ -322,6 +326,8 @@ impl QuicPathLimits {
         counters: None,
         #[cfg(test)]
         panic_in_receive: false,
+        #[cfg(test)]
+        panic_in_watch: false,
     };
 
     /// [`Self::DEFAULT`] for a path in shadow mode: control frames only.
@@ -849,14 +855,23 @@ impl QuicPath {
             built_at,
         );
         let heard = Arc::new(recycle::PeerHeard::default());
+        #[cfg_attr(not(test), allow(unused_mut))]
+        let mut report = recycle::PathReport::new(connection.inner().clone(), stats.node());
+        #[cfg(test)]
+        {
+            report.panic_once_bucketed = limits.panic_in_watch;
+        }
         let receive = GlobalExecutor::spawn(supervise_receive(
             connection.inner().clone(),
             connection.closer(),
             Arc::new(receiver),
             stats.clone(),
             time,
-            connection.cap_holds(),
-            heard.clone(),
+            recycle::AckWatchParts {
+                cap_holds: connection.cap_holds(),
+                heard: heard.clone(),
+                report,
+            },
         ));
         (
             Self {
@@ -1501,21 +1516,26 @@ async fn supervise_receive<T: TimeSource>(
     receiver: Arc<inbound::Receiver<T>>,
     stats: Arc<QuicPathStats>,
     time: T,
-    cap_holds: Arc<super::socket::CapHolds>,
-    heard: Arc<recycle::PeerHeard>,
+    watch: recycle::AckWatchParts,
 ) {
     use futures::FutureExt;
     let mut receive = std::pin::pin!(
         std::panic::AssertUnwindSafe(inbound::receive(connection.clone(), receiver)).catch_unwind()
     );
-    let node = stats.node();
+    // Outside the watch, so a panic the watch contains does not end the path's
+    // report: it ends with this task ([`recycle::PathReport`]).
+    let recycle::AckWatchParts {
+        cap_holds,
+        heard,
+        mut report,
+    } = watch;
     let watch = std::panic::AssertUnwindSafe(recycle::watch_acknowledgements(
         connection.clone(),
         closer.clone(),
         time,
         cap_holds,
         heard,
-        node,
+        &mut report,
     ))
     .catch_unwind();
     let ended = tokio::select! {

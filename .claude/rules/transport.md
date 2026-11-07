@@ -111,13 +111,75 @@ refill also covered: capacity moves between connections, the node cap
 holds; so no timer-slack margin is needed), and a send error after the
 take does not refund it (as uncapped). Rate updates every RTT can
 reorder waiters slightly, as on the uncapped reserve path; order is not
-a correctness property of the cap. Then each attempt is:
-cwnd check, node-wide egress_cap::try_take, back to back with no await
-before the send; if the cap is short, sleep through StreamPacing (deficit x
-U[1.0, 1.4) + U[0, 2 ms)) and start again from the cwnd check. NODE-CAP
-ADMISSION IS A RACE: nothing is held on the cap while waiting, the order
-among waiters is random, so connections share the cap by their number of
-waiting streams (no isolation between connections). The kept connection
+a correctness property of the cap. Then each attempt is: wait in the
+node-wide cap's admission queue (StreamPacing::wait_for_admission over
+EgressCap::poll_admit, the SAME queue the QUIC endpoint waits in); if it had
+to wait, start again from the cwnd check, which the queue then admits at
+once; then cwnd check and egress_cap::try_take back to back with no await
+before the send (a take that still fails, because another sender took the
+refill first, queues again). NODE-CAP ADMISSION IS IN ORDER: each waiting
+stream and each waiting QUIC connection is one entry, and poll_admit admits
+a waiter only when the bucket holds its datagram PLUS one for every waiter
+queued ahead of it (counted up to MAX_ADMISSION_WAKERS), so a waiter that
+polls first cannot take another's turn. Nothing is set aside: a waiter
+ahead that has not polled yet takes its datagram from the same level when
+it does. Timers (staggered by place) decide only when a waiter looks; a late
+timer delays that waiter, never reorders. Without the level check, waiters
+due on one tick were admitted in poll order and a re-armed waiter lost every
+tie (one stream in three sent nothing in 2 s at 1524 streams). After
+Admission::Waited the stream re-checks cwnd and calls again; that call
+takes its turn without queueing within ADMISSION_PASS (1 ms). Without the
+pass it re-queued at the back on every turn and never sent. A stream held
+by cwnd past the pass, or whose take failed (an unpaced send took the
+datagram first), queues again AT ITS PLACE (AdmissionWaiter::held_place, the
+ticket it was admitted from, kept until a take succeeds), so neither costs
+it a turn of the queue (streams_sharing_a_window_keep_their_turn_under_a_binding_cap:
+worst gap one turn, 0.86 s, against two turns, 1.61 s, when it went to the
+back). At most MAX_ADMISSION_WAKERS admissions are live at once; the next
+waiter waits, and no live one is dropped. Every admission has a number its
+waiter keeps; a waiter that polls again (a QUIC poller whose take failed, a
+stream past the pass) withdraws its own, and a take never withdraws one it
+did not use, so a failed send on quinn's respond path (no poll_writable)
+leaves every live admission alone. A named waiter admitted on its first poll
+keeps a place too (its admission's number). A withdrawn admission wakes the
+next held waker, and a waiter's timer is set no later than the oldest
+outstanding admission lapses, so a datagram counted for an admission that
+goes unused does not leave the bucket idle. An admission stays on the queue
+(QueuedWaiters::admitted) until its take or for ADMISSION_PASS, whichever
+comes first: it counts ahead of every waiter that polls, and every take
+leaves one datagram per outstanding admission but its own, so on a
+multi-thread runtime nobody can use a datagram admitted to another sender
+between its Ready and its take. Admission times are read under the queue
+lock. A stream's admission is NAMED (AdmissionWaiter::named, taken with
+try_take_admitted through StreamPacing::take): its take finds its own
+admission or, once that lapsed, takes as a newcomer that leaves the
+datagrams owed to the rest. Without names, a stream descheduled past the
+pass took the datagram of a newer admission and cleared that admission as
+its own (2 to 37 of 3200 takes lost in
+an_admitted_take_is_not_lost_to_another_thread). A QUIC take is named too:
+QuicPoller::poll_ready hands its admission number to QuicSocket::try_send
+through a thread-local (quic/socket.rs HANDED_ADMISSION), relying on quinn
+0.11.12 calling poll_writable then try_send back to back on one thread
+(connection.rs:1048-1057; a quinn bump must re-check it,
+a_poller_hands_its_admission_to_the_transmit_that_follows). quinn's
+endpoint respond (endpoint.rs:584) sends with no poll, finds no handoff and
+leaves every admission alone. No take ever uses an admission it does not
+name. The queue holds a waker
+and a place, never bytes. So connections share the cap by their number of
+waiting senders (no isolation between connections). The wait races the
+stream's deadline (cut at LONG_WAIT and at PACED_WAIT_DEADLINE, check()
+after each cut), so abandonment and its counters mean what they did. Past
+MAX_ADMISSION_WAKERS (1024) queued waiters, newer ones hold no waker but
+keep their place and their staggered timer; no waiter is evicted (evicting
+the oldest sent the longest waiters to the back, and 500 of 1524 streams
+sent once in 2 s). A waiter's place is counted under the queue lock up to
+MAX_ADMISSION_WAKERS + 1 (so at most 1025 steps per poll, however long the
+queue), and its timer's stagger is clamped to MAX_ADMISSION_WAKERS so
+quic::socket::cap_hold_validity still bounds a QUIC transmit's next poll; a
+waiter further back wakes early and waits again: it is never admitted while
+more than MAX_ADMISSION_WAKERS are ahead of it, whatever the level (the
+clamp is for the timer only, pinned by
+a_waiter_past_the_count_bound_is_not_admitted_by_a_large_burst). The kept connection
 payment can be stale after a cwnd or cap wait (the bucket refills under
 it): a connection may then exceed its bucket by one datagram per waiting
 stream. That moves capacity between connections only; the node cap is
@@ -126,7 +188,14 @@ NEVER put a reservation on the NODE cap (earlier reservation/hold models
 there leaked capacity). 0.2.148 used try_take + jittered retry on
 the per-connection bucket too; the race starved streams on busy connections
 past 5 s (every abandonment on capped peers was `connection`, failures
-doubled on the busiest capped peer). StreamPacing (one per stream, only with
+doubled on the busiest capped peer). The node cap kept that race (try_take
++ jittered retry) until #6112, on the reasoning that its waiters were all
+streams, equally unordered. It stopped being neutral once QUIC shared the
+cap: QUIC waits in the queue, so it won contended refills, and with the
+default minimum (below) a QUIC path took about 462 kB/s and a UDP stream
+38 kB/s of a 500 kB/s cap (40 seeds). The 0.2.148 lesson applies: a random
+race among waiters starves the unlucky ones, so stream waiters now queue
+too (249 and 251 kB/s measured the same way). StreamPacing (one per stream, only with
 a cap) measures the gap since the stream's previous fragment was sent, the
 gap the receiver's STREAM_INACTIVITY_TIMEOUT times, and is checked BEFORE
 every take and after every sleep, and on every poll of the cwnd wait: at
@@ -159,9 +228,11 @@ before it sends (answered_connection_ack, receipts taken before the NoOp).
 Unpaced debt is capped at DEBT_LIMIT (1 s at the cap); the rest is forgiven
 (sent uncharged) and counted. Over any interval ending at a paced send the
 node sends at most burst + rate x interval + bytes forgiven in the
-interval. Invariant: nothing is reserved on the NODE cap; a paced sender
-holds no node-wide capacity while it waits, and is charged there only at
-its send (it does hold its per-connection reservation, see above). Gaps
+interval. Invariant: nothing is reserved on the NODE cap while a sender
+waits; it holds no node-wide capacity in the queue, and is charged there only
+at its send (it does hold its per-connection reservation, see above). Between
+its admission and its take an admitted sender holds one datagram, for at most
+ADMISSION_PASS (1 ms): every other take leaves it in the bucket. Gaps
 that reach LONG_WAIT
 (2.5 s) and abandoned streams are counted by what took most of the gap
 (WaitCause: cap, connection = the connection's own bucket, other = cwnd, the
@@ -177,20 +248,25 @@ the cap's TimeSource, kept in the caller's AdmissionWaiter. The timer is
 STAGGERED: deficit plus one WAKE_DATAGRAM_BYTES of refill per waiter queued
 ahead, so N waiters with one deficit wake one per datagram of refill, oldest
 first, not all N at once. While Pending the cap also holds the caller's
-waker (at most MAX_ADMISSION_WAKERS; past it an entry is dropped WITHOUT
-waking, its waiter keeps its timer); a waiter keeps its queue place across
+waker (at most MAX_ADMISSION_WAKERS; past it a newer waiter is queued with
+no waker and relies on its timer, and no entry is dropped); a waiter keeps its queue place across
 polls, and dropping an AdmissionWaiter removes its entry, so a closed
 connection cannot absorb a wake. Bytes given back (a take that sent less, or a failed send)
 wake one held waker per WAKE_DATAGRAM_BYTES (1200, the QUIC datagram) the
 bucket then holds, and none if it holds less, so legacy give-backs cost N
 waiting QUIC connections nothing until a datagram fits; wakers are woken
-after the lock is released, oldest registration first (a FIFO; overflow
-drops the oldest). An admitted waiter took the slot reserved for it, so
+after the lock is released, oldest holder first; the woken keep their
+places. An admission wakes the oldest waiter still holding a waker (the
+next in line, AdmissionQueue::try_admit), one wake per admission: a waiter's
+timer is set from its place when it last polled, and waiters that left
+ahead of it since (streams failing at their deadline) make it late. Without
+that wake, 300 streams on a 64 KiB/s cap, failing at their deadline and
+retrying, used 18% of the refill; with it, 100%. An admitted waiter took the slot reserved for it, so
 nobody behind it moves; a waiter dropped while queued wakes the next
 MAX_FOLLOWERS_WOKEN_PER_LEAVE (8) behind it so each re-polls to its new
 place (AdmissionQueue::leave), so N closes cost at most 8 N wakes. Waiters
 further back stay up to one datagram late per such drop until they next
-poll. An entry evicted at MAX_ADMISSION_WAKERS wakes nobody. No waiter wakes before
+poll. No waiter wakes before
 the bucket can admit it. It takes
 nothing; the QUIC socket takes with
 try_take and sends with DemuxSocket::try_send_to_paced, so its datagram is
@@ -774,12 +850,25 @@ Rate calculation on every rate update (peer_connection::paced_rate; #6047):
   1 MB/s, which GlobalBandwidthManager clamps to the total), a total below
   n x 1 MB/s, so nearly every residential cap, gives every connection a share
   of min(1 MB/s, total): each QUIC window cap is total x RTT and apportions
-  nothing, and the egress cap itself is not neutral between the transports.
-  QUIC waits in poll_admit (a queued waker, woken in order as the bucket
-  refills); a UDP stream sender takes with try_take and sleeps jittered
-  deficits, so QUIC wins contended refills. Measured the same way with the
-  default minimum: QUIC about 462 kB/s, UDP about 38 kB/s (40 seeds). #6112
-  tracks the fix.
+  nothing. The egress cap's admission queue apportions it instead: QUIC and
+  UDP stream senders wait in the same FIFO (see "Node-wide egress cap"), so
+  each waiting sender gets a turn. Measured the same way with the default
+  minimum: QUIC 249362 to 249363 B/s, one UDP stream 250568 B/s (40 seeds;
+  before #6112 QUIC 461 to 463 kB/s, UDP 37 to 39 kB/s). With four UDP
+  streams on the other connection: QUIC about 100 kB/s, the streams about
+  400 kB/s, since the queue serves senders, not connections (with no QUIC
+  path, one stream against four on another connection: 100 and 400 kB/s).
+  With the minimum below the share the connection buckets bound each side:
+  QUIC 239332 to 240057 B/s, UDP 249943 to 250106 B/s, with one or four
+  streams. No fragment reached the stream deadline in any case.
+  KNOWN LIMITATION on capped nodes: a QUIC connection is one sender in that
+  queue, so its ACKs wait their turn behind queued UDP stream fragments. With
+  100 UDP streams queued on a 500 kB/s cap, the peer sending to this node over
+  QUIC measured srtt 123 ms (41 ms on main, where QUIC won nearly every refill)
+  and a 300 kB transfer took 0.74 s (0.21 s); no losses or congestion events.
+  No ACK priority: quinn does not mark ACK-only transmits and the poller does
+  not know a transmit's size when it polls, so a size rule would be a guess.
+  Only nodes with total-bandwidth-limit are affected.
   CappedCubic::metrics reports the capped window as congestion_window.
   The transport sets the rate when it binds (bind_udp_listener, pinned by
   the_transport_gives_the_endpoint_its_bandwidth_settings); QuicSettings
@@ -1203,8 +1292,32 @@ a test passes its own; tests read their own, never the global).
   path tried, data and control, and those that waited for stream credit);
   quic_streamed_sends and quic_stream_permit_waited; quic_bytes_sent and
   quic_bytes_received (quinn's UDP payload counts, reported by change at each 2 s
-  tick of the acknowledgement watch, so a path's last tick before it closes is
-  lost); quic_session_ended_with_data_path_<age> (sessions that ended while their
+  tick of the acknowledgement watch and once more when the path's task ends);
+  quic_sent_packets, quic_lost_packets, quic_lost_bytes and
+  quic_congestion_events (quinn's PathStats, every path including shadow ones, by
+  the same tick and once more when the path's task ends, so a path's last tick
+  before it closes is counted, sums of the period). A CONNECTION_CLOSE quinn sends
+  again after that report is in neither the byte nor the packet counts. A panic
+  in the watch, which the path survives, ends nothing: the report is the
+  receive supervisor's (recycle::PathReport); quic_loss_rate_<zero|lt_0_5pct|lt_1pct|
+  lt_2pct|lt_5pct|lt_10pct|lt_20pct|ge_20pct> (a gauge of live paths that have sent
+  at least 200 packets since they started, each in the one bucket of its own
+  lost/sent over its life, moved as it changes, out when the path ends; every
+  bucket uploaded every period, 0 included; no per-path values) and
+  quic_ended_loss_rate_<bucket> (paths that ended in the period, by their final
+  bucket, so paths that fail lossy still show) and quic_ended_paths_below_floor
+  (paths that ended in the period before 200 packets). Packets in flight at close
+  are dropped by quinn, not declared lost, so a final bucket can understate the
+  loss at the end. The rate is quinn's lost over
+  sent (quinn-proto 0.11.19), not a measurement of the link: sent counts every
+  packet quinn built, acknowledgement-only ones included; lost counts quinn's
+  loss declarations, and a packet declared lost and later acknowledged is not
+  taken back; lost PLPMTUD probes are left out of lost while sent ones are in
+  sent, and MTU discovery is off, so no path sends any. A shadow path's packets
+  are mostly keepalives and acknowledgements, so its rate may not hold for
+  data-sized packets. The sums and the buckets are updated and reset under one
+  lock;
+  quic_session_ended_with_data_path_<age> (sessions that ended while their
   path's route still carried data); quic_streams_sampled_paths,
   quic_streams_open_ge_<8|16|32|48> and quic_streams_peak_max (per path and period,
   the peak of inbound streams read at once, counted as inbound_concurrency counts

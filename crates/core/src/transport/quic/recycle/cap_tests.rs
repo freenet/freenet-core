@@ -477,7 +477,7 @@ fn the_floor_keeps_two_datagrams_in_flight_both_ways() {
 /// `a_quic_path_and_udp_streams_each_get_their_fair_share_under_a_saturated_egress_cap`.
 #[test]
 fn a_quic_path_and_udp_streams_both_progress_under_an_egress_cap() {
-    use crate::transport::egress_cap::{PACED_WAIT_DEADLINE, try_take};
+    use crate::transport::egress_cap::{PACED_WAIT_DEADLINE, StreamPacing, try_take};
     bounded(|| async move {
         const CAP: u64 = 500_000;
         const QUIC_LEN: usize = 1_000_000;
@@ -504,8 +504,10 @@ fn a_quic_path_and_udp_streams_both_progress_under_an_egress_cap() {
                 // the cap, send at once, or sleep the deficit and try again.
                 let fragment = [0x02u8; 1200];
                 let (mut sent, mut last, mut longest) = (0, link.time.now_nanos(), 0u64);
+                // Never admitted: each take is a newcomer's.
+                let mut pacing = StreamPacing::new(&link.time);
                 while sent < UDP_LEN {
-                    match try_take(link.a_socket.as_ref(), Duration::ZERO) {
+                    match try_take(link.a_socket.as_ref(), &mut pacing) {
                         Ok(Some(take)) => {
                             let n = link
                                 .a_socket
@@ -563,106 +565,175 @@ fn a_quic_path_and_udp_streams_both_progress_under_an_egress_cap() {
     })
 }
 
-/// Under a saturated egress cap shared by two connections, with the minimum
-/// per connection set below the share, a QUIC path and a UDP stream sender on
-/// the other connection each get their fair share, half the cap, within 15%.
-/// The UDP sender is paced as the UDP transport paces a stream fragment: it
-/// reserves from its own connection's token bucket at the share
-/// (`TokenBucket::reserve`), then takes from the egress cap. Each side's rate
-/// is the bytes it put on the wire while the QUIC transfer ran, from when its
-/// connection was up.
-///
-/// What it covers is narrow: two connections, the same RTT, one flow each,
-/// and a minimum below the share. With the default minimum the share is the
-/// whole cap and the window cap does not apportion it (see `transport.md`).
-/// Seeded; over 40 seeds the rates ranged 239354 to 239658 B/s for QUIC and
-/// 249990 to 250105 B/s for UDP.
-///
-/// Measured: QUIC about 239 kB/s and UDP about 250 kB/s of a 250 kB/s share.
-/// With the window cap removed (and Cubic no longer told about it) QUIC took
-/// about 491 kB/s and UDP about 12 kB/s, so the window cap is what holds QUIC
-/// to its share here.
-///
-/// #6112 measured QUIC at about 390 kB/s against what it took for a 250 kB/s
-/// share. With the default minimum per connection (1 MB/s, which
-/// `GlobalBandwidthManager::new` clamps to the total) the share is the whole
-/// cap, so the window cap does not apportion it; that case is the open part
-/// of #6112, and this test sets a minimum below the share.
-#[test]
-fn a_quic_path_and_udp_streams_each_get_their_fair_share_under_a_saturated_egress_cap() {
-    use crate::transport::egress_cap::{jittered, try_take};
-    use crate::transport::token_bucket::TokenBucket;
-    bounded(|| async move {
-        let _seed = crate::config::GlobalRng::seed_guard(0x5940_6112);
-        const CAP: u64 = 500_000;
-        const QUIC_LEN: usize = 2_000_000;
-        let share = CAP as f64 / 2.0;
-        // A minimum below the share, as above.
-        let manager = Arc::new(GlobalBandwidthManager::new(CAP as usize, Some(1000)));
-        manager.register_connection();
-        manager.register_connection();
-        let link = Arc::new(
-            Link::new(
-                "quic-cap-fair-share",
-                7,
-                QuicRateLimit::new(None, Some(manager.clone())),
-                Some(CAP),
-            )
-            .await,
-        );
-        let udp = {
-            let link = link.clone();
-            let share = manager.current_per_connection_rate();
-            tokio::spawn(async move {
-                // The connection's bucket, as `initial_paced_rate` builds it:
-                // the global share, a tenth of it as capacity.
-                let bucket =
-                    TokenBucket::new_with_time_source(share / 10, share, link.time.clone());
-                let fragment = [0x02u8; 1200];
-                loop {
-                    let wait = bucket.reserve(fragment.len());
-                    if !wait.is_zero() {
-                        link.time.sleep(wait).await;
-                    }
-                    loop {
-                        match try_take(link.a_socket.as_ref(), Duration::ZERO) {
-                            Ok(Some(take)) => {
-                                link.a_socket
-                                    .try_send_to_paced(&fragment, link.b_addr, take)
-                                    .expect("sent");
-                                break;
-                            }
-                            Ok(None) => unreachable!("the socket has a cap"),
-                            // As `StreamPacing` sleeps a refused take.
-                            Err(deficit) => link.time.sleep(jittered(deficit)).await,
-                        }
-                    }
+/// A paced UDP stream on `a`, sending 1200-byte fragments to `b` as
+/// `outbound_stream::capped_attempt` sends a stream fragment under a cap:
+/// reserve it on its connection's `bucket` (`TokenBucket::reserve`), wait in
+/// the cap's admission queue (`StreamPacing::wait_for_admission`), the one
+/// the QUIC endpoint waits in, then take and send at once. There is no
+/// congestion window here, so a fragment that had to wait goes straight back
+/// to the queue, which admits it at once. Records each send's time in
+/// `sends`. A fragment that reaches the stream deadline is counted in
+/// `abandoned`, and the stream carries on with a fresh gap.
+async fn paced_udp_stream(
+    link: Arc<Link>,
+    bucket: Arc<crate::transport::token_bucket::TokenBucket<VirtualTime>>,
+    sends: Arc<Mutex<Vec<u64>>>,
+    abandoned: Arc<AtomicU64>,
+) {
+    use crate::transport::egress_cap::{PACED_TAKE_BYTES, StreamPacing, try_take};
+    let fragment = [0x02u8; 1200];
+    let cap = link.a_socket.egress_cap().expect("a cap");
+    let mut pacing = StreamPacing::new(&link.time);
+    loop {
+        let wait = bucket.reserve(fragment.len());
+        if !wait.is_zero() {
+            link.time.sleep(wait).await;
+        }
+        loop {
+            if pacing
+                .wait_for_admission(&link.time, cap, PACED_TAKE_BYTES)
+                .await
+                .is_err()
+            {
+                abandoned.fetch_add(1, Ordering::Relaxed);
+                pacing = StreamPacing::new(&link.time);
+                continue;
+            }
+            match try_take(link.a_socket.as_ref(), &mut pacing) {
+                Ok(Some(take)) => {
+                    link.a_socket
+                        .try_send_to_paced(&fragment, link.b_addr, take)
+                        .expect("sent");
+                    sends.lock().unwrap().push(link.time.now_nanos());
+                    pacing.sent(&link.time);
+                    break;
                 }
-            })
-        };
-        let (start, elapsed) = link
-            .send_timed(true, QUIC_LEN, Duration::from_secs(120))
-            .await;
-        udp.abort();
-        let end = start + elapsed.as_nanos() as u64;
-        let (mut quic, mut udp_bytes) = (0u64, 0u64);
-        for (at, len, is_quic) in link.sent.lock().unwrap().iter() {
-            if (start..=end).contains(at) {
-                if *is_quic {
-                    quic += *len as u64;
-                } else {
-                    udp_bytes += *len as u64;
-                }
+                Ok(None) => unreachable!("the socket has a cap"),
+                // Another sender took the refill first: queue again.
+                Err(_) => {}
             }
         }
-        let seconds = elapsed.as_secs_f64();
-        let (quic_rate, udp_rate) = (quic as f64 / seconds, udp_bytes as f64 / seconds);
-        for (name, rate) in [("QUIC", quic_rate), ("UDP", udp_rate)] {
-            assert!(
-                (rate - share).abs() <= 0.15 * share,
-                "{name} ran at {rate:.0} B/s, the share is {share:.0} (QUIC {quic_rate:.0}, \
-                 UDP {udp_rate:.0}, over {seconds:.2} s)"
-            );
+    }
+}
+
+/// A QUIC path and `streams` paced UDP streams on another connection share
+/// a saturated 500 kB/s egress cap; `minimum` is the minimum per connection
+/// (`None` for the default). Returns the QUIC and UDP rates in B/s, from the
+/// bytes each put on the wire while a 2 MB QUIC transfer ran (from when its
+/// connection was up), and the fragments abandoned at the stream deadline.
+async fn quic_and_udp_rates(
+    network: &str,
+    subnet: u8,
+    seed: u64,
+    minimum: Option<usize>,
+    streams: usize,
+) -> (f64, f64, u64) {
+    use crate::transport::token_bucket::TokenBucket;
+    let _seed = crate::config::GlobalRng::seed_guard(seed);
+    const CAP: u64 = 500_000;
+    let manager = Arc::new(GlobalBandwidthManager::new(CAP as usize, minimum));
+    manager.register_connection();
+    manager.register_connection();
+    let link = Arc::new(
+        Link::new(
+            network,
+            subnet,
+            QuicRateLimit::new(None, Some(manager.clone())),
+            Some(CAP),
+        )
+        .await,
+    );
+    // The connection's bucket, as `initial_paced_rate` builds it: the global
+    // share, a tenth of it as capacity.
+    let share = manager.current_per_connection_rate();
+    let bucket = Arc::new(TokenBucket::new_with_time_source(
+        share / 10,
+        share,
+        link.time.clone(),
+    ));
+    let abandoned = Arc::new(AtomicU64::new(0));
+    let udp: Vec<_> = (0..streams)
+        .map(|_| {
+            tokio::spawn(paced_udp_stream(
+                link.clone(),
+                bucket.clone(),
+                Arc::default(),
+                abandoned.clone(),
+            ))
+        })
+        .collect();
+    let (start, elapsed) = link
+        .send_timed(true, 2_000_000, Duration::from_secs(120))
+        .await;
+    for task in udp {
+        task.abort();
+    }
+    let end = start + elapsed.as_nanos() as u64;
+    let (mut quic, mut udp_bytes) = (0u64, 0u64);
+    for (at, len, is_quic) in link.sent.lock().unwrap().iter() {
+        if (start..=end).contains(at) {
+            if *is_quic {
+                quic += *len as u64;
+            } else {
+                udp_bytes += *len as u64;
+            }
+        }
+    }
+    let seconds = elapsed.as_secs_f64();
+    (
+        quic as f64 / seconds,
+        udp_bytes as f64 / seconds,
+        abandoned.load(Ordering::Relaxed),
+    )
+}
+
+/// Under a saturated egress cap shared by two connections, a QUIC path and a
+/// UDP stream on the other connection each get their fair share, half the
+/// cap, within 15%, both with the minimum per connection set below the share
+/// and with the default minimum, and no fragment reaches the stream deadline.
+/// The UDP stream is paced as the UDP transport paces one
+/// ([`paced_udp_stream`]).
+///
+/// The two minimums hold the QUIC path to its share in different ways. With
+/// a minimum below the share, the share is half the cap and the QUIC window
+/// cap (`rate x RTT`) keeps QUIC to it: with the window cap removed (and
+/// Cubic no longer told about it) QUIC took about 491 kB/s and UDP about
+/// 12 kB/s. With the default minimum (1 MB/s, which
+/// `GlobalBandwidthManager::new` clamps to the total) each connection's
+/// share is the whole cap, so the window cap does not apportion it; the
+/// node-wide cap's admission queue does, serving the two senders in turn.
+/// Before UDP streams waited in that queue (#6112), with the default minimum
+/// QUIC took 461 to 463 kB/s and UDP 37 to 39 kB/s over 40 seeds.
+///
+/// What it covers is narrow: two connections, the same RTT, one flow each.
+/// Seeded; over 40 seeds the rates ranged 239332 to 239769 B/s for QUIC and
+/// 250059 to 250106 B/s for UDP with the minimum below the share, and
+/// 249362 to 249363 B/s for QUIC and 250568 B/s for UDP with the default
+/// minimum. With four UDP streams on the other connection and the default
+/// minimum, QUIC got about 100 kB/s and the streams about 400 kB/s: the
+/// queue serves waiting senders in turn, so connections share the cap by
+/// their number of waiting senders unless the minimum is below the share.
+#[test]
+fn a_quic_path_and_udp_streams_each_get_their_fair_share_under_a_saturated_egress_cap() {
+    bounded(|| async move {
+        let share = 500_000.0 / 2.0;
+        for (subnet, minimum) in [(7, Some(1000)), (8, None)] {
+            let (quic_rate, udp_rate, abandoned) = quic_and_udp_rates(
+                &format!("quic-cap-fair-share-{subnet}"),
+                subnet,
+                0x5940_6112,
+                minimum,
+                1,
+            )
+            .await;
+            assert_eq!(abandoned, 0, "minimum {minimum:?}: no fragment abandoned");
+            for (name, rate) in [("QUIC", quic_rate), ("UDP", udp_rate)] {
+                assert!(
+                    (rate - share).abs() <= 0.15 * share,
+                    "minimum {minimum:?}: {name} ran at {rate:.0} B/s, the share is \
+                     {share:.0} (QUIC {quic_rate:.0}, UDP {udp_rate:.0})"
+                );
+            }
         }
     })
 }

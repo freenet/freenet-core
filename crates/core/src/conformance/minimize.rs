@@ -9,8 +9,8 @@
 //! anything about contracts with large ones. That is the wrong way round: the
 //! large-state contracts are the expensive ones.
 //!
-//! **A small witness is a usable bug report.** The evidence that removes a contract
-//! is also the most useful thing its author will ever receive, and "these two 400 KB
+//! **A small witness is a usable bug report.** The evidence for a broken law is
+//! the most useful thing its author will ever receive, and "these two 400 KB
 //! blobs disagree" is not a bug report. Two four-byte states that disagree is.
 //!
 //! The shrinking is deliberately unambitious: it substitutes smaller states drawn

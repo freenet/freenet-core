@@ -102,6 +102,12 @@ use tokio::sync::mpsc;
 
 use crate::util::time_source::{DynTimeSource, InstantTimeSrc, TimeSource};
 
+mod native_grants;
+
+pub(crate) use native_grants::{
+    GrantToken, GrantTokenHash, MAX_NATIVE_GRANTS, sanitize_client_name,
+};
+
 /// Apps one delegate can be bound to. Above this a new binding is not recorded
 /// (the delegate keeps working in the foreground for that app).
 pub(crate) const MAX_APPS_PER_DELEGATE: usize = 8;
@@ -169,9 +175,9 @@ pub(crate) enum AppIdentity {
 
 impl AppIdentity {
     const TAG_WEBAPP: u8 = 1;
-    const ENCODED_LEN: usize = 33;
+    pub(crate) const ENCODED_LEN: usize = 33;
 
-    fn encode(&self) -> [u8; Self::ENCODED_LEN] {
+    pub(crate) fn encode(&self) -> [u8; Self::ENCODED_LEN] {
         let mut out = [0u8; Self::ENCODED_LEN];
         match self {
             AppIdentity::WebApp(id) => {
@@ -182,7 +188,7 @@ impl AppIdentity {
         out
     }
 
-    fn decode(bytes: &[u8]) -> Option<Self> {
+    pub(crate) fn decode(bytes: &[u8]) -> Option<Self> {
         if bytes.len() != Self::ENCODED_LEN {
             return None;
         }
@@ -399,6 +405,34 @@ pub(crate) trait CapabilityStorage: Send + Sync {
     fn get_grant(&self, key: &[u8]) -> anyhow::Result<Option<Vec<u8>>>;
     fn remove_grant(&self, key: &[u8]) -> anyhow::Result<()>;
     fn all_grants(&self) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>>;
+    /// Native app grants (#5264), keyed by the SHA-256 of the grant token.
+    /// Encoding is owned by `delegate_capabilities::native_grants`.
+    ///
+    /// Insert a new grant unless `max` grants already exist. The count and the
+    /// insert happen in ONE write transaction, so concurrent inserts cannot
+    /// exceed `max`. `Ok(false)` when the cap refused it. A key already present
+    /// is left as it is and reported as `Ok(true)`, without counting against
+    /// the cap.
+    fn insert_native_grant_capped(
+        &self,
+        token_hash: &[u8; 32],
+        value: &[u8],
+        max: usize,
+    ) -> anyhow::Result<bool>;
+    /// Rewrite an EXISTING grant row with `update(old)`, in one write
+    /// transaction. A row that is absent (revoked) is left absent: this must
+    /// never recreate a deleted grant. `update` returning `None` leaves the row
+    /// unchanged.
+    fn update_native_grant_if_present(
+        &self,
+        token_hash: &[u8; 32],
+        update: &mut dyn FnMut(&[u8]) -> Option<Vec<u8>>,
+    ) -> anyhow::Result<()>;
+    fn get_native_grant(&self, token_hash: &[u8; 32]) -> anyhow::Result<Option<Vec<u8>>>;
+    /// Remove a native grant; `true` if a row was removed.
+    fn remove_native_grant(&self, token_hash: &[u8; 32]) -> anyhow::Result<bool>;
+    #[allow(clippy::type_complexity)]
+    fn all_native_grants(&self) -> anyhow::Result<Vec<([u8; 32], Vec<u8>)>>;
 }
 
 #[cfg(feature = "redb")]
@@ -427,6 +461,30 @@ impl CapabilityStorage for crate::contract::storages::redb::ReDb {
     fn all_grants(&self) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
         Ok(self.load_all_app_capability_grants()?)
     }
+    fn insert_native_grant_capped(
+        &self,
+        token_hash: &[u8; 32],
+        value: &[u8],
+        max: usize,
+    ) -> anyhow::Result<bool> {
+        Ok(self.insert_native_app_grant_capped(token_hash, value, max)?)
+    }
+    fn update_native_grant_if_present(
+        &self,
+        token_hash: &[u8; 32],
+        update: &mut dyn FnMut(&[u8]) -> Option<Vec<u8>>,
+    ) -> anyhow::Result<()> {
+        Ok(self.update_native_app_grant_if_present(token_hash, update)?)
+    }
+    fn get_native_grant(&self, token_hash: &[u8; 32]) -> anyhow::Result<Option<Vec<u8>>> {
+        Ok(self.get_native_app_grant(token_hash)?)
+    }
+    fn remove_native_grant(&self, token_hash: &[u8; 32]) -> anyhow::Result<bool> {
+        Ok(self.remove_native_app_grant(token_hash)?)
+    }
+    fn all_native_grants(&self) -> anyhow::Result<Vec<([u8; 32], Vec<u8>)>> {
+        Ok(self.load_all_native_app_grants()?)
+    }
 }
 
 /// In-process storage. See [`CapabilityStorage`].
@@ -435,6 +493,7 @@ impl CapabilityStorage for crate::contract::storages::redb::ReDb {
 pub(crate) struct MemoryCapabilityStorage {
     records: Mutex<HashMap<DelegateKey, Vec<u8>>>,
     grants: Mutex<HashMap<Vec<u8>, Vec<u8>>>,
+    native_grants: Mutex<HashMap<[u8; 32], Vec<u8>>>,
 }
 
 #[cfg(any(test, not(feature = "redb")))]
@@ -477,6 +536,49 @@ impl CapabilityStorage for MemoryCapabilityStorage {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect())
     }
+    fn insert_native_grant_capped(
+        &self,
+        token_hash: &[u8; 32],
+        value: &[u8],
+        max: usize,
+    ) -> anyhow::Result<bool> {
+        let mut grants = self.native_grants.lock();
+        if grants.contains_key(token_hash) {
+            return Ok(true);
+        }
+        if grants.len() >= max {
+            return Ok(false);
+        }
+        grants.insert(*token_hash, value.to_vec());
+        Ok(true)
+    }
+    fn update_native_grant_if_present(
+        &self,
+        token_hash: &[u8; 32],
+        update: &mut dyn FnMut(&[u8]) -> Option<Vec<u8>>,
+    ) -> anyhow::Result<()> {
+        let mut grants = self.native_grants.lock();
+        if let Some(row) = grants.get_mut(token_hash)
+            && let Some(new) = update(row)
+        {
+            *row = new;
+        }
+        Ok(())
+    }
+    fn get_native_grant(&self, token_hash: &[u8; 32]) -> anyhow::Result<Option<Vec<u8>>> {
+        Ok(self.native_grants.lock().get(token_hash).cloned())
+    }
+    fn remove_native_grant(&self, token_hash: &[u8; 32]) -> anyhow::Result<bool> {
+        Ok(self.native_grants.lock().remove(token_hash).is_some())
+    }
+    fn all_native_grants(&self) -> anyhow::Result<Vec<([u8; 32], Vec<u8>)>> {
+        Ok(self
+            .native_grants
+            .lock()
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect())
+    }
 }
 
 /// [`MemoryCapabilityStorage`] whose record and grant READS can be made to
@@ -487,6 +589,19 @@ pub(crate) struct FlakyCapabilityStorage {
     inner: MemoryCapabilityStorage,
     pub fail_records: std::sync::atomic::AtomicBool,
     pub fail_grants: std::sync::atomic::AtomicBool,
+    #[allow(clippy::type_complexity)]
+    pub after_native_get: Mutex<Option<Box<dyn FnOnce(&MemoryCapabilityStorage) + Send>>>,
+    /// Calls to `insert_native_grant_capped`.
+    pub native_inserts: std::sync::atomic::AtomicUsize,
+    /// Calls to `remove_native_grant` that reached the inner storage.
+    pub native_removes: std::sync::atomic::AtomicUsize,
+    /// The next native insert commits and then reports an error.
+    pub native_insert_commits_then_errs: std::sync::atomic::AtomicBool,
+    /// Native removes report an error (and remove nothing).
+    pub fail_native_remove: std::sync::atomic::AtomicBool,
+    /// Runs once, before the next native remove (may block or panic).
+    #[allow(clippy::type_complexity)]
+    pub before_native_remove: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 #[cfg(test)]
@@ -520,6 +635,58 @@ impl CapabilityStorage for FlakyCapabilityStorage {
     }
     fn all_grants(&self) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
         self.inner.all_grants()
+    }
+    fn insert_native_grant_capped(
+        &self,
+        token_hash: &[u8; 32],
+        value: &[u8],
+        max: usize,
+    ) -> anyhow::Result<bool> {
+        self.native_inserts.fetch_add(1, Ordering::SeqCst);
+        let stored = self
+            .inner
+            .insert_native_grant_capped(token_hash, value, max)?;
+        if self
+            .native_insert_commits_then_errs
+            .swap(false, Ordering::SeqCst)
+        {
+            anyhow::bail!("injected error after the insert committed");
+        }
+        Ok(stored)
+    }
+    fn update_native_grant_if_present(
+        &self,
+        token_hash: &[u8; 32],
+        update: &mut dyn FnMut(&[u8]) -> Option<Vec<u8>>,
+    ) -> anyhow::Result<()> {
+        self.inner
+            .update_native_grant_if_present(token_hash, update)
+    }
+    fn get_native_grant(&self, token_hash: &[u8; 32]) -> anyhow::Result<Option<Vec<u8>>> {
+        if self.fail_grants.load(Ordering::Relaxed) {
+            anyhow::bail!("injected grant read failure");
+        }
+        let row = self.inner.get_native_grant(token_hash);
+        // Runs once, right after the read: lets a test interleave another
+        // operation (a revocation) between a read and whatever follows it.
+        if let Some(hook) = self.after_native_get.lock().take() {
+            hook(&self.inner);
+        }
+        row
+    }
+    fn remove_native_grant(&self, token_hash: &[u8; 32]) -> anyhow::Result<bool> {
+        if let Some(hook) = self.before_native_remove.lock().take() {
+            hook();
+        }
+        if self.fail_native_remove.load(Ordering::SeqCst) {
+            anyhow::bail!("injected remove failure");
+        }
+        let removed = self.inner.remove_native_grant(token_hash);
+        self.native_removes.fetch_add(1, Ordering::SeqCst);
+        removed
+    }
+    fn all_native_grants(&self) -> anyhow::Result<Vec<([u8; 32], Vec<u8>)>> {
+        self.inner.all_native_grants()
     }
 }
 

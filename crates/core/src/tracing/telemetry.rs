@@ -4483,8 +4483,9 @@ mod tests {
         // `rejected_oversized` population outcome across the 6 sources, and
         // the `over_size_bound` entry in `current`), 7 x 21 bytes at u64::MAX
         // = 147: measured 15342, still within this limit. Raised by #6001 for
-        // the 149 counters of `tel_t` and `tel`: measured 18629.
-        const MAX_WORST_CASE_JSON_BYTES: usize = 18_688;
+        // the 149 counters of `tel_t` and `tel`: measured 18629. Raised for
+        // the 4 `recv_ap` counters (already-applied skips): measured 18725.
+        const MAX_WORST_CASE_JSON_BYTES: usize = 18_816;
         // Raised from 2_048 by #5647 for the same 7 new counters, about 2 bytes
         // each in an all-zero block (a digit and a comma): measured 2057.
         // Raised again by #6001 for `tel_t` and `tel`: measured 2515.
@@ -4544,6 +4545,7 @@ mod tests {
             recv_n: [[value; 9]; 4],
             recv_tn: [[value; 9]; 10],
             recv_tb: [[value; 9]; 10],
+            recv_ap: [value; 4],
             state_n: [value; 9],
             state_b: [value; 9],
             state: [value; 9],
@@ -4576,7 +4578,7 @@ mod tests {
         let object = block
             .as_object()
             .expect("network_efficiency_v1 must remain a JSON object");
-        assert_eq!(object.len(), 39, "schema must remain fixed-cardinality");
+        assert_eq!(object.len(), 40, "schema must remain fixed-cardinality");
         let encoded = serde_json::to_vec(block).expect("serialize diagnostic block");
         assert!(
             encoded.len() <= MAX_BUSY_JSON_BYTES,
@@ -7706,6 +7708,13 @@ mod tests {
         data.streams_open_paths_sampled = 1009;
         data.streams_open_ge = vec![1010, 1011, 1012, 1013];
         data.streams_open_max = 1014;
+        data.sent_packets = 1015;
+        data.lost_packets = 1016;
+        data.lost_bytes = 1017;
+        data.congestion_events = 1018;
+        data.loss_rate = (1019..1027).collect();
+        data.ended_loss_rate = (1027..1035).collect();
+        data.ended_below_floor = 1035;
         let want: std::collections::BTreeMap<String, u64> =
             snapshot.quic_data.keys().into_iter().collect();
         assert!(want.values().all(|value| *value != 0));

@@ -802,7 +802,7 @@ pub(crate) async fn watch_acknowledgements<T: TimeSource>(
     time: T,
     cap_holds: Arc<CapHolds>,
     heard: Arc<PeerHeard>,
-    node: &'static crate::transport::metrics::QuicDataCounters,
+    report: &mut PathReport,
 ) {
     let Some(first) = AckSample::of(&connection, &cap_holds) else {
         tracing::warn!(
@@ -814,15 +814,15 @@ pub(crate) async fn watch_acknowledgements<T: TimeSource>(
     };
     let mut received = first.received;
     let mut watch = AckWatch::new(ACK_WATCH_WINDOW, first);
-    let mut bytes = UdpBytes::of(&connection);
     loop {
         time.sleep(ACK_WATCH_TICK).await;
-        if connection.close_reason().is_some() {
+        // Read before the counts, so a closed connection's counts are its
+        // final ones.
+        let closed = connection.close_reason().is_some();
+        report.report();
+        if closed {
             return;
         }
-        let (next, sent, got) = bytes.step(UdpBytes::of(&connection));
-        node.record_bytes(sent, got);
-        bytes = next;
         let Some(sample) = AckSample::of(&connection, &cap_holds) else {
             return;
         };
@@ -846,9 +846,89 @@ pub(crate) async fn watch_acknowledgements<T: TimeSource>(
 
 #[cfg(test)]
 mod cap_tests;
+
+/// What a path's receive supervisor keeps for its acknowledgement watch.
+pub(crate) struct AckWatchParts {
+    pub(crate) cap_holds: Arc<CapHolds>,
+    pub(crate) heard: Arc<PeerHeard>,
+    pub(crate) report: PathReport,
+}
+
+/// Watch panics `PathReport::panic_once_bucketed` raised. Tests only; only
+/// the one test that sets it raises any.
+#[cfg(test)]
+pub(crate) static TEST_WATCH_PANICS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// A path's byte and loss counts, reported node-wide by their change at each
+/// tick of the watch, and once more when the report is dropped. It is owned
+/// by the path's receive supervisor and lent to the watch, so it is dropped
+/// when the path's task ends (the connection closed and the receive task
+/// returned, or the task was aborted with the path), and the counts up to
+/// then, often the losses that ended the path, are still reported. Then the
+/// window is dropped, which counts the path among the ended ones. A panic in
+/// the watch, which the supervisor contains while the path stays up, does
+/// not drop it: the path stays in its live bucket until it really ends.
+/// After a contained watch panic nothing ticks it any more, so the path's
+/// bytes and packets from then on arrive as one report when the path ends.
+pub(crate) struct PathReport {
+    connection: quinn::Connection,
+    node: &'static crate::transport::metrics::QuicDataCounters,
+    bytes: UdpBytes,
+    loss: PathLoss,
+    window: crate::transport::metrics::PathLossWindow,
+    /// The next report that finds the path in a bucket panics, once
+    /// (supervisor test).
+    #[cfg(test)]
+    pub(crate) panic_once_bucketed: bool,
+}
+
+impl PathReport {
+    pub(crate) fn new(
+        connection: quinn::Connection,
+        node: &'static crate::transport::metrics::QuicDataCounters,
+    ) -> Self {
+        let stats = connection.stats();
+        Self {
+            bytes: UdpBytes::of(&stats),
+            loss: PathLoss::of(&stats),
+            window: crate::transport::metrics::PathLossWindow::new(node),
+            connection,
+            node,
+            #[cfg(test)]
+            panic_once_bucketed: false,
+        }
+    }
+
+    /// Report the change since the last report, from one read of the stats.
+    fn report(&mut self) {
+        let stats = self.connection.stats();
+        let (next, sent, got) = self.bytes.step(UdpBytes::of(&stats));
+        self.node.record_bytes(sent, got);
+        self.bytes = next;
+        let (next, delta) = self.loss.step(PathLoss::of(&stats));
+        self.node.record_path_loss(&mut self.window, delta);
+        self.loss = next;
+        #[cfg(test)]
+        if self.panic_once_bucketed && self.window.is_bucketed() {
+            self.panic_once_bucketed = false;
+            TEST_WATCH_PANICS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            panic!("test: the acknowledgement watch panics");
+        }
+    }
+}
+
+impl Drop for PathReport {
+    fn drop(&mut self) {
+        // Not while unwinding: quinn's state lock may be what panicked.
+        if !std::thread::panicking() {
+            self.report();
+        }
+    }
+}
 /// A path's UDP payload bytes as quinn counts them, reported node-wide by their
-/// change at each tick of the watch (`quic_bytes_sent`, `quic_bytes_received`).
-/// What a path moves in its last tick before it closes is not reported.
+/// change at each tick of the watch (`quic_bytes_sent`, `quic_bytes_received`)
+/// and when the path's task ends ([`PathReport`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct UdpBytes {
     sent: u64,
@@ -856,8 +936,7 @@ struct UdpBytes {
 }
 
 impl UdpBytes {
-    fn of(connection: &quinn::Connection) -> Self {
-        let stats = connection.stats();
+    fn of(stats: &quinn::ConnectionStats) -> Self {
         Self {
             sent: stats.udp_tx.bytes,
             received: stats.udp_rx.bytes,
@@ -873,6 +952,43 @@ impl UdpBytes {
             now.sent.saturating_sub(self.sent),
             now.received.saturating_sub(self.received),
         )
+    }
+}
+
+/// A path's packet counts as quinn's `PathStats` keeps them, reported
+/// node-wide by their change at each tick of the watch (`quic_sent_packets`,
+/// `quic_lost_packets`, `quic_lost_bytes`, `quic_congestion_events`, and the
+/// path's own loss rate in `quic_loss_rate_<bucket>`), as for [`UdpBytes`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct PathLoss {
+    pub(crate) sent_packets: u64,
+    pub(crate) lost_packets: u64,
+    pub(crate) lost_bytes: u64,
+    pub(crate) congestion_events: u64,
+}
+
+impl PathLoss {
+    fn of(stats: &quinn::ConnectionStats) -> Self {
+        let path = stats.path;
+        Self {
+            sent_packets: path.sent_packets,
+            lost_packets: path.lost_packets,
+            lost_bytes: path.lost_bytes,
+            congestion_events: path.congestion_events,
+        }
+    }
+
+    /// The change from `self` to `now`, and the state to report the next change
+    /// from, which is `now`. Pure, so the report is tested.
+    #[must_use]
+    fn step(self, now: Self) -> (Self, Self) {
+        let delta = Self {
+            sent_packets: now.sent_packets.saturating_sub(self.sent_packets),
+            lost_packets: now.lost_packets.saturating_sub(self.lost_packets),
+            lost_bytes: now.lost_bytes.saturating_sub(self.lost_bytes),
+            congestion_events: now.congestion_events.saturating_sub(self.congestion_events),
+        };
+        (now, delta)
     }
 }
 

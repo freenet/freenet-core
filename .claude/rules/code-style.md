@@ -352,6 +352,19 @@ example (the `classify_suspend_jump` helper and its rustdoc). Do not
 add new call sites for any other purpose — every other "I need real
 time" urge in `crates/core/` should still go through `TimeSource`.
 
+#### Exception: `tokio::time::Instant` in the client API's HTTP layer
+
+Request state that lives only in the HTTP handlers under
+`crates/core/src/server/client_api/` (the native app grant requests in
+`app_grants.rs`, and the delegate permission prompts in
+`contract/user_input.rs` they mirror) may read `tokio::time::Instant` directly
+instead of `TimeSource`. The simulation harness does not drive these routes,
+and tokio's clock is what their tests pause and advance
+(`#[tokio::test(start_paused = true)]`, `tokio::time::advance`), so they stay
+deterministic. Say so in a comment where the clock is read. This does not
+extend to anything the simulation runs: operations, routing, transport and the
+contract executor still go through `TimeSource`.
+
 #### Exception: `OsRng` for cryptographic key / nonce generation
 
 The other legitimate reason to bypass `GlobalRng` in `crates/core/` is
