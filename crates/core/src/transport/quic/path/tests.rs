@@ -3522,6 +3522,7 @@ async fn stuck_send(
     clock: VirtualTime,
     ack_until: u64,
     hold: bool,
+    first_ack: bool,
     total: Duration,
 ) -> (BoundedSend, Duration) {
     let acks = recycle::AckProgress::detached();
@@ -3539,10 +3540,13 @@ async fn stuck_send(
     let start = clock.now();
     let ticking = clock.clone();
     let peer = async move {
-        for _ in 0..ack_until {
+        for second in 0..ack_until {
             ticking.sleep(Duration::from_secs(1)).await;
             if hold {
                 cap.hold_one();
+                if first_ack && second == 0 {
+                    acks.ack();
+                }
             } else {
                 acks.ack();
             }
@@ -3571,7 +3575,7 @@ fn the_gap_runs_on_while_the_connection_is_acknowledged() {
         let time = VirtualTime::new();
         let clock = time.clone();
         let (sent, after) = drive(&time, LIMIT, async move {
-            stuck_send(clock, 30, false, Duration::from_secs(120)).await
+            stuck_send(clock, 30, false, false, Duration::from_secs(120)).await
         })
         .await;
         assert!(
@@ -3591,7 +3595,7 @@ fn the_gap_runs_out_on_its_own_when_nothing_is_acknowledged() {
         let time = VirtualTime::new();
         let clock = time.clone();
         let (sent, after) = drive(&time, LIMIT, async move {
-            stuck_send(clock, 0, false, Duration::from_secs(120)).await
+            stuck_send(clock, 0, false, false, Duration::from_secs(120)).await
         })
         .await;
         assert!(
@@ -3602,22 +3606,47 @@ fn the_gap_runs_out_on_its_own_when_nothing_is_acknowledged() {
     })
 }
 
-/// An egress cap holding the node's QUIC transmits counts as the connection
-/// moving, as for the stall count: nothing can be acknowledged meanwhile.
+/// An egress cap holding this connection's transmits counts as the connection
+/// moving, as for the stall count, but only within `STALL_PROGRESS_WINDOW` of
+/// the connection's last acknowledgement: a held transmit on a connection
+/// nothing has acknowledged for the window is no evidence that it is alive
+/// (#6128 CI: a dark connection's own probes, held by a saturated cap, kept its
+/// send going). One acknowledgement at 1 s, then a hold every second to 30 s:
+/// the 2 s wake sees the acknowledgement, the 12 s wake counts the holds (10 s
+/// after it), the 22 s wake does not, and the send ends at 22 s.
 #[test]
 fn a_cap_hold_counts_as_the_connection_moving() {
     bounded(|| async move {
         let time = VirtualTime::new();
         let clock = time.clone();
         let (sent, after) = drive(&time, LIMIT, async move {
-            stuck_send(clock, 30, true, Duration::from_secs(120)).await
+            stuck_send(clock, 30, true, true, Duration::from_secs(120)).await
         })
         .await;
         assert!(
             matches!(sent, BoundedSend::Failed(SendFailure::TimedOut)),
             "{sent:?}"
         );
-        assert_eq!(after, Duration::from_secs(42));
+        assert_eq!(after, Duration::from_secs(22));
+    })
+}
+
+/// Holds with no acknowledgement during the send count for nothing: the send
+/// fails at its own gap, as on a path gone dark whose probes the cap holds.
+#[test]
+fn a_cap_hold_without_an_acknowledgement_is_not_progress() {
+    bounded(|| async move {
+        let time = VirtualTime::new();
+        let clock = time.clone();
+        let (sent, after) = drive(&time, LIMIT, async move {
+            stuck_send(clock, 30, true, false, Duration::from_secs(120)).await
+        })
+        .await;
+        assert!(
+            matches!(sent, BoundedSend::Failed(SendFailure::TimedOut)),
+            "{sent:?}"
+        );
+        assert_eq!(after, Duration::from_secs(5));
     })
 }
 
@@ -3874,7 +3903,7 @@ fn total_ends_a_send_on_a_connection_that_keeps_moving() {
         let time = VirtualTime::new();
         let clock = time.clone();
         let (sent, after) = drive(&time, LIMIT, async move {
-            stuck_send(clock, 1000, false, Duration::from_secs(60)).await
+            stuck_send(clock, 1000, false, false, Duration::from_secs(60)).await
         })
         .await;
         assert!(

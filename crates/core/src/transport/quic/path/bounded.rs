@@ -365,6 +365,10 @@ struct ConnectionWatch {
     started: u64,
     /// The wake that last saw the connection move; `None` before the first.
     moved_at: Option<u64>,
+    /// The wake that last saw the acknowledged count move; `None` before the
+    /// first. A cap hold is progress only within [`STALL_PROGRESS_WINDOW`] of
+    /// it.
+    acked_at: Option<u64>,
     /// A reading saw a hold live ([`QuietProof::live_hold_seen`]).
     live_hold_seen: bool,
 }
@@ -378,6 +382,7 @@ impl ConnectionWatch {
             hold_unchanged_since: None,
             started: now,
             moved_at: None,
+            acked_at: None,
             live_hold_seen: cap.held_now,
             source,
         }
@@ -400,7 +405,18 @@ impl ConnectionWatch {
         let held = cap_held(&mut self.hold_unchanged_since, now, &cap, &self.cap);
         self.cap = cap;
         self.live_hold_seen |= cap.held_now;
-        if acked != self.acked || held {
+        let acknowledged = acked != self.acked;
+        if acknowledged {
+            self.acked_at = Some(now);
+        }
+        // A held transmit on a connection nothing has acknowledged for the
+        // window is no evidence the path is alive: a dark connection's own
+        // probes wait for a saturated cap too.
+        let held = held
+            && self
+                .acked_at
+                .is_some_and(|at| now.saturating_sub(at) <= nanos(STALL_PROGRESS_WINDOW));
+        if acknowledged || held {
             self.acked = acked;
             self.moved_at = Some(now);
         }

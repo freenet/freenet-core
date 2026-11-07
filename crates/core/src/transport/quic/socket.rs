@@ -54,7 +54,8 @@ use crate::transport::{Socket, normalize_mapped_addr};
 /// built them (their frames are counted in its stats) but they have not been
 /// sent. The path's acknowledgement watch (`recycle`) runs no window while
 /// one is held, since a send it counted may not have left yet, and the stall
-/// count and a send's gap (`path`) read a hold as the connection moving.
+/// count and a send's gap (`path`) read a hold as the connection moving, but
+/// only within the window after the connection's last acknowledgement.
 ///
 /// Per connection, never node-wide: on a node whose cap binds, some
 /// connection's transmit is held nearly all the time, and a node-wide count
