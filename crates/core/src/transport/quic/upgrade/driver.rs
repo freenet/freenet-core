@@ -152,6 +152,12 @@ pub(in crate::transport) enum PathClock {
 impl PathClock {
     /// The wall clock: the system's, or in a simulation the Unix epoch plus the
     /// network's virtual time, so a simulation can place a ramp start on it.
+    /// The real arm reads `SystemTime::now()`, not the path's time source,
+    /// which is monotonic with no epoch to compare a Unix ramp start against.
+    /// A backward step of the system clock lowers the share; that recycles
+    /// nothing (a path with data is never rechecked), so a pair carrying data
+    /// stays, but a pair whose next session starts during the step may lose
+    /// its bit until the clock is back.
     pub(in crate::transport) fn wall_now(&self) -> std::time::SystemTime {
         match self {
             Self::Real(_) => std::time::SystemTime::now(),
