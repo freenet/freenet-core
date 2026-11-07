@@ -930,9 +930,12 @@ fn test_simulation_uses_no_blocking_pool_thread() {
         let control_before = blocking_pool_threads();
         let control = create_runtime();
         control
-            .block_on(tokio::task::spawn_blocking(|| {
-                std::thread::sleep(Duration::from_millis(50));
-            }))
+            .block_on(async {
+                tokio::task::spawn_blocking(|| {
+                    std::thread::sleep(Duration::from_millis(50));
+                })
+                .await
+            })
             .expect("control blocking task");
         let seen = blocking_pool_threads();
         assert!(
