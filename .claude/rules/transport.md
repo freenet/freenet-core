@@ -1162,13 +1162,17 @@ pair is in the slice when its bucket is below the percentage, so 0 holds none,
   advertised `caps::RECYCLES` (2) in its `Ready` or `ReadyAck`, is rechecked every
   `DATA_RECHECK_INTERVAL` (45 s, jittered +/-20% per pair). Once this node's bit
   for the pair is on, the recheck closes the path with RECYCLE_FOR_DATA (7) and
-  the pair offers again (a server at once): no fault, no backoff charge, not a
-  fallback, not churn, not counted toward the stall close and not DOWNGRADE;
+  the pair offers again (a server after the first-offer delay, 2 to 10 s, so its
+  UDP offer does not reach the client before the close and get declined
+  `NotReady`): no fault, no backoff charge, not a fallback, not churn, not counted toward the stall close and not DOWNGRADE;
   counted only as `quic_close_sent_recycle_for_data` /
   `quic_close_received_recycle_for_data`. A path with data, or to a peer without
   `RECYCLES` (a release before it reads the close as a lost connection), is never
   rechecked, and the next attempt carries data, so a pair is recycled at most once
-  per flip. The bit is not tied to a version: every node that knows it sets it.
+  per flip. If the close frame is lost, the peer does not see RECYCLE_FOR_DATA:
+  its path ends by idle timeout, which it records as a charged fallback (one per
+  lost close, not a recycle). The bit is not tied to a version: every node that
+  knows it sets it.
   `QUIC_DATA_RECEIVER_READY` is true: `recv` reads the path's data ("QUIC receive
   flow" below).
   The machine reads no key to decide it.
@@ -1625,7 +1629,12 @@ every rate), endpoint-down, panics and breaker trips, RSS against
   both sides agree with no extra message, ramped within one release over 24 h
   from its start (5% for 6 h, then to 25% at 12 h and 100% at 24 h; "Data slice").
   It needs the 384 KiB window ceiling (the memory gate against UDP, pinned by
-  `a_connections_quic_memory_stays_under_udps_at_the_ceiling`). Pairs outside the
+  `a_connections_quic_memory_stays_under_udps_at_the_ceiling`: QUIC's worst case
+  per connection is under UDP's constant-bounded state, derived from UDP's
+  constants. A data pair keeps its UDP session as the fallback, so this bounds
+  what QUIC adds, and QUIC on top of UDP stays under twice UDP's figure. The
+  send terms are copied from M2's measurement on `feat/quic-data-memory`, which
+  is not merged, so nothing in CI re-measures them; #6141). Pairs outside the
   slice are the control while it grows. Needs identity PR3, the
   quinn pin decision and #6027. Keep the stream limits if permit waits plus
   `quic_open_uni_waited` stay below 0.5% of sends and ge_48 below 0.2% of

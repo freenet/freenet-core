@@ -51,7 +51,7 @@ const RECENT_WINDOW: Duration = Duration::from_secs(10);
 /// returns a meaningful min/median, just over a shorter effective
 /// window. A future iteration can add per-second binning to keep the
 /// full baseline window at any sample rate (tracked in #4074).
-const MAX_SAMPLES: usize = 32_768;
+pub(in crate::transport) const MAX_SAMPLES: usize = 32_768;
 
 /// Snapshot of one peer's rolling RTT state. Cheap to copy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

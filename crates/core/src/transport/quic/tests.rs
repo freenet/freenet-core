@@ -1773,14 +1773,15 @@ fn windows_are_a_clamped_share_of_memory() {
 /// The memory gate for QUIC data at 100% (M2-ACCOUNTING, "Alternative gate"):
 /// at the window ceiling a connection's worst-case QUIC memory, the pinned
 /// terms plus the derived ones, is under the UDP transport's per-connection
-/// state, so carrying data on QUIC costs no more per connection than UDP on any
-/// host (every host's window is at most the ceiling, and every term grows with
-/// it). The receive terms are this tree's measurements (`config`); the send
-/// terms are M2's, measured on f1a355968 (`feat/quic-data-memory`, not in this
-/// tree yet), and UDP's figure is derived (UDP-WORST-CASE: A2 4.7 + B1 2.95 +
-/// C1 to C4 0.77 MiB). So this pins the comparison against those figures, not
-/// the figures themselves; when the send measurements land, read them from
-/// their constants here.
+/// state bounded by a constant (outside the reassembly allowance both share).
+/// A pair that carries data on QUIC keeps its UDP session as the fallback, so
+/// this bounds what QUIC adds: a connection with both stays under twice UDP's
+/// figure, on any host (every host's window is at most the ceiling, and every
+/// term grows with it). The receive terms are this tree's measurements
+/// (`config`); the send terms are M2's, measured on f1a355968
+/// (`feat/quic-data-memory`, not in this tree yet, so nothing here re-measures
+/// them; #6141); UDP's figure is derived from its constants (UDP-WORST-CASE: A2, B1,
+/// C1 to C4), with each entry's size from that derivation.
 #[test]
 fn a_connections_quic_memory_stays_under_udps_at_the_ceiling() {
     use super::config::{
@@ -1810,7 +1811,11 @@ fn a_connections_quic_memory_stays_under_udps_at_the_ceiling() {
             SEND_ABORT_LIMIT as usize * 100 + streams * 4 * KIB + SHORT_CHANNEL_CAPACITY * DATAGRAM;
         receive + send + derived
     };
-    let udp = 842 * MIB / 100;
+    let udp = udp_constant_bounded_bytes();
+    assert!(
+        (8 * MIB..=9 * MIB).contains(&udp),
+        "UDP-WORST-CASE puts it at about 8.4 MiB: {udp} B"
+    );
     assert_eq!(
         worst(0),
         3_911_680 + 999_424,
@@ -1821,6 +1826,36 @@ fn a_connections_quic_memory_stays_under_udps_at_the_ceiling() {
         at_ceiling <= udp,
         "QUIC worst case per connection {at_ceiling} B at the ceiling, UDP's {udp} B"
     );
+}
+
+/// The UDP transport's per-connection state bounded by a constant, outside the
+/// reassembly allowance (UDP-WORST-CASE, section 1), from the constants that
+/// bound each term. A2: up to 31 B the per-fragment charge misses, for every
+/// fragment the allowance covers (the largest stream, plus 16 MiB of other
+/// streams' fragments at about 1490 B each). B1: the inbound packet channel.
+/// C1 to C3: hash maps at their capacity (a bucket per 8/7 of capacity, rounded
+/// to a power of two, at 17 B; plus 32 B per boxed LRU entry). C4: the RTT
+/// samples, 16 B each.
+fn udp_constant_bounded_bytes() -> usize {
+    use crate::transport::connection_handler::INBOUND_CHANNEL_CAPACITY;
+    use crate::transport::packet_data::{MAX_RECV_PACKET_SIZE, PacketData, UnknownEncryption};
+    use crate::transport::peer_connection::inbound_budget::MAX_REMEMBERED_REFUSALS;
+    use crate::transport::peer_connection::streaming::MAX_STREAM_TOTAL_BYTES;
+    use crate::transport::peer_connection::{
+        COMPLETED_STREAM_MEMORY, DEDUP_CACHE_CAPACITY, MAX_DATA_SIZE,
+    };
+    use crate::transport::rolling_rtt_stats::MAX_SAMPLES;
+    let buckets = |capacity: usize| (capacity * 8 / 7).next_power_of_two() * 17;
+    let fragments =
+        (MAX_STREAM_TOTAL_BYTES as usize).div_ceil(MAX_DATA_SIZE) + 1 + 16 * 1024 * 1024 / 1490;
+    let a2 = fragments * 31;
+    let b1 = INBOUND_CHANNEL_CAPACITY
+        * std::mem::size_of::<PacketData<UnknownEncryption, MAX_RECV_PACKET_SIZE>>();
+    let c1 = buckets(MAX_REMEMBERED_REFUSALS);
+    let c2 = buckets(COMPLETED_STREAM_MEMORY.get()) + COMPLETED_STREAM_MEMORY.get() * 32;
+    let c3 = buckets(DEDUP_CACHE_CAPACITY.get()) + DEDUP_CACHE_CAPACITY.get() * 32;
+    let c4 = MAX_SAMPLES * 16;
+    a2 + b1 + c1 + c2 + c3 + c4
 }
 
 /// The connection receive window, the stream receive window and the send

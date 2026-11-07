@@ -491,24 +491,39 @@ Current wire-gated floors:
   sets it to the planned publish time (T0) just before the soak, and it stays set
   afterwards: from T0 the share of pairs carrying data is 5% for 6 h, then rises
   to 25% at 12 h and 100% at 24 h, and stays at 100% (see "Data slice" in
-  `.claude/rules/transport.md`). Publishing later than T0 only moves the curve
-  earlier for the nodes that update first; a node whose clock reads before T0
-  gets 5%. That PR also updates the expectation that pins the release's share,
-  the `quic-data-release-share` case in `simulation_integration.rs`.
+  `.claude/rules/transport.md`). T0 is fixed in the binary, so a publish later
+  than T0 starts every node that updates part-way along the curve: a node that
+  updates 12 h after T0 starts at 25%, and one that updates 24 h or more after
+  T0 starts at 100%, skipping the ramp. **If the publish slips more than about
+  3 h past T0, re-set T0 in a new reviewed PR before publishing.** A node whose
+  clock reads before T0 gets 5%. The soak runs before T0, so it exercises only
+  the 5% share. That PR also updates the expectation that pins the release's
+  share, the `quic-data-release-share` case in `simulation_integration.rs`.
 
   Reading the ramp: each node logs at INFO when its share enters a new band
   ("QUIC data: this node offers data to this share of its pairs", with
-  `data_percent`). In telemetry, `quic_enabled_data_paths` and
+  `data_percent`; at 0% it logs "offers data to none of its pairs"). With T0
+  unset, a `prefer` node logs at startup that it has no data share and keeps
+  every pair's data on UDP. In telemetry, `quic_enabled_data_paths` and
   `quic_live_data_paths` count paths carrying data, the
   `quic_close_sent_recycle_for_data` / `quic_close_received_recycle_for_data`
   counts are paths recycled to take data as the share reaches them (expected,
-  not a fault), and the `quic_loss_rate_*` families give per-path loss.
+  not a fault), and the `quic_loss_rate_*` families give per-path loss over
+  every path. The loss of the paths that carry data alone is in
+  `quic_carrying_loss_rate_*` (live), `quic_carrying_ended_loss_rate_*` (ended),
+  `quic_carried_packets_sent` / `quic_carried_packets_lost`, and
+  `quic_carried_paths_ended_below_floor`; read these, not the all-path
+  families, to judge data on QUIC.
 
-  Emergency stop: a default-off release, built, soaked and parked before the ramp
-  release is cut, is published through the normal auto-update stagger (0 to 4 h).
-  It turns QUIC off on every node that did not set `transport-quic` itself (the
-  default is read, never written to `config.toml`); nodes that set the key keep
-  their setting. Per-path fallback to UDP needs no release.
+  Emergency stop: a parked release, built and soaked before the ramp release is
+  cut, is published through the normal auto-update stagger (0 to 4 h). It makes
+  two changes, and needs both. It sets the default mode to off, which turns QUIC
+  off on every node that did not set `transport-quic` itself (the default is
+  read, never written to `config.toml`). It also sets `QUIC_DATA_RAMP_START`
+  back to `None`, which gives every node that set `transport-quic = "prefer"`
+  itself (testers, possibly our own gateways) a share of 0, so none of its pairs
+  carries data; only a node that also set `quic-data-percent` keeps a share.
+  Per-path fallback to UDP needs no release.
 
 When a NEW wire-gated feature first ships (not this one), set its floor to
 **exactly that release version** and freeze it, as described above.

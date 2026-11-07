@@ -542,7 +542,7 @@ impl InboundStreamBudget {
 }
 
 /// Most refused stream ids one connection remembers at once.
-pub(super) const MAX_REMEMBERED_REFUSALS: usize = 4096;
+pub(in crate::transport) const MAX_REMEMBERED_REFUSALS: usize = 4096;
 
 /// Refused inbound stream ids, so a refused stream's later fragments are
 /// dropped rather than admitted part-way through.
