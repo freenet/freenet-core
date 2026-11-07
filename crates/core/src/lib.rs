@@ -29,7 +29,7 @@ mod node;
 pub use node::{
     EventLoopExitReason, Node, ShutdownHandle, enable_abort_on_fatal_listener_exit,
     enable_abort_on_redb_poison, enable_fast_crash_exit_code, listener_exit_is_graceful,
-    run_local_node, run_network_node,
+    run_local_node, run_local_node_with_listener, run_network_node,
 };
 pub use transport::quic::breaker::{
     STOP_NOTE_ENV_VAR as QUIC_BREAKER_STOP_NOTE_ENV_VAR,

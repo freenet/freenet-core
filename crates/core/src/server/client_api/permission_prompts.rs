@@ -260,7 +260,7 @@ fn hosted_flag(req: &axum::extract::Request) -> Option<bool> {
     let flag = req.extensions().get::<HostedMode>().map(|h| h.0);
     if flag.is_none() {
         tracing::error!(
-            path = req.uri().path(),
+            path = %super::app_grants::redact_uri_for_log(req.uri()),
             "Permission route reached without the HostedMode extension; \
              refusing. The router composition must inject HostedMode."
         );
@@ -349,7 +349,7 @@ async fn resolve_and_run(
 /// legacy SSE stream, the standalone prompt page, and the capability-grant
 /// list, revoke and page. Each shows or changes state that is not scoped to
 /// one hosted user.
-async fn refuse_when_hosted(
+pub(super) async fn refuse_when_hosted(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
@@ -393,7 +393,7 @@ async fn refuse_when_hosted(
 /// Fail closed: a MISSING `ConnectInfo` cannot prove loopback and is rejected.
 /// (It is absent only in unit tests that build a request without connect-info;
 /// those tests inject it explicitly to exercise both sides of this boundary.)
-fn peer_is_loopback(connect_info: Option<&ConnectInfo<SocketAddr>>) -> bool {
+pub(super) fn peer_is_loopback(connect_info: Option<&ConnectInfo<SocketAddr>>) -> bool {
     match connect_info {
         Some(ConnectInfo(addr)) => is_loopback_source(addr.ip()),
         None => false,
@@ -795,7 +795,7 @@ async fn list_grants(
     Json(grants_body(capabilities_of(op_manager).as_deref())).into_response()
 }
 
-fn grants_read_trusted(
+pub(super) fn grants_read_trusted(
     headers: &HeaderMap,
     allowed_hosts: Option<&AllowedHosts>,
     allowed_source_cidrs: Option<&AllowedSourceCidrs>,
@@ -814,7 +814,7 @@ fn grants_read_trusted(
 
 /// Whether the Host header names the loopback interface (`localhost`,
 /// `127.0.0.1`, `[::1]`, with any port).
-fn host_is_loopback(headers: &HeaderMap) -> bool {
+pub(super) fn host_is_loopback(headers: &HeaderMap) -> bool {
     let Some(host) = headers
         .get(axum::http::header::HOST)
         .and_then(|h| h.to_str().ok())
@@ -1292,7 +1292,7 @@ fn origin_matches_allowed_host(
 /// and the socket is refused. That is the safe direction — the overlay falls
 /// back to polling rather than the gate silently opening — but whoever enables
 /// h2 has to teach this function to read `uri.authority()` too.
-fn origin_is_exactly_same_origin(headers: &HeaderMap) -> bool {
+pub(super) fn origin_is_exactly_same_origin(headers: &HeaderMap) -> bool {
     let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok()) else {
         return false;
     };
@@ -1450,7 +1450,7 @@ fn expired_html() -> String {
 }
 
 /// Minimal HTML entity escaping for untrusted delegate content.
-fn html_escape(s: &str) -> String {
+pub(super) fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
