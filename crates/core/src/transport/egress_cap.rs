@@ -167,6 +167,19 @@ pub(crate) const DEBT_LIMIT: Duration = Duration::from_secs(1);
 /// run at whatever rate its timers produce.
 pub(crate) const RETX_DEBT_LIMIT: Duration = Duration::from_millis(100);
 
+/// [`RETX_DEBT_LIMIT`], or in tests `FREENET_RETX_DEBT_LIMIT_MS` when set, so a
+/// storm run can sweep it without a rebuild.
+fn retx_debt_limit() -> Duration {
+    #[cfg(test)]
+    if let Some(ms) = std::env::var("FREENET_RETX_DEBT_LIMIT_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        return Duration::from_millis(ms);
+    }
+    RETX_DEBT_LIMIT
+}
+
 /// The shortest a retransmit the cap refused is deferred for, however small
 /// the deficit: without it a connection whose resend is refused by a
 /// datagram's worth wakes its resend arm about once per datagram time while
@@ -989,7 +1002,7 @@ impl EgressCap {
     /// datagram with `Socket::send_to_paced`, which charges it once.
     pub(crate) fn try_take_retransmit(&self, bytes: usize) -> Result<EgressTake<'_>, Duration> {
         let cost = self.cost_ns(bytes as u64);
-        let limit = i64::try_from(RETX_DEBT_LIMIT.as_nanos()).unwrap_or(i64::MAX);
+        let limit = i64::try_from(retx_debt_limit().as_nanos()).unwrap_or(i64::MAX);
         let fits = |empty_at: i64, now: i64| {
             let after = self.refilled(empty_at, now).saturating_add(cost);
             let over = after.saturating_sub(now.saturating_add(limit));
