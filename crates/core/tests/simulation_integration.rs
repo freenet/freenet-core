@@ -1040,7 +1040,7 @@ fn test_simulation_uses_no_blocking_pool_thread() {
     );
 }
 
-/// Same seed, same trace, three runs in one process, to about 240 s of
+/// Same seed, same trace, five runs in one process, to about 240 s of
 /// virtual time.
 ///
 /// std `RandomState` gives every new map fresh keys (per thread, from the OS,
@@ -1053,7 +1053,10 @@ fn test_simulation_uses_no_blocking_pool_thread() {
 /// runs 30 s and saw none of it.
 ///
 /// GETs and UPDATEs keep going every 2 s, so the runs are busy throughout, and
-/// every event's kind, transaction and peer are compared in order.
+/// every event's kind, transaction and peer are compared in order. Five runs,
+/// not three: with `DecisionHasher` reverted to `RandomState` a pair of runs
+/// diverged in about half of the tries, so four comparisons are what make a
+/// regression show.
 #[test_log::test]
 fn test_same_seed_same_trace_in_one_process_past_four_minutes() {
     const SEED: u64 = 0xD15C_6123;
@@ -1151,7 +1154,12 @@ fn test_same_seed_same_trace_in_one_process_past_four_minutes() {
         "the run produced too few events ({}) to compare",
         first.len()
     );
-    for name in ["disk-det-run2", "disk-det-run3"] {
+    for name in [
+        "disk-det-run2",
+        "disk-det-run3",
+        "disk-det-run4",
+        "disk-det-run5",
+    ] {
         let other = run_and_trace(name);
         let diverges_at = first.iter().zip(&other).position(|(a, b)| a != b);
         assert!(
