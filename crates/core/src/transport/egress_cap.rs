@@ -170,8 +170,13 @@ pub(crate) const RETX_DEBT_LIMIT: Duration = Duration::from_millis(100);
 /// The shortest a retransmit the cap refused is deferred for, however small
 /// the deficit: without it a connection whose resend is refused by a
 /// datagram's worth wakes its resend arm about once per datagram time while
-/// the cap stays full.
-pub(crate) const RETX_DEFER_MIN: Duration = Duration::from_millis(10);
+/// the cap stays full. Chosen from the storm rows over 40 seeds (16
+/// connections on a 4 Mbit/s uplink, `link_model::storm_tests`): with no
+/// floor a cap at 4x the uplink completed fewer streams than uncapped
+/// retransmits (166 against 192) at about 230 wakes a second per connection;
+/// 2 ms completed 368 and 23 wakes; 10 ms and RTO / 16 gave back the
+/// retransmits' lead over queued first copies at 2x the uplink.
+pub(crate) const RETX_DEFER_MIN: Duration = Duration::from_millis(2);
 
 /// The shortest deferral of a refused retransmit on a connection whose
 /// effective RTO is `rto`: [`RETX_DEFER_MIN`]. In tests,
