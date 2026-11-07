@@ -69,14 +69,15 @@ const MAX_PENDING_RESULTS: usize = 2048;
 /// For production use, see the type alias [`SessionActorImpl`] which uses real time.
 pub struct SessionActor<T: TimeSource> {
     message_rx: mpsc::Receiver<SessionMessage>,
-    client_transactions: HashMap<Transaction, HashSet<ClientId>>,
+    client_transactions:
+        crate::util::DecisionHashMap<Transaction, crate::util::DecisionHashSet<ClientId>>,
     // Track RequestId correlation for each (Transaction, ClientId) pair
     client_request_ids: HashMap<(Transaction, ClientId), RequestId>,
     /// Cache of pending results for late-arriving subscribers.
     ///
     /// Uses lazy evaluation for cleanup - entries are pruned only during message processing.
     /// See module-level documentation for detailed cache eviction strategy and limitations.
-    pending_results: HashMap<Transaction, PendingResult>,
+    pending_results: crate::util::DecisionHashMap<Transaction, PendingResult>,
     client_responses: ClientResponsesSender,
     /// Time source for cache TTL calculations.
     time_source: T,
@@ -131,9 +132,9 @@ impl<T: TimeSource> SessionActor<T> {
     ) -> Self {
         Self {
             message_rx,
-            client_transactions: HashMap::new(),
+            client_transactions: Default::default(),
             client_request_ids: HashMap::new(),
-            pending_results: HashMap::new(),
+            pending_results: Default::default(),
             client_responses,
             time_source,
         }

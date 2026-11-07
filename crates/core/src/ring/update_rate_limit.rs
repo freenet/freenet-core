@@ -242,7 +242,6 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use dashmap::DashMap;
 use freenet_stdlib::prelude::ContractInstanceId;
 use tokio::time::Instant;
 
@@ -813,7 +812,7 @@ impl RateLimitDecision {
 /// most recent of them for sweeping and eviction. Two `Instant`s and a
 /// copy, so per-entry memory is still tiny.
 pub(crate) struct UpdateRateLimiter {
-    last_accepted: DashMap<(SocketAddr, ContractInstanceId), PairStamps>,
+    last_accepted: crate::util::DecisionDashMap<(SocketAddr, ContractInstanceId), PairStamps>,
     /// Authoritative size counter for capacity enforcement. Held
     /// in sync with `last_accepted.len()` at every stable point
     /// (incremented by successful new-pair inserts in
@@ -974,7 +973,7 @@ impl UpdateRateLimiter {
             new_pair_budget_untracked_total: AtomicU64::new(0),
             last_new_pair_log: Mutex::new(None),
             last_rejected_log: [Mutex::new(None), Mutex::new(None)],
-            last_accepted: DashMap::new(),
+            last_accepted: Default::default(),
             size: AtomicUsize::new(0),
             min_interval,
             broadcast_interval,

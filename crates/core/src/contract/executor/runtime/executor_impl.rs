@@ -1071,7 +1071,7 @@ where
                         cause: "contract cannot request itself as a related contract".into(),
                     }));
                 }
-                let unique_ids: HashSet<ContractInstanceId> = missing_related
+                let unique_ids: crate::util::DecisionHashSet<ContractInstanceId> = missing_related
                     .iter()
                     .map(|c| c.contract_instance_id)
                     .collect();
@@ -2712,7 +2712,8 @@ where
         }
 
         // Dedup
-        let unique_ids: HashSet<ContractInstanceId> = requested_ids.into_iter().collect();
+        let unique_ids: crate::util::DecisionHashSet<ContractInstanceId> =
+            requested_ids.into_iter().collect();
 
         // Reject too many
         if unique_ids.len() > MAX_RELATED_CONTRACTS_PER_REQUEST {
