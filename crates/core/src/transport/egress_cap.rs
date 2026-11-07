@@ -167,6 +167,30 @@ pub(crate) const DEBT_LIMIT: Duration = Duration::from_secs(1);
 /// run at whatever rate its timers produce.
 pub(crate) const RETX_DEBT_LIMIT: Duration = Duration::from_millis(100);
 
+/// The most of the cap's rate retransmits may use, over [`RETX_SHARE_WINDOW`]:
+/// first copies always get the rest. Without it, where the cap binds and the
+/// receiver's receipts are lost, retransmits of packets it already holds took
+/// the cap ahead of first copies until a stream missed its 5 s fragment
+/// deadline (the receipt-loss row in `link_model::storm_tests`).
+pub(crate) const RETX_SHARE_PERCENT: u64 = 50;
+
+/// The window the retransmit share is measured over: retransmits may burst
+/// to this much of their share at once (after an outage, say), then hold to
+/// the share.
+pub(crate) const RETX_SHARE_WINDOW: Duration = Duration::from_secs(1);
+
+/// [`RETX_SHARE_PERCENT`], or in tests `FREENET_RETX_SHARE_PERCENT` when set.
+fn retx_share_percent() -> u64 {
+    #[cfg(test)]
+    if let Some(pct) = std::env::var("FREENET_RETX_SHARE_PERCENT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        return pct.clamp(1, 100);
+    }
+    RETX_SHARE_PERCENT
+}
+
 /// [`RETX_DEBT_LIMIT`], or in tests `FREENET_RETX_DEBT_LIMIT_MS` when set, so a
 /// storm run can sweep it without a rebuild.
 fn retx_debt_limit() -> Duration {
@@ -386,6 +410,11 @@ pub struct EgressCap {
     sleep_until: Box<dyn Fn(u64) -> SleepFuture + Send + Sync>,
     /// Time (ns, on `clock`) at which the bucket level is zero.
     empty_at_ns: AtomicI64,
+    /// Time (ns, on `clock`) at which the retransmit meter is empty: a leaky
+    /// bucket of retransmitted bytes at [`RETX_SHARE_PERCENT`] of the rate,
+    /// holding at most [`RETX_SHARE_WINDOW`] of it
+    /// ([`EgressCap::try_take_retransmit`]).
+    retx_meter_empty_at_ns: AtomicI64,
     /// Wakers of [`Self::poll_admit`] callers that are `Pending`, in the
     /// order they first registered. Shared with each registered
     /// [`AdmissionWaiter`] so dropping one removes its entry.
@@ -869,6 +898,9 @@ impl EgressCap {
             clock,
             sleep_until,
             empty_at_ns: AtomicI64::new(now.saturating_sub(burst_ns)),
+            retx_meter_empty_at_ns: AtomicI64::new(
+                now.saturating_sub(i64::try_from(RETX_SHARE_WINDOW.as_nanos()).unwrap_or(i64::MAX)),
+            ),
             admission: Arc::new(AdmissionQueue::default()),
             last_long_wait_warn_ns: AtomicI64::new(i64::MIN),
             last_abandon_warn_ns: AtomicI64::new(i64::MIN),
@@ -993,8 +1025,9 @@ impl EgressCap {
 
     /// Take `bytes` for a legacy UDP retransmit (an RTO resend or a tail-loss
     /// probe) if the bucket's debt after the take stays within
-    /// [`RETX_DEBT_LIMIT`]; otherwise take nothing and return how long the
-    /// rate needs until it would fit. Unlike [`Self::charge_unpaced`] nothing
+    /// [`RETX_DEBT_LIMIT`] and retransmits stay within their share of the rate
+    /// ([`RETX_SHARE_PERCENT`] over [`RETX_SHARE_WINDOW`]); otherwise take
+    /// nothing and return how long until it would fit. Unlike [`Self::charge_unpaced`] nothing
     /// is forgiven, so retransmits cannot exceed the cap by more than that
     /// debt; unlike a paced take it needs no admission and may go into debt,
     /// so a lost packet is repaired ahead of first copies waiting in the
@@ -1011,6 +1044,40 @@ impl EgressCap {
         let (old, new, now) = self.update(|empty_at, now| fits(empty_at, now).ok());
         if let Err(over) = fits(old, now) {
             return Err(Duration::from_nanos(over as u64));
+        }
+        // The retransmit share: the meter refills at the share of the rate,
+        // so this datagram costs `100 / share` times its cost at the full
+        // rate. If it does not fit, the main take is given back.
+        let meter_cost =
+            cost.saturating_mul(100) / i64::try_from(retx_share_percent()).unwrap_or(100);
+        let window = i64::try_from(RETX_SHARE_WINDOW.as_nanos()).unwrap_or(i64::MAX);
+        let meter_fits = |empty_at: i64, now: i64| {
+            let after = empty_at
+                .max(now.saturating_sub(window))
+                .saturating_add(meter_cost);
+            if after <= now {
+                Ok(after)
+            } else {
+                Err(after - now)
+            }
+        };
+        let mut meter = self.retx_meter_empty_at_ns.load(Ordering::Acquire);
+        loop {
+            match meter_fits(meter, now) {
+                Ok(after) => match self.retx_meter_empty_at_ns.compare_exchange_weak(
+                    meter,
+                    after,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => break,
+                    Err(current) => meter = current,
+                },
+                Err(over) => {
+                    self.give_back(bytes as u64);
+                    return Err(Duration::from_nanos(over as u64));
+                }
+            }
         }
         let debt = self.bytes_for(new.saturating_sub(now));
         if debt > 0 {
