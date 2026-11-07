@@ -313,6 +313,9 @@ impl StallCount {
             && !cap.held_now
         {
             self.progressed_at = self.progressed_at.min(proof.since);
+            // The same for the last acknowledgement, which a settle dates when
+            // it sees it: nothing moved after `since`.
+            self.acked_at = self.acked_at.min(proof.since);
         }
         if matches!(outcome, BoundedSend::Sent) {
             self.in_a_row = 0;
@@ -328,6 +331,19 @@ impl StallCount {
             quiet_timeout: true,
         }
     }
+    /// Take a later acknowledgement time from the path's record (a send's
+    /// watch may have seen the count move since this count last read it).
+    pub(crate) fn note_acked_at(&mut self, at: u64) {
+        if at != super::bounded::NO_ACK {
+            self.acked_at = self.acked_at.max(at);
+        }
+    }
+
+    /// When this count last saw the connection acknowledged.
+    pub(crate) fn acked_at(&self) -> u64 {
+        self.acked_at
+    }
+
     /// [`Self::take`] with no egress cap.
     #[cfg(test)]
     pub(crate) fn take_uncapped(
@@ -378,7 +394,10 @@ impl QuicPath {
             let acked = self.ack_progress.as_ref().map(recycle::AckProgress::acked);
             let cap = self.connection.cap_holds().read();
             let quiet = *self.quiet.lock();
+            stall.note_acked_at(self.last_acked.load(std::sync::atomic::Ordering::Acquire));
             let verdict = stall.take(outcome, source_stalled, acked, cap, quiet, now_nanos);
+            self.last_acked
+                .store(stall.acked_at(), std::sync::atomic::Ordering::Release);
             (verdict, acked)
         };
         if let (true, Some(acked)) = (verdict.quiet_timeout, acked) {

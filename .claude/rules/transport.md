@@ -1674,13 +1674,19 @@ Sending (QuicPath::send_short_bounded / send_stream_bounded /
   connection was newly acknowledged (recycle::AckProgress) for
   STALL_PROGRESS_WINDOW (10 s), the stall count's rule. An egress cap hold of
   this connection's transmit (recycle::cap_held, its own record) also counts,
-  but only within route::hold_credit of an acknowledgement seen during the
-  send: the window, or socket::cap_transmit_wait (the longest one transmit can
-  wait at the cap, the derivation cap_hold_validity also uses) if longer. That
-  is 10 s at 1 MB/s, about 13.3 s at 100 kB/s, about 19.8 s at 64 KiB/s. A
-  send that has seen no acknowledgement gets nothing from holds: a dark
-  connection's own probes wait for a saturated cap too, and on #6128's CI they
-  kept a dark send going for 32 s. Under random loss the 384 KiB send window drains at Cubic's window per
+  but only within route::hold_credit of the connection's last acknowledgement:
+  the window, or socket::cap_transmit_wait (the longest one transmit can wait
+  at the cap, the derivation cap_hold_validity also uses) if longer. That is
+  10 s at 1 MB/s, about 13.3 s at 100 kB/s, about 19.8 s at 64 KiB/s, about
+  124 s at 10 kB/s and about 6.8 h at 50 B/s. The last acknowledgement is the
+  path's record (QuicPath::last_acked), kept by the stall count at settles and
+  by every send's watch at its wakes, so a new send whose first transmits wait
+  past its gap in a deep cap queue on a live path is credited. A connection
+  nothing has acknowledged for the credit gets nothing from holds: a dark
+  connection's own probes wait for a saturated cap too, and on #6128's CI,
+  counted without that limit, they kept a dark send going for 32 s. For the
+  credit after its last ack a dark path's own held probes do still count (on
+  main they counted for as long as they were held). Under random loss the 384 KiB send window drains at Cubic's window per
   round trip, so writes wait past 5 s while acks still arrive; failing them
   reset streams the peer was receiving (E5B9-LAB, 8 MiB at 5% loss and 200 ms
   failed). The connection is read at the timer's wakes, so a send that stops
@@ -1983,7 +1989,12 @@ QUIC send route (#5940 e5b-6, quic/upgrade/data_route.rs,
   floors the per-connection bandwidth-limit), so the credit grows without bound
   as the cap falls. The real bound on a busy capped node: a path gone dark goes
   suspect at a send timeout at least hold_credit after the last acknowledgement
-  a settle saw, so one credit plus one gap; until then new streams that time
+  the path recorded (dated when a settle or a wake saw it, and moved back to a
+  quiet proof's since when one applies), so one credit plus one gap. The credit
+  covers this node's cap only: a peer whose own cap is saturated delays its
+  acknowledgements, and below about 137 kB/s (where cap_transmit_wait reaches
+  the window) that delay can pass a window,
+  which reads as a quiet path here (not new with this rule); until then new streams that time
   out after opening are dropped (as before), a short that times out before its
   end is written goes to UDP, and a one-packet short (written whole at once)
   ends MaybeDelivered and is not resent, so on a dark path it can be lost in

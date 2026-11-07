@@ -674,6 +674,10 @@ pub(crate) struct QuicPath {
     /// The last [`bounded::QuietProof`] a send that ran out of gap left, taken
     /// by the next settle.
     quiet: Arc<parking_lot::Mutex<Option<bounded::QuietProof>>>,
+    /// When the connection was last seen acknowledged, on the path's clock
+    /// ([`bounded::ConnectionProgress::last_acked`]); the path's build time to
+    /// start, as for the stall count.
+    last_acked: Arc<std::sync::atomic::AtomicU64>,
     /// The connection's count of acknowledged packets, `None` if its controller
     /// does not keep one.
     ack_progress: Option<recycle::AckProgress>,
@@ -839,9 +843,10 @@ impl QuicPath {
                  send timeout counts toward the stall close"
             );
         }
+        let built_at = time.now_nanos();
         let stall = route::StallCount::new(
             ack_progress.as_ref().map(recycle::AckProgress::acked),
-            time.now_nanos(),
+            built_at,
         );
         let heard = Arc::new(recycle::PeerHeard::default());
         let receive = GlobalExecutor::spawn(supervise_receive(
@@ -864,6 +869,7 @@ impl QuicPath {
                 counted_as_data_path: std::sync::atomic::AtomicBool::new(false),
                 stall: parking_lot::Mutex::new(stall),
                 quiet: Arc::default(),
+                last_acked: Arc::new(std::sync::atomic::AtomicU64::new(built_at)),
                 ack_progress,
                 suspect_since_acked: parking_lot::Mutex::new(None),
                 suspect: std::sync::atomic::AtomicBool::new(false),
@@ -1081,6 +1087,7 @@ impl QuicPath {
             acks,
             cap_holds: self.connection.cap_holds(),
             quiet: self.quiet.clone(),
+            last_acked: self.last_acked.clone(),
         })
     }
 

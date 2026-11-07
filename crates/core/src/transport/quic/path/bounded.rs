@@ -301,7 +301,16 @@ pub(crate) struct ConnectionProgress {
     pub(crate) cap_holds: Arc<CapHolds>,
     /// Where a send that ran out of gap leaves its [`QuietProof`]; the path's.
     pub(crate) quiet: Arc<parking_lot::Mutex<Option<QuietProof>>>,
+    /// When the connection's acknowledged count was last seen to move, on the
+    /// send's clock, or [`NO_ACK`]: the path's record, which the stall count
+    /// and every send's watch keep. A send's watch starts from it, so a hold is
+    /// credited when the connection, not only this send, was acknowledged
+    /// within `route::hold_credit`.
+    pub(crate) last_acked: Arc<AtomicU64>,
 }
+
+/// [`ConnectionProgress::last_acked`] when nothing has been seen acknowledged.
+pub(crate) const NO_ACK: u64 = u64::MAX;
 
 /// What a send that ran out of its gap saw of its connection: from `since`
 /// to the timeout the acknowledged count stayed `acked` and the cap's hold
@@ -365,8 +374,10 @@ struct ConnectionWatch {
     started: u64,
     /// The wake that last saw the connection move; `None` before the first.
     moved_at: Option<u64>,
-    /// The wake that last saw the acknowledged count move; `None` before the
-    /// first. A cap hold is progress only within `route::hold_credit` of it.
+    /// When the connection's acknowledged count last moved, from the path's
+    /// record when the send starts, then each wake that saw it move; `None`
+    /// before any. A cap hold is progress only within `route::hold_credit` of
+    /// it.
     acked_at: Option<u64>,
     /// A reading saw a hold live ([`QuietProof::live_hold_seen`]).
     live_hold_seen: bool,
@@ -381,7 +392,7 @@ impl ConnectionWatch {
             hold_unchanged_since: None,
             started: now,
             moved_at: None,
-            acked_at: None,
+            acked_at: Some(source.last_acked.load(Ordering::Acquire)).filter(|at| *at != NO_ACK),
             live_hold_seen: cap.held_now,
             source,
         }
@@ -407,6 +418,7 @@ impl ConnectionWatch {
         let acknowledged = acked != self.acked;
         if acknowledged {
             self.acked_at = Some(now);
+            self.source.last_acked.fetch_max(now, Ordering::AcqRel);
         }
         // A held transmit on a connection nothing has acknowledged for the
         // window is no evidence the path is alive: a dark connection's own

@@ -629,3 +629,46 @@ fn a_hold_is_credited_for_the_caps_longest_wait_past_the_window() {
             .quiet_timeout
     );
 }
+
+/// A matching quiet proof moves the last acknowledgement back too, not only the
+/// last progress: a settle that first sees an acknowledgement dates it when it
+/// sees it (8 s), but a proof says nothing moved after its `since` (1 s), so a
+/// later hold (at 12 s) is past the credit after the real acknowledgement and
+/// is no progress. Dated at 8 s, the hold would be credited and the timeout
+/// would not count.
+#[test]
+fn a_quiet_proof_dates_the_last_acknowledgement_back() {
+    use super::super::bounded::QuietProof;
+    let free = CapHoldReading {
+        holds: 3,
+        held_now: false,
+        validity: Duration::from_secs(60),
+        longest_wait: Duration::ZERO,
+    };
+    let held = CapHoldReading {
+        holds: 4,
+        held_now: true,
+        ..free
+    };
+    let proof = QuietProof {
+        acked: 5,
+        holds: 3,
+        since: SECOND,
+        live_hold_seen: false,
+    };
+    let mut count = StallCount::new(Some(0), 0);
+    let _ = count.take(&BoundedSend::Sent, false, Some(5), free, None, 8 * SECOND);
+    let _ = count.take(
+        &timeouts()[2],
+        false,
+        Some(5),
+        free,
+        Some(proof),
+        9 * SECOND,
+    );
+    let verdict = count.take(&timeouts()[2], false, Some(5), held, None, 12 * SECOND);
+    assert!(
+        verdict.quiet_timeout,
+        "the hold at 12 s is past the credit after the acknowledgement at 1 s"
+    );
+}

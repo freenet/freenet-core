@@ -3531,6 +3531,7 @@ async fn stuck_send(
         acks: acks.clone(),
         cap_holds: cap.clone(),
         quiet: Arc::default(),
+        last_acked: Arc::new(std::sync::atomic::AtomicU64::new(bounded::NO_ACK)),
     };
     let deadlines = SendDeadlines {
         open: Duration::from_secs(2),
@@ -3631,6 +3632,60 @@ fn a_cap_hold_counts_as_the_connection_moving() {
     })
 }
 
+/// A live send whose transmits wait in a deep cap queue longer than its gap,
+/// with nothing of its own acknowledged yet, is credited by the connection's
+/// last acknowledgement before it (the path's record, `last_acked`): its writes
+/// stall from 0 to 8 s while the cap holds every second, the connection was
+/// acknowledged at 0 s, its own first acknowledgement comes at 7 s, and it is
+/// `Sent` (#6128 re-review). Credited only by this send's own acknowledgements,
+/// it timed out at 5 s on a live path.
+#[test]
+fn a_live_send_held_in_the_cap_queue_past_its_gap_is_sent() {
+    bounded(|| async move {
+        let time = VirtualTime::new();
+        let clock = time.clone();
+        let sent = drive(&time, LIMIT, async move {
+            let acks = recycle::AckProgress::detached();
+            let cap = Arc::new(super::super::socket::CapHolds::new(Some(100_000)));
+            let connection = bounded::ConnectionProgress {
+                acks: acks.clone(),
+                cap_holds: cap.clone(),
+                quiet: Arc::default(),
+                last_acked: Arc::new(std::sync::atomic::AtomicU64::new(clock.now_nanos())),
+            };
+            let deadlines = SendDeadlines {
+                open: Duration::from_secs(2),
+                gap: Some(Duration::from_secs(5)),
+                total: Duration::from_secs(120),
+            };
+            let ticking = clock.clone();
+            let queue = async move {
+                for second in 1..=8 {
+                    ticking.sleep(Duration::from_secs(1)).await;
+                    cap.hold_one();
+                    if second == 7 {
+                        acks.ack();
+                    }
+                }
+                never().await
+            };
+            let stepping = clock.clone();
+            let send = bounded_send(&clock, deadlines, Some(connection), |progress| async move {
+                progress.mark_opened();
+                stepping.sleep(Duration::from_secs(8)).await;
+                progress.step();
+                Ok(())
+            });
+            tokio::select! {
+                sent = send => sent,
+                _ = queue => unreachable!("the queue never ends"),
+            }
+        })
+        .await;
+        assert!(matches!(sent, BoundedSend::Sent), "{sent:?}");
+    })
+}
+
 /// Holds with no acknowledgement during the send count for nothing: the send
 /// fails at its own gap, as on a path gone dark whose probes the cap holds.
 #[test]
@@ -3665,6 +3720,7 @@ fn a_send_waiting_for_its_source_ends_at_its_own_gap() {
                 acks: acks.clone(),
                 cap_holds: Arc::new(super::super::socket::CapHolds::new(None)),
                 quiet: Arc::default(),
+                last_acked: Arc::new(std::sync::atomic::AtomicU64::new(bounded::NO_ACK)),
             };
             let deadlines = SendDeadlines {
                 open: Duration::from_secs(2),
@@ -3722,6 +3778,7 @@ fn progress_from_before_the_send_does_not_extend_its_gap() {
                 acks,
                 cap_holds: cap,
                 quiet: Arc::default(),
+                last_acked: Arc::new(std::sync::atomic::AtomicU64::new(bounded::NO_ACK)),
             };
             let deadlines = SendDeadlines {
                 open: Duration::from_secs(2),
@@ -3770,6 +3827,7 @@ fn a_quiet_proof_says_whether_its_send_saw_a_live_hold() {
                     acks: recycle::AckProgress::detached(),
                     cap_holds: cap.clone(),
                     quiet: quiet.clone(),
+                    last_acked: Arc::new(std::sync::atomic::AtomicU64::new(bounded::NO_ACK)),
                 };
                 let sent =
                     bounded_send(&clock, deadlines, Some(connection), |progress| async move {
@@ -3817,6 +3875,7 @@ fn a_hold_read_live_by_a_wake_voids_the_proof() {
                 acks: recycle::AckProgress::detached(),
                 cap_holds: cap.clone(),
                 quiet: quiet.clone(),
+                last_acked: Arc::new(std::sync::atomic::AtomicU64::new(bounded::NO_ACK)),
             };
             let deadlines = SendDeadlines {
                 open: Duration::from_secs(2),
@@ -3875,6 +3934,7 @@ fn source_waits_do_not_rearm_the_timer_without_an_extension() {
                 acks: recycle::AckProgress::detached(),
                 cap_holds: Arc::new(super::super::socket::CapHolds::new(None)),
                 quiet: Arc::default(),
+                last_acked: Arc::new(std::sync::atomic::AtomicU64::new(bounded::NO_ACK)),
             };
             let deadlines = SendDeadlines {
                 open: Duration::from_secs(2),
@@ -4270,45 +4330,65 @@ fn a_write_held_by_a_silent_peer_fails_at_the_gap() {
     })
 }
 
-/// A live, busy path on a node whose total cap binds (100 kB/s, where one held
-/// transmit can wait about 13.3 s, past the 10 s window), its peer reading and
-/// acknowledging: send timeouts settled on it every 2 s, while a bulk stream
-/// keeps the cap holding its transmits, neither stall-close it nor make it
-/// suspect.
+/// A live path on a node whose total cap binds (100 kB/s, where one held
+/// transmit can wait about 13.3 s, past the 10 s window) is not made suspect
+/// while the cap holds its transmits and nothing is acknowledged for longer
+/// than the window but less than the hold credit; once past the credit it is.
+/// The peer acknowledges a short at t0 and is then silenced; the cap holds a
+/// transmit of the connection (on its real record) every 2 s, and a send
+/// timeout settles each time. To t0 + 12 s the hold is credited and no timeout
+/// counts; without the credit (the window alone) it would be suspect at 12 s.
+/// From the credit on the hold counts for nothing, and a window after the last
+/// credited progress the path is suspect.
 #[test]
 fn a_live_path_under_a_binding_cap_is_not_stall_closed() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let p = paths_capped("quic-path-live-capped", 82, 100_000).await;
+        let network = "quic-path-live-capped";
+        let p = paths_capped(network, 82, 100_000).await;
+        let b_addr = p.pair.b_addr;
         let (a, time) = (p.a.clone(), p.time());
         let holds = a.connection().cap_holds();
-        let (held, suspect) = p
+        let credit = super::route::hold_credit(&holds.read());
+        let window = super::route::STALL_PROGRESS_WINDOW;
+        assert!(
+            credit > window + Duration::from_secs(2),
+            "premise: {credit:?}"
+        );
+        let (suspect_within, suspect_after) = p
             .drive(async move {
-                let busy = a.clone();
-                let bulk = tokio::spawn(async move {
-                    busy.send_stream(StreamId::next(), None, payload(4 * MIB).into())
-                        .await
-                        .ok();
-                });
-                let before = holds.read().holds;
-                let mut suspect = false;
-                for _ in 0..20 {
-                    time.sleep(Duration::from_secs(2)).await;
+                a.send_short(b"live").await.expect("acknowledged");
+                a.settle(SendKind::Short, &BoundedSend::Sent, false, time.now_nanos());
+                let t0 = time.now();
+                let _silenced = DropFrom::new(network, &[b_addr]);
+                let held_timeout = |a: &QuicPath, now: u64| {
+                    holds.hold_one();
                     a.settle(
                         SendKind::Stream,
                         &BoundedSend::Failed(SendFailure::TimedOut),
                         false,
-                        time.now_nanos(),
+                        now,
                     );
-                    suspect |= a.is_suspect();
+                    a.is_suspect()
+                };
+                let mut suspect_within = false;
+                while time.now() - t0 < window + Duration::from_secs(2) {
+                    time.sleep(Duration::from_secs(2)).await;
+                    suspect_within |= held_timeout(&a, time.now_nanos());
                 }
-                bulk.abort();
-                (holds.read().holds - before, suspect)
+                let mut suspect_after = false;
+                while time.now() - t0 < credit + window + Duration::from_secs(4) {
+                    time.sleep(Duration::from_secs(2)).await;
+                    suspect_after |= held_timeout(&a, time.now_nanos());
+                }
+                (suspect_within, suspect_after)
             })
             .await;
-        assert!(held > 0, "premise: the cap held the path's transmits");
-        assert!(!suspect, "a live path is never suspect");
-        assert!(p.a.connection().inner().close_reason().is_none());
+        assert!(
+            !suspect_within,
+            "held past the window but within the credit: not suspect"
+        );
+        assert!(suspect_after, "past the credit the hold no longer counts");
         assert_eq!(
             p.a.stats().send_event_count(QuicSendEvent::StalledClosed),
             0
@@ -4525,9 +4605,11 @@ impl crate::transport::boundary::StreamProgressObserver for SilenceAfter {
 /// Egress cap holds count per connection (#6128 review), and a hold extends a
 /// send only within the window of an acknowledgement seen during it (#6128
 /// CI): on a capped node whose cap a busy connection keeps saturated, a send
-/// on another connection to a peer that has gone dark ends at its own 5 s gap,
-/// however its own probes are held, and a later send on that path, one hold
-/// credit (`route::hold_credit`) after the first, makes the path suspect. With one node-wide record, the
+/// on another connection to a peer that has gone dark ends within a hold credit
+/// (`route::hold_credit`) and a window of the connection's last
+/// acknowledgement, however its own probes are held, and a later send on that
+/// path, one credit after the first, ends at its own 5 s gap and makes the path
+/// suspect. With one node-wide record, the
 /// busy connection's holds read as the dark connection moving and the send ran
 /// to `total` (300 s); with holds counted without an acknowledgement, its own
 /// held probes kept it going (32 s on CI).
@@ -4619,20 +4701,30 @@ fn a_dark_path_beside_a_cap_held_one_times_out_and_goes_suspect() {
             held_beside > 0,
             "the cap held the busy connection meanwhile"
         );
-        for (outcome, took, _) in [&first, &second] {
+        let credit = super::route::hold_credit(&ac_holds.read());
+        for (outcome, _, _) in [&first, &second] {
             assert!(
                 matches!(outcome, BoundedSend::Failed(SendFailure::TimedOut)),
                 "{outcome:?}"
             );
-            // Its own gap: no acknowledgement during the send, so the
-            // connection's own held probes extend nothing.
-            assert_eq!(
-                *took,
-                gap,
-                "the dark connection's own holds were {:?}",
-                ac_holds.read()
-            );
         }
+        // The first is credited by the connection's last acknowledgement before
+        // the silence, so its own held probes may extend it, but at most for
+        // the credit and a window after that acknowledgement.
+        assert!(
+            first.1 <= credit + super::route::STALL_PROGRESS_WINDOW,
+            "took {:?}, credit {credit:?}; the dark connection's own holds were {:?}",
+            first.1,
+            ac_holds.read()
+        );
+        // The second starts a credit after the first settle, so nothing credits
+        // its holds: its own gap.
+        assert_eq!(
+            second.1,
+            gap,
+            "the dark connection's own holds were {:?}",
+            ac_holds.read()
+        );
         assert!(
             second.2,
             "suspect once a hold credit and a gap have passed with nothing \
