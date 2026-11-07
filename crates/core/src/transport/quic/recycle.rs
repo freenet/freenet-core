@@ -72,11 +72,12 @@
 //!   counts a transmit's frames, and its bytes in flight, when it builds
 //!   it, and the cap may hold it longer than the window.
 //!
-//! **Guard 2 is inactive while the egress cap holds QUIC transmits.** While
-//! the cap holds any QUIC transmit, or held one since the previous sample,
-//! no window runs, on any path: the cap is node-wide and quinn does not say
-//! which connection a held transmit belongs to. On a node whose cap binds
-//! most of the time, guard 2 is then off most of the time. Narrowing the
+//! **Guard 2 is inactive while the egress cap holds this connection's
+//! transmits.** While the cap holds one of them, or held one since the
+//! previous sample, no window runs on this path. The holds are counted per
+//! connection (`socket::with_poller_holds` gives quinn's poller for the
+//! connection its own record), so a cap kept busy by other connections does
+//! not switch guard 2 off here. Narrowing the
 //! pause to the sends counted since the hold would not be enough, because a
 //! held transmit is also counted in quinn's bytes in flight. A hold left
 //! behind by a connection that ended stops counting after its validity
@@ -324,6 +325,18 @@ impl AckProgress {
     pub(crate) fn acked(&self) -> u64 {
         self.0.lock().acked
     }
+
+    /// A record of no connection, moved by [`Self::ack`]. Tests only.
+    #[cfg(test)]
+    pub(crate) fn detached() -> Self {
+        Self(Arc::default())
+    }
+
+    /// The peer newly acknowledged one more packet. Tests only.
+    #[cfg(test)]
+    pub(crate) fn ack(&self) {
+        self.0.lock().acked += 1;
+    }
 }
 
 /// A congestion controller that lowers `inner`'s window to the configured
@@ -519,7 +532,7 @@ pub(crate) struct AckSample {
     sent: u64,
     /// Frames received from the peer.
     received: u64,
-    /// The QUIC transmits the egress cap holds, node-wide.
+    /// This connection's QUIC transmits the egress cap holds.
     cap: CapHoldReading,
 }
 

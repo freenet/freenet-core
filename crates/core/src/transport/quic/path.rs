@@ -165,7 +165,7 @@ use crate::transport::peer_connection::{embeds_metadata, fits_one_packet};
 
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use bounded::{BoundedSend, MaybeDelivered, NotOpened, SendDeadlines, SendFailure};
-use bounded::{SendProgress, bounded_send};
+use bounded::{ConnectionProgress, SendProgress, bounded_send};
 pub(crate) use inbound::{InboundShort, InboundStreamArrival};
 #[cfg(test)]
 pub(crate) use route::STALLED_SENDS_LIMIT;
@@ -677,6 +677,15 @@ pub(crate) struct QuicPath {
     counted_as_data_path: std::sync::atomic::AtomicBool,
     /// Send timeouts while nothing is acknowledged ([`route::StallCount`]).
     stall: parking_lot::Mutex<route::StallCount>,
+    /// The last [`bounded::QuietProof`] a send that ran out of gap left, taken
+    /// by the next settle.
+    quiet: Arc<parking_lot::Mutex<Option<bounded::QuietProof>>>,
+    /// When the connection was last seen acknowledged, on the path's clock
+    /// ([`bounded::ConnectionProgress::last_acked`]); the path's build time to
+    /// start, as for the stall count, so a path dark from its start has its
+    /// first sends' cap holds credited for one `route::hold_credit` after it
+    /// is built (seconds at a high cap, minutes at a low one).
+    last_acked: Arc<std::sync::atomic::AtomicU64>,
     /// The connection's count of acknowledged packets, `None` if its controller
     /// does not keep one.
     ack_progress: Option<recycle::AckProgress>,
@@ -842,9 +851,10 @@ impl QuicPath {
                  send timeout counts toward the stall close"
             );
         }
+        let built_at = time.now_nanos();
         let stall = route::StallCount::new(
             ack_progress.as_ref().map(recycle::AckProgress::acked),
-            time.now_nanos(),
+            built_at,
         );
         let heard = Arc::new(recycle::PeerHeard::default());
         #[cfg_attr(not(test), allow(unused_mut))]
@@ -875,6 +885,8 @@ impl QuicPath {
                 send_data: AtomicU8::new(SEND_DATA_NEVER),
                 counted_as_data_path: std::sync::atomic::AtomicBool::new(false),
                 stall: parking_lot::Mutex::new(stall),
+                quiet: Arc::default(),
+                last_acked: Arc::new(std::sync::atomic::AtomicU64::new(built_at)),
                 ack_progress,
                 suspect_since_acked: parking_lot::Mutex::new(None),
                 suspect: std::sync::atomic::AtomicBool::new(false),
@@ -1084,6 +1096,18 @@ impl QuicPath {
         );
     }
 
+    /// What a send's gap reads of this path's connection
+    /// ([`bounded::ConnectionProgress`]); `None` when the controller counts no
+    /// acknowledgements, and then only the send's own gap applies.
+    fn connection_progress(&self) -> Option<ConnectionProgress> {
+        self.ack_progress.clone().map(|acks| ConnectionProgress {
+            acks,
+            cap_holds: self.connection.cap_holds(),
+            quiet: self.quiet.clone(),
+            last_acked: self.last_acked.clone(),
+        })
+    }
+
     /// Send one serialized message. Tests only, with no deadline; nodes use
     /// [`Self::send_short_bounded`].
     #[cfg(test)]
@@ -1102,7 +1126,7 @@ impl QuicPath {
         deadlines: impl Into<SendDeadlines>,
         payload: &[u8],
     ) -> BoundedSend {
-        bounded_send(time, deadlines, |progress| {
+        bounded_send(time, deadlines, self.connection_progress(), |progress| {
             self.send_short_with(payload, None, progress)
         })
         .await
@@ -1160,7 +1184,7 @@ impl QuicPath {
         control: QuicControl,
     ) -> BoundedSend {
         let payload = control.encode();
-        bounded_send(time, timeout, |progress| {
+        bounded_send(time, timeout, None, |progress| {
             self.send_control_with(&payload[..], progress)
         })
         .await
@@ -1195,7 +1219,7 @@ impl QuicPath {
         payload: Bytes,
         observer: Option<&dyn StreamProgressObserver>,
     ) -> BoundedSend {
-        bounded_send(time, deadlines, |progress| {
+        bounded_send(time, deadlines, self.connection_progress(), |progress| {
             self.send_stream_with(stream_id, metadata, payload, observer, progress)
         })
         .await
@@ -1306,7 +1330,7 @@ impl QuicPath {
             total: deadlines.total - waited,
             ..deadlines
         };
-        bounded_send(time, deadlines, |progress| {
+        bounded_send(time, deadlines, self.connection_progress(), |progress| {
             self.send_stream_chunks_with(
                 stream_id, total_len, metadata, first, chunks, observer, progress,
             )
@@ -1332,13 +1356,19 @@ impl QuicPath {
         let metadata = frame_metadata(metadata);
         let header = FrameHeader::stream(stream_id, total_len, metadata.len())?;
         let slot = self.stream_slot().await?;
+        let source_wait = progress.clone();
         let mut send = self.open(&header, metadata, Some(slot), progress).await?;
         let mut delivered: u64 = 0;
         let mut next = Some(first);
         let failure = loop {
             let item = match next.take() {
                 Some(chunk) => Some(Ok(chunk)),
-                None => send.race(chunks.next()).await?,
+                None => {
+                    source_wait.waiting_on_source(true);
+                    let item = send.race(chunks.next()).await;
+                    source_wait.waiting_on_source(false);
+                    item?
+                }
             };
             match item {
                 None if delivered == total_len => break None,

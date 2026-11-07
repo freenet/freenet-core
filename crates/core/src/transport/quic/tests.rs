@@ -377,6 +377,31 @@ impl Pair {
     fn sent(&self) -> Vec<Sent> {
         self.log.lock().unwrap().clone()
     }
+
+    /// A third endpoint on the pair's network and clock, uncapped, at
+    /// `addr`, with its keys. Its pump stops with the pair.
+    pub(in crate::transport::quic) async fn third(
+        &mut self,
+        addr: SocketAddr,
+    ) -> (QuicEndpoint, TransportKeypair) {
+        register_address_network(addr, &self.network);
+        let inner = SimulationSocket::bind(addr).await.expect("sim bind");
+        let socket = Arc::new(DemuxSocket::wrap(
+            Recording {
+                inner,
+                addr,
+                time: self.time.clone(),
+                log: self.log.clone(),
+            },
+            None,
+        ));
+        let keys = TransportKeypair::new();
+        let endpoint =
+            QuicEndpoint::bind(socket.clone(), addr, self.time.clone(), &settings(), &keys)
+                .expect("third endpoint");
+        self.pumps.push(pump(socket));
+        (endpoint, keys)
+    }
 }
 
 /// The raw public key the holder of `key` presents (its SPKI DER).
@@ -626,7 +651,11 @@ async fn attempt(
                             quinn::crypto::rustls::QuicServerConfig::try_from(Arc::new(*tls))
                                 .unwrap(),
                         );
-                        let connection = incoming.incoming.accept_with(Arc::new(config))?.await?;
+                        let connection =
+                            super::socket::with_poller_holds(&incoming.cap_holds, || {
+                                incoming.incoming.accept_with(Arc::new(config))
+                            })?
+                            .await?;
                         Ok(QuicConnection::new(
                             connection,
                             incoming.permit,
@@ -2109,12 +2138,39 @@ fn a_sent_datagram_is_charged_once() {
     );
 }
 
-/// #5940 step M6: a connection that ends while the egress cap holds its
-/// transmit leaves its poller held, because quinn keeps the poller until
-/// the connection's last handle goes and never polls it again. Such a hold
-/// stops pausing the acknowledgement watch once it has gone
-/// `cap_hold_validity` of the cap's rate with no new hold event, and the
-/// watch then runs and closes as usual.
+/// `with_poller_holds` puts back the slot it found, after a panic in its
+/// closure and after a nested call, so no later poller takes a stale record
+/// and an outer call keeps its own.
+#[test]
+fn with_poller_holds_puts_the_slot_back() {
+    use super::socket::{CapHolds, next_poller_holds, with_poller_holds};
+    let outer = Arc::new(CapHolds::new(None));
+    let inner = Arc::new(CapHolds::new(None));
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        with_poller_holds(&outer, || panic!("test: a connect that panics"))
+    }));
+    assert!(panicked.is_err());
+    assert!(next_poller_holds().is_none(), "cleared after a panic");
+    with_poller_holds(&outer, || {
+        with_poller_holds(&inner, || {
+            assert!(Arc::ptr_eq(&next_poller_holds().unwrap(), &inner));
+        });
+        assert!(
+            Arc::ptr_eq(&next_poller_holds().expect("the outer record"), &outer),
+            "the nested call put the outer record back"
+        );
+    });
+    assert!(next_poller_holds().is_none());
+}
+
+/// #5940 step M6, holds per connection since #6128: a poller's hold is
+/// counted in its own connection's record only (`socket::with_poller_holds`),
+/// so another connection's watch, stall count and send gaps never see it.
+/// And a connection that ends while the egress cap holds its transmit leaves
+/// its poller held, because quinn keeps the poller until the connection's
+/// last handle goes and never polls it again. Such a hold stops counting
+/// once it has gone `cap_hold_validity` of the cap's rate with no new hold
+/// event, and a watch on that record then runs and closes as usual.
 #[test]
 fn a_hold_left_by_an_ended_connection_stops_pausing_the_ack_watch() {
     use super::recycle::{ACK_WATCH_TICK, ACK_WATCH_WINDOW, AckSample, AckWatch};
@@ -2126,18 +2182,31 @@ fn a_hold_left_by_an_ended_connection_stops_pausing_the_ack_watch() {
     let (socket, demux) = scripted(local, SendMode::Send, Vec::new(), Some((rate, &time)));
     let cap = demux.egress_cap().unwrap();
     cap.charge_unpaced(cap.burst_bytes() as usize);
-    let holds = socket.cap_holds();
+    let holds = Arc::new(socket.cap_holds().like());
+    let other = Arc::new(socket.cap_holds().like());
     // The connection's poller waits for the cap, then the connection ends
     // and nothing polls the poller again, but a handle keeps it.
-    let mut poller = socket.clone().create_io_poller();
+    let mut poller = super::socket::with_poller_holds(&holds, || socket.clone().create_io_poller());
+    let _other_poller =
+        super::socket::with_poller_holds(&other, || socket.clone().create_io_poller());
     let waker = futures::task::noop_waker();
     let mut cx = Context::from_waker(&waker);
     assert!(poller.as_mut().poll_writable(&mut cx).is_pending());
     let held = holds.read();
     assert!(held.held_now);
     assert_eq!(held.validity, super::socket::cap_hold_validity(rate));
+    let elsewhere = other.read();
+    assert!(
+        !elsewhere.held_now && elsewhere.holds == 0,
+        "another connection's record sees no hold"
+    );
+    assert_eq!(
+        socket.cap_holds().read().holds,
+        0,
+        "the template is never counted"
+    );
 
-    // Another path's watch: a send every tick, the peer sending every tick
+    // A watch on that record: a send every tick, the peer sending every tick
     // and acknowledging nothing.
     let record = Arc::default();
     let tick = ACK_WATCH_TICK.as_secs();
@@ -2231,7 +2300,9 @@ fn a_cap_short_of_the_datagram_is_would_block() {
     assert_eq!(cap.level_bytes(), level, "nothing was charged");
     assert_eq!(socket.send_refused(), 1, "a cap refusal is counted");
 
-    let mut poller = socket.clone().create_io_poller();
+    let mut poller = super::socket::with_poller_holds(&Arc::new(socket.cap_holds().like()), || {
+        socket.clone().create_io_poller()
+    });
     let waker = futures::task::noop_waker();
     let mut cx = Context::from_waker(&waker);
     assert!(poller.as_mut().poll_writable(&mut cx).is_pending());
@@ -4295,7 +4366,9 @@ fn adapter_refuses_sends_after_a_panic() {
     assert!(error.to_string().contains("adapter panicked"), "{error}");
     let waker = futures::task::noop_waker();
     let mut cx = Context::from_waker(&waker);
-    let mut poller = socket.clone().create_io_poller();
+    let mut poller = super::socket::with_poller_holds(&Arc::new(socket.cap_holds().like()), || {
+        socket.clone().create_io_poller()
+    });
     assert!(matches!(
         poller.as_mut().poll_writable(&mut cx),
         Poll::Ready(Err(_))
