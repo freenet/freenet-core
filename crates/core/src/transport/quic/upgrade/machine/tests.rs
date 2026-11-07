@@ -2874,7 +2874,11 @@ fn the_data_recheck_is_jittered() {
         let due = rig.machine.deadline().expect("a recheck is due");
         assert_eq!(rig.tick_at(due), vec![]);
         let next = rig.machine.deadline().expect("asked again");
-        assert_eq!(next - due, DATA_RECHECK_INTERVAL.mul_f64(factor), "{sample}");
+        assert_eq!(
+            next - due,
+            DATA_RECHECK_INTERVAL.mul_f64(factor),
+            "{sample}"
+        );
     }
 }
 

@@ -310,7 +310,15 @@ impl QuicPolicy {
         let before = self
             .logged_band
             .swap(band, std::sync::atomic::Ordering::Relaxed);
-        if before != band {
+        if before == band {
+            return;
+        }
+        if percent == 0 {
+            tracing::info!(
+                share = ?share,
+                "QUIC data: this node offers data to none of its pairs (share 0%)"
+            );
+        } else {
             tracing::info!(
                 data_percent = percent,
                 share = ?share,
@@ -390,12 +398,21 @@ pub(crate) fn log_startup(config: &NetworkApiConfig) {
         return;
     }
     if configured_mode(config) == QuicMode::Prefer {
-        tracing::info!(
-            share = ?DataShare::of(config.quic_data_percent(), QUIC_DATA_RAMP_START),
-            "transport-quic = \"prefer\" negotiates data with this share of pairs: a pair \
-             sends its data on QUIC only if both sides set their data bit, and all other \
-             traffic stays on UDP"
-        );
+        let share = DataShare::of(config.quic_data_percent(), QUIC_DATA_RAMP_START);
+        if share == DataShare::Fixed(0) {
+            tracing::info!(
+                share = ?share,
+                "transport-quic = \"prefer\" with no data share (no ramp in this build \
+                 and no quic-data-percent): every pair keeps its data on UDP"
+            );
+        } else {
+            tracing::info!(
+                share = ?share,
+                "transport-quic = \"prefer\" negotiates data with this share of pairs: a \
+                 pair sends its data on QUIC only if both sides set their data bit, and all \
+                 other traffic stays on UDP"
+            );
+        }
     }
     // These keys matter only with QUIC on.
     if configured_mode(config) == QuicMode::Off {
@@ -595,6 +612,20 @@ mod tests {
         if QUIC_DATA_RAMP_START.is_none() {
             assert_eq!(caps_with("prefer", None), 0, "no ramp, no data");
         }
+        // With no quic-data-percent the policy takes the release's ramp, and
+        // own_caps asks with it, whether or not this build sets a start.
+        let mut plain = config("prefer", None);
+        plain.quic_data_percent = None;
+        let up = QuicAvailabilityWatch::for_test(QuicAvailability::Up).1;
+        let policy = QuicPolicy::new(&plain, BreakerOutcome::NotConsulted, up);
+        assert_eq!(policy.share(), DataShare::of(None, QUIC_DATA_RAMP_START));
+        let now = std::time::SystemTime::now();
+        for peer in (0..200).map(key) {
+            assert_eq!(
+                policy.own_caps(&local, &peer, now),
+                policy.own_caps_with(policy.share(), &local, &peer, now)
+            );
+        }
         assert_eq!(caps_with("prefer", Some("lots".to_string())), 0);
         assert_eq!(caps_with("prefer", Some("100".to_string())), caps::DATA);
         assert_eq!(caps_with("prefer", Some("0".to_string())), 0);
@@ -722,6 +753,37 @@ mod tests {
         }
     }
 
+    /// The share is logged at INFO once per band as `own_caps` sees it move, with
+    /// its own wording at 0%, so a log at 0% does not read as data being on.
+    #[test]
+    fn the_share_is_logged_once_per_band() {
+        const ON: &str = "offers data to this share of its pairs";
+        const NONE: &str = "offers data to none of its pairs";
+        let up = QuicAvailabilityWatch::for_test(QuicAvailability::Up).1;
+        let policy = QuicPolicy::new(&config("prefer", None), BreakerOutcome::NotConsulted, up);
+        let (local, peer) = (key(0), key(1));
+        let (logs, guard) = crate::util::test_log_capture::install();
+        for percent in [0, 0, 5, 7, 37, 39, 100] {
+            policy.own_caps_with(DataShare::Fixed(percent), &local, &peer, at(0));
+        }
+        drop(guard);
+        let logs = logs.lock().unwrap().clone();
+        let ours: Vec<_> = logs
+            .iter()
+            .filter(|line| line.contains(ON) || line.contains(NONE))
+            .collect();
+        assert_eq!(ours.len(), 4, "{logs:?}");
+        assert!(
+            ours[0].contains(NONE) && ours[0].starts_with("INFO"),
+            "{}",
+            ours[0]
+        );
+        for (line, percent) in ours[1..].iter().zip(["5", "37", "100"]) {
+            assert!(line.contains(ON), "{line}");
+            assert!(line.contains(&format!("data_percent={percent}")), "{line}");
+        }
+    }
+
     /// The bands an operator sees at INFO: 5, then every 10.
     #[test]
     fn the_log_bands_are_these() {
@@ -837,6 +899,12 @@ mod tests {
     #[test]
     fn startup_reports_prefer_and_max_paths() {
         const PREFER: &str = "negotiates data with this share of pairs";
+        const NO_SHARE: &str = "with no data share";
+        let prefer = if QUIC_DATA_RAMP_START.is_none() {
+            NO_SHARE
+        } else {
+            PREFER
+        };
         const INVALID: &str = "quic-max-paths is not a whole number";
         const LOWERED: &str = "quic-max-paths is above max-number-of-connections";
         let above = (config("off", None).max_connections + 1).to_string();
@@ -845,7 +913,7 @@ mod tests {
             ("off", Some("lots"), None),
             ("off", Some(above.as_str()), None),
             ("shadow", Some("3"), None),
-            ("prefer", None, Some(("INFO", PREFER))),
+            ("prefer", None, Some(("INFO", prefer))),
             ("shadow", Some("lots"), Some(("WARN", INVALID))),
             ("shadow", Some(above.as_str()), Some(("INFO", LOWERED))),
         ] {
@@ -856,7 +924,11 @@ mod tests {
             let logs = logs.lock().unwrap().clone();
             let ours: Vec<_> = logs
                 .iter()
-                .filter(|line| [PREFER, INVALID, LOWERED].iter().any(|n| line.contains(n)))
+                .filter(|line| {
+                    [PREFER, NO_SHARE, INVALID, LOWERED]
+                        .iter()
+                        .any(|n| line.contains(n))
+                })
                 .collect();
             match expected {
                 None => assert!(ours.is_empty(), "{mode} {max_paths:?}: {logs:?}"),
