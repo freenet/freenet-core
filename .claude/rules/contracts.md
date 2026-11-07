@@ -349,19 +349,30 @@ State merging rules:
     (CmRDT-style "increment by X" deltas legitimately violate it) or
     `UpdateData::RelatedState` (a cross-contract hint, not a CRDT op).
 
-    **Contested as of RFC #5320.** That delta exemption is a live
-    disagreement, not settled fact. The RFC requires delta idempotence on
-    the grounds that Freenet delivery is at-least-once with no dedup for
-    delta redelivery, so an "increment by X" delta silently double-applies
-    when redelivered — which makes it unsafe under this transport whatever
-    its standing as a CRDT in the abstract. Issue #4320 §1 makes the same
-    argument independently. The offline verifier
-    (`crate::conformance::ConformanceProperty::DeltaIdempotence`) therefore
-    checks deltas, but reports them at `Severity::Diagnostic` so the check
-    can never justify removing a contract while the question is open.
-    Whether any deployed contract actually relies on the unsafe pattern is
-    empirical and unanswered; `fdev verify-merge` against deployed WASM is
-    how it gets answered. Do not treat either side as decided until it is.
+    **Settled: deltas must be idempotent.** Ian ruled on 2026-11-06
+    (recorded in https://github.com/freenet/freenet-core/issues/5906#issuecomment-6677346389).
+    Freenet delivery is at-least-once, so an "increment by X" delta that
+    double-applies when redelivered is a contract bug under this transport,
+    whatever its standing as a CRDT in the abstract (the RFC #5320 position;
+    issue #4320 §1 makes the same argument). The runtime probe above still
+    exempts deltas: it is a storm detector for full-state merges, not the
+    statement of the law. The offline verifier
+    (`crate::conformance::ConformanceProperty::DeltaIdempotence`) checks
+    deltas and reports them at `Severity::Diagnostic`. That severity is not
+    a judgment that non-idempotent deltas are acceptable; it stays because
+    nodes act on no conformance verdict (next paragraph).
+
+    **Nodes do not remove contracts for breaking a merge law.** Removal was
+    the RFC #5320 plan and is superseded:
+    https://github.com/freenet/freenet-core/issues/5906#issuecomment-6677346389.
+    Verifier, `fdev verify-merge` and shadow-mode results are diagnostics
+    recorded locally. Instead, nodes decline work a contract with a lawful
+    merge never needs: a payload already merged into the node's current
+    state is not merged again (`ring::applied_payloads`). The removal
+    machinery in `conformance::policy` (`EnforcementMode::Enforce`,
+    `ConformanceAction::Remove`, `RemovalTier`) and the shadow
+    `would_remove` count are retained, unreachable, and not planned to be
+    enabled; deleting that code is a separate decision.
   - Invalid merges should return error, not panic
 ```
 

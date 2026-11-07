@@ -6237,9 +6237,25 @@ pub async fn subscribe_with_id(
 /// Use `PeerKeyLocation` when the address may be unknown (e.g., during NAT traversal).
 pub type PeerId = crate::ring::KnownPeerKeyLocation;
 
-pub async fn run_local_node(
+pub async fn run_local_node(executor: Executor, socket: WebsocketApiConfig) -> anyhow::Result<()> {
+    run_local_node_impl(executor, socket, None).await
+}
+
+/// [`run_local_node`] on a client-API listener the caller has already bound,
+/// so nothing else can take the port between choosing it and serving on it.
+/// The listener must be bound to `socket.address:socket.port`.
+pub async fn run_local_node_with_listener(
+    executor: Executor,
+    socket: WebsocketApiConfig,
+    listener: std::net::TcpListener,
+) -> anyhow::Result<()> {
+    run_local_node_impl(executor, socket, Some(listener)).await
+}
+
+async fn run_local_node_impl(
     mut executor: Executor,
     socket: WebsocketApiConfig,
+    listener: Option<std::net::TcpListener>,
 ) -> anyhow::Result<()> {
     if !crate::server::is_private_ip(&socket.address) {
         anyhow::bail!(
@@ -6257,7 +6273,29 @@ pub async fn run_local_node(
         crate::config::PCK_VERSION.to_string(),
     );
 
-    let (mut gw, mut ws_proxy) = crate::server::serve_client_api_in(socket).await?;
+    let hosted_mode = socket.hosted_mode;
+    let (mut gw, mut ws_proxy) = match listener {
+        Some(listener) => {
+            crate::server::serve_client_api_in_with_listener(socket, listener).await?
+        }
+        None => crate::server::serve_client_api_in(socket).await?,
+    };
+
+    // Native app grants (#5264). A network node reaches its grant store
+    // through the `OpManager` (`set_op_manager`), which local mode never has,
+    // so give the grant routes a store over this node's own database. Not on a
+    // hosted node, which serves no grants.
+    if !hosted_mode {
+        #[cfg(feature = "redb")]
+        let storage: Arc<dyn crate::contract::delegate_capabilities::CapabilityStorage> =
+            Arc::new(executor.state_store.inner().clone());
+        #[cfg(not(feature = "redb"))]
+        let storage: Arc<dyn crate::contract::delegate_capabilities::CapabilityStorage> =
+            Arc::new(crate::contract::delegate_capabilities::MemoryCapabilityStorage::default());
+        gw.app_grants().set_local_capabilities(
+            crate::contract::delegate_capabilities::DelegateCapabilities::new(storage),
+        );
+    }
 
     // TODO: use combinator instead
     // let mut all_clients =

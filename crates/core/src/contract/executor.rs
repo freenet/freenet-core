@@ -2742,6 +2742,16 @@ mod tests {
                 "MAX_QUEUED_BYTES",
                 "conformance-capture harness, not a node budget",
             ),
+            (
+                "MAX_BODY_BYTES",
+                "per-request body limit on the native app grant routes; a request body is \
+                 parsed and dropped, not retained",
+            ),
+            (
+                "MAX_CLIENT_NAME_BYTES",
+                "per-record length cap on a native app grant's display name, in a table \
+                 bounded at MAX_NATIVE_GRANTS (64) rows; not a cache budget",
+            ),
             // Functions.
             ("disk_budget_for", "DISK, not resident memory"),
             (

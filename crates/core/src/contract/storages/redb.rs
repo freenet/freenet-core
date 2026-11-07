@@ -282,6 +282,15 @@ pub(crate) const DELEGATE_CAPABILITY_RECORDS_TABLE: TableDefinition<&[u8], &[u8]
 pub(crate) const APP_CAPABILITY_GRANTS_TABLE: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("app_capability_grants");
 
+/// User-approved grants letting a native (non-browser) client act as a web
+/// app's identity (#5264). Encoding is owned by
+/// `contract::delegate_capabilities::native_grants`.
+///
+/// Key: SHA-256 of the grant token (32 bytes). The token itself is never
+/// stored.
+pub(crate) const NATIVE_APP_GRANTS_TABLE: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("native_app_grants");
+
 /// Durable half of the delegate contract-subscription registry
 /// (`wasm_runtime::delegate_subscriptions`), so a delegate's subscriptions
 /// survive a node restart (#5493). One row per `(contract, delegate)` pair,
@@ -1138,6 +1147,7 @@ impl ReDb {
                     "DELEGATE_CAPABILITY_RECORDS_TABLE",
                 ),
                 (APP_CAPABILITY_GRANTS_TABLE, "APP_CAPABILITY_GRANTS_TABLE"),
+                (NATIVE_APP_GRANTS_TABLE, "NATIVE_APP_GRANTS_TABLE"),
             ] {
                 txn.open_table(table).map_err(|e| {
                     tracing::error!(
@@ -2018,6 +2028,112 @@ impl ReDb {
             for entry in tbl.iter()? {
                 let (key, value) = entry?;
                 out.push((key.value().to_vec(), value.value().to_vec()));
+            }
+            Ok(out)
+        })
+    }
+
+    /// Insert unless the table already holds `max` rows; count and insert in
+    /// one write transaction. `Ok(false)` when refused. A key already present
+    /// is left as it is and reported `Ok(true)`.
+    pub(crate) fn insert_native_app_grant_capped(
+        &self,
+        token_hash: &[u8; 32],
+        value: &[u8],
+        max: usize,
+    ) -> Result<bool, redb::Error> {
+        let txn = self.begin_write()?;
+        let (stored, wrote) = {
+            let mut tbl = txn.open_table(NATIVE_APP_GRANTS_TABLE)?;
+            if tbl.get(token_hash.as_slice())?.is_some() {
+                // Idempotent: already stored, not counted against the cap.
+                (true, false)
+            } else if tbl.len()? >= max as u64 {
+                (false, false)
+            } else {
+                tbl.insert(token_hash.as_slice(), value)?;
+                (true, true)
+            }
+        };
+        if wrote {
+            Self::commit_guarded(txn)?;
+        } else {
+            txn.abort()?;
+        }
+        Ok(stored)
+    }
+
+    /// Rewrite an existing row with `update(old)` in one write transaction;
+    /// never recreates an absent (revoked) row.
+    pub(crate) fn update_native_app_grant_if_present(
+        &self,
+        token_hash: &[u8; 32],
+        update: &mut dyn FnMut(&[u8]) -> Option<Vec<u8>>,
+    ) -> Result<(), redb::Error> {
+        let txn = self.begin_write()?;
+        let changed = {
+            let mut tbl = txn.open_table(NATIVE_APP_GRANTS_TABLE)?;
+            let new = tbl
+                .get(token_hash.as_slice())?
+                .and_then(|old| update(old.value()));
+            match new {
+                Some(new) => {
+                    tbl.insert(token_hash.as_slice(), new.as_slice())?;
+                    true
+                }
+                None => false,
+            }
+        };
+        if changed {
+            Self::commit_guarded(txn)?;
+        } else {
+            txn.abort()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn get_native_app_grant(
+        &self,
+        token_hash: &[u8; 32],
+    ) -> Result<Option<Vec<u8>>, redb::Error> {
+        self.read_guarded(|txn| {
+            let tbl = txn.open_table(NATIVE_APP_GRANTS_TABLE)?;
+            Ok(tbl.get(token_hash.as_slice())?.map(|v| v.value().to_vec()))
+        })
+    }
+
+    /// `true` if a row was removed.
+    pub(crate) fn remove_native_app_grant(
+        &self,
+        token_hash: &[u8; 32],
+    ) -> Result<bool, redb::Error> {
+        let txn = self.begin_write()?;
+        let removed = {
+            let mut tbl = txn.open_table(NATIVE_APP_GRANTS_TABLE)?;
+            tbl.remove(token_hash.as_slice())?.is_some()
+        };
+        if removed {
+            Self::commit_guarded(txn)?;
+        } else {
+            txn.abort()?;
+        }
+        Ok(removed)
+    }
+
+    /// Every native grant, skipping rows whose key is not 32 bytes.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn load_all_native_app_grants(
+        &self,
+    ) -> Result<Vec<([u8; 32], Vec<u8>)>, redb::Error> {
+        self.read_guarded(|txn| {
+            let tbl = txn.open_table(NATIVE_APP_GRANTS_TABLE)?;
+            let mut out = Vec::new();
+            for entry in tbl.iter()? {
+                let (key, value) = entry?;
+                let Ok(hash) = <[u8; 32]>::try_from(key.value()) else {
+                    continue;
+                };
+                out.push((hash, value.value().to_vec()));
             }
             Ok(out)
         })

@@ -58,6 +58,11 @@
         font-weight: 600;
         margin-bottom: 8px;
       }
+      h2 {
+        font-size: 16px;
+        font-weight: 600;
+        margin: 24px 0 8px;
+      }
       p.intro {
         color: var(--muted);
         font-size: 14px;
@@ -125,6 +130,13 @@
       </p>
       <div id="list"><div class="empty">Loading...</div></div>
       <div id="error" class="error" hidden></div>
+      <h2>Programs using an app</h2>
+      <p class="intro">
+        Programs on this computer you allowed to use an app with your data, as
+        the app's own page can. Revoking disconnects the program at once; it has
+        to ask you again.
+      </p>
+      <div id="native"><div class="empty">Loading...</div></div>
       <details class="stats">
         <summary>Counters</summary>
         <pre id="stats"></pre>
@@ -211,7 +223,111 @@
               },
             );
         }
+        var native = document.getElementById('native');
+        function nativeRow(g) {
+          var r = document.createElement('div');
+          r.className = 'row';
+          var what = document.createElement('div');
+          what.className = 'what';
+          var line = document.createElement('div');
+          var app = document.createElement('div');
+          app.className = 'app';
+          if (g.unreadable) {
+            line.textContent =
+              'A grant this version of Freenet cannot read (made by a different version)';
+            app.textContent = 'Revoke it to free its slot.';
+          } else if (g.client_name) {
+            // <bdi> keeps the self-reported name from reordering the text
+            // around it.
+            var name = document.createElement('bdi');
+            name.textContent = g.client_name;
+            line.appendChild(
+              document.createTextNode('A program calling itself "'),
+            );
+            line.appendChild(name);
+            line.appendChild(document.createTextNode('" (not verified)'));
+          } else {
+            line.textContent = 'A program that did not name itself';
+          }
+          if (!g.unreadable) {
+            app.textContent =
+              'Freenet app ' +
+              g.app +
+              ' - allowed ' +
+              new Date(g.created_at_ms).toLocaleString() +
+              ', last used ' +
+              new Date(g.last_used_at_ms).toLocaleString();
+          }
+          what.appendChild(line);
+          what.appendChild(app);
+          var btn = document.createElement('button');
+          btn.textContent = 'Revoke';
+          btn.onclick = function () {
+            btn.disabled = true;
+            fetch('/permission/native-grants/revoke', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ id: g.id }),
+            }).then(
+              function (r) {
+                if (!r.ok) {
+                  showError('Could not revoke (HTTP ' + r.status + ').');
+                }
+                loadNative();
+              },
+              function () {
+                showError('Could not reach the node.');
+                loadNative();
+              },
+            );
+          };
+          r.appendChild(what);
+          r.appendChild(btn);
+          return r;
+        }
+        function loadNative() {
+          fetch('/permission/native-grants')
+            .then(function (r) {
+              return r.json().then(function (body) {
+                return { ok: r.ok, body: body };
+              });
+            })
+            .then(
+              function (res) {
+                var body = res.body;
+                native.textContent = '';
+                if (!res.ok) {
+                  // Refused here (not this computer, or proxied): show only
+                  // why, not an empty list.
+                  var refused = document.createElement('div');
+                  refused.className = 'error';
+                  refused.textContent =
+                    (body && body.error) || 'Could not load programs.';
+                  native.appendChild(refused);
+                  return;
+                }
+                if (body && body.error) {
+                  showError(body.error);
+                }
+                var grants = (body && body.grants) || [];
+                if (!grants.length) {
+                  var e = document.createElement('div');
+                  e.className = 'empty';
+                  e.textContent = 'No program has been allowed to use an app.';
+                  native.appendChild(e);
+                  return;
+                }
+                grants.forEach(function (g) {
+                  native.appendChild(nativeRow(g));
+                });
+              },
+              function () {
+                native.textContent = 'Could not load programs.';
+              },
+            );
+        }
         load();
+        loadNative();
       })();
     </script>
   </body>

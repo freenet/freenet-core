@@ -1922,7 +1922,8 @@ fn resource_exhaustion_is_inconclusive() {
 /// both order-invariant and idempotent (union) or neither (append).
 ///
 /// Two things are asserted: the idempotence check fires, and it is a Diagnostic, so
-/// a counter-style contract cannot be removed for it while the question is open.
+/// a counter-style contract is not removal-eligible for it. Deltas must be
+/// idempotent (settled 2026-11-06), but nodes act on no conformance verdict.
 #[test]
 fn a_commutative_but_non_idempotent_delta_is_a_diagnostic_not_a_violation() {
     let sum = |a: &[u8], d: &[u8]| -> Vec<u8> {
@@ -1948,8 +1949,8 @@ fn a_commutative_but_non_idempotent_delta_is_a_diagnostic_not_a_violation() {
     assert_eq!(outcome.violation().unwrap().severity, Severity::Diagnostic);
     assert!(
         !outcome.is_enforceable_violation(),
-        "a counter-style delta must not be removal-eligible while the question of \
-         whether any deployed contract relies on it is unanswered"
+        "a counter-style delta must not be removal-eligible: DeltaIdempotence is a \
+         diagnostic, and nodes act on no conformance verdict"
     );
 
     // And the ordering property, a `Severity::Violation` (now report-only, but
