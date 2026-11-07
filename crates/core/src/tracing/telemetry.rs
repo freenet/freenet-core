@@ -1341,24 +1341,25 @@ impl TelemetryWorker {
 
         // Transport snapshots are optional (disabled if interval is 0)
         // Clamp to minimum to prevent spamming telemetry server
-        let snapshot_interval_secs = if self.transport_snapshot_interval_secs == 0 {
-            // Use a long interval but we'll skip the actual snapshot logic
-            u64::MAX / 2 // Effectively disabled
-        } else if self.transport_snapshot_interval_secs < MIN_TRANSPORT_SNAPSHOT_INTERVAL_SECS {
-            tracing::warn!(
-                "Transport snapshot interval {}s is below minimum {}s, using minimum",
-                self.transport_snapshot_interval_secs,
-                MIN_TRANSPORT_SNAPSHOT_INTERVAL_SECS
-            );
-            MIN_TRANSPORT_SNAPSHOT_INTERVAL_SECS
+        let mut transport_snapshot_interval = if self.transport_snapshot_interval_secs == 0 {
+            None
         } else {
-            self.transport_snapshot_interval_secs
+            let snapshot_interval_secs =
+                if self.transport_snapshot_interval_secs < MIN_TRANSPORT_SNAPSHOT_INTERVAL_SECS {
+                    tracing::warn!(
+                        "Transport snapshot interval {}s is below minimum {}s, using minimum",
+                        self.transport_snapshot_interval_secs,
+                        MIN_TRANSPORT_SNAPSHOT_INTERVAL_SECS
+                    );
+                    MIN_TRANSPORT_SNAPSHOT_INTERVAL_SECS
+                } else {
+                    self.transport_snapshot_interval_secs
+                };
+            let mut interval = tokio::time::interval(Duration::from_secs(snapshot_interval_secs));
+            // Same reason as `batch_interval`.
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            Some(interval)
         };
-        let mut transport_snapshot_interval =
-            tokio::time::interval(Duration::from_secs(snapshot_interval_secs));
-        // Same reason as `batch_interval`.
-        transport_snapshot_interval
-            .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             crate::deterministic_select! {
@@ -1424,13 +1425,17 @@ impl TelemetryWorker {
                     }
                     self.flush().await;
                 },
-                _ = transport_snapshot_interval.tick() => {
-                    // Emit transport layer metrics snapshot (only if enabled)
-                    if self.transport_snapshot_interval_secs > 0 {
-                        if let Some(snapshot) = TRANSPORT_METRICS.take_snapshot() {
-                            let event = self.snapshot_to_telemetry(&snapshot);
-                            self.handle_event(event).await;
+                _ = async {
+                    match &mut transport_snapshot_interval {
+                        Some(interval) => {
+                            interval.tick().await;
                         }
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    if let Some(snapshot) = TRANSPORT_METRICS.take_snapshot() {
+                        let event = self.snapshot_to_telemetry(&snapshot);
+                        self.handle_event(event).await;
                     }
                 },
             }
@@ -5817,6 +5822,72 @@ mod tests {
             .find(|a| a["key"] == "peer_id")
             .expect("peer_id attribute must be present");
         assert_eq!(peer_attr["value"]["stringValue"], "test-peer-id-xyz");
+    }
+
+    #[tokio::test]
+    async fn test_disabled_transport_snapshots_survive_slow_event_flush() {
+        use httptest::{Expectation, Server, matchers::request, responders::*};
+
+        use crate::util::deterministic_select::deterministic_start_index;
+
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(request::method_path("POST", "/v1/logs"))
+                .times(1..)
+                .respond_with(delay_and_then(Duration::from_millis(20), status_code(200))),
+        );
+        let (cmd_tx, cmd_rx) = mpsc::channel(3);
+        let (_transfer_tx, transfer_rx) = mpsc::channel(1);
+        let metrics = Arc::new(TelemetryLocalMetrics::default());
+        let mut worker = TelemetryWorker::new(
+            format!("http://{}", server.addr()),
+            cmd_rx,
+            0,
+            transfer_rx,
+            "snapshot-disabled-peer".to_string(),
+            metrics.clone(),
+        );
+        worker.buffer = (0..MAX_BUFFER_SIZE - 1)
+            .map(|_| test_telemetry_event("get_request", EventPriority::Operational))
+            .collect();
+        cmd_tx
+            .try_send(TelemetryCommand::Event(test_telemetry_event(
+                "get_request",
+                EventPriority::Operational,
+            )))
+            .unwrap();
+        cmd_tx
+            .try_send(TelemetryCommand::Event(test_telemetry_event(
+                "get_request",
+                EventPriority::Operational,
+            )))
+            .unwrap();
+        cmd_tx.try_send(TelemetryCommand::Shutdown).unwrap();
+
+        // Poll the full-buffer command first, then the snapshot arm before the
+        // next command. The slow HTTP response makes its first tick more than
+        // Tokio's 5 ms missed-tick margin late. The server has its own runtime,
+        // so use real time here instead of an automatically advancing clock.
+        let seed = (0..1000)
+            .find(|seed| {
+                GlobalRng::scoped_seed(*seed, || {
+                    deterministic_start_index(5) == 1 && deterministic_start_index(5) == 4
+                })
+            })
+            .expect("a seed must select the command, then the snapshot arm");
+        let _seed = GlobalRng::seed_guard(seed);
+        tokio::time::timeout(Duration::from_secs(5), worker.run())
+            .await
+            .expect("the worker must send both events and shut down after the late tick");
+
+        let snapshot = metrics.snapshot();
+        assert!(snapshot.batch_events_sent_total > MAX_BUFFER_SIZE as u64);
+        assert_eq!(snapshot.batch_send_failures_total, 0);
+        assert_eq!(snapshot.rate_limit_admitted_operational_total, 2);
+        assert_eq!(
+            snapshot.event_type_admissions[event_type_index("transport_snapshot")],
+            [0, 0]
+        );
     }
 
     #[test]
