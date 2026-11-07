@@ -183,7 +183,8 @@ strings, and the request and approval ids in the grant routes' paths are
 redacted.
 
 Grants work in `freenet local` as well as on a network node; a hosted node
-serves none.
+serves none. They persist across restarts in the redb store; a build without
+the `redb` feature keeps them in memory and loses them on restart.
 
 How a WebSocket connection presenting a token is closed when the node does not
 accept the token:

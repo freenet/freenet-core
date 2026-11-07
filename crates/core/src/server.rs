@@ -322,6 +322,13 @@ pub(crate) async fn serve_client_api_in(
     serve_client_api_in_impl(config, None).await
 }
 
+pub(crate) async fn serve_client_api_in_with_listener(
+    config: WebsocketApiConfig,
+    listener: std::net::TcpListener,
+) -> std::io::Result<(HttpClientApi, WebSocketProxy)> {
+    serve_client_api_in_impl(config, Some(listener)).await
+}
+
 /// Hostnames and IPs accepted in the HTTP `Host` header for WebSocket connections.
 pub(crate) type AllowedHosts = Arc<HashSet<String>>;
 

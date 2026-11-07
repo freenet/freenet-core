@@ -56,7 +56,7 @@ enum OutboundAppMessage {
 fn node_config(
     dir: &Path,
     ws_port: u16,
-    network_port: u16,
+    network_port: Option<u16>,
     keypair_path: &Path,
 ) -> freenet::config::ConfigArgs {
     freenet::config::ConfigArgs {
@@ -67,14 +67,16 @@ fn node_config(
         },
         network_api: freenet::config::NetworkArgs {
             public_address: Some(Ipv4Addr::LOCALHOST.into()),
-            public_port: Some(network_port),
-            is_gateway: true,
+            public_port: network_port,
+            // A gateway must name a public network port; a local-mode node
+            // (no network port) is not one.
+            is_gateway: network_port.is_some(),
             skip_load_from_network: true,
             gateways: Some(vec![]),
             location: Some(0.5),
             ignore_protocol_checking: true,
             address: Some(Ipv4Addr::LOCALHOST.into()),
-            network_port: Some(network_port),
+            network_port,
             ..Default::default()
         },
         config_paths: freenet::config::ConfigPathsArgs {
@@ -209,7 +211,7 @@ async fn native_app_grant_end_to_end() -> TestResult {
 
     let ws_port = reserve_port()?;
     let net_port = reserve_port()?;
-    let cfg = node_config(&data_path, ws_port, net_port, &keypair_path)
+    let cfg = node_config(&data_path, ws_port, Some(net_port), &keypair_path)
         .build()
         .await?;
     let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, ws_port)))?;
@@ -228,9 +230,43 @@ async fn native_app_grant_end_to_end() -> TestResult {
     Ok(())
 }
 
-/// The same flow on a node started the way `freenet local` starts one: an
-/// `Executor::from_config_local` driven by `run_local_node`, which has no
-/// `OpManager`. Grants must work there too.
+/// Start a node the way `freenet local` starts one (an
+/// `Executor::from_config_local` driven by `run_local_node`), on a client-API
+/// listener bound here first, so the port cannot be taken in between and the
+/// readiness check can only reach this node. Retries opening the store while a
+/// previous node on the same data dir is still releasing it.
+async fn start_local_node(
+    data_path: &Path,
+    keypair_path: &Path,
+) -> anyhow::Result<(u16, tokio::task::JoinHandle<anyhow::Result<()>>)> {
+    let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))?;
+    let ws_port = listener.local_addr()?.port();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let (executor, socket) = loop {
+        let cfg = node_config(data_path, ws_port, None, keypair_path)
+            .build()
+            .await?;
+        let socket = cfg.ws_api.clone();
+        match freenet::local_node::Executor::from_config_local(std::sync::Arc::new(cfg)).await {
+            Ok(executor) => break (executor, socket),
+            Err(e) if Instant::now() < deadline => {
+                tracing::info!(error = %e, "store not released yet; retrying");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    };
+    let run = tokio::spawn(async move {
+        freenet::run_local_node_with_listener(executor, socket, listener).await
+    });
+    wait_ws_ready(ws_port, Duration::from_secs(60)).await?;
+    Ok((ws_port, run))
+}
+
+/// The same flow on a local-mode node, which has no `OpManager`: grants must
+/// work there too. Then a grant collected on that node still works after the
+/// node is stopped and a new one is started on the same data directory, which
+/// shows the grant is kept in the redb store and not in memory.
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn native_app_grant_end_to_end_local_mode() -> TestResult {
     let data_dir = tempfile::tempdir()?;
@@ -240,21 +276,81 @@ async fn native_app_grant_end_to_end_local_mode() -> TestResult {
     key.save(&keypair_path)?;
     key.public().save(data_path.join("public.pem"))?;
 
-    let ws_port = reserve_port()?;
-    let net_port = reserve_port()?;
-    let cfg = node_config(&data_path, ws_port, net_port, &keypair_path)
-        .build()
-        .await?;
-    let socket = cfg.ws_api.clone();
-    let executor =
-        freenet::local_node::Executor::from_config_local(std::sync::Arc::new(cfg)).await?;
-    let run = tokio::spawn(async move { freenet::run_local_node(executor, socket).await });
-    wait_ws_ready(ws_port, Duration::from_secs(60)).await?;
-
+    let (ws_port, run) = start_local_node(&data_path, &keypair_path).await?;
     grant_flow(ws_port).await?;
+
+    // A second grant, kept across a restart.
+    let app = ContractInstanceId::new([42u8; 32]);
+    let token = obtain_grant(ws_port, app).await?;
+    let delegate = load_delegate(TEST_DELEGATE, Parameters::from(vec![]))?;
+    expect_attested(ws_port, &token, &delegate, false, app).await?;
 
     run.abort();
     drop(run.await);
+
+    let (ws_port, run) = start_local_node(&data_path, &keypair_path).await?;
+    expect_attested(ws_port, &token, &delegate, true, app).await?;
+    run.abort();
+    drop(run.await);
+    Ok(())
+}
+
+/// Request, approve (as the page's script does) and collect a grant for `app`.
+async fn obtain_grant(ws_port: u16, app: ContractInstanceId) -> anyhow::Result<String> {
+    let base = format!("http://127.0.0.1:{ws_port}");
+    let http = reqwest::Client::new();
+    let created: serde_json::Value = http
+        .post(format!("{base}/v1/app-grants/request"))
+        .json(&serde_json::json!({ "app": app.to_string(), "client_name": "e2e client" }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let request_id = created["request_id"].as_str().unwrap().to_string();
+    let approve_url = created["approve_url"].as_str().unwrap().to_string();
+    let page = http
+        .get(&approve_url)
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
+    let start = page.find("data-nonce=\"").expect("page nonce") + "data-nonce=\"".len();
+    let nonce = &page[start..start + 64];
+    let resp = http
+        .post(&approve_url)
+        .header("Origin", &base)
+        .json(&serde_json::json!({ "nonce": nonce, "allow": true }))
+        .send()
+        .await?;
+    anyhow::ensure!(resp.status() == 200, "approve failed: {}", resp.status());
+    let polled: serde_json::Value = http
+        .get(format!("{base}/v1/app-grants/request/{request_id}"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    anyhow::ensure!(polled["status"] == "approved", "{polled}");
+    Ok(polled["token"].as_str().unwrap().to_string())
+}
+
+/// A connection opened with `token` is attested as `app` by a real delegate.
+async fn expect_attested(
+    ws_port: u16,
+    token: &str,
+    delegate: &DelegateContainer,
+    register: bool,
+    app: ContractInstanceId,
+) -> TestResult {
+    let attested = attested_origin(ws_port, token, delegate, register)
+        .await?
+        .expect("a grant-token connection must receive an attested identity");
+    match bincode::deserialize::<MessageOrigin>(&attested)? {
+        MessageOrigin::WebApp(id) => assert_eq!(id, app, "wrong contract attested"),
+        other => panic!("expected MessageOrigin::WebApp, got {other:?}"),
+    }
     Ok(())
 }
 

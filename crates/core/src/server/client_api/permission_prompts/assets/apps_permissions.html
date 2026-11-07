@@ -230,7 +230,13 @@
           var what = document.createElement('div');
           what.className = 'what';
           var line = document.createElement('div');
-          if (g.client_name) {
+          var app = document.createElement('div');
+          app.className = 'app';
+          if (g.unreadable) {
+            line.textContent =
+              'A grant this version of Freenet cannot read (made by a different version)';
+            app.textContent = 'Revoke it to free its slot.';
+          } else if (g.client_name) {
             // <bdi> keeps the self-reported name from reordering the text
             // around it.
             var name = document.createElement('bdi');
@@ -243,15 +249,15 @@
           } else {
             line.textContent = 'A program that did not name itself';
           }
-          var app = document.createElement('div');
-          app.className = 'app';
-          app.textContent =
-            'Freenet app ' +
-            g.app +
-            ' - allowed ' +
-            new Date(g.created_at_ms).toLocaleString() +
-            ', last used ' +
-            new Date(g.last_used_at_ms).toLocaleString();
+          if (!g.unreadable) {
+            app.textContent =
+              'Freenet app ' +
+              g.app +
+              ' - allowed ' +
+              new Date(g.created_at_ms).toLocaleString() +
+              ', last used ' +
+              new Date(g.last_used_at_ms).toLocaleString();
+          }
           what.appendChild(line);
           what.appendChild(app);
           var btn = document.createElement('button');

@@ -1185,6 +1185,7 @@ fn page_scripts_match_the_routes_and_body_keys() {
         serde_json::from_value(serde_json::json!({ "id": "x" })).unwrap();
     assert_eq!(parsed.id, "x");
     for key in [
+        "g.unreadable",
         "g.client_name",
         "g.app",
         "g.created_at_ms",
@@ -1657,14 +1658,45 @@ async fn bodies_are_parsed_after_the_gate() {
             StatusCode::PAYLOAD_TOO_LARGE,
             "{path}"
         );
+        // The boundary: exactly MAX_BODY_BYTES is read (and fails to parse);
+        // one byte more is refused unread.
+        assert_eq!(
+            send(
+                &r,
+                req("application/json", Body::from(vec![b' '; MAX_BODY_BYTES]))
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST,
+            "{path}"
+        );
+        assert_eq!(
+            send(
+                &r,
+                req(
+                    "application/json",
+                    Body::from(vec![b' '; MAX_BODY_BYTES + 1])
+                )
+            )
+            .await
+            .0,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "{path}"
+        );
     }
 }
 
-/// A `HEAD` of the approval page does not rotate its nonce.
+/// A `HEAD` of the approval page does not rotate its nonce, and answers with
+/// the status a GET would.
 #[tokio::test]
 async fn head_does_not_rotate_the_approval_nonce() {
     let (state, _) = new_state();
     let r = router(&state);
+    let unknown = Request::head(format!("/v1/app-grants/approve/{}", "a".repeat(64)))
+        .header("host", HOST)
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(send(&r, unknown).await.0, StatusCode::GONE);
     let (_, approve_id) = create(&r).await;
     let nonce = open_page(&r, &approve_id).await;
     let head = Request::head(format!("/v1/app-grants/approve/{approve_id}"))
@@ -1697,5 +1729,40 @@ async fn unreadable_record_resolves_to_unavailable() {
     assert!(matches!(
         resolve(&state, token.expose()).await,
         GrantLookup::Unavailable
+    ));
+}
+
+/// A row this build cannot decode is listed (so it is visible and counted
+/// where the user can see it), can be revoked by its id, and once revoked its
+/// token reads as "not found" (4401) rather than "unavailable" (4503).
+#[tokio::test]
+async fn an_unreadable_row_is_listed_and_revocable() {
+    let (state, caps, storage) = flaky_state();
+    let r = router(&state);
+    let token = GrantToken::generate();
+    assert!(
+        storage
+            .insert_native_grant_capped(&token.hash().0, b"\x09garbage", 64)
+            .unwrap()
+    );
+    let (status, body) = send(&r, list_req()).await;
+    assert_eq!(status, StatusCode::OK);
+    let v = json(&body);
+    assert_eq!(v["grants"][0]["id"], token.hash().to_hex(), "{body}");
+    assert_eq!(v["grants"][0]["unreadable"], true);
+    assert!(matches!(
+        resolve(&state, token.expose()).await,
+        GrantLookup::Unavailable
+    ));
+    assert_eq!(
+        send(&r, revoke_req(&token.hash().to_hex(), Some(SELF_ORIGIN)))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(caps.native_grant_count().unwrap(), 0);
+    assert!(matches!(
+        resolve(&state, token.expose()).await,
+        GrantLookup::NotFound
     ));
 }

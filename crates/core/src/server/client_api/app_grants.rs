@@ -95,14 +95,16 @@
 //!
 //! # WebSocket close codes for a token
 //!
-//! - 4401: the token names nothing (a stale shell-page token, or a revoked
-//!   grant). Discard it.
+//! - 4401: the token names nothing (a stale shell-page token, or a grant that
+//!   was revoked or never issued). Discard it.
 //! - 4503: the grant store could not be consulted right now (node starting,
-//!   storage fault). Keep the token and retry.
+//!   storage fault, or a stored record this build cannot read). Keep the
+//!   token and retry.
 //! - 4403: a token sent in the `Authorization` header that this connection
-//!   cannot use as a grant (not a local connection, a non-loopback `Host`, or
-//!   forwarding headers). Keep the token; connect directly to the node over
-//!   loopback.
+//!   cannot use as a grant: not a local connection, a non-loopback `Host`,
+//!   forwarding headers, a hosted node, or a router that serves no grants.
+//!   Keep the token; it works only on a direct loopback connection to a node
+//!   that serves grants.
 //!
 //! # Where the grant store lives
 //!
@@ -110,6 +112,10 @@
 //! capabilities of its runtime pool). `freenet local` has no `OpManager`, so
 //! `node::run_local_node` gives this state a store over the same database
 //! ([`AppGrantState::set_local_capabilities`]). A hosted node has none.
+//!
+//! Grants persist across restarts in the redb store. A build without the
+//! `redb` feature keeps them in memory, so they are lost on restart, as that
+//! build's delegate capability grants already are.
 //!
 //! # Storage I/O
 //!
@@ -352,7 +358,8 @@ impl AppGrantState {
     /// second call is ignored.
     pub(crate) fn set_local_capabilities(&self, caps: Arc<DelegateCapabilities>) {
         if self.0.local_caps.set(caps).is_err() {
-            tracing::debug!("native app grant store already set; ignoring repeat wiring");
+            // Wired once at startup; a second call is a wiring mistake.
+            tracing::warn!("native app grant store already set; ignoring repeat wiring");
         }
     }
 
@@ -1209,9 +1216,6 @@ async fn approve_page(
     if let Some(r) = local_gate(connect_info.as_ref(), &headers) {
         return r;
     }
-    if method == axum::http::Method::HEAD {
-        return (page_headers(&random_id()), ()).into_response();
-    }
     if !page_fetch_is_direct(&headers) {
         return refuse(
             StatusCode::FORBIDDEN,
@@ -1239,6 +1243,11 @@ async fn approve_page(
                 "This request has expired or was already answered. Start again from the program that asked.",
             );
         };
+        // A HEAD answers with the status GET would give, without rotating
+        // the nonce: only a rendered page may replace it.
+        if method == axum::http::Method::HEAD {
+            return (page_headers(&random_id()), ()).into_response();
+        }
         p.page_nonce = Some(nonce.clone());
         (p.app, p.client_name.clone())
     };
@@ -1350,18 +1359,24 @@ async fn list_native_grants(
     let Some(caps) = state.capabilities() else {
         return Json(empty).into_response();
     };
-    match off_thread(move || caps.native_grants()).await {
+    match off_thread(move || caps.native_grant_listing()).await {
         Some(Ok(grants)) => {
             let rows: Vec<_> = grants
                 .into_iter()
-                .map(|(hash, g)| {
-                    serde_json::json!({
+                .map(|(hash, g)| match g {
+                    Some(g) => serde_json::json!({
                         "id": hash.to_hex(),
                         "app": g.app.display(),
                         "client_name": g.client_name,
                         "created_at_ms": g.created_at_ms,
                         "last_used_at_ms": g.last_used_at_ms,
-                    })
+                    }),
+                    // A row this build cannot read: listed, so it can be
+                    // revoked by its id (the table key).
+                    None => serde_json::json!({
+                        "id": hash.to_hex(),
+                        "unreadable": true,
+                    }),
                 })
                 .collect();
             Json(serde_json::json!({ "grants": rows })).into_response()

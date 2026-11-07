@@ -282,7 +282,9 @@ impl DelegateCapabilities {
         self.storage.remove_native_grant(&token_hash.0)
     }
 
-    /// Every stored grant, oldest first. Unreadable rows are skipped.
+    /// Every readable stored grant, oldest first (tests). The Apps page uses
+    /// [`Self::native_grant_listing`], which also lists unreadable rows.
+    #[cfg(test)]
     pub(crate) fn native_grants(&self) -> anyhow::Result<Vec<(GrantTokenHash, NativeGrant)>> {
         let mut out: Vec<_> = self
             .storage
@@ -293,6 +295,27 @@ impl DelegateCapabilities {
             })
             .collect();
         out.sort_by_key(|(_, g)| g.created_at_ms);
+        Ok(out)
+    }
+
+    /// Every stored row for the Apps and permissions page, oldest first, with
+    /// rows this build cannot decode listed as `None` at the end. Those still
+    /// count toward [`MAX_NATIVE_GRANTS`] and still make their token read as
+    /// "unavailable" (4503), so the user must be able to see and revoke them;
+    /// the hash, the table key, is all a revocation needs.
+    pub(crate) fn native_grant_listing(
+        &self,
+    ) -> anyhow::Result<Vec<(GrantTokenHash, Option<NativeGrant>)>> {
+        let mut out: Vec<_> = self
+            .storage
+            .all_native_grants()?
+            .into_iter()
+            .map(|(hash, bytes)| (GrantTokenHash(hash), NativeGrant::decode(&bytes)))
+            .collect();
+        out.sort_by_key(|(_, g)| match g {
+            Some(g) => (0, g.created_at_ms),
+            None => (1, 0),
+        });
         Ok(out)
     }
 }

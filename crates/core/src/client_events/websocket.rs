@@ -50,13 +50,14 @@ pub const AUTH_TOKEN_UNAVAILABLE_CLOSE_CODE: u16 = 4503;
 pub const AUTH_TOKEN_NOT_USABLE_HERE_ERROR: &str = "AUTH_TOKEN_NOT_USABLE_HERE";
 
 /// WebSocket close code for a token sent in the `Authorization` header that
-/// this connection cannot use as a native app grant (#5264): the connection is
-/// not local, its `Host` is not loopback, or it carries forwarding headers, so
-/// the grant store is not consulted at all. Unlike
-/// [`AUTH_TOKEN_INVALID_CLOSE_CODE`] this says nothing about the token itself:
-/// a native client must keep it and connect to the node directly over
-/// loopback. A stale shell-page token (sent in the query string) still gets
-/// 4401. Mirrors HTTP 403.
+/// this connection cannot use as a native app grant (#5264), so the grant
+/// store is not consulted at all: the connection is not local, its `Host` is
+/// not loopback, it carries forwarding headers, the node is hosted, or this
+/// router serves no grants. Unlike [`AUTH_TOKEN_INVALID_CLOSE_CODE`] this says
+/// nothing about the token itself: a native client must keep it. It can be
+/// used only on a direct loopback connection to a node that serves grants. A
+/// stale shell-page token (sent in the query string) still gets 4401. Mirrors
+/// HTTP 403.
 pub const AUTH_TOKEN_NOT_USABLE_HERE_CLOSE_CODE: u16 = 4403;
 
 /// What the upgrade found out about the connection's auth token.
@@ -105,13 +106,22 @@ enum GrantGateKind {
 /// non-hosted node that serves grants, for a local connection whose headers
 /// pass [`upgrade_may_use_grant`]; any other header token is "not usable
 /// here" (4403, keep the token), never "invalid" (4401, discard it).
-fn grant_gate_kind(
+struct GrantGateInputs {
     has_grant_state: bool,
     hosted: bool,
     token_from_header: bool,
     headers_allow_grant: bool,
     connection_scope: ConnectionScope,
-) -> GrantGateKind {
+}
+
+fn grant_gate_kind(inputs: GrantGateInputs) -> GrantGateKind {
+    let GrantGateInputs {
+        has_grant_state,
+        hosted,
+        token_from_header,
+        headers_allow_grant,
+        connection_scope,
+    } = inputs;
     if !token_from_header {
         return GrantGateKind::NoGrants;
     }
@@ -1400,13 +1410,13 @@ async fn websocket_commands(
     // live registration.
     let app_grants = app_grants.map(|Extension(g)| g);
     let grant_gate = match (
-        grant_gate_kind(
-            app_grants.is_some(),
-            hosted_mode.0,
-            token_from_header.is_some_and(|Extension(h)| h.0),
-            upgrade_may_use_grant(&headers),
+        grant_gate_kind(GrantGateInputs {
+            has_grant_state: app_grants.is_some(),
+            hosted: hosted_mode.0,
+            token_from_header: token_from_header.is_some_and(|Extension(h)| h.0),
+            headers_allow_grant: upgrade_may_use_grant(&headers),
             connection_scope,
-        ),
+        }),
         app_grants,
     ) {
         (GrantGateKind::Applies, Some(g)) => GrantGate::Applies(g),
@@ -1649,8 +1659,9 @@ async fn websocket_interface(
             ),
             TokenCheck::NotUsableHere => (
                 AUTH_TOKEN_NOT_USABLE_HERE_ERROR,
-                "This connection cannot use an app grant. Keep the token and connect to the \
-                 node directly over loopback.",
+                "This connection cannot use an app grant. App grants are honoured only on a \
+                 direct loopback connection to a Freenet node that serves them (not through a \
+                 proxy, and not on a hosted node). Keep the token.",
                 AUTH_TOKEN_NOT_USABLE_HERE_CLOSE_CODE,
             ),
             TokenCheck::GrantNotFound => (
@@ -3422,14 +3433,52 @@ mod tests {
     fn grant_gate_decision() {
         use ConnectionScope::{Local, Remote};
         use GrantGateKind::{Applies, NoGrants, NotHere};
+        // The one case that consults the grant store.
+        let ok = || GrantGateInputs {
+            has_grant_state: true,
+            hosted: false,
+            token_from_header: true,
+            headers_allow_grant: true,
+            connection_scope: Local,
+        };
+        assert_eq!(grant_gate_kind(ok()), Applies);
         // Only a header token is ever a grant.
-        assert_eq!(grant_gate_kind(true, false, false, true, Local), NoGrants);
-        assert_eq!(grant_gate_kind(true, false, true, true, Local), Applies);
+        assert_eq!(
+            grant_gate_kind(GrantGateInputs {
+                token_from_header: false,
+                ..ok()
+            }),
+            NoGrants
+        );
         // Every other header-token case is "keep the token", not "invalid".
-        assert_eq!(grant_gate_kind(true, false, true, true, Remote), NotHere);
-        assert_eq!(grant_gate_kind(true, false, true, false, Local), NotHere);
-        assert_eq!(grant_gate_kind(true, true, true, true, Local), NotHere);
-        assert_eq!(grant_gate_kind(false, false, true, true, Local), NotHere);
+        assert_eq!(
+            grant_gate_kind(GrantGateInputs {
+                connection_scope: Remote,
+                ..ok()
+            }),
+            NotHere
+        );
+        assert_eq!(
+            grant_gate_kind(GrantGateInputs {
+                headers_allow_grant: false,
+                ..ok()
+            }),
+            NotHere
+        );
+        assert_eq!(
+            grant_gate_kind(GrantGateInputs {
+                hosted: true,
+                ..ok()
+            }),
+            NotHere
+        );
+        assert_eq!(
+            grant_gate_kind(GrantGateInputs {
+                has_grant_state: false,
+                ..ok()
+            }),
+            NotHere
+        );
     }
 
     /// The token-check close codes through the REAL client-API composition
@@ -3609,7 +3658,12 @@ mod tests {
 
         // A hosted node serves no grants: a header token is "not usable here"
         // (keep it), never "invalid". A hosted connection needs a user token
-        // over a secure (loopback, X-Forwarded-Proto: https) connection.
+        // over a secure (loopback, X-Forwarded-Proto: https) connection, and
+        // that forwarding header alone also makes the gate say "not here", so
+        // this case cannot isolate the hosted check: without the header the
+        // upgrade is refused (403) before the gate runs, and without a user
+        // token a hosted node refuses the connection outright. The hosted
+        // branch on its own is pinned by `grant_gate_decision`.
         let (hosted_port, _hosted_gw) = serve(true).await;
         let hosted_local = format!("127.0.0.1:{hosted_port}");
         assert_eq!(
