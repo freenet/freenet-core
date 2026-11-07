@@ -866,9 +866,17 @@ impl ConfigArgs {
         // treatment; the grant that widens it has to match.
         let cidrs_granted_this_boot = self.ws_api.allowed_source_cidrs.clone();
 
+        // Keypair/cipher paths from the file that are only the automatic
+        // location under its own secrets dir; see `PreviousSecretPaths`.
+        let mut previous_secrets = secret::PreviousSecretPaths::default();
+
         // merge the configuration from the file with the command line arguments
         if let Some(cfg) = cfg {
-            self.secrets.merge(cfg.secrets);
+            let file_secrets_dirs = [
+                cfg.config_paths.secrets_dir(OperationMode::Network),
+                cfg.config_paths.secrets_dir(OperationMode::Local),
+            ];
+            previous_secrets = self.secrets.merge(cfg.secrets, &file_secrets_dirs);
             self.mode.get_or_insert(cfg.mode);
             // GHSA-824h-7x5x-wfmf upgrade migration. `build()` persists the
             // RESOLVED config, so every node that has ever booted in network
@@ -1176,7 +1184,9 @@ impl ConfigArgs {
         let mode = self.mode.unwrap_or(OperationMode::Network);
         let config_paths = self.config_paths.build(self.id.as_deref())?;
 
-        let secrets = self.secrets.build(Some(&config_paths.secrets_dir(mode)))?;
+        let secrets = self
+            .secrets
+            .build_with_previous(Some(&config_paths.secrets_dir(mode)), &previous_secrets)?;
 
         let peer_id = self
             .network_api
@@ -4555,6 +4565,9 @@ impl ConfigPathsArgs {
 
     pub fn build(self, id: Option<&str>) -> std::io::Result<ConfigPaths> {
         // Used by the Windows migration block below; suppress warning on other platforms.
+        // Set by the command line, the environment, or `config.toml`. A default
+        // install with no `config.toml` yet leaves it unset (#6134), so the
+        // migration can run on that first boot.
         #[allow(unused_variables)]
         let has_custom_data_dir = self.data_dir.is_some();
         let app_data_dir = self
@@ -4562,6 +4575,8 @@ impl ConfigPathsArgs {
             .map(Ok::<_, std::io::Error>)
             .unwrap_or_else(|| {
                 let default_dirs = Self::default_dirs(id)?;
+                // A temp dir always has `data_dir` pre-filled by
+                // `apply_default_dirs`, so only a `ProjectDirs` default reaches here.
                 let Either::Left(defaults) = default_dirs else {
                     unreachable!("default_dirs should return Left if data_dir is None and id is not set for temp dir")
                 };
@@ -7881,6 +7896,45 @@ shutdown-drain-secs = 42
             args.config_dir.as_deref(),
             Some(Path::new("/default/config")),
             "the config dir is where config.toml was found, so it stays the default"
+        );
+    }
+
+    /// The tests above drive `apply_default_dirs` then `merge` by hand,
+    /// because test builds never reach the release branch. This pins that
+    /// `build_with_gateways_index` really does the same: the default branch
+    /// goes through `apply_default_dirs` (no direct `data_dir` pre-fill), it
+    /// runs before the file is merged, and the file's automatic secret paths
+    /// are handed to the build as fallbacks rather than merged as explicit.
+    #[test]
+    fn build_resolves_the_default_data_dir_through_apply_default_dirs() {
+        let build = extract_fn_body(
+            production_source(),
+            "async fn build_with_gateways_index(mut self, gateways_index: &str)",
+        );
+        let apply = build
+            .find(".apply_default_dirs(")
+            .expect("the default-dir branch must go through apply_default_dirs (#6134)");
+        assert!(
+            !build.contains("config_paths.data_dir = Some("),
+            "build_with_gateways_index pre-fills data_dir directly again, so the \
+             default would beat config.toml's data_dir (#6134)"
+        );
+        let merge = build
+            .find("self.config_paths.merge(")
+            .expect("build_with_gateways_index must merge the file's paths");
+        assert!(
+            apply < merge,
+            "the defaults must be applied before the file is merged"
+        );
+        assert!(
+            build.contains("self.secrets.merge(cfg.secrets, &file_secrets_dirs)"),
+            "the file's secret paths must be merged against the file's own secrets dirs"
+        );
+        assert!(
+            build.contains(
+                ".build_with_previous(Some(&config_paths.secrets_dir(mode)), &previous_secrets)"
+            ),
+            "the secrets must be built with the file's automatic paths as fallbacks"
         );
     }
 
