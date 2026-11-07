@@ -320,3 +320,174 @@ fn storm_without_a_cap_defers_nothing() {
     assert_eq!(deferred, 0);
     assert_eq!(r.cap_bytes, 0, "no cap to charge");
 }
+
+/// Idle time after the last stream before the receipt-loss row reads the
+/// flight size, as `fix-6100`'s reverse-loss gate.
+const IDLE_SECS: u64 = 180;
+
+/// What one receipt-loss run did.
+#[derive(Debug)]
+struct ReverseLossReport {
+    completed_after: Option<Duration>,
+    probe: CongestionProbe,
+}
+
+/// One connection, fast links both ways, three back-to-back `payload_len`
+/// streams from A to B. Once connected, B's uplink (which carries only B's
+/// receipts, NoOps and Pongs) loses `receipt_loss` of its packets, so A loses
+/// receipts while every data packet arrives. A's socket has the cap `cap`.
+async fn run_reverse_loss(
+    payload_len: usize,
+    receipt_loss: f64,
+    horizon: Duration,
+    seed: u64,
+    cap: Cap,
+) -> ReverseLossReport {
+    let vt = VirtualTime::new();
+    let driver = tokio::spawn(drive_virtual_time(vt.clone()));
+    let clean = HostLink {
+        uplink_bps: 0,
+        queue_bytes: 1 << 24,
+        one_way_delay: ONE_WAY_DELAY,
+        loss: Loss::None,
+    };
+    let link = Arc::new(LinkModel::new(clean.clone(), seed));
+    let channels: Channels = Arc::new(DashMap::new());
+    let config = Some(CongestionControlConfig::new(
+        CongestionControlAlgorithm::FixedRate,
+    ));
+    let (pub_a, mut peer_a, addr_a) = create_mock_peer_with_link_model_and_cap(
+        link.clone(),
+        channels.clone(),
+        vt.clone(),
+        config.clone(),
+        cap.rate(),
+    )
+    .await
+    .expect("peer a");
+    let (pub_b, mut peer_b, addr_b) = create_mock_peer_with_link_model_and_cap(
+        link.clone(),
+        channels.clone(),
+        vt.clone(),
+        config,
+        None,
+    )
+    .await
+    .expect("peer b");
+    let (ca, cb) = futures::join!(peer_a.connect(pub_b, addr_b), peer_b.connect(pub_a, addr_a));
+    let (conn_a, conn_b) = connect_pair(ca, cb).await;
+    let (mut conn_a, mut conn_b) = (conn_a.expect("connect a"), conn_b.expect("connect b"));
+    if let Cap::Main(_) = cap {
+        conn_a.egress_cap().expect("a cap").uncap_retransmits();
+    }
+    link.set_host_link(
+        addr_b,
+        HostLink {
+            loss: Loss::Bernoulli(receipt_loss),
+            ..clean
+        },
+    );
+
+    let start = vt.now_nanos();
+    let mut until = vt.sleep_until(start + horizon.as_nanos() as u64);
+    let mut completed_after = None;
+    const STREAMS: usize = 3;
+    let mut done = 0;
+    'outer: while done < STREAMS {
+        let payload: Vec<u8> = (0..payload_len)
+            .map(|i| (i * 7 + done + seed as usize) as u8)
+            .collect();
+        conn_a.send(payload).await.expect("send");
+        loop {
+            tokio::select! {
+                biased;
+                r = conn_b.recv() => {
+                    if r.is_err() { break 'outer; }
+                    done += 1;
+                    if done == STREAMS {
+                        completed_after = Some(Duration::from_nanos(vt.now_nanos() - start));
+                    }
+                    break;
+                }
+                r = conn_a.recv() => if r.is_err() { break 'outer; },
+                _ = &mut until => break 'outer,
+            }
+        }
+    }
+    let mut idle = vt.sleep(Duration::from_secs(IDLE_SECS));
+    loop {
+        tokio::select! {
+            biased;
+            r = conn_b.recv() => if r.is_err() { break; },
+            r = conn_a.recv() => if r.is_err() { break; },
+            _ = &mut idle => break,
+        }
+    }
+    let probe = conn_a.congestion_probe();
+    driver.abort();
+    drop((peer_a, peer_b));
+    ReverseLossReport {
+        completed_after,
+        probe,
+    }
+}
+
+/// The receipt-loss row: receipts are not cumulative, so a path that loses
+/// most of the receiver's packets loses most of the sender's receipts while
+/// every data packet arrives (the case that sank #6100's ACK-clocked credit).
+/// With the cap above the stream rate (FixedRate's 1.25 MB/s) and at it,
+/// capped retransmits must deliver no later than main (with 10% slack for
+/// timer granularity), fail no more streams, and leave no more in flight after
+/// the idle time.
+#[test]
+fn receipt_loss_under_a_cap_matches_or_beats_main() {
+    let mut failures = Vec::new();
+    for rate in [2_500_000u64, 1_250_000] {
+        for loss in [0.5, 0.7, 0.9] {
+            let seed = 11;
+            let run = |cap| {
+                block_on_seeded(
+                    seed,
+                    run_reverse_loss(6 * 1024 * 1024, loss, Duration::from_secs(120), seed, cap),
+                )
+            };
+            let main = run(Cap::Main(rate));
+            let capped = run(Cap::Capped(rate));
+            let line = |label: &str, r: &ReverseLossReport| {
+                format!(
+                    "{label}: done after {:?}, {} B in flight after {IDLE_SECS} s idle, {} RTO, \
+                     {} retransmits, {} deferred, {} abandoned, {} streams failed",
+                    r.completed_after,
+                    r.probe.flightsize,
+                    r.probe.rto_expiries,
+                    r.probe.retransmissions,
+                    r.probe.retransmits_deferred,
+                    r.probe.abandoned_packets,
+                    r.probe.outbound_streams_failed,
+                )
+            };
+            let summary = format!(
+                "cap {rate} B/s, receipt loss {loss}\n  {}\n  {}",
+                line("main  ", &main),
+                line("capped", &capped)
+            );
+            eprintln!("{summary}");
+            let late = match (main.completed_after, capped.completed_after) {
+                (Some(m), Some(c)) => c > m.mul_f64(1.1),
+                (Some(_), None) => true,
+                (None, _) => false,
+            };
+            if late
+                || capped.probe.outbound_streams_failed > main.probe.outbound_streams_failed
+                || capped.probe.flightsize > main.probe.flightsize.max(64 * 1024)
+            {
+                failures.push(summary);
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "capped retransmits did worse under receipt loss:\n{}",
+        failures.join("\n")
+    );
+}
