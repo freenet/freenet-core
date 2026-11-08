@@ -12722,6 +12722,17 @@ mod hol_4391_tests {
         ));
         let send = Arc::new(send);
         let key = delegate_key_n(0x68);
+        // One loop round-trip first: `contract_handling` installs the lane
+        // before its loop starts, so once the loop has answered anything,
+        // later delegate requests go through the lane. Without this the first
+        // request below can reach the loop directly (sent before the lane
+        // existed), mark nothing, and the test passes for the wrong reason.
+        put_local(
+            &send,
+            make_contract(b"lane_release_warmup"),
+            WrappedState::new(b"w".to_vec()),
+        )
+        .await;
         // A request the lane never runs: forwarded to the loop.
         tokio::time::timeout(
             Duration::from_secs(5),
