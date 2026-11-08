@@ -3659,3 +3659,64 @@ async fn set_peer_identity_promotes_the_session_on_set_and_same_only() {
     assert_eq!(promoted(&e), None, "Refused");
     assert_eq!(e.conn.peer_identity(), Some(&key));
 }
+
+/// A connection opens its upgrade session with a pacer when it has a bandwidth
+/// limit, and without one when it has none: `open_session` builds the pacer
+/// from the connection's limit.
+#[tokio::test(start_paused = true)]
+async fn a_session_paces_its_data_only_under_a_limit() {
+    for (case, subnet, limit) in [("none", 30, None), ("limited", 31, Some(100_000))] {
+        let hub = crate::transport::quic::upgrade::driver::tests::Harness::server(
+            &format!("ack-policy-paced-{case}"),
+            subnet,
+        )
+        .await;
+        let mut e = single(CAPABLE);
+        e.conn.remote_conn.bandwidth_limit = limit;
+        e.conn = e.conn.with_upgrade_site(&hub.site());
+        assert_eq!(
+            e.conn.quic_path.as_ref().expect("a session").paces_data(),
+            limit.is_some(),
+            "{case}"
+        );
+    }
+}
+
+/// The pacer a session builds runs on the path's clock, the one its paths'
+/// send deadlines run on, not the connection's: a 200 kB reservation at a
+/// 100 kB/s limit waits about 1.9 s (the burst is 10 kB), and that wait shrinks
+/// as the path's virtual clock advances, while the connection's clock (real
+/// time here) barely moves.
+#[tokio::test(start_paused = true)]
+async fn a_sessions_pacer_runs_on_the_path_clock() {
+    let hub = crate::transport::quic::upgrade::driver::tests::Harness::server(
+        "ack-policy-pacer-clock",
+        32,
+    )
+    .await;
+    let mut e = single(CAPABLE);
+    e.conn.remote_conn.bandwidth_limit = Some(100_000);
+    e.conn = e.conn.with_upgrade_site(&hub.site());
+    let pacer = e
+        .conn
+        .quic_path
+        .as_ref()
+        .expect("a session")
+        .pacer()
+        .expect("a limit paces");
+    let first = pacer
+        .reserve_within(200_000, Duration::MAX)
+        .expect("no limit to refuse at");
+    assert!(
+        first >= Duration::from_millis(1_850) && first <= Duration::from_millis(1_950),
+        "{first:?}"
+    );
+    hub.time().advance(Duration::from_secs(1));
+    let after = pacer
+        .reserve_within(0, Duration::MAX)
+        .expect("no limit to refuse at");
+    assert!(
+        after >= Duration::from_millis(850) && after <= Duration::from_millis(950),
+        "a second of the path's clock paid a second of the debt: {after:?}"
+    );
+}

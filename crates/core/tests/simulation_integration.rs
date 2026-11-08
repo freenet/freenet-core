@@ -848,6 +848,198 @@ impl TraceFingerprint {
     }
 }
 
+/// Thread ids of the tokio blocking-pool threads alive now (Linux).
+#[cfg(target_os = "linux")]
+fn blocking_pool_threads() -> std::collections::BTreeSet<u64> {
+    let Ok(tasks) = std::fs::read_dir("/proc/self/task") else {
+        return Default::default();
+    };
+    tasks
+        .flatten()
+        .filter_map(|task| {
+            let tid = task.file_name().to_str()?.parse::<u64>().ok()?;
+            let name = std::fs::read_to_string(task.path().join("comm")).ok()?;
+            (name.trim_end() == "tokio-rt-worker").then_some(tid)
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+const NO_BLOCKING_POOL_CHILD_ENV: &str = "FREENET_NO_BLOCKING_POOL_CHILD";
+#[cfg(target_os = "linux")]
+const NO_BLOCKING_POOL_TEST: &str = "test_simulation_uses_no_blocking_pool_thread";
+
+/// No simulated node may hand work to tokio's blocking pool.
+///
+/// A blocking-pool thread finishes in wall-clock time, so the simulation step
+/// at which the awaiting task resumes follows OS scheduling, and one seed gives
+/// different results from run to run. That was #6123: Ring's disk-usage sweep
+/// awaited `spawn_blocking` (now `offload_blocking`, inline on a simulation
+/// host). The sweep first walks 70-90 s of virtual time into a run, so this run
+/// keeps operations going to about 140 s and watches, every 20 ms, for a
+/// `tokio-rt-worker` thread (tokio's name for its blocking-pool threads) that
+/// was not there before the simulation started. It catches any awaited
+/// `spawn_blocking` or `tokio::fs` call on a simulation path, not only the
+/// sweep's. The polling matters: an idle blocking thread exits after 10 s, so
+/// a check at the end alone could miss one used early.
+///
+/// Runs in a child process (a re-exec of this binary filtered to this test), so
+/// no other test in the same `cargo test` process can create a blocking thread
+/// during the watch.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_simulation_uses_no_blocking_pool_thread() {
+    if std::env::var_os(NO_BLOCKING_POOL_CHILD_ENV).is_none() {
+        let output = std::process::Command::new("/proc/self/exe")
+            .args([
+                "--exact",
+                "--test-threads=1",
+                "--nocapture",
+                NO_BLOCKING_POOL_TEST,
+            ])
+            .env(NO_BLOCKING_POOL_CHILD_ENV, "1")
+            .output()
+            .expect("re-exec the test binary");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "child run of {NO_BLOCKING_POOL_TEST} failed.\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        );
+        // libtest exits 0 when its filter matches nothing; fail closed on a
+        // rename instead of passing vacuously.
+        assert!(
+            stdout.contains("1 passed"),
+            "the child must actually have run {NO_BLOCKING_POOL_TEST}; if it was \
+             renamed, update NO_BLOCKING_POOL_TEST.\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        );
+        return;
+    }
+
+    const SEED: u64 = 0xD15C_6123;
+    const NAME: &str = "no-blocking-pool";
+    const NODES: usize = 9;
+    const CONTRACTS: u8 = 4;
+    const ROUNDS: usize = 30;
+
+    // Positive control: a deliberate `spawn_blocking` on a runtime of its own
+    // must show up, or the detector is blind (tokio renamed its blocking
+    // threads, or something set a thread name) and an empty result below
+    // would mean nothing.
+    {
+        let control_before = blocking_pool_threads();
+        let control = create_runtime();
+        control
+            .block_on(async {
+                tokio::task::spawn_blocking(|| {
+                    std::thread::sleep(Duration::from_millis(50));
+                })
+                .await
+            })
+            .expect("control blocking task");
+        let seen = blocking_pool_threads();
+        assert!(
+            seen.difference(&control_before).next().is_some(),
+            "the detector did not see a deliberate spawn_blocking; tokio's \
+             blocking-pool thread name is no longer \"tokio-rt-worker\", so this \
+             test would pass without detecting anything"
+        );
+        drop(control);
+    }
+
+    // Taken before the network is built, so a blocking thread created while
+    // building it counts too.
+    let before = blocking_pool_threads();
+    setup_deterministic_state(SEED);
+    let rt = create_runtime();
+    let mut sim = rt.block_on(SimNetwork::new(NAME, 1, NODES, 10, 3, 8, 3, SEED));
+
+    let contracts: Vec<_> = (0..CONTRACTS)
+        .map(|i| SimOperation::create_test_contract(0x60 + i))
+        .collect();
+    let mut operations = Vec::new();
+    for (i, contract) in contracts.iter().enumerate() {
+        operations.push(ScheduledOperation::new(
+            NodeLabel::gateway(NAME, 0),
+            SimOperation::Put {
+                contract: contract.clone(),
+                state: SimOperation::create_test_state(i as u8),
+                subscribe: true,
+            },
+        ));
+    }
+    for node in 1..=NODES {
+        operations.push(ScheduledOperation::new(
+            NodeLabel::node(NAME, node),
+            SimOperation::Subscribe {
+                contract_id: *contracts[node % contracts.len()].key().id(),
+            },
+        ));
+    }
+    for round in 0..ROUNDS {
+        let contract = &contracts[round % contracts.len()];
+        operations.push(ScheduledOperation::new(
+            NodeLabel::node(NAME, 1 + round % NODES),
+            SimOperation::Update {
+                key: contract.key(),
+                data: SimOperation::create_test_state(16 + round as u8),
+            },
+        ));
+        operations.push(ScheduledOperation::new(
+            NodeLabel::node(NAME, 1 + (round * 5 + 3) % NODES),
+            SimOperation::Get {
+                contract_id: *contracts[(round + 1) % contracts.len()].key().id(),
+                return_contract_code: false,
+                subscribe: false,
+            },
+        ));
+    }
+    let op_interval = Duration::from_secs(2);
+    let op_seconds = operations.len() as u64 * op_interval.as_secs();
+    assert!(
+        op_seconds > 120,
+        "operations must run past the sweep's first disk walk (70-90 s)"
+    );
+    sim.with_controlled_op_interval(op_interval);
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watcher = {
+        let stop = stop.clone();
+        let before = before.clone();
+        std::thread::spawn(move || {
+            let mut seen = std::collections::BTreeSet::new();
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                seen.extend(blocking_pool_threads().difference(&before).copied());
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            seen.extend(blocking_pool_threads().difference(&before).copied());
+            seen
+        })
+    };
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(op_seconds + 30),
+        Duration::from_secs(20),
+    );
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let new_threads = watcher.join().expect("watcher thread");
+    assert!(
+        result.turmoil_result.is_ok(),
+        "simulation failed: {:?}",
+        result.turmoil_result.err()
+    );
+    assert!(
+        new_threads.is_empty(),
+        "a simulated node handed work to tokio's blocking pool ({} new \
+         tokio-rt-worker threads: {new_threads:?}). Its result then arrives in \
+         wall-clock time and the run stops being a function of its seed \
+         (#6123). Run blocking work inline on a simulation host, e.g. through \
+         crate::util::blocking::offload_blocking.",
+        new_threads.len()
+    );
+}
+
 /// **STRICT** determinism test: verifies that same seed produces EXACTLY identical events.
 ///
 /// This test uses Turmoil's deterministic scheduler to ensure reproducible execution.

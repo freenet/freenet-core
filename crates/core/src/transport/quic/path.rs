@@ -132,6 +132,7 @@
 
 pub(crate) mod bounded;
 pub(crate) mod inbound;
+pub(in crate::transport) mod pacer;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -699,6 +700,10 @@ pub(crate) struct QuicPath {
     suspect: std::sync::atomic::AtomicBool,
     /// Where the path's watch reports that the peer was heard from.
     heard: Arc<recycle::PeerHeard>,
+    /// What paces the path's data sends at the connection's bandwidth limit,
+    /// once set ([`Self::pace_with`]); unset, as with no limit, nothing is
+    /// paced. Control frames are never paced.
+    pacer: std::sync::OnceLock<Arc<dyn pacer::SendPacer>>,
     #[cfg(test)]
     budget: SharedInboundBudget,
 }
@@ -891,11 +896,50 @@ impl QuicPath {
                 suspect_since_acked: parking_lot::Mutex::new(None),
                 suspect: std::sync::atomic::AtomicBool::new(false),
                 heard,
+                pacer: std::sync::OnceLock::new(),
                 #[cfg(test)]
                 budget,
             },
             controls,
         )
+    }
+
+    /// Pace this path's data sends with `pacer` (`pacer` module): the
+    /// connection's token bucket when a bandwidth limit is set. A second call
+    /// changes nothing.
+    pub(in crate::transport) fn pace_with(&self, pacer: Arc<dyn pacer::SendPacer>) {
+        let _already = self.pacer.set(pacer);
+    }
+
+    /// A message of `bytes` that `outcome` sent on UDP instead, after the UDP
+    /// send succeeded: if the pacer refused it, charge the whole message to the
+    /// pacer as debt, since UDP put all of it on the wire, so the path's next
+    /// sends wait for it. A Short refused after its stream opened also paid for
+    /// the writes it made on QUIC; those bytes were sent too. The debt is
+    /// bounded ([`pacer::FALLBACK_DEBT`]), which is what keeps the charge from
+    /// failing streams already open. Returns what was charged.
+    pub(in crate::transport) fn charge_fallback(&self, outcome: &BoundedSend, bytes: u64) -> u64 {
+        let refused = matches!(
+            outcome,
+            BoundedSend::Failed(SendFailure::NotOpened(NotOpened::Paced) | SendFailure::Paced)
+        );
+        let (true, Some(pacer)) = (refused, self.pacer.get()) else {
+            return 0;
+        };
+        pacer.charge(usize::try_from(bytes).unwrap_or(usize::MAX)) as u64
+    }
+
+    /// The pacing for a data send, if the path is paced.
+    fn pacing(&self) -> Option<pacer::Pacing> {
+        self.pacer.get().map(|pacer| pacer::Pacing {
+            pacer: Arc::clone(pacer),
+        })
+    }
+
+    /// Whether the path's data sends are paced.
+    #[cfg(test)]
+    pub(in crate::transport) fn is_paced(&self) -> bool {
+        self.pacer.get().is_some()
     }
 
     /// The key the peer proved in the handshake.
@@ -1140,15 +1184,17 @@ impl QuicPath {
     ) -> Result<(), QuicSendError> {
         self.debug_assert_carries_data();
         let header = FrameHeader::short(payload.len() as u64)?;
-        let slot = if fits_one_packet(payload.len() as u64) {
-            None
+        // A Short past one packet is a stream on UDP, and paced as one; a Short
+        // of one packet is not, as on UDP.
+        let (slot, pacing) = if fits_one_packet(payload.len() as u64) {
+            (None, None)
         } else {
-            Some(self.stream_slot().await?)
+            (Some(self.stream_slot().await?), self.pacing())
         };
-        let mut send = self.open(&header, &[], slot, progress).await?;
+        let mut send = self.open(&header, &[], slot, pacing, progress).await?;
         for piece in payload.chunks(FRAGMENT_PAYLOAD_SIZE) {
             send.take_turns().await;
-            send.write_all(piece).await?;
+            send.write_paced(piece).await?;
             if let Some(observer) = observer {
                 observer.on_fragment_sent();
             }
@@ -1169,7 +1215,8 @@ impl QuicPath {
         progress: SendProgress,
     ) -> Result<(), QuicSendError> {
         let header = FrameHeader::control(payload.len() as u64)?;
-        let mut send = self.open(&header, &[], None, progress).await?;
+        // Never paced: a control frame must not wait behind data.
+        let mut send = self.open(&header, &[], None, None, progress).await?;
         send.write_all(payload).await?;
         send.finish().await
     }
@@ -1237,7 +1284,9 @@ impl QuicPath {
         let metadata = frame_metadata(metadata);
         let header = FrameHeader::stream(stream_id, payload.len() as u64, metadata.len())?;
         let slot = self.stream_slot().await?;
-        let mut send = self.open(&header, metadata, Some(slot), progress).await?;
+        let mut send = self
+            .open(&header, metadata, Some(slot), self.pacing(), progress)
+            .await?;
         send.write_fragments(payload, observer).await?;
         send.finish().await
     }
@@ -1357,7 +1406,9 @@ impl QuicPath {
         let header = FrameHeader::stream(stream_id, total_len, metadata.len())?;
         let slot = self.stream_slot().await?;
         let source_wait = progress.clone();
-        let mut send = self.open(&header, metadata, Some(slot), progress).await?;
+        let mut send = self
+            .open(&header, metadata, Some(slot), self.pacing(), progress)
+            .await?;
         let mut delivered: u64 = 0;
         let mut next = Some(first);
         let failure = loop {
@@ -1430,14 +1481,24 @@ impl QuicPath {
 
     /// Open a uni stream and write the header and metadata. Waits for a
     /// stream credit when the peer's [`super::config::MAX_UNI_STREAMS`] are
-    /// in use. The stream takes over `slot`.
+    /// in use. The stream takes over `slot`. With `pacing`, the header and
+    /// metadata are taken from the pacer before the stream opens, so a
+    /// refusal opens nothing, and the stream's later writes are paced too.
     async fn open(
         &self,
         header: &FrameHeader,
         metadata: &[u8],
         slot: Option<tokio::sync::OwnedSemaphorePermit>,
+        pacing: Option<pacer::Pacing>,
         progress: SendProgress,
     ) -> Result<Outgoing, QuicSendError> {
+        let paid = match &pacing {
+            Some(pacing) => {
+                let bytes = super::framing::HEADER_LEN + metadata.len();
+                Some(pace(pacing, bytes, &progress).await?)
+            }
+            None => None,
+        };
         // Polled once by hand, to tell an open that had to wait for the peer's
         // stream credit from one that did not (`quic_open_uni_waited`).
         let mut open = std::pin::pin!(self.connection.inner().open_uni());
@@ -1453,12 +1514,39 @@ impl QuicPath {
         };
         let stream = opened?;
         progress.mark_opened();
-        let mut send = Outgoing::new(stream, self.aborts.clone(), slot, progress);
+        let mut send = Outgoing::new(stream, self.aborts.clone(), slot, pacing, progress);
         send.write_all(&header.encode()).await?;
         if !metadata.is_empty() {
             send.write_all(metadata).await?;
         }
+        if let Some(paid) = paid {
+            paid.spent();
+        }
         Ok(send)
+    }
+}
+
+/// Take `bytes` from `pacing` and wait for them, with no more than the send's
+/// current deadline leaves (`pacer` module). A refusal marks `progress`, and
+/// the error it returns only ends the send, which then ends as at that
+/// deadline. Dropping the returned bytes before [`pacer::PacedBytes::spent`]
+/// gives them back, as does dropping this future during its wait.
+async fn pace(
+    pacing: &pacer::Pacing,
+    bytes: usize,
+    progress: &SendProgress,
+) -> Result<pacer::PacedBytes, QuicSendError> {
+    match pacing.take(bytes, progress.time_left()) {
+        pacer::Paced::Taken { bytes, wait } => {
+            if !wait.is_zero() {
+                pacing.pacer.sleep(wait).await;
+            }
+            Ok(bytes)
+        }
+        pacer::Paced::Refused => {
+            progress.refuse();
+            Err(QuicSendError::Closed)
+        }
     }
 }
 
@@ -1592,6 +1680,8 @@ struct Outgoing {
     awaiting_ack: bool,
     /// A piece of the message has been written ([`Self::take_turns`]).
     wrote_a_piece: bool,
+    /// The send's pacing, for a paced data send ([`Self::write_paced`]).
+    pacing: Option<pacer::Pacing>,
 }
 
 type StoppedResult = Result<Option<quinn::VarInt>, quinn::StoppedError>;
@@ -1601,6 +1691,7 @@ impl Outgoing {
         send: quinn::SendStream,
         aborts: Arc<SendAborts>,
         slot: Option<tokio::sync::OwnedSemaphorePermit>,
+        pacing: Option<pacer::Pacing>,
         progress: SendProgress,
     ) -> Self {
         let stopped = Box::pin(send.stopped());
@@ -1613,7 +1704,39 @@ impl Outgoing {
             slot,
             awaiting_ack: false,
             wrote_a_piece: false,
+            pacing,
         }
+    }
+
+    /// Take `bytes` from the send's pacer, if it has one, and wait for them,
+    /// racing a stop from the peer as every wait on an open stream does. A
+    /// refusal ends the send as at its current deadline ([`pace`]).
+    async fn pace(&mut self, bytes: usize) -> Result<Option<pacer::PacedBytes>, QuicSendError> {
+        let Some(pacing) = self.pacing.clone() else {
+            return Ok(None);
+        };
+        match pacing.take(bytes, self.progress.time_left()) {
+            pacer::Paced::Taken { bytes, wait } => {
+                if !wait.is_zero() {
+                    self.race(pacing.pacer.sleep(wait)).await?;
+                }
+                Ok(Some(bytes))
+            }
+            pacer::Paced::Refused => {
+                self.progress.refuse();
+                Err(QuicSendError::Closed)
+            }
+        }
+    }
+
+    /// [`Self::write_all`], paced.
+    async fn write_paced(&mut self, buf: &[u8]) -> Result<(), QuicSendError> {
+        let paid = self.pace(buf.len()).await?;
+        self.write_all(buf).await?;
+        if let Some(paid) = paid {
+            paid.spent();
+        }
+        Ok(())
     }
 
     /// Let the path's other streamed sends run before this send's next piece.
@@ -1678,7 +1801,11 @@ impl Outgoing {
         while !chunk.is_empty() {
             self.take_turns().await;
             let fragment = chunk.split_to(chunk.len().min(FRAGMENT_PAYLOAD_SIZE));
+            let paid = self.pace(fragment.len()).await?;
             self.write_chunk(fragment).await?;
+            if let Some(paid) = paid {
+                paid.spent();
+            }
             if let Some(observer) = observer {
                 observer.on_fragment_sent();
             }

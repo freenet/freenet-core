@@ -2,6 +2,7 @@
 #[cfg(test)]
 pub(crate) mod alloc_count;
 pub(crate) mod backoff;
+pub(crate) mod blocking;
 pub(crate) mod byte_bounded_lru;
 pub mod deterministic_select;
 /// Internal to the `freenet` binary: not a stable API (it exposes reqwest types).

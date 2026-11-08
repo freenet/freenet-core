@@ -142,6 +142,11 @@ pub(crate) enum SendFailure {
     /// A deadline passed after the stream was opened and before its end was
     /// sent. The stream was reset.
     TimedOut,
+    /// After the stream was opened, the connection's bandwidth-limit pacer
+    /// refused a write whose wait would have reached the send's deadline
+    /// (`pacer` module). The stream was reset. This side held the send back,
+    /// so it says nothing about the path.
+    Paced,
     /// The send failed (`QuicSendError`), before the end of the stream was
     /// sent, or after it with a stop from the peer. This includes a source that
     /// ended or failed before its first chunk, where no stream was opened: such
@@ -158,6 +163,10 @@ pub(crate) enum NotOpened {
     TimedOut,
     /// The connection was lost first.
     ConnectionLost(quinn::ConnectionError),
+    /// The connection's bandwidth-limit pacer refused the header's wait, which
+    /// would have reached the open deadline (`pacer` module). Held back on this
+    /// side, so it says nothing about the path.
+    Paced,
 }
 
 const STAGE_OPENING: u8 = 0;
@@ -180,10 +189,20 @@ struct ProgressState {
     extended: AtomicBool,
     /// Told when a wait for the source starts while `extended`.
     source_wait: tokio::sync::Notify,
+    /// The end of the connection's window the armed timer reads
+    /// ([`ConnectionWatch::until`]), 0 for none, so a pacer's wait is judged
+    /// against the deadline the timer enforces ([`SendProgress::time_left`]).
+    window: AtomicU64,
     /// Timers armed by [`bounded_send`]. Tests only.
     #[cfg(test)]
     arms: AtomicU64,
     now: Box<dyn Fn() -> u64 + Send + Sync>,
+    /// The send's deadlines and its start on `now`, so a pacer can refuse a
+    /// wait that would reach the current one. `None`: no deadline.
+    deadlines: Option<(SendDeadlines, u64)>,
+    /// The path's pacer refused a write, so the send ends as at its current
+    /// deadline (`pacer` module).
+    refused: AtomicBool,
 }
 
 impl SendProgress {
@@ -196,13 +215,16 @@ impl SendProgress {
             on_source: AtomicBool::new(false),
             extended: AtomicBool::new(false),
             source_wait: tokio::sync::Notify::new(),
+            window: AtomicU64::new(0),
             #[cfg(test)]
             arms: AtomicU64::new(0),
             now: Box::new(|| 0),
+            deadlines: None,
+            refused: AtomicBool::new(false),
         }))
     }
 
-    fn on_clock<T: TimeSource>(time: &T) -> Self {
+    fn on_clock<T: TimeSource>(time: &T, deadlines: SendDeadlines, started: u64) -> Self {
         let time = time.clone();
         Self(Arc::new(ProgressState {
             stage: AtomicU8::new(STAGE_OPENING),
@@ -210,10 +232,38 @@ impl SendProgress {
             on_source: AtomicBool::new(false),
             extended: AtomicBool::new(false),
             source_wait: tokio::sync::Notify::new(),
+            window: AtomicU64::new(0),
             #[cfg(test)]
             arms: AtomicU64::new(0),
             now: Box::new(move || time.now_nanos()),
+            deadlines: Some((deadlines, started)),
+            refused: AtomicBool::new(false),
         }))
+    }
+
+    /// How long until the send's current deadline, the one [`bounded_send`]'s
+    /// timer enforces: with the stream open, the later of the send's own gap
+    /// and its connection's window, unless it waits for its source. So a
+    /// pacer's wait on a connection that is still being acknowledged is not
+    /// refused at the send's own gap, where the timer would not end the send.
+    /// `Duration::MAX` for a send with none.
+    pub(super) fn time_left(&self) -> Duration {
+        match &self.0.deadlines {
+            Some((deadlines, started)) => Duration::from_nanos(
+                self.deadline(deadlines, *started, self.0.window.load(Ordering::Acquire))
+                    .saturating_sub((self.0.now)()),
+            ),
+            None => Duration::MAX,
+        }
+    }
+
+    /// The pacer refused a write: the send ends as at its current deadline.
+    pub(super) fn refuse(&self) {
+        self.0.refused.store(true, Ordering::Release);
+    }
+
+    fn refused(&self) -> bool {
+        self.0.refused.load(Ordering::Acquire)
     }
 
     /// The stream exists.
@@ -279,6 +329,14 @@ impl SendProgress {
                     .min(total)
             }),
             _ => total,
+        }
+    }
+
+    /// The outcome of a send the pacer refused, by how far it had got.
+    fn paced(&self) -> BoundedSend {
+        match self.stage() {
+            STAGE_OPENING => BoundedSend::Failed(SendFailure::NotOpened(NotOpened::Paced)),
+            _ => BoundedSend::Failed(SendFailure::Paced),
         }
     }
 
@@ -488,7 +546,7 @@ where
         .and(connection)
         .map(|connection| ConnectionWatch::new(connection, started));
     let until = |watch: &Option<ConnectionWatch>| watch.as_ref().map_or(0, ConnectionWatch::until);
-    let progress = SendProgress::on_clock(time);
+    let progress = SendProgress::on_clock(time, deadlines, started);
     let send = send(progress.clone());
     tokio::pin!(send);
     loop {
@@ -496,13 +554,22 @@ where
         // deadline, which reads `on_source` (see `waiting_on_source`).
         let own = progress.deadline(&deadlines, started, 0);
         let window = until(&watch);
+        progress.0.window.store(window, Ordering::Release);
         progress.0.extended.store(window > own, Ordering::SeqCst);
         let deadline = progress.deadline(&deadlines, started, window);
         #[cfg(test)]
         progress.0.arms.fetch_add(1, Ordering::Relaxed);
         let wait = Duration::from_nanos(deadline.saturating_sub(time.now_nanos()));
         tokio::select! {
-            result = &mut send => return outcome(result, &progress),
+            result = &mut send => {
+                // A refusal returns an error only to end the send, which then
+                // ends as a deadline would at that stage. It leaves no
+                // `QuietProof`: this side held the send back.
+                if progress.refused() {
+                    return progress.paced();
+                }
+                return outcome(result, &progress);
+            }
             () = progress.0.source_wait.notified() => {}
             () = time.sleep_cancelable(wait) => {
                 let now = time.now_nanos();

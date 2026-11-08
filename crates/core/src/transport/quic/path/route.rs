@@ -11,7 +11,9 @@
 //! | `Sent` | done | done |
 //! | `MaybeDelivered` | done | done |
 //! | `Failed(NotOpened)` | UDP | UDP, same id |
+//! | `Failed(NotOpened(Paced))` (the pacer refused it) | UDP, charged to the pacer | UDP, same id, charged to the pacer |
 //! | `Failed(TimedOut)` after open | UDP | give up |
+//! | `Failed(Paced)` after open | UDP, charged to the pacer | give up |
 //! | `ConnectionLost` before the end | UDP | give up |
 //! | Stopped `NOT_ACCEPTING_DATA` | UDP | UDP, same id |
 //! | Stopped `BUDGET_REFUSED` | UDP | give up |
@@ -120,6 +122,10 @@ quic_outcomes! {
         /// The connection acknowledged something again, so the path took sends
         /// again.
         SuspectLeft => "suspect_left",
+        /// The connection's bandwidth-limit pacer refused a send, before or
+        /// after its stream opened (`pacer` module). Also counted under its
+        /// kind's result.
+        PacerRefused => "pacer_refused",
     }
 }
 
@@ -132,7 +138,9 @@ pub(crate) fn next_step(kind: SendKind, outcome: &BoundedSend) -> (NextStep, Qui
         BoundedSend::Sent => return (Done, R::Sent),
         BoundedSend::MaybeDelivered(_) => return (Done, R::MaybeDelivered),
         BoundedSend::Failed(SendFailure::NotOpened(_)) => (SendOnUdp, false),
-        BoundedSend::Failed(SendFailure::TimedOut) => (short_goes_on_udp, true),
+        BoundedSend::Failed(SendFailure::TimedOut | SendFailure::Paced) => {
+            (short_goes_on_udp, true)
+        }
         BoundedSend::Failed(SendFailure::Error(error)) => match error {
             QuicSendError::InvalidFrame(_) => (SendOnUdp, false),
             QuicSendError::ConnectionLost(_) | QuicSendError::Closed => (short_goes_on_udp, true),
@@ -155,6 +163,8 @@ pub(crate) fn next_step(kind: SendKind, outcome: &BoundedSend) -> (NextStep, Qui
 /// Whether `outcome` is a send deadline running out: before the stream opened,
 /// with the stream open and not moving, or waiting for the acknowledgement of
 /// its end. Whether it counts against the path is [`StallCount`]'s decision.
+/// A send the pacer refused is not one: this side held it back, and the path
+/// said nothing (`pacer` module), so it never counts toward the stall close.
 fn timed_out(outcome: &BoundedSend) -> bool {
     match outcome {
         BoundedSend::MaybeDelivered(MaybeDelivered::TimedOut)
@@ -163,6 +173,8 @@ fn timed_out(outcome: &BoundedSend) -> bool {
         BoundedSend::Sent
         | BoundedSend::MaybeDelivered(MaybeDelivered::ConnectionLost)
         | BoundedSend::Failed(SendFailure::NotOpened(NotOpened::ConnectionLost(_)))
+        | BoundedSend::Failed(SendFailure::NotOpened(NotOpened::Paced))
+        | BoundedSend::Failed(SendFailure::Paced)
         | BoundedSend::Failed(SendFailure::Error(_)) => false,
     }
 }
@@ -236,6 +248,12 @@ pub(crate) struct StallVerdict {
 /// A [`QuietProof`] a timed-out send left dates the progress this sees
 /// ([`Self::take`]), so a path that went dark mid-send counts its first
 /// timeout.
+///
+/// A send the path's pacer refused ([`NotOpened::Paced`], [`SendFailure::Paced`])
+/// is not a timeout and never counts: this side held it back. A pacer's waits
+/// are not progress: they only hold writes into quinn's buffer, and on a live
+/// path acknowledgements keep arriving meanwhile, so a paced path that goes
+/// dark still goes suspect and closes.
 #[derive(Debug)]
 pub(crate) struct StallCount {
     in_a_row: u32,
@@ -380,6 +398,12 @@ impl QuicPath {
     ) -> NextStep {
         let (step, result) = next_step(kind, outcome);
         self.stats.record_send(kind, result);
+        if matches!(
+            outcome,
+            BoundedSend::Failed(SendFailure::NotOpened(NotOpened::Paced) | SendFailure::Paced)
+        ) {
+            self.stats.record_send_event(QuicSendEvent::PacerRefused);
+        }
         if let BoundedSend::Failed(SendFailure::Error(QuicSendError::Stopped(code))) = outcome {
             self.stats.record_stop(*code);
             if *code == u64::from(stop_code::NOT_ACCEPTING_DATA) {
