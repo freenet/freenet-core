@@ -363,7 +363,8 @@ pub(crate) struct PooledDelegateRunner {
 /// `f(&mut executor)` unwinds past the post-call health check, and the tokio
 /// mutex is not poisoned, so without this the next caller would run on an
 /// executor left mid-call. [`Self::begin`] arms it; [`SuspectCall::done`]
-/// disarms it after a normal return; [`Self::take`] reads and clears it.
+/// disarms it after a normal return; [`Self::recover`] clears it only once a
+/// replacement has actually succeeded.
 #[derive(Default)]
 pub(crate) struct SuspectFlag(std::sync::atomic::AtomicBool);
 
@@ -376,7 +377,24 @@ impl SuspectFlag {
         SuspectCall(self)
     }
 
-    /// Whether the last call panicked, clearing the mark.
+    /// Whether the last call panicked (or a replacement is still owed).
+    pub(crate) fn is_set(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+
+    /// Run `replace` with the mark SET, and clear it only if `replace`
+    /// reports success. A replacement that fails, or whose future is dropped
+    /// before it finishes (the lane aborted mid-await), leaves the mark set,
+    /// so the next call tries again instead of running on the executor
+    /// unchecked.
+    pub(crate) async fn recover(&self, replace: impl std::future::Future<Output = bool>) {
+        self.0.store(true, Ordering::SeqCst);
+        if replace.await {
+            self.0.store(false, Ordering::SeqCst);
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn take(&self) -> bool {
         self.0.swap(false, Ordering::SeqCst)
     }
@@ -397,32 +415,39 @@ impl PooledDelegateRunner {
         let mut executor = self.executor.lock().await;
         // The previous call panicked out of `f`, past the health check below:
         // replace before anything else runs on it.
-        if self.suspect.take() {
-            self.replace(&mut executor, operation, "a call into it panicked")
+        if self.suspect.is_set() {
+            self.suspect
+                .recover(self.replace(&mut executor, operation, "a call into it panicked"))
                 .await;
         }
         let call = self.suspect.begin();
         let result = f(&mut executor);
         call.done();
         if !executor.runtime.is_healthy() {
-            self.replace(&mut executor, operation, "it became unhealthy")
+            self.suspect
+                .recover(self.replace(&mut executor, operation, "it became unhealthy"))
                 .await;
         }
         result
     }
 
-    async fn replace(&self, executor: &mut Executor<Runtime>, operation: &str, why: &str) {
-        let replacement_number = self.replacements.fetch_add(1, Ordering::SeqCst) + 1;
-        tracing::warn!(
-            operation,
-            replacement_number,
-            why,
-            "Replacing the delegate executor"
-        );
+    /// Replace the executor; `true` on success. Only a success is counted.
+    async fn replace(&self, executor: &mut Executor<Runtime>, operation: &str, why: &str) -> bool {
+        tracing::warn!(operation, why, "Replacing the delegate executor");
         match self.factory.create_delegate_executor().await {
-            Ok(replacement) => *executor = replacement,
+            Ok(replacement) => {
+                *executor = replacement;
+                let replacement_number = self.replacements.fetch_add(1, Ordering::SeqCst) + 1;
+                tracing::warn!(replacement_number, "Replaced the delegate executor");
+                true
+            }
             Err(e) => {
-                tracing::error!(error = %e, "Failed to replace the delegate executor");
+                tracing::error!(
+                    error = %e,
+                    "Failed to replace the delegate executor; it stays marked for \
+                     replacement and the next call retries"
+                );
+                false
             }
         }
     }
@@ -1874,6 +1899,26 @@ mod tests {
     ///
     /// FALSIFY: give `SuspectCall` a `Drop` that clears the flag (a panic then
     /// clears it too), or have `begin` not set it.
+    /// The mark is cleared only by a SUCCESSFUL replacement: a failed one, or
+    /// one whose future is dropped mid-await, leaves it set for a retry.
+    ///
+    /// FALSIFY: clear the mark before awaiting `replace` in
+    /// `SuspectFlag::recover` (or clear it unconditionally after).
+    #[tokio::test]
+    async fn a_failed_or_cancelled_replacement_keeps_the_executor_suspect() {
+        let flag = SuspectFlag::default();
+        flag.recover(async { false }).await;
+        assert!(flag.is_set(), "a failed replacement leaves the mark set");
+        flag.recover(async { true }).await;
+        assert!(!flag.is_set(), "a successful replacement clears it");
+        let pending = flag.recover(std::future::pending::<bool>());
+        assert!(
+            futures::FutureExt::now_or_never(pending).is_none(),
+            "the replacement is still in progress"
+        );
+        assert!(flag.is_set(), "a cancelled replacement leaves the mark set");
+    }
+
     #[test]
     fn a_call_that_panics_leaves_the_executor_suspect() {
         let flag = SuspectFlag::default();
@@ -2348,6 +2393,24 @@ mod tests {
         .await
         .expect("build RuntimePool");
 
+        // The production pool ENABLES the delegate lane: `contract_handling`
+        // starts a lane only for an executor whose `delegate_runner()` is
+        // `Some`, and every test with the mock runtime opts in by hand, so a
+        // pool returning `None` would turn the whole lane off with every other
+        // test still green. It must also be the pool's own runner, the one its
+        // `execute_delegate_request` uses, so the loop and the lane share one
+        // lock.
+        {
+            use crate::contract::executor::ContractExecutor;
+            let runner = pool
+                .delegate_runner()
+                .expect("the production RuntimePool must provide a delegate runner");
+            assert_eq!(
+                Arc::as_ptr(&runner) as *const (),
+                Arc::as_ptr(&pool.delegate_runner) as *const (),
+                "the lane must run on the pool's own delegate runner"
+            );
+        }
         for slot in &pool.runtimes {
             let executor = slot.as_ref().expect("executor present");
             assert!(Arc::ptr_eq(

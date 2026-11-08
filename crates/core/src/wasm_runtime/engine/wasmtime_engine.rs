@@ -367,17 +367,19 @@ const STORE_ARENA_MAX_BYTES: usize = 256 * 1024 * 1024;
 ///
 /// # Sizing
 ///
-/// `clamp((memory_limit / 8 - DELEGATE_STORE_ARENA_BYTES) / pool_size, 4 MiB,
-/// 256 MiB)`. It is divided by the
+/// `clamp((memory_limit / STORE_ARENA_RAM_DIVISOR - DELEGATE_STORE_ARENA_BYTES)
+/// / pool_size, 4 MiB, 256 MiB)`, with a divisor of 8. It is divided by the
 /// pool size because there is one Store PER pool worker (up to 16), so the
-/// node-wide arena slack is the product. (The node's one delegate executor,
-/// outside the pool, has its own fixed budget instead,
-/// [`DELEGATE_STORE_ARENA_BYTES`](super::DELEGATE_STORE_ARENA_BYTES), applied
-/// with `set_store_arena_budget_bytes`.) the memory limit comes from
+/// node-wide arena slack is the product. The node's one delegate executor,
+/// outside the pool, has its own fixed budget,
+/// [`DELEGATE_STORE_ARENA_BYTES`](super::DELEGATE_STORE_ARENA_BYTES) (applied
+/// with `set_store_arena_budget_bytes`), set aside from the envelope first.
+/// The memory limit comes from
 /// [`read_total_ram_bytes`](crate::wasm_runtime::read_total_ram_bytes), which
 /// already resolves `min(MemTotal, cgroup limit)` and so honours the shipped
-/// `MemoryMax=2G`. A 2 GiB peer with 16 workers resolves to 16 MiB per Store
-/// (256 MiB node-wide) from the RAM-scaled share; an unconstrained gateway
+/// `MemoryMax=2G`. A 2 GiB peer with 16 workers resolves to 15 MiB per Store
+/// (240 MiB node-wide, plus the delegate executor's 16 MiB) from the
+/// RAM-scaled share; an unconstrained gateway
 /// saturates at [`STORE_ARENA_MAX_BYTES`].
 ///
 /// # When ONE instance is as large as the whole budget
@@ -765,8 +767,14 @@ pub(crate) struct WasmtimeEngine {
     /// stay covered by [`STORE_REFRESH_THRESHOLD`] and [`STORE_MAX_AGE`].
     retired_instance_bytes: u64,
     /// Retired-instance bytes this Store may hold before it is refreshed.
-    /// Resolved once per engine from the node's memory limit and pool size.
+    /// Resolved once per engine from the node's memory limit and pool size,
+    /// unless set to a fixed figure (the delegate executor).
     arena_budget_bytes: u64,
+    /// `arena_budget_bytes` was set to a fixed figure by
+    /// `set_store_arena_budget_bytes` (the node's delegate executor), so the
+    /// memory limit and pool size do not size it and the cadence warning must
+    /// not tell the operator to change them.
+    fixed_arena_budget: bool,
     /// Last time [`Self::note_refresh_cadence`] warned that refreshes are firing
     /// after a single instance. Real wall-clock `Instant` deliberately: it
     /// rate-limits an operator log line, not node behavior (same rationale as
@@ -891,6 +899,7 @@ impl WasmEngine for WasmtimeEngine {
             lifetime_instances: 0,
             retired_instance_bytes: 0,
             arena_budget_bytes: store_arena_budget_bytes() as u64,
+            fixed_arena_budget: false,
             last_cadence_warn: None,
             store_created_at: Instant::now(),
             offload_compilation: config.offload_compilation,
@@ -899,6 +908,7 @@ impl WasmEngine for WasmtimeEngine {
 
     fn set_store_arena_budget_bytes(&mut self, bytes: u64) {
         self.arena_budget_bytes = bytes;
+        self.fixed_arena_budget = true;
     }
 
     fn is_healthy(&self) -> bool {
@@ -1444,6 +1454,7 @@ impl WasmtimeEngine {
             lifetime_instances: 0,
             retired_instance_bytes: 0,
             arena_budget_bytes: store_arena_budget_bytes() as u64,
+            fixed_arena_budget: false,
             last_cadence_warn: None,
             store_created_at: Instant::now(),
             offload_compilation: config.offload_compilation,
@@ -1721,6 +1732,20 @@ impl WasmtimeEngine {
             return;
         }
         self.last_cadence_warn = Some(now);
+        if self.fixed_arena_budget {
+            // The node's delegate executor: its arena is a fixed constant,
+            // which no operator setting changes.
+            tracing::warn!(
+                retired_instance_bytes = self.retired_instance_bytes,
+                arena_budget_bytes = self.arena_budget_bytes,
+                "A single delegate instance's memory fills the delegate \
+                 executor's fixed WASM arena budget (DELEGATE_STORE_ARENA_BYTES), \
+                 so its Store is being replaced on every call. Memory stays \
+                 bounded, but each delegate call pays an extra store rebuild. \
+                 No node setting changes this budget."
+            );
+            return;
+        }
         tracing::warn!(
             retired_instance_bytes = self.retired_instance_bytes,
             arena_budget_bytes = self.arena_budget_bytes,
