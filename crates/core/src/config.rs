@@ -6636,6 +6636,89 @@ pub fn set_logger(
     }
 }
 
+/// Parse the remote gateway index, dropping an entry that does not deserialize
+/// instead of rejecting the whole index.
+///
+/// The index is shared by every node, so a single malformed entry (a gateway
+/// added without its `public_key`, say) would otherwise make every peer ignore
+/// the update. The strict whole-document parse is tried first; only when it
+/// fails is each entry parsed on its own. A document that is not TOML at all,
+/// or has no `gateways` array, still fails. (A hand-edited local
+/// `gateways.toml` is deliberately NOT parsed this way: see
+/// [`parse_gateways_toml`].)
+fn parse_index_tolerating_bad_entries(content: &str, source: &str) -> anyhow::Result<Gateways> {
+    let strict_error = match parse_gateways_toml(content, source) {
+        Ok(gateways) => return Ok(gateways),
+        Err(e) => e,
+    };
+    let table: toml::Table = toml::from_str(content)?;
+    let Some(toml::Value::Array(entries)) = table.get("gateways") else {
+        return Err(strict_error.into());
+    };
+    let mut gateways = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let mut single = toml::Table::new();
+        single.insert("gateways".into(), toml::Value::Array(vec![entry.clone()]));
+        let parsed = toml::to_string(&single)
+            .map_err(anyhow::Error::from)
+            .and_then(|doc| parse_gateways_toml(&doc, source).map_err(anyhow::Error::from));
+        match parsed {
+            Ok(mut one) => gateways.append(&mut one.gateways),
+            Err(error) => tracing::warn!(
+                entry = %entry,
+                error = %error,
+                "Skipping malformed gateway entry in the remote index"
+            ),
+        }
+    }
+    Ok(Gateways { gateways })
+}
+
+/// Fetch one index gateway's public key into `pub_keys_dir` and return the
+/// local path. The body is validated BEFORE it is written, so a bad response
+/// can never overwrite a good cached key of the same name.
+async fn fetch_index_gateway_key(
+    client: &reqwest::Client,
+    base_url: &reqwest::Url,
+    gateway: &GatewayConfig,
+    pub_keys_dir: &Path,
+) -> anyhow::Result<PathBuf> {
+    let public_key_url = base_url.join(&gateway.public_key_path.to_string_lossy())?;
+    let content = client
+        .get(public_key_url)
+        .send()
+        .await?
+        .error_for_status()?
+        .bytes()
+        .await?;
+    let file_name = gateway
+        .public_key_path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("Invalid public key path"))?;
+
+    // Validate the public key (hex-encoded X25519 public key, 32 bytes = 64 hex chars)
+    let text = std::str::from_utf8(&content)
+        .map_err(|_| anyhow::anyhow!("public key is not valid UTF-8"))?
+        .trim();
+    // Legacy RSA PEM keys are not usable; the gateway needs to move to X25519.
+    if text.starts_with("-----BEGIN") {
+        anyhow::bail!("legacy RSA PEM public key format; gateway needs to be updated to X25519");
+    }
+    let key_bytes =
+        hex::decode(text).map_err(|e| anyhow::anyhow!("invalid public key hex encoding: {e}"))?;
+    if key_bytes.len() != 32 {
+        anyhow::bail!(
+            "invalid public key length {} (expected 32)",
+            key_bytes.len()
+        );
+    }
+
+    let local_path = pub_keys_dir.join(file_name);
+    fs::write(&local_path, &content)
+        .with_context(|| format!("failed writing gateway pubkey to {local_path:?}"))?;
+    Ok(local_path)
+}
+
 async fn load_gateways_from_index(url: &str, pub_keys_dir: &Path) -> anyhow::Result<Gateways> {
     // Use an explicit timeout so the node doesn't hang indefinitely when the
     // network is unavailable (e.g., immediately after a Windows restart before
@@ -6655,66 +6738,31 @@ async fn load_gateways_from_index(url: &str, pub_keys_dir: &Path) -> anyhow::Res
     // Name the remote index, not a local file: a duplicate spelling published
     // there would otherwise have every node on the network tell its operator to
     // go edit an innocent gateways.toml, on every boot.
-    let mut gateways: Gateways = parse_gateways_toml(&response, url)?;
+    let mut gateways: Gateways = parse_index_tolerating_bad_entries(&response, url)?;
     let mut base_url = reqwest::Url::parse(url)?;
     base_url.set_path("");
     let mut valid_gateways = Vec::new();
 
-    for gateway in &mut gateways.gateways {
+    // One gateway whose key cannot be fetched or validated (a 404 for a gateway
+    // the index lists before its key is served, a truncated body) must not fail
+    // the whole load: every peer would then keep its stale cache, so a single
+    // bad entry would block the update for the entire network. Each entry is
+    // resolved on its own and a failure skips just that entry.
+    for mut gateway in std::mem::take(&mut gateways.gateways) {
         gateway.location = None; // always ignore any location from files if set, it should be derived from IP
-        let public_key_url = base_url.join(&gateway.public_key_path.to_string_lossy())?;
-        let public_key_response = client
-            .get(public_key_url)
-            .send()
-            .await?
-            .error_for_status()?;
-        let file_name = gateway
-            .public_key_path
-            .file_name()
-            .ok_or_else(|| anyhow::anyhow!("Invalid public key path"))?;
-        let local_path = pub_keys_dir.join(file_name);
-        let mut public_key_file = File::create(&local_path)?;
-        let content = public_key_response.bytes().await?;
-        std::io::copy(&mut content.as_ref(), &mut public_key_file)?;
-
-        // Validate the public key (hex-encoded X25519 public key, 32 bytes = 64 hex chars)
-        // Also accept legacy RSA PEM keys temporarily for backwards compatibility
-        let mut key_file = File::open(&local_path).with_context(|| {
-            format!(
-                "failed loading gateway pubkey from {:?}",
-                gateway.public_key_path
-            )
-        })?;
-        let mut buf = String::new();
-        key_file.read_to_string(&mut buf)?;
-        let buf = buf.trim();
-
-        // Check if it's a legacy RSA PEM public key
-        if buf.starts_with("-----BEGIN") {
-            tracing::warn!(
-                public_key_path = ?gateway.public_key_path,
-                "Gateway uses legacy RSA PEM public key format. \
-                 Gateway needs to be updated to X25519 format. Skipping."
-            );
-            continue;
-        }
-
-        if let Ok(key_bytes) = hex::decode(buf) {
-            if key_bytes.len() == 32 {
+        match fetch_index_gateway_key(&client, &base_url, &gateway, pub_keys_dir).await {
+            Ok(local_path) => {
                 gateway.public_key_path = local_path;
-                valid_gateways.push(gateway.clone());
-            } else {
+                valid_gateways.push(gateway);
+            }
+            Err(error) => {
                 tracing::warn!(
+                    address = ?gateway.address,
                     public_key_path = ?gateway.public_key_path,
-                    "Invalid public key length {} (expected 32), ignoring",
-                    key_bytes.len()
+                    error = %format!("{error:#}"),
+                    "Skipping gateway from the remote index: its public key is unusable"
                 );
             }
-        } else {
-            tracing::warn!(
-                public_key_path = ?gateway.public_key_path,
-                "Invalid public key hex encoding in remote gateway file, ignoring"
-            );
         }
     }
 
@@ -8377,7 +8425,9 @@ shutdown-drain-secs = 42
         }
     }
 
-    /// ...and the remote-index call site must actually PASS its URL.
+    /// ...and the remote-index call site must actually PASS its URL (through
+    /// `parse_index_tolerating_bad_entries`, which hands it on to
+    /// `parse_gateways_toml`).
     ///
     /// The message-formatting test above pins what `redundant_key_spellings`
     /// produces; this pins the one line that decides which source it is told
@@ -8391,7 +8441,7 @@ shutdown-drain-secs = 42
         let source = include_str!("config.rs");
         // Assembled at runtime: spelled out as a literal, the needle would
         // appear in this test's own text and match itself. (It did.)
-        let needle = format!("parse_gateways_toml(&response, {})", "url");
+        let needle = format!("parse_index_tolerating_bad_entries(&response, {})", "url");
         assert!(
             source.contains(&needle),
             "load_gateways_from_index must pass the index URL as the source \
@@ -10827,6 +10877,128 @@ shutdown-drain-secs = 42
             pub_keys_dir.path().join("public_key.pem")
         );
         assert!(pub_keys_dir.path().join("public_key.pem").exists());
+    }
+
+    /// One gateway whose key cannot be used must not poison the whole index:
+    /// the others are still loaded (and so still replace the local cache).
+    /// Before, a single 404 aborted `load_gateways_from_index`, and a newly
+    /// added gateway whose key was not served yet kept every peer on its
+    /// stale cache.
+    #[tokio::test]
+    async fn load_gateways_from_index_skips_a_bad_entry() {
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(all_of!(request::method("GET"), request::path("/gateways")))
+                .times(1..)
+                .respond_with(status_code(200).body(
+                    r#"
+                    [[gateways]]
+                    address = { hostname = "missing-key.example.com" }
+                    public_key = "/keys/missing.pub"
+
+                    [[gateways]]
+                    address = { hostname = "short-key.example.com" }
+                    public_key = "/keys/short.pub"
+
+                    [[gateways]]
+                    address = { hostname = "good.example.com" }
+                    public_key = "/keys/good.pub"
+
+                    [[gateways]]
+                    address = { hostname = "not-hex.example.com" }
+                    public_key = "/keys/not_hex.pub"
+
+                    [[gateways]]
+                    address = { hostname = "no-key-field.example.com" }
+
+                    [[gateways]]
+                    address = { hostname = "good-two.example.com" }
+                    public_key = "/keys/good_two.pub"
+                    "#,
+                )),
+        );
+        let good_hex = hex::encode(TransportKeypair::new().public().as_bytes());
+        let good_two_hex = hex::encode(TransportKeypair::new().public().as_bytes());
+        server.expect(
+            Expectation::matching(request::path("/keys/missing.pub"))
+                .times(1..)
+                .respond_with(status_code(404)),
+        );
+        server.expect(
+            Expectation::matching(request::path("/keys/short.pub"))
+                .times(1..)
+                .respond_with(status_code(200).body(hex::encode([1u8; 31]))),
+        );
+        server.expect(
+            Expectation::matching(request::path("/keys/good.pub"))
+                .times(1..)
+                .respond_with(status_code(200).body(good_hex.clone())),
+        );
+        server.expect(
+            Expectation::matching(request::path("/keys/not_hex.pub"))
+                .times(1..)
+                .respond_with(status_code(200).body("zz-not-hex")),
+        );
+        server.expect(
+            Expectation::matching(request::path("/keys/good_two.pub"))
+                .times(1..)
+                .respond_with(status_code(200).body(good_two_hex.clone())),
+        );
+
+        let pub_keys_dir = tempfile::tempdir().unwrap();
+        // A previously cached good key under a name that a bad key then reuses
+        // must survive: a rejected body must not overwrite it.
+        std::fs::write(pub_keys_dir.path().join("not_hex.pub"), &good_hex).unwrap();
+
+        let gateways = load_gateways_from_index(&server.url_str("/gateways"), pub_keys_dir.path())
+            .await
+            .expect("one bad entry must not fail the whole index");
+        let hosts: Vec<_> = gateways
+            .gateways
+            .iter()
+            .map(|gw| gw.address.clone())
+            .collect();
+        assert_eq!(
+            hosts,
+            vec![
+                Address::Hostname("good.example.com".to_string()),
+                Address::Hostname("good-two.example.com".to_string()),
+            ]
+        );
+        assert_eq!(
+            std::fs::read_to_string(pub_keys_dir.path().join("not_hex.pub")).unwrap(),
+            good_hex,
+            "a rejected key body must not overwrite the cached key file"
+        );
+    }
+
+    /// If every entry in the index is unusable the load yields no gateways
+    /// (not an error), so `build()` falls back to the local cache and then the
+    /// compiled-in list instead of starting with nothing.
+    #[tokio::test]
+    async fn load_gateways_from_index_all_bad_yields_empty() {
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(request::path("/gateways"))
+                .times(1..)
+                .respond_with(status_code(200).body(
+                    r#"
+                    [[gateways]]
+                    address = { hostname = "a.example.com" }
+                    public_key = "/keys/a.pub"
+                    "#,
+                )),
+        );
+        server.expect(
+            Expectation::matching(request::path("/keys/a.pub"))
+                .times(1..)
+                .respond_with(status_code(404)),
+        );
+        let pub_keys_dir = tempfile::tempdir().unwrap();
+        let gateways = load_gateways_from_index(&server.url_str("/gateways"), pub_keys_dir.path())
+            .await
+            .unwrap();
+        assert!(gateways.gateways.is_empty());
     }
 
     #[test]
