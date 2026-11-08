@@ -665,8 +665,9 @@ impl NodeConfig {
         let mut gateway_addrs = Vec::with_capacity(config.gateways.len());
         // The last resolution failure, returned only if NO gateway resolved.
         let mut unresolved_error = None;
-        // The last unusable-key failure, returned only if NO gateway was usable.
-        let mut skipped_error: Option<anyhow::Error> = None;
+        // Why each gateway with an unusable key was skipped; reported (all of
+        // them, capped) only if NO gateway was usable.
+        let mut skipped_reasons: Vec<String> = Vec::new();
         for gw in &config.gateways {
             let GatewayConfig {
                 address,
@@ -693,9 +694,9 @@ impl NodeConfig {
                             error = %e,
                             "Skipping gateway whose public key cannot be read"
                         );
-                        skipped_error = Some(anyhow::Error::new(e).context(format!(
-                            "failed loading gateway pubkey from {public_key_path:?}"
-                        )));
+                        skipped_reasons.push(format!(
+                            "{address:?}: failed loading gateway pubkey from {public_key_path:?}: {e}"
+                        ));
                         break;
                     }
                 };
@@ -716,6 +717,9 @@ impl NodeConfig {
                             public_key_path = ?public_key_path,
                             "Gateway public key still in RSA PEM format after 5s. Skipping this gateway."
                         );
+                        skipped_reasons.push(format!(
+                            "{address:?}: public key {public_key_path:?} still in legacy RSA PEM format"
+                        ));
                         break;
                     }
                 }
@@ -731,8 +735,8 @@ impl NodeConfig {
                             "Skipping gateway with invalid public key length {} (expected 32)",
                             bytes.len()
                         );
-                        skipped_error = Some(anyhow::anyhow!(
-                            "invalid gateway pubkey length {} (expected 32) from {public_key_path:?}",
+                        skipped_reasons.push(format!(
+                            "{address:?}: invalid gateway pubkey length {} (expected 32) from {public_key_path:?}",
                             bytes.len()
                         ));
                     }
@@ -743,8 +747,8 @@ impl NodeConfig {
                             error = %e,
                             "Skipping gateway whose public key is not valid hex"
                         );
-                        skipped_error = Some(anyhow::anyhow!(
-                            "failed to decode gateway pubkey hex from {public_key_path:?}: {e}"
+                        skipped_reasons.push(format!(
+                            "{address:?}: failed to decode gateway pubkey hex from {public_key_path:?}: {e}"
                         ));
                     }
                 }
@@ -795,11 +799,27 @@ impl NodeConfig {
         // A gateway may run with no bootstrap peers (isolated gateways are a
         // valid configuration), so only a peer that needs one fails here.
         if gateways.is_empty() && !config.is_gateway {
+            if !skipped_reasons.is_empty() {
+                const SHOWN: usize = 5;
+                let total = skipped_reasons.len();
+                let mut detail = skipped_reasons
+                    .iter()
+                    .take(SHOWN)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                if total > SHOWN {
+                    detail.push_str(&format!("; and {} more", total - SHOWN));
+                }
+                if let Some(error) = &unresolved_error {
+                    detail.push_str(&format!("; other gateways did not resolve: {error:#}"));
+                }
+                return Err(anyhow::anyhow!(
+                    "no configured gateway could be used ({total} skipped): {detail}"
+                ));
+            }
             if let Some(error) = unresolved_error {
                 return Err(error.context("no configured gateway address could be resolved"));
-            }
-            if let Some(error) = skipped_error {
-                return Err(error.context("no configured gateway could be used"));
             }
         }
         tracing::info!(
@@ -7420,15 +7440,74 @@ mod tests {
         let Err(err) = build(bad.clone(), "unusable-key-only", false).await else {
             panic!("with no usable gateway key, a non-gateway must still fail");
         };
+        let msg = format!("{err:#}");
         assert!(
-            format!("{err:#}").contains("no configured gateway could be used"),
-            "got: {err:#}"
+            msg.contains("no configured gateway could be used (5 skipped)"),
+            "got: {msg}"
         );
+        // Every distinct reason is reported, not just the last.
+        for reason in [
+            "invalid gateway pubkey length 31",
+            "invalid gateway pubkey length 33",
+            "failed to decode gateway pubkey hex",
+            "failed loading gateway pubkey",
+        ] {
+            assert!(msg.contains(reason), "missing {reason:?} in: {msg}");
+        }
 
         let gateway = build(bad, "unusable-key-gateway", true)
             .await
             .expect("a gateway with no usable bootstrap peer must still start");
         assert!(gateway.gateways.is_empty());
+    }
+
+    /// A gateway key that stays in the legacy RSA PEM format is skipped like
+    /// any other unusable key, and a non-gateway whose only gateway is such an
+    /// entry gets the clear error rather than a silently empty bootstrap list.
+    #[tokio::test]
+    async fn gateway_with_only_pem_key_fails_clearly_for_a_non_gateway() {
+        let dir = tempfile::tempdir().unwrap();
+        let pem_key = dir.path().join("pem.pub");
+        std::fs::write(
+            &pem_key,
+            "-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----\n",
+        )
+        .unwrap();
+        let build = |is_gateway: bool, id: &'static str| {
+            let pem_key = pem_key.clone();
+            async move {
+                let mut config = crate::config::ConfigArgs {
+                    id: Some(id.to_string()),
+                    mode: Some(crate::contract::OperationMode::Local),
+                    ..Default::default()
+                }
+                .build()
+                .await
+                .expect("build Config");
+                config.gateways = vec![GatewayConfig {
+                    address: Address::HostAddress("127.0.0.2:31337".parse().unwrap()),
+                    public_key_path: pem_key,
+                    location: None,
+                }];
+                config.is_gateway = is_gateway;
+                NodeConfig::new(config).await
+            }
+        };
+        let Err(err) = build(false, "pem-only-peer").await else {
+            panic!("a non-gateway whose only gateway key is PEM must fail");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("no configured gateway could be used") && msg.contains("RSA PEM"),
+            "got: {msg}"
+        );
+        assert!(
+            build(true, "pem-only-gateway")
+                .await
+                .expect("a gateway still starts")
+                .gateways
+                .is_empty()
+        );
     }
 
     // Hostname resolution tests
