@@ -4690,9 +4690,9 @@ async fn a_node_without_the_contract(
     // strictly closer nodes, so it never reaches the probe.
     //
     // This is a heuristic. It rests on a snapshot of node-a's connections (read
-    // from its diagnostics) taken before the PUT, and the code does not check that
-    // the network is fully connected or that routing picks the closest peer: the
-    // router also tries peers with no routing history first while it has few
+    // from its diagnostics) taken before the PUT, once node-a is connected to
+    // every other node. It does not check that the connections stay that way
+    // until the PUT, or that routing picks the closest peer: the router also tries peers with no routing history first while it has few
     // routing events. Earlier, without the snapshot, node-a's first hop was a
     // farther node in 1 of 116 PUTs because it was not connected to the gateway at
     // that moment. If the premise fails (connections change, or the router picks
@@ -4714,8 +4714,32 @@ async fn a_node_without_the_contract(
         let node = ctx.node(name)?;
         let (stream, _) = connect_async(&node.ws_url()).await?;
         let mut client = WebApi::start(stream);
-        let (own, peers) = node_ring_location(&mut client).await?;
+        let (own, mut peers) = node_ring_location(&mut client).await?;
         if *name == publisher_name {
+            // `health_check_readiness` only means each node answers; it does not
+            // mean the mesh has formed. Snapshotting node-a's connections before
+            // it has dialled its peers (seen as "node-a peers: [only node-d]"
+            // under CPU load) leaves the key search below no feasible key, or a
+            // premise that is stale by the time of the PUT. The harness targets
+            // a full mesh (min_connections = node_count - 1), so wait for it.
+            let expected = candidates.len() + 1; // every other node, gateway included
+            let deadline = std::time::Instant::now() + Duration::from_secs(300);
+            let distinct = |peers: &[(String, f64)]| {
+                peers
+                    .iter()
+                    .map(|(addr, _)| addr)
+                    .collect::<std::collections::HashSet<_>>()
+                    .len()
+            };
+            while distinct(&peers) < expected {
+                ensure!(
+                    std::time::Instant::now() < deadline,
+                    "{publisher_name} still has only {} of {expected} connections after 300s: {peers:?}",
+                    distinct(&peers)
+                );
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                peers = node_ring_location(&mut client).await?.1;
+            }
             publisher_peers = peers;
         }
         ring_positions.push((name.to_string(), own));
