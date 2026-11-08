@@ -266,10 +266,30 @@ pub(crate) const RETX_DEFER_LIMIT_RTOS: u32 = 1;
 /// RTO deadline, because an ack that resets the backoff moves every deadline
 /// earlier at once, so a resend just found due would count as long
 /// deferred.
+///
+/// It also holds the connection's booking in the retransmit share: a resend
+/// the share refuses books the next free slot instead of retrying, so the
+/// connections waiting on the share wake one per slot rather than all at
+/// once on the same deficit (with a herd, node-wide wakes grew with the
+/// connection count toward [`RETX_DEFER_MIN`]'s 500 a second each).
 #[derive(Debug, Default)]
 pub(crate) struct RetxDeferral {
     /// When the run of refusals started (the connection's time source, ns).
     refused_since: Option<u64>,
+    /// The share this connection has booked and not used. At most one; it
+    /// is used by the next take, or refunded when the run ends or the
+    /// resend goes uncapped. A connection that closes holding one loses
+    /// that one datagram of share.
+    booking: Option<RetxBooking>,
+}
+
+/// A booked slot in the retransmit share ([`RetxDeferral`]).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RetxBooking {
+    /// The share paid for it (ns on the share's meter).
+    share_ns: i64,
+    /// When the slot comes (ns on the cap's clock).
+    slot_ns: i64,
 }
 
 impl RetxDeferral {
@@ -286,7 +306,7 @@ impl RetxDeferral {
         let deferred_for = self.refused_since.map_or(Duration::ZERO, |since| {
             Duration::from_nanos(now_nanos.saturating_sub(since))
         });
-        let decision = cap.admit_retransmit(kind, bytes, deferred_for, rto);
+        let decision = cap.admit_retransmit(kind, bytes, deferred_for, rto, &mut self.booking);
         match decision {
             RetxAdmit::Take(_) => self.refused_since = None,
             RetxAdmit::Defer(_) => {
@@ -297,9 +317,38 @@ impl RetxDeferral {
         decision
     }
 
-    /// Nothing due was refused: the run, if any, is over.
-    pub(in crate::transport) fn end_run(&mut self) {
+    /// Tests only: the slot this connection has booked in the share.
+    #[cfg(test)]
+    pub(in crate::transport) fn booked_slot(&self) -> Option<i64> {
+        self.booking.map(|b| b.slot_ns)
+    }
+
+    /// Nothing due was refused: the run, if any, is over, and an unused
+    /// booking is handed back to `cap`.
+    pub(in crate::transport) fn end_run(&mut self, cap: Option<&EgressCap>) {
         self.refused_since = None;
+        if let (Some(booking), Some(cap)) = (self.booking.take(), cap) {
+            cap.refund_retx_share(booking.share_ns);
+        }
+    }
+}
+
+/// Why a retransmit take was refused, and how long until it would fit.
+#[derive(Debug, Clone, Copy)]
+enum RetxRefused {
+    /// The share is spent.
+    Share(Duration),
+    /// The bucket's debt would pass [`RETX_DEBT_LIMIT`].
+    Bucket(Duration),
+    /// The connection's booked slot has not come yet.
+    Slot(Duration),
+}
+
+impl RetxRefused {
+    fn wait(self) -> Duration {
+        match self {
+            Self::Share(wait) | Self::Bucket(wait) | Self::Slot(wait) => wait,
+        }
     }
 }
 
@@ -1118,25 +1167,76 @@ impl EgressCap {
     /// it once; a take dropped unsent gives back both the bucket and the
     /// share.
     pub(crate) fn try_take_retransmit(&self, bytes: usize) -> Result<EgressTake<'_>, Duration> {
+        self.take_retx(bytes, None).map_err(RetxRefused::wait)
+    }
+
+    /// The share's cost of a `bytes` retransmit and the share's window.
+    fn retx_share_cost(&self, bytes: usize) -> (i64, i64) {
+        let meter_cost = self.cost_ns(bytes as u64).saturating_mul(100)
+            / i64::try_from(retx_share_percent()).unwrap_or(100);
+        let window = i64::try_from(RETX_SHARE_WINDOW.as_nanos())
+            .unwrap_or(i64::MAX)
+            .max(meter_cost);
+        (meter_cost, window)
+    }
+
+    /// Book the next free slot in the share for a `bytes` retransmit: pay
+    /// for it now, whenever it comes ([`RetxDeferral`]). With `queue`, the
+    /// slot is no earlier than one datagram from now even if the share has
+    /// room (the bucket refused): the bookings then space the connections
+    /// out by the share's datagram time instead of all retrying on the
+    /// bucket's one deficit.
+    fn book_retx_share(&self, bytes: usize, queue: bool) -> RetxBooking {
+        let (meter_cost, window) = self.retx_share_cost(bytes);
+        let now = self.now();
+        let earliest = if queue {
+            now
+        } else {
+            now.saturating_sub(window)
+        };
+        let mut meter = self.retx_meter_empty_at_ns.load(Ordering::Acquire);
+        loop {
+            let slot = meter.max(earliest).saturating_add(meter_cost);
+            match self.retx_meter_empty_at_ns.compare_exchange_weak(
+                meter,
+                slot,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return RetxBooking {
+                        share_ns: meter_cost,
+                        slot_ns: slot,
+                    };
+                }
+                Err(current) => meter = current,
+            }
+        }
+    }
+
+    /// [`Self::try_take_retransmit`], with the share already paid
+    /// (`prepaid`, a booking whose slot has come) or not.
+    fn take_retx(&self, bytes: usize, prepaid: Option<i64>) -> Result<EgressTake<'_>, RetxRefused> {
         let cost = self.cost_ns(bytes as u64);
         // The retransmit share: a leaky bucket refilled at the share of the
         // rate, so this datagram costs `100 / share` times its cost at the
         // full rate. It holds RETX_SHARE_WINDOW, or one datagram if that is
         // more, so a cap too small for a datagram in a window of its share
         // (under about 2400 B/s) still admits retransmits at its share.
-        let meter_cost =
-            cost.saturating_mul(100) / i64::try_from(retx_share_percent()).unwrap_or(100);
-        let window = i64::try_from(RETX_SHARE_WINDOW.as_nanos())
-            .unwrap_or(i64::MAX)
-            .max(meter_cost);
+        let (meter_cost, window) = match prepaid {
+            Some(paid) => (paid, 0),
+            None => self.retx_share_cost(bytes),
+        };
         let now = self.now();
         let mut meter = self.retx_meter_empty_at_ns.load(Ordering::Acquire);
-        loop {
+        while prepaid.is_none() {
             let after = meter
                 .max(now.saturating_sub(window))
                 .saturating_add(meter_cost);
             if after > now {
-                return Err(Duration::from_nanos((after - now) as u64));
+                return Err(RetxRefused::Share(Duration::from_nanos(
+                    (after - now) as u64,
+                )));
             }
             match self.retx_meter_empty_at_ns.compare_exchange_weak(
                 meter,
@@ -1156,8 +1256,11 @@ impl EgressCap {
         };
         let (old, new, now) = self.update(|empty_at, now| fits(empty_at, now).ok());
         if let Err(over) = fits(old, now) {
-            self.refund_retx_share(meter_cost);
-            return Err(Duration::from_nanos(over as u64));
+            // A booking is kept for the retry; a share just taken is handed back.
+            if prepaid.is_none() {
+                self.refund_retx_share(meter_cost);
+            }
+            return Err(RetxRefused::Bucket(Duration::from_nanos(over as u64)));
         }
         let debt = self.bytes_for(new.saturating_sub(now));
         if debt > 0 {
@@ -1200,10 +1303,26 @@ impl EgressCap {
         bytes: usize,
         deferred_for: Duration,
         rto: Duration,
+        booking: &mut Option<RetxBooking>,
     ) -> RetxAdmit<'_> {
-        let wait = match self.try_take_retransmit(bytes) {
-            Ok(take) => return RetxAdmit::Take(take),
-            Err(wait) => wait,
+        let booked = booking.filter(|_| kind == ResendKind::Rto);
+        let attempt = match booked {
+            Some(b) if self.now() < b.slot_ns => Err(RetxRefused::Slot(Duration::from_nanos(
+                (b.slot_ns - self.now()).max(0) as u64,
+            ))),
+            Some(b) => self.take_retx(bytes, Some(b.share_ns)),
+            None => self.take_retx(bytes, None),
+        };
+        let refused = match attempt {
+            Ok(take) => {
+                if booked.is_some() {
+                    // The take now carries the booked share (refunded if
+                    // it is dropped unsent).
+                    *booking = None;
+                }
+                return RetxAdmit::Take(take);
+            }
+            Err(refused) => refused,
         };
         match kind {
             ResendKind::Probe => {
@@ -1213,20 +1332,39 @@ impl EgressCap {
             ResendKind::Rto => {
                 let limit = rto.saturating_mul(RETX_DEFER_LIMIT_RTOS);
                 if deferred_for >= limit {
+                    if let Some(b) = booking.take() {
+                        self.refund_retx_share(b.share_ns);
+                    }
                     TRANSPORT_METRICS.record_egress_retransmit_uncapped();
-                    RetxAdmit::Uncapped
-                } else {
-                    TRANSPORT_METRICS.record_egress_retransmit_deferred();
-                    RetxAdmit::Defer(
-                        wait.max(retx_defer_min(rto))
-                            .min(limit.saturating_sub(deferred_for)),
-                    )
+                    return RetxAdmit::Uncapped;
                 }
+                TRANSPORT_METRICS.record_egress_retransmit_deferred();
+                // A refusal books a slot in the share (a booked resend the
+                // bucket refused books again at the back), so the
+                // connections waiting wake one per slot, not all together.
+                let wait = match refused {
+                    RetxRefused::Slot(wait) => wait,
+                    RetxRefused::Share(_) | RetxRefused::Bucket(_) => {
+                        if let Some(old) = booking.take() {
+                            self.refund_retx_share(old.share_ns);
+                        }
+                        let queue = matches!(refused, RetxRefused::Bucket(_));
+                        let b = self.book_retx_share(bytes, queue);
+                        *booking = Some(b);
+                        let slot = Duration::from_nanos((b.slot_ns - self.now()).max(0) as u64);
+                        slot.max(refused.wait())
+                    }
+                };
+                RetxAdmit::Defer(
+                    wait.max(retx_defer_min(rto))
+                        .min(limit.saturating_sub(deferred_for)),
+                )
             }
         }
     }
 
-    /// Hand back a retransmit's share ([`Self::try_take_retransmit`]) when
+    /// Hand back a retransmit's share ([`Self::try_take_retransmit`], or a
+    /// booking) when
     /// its datagram was not sent.
     fn refund_retx_share(&self, meter_cost: i64) {
         if meter_cost > 0 {

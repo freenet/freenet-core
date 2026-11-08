@@ -2099,7 +2099,8 @@ fn a_refused_resend_is_deferred_at_most_one_rto_then_sent_uncapped() {
     // Hold the bucket a second in debt: far past the retransmit limit.
     cap.charge_unpaced(BURST as usize + RATE as usize);
     let rto = Duration::from_millis(500);
-    let take = |kind, deferred_for| cap.admit_retransmit(kind, PACKET, deferred_for, rto);
+    let take =
+        |kind, deferred_for| cap.admit_retransmit(kind, PACKET, deferred_for, rto, &mut None);
     let deferral = |decision: RetxAdmit<'_>| match decision {
         RetxAdmit::Defer(wait) => wait,
         other @ (RetxAdmit::Take(_) | RetxAdmit::Uncapped | RetxAdmit::SkipProbe) => {
@@ -2212,7 +2213,7 @@ fn a_retransmit_not_sent_hands_back_its_share() {
 #[test]
 fn the_deferral_limit_counts_a_connection_run_of_refusals() {
     use crate::transport::sent_packet_tracker::ResendKind;
-    let (cap, _time) = cap_at(RATE);
+    let (cap, time) = cap_at(RATE);
     cap.charge_unpaced(BURST as usize + RATE as usize);
     let rto = Duration::from_millis(500);
     let ms = |n: u64| n * 1_000_000;
@@ -2237,19 +2238,146 @@ fn the_deferral_limit_counts_a_connection_run_of_refusals() {
         RetxAdmit::Uncapped
     ));
     // Nothing due was refused: the next refusal starts a new run.
-    run.end_run();
+    run.end_run(Some(&cap));
     assert!(matches!(
         run.admit(&cap, ResendKind::Rto, PACKET, rto, ms(20_000)),
         RetxAdmit::Defer(_)
     ));
-    // A take ends the run too.
-    let (free, _t) = cap_at(RATE);
+    // A take ends the run too: once the debt has drained the booked slot
+    // is taken, and a refusal after that starts a new run.
+    time.advance(Duration::from_secs(2));
     assert!(matches!(
-        run.admit(&free, ResendKind::Rto, PACKET, rto, ms(30_000)),
+        run.admit(&cap, ResendKind::Rto, PACKET, rto, ms(30_000)),
         RetxAdmit::Take(_)
     ));
+    cap.charge_unpaced(BURST as usize + RATE as usize);
     assert!(matches!(
         run.admit(&cap, ResendKind::Rto, PACKET, rto, ms(30_001)),
         RetxAdmit::Defer(_)
     ));
+}
+
+/// `count` connections, each always holding a due RTO resend, on one cap
+/// whose share binds (1 MB/s: 500 kB/s of retransmits), for one second.
+/// Returns how many times the connections' resend arms woke.
+fn herd_wakes(count: usize) -> u64 {
+    use crate::transport::sent_packet_tracker::ResendKind;
+    let (cap, time) = cap_at(RATE);
+    // A long RTO, so no run reaches the deferral limit: this measures waking.
+    let rto = Duration::from_secs(60);
+    let mut runs: Vec<RetxDeferral> = (0..count).map(|_| RetxDeferral::default()).collect();
+    let start = time.now_nanos();
+    let end = start + 1_000_000_000;
+    let mut due: std::collections::BinaryHeap<std::cmp::Reverse<(u64, usize)>> =
+        (0..count).map(|i| std::cmp::Reverse((start, i))).collect();
+    let mut wakes = 0;
+    while let Some(std::cmp::Reverse((at, i))) = due.pop() {
+        if at >= end {
+            break;
+        }
+        time.advance(Duration::from_nanos(at.saturating_sub(time.now_nanos())));
+        wakes += 1;
+        let next = match runs[i].admit(&cap, ResendKind::Rto, PACKET, rto, at) {
+            RetxAdmit::Take(take) => {
+                take.sent(PACKET);
+                at
+            }
+            RetxAdmit::Defer(wait) => at + u64::try_from(wait.as_nanos()).unwrap(),
+            other @ (RetxAdmit::Uncapped | RetxAdmit::SkipProbe) => {
+                panic!("unexpected {other:?}")
+            }
+        };
+        due.push(std::cmp::Reverse((next.max(at + 1), i)));
+    }
+    wakes
+}
+
+/// Connections waiting on the share wake one per booked slot, so node-wide
+/// wakes stay near one per admitted datagram however many connections wait.
+/// Without the booking each refused connection woke every `RETX_DEFER_MIN`
+/// (500 a second each), so 256 connections woke 16 times as often as 16.
+#[test]
+fn share_waiters_wake_once_per_slot_whatever_their_number() {
+    let few = herd_wakes(16);
+    let many = herd_wakes(256);
+    eprintln!("wakes in a second: 16 connections {few}, 256 connections {many}");
+    assert!(
+        many <= 2 * few,
+        "256 connections woke {many} times in a second, 16 woke {few}"
+    );
+}
+
+/// A booking cannot leak: it is handed back when the run ends (which is
+/// also what an ack of the booked packet leads to: nothing due is refused),
+/// when its take is dropped unsent, and when the resend goes uncapped. A
+/// connection that closes holding one loses only that one datagram.
+#[test]
+fn a_booking_is_handed_back_or_costs_one_datagram() {
+    use crate::transport::sent_packet_tracker::ResendKind;
+    let rto = Duration::from_millis(500);
+    // A cap whose share is spent and a connection booked into it.
+    let booked = || {
+        let (cap, time) = cap_at(RATE);
+        exhaust_retx_share(&cap, &time, Duration::from_millis(2));
+        let mut a = RetxDeferral::default();
+        let now = time.now_nanos();
+        assert!(matches!(
+            a.admit(&cap, ResendKind::Rto, PACKET, rto, now),
+            RetxAdmit::Defer(_)
+        ));
+        let slot = a.booked_slot().expect("booked");
+        (cap, time, a, slot)
+    };
+    // The slot the next booking gets: right after `slot` if that booking
+    // still holds its share, at `slot` itself if it was handed back.
+    let next_slot = |cap: &EgressCap| cap.book_retx_share(PACKET, false).slot_ns;
+    let one = cap_at(RATE).0.retx_share_cost(PACKET).0;
+
+    // Run end.
+    let (cap, _time, mut a, slot) = booked();
+    a.end_run(Some(&cap));
+    assert_eq!(a.booked_slot(), None);
+    assert_eq!(next_slot(&cap), slot, "run end hands the booking back");
+
+    // Its take dropped unsent (the slot has come).
+    let (cap, time, mut a, slot) = booked();
+    time.advance(Duration::from_nanos(
+        u64::try_from(slot - time.now_nanos() as i64).unwrap(),
+    ));
+    match a.admit(&cap, ResendKind::Rto, PACKET, rto, time.now_nanos()) {
+        RetxAdmit::Take(take) => drop(take),
+        other => panic!("the slot has come: expected a take, got {other:?}"),
+    }
+    assert_eq!(a.booked_slot(), None, "the take carries the booking");
+    assert_eq!(next_slot(&cap), slot, "a dropped take hands it back");
+
+    // Sent, by contrast, it keeps its slot.
+    let (cap, time, mut a, slot) = booked();
+    time.advance(Duration::from_nanos(
+        u64::try_from(slot - time.now_nanos() as i64).unwrap(),
+    ));
+    match a.admit(&cap, ResendKind::Rto, PACKET, rto, time.now_nanos()) {
+        RetxAdmit::Take(take) => take.sent(PACKET),
+        other => panic!("expected a take, got {other:?}"),
+    }
+    assert_eq!(next_slot(&cap), slot + one);
+
+    // Uncapped (the run has lasted one RTO).
+    let (cap, time, mut a, slot) = booked();
+    let at_limit = time.now_nanos() + 500_000_000;
+    assert!(matches!(
+        a.admit(&cap, ResendKind::Rto, PACKET, rto, at_limit),
+        RetxAdmit::Uncapped
+    ));
+    assert_eq!(a.booked_slot(), None);
+    assert_eq!(next_slot(&cap), slot, "uncapped hands the booking back");
+
+    // Closed holding it: that one datagram, no more.
+    let (cap, _time, a, slot) = booked();
+    drop(a);
+    assert_eq!(
+        next_slot(&cap),
+        slot + one,
+        "a closed connection loses one datagram"
+    );
 }

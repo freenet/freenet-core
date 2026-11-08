@@ -3501,7 +3501,7 @@ pub(in crate::transport) mod tests {
             match action {
                 ResendAction::WaitUntil(at) => {
                     if !refused {
-                        run.end_run();
+                        run.end_run(Some(&cap));
                     }
                     tracker
                         .time_source
@@ -3532,5 +3532,51 @@ pub(in crate::transport) mod tests {
             "abandoned after {elapsed:?}, bound {bound:?}"
         );
         assert_eq!(tracker.pending_len(), 0, "flight released");
+    }
+
+    /// A booking in the share is handed back when its packet is acked: the
+    /// resend arm then finds nothing due refused and ends the run (as
+    /// `PeerConnection::recv` does on a `WaitUntil` with nothing deferred),
+    /// so the next connection to book gets the acked packet's slot.
+    #[test]
+    fn an_acked_booking_is_handed_back() {
+        use crate::transport::egress_cap::{EgressCap, RetxAdmit, RetxDeferral};
+        let cap_time = VirtualTime::new();
+        let cap = EgressCap::new(1_000_000, cap_time.clone());
+        // Spend the share (500 kB in its 1 s window), keeping the bucket
+        // clear of its debt limit.
+        while let Ok(take) = cap.try_take_retransmit(1_200) {
+            take.sent(1_200);
+            cap_time.advance(Duration::from_millis(2));
+        }
+        let mut tracker = mock_sent_packet_tracker();
+        tracker.report_sent_packet(1, vec![0u8; 1_200].into());
+        tracker.time_source.advance(tracker.effective_rto());
+        let rto = tracker.effective_rto();
+        let mut run = RetxDeferral::default();
+        let arm = |tracker: &mut SentPacketTracker<VirtualTime>, run: &mut RetxDeferral| {
+            let now = tracker.time_source.now_nanos();
+            let mut refused = false;
+            let action = tracker.get_resend_admitted(|kind, len| {
+                match run.admit(&cap, kind, len, rto, now) {
+                    RetxAdmit::Defer(wait) => {
+                        refused = true;
+                        Err(wait)
+                    }
+                    other => panic!("expected a deferral, got {other:?}"),
+                }
+            });
+            if matches!(action, ResendAction::WaitUntil(_)) && !refused {
+                run.end_run(Some(&cap));
+            }
+        };
+        arm(&mut tracker, &mut run);
+        let slot = run.booked_slot().expect("booked");
+        let _ = tracker.report_received_receipts(&[1]);
+        arm(&mut tracker, &mut run);
+        assert_eq!(run.booked_slot(), None, "the run ended with the ack");
+        let mut other = RetxDeferral::default();
+        let _ = other.admit(&cap, ResendKind::Rto, 1_200, rto, 0);
+        assert_eq!(other.booked_slot(), Some(slot), "its slot was handed back");
     }
 }

@@ -2488,7 +2488,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                                 } else {
                                     // Nothing due was refused: a run of
                                     // refusals, if any, is over.
-                                    self.retx_deferral.end_run();
+                                    self.retx_deferral.end_run(cap);
                                 }
                                 self.recv_timers.resend.arm_at(deadline_nanos);
                                 break;
