@@ -75,8 +75,8 @@ pub const SWEEP_MAX_GAP_INTERVAL_MULTIPLE: u64 = 8;
 /// Delegate execution is SERIAL: every delegate `process()` and the live
 /// secret import run on the node's one delegate executor under its lock
 /// (`RuntimePool`'s `PooledDelegateRunner`; before the delegate lane this was
-/// the contract loop), so only one `store_secret` runs at a time node-wide and the increment/decrement are never actually
-/// contended and a plain map would suffice for correctness. The per-user value
+/// the contract loop), so only one `store_secret` runs at a time node-wide
+/// and the increment/decrement are never actually contended and a plain map would suffice for correctness. The per-user value
 /// is held as an [`AtomicU64`](std::sync::atomic::AtomicU64) as cheap insurance
 /// (and so reads never need the `DashMap` write path), but no compare-and-swap
 /// is required precisely because of that serial-execution guarantee.

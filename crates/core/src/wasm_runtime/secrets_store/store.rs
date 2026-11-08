@@ -1789,9 +1789,10 @@ impl SecretsStore {
     /// delegate executor (`PooledDelegateRunner`) and the hosted export runs
     /// on a POOLED executor. Without this, every delegate registered after
     /// startup would export with the placeholder. ReDb is shared and written
-    /// before the in-memory mirror. One prefix lookup per delegate directory
-    /// found on disk, filtered to the requesting user for a user scope, so the
-    /// cost is the caller's own data, not every user's.
+    /// before the in-memory mirror. One prefix scan per delegate directory
+    /// found on disk. For a user scope the scan visits that delegate key's
+    /// rows for ALL users and keeps the requesting user's, so the cost is
+    /// bounded by the key's rows, not the whole index.
     fn code_hash_from_db(&self, key: &[u8; 32], scope: &SecretScope<'_>) -> Option<CodeHash> {
         let user = match scope {
             SecretScope::Local => None,
@@ -2597,7 +2598,7 @@ impl SecretsStore {
     /// the next registration (and picked up if its secrets arrive later); this
     /// also denies a client the ability to drive marker writes with bogus keys.
     ///
-    /// Designed to run synchronously on the contract loop, mirroring the on-loop
+    /// Designed to run synchronously on the delegate executor, mirroring the
     /// write discipline of `store_secret` / the live bundle import. The work is
     /// bounded by the predecessors' own on-disk secret count.
     ///

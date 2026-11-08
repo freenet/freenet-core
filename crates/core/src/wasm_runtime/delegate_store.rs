@@ -132,8 +132,9 @@ impl DelegateStore {
                 // (`ensure_reg_file`). Never a record itself. Deleting it
                 // unconditionally relies on no `ensure_reg_file` being in
                 // flight while a store is built over this directory: both run
-                // on the contract loop (registration, replacement executors)
-                // or before it starts (pool start-up), one at a time.
+                // under the one delegate executor's lock (registration on the
+                // executor, a replacement built while the lock is held) or
+                // before it exists (pool start-up), one at a time.
                 if path
                     .file_name()
                     .and_then(|n| n.to_str())

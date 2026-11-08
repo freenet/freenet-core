@@ -1649,8 +1649,10 @@ impl ReDb {
 
     /// The code hashes recorded for the 32-byte delegate key `key` in the
     /// secrets index: in the single-user table when `user` is `None`, else in
-    /// the per-user table for that user only. A prefix range scan over this
-    /// key's rows, so the cost is this key's rows, never the whole table.
+    /// the per-user table, keeping only `user`'s rows. A prefix range scan
+    /// over this key's rows: in the per-user table that visits the key's rows
+    /// for EVERY user and filters them, so the cost is all of this key's rows,
+    /// never the whole table.
     /// Used by the secrets export to recover a delegate's real code hash
     /// (`SecretsStore::walk_scope_secrets_on_disk`).
     pub fn code_hashes_for_delegate(

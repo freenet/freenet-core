@@ -1038,8 +1038,9 @@ impl RuntimePool {
                 total = status.total,
                 replacements = status.replacements,
                 delegate_replacements = status.delegate_replacements,
-                "RuntimePool health status (degraded - {} replacements)",
-                status.replacements
+                "RuntimePool health status (degraded - {} contract and {} delegate replacements)",
+                status.replacements,
+                status.delegate_replacements
             );
         }
     }
@@ -1954,12 +1955,6 @@ mod tests {
     use std::num::NonZeroUsize;
     use std::sync::Arc;
 
-    /// A call that PANICS out of `with_executor`'s closure leaves the
-    /// delegate executor marked suspect, so the next call replaces it before
-    /// running; a call that returns does not.
-    ///
-    /// FALSIFY: give `SuspectCall` a `Drop` that clears the flag (a panic then
-    /// clears it too), or have `begin` not set it.
     /// Through the call protocol: after a call PANICKED, a failed replacement
     /// refuses the next call (it does not run on the executor left mid-call)
     /// and keeps the mark, so the call after that retries; a successful
@@ -2028,6 +2023,12 @@ mod tests {
         assert!(flag.is_set(), "a cancelled replacement leaves the mark set");
     }
 
+    /// A call that PANICS out of `with_executor`'s closure leaves the
+    /// delegate executor marked suspect, so the next call replaces it before
+    /// running; a call that returns does not.
+    ///
+    /// FALSIFY: give `SuspectCall` a `Drop` that clears the flag (a panic then
+    /// clears it too), or have `begin` not set it.
     #[test]
     fn a_call_that_panics_leaves_the_executor_suspect() {
         let flag = SuspectFlag::default();
