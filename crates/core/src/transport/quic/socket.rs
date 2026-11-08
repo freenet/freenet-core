@@ -50,10 +50,22 @@ use crate::transport::egress_cap::AdmissionWaiter;
 use crate::transport::metrics::TRANSPORT_METRICS;
 use crate::transport::{Socket, normalize_mapped_addr};
 
-/// QUIC transmits the egress cap is holding, node-wide: quinn has built
-/// them (their frames are counted in its stats) but they have not been
+/// One connection's QUIC transmits the egress cap is holding: quinn has
+/// built them (their frames are counted in its stats) but they have not been
 /// sent. The path's acknowledgement watch (`recycle`) runs no window while
-/// one is held, since a send it counted may not have left yet.
+/// one is held, since a send it counted may not have left yet, and the stall
+/// count and a send's gap (`path`) read a hold as the connection moving, but
+/// only within the window after the connection's last acknowledgement.
+///
+/// Per connection, never node-wide: on a node whose cap binds, some
+/// connection's transmit is held nearly all the time, and a node-wide count
+/// read as progress would keep every path, a dark one included, from ever
+/// timing out. quinn builds one poller per connection, inside
+/// `Endpoint::connect_with` or `Incoming::accept_with`; the endpoint makes
+/// the connection's record and hands it to that poller with
+/// [`with_poller_holds`]. A connection whose transmits are held still has
+/// holds of its own when it is dark (its probes wait for the cap too), but
+/// those are as sparse as its probes, which back off.
 ///
 /// A hold is a poller whose `poll_writable` the cap answered `Pending`.
 /// Waiting for the kernel's send buffer (`poll_send_ready` pending, no cap
@@ -77,6 +89,14 @@ pub(crate) struct CapHolds {
     holds: AtomicU64,
     /// [`cap_hold_validity`] of the cap's rate; zero without a cap.
     validity: Duration,
+    /// [`cap_transmit_wait`] of the cap's rate; zero without a cap.
+    longest_wait: Duration,
+    /// Pollers built with no record of their own (outside
+    /// [`with_poller_holds`]). Counted only on the socket's empty template
+    /// record, which every connection's record is made from, so it is per
+    /// endpoint: a test reads its own endpoint's count
+    /// (`QuicEndpoint::fallback_pollers`), never a process-wide one.
+    fallback_pollers: AtomicU64,
 }
 
 /// What [`CapHolds::read`] returns.
@@ -85,21 +105,37 @@ pub(crate) struct CapHoldReading {
     pub(crate) holds: u64,
     pub(crate) held_now: bool,
     pub(crate) validity: Duration,
+    /// [`cap_transmit_wait`] of the cap's rate; zero without a cap.
+    pub(crate) longest_wait: Duration,
 }
 
 /// The margin [`cap_hold_validity`] puts on the longest wait the cap can
 /// give one QUIC transmit, for the time from a waiter's timer to its poll.
 pub(crate) const CAP_HOLD_VALIDITY_MARGIN: u32 = 2;
 
+/// The longest the cap makes one waiting transmit wait before its poller is
+/// polled again, for a cap of `rate_bytes_per_sec`: the cap's debt limit
+/// (unpaced sends may run the bucket that far into debt) plus one datagram's
+/// refill for every waiter its timer counts ahead of it (at most
+/// `MAX_ADMISSION_WAKERS`, however long the queue: the stagger is clamped
+/// there) and for its own. About 19.8 s at 64 KiB/s, 13.3 s
+/// at 100 kB/s, 2.2 s at 1 MB/s. The one derivation of that wait:
+/// [`cap_hold_validity`] puts a margin on it, and the stall count and a send's
+/// gap credit a hold for it after the connection's last acknowledgement
+/// (`path::route::hold_credit`).
+pub(crate) fn cap_transmit_wait(rate_bytes_per_sec: u64) -> Duration {
+    use crate::transport::egress_cap::{DEBT_LIMIT, MAX_ADMISSION_WAKERS, WAKE_DATAGRAM_BYTES};
+    let queued = (MAX_ADMISSION_WAKERS as u64 + 1) * WAKE_DATAGRAM_BYTES as u64;
+    let refill = Duration::from_secs_f64(queued as f64 / rate_bytes_per_sec.max(1) as f64);
+    DEBT_LIMIT + refill
+}
+
 /// How long a hold stays valid with no new hold event, for a cap of
-/// `rate_bytes_per_sec`: [`CAP_HOLD_VALIDITY_MARGIN`] times the longest the
-/// cap makes one waiting transmit wait before its poller is polled again.
-/// That is the cap's debt limit (unpaced sends may run the bucket that far
-/// into debt) plus one datagram's refill for every waiter its timer counts
-/// ahead of it (at most `MAX_ADMISSION_WAKERS`, however long the queue: the
-/// stagger is clamped there) and for its own. A held poller of a
-/// live connection is polled again within that, at its timer; one that is
-/// not was left behind by a connection that ended.
+/// `rate_bytes_per_sec`: [`CAP_HOLD_VALIDITY_MARGIN`] times
+/// [`cap_transmit_wait`], the longest the cap makes one waiting transmit wait
+/// before its poller is polled again. A held poller of a live connection is
+/// polled again within that, at its timer; one that is not was left behind by
+/// a connection that ended.
 ///
 /// The tail is long at low rates: about 4 min at 10 KB/s, 27 s at
 /// 100 KB/s, under 5 s at 1 MB/s. For that long a left-behind hold still
@@ -108,10 +144,7 @@ pub(crate) const CAP_HOLD_VALIDITY_MARGIN: u32 = 2;
 /// `connection_handler` already requires a QUIC endpoint to share the cap's
 /// clock before it uses the cap.
 pub(crate) fn cap_hold_validity(rate_bytes_per_sec: u64) -> Duration {
-    use crate::transport::egress_cap::{DEBT_LIMIT, MAX_ADMISSION_WAKERS, WAKE_DATAGRAM_BYTES};
-    let queued = (MAX_ADMISSION_WAKERS as u64 + 1) * WAKE_DATAGRAM_BYTES as u64;
-    let refill = Duration::from_secs_f64(queued as f64 / rate_bytes_per_sec.max(1) as f64);
-    (DEBT_LIMIT + refill).saturating_mul(CAP_HOLD_VALIDITY_MARGIN)
+    cap_transmit_wait(rate_bytes_per_sec).saturating_mul(CAP_HOLD_VALIDITY_MARGIN)
 }
 
 impl CapHolds {
@@ -120,6 +153,16 @@ impl CapHolds {
     pub(crate) fn new(cap_rate: Option<u64>) -> Self {
         Self {
             validity: cap_rate.map(cap_hold_validity).unwrap_or_default(),
+            longest_wait: cap_rate.map(cap_transmit_wait).unwrap_or_default(),
+            ..Self::default()
+        }
+    }
+
+    /// Empty records for the same cap: another connection's.
+    pub(crate) fn like(&self) -> Self {
+        Self {
+            validity: self.validity,
+            longest_wait: self.longest_wait,
             ..Self::default()
         }
     }
@@ -138,22 +181,93 @@ impl CapHolds {
         self.held_now.fetch_sub(1, Ordering::AcqRel);
     }
 
+    /// The cap starts holding one more poller, as a poll answered `Pending`
+    /// records it. Tests only.
+    #[cfg(test)]
+    pub(crate) fn hold_one(&self) {
+        self.waiting(false);
+    }
+
+    /// A held poller was admitted. Tests only.
+    #[cfg(test)]
+    pub(crate) fn release_one(&self) {
+        self.release();
+    }
+
+    /// Pollers built outside [`with_poller_holds`] from this template
+    /// record's socket. Tests only; production logs a warning per poller.
+    #[cfg(test)]
+    pub(crate) fn fallback_pollers(&self) -> u64 {
+        self.fallback_pollers.load(Ordering::Relaxed)
+    }
+
     /// The hold events so far, whether a poller is held now, and how long a
     /// hold stays valid with no new event.
     pub(crate) fn read(&self) -> CapHoldReading {
+        // `holds` is read Relaxed before `held_now`, so on a weak memory model
+        // a reader on another thread can see a slightly stale `holds`. It only
+        // ever grows, so a stale value reads as "no new hold yet", which the
+        // next reading corrects.
         let holds = self.holds.load(Ordering::Relaxed);
         CapHoldReading {
             holds,
             held_now: self.held_now.load(Ordering::Acquire) > 0,
             validity: self.validity,
+            longest_wait: self.longest_wait,
         }
     }
+}
+
+thread_local! {
+    /// The record [`with_poller_holds`] hands to the poller quinn creates in
+    /// its call. A thread-local works only because quinn 0.11.12 (pinned
+    /// `=0.11.12`) calls `create_io_poller` synchronously, on the calling
+    /// thread, inside `Endpoint::connect_with` and `Incoming::accept_with`
+    /// (`ConnectionRef::new`), and otherwise only on a rebind, which needs
+    /// migration, which is off. A quinn bump must re-check both; a poller
+    /// built anywhere else is counted (`CapHolds::fallback_pollers`) and its
+    /// connection's holds go unseen.
+    static NEXT_POLLER_HOLDS: std::cell::RefCell<Option<Arc<CapHolds>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The record [`with_poller_holds`] has set on this thread now. Tests only.
+#[cfg(test)]
+pub(crate) fn next_poller_holds() -> Option<Arc<CapHolds>> {
+    NEXT_POLLER_HOLDS.with(|next| next.borrow().clone())
+}
+
+/// Run `f`, which creates one quinn connection (`Endpoint::connect_with` or
+/// `Incoming::accept_with`), so that the poller quinn creates for it, on this
+/// thread inside the call, counts its holds in `holds`.
+///
+/// Depends on quinn 0.11.12 (pinned `=0.11.12`): `ConnectionRef::new` calls
+/// `create_io_poller` synchronously inside both calls, and the only other
+/// caller is a rebind, which needs migration, which is off. Re-check both
+/// before bumping quinn; a poller built with no record set logs a warning
+/// and is counted on the socket's template record
+/// ([`CapHolds::fallback_pollers`]), which the path tests assert stays 0 for
+/// their endpoints.
+pub(crate) fn with_poller_holds<R>(holds: &Arc<CapHolds>, f: impl FnOnce() -> R) -> R {
+    /// Puts back what the slot held before, however `f` ends, a panic
+    /// included, so a nested call does not lose the outer one's record.
+    struct Restore(Option<Arc<CapHolds>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let previous = self.0.take();
+            NEXT_POLLER_HOLDS.with(|next| *next.borrow_mut() = previous);
+        }
+    }
+    let previous = NEXT_POLLER_HOLDS.with(|next| next.borrow_mut().replace(holds.clone()));
+    let _restore = Restore(previous);
+    f()
 }
 
 /// The QUIC endpoint's socket. See the module docs.
 pub(crate) struct QuicSocket<S> {
     socket: Arc<DemuxSocket<S>>,
-    /// Transmits the egress cap holds, shared with every connection's path.
+    /// Empty hold records for this socket's cap, copied for each connection
+    /// ([`CapHolds::like`]); never counted into.
     cap_holds: Arc<CapHolds>,
     /// Only quinn's endpoint driver receives, one call at a time; the lock
     /// is never contended.
@@ -290,7 +404,8 @@ impl<S> fmt::Debug for QuicSocket<S> {
 }
 
 impl<S: Socket> QuicSocket<S> {
-    /// The transmits the egress cap holds, for the paths' watches.
+    /// Empty hold records for this socket's cap, from which each connection's
+    /// own is made ([`CapHolds::like`], [`with_poller_holds`]).
     pub(crate) fn cap_holds(&self) -> Arc<CapHolds> {
         self.cap_holds.clone()
     }
@@ -393,7 +508,28 @@ impl<S: Socket> QuicSocket<S> {
 
 impl<S: Socket> AsyncUdpSocket for QuicSocket<S> {
     fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn UdpPoller>> {
+        let holds = NEXT_POLLER_HOLDS
+            .with(|next| next.borrow_mut().take())
+            .unwrap_or_else(|| {
+                // Only a poller built outside `with_poller_holds`, which quinn
+                // 0.11.12 does only on a rebind (migration is off), gets here;
+                // its holds go into a record nobody reads, so the stall count,
+                // send gaps and ack watch of its connection would see none.
+                // Counted, not asserted: this runs under quinn's endpoint
+                // lock, and a panic there poisons it and aborts the process
+                // (see "NOT CONTAINED" in the transport rules). Tests read the
+                // count per endpoint.
+                self.cap_holds
+                    .fallback_pollers
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    "QUIC: a connection's poller was built outside with_poller_holds; \
+                     its egress cap holds will not be seen"
+                );
+                Arc::new(self.cap_holds.like())
+            });
         Box::pin(QuicPoller {
+            holds,
             socket: self,
             waiter: std::sync::Mutex::new(AdmissionWaiter::default()),
             held: false,
@@ -637,6 +773,8 @@ fn take_handed_admission(cap: &crate::transport::egress_cap::EgressCap) -> Optio
 /// can take a send and the egress cap holds a full datagram.
 struct QuicPoller<S> {
     socket: Arc<QuicSocket<S>>,
+    /// Its connection's hold records ([`with_poller_holds`]).
+    holds: Arc<CapHolds>,
     /// Behind a mutex only so the poller is `Sync`, which quinn requires;
     /// `poll_writable` has `&mut self` and uses `get_mut`, so it is never
     /// locked.
@@ -649,9 +787,9 @@ impl<S> QuicPoller<S> {
     /// Record the cap's answer to this poll ([`CapHolds`]).
     fn record_admission(&mut self, waiting: bool) {
         if waiting {
-            self.socket.cap_holds.waiting(self.held);
+            self.holds.waiting(self.held);
         } else if self.held {
-            self.socket.cap_holds.release();
+            self.holds.release();
         }
         self.held = waiting;
     }
@@ -660,7 +798,7 @@ impl<S> QuicPoller<S> {
 impl<S> Drop for QuicPoller<S> {
     fn drop(&mut self) {
         if self.held {
-            self.socket.cap_holds.release();
+            self.holds.release();
         }
     }
 }

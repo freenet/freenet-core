@@ -853,7 +853,12 @@ Rate calculation on every rate update (peer_connection::paced_rate; #6047):
   packet. Not charged, as on UDP: one-packet Shorts and control frames,
   which never wait behind data. With no limit nothing is paced. A write
   reserves with reserve_within, limited to what the send's current deadline
-  leaves, and waits in the send's own task; a refused reservation takes
+  leaves for its stage (with the stream open, its own gap, never the
+  connection's window: bounded::SendProgress::time_left; the window would let
+  the queue hold about 10 s of the rate instead of 5 s, refusing more opens;
+  a wait for a pipe's source is not a step, so after a slow chunk the next
+  write may be offered little and refused mid-stream, as in #6126),
+  and waits in the send's own task; a refused reservation takes
   nothing and ends the send NotOpened(Paced) before the stream opened
   (header and metadata are taken before open_uni) or Failed(Paced) after
   (the stream is reset). A message the pacer refused that UDP then sent is
@@ -1828,6 +1833,55 @@ Sending (QuicPath::send_short_bounded / send_stream_bounded /
   (STREAM_INACTIVITY_TIMEOUT) and inbound_stream_age_limit(len); a plain
   Duration is one deadline for all of it. A send from a source waits for the
   first chunk for the gap, counted in total, and open runs from when it arrives.
+  The gap is judged on CONNECTION progress (bounded::ConnectionWatch): a node
+  send runs out of gap only once its own gap has passed AND nothing on the
+  connection was newly acknowledged (recycle::AckProgress) for
+  STALL_PROGRESS_WINDOW (10 s), the stall count's rule. An egress cap hold of
+  this connection's transmit (recycle::cap_held, its own record) also counts,
+  but only within route::hold_credit of the connection's last acknowledgement:
+  the window, or socket::cap_transmit_wait (the longest one transmit can wait
+  at the cap, the derivation cap_hold_validity also uses) if longer. That is
+  10 s at 1 MB/s, about 13.3 s at 100 kB/s, about 19.8 s at 64 KiB/s, about
+  124 s at 10 kB/s and about 6.8 h at 50 B/s. The last acknowledgement is the
+  path's record (QuicPath::last_acked), kept by the stall count at settles and
+  by every send's watch at its wakes, so a new send whose first transmits wait
+  past its gap in a deep cap queue on a live path is credited. The record
+  holds the count with the time (bounded::AckRecord), so a count it has not
+  seen (an acknowledgement after the last settle or wake) is dated at the new
+  send's start rather than missed. A connection
+  nothing has acknowledged for the credit gets nothing from holds: a dark
+  connection's own probes wait for a saturated cap too, and counted without
+  that limit they kept a dark send going for 32 s. For the
+  credit after its last ack a dark path's own held probes do still count (on
+  main they counted for as long as they were held). Under random loss the 384 KiB send window drains at Cubic's window per
+  round trip, so writes wait past 5 s while acks still arrive; failing them
+  reset streams the peer was receiving (E5B9-LAB, 8 MiB at 5% loss and 200 ms
+  failed). The connection is read at the timer's wakes, so a send that stops
+  moving ends at its own gap or within 2 x STALL_PROGRESS_WINDOW of the last
+  move, never past total. It gives nothing until a wake during the send has
+  seen a move, so a path dark before the send fails it at 5 s with no cap
+  holding its transmits; where the cap holds them, at most at the record's
+  last acknowledgement plus hold_credit plus one window (after an idle
+  spell, a capped path that went dark gets one such credit from its first
+  new send, whose start dates the keepalive acknowledgements from before it
+  went dark); a path that
+  goes dark mid-send fails it at 12 to 22 s (its own early acknowledgements
+  are a move; 22 s when one lands just after the 2 s first wake; pinned at
+  12 s by
+  a_path_dark_mid_send_fails_within_two_windows_and_goes_suspect). Nothing
+  while the send waits for its own source (the connection is not what holds
+  it; a stalled source is bounded by the send's own gap, as pipe_stream's 5 s
+  upstream inactivity bounds it on UDP; the receiver's QUIC reader idles at
+  30 s in production. A SeqCst flag handshake wakes the loop to re-arm when
+  that drops an extended deadline, once: a timer already armed at the own gap
+  is not re-armed), and nothing without a CappedCubic
+  controller. Control sends have no gap. A receiver reads every announced
+  stream to its end whatever its consumer does (push_fragment does not wait);
+  its one wait is announcing a stream into a full channel, bounded by
+  inbound_stream_age_limit(len), the sender's total, so the two give up
+  together. With keepalive PINGs (15 s apart) as its only acknowledgements, at
+  most two wakes in a row (10 s apart) can each see a new one, so they alone
+  extend a stopped send by at most two wakes. Argued, not tested.
   One timer per send, re-armed when it fires, as BodyReader. Messages are
   written in pieces of at most FRAGMENT_PAYLOAD_SIZE, each returning when quinn
   has buffered it, and each is a step of the gap and, for a stream, one
@@ -2004,11 +2058,19 @@ Path recycling (quic/recycle.rs, #5940 step M6): besides the send-reset
   outstanding (in flight after the latest acknowledgements, minus losses,
   or a send since), so recovery from an outage does not close the path.
   quinn counts a transmit's frames, and its bytes in flight, when it builds
-  it, before the egress cap admits it. Guard 2 is therefore inactive while
-  the egress cap holds QUIC transmits: while the cap holds any (or held one
-  since the previous sample; socket::CapHolds, node-wide) no window runs on
-  any path, so on a node whose cap binds most of the time guard 2 is off
-  most of the time. Do not narrow this to the sends counted since the hold:
+  it, before the egress cap admits it. Guard 2 is therefore inactive on a
+  connection while the egress cap holds its transmits: while the cap holds
+  one of this connection's (or held one since the previous sample;
+  socket::CapHolds, one record per connection since #6128, handed to the
+  poller quinn creates inside connect_with / accept_with by
+  socket::with_poller_holds, which relies on quinn 0.11.12 building that
+  poller synchronously on the calling thread; a poller built elsewhere is
+  counted per endpoint, CapHolds::fallback_pollers, and the path tests
+  assert 0) no window runs on that path (pinned per connection by
+  a_held_connection_does_not_pause_another_connections_ack_watch). Never node-wide:
+  on a node whose cap binds, some connection is nearly always held, and a
+  node-wide record kept every path's guard 2, stall count and send gap from
+  firing. Do not narrow this to the sends counted since the hold:
   a held transmit is also in quinn's bytes in flight. A hold whose poller
   is not polled again within socket::cap_hold_validity of the cap's rate
   (a poller left by an ended connection) stops counting.
@@ -2093,10 +2155,37 @@ QUIC send route (#5940 e5b-6, quic/upgrade/data_route.rs,
   that are being acknowledged, or a receiver whose consumer is slow while its QUIC
   stack acknowledges, is closed and loses what the receiver's readers hold. Known
   gap: a consumer stalled past the window while nothing else on the path is
-  acknowledged reads as a stalled path. An egress cap hold counts as progress,
-  by the ack watch's rule (recycle::cap_held, shared): while
-  total-bandwidth-limit holds QUIC transmits nothing can be acknowledged, and at
-  a low cap one held transmit waits longer than the window. A pipe that timed out
+  acknowledged reads as a stalled path. An egress cap hold of THIS connection's
+  transmit counts as progress, by the ack watch's rule (recycle::cap_held,
+  shared), while total-bandwidth-limit holds them nothing can be acknowledged;
+  but only for route::hold_credit after the connection's last acknowledgement
+  (as seen at a settle): the window, or the longest one transmit can wait at
+  the cap if that is longer (10 s at 1 MB/s, about 13.3 s at 100 kB/s, about
+  19.8 s at 64 KiB/s). A live path whose transmit the cap holds is acknowledged
+  again within that, so it is not stall-closed (pinned at 50 B/s and at
+  100 kB/s); a dark connection whose own probes the cap holds stops counting
+  them after it. total-bandwidth-limit has no floor (MIN_BANDWIDTH_LIMIT only
+  floors the per-connection bandwidth-limit), so the credit grows without bound
+  as the cap falls. The real bound on a busy capped node: a path gone dark goes
+  suspect at a send timeout at least hold_credit after the last acknowledgement
+  the path recorded (dated when a settle or a wake saw it, and moved back to a
+  quiet proof's since when one applies), so one credit plus one gap. The credit
+  covers this node's cap only: a peer whose own cap is saturated delays its
+  acknowledgements, and below about 137 kB/s (where cap_transmit_wait reaches
+  the window) that delay can pass a window,
+  which reads as a quiet path here (not new with this rule); until then new streams that time
+  out after opening are dropped (as before), a short that times out before its
+  end is written goes to UDP, and a one-packet short (written whole at once)
+  ends MaybeDelivered and is not resent, so on a dark path it can be lost in
+  that time, as before suspect existed. A send that
+  ran out of its gap leaves a QuietProof (the acked count and hold count, and
+  since when they stood still); while the counts still match, the stall count
+  dates the progress it sees from then, so the first timeout after a path goes
+  dark mid-send counts and the path goes suspect at once. The path has one
+  slot, read (not taken) by every settle; a later timeout's proof of the same
+  counts is merged into it (earlier since kept), so it cannot push an earlier
+  send's date forward. Both counts only grow, which is what makes a matching
+  proof sound. A pipe that timed out
   waiting for its source does not count (WatchedSource). It costs a normal
   backoff.
   Fast path: Session::routed is an atomic set only while the live attempt holds a

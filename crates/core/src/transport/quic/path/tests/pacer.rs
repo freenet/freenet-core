@@ -259,7 +259,13 @@ fn bytes_taken_for_a_write_not_made_go_back() {
         let _seed = GlobalRng::seed_guard(SEED);
         let p = paths("quic-pacer-give-back", 123, QuicPathLimits::DEFAULT).await;
         // Header and metadata go at once; the first fragment is granted after
-        // 10 s, past the 5 s gap.
+        // 30 s, ignoring the limit it is offered (a real pacer would refuse
+        // any wait past the 5 s gap, which is how this case arises: a pacer
+        // that waits longer than it said). 30 s is past the gap and past the
+        // connection's window too: the header's acknowledgement, seen at the
+        // first wake (the 2 s open deadline), extends the deadline to 12 s,
+        // and nothing moves after it, since the send waits on the pacer. A
+        // 10 s grant would finish inside that window and the send complete.
         let pacer = Scripted::new(&p.time(), usize::MAX, Duration::ZERO);
         struct SlowAfterFirst(Arc<Scripted>);
         impl SendPacer for SlowAfterFirst {
@@ -269,7 +275,7 @@ fn bytes_taken_for_a_write_not_made_go_back() {
                 Ok(if first {
                     Duration::ZERO
                 } else {
-                    Duration::from_secs(10)
+                    Duration::from_secs(30)
                 })
             }
             fn give_back(&self, bytes: usize) {
@@ -601,4 +607,252 @@ fn a_pacer_wait_never_marks_a_step() {
             "{signature:?} must not count a pacer wait as progress"
         );
     }
+}
+
+/// A pacer that grants every reservation at once until `slow_from`
+/// reservations have been made, then makes each wait `wait`, refusing one whose
+/// wait would reach the limit it is offered, as `LimitPacer` does. Records the
+/// limits it was offered.
+struct Honest {
+    slow_from: usize,
+    wait: Duration,
+    calls: AtomicUsize,
+    limits: parking_lot::Mutex<Vec<Duration>>,
+    given_back: AtomicUsize,
+    time: VirtualTime,
+}
+
+impl Honest {
+    fn new(time: &VirtualTime, slow_from: usize, wait: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            slow_from,
+            wait,
+            calls: AtomicUsize::new(0),
+            limits: parking_lot::Mutex::new(Vec::new()),
+            given_back: AtomicUsize::new(0),
+            time: time.clone(),
+        })
+    }
+}
+
+impl SendPacer for Honest {
+    fn reserve_within(&self, _bytes: usize, limit: Duration) -> Result<Duration, Duration> {
+        self.limits.lock().push(limit);
+        let wait = if self.calls.fetch_add(1, Ordering::Relaxed) < self.slow_from {
+            Duration::ZERO
+        } else {
+            self.wait
+        };
+        if wait < limit { Ok(wait) } else { Err(wait) }
+    }
+
+    fn give_back(&self, bytes: usize) {
+        self.given_back.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn charge(&self, bytes: usize) -> usize {
+        bytes
+    }
+
+    fn sleep(
+        &self,
+        wait: Duration,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        self.time.sleep_cancelable(wait)
+    }
+}
+
+/// A pacer is offered at most the send's own gap, never the
+/// connection's window, so its queue holds no more than #6126 allowed. Over
+/// the lossy path of
+/// `a_lossy_path_finishes_a_stream_whose_writes_wait_past_the_gap`, where
+/// quinn makes writes wait past the gap and the connection's window carries
+/// the send, every reservation is offered at most 5 s and the send completes:
+/// the long waits are quinn's, after a reservation, and the write they end in
+/// is a step, so the next reservation is offered a fresh gap.
+#[test]
+fn a_pacer_is_offered_at_most_the_gap_on_a_lossy_live_path() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let network = "quic-pacer-lossy-window";
+        let loss = seeded_loss_from(network, 5, 0x5940_0007, Some(Duration::from_millis(100)));
+        let p = paths(network, 47, QuicPathLimits::DEFAULT).await;
+        let pacer = Scripted::new(&p.time(), usize::MAX, Duration::ZERO);
+        p.a.pace_with(pacer.clone());
+        let (elapsed, outcome) = time_a_stream(&p, 8 * MIB).await;
+        crate::transport::in_memory_socket::set_packet_delivery_callback(network, None);
+        let dropped = loss.dropped.load(Ordering::Relaxed);
+        assert!(dropped > 0, "the loss happened");
+        assert!(matches!(outcome, BoundedSend::Sent), "{outcome:?}");
+        let gap = crate::transport::peer_connection::streaming::STREAM_INACTIVITY_TIMEOUT;
+        assert!(
+            elapsed > gap,
+            "premise: the send outlived its own gap: {elapsed:?}"
+        );
+        let longest = pacer
+            .limits
+            .lock()
+            .iter()
+            .copied()
+            .max()
+            .expect("the send was paced");
+        assert!(longest <= gap, "offered {longest:?}, past the gap");
+    });
+}
+
+/// Long pacer waits inside the gap on a live connection: every fragment after
+/// the header waits 4 s, under the 5 s gap the pacer is offered each time
+/// (each write is a step), and the stream is `Sent` after about 4 s per
+/// fragment.
+#[test]
+fn long_pacer_waits_inside_the_gap_complete() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths("quic-pacer-long-waits", 128, QuicPathLimits::DEFAULT).await;
+        let pacer = Honest::new(&p.time(), 1, Duration::from_secs(4));
+        p.a.pace_with(pacer.clone());
+        let fragments = 3;
+        let (elapsed, outcome) = time_a_stream(&p, fragments * FRAGMENT_PAYLOAD_SIZE).await;
+        assert!(matches!(outcome, BoundedSend::Sent), "{outcome:?}");
+        assert!(
+            elapsed >= Duration::from_secs(4 * fragments as u64),
+            "{elapsed:?}"
+        );
+        assert_eq!(pacer.calls.load(Ordering::Relaxed), 1 + fragments);
+    });
+}
+
+/// A wait past the gap is refused, after the stream opened: the send ends
+/// `Failed(Paced)` at once, leaves no quiet proof, and its settle counts
+/// nothing toward the stall close, so the path does not go suspect. The first
+/// fragment is offered at most 5 s, so the 8 s wait is refused.
+#[test]
+fn a_pacer_wait_past_the_gap_is_refused_and_counts_for_nothing() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths("quic-pacer-past-gap", 129, QuicPathLimits::DEFAULT).await;
+        let pacer = Honest::new(&p.time(), 1, Duration::from_secs(8));
+        p.a.pace_with(pacer.clone());
+        let (elapsed, outcome) = time_a_stream(&p, 3 * FRAGMENT_PAYLOAD_SIZE).await;
+        assert!(
+            matches!(outcome, BoundedSend::Failed(SendFailure::Paced)),
+            "{outcome:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "refused at once: {elapsed:?}"
+        );
+        let limits = pacer.limits.lock().clone();
+        assert_eq!(limits.len(), 2, "the header, then the refused fragment");
+        assert!(limits[1] <= Duration::from_secs(5), "{limits:?}");
+        assert_eq!(p.a.stall_state(), (0, None), "no proof left");
+        p.a.settle(SendKind::Stream, &outcome, false, p.time().now_nanos());
+        assert_eq!(p.a.stall_state().0, 0, "not counted");
+        assert!(!p.a.is_suspect());
+    });
+}
+
+/// The pacer is offered no more than `total` leaves: with a 3 s total, under
+/// the 5 s gap, every limit after the header is at most what remains of it.
+#[test]
+fn the_pacer_is_offered_no_more_than_total_leaves() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths("quic-pacer-total", 130, QuicPathLimits::DEFAULT).await;
+        let pacer = Honest::new(&p.time(), usize::MAX, Duration::ZERO);
+        p.a.pace_with(pacer.clone());
+        let (a, time) = (p.a.clone(), p.time());
+        let len = 3 * FRAGMENT_PAYLOAD_SIZE;
+        let deadlines = SendDeadlines {
+            total: Duration::from_secs(3),
+            ..SendDeadlines::stream(len as u64)
+        };
+        let outcome = p
+            .drive(async move {
+                a.send_stream_bounded(
+                    &time,
+                    deadlines,
+                    StreamId::next(),
+                    None,
+                    Bytes::from(payload(len)),
+                    None,
+                )
+                .await
+            })
+            .await;
+        assert!(matches!(outcome, BoundedSend::Sent), "{outcome:?}");
+        let limits = pacer.limits.lock().clone();
+        assert!(limits.len() > 1, "{limits:?}");
+        assert!(
+            limits.iter().all(|limit| *limit <= Duration::from_secs(3)),
+            "{limits:?}"
+        );
+    });
+}
+
+/// A paced path that goes dark mid-send fails the send within two windows of
+/// the open deadline's wake, as without a pacer, and its timeout counts: the
+/// stall count's first counted timeout, the quiet proof, and the path suspect.
+/// A pacer's waits are not progress (a real limit pacer at 400 kB/s waits here).
+#[test]
+fn a_paced_path_dark_mid_send_fails_within_two_windows_and_goes_suspect() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let network = "quic-pacer-dark-mid-send";
+        let p = paths(network, 131, QuicPathLimits::DEFAULT).await;
+        let pacer = Arc::new(CountsWaits {
+            inner: pacer_at(&p.time(), 400_000),
+            waited: AtomicUsize::new(0),
+        });
+        p.a.pace_with(pacer.clone());
+        let (a, time) = (p.a.clone(), p.time());
+        let body = over_window();
+        let fragments = body.len().div_ceil(FRAGMENT_PAYLOAD_SIZE);
+        let silencer = Arc::new(SilenceAfter {
+            network,
+            from: p.pair.b_addr,
+            // A quarter in: at 400 kB/s the rest is more than a send window,
+            // so writes are still waiting when the path goes dark.
+            after: fragments / 4,
+            sent: AtomicUsize::new(0),
+            silenced: parking_lot::Mutex::new(None),
+        });
+        let watched = silencer.clone();
+        let deadlines = SendDeadlines::stream(body.len() as u64);
+        let (outcome, took) = p
+            .drive(async move {
+                let start = time.now();
+                let outcome = a
+                    .send_stream_bounded(
+                        &time,
+                        deadlines,
+                        StreamId::next(),
+                        None,
+                        body,
+                        Some(&*watched),
+                    )
+                    .await;
+                (outcome, time.now() - start)
+            })
+            .await;
+        assert!(silencer.silenced.lock().is_some(), "the path went dark");
+        assert!(
+            pacer.waited.load(Ordering::Relaxed) > 0,
+            "the pacer held writes"
+        );
+        assert!(
+            matches!(outcome, BoundedSend::Failed(SendFailure::TimedOut)),
+            "{outcome:?}"
+        );
+        let window = super::super::route::STALL_PROGRESS_WINDOW;
+        assert!(
+            took > Duration::from_secs(5) && took <= Duration::from_secs(2) + 2 * window,
+            "took {took:?}"
+        );
+        assert!(p.a.stall_state().1.is_some(), "the timeout left a proof");
+        p.a.settle(SendKind::Stream, &outcome, false, p.time().now_nanos());
+        assert_eq!(p.a.stall_state().0, 1, "the timeout counted");
+        assert!(p.a.is_suspect(), "the first timeout makes the path suspect");
+        drop(silencer.silenced.lock().take());
+    });
 }

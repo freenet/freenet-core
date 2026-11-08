@@ -35,7 +35,7 @@ use std::time::Duration;
 
 use super::super::recycle::{self, ACK_WATCH_WINDOW, cap_held};
 use super::super::socket::CapHoldReading;
-use super::bounded::{BoundedSend, MaybeDelivered, NotOpened, SendFailure};
+use super::bounded::{BoundedSend, MaybeDelivered, NotOpened, QuietProof, SendFailure};
 use super::{QuicPath, QuicSendError, stop_code};
 use crate::transport::metrics::QuicCloseCode;
 
@@ -183,6 +183,21 @@ fn timed_out(outcome: &BoundedSend) -> bool {
 /// timeout counts against it: the acknowledgement watch's window.
 pub(crate) const STALL_PROGRESS_WINDOW: Duration = ACK_WATCH_WINDOW;
 
+/// How long after a connection's last acknowledgement an egress cap hold of
+/// its transmits still counts as progress: the window, or the longest one
+/// transmit can wait at this cap ([`socket::cap_transmit_wait`]), whichever is
+/// longer. A live path whose transmits the cap holds is acknowledged again
+/// within that; a held transmit on a connection nothing has acknowledged for
+/// longer is no evidence it is alive (a dark connection's own probes wait for a
+/// saturated cap too, and counted without that limit they kept a dark
+/// send going for 32 s). 10 s (the window) at 1 MB/s, about 13.3 s at
+/// 100 kB/s, about 19.8 s at 64 KiB/s, longer at lower caps.
+///
+/// [`socket::cap_transmit_wait`]: super::super::socket::cap_transmit_wait
+pub(crate) fn hold_credit(cap: &CapHoldReading) -> Duration {
+    STALL_PROGRESS_WINDOW.max(cap.longest_wait)
+}
+
 /// What [`StallCount::take`] decided.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct StallVerdict {
@@ -219,10 +234,21 @@ pub(crate) struct StallVerdict {
 /// consumer stays stalled past the window while nothing else on the path is
 /// acknowledged reads as a stalled path.
 ///
-/// An egress cap hold counts as progress, as it does for the acknowledgement
-/// watch (`recycle::cap_held`): while `total-bandwidth-limit` holds the node's
-/// QUIC transmits nothing can be acknowledged, one held transmit can wait for
-/// longer than the window at a low cap, and the path itself is not stalled.
+/// An egress cap hold of this connection's transmit counts as progress, as it
+/// does for the acknowledgement watch (`recycle::cap_held`), while
+/// `total-bandwidth-limit` holds them nothing can be acknowledged; but only
+/// for [`hold_credit`] after the connection's last acknowledgement (the window,
+/// or the longest one transmit can wait at the cap if that is longer). A held
+/// transmit on a connection nothing has acknowledged for longer is no evidence
+/// it is alive: a dark connection's own probes wait for a saturated cap too.
+/// The record is the connection's own
+/// (`socket::with_poller_holds`): a node-wide one would read as progress on
+/// every path whenever any connection is held, and on a node whose cap binds
+/// this count would never fire.
+///
+/// A [`QuietProof`] a timed-out send left dates the progress this sees
+/// ([`Self::take`]), so a path that went dark mid-send counts its first
+/// timeout.
 ///
 /// A send the path's pacer refused ([`NotOpened::Paced`], [`SendFailure::Paced`])
 /// is not a timeout and never counts: this side held it back. A pacer's waits
@@ -237,6 +263,9 @@ pub(crate) struct StallCount {
     /// When the count last moved, or the cap last held a transmit, on the
     /// path's clock.
     progressed_at: u64,
+    /// When the count last moved (or the path was built), on the path's clock.
+    /// A cap hold is progress only within [`hold_credit`] of it.
+    acked_at: u64,
     /// The cap's holds at the last settle, and since when a hold has been
     /// reported with no new hold event (`recycle::cap_held`).
     cap: Option<CapHoldReading>,
@@ -251,21 +280,28 @@ impl StallCount {
             in_a_row: 0,
             acked,
             progressed_at: now_nanos,
+            acked_at: now_nanos,
             cap: None,
             hold_unchanged_since: None,
         }
     }
 
     /// Take `outcome`, with the connection's acknowledged-packet count `acked`
-    /// (`None` when the controller does not count them) and the egress cap's
-    /// holds `cap`, at `now_nanos`: whether it counted, and whether the path
-    /// should close now (once, at the limit).
+    /// (`None` when the controller does not count them) and the connection's
+    /// egress cap holds `cap`, at `now_nanos`: whether it counted, and whether
+    /// the path should close now (once, at the limit).
+    ///
+    /// Progress seen here is dated `now_nanos`. If `quiet` (a send that ran out
+    /// of gap, [`QuietProof`]) still matches the counts, nothing moved after its
+    /// `since`, and the last progress is dated no later than that, whether this
+    /// settle or an earlier one saw it.
     pub(crate) fn take(
         &mut self,
         outcome: &BoundedSend,
         source_stalled: bool,
         acked: Option<u64>,
         cap: CapHoldReading,
+        quiet: Option<QuietProof>,
         now_nanos: u64,
     ) -> StallVerdict {
         let previous = self.cap.replace(cap).unwrap_or(cap);
@@ -273,16 +309,37 @@ impl StallCount {
         let acknowledged = acked.is_some_and(|acked| self.acked != Some(acked));
         if acknowledged {
             self.acked = acked;
+            self.acked_at = now_nanos;
         }
+        let window = u64::try_from(STALL_PROGRESS_WINDOW.as_nanos()).unwrap_or(u64::MAX);
+        // A held transmit on a connection nothing has acknowledged for the
+        // window is no evidence the path is alive: a dark connection's own
+        // probes wait for a saturated cap too.
+        let credit = u64::try_from(hold_credit(&cap).as_nanos()).unwrap_or(u64::MAX);
+        let held = held && now_nanos.saturating_sub(self.acked_at) <= credit;
         if acknowledged || held {
             self.progressed_at = now_nanos;
             self.in_a_row = 0;
+        }
+        // A proof that still matches says nothing moved after its `since`, so
+        // the last progress was no later than that, whichever settle first saw
+        // it and dated it when it did. Both values are no earlier than the real
+        // last move, so the smaller one still is.
+        if let Some(proof) = quiet
+            && !proof.live_hold_seen
+            && acked == Some(proof.acked)
+            && cap.holds == proof.holds
+            && !cap.held_now
+        {
+            self.progressed_at = self.progressed_at.min(proof.since);
+            // The same for the last acknowledgement, which a settle dates when
+            // it sees it: nothing moved after `since`.
+            self.acked_at = self.acked_at.min(proof.since);
         }
         if matches!(outcome, BoundedSend::Sent) {
             self.in_a_row = 0;
             return StallVerdict::default();
         }
-        let window = u64::try_from(STALL_PROGRESS_WINDOW.as_nanos()).unwrap_or(u64::MAX);
         let quiet = acked.is_none() || now_nanos.saturating_sub(self.progressed_at) >= window;
         if !timed_out(outcome) || source_stalled || !quiet {
             return StallVerdict::default();
@@ -293,6 +350,25 @@ impl StallCount {
             quiet_timeout: true,
         }
     }
+    /// Take a later acknowledgement time from the path's record (a send's
+    /// watch may have seen the count move since this count last read it).
+    pub(crate) fn note_acked_at(&mut self, at: u64) {
+        if at != super::bounded::NO_ACK {
+            self.acked_at = self.acked_at.max(at);
+        }
+    }
+
+    /// When this count last saw the connection acknowledged.
+    pub(crate) fn acked_at(&self) -> u64 {
+        self.acked_at
+    }
+
+    /// Counted timeouts in a row. Tests only.
+    #[cfg(test)]
+    pub(crate) fn in_a_row(&self) -> u32 {
+        self.in_a_row
+    }
+
     /// [`Self::take`] with no egress cap.
     #[cfg(test)]
     pub(crate) fn take_uncapped(
@@ -306,13 +382,21 @@ impl StallCount {
             holds: 0,
             held_now: false,
             validity: Duration::ZERO,
+            longest_wait: Duration::ZERO,
         };
-        self.take(outcome, source_stalled, acked, no_cap, now_nanos)
+        self.take(outcome, source_stalled, acked, no_cap, None, now_nanos)
             .close
     }
 }
 
 impl QuicPath {
+    /// The stall count's timeouts in a row, and the quiet proof a timed-out
+    /// send left. Tests only.
+    #[cfg(test)]
+    pub(crate) fn stall_state(&self) -> (u32, Option<QuietProof>) {
+        (self.stall.lock().in_a_row(), *self.quiet.lock())
+    }
+
     /// Count `outcome` of a send of `kind` and say what to do with the message.
     /// Every data send of the node ends here.
     ///
@@ -340,12 +424,24 @@ impl QuicPath {
                 self.stop_sending_data();
             }
         }
-        let acked = self.ack_progress.as_ref().map(recycle::AckProgress::acked);
-        let cap = self.connection.cap_holds().read();
-        let verdict = self
-            .stall
-            .lock()
-            .take(outcome, source_stalled, acked, cap, now_nanos);
+        // The counts are read under the stall lock, so concurrent settles take
+        // them in order. The proof is read, not taken: it checks itself against
+        // the counts, so one left for another send's settle stays usable.
+        let (verdict, acked) = {
+            let mut stall = self.stall.lock();
+            let cap = self.connection.cap_holds().read();
+            let quiet = *self.quiet.lock();
+            // The record's lock is taken under the stall lock (never the
+            // reverse), and the count is read inside it, so a watch cannot
+            // date a newer count between this read and the write below.
+            self.last_acked.with(|seen| {
+                let acked = self.ack_progress.as_ref().map(recycle::AckProgress::acked);
+                stall.note_acked_at(seen.at);
+                let verdict = stall.take(outcome, source_stalled, acked, cap, quiet, now_nanos);
+                seen.settle(acked, stall.acked_at());
+                (verdict, acked)
+            })
+        };
         if let (true, Some(acked)) = (verdict.quiet_timeout, acked) {
             self.become_suspect(acked);
         }

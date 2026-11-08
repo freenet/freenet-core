@@ -218,7 +218,8 @@ pub(crate) struct EndpointCore {
     /// The endpoint's health, handed to each connection (its watcher, and
     /// its closer, which does not count a close after an adapter panic).
     health: Arc<EndpointHealth>,
-    /// The QUIC transmits the egress cap holds (`socket::CapHolds`).
+    /// Empty hold records for the endpoint's cap; each connection gets a copy
+    /// of its own (`socket::CapHolds`, `socket::with_poller_holds`).
     cap_holds: Arc<socket::CapHolds>,
     /// Test hooks that inject faults into quinn's drivers.
     #[cfg(any(test, feature = "testing"))]
@@ -422,6 +423,17 @@ fn require_unwinding(unwinds: bool) -> io::Result<()> {
 /// Whether this build unwinds on panic, which the QUIC transport needs
 /// ([`require_unwinding`]).
 pub(crate) const UNWINDS: bool = cfg!(panic = "unwind");
+
+impl EndpointCore {
+    /// Connection pollers this endpoint's socket built outside
+    /// `socket::with_poller_holds`: their cap holds go into a record nobody
+    /// reads. Expected 0 (quinn 0.11.12 builds one elsewhere only on a
+    /// rebind, which needs migration, which is off).
+    #[cfg(test)]
+    pub(crate) fn fallback_pollers(&self) -> u64 {
+        self.cap_holds.fallback_pollers()
+    }
+}
 
 impl QuicEndpoint {
     /// Build an endpoint over `socket`, which must be the socket the
@@ -863,9 +875,11 @@ impl QuicEndpoint {
             .sources
             .allow(addr)
             .ok_or(QuicConnectError::AllowSetFull)?;
-        let connecting = self
-            .endpoint
-            .connect_with(config, addr, config::SERVER_NAME)?;
+        let holds = Arc::new(self.cap_holds.like());
+        let connecting = socket::with_poller_holds(&holds, || {
+            self.endpoint
+                .connect_with(config, addr, config::SERVER_NAME)
+        })?;
         let connection = connecting.await?;
         Ok(QuicConnection::new(
             connection,
@@ -873,7 +887,7 @@ impl QuicEndpoint {
             None,
             peer,
             self.health.clone(),
-            self.cap_holds.clone(),
+            holds,
         ))
     }
 }
@@ -922,7 +936,7 @@ impl EndpointCore {
                 config: Arc::new(config),
                 peer: expected,
                 hold,
-                cap_holds: self.cap_holds.clone(),
+                cap_holds: Arc::new(self.cap_holds.like()),
             });
         }
     }
@@ -942,7 +956,7 @@ pub(crate) struct QuicIncoming {
     peer: PeerKey,
     /// Keeps the address bound to `peer` while the attempt lives.
     hold: KeyHold,
-    /// The endpoint's record of cap-held transmits.
+    /// The connection's own record of cap-held transmits, given to its poller.
     cap_holds: Arc<socket::CapHolds>,
 }
 
@@ -998,7 +1012,9 @@ impl QuicIncoming {
     /// `a_*_panic_during_connect_ends_the_handshake` tests.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn establish(self) -> Result<QuicConnection, quinn::ConnectionError> {
-        let connection = self.incoming.accept_with(self.config)?.await?;
+        let connecting =
+            socket::with_poller_holds(&self.cap_holds, || self.incoming.accept_with(self.config))?;
+        let connection = connecting.await?;
         Ok(QuicConnection::new(
             connection,
             self.permit,
@@ -1020,7 +1036,8 @@ pub(crate) struct QuicConnection {
     closer: QuicCloser,
     /// The key the peer proved in the handshake.
     peer: PeerKey,
-    /// The endpoint's record of cap-held transmits, for the path's watch.
+    /// This connection's record of cap-held transmits, for the path's watch,
+    /// stall count and send gaps.
     cap_holds: Arc<socket::CapHolds>,
 }
 
@@ -1125,7 +1142,7 @@ impl QuicConnection {
         self.closer.close(code);
     }
 
-    /// The endpoint's record of the QUIC transmits its egress cap holds.
+    /// This connection's record of the QUIC transmits the egress cap holds.
     pub(crate) fn cap_holds(&self) -> Arc<socket::CapHolds> {
         self.cap_holds.clone()
     }
