@@ -246,6 +246,10 @@ impl SendProgress {
     /// longer and more data would go to UDP. A live lossy path does not need
     /// it: its long waits are quinn's, after the pacer's take, and the write
     /// they end in is a step, so the next take is offered a fresh gap.
+    /// A wait for the source is not a step, though: after a slow chunk the
+    /// next take may be offered little or nothing, and a refusal mid-stream
+    /// drops the message (`Failed(Paced)`). That is #6126's behaviour on main,
+    /// not changed here.
     pub(super) fn time_left(&self) -> Duration {
         match &self.0.deadlines {
             Some((deadlines, started)) => Duration::from_nanos(
@@ -377,6 +381,29 @@ pub(crate) struct AckSeen {
     pub(crate) at: u64,
 }
 
+impl AckSeen {
+    /// A settle that read the count `acked` (`None` without a counting
+    /// controller) dates the last acknowledgement `dated`: forward when it saw
+    /// a move, or back to a matching proof's `since` (`route::StallCount::take`).
+    /// A reading below the record's count is stale (a watch dated a newer count
+    /// since), so then the date only moves forward: going back on a stale count
+    /// would remove hold credit the newer acknowledgement earned.
+    pub(crate) fn settle(&mut self, acked: Option<u64>, dated: u64) {
+        match acked {
+            Some(acked) if acked < self.count => {
+                if self.at == NO_ACK || dated > self.at {
+                    self.at = dated;
+                }
+            }
+            Some(acked) => {
+                self.count = acked;
+                self.at = dated;
+            }
+            None => self.at = dated,
+        }
+    }
+}
+
 /// A path's [`AckSeen`], kept by the stall count at settles and by every
 /// send's watch at its start and wakes. The count is stored with the time so
 /// that a move nobody has dated yet (an acknowledgement after the last settle
@@ -402,12 +429,14 @@ impl AckRecord {
     /// The count is `count` at `now`: if the record has not seen it, the
     /// connection was acknowledged since the record last moved, and it is
     /// dated `now`. Returns when the connection was last acknowledged, if
-    /// ever. Acknowledged counts only grow, so a count different from the
+    /// ever. Acknowledged counts only grow, so only a count above the
     /// record's is a move.
     pub(crate) fn date_unseen(&self, count: u64, now: u64) -> Option<u64> {
         let mut seen = self.0.lock();
-        if seen.count != count {
-            seen.count = seen.count.max(count);
+        // Only a higher count is a move: a caller holding a stale, lower
+        // reading has seen nothing new.
+        if count > seen.count {
+            seen.count = count;
             seen.at = if seen.at == NO_ACK {
                 now
             } else {

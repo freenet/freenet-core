@@ -390,12 +390,6 @@ impl StallCount {
 }
 
 impl QuicPath {
-    /// Count `outcome` of a send of `kind` and say what to do with the message.
-    /// Every data send of the node ends here.
-    ///
-    /// `source_stalled`: the send was waiting for its source when it timed out.
-    /// That says nothing about the path, so the stall count does not move.
-    /// `now_nanos` is on the path's clock ([`StallCount`]).
     /// The stall count's timeouts in a row, and the quiet proof a timed-out
     /// send left. Tests only.
     #[cfg(test)]
@@ -403,6 +397,12 @@ impl QuicPath {
         (self.stall.lock().in_a_row(), *self.quiet.lock())
     }
 
+    /// Count `outcome` of a send of `kind` and say what to do with the message.
+    /// Every data send of the node ends here.
+    ///
+    /// `source_stalled`: the send was waiting for its source when it timed out.
+    /// That says nothing about the path, so the stall count does not move.
+    /// `now_nanos` is on the path's clock ([`StallCount`]).
     pub(crate) fn settle(
         &self,
         kind: SendKind,
@@ -429,25 +429,18 @@ impl QuicPath {
         // the counts, so one left for another send's settle stays usable.
         let (verdict, acked) = {
             let mut stall = self.stall.lock();
-            let acked = self.ack_progress.as_ref().map(recycle::AckProgress::acked);
             let cap = self.connection.cap_holds().read();
             let quiet = *self.quiet.lock();
             // The record's lock is taken under the stall lock (never the
-            // reverse), so a watch cannot move it between the read and the
-            // write here.
-            let verdict = self.last_acked.with(|seen| {
+            // reverse), and the count is read inside it, so a watch cannot
+            // date a newer count between this read and the write below.
+            self.last_acked.with(|seen| {
+                let acked = self.ack_progress.as_ref().map(recycle::AckProgress::acked);
                 stall.note_acked_at(seen.at);
                 let verdict = stall.take(outcome, source_stalled, acked, cap, quiet, now_nanos);
-                // The count's time as this settle dates it: forward when it saw
-                // a move, back to a matching proof's `since`, which says
-                // nothing moved after it (`StallCount::take`).
-                seen.at = stall.acked_at();
-                if let Some(acked) = acked {
-                    seen.count = seen.count.max(acked);
-                }
-                verdict
-            });
-            (verdict, acked)
+                seen.settle(acked, stall.acked_at());
+                (verdict, acked)
+            })
         };
         if let (true, Some(acked)) = (verdict.quiet_timeout, acked) {
             self.become_suspect(acked);

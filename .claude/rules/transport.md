@@ -855,7 +855,9 @@ Rate calculation on every rate update (peer_connection::paced_rate; #6047):
   reserves with reserve_within, limited to what the send's current deadline
   leaves for its stage (with the stream open, its own gap, never the
   connection's window: bounded::SendProgress::time_left; the window would let
-  the queue hold about 10 s of the rate instead of 5 s, refusing more opens),
+  the queue hold about 10 s of the rate instead of 5 s, refusing more opens;
+  a wait for a pipe's source is not a step, so after a slow chunk the next
+  write may be offered little and refused mid-stream, as in #6126),
   and waits in the send's own task; a refused reservation takes
   nothing and ends the send NotOpened(Paced) before the stream opened
   (header and metadata are taken before open_uni) or Failed(Paced) after

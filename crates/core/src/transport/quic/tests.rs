@@ -2264,7 +2264,7 @@ fn a_hold_left_by_an_ended_connection_stops_pausing_the_ack_watch() {
     );
 }
 
-/// Recycle guard 2 per connection (#6128): while the egress cap holds one
+/// Recycle guard 2 per connection: while the egress cap holds one
 /// connection's transmit, another connection's acknowledgement watch, reading
 /// its own record, is not paused, and closes a peer that sends and
 /// acknowledges nothing within the window, as it would on an uncapped node.

@@ -259,11 +259,13 @@ fn bytes_taken_for_a_write_not_made_go_back() {
         let _seed = GlobalRng::seed_guard(SEED);
         let p = paths("quic-pacer-give-back", 123, QuicPathLimits::DEFAULT).await;
         // Header and metadata go at once; the first fragment is granted after
-        // 30 s. That is past the 5 s gap and past the connection's window
-        // too (#6128): the header's acknowledgement, seen at the first wake
-        // (the 2 s open deadline), extends the deadline to 12 s, and nothing
-        // moves after it, since the send waits on the pacer. A 10 s grant
-        // would finish inside that window and the send would complete.
+        // 30 s, ignoring the limit it is offered (a real pacer would refuse
+        // any wait past the 5 s gap, which is how this case arises: a pacer
+        // that waits longer than it said). 30 s is past the gap and past the
+        // connection's window too: the header's acknowledgement, seen at the
+        // first wake (the 2 s open deadline), extends the deadline to 12 s,
+        // and nothing moves after it, since the send waits on the pacer. A
+        // 10 s grant would finish inside that window and the send complete.
         let pacer = Scripted::new(&p.time(), usize::MAX, Duration::ZERO);
         struct SlowAfterFirst(Arc<Scripted>);
         impl SendPacer for SlowAfterFirst {
@@ -660,7 +662,7 @@ impl SendPacer for Honest {
     }
 }
 
-/// #6128 with #6126: a pacer is offered at most the send's own gap, never the
+/// A pacer is offered at most the send's own gap, never the
 /// connection's window, so its queue holds no more than #6126 allowed. Over
 /// the lossy path of
 /// `a_lossy_path_finishes_a_stream_whose_writes_wait_past_the_gap`, where

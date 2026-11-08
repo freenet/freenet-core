@@ -3756,8 +3756,8 @@ fn a_cap_hold_counts_as_the_connection_moving() {
 /// last acknowledgement before it (the path's record, `last_acked`): its writes
 /// stall from 0 to 8 s while the cap holds every second, the connection was
 /// acknowledged at 0 s, its own first acknowledgement comes at 7 s, and it is
-/// `Sent` (#6128 re-review). Credited only by this send's own acknowledgements,
-/// it timed out at 5 s on a live path.
+/// `Sent`. Credited only by this send's own acknowledgements, it timed out at
+/// 5 s on a live path.
 #[test]
 fn a_live_send_held_in_the_cap_queue_past_its_gap_is_sent() {
     bounded(|| async move {
@@ -3808,11 +3808,13 @@ fn a_live_send_held_in_the_cap_queue_past_its_gap_is_sent() {
 /// An acknowledgement the path's record has not seen yet (it came after the
 /// last settle or wake) is dated at the send's start, not taken as no news:
 /// the record says the connection was last acknowledged at 0 s, the peer
-/// acknowledged again at 7 s with nobody reading, and a send starts at 8 s
-/// whose writes the 1 MB/s cap holds (hold credit 10 s) until 16 s. Dated at
-/// 0 s, the holds at its 13 s gap are 13 s past the last acknowledgement and
-/// earn nothing, so it timed out at 5 s on a live path (#6128 re-review, item
-/// 2). Dated at its start, they are credited and the send is `Sent`.
+/// acknowledged again at 7 s with nobody reading, and a send starts at 9 s
+/// whose writes the 1 MB/s cap holds (hold credit 10 s) until 17 s. Its first
+/// wake is its open deadline, 11 s. Dated at 0 s, the hold seen there is 11 s
+/// past the last acknowledgement and earns nothing, so the send timed out at
+/// its 5 s gap on a live path. Dated at its start, the holds are credited and
+/// the send is `Sent`. (Starting at 8 s would not show it: the 10 s wake is
+/// exactly one credit after 0 s, which still counts.)
 #[test]
 fn an_acknowledgement_the_record_has_not_seen_credits_the_next_send() {
     bounded(|| async move {
@@ -3828,7 +3830,7 @@ fn an_acknowledgement_the_record_has_not_seen_credits_the_next_send() {
             let record = Arc::new(bounded::AckRecord::new(acks.acked(), clock.now_nanos()));
             clock.sleep(Duration::from_secs(7)).await;
             acks.ack();
-            clock.sleep(Duration::from_secs(1)).await;
+            clock.sleep(Duration::from_secs(2)).await;
             let connection = bounded::ConnectionProgress {
                 acks: acks.clone(),
                 cap_holds: cap.clone(),
@@ -3864,10 +3866,47 @@ fn an_acknowledgement_the_record_has_not_seen_credits_the_next_send() {
         assert!(matches!(sent, BoundedSend::Sent), "{sent:?}");
         assert_eq!(
             record.at,
-            Duration::from_secs(8).as_nanos() as u64,
+            Duration::from_secs(9).as_nanos() as u64,
             "the unseen acknowledgement is dated at the send's start"
         );
     })
+}
+
+/// The path's record moves only on news. A reading of the count below the
+/// record's is stale: a settle holding one (a watch dated a newer count
+/// meanwhile) may move the date forward but never back to an old proof's
+/// `since`, which would take away the hold credit the newer acknowledgement
+/// earned; and a watch holding one does not date anything. A fresh reading
+/// that matches a proof may move the date back.
+#[test]
+fn a_stale_count_never_moves_the_ack_record_back() {
+    use bounded::{AckRecord, AckSeen, NO_ACK};
+    // A watch dated count 6 at 40 s; a settle then read 5 (stale) and its
+    // stall count, from a proof of count 5, dates the last ack at 10 s.
+    let mut seen = AckSeen { count: 6, at: 40 };
+    seen.settle(Some(5), 10);
+    assert_eq!(seen, AckSeen { count: 6, at: 40 }, "not moved back");
+    seen.settle(Some(5), 50);
+    assert_eq!(seen, AckSeen { count: 6, at: 50 }, "forward is fine");
+    // A fresh reading that matches the proof moves it back.
+    seen.settle(Some(6), 20);
+    assert_eq!(seen, AckSeen { count: 6, at: 20 });
+    let mut none = AckSeen {
+        count: 0,
+        at: NO_ACK,
+    };
+    none.settle(Some(3), 7);
+    assert_eq!(none, AckSeen { count: 3, at: 7 });
+
+    let record = AckRecord::new(6, 40);
+    assert_eq!(
+        record.date_unseen(5, 90),
+        Some(40),
+        "a stale count is no news"
+    );
+    assert_eq!(record.seen(), AckSeen { count: 6, at: 40 });
+    assert_eq!(record.date_unseen(7, 90), Some(90), "a higher count is");
+    assert_eq!(record.seen(), AckSeen { count: 7, at: 90 });
 }
 
 /// Holds with no acknowledgement during the send count for nothing: the send
@@ -4213,8 +4252,8 @@ fn source_waits_rearm_the_timer_once_while_it_is_extended() {
 /// starts at 0 s and times out at 5 s, the second starts at 3 s and times out
 /// at 8 s, before the first's settle reads the slot. The proofs are of the
 /// same counts, so the slot keeps the earlier `since` (0 s), and the first
-/// send's settle still dates progress back to it (#6128 re-review, item 10).
-/// Replaced, it read 3 s, which delays the path going suspect.
+/// send's settle still dates progress back to it. Replaced, it read 3 s,
+/// which delays the path going suspect.
 #[test]
 fn a_later_proof_of_the_same_counts_keeps_the_earlier_since() {
     bounded(|| async move {
@@ -4857,8 +4896,8 @@ fn a_path_dark_mid_send_fails_within_two_windows_and_goes_suspect() {
     })
 }
 
-/// Other sends settling around a timeout do not cost it its quiet proof
-/// (#6128 re-review). An unrelated `Sent` settles at 8 s (4 s before the
+/// Other sends settling around a timeout do not cost it its quiet proof. An
+/// unrelated `Sent` settles at 8 s (4 s before the
 /// timeout), after the timed-out send's own acknowledgements, so the stall
 /// count dates progress at 8 s; after the timeout at 12 s another unrelated
 /// `Sent` settles first. The timed-out
@@ -5006,9 +5045,9 @@ impl crate::transport::boundary::StreamProgressObserver for SilenceAfter {
     }
 }
 
-/// Egress cap holds count per connection (#6128 review), and a hold extends a
-/// send only within the window of an acknowledgement seen during it (#6128
-/// CI): on a capped node whose cap a busy connection keeps saturated, a send
+/// Egress cap holds count per connection, and a hold extends a send only
+/// within the window of an acknowledgement seen during it (a dark connection's
+/// own held probes are no evidence it is alive): on a capped node whose cap a busy connection keeps saturated, a send
 /// on another connection to a peer that has gone dark ends within a hold credit
 /// (`route::hold_credit`) and a window of the connection's last
 /// acknowledgement, however its own probes are held, and a later send on that
