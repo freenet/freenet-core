@@ -4578,6 +4578,87 @@ mod tests {
         }
     }
 
+    /// #6143: the other two receiver pre-merge skips, on both receive paths.
+    /// A payload already merged into local state is `RxAlreadyApplied`; one
+    /// from a sender whose per-sender merge backoff has tripped is
+    /// `RxBackoff`. Each case uses a fresh payload so the dedup cache does
+    /// not take it first.
+    #[tokio::test]
+    async fn receiver_already_applied_and_backoff_skips_are_counted() {
+        use crate::operations::update::propagation_stats::PropagationEvent as Ev;
+        use crate::ring::merge_backoff::MergeFailureClass;
+
+        let (op_manager, _notification_rx, _guard) =
+            build_queue_full_test_node("rx-skips-count-6143").await;
+        let sender_addr: SocketAddr = "127.0.0.1:12400".parse().unwrap();
+        let key_of = |seed: u8| {
+            ContractKey::from_id_and_code(
+                ContractInstanceId::new([seed; 32]),
+                CodeHash::new([seed + 1; 32]),
+            )
+        };
+        let (inline_key, stream_key) = (key_of(21), key_of(23));
+        let inline = |key: ContractKey, bytes: Vec<u8>| {
+            let op_manager = &op_manager;
+            async move {
+                let _result: Result<(), OpError> = drive_relay_broadcast_to(
+                    op_manager,
+                    Transaction::new::<UpdateMsg>(),
+                    key,
+                    DeltaOrFullState::Delta(bytes),
+                    Vec::new(),
+                    sender_addr,
+                    crate::ring::broadcast_coverage::CoveredPeers::empty(),
+                )
+                .await;
+            }
+        };
+        let streamed = |key: ContractKey, bytes: Vec<u8>| {
+            let op_manager = &op_manager;
+            async move {
+                let _result: Result<(), OpError> = apply_streaming_broadcast(
+                    op_manager,
+                    Transaction::new::<UpdateMsg>(),
+                    key,
+                    bytes,
+                    Vec::new(),
+                    sender_addr,
+                    crate::ring::broadcast_coverage::CoveredPeers::empty(),
+                )
+                .await;
+            }
+        };
+
+        // Already applied.
+        let applied = &op_manager.ring.applied_payloads;
+        applied.record_absorbed(&inline_key, applied.payload_hash(true, &[1, 1]));
+        applied.record_absorbed(&stream_key, applied.payload_hash(false, &[2, 2]));
+        inline(inline_key, vec![1, 1]).await;
+        streamed(stream_key, vec![2, 2]).await;
+
+        // Per-sender backoff: three consecutive Invalid failures trip it.
+        for key in [inline_key, stream_key] {
+            for h in [0x31u64, 0x32, 0x33] {
+                op_manager.ring.merge_backoff.record_failure(
+                    key.id(),
+                    sender_addr,
+                    MergeFailureClass::Invalid,
+                    h,
+                );
+            }
+        }
+        inline(inline_key, vec![3, 3]).await;
+        streamed(stream_key, vec![4, 4]).await;
+
+        for key in [inline_key, stream_key] {
+            let events = op_manager
+                .update_propagation_stats
+                .events_for_test(key.id());
+            assert_eq!(events.get(Ev::RxAlreadyApplied), 1, "{key}: {events:?}");
+            assert_eq!(events.get(Ev::RxBackoff), 1, "{key}: {events:?}");
+        }
+    }
+
     /// A generic contract-exec rejection: `is_contract_exec_rejection() == true`
     /// (recorded by the merge backoff as the Invalid class) but NOT
     /// `is_invalid_update_rejection` (so the driver does not spawn summary-back)

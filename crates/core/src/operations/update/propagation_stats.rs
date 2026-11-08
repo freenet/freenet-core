@@ -43,17 +43,23 @@
 //! place a leg can end without a send logged at debug or trace, which release
 //! builds compile out (`release_max_level_info`). So the summary also counts
 //! what each leg actually did ([`PropagationEvent`]): handed a delta or a full
-//! state to the network bridge, or skipped and why, plus the best-effort
-//! `try_notify` drops that lose a whole fan-out or heal before it starts, and
-//! the receiver-side pre-merge skips. The same counts go to the
-//! `broadcast_payload_mix` telemetry event so the fleet can see them.
+//! state to the network bridge, or skipped and why; how the transport then
+//! carried it (one packet, or a stream, and whether the stream's last
+//! fragment left); the best-effort `try_notify` drops that lose a whole
+//! fan-out or heal before it starts; and the receiver-side pre-merge skips.
+//! The same counts go to the `broadcast_payload_mix` telemetry event so the
+//! fleet can see them.
+//!
+//! The transport layer matters for #6143 itself: that node's telemetry
+//! counted ~14 delta sends per update handed to the bridge, so the loss was
+//! below it.
 //!
 //! On top of that, [`detect_stalls`] WARNs when a contract had
 //! locally-originated (client) updates that resolved targets in one window and
-//! no send was handed to the bridge for it in that window or the next. That is
-//! the #6143 shape at the layer this module can see. It does not see past the
-//! bridge: a leg handed to the event loop and lost later (transport, receiver)
-//! still counts as sent here.
+//! nothing reached the wire for it in that window or the next. What it cannot
+//! see: a single packet abandoned after its retransmits, and anything the
+//! receiver does with a message that arrived. The transport has no
+//! per-message receiver acknowledgement to count.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -92,8 +98,8 @@ const MAX_STALL_CANDIDATES: usize = 256;
 /// contract, other than the fan-out target resolution `record_broadcast`
 /// already counts. See the module docs (#6143).
 ///
-/// Counts are per event, not per leg: [`Self::StreamUndelivered`] is a later
-/// event on a leg already counted as [`Self::SentFull`].
+/// Counts are per event, not per leg: one leg is usually a `Sent*` event and
+/// then a `Wire*` event, and a stream one more `WireStream*` outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PropagationEvent {
     /// A local client UPDATE that changed this node's state, and so emitted a
@@ -120,15 +126,32 @@ pub(crate) enum PropagationEvent {
     /// The send itself failed: `bridge.send` or the stream dispatch returned
     /// `Err`, or the payload failed to serialize.
     SendFailed,
-    /// A full-state stream was dispatched but dropped or timed out before the
-    /// transport reported it delivered.
-    StreamUndelivered,
     /// A `BroadcastStateChange` (a whole fan-out) was dropped because the
     /// event-loop notification channel was full.
     FanoutEventDropped,
     /// A `SyncStateToPeer` (a targeted heal) was dropped because the
     /// event-loop notification channel was full.
     HealEventDropped,
+    /// Transport: an UPDATE broadcast message left as one UDP packet. It is
+    /// retransmitted until acknowledged or abandoned, and nothing reports
+    /// which, so this is the last thing observed of it.
+    WireShort,
+    /// Transport: an UPDATE broadcast went out as a stream, either an inline
+    /// message too big for one packet or a full-state broadcast stream. Its
+    /// fate is one of the three `WireStream*` events below.
+    WireStream,
+    /// Transport: an UPDATE broadcast message on a path that reports no
+    /// per-message fate (the QUIC data path).
+    WireUnobserved,
+    /// Transport: a stream's last fragment left the sender. NOT a receiver
+    /// acknowledgement; the UDP stream path has none.
+    WireStreamDelivered,
+    /// Transport: a stream failed before its last fragment left (cwnd wait
+    /// timeout, send error, connection gone, or no outcome in time).
+    WireStreamFailed,
+    /// Transport: a stream failed because a fragment missed the node-wide
+    /// egress deadline. The transport logs these per stream at debug only.
+    WireStreamEgressAbandoned,
     /// Receiver: an inbound broadcast skipped by the 60 s payload dedup cache.
     RxDedup,
     /// Receiver: an inbound broadcast skipped because the payload is already
@@ -142,7 +165,7 @@ pub(crate) enum PropagationEvent {
 impl PropagationEvent {
     /// Every event, in reporting order. Kept in lockstep with
     /// [`Self::index`] by `propagation_events_are_densely_indexed`.
-    pub(crate) const ALL: [PropagationEvent; 16] = [
+    pub(crate) const ALL: [PropagationEvent; 21] = [
         PropagationEvent::ClientOriginated,
         PropagationEvent::SentDelta,
         PropagationEvent::SentFull,
@@ -153,9 +176,14 @@ impl PropagationEvent {
         PropagationEvent::SkipNotHosted,
         PropagationEvent::SkipNoAddress,
         PropagationEvent::SendFailed,
-        PropagationEvent::StreamUndelivered,
         PropagationEvent::FanoutEventDropped,
         PropagationEvent::HealEventDropped,
+        PropagationEvent::WireShort,
+        PropagationEvent::WireStream,
+        PropagationEvent::WireUnobserved,
+        PropagationEvent::WireStreamDelivered,
+        PropagationEvent::WireStreamFailed,
+        PropagationEvent::WireStreamEgressAbandoned,
         PropagationEvent::RxDedup,
         PropagationEvent::RxAlreadyApplied,
         PropagationEvent::RxBackoff,
@@ -175,12 +203,30 @@ impl PropagationEvent {
             PropagationEvent::SkipNotHosted => 7,
             PropagationEvent::SkipNoAddress => 8,
             PropagationEvent::SendFailed => 9,
-            PropagationEvent::StreamUndelivered => 10,
-            PropagationEvent::FanoutEventDropped => 11,
-            PropagationEvent::HealEventDropped => 12,
-            PropagationEvent::RxDedup => 13,
-            PropagationEvent::RxAlreadyApplied => 14,
-            PropagationEvent::RxBackoff => 15,
+            PropagationEvent::FanoutEventDropped => 10,
+            PropagationEvent::HealEventDropped => 11,
+            PropagationEvent::WireShort => 12,
+            PropagationEvent::WireStream => 13,
+            PropagationEvent::WireUnobserved => 14,
+            PropagationEvent::WireStreamDelivered => 15,
+            PropagationEvent::WireStreamFailed => 16,
+            PropagationEvent::WireStreamEgressAbandoned => 17,
+            PropagationEvent::RxDedup => 18,
+            PropagationEvent::RxAlreadyApplied => 19,
+            PropagationEvent::RxBackoff => 20,
+        }
+    }
+
+    /// The `WireStream*` event for a stream's completion signal: `None` when
+    /// none came (the sender was dropped unsignalled, or the wait ran out).
+    /// A cwnd-wait timeout ends that way, as does a stream orphaned at
+    /// connection teardown.
+    pub(crate) fn for_stream_outcome(outcome: Option<crate::transport::StreamSendOutcome>) -> Self {
+        use crate::transport::StreamSendOutcome;
+        match outcome {
+            Some(StreamSendOutcome::Delivered) => PropagationEvent::WireStreamDelivered,
+            Some(StreamSendOutcome::EgressAbandoned) => PropagationEvent::WireStreamEgressAbandoned,
+            Some(StreamSendOutcome::Dropped) | None => PropagationEvent::WireStreamFailed,
         }
     }
 
@@ -198,9 +244,14 @@ impl PropagationEvent {
             PropagationEvent::SkipNotHosted => "skip_not_hosted",
             PropagationEvent::SkipNoAddress => "skip_no_address",
             PropagationEvent::SendFailed => "send_failed",
-            PropagationEvent::StreamUndelivered => "stream_undelivered",
             PropagationEvent::FanoutEventDropped => "fanout_event_dropped",
             PropagationEvent::HealEventDropped => "heal_event_dropped",
+            PropagationEvent::WireShort => "wire_short",
+            PropagationEvent::WireStream => "wire_stream",
+            PropagationEvent::WireUnobserved => "wire_unobserved",
+            PropagationEvent::WireStreamDelivered => "wire_stream_delivered",
+            PropagationEvent::WireStreamFailed => "wire_stream_failed",
+            PropagationEvent::WireStreamEgressAbandoned => "wire_stream_egress_abandoned",
             PropagationEvent::RxDedup => "rx_dedup",
             PropagationEvent::RxAlreadyApplied => "rx_already_applied",
             PropagationEvent::RxBackoff => "rx_backoff",
@@ -240,6 +291,16 @@ impl EventCounts {
     pub(crate) fn sent(&self) -> u64 {
         self.get(PropagationEvent::SentDelta)
             .saturating_add(self.get(PropagationEvent::SentFull))
+    }
+
+    /// Messages the transport took and did not report lost: a single packet
+    /// or an unobserved path (neither reports a fate), or a stream whose last
+    /// fragment left. The strongest per-message "it went out" the node can
+    /// see; nothing here is a receiver acknowledgement.
+    pub(crate) fn reached_wire(&self) -> u64 {
+        self.get(PropagationEvent::WireShort)
+            .saturating_add(self.get(PropagationEvent::WireUnobserved))
+            .saturating_add(self.get(PropagationEvent::WireStreamDelivered))
     }
 }
 
@@ -429,8 +490,8 @@ pub(crate) fn aggregate_window(
     })
 }
 
-/// A contract whose local client updates resolved fan-out targets but put
-/// nothing on the network bridge for two consecutive windows (#6143).
+/// A contract whose local client updates resolved fan-out targets but got
+/// nothing onto the wire for two consecutive windows (#6143).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StallReport {
     pub(crate) contract: ContractInstanceId,
@@ -457,12 +518,19 @@ pub(crate) struct StallCandidate {
 /// candidates.
 ///
 /// A candidate is a contract with at least one local client update, at least
-/// one resolved fan-out target, and zero payloads handed to the network bridge
-/// in the window. It is reported if the NEXT window also hands nothing to the
-/// bridge for it. The second window is grace for a leg queued near the end of
-/// a window (or parked waiting on lane capacity) that sends just after the
-/// boundary: one send in either window clears it. A contract that keeps
-/// stalling with fresh client updates is reported once per window.
+/// one resolved fan-out target, and nothing that reached the wire in the
+/// window ([`EventCounts::reached_wire`]): every leg was skipped, failed
+/// before the bridge, or went out as a stream that then failed. It is
+/// reported if the NEXT window also gets nothing onto the wire for it. The
+/// second window is grace for a leg queued near the end of a window, or a
+/// stream still in flight at the boundary: one message reaching the wire in
+/// either window clears it. A contract that keeps stalling with fresh client
+/// updates is reported once per window.
+///
+/// The strongest signal available is the sender's: a stream counts once its
+/// last fragment leaves, and a single-packet message once the transport takes
+/// it. Loss after that (a packet abandoned after its retransmits, a receiver
+/// dropping the message) is not seen here.
 ///
 /// Zero resolved targets is deliberately not a candidate: that is the
 /// `no_targets` outcome, which `handle_broadcast_state_change` already WARNs.
@@ -478,7 +546,7 @@ pub(crate) fn detect_stalls(
     let mut reports = Vec::new();
     for (contract, candidate) in pending.drain() {
         let now = current.get(&contract);
-        if now.is_some_and(|s| s.events.sent() > 0) {
+        if now.is_some_and(|s| s.events.reached_wire() > 0) {
             continue;
         }
         let mut events = candidate.events;
@@ -496,7 +564,7 @@ pub(crate) fn detect_stalls(
 
     for s in window {
         let client_originated = s.events.get(PropagationEvent::ClientOriginated);
-        if client_originated == 0 || s.targets_total == 0 || s.events.sent() > 0 {
+        if client_originated == 0 || s.targets_total == 0 || s.events.reached_wire() > 0 {
             continue;
         }
         if pending.len() >= MAX_STALL_CANDIDATES {
@@ -703,7 +771,12 @@ impl UpdatePropagationStats {
             skip_not_hosted = e.get(PropagationEvent::SkipNotHosted),
             skip_no_address = e.get(PropagationEvent::SkipNoAddress),
             send_failed = e.get(PropagationEvent::SendFailed),
-            stream_undelivered = e.get(PropagationEvent::StreamUndelivered),
+            wire_short = e.get(PropagationEvent::WireShort),
+            wire_stream = e.get(PropagationEvent::WireStream),
+            wire_unobserved = e.get(PropagationEvent::WireUnobserved),
+            wire_stream_delivered = e.get(PropagationEvent::WireStreamDelivered),
+            wire_stream_failed = e.get(PropagationEvent::WireStreamFailed),
+            wire_stream_egress_abandoned = e.get(PropagationEvent::WireStreamEgressAbandoned),
             fanout_event_dropped = e.get(PropagationEvent::FanoutEventDropped),
             heal_event_dropped = e.get(PropagationEvent::HealEventDropped),
             rx_dedup = e.get(PropagationEvent::RxDedup),
@@ -733,7 +806,12 @@ impl UpdatePropagationStats {
                 skip_not_hosted = e.get(PropagationEvent::SkipNotHosted),
                 skip_no_address = e.get(PropagationEvent::SkipNoAddress),
                 send_failed = e.get(PropagationEvent::SendFailed),
-                stream_undelivered = e.get(PropagationEvent::StreamUndelivered),
+                wire_short = e.get(PropagationEvent::WireShort),
+                wire_stream = e.get(PropagationEvent::WireStream),
+                wire_unobserved = e.get(PropagationEvent::WireUnobserved),
+                wire_stream_delivered = e.get(PropagationEvent::WireStreamDelivered),
+                wire_stream_failed = e.get(PropagationEvent::WireStreamFailed),
+                wire_stream_egress_abandoned = e.get(PropagationEvent::WireStreamEgressAbandoned),
                 fanout_event_dropped = e.get(PropagationEvent::FanoutEventDropped),
                 heal_event_dropped = e.get(PropagationEvent::HealEventDropped),
                 rx_dedup = e.get(PropagationEvent::RxDedup),
@@ -810,11 +888,51 @@ fn log_stall(stall: &StallReport) {
         skip_no_address = e.get(PropagationEvent::SkipNoAddress),
         send_failed = e.get(PropagationEvent::SendFailed),
         fanout_event_dropped = e.get(PropagationEvent::FanoutEventDropped),
+        sent_delta = e.get(PropagationEvent::SentDelta),
+        sent_full = e.get(PropagationEvent::SentFull),
+        wire_stream = e.get(PropagationEvent::WireStream),
+        wire_stream_failed = e.get(PropagationEvent::WireStreamFailed),
+        wire_stream_egress_abandoned = e.get(PropagationEvent::WireStreamEgressAbandoned),
         window_s = SUMMARY_WINDOW.as_secs(),
         phase = "origination_stall",
         "update_propagation_stalled: local client updates found broadcast targets \
-         but no payload was handed to the network for two windows (#6143)"
+         but nothing reached the wire for two windows (#6143)"
     );
+}
+
+/// The two places a [`PropagationEvent`] is counted, held for code that has
+/// no [`crate::node::OpManager`] at hand: the per-connection send task, which
+/// sees how the transport carried each UPDATE broadcast.
+#[derive(Clone)]
+pub(crate) struct PropagationSink {
+    stats: std::sync::Arc<UpdatePropagationStats>,
+    mix: std::sync::Arc<crate::node::PayloadMix>,
+}
+
+impl PropagationSink {
+    pub(crate) fn of(op_manager: &crate::node::OpManager) -> Self {
+        Self {
+            stats: op_manager.update_propagation_stats.clone(),
+            mix: op_manager.payload_mix.clone(),
+        }
+    }
+
+    /// Same as [`record_propagation_event`].
+    pub(crate) fn record(&self, contract: &ContractInstanceId, ev: PropagationEvent) {
+        self.stats.record_event(*contract, ev);
+        self.mix.record_propagation_event(ev);
+    }
+
+    /// A sink of its own, for tests, with the stats it records into.
+    #[cfg(test)]
+    pub(crate) fn for_test() -> (Self, std::sync::Arc<UpdatePropagationStats>) {
+        let stats = std::sync::Arc::new(UpdatePropagationStats::new());
+        let sink = Self {
+            stats: stats.clone(),
+            mix: std::sync::Arc::new(crate::node::PayloadMix::new()),
+        };
+        (sink, stats)
+    }
 }
 
 /// Count one [`PropagationEvent`] in BOTH the per-contract INFO summary and
@@ -1401,6 +1519,32 @@ mod tests {
     }
 
     #[test]
+    fn a_stream_outcome_maps_to_its_wire_event() {
+        use crate::transport::StreamSendOutcome;
+        for (outcome, want) in [
+            (
+                Some(StreamSendOutcome::Delivered),
+                PropagationEvent::WireStreamDelivered,
+            ),
+            (
+                Some(StreamSendOutcome::EgressAbandoned),
+                PropagationEvent::WireStreamEgressAbandoned,
+            ),
+            (
+                Some(StreamSendOutcome::Dropped),
+                PropagationEvent::WireStreamFailed,
+            ),
+            (None, PropagationEvent::WireStreamFailed),
+        ] {
+            assert_eq!(
+                PropagationEvent::for_stream_outcome(outcome),
+                want,
+                "{outcome:?}"
+            );
+        }
+    }
+
+    #[test]
     fn each_event_is_counted_against_its_own_contract() {
         let stats = UpdatePropagationStats::new();
         let (a, b) = (cid(1), cid(2));
@@ -1476,6 +1620,72 @@ mod tests {
         assert!(detect_stalls(&mut pending, &[]).is_empty());
     }
 
+    /// The shape #6143's own telemetry fits: every leg handed to the bridge,
+    /// and every one then lost as a failed or abandoned stream. Counting at
+    /// the bridge alone would call this healthy.
+    #[test]
+    fn legs_handed_to_the_bridge_whose_streams_all_failed_are_a_stall() {
+        let c = cid(10);
+        let lost = || {
+            vec![summary(
+                c,
+                14,
+                counts(&[
+                    (PropagationEvent::ClientOriginated, 1),
+                    (PropagationEvent::SentDelta, 14),
+                    (PropagationEvent::WireStream, 14),
+                    (PropagationEvent::WireStreamFailed, 10),
+                    (PropagationEvent::WireStreamEgressAbandoned, 4),
+                ]),
+            )]
+        };
+        let mut pending = HashMap::new();
+        assert!(
+            detect_stalls(&mut pending, &lost()).is_empty(),
+            "grace window"
+        );
+        let reports = detect_stalls(&mut pending, &lost());
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].events.get(PropagationEvent::SentDelta), 28);
+        assert_eq!(
+            reports[0]
+                .events
+                .get(PropagationEvent::WireStreamEgressAbandoned),
+            8
+        );
+    }
+
+    /// A stream still in flight at the window boundary, delivered in the next
+    /// window, clears the candidate.
+    #[test]
+    fn a_stream_delivered_in_the_grace_window_clears_the_candidate() {
+        let c = cid(11);
+        let mut pending = HashMap::new();
+        detect_stalls(
+            &mut pending,
+            &[summary(
+                c,
+                2,
+                counts(&[
+                    (PropagationEvent::ClientOriginated, 1),
+                    (PropagationEvent::SentDelta, 2),
+                    (PropagationEvent::WireStream, 2),
+                ]),
+            )],
+        );
+        assert_eq!(
+            pending.len(),
+            1,
+            "in flight: nothing has reached the wire yet"
+        );
+        let w2 = vec![summary(
+            c,
+            0,
+            counts(&[(PropagationEvent::WireStreamDelivered, 1)]),
+        )];
+        assert!(detect_stalls(&mut pending, &w2).is_empty());
+    }
+
     #[test]
     fn a_send_in_the_grace_window_clears_the_candidate() {
         let c = cid(9);
@@ -1488,8 +1698,15 @@ mod tests {
                 counts(&[(PropagationEvent::ClientOriginated, 1)]),
             )],
         );
-        // The legs were queued near the boundary and sent in the next window.
-        let w2 = vec![summary(c, 0, counts(&[(PropagationEvent::SentDelta, 3)]))];
+        // The legs were queued near the boundary and went out in the next window.
+        let w2 = vec![summary(
+            c,
+            0,
+            counts(&[
+                (PropagationEvent::SentDelta, 3),
+                (PropagationEvent::WireShort, 3),
+            ]),
+        )];
         assert!(detect_stalls(&mut pending, &w2).is_empty());
         assert!(pending.is_empty());
     }
@@ -1498,13 +1715,15 @@ mod tests {
     fn non_candidates_never_warn() {
         let mut pending = HashMap::new();
         let w = vec![
-            // Sent in the same window.
+            // Reached the wire in the same window.
             summary(
                 cid(1),
                 5,
                 counts(&[
                     (PropagationEvent::ClientOriginated, 1),
                     (PropagationEvent::SentFull, 1),
+                    (PropagationEvent::WireStream, 1),
+                    (PropagationEvent::WireStreamDelivered, 1),
                 ]),
             ),
             // No targets: the NO_TARGETS path, which already WARNs itself.
@@ -1631,20 +1850,48 @@ mod tests {
     fn every_propagation_event_has_a_production_recording_site() {
         let sources = [
             include_str!("../../node/network_bridge/broadcast_queue.rs"),
+            include_str!("../../node/network_bridge/p2p_protoc.rs"),
             include_str!("../../node/op_state_manager.rs"),
             include_str!("../update.rs"),
             include_str!("op_ctx_task.rs"),
         ];
-        for ev in PropagationEvent::ALL {
-            let needle = format!("PropagationEvent::{ev:?}");
-            let found = sources.iter().any(|src| {
-                // Production code only: everything above the first test module.
-                let prod = src.split("#[cfg(test)]\nmod ").next().unwrap_or(src);
-                prod.lines().any(|line| {
-                    let line = line.trim_start();
-                    !line.starts_with("//") && line.contains(&needle)
-                })
+        // Production code only: everything above the first top-level test
+        // module, whatever its visibility.
+        let production = |src: &'static str| -> &'static str {
+            let test_mod = src.match_indices("\n#[cfg(test)]\n").find(|(i, m)| {
+                let rest = &src[i + m.len()..];
+                ["mod ", "pub(crate) mod ", "pub(super) mod "]
+                    .iter()
+                    .any(|p| rest.starts_with(p))
             });
+            test_mod.map_or(src, |(i, _)| &src[..i])
+        };
+        let named = |src: &'static str, needle: &str| {
+            production(src).lines().any(|line| {
+                let line = line.trim_start();
+                !line.starts_with("//") && line.contains(needle)
+            })
+        };
+        // The three stream fates are produced by `for_stream_outcome`, which
+        // must be called from BOTH stream paths: the broadcast queue's
+        // full-state streams and the connection task's inline broadcasts.
+        let by_outcome = [
+            PropagationEvent::WireStreamDelivered,
+            PropagationEvent::WireStreamFailed,
+            PropagationEvent::WireStreamEgressAbandoned,
+        ];
+        for src in &sources[..2] {
+            assert!(
+                named(src, "PropagationEvent::for_stream_outcome("),
+                "a stream path no longer records its stream's fate"
+            );
+        }
+        for ev in PropagationEvent::ALL {
+            if by_outcome.contains(&ev) {
+                continue;
+            }
+            let needle = format!("PropagationEvent::{ev:?}");
+            let found = sources.iter().any(|src| named(src, &needle));
             assert!(found, "{needle} is never recorded by production code");
         }
     }

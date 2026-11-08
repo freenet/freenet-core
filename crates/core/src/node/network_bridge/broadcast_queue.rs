@@ -4119,6 +4119,15 @@ fn streaming_completion_delivered(completion: StreamCompletionResult) -> bool {
     matches!(completion, Ok(Ok(StreamSendOutcome::Delivered)))
 }
 
+/// The outcome a streaming completion reported, or `None` when it reported
+/// none (the oneshot was dropped unsignalled, or the wait timed out).
+fn stream_outcome_of(completion: &StreamCompletionResult) -> Option<StreamSendOutcome> {
+    match completion {
+        Ok(Ok(outcome)) => Some(*outcome),
+        Ok(Err(_)) | Err(_) => None,
+    }
+}
+
 /// Result of awaiting the streaming completion oneshot under a timeout:
 /// `timeout(.., completion_rx).await`. The inner `Ok`/`Err` distinguishes a
 /// delivered/dropped signal from a dropped oneshot; the outer `Err` is the
@@ -4939,9 +4948,10 @@ pub(super) async fn broadcast_to_single_peer(
                     "Failed to send broadcast stream data"
                 );
             } else {
-                // Handed to the transport. Whether it then completes is
-                // counted separately (`StreamUndelivered`) below.
+                // Handed to the transport, as a stream. Its fate is counted
+                // below from the completion signal.
                 record_propagation_event(op_manager, key.id(), PropagationEvent::SentFull);
+                record_propagation_event(op_manager, key.id(), PropagationEvent::WireStream);
                 // Wait for the stream transfer to actually complete before
                 // doing the delivery bookkeeping. The lane permit is held for
                 // at most `STREAM_PERMIT_HOLD` of the wait; the queue's claim on
@@ -4956,6 +4966,11 @@ pub(super) async fn broadcast_to_single_peer(
                     completion_timeout,
                 )
                 .await;
+                record_propagation_event(
+                    op_manager,
+                    key.id(),
+                    PropagationEvent::for_stream_outcome(stream_outcome_of(&completion)),
+                );
                 // Classify AND apply the delivery gate in one production call
                 // (#4235): only a real `Delivered` refreshes interest / caches
                 // the summary. See `record_streaming_delivery`.
@@ -5008,11 +5023,6 @@ pub(super) async fn broadcast_to_single_peer(
                         "Broadcast stream completed successfully"
                     );
                 } else {
-                    record_propagation_event(
-                        op_manager,
-                        key.id(),
-                        PropagationEvent::StreamUndelivered,
-                    );
                     tracing::debug!(
                         tx = %update_tx,
                         peer = %peer_addr,
@@ -6706,6 +6716,10 @@ mod tests {
     /// A real `OpManager` hosting one contract, connected to one peer, with a
     /// stand-in contract handler whose stored state is `stored` throughout.
     /// Shared by the tests below that drive the real `broadcast_to_single_peer`.
+    /// A peer summary for which `one_peer_node`'s stand-in fails the first
+    /// delta query (see the handler).
+    const PROBE_FAILS_ONCE: &[u8] = &[0xBB];
+
     struct OnePeerNode {
         op_manager: std::sync::Arc<crate::node::OpManager>,
         key: ContractKey,
@@ -6784,6 +6798,7 @@ mod tests {
         let target = PeerKeyLocation::new(peer_pub.clone(), peer_addr);
         let peer_key = PeerKey::from(peer_pub);
 
+        let probe_failed = std::sync::atomic::AtomicBool::new(false);
         let handler = tokio::spawn(async move {
             while let Ok((id, ev, _priority)) = ch_channel.recv_from_sender().await {
                 #[allow(
@@ -6805,6 +6820,23 @@ mod tests {
                             contract: None,
                         }),
                     },
+                    // Every peer summary this stand-in is asked about is
+                    // converged with the stored state: an empty delta. The
+                    // one exception, `PROBE_FAILS_ONCE`, fails its first query,
+                    // so the staleness probe cannot decide and the leg goes on
+                    // to `compute_delta`, which then gets the empty delta.
+                    ContractHandlerEvent::GetDeltaQuery { key, their_summary } => {
+                        let delta = if their_summary.as_ref() == PROBE_FAILS_ONCE
+                            && !probe_failed.swap(true, std::sync::atomic::Ordering::Relaxed)
+                        {
+                            Err(crate::contract::ExecutorError::other(
+                                crate::contract::ContractQueueFull,
+                            ))
+                        } else {
+                            Ok(freenet_stdlib::prelude::StateDelta::from(Vec::<u8>::new()))
+                        };
+                        ContractHandlerEvent::GetDeltaResponse { key, delta }
+                    }
                     ContractHandlerEvent::GetStateAndSummaryQuery { key } => {
                         ContractHandlerEvent::GetStateAndSummaryResponse {
                             key,
@@ -7175,6 +7207,124 @@ mod tests {
         assert_eq!(events.get(Ev::FanoutEventDropped), 3, "{events:?}");
         assert_eq!(events.get(Ev::HealEventDropped), 1, "{events:?}");
 
+        node.handler.abort();
+    }
+
+    /// #6143: the three converged-skips past the byte compare, through the real
+    /// `broadcast_to_single_peer`. A peer whose cached summary differs from
+    /// ours byte-wise is skipped as `SkipCachedConverged` when the shared delta
+    /// cache already holds an empty delta for the pair, and as
+    /// `SkipProbeConverged` when the bounded WASM probe (the stand-in answers
+    /// an empty delta) says so, and as `SkipEmptyDelta` when the probe cannot
+    /// decide and `compute_delta` then returns an empty delta.
+    #[tokio::test(flavor = "current_thread")]
+    async fn semantic_converged_skips_are_counted_by_the_check_that_decided() {
+        use std::sync::Arc;
+
+        use freenet_stdlib::prelude::{StateDelta, WrappedState};
+
+        use crate::node::network_bridge::p2p_protoc::{P2pBridge, P2pBridgeEvent};
+        use crate::operations::update::propagation_stats::PropagationEvent as Ev;
+        use crate::ring::interest::SummaryPopulationSource;
+
+        let state = WrappedState::new(vec![5u8; 32]);
+        let ours = summary_of(state.as_ref());
+        let node = one_peer_node("bq-6143-semantic-skips", state.clone(), true).await;
+        let op_manager = &node.op_manager;
+        let key = node.key;
+        let fanout: super::FanoutTargets = Arc::new(vec![node.target.pub_key().clone()]);
+        let (bridge_tx, mut bridge_rx) = tokio::sync::mpsc::channel::<P2pBridgeEvent>(16);
+        let bridge = P2pBridge::new_for_test(bridge_tx, op_manager.clone());
+        let events = || {
+            op_manager
+                .update_propagation_stats
+                .events_for_test(key.id())
+        };
+
+        // Cached verdict.
+        let theirs = StateSummary::from(vec![0xEEu8]);
+        assert_ne!(theirs.as_ref(), ours.as_ref());
+        op_manager.interest_manager.upsert_peer_summary_from(
+            &key,
+            &node.peer_key,
+            theirs.clone(),
+            SummaryPopulationSource::Delivery,
+        );
+        op_manager.interest_manager.cache_delta(
+            &key,
+            theirs.as_ref(),
+            ours.as_ref(),
+            StateDelta::from(Vec::<u8>::new()),
+        );
+        super::broadcast_to_single_peer(
+            &bridge,
+            op_manager,
+            key,
+            state.clone(),
+            node.target.clone(),
+            None,
+            fanout.clone(),
+        )
+        .await;
+        assert_eq!(events().get(Ev::SkipCachedConverged), 1, "{:?}", events());
+
+        // Probe verdict: a different summary, nothing cached for it.
+        let other_addr: std::net::SocketAddr = "127.0.0.1:47103".parse().unwrap();
+        let other_pub = crate::transport::TransportPublicKey::from_bytes([9u8; 32]);
+        assert!(op_manager.ring.connection_manager.add_connection(
+            crate::ring::Location::new(0.7),
+            other_addr,
+            other_pub.clone(),
+            false,
+        ));
+        op_manager.interest_manager.upsert_peer_summary_from(
+            &key,
+            &PeerKey::from(other_pub.clone()),
+            StateSummary::from(vec![0xDDu8]),
+            SummaryPopulationSource::Delivery,
+        );
+        super::broadcast_to_single_peer(
+            &bridge,
+            op_manager,
+            key,
+            state.clone(),
+            crate::ring::PeerKeyLocation::new(other_pub, other_addr),
+            None,
+            fanout.clone(),
+        )
+        .await;
+        assert_eq!(events().get(Ev::SkipProbeConverged), 1, "{:?}", events());
+
+        // Empty delta from `compute_delta`: the probe failed, so the leg went
+        // on to compute a delta, and the contract said there is nothing to send.
+        let third_addr: std::net::SocketAddr = "127.0.0.1:47104".parse().unwrap();
+        let third_pub = crate::transport::TransportPublicKey::from_bytes([10u8; 32]);
+        assert!(op_manager.ring.connection_manager.add_connection(
+            crate::ring::Location::new(0.8),
+            third_addr,
+            third_pub.clone(),
+            false,
+        ));
+        op_manager.interest_manager.upsert_peer_summary_from(
+            &key,
+            &PeerKey::from(third_pub.clone()),
+            StateSummary::from(PROBE_FAILS_ONCE.to_vec()),
+            SummaryPopulationSource::Delivery,
+        );
+        super::broadcast_to_single_peer(
+            &bridge,
+            op_manager,
+            key,
+            state.clone(),
+            crate::ring::PeerKeyLocation::new(third_pub, third_addr),
+            None,
+            fanout.clone(),
+        )
+        .await;
+        assert_eq!(events().get(Ev::SkipEmptyDelta), 1, "{:?}", events());
+
+        assert!(bridge_rx.try_recv().is_err(), "no peer was sent anything");
+        assert_eq!(events().sent(), 0);
         node.handler.abort();
     }
 }

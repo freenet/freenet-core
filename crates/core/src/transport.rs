@@ -349,8 +349,8 @@ impl From<SocketAddr> for ObservedAddr {
 pub(crate) use self::boundary::TransportHandle;
 pub(crate) use self::boundary::{
     CloseReason, InboundAcceptor, InboundExpectations, InboundStreamRegistry, ListenerExit,
-    NextConnection, OutboundConnector, PeerConnectionApi, PendingConnection, ReceiptStamp,
-    StreamProgressObserver, StreamSendOutcome,
+    NextConnection, ObservedSend, OutboundConnector, PeerConnectionApi, PendingConnection,
+    ReceiptStamp, StreamProgressObserver, StreamSendOutcome,
 };
 pub use self::boundary::{IncomingChunks, IncomingStream, StreamIdentity};
 #[cfg(test)]

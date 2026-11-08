@@ -3432,10 +3432,83 @@ enum ProtocolStatus {
     Failed,
 }
 
+/// The contract an outbound message carries an inline UPDATE broadcast for,
+/// if it does. Full-state broadcast streams are sent as `StreamSend` events
+/// and observed by the broadcast queue instead.
+fn inline_broadcast_contract(
+    msg: &NetMessage,
+) -> Option<freenet_stdlib::prelude::ContractInstanceId> {
+    use crate::operations::update::UpdateMsg;
+    match msg {
+        NetMessage::V1(NetMessageV1::Update(
+            UpdateMsg::BroadcastTo { key, .. } | UpdateMsg::BroadcastToV2 { key, .. },
+        )) => Some(*key.id()),
+        NetMessage::V1(_) => None,
+    }
+}
+
+/// Send one serialized UPDATE broadcast for `contract` and count how the
+/// transport carried it (#6143). A stream's fate arrives later, on a task of
+/// its own, so this connection's task never waits for it.
+async fn send_observed_broadcast(
+    conn: &mut Box<dyn PeerConnectionApi>,
+    data: Vec<u8>,
+    contract: freenet_stdlib::prelude::ContractInstanceId,
+    propagation: &crate::operations::update::propagation_stats::PropagationSink,
+) -> Result<(), TransportError> {
+    use crate::operations::update::propagation_stats::PropagationEvent;
+    use crate::transport::ObservedSend;
+
+    let len = data.len() as u64;
+    let peer = conn.remote_addr();
+    let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+    let observed = match conn.send_bytes_observed(data, completion_tx).await {
+        Ok(observed) => observed,
+        Err(error) => {
+            propagation.record(&contract, PropagationEvent::SendFailed);
+            return Err(error);
+        }
+    };
+    match observed {
+        ObservedSend::Short => propagation.record(&contract, PropagationEvent::WireShort),
+        ObservedSend::Unobserved => propagation.record(&contract, PropagationEvent::WireUnobserved),
+        ObservedSend::Stream => {
+            propagation.record(&contract, PropagationEvent::WireStream);
+            let propagation = propagation.clone();
+            let wait = super::broadcast_queue::stream_completion_timeout(len);
+            // Short-lived: ends when the stream reports, its sender is
+            // dropped, or the wait runs out.
+            tokio::spawn(async move {
+                let outcome = match tokio::time::timeout(wait, completion_rx).await {
+                    Ok(Ok(outcome)) => Some(outcome),
+                    Ok(Err(_)) | Err(_) => None,
+                };
+                let ev = PropagationEvent::for_stream_outcome(outcome);
+                propagation.record(&contract, ev);
+                if ev != PropagationEvent::WireStreamDelivered {
+                    // The transport's own WARN for this failure (or its debug
+                    // line, for an egress abandon) names no contract; this
+                    // line does.
+                    tracing::warn!(
+                        contract = %contract,
+                        peer = %peer,
+                        outcome = ev.label(),
+                        stream_bytes = len,
+                        "UPDATE broadcast stream to peer failed before its last fragment \
+                         left (#6143)"
+                    );
+                }
+            });
+        }
+    }
+    Ok(())
+}
+
 async fn handle_peer_channel_message(
     conn: &mut Box<dyn PeerConnectionApi>,
     msg: Either<NetMessage, ConnEvent>,
     outbound_mix: &crate::node::network_bridge::outbound_message_mix::OutboundMix,
+    propagation: &crate::operations::update::propagation_stats::PropagationSink,
 ) -> Result<(), TransportError> {
     match msg {
         Left(msg) => {
@@ -3446,13 +3519,20 @@ async fn handle_peer_channel_message(
             // nothing on this hot path.
             let class =
                 crate::node::network_bridge::outbound_message_mix::OutboundClass::classify(&msg);
+            let broadcast_contract = inline_broadcast_contract(&msg);
             // The transport moves bytes; serializing the message is this
             // layer's job. A serialization failure is reported exactly as a
             // failed send.
             let sent = match bincode::serialize(&msg) {
                 Ok(data) => {
                     let serialized_len = data.len();
-                    conn.send_bytes(data).await.map(|()| serialized_len)
+                    match broadcast_contract {
+                        Some(contract) => {
+                            send_observed_broadcast(conn, data, contract, propagation).await
+                        }
+                        None => conn.send_bytes(data).await,
+                    }
+                    .map(|()| serialized_len)
                 }
                 Err(error) => Err(serialization_failure(error)),
             };
@@ -3618,11 +3698,12 @@ async fn drain_pending_before_shutdown(
     conn: &mut Box<dyn PeerConnectionApi>,
     remote_addr: SocketAddr,
     outbound_mix: &crate::node::network_bridge::outbound_message_mix::OutboundMix,
+    propagation: &crate::operations::update::propagation_stats::PropagationSink,
 ) -> usize {
     let mut drained = 0;
     while let Ok(msg) = rx.try_recv() {
         // Best-effort send - connection may already be degraded
-        if let Err(e) = handle_peer_channel_message(conn, msg, outbound_mix).await {
+        if let Err(e) = handle_peer_channel_message(conn, msg, outbound_mix, propagation).await {
             tracing::debug!(
                 to = %remote_addr,
                 ?e,
@@ -3653,6 +3734,9 @@ async fn drain_pending_before_shutdown(
 ///
 /// IMPORTANT: Before exiting on any error path, we drain pending messages to prevent
 /// loss of messages that arrived during the select! wait.
+// One more than clippy's default since #6143 added the propagation sink; the
+// arguments are this task's whole state, each passed once by its one spawn site.
+#[allow(clippy::too_many_arguments)]
 async fn peer_connection_listener(
     mut rx: PeerConnChannelRecv,
     mut conn: Box<dyn PeerConnectionApi>,
@@ -3660,6 +3744,7 @@ async fn peer_connection_listener(
     conn_events: Sender<ConnEvent>,
     connection_id: u64,
     outbound_mix: std::sync::Arc<crate::node::network_bridge::outbound_message_mix::OutboundMix>,
+    propagation: crate::operations::update::propagation_stats::PropagationSink,
     link_use: zombie_sweep::LinkUseStamp,
 ) {
     let remote_addr = conn.remote_addr();
@@ -3690,7 +3775,8 @@ async fn peer_connection_listener(
                 Ok(msg) => {
                     drained += 1;
                     if let Err(error) =
-                        handle_peer_channel_message(&mut conn, msg, &outbound_mix).await
+                        handle_peer_channel_message(&mut conn, msg, &outbound_mix, &propagation)
+                            .await
                     {
                         if !error.closes_connection() {
                             tracing::warn!(
@@ -3711,6 +3797,7 @@ async fn peer_connection_listener(
                                 &mut conn,
                                 remote_addr,
                                 &outbound_mix,
+                                &propagation,
                             )
                             .await;
                             notify_transport_closed(
@@ -3758,7 +3845,7 @@ async fn peer_connection_listener(
             msg = rx.recv() => {
                 match msg {
                     Some(msg) => {
-                        if let Err(error) = handle_peer_channel_message(&mut conn, msg, &outbound_mix).await {
+                        if let Err(error) = handle_peer_channel_message(&mut conn, msg, &outbound_mix, &propagation).await {
                             if !error.closes_connection() {
                                 tracing::warn!(
                                     to = %remote_addr,
@@ -3772,7 +3859,7 @@ async fn peer_connection_listener(
                                     "[CONN_LIFECYCLE] Connection closed after channel command"
                                 );
                                 // Drain any messages that arrived while we were processing this one
-                                drain_pending_before_shutdown(&mut rx, &mut conn, remote_addr, &outbound_mix).await;
+                                drain_pending_before_shutdown(&mut rx, &mut conn, remote_addr, &outbound_mix, &propagation).await;
                                 notify_transport_closed(
                                     &conn_events,
                                     remote_addr,
@@ -3835,7 +3922,7 @@ async fn peer_connection_listener(
                                 );
                                 // Drain pending messages - they may still be sendable even if
                                 // the conn_events channel is closed
-                                drain_pending_before_shutdown(&mut rx, &mut conn, remote_addr, &outbound_mix).await;
+                                drain_pending_before_shutdown(&mut rx, &mut conn, remote_addr, &outbound_mix, &propagation).await;
                                 return;
                             }
                         }
@@ -3846,7 +3933,7 @@ async fn peer_connection_listener(
                                 "[CONN_LIFECYCLE] Failed to deserialize inbound message; closing connection"
                             );
                             // Drain pending outbound messages before closing - they may still succeed
-                            drain_pending_before_shutdown(&mut rx, &mut conn, remote_addr, &outbound_mix).await;
+                            drain_pending_before_shutdown(&mut rx, &mut conn, remote_addr, &outbound_mix, &propagation).await;
                             let transport_error = TransportError::Other(anyhow!(
                                 "Failed to deserialize inbound message from {remote_addr}: {error:?}"
                             ));
@@ -3882,7 +3969,7 @@ async fn peer_connection_listener(
                         // waiting in select!, and they would be lost without this drain.
                         // Label the disconnect (see disconnect_reason_for_close).
                         let reason = disconnect_reason_for_close(conn.close_reason());
-                        drain_pending_before_shutdown(&mut rx, &mut conn, remote_addr, &outbound_mix).await;
+                        drain_pending_before_shutdown(&mut rx, &mut conn, remote_addr, &outbound_mix, &propagation).await;
                         notify_transport_closed(&conn_events, remote_addr, error, connection_id, reason).await;
                         return;
                     }
@@ -4087,6 +4174,13 @@ pub(crate) mod tests {
     struct RecordingConnection {
         sent: Arc<parking_lot::Mutex<Vec<Vec<u8>>>>,
         fail: bool,
+        /// For `send_bytes_observed`: how the send is reported as carried,
+        /// and, for a stream, the outcome to signal (`None` drops the sender
+        /// unsignalled). `None` keeps the trait's default behaviour.
+        observe: Option<(
+            crate::transport::ObservedSend,
+            Option<crate::transport::StreamSendOutcome>,
+        )>,
     }
 
     impl super::PeerConnectionApi for RecordingConnection {
@@ -4113,6 +4207,32 @@ pub(crate) mod tests {
                 Ok(())
             };
             Box::pin(async move { result })
+        }
+
+        fn send_bytes_observed(
+            &mut self,
+            data: Vec<u8>,
+            completion_tx: tokio::sync::oneshot::Sender<crate::transport::StreamSendOutcome>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<crate::transport::ObservedSend, super::TransportError>,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            self.sent.lock().push(data);
+            if self.fail {
+                let err = super::TransportError::ConnectionClosed(self.remote_addr());
+                return Box::pin(async move { Err(err) });
+            }
+            let (observed, outcome) = self
+                .observe
+                .unwrap_or((crate::transport::ObservedSend::Unobserved, None));
+            if let Some(outcome) = outcome {
+                let _ignored = completion_tx.send(outcome);
+            }
+            Box::pin(async move { Ok(observed) })
         }
 
         fn recv(
@@ -4205,12 +4325,14 @@ pub(crate) mod tests {
         let mut conn: Box<dyn super::PeerConnectionApi> = Box::new(RecordingConnection {
             sent: sent.clone(),
             fail: false,
+            observe: None,
         });
         let mix = crate::node::network_bridge::outbound_message_mix::OutboundMix::new();
+        let (sink, _) = crate::operations::update::propagation_stats::PropagationSink::for_test();
         let msg = hosting_announce();
         let expected = bincode::serialize(&msg).unwrap();
 
-        super::handle_peer_channel_message(&mut conn, either::Left(msg), &mix)
+        super::handle_peer_channel_message(&mut conn, either::Left(msg), &mix, &sink)
             .await
             .expect("send succeeds");
 
@@ -4228,18 +4350,176 @@ pub(crate) mod tests {
         let mut conn: Box<dyn super::PeerConnectionApi> = Box::new(RecordingConnection {
             sent: sent.clone(),
             fail: true,
+            observe: None,
         });
         let mix = crate::node::network_bridge::outbound_message_mix::OutboundMix::new();
+        let (sink, _) = crate::operations::update::propagation_stats::PropagationSink::for_test();
 
-        let result =
-            super::handle_peer_channel_message(&mut conn, either::Left(hosting_announce()), &mix)
-                .await;
+        let result = super::handle_peer_channel_message(
+            &mut conn,
+            either::Left(hosting_announce()),
+            &mix,
+            &sink,
+        )
+        .await;
 
         assert!(result.is_err(), "the transport's error is returned");
         assert_eq!(sent.lock().len(), 1, "premise: the send was attempted");
         let rollup = mix.rollup_body_for_test();
         assert_eq!(rollup["total_msgs"], 0);
         assert_eq!(rollup["total_bytes"], 0);
+    }
+
+    /// #6143: an inline UPDATE broadcast is counted against its contract by
+    /// how the transport carried it, and a stream by its fate, with a WARN
+    /// naming the contract when it fails. Other messages are not counted.
+    #[tokio::test]
+    async fn an_inline_broadcast_is_counted_by_how_the_transport_carried_it() {
+        use crate::operations::update::propagation_stats::{
+            PropagationEvent as Ev, PropagationSink,
+        };
+        use crate::transport::{ObservedSend, StreamSendOutcome};
+
+        let key = freenet_stdlib::prelude::ContractKey::from_id_and_code(
+            freenet_stdlib::prelude::ContractInstanceId::new([61u8; 32]),
+            freenet_stdlib::prelude::CodeHash::new([62u8; 32]),
+        );
+        let broadcast = || {
+            crate::message::NetMessage::from(crate::operations::update::UpdateMsg::BroadcastTo {
+                id: crate::message::Transaction::new::<crate::operations::update::UpdateMsg>(),
+                key,
+                payload: crate::message::DeltaOrFullState::Delta(vec![1, 2, 3]),
+                sender_summary_bytes: vec![4, 5],
+            })
+        };
+        let mix = crate::node::network_bridge::outbound_message_mix::OutboundMix::new();
+
+        let run = |fail: bool, observe: Option<(ObservedSend, Option<StreamSendOutcome>)>| {
+            let mix = &mix;
+            async move {
+                let (sink, stats): (PropagationSink, _) = PropagationSink::for_test();
+                let mut conn: Box<dyn super::PeerConnectionApi> = Box::new(RecordingConnection {
+                    sent: Arc::new(parking_lot::Mutex::new(Vec::new())),
+                    fail,
+                    observe,
+                });
+                let result = super::handle_peer_channel_message(
+                    &mut conn,
+                    either::Left(broadcast()),
+                    mix,
+                    &sink,
+                )
+                .await;
+                // A stream's fate lands on a task of its own.
+                for _ in 0..100 {
+                    tokio::task::yield_now().await;
+                }
+                (result, stats.events_for_test(key.id()))
+            }
+        };
+
+        let (r, e) = run(false, Some((ObservedSend::Short, None))).await;
+        assert!(r.is_ok());
+        assert_eq!((e.get(Ev::WireShort), e.reached_wire()), (1, 1), "{e:?}");
+
+        let (_, e) = run(false, Some((ObservedSend::Unobserved, None))).await;
+        assert_eq!(
+            (e.get(Ev::WireUnobserved), e.reached_wire()),
+            (1, 1),
+            "{e:?}"
+        );
+
+        let (_, e) = run(
+            false,
+            Some((ObservedSend::Stream, Some(StreamSendOutcome::Delivered))),
+        )
+        .await;
+        assert_eq!(e.get(Ev::WireStream), 1, "{e:?}");
+        assert_eq!(e.get(Ev::WireStreamDelivered), 1, "{e:?}");
+        assert_eq!(e.reached_wire(), 1);
+
+        let (_, e) = run(
+            false,
+            Some((
+                ObservedSend::Stream,
+                Some(StreamSendOutcome::EgressAbandoned),
+            )),
+        )
+        .await;
+        assert_eq!(e.get(Ev::WireStreamEgressAbandoned), 1, "{e:?}");
+        assert_eq!(
+            e.reached_wire(),
+            0,
+            "an abandoned stream did not reach the wire"
+        );
+
+        let (_, e) = run(false, Some((ObservedSend::Stream, None))).await;
+        assert_eq!(e.get(Ev::WireStreamFailed), 1, "unsignalled sender: {e:?}");
+        assert_eq!(e.reached_wire(), 0);
+
+        let (r, e) = run(true, None).await;
+        assert!(r.is_err());
+        assert_eq!(e.get(Ev::SendFailed), 1, "{e:?}");
+
+        // Not a broadcast: nothing is attributed.
+        let (sink, stats) = PropagationSink::for_test();
+        let mut conn: Box<dyn super::PeerConnectionApi> = Box::new(RecordingConnection {
+            sent: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            fail: false,
+            observe: Some((ObservedSend::Short, None)),
+        });
+        super::handle_peer_channel_message(
+            &mut conn,
+            either::Left(hosting_announce()),
+            &mix,
+            &sink,
+        )
+        .await
+        .expect("send succeeds");
+        let announced = freenet_stdlib::prelude::ContractInstanceId::new([1u8; 32]);
+        assert_eq!(stats.events_for_test(&announced).get(Ev::WireShort), 0);
+    }
+
+    /// The failure WARN names the contract (#6143): the transport's own lines
+    /// for these failures do not.
+    #[tokio::test]
+    async fn a_failed_broadcast_stream_warns_with_its_contract() {
+        use crate::operations::update::propagation_stats::PropagationSink;
+        use crate::test_utils::TestLogger;
+        use crate::transport::{ObservedSend, StreamSendOutcome};
+
+        let logger = TestLogger::new().capture_logs().with_level("warn").init();
+        let id = freenet_stdlib::prelude::ContractInstanceId::new([63u8; 32]);
+        let key = freenet_stdlib::prelude::ContractKey::from_id_and_code(
+            id,
+            freenet_stdlib::prelude::CodeHash::new([64u8; 32]),
+        );
+        let msg =
+            crate::message::NetMessage::from(crate::operations::update::UpdateMsg::BroadcastTo {
+                id: crate::message::Transaction::new::<crate::operations::update::UpdateMsg>(),
+                key,
+                payload: crate::message::DeltaOrFullState::Delta(vec![1]),
+                sender_summary_bytes: vec![],
+            });
+        let (sink, _) = PropagationSink::for_test();
+        let mix = crate::node::network_bridge::outbound_message_mix::OutboundMix::new();
+        let mut conn: Box<dyn super::PeerConnectionApi> = Box::new(RecordingConnection {
+            sent: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            fail: false,
+            observe: Some((ObservedSend::Stream, Some(StreamSendOutcome::Dropped))),
+        });
+        super::handle_peer_channel_message(&mut conn, either::Left(msg), &mix, &sink)
+            .await
+            .expect("send succeeds");
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            logger.contains(&id.to_string()),
+            "the WARN must name the contract: {:?}",
+            logger.logs()
+        );
+        assert!(logger.contains("wire_stream_failed"), "{:?}", logger.logs());
     }
 
     /// Only this node's own CONNECT request as a joiner is ended at once
