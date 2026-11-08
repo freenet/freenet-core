@@ -4146,6 +4146,69 @@ fn source_waits_do_not_rearm_the_timer_without_an_extension() {
     })
 }
 
+/// While the connection's window has pushed the timer past the send's own
+/// gap, the first wait for the source wakes the loop to re-arm it at the gap,
+/// and later ones do not: the armed deadline is already the gap, so re-arming
+/// would arm the same one. The connection is acknowledged every second; the
+/// 5 s wake sees it and arms the timer for 15 s; a write at 6 s, then 50
+/// source reads between 6 s and 7 s. Before, each read re-armed the timer.
+#[test]
+fn source_waits_rearm_the_timer_once_while_it_is_extended() {
+    bounded(|| async move {
+        let time = VirtualTime::new();
+        let clock = time.clone();
+        let arms = drive(&time, LIMIT, async move {
+            let acks = recycle::AckProgress::detached();
+            let connection = bounded::ConnectionProgress {
+                acks: acks.clone(),
+                cap_holds: Arc::new(super::super::socket::CapHolds::new(None)),
+                quiet: Arc::default(),
+                last_acked: Arc::new(bounded::AckRecord::new(acks.acked(), bounded::NO_ACK)),
+            };
+            let deadlines = SendDeadlines {
+                open: Duration::from_secs(2),
+                gap: Some(Duration::from_secs(5)),
+                total: Duration::from_secs(120),
+            };
+            let ticking = clock.clone();
+            let peer = async move {
+                loop {
+                    ticking.sleep(Duration::from_secs(1)).await;
+                    acks.ack();
+                }
+            };
+            let stepping = clock.clone();
+            let counted = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let seen = counted.clone();
+            let send = bounded_send(&clock, deadlines, Some(connection), |progress| async move {
+                progress.mark_opened();
+                stepping.sleep(Duration::from_secs(6)).await;
+                progress.step();
+                let before = progress.arms();
+                for _ in 0..50 {
+                    progress.waiting_on_source(true);
+                    stepping.sleep(Duration::from_millis(10)).await;
+                    progress.waiting_on_source(false);
+                    stepping.sleep(Duration::from_millis(10)).await;
+                }
+                seen.store(
+                    progress.arms() - before,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                Ok(())
+            });
+            let sent = tokio::select! {
+                sent = send => sent,
+                () = peer => unreachable!("the peer never ends"),
+            };
+            assert!(matches!(sent, BoundedSend::Sent), "{sent:?}");
+            counted.load(std::sync::atomic::Ordering::Relaxed)
+        })
+        .await;
+        assert!(arms <= 2, "{arms} timers armed for 50 source reads");
+    })
+}
+
 /// `total` still ends a send whose connection never stops moving.
 #[test]
 fn total_ends_a_send_on_a_connection_that_keeps_moving() {

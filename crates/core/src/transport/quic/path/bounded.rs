@@ -189,10 +189,6 @@ struct ProgressState {
     extended: AtomicBool,
     /// Told when a wait for the source starts while `extended`.
     source_wait: tokio::sync::Notify,
-    /// The end of the connection's window the armed timer reads
-    /// ([`ConnectionWatch::until`]), 0 for none, so a pacer's wait is judged
-    /// against the deadline the timer enforces ([`SendProgress::time_left`]).
-    window: AtomicU64,
     /// Timers armed by [`bounded_send`]. Tests only.
     #[cfg(test)]
     arms: AtomicU64,
@@ -215,7 +211,6 @@ impl SendProgress {
             on_source: AtomicBool::new(false),
             extended: AtomicBool::new(false),
             source_wait: tokio::sync::Notify::new(),
-            window: AtomicU64::new(0),
             #[cfg(test)]
             arms: AtomicU64::new(0),
             now: Box::new(|| 0),
@@ -232,7 +227,6 @@ impl SendProgress {
             on_source: AtomicBool::new(false),
             extended: AtomicBool::new(false),
             source_wait: tokio::sync::Notify::new(),
-            window: AtomicU64::new(0),
             #[cfg(test)]
             arms: AtomicU64::new(0),
             now: Box::new(move || time.now_nanos()),
@@ -241,16 +235,21 @@ impl SendProgress {
         }))
     }
 
-    /// How long until the send's current deadline, the one [`bounded_send`]'s
-    /// timer enforces: with the stream open, the later of the send's own gap
-    /// and its connection's window, unless it waits for its source. So a
-    /// pacer's wait on a connection that is still being acknowledged is not
-    /// refused at the send's own gap, where the timer would not end the send.
-    /// `Duration::MAX` for a send with none.
+    /// How long a pacer may make the send wait: until the send's own
+    /// deadline for its stage (its own gap while the stream is open, never
+    /// the connection's window), so no later than the deadline its timer
+    /// enforces, which is never earlier. `Duration::MAX` for a send with none.
+    ///
+    /// Not the window: that would let the pacer's queue hold up to the window
+    /// of the rate (about 10 s) where #6126 bounds it at the gap (5 s), so
+    /// later opens, limited to their 2 s open deadline, would be refused for
+    /// longer and more data would go to UDP. A live lossy path does not need
+    /// it: its long waits are quinn's, after the pacer's take, and the write
+    /// they end in is a step, so the next take is offered a fresh gap.
     pub(super) fn time_left(&self) -> Duration {
         match &self.0.deadlines {
             Some((deadlines, started)) => Duration::from_nanos(
-                self.deadline(deadlines, *started, self.0.window.load(Ordering::Acquire))
+                self.deadline(deadlines, *started, 0)
                     .saturating_sub((self.0.now)()),
             ),
             None => Duration::MAX,
@@ -607,12 +606,18 @@ where
     tokio::pin!(send);
     loop {
         // `extended` first, from the connection's window alone, then the
-        // deadline, which reads `on_source` (see `waiting_on_source`).
+        // deadline, which reads `on_source` (see `waiting_on_source`). Then
+        // `extended` again from the deadline actually armed: one armed at
+        // the send's own gap (the send is waiting for its source) has
+        // nothing a source wait could bring earlier, so later source waits
+        // do not wake the loop to re-arm the same deadline.
         let own = progress.deadline(&deadlines, started, 0);
         let window = until(&watch);
-        progress.0.window.store(window, Ordering::Release);
         progress.0.extended.store(window > own, Ordering::SeqCst);
         let deadline = progress.deadline(&deadlines, started, window);
+        if deadline <= own {
+            progress.0.extended.store(false, Ordering::SeqCst);
+        }
         #[cfg(test)]
         progress.0.arms.fetch_add(1, Ordering::Relaxed);
         let wait = Duration::from_nanos(deadline.saturating_sub(time.now_nanos()));

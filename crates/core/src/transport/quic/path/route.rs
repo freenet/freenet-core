@@ -362,6 +362,12 @@ impl StallCount {
         self.acked_at
     }
 
+    /// Counted timeouts in a row. Tests only.
+    #[cfg(test)]
+    pub(crate) fn in_a_row(&self) -> u32 {
+        self.in_a_row
+    }
+
     /// [`Self::take`] with no egress cap.
     #[cfg(test)]
     pub(crate) fn take_uncapped(
@@ -389,6 +395,13 @@ impl QuicPath {
     /// `source_stalled`: the send was waiting for its source when it timed out.
     /// That says nothing about the path, so the stall count does not move.
     /// `now_nanos` is on the path's clock ([`StallCount`]).
+    /// The stall count's timeouts in a row, and the quiet proof a timed-out
+    /// send left. Tests only.
+    #[cfg(test)]
+    pub(crate) fn stall_state(&self) -> (u32, Option<QuietProof>) {
+        (self.stall.lock().in_a_row(), *self.quiet.lock())
+    }
+
     pub(crate) fn settle(
         &self,
         kind: SendKind,
