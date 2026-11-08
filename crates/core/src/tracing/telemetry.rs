@@ -3350,6 +3350,10 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 serde_json::json!(snapshot.egress_retransmits_deferred),
             );
             m.insert(
+                "egress_retransmits_uncapped".into(),
+                serde_json::json!(snapshot.egress_retransmits_uncapped),
+            );
+            m.insert(
                 "egress_probes_skipped".into(),
                 serde_json::json!(snapshot.egress_probes_skipped),
             );
@@ -7793,6 +7797,7 @@ mod tests {
             egress_debt_forgiven_bytes: 31,
             egress_retransmits_deferred: 32,
             egress_probes_skipped: 33,
+            egress_retransmits_uncapped: 34,
             ..Default::default()
         };
         let reference = serde_json::to_value(&snapshot).unwrap();
@@ -7844,6 +7849,7 @@ mod tests {
             ("egress_debt_forgiven_bytes", 31),
             ("egress_retransmits_deferred", 32),
             ("egress_probes_skipped", 33),
+            ("egress_retransmits_uncapped", 34),
         ] {
             assert_eq!(json[key], expected, "event-log value for {key}");
             assert_eq!(json[key], reference[key], "serde value for {key}");

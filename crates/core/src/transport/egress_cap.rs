@@ -144,6 +144,7 @@ use super::Socket;
 use super::metrics::{EgressDecision, TRANSPORT_METRICS, WaitCause};
 use super::packet_data::MAX_PACKET_SIZE;
 use super::peer_connection::streaming::STREAM_INACTIVITY_TIMEOUT;
+use super::sent_packet_tracker::ResendKind;
 use crate::simulation::TimeSource;
 
 /// The bucket holds at most this much time at the cap rate, so after an idle
@@ -237,6 +238,27 @@ pub(crate) fn retx_defer_min(rto: Duration) -> Duration {
     }
     let _ = rto;
     RETX_DEFER_MIN
+}
+
+/// A refused RTO resend is deferred until it has been due for this many
+/// effective RTOs, then sent uncapped ([`EgressCap::admit_retransmit`]).
+/// One: the deferral at most doubles the wait between a packet's resends,
+/// so it is still abandoned after `MAX_PACKET_RETRANSMITS`, within twice the
+/// time it would take without the cap.
+pub(crate) const RETX_DEFER_LIMIT_RTOS: u32 = 1;
+
+/// What [`EgressCap::admit_retransmit`] decided.
+#[derive(Debug)]
+pub(crate) enum RetxAdmit<'a> {
+    /// Send with this take (`Socket::send_to_paced`).
+    Take(EgressTake<'a>),
+    /// Send uncapped (`Socket::send_to`, charged as an unpaced send): the
+    /// resend has been deferred for [`RETX_DEFER_LIMIT_RTOS`] effective RTOs.
+    Uncapped,
+    /// Do not send now; ask again after this long.
+    Defer(Duration),
+    /// Skip this probe.
+    SkipProbe,
 }
 
 /// A gap between one stream's fragments at least this long is counted and
@@ -870,6 +892,9 @@ pub struct EgressTake<'a> {
     /// Taken without admission (a retransmit), so recorded as an unpaced
     /// send, as retransmits were before they were capped.
     unpaced: bool,
+    /// The retransmit share this take holds (ns on the share's meter), handed
+    /// back if the datagram is not sent; 0 for a paced take.
+    retx_share_ns: i64,
 }
 
 impl EgressCap {
@@ -898,9 +923,8 @@ impl EgressCap {
             clock,
             sleep_until,
             empty_at_ns: AtomicI64::new(now.saturating_sub(burst_ns)),
-            retx_meter_empty_at_ns: AtomicI64::new(
-                now.saturating_sub(i64::try_from(RETX_SHARE_WINDOW.as_nanos()).unwrap_or(i64::MAX)),
-            ),
+            // Long empty: the share starts full, whatever its window.
+            retx_meter_empty_at_ns: AtomicI64::new(i64::MIN / 2),
             admission: Arc::new(AdmissionQueue::default()),
             last_long_wait_warn_ns: AtomicI64::new(i64::MIN),
             last_abandon_warn_ns: AtomicI64::new(i64::MIN),
@@ -1022,17 +1046,51 @@ impl EgressCap {
     }
 
     /// Take `bytes` for a legacy UDP retransmit (an RTO resend or a tail-loss
-    /// probe) if the bucket's debt after the take stays within
-    /// [`RETX_DEBT_LIMIT`] and retransmits stay within their share of the rate
-    /// ([`RETX_SHARE_PERCENT`] over [`RETX_SHARE_WINDOW`]); otherwise take
-    /// nothing and return how long until it would fit. Unlike [`Self::charge_unpaced`] nothing
-    /// is forgiven, so retransmits cannot exceed the cap by more than that
-    /// debt; unlike a paced take it needs no admission and may go into debt,
-    /// so a lost packet is repaired ahead of first copies waiting in the
-    /// admission queue. One atomic update: no lock, no await. Send the
-    /// datagram with `Socket::send_to_paced`, which charges it once.
+    /// probe) if retransmits stay within their share of the rate
+    /// ([`RETX_SHARE_PERCENT`] over [`RETX_SHARE_WINDOW`]) and the bucket's
+    /// debt after the take stays within [`RETX_DEBT_LIMIT`]; otherwise take
+    /// nothing and return how long until it would fit. Unlike
+    /// [`Self::charge_unpaced`] nothing is forgiven; unlike a paced take it
+    /// needs no admission and may go into debt, so a lost packet is repaired
+    /// ahead of first copies waiting in the admission queue.
+    ///
+    /// The share is checked first, so a share refusal touches the bucket not
+    /// at all, and the bucket refusal path only hands the share back: both
+    /// are atomic updates with no lock and no await, and neither wakes paced
+    /// waiters. Send the datagram with `Socket::send_to_paced`, which charges
+    /// it once; a take dropped unsent gives back both the bucket and the
+    /// share.
     pub(crate) fn try_take_retransmit(&self, bytes: usize) -> Result<EgressTake<'_>, Duration> {
         let cost = self.cost_ns(bytes as u64);
+        // The retransmit share: a leaky bucket refilled at the share of the
+        // rate, so this datagram costs `100 / share` times its cost at the
+        // full rate. It holds RETX_SHARE_WINDOW, or one datagram if that is
+        // more, so a cap too small for a datagram in a window of its share
+        // (under about 2400 B/s) still admits retransmits at its share.
+        let meter_cost =
+            cost.saturating_mul(100) / i64::try_from(retx_share_percent()).unwrap_or(100);
+        let window = i64::try_from(RETX_SHARE_WINDOW.as_nanos())
+            .unwrap_or(i64::MAX)
+            .max(meter_cost);
+        let now = self.now();
+        let mut meter = self.retx_meter_empty_at_ns.load(Ordering::Acquire);
+        loop {
+            let after = meter
+                .max(now.saturating_sub(window))
+                .saturating_add(meter_cost);
+            if after > now {
+                return Err(Duration::from_nanos((after - now) as u64));
+            }
+            match self.retx_meter_empty_at_ns.compare_exchange_weak(
+                meter,
+                after,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(current) => meter = current,
+            }
+        }
         let limit = i64::try_from(retx_debt_limit().as_nanos()).unwrap_or(i64::MAX);
         let fits = |empty_at: i64, now: i64| {
             let after = self.refilled(empty_at, now).saturating_add(cost);
@@ -1041,41 +1099,8 @@ impl EgressCap {
         };
         let (old, new, now) = self.update(|empty_at, now| fits(empty_at, now).ok());
         if let Err(over) = fits(old, now) {
+            self.refund_retx_share(meter_cost);
             return Err(Duration::from_nanos(over as u64));
-        }
-        // The retransmit share: the meter refills at the share of the rate,
-        // so this datagram costs `100 / share` times its cost at the full
-        // rate. If it does not fit, the main take is given back.
-        let meter_cost =
-            cost.saturating_mul(100) / i64::try_from(retx_share_percent()).unwrap_or(100);
-        let window = i64::try_from(RETX_SHARE_WINDOW.as_nanos()).unwrap_or(i64::MAX);
-        let meter_fits = |empty_at: i64, now: i64| {
-            let after = empty_at
-                .max(now.saturating_sub(window))
-                .saturating_add(meter_cost);
-            if after <= now {
-                Ok(after)
-            } else {
-                Err(after - now)
-            }
-        };
-        let mut meter = self.retx_meter_empty_at_ns.load(Ordering::Acquire);
-        loop {
-            match meter_fits(meter, now) {
-                Ok(after) => match self.retx_meter_empty_at_ns.compare_exchange_weak(
-                    meter,
-                    after,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                ) {
-                    Ok(_) => break,
-                    Err(current) => meter = current,
-                },
-                Err(over) => {
-                    self.give_back(bytes as u64);
-                    return Err(Duration::from_nanos(over as u64));
-                }
-            }
         }
         let debt = self.bytes_for(new.saturating_sub(now));
         if debt > 0 {
@@ -1088,7 +1113,64 @@ impl EgressCap {
             taken_bytes: bytes as u64,
             waited: Duration::ZERO,
             unpaced: true,
+            retx_share_ns: meter_cost,
         })
+    }
+
+    /// Decide one legacy UDP retransmit under this cap: `kind` is an RTO
+    /// resend or a tail-loss probe of `bytes`, `overdue` how long an RTO
+    /// resend has been due, `rto` the connection's effective RTO.
+    ///
+    /// - The cap takes it ([`Self::try_take_retransmit`]): [`RetxAdmit::Take`].
+    /// - A refused probe is skipped: [`RetxAdmit::SkipProbe`].
+    /// - A refused RTO resend is deferred ([`RetxAdmit::Defer`]) for at least
+    ///   [`RETX_DEFER_MIN`] and at most until it has been due for one
+    ///   effective RTO ([`RETX_DEFER_LIMIT_RTOS`]); refused then, it goes
+    ///   uncapped ([`RetxAdmit::Uncapped`]), charged as an unpaced send as
+    ///   before the cap. So a resend is never deferred without bound: under
+    ///   unpaced debt above [`RETX_DEBT_LIMIT`] (short messages, receipts and
+    ///   keepalives at or above the rate) the cap could otherwise refuse it
+    ///   for as long as that lasts, and since the retransmit count moves only
+    ///   when a resend goes, the packet would never be abandoned and its
+    ///   flight never released (#4345). It also bounds how long one
+    ///   connection's resends can be held behind another's use of the
+    ///   node-wide share.
+    pub(in crate::transport) fn admit_retransmit(
+        &self,
+        kind: ResendKind,
+        bytes: usize,
+        overdue: Duration,
+        rto: Duration,
+    ) -> RetxAdmit<'_> {
+        let wait = match self.try_take_retransmit(bytes) {
+            Ok(take) => return RetxAdmit::Take(take),
+            Err(wait) => wait,
+        };
+        match kind {
+            ResendKind::Probe => {
+                TRANSPORT_METRICS.record_egress_probe_skipped();
+                RetxAdmit::SkipProbe
+            }
+            ResendKind::Rto => {
+                let limit = rto.saturating_mul(RETX_DEFER_LIMIT_RTOS);
+                if overdue >= limit {
+                    TRANSPORT_METRICS.record_egress_retransmit_uncapped();
+                    RetxAdmit::Uncapped
+                } else {
+                    TRANSPORT_METRICS.record_egress_retransmit_deferred();
+                    RetxAdmit::Defer(wait.max(retx_defer_min(rto)).min(limit - overdue))
+                }
+            }
+        }
+    }
+
+    /// Hand back a retransmit's share ([`Self::try_take_retransmit`]) when
+    /// its datagram was not sent.
+    fn refund_retx_share(&self, meter_cost: i64) {
+        if meter_cost > 0 {
+            self.retx_meter_empty_at_ns
+                .fetch_sub(meter_cost, Ordering::AcqRel);
+        }
     }
 
     /// Charge a datagram sent without pacing. The bucket may go into debt,
@@ -1240,6 +1322,7 @@ impl EgressCap {
                 taken_bytes: bytes as u64,
                 waited,
                 unpaced: false,
+                retx_share_ns: 0,
             },
             own.is_some(),
         ))
@@ -1603,6 +1686,9 @@ impl EgressTake<'_> {
         let this = ManuallyDrop::new(self);
         let sent = (sent_bytes as u64).min(this.taken_bytes);
         this.cap.give_back(this.taken_bytes - sent);
+        if sent == 0 {
+            this.cap.refund_retx_share(this.retx_share_ns);
+        }
         let decision = if this.unpaced {
             EgressDecision::Unpaced
         } else if this.waited.is_zero() {
@@ -1617,6 +1703,7 @@ impl EgressTake<'_> {
 impl Drop for EgressTake<'_> {
     fn drop(&mut self) {
         self.cap.give_back(self.taken_bytes);
+        self.cap.refund_retx_share(self.retx_share_ns);
     }
 }
 

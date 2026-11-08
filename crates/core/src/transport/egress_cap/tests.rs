@@ -2088,3 +2088,121 @@ fn a_retransmit_takes_up_to_its_debt_limit_and_nothing_is_forgiven() {
     assert_eq!(cap.stats().forgiven_bytes, 0);
     assert_eq!(count(&cap, EgressDecision::Unpaced), 2);
 }
+
+/// A refused RTO resend is deferred for at least the floor and never past
+/// one effective RTO of being due; once due that long it goes uncapped. A
+/// refused probe is skipped.
+#[test]
+fn a_refused_resend_is_deferred_at_most_one_rto_then_sent_uncapped() {
+    use crate::transport::sent_packet_tracker::ResendKind;
+    let (cap, _time) = cap_at(RATE);
+    // Hold the bucket a second in debt: far past the retransmit limit.
+    cap.charge_unpaced(BURST as usize + RATE as usize);
+    let rto = Duration::from_millis(500);
+    let take = |kind, overdue| cap.admit_retransmit(kind, PACKET, overdue, rto);
+    match take(ResendKind::Rto, Duration::ZERO) {
+        RetxAdmit::Defer(wait) => {
+            assert!(wait >= RETX_DEFER_MIN && wait <= rto, "deferred {wait:?}");
+        }
+        other => panic!("expected a deferral, got {other:?}"),
+    }
+    match take(ResendKind::Rto, Duration::from_millis(499)) {
+        RetxAdmit::Defer(wait) => assert_eq!(
+            wait,
+            Duration::from_millis(1),
+            "no later than the limit, even under the floor"
+        ),
+        other => panic!("expected a deferral, got {other:?}"),
+    }
+    assert!(matches!(take(ResendKind::Rto, rto), RetxAdmit::Uncapped));
+    assert!(matches!(
+        take(ResendKind::Probe, Duration::ZERO),
+        RetxAdmit::SkipProbe
+    ));
+    assert_eq!(
+        cap.level_bytes(),
+        -(RATE as i64),
+        "deciding takes nothing from the bucket"
+    );
+}
+
+/// A cap too small for one datagram in a window of its share (1 000 B/s:
+/// 500 B a second for retransmits, a 1 200 B datagram) still admits
+/// retransmits, at its share of the rate.
+#[test]
+fn a_tiny_cap_still_admits_retransmits_at_its_share() {
+    let rate = 1_000;
+    let (cap, time) = cap_at(rate);
+    let first = cap
+        .try_take_retransmit(PACKET)
+        .expect("a fresh share holds one");
+    first.sent(PACKET);
+    let wait = match cap.try_take_retransmit(PACKET) {
+        Ok(_) => panic!("one datagram per 2.4 s at a 500 B/s share"),
+        Err(wait) => wait,
+    };
+    assert_eq!(wait, Duration::from_millis(2_400));
+    time.advance(wait);
+    cap.try_take_retransmit(PACKET)
+        .expect("the share has refilled")
+        .sent(PACKET);
+}
+
+/// Takes retransmits at `step` intervals until the share refuses (the
+/// bucket, refilled faster than the share, never does); returns the wait.
+fn exhaust_retx_share(cap: &EgressCap, time: &VirtualTime, step: Duration) -> Duration {
+    for _ in 0..100_000 {
+        match cap.try_take_retransmit(PACKET) {
+            Ok(take) => take.sent(PACKET),
+            Err(wait) => return wait,
+        }
+        time.advance(step);
+    }
+    panic!("the share never refused");
+}
+
+/// The share is checked before the bucket: a share refusal leaves the
+/// bucket untouched, and a bucket refusal or a take dropped unsent hands
+/// the share back, so neither costs later retransmits anything.
+#[test]
+fn a_retransmit_not_sent_hands_back_its_share() {
+    // 1 MB/s: the bucket refills 2 000 B per 2 ms step, the share 1 000 B.
+    let step = Duration::from_millis(2);
+    let (cap, time) = cap_at(RATE);
+    let wait = exhaust_retx_share(&cap, &time, step);
+    let level = cap.level_bytes();
+    assert!(cap.try_take_retransmit(PACKET).is_err());
+    assert_eq!(
+        cap.level_bytes(),
+        level,
+        "a share refusal leaves the bucket"
+    );
+
+    // Room in the share for exactly one datagram: dropping its take unsent
+    // hands it back, so the next take still fits, and the one after not.
+    time.advance(wait);
+    drop(cap.try_take_retransmit(PACKET).expect("one fits"));
+    cap.try_take_retransmit(PACKET)
+        .expect("the dropped take handed its share back")
+        .sent(PACKET);
+    assert!(cap.try_take_retransmit(PACKET).is_err(), "and only one");
+
+    // A bucket refusal hands the share back too. Room in the share for
+    // exactly one again, the bucket at the retransmit debt limit.
+    let (cap, time) = cap_at(RATE);
+    let wait = exhaust_retx_share(&cap, &time, step);
+    time.advance(wait);
+    let level = cap.level_bytes();
+    cap.charge_unpaced(usize::try_from(level + 100_000).expect("in credit"));
+    assert_eq!(cap.level_bytes(), -100_000);
+    assert!(
+        cap.try_take_retransmit(PACKET).is_err(),
+        "the bucket refuses"
+    );
+    // 1.2 ms pays off one datagram of debt but refills only half a datagram
+    // of share: the take fits only if the refusal handed the share back.
+    time.advance(Duration::from_micros(1_200));
+    cap.try_take_retransmit(PACKET)
+        .expect("the bucket refusal handed the share back")
+        .sent(PACKET);
+}

@@ -88,8 +88,8 @@ impl StormReport {
         let sum = |f: fn(&CongestionProbe) -> u64| self.probes.iter().map(f).sum::<u64>();
         format!(
             "{label}: {} completed (last at {:?}), {} offered / {} first copies = {:.2}x, \
-             cap charged {} B forgave {} B, {} RTO, {} retransmits, {} deferred, {} abandoned, \
-             {} streams failed",
+             cap charged {} B forgave {} B, {} RTO, {} retransmits, {} deferred, {} uncapped, \
+             {} abandoned, {} streams failed",
             self.completed,
             self.last_completed,
             self.offered_packets,
@@ -100,6 +100,7 @@ impl StormReport {
             sum(|p| p.rto_expiries),
             sum(|p| u64::from(p.retransmissions)),
             sum(|p| u64::from(p.retransmits_deferred)),
+            sum(|p| u64::from(p.retransmits_uncapped)),
             sum(|p| u64::from(p.abandoned_packets)),
             sum(|p| u64::from(p.outbound_streams_failed)),
         )
@@ -275,7 +276,12 @@ fn seeds() -> Vec<u64> {
 /// at least main's. Either way nothing retransmitted is forgiven past the cap.
 #[test]
 fn storm_under_a_cap_matches_or_beats_main() {
-    const PEERS: usize = 16;
+    // Override with `FREENET_STORM_PEERS` to explore the wake rate at a
+    // gateway's connection count.
+    let peers: usize = std::env::var("FREENET_STORM_PEERS")
+        .ok()
+        .map(|v| v.trim().parse().expect("decimal"))
+        .unwrap_or(16);
     const PER_SEED_CAP: u64 = 1_000_000;
     // Override with `FREENET_STORM_CAP` (bytes per second) to explore.
     let caps: Vec<u64> = match std::env::var("FREENET_STORM_CAP") {
@@ -286,11 +292,12 @@ fn storm_under_a_cap_matches_or_beats_main() {
     for cap in caps {
         let mut main_done = Vec::new();
         let mut capped_done = Vec::new();
+        let mut capped_deferred = 0u64;
         for seed in seeds() {
             let run = |cap| {
                 block_on_seeded(
                     seed,
-                    run_storm(PEERS, 512 * 1024, Duration::from_secs(60), seed, cap),
+                    run_storm(peers, 512 * 1024, Duration::from_secs(60), seed, cap),
                 )
             };
             let main = run(Cap::Main(cap));
@@ -307,6 +314,11 @@ fn storm_under_a_cap_matches_or_beats_main() {
             }
             main_done.push(main.completed);
             capped_done.push(capped.completed);
+            capped_deferred += capped
+                .probes
+                .iter()
+                .map(|p| u64::from(p.retransmits_deferred))
+                .sum::<u64>();
         }
         let median = |v: &mut Vec<usize>| {
             v.sort_unstable();
@@ -325,6 +337,10 @@ fn storm_under_a_cap_matches_or_beats_main() {
         eprintln!(
             "cap {cap} B/s: streams completed, main / capped: total {} / {}, median {} / {}",
             totals.0, totals.1, medians.0, medians.1
+        );
+        assert!(
+            capped_deferred > 0,
+            "premise: the cap deferred resends in the storm at {cap} B/s"
         );
         if cap != PER_SEED_CAP && (totals.1 < totals.0 || medians.1 < medians.0) {
             failures.push(format!(
@@ -392,17 +408,20 @@ struct ReverseLossReport {
 /// - the effective RTO, capped at `MAX_EFFECTIVE_RTO` whatever the backoff;
 /// - plus one probe timeout, since a probe that goes refreshes the send time
 ///   (its own, or that of a probed packet ahead of it in the queue);
-/// - plus the wait for admission, which across all intervals is at most the
-///   retransmits still possible, `M x pending x MAX_PACKET_SIZE`, at the
-///   retransmit share of the rate, plus one deferral floor and one resend
-///   yield per interval.
+/// - plus the wait for admission. A refused resend is deferred at most one
+///   effective RTO (`RETX_DEFER_LIMIT_RTOS`), so this is at most
+///   `MAX_EFFECTIVE_RTO` per interval whatever else holds the cap. On an
+///   idle node it is also at most, across all intervals, the retransmits
+///   still possible, `M x pending x MAX_PACKET_SIZE`, at the retransmit
+///   share of the rate; the bound takes the smaller. Plus one deferral floor
+///   and one resend yield per interval.
 ///
 /// Abandonments are free on the cap but count against
 /// `MAX_RESENDS_PER_ITERATION`, so they add `pending /
 /// MAX_RESENDS_PER_ITERATION` resend yields. `probe_timeout` is the largest
 /// read during the run, since an RTT sample can raise it.
 fn flight_drain_bound(pending: usize, probe_timeout: Duration, rate: u64) -> Duration {
-    use crate::transport::egress_cap::{RETX_DEFER_MIN, RETX_SHARE_PERCENT};
+    use crate::transport::egress_cap::{RETX_DEFER_LIMIT_RTOS, RETX_DEFER_MIN, RETX_SHARE_PERCENT};
     use crate::transport::packet_data::MAX_PACKET_SIZE;
     use crate::transport::peer_connection::{MAX_RESENDS_PER_ITERATION, RESEND_YIELD_DELAY};
     use crate::transport::sent_packet_tracker::{MAX_EFFECTIVE_RTO, MAX_PACKET_RETRANSMITS};
@@ -411,7 +430,8 @@ fn flight_drain_bound(pending: usize, probe_timeout: Duration, rate: u64) -> Dur
     let per_interval = MAX_EFFECTIVE_RTO + probe_timeout + RETX_DEFER_MIN + RESEND_YIELD_DELAY;
     let share_rate = rate * RETX_SHARE_PERCENT / 100;
     let admission_bytes = m * pending as u64 * MAX_PACKET_SIZE as u64;
-    let admission = Duration::from_secs_f64(admission_bytes as f64 / share_rate as f64);
+    let admission = Duration::from_secs_f64(admission_bytes as f64 / share_rate as f64)
+        .min(MAX_EFFECTIVE_RTO * RETX_DEFER_LIMIT_RTOS * intervals);
     let abandon_yields =
         u32::try_from(pending.div_ceil(MAX_RESENDS_PER_ITERATION)).unwrap_or(u32::MAX);
     per_interval * intervals + admission + RESEND_YIELD_DELAY * abandon_yields
@@ -588,6 +608,7 @@ fn receipt_loss_under_a_cap_matches_or_beats_main() {
             _ => default.to_vec(),
         }
     };
+    let mut deferred_by_rate = std::collections::BTreeMap::new();
     for rate in list("FREENET_RECEIPT_RATES", &[2_500_000, 1_250_000]) {
         for loss in [0.5, 0.7, 0.9] {
             for seed in list("FREENET_RECEIPT_SEEDS", &[11]) {
@@ -609,8 +630,8 @@ fn receipt_loss_under_a_cap_matches_or_beats_main() {
                     format!(
                         "{label}: done after {:?}, {} B ({} packets) in flight at idle, {} B after \
                      {IDLE_SECS} s idle, drained after {:?} (bound {:?}), largest rise {} B, \
-                     closed {}, {} RTO, {} retransmits, {} deferred, {} abandoned, \
-                     {} streams failed",
+                     closed {}, {} RTO, {} retransmits, {} deferred, {} uncapped, \
+                     {} abandoned, {} streams failed",
                         r.completed_after,
                         r.at_idle.flightsize,
                         r.at_idle.pending_packets,
@@ -622,6 +643,7 @@ fn receipt_loss_under_a_cap_matches_or_beats_main() {
                         r.probe.rto_expiries,
                         r.probe.retransmissions,
                         r.probe.retransmits_deferred,
+                        r.probe.retransmits_uncapped,
                         r.probe.abandoned_packets,
                         r.probe.outbound_streams_failed,
                     )
@@ -637,6 +659,7 @@ fn receipt_loss_under_a_cap_matches_or_beats_main() {
                     (Some(_), None) => true,
                     (None, _) => false,
                 };
+                *deferred_by_rate.entry(rate).or_insert(0) += capped.probe.retransmits_deferred;
                 // The old flight condition, printed for comparison only.
                 let old_flight_fails =
                     capped.flight_at_idle_check > main.flight_at_idle_check.max(64 * 1024);
@@ -656,6 +679,13 @@ fn receipt_loss_under_a_cap_matches_or_beats_main() {
                 }
             }
         }
+    }
+    // The row must exercise the cap: at the stream rate it binds.
+    if let Some(&deferred) = deferred_by_rate.get(&1_250_000) {
+        assert!(
+            deferred > 0,
+            "premise: the cap deferred resends under receipt loss at the stream rate"
+        );
     }
     assert!(
         failures.is_empty(),
@@ -782,6 +812,7 @@ async fn run_outage(
 #[test]
 fn an_outage_under_a_cap_matches_or_beats_main() {
     let mut failures = Vec::new();
+    let mut deferred_at_stream_rate = 0;
     for rate in [2_500_000u64, 1_250_000] {
         for seed in seeds() {
             let run = |cap| {
@@ -822,11 +853,20 @@ fn an_outage_under_a_cap_matches_or_beats_main() {
                 (Some(_), None) => true,
                 (None, _) => false,
             };
+            if rate == 1_250_000 {
+                deferred_at_stream_rate += capped.probe.retransmits_deferred;
+            }
             if late || capped.probe.outbound_streams_failed > main.probe.outbound_streams_failed {
                 failures.push(summary);
             }
         }
     }
+    // The row must exercise the cap: at the stream rate the post-outage
+    // repair burst meets it.
+    assert!(
+        deferred_at_stream_rate > 0,
+        "premise: the cap deferred resends after the outage at the stream rate"
+    );
     assert!(
         failures.is_empty(),
         "capped retransmits did worse after an outage:\n{}",

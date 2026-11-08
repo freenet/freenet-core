@@ -945,8 +945,13 @@ struct EgressCounters {
     debt_hwm_bytes: AtomicU64,
     /// Unpaced bytes forgiven because the debt reached the debt limit.
     debt_forgiven_bytes: AtomicU64,
-    /// Legacy UDP retransmits (RTO resends) the node-wide egress cap deferred (`EgressCap::try_take_retransmit`).
+    /// Refusals of a due legacy UDP RTO resend by the node-wide egress cap
+    /// (`EgressCap::admit_retransmit`). Counts refusals, not packets: a
+    /// resend refused at each of several wakes counts once per wake.
     retransmits_deferred: AtomicU64,
+    /// Legacy UDP RTO resends sent uncapped after being deferred for
+    /// `RETX_DEFER_LIMIT_RTOS` effective RTOs.
+    retransmits_uncapped: AtomicU64,
     /// Legacy UDP tail-loss probes skipped because the egress cap had no room for them.
     probes_skipped: AtomicU64,
 }
@@ -2196,6 +2201,13 @@ impl TransportMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record a legacy UDP RTO resend sent uncapped after its deferral limit.
+    pub(crate) fn record_egress_retransmit_uncapped(&self) {
+        self.egress
+            .retransmits_uncapped
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Record a legacy UDP tail-loss probe skipped for want of egress cap.
     pub(crate) fn record_egress_probe_skipped(&self) {
         self.egress.probes_skipped.fetch_add(1, Ordering::Relaxed);
@@ -2700,6 +2712,7 @@ impl TransportMetrics {
             egress_debt_hwm_bytes: get64(&egress.debt_hwm_bytes),
             egress_debt_forgiven_bytes: get64(&egress.debt_forgiven_bytes),
             egress_retransmits_deferred: get64(&egress.retransmits_deferred),
+            egress_retransmits_uncapped: get64(&egress.retransmits_uncapped),
             egress_probes_skipped: get64(&egress.probes_skipped),
             conn_identity_set_dialed: get32(&identity[ConnIdentity::SetDialed as usize]),
             conn_identity_expected_inbound_bound: get32(
@@ -3306,6 +3319,7 @@ pub struct TransportSnapshot {
     pub egress_debt_hwm_bytes: u64,
     pub egress_debt_forgiven_bytes: u64,
     pub egress_retransmits_deferred: u64,
+    pub egress_retransmits_uncapped: u64,
     pub egress_probes_skipped: u64,
     /// Connection identity decisions during the period, by
     /// [`ConnIdentity`] (the field suffix is its label). Counts only, no
@@ -3623,6 +3637,7 @@ impl TransportSnapshot {
             egress_debt_hwm_bytes,
             egress_debt_forgiven_bytes,
             egress_retransmits_deferred,
+            egress_retransmits_uncapped,
             egress_probes_skipped,
             conn_identity_set_dialed,
             conn_identity_expected_inbound_bound,
@@ -3767,6 +3782,7 @@ impl TransportSnapshot {
         self.egress_debt_hwm_bytes = egress_debt_hwm_bytes;
         self.egress_debt_forgiven_bytes = egress_debt_forgiven_bytes;
         self.egress_retransmits_deferred = egress_retransmits_deferred;
+        self.egress_retransmits_uncapped = egress_retransmits_uncapped;
         self.egress_probes_skipped = egress_probes_skipped;
         self.conn_identity_set_dialed = conn_identity_set_dialed;
         self.conn_identity_expected_inbound_bound = conn_identity_expected_inbound_bound;
@@ -4036,6 +4052,7 @@ struct SnapshotExtras {
     pub egress_debt_hwm_bytes: u64,
     pub egress_debt_forgiven_bytes: u64,
     pub egress_retransmits_deferred: u64,
+    pub egress_retransmits_uncapped: u64,
     pub egress_probes_skipped: u64,
     /// Connection identity decisions during the period, by
     /// [`ConnIdentity`] (the field suffix is its label). Counts only, no
@@ -4172,6 +4189,7 @@ impl SnapshotExtras {
             || self.egress_streams_refused_other != 0
             || self.egress_debt_forgiven_bytes != 0
             || self.egress_retransmits_deferred != 0
+            || self.egress_retransmits_uncapped != 0
             || self.egress_probes_skipped != 0
             || self.conn_identity_set_dialed != 0
             || self.conn_identity_expected_inbound_bound != 0

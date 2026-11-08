@@ -42,6 +42,7 @@ pub mod streaming_buffer;
 #[cfg(not(feature = "bench"))]
 pub(crate) mod streaming_buffer;
 
+use super::egress_cap::RetxAdmit;
 use super::{
     TransportError, TransportPublicKey,
     bbr::DeliveryRateToken,
@@ -51,7 +52,7 @@ use super::{
     packet_data::{self, PacketData},
     received_packet_tracker::ReceivedPacketTracker,
     received_packet_tracker::ReportResult,
-    sent_packet_tracker::{PacketStream, ResendAction, ResendKind, SentPacketTracker},
+    sent_packet_tracker::{PacketStream, ResendAction, SentPacketTracker},
     symmetric_message::{self, SymmetricMessage, SymmetricMessagePayload, UpgradeControl},
     token_bucket::TokenBucket,
 };
@@ -323,6 +324,8 @@ struct TelemetryTestCounts {
     retransmissions: u32,
     /// RTO resends the egress cap deferred.
     retransmits_deferred: u32,
+    /// RTO resends sent uncapped after their deferral limit.
+    retransmits_uncapped: u32,
     keepalive_rtt_samples: u32,
     standalone_ack_flushes: u32,
     outbound_streams_failed: u32,
@@ -354,6 +357,8 @@ pub(crate) struct CongestionProbe {
     pub retransmissions: u32,
     /// RTO resends the node-wide egress cap deferred.
     pub retransmits_deferred: u32,
+    /// RTO resends sent uncapped after their deferral limit.
+    pub retransmits_uncapped: u32,
     /// Packets the sent-packet tracker still waits on a receipt for.
     pub pending_packets: usize,
     /// The tail-loss probe timeout; `None` before the first RTT sample.
@@ -2415,39 +2420,46 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                             "Checking for resends"
                         );
                         // With a node-wide egress cap, a resend or probe goes
-                        // only if the cap takes it (`EgressCap::try_take_retransmit`,
+                        // only if the cap takes it (`EgressCap::admit_retransmit`,
                         // no await, no lock): a refused RTO resend is deferred
-                        // with its state unchanged, a refused probe skipped.
-                        // Without a cap nothing is asked.
+                        // with its state unchanged, at most until it has been
+                        // due for one effective RTO, then sent uncapped; a
+                        // refused probe is skipped. Without a cap nothing is
+                        // asked.
                         let socket = &self.remote_conn.socket;
                         let cap = socket.egress_cap().filter(|cap| cap.caps_retransmits());
                         let mut take = None;
+                        #[cfg(test)]
                         let mut deferred = false;
+                        #[cfg(test)]
+                        let mut uncapped = false;
                         let maybe_resend = {
                             let mut tracker = self.remote_conn.sent_tracker.lock();
-                            let defer_min =
-                                super::egress_cap::retx_defer_min(tracker.effective_rto());
-                            tracker.get_resend_admitted(|kind, len| {
+                            let rto = tracker.effective_rto();
+                            tracker.get_resend_admitted(|kind, len, overdue| {
                                 let Some(cap) = cap else {
                                     return Ok(());
                                 };
-                                match cap.try_take_retransmit(len) {
-                                    Ok(taken) => {
+                                match cap.admit_retransmit(kind, len, overdue, rto) {
+                                    RetxAdmit::Take(taken) => {
                                         take = Some(taken);
                                         Ok(())
                                     }
-                                    Err(wait) => {
-                                        match kind {
-                                            ResendKind::Rto => {
-                                                deferred = true;
-                                                super::TRANSPORT_METRICS
-                                                    .record_egress_retransmit_deferred();
-                                            }
-                                            ResendKind::Probe => super::TRANSPORT_METRICS
-                                                .record_egress_probe_skipped(),
+                                    RetxAdmit::Uncapped => {
+                                        #[cfg(test)]
+                                        {
+                                            uncapped = true;
                                         }
-                                        Err(wait.max(defer_min))
+                                        Ok(())
                                     }
+                                    RetxAdmit::Defer(wait) => {
+                                        #[cfg(test)]
+                                        {
+                                            deferred = true;
+                                        }
+                                        Err(wait)
+                                    }
+                                    RetxAdmit::SkipProbe => Err(Duration::ZERO),
                                 }
                             })
                         };
@@ -2455,6 +2467,10 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                         // action-specific side effects (congestion notification, logging).
                         // Abandon releases flight size and is handled inline (it neither
                         // re-sends nor re-registers). See #4345.
+                        #[cfg(test)]
+                        if uncapped {
+                            self.telemetry_test_counts.retransmits_uncapped += 1;
+                        }
                         let (idx, packet) = match maybe_resend {
                             // Also where the cap deferred a resend: it keeps its
                             // place, and the timer brings the arm back when the
@@ -2741,6 +2757,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             outbound_streams_failed: self.telemetry_test_counts.outbound_streams_failed,
             retransmissions: self.telemetry_test_counts.retransmissions,
             retransmits_deferred: self.telemetry_test_counts.retransmits_deferred,
+            retransmits_uncapped: self.telemetry_test_counts.retransmits_uncapped,
             pending_packets: tracker.pending_len(),
             probe_timeout: tracker.probe_timeout(),
         }
