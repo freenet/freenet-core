@@ -1383,8 +1383,10 @@ impl ConfigArgs {
             // below, so a cached entry wins on an address collision.
             //
             // A cached entry wins even if the compiled-in key for the same
-            // address is newer: the cache came from a live fetch, and a stale
-            // key costs only that one gateway's handshake. Local mode never
+            // address is newer: the cache usually came from a live fetch (or
+            // from an earlier offline boot, whose fallback key file this call
+            // rewrites anyway), and a stale key costs only that one gateway's
+            // handshake. Local mode never
             // reaches this branch.
             let fallback = if remote_fetch_failed {
                 compiled_fallback_gateways(fallback_gateways, &config_paths.secrets_dir(mode))
@@ -1463,11 +1465,14 @@ impl ConfigArgs {
             if !fallback.gateways.is_empty() {
                 let before = gateways.gateways.len();
                 gateways.merge_and_deduplicate(fallback);
-                tracing::info!(
-                    added = gateways.gateways.len() - before,
-                    total = gateways.gateways.len(),
-                    "Remote gateway index unavailable; added compiled-in fallback gateways"
-                );
+                let added = gateways.gateways.len() - before;
+                if added > 0 {
+                    tracing::info!(
+                        added,
+                        total = gateways.gateways.len(),
+                        "Remote gateway index unavailable; added compiled-in fallback gateways"
+                    );
+                }
             }
 
             gateways

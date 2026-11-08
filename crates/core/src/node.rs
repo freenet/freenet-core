@@ -743,7 +743,9 @@ impl NodeConfig {
 
             // One unresolvable gateway must not stop the node: a cached or
             // compiled-in hostname outlives its DNS record once that gateway is
-            // retired, and the remaining gateways can still bootstrap us.
+            // retired, and the remaining gateways can still bootstrap us. The
+            // skip lasts for this process: a gateway that failed to resolve
+            // only transiently is not retried until the next start.
             let address = match Self::parse_socket_addr(address).await {
                 Ok(address) => address,
                 Err(error) => {
@@ -763,7 +765,9 @@ impl NodeConfig {
                 .unwrap_or_else(|| Location::from_address(&address));
             gateways.push(InitPeerNode::new(peer_key_location, location));
         }
-        if gateways.is_empty() {
+        // A gateway may run with no bootstrap peers (isolated gateways are a
+        // valid configuration), so only a peer that needs one fails here.
+        if gateways.is_empty() && !config.is_gateway {
             if let Some(error) = unresolved_error {
                 return Err(error.context("no configured gateway address could be resolved"));
             }
@@ -7265,7 +7269,7 @@ mod tests {
             public_key_path: key_path,
             location: None,
         };
-        let build = |gateways: Vec<GatewayConfig>, id: &str| {
+        let build = |gateways: Vec<GatewayConfig>, id: &str, is_gateway: bool| {
             let id = id.to_string();
             async move {
                 let mut config = crate::config::ConfigArgs {
@@ -7277,6 +7281,7 @@ mod tests {
                 .await
                 .expect("build Config");
                 config.gateways = gateways;
+                config.is_gateway = is_gateway;
                 NodeConfig::new(config).await
             }
         };
@@ -7284,6 +7289,7 @@ mod tests {
         let node_config = build(
             vec![unresolvable.clone(), resolvable],
             "unresolvable-gw-skipped",
+            false,
         )
         .await
         .expect("one unresolvable gateway must not stop the node");
@@ -7296,14 +7302,20 @@ mod tests {
             vec![Some(resolvable_addr)]
         );
 
-        let err = build(vec![unresolvable], "unresolvable-gw-only")
-            .await
-            .err()
-            .expect("with no gateway resolvable, startup must still fail");
+        let Err(err) = build(vec![unresolvable.clone()], "unresolvable-gw-only", false).await
+        else {
+            panic!("with no gateway resolvable, startup must still fail");
+        };
         assert!(
             format!("{err:#}").contains("no configured gateway address could be resolved"),
             "got: {err:#}"
         );
+
+        // A gateway may run with no bootstrap peers, so it still starts.
+        let gateway = build(vec![unresolvable], "unresolvable-gw-gateway", true)
+            .await
+            .expect("a gateway with no resolvable bootstrap peer must still start");
+        assert!(gateway.gateways.is_empty());
     }
 
     // Hostname resolution tests
