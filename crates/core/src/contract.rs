@@ -8370,6 +8370,14 @@ mod tests {
             "PooledDelegateRunner::run must run the delegate inside `with_executor`, \
              which holds the delegate executor's lock: {run}"
         );
+        let forwarded: String = run.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            forwarded.contains(
+                "executor.delegate_request(req,origin_contract,caller_delegate,connection_scope,user_context,)"
+            ),
+            "PooledDelegateRunner::run must hand the executor every argument it was \
+             given, the hosted user's context included: {run}"
+        );
         let with_executor = fn_region(&pool, "    async fn with_executor<R>(");
         assert!(
             with_executor.contains("self.executor.lock().await"),
@@ -8475,25 +8483,38 @@ mod tests {
         // `\nasync fn `" — the same widening hazard `fn_region`'s own rustdoc
         // describes, which this pin's hand-rolled bound had.
         let src = production_code();
-        let body = fn_region(&src, "async fn handle_delegate_with_contract_requests");
-
-        let arm = body
+        // The arm lives in `delegate_response_values`, which classifies one
+        // executor answer for both the loop's round-trip and the delegate
+        // lane, so a single arm covers both paths.
+        let classify = fn_region(&src, "fn delegate_response_values(");
+        let arm = classify
             .find("phase = \"unexpected_response\"")
             .expect("the unexpected-response arm must exist");
-        let after = &body[arm..];
+        let after = &classify[arm..];
         let arm_end = after.find("Err(err) => {").unwrap_or(after.len());
         let arm = &after[..arm_end];
-
         assert!(
-            arm.contains("DelegateRunOutcome::Failed"),
-            "the unexpected-response arm must yield `Failed`, which is what \
+            arm.contains("Err(ExecutorError::other("),
+            "the unexpected-response arm must yield an error, which is what \
              reaches the client as Err. Reporting an internal invariant \
              violation as a success is the lie #5263 removed. Arm: {arm:?}"
         );
         assert!(
-            !arm.contains("DelegateRunOutcome::Completed"),
-            "the unexpected-response arm must not fall back to a success \
-             outcome. Arm: {arm:?}"
+            !arm.contains("Ok("),
+            "the unexpected-response arm must not fall back to a success. Arm: {arm:?}"
+        );
+
+        // ...and both consumers turn that error into a failure the client sees.
+        let round_trip = fn_region(&src, "async fn handle_delegate_with_contract_requests");
+        assert!(
+            round_trip.contains("Err(err) => return DelegateRunOutcome::Failed(err)"),
+            "the round-trip must turn a classified error into `Failed`"
+        );
+        let lane = strip_comments(include_str!("contract/delegate_lane.rs"));
+        let serve = fn_region(&lane, "async fn serve(");
+        assert!(
+            serve.contains("respond(responder, id, Err(err))"),
+            "the lane must answer a classified error with Err: {serve}"
         );
     }
 
@@ -11722,6 +11743,90 @@ mod hol_4391_tests {
             vec![None, Some(b"a1".to_vec()), Some(b"a2".to_vec())],
             "A's resumed leg must read A's first leg, and B must run after A ended"
         );
+        put.await.expect("join").expect("PUT answered");
+        handle.abort();
+    }
+
+    /// The lane path keeps #5263's prohibition: an executor answering a
+    /// delegate request with a variant that is not a delegate response
+    /// reaches the client as an error, never as an empty success.
+    ///
+    /// FALSIFY: in `delegate_response_values`, make the `Ok(_other)` arm
+    /// return `Ok(Vec::new())`; this test fails (it sees a successful empty
+    /// response).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_lane_answers_an_unexpected_response_variant_with_an_error() {
+        let _guard = TEST_GUARD.lock().await;
+        let (mut handler, send) = build_handler(vec![]).await;
+        handler.runtime_mut().enable_delegate_lane();
+        handler
+            .runtime_mut()
+            .delegate_wrong_variant
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let handle = GlobalExecutor::spawn(contract_handling(
+            handler,
+            crate::contract::user_input::AutoApprovePrompter,
+        ));
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            send.send_to_handler(delegate_event(&test_delegate_key())),
+        )
+        .await
+        .expect("answered")
+        .expect("answered");
+        assert!(
+            matches!(response, ContractHandlerEvent::DelegateResponse(Err(_))),
+            "an unexpected executor variant must reach the client as Err, got {response}"
+        );
+        handle.abort();
+    }
+
+    /// A hosted user's request run on the lane runs under that user: the
+    /// executor is handed the request's `user_context`, so the run gets that
+    /// user's secrets and context.
+    ///
+    /// FALSIFY: in `delegate_lane::serve`, pass `None` instead of
+    /// `user_context.as_ref()` to `runner.run`; the observed user is `None`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_lane_runs_a_hosted_request_under_its_user() {
+        let _guard = TEST_GUARD.lock().await;
+        let mut handles = None;
+        let (send, gate, put, handle) = loop_held_in_contract_wasm(
+            |h| {
+                let rt = h.runtime_mut();
+                handles = Some((rt.delegate_script.clone(), rt.delegate_observations.clone()));
+            },
+            true,
+        )
+        .await;
+        let _release = ReleaseOnDrop(gate.clone());
+        let (script, observations) = handles.unwrap();
+        script.lock().unwrap().push_back(ScriptedRun {
+            outbound: vec![app_out(b"for-user")],
+            writes_context: None,
+        });
+        let user = UserSecretContext::from_token(b"delegate-lane-hosted-user");
+        let uid = *user.user_id();
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            send.send_to_handler(delegate_event_for(&test_delegate_key(), Some(user))),
+        )
+        .await
+        .expect("answered on the lane while the loop is held")
+        .expect("answered");
+        assert_eq!(app_payloads(&response), vec![b"for-user".to_vec()]);
+        let seen: Vec<_> = observations
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|o| o.secret_user)
+            .collect();
+        assert_eq!(
+            seen,
+            vec![Some(uid)],
+            "the lane run must carry the request's user"
+        );
+        gate.release();
         put.await.expect("join").expect("PUT answered");
         handle.abort();
     }

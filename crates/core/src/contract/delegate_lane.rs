@@ -333,11 +333,11 @@ impl DelegateGate {
         })
     }
 
-    fn try_forward(&self, unit: LaneUnit) -> Result<(), LaneUnit> {
+    fn try_forward(&self, unit: LaneUnit) -> Result<(), Box<LaneUnit>> {
         let mut inner = self.lock();
         let entry = inner.entries.entry(unit.key.clone()).or_default();
         if !entry.is_clear() {
-            return Err(unit);
+            return Err(Box::new(unit));
         }
         entry.unit_pending = true;
         inner.units.push_back(unit);
@@ -511,10 +511,15 @@ fn respond(
     response: Result<Vec<OutboundDelegateMsg>, ExecutorError>,
 ) {
     // A dropped receiver means the client went away; the delegate already ran.
-    let _ = responder.send((
-        EventId { id },
-        ContractHandlerEvent::DelegateResponse(response),
-    ));
+    if responder
+        .send((
+            EventId { id },
+            ContractHandlerEvent::DelegateResponse(response),
+        ))
+        .is_err()
+    {
+        tracing::debug!(id, "Delegate lane: the client went away before its answer");
+    }
 }
 
 /// The lane task. Runs until its intake closes (the node's sender half is
