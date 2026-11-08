@@ -228,17 +228,32 @@ mis-tag.
 `contract_handling` has started a delegate lane (`contract/delegate_lane.rs`;
 production always does), `ContractHandlerChannel::send_to_handler` hands a
 `DelegateRequest` to the lane's intake with `try_send` instead of the loop's
-fair queue, so its `Priority` is dropped and neither `CLIENT_LOCAL_RESERVE`
-nor Background shedding applies to it. Its bounds are the lane's own: a
-128-slot intake (`LANE_INTAKE_CAPACITY`; full means refused at once), a
-256-request queue (`LANE_QUEUE_CAPACITY`), and at most
-`MAX_PENDING_PER_DELEGATE` (8) queued requests for a PARKED delegate. There is
-no per-client fairness inside the lane. Keep tagging `DelegateRequest`
-ClientLocal at the send site anyway: the tag still applies when no lane is
-running (tests, or after the lane's intake closes), when the request falls
-back to the loop. Work the lane hands back to the loop (`LaneUnit`s) runs at
-the TOP of each loop iteration, ahead of the fair queue, at most
-`MAX_RESUME_DRAIN_BATCH` (16) per iteration.
+fair queue, so its `Priority` is dropped and the fair queue's
+`CLIENT_LOCAL_RESERVE` and Background shedding do not apply to it. Its bounds
+are the lane's own (`contract/delegate_lane.rs`, module docs "Bounds"):
+
+- a 128-slot intake (`LANE_INTAKE_CAPACITY`; full means refused at once) and
+  a 256-request queue (`LANE_QUEUE_CAPACITY`);
+- BLOCKED requests (their delegate is parked, claimed, or has a unit
+  pending) capped per key at `MAX_PENDING_PER_DELEGATE` (8) when parked and
+  `MAX_QUEUED_PER_BUSY_DELEGATE` (100, the fair queue's per-slot cap)
+  otherwise, and in total at `MAX_BLOCKED_QUEUED` (half the queue);
+- payload bytes charged from offer until done, against a budget carved out
+  of the park registry's (`lane_bytes_budget_for`); blocked requests may hold
+  at most half of it;
+- units handed to the loop: at most one per delegate and
+  `MAX_PENDING_UNITS` (64) in all, still charged until the loop takes them;
+- a LOCAL reserve, the lane's version of `CLIENT_LOCAL_RESERVE`: non-local
+  requests may use only seven eighths of the intake, of the blocked count and
+  of the byte budget (`LOCAL_RESERVE_DIVISOR`).
+
+There is no per-client fairness inside the lane beyond that reserve. Keep
+tagging `DelegateRequest` ClientLocal at the send site anyway: the tag still
+applies when no lane is running (tests, or after the lane's intake closes),
+when the request falls back to the loop. Units run at the TOP of each loop
+iteration, ahead of the fair queue, at most `MAX_LANE_UNITS_PER_ITERATION`
+(4) per iteration; every `claim_delegate` and the inter-delegate hop may also
+run one pending unit for the delegate it claims.
 
 ## Critical Invariant: Initialize-Before-Send
 

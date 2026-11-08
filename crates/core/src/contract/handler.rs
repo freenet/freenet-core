@@ -490,7 +490,7 @@ impl ContractHandlerChannel<SenderHalve> {
         }
         match tokio::time::timeout(timeout, result_receiver).await {
             Ok(Ok((_, res))) => Ok(res),
-            Ok(Err(_)) | Err(_) => Err(crate::contract::ContractError::NoEvHandlerResponse),
+            Ok(Err(_)) | Err(_) => Err(ContractError::NoEvHandlerResponse),
         }
     }
 
@@ -528,7 +528,23 @@ impl ContractHandlerChannel<SenderHalve> {
             });
         };
         let bytes = super::delegate_park::request_bytes(&req).get();
-        let Some(charge) = lane.bytes.try_charge(bytes) else {
+        let local = connection_scope.is_local();
+        // The local reserve (`delegate_lane::LOCAL_RESERVE_DIVISOR`): a
+        // non-local request may not take the last intake slots.
+        if !local && lane.tx.capacity() <= super::delegate_lane::LOCAL_INTAKE_RESERVE {
+            let total = super::delegate_lane::record_refusal();
+            if super::delegate_lane::log_this_refusal(total) {
+                tracing::warn!(
+                    delegate_key = %req.key(),
+                    total_refused = total,
+                    "Refused a non-local delegate request: the delegate lane's \
+                     intake is full apart from its local reserve. Logged at \
+                     powers of two of the running total"
+                );
+            }
+            return None;
+        }
+        let Some(charge) = lane.bytes.try_charge(bytes, local) else {
             let total = super::delegate_lane::record_refusal();
             if super::delegate_lane::log_this_refusal(total) {
                 tracing::warn!(
@@ -643,7 +659,7 @@ impl ContractHandlerChannel<SenderHalve> {
         .await
         {
             Ok(Ok(())) => {}
-            Ok(Err(_)) => return Err(crate::contract::ContractError::NoEvHandlerResponse),
+            Ok(Err(_)) => return Err(ContractError::NoEvHandlerResponse),
             Err(_) => {
                 tracing::error!(
                     client = %client_id,
@@ -653,7 +669,7 @@ impl ContractHandlerChannel<SenderHalve> {
                     "Timed out registering transaction for result delivery — \
                      event loop is not draining client transactions (Priority 7 starvation)"
                 );
-                return Err(crate::contract::ContractError::NoEvHandlerResponse);
+                return Err(ContractError::NoEvHandlerResponse);
             }
         }
 
@@ -680,7 +696,7 @@ impl ContractHandlerChannel<SenderHalve> {
         .await
         {
             Ok(Ok(())) => {}
-            Ok(Err(_)) => return Err(crate::contract::ContractError::NoEvHandlerResponse),
+            Ok(Err(_)) => return Err(ContractError::NoEvHandlerResponse),
             Err(_) => {
                 tracing::error!(
                     tx = %tx,
@@ -692,7 +708,7 @@ impl ContractHandlerChannel<SenderHalve> {
                     "Timed out registering subscription for result delivery — \
                      event loop is not draining client transactions (Priority 7 starvation)"
                 );
-                return Err(crate::contract::ContractError::NoEvHandlerResponse);
+                return Err(ContractError::NoEvHandlerResponse);
             }
         }
 
@@ -761,7 +777,7 @@ impl ContractHandlerChannel<ContractHandlerHalve> {
                 .send((id, ev))
                 .map_err(|_| ContractError::NoEvHandlerResponse)
         } else {
-            Err(crate::contract::ContractError::NoEvHandlerResponse)
+            Err(ContractError::NoEvHandlerResponse)
         }
     }
 
@@ -829,7 +845,7 @@ impl ContractHandlerChannel<ContractHandlerHalve> {
             self.end.waiting_response.insert(id, result);
             return Ok((EventId { id }, ev, priority));
         }
-        Err(crate::contract::ContractError::NoEvHandlerResponse)
+        Err(ContractError::NoEvHandlerResponse)
     }
 
     /// Try to receive an event without blocking.
@@ -853,7 +869,7 @@ impl ContractHandlerChannel<ContractHandlerHalve> {
             }
             Err(tokio::sync::mpsc::error::TryRecvError::Empty) => Ok(None),
             Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                Err(crate::contract::ContractError::NoEvHandlerResponse)
+                Err(ContractError::NoEvHandlerResponse)
             }
         }
     }
@@ -1354,6 +1370,88 @@ pub mod test {
         }
     }
 
+    fn remote_delegate_request() -> ContractHandlerEvent {
+        let ContractHandlerEvent::DelegateRequest {
+            req,
+            origin_contract,
+            user_context,
+            ..
+        } = lane_delegate_request()
+        else {
+            unreachable!()
+        };
+        ContractHandlerEvent::DelegateRequest {
+            req,
+            origin_contract,
+            connection_scope: crate::client_events::ConnectionScope::Remote,
+            user_context,
+        }
+    }
+
+    /// A flood of NON-LOCAL delegate requests fills the lane's intake only
+    /// up to its local reserve, so a request from a local connection is still
+    /// admitted (the lane's version of the fair queue's
+    /// `CLIENT_LOCAL_RESERVE`).
+    ///
+    /// FALSIFY: drop the `!local && lane.tx.capacity() <=
+    /// LOCAL_INTAKE_RESERVE` refusal in `offer_to_delegate_lane`; the remote
+    /// flood takes every slot and the local request is refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_remote_flood_leaves_the_local_reserve() -> anyhow::Result<()> {
+        use crate::contract::delegate_lane::{LANE_INTAKE_CAPACITY, LOCAL_INTAKE_RESERVE};
+        let (send, mut rcv, _) = contract_handler_channel();
+        let (tx, mut lane_rx) = mpsc::channel(LANE_INTAKE_CAPACITY);
+        rcv.install_delegate_lane(DelegateLaneIntake {
+            tx,
+            bytes: crate::contract::delegate_lane::LaneBytes::new(usize::MAX),
+        });
+        let send = Arc::new(send);
+        let refused = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+        for _ in 0..LANE_INTAKE_CAPACITY {
+            let (s, r) = (send.clone(), refused.clone());
+            tasks.push(GlobalExecutor::spawn(async move {
+                if s.send_to_handler(remote_delegate_request()).await.is_err() {
+                    r.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }));
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while refused.load(std::sync::atomic::Ordering::SeqCst) < LOCAL_INTAKE_RESERVE {
+            anyhow::ensure!(tokio::time::Instant::now() < deadline, "remote refusals");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            refused.load(std::sync::atomic::Ordering::SeqCst),
+            LOCAL_INTAKE_RESERVE,
+            "remote requests are refused only for the reserved slots"
+        );
+        let s = send.clone();
+        let local =
+            GlobalExecutor::spawn(async move { s.send_to_handler(lane_delegate_request()).await });
+        let mut queued = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while queued.len() < LANE_INTAKE_CAPACITY - LOCAL_INTAKE_RESERVE + 1 {
+            anyhow::ensure!(
+                tokio::time::Instant::now() < deadline && !local.is_finished(),
+                "the local request must be queued, not refused"
+            );
+            match lane_rx.try_recv() {
+                Ok(r) => queued.push(r),
+                Err(_) => tokio::time::sleep(Duration::from_millis(5)).await,
+            }
+        }
+        assert!(
+            queued.iter().any(|r| r.connection_scope.is_local()),
+            "the local request reached the lane"
+        );
+        local.abort();
+        for t in tasks {
+            t.abort();
+        }
+        Ok(())
+    }
+
     /// A FULL lane intake refuses a delegate request at once (the client gets
     /// an error) and does NOT fall back to the loop, which would let a later
     /// request for the same delegate overtake it on the lane.
@@ -1375,10 +1473,7 @@ pub mod test {
         )
         .await?;
         assert!(
-            matches!(
-                result,
-                Err(crate::contract::ContractError::NoEvHandlerResponse)
-            ),
+            matches!(result, Err(super::ContractError::NoEvHandlerResponse)),
             "a full lane refuses the request with an error, got {result:?}"
         );
         assert!(
@@ -1404,7 +1499,7 @@ pub mod test {
         let (send, mut rcv, _) = contract_handler_channel();
         let (tx, mut lane_rx) = mpsc::channel(8);
         let bytes = crate::contract::delegate_lane::LaneBytes::new(4);
-        let _held = bytes.try_charge(4).expect("the budget is free");
+        let _held = bytes.try_charge(4, true).expect("the budget is free");
         rcv.install_delegate_lane(DelegateLaneIntake { tx, bytes });
         let result = tokio::time::timeout(
             Duration::from_secs(5),
@@ -1413,7 +1508,7 @@ pub mod test {
         .await?;
         assert!(matches!(
             result,
-            Err(crate::contract::ContractError::NoEvHandlerResponse)
+            Err(super::ContractError::NoEvHandlerResponse)
         ));
         assert!(lane_rx.try_recv().is_err(), "nothing queued on the lane");
         assert!(

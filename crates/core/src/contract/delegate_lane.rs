@@ -64,7 +64,9 @@
 //! instead of queueing it anywhere unbounded. The lane holds at most
 //! [`LANE_QUEUE_CAPACITY`] requests it has taken from the intake; past that it
 //! stops reading, so the intake fills and refuses. Units to the loop are at
-//! most one per delegate and are themselves drawn from that bounded queue.
+//! most one per delegate and at most [`MAX_PENDING_UNITS`] in all; they keep
+//! their request's byte charge until the loop takes them. A forwarded request
+//! whose client has gone away is dropped when the loop takes it.
 //!
 //! BLOCKED requests (their delegate is not free: parked, claimed by the loop,
 //! or with a round-trip handed to the loop) are bounded twice, so they can
@@ -89,11 +91,17 @@
 //!
 //! Bytes are bounded too: every request is charged its payload size
 //! (`delegate_park::request_bytes`) from the moment the sender offers it
-//! until the lane has finished with it, against [`lane_bytes_budget_for`]
+//! until the lane, or the loop for a unit, has finished with it; blocked
+//! requests may hold at most half of it. The budget is [`lane_bytes_budget_for`]
 //! (a quarter of the park registry's RAM-scaled figure, carved out of it). Over budget, the sender
 //! refuses it at once. One request larger than the whole budget is still
 //! admitted when nothing else is held, so a legitimately large request is not
-//! refused forever; the bound is then budget plus one request.
+//! refused forever (if its delegate is busy, `prune` then refuses it under the
+//! blocked half); the bound is then budget plus one request.
+//!
+//! A LOCAL reserve mirrors the fair queue's `CLIENT_LOCAL_RESERVE`: requests
+//! from non-local connections may use the intake, the blocked count and the
+//! byte budget only up to seven eighths ([`LOCAL_RESERVE_DIVISOR`]).
 //!
 //! A queued request whose client has gone away (its responder is closed) is
 //! dropped instead of run, so a retry after a client-side timeout does not
@@ -135,11 +143,32 @@ pub(crate) const MAX_BLOCKED_QUEUED: usize = LANE_QUEUE_CAPACITY / 2;
 /// Requests the lane holds for one delegate that is busy but NOT parked (a
 /// loop claim or a pending unit). That lasts one loop round-trip, which under
 /// load is the contract-WASM backlog this lane exists to escape (seconds, not
-/// a human's minute), so the cap is looser than the park's 8: 32 lets a burst
-/// on a hosted node's shared delegate key ride out a multi-second loop stall
-/// without refusals, and four such keys reach [`MAX_BLOCKED_QUEUED`], so one
-/// hot key cannot hold more than a quarter of the blocked share.
-pub(crate) const MAX_QUEUED_PER_BUSY_DELEGATE: usize = 32;
+/// a human's minute), so the cap is looser than the park's 8. It is the fair
+/// queue's per-slot cap (`fair_queue::MAX_QUEUED_PER_CONTRACT`, 100): before
+/// the lane, client delegate requests all waited in one fair-queue slot, so a
+/// burst on a hosted node's shared delegate key could hold 100 waiting
+/// requests and still be served. It stays under [`MAX_BLOCKED_QUEUED`], so one
+/// key still cannot take the queue's runnable half.
+pub(crate) const MAX_QUEUED_PER_BUSY_DELEGATE: usize = super::fair_queue::MAX_QUEUED_PER_CONTRACT;
+
+/// Units (round-trips handed to the loop, and requests forwarded to it) that
+/// may wait for the loop at once, across all delegates. At the cap the lane
+/// starts no run and forwards nothing, so every delegate counts as busy and
+/// the blocked caps above apply to what waits. Without it, units leave the
+/// lane's queue the moment they are handed over, so the queue bound did not
+/// bound them: distinct-key registrations could pile up at client rate while
+/// the loop is in contract WASM.
+pub(crate) const MAX_PENDING_UNITS: usize = 64;
+
+/// Share of the intake, of the blocked count and of the lane byte budget kept
+/// for requests from LOCAL connections (`ConnectionScope::Local`), the lane's
+/// version of the fair queue's `CLIENT_LOCAL_RESERVE`: a remote or hosted
+/// flood fills the lane only up to the reserve, so the node operator's own
+/// client is still admitted. One eighth of each.
+pub(crate) const LOCAL_RESERVE_DIVISOR: usize = 8;
+
+/// Intake slots only a local request may take.
+pub(crate) const LOCAL_INTAKE_RESERVE: usize = LANE_INTAKE_CAPACITY / LOCAL_RESERVE_DIVISOR;
 
 /// Payload bytes the lane may hold (intake plus queue) on a host with
 /// `total_ram` bytes: a quarter of the park registry's figure
@@ -168,14 +197,21 @@ impl LaneBytes {
         })
     }
 
-    /// Charge `bytes`, or `None` when that would exceed the budget (unless
-    /// nothing is held: see the module docs).
-    pub(crate) fn try_charge(self: &Arc<Self>, bytes: usize) -> Option<LaneCharge> {
+    /// Charge `bytes`, or `None` when that would exceed the budget. A remote
+    /// request may use the budget less its local reserve; a local one all of
+    /// it. Nothing held admits one request of any size, and a zero-byte
+    /// request is never refused for bytes (see the module docs).
+    pub(crate) fn try_charge(self: &Arc<Self>, bytes: usize, local: bool) -> Option<LaneCharge> {
         use std::sync::atomic::Ordering;
+        let limit = if local {
+            self.budget
+        } else {
+            self.budget - self.budget / LOCAL_RESERVE_DIVISOR
+        };
         let mut held = self.held.load(Ordering::Acquire);
         loop {
             let next = held.saturating_add(bytes);
-            if held != 0 && next > self.budget {
+            if bytes != 0 && held != 0 && next > limit {
                 return None;
             }
             match self
@@ -199,11 +235,23 @@ impl LaneBytes {
     }
 }
 
-/// A request's share of [`LaneBytes`], released on drop.
+/// A request's share of [`LaneBytes`], released on drop. Carried by the
+/// request and then by its [`LaneUnit`], so a round-trip or forwarded request
+/// waiting for the loop stays charged until the loop takes it.
 #[derive(Debug, Default)]
 pub(crate) struct LaneCharge {
     bytes: Option<Arc<LaneBytes>>,
     n: usize,
+}
+
+impl LaneCharge {
+    fn bytes(&self) -> usize {
+        self.n
+    }
+
+    fn budget(&self) -> Option<usize> {
+        self.bytes.as_ref().map(|b| b.budget)
+    }
 }
 
 impl Drop for LaneCharge {
@@ -219,9 +267,7 @@ impl Drop for LaneCharge {
 /// Refusals counted by the lane and its sender, mirrored into the node's
 /// telemetry (`network_status::record_delegate_lane_refusal`).
 pub(crate) fn record_refusal() -> u64 {
-    static TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    crate::node::network_status::record_delegate_lane_refusal();
-    TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+    crate::node::network_status::record_delegate_lane_refusal()
 }
 
 /// Whether a refusal with this running total is logged: the first, then at
@@ -282,6 +328,8 @@ pub(crate) struct LaneUnit {
     /// `process()` again. `None`: a forwarded request the loop runs from the
     /// start.
     pub(crate) first_values: Option<Vec<OutboundDelegateMsg>>,
+    /// The request's lane bytes, released when the loop takes the unit.
+    pub(crate) charge: LaneCharge,
 }
 
 #[derive(Default, Debug)]
@@ -326,6 +374,18 @@ impl Inner {
         let pos = self.units.iter().position(|u| &u.key == key)?;
         self.units.remove(pos)
     }
+
+    fn units_full(&self) -> bool {
+        self.units.len() >= MAX_PENDING_UNITS
+    }
+}
+
+/// Whether a unit is a FORWARDED request whose client has gone away. Such a
+/// unit is dropped when the loop takes it rather than run. A continuation
+/// (`first_values` is `Some`) always runs: its round-trip already started,
+/// and the delegate's own state expects it to finish.
+fn abandoned(unit: &LaneUnit) -> bool {
+    unit.first_values.is_none() && unit.responder.is_closed()
 }
 
 /// Per-delegate exclusion between the lane and the loop. See the module docs.
@@ -343,9 +403,6 @@ pub(crate) struct DelegateGate {
     units_ready: Notify,
     /// Lane -> loop claims waiting on a lane run: a lane run ended.
     lane_run_ended: Notify,
-    /// Requests the lane refused because their delegate was blocked past a
-    /// cap (see [`prune`]). Also mirrored into telemetry.
-    refused_blocked: std::sync::atomic::AtomicU64,
 }
 
 impl DelegateGate {
@@ -373,7 +430,7 @@ impl DelegateGate {
         entry.loop_claims += 1;
         let unit = if entry.unit_pending {
             entry.unit_pending = false;
-            inner.take_unit(key)
+            inner.take_unit(key).filter(|unit| !abandoned(unit))
         } else {
             None
         };
@@ -462,9 +519,13 @@ impl DelegateGate {
     }
 
     fn state(&self, key: &DelegateKey) -> KeyState {
-        match self.lock().entries.get(key) {
-            None => KeyState::Free,
+        let inner = self.lock();
+        match inner.entries.get(key) {
             Some(entry) if entry.park_holds > 0 => KeyState::Parked,
+            // At the unit cap nothing can start or be forwarded, so a free
+            // delegate waits like a busy one.
+            _ if inner.units_full() => KeyState::Busy,
+            None => KeyState::Free,
             Some(entry) if entry.is_clear() => KeyState::Free,
             Some(_) => KeyState::Busy,
         }
@@ -479,9 +540,35 @@ impl DelegateGate {
     }
 
     /// The oldest waiting unit, with its delegate claimed for the loop.
+    ///
+    /// A forwarded request whose client has gone away is dropped here, not
+    /// returned (see [`abandoned`]).
     pub(crate) fn take_next_unit(self: &Arc<Self>) -> Option<(LoopClaim, LaneUnit)> {
         let mut inner = self.lock();
-        let unit = inner.units.pop_front()?;
+        let mut dropped = false;
+        let unit = loop {
+            let Some(unit) = inner.units.pop_front() else {
+                drop(inner);
+                if dropped {
+                    self.lane_wake.notify_one();
+                }
+                return None;
+            };
+            if abandoned(&unit) {
+                tracing::debug!(
+                    delegate_key = %unit.key,
+                    id = unit.id,
+                    "Delegate lane: dropping a forwarded request whose client went away"
+                );
+                if let Some(entry) = inner.entries.get_mut(&unit.key) {
+                    entry.unit_pending = false;
+                }
+                inner.remove_if_clear(&unit.key);
+                dropped = true;
+                continue;
+            }
+            break unit;
+        };
         let entry = inner.entries.entry(unit.key.clone()).or_default();
         entry.unit_pending = false;
         entry.loop_claims += 1;
@@ -490,6 +577,10 @@ impl DelegateGate {
             key: unit.key.clone(),
             park: false,
         };
+        drop(inner);
+        if dropped {
+            self.lane_wake.notify_one();
+        }
         Some((claim, unit))
     }
 
@@ -501,6 +592,10 @@ impl DelegateGate {
 
     fn try_begin_lane_run(self: &Arc<Self>, key: &DelegateKey) -> Option<LaneRun> {
         let mut inner = self.lock();
+        // A run may hand off, so none starts at the unit cap.
+        if inner.units_full() {
+            return None;
+        }
         let entry = inner.entries.entry(key.clone()).or_default();
         if !entry.is_clear() {
             return None;
@@ -515,6 +610,9 @@ impl DelegateGate {
 
     fn try_forward(&self, unit: LaneUnit) -> Result<(), Box<LaneUnit>> {
         let mut inner = self.lock();
+        if inner.units_full() {
+            return Err(Box::new(unit));
+        }
         let entry = inner.entries.entry(unit.key.clone()).or_default();
         if !entry.is_clear() {
             return Err(Box::new(unit));
@@ -527,7 +625,7 @@ impl DelegateGate {
     }
 
     fn is_free(&self, key: &DelegateKey) -> bool {
-        self.lock().entries.get(key).is_none_or(Entry::is_clear)
+        self.state(key) == KeyState::Free
     }
 
     fn end_lane_run(&self, key: &DelegateKey, unit: Option<LaneUnit>) {
@@ -561,9 +659,8 @@ impl DelegateGate {
     }
 
     #[cfg(test)]
-    pub(crate) fn refused_blocked_count(&self) -> u64 {
-        self.refused_blocked
-            .load(std::sync::atomic::Ordering::Relaxed)
+    pub(crate) fn pending_units(&self) -> usize {
+        self.lock().units.len()
     }
 }
 
@@ -818,6 +915,7 @@ fn prune(queue: &mut VecDeque<LaneRequest>, gate: &DelegateGate) {
     // Per key: (state, requests kept so far). One gate lookup per key.
     let mut seen: HashMap<DelegateKey, (KeyState, usize)> = HashMap::new();
     let mut blocked_total = 0usize;
+    let mut blocked_bytes = 0usize;
     queue.retain(|request| {
         let key = request.req.key();
         if request.responder.is_closed() {
@@ -839,9 +937,25 @@ fn prune(queue: &mut VecDeque<LaneRequest>, gate: &DelegateGate) {
             KeyState::Parked => MAX_PENDING_PER_DELEGATE,
             KeyState::Busy => MAX_QUEUED_PER_BUSY_DELEGATE,
         };
-        if *kept >= per_key || blocked_total >= MAX_BLOCKED_QUEUED {
-            gate.refused_blocked
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // A remote request leaves the local reserve free (count and bytes).
+        let local = request.connection_scope.is_local();
+        let reserve = |limit: usize| {
+            if local {
+                limit
+            } else {
+                limit - limit / LOCAL_RESERVE_DIVISOR
+            }
+        };
+        // Blocked requests may hold at most HALF the lane byte budget, so
+        // requests to free delegates always have the other half: one parked
+        // delegate's re-registrations (each carrying its WASM) cannot make
+        // the sender refuse every delegate on the node. This also refuses a
+        // blocked request admitted by the "nothing held" oversize rule.
+        let bytes = request.charge.bytes();
+        let over_bytes = request.charge.budget().is_some_and(|budget| {
+            bytes != 0 && blocked_bytes.saturating_add(bytes) > reserve(budget / 2)
+        });
+        if *kept >= per_key || blocked_total >= reserve(MAX_BLOCKED_QUEUED) || over_bytes {
             let total = record_refusal();
             if log_this_refusal(total) {
                 tracing::warn!(
@@ -862,6 +976,7 @@ fn prune(queue: &mut VecDeque<LaneRequest>, gate: &DelegateGate) {
         }
         *kept += 1;
         blocked_total += 1;
+        blocked_bytes += bytes;
         true
     });
 }
@@ -918,6 +1033,7 @@ async fn serve(
             connection_scope,
             user_context,
             first_values: None,
+            charge,
         };
         return gate.try_forward(unit).map_err(|unit| LaneRequest {
             id: unit.id,
@@ -926,7 +1042,7 @@ async fn serve(
             origin_contract: unit.origin_contract,
             connection_scope: unit.connection_scope,
             user_context: unit.user_context,
-            charge,
+            charge: unit.charge,
         });
     }
 
@@ -940,7 +1056,7 @@ async fn serve(
         origin_contract,
         connection_scope,
         user_context,
-        charge: _charge,
+        charge,
     } = request;
     let continuation = continuation_request(&req);
     tracing::debug!(delegate_key = %key, "Processing delegate request on the delegate lane");
@@ -948,6 +1064,16 @@ async fn serve(
     // client is answered with an error and the run's gate entry is released
     // (`LaneRun` drops). The runner itself marks its executor for a health
     // check before the next use (`PooledDelegateRunner`).
+    //
+    // CAVEAT: only the executor is replaced. Node state a host-side panic may
+    // have left half-updated stays as it was: the delegate's
+    // `DelegateContextCache` entry (read before the run, written after), the
+    // inherited-origins map, the created-delegate counter, and an on-disk
+    // secret or its quota counter if the panic hit a secret write. Before the
+    // lane such a panic ended the contract loop and so the node. The locks
+    // involved are poison-tolerant, so nothing cascades; a delegate whose
+    // run panicked may see a stale or missing context on its next run. WASM
+    // traps are not panics (they are errors), so this needs a host bug.
     let result = {
         use futures::FutureExt;
         std::panic::AssertUnwindSafe(runner.run(
@@ -999,6 +1125,7 @@ async fn serve(
                 connection_scope,
                 user_context,
                 first_values: Some(values),
+                charge,
             });
         }
     }
@@ -1018,7 +1145,10 @@ mod tests {
     }
 
     fn unit(k: &DelegateKey) -> LaneUnit {
-        let (responder, _) = tokio::sync::oneshot::channel();
+        // The receiver is kept alive (leaked): a unit whose client has gone
+        // away is dropped when taken, and these tests are about the gate.
+        let (responder, rx) = tokio::sync::oneshot::channel();
+        std::mem::forget(rx);
         LaneUnit {
             key: k.clone(),
             id: 0,
@@ -1028,6 +1158,7 @@ mod tests {
             connection_scope: crate::client_events::ConnectionScope::Local,
             user_context: None,
             first_values: None,
+            charge: LaneCharge::default(),
         }
     }
 
@@ -1183,9 +1314,10 @@ mod tests {
     /// dropped); other delegates' requests and a non-parked delegate's are
     /// untouched; a request whose client went away is dropped.
     ///
-    /// FALSIFY: remove the `*parked && *kept >= MAX_PENDING_PER_DELEGATE`
-    /// refusal in `prune`; D keeps all of its requests. Remove the
-    /// `is_closed()` check; the abandoned request stays queued.
+    /// FALSIFY: in `prune`, make `KeyState::Parked` map to
+    /// `MAX_QUEUED_PER_BUSY_DELEGATE` instead of `MAX_PENDING_PER_DELEGATE`;
+    /// D keeps all of its requests. Remove the `is_closed()` check; the
+    /// abandoned request stays queued.
     #[tokio::test]
     async fn prune_caps_a_parked_delegate_and_drops_abandoned_requests() {
         use super::super::delegate_park::MAX_PENDING_PER_DELEGATE;
@@ -1253,7 +1385,6 @@ mod tests {
                 "the OLDEST requests are kept and the newest refused (request {i})"
             );
         }
-        assert_eq!(gate.refused_blocked_count(), extra as u64);
 
         // Unparked: no cap any more.
         drop(park_hold);
@@ -1397,24 +1528,192 @@ mod tests {
         assert_eq!(queue.len(), MAX_QUEUED_PER_BUSY_DELEGATE);
     }
 
+    /// Blocked requests may hold at most HALF the lane byte budget, so
+    /// requests queued behind a parked delegate (here re-registrations, and
+    /// one oversized request admitted when nothing was held) can never leave
+    /// a request to a FREE delegate refused for bytes.
+    ///
+    /// FALSIFY: drop `|| over_bytes` from `prune`'s refusal; the free
+    /// delegate's charge is refused.
+    #[tokio::test]
+    async fn blocked_requests_cannot_take_the_byte_budget_from_free_delegates() {
+        let gate = DelegateGate::new();
+        let p = key(50);
+        let (claim, _) = gate.claim(&p).await;
+        let _park = gate.hold(&p);
+        drop(claim);
+        let bytes = LaneBytes::new(100);
+        let mut rxs = Vec::new();
+        let mut queue = VecDeque::new();
+        for _ in 0..2 {
+            let (mut r, rx) = request(&p);
+            r.charge = bytes.try_charge(40, true).expect("fits");
+            queue.push_back(r);
+            rxs.push(rx);
+        }
+        prune(&mut queue, &gate);
+        assert_eq!(
+            queue.len(),
+            1,
+            "the second 40 bytes would exceed the blocked half"
+        );
+        assert!(
+            bytes.try_charge(40, true).is_some(),
+            "a request to a free delegate is still admitted"
+        );
+
+        // One oversized request, admitted because nothing was held, for the
+        // parked delegate: refused by prune, releasing the budget.
+        drop(queue);
+        let bytes = LaneBytes::new(100);
+        let (mut big, _rx) = request(&p);
+        big.charge = bytes.try_charge(500, true).expect("oversize when empty");
+        let mut queue = VecDeque::from([big]);
+        prune(&mut queue, &gate);
+        assert!(queue.is_empty());
+        assert_eq!(bytes.held(), 0);
+        assert!(bytes.try_charge(40, true).is_some());
+    }
+
     /// The lane's byte budget refuses past the budget, releases on drop, and
     /// admits a single oversized request when nothing else is held.
     #[test]
     fn lane_bytes_charge_refuse_and_release() {
         let bytes = LaneBytes::new(100);
-        let a = bytes.try_charge(60).expect("under budget");
-        assert!(bytes.try_charge(50).is_none(), "60 + 50 is over 100");
-        let b = bytes.try_charge(40).expect("60 + 40 fits exactly");
+        let a = bytes.try_charge(60, true).expect("under budget");
+        assert!(bytes.try_charge(50, true).is_none(), "60 + 50 is over 100");
+        let b = bytes.try_charge(40, true).expect("60 + 40 fits exactly");
         assert_eq!(bytes.held(), 100);
         drop(a);
         drop(b);
         assert_eq!(bytes.held(), 0, "charges are released on drop");
         let big = bytes
-            .try_charge(500)
+            .try_charge(500, true)
             .expect("one oversized request when empty");
-        assert!(bytes.try_charge(1).is_none());
+        assert!(bytes.try_charge(1, true).is_none());
+        let empty = bytes
+            .try_charge(0, false)
+            .expect("a zero-byte request is never refused for bytes");
+        drop(empty);
         drop(big);
         assert_eq!(bytes.held(), 0);
+
+        // The local reserve: a remote request may use 7/8 of the budget.
+        let budget = 800;
+        let bytes = LaneBytes::new(budget);
+        let _r = bytes.try_charge(600, false).expect("remote, under 7/8");
+        assert!(
+            bytes.try_charge(150, false).is_none(),
+            "750 is over a remote request's 700"
+        );
+        let _l = bytes
+            .try_charge(150, true)
+            .expect("a local request may use the reserve");
+    }
+
+    /// Pending units are capped in total: at the cap the lane neither runs
+    /// nor forwards, so every waiting request counts as blocked; and a unit
+    /// keeps its request's bytes charged until the loop takes it.
+    ///
+    /// FALSIFY: drop the `units_full()` checks in `try_forward` /
+    /// `try_begin_lane_run` (units exceed the cap); or move the charge out of
+    /// the forwarded `LaneUnit` (held bytes fall to the queued ones only).
+    #[tokio::test]
+    async fn pending_units_are_capped_and_stay_charged() {
+        struct Never;
+        impl DelegateRunner for Never {
+            fn run<'a>(
+                &'a self,
+                _req: DelegateRequest<'a>,
+                _origin_contract: Option<&'a ContractInstanceId>,
+                _caller_delegate: Option<&'a DelegateKey>,
+                _connection_scope: crate::client_events::ConnectionScope,
+                _user_context: Option<&'a UserSecretContext>,
+            ) -> BoxFuture<'a, Result<HostResponse, ExecutorError>> {
+                unreachable!("only forwarded requests in this test")
+            }
+        }
+        let gate = DelegateGate::new();
+        let bytes = LaneBytes::new(usize::MAX);
+        let (tx, rx) = tokio::sync::mpsc::channel(LANE_INTAKE_CAPACITY);
+        let lane = tokio::spawn(run_lane(Arc::new(Never), gate.clone(), rx));
+        let n = MAX_PENDING_UNITS + 20;
+        let mut answers = Vec::new();
+        for i in 0..n {
+            // Distinct keys, each a forwarded (loop-only) request.
+            let k = DelegateKey::new(
+                [(i % 256) as u8; 32],
+                freenet_stdlib::prelude::CodeHash::new([(i / 256) as u8 + 1; 32]),
+            );
+            let (responder, rx) = tokio::sync::oneshot::channel();
+            answers.push(rx);
+            tx.send(LaneRequest {
+                id: i as u64,
+                responder,
+                req: DelegateRequest::UnregisterDelegate(k),
+                origin_contract: None,
+                connection_scope: crate::client_events::ConnectionScope::Local,
+                user_context: None,
+                charge: bytes.try_charge(10, true).expect("budget"),
+            })
+            .await
+            .expect("lane up");
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while gate.pending_units() < MAX_PENDING_UNITS {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "units never reached the cap"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // Negative assertion: give the lane time to (wrongly) forward more.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(gate.pending_units(), MAX_PENDING_UNITS, "units are capped");
+        assert_eq!(
+            bytes.held(),
+            10 * n,
+            "every request is still charged: the units AND those waiting behind the cap"
+        );
+        // The loop taking a unit releases its bytes, and the lane forwards one
+        // more in its place.
+        let (claim, unit) = gate.take_next_unit().expect("a unit");
+        drop(unit);
+        drop(claim);
+        assert_eq!(bytes.held(), 10 * (n - 1));
+        lane.abort();
+        drop(answers);
+    }
+
+    /// A forwarded request whose client has gone away is dropped when the
+    /// loop takes units, not run; a continuation is always run.
+    ///
+    /// FALSIFY: return the unit regardless of `abandoned` in
+    /// `take_next_unit`.
+    #[test]
+    fn take_next_unit_drops_forwarded_requests_whose_client_left() {
+        let gate = DelegateGate::new();
+        let gone = key(40);
+        let (mut u, rx) = {
+            let (responder, rx) = tokio::sync::oneshot::channel();
+            let mut u = unit(&gone);
+            u.responder = responder;
+            (u, rx)
+        };
+        drop(rx);
+        u.id = 1;
+        gate.hand_off_for_test(u);
+        let live = key(41);
+        let (responder, _live_rx) = tokio::sync::oneshot::channel();
+        let mut v = unit(&live);
+        v.responder = responder;
+        gate.hand_off_for_test(v);
+        let (_claim, taken) = gate.take_next_unit().expect("the live unit");
+        assert_eq!(
+            taken.key, live,
+            "the abandoned forwarded request is skipped"
+        );
+        assert!(!gate.is_tracking(&gone), "and its delegate is released");
     }
 
     /// The force-resume path (`sweep_expired_parks` ->

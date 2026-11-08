@@ -136,15 +136,19 @@ const MAX_INFLIGHT_DEFERRALS: usize = 256;
 /// bounded-batch rationale.
 const MAX_RESUME_DRAIN_BATCH: usize = 16;
 
-/// Delegate lane units (`delegate_lane::LaneUnit`) the loop runs per
-/// iteration, i.e. per fair-queue event. Lower than
+/// Delegate lane units (`delegate_lane::LaneUnit`) the TOP-OF-ITERATION drain
+/// runs per loop iteration, i.e. per fair-queue event. Lower than
 /// [`MAX_RESUME_DRAIN_BATCH`] on purpose: resumes are bounded by the park
 /// count, while units are refilled continuously by client traffic, so a cap
 /// of 16 let one client's stream of hand-offs take 16 loop round-trips for
-/// every contract operation. At 4 the fair queue gets at least one event per
-/// four units. Leftover units are not stranded: the loop skips its blocking
-/// wait while one is pending (`has_pending_unit`), and still pops the fair
-/// queue every iteration.
+/// every contract operation. This drain gives the fair queue one event per
+/// four units. It is not the only place units run: every `claim_delegate`
+/// (notification, lifecycle, resume, the client-arm fallback) and the
+/// inter-delegate hop run the claimed delegate's pending unit first, at most
+/// one per claim (see the per-iteration bound comment in `contract_handling`).
+/// Leftover units are not stranded: the loop skips its blocking wait while one
+/// is pending (`has_pending_unit`), and still pops the fair queue every
+/// iteration.
 const MAX_LANE_UNITS_PER_ITERATION: usize = 4;
 
 /// A PUT/UPDATE that deferred its related-contract fetch off the serial loop,
@@ -3413,8 +3417,8 @@ where
         });
         let mut abort = crate::util::AbortOnDrop::new();
         abort.push(handle.abort_handle());
-        let host_ram = crate::wasm_runtime::read_total_ram_bytes()
-            .unwrap_or(delegate_park::PARKED_FALLBACK_TOTAL_RAM_BYTES);
+        // The SAME RAM figure the park registry read, so the carve adds up.
+        let host_ram = park_ctx.host_ram();
         contract_handler
             .channel()
             .install_delegate_lane(handler::DelegateLaneIntake {
@@ -5715,6 +5719,8 @@ async fn run_lane_unit<CH, P>(
         connection_scope,
         user_context,
         first_values,
+        // Released here: the loop has taken the unit.
+        charge: _,
     } = unit;
     // Into the loop's own waiting-response map, so every answer below takes
     // the path an event received from the channel takes, including being
@@ -8536,7 +8542,8 @@ mod tests {
                 .unwrap_or_else(|| panic!("`with_executor` must contain `{needle}`"))
         };
         assert!(
-            at("self.suspect.take()") < at("f(&mut executor)")
+            at("self.suspect.is_set()") < at("f(&mut executor)")
+                && at(".recover(") < at("f(&mut executor)")
                 && at("self.suspect.begin()") < at("f(&mut executor)")
                 && at("call.done()") > at("f(&mut executor)"),
             "`with_executor` must replace an executor whose last call panicked \
@@ -8722,6 +8729,19 @@ mod tests {
             *stack.last().expect("the position is inside a block")
         }
 
+        /// Whether `between` (the code from a claim's binding to the call)
+        /// gives up one of `names`: a `drop` or `forget` of it (any path:
+        /// `drop(`, `mem::drop(`, `std::mem::forget(`), or a `spawn(`, whose
+        /// body would run without the parent's claim.
+        fn releases_claim(between: &str, names: &[&str]) -> bool {
+            between.contains("spawn(")
+                || names.iter().any(|name| {
+                    ["drop(", "forget("]
+                        .iter()
+                        .any(|f| between.contains(&format!("{f}{name})")))
+                })
+        }
+
         /// Whether the call at `idx` is in scope of a claim binding whose
         /// statement contains `token`.
         fn claimed_in_scope(code: &str, fn_start: usize, idx: usize, token: &str) -> bool {
@@ -8743,9 +8763,7 @@ mod tests {
                     let open = innermost_open(code, fn_start, b);
                     let scope_ends = end_of_block(code, open) > idx;
                     let between = &code[stmt_end..idx];
-                    let dropped =
-                        between.contains("drop(_claim") || between.contains("drop(claim)");
-                    scope_ends && !dropped
+                    scope_ends && !releases_claim(between, &["_claim", "claim"])
                 })
             })
         }
@@ -8806,7 +8824,8 @@ mod tests {
             .expect("the hop must bind its target claim as `let _hop_claim = hop_claim;`");
         let open = innermost_open(&code, start, binding);
         assert!(
-            end_of_block(&code, open) > hop && !code[binding..hop].contains("drop(_hop_claim"),
+            end_of_block(&code, open) > hop
+                && !releases_claim(&code[binding..hop], &["_hop_claim", "hop_claim"]),
             "the hop's target claim must be in scope at `.execute_delegate_hop(`"
         );
         for token in [
@@ -12759,6 +12778,7 @@ mod hol_4391_tests {
                 connection_scope: crate::client_events::ConnectionScope::Local,
                 user_context: None,
                 first_values: Some(first_values),
+                charge: Default::default(),
             },
             rx,
         )

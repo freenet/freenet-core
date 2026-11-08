@@ -261,7 +261,7 @@ const MIN_PARKED_BYTES: usize = MAX_PARKED_BYTES / 8;
 
 /// RAM assumed when the host's real figure cannot be read — the same
 /// conservative 1 GiB every sibling budget falls back to.
-pub(super) const PARKED_FALLBACK_TOTAL_RAM_BYTES: usize = 1024 * 1024 * 1024;
+const PARKED_FALLBACK_TOTAL_RAM_BYTES: usize = 1024 * 1024 * 1024;
 
 /// Fraction of node memory the park registry may pin. Matches the shape of
 /// every sibling budget (`budget_for_ram`, `summary_budget_for`, ...), which is
@@ -297,9 +297,13 @@ pub(super) fn parked_budget_for(total_ram: usize) -> usize {
 /// because no other test's stub returns a state large enough to reach the
 /// refusal branch, which was a fact about the tests that happened to exist,
 /// written in a comment. `OverrideGuard::install` now checks it against this.
+///
+/// The smallest registry budget is at the floor WITH a delegate lane running,
+/// which carves its share out (`DelegateParkCtx::set_gate`); `0` bytes of RAM
+/// lands every RAM-scaled term on its floor.
 #[cfg(test)]
 pub(super) fn min_upsert_fetch_allowance() -> ByteCount {
-    upsert_fetch_allowance(MIN_PARKED_BYTES)
+    upsert_fetch_allowance(parked_budget_for(0) - super::delegate_lane::lane_bytes_budget_for(0))
 }
 
 /// Bytes ONE deferred upsert's off-loop related-contract fetch may RETAIN.
@@ -1832,8 +1836,9 @@ impl DelegateParkCtx {
     /// bytes they used to be charged here are now charged there
     /// (`delegate_lane::lane_bytes_budget_for`). The node's total stays
     /// `parked_budget_for`, the figure `declared_cache_ceiling` sums. The
-    /// per-upsert fetch allowance is still derived from the full figure, so
-    /// deferred upserts are unaffected.
+    /// per-upsert fetch allowance follows the carved budget (it is derived
+    /// from `self.budget`), so "four fully-fetching parks fill the budget"
+    /// still holds of the budget the registry actually has.
     pub(super) fn set_gate(&mut self, gate: std::sync::Arc<super::delegate_lane::DelegateGate>) {
         self.gate = Some(gate);
         self.budget = parked_budget_for(self.host_ram)
@@ -1890,9 +1895,14 @@ impl DelegateParkCtx {
     /// The bytes ONE deferred upsert's off-loop related fetch may retain on
     /// this node. See [`upsert_fetch_allowance`].
     pub(super) fn upsert_fetch_allowance(&self) -> ByteCount {
-        // The FULL registry figure, not `self.budget`, which `set_gate` lowers
-        // by the delegate lane's share; see there.
-        upsert_fetch_allowance(parked_budget_for(self.host_ram))
+        upsert_fetch_allowance(self.budget)
+    }
+
+    /// The host RAM this registry sized itself from, read once at
+    /// construction. The delegate lane sizes its byte budget from the SAME
+    /// figure, so the carve in [`Self::set_gate`] adds up exactly.
+    pub(super) fn host_ram(&self) -> usize {
+        self.host_ram
     }
 
     pub(super) fn resume_tx(&self) -> &tokio::sync::mpsc::UnboundedSender<DelegateResume> {
@@ -2411,7 +2421,7 @@ mod tests {
     /// With a delegate lane, the lane's byte budget is carved OUT of the park
     /// registry's, so the node total stays `parked_budget_for`, the one term
     /// `declared_cache_ceiling` sums; the per-upsert fetch allowance keeps
-    /// using the full figure.
+    /// following the carved budget.
     ///
     /// FALSIFY: drop the budget reduction in `set_gate`; the two budgets
     /// together exceed `parked_budget_for`.
@@ -2421,7 +2431,6 @@ mod tests {
         let mut ctx = DelegateParkCtx::new(tx);
         let full = parked_budget_for(ctx.host_ram);
         assert_eq!(ctx.budget(), full, "no lane: the registry has it all");
-        let allowance = ctx.upsert_fetch_allowance();
         ctx.set_gate(super::super::delegate_lane::DelegateGate::new());
         assert_eq!(
             ctx.budget() + super::super::delegate_lane::lane_bytes_budget_for(ctx.host_ram),
@@ -2430,9 +2439,14 @@ mod tests {
         );
         assert!(ctx.budget() < full);
         assert_eq!(
-            ctx.upsert_fetch_allowance(),
-            allowance,
-            "deferred upserts are unaffected"
+            ctx.upsert_fetch_allowance().get(),
+            upsert_fetch_allowance(ctx.budget()),
+            "the fetch allowance follows the carved budget, so four fully \
+             fetching parks still fill exactly the registry's real budget"
+        );
+        assert!(
+            ctx.upsert_fetch_allowance() >= min_upsert_fetch_allowance(),
+            "min_upsert_fetch_allowance must stay a true minimum with the carve"
         );
     }
 
