@@ -406,48 +406,104 @@ impl SuspectCall<'_> {
     }
 }
 
+/// The call protocol around the delegate executor, generic so it can be
+/// tested without building a real executor:
+///
+/// 1. If the previous call panicked out of `f` (the mark is set), replace the
+///    executor first. If that replacement FAILS (or the future is dropped
+///    mid-replacement), do NOT run `f` on the executor left mid-call: return
+///    `None`, with the mark still set, so the next call retries.
+/// 2. Run `f` with the mark armed; a normal return disarms it.
+/// 3. If the executor is unhealthy afterwards, replace it; a failure leaves
+///    the mark set, so the next call retries before running.
+pub(crate) async fn run_guarded<E, R, Fut>(
+    suspect: &SuspectFlag,
+    executor: &mut E,
+    replace: impl Fn(&'static str) -> Fut,
+    healthy: impl Fn(&E) -> bool,
+    f: impl FnOnce(&mut E) -> R,
+) -> Option<R>
+where
+    Fut: std::future::Future<Output = Option<E>>,
+{
+    if suspect.is_set() {
+        suspect
+            .recover(async {
+                match replace("a call into it panicked").await {
+                    Some(new) => {
+                        *executor = new;
+                        true
+                    }
+                    None => false,
+                }
+            })
+            .await;
+        if suspect.is_set() {
+            return None;
+        }
+    }
+    let call = suspect.begin();
+    let result = f(executor);
+    call.done();
+    if !healthy(executor) {
+        suspect
+            .recover(async {
+                match replace("it became unhealthy").await {
+                    Some(new) => {
+                        *executor = new;
+                        true
+                    }
+                    None => false,
+                }
+            })
+            .await;
+    }
+    Some(result)
+}
+
 impl PooledDelegateRunner {
+    /// Run `f` on the delegate executor under its lock (see [`run_guarded`]).
+    /// `Err` only when the executor must be replaced and could not be: the
+    /// caller is refused rather than run on a broken executor.
     async fn with_executor<R>(
         &self,
-        operation: &str,
+        operation: &'static str,
         f: impl FnOnce(&mut Executor<Runtime>) -> R,
-    ) -> R {
+    ) -> Result<R, ExecutorError> {
         let mut executor = self.executor.lock().await;
-        // The previous call panicked out of `f`, past the health check below:
-        // replace before anything else runs on it.
-        if self.suspect.is_set() {
-            self.suspect
-                .recover(self.replace(&mut executor, operation, "a call into it panicked"))
-                .await;
-        }
-        let call = self.suspect.begin();
-        let result = f(&mut executor);
-        call.done();
-        if !executor.runtime.is_healthy() {
-            self.suspect
-                .recover(self.replace(&mut executor, operation, "it became unhealthy"))
-                .await;
-        }
-        result
+        run_guarded(
+            &self.suspect,
+            &mut *executor,
+            |why| self.replacement(operation, why),
+            |executor| executor.runtime.is_healthy(),
+            f,
+        )
+        .await
+        .ok_or_else(|| {
+            ExecutorError::other(anyhow::anyhow!(
+                "the delegate executor needs replacing after a failed call and \
+                 the replacement could not be built; retry"
+            ))
+        })
     }
 
-    /// Replace the executor; `true` on success. Only a success is counted.
-    async fn replace(&self, executor: &mut Executor<Runtime>, operation: &str, why: &str) -> bool {
+    /// A fresh delegate executor, or `None` if one could not be built.
+    /// Counted only on success.
+    async fn replacement(&self, operation: &str, why: &str) -> Option<Executor<Runtime>> {
         tracing::warn!(operation, why, "Replacing the delegate executor");
         match self.factory.create_delegate_executor().await {
             Ok(replacement) => {
-                *executor = replacement;
                 let replacement_number = self.replacements.fetch_add(1, Ordering::SeqCst) + 1;
                 tracing::warn!(replacement_number, "Replaced the delegate executor");
-                true
+                Some(replacement)
             }
             Err(e) => {
                 tracing::error!(
                     error = %e,
                     "Failed to replace the delegate executor; it stays marked for \
-                     replacement and the next call retries"
+                     replacement, and calls are refused until a replacement succeeds"
                 );
-                false
+                None
             }
         }
     }
@@ -462,15 +518,19 @@ impl crate::contract::delegate_lane::DelegateRunner for PooledDelegateRunner {
         connection_scope: crate::client_events::ConnectionScope,
         user_context: Option<&'a UserSecretContext>,
     ) -> futures::future::BoxFuture<'a, Response> {
-        Box::pin(self.with_executor("delegate_request", move |executor| {
-            executor.delegate_request(
-                req,
-                origin_contract,
-                caller_delegate,
-                connection_scope,
-                user_context,
-            )
-        }))
+        Box::pin(async move {
+            self.with_executor("delegate_request", move |executor| {
+                executor.delegate_request(
+                    req,
+                    origin_contract,
+                    caller_delegate,
+                    connection_scope,
+                    user_context,
+                )
+            })
+            .await
+            .and_then(|response| response)
+        })
     }
 }
 
@@ -1788,6 +1848,7 @@ impl ContractExecutor for RuntimePool {
                 executor.import_secrets(&scope, bundle, &material, overwrite)
             })
             .await
+            .and_then(|result| result)
     }
 
     fn get_subscription_info(&self) -> Vec<crate::message::SubscriptionInfo> {
@@ -1899,6 +1960,54 @@ mod tests {
     ///
     /// FALSIFY: give `SuspectCall` a `Drop` that clears the flag (a panic then
     /// clears it too), or have `begin` not set it.
+    /// Through the call protocol: after a call PANICKED, a failed replacement
+    /// refuses the next call (it does not run on the executor left mid-call)
+    /// and keeps the mark, so the call after that retries; a successful
+    /// replacement runs the call on the NEW executor and clears the mark.
+    ///
+    /// FALSIFY: in `run_guarded`, drop the `if suspect.is_set() { return
+    /// None; }` after the pre-call recover; the refused call runs on the
+    /// panicked executor (and its `done()` clears the mark).
+    #[tokio::test]
+    async fn a_failed_replacement_refuses_the_call_and_retries_next_time() {
+        #[derive(Debug, PartialEq)]
+        struct Fake(u32);
+        let flag = SuspectFlag::default();
+        let mut executor = Fake(1);
+        // A call panicked: armed, never disarmed.
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _call = flag.begin();
+            panic!("host bug");
+        }));
+        assert!(panicked.is_err());
+        let mut ran = 0;
+        let out = run_guarded(
+            &flag,
+            &mut executor,
+            |_| async { None::<Fake> },
+            |_| true,
+            |_| {
+                ran += 1;
+            },
+        )
+        .await;
+        assert!(out.is_none(), "the call is refused");
+        assert_eq!(ran, 0, "nothing ran on the executor left mid-call");
+        assert!(flag.is_set(), "still marked, so the next call retries");
+        assert_eq!(executor, Fake(1));
+
+        let out = run_guarded(
+            &flag,
+            &mut executor,
+            |_| async { Some(Fake(2)) },
+            |_| true,
+            |e: &mut Fake| e.0,
+        )
+        .await;
+        assert_eq!(out, Some(2), "the call ran on the replacement");
+        assert!(!flag.is_set());
+    }
+
     /// The mark is cleared only by a SUCCESSFUL replacement: a failed one, or
     /// one whose future is dropped mid-await, leaves it set for a retry.
     ///
