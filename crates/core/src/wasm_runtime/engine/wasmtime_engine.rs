@@ -367,9 +367,13 @@ const STORE_ARENA_MAX_BYTES: usize = 256 * 1024 * 1024;
 ///
 /// # Sizing
 ///
-/// `clamp(memory_limit / 8 / pool_size, 4 MiB, 256 MiB)`. It is divided by the
+/// `clamp((memory_limit / 8 - DELEGATE_STORE_ARENA_BYTES) / pool_size, 4 MiB,
+/// 256 MiB)`. It is divided by the
 /// pool size because there is one Store PER pool worker (up to 16), so the
-/// node-wide arena slack is the product; the memory limit comes from
+/// node-wide arena slack is the product. (The node's one delegate executor,
+/// outside the pool, has its own fixed budget instead,
+/// [`DELEGATE_STORE_ARENA_BYTES`](super::DELEGATE_STORE_ARENA_BYTES), applied
+/// with `set_store_arena_budget_bytes`.) the memory limit comes from
 /// [`read_total_ram_bytes`](crate::wasm_runtime::read_total_ram_bytes), which
 /// already resolves `min(MemTotal, cgroup limit)` and so honours the shipped
 /// `MemoryMax=2G`. A 2 GiB peer with 16 workers resolves to 16 MiB per Store
@@ -399,19 +403,7 @@ const STORE_ARENA_MAX_BYTES: usize = 256 * 1024 * 1024;
 fn store_arena_budget_bytes() -> usize {
     let total_ram =
         crate::wasm_runtime::read_total_ram_bytes().unwrap_or(STORE_ARENA_FALLBACK_TOTAL_RAM_BYTES);
-    store_arena_budget_for(
-        total_ram,
-        store_arena_executors(crate::config::runtime_pool_size().into()),
-    )
-}
-
-/// Executors that each own a wasmtime Store for a pool of `pool_size`: the
-/// contract pool plus the ONE delegate executor every delegate `process()`
-/// runs on (`contract::executor::runtime::pool::PooledDelegateRunner`). The
-/// arena envelope is divided across all of them, so adding the delegate
-/// executor did not add an arena on top of the envelope.
-pub(crate) fn store_arena_executors(pool_size: usize) -> usize {
-    pool_size + 1
+    store_arena_budget_for(total_ram, crate::config::runtime_pool_size().into())
 }
 
 /// Pure sizing math behind [`store_arena_budget_bytes`], split out so
@@ -421,8 +413,20 @@ pub(crate) fn store_arena_executors(pool_size: usize) -> usize {
 /// to include this term: there is one Store per pool worker, so the node-wide
 /// arena slack is `pool_size ×` this.
 pub(crate) fn store_arena_budget_for(total_ram: usize, pool_size: usize) -> usize {
-    (total_ram / STORE_ARENA_RAM_DIVISOR / pool_size.max(1))
+    (contract_arena_envelope(total_ram) / pool_size.max(1))
         .clamp(STORE_ARENA_MIN_BYTES, STORE_ARENA_MAX_BYTES)
+}
+
+/// The share of `total_ram / STORE_ARENA_RAM_DIVISOR` left for the contract
+/// pool's Stores after the delegate executor's fixed arena
+/// ([`DELEGATE_STORE_ARENA_BYTES`](super::DELEGATE_STORE_ARENA_BYTES)) is set
+/// aside, so adding that executor did not add an arena on top of the
+/// envelope. Applied before the per-Store clamp, so a clamp that binds (a
+/// very small or very large host) can still put the total above the envelope;
+/// `contract::executor::declared_cache_ceiling` sums the real terms either
+/// way.
+fn contract_arena_envelope(total_ram: usize) -> usize {
+    (total_ram / STORE_ARENA_RAM_DIVISOR).saturating_sub(super::DELEGATE_STORE_ARENA_BYTES)
 }
 
 /// Fallback total-RAM estimate (1 GiB) when the OS query fails, mirroring the
@@ -891,6 +895,10 @@ impl WasmEngine for WasmtimeEngine {
             store_created_at: Instant::now(),
             offload_compilation: config.offload_compilation,
         })
+    }
+
+    fn set_store_arena_budget_bytes(&mut self, bytes: u64) {
+        self.arena_budget_bytes = bytes;
     }
 
     fn is_healthy(&self) -> bool {
@@ -5086,7 +5094,8 @@ mod tests {
     }
 
     /// The arena budget must be derived from the memory the node may use divided
-    /// by the number of Stores (one per pool worker), not from a constant — and
+    /// by the number of pool Stores (one per pool worker, after the delegate
+    /// executor's fixed share), not from a constant — and
     /// must land at its floor for the shape that OOMs today: a 2 GiB `MemoryMax`
     /// on a many-core box.
     #[test]
@@ -5103,11 +5112,29 @@ mod tests {
         // not constrain CPU count).
         let sized = store_arena_budget_for;
         let two_gib = 2 * 1024 * 1024 * 1024;
+        let delegate = crate::wasm_runtime::DELEGATE_STORE_ARENA_BYTES;
         assert_eq!(
             sized(two_gib, 16),
-            two_gib / STORE_ARENA_RAM_DIVISOR / 16,
+            (two_gib / STORE_ARENA_RAM_DIVISOR - delegate) / 16,
             "a 2 GiB cap across 16 workers must resolve from the RAM-scaled \
-             share, with neither clamp binding"
+             share, less the delegate executor's fixed arena, with neither \
+             clamp binding"
+        );
+        // The delegate executor's arena comes OUT of the envelope rather than
+        // on top of it: pool plus delegate equals the envelope when no clamp
+        // binds. It is a fixed amount, not a pool share, so a one-worker host
+        // is not halved to fund it.
+        let one_gib = 1024 * 1024 * 1024;
+        for pool in [1, 4] {
+            assert_eq!(
+                pool * sized(one_gib, pool) + delegate,
+                one_gib / STORE_ARENA_RAM_DIVISOR,
+                "pool {pool}: contract arenas plus the delegate arena must be the envelope"
+            );
+        }
+        assert_eq!(
+            sized(one_gib, 1),
+            one_gib / STORE_ARENA_RAM_DIVISOR - delegate
         );
         assert!(
             sized(two_gib, 16) * 16 <= two_gib / 4,
@@ -5120,9 +5147,14 @@ mod tests {
         let tiny = 256 * 1024 * 1024;
         assert_eq!(sized(tiny, 16), STORE_ARENA_MIN_BYTES);
         assert!(sized(tiny, 16) * 16 <= tiny / 4);
-        // A single-worker 2 GiB peer and a large unconstrained gateway both keep
-        // the generous ceiling, so this only bites the constrained many-core case.
-        assert_eq!(sized(two_gib, 1), STORE_ARENA_MAX_BYTES);
+        // A single-worker 2 GiB peer keeps almost all of the generous ceiling
+        // (its envelope less the delegate executor's 16 MiB), and a large
+        // unconstrained gateway keeps the ceiling, so the RAM share only bites
+        // the constrained many-core case.
+        assert_eq!(
+            sized(two_gib, 1),
+            two_gib / STORE_ARENA_RAM_DIVISOR - delegate
+        );
         assert_eq!(sized(125 * 1024 * 1024 * 1024, 16), STORE_ARENA_MAX_BYTES);
     }
 

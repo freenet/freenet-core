@@ -1776,14 +1776,11 @@ pub(crate) fn declared_cache_ceiling_terms(
     let summary = summary_budget_for(memory_limit, pool_size);
     let delta = delta_budget_for(memory_limit, pool_size);
     // One wasmtime Store per executor, each holding retired-instance bytes up
-    // to its arena budget between refreshes. There are `pool_size + 1` such
-    // executors: the contract pool plus the ONE delegate executor
-    // (`runtime::pool::PooledDelegateRunner`) that every delegate `process()`
-    // runs on since the delegate lane. It is built by the same factory, so it
-    // gets the same per-executor arena budget.
-    // The envelope is divided across all of them (`store_arena_executors`).
-    let arena_executors = crate::wasm_runtime::engine::store_arena_executors(pool_size);
-    let arena = crate::wasm_runtime::engine::store_arena_budget_for(memory_limit, arena_executors);
+    // to its arena budget between refreshes. The node's ONE delegate executor
+    // (`runtime::pool::PooledDelegateRunner`), outside the pool, has its own
+    // Store with a fixed budget, summed below as a node-wide term.
+    let arena = crate::wasm_runtime::engine::store_arena_budget_for(memory_limit, pool_size);
+    let delegate_arena = crate::wasm_runtime::DELEGATE_STORE_ARENA_BYTES;
 
     // NODE-WIDE — one of each, shared by every executor.
     let contract_modules = crate::wasm_runtime::budget_for_ram(memory_limit);
@@ -1801,7 +1798,11 @@ pub(crate) fn declared_cache_ceiling_terms(
     #[cfg(not(feature = "redb"))]
     let page_cache = 0;
     // The delegate park registry's node-wide retention cap (#5544 S4). One per
-    // node, so NOT multiplied by the pool.
+    // node, so NOT multiplied by the pool. With a delegate lane running it is
+    // SPLIT, not added to: the lane's queued-request byte budget
+    // (`delegate_lane::lane_bytes_budget_for`) is carved out of it
+    // (`DelegateParkCtx::set_gate`), so this one term covers both. Pinned by
+    // `the_delegate_lane_byte_budget_is_carved_from_the_park_budget`.
     //
     // Missing from this sum until the #5554 follow-up. At the time
     // `ring::hosting::cache::resident_overhead_budget_for` derived the hosting
@@ -1841,7 +1842,8 @@ pub(crate) fn declared_cache_ceiling_terms(
         // pool 2).
         ("summary_budget_for", pool_size * summary),
         ("delta_budget_for", pool_size * delta),
-        ("store_arena_budget_for", arena_executors * arena),
+        ("store_arena_budget_for", pool_size * arena),
+        ("DELEGATE_STORE_ARENA_BYTES", delegate_arena),
         ("budget_for_ram", contract_modules),
         // Labelled by the DIVISOR because the delegate module cache has no
         // budget function of its own: it is a fraction of the contract module
@@ -2333,6 +2335,7 @@ mod tests {
             "delta_budget_for",
             "store_arena_budget_for",
             // node-wide
+            "DELEGATE_STORE_ARENA_BYTES",
             "budget_for_ram",
             "DELEGATE_MODULE_CACHE_BUDGET_DIVISOR",
             "SOURCE_CODE_CACHE_MAX_BYTES",
@@ -2382,10 +2385,8 @@ mod tests {
                 .map(|(_, bytes)| *bytes)
                 .unwrap_or_else(|| panic!("`{label}` must be a summed term"))
         };
-        // The Store arena is held by every EXECUTOR, and there is one more
-        // executor than the pool: the delegate executor every delegate
-        // `process()` runs on (`PooledDelegateRunner`). Counting only the pool
-        // leaves that arena out of the aggregate.
+        // The delegate executor (`PooledDelegateRunner`) is outside the pool
+        // and has its own fixed arena, checked below.
         for (label, per_executor, executors) in [
             (
                 "summary_budget_for",
@@ -2395,8 +2396,8 @@ mod tests {
             ("delta_budget_for", delta_budget_for(ONE_GIB, POOL), POOL),
             (
                 "store_arena_budget_for",
-                crate::wasm_runtime::engine::store_arena_budget_for(ONE_GIB, POOL + 1),
-                POOL + 1,
+                crate::wasm_runtime::engine::store_arena_budget_for(ONE_GIB, POOL),
+                POOL,
             ),
         ] {
             assert_eq!(
@@ -2408,6 +2409,13 @@ mod tests {
                  hides memory from the aggregate-safety checks"
             );
         }
+
+        assert_eq!(
+            value(&terms, "DELEGATE_STORE_ARENA_BYTES"),
+            crate::wasm_runtime::DELEGATE_STORE_ARENA_BYTES,
+            "the node's one delegate executor has its own Store, with a fixed \
+             arena budget outside the pool's; it must be counted once"
+        );
 
         // THE THREE TERMS NOTHING ELSE CHECKS. The non-zero check in the
         // sibling guard is a FLOOR, not a value: drop the `2 *` from
@@ -2744,6 +2752,17 @@ mod tests {
             (
                 "CGROUP_UNLIMITED_THRESHOLD_BYTES",
                 "sentinel for reading the cgroup limit, not a budget",
+            ),
+            (
+                "contract_arena_envelope",
+                "consumed inside store_arena_budget_for (the RAM share less the \
+                 delegate executor's fixed arena), which is summed",
+            ),
+            (
+                "lane_bytes_budget_for",
+                "carved OUT of parked_budget_for, which is summed: \
+                 DelegateParkCtx::set_gate lowers the park registry's own budget by \
+                 it, pinned by the_delegate_lane_byte_budget_is_carved_from_the_park_budget",
             ),
             ("MAX_PARKED_BYTES", "clamp inside parked_budget_for"),
             ("MIN_PARKED_BYTES", "clamp inside parked_budget_for"),

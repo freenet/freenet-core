@@ -14,11 +14,11 @@ pub struct PoolHealthStatus {
     pub checked_out: usize,
     /// Total pool size (should equal available + checked_out)
     pub total: usize,
-    /// Number of executors that were replaced due to failures, the delegate
-    /// executor's replacements included.
+    /// Number of POOL executors that were replaced due to failures.
     pub replacements: usize,
-    /// Of `replacements`, how many were of the delegate executor
-    /// ([`PooledDelegateRunner`]).
+    /// Number of times the delegate executor ([`PooledDelegateRunner`]),
+    /// which is outside the pool, was replaced. Not included in
+    /// `replacements`, which with `total` describes the pool only.
     pub delegate_replacements: usize,
     /// Number of distinct contracts currently being processed.
     /// Observability-only: the sequential event loop means this is always 0 or 1.
@@ -283,6 +283,17 @@ struct ExecutorFactory {
 }
 
 impl ExecutorFactory {
+    /// The delegate executor: a pool-shaped executor with its own small,
+    /// fixed Store arena budget (`DELEGATE_STORE_ARENA_BYTES`), so it does not
+    /// take a share of the contract executors' RAM-scaled arena envelope.
+    async fn create_delegate_executor(&self) -> anyhow::Result<Executor<Runtime>> {
+        let mut executor = self.create().await?;
+        executor
+            .runtime
+            .set_store_arena_budget_bytes(crate::wasm_runtime::DELEGATE_STORE_ARENA_BYTES as u64);
+        Ok(executor)
+    }
+
     async fn create(&self) -> anyhow::Result<Executor<Runtime>> {
         let mut executor = Executor::from_config_with_shared_modules(
             self.config.clone(),
@@ -337,10 +348,44 @@ impl ExecutorFactory {
 pub(crate) struct PooledDelegateRunner {
     executor: tokio::sync::Mutex<Executor<Runtime>>,
     factory: ExecutorFactory,
-    /// Times the delegate executor was found unhealthy after a run and
-    /// replaced. Reported in the pool's health status, so a delegate executor
-    /// that keeps breaking is visible next to the contract executors.
+    /// Times the delegate executor was replaced (unhealthy after a run, or
+    /// a call into it panicked). Reported in the pool's health status as
+    /// `delegate_replacements`, so a delegate executor that keeps breaking is
+    /// visible next to the contract executors.
     replacements: AtomicUsize,
+    /// Set while a call into the executor is in progress; still set after
+    /// the call only if it PANICKED (the delegate lane catches the panic and
+    /// carries on). See [`SuspectFlag`].
+    suspect: SuspectFlag,
+}
+
+/// Marks an executor whose last call did not return. A panic inside
+/// `f(&mut executor)` unwinds past the post-call health check, and the tokio
+/// mutex is not poisoned, so without this the next caller would run on an
+/// executor left mid-call. [`Self::begin`] arms it; [`SuspectCall::done`]
+/// disarms it after a normal return; [`Self::take`] reads and clears it.
+#[derive(Default)]
+pub(crate) struct SuspectFlag(std::sync::atomic::AtomicBool);
+
+/// One call in progress; see [`SuspectFlag`].
+pub(crate) struct SuspectCall<'a>(&'a SuspectFlag);
+
+impl SuspectFlag {
+    pub(crate) fn begin(&self) -> SuspectCall<'_> {
+        self.0.store(true, Ordering::SeqCst);
+        SuspectCall(self)
+    }
+
+    /// Whether the last call panicked, clearing the mark.
+    pub(crate) fn take(&self) -> bool {
+        self.0.swap(false, Ordering::SeqCst)
+    }
+}
+
+impl SuspectCall<'_> {
+    pub(crate) fn done(self) {
+        (self.0).0.store(false, Ordering::SeqCst);
+    }
 }
 
 impl PooledDelegateRunner {
@@ -350,22 +395,36 @@ impl PooledDelegateRunner {
         f: impl FnOnce(&mut Executor<Runtime>) -> R,
     ) -> R {
         let mut executor = self.executor.lock().await;
+        // The previous call panicked out of `f`, past the health check below:
+        // replace before anything else runs on it.
+        if self.suspect.take() {
+            self.replace(&mut executor, operation, "a call into it panicked")
+                .await;
+        }
+        let call = self.suspect.begin();
         let result = f(&mut executor);
+        call.done();
         if !executor.runtime.is_healthy() {
-            let replacement_number = self.replacements.fetch_add(1, Ordering::SeqCst) + 1;
-            tracing::warn!(
-                operation,
-                replacement_number,
-                "Delegate executor became unhealthy, replacing it"
-            );
-            match self.factory.create().await {
-                Ok(replacement) => *executor = replacement,
-                Err(e) => {
-                    tracing::error!(error = %e, "Failed to replace the delegate executor");
-                }
-            }
+            self.replace(&mut executor, operation, "it became unhealthy")
+                .await;
         }
         result
+    }
+
+    async fn replace(&self, executor: &mut Executor<Runtime>, operation: &str, why: &str) {
+        let replacement_number = self.replacements.fetch_add(1, Ordering::SeqCst) + 1;
+        tracing::warn!(
+            operation,
+            replacement_number,
+            why,
+            "Replacing the delegate executor"
+        );
+        match self.factory.create_delegate_executor().await {
+            Ok(replacement) => *executor = replacement,
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to replace the delegate executor");
+            }
+        }
     }
 }
 
@@ -819,9 +878,10 @@ impl RuntimePool {
             delegate_notification_tx: delegate_notification_tx.clone(),
         };
         let delegate_runner = Arc::new(PooledDelegateRunner {
-            executor: tokio::sync::Mutex::new(factory.create().await?),
+            executor: tokio::sync::Mutex::new(factory.create_delegate_executor().await?),
             factory,
             replacements: AtomicUsize::new(0),
+            suspect: SuspectFlag::default(),
         });
 
         Ok(Self {
@@ -858,7 +918,7 @@ impl RuntimePool {
         let available = self.runtimes.iter().filter(|s| s.is_some()).count();
         let checked_out = self.checked_out.load(Ordering::SeqCst);
         let delegate_replacements = self.delegate_runner.replacements.load(Ordering::SeqCst);
-        let replacements = self.replacements_count.load(Ordering::SeqCst) + delegate_replacements;
+        let replacements = self.replacements_count.load(Ordering::SeqCst);
 
         // Check for pool degradation
         let expected_total = available + checked_out;
@@ -886,7 +946,7 @@ impl RuntimePool {
     /// Called periodically when there have been replacements to help diagnose issues.
     fn log_health_if_degraded(&self) {
         let status = self.health_status();
-        if status.replacements > 0 {
+        if status.replacements > 0 || status.delegate_replacements > 0 {
             tracing::info!(
                 available = status.available,
                 checked_out = status.checked_out,
@@ -1807,6 +1867,29 @@ mod tests {
     };
     use std::num::NonZeroUsize;
     use std::sync::Arc;
+
+    /// A call that PANICS out of `with_executor`'s closure leaves the
+    /// delegate executor marked suspect, so the next call replaces it before
+    /// running; a call that returns does not.
+    ///
+    /// FALSIFY: give `SuspectCall` a `Drop` that clears the flag (a panic then
+    /// clears it too), or have `begin` not set it.
+    #[test]
+    fn a_call_that_panics_leaves_the_executor_suspect() {
+        let flag = SuspectFlag::default();
+        flag.begin().done();
+        assert!(!flag.take(), "a call that returned is not suspect");
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _call = flag.begin();
+            panic!("delegate call panicked");
+        }));
+        assert!(panicked.is_err());
+        assert!(
+            flag.take(),
+            "a call that panicked leaves the executor suspect"
+        );
+        assert!(!flag.take(), "taking the mark clears it");
+    }
 
     /// The contract module cache is keyed by code hash, so its interest
     /// predicate must answer "is ANY in-use instance running this code?" — a

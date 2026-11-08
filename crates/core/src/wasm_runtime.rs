@@ -65,7 +65,7 @@ impl SharedStores {
         }
     }
 }
-pub(crate) use engine::BackendEngine;
+pub(crate) use engine::{BackendEngine, DELEGATE_STORE_ARENA_BYTES};
 pub(crate) use error::{
     ContractError, DELEGATE_HOSTED_RUN_WITHOUT_USER, DELEGATE_PARAMS_MISMATCH,
     DELEGATE_UNREGISTER_HOSTED, DELEGATE_UNREGISTER_NOT_LOCAL, RuntimeInnerError, RuntimeResult,
