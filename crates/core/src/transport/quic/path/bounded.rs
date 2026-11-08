@@ -359,16 +359,69 @@ pub(crate) struct ConnectionProgress {
     pub(crate) cap_holds: Arc<CapHolds>,
     /// Where a send that ran out of gap leaves its [`QuietProof`]; the path's.
     pub(crate) quiet: Arc<parking_lot::Mutex<Option<QuietProof>>>,
-    /// When the connection's acknowledged count was last seen to move, on the
-    /// send's clock, or [`NO_ACK`]: the path's record, which the stall count
-    /// and every send's watch keep. A send's watch starts from it, so a hold is
-    /// credited when the connection, not only this send, was acknowledged
-    /// within `route::hold_credit`.
-    pub(crate) last_acked: Arc<AtomicU64>,
+    /// The path's record of the connection's acknowledged count and when it
+    /// was last seen to move ([`AckRecord`]), which the stall count and every
+    /// send's watch keep. A send's watch starts from it, so a hold is credited
+    /// when the connection, not only this send, was acknowledged within
+    /// `route::hold_credit`.
+    pub(crate) last_acked: Arc<AckRecord>,
 }
 
-/// [`ConnectionProgress::last_acked`] when nothing has been seen acknowledged.
+/// [`AckSeen::at`] when nothing has been seen acknowledged.
 pub(crate) const NO_ACK: u64 = u64::MAX;
+
+/// The acknowledged count last seen on a connection and when it was seen to
+/// move, on the path's clock ([`NO_ACK`] for never).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AckSeen {
+    pub(crate) count: u64,
+    pub(crate) at: u64,
+}
+
+/// A path's [`AckSeen`], kept by the stall count at settles and by every
+/// send's watch at its start and wakes. The count is stored with the time so
+/// that a move nobody has dated yet (an acknowledgement after the last settle
+/// or wake) is seen as one: a send's watch dates it at its own start
+/// ([`AckRecord::date_unseen`]), the earliest time this side knows of it,
+/// rather than taking the older time as the last acknowledgement. One lock,
+/// never held across an await; the stall count's settle takes it while
+/// holding the stall lock, and nothing holding it takes the stall lock.
+#[derive(Debug)]
+pub(crate) struct AckRecord(parking_lot::Mutex<AckSeen>);
+
+impl AckRecord {
+    pub(crate) fn new(count: u64, at: u64) -> Self {
+        Self(parking_lot::Mutex::new(AckSeen { count, at }))
+    }
+
+    /// The record now.
+    pub(crate) fn seen(&self) -> AckSeen {
+        *self.0.lock()
+    }
+
+    /// The count is `count` at `now`: if the record has not seen it, the
+    /// connection was acknowledged since the record last moved, and it is
+    /// dated `now`. Returns when the connection was last acknowledged, if
+    /// ever. Acknowledged counts only grow, so a count different from the
+    /// record's is a move.
+    pub(crate) fn date_unseen(&self, count: u64, now: u64) -> Option<u64> {
+        let mut seen = self.0.lock();
+        if seen.count != count {
+            seen.count = seen.count.max(count);
+            seen.at = if seen.at == NO_ACK {
+                now
+            } else {
+                seen.at.max(now)
+            };
+        }
+        Some(seen.at).filter(|at| *at != NO_ACK)
+    }
+
+    /// Replace the record, under the caller's ordering (the stall lock).
+    pub(crate) fn with<R>(&self, f: impl FnOnce(&mut AckSeen) -> R) -> R {
+        f(&mut self.0.lock())
+    }
+}
 
 /// What a send that ran out of its gap saw of its connection: from `since`
 /// to the timeout the acknowledged count stayed `acked` and the cap's hold
@@ -433,8 +486,8 @@ struct ConnectionWatch {
     /// The wake that last saw the connection move; `None` before the first.
     moved_at: Option<u64>,
     /// When the connection's acknowledged count last moved, from the path's
-    /// record when the send starts, then each wake that saw it move; `None`
-    /// before any. A cap hold is progress only within `route::hold_credit` of
+    /// record when the send starts (a move the record has not seen is dated
+    /// at the start), then each wake that saw it move; `None` before any. A cap hold is progress only within `route::hold_credit` of
     /// it.
     acked_at: Option<u64>,
     /// A reading saw a hold live ([`QuietProof::live_hold_seen`]).
@@ -444,13 +497,16 @@ struct ConnectionWatch {
 impl ConnectionWatch {
     fn new(source: ConnectionProgress, now: u64) -> Self {
         let cap = source.cap_holds.read();
+        let acked = source.acks.acked();
         Self {
-            acked: source.acks.acked(),
+            acked,
             cap,
             hold_unchanged_since: None,
             started: now,
             moved_at: None,
-            acked_at: Some(source.last_acked.load(Ordering::Acquire)).filter(|at| *at != NO_ACK),
+            // A count the path's record has not seen moved since the record
+            // last did, and is dated now (`AckRecord::date_unseen`).
+            acked_at: source.last_acked.date_unseen(acked, now),
             live_hold_seen: cap.held_now,
             source,
         }
@@ -476,7 +532,7 @@ impl ConnectionWatch {
         let acknowledged = acked != self.acked;
         if acknowledged {
             self.acked_at = Some(now);
-            self.source.last_acked.fetch_max(now, Ordering::AcqRel);
+            self.source.last_acked.date_unseen(acked, now);
         }
         // A held transmit on a connection nothing has acknowledged for the
         // window is no evidence the path is alive: a dark connection's own

@@ -418,28 +418,21 @@ impl QuicPath {
             let acked = self.ack_progress.as_ref().map(recycle::AckProgress::acked);
             let cap = self.connection.cap_holds().read();
             let quiet = *self.quiet.lock();
-            let seen = self.last_acked.load(std::sync::atomic::Ordering::Acquire);
-            stall.note_acked_at(seen);
-            let verdict = stall.take(outcome, source_stalled, acked, cap, quiet, now_nanos);
-            // Forward with `fetch_max`, as the send watches write it without
-            // the stall lock, so an ack a watch saw since the load is kept. A
-            // proof may move it back; that only replaces the value loaded, so a
-            // watch's later ack wins.
-            let at = stall.acked_at();
-            if at >= seen {
-                self.last_acked
-                    .fetch_max(at, std::sync::atomic::Ordering::AcqRel);
-            } else {
-                // Lost to a watch's later ack, the value is left as it is.
-                self.last_acked
-                    .compare_exchange(
-                        seen,
-                        at,
-                        std::sync::atomic::Ordering::AcqRel,
-                        std::sync::atomic::Ordering::Acquire,
-                    )
-                    .ok();
-            }
+            // The record's lock is taken under the stall lock (never the
+            // reverse), so a watch cannot move it between the read and the
+            // write here.
+            let verdict = self.last_acked.with(|seen| {
+                stall.note_acked_at(seen.at);
+                let verdict = stall.take(outcome, source_stalled, acked, cap, quiet, now_nanos);
+                // The count's time as this settle dates it: forward when it saw
+                // a move, back to a matching proof's `since`, which says
+                // nothing moved after it (`StallCount::take`).
+                seen.at = stall.acked_at();
+                if let Some(acked) = acked {
+                    seen.count = seen.count.max(acked);
+                }
+                verdict
+            });
             (verdict, acked)
         };
         if let (true, Some(acked)) = (verdict.quiet_timeout, acked) {

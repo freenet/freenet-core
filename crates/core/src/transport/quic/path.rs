@@ -681,12 +681,13 @@ pub(crate) struct QuicPath {
     /// The last [`bounded::QuietProof`] a send that ran out of gap left, taken
     /// by the next settle.
     quiet: Arc<parking_lot::Mutex<Option<bounded::QuietProof>>>,
-    /// When the connection was last seen acknowledged, on the path's clock
-    /// ([`bounded::ConnectionProgress::last_acked`]); the path's build time to
-    /// start, as for the stall count, so a path dark from its start has its
-    /// first sends' cap holds credited for one `route::hold_credit` after it
-    /// is built (seconds at a high cap, minutes at a low one).
-    last_acked: Arc<std::sync::atomic::AtomicU64>,
+    /// The connection's acknowledged count and when it was last seen to
+    /// move, on the path's clock ([`bounded::AckRecord`]); the count at build
+    /// and the build time to start, as for the stall count, so a path dark
+    /// from its start has its first sends' cap holds credited for one
+    /// `route::hold_credit` after it is built (seconds at a high cap, minutes
+    /// at a low one).
+    last_acked: Arc<bounded::AckRecord>,
     /// The connection's count of acknowledged packets, `None` if its controller
     /// does not keep one.
     ack_progress: Option<recycle::AckProgress>,
@@ -891,7 +892,10 @@ impl QuicPath {
                 counted_as_data_path: std::sync::atomic::AtomicBool::new(false),
                 stall: parking_lot::Mutex::new(stall),
                 quiet: Arc::default(),
-                last_acked: Arc::new(std::sync::atomic::AtomicU64::new(built_at)),
+                last_acked: Arc::new(bounded::AckRecord::new(
+                    ack_progress.as_ref().map_or(0, recycle::AckProgress::acked),
+                    built_at,
+                )),
                 ack_progress,
                 suspect_since_acked: parking_lot::Mutex::new(None),
                 suspect: std::sync::atomic::AtomicBool::new(false),

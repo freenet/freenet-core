@@ -91,6 +91,12 @@ pub(crate) struct CapHolds {
     validity: Duration,
     /// [`cap_transmit_wait`] of the cap's rate; zero without a cap.
     longest_wait: Duration,
+    /// Pollers built with no record of their own (outside
+    /// [`with_poller_holds`]). Counted only on the socket's empty template
+    /// record, which every connection's record is made from, so it is per
+    /// endpoint: a test reads its own endpoint's count
+    /// (`QuicEndpoint::fallback_pollers`), never a process-wide one.
+    fallback_pollers: AtomicU64,
 }
 
 /// What [`CapHolds::read`] returns.
@@ -188,6 +194,12 @@ impl CapHolds {
         self.release();
     }
 
+    /// Pollers built outside [`with_poller_holds`] from this template
+    /// record's socket.
+    pub(crate) fn fallback_pollers(&self) -> u64 {
+        self.fallback_pollers.load(Ordering::Relaxed)
+    }
+
     /// The hold events so far, whether a poller is held now, and how long a
     /// hold stays valid with no new event.
     pub(crate) fn read(&self) -> CapHoldReading {
@@ -218,12 +230,6 @@ pub(crate) fn next_poller_holds() -> Option<Arc<CapHolds>> {
     NEXT_POLLER_HOLDS.with(|next| next.borrow().clone())
 }
 
-/// Pollers built outside [`with_poller_holds`]; tests assert it stays 0. It
-/// is process-wide, so every poller a test builds must go through
-/// `with_poller_holds`, or another test's assertion fails.
-#[cfg(test)]
-pub(crate) static FALLBACK_POLLERS: AtomicU64 = AtomicU64::new(0);
-
 /// Run `f`, which creates one quinn connection (`Endpoint::connect_with` or
 /// `Incoming::accept_with`), so that the poller quinn creates for it, on this
 /// thread inside the call, counts its holds in `holds`.
@@ -232,7 +238,9 @@ pub(crate) static FALLBACK_POLLERS: AtomicU64 = AtomicU64::new(0);
 /// `create_io_poller` synchronously inside both calls, and the only other
 /// caller is a rebind, which needs migration, which is off. Re-check both
 /// before bumping quinn; a poller built with no record set logs a warning
-/// and is counted for the tests (`FALLBACK_POLLERS`).
+/// and is counted on the socket's template record
+/// ([`CapHolds::fallback_pollers`]), which the path tests assert stays 0 for
+/// their endpoints.
 pub(crate) fn with_poller_holds<R>(holds: &Arc<CapHolds>, f: impl FnOnce() -> R) -> R {
     /// Puts back what the slot held before, however `f` ends, a panic
     /// included, so a nested call does not lose the outer one's record.
@@ -500,11 +508,13 @@ impl<S: Socket> AsyncUdpSocket for QuicSocket<S> {
                 // 0.11.12 does only on a rebind (migration is off), gets here;
                 // its holds go into a record nobody reads, so the stall count,
                 // send gaps and ack watch of its connection would see none.
-                // Counted for the tests, not asserted: this runs under quinn's
-                // endpoint lock, and a panic there poisons it and aborts the
-                // process (see "NOT CONTAINED" in the transport rules).
-                #[cfg(test)]
-                FALLBACK_POLLERS.fetch_add(1, Ordering::Relaxed);
+                // Counted, not asserted: this runs under quinn's endpoint
+                // lock, and a panic there poisons it and aborts the process
+                // (see "NOT CONTAINED" in the transport rules). Tests read the
+                // count per endpoint.
+                self.cap_holds
+                    .fallback_pollers
+                    .fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(
                     "QUIC: a connection's poller was built outside with_poller_holds; \
                      its egress cap holds will not be seen"

@@ -424,6 +424,17 @@ fn require_unwinding(unwinds: bool) -> io::Result<()> {
 /// ([`require_unwinding`]).
 pub(crate) const UNWINDS: bool = cfg!(panic = "unwind");
 
+impl EndpointCore {
+    /// Connection pollers this endpoint's socket built outside
+    /// `socket::with_poller_holds`: their cap holds go into a record nobody
+    /// reads. Expected 0 (quinn 0.11.12 builds one elsewhere only on a
+    /// rebind, which needs migration, which is off).
+    #[cfg(test)]
+    pub(crate) fn fallback_pollers(&self) -> u64 {
+        self.cap_holds.fallback_pollers()
+    }
+}
+
 impl QuicEndpoint {
     /// Build an endpoint over `socket`, which must be the socket the
     /// listener reads (it fills the QUIC ingress queue), bound at

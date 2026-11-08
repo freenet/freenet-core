@@ -2163,6 +2163,35 @@ fn with_poller_holds_puts_the_slot_back() {
     assert!(next_poller_holds().is_none());
 }
 
+/// A poller built outside `with_poller_holds` (quinn 0.11.12 builds one only
+/// on a rebind, which needs migration, which is off) is counted on its own
+/// socket's template record, where a test can see it, and one built inside
+/// is not. The count is per socket, so a test asserting 0 for its endpoints
+/// is not moved by another test's pollers in the same process.
+#[test]
+fn a_poller_built_without_a_record_is_counted_on_its_socket() {
+    use quinn::AsyncUdpSocket;
+    let time = VirtualTime::new();
+    let local: SocketAddr = "10.201.41.1:5000".parse().unwrap();
+    let (socket, _demux) = scripted(local, SendMode::Send, Vec::new(), Some((1_000_000, &time)));
+    let (other, _other_demux) = scripted(
+        "10.201.41.2:5000".parse().unwrap(),
+        SendMode::Send,
+        Vec::new(),
+        Some((1_000_000, &time)),
+    );
+    let holds = Arc::new(socket.cap_holds().like());
+    let _inside = super::socket::with_poller_holds(&holds, || socket.clone().create_io_poller());
+    assert_eq!(socket.cap_holds().fallback_pollers(), 0);
+    let _outside = socket.clone().create_io_poller();
+    assert_eq!(socket.cap_holds().fallback_pollers(), 1, "counted");
+    assert_eq!(
+        other.cap_holds().fallback_pollers(),
+        0,
+        "another socket's count is its own"
+    );
+}
+
 /// #5940 step M6, holds per connection since #6128: a poller's hold is
 /// counted in its own connection's record only (`socket::with_poller_holds`),
 /// so another connection's watch, stall count and send gaps never see it.

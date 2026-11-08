@@ -3648,7 +3648,7 @@ async fn stuck_send(
         acks: acks.clone(),
         cap_holds: cap.clone(),
         quiet: Arc::default(),
-        last_acked: Arc::new(std::sync::atomic::AtomicU64::new(bounded::NO_ACK)),
+        last_acked: Arc::new(bounded::AckRecord::new(acks.acked(), bounded::NO_ACK)),
     };
     let deadlines = SendDeadlines {
         open: Duration::from_secs(2),
@@ -3770,7 +3770,7 @@ fn a_live_send_held_in_the_cap_queue_past_its_gap_is_sent() {
                 acks: acks.clone(),
                 cap_holds: cap.clone(),
                 quiet: Arc::default(),
-                last_acked: Arc::new(std::sync::atomic::AtomicU64::new(clock.now_nanos())),
+                last_acked: Arc::new(bounded::AckRecord::new(acks.acked(), clock.now_nanos())),
             };
             let deadlines = SendDeadlines {
                 open: Duration::from_secs(2),
@@ -3802,6 +3802,71 @@ fn a_live_send_held_in_the_cap_queue_past_its_gap_is_sent() {
         })
         .await;
         assert!(matches!(sent, BoundedSend::Sent), "{sent:?}");
+    })
+}
+
+/// An acknowledgement the path's record has not seen yet (it came after the
+/// last settle or wake) is dated at the send's start, not taken as no news:
+/// the record says the connection was last acknowledged at 0 s, the peer
+/// acknowledged again at 7 s with nobody reading, and a send starts at 8 s
+/// whose writes the 1 MB/s cap holds (hold credit 10 s) until 16 s. Dated at
+/// 0 s, the holds at its 13 s gap are 13 s past the last acknowledgement and
+/// earn nothing, so it timed out at 5 s on a live path (#6128 re-review, item
+/// 2). Dated at its start, they are credited and the send is `Sent`.
+#[test]
+fn an_acknowledgement_the_record_has_not_seen_credits_the_next_send() {
+    bounded(|| async move {
+        let time = VirtualTime::new();
+        let clock = time.clone();
+        let (sent, record) = drive(&time, LIMIT, async move {
+            let acks = recycle::AckProgress::detached();
+            let cap = Arc::new(super::super::socket::CapHolds::new(Some(1_000_000)));
+            assert!(
+                super::route::hold_credit(&cap.read()) == super::route::STALL_PROGRESS_WINDOW,
+                "premise: the credit is the window at this cap"
+            );
+            let record = Arc::new(bounded::AckRecord::new(acks.acked(), clock.now_nanos()));
+            clock.sleep(Duration::from_secs(7)).await;
+            acks.ack();
+            clock.sleep(Duration::from_secs(1)).await;
+            let connection = bounded::ConnectionProgress {
+                acks: acks.clone(),
+                cap_holds: cap.clone(),
+                quiet: Arc::default(),
+                last_acked: record.clone(),
+            };
+            let deadlines = SendDeadlines {
+                open: Duration::from_secs(2),
+                gap: Some(Duration::from_secs(5)),
+                total: Duration::from_secs(120),
+            };
+            let ticking = clock.clone();
+            let queue = async move {
+                loop {
+                    ticking.sleep(Duration::from_secs(1)).await;
+                    cap.hold_one();
+                }
+            };
+            let stepping = clock.clone();
+            let send = bounded_send(&clock, deadlines, Some(connection), |progress| async move {
+                progress.mark_opened();
+                stepping.sleep(Duration::from_secs(8)).await;
+                progress.step();
+                Ok(())
+            });
+            let sent = tokio::select! {
+                sent = send => sent,
+                () = queue => unreachable!("the queue never ends"),
+            };
+            (sent, record.seen())
+        })
+        .await;
+        assert!(matches!(sent, BoundedSend::Sent), "{sent:?}");
+        assert_eq!(
+            record.at,
+            Duration::from_secs(8).as_nanos() as u64,
+            "the unseen acknowledgement is dated at the send's start"
+        );
     })
 }
 
@@ -3839,7 +3904,7 @@ fn a_send_waiting_for_its_source_ends_at_its_own_gap() {
                 acks: acks.clone(),
                 cap_holds: Arc::new(super::super::socket::CapHolds::new(None)),
                 quiet: Arc::default(),
-                last_acked: Arc::new(std::sync::atomic::AtomicU64::new(bounded::NO_ACK)),
+                last_acked: Arc::new(bounded::AckRecord::new(acks.acked(), bounded::NO_ACK)),
             };
             let deadlines = SendDeadlines {
                 open: Duration::from_secs(2),
@@ -3894,10 +3959,10 @@ fn progress_from_before_the_send_does_not_extend_its_gap() {
             cap.hold_one();
             cap.release_one();
             let connection = bounded::ConnectionProgress {
-                acks,
+                acks: acks.clone(),
                 cap_holds: cap,
                 quiet: Arc::default(),
-                last_acked: Arc::new(std::sync::atomic::AtomicU64::new(bounded::NO_ACK)),
+                last_acked: Arc::new(bounded::AckRecord::new(acks.acked(), bounded::NO_ACK)),
             };
             let deadlines = SendDeadlines {
                 open: Duration::from_secs(2),
@@ -3946,7 +4011,7 @@ fn a_quiet_proof_says_whether_its_send_saw_a_live_hold() {
                     acks: recycle::AckProgress::detached(),
                     cap_holds: cap.clone(),
                     quiet: quiet.clone(),
-                    last_acked: Arc::new(std::sync::atomic::AtomicU64::new(bounded::NO_ACK)),
+                    last_acked: Arc::new(bounded::AckRecord::new(0, bounded::NO_ACK)),
                 };
                 let sent =
                     bounded_send(&clock, deadlines, Some(connection), |progress| async move {
@@ -3994,7 +4059,7 @@ fn a_hold_read_live_by_a_wake_voids_the_proof() {
                 acks: recycle::AckProgress::detached(),
                 cap_holds: cap.clone(),
                 quiet: quiet.clone(),
-                last_acked: Arc::new(std::sync::atomic::AtomicU64::new(bounded::NO_ACK)),
+                last_acked: Arc::new(bounded::AckRecord::new(0, bounded::NO_ACK)),
             };
             let deadlines = SendDeadlines {
                 open: Duration::from_secs(2),
@@ -4053,7 +4118,7 @@ fn source_waits_do_not_rearm_the_timer_without_an_extension() {
                 acks: recycle::AckProgress::detached(),
                 cap_holds: Arc::new(super::super::socket::CapHolds::new(None)),
                 quiet: Arc::default(),
-                last_acked: Arc::new(std::sync::atomic::AtomicU64::new(bounded::NO_ACK)),
+                last_acked: Arc::new(bounded::AckRecord::new(0, bounded::NO_ACK)),
             };
             let deadlines = SendDeadlines {
                 open: Duration::from_secs(2),
@@ -4765,6 +4830,7 @@ fn an_accepted_connection_on_a_capped_endpoint_records_its_holds() {
         let mut p = paths_capped(network, 80, 100_000).await;
         let c_addr: SocketAddr = "10.203.80.3:5000".parse().unwrap();
         let (c_end, c_keys) = p.pair.third(c_addr).await;
+        let c_watch = c_end.clone();
         let a_end = p.pair.a.clone();
         let permit = a_end
             .allow_peer(c_addr, c_keys.public())
@@ -4800,8 +4866,8 @@ fn an_accepted_connection_on_a_capped_endpoint_records_its_holds() {
             "the accepted connection's own record saw the cap hold it"
         );
         assert_eq!(
-            super::super::socket::FALLBACK_POLLERS.load(std::sync::atomic::Ordering::Relaxed),
-            0,
+            [&p.pair.a, &p.pair.b, &c_watch].map(|end| end.fallback_pollers()),
+            [0, 0, 0],
             "every poller got its connection's record"
         );
     })
@@ -4845,6 +4911,7 @@ fn a_dark_path_beside_a_cap_held_one_times_out_and_goes_suspect() {
         let mut p = paths_capped(network, 76, 100_000).await;
         let c_addr: SocketAddr = "10.203.76.3:5000".parse().unwrap();
         let (c_end, c_keys) = p.pair.third(c_addr).await;
+        let c_watch = c_end.clone();
         let permit = c_end
             .allow_peer(p.pair.a_addr, p.pair.a_keys.public())
             .expect("allow-set has room");
@@ -4956,8 +5023,8 @@ fn a_dark_path_beside_a_cap_held_one_times_out_and_goes_suspect() {
             first.2
         );
         assert_eq!(
-            super::super::socket::FALLBACK_POLLERS.load(std::sync::atomic::Ordering::Relaxed),
-            0,
+            [&p.pair.a, &p.pair.b, &c_watch].map(|end| end.fallback_pollers()),
+            [0, 0, 0],
             "every poller got its connection's record"
         );
     })
