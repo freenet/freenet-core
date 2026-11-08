@@ -201,14 +201,20 @@ async fn handshake_completes_promptly_with_the_egress_bucket_in_full_debt() {
 
 /// The connection's control traffic never waits for the egress cap, with
 /// both buckets a full second in debt: receipts (standalone ACK NoOps),
-/// keepalive Pings and the Pongs that answer them, and retransmissions are
-/// all charged as unpaced, and none goes through a pacing point.
+/// keepalive Pings and the Pongs that answer them are all charged as
+/// unpaced, and none goes through a pacing point.
 ///
-/// The test first checks that each kind of datagram really was sent, from
-/// the connections' own counters, so a run in which, say, no retransmission
-/// happened cannot pass by saying nothing about it. Once connected, the
-/// joiner drops 30 of its sends (the handshake is not affected), so some of
-/// its short messages are lost and retransmitted.
+/// Retransmissions are the exception by design: they take from the cap only
+/// within `RETX_DEBT_LIMIT` (`EgressCap::try_take_retransmit`), so with the
+/// bucket held a full second in debt (its clock never advances) every RTO
+/// resend is deferred and none is sent. The recv loop must not wait on them:
+/// Pongs and ACKs keep flowing while the resends stay deferred.
+///
+/// The test first checks that each kind of datagram really was sent (or, for
+/// resends, deferred), from the connections' own counters, so a run in
+/// which, say, no resend fell due cannot pass by saying nothing about it.
+/// Once connected, the joiner drops 30 of its sends (the handshake is not
+/// affected), so some of its short messages are lost and fall due for resend.
 #[tokio::test(start_paused = true)]
 async fn control_traffic_never_waits_for_the_egress_cap() {
     let channels: Channels = Arc::new(DashMap::new());
@@ -252,13 +258,17 @@ async fn control_traffic_never_waits_for_the_egress_cap() {
     let (gw_conn, received) = gateway.await.unwrap();
     let joiner_conn = joiner.await.unwrap();
 
-    assert_eq!(
-        received, MESSAGES,
-        "every message arrived, lost ones resent"
+    assert!(
+        received < MESSAGES,
+        "lost messages are not resent past the retransmit debt limit"
     );
     let (retransmits, joiner_pongs, _) = joiner_conn.control_traffic_counts();
     let (_, gw_pongs, gw_acks) = gw_conn.control_traffic_counts();
-    assert!(retransmits > 0, "premise: the joiner retransmitted");
+    assert_eq!(retransmits, 0, "no resend fits a bucket a second in debt");
+    assert!(
+        joiner_conn.congestion_probe().retransmits_deferred > 0,
+        "premise: the joiner's resends fell due and were deferred"
+    );
     assert!(
         joiner_pongs > 0 && gw_pongs > 0,
         "premise: both sides sent keepalive Pings and answered the other's \
