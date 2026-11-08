@@ -12695,6 +12695,78 @@ mod hol_4391_tests {
         lane.abort();
     }
 
+    /// A request the lane FORWARDED releases its delegate once the loop has
+    /// handled it: the next request for that delegate runs on the lane again,
+    /// even while the loop is stuck in contract WASM.
+    ///
+    /// FALSIFY: drop the `take_forwarded_delegate(id.id)` binding in the
+    /// `DelegateRequest` arm of `handle_contract_event`; the delegate stays
+    /// loop-owned, the second request is forwarded to the held loop and is not
+    /// answered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_forwarded_request_gives_its_delegate_back_to_the_lane() {
+        let _guard = TEST_GUARD.lock().await;
+        let blocking = make_contract(b"lane_release_blocking_contract");
+        let hold = Arc::new(crate::contract::executor::mock_wasm_runtime::BlockingGate::default());
+        let (mut handler, send) = build_handler(vec![(
+            *blocking.key().id(),
+            ValidateOverride::Block(hold.clone()),
+        )])
+        .await;
+        let _release = ReleaseOnDrop(hold.clone());
+        handler.runtime_mut().enable_delegate_lane();
+        let script = handler.runtime_mut().delegate_script.clone();
+        let handle = GlobalExecutor::spawn(contract_handling(
+            handler,
+            crate::contract::user_input::AutoApprovePrompter,
+        ));
+        let send = Arc::new(send);
+        let key = delegate_key_n(0x68);
+        // A request the lane never runs: forwarded to the loop.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            send.send_to_handler(ContractHandlerEvent::DelegateRequest {
+                req: DelegateRequest::UnregisterDelegate(key.clone()),
+                origin_contract: None,
+                connection_scope: crate::client_events::ConnectionScope::Local,
+                user_context: None,
+            }),
+        )
+        .await
+        .expect("the loop answers the forwarded request")
+        .expect("answered");
+
+        // Now hold the loop in contract WASM.
+        let s = send.clone();
+        let put = GlobalExecutor::spawn(async move {
+            s.send_to_handler(ContractHandlerEvent::PutQuery {
+                key: blocking.key(),
+                state: WrappedState::new(b"s".to_vec()),
+                related_contracts: RelatedContracts::default(),
+                contract: Some(blocking),
+            })
+            .await
+        });
+        let probe = hold.clone();
+        wait_until("the loop to be held in contract WASM", || probe.entered()).await;
+
+        script.lock().unwrap().push_back(ScriptedRun {
+            outbound: vec![app_out(b"lane")],
+            writes_context: None,
+        });
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            send.send_to_handler(delegate_event(&key)),
+        )
+        .await
+        .expect("the delegate is free again: the lane must answer while the loop is held")
+        .expect("answered");
+        assert_eq!(app_payloads(&response), vec![b"lane".to_vec()]);
+        hold.release();
+        put.await.expect("join").expect("PUT answered");
+        handle.abort();
+    }
+
     /// A lane unit for `key` whose first `process()` call (made by the lane)
     /// returned `first_values`.
     fn unit_for(
