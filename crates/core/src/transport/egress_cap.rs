@@ -543,6 +543,9 @@ pub struct EgressCap {
     /// holding at most [`RETX_SHARE_WINDOW`] of it
     /// ([`EgressCap::try_take_retransmit`]).
     retx_meter_empty_at_ns: AtomicI64,
+    /// The next free datagram time (ns, on `clock`) for a retransmit the
+    /// bucket refused ([`EgressCap::space_retx_bucket_wait`]).
+    retx_bucket_next_ns: AtomicI64,
     /// Wakers of [`Self::poll_admit`] callers that are `Pending`, in the
     /// order they first registered. Shared with each registered
     /// [`AdmissionWaiter`] so dropping one removes its entry.
@@ -1031,6 +1034,7 @@ impl EgressCap {
             empty_at_ns: AtomicI64::new(now.saturating_sub(burst_ns)),
             // Long empty: the share starts full, whatever its window.
             retx_meter_empty_at_ns: AtomicI64::new(i64::MIN / 2),
+            retx_bucket_next_ns: AtomicI64::new(i64::MIN / 2),
             admission: Arc::new(AdmissionQueue::default()),
             last_long_wait_warn_ns: AtomicI64::new(i64::MIN),
             last_abandon_warn_ns: AtomicI64::new(i64::MIN),
@@ -1181,19 +1185,11 @@ impl EgressCap {
     }
 
     /// Book the next free slot in the share for a `bytes` retransmit: pay
-    /// for it now, whenever it comes ([`RetxDeferral`]). With `queue`, the
-    /// slot is no earlier than one datagram from now even if the share has
-    /// room (the bucket refused): the bookings then space the connections
-    /// out by the share's datagram time instead of all retrying on the
-    /// bucket's one deficit.
-    fn book_retx_share(&self, bytes: usize, queue: bool) -> RetxBooking {
+    /// for it now, whenever it comes ([`RetxDeferral`]).
+    fn book_retx_share(&self, bytes: usize) -> RetxBooking {
         let (meter_cost, window) = self.retx_share_cost(bytes);
         let now = self.now();
-        let earliest = if queue {
-            now
-        } else {
-            now.saturating_sub(window)
-        };
+        let earliest = now.saturating_sub(window);
         let mut meter = self.retx_meter_empty_at_ns.load(Ordering::Acquire);
         loop {
             let slot = meter.max(earliest).saturating_add(meter_cost);
@@ -1210,6 +1206,29 @@ impl EgressCap {
                     };
                 }
                 Err(current) => meter = current,
+            }
+        }
+    }
+
+    /// How long a retransmit the bucket refused with `wait` should wait: to
+    /// the next free datagram time after `wait` among the retransmits the
+    /// bucket refused, so they come back one per datagram of refill. A
+    /// timing hint only: nothing is paid, so nothing can leak.
+    fn space_retx_bucket_wait(&self, bytes: usize, wait: Duration) -> Duration {
+        let cost = self.cost_ns(bytes as u64);
+        let now = self.now();
+        let at = now.saturating_add(i64::try_from(wait.as_nanos()).unwrap_or(i64::MAX));
+        let mut next = self.retx_bucket_next_ns.load(Ordering::Acquire);
+        loop {
+            let slot = next.max(at);
+            match self.retx_bucket_next_ns.compare_exchange_weak(
+                next,
+                slot.saturating_add(cost),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Duration::from_nanos((slot - now).max(0) as u64),
+                Err(current) => next = current,
             }
         }
     }
@@ -1339,21 +1358,18 @@ impl EgressCap {
                     return RetxAdmit::Uncapped;
                 }
                 TRANSPORT_METRICS.record_egress_retransmit_deferred();
-                // A refusal books a slot in the share (a booked resend the
-                // bucket refused books again at the back), so the
-                // connections waiting wake one per slot, not all together.
+                // The connections waiting wake one at a time, not all on the
+                // same deficit: a share refusal books the next slot in the
+                // share; a bucket refusal (any booking kept) waits for the
+                // next free datagram time on the bucket.
                 let wait = match refused {
                     RetxRefused::Slot(wait) => wait,
-                    RetxRefused::Share(_) | RetxRefused::Bucket(_) => {
-                        if let Some(old) = booking.take() {
-                            self.refund_retx_share(old.share_ns);
-                        }
-                        let queue = matches!(refused, RetxRefused::Bucket(_));
-                        let b = self.book_retx_share(bytes, queue);
+                    RetxRefused::Share(_) => {
+                        let b = self.book_retx_share(bytes);
                         *booking = Some(b);
-                        let slot = Duration::from_nanos((b.slot_ns - self.now()).max(0) as u64);
-                        slot.max(refused.wait())
+                        Duration::from_nanos((b.slot_ns - self.now()).max(0) as u64)
                     }
+                    RetxRefused::Bucket(wait) => self.space_retx_bucket_wait(bytes, wait),
                 };
                 RetxAdmit::Defer(
                     wait.max(retx_defer_min(rto))

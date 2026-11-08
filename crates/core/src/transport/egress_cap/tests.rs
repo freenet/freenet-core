@@ -2258,9 +2258,11 @@ fn the_deferral_limit_counts_a_connection_run_of_refusals() {
 }
 
 /// `count` connections, each always holding a due RTO resend, on one cap
-/// whose share binds (1 MB/s: 500 kB/s of retransmits), for one second.
+/// for one second: its share binds (1 MB/s: 500 kB/s of retransmits), or
+/// with `hold_debt` its bucket, kept at the retransmit debt limit by other
+/// traffic, so every resend misses by a datagram.
 /// Returns how many times the connections' resend arms woke.
-fn herd_wakes(count: usize) -> u64 {
+fn herd_wakes(count: usize, hold_debt: bool) -> u64 {
     use crate::transport::sent_packet_tracker::ResendKind;
     let (cap, time) = cap_at(RATE);
     // A long RTO, so no run reaches the deferral limit: this measures waking.
@@ -2277,6 +2279,11 @@ fn herd_wakes(count: usize) -> u64 {
         }
         time.advance(Duration::from_nanos(at.saturating_sub(time.now_nanos())));
         wakes += 1;
+        if hold_debt {
+            // At the retransmit debt limit: every resend just misses.
+            let level = cap.level_bytes();
+            cap.charge_unpaced(usize::try_from(level + 100_000).unwrap_or(0));
+        }
         let next = match runs[i].admit(&cap, ResendKind::Rto, PACKET, rto, at) {
             RetxAdmit::Take(take) => {
                 take.sent(PACKET);
@@ -2292,19 +2299,26 @@ fn herd_wakes(count: usize) -> u64 {
     wakes
 }
 
-/// Connections waiting on the share wake one per booked slot, so node-wide
-/// wakes stay near one per admitted datagram however many connections wait.
+/// Connections waiting on the share wake one per booked slot, and those
+/// waiting on the bucket one per datagram of its refill, so node-wide wakes
+/// do not grow with the number of connections waiting.
 /// Without the booking each refused connection woke every `RETX_DEFER_MIN`
 /// (500 a second each), so 256 connections woke 16 times as often as 16.
 #[test]
 fn share_waiters_wake_once_per_slot_whatever_their_number() {
-    let few = herd_wakes(16);
-    let many = herd_wakes(256);
-    eprintln!("wakes in a second: 16 connections {few}, 256 connections {many}");
-    assert!(
-        many <= 2 * few,
-        "256 connections woke {many} times in a second, 16 woke {few}"
-    );
+    for hold_debt in [false, true] {
+        let few = herd_wakes(16, hold_debt);
+        let many = herd_wakes(256, hold_debt);
+        eprintln!(
+            "wakes in a second (bucket held in debt: {hold_debt}): 16 connections {few}, \
+             256 connections {many}"
+        );
+        assert!(
+            many <= 2 * few,
+            "bucket held in debt: {hold_debt}: 256 connections woke {many} times in a \
+             second, 16 woke {few}"
+        );
+    }
 }
 
 /// A booking cannot leak: it is handed back when the run ends (which is
@@ -2330,7 +2344,7 @@ fn a_booking_is_handed_back_or_costs_one_datagram() {
     };
     // The slot the next booking gets: right after `slot` if that booking
     // still holds its share, at `slot` itself if it was handed back.
-    let next_slot = |cap: &EgressCap| cap.book_retx_share(PACKET, false).slot_ns;
+    let next_slot = |cap: &EgressCap| cap.book_retx_share(PACKET).slot_ns;
     let one = cap_at(RATE).0.retx_share_cost(PACKET).0;
 
     // Run end.

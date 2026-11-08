@@ -304,6 +304,18 @@ refused. Do NOT remove that limit: the count moves only when a
 resend goes, so an unbounded deferral (unpaced debt > 100 ms, or a tiny cap)
 never abandons the packet and pins flight (#4345). Refused probe: skipped,
 marked probed. Abandonment never asks the cap. No cap -> nothing asked.
+A SHARE refusal BOOKS the next slot in the share (RetxDeferral,
+at most one booking per connection; refunded on run end, which an ack leads
+to, on a dropped take and on going uncapped; a closed connection loses at
+most that one datagram), so waiting connections wake one per slot; a BUCKET
+refusal waits for the next free datagram time among bucket-refused
+retransmits (retx_bucket_next_ns, a timing hint, nothing paid). Booking on
+bucket refusals too was tried and cost 1 MB/s storm streams (383 vs 550):
+it paced bucket-limited repairs at the share rate. Without
+it they all woke on the same deficit and node-wide wakes grew with N (97k/s
+at 256 connections); pinned by
+share_waiters_wake_once_per_slot_whatever_their_number. Booking, take and
+refund are atomics only: nothing under the sent_tracker lock takes a lock.
 Counters: egress_retransmits_deferred (refusals, not packets),
 egress_retransmits_uncapped, egress_probes_skipped.
 The share is NODE-WIDE: one lossy peer can use it; the deferral limit bounds
