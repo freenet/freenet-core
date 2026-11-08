@@ -266,41 +266,76 @@ fn seeds() -> Vec<u64> {
     }
 }
 
-/// The storm row: 16 connections share the 4 Mbit/s uplink, 512 KiB each,
-/// 60 s. With the cap at 450 kB/s, capped retransmits must do at least as
-/// well as main: as many streams completed, and nothing retransmitted
-/// forgiven past the cap.
+/// The storm rows: 16 connections share the 4 Mbit/s (500 kB/s) uplink,
+/// 512 KiB each, 60 s, with the cap above the uplink so retransmits storm
+/// (a cap under the uplink means no storm, so it cannot fail). At 1 MB/s (2x
+/// the uplink, the planned default cap of #6045) capped retransmits must
+/// complete at least as many streams as main on every seed. At 2 MB/s (4x),
+/// where single seeds vary more, the total and the median per seed must be
+/// at least main's. Either way nothing retransmitted is forgiven past the cap.
 #[test]
 fn storm_under_a_cap_matches_or_beats_main() {
     const PEERS: usize = 16;
+    const PER_SEED_CAP: u64 = 1_000_000;
     // Override with `FREENET_STORM_CAP` (bytes per second) to explore.
-    let cap: u64 = std::env::var("FREENET_STORM_CAP")
-        .ok()
-        .map(|v| v.trim().parse().expect("decimal bytes per second"))
-        .unwrap_or(450_000);
+    let caps: Vec<u64> = match std::env::var("FREENET_STORM_CAP") {
+        Ok(v) => vec![v.trim().parse().expect("decimal bytes per second")],
+        Err(_) => vec![PER_SEED_CAP, 2 * PER_SEED_CAP],
+    };
     let mut failures = Vec::new();
-    for seed in seeds() {
-        let run = |cap| {
-            block_on_seeded(
-                seed,
-                run_storm(PEERS, 512 * 1024, Duration::from_secs(60), seed, cap),
-            )
+    for cap in caps {
+        let mut main_done = Vec::new();
+        let mut capped_done = Vec::new();
+        for seed in seeds() {
+            let run = |cap| {
+                block_on_seeded(
+                    seed,
+                    run_storm(PEERS, 512 * 1024, Duration::from_secs(60), seed, cap),
+                )
+            };
+            let main = run(Cap::Main(cap));
+            let capped = run(Cap::Capped(cap));
+            let line = format!(
+                "cap {cap} B/s, seed {seed}\n  {}\n  {}",
+                main.summary("main  "),
+                capped.summary("capped")
+            );
+            eprintln!("{line}");
+            if capped.cap_forgiven > 0 || (cap == PER_SEED_CAP && capped.completed < main.completed)
+            {
+                failures.push(line);
+            }
+            main_done.push(main.completed);
+            capped_done.push(capped.completed);
+        }
+        let median = |v: &mut Vec<usize>| {
+            v.sort_unstable();
+            let n = v.len();
+            if n % 2 == 1 {
+                v[n / 2] as f64
+            } else {
+                (v[n / 2 - 1] + v[n / 2]) as f64 / 2.0
+            }
         };
-        let main = run(Cap::Main(cap));
-        let capped = run(Cap::Capped(cap));
-        let line = format!(
-            "seed {seed}\n  {}\n  {}",
-            main.summary("main  "),
-            capped.summary("capped")
+        let totals = (
+            main_done.iter().sum::<usize>(),
+            capped_done.iter().sum::<usize>(),
         );
-        eprintln!("{line}");
-        if capped.completed < main.completed {
-            failures.push(line);
+        let medians = (median(&mut main_done), median(&mut capped_done));
+        eprintln!(
+            "cap {cap} B/s: streams completed, main / capped: total {} / {}, median {} / {}",
+            totals.0, totals.1, medians.0, medians.1
+        );
+        if cap != PER_SEED_CAP && (totals.1 < totals.0 || medians.1 < medians.0) {
+            failures.push(format!(
+                "cap {cap} B/s: total {} / {}, median {} / {}",
+                totals.0, totals.1, medians.0, medians.1
+            ));
         }
     }
     assert!(
         failures.is_empty(),
-        "fewer streams completed with retransmits capped:\n{}",
+        "capped retransmits did worse in the storm:\n{}",
         failures.join("\n")
     );
 }
