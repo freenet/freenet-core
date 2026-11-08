@@ -393,7 +393,8 @@ impl AckRecord {
         Self(parking_lot::Mutex::new(AckSeen { count, at }))
     }
 
-    /// The record now.
+    /// The record now. Tests only.
+    #[cfg(test)]
     pub(crate) fn seen(&self) -> AckSeen {
         *self.0.lock()
     }

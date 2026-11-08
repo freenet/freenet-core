@@ -195,7 +195,8 @@ impl CapHolds {
     }
 
     /// Pollers built outside [`with_poller_holds`] from this template
-    /// record's socket.
+    /// record's socket. Tests only; production logs a warning per poller.
+    #[cfg(test)]
     pub(crate) fn fallback_pollers(&self) -> u64 {
         self.fallback_pollers.load(Ordering::Relaxed)
     }
