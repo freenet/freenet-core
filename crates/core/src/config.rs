@@ -1381,8 +1381,13 @@ impl ConfigArgs {
             // under --skip-load-from-network, whose isolated networks must not
             // learn the production gateways. It is merged after the cache
             // below, so a cached entry wins on an address collision.
-            let fallback = if remote_fetch_failed && mode == OperationMode::Network {
-                compiled_fallback_gateways(fallback_gateways, &config_paths.secrets_dir(mode))?
+            //
+            // A cached entry wins even if the compiled-in key for the same
+            // address is newer: the cache came from a live fetch, and a stale
+            // key costs only that one gateway's handshake. Local mode never
+            // reaches this branch.
+            let fallback = if remote_fetch_failed {
+                compiled_fallback_gateways(fallback_gateways, &config_paths.secrets_dir(mode))
             } else {
                 Gateways::default()
             };
@@ -2666,14 +2671,13 @@ pub struct InlineGwConfig {
 /// gateway configs, writing each key to `secrets_dir` where `NodeConfig` reads
 /// gateway keys from.
 ///
-/// An entry with a malformed key is a build defect, not an operator error, so
-/// it is skipped with an error log rather than refusing to start: the node may
-/// still have the cache or other entries to bootstrap from. The
-/// `fallback_gateways_are_well_formed` test keeps the shipped list clean.
-fn compiled_fallback_gateways(
-    entries: &[(&str, &str)],
-    secrets_dir: &Path,
-) -> anyhow::Result<Gateways> {
+/// Never fails: this is a last resort, so it must not turn a startup that
+/// worked without it into one that does not. An entry with a malformed key (a
+/// build defect; `fallback_gateways_are_well_formed` keeps the shipped list
+/// clean) or whose key file cannot be written (read-only or full secrets dir)
+/// is skipped with a log, and the cache or the other entries may still
+/// bootstrap the node.
+fn compiled_fallback_gateways(entries: &[(&str, &str)], secrets_dir: &Path) -> Gateways {
     let mut gateways = Vec::with_capacity(entries.len());
     for &(hostname, key_hex) in entries {
         if !matches!(hex::decode(key_hex), Ok(bytes) if bytes.len() == 32) {
@@ -2683,17 +2687,26 @@ fn compiled_fallback_gateways(
             );
             continue;
         }
-        fs::create_dir_all(secrets_dir)?;
         // Hex-encode the address so the filename is safe on every platform.
         let key_path = secrets_dir.join(format!("fallback_gw_{}.pub", hex::encode(hostname)));
-        fs::write(&key_path, key_hex)?;
+        if let Err(error) =
+            fs::create_dir_all(secrets_dir).and_then(|()| fs::write(&key_path, key_hex))
+        {
+            tracing::warn!(
+                hostname,
+                file = ?key_path,
+                error = %error,
+                "Could not write compiled-in fallback gateway key; skipping it"
+            );
+            continue;
+        }
         gateways.push(GatewayConfig {
             address: Address::Hostname(hostname.to_string()),
             public_key_path: key_path,
             location: None,
         });
     }
-    Ok(Gateways { gateways })
+    Gateways { gateways }
 }
 
 /// Parse a `--gateway` value in the format "ip:port,hex-pubkey".
@@ -11817,6 +11830,61 @@ shutdown-drain-secs = 42
             fs::read_to_string(&cfg.gateways[1].public_key_path).unwrap(),
             key_b
         );
+        // The merged set is persisted, as the cache alone was before: a peer
+        // whose first boot was offline gets a cache, and the next successful
+        // fetch replaces it wholesale.
+        let persisted =
+            parse_gateways_toml(&fs::read_to_string(dir.join("gateways.toml")).unwrap(), "t")
+                .unwrap();
+        assert_eq!(
+            persisted
+                .gateways
+                .iter()
+                .map(|g| &g.address)
+                .collect::<Vec<_>>(),
+            cfg.gateways.iter().map(|g| &g.address).collect::<Vec<_>>()
+        );
+    }
+
+    /// A secrets dir the key cannot be written to skips the fallback instead
+    /// of failing startup; the cache still bootstraps the node.
+    #[test]
+    fn compiled_fallback_skips_entries_whose_key_cannot_be_written() {
+        let dir = tempfile::tempdir().unwrap();
+        // A regular file where the secrets DIRECTORY should be.
+        let not_a_dir = dir.path().join("secrets");
+        fs::write(&not_a_dir, "").unwrap();
+        let key = random_key_hex();
+        let gateways = compiled_fallback_gateways(&[("gw.example:1", key.as_str())], &not_a_dir);
+        assert!(gateways.gateways.is_empty());
+    }
+
+    /// A gateway with the index down gets the compiled-in list too, just as a
+    /// successful fetch would give it the index (an official gateway drops
+    /// its own entry later, by key, in `NodeConfig::new`).
+    #[tokio::test]
+    async fn gateway_with_index_down_also_uses_compiled_fallback() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dir = temp_dir.path();
+        let (_server, index_url) = failing_gateways_index_server();
+        let mut args = plain_peer_args(dir);
+        args.network_api.is_gateway = true;
+        args.network_api.public_address = Some("203.0.113.10".parse().unwrap());
+        args.network_api.public_port = Some(31337);
+        args.network_api.network_port = Some(31337);
+        let key = random_key_hex();
+        let fallback = [("gw-a.example:31337", key.as_str())];
+
+        let cfg = args
+            .build_with_gateway_sources(&index_url, &fallback)
+            .await
+            .unwrap();
+
+        assert!(cfg.is_gateway);
+        assert_eq!(
+            cfg.gateways.iter().map(|g| &g.address).collect::<Vec<_>>(),
+            vec![&Address::Hostname("gw-a.example:31337".to_string())]
+        );
     }
 
     /// A successful fetch is authoritative: the compiled-in list is not
@@ -11892,7 +11960,7 @@ shutdown-drain-secs = 42
             ("short.example:2", "abcd"),
             ("good.example:3", good.as_str()),
         ];
-        let gateways = compiled_fallback_gateways(&entries, dir.path()).unwrap();
+        let gateways = compiled_fallback_gateways(&entries, dir.path());
         assert_eq!(
             gateways
                 .gateways
@@ -11923,7 +11991,6 @@ shutdown-drain-secs = 42
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
             compiled_fallback_gateways(FALLBACK_GATEWAYS, dir.path())
-                .unwrap()
                 .gateways
                 .len(),
             FALLBACK_GATEWAYS.len(),
@@ -13115,18 +13182,15 @@ shutdown-drain-secs = 42
     fn the_client_api_exposure_path_stays_wired_end_to_end() {
         let src = production_source();
 
-        let build = extract_fn_body(
-            src,
-            "async fn build_with_gateways_index(mut self, gateways_index: &str)",
-        );
+        let build = extract_fn_body(src, "async fn build_with_gateway_sources(");
         assert!(
             build.contains("resolve_ws_api_address("),
-            "build_with_gateways_index no longer resolves the client-API bind through \
+            "build_with_gateway_sources no longer resolves the client-API bind through \
              the shared helper"
         );
         assert!(
             build.contains("exposure: ws_api_exposure"),
-            "build_with_gateways_index no longer records the exposure decision, so \
+            "build_with_gateway_sources no longer records the exposure decision, so \
              nothing downstream can report it"
         );
         // `build()` legitimately warns about other things (gateway dedup, source
