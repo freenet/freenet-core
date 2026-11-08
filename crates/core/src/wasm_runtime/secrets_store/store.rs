@@ -1750,23 +1750,11 @@ impl SecretsStore {
     // from the delegate's wasm+params), so a re-installed webapp shipping the
     // same delegate yields the same key and the imported secrets line up.
 
-    /// Map `delegate-key-bytes (32) -> real CodeHash` for `scope`, so the
-    /// on-disk enumeration can recover the real `code_hash` of a delegate the
-    /// dir name (key-only) can't carry. Best-effort: a delegate missing from
-    /// both sources is simply not in the map (the caller falls back to a
-    /// placeholder code_hash, which is inert for reading and decrypting).
-    ///
-    /// Two sources: this store's in-memory index, and the ReDb index it
-    /// mirrors. The ReDb read is what makes this correct across executors.
-    /// Each `Runtime` owns its own `SecretsStore`, whose in-memory index is
-    /// loaded from ReDb at construction and then updated only by its own
-    /// writes, while every delegate secret write now happens on the node's one
-    /// delegate executor (`PooledDelegateRunner`) and the hosted export runs on
-    /// a POOLED executor. Without the ReDb read, every delegate registered
-    /// after startup would export with a placeholder code_hash. ReDb is shared
-    /// by every executor and written before the in-memory mirror, so it holds
-    /// every completed write. An export is rare, so one index scan per export
-    /// is cheap.
+    /// Map `delegate-key-bytes (32) -> real CodeHash` from this store's in-memory
+    /// index for `scope`, so the on-disk enumeration can recover the real
+    /// `code_hash` of a delegate the dir name (key-only) can't carry. A
+    /// delegate missing here is looked up in ReDb per key by
+    /// [`Self::code_hash_from_db`]; see there for why.
     fn index_code_hashes_by_key(
         &self,
         scope: &SecretScope<'_>,
@@ -1779,19 +1767,6 @@ impl SecretsStore {
                     // `DelegateKey` derefs to its 32-byte key.
                     out.insert(**dk, *dk.code_hash());
                 }
-                match self.db.load_all_secrets_index() {
-                    Ok(entries) => {
-                        for (dk, _) in entries {
-                            out.entry(*dk).or_insert(*dk.code_hash());
-                        }
-                    }
-                    Err(e) => tracing::warn!(
-                        error = %e,
-                        "Export: could not read the secrets index from ReDb; code \
-                         hashes of delegates this executor did not register fall \
-                         back to the placeholder"
-                    ),
-                }
             }
             SecretScope::User { id, .. } => {
                 for entry in self.user_key_to_secret_part.iter() {
@@ -1800,24 +1775,39 @@ impl SecretsStore {
                         out.insert(**dk, *dk.code_hash());
                     }
                 }
-                match self.db.load_all_user_secrets_index() {
-                    Ok(entries) => {
-                        for ((dk, user), _) in entries {
-                            if UserId::new(user) == **id {
-                                out.entry(*dk).or_insert(*dk.code_hash());
-                            }
-                        }
-                    }
-                    Err(e) => tracing::warn!(
-                        error = %e,
-                        "Export: could not read the user secrets index from ReDb; \
-                         code hashes of delegates this executor did not register \
-                         fall back to the placeholder"
-                    ),
-                }
             }
         }
         out
+    }
+
+    /// The real code hash of delegate `key` for `scope`, from the shared ReDb
+    /// index, when this store's in-memory index does not have it.
+    ///
+    /// Each `Runtime` owns its own `SecretsStore`, whose in-memory index is
+    /// loaded from ReDb at construction and then updated only by its own
+    /// writes, while every delegate secret write now happens on the node's one
+    /// delegate executor (`PooledDelegateRunner`) and the hosted export runs
+    /// on a POOLED executor. Without this, every delegate registered after
+    /// startup would export with the placeholder. ReDb is shared and written
+    /// before the in-memory mirror. One prefix lookup per delegate directory
+    /// found on disk, filtered to the requesting user for a user scope, so the
+    /// cost is the caller's own data, not every user's.
+    fn code_hash_from_db(&self, key: &[u8; 32], scope: &SecretScope<'_>) -> Option<CodeHash> {
+        let user = match scope {
+            SecretScope::Local => None,
+            SecretScope::User { id, .. } => Some(id.as_bytes()),
+        };
+        match self.db.code_hashes_for_delegate(key, user) {
+            Ok(hashes) => hashes.first().map(CodeHash::from),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Export: could not read the secrets index from ReDb; this \
+                     delegate's code hash falls back to the placeholder"
+                );
+                None
+            }
+        }
     }
 
     /// Count the secrets under `scope` on disk, STOPPING as soon as the count
@@ -1936,6 +1926,7 @@ impl SecretsStore {
             let code_hash = code_hashes
                 .get(&delegate_key_bytes)
                 .copied()
+                .or_else(|| self.code_hash_from_db(&delegate_key_bytes, scope))
                 .unwrap_or_else(|| CodeHash::from(&[0u8; 32]));
             let delegate = DelegateKey::new(delegate_key_bytes, code_hash);
 
@@ -7582,7 +7573,7 @@ mod test {
     /// hosted export runs on a pooled one) still recovers the delegate's REAL
     /// code_hash, from the shared ReDb index, rather than the placeholder.
     ///
-    /// FALSIFY: drop the ReDb read from `index_code_hashes_by_key`; the
+    /// FALSIFY: drop the `code_hash_from_db` fallback in the walk; the
     /// exported key carries the placeholder code_hash.
     #[tokio::test]
     async fn export_recovers_code_hash_written_by_another_executor()
@@ -7607,6 +7598,39 @@ mod test {
         store.key_to_secret_part.remove(delegate.key());
 
         let entries = store.export_scope_entries(SecretScope::Local)?;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].delegate_key.code_hash(),
+            delegate.key().code_hash(),
+            "the exported key must carry the delegate's real code_hash"
+        );
+        Ok(())
+    }
+
+    /// The same for a USER scope: the code hash comes from the per-user ReDb
+    /// rows of the requesting user.
+    ///
+    /// FALSIFY: as above.
+    #[tokio::test]
+    async fn user_export_recovers_code_hash_written_by_another_executor()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("secrets-store-test");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
+        let delegate = Delegate::from((&vec![74].into(), &vec![].into()));
+        let ctx = UserSecretContext::from_token(b"export-code-hash-user");
+        store.store_secret(
+            delegate.key(),
+            &SecretsId::new(vec![75]),
+            ctx.scope(),
+            Zeroizing::new(b"uval".to_vec()),
+        )?;
+        store
+            .user_key_to_secret_part
+            .remove(&(delegate.key().clone(), *ctx.user_id()));
+        let entries = store.export_scope_entries(ctx.scope())?;
         assert_eq!(entries.len(), 1);
         assert_eq!(
             entries[0].delegate_key.code_hash(),
