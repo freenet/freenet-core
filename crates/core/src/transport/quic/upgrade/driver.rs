@@ -86,8 +86,10 @@ use crate::transport::crypto::TransportPublicKey;
 use crate::transport::metrics::{QuicCloseCode, QuicFallback, QuicUpgradeOutcome};
 use crate::transport::peer_connection::UdpSender;
 use crate::transport::peer_connection::inbound_budget::SharedInboundBudget;
+use crate::transport::quic::config::QuicRateLimit;
 use crate::transport::quic::control::ControlError;
 use crate::transport::quic::identity::PeerKey;
+use crate::transport::quic::path::pacer::{LimitPacer, SendPacer};
 use crate::transport::quic::path::{
     BoundedSend, QuicDataInbox, QuicDataSenders, QuicPath, QuicPathLimits, data_channels,
 };
@@ -394,6 +396,10 @@ struct Session {
     data: QuicDataSenders,
     /// What a path's short queue falls back on.
     udp: Arc<dyn UdpShorts>,
+    /// What paces each path's data sends, when the connection has a bandwidth
+    /// limit (`path::pacer`): the connection's token bucket. `None` with no
+    /// limit.
+    pacer: Option<Arc<dyn SendPacer>>,
     /// Whether the live attempt may hold a data route, read without the lock by
     /// every send of the connection ([`Self::data_route`]). Set only after the
     /// route is in place and cleared when the attempt goes, both under the lock,
@@ -522,6 +528,7 @@ impl QuicUpgrades {
 
     /// Start the upgrade of a new UDP session. The inbox is what its paths deliver
     /// to, for the connection's `recv`.
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::transport) fn open_session<S: Socket, T: TimeSource>(
         self: &Arc<Self>,
         remote: SocketAddr,
@@ -529,6 +536,7 @@ impl QuicUpgrades {
         budget: SharedInboundBudget,
         quic_receipt_nanos: Arc<AtomicU64>,
         sender: UdpSender<S, T>,
+        rate_limit: Option<QuicRateLimit>,
         time: T,
     ) -> (QuicPathState, QuicDataInbox) {
         let sender = Arc::new(sender);
@@ -549,6 +557,10 @@ impl QuicUpgrades {
             budget,
             data,
             udp: sender.clone(),
+            // On the path's clock, the one a send's deadlines run on.
+            pacer: rate_limit
+                .and_then(|limit| LimitPacer::new(limit, self.path_clock.clone()))
+                .map(|pacer| Arc::new(pacer) as Arc<dyn SendPacer>),
             routed: Arc::new(AtomicBool::new(false)),
             quic_receipt_nanos,
             now: Arc::new(move || clock.now()),
@@ -971,6 +983,9 @@ impl Session {
             return;
         }
         path.enable_data();
+        if let Some(pacer) = &self.pacer {
+            path.pace_with(Arc::clone(pacer));
+        }
         let (route, worker) = DataRoute::new(
             Arc::clone(path),
             self.hub.path_clock.clone(),
@@ -1501,6 +1516,18 @@ pub(in crate::transport) struct QuicPathState {
 }
 
 impl QuicPathState {
+    /// Whether this session paces its paths' data sends.
+    #[cfg(test)]
+    pub(in crate::transport) fn paces_data(&self) -> bool {
+        self.session.pacer.is_some()
+    }
+
+    /// The pacer this session gives its paths, if any.
+    #[cfg(test)]
+    pub(in crate::transport) fn pacer(&self) -> Option<Arc<dyn SendPacer>> {
+        self.session.pacer.clone()
+    }
+
     /// An upgrade message arrived on the UDP session. Never waits: `recv` calls
     /// this. A message dropped on a full inbox costs what a lost datagram costs,
     /// and the machine's deadlines cover that.

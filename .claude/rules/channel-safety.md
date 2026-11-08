@@ -56,7 +56,9 @@ stalling the entire event loop. This has caused 6+ production deadlocks:
   `tokio::time::timeout(500ms, peer_connection.sender.reserve())` so
   ownership of `completion_tx` is retained on the timeout path,
   releasing the broadcast queue's permit immediately instead of
-  waiting `STREAM_COMPLETION_TIMEOUT` (120 s). One emission site
+  waiting out the stream completion wait (then a flat 120 s; since
+  #6127 the permit is held for at most `STREAM_PERMIT_HOLD`, 120 s,
+  of a size-scaled wait). One emission site
   (`announce_contract_hosted`) intentionally kept the blocking variant
   because it carries a one-shot transition — see its inline
   `DELIBERATELY blocking` comment for the rationale.

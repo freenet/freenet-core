@@ -102,7 +102,7 @@ const TOKEN_BUCKET_WINDOW: Duration = Duration::from_millis(100);
 /// (~1200 bytes) cannot be admitted, stalling connections at very low rates.
 /// 8 KiB (~6–7 max-size packets) provides enough headroom for burst handling
 /// without allowing large uncontrolled bursts.
-const MIN_BUCKET_CAPACITY_BYTES: usize = 8192;
+pub(in crate::transport) const MIN_BUCKET_CAPACITY_BYTES: usize = 8192;
 
 pub type SerializedMessage = Vec<u8>;
 
@@ -249,8 +249,9 @@ pub(super) async fn bind_udp_listener<S: Socket>(
         .as_ref()
         .and_then(|_| get_socket_virtual_time(&bind_addr));
     // The node-wide egress cap exists only when `total-bandwidth-limit` is
-    // set and not 0 (`global_bandwidth` is set, and `from_total_limit`
-    // builds no cap for 0), so a node without it pays nothing. The cap runs
+    // set and not 0 (`global_bandwidth` is set; the node builds no pool for a
+    // total of 0, `NetworkApiConfig::global_bandwidth_manager`), so a node
+    // without it pays nothing. The cap runs
     // on `RealTime`, as the listener built below does, in production and in
     // simulation alike; waiters sleep on their own connection's time
     // source. A cap on the network's `VirtualTime` would compute deficits on

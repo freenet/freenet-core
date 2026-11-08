@@ -1433,3 +1433,152 @@ fn many_tasks_send_while_the_path_closes_and_nothing_goes_twice() {
         Err(_) => panic!("the multi-thread test did not finish"),
     }
 }
+
+/// A pacer that grants its first `grant` reservations at once, refuses every
+/// one after, and records what is charged to it.
+#[derive(Default)]
+struct RefusingPacer {
+    grant: usize,
+    calls: std::sync::atomic::AtomicUsize,
+    granted: std::sync::atomic::AtomicUsize,
+    charged: std::sync::atomic::AtomicUsize,
+}
+
+impl crate::transport::quic::path::pacer::SendPacer for RefusingPacer {
+    fn reserve_within(&self, bytes: usize, limit: Duration) -> Result<Duration, Duration> {
+        let call = self
+            .calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if call < self.grant {
+            self.granted
+                .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+            Ok(Duration::ZERO)
+        } else {
+            Err(limit)
+        }
+    }
+
+    fn give_back(&self, _bytes: usize) {}
+
+    fn charge(&self, bytes: usize) -> usize {
+        self.charged
+            .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        bytes
+    }
+
+    fn sleep(&self, wait: Duration) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> {
+        Box::pin(tokio::time::sleep(wait))
+    }
+}
+
+/// A Stream and a Short past one packet that the pacer refuses go on UDP, and
+/// their bytes are charged to the pacer as debt once UDP has sent them, so the
+/// path's next sends wait for them.
+#[test]
+fn messages_the_pacer_refuses_go_on_udp_and_are_charged_to_it() {
+    run(
+        "quic-send-paced-udp",
+        140,
+        QuicPathLimits::DEFAULT,
+        |mut rig| async move {
+            let pacer = Arc::new(RefusingPacer::default());
+            rig.route.path().pace_with(pacer.clone());
+            let id = StreamId::next();
+            let stream = bytes_of(3000);
+            rig.e
+                .conn
+                .outbound_stream_with_id(id, stream.clone(), None, None, None)
+                .await;
+            let large = bytes_of(4000);
+            rig.e.conn.send_serialized(large.to_vec()).await.unwrap();
+            rig.path.settle(Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+            let udp = rig.udp_data();
+            assert_eq!(
+                udp.stream_bytes.len(),
+                stream.len() + large.len(),
+                "both went on UDP"
+            );
+            assert_eq!(rig.stats().send_count(SendKind::Stream, R::NotOpenedUdp), 1);
+            assert_eq!(
+                rig.stats()
+                    .send_count(SendKind::LargeShort, R::NotOpenedUdp),
+                1
+            );
+            assert_eq!(
+                pacer.charged.load(std::sync::atomic::Ordering::Relaxed),
+                stream.len() + large.len(),
+                "every refused byte is charged to the pacer"
+            );
+        },
+    );
+}
+
+/// A Short past one packet that the pacer refuses after its stream opened is
+/// reset and goes on UDP whole, and the whole message is charged to the
+/// pacer: UDP put all of it on the wire, on top of what the QUIC writes before
+/// the refusal already paid.
+#[test]
+fn a_large_short_the_pacer_refuses_after_opening_is_charged_in_full() {
+    run(
+        "quic-send-paced-open",
+        141,
+        QuicPathLimits::DEFAULT,
+        |mut rig| async move {
+            // The header and the first write go; the next write is refused.
+            let pacer = Arc::new(RefusingPacer {
+                grant: 2,
+                ..RefusingPacer::default()
+            });
+            rig.route.path().pace_with(pacer.clone());
+            let large = bytes_of(4000);
+            rig.e.conn.send_serialized(large.to_vec()).await.unwrap();
+            rig.path.settle(Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+            let udp = rig.udp_data();
+            assert_eq!(udp.stream_bytes, large.to_vec(), "it went on UDP whole");
+            assert_eq!(
+                rig.stats().send_count(SendKind::LargeShort, R::FailedUdp),
+                1
+            );
+            let granted = pacer.granted.load(std::sync::atomic::Ordering::Relaxed);
+            assert!(
+                granted > crate::transport::quic::framing::HEADER_LEN,
+                "a payload write was made on QUIC"
+            );
+            assert_eq!(
+                pacer.charged.load(std::sync::atomic::Ordering::Relaxed),
+                large.len()
+            );
+        },
+    );
+}
+
+/// A message the pacer refused whose UDP send then fails leaves no debt: the
+/// pacer is charged only for what UDP sent.
+#[test]
+fn a_fallback_that_fails_on_udp_leaves_no_debt() {
+    run(
+        "quic-send-paced-udp-fails",
+        142,
+        QuicPathLimits::DEFAULT,
+        |mut rig| async move {
+            let pacer = Arc::new(RefusingPacer::default());
+            rig.route.path().pace_with(pacer.clone());
+            rig.e
+                .fail_sends
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            rig.e
+                .conn
+                .outbound_stream_with_id(StreamId::next(), bytes_of(3000), None, None, None)
+                .await;
+            rig.path.settle(Duration::from_secs(1)).await;
+            assert_eq!(rig.stats().send_count(SendKind::Stream, R::NotOpenedUdp), 1);
+            assert_eq!(
+                pacer.charged.load(std::sync::atomic::Ordering::Relaxed),
+                0,
+                "nothing went out, so nothing is owed"
+            );
+        },
+    );
+}

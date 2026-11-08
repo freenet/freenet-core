@@ -93,23 +93,19 @@ pub enum ConformanceProperty {
     DeltaDeterminism,
     /// `apply(apply(A, D), D) == apply(A, D)` — at-least-once delivery must be harmless.
     ///
-    /// **This property is contested, and the disagreement is not resolved here.**
-    /// The existing sampled probe in
-    /// `contract::executor::runtime::executor_impl::maybe_probe_idempotency`
-    /// deliberately exempts delta inputs, on the stated grounds that
-    /// operation-based CRDTs (counters, append-logs) legitimately break byte
-    /// equality on re-apply: an "increment by 1" delta yields `S+1` then `S+2`.
-    /// The RFC takes the opposite position, and explicitly requires delta
-    /// idempotence, because Freenet delivery is at-least-once — under which a
-    /// contract that double-counts a redelivered increment is not a valid CmRDT,
-    /// it is a contract that will silently corrupt its own state.
+    /// **Settled: deltas must be idempotent.** Ian ruled on 2026-11-06 (recorded
+    /// in <https://github.com/freenet/freenet-core/issues/5906#issuecomment-6677346389>).
+    /// Freenet delivery is at-least-once, so a contract that double-counts a
+    /// redelivered increment is not a valid CmRDT under this transport: it will
+    /// silently corrupt its own state. That was the RFC's position. The sampled
+    /// probe in `contract::executor::runtime::executor_impl::maybe_probe_idempotency`
+    /// still exempts delta inputs; it is a storm detector for full-state merges and
+    /// does not state the law.
     ///
-    /// The RFC is the newer and more specific document, so the check exists. But
-    /// whether any deployed first-party contract actually relies on non-idempotent
-    /// deltas is an empirical question that cannot be settled by reading code, and
-    /// it must be answered by running `fdev verify-merge` against deployed WASM
-    /// before this property is ever allowed to influence anything on the network.
-    /// Until then it is a reporting signal for contract authors.
+    /// The property stays [`Severity::Diagnostic`] and report-only only because
+    /// nodes act on no conformance verdict (the removal plan is superseded, see
+    /// `policy`'s module docs). The severity is not a judgment that non-idempotent
+    /// deltas are acceptable: a finding here is a bug the author should fix.
     ///
     /// # Why this one stays [`PremiseSource::EvidenceBytes`], and what makes that safe
     ///
@@ -143,8 +139,8 @@ pub enum ConformanceProperty {
     /// `policy::decide` never maps to a removal: a fabricated delta buys an attacker
     /// a report and nothing else. That coupling is NOT incidental. This is the only
     /// property that both travels as evidence and consumes delta bytes, so making it
-    /// removal-eligible (a `Violation` with a `RemovalEligible` tier) — which the
-    /// contested empirical question above may one day justify — must revisit this
+    /// removal-eligible (a `Violation` with a `RemovalEligible` tier), which nothing
+    /// plans since nodes act on no verdict, would have to revisit this
     /// classification in the same change. `no_shippable_removal_eligible_property_consumes_unvalidated_bytes`
     /// is the test that forces it to.
     DeltaIdempotence,
@@ -180,8 +176,8 @@ pub enum ConformanceProperty {
     /// assumes a base can be applied out of order in production too.
     ///
     /// Re-delivery is deliberately not checked here; that is
-    /// [`ConformanceProperty::DeltaIdempotence`], which is contested and reports at
-    /// a lower severity. Folding it in would accuse a counter-style contract under
+    /// [`ConformanceProperty::DeltaIdempotence`], which reports at a lower
+    /// severity for the reason given there. Folding it in would accuse a counter-style contract under
     /// this property's name regardless of that.
     ///
     /// # Local provenance only: this property is NOT self-verifying
@@ -235,12 +231,13 @@ pub enum ConformanceProperty {
     /// exists to catch.
     ///
     /// Ian's call (2026-08-17) was to leave it removal-eligible and settle the
-    /// question when the active-but-not-enforcing phase is wired, with real shadow
-    /// telemetry rather than a five-contract sample. Do not quietly downgrade it
-    /// before then, and do not let Enforce become reachable without revisiting it.
+    /// question with real shadow telemetry rather than a five-contract sample.
     /// Reaffirmed 2026-10-22 (#5906) when [`ConformanceProperty::PathAgreement`]
     /// became report-only: this is the sync-loop check, and it stays
-    /// removal-eligible.
+    /// removal-eligible. The removal plan itself is now superseded and `Enforce`
+    /// is unreachable and not planned (see `policy`'s module docs), so the tier
+    /// only decides whether a finding is counted as `would_remove` or as reported
+    /// in the shadow diagnostics.
     ///
     /// What would settle it, in either direction:
     ///
@@ -331,8 +328,9 @@ pub enum ConformanceProperty {
     /// `ReconciliationCycle` this is a single step with no schedule to get wrong,
     /// which is the narrower assumption of the two.
     ///
-    /// Shadow-mode counts are what should settle whether it should ever become
-    /// removal-eligible again. Its findings are in the shadow `reported` count, not
+    /// Shadow-mode counts are what would settle whether it should count as
+    /// removal-eligible again (a diagnostic distinction only: nodes do not remove
+    /// contracts, see `policy`'s module docs). Its findings are in the shadow `reported` count, not
     /// `would_remove`; the number to read is contracts flagged by THIS property and
     /// by no removal-eligible one. If that number stays at zero the property adds
     /// nothing a removal could rest on; if it is the sole finding for real
@@ -867,7 +865,8 @@ pub enum IdempotenceSettling {
     /// running out is not a proof that the state never settles; replacing it with
     /// one (a repeated state, or a re-delivery failure) is tracked in #5906.
     ///
-    /// **Known gap, to close before Enforce can become reachable:** a contract
+    /// **Known gap** (it would have had to close before Enforce could become
+    /// reachable; Enforce is not planned, see `policy`'s module docs): a contract
     /// that settles after more rewrites than the budget lands here and is
     /// removal-eligible. Pinned as current behaviour by
     /// `policy::tests::known_gap_idempotence_not_shown_to_settle_stays_removal_eligible`.
@@ -899,12 +898,13 @@ pub enum IdempotenceSettling {
     /// into `settling: None` (ambiguous with "this property carries no settling
     /// data at all").
     ///
-    /// **Known gap, to close before Enforce can become reachable:** this class
+    /// **Known gap** (it would have had to close before Enforce could become
+    /// reachable; Enforce is not planned, see `policy`'s module docs): this class
     /// keeps the property's removal-eligible tier, yet it can come from a fuel trap
     /// or a resource ceiling on the follow-up merges, which a PUT of an unusual or
-    /// large state can reach. Removal must rest on proof that the state never
-    /// settles, not on classification failing. That proof is the next #5906 item;
-    /// until then this is pinned as current behaviour by
+    /// large state can reach. A removal would have had to rest on proof that the
+    /// state never settles, not on classification failing. Pinned as current
+    /// behaviour by
     /// `policy::tests::known_gap_idempotence_not_shown_to_settle_stays_removal_eligible`.
     Indeterminate,
 }

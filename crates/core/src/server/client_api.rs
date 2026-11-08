@@ -160,6 +160,7 @@ fn sandbox_origin_from_headers(headers: &axum::http::HeaderMap) -> String {
         .unwrap_or_else(|| "'self'".to_string())
 }
 
+pub(crate) mod app_grants;
 pub(crate) mod hosted_export;
 pub(crate) mod hosted_import;
 pub(crate) mod hosted_migrate;
@@ -221,6 +222,10 @@ pub struct HttpClientApi {
     /// (P3-live of #4381). Shared (same `Arc`) with the router's `Extension`;
     /// the node fills it at startup via `set_op_manager`.
     export_op_manager: hosted_export::ExportOpManagerHandle,
+    /// Native app grants (#5264): pending approvals and the live connections
+    /// opened with each grant. Shared (same `Arc`) with the router's
+    /// `Extension`; the WebSocket router gets it from `server.rs`.
+    app_grants: app_grants::AppGrantState,
 }
 
 /// Set `HostedMode(false)` on a request that has no `HostedMode`; keep one set
@@ -300,6 +305,10 @@ impl HttpClientApi {
         // the public pull drains it.
         let migrate_store = hosted_migrate::MigratePullStore::default();
 
+        // Native app grants (#5264). Reaches the grant store through the same
+        // per-node op_manager handle.
+        let app_grants = app_grants::AppGrantState::new(export_op_manager.clone());
+
         let router = Router::new()
             .route("/", axum::routing::get(home_page::homepage))
             .route(
@@ -346,6 +355,9 @@ impl HttpClientApi {
             .merge(hosted_migrate::routes(ApiVersion::V1))
             .merge(hosted_migrate::routes(ApiVersion::V2))
             .merge(permission_prompts::routes())
+            // User-approved app grants for native clients (#5264).
+            .merge(app_grants::routes())
+            .layer(Extension(app_grants.clone()))
             .layer(Extension(origin_contracts.clone()))
             .layer(Extension(pending_prompts))
             .layer(Extension(export_op_manager.clone()))
@@ -358,6 +370,7 @@ impl HttpClientApi {
                 origin_contracts,
                 response_channels: HashMap::new(),
                 export_op_manager,
+                app_grants,
             },
             router,
         )
@@ -367,6 +380,12 @@ impl HttpClientApi {
     /// This allows tests to verify token expiration behavior.
     pub fn origin_contracts(&self) -> &OriginContractMap {
         &self.origin_contracts
+    }
+
+    /// The native-app-grant state, for the WebSocket router's on-upgrade
+    /// lookup (see `server::serve_client_api_in_impl`).
+    pub(crate) fn app_grants(&self) -> app_grants::AppGrantState {
+        self.app_grants.clone()
     }
 }
 

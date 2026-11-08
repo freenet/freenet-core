@@ -1316,6 +1316,10 @@ impl P2pConnManager {
             quic.breaker,
         );
 
+        config
+            .config
+            .network_api
+            .warn_if_total_bandwidth_limit_is_zero();
         Ok(P2pConnManager {
             gateways,
             bridge,
@@ -1340,34 +1344,27 @@ impl P2pConnManager {
             global_bandwidth: config
                 .config
                 .network_api
-                .total_bandwidth_limit
-                .map(|total| {
-                    let manager = Arc::new(GlobalBandwidthManager::new(
-                        total,
-                        config.config.network_api.min_bandwidth_per_connection,
-                    ));
+                .global_bandwidth_manager()
+                .inspect(|manager| {
                     // The transport builds a node-wide egress cap from the
                     // same total (`transport::egress_cap`); say so at startup,
                     // and warn when it is low for the allowed connections.
-                    if total > 0 {
-                        crate::transport::egress_cap::log_startup_cap(
-                            total,
-                            config
-                                .config
-                                .network_api
-                                .min_bandwidth_per_connection
-                                .unwrap_or(
-                                    crate::transport::global_bandwidth::DEFAULT_MIN_PER_CONNECTION,
-                                ),
-                            config.config.network_api.max_connections,
-                        );
-                    }
+                    crate::transport::egress_cap::log_startup_cap(
+                        manager.total_limit(),
+                        config
+                            .config
+                            .network_api
+                            .min_bandwidth_per_connection
+                            .unwrap_or(
+                                crate::transport::global_bandwidth::DEFAULT_MIN_PER_CONNECTION,
+                            ),
+                        config.config.network_api.max_connections,
+                    );
                     // Phase 1.6 shadow telemetry (#4074): expose the
                     // effective aggregate rate R to the demand aggregator.
                     // Observation only — the manager is read, never written,
                     // by the shadow side. See transport/shadow_demand.rs.
-                    crate::transport::shadow_demand::register_global_bandwidth(&manager);
-                    manager
+                    crate::transport::shadow_demand::register_global_bandwidth(manager);
                 }),
             ledbat_min_ssthresh: config.config.network_api.ledbat_min_ssthresh,
             congestion_config: config.config.network_api.build_congestion_config(),
@@ -2226,8 +2223,9 @@ impl P2pConnManager {
                             // channel cannot drain within that window we drop the
                             // stream fragment and fire `completion_tx` so the
                             // broadcast queue releases its semaphore permit
-                            // immediately instead of waiting STREAM_COMPLETION_TIMEOUT
-                            // (120 s). Issue #4145. Using `reserve()` (rather than
+                            // immediately instead of holding it for up to
+                            // `STREAM_PERMIT_HOLD` (120 s) of the stream
+                            // completion wait. Issue #4145. Using `reserve()` (rather than
                             // `timeout(send())`) lets us keep ownership of
                             // `completion_tx` when the timeout fires, so we can
                             // signal it manually on the drop path.
@@ -5414,15 +5412,16 @@ pub(crate) mod tests {
     /// Load-bearing invariant for #4145: when the per-peer channel is
     /// saturated and the dispatch times out, the StreamSend branch MUST
     /// signal `completion_tx` so the broadcast queue's semaphore permit
-    /// releases immediately instead of waiting `STREAM_COMPLETION_TIMEOUT`
-    /// (120 s). This is the entire reason the dispatch uses `reserve()`
+    /// releases immediately instead of being held for up to
+    /// `STREAM_PERMIT_HOLD` (120 s) of the stream completion wait. This is the
+    /// entire reason the dispatch uses `reserve()`
     /// (so we retain ownership of `completion_tx`) instead of
     /// `timeout(send())` (which moves it into the dropped future).
     ///
     /// This test pins the *pattern* — production code is exercised by
     /// the source-scrape pin `stream_send_branch_uses_timed_reserve_pattern`.
     /// A behavioural mismatch between the two is a CI failure here, not
-    /// a 120 s production stall.
+    /// a production stall of up to 120 s per send.
     #[tokio::test]
     async fn stream_send_pattern_fires_completion_tx_on_timeout() {
         use crate::transport::StreamSendOutcome;
@@ -5457,7 +5456,7 @@ pub(crate) mod tests {
             matches!(signal, Ok(Ok(StreamSendOutcome::Dropped))),
             "completion_tx must be fired on the dispatch timeout path so the \
              broadcast queue releases its permit immediately (not after \
-             120s STREAM_COMPLETION_TIMEOUT). Got {signal:?}"
+             stream completion timeout). Got {signal:?}"
         );
     }
 
@@ -5515,8 +5514,8 @@ pub(crate) mod tests {
         // broadcast queue's semaphore permit releases immediately.
         // Per-arm count instead of a single match: a refactor that
         // drops just the timeout arm's fire (the one #4145 added)
-        // would otherwise silently reintroduce the 120 s
-        // STREAM_COMPLETION_TIMEOUT stall.
+        // would otherwise silently reintroduce a stall of up to
+        // `STREAM_PERMIT_HOLD` (120 s) per send.
         //
         // Post-#4235 the signal carries a `StreamSendOutcome` instead
         // of `()`, and every drop arm reports `Dropped` so the broadcast queue
@@ -5532,7 +5531,7 @@ pub(crate) mod tests {
              StreamSendOutcome::Dropped in all three non-success arms \
              (closed / timeout / no-connection) — found {fire_count} such \
              occurrences, expected exactly 3. If you REMOVED one, a refactor \
-             reintroduced the 120 s STREAM_COMPLETION_TIMEOUT stall (#4145). \
+             reintroduced the stream completion timeout stall (#4145). \
              If you relabeled a drop arm as Delivered, you reintroduced the \
              delivery/permit conflation (#4235). If you ADDED a new arm with \
              its own fire, bump this count to match. Body:\n{body}"

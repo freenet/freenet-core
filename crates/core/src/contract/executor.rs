@@ -2507,6 +2507,45 @@ mod tests {
         );
     }
 
+    /// What follows `const ` in a module-scope constant declaration of any
+    /// visibility (`const`, `pub const`, `pub(crate)`, `pub(super)`,
+    /// `pub(in some::path)`), or `None` for any other line.
+    fn const_declaration(line: &str) -> Option<&str> {
+        let rest = match line.strip_prefix("pub") {
+            None => line,
+            Some(after) => match after.strip_prefix('(') {
+                Some(inner) => inner.split_once(')')?.1.strip_prefix(' ')?,
+                None => after.strip_prefix(' ')?,
+            },
+        };
+        rest.strip_prefix("const ")
+    }
+
+    #[test]
+    fn const_declaration_reads_every_visibility() {
+        for (line, want) in [
+            ("const A_BYTES: usize = 1;", Some("A_BYTES: usize = 1;")),
+            ("pub const A_BYTES: usize = 1;", Some("A_BYTES: usize = 1;")),
+            (
+                "pub(crate) const A_BYTES: usize = 1;",
+                Some("A_BYTES: usize = 1;"),
+            ),
+            (
+                "pub(super) const A_BYTES: usize = 1;",
+                Some("A_BYTES: usize = 1;"),
+            ),
+            (
+                "pub(in crate::transport) const A_BYTES: usize = 1;",
+                Some("A_BYTES: usize = 1;"),
+            ),
+            ("    const A_BYTES: usize = 1;", None),
+            ("pub fn a_bytes() -> usize {", None),
+            ("pub(crate) static A_BYTES: usize = 1;", None),
+        ] {
+            assert_eq!(const_declaration(line), want, "{line:?}");
+        }
+    }
+
     /// The other half of `declared_cache_ceiling_names_every_budget`, and the
     /// half that was missing: that one catches a summed budget being REMOVED;
     /// this one catches a new one being ADDED and not summed.
@@ -2741,6 +2780,16 @@ mod tests {
             (
                 "MAX_QUEUED_BYTES",
                 "conformance-capture harness, not a node budget",
+            ),
+            (
+                "MAX_BODY_BYTES",
+                "per-request body limit on the native app grant routes; a request body is \
+                 parsed and dropped, not retained",
+            ),
+            (
+                "MAX_CLIENT_NAME_BYTES",
+                "per-record length cap on a native app grant's display name, in a table \
+                 bounded at MAX_NATIVE_GRANTS (64) rows; not a cache budget",
             ),
             // Functions.
             ("disk_budget_for", "DISK, not resident memory"),
@@ -3089,11 +3138,11 @@ mod tests {
             for (i, line) in lines.iter().copied().enumerate() {
                 // Module scope only: an indented declaration is inside a
                 // function or a test module and cannot be a node-wide budget.
-                if let Some(rest) = line
-                    .strip_prefix("const ")
-                    .or_else(|| line.strip_prefix("pub const "))
-                    .or_else(|| line.strip_prefix("pub(crate) const "))
-                    .or_else(|| line.strip_prefix("pub(super) const "))
+                // Any visibility, `pub(in path)` included: a fixed list of
+                // prefixes dropped `MIN_BUCKET_CAPACITY_BYTES` from discovery
+                // when it became `pub(in crate::transport)`, leaving its
+                // `NOT_SUMMED` entry naming nothing.
+                if let Some(rest) = const_declaration(line)
                     && let Some((name, tail)) = rest.split_once(':')
                     // `ByteCount` as well as `usize`: a budget does not stop
                     // being a budget because its type became safer. This guard

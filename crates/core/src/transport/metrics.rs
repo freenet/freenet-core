@@ -31,7 +31,7 @@ use crate::tracing::{TransferDirection, TransferEvent};
 
 mod quic_data;
 pub use quic_data::QuicDataSnapshot;
-pub(crate) use quic_data::{QuicDataCounters, StreamsOpenPeak};
+pub(crate) use quic_data::{PathLossWindow, QuicDataCounters, StreamsOpenPeak};
 
 /// Global transport metrics instance.
 ///
@@ -5111,6 +5111,53 @@ mod tests {
         assert_eq!(json["quic_live_data_paths"], 1, "the gauge survives");
         assert!(json.get("quic_data_send_short_sent").is_none());
         assert_eq!(json["quic_sends"], 1);
+    }
+
+    /// quinn's per-path loss counts go through `take_snapshot` end to end: a
+    /// report makes the period active and reaches the upload under its keys with
+    /// its own values, the loss-rate bucket included, a read that does not reset
+    /// leaves them, and the next period is empty.
+    #[test]
+    fn quic_path_loss_goes_through_take_snapshot() {
+        let metrics: &'static TransportMetrics = Box::leak(Box::new(TransportMetrics::new()));
+        let mut window = PathLossWindow::new(&metrics.quic_data);
+        metrics.quic_data.record_path_loss(
+            &mut window,
+            crate::transport::quic::recycle::PathLoss {
+                sent_packets: 1000,
+                lost_packets: 7,
+                lost_bytes: 8400,
+                congestion_events: 3,
+            },
+        );
+        let peek = metrics.read_snapshot();
+        assert_eq!(peek.quic_data.lost_packets, 7);
+        let snap = metrics.take_snapshot().expect("a report is activity");
+        let json = snap.upload_json().unwrap();
+        assert_eq!(json["quic_sent_packets"], 1000, "the peek did not reset");
+        assert_eq!(json["quic_lost_packets"], 7);
+        assert_eq!(json["quic_lost_bytes"], 8400);
+        assert_eq!(json["quic_congestion_events"], 3);
+        assert_eq!(json["quic_loss_rate_lt_1pct"], 1);
+        assert_eq!(json["quic_loss_rate_zero"], 0, "a gauge of 0 is sent");
+        assert!(
+            json.get("quic_ended_loss_rate_zero").is_none(),
+            "a count of 0 is not"
+        );
+        assert!(json.get("quic_ended_paths_below_floor").is_none());
+        assert!(
+            metrics.take_snapshot().is_none(),
+            "the sums were reset, and the bucket alone is not activity"
+        );
+        assert_eq!(metrics.read_snapshot().quic_data.loss_rate[2], 1, "a gauge");
+        // A path that ends below the floor reaches the JSON by its own key.
+        drop(PathLossWindow::new(&metrics.quic_data));
+        let json = metrics
+            .take_snapshot()
+            .expect("an ended path is activity")
+            .upload_json()
+            .unwrap();
+        assert_eq!(json["quic_ended_paths_below_floor"], 1);
     }
 
     /// A breaker trip reaches the snapshot and its JSON, counts as activity

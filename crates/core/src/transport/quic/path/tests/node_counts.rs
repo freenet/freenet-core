@@ -74,6 +74,10 @@ fn a_paths_sends_and_receives_reach_the_node() {
         assert_eq!(keys["quic_open_uni_waited"], 0);
         assert!(keys["quic_bytes_sent"] > 0);
         assert!(keys["quic_bytes_received"] > 0);
+        assert!(
+            keys["quic_sent_packets"] > 0,
+            "quinn's path counts reach the node"
+        );
         assert_eq!(keys["quic_streams_sampled_paths"], 1, "only b read streams");
     });
 }
