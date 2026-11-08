@@ -622,28 +622,37 @@ impl QuicUpgrades {
     /// bucket and the share now (`slice`).
     #[cfg(any(test, feature = "testing"))]
     fn share_note(&self, peer: &TransportPublicKey, caps: u32) -> String {
-        let share = self
-            .trace
-            .as_ref()
-            .and_then(|t| t.data_ramp_start())
-            .map_or(self.policy.share(), |start_unix_secs| {
-                super::policy::DataShare::Ramp { start_unix_secs }
-            });
+        let (share, now) = self
+            .trace_ramp()
+            .unwrap_or((self.policy.share(), self.path_clock.wall_now()));
         format!(
             "data share: bucket {}, percent {}, caps {caps}",
             super::slice::bucket(&self.local_key, peer),
-            share.percent_at(self.path_clock.wall_now()),
+            share.percent_at(now),
         )
     }
 
+    /// The ramp a test's trace gives, and the wall clock now to read it at. A
+    /// start before the epoch (one before the run began, on the virtual wall
+    /// clock) moves both forward by the same amount: the share reads only the
+    /// time since the start.
+    #[cfg(any(test, feature = "testing"))]
+    fn trace_ramp(&self) -> Option<(super::policy::DataShare, std::time::SystemTime)> {
+        let start = self.trace.as_ref()?.data_ramp_start()?;
+        let shift = Duration::from_secs(start.min(0).unsigned_abs());
+        let share = super::policy::DataShare::Ramp {
+            start_unix_secs: start.max(0).unsigned_abs(),
+        };
+        Some((share, self.path_clock.wall_now() + shift))
+    }
+
     fn own_caps(&self, peer: &TransportPublicKey) -> u32 {
-        let now = self.path_clock.wall_now();
         #[cfg(any(test, feature = "testing"))]
-        if let Some(start_unix_secs) = self.trace.as_ref().and_then(|t| t.data_ramp_start()) {
-            let share = super::policy::DataShare::Ramp { start_unix_secs };
+        if let Some((share, now)) = self.trace_ramp() {
             return self.policy.own_caps_with(share, &self.local_key, peer, now);
         }
-        self.policy.own_caps(&self.local_key, peer, now)
+        self.policy
+            .own_caps(&self.local_key, peer, self.path_clock.wall_now())
     }
 
     fn file_seed(&self, key: &TransportPublicKey, session: u64, seed: BackoffSeed) {

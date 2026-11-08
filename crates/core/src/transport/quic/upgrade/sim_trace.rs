@@ -47,8 +47,9 @@ struct TraceData {
     connections: Mutex<BTreeMap<SocketAddr, usize>>,
     /// Nodes that receive an extra Initial each time they allow a peer.
     initial_on_attempt: Mutex<BTreeSet<SocketAddr>>,
-    /// A data ramp start of the test's own, in seconds on the virtual clock.
-    ramp_start: Mutex<Option<u64>>,
+    /// A data ramp start of the test's own, in seconds on the virtual clock;
+    /// negative for one before the run began.
+    ramp_start: Mutex<Option<i64>>,
     /// Nodes that build their paths to refuse data while they advertise the bit.
     refuse_data: Mutex<BTreeSet<SocketAddr>>,
     /// The version a peer reports, and the release it then reads as.
@@ -124,11 +125,13 @@ impl QuicUpgradeTrace {
         self.data.initial_on_attempt.lock().insert(node);
     }
 
-    /// Every node with no `quic-data-percent` ramps its data share from `start`
-    /// seconds of virtual time (`slice::ramp_percent`), in place of the release's
-    /// `QUIC_DATA_RAMP_START`.
-    pub fn ramp_data_from(&self, start: Duration) {
-        *self.data.ramp_start.lock() = Some(start.as_secs());
+    /// Every node with no `quic-data-percent` ramps its data share
+    /// (`slice::ramp_percent`) from a start `ago` before the run began (zero:
+    /// from the run's start), in place of the release's
+    /// `QUIC_DATA_RAMP_START`, so a short run can cover any part of the ramp
+    /// on the real curve.
+    pub fn ramp_data_started_before(&self, ago: Duration) {
+        *self.data.ramp_start.lock() = Some(-i64::try_from(ago.as_secs()).unwrap_or(i64::MAX));
     }
 
     /// `node` advertises its data bit but builds every path to refuse data, as a
@@ -229,7 +232,7 @@ impl NodeTrace {
         }
     }
 
-    pub(crate) fn data_ramp_start(&self) -> Option<u64> {
+    pub(crate) fn data_ramp_start(&self) -> Option<i64> {
         *self.trace.data.ramp_start.lock()
     }
 
