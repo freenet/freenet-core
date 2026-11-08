@@ -1161,8 +1161,11 @@ impl Runtime {
     /// [`SecretsStore::migrate_secrets`] for the full contract (Local-only DEK
     /// carve-out, no-delete invariant, one-shot / anti-resurrection marker).
     ///
-    /// Runs ON the contract loop (serialized with delegate `store_secret`),
-    /// mirroring the on-loop write discipline of `import_secret_bundle`.
+    /// Must run serialized with delegate `store_secret`, as
+    /// `import_secret_bundle` does. That used to mean "on the contract loop";
+    /// since the delegate lane it means "under the delegate executor's lock"
+    /// (`PooledDelegateRunner`), which every delegate run and the live import
+    /// take. Re-wiring this must go through that lock too.
     ///
     /// HAS NO CALLER as of GHSA-824h-7x5x-wfmf. Its only one was the
     /// `DelegateRequest::RegisterDelegateWithPredecessors` handler in

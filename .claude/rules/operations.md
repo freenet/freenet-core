@@ -224,6 +224,22 @@ starve NetworkRelay/Background — but that is a backstop, not a license to
 mis-tag.
 ```
 
+**Exception: client `DelegateRequest`s (the delegate lane, #6144).** Once
+`contract_handling` has started a delegate lane (`contract/delegate_lane.rs`;
+production always does), `ContractHandlerChannel::send_to_handler` hands a
+`DelegateRequest` to the lane's intake with `try_send` instead of the loop's
+fair queue, so its `Priority` is dropped and neither `CLIENT_LOCAL_RESERVE`
+nor Background shedding applies to it. Its bounds are the lane's own: a
+128-slot intake (`LANE_INTAKE_CAPACITY`; full means refused at once), a
+256-request queue (`LANE_QUEUE_CAPACITY`), and at most
+`MAX_PENDING_PER_DELEGATE` (8) queued requests for a PARKED delegate. There is
+no per-client fairness inside the lane. Keep tagging `DelegateRequest`
+ClientLocal at the send site anyway: the tag still applies when no lane is
+running (tests, or after the lane's intake closes), when the request falls
+back to the loop. Work the lane hands back to the loop (`LaneUnit`s) runs at
+the TOP of each loop iteration, ahead of the fair queue, at most
+`MAX_RESUME_DRAIN_BATCH` (16) per iteration.
+
 ## Critical Invariant: Initialize-Before-Send
 
 ```
