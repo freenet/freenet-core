@@ -3410,22 +3410,20 @@ where
         let (intake_tx, intake_rx) =
             tokio::sync::mpsc::channel(delegate_lane::LANE_INTAKE_CAPACITY);
         let lane_gate = gate.clone();
+        let forward: std::sync::Arc<dyn delegate_lane::LoopForward> =
+            std::sync::Arc::new(contract_handler.channel().loop_forwarder());
         // A block, so the chokepoint pin's spawn scan can read the body: it
         // runs delegates only through `runner`, never through the handler.
         let handle = GlobalExecutor::spawn(async move {
-            delegate_lane::run_lane(runner, lane_gate, intake_rx).await;
+            delegate_lane::run_lane(runner, lane_gate, forward, intake_rx).await;
         });
         let mut abort = crate::util::AbortOnDrop::new();
         abort.push(handle.abort_handle());
-        // The SAME RAM figure the park registry read, so the carve adds up.
-        let host_ram = park_ctx.host_ram();
         contract_handler
             .channel()
             .install_delegate_lane(handler::DelegateLaneIntake {
                 tx: intake_tx,
-                bytes: delegate_lane::LaneBytes::new(delegate_lane::lane_bytes_budget_for(
-                    host_ram,
-                )),
+                gate: gate.clone(),
             });
         park_ctx.set_gate(gate.clone());
         // The abort guard rides with the gate for the loop's lifetime.
@@ -3434,8 +3432,7 @@ where
 
     loop {
         // Work the delegate lane handed over: the rest of a round-trip whose
-        // output needs this loop, or a request the lane does not run. Each is
-        // a full delegate run, so bounded per iteration like the resumes
+        // output needs this loop. Each is a full delegate run, so bounded per iteration like the resumes
         // below. Ahead of new queued work for the same reason as resumes: a
         // client is waiting on it and the delegate is held for it. What is
         // left over when the batch runs out is picked up by the
@@ -3543,14 +3540,16 @@ where
         // in the 105:
         //
         //  * The drain at the TOP of this iteration runs at most
-        //    `MAX_LANE_UNITS_PER_ITERATION` (4) units. Each is one client
-        //    request's round-trip (the lane already made its first `process()`
-        //    call) or a forwarded registration. Smaller than the resume batch
-        //    because units are refilled by client traffic rather than by
-        //    parks: a steady stream of them gets at most 4 round-trips per
-        //    fair-queue event. The supply is bounded by the lane's queue
-        //    (`LANE_QUEUE_CAPACITY`) and the gate (at most one unit per
-        //    delegate).
+        //    `MAX_LANE_UNITS_PER_ITERATION` (4) units. Each is the rest of one
+        //    client request's round-trip (the lane already made its first
+        //    `process()` call). Smaller than the resume batch because units
+        //    are refilled by client traffic rather than by parks: a steady
+        //    stream of them gets at most 4 round-trips per fair-queue event.
+        //    At most `delegate_lane::MAX_PENDING_UNITS` (16) exist at once
+        //    and at most one per delegate: the lane checks the bound before
+        //    it starts a run, and forwards to the fair queue instead.
+        //    (Requests the lane forwards are ordinary fair-queue events, not
+        //    units, and are counted by the fair queue.)
         //  * `claim_delegate` runs the claimed delegate's pending unit before
         //    the run it was called for, inside every loop entry that claims
         //    (notification, lifecycle, resume, the client-arm fallback), so
@@ -3563,8 +3562,7 @@ where
         //    and a round-trip may message many targets, so one iteration can
         //    run as many nested units as there are delegates with a pending
         //    unit that it messages. That is bounded by the units in existence
-        //    (at most one per delegate, drawn from the lane's bounded queue),
-        //    not by a per-iteration constant.
+        //    (`MAX_PENDING_UNITS`), not by a per-iteration constant.
         //
         // `the_sweep_budget_admits_one_maximal_victim_past_the_limit` pins the
         // boundary, which the original test could not see because its victims
@@ -4642,6 +4640,10 @@ async fn send_queue_full_response(
         event = %rejected.event,
         "Rejected event due to per-contract queue capacity limit"
     );
+    // A delegate request the delegate lane forwarded is finished here too:
+    // release its loop-owned mark, or the lane would send every later request
+    // for that delegate to the loop for good (`delegate_lane`).
+    drop(channel.take_forwarded_delegate(rejected.id.id));
     // Typed `ContractQueueFull` marker powers `is_contract_queue_full` at
     // every caller; the UPDATE relay drivers gate amplification on it. #4251.
     let make_err = || ExecutorError::other(ContractQueueFull);
@@ -5697,9 +5699,9 @@ where
     Some(claim)
 }
 
-/// Run work the delegate lane handed to the loop: a request it forwarded
-/// (registration, unregistration, a forged node-only inbound message) or the
-/// rest of a round-trip whose first `process()` call it already made. The
+/// Run work the delegate lane handed to the loop: the rest of a round-trip
+/// whose first `process()` call it already made. (Requests the lane does not
+/// run reach the loop as ordinary `DelegateRequest` events instead.) The
 /// caller holds the delegate's claim.
 async fn run_lane_unit<CH, P>(
     contract_handler: &mut CH,
@@ -5719,8 +5721,6 @@ async fn run_lane_unit<CH, P>(
         connection_scope,
         user_context,
         first_values,
-        // Released here: the loop has taken the unit.
-        charge: _,
     } = unit;
     // Into the loop's own waiting-response map, so every answer below takes
     // the path an event received from the channel takes, including being
@@ -5737,7 +5737,7 @@ async fn run_lane_unit<CH, P>(
         origin_contract,
         connection_scope,
         user_context,
-        first_values,
+        Some(first_values),
     )
     .await;
 }
@@ -6981,9 +6981,17 @@ where
                 "Processing delegate request"
             );
 
-            // Reached with a delegate lane running only if the lane's intake
-            // closed (the request then falls back to the loop); claim the
-            // delegate all the same so the lane cannot be inside it.
+            // With a delegate lane running, this is reached by every request
+            // the lane FORWARDED (its delegate was busy, the lane was at its
+            // unit bound, or it is a registration/unregistration/forged
+            // inbound), and by any request sent while the lane's intake was
+            // closed. Hold the lane's loop-owned mark for a forwarded one
+            // until this arm is done, so later requests for the delegate
+            // keep following it instead of overtaking it on the lane
+            // (`delegate_lane`). If the run parks or queues behind a park,
+            // the park's own claim takes over from here.
+            let _loop_owned = contract_handler.channel().take_forwarded_delegate(id.id);
+            // Claim the delegate so the lane cannot be inside it.
             let mut park = park;
             let _claim = match park.as_deref_mut() {
                 Some(park) => claim_delegate(contract_handler, park, prompter, &delegate_key).await,
@@ -8535,20 +8543,27 @@ mod tests {
             "`with_executor` must take the delegate executor's lock"
         );
         // A panic out of `f` skips the post-call health check, so the next
-        // call must replace a suspect executor BEFORE running on it.
+        // call must replace a suspect executor BEFORE running on it, and must
+        // not run at all if that replacement failed.
+        assert!(
+            with_executor.contains("run_guarded(") && with_executor.contains("&self.suspect"),
+            "`with_executor` must run through `run_guarded`: {with_executor}"
+        );
+        let guarded = fn_region(&pool, "pub(crate) async fn run_guarded<");
         let at = |needle: &str| {
-            with_executor
+            guarded
                 .find(needle)
-                .unwrap_or_else(|| panic!("`with_executor` must contain `{needle}`"))
+                .unwrap_or_else(|| panic!("`run_guarded` must contain `{needle}`"))
         };
         assert!(
-            at("self.suspect.is_set()") < at("f(&mut executor)")
-                && at(".recover(") < at("f(&mut executor)")
-                && at("self.suspect.begin()") < at("f(&mut executor)")
-                && at("call.done()") > at("f(&mut executor)"),
-            "`with_executor` must replace an executor whose last call panicked \
-             before running on it, arm the mark before the call and disarm it \
-             after: {with_executor}"
+            at("suspect.is_set()") < at("f(executor)")
+                && at(".recover(") < at("f(executor)")
+                && at("return None;") < at("f(executor)")
+                && at("suspect.begin()") < at("f(executor)")
+                && at("call.done()") > at("f(executor)"),
+            "`run_guarded` must replace an executor whose last call panicked \
+             before running on it, refuse the call if that failed, arm the mark \
+             before the call and disarm it after: {guarded}"
         );
 
         // 2.
@@ -12416,84 +12431,6 @@ mod hol_4391_tests {
         handle.abort();
     }
 
-    /// One PARKED delegate flooded with requests does not take the lane from
-    /// every other delegate: past `MAX_PENDING_PER_DELEGATE` its requests are
-    /// refused at once (as the park's own queue refused them before the
-    /// lane), and a request to another delegate is still answered.
-    ///
-    /// The flood is sized to fill the lane's queue AND its intake, which is
-    /// what refused every delegate on the node before the cap.
-    ///
-    /// FALSIFY: remove the parked-delegate refusal in `delegate_lane::prune`;
-    /// the refusals never reach `flood - MAX_PENDING_PER_DELEGATE` and E is
-    /// refused.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_parked_delegate_flooded_past_its_cap_does_not_block_other_delegates() {
-        use delegate_park::MAX_PENDING_PER_DELEGATE;
-        let _guard = TEST_GUARD.lock().await;
-        let (mut handler, send) = build_handler(vec![]).await;
-        handler.runtime_mut().enable_delegate_lane();
-        let script = handler.runtime_mut().delegate_script.clone();
-        script.lock().unwrap().push_back(prompt_outbound().into());
-        script.lock().unwrap().push_back(ScriptedRun {
-            outbound: vec![app_out(b"e")],
-            writes_context: None,
-        });
-        let prompter = ObservedGatedPrompter::default();
-        let handle = GlobalExecutor::spawn(contract_handling(handler, prompter.clone()));
-        let send = Arc::new(send);
-        let d = test_delegate_key();
-        let e = delegate_key_n(0x62);
-
-        let (s, k) = (send.clone(), d.clone());
-        let _parked =
-            GlobalExecutor::spawn(async move { s.send_to_handler(delegate_event(&k)).await });
-        let shown = prompter.shown.clone();
-        wait_until("D to park on its prompt", || {
-            shown.load(std::sync::atomic::Ordering::SeqCst) == 1
-        })
-        .await;
-
-        let flood = delegate_lane::LANE_QUEUE_CAPACITY
-            + delegate_lane::LANE_INTAKE_CAPACITY
-            + MAX_PENDING_PER_DELEGATE;
-        let refused = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let mut waiting = Vec::with_capacity(flood);
-        for _ in 0..flood {
-            let (s, k, r) = (send.clone(), d.clone(), refused.clone());
-            waiting.push(GlobalExecutor::spawn(async move {
-                if s.send_to_handler(delegate_event(&k)).await.is_err() {
-                    r.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                }
-            }));
-        }
-        let probe = refused.clone();
-        wait_until(
-            "every request past the parked delegate's cap to be refused",
-            || probe.load(std::sync::atomic::Ordering::SeqCst) == flood - MAX_PENDING_PER_DELEGATE,
-        )
-        .await;
-
-        let response = tokio::time::timeout(
-            Duration::from_secs(5),
-            send.send_to_handler(delegate_event(&e)),
-        )
-        .await
-        .expect("a request to another delegate must not wait for D's park")
-        .expect("a request to another delegate must not be refused");
-        assert_eq!(app_payloads(&response), vec![b"e".to_vec()]);
-        assert_eq!(
-            refused.load(std::sync::atomic::Ordering::SeqCst),
-            flood - MAX_PENDING_PER_DELEGATE,
-            "exactly the parked delegate's cap stays queued"
-        );
-        prompter.release.add_permits(1);
-        handle.abort();
-        for w in waiting {
-            w.abort();
-        }
-    }
-
     /// Units the lane hands over are not stranded when more arrive than the
     /// loop drains per iteration. `units_ready` stores ONE permit however
     /// many units are pushed, so without the `has_pending_unit` guard before
@@ -12515,7 +12452,10 @@ mod hol_4391_tests {
         .await;
         let _release = ReleaseOnDrop(gate.clone());
         let (script, calls) = handles.unwrap();
-        let n = 2 * MAX_RESUME_DRAIN_BATCH + 8;
+        // Every unit the lane may hold at once: more than two drain batches
+        // (`MAX_LANE_UNITS_PER_ITERATION` each) while the loop is held.
+        let n = delegate_lane::MAX_PENDING_UNITS;
+        assert!(n > 2 * MAX_LANE_UNITS_PER_ITERATION);
         let sink = delegate_key_n(0x70);
         let keys: Vec<DelegateKey> = (0..n).map(|i| delegate_key_n(0x80 + i as u8)).collect();
         {
@@ -12637,17 +12577,24 @@ mod hol_4391_tests {
 
     /// A delegate run the LOOP starts (here a contract notification, a
     /// two-leg round-trip) is not interleaved with a lane run of the same
-    /// delegate: the lane request waits for the whole round-trip, because the
-    /// notification path claims the delegate (`claim_delegate`). The
-    /// round-trip is held BETWEEN its two `process()` calls, with the
-    /// delegate runner's lock released, so only the gate can stop the lane.
+    /// delegate: a lane request arriving mid-round-trip is FORWARDED to the
+    /// loop instead of run, because the notification path claims the
+    /// delegate (`claim_delegate`). The round-trip is held BETWEEN its two
+    /// `process()` calls, with the delegate runner's lock released, so only
+    /// the gate can stop the lane.
     ///
     /// FALSIFY: in `handle_delegate_notification`, replace the
-    /// `claim_delegate(..)` call with `None`; the lane request runs between
-    /// the notification's two legs.
+    /// `claim_delegate(..)` call with `None`; the lane runs the request
+    /// between the notification's two legs instead of forwarding it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_lane_request_does_not_run_inside_a_loop_notification_round_trip() {
-        use crate::contract::delegate_lane::{DelegateRunner, LaneRequest};
+        use crate::contract::delegate_lane::{DelegateRunner, LaneRequest, LoopForward};
+        struct Collect(tokio::sync::mpsc::UnboundedSender<LaneRequest>);
+        impl LoopForward for Collect {
+            fn forward(&self, request: LaneRequest) {
+                self.0.send(request).expect("test receiver alive");
+            }
+        }
         let _guard = TEST_GUARD.lock().await;
         let (mut handler, _send) = build_handler(vec![]).await;
         handler.runtime_mut().enable_delegate_lane();
@@ -12679,7 +12626,13 @@ mod hol_4391_tests {
         let mut park = delegate_park::DelegateParkCtx::new(resume_tx);
         park.set_gate(gate.clone());
         let (intake_tx, intake_rx) = tokio::sync::mpsc::channel(8);
-        let lane = GlobalExecutor::spawn(delegate_lane::run_lane(runner, gate, intake_rx));
+        let (forward_tx, mut forwarded) = tokio::sync::mpsc::unbounded_channel();
+        let lane = GlobalExecutor::spawn(delegate_lane::run_lane(
+            runner,
+            gate,
+            Arc::new(Collect(forward_tx)),
+            intake_rx,
+        ));
 
         let k = key.clone();
         let notification = GlobalExecutor::spawn(async move {
@@ -12698,7 +12651,7 @@ mod hol_4391_tests {
         })
         .await;
 
-        let (responder, mut answer) = tokio::sync::oneshot::channel();
+        let (responder, _answer) = tokio::sync::oneshot::channel();
         intake_tx
             .send(LaneRequest {
                 id: 1,
@@ -12713,28 +12666,21 @@ mod hol_4391_tests {
                 origin_contract: None,
                 connection_scope: crate::client_events::ConnectionScope::Local,
                 user_context: None,
-                charge: Default::default(),
+                priority: fair_queue::Priority::ClientLocal,
             })
             .await
             .expect("lane is up");
-        // Negative assertion: a sleep by necessity.
-        assert!(
-            tokio::time::timeout(Duration::from_millis(400), &mut answer)
-                .await
-                .is_err(),
-            "the lane must not answer while the notification round-trip holds the delegate"
-        );
+        let sent_on = tokio::time::timeout(Duration::from_secs(5), forwarded.recv())
+            .await
+            .expect("the lane must forward the request, not run it, mid-round-trip")
+            .expect("forwarder open");
+        assert_eq!(sent_on.id, 1);
 
         pause.release.add_permits(1);
         tokio::time::timeout(Duration::from_secs(5), notification)
             .await
             .expect("the notification run completes")
             .expect("join");
-        let (_, response) = tokio::time::timeout(Duration::from_secs(5), answer)
-            .await
-            .expect("the lane request runs once the delegate is free")
-            .expect("answered");
-        assert_eq!(app_payloads(&response), vec![b"lane".to_vec()]);
         let kinds: Vec<Vec<&'static str>> = observations
             .lock()
             .unwrap()
@@ -12743,12 +12689,8 @@ mod hol_4391_tests {
             .collect();
         assert_eq!(
             kinds,
-            vec![
-                vec!["ContractNotification"],
-                Vec::new(),
-                vec!["ApplicationMessage"],
-            ],
-            "the lane run must come after BOTH legs of the notification round-trip"
+            vec![vec!["ContractNotification"], Vec::new()],
+            "nothing ran between (or after) the notification's two legs on the lane"
         );
         lane.abort();
     }
@@ -12777,8 +12719,7 @@ mod hol_4391_tests {
                 origin_contract: None,
                 connection_scope: crate::client_events::ConnectionScope::Local,
                 user_context: None,
-                first_values: Some(first_values),
-                charge: Default::default(),
+                first_values,
             },
             rx,
         )
@@ -12943,139 +12884,12 @@ mod hol_4391_tests {
         assert_eq!(left.key, x);
     }
 
-    /// Many PARKED delegates, each at its per-key cap, plus a busy delegate
-    /// flooded with requests, cannot take the lane from other delegates:
-    /// blocked requests are capped in TOTAL (`MAX_BLOCKED_QUEUED`), the excess
-    /// is refused at once, and a request to a free delegate is still answered
-    /// on the lane while the loop is held in contract WASM.
-    ///
-    /// Sized so that WITHOUT the total cap the parked keys alone keep more
-    /// than `LANE_QUEUE_CAPACITY` requests: the lane then stops reading and
-    /// the free delegate's request is refused.
-    ///
-    /// FALSIFY: drop `|| blocked_total >= MAX_BLOCKED_QUEUED` in
-    /// `delegate_lane::prune`; the refusals never reach the expected count and
-    /// the free delegate's request is refused.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn many_parked_delegates_and_a_busy_one_cannot_lock_the_lane() {
-        use delegate_park::MAX_PENDING_PER_DELEGATE;
-        let _guard = TEST_GUARD.lock().await;
-        let parked = delegate_lane::LANE_QUEUE_CAPACITY / MAX_PENDING_PER_DELEGATE + 1;
-        let blocking = make_contract(b"lane_lockout_blocking_contract");
-        let hold = Arc::new(crate::contract::executor::mock_wasm_runtime::BlockingGate::default());
-        let (mut handler, send) = build_handler(vec![(
-            *blocking.key().id(),
-            ValidateOverride::Block(hold.clone()),
-        )])
-        .await;
-        let _release = ReleaseOnDrop(hold.clone());
-        handler.runtime_mut().enable_delegate_lane();
-        let calls = handler.runtime_mut().delegate_calls.clone();
-        let parked_keys: Vec<DelegateKey> = (0..parked)
-            .map(|i| delegate_key_n(0x10 + i as u8))
-            .collect();
-        let busy = delegate_key_n(0xF0);
-        let free = delegate_key_n(0xF1);
-        {
-            let script = handler.runtime_mut().delegate_script.clone();
-            let mut script = script.lock().unwrap();
-            for _ in &parked_keys {
-                script.push_back(prompt_outbound().into());
-            }
-            script.push_back(vec![send_to(&delegate_key_n(0xF2), &busy)].into());
-            script.push_back(ScriptedRun {
-                outbound: vec![app_out(b"free")],
-                writes_context: None,
-            });
-        }
-        let prompter = ObservedGatedPrompter::default();
-        let handle = GlobalExecutor::spawn(contract_handling(handler, prompter.clone()));
-        let send = Arc::new(send);
-        let mut waiting = Vec::new();
-        for k in parked_keys.clone() {
-            let s = send.clone();
-            waiting.push(GlobalExecutor::spawn(async move {
-                s.send_to_handler(delegate_event(&k)).await
-            }));
-        }
-        let shown = prompter.shown.clone();
-        wait_until("every parked delegate to park on its prompt", || {
-            shown.load(std::sync::atomic::Ordering::SeqCst) == parked
-        })
-        .await;
-
-        // Hold the loop, then give the busy delegate a round-trip the loop
-        // cannot drain.
-        let s = send.clone();
-        let put = GlobalExecutor::spawn(async move {
-            s.send_to_handler(ContractHandlerEvent::PutQuery {
-                key: blocking.key(),
-                state: WrappedState::new(b"s".to_vec()),
-                related_contracts: RelatedContracts::default(),
-                contract: Some(blocking),
-            })
-            .await
-        });
-        let probe = hold.clone();
-        wait_until("the loop to be held in contract WASM", || probe.entered()).await;
-        let (s, k) = (send.clone(), busy.clone());
-        waiting.push(GlobalExecutor::spawn(async move {
-            s.send_to_handler(delegate_event(&k)).await
-        }));
-        let probe = calls.clone();
-        wait_until("the busy delegate's first leg to hand off", || {
-            probe.lock().unwrap().len() == parked + 1
-        })
-        .await;
-
-        let busy_flood = 2 * delegate_lane::MAX_QUEUED_PER_BUSY_DELEGATE;
-        let flood = parked * MAX_PENDING_PER_DELEGATE + busy_flood;
-        let refused = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let targets = parked_keys
-            .iter()
-            .flat_map(|k| std::iter::repeat_n(k.clone(), MAX_PENDING_PER_DELEGATE))
-            .chain(std::iter::repeat_n(busy.clone(), busy_flood));
-        for k in targets {
-            let (s, r) = (send.clone(), refused.clone());
-            waiting.push(GlobalExecutor::spawn(async move {
-                if s.send_to_handler(delegate_event(&k)).await.is_err() {
-                    r.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                }
-                Ok::<_, ContractError>(ContractHandlerEvent::DelegateResponse(Ok(Vec::new())))
-            }));
-        }
-        let probe = refused.clone();
-        wait_until(
-            "every blocked request past the total cap to be refused",
-            || {
-                probe.load(std::sync::atomic::Ordering::SeqCst)
-                    == flood - delegate_lane::MAX_BLOCKED_QUEUED
-            },
-        )
-        .await;
-
-        let response = tokio::time::timeout(
-            Duration::from_secs(5),
-            send.send_to_handler(delegate_event(&free)),
-        )
-        .await
-        .expect("a free delegate's request must not wait")
-        .expect("a free delegate's request must not be refused");
-        assert_eq!(app_payloads(&response), vec![b"free".to_vec()]);
-        assert!(!put.is_finished(), "the loop was held throughout");
-        hold.release();
-        prompter.release.add_permits(parked);
-        handle.abort();
-        for w in waiting {
-            w.abort();
-        }
-    }
-
     /// Lane units cannot starve fair-queue contract work: with many units
     /// pending, the loop runs at most `MAX_LANE_UNITS_PER_ITERATION` of them
     /// before the next fair-queue event.
     ///
-    /// Shape: the loop is held in one contract's validate while 40 delegates
+    /// Shape: the loop is held in one contract's validate while
+    /// `MAX_PENDING_UNITS` (16) delegates
     /// hand off a round-trip each; a second PUT (whose validate also blocks)
     /// is queued. When the first is released, the loop drains units, then
     /// pops the second PUT and blocks in its validate, so the number of units
@@ -13105,7 +12919,7 @@ mod hol_4391_tests {
         let _release = ReleaseOnDrop(gate.clone());
         let _release2 = ReleaseOnDrop(second_gate.clone());
         let (script, calls) = handles.unwrap();
-        let n = 40;
+        let n = delegate_lane::MAX_PENDING_UNITS;
         let sink = delegate_key_n(0x6F);
         let keys: Vec<DelegateKey> = (0..n).map(|i| delegate_key_n(0x20 + i as u8)).collect();
         {

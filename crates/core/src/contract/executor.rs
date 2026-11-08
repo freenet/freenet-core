@@ -1798,11 +1798,7 @@ pub(crate) fn declared_cache_ceiling_terms(
     #[cfg(not(feature = "redb"))]
     let page_cache = 0;
     // The delegate park registry's node-wide retention cap (#5544 S4). One per
-    // node, so NOT multiplied by the pool. With a delegate lane running it is
-    // SPLIT, not added to: the lane's queued-request byte budget
-    // (`delegate_lane::lane_bytes_budget_for`) is carved out of it
-    // (`DelegateParkCtx::set_gate`), so this one term covers both. Pinned by
-    // `the_delegate_lane_byte_budget_is_carved_from_the_park_budget`.
+    // node, so NOT multiplied by the pool.
     //
     // Missing from this sum until the #5554 follow-up. At the time
     // `ring::hosting::cache::resident_overhead_budget_for` derived the hosting
@@ -2757,12 +2753,6 @@ mod tests {
                 "contract_arena_envelope",
                 "consumed inside store_arena_budget_for (the RAM share less the \
                  delegate executor's fixed arena), which is summed",
-            ),
-            (
-                "lane_bytes_budget_for",
-                "carved OUT of parked_budget_for, which is summed: \
-                 DelegateParkCtx::set_gate lowers the park registry's own budget by \
-                 it, pinned by the_delegate_lane_byte_budget_is_carved_from_the_park_budget",
             ),
             ("MAX_PARKED_BYTES", "clamp inside parked_budget_for"),
             ("MIN_PARKED_BYTES", "clamp inside parked_budget_for"),

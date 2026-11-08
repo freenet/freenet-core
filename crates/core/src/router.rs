@@ -761,8 +761,9 @@ pub(crate) struct RouterSnapshotInfo {
     /// populated them.
     pub hosting_retractions_emitted: Option<u64>,
     pub hosting_retractions_dropped: Option<u64>,
-    /// Delegate lane refusals, lane panics and dropped inter-delegate
-    /// messages (`network_status::DelegateLaneStats`). Monotonic lifetime
+    /// Delegate lane refusals (full intake), lane panics and dropped
+    /// inter-delegate messages (`network_status::delegate_lane_counts`).
+    /// Monotonic lifetime
     /// totals; `None` until the ring's snapshot task has populated them.
     pub delegate_lane_requests_refused: Option<u64>,
     pub delegate_lane_panics: Option<u64>,

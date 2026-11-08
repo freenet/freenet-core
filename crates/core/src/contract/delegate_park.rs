@@ -46,9 +46,9 @@
 //! [`DelegateParkCtx`] therefore keeps its own per-delegate exclusion: while a
 //! delegate is parked, further requests for it are QUEUED rather than run, and
 //! drained when it resumes. With a delegate lane running, a parked delegate's
-//! CLIENT requests mostly never reach this queue: they wait in the lane's own
-//! queue (the park's gate claim keeps the lane off the delegate), under the
-//! same [`MAX_PENDING_PER_DELEGATE`] cap (`delegate_lane::prune`). That preserves the invariant the delegate author
+//! client requests still arrive here: the park's gate claim keeps the lane
+//! off the delegate, so the lane forwards them to the loop's ordinary path.
+//! That preserves the invariant the delegate author
 //! already relies on, and converts a node-wide stall into a per-delegate one —
 //! which is the correct semantics, not a compromise. Everything else on the
 //! node keeps running.
@@ -90,7 +90,7 @@
 //!
 //! ```text
 //! contract_handling
-//!   ├─ run_lane_unit (lane hand-offs) ─► dispatch_delegate_request ─┐
+//!   ├─ run_lane_unit (lane continuations) ─► dispatch_delegate_request ─┐
 //!   ├─ handle_contract_event ─────────► dispatch_delegate_request ──┤
 //!   ├─ handle_delegate_notification ─────────────────────────────────┤
 //!   ├─ run_lifecycle ────────────────────────────────────────────────┤
@@ -297,13 +297,9 @@ pub(super) fn parked_budget_for(total_ram: usize) -> usize {
 /// because no other test's stub returns a state large enough to reach the
 /// refusal branch, which was a fact about the tests that happened to exist,
 /// written in a comment. `OverrideGuard::install` now checks it against this.
-///
-/// The smallest registry budget is at the floor WITH a delegate lane running,
-/// which carves its share out (`DelegateParkCtx::set_gate`); `0` bytes of RAM
-/// lands every RAM-scaled term on its floor.
 #[cfg(test)]
 pub(super) fn min_upsert_fetch_allowance() -> ByteCount {
-    upsert_fetch_allowance(parked_budget_for(0) - super::delegate_lane::lane_bytes_budget_for(0))
+    upsert_fetch_allowance(MIN_PARKED_BYTES)
 }
 
 /// Bytes ONE deferred upsert's off-loop related-contract fetch may RETAIN.
@@ -1829,20 +1825,8 @@ impl DelegateParkCtx {
 
     /// Share `gate` with the delegate lane. Called once by `contract_handling`
     /// when it starts a lane.
-    ///
-    /// Also hands the lane its byte budget OUT OF this registry's: with a lane
-    /// running, client requests for a parked delegate wait in the lane's queue
-    /// (`delegate_lane::prune`), not in this registry's pending queues, so the
-    /// bytes they used to be charged here are now charged there
-    /// (`delegate_lane::lane_bytes_budget_for`). The node's total stays
-    /// `parked_budget_for`, the figure `declared_cache_ceiling` sums. The
-    /// per-upsert fetch allowance follows the carved budget (it is derived
-    /// from `self.budget`), so "four fully-fetching parks fill the budget"
-    /// still holds of the budget the registry actually has.
     pub(super) fn set_gate(&mut self, gate: std::sync::Arc<super::delegate_lane::DelegateGate>) {
         self.gate = Some(gate);
-        self.budget = parked_budget_for(self.host_ram)
-            - super::delegate_lane::lane_bytes_budget_for(self.host_ram);
     }
 
     /// The gate shared with the delegate lane, if one is running.
@@ -1896,13 +1880,6 @@ impl DelegateParkCtx {
     /// this node. See [`upsert_fetch_allowance`].
     pub(super) fn upsert_fetch_allowance(&self) -> ByteCount {
         upsert_fetch_allowance(self.budget)
-    }
-
-    /// The host RAM this registry sized itself from, read once at
-    /// construction. The delegate lane sizes its byte budget from the SAME
-    /// figure, so the carve in [`Self::set_gate`] adds up exactly.
-    pub(super) fn host_ram(&self) -> usize {
-        self.host_ram
     }
 
     pub(super) fn resume_tx(&self) -> &tokio::sync::mpsc::UnboundedSender<DelegateResume> {
@@ -2417,38 +2394,6 @@ fn resume_in_hand(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// With a delegate lane, the lane's byte budget is carved OUT of the park
-    /// registry's, so the node total stays `parked_budget_for`, the one term
-    /// `declared_cache_ceiling` sums; the per-upsert fetch allowance keeps
-    /// following the carved budget.
-    ///
-    /// FALSIFY: drop the budget reduction in `set_gate`; the two budgets
-    /// together exceed `parked_budget_for`.
-    #[test]
-    fn the_delegate_lane_byte_budget_is_carved_from_the_park_budget() {
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut ctx = DelegateParkCtx::new(tx);
-        let full = parked_budget_for(ctx.host_ram);
-        assert_eq!(ctx.budget(), full, "no lane: the registry has it all");
-        ctx.set_gate(super::super::delegate_lane::DelegateGate::new());
-        assert_eq!(
-            ctx.budget() + super::super::delegate_lane::lane_bytes_budget_for(ctx.host_ram),
-            full,
-            "park registry + delegate lane must together be the declared figure"
-        );
-        assert!(ctx.budget() < full);
-        assert_eq!(
-            ctx.upsert_fetch_allowance().get(),
-            upsert_fetch_allowance(ctx.budget()),
-            "the fetch allowance follows the carved budget, so four fully \
-             fetching parks still fill exactly the registry's real budget"
-        );
-        assert!(
-            ctx.upsert_fetch_allowance() >= min_upsert_fetch_allowance(),
-            "min_upsert_fetch_allowance must stay a true minimum with the carve"
-        );
-    }
 
     // ---------------------------------------------------------------------
     // `usize` shims for the byte functions, shadowing the `super::*` imports.
