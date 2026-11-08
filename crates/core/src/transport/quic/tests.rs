@@ -2264,6 +2264,48 @@ fn a_hold_left_by_an_ended_connection_stops_pausing_the_ack_watch() {
     );
 }
 
+/// Recycle guard 2 per connection (#6128): while the egress cap holds one
+/// connection's transmit, another connection's acknowledgement watch, reading
+/// its own record, is not paused, and closes a peer that sends and
+/// acknowledges nothing within the window, as it would on an uncapped node.
+/// With one node-wide record, as before, it saw the hold and never closed.
+#[test]
+fn a_held_connection_does_not_pause_another_connections_ack_watch() {
+    use super::recycle::{ACK_WATCH_TICK, ACK_WATCH_WINDOW, AckSample, AckWatch};
+    use quinn::AsyncUdpSocket;
+    use std::task::Context;
+    let time = VirtualTime::new();
+    let local: SocketAddr = "10.201.42.1:5000".parse().unwrap();
+    let rate = 1_000_000;
+    let (socket, demux) = scripted(local, SendMode::Send, Vec::new(), Some((rate, &time)));
+    let cap = demux.egress_cap().unwrap();
+    cap.charge_unpaced(cap.burst_bytes() as usize);
+    let held = Arc::new(socket.cap_holds().like());
+    let other = Arc::new(socket.cap_holds().like());
+    let mut held_poller =
+        super::socket::with_poller_holds(&held, || socket.clone().create_io_poller());
+    let _other_poller =
+        super::socket::with_poller_holds(&other, || socket.clone().create_io_poller());
+    let waker = futures::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let record = Arc::default();
+    let tick = ACK_WATCH_TICK.as_secs();
+    let sample_other =
+        |t: u64| AckSample::synthetic(&record, 5, 5, 0, 10 + t, 100 + t, other.read());
+    let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample_other(0));
+    let closed = (1..=50u64).find(|t| {
+        // The held connection's poller is polled every tick and still waits.
+        assert!(held_poller.as_mut().poll_writable(&mut cx).is_pending());
+        assert!(held.read().held_now, "premise: the cap holds a transmit");
+        watch.observe(t * tick * 1_000_000_000, sample_other(*t))
+    });
+    let closed = Duration::from_secs(closed.expect("the other watch closed") * tick);
+    assert!(
+        closed <= ACK_WATCH_WINDOW + 2 * ACK_WATCH_TICK,
+        "closed at {closed:?}"
+    );
+}
+
 /// #5940 step M6: `socket::cap_hold_validity`, without its margin, bounds
 /// the longest wait the real cap gives a QUIC transmit before its poller is
 /// polled again: with the cap at its deepest debt (`DEBT_LIMIT`) and 500
