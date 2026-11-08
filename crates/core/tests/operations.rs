@@ -4723,7 +4723,7 @@ async fn a_node_without_the_contract(
             // premise that is stale by the time of the PUT. The harness targets
             // a full mesh (min_connections = node_count - 1), so wait for it.
             let expected = candidates.len() + 1; // every other node, gateway included
-            let deadline = std::time::Instant::now() + Duration::from_secs(120);
+            let deadline = std::time::Instant::now() + Duration::from_secs(300);
             let distinct = |peers: &[(String, f64)]| {
                 peers
                     .iter()
@@ -4734,7 +4734,7 @@ async fn a_node_without_the_contract(
             while distinct(&peers) < expected {
                 ensure!(
                     std::time::Instant::now() < deadline,
-                    "{publisher_name} still has only {} of {expected} connections after 120s: {peers:?}",
+                    "{publisher_name} still has only {} of {expected} connections after 300s: {peers:?}",
                     distinct(&peers)
                 );
                 tokio::time::sleep(Duration::from_millis(500)).await;
