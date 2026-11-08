@@ -4209,6 +4209,57 @@ fn source_waits_rearm_the_timer_once_while_it_is_extended() {
     })
 }
 
+/// Two sends on a dark connection share the path's proof slot: the first
+/// starts at 0 s and times out at 5 s, the second starts at 3 s and times out
+/// at 8 s, before the first's settle reads the slot. The proofs are of the
+/// same counts, so the slot keeps the earlier `since` (0 s), and the first
+/// send's settle still dates progress back to it (#6128 re-review, item 10).
+/// Replaced, it read 3 s, which delays the path going suspect.
+#[test]
+fn a_later_proof_of_the_same_counts_keeps_the_earlier_since() {
+    bounded(|| async move {
+        let time = VirtualTime::new();
+        let clock = time.clone();
+        let proof = drive(&time, LIMIT, async move {
+            let acks = recycle::AckProgress::detached();
+            let quiet: Arc<parking_lot::Mutex<Option<bounded::QuietProof>>> = Arc::default();
+            let record = Arc::new(bounded::AckRecord::new(acks.acked(), bounded::NO_ACK));
+            let connection = bounded::ConnectionProgress {
+                acks,
+                cap_holds: Arc::new(super::super::socket::CapHolds::new(None)),
+                quiet: quiet.clone(),
+                last_acked: record,
+            };
+            let deadlines = SendDeadlines {
+                open: Duration::from_secs(2),
+                gap: Some(Duration::from_secs(5)),
+                total: Duration::from_secs(120),
+            };
+            let stuck = |progress: bounded::SendProgress| async move {
+                progress.mark_opened();
+                never().await
+            };
+            let first = bounded_send(&clock, deadlines, Some(connection.clone()), stuck);
+            let later = clock.clone();
+            let second = async move {
+                later.sleep(Duration::from_secs(3)).await;
+                bounded_send(&later, deadlines, Some(connection), stuck).await
+            };
+            let (first, second) = tokio::join!(first, second);
+            for sent in [first, second] {
+                assert!(
+                    matches!(sent, BoundedSend::Failed(SendFailure::TimedOut)),
+                    "{sent:?}"
+                );
+            }
+            *quiet.lock()
+        })
+        .await
+        .expect("a proof");
+        assert_eq!(proof.since, 0, "{proof:?}");
+    })
+}
+
 /// `total` still ends a send whose connection never stops moving.
 #[test]
 fn total_ends_a_send_on_a_connection_that_keeps_moving() {

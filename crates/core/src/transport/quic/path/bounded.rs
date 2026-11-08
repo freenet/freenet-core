@@ -440,6 +440,11 @@ impl AckRecord {
 /// proof stops matching, or was read live by a wake, which set the flag; and
 /// one live at any time after `since` that started before it was live at
 /// `since`, which is a reading of the send.
+///
+/// Relies on both counts only growing: the connection's acknowledged count
+/// (`recycle::AckProgress`, a counter of newly acknowledged packets) and the
+/// cap's hold events (`socket::CapHolds::holds`). A count that could go back
+/// would let a stale proof match again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct QuietProof {
     pub(crate) acked: u64,
@@ -512,12 +517,30 @@ impl ConnectionWatch {
     }
 
     /// The send ran out of gap: leave what it saw for the stall count.
+    ///
+    /// The path has one slot, read (not taken) by every settle, so a later
+    /// send's timeout may come before an earlier one's settle. A proof of the
+    /// same counts is merged rather than replaced: both say nothing moved
+    /// from their `since` to their timeout, and as the counts only grow, the
+    /// two together say nothing moved from the earlier `since`, so the
+    /// earlier send's settle still dates progress back to it. A live hold
+    /// either saw is kept. A proof of other counts no longer matches the
+    /// connection, so replacing it loses nothing.
     fn prove_quiet(&self) {
-        *self.source.quiet.lock() = Some(QuietProof {
+        let proof = QuietProof {
             acked: self.acked,
             holds: self.cap.holds,
             since: self.moved_at.unwrap_or(self.started),
             live_hold_seen: self.live_hold_seen,
+        };
+        let mut slot = self.source.quiet.lock();
+        *slot = Some(match *slot {
+            Some(left) if (left.acked, left.holds) == (proof.acked, proof.holds) => QuietProof {
+                since: left.since.min(proof.since),
+                live_hold_seen: left.live_hold_seen || proof.live_hold_seen,
+                ..proof
+            },
+            _ => proof,
         });
     }
 

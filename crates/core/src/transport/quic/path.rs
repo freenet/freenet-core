@@ -678,8 +678,8 @@ pub(crate) struct QuicPath {
     counted_as_data_path: std::sync::atomic::AtomicBool,
     /// Send timeouts while nothing is acknowledged ([`route::StallCount`]).
     stall: parking_lot::Mutex<route::StallCount>,
-    /// The last [`bounded::QuietProof`] a send that ran out of gap left, taken
-    /// by the next settle.
+    /// The [`bounded::QuietProof`] sends that ran out of gap left, read (not
+    /// taken) by every settle; a proof of the same counts is merged into it.
     quiet: Arc<parking_lot::Mutex<Option<bounded::QuietProof>>>,
     /// The connection's acknowledged count and when it was last seen to
     /// move, on the path's clock ([`bounded::AckRecord`]); the count at build
