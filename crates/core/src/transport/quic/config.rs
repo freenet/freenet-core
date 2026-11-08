@@ -340,6 +340,9 @@ impl QuicRateLimit {
         // `paced_rate` lowers a controller's rate to the cap; given no
         // controller rate (`usize::MAX`) it returns the cap itself, or
         // `usize::MAX` when there is none.
+        // The node builds no manager for a `total-bandwidth-limit` of 0
+        // (`NetworkApiConfig::global_bandwidth_manager`), for UDP and QUIC
+        // alike.
         let global = self
             .global
             .as_ref()

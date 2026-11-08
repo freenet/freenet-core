@@ -46,9 +46,10 @@
 //!   weights focus toward contracts that will actually produce samples (#5913).
 //! - [`shadow`] — the opt-in loop that replays sampled states on a peer and records
 //!   what it would remove, without acting on it.
-//! - [`policy`] — what a peer is permitted to do about a finding. Deletion is the
-//!   last step of the RFC's deployment plan, and this is where that ordering is
-//!   enforced and tested rather than merely intended.
+//! - [`policy`] — what a peer is permitted to do about a finding. Removal was the
+//!   last step of the RFC #5320 deployment plan; that plan is superseded and nodes
+//!   do not remove contracts for breaking a merge law (see [`policy`]). The
+//!   retained, unreachable removal path is kept unable to fire there, by tests.
 //!
 //! # Relationship to the existing probe
 //!
@@ -71,8 +72,20 @@
 //! This module does not replace or disable that probe. The node can run this verifier
 //! in an opt-in shadow mode: set `FREENET_CONFORMANCE_CAPTURE_DIR` (see [`capture`] and
 //! [`shadow`]) and it samples observed states and records what it *would* remove.
-//! Nothing is ever removed: [`EnforcementMode::Enforce`] is not reachable from
-//! configuration, and with the variable unset none of this runs.
+//! Those results are diagnostics recorded locally. The node never removes a
+//! contract on a conformance verdict: the [`EnforcementMode::Enforce`] path exists
+//! in the code but is unreachable from configuration, and enabling it is not
+//! planned. With the variable unset none of this runs.
+//!
+//! # Removal is not the plan
+//!
+//! RFC #5320 planned for nodes to remove contracts whose merges break the laws
+//! this module checks. That plan is superseded:
+//! <https://github.com/freenet/freenet-core/issues/5906#issuecomment-6677346389>.
+//! Nodes instead decline work that a contract with a lawful merge never needs: a
+//! payload already merged into the node's current state is not merged again
+//! (`ring::applied_payloads`). The verifier and `fdev verify-merge` remain the way
+//! an author finds a broken law; their findings are diagnostics.
 //!
 //! # The bias toward `Inconclusive`
 //!
@@ -81,9 +94,11 @@
 //! [`PropertyOutcome::Inconclusive`] — never a violation. This is deliberate and it
 //! is the most important design decision in the module: the only enforcement
 //! mechanism ever shipped for this class of problem (#4295) had a 100% false-positive
-//! rate in production, and a violation here is eventually meant to justify deleting a
-//! contract. A missed violation costs bandwidth. A false violation deletes a working
-//! application. The asymmetry is not close.
+//! rate in production. A violation here was once meant to justify deleting a
+//! contract; that removal plan is superseded (see "Removal is not the plan" above),
+//! but a false violation still tells an author their working application is broken
+//! and sends them chasing a defect that does not exist. A missed violation costs
+//! bandwidth. The asymmetry still holds.
 //!
 //! For the eight byte-comparison laws — the merge laws and the determinism checks —
 //! that means anything short of "both sides ran to completion and the canonical
@@ -109,7 +124,7 @@
 //!   commutativity violation. That is correct: the merge really is order-dependent.
 //!   The re-run was never going to save it.
 //! - If the clock straddle is a one-off, the second run disagrees and the finding
-//!   becomes `UpdateDeterminism`, which is itself enforceable. So a contract that
+//!   becomes `UpdateDeterminism`, which is itself a merge-law break. So a contract that
 //!   stamps `now()` into merged state is flagged either way; only the name changes.
 //!
 //! The honest summary is that the re-run protects the ACCURACY of the accusation,

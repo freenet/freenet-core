@@ -24,6 +24,7 @@ use crate::transport::peer_connection::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
 use crate::transport::peer_connection::streaming_handle_idle_timeout;
 
 mod node_counts;
+mod pacer;
 mod route;
 
 /// How long, in virtual time, a test's traffic may take.
@@ -2029,7 +2030,7 @@ fn a_stop_reported_by_the_write_is_not_counted() {
             .drive(async move {
                 let header = FrameHeader::short(10).expect("a short header");
                 let mut send = a
-                    .open(&header, &[], None, SendProgress::new())
+                    .open(&header, &[], None, None, SendProgress::new())
                     .await
                     .expect("open");
                 let written = send.written(Err(quinn::WriteError::Stopped(

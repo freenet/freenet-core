@@ -1,6 +1,13 @@
 //! Shadow mode: the peer checks contracts it has sampled, and records what it
 //! *would* remove.
 //!
+//! The results are diagnostics recorded locally. Removal was the RFC #5320 plan
+//! and is superseded: nodes do not remove contracts for breaking a merge law (see
+//! `policy`'s module docs and
+//! <https://github.com/freenet/freenet-core/issues/5906#issuecomment-6677346389>).
+//! The "would remove" wording and the `would_remove` count are retained from that
+//! plan; nothing acts on them and acting on them is not planned.
+//!
 //! Everything else in this module tree is reachable only from `fdev` and from tests.
 //! `decide` has been fully specified and tested since #5344 and has never once been
 //! called by a running node, which means the mechanism the RFC describes does not yet
@@ -12,10 +19,11 @@
 //! # What this deliberately does NOT do
 //!
 //! No removal, in any configuration reachable from here. No evidence propagation, no
-//! author diagnostics, no network traffic of any kind. Those are the RFC's Phase 4;
-//! this is Phase 3, "single/live peer shadow validation", whose whole job is to prove
-//! that focus selection, sampling and local discovery behave on a real peer before
-//! anything is shipped fleet-wide.
+//! author diagnostics, no network traffic of any kind. Under the RFC's numbering
+//! those were Phase 4 and this was Phase 3, "single/live peer shadow validation",
+//! whose job was to prove that focus selection, sampling and local discovery behave
+//! on a real peer. With the removal plan superseded, this loop is a local
+//! diagnostic and nothing further is planned on top of it.
 //!
 //! It also generates no synchronization traffic to manufacture samples. It reads what
 //! capture has already observed from ordinary traffic, which is the RFC's explicit
@@ -133,8 +141,10 @@ pub struct ShadowReport {
     pub cases: usize,
     /// Outcomes that reached no verdict.
     pub inconclusive: usize,
-    /// Violations that would have caused a removal, had enforcement been on. The
-    /// number the RFC's Phase 5 gate is judged on.
+    /// Violations that would have caused a removal, had enforcement been on. Under
+    /// the superseded removal plan this was the number the RFC's Phase 5 gate would
+    /// have been judged on; it is now a diagnostic count of serious findings.
+    /// Enforcement is unreachable and not planned.
     ///
     /// Only removal-eligible findings reach it (`policy::removal_tier`). A
     /// report-only finding is counted in `reported` instead, in Shadow as in every
@@ -1163,8 +1173,9 @@ pub(crate) async fn probe_with_budget(
 /// Count a removal-proposing decision.
 ///
 /// One function for BOTH `WouldRemove` and `Remove` deliberately. The comment
-/// between those two arms says they are handled together precisely so shadow and
-/// enforcement cannot drift, and one counter is the shape in which they cannot.
+/// between those two arms says they are handled together so shadow and the
+/// retained, unreachable enforcement path cannot drift, and one counter is the
+/// shape in which they cannot.
 fn count_would_remove(report: &mut ShadowReport) {
     report.would_remove += 1;
 }
@@ -1356,11 +1367,11 @@ fn tally_decisions(
                     would_remove: true,
                 });
             }
-            // Unreachable while nothing constructs `EnforcementMode::Enforce`, and
-            // deliberately still handled: the point of routing shadow through the same
-            // `decide` enforcement will use is that the two cannot drift. Counting a
-            // removal as a would-remove keeps this honest if a future caller reaches
-            // it before the removal path exists.
+            // Unreachable: nothing constructs `EnforcementMode::Enforce`, and
+            // enabling it is not planned (the removal plan is superseded, see
+            // `policy`'s module docs). Still handled so shadow and the retained
+            // `decide` path cannot drift: counting a removal as a would-remove keeps
+            // this honest if a caller ever reaches it. No removal path exists.
             ConformanceAction::Remove(violation) => {
                 count_would_remove(report);
                 findings.push(Finding {
@@ -1743,8 +1754,9 @@ mod settled_counter_tests {
     }
 
     /// Report-only findings land in `reported` and never in `would_remove`, through
-    /// the same `decide` and tally the probe uses. `would_remove` is the number the
-    /// enforcement gate is judged on, so this is the property the tier exists for.
+    /// the same `decide` and tally the probe uses. `would_remove` is the diagnostic
+    /// count of serious findings, and a finding anyone can produce on demand must
+    /// not be able to move it, so this is the property the tier exists for.
     #[test]
     fn report_only_findings_never_reach_would_remove_in_shadow() {
         let report_only = [
@@ -1956,8 +1968,8 @@ mod settled_counter_tests {
                  drift while the comment beside them claims they cannot"
             );
             // And ONLY through it. Calling the helper does not stop an arm also
-            // incrementing on its own, which double-counts the number Phase 5 is
-            // judged on — and a test that calls the helper directly cannot see a
+            // incrementing on its own, which double-counts `would_remove`, and a
+            // test that calls the helper directly cannot see a
             // second increment at the call site.
             assert!(
                 !window.contains("report.would_remove"),
@@ -4033,8 +4045,8 @@ mod tests {
     ///
     /// Both halves are needed. Without the conforming half this test would pass for a
     /// runner that flagged everything, which is the failure mode that matters most
-    /// here: the RFC's whole deployment plan turns on shadow mode producing few enough
-    /// prospective removals that every one can be understood.
+    /// here: a diagnostic that flags conforming contracts tells their authors about
+    /// defects that do not exist, and buries the real findings.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_real_defect_reaches_would_remove_and_a_conforming_contract_does_not()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -4133,8 +4145,8 @@ mod tests {
         );
         assert_eq!(
             honest.would_remove, 0,
-            "a conforming contract produced a prospective removal, which is the false \
-             positive the whole deployment plan is gated on not happening: {honest:?}"
+            "a conforming contract produced a prospective removal, a false positive \
+             that would tell its author about a defect that does not exist: {honest:?}"
         );
         Ok(())
     }

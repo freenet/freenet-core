@@ -5,13 +5,12 @@
 //! not enumerated event kinds, so they never reach the telemetry collector either. The
 //! one place an operator would look shows nothing.
 //!
-//! That matters more than a missing view usually would. Removal is not enabled yet,
-//! and the RFC's gate for enabling it requires that every prospective deletion "has
-//! been understood" — a statement about what a human has been able to inspect. If the
-//! only route to that is grepping a peer's log files before they rotate, the gate is
-//! being argued from evidence most operators cannot reach, and an operator whose
-//! contract is about to be deleted has no way to find out why, or to disagree, before
-//! it happens. **Visibility has to precede automatic deletion.**
+//! These findings are diagnostics recorded locally. Removal was the RFC #5320 plan,
+//! with a gate requiring that every prospective deletion "has been understood"; that
+//! plan is superseded and nodes do not remove contracts for breaking a merge law (see
+//! `policy`'s module docs). The view still matters: the findings are only useful to
+//! an operator or a contract author who can read them, and grepping a peer's log
+//! files before they rotate is evidence most of them cannot reach.
 //!
 //! # Shape
 //!
@@ -135,11 +134,13 @@ pub struct MergeFinding {
     /// property.
     ///
     /// Carried here and not only in `fdev` because this is the path that generates
-    /// the shadow corpus, and `ConformanceAction::WouldRemove` is documented as the
-    /// number the enforcement gate is judged on. A distinction that exists only in
-    /// the offline tool is a distinction the policy it was collected for never sees.
+    /// the shadow corpus, and `ConformanceAction::WouldRemove` is the diagnostic
+    /// count of serious findings. A distinction that exists only in the offline
+    /// tool is a distinction the shadow diagnostics never see.
     pub settling: Option<IdempotenceSettling>,
     /// Whether enforcement, were it enabled, would have removed the contract for this.
+    /// Diagnostic only: enforcement is unreachable and not planned, and nodes do not
+    /// remove contracts for breaking a merge law (see `policy`'s module docs).
     pub would_remove: bool,
 }
 
@@ -265,8 +266,8 @@ impl CheckedContract {
             // Deduplicating on the property alone would silently pick whichever
             // classification arrived first. Since #5462 two `state_idempotence`
             // findings on one contract can carry DIFFERENT settling classes, and
-            // they are not equally important: `NeverSettled` is the one an
-            // enforcement policy can act on, while `SettledAfter` is waiting on the
+            // they are not equally important: `NeverSettled` is the removal-eligible
+            // (most serious) class, while `SettledAfter` is waiting on the
             // install-path fix. Keeping the first would let a benign case mask a
             // non-convergent one on the same contract — the operator would read
             // "settles after a rewrite" for a contract that also never settles.
@@ -304,7 +305,7 @@ fn slot_rank(finding: &MergeFinding) -> (bool, u8) {
 /// partly to keep it that way. This orders how much a reader NEEDS to see it when
 /// two findings for one property must collapse to one: an unknown class outranks a
 /// benign one because it has not been shown benign, and a never-settling class
-/// outranks both because it is the case enforcement can act on. The benign class,
+/// outranks both because it is the removal-eligible (most serious) class. The benign class,
 /// `SettledAfter`, is report-only (`policy::removal_tier`).
 pub(crate) fn settling_rank(settling: Option<IdempotenceSettling>) -> u8 {
     match settling {

@@ -1317,6 +1317,10 @@ impl P2pConnManager {
             quic.breaker,
         );
 
+        config
+            .config
+            .network_api
+            .warn_if_total_bandwidth_limit_is_zero();
         Ok(P2pConnManager {
             gateways,
             bridge,
@@ -1341,34 +1345,27 @@ impl P2pConnManager {
             global_bandwidth: config
                 .config
                 .network_api
-                .total_bandwidth_limit
-                .map(|total| {
-                    let manager = Arc::new(GlobalBandwidthManager::new(
-                        total,
-                        config.config.network_api.min_bandwidth_per_connection,
-                    ));
+                .global_bandwidth_manager()
+                .inspect(|manager| {
                     // The transport builds a node-wide egress cap from the
                     // same total (`transport::egress_cap`); say so at startup,
                     // and warn when it is low for the allowed connections.
-                    if total > 0 {
-                        crate::transport::egress_cap::log_startup_cap(
-                            total,
-                            config
-                                .config
-                                .network_api
-                                .min_bandwidth_per_connection
-                                .unwrap_or(
-                                    crate::transport::global_bandwidth::DEFAULT_MIN_PER_CONNECTION,
-                                ),
-                            config.config.network_api.max_connections,
-                        );
-                    }
+                    crate::transport::egress_cap::log_startup_cap(
+                        manager.total_limit(),
+                        config
+                            .config
+                            .network_api
+                            .min_bandwidth_per_connection
+                            .unwrap_or(
+                                crate::transport::global_bandwidth::DEFAULT_MIN_PER_CONNECTION,
+                            ),
+                        config.config.network_api.max_connections,
+                    );
                     // Phase 1.6 shadow telemetry (#4074): expose the
                     // effective aggregate rate R to the demand aggregator.
                     // Observation only — the manager is read, never written,
                     // by the shadow side. See transport/shadow_demand.rs.
-                    crate::transport::shadow_demand::register_global_bandwidth(&manager);
-                    manager
+                    crate::transport::shadow_demand::register_global_bandwidth(manager);
                 }),
             ledbat_min_ssthresh: config.config.network_api.ledbat_min_ssthresh,
             congestion_config: config.config.network_api.build_congestion_config(),

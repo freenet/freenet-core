@@ -674,8 +674,8 @@ fn run<O: ConformanceOracle + ?Sized>(
             let (d1, d2) = (&case.deltas[0], &case.deltas[1]);
             // Ordering only. Re-delivery is deliberately NOT checked here.
             //
-            // This property is `Severity::Violation`; delta idempotence is contested
-            // and therefore `Severity::Diagnostic`. Re-applying D1 a third time here
+            // This property is `Severity::Violation`; delta idempotence is
+            // `Severity::Diagnostic` (see its doc for why). Re-applying D1 a third time here
             // would be a delta-idempotence check wearing an ordering check's name and
             // severity, so downgrading `DeltaIdempotence` would not actually spare a
             // counter-style contract — it would still be accused, under a property

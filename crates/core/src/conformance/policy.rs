@@ -1,13 +1,23 @@
 //! What a peer is allowed to *do* about a conformance finding.
 //!
-//! The RFC's deployment plan makes deletion the last step, after offline
-//! validation, single-peer shadow validation, a full release of fleet-wide shadow
-//! mode, and an explicit enforcement gate. That ordering is easy to state and easy
-//! to erode: one plausible-looking commit that treats a violation as a removal, and
-//! the gate is gone with nothing failing.
+//! **Nodes do not remove contracts for breaking a merge law.** Removal was the
+//! plan in RFC #5320: offline validation, single-peer shadow validation, a full
+//! release of fleet-wide shadow mode, then an enforcement gate after which a
+//! verified violation would remove the contract. That plan is superseded, see
+//! <https://github.com/freenet/freenet-core/issues/5906#issuecomment-6677346389>.
+//! Verifier and shadow results are diagnostics, recorded locally. Instead, nodes
+//! decline work that a contract with a lawful merge never needs: a payload already
+//! merged into the node's current state is not merged again
+//! (`ring::applied_payloads`).
 //!
-//! So the ordering lives here, as a decision function with tests, rather than as
-//! scattered `if` statements at the call sites. Three invariants are pinned:
+//! The removal machinery in this module ([`EnforcementMode::Enforce`],
+//! [`ConformanceAction::Remove`], [`RemovalTier`], and the `would_remove` count
+//! the shadow probe keeps) is retained and unreachable: nothing constructs
+//! `Enforce`, and enabling it is not planned. Whether to delete that code is a
+//! separate decision. While it exists, the decision function and its tests keep
+//! the invariants below, so the unreachable path cannot become live through one
+//! plausible-looking commit that treats a violation as a removal. Three invariants
+//! are pinned:
 //!
 //! 1. Under [`EnforcementMode::Shadow`], **no input of any kind produces a removal.**
 //! 2. A [`Severity::Diagnostic`] finding never proposes removal in *any* mode. A
@@ -31,15 +41,16 @@ pub enum EnforcementMode {
     Disabled,
     /// The full mechanism runs and reports, but nothing is ever removed.
     ///
-    /// The default, and the only mode the RFC's plan permits until every gate in
-    /// its Phase 5 list has been met on live data.
+    /// The default, and the mode the conformance mechanism runs in. Its findings
+    /// are diagnostics recorded locally.
     #[default]
     Shadow,
-    /// Verified violations remove the contract locally.
+    /// Verified violations would remove the contract locally.
     ///
-    /// Not reachable from configuration yet. It exists so the shadow-mode code path
-    /// is the same code path enforcement will use, which is what makes shadow-mode
-    /// measurements predictive of enforcement rather than merely adjacent to it.
+    /// Retained and unreachable: nothing constructs it, and enabling it is not
+    /// planned, because the removal plan is superseded (see the module docs). It
+    /// was kept so the shadow-mode code path was the same one enforcement would
+    /// have used.
     Enforce,
 }
 
@@ -50,13 +61,14 @@ pub enum ConformanceAction {
     Nothing,
     /// Worth telling the author and the telemetry, but not grounds for removal.
     Report(Violation),
-    /// Would have been removed had enforcement been enabled. This is the signal the
-    /// shadow period exists to collect, and the number the enforcement gate is
-    /// judged on.
+    /// Would have been removed had enforcement been enabled. Under the superseded
+    /// removal plan this was the number an enforcement gate would have been judged
+    /// on; it is now a diagnostic count recorded locally.
     WouldRemove(Violation),
     /// Remove the contract locally: stop executing, serving, propagating and
     /// hosting it, and remember the id so ordinary traffic cannot immediately
-    /// reintroduce it.
+    /// reintroduce it. Unreachable: only [`EnforcementMode::Enforce`] produces it,
+    /// and nothing constructs that mode.
     Remove(Violation),
 }
 
@@ -106,7 +118,7 @@ pub fn decide(mode: EnforcementMode, outcome: &PropertyOutcome) -> ConformanceAc
         // Diagnostics are reports in every mode, enforcement included.
         (_, Severity::Diagnostic, _) => ConformanceAction::Report(violation),
         // So are report-only findings, and Shadow is not an exception: a
-        // `WouldRemove` is the number the enforcement gate is judged on, and a
+        // `WouldRemove` is the diagnostic count of serious findings, and a
         // finding anyone can produce on demand must not be able to move it.
         (_, Severity::Violation, RemovalTier::ReportOnly) => ConformanceAction::Report(violation),
         (EnforcementMode::Shadow, Severity::Violation, RemovalTier::RemovalEligible) => {
@@ -128,6 +140,10 @@ pub fn decide(mode: EnforcementMode, outcome: &PropertyOutcome) -> ConformanceAc
 /// contract must not converge after a bounded cost anyway. Folding that into the
 /// severity would bend the classification to soften an enforcement consequence,
 /// which is the move #5462 rejected.
+///
+/// Retained with the rest of the removal machinery, which is unreachable (see the
+/// module docs). Today the tier only decides whether a finding is counted as
+/// `would_remove` or as reported in the shadow diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RemovalTier {
     /// [`ConformanceAction::WouldRemove`] in Shadow, [`ConformanceAction::Remove`]
@@ -149,7 +165,8 @@ pub enum RemovalTier {
 /// and never removed.
 pub fn property_tier(property: ConformanceProperty) -> RemovalTier {
     match property {
-        // Diagnostics: wasteful or contested, never a proof of non-convergence.
+        // Diagnostics: wasteful, or (delta idempotence) a law nodes act on no
+        // verdict for. Never a proof of non-convergence.
         // `decide` also refuses them by severity; listing them here keeps the tier
         // table a complete answer on its own.
         ConformanceProperty::DeltaIdempotence
@@ -192,9 +209,9 @@ pub fn property_tier(property: ConformanceProperty) -> RemovalTier {
 /// produce one. A finding that did not settle within the budget
 /// ([`IdempotenceSettling::NeverSettled`]) or whose classification could not
 /// complete ([`IdempotenceSettling::Indeterminate`]) keeps the property's tier.
-/// Neither is a proof that the state never settles, so both are a known gap that
-/// must be closed before Enforce can become reachable; replacing the bounded budget
-/// with a proof of non-settling is separate work (#5906).
+/// Neither is a proof that the state never settles, so both were a known gap to
+/// close before Enforce could become reachable. Enforce is not planned (see the
+/// module docs), so this now affects only which diagnostic count a finding lands in.
 ///
 /// This tier governs conformance REMOVAL only. The live re-apply probe
 /// (`ring::broken_invariants`, fed by `contract::executor::runtime::reapply_probe`)
@@ -264,8 +281,8 @@ mod tests {
     }
 
     /// The load-bearing test. If a future change makes shadow mode capable of
-    /// removing anything, this fails, and the deployment plan's whole ordering
-    /// depends on it holding.
+    /// removing anything, this fails. Shadow is the mode that runs, and nodes do
+    /// not remove contracts for breaking a merge law.
     #[test]
     fn shadow_mode_never_removes_anything() {
         for property in ConformanceProperty::ALL {
@@ -286,7 +303,8 @@ mod tests {
     }
 
     /// A wasteful self-delta is an efficiency complaint about a contract that still
-    /// converges. It must never propose removal, even once enforcement is on.
+    /// converges. It must never propose removal, even under the unreachable
+    /// `Enforce` mode.
     #[test]
     fn diagnostics_never_propose_removal_even_under_enforcement() {
         for property in ConformanceProperty::ALL {
@@ -425,9 +443,10 @@ mod tests {
     /// KNOWN GAP, pinned on purpose. `NeverSettled` here means "did not settle
     /// within the budget" and `Indeterminate` means "classification failed" (a trap
     /// or a resource ceiling can cause it). Neither is a proof that the state never
-    /// settles, and both must be resolved before Enforce can become reachable
-    /// (#5906, proof of non-settling). When that lands this test changes with it;
-    /// until then it records what the policy does today.
+    /// settles. Under the superseded removal plan both had to be resolved before
+    /// Enforce could become reachable (#5906). Enforce is not planned, so this test
+    /// records what the policy does today: which diagnostic count the finding
+    /// lands in.
     #[test]
     fn known_gap_idempotence_not_shown_to_settle_stays_removal_eligible() {
         for settling in [

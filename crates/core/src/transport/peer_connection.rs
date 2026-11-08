@@ -188,7 +188,7 @@ pub(crate) struct RemoteConnection<S = super::UdpSocket, T: TimeSource = RealTim
 /// Before #6047 the rate update ignored `bandwidth-limit`, which then only set
 /// the initial rate. `bandwidth_limit` is the value after
 /// [`effective_bandwidth_limit`].
-pub(super) fn paced_rate(
+pub(crate) fn paced_rate(
     cc_rate: usize,
     global_rate: Option<usize>,
     bandwidth_limit: Option<usize>,
@@ -1094,6 +1094,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                 self.inbound_budget.clone(),
                 self.quic_receipt_nanos.clone(),
                 self.udp_sender(),
+                self.path_rate_limit(),
                 self.remote_conn.time_source.clone(),
             );
             self.quic_path = Some(quic_path);
@@ -1241,6 +1242,20 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             );
         }
         self.pending_decline = None;
+    }
+
+    /// The bandwidth limit this connection's QUIC data is paced at
+    /// (`bandwidth-limit`, or `total-bandwidth-limit` and its share), or `None`
+    /// with no limit. The session builds the pacer from it, on the path's
+    /// clock (`quic::path::pacer`): a bucket of the QUIC side's own, not the
+    /// UDP stream bucket, whose rate the UDP congestion controller can hold
+    /// below the limit.
+    fn path_rate_limit(&self) -> Option<crate::transport::quic::config::QuicRateLimit> {
+        let limit = crate::transport::quic::config::QuicRateLimit::new(
+            self.remote_conn.bandwidth_limit,
+            self.remote_conn.global_bandwidth.clone(),
+        );
+        limit.rate().is_some().then_some(limit)
     }
 
     /// What sends one tracked packet on the UDP session from outside the
@@ -6632,6 +6647,33 @@ mod tests {
             time_source,
         });
         (conn, inbound_tx)
+    }
+
+    /// A connection paces its QUIC data at a limit only when one is set
+    /// (`bandwidth-limit`, or `total-bandwidth-limit`), and at that limit, not
+    /// at the UDP bucket's rate: 5 MB/s is above FixedRate's 1.25 MB/s.
+    #[tokio::test]
+    async fn quic_data_is_paced_only_under_a_limit_and_at_that_limit() {
+        let addr: SocketAddr = "127.0.0.1:41000".parse().unwrap();
+        let (unlimited, _tx) = test_conn_with_bandwidth_limit(addr, None);
+        assert!(unlimited.path_rate_limit().is_none(), "no limit, no pacing");
+        let (zero, _tx) = test_conn_with_bandwidth_limit(addr, Some(0));
+        assert!(zero.path_rate_limit().is_none(), "0 is unset");
+        let (limited, _tx) = test_conn_with_bandwidth_limit(addr, Some(5_000_000));
+        assert_eq!(
+            limited.path_rate_limit().and_then(|limit| limit.rate()),
+            Some(5_000_000)
+        );
+        let (mut shared, _tx) = test_conn_with_bandwidth_limit(addr, None);
+        shared.remote_conn.global_bandwidth =
+            Some(Arc::new(GlobalBandwidthManager::new(500_000, Some(1000))));
+        assert_eq!(
+            shared.path_rate_limit().and_then(|limit| limit.rate()),
+            Some(500_000),
+            "total-bandwidth-limit paces at the connection's share"
+        );
+        // A total of 0 builds no manager, so it reaches no connection
+        // (config::tests::a_total_of_zero_paces_neither_transport).
     }
 
     /// Runs `conn`'s real `recv()` loop until its token bucket's rate is
