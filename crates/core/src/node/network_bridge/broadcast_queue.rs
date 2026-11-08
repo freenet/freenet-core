@@ -42,6 +42,7 @@ use std::time::Duration;
 use freenet_stdlib::prelude::{ContractKey, WrappedState};
 
 use crate::node::OpManager;
+use crate::operations::update::propagation_stats::{PropagationEvent, record_propagation_event};
 use crate::ring::PeerKeyLocation;
 use crate::transport::StreamSendOutcome;
 
@@ -712,10 +713,20 @@ pub(super) fn plan_fanout_send<T: crate::util::time_source::TimeSource + Sync>(
     }
 }
 
+/// Outcome of [`fanout_send_needed`]: send, or skip and why (#6143).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FanoutDecision {
+    Send,
+    /// Skip. The event names which check decided the peer is converged:
+    /// byte-equal summaries, a cached empty delta, or the WASM probe.
+    Skip(PropagationEvent),
+}
+
 /// Full semantic staleness decision for one (contract, peer) fan-out send:
 /// [`plan_fanout_send`] plus the bounded WASM `get_state_delta` probe on a
-/// cache miss. Returns `true` when the peer needs our state (send), `false`
-/// when it is converged (skip).
+/// cache miss. Returns [`FanoutDecision::Send`] when the peer needs our state,
+/// and [`FanoutDecision::Skip`] naming the deciding check when it is
+/// converged.
 ///
 /// `probes_used` is the per-fan-out-invocation probe budget counter (mirrors
 /// the `Summaries` handler's per-message `MAX_STALENESS_PROBES_PER_SUMMARIES`
@@ -740,9 +751,9 @@ pub(super) async fn fanout_send_needed(
     key: &ContractKey,
     summaries: SummaryPair<'_>,
     probes_used: &mut usize,
-) -> bool {
+) -> FanoutDecision {
     match plan_fanout_send(&op_manager.interest_manager, key, summaries, *probes_used) {
-        FanoutSendPlan::Send => true,
+        FanoutSendPlan::Send => FanoutDecision::Send,
         FanoutSendPlan::Skip => {
             // #5147 diagnostic: the pre-existing summary-match skip is the
             // OTHER mechanism suppressing fan-out legs, and it is fed by the
@@ -751,7 +762,13 @@ pub(super) async fn fanout_send_needed(
             // the two visible instead of showing up as an unexplained rise in
             // total sends.
             crate::config::GlobalTestMetrics::record_fanout_summary_skip();
-            false
+            // `plan_fanout_send` skips on byte-equal summaries first and on a
+            // cached empty delta otherwise; re-deriving which is one memcmp.
+            if summaries.ours.as_ref() == summaries.theirs.as_ref() {
+                FanoutDecision::Skip(PropagationEvent::SkipSummaryEqual)
+            } else {
+                FanoutDecision::Skip(PropagationEvent::SkipCachedConverged)
+            }
         }
         FanoutSendPlan::Probe => {
             *probes_used += 1;
@@ -764,7 +781,11 @@ pub(super) async fn fanout_send_needed(
                 .interest_manager
                 .peer_summary_has_pending_state(op_manager, key, theirs, ours)
                 .await;
-            crate::ring::interest::summary_indicates_stale_peer(ours, theirs, verdict)
+            if crate::ring::interest::summary_indicates_stale_peer(ours, theirs, verdict) {
+                FanoutDecision::Send
+            } else {
+                FanoutDecision::Skip(PropagationEvent::SkipProbeConverged)
+            }
         }
     }
 }
@@ -4336,7 +4357,12 @@ pub(super) async fn broadcast_to_single_peer(
     use crate::ring::PeerKey;
     use crate::transport::StreamId;
 
+    // #6143: every exit below that sends nothing logs at debug/trace only,
+    // which release builds compile out. Each one is counted instead, per
+    // contract, in the `update_propagation_summary` INFO line and the
+    // `broadcast_payload_mix` telemetry (see `propagation_stats`).
     let Some(peer_addr) = target.socket_addr() else {
+        record_propagation_event(op_manager, key.id(), PropagationEvent::SkipNoAddress);
         return;
     };
 
@@ -4361,6 +4387,7 @@ pub(super) async fn broadcast_to_single_peer(
             peer = %peer_addr,
             "Skipping broadcast - contract not hosted or in use"
         );
+        record_propagation_event(op_manager, key.id(), PropagationEvent::SkipNotHosted);
         return;
     }
 
@@ -4448,7 +4475,7 @@ pub(super) async fn broadcast_to_single_peer(
         // Per-invocation probe budget: one (contract, peer) pair per call, so
         // at most one WASM probe per queue entry (see `fanout_send_needed`).
         let mut staleness_probes_used = 0usize;
-        if !fanout_send_needed(
+        if let FanoutDecision::Skip(skip) = fanout_send_needed(
             op_manager,
             &key,
             SummaryPair { ours, theirs },
@@ -4456,6 +4483,7 @@ pub(super) async fn broadcast_to_single_peer(
         )
         .await
         {
+            record_propagation_event(op_manager, key.id(), skip);
             tracing::trace!(
                 contract = %key,
                 peer = %peer_addr,
@@ -4589,6 +4617,11 @@ pub(super) async fn broadcast_to_single_peer(
                     // sent (no bytes). Previously this exit returned without
                     // reporting, undercounting the send-CPU axis.
                     report_send_cpu(op_manager);
+                    record_propagation_event(
+                        op_manager,
+                        key.id(),
+                        PropagationEvent::SkipEmptyDelta,
+                    );
                     return;
                 }
                 Err(err) => {
@@ -4805,6 +4838,7 @@ pub(super) async fn broadcast_to_single_peer(
                     error = %e,
                     "Failed to serialize BroadcastStreamingPayload, skipping"
                 );
+                record_propagation_event(op_manager, key.id(), PropagationEvent::SendFailed);
                 return;
             }
         };
@@ -4895,6 +4929,9 @@ pub(super) async fn broadcast_to_single_peer(
                 // fragment was handed to the transport — also a streaming-
                 // broadcast failure.
                 BROADCAST_STREAM_METRICS.record_attempt(false);
+                // `send_res` (the metadata send) was Ok, so the generic
+                // failure count after this branch does not see this one.
+                record_propagation_event(op_manager, key.id(), PropagationEvent::SendFailed);
                 tracing::warn!(
                     tx = %update_tx,
                     peer = %peer_addr,
@@ -4902,6 +4939,9 @@ pub(super) async fn broadcast_to_single_peer(
                     "Failed to send broadcast stream data"
                 );
             } else {
+                // Handed to the transport. Whether it then completes is
+                // counted separately (`StreamUndelivered`) below.
+                record_propagation_event(op_manager, key.id(), PropagationEvent::SentFull);
                 // Wait for the stream transfer to actually complete before
                 // doing the delivery bookkeeping. The lane permit is held for
                 // at most `STREAM_PERMIT_HOLD` of the wait; the queue's claim on
@@ -4968,6 +5008,11 @@ pub(super) async fn broadcast_to_single_peer(
                         "Broadcast stream completed successfully"
                     );
                 } else {
+                    record_propagation_event(
+                        op_manager,
+                        key.id(),
+                        PropagationEvent::StreamUndelivered,
+                    );
                     tracing::debug!(
                         tx = %update_tx,
                         peer = %peer_addr,
@@ -5008,6 +5053,15 @@ pub(super) async fn broadcast_to_single_peer(
         // successful enqueue is the terminal state we can observe, so delivery
         // tracks the send result (unchanged pre-#4235 behavior for this path).
         if res.is_ok() {
+            record_propagation_event(
+                op_manager,
+                key.id(),
+                if sent_delta {
+                    PropagationEvent::SentDelta
+                } else {
+                    PropagationEvent::SentFull
+                },
+            );
             if let Some(guard) = missing_attempt_guard.as_mut() {
                 guard.mark_delivered(payload_size);
             }
@@ -5058,6 +5112,7 @@ pub(super) async fn broadcast_to_single_peer(
     };
 
     if let Err(err) = &send_result {
+        record_propagation_event(op_manager, key.id(), PropagationEvent::SendFailed);
         tracing::warn!(
             tx = %update_tx,
             peer = %peer_addr,
@@ -6648,34 +6703,33 @@ mod tests {
         );
     }
 
-    /// One full-state leg for S1 then one for S2 to a peer whose summary was
-    /// never seen, with S2 already stored throughout. Returns every full state
-    /// put on the wire with the summary sent alongside it, the summary cached
-    /// for the peer after each leg, and S1/S2.
-    async fn run_two_full_state_legs(
+    /// A real `OpManager` hosting one contract, connected to one peer, with a
+    /// stand-in contract handler whose stored state is `stored` throughout.
+    /// Shared by the tests below that drive the real `broadcast_to_single_peer`.
+    struct OnePeerNode {
+        op_manager: std::sync::Arc<crate::node::OpManager>,
+        key: ContractKey,
+        target: crate::ring::PeerKeyLocation,
+        peer_key: PeerKey,
+        handler: tokio::task::JoinHandle<()>,
+        /// Receivers and monitors whose drop would close a channel the node
+        /// still writes to; held for the test's lifetime.
+        _keep_alive: Box<dyn std::any::Any>,
+    }
+
+    async fn one_peer_node(
+        id: &str,
+        stored: freenet_stdlib::prelude::WrappedState,
         snapshot_ok: bool,
-    ) -> (
-        Vec<(Vec<u8>, Vec<u8>)>,
-        Vec<Option<StateSummary<'static>>>,
-        freenet_stdlib::prelude::WrappedState,
-        freenet_stdlib::prelude::WrappedState,
-    ) {
+    ) -> OnePeerNode {
         use std::net::SocketAddr;
         use std::sync::Arc;
 
-        use freenet_stdlib::prelude::WrappedState;
-
         use crate::contract::{ContractHandlerEvent, StoreResponse};
-        use crate::message::{DeltaOrFullState, NetMessage, NetMessageV1};
-        use crate::node::network_bridge::p2p_protoc::{P2pBridge, P2pBridgeEvent};
-        use crate::operations::update::UpdateMsg;
         use crate::ring::PeerKeyLocation;
 
-        let s1 = WrappedState::new(vec![1u8; 32]);
-        let s2 = WrappedState::new(vec![2u8; 32]);
-
         let config_args = crate::config::ConfigArgs {
-            id: Some(format!("bq-5842-snapshot-{snapshot_ok}")),
+            id: Some(id.to_string()),
             mode: Some(crate::contract::OperationMode::Local),
             ..Default::default()
         };
@@ -6683,11 +6737,11 @@ mod tests {
             crate::node::NodeConfig::new(config_args.build().await.expect("build Config"))
                 .await
                 .expect("build NodeConfig");
-        let (_notifications, notification_tx) = crate::node::event_loop_notification_channel();
+        let (notifications, notification_tx) = crate::node::event_loop_notification_channel();
         let (ops_ch_channel, mut ch_channel, wait_for_event) =
             crate::contract::contract_handler_channel();
         let connection_manager = crate::ring::ConnectionManager::new(&node_config);
-        let (result_router_tx, _result_router_rx) = tokio::sync::mpsc::channel(100);
+        let (result_router_tx, result_router_rx) = tokio::sync::mpsc::channel(100);
         let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
         let op_manager = Arc::new(
             crate::node::OpManager::new(
@@ -6730,9 +6784,6 @@ mod tests {
         let target = PeerKeyLocation::new(peer_pub.clone(), peer_addr);
         let peer_key = PeerKey::from(peer_pub);
 
-        // The stand-in executor. The stored state is S2 throughout: the second
-        // write has already committed when the S1 leg runs.
-        let stored = s2.clone();
         let handler = tokio::spawn(async move {
             while let Ok((id, ev, _priority)) = ch_channel.recv_from_sender().await {
                 #[allow(
@@ -6773,6 +6824,60 @@ mod tests {
                 }
             }
         });
+
+        OnePeerNode {
+            op_manager,
+            key,
+            target,
+            peer_key,
+            handler,
+            _keep_alive: Box::new((
+                notifications,
+                result_router_rx,
+                wait_for_event,
+                task_monitor,
+            )),
+        }
+    }
+
+    /// One full-state leg for S1 then one for S2 to a peer whose summary was
+    /// never seen, with S2 already stored throughout. Returns every full state
+    /// put on the wire with the summary sent alongside it, the summary cached
+    /// for the peer after each leg, and S1/S2.
+    async fn run_two_full_state_legs(
+        snapshot_ok: bool,
+    ) -> (
+        Vec<(Vec<u8>, Vec<u8>)>,
+        Vec<Option<StateSummary<'static>>>,
+        freenet_stdlib::prelude::WrappedState,
+        freenet_stdlib::prelude::WrappedState,
+    ) {
+        use std::sync::Arc;
+
+        use freenet_stdlib::prelude::WrappedState;
+
+        use crate::message::{DeltaOrFullState, NetMessage, NetMessageV1};
+        use crate::node::network_bridge::p2p_protoc::{P2pBridge, P2pBridgeEvent};
+        use crate::operations::update::UpdateMsg;
+
+        let s1 = WrappedState::new(vec![1u8; 32]);
+        let s2 = WrappedState::new(vec![2u8; 32]);
+
+        // The stored state is S2 throughout: the second write has already
+        // committed when the S1 leg runs.
+        let OnePeerNode {
+            op_manager,
+            key,
+            target,
+            peer_key,
+            handler,
+            _keep_alive,
+        } = one_peer_node(
+            &format!("bq-5842-snapshot-{snapshot_ok}"),
+            s2.clone(),
+            snapshot_ok,
+        )
+        .await;
 
         let (bridge_tx, mut bridge_rx) = tokio::sync::mpsc::channel::<P2pBridgeEvent>(16);
         let bridge = P2pBridge::new_for_test(bridge_tx, op_manager.clone());
@@ -6826,7 +6931,7 @@ mod tests {
         }
 
         handler.abort();
-        drop((wait_for_event, task_monitor));
+        drop(_keep_alive);
         (sent, recorded, s1, s2)
     }
 
@@ -6904,5 +7009,172 @@ mod tests {
             );
         }
         assert_eq!(recorded, vec![None, None], "nothing recorded for the peer");
+    }
+
+    /// #6143: driving the REAL `broadcast_to_single_peer`, each exit counts
+    /// its own outcome against the contract. A source pin cannot establish
+    /// this: it stays green over a recording call moved into a dead branch.
+    ///
+    /// Sequence against one peer, stored state S throughout:
+    /// 1. no cached summary for the peer: full state sent (`SentFull`), and
+    ///    the delivery caches S's summary for the peer;
+    /// 2. same state again: cached summary byte-equal to ours, so the leg is
+    ///    skipped (`SkipSummaryEqual`) and nothing reaches the bridge;
+    /// 3. a target with no socket address (`SkipNoAddress`);
+    /// 4. the bridge's receiver gone: the send fails (`SendFailed`);
+    /// 5. the contract no longer hosted (`SkipNotHosted`).
+    #[tokio::test(flavor = "current_thread")]
+    async fn each_broadcast_leg_exit_is_counted_against_its_contract() {
+        use std::sync::Arc;
+
+        use freenet_stdlib::prelude::WrappedState;
+
+        use crate::node::network_bridge::p2p_protoc::{P2pBridge, P2pBridgeEvent};
+        use crate::operations::update::propagation_stats::PropagationEvent as Ev;
+
+        let state = WrappedState::new(vec![3u8; 32]);
+        let node = one_peer_node("bq-6143-leg-outcomes", state.clone(), true).await;
+        let op_manager = &node.op_manager;
+        let key = node.key;
+        let fanout: super::FanoutTargets = Arc::new(vec![node.target.pub_key().clone()]);
+        let events = || {
+            op_manager
+                .update_propagation_stats
+                .events_for_test(key.id())
+        };
+
+        let (bridge_tx, mut bridge_rx) = tokio::sync::mpsc::channel::<P2pBridgeEvent>(16);
+        let bridge = P2pBridge::new_for_test(bridge_tx, op_manager.clone());
+        let leg = |target: crate::ring::PeerKeyLocation| {
+            super::broadcast_to_single_peer(
+                &bridge,
+                op_manager,
+                key,
+                state.clone(),
+                target,
+                None,
+                fanout.clone(),
+            )
+        };
+
+        // 1. first send: full state.
+        leg(node.target.clone()).await;
+        assert!(bridge_rx.try_recv().is_ok(), "the first leg must send");
+        assert_eq!(events().get(Ev::SentFull), 1, "{:?}", events());
+        assert_eq!(
+            op_manager
+                .interest_manager
+                .get_peer_summary(&key, &node.peer_key),
+            Some(summary_of(state.as_ref())),
+            "precondition for step 2: the delivery cached our summary"
+        );
+
+        // 2. converged by cached summary: skipped, nothing on the bridge.
+        leg(node.target.clone()).await;
+        assert!(
+            bridge_rx.try_recv().is_err(),
+            "a converged peer gets nothing"
+        );
+        assert_eq!(events().get(Ev::SkipSummaryEqual), 1, "{:?}", events());
+        assert_eq!(events().sent(), 1, "the skip must not count as a send");
+
+        // 3. no socket address.
+        leg(crate::ring::PeerKeyLocation::with_unknown_addr(
+            node.target.pub_key().clone(),
+        ))
+        .await;
+        assert_eq!(events().get(Ev::SkipNoAddress), 1, "{:?}", events());
+
+        // 4. bridge closed: a second peer, with no cached summary, gets as
+        //    far as the send, which then fails.
+        drop(bridge_rx);
+        let other_addr: std::net::SocketAddr = "127.0.0.1:47102".parse().unwrap();
+        let other_pub = crate::transport::TransportPublicKey::from_bytes([8u8; 32]);
+        assert!(op_manager.ring.connection_manager.add_connection(
+            crate::ring::Location::new(0.6),
+            other_addr,
+            other_pub.clone(),
+            false,
+        ));
+        leg(crate::ring::PeerKeyLocation::new(other_pub, other_addr)).await;
+        assert_eq!(events().get(Ev::SendFailed), 1, "{:?}", events());
+        assert_eq!(events().sent(), 1, "a failed send is not a send");
+
+        // 5. a contract this node does not host: counted against THAT
+        //    contract, not the hosted one.
+        let unhosted = ContractKey::from_id_and_code(
+            ContractInstanceId::new([59u8; 32]),
+            CodeHash::new([42u8; 32]),
+        );
+        super::broadcast_to_single_peer(
+            &bridge,
+            op_manager,
+            unhosted,
+            state.clone(),
+            node.target.clone(),
+            None,
+            fanout.clone(),
+        )
+        .await;
+        assert_eq!(
+            op_manager
+                .update_propagation_stats
+                .events_for_test(unhosted.id())
+                .get(Ev::SkipNotHosted),
+            1
+        );
+        assert_eq!(events().get(Ev::SkipNotHosted), 0);
+
+        node.handler.abort();
+    }
+
+    /// #6143: a fan-out or heal dropped because the event-loop channel is full
+    /// is a whole UPDATE that never leaves this node, and the drop itself logs
+    /// at debug. Driving the real `OpManager::try_notify_node_event` into a
+    /// full channel must count each drop against the contract.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_dropped_fanout_or_heal_event_is_counted() {
+        use freenet_stdlib::prelude::WrappedState;
+
+        use crate::message::NodeEvent;
+        use crate::operations::update::propagation_stats::PropagationEvent as Ev;
+
+        let state = WrappedState::new(vec![4u8; 32]);
+        let node = one_peer_node("bq-6143-notify-drops", state.clone(), true).await;
+        let op_manager = &node.op_manager;
+        let key = node.key;
+        let peer_addr = node.target.socket_addr().expect("test peer has an address");
+
+        // Nothing drains the channel, so it fills and then refuses.
+        let mut fanout_drops = 0u64;
+        for _ in 0..100_000 {
+            let ev = NodeEvent::BroadcastStateChange {
+                key,
+                new_state: state.clone(),
+                is_retry: false,
+                is_reemit: false,
+            };
+            if op_manager.try_notify_node_event(ev).is_err() {
+                fanout_drops += 1;
+                if fanout_drops == 3 {
+                    break;
+                }
+            }
+        }
+        assert_eq!(fanout_drops, 3, "the channel never filled");
+        let heal = NodeEvent::SyncStateToPeer {
+            key,
+            new_state: state.clone(),
+            target: peer_addr,
+        };
+        assert!(op_manager.try_notify_node_event(heal).is_err());
+
+        let events = op_manager
+            .update_propagation_stats
+            .events_for_test(key.id());
+        assert_eq!(events.get(Ev::FanoutEventDropped), 3, "{events:?}");
+        assert_eq!(events.get(Ev::HealEventDropped), 1, "{events:?}");
+
+        node.handler.abort();
     }
 }

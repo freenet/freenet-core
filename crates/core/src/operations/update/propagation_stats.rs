@@ -34,11 +34,33 @@
 //! map is size-capped ([`MAX_TRACKED_CONTRACTS`]) so a churn of
 //! network-influenced contract keys cannot grow it unboundedly (per the
 //! per-key-collection rule in `.claude/rules/code-style.md`).
+//!
+//! ## Per-leg outcomes and the origination stall WARN (#6143)
+//!
+//! `targets_avg` counts fan-out targets RESOLVED, which is decided before any
+//! per-peer work. In #6143 a node logged `targets_avg=14.0` for each of its
+//! own UPDATEs for 80 minutes while no receiver applied any of them, and every
+//! place a leg can end without a send logged at debug or trace, which release
+//! builds compile out (`release_max_level_info`). So the summary also counts
+//! what each leg actually did ([`PropagationEvent`]): handed a delta or a full
+//! state to the network bridge, or skipped and why, plus the best-effort
+//! `try_notify` drops that lose a whole fan-out or heal before it starts, and
+//! the receiver-side pre-merge skips. The same counts go to the
+//! `broadcast_payload_mix` telemetry event so the fleet can see them.
+//!
+//! On top of that, [`detect_stalls`] WARNs when a contract had
+//! locally-originated (client) updates that resolved targets in one window and
+//! no send was handed to the bridge for it in that window or the next. That is
+//! the #6143 shape at the layer this module can see. It does not see past the
+//! bridge: a leg handed to the event loop and lost later (transport, receiver)
+//! still counts as sent here.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use dashmap::DashMap;
 use freenet_stdlib::prelude::ContractInstanceId;
+use parking_lot::Mutex;
 
 use crate::config::GlobalExecutor;
 
@@ -59,6 +81,167 @@ const TOP_K: usize = 8;
 /// 4096 is comfortably above the active-contract count of a busy gateway
 /// while still capping memory at a few hundred KB worst case.
 const MAX_TRACKED_CONTRACTS: usize = 4096;
+
+/// Cap on contracts carried from one window to the next as stall candidates.
+/// A candidate needs a local client update, so the real population is the
+/// handful of contracts this node's own clients write to. The cap only stops
+/// a client flood from growing the map.
+const MAX_STALL_CANDIDATES: usize = 256;
+
+/// One countable thing that happened to an UPDATE's propagation for a
+/// contract, other than the fan-out target resolution `record_broadcast`
+/// already counts. See the module docs (#6143).
+///
+/// Counts are per event, not per leg: [`Self::StreamUndelivered`] is a later
+/// event on a leg already counted as [`Self::SentFull`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PropagationEvent {
+    /// A local client UPDATE that changed this node's state, and so emitted a
+    /// fan-out. The denominator for the stall check.
+    ClientOriginated,
+    /// A delta handed to the network bridge (`bridge.send` returned `Ok`).
+    SentDelta,
+    /// A full state handed to the network bridge: an inline send that
+    /// returned `Ok`, or a stream whose dispatch returned `Ok`.
+    SentFull,
+    /// Skipped: our cached copy of the peer's summary is byte-equal to ours.
+    SkipSummaryEqual,
+    /// Skipped: the shared delta cache holds an empty delta for this summary
+    /// pair, so the peer is believed converged.
+    SkipCachedConverged,
+    /// Skipped: the bounded WASM staleness probe said the peer is converged.
+    SkipProbeConverged,
+    /// Skipped: `compute_delta` returned an empty delta (`Ok(None)`).
+    SkipEmptyDelta,
+    /// Skipped: `should_broadcast_contract` was false (not hosted or in use).
+    SkipNotHosted,
+    /// Skipped: the target had no socket address.
+    SkipNoAddress,
+    /// The send itself failed: `bridge.send` or the stream dispatch returned
+    /// `Err`, or the payload failed to serialize.
+    SendFailed,
+    /// A full-state stream was dispatched but dropped or timed out before the
+    /// transport reported it delivered.
+    StreamUndelivered,
+    /// A `BroadcastStateChange` (a whole fan-out) was dropped because the
+    /// event-loop notification channel was full.
+    FanoutEventDropped,
+    /// A `SyncStateToPeer` (a targeted heal) was dropped because the
+    /// event-loop notification channel was full.
+    HealEventDropped,
+    /// Receiver: an inbound broadcast skipped by the 60 s payload dedup cache.
+    RxDedup,
+    /// Receiver: an inbound broadcast skipped because the payload is already
+    /// merged into local state.
+    RxAlreadyApplied,
+    /// Receiver: an inbound broadcast skipped by the merge-failure backoff
+    /// (per-sender cooldown or a known-failed payload).
+    RxBackoff,
+}
+
+impl PropagationEvent {
+    /// Every event, in reporting order. Kept in lockstep with
+    /// [`Self::index`] by `propagation_events_are_densely_indexed`.
+    pub(crate) const ALL: [PropagationEvent; 16] = [
+        PropagationEvent::ClientOriginated,
+        PropagationEvent::SentDelta,
+        PropagationEvent::SentFull,
+        PropagationEvent::SkipSummaryEqual,
+        PropagationEvent::SkipCachedConverged,
+        PropagationEvent::SkipProbeConverged,
+        PropagationEvent::SkipEmptyDelta,
+        PropagationEvent::SkipNotHosted,
+        PropagationEvent::SkipNoAddress,
+        PropagationEvent::SendFailed,
+        PropagationEvent::StreamUndelivered,
+        PropagationEvent::FanoutEventDropped,
+        PropagationEvent::HealEventDropped,
+        PropagationEvent::RxDedup,
+        PropagationEvent::RxAlreadyApplied,
+        PropagationEvent::RxBackoff,
+    ];
+
+    pub(crate) const COUNT: usize = Self::ALL.len();
+
+    pub(crate) const fn index(self) -> usize {
+        match self {
+            PropagationEvent::ClientOriginated => 0,
+            PropagationEvent::SentDelta => 1,
+            PropagationEvent::SentFull => 2,
+            PropagationEvent::SkipSummaryEqual => 3,
+            PropagationEvent::SkipCachedConverged => 4,
+            PropagationEvent::SkipProbeConverged => 5,
+            PropagationEvent::SkipEmptyDelta => 6,
+            PropagationEvent::SkipNotHosted => 7,
+            PropagationEvent::SkipNoAddress => 8,
+            PropagationEvent::SendFailed => 9,
+            PropagationEvent::StreamUndelivered => 10,
+            PropagationEvent::FanoutEventDropped => 11,
+            PropagationEvent::HealEventDropped => 12,
+            PropagationEvent::RxDedup => 13,
+            PropagationEvent::RxAlreadyApplied => 14,
+            PropagationEvent::RxBackoff => 15,
+        }
+    }
+
+    /// Stable field name, used in the INFO line and as the telemetry field
+    /// suffix. Changing one breaks log and dashboard queries.
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            PropagationEvent::ClientOriginated => "client_originated",
+            PropagationEvent::SentDelta => "sent_delta",
+            PropagationEvent::SentFull => "sent_full",
+            PropagationEvent::SkipSummaryEqual => "skip_summary_equal",
+            PropagationEvent::SkipCachedConverged => "skip_cached_converged",
+            PropagationEvent::SkipProbeConverged => "skip_probe_converged",
+            PropagationEvent::SkipEmptyDelta => "skip_empty_delta",
+            PropagationEvent::SkipNotHosted => "skip_not_hosted",
+            PropagationEvent::SkipNoAddress => "skip_no_address",
+            PropagationEvent::SendFailed => "send_failed",
+            PropagationEvent::StreamUndelivered => "stream_undelivered",
+            PropagationEvent::FanoutEventDropped => "fanout_event_dropped",
+            PropagationEvent::HealEventDropped => "heal_event_dropped",
+            PropagationEvent::RxDedup => "rx_dedup",
+            PropagationEvent::RxAlreadyApplied => "rx_already_applied",
+            PropagationEvent::RxBackoff => "rx_backoff",
+        }
+    }
+}
+
+/// Per-event counts, indexed by [`PropagationEvent::index`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct EventCounts([u64; PropagationEvent::COUNT]);
+
+impl EventCounts {
+    pub(crate) fn get(&self, ev: PropagationEvent) -> u64 {
+        // `index()` is an exhaustive match and `ALL`'s length sizes the
+        // array; `propagation_events_are_densely_indexed` keeps them in step,
+        // and `get` degrades to 0 rather than panicking if they drift.
+        self.0.get(ev.index()).copied().unwrap_or(0)
+    }
+
+    fn add(&mut self, ev: PropagationEvent, n: u64) {
+        if let Some(slot) = self.0.get_mut(ev.index()) {
+            *slot = slot.saturating_add(n);
+        }
+    }
+
+    fn merge(&mut self, other: &EventCounts) {
+        for ev in PropagationEvent::ALL {
+            self.add(ev, other.get(ev));
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.iter().all(|&n| n == 0)
+    }
+
+    /// Payloads handed to the network bridge.
+    pub(crate) fn sent(&self) -> u64 {
+        self.get(PropagationEvent::SentDelta)
+            .saturating_add(self.get(PropagationEvent::SentFull))
+    }
+}
 
 /// Per-contract windowed counters.
 ///
@@ -98,6 +281,8 @@ struct ContractCounters {
     /// from `BroadcastTargetResult`). A persistently non-zero value points at
     /// stale interest state.
     interest_resolve_failed: u64,
+    /// Per-leg outcomes and the other [`PropagationEvent`]s (#6143).
+    events: EventCounts,
 }
 
 impl ContractCounters {
@@ -108,6 +293,7 @@ impl ContractCounters {
             && self.no_targets == 0
             && self.fully_covered == 0
             && self.interest_resolve_failed == 0
+            && self.events.is_empty()
     }
 }
 
@@ -125,9 +311,18 @@ pub(crate) struct ContractSummary {
     /// `no_targets`.
     pub(crate) fully_covered: u64,
     pub(crate) interest_resolve_failed: u64,
+    pub(crate) events: EventCounts,
 }
 
 impl ContractSummary {
+    /// True when the contract did anything this window worth a line: a
+    /// fan-out, or any [`PropagationEvent`]. A heal-only or receive-only
+    /// contract has no `updates` but still counts. `interest_resolve_failed`
+    /// alone does not, since it is only ever recorded alongside an update.
+    fn is_active(&self) -> bool {
+        self.updates > 0 || !self.events.is_empty()
+    }
+
     /// Mean resolved targets per update attempt, rounded to one decimal.
     /// Returns 0.0 when there were no attempts (avoids divide-by-zero).
     fn targets_avg(&self) -> f64 {
@@ -157,6 +352,8 @@ pub(crate) struct WindowSummary {
     pub(crate) fully_covered: u64,
     /// Total interest-resolve failures across all contracts this window.
     pub(crate) interest_resolve_failed: u64,
+    /// [`PropagationEvent`] totals across all contracts this window.
+    pub(crate) events: EventCounts,
     /// The top-K contracts by update activity (descending), for per-contract
     /// lines. Length is at most [`TOP_K`].
     pub(crate) top: Vec<ContractSummary>,
@@ -179,16 +376,16 @@ impl WindowSummary {
 
 /// Pure aggregation: turn a set of drained per-contract summaries into a
 /// bounded [`WindowSummary`]. Selects the top-`top_k` contracts by update
-/// count (ties broken by contract id for determinism) and rolls the rest up
-/// into an `others` count. Contracts with zero update attempts are ignored
-/// (a tracked contract can have a live map entry but no activity this window).
+/// count, then by bridge sends (ties broken by contract id for determinism)
+/// and rolls the rest up into an `others` count. Inactive contracts (see
+/// [`ContractSummary::is_active`]) are ignored.
 ///
 /// Extracted from the draining/IO so it can be unit-tested without a runtime.
 pub(crate) fn aggregate_window(
     mut summaries: Vec<ContractSummary>,
     top_k: usize,
 ) -> Option<WindowSummary> {
-    summaries.retain(|s| s.updates > 0);
+    summaries.retain(ContractSummary::is_active);
     if summaries.is_empty() {
         return None;
     }
@@ -199,6 +396,10 @@ pub(crate) fn aggregate_window(
     let no_targets: u64 = summaries.iter().map(|s| s.no_targets).sum();
     let fully_covered: u64 = summaries.iter().map(|s| s.fully_covered).sum();
     let interest_resolve_failed: u64 = summaries.iter().map(|s| s.interest_resolve_failed).sum();
+    let mut events = EventCounts::default();
+    for s in &summaries {
+        events.merge(&s.events);
+    }
 
     // Most active first; deterministic tie-break on the contract's raw bytes
     // so a given window always produces the same top-K regardless of map
@@ -208,6 +409,7 @@ pub(crate) fn aggregate_window(
     summaries.sort_by(|a, b| {
         b.updates
             .cmp(&a.updates)
+            .then_with(|| b.events.sent().cmp(&a.events.sent()))
             .then_with(|| a.contract.as_bytes().cmp(b.contract.as_bytes()))
     });
 
@@ -221,9 +423,95 @@ pub(crate) fn aggregate_window(
         no_targets,
         fully_covered,
         interest_resolve_failed,
+        events,
         top: summaries,
         others,
     })
+}
+
+/// A contract whose local client updates resolved fan-out targets but put
+/// nothing on the network bridge for two consecutive windows (#6143).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StallReport {
+    pub(crate) contract: ContractInstanceId,
+    /// Client updates in the window that raised the candidate.
+    pub(crate) client_originated: u64,
+    /// Targets resolved for this contract in that window.
+    pub(crate) targets_total: u64,
+    /// Every event for this contract across both windows, so the WARN can say
+    /// where the legs went.
+    pub(crate) events: EventCounts,
+}
+
+/// A window's stall candidate, carried until the next window confirms or
+/// clears it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StallCandidate {
+    client_originated: u64,
+    targets_total: u64,
+    events: EventCounts,
+}
+
+/// Decide which contracts stalled, given last window's candidates and this
+/// window's per-contract summaries. Replaces `pending` with this window's
+/// candidates.
+///
+/// A candidate is a contract with at least one local client update, at least
+/// one resolved fan-out target, and zero payloads handed to the network bridge
+/// in the window. It is reported if the NEXT window also hands nothing to the
+/// bridge for it. The second window is grace for a leg queued near the end of
+/// a window (or parked waiting on lane capacity) that sends just after the
+/// boundary: one send in either window clears it. A contract that keeps
+/// stalling with fresh client updates is reported once per window.
+///
+/// Zero resolved targets is deliberately not a candidate: that is the
+/// `no_targets` outcome, which `handle_broadcast_state_change` already WARNs.
+///
+/// Pure so the decision can be unit-tested without a runtime.
+pub(crate) fn detect_stalls(
+    pending: &mut HashMap<ContractInstanceId, StallCandidate>,
+    window: &[ContractSummary],
+) -> Vec<StallReport> {
+    let current: HashMap<ContractInstanceId, &ContractSummary> =
+        window.iter().map(|s| (s.contract, s)).collect();
+
+    let mut reports = Vec::new();
+    for (contract, candidate) in pending.drain() {
+        let now = current.get(&contract);
+        if now.is_some_and(|s| s.events.sent() > 0) {
+            continue;
+        }
+        let mut events = candidate.events;
+        if let Some(s) = now {
+            events.merge(&s.events);
+        }
+        reports.push(StallReport {
+            contract,
+            client_originated: candidate.client_originated,
+            targets_total: candidate.targets_total,
+            events,
+        });
+    }
+    reports.sort_by(|a, b| a.contract.as_bytes().cmp(b.contract.as_bytes()));
+
+    for s in window {
+        let client_originated = s.events.get(PropagationEvent::ClientOriginated);
+        if client_originated == 0 || s.targets_total == 0 || s.events.sent() > 0 {
+            continue;
+        }
+        if pending.len() >= MAX_STALL_CANDIDATES {
+            break;
+        }
+        pending.insert(
+            s.contract,
+            StallCandidate {
+                client_originated,
+                targets_total: s.targets_total,
+                events: s.events,
+            },
+        );
+    }
+    reports
 }
 
 /// Bounded per-contract UPDATE-propagation counters with a periodic summary
@@ -232,13 +520,44 @@ pub(crate) fn aggregate_window(
 /// the background task started with [`Self::start_summary_task`].
 pub(crate) struct UpdatePropagationStats {
     contracts: DashMap<ContractInstanceId, ContractCounters>,
+    /// Stall candidates from the previous window. Touched only by the drain,
+    /// which runs on one task, so the lock is never contended.
+    stall_candidates: Mutex<HashMap<ContractInstanceId, StallCandidate>>,
 }
 
 impl UpdatePropagationStats {
     pub(crate) fn new() -> Self {
         Self {
             contracts: DashMap::new(),
+            stall_candidates: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Count one [`PropagationEvent`] for `contract`.
+    ///
+    /// Same per-key write guard and tracking cap as [`Self::record_broadcast`].
+    /// Production code reaches this through [`record_propagation_event`], which
+    /// also feeds the telemetry window, so the log and the telemetry agree.
+    pub(crate) fn record_event(&self, contract: ContractInstanceId, ev: PropagationEvent) {
+        if !self.contracts.contains_key(&contract) && self.contracts.len() >= MAX_TRACKED_CONTRACTS
+        {
+            return;
+        }
+        self.contracts
+            .entry(contract)
+            .or_default()
+            .events
+            .add(ev, 1);
+    }
+
+    /// Non-draining read of one contract's counters, for tests in other
+    /// modules that drive the real production call sites.
+    #[cfg(test)]
+    pub(crate) fn events_for_test(&self, contract: &ContractInstanceId) -> EventCounts {
+        self.contracts
+            .get(contract)
+            .map(|c| c.events)
+            .unwrap_or_default()
     }
 
     /// Record the terminal outcome of one logical broadcast for `contract`.
@@ -338,6 +657,7 @@ impl UpdatePropagationStats {
                     no_targets: counters.no_targets,
                     fully_covered: counters.fully_covered,
                     interest_resolve_failed: counters.interest_resolve_failed,
+                    events: counters.events,
                 });
             }
             // Remove every entry — clears the map so the cap resets each window.
@@ -346,15 +666,26 @@ impl UpdatePropagationStats {
         out
     }
 
-    /// Drain the current window and emit it at INFO. Public for the periodic
-    /// task and for deterministic unit tests (which call it directly after
-    /// recording, instead of waiting on the real-time ticker).
-    pub(crate) fn drain_and_log(&self) {
-        let Some(summary) = aggregate_window(self.drain_window(), TOP_K) else {
+    /// Drain the current window, emit it at INFO, and WARN for any contract
+    /// whose local client updates stalled (see [`detect_stalls`]). Returns
+    /// the number of stall WARNs emitted, for the telemetry window.
+    ///
+    /// Public for the periodic task and for deterministic unit tests (which
+    /// call it directly after recording, instead of waiting on the real-time
+    /// ticker).
+    pub(crate) fn drain_and_log(&self) -> u64 {
+        let drained = self.drain_window();
+        let stalls = detect_stalls(&mut self.stall_candidates.lock(), &drained);
+        for stall in &stalls {
+            log_stall(stall);
+        }
+
+        let Some(summary) = aggregate_window(drained, TOP_K) else {
             // Nothing happened this window — stay silent (budget rule).
-            return;
+            return stalls.len() as u64;
         };
 
+        let e = &summary.events;
         tracing::info!(
             contracts = summary.contracts,
             updates = summary.updates,
@@ -362,12 +693,29 @@ impl UpdatePropagationStats {
             no_targets = summary.no_targets,
             fully_covered = summary.fully_covered,
             interest_resolve_failed = summary.interest_resolve_failed,
+            client_originated = e.get(PropagationEvent::ClientOriginated),
+            sent_delta = e.get(PropagationEvent::SentDelta),
+            sent_full = e.get(PropagationEvent::SentFull),
+            skip_summary_equal = e.get(PropagationEvent::SkipSummaryEqual),
+            skip_cached_converged = e.get(PropagationEvent::SkipCachedConverged),
+            skip_probe_converged = e.get(PropagationEvent::SkipProbeConverged),
+            skip_empty_delta = e.get(PropagationEvent::SkipEmptyDelta),
+            skip_not_hosted = e.get(PropagationEvent::SkipNotHosted),
+            skip_no_address = e.get(PropagationEvent::SkipNoAddress),
+            send_failed = e.get(PropagationEvent::SendFailed),
+            stream_undelivered = e.get(PropagationEvent::StreamUndelivered),
+            fanout_event_dropped = e.get(PropagationEvent::FanoutEventDropped),
+            heal_event_dropped = e.get(PropagationEvent::HealEventDropped),
+            rx_dedup = e.get(PropagationEvent::RxDedup),
+            rx_already_applied = e.get(PropagationEvent::RxAlreadyApplied),
+            rx_backoff = e.get(PropagationEvent::RxBackoff),
             window_s = SUMMARY_WINDOW.as_secs(),
             phase = "summary",
             "update_propagation_summary"
         );
 
         for c in &summary.top {
+            let e = &c.events;
             tracing::info!(
                 contract = %format!("{:.8}", c.contract),
                 updates = c.updates,
@@ -375,6 +723,22 @@ impl UpdatePropagationStats {
                 no_targets = c.no_targets,
                 fully_covered = c.fully_covered,
                 interest_resolve_failed = c.interest_resolve_failed,
+                client_originated = e.get(PropagationEvent::ClientOriginated),
+                sent_delta = e.get(PropagationEvent::SentDelta),
+                sent_full = e.get(PropagationEvent::SentFull),
+                skip_summary_equal = e.get(PropagationEvent::SkipSummaryEqual),
+                skip_cached_converged = e.get(PropagationEvent::SkipCachedConverged),
+                skip_probe_converged = e.get(PropagationEvent::SkipProbeConverged),
+                skip_empty_delta = e.get(PropagationEvent::SkipEmptyDelta),
+                skip_not_hosted = e.get(PropagationEvent::SkipNotHosted),
+                skip_no_address = e.get(PropagationEvent::SkipNoAddress),
+                send_failed = e.get(PropagationEvent::SendFailed),
+                stream_undelivered = e.get(PropagationEvent::StreamUndelivered),
+                fanout_event_dropped = e.get(PropagationEvent::FanoutEventDropped),
+                heal_event_dropped = e.get(PropagationEvent::HealEventDropped),
+                rx_dedup = e.get(PropagationEvent::RxDedup),
+                rx_already_applied = e.get(PropagationEvent::RxAlreadyApplied),
+                rx_backoff = e.get(PropagationEvent::RxBackoff),
                 phase = "summary_contract",
                 "update_propagation_summary contract detail"
             );
@@ -388,6 +752,7 @@ impl UpdatePropagationStats {
                 summary.others
             );
         }
+        stalls.len() as u64
     }
 
     /// Spawn the background summary task and return its `JoinHandle` so the
@@ -400,7 +765,14 @@ impl UpdatePropagationStats {
     /// the counters themselves carry no timestamps, so this is
     /// deterministic-test-friendly without a `TimeSource` — tests call
     /// [`Self::drain_and_log`] directly.
-    pub(crate) fn start_summary_task(self: std::sync::Arc<Self>) -> tokio::task::JoinHandle<()> {
+    ///
+    /// `on_stalls` receives each window's stall WARN count. The node passes
+    /// it to the `broadcast_payload_mix` telemetry window, so the event
+    /// carries it next to the counts that explain it.
+    pub(crate) fn start_summary_task(
+        self: std::sync::Arc<Self>,
+        on_stalls: impl Fn(u64) + Send + 'static,
+    ) -> tokio::task::JoinHandle<()> {
         GlobalExecutor::spawn(async move {
             // No startup jitter on purpose. The sibling periodic tasks draw
             // `GlobalRng` for jitter to de-correlate *network* side-effects
@@ -416,10 +788,49 @@ impl UpdatePropagationStats {
             ticker.tick().await;
             loop {
                 ticker.tick().await;
-                self.drain_and_log();
+                on_stalls(self.drain_and_log());
             }
         })
     }
+}
+
+/// WARN for one stalled contract. Rate-limited by construction: at most once
+/// per contract per window, and only for contracts with local client updates.
+fn log_stall(stall: &StallReport) {
+    let e = &stall.events;
+    tracing::warn!(
+        contract = %stall.contract,
+        client_originated = stall.client_originated,
+        targets_total = stall.targets_total,
+        skip_summary_equal = e.get(PropagationEvent::SkipSummaryEqual),
+        skip_cached_converged = e.get(PropagationEvent::SkipCachedConverged),
+        skip_probe_converged = e.get(PropagationEvent::SkipProbeConverged),
+        skip_empty_delta = e.get(PropagationEvent::SkipEmptyDelta),
+        skip_not_hosted = e.get(PropagationEvent::SkipNotHosted),
+        skip_no_address = e.get(PropagationEvent::SkipNoAddress),
+        send_failed = e.get(PropagationEvent::SendFailed),
+        fanout_event_dropped = e.get(PropagationEvent::FanoutEventDropped),
+        window_s = SUMMARY_WINDOW.as_secs(),
+        phase = "origination_stall",
+        "update_propagation_stalled: local client updates found broadcast targets \
+         but no payload was handed to the network for two windows (#6143)"
+    );
+}
+
+/// Count one [`PropagationEvent`] in BOTH the per-contract INFO summary and
+/// the node-wide `broadcast_payload_mix` telemetry window.
+///
+/// The single entry point production code uses, so the two can never
+/// disagree about what happened.
+pub(crate) fn record_propagation_event(
+    op_manager: &crate::node::OpManager,
+    contract: &ContractInstanceId,
+    ev: PropagationEvent,
+) {
+    op_manager
+        .update_propagation_stats
+        .record_event(*contract, ev);
+    op_manager.payload_mix.record_propagation_event(ev);
 }
 
 #[cfg(test)]
@@ -447,6 +858,7 @@ mod tests {
             no_targets: 0,
             fully_covered: 0,
             interest_resolve_failed: 5,
+            events: EventCounts::default(),
         }];
         assert!(aggregate_window(summaries, TOP_K).is_none());
     }
@@ -461,6 +873,7 @@ mod tests {
                 no_targets: 0,
                 fully_covered: 0,
                 interest_resolve_failed: 1,
+                events: EventCounts::default(),
             },
             ContractSummary {
                 contract: cid(2),
@@ -469,6 +882,7 @@ mod tests {
                 no_targets: 3,
                 fully_covered: 0,
                 interest_resolve_failed: 4,
+                events: EventCounts::default(),
             },
         ];
         let w = aggregate_window(summaries, TOP_K).expect("non-empty");
@@ -498,6 +912,7 @@ mod tests {
                 no_targets: 0,
                 fully_covered: 0,
                 interest_resolve_failed: 0,
+                events: EventCounts::default(),
             })
             .collect();
         let w = aggregate_window(summaries, 2).expect("non-empty");
@@ -521,6 +936,7 @@ mod tests {
                 no_targets: 0,
                 fully_covered: 0,
                 interest_resolve_failed: 0,
+                events: EventCounts::default(),
             },
             ContractSummary {
                 contract: cid(3),
@@ -529,6 +945,7 @@ mod tests {
                 no_targets: 0,
                 fully_covered: 0,
                 interest_resolve_failed: 0,
+                events: EventCounts::default(),
             },
         ];
         let w = aggregate_window(summaries, 1).expect("non-empty");
@@ -950,5 +1367,285 @@ mod tests {
             "the fresh-no-target record must be gated on `!is_retry && !is_reemit` so retry \
              and #4359 deferred re-emissions are not counted as fresh broadcasts."
         );
+    }
+
+    // ── #6143: per-leg outcomes and the origination stall WARN ────────────
+
+    fn counts(pairs: &[(PropagationEvent, u64)]) -> EventCounts {
+        let mut c = EventCounts::default();
+        for (ev, n) in pairs {
+            c.add(*ev, *n);
+        }
+        c
+    }
+
+    fn summary(contract: ContractInstanceId, targets: u64, events: EventCounts) -> ContractSummary {
+        ContractSummary {
+            contract,
+            updates: u64::from(targets > 0),
+            targets_total: targets,
+            no_targets: 0,
+            fully_covered: 0,
+            interest_resolve_failed: 0,
+            events,
+        }
+    }
+
+    #[test]
+    fn propagation_events_are_densely_indexed() {
+        let mut labels = std::collections::HashSet::new();
+        for (i, ev) in PropagationEvent::ALL.iter().enumerate() {
+            assert_eq!(ev.index(), i, "{ev:?} is out of place in ALL");
+            assert!(labels.insert(ev.label()), "duplicate label {}", ev.label());
+        }
+    }
+
+    #[test]
+    fn each_event_is_counted_against_its_own_contract() {
+        let stats = UpdatePropagationStats::new();
+        let (a, b) = (cid(1), cid(2));
+        for ev in PropagationEvent::ALL {
+            stats.record_event(a, ev);
+        }
+        stats.record_event(a, PropagationEvent::SkipSummaryEqual);
+        stats.record_event(b, PropagationEvent::RxBackoff);
+
+        let a_events = stats.events_for_test(&a);
+        for ev in PropagationEvent::ALL {
+            let want = if ev == PropagationEvent::SkipSummaryEqual {
+                2
+            } else {
+                1
+            };
+            assert_eq!(a_events.get(ev), want, "{ev:?}");
+        }
+        let b_events = stats.events_for_test(&b);
+        assert_eq!(b_events.get(PropagationEvent::RxBackoff), 1);
+        assert_eq!(b_events.sent(), 0);
+        assert_eq!(a_events.sent(), 2, "sent = sent_delta + sent_full");
+    }
+
+    /// A contract with no fan-out of its own (a heal-only or receive-only
+    /// contract) still has a story to tell, so it must not be filtered out of
+    /// the window the way an idle contract is.
+    #[test]
+    fn a_window_with_only_propagation_events_is_still_reported() {
+        let w = aggregate_window(
+            vec![summary(
+                cid(4),
+                0,
+                counts(&[(PropagationEvent::RxDedup, 3)]),
+            )],
+            TOP_K,
+        )
+        .expect("an event-only contract is activity");
+        assert_eq!(w.contracts, 1);
+        assert_eq!(w.updates, 0);
+        assert_eq!(w.events.get(PropagationEvent::RxDedup), 3);
+    }
+
+    /// The #6143 signature: a client update found 14 targets and every leg was
+    /// skipped. One window raises a candidate; a second window with no send
+    /// confirms it, exactly once.
+    #[test]
+    fn a_client_update_with_targets_and_no_send_for_two_windows_is_a_stall() {
+        let c = cid(9);
+        let mut pending = HashMap::new();
+        let w1 = vec![summary(
+            c,
+            14,
+            counts(&[
+                (PropagationEvent::ClientOriginated, 1),
+                (PropagationEvent::SkipSummaryEqual, 14),
+            ]),
+        )];
+        assert!(detect_stalls(&mut pending, &w1).is_empty(), "grace window");
+        assert_eq!(pending.len(), 1);
+
+        let reports = detect_stalls(&mut pending, &[]);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].contract, c);
+        assert_eq!(reports[0].client_originated, 1);
+        assert_eq!(reports[0].targets_total, 14);
+        assert_eq!(
+            reports[0].events.get(PropagationEvent::SkipSummaryEqual),
+            14,
+            "the WARN must carry where the legs went"
+        );
+        assert!(pending.is_empty(), "reported once, not every window after");
+        assert!(detect_stalls(&mut pending, &[]).is_empty());
+    }
+
+    #[test]
+    fn a_send_in_the_grace_window_clears_the_candidate() {
+        let c = cid(9);
+        let mut pending = HashMap::new();
+        detect_stalls(
+            &mut pending,
+            &[summary(
+                c,
+                3,
+                counts(&[(PropagationEvent::ClientOriginated, 1)]),
+            )],
+        );
+        // The legs were queued near the boundary and sent in the next window.
+        let w2 = vec![summary(c, 0, counts(&[(PropagationEvent::SentDelta, 3)]))];
+        assert!(detect_stalls(&mut pending, &w2).is_empty());
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn non_candidates_never_warn() {
+        let mut pending = HashMap::new();
+        let w = vec![
+            // Sent in the same window.
+            summary(
+                cid(1),
+                5,
+                counts(&[
+                    (PropagationEvent::ClientOriginated, 1),
+                    (PropagationEvent::SentFull, 1),
+                ]),
+            ),
+            // No targets: the NO_TARGETS path, which already WARNs itself.
+            summary(
+                cid(2),
+                0,
+                counts(&[(PropagationEvent::ClientOriginated, 1)]),
+            ),
+            // No client update: relayed traffic that found every peer current.
+            summary(
+                cid(3),
+                5,
+                counts(&[(PropagationEvent::SkipSummaryEqual, 5)]),
+            ),
+        ];
+        assert!(detect_stalls(&mut pending, &w).is_empty());
+        assert!(pending.is_empty(), "none of these is a candidate");
+        assert!(detect_stalls(&mut pending, &[]).is_empty());
+    }
+
+    /// A stall that keeps going while the client keeps posting is reported in
+    /// every window, each report carrying both windows' counts.
+    #[test]
+    fn a_continuing_stall_is_reported_once_per_window() {
+        let c = cid(9);
+        let stalled = || {
+            vec![summary(
+                c,
+                14,
+                counts(&[
+                    (PropagationEvent::ClientOriginated, 1),
+                    (PropagationEvent::SkipEmptyDelta, 14),
+                ]),
+            )]
+        };
+        let mut pending = HashMap::new();
+        assert!(detect_stalls(&mut pending, &stalled()).is_empty());
+        for _ in 0..3 {
+            let reports = detect_stalls(&mut pending, &stalled());
+            assert_eq!(reports.len(), 1);
+            assert_eq!(reports[0].events.get(PropagationEvent::SkipEmptyDelta), 28);
+            assert_eq!(
+                pending.len(),
+                1,
+                "this window's updates are a new candidate"
+            );
+        }
+    }
+
+    #[test]
+    fn stall_candidates_are_capped() {
+        let mut pending = HashMap::new();
+        let w: Vec<ContractSummary> = (0..MAX_STALL_CANDIDATES + 10)
+            .map(|i| {
+                let mut bytes = [0u8; 32];
+                bytes[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                summary(
+                    ContractInstanceId::new(bytes),
+                    1,
+                    counts(&[(PropagationEvent::ClientOriginated, 1)]),
+                )
+            })
+            .collect();
+        detect_stalls(&mut pending, &w);
+        assert_eq!(pending.len(), MAX_STALL_CANDIDATES);
+    }
+
+    /// End to end through the real recorders and the real drain: the INFO line
+    /// carries the per-leg counts, and the stall WARN fires on the second
+    /// drain and only then.
+    #[test]
+    fn drain_and_log_reports_leg_outcomes_and_warns_on_a_stall() {
+        use crate::test_utils::TestLogger;
+
+        let logger = TestLogger::new().capture_logs().with_level("info").init();
+        let stats = UpdatePropagationStats::new();
+        let c = cid(42);
+        stats.record_event(c, PropagationEvent::ClientOriginated);
+        stats.record_broadcast(c, 3, 0);
+        for _ in 0..3 {
+            stats.record_event(c, PropagationEvent::SkipSummaryEqual);
+        }
+
+        // The captured lines carry ANSI colour codes between a field's name
+        // and its value; strip them to match `name: value`.
+        let plain = |logger: &TestLogger| {
+            let mut out = String::new();
+            for line in logger.logs() {
+                let mut chars = line.chars();
+                while let Some(ch) = chars.next() {
+                    if ch == '\u{1b}' {
+                        for c in chars.by_ref() {
+                            if c == 'm' {
+                                break;
+                            }
+                        }
+                    } else {
+                        out.push(ch);
+                    }
+                }
+                out.push('\n');
+            }
+            out
+        };
+
+        assert_eq!(stats.drain_and_log(), 0, "first window is grace");
+        let text = plain(&logger);
+        assert!(text.contains("skip_summary_equal: 3"), "{text}");
+        assert!(text.contains("client_originated: 1"), "{text}");
+        assert!(text.contains("sent_delta: 0"), "{text}");
+        assert!(!text.contains("update_propagation_stalled"), "{text}");
+
+        assert_eq!(stats.drain_and_log(), 1);
+        let text = plain(&logger);
+        assert!(text.contains("update_propagation_stalled"), "{text}");
+        assert!(text.contains("WARN"), "{text}");
+    }
+
+    /// Pin: every [`PropagationEvent`] is recorded somewhere in production
+    /// code. Counting the recorder in tests proves nothing if no production
+    /// path calls it with that variant — the "manually-mirrored counter rots"
+    /// pattern in `.claude/rules/bug-prevention-patterns.md`.
+    #[test]
+    fn every_propagation_event_has_a_production_recording_site() {
+        let sources = [
+            include_str!("../../node/network_bridge/broadcast_queue.rs"),
+            include_str!("../../node/op_state_manager.rs"),
+            include_str!("../update.rs"),
+            include_str!("op_ctx_task.rs"),
+        ];
+        for ev in PropagationEvent::ALL {
+            let needle = format!("PropagationEvent::{ev:?}");
+            let found = sources.iter().any(|src| {
+                // Production code only: everything above the first test module.
+                let prod = src.split("#[cfg(test)]\nmod ").next().unwrap_or(src);
+                prod.lines().any(|line| {
+                    let line = line.trim_start();
+                    !line.starts_with("//") && line.contains(&needle)
+                })
+            });
+            assert!(found, "{needle} is never recorded by production code");
+        }
     }
 }

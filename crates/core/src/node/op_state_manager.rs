@@ -782,11 +782,16 @@ impl OpManager {
         // DEBUG demotions without re-introducing per-event log volume. It runs
         // for the node's lifetime, so its handle is registered with the
         // BackgroundTaskMonitor rather than dropped fire-and-forget.
+        let payload_mix =
+            Arc::new(crate::node::network_bridge::broadcast_payload_mix::PayloadMix::new());
         let update_propagation_stats =
             Arc::new(crate::operations::update::propagation_stats::UpdatePropagationStats::new());
+        let stall_sink = payload_mix.clone();
         task_monitor.register(
             "update_propagation_summary",
-            update_propagation_stats.clone().start_summary_task(),
+            update_propagation_stats
+                .clone()
+                .start_summary_task(move |stalls| stall_sink.record_origination_stalls(stalls)),
         );
         let bootstrap_pacer = Arc::new(Mutex::new(
             crate::operations::connect::bootstrap::BootstrapPacer::new(
@@ -809,9 +814,7 @@ impl OpManager {
             outbound_mix: Arc::new(
                 crate::node::network_bridge::outbound_message_mix::OutboundMix::new(),
             ),
-            payload_mix: Arc::new(
-                crate::node::network_bridge::broadcast_payload_mix::PayloadMix::new(),
-            ),
+            payload_mix,
             interest_manager,
             broadcast_dedup_cache: Arc::new(crate::operations::update::BroadcastDedupCache::new()),
             broadcast_coverage: Arc::new(
@@ -1163,12 +1166,24 @@ impl OpManager {
     /// error as advisory and continue.**
     pub fn try_notify_node_event(&self, msg: NodeEvent) -> Result<(), OpError> {
         tracing::debug!(event = %msg, "try_notify_node_event: queuing node event (non-blocking)");
-        try_notify_node_event_on(
+        // #6143: a dropped fan-out or heal is a whole UPDATE that never left
+        // this node, and the drop below logs at debug only. Count it in the
+        // propagation summary so release builds can see it.
+        let dropped_event = propagation_drop_event(&msg);
+        let result = try_notify_node_event_on(
             self.to_event_listener.notifications_sender(),
             self.to_event_listener.notification_channel_pending(),
             self.to_event_listener.notifications_sender().capacity(),
             msg,
-        )
+        );
+        if result.is_err() {
+            if let Some((contract, ev)) = dropped_event {
+                crate::operations::update::propagation_stats::record_propagation_event(
+                    self, &contract, ev,
+                );
+            }
+        }
+        result
     }
 
     // The blocking `notify_node_event` is still used by callers that
@@ -2453,6 +2468,34 @@ async fn notify_node_event_on(
 /// requiring the wrapper type here. `channel_remaining` is the value
 /// returned by `tokio::sync::mpsc::Sender::capacity()`, which is the
 /// *current* available slot count, not the channel's max capacity.
+/// The contract and [`PropagationEvent`] to count if `msg` is dropped by
+/// [`OpManager::try_notify_node_event`]: a fan-out or a targeted heal, which
+/// carry UPDATE propagation, and nothing else.
+///
+/// [`PropagationEvent`]: crate::operations::update::propagation_stats::PropagationEvent
+fn propagation_drop_event(
+    msg: &NodeEvent,
+) -> Option<(
+    ContractInstanceId,
+    crate::operations::update::propagation_stats::PropagationEvent,
+)> {
+    use crate::operations::update::propagation_stats::PropagationEvent;
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "only the two UPDATE-propagation events are counted; every \
+                  other node event is unrelated to propagation"
+    )]
+    match msg {
+        NodeEvent::BroadcastStateChange { key, .. } => {
+            Some((*key.id(), PropagationEvent::FanoutEventDropped))
+        }
+        NodeEvent::SyncStateToPeer { key, .. } => {
+            Some((*key.id(), PropagationEvent::HealEventDropped))
+        }
+        _ => None,
+    }
+}
+
 fn try_notify_node_event_on(
     notifications_sender: &mpsc::Sender<Either<NetMessage, NodeEvent>>,
     channel_pending: usize,

@@ -939,6 +939,16 @@ pub(crate) async fn update_contract(
             // causes the executor to emit a fan-out, modulo the residuals
             // enumerated there.
             op_manager.payload_mix.record_apply(origin, state_changed);
+            if state_changed && origin == crate::node::ApplyOrigin::ClientLocal {
+                // #6143: the denominator of the propagation stall check. A
+                // client update that changed state emitted a fan-out; the
+                // summary WARNs if that fan-out put nothing on the wire.
+                propagation_stats::record_propagation_event(
+                    op_manager,
+                    key.id(),
+                    propagation_stats::PropagationEvent::ClientOriginated,
+                );
+            }
             if state_changed {
                 // A `BroadcastStateChange` was emitted for this write, so hand
                 // the coverage to it. Otherwise the guard's drop clears it —
@@ -2893,6 +2903,18 @@ mod tests {
             .await
             .expect("update must succeed");
             let after = op_manager.payload_mix.applies_snapshot();
+
+            // #6143: only a CLIENT apply that changed state is an origination
+            // for the propagation stall check.
+            let originated = op_manager
+                .update_propagation_stats
+                .events_for_test(key.id())
+                .get(propagation_stats::PropagationEvent::ClientOriginated);
+            assert_eq!(
+                originated, 1,
+                "{origin:?}: the client apply counts once and the relay apply \
+                 after it adds nothing"
+            );
 
             assert_eq!(
                 after[arm][CHANGED],
