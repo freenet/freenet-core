@@ -73,10 +73,17 @@
 //! wait longer until the debt is paid. That covers the handshake tasks, the
 //! keepalive task, short messages (sent from the connection's own task, which
 //! also receives for the connection, so a wait there would delay its ACKs),
-//! and everything `PeerConnection::recv` sends: ACKs, Pongs, receipts,
-//! retransmissions. `recv` must never wait here: it runs as a branch of a
-//! `select!` that can be cancelled, and it changes connection state before
-//! some of its sends.
+//! and everything `PeerConnection::recv` sends: ACKs, Pongs, receipts.
+//! `recv` must never wait here: it runs as a branch of a `select!` that can
+//! be cancelled, and it changes connection state before some of its sends.
+//!
+//! Retransmissions (RTO resends and tail-loss probes, sent from `recv`) do
+//! not wait either, but they are not simply charged: they take from the
+//! bucket only within [`RETX_DEBT_LIMIT`] and their share of the rate
+//! ([`EgressCap::admit_retransmit`]). A refused resend is deferred by the
+//! resend timer, for at most one effective RTO from its first refusal
+//! ([`RETX_DEFER_LIMIT_RTOS`]), then sent uncapped; a refused probe is
+//! skipped.
 //!
 //! # What the cap guarantees
 //!
@@ -240,12 +247,61 @@ pub(crate) fn retx_defer_min(rto: Duration) -> Duration {
     RETX_DEFER_MIN
 }
 
-/// A refused RTO resend is deferred until it has been due for this many
-/// effective RTOs, then sent uncapped ([`EgressCap::admit_retransmit`]).
+/// A connection's refused RTO resends are deferred until they have been
+/// refused for this many effective RTOs in a row ([`RetxDeferral`]), then
+/// sent uncapped ([`EgressCap::admit_retransmit`]).
 /// One: the deferral at most doubles the wait between a packet's resends,
 /// so it is still abandoned after `MAX_PACKET_RETRANSMITS`, within twice the
 /// time it would take without the cap.
 pub(crate) const RETX_DEFER_LIMIT_RTOS: u32 = 1;
+
+/// One connection's run of refused RTO resends, for
+/// [`EgressCap::admit_retransmit`]'s deferral limit. The run starts at the
+/// first refusal and lasts until the cap takes a resend again or nothing due
+/// is refused ([`Self::end_run`]); once it has lasted one effective RTO
+/// ([`RETX_DEFER_LIMIT_RTOS`]) every due resend goes uncapped. It is per
+/// connection, not per packet, because only the head of the resend queue is
+/// asked: a per-packet limit would hold the packets behind it for one RTO
+/// each in turn. And it is measured from the first refusal, not from the
+/// RTO deadline, because an ack that resets the backoff moves every deadline
+/// earlier at once, so a resend just found due would count as long
+/// deferred.
+#[derive(Debug, Default)]
+pub(crate) struct RetxDeferral {
+    /// When the run of refusals started (the connection's time source, ns).
+    refused_since: Option<u64>,
+}
+
+impl RetxDeferral {
+    /// Decide one retransmit at `now_nanos` ([`EgressCap::admit_retransmit`]),
+    /// with this connection's run of refusals.
+    pub(in crate::transport) fn admit<'a>(
+        &mut self,
+        cap: &'a EgressCap,
+        kind: ResendKind,
+        bytes: usize,
+        rto: Duration,
+        now_nanos: u64,
+    ) -> RetxAdmit<'a> {
+        let deferred_for = self.refused_since.map_or(Duration::ZERO, |since| {
+            Duration::from_nanos(now_nanos.saturating_sub(since))
+        });
+        let decision = cap.admit_retransmit(kind, bytes, deferred_for, rto);
+        match decision {
+            RetxAdmit::Take(_) => self.refused_since = None,
+            RetxAdmit::Defer(_) => {
+                self.refused_since.get_or_insert(now_nanos);
+            }
+            RetxAdmit::Uncapped | RetxAdmit::SkipProbe => {}
+        }
+        decision
+    }
+
+    /// Nothing due was refused: the run, if any, is over.
+    pub(in crate::transport) fn end_run(&mut self) {
+        self.refused_since = None;
+    }
+}
 
 /// What [`EgressCap::admit_retransmit`] decided.
 #[derive(Debug)]
@@ -253,7 +309,8 @@ pub(crate) enum RetxAdmit<'a> {
     /// Send with this take (`Socket::send_to_paced`).
     Take(EgressTake<'a>),
     /// Send uncapped (`Socket::send_to`, charged as an unpaced send): the
-    /// resend has been deferred for [`RETX_DEFER_LIMIT_RTOS`] effective RTOs.
+    /// connection's resends have been refused for [`RETX_DEFER_LIMIT_RTOS`]
+    /// effective RTOs in a row.
     Uncapped,
     /// Do not send now; ask again after this long.
     Defer(Duration),
@@ -1118,14 +1175,16 @@ impl EgressCap {
     }
 
     /// Decide one legacy UDP retransmit under this cap: `kind` is an RTO
-    /// resend or a tail-loss probe of `bytes`, `overdue` how long an RTO
-    /// resend has been due, `rto` the connection's effective RTO.
+    /// resend or a tail-loss probe of `bytes`, `deferred_for` how long the
+    /// connection's resends have been refused in a row ([`RetxDeferral`],
+    /// zero at the first refusal), `rto` the connection's effective RTO.
     ///
     /// - The cap takes it ([`Self::try_take_retransmit`]): [`RetxAdmit::Take`].
     /// - A refused probe is skipped: [`RetxAdmit::SkipProbe`].
     /// - A refused RTO resend is deferred ([`RetxAdmit::Defer`]) for at least
-    ///   [`RETX_DEFER_MIN`] and at most until it has been due for one
-    ///   effective RTO ([`RETX_DEFER_LIMIT_RTOS`]); refused then, it goes
+    ///   [`RETX_DEFER_MIN`] and at most until the connection's resends have
+    ///   been refused for one effective RTO ([`RETX_DEFER_LIMIT_RTOS`]);
+    ///   refused then, it goes
     ///   uncapped ([`RetxAdmit::Uncapped`]), charged as an unpaced send as
     ///   before the cap. So a resend is never deferred without bound: under
     ///   unpaced debt above [`RETX_DEBT_LIMIT`] (short messages, receipts and
@@ -1139,7 +1198,7 @@ impl EgressCap {
         &self,
         kind: ResendKind,
         bytes: usize,
-        overdue: Duration,
+        deferred_for: Duration,
         rto: Duration,
     ) -> RetxAdmit<'_> {
         let wait = match self.try_take_retransmit(bytes) {
@@ -1153,12 +1212,12 @@ impl EgressCap {
             }
             ResendKind::Rto => {
                 let limit = rto.saturating_mul(RETX_DEFER_LIMIT_RTOS);
-                if overdue >= limit {
+                if deferred_for >= limit {
                     TRANSPORT_METRICS.record_egress_retransmit_uncapped();
                     RetxAdmit::Uncapped
                 } else {
                     TRANSPORT_METRICS.record_egress_retransmit_deferred();
-                    RetxAdmit::Defer(wait.max(retx_defer_min(rto)).min(limit - overdue))
+                    RetxAdmit::Defer(wait.max(retx_defer_min(rto)).min(limit - deferred_for))
                 }
             }
         }

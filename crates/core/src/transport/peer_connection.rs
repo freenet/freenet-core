@@ -42,7 +42,7 @@ pub mod streaming_buffer;
 #[cfg(not(feature = "bench"))]
 pub(crate) mod streaming_buffer;
 
-use super::egress_cap::RetxAdmit;
+use super::egress_cap::{RetxAdmit, RetxDeferral};
 use super::{
     TransportError, TransportPublicKey,
     bbr::DeliveryRateToken,
@@ -454,6 +454,9 @@ pub struct PeerConnection<S = super::UdpSocket, T: TimeSource = RealTime> {
     /// the idle timeout, so the node can report the disconnect as a timeout
     /// rather than a generic transport closure (telemetry only).
     closed_by_idle_timeout: bool,
+    /// This connection's run of RTO resends the node-wide egress cap refused
+    /// (`EgressCap::admit_retransmit`'s deferral limit).
+    retx_deferral: RetxDeferral,
     /// Test-only per-connection tallies of the telemetry events this
     /// connection recorded, so tests need not read process-wide counters
     /// that concurrent tests also move.
@@ -1544,6 +1547,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             recv_timers,
             timeout_checks_run: 0,
             closed_by_idle_timeout: false,
+            retx_deferral: RetxDeferral::default(),
             #[cfg(test)]
             telemetry_test_counts: TelemetryTestCounts::default(),
             receipts_flush_due: false,
@@ -2425,22 +2429,25 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                         // with its state unchanged, at most until it has been
                         // due for one effective RTO, then sent uncapped; a
                         // refused probe is skipped. Without a cap nothing is
-                        // asked.
+                        // asked. A deferred resend calls the congestion
+                        // controller's on_timeout when it goes (below), once
+                        // per expiry as on main, at most one RTO later.
                         let socket = &self.remote_conn.socket;
                         let cap = socket.egress_cap().filter(|cap| cap.caps_retransmits());
                         let mut take = None;
-                        #[cfg(test)]
                         let mut deferred = false;
                         #[cfg(test)]
                         let mut uncapped = false;
                         let maybe_resend = {
                             let mut tracker = self.remote_conn.sent_tracker.lock();
                             let rto = tracker.effective_rto();
-                            tracker.get_resend_admitted(|kind, len, overdue| {
+                            let now = self.time_source.now_nanos();
+                            let retx_deferral = &mut self.retx_deferral;
+                            tracker.get_resend_admitted(|kind, len| {
                                 let Some(cap) = cap else {
                                     return Ok(());
                                 };
-                                match cap.admit_retransmit(kind, len, overdue, rto) {
+                                match retx_deferral.admit(cap, kind, len, rto, now) {
                                     RetxAdmit::Take(taken) => {
                                         take = Some(taken);
                                         Ok(())
@@ -2453,10 +2460,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                                         Ok(())
                                     }
                                     RetxAdmit::Defer(wait) => {
-                                        #[cfg(test)]
-                                        {
-                                            deferred = true;
-                                        }
+                                        deferred = true;
                                         Err(wait)
                                     }
                                     RetxAdmit::SkipProbe => Err(Duration::ZERO),
@@ -2476,9 +2480,15 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                             // place, and the timer brings the arm back when the
                             // rate has made room. The loop never waits here.
                             ResendAction::WaitUntil(deadline_nanos) => {
-                                #[cfg(test)]
                                 if deferred {
-                                    self.telemetry_test_counts.retransmits_deferred += 1;
+                                    #[cfg(test)]
+                                    {
+                                        self.telemetry_test_counts.retransmits_deferred += 1;
+                                    }
+                                } else {
+                                    // Nothing due was refused: a run of
+                                    // refusals, if any, is over.
+                                    self.retx_deferral.end_run();
                                 }
                                 self.recv_timers.resend.arm_at(deadline_nanos);
                                 break;

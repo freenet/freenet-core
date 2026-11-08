@@ -284,6 +284,31 @@ transport-quic and total-bandwidth-limit.
 Tests assert on per-cap EgressCap::stats(), never the global counters.
 ```
 
+### Retransmit cap (legacy UDP, #6147)
+
+```
+With a cap, RTO resends and TLP probes go through EgressCap::admit_retransmit
+from the resend arm of PeerConnection::recv: NO await, NO lock (share meter
+CAS, then bucket CAS; a bucket refusal only refunds the share). Takes only
+while retransmits < RETX_SHARE_PERCENT (50%) of the rate over
+RETX_SHARE_WINDOW (1 s, at least one datagram) AND bucket debt after the take
+<= RETX_DEBT_LIMIT (100 ms). Nothing retransmitted is forgiven.
+Refused RTO resend: state UNCHANGED (count, backoff, send time), timer
+re-armed at max(wait, RETX_DEFER_MIN = 2 ms), capped at the deferral limit:
+once refused for RETX_DEFER_LIMIT_RTOS (1) effective RTO (counted from its FIRST refusal, not the deadline: a backoff reset moves deadlines) it goes UNCAPPED
+(charged unpaced). Do NOT remove that limit: the count moves only when a
+resend goes, so an unbounded deferral (unpaced debt > 100 ms, or a tiny cap)
+never abandons the packet and pins flight (#4345). Refused probe: skipped,
+marked probed. Abandonment never asks the cap. No cap -> nothing asked.
+Counters: egress_retransmits_deferred (refusals, not packets),
+egress_retransmits_uncapped, egress_probes_skipped.
+The share is NODE-WIDE: one lossy peer can use it; the deferral limit bounds
+how long another connection's resend is held (one RTO).
+Flight bound derivation: RETX-CAP-DESIGN.md; pinned by
+link_model::storm_tests::flight_drain_bound and
+sent_packet_tracker::held_cap_debt_cannot_stop_abandonment.
+```
+
 ### WHEN modifying congestion control
 
 ```

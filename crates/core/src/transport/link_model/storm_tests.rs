@@ -274,6 +274,11 @@ fn seeds() -> Vec<u64> {
 /// complete at least as many streams as main on every seed. At 2 MB/s (4x),
 /// where single seeds vary more, the total and the median per seed must be
 /// at least main's. Either way nothing retransmitted is forgiven past the cap.
+///
+/// The per-seed comparison is strict on 3 seeds, which is sound only while
+/// the runs are deterministic: a change to scheduling or RNG consumption
+/// elsewhere can move a seed by a stream without any regression here, and
+/// then the 40-seed sweep (`FREENET_STORM_SEEDS`) is what tells the two apart.
 #[test]
 fn storm_under_a_cap_matches_or_beats_main() {
     // Override with `FREENET_STORM_PEERS` to explore the wake rate at a
@@ -833,11 +838,12 @@ fn an_outage_under_a_cap_matches_or_beats_main() {
             let line = |label: &str, r: &OutageReport| {
                 format!(
                     "{label}: done after {:?}, {} retransmits during the outage, {} RTO, \
-                     {} deferred, {} abandoned, {} streams failed",
+                     {} deferred, {} uncapped, {} abandoned, {} streams failed",
                     r.completed_after,
                     r.retransmits_during_outage,
                     r.probe.rto_expiries,
                     r.probe.retransmits_deferred,
+                    r.probe.retransmits_uncapped,
                     r.probe.abandoned_packets,
                     r.probe.outbound_streams_failed,
                 )

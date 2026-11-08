@@ -2099,7 +2099,7 @@ fn a_refused_resend_is_deferred_at_most_one_rto_then_sent_uncapped() {
     // Hold the bucket a second in debt: far past the retransmit limit.
     cap.charge_unpaced(BURST as usize + RATE as usize);
     let rto = Duration::from_millis(500);
-    let take = |kind, overdue| cap.admit_retransmit(kind, PACKET, overdue, rto);
+    let take = |kind, deferred_for| cap.admit_retransmit(kind, PACKET, deferred_for, rto);
     match take(ResendKind::Rto, Duration::ZERO) {
         RetxAdmit::Defer(wait) => {
             assert!(wait >= RETX_DEFER_MIN && wait <= rto, "deferred {wait:?}");
