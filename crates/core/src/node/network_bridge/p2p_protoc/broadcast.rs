@@ -957,13 +957,14 @@ impl P2pConnManager {
             // converged-but-nondeterministic-summary pair does not re-flood
             // full state. Mirrors production `broadcast_to_single_peer`.
             if let (Some(ours), Some(theirs)) = (&our_summary, &their_summary) {
-                if !super::super::broadcast_queue::fanout_send_needed(
-                    op_manager,
-                    &key,
-                    super::super::broadcast_queue::SummaryPair { ours, theirs },
-                    &mut staleness_probes_used,
-                )
-                .await
+                if let super::super::broadcast_queue::FanoutDecision::Skip(_) =
+                    super::super::broadcast_queue::fanout_send_needed(
+                        op_manager,
+                        &key,
+                        super::super::broadcast_queue::SummaryPair { ours, theirs },
+                        &mut staleness_probes_used,
+                    )
+                    .await
                 {
                     tracing::trace!(
                         contract = %key,

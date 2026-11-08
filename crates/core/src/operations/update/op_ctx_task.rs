@@ -1870,6 +1870,18 @@ fn seed_sender_summary_from_broadcast(
     )
 }
 
+/// Count a receiver-side skip of an inbound broadcast (dedup, already
+/// applied, merge backoff) in the per-contract propagation summary (#6143).
+/// Each skip logs at debug only, which release builds compile out, so this
+/// count is how a receiver dropping one sender's broadcasts becomes visible.
+fn count_receiver_skip(
+    op_manager: &OpManager,
+    key: &ContractKey,
+    ev: super::propagation_stats::PropagationEvent,
+) {
+    super::propagation_stats::record_propagation_event(op_manager, key.id(), ev);
+}
+
 /// Inner driver for `BroadcastTo`. Mirrors `update.rs:595-825`.
 ///
 /// 1. Update sender's cached summary in `interest_manager`.
@@ -1951,6 +1963,11 @@ async fn drive_relay_broadcast_to(
         op_manager.interest_manager.now(),
     ) {
         receiver_terminal.mark_dedup();
+        count_receiver_skip(
+            op_manager,
+            &key,
+            super::propagation_stats::PropagationEvent::RxDedup,
+        );
         tracing::debug!(
             tx = %incoming_tx,
             %key,
@@ -1978,6 +1995,11 @@ async fn drive_relay_broadcast_to(
             .payload_hash(is_delta, &payload_bytes),
     ) {
         receiver_terminal.mark_already_applied();
+        count_receiver_skip(
+            op_manager,
+            &key,
+            super::propagation_stats::PropagationEvent::RxAlreadyApplied,
+        );
         tracing::debug!(
             tx = %incoming_tx,
             %key,
@@ -2009,6 +2031,11 @@ async fn drive_relay_broadcast_to(
         decision @ (crate::ring::merge_backoff::MergeDecision::InBackoff
         | crate::ring::merge_backoff::MergeDecision::KnownFailedPayload) => {
             receiver_terminal.mark_backoff();
+            count_receiver_skip(
+                op_manager,
+                &key,
+                super::propagation_stats::PropagationEvent::RxBackoff,
+            );
             crate::config::GlobalTestMetrics::record_merge_suppressed_by_backoff();
             tracing::debug!(
                 tx = %incoming_tx,
@@ -2923,6 +2950,11 @@ async fn apply_streaming_broadcast(
         op_manager.interest_manager.now(),
     ) {
         receiver_terminal.mark_dedup();
+        count_receiver_skip(
+            op_manager,
+            &key,
+            super::propagation_stats::PropagationEvent::RxDedup,
+        );
         tracing::debug!(
             tx = %incoming_tx,
             %key,
@@ -2941,6 +2973,11 @@ async fn apply_streaming_broadcast(
             .payload_hash(false, &state_bytes),
     ) {
         receiver_terminal.mark_already_applied();
+        count_receiver_skip(
+            op_manager,
+            &key,
+            super::propagation_stats::PropagationEvent::RxAlreadyApplied,
+        );
         tracing::debug!(
             tx = %incoming_tx,
             %key,
@@ -2962,6 +2999,11 @@ async fn apply_streaming_broadcast(
         decision @ (crate::ring::merge_backoff::MergeDecision::InBackoff
         | crate::ring::merge_backoff::MergeDecision::KnownFailedPayload) => {
             receiver_terminal.mark_backoff();
+            count_receiver_skip(
+                op_manager,
+                &key,
+                super::propagation_stats::PropagationEvent::RxBackoff,
+            );
             crate::config::GlobalTestMetrics::record_merge_suppressed_by_backoff();
             tracing::debug!(
                 tx = %incoming_tx,
@@ -4479,6 +4521,61 @@ mod tests {
             "a second streaming queue-full drop within the throttle window MUST \
              NOT emit another ResyncRequest (bounds #4251 amplification)"
         );
+    }
+
+    /// #6143: a receiver skipping a broadcast before the merge logs at debug,
+    /// so release builds cannot see it. Driving both real receive paths with
+    /// the same payload twice must count the second as a dedup skip against
+    /// the contract.
+    #[tokio::test]
+    async fn receiver_dedup_skip_is_counted_on_both_broadcast_paths() {
+        use crate::operations::update::propagation_stats::PropagationEvent as Ev;
+
+        let (op_manager, _notification_rx, _guard) =
+            build_queue_full_test_node("rx-dedup-count-6143").await;
+        let sender_addr: SocketAddr = "127.0.0.1:12300".parse().unwrap();
+        let inline_key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([11u8; 32]),
+            CodeHash::new([12u8; 32]),
+        );
+        let stream_key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([13u8; 32]),
+            CodeHash::new([14u8; 32]),
+        );
+
+        for _ in 0..2 {
+            // The stand-in handler answers queue-full; only the pre-merge
+            // dedup outcome matters here.
+            let _result: Result<(), OpError> = drive_relay_broadcast_to(
+                &op_manager,
+                Transaction::new::<UpdateMsg>(),
+                inline_key,
+                DeltaOrFullState::Delta(vec![1, 2, 3]),
+                Vec::new(),
+                sender_addr,
+                crate::ring::broadcast_coverage::CoveredPeers::empty(),
+            )
+            .await;
+            // The stand-in handler answers queue-full; only the pre-merge
+            // dedup outcome matters here.
+            let _result: Result<(), OpError> = apply_streaming_broadcast(
+                &op_manager,
+                Transaction::new::<UpdateMsg>(),
+                stream_key,
+                vec![4, 5, 6],
+                Vec::new(),
+                sender_addr,
+                crate::ring::broadcast_coverage::CoveredPeers::empty(),
+            )
+            .await;
+        }
+
+        for key in [inline_key, stream_key] {
+            let events = op_manager
+                .update_propagation_stats
+                .events_for_test(key.id());
+            assert_eq!(events.get(Ev::RxDedup), 1, "{key}: {events:?}");
+        }
     }
 
     /// A generic contract-exec rejection: `is_contract_exec_rejection() == true`
