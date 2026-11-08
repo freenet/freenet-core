@@ -277,8 +277,8 @@ impl SendProgress {
     }
 
     /// The send starts (`true`) or stops waiting for its source's next chunk.
-    /// The connection's progress does not extend the gap meanwhile: the
-    /// receiver gets nothing and ends the stream at its own idle timeout.
+    /// The connection's progress does not extend the gap meanwhile: it is not
+    /// what holds the send ([`ConnectionWatch`]).
     ///
     /// With [`bounded_send`]'s loop this is a store-then-load handshake on two
     /// flags, both `SeqCst`: this side stores `on_source` then reads
@@ -465,21 +465,33 @@ pub(crate) struct QuietProof {
 /// count and the ack watch read one). A send fails on its gap only once both
 /// its own gap and that window have run out. Not while the send waits for
 /// its own source ([`SendProgress::waiting_on_source`]): the connection is not
-/// what holds it then, and the receiver, which gets nothing, ends the stream at
-/// its own 5 s idle timeout.
+/// what holds it then, and a source that stalls is bounded by the send's own
+/// gap, as a relayed stream on UDP is by pipe_stream's 5 s upstream
+/// inactivity. (The receiver does not force this: a QUIC stream's reader
+/// idles out at `streaming_handle_idle_timeout`, 30 s in production.)
 ///
 /// The connection is read only at the timer's wakes, so a move is dated to
 /// the wake that saw it, which can come up to one window after it. A send
 /// that stops moving therefore ends at its own gap or at most twice
 /// [`STALL_PROGRESS_WINDOW`] after the connection's last move, whichever is
-/// later, and never after `total`. So a path dark before the send started
-/// fails it at its own gap (5 s), and one that goes dark mid-send, whose last
-/// acknowledgements are of this send's own first flight, fails it between
-/// its gap and twice the window after those acknowledgements (12 to 22 s
-/// with the 2 s open deadline as the first wake: 12 s when they came before
-/// it, up to 22 s when one came just after it). Such a send leaves a
-/// [`QuietProof`], so its timeout counts toward the stall close and the
-/// path goes suspect at once.
+/// later, and never after `total`. One that goes dark mid-send, whose last
+/// acknowledgements are of this send's own first flight, fails between its
+/// gap and twice the window after those acknowledgements (12 to 22 s with
+/// the 2 s open deadline as the first wake: 12 s when they came before it,
+/// up to 22 s when one came just after it). Such a send leaves a
+/// [`QuietProof`], so its timeout counts toward the stall close and the path
+/// goes suspect at once.
+///
+/// A path dark before the send started gives it no move to see, so with no
+/// egress cap holding the connection's transmits the send fails at its own
+/// gap (5 s). Where the cap holds them, a hold is credited for
+/// `route::hold_credit` after the connection's last acknowledgement as the
+/// path's record dates it ([`AckRecord`]: the build time on a new path, and
+/// an acknowledgement the record has not seen is dated at the send's start),
+/// so the send can run to that date plus `hold_credit` plus one window, never
+/// past `total`. After an idle spell, a capped path that went dark gets one
+/// such credit from its first new send: the keepalive acknowledgements before
+/// it went dark are dated at that send's start.
 struct ConnectionWatch {
     source: ConnectionProgress,
     acked: u64,
@@ -491,8 +503,8 @@ struct ConnectionWatch {
     moved_at: Option<u64>,
     /// When the connection's acknowledged count last moved, from the path's
     /// record when the send starts (a move the record has not seen is dated
-    /// at the start), then each wake that saw it move; `None` before any. A cap hold is progress only within `route::hold_credit` of
-    /// it.
+    /// at the start), then each wake that saw it move; `None` before any. A
+    /// cap hold is progress only within `route::hold_credit` of it.
     acked_at: Option<u64>,
     /// A reading saw a hold live ([`QuietProof::live_hold_seen`]).
     live_hold_seen: bool,
@@ -657,7 +669,10 @@ where
             () = progress.0.source_wait.notified() => {}
             () = time.sleep_cancelable(wait) => {
                 let now = time.now_nanos();
-                if let Some(watch) = watch.as_mut() {
+                // Only the gap of an open stream reads the connection.
+                if progress.stage() == STAGE_OPENED
+                    && let Some(watch) = watch.as_mut()
+                {
                     watch.observe(now);
                 }
                 if now >= progress.deadline(&deadlines, started, until(&watch)) {

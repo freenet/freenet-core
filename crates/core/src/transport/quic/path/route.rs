@@ -189,7 +189,8 @@ pub(crate) const STALL_PROGRESS_WINDOW: Duration = ACK_WATCH_WINDOW;
 /// longer. A live path whose transmits the cap holds is acknowledged again
 /// within that; a held transmit on a connection nothing has acknowledged for
 /// longer is no evidence it is alive (a dark connection's own probes wait for a
-/// saturated cap too, #6128 CI). 10 s (the window) at 1 MB/s, about 13.3 s at
+/// saturated cap too, and counted without that limit they kept a dark
+/// send going for 32 s). 10 s (the window) at 1 MB/s, about 13.3 s at
 /// 100 kB/s, about 19.8 s at 64 KiB/s, longer at lower caps.
 ///
 /// [`socket::cap_transmit_wait`]: super::super::socket::cap_transmit_wait
@@ -239,8 +240,8 @@ pub(crate) struct StallVerdict {
 /// for [`hold_credit`] after the connection's last acknowledgement (the window,
 /// or the longest one transmit can wait at the cap if that is longer). A held
 /// transmit on a connection nothing has acknowledged for longer is no evidence
-/// it is alive: a dark connection's own probes wait for a saturated cap too
-/// (#6128 CI). The record is the connection's own
+/// it is alive: a dark connection's own probes wait for a saturated cap too.
+/// The record is the connection's own
 /// (`socket::with_poller_holds`): a node-wide one would read as progress on
 /// every path whenever any connection is held, and on a node whose cap binds
 /// this count would never fire.

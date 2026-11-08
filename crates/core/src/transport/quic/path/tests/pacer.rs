@@ -261,9 +261,9 @@ fn bytes_taken_for_a_write_not_made_go_back() {
         // Header and metadata go at once; the first fragment is granted after
         // 30 s. That is past the 5 s gap and past the connection's window
         // too (#6128): the header's acknowledgement, seen at the first wake
-        // past the gap (5 s), extends the deadline to 15 s, and nothing moves
-        // after it, since the send waits on the pacer. A 10 s grant would
-        // finish inside that window and the send would complete.
+        // (the 2 s open deadline), extends the deadline to 12 s, and nothing
+        // moves after it, since the send waits on the pacer. A 10 s grant
+        // would finish inside that window and the send would complete.
         let pacer = Scripted::new(&p.time(), usize::MAX, Duration::ZERO);
         struct SlowAfterFirst(Arc<Scripted>);
         impl SendPacer for SlowAfterFirst {

@@ -219,7 +219,13 @@ impl CapHolds {
 
 thread_local! {
     /// The record [`with_poller_holds`] hands to the poller quinn creates in
-    /// its call.
+    /// its call. A thread-local works only because quinn 0.11.12 (pinned
+    /// `=0.11.12`) calls `create_io_poller` synchronously, on the calling
+    /// thread, inside `Endpoint::connect_with` and `Incoming::accept_with`
+    /// (`ConnectionRef::new`), and otherwise only on a rebind, which needs
+    /// migration, which is off. A quinn bump must re-check both; a poller
+    /// built anywhere else is counted (`CapHolds::fallback_pollers`) and its
+    /// connection's holds go unseen.
     static NEXT_POLLER_HOLDS: std::cell::RefCell<Option<Arc<CapHolds>>> =
         const { std::cell::RefCell::new(None) };
 }

@@ -853,9 +853,10 @@ Rate calculation on every rate update (peer_connection::paced_rate; #6047):
   packet. Not charged, as on UDP: one-packet Shorts and control frames,
   which never wait behind data. With no limit nothing is paced. A write
   reserves with reserve_within, limited to what the send's current deadline
-  leaves (the deadline its timer enforces, so with the stream open the later
-  of its own gap and the connection's window, bounded::SendProgress::
-  time_left), and waits in the send's own task; a refused reservation takes
+  leaves for its stage (with the stream open, its own gap, never the
+  connection's window: bounded::SendProgress::time_left; the window would let
+  the queue hold about 10 s of the rate instead of 5 s, refusing more opens),
+  and waits in the send's own task; a refused reservation takes
   nothing and ends the send NotOpened(Paced) before the stream opened
   (header and metadata are taken before open_uni) or Failed(Paced) after
   (the stream is reset). A message the pacer refused that UDP then sent is
@@ -1842,10 +1843,13 @@ Sending (QuicPath::send_short_bounded / send_stream_bounded /
   124 s at 10 kB/s and about 6.8 h at 50 B/s. The last acknowledgement is the
   path's record (QuicPath::last_acked), kept by the stall count at settles and
   by every send's watch at its wakes, so a new send whose first transmits wait
-  past its gap in a deep cap queue on a live path is credited. A connection
+  past its gap in a deep cap queue on a live path is credited. The record
+  holds the count with the time (bounded::AckRecord), so a count it has not
+  seen (an acknowledgement after the last settle or wake) is dated at the new
+  send's start rather than missed. A connection
   nothing has acknowledged for the credit gets nothing from holds: a dark
-  connection's own probes wait for a saturated cap too, and on #6128's CI,
-  counted without that limit, they kept a dark send going for 32 s. For the
+  connection's own probes wait for a saturated cap too, and counted without
+  that limit they kept a dark send going for 32 s. For the
   credit after its last ack a dark path's own held probes do still count (on
   main they counted for as long as they were held). Under random loss the 384 KiB send window drains at Cubic's window per
   round trip, so writes wait past 5 s while acks still arrive; failing them
@@ -1853,14 +1857,22 @@ Sending (QuicPath::send_short_bounded / send_stream_bounded /
   failed). The connection is read at the timer's wakes, so a send that stops
   moving ends at its own gap or within 2 x STALL_PROGRESS_WINDOW of the last
   move, never past total. It gives nothing until a wake during the send has
-  seen a move, so a path dark before the send fails it at 5 s; a path that
+  seen a move, so a path dark before the send fails it at 5 s with no cap
+  holding its transmits; where the cap holds them, at most at the record's
+  last acknowledgement plus hold_credit plus one window (after an idle
+  spell, a capped path that went dark gets one such credit from its first
+  new send, whose start dates the keepalive acknowledgements from before it
+  went dark); a path that
   goes dark mid-send fails it at 12 to 22 s (its own early acknowledgements
   are a move; 22 s when one lands just after the 2 s first wake; pinned at
   12 s by
   a_path_dark_mid_send_fails_within_two_windows_and_goes_suspect). Nothing
-  while the send waits for its own source (the receiver sees no bytes and
-  evicts at its own 5 s; a SeqCst flag handshake wakes the loop to re-arm when
-  that drops an extended deadline), and nothing without a CappedCubic
+  while the send waits for its own source (the connection is not what holds
+  it; a stalled source is bounded by the send's own gap, as pipe_stream's 5 s
+  upstream inactivity bounds it on UDP; the receiver's QUIC reader idles at
+  30 s in production. A SeqCst flag handshake wakes the loop to re-arm when
+  that drops an extended deadline, once: a timer already armed at the own gap
+  is not re-armed), and nothing without a CappedCubic
   controller. Control sends have no gap. A receiver reads every announced
   stream to its end whatever its consumer does (push_fragment does not wait);
   its one wait is announcing a stream into a full channel, bounded by
@@ -2049,7 +2061,11 @@ Path recycling (quic/recycle.rs, #5940 step M6): besides the send-reset
   one of this connection's (or held one since the previous sample;
   socket::CapHolds, one record per connection since #6128, handed to the
   poller quinn creates inside connect_with / accept_with by
-  socket::with_poller_holds) no window runs on that path. Never node-wide:
+  socket::with_poller_holds, which relies on quinn 0.11.12 building that
+  poller synchronously on the calling thread; a poller built elsewhere is
+  counted per endpoint, CapHolds::fallback_pollers, and the path tests
+  assert 0) no window runs on that path (pinned per connection by
+  a_held_connection_does_not_pause_another_connections_ack_watch). Never node-wide:
   on a node whose cap binds, some connection is nearly always held, and a
   node-wide record kept every path's guard 2, stall count and send gap from
   firing. Do not narrow this to the sends counted since the hold:
@@ -2163,7 +2179,11 @@ QUIC send route (#5940 e5b-6, quic/upgrade/data_route.rs,
   ran out of its gap leaves a QuietProof (the acked count and hold count, and
   since when they stood still); while the counts still match, the stall count
   dates the progress it sees from then, so the first timeout after a path goes
-  dark mid-send counts and the path goes suspect at once. A pipe that timed out
+  dark mid-send counts and the path goes suspect at once. The path has one
+  slot, read (not taken) by every settle; a later timeout's proof of the same
+  counts is merged into it (earlier since kept), so it cannot push an earlier
+  send's date forward. Both counts only grow, which is what makes a matching
+  proof sound. A pipe that timed out
   waiting for its source does not count (WatchedSource). It costs a normal
   backoff.
   Fast path: Session::routed is an atomic set only while the live attempt holds a

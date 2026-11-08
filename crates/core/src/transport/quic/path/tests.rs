@@ -3730,8 +3730,8 @@ fn the_gap_runs_out_on_its_own_when_nothing_is_acknowledged() {
 /// moving, as for the stall count, but only within `STALL_PROGRESS_WINDOW` of
 /// the connection's last acknowledgement: a held transmit on a connection
 /// nothing has acknowledged for the window is no evidence that it is alive
-/// (#6128 CI: a dark connection's own probes, held by a saturated cap, kept its
-/// send going). One acknowledgement at 1 s, then a hold every second to 30 s:
+/// (a dark connection's own probes, held by a saturated cap, kept its send
+/// going). One acknowledgement at 1 s, then a hold every second to 30 s:
 /// the 2 s wake sees the acknowledgement, the 12 s wake counts the holds (10 s
 /// after it), the 22 s wake does not, and the send ends at 22 s.
 #[test]

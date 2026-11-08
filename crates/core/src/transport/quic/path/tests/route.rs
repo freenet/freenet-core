@@ -207,8 +207,8 @@ fn timeouts_count_only_once_nothing_is_acknowledged_for_the_window() {
 }
 
 /// A hold of the egress cap counts as progress, but only within the window of
-/// the connection's last acknowledgement (#6128 CI: a dark connection's own
-/// probes, held by a saturated cap, read as progress). An acknowledgement at 5 s
+/// the connection's last acknowledgement (a dark connection's own probes, held
+/// by a saturated cap, read as progress). An acknowledgement at 5 s
 /// and a hold live from then on: no timeout counts while the hold is within the
 /// window of it (to 15 s); after that the hold counts for nothing, the last
 /// progress stays at 15 s, and from 25 s eight timeouts close the path. A hold
