@@ -2100,20 +2100,19 @@ fn a_refused_resend_is_deferred_at_most_one_rto_then_sent_uncapped() {
     cap.charge_unpaced(BURST as usize + RATE as usize);
     let rto = Duration::from_millis(500);
     let take = |kind, deferred_for| cap.admit_retransmit(kind, PACKET, deferred_for, rto);
-    match take(ResendKind::Rto, Duration::ZERO) {
-        RetxAdmit::Defer(wait) => {
-            assert!(wait >= RETX_DEFER_MIN && wait <= rto, "deferred {wait:?}");
+    let deferral = |decision: RetxAdmit<'_>| match decision {
+        RetxAdmit::Defer(wait) => wait,
+        other @ (RetxAdmit::Take(_) | RetxAdmit::Uncapped | RetxAdmit::SkipProbe) => {
+            panic!("expected a deferral, got {other:?}")
         }
-        other => panic!("expected a deferral, got {other:?}"),
-    }
-    match take(ResendKind::Rto, Duration::from_millis(499)) {
-        RetxAdmit::Defer(wait) => assert_eq!(
-            wait,
-            Duration::from_millis(1),
-            "no later than the limit, even under the floor"
-        ),
-        other => panic!("expected a deferral, got {other:?}"),
-    }
+    };
+    let wait = deferral(take(ResendKind::Rto, Duration::ZERO));
+    assert!(wait >= RETX_DEFER_MIN && wait <= rto, "deferred {wait:?}");
+    assert_eq!(
+        deferral(take(ResendKind::Rto, Duration::from_millis(499))),
+        Duration::from_millis(1),
+        "no later than the limit, even under the floor"
+    );
     assert!(matches!(take(ResendKind::Rto, rto), RetxAdmit::Uncapped));
     assert!(matches!(
         take(ResendKind::Probe, Duration::ZERO),
