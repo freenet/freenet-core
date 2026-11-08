@@ -4714,8 +4714,25 @@ async fn a_node_without_the_contract(
         let node = ctx.node(name)?;
         let (stream, _) = connect_async(&node.ws_url()).await?;
         let mut client = WebApi::start(stream);
-        let (own, peers) = node_ring_location(&mut client).await?;
+        let (own, mut peers) = node_ring_location(&mut client).await?;
         if *name == publisher_name {
+            // `health_check_readiness` only means each node answers; it does not
+            // mean the mesh has formed. Snapshotting node-a's connections before
+            // it has dialled its peers (seen as "node-a peers: [only node-d]"
+            // under CPU load) leaves the key search below no feasible key, or a
+            // premise that is stale by the time of the PUT. The harness targets
+            // a full mesh (min_connections = node_count - 1), so wait for it.
+            let expected = candidates.len() + 1; // every other node, gateway included
+            let deadline = std::time::Instant::now() + Duration::from_secs(120);
+            while peers.len() < expected {
+                ensure!(
+                    std::time::Instant::now() < deadline,
+                    "{publisher_name} still has only {} of {expected} connections after 120s: {peers:?}",
+                    peers.len()
+                );
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                peers = node_ring_location(&mut client).await?.1;
+            }
             publisher_peers = peers;
         }
         ring_positions.push((name.to_string(), own));
