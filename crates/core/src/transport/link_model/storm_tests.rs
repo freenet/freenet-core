@@ -413,9 +413,10 @@ struct ReverseLossReport {
 /// - the effective RTO, capped at `MAX_EFFECTIVE_RTO` whatever the backoff;
 /// - plus one probe timeout, since a probe that goes refreshes the send time
 ///   (its own, or that of a probed packet ahead of it in the queue);
-/// - plus the wait for admission. A refused resend is deferred at most one
-///   effective RTO (`RETX_DEFER_LIMIT_RTOS`), so this is at most
-///   `MAX_EFFECTIVE_RTO` per interval whatever else holds the cap. On an
+/// - plus the wait for admission. A connection's resends are refused at most
+///   one effective RTO in a row (`RETX_DEFER_LIMIT_RTOS`) before the due ones
+///   go uncapped, so this is at most `MAX_EFFECTIVE_RTO` plus the resend
+///   yields to send them per interval, whatever else holds the cap. On an
 ///   idle node it is also at most, across all intervals, the retransmits
 ///   still possible, `M x pending x MAX_PACKET_SIZE`, at the retransmit
 ///   share of the rate; the bound takes the smaller. Plus one deferral floor
@@ -435,10 +436,12 @@ fn flight_drain_bound(pending: usize, probe_timeout: Duration, rate: u64) -> Dur
     let per_interval = MAX_EFFECTIVE_RTO + probe_timeout + RETX_DEFER_MIN + RESEND_YIELD_DELAY;
     let share_rate = rate * RETX_SHARE_PERCENT / 100;
     let admission_bytes = m * pending as u64 * MAX_PACKET_SIZE as u64;
-    let admission = Duration::from_secs_f64(admission_bytes as f64 / share_rate as f64)
-        .min(MAX_EFFECTIVE_RTO * RETX_DEFER_LIMIT_RTOS * intervals);
     let abandon_yields =
         u32::try_from(pending.div_ceil(MAX_RESENDS_PER_ITERATION)).unwrap_or(u32::MAX);
+    let admission = Duration::from_secs_f64(admission_bytes as f64 / share_rate as f64).min(
+        (MAX_EFFECTIVE_RTO * RETX_DEFER_LIMIT_RTOS + RESEND_YIELD_DELAY * abandon_yields)
+            * intervals,
+    );
     per_interval * intervals + admission + RESEND_YIELD_DELAY * abandon_yields
 }
 

@@ -295,8 +295,12 @@ RETX_SHARE_WINDOW (1 s, at least one datagram) AND bucket debt after the take
 <= RETX_DEBT_LIMIT (100 ms). Nothing retransmitted is forgiven.
 Refused RTO resend: state UNCHANGED (count, backoff, send time), timer
 re-armed at max(wait, RETX_DEFER_MIN = 2 ms), capped at the deferral limit:
-once refused for RETX_DEFER_LIMIT_RTOS (1) effective RTO (counted from its FIRST refusal, not the deadline: a backoff reset moves deadlines) it goes UNCAPPED
-(charged unpaced). Do NOT remove that limit: the count moves only when a
+once the CONNECTION's resends have been refused for RETX_DEFER_LIMIT_RTOS (1)
+effective RTO in a row (RetxDeferral: from the first refusal, not the RTO
+deadline, since a backoff reset moves every deadline; per connection, not
+per packet, since only the queue head is asked) every due resend goes
+UNCAPPED (charged unpaced) until the cap takes one or nothing due is
+refused. Do NOT remove that limit: the count moves only when a
 resend goes, so an unbounded deferral (unpaced debt > 100 ms, or a tiny cap)
 never abandons the packet and pins flight (#4345). Refused probe: skipped,
 marked probed. Abandonment never asks the cap. No cap -> nothing asked.

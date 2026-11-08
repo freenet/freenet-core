@@ -2206,3 +2206,51 @@ fn a_retransmit_not_sent_hands_back_its_share() {
         .expect("the bucket refusal handed the share back")
         .sent(PACKET);
 }
+
+/// A connection's run of refusals starts at its first refusal, survives
+/// uncapped sends, so the resends behind the first also go at once, and
+/// ends when the cap takes a resend or nothing due is refused.
+#[test]
+fn the_deferral_limit_counts_a_connection_run_of_refusals() {
+    use crate::transport::sent_packet_tracker::ResendKind;
+    let (cap, _time) = cap_at(RATE);
+    cap.charge_unpaced(BURST as usize + RATE as usize);
+    let rto = Duration::from_millis(500);
+    let ms = |n: u64| n * 1_000_000;
+    let mut run = RetxDeferral::default();
+    // Deep in debt at t = 10 s: the run starts at the first refusal, not
+    // at the resend's deadline, however long ago that was.
+    assert!(matches!(
+        run.admit(&cap, ResendKind::Rto, PACKET, rto, ms(10_000)),
+        RetxAdmit::Defer(_)
+    ));
+    assert!(matches!(
+        run.admit(&cap, ResendKind::Rto, PACKET, rto, ms(10_499)),
+        RetxAdmit::Defer(_)
+    ));
+    // One RTO into the run: this resend and the next go uncapped.
+    assert!(matches!(
+        run.admit(&cap, ResendKind::Rto, PACKET, rto, ms(10_500)),
+        RetxAdmit::Uncapped
+    ));
+    assert!(matches!(
+        run.admit(&cap, ResendKind::Rto, PACKET, rto, ms(10_501)),
+        RetxAdmit::Uncapped
+    ));
+    // Nothing due was refused: the next refusal starts a new run.
+    run.end_run();
+    assert!(matches!(
+        run.admit(&cap, ResendKind::Rto, PACKET, rto, ms(20_000)),
+        RetxAdmit::Defer(_)
+    ));
+    // A take ends the run too.
+    let (free, _t) = cap_at(RATE);
+    assert!(matches!(
+        run.admit(&free, ResendKind::Rto, PACKET, rto, ms(30_000)),
+        RetxAdmit::Take(_)
+    ));
+    assert!(matches!(
+        run.admit(&cap, ResendKind::Rto, PACKET, rto, ms(30_001)),
+        RetxAdmit::Defer(_)
+    ));
+}

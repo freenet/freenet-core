@@ -1217,7 +1217,10 @@ impl EgressCap {
                     RetxAdmit::Uncapped
                 } else {
                     TRANSPORT_METRICS.record_egress_retransmit_deferred();
-                    RetxAdmit::Defer(wait.max(retx_defer_min(rto)).min(limit - deferred_for))
+                    RetxAdmit::Defer(
+                        wait.max(retx_defer_min(rto))
+                            .min(limit.saturating_sub(deferred_for)),
+                    )
                 }
             }
         }

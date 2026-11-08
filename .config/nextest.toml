@@ -152,7 +152,7 @@ slow-timeout = { period = "900s", terminate-after = 2 }
 # reads flight until it drains after the idle point (at least 180 s of
 # virtual time each); measured 420 s wall-clock under a load of ~35 on 16
 # cores. The storm rows (16 connections, 60 s, 3 seeds, 2 caps) measured
-# 136 s, the outage row OUTAGE_WALL s. They are seeded and on virtual time, so
+# 136 s, the outage row 80 s. They are seeded and on virtual time, so
 # deterministic: a retry cannot pass what failed, and would only triple the
 # runner time of a hang.
 [[profile.ci.overrides]]
