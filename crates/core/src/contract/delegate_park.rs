@@ -18,7 +18,10 @@
 //! the single serial loop — so nothing else on the node ran until it finished.
 //! For a permission prompt that is up to `USER_INPUT_TIMEOUT` (60 s) during
 //! which no GET, PUT, UPDATE, subscribe or delegate notification is serviced
-//! anywhere on this node.
+//! anywhere on this node. (That described every request when #5544 landed.
+//! Since the delegate lane, client delegate requests to OTHER delegates are
+//! served by the lane's own task and would not have waited; contract work and
+//! every other loop event still would.)
 //!
 //! Parking replaces that: the loop hands the slow half to a spawned task and
 //! returns immediately, and the delegate is re-entered on a later iteration
@@ -42,7 +45,10 @@
 //!
 //! [`DelegateParkCtx`] therefore keeps its own per-delegate exclusion: while a
 //! delegate is parked, further requests for it are QUEUED rather than run, and
-//! drained when it resumes. That preserves the invariant the delegate author
+//! drained when it resumes. With a delegate lane running, a parked delegate's
+//! CLIENT requests mostly never reach this queue: they wait in the lane's own
+//! queue (the park's gate claim keeps the lane off the delegate), under the
+//! same [`MAX_PENDING_PER_DELEGATE`] cap (`delegate_lane::prune`). That preserves the invariant the delegate author
 //! already relies on, and converts a node-wide stall into a per-delegate one —
 //! which is the correct semantics, not a compromise. Everything else on the
 //! node keeps running.
@@ -105,9 +111,9 @@
 //! **What would break it.** Running a delegate on anything but the delegate
 //! runner; starting a loop run of a delegate without claiming it on the gate;
 //! resuming a continuation anywhere other than the loop. The pins are
-//! `every_delegate_run_is_reached_from_the_serial_loop` and
-//! `every_delegate_process_runs_on_the_one_delegate_executor` in
-//! `contract.rs`.
+//! `every_delegate_run_is_reached_from_the_serial_loop`,
+//! `every_delegate_process_runs_on_the_one_delegate_executor` and
+//! `every_loop_delegate_run_claims_the_delegate_on_the_gate` in `contract.rs`.
 //!
 //! # Ownership
 //!
@@ -1748,6 +1754,15 @@ pub(super) struct DelegateParkCtx {
     /// running. Kept here because every loop path that starts a delegate run
     /// already holds `&mut DelegateParkCtx`.
     gate: Option<std::sync::Arc<super::delegate_lane::DelegateGate>>,
+    /// Delegates whose round-trip is running a hop target's handed-off lane
+    /// unit inline (see the hop in `handle_delegate_with_contract_requests`).
+    /// Non-empty means the current round-trip is nested inside another one,
+    /// and each key here is mid-round-trip on this loop.
+    hop_unit_stack: Vec<DelegateKey>,
+    /// Inter-delegate messages dropped because the target was mid-round-trip
+    /// (parked, or nested in the hop that delivers it). Counted, not only
+    /// logged.
+    dropped_hops: u64,
 }
 
 /// Why parked work was turned away, counted rather than only logged (L9).
@@ -1778,6 +1793,8 @@ impl DelegateParkCtx {
             refused: RefusalCounts::default(),
             resume_tx,
             gate: None,
+            hop_unit_stack: Vec::new(),
+            dropped_hops: 0,
         }
     }
 
@@ -1790,6 +1807,32 @@ impl DelegateParkCtx {
     /// The gate shared with the delegate lane, if one is running.
     pub(super) fn gate(&self) -> Option<std::sync::Arc<super::delegate_lane::DelegateGate>> {
         self.gate.clone()
+    }
+
+    /// Whether the current round-trip is nested inside a hop that is running
+    /// its target's lane unit.
+    pub(super) fn in_hop_unit(&self) -> bool {
+        !self.hop_unit_stack.is_empty()
+    }
+
+    /// Whether `key`'s round-trip is suspended in a hop running another
+    /// delegate's lane unit, so running `key` now would clobber it.
+    pub(super) fn is_mid_hop(&self, key: &DelegateKey) -> bool {
+        self.hop_unit_stack.contains(key)
+    }
+
+    pub(super) fn enter_hop_unit(&mut self, caller: &DelegateKey) {
+        self.hop_unit_stack.push(caller.clone());
+    }
+
+    pub(super) fn leave_hop_unit(&mut self) {
+        self.hop_unit_stack.pop();
+    }
+
+    /// Count one dropped inter-delegate message; returns the new total.
+    pub(super) fn count_dropped_hop(&mut self) -> u64 {
+        self.dropped_hops = self.dropped_hops.saturating_add(1);
+        self.dropped_hops
     }
 
     /// The byte budget this registry is enforcing. Tests assert against THIS

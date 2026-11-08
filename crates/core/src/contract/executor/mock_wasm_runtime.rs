@@ -224,6 +224,10 @@ pub(crate) struct MockWasmRuntime {
     /// by a helper-call indirection. A prohibition worth pinning is worth being
     /// able to execute.
     pub(crate) delegate_wrong_variant: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// A one-shot pause after the next delegate run through the lane runner
+    /// (see [`PauseAfterNextRun`]). Lets a test hold a loop round-trip
+    /// BETWEEN two `process()` calls, with the runner's lock released.
+    pub(crate) delegate_pause_after: DelegatePauseSlot,
     /// A delegate lane runner over this mock's delegate state, when a test
     /// opted in with [`MockWasmRuntime::enable_delegate_lane`]. `None` (the
     /// default) keeps every delegate run on the contract loop, as every test
@@ -241,6 +245,28 @@ pub(crate) struct MockDelegateState {
     observations: DelegateObservations,
     unregistered: UnregisteredDelegates,
     wrong_variant: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pause_after: DelegatePauseSlot,
+}
+
+/// Shared slot for a [`PauseAfterNextRun`].
+pub(crate) type DelegatePauseSlot = std::sync::Arc<std::sync::Mutex<Option<PauseAfterNextRun>>>;
+
+/// Taken by the next delegate run through [`MockDelegateRunner`]: once that
+/// run's `process()` has returned and the runner's lock is released, the
+/// caller marks `reached` and waits for one `release` permit.
+#[derive(Clone)]
+pub(crate) struct PauseAfterNextRun {
+    pub(crate) reached: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) release: std::sync::Arc<tokio::sync::Semaphore>,
+}
+
+impl Default for PauseAfterNextRun {
+    fn default() -> Self {
+        Self {
+            reached: std::sync::Arc::default(),
+            release: std::sync::Arc::new(tokio::sync::Semaphore::new(0)),
+        }
+    }
 }
 
 /// The mock's delegate runner: one lock around the scripted run, shared by the
@@ -260,9 +286,29 @@ impl crate::contract::delegate_lane::DelegateRunner for MockDelegateRunner {
         user_context: Option<&'a UserSecretContext>,
     ) -> futures::future::BoxFuture<'a, Response> {
         Box::pin(async move {
-            let _serial = self.lock.lock().await;
-            let user = user_context.map(|u| *u.user_id());
-            scripted_delegate_request(&self.state, req, user, user)
+            let result = {
+                let _serial = self.lock.lock().await;
+                let user = user_context.map(|u| *u.user_id());
+                scripted_delegate_request(&self.state, req, user, user)
+            };
+            let pause = self
+                .state
+                .pause_after
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            if let Some(pause) = pause {
+                pause
+                    .reached
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                pause
+                    .release
+                    .acquire()
+                    .await
+                    .expect("pause semaphore closed")
+                    .forget();
+            }
+            result
         })
     }
 }
@@ -276,6 +322,7 @@ impl MockWasmRuntime {
             observations: self.delegate_observations.clone(),
             unregistered: self.unregistered_delegates.clone(),
             wrong_variant: self.delegate_wrong_variant.clone(),
+            pause_after: self.delegate_pause_after.clone(),
         }
     }
 
@@ -994,6 +1041,7 @@ impl Executor<MockWasmRuntime, MockStateStorage> {
             registered_params: RegisteredParams::default(),
             unregistered_delegates: UnregisteredDelegates::default(),
             delegate_wrong_variant: std::sync::Arc::default(),
+            delegate_pause_after: std::sync::Arc::default(),
             delegate_lane: None,
         };
 
@@ -1034,6 +1082,7 @@ impl Executor<MockWasmRuntime, MockStateStorage> {
             registered_params: RegisteredParams::default(),
             unregistered_delegates: UnregisteredDelegates::default(),
             delegate_wrong_variant: std::sync::Arc::default(),
+            delegate_pause_after: std::sync::Arc::default(),
             delegate_lane: None,
         };
 
@@ -1066,6 +1115,7 @@ impl Executor<MockWasmRuntime, MockStateStorage> {
             registered_params: RegisteredParams::default(),
             unregistered_delegates: UnregisteredDelegates::default(),
             delegate_wrong_variant: std::sync::Arc::default(),
+            delegate_pause_after: std::sync::Arc::default(),
             delegate_lane: None,
         };
 

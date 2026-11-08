@@ -65,6 +65,34 @@
 //! [`LANE_QUEUE_CAPACITY`] requests it has taken from the intake; past that it
 //! stops reading, so the intake fills and refuses. Units to the loop are at
 //! most one per delegate and are themselves drawn from that bounded queue.
+//!
+//! A PARKED delegate (one waiting on a user prompt or an off-loop fetch, up to
+//! `delegate_park::PARK_TTL`) keeps at most
+//! [`MAX_PENDING_PER_DELEGATE`](super::delegate_park::MAX_PENDING_PER_DELEGATE)
+//! requests queued here; the lane refuses the rest at once, with the shape the
+//! park's own queue refused them with before this lane existed (the responder
+//! is dropped, so the client sees an error). Without that cap one parked
+//! delegate fills the queue, the lane stops reading, and every delegate on the
+//! node is refused until the park ends. The cap is per delegate KEY, as the
+//! park is: on a hosted node every user of a shared delegate key shares it.
+//! The other reasons a delegate is not free (a loop claim, a pending unit, a
+//! lane run) last one loop round-trip, not a human's reaction time, so they do
+//! not refuse: a burst of requests to a busy delegate waits, as it did in the
+//! loop's fair queue.
+//!
+//! A queued request whose client has gone away (its responder is closed) is
+//! dropped instead of run, so a retry after a client-side timeout does not
+//! execute twice.
+//!
+//! # Ordering caveats
+//!
+//! * Startup: a request sent before `contract_handling` installs the lane
+//!   reaches the loop, and a later request to the same delegate, sent after
+//!   installation, reaches the lane and may run first. Only requests already
+//!   in flight while the node starts are affected.
+//! * The gate is per delegate KEY, not per (key, hosted user), the same
+//!   granularity as the park registry: one user's round-trip on a shared
+//!   delegate key holds every other user's requests for that key.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -148,6 +176,10 @@ struct Entry {
     /// starts no new run of this delegate, so a burst of client requests
     /// cannot starve the loop's claim.
     loop_waiting: usize,
+    /// How many of `loop_claims` are held by a park entry
+    /// ([`DelegateGate::hold`]). Non-zero means the delegate is PARKED, which
+    /// can last up to the park TTL, so the lane caps its queued requests.
+    park_holds: usize,
 }
 
 impl Entry {
@@ -191,6 +223,9 @@ pub(crate) struct DelegateGate {
     units_ready: Notify,
     /// Lane -> loop claims waiting on a lane run: a lane run ended.
     lane_run_ended: Notify,
+    /// Requests the lane refused because their delegate was parked with a
+    /// full queue behind it. Counted, not only logged.
+    refused_parked: std::sync::atomic::AtomicU64,
 }
 
 impl DelegateGate {
@@ -226,14 +261,17 @@ impl DelegateGate {
             LoopClaim {
                 gate: self.clone(),
                 key: key.clone(),
+                park: false,
             },
             unit,
         )
     }
 
-    /// [`Self::claim`] for a caller that cannot run a pending unit (the
-    /// inter-delegate hop, which is itself inside a round-trip): `None` if the
-    /// delegate has one, and nothing is claimed.
+    /// [`Self::claim`] for a caller that may not run a pending unit (an
+    /// inter-delegate hop from a round-trip that is itself nested inside
+    /// another hop's unit run; see the hop in
+    /// `handle_delegate_with_contract_requests`): `None` if the delegate has
+    /// one, and nothing is claimed.
     pub(crate) async fn claim_unless_pending(
         self: &Arc<Self>,
         key: &DelegateKey,
@@ -252,6 +290,7 @@ impl DelegateGate {
         Some(LoopClaim {
             gate: self.clone(),
             key: key.clone(),
+            park: false,
         })
     }
 
@@ -286,17 +325,36 @@ impl DelegateGate {
         }
     }
 
-    /// Claim `key` for the loop WITHOUT waiting. Only for a caller that already
-    /// holds a claim on it (a park entry, taken while its run holds one).
+    /// Claim `key` for a PARK ENTRY, without waiting. Only for a caller that
+    /// already holds a claim on it (the park is taken while its run holds
+    /// one). Marks the delegate parked for the lane's per-delegate queue cap.
     pub(crate) fn hold(self: &Arc<Self>, key: &DelegateKey) -> LoopClaim {
         let mut inner = self.lock();
         let entry = inner.entries.entry(key.clone()).or_default();
         debug_assert!(entry.loop_claims > 0, "hold() without a live loop claim");
         entry.loop_claims += 1;
+        entry.park_holds += 1;
         LoopClaim {
             gate: self.clone(),
             key: key.clone(),
+            park: true,
         }
+    }
+
+    /// Whether a park entry holds `key`.
+    fn is_parked(&self, key: &DelegateKey) -> bool {
+        self.lock()
+            .entries
+            .get(key)
+            .is_some_and(|entry| entry.park_holds > 0)
+    }
+
+    /// Whether the loop has a unit waiting. Lets the loop skip its blocking
+    /// wait while one is: `units_ready` is a `Notify`, which stores at most
+    /// one permit, so after a capped drain the wake for the rest may already
+    /// have been spent.
+    pub(crate) fn has_pending_unit(&self) -> bool {
+        !self.lock().units.is_empty()
     }
 
     /// The oldest waiting unit, with its delegate claimed for the loop.
@@ -309,6 +367,7 @@ impl DelegateGate {
         let claim = LoopClaim {
             gate: self.clone(),
             key: unit.key.clone(),
+            park: false,
         };
         Some((claim, unit))
     }
@@ -372,6 +431,12 @@ impl DelegateGate {
     pub(crate) fn is_tracking(&self, key: &DelegateKey) -> bool {
         self.lock().entries.contains_key(key)
     }
+
+    #[cfg(test)]
+    pub(crate) fn refused_parked_count(&self) -> u64 {
+        self.refused_parked
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 /// A loop claim waiting for a lane run to end. See [`DelegateGate::wait_for_lane`].
@@ -410,6 +475,8 @@ impl Drop for Waiting {
 pub(crate) struct LoopClaim {
     gate: Arc<DelegateGate>,
     key: DelegateKey,
+    /// Taken by [`DelegateGate::hold`] for a park entry.
+    park: bool,
 }
 
 impl Drop for LoopClaim {
@@ -417,6 +484,9 @@ impl Drop for LoopClaim {
         let mut inner = self.gate.lock();
         if let Some(entry) = inner.entries.get_mut(&self.key) {
             entry.loop_claims = entry.loop_claims.saturating_sub(1);
+            if self.park {
+                entry.park_holds = entry.park_holds.saturating_sub(1);
+            }
         }
         inner.remove_if_clear(&self.key);
         drop(inner);
@@ -452,20 +522,18 @@ impl Drop for LaneRun {
     }
 }
 
-/// Logs when the lane task ends for any reason other than its intake closing,
-/// so a lane that died is visible. Requests then fall back to the loop (the
-/// sender sees a closed intake).
-struct ExitLog {
-    clean: bool,
+/// Logs the lane task being DROPPED before it finished, which happens only
+/// when `contract_handling` aborts it on the way out (node shutdown, or the
+/// loop returning an error). Not an error: the loop that owns the lane is
+/// gone too. A lane that PANICS is reported by [`run_lane`] itself, at error.
+struct AbortLog {
+    finished: bool,
 }
 
-impl Drop for ExitLog {
+impl Drop for AbortLog {
     fn drop(&mut self) {
-        if !self.clean {
-            tracing::error!(
-                "Delegate lane task ended unexpectedly; client delegate requests fall \
-                 back to the contract loop"
-            );
+        if !self.finished {
+            tracing::debug!("Delegate lane task stopped with the contract loop");
         }
     }
 }
@@ -524,12 +592,46 @@ fn respond(
 
 /// The lane task. Runs until its intake closes (the node's sender half is
 /// gone) or it is aborted with the contract loop.
+///
+/// A panic inside the lane (a delegate runner bug) is caught here, logged at
+/// error, and ends the lane: its intake closes with it, so every later client
+/// delegate request falls back to the contract loop (the sender sees a closed
+/// intake). The panic is not re-raised: nothing awaits the lane's handle, so
+/// re-raising would only lose the message. An abort is not a panic and is
+/// logged at debug by [`AbortLog`].
 pub(crate) async fn run_lane(
+    runner: Arc<dyn DelegateRunner>,
+    gate: Arc<DelegateGate>,
+    intake: tokio::sync::mpsc::Receiver<LaneRequest>,
+) {
+    use futures::FutureExt;
+    let mut exit = AbortLog { finished: false };
+    let outcome = std::panic::AssertUnwindSafe(lane_loop(runner, gate, intake))
+        .catch_unwind()
+        .await;
+    exit.finished = true;
+    match outcome {
+        Ok(()) => tracing::debug!("Delegate lane task ended: its intake closed"),
+        Err(payload) => {
+            let reason = payload
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "non-string panic payload".to_string());
+            tracing::error!(
+                %reason,
+                "Delegate lane task PANICKED; client delegate requests fall back to \
+                 the contract loop for the rest of this process"
+            );
+        }
+    }
+}
+
+async fn lane_loop(
     runner: Arc<dyn DelegateRunner>,
     gate: Arc<DelegateGate>,
     mut intake: tokio::sync::mpsc::Receiver<LaneRequest>,
 ) {
-    let mut exit = ExitLog { clean: false };
     let mut queue: VecDeque<LaneRequest> = VecDeque::new();
     loop {
         while queue.len() < LANE_QUEUE_CAPACITY {
@@ -538,8 +640,9 @@ pub(crate) async fn run_lane(
                 Err(_) => break,
             }
         }
+        prune(&mut queue, &gate);
 
-        if let Some(idx) = next_runnable(&queue, &gate) {
+        if let Some(idx) = next_runnable(&queue, |key| gate.is_free(key)) {
             let request = queue.remove(idx).expect("index from next_runnable");
             if let Err(request) = serve(&runner, &gate, request).await {
                 // The loop claimed the delegate between the scan and here.
@@ -553,26 +656,75 @@ pub(crate) async fn run_lane(
         tokio::select! {
             req = intake.recv(), if queue.len() < LANE_QUEUE_CAPACITY => match req {
                 Some(req) => queue.push_back(req),
-                None => {
-                    exit.clean = true;
-                    return;
-                }
+                None => return,
             },
             () = wake => {}
         }
     }
 }
 
+/// Drop queued requests whose client has gone away, and refuse the requests
+/// for a PARKED delegate past [`MAX_PENDING_PER_DELEGATE`] (the oldest are
+/// kept, so per-delegate order holds). See the module docs, "Bounds".
+///
+/// [`MAX_PENDING_PER_DELEGATE`]: super::delegate_park::MAX_PENDING_PER_DELEGATE
+fn prune(queue: &mut VecDeque<LaneRequest>, gate: &DelegateGate) {
+    use super::delegate_park::MAX_PENDING_PER_DELEGATE;
+    // Per key: (parked, requests kept so far). One gate lookup per key.
+    let mut seen: HashMap<DelegateKey, (bool, usize)> = HashMap::new();
+    queue.retain(|request| {
+        let key = request.req.key();
+        if request.responder.is_closed() {
+            tracing::debug!(
+                delegate_key = %key,
+                id = request.id,
+                "Delegate lane: dropping a queued request whose client went away"
+            );
+            return false;
+        }
+        let (parked, kept) = seen
+            .entry(key.clone())
+            .or_insert_with(|| (gate.is_parked(key), 0));
+        if *parked && *kept >= MAX_PENDING_PER_DELEGATE {
+            let total = gate
+                .refused_parked
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            tracing::warn!(
+                delegate_key = %key,
+                limit = MAX_PENDING_PER_DELEGATE,
+                total_refused = total,
+                "Refused a delegate request: the delegate is parked and already has \
+                 the maximum number of requests waiting behind it. Dropping the \
+                 responder so the client sees an error"
+            );
+            // Dropping the request drops its responder: the client's oneshot
+            // closes and it surfaces an error, as the park's own queue did.
+            return false;
+        }
+        *kept += 1;
+        true
+    });
+}
+
 /// The first queued request whose delegate is free and has no earlier request
 /// still queued.
-fn next_runnable(queue: &VecDeque<LaneRequest>, gate: &DelegateGate) -> Option<usize> {
+///
+/// `is_free` reads the gate, which the loop changes concurrently, so two
+/// requests for the same delegate can get different answers within one scan.
+/// The `blocked` set is what stops the LATER one running when the earlier one
+/// was seen busy (`next_runnable_never_runs_a_later_request_for_a_blocked_delegate`).
+fn next_runnable(
+    queue: &VecDeque<LaneRequest>,
+    mut is_free: impl FnMut(&DelegateKey) -> bool,
+) -> Option<usize> {
     let mut blocked: HashSet<&DelegateKey> = HashSet::new();
     for (idx, request) in queue.iter().enumerate() {
         let key = request.req.key();
         if blocked.contains(key) {
             continue;
         }
-        if gate.is_free(key) {
+        if is_free(key) {
             return Some(idx);
         }
         blocked.insert(key);
@@ -784,6 +936,182 @@ mod tests {
             gate.try_begin_lane_run(&k).is_some(),
             "a claim abandoned while waiting must not block the lane forever"
         );
+    }
+
+    fn request(
+        k: &DelegateKey,
+    ) -> (
+        LaneRequest,
+        tokio::sync::oneshot::Receiver<(EventId, ContractHandlerEvent)>,
+    ) {
+        let (responder, rx) = tokio::sync::oneshot::channel();
+        let req = LaneRequest {
+            id: 0,
+            responder,
+            req: DelegateRequest::ApplicationMessages {
+                key: k.clone(),
+                params: freenet_stdlib::prelude::Parameters::from(Vec::new()),
+                inbound: Vec::new(),
+            },
+            origin_contract: None,
+            connection_scope: crate::client_events::ConnectionScope::Local,
+            user_context: None,
+        };
+        (req, rx)
+    }
+
+    /// A busy delegate does not block a free one behind it, and a request
+    /// for a busy delegate is never overtaken by a later request for the
+    /// same delegate, even when the gate's answer changes mid-scan.
+    ///
+    /// FALSIFY: remove `blocked.insert(key)` from `next_runnable`; the second
+    /// assertion picks the later X (index 1).
+    #[test]
+    fn next_runnable_never_runs_a_later_request_for_a_blocked_delegate() {
+        let (x, y) = (key(10), key(11));
+        // [X busy, Y free, X]: Y, not the second X.
+        let queue: VecDeque<_> = [&x, &y, &x].into_iter().map(|k| request(k).0).collect();
+        assert_eq!(next_runnable(&queue, |k| k != &x), Some(1));
+
+        // [X, X, Y busy]: the gate frees X between the two X checks (the
+        // loop dropped its claim mid-scan). The first X was seen busy, so
+        // the second X must NOT run ahead of it.
+        let queue: VecDeque<_> = [&x, &x, &y].into_iter().map(|k| request(k).0).collect();
+        let mut x_checks = 0;
+        let picked = next_runnable(&queue, |k| {
+            if k == &x {
+                x_checks += 1;
+                x_checks > 1
+            } else {
+                false
+            }
+        });
+        assert_eq!(
+            picked, None,
+            "a later request for a delegate seen busy must wait for the earlier one"
+        );
+    }
+
+    /// A PARKED delegate keeps at most `MAX_PENDING_PER_DELEGATE` queued
+    /// requests (the oldest), the rest are refused (their responder is
+    /// dropped); other delegates' requests and a non-parked delegate's are
+    /// untouched; a request whose client went away is dropped.
+    ///
+    /// FALSIFY: remove the `*parked && *kept >= MAX_PENDING_PER_DELEGATE`
+    /// refusal in `prune`; D keeps all of its requests. Remove the
+    /// `is_closed()` check; the abandoned request stays queued.
+    #[tokio::test]
+    async fn prune_caps_a_parked_delegate_and_drops_abandoned_requests() {
+        use super::super::delegate_park::MAX_PENDING_PER_DELEGATE;
+        let gate = DelegateGate::new();
+        let (d, e, f) = (key(20), key(21), key(22));
+        let (claim, _) = gate.claim(&d).await;
+        let park_hold = gate.hold(&d);
+        drop(claim);
+        // F is claimed by the loop but NOT parked: no cap.
+        let (f_claim, _) = gate.claim(&f).await;
+
+        let extra = 3;
+        let mut queue = VecDeque::new();
+        let mut d_rx = Vec::new();
+        let mut f_rx = Vec::new();
+        for _ in 0..MAX_PENDING_PER_DELEGATE + extra {
+            let (r, rx) = request(&d);
+            queue.push_back(r);
+            d_rx.push(rx);
+            let (r, rx) = request(&f);
+            queue.push_back(r);
+            f_rx.push(rx);
+        }
+        let (r, mut e_rx) = request(&e);
+        queue.push_back(r);
+        let (r, gone) = request(&e);
+        drop(gone);
+        queue.push_back(r);
+
+        prune(&mut queue, &gate);
+
+        fn count(queue: &VecDeque<LaneRequest>, k: &DelegateKey) -> usize {
+            queue.iter().filter(|r| r.req.key() == k).count()
+        }
+        assert_eq!(
+            count(&queue, &d),
+            MAX_PENDING_PER_DELEGATE,
+            "parked D is capped"
+        );
+        assert_eq!(
+            count(&queue, &f),
+            MAX_PENDING_PER_DELEGATE + extra,
+            "a delegate that is busy but not parked is not capped"
+        );
+        assert_eq!(
+            count(&queue, &e),
+            1,
+            "the abandoned request is dropped, the live one kept"
+        );
+        assert!(
+            matches!(
+                e_rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "the live request is still waiting for its answer"
+        );
+        for (i, rx) in d_rx.iter_mut().enumerate() {
+            let closed = matches!(
+                rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+            );
+            assert_eq!(
+                closed,
+                i >= MAX_PENDING_PER_DELEGATE,
+                "the OLDEST requests are kept and the newest refused (request {i})"
+            );
+        }
+        assert_eq!(gate.refused_parked_count(), extra as u64);
+
+        // Unparked: no cap any more.
+        drop(park_hold);
+        drop(f_claim);
+        let mut more_rx = Vec::new();
+        for _ in 0..extra {
+            let (r, rx) = request(&d);
+            queue.push_back(r);
+            more_rx.push(rx);
+        }
+        prune(&mut queue, &gate);
+        assert_eq!(count(&queue, &d), MAX_PENDING_PER_DELEGATE + extra);
+    }
+
+    /// A panic inside the lane ends the lane quietly for its awaiter (it is
+    /// logged, not re-raised) and closes its intake, so senders fall back to
+    /// the loop.
+    ///
+    /// FALSIFY: in `run_lane`, await `lane_loop(..)` directly instead of
+    /// through `catch_unwind`; the join reports a panic.
+    #[tokio::test]
+    async fn a_panicking_lane_is_caught_and_closes_its_intake() {
+        struct Panics;
+        impl DelegateRunner for Panics {
+            fn run<'a>(
+                &'a self,
+                _req: DelegateRequest<'a>,
+                _origin_contract: Option<&'a ContractInstanceId>,
+                _caller_delegate: Option<&'a DelegateKey>,
+                _connection_scope: crate::client_events::ConnectionScope,
+                _user_context: Option<&'a UserSecretContext>,
+            ) -> BoxFuture<'a, Result<HostResponse, ExecutorError>> {
+                Box::pin(async { panic!("runner bug") })
+            }
+        }
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let lane = tokio::spawn(run_lane(Arc::new(Panics), DelegateGate::new(), rx));
+        let (req, _answer) = request(&key(30));
+        tx.send(req).await.expect("lane is up");
+        tokio::time::timeout(Duration::from_secs(5), lane)
+            .await
+            .expect("the lane ends")
+            .expect("the panic is caught inside the lane, not propagated to its join");
+        assert!(tx.is_closed(), "the dead lane's intake is closed");
     }
 
     #[tokio::test]
