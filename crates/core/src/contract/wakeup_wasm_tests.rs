@@ -228,6 +228,7 @@ impl Node {
                 origin_contract: None,
                 connection_scope: crate::client_events::ConnectionScope::Local,
                 user_context: None,
+                lane_ticket: Default::default(),
             })
             .await;
         #[allow(clippy::wildcard_enum_match_arm)]
@@ -278,6 +279,7 @@ async fn a_real_delegate_is_woken_with_no_client_connected() {
         origin_contract: Some(app),
         connection_scope: crate::client_events::ConnectionScope::Local,
         user_context: None,
+        lane_ticket: Default::default(),
     })
     .await;
     node.nudge_until("the Background grant", || {
@@ -392,6 +394,7 @@ async fn a_notification_run_sees_the_same_params_as_a_client_run() {
         origin_contract: None,
         connection_scope: crate::client_events::ConnectionScope::Local,
         user_context: None,
+        lane_ticket: Default::default(),
     })
     .await;
 
@@ -409,6 +412,7 @@ async fn a_notification_run_sees_the_same_params_as_a_client_run() {
                 origin_contract: None,
                 connection_scope: crate::client_events::ConnectionScope::Local,
                 user_context: None,
+                lane_ticket: Default::default(),
             })
             .await;
         let payload = outbound
@@ -537,6 +541,7 @@ async fn a_client_request_whose_params_do_not_derive_the_key_is_refused() {
             origin_contract: None,
             connection_scope: crate::client_events::ConnectionScope::Local,
             user_context: None,
+            lane_ticket: Default::default(),
         })
         .await;
     }
@@ -556,6 +561,7 @@ async fn a_client_request_whose_params_do_not_derive_the_key_is_refused() {
                     origin_contract: None,
                     connection_scope: crate::client_events::ConnectionScope::Local,
                     user_context: None,
+                    lane_ticket: Default::default(),
                 })
                 .await
                 .expect("handler reply")
@@ -753,6 +759,7 @@ async fn a_hop_into_a_parameterized_delegate_runs_it() {
             origin_contract: None,
             connection_scope: crate::client_events::ConnectionScope::Local,
             user_context: None,
+            lane_ticket: Default::default(),
         })
         .await;
     }
@@ -773,6 +780,7 @@ async fn a_hop_into_a_parameterized_delegate_runs_it() {
                 origin_contract: None,
                 connection_scope: crate::client_events::ConnectionScope::Local,
                 user_context: None,
+                lane_ticket: Default::default(),
             })
             .await
             .into_iter()

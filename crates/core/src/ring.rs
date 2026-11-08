@@ -2318,6 +2318,14 @@ impl Ring {
                 snapshot.delegate_lane_requests_refused = Some(refused);
                 snapshot.delegate_lane_panics = Some(panics);
                 snapshot.inter_delegate_messages_dropped = Some(dropped);
+                let (runs, forwarded) = crate::contract::delegate_lane_routing_counts();
+                snapshot.delegate_lane_runs = Some(runs);
+                snapshot.delegate_lane_forwarded_busy = Some(forwarded[0]);
+                snapshot.delegate_lane_forwarded_parked = Some(forwarded[1]);
+                snapshot.delegate_lane_forwarded_loop_owned = Some(forwarded[2]);
+                snapshot.delegate_lane_forwarded_unit_bound = Some(forwarded[3]);
+                snapshot.delegate_lane_forwarded_not_runnable = Some(forwarded[4]);
+                snapshot.delegate_lane_forwarded_forged = Some(forwarded[5]);
             }
 
             // Streamed-transfer abort counters (Group B): isolate the

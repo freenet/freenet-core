@@ -4023,6 +4023,34 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     "inter_delegate_messages_dropped".to_string(),
                     serde_json::json!(snapshot.inter_delegate_messages_dropped),
                 );
+                obj.insert(
+                    "delegate_lane_runs".to_string(),
+                    serde_json::json!(snapshot.delegate_lane_runs),
+                );
+                obj.insert(
+                    "delegate_lane_forwarded_busy".to_string(),
+                    serde_json::json!(snapshot.delegate_lane_forwarded_busy),
+                );
+                obj.insert(
+                    "delegate_lane_forwarded_parked".to_string(),
+                    serde_json::json!(snapshot.delegate_lane_forwarded_parked),
+                );
+                obj.insert(
+                    "delegate_lane_forwarded_loop_owned".to_string(),
+                    serde_json::json!(snapshot.delegate_lane_forwarded_loop_owned),
+                );
+                obj.insert(
+                    "delegate_lane_forwarded_unit_bound".to_string(),
+                    serde_json::json!(snapshot.delegate_lane_forwarded_unit_bound),
+                );
+                obj.insert(
+                    "delegate_lane_forwarded_not_runnable".to_string(),
+                    serde_json::json!(snapshot.delegate_lane_forwarded_not_runnable),
+                );
+                obj.insert(
+                    "delegate_lane_forwarded_forged".to_string(),
+                    serde_json::json!(snapshot.delegate_lane_forwarded_forged),
+                );
                 // Streamed-transfer abort counters (Group B), routing/hosting
                 // attribution (Group C), and connect-emit counters — same
                 // hand-mirror footgun: a new `RouterSnapshotInfo` field is
@@ -5140,11 +5168,25 @@ mod tests {
         info.delegate_lane_requests_refused = Some(601);
         info.delegate_lane_panics = Some(607);
         info.inter_delegate_messages_dropped = Some(613);
+        info.delegate_lane_runs = Some(617);
+        info.delegate_lane_forwarded_busy = Some(619);
+        info.delegate_lane_forwarded_parked = Some(621);
+        info.delegate_lane_forwarded_loop_owned = Some(623);
+        info.delegate_lane_forwarded_unit_bound = Some(625);
+        info.delegate_lane_forwarded_not_runnable = Some(627);
+        info.delegate_lane_forwarded_forged = Some(629);
         let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
         for (key, want) in [
             ("delegate_lane_requests_refused", 601),
             ("delegate_lane_panics", 607),
             ("inter_delegate_messages_dropped", 613),
+            ("delegate_lane_runs", 617),
+            ("delegate_lane_forwarded_busy", 619),
+            ("delegate_lane_forwarded_parked", 621),
+            ("delegate_lane_forwarded_loop_owned", 623),
+            ("delegate_lane_forwarded_unit_bound", 625),
+            ("delegate_lane_forwarded_not_runnable", 627),
+            ("delegate_lane_forwarded_forged", 629),
         ] {
             assert_eq!(json[key], want, "{key} must reach the OTLP body");
         }

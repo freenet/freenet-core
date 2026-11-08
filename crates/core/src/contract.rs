@@ -18,6 +18,7 @@ mod executor;
 mod fair_queue;
 #[cfg(all(test, feature = "wasmtime-backend", feature = "redb"))]
 mod wakeup_wasm_tests;
+pub(crate) use delegate_lane::routing_counts as delegate_lane_routing_counts;
 pub(crate) use fair_queue::Priority;
 /// Fair-queue occupancy for the status snapshot (#4917). Re-exported rather
 /// than widening `fair_queue` itself, which is otherwise private to this
@@ -3421,10 +3422,7 @@ where
         abort.push(handle.abort_handle());
         contract_handler
             .channel()
-            .install_delegate_lane(handler::DelegateLaneIntake {
-                tx: intake_tx,
-                gate: gate.clone(),
-            });
+            .install_delegate_lane(handler::DelegateLaneIntake { tx: intake_tx });
         park_ctx.set_gate(gate.clone());
         // The abort guard rides with the gate for the loop's lifetime.
         (gate, abort)
@@ -3432,17 +3430,27 @@ where
 
     loop {
         // Work the delegate lane handed over: the rest of a round-trip whose
-        // output needs this loop. Each is a full delegate run, so bounded per iteration like the resumes
-        // below. Ahead of new queued work for the same reason as resumes: a
+        // output needs this loop. Each is a full delegate run, so bounded per
+        // iteration like the resumes below. Ahead of new queued work for the
+        // same reason as resumes: a
         // client is waiting on it and the delegate is held for it. What is
         // left over when the batch runs out is picked up by the
         // `has_pending_unit` guard before the select below, not by a wake.
         if let Some((gate, _)) = &delegate_gate {
             for _ in 0..MAX_LANE_UNITS_PER_ITERATION {
-                let Some((_claim, unit)) = gate.take_next_unit() else {
+                let Some((claim, unit)) = gate.take_next_unit() else {
                     break;
                 };
-                run_lane_unit(&mut contract_handler, &mut park_ctx, &prompter, unit).await;
+                // The claim is this unit's alone: released before the client
+                // is answered.
+                run_lane_unit(
+                    &mut contract_handler,
+                    &mut park_ctx,
+                    &prompter,
+                    unit,
+                    Some(claim),
+                )
+                .await;
             }
         }
 
@@ -4640,10 +4648,9 @@ async fn send_queue_full_response(
         event = %rejected.event,
         "Rejected event due to per-contract queue capacity limit"
     );
-    // A delegate request the delegate lane forwarded is finished here too:
-    // release its loop-owned mark, or the lane would send every later request
-    // for that delegate to the loop for good (`delegate_lane`).
-    drop(channel.take_forwarded_delegate(rejected.id.id));
+    // A delegate request the lane forwarded carries its loop-owned mark in
+    // the event (`delegate_lane::LaneTicket`); it is released when `rejected`
+    // drops at the end of this function.
     // Typed `ContractQueueFull` marker powers `is_contract_queue_full` at
     // every caller; the UPDATE relay drivers gate amplification on it. #4251.
     let make_err = || ExecutorError::other(ContractQueueFull);
@@ -5694,7 +5701,8 @@ where
     let gate = park.gate()?;
     let (claim, unit) = gate.claim(key).await;
     if let Some(unit) = unit {
-        run_lane_unit(contract_handler, park, prompter, unit).await;
+        // The caller still needs the claim after the unit: not released.
+        run_lane_unit(contract_handler, park, prompter, unit, None).await;
     }
     Some(claim)
 }
@@ -5708,6 +5716,9 @@ async fn run_lane_unit<CH, P>(
     park: &mut delegate_park::DelegateParkCtx,
     prompter: &std::sync::Arc<P>,
     unit: delegate_lane::LaneUnit,
+    // `Some` when the caller's claim exists only for this unit: released
+    // before the client is answered.
+    claim: Option<delegate_lane::LoopClaim>,
 ) where
     CH: ContractHandler + Send + 'static,
     P: UserInputPrompter + 'static,
@@ -5738,6 +5749,10 @@ async fn run_lane_unit<CH, P>(
         connection_scope,
         user_context,
         Some(first_values),
+        delegate_lane::LoopRelease {
+            claim,
+            ticket: Default::default(),
+        },
     )
     .await;
 }
@@ -5756,7 +5771,7 @@ where
     CH: ContractHandler + Send + 'static,
     P: UserInputPrompter + 'static,
 {
-    Box::pin(run_lane_unit(contract_handler, park, prompter, unit))
+    Box::pin(run_lane_unit(contract_handler, park, prompter, unit, None))
 }
 
 /// Run one client-driven delegate request, honouring per-delegate exclusion.
@@ -5777,6 +5792,9 @@ async fn dispatch_delegate_request<CH, P>(
     // `Some` for a round-trip the delegate lane started and handed to the
     // loop: what its first `process()` call returned. See `RunSeed`.
     first_values: Option<Vec<OutboundDelegateMsg>>,
+    // The claim and loop-owned mark held for THIS run only: released just
+    // before the client is answered (or when this returns on another path).
+    release: delegate_lane::LoopRelease,
 ) where
     CH: ContractHandler + Send + 'static,
     P: UserInputPrompter + 'static,
@@ -5985,6 +6003,10 @@ async fn dispatch_delegate_request<CH, P>(
     )
     .await;
 
+    // Release before answering, as the lane does, so the client's next
+    // request for this delegate finds it free rather than being forwarded.
+    // A parked run is held by its park entry's own claim.
+    release.release();
     match outcome {
         DelegateRunOutcome::Parked => {
             // Move the client's responder into the park so the resumed run can
@@ -6175,8 +6197,10 @@ where
 /// Re-enter a delegate whose park has resolved, then drain whatever queued
 /// behind it.
 ///
-/// Runs ON the serial loop (the delegate's WASM must stay serial); only the
-/// WAIT happened off it. This is the counterpart to #4391's
+/// Runs ON the serial loop, which holds this delegate's claim on the lane gate
+/// while it runs; the WASM itself runs on the one delegate executor, whose
+/// lock keeps delegate runs serial. Only the WAIT happened off the loop. This
+/// is the counterpart to #4391's
 /// `handle_deferred_resume`.
 ///
 /// `Some(runs)` is the number of delegate runs performed, INCLUDING the pending
@@ -6528,6 +6552,8 @@ where
                     connection_scope,
                     user_context,
                     None,
+                    // The resume's own claim covers the whole drain.
+                    delegate_lane::LoopRelease::default(),
                 )
                 .await;
             }
@@ -6969,6 +6995,7 @@ where
             origin_contract,
             connection_scope,
             user_context,
+            lane_ticket,
         } => {
             let delegate_key = req.key().clone();
             tracing::debug!(
@@ -6985,12 +7012,14 @@ where
             // the lane FORWARDED (its delegate was busy, the lane was at its
             // unit bound, or it is a registration/unregistration/forged
             // inbound), and by any request sent while the lane's intake was
-            // closed. Hold the lane's loop-owned mark for a forwarded one
-            // until this arm is done, so later requests for the delegate
-            // keep following it instead of overtaking it on the lane
-            // (`delegate_lane`). If the run parks or queues behind a park,
-            // the park's own claim takes over from here.
-            let _loop_owned = contract_handler.channel().take_forwarded_delegate(id.id);
+            // closed. A forwarded one carries its loop-owned mark
+            // (`lane_ticket`): held until this run is done, so the same
+            // user's later requests for the delegate keep following it
+            // instead of overtaking it on the lane (`delegate_lane`), and
+            // released with the claim just BEFORE the client is answered
+            // (`LoopRelease`), so the client's next request can find the
+            // delegate free. If the run parks or queues behind a park, the
+            // park's own claim takes over.
             // Claim the delegate so the lane cannot be inside it.
             let mut park = park;
             let _claim = match park.as_deref_mut() {
@@ -7011,6 +7040,10 @@ where
                 connection_scope,
                 user_context,
                 None,
+                delegate_lane::LoopRelease {
+                    claim: _claim,
+                    ticket: lane_ticket,
+                },
             )
             .await;
         }
@@ -8760,11 +8793,12 @@ mod tests {
         /// Whether the call at `idx` is in scope of a claim binding whose
         /// statement contains `token`.
         fn claimed_in_scope(code: &str, fn_start: usize, idx: usize, token: &str) -> bool {
-            const BINDINGS: [&str; 5] = [
+            const BINDINGS: [&str; 6] = [
                 "let _claim =",
                 "let _claim:",
                 "let (_claim,",
                 "let Some((_claim,",
+                "let Some((claim, unit))",
                 "let (claim, unit) =",
             ];
             let body = &code[fn_start..idx];
@@ -9333,6 +9367,58 @@ mod tests {
             }
             other => panic!("expected PutResponse, got {other}"),
         }
+    }
+
+    /// A forwarded delegate request the FAIR QUEUE refuses releases its
+    /// loop-owned mark: the mark rides in the event and goes when the
+    /// refused event is dropped, so the lane can run the delegate again.
+    /// Driven through the real queue at its per-slot cap.
+    ///
+    /// FALSIFY: `std::mem::forget(rejected)` at the end of
+    /// `send_queue_full_response` (or make `LoopOwned::drop` not decrement);
+    /// the delegate stays loop-owned.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_forwarded_request_releases_its_mark() {
+        let (_send, mut rcv_halve, _) = handler::contract_handler_channel();
+        let gate = delegate_lane::DelegateGate::new();
+        let key = DelegateKey::new(
+            [0x5A; 32],
+            freenet_stdlib::prelude::CodeHash::new([0x5A; 32]),
+        );
+        let event = |ticket| ContractHandlerEvent::DelegateRequest {
+            req: DelegateRequest::UnregisterDelegate(key.clone()),
+            origin_contract: None,
+            connection_scope: crate::client_events::ConnectionScope::Local,
+            user_context: None,
+            lane_ticket: ticket,
+        };
+        let mut queue = fair_queue::FairEventQueue::new();
+        // Fill the client slot to its cap.
+        let mut n = 0u64;
+        while queue
+            .try_push(
+                handler::EventId { id: n },
+                event(Default::default()),
+                fair_queue::Priority::ClientLocal,
+            )
+            .is_ok()
+        {
+            n += 1;
+            assert!(n < 100_000, "the queue never refused");
+        }
+        let rejected = queue
+            .try_push(
+                handler::EventId { id: n + 1 },
+                event(gate.ticket_for_test(&key, None)),
+                fair_queue::Priority::ClientLocal,
+            )
+            .expect_err("the slot is full");
+        assert!(gate.is_tracking(&key), "marked while in flight");
+        send_queue_full_response(&mut rcv_halve, rejected).await;
+        assert!(
+            !gate.is_tracking(&key),
+            "the refusal released the loop-owned mark"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -11308,6 +11394,7 @@ mod hol_4391_tests {
             origin_contract: None,
             connection_scope: crate::client_events::ConnectionScope::Local,
             user_context: None,
+            lane_ticket: Default::default(),
         };
         let send_fut = send_halve.send_to_handler(event);
         let recv_fut = async {
@@ -11383,6 +11470,7 @@ mod hol_4391_tests {
             origin_contract: None,
             connection_scope: crate::client_events::ConnectionScope::Local,
             user_context: None,
+            lane_ticket: Default::default(),
         };
 
         let send_fut = send_halve.send_to_handler(event);
@@ -11485,6 +11573,7 @@ mod hol_4391_tests {
             origin_contract: None,
             connection_scope: crate::client_events::ConnectionScope::Local,
             user_context: None,
+            lane_ticket: Default::default(),
         };
 
         let send_fut = send_halve.send_to_handler(event);
@@ -11618,6 +11707,7 @@ mod hol_4391_tests {
                 origin_contract,
                 connection_scope,
                 user_context,
+                lane_ticket: Default::default(),
             },
             other => panic!("delegate_event built {other}"),
         }
@@ -11866,6 +11956,7 @@ mod hol_4391_tests {
             origin_contract: None,
             connection_scope: crate::client_events::ConnectionScope::Local,
             user_context: None,
+            lane_ticket: Default::default(),
         }
     }
 
@@ -12285,6 +12376,7 @@ mod hol_4391_tests {
             origin_contract: None,
             connection_scope: crate::client_events::ConnectionScope::Local,
             user_context: None,
+            lane_ticket: Default::default(),
         };
         let response = tokio::time::timeout(Duration::from_secs(5), send.send_to_handler(forged))
             .await
@@ -12591,7 +12683,7 @@ mod hol_4391_tests {
         use crate::contract::delegate_lane::{DelegateRunner, LaneRequest, LoopForward};
         struct Collect(tokio::sync::mpsc::UnboundedSender<LaneRequest>);
         impl LoopForward for Collect {
-            fn forward(&self, request: LaneRequest) {
+            fn forward(&self, request: LaneRequest, _ticket: delegate_lane::LaneTicket) {
                 self.0.send(request).expect("test receiver alive");
             }
         }
@@ -12741,6 +12833,7 @@ mod hol_4391_tests {
                 origin_contract: None,
                 connection_scope: crate::client_events::ConnectionScope::Local,
                 user_context: None,
+                lane_ticket: Default::default(),
             }),
         )
         .await
@@ -12882,7 +12975,7 @@ mod hol_4391_tests {
         let prompter = Arc::new(crate::contract::user_input::AutoApprovePrompter);
         let (_claim, unit) = gate.take_next_unit().expect("D's unit first");
         assert_eq!(unit.key, d);
-        run_lane_unit(&mut handler, &mut park, &prompter, unit).await;
+        run_lane_unit(&mut handler, &mut park, &prompter, unit, None).await;
         drop(_claim);
 
         assert_eq!(
@@ -12947,7 +13040,7 @@ mod hol_4391_tests {
         let prompter = Arc::new(crate::contract::user_input::AutoApprovePrompter);
         let (_claim, unit) = gate.take_next_unit().expect("D's unit first");
         assert_eq!(unit.key, d);
-        run_lane_unit(&mut handler, &mut park, &prompter, unit).await;
+        run_lane_unit(&mut handler, &mut park, &prompter, unit, None).await;
         drop(_claim);
 
         assert_eq!(
@@ -16446,6 +16539,7 @@ mod hol_4391_tests {
                 origin_contract,
                 connection_scope,
                 user_context: Some(user.clone()),
+                lane_ticket: Default::default(),
             },
             other => panic!("delegate_event built {other}"),
         };
@@ -16710,6 +16804,7 @@ mod hol_4391_tests {
                 origin_contract,
                 connection_scope,
                 user_context: Some(user),
+                lane_ticket: Default::default(),
             },
             other => panic!("delegate_event built {other}"),
         };

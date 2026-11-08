@@ -254,11 +254,9 @@ pub(crate) struct ContractHandlerHalve {
 /// then, and for executors that do not provide a delegate runner.
 type DelegateLaneSlot = Arc<std::sync::OnceLock<DelegateLaneIntake>>;
 
-/// A started delegate lane: its intake channel and the gate it shares with
-/// the loop.
+/// A started delegate lane's intake channel.
 pub(crate) struct DelegateLaneIntake {
     pub(crate) tx: mpsc::Sender<super::delegate_lane::LaneRequest>,
-    pub(crate) gate: Arc<super::delegate_lane::DelegateGate>,
 }
 
 /// Puts a request the delegate lane does not run back on the loop's
@@ -269,7 +267,11 @@ pub(crate) struct LoopForwarder {
 }
 
 impl super::delegate_lane::LoopForward for LoopForwarder {
-    fn forward(&self, request: super::delegate_lane::LaneRequest) {
+    fn forward(
+        &self,
+        request: super::delegate_lane::LaneRequest,
+        ticket: super::delegate_lane::LaneTicket,
+    ) {
         let super::delegate_lane::LaneRequest {
             id,
             responder,
@@ -285,6 +287,7 @@ impl super::delegate_lane::LoopForward for LoopForwarder {
                 origin_contract,
                 connection_scope,
                 user_context,
+                lane_ticket: ticket,
             },
             id,
             priority,
@@ -568,6 +571,7 @@ impl ContractHandlerChannel<SenderHalve> {
             origin_contract,
             connection_scope,
             user_context,
+            lane_ticket: _,
         } = ev
         else {
             return Some(InternalCHEvent {
@@ -577,6 +581,27 @@ impl ContractHandlerChannel<SenderHalve> {
                 result,
             });
         };
+        // The LOCAL reserve (`delegate_lane::LOCAL_INTAKE_RESERVE`): a
+        // request that is not from the node's own local client may not take
+        // the last slots. Check-then-act against concurrent senders: N remote
+        // senders racing here can overshoot the reserve by up to N - 1 slots,
+        // so the reserve is approximate, not exact.
+        if !super::delegate_lane::is_local_client(connection_scope, user_context.as_ref())
+            && lane.tx.capacity() <= super::delegate_lane::LOCAL_INTAKE_RESERVE
+        {
+            let total = super::delegate_lane::record_refusal();
+            if super::delegate_lane::log_this_refusal(total) {
+                tracing::warn!(
+                    delegate_key = %req.key(),
+                    total_refused = total,
+                    "Refused a non-local delegate request: the delegate lane's intake \
+                     is full apart from its local reserve. Logged at powers of two \
+                     of the running total"
+                );
+            }
+            // `result` (the responder) drops here: the client sees an error.
+            return None;
+        }
         let request = LaneRequest {
             id,
             responder: result,
@@ -607,6 +632,7 @@ impl ContractHandlerChannel<SenderHalve> {
                     origin_contract: request.origin_contract,
                     connection_scope: request.connection_scope,
                     user_context: request.user_context,
+                    lane_ticket: Default::default(),
                 },
                 id: request.id,
                 priority: request.priority,
@@ -851,16 +877,6 @@ impl ContractHandlerChannel<ContractHandlerHalve> {
         }
     }
 
-    /// The loop's hold on a request the delegate lane forwarded as event
-    /// `id`, if it was one (`delegate_lane::DelegateGate::take_forwarded`).
-    /// Hold it until the loop is done with the request, refusals included.
-    pub(crate) fn take_forwarded_delegate(
-        &self,
-        id: u64,
-    ) -> Option<super::delegate_lane::LoopOwned> {
-        self.end.delegate_lane.get()?.gate.take_forwarded(id)
-    }
-
     /// Check if a waiting_response entry exists for the given event ID.
     #[cfg(test)]
     pub fn has_waiting_response(&self, id: &EventId) -> bool {
@@ -1017,6 +1033,10 @@ pub(crate) enum ContractHandlerEvent {
         /// `UserSecretContext` holds the `dek_secret` in `Zeroizing`; its
         /// `Debug` impl redacts the secret, so logging this event is safe.
         user_context: Option<UserSecretContext>,
+        /// The delegate lane's loop-owned mark, when the lane forwarded this
+        /// request (`delegate_lane::LaneTicket`); empty otherwise. Released
+        /// wherever this event is dropped.
+        lane_ticket: super::delegate_lane::LaneTicket,
     },
     /// `Err` on a genuine delegate execution failure (#5263 — previously
     /// every failure here silently became an empty successful
@@ -1379,6 +1399,7 @@ pub mod test {
             origin_contract: None,
             connection_scope: crate::client_events::ConnectionScope::Local,
             user_context: None,
+            lane_ticket: Default::default(),
         }
     }
 
@@ -1388,6 +1409,7 @@ pub mod test {
             origin_contract,
             connection_scope,
             user_context,
+            lane_ticket: _,
         } = lane_delegate_request()
         else {
             unreachable!()
@@ -1416,10 +1438,7 @@ pub mod test {
         let (send, mut rcv, _) = contract_handler_channel();
         let (tx, mut lane_rx) = mpsc::channel(1);
         tx.try_send(lane_filler()).expect("room for the filler");
-        rcv.install_delegate_lane(DelegateLaneIntake {
-            tx,
-            gate: crate::contract::delegate_lane::DelegateGate::new(),
-        });
+        rcv.install_delegate_lane(DelegateLaneIntake { tx });
         let result = tokio::time::timeout(
             Duration::from_secs(5),
             send.send_to_handler(lane_delegate_request()),
@@ -1453,10 +1472,7 @@ pub mod test {
         let (send, mut rcv, _) = contract_handler_channel();
         let (tx, lane_rx) = mpsc::channel(8);
         drop(lane_rx);
-        rcv.install_delegate_lane(DelegateLaneIntake {
-            tx,
-            gate: crate::contract::delegate_lane::DelegateGate::new(),
-        });
+        rcv.install_delegate_lane(DelegateLaneIntake { tx });
         let client = GlobalExecutor::spawn(async move {
             send.send_to_handler_prioritized(
                 lane_delegate_request(),
@@ -1481,6 +1497,86 @@ pub mod test {
         Ok(())
     }
 
+    /// A flood of requests that are not from the node's own local client
+    /// (remote connections, or hosted users arriving through the loopback
+    /// proxy) fills the lane's intake only up to its local reserve, so a
+    /// local request is still admitted.
+    ///
+    /// FALSIFY: drop the local-reserve refusal in `offer_to_delegate_lane`;
+    /// the flood takes every slot and the local request is refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_remote_flood_leaves_the_local_reserve() -> anyhow::Result<()> {
+        use crate::contract::delegate_lane::{LANE_INTAKE_CAPACITY, LOCAL_INTAKE_RESERVE};
+        for hosted in [false, true] {
+            let (send, mut rcv, _) = contract_handler_channel();
+            let (tx, mut lane_rx) = mpsc::channel(LANE_INTAKE_CAPACITY);
+            rcv.install_delegate_lane(DelegateLaneIntake { tx });
+            let send = Arc::new(send);
+            let refused = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut tasks = Vec::new();
+            for _ in 0..LANE_INTAKE_CAPACITY {
+                let (s, r) = (send.clone(), refused.clone());
+                let ContractHandlerEvent::DelegateRequest {
+                    req,
+                    origin_contract,
+                    ..
+                } = lane_delegate_request()
+                else {
+                    panic!("lane_delegate_request builds a DelegateRequest");
+                };
+                let ev = ContractHandlerEvent::DelegateRequest {
+                    req,
+                    origin_contract,
+                    connection_scope: if hosted {
+                        crate::client_events::ConnectionScope::Local
+                    } else {
+                        crate::client_events::ConnectionScope::Remote
+                    },
+                    user_context: hosted.then(|| UserSecretContext::from_token(b"hosted")),
+                    lane_ticket: Default::default(),
+                };
+                tasks.push(GlobalExecutor::spawn(async move {
+                    if s.send_to_handler(ev).await.is_err() {
+                        r.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }));
+            }
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while refused.load(std::sync::atomic::Ordering::SeqCst) < LOCAL_INTAKE_RESERVE {
+                anyhow::ensure!(tokio::time::Instant::now() < deadline, "refusals");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let s = send.clone();
+            let local =
+                GlobalExecutor::spawn(
+                    async move { s.send_to_handler(lane_delegate_request()).await },
+                );
+            let mut queued = Vec::new();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while queued.len() < LANE_INTAKE_CAPACITY - LOCAL_INTAKE_RESERVE + 1 {
+                anyhow::ensure!(
+                    tokio::time::Instant::now() < deadline && !local.is_finished(),
+                    "the local request must be queued, not refused (hosted={hosted})"
+                );
+                match lane_rx.try_recv() {
+                    Ok(r) => queued.push(r),
+                    Err(_) => tokio::time::sleep(Duration::from_millis(5)).await,
+                }
+            }
+            assert!(
+                queued
+                    .iter()
+                    .any(|r| r.user_context.is_none() && r.connection_scope.is_local()),
+                "the local request reached the lane (hosted={hosted})"
+            );
+            local.abort();
+            for t in tasks {
+                t.abort();
+            }
+        }
+        Ok(())
+    }
+
     /// The lane's forwarder puts a request on the loop's ordinary path
     /// exactly as the handler would have: same id, same priority, and the
     /// client's own responder, so the loop's answer reaches the client.
@@ -1501,7 +1597,7 @@ pub mod test {
         };
         request.id = 4242;
         request.priority = crate::contract::fair_queue::Priority::Background;
-        forwarder.forward(request);
+        forwarder.forward(request, Default::default());
         let (id, ev, priority) =
             tokio::time::timeout(Duration::from_secs(5), rcv.recv_from_sender()).await??;
         assert_eq!(id.id, 4242);

@@ -62,13 +62,26 @@
 //!   handed-off unit, inter-delegate hop target), and a park entry holds a
 //!   claim for as long as it lives;
 //! * no pending unit for `D`, and no loop claim waiting for a lane run of `D`;
-//! * no LOOP-OWNED request for `D`: a request the lane forwarded for `D` and
-//!   the loop has not finished. The lane marks it before forwarding and the
-//!   loop's `DelegateRequest` arm (or the fair queue's refusal) releases it
-//!   ([`DelegateGate::take_forwarded`]). So once one request for `D` is
-//!   forwarded, every later one is forwarded too until the loop has done the
-//!   earlier ones, and none overtakes it: the loop's channel and the fair
-//!   queue's slot for client delegate requests are both FIFO.
+//! * no LOOP-OWNED request for `D` from the SAME USER: a request the lane
+//!   forwarded for `D` and the loop has not finished. The lane marks it before
+//!   forwarding; the mark is a [`LaneTicket`] carried INSIDE the forwarded
+//!   event, released wherever that event ends (the loop's `DelegateRequest`
+//!   arm, a fair-queue refusal or eviction, a closed channel). So once one of
+//!   a user's requests for `D` is forwarded, that user's later requests for `D`
+//!   are forwarded too until the loop has done the earlier ones, and none
+//!   overtakes it: the loop's channel and the fair queue's slot for client
+//!   delegate requests are both FIFO.
+//!
+//! The mark is per (delegate key, hosted user), the finest scope the event
+//! carries: a `DelegateRequest` names no client or connection, only its user
+//! (`user_context`, `None` on a node that is not hosted). Order is promised per
+//! client, every client belongs to one user, and `DelegateContextCache` is
+//! itself keyed by (delegate, user), so nothing needs one user's forwarded
+//! request to hold back another user's. On a hosted node that keeps one
+//! user's forward from sending every other user of a shared delegate key (the
+//! River chat delegate) to the loop. Exclusion between lane and loop RUNS
+//! stays per key. A forged node-only message is forwarded WITHOUT a mark: the
+//! loop only refuses it, changing nothing a later request could observe.
 //!
 //! Claiming waits only for a lane run of `D` that is in progress (one
 //! `process()` call). The lane never waits on the loop, so that wait is
@@ -81,21 +94,36 @@
 //! The intake channel is bounded ([`LANE_INTAKE_CAPACITY`]) and the sender
 //! uses `try_send`; a full intake refuses the request (the client sees an
 //! error). It fills only if the lane itself, at about a millisecond per run,
-//! is flooded: the lane holds nothing else. Units are bounded as above.
+//! is flooded: the lane holds nothing else. Requests that are not from the
+//! node's own LOCAL client (a remote connection, or a hosted user, whose
+//! traffic arrives through the loopback TLS proxy) may use only
+//! `LANE_INTAKE_CAPACITY - LOCAL_INTAKE_RESERVE` slots, so a remote flood
+//! cannot refuse the operator's own requests: the lane's version of the fair
+//! queue's `CLIENT_LOCAL_RESERVE`, which does not see lane-run requests.
+//! Units are bounded as above. The fair queue's bounds apply to FORWARDED
+//! requests only; requests the lane runs are bounded by the intake, the
+//! lane's speed and the websocket-level per-user operation limit.
 //!
 //! # Ordering caveats
 //!
 //! * Startup: a request sent before `contract_handling` installs the lane
 //!   reaches the loop, and a later request to the same delegate, sent after
 //!   installation, reaches the lane and may run first. Only requests already
-//!   in flight while the node starts are affected.
-//! * The gate is per delegate KEY, not per (key, hosted user), the same
+//!   in flight while the node starts are affected. Closing this would mean
+//!   creating the intake with the contract handler channel, which needs a
+//!   drain path for channels driven without `contract_handling` (tests, and
+//!   the window before the runner exists); not done, since the effect is
+//!   limited to start-up.
+//! * Exclusion (claims, parks, lane runs) is per delegate KEY, the same
 //!   granularity as the park registry: one user's round-trip on a shared
 //!   delegate key sends every other user's requests for that key to the loop
-//!   until it finishes.
+//!   until it finishes. The loop-owned MARK is finer, per (key, user), since
+//!   that is all the ordering it protects needs: a user's later request
+//!   follows that user's forwarded one, and does not hold back other users.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use freenet_stdlib::client_api::{DelegateRequest, HostResponse};
 use freenet_stdlib::prelude::{ContractInstanceId, DelegateKey, OutboundDelegateMsg};
@@ -104,7 +132,7 @@ use tokio::sync::Notify;
 
 use super::ExecutorError;
 use super::handler::{ContractHandlerEvent, EventId};
-use crate::wasm_runtime::UserSecretContext;
+use crate::wasm_runtime::{UserId, UserSecretContext};
 
 /// Requests the intake channel buffers before `try_send` refuses.
 pub(crate) const LANE_INTAKE_CAPACITY: usize = 128;
@@ -113,6 +141,74 @@ pub(crate) const LANE_INTAKE_CAPACITY: usize = 128;
 /// before the lane starts a run: at the bound the request is forwarded to the
 /// loop instead, as before this lane.
 pub(crate) const MAX_PENDING_UNITS: usize = 16;
+
+/// Intake slots only a LOCAL request (local connection, no hosted user) may
+/// take. See the module docs, "Bounds".
+pub(crate) const LOCAL_INTAKE_RESERVE: usize = LANE_INTAKE_CAPACITY / 8;
+
+/// Whether a request counts as the node's own local client for the intake
+/// reserve: a local connection AND no hosted user (hosted traffic arrives
+/// through the loopback proxy, so its scope reads `Local`).
+pub(crate) fn is_local_client(
+    connection_scope: crate::client_events::ConnectionScope,
+    user_context: Option<&UserSecretContext>,
+) -> bool {
+    connection_scope.is_local() && user_context.is_none()
+}
+
+/// Why the lane forwarded a request instead of running it (telemetry).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ForwardReason {
+    /// The loop holds the delegate (a claim, a claim waiting, a pending unit).
+    Busy,
+    /// A park entry holds the delegate.
+    Parked,
+    /// An earlier request of the same user for it is still with the loop.
+    LoopOwned,
+    /// [`MAX_PENDING_UNITS`] continuations are already waiting.
+    UnitBound,
+    /// Registration or unregistration: the loop owns those hooks.
+    NotRunnable,
+    /// A forged node-only inbound message: the loop refuses it.
+    Forged,
+}
+
+/// Lane-run and forwarded counts, by reason, for the router snapshot
+/// (`network_status::delegate_lane_routing_counts`). Plain atomics: bumped
+/// once per request.
+pub(crate) static LANE_RUNS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static FORWARDED: [AtomicU64; 6] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+impl ForwardReason {
+    /// Index into [`FORWARDED`], in declaration order.
+    pub(crate) fn index(self) -> usize {
+        match self {
+            Self::Busy => 0,
+            Self::Parked => 1,
+            Self::LoopOwned => 2,
+            Self::UnitBound => 3,
+            Self::NotRunnable => 4,
+            Self::Forged => 5,
+        }
+    }
+}
+
+/// `(lane_runs, forwarded[busy, parked, loop_owned, unit_bound, not_runnable,
+/// forged])`.
+pub(crate) fn routing_counts() -> (u64, [u64; 6]) {
+    let mut forwarded = [0u64; 6];
+    for (out, counter) in forwarded.iter_mut().zip(FORWARDED.iter()) {
+        *out = counter.load(AtomicOrdering::Relaxed);
+    }
+    (LANE_RUNS.load(AtomicOrdering::Relaxed), forwarded)
+}
 
 /// Count one refused client delegate request (telemetry); returns the
 /// running total.
@@ -146,9 +242,51 @@ pub(crate) trait DelegateRunner: Send + Sync + 'static {
 }
 
 /// Hands a request the lane does not run to the loop's ordinary
-/// `DelegateRequest` path. Implemented by `handler::LoopForwarder`.
+/// `DelegateRequest` path, carrying its [`LaneTicket`] inside the event.
+/// Implemented by `handler::LoopForwarder`.
 pub(crate) trait LoopForward: Send + Sync + 'static {
-    fn forward(&self, request: LaneRequest);
+    fn forward(&self, request: LaneRequest, ticket: LaneTicket);
+}
+
+/// The loop-owned mark of a forwarded request, carried in the forwarded
+/// `ContractHandlerEvent::DelegateRequest` and released when it is dropped:
+/// wherever the event ends. Empty for a request the lane did not forward.
+#[derive(Default)]
+pub(crate) struct LaneTicket(Option<LoopOwned>);
+
+impl std::fmt::Debug for LaneTicket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "LaneTicket(held)"
+        } else {
+            "LaneTicket(none)"
+        })
+    }
+}
+
+impl LaneTicket {
+    #[cfg(test)]
+    pub(crate) fn is_held(&self) -> bool {
+        self.0.is_some()
+    }
+}
+
+/// What the loop holds for one client delegate run, released together just
+/// before it answers the client (`contract::dispatch_delegate_request`), as
+/// the lane does: so a client's next request can find the delegate free.
+#[derive(Default)]
+pub(crate) struct LoopRelease {
+    pub(crate) claim: Option<LoopClaim>,
+    pub(crate) ticket: LaneTicket,
+}
+
+impl LoopRelease {
+    /// Release the claim and the loop-owned mark now.
+    pub(crate) fn release(self) {
+        let Self { claim, ticket } = self;
+        drop(claim);
+        drop(ticket);
+    }
 }
 
 /// The client's response channel, the same one the loop's waiting-response
@@ -195,18 +333,25 @@ struct Entry {
     /// starts no new run of this delegate, so a burst of client requests
     /// cannot starve the loop's claim.
     loop_waiting: usize,
+    /// How many of `loop_claims` are park entries ([`DelegateGate::hold`]),
+    /// for telemetry only.
+    park_holds: usize,
     /// Requests for this delegate the lane forwarded and the loop has not
-    /// finished ([`LoopOwned`]).
-    loop_owned: usize,
+    /// finished ([`LoopOwned`]), per hosted user. Blocks a lane run only for
+    /// the same user; see the module docs.
+    loop_owned: HashMap<Option<UserId>, usize>,
 }
 
 impl Entry {
+    /// Nothing holds the delegate at all: the entry can be removed.
     fn is_clear(&self) -> bool {
-        !self.lane_running
-            && !self.unit_pending
-            && self.loop_claims == 0
-            && self.loop_waiting == 0
-            && self.loop_owned == 0
+        self.runnable_by_lane() && self.loop_owned.is_empty()
+    }
+
+    /// Neither the lane nor the loop is running or holding the delegate
+    /// (per KEY: exclusion between runs).
+    fn runnable_by_lane(&self) -> bool {
+        !self.lane_running && !self.unit_pending && self.loop_claims == 0 && self.loop_waiting == 0
     }
 }
 
@@ -216,8 +361,6 @@ struct Inner {
     /// Units for the loop, oldest first. At most one per delegate and
     /// [`MAX_PENDING_UNITS`] in all.
     units: VecDeque<LaneUnit>,
-    /// Forwarded requests the loop has not finished, by event id.
-    forwarded: HashMap<u64, DelegateKey>,
 }
 
 impl Inner {
@@ -282,6 +425,7 @@ impl DelegateGate {
             LoopClaim {
                 gate: self.clone(),
                 key: key.clone(),
+                park: false,
             },
             unit,
         )
@@ -308,6 +452,7 @@ impl DelegateGate {
         Some(LoopClaim {
             gate: self.clone(),
             key: key.clone(),
+            park: false,
         })
     }
 
@@ -350,9 +495,11 @@ impl DelegateGate {
         let entry = inner.entries.entry(key.clone()).or_default();
         debug_assert!(entry.loop_claims > 0, "hold() without a live loop claim");
         entry.loop_claims += 1;
+        entry.park_holds += 1;
         LoopClaim {
             gate: self.clone(),
             key: key.clone(),
+            park: true,
         }
     }
 
@@ -374,6 +521,7 @@ impl DelegateGate {
         let claim = LoopClaim {
             gate: self.clone(),
             key: unit.key.clone(),
+            park: false,
         };
         Some((claim, unit))
     }
@@ -384,43 +532,56 @@ impl DelegateGate {
         self.units_ready.notified().await;
     }
 
-    /// Start a lane run of `key` if it is free and the unit bound has room
-    /// (a run may hand off). `None` means: forward the request instead.
-    fn try_begin_lane_run(self: &Arc<Self>, key: &DelegateKey) -> Option<LaneRun> {
+    /// Start a lane run of `key` for `user` if the delegate is free and the
+    /// unit bound has room (a run may hand off). `Err` says why to forward
+    /// instead.
+    fn try_begin_lane_run(
+        self: &Arc<Self>,
+        key: &DelegateKey,
+        user: Option<UserId>,
+    ) -> Result<LaneRun, ForwardReason> {
         let mut inner = self.lock();
         if inner.units.len() >= MAX_PENDING_UNITS {
-            return None;
+            return Err(ForwardReason::UnitBound);
         }
         let entry = inner.entries.entry(key.clone()).or_default();
-        if !entry.is_clear() {
+        let reason = if entry.park_holds > 0 {
+            Some(ForwardReason::Parked)
+        } else if !entry.runnable_by_lane() {
+            Some(ForwardReason::Busy)
+        } else if entry.loop_owned.contains_key(&user) {
+            Some(ForwardReason::LoopOwned)
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
             inner.remove_if_clear(key);
-            return None;
+            return Err(reason);
         }
         entry.lane_running = true;
-        Some(LaneRun {
+        Ok(LaneRun {
             gate: self.clone(),
             key: key.clone(),
             ended: false,
         })
     }
 
-    /// Record that the request `id` for `key` is being forwarded to the
-    /// loop. Called BEFORE forwarding, so the loop cannot finish it first.
-    fn mark_loop_owned(&self, key: &DelegateKey, id: u64) {
+    /// Mark `user`'s requests for `key` loop-owned until the returned guard is
+    /// dropped. Called BEFORE forwarding, so the loop cannot finish first.
+    fn mark_loop_owned(self: &Arc<Self>, key: &DelegateKey, user: Option<UserId>) -> LoopOwned {
         let mut inner = self.lock();
-        inner.entries.entry(key.clone()).or_default().loop_owned += 1;
-        inner.forwarded.insert(id, key.clone());
-    }
-
-    /// The loop's side of a forwarded request: `Some` if the lane forwarded
-    /// event `id`. Hold the guard until the loop is done with the request (a
-    /// refusal counts); dropping it lets the lane run the delegate again.
-    pub(crate) fn take_forwarded(self: &Arc<Self>, id: u64) -> Option<LoopOwned> {
-        let key = self.lock().forwarded.remove(&id)?;
-        Some(LoopOwned {
+        *inner
+            .entries
+            .entry(key.clone())
+            .or_default()
+            .loop_owned
+            .entry(user)
+            .or_default() += 1;
+        LoopOwned {
             gate: self.clone(),
-            key,
-        })
+            key: key.clone(),
+            user,
+        }
     }
 
     fn end_lane_run(&self, key: &DelegateKey, unit: Option<LaneUnit>) {
@@ -458,6 +619,17 @@ impl DelegateGate {
         inner.units.push_back(unit);
         drop(inner);
         self.units_ready.notify_one();
+    }
+
+    /// A loop-owned mark for `key` and `user`, as the lane makes when it
+    /// forwards a request.
+    #[cfg(test)]
+    pub(crate) fn ticket_for_test(
+        self: &Arc<Self>,
+        key: &DelegateKey,
+        user: Option<UserId>,
+    ) -> LaneTicket {
+        LaneTicket(Some(self.mark_loop_owned(key, user)))
     }
 
     #[cfg(test)]
@@ -500,6 +672,8 @@ impl Drop for Waiting {
 pub(crate) struct LoopClaim {
     gate: Arc<DelegateGate>,
     key: DelegateKey,
+    /// Taken by [`DelegateGate::hold`] for a park entry.
+    park: bool,
 }
 
 impl Drop for LoopClaim {
@@ -507,22 +681,31 @@ impl Drop for LoopClaim {
         let mut inner = self.gate.lock();
         if let Some(entry) = inner.entries.get_mut(&self.key) {
             entry.loop_claims = entry.loop_claims.saturating_sub(1);
+            if self.park {
+                entry.park_holds = entry.park_holds.saturating_sub(1);
+            }
         }
         inner.remove_if_clear(&self.key);
     }
 }
 
-/// A forwarded request the loop holds. See [`DelegateGate::take_forwarded`].
+/// A forwarded request's loop-owned mark. Carried in a [`LaneTicket`].
 pub(crate) struct LoopOwned {
     gate: Arc<DelegateGate>,
     key: DelegateKey,
+    user: Option<UserId>,
 }
 
 impl Drop for LoopOwned {
     fn drop(&mut self) {
         let mut inner = self.gate.lock();
-        if let Some(entry) = inner.entries.get_mut(&self.key) {
-            entry.loop_owned = entry.loop_owned.saturating_sub(1);
+        if let Some(entry) = inner.entries.get_mut(&self.key)
+            && let Some(count) = entry.loop_owned.get_mut(&self.user)
+        {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                entry.loop_owned.remove(&self.user);
+            }
         }
         inner.remove_if_clear(&self.key);
     }
@@ -570,14 +753,6 @@ impl Drop for AbortLog {
             tracing::debug!("Delegate lane task stopped with the contract loop");
         }
     }
-}
-
-/// Whether the lane may run this request itself. Anything else is forwarded
-/// to the loop, which owns the registration hooks and the forged-inbound
-/// refusal.
-fn lane_runs_itself(req: &DelegateRequest<'_>) -> bool {
-    matches!(req, DelegateRequest::ApplicationMessages { .. })
-        && super::node_only_inbound(req).is_none()
 }
 
 /// Whether a `process()` result can be answered without the loop: only
@@ -661,8 +836,41 @@ pub(crate) async fn run_lane(
                 "Delegate lane task PANICKED; client delegate requests fall back to \
                  the contract loop for the rest of this process"
             );
+            // Requests already buffered in the intake go to the loop rather
+            // than lose their responders. Close first, so new requests see a
+            // closed intake and go to the loop directly; a sender racing the
+            // close may still put its request on the loop's channel before a
+            // drained one, so order across this hand-over is best effort.
+            intake.close();
+            while let Ok(request) = intake.try_recv() {
+                forward_to_loop(&gate, &*forward, request, ForwardReason::Busy);
+            }
         }
     }
+}
+
+/// Forward `request` to the loop (counted by `reason`), marked loop-owned for
+/// its user unless it is a forged node-only message the loop only refuses.
+fn forward_to_loop(
+    gate: &Arc<DelegateGate>,
+    forward: &dyn LoopForward,
+    request: LaneRequest,
+    reason: ForwardReason,
+) {
+    FORWARDED[reason.index()].fetch_add(1, AtomicOrdering::Relaxed);
+    let key = request.req.key().clone();
+    tracing::debug!(
+        delegate_key = %key,
+        ?reason,
+        "Delegate lane: forwarding a request to the contract loop"
+    );
+    let ticket = if reason == ForwardReason::Forged {
+        LaneTicket::default()
+    } else {
+        let user = request.user_context.as_ref().map(|u| *u.user_id());
+        LaneTicket(Some(gate.mark_loop_owned(&key, user)))
+    };
+    forward.forward(request, ticket);
 }
 
 fn panic_reason(payload: &(dyn std::any::Any + Send)) -> String {
@@ -682,20 +890,22 @@ async fn serve(
     request: LaneRequest,
 ) {
     let key = request.req.key().clone();
-    let run = if lane_runs_itself(&request.req) {
-        gate.try_begin_lane_run(&key)
+    let user = request.user_context.as_ref().map(|u| *u.user_id());
+    let run = if !matches!(request.req, DelegateRequest::ApplicationMessages { .. }) {
+        Err(ForwardReason::NotRunnable)
+    } else if super::node_only_inbound(&request.req).is_some() {
+        Err(ForwardReason::Forged)
     } else {
-        None
+        gate.try_begin_lane_run(&key, user)
     };
-    let Some(run) = run else {
-        tracing::debug!(
-            delegate_key = %key,
-            "Delegate lane: forwarding a request to the contract loop"
-        );
-        gate.mark_loop_owned(&key, request.id);
-        forward.forward(request);
-        return;
+    let run = match run {
+        Ok(run) => run,
+        Err(reason) => {
+            forward_to_loop(gate, forward, request, reason);
+            return;
+        }
     };
+    LANE_RUNS.fetch_add(1, AtomicOrdering::Relaxed);
     let LaneRequest {
         id,
         responder,
@@ -850,12 +1060,19 @@ mod tests {
         )
     }
 
+    /// A request as it reached the loop, with its ticket.
+    type Forwarded = (LaneRequest, LaneTicket);
+
     /// Records forwarded requests, standing in for the loop's channel.
-    struct Collect(tokio::sync::mpsc::UnboundedSender<LaneRequest>);
+    struct Collect(tokio::sync::mpsc::UnboundedSender<Forwarded>);
     impl LoopForward for Collect {
-        fn forward(&self, request: LaneRequest) {
-            self.0.send(request).expect("test receiver alive");
+        fn forward(&self, request: LaneRequest, ticket: LaneTicket) {
+            self.0.send((request, ticket)).expect("test receiver alive");
         }
+    }
+
+    fn user(token: &[u8]) -> UserSecretContext {
+        UserSecretContext::from_token(token)
     }
 
     /// Answers every request with an empty response and counts the runs.
@@ -884,7 +1101,7 @@ mod tests {
         gate: Arc<DelegateGate>,
         runner: Arc<Counts>,
         tx: tokio::sync::mpsc::Sender<LaneRequest>,
-        forwarded: tokio::sync::mpsc::UnboundedReceiver<LaneRequest>,
+        forwarded: tokio::sync::mpsc::UnboundedReceiver<Forwarded>,
         task: tokio::task::JoinHandle<()>,
     }
 
@@ -913,7 +1130,7 @@ mod tests {
             self.runner.0.load(std::sync::atomic::Ordering::SeqCst)
         }
 
-        async fn next_forwarded(&mut self) -> LaneRequest {
+        async fn next_forwarded(&mut self) -> Forwarded {
             tokio::time::timeout(Duration::from_secs(5), self.forwarded.recv())
                 .await
                 .expect("a request is forwarded")
@@ -928,13 +1145,13 @@ mod tests {
         let (claim, pending) = gate.claim(&k).await;
         assert!(pending.is_none());
         assert!(
-            gate.try_begin_lane_run(&k).is_none(),
+            gate.try_begin_lane_run(&k, None).is_err(),
             "claimed: lane must not run"
         );
         drop(claim);
         assert!(!gate.is_tracking(&k), "a clear entry is removed");
         let run = gate
-            .try_begin_lane_run(&k)
+            .try_begin_lane_run(&k, None)
             .expect("free after the claim drops");
         run.finish();
         assert!(!gate.is_tracking(&k));
@@ -944,7 +1161,7 @@ mod tests {
     async fn a_claim_waits_for_the_lane_run_and_takes_its_handoff() {
         let gate = DelegateGate::new();
         let k = key(2);
-        let run = gate.try_begin_lane_run(&k).expect("free");
+        let run = gate.try_begin_lane_run(&k, None).expect("free");
         let g2 = gate.clone();
         let k2 = k.clone();
         let claim = tokio::spawn(async move { g2.claim(&k2).await });
@@ -966,7 +1183,7 @@ mod tests {
     async fn a_waiting_loop_claim_blocks_new_lane_runs() {
         let gate = DelegateGate::new();
         let k = key(3);
-        let run = gate.try_begin_lane_run(&k).expect("free");
+        let run = gate.try_begin_lane_run(&k, None).expect("free");
         let g2 = gate.clone();
         let k2 = k.clone();
         let claim = tokio::spawn(async move { g2.claim(&k2).await });
@@ -974,13 +1191,13 @@ mod tests {
         run.finish();
         // The lane may get here before the claimer wakes; it must not start
         // another run of the delegate ahead of the waiting claim.
-        assert!(gate.try_begin_lane_run(&k).is_none());
+        assert!(gate.try_begin_lane_run(&k, None).is_err());
         let (c, _) = tokio::time::timeout(Duration::from_secs(5), claim)
             .await
             .unwrap()
             .unwrap();
         drop(c);
-        assert!(gate.try_begin_lane_run(&k).is_some());
+        assert!(gate.try_begin_lane_run(&k, None).is_ok());
     }
 
     #[tokio::test]
@@ -999,24 +1216,25 @@ mod tests {
     async fn a_cancelled_claim_does_not_keep_the_lane_off_the_delegate() {
         let gate = DelegateGate::new();
         let k = key(6);
-        let run = gate.try_begin_lane_run(&k).expect("free");
+        let run = gate.try_begin_lane_run(&k, None).expect("free");
         let waiting = tokio::time::timeout(Duration::from_millis(20), gate.claim(&k)).await;
         assert!(waiting.is_err(), "the claim waits for the lane run");
         run.finish();
         assert!(
-            gate.try_begin_lane_run(&k).is_some(),
+            gate.try_begin_lane_run(&k, None).is_ok(),
             "a claim abandoned while waiting must not block the lane forever"
         );
     }
 
     /// A request for a delegate the loop holds is FORWARDED, not run; and
-    /// once one request for a delegate is forwarded, later requests for it
-    /// are forwarded too, in order, until the loop has finished the earlier
-    /// ones. Only then does the lane run the delegate again.
+    /// once one request for a delegate is forwarded, the same user's later
+    /// requests for it are forwarded too, in order, until the loop has
+    /// finished the earlier ones (the tickets are dropped). Only then does
+    /// the lane run the delegate again.
     ///
-    /// FALSIFY: drop `mark_loop_owned` from `serve` (or the `loop_owned`
-    /// term from `Entry::is_clear`); the second request runs on the lane,
-    /// ahead of the first one the loop still holds.
+    /// FALSIFY: forward with an empty ticket (no `mark_loop_owned`) in
+    /// `forward_to_loop`; the second request runs on the lane, ahead of the
+    /// first one the loop still holds.
     #[tokio::test]
     async fn requests_follow_a_forwarded_request_to_the_loop_in_order() {
         let mut lane = Lane::start();
@@ -1025,21 +1243,22 @@ mod tests {
         let (claim, _) = lane.gate.claim(&k).await;
         let (r1, _a1) = request(&k, 1);
         lane.tx.send(r1).await.unwrap();
-        let first = lane.next_forwarded().await;
+        let (first, t1) = lane.next_forwarded().await;
         assert_eq!(first.id, 1, "a request for a claimed delegate is forwarded");
+        assert!(t1.is_held(), "and carries its loop-owned mark");
         drop(claim);
 
         // The loop has not yet processed the forwarded request: K is
         // loop-owned, so the next request must follow it, not overtake it.
         let (r2, _a2) = request(&k, 2);
         lane.tx.send(r2).await.unwrap();
-        let second = lane.next_forwarded().await;
+        let (second, t2) = lane.next_forwarded().await;
         assert_eq!(second.id, 2, "a later request follows the forwarded one");
         assert_eq!(lane.runs(), 0, "nothing for K ran on the lane");
 
         // The loop finishes both; the lane runs K again.
-        drop(lane.gate.take_forwarded(1).expect("forwarded 1"));
-        drop(lane.gate.take_forwarded(2).expect("forwarded 2"));
+        drop((first, t1));
+        drop((second, t2));
         let (r3, a3) = request(&k, 3);
         lane.tx.send(r3).await.unwrap();
         tokio::time::timeout(Duration::from_secs(5), a3)
@@ -1048,6 +1267,44 @@ mod tests {
             .expect("answered on the lane");
         assert_eq!(lane.runs(), 1);
         assert!(!lane.gate.is_tracking(&k));
+        lane.task.abort();
+    }
+
+    /// The loop-owned mark is per (delegate, USER): user A's forwarded
+    /// request for K does not send user B's request for K to the loop, while
+    /// A's own later request for K still follows A's first.
+    ///
+    /// FALSIFY: key the mark by delegate only (look up `loop_owned` without
+    /// the user); B's request is forwarded too.
+    #[tokio::test]
+    async fn one_users_forwarded_request_does_not_hold_back_another_user() {
+        let mut lane = Lane::start();
+        let k = key(11);
+        let (claim, _) = lane.gate.claim(&k).await;
+        let (mut a1, _x1) = request(&k, 1);
+        a1.user_context = Some(user(b"lane-user-a"));
+        lane.tx.send(a1).await.unwrap();
+        let held_a1 = lane.next_forwarded().await;
+        drop(claim);
+
+        // B: runs on the lane although A's request is still with the loop.
+        let (mut b1, yb) = request(&k, 2);
+        b1.user_context = Some(user(b"lane-user-b"));
+        lane.tx.send(b1).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), yb)
+            .await
+            .expect("B answered")
+            .expect("B answered on the lane");
+        assert_eq!(lane.runs(), 1);
+
+        // A again: follows A's first, still with the loop.
+        let (mut a2, _x2) = request(&k, 3);
+        a2.user_context = Some(user(b"lane-user-a"));
+        lane.tx.send(a2).await.unwrap();
+        let (fwd, _t) = lane.next_forwarded().await;
+        assert_eq!(fwd.id, 3, "A's later request follows A's forwarded one");
+        assert_eq!(lane.runs(), 1);
+        drop(held_a1);
         lane.task.abort();
     }
 
@@ -1065,12 +1322,13 @@ mod tests {
         let free = key(20);
         let (r, _a) = request(&free, 7);
         lane.tx.send(r).await.unwrap();
-        assert_eq!(lane.next_forwarded().await.id, 7);
+        let forwarded = lane.next_forwarded().await;
+        assert_eq!(forwarded.0.id, 7);
         assert_eq!(lane.runs(), 0);
         // One unit taken by the loop: room again, the lane runs.
         let (claim, _) = lane.gate.take_next_unit().expect("a unit");
         drop(claim);
-        drop(lane.gate.take_forwarded(7));
+        drop(forwarded);
         let (r, a) = request(&free, 8);
         lane.tx.send(r).await.unwrap();
         tokio::time::timeout(Duration::from_secs(5), a)
@@ -1081,9 +1339,9 @@ mod tests {
         lane.task.abort();
     }
 
-    /// Registrations, unregistrations and forged node-only inbound go to the
-    /// loop's ordinary path; a flood of them for distinct keys leaves no
-    /// lane state behind beyond the loop-owned marks the loop releases.
+    /// Registrations and unregistrations go to the loop's ordinary path; a
+    /// flood of them for distinct keys leaves no lane state behind once the
+    /// loop has dropped their tickets.
     #[tokio::test]
     async fn requests_the_lane_does_not_run_go_to_the_loop() {
         let mut lane = Lane::start();
@@ -1095,9 +1353,9 @@ mod tests {
             lane.tx.send(r).await.unwrap();
         }
         for i in 0..n {
-            let r = lane.next_forwarded().await;
+            let (r, ticket) = lane.next_forwarded().await;
             assert_eq!(r.id, i, "forwarded in order");
-            drop(lane.gate.take_forwarded(r.id));
+            assert!(ticket.is_held());
         }
         assert_eq!(lane.runs(), 0);
         assert_eq!(
@@ -1109,6 +1367,91 @@ mod tests {
             assert!(!lane.gate.is_tracking(&key(i as u8)));
         }
         lane.task.abort();
+    }
+
+    /// An `ApplicationMessages` request carrying an inbound message only the
+    /// node may deliver is FORWARDED to the loop's refusal, never run on the
+    /// lane (whose runner has no such check), and carries no loop-owned mark.
+    ///
+    /// FALSIFY: drop the `node_only_inbound` branch in `serve`; the forged
+    /// request runs on the lane.
+    #[tokio::test]
+    async fn a_forged_node_only_message_is_forwarded_not_run() {
+        let mut lane = Lane::start();
+        let k = key(12);
+        let (r, _a) = request_with(
+            &k,
+            1,
+            DelegateRequest::ApplicationMessages {
+                key: k.clone(),
+                params: freenet_stdlib::prelude::Parameters::from(Vec::new()),
+                inbound: vec![freenet_stdlib::prelude::InboundDelegateMsg::UserResponse(
+                    freenet_stdlib::prelude::UserInputResponse {
+                        request_id: 1,
+                        response: freenet_stdlib::prelude::ClientResponse::new(b"y".to_vec()),
+                        context: freenet_stdlib::prelude::DelegateContext::default(),
+                    },
+                )],
+            },
+        );
+        lane.tx.send(r).await.unwrap();
+        let (fwd, ticket) = lane.next_forwarded().await;
+        assert_eq!(fwd.id, 1);
+        assert!(!ticket.is_held(), "a forged request marks nothing");
+        assert_eq!(lane.runs(), 0, "the forged request did not run on the lane");
+        lane.task.abort();
+    }
+
+    /// If the lane task dies outside a run, requests already buffered in its
+    /// intake are forwarded to the loop instead of losing their responders.
+    ///
+    /// FALSIFY: drop the drain after the panic in `run_lane`; the buffered
+    /// requests are never forwarded.
+    #[tokio::test]
+    async fn a_dying_lane_hands_its_buffered_requests_to_the_loop() {
+        /// Panics on its first forward (outside any run), then collects.
+        struct PanicsOnce(
+            std::sync::atomic::AtomicBool,
+            tokio::sync::mpsc::UnboundedSender<Forwarded>,
+        );
+        impl LoopForward for PanicsOnce {
+            fn forward(&self, request: LaneRequest, ticket: LaneTicket) {
+                if !self.0.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    panic!("forwarder bug");
+                }
+                self.1.send((request, ticket)).expect("receiver alive");
+            }
+        }
+        let gate = DelegateGate::new();
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let (ftx, mut frx) = tokio::sync::mpsc::unbounded_channel();
+        // Queued before the lane task first runs (current-thread runtime).
+        for i in 1..=3u8 {
+            let k = key(40 + i);
+            let (r, a) = request_with(&k, i as u64, DelegateRequest::UnregisterDelegate(k.clone()));
+            std::mem::forget(a);
+            tx.try_send(r).expect("room");
+        }
+        let lane = tokio::spawn(run_lane(
+            Arc::new(Counts(Default::default())),
+            gate,
+            Arc::new(PanicsOnce(Default::default(), ftx)),
+            rx,
+        ));
+        tokio::time::timeout(Duration::from_secs(5), lane)
+            .await
+            .expect("the lane ends")
+            .expect("its panic is caught");
+        let mut ids = Vec::new();
+        while let Ok((r, _)) = frx.try_recv() {
+            ids.push(r.id);
+        }
+        assert_eq!(
+            ids,
+            vec![2, 3],
+            "the buffered requests reach the loop, in order"
+        );
+        assert!(tx.is_closed());
     }
 
     /// A panic inside ONE delegate run fails that request only: its client
@@ -1145,7 +1488,7 @@ mod tests {
         }
         let gate = DelegateGate::new();
         let (tx, rx) = tokio::sync::mpsc::channel(4);
-        let (ftx, _frx) = tokio::sync::mpsc::unbounded_channel();
+        let (ftx, _frx) = tokio::sync::mpsc::unbounded_channel::<Forwarded>();
         let lane = tokio::spawn(run_lane(
             Arc::new(PanicsOnce(Default::default())),
             gate.clone(),
@@ -1208,7 +1551,7 @@ mod tests {
     async fn a_lane_run_dropped_mid_call_releases_the_delegate() {
         let gate = DelegateGate::new();
         let k = key(5);
-        drop(gate.try_begin_lane_run(&k).expect("free"));
+        drop(gate.try_begin_lane_run(&k, None).expect("free"));
         let (_c, pending) = tokio::time::timeout(Duration::from_secs(5), gate.claim(&k))
             .await
             .expect("a dead lane run must not strand the loop");

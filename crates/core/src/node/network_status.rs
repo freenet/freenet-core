@@ -747,8 +747,8 @@ pub struct HostingRetractionStats {
 
 /// Delegate lane (`contract::delegate_lane`) and inter-delegate delivery
 /// counters. Each is a client-visible loss that is otherwise only a log line:
-/// a request the lane refused (its intake was full), a delegate run that panicked on the lane, and an inter-delegate
-/// message the hop dropped because its target was mid-round-trip. Monotonic
+/// a request the lane refused (its intake was full), a delegate run that
+/// panicked on the lane, and an inter-delegate message the hop dropped because its target was mid-round-trip. Monotonic
 /// lifetime totals; the collector differences them. Plain atomics rather
 /// than fields under the `NETWORK_STATUS` lock: they are bumped once per
 /// refused request, i.e. at flood rate, and must not take a global write lock
