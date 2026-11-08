@@ -4009,6 +4009,20 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     "hosting_retractions_dropped".to_string(),
                     serde_json::json!(snapshot.hosting_retractions_dropped),
                 );
+                // Delegate lane counters. Pinned by
+                // `router_snapshot_json_includes_delegate_lane_counters`.
+                obj.insert(
+                    "delegate_lane_requests_refused".to_string(),
+                    serde_json::json!(snapshot.delegate_lane_requests_refused),
+                );
+                obj.insert(
+                    "delegate_lane_panics".to_string(),
+                    serde_json::json!(snapshot.delegate_lane_panics),
+                );
+                obj.insert(
+                    "inter_delegate_messages_dropped".to_string(),
+                    serde_json::json!(snapshot.inter_delegate_messages_dropped),
+                );
                 // Streamed-transfer abort counters (Group B), routing/hosting
                 // attribution (Group C), and connect-emit counters — same
                 // hand-mirror footgun: a new `RouterSnapshotInfo` field is
@@ -5108,6 +5122,29 @@ mod tests {
         for (key, want) in [
             ("hosting_retractions_emitted", 509),
             ("hosting_retractions_dropped", 521),
+        ] {
+            assert_eq!(json[key], want, "{key} must reach the OTLP body");
+        }
+    }
+
+    /// Pin: the delegate lane counters must reach the hand-mirrored OTLP
+    /// body. Each counts a client-visible loss (a refused request, a panicked
+    /// run, a dropped inter-delegate message) that is otherwise only a log
+    /// line.
+    #[test]
+    fn router_snapshot_json_includes_delegate_lane_counters() {
+        use arbitrary::{Arbitrary, Unstructured};
+        let mut u = Unstructured::new(&[0u8; 4096]);
+        let mut info = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
+            .expect("construct RouterSnapshotInfo for test");
+        info.delegate_lane_requests_refused = Some(601);
+        info.delegate_lane_panics = Some(607);
+        info.inter_delegate_messages_dropped = Some(613);
+        let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
+        for (key, want) in [
+            ("delegate_lane_requests_refused", 601),
+            ("delegate_lane_panics", 607),
+            ("inter_delegate_messages_dropped", 613),
         ] {
             assert_eq!(json[key], want, "{key} must reach the OTLP body");
         }

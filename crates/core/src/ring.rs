@@ -2309,6 +2309,17 @@ impl Ring {
                 snapshot.hosting_retractions_dropped = Some(dropped);
             }
 
+            // Delegate lane counters (`contract::delegate_lane`). Same
+            // hand-mirror footgun: pinned by
+            // `router_snapshot_json_includes_delegate_lane_counters`.
+            if let Some((refused, panics, dropped)) =
+                crate::node::network_status::delegate_lane_counts()
+            {
+                snapshot.delegate_lane_requests_refused = Some(refused);
+                snapshot.delegate_lane_panics = Some(panics);
+                snapshot.inter_delegate_messages_dropped = Some(dropped);
+            }
+
             // Streamed-transfer abort counters (Group B): isolate the
             // large-contract failure class on the existing snapshot cadence.
             // Same hand-mirror footgun as the counters above — a new

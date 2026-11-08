@@ -136,6 +136,17 @@ const MAX_INFLIGHT_DEFERRALS: usize = 256;
 /// bounded-batch rationale.
 const MAX_RESUME_DRAIN_BATCH: usize = 16;
 
+/// Delegate lane units (`delegate_lane::LaneUnit`) the loop runs per
+/// iteration, i.e. per fair-queue event. Lower than
+/// [`MAX_RESUME_DRAIN_BATCH`] on purpose: resumes are bounded by the park
+/// count, while units are refilled continuously by client traffic, so a cap
+/// of 16 let one client's stream of hand-offs take 16 loop round-trips for
+/// every contract operation. At 4 the fair queue gets at least one event per
+/// four units. Leftover units are not stranded: the loop skips its blocking
+/// wait while one is pending (`has_pending_unit`), and still pops the fair
+/// queue every iteration.
+const MAX_LANE_UNITS_PER_ITERATION: usize = 4;
+
 /// A PUT/UPDATE that deferred its related-contract fetch off the serial loop,
 /// carrying everything needed to re-run the upsert once the fetch resolves.
 ///
@@ -2695,15 +2706,10 @@ where
                         let (claim, unit) = gate.claim(&target_key).await;
                         hop_claim = Some(claim);
                         if let Some(unit) = unit {
-                            ctx.park.enter_hop_unit(delegate_key);
-                            run_lane_unit_boxed(
-                                &mut *contract_handler,
-                                &mut *ctx.park,
-                                prompter,
-                                unit,
-                            )
-                            .await;
-                            ctx.park.leave_hop_unit();
+                            let mut scope = ctx.park.enter_hop_unit(delegate_key);
+                            run_lane_unit_boxed(&mut *contract_handler, &mut scope, prompter, unit)
+                                .await;
+                            drop(scope);
                             if ctx.park.is_parked(&target_key) {
                                 let total = ctx.park.count_dropped_hop();
                                 tracing::info!(
@@ -3407,7 +3413,16 @@ where
         });
         let mut abort = crate::util::AbortOnDrop::new();
         abort.push(handle.abort_handle());
-        contract_handler.channel().install_delegate_lane(intake_tx);
+        let host_ram = crate::wasm_runtime::read_total_ram_bytes()
+            .unwrap_or(delegate_park::PARKED_FALLBACK_TOTAL_RAM_BYTES);
+        contract_handler
+            .channel()
+            .install_delegate_lane(handler::DelegateLaneIntake {
+                tx: intake_tx,
+                bytes: delegate_lane::LaneBytes::new(delegate_lane::lane_bytes_budget_for(
+                    host_ram,
+                )),
+            });
         park_ctx.set_gate(gate.clone());
         // The abort guard rides with the gate for the loop's lifetime.
         (gate, abort)
@@ -3422,7 +3437,7 @@ where
         // left over when the batch runs out is picked up by the
         // `has_pending_unit` guard before the select below, not by a wake.
         if let Some((gate, _)) = &delegate_gate {
-            for _ in 0..MAX_RESUME_DRAIN_BATCH {
+            for _ in 0..MAX_LANE_UNITS_PER_ITERATION {
                 let Some((_claim, unit)) = gate.take_next_unit() else {
                     break;
                 };
@@ -3524,15 +3539,14 @@ where
         // in the 105:
         //
         //  * The drain at the TOP of this iteration runs at most
-        //    `MAX_RESUME_DRAIN_BATCH` (16) units. Each is one client request's
-        //    round-trip (the lane already made its first `process()` call) or a
-        //    forwarded registration. Same budget and same reason as the resume
-        //    batch: a client is already waiting on each, and the delegate is
-        //    held for it. They are refilled by client traffic rather than by
-        //    parks, so a steady stream of them gets up to 16 round-trips per
-        //    fair-queue event; the lane's own queue bound
-        //    (`LANE_QUEUE_CAPACITY`) and the per-delegate gate (at most one
-        //    unit per delegate) are what bound the supply.
+        //    `MAX_LANE_UNITS_PER_ITERATION` (4) units. Each is one client
+        //    request's round-trip (the lane already made its first `process()`
+        //    call) or a forwarded registration. Smaller than the resume batch
+        //    because units are refilled by client traffic rather than by
+        //    parks: a steady stream of them gets at most 4 round-trips per
+        //    fair-queue event. The supply is bounded by the lane's queue
+        //    (`LANE_QUEUE_CAPACITY`) and the gate (at most one unit per
+        //    delegate).
         //  * `claim_delegate` runs the claimed delegate's pending unit before
         //    the run it was called for, inside every loop entry that claims
         //    (notification, lifecycle, resume, the client-arm fallback), so
@@ -3540,8 +3554,13 @@ where
         //    claim, because a delegate has at most one pending unit and the
         //    claim stops the lane making another.
         //  * The inter-delegate hop runs its target's pending unit before
-        //    delivering (one per hop target, never nested past one level; see
-        //    the hop in `handle_delegate_with_contract_requests`).
+        //    delivering (never nested past one level; see the hop in
+        //    `handle_delegate_with_contract_requests`). One per hop TARGET,
+        //    and a round-trip may message many targets, so one iteration can
+        //    run as many nested units as there are delegates with a pending
+        //    unit that it messages. That is bounded by the units in existence
+        //    (at most one per delegate, drawn from the lane's bounded queue),
+        //    not by a per-iteration constant.
         //
         // `the_sweep_budget_admits_one_maximal_victim_past_the_limit` pins the
         // boundary, which the original test could not see because its victims
@@ -3735,7 +3754,7 @@ where
         // after the drain at the top stopped at its batch limit there may be
         // no wake left for the rest, and they would wait on unrelated
         // traffic. Not a spin: a unit still pending here means the top drain
-        // ran a full batch (16 real round-trips) or the lane pushed a new one
+        // ran a full batch (4 real round-trips) or the lane pushed a new one
         // during this iteration, and the next iteration runs at least one.
         if delegate_gate
             .as_ref()
@@ -5793,7 +5812,7 @@ async fn dispatch_delegate_request<CH, P>(
         user_context.is_some(),
     );
 
-    // INVARIANT (see `every_delegate_run_is_reached_from_the_serial_loop` and
+    // INVARIANT (see `every_loop_delegate_run_goes_through_the_round_trip_chokepoint` and
     // `every_delegate_process_runs_on_the_one_delegate_executor`):
     //
     //   At most one delegate `process()` executes node-wide at any instant,
@@ -6072,8 +6091,14 @@ where
         }
         // ...and re-ask per victim, because THIS loop awaits too: a guard
         // firing while park X is being force-resumed is invisible to the
-        // decision already made about park Y. No `.await` between this
-        // check and `take_matching` inside `handle_delegate_resume`.
+        // decision already made about park Y. Nothing between this check
+        // and `take_matching` inside `handle_delegate_resume` suspends:
+        // `handle_delegate_resume` awaits `claim_delegate` before
+        // `take_matching`, but for a key that is still parked (every victim
+        // here) that await does not suspend: the park entry holds a gate
+        // claim, so the delegate lane is not running the delegate and has no
+        // unit for it, and `DelegateGate::claim` returns at its first check.
+        // Pinned by `a_claim_on_a_parked_delegate_does_not_suspend`.
         if !park_ctx.should_force_resume(&delegate_key, epoch, delegate_resume_rx, delegate_resumes)
         {
             tracing::debug!(
@@ -6119,8 +6144,9 @@ where
         let Some(runs) = runs else { continue };
         spent = spent.saturating_add(runs.max(1));
         // Logged AFTER the resume, not before, so nothing sits between
-        // `should_force_resume` and `take_matching` (the first statement of
-        // `handle_delegate_resume`) — that gap is the residual window #5554
+        // `should_force_resume` and `take_matching` (which
+        // `handle_delegate_resume` reaches with no suspension for a parked
+        // key, see above) — that gap is the residual window #5554
         // narrows, and the cheapest way to keep it narrow is to put nothing in
         // it. On the service path this line is microseconds
         // (`tracing_appender::non_blocking`, which drops on overflow), so this
@@ -7546,7 +7572,7 @@ mod tests {
     /// comments nest, which this does not model. Either only REMOVES text. For
     /// a pin that requires text to be PRESENT that fails loud (red). For a pin
     /// that requires text to be ABSENT, such as the spawned-body check in
-    /// `every_delegate_run_is_reached_from_the_serial_loop`, removed text can
+    /// `every_loop_delegate_run_goes_through_the_round_trip_chokepoint`, removed text can
     /// hide a needle or a brace and fail quiet (green). Neither shape occurs in
     /// the scanned code today.
     pub(crate) fn strip_comments(src: &str) -> String {
@@ -8321,7 +8347,7 @@ mod tests {
     ///    immediately after the chokepoint — a declaration form the owner scan
     ///    could not see (see `enclosing_fn`).
     #[test]
-    fn every_delegate_run_is_reached_from_the_serial_loop() {
+    fn every_loop_delegate_run_goes_through_the_round_trip_chokepoint() {
         // Production text only, comments stripped. Both needles occur in this
         // test's own prose and in the module's doc comments, and a scrape that
         // counted those would report a true fact about the wrong text (#5450).
@@ -8441,7 +8467,7 @@ mod tests {
     }
 
     /// PIN, half 2 of 2 (half 1 is
-    /// `every_delegate_run_is_reached_from_the_serial_loop`): every delegate
+    /// `every_loop_delegate_run_goes_through_the_round_trip_chokepoint`): every delegate
     /// `process()` on a production node runs on the ONE delegate executor,
     /// under its lock, whether the loop or the delegate lane started it.
     ///
@@ -8501,6 +8527,21 @@ mod tests {
         assert!(
             with_executor.contains("self.executor.lock().await"),
             "`with_executor` must take the delegate executor's lock"
+        );
+        // A panic out of `f` skips the post-call health check, so the next
+        // call must replace a suspect executor BEFORE running on it.
+        let at = |needle: &str| {
+            with_executor
+                .find(needle)
+                .unwrap_or_else(|| panic!("`with_executor` must contain `{needle}`"))
+        };
+        assert!(
+            at("self.suspect.take()") < at("f(&mut executor)")
+                && at("self.suspect.begin()") < at("f(&mut executor)")
+                && at("call.done()") > at("f(&mut executor)"),
+            "`with_executor` must replace an executor whose last call panicked \
+             before running on it, arm the mark before the call and disarm it \
+             after: {with_executor}"
         );
 
         // 2.
@@ -8562,19 +8603,27 @@ mod tests {
     /// The scan: every production function that calls a delegate-running
     /// function (the round-trip and the functions that reach it on their
     /// caller's claim) must either be one of those functions itself, or be a
-    /// listed CLAIMER whose claiming call appears BEFORE every such call in its
-    /// body. A new caller fails until it is listed with its claim. Fails closed
-    /// on a rename: every name is looked up with `fn_region`, which panics on a
-    /// miss, and every claimer must still call something it is listed for.
+    /// listed CLAIMER. For a claimer, EACH call must be IN SCOPE of a claim:
+    /// a `let` binding of the claim (`let _claim =`, `let (_claim, ..)`,
+    /// `let Some((_claim, ..))`, `let (claim, unit) =`) whose statement takes
+    /// the claim, which appears before the call in a block that ENCLOSES the
+    /// call (so a claim in another match arm does not count), and which is not
+    /// `drop`ped before the call. `let _ = claim_delegate(..)` is not a
+    /// binding: it drops the claim at once. A new caller fails until it is
+    /// listed with its claim. Fails closed on a rename: every name is looked
+    /// up with `fn_region`, which panics on a miss, and every claimer must
+    /// still call something it is listed for.
     ///
-    /// The inter-delegate hop is checked separately: its target claim must
-    /// precede the hop's `.execute_delegate_hop(` call.
+    /// The inter-delegate hop is checked the same way: `.execute_delegate_hop(`
+    /// must be in scope of `let _hop_claim = hop_claim;`, and `hop_claim` is
+    /// taken by `gate.claim(&target_key)` or
+    /// `gate.claim_unless_pending(&target_key)`.
     ///
     /// FALSIFY: delete the `claim_delegate(..)` call (keeping the
     /// `let _claim = None;` shape) in `handle_delegate_notification`,
     /// `run_lifecycle`, `handle_delegate_resume` or the client arm of
-    /// `handle_contract_event`; or the `.take_next_unit(` drain in
-    /// `contract_handling`; or `gate.claim(&target_key)` in the hop.
+    /// `handle_contract_event`; write `let _ = claim_delegate(..)`; add
+    /// `drop(_claim);` before the run; or move the claim into another arm.
     #[test]
     fn every_loop_delegate_run_claims_the_delegate_on_the_gate() {
         let code = production_code();
@@ -8630,12 +8679,82 @@ mod tests {
             calls.len()
         );
 
+        /// The innermost `{` enclosing byte `at`, scanning from `from` (a
+        /// position outside any block of interest) with the same comment,
+        /// string and char-literal handling as `end_of_block`.
+        fn innermost_open(code: &str, from: usize, at: usize) -> usize {
+            let bytes = code.as_bytes();
+            let mut stack: Vec<usize> = Vec::new();
+            let mut i = from;
+            while i < at {
+                let b = bytes[i];
+                let next = bytes.get(i + 1).copied();
+                match b {
+                    b'/' if next == Some(b'/') => {
+                        while i < at && bytes[i] != b'\n' {
+                            i += 1;
+                        }
+                        continue;
+                    }
+                    b'"' => {
+                        i += 1;
+                        while i < at && bytes[i] != b'"' {
+                            i += if bytes[i] == b'\\' { 2 } else { 1 };
+                        }
+                        i += 1;
+                        continue;
+                    }
+                    b'\'' => {
+                        let close = if next == Some(b'\\') { i + 3 } else { i + 2 };
+                        if bytes.get(close) == Some(&b'\'') {
+                            i = close + 1;
+                            continue;
+                        }
+                    }
+                    b'{' => stack.push(i),
+                    b'}' => {
+                        stack.pop();
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            *stack.last().expect("the position is inside a block")
+        }
+
+        /// Whether the call at `idx` is in scope of a claim binding whose
+        /// statement contains `token`.
+        fn claimed_in_scope(code: &str, fn_start: usize, idx: usize, token: &str) -> bool {
+            const BINDINGS: [&str; 5] = [
+                "let _claim =",
+                "let _claim:",
+                "let (_claim,",
+                "let Some((_claim,",
+                "let (claim, unit) =",
+            ];
+            let body = &code[fn_start..idx];
+            BINDINGS.iter().any(|binding| {
+                body.match_indices(binding).any(|(rel, _)| {
+                    let b = fn_start + rel;
+                    let stmt_end = code[b..].find(';').map_or(code.len(), |e| b + e);
+                    if stmt_end > idx || !code[b..stmt_end].contains(token) {
+                        return false;
+                    }
+                    let open = innermost_open(code, fn_start, b);
+                    let scope_ends = end_of_block(code, open) > idx;
+                    let between = &code[stmt_end..idx];
+                    let dropped =
+                        between.contains("drop(_claim") || between.contains("drop(claim)");
+                    scope_ends && !dropped
+                })
+            })
+        }
+
         for (caller, idx, callee) in &calls {
             if let Some((_, token)) = claimers.iter().find(|(name, _)| name == caller) {
                 let start = code[..*idx]
                     .rfind(&format!("fn {caller}"))
                     .expect("enclosing function declaration");
-                let preceding = &code[start..*idx];
                 // The round-trip calls itself only through the hop.
                 if *caller == "handle_delegate_with_contract_requests"
                     && *callee != "run_lane_unit_boxed"
@@ -8646,10 +8765,12 @@ mod tests {
                     );
                 }
                 assert!(
-                    preceding.contains(token),
-                    "`{caller}` calls `{callee}` without first claiming the delegate \
-                     (`{token}`). A loop run of a delegate the lane may be running \
-                     interleaves with it and clobbers its context"
+                    claimed_in_scope(&code, start, *idx, token),
+                    "`{caller}` calls `{callee}` without a claim in scope (`{token}` \
+                     bound by `let _claim = ..` or similar in a block enclosing \
+                     the call, and not dropped first). A loop run of a delegate \
+                     the lane may be running interleaves with it and clobbers its \
+                     context"
                 );
             } else {
                 assert!(
@@ -8669,20 +8790,33 @@ mod tests {
             );
         }
 
-        // The hop: its target claim precedes the hop call.
+        // The hop: `.execute_delegate_hop(` in scope of the target's claim.
+        let start = code
+            .find("async fn handle_delegate_with_contract_requests")
+            .expect("the round-trip");
         let round_trip = fn_region(&code, "async fn handle_delegate_with_contract_requests");
-        let hop = round_trip
-            .find(".execute_delegate_hop(")
-            .expect("the round-trip must contain the inter-delegate hop");
-        let before_hop = &round_trip[..hop];
+        let hop = start
+            + round_trip
+                .find(".execute_delegate_hop(")
+                .expect("the round-trip must contain the inter-delegate hop");
+        let before_hop = &code[start..hop];
+        let binding = before_hop
+            .rfind("let _hop_claim = hop_claim;")
+            .map(|rel| start + rel)
+            .expect("the hop must bind its target claim as `let _hop_claim = hop_claim;`");
+        let open = innermost_open(&code, start, binding);
+        assert!(
+            end_of_block(&code, open) > hop && !code[binding..hop].contains("drop(_hop_claim"),
+            "the hop's target claim must be in scope at `.execute_delegate_hop(`"
+        );
         for token in [
+            "hop_claim = Some(claim)",
             "gate.claim(&target_key)",
             "gate.claim_unless_pending(&target_key)",
         ] {
             assert!(
                 before_hop.contains(token),
-                "the inter-delegate hop must claim its target (`{token}`) before \
-                 running it"
+                "the inter-delegate hop must take its target claim (`{token}`)"
             );
         }
     }
@@ -12560,6 +12694,7 @@ mod hol_4391_tests {
                 origin_contract: None,
                 connection_scope: crate::client_events::ConnectionScope::Local,
                 user_context: None,
+                charge: Default::default(),
             })
             .await
             .expect("lane is up");
@@ -12597,6 +12732,418 @@ mod hol_4391_tests {
             "the lane run must come after BOTH legs of the notification round-trip"
         );
         lane.abort();
+    }
+
+    /// A lane unit for `key` whose first `process()` call (made by the lane)
+    /// returned `first_values`.
+    fn unit_for(
+        key: &DelegateKey,
+        id: u64,
+        first_values: Vec<OutboundDelegateMsg>,
+    ) -> (
+        delegate_lane::LaneUnit,
+        tokio::sync::oneshot::Receiver<(handler::EventId, ContractHandlerEvent)>,
+    ) {
+        let (responder, rx) = tokio::sync::oneshot::channel();
+        (
+            delegate_lane::LaneUnit {
+                key: key.clone(),
+                id,
+                responder,
+                req: DelegateRequest::ApplicationMessages {
+                    key: key.clone(),
+                    params: Parameters::from(Vec::new()),
+                    inbound: Vec::new(),
+                },
+                origin_contract: None,
+                connection_scope: crate::client_events::ConnectionScope::Local,
+                user_context: None,
+                first_values: Some(first_values),
+            },
+            rx,
+        )
+    }
+
+    /// A handler with a mock lane runner, a park context sharing a gate with
+    /// it, and units left pending on that gate, without the loop: the test
+    /// drives the loop's unit runs itself, so it can read the park context's
+    /// counters afterwards.
+    async fn hop_harness(
+        units: Vec<(DelegateKey, Vec<OutboundDelegateMsg>)>,
+        script_writes: usize,
+    ) -> (
+        MockWasmContractHandler,
+        delegate_park::DelegateParkCtx,
+        Arc<delegate_lane::DelegateGate>,
+        crate::contract::executor::mock_wasm_runtime::DelegateObservations,
+        Vec<tokio::sync::oneshot::Receiver<(handler::EventId, ContractHandlerEvent)>>,
+    ) {
+        let (mut handler, _send) = build_handler(vec![]).await;
+        std::mem::forget(_send);
+        handler.runtime_mut().enable_delegate_lane();
+        let rt = handler.runtime_mut();
+        let observations = rt.delegate_observations.clone();
+        {
+            let mut script = rt.delegate_script.lock().unwrap();
+            for _ in 0..script_writes {
+                script.push_back(ScriptedRun {
+                    outbound: Vec::new(),
+                    writes_context: Some(b"clobbered".to_vec()),
+                });
+            }
+        }
+        let gate = delegate_lane::DelegateGate::new();
+        let (resume_tx, resume_rx) = tokio::sync::mpsc::unbounded_channel();
+        std::mem::forget(resume_rx);
+        let mut park = delegate_park::DelegateParkCtx::new(resume_tx);
+        park.set_gate(gate.clone());
+        let mut answers = Vec::new();
+        for (i, (key, first)) in units.into_iter().enumerate() {
+            let (unit, rx) = unit_for(&key, 1000 + i as u64, first);
+            gate.hand_off_for_test(unit);
+            answers.push(rx);
+        }
+        (handler, park, gate, observations, answers)
+    }
+
+    /// D's handed-off round-trip messages T, whose own round-trip is pending;
+    /// T's round-trip (run first, nested in the hop) messages D back. D is
+    /// suspended mid-round-trip in that hop, so T's message to D is DROPPED
+    /// and counted, D is never entered in between, and D's continuation reads
+    /// the context D's own first leg left.
+    ///
+    /// FALSIFY: remove the `is_mid_hop(&target_key)` check from the hop (D is
+    /// entered with T's message and D's continuation reads "clobbered"); or
+    /// do not register D with `enter_hop_unit` (same).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_nested_hop_back_into_its_suspended_caller_is_dropped_and_counted() {
+        let _guard = TEST_GUARD.lock().await;
+        let d = delegate_key_n(0x71);
+        let t = delegate_key_n(0x72);
+        let (mut handler, mut park, gate, observations, answers) = hop_harness(
+            vec![
+                (d.clone(), vec![send_to(&t, &d)]),
+                (t.clone(), vec![send_to(&d, &t)]),
+            ],
+            8,
+        )
+        .await;
+        // D's first leg (made by the lane) left this context.
+        handler
+            .runtime_mut()
+            .delegate_contexts
+            .lock()
+            .unwrap()
+            .insert((d.clone(), None), b"d1".to_vec());
+        let prompter = Arc::new(crate::contract::user_input::AutoApprovePrompter);
+        let (_claim, unit) = gate.take_next_unit().expect("D's unit first");
+        assert_eq!(unit.key, d);
+        run_lane_unit(&mut handler, &mut park, &prompter, unit).await;
+        drop(_claim);
+
+        assert_eq!(
+            park.dropped_hops(),
+            1,
+            "T's message to D is dropped and counted"
+        );
+        let d_runs: Vec<_> = observations
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|o| o.delegate_key == d)
+            .map(|o| (o.inbound_kinds.clone(), o.observed_context.clone()))
+            .collect();
+        assert_eq!(
+            d_runs,
+            vec![(Vec::new(), Some(b"d1".to_vec()))],
+            "D runs once, its continuation, reading its own first leg's context"
+        );
+        let t_kinds: Vec<_> = observations
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|o| o.delegate_key == t)
+            .map(|o| o.inbound_kinds.clone())
+            .collect();
+        assert_eq!(
+            t_kinds,
+            vec![Vec::new(), vec!["DelegateMessage"]],
+            "T's continuation runs first, then D's message is delivered"
+        );
+        assert!(
+            gate.take_next_unit().is_none(),
+            "T's unit was run by the hop"
+        );
+        for a in answers {
+            assert!(a.await.is_ok(), "both clients answered");
+        }
+    }
+
+    /// Nesting stops at ONE level: inside the hop's nested run of T's unit, a
+    /// hop from T to X, which has its own pending unit, is dropped and counted
+    /// rather than nesting again; X's unit stays pending for the loop.
+    ///
+    /// FALSIFY: take the `else` (claim and run the unit) branch even when
+    /// `in_hop_unit()`; X's unit is run nested and the count is 0.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_second_level_hop_to_a_pending_unit_is_dropped_and_counted() {
+        let _guard = TEST_GUARD.lock().await;
+        let d = delegate_key_n(0x73);
+        let t = delegate_key_n(0x74);
+        let x = delegate_key_n(0x75);
+        let (mut handler, mut park, gate, observations, _answers) = hop_harness(
+            vec![
+                (d.clone(), vec![send_to(&t, &d)]),
+                (t.clone(), vec![send_to(&x, &t)]),
+                (x.clone(), vec![app_out(b"x")]),
+            ],
+            8,
+        )
+        .await;
+        let prompter = Arc::new(crate::contract::user_input::AutoApprovePrompter);
+        let (_claim, unit) = gate.take_next_unit().expect("D's unit first");
+        assert_eq!(unit.key, d);
+        run_lane_unit(&mut handler, &mut park, &prompter, unit).await;
+        drop(_claim);
+
+        assert_eq!(
+            park.dropped_hops(),
+            1,
+            "T's message to X is dropped and counted"
+        );
+        assert!(
+            !observations
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|o| o.delegate_key == x),
+            "X is not entered inside the nested run"
+        );
+        let (_c, left) = gate.take_next_unit().expect("X's unit is still pending");
+        assert_eq!(left.key, x);
+    }
+
+    /// Many PARKED delegates, each at its per-key cap, plus a busy delegate
+    /// flooded with requests, cannot take the lane from other delegates:
+    /// blocked requests are capped in TOTAL (`MAX_BLOCKED_QUEUED`), the excess
+    /// is refused at once, and a request to a free delegate is still answered
+    /// on the lane while the loop is held in contract WASM.
+    ///
+    /// Sized so that WITHOUT the total cap the parked keys alone keep more
+    /// than `LANE_QUEUE_CAPACITY` requests: the lane then stops reading and
+    /// the free delegate's request is refused.
+    ///
+    /// FALSIFY: drop `|| blocked_total >= MAX_BLOCKED_QUEUED` in
+    /// `delegate_lane::prune`; the refusals never reach the expected count and
+    /// the free delegate's request is refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn many_parked_delegates_and_a_busy_one_cannot_lock_the_lane() {
+        use delegate_park::MAX_PENDING_PER_DELEGATE;
+        let _guard = TEST_GUARD.lock().await;
+        let parked = delegate_lane::LANE_QUEUE_CAPACITY / MAX_PENDING_PER_DELEGATE + 1;
+        let blocking = make_contract(b"lane_lockout_blocking_contract");
+        let hold = Arc::new(crate::contract::executor::mock_wasm_runtime::BlockingGate::default());
+        let (mut handler, send) = build_handler(vec![(
+            *blocking.key().id(),
+            ValidateOverride::Block(hold.clone()),
+        )])
+        .await;
+        let _release = ReleaseOnDrop(hold.clone());
+        handler.runtime_mut().enable_delegate_lane();
+        let calls = handler.runtime_mut().delegate_calls.clone();
+        let parked_keys: Vec<DelegateKey> = (0..parked)
+            .map(|i| delegate_key_n(0x10 + i as u8))
+            .collect();
+        let busy = delegate_key_n(0xF0);
+        let free = delegate_key_n(0xF1);
+        {
+            let script = handler.runtime_mut().delegate_script.clone();
+            let mut script = script.lock().unwrap();
+            for _ in &parked_keys {
+                script.push_back(prompt_outbound().into());
+            }
+            script.push_back(vec![send_to(&delegate_key_n(0xF2), &busy)].into());
+            script.push_back(ScriptedRun {
+                outbound: vec![app_out(b"free")],
+                writes_context: None,
+            });
+        }
+        let prompter = ObservedGatedPrompter::default();
+        let handle = GlobalExecutor::spawn(contract_handling(handler, prompter.clone()));
+        let send = Arc::new(send);
+        let mut waiting = Vec::new();
+        for k in parked_keys.clone() {
+            let s = send.clone();
+            waiting.push(GlobalExecutor::spawn(async move {
+                s.send_to_handler(delegate_event(&k)).await
+            }));
+        }
+        let shown = prompter.shown.clone();
+        wait_until("every parked delegate to park on its prompt", || {
+            shown.load(std::sync::atomic::Ordering::SeqCst) == parked
+        })
+        .await;
+
+        // Hold the loop, then give the busy delegate a round-trip the loop
+        // cannot drain.
+        let s = send.clone();
+        let put = GlobalExecutor::spawn(async move {
+            s.send_to_handler(ContractHandlerEvent::PutQuery {
+                key: blocking.key(),
+                state: WrappedState::new(b"s".to_vec()),
+                related_contracts: RelatedContracts::default(),
+                contract: Some(blocking),
+            })
+            .await
+        });
+        let probe = hold.clone();
+        wait_until("the loop to be held in contract WASM", || probe.entered()).await;
+        let (s, k) = (send.clone(), busy.clone());
+        waiting.push(GlobalExecutor::spawn(async move {
+            s.send_to_handler(delegate_event(&k)).await
+        }));
+        let probe = calls.clone();
+        wait_until("the busy delegate's first leg to hand off", || {
+            probe.lock().unwrap().len() == parked + 1
+        })
+        .await;
+
+        let busy_flood = 2 * delegate_lane::MAX_QUEUED_PER_BUSY_DELEGATE;
+        let flood = parked * MAX_PENDING_PER_DELEGATE + busy_flood;
+        let refused = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let targets = parked_keys
+            .iter()
+            .flat_map(|k| std::iter::repeat_n(k.clone(), MAX_PENDING_PER_DELEGATE))
+            .chain(std::iter::repeat_n(busy.clone(), busy_flood));
+        for k in targets {
+            let (s, r) = (send.clone(), refused.clone());
+            waiting.push(GlobalExecutor::spawn(async move {
+                if s.send_to_handler(delegate_event(&k)).await.is_err() {
+                    r.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                Ok::<_, ContractError>(ContractHandlerEvent::DelegateResponse(Ok(Vec::new())))
+            }));
+        }
+        let probe = refused.clone();
+        wait_until(
+            "every blocked request past the total cap to be refused",
+            || {
+                probe.load(std::sync::atomic::Ordering::SeqCst)
+                    == flood - delegate_lane::MAX_BLOCKED_QUEUED
+            },
+        )
+        .await;
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            send.send_to_handler(delegate_event(&free)),
+        )
+        .await
+        .expect("a free delegate's request must not wait")
+        .expect("a free delegate's request must not be refused");
+        assert_eq!(app_payloads(&response), vec![b"free".to_vec()]);
+        assert!(!put.is_finished(), "the loop was held throughout");
+        hold.release();
+        prompter.release.add_permits(parked);
+        handle.abort();
+        for w in waiting {
+            w.abort();
+        }
+    }
+
+    /// Lane units cannot starve fair-queue contract work: with many units
+    /// pending, the loop runs at most `MAX_LANE_UNITS_PER_ITERATION` of them
+    /// before the next fair-queue event.
+    ///
+    /// Shape: the loop is held in one contract's validate while 40 delegates
+    /// hand off a round-trip each; a second PUT (whose validate also blocks)
+    /// is queued. When the first is released, the loop drains units, then
+    /// pops the second PUT and blocks in its validate, so the number of units
+    /// run by then is frozen and can be read.
+    ///
+    /// FALSIFY: drain `MAX_RESUME_DRAIN_BATCH` (16) units per iteration
+    /// instead; 16 units have run when the second PUT starts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fair_queue_work_runs_between_lane_units() {
+        let _guard = TEST_GUARD.lock().await;
+        let second = make_contract(b"lane_fairness_second_contract");
+        let second_gate =
+            Arc::new(crate::contract::executor::mock_wasm_runtime::BlockingGate::default());
+        let mut handles = None;
+        let sg = second_gate.clone();
+        let second_id = *second.key().id();
+        let (send, gate, put, handle) = loop_held_in_contract_wasm(
+            |h| {
+                let rt = h.runtime_mut();
+                rt.validate_overrides
+                    .insert(second_id, ValidateOverride::Block(sg));
+                handles = Some((rt.delegate_script.clone(), rt.delegate_calls.clone()));
+            },
+            true,
+        )
+        .await;
+        let _release = ReleaseOnDrop(gate.clone());
+        let _release2 = ReleaseOnDrop(second_gate.clone());
+        let (script, calls) = handles.unwrap();
+        let n = 40;
+        let sink = delegate_key_n(0x6F);
+        let keys: Vec<DelegateKey> = (0..n).map(|i| delegate_key_n(0x20 + i as u8)).collect();
+        {
+            let mut script = script.lock().unwrap();
+            for k in &keys {
+                script.push_back(vec![send_to(&sink, k)].into());
+            }
+        }
+        // The second PUT goes into the loop's channel first; the loop is
+        // held, so it waits there.
+        let s = send.clone();
+        let put2 = GlobalExecutor::spawn(async move {
+            s.send_to_handler(ContractHandlerEvent::PutQuery {
+                key: second.key(),
+                state: WrappedState::new(b"s2".to_vec()),
+                related_contracts: RelatedContracts::default(),
+                contract: Some(second),
+            })
+            .await
+        });
+        let mut requests = Vec::new();
+        for k in keys {
+            let s = send.clone();
+            requests.push(GlobalExecutor::spawn(async move {
+                s.send_to_handler(delegate_event(&k)).await
+            }));
+        }
+        let probe = calls.clone();
+        wait_until("every first leg to hand off", || {
+            probe.lock().unwrap().len() == n
+        })
+        .await;
+        // Margin for the second PUT's task, spawned before the 40 requests
+        // whose lane runs were just observed, to have sent.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        gate.release();
+        let probe = second_gate.clone();
+        wait_until("the loop to reach the second PUT", || probe.entered()).await;
+        // Each unit run is two `process()` calls: the hop to `sink`, then the
+        // round-trip's continuation.
+        let units_run = (calls.lock().unwrap().len() - n) / 2;
+        assert!(
+            units_run <= MAX_LANE_UNITS_PER_ITERATION,
+            "{units_run} lane units ran before one fair-queue event; at most \
+             {MAX_LANE_UNITS_PER_ITERATION} may"
+        );
+        second_gate.release();
+        for r in requests {
+            tokio::time::timeout(Duration::from_secs(10), r)
+                .await
+                .expect("every unit still completes")
+                .expect("join")
+                .expect("answered");
+        }
+        put.await.expect("join").expect("PUT answered");
+        put2.await.expect("join").expect("second PUT answered");
+        handle.abort();
     }
 
     /// THE #5544 REGRESSION TEST: unrelated contract work must keep draining

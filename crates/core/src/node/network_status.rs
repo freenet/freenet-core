@@ -375,6 +375,7 @@ pub struct NetworkStatus {
     pub terminal_consult_stats: TerminalConsultStats,
     /// Eviction-retraction emission counters (#5059).
     pub hosting_retraction_stats: HostingRetractionStats,
+    pub delegate_lane_stats: DelegateLaneStats,
     /// Streamed-transfer abort counters (large-contract failure isolation).
     pub stream_abort_stats: StreamAbortStats,
     /// Relayed-operation counters (routing/hosting attribution).
@@ -744,6 +745,19 @@ pub struct HostingRetractionStats {
     pub dropped: u64,
 }
 
+/// Delegate lane (`contract::delegate_lane`) and inter-delegate delivery
+/// counters. Each is a client-visible loss that is otherwise only a log line:
+/// a request the lane refused (blocked caps, byte budget, full intake), a
+/// delegate run that panicked on the lane, and an inter-delegate message the
+/// hop dropped because its target was mid-round-trip. Monotonic lifetime
+/// totals; the collector differences them.
+#[derive(Default)]
+pub struct DelegateLaneStats {
+    pub requests_refused: u64,
+    pub lane_panics: u64,
+    pub inter_delegate_dropped: u64,
+}
+
 /// Streamed-transfer (> 64 KB `streaming_threshold`) abort counters, aggregated
 /// per-node so the large-contract failure class (~50% of large fetches were
 /// failing) is legible in central telemetry WITHOUT a per-fragment or
@@ -998,6 +1012,7 @@ pub fn init(listening_port: u16, gateway_addrs: HashSet<SocketAddr>, version: St
         nat_stats: NatStats::default(),
         terminal_consult_stats: TerminalConsultStats::default(),
         hosting_retraction_stats: HostingRetractionStats::default(),
+        delegate_lane_stats: DelegateLaneStats::default(),
         stream_abort_stats: StreamAbortStats::default(),
         relayed_op_stats: RelayedOpStats::default(),
         connect_emit_stats: ConnectEmitStats::default(),
@@ -1333,6 +1348,41 @@ pub fn record_hosting_retraction_dropped() {
                 s.hosting_retraction_stats.dropped.saturating_add(1);
         }
     }
+}
+
+fn update_delegate_lane_stats(f: impl FnOnce(&mut DelegateLaneStats)) {
+    if let Some(status) = NETWORK_STATUS.get() {
+        if let Ok(mut s) = status.write() {
+            f(&mut s.delegate_lane_stats);
+        }
+    }
+}
+
+/// Record one client delegate request the delegate lane refused.
+pub fn record_delegate_lane_refusal() {
+    update_delegate_lane_stats(|s| s.requests_refused = s.requests_refused.saturating_add(1));
+}
+
+/// Record one delegate run that panicked on the delegate lane.
+pub fn record_delegate_lane_panic() {
+    update_delegate_lane_stats(|s| s.lane_panics = s.lane_panics.saturating_add(1));
+}
+
+/// Record one inter-delegate message dropped because its target was
+/// mid-round-trip.
+pub fn record_inter_delegate_dropped() {
+    update_delegate_lane_stats(|s| {
+        s.inter_delegate_dropped = s.inter_delegate_dropped.saturating_add(1)
+    });
+}
+
+/// `(requests_refused, lane_panics, inter_delegate_dropped)` for the snapshot
+/// cadence; `None` before the singleton is initialized.
+pub fn delegate_lane_counts() -> Option<(u64, u64, u64)> {
+    let status = NETWORK_STATUS.get()?;
+    let s = status.read().ok()?;
+    let c = &s.delegate_lane_stats;
+    Some((c.requests_refused, c.lane_panics, c.inter_delegate_dropped))
 }
 
 /// `(emitted, dropped)` eviction-retraction totals for the snapshot cadence.

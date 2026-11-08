@@ -247,7 +247,15 @@ pub(crate) struct ContractHandlerHalve {
 /// Where client delegate requests go instead of the contract loop, once the
 /// loop has started a delegate lane (`contract::delegate_lane`). Empty until
 /// then, and for executors that do not provide a delegate runner.
-type DelegateLaneSlot = Arc<std::sync::OnceLock<mpsc::Sender<super::delegate_lane::LaneRequest>>>;
+type DelegateLaneSlot = Arc<std::sync::OnceLock<DelegateLaneIntake>>;
+
+/// The sender side of a delegate lane: its intake channel and the byte
+/// budget every offered request is charged against
+/// (`delegate_lane::LaneBytes`).
+pub(crate) struct DelegateLaneIntake {
+    pub(crate) tx: mpsc::Sender<super::delegate_lane::LaneRequest>,
+    pub(crate) bytes: Arc<super::delegate_lane::LaneBytes>,
+}
 
 /// Ownership of a client's response oneshot, removed from `waiting_response`
 /// so it can outlive a single `handle_contract_event` call.
@@ -482,7 +490,7 @@ impl ContractHandlerChannel<SenderHalve> {
         }
         match tokio::time::timeout(timeout, result_receiver).await {
             Ok(Ok((_, res))) => Ok(res),
-            Ok(Err(_)) | Err(_) => Err(ContractError::NoEvHandlerResponse),
+            Ok(Err(_)) | Err(_) => Err(crate::contract::ContractError::NoEvHandlerResponse),
         }
     }
 
@@ -519,6 +527,22 @@ impl ContractHandlerChannel<SenderHalve> {
                 result,
             });
         };
+        let bytes = super::delegate_park::request_bytes(&req).get();
+        let Some(charge) = lane.bytes.try_charge(bytes) else {
+            let total = super::delegate_lane::record_refusal();
+            if super::delegate_lane::log_this_refusal(total) {
+                tracing::warn!(
+                    delegate_key = %req.key(),
+                    bytes,
+                    total_refused = total,
+                    "Refused a delegate request: the delegate lane holds its byte \
+                     budget of queued requests. Logged at powers of two of the \
+                     running total"
+                );
+            }
+            // `result` (the responder) drops here: the client sees an error.
+            return None;
+        };
         let request = LaneRequest {
             id,
             responder: result,
@@ -526,15 +550,21 @@ impl ContractHandlerChannel<SenderHalve> {
             origin_contract,
             connection_scope,
             user_context,
+            charge,
         };
-        match lane.try_send(request) {
+        match lane.tx.try_send(request) {
             Ok(()) => None,
             Err(mpsc::error::TrySendError::Full(request)) => {
-                tracing::warn!(
-                    delegate_key = %request.req.key(),
-                    capacity = super::delegate_lane::LANE_INTAKE_CAPACITY,
-                    "Refused a delegate request: the delegate lane is full"
-                );
+                let total = super::delegate_lane::record_refusal();
+                if super::delegate_lane::log_this_refusal(total) {
+                    tracing::warn!(
+                        delegate_key = %request.req.key(),
+                        capacity = super::delegate_lane::LANE_INTAKE_CAPACITY,
+                        total_refused = total,
+                        "Refused a delegate request: the delegate lane is full. \
+                         Logged at powers of two of the running total"
+                    );
+                }
                 None
             }
             Err(mpsc::error::TrySendError::Closed(request)) => Some(InternalCHEvent {
@@ -613,7 +643,7 @@ impl ContractHandlerChannel<SenderHalve> {
         .await
         {
             Ok(Ok(())) => {}
-            Ok(Err(_)) => return Err(ContractError::NoEvHandlerResponse),
+            Ok(Err(_)) => return Err(crate::contract::ContractError::NoEvHandlerResponse),
             Err(_) => {
                 tracing::error!(
                     client = %client_id,
@@ -623,7 +653,7 @@ impl ContractHandlerChannel<SenderHalve> {
                     "Timed out registering transaction for result delivery — \
                      event loop is not draining client transactions (Priority 7 starvation)"
                 );
-                return Err(ContractError::NoEvHandlerResponse);
+                return Err(crate::contract::ContractError::NoEvHandlerResponse);
             }
         }
 
@@ -650,7 +680,7 @@ impl ContractHandlerChannel<SenderHalve> {
         .await
         {
             Ok(Ok(())) => {}
-            Ok(Err(_)) => return Err(ContractError::NoEvHandlerResponse),
+            Ok(Err(_)) => return Err(crate::contract::ContractError::NoEvHandlerResponse),
             Err(_) => {
                 tracing::error!(
                     tx = %tx,
@@ -662,7 +692,7 @@ impl ContractHandlerChannel<SenderHalve> {
                     "Timed out registering subscription for result delivery — \
                      event loop is not draining client transactions (Priority 7 starvation)"
                 );
-                return Err(ContractError::NoEvHandlerResponse);
+                return Err(crate::contract::ContractError::NoEvHandlerResponse);
             }
         }
 
@@ -731,7 +761,7 @@ impl ContractHandlerChannel<ContractHandlerHalve> {
                 .send((id, ev))
                 .map_err(|_| ContractError::NoEvHandlerResponse)
         } else {
-            Err(ContractError::NoEvHandlerResponse)
+            Err(crate::contract::ContractError::NoEvHandlerResponse)
         }
     }
 
@@ -774,10 +804,7 @@ impl ContractHandlerChannel<ContractHandlerHalve> {
 
     /// Route client delegate requests to `lane` from now on. Called once by
     /// `contract_handling`; a second call is ignored.
-    pub(crate) fn install_delegate_lane(
-        &mut self,
-        lane: mpsc::Sender<super::delegate_lane::LaneRequest>,
-    ) {
+    pub(crate) fn install_delegate_lane(&mut self, lane: DelegateLaneIntake) {
         if self.end.delegate_lane.set(lane).is_err() {
             tracing::warn!("A delegate lane is already installed; ignoring the second one");
         }
@@ -802,7 +829,7 @@ impl ContractHandlerChannel<ContractHandlerHalve> {
             self.end.waiting_response.insert(id, result);
             return Ok((EventId { id }, ev, priority));
         }
-        Err(ContractError::NoEvHandlerResponse)
+        Err(crate::contract::ContractError::NoEvHandlerResponse)
     }
 
     /// Try to receive an event without blocking.
@@ -826,7 +853,7 @@ impl ContractHandlerChannel<ContractHandlerHalve> {
             }
             Err(tokio::sync::mpsc::error::TryRecvError::Empty) => Ok(None),
             Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                Err(ContractError::NoEvHandlerResponse)
+                Err(crate::contract::ContractError::NoEvHandlerResponse)
             }
         }
     }
@@ -1287,6 +1314,153 @@ pub mod test {
 
     use super::*;
     use crate::config::GlobalExecutor;
+
+    fn lane_delegate_request() -> ContractHandlerEvent {
+        let key = DelegateKey::new([9u8; 32], CodeHash::new([9u8; 32]));
+        ContractHandlerEvent::DelegateRequest {
+            req: freenet_stdlib::client_api::DelegateRequest::ApplicationMessages {
+                key,
+                params: Parameters::from(Vec::new()),
+                inbound: vec![InboundDelegateMsg::ApplicationMessage(
+                    ApplicationMessage::new(b"payload".to_vec()),
+                )],
+            },
+            origin_contract: None,
+            connection_scope: crate::client_events::ConnectionScope::Local,
+            user_context: None,
+        }
+    }
+
+    fn lane_filler() -> crate::contract::delegate_lane::LaneRequest {
+        let ContractHandlerEvent::DelegateRequest {
+            req,
+            origin_contract,
+            connection_scope,
+            user_context,
+        } = lane_delegate_request()
+        else {
+            unreachable!()
+        };
+        let (responder, rx) = tokio::sync::oneshot::channel();
+        std::mem::forget(rx);
+        crate::contract::delegate_lane::LaneRequest {
+            id: u64::MAX,
+            responder,
+            req,
+            origin_contract,
+            connection_scope,
+            user_context,
+            charge: Default::default(),
+        }
+    }
+
+    /// A FULL lane intake refuses a delegate request at once (the client gets
+    /// an error) and does NOT fall back to the loop, which would let a later
+    /// request for the same delegate overtake it on the lane.
+    ///
+    /// FALSIFY: in `offer_to_delegate_lane`, return `Some(..)` (fall back) from
+    /// the `Full` arm; the request reaches the loop's channel.
+    #[tokio::test]
+    async fn a_full_delegate_lane_refuses_without_falling_back() -> anyhow::Result<()> {
+        let (send, mut rcv, _) = contract_handler_channel();
+        let (tx, mut lane_rx) = mpsc::channel(1);
+        tx.try_send(lane_filler()).expect("room for the filler");
+        rcv.install_delegate_lane(DelegateLaneIntake {
+            tx,
+            bytes: crate::contract::delegate_lane::LaneBytes::new(usize::MAX),
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            send.send_to_handler(lane_delegate_request()),
+        )
+        .await?;
+        assert!(
+            matches!(
+                result,
+                Err(crate::contract::ContractError::NoEvHandlerResponse)
+            ),
+            "a full lane refuses the request with an error, got {result:?}"
+        );
+        assert!(
+            rcv.try_recv_from_sender()?.is_none(),
+            "a refused request must not fall back to the loop"
+        );
+        assert_eq!(
+            lane_rx.try_recv()?.id,
+            u64::MAX,
+            "only the filler is queued"
+        );
+        assert!(lane_rx.try_recv().is_err());
+        Ok(())
+    }
+
+    /// A request over the lane's BYTE budget is refused at once, and nothing
+    /// is queued.
+    ///
+    /// FALSIFY: skip the `try_charge` refusal in `offer_to_delegate_lane`; the
+    /// request is queued on the lane.
+    #[tokio::test]
+    async fn a_delegate_lane_over_its_byte_budget_refuses() -> anyhow::Result<()> {
+        let (send, mut rcv, _) = contract_handler_channel();
+        let (tx, mut lane_rx) = mpsc::channel(8);
+        let bytes = crate::contract::delegate_lane::LaneBytes::new(4);
+        let _held = bytes.try_charge(4).expect("the budget is free");
+        rcv.install_delegate_lane(DelegateLaneIntake { tx, bytes });
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            send.send_to_handler(lane_delegate_request()),
+        )
+        .await?;
+        assert!(matches!(
+            result,
+            Err(crate::contract::ContractError::NoEvHandlerResponse)
+        ));
+        assert!(lane_rx.try_recv().is_err(), "nothing queued on the lane");
+        assert!(
+            rcv.try_recv_from_sender()?.is_none(),
+            "nothing sent to the loop"
+        );
+        Ok(())
+    }
+
+    /// A CLOSED lane (its task died) sends the request to the loop instead,
+    /// with the same event id, the same priority and the client's own
+    /// responder, so the loop's answer reaches the client.
+    ///
+    /// FALSIFY: refuse in the `Closed` arm (return `None`), or rebuild the
+    /// event with a fresh id/responder; the client is not answered.
+    #[tokio::test]
+    async fn a_closed_delegate_lane_falls_back_to_the_loop() -> anyhow::Result<()> {
+        let (send, mut rcv, _) = contract_handler_channel();
+        let (tx, lane_rx) = mpsc::channel(8);
+        drop(lane_rx);
+        rcv.install_delegate_lane(DelegateLaneIntake {
+            tx,
+            bytes: crate::contract::delegate_lane::LaneBytes::new(usize::MAX),
+        });
+        let client = GlobalExecutor::spawn(async move {
+            send.send_to_handler_prioritized(
+                lane_delegate_request(),
+                crate::contract::fair_queue::Priority::ClientLocal,
+            )
+            .await
+        });
+        let (id, ev, priority) =
+            tokio::time::timeout(Duration::from_secs(5), rcv.recv_from_sender()).await??;
+        assert!(
+            matches!(ev, ContractHandlerEvent::DelegateRequest { .. }),
+            "the loop receives the delegate request, got {ev}"
+        );
+        assert_eq!(priority, crate::contract::fair_queue::Priority::ClientLocal);
+        rcv.send_to_sender(id, ContractHandlerEvent::DelegateResponse(Ok(Vec::new())))
+            .await?;
+        let answer = tokio::time::timeout(Duration::from_secs(5), client).await???;
+        assert!(
+            matches!(answer, ContractHandlerEvent::DelegateResponse(Ok(_))),
+            "the loop's answer reaches the client through its own responder"
+        );
+        Ok(())
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn channel_test() -> anyhow::Result<()> {

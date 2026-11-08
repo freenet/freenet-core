@@ -954,14 +954,22 @@ impl ContractExecutor for Executor<MockWasmRuntime, MockStateStorage> {
     async fn execute_delegate_hop(
         &mut self,
         req: DelegateRequest<'_>,
-        _caller_delegate: &DelegateKey,
-        _connection_scope: crate::client_events::ConnectionScope,
+        caller_delegate: &DelegateKey,
+        connection_scope: crate::client_events::ConnectionScope,
         user_context: Option<&UserSecretContext>,
     ) -> Response {
         if let Some(runner) = self.runtime.delegate_lane.clone() {
             use crate::contract::delegate_lane::DelegateRunner;
+            // The hop's attested caller rides through the runner, as in
+            // `RuntimePool::execute_delegate_hop`.
             return runner
-                .run(req, None, None, _connection_scope, user_context)
+                .run(
+                    req,
+                    None,
+                    Some(caller_delegate),
+                    connection_scope,
+                    user_context,
+                )
                 .await;
         }
         let user = user_context.map(|u| *u.user_id());

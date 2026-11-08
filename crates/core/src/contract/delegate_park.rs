@@ -111,7 +111,7 @@
 //! **What would break it.** Running a delegate on anything but the delegate
 //! runner; starting a loop run of a delegate without claiming it on the gate;
 //! resuming a continuation anywhere other than the loop. The pins are
-//! `every_delegate_run_is_reached_from_the_serial_loop`,
+//! `every_loop_delegate_run_goes_through_the_round_trip_chokepoint`,
 //! `every_delegate_process_runs_on_the_one_delegate_executor` and
 //! `every_loop_delegate_run_claims_the_delegate_on_the_gate` in `contract.rs`.
 //!
@@ -261,7 +261,7 @@ const MIN_PARKED_BYTES: usize = MAX_PARKED_BYTES / 8;
 
 /// RAM assumed when the host's real figure cannot be read — the same
 /// conservative 1 GiB every sibling budget falls back to.
-const PARKED_FALLBACK_TOTAL_RAM_BYTES: usize = 1024 * 1024 * 1024;
+pub(super) const PARKED_FALLBACK_TOTAL_RAM_BYTES: usize = 1024 * 1024 * 1024;
 
 /// Fraction of node memory the park registry may pin. Matches the shape of
 /// every sibling budget (`budget_for_ram`, `summary_budget_for`, ...), which is
@@ -1765,6 +1765,31 @@ pub(super) struct DelegateParkCtx {
     dropped_hops: u64,
 }
 
+/// See [`DelegateParkCtx::enter_hop_unit`]. Derefs to the park context, so the
+/// nested run borrows it through the guard.
+pub(super) struct HopUnitScope<'a> {
+    park: &'a mut DelegateParkCtx,
+}
+
+impl std::ops::Deref for HopUnitScope<'_> {
+    type Target = DelegateParkCtx;
+    fn deref(&self) -> &DelegateParkCtx {
+        self.park
+    }
+}
+
+impl std::ops::DerefMut for HopUnitScope<'_> {
+    fn deref_mut(&mut self) -> &mut DelegateParkCtx {
+        self.park
+    }
+}
+
+impl Drop for HopUnitScope<'_> {
+    fn drop(&mut self) {
+        self.park.hop_unit_stack.pop();
+    }
+}
+
 /// Why parked work was turned away, counted rather than only logged (L9).
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct RefusalCounts {
@@ -1800,8 +1825,19 @@ impl DelegateParkCtx {
 
     /// Share `gate` with the delegate lane. Called once by `contract_handling`
     /// when it starts a lane.
+    ///
+    /// Also hands the lane its byte budget OUT OF this registry's: with a lane
+    /// running, client requests for a parked delegate wait in the lane's queue
+    /// (`delegate_lane::prune`), not in this registry's pending queues, so the
+    /// bytes they used to be charged here are now charged there
+    /// (`delegate_lane::lane_bytes_budget_for`). The node's total stays
+    /// `parked_budget_for`, the figure `declared_cache_ceiling` sums. The
+    /// per-upsert fetch allowance is still derived from the full figure, so
+    /// deferred upserts are unaffected.
     pub(super) fn set_gate(&mut self, gate: std::sync::Arc<super::delegate_lane::DelegateGate>) {
         self.gate = Some(gate);
+        self.budget = parked_budget_for(self.host_ram)
+            - super::delegate_lane::lane_bytes_budget_for(self.host_ram);
     }
 
     /// The gate shared with the delegate lane, if one is running.
@@ -1821,17 +1857,25 @@ impl DelegateParkCtx {
         self.hop_unit_stack.contains(key)
     }
 
-    pub(super) fn enter_hop_unit(&mut self, caller: &DelegateKey) {
+    /// Record `caller` as suspended in a hop running another delegate's lane
+    /// unit, for as long as the returned guard lives. RAII so an early return
+    /// between entering and leaving cannot leave the stack non-empty, which
+    /// would make every later hop look nested and drop it.
+    pub(super) fn enter_hop_unit(&mut self, caller: &DelegateKey) -> HopUnitScope<'_> {
         self.hop_unit_stack.push(caller.clone());
+        HopUnitScope { park: self }
     }
 
-    pub(super) fn leave_hop_unit(&mut self) {
-        self.hop_unit_stack.pop();
-    }
-
-    /// Count one dropped inter-delegate message; returns the new total.
+    /// Count one dropped inter-delegate message (also in telemetry); returns
+    /// the new total.
     pub(super) fn count_dropped_hop(&mut self) -> u64 {
+        crate::node::network_status::record_inter_delegate_dropped();
         self.dropped_hops = self.dropped_hops.saturating_add(1);
+        self.dropped_hops
+    }
+
+    #[cfg(test)]
+    pub(super) fn dropped_hops(&self) -> u64 {
         self.dropped_hops
     }
 
@@ -1846,7 +1890,9 @@ impl DelegateParkCtx {
     /// The bytes ONE deferred upsert's off-loop related fetch may retain on
     /// this node. See [`upsert_fetch_allowance`].
     pub(super) fn upsert_fetch_allowance(&self) -> ByteCount {
-        upsert_fetch_allowance(self.budget)
+        // The FULL registry figure, not `self.budget`, which `set_gate` lowers
+        // by the delegate lane's share; see there.
+        upsert_fetch_allowance(parked_budget_for(self.host_ram))
     }
 
     pub(super) fn resume_tx(&self) -> &tokio::sync::mpsc::UnboundedSender<DelegateResume> {
@@ -2273,10 +2319,16 @@ impl DelegateParkCtx {
     /// it needs the same remedy rather than an argument about how short the
     /// window is.
     ///
-    /// Call this immediately before each force-resume, with no `.await`
-    /// between: it and [`Self::take_matching`] (the first statement of
-    /// `handle_delegate_resume`) are both synchronous, so the observation and
-    /// the removal cannot be separated by a suspension point.
+    /// Call this immediately before each force-resume, with nothing that
+    /// suspends between: it and [`Self::take_matching`] are both synchronous,
+    /// and the one await `handle_delegate_resume` makes before
+    /// `take_matching` (claiming the delegate on the lane's gate) does not
+    /// suspend for a key that is still parked: the park entry holds a gate
+    /// claim, so the lane has no run or unit for it and `DelegateGate::claim`
+    /// returns at its first check (pinned by
+    /// `delegate_lane::tests::a_claim_on_a_parked_delegate_does_not_suspend`).
+    /// So the observation and the removal cannot be separated by a suspension
+    /// point.
     ///
     /// RESIDUAL, stated rather than implied: a guard that fires in the
     /// instants between this call and `take_matching` is still lost. That is
@@ -2355,6 +2407,34 @@ fn resume_in_hand(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// With a delegate lane, the lane's byte budget is carved OUT of the park
+    /// registry's, so the node total stays `parked_budget_for`, the one term
+    /// `declared_cache_ceiling` sums; the per-upsert fetch allowance keeps
+    /// using the full figure.
+    ///
+    /// FALSIFY: drop the budget reduction in `set_gate`; the two budgets
+    /// together exceed `parked_budget_for`.
+    #[test]
+    fn the_delegate_lane_byte_budget_is_carved_from_the_park_budget() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut ctx = DelegateParkCtx::new(tx);
+        let full = parked_budget_for(ctx.host_ram);
+        assert_eq!(ctx.budget(), full, "no lane: the registry has it all");
+        let allowance = ctx.upsert_fetch_allowance();
+        ctx.set_gate(super::super::delegate_lane::DelegateGate::new());
+        assert_eq!(
+            ctx.budget() + super::super::delegate_lane::lane_bytes_budget_for(ctx.host_ram),
+            full,
+            "park registry + delegate lane must together be the declared figure"
+        );
+        assert!(ctx.budget() < full);
+        assert_eq!(
+            ctx.upsert_fetch_allowance(),
+            allowance,
+            "deferred upserts are unaffected"
+        );
+    }
 
     // ---------------------------------------------------------------------
     // `usize` shims for the byte functions, shadowing the `super::*` imports.

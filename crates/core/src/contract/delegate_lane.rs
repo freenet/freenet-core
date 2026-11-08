@@ -66,19 +66,34 @@
 //! stops reading, so the intake fills and refuses. Units to the loop are at
 //! most one per delegate and are themselves drawn from that bounded queue.
 //!
-//! A PARKED delegate (one waiting on a user prompt or an off-loop fetch, up to
-//! `delegate_park::PARK_TTL`) keeps at most
-//! [`MAX_PENDING_PER_DELEGATE`](super::delegate_park::MAX_PENDING_PER_DELEGATE)
-//! requests queued here; the lane refuses the rest at once, with the shape the
-//! park's own queue refused them with before this lane existed (the responder
-//! is dropped, so the client sees an error). Without that cap one parked
-//! delegate fills the queue, the lane stops reading, and every delegate on the
-//! node is refused until the park ends. The cap is per delegate KEY, as the
-//! park is: on a hosted node every user of a shared delegate key shares it.
-//! The other reasons a delegate is not free (a loop claim, a pending unit, a
-//! lane run) last one loop round-trip, not a human's reaction time, so they do
-//! not refuse: a burst of requests to a busy delegate waits, as it did in the
-//! loop's fair queue.
+//! BLOCKED requests (their delegate is not free: parked, claimed by the loop,
+//! or with a round-trip handed to the loop) are bounded twice, so they can
+//! never take the queue from runnable work:
+//!
+//! * per delegate KEY: a PARKED delegate (waiting on a user prompt or an
+//!   off-loop fetch, up to `delegate_park::PARK_TTL`) keeps at most
+//!   [`MAX_PENDING_PER_DELEGATE`](super::delegate_park::MAX_PENDING_PER_DELEGATE)
+//!   (8), the cap the park's own queue had before this lane existed; any other
+//!   busy delegate keeps at most [`MAX_QUEUED_PER_BUSY_DELEGATE`] (32);
+//! * in total: at most [`MAX_BLOCKED_QUEUED`] (half the queue) blocked
+//!   requests across all keys, so at least half the queue is always free for
+//!   requests the lane can run, and the lane never stops reading its intake
+//!   because of blocked work. Without this a few dozen parked keys at 8 each
+//!   fill the queue and every delegate on the node is refused.
+//!
+//! Past either bound a request is refused at once, with the shape the park's
+//! queue refused with (the responder is dropped, so the client sees an
+//! error). The OLDEST blocked requests are kept, so per-delegate order holds.
+//! The caps are per delegate KEY, as the park is: on a hosted node every user
+//! of a shared delegate key shares them.
+//!
+//! Bytes are bounded too: every request is charged its payload size
+//! (`delegate_park::request_bytes`) from the moment the sender offers it
+//! until the lane has finished with it, against [`lane_bytes_budget_for`]
+//! (a quarter of the park registry's RAM-scaled figure, carved out of it). Over budget, the sender
+//! refuses it at once. One request larger than the whole budget is still
+//! admitted when nothing else is held, so a legitimately large request is not
+//! refused forever; the bound is then budget plus one request.
 //!
 //! A queued request whose client has gone away (its responder is closed) is
 //! dropped instead of run, so a retry after a client-side timeout does not
@@ -113,6 +128,109 @@ pub(crate) const LANE_INTAKE_CAPACITY: usize = 128;
 /// their delegate to be free. Past this the lane stops reading the intake.
 pub(crate) const LANE_QUEUE_CAPACITY: usize = 256;
 
+/// Blocked requests the lane holds across ALL delegates (see the module docs,
+/// "Bounds"). Half the queue, so runnable requests always have room.
+pub(crate) const MAX_BLOCKED_QUEUED: usize = LANE_QUEUE_CAPACITY / 2;
+
+/// Requests the lane holds for one delegate that is busy but NOT parked (a
+/// loop claim or a pending unit). That lasts one loop round-trip, which under
+/// load is the contract-WASM backlog this lane exists to escape (seconds, not
+/// a human's minute), so the cap is looser than the park's 8: 32 lets a burst
+/// on a hosted node's shared delegate key ride out a multi-second loop stall
+/// without refusals, and four such keys reach [`MAX_BLOCKED_QUEUED`], so one
+/// hot key cannot hold more than a quarter of the blocked share.
+pub(crate) const MAX_QUEUED_PER_BUSY_DELEGATE: usize = 32;
+
+/// Payload bytes the lane may hold (intake plus queue) on a host with
+/// `total_ram` bytes: a quarter of the park registry's figure
+/// (`delegate_park::parked_budget_for`), CARVED OUT of it
+/// (`DelegateParkCtx::set_gate` lowers the registry's own budget by this), so
+/// the node total `contract::executor::declared_cache_ceiling` sums as
+/// `parked_budget_for` is unchanged. The requests it holds are the ones that
+/// used to queue behind a park and be charged to that registry. 8 MiB at 1 GiB
+/// of RAM, 16 MiB at most: a few thousand typical client delegate requests.
+pub(crate) fn lane_bytes_budget_for(total_ram: usize) -> usize {
+    super::delegate_park::parked_budget_for(total_ram) / 4
+}
+
+/// Payload bytes currently held by requests offered to the lane.
+#[derive(Debug)]
+pub(crate) struct LaneBytes {
+    held: std::sync::atomic::AtomicUsize,
+    budget: usize,
+}
+
+impl LaneBytes {
+    pub(crate) fn new(budget: usize) -> Arc<Self> {
+        Arc::new(Self {
+            held: std::sync::atomic::AtomicUsize::new(0),
+            budget,
+        })
+    }
+
+    /// Charge `bytes`, or `None` when that would exceed the budget (unless
+    /// nothing is held: see the module docs).
+    pub(crate) fn try_charge(self: &Arc<Self>, bytes: usize) -> Option<LaneCharge> {
+        use std::sync::atomic::Ordering;
+        let mut held = self.held.load(Ordering::Acquire);
+        loop {
+            let next = held.saturating_add(bytes);
+            if held != 0 && next > self.budget {
+                return None;
+            }
+            match self
+                .held
+                .compare_exchange_weak(held, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => {
+                    return Some(LaneCharge {
+                        bytes: Some(self.clone()),
+                        n: bytes,
+                    });
+                }
+                Err(actual) => held = actual,
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn held(&self) -> usize {
+        self.held.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+/// A request's share of [`LaneBytes`], released on drop.
+#[derive(Debug, Default)]
+pub(crate) struct LaneCharge {
+    bytes: Option<Arc<LaneBytes>>,
+    n: usize,
+}
+
+impl Drop for LaneCharge {
+    fn drop(&mut self) {
+        if let Some(bytes) = &self.bytes {
+            bytes
+                .held
+                .fetch_sub(self.n, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+}
+
+/// Refusals counted by the lane and its sender, mirrored into the node's
+/// telemetry (`network_status::record_delegate_lane_refusal`).
+pub(crate) fn record_refusal() -> u64 {
+    static TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    crate::node::network_status::record_delegate_lane_refusal();
+    TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
+/// Whether a refusal with this running total is logged: the first, then at
+/// each power of two, so a flood of refusals is a handful of lines with the
+/// total in each rather than one line per request.
+pub(crate) fn log_this_refusal(total: u64) -> bool {
+    total.is_power_of_two()
+}
+
 /// Runs one delegate `process()` call on the node's delegate executor.
 ///
 /// Implementations MUST run every call on one executor under one lock: that
@@ -143,6 +261,8 @@ pub(crate) struct LaneRequest {
     pub(crate) origin_contract: Option<ContractInstanceId>,
     pub(crate) connection_scope: crate::client_events::ConnectionScope,
     pub(crate) user_context: Option<UserSecretContext>,
+    /// The request's payload bytes, held until the lane is done with it.
+    pub(crate) charge: LaneCharge,
 }
 
 /// Work the lane hands to the loop.
@@ -223,9 +343,9 @@ pub(crate) struct DelegateGate {
     units_ready: Notify,
     /// Lane -> loop claims waiting on a lane run: a lane run ended.
     lane_run_ended: Notify,
-    /// Requests the lane refused because their delegate was parked with a
-    /// full queue behind it. Counted, not only logged.
-    refused_parked: std::sync::atomic::AtomicU64,
+    /// Requests the lane refused because their delegate was blocked past a
+    /// cap (see [`prune`]). Also mirrored into telemetry.
+    refused_blocked: std::sync::atomic::AtomicU64,
 }
 
 impl DelegateGate {
@@ -341,12 +461,13 @@ impl DelegateGate {
         }
     }
 
-    /// Whether a park entry holds `key`.
-    fn is_parked(&self, key: &DelegateKey) -> bool {
-        self.lock()
-            .entries
-            .get(key)
-            .is_some_and(|entry| entry.park_holds > 0)
+    fn state(&self, key: &DelegateKey) -> KeyState {
+        match self.lock().entries.get(key) {
+            None => KeyState::Free,
+            Some(entry) if entry.park_holds > 0 => KeyState::Parked,
+            Some(entry) if entry.is_clear() => KeyState::Free,
+            Some(_) => KeyState::Busy,
+        }
     }
 
     /// Whether the loop has a unit waiting. Lets the loop skip its blocking
@@ -432,11 +553,27 @@ impl DelegateGate {
         self.lock().entries.contains_key(key)
     }
 
+    /// Leave `unit` pending for the loop, as the lane does after handing a
+    /// round-trip off. The delegate must be free.
     #[cfg(test)]
-    pub(crate) fn refused_parked_count(&self) -> u64 {
-        self.refused_parked
+    pub(crate) fn hand_off_for_test(&self, unit: LaneUnit) {
+        assert!(self.try_forward(unit).is_ok(), "the delegate must be free");
+    }
+
+    #[cfg(test)]
+    pub(crate) fn refused_blocked_count(&self) -> u64 {
+        self.refused_blocked
             .load(std::sync::atomic::Ordering::Relaxed)
     }
+}
+
+/// What [`prune`] needs to know about a delegate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyState {
+    Free,
+    Parked,
+    /// Not free and not parked: a loop claim, a pending unit, a lane run.
+    Busy,
 }
 
 /// A loop claim waiting for a lane run to end. See [`DelegateGate::wait_for_lane`].
@@ -593,12 +730,13 @@ fn respond(
 /// The lane task. Runs until its intake closes (the node's sender half is
 /// gone) or it is aborted with the contract loop.
 ///
-/// A panic inside the lane (a delegate runner bug) is caught here, logged at
-/// error, and ends the lane: its intake closes with it, so every later client
-/// delegate request falls back to the contract loop (the sender sees a closed
-/// intake). The panic is not re-raised: nothing awaits the lane's handle, so
-/// re-raising would only lose the message. An abort is not a panic and is
-/// logged at debug by [`AbortLog`].
+/// A panic inside ONE delegate run is caught in [`serve`]: that request's
+/// client gets an error and the lane carries on. A panic anywhere else in the
+/// lane is caught here, logged at error, and ends the lane: its intake closes
+/// with it, so every later client delegate request falls back to the contract
+/// loop (the sender sees a closed intake). The panic is not re-raised: nothing
+/// awaits the lane's handle, so re-raising would only lose the message. An
+/// abort is not a panic and is logged at debug by [`AbortLog`].
 pub(crate) async fn run_lane(
     runner: Arc<dyn DelegateRunner>,
     gate: Arc<DelegateGate>,
@@ -613,11 +751,8 @@ pub(crate) async fn run_lane(
     match outcome {
         Ok(()) => tracing::debug!("Delegate lane task ended: its intake closed"),
         Err(payload) => {
-            let reason = payload
-                .downcast_ref::<&str>()
-                .map(|s| (*s).to_string())
-                .or_else(|| payload.downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "non-string panic payload".to_string());
+            let reason = panic_reason(&*payload);
+            crate::node::network_status::record_delegate_lane_panic();
             tracing::error!(
                 %reason,
                 "Delegate lane task PANICKED; client delegate requests fall back to \
@@ -625,6 +760,14 @@ pub(crate) async fn run_lane(
             );
         }
     }
+}
+
+fn panic_reason(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".to_string())
 }
 
 async fn lane_loop(
@@ -663,15 +806,18 @@ async fn lane_loop(
     }
 }
 
-/// Drop queued requests whose client has gone away, and refuse the requests
-/// for a PARKED delegate past [`MAX_PENDING_PER_DELEGATE`] (the oldest are
-/// kept, so per-delegate order holds). See the module docs, "Bounds".
+/// Drop queued requests whose client has gone away, and refuse BLOCKED
+/// requests past their caps: per key ([`MAX_PENDING_PER_DELEGATE`] for a
+/// parked delegate, [`MAX_QUEUED_PER_BUSY_DELEGATE`] for another busy one)
+/// and in total ([`MAX_BLOCKED_QUEUED`]). The oldest are kept, so per-delegate
+/// order holds. See the module docs, "Bounds".
 ///
 /// [`MAX_PENDING_PER_DELEGATE`]: super::delegate_park::MAX_PENDING_PER_DELEGATE
 fn prune(queue: &mut VecDeque<LaneRequest>, gate: &DelegateGate) {
     use super::delegate_park::MAX_PENDING_PER_DELEGATE;
-    // Per key: (parked, requests kept so far). One gate lookup per key.
-    let mut seen: HashMap<DelegateKey, (bool, usize)> = HashMap::new();
+    // Per key: (state, requests kept so far). One gate lookup per key.
+    let mut seen: HashMap<DelegateKey, (KeyState, usize)> = HashMap::new();
+    let mut blocked_total = 0usize;
     queue.retain(|request| {
         let key = request.req.key();
         if request.responder.is_closed() {
@@ -682,27 +828,40 @@ fn prune(queue: &mut VecDeque<LaneRequest>, gate: &DelegateGate) {
             );
             return false;
         }
-        let (parked, kept) = seen
+        let (state, kept) = seen
             .entry(key.clone())
-            .or_insert_with(|| (gate.is_parked(key), 0));
-        if *parked && *kept >= MAX_PENDING_PER_DELEGATE {
-            let total = gate
-                .refused_parked
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                + 1;
-            tracing::warn!(
-                delegate_key = %key,
-                limit = MAX_PENDING_PER_DELEGATE,
-                total_refused = total,
-                "Refused a delegate request: the delegate is parked and already has \
-                 the maximum number of requests waiting behind it. Dropping the \
-                 responder so the client sees an error"
-            );
+            .or_insert_with(|| (gate.state(key), 0));
+        let per_key = match state {
+            KeyState::Free => {
+                *kept += 1;
+                return true;
+            }
+            KeyState::Parked => MAX_PENDING_PER_DELEGATE,
+            KeyState::Busy => MAX_QUEUED_PER_BUSY_DELEGATE,
+        };
+        if *kept >= per_key || blocked_total >= MAX_BLOCKED_QUEUED {
+            gate.refused_blocked
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let total = record_refusal();
+            if log_this_refusal(total) {
+                tracing::warn!(
+                    delegate_key = %key,
+                    state = ?state,
+                    per_key_limit = per_key,
+                    blocked_limit = MAX_BLOCKED_QUEUED,
+                    total_refused = total,
+                    "Refused a delegate request: its delegate is busy and the lane \
+                     already holds as many requests waiting for it (or for busy \
+                     delegates in total) as it allows. The client sees an error. \
+                     Logged at powers of two of the running total"
+                );
+            }
             // Dropping the request drops its responder: the client's oneshot
             // closes and it surfaces an error, as the park's own queue did.
             return false;
         }
         *kept += 1;
+        blocked_total += 1;
         true
     });
 }
@@ -748,6 +907,7 @@ async fn serve(
             origin_contract,
             connection_scope,
             user_context,
+            charge,
         } = request;
         let unit = LaneUnit {
             key,
@@ -766,6 +926,7 @@ async fn serve(
             origin_contract: unit.origin_contract,
             connection_scope: unit.connection_scope,
             user_context: unit.user_context,
+            charge,
         });
     }
 
@@ -779,18 +940,42 @@ async fn serve(
         origin_contract,
         connection_scope,
         user_context,
+        charge: _charge,
     } = request;
     let continuation = continuation_request(&req);
     tracing::debug!(delegate_key = %key, "Processing delegate request on the delegate lane");
-    let result = runner
-        .run(
+    // A panic inside this one run fails this one request, not the lane: the
+    // client is answered with an error and the run's gate entry is released
+    // (`LaneRun` drops). The runner itself marks its executor for a health
+    // check before the next use (`PooledDelegateRunner`).
+    let result = {
+        use futures::FutureExt;
+        std::panic::AssertUnwindSafe(runner.run(
             req,
             origin_contract.as_ref(),
             None,
             connection_scope,
             user_context.as_ref(),
-        )
-        .await;
+        ))
+        .catch_unwind()
+        .await
+    };
+    let result = match result {
+        Ok(result) => result,
+        Err(payload) => {
+            let reason = panic_reason(&*payload);
+            crate::node::network_status::record_delegate_lane_panic();
+            tracing::error!(
+                delegate_key = %key,
+                %reason,
+                "A delegate run PANICKED on the delegate lane; answering its client \
+                 with an error and continuing"
+            );
+            Err(ExecutorError::other(anyhow::anyhow!(
+                "the delegate run panicked: {reason}"
+            )))
+        }
+    };
     match super::delegate_response_values(result, &key) {
         Err(err) => {
             run.finish();
@@ -956,6 +1141,7 @@ mod tests {
             origin_contract: None,
             connection_scope: crate::client_events::ConnectionScope::Local,
             user_context: None,
+            charge: LaneCharge::default(),
         };
         (req, rx)
     }
@@ -1067,7 +1253,7 @@ mod tests {
                 "the OLDEST requests are kept and the newest refused (request {i})"
             );
         }
-        assert_eq!(gate.refused_parked_count(), extra as u64);
+        assert_eq!(gate.refused_blocked_count(), extra as u64);
 
         // Unparked: no cap any more.
         drop(park_hold);
@@ -1082,36 +1268,174 @@ mod tests {
         assert_eq!(count(&queue, &d), MAX_PENDING_PER_DELEGATE + extra);
     }
 
-    /// A panic inside the lane ends the lane quietly for its awaiter (it is
-    /// logged, not re-raised) and closes its intake, so senders fall back to
-    /// the loop.
+    /// A panic inside ONE delegate run fails that request only: its client
+    /// gets an error, the gate releases the delegate, and the lane serves the
+    /// next request.
     ///
-    /// FALSIFY: in `run_lane`, await `lane_loop(..)` directly instead of
-    /// through `catch_unwind`; the join reports a panic.
+    /// FALSIFY: in `serve`, await `runner.run(..)` without `catch_unwind`; the
+    /// first client sees its responder dropped (not an error response), the
+    /// lane dies, and the second request is never answered.
     #[tokio::test]
-    async fn a_panicking_lane_is_caught_and_closes_its_intake() {
-        struct Panics;
-        impl DelegateRunner for Panics {
+    async fn a_panicking_run_fails_only_its_request_and_the_lane_carries_on() {
+        struct PanicsOnce(std::sync::atomic::AtomicBool);
+        impl DelegateRunner for PanicsOnce {
             fn run<'a>(
                 &'a self,
-                _req: DelegateRequest<'a>,
+                req: DelegateRequest<'a>,
                 _origin_contract: Option<&'a ContractInstanceId>,
                 _caller_delegate: Option<&'a DelegateKey>,
                 _connection_scope: crate::client_events::ConnectionScope,
                 _user_context: Option<&'a UserSecretContext>,
             ) -> BoxFuture<'a, Result<HostResponse, ExecutorError>> {
-                Box::pin(async { panic!("runner bug") })
+                let first = !self.0.swap(true, std::sync::atomic::Ordering::SeqCst);
+                let key = req.key().clone();
+                Box::pin(async move {
+                    if first {
+                        panic!("runner bug");
+                    }
+                    Ok(HostResponse::DelegateResponse {
+                        key,
+                        values: Vec::new(),
+                    })
+                })
             }
         }
+        let gate = DelegateGate::new();
         let (tx, rx) = tokio::sync::mpsc::channel(4);
-        let lane = tokio::spawn(run_lane(Arc::new(Panics), DelegateGate::new(), rx));
-        let (req, _answer) = request(&key(30));
+        let lane = tokio::spawn(run_lane(
+            Arc::new(PanicsOnce(Default::default())),
+            gate.clone(),
+            rx,
+        ));
+        let k = key(30);
+        let (req, a) = request(&k);
         tx.send(req).await.expect("lane is up");
-        tokio::time::timeout(Duration::from_secs(5), lane)
+        let (_, first) = tokio::time::timeout(Duration::from_secs(5), a)
             .await
-            .expect("the lane ends")
-            .expect("the panic is caught inside the lane, not propagated to its join");
-        assert!(tx.is_closed(), "the dead lane's intake is closed");
+            .expect("answered")
+            .expect(
+                "the panicking request's client gets an ERROR response, not a dropped responder",
+            );
+        assert!(
+            matches!(first, ContractHandlerEvent::DelegateResponse(Err(_))),
+            "got {first}"
+        );
+        let (req, b) = request(&k);
+        tx.send(req).await.expect("the lane is still up");
+        let (_, second) = tokio::time::timeout(Duration::from_secs(5), b)
+            .await
+            .expect("the lane serves the next request")
+            .expect("answered");
+        assert!(
+            matches!(second, ContractHandlerEvent::DelegateResponse(Ok(_))),
+            "got {second}"
+        );
+        assert!(
+            !gate.is_tracking(&k),
+            "the panicked run released its delegate"
+        );
+        assert!(!lane.is_finished());
+        lane.abort();
+    }
+
+    /// Blocked requests are bounded in TOTAL, not only per key: many parked
+    /// keys at their per-key cap cannot fill the queue, and a busy (not
+    /// parked) key is capped too. Requests for a free delegate are never
+    /// refused by these caps.
+    ///
+    /// FALSIFY: drop `|| blocked_total >= MAX_BLOCKED_QUEUED` in `prune`
+    /// (kept blocked exceeds the total); make `KeyState::Busy` return true
+    /// like `Free` (the busy key keeps everything).
+    #[tokio::test]
+    async fn prune_bounds_blocked_requests_in_total_and_for_busy_keys() {
+        use super::super::delegate_park::MAX_PENDING_PER_DELEGATE;
+        let gate = DelegateGate::new();
+        let parked_keys = MAX_BLOCKED_QUEUED / MAX_PENDING_PER_DELEGATE + 4;
+        let mut holds = Vec::new();
+        let mut queue = VecDeque::new();
+        let mut rxs = Vec::new();
+        for i in 0..parked_keys {
+            let k = key(100 + i as u8);
+            let (claim, _) = gate.claim(&k).await;
+            holds.push(gate.hold(&k));
+            drop(claim);
+            for _ in 0..MAX_PENDING_PER_DELEGATE {
+                let (r, rx) = request(&k);
+                queue.push_back(r);
+                rxs.push(rx);
+            }
+        }
+        let free = key(99);
+        for _ in 0..10 {
+            let (r, rx) = request(&free);
+            queue.push_back(r);
+            rxs.push(rx);
+        }
+        prune(&mut queue, &gate);
+        let blocked = queue.iter().filter(|r| r.req.key() != &free).count();
+        assert_eq!(
+            blocked, MAX_BLOCKED_QUEUED,
+            "blocked requests are capped in total"
+        );
+        assert_eq!(
+            queue.len() - blocked,
+            10,
+            "a free delegate's requests are never capped"
+        );
+
+        // A busy, NOT parked key: capped per key at MAX_QUEUED_PER_BUSY_DELEGATE.
+        drop(holds);
+        let busy = key(98);
+        let (_busy_claim, _) = gate.claim(&busy).await;
+        let mut queue = VecDeque::new();
+        for _ in 0..MAX_QUEUED_PER_BUSY_DELEGATE + 5 {
+            let (r, rx) = request(&busy);
+            queue.push_back(r);
+            rxs.push(rx);
+        }
+        prune(&mut queue, &gate);
+        assert_eq!(queue.len(), MAX_QUEUED_PER_BUSY_DELEGATE);
+    }
+
+    /// The lane's byte budget refuses past the budget, releases on drop, and
+    /// admits a single oversized request when nothing else is held.
+    #[test]
+    fn lane_bytes_charge_refuse_and_release() {
+        let bytes = LaneBytes::new(100);
+        let a = bytes.try_charge(60).expect("under budget");
+        assert!(bytes.try_charge(50).is_none(), "60 + 50 is over 100");
+        let b = bytes.try_charge(40).expect("60 + 40 fits exactly");
+        assert_eq!(bytes.held(), 100);
+        drop(a);
+        drop(b);
+        assert_eq!(bytes.held(), 0, "charges are released on drop");
+        let big = bytes
+            .try_charge(500)
+            .expect("one oversized request when empty");
+        assert!(bytes.try_charge(1).is_none());
+        drop(big);
+        assert_eq!(bytes.held(), 0);
+    }
+
+    /// The force-resume path (`sweep_expired_parks` ->
+    /// `handle_delegate_resume`) relies on claiming a PARKED delegate not
+    /// suspending, so nothing can run between `should_force_resume` and
+    /// `take_matching` (#5554).
+    ///
+    /// FALSIFY: add `tokio::task::yield_now().await;` to `claim`; this
+    /// returns `None` from `now_or_never`.
+    #[tokio::test]
+    async fn a_claim_on_a_parked_delegate_does_not_suspend() {
+        use futures::FutureExt;
+        let gate = DelegateGate::new();
+        let k = key(7);
+        let (run_claim, _) = gate.claim(&k).await;
+        let _park = gate.hold(&k);
+        drop(run_claim);
+        assert!(
+            gate.claim(&k).now_or_never().is_some(),
+            "claiming a parked delegate must complete without suspending"
+        );
     }
 
     #[tokio::test]

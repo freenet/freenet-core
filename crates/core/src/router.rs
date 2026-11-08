@@ -761,6 +761,12 @@ pub(crate) struct RouterSnapshotInfo {
     /// populated them.
     pub hosting_retractions_emitted: Option<u64>,
     pub hosting_retractions_dropped: Option<u64>,
+    /// Delegate lane refusals, lane panics and dropped inter-delegate
+    /// messages (`network_status::DelegateLaneStats`). Monotonic lifetime
+    /// totals; `None` until the ring's snapshot task has populated them.
+    pub delegate_lane_requests_refused: Option<u64>,
+    pub delegate_lane_panics: Option<u64>,
+    pub inter_delegate_messages_dropped: Option<u64>,
     /// Computed-upstream vs. stored-`is_upstream`-flag divergence counters
     /// (hosting redesign piece D, #4642 / #4671). `comparisons` is the
     /// denominator (one per `send_unsubscribe_upstream`), `divergences` the times
@@ -3575,6 +3581,9 @@ impl Router {
             // path as the consult counters above.
             hosting_retractions_emitted: None,
             hosting_retractions_dropped: None,
+            delegate_lane_requests_refused: None,
+            delegate_lane_panics: None,
+            inter_delegate_messages_dropped: None,
             // Computed-upstream vs. stored-flag divergence counters (piece D,
             // #4642 / #4671), populated by Ring from the network_status
             // singleton on the snapshot cadence.
