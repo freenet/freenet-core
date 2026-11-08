@@ -14,8 +14,12 @@ pub struct PoolHealthStatus {
     pub checked_out: usize,
     /// Total pool size (should equal available + checked_out)
     pub total: usize,
-    /// Number of executors that were replaced due to failures
+    /// Number of executors that were replaced due to failures, the delegate
+    /// executor's replacements included.
     pub replacements: usize,
+    /// Of `replacements`, how many were of the delegate executor
+    /// ([`PooledDelegateRunner`]).
+    pub delegate_replacements: usize,
     /// Number of distinct contracts currently being processed.
     /// Observability-only: the sequential event loop means this is always 0 or 1.
     pub contracts_in_flight: usize,
@@ -204,11 +208,14 @@ pub struct RuntimePool {
     /// prose hope. `Arc` so an admitted `ExportJob` can hold an owned permit
     /// across the spawned background task without borrowing the pool.
     ///
-    /// NOTE: this is EXPORT-only. The live secret IMPORT (#4592) deliberately
-    /// runs ON the contract loop (serialized with delegate `store_secret`), not
-    /// off-loop, so it takes no permit here — see the `import_secrets` impl and
-    /// the `ImportSecrets` arm in `contract.rs` for why (the store write path
-    /// assumes node-wide write serialization).
+    /// NOTE: this is EXPORT-only. The live secret IMPORT (#4592) is handled
+    /// on the contract loop and takes no permit here. What serializes it with
+    /// delegate `store_secret` is NOT the loop (since the delegate lane, the
+    /// lane runs delegates too) but the delegate executor's lock: `import_secrets`
+    /// runs under `PooledDelegateRunner::with_executor`, as every delegate
+    /// `process()` does. See the `import_secrets` impl and the `ImportSecrets`
+    /// arm in `contract.rs` (the store write path assumes node-wide write
+    /// serialization).
     export_semaphore: Arc<Semaphore>,
     /// Inactive-user reclaim sweep task (#4561, P5 of #4381). `Some` ONLY when
     /// hosted mode is on AND `per-user-inactive-ttl > 0`. The pool owns the
@@ -330,6 +337,10 @@ impl ExecutorFactory {
 pub(crate) struct PooledDelegateRunner {
     executor: tokio::sync::Mutex<Executor<Runtime>>,
     factory: ExecutorFactory,
+    /// Times the delegate executor was found unhealthy after a run and
+    /// replaced. Reported in the pool's health status, so a delegate executor
+    /// that keeps breaking is visible next to the contract executors.
+    replacements: AtomicUsize,
 }
 
 impl PooledDelegateRunner {
@@ -341,8 +352,10 @@ impl PooledDelegateRunner {
         let mut executor = self.executor.lock().await;
         let result = f(&mut executor);
         if !executor.runtime.is_healthy() {
+            let replacement_number = self.replacements.fetch_add(1, Ordering::SeqCst) + 1;
             tracing::warn!(
                 operation,
+                replacement_number,
                 "Delegate executor became unhealthy, replacing it"
             );
             match self.factory.create().await {
@@ -808,6 +821,7 @@ impl RuntimePool {
         let delegate_runner = Arc::new(PooledDelegateRunner {
             executor: tokio::sync::Mutex::new(factory.create().await?),
             factory,
+            replacements: AtomicUsize::new(0),
         });
 
         Ok(Self {
@@ -843,7 +857,8 @@ impl RuntimePool {
     pub fn health_status(&self) -> PoolHealthStatus {
         let available = self.runtimes.iter().filter(|s| s.is_some()).count();
         let checked_out = self.checked_out.load(Ordering::SeqCst);
-        let replacements = self.replacements_count.load(Ordering::SeqCst);
+        let delegate_replacements = self.delegate_runner.replacements.load(Ordering::SeqCst);
+        let replacements = self.replacements_count.load(Ordering::SeqCst) + delegate_replacements;
 
         // Check for pool degradation
         let expected_total = available + checked_out;
@@ -862,6 +877,7 @@ impl RuntimePool {
             checked_out,
             total: self.pool_size,
             replacements,
+            delegate_replacements,
             contracts_in_flight: self.in_flight_contracts.len(),
         }
     }
@@ -876,6 +892,7 @@ impl RuntimePool {
                 checked_out = status.checked_out,
                 total = status.total,
                 replacements = status.replacements,
+                delegate_replacements = status.delegate_replacements,
                 "RuntimePool health status (degraded - {} replacements)",
                 status.replacements
             );

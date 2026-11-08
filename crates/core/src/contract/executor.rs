@@ -1776,8 +1776,14 @@ pub(crate) fn declared_cache_ceiling_terms(
     let summary = summary_budget_for(memory_limit, pool_size);
     let delta = delta_budget_for(memory_limit, pool_size);
     // One wasmtime Store per executor, each holding retired-instance bytes up
-    // to its arena budget between refreshes.
-    let arena = crate::wasm_runtime::engine::store_arena_budget_for(memory_limit, pool_size);
+    // to its arena budget between refreshes. There are `pool_size + 1` such
+    // executors: the contract pool plus the ONE delegate executor
+    // (`runtime::pool::PooledDelegateRunner`) that every delegate `process()`
+    // runs on since the delegate lane. It is built by the same factory, so it
+    // gets the same per-executor arena budget.
+    // The envelope is divided across all of them (`store_arena_executors`).
+    let arena_executors = crate::wasm_runtime::engine::store_arena_executors(pool_size);
+    let arena = crate::wasm_runtime::engine::store_arena_budget_for(memory_limit, arena_executors);
 
     // NODE-WIDE — one of each, shared by every executor.
     let contract_modules = crate::wasm_runtime::budget_for_ram(memory_limit);
@@ -1835,7 +1841,7 @@ pub(crate) fn declared_cache_ceiling_terms(
         // pool 2).
         ("summary_budget_for", pool_size * summary),
         ("delta_budget_for", pool_size * delta),
-        ("store_arena_budget_for", pool_size * arena),
+        ("store_arena_budget_for", arena_executors * arena),
         ("budget_for_ram", contract_modules),
         // Labelled by the DIVISOR because the delegate module cache has no
         // budget function of its own: it is a fraction of the contract module
@@ -2376,21 +2382,30 @@ mod tests {
                 .map(|(_, bytes)| *bytes)
                 .unwrap_or_else(|| panic!("`{label}` must be a summed term"))
         };
-        for (label, per_executor) in [
-            ("summary_budget_for", summary_budget_for(ONE_GIB, POOL)),
-            ("delta_budget_for", delta_budget_for(ONE_GIB, POOL)),
+        // The Store arena is held by every EXECUTOR, and there is one more
+        // executor than the pool: the delegate executor every delegate
+        // `process()` runs on (`PooledDelegateRunner`). Counting only the pool
+        // leaves that arena out of the aggregate.
+        for (label, per_executor, executors) in [
+            (
+                "summary_budget_for",
+                summary_budget_for(ONE_GIB, POOL),
+                POOL,
+            ),
+            ("delta_budget_for", delta_budget_for(ONE_GIB, POOL), POOL),
             (
                 "store_arena_budget_for",
-                crate::wasm_runtime::engine::store_arena_budget_for(ONE_GIB, POOL),
+                crate::wasm_runtime::engine::store_arena_budget_for(ONE_GIB, POOL + 1),
+                POOL + 1,
             ),
         ] {
             assert_eq!(
                 value(&terms, label),
-                POOL * per_executor,
+                executors * per_executor,
                 "`{label}` is PER-EXECUTOR, so the aggregate must count \
-                 `pool_size` of them. Declaring one copy of a budget the node \
-                 commits {POOL} times is #5268's defect 3, and it hides memory \
-                 from the aggregate-safety checks"
+                 {executors} of them at pool size {POOL}. Declaring fewer copies \
+                 of a budget than the node commits is #5268's defect 3, and it \
+                 hides memory from the aggregate-safety checks"
             );
         }
 

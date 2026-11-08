@@ -399,7 +399,19 @@ const STORE_ARENA_MAX_BYTES: usize = 256 * 1024 * 1024;
 fn store_arena_budget_bytes() -> usize {
     let total_ram =
         crate::wasm_runtime::read_total_ram_bytes().unwrap_or(STORE_ARENA_FALLBACK_TOTAL_RAM_BYTES);
-    store_arena_budget_for(total_ram, crate::config::runtime_pool_size().into())
+    store_arena_budget_for(
+        total_ram,
+        store_arena_executors(crate::config::runtime_pool_size().into()),
+    )
+}
+
+/// Executors that each own a wasmtime Store for a pool of `pool_size`: the
+/// contract pool plus the ONE delegate executor every delegate `process()`
+/// runs on (`contract::executor::runtime::pool::PooledDelegateRunner`). The
+/// arena envelope is divided across all of them, so adding the delegate
+/// executor did not add an arena on top of the envelope.
+pub(crate) fn store_arena_executors(pool_size: usize) -> usize {
+    pool_size + 1
 }
 
 /// Pure sizing math behind [`store_arena_budget_bytes`], split out so

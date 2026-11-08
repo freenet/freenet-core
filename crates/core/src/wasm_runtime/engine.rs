@@ -35,7 +35,7 @@ mod wasmtime_engine;
 /// `contract::executor::declared_cache_ceiling`, which is test-only since #5647
 /// (it feeds `cache_byte_budgets_are_aggregate_safe`).
 #[cfg(all(feature = "wasmtime-backend", test))]
-pub(crate) use wasmtime_engine::store_arena_budget_for;
+pub(crate) use wasmtime_engine::{store_arena_budget_for, store_arena_executors};
 
 use super::ContractError;
 use super::runtime::RuntimeConfig;
