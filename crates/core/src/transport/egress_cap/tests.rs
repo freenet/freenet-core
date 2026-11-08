@@ -2003,3 +2003,88 @@ fn a_refused_re_poll_that_withdraws_its_admission_wakes_the_next_waiter() {
         "and the next waiter is woken to look again"
     );
 }
+
+/// Retransmits get at most their share of the rate: they may take
+/// `RETX_SHARE_WINDOW` of the share at once, then only as fast as the share
+/// refills, while the main bucket, refilled faster than they send, has room
+/// for more. First copies keep the rest. A refused retransmit takes nothing
+/// from the main bucket.
+#[test]
+fn retransmits_hold_to_their_share_of_the_rate() {
+    use super::{RETX_SHARE_PERCENT, RETX_SHARE_WINDOW};
+    let rate = 10 * RATE;
+    let (cap, time) = cap_at(rate);
+    let share_rate = rate * RETX_SHARE_PERCENT / 100;
+    // Each step refills the main bucket by 2000 B, more than a datagram, so
+    // it never refuses; the share refills by 1000 B, less than one.
+    let step = Duration::from_micros(200);
+    let start = time.now_nanos();
+    let mut taken = 0u64;
+    loop {
+        time.advance(step);
+        match cap.try_take_retransmit(PACKET) {
+            Ok(take) => {
+                take.sent(PACKET);
+                taken += 1;
+            }
+            Err(_) => break,
+        }
+        assert!(taken < 100_000, "the share never refused");
+    }
+    let elapsed = Duration::from_nanos(time.now_nanos() - start);
+    let allowed = share_rate * RETX_SHARE_WINDOW.as_millis() as u64 / 1000
+        + share_rate * elapsed.as_micros() as u64 / 1_000_000;
+    let sent = taken * PACKET as u64;
+    assert!(
+        sent <= allowed && sent + 2 * PACKET as u64 >= allowed,
+        "retransmits sent {sent} B, the share allows {allowed} B over {elapsed:?}"
+    );
+    assert!(
+        sent < rate * elapsed.as_micros() as u64 / 1_000_000,
+        "the main bucket would have allowed more: the share refused"
+    );
+    let level = cap.level_bytes();
+    assert!(
+        cap.try_take_retransmit(PACKET).is_err(),
+        "still over the share"
+    );
+    assert_eq!(
+        cap.level_bytes(),
+        level,
+        "a refused retransmit takes nothing"
+    );
+}
+
+/// A retransmit may put the bucket into debt up to `RETX_DEBT_LIMIT` and no
+/// further: past it the take is refused with the time until it fits, takes
+/// nothing, and nothing is forgiven. Taken, it is recorded as an unpaced
+/// send, as retransmits were before they were capped.
+#[test]
+fn a_retransmit_takes_up_to_its_debt_limit_and_nothing_is_forgiven() {
+    let (cap, time) = cap_at(RATE);
+    // 100 ms at 1 MB/s: 100 000 bytes of debt.
+    assert_eq!(RETX_DEBT_LIMIT, Duration::from_millis(100));
+    cap.charge_unpaced(BURST as usize + 99_000);
+    assert_eq!(cap.level_bytes(), -99_000);
+    let wait = match cap.try_take_retransmit(PACKET) {
+        Ok(_) => panic!("1 200 bytes more would be 100 200 bytes of debt"),
+        Err(wait) => wait,
+    };
+    assert_eq!(wait, Duration::from_micros(200), "200 bytes over the limit");
+    assert_eq!(
+        cap.level_bytes(),
+        -99_000,
+        "a refused retransmit takes nothing"
+    );
+
+    time.advance(wait);
+    let take = cap.try_take_retransmit(PACKET).expect("fits now");
+    take.sent(PACKET);
+    assert_eq!(
+        cap.level_bytes(),
+        -100_000,
+        "debt at the limit, not past it"
+    );
+    assert_eq!(cap.stats().forgiven_bytes, 0);
+    assert_eq!(count(&cap, EgressDecision::Unpaced), 2);
+}
