@@ -329,7 +329,57 @@ const IDLE_SECS: u64 = 180;
 #[derive(Debug)]
 struct ReverseLossReport {
     completed_after: Option<Duration>,
+    /// At the end of the idle time.
     probe: CongestionProbe,
+    /// At the idle point (the last stream done, failed or out of time).
+    at_idle: CongestionProbe,
+    /// Flight [`IDLE_SECS`] after the idle point (the old gate's reading).
+    flight_at_idle_check: usize,
+    /// The largest rise in flight between two one-second readings after the
+    /// idle point.
+    flight_rise: usize,
+    /// How long after the idle point flight first read zero.
+    drained_after: Option<Duration>,
+    /// The longest the abandonment rules allow flight to take to drain
+    /// ([`flight_drain_bound`]), from the state at the idle point.
+    drain_bound: Duration,
+    /// A connection closed during the idle time.
+    closed: bool,
+}
+
+/// The longest flight left at the idle point can take to drain under the
+/// abandonment rules, with retransmits capped at `rate` (derivation in
+/// RETX-CAP-DESIGN.md, "Receipt-loss flight bound"). Nothing new is sent
+/// after the idle point, so flight leaves only by receipt or abandonment.
+/// A packet tracked at the idle point has at most `M` =
+/// `MAX_PACKET_RETRANSMITS` resends left before the expiry that abandons it,
+/// so `M + 1` expiry intervals. Each interval is at most:
+/// - the effective RTO, capped at `MAX_EFFECTIVE_RTO` whatever the backoff;
+/// - plus one probe timeout, since a probe that goes refreshes the send time
+///   (its own, or that of a probed packet ahead of it in the queue);
+/// - plus the wait for admission, which across all intervals is at most the
+///   retransmits still possible, `M x pending x MAX_PACKET_SIZE`, at the
+///   retransmit share of the rate, plus one deferral floor and one resend
+///   yield per interval.
+///
+/// Abandonments are free on the cap but count against
+/// `MAX_RESENDS_PER_ITERATION`, so they add `pending /
+/// MAX_RESENDS_PER_ITERATION` resend yields. `probe_timeout` is the largest
+/// read during the run, since an RTT sample can raise it.
+fn flight_drain_bound(pending: usize, probe_timeout: Duration, rate: u64) -> Duration {
+    use crate::transport::egress_cap::{RETX_DEFER_MIN, RETX_SHARE_PERCENT};
+    use crate::transport::packet_data::MAX_PACKET_SIZE;
+    use crate::transport::peer_connection::{MAX_RESENDS_PER_ITERATION, RESEND_YIELD_DELAY};
+    use crate::transport::sent_packet_tracker::{MAX_EFFECTIVE_RTO, MAX_PACKET_RETRANSMITS};
+    let m = u64::from(MAX_PACKET_RETRANSMITS);
+    let intervals = u32::try_from(m + 1).expect("small");
+    let per_interval = MAX_EFFECTIVE_RTO + probe_timeout + RETX_DEFER_MIN + RESEND_YIELD_DELAY;
+    let share_rate = rate * RETX_SHARE_PERCENT / 100;
+    let admission_bytes = m * pending as u64 * MAX_PACKET_SIZE as u64;
+    let admission = Duration::from_secs_f64(admission_bytes as f64 / share_rate as f64);
+    let abandon_yields =
+        u32::try_from(pending.div_ceil(MAX_RESENDS_PER_ITERATION)).unwrap_or(u32::MAX);
+    per_interval * intervals + admission + RESEND_YIELD_DELAY * abandon_yields
 }
 
 /// One connection, fast links both ways, three back-to-back `payload_len`
@@ -414,26 +464,66 @@ async fn run_reverse_loss(
             }
         }
     }
-    // `FREENET_RECEIPT_IDLE_SECS` overrides the idle time, to explore.
-    let idle_secs = std::env::var("FREENET_RECEIPT_IDLE_SECS")
+    // Read flight once a second from the idle point: until it drains and
+    // the old check's IDLE_SECS have passed, or until the drain bound (with
+    // the largest probe timeout seen) has passed. `FREENET_RECEIPT_IDLE_SECS`
+    // sets a fixed idle time instead, to explore.
+    let fixed_idle = std::env::var("FREENET_RECEIPT_IDLE_SECS")
         .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(IDLE_SECS);
-    let mut idle = vt.sleep(Duration::from_secs(idle_secs));
-    loop {
-        tokio::select! {
-            biased;
-            r = conn_b.recv() => if r.is_err() { break; },
-            r = conn_a.recv() => if r.is_err() { break; },
-            _ = &mut idle => break,
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(Duration::from_secs);
+    let rate = cap.rate().expect("the receipt-loss row runs with a cap");
+    let at_idle = conn_a.congestion_probe();
+    let idle_start = vt.now_nanos();
+    let mut probe_timeout = at_idle.probe_timeout.unwrap_or_default();
+    let mut last_flight = at_idle.flightsize;
+    let mut flight_rise = 0;
+    let mut flight_at_idle_check = None;
+    let mut drained_after = (last_flight == 0).then_some(Duration::ZERO);
+    let mut closed = false;
+    let mut probe = at_idle;
+    'idle: loop {
+        let elapsed = Duration::from_nanos(vt.now_nanos() - idle_start);
+        let bound = flight_drain_bound(at_idle.pending_packets, probe_timeout, rate);
+        let done = match fixed_idle {
+            Some(fixed) => elapsed >= fixed,
+            None => (drained_after.is_some() && flight_at_idle_check.is_some()) || elapsed >= bound,
+        };
+        if done {
+            break;
+        }
+        let mut tick = vt.sleep(Duration::from_secs(1));
+        loop {
+            tokio::select! {
+                biased;
+                r = conn_b.recv() => if r.is_err() { closed = true; break 'idle; },
+                r = conn_a.recv() => if r.is_err() { closed = true; break 'idle; },
+                _ = &mut tick => break,
+            }
+        }
+        probe = conn_a.congestion_probe();
+        probe_timeout = probe_timeout.max(probe.probe_timeout.unwrap_or_default());
+        flight_rise = flight_rise.max(probe.flightsize.saturating_sub(last_flight));
+        last_flight = probe.flightsize;
+        let elapsed = Duration::from_nanos(vt.now_nanos() - idle_start);
+        if probe.flightsize == 0 && drained_after.is_none() {
+            drained_after = Some(elapsed);
+        }
+        if elapsed >= Duration::from_secs(IDLE_SECS) && flight_at_idle_check.is_none() {
+            flight_at_idle_check = Some(probe.flightsize);
         }
     }
-    let probe = conn_a.congestion_probe();
     driver.abort();
     drop((peer_a, peer_b));
     ReverseLossReport {
         completed_after,
         probe,
+        at_idle,
+        flight_at_idle_check: flight_at_idle_check.unwrap_or(probe.flightsize),
+        flight_rise,
+        drained_after,
+        drain_bound: flight_drain_bound(at_idle.pending_packets, probe_timeout, rate),
+        closed,
     }
 }
 
@@ -442,8 +532,13 @@ async fn run_reverse_loss(
 /// every data packet arrives (the case that sank #6100's ACK-clocked credit).
 /// With the cap above the stream rate (FixedRate's 1.25 MB/s) and at it,
 /// capped retransmits must deliver no later than main (with 10% slack for
-/// timer granularity), fail no more streams, and leave no more in flight after
-/// the idle time.
+/// timer granularity) and fail no more streams. Flight left at the idle point
+/// must never rise and must drain within the bound the abandonment rules set
+/// ([`flight_drain_bound`]): the check is for flight that never drains
+/// (`fix-6100`'s held resends). Capping retransmits slows the abandonment,
+/// which counts resends, so flight that main's failed stream released at
+/// once can still be draining at the old fixed 180 s reading; that reading
+/// is printed but not judged.
 #[test]
 fn receipt_loss_under_a_cap_matches_or_beats_main() {
     let mut failures = Vec::new();
@@ -477,10 +572,18 @@ fn receipt_loss_under_a_cap_matches_or_beats_main() {
                 let capped = run(Cap::Capped(rate));
                 let line = |label: &str, r: &ReverseLossReport| {
                     format!(
-                        "{label}: done after {:?}, {} B in flight after {IDLE_SECS} s idle, {} RTO, \
-                     {} retransmits, {} deferred, {} abandoned, {} streams failed",
+                        "{label}: done after {:?}, {} B ({} packets) in flight at idle, {} B after \
+                     {IDLE_SECS} s idle, drained after {:?} (bound {:?}), largest rise {} B, \
+                     closed {}, {} RTO, {} retransmits, {} deferred, {} abandoned, \
+                     {} streams failed",
                         r.completed_after,
-                        r.probe.flightsize,
+                        r.at_idle.flightsize,
+                        r.at_idle.pending_packets,
+                        r.flight_at_idle_check,
+                        r.drained_after,
+                        r.drain_bound,
+                        r.flight_rise,
+                        r.closed,
                         r.probe.rto_expiries,
                         r.probe.retransmissions,
                         r.probe.retransmits_deferred,
@@ -499,9 +602,20 @@ fn receipt_loss_under_a_cap_matches_or_beats_main() {
                     (Some(_), None) => true,
                     (None, _) => false,
                 };
+                // The old flight condition, printed for comparison only.
+                let old_flight_fails =
+                    capped.flight_at_idle_check > main.flight_at_idle_check.max(64 * 1024);
+                let undrained = capped.closed
+                    || capped.flight_rise > 0
+                    || capped.drained_after.is_none_or(|d| d > capped.drain_bound);
+                eprintln!(
+                    "  flight: old condition {}, derived bound {}",
+                    if old_flight_fails { "FAILS" } else { "passes" },
+                    if undrained { "FAILS" } else { "passes" },
+                );
                 if late
                     || capped.probe.outbound_streams_failed > main.probe.outbound_streams_failed
-                    || capped.probe.flightsize > main.probe.flightsize.max(64 * 1024)
+                    || undrained
                 {
                     failures.push(summary);
                 }

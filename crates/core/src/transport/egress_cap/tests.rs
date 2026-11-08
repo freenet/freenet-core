@@ -2054,3 +2054,37 @@ fn retransmits_hold_to_their_share_of_the_rate() {
         "a refused retransmit takes nothing"
     );
 }
+
+/// A retransmit may put the bucket into debt up to `RETX_DEBT_LIMIT` and no
+/// further: past it the take is refused with the time until it fits, takes
+/// nothing, and nothing is forgiven. Taken, it is recorded as an unpaced
+/// send, as retransmits were before they were capped.
+#[test]
+fn a_retransmit_takes_up_to_its_debt_limit_and_nothing_is_forgiven() {
+    let (cap, time) = cap_at(RATE);
+    // 100 ms at 1 MB/s: 100 000 bytes of debt.
+    assert_eq!(RETX_DEBT_LIMIT, Duration::from_millis(100));
+    cap.charge_unpaced(BURST as usize + 99_000);
+    assert_eq!(cap.level_bytes(), -99_000);
+    let wait = match cap.try_take_retransmit(PACKET) {
+        Ok(_) => panic!("1 200 bytes more would be 100 200 bytes of debt"),
+        Err(wait) => wait,
+    };
+    assert_eq!(wait, Duration::from_micros(200), "200 bytes over the limit");
+    assert_eq!(
+        cap.level_bytes(),
+        -99_000,
+        "a refused retransmit takes nothing"
+    );
+
+    time.advance(wait);
+    let take = cap.try_take_retransmit(PACKET).expect("fits now");
+    take.sent(PACKET);
+    assert_eq!(
+        cap.level_bytes(),
+        -100_000,
+        "debt at the limit, not past it"
+    );
+    assert_eq!(cap.stats().forgiven_bytes, 0);
+    assert_eq!(count(&cap, EgressDecision::Unpaced), 2);
+}

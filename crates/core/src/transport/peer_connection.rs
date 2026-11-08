@@ -108,6 +108,16 @@ const SIMULATION_ACK_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 const SIMULATION_RESEND_CHECK_INTERVAL: Duration = Duration::from_millis(50);
 const SIMULATION_RESEND_YIELD_DELAY: Duration = Duration::from_millis(10);
 
+/// The most resends (and abandonments) the recv loop's resend arm handles in
+/// one iteration, so it cannot monopolise the select loop; the rest wait
+/// [`RESEND_YIELD_DELAY`] (see the top of the loop), so inbound branches can
+/// interleave.
+pub(in crate::transport) const MAX_RESENDS_PER_ITERATION: usize = 4;
+
+/// How long the resend arm yields after [`MAX_RESENDS_PER_ITERATION`],
+/// outside simulation.
+pub(in crate::transport) const RESEND_YIELD_DELAY: Duration = Duration::from_millis(2);
+
 /// An inbound packet as the listener hands it to an established connection,
 /// with the time the listener queued it (nanoseconds from the listener's
 /// `TimeSource`, the same clock the connection's `time_source` reads).
@@ -344,6 +354,10 @@ pub(crate) struct CongestionProbe {
     pub retransmissions: u32,
     /// RTO resends the node-wide egress cap deferred.
     pub retransmits_deferred: u32,
+    /// Packets the sent-packet tracker still waits on a receipt for.
+    pub pending_packets: usize,
+    /// The tail-loss probe timeout; `None` before the first RTT sample.
+    pub probe_timeout: Option<Duration>,
 }
 
 /// The `PeerConnection` struct is responsible for managing the connection with a remote peer.
@@ -878,7 +892,7 @@ impl<T: TimeSource> RecvTimers<T> {
             resend_yield: if in_simulation {
                 SIMULATION_RESEND_YIELD_DELAY
             } else {
-                Duration::from_millis(2)
+                RESEND_YIELD_DELAY
             },
         }
     }
@@ -2394,10 +2408,6 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                     }
                     self.recv_timers.resend.poll_fire(cx)
                 }) => {
-                    // Bound retransmissions per iteration to prevent monopolizing the
-                    // select loop. Remaining resends are deferred by a short sleep
-                    // (see top of loop) so inbound branches can interleave.
-                    const MAX_RESENDS_PER_ITERATION: usize = 4;
                     let mut resend_count = 0;
                     loop {
                         tracing::trace!(
@@ -2731,6 +2741,8 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             outbound_streams_failed: self.telemetry_test_counts.outbound_streams_failed,
             retransmissions: self.telemetry_test_counts.retransmissions,
             retransmits_deferred: self.telemetry_test_counts.retransmits_deferred,
+            pending_packets: tracker.pending_len(),
+            probe_timeout: tracker.probe_timeout(),
         }
     }
 
