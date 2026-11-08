@@ -83,6 +83,32 @@ const APPLICATION: &str = "Freenet";
 
 const FREENET_GATEWAYS_INDEX: &str = "https://freenet.org/keys/gateways.toml";
 
+/// Official gateways compiled into the binary as `("host:port", hex X25519
+/// public key)`, mirroring [`FREENET_GATEWAYS_INDEX`]. The address is spelled
+/// exactly as the index spells it (`hostname = "..."`), because entries are
+/// deduplicated against the cached index by [`Address`] equality and
+/// `Address::Hostname` never equals the same gateway as `Address::Host`.
+///
+/// Used only when the remote index was fetched and returned nothing, merged
+/// AFTER the on-disk `gateways.toml` cache (the cache wins on an address
+/// collision). A successful fetch never consults this list, so the remote index
+/// stays authoritative and a gateway is still retired by editing the index.
+///
+/// Without it, a first boot with the index unreachable refuses to start, and a
+/// node holding an old cache never learns a gateway added since. When a gateway
+/// is added to the index, add it here too: a list whose entries all share one
+/// host does not survive that host's outage.
+const FALLBACK_GATEWAYS: &[(&str, &str)] = &[
+    (
+        "gw1.freenet.org:31337",
+        "25836988b1d2449f7971a3c553dc896619a170d9c6ad46e75c2443778d70585a",
+    ),
+    (
+        "gw2.freenet.org:31338",
+        "a7e93b2b0f6c353a66a115b618547bcb739353f4640f1431cae91833beaf690c",
+    ),
+];
+
 #[derive(clap::Parser, Debug, Clone)]
 pub struct ConfigArgs {
     /// Node operation mode. Default is network mode.
@@ -801,7 +827,8 @@ impl ConfigArgs {
 
     /// Parse the command line arguments and return the configuration.
     pub async fn build(self) -> anyhow::Result<Config> {
-        self.build_with_gateways_index(FREENET_GATEWAYS_INDEX).await
+        self.build_with_gateway_sources(FREENET_GATEWAYS_INDEX, FALLBACK_GATEWAYS)
+            .await
     }
 
     /// Build the configuration, fetching the remote gateway index from
@@ -811,7 +838,22 @@ impl ConfigArgs {
     /// [`FREENET_GATEWAYS_INDEX`] constant. Tests inject a local mock-server
     /// URL so the remote-fetch path is exercised deterministically without
     /// reaching out to `freenet.org` (which would be slow and flaky in CI).
-    async fn build_with_gateways_index(mut self, gateways_index: &str) -> anyhow::Result<Config> {
+    ///
+    /// Uses NO compiled-in fallback gateways, so a test that drives the fetch
+    /// into failure never ends up dialing the production gateways.
+    #[cfg(test)]
+    async fn build_with_gateways_index(self, gateways_index: &str) -> anyhow::Result<Config> {
+        self.build_with_gateway_sources(gateways_index, &[]).await
+    }
+
+    /// Build the configuration from the remote index at `gateways_index`,
+    /// with `fallback_gateways` (see [`FALLBACK_GATEWAYS`]) merged in after
+    /// the on-disk cache when that fetch returns nothing.
+    async fn build_with_gateway_sources(
+        mut self,
+        gateways_index: &str,
+        fallback_gateways: &[(&str, &str)],
+    ) -> anyhow::Result<Config> {
         let cfg = if let Some(path) = self.config_paths.config_dir.as_ref() {
             if !path.exists() {
                 return Err(anyhow::Error::new(std::io::Error::new(
@@ -1334,6 +1376,17 @@ impl ConfigArgs {
                 );
             }
 
+            // The compiled-in list stands in for the remote index, so it is
+            // used exactly when the index was asked and gave nothing — never
+            // under --skip-load-from-network, whose isolated networks must not
+            // learn the production gateways. It is merged after the cache
+            // below, so a cached entry wins on an address collision.
+            let fallback = if remote_fetch_failed && mode == OperationMode::Network {
+                compiled_fallback_gateways(fallback_gateways, &config_paths.secrets_dir(mode))?
+            } else {
+                Gateways::default()
+            };
+
             let mut gateways = match File::open(&*gateways_file) {
                 Ok(mut file) => {
                     let mut content = String::new();
@@ -1367,6 +1420,7 @@ impl ConfigArgs {
                         && !self.network_api.is_gateway
                         && mode == OperationMode::Network
                         && remotely_loaded_gateways.gateways.is_empty()
+                        && fallback.gateways.is_empty()
                         && !has_cli_gateways
                     {
                         let hint = if remote_fetch_failed {
@@ -1389,7 +1443,8 @@ impl ConfigArgs {
                             hint,
                         )));
                     }
-                    if remotely_loaded_gateways.gateways.is_empty() {
+                    if remotely_loaded_gateways.gateways.is_empty() && fallback.gateways.is_empty()
+                    {
                         tracing::warn!("No gateways file found, initializing disjoint gateway");
                     }
                     Gateways { gateways: vec![] }
@@ -1398,6 +1453,16 @@ impl ConfigArgs {
 
             if !remotely_loaded_gateways.gateways.is_empty() {
                 gateways.merge_and_deduplicate(remotely_loaded_gateways);
+            }
+
+            if !fallback.gateways.is_empty() {
+                let before = gateways.gateways.len();
+                gateways.merge_and_deduplicate(fallback);
+                tracing::info!(
+                    added = gateways.gateways.len() - before,
+                    total = gateways.gateways.len(),
+                    "Remote gateway index unavailable; added compiled-in fallback gateways"
+                );
             }
 
             gateways
@@ -2595,6 +2660,40 @@ pub struct InlineGwConfig {
 
     /// Optional location of the gateway. Necessary for deterministic testing.
     pub location: Option<f64>,
+}
+
+/// Turn `("host:port", hex key)` entries (see [`FALLBACK_GATEWAYS`]) into
+/// gateway configs, writing each key to `secrets_dir` where `NodeConfig` reads
+/// gateway keys from.
+///
+/// An entry with a malformed key is a build defect, not an operator error, so
+/// it is skipped with an error log rather than refusing to start: the node may
+/// still have the cache or other entries to bootstrap from. The
+/// `fallback_gateways_are_well_formed` test keeps the shipped list clean.
+fn compiled_fallback_gateways(
+    entries: &[(&str, &str)],
+    secrets_dir: &Path,
+) -> anyhow::Result<Gateways> {
+    let mut gateways = Vec::with_capacity(entries.len());
+    for &(hostname, key_hex) in entries {
+        if !matches!(hex::decode(key_hex), Ok(bytes) if bytes.len() == 32) {
+            tracing::error!(
+                hostname,
+                "Compiled-in fallback gateway has an invalid public key; skipping it"
+            );
+            continue;
+        }
+        fs::create_dir_all(secrets_dir)?;
+        // Hex-encode the address so the filename is safe on every platform.
+        let key_path = secrets_dir.join(format!("fallback_gw_{}.pub", hex::encode(hostname)));
+        fs::write(&key_path, key_hex)?;
+        gateways.push(GatewayConfig {
+            address: Address::Hostname(hostname.to_string()),
+            public_key_path: key_path,
+            location: None,
+        });
+    }
+    Ok(Gateways { gateways })
 }
 
 /// Parse a `--gateway` value in the format "ip:port,hex-pubkey".
@@ -11589,6 +11688,246 @@ shutdown-drain-secs = 42
             cfg.gateways.is_empty(),
             "disjoint peer should start with no gateways, got {:?}",
             cfg.gateways
+        );
+    }
+
+    /// A gateway index server that answers every request with HTTP 500: the
+    /// shape of the index host being down, as opposed to serving an empty file.
+    fn failing_gateways_index_server() -> (Server, String) {
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(request::method("GET"))
+                .times(..)
+                .respond_with(status_code(500)),
+        );
+        let url = server.url_str("/gateways.toml");
+        (server, url)
+    }
+
+    fn random_key_hex() -> String {
+        hex::encode(TransportKeypair::new().public().as_bytes())
+    }
+
+    /// Non-gateway network-mode args rooted at `dir`, with no public identity
+    /// (so `peer_id == None`, the ordinary NAT'd peer).
+    fn plain_peer_args(dir: &Path) -> ConfigArgs {
+        ConfigArgs {
+            mode: Some(OperationMode::Network),
+            config_paths: ConfigPathsArgs {
+                config_dir: Some(dir.to_path_buf()),
+                data_dir: Some(dir.to_path_buf()),
+                log_dir: Some(dir.to_path_buf()),
+            },
+            network_api: NetworkArgs {
+                is_gateway: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn write_cached_gateways(dir: &Path, entries: &[(&str, &str)]) {
+        let gateways = entries
+            .iter()
+            .map(|(hostname, key_file)| GatewayConfig {
+                address: Address::Hostname(hostname.to_string()),
+                public_key_path: dir.join(key_file),
+                location: None,
+            })
+            .collect();
+        fs::write(
+            dir.join("gateways.toml"),
+            toml::to_string(&Gateways { gateways }).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// The first-boot outage case: the index is unreachable and no
+    /// `gateways.toml` cache exists yet. On main the peer refused to start
+    /// ("Cannot initialize node without gateways"); with a compiled-in list it
+    /// starts with those gateways and keeps retrying them. Covers both an index
+    /// that errors and one that serves nothing.
+    #[tokio::test]
+    async fn first_boot_with_index_down_uses_compiled_fallback_gateways() {
+        for (label, (_server, index_url)) in [
+            ("HTTP 500", failing_gateways_index_server()),
+            ("empty body", empty_gateways_index_server()),
+        ] {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let dir = temp_dir.path();
+            assert!(!dir.join("gateways.toml").exists());
+            let key = random_key_hex();
+            let fallback = [("gw-a.example:31337", key.as_str())];
+
+            let cfg = plain_peer_args(dir)
+                .build_with_gateway_sources(&index_url, &fallback)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("{label}: a peer with a compiled-in fallback must start: {e}")
+                });
+
+            assert_eq!(
+                cfg.gateways.iter().map(|g| &g.address).collect::<Vec<_>>(),
+                vec![&Address::Hostname("gw-a.example:31337".to_string())],
+                "{label}"
+            );
+            assert_eq!(
+                fs::read_to_string(&cfg.gateways[0].public_key_path).unwrap(),
+                key,
+                "{label}: the fallback key must be written where NodeConfig reads it"
+            );
+        }
+    }
+
+    /// With an older cache on disk, the compiled-in list adds the gateways the
+    /// cache lacks (e.g. one added to the index after the cache was written)
+    /// and never displaces a cached entry: on an address collision the
+    /// cache's entry, with its key, wins.
+    #[tokio::test]
+    async fn index_down_merges_compiled_fallback_after_cache() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dir = temp_dir.path();
+        write_cached_gateways(dir, &[("gw-a.example:31337", "cached_a.pub")]);
+        let (_server, index_url) = failing_gateways_index_server();
+        let key_a_compiled = random_key_hex();
+        let key_b = random_key_hex();
+        let fallback = [
+            ("gw-a.example:31337", key_a_compiled.as_str()),
+            ("gw-b.example:31338", key_b.as_str()),
+        ];
+
+        let cfg = plain_peer_args(dir)
+            .build_with_gateway_sources(&index_url, &fallback)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            cfg.gateways.iter().map(|g| &g.address).collect::<Vec<_>>(),
+            vec![
+                &Address::Hostname("gw-a.example:31337".to_string()),
+                &Address::Hostname("gw-b.example:31338".to_string()),
+            ]
+        );
+        assert_eq!(
+            cfg.gateways[0].public_key_path,
+            dir.join("cached_a.pub"),
+            "the cached entry must win the collision, not the compiled-in one"
+        );
+        assert_eq!(
+            fs::read_to_string(&cfg.gateways[1].public_key_path).unwrap(),
+            key_b
+        );
+    }
+
+    /// A successful fetch is authoritative: the compiled-in list is not
+    /// merged, so retiring a gateway from the index still retires it.
+    #[tokio::test]
+    async fn successful_index_fetch_ignores_compiled_fallback() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dir = temp_dir.path();
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(request::path("/gateways.toml")).respond_with(
+                status_code(200).body(
+                    r#"
+                    [[gateways]]
+                    public_key = "keys/gw-c.pub"
+
+                    [gateways.address]
+                    hostname = "gw-c.example:31337"
+                    "#,
+                ),
+            ),
+        );
+        server.expect(
+            Expectation::matching(request::path("/keys/gw-c.pub"))
+                .respond_with(status_code(200).body(random_key_hex())),
+        );
+        let index_url = server.url_str("/gateways.toml");
+        let key_b = random_key_hex();
+        let fallback = [("gw-b.example:31338", key_b.as_str())];
+
+        let cfg = plain_peer_args(dir)
+            .build_with_gateway_sources(&index_url, &fallback)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            cfg.gateways.iter().map(|g| &g.address).collect::<Vec<_>>(),
+            vec![&Address::Hostname("gw-c.example:31337".to_string())]
+        );
+    }
+
+    /// `--skip-load-from-network` runs isolated networks from the on-disk file
+    /// alone; the compiled-in production gateways must never leak into them.
+    #[tokio::test]
+    async fn skip_load_from_network_never_uses_compiled_fallback() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dir = temp_dir.path();
+        write_cached_gateways(dir, &[("gw-a.example:31337", "cached_a.pub")]);
+        let mut args = plain_peer_args(dir);
+        args.network_api.skip_load_from_network = true;
+        let key_b = random_key_hex();
+        let fallback = [("gw-b.example:31338", key_b.as_str())];
+
+        let cfg = args
+            .build_with_gateway_sources("http://127.0.0.1:9/unused", &fallback)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            cfg.gateways.iter().map(|g| &g.address).collect::<Vec<_>>(),
+            vec![&Address::Hostname("gw-a.example:31337".to_string())]
+        );
+    }
+
+    /// A malformed compiled-in key skips that entry rather than failing
+    /// startup, and the well-formed entries are still used.
+    #[test]
+    fn compiled_fallback_skips_entries_with_invalid_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = random_key_hex();
+        let entries = [
+            ("bad-hex.example:1", "not hex"),
+            ("short.example:2", "abcd"),
+            ("good.example:3", good.as_str()),
+        ];
+        let gateways = compiled_fallback_gateways(&entries, dir.path()).unwrap();
+        assert_eq!(
+            gateways
+                .gateways
+                .iter()
+                .map(|g| &g.address)
+                .collect::<Vec<_>>(),
+            vec![&Address::Hostname("good.example:3".to_string())]
+        );
+    }
+
+    /// The shipped list: non-empty, every key a 32-byte X25519 key, every
+    /// address `host:port` with a valid port, and no address listed twice.
+    #[test]
+    fn fallback_gateways_are_well_formed() {
+        assert!(!FALLBACK_GATEWAYS.is_empty());
+        let mut seen = HashSet::new();
+        for (hostname, key_hex) in FALLBACK_GATEWAYS {
+            let bytes = hex::decode(key_hex).unwrap_or_else(|e| panic!("{hostname}: {e}"));
+            assert_eq!(bytes.len(), 32, "{hostname}: key must be 32 bytes");
+            let (host, port) = hostname
+                .rsplit_once(':')
+                .unwrap_or_else(|| panic!("{hostname}: expected host:port"));
+            assert!(!host.is_empty(), "{hostname}: empty host");
+            port.parse::<u16>()
+                .unwrap_or_else(|e| panic!("{hostname}: bad port: {e}"));
+            assert!(seen.insert(*hostname), "{hostname} listed twice");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            compiled_fallback_gateways(FALLBACK_GATEWAYS, dir.path())
+                .unwrap()
+                .gateways
+                .len(),
+            FALLBACK_GATEWAYS.len(),
+            "no shipped entry may be skipped"
         );
     }
 
