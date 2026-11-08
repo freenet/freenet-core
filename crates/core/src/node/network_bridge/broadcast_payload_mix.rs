@@ -719,15 +719,16 @@ struct Window {
     applies: [[u64; 2]; ApplyOrigin::COUNT],
 
     /// Node-wide [`PropagationEvent`] counts (#6143): what each fan-out leg
-    /// actually did, the best-effort fan-out/heal events dropped before they
-    /// started, and the receiver's pre-merge skips. The per-contract split
-    /// is in the `update_propagation_summary` INFO line; this is the
-    /// fleet-queryable copy.
+    /// actually did, how the transport carried it, the best-effort
+    /// fan-out/heal events dropped before they started, and the receiver's
+    /// pre-merge skips. The per-contract split is in the
+    /// `update_propagation_summary` INFO line; this is the fleet-queryable
+    /// copy.
     ///
     /// Not the same count as `delta_sends` / the full-state arms above. Those
     /// count a full-state STREAM when it completes; `prop_sent_full` counts it
-    /// when it is handed to the bridge, and `prop_stream_undelivered` counts
-    /// the ones that then never completed.
+    /// when it is handed to the bridge, and the `prop_wire_stream_*` fields
+    /// count how each stream then ended.
     propagation_events: [u64; PropagationEvent::COUNT],
     /// Contracts the propagation summary WARNed as stalled
     /// (`update_propagation_stalled`) in the summary window that ended
