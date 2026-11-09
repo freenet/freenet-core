@@ -3008,29 +3008,38 @@ mod tests {
                 "WAKE_DATAGRAM_BYTES",
                 "egress-cap wake threshold for a QUIC datagram (a rate quantity), not memory",
             ),
-            // The QUIC flow-control windows are the same class of
-            // per-connection exception as inbound stream reassembly (see the
-            // MAX_STREAM_TOTAL_BYTES row). The memory one QUIC connection
-            // holds (some of its terms are measured in quic::config) is NOT
-            // accounted in this aggregate,
-            // and must be before QUIC carries data by default (Step 3 at 100%,
-            // a gate in the #5940 rollout plan; shadow paths carry none). It is in addition to reassembly, not covered by
-            // it.
+            // A QUIC data path's flow-control windows are set per connection
+            // from the node's buffer budget (quic::budget, quic_buffer_budget_for,
+            // listed below): these are the bounds and terms inside it, not
+            // budgets of their own.
             (
-                "connection_window_bytes",
-                "one QUIC connection's flow-control window W: a per-connection \
-                 exception like MAX_STREAM_TOTAL_BYTES; quinn holds received data \
-                 beyond W and state W does not limit (measured terms in \
-                 quic::config); not accounted here, and must be before QUIC \
-                 carries data by default",
+                "floor_window_bytes",
+                "the floor window of one QUIC connection, inside quic_buffer_budget_for \
+                 (each data path's floor grant)",
             ),
             (
                 "MIN_WINDOW_BYTES",
-                "clamp inside connection_window_bytes (per connection, not summed)",
+                "floor of one QUIC connection's window, inside quic_buffer_budget_for",
+            ),
+            (
+                "MIN_WINDOW_SMALL_HOST_BYTES",
+                "floor of one QUIC connection's window under 2 GiB, inside \
+                 quic_buffer_budget_for",
             ),
             (
                 "MAX_WINDOW_BYTES",
-                "clamp inside connection_window_bytes (per connection, not summed)",
+                "the largest window one QUIC connection grows to, inside \
+                 quic_buffer_budget_for (per connection, not summed)",
+            ),
+            (
+                "GAP_BYTES",
+                "the charge per received gap of one QUIC connection, inside \
+                 quic_buffer_budget_for",
+            ),
+            (
+                "CONTROL_BUFFER_BYTES",
+                "the control and short buffers of one QUIC data path, inside \
+                 quic_buffer_budget_for",
             ),
             (
                 "INCOMING_BUFFER_BYTES",
