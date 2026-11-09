@@ -4119,7 +4119,9 @@ echo "RC=$?"
         };
         let child = long.stdout(std::process::Stdio::null()).spawn().unwrap();
         let started = std::time::Instant::now();
-        let waited = wait_bounded(child, std::time::Duration::from_millis(300));
+        let waited = wait_until(child, || {
+            started.elapsed() >= std::time::Duration::from_millis(300)
+        });
         assert!(matches!(waited, BoundedWait::Stopped), "{waited:?}");
         assert!(
             started.elapsed() < std::time::Duration::from_secs(10),
@@ -4137,7 +4139,7 @@ echo "RC=$?"
                 .spawn()
                 .unwrap()
         };
-        match wait_bounded(quick, std::time::Duration::from_secs(30)) {
+        match wait_until(quick, || false) {
             BoundedWait::Finished(Ok(status)) => assert_eq!(status.code(), Some(3)),
             other @ (BoundedWait::Finished(Err(_))
             | BoundedWait::Stopped
@@ -4176,21 +4178,48 @@ echo "RC=$?"
     }
 
     /// The bounded spawner end to end, with a stand-in `freenet` (a shell
-    /// script run as `<exe> update --quiet`) stopped at a short limit in each
-    /// place a stop can land: after replacing itself, between the two renames,
-    /// and before doing anything.
+    /// script run as `<exe> update --quiet`) stopped in each place a stop can
+    /// land: after replacing itself, between the two renames, and before doing
+    /// anything. The stop is triggered by a marker the script writes once its
+    /// step is done, not by wall time, so a slow machine cannot change the
+    /// result (a bound of a minute only keeps a broken script from hanging the
+    /// test, and then the marker assertion fails).
     #[cfg(unix)]
     #[test]
     fn a_stopped_update_reports_whether_it_had_replaced_the_binary() {
         use std::os::unix::fs::PermissionsExt;
-        let limit = std::time::Duration::from_millis(500);
-        let run = |script: &str| {
+        let run = |step: &str| {
             let tmp = tempfile::tempdir().unwrap();
             let exe = tmp.path().join("freenet");
-            std::fs::write(&exe, format!("#!/bin/sh\n{script}\nsleep 30\n")).unwrap();
+            let marker = tmp.path().join("step-done");
+            std::fs::write(
+                &exe,
+                format!("#!/bin/sh\n{step}\n: > '{}'\nsleep 30\n", marker.display()),
+            )
+            .unwrap();
             std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
             let before = std::fs::read(&exe).unwrap();
-            let outcome = spawn_update_command_bounded(&exe, tmp.path(), Some(1), limit);
+            // A file just written can fail to exec with ETXTBSY while another
+            // test thread forks with our write descriptor still open
+            // (rust-lang/rust#114554); the descriptor closes once that fork
+            // execs, so retry briefly.
+            let mut tries = 0;
+            let outcome = loop {
+                let started = std::time::Instant::now();
+                let outcome = spawn_update_command_until(&exe, tmp.path(), Some(1), || {
+                    marker.exists() || started.elapsed() > std::time::Duration::from_secs(60)
+                });
+                match &outcome {
+                    BoundedUpdate::Finished(Err(e))
+                        if e.raw_os_error() == Some(libc::ETXTBSY) && tries < 50 =>
+                    {
+                        tries += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    BoundedUpdate::Finished(_) | BoundedUpdate::Stopped { .. } => break outcome,
+                }
+            };
+            assert!(marker.exists(), "the script reached its stop point");
             let after = std::fs::read(&exe).ok();
             (outcome, before, after, tmp)
         };
@@ -4870,7 +4899,7 @@ echo "RC=$?"
         // Every wrapper update path builds its command in `update_command`.
         for spawner in [
             "pub(super) fn spawn_update_command(",
-            "fn spawn_update_command_bounded(",
+            "fn spawn_update_command_until(",
         ] {
             let body = body_of(spawner);
             assert!(

@@ -869,27 +869,43 @@ pub(super) enum BoundedUpdate {
 }
 
 /// [`spawn_update_command`], waiting at most `limit`. Past it the child is
-/// stopped ([`wait_bounded`]). A stop can land between the two renames of
+/// stopped ([`wait_until`]). A stop can land between the two renames of
 /// `replace_binary`, which leave no binary in place, so the moved-aside binary
 /// is then put back ([`restore_binary_after_stop`]); not when the child could
 /// not be reaped, since it may still be running. Whether the binary changed is
 /// judged by content ([`binary_identity`]), taken before and after.
 ///
-/// Not everything a stop interrupts is restored. On macOS, a kill can leave
-/// the DMG mounted, a copy's temporary directory behind, or a detached bundle
-/// updater that times out waiting; each is cleared by a later attempt.
+/// Not everything a stop interrupts is restored. On macOS a kill can leave
+/// the DMG mounted (it is mounted inside a fresh temporary directory, which
+/// nothing detaches or removes later), a copy's staging directory behind (the
+/// next attempt clears it), or a detached bundle updater that times out
+/// waiting.
 pub(super) fn spawn_update_command_bounded(
     exe_path: &Path,
     log_dir: &Path,
     post_stop_exit_code: Option<i32>,
     limit: std::time::Duration,
 ) -> BoundedUpdate {
+    let started = std::time::Instant::now();
+    spawn_update_command_until(exe_path, log_dir, post_stop_exit_code, || {
+        started.elapsed() >= limit
+    })
+}
+
+/// [`spawn_update_command_bounded`] with the limit as a predicate, polled
+/// while the child runs: once `stop_now` returns true the child is stopped.
+pub(super) fn spawn_update_command_until(
+    exe_path: &Path,
+    log_dir: &Path,
+    post_stop_exit_code: Option<i32>,
+    stop_now: impl FnMut() -> bool,
+) -> BoundedUpdate {
     let before = binary_identity(exe_path);
     let child = match update_command(exe_path, log_dir, post_stop_exit_code).spawn() {
         Ok(child) => child,
         Err(e) => return BoundedUpdate::Finished(Err(e)),
     };
-    match wait_bounded(child, limit) {
+    match wait_until(child, stop_now) {
         BoundedWait::Finished(result) => BoundedUpdate::Finished(result),
         BoundedWait::Stopped => {
             restore_binary_after_stop(exe_path, log_dir);
@@ -923,7 +939,7 @@ pub(super) fn binary_changed(before: Option<blake3::Hash>, after: Option<blake3:
     matches!((before, after), (Some(before), Some(after)) if before != after)
 }
 
-/// How [`wait_bounded`] ended.
+/// How [`wait_until`] ended.
 #[derive(Debug)]
 pub(super) enum BoundedWait {
     /// The child exited within the limit (or its exit status could not be read).
@@ -935,27 +951,23 @@ pub(super) enum BoundedWait {
     Unreaped,
 }
 
-/// Wait for `child` for at most `limit`. Past it, or when its state cannot be
-/// polled (waiting on it unbounded is what this exists to avoid), kill and
-/// reap the child.
-pub(super) fn wait_bounded(
+/// Wait for `child`, polling `stop_now` between checks. Once it returns true,
+/// or when the child's state cannot be polled (waiting on it unbounded is what
+/// this exists to avoid), kill and reap the child.
+pub(super) fn wait_until(
     mut child: std::process::Child,
-    limit: std::time::Duration,
+    mut stop_now: impl FnMut() -> bool,
 ) -> BoundedWait {
-    let started = std::time::Instant::now();
     loop {
         match child.try_wait() {
             Ok(Some(status)) => return BoundedWait::Finished(Ok(status)),
             Ok(None) => {}
             Err(_) => break,
         }
-        let Some(left) = limit.checked_sub(started.elapsed()) else {
-            break;
-        };
-        if left.is_zero() {
+        if stop_now() {
             break;
         }
-        std::thread::sleep(left.min(std::time::Duration::from_millis(250)));
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
     // Best-effort: the child may have exited since the last poll, so a failed
     // kill is not itself a problem. Reaping is what says it is gone.
