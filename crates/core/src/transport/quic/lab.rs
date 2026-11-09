@@ -36,7 +36,7 @@ use tokio::sync::mpsc;
 use super::config::{QuicRateLimit, connection_window_bytes};
 use super::path::{BoundedSend, QuicPath, QuicPathLimits, SendDeadlines, data_channels};
 use super::{QuicEndpoint, QuicSettings};
-use crate::simulation::{RealTime, TimeSource};
+use crate::simulation::RealTime;
 use crate::transport::boundary::StreamProgressObserver;
 use crate::transport::demux::DemuxSocket;
 use crate::transport::link_model::{HostLink, LinkModel, Loss};
@@ -76,20 +76,27 @@ pub fn set_controller(controller: LabController) {
     lab::INNER_CONTROLLER.store(value, Ordering::Relaxed);
 }
 
-/// Judge a streamed send's 5 s gap on the connection's progress (the last
-/// newly acknowledged packet, sampled every 20 ms by
-/// [`LabPair::concurrent_streams`]) as well as on the send's own, from now
-/// on. Off is what a node does.
-pub fn set_gap_on_connection_progress(on: bool) {
-    super::path::bounded::lab::GAP_ON_CONNECTION_PROGRESS.store(on, Ordering::Relaxed);
+/// Kept for the older lab scripts. Since #6128 a node judges a streamed
+/// send's gap on the connection's progress itself, so there is nothing to
+/// switch, and this does nothing whatever `on` is.
+pub fn set_gap_on_connection_progress(_on: bool) {}
+
+/// Kept for the older lab scripts; does nothing since #6128 (the node's
+/// own connection window applies).
+pub fn set_connection_gap(_window: Option<Duration>) {}
+
+/// The congestion controller's initial window in bytes for connections
+/// built from now on; `None` for quinn's (10 datagrams, 12,000 bytes).
+pub fn set_initial_window(bytes: Option<u64>) {
+    super::recycle::lab::INITIAL_WINDOW.store(bytes.unwrap_or(0), Ordering::Relaxed);
 }
 
-/// The window after the connection's last acknowledgement that keeps a
-/// send's gap from running out, under [`set_gap_on_connection_progress`];
-/// `None` is the send's own gap (5 s).
-pub fn set_connection_gap(window: Option<Duration>) {
-    let nanos = window.map_or(0, |w| u64::try_from(w.as_nanos()).unwrap_or(u64::MAX));
-    super::path::bounded::lab::CONNECTION_GAP.store(nanos, Ordering::Relaxed);
+/// A rate start for connections built from now on: until the first
+/// congestion event the window is at least `bytes_per_s` x srtt, so the
+/// pacer sends at about 1.25 x that from the first round trip. `None` for
+/// the node's (none).
+pub fn set_rate_start(bytes_per_s: Option<u64>) {
+    super::recycle::lab::RATE_START.store(bytes_per_s.unwrap_or(0), Ordering::Relaxed);
 }
 
 /// A floor under the controller's window (before the bandwidth cap), for
@@ -540,6 +547,8 @@ pub struct LabPair {
     time: RealTime,
     window: u64,
     assembled: mpsc::UnboundedReceiver<usize>,
+    /// When the receiver last assembled a message in full.
+    last_arrival: Arc<parking_lot::Mutex<Option<Instant>>>,
     shapers: [Option<Arc<Shaper>>; 2],
     _keep: Box<dyn std::any::Any + Send>,
 }
@@ -634,12 +643,16 @@ impl LabPair {
         );
         b.enable_data();
         let (assembled_tx, assembled) = mpsc::unbounded_channel();
+        let last_arrival = Arc::new(parking_lot::Mutex::new(None));
         let mut arrivals = b_inbox.streams;
+        let arrived = last_arrival.clone();
         let reader = tokio::spawn(async move {
             while let Some(arrival) = arrivals.recv().await {
                 let assembled_tx = assembled_tx.clone();
+                let arrived = arrived.clone();
                 tokio::spawn(async move {
                     if let Ok(body) = arrival.handle.assemble().await {
+                        *arrived.lock() = Some(Instant::now());
                         assembled_tx.send(body.len()).ok();
                     }
                 });
@@ -665,6 +678,7 @@ impl LabPair {
             time,
             window: config.window_bytes,
             assembled,
+            last_arrival,
             shapers: [a_shaper, b_shaper],
             _keep: Box::new(keep),
         }
@@ -696,23 +710,11 @@ impl LabPair {
         let started = Arc::new(AtomicUsize::new(0));
         let samples = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let sampler = {
-            let (connection, time, samples) = (
-                self.a.quinn_connection(),
-                self.time.clone(),
-                samples.clone(),
-            );
+            let (connection, samples) = (self.a.quinn_connection(), samples.clone());
             let progress = super::recycle::AckProgress::of(&connection);
             tokio::spawn(async move {
-                let mut last_acked = 0;
-                super::path::bounded::lab::LAST_CONNECTION_ACK
-                    .store(time.now_nanos(), Ordering::Relaxed);
                 loop {
                     let acked = progress.as_ref().map_or(0, |p| p.acked());
-                    if acked > last_acked {
-                        last_acked = acked;
-                        super::path::bounded::lab::LAST_CONNECTION_ACK
-                            .store(time.now_nanos(), Ordering::Relaxed);
-                    }
                     let stats = connection.stats();
                     samples.lock().push(ConnSample {
                         at: start.elapsed(),
@@ -801,23 +803,58 @@ impl LabPair {
     /// # Panics
     /// If the send does not return `Sent` or the receiver gets nothing.
     pub async fn transfer(&mut self, bytes: usize) -> Duration {
+        self.transfer_timed(bytes, Duration::from_secs(3600))
+            .await
+            .expect("the transfer completes")
+            .1
+    }
+
+    /// Send one message of `bytes`. Returns the time from the start of the
+    /// send to the receiver assembling it, and to the later of that and the
+    /// send returning `Sent`. The first is the one to compare with the UDP
+    /// transport's arrival. `Err` with the outcome when the send does not
+    /// return `Sent`, or nothing arrives within `limit`.
+    pub async fn transfer_timed(
+        &mut self,
+        bytes: usize,
+        limit: Duration,
+    ) -> Result<(Duration, Duration), String> {
         let body = Bytes::from(vec![0x5Au8; bytes]);
+        *self.last_arrival.lock() = None;
         let start = Instant::now();
-        let outcome = self
-            .a
-            .send_stream_bounded(
+        let outcome = tokio::time::timeout(
+            limit,
+            self.a.send_stream_bounded(
                 &self.time,
                 SendDeadlines::stream(bytes as u64),
                 StreamId::next(),
                 None,
                 body,
                 None,
-            )
-            .await;
-        assert!(matches!(outcome, BoundedSend::Sent), "{outcome:?}");
-        let got = self.assembled.recv().await.expect("the receiver runs");
+            ),
+        )
+        .await
+        .map_err(|_| "limit".to_string())?;
+        if !matches!(outcome, BoundedSend::Sent) {
+            return Err(format!("{outcome:?}"));
+        }
+        let got = tokio::time::timeout(limit, self.assembled.recv())
+            .await
+            .map_err(|_| "not assembled".to_string())?
+            .ok_or_else(|| "receiver gone".to_string())?;
         assert_eq!(got, bytes);
-        start.elapsed()
+        let done = start.elapsed();
+        let arrived = self
+            .last_arrival
+            .lock()
+            .expect("an assembled message has an arrival time")
+            .saturating_duration_since(start);
+        Ok((arrived, done))
+    }
+
+    /// quinn's congestion window on the sender's path now.
+    pub fn cwnd(&self) -> u64 {
+        self.a.quinn_connection().stats().path.cwnd
     }
 
     /// quinn's view of the sender's path, and the link's ground truth for

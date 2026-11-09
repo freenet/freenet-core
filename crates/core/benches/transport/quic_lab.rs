@@ -35,7 +35,7 @@ use freenet::transport::quic_lab::set_connection_gap;
 use freenet::transport::quic_lab::{
     Competitor, ConnSample, FRAGMENT_BYTES, LabConfig, LabController, LabMany, LabPair, LabSocket,
     LinkSpec, StreamsRun, link_report, set_controller, set_gap_on_connection_progress,
-    set_min_window, set_send_window, shape_port,
+    set_initial_window, set_min_window, set_rate_start, set_send_window, shape_port,
 };
 use freenet::transport::{TRANSPORT_METRICS, TransportKeypair, create_connection_handler};
 use tokio::sync::mpsc;
@@ -300,6 +300,21 @@ fn quic_lab_fairness() {
     }
 }
 
+/// When the receiver of the latest [`udp_pair`] last got a whole message.
+static UDP_LAST_ARRIVAL: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+
+/// The start-of-connection knobs, for every QUIC connection built after the
+/// call: `LAB_IW_PKTS` (initial window in 1200-byte datagrams; 0 is quinn's
+/// 10), `LAB_RATE_START_KBPS` (a rate start in KB/s, 1000 bytes; 0 is
+/// none). Returns them for the result lines.
+fn apply_start_knobs() -> String {
+    let iw: u64 = env_or("LAB_IW_PKTS", 0);
+    set_initial_window((iw > 0).then_some(iw * 1200));
+    let rate: u64 = env_or("LAB_RATE_START_KBPS", 0);
+    set_rate_start((rate > 0).then_some(rate * 1000));
+    format!("iw_pkts={iw} rate_start_kbps={rate}")
+}
+
 /// A UDP-transport pair on loopback: send a message with `send`, read each
 /// assembled message's length from the receiver.
 async fn udp_pair(
@@ -366,6 +381,7 @@ async fn udp_pair(
     });
     let b_task = tokio::spawn(async move {
         while let Ok(msg) = b_conn.recv().await {
+            *UDP_LAST_ARRIVAL.lock().unwrap() = Some(Instant::now());
             if got_tx.send(msg.len()).is_err() {
                 break;
             }
@@ -623,6 +639,7 @@ fn quic_lab_loss() {
         "veno" => LabController::Veno,
         other => panic!("unknown controller {other}"),
     });
+    let knobs = apply_start_knobs();
     let gap_rule = std::env::var("LAB_GAP").unwrap_or_else(|_| "stream".into());
     set_gap_on_connection_progress(match gap_rule.as_str() {
         "stream" => false,
@@ -814,7 +831,7 @@ fn quic_lab_loss() {
         println!(
             "LAB_LOSS transport={transport} threads={threads} streams={streams} stream_kib={} \
              window_kib={} loss={loss} seed={seed} delay_ms={delay_ms} rate_mbit={rate_mbit} \
-             controller={controller} gap={gap_rule} conn_gap_s={conn_gap_s} send_window_kib={send_window_kib} min_window_kib={min_window_kib} rep={rep} {line}",
+             controller={controller} {knobs} gap={gap_rule} conn_gap_s={conn_gap_s} send_window_kib={send_window_kib} min_window_kib={min_window_kib} rep={rep} {line}",
             stream_bytes / 1024,
             window / 1024,
         );
@@ -946,6 +963,7 @@ fn quic_lab_many() {
         "veno" => LabController::Veno,
         other => panic!("unknown controller {other}"),
     });
+    let knobs = apply_start_knobs();
     let gap_rule = std::env::var("LAB_GAP").unwrap_or_else(|_| "stream".into());
     set_gap_on_connection_progress(gap_rule == "connection");
     let conn_gap_s: u64 = env_or("LAB_CONN_GAP_S", 0);
@@ -1068,7 +1086,7 @@ fn quic_lab_many() {
         });
         rt.shutdown_timeout(Duration::from_secs(1));
         println!(
-            "LAB_MANY transport={transport} controller={controller} gap={gap_rule} \
+            "LAB_MANY transport={transport} controller={controller} {knobs} gap={gap_rule} \
              min_window_kib={min_window_kib} conns={conns} per={per} stream_kib={} \
              window_kib={} rate_mbit={rate_mbit} queue_kib={} loss={loss} competitor={competitor} \
              rep={rep} {line}",
@@ -1322,5 +1340,170 @@ fn quic_lab_mix() {
             times.iter().filter(|t| **t > 120.0).count(),
             times.iter().filter(|t| **t > 300.0).count(),
         );
+    }
+}
+
+/// Time to delivery of one message on a fresh connection (or after warming
+/// it), QUIC path against the UDP transport, both timed to the receiver
+/// having the whole message. One `LAB_COLD` line per transfer.
+///
+/// Settings: `LAB_TRANSPORT` (quic or udp), `LAB_SIZES_KIB`
+/// (16,64,256,1024,8192), `LAB_DELAYS_MS` one way (25,50,150,250,400),
+/// `LAB_LOSS` (0) both ways with `LAB_SEED` (1, plus the repetition),
+/// `LAB_RATE_MBIT` (0 for no bottleneck) and `LAB_QUEUE_KIB` (1024),
+/// `LAB_WINDOW_KIB` (8192), `LAB_REPS` (3), `LAB_THREADS` (4),
+/// `LAB_CONTROLLER` (cubic, bbr), the start knobs of [`apply_start_knobs`],
+/// `LAB_MODE`: `cold` (the message is the connection's first),
+/// `smalls` (after 50 messages of 1 KiB, 20 ms apart, which leave the window
+/// where an application-limited connection keeps it), `warm` (after one 4 MiB
+/// transfer and 1 s idle, the window a cached or resumed one would give).
+/// `LAB_LIMIT_S` (300) bounds one transfer.
+#[test]
+fn quic_lab_cold() {
+    if !enabled("quic_lab_cold") {
+        return;
+    }
+    let transport = std::env::var("LAB_TRANSPORT").unwrap_or_else(|_| "quic".into());
+    let list = |name: &str, default: &str| -> Vec<u64> {
+        std::env::var(name)
+            .unwrap_or_else(|_| default.into())
+            .split(',')
+            .map(|v| v.trim().parse().expect("a number"))
+            .collect()
+    };
+    let sizes = list("LAB_SIZES_KIB", "16,64,256,1024,8192");
+    let delays = list("LAB_DELAYS_MS", "25,50,150,250,400");
+    let loss: f64 = env_or("LAB_LOSS", 0.0);
+    let seed: u64 = env_or("LAB_SEED", 1);
+    let rate_mbit: u64 = env_or("LAB_RATE_MBIT", 0);
+    let queue_kib: usize = env_or("LAB_QUEUE_KIB", 1024);
+    let window = env_or("LAB_WINDOW_KIB", 8192u64) * 1024;
+    let reps: u64 = env_or("LAB_REPS", 3);
+    let threads: usize = env_or("LAB_THREADS", 4);
+    let mode = std::env::var("LAB_MODE").unwrap_or_else(|_| "cold".into());
+    let limit = Duration::from_secs(env_or("LAB_LIMIT_S", 300));
+    let controller = std::env::var("LAB_CONTROLLER").unwrap_or_else(|_| "cubic".into());
+    set_controller(match controller.as_str() {
+        "cubic" => LabController::Cubic,
+        "bbr" => LabController::Bbr,
+        "veno" => LabController::Veno,
+        other => panic!("unknown controller {other}"),
+    });
+    let knobs = apply_start_knobs();
+    for &delay_ms in &delays {
+        for &size_kib in &sizes {
+            let bytes = size_kib as usize * 1024;
+            for rep in 0..reps {
+                let link = LinkSpec {
+                    rate_bps: rate_mbit * 1_000_000,
+                    one_way_delay: Duration::from_millis(delay_ms),
+                    queue_bytes: queue_kib * 1024,
+                    loss,
+                    seed: seed + rep,
+                };
+                let rt = runtime(threads);
+                let line = rt.block_on(async {
+                    match transport.as_str() {
+                        "quic" => {
+                            let mut pair = LabPair::connect(LabConfig {
+                                window_bytes: window,
+                                bandwidth_limit: None,
+                                link: Some(link),
+                            })
+                            .await;
+                            match mode.as_str() {
+                                "cold" => {}
+                                "smalls" => {
+                                    for _ in 0..50 {
+                                        pair.transfer_timed(1024, limit).await.ok();
+                                        tokio::time::sleep(Duration::from_millis(20)).await;
+                                    }
+                                }
+                                "warm" => {
+                                    pair.transfer_timed(4 << 20, limit).await.ok();
+                                    tokio::time::sleep(Duration::from_secs(1)).await;
+                                }
+                                other => panic!("unknown mode {other}"),
+                            }
+                            let cwnd_before = pair.cwnd();
+                            let result = pair.transfer_timed(bytes, limit).await;
+                            let link = pair
+                                .sender_port()
+                                .and_then(link_report)
+                                .unwrap_or_default();
+                            match result {
+                                Ok((arrived, done)) => format!(
+                                    "ok=1 arrival_s={:.3} sent_s={:.3} cwnd_before={cwnd_before} \
+                                     {} sender_link[{link}]",
+                                    arrived.as_secs_f64(),
+                                    done.as_secs_f64(),
+                                    pair.describe()
+                                ),
+                                Err(e) => format!(
+                                    "ok=0 failure={e:?} cwnd_before={cwnd_before} {} \
+                                     sender_link[{link}]",
+                                    pair.describe()
+                                ),
+                            }
+                        }
+                        "udp" => {
+                            let (send, mut got, _tasks, a_port) =
+                                udp_pair(None, Some(link)).await;
+                            let mut wait = async |n: usize| {
+                                tokio::time::timeout(limit, got.recv())
+                                    .await
+                                    .ok()
+                                    .flatten()
+                                    .map(|len| assert_eq!(len, n + 8))
+                                    .is_some()
+                            };
+                            match mode.as_str() {
+                                "cold" => {}
+                                "smalls" => {
+                                    for _ in 0..50 {
+                                        send.send(vec![1u8; 1024]).await.expect("driver");
+                                        wait(1024).await;
+                                        tokio::time::sleep(Duration::from_millis(20)).await;
+                                    }
+                                }
+                                "warm" => {
+                                    send.send(vec![1u8; 4 << 20]).await.expect("driver");
+                                    wait(4 << 20).await;
+                                    tokio::time::sleep(Duration::from_secs(1)).await;
+                                }
+                                other => panic!("unknown mode {other}"),
+                            }
+                            *UDP_LAST_ARRIVAL.lock().unwrap() = None;
+                            let start = Instant::now();
+                            send.send(vec![0x5Au8; bytes]).await.expect("driver runs");
+                            let ok = wait(bytes).await;
+                            let link = link_report(a_port).unwrap_or_default();
+                            if ok {
+                                let arrived = UDP_LAST_ARRIVAL
+                                    .lock()
+                                    .unwrap()
+                                    .expect("arrival recorded")
+                                    .saturating_duration_since(start);
+                                format!(
+                                    "ok=1 arrival_s={:.3} sender_link[{link}]",
+                                    arrived.as_secs_f64()
+                                )
+                            } else {
+                                format!("ok=0 failure=\"limit\" sender_link[{link}]")
+                            }
+                        }
+                        other => panic!("unknown transport {other}"),
+                    }
+                });
+                rt.shutdown_timeout(Duration::from_secs(1));
+                println!(
+                    "LAB_COLD transport={transport} controller={controller} {knobs} mode={mode} \
+                     size_kib={size_kib} delay_ms={delay_ms} rtt_ms={} loss={loss} \
+                     rate_mbit={rate_mbit} queue_kib={queue_kib} window_kib={} rep={rep} {line}",
+                    2 * delay_ms,
+                    window / 1024,
+                );
+            }
+        }
     }
 }

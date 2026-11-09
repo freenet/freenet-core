@@ -305,7 +305,7 @@ pub(crate) const QUIC_MEMORY_MEASURED_WITH: [(&str, &str); 3] = [
 pub(crate) const MIN_WINDOW_BYTES: u64 = 128 * 1024;
 
 /// The largest flow-control window per connection and direction.
-pub(crate) const MAX_WINDOW_BYTES: u64 = 2 * 1024 * 1024;
+pub(crate) const MAX_WINDOW_BYTES: u64 = 16 * 1024 * 1024; // LAB ONLY: raised to measure large windows
 
 /// The share of the node's memory all QUIC windows together may hold, as a
 /// divisor: one twentieth, 5%.

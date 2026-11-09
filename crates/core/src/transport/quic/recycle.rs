@@ -253,27 +253,50 @@ impl CappedCubicFactory {
 impl ControllerFactory for CappedCubicFactory {
     fn build(self: Arc<Self>, now: Instant, current_mtu: u16) -> Box<dyn Controller> {
         #[cfg(feature = "bench")]
+        let this = {
+            let iw = lab::INITIAL_WINDOW.load(Ordering::Relaxed);
+            if iw > 0 {
+                let mut cubic = quinn::congestion::CubicConfig::default();
+                cubic.initial_window(iw);
+                Arc::new(Self {
+                    cubic: Arc::new(cubic),
+                    rate: self.rate.clone(),
+                })
+            } else {
+                self
+            }
+        };
+        #[cfg(not(feature = "bench"))]
+        let this = self;
+        #[cfg(feature = "bench")]
         if lab::INNER_CONTROLLER.load(Ordering::Relaxed) == lab::VENO {
             return Box::new(CappedCubic::new(
                 Box::new(lab::VenoCubic::new(
-                    self.cubic.clone().build(now, current_mtu),
+                    this.cubic.clone().build(now, current_mtu),
                     current_mtu,
                 )),
-                self.rate.clone(),
+                this.rate.clone(),
                 current_mtu,
             ));
         }
         #[cfg(feature = "bench")]
         if lab::INNER_CONTROLLER.load(Ordering::Relaxed) == lab::BBR {
             return Box::new(CappedCubic::new(
-                Arc::new(quinn::congestion::BbrConfig::default()).build(now, current_mtu),
-                self.rate.clone(),
+                {
+                    let mut bbr = quinn::congestion::BbrConfig::default();
+                    let iw = lab::INITIAL_WINDOW.load(Ordering::Relaxed);
+                    if iw > 0 {
+                        bbr.initial_window(iw);
+                    }
+                    Arc::new(bbr).build(now, current_mtu)
+                },
+                this.rate.clone(),
                 current_mtu,
             ));
         }
         Box::new(CappedCubic::new(
-            self.cubic.clone().build(now, current_mtu),
-            self.rate.clone(),
+            this.cubic.clone().build(now, current_mtu),
+            this.rate.clone(),
             current_mtu,
         ))
     }
@@ -432,6 +455,18 @@ pub(crate) mod lab {
     /// none (the node's).
     pub(crate) static MIN_WINDOW: std::sync::atomic::AtomicU64 =
         std::sync::atomic::AtomicU64::new(0);
+
+    /// The inner controller's initial window in bytes, for connections built
+    /// after it is set; 0 keeps quinn's default (10 datagrams of 1200).
+    pub(crate) static INITIAL_WINDOW: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
+    /// A rate start: until the connection's first congestion event, the
+    /// window is at least this rate (bytes per second) times the smoothed
+    /// RTT, so quinn's pacer (1.25 x window / srtt) sends at about 1.25
+    /// times it from the first round trip. 0 is none (the node's).
+    pub(crate) static RATE_START: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
 }
 
 /// The window [`CappedCubic`] allows at `rate` bytes per second over an RTT
@@ -526,6 +561,17 @@ pub(crate) struct CappedCubic {
     /// first.
     srtt: Option<Duration>,
     mtu: u16,
+    /// Bench only: the connection has had a congestion event, which ends
+    /// the lab's rate start (`lab::RATE_START`).
+    #[cfg(feature = "bench")]
+    congested: bool,
+    /// Bench only: the latest RTT sample, `now - sent` of the latest packet
+    /// acknowledged. quinn updates its smoothed RTT after the controller's
+    /// `on_ack` for the same ACK frame, so after the handshake `srtt` above
+    /// still holds the configured initial RTT (333 ms) until the first data
+    /// is acknowledged; the sample is the path's real RTT from the first ACK.
+    #[cfg(feature = "bench")]
+    sample: Option<Duration>,
 }
 
 impl CappedCubic {
@@ -536,6 +582,10 @@ impl CappedCubic {
             rate,
             srtt: None,
             mtu,
+            #[cfg(feature = "bench")]
+            congested: false,
+            #[cfg(feature = "bench")]
+            sample: None,
         }
     }
 
@@ -571,6 +621,10 @@ impl Controller for CappedCubic {
     ) {
         self.state.lock().acked += 1;
         self.srtt = Some(rtt.get());
+        #[cfg(feature = "bench")]
+        {
+            self.sample = Some(now.saturating_duration_since(sent));
+        }
         // A send the cap holds back is not Cubic's doing: while the cap is
         // below Cubic's window, do not let Cubic grow (see the module docs).
         // Without a limit nothing more is asked of Cubic.
@@ -610,6 +664,10 @@ impl Controller for CappedCubic {
             let mut state = self.state.lock();
             state.lost_since_acks = state.lost_since_acks.saturating_add(lost_bytes);
         }
+        #[cfg(feature = "bench")]
+        {
+            self.congested = true;
+        }
         self.inner
             .on_congestion_event(now, sent, is_persistent_congestion, lost_bytes);
     }
@@ -625,6 +683,13 @@ impl Controller for CappedCubic {
             .inner
             .window()
             .max(lab::MIN_WINDOW.load(Ordering::Relaxed));
+        #[cfg(feature = "bench")]
+        let inner = match (lab::RATE_START.load(Ordering::Relaxed), self.sample) {
+            (rate, Some(srtt)) if rate > 0 && !self.congested => {
+                inner.max(rate_window(rate, srtt, self.mtu))
+            }
+            _ => inner,
+        };
         #[cfg(not(feature = "bench"))]
         let inner = self.inner.window();
         self.capped(inner)
@@ -647,6 +712,10 @@ impl Controller for CappedCubic {
             rate: self.rate.clone(),
             srtt: self.srtt,
             mtu: self.mtu,
+            #[cfg(feature = "bench")]
+            congested: self.congested,
+            #[cfg(feature = "bench")]
+            sample: self.sample,
         })
     }
 
