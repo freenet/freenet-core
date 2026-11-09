@@ -57,21 +57,28 @@
 //! On top of that, [`detect_stalls`] WARNs, at the end of window W, for a
 //! contract that over windows W-1 and W together had:
 //! - a local client update in W-1;
-//! - every resolved leg ended unsent: the `skip_*` counts plus the legs the
-//!   bridge refused (`send_failed`) reach the legs resolved (`targets_total`
-//!   for fan-outs plus `heal_target` for heals, above zero). Or a whole
-//!   fan-out was dropped (`fanout_event_dropped`);
+//! - every open leg ended unsent: the evidence skips (every `skip_*` count
+//!   but `skip_superseded` and `skip_evicted`) plus the legs the bridge
+//!   refused (`send_failed`) reach the open legs. The open legs are the legs
+//!   resolved (`targets_total` for fan-outs plus `heal_target` for heals)
+//!   minus `skip_superseded`, and must be above zero, with `targets_total`
+//!   above zero too. Or a whole fan-out was dropped (`fanout_event_dropped`);
 //! - nothing at all handed to the network bridge (`sent_delta + sent_full`
 //!   is zero across both windows).
 //!
 //! A queued leg replaced by a newer fan-out or heal for the same (contract,
 //! peer) pair counts `skip_superseded`: its update rides on the newer leg,
-//! whose own outcome decides whether anything was sent. Before #6143 a
-//! superseded leg recorded nothing, so two client updates in a burst counted
-//! twice the targets against at most half as many outcomes, and every leg
-//! could never be accounted for. A heal registers its leg as `heal_target`,
-//! as a fan-out registers its targets, so a heal's skip never stands in for
-//! a fan-out leg's outcome.
+//! whose own outcome decides whether anything was sent, so the superseded
+//! leg is closed and leaves the open legs. Before #6143 a superseded leg
+//! recorded nothing, so two client updates in a burst counted twice the
+//! targets against at most half as many outcomes, and every leg could never
+//! be accounted for. It is subtracted rather than counted as evidence: a
+//! relayed fan-out counted before W-1 whose legs a client update supersedes
+//! in W-1 would otherwise stand in for the client update's own legs while
+//! they are still held. A heal registers its leg as `heal_target`, as a
+//! fan-out registers its targets, so a heal's skip never stands in for a
+//! fan-out leg's outcome, and heals alone, with no fan-out target, are never
+//! a stall.
 //!
 //! W is grace for a leg queued near the end of W-1, and judging the two
 //! windows together catches an update applied at the end of W-1 whose
@@ -91,8 +98,11 @@
 //!   on the QUIC path, and anything the receiver does with a message that
 //!   arrived. Those are diagnosed from the `wire_*` counts here and the
 //!   receiver-side `rx_*` counts across the fleet.
-//! - Legs dropped from the broadcast queue at capacity (`evict_oldest`). They
-//!   record no event here; the queue WARNs each eviction itself.
+//! - A fan-out with a leg dropped from the broadcast queue at capacity
+//!   (`evict_oldest`). That leg counts `skip_evicted`, a counter only: it is
+//!   neither evidence nor subtracted from the open legs, so the other legs
+//!   can never account for every leg. A missed WARN, which fails safe; the
+//!   queue also WARNs each eviction itself.
 //! - Partial failure: one leg handed to the bridge clears both windows, so 13
 //!   of 14 legs failing raises nothing. The per-contract counts show it.
 //! - Any send for the contract clears it, including a send for a relayed
@@ -207,8 +217,14 @@ pub(crate) enum PropagationEvent {
     /// Ended unsent: a newer fan-out or heal replaced this leg's queued
     /// (contract, peer) entry before it ran. Its update rides on the newer
     /// leg, whose own outcome decides whether anything was sent; this leg
-    /// recorded nothing before #6143.
+    /// recorded nothing before #6143. Not stall evidence: the stall check
+    /// subtracts it from the legs instead (see [`detect_stalls`]).
     SkipSuperseded,
+    /// Ended unsent: the broadcast queue was full and dropped this queued
+    /// leg to make room (`evict_oldest`). A counter only: neither stall
+    /// evidence nor subtracted from the legs, so an evicted leg can only
+    /// keep the stall WARN from firing, never make it fire.
+    SkipEvicted,
     /// The network bridge refused a leg: `bridge.send` or the stream dispatch
     /// returned `Err`, or the payload failed to serialize. That leg counts no
     /// `Sent*`, so this is a per-leg outcome disjoint from `SentDelta` /
@@ -265,7 +281,7 @@ pub(crate) enum PropagationEvent {
 impl PropagationEvent {
     /// Every event, in reporting order. Kept in lockstep with
     /// [`Self::index`] by `propagation_events_are_densely_indexed`.
-    pub(crate) const ALL: [PropagationEvent; 24] = [
+    pub(crate) const ALL: [PropagationEvent; 25] = [
         PropagationEvent::ClientOriginated,
         PropagationEvent::SentDelta,
         PropagationEvent::SentFull,
@@ -276,6 +292,7 @@ impl PropagationEvent {
         PropagationEvent::SkipNotHosted,
         PropagationEvent::SkipNoAddress,
         PropagationEvent::SkipSuperseded,
+        PropagationEvent::SkipEvicted,
         PropagationEvent::SendFailed,
         PropagationEvent::FanoutEventDropped,
         PropagationEvent::HealEventDropped,
@@ -306,26 +323,29 @@ impl PropagationEvent {
             PropagationEvent::SkipNotHosted => 7,
             PropagationEvent::SkipNoAddress => 8,
             PropagationEvent::SkipSuperseded => 9,
-            PropagationEvent::SendFailed => 10,
-            PropagationEvent::FanoutEventDropped => 11,
-            PropagationEvent::HealEventDropped => 12,
-            PropagationEvent::HealTarget => 13,
-            PropagationEvent::WireShort => 14,
-            PropagationEvent::WireStream => 15,
-            PropagationEvent::WireUnobserved => 16,
-            PropagationEvent::WireStreamDelivered => 17,
-            PropagationEvent::WireStreamFailed => 18,
-            PropagationEvent::WireStreamEgressAbandoned => 19,
-            PropagationEvent::WireSendFailed => 20,
-            PropagationEvent::RxDedup => 21,
-            PropagationEvent::RxAlreadyApplied => 22,
-            PropagationEvent::RxBackoff => 23,
+            PropagationEvent::SkipEvicted => 10,
+            PropagationEvent::SendFailed => 11,
+            PropagationEvent::FanoutEventDropped => 12,
+            PropagationEvent::HealEventDropped => 13,
+            PropagationEvent::HealTarget => 14,
+            PropagationEvent::WireShort => 15,
+            PropagationEvent::WireStream => 16,
+            PropagationEvent::WireUnobserved => 17,
+            PropagationEvent::WireStreamDelivered => 18,
+            PropagationEvent::WireStreamFailed => 19,
+            PropagationEvent::WireStreamEgressAbandoned => 20,
+            PropagationEvent::WireSendFailed => 21,
+            PropagationEvent::RxDedup => 22,
+            PropagationEvent::RxAlreadyApplied => 23,
+            PropagationEvent::RxBackoff => 24,
         }
     }
 
-    /// True for a sender-side skip (`Skip*`): a leg this node decided not to
-    /// send. Positive evidence for the stall check ([`detect_stalls`]).
-    pub(crate) const fn is_skip(self) -> bool {
+    /// True for a sender-side skip that is positive evidence for the stall
+    /// check ([`detect_stalls`]): a leg this node decided not to send. Two
+    /// `Skip*` events are not: `SkipSuperseded` is subtracted from the legs
+    /// instead, and `SkipEvicted` is a counter only.
+    pub(crate) const fn is_evidence_skip(self) -> bool {
         matches!(
             self,
             PropagationEvent::SkipSummaryEqual
@@ -334,7 +354,6 @@ impl PropagationEvent {
                 | PropagationEvent::SkipEmptyDelta
                 | PropagationEvent::SkipNotHosted
                 | PropagationEvent::SkipNoAddress
-                | PropagationEvent::SkipSuperseded
         )
     }
 
@@ -378,6 +397,7 @@ impl PropagationEvent {
             PropagationEvent::SkipNotHosted => "skip_not_hosted",
             PropagationEvent::SkipNoAddress => "skip_no_address",
             PropagationEvent::SkipSuperseded => "skip_superseded",
+            PropagationEvent::SkipEvicted => "skip_evicted",
             PropagationEvent::SendFailed => "send_failed",
             PropagationEvent::FanoutEventDropped => "fanout_event_dropped",
             PropagationEvent::HealEventDropped => "heal_event_dropped",
@@ -618,7 +638,7 @@ pub(crate) fn aggregate_window(
 }
 
 /// A contract that stalled (#6143): a local client update in window W-1,
-/// every resolved leg skipped or refused by the bridge (or a fan-out dropped)
+/// every open leg skipped or refused by the bridge (or a fan-out dropped)
 /// over W-1 and W, and nothing handed to the network bridge in either window.
 /// See [`detect_stalls`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -647,21 +667,29 @@ fn stall_of(previous: &ContractSummary, current: Option<&ContractSummary>) -> Op
         events.merge(&current.events);
         targets_total = targets_total.saturating_add(current.targets_total);
     }
-    // Positive evidence that the update never left: every resolved leg
-    // ended unsent (skipped, or refused by the bridge), or a whole fan-out
-    // was dropped before it resolved any. Resolved targets alone are not
+    // Positive evidence that the update never left: every open leg ended
+    // unsent (skipped, or refused by the bridge), or a whole fan-out was
+    // dropped before it resolved any. Resolved targets alone are not
     // evidence, and neither is one refused leg among them: a leg held while
     // its (contract, peer) pair is busy with a stream, or queued behind the
-    // large lane's permits, records nothing for as long as it waits. The
-    // legs are the fan-outs' resolved targets plus the heals'
+    // large lane's permits, records nothing for as long as it waits.
+    //
+    // The legs are the fan-outs' resolved targets plus the heals'
     // (`heal_target`): a heal's leg can skip too, and must not be read as a
-    // fan-out leg's outcome.
+    // fan-out leg's outcome. A leg superseded by a newer one for the same
+    // pair is closed, not evidence: it is subtracted, since its update rides
+    // on the newer leg. Counting it as evidence instead let a relayed
+    // fan-out from before W-1, superseded by the client update's legs, stand
+    // in for those legs while they were still held. An evicted leg is
+    // neither, so it can only hide a stall. And at least one target must
+    // come from a fan-out: heals alone are not the client update's legs.
     let legs = targets_total.saturating_add(events.get(PropagationEvent::HealTarget));
+    let open_legs = legs.saturating_sub(events.get(PropagationEvent::SkipSuperseded));
     let ended_unsent = PropagationEvent::ALL
         .iter()
-        .filter(|ev| ev.is_skip() || **ev == PropagationEvent::SendFailed)
+        .filter(|ev| ev.is_evidence_skip() || **ev == PropagationEvent::SendFailed)
         .fold(0u64, |n, &ev| n.saturating_add(events.get(ev)));
-    let every_leg_ended_unsent = legs > 0 && ended_unsent >= legs;
+    let every_leg_ended_unsent = targets_total > 0 && open_legs > 0 && ended_unsent >= open_legs;
     let fanout_dropped = events.get(PropagationEvent::FanoutEventDropped) > 0;
     ((every_leg_ended_unsent || fanout_dropped) && events.sent() == 0).then_some(StallReport {
         contract: previous.contract,
@@ -677,9 +705,10 @@ fn stall_of(previous: &ContractSummary, current: Option<&ContractSummary>) -> Op
 ///
 /// A contract stalls when, over W-1 and W together, it had:
 /// - a client update in W-1;
-/// - every resolved leg accounted for as ended unsent (the `skip_*` counts,
-///   `skip_superseded` included, plus `send_failed` reach the legs
-///   resolved: `targets_total` plus `heal_target`, above zero), or a
+/// - every open leg accounted for as ended unsent: the evidence skips
+///   ([`PropagationEvent::is_evidence_skip`]) plus `send_failed` reach the
+///   open legs, which are `targets_total` plus `heal_target` minus
+///   `skip_superseded`, above zero, with `targets_total` above zero. Or a
 ///   fan-out dropped by `try_notify` (`fanout_event_dropped`);
 /// - nothing handed to the bridge (`sent_delta + sent_full == 0`).
 ///
@@ -956,6 +985,7 @@ impl UpdatePropagationStats {
             skip_not_hosted = e.get(PropagationEvent::SkipNotHosted),
             skip_no_address = e.get(PropagationEvent::SkipNoAddress),
             skip_superseded = e.get(PropagationEvent::SkipSuperseded),
+            skip_evicted = e.get(PropagationEvent::SkipEvicted),
             send_failed = e.get(PropagationEvent::SendFailed),
             wire_short = e.get(PropagationEvent::WireShort),
             wire_stream = e.get(PropagationEvent::WireStream),
@@ -994,6 +1024,7 @@ impl UpdatePropagationStats {
                 skip_not_hosted = e.get(PropagationEvent::SkipNotHosted),
                 skip_no_address = e.get(PropagationEvent::SkipNoAddress),
                 skip_superseded = e.get(PropagationEvent::SkipSuperseded),
+                skip_evicted = e.get(PropagationEvent::SkipEvicted),
                 send_failed = e.get(PropagationEvent::SendFailed),
                 wire_short = e.get(PropagationEvent::WireShort),
                 wire_stream = e.get(PropagationEvent::WireStream),
@@ -1103,6 +1134,7 @@ fn log_stall(stall: &StallReport) {
         skip_not_hosted = e.get(PropagationEvent::SkipNotHosted),
         skip_no_address = e.get(PropagationEvent::SkipNoAddress),
         skip_superseded = e.get(PropagationEvent::SkipSuperseded),
+        skip_evicted = e.get(PropagationEvent::SkipEvicted),
         send_failed = e.get(PropagationEvent::SendFailed),
         heal_target = e.get(PropagationEvent::HealTarget),
         fanout_event_dropped = e.get(PropagationEvent::FanoutEventDropped),
@@ -2078,15 +2110,28 @@ mod tests {
         });
     }
 
-    /// Every sender-side skip is evidence: a client update whose legs were
-    /// all skipped for any one reason is a stall.
+    /// Every evidence skip is evidence: a client update whose legs were all
+    /// skipped for any one reason is a stall. `skip_superseded` and
+    /// `skip_evicted` are the two `skip_*` events that are not; their own
+    /// tests say what they are instead.
     #[test]
     fn every_skip_reason_is_evidence_of_a_stall() {
         let skips: Vec<_> = PropagationEvent::ALL
             .into_iter()
-            .filter(|ev| ev.is_skip())
+            .filter(|ev| ev.is_evidence_skip())
             .collect();
-        assert_eq!(skips.len(), 7, "a new skip reason needs a look here");
+        assert_eq!(skips.len(), 6, "a new skip reason needs a look here");
+        let not_evidence: Vec<_> = PropagationEvent::ALL
+            .into_iter()
+            .filter(|ev| ev.label().starts_with("skip_") && !ev.is_evidence_skip())
+            .collect();
+        assert_eq!(
+            not_evidence,
+            vec![
+                PropagationEvent::SkipSuperseded,
+                PropagationEvent::SkipEvicted
+            ]
+        );
         for skip in skips {
             let stats = UpdatePropagationStats::new();
             let c = cid(25);
@@ -2168,6 +2213,8 @@ mod tests {
     /// resolve 28 legs, but at most 14 reach a send, a skip or a refusal; the
     /// other 14 were superseded. Uncounted, every leg could never be
     /// accounted for, and this burst, the #6143 shape, could never warn.
+    /// Since round 7 a superseded leg leaves the open legs (28 - 14 = 14),
+    /// and the 14 newer legs' skips meet that.
     #[test]
     fn a_superseded_leg_is_accounted_for_as_ended_unsent() {
         let stats = UpdatePropagationStats::new();
@@ -2202,11 +2249,68 @@ mod tests {
         assert_eq!(reports[0].events.get(PropagationEvent::SkipSuperseded), 14);
     }
 
+    /// #6143 review round 7: a superseded leg is subtracted from the legs,
+    /// never counted as evidence that a leg ended unsent.
+    ///
+    /// Across windows: a relayed fan-out at the end of W-2 resolves 14 legs,
+    /// and the client update in W-1 supersedes all of them with its own 14,
+    /// which are still held. As evidence, the 14 superseded legs would meet
+    /// the client's 14 targets and WARN; subtracted, no leg is open
+    /// (14 - 14 = 0).
+    ///
+    /// Within one window: 14 targets, 7 superseded, 3 skipped, 4 held. Seven
+    /// legs are open and only 3 ended, so not a stall; as evidence, 7 + 3
+    /// would meet the 7 open legs.
+    #[test]
+    fn a_superseded_leg_is_not_evidence_of_a_stall() {
+        let stats = UpdatePropagationStats::new();
+        let superseded = PropagationEvent::SkipSuperseded;
+        let cross_window = cid(36);
+        stats.record_broadcast(cross_window, 14, 0);
+        assert!(stats.drain_stalls_for_test().is_empty(), "W-2");
+        client_update(&stats, cross_window, 14, &[(superseded, 14)]);
+        let partly_held = cid(37);
+        client_update(
+            &stats,
+            partly_held,
+            14,
+            &[(superseded, 7), (PropagationEvent::SkipSummaryEqual, 3)],
+        );
+        assert!(stats.drain_stalls_for_test().is_empty(), "grace");
+        let reports = stats.drain_stalls_for_test();
+        assert!(reports.is_empty(), "{reports:#?}");
+    }
+
+    /// #6143 review round 7: a leg evicted from the full broadcast queue
+    /// counts `skip_evicted`, a counter only. It is not evidence (14 targets
+    /// all evicted is no stall), and it is not subtracted from the legs
+    /// (14 targets, 7 evicted, 7 skipped is no stall either: 7 skips do not
+    /// reach 14 legs). So an eviction can only hide a stall, never raise one.
+    #[test]
+    fn an_evicted_leg_is_neither_evidence_nor_subtracted() {
+        let stats = UpdatePropagationStats::new();
+        let evicted = PropagationEvent::SkipEvicted;
+        let all_evicted = cid(38);
+        client_update(&stats, all_evicted, 14, &[(evicted, 14)]);
+        let half_evicted = cid(39);
+        client_update(
+            &stats,
+            half_evicted,
+            14,
+            &[(evicted, 7), (PropagationEvent::SkipSummaryEqual, 7)],
+        );
+        assert!(stats.drain_stalls_for_test().is_empty(), "grace");
+        let reports = stats.drain_stalls_for_test();
+        assert!(reports.is_empty(), "{reports:#?}");
+    }
+
     /// #6143 review round 6: a heal (`SyncStateToPeer`) registers its own leg
     /// (`heal_target`), so its skip accounts for that leg and never for a
     /// fan-out leg still held. Repeated converged heals beside a client
     /// update whose 14 legs are all held are not a stall; heals that skip
-    /// beside fan-out legs that all skipped are part of one.
+    /// beside fan-out legs that all skipped are part of one. A client update
+    /// whose fan-out resolved no target is not a stall on heal skips alone
+    /// (review round 7): heals are not the client update's legs.
     #[test]
     fn a_heal_skip_accounts_for_its_own_leg_only() {
         let stats = UpdatePropagationStats::new();
@@ -2221,6 +2325,9 @@ mod tests {
         // The heals land in W.
         let heals_next = cid(35);
         client_update(&stats, heals_next, 14, &[]);
+        // No fan-out target at all, only heals, every one skipped.
+        let no_targets = cid(40);
+        client_update(&stats, no_targets, 0, &[(heal, 3), (skip, 3)]);
         assert!(stats.drain_stalls_for_test().is_empty(), "grace");
         record(&stats, heals_next, &[(heal, 14), (skip, 14)]);
         let stalled: Vec<_> = stats
@@ -2584,6 +2691,18 @@ mod tests {
             out
         };
         let calls = |needle: &str| body.matches(needle).count();
+
+        // Every `count(..)` below records against the fan-out's own contract:
+        // the closure is defined once, at the fan-out's top level, keyed by
+        // `key`.
+        let closure = "letcount=|ev|record_propagation_event(op_manager,key.id(),ev);";
+        assert_eq!(calls("letcount="), 1, "one `count` closure");
+        let closure_at = body.find(closure).expect("`count` records against `key`");
+        assert_eq!(
+            body[..closure_at].matches('{').count(),
+            body[..closure_at].matches('}').count() + 1,
+            "the `count` closure is defined at the fan-out's top level"
+        );
 
         // Not hosted: one count per target, then out.
         let not_hosted = "count(PropagationEvent::SkipNotHosted);";

@@ -553,9 +553,10 @@ WHEN adding a way for a broadcast leg, fan-out or heal to end:
     (`broadcast_queue.rs`) and the simulation's inline copy
     (`p2p_protoc/broadcast.rs::broadcast_state_to_peers`), pinned by
     `the_simulation_fan_out_counts_its_legs` (exact call counts at statement
-    position). One known difference: the simulation's streamed full state
+    position). Two known differences: the simulation's streamed full state
     counts `sent_full` but no `wire_stream` or stream fate, since its
-    `send_stream` gives no completion signal.
+    `send_stream` gives no completion signal; and it has no queue, so it
+    never counts `skip_superseded` or `skip_evicted`.
   → A stream's fate goes through `record_propagation_stream_fate` (or
     `PropagationSink::record_stream_fate`), which maps the completion signal
     to its `wire_stream_*` event.
@@ -566,10 +567,10 @@ WHEN adding a way for a broadcast leg, fan-out or heal to end:
 The fields: `client_originated` (a client apply that changed
 state); `sent_delta` / `sent_full` (handed to the bridge); the skips
 `skip_summary_equal`, `skip_cached_converged`, `skip_probe_converged`,
-`skip_empty_delta`, `skip_not_hosted`, `skip_no_address`, `skip_superseded`;
-`send_failed`; transport `wire_short` (one packet), `wire_stream` and its fate
-`wire_stream_delivered` / `_failed` / `_egress_abandoned`, `wire_unobserved`
-(QUIC path), `wire_send_failed`; `fanout_event_dropped` /
+`skip_empty_delta`, `skip_not_hosted`, `skip_no_address`, `skip_superseded`,
+`skip_evicted`; `send_failed`; transport `wire_short` (one packet),
+`wire_stream` and its fate `wire_stream_delivered` / `_failed` /
+`_egress_abandoned`, `wire_unobserved` (QUIC path), `wire_send_failed`; `fanout_event_dropped` /
 `heal_event_dropped` (`try_notify` refused); `heal_target` (a heal's leg,
 registered when its peer resolves); and the receiver's `rx_dedup`,
 `rx_already_applied`, `rx_backoff`.
@@ -586,17 +587,28 @@ telemetry) at the end of window W for a contract that, over W-1 and W
 together, had:
 
 - a client update in W-1;
-- every resolved leg ended unsent: the `skip_*` counts plus `send_failed`
-  reach the legs resolved, `targets_total` (fan-outs) plus `heal_target`
-  (heals), above zero. Or a fan-out was dropped (`fanout_event_dropped`);
+- every open leg ended unsent: the evidence skips (every `skip_*` but
+  `skip_superseded` and `skip_evicted`) plus `send_failed` reach the open
+  legs. The open legs are `targets_total` (fan-outs) plus `heal_target`
+  (heals) minus `skip_superseded`, above zero, and `targets_total` must be
+  above zero too. Or a fan-out was dropped (`fanout_event_dropped`);
 - nothing handed to the bridge (`sent_delta + sent_full == 0`).
 
 A queued leg replaced by a newer fan-out or heal for the same (contract,
 peer) pair counts `skip_superseded`: its update rides on the newer leg, whose
-own outcome decides whether anything was sent. Before #6143 a superseded leg
+own outcome decides whether anything was sent, so it is closed and subtracted
+from the legs. It is not evidence: a relayed fan-out counted before W-1 whose
+legs a client update supersedes would otherwise stand in for the client
+update's own legs while they are still held. Before #6143 a superseded leg
 recorded nothing, so a burst of client updates resolved more legs than could
 ever end, and the stall could not fire. A heal registers its own leg, so a
-heal's skip never stands in for a fan-out leg's outcome.
+heal's skip never stands in for a fan-out leg's outcome, and heals alone,
+with no fan-out target, are never a stall.
+
+A leg the full broadcast queue drops to make room (`evict_oldest`) counts
+`skip_evicted` against its own contract. It is a counter only, neither
+evidence nor subtracted, so an eviction can only hide a stall, never raise
+one.
 
 W is grace for a leg queued late in W-1, and reading both windows catches an
 update applied at the end of W-1 whose fan-out is processed in W. The state
@@ -617,26 +629,29 @@ beside siblings that are only held is not a stall.
 So the WARN targets the sender-side shapes: every leg skipped or refused by
 the bridge, or the whole fan-out dropped. Transport outcomes (`wire_*`) are
 counters only and never raise it, so a slow stream delivered many windows
-later is never a false WARN, and a failed one never a WARN. A client update whose legs were all
-skipped as converged (`skip_summary_equal` and the like) counts as a stall:
-the update changed this node's state, so no peer can already hold it, and the
-skip means this node's belief about the peer is stale. That is the leading
+later is never a false WARN, and a failed one never a WARN.
+
+A client update whose legs were all skipped as converged
+(`skip_summary_equal` and the like) counts as a stall: the update changed
+this node's state, so no peer can already hold it, and the skip means this
+node's belief about the peer is stale. That is the leading
 #6143 hypothesis. Exception: a contract with a lossy summary (two states can
 share one) can legitimately match a peer's summary after a real change, so
 its WARNs describe the contract, not the network.
 
-Do not rebuild stream-fate tracking into the WARN. Three review rounds of a
-per-window candidate carry that waited on each stream's fate each found new
-false-WARN and missed-WARN bugs, and it still could not see the likeliest
-transport losses (#6145).
+Do not rebuild stream-fate tracking into the WARN. Waiting on each stream's
+fate means carrying candidates across windows, which raises false and missed
+WARNs at every window boundary, and it still cannot see the likeliest
+transport losses.
 
 **It cannot see:**
 - loss at or after the transport: a stream that fails after the bridge took
   it, a single packet abandoned after its retransmits, a lost QUIC message.
   Diagnose those from the `wire_*` counts and the receivers' `rx_*` counts
   across the fleet;
-- legs evicted from the broadcast queue at capacity (`evict_oldest`): no
-  event is counted, though the queue WARNs each eviction itself;
+- a fan-out with a leg evicted from the broadcast queue at capacity
+  (`evict_oldest`): that leg counts only `skip_evicted`, so the others can
+  never account for every leg. The queue also WARNs each eviction itself;
 - relayed updates: only a client update makes a contract a candidate;
 - partial failure: one leg handed to the bridge in either window clears the
   contract, so 13 of 14 legs failing raises nothing;
