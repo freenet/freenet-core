@@ -3510,6 +3510,37 @@ async fn send_observed_broadcast(
     Ok(())
 }
 
+/// Send one message serialized by the caller, returning its length. A
+/// serialization failure is reported exactly as a failed send. For an inline
+/// UPDATE broadcast (`broadcast_contract`), the transport's carriage is
+/// counted, and so is a serialization failure, as `WireSendFailed` (#6143):
+/// the bridge already took that leg and counted its `Sent*`, so it ends
+/// unsent here, below the bridge.
+async fn send_serialized_message(
+    conn: &mut Box<dyn PeerConnectionApi>,
+    serialized: bincode::Result<Vec<u8>>,
+    broadcast_contract: Option<freenet_stdlib::prelude::ContractInstanceId>,
+    propagation: &crate::operations::update::propagation_stats::PropagationSink,
+) -> Result<usize, TransportError> {
+    use crate::operations::update::propagation_stats::PropagationEvent;
+
+    let data = match serialized {
+        Ok(data) => data,
+        Err(error) => {
+            if let Some(contract) = broadcast_contract {
+                propagation.record(&contract, PropagationEvent::WireSendFailed);
+            }
+            return Err(serialization_failure(error));
+        }
+    };
+    let serialized_len = data.len();
+    match broadcast_contract {
+        Some(contract) => send_observed_broadcast(conn, data, contract, propagation).await,
+        None => conn.send_bytes(data).await,
+    }
+    .map(|()| serialized_len)
+}
+
 async fn handle_peer_channel_message(
     conn: &mut Box<dyn PeerConnectionApi>,
     msg: Either<NetMessage, ConnEvent>,
@@ -3527,21 +3558,14 @@ async fn handle_peer_channel_message(
                 crate::node::network_bridge::outbound_message_mix::OutboundClass::classify(&msg);
             let broadcast_contract = inline_broadcast_contract(&msg);
             // The transport moves bytes; serializing the message is this
-            // layer's job. A serialization failure is reported exactly as a
-            // failed send.
-            let sent = match bincode::serialize(&msg) {
-                Ok(data) => {
-                    let serialized_len = data.len();
-                    match broadcast_contract {
-                        Some(contract) => {
-                            send_observed_broadcast(conn, data, contract, propagation).await
-                        }
-                        None => conn.send_bytes(data).await,
-                    }
-                    .map(|()| serialized_len)
-                }
-                Err(error) => Err(serialization_failure(error)),
-            };
+            // layer's job.
+            let sent = send_serialized_message(
+                conn,
+                bincode::serialize(&msg),
+                broadcast_contract,
+                propagation,
+            )
+            .await;
             match sent {
                 Ok(serialized_len) => {
                     // #4956: attribute the bytes to the message kind that
@@ -4376,6 +4400,47 @@ pub(crate) mod tests {
         let rollup = mix.rollup_body_for_test();
         assert_eq!(rollup["total_msgs"], 0);
         assert_eq!(rollup["total_bytes"], 0);
+    }
+
+    /// #6143 review round 6: an inline UPDATE broadcast the connection task
+    /// cannot serialize ends there, below the bridge, which already counted
+    /// its `Sent*`. It is counted as `wire_send_failed` (not the bridge's
+    /// `send_failed`) in the summary and in telemetry, and nothing reaches the
+    /// transport. A message that is not a broadcast counts nothing.
+    #[tokio::test]
+    async fn a_broadcast_that_fails_to_serialize_is_counted_as_wire_send_failed() {
+        use crate::operations::update::propagation_stats::{
+            PropagationEvent as Ev, PropagationSink,
+        };
+
+        let (sink, stats, telemetry) = PropagationSink::for_test();
+        let sent = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let mut conn: Box<dyn super::PeerConnectionApi> = Box::new(RecordingConnection {
+            sent: sent.clone(),
+            fail: false,
+            observe: None,
+        });
+        let contract = freenet_stdlib::prelude::ContractInstanceId::new([63u8; 32]);
+        let unserializable =
+            || -> bincode::Result<Vec<u8>> { Err(Box::new(bincode::ErrorKind::SizeLimit)) };
+
+        let result =
+            super::send_serialized_message(&mut conn, unserializable(), Some(contract), &sink)
+                .await;
+        assert!(result.is_err(), "reported as a failed send");
+        assert!(sent.lock().is_empty(), "nothing reached the transport");
+        let events = stats.events_for_test(&contract);
+        assert_eq!(events.get(Ev::WireSendFailed), 1, "{events:?}");
+        assert_eq!(events.get(Ev::SendFailed), 0, "{events:?}");
+        assert_eq!(telemetry.propagation_event_for_test(Ev::WireSendFailed), 1);
+
+        let result = super::send_serialized_message(&mut conn, unserializable(), None, &sink).await;
+        assert!(result.is_err());
+        assert_eq!(
+            telemetry.propagation_event_for_test(Ev::WireSendFailed),
+            1,
+            "a message that is not a broadcast is not counted"
+        );
     }
 
     /// #6143: an inline UPDATE broadcast, either wire variant, is counted

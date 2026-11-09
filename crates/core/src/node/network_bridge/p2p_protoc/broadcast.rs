@@ -731,11 +731,11 @@ impl P2pConnManager {
             return;
         }
 
-        let target = op_manager
-            .ring
-            .connection_manager
-            .get_peer_by_addr(target_addr);
-        let Some(target) = target else {
+        // Registers the heal's leg for the stall check (#6143), on both the
+        // production and the simulation path below.
+        let Some(target) =
+            super::super::broadcast_queue::resolve_heal_target(op_manager, &key, target_addr)
+        else {
             tracing::debug!(
                 contract = %key,
                 peer = %target_addr,

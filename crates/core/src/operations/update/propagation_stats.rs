@@ -58,11 +58,20 @@
 //! contract that over windows W-1 and W together had:
 //! - a local client update in W-1;
 //! - every resolved leg ended unsent: the `skip_*` counts plus the legs the
-//!   bridge refused (`send_failed`) reach the targets resolved
-//!   (`targets_total`, above zero). Or a whole fan-out was dropped
-//!   (`fanout_event_dropped`);
+//!   bridge refused (`send_failed`) reach the legs resolved (`targets_total`
+//!   for fan-outs plus `heal_target` for heals, above zero). Or a whole
+//!   fan-out was dropped (`fanout_event_dropped`);
 //! - nothing at all handed to the network bridge (`sent_delta + sent_full`
 //!   is zero across both windows).
+//!
+//! A queued leg replaced by a newer fan-out or heal for the same (contract,
+//! peer) pair counts `skip_superseded`: its update rides on the newer leg,
+//! whose own outcome decides whether anything was sent. Before #6143 a
+//! superseded leg recorded nothing, so two client updates in a burst counted
+//! twice the targets against at most half as many outcomes, and every leg
+//! could never be accounted for. A heal registers its leg as `heal_target`,
+//! as a fan-out registers its targets, so a heal's skip never stands in for
+//! a fan-out leg's outcome.
 //!
 //! W is grace for a leg queued near the end of W-1, and judging the two
 //! windows together catches an update applied at the end of W-1 whose
@@ -103,10 +112,10 @@
 //! How it can be wrong:
 //! - The drop counter cannot tell a client fan-out from a relayed one, so a
 //!   relayed fan-out dropped beside a client update whose legs are still
-//!   held counts as the client's. A relayed fan-out's skips do not do this
-//!   alone, since it adds its own targets too; but the legs of a fan-out
-//!   whose targets were counted before W-1 can record their skips in W-1,
-//!   and those count toward the client update's legs.
+//!   held counts as the client's. A relayed fan-out's or a heal's skips do
+//!   not do this alone, since each registers its own legs too; but the legs
+//!   of a fan-out whose targets were counted before W-1 can record their
+//!   skips in W-1, and those count toward the client update's legs.
 //! - A contract whose window-W counts were refused at the
 //!   [`MAX_TRACKED_CONTRACTS`] cap reads as having sent nothing in W, so at
 //!   the cap a send in W can go unseen and the WARN can be false.
@@ -148,17 +157,18 @@ const TOP_K: usize = 8;
 /// capacity, rather than letting a key churn grow the map without bound.
 /// 4096 is comfortably above the active-contract count of a busy gateway.
 /// Each entry is at most [`MAX_COUNTERS_SIZE`] plus its key (pinned by
-/// `a_tracked_contract_stays_within_its_memory_bound`), about 1 MB of entries
-/// at the cap. A hash table holds 4096 entries in 8192 buckets (hashbrown's
-/// 7/8 load factor rounds up to the next power of two), so the map is about
-/// 2 MB at the cap. The previous window's client-updated summaries kept for
-/// the stall check are bounded the same way: about 4 MB for the two.
+/// `a_tracked_contract_stays_within_its_memory_bound`), about 1.3 MB of
+/// entries at the cap. A hash table holds 4096 entries in 8192 buckets
+/// (hashbrown's 7/8 load factor rounds up to the next power of two), so the
+/// map is about 2.6 MB at the cap. The previous window's client-updated
+/// summaries kept for the stall check are bounded the same way: about 5 MB
+/// for the two.
 const MAX_TRACKED_CONTRACTS: usize = 4096;
 
 /// Upper bound on `size_of::<ContractCounters>()` and
 /// `size_of::<ContractSummary>()`, for the memory estimate above.
 #[cfg(test)]
-const MAX_COUNTERS_SIZE: usize = 256;
+const MAX_COUNTERS_SIZE: usize = 288;
 
 /// Most stall WARN lines in one window. Past it, one more WARN gives the
 /// number left out. Each WARN is one contract, so this bounds the per-node
@@ -194,6 +204,11 @@ pub(crate) enum PropagationEvent {
     SkipNotHosted,
     /// Skipped: the target had no socket address.
     SkipNoAddress,
+    /// Ended unsent: a newer fan-out or heal replaced this leg's queued
+    /// (contract, peer) entry before it ran. Its update rides on the newer
+    /// leg, whose own outcome decides whether anything was sent; this leg
+    /// recorded nothing before #6143.
+    SkipSuperseded,
     /// The network bridge refused a leg: `bridge.send` or the stream dispatch
     /// returned `Err`, or the payload failed to serialize. That leg counts no
     /// `Sent*`, so this is a per-leg outcome disjoint from `SentDelta` /
@@ -206,6 +221,10 @@ pub(crate) enum PropagationEvent {
     /// A `SyncStateToPeer` (a targeted heal) was dropped because the
     /// event-loop notification channel was full.
     HealEventDropped,
+    /// A targeted heal resolved its peer and started a leg. The heal's
+    /// counterpart of a fan-out's resolved targets (`targets_total`), so the
+    /// stall check has a leg for each heal leg's outcome.
+    HealTarget,
     /// Transport: an UPDATE broadcast message left as one UDP packet. It is
     /// retransmitted until acknowledged or abandoned, and nothing reports
     /// which, so this is the last thing observed of it.
@@ -227,8 +246,9 @@ pub(crate) enum PropagationEvent {
     /// egress deadline. The transport logs these per stream at debug only.
     WireStreamEgressAbandoned,
     /// Transport: the connection task could not send an inline UPDATE
-    /// broadcast the bridge had already taken (the connection refused it, or
-    /// was failing while draining its queue before shutdown). That leg
+    /// broadcast the bridge had already taken (the message failed to
+    /// serialize, the connection refused it, or it was failing while
+    /// draining its queue before shutdown). That leg
     /// counted a `Sent*` event when the bridge took it, possibly in an
     /// earlier window. A counter only, like every `Wire*` event.
     WireSendFailed,
@@ -245,7 +265,7 @@ pub(crate) enum PropagationEvent {
 impl PropagationEvent {
     /// Every event, in reporting order. Kept in lockstep with
     /// [`Self::index`] by `propagation_events_are_densely_indexed`.
-    pub(crate) const ALL: [PropagationEvent; 22] = [
+    pub(crate) const ALL: [PropagationEvent; 24] = [
         PropagationEvent::ClientOriginated,
         PropagationEvent::SentDelta,
         PropagationEvent::SentFull,
@@ -255,9 +275,11 @@ impl PropagationEvent {
         PropagationEvent::SkipEmptyDelta,
         PropagationEvent::SkipNotHosted,
         PropagationEvent::SkipNoAddress,
+        PropagationEvent::SkipSuperseded,
         PropagationEvent::SendFailed,
         PropagationEvent::FanoutEventDropped,
         PropagationEvent::HealEventDropped,
+        PropagationEvent::HealTarget,
         PropagationEvent::WireShort,
         PropagationEvent::WireStream,
         PropagationEvent::WireUnobserved,
@@ -283,19 +305,21 @@ impl PropagationEvent {
             PropagationEvent::SkipEmptyDelta => 6,
             PropagationEvent::SkipNotHosted => 7,
             PropagationEvent::SkipNoAddress => 8,
-            PropagationEvent::SendFailed => 9,
-            PropagationEvent::FanoutEventDropped => 10,
-            PropagationEvent::HealEventDropped => 11,
-            PropagationEvent::WireShort => 12,
-            PropagationEvent::WireStream => 13,
-            PropagationEvent::WireUnobserved => 14,
-            PropagationEvent::WireStreamDelivered => 15,
-            PropagationEvent::WireStreamFailed => 16,
-            PropagationEvent::WireStreamEgressAbandoned => 17,
-            PropagationEvent::WireSendFailed => 18,
-            PropagationEvent::RxDedup => 19,
-            PropagationEvent::RxAlreadyApplied => 20,
-            PropagationEvent::RxBackoff => 21,
+            PropagationEvent::SkipSuperseded => 9,
+            PropagationEvent::SendFailed => 10,
+            PropagationEvent::FanoutEventDropped => 11,
+            PropagationEvent::HealEventDropped => 12,
+            PropagationEvent::HealTarget => 13,
+            PropagationEvent::WireShort => 14,
+            PropagationEvent::WireStream => 15,
+            PropagationEvent::WireUnobserved => 16,
+            PropagationEvent::WireStreamDelivered => 17,
+            PropagationEvent::WireStreamFailed => 18,
+            PropagationEvent::WireStreamEgressAbandoned => 19,
+            PropagationEvent::WireSendFailed => 20,
+            PropagationEvent::RxDedup => 21,
+            PropagationEvent::RxAlreadyApplied => 22,
+            PropagationEvent::RxBackoff => 23,
         }
     }
 
@@ -310,6 +334,7 @@ impl PropagationEvent {
                 | PropagationEvent::SkipEmptyDelta
                 | PropagationEvent::SkipNotHosted
                 | PropagationEvent::SkipNoAddress
+                | PropagationEvent::SkipSuperseded
         )
     }
 
@@ -352,9 +377,11 @@ impl PropagationEvent {
             PropagationEvent::SkipEmptyDelta => "skip_empty_delta",
             PropagationEvent::SkipNotHosted => "skip_not_hosted",
             PropagationEvent::SkipNoAddress => "skip_no_address",
+            PropagationEvent::SkipSuperseded => "skip_superseded",
             PropagationEvent::SendFailed => "send_failed",
             PropagationEvent::FanoutEventDropped => "fanout_event_dropped",
             PropagationEvent::HealEventDropped => "heal_event_dropped",
+            PropagationEvent::HealTarget => "heal_target",
             PropagationEvent::WireShort => "wire_short",
             PropagationEvent::WireStream => "wire_stream",
             PropagationEvent::WireUnobserved => "wire_unobserved",
@@ -625,12 +652,16 @@ fn stall_of(previous: &ContractSummary, current: Option<&ContractSummary>) -> Op
     // was dropped before it resolved any. Resolved targets alone are not
     // evidence, and neither is one refused leg among them: a leg held while
     // its (contract, peer) pair is busy with a stream, or queued behind the
-    // large lane's permits, records nothing for as long as it waits.
+    // large lane's permits, records nothing for as long as it waits. The
+    // legs are the fan-outs' resolved targets plus the heals'
+    // (`heal_target`): a heal's leg can skip too, and must not be read as a
+    // fan-out leg's outcome.
+    let legs = targets_total.saturating_add(events.get(PropagationEvent::HealTarget));
     let ended_unsent = PropagationEvent::ALL
         .iter()
         .filter(|ev| ev.is_skip() || **ev == PropagationEvent::SendFailed)
         .fold(0u64, |n, &ev| n.saturating_add(events.get(ev)));
-    let every_leg_ended_unsent = targets_total > 0 && ended_unsent >= targets_total;
+    let every_leg_ended_unsent = legs > 0 && ended_unsent >= legs;
     let fanout_dropped = events.get(PropagationEvent::FanoutEventDropped) > 0;
     ((every_leg_ended_unsent || fanout_dropped) && events.sent() == 0).then_some(StallReport {
         contract: previous.contract,
@@ -646,8 +677,9 @@ fn stall_of(previous: &ContractSummary, current: Option<&ContractSummary>) -> Op
 ///
 /// A contract stalls when, over W-1 and W together, it had:
 /// - a client update in W-1;
-/// - every resolved leg accounted for as ended unsent (the `skip_*` counts
-///   plus `send_failed` reach `targets_total`, which is above zero), or a
+/// - every resolved leg accounted for as ended unsent (the `skip_*` counts,
+///   `skip_superseded` included, plus `send_failed` reach the legs
+///   resolved: `targets_total` plus `heal_target`, above zero), or a
 ///   fan-out dropped by `try_notify` (`fanout_event_dropped`);
 /// - nothing handed to the bridge (`sent_delta + sent_full == 0`).
 ///
@@ -923,6 +955,7 @@ impl UpdatePropagationStats {
             skip_empty_delta = e.get(PropagationEvent::SkipEmptyDelta),
             skip_not_hosted = e.get(PropagationEvent::SkipNotHosted),
             skip_no_address = e.get(PropagationEvent::SkipNoAddress),
+            skip_superseded = e.get(PropagationEvent::SkipSuperseded),
             send_failed = e.get(PropagationEvent::SendFailed),
             wire_short = e.get(PropagationEvent::WireShort),
             wire_stream = e.get(PropagationEvent::WireStream),
@@ -933,6 +966,7 @@ impl UpdatePropagationStats {
             wire_send_failed = e.get(PropagationEvent::WireSendFailed),
             fanout_event_dropped = e.get(PropagationEvent::FanoutEventDropped),
             heal_event_dropped = e.get(PropagationEvent::HealEventDropped),
+            heal_target = e.get(PropagationEvent::HealTarget),
             rx_dedup = e.get(PropagationEvent::RxDedup),
             rx_already_applied = e.get(PropagationEvent::RxAlreadyApplied),
             rx_backoff = e.get(PropagationEvent::RxBackoff),
@@ -959,6 +993,7 @@ impl UpdatePropagationStats {
                 skip_empty_delta = e.get(PropagationEvent::SkipEmptyDelta),
                 skip_not_hosted = e.get(PropagationEvent::SkipNotHosted),
                 skip_no_address = e.get(PropagationEvent::SkipNoAddress),
+                skip_superseded = e.get(PropagationEvent::SkipSuperseded),
                 send_failed = e.get(PropagationEvent::SendFailed),
                 wire_short = e.get(PropagationEvent::WireShort),
                 wire_stream = e.get(PropagationEvent::WireStream),
@@ -969,6 +1004,7 @@ impl UpdatePropagationStats {
                 wire_send_failed = e.get(PropagationEvent::WireSendFailed),
                 fanout_event_dropped = e.get(PropagationEvent::FanoutEventDropped),
                 heal_event_dropped = e.get(PropagationEvent::HealEventDropped),
+                heal_target = e.get(PropagationEvent::HealTarget),
                 rx_dedup = e.get(PropagationEvent::RxDedup),
                 rx_already_applied = e.get(PropagationEvent::RxAlreadyApplied),
                 rx_backoff = e.get(PropagationEvent::RxBackoff),
@@ -1066,7 +1102,9 @@ fn log_stall(stall: &StallReport) {
         skip_empty_delta = e.get(PropagationEvent::SkipEmptyDelta),
         skip_not_hosted = e.get(PropagationEvent::SkipNotHosted),
         skip_no_address = e.get(PropagationEvent::SkipNoAddress),
+        skip_superseded = e.get(PropagationEvent::SkipSuperseded),
         send_failed = e.get(PropagationEvent::SendFailed),
+        heal_target = e.get(PropagationEvent::HealTarget),
         fanout_event_dropped = e.get(PropagationEvent::FanoutEventDropped),
         window_s = SUMMARY_WINDOW.as_secs(),
         phase = "origination_stall",
@@ -2048,7 +2086,7 @@ mod tests {
             .into_iter()
             .filter(|ev| ev.is_skip())
             .collect();
-        assert_eq!(skips.len(), 6, "a new skip reason needs a look here");
+        assert_eq!(skips.len(), 7, "a new skip reason needs a look here");
         for skip in skips {
             let stats = UpdatePropagationStats::new();
             let c = cid(25);
@@ -2107,7 +2145,90 @@ mod tests {
             stats.record_event(next, sent);
             assert!(stats.drain_stalls_for_test().is_empty(), "{sent:?}");
             assert!(stats.drain_stalls_for_test().is_empty(), "{sent:?}");
+
+            // A dropped fan-out is evidence, but a send still clears it, in
+            // the same window or the next. (A rule that let a drop warn
+            // whatever was sent fails here and nowhere else.)
+            let stats = UpdatePropagationStats::new();
+            let (dropped_same, dropped_next) = (cid(15), cid(16));
+            let dropped = (PropagationEvent::FanoutEventDropped, 1);
+            client_update(&stats, dropped_same, 0, &[dropped, (sent, 1)]);
+            client_update(&stats, dropped_next, 0, &[dropped]);
+            assert!(stats.drain_stalls_for_test().is_empty(), "{sent:?}: grace");
+            stats.record_event(dropped_next, sent);
+            assert!(
+                stats.drain_stalls_for_test().is_empty(),
+                "{sent:?} beside a dropped fan-out"
+            );
         }
+    }
+
+    /// #6143 review round 6: a newer fan-out that replaces a queued leg ends
+    /// that leg as `skip_superseded`. Two client updates of 14 targets each
+    /// resolve 28 legs, but at most 14 reach a send, a skip or a refusal; the
+    /// other 14 were superseded. Uncounted, every leg could never be
+    /// accounted for, and this burst, the #6143 shape, could never warn.
+    #[test]
+    fn a_superseded_leg_is_accounted_for_as_ended_unsent() {
+        let stats = UpdatePropagationStats::new();
+        let superseded = (PropagationEvent::SkipSuperseded, 14);
+        // The newer legs all skipped as converged.
+        let skipped = cid(30);
+        client_update(&stats, skipped, 14, &[]);
+        client_update(
+            &stats,
+            skipped,
+            14,
+            &[superseded, (PropagationEvent::SkipSummaryEqual, 14)],
+        );
+        // The newer legs still held: no outcome yet, so not a stall.
+        let held = cid(31);
+        client_update(&stats, held, 14, &[]);
+        client_update(&stats, held, 14, &[superseded]);
+        // The newer legs sent.
+        let sent = cid(32);
+        client_update(&stats, sent, 14, &[]);
+        client_update(
+            &stats,
+            sent,
+            14,
+            &[superseded, (PropagationEvent::SentDelta, 14)],
+        );
+        assert!(stats.drain_stalls_for_test().is_empty(), "grace");
+        let reports = stats.drain_stalls_for_test();
+        let stalled: Vec<_> = reports.iter().map(|r| r.contract).collect();
+        assert_eq!(stalled, vec![skipped]);
+        assert_eq!(reports[0].targets_total, 28);
+        assert_eq!(reports[0].events.get(PropagationEvent::SkipSuperseded), 14);
+    }
+
+    /// #6143 review round 6: a heal (`SyncStateToPeer`) registers its own leg
+    /// (`heal_target`), so its skip accounts for that leg and never for a
+    /// fan-out leg still held. Repeated converged heals beside a client
+    /// update whose 14 legs are all held are not a stall; heals that skip
+    /// beside fan-out legs that all skipped are part of one.
+    #[test]
+    fn a_heal_skip_accounts_for_its_own_leg_only() {
+        let stats = UpdatePropagationStats::new();
+        let (heal, skip) = (
+            PropagationEvent::HealTarget,
+            PropagationEvent::SkipSummaryEqual,
+        );
+        let held = cid(33);
+        client_update(&stats, held, 14, &[(heal, 14), (skip, 14)]);
+        let every_leg = cid(34);
+        client_update(&stats, every_leg, 3, &[(heal, 2), (skip, 5)]);
+        // The heals land in W.
+        let heals_next = cid(35);
+        client_update(&stats, heals_next, 14, &[]);
+        assert!(stats.drain_stalls_for_test().is_empty(), "grace");
+        record(&stats, heals_next, &[(heal, 14), (skip, 14)]);
+        let stalled: Vec<_> = stats
+            .drain_stalls_for_test()
+            .into_iter()
+            .map(|r| r.contract)
+            .collect();
+        assert_eq!(stalled, vec![every_leg]);
     }
 
     /// Only W-1 and W are read: a send two windows before the client update
@@ -2384,9 +2505,15 @@ mod tests {
     /// A source pin, not a behavioural test: that function exists only under
     /// `simulation_tests`, which the lib test job does not build, and the
     /// simulation job runs no lib test outside `sim_e2e_tests`. So each
-    /// recording site is pinned exactly: the expected number of calls, each
-    /// at statement position, inside that function's body. Deleting one of
-    /// the two `SendFailed` calls, or commenting any call out, fails it.
+    /// recording site is pinned in its place, on the function's body with
+    /// comments and whitespace removed (so a commented-out call is gone and
+    /// rustfmt cannot move a needle): the number of calls, and for each its
+    /// context. The `SkipNotHosted` count runs once per target; every other
+    /// site is in the per-target loop; each skip and the serialization
+    /// failure end their leg with a `continue` in the same block; the refused
+    /// send is counted in the `Err` arm of the send result and the `Sent*`
+    /// count in its `else` arm, with the delta and full arms the right way
+    /// round.
     #[test]
     fn the_simulation_fan_out_counts_its_legs() {
         let src = include_str!("../../node/network_bridge/p2p_protoc/broadcast.rs");
@@ -2403,38 +2530,132 @@ mod tests {
         let len = src[at..]
             .find("\n    }\n")
             .expect("end of the simulation fan-out not found");
-        let body = &src[at..at + len];
-        let at_statement = |needle: &str| {
-            body.lines()
-                .filter(|line| line.trim_start().starts_with(needle))
-                .count()
+        // Line comments and all whitespace removed. The body holds no string
+        // with `//` in it, so cutting at `//` removes only comments.
+        let body: String = src[at..at + len]
+            .lines()
+            .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+            .flat_map(str::chars)
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        // The span of the block whose `{` is at `open`, without its braces.
+        let block = |text: &str, open: usize| -> (usize, usize) {
+            assert_eq!(&text[open..=open], "{", "not a block");
+            let mut depth = 0usize;
+            for (i, ch) in text[open..].char_indices() {
+                match ch {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return (open + 1, open + i);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            panic!("unbalanced block at {open}");
         };
-        for (needle, want) in [
-            ("count(PropagationEvent::SkipNotHosted);", 1),
-            ("count(PropagationEvent::SkipNoAddress);", 1),
-            ("count(skip);", 1),
-            ("count(PropagationEvent::SkipEmptyDelta);", 1),
-            // Payload serialization failure and a refused send.
-            ("count(PropagationEvent::SendFailed);", 2),
-            ("count(if sent_delta {", 1),
-        ] {
+        // The block opened by the unique occurrence of `head`, which ends
+        // in `{`.
+        let block_after = |text: &str, head: &str| -> (usize, usize) {
             assert_eq!(
-                at_statement(needle),
-                want,
-                "the simulation fan-out's calls of `{needle}`"
+                text.matches(head).count(),
+                1,
+                "the simulation fan-out must hold `{head}` once"
+            );
+            let open = text.find(head).map(|i| i + head.len() - 1).unwrap_or(0);
+            block(text, open)
+        };
+        // What follows `at` up to the end of its block, at that block's
+        // nesting level only.
+        let rest_of_block = |text: &str, at: usize| -> String {
+            let mut depth = 0usize;
+            let mut out = String::new();
+            for ch in text[at..].chars() {
+                match ch {
+                    '{' => depth += 1,
+                    '}' if depth == 0 => break,
+                    '}' => depth -= 1,
+                    _ if depth == 0 => out.push(ch),
+                    _ => {}
+                }
+            }
+            out
+        };
+        let calls = |needle: &str| body.matches(needle).count();
+
+        // Not hosted: one count per target, then out.
+        let not_hosted = "count(PropagationEvent::SkipNotHosted);";
+        assert_eq!(calls(not_hosted), 1, "`{not_hosted}`");
+        assert!(
+            body.contains(&format!(
+                "for_in&target_result.targets{{{not_hosted}}}return;"
+            )),
+            "the not-hosted skip must be counted once per target"
+        );
+
+        let (loop_start, loop_end) = block_after(&body, "fortargetin&target_result.targets{");
+        let per_leg = &body[loop_start..loop_end];
+        // The no-address skip is the loop's first statement and ends the leg.
+        assert!(
+            per_leg.starts_with(
+                "letSome(peer_addr)=target.socket_addr()else{\
+                 count(PropagationEvent::SkipNoAddress);continue;};"
+            ),
+            "the no-address skip must be counted, then end its leg"
+        );
+        // Each skip, and the serialization failure, ends its leg.
+        for needle in [
+            "count(PropagationEvent::SkipNoAddress);",
+            "count(skip);",
+            "count(PropagationEvent::SkipEmptyDelta);",
+        ] {
+            assert_eq!(calls(needle), 1, "`{needle}`");
+            let at = per_leg.find(needle).expect("in the per-target loop");
+            assert!(
+                rest_of_block(per_leg, at + needle.len()).contains("continue;"),
+                "`{needle}` must end its leg"
             );
         }
-        // The two arms of `count(if sent_delta { .. } else { .. })`.
-        for (arm, want) in [
-            ("PropagationEvent::SentDelta", 1),
-            ("PropagationEvent::SentFull", 1),
-        ] {
-            assert_eq!(
-                at_statement(arm),
-                want,
-                "the simulation fan-out's `{arm}` arm"
-            );
-        }
+        let failed = "count(PropagationEvent::SendFailed);";
+        assert_eq!(calls(failed), 2, "`{failed}`");
+        assert_eq!(per_leg.matches(failed).count(), 2, "`{failed}` per leg");
+
+        // The send result: refused in `Err`, sent in `else`.
+        let head = "ifletErr(err)=send_result{";
+        let (err_start, err_end) = block_after(per_leg, head);
+        let err_arm = &per_leg[err_start..err_end];
+        assert!(
+            rest_of_block(err_arm, 0).contains(failed),
+            "a refused send must be counted in the `Err` arm"
+        );
+        let serialize_failed = per_leg
+            .match_indices(failed)
+            .map(|(i, _)| i)
+            .find(|&i| i < err_start || i >= err_end)
+            .expect("the serialization failure's count");
+        assert!(
+            rest_of_block(per_leg, serialize_failed + failed.len()).contains("continue;"),
+            "the serialization failure must end its leg"
+        );
+        assert!(
+            per_leg[err_end..].starts_with("}else{"),
+            "the send result must have an `else` arm"
+        );
+        let (else_start, else_end) = block(per_leg, err_end + "}else".len());
+        let sent =
+            "count(ifsent_delta{PropagationEvent::SentDelta}else{PropagationEvent::SentFull});";
+        assert_eq!(calls(sent), 1, "`{sent}`");
+        let else_arm = &per_leg[else_start..else_end];
+        let in_else = else_arm
+            .find(sent)
+            .expect("the `Sent*` count in the `else` arm");
+        assert_eq!(
+            else_arm[..in_else].matches('{').count(),
+            else_arm[..in_else].matches('}').count(),
+            "the `Sent*` count must be a statement of the send result's `else` arm"
+        );
     }
 
     /// Pin: every [`PropagationEvent`] is recorded somewhere in production
