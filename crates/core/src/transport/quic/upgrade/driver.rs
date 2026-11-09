@@ -615,9 +615,6 @@ impl QuicUpgrades {
         reported
     }
 
-    /// This node's caps on a path to `peer`, from the share at the wall clock now
-    /// ([`QuicPolicy::own_caps`]). A test's trace may give the ramp a start of
-    /// its own.
     /// What a test's trace notes of a data-share decision for `peer`: the pair's
     /// bucket and the share now (`slice`).
     #[cfg(any(test, feature = "testing"))]
@@ -646,6 +643,19 @@ impl QuicUpgrades {
         Some((share, self.path_clock.wall_now() + shift))
     }
 
+    /// Whether this node's data bit can still come on ([`QuicPolicy::bit_may_come_on`]).
+    /// A test's trace may give the ramp a start of its own.
+    fn bit_may_come_on(&self) -> bool {
+        #[cfg(any(test, feature = "testing"))]
+        if let Some((share, _)) = self.trace_ramp() {
+            return self.policy.bit_may_come_on_with(share);
+        }
+        self.policy.bit_may_come_on()
+    }
+
+    /// This node's caps on a path to `peer`, from the share at the wall clock now
+    /// ([`QuicPolicy::own_caps`]). A test's trace may give the ramp a start of
+    /// its own.
     fn own_caps(&self, peer: &TransportPublicKey) -> u32 {
         #[cfg(any(test, feature = "testing"))]
         if let Some((share, now)) = self.trace_ramp() {
@@ -737,11 +747,13 @@ impl Session {
                 caps
             })
         };
+        let bit_may_come_on = || self.hub.bit_may_come_on();
         let inputs = Inputs {
             now: (self.now)(),
             sample: GlobalRng::random_range(0.0..1.0),
             policy: &self.hub.policy,
             own_caps: &own_caps,
+            bit_may_come_on: &bit_may_come_on,
         };
         state.machine.step(inputs, event)
     }

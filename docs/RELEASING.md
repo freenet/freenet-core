@@ -500,6 +500,14 @@ Current wire-gated floors:
   the 5% share. That PR also updates the expectation that pins the release's
   share, the `quic-data-release-share` case in `simulation_integration.rs`.
 
+  Release notes. The release that sets T0 must say in its notes that `prefer`
+  nodes, which is every Linux and macOS node that did not set `transport-quic`,
+  start carrying data with a growing share of their pairs. A release cut from
+  main between the ramp code (#6138) and the T0 PR also changes something: it
+  makes `prefer` the default on Linux and macOS, at a share of 0. Its nodes
+  then behave as shadow nodes (no pair carries data, no path is recycled), but
+  its notes should still say that the default mode changed.
+
   Reading the ramp: each node logs at INFO when its share enters a new band
   ("QUIC data: this node offers data to this share of its pairs", with
   `data_percent`; at 0% it logs "offers data to none of its pairs"). With T0
@@ -513,7 +521,11 @@ Current wire-gated floors:
   `quic_carrying_loss_rate_*` (live), `quic_carrying_ended_loss_rate_*` (ended),
   `quic_carried_packets_sent` / `quic_carried_packets_lost`, and
   `quic_carried_paths_ended_below_floor`; read these, not the all-path
-  families, to judge data on QUIC.
+  families, to judge data on QUIC. Two known sources of noise: a recycle whose
+  close frame is lost reaches the peer as a lost connection, so it counts as a
+  charged fallback (`quic_fallback_reset`) instead of a recycle; and a backward
+  step of a node's wall clock lowers its share, after which the step forward
+  can turn a pair's bit on a second time and recycle it again.
 
   Emergency stop: a parked release, built and soaked before the ramp release is
   cut, is published through the normal auto-update stagger (0 to 4 h). It makes
@@ -523,6 +535,9 @@ Current wire-gated floors:
   back to `None`, which gives every node that set `transport-quic = "prefer"`
   itself (testers, possibly our own gateways) a share of 0, so none of its pairs
   carries data; only a node that also set `quic-data-percent` keeps a share.
+  A node takes either change only when it restarts into the release (an
+  auto-update restarts it, 0 to 4 h after publish). Until then its paths with
+  data keep carrying data: a path with data is never rechecked.
   Per-path fallback to UDP needs no release.
 
 When a NEW wire-gated feature first ships (not this one), set its floor to

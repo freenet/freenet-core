@@ -41,6 +41,8 @@ struct Rig {
     own_caps: u32,
     /// What the peer's `Ready` and `ReadyAck` carry in the table.
     peer_caps: u32,
+    /// Whether this node's data bit can still come on (a ramp).
+    bit_may_come_on: bool,
 }
 
 impl Rig {
@@ -63,6 +65,7 @@ impl Rig {
             sample: NO_JITTER,
             own_caps: 0,
             peer_caps: 0,
+            bit_may_come_on: true,
         }
     }
 
@@ -98,11 +101,14 @@ impl Rig {
     fn step(&mut self, event: Event) -> Vec<Action> {
         let caps = self.own_caps;
         let own_caps = move || caps;
+        let may = self.bit_may_come_on;
+        let bit_may_come_on = move || may;
         let cx = Inputs {
             now: self.now,
             sample: self.sample,
             policy: &self.policy,
             own_caps: &own_caps,
+            bit_may_come_on: &bit_may_come_on,
         };
         self.machine.step(cx, event)
     }
@@ -636,7 +642,7 @@ fn expected_with(
             QuicControl::Ready { caps, .. } | QuicControl::ReadyAck { caps, .. },
         ) = action
         {
-            *caps = own_caps | caps::RECYCLES;
+            *caps = own_caps;
         }
     }
     let activates = matches!(
@@ -893,7 +899,7 @@ fn a_path_carries_data_only_with_both_bits() {
             server.step(Event::PathEstablished { attempt }),
             [Action::SendControl(QuicControl::Ready {
                 attempt,
-                caps: own | caps::RECYCLES
+                caps: own
             })],
             "{case}: Ready says what this node has"
         );
@@ -915,10 +921,7 @@ fn a_path_carries_data_only_with_both_bits() {
         let mut client = reach_with(Role::Client, S::Connecting, own, peer);
         let attempt = CLIENT_ATTEMPT;
         let mut want = vec![
-            Action::SendControl(QuicControl::ReadyAck {
-                attempt,
-                caps: own | caps::RECYCLES,
-            }),
+            Action::SendControl(QuicControl::ReadyAck { attempt, caps: own }),
             Action::Record(Outcome::Established(Role::Client)),
         ];
         if carries {
@@ -938,17 +941,14 @@ fn a_path_carries_data_only_with_both_bits() {
 }
 
 /// A node with its bit clear sends no data bit in `Ready` and in `ReadyAck`,
-/// whatever bit the peer's frame carried: only `caps::RECYCLES`.
+/// whatever bit the peer's frame carried: what `own_caps` gave, here nothing.
 #[test]
 fn a_node_without_the_bit_sends_caps_zero() {
     let mut server = reach_with(Role::Server, S::Connecting, 0, caps::DATA);
     let attempt = SERVER_ATTEMPT;
     assert_eq!(
         server.step(Event::PathEstablished { attempt }),
-        [Action::SendControl(QuicControl::Ready {
-            attempt,
-            caps: caps::RECYCLES
-        })]
+        [Action::SendControl(QuicControl::Ready { attempt, caps: 0 })]
     );
     let mut client = reach_with(Role::Client, S::Connecting, 0, caps::DATA);
     let attempt = CLIENT_ATTEMPT;
@@ -959,7 +959,7 @@ fn a_node_without_the_bit_sends_caps_zero() {
     assert!(
         actions.contains(&Action::SendControl(QuicControl::ReadyAck {
             attempt,
-            caps: caps::RECYCLES
+            caps: 0
         })),
         "{actions:?}"
     );
@@ -1039,8 +1039,15 @@ fn a_stale_attempt_changes_nothing() {
 /// own evidence: the client on `Ready`, the server on `ReadyAck`.
 #[test]
 fn a_server_and_a_client_reach_active_together() {
-    let mut server = Rig::promoted(Role::Server);
-    let mut client = Rig::promoted(Role::Client);
+    // Both on a ramp without their bit yet: each says it recycles.
+    let ramping = |role| {
+        let mut rig = Rig::new(role);
+        rig.own_caps = caps::RECYCLES;
+        rig.promote(Some(QUIC_UPGRADE_NEGOTIATES_IN));
+        rig
+    };
+    let mut server = ramping(Role::Server);
+    let mut client = ramping(Role::Client);
 
     let actions = server.tick_due();
     assert_eq!(
@@ -1048,7 +1055,8 @@ fn a_server_and_a_client_reach_active_together() {
         Action::AllowPeerThenOffer {
             attempt: 1,
             caps: 0
-        }
+        },
+        "the Offer's caps stay 0"
     );
     let actions = client.offer(1);
     assert_eq!(
@@ -2795,6 +2803,7 @@ fn each_attempt_reads_its_own_caps_when_it_starts() {
 fn active_without_own_bit(role: Role) -> (Rig, u32) {
     let mut rig = Rig::new(role);
     rig.peer_caps = caps::DATA | caps::RECYCLES;
+    rig.own_caps = caps::RECYCLES;
     rig.promote(Some(QUIC_UPGRADE_NEGOTIATES_IN));
     let attempt = rig.activate();
     assert!(rig.machine.is_active() && !rig.machine.carries_data());
@@ -2826,7 +2835,7 @@ fn a_path_without_data_is_recycled_once_when_the_bit_comes_on() {
         assert!(next > due, "{role:?}");
         assert!(rig.machine.is_active());
 
-        rig.own_caps = caps::DATA;
+        rig.own_caps = caps::DATA | caps::RECYCLES;
         let failures = rig.machine.failures;
         let actions = rig.tick_at(next);
         assert_eq!(
@@ -2883,9 +2892,11 @@ fn the_data_recheck_is_jittered() {
 }
 
 /// No recheck on a path with this node's bit already set, nor on a path to a
-/// peer that did not set `caps::RECYCLES`: a node before the bit reads the close
-/// as a lost connection and charges it. Each side advertises the bit in its
-/// `Ready` or `ReadyAck`, whatever its own data bit.
+/// peer that did not set `caps::RECYCLES` (a node before the bit, which reads
+/// the close as a lost connection and charges it, or one whose share is fixed
+/// at 0, which can never carry data), nor when this node's own bit cannot come
+/// on (a fixed share). Each side sends the caps its policy gives
+/// (`QuicPolicy::own_caps`).
 #[test]
 fn only_a_path_without_the_bit_to_a_recycling_peer_is_rechecked() {
     for role in [Role::Server, Role::Client] {
@@ -2905,8 +2916,18 @@ fn only_a_path_without_the_bit_to_a_recycling_peer_is_rechecked() {
             "{role:?}: a peer without RECYCLES"
         );
     }
-    // What this node sends: RECYCLES with or without its data bit.
-    for own in [0, caps::DATA] {
+    // A node whose bit cannot come on (a fixed share) does not ask.
+    for role in [Role::Server, Role::Client] {
+        let mut rig = Rig::new(role);
+        rig.peer_caps = caps::RECYCLES;
+        rig.own_caps = caps::RECYCLES;
+        rig.bit_may_come_on = false;
+        rig.promote(Some(QUIC_UPGRADE_NEGOTIATES_IN));
+        rig.activate();
+        assert_eq!(rig.machine.deadline(), None, "{role:?}: a fixed share");
+    }
+    // What this node sends: its caps as the policy gives them.
+    for own in [0, caps::RECYCLES, caps::DATA | caps::RECYCLES] {
         let mut rig = Rig::new(Role::Server);
         rig.own_caps = own;
         rig.promote(Some(QUIC_UPGRADE_NEGOTIATES_IN));
@@ -2917,20 +2938,22 @@ fn only_a_path_without_the_bit_to_a_recycling_peer_is_rechecked() {
         assert!(
             actions.contains(&Action::SendControl(QuicControl::Ready {
                 attempt,
-                caps: own | caps::RECYCLES,
+                caps: own
             })),
             "{actions:?}"
         );
     }
 }
 
-/// The peer's RECYCLE_FOR_DATA close, through the real error mapping, ends the
-/// path with no fault: nothing charged, no fallback, and a server offers again
-/// within the first-offer delay.
+/// The peer's RECYCLE_FOR_DATA close, through the real error mapping, on a path
+/// active for [`RECYCLE_MIN_ACTIVE`], ends the path with no fault: nothing
+/// charged, no fallback, and a server offers again within the first-offer
+/// delay.
 #[test]
 fn a_recycle_close_from_the_peer_is_no_fault() {
     for role in [Role::Server, Role::Client] {
         let (mut rig, attempt) = active_without_own_bit(role);
+        rig.now += RECYCLE_MIN_ACTIVE;
         let failures = rig.machine.failures;
         let actions = rig.close_with(attempt, u64::from(QuicCloseCode::RecycleForData.code()));
         assert_eq!(
@@ -2955,4 +2978,93 @@ fn a_recycle_close_from_the_peer_is_no_fault() {
             );
         }
     }
+}
+
+/// A RECYCLE_FOR_DATA close an honest peer would not send is charged like a
+/// downgrade, so a peer that closes every path with the code cannot make this
+/// side handshake again and again for free: one in setup, one sooner than
+/// [`RECYCLE_MIN_ACTIVE`] after the path came up, one to a node that did not
+/// say it takes them (no `caps::RECYCLES`), and a second in one session (an
+/// honest peer's bit comes on once).
+#[test]
+fn a_recycle_close_an_honest_peer_would_not_send_is_charged() {
+    let code = u64::from(QuicCloseCode::RecycleForData.code());
+    let charged = |rig: &Rig, failures: u32, actions: &[Action], case: &str| {
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Record(
+                    Outcome::Fallback(FallbackCause::DowngradeReceived) | Outcome::SetupDowngraded
+                )
+            )),
+            "{case}: {actions:?}"
+        );
+        assert_eq!(rig.machine.failures, failures + 1, "{case}: charged");
+        assert!(rig.backoff() >= BACKOFF_MIN.mul_f64(0.8), "{case}");
+    };
+    for role in [Role::Server, Role::Client] {
+        // In setup.
+        let mut rig = Rig::new(role);
+        rig.own_caps = caps::RECYCLES;
+        rig.promote(Some(QUIC_UPGRADE_NEGOTIATES_IN));
+        let attempt = if role == Role::Server {
+            rig.tick_due();
+            rig.machine.last_attempt
+        } else {
+            rig.offer(CLIENT_ATTEMPT);
+            CLIENT_ATTEMPT
+        };
+        let failures = rig.machine.failures;
+        let actions = rig.close_with(attempt, code);
+        charged(&rig, failures, &actions, &format!("{role:?} in setup"));
+
+        // Too soon after the path came up.
+        let (mut rig, attempt) = active_without_own_bit(role);
+        rig.now += RECYCLE_MIN_ACTIVE - Duration::from_secs(1);
+        let failures = rig.machine.failures;
+        let actions = rig.close_with(attempt, code);
+        charged(&rig, failures, &actions, &format!("{role:?} too soon"));
+
+        // To a node that did not say it takes one.
+        let mut rig = Rig::new(role);
+        rig.peer_caps = caps::DATA | caps::RECYCLES;
+        rig.promote(Some(QUIC_UPGRADE_NEGOTIATES_IN));
+        let attempt = rig.activate();
+        rig.now += RECYCLE_MIN_ACTIVE;
+        let failures = rig.machine.failures;
+        let actions = rig.close_with(attempt, code);
+        charged(
+            &rig,
+            failures,
+            &actions,
+            &format!("{role:?} without RECYCLES"),
+        );
+
+        // A second in one session.
+        let (mut rig, attempt) = active_without_own_bit(role);
+        rig.now += RECYCLE_MIN_ACTIVE;
+        let failures = rig.machine.failures;
+        rig.close_with(attempt, code);
+        assert_eq!(
+            rig.machine.failures, failures,
+            "{role:?}: the first is free"
+        );
+        rig.now = rig.machine.retry_at.max(rig.now);
+        let attempt = rig.activate();
+        rig.now += RECYCLE_MIN_ACTIVE;
+        let actions = rig.close_with(attempt, code);
+        charged(&rig, failures, &actions, &format!("{role:?} a second"));
+    }
+}
+
+/// A free recycle never shortens a backoff already pending: a server whose
+/// next offer was already later than the first-offer delay keeps it.
+#[test]
+fn a_recycle_does_not_cancel_a_pending_backoff() {
+    let (mut rig, attempt) = active_without_own_bit(Role::Server);
+    rig.now += RECYCLE_MIN_ACTIVE;
+    let later = rig.now + Duration::from_secs(600);
+    rig.machine.retry_at = later;
+    rig.close_with(attempt, u64::from(QuicCloseCode::RecycleForData.code()));
+    assert_eq!(rig.machine.retry_at, later, "kept");
 }

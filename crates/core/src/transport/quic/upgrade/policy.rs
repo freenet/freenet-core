@@ -293,18 +293,50 @@ impl QuicPolicy {
             QuicMode::Prefer => {
                 let percent = share.percent_at(now);
                 self.log_band(percent, share);
-                if super::slice::in_slice(local, peer, percent) {
+                let data = if super::slice::in_slice(local, peer, percent) {
                     caps::DATA
                 } else {
                     0
-                }
+                };
+                // A node that carries data with some pairs, or will, takes a
+                // recycle for data as no fault and is worth recycling toward.
+                // One that never will (a share fixed at 0) does not say so, so
+                // no peer closes a path to it that could never carry data.
+                let recycles = if share == DataShare::Fixed(0) {
+                    0
+                } else {
+                    caps::RECYCLES
+                };
+                data | recycles
             }
             QuicMode::Off | QuicMode::Shadow => 0,
         }
     }
 
+    /// Whether this node's data bit on a path can still come on while the
+    /// node runs: only on a ramp, in `prefer`. A fixed share gives a pair the
+    /// same bit for the life of the process, so a path without the bit is never
+    /// rechecked for it (`machine::UpgradeMachine::recheck_data`).
+    pub(in crate::transport) fn bit_may_come_on_with(&self, share: DataShare) -> bool {
+        data_bit_allowed(cfg!(any(test, feature = "testing")))
+            && self.mode == QuicMode::Prefer
+            && matches!(share, DataShare::Ramp { .. })
+    }
+
+    /// [`Self::bit_may_come_on_with`] with the policy's share.
+    pub(in crate::transport) fn bit_may_come_on(&self) -> bool {
+        self.bit_may_come_on_with(self.share)
+    }
+
     /// Report the share at INFO when it enters a new band, so an operator can see
     /// the ramp move.
+    ///
+    /// Called from `own_caps`, which the upgrade driver calls while it holds a
+    /// session's lock. The INFO line is written only when the band changes
+    /// (an atomic swap decides it): 11 times over a whole ramp (5%, then every
+    /// 10% to 100%), more only if the wall clock steps back and forth. So the
+    /// lock is held over a log write that rarely; every other call is the swap
+    /// alone.
     fn log_band(&self, percent: u8, share: DataShare) {
         let band = log_band(percent);
         let before = self
@@ -627,21 +659,43 @@ mod tests {
             );
         }
         assert_eq!(caps_with("prefer", Some("lots".to_string())), 0);
-        assert_eq!(caps_with("prefer", Some("100".to_string())), caps::DATA);
+        assert_eq!(
+            caps_with("prefer", Some("100".to_string())),
+            caps::DATA | caps::RECYCLES
+        );
         assert_eq!(caps_with("prefer", Some("0".to_string())), 0);
         assert_eq!(
-            caps_with("prefer", Some(bucket.to_string())),
+            caps_with("prefer", Some(bucket.to_string())) & caps::DATA,
             0,
             "a bucket equal to the percentage is out"
         );
         assert_eq!(
             caps_with("prefer", Some((bucket + 1).to_string())),
-            caps::DATA,
+            caps::DATA | caps::RECYCLES,
             "the bucket below the percentage is in"
         );
         for mode in ["shadow", "off"] {
             assert_eq!(caps_with(mode, Some("100".to_string())), 0, "{mode}");
         }
+        // RECYCLES says the node carries data with some pairs or will: any
+        // share but one fixed at 0, in `prefer` only.
+        assert_eq!(
+            caps_with("prefer", Some("1".to_string())) & caps::RECYCLES,
+            caps::RECYCLES
+        );
+        let ramp = DataShare::Ramp {
+            start_unix_secs: 1_900_000_000,
+        };
+        let prefer = QuicPolicy::new(
+            &config("prefer", None),
+            BreakerOutcome::NotConsulted,
+            QuicAvailabilityWatch::for_test(QuicAvailability::Up).1,
+        );
+        assert_eq!(
+            prefer.own_caps_with(ramp, &local, &peer, std::time::UNIX_EPOCH) & caps::RECYCLES,
+            caps::RECYCLES,
+            "on a ramp, before the start"
+        );
     }
 
     /// The receive side exists, so a build without `cfg(test)` or the `testing`
@@ -677,6 +731,22 @@ mod tests {
         std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs)
     }
 
+    /// Only a ramp, in `prefer`, can turn a pair's bit on while the node runs,
+    /// so only then is a path without the bit rechecked.
+    #[test]
+    fn only_a_ramp_in_prefer_can_turn_the_bit_on() {
+        let up = || QuicAvailabilityWatch::for_test(QuicAvailability::Up).1;
+        let ramp = DataShare::Ramp {
+            start_unix_secs: 1_900_000_000,
+        };
+        let prefer = QuicPolicy::new(&config("prefer", None), BreakerOutcome::NotConsulted, up());
+        let shadow = QuicPolicy::new(&config("shadow", None), BreakerOutcome::NotConsulted, up());
+        assert!(prefer.bit_may_come_on_with(ramp));
+        assert!(!prefer.bit_may_come_on_with(DataShare::Fixed(0)));
+        assert!(!prefer.bit_may_come_on_with(DataShare::Fixed(50)));
+        assert!(!shadow.bit_may_come_on_with(ramp));
+    }
+
     /// With a ramp, a `prefer` node's bit follows the curve at the time it is
     /// asked, from the start it is given: none of a pair's peers before the share
     /// covers it, and every peer once it does. A time before the start reads as
@@ -699,7 +769,7 @@ mod tests {
         let carrying = |secs| {
             peers
                 .iter()
-                .filter(|peer| prefer.own_caps_with(ramp, &local, peer, at(secs)) == caps::DATA)
+                .filter(|peer| prefer.own_caps_with(ramp, &local, peer, at(secs)) & caps::DATA != 0)
                 .count()
         };
         let share = |n: usize| n * 100 / peers.len();

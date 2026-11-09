@@ -21214,11 +21214,14 @@ fn assert_ramp_pairs_carry_data_by(run: &QuicShadowRun, full_at: Duration) {
 const RAMP_HOUR: Duration = Duration::from_secs(3600);
 
 /// The end of the data ramp's first stage: it started 5 h before the run, so
-/// the share stays at 5% for the first hour of the run, then grows. A path that
-/// came up without data is not recycled while the share is 5% (about 80
-/// rechecks per pair in that hour; the share is the same over the whole
-/// plateau, so the first 5 h would add nothing but run time); after it,
-/// recycles are allowed. PR CI's half of the day-long ramp, with
+/// the share stays at 5% for the first hour of the run, then grows (to about
+/// 11.7% at 3 h). A path that came up without data is not recycled while the
+/// share is 5% (about 80 rechecks per pair in that hour; the share is the same
+/// over the whole plateau, so the first 5 h would add nothing but run time),
+/// and is recycled once the growing share reaches its pair: with this seed a
+/// pair's bucket is reached during the run, so a recycle after the first hour
+/// is required (the positive control: with recycling disabled this fails). PR
+/// CI's half of the day-long ramp, with
 /// `test_quic_data_ramp_turns_on_every_pair_by_the_end_of_the_day`; the whole
 /// day runs nightly (`test_quic_data_ramp_turns_on_every_pair_within_a_day`).
 #[test_log::test]
@@ -21227,7 +21230,7 @@ fn test_quic_data_ramp_recycles_nothing_while_the_share_is_five_percent() {
         "quic-data-ramp-start",
         0x5940_7A00_0002,
         5 * RAMP_HOUR,
-        2,
+        3,
         RAMP_HOUR,
     );
     let records = run.trace.records();
@@ -21245,12 +21248,17 @@ fn test_quic_data_ramp_recycles_nothing_while_the_share_is_five_percent() {
         "nothing is recycled at 5%: {}",
         run.dump()
     );
+    assert!(
+        recycles.iter().any(|r| r.at >= RAMP_HOUR),
+        "positive control: a pair is recycled once the growing share reaches it: {}",
+        run.dump()
+    );
 }
 
 /// The end of the data ramp: it started 23 h before the run, so the share
 /// reaches 100% one hour in. By then, plus a recheck and the time to set up
 /// again, every pair whose path came up by then carries data, the pairs the
-/// share had not covered by being recycled.
+/// share had not covered by being recycled, and data arrives on those paths.
 #[test_log::test]
 fn test_quic_data_ramp_turns_on_every_pair_by_the_end_of_the_day() {
     let (run, recycles) = run_quic_data_ramp(
@@ -21266,6 +21274,16 @@ fn test_quic_data_ramp_turns_on_every_pair_by_the_end_of_the_day() {
         run.dump()
     );
     assert_ramp_pairs_carry_data_by(&run, RAMP_HOUR);
+    // Health: data does arrive on a path after the recycles, so the paths the
+    // share turned on carry the node's traffic, not just the bit.
+    let first_recycle = recycles.iter().map(|r| r.at).min().expect("checked above");
+    assert!(
+        run.trace.records().iter().any(|r| r.at > first_recycle
+            && (r.what.starts_with("received a short on the path")
+                || r.what.starts_with("received a stream on the path"))),
+        "data arrives on a path after the recycles: {}",
+        run.dump()
+    );
 }
 
 /// The whole data ramp over a virtual day, as one run: by 24 h, plus a recheck
