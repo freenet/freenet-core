@@ -1141,7 +1141,7 @@ doc has the transition table.
   seed may come off a clock with another epoch. A promotion's first offer waits
   for the later of the seed and its own delay. e5a-5b must carry it per peer key
   across a replaced session, or a session that flaps retries at session rate.
-  Failures: close codes 1, 3, 4, 5 and 6, a lost connection, an idle timeout and a
+  Failures: close codes 1, 3, 4, 5, 6 and 8, a lost connection, an idle timeout and a
   deadline each mean fallback plus normal backoff, then a new offer. Never a
   permanent downgrade. Identity: close code 2 received, or Event::IdentityMismatch
   (closes with IDENTITY_MISMATCH). A TLS failure during the handshake
@@ -1268,7 +1268,7 @@ snapshot except the two gauges.
   offered and declined_uncharged. Both sides count `established`; only the
   offerer's is the numerator. Counts are node-wide; there is no per-pair series.
   `quic_fallback_<label>` (`QuicFallback`): idle, reset, protocol, downgrade_rx,
-  endpoint_down, session_ended_rx. Paths that had been active only; an attempt
+  endpoint_down, session_ended_rx, over_budget_rx. Paths that had been active only; an attempt
   that ends in setup is counted in `quic_upgrade_*`. A close this node sent for
   send_abort_limit or peer_not_acknowledging reaches the machine as a lost
   connection, so it counts as `reset`; its count is `quic_close_sent_*`. A key
@@ -1299,10 +1299,12 @@ snapshot except the two gauges.
   negative. Subtract only over windows much longer than 150 s (an hour or a
   day). The Step 2 gate, fallbacks per path-day excluding endpoint and
   restart causes, is then
-    (sum over c in idle, reset, protocol, downgrade_rx of
+    (sum over c in idle, reset, protocol, downgrade_rx, over_budget_rx of
        quic_fallback_<c> - quic_churned_fallback_<c>) / path-days,
   with endpoint_down and session_ended_rx left out entirely (session_ended_rx
-  is churn by definition). It is a lower bound on fallbacks where QUIC failed
+  is churn by definition). over_budget_rx is in the sum: it is a close that
+  counted as downgrade_rx before OVER_BUDGET existed (a peer's second trip
+  past the gap cap), and a release before the code counts it as reset. It is a lower bound on fallbacks where QUIC failed
   while UDP kept working: any session end within the window counts, including
   one that the QUIC failure itself caused.
   `quic_close_received_<label>`: one per QUIC connection quinn reports as closed
@@ -1378,7 +1380,17 @@ a test passes its own; tests read their own, never the global).
   path's route still carried data); quic_streams_sampled_paths,
   quic_streams_open_ge_<8|16|32|48> and quic_streams_peak_max (per path and period,
   the peak of inbound streams read at once, counted as inbound_concurrency counts
-  connections).
+  connections); quic_send_resets (sends a path reset on this side, counted by
+  recycle::SendAborts while the connection is open) and quic_path_ms (time QUIC
+  paths were up, shadow ones included, added at each tick of the acknowledgement
+  watch; the last tick to a path's end is not counted), whose ratio over a long
+  window is resets per connection-hour (a path whose acknowledgement watch is
+  off or panicked stops adding time but not resets, so the ratio errs high;
+  each is logged, at WARN and ERROR); quic_send_resets_reached_<64|512|2048|4096>
+  and quic_send_resets_path_max (paths whose lifetime reset count reached each
+  level in the period, and the highest count a reset in the period took a path
+  to). They are for the fixed charge, which takes quinn's stopped map at
+  SEND_ABORT_LIMIT x QUIC_STOPPED_ENTRY_BYTES until field data justifies less.
   A family is the keys of one label list under one prefix
   (`QuicDataSnapshot::keys_by_family`). No other key starts with a family's
   prefix or with the prefix sibling families share (`quic_data_` for the send,
@@ -1928,6 +1940,12 @@ Sending (QuicPath::send_short_bounded / send_stream_bounded /
   surfaced through a write or through stopped(), is not one; nor is a reset
   on a closed connection) and closes the connection past
   recycle::SEND_ABORT_LIMIT (4096) with close code SEND_ABORT_LIMIT (M6).
+  The fixed charge per connection (config::QUIC_CONNECTION_CHARGE_BYTES,
+  840 KiB) takes the map at that worst case, 4096 x QUIC_STOPPED_ENTRY_BYTES
+  (104 B, measured 88 B). Polling stopped() only after finish() would not
+  avoid the entries: a writer blocked on connection credit must still race
+  stopped() (below), so the poll stays on every wait and the common resets
+  register anyway.
   Every write, and the wait for a source's next chunk, races the
   stream's stopped() future and resets on a stop:
   quinn-proto 0.11.19 does not report STOP_SENDING to a writer blocked on
@@ -1974,7 +1992,7 @@ Unordered reads: the header, the metadata, and short and control bodies are
   them, so it does not grow with the connection's age; after KEPT_GAPS_GRACE
   (30 s) each counts 32 less (a quinn peer resets a stopped stream within a
   round trip). A second trip past the cap closes the path with
-  DOWNGRADE (closed_too_many_ranges). A Stream waiting for room in the
+  OVER_BUDGET (closed_too_many_ranges). A Stream waiting for room in the
   delivery channel reads its payload but NOT its end until it is announced
   (reading the end frees quinn's slot, and the slots bound how many streams
   can wait); one that ends short fails Truncated at once. While it waits it
@@ -2410,7 +2428,13 @@ Application error codes, one range per QUIC frame type, all one-byte
                 and counts quic_fallback_session_ended_rx, or
                 setup_downgrade_rx in setup; a node without this code reads
                 ConnectionLost: quic_fallback_reset, or
-                quic_upgrade_handshake_failed in setup)
+                quic_upgrade_handshake_failed in setup), 0x07 left to the
+                ramp branch's RECYCLE_FOR_DATA, OVER_BUDGET 8 (the peer held
+                more of this node's QUIC buffer budget than it allows: its
+                gaps past the cap a second time; the peer reads it as
+                Refused{OverBudget}, falls back, charges as for Downgrade and
+                counts quic_fallback_over_budget_rx, or setup_downgrade_rx in
+                setup; a node without this code reads ConnectionLost)
     0x10..=0x1f STOP_SENDING: path::stop_code (receiver refusals;
                 NOT_ACCEPTING_DATA 0x19 is a shadow path refusing data. Data
                 may be sent only after caps negotiation, so it is a counter

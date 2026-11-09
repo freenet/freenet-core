@@ -450,7 +450,7 @@ quic_outcomes! {
         /// stream that went past it was stopped (`stop_code::EVICTED`).
         TooManyRanges => "too_many_ranges",
         /// The connection went past `inbound::MAX_GAPS_PER_CONNECTION` a
-        /// second time, so the path was closed with DOWNGRADE (once per path):
+        /// second time, so the path was closed with OVER_BUDGET (once per path):
         /// the gaps of streams it stopped stay counted for the connection's
         /// life, because quinn keeps them until the peer ends the stream.
         ClosedTooManyRanges => "closed_too_many_ranges",
@@ -866,7 +866,11 @@ impl QuicPath {
         }
         #[cfg(test)]
         let inbound_ranges = receiver.ranges();
-        let aborts = Arc::new(SendAborts::new(limits.max_send_aborts, connection.closer()));
+        let aborts = Arc::new(SendAborts::new(
+            limits.max_send_aborts,
+            connection.closer(),
+            stats.node(),
+        ));
         // Read once: quinn keeps one controller per connection while migration is
         // off (`config`), so the record stays the connection's. The ack watch
         // compares records by pointer because it samples, and does not need to here.
@@ -885,7 +889,8 @@ impl QuicPath {
         );
         let heard = Arc::new(recycle::PeerHeard::default());
         #[cfg_attr(not(test), allow(unused_mut))]
-        let mut report = recycle::PathReport::new(connection.inner().clone(), stats.node());
+        let mut report =
+            recycle::PathReport::new(connection.inner().clone(), stats.node(), built_at);
         #[cfg(test)]
         {
             report.panic_once_bucketed = limits.panic_in_watch;

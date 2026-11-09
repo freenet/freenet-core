@@ -181,9 +181,11 @@ use crate::transport::metrics::QuicCloseCode;
 /// timeout) or its chunk source fails, both rare, so 4096 is far above what
 /// one does over a long life, and a path that gets there is closed and
 /// rebuilt with nothing lost but the upgrade. The `stopped` map entries the
-/// limit bounds are about 100 bytes each, so at most about 400 KiB per
-/// path, under one connection's flow-control window
-/// (`config::MAX_WINDOW_BYTES`, 2 MiB).
+/// limit bounds are measured at under `config::QUIC_STOPPED_ENTRY_BYTES`
+/// (104 B) each, so at most 416 KiB per path, which the per-connection fixed
+/// charge (`config::QUIC_CONNECTION_CHARGE_BYTES`) takes in full. How often
+/// paths reset, and how close they come to the limit, is reported
+/// (`quic_send_resets`, `quic_path_ms`, `quic_send_resets_reached_<n>`).
 pub(crate) const SEND_ABORT_LIMIT: u64 = 4096;
 
 /// How long the peer may go on sending without acknowledging packets this
@@ -219,14 +221,20 @@ pub(crate) struct SendAborts {
     count: AtomicU64,
     limit: u64,
     closer: QuicCloser,
+    node: &'static crate::transport::metrics::QuicDataCounters,
 }
 
 impl SendAborts {
-    pub(crate) fn new(limit: u64, closer: QuicCloser) -> Self {
+    pub(crate) fn new(
+        limit: u64,
+        closer: QuicCloser,
+        node: &'static crate::transport::metrics::QuicDataCounters,
+    ) -> Self {
         Self {
             count: AtomicU64::new(0),
             limit,
             closer,
+            node,
         }
     }
 
@@ -238,6 +246,7 @@ impl SendAborts {
             return;
         }
         let count = self.count.fetch_add(1, Ordering::Relaxed) + 1;
+        self.node.record_send_reset(count);
         if count > self.limit && self.closer.close(QuicCloseCode::SendAbortLimit) {
             tracing::warn!(
                 remote = %self.closer.remote_address(),
@@ -866,7 +875,7 @@ pub(crate) async fn watch_acknowledgements<T: TimeSource>(
         // Read before the counts, so a closed connection's counts are its
         // final ones.
         let closed = connection.close_reason().is_some();
-        report.report();
+        report.report(Some(time.now_nanos()));
         if closed {
             return;
         }
@@ -924,6 +933,9 @@ pub(crate) struct PathReport {
     bytes: UdpBytes,
     loss: PathLoss,
     window: crate::transport::metrics::PathLossWindow,
+    /// When the path's time was last reported, in the time source's
+    /// nanoseconds.
+    timed_at: u64,
     /// The next report that finds the path in a bucket panics, once
     /// (supervisor test).
     #[cfg(test)]
@@ -931,12 +943,15 @@ pub(crate) struct PathReport {
 }
 
 impl PathReport {
+    /// A report for a path built at `built_at` (time-source nanoseconds).
     pub(crate) fn new(
         connection: quinn::Connection,
         node: &'static crate::transport::metrics::QuicDataCounters,
+        built_at: u64,
     ) -> Self {
         let stats = connection.stats();
         Self {
+            timed_at: built_at,
             bytes: UdpBytes::of(&stats),
             loss: PathLoss::of(&stats),
             window: crate::transport::metrics::PathLossWindow::new(node),
@@ -947,8 +962,17 @@ impl PathReport {
         }
     }
 
-    /// Report the change since the last report, from one read of the stats.
-    fn report(&mut self) {
+    /// Report the change since the last report, from one read of the stats,
+    /// and the time since the last one when `now` is given. The final report,
+    /// on drop, has no clock, so a path's last tick to its end (under
+    /// [`ACK_WATCH_TICK`]) is not counted.
+    fn report(&mut self, now: Option<u64>) {
+        if let Some(now) = now {
+            // Whole milliseconds, carrying the rest to the next report.
+            let ms = now.saturating_sub(self.timed_at) / 1_000_000;
+            self.timed_at = self.timed_at.saturating_add(ms * 1_000_000);
+            self.node.record_path_time(ms);
+        }
         let stats = self.connection.stats();
         let (next, sent, got) = self.bytes.step(UdpBytes::of(&stats));
         self.node.record_bytes(sent, got);
@@ -969,7 +993,7 @@ impl Drop for PathReport {
     fn drop(&mut self) {
         // Not while unwinding: quinn's state lock may be what panicked.
         if !std::thread::panicking() {
-            self.report();
+            self.report(None);
         }
     }
 }

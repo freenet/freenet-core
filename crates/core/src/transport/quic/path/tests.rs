@@ -1137,7 +1137,7 @@ fn a_stream_stopped_with_gaps_is_released_after_the_grace_period() {
 }
 
 /// Past the gap cap, the stream that went over it is stopped; its gaps stay
-/// counted, so the next time past the cap closes the path with DOWNGRADE and
+/// counted, so the next time past the cap closes the path with OVER_BUDGET and
 /// the peer falls back to UDP. Here the cap is 2 and every other datagram is
 /// lost, so each stream leaves gaps.
 #[test]
@@ -1184,15 +1184,20 @@ fn a_second_trip_past_the_gap_cap_closes_the_path() {
             ))) => {
                 assert_eq!(
                     close.error_code.into_inner(),
-                    u64::from(super::super::error::close_code::DOWNGRADE),
-                    "closed with DOWNGRADE"
+                    u64::from(super::super::error::close_code::OVER_BUDGET),
+                    "closed with OVER_BUDGET"
                 );
             }
-            other => panic!("expected the path closed with DOWNGRADE, got {other:?}"),
+            other => panic!("expected the path closed with OVER_BUDGET, got {other:?}"),
         }
         let stats = p.b.stats();
         assert_eq!(stats.count(QuicInboundOutcome::TooManyRanges), 2);
         assert_eq!(stats.count(QuicInboundOutcome::ClosedTooManyRanges), 1);
+        assert_eq!(
+            crate::transport::metrics::TRANSPORT_METRICS.quic_close_sent_to(from),
+            vec![QuicCloseCode::OverBudget],
+            "counted as quic_close_sent_over_budget"
+        );
         assert!(
             p.b.inbound_gaps_kept() >= 2,
             "the first stream's gaps stayed"
@@ -2579,6 +2584,49 @@ fn recycle_closes_to(remote: SocketAddr) -> Vec<QuicCloseCode> {
             )
         })
         .collect()
+}
+
+/// The reset gauge for the fixed charge (buffer-budget PR 2): a path's
+/// resets reach the node counters with the levels its count passes, and its
+/// time up is reported tick by tick, so resets per connection-hour can be
+/// read from the field.
+#[test]
+fn a_paths_resets_and_time_reach_the_node_counters() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let counters: &'static crate::transport::metrics::QuicDataCounters =
+            Box::leak(Box::new(crate::transport::metrics::QuicDataCounters::new()));
+        let limits = QuicPathLimits {
+            counters: Some(counters),
+            ..QuicPathLimits::DEFAULT
+        };
+        // `paths` gives `a` the same counters; only `b` resets sends.
+        let p = paths("quic-path-reset-gauge", 24, limits).await;
+        let (b, time) = (p.b.clone(), p.time());
+        let (resets, timed) = p
+            .drive(async move {
+                abort_sends(b.clone(), 64).await;
+                let resets = counters.snapshot(true);
+                time.sleep(Duration::from_secs(20)).await;
+                (resets, counters.snapshot(true))
+            })
+            .await;
+        assert_eq!(p.b.send_aborts(), 64);
+        let keys: std::collections::BTreeMap<_, _> = resets.keys().into_iter().collect();
+        assert_eq!(keys["quic_send_resets"], 64);
+        assert_eq!(keys["quic_send_resets_reached_64"], 1);
+        assert_eq!(keys["quic_send_resets_reached_512"], 0);
+        assert_eq!(keys["quic_send_resets_path_max"], 64);
+        // Two paths, 20 s between the two snapshots, each reported at its
+        // watch's 2 s ticks.
+        let tick = recycle::ACK_WATCH_TICK.as_millis() as u64;
+        assert!(
+            (2 * (20_000 - tick)..=2 * (20_000 + tick)).contains(&timed.path_ms),
+            "{} ms of path time for two paths in 20 s",
+            timed.path_ms
+        );
+        assert_eq!(timed.send_resets, 0);
+    });
 }
 
 /// #5940 step M6, guard 1: a path that has reset its limit of sends stays

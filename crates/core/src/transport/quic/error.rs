@@ -68,9 +68,17 @@ pub(crate) mod close_code {
     /// reads it as `QuicErrorKind::ConnectionLost`, which falls back and
     /// counts as `quic_fallback_reset`.
     pub(crate) const SESSION_ENDED: u32 = 0x06;
+    /// The peer held more of this node's QUIC buffer budget than this node
+    /// allows it (its gaps past the cap a second time, `path::inbound`), so
+    /// the path is closed; fall back to the UDP session, and negotiate again
+    /// after the normal backoff (`quic_fallback_over_budget_rx`). 0x07 is left
+    /// to `RECYCLE_FOR_DATA` on the ramp branch. A node that does not know
+    /// this code reads it as `QuicErrorKind::ConnectionLost`, which also
+    /// falls back and counts as `quic_fallback_reset`.
+    pub(crate) const OVER_BUDGET: u32 = 0x08;
     /// Every close code, for the range and duplicate checks. A source-scrape
     /// test checks that each `const` in this module is listed.
-    pub(crate) const ALL: [u32; 7] = [
+    pub(crate) const ALL: [u32; 8] = [
         NODE_DROPPED_PEER,
         DOWNGRADE,
         IDENTITY_MISMATCH,
@@ -78,6 +86,7 @@ pub(crate) mod close_code {
         PEER_NOT_ACKNOWLEDGING,
         CONTROL_REFUSED,
         SESSION_ENDED,
+        OVER_BUDGET,
     ];
 }
 
@@ -92,7 +101,7 @@ const _: () = {
     let reset = reset_code::ALL;
     // No code is used twice, within or across the namespaces.
     let all_len = close.len() + stop.len() + reset.len();
-    let mut all = [0u32; 7 + 9 + 2];
+    let mut all = [0u32; 8 + 9 + 2];
     assert!(all.len() == all_len, "update the combined length");
     let mut n = 0;
     let mut i = 0;
@@ -156,6 +165,7 @@ impl QuicCloseCode {
             Self::PeerNotAcknowledging => close_code::PEER_NOT_ACKNOWLEDGING,
             Self::ControlRefused => close_code::CONTROL_REFUSED,
             Self::SessionEnded => close_code::SESSION_ENDED,
+            Self::OverBudget => close_code::OVER_BUDGET,
         }
     }
 
@@ -176,6 +186,7 @@ impl QuicCloseCode {
             Self::PeerNotAcknowledging => b"peer not acknowledging",
             Self::ControlRefused => b"control frame refused",
             Self::SessionEnded => b"udp session ended",
+            Self::OverBudget => b"over budget",
         }
     }
 }
@@ -248,6 +259,7 @@ pub(in crate::transport) fn attribute(
                 | QuicRefusal::ConnectionRefused
                 | QuicRefusal::Downgrade
                 | QuicRefusal::SessionEnded
+                | QuicRefusal::OverBudget
                 | QuicRefusal::AllowSetFull
                 | QuicRefusal::KeyConflict
                 | QuicRefusal::UnusableKey
@@ -323,6 +335,9 @@ impl From<quinn::ConnectionError> for QuicErrorKind {
                     },
                     Some(QuicCloseCode::SessionEnded) => Self::Refused {
                         reason: QuicRefusal::SessionEnded,
+                    },
+                    Some(QuicCloseCode::OverBudget) => Self::Refused {
+                        reason: QuicRefusal::OverBudget,
                     },
                     // A code a newer peer added still ends the connection.
                     Some(QuicCloseCode::NodeDroppedPeer) | None => Self::ConnectionLost,

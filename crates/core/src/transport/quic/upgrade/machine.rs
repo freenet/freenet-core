@@ -337,6 +337,8 @@ pub(in crate::transport) enum FallbackCause {
     EndpointDown,
     /// The peer closed with `close_code::SESSION_ENDED`.
     SessionEndedReceived,
+    /// The peer closed with `close_code::OVER_BUDGET`.
+    OverBudgetReceived,
 }
 
 /// Which side of the QUIC connection this node is.
@@ -475,6 +477,12 @@ fn classify(kind: QuicErrorKind) -> Verdict {
                 Outcome::SetupDowngraded,
                 FallbackCause::SessionEndedReceived,
             ),
+            // Close code OVER_BUDGET: the peer closed the path for this node's
+            // holding. Charged like a downgrade, counted apart once active; in
+            // setup it is `SetupDowngraded`, as above.
+            QuicRefusal::OverBudget => {
+                normal(Outcome::SetupDowngraded, FallbackCause::OverBudgetReceived)
+            }
             // This node's own limit, so the peer is not charged.
             QuicRefusal::AllowSetFull => Verdict::Fail {
                 penalty: Penalty::Uncharged,

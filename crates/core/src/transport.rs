@@ -537,6 +537,10 @@ pub(in crate::transport) enum QuicRefusal {
     /// this node ended, so it dropped the path. Fall back to UDP.
     #[error("the peer's UDP session to this node ended")]
     SessionEnded,
+    /// The peer closed with `close_code::OVER_BUDGET`: this node held more of
+    /// its QUIC buffer budget than it allows. Fall back to UDP.
+    #[error("the peer closed the path for holding more than its budget")]
+    OverBudget,
     /// The peer closed with `close_code::IDENTITY_MISMATCH`: the key this
     /// node proved is not the one the peer has on record for it.
     #[error("the peer reported an identity mismatch")]

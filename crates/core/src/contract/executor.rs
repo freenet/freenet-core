@@ -3068,6 +3068,44 @@ mod tests {
                  behaviour, plus the unmeasured terms in the quic::config module \
                  doc; summed once a QUIC path cap exists (M4, #5940)",
             ),
+            // Buffer-budget terms (#5940): the fixed charge per QUIC connection
+            // and the node-wide budget for what scales with the windows. Both
+            // are summed (budget + quic_connections x charge) by the buffer
+            // budget's aggregate-accounting step, which waits for the
+            // small-host decision; nothing is charged against either yet.
+            (
+                "QUIC_OPEN_STREAM_BYTES",
+                "a measurement of one QUIC connection term (one open stream, both \
+                 sides), not a ceiling; a term inside QUIC_CONNECTION_CHARGE_BYTES",
+            ),
+            (
+                "QUIC_STOPPED_ENTRY_BYTES",
+                "a measurement of one QUIC connection term (one entry of quinn's \
+                 stopped map), not a ceiling; a term inside \
+                 QUIC_CONNECTION_CHARGE_BYTES",
+            ),
+            (
+                "QUIC_CRYPTO_BUFFER_BYTES",
+                "quinn's CRYPTO reassembly limit for ONE QUIC connection; a term \
+                 inside QUIC_CONNECTION_CHARGE_BYTES",
+            ),
+            (
+                "QUIC_CRYPTO_HOLD_BYTES",
+                "quinn's CRYPTO assembler worst case for ONE QUIC connection's \
+                 1-RTT space, derived; a term inside QUIC_CONNECTION_CHARGE_BYTES",
+            ),
+            (
+                "QUIC_CONNECTION_CHARGE_BYTES",
+                "the fixed charge per QUIC connection; summed as quic_connections x \
+                 this by the buffer budget's aggregate-accounting step (#5940), \
+                 which waits for the small-host decision on the connection cap",
+            ),
+            (
+                "quic_buffer_budget_for",
+                "the node-wide QUIC buffer budget (memory / 16); summed by the buffer \
+                 budget's aggregate-accounting step (#5940), which waits for the \
+                 small-host decision; nothing is metered against it yet",
+            ),
             (
                 "READ_START_BYTES",
                 "initial allocation of ONE QUIC stream read (quic::path::inbound), \

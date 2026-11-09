@@ -1258,7 +1258,7 @@ fn every_close_code_falls_back_then_upgrades_again() {
 }
 
 /// Close codes 1, 3, 4 and 5 read as a downgrade, and record that cause; code 6
-/// records `session_ended_rx`. An
+/// records `session_ended_rx` and code 8 `over_budget_rx`. An
 /// unknown one, which is how an older node reads code 5, is a lost connection.
 #[test]
 fn close_codes_record_their_cause() {
@@ -1277,6 +1277,10 @@ fn close_codes_record_their_cause() {
         (
             QuicCloseCode::SessionEnded.code(),
             Outcome::Fallback(FallbackCause::SessionEndedReceived),
+        ),
+        (
+            QuicCloseCode::OverBudget.code(),
+            Outcome::Fallback(FallbackCause::OverBudgetReceived),
         ),
         (0x0f, lost),
     ] {
@@ -1297,6 +1301,7 @@ fn a_downgrade_close_in_setup_is_not_a_path_fallback() {
         QuicCloseCode::PeerNotAcknowledging,
         QuicCloseCode::ControlRefused,
         QuicCloseCode::SessionEnded,
+        QuicCloseCode::OverBudget,
     ] {
         let mut rig = reach(Role::Server, S::Confirming);
         let actions = rig.close_with(attempt_of(Role::Server), u64::from(code.code()));

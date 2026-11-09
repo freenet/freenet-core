@@ -7,7 +7,12 @@
 //! measurement runs both endpoints, quinn's drivers and the paths' receive
 //! tasks on the test's current-thread runtime, over `SimulationSocket` on
 //! one `VirtualTime`, with `GlobalRng` seeded, so a run is repeatable. The
-//! stream measurements drive quinn-proto directly, with no runtime at all.
+//! received-data measurements (assembler hold, ACK tail) drive quinn-proto
+//! directly, with no runtime at all. The open-stream and `stopped`-entry
+//! measurements (`StreamRig`) run real endpoints the same way as the
+//! idle-connection one, on the current-thread runtime, and take the
+//! `stopped`-entry figure as the difference of two runs, so the simulated
+//! clock's retained timer-queue capacity cancels out.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -15,7 +20,8 @@ use std::time::{Duration, Instant};
 
 use super::config::{
     QUIC_ACK_TAIL_BYTES, QUIC_ASSEMBLER_HOLD_PER_STREAM_BYTES, QUIC_ASSEMBLER_HOLD_WINDOW_MULTIPLE,
-    QUIC_CONNECTION_FIXED_BYTES, QUIC_MEMORY_MEASURED_WITH, QuicSettings,
+    QUIC_CONNECTION_FIXED_BYTES, QUIC_MEMORY_MEASURED_WITH, QUIC_OPEN_STREAM_BYTES,
+    QUIC_STOPPED_ENTRY_BYTES, QuicSettings,
 };
 use super::path::{QuicInbound, QuicPath};
 use super::tests::{SEED, bounded, drive};
@@ -241,6 +247,222 @@ fn an_idle_connection_measures_within_the_fixed_pin() {
              ({QUIC_CONNECTION_FIXED_BYTES} B); re-measure and raise it with the margin \
              its doc states",
             cost.per_connection()
+        );
+    })
+}
+
+/// One connection with a node's path on each side, for the stream
+/// measurements, on its own network and clock.
+struct StreamRig {
+    time: VirtualTime,
+    network: String,
+    /// The client's quinn connection, to write streams by hand.
+    raw: quinn::Connection,
+    _held: [Held; 2],
+    _permit: super::QuicPeerPermit,
+    pumps: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl StreamRig {
+    async fn new(network: &str, subnet: u8) -> Self {
+        let a_addr: SocketAddr = format!("10.204.{subnet}.1:5000").parse().unwrap();
+        let b_addr: SocketAddr = format!("10.204.{subnet}.2:5000").parse().unwrap();
+        let time = VirtualTime::new();
+        register_network_time_source(network, time.clone());
+        register_address_network(a_addr, network);
+        register_address_network(b_addr, network);
+        let bind = |addr| async move {
+            Arc::new(DemuxSocket::wrap(
+                SimulationSocket::bind(addr).await.expect("sim bind"),
+                None,
+            ))
+        };
+        let (a_socket, b_socket) = (bind(a_addr).await, bind(b_addr).await);
+        let (a_keys, b_keys) = (TransportKeypair::new(), TransportKeypair::new());
+        let a = QuicEndpoint::bind(a_socket.clone(), a_addr, time.clone(), &settings(), &a_keys)
+            .expect("endpoint a");
+        let b = QuicEndpoint::bind(b_socket.clone(), b_addr, time.clone(), &settings(), &b_keys)
+            .expect("endpoint b");
+        let pumps = [a_socket, b_socket]
+            .into_iter()
+            .map(|socket| {
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; MAX_RECV_PACKET_SIZE];
+                    while socket.recv_classified(&mut buf).await.is_ok() {}
+                })
+            })
+            .collect();
+        let permit = b
+            .allow_peer(a_addr, a_keys.public())
+            .expect("allow-set has room");
+        let b_key = b_keys.public().clone();
+        let (client, server) = drive(&time, LIMIT, async move {
+            let (client, server) = tokio::join!(a.connect(b_addr, &b_key), async {
+                b.accept()
+                    .await
+                    .expect("an incoming attempt")
+                    .establish()
+                    .await
+            });
+            (
+                client.expect("client handshake"),
+                server.expect("server accepted"),
+            )
+        })
+        .await;
+        let raw = client.inner().clone();
+        let hold = |conn: QuicConnection, time: &VirtualTime| {
+            let (path, inbound) = QuicPath::new(conn, time.clone());
+            Held {
+                _path: path,
+                _inbound: inbound,
+            }
+        };
+        let held = [hold(client, &time), hold(server, &time)];
+        Self {
+            time,
+            network: network.to_string(),
+            raw,
+            _held: held,
+            _permit: permit,
+            pumps,
+        }
+    }
+}
+
+impl Drop for StreamRig {
+    fn drop(&mut self) {
+        for pump in &self.pumps {
+            pump.abort();
+        }
+        unregister_network_time_source(&self.network);
+    }
+}
+
+/// What `streams` open uni streams cost on one connection, both sides
+/// together: quinn's per-stream state on the sender and the receiver, and
+/// the receiver's reader for each (`path::inbound`), with one byte written
+/// on each and the stream left open. A warm-up stream first, a settled
+/// baseline, then the streams, settled, against it.
+async fn measure_open_streams(network: &str, subnet: u8, streams: usize) -> Live {
+    let _seed = GlobalRng::seed_guard(SEED);
+    let rig = StreamRig::new(network, subnet).await;
+    let (time, raw) = (rig.time.clone(), rig.raw.clone());
+    let warm = raw.clone();
+    drive(&time, LIMIT, async move {
+        let mut send = warm.open_uni().await.expect("open");
+        send.write_all(&[1]).await.expect("write");
+        send.finish().expect("finish");
+    })
+    .await;
+    settle(&time).await;
+    let baseline = live_bytes();
+    let opened = drive(&time, LIMIT, async move {
+        let mut held = Vec::with_capacity(streams);
+        for _ in 0..streams {
+            let mut send = raw.open_uni().await.expect("open");
+            send.write_all(&[1]).await.expect("write");
+            held.push(send);
+        }
+        held
+    })
+    .await;
+    settle(&time).await;
+    let cost = live_bytes() - baseline;
+    drop(opened);
+    cost
+}
+
+/// What `streams` streams leave behind on one connection, both sides together,
+/// once each was opened, had `stopped()` polled if `poll_stopped` (as every
+/// send of a path's does, `Outgoing`), and was reset by the sender, settled.
+///
+/// The total also holds a harness artifact of about 100 B per stream: each
+/// inbound stream's reader arms a timer, `VirtualSleep` has no drop
+/// deregistration, so `VirtualTime`'s wakeup queues reach about `streams`
+/// entries, and a `Vec`/`BinaryHeap` keeps its peak capacity once they fire.
+/// Production timers deregister on drop. Compare two runs to cancel it.
+async fn measure_reset_streams(
+    network: &str,
+    subnet: u8,
+    streams: usize,
+    poll_stopped: bool,
+) -> Live {
+    use futures::FutureExt;
+    let _seed = GlobalRng::seed_guard(SEED);
+    let rig = StreamRig::new(network, subnet).await;
+    let (time, raw) = (rig.time.clone(), rig.raw.clone());
+    let reset_one = move |raw: quinn::Connection| async move {
+        let mut send = raw.open_uni().await.expect("open");
+        send.write_all(&[1]).await.expect("write");
+        if poll_stopped {
+            // Registers the stream in quinn's `stopped` map.
+            assert!(send.stopped().now_or_never().is_none());
+        }
+        send.reset(0u32.into()).expect("reset");
+    };
+    let warm = raw.clone();
+    drive(&time, LIMIT, reset_one(warm)).await;
+    settle(&time).await;
+    let baseline = live_bytes();
+    drive(&time, LIMIT, async move {
+        for _ in 0..streams {
+            reset_one(raw.clone()).await;
+        }
+    })
+    .await;
+    settle(&time).await;
+    live_bytes() - baseline
+}
+
+/// Polling `stopped()` on a stream this side then resets costs at most
+/// [`QUIC_STOPPED_ENTRY_BYTES`] per stream until the connection closes, in
+/// jemalloc-rounded bytes: quinn's `stopped` map entry. Measured as the
+/// difference between 1,024 resets with the poll and 1,024 without it, on
+/// connections of their own, so everything else a reset stream leaves (and the
+/// harness's timer queues, see [`measure_reset_streams`]) cancels out.
+#[test]
+fn polling_stopped_on_a_reset_stream_costs_at_most_its_entry() {
+    bounded(|| async move {
+        let streams = 1024;
+        let polled = measure_reset_streams("quic-memory-stopped", 3, streams, true).await;
+        let plain = measure_reset_streams("quic-memory-unpolled", 4, streams, false).await;
+        let entries = polled.rounded - plain.rounded;
+        assert!(
+            entries > 0,
+            "premise: the polls left memory: {polled:?} against {plain:?}"
+        );
+        let per_stream = (entries as usize).div_ceil(streams);
+        assert!(
+            per_stream <= QUIC_STOPPED_ENTRY_BYTES,
+            "{per_stream} B per stopped() entry ({polled:?} against {plain:?}) exceeds \
+             QUIC_STOPPED_ENTRY_BYTES ({QUIC_STOPPED_ENTRY_BYTES} B); re-measure and raise it \
+             with the margin its doc states"
+        );
+    })
+}
+
+/// An open uni stream with one byte on it, held by a node's path on both
+/// sides, measures within [`QUIC_OPEN_STREAM_BYTES`], both sides together, in
+/// jemalloc-rounded bytes. Measured with `STREAMED_SEND_LIMIT` streams on one
+/// connection.
+#[test]
+fn an_open_stream_measures_within_its_pin() {
+    bounded(|| async move {
+        // Not the whole stream limit: the warm-up stream's slot comes back only
+        // once more than an eighth of the limit is freed.
+        let streams = super::config::STREAMED_SEND_LIMIT as usize;
+        let cost = measure_open_streams("quic-memory-streams", 2, streams).await;
+        assert!(
+            cost.rounded > 0,
+            "premise: the streams held memory: {cost:?}"
+        );
+        let per_stream = (cost.rounded as usize).div_ceil(streams);
+        assert!(
+            per_stream <= QUIC_OPEN_STREAM_BYTES,
+            "{per_stream} B per open stream ({cost:?}) exceeds QUIC_OPEN_STREAM_BYTES \
+             ({QUIC_OPEN_STREAM_BYTES} B); re-measure and raise it with the margin its doc \
+             states"
         );
     })
 }
@@ -831,4 +1053,23 @@ fn quic_memory_figures_match_the_locked_versions() {
              with {measured}: re-measure (quic::memory_tests) before moving the pin"
         );
     }
+}
+
+/// The fixed charge per connection is the sum the buffer-budget design gives
+/// (840 KiB, the `stopped` map at the reset limit's worst case), and the budget
+/// for what scales with the windows is a sixteenth of node memory. A change to
+/// any term moves the first figure, so the design's connection caps are
+/// re-derived with it.
+#[test]
+fn the_fixed_charge_and_the_buffer_budget_match_the_design() {
+    use super::config::{QUIC_CONNECTION_CHARGE_BYTES, quic_buffer_budget_for};
+    assert_eq!(
+        super::recycle::SEND_ABORT_LIMIT as usize * QUIC_STOPPED_ENTRY_BYTES,
+        416 * 1024
+    );
+    assert_eq!(QUIC_CONNECTION_CHARGE_BYTES, 860_160);
+    const MIB: usize = 1024 * 1024;
+    assert_eq!(quic_buffer_budget_for(1024 * MIB), 64 * MIB);
+    assert_eq!(quic_buffer_budget_for(2048 * MIB), 128 * MIB);
+    assert_eq!(quic_buffer_budget_for(7600 * MIB), 475 * MIB);
 }

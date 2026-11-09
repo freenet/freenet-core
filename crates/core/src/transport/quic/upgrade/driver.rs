@@ -624,6 +624,7 @@ fn fallback_label(cause: FallbackCause) -> QuicFallback {
         FallbackCause::DowngradeReceived => QuicFallback::DowngradeReceived,
         FallbackCause::EndpointDown => QuicFallback::EndpointDown,
         FallbackCause::SessionEndedReceived => QuicFallback::SessionEndedReceived,
+        FallbackCause::OverBudgetReceived => QuicFallback::OverBudgetReceived,
     }
 }
 
