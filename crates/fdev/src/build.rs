@@ -23,11 +23,11 @@ const DEFAULT_OUTPUT_NAME: &str = "contract-state";
 const WASM_TARGET: &str = "wasm32-unknown-unknown";
 
 #[cfg(windows)]
-pub const NPM_BUILD_COMMAND: &'static str = "npm.cmd";
+pub const NPM_BUILD_COMMAND: &str = "npm.cmd";
 #[cfg(windows)]
-pub const TSC_BUILD_COMMAND: &'static str = "tsc.cmd";
+pub const TSC_BUILD_COMMAND: &str = "tsc.cmd";
 #[cfg(windows)]
-pub const WEBPACK_BUILD_COMMAND: &'static str = "webpack.cmd";
+pub const WEBPACK_BUILD_COMMAND: &str = "webpack.cmd";
 
 #[cfg(not(windows))]
 pub const NPM_BUILD_COMMAND: &str = "npm";

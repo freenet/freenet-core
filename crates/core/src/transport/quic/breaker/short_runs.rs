@@ -1,21 +1,36 @@
-//! The QUIC crash-loop breaker on Windows: count short runs (#6031).
+//! The QUIC crash-loop breaker on Windows: count short runs that panicked in
+//! QUIC code (#6031).
 //!
 //! The unix breaker asks whether a run crashed. Windows gives no reliable way
-//! to answer that, so this one does not ask: a run with QUIC enabled that
-//! lasted less than [`SHORT_RUN`] counts, whatever ended it, and
-//! [`SHORT_RUNS_TO_TRIP`] of them in a row keep QUIC off for
-//! [`QUIC_BREAKER_COOLDOWN`]. A run that started more than the cooldown after
-//! the one before it starts the count again, so short runs do not add up over
-//! a week.
+//! to answer that from the outside (a logoff, a Fast Startup shutdown, a
+//! session end and a `taskkill` all look alike), so this one asks the run
+//! itself: the failure the breaker exists for, a panic inside quinn's driver
+//! or in the runtime adapter quinn calls under its lock, always panics before
+//! quinn's destructors abort the process. A panic hook ([`record_quic_panics`])
+//! records a panic located in quinn, quinn-proto or this crate's QUIC
+//! transport ([`quic_attributed`]) in the run's marker. A run with QUIC
+//! enabled counts only if it lasted less than [`SHORT_RUN`] and recorded such
+//! a panic, and [`SHORT_RUNS_TO_TRIP`] of them in a row keep QUIC off for
+//! [`QUIC_BREAKER_COOLDOWN`]. A short run that recorded no QUIC panic (any
+//! ordinary stop) starts the count again. A run that started more than the
+//! cooldown after the one before it starts the count again too.
 //!
-//! This is weaker than the unix breaker. A crash loop whose runs each last
-//! [`SHORT_RUN`] or more never trips, and neither does a fault that crashes
-//! once a day. See [`super`].
+//! The first version (#6101) counted every short run, whatever ended it.
+//! Replayed over 2.2 days of telemetry from 634 Windows peers, that would
+//! have kept QUIC off for a day on 1.3% of them, for ordinary short sessions.
+//!
+//! This is weaker than the unix breaker in one way: a process death not
+//! preceded by a panic (a stack overflow, an out-of-memory abort, an access
+//! violation) is not counted. The quinn failure this exists for panics first.
+//! And as before, a crash loop whose runs each last [`SHORT_RUN`] or more
+//! never trips, and neither does a fault that crashes once a day. See
+//! [`super`].
 //!
 //! # The marker
 //!
 //! [`Marker::ShortRuns`] in the unix marker's file: the short runs in a row
-//! before this run, when this run started, and a nonce.
+//! before this run, when this run started, a nonce, and whether this run has
+//! recorded a QUIC panic.
 //!
 //! - **Written** once the endpoint is up, as on unix, so a start that cannot
 //!   bind (a second node on the same port) changes nothing.
@@ -26,9 +41,27 @@
 //!   not reach it. A panic in the update-check task does, as on unix: the run
 //!   then ends `Ok`. The Ctrl+C path is untested in a real process on Windows:
 //!   a test would have to send the console event, which can reach the runner.
+//! - **Marked** by the panic hook on the first panic attributed to QUIC code,
+//!   but only while the marker is still this run's: after [`SHORT_RUN`] the
+//!   timer has removed it, so a later panic finds nothing to mark. The timer
+//!   and the clean exit announce the removal first ([`note_marker_cleared`]),
+//!   so a panic racing them takes its mark back out.
 //! - **Still there at the next start** means the last run lasted less than
-//!   [`SHORT_RUN`] and did not reach a clean exit. [`decide`] counts it unless
-//!   that run started the cooldown or more ago.
+//!   [`SHORT_RUN`] and did not reach a clean exit. [`decide`] counts it if it
+//!   recorded a QUIC panic and started less than the cooldown ago.
+//!
+//! # The panic hook
+//!
+//! Process-global, installed once, when the first Windows marker is written.
+//! It calls the hook that was installed before it, so the default panic output
+//! (or any other hook) still runs. A panic counts as QUIC's if the thread is
+//! inside a [`QuicCode`] guard (quinn's driver polls and the socket adapter's
+//! calls, so a panic in a dependency they call counts), or failing that, if
+//! its location is in QUIC code ([`quic_attributed`]). It does no logging and takes no lock: it
+//! may run on a thread that holds one. It counts every attributed panic, a
+//! caught one included (the socket adapter catches its own panics and turns
+//! QUIC off for the run, #6027): a fault that recurs at every start is what
+//! the breaker is for, whether or not it ends the process.
 //!
 //! [`decide`] is a pure function of what was read and the clock. Everything
 //! here compiles and is tested on every platform: the one thing that is
@@ -89,18 +122,20 @@
 //! - **A fatal listener or storage exit counts.** It also exits 42 under the
 //!   wrapper, but through `std::process::exit` in `p2p_impl.rs`, which does not
 //!   reach the clean exit.
-//! - **Known false trips** (one cooldown with QUIC off each): three runs in a
-//!   row shorter than [`SHORT_RUN`] that were stopped on purpose, from the tray
-//!   or by `freenet service restart`, or ended by a shutdown or logoff soon
-//!   after each logon. Also a second node on the same data directory that
-//!   reaches [`gate`] while the first is under [`SHORT_RUN`] with the count one
-//!   short of a trip. The preflight in `run_network` exits 43 before that when
-//!   a live node answers, so this needs that check to miss it.
+//! - **Known false trips** (one cooldown with QUIC off each): three short runs
+//!   in a row that each recorded a QUIC panic which did not stop the node and
+//!   were then stopped on purpose. Also a second node on the same data
+//!   directory that reaches [`gate`] while the first is under [`SHORT_RUN`]
+//!   with a recorded panic and the count one short of a trip. The preflight in
+//!   `run_network` exits 43 before that when a live node answers.
 //! - **A marker left behind counts once**: a rollback to a release that does
 //!   not clear it, followed by this release again within the cooldown, reads
 //!   it as one short run.
-//! - **Known missed trips**: a crash loop whose runs each last [`SHORT_RUN`] or
-//!   more never trips; a fault that crashes once per cooldown or less often
+//! - **Known missed trips**: a crash not preceded by a panic attributed to QUIC
+//!   code (a stack overflow, an out-of-memory abort, an access violation, or
+//!   a panic in a dependency on a thread outside the guarded calls, such as a
+//!   task this crate spawns that calls into `bytes`); a panic whose mark could not be written; a crash loop whose runs
+//!   each last [`SHORT_RUN`] or more never trips; a fault that crashes once per cooldown or less often
 //!   never trips, because the gap resets the count; a crash before the marker
 //!   is written is not counted; a crash in a run whose marker could not be
 //!   written is not counted.
@@ -143,8 +178,9 @@ pub(super) struct Decision {
 
 /// The whole decision, as described in the module docs. Only
 /// [`Verdict::Arm`], [`Verdict::Trip`] and [`Verdict::Cool`] come out of it. A
-/// run counts only if it started within the cooldown, so a clock gone back past
-/// its start and a run from long ago both start the count again.
+/// run counts only if it recorded a QUIC panic and started within the
+/// cooldown, so an ordinary stop, a clock gone back past its start and a run
+/// from long ago all start the count again.
 pub(super) fn decide(previous: &Previous, now_secs: u64, ignore_breaker: bool) -> Decision {
     let arm = |short_runs| Decision {
         verdict: Verdict::Arm,
@@ -154,6 +190,7 @@ pub(super) fn decide(previous: &Previous, now_secs: u64, ignore_breaker: bool) -
         Previous::Marker(Marker::ShortRuns {
             short_runs,
             started_at_secs,
+            quic_panicked: true,
             ..
         }) if within_cooldown(*started_at_secs, now_secs) => {
             let short_runs = short_runs.saturating_add(1);
@@ -201,6 +238,7 @@ fn marker_after(decision: Decision, now_secs: u64, nonce: u64) -> Option<Marker>
             short_runs: decision.short_runs,
             started_at_secs: now_secs,
             nonce,
+            quic_panicked: false,
         }),
         Verdict::Trip => Some(Marker::Tripped {
             tripped_at_secs: now_secs,
@@ -309,6 +347,7 @@ async fn clear_after_short_run(time: &impl TimeSource, path: PathBuf, nonce: u64
     for attempt in 1..=CLEAR_ATTEMPTS {
         time.sleep(SHORT_RUN).await;
         let target = path.clone();
+        note_marker_cleared();
         // The disk can be slow on Windows; this task must not hold a worker.
         let outcome = tokio::task::spawn_blocking(move || clear_if_owned(&target, nonce)).await;
         match outcome {
@@ -334,6 +373,149 @@ async fn clear_after_short_run(time: &impl TimeSource, path: PathBuf, nonce: u64
     }
 }
 
+/// Whether a panic at `file` (a panic location's path) is in QUIC code: quinn
+/// or quinn-proto (a crate directory named `quinn` or `quinn-proto`, or
+/// starting `quinn-`, as cargo names a registry or versioned vendored crate),
+/// or this crate's QUIC transport. Paths use either separator, since a Windows
+/// build reports backslashes. The fallback to [`QuicCode`]: a panic in
+/// QUIC code on a thread that is not inside a guarded call.
+pub(super) fn quic_attributed(file: &str) -> bool {
+    let file = file.replace('\\', "/");
+    file.split('/')
+        .any(|part| part == "quinn" || part == "quinn-proto" || part.starts_with("quinn-"))
+        || file.contains("src/transport/quic/")
+        || file.ends_with("src/transport/quic.rs")
+}
+
+thread_local! {
+    /// How many [`QuicCode`] guards this thread is inside.
+    static IN_QUIC_CODE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// While alive, a panic on this thread counts as a panic in QUIC code,
+/// wherever it is located: inside quinn's driver polls (`runtime.rs`) and the
+/// socket adapter's calls (`socket.rs`), a panic in a dependency they call
+/// (`bytes`, `tokio`, `rustls`, the egress cap) is the same QUIC fault. The
+/// count is restored on drop, which during an unwind runs after the hook.
+pub(crate) struct QuicCode(());
+
+impl QuicCode {
+    pub(crate) fn enter() -> Self {
+        IN_QUIC_CODE.with(|depth| depth.set(depth.get().saturating_add(1)));
+        Self(())
+    }
+}
+
+impl Drop for QuicCode {
+    fn drop(&mut self) {
+        IN_QUIC_CODE.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
+/// Whether this thread is inside a [`QuicCode`] guard. `false` if the
+/// thread-local is gone (a panic during thread teardown).
+fn in_quic_code() -> bool {
+    IN_QUIC_CODE
+        .try_with(|depth| depth.get() > 0)
+        .unwrap_or(false)
+}
+
+/// Set by a clean exit or the short-run timer before it removes the marker,
+/// so a panic racing it cannot write the marker back
+/// ([`record_quic_panic_at`]).
+static MARKER_CLEARED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Called before this run's marker is removed on purpose (the short-run
+/// timer, a clean exit).
+pub(super) fn note_marker_cleared() {
+    MARKER_CLEARED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Mark the marker at `path` as having recorded a QUIC panic, if it is still
+/// the run's with `nonce` and not marked yet. Returns whether it wrote. Takes
+/// no lock and logs nothing: it runs inside the panic hook.
+fn mark_quic_panic(path: &Path, nonce: u64) -> std::io::Result<bool> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    match serde_json::from_slice::<Marker>(&bytes) {
+        Ok(Marker::ShortRuns {
+            short_runs,
+            started_at_secs,
+            nonce: owner,
+            quic_panicked: false,
+        }) if owner == nonce => {
+            let marked = Marker::ShortRuns {
+                short_runs,
+                started_at_secs,
+                nonce,
+                quic_panicked: true,
+            };
+            write_marker(path, &marked).map(|()| true)
+        }
+        Ok(_) | Err(_) => Ok(false),
+    }
+}
+
+/// The marker the panic hook marks: the first one this process wrote.
+static PANIC_TARGET: std::sync::OnceLock<(PathBuf, u64)> = std::sync::OnceLock::new();
+/// Set by the first attributed panic, so only that one touches the disk.
+static PANIC_RECORDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static HOOK_INSTALLED: std::sync::Once = std::sync::Once::new();
+
+/// Install the panic hook (once per process) that records a panic in QUIC
+/// code in the marker at `path` with `nonce`. See the module docs.
+pub(super) fn record_quic_panics(path: PathBuf, nonce: u64) {
+    // One node per process in production; a second keeps the first.
+    let _first_wins = PANIC_TARGET.set((path, nonce));
+    HOOK_INSTALLED.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            on_panic(
+                info.location().map(|location| location.file()),
+                in_quic_code(),
+            );
+            previous(info);
+        }));
+    });
+}
+
+/// What the hook does before calling the hook it replaced: `file` is the
+/// panic's location, `in_quic` whether the panicking thread is inside a
+/// [`QuicCode`] guard.
+fn on_panic(file: Option<&str>, in_quic: bool) {
+    if !(in_quic || file.is_some_and(quic_attributed)) {
+        return;
+    }
+    let Some((path, nonce)) = PANIC_TARGET.get() else {
+        return;
+    };
+    if PANIC_RECORDED.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    record_quic_panic_at(path, *nonce, || {
+        MARKER_CLEARED.load(std::sync::atomic::Ordering::SeqCst)
+    });
+}
+
+/// Mark the marker, unless `cleared` says the run removed it on purpose, and
+/// if that happened while the mark was being written, remove the marker
+/// again: the clearer sets `cleared` before it removes the file, so either it
+/// removes the marked file or this sees `cleared` and removes it. Best effort:
+/// a mark that cannot be written leaves the run uncounted.
+fn record_quic_panic_at(path: &Path, nonce: u64, cleared: impl Fn() -> bool) {
+    if cleared() {
+        return;
+    }
+    if let Ok(true) = mark_quic_panic(path, nonce) {
+        if cleared() {
+            let _best_effort = clear_if_owned(path, nonce);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::write_atomic;
@@ -352,6 +534,17 @@ mod tests {
             short_runs,
             started_at_secs,
             nonce: NONCE,
+            quic_panicked: false,
+        })
+    }
+
+    /// A short run that recorded a QUIC panic: the kind that counts.
+    fn panicked(short_runs: u32, started_at_secs: u64) -> Previous {
+        Previous::Marker(Marker::ShortRuns {
+            short_runs,
+            started_at_secs,
+            nonce: NONCE,
+            quic_panicked: true,
         })
     }
 
@@ -377,8 +570,18 @@ mod tests {
         decision.verdict
     }
 
-    /// Three short runs trip, not two: the fourth start is the first one with
-    /// QUIC off.
+    /// [`start`], then a panic in QUIC code during the run (what the hook
+    /// does with it).
+    fn start_panicking(path: &Path, now_secs: u64, ignore: bool) -> Verdict {
+        let verdict = start(path, now_secs, ignore);
+        if verdict == Verdict::Arm {
+            assert!(mark_quic_panic(path, NONCE).unwrap(), "marked");
+        }
+        verdict
+    }
+
+    /// Three short runs that panicked in QUIC code trip, not two: the fourth
+    /// start is the first one with QUIC off.
     #[test]
     fn three_short_runs_in_a_row_trip() {
         let dir = tempfile::tempdir().unwrap();
@@ -391,6 +594,8 @@ mod tests {
                 running(run, now),
                 "the marker records the runs so far and this start"
             );
+            assert!(mark_quic_panic(&path, NONCE).unwrap());
+            assert_eq!(read_previous(&path), panicked(run, now));
         }
         let now = T0 + u64::from(SHORT_RUNS_TO_TRIP);
         assert_eq!(start(&path, now, false), Verdict::Trip);
@@ -404,14 +609,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = marker_path(dir.path());
         for run in 0..2 {
-            assert_eq!(start(&path, T0 + run, false), Verdict::Arm);
+            assert_eq!(start_panicking(&path, T0 + run, false), Verdict::Arm);
         }
-        assert_eq!(read_previous(&path), running(1, T0 + 1));
+        assert_eq!(read_previous(&path), panicked(1, T0 + 1));
         clear_if_owned(&path, NONCE).unwrap();
         for run in 0..SHORT_RUNS_TO_TRIP {
-            assert_eq!(start(&path, T0 + 10, false), Verdict::Arm, "start {run}");
+            assert_eq!(
+                start_panicking(&path, T0 + 10, false),
+                Verdict::Arm,
+                "start {run}"
+            );
         }
-        assert_eq!(read_previous(&path), running(2, T0 + 10));
+        assert_eq!(read_previous(&path), panicked(2, T0 + 10));
     }
 
     #[test]
@@ -489,17 +698,17 @@ mod tests {
     #[test]
     fn a_clock_going_back_fails_open() {
         // A running marker from the future: not counted, whatever it says.
-        assert_eq!(decide(&running(2, T0 + 1), T0, false), arm(0));
-        assert_eq!(decide(&running(2, T0), T0, false).verdict, Verdict::Trip);
+        assert_eq!(decide(&panicked(2, T0 + 1), T0, false), arm(0));
+        assert_eq!(decide(&panicked(2, T0), T0, false).verdict, Verdict::Trip);
         // Same second counts: restarts can be that fast.
-        assert_eq!(decide(&running(0, T0), T0, false), arm(1));
+        assert_eq!(decide(&panicked(0, T0), T0, false), arm(1));
 
         // A trip from the future holds nothing off, however close.
         assert_eq!(decide(&tripped(T0 + 1), T0, false), arm(0));
         assert_eq!(decide(&tripped(T0 + 2 * cooldown()), T0, false), arm(0));
         // A clock that cannot be read is 0 (`unix_secs`).
         assert_eq!(decide(&tripped(T0), 0, false), arm(0));
-        assert_eq!(decide(&running(2, T0), 0, false), arm(0));
+        assert_eq!(decide(&panicked(2, T0), 0, false), arm(0));
         // A trip time at the top of the range does not wrap into a cooldown.
         assert_eq!(decide(&tripped(u64::MAX), u64::MAX, false), arm(0));
     }
@@ -508,14 +717,17 @@ mod tests {
     #[test]
     fn a_run_from_a_cooldown_ago_starts_the_count_again() {
         assert_eq!(
-            decide(&running(2, T0), T0 + cooldown() - 1, false).verdict,
+            decide(&panicked(2, T0), T0 + cooldown() - 1, false).verdict,
             Verdict::Trip,
             "one second inside"
         );
-        assert_eq!(decide(&running(0, T0), T0 + cooldown() - 1, false), arm(1));
-        assert_eq!(decide(&running(2, T0), T0 + cooldown(), false), arm(0));
-        assert_eq!(decide(&running(2, T0), T0 + 30 * cooldown(), false), arm(0));
-        assert_eq!(decide(&running(2, T0), T0 + cooldown(), true), arm(0));
+        assert_eq!(decide(&panicked(0, T0), T0 + cooldown() - 1, false), arm(1));
+        assert_eq!(decide(&panicked(2, T0), T0 + cooldown(), false), arm(0));
+        assert_eq!(
+            decide(&panicked(2, T0), T0 + 30 * cooldown(), false),
+            arm(0)
+        );
+        assert_eq!(decide(&panicked(2, T0), T0 + cooldown(), true), arm(0));
     }
 
     /// Three short sessions a week apart never trip, and neither does a crash
@@ -528,11 +740,11 @@ mod tests {
             for run in 0..10 {
                 let now = T0 + run * gap;
                 assert_eq!(
-                    start(&path, now, false),
+                    start_panicking(&path, now, false),
                     Verdict::Arm,
                     "gap {gap} run {run}"
                 );
-                assert_eq!(read_previous(&path), running(0, now));
+                assert_eq!(read_previous(&path), panicked(0, now));
             }
             std::fs::remove_file(&path).unwrap();
         }
@@ -540,7 +752,7 @@ mod tests {
         let half_a_day = cooldown() / 2;
         for run in 0..SHORT_RUNS_TO_TRIP {
             let now = T0 + u64::from(run) * half_a_day;
-            assert_eq!(start(&path, now, false), Verdict::Arm);
+            assert_eq!(start_panicking(&path, now, false), Verdict::Arm);
         }
         let now = T0 + u64::from(SHORT_RUNS_TO_TRIP) * half_a_day;
         assert_eq!(start(&path, now, false), Verdict::Trip);
@@ -549,8 +761,8 @@ mod tests {
     /// The override skips the trip and the cooldown, and the count goes on.
     #[test]
     fn the_override_runs_quic_and_keeps_counting() {
-        assert_eq!(decide(&running(2, T0), T0, true), arm(3));
-        assert_eq!(decide(&running(9, T0), T0, true), arm(10));
+        assert_eq!(decide(&panicked(2, T0), T0, true), arm(3));
+        assert_eq!(decide(&panicked(9, T0), T0, true), arm(10));
         assert_eq!(decide(&tripped(T0), T0, true), arm(0));
         assert_eq!(
             marker_after(decide(&tripped(T0), T0, true), T0, NONCE),
@@ -558,16 +770,17 @@ mod tests {
                 short_runs: 0,
                 started_at_secs: T0,
                 nonce: NONCE,
+                quic_panicked: false,
             }),
             "the override's start replaces the trip, so the trip is gone"
         );
         assert_eq!(
-            decide(&running(3, T0), T0, false).verdict,
+            decide(&panicked(3, T0), T0, false).verdict,
             Verdict::Trip,
             "once removed, the last run trips"
         );
         assert_eq!(
-            decide(&running(u32::MAX, T0), T0, true),
+            decide(&panicked(u32::MAX, T0), T0, true),
             arm(u32::MAX),
             "the count saturates"
         );
@@ -615,6 +828,7 @@ mod tests {
                 short_runs: SHORT_RUNS_TO_TRIP - 1,
                 started_at_secs: T0,
                 nonce: NONCE,
+                quic_panicked: true,
             },
         )
         .unwrap();
@@ -647,6 +861,7 @@ mod tests {
                 short_runs: SHORT_RUNS_TO_TRIP - 1,
                 started_at_secs: T0,
                 nonce: NONCE,
+                quic_panicked: true,
             },
         )
         .unwrap();
@@ -661,7 +876,7 @@ mod tests {
         assert_eq!(gated.settings, None);
         assert_eq!(
             read_previous(&path),
-            running(SHORT_RUNS_TO_TRIP - 1, T0),
+            panicked(SHORT_RUNS_TO_TRIP - 1, T0),
             "the marker stays, so the next start decides again"
         );
     }
@@ -773,9 +988,18 @@ mod tests {
         assert_eq!(
             serde_json::to_value(marker_after(arm(2), T0, NONCE).unwrap()).unwrap(),
             serde_json::json!({
-                "state": "short_runs", "short_runs": 2, "started_at_secs": T0, "nonce": NONCE
+                "state": "short_runs", "short_runs": 2, "started_at_secs": T0, "nonce": NONCE,
+                "quic_panicked": false
             })
         );
+        // A marker from the release before the field (#6101) reads as a run
+        // that recorded no QUIC panic, so it does not count.
+        let earlier: Marker = serde_json::from_value(serde_json::json!({
+            "state": "short_runs", "short_runs": 2, "started_at_secs": T0, "nonce": NONCE
+        }))
+        .unwrap();
+        assert_eq!(Previous::Marker(earlier), running(2, T0));
+        assert_eq!(decide(&running(2, T0), T0, false), arm(0));
     }
 
     /// `write_atomic` is what stands between a crash and a half-written
@@ -803,5 +1027,273 @@ mod tests {
             ignore_breaker: false,
         });
         assert_eq!(got, Verdict::Arm);
+    }
+
+    /// A short run that recorded no QUIC panic (a logoff, a shutdown, a
+    /// `taskkill`, a tray Quit) starts the count again, however many in a row.
+    #[test]
+    fn an_ordinary_short_run_does_not_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = marker_path(dir.path());
+        for run in 0..10 {
+            assert_eq!(start(&path, T0 + run, false), Verdict::Arm, "start {run}");
+            assert_eq!(read_previous(&path), running(0, T0 + run));
+        }
+        assert_eq!(
+            decide(&running(SHORT_RUNS_TO_TRIP - 1, T0), T0, false),
+            arm(0)
+        );
+        // Two panicked runs, then an ordinary stop: the count starts again.
+        std::fs::remove_file(&path).unwrap();
+        for run in 0..2 {
+            assert_eq!(start_panicking(&path, T0 + run, false), Verdict::Arm);
+        }
+        assert_eq!(start(&path, T0 + 2, false), Verdict::Arm);
+        assert_eq!(read_previous(&path), running(2, T0 + 2));
+        assert_eq!(start(&path, T0 + 3, false), Verdict::Arm);
+        assert_eq!(read_previous(&path), running(0, T0 + 3));
+    }
+
+    /// Attribution is by the panic's file: quinn and quinn-proto, under any
+    /// cargo source directory and either separator, and this crate's QUIC
+    /// transport. Nothing else.
+    #[test]
+    fn a_panic_is_attributed_to_quic_by_its_location() {
+        for quic in [
+            "/home/u/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/quinn-0.11.12/src/endpoint.rs",
+            "C:\\Users\\u\\.cargo\\registry\\src\\index.crates.io-1949cf8c6b5b557f\\quinn-proto-0.11.18\\src\\connection\\mod.rs",
+            "/build/vendor/quinn-udp-0.5.14/src/lib.rs",
+            "/build/vendor/quinn/src/endpoint.rs",
+            "/build/vendor/quinn-proto/src/connection/mod.rs",
+            "crates/core/src/transport/quic/runtime.rs",
+            "crates\\core\\src\\transport\\quic\\path\\route.rs",
+            "crates/core/src/transport/quic.rs",
+        ] {
+            assert!(quic_attributed(quic), "{quic}");
+        }
+        for other in [
+            "crates/core/src/transport/peer_connection.rs",
+            "crates/core/src/transport/quick.rs",
+            "crates/core/src/node/p2p_impl.rs",
+            "/home/u/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tokio-1.47.1/src/runtime/task/mod.rs",
+            "/rustc/1159e78c4747b02ef996e55082b704c09b970588/library/core/src/option.rs",
+            "/home/u/.cargo/registry/src/x/myquinn-1.0.0/src/lib.rs",
+            "",
+        ] {
+            assert!(!quic_attributed(other), "{other}");
+        }
+    }
+
+    /// A panic marks only this run's marker, once: not another run's, not a
+    /// trip, and not a marker the timer has already removed, so a panic after
+    /// the run has lasted [`SHORT_RUN`] cannot make it count.
+    #[test]
+    fn a_panic_marks_only_this_short_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = marker_path(dir.path());
+        assert!(!mark_quic_panic(&path, NONCE).unwrap(), "no marker");
+
+        write_marker(&path, &marker_after(arm(1), T0, NONCE + 1).unwrap()).unwrap();
+        assert!(!mark_quic_panic(&path, NONCE).unwrap(), "another run's");
+        assert_eq!(
+            read_previous(&path),
+            Previous::Marker(marker_after(arm(1), T0, NONCE + 1).unwrap())
+        );
+
+        write_marker(
+            &path,
+            &Marker::Tripped {
+                tripped_at_secs: T0,
+            },
+        )
+        .unwrap();
+        assert!(!mark_quic_panic(&path, NONCE).unwrap(), "a trip");
+        assert_eq!(read_previous(&path), tripped(T0));
+
+        write_marker(&path, &marker_after(arm(1), T0, NONCE).unwrap()).unwrap();
+        assert!(mark_quic_panic(&path, NONCE).unwrap());
+        assert_eq!(read_previous(&path), panicked(1, T0));
+        assert!(!mark_quic_panic(&path, NONCE).unwrap(), "once");
+
+        // The run passed the limit: the timer removed it; a panic now finds
+        // nothing to mark and the next start counts nothing.
+        write_marker(&path, &marker_after(arm(1), T0, NONCE).unwrap()).unwrap();
+        assert!(clear_if_owned(&path, NONCE).unwrap());
+        assert!(!mark_quic_panic(&path, NONCE).unwrap());
+        assert!(!path.exists());
+        assert_eq!(decide(&read_previous(&path), T0 + 1, false), arm(0));
+    }
+
+    /// Set in the child process that runs [`the_panic_hook_marks_a_quic_panic_and_chains`]'s body.
+    const HOOK_CHILD_ENV: &str = "FREENET_TEST_QUIC_PANIC_HOOK_CHILD";
+
+    /// The real hook, installed in a child process (the hook is
+    /// process-global, so it must not reach other tests; see the
+    /// cross-test-interference row in bug-prevention-patterns): a panic in
+    /// this file, which is QUIC code, marks the run, the hook installed
+    /// before it still runs, and the default panic output still reaches
+    /// stderr.
+    #[test]
+    fn the_panic_hook_marks_a_quic_panic_and_chains() {
+        let name = "transport::quic::breaker::short_runs::tests::the_panic_hook_marks_a_quic_panic_and_chains";
+        if std::env::var_os(HOOK_CHILD_ENV).is_some() {
+            hook_child_body();
+            return;
+        }
+        let exe = if cfg!(target_os = "linux") {
+            PathBuf::from("/proc/self/exe")
+        } else {
+            std::env::current_exe().expect("test binary path")
+        };
+        let output = std::process::Command::new(exe)
+            .args(["--exact", "--test-threads=1", "--nocapture", name])
+            .env(HOOK_CHILD_ENV, "1")
+            .output()
+            .expect("re-run the test binary");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "the child failed ({}).\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            output.status
+        );
+        // libtest exits 0 when its filter matches nothing: a rename must fail.
+        assert!(
+            stdout.contains("1 passed"),
+            "the child did not run the test; was it renamed?\nstdout:\n{stdout}"
+        );
+        assert!(
+            stderr.contains("injected QUIC panic"),
+            "the default panic output was swallowed:\n{stderr}"
+        );
+    }
+
+    fn hook_child_body() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static EARLIER_HOOK_RUNS: AtomicU32 = AtomicU32::new(0);
+        let default = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            EARLIER_HOOK_RUNS.fetch_add(1, Ordering::SeqCst);
+            default(info);
+        }));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = marker_path(dir.path());
+        write_marker(&path, &marker_after(arm(1), T0, NONCE).unwrap()).unwrap();
+        record_quic_panics(path.clone(), NONCE);
+
+        // Not QUIC's: located elsewhere, or with no location, outside a
+        // guard. Nothing is marked and nothing latches.
+        on_panic(Some("crates/core/src/node/p2p_impl.rs"), false);
+        on_panic(None, false);
+        assert_eq!(read_previous(&path), running(1, T0), "not QUIC's");
+        // A real panic located in a dependency (alloc), outside a guard.
+        let caught = std::panic::catch_unwind(|| {
+            let v: Vec<u64> = Vec::with_capacity(std::hint::black_box(usize::MAX));
+            v.len()
+        });
+        assert!(caught.is_err());
+        assert_eq!(EARLIER_HOOK_RUNS.load(Ordering::SeqCst), 1, "chained");
+        assert_eq!(
+            read_previous(&path),
+            running(1, T0),
+            "a dependency's own panic"
+        );
+
+        // The same dependency panic inside a guard (as in quinn's driver or
+        // the socket adapter) is QUIC's.
+        let caught = std::panic::catch_unwind(|| {
+            let _quic = QuicCode::enter();
+            let v: Vec<u64> = Vec::with_capacity(std::hint::black_box(usize::MAX));
+            v.len()
+        });
+        assert!(caught.is_err());
+        assert!(!in_quic_code(), "the guard is released by the unwind");
+        assert_eq!(EARLIER_HOOK_RUNS.load(Ordering::SeqCst), 2, "chained");
+        assert_eq!(read_previous(&path), panicked(1, T0), "marked");
+
+        // A later panic in QUIC code does not touch the disk again.
+        write_marker(&path, &marker_after(arm(1), T0, NONCE).unwrap()).unwrap();
+        let caught = std::panic::catch_unwind(|| panic!("injected QUIC panic"));
+        assert!(caught.is_err());
+        assert_eq!(EARLIER_HOOK_RUNS.load(Ordering::SeqCst), 3, "still chained");
+        assert_eq!(read_previous(&path), running(1, T0), "marked once only");
+    }
+
+    /// A panic racing the run's own removal of its marker (the short-run
+    /// timer, a clean exit) does not write it back: nothing is written once
+    /// the removal is announced, and a mark written while it is announced is
+    /// taken out again.
+    #[test]
+    fn a_panic_racing_the_clear_does_not_resurrect_the_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = marker_path(dir.path());
+        write_marker(&path, &marker_after(arm(1), T0, NONCE).unwrap()).unwrap();
+        record_quic_panic_at(&path, NONCE, || true);
+        assert_eq!(
+            read_previous(&path),
+            running(1, T0),
+            "announced: not written"
+        );
+
+        // Announced between the check and the write: the mark is removed.
+        let asks = std::cell::Cell::new(0);
+        record_quic_panic_at(&path, NONCE, || {
+            asks.set(asks.get() + 1);
+            asks.get() > 1
+        });
+        assert_eq!(asks.get(), 2);
+        assert!(!path.exists(), "the clearer's removal stands");
+
+        // Not announced: marked.
+        write_marker(&path, &marker_after(arm(1), T0, NONCE).unwrap()).unwrap();
+        record_quic_panic_at(&path, NONCE, || false);
+        assert_eq!(read_previous(&path), panicked(1, T0));
+    }
+
+    /// The guard nests and is released in order.
+    #[test]
+    fn the_quic_code_guard_nests() {
+        assert!(!in_quic_code());
+        let outer = QuicCode::enter();
+        {
+            let _inner = QuicCode::enter();
+            assert!(in_quic_code());
+        }
+        assert!(in_quic_code());
+        drop(outer);
+        assert!(!in_quic_code());
+    }
+
+    /// Pins the guarded call sites, which no unit test reaches through a real
+    /// quinn driver: every driver future quinn spawns is polled inside a
+    /// guard, and so is every catch_unwind call in the socket adapter.
+    #[test]
+    fn quinn_drivers_and_the_socket_adapter_run_inside_the_guard() {
+        let flat = |src: &str| src.split_whitespace().collect::<String>();
+        let runtime = flat(include_str!("../runtime.rs"));
+        let spawn = runtime
+            .find("fnspawn(&self,future:")
+            .expect("Runtime::spawn");
+        let body = &runtime[spawn..];
+        let wrap = body
+            .find("letfuture=Box::pin(InQuicCode(future));")
+            .expect("wrapped");
+        let first_spawn = body.find("GlobalExecutor::spawn(").expect("spawned");
+        assert!(
+            wrap < first_spawn,
+            "the driver is wrapped before it is spawned"
+        );
+        assert!(
+            runtime.contains("let_quic=QuicCode::enter();self.0.as_mut().poll(cx)"),
+            "InQuicCode polls inside the guard"
+        );
+        let socket = flat(include_str!("../socket.rs"));
+        let unwinds = socket.matches("std::panic::catch_unwind(").count();
+        let guarded = socket
+            .matches("let_quic=super::breaker::QuicCode::enter();matchstd::panic::catch_unwind(")
+            .count();
+        assert!(unwinds >= 3, "the adapter's catch_unwind calls: {unwinds}");
+        assert_eq!(guarded, unwinds, "every adapter catch_unwind is guarded");
     }
 }

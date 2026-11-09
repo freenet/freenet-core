@@ -2636,9 +2636,9 @@ pub struct NetworkArgs {
     ///
     /// On unix, if a run with QUIC enabled ends abnormally, the node starts
     /// with QUIC off for 24 hours. On Windows the same happens after three
-    /// short runs in a row, whatever ended them. Set this to run QUIC anyway. A
-    /// start with this set erases the trip: removing it later does not bring
-    /// the 24 hours back. Default: false.
+    /// short runs in a row that each panicked in QUIC code. Set this to run
+    /// QUIC anyway. A start with this set erases the trip: removing it later
+    /// does not bring the 24 hours back. Default: false.
     ///
     /// Works as a bare flag after the subcommand: `--quic-ignore-crash-breaker`
     /// turns it on, `--quic-ignore-crash-breaker=false` turns it off. Before
@@ -4742,8 +4742,9 @@ impl ConfigPathsArgs {
                     // Ensure the parent directory exists before rename.
                     // On a fresh Local AppData install, the intermediate dirs
                     // (e.g., "The Freenet Project Inc/Freenet") won't exist yet.
+                    // A failure here surfaces as the rename's error below.
                     if let Some(parent) = app_data_dir.parent() {
-                        let _ = fs::create_dir_all(parent);
+                        drop(fs::create_dir_all(parent));
                     }
                     if let Err(e) = fs::rename(&old_roaming, &app_data_dir) {
                         tracing::warn!(

@@ -822,16 +822,8 @@ fn the_ack_tail_measures_within_its_pin() {
 /// in the constants' docs, and moves the pin.
 #[test]
 fn quic_memory_figures_match_the_locked_versions() {
-    let lock = include_str!("../../../../../Cargo.lock").replace("\r\n", "\n");
     for (name, measured) in QUIC_MEMORY_MEASURED_WITH {
-        let header = format!("[[package]]\nname = \"{name}\"\nversion = \"");
-        let locked: Vec<&str> = lock
-            .match_indices(&header)
-            .map(|(at, _)| {
-                let rest = &lock[at + header.len()..];
-                &rest[..rest.find('"').expect("closing quote")]
-            })
-            .collect();
+        let locked = super::tests::locked_versions(name);
         assert_eq!(
             locked,
             [measured],

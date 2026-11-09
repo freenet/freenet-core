@@ -81,7 +81,8 @@ mod platform {
         let webview = WebViewBuilder::new_with_web_context(&mut web_context)
             .with_html(SETUP_HTML)
             .with_ipc_handler(move |msg| {
-                let _ = ipc_proxy.send_event(UiEvent::Action(msg.body().to_string()));
+                // Fails only once the event loop has exited.
+                drop(ipc_proxy.send_event(UiEvent::Action(msg.body().to_string())));
             })
             .with_devtools(false)
             .build(&window)
@@ -96,6 +97,9 @@ mod platform {
         event_loop.run_return(|event, _, control_flow| {
             *control_flow = ControlFlow::Wait;
 
+            // Ends in a wildcard: tao's `Event` is non-exhaustive, and the
+            // wizard handles only the events it names.
+            #[allow(clippy::wildcard_enum_match_arm)]
             match event {
                 Event::WindowEvent {
                     event: WindowEvent::CloseRequested,
@@ -117,12 +121,12 @@ mod platform {
                         let install_proxy = proxy.clone();
                         let handle = std::thread::spawn(move || {
                             let cb_result = installer::run_install(|progress| {
-                                let _ = install_proxy.send_event(UiEvent::Progress(progress));
+                                drop(install_proxy.send_event(UiEvent::Progress(progress)));
                             });
                             if let Err(e) = cb_result {
-                                let _ = install_proxy.send_event(UiEvent::Progress(
+                                drop(install_proxy.send_event(UiEvent::Progress(
                                     InstallProgress::Error(format!("{e:#}")),
-                                ));
+                                )));
                             }
                         });
                         install_handle = Some(handle);
@@ -172,9 +176,11 @@ mod platform {
                             format!("showError('{escaped}')")
                         }
                     };
-                    let _ = webview.evaluate_script(&js);
+                    // Best-effort: a failed UI update is not recoverable here.
+                    drop(webview.evaluate_script(&js));
                 }
 
+                // Every other event is ignored.
                 _ => {}
             }
         });
@@ -182,7 +188,8 @@ mod platform {
         // Drop the webview so WebView2 releases file locks on the data dir
         drop(webview);
         // Clean up the temporary WebView2 data directory
-        let _ = std::fs::remove_dir_all(&webview2_data_dir);
+        // Best-effort: a leftover temporary directory is harmless.
+        drop(std::fs::remove_dir_all(&webview2_data_dir));
 
         Ok(result)
     }

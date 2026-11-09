@@ -21428,6 +21428,7 @@ fn test_quic_data_path_cut_mid_transfer_falls_back_to_udp() {
     let contract = SimOperation::create_test_contract(0x63);
     let key = contract.key();
     let warm_up = SimOperation::create_test_contract(0x64);
+    let late = SimOperation::create_test_contract(0x65);
     let state: Vec<u8> = (0..STATE_LEN).map(|i| (i % 251) as u8).collect();
 
     let node = NodeLabel::node(NETWORK, 1);
@@ -21469,6 +21470,18 @@ fn test_quic_data_path_cut_mid_transfer_falls_back_to_udp() {
             SimOperation::Put {
                 contract,
                 state: state.clone(),
+                subscribe: false,
+            },
+        ),
+        // The gateway sends on its path after the cut, more than a stall window
+        // after its last acknowledgement, so its path goes suspect by
+        // construction rather than only if some other message of its happens
+        // to time out there.
+        ScheduledOperation::new(
+            gateway.clone(),
+            SimOperation::Put {
+                contract: late,
+                state: vec![2; 64],
                 subscribe: false,
             },
         ),

@@ -3138,7 +3138,8 @@ pub struct TransportSnapshot {
     pub quic_adapter_panicked: u64,
     /// Times the QUIC crash-loop breaker tripped, so this run started with
     /// QUIC off (#5940): on unix a run with QUIC enabled ended abnormally, on
-    /// Windows three runs in a row ended within ten minutes for any reason.
+    /// Windows three runs in a row ended within ten minutes after a panic in
+    /// QUIC code.
     pub quic_breaker_trips: u64,
     /// Sends the QUIC socket refused with `WouldBlock` (egress cap or full
     /// socket buffer). Chiefly datagrams quinn's endpoint made on its own,
@@ -3862,7 +3863,8 @@ struct SnapshotExtras {
     pub quic_adapter_panicked: u64,
     /// Times the QUIC crash-loop breaker tripped, so this run started with
     /// QUIC off (#5940): on unix a run with QUIC enabled ended abnormally, on
-    /// Windows three runs in a row ended within ten minutes for any reason.
+    /// Windows three runs in a row ended within ten minutes after a panic in
+    /// QUIC code.
     pub quic_breaker_trips: u64,
     /// Sends the QUIC socket refused with `WouldBlock` (egress cap or full
     /// socket buffer). Chiefly datagrams quinn's endpoint made on its own,

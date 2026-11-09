@@ -641,12 +641,19 @@ mod pins {
     /// This is the fact that makes the merged #5554 safe, and until this pin
     /// nothing checked it. #5554 parks delegates off the serial
     /// `contract_handling` loop, so a delegate's round trip can span two loop
-    /// iterations; its own comment notes the serial loop was the ONLY thing
-    /// guaranteeing one `process()` per delegate. What keeps that sound is that
-    /// the guard drops HERE, inside this function, so `DELEGATE_ENV` is cleared
-    /// before the `Err` reaches `inbound_app_message`, before
-    /// `DelegateRunOutcome::Failed`, and therefore before a park can release a
-    /// queued run for the same delegate.
+    /// iterations. When #5554 merged, the serial loop was the only thing
+    /// guaranteeing one `process()` per delegate. Since the delegate lane
+    /// (`contract::delegate_lane`) two tasks start delegate runs, and that
+    /// guarantee is now held by the delegate executor's lock
+    /// (`PooledDelegateRunner`, one `process()` node-wide at a time) plus
+    /// `DelegateGate` (no run of a delegate interleaved with its own
+    /// round-trip, between the lane and the loop). What keeps it sound at this
+    /// level is that the guard drops HERE, inside this function, so
+    /// `DELEGATE_ENV` is cleared before the `Err` reaches
+    /// `inbound_app_message`, before `DelegateRunOutcome::Failed`, and
+    /// therefore before a park can release a queued run for the same delegate,
+    /// and before the delegate executor's lock is released to the next caller,
+    /// which may be the lane or the loop.
     ///
     /// The realistic regression is not deletion but HOISTING: moving the guard
     /// up into `inbound_app_message` so one guard spans the whole batch reads

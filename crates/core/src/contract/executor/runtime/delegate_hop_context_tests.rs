@@ -353,9 +353,10 @@ async fn a_hosted_node_refuses_a_delegate_run_with_no_user() {
 }
 
 /// The pool's hop runs the target under the hop's user: that user's secrets
-/// and context. The production node uses `RuntimePool`, which pops an
-/// executor and forwards; the executor half of that is driven above, and this
-/// pins the forwarding, since building a pool here would need a running node.
+/// and context. The production node uses `RuntimePool`, which forwards the hop
+/// to its delegate executor (`PooledDelegateRunner`); the executor half of
+/// that is driven above, and this pins the forwarding, since building a pool
+/// here would need a running node.
 ///
 /// Bounded to the method body, and the call must be at statement position, so
 /// a commented-out or moved call does not satisfy it.
@@ -373,15 +374,15 @@ fn the_pools_hop_forwards_the_user() {
         .find("\n    }\n")
         .expect("the method is bounded by its closing brace")];
     let call = body
-        .match_indices("executor.delegate_request(")
+        .match_indices("self.delegate_runner")
         .find(|(i, _)| {
             let line_start = body[..*i].rfind('\n').map_or(0, |n| n + 1);
-            body[line_start..*i].trim() == "let result ="
+            body[line_start..*i].trim().is_empty()
         })
         .map(|(i, _)| &body[i..])
-        .expect("the pool's hop calls delegate_request at statement position");
+        .expect("the pool's hop calls its delegate runner at statement position");
     let args: String = call
-        .split(");")
+        .split(".await")
         .next()
         .expect("the call is bounded")
         .chars()
@@ -389,7 +390,7 @@ fn the_pools_hop_forwards_the_user() {
         .collect();
     assert_eq!(
         args,
-        "executor.delegate_request(req,None,Some(caller_delegate),connection_scope,user_context,",
+        "self.delegate_runner.run(req,None,Some(caller_delegate),connection_scope,user_context,)",
         "the pool's hop must run the target under the hop's user"
     );
 }

@@ -65,10 +65,14 @@ impl Executor<Runtime> {
     /// secrets store at `target_scope`, LIVE — the durable counterpart of
     /// [`Self::export_user_secrets`] and the mutating mirror of it (P3-live of
     /// #4592). Runs on the executor (which owns the `SecretsStore` via its
-    /// `Runtime`). Unlike the read-only export, this is invoked ON the contract
-    /// loop by the pool caller (`RuntimePool::import_secrets`) — the import WRITES
-    /// and the store write path assumes node-wide write serialization, so it must
-    /// not run off-loop where it could race another writer on the same secret.
+    /// `Runtime`). Unlike the read-only export, the pool caller
+    /// (`RuntimePool::import_secrets`) runs it on the node's delegate executor
+    /// under that executor's lock, which every delegate `store_secret` also
+    /// takes: the import WRITES and the store write path assumes node-wide
+    /// write serialization, so it must not run where it could race another
+    /// writer on the same secret (a pooled executor, or any task outside that
+    /// lock). Being handled on the contract loop is no longer what serializes
+    /// it; the delegate lane runs delegates off the loop.
     ///
     /// The bundle is decrypted under `material`; `import_bundle` authenticates
     /// the WHOLE bundle BEFORE writing anything, so a wrong key / corrupt bundle

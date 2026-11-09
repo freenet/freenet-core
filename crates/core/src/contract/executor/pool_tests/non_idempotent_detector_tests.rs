@@ -61,6 +61,9 @@ fn make_mock_runtime(override_: UpdateOverride) -> MockWasmRuntime {
         delegate_codes: Default::default(),
         unregistered_delegates: Default::default(),
         delegate_wrong_variant: Default::default(),
+        delegate_lane: None,
+        delegate_pause_after: Default::default(),
+        delegate_run_hook: Default::default(),
         registered_params: Default::default(),
     }
 }
@@ -253,6 +256,9 @@ fn healthy_mock_is_idempotent_on_reapply() {
         delegate_codes: Default::default(),
         unregistered_delegates: Default::default(),
         delegate_wrong_variant: Default::default(),
+        delegate_lane: None,
+        delegate_pause_after: Default::default(),
+        delegate_run_hook: Default::default(),
         registered_params: Default::default(),
     };
     let key = fake_key();

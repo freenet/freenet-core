@@ -12,14 +12,17 @@
 //! The offline `freenet secrets import` CLI opens the secrets ReDb directly,
 //! which is single-writer — so it requires the node to be STOPPED. This endpoint
 //! instead submits a [`crate::contract::ContractHandlerEvent::ImportSecrets`]
-//! event to the running node's contract loop, which routes it to the ONE
-//! legitimate `SecretsStore` (owned by a pooled executor). Unlike the read-only
-//! export (which runs off-loop), the import runs ON the contract loop (see
-//! `RuntimePool::import_secrets`): it WRITES, and the store write path assumes
-//! node-wide write serialization, so on-loop keeps every secret write in one
-//! serialization domain (with delegate `store_secret`). The brief loop-block is
-//! acceptable because this endpoint is loopback + dashboard-gated (a one-shot
-//! operator migration), not the authenticated-remote DoS surface of the export.
+//! event to the running node's contract loop, which routes it to the
+//! `SecretsStore` of the node's ONE delegate executor (`RuntimePool::
+//! import_secrets`, `PooledDelegateRunner`). Unlike the read-only export
+//! (which runs off-loop on a pooled executor), the import runs under the
+//! delegate executor's lock: it WRITES, and the store write path assumes
+//! node-wide write serialization, and that lock is the one every delegate
+//! `store_secret` (loop or delegate lane) takes, so every secret write stays
+//! in one serialization domain. The contract loop waits for it; that brief
+//! block is acceptable because this endpoint is loopback + dashboard-gated (a
+//! one-shot operator migration), not the authenticated-remote DoS surface of
+//! the export.
 //!
 //! # Security — the import GATE (fail-closed)
 //!

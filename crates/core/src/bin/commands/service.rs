@@ -967,7 +967,10 @@ mod tests {
     fn wrapper_single_instance_lock_is_exclusive() {
         let first = match acquire_wrapper_single_instance_lock() {
             AcquireWrapperLockOutcome::Acquired(guard) => guard,
-            other => panic!("first acquire must succeed on an unheld mutex, got {other:?}"),
+            other @ (AcquireWrapperLockOutcome::AnotherWrapperRunning
+            | AcquireWrapperLockOutcome::UnavailableSoProceed) => {
+                panic!("first acquire must succeed on an unheld mutex, got {other:?}")
+            }
         };
         assert!(
             matches!(

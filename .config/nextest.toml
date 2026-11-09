@@ -157,3 +157,10 @@ fail-fast = false
 # (test_get_reliability_with_latency: 100 nodes + fault injection).
 # Allow 15 min per period with 2 periods = 30 min hard cap.
 slow-timeout = { period = "900s", terminate-after = 2 }
+
+# The Windows QUIC crash-loop breaker tests (#6031) drive the real binary
+# through several starts each; a failure is deterministic (an injected panic
+# is counted or it is not), so a retry only repeats the minutes.
+[[profile.ci.overrides]]
+filter = "binary(quic_breaker_windows)"
+retries = 0
