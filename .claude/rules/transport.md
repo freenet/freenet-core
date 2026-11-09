@@ -450,7 +450,8 @@ inbound session key (`handshake_unauthenticated_dropped`), QUIC endpoint deaths
 and no breaker state is left), QUIC crash-loop breaker trips at startup
 (`quic_breaker_trips`, on unix counted for any abnormal end of a QUIC-enabled
 run, not only a QUIC fault, and on Windows for three runs in a row that ended
-within ten minutes, for any reason, each starting within 24 h of the one before;
+within ten minutes after recording a panic in QUIC code (quinn, quinn-proto or
+transport/quic, by panic location), each starting within 24 h of the one before;
 see `quic/breaker.rs`) and whether the breaker keeps QUIC
 off in this process (`quic_breaker_suppressed`, a state that is never reset and
 is not activity by itself) and QUIC connections this node closed, by close code
@@ -2477,10 +2478,16 @@ Liveness ("alive" = the endpoint driver has not ENDED; it does not mean
     deterministic fault recurs once per start. A panic that is not
     contained aborts the process. On unix the next start trips the breaker
     (quic_breaker_trips, see quic/breaker.rs). On Windows the breaker does
-    not look at how a run ended: it counts runs that lasted under 10 minutes,
-    so the fourth start after three such aborts in a row trips it, and an
-    abort after 10 minutes or more never does, nor do aborts a day apart
-    (quic/breaker/short_runs.rs).
+    not look at how a run ended: a panic hook records a panic located in QUIC
+    code in the run's marker, and it counts runs that lasted under 10 minutes
+    and recorded one, so the fourth start after three such aborts in a row
+    trips it. An ordinary stop records no panic and never counts; an abort
+    after 10 minutes or more never does, nor do aborts a day apart
+    (quic/breaker/short_runs.rs). A panic counts as QUIC's when the thread
+    is inside a QuicCode guard (quinn's driver polls in runtime.rs, the socket
+    adapter's catch_unwind calls) or, failing that, by location. The hook is
+    process-global: only a child-process test installs it (the arming tests
+    pass a no-op installer).
   → When the node drops its last handle, the availability is Released
     (final; the first final state stored wins, so a release and a
     driver return racing never overwrite each other) and the driver's
