@@ -862,7 +862,8 @@ fn measure_gap_hold_reading(settings: &QuicSettings, shapes: &[Shape], unordered
                             while let Ok(Some(chunk)) = chunks.next(usize::MAX) {
                                 drop(chunk);
                             }
-                            let _ = chunks.finalize();
+                            // The receiver transmits after each datagram anyway.
+                            let _should_transmit: quinn_proto::ShouldTransmit = chunks.finalize();
                         }
                     }
                 }
