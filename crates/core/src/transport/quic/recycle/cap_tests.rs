@@ -333,10 +333,12 @@ impl Link {
         )
         .await;
         let b_socket = socket(b_addr, None, Arc::default()).await;
+        // At a data path's floor window, which its meter raises a fresh
+        // connection to (`budget`).
         let settings = |rate_limit| QuicSettings {
             memory_limit: 1024 * 1024 * 1024,
             idle_timeout: None,
-            initial_window: None,
+            initial_window: Some(crate::transport::quic::budget::MIN_WINDOW_BYTES),
             rate_limit,
         };
         let (a_keys, b_keys) = (TransportKeypair::new(), TransportKeypair::new());

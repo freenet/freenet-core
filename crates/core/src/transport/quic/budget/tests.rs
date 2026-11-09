@@ -102,7 +102,11 @@ fn a_window_limited_path_grows_and_an_idle_one_does_not() {
     let seen = idle.meter.evaluate(at).unwrap();
     assert!(!seen.limited);
     assert_eq!(seen.recv_window, FLOOR);
-    assert_eq!(idle.fake.last_recv(), None, "nothing set on an idle path");
+    assert_eq!(
+        *idle.fake.recv.lock().unwrap(),
+        vec![FLOOR],
+        "an idle path keeps the floor its registration set"
+    );
 }
 
 /// Bytes read above a gap are credit, not delivery: a peer that fills its

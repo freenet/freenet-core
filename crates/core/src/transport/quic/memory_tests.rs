@@ -698,7 +698,12 @@ fn connected_pair_with_factory(
     let b_peer = super::identity::PeerKey::of(b_keys.public()).expect("b's key");
     let real = RealTime::new();
 
-    let receiver_transport = Arc::new(super::config::transport_config(settings, &real));
+    let mut receiver_transport = super::config::transport_config(settings, &real);
+    // The receiver is a data path, which raises the endpoint's initial stream
+    // limit (`QuicPath::with_budget`).
+    receiver_transport
+        .max_concurrent_uni_streams(quinn::VarInt::from_u32(super::config::MAX_UNI_STREAMS));
+    let receiver_transport = Arc::new(receiver_transport);
     let server = super::config::server_config(
         Arc::new(b_identity.server_tls(&a_peer).expect("server tls")),
         receiver_transport,

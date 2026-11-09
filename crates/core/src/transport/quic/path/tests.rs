@@ -1118,6 +1118,12 @@ fn a_stream_stopped_with_gaps_is_released_after_the_grace_period() {
         let _seed = GlobalRng::seed_guard(SEED);
         let network = "quic-path-stopped-gaps";
         let mut p = paths(network, 89, QuicPathLimits::DEFAULT).await;
+        // Let the paths' stream-limit raises (`config::INITIAL_UNI_STREAMS`)
+        // and their acknowledgements settle, so the first datagram `a` sends
+        // below is the stream's.
+        let settle = p.time();
+        p.drive(async move { settle.sleep(Duration::from_millis(200)).await })
+            .await;
         let from = p.pair.a_addr;
         let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counted = seen.clone();
@@ -6549,5 +6555,47 @@ fn a_data_paths_window_grows_when_delivery_fills_it() {
             snap.budget_charged_peak
         );
         assert!(snap.budget_charged_peak <= total);
+    })
+}
+
+/// A connection starts with `config::INITIAL_UNI_STREAMS` streams for its peer;
+/// a path that accepts data raises that to `MAX_UNI_STREAMS`, and a shadow path
+/// leaves it, so a shadow peer can make quinn hold in-order data on few streams.
+#[test]
+fn only_a_path_that_takes_data_lets_its_peer_open_every_stream() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        for (limits, network, subnet, expected) in [
+            (
+                QuicPathLimits::DEFAULT,
+                "quic-path-streams-data",
+                27,
+                super::super::config::MAX_UNI_STREAMS,
+            ),
+            (
+                QuicPathLimits::SHADOW,
+                "quic-path-streams-shadow",
+                28,
+                super::super::config::INITIAL_UNI_STREAMS,
+            ),
+        ] {
+            let p = paths(network, subnet, limits).await;
+            let (raw, time) = (p.a_raw(), p.time());
+            let opened = p
+                .drive(async move {
+                    // Let the raise reach the peer.
+                    time.sleep(Duration::from_millis(200)).await;
+                    let mut held = Vec::new();
+                    while held.len() < 100 {
+                        match futures::FutureExt::now_or_never(raw.open_uni()) {
+                            Some(stream) => held.push(stream.expect("open")),
+                            None => break,
+                        }
+                    }
+                    held.len()
+                })
+                .await;
+            assert_eq!(opened, expected as usize, "{network}");
+        }
     })
 }

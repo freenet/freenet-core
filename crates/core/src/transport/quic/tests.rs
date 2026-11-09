@@ -1586,8 +1586,9 @@ fn pinned_transport_fields(window: u64) -> Vec<(&'static str, String)> {
     vec![
         // Literals, not the constants, so a change to a limit fails here.
         ("max_concurrent_bidi_streams", "0".into()),
-        // The uni value is set from field data (see its doc).
-        ("max_concurrent_uni_streams", "64".into()),
+        // Until a path takes data (see INITIAL_UNI_STREAMS); a data path
+        // raises it to MAX_UNI_STREAMS, which is set from field data.
+        ("max_concurrent_uni_streams", "4".into()),
         // Every stream may use the largest window a data path grows to.
         ("stream_receive_window", "8388608".into()),
         ("receive_window", window.to_string()),
@@ -1813,6 +1814,21 @@ fn the_initial_window_is_the_floor_for_the_memory() {
         "the floor, whatever the memory"
     );
     assert_eq!(at(GIB, Some(300_000)), 300_000, "named in the settings");
+    let start = |initial_window| {
+        QuicSettings {
+            memory_limit: 2 * GIB,
+            idle_timeout: None,
+            initial_window,
+            rate_limit: Default::default(),
+        }
+        .initial_receive_window()
+    };
+    assert_eq!(
+        start(None),
+        16 * 1024,
+        "a connection starts below the floor"
+    );
+    assert_eq!(start(Some(300_000)), 300_000, "named in the settings");
 }
 
 /// The connection receive window and the send window are the initial window,
@@ -1847,7 +1863,11 @@ fn windows_never_exceed_the_reassembly_allowance() {
                 field("receive_window"),
                 field("send_window"),
             );
-            assert_eq!((connection, send), (window, window));
+            assert_eq!(
+                (connection, send),
+                (settings.initial_receive_window(), window)
+            );
+            assert!(connection <= window);
             assert_eq!(stream, config::stream_window());
             assert!(stream <= CAP && connection <= CAP && send <= CAP);
         }

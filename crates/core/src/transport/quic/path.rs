@@ -145,7 +145,7 @@ use futures::{Stream, StreamExt};
 use tokio::sync::mpsc;
 
 use super::QuicConnection;
-use super::config::STREAMED_SEND_LIMIT;
+use super::config::{MAX_UNI_STREAMS, STREAMED_SEND_LIMIT};
 use super::control::{ControlError, QuicControl};
 use super::framing::{FrameHeader, HeaderError};
 use super::identity::PeerKey;
@@ -868,6 +868,14 @@ impl QuicPath {
         {
             receiver.panic_on_stream = limits.panic_in_receive;
             receiver.set_gap_cap(limits.max_gaps);
+        }
+        // A path that reads data lets the peer open every stream the path's
+        // limits allow (the endpoint starts each connection at
+        // `config::INITIAL_UNI_STREAMS`).
+        if limits.accept_data {
+            connection
+                .inner()
+                .set_max_concurrent_uni_streams(quinn::VarInt::from_u32(MAX_UNI_STREAMS));
         }
         // A path that reads data takes a share of the node's buffer budget,
         // which sets its windows from here on; a shadow path keeps the

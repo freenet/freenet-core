@@ -113,6 +113,24 @@ pub(crate) const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 /// of the two keys).
 pub(crate) const MAX_UNI_STREAMS: u32 = 64;
 
+/// The uni streams every connection's peer may open until the path takes
+/// data: enough for the upgrade's control frames (`Ready`, `ReadyAck`). A
+/// path that accepts data raises it to [`MAX_UNI_STREAMS`] when it is built
+/// (`QuicPath::with_budget`). quinn applies a raise at once and cannot take a
+/// grant back, so a connection starts low: a stream in its in-order phase
+/// (header, metadata, short or control body) can make quinn hold up to about
+/// 44 KiB of datagrams (`QUIC_ASSEMBLER_HOLD_PER_STREAM_BYTES`), and a shadow
+/// path reads its headers in order too.
+pub(crate) const INITIAL_UNI_STREAMS: u32 = 4;
+
+/// The connection receive window every connection starts with, until a data
+/// path's buffer-budget meter raises it to the floor (`budget`). Small for the
+/// reason [`INITIAL_UNI_STREAMS`] is: what a peer sends past a missing byte of
+/// an in-order phase stays in quinn's assembler as whole datagrams, up to
+/// about 5 x the window (`QUIC_ASSEMBLER_HOLD_WINDOW_MULTIPLE`), and a shadow
+/// path, which carries only control frames, needs little.
+pub(crate) const INITIAL_RECEIVE_WINDOW_BYTES: u64 = 16 * 1024;
+
 /// Uni stream slots left for short messages and control frames when every
 /// streamed-message permit is held and the unannounced credit is at
 /// [`UNANNOUNCED_CREDIT_SLACK`]. What that holds under is on
@@ -478,6 +496,15 @@ impl QuicSettings {
             .unwrap_or_else(|| super::budget::floor_window_bytes(self.memory_limit))
             .min(PER_CONNECTION_INBOUND_CAP)
     }
+
+    /// The connection receive window every connection starts with:
+    /// [`INITIAL_RECEIVE_WINDOW_BYTES`], or the settings' initial window, at most
+    /// [`Self::window_bytes`]. A data path's meter raises it to the floor.
+    pub(crate) fn initial_receive_window(&self) -> u64 {
+        self.initial_window
+            .unwrap_or(INITIAL_RECEIVE_WINDOW_BYTES)
+            .min(self.window_bytes())
+    }
 }
 
 /// The per-stream receive window: the largest connection window
@@ -553,7 +580,7 @@ pub(crate) fn transport_config<T: TimeSource>(
     // (`peer_connection::inbound_concurrency::ACK_DELAY_ALLOWANCE`). If it
     // is ever set here, change that constant to match.
     config
-        .max_concurrent_uni_streams(VarInt::from_u32(MAX_UNI_STREAMS))
+        .max_concurrent_uni_streams(VarInt::from_u32(INITIAL_UNI_STREAMS))
         .max_concurrent_bidi_streams(VarInt::from_u32(MAX_BIDI_STREAMS))
         .max_idle_timeout(Some(idle_timeout(
             settings
@@ -566,7 +593,7 @@ pub(crate) fn transport_config<T: TimeSource>(
         // budget (`budget`), is what bounds the peer. Both are at most
         // budget::MAX_WINDOW_BYTES (8 MiB), far inside a VarInt.
         .stream_receive_window(VarInt::from_u32(stream_window() as u32))
-        .receive_window(VarInt::from_u32(window as u32))
+        .receive_window(VarInt::from_u32(settings.initial_receive_window() as u32))
         .send_window(window)
         .send_fairness(true)
         .initial_mtu(MAX_UDP_PAYLOAD)

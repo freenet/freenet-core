@@ -3019,6 +3019,11 @@ mod tests {
                  (each data path's floor grant)",
             ),
             (
+                "INITIAL_RECEIVE_WINDOW_BYTES",
+                "the window ONE QUIC connection starts with before a data path's \
+                 meter raises it; part of the fixed charge per connection",
+            ),
+            (
                 "MIN_WINDOW_BYTES",
                 "floor of one QUIC connection's window, inside quic_buffer_budget_for",
             ),
