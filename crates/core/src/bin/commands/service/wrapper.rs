@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use freenet::simulation::{RealTime, TimeSource};
 use std::path::Path;
 
 #[cfg(target_os = "macos")]
@@ -886,9 +887,12 @@ pub(super) fn spawn_update_command_bounded(
     post_stop_exit_code: Option<i32>,
     limit: std::time::Duration,
 ) -> BoundedUpdate {
-    let started = std::time::Instant::now();
+    // The limit is read through the crate's `TimeSource` (`RealTime`, whose
+    // epoch is its creation), as the DST rule requires; this supervisor runs
+    // outside any simulation, so real time is what it should measure.
+    let clock = RealTime::new();
     spawn_update_command_until(exe_path, log_dir, post_stop_exit_code, || {
-        started.elapsed() >= limit
+        clock.now() >= limit
     })
 }
 
@@ -1760,7 +1764,7 @@ fn run_wrapper_loop(
                     if let Some((_, status_tx)) = tray {
                         status_tx.send(WrapperStatus::Updating).ok();
                     }
-                    let started = std::time::Instant::now();
+                    let attempt_clock = RealTime::new();
                     match crash_loop_update(
                         &exe_path,
                         log_dir,
@@ -1785,7 +1789,7 @@ fn run_wrapper_loop(
                         }
                         CrashLoopUpdateNext::Relaunch => {}
                     }
-                    secs = secs.saturating_sub(started.elapsed().as_secs());
+                    secs = secs.saturating_sub(attempt_clock.now().as_secs());
                 }
 
                 #[cfg(any(target_os = "windows", target_os = "macos"))]

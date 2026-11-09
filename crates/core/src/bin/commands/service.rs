@@ -4058,7 +4058,7 @@ echo "RC=$?"
         let respawn = at("ifspawn_new_wrapper(&exe_path,log_dir){returnOk(());}");
         let bundle = at("CrashLoopUpdateNext::ExitForBundleUpdater=>{");
         let relaunch = at("CrashLoopUpdateNext::Relaunch=>{}");
-        let shorten = at("secs=secs.saturating_sub(started.elapsed().as_secs());");
+        let shorten = at("secs=secs.saturating_sub(attempt_clock.now().as_secs());");
         let sleep = at("sleep_with_jitter_interruptible(secs");
         assert!(
             give_up < gate
