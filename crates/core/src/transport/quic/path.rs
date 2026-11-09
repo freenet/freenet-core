@@ -450,7 +450,7 @@ quic_outcomes! {
         /// stream that went past it was stopped (`stop_code::EVICTED`).
         TooManyRanges => "too_many_ranges",
         /// The connection went past `inbound::MAX_GAPS_PER_CONNECTION` a
-        /// second time, so the path was closed with DOWNGRADE (once per path):
+        /// second time, so the path was closed with OVER_BUDGET (once per path):
         /// the gaps of streams it stopped stay counted for the connection's
         /// life, because quinn keeps them until the peer ends the stream.
         ClosedTooManyRanges => "closed_too_many_ranges",
