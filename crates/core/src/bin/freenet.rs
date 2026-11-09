@@ -3348,12 +3348,6 @@ mod tests {
         );
     }
 
-    /// #5799: while a newer release cools down, no trigger asks GitHub or
-    /// claims a lockout retry, and every CoolingDown arm keeps its signal and
-    /// does not send. Every gate re-reads the record, so a stay early in a tick
-    /// holds the later triggers in it. The two triggers that know no version
-    /// restart their own wait when staging stays, rather than firing every
-    /// tick. The re-poll is pulled in to the cooldown's end, last in the tick.
     /// #6152: the startup check decides without spending (`peek`), and claims
     /// a locked-out node's retry only after the jitter, inside
     /// `claim_after_jitter`, so a node that dies during the jitter spends
@@ -3379,6 +3373,12 @@ mod tests {
         );
     }
 
+    /// #5799: while a newer release cools down, no trigger asks GitHub or
+    /// claims a lockout retry, and every CoolingDown arm keeps its signal and
+    /// does not send. Every gate re-reads the record, so a stay early in a tick
+    /// holds the later triggers in it. The two triggers that know no version
+    /// restart their own wait when staging stays, rather than firing every
+    /// tick. The re-poll is pulled in to the cooldown's end, last in the tick.
     #[test]
     fn update_triggers_wait_out_a_cooling_release() {
         let src = strip_line_comments(include_str!("freenet.rs"));

@@ -263,25 +263,101 @@ pub(super) fn crash_update_due(consecutive_failures: u32) -> bool {
         && (consecutive_failures / CRASH_UPDATE_FIRST_AT).is_power_of_two()
 }
 
+/// Whether the backoff after this exit runs a crash-loop update attempt
+/// ([`crash_update_due`]). Never after an exit 42 or a probation crash, which
+/// already ran an update for this exit. Never after a port conflict: the
+/// attempt forwards the exit code so `freenet update` keeps the supervised
+/// download budget, and during probation that code would count as a crash, so
+/// a port held by a stale process after an update (#3967) could roll back and
+/// pin a good release.
+pub(super) fn crash_update_wanted(
+    exit_code: i32,
+    is_port_conflict: bool,
+    probation_crash: bool,
+    consecutive_failures: u32,
+) -> bool {
+    exit_code != WRAPPER_EXIT_UPDATE_NEEDED
+        && !is_port_conflict
+        && !probation_crash
+        && crash_update_due(consecutive_failures)
+}
+
+/// The longest a crash-loop update attempt may hold the relaunch. Past it the
+/// wrapper stops `freenet update` and relaunches the node: the attempt is an
+/// extra chance to update, and must never keep the node down.
+const CRASH_UPDATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// What the wrapper does after a crash-loop update attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CrashLoopUpdateNext {
+    /// The binary on disk was replaced: re-exec the wrapper from it.
+    RestartWrapper,
+    /// The macOS app's bundle updater was staged (exit 44). It waits for this
+    /// process to exit before it swaps the bundle, so the wrapper exits, as the
+    /// other wrapper update paths do. Relaunching instead would make the
+    /// updater time out and delete the staged bundle.
+    ExitForBundleUpdater,
+    /// Nothing was installed (skipped, no release, failed or stopped at
+    /// [`CRASH_UPDATE_TIMEOUT`]): go on with the backoff and relaunch.
+    Relaunch,
+}
+
+/// [`CrashLoopUpdateNext`] for an attempt's outcome; `None` when the attempt
+/// was skipped or stopped at the timeout.
+pub(super) fn crash_loop_update_next(
+    outcome: Option<super::super::update::UpdateSubprocessOutcome>,
+) -> CrashLoopUpdateNext {
+    use super::super::update::UpdateSubprocessOutcome;
+    match outcome {
+        Some(UpdateSubprocessOutcome::BinaryReplaced) => CrashLoopUpdateNext::RestartWrapper,
+        Some(UpdateSubprocessOutcome::BundleUpdateStaged) => {
+            CrashLoopUpdateNext::ExitForBundleUpdater
+        }
+        Some(
+            UpdateSubprocessOutcome::AlreadyUpToDate
+            | UpdateSubprocessOutcome::OtherFailure
+            | UpdateSubprocessOutcome::SpawnFailed,
+        )
+        | None => CrashLoopUpdateNext::Relaunch,
+    }
+}
+
 /// One crash-loop update attempt ([`crash_update_due`]): claim the attempt
-/// as the node does (a locked-out node spends its daily retry, or skips if it
-/// is spent), run `freenet update` with the crash's exit code, and drive the
-/// failure counter as every other wrapper update path does. Returns whether
-/// the binary on disk was replaced. A failed or skipped attempt changes
-/// nothing else: the wrapper goes on with its backoff and relaunch.
-fn crash_loop_update(exe_path: &Path, log_dir: &Path, exit_code: i32, failures: u32) -> bool {
+/// as the node does (a locked-out node spends its daily retry here, even when
+/// no release is found, or skips if it is spent), run `freenet update` with
+/// the crash's exit code for at most [`CRASH_UPDATE_TIMEOUT`], and drive the
+/// failure counter as every other wrapper update path does. A failed, skipped
+/// or stopped attempt changes nothing else: the wrapper goes on with its
+/// backoff and relaunch.
+fn crash_loop_update(
+    exe_path: &Path,
+    log_dir: &Path,
+    exit_code: i32,
+    failures: u32,
+) -> CrashLoopUpdateNext {
     if let Err(reason) = super::super::auto_update::claim_update_attempt() {
         log_wrapper_event(
             log_dir,
             &format!("{failures} consecutive failures; update check skipped: {reason}"),
         );
-        return false;
+        return crash_loop_update_next(None);
     }
     log_wrapper_event(
         log_dir,
         &format!("{failures} consecutive failures; checking for an update before relaunching..."),
     );
-    let result = spawn_update_command(exe_path, log_dir, Some(exit_code));
+    let Some(result) =
+        spawn_update_command_bounded(exe_path, log_dir, Some(exit_code), CRASH_UPDATE_TIMEOUT)
+    else {
+        log_wrapper_event(
+            log_dir,
+            &format!(
+                "Update did not finish within {}s; stopped it, continuing the backoff",
+                CRASH_UPDATE_TIMEOUT.as_secs()
+            ),
+        );
+        return crash_loop_update_next(None);
+    };
     let outcome = super::super::update::classify_update_subprocess(&result);
     match super::super::update::update_counter_action(outcome) {
         super::super::update::UpdateCounterAction::Clear => {
@@ -292,19 +368,20 @@ fn crash_loop_update(exe_path: &Path, log_dir: &Path, exit_code: i32, failures: 
         }
         super::super::update::UpdateCounterAction::NoChange => {}
     }
-    let replaced = matches!(
-        outcome,
-        super::super::update::UpdateSubprocessOutcome::BinaryReplaced
-    );
+    let next = crash_loop_update_next(Some(outcome));
     log_wrapper_event(
         log_dir,
-        if replaced {
-            "Update installed after a crash loop, restarting wrapper..."
-        } else {
-            "No update installed; continuing the backoff"
+        match next {
+            CrashLoopUpdateNext::RestartWrapper => {
+                "Update installed after a crash loop, restarting wrapper..."
+            }
+            CrashLoopUpdateNext::ExitForBundleUpdater => {
+                "Bundle update staged after a crash loop; exiting for updater"
+            }
+            CrashLoopUpdateNext::Relaunch => "No update installed; continuing the backoff",
         },
     );
-    replaced
+    next
 }
 
 /// Pure function: given current state and exit info, determine the next action
@@ -752,6 +829,92 @@ pub(super) fn spawn_update_command(
     log_dir: &Path,
     post_stop_exit_code: Option<i32>,
 ) -> std::io::Result<std::process::ExitStatus> {
+    update_command(exe_path, log_dir, post_stop_exit_code).status()
+}
+
+/// [`spawn_update_command`], waiting at most `limit`. Past it the child is
+/// stopped ([`wait_bounded`]) and `None` returned. A stop can land between
+/// the two renames of `replace_binary`, which leave no binary in place, so the
+/// moved-aside binary is then put back ([`restore_binary_after_stop`]).
+fn spawn_update_command_bounded(
+    exe_path: &Path,
+    log_dir: &Path,
+    post_stop_exit_code: Option<i32>,
+    limit: std::time::Duration,
+) -> Option<std::io::Result<std::process::ExitStatus>> {
+    let child = match update_command(exe_path, log_dir, post_stop_exit_code).spawn() {
+        Ok(child) => child,
+        Err(e) => return Some(Err(e)),
+    };
+    let waited = wait_bounded(child, limit);
+    if waited.is_none() {
+        restore_binary_after_stop(exe_path, log_dir);
+    }
+    waited
+}
+
+/// Wait for `child` for at most `limit`. Past it, kill and reap the child and
+/// return `None`; also `None` when its state cannot be read, since waiting on
+/// it unbounded is what this exists to avoid.
+pub(super) fn wait_bounded(
+    mut child: std::process::Child,
+    limit: std::time::Duration,
+) -> Option<std::io::Result<std::process::ExitStatus>> {
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(Ok(status)),
+            Ok(None) => {}
+            Err(_) => break,
+        }
+        let Some(left) = limit.checked_sub(started.elapsed()) else {
+            break;
+        };
+        if left.is_zero() {
+            break;
+        }
+        std::thread::sleep(left.min(std::time::Duration::from_millis(250)));
+    }
+    // Both best-effort: the child may have exited since the last poll, and
+    // either way it is gone once `wait` returns.
+    #[allow(clippy::let_underscore_must_use)]
+    let _ = child.kill();
+    #[allow(clippy::let_underscore_must_use)]
+    let _ = child.wait();
+    None
+}
+
+/// After stopping `freenet update` mid-run: if it was stopped between
+/// `replace_binary`'s two renames, there is no binary at `exe_path` and the
+/// replaced one sits at its backup path. Put it back.
+pub(super) fn restore_binary_after_stop(exe_path: &Path, log_dir: &Path) {
+    let backup = super::super::update::binary_backup_path(exe_path);
+    if exe_path.exists() || !backup.exists() {
+        return;
+    }
+    match std::fs::rename(&backup, exe_path) {
+        Ok(()) => log_wrapper_event(
+            log_dir,
+            "Stopped update had moved the binary aside; restored it",
+        ),
+        Err(e) => log_wrapper_event(
+            log_dir,
+            &format!(
+                "CRITICAL: stopped update left no binary at {}; the previous one is at {}: {e}",
+                exe_path.display(),
+                backup.display()
+            ),
+        ),
+    }
+}
+
+/// The `freenet update` command every wrapper update path runs, with all three
+/// standard handles set explicitly (see [`spawn_update_command`]).
+fn update_command(
+    exe_path: &Path,
+    log_dir: &Path,
+    post_stop_exit_code: Option<i32>,
+) -> std::process::Command {
     let (stdout, stderr) = update_output_stdio(log_dir);
     let mut cmd = std::process::Command::new(exe_path);
     cmd.args(["update", "--quiet"])
@@ -773,7 +936,7 @@ pub(super) fn spawn_update_command(
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
 
-    cmd.status()
+    cmd
 }
 
 /// The stdout and stderr for a `freenet update` child: today's wrapper log,
@@ -1490,22 +1653,42 @@ fn run_wrapper_loop(
                 // check if every run dies first, so at a few crash counts
                 // (`crash_update_due`) the wrapper tries `freenet update`
                 // itself, inside the backoff wait it was going to sleep
-                // anyway. Not after an exit 42 or a probation crash: those
-                // already ran an update for this exit.
+                // anyway (`crash_update_wanted` says when not to).
                 let mut secs = secs;
-                if exit_code != WRAPPER_EXIT_UPDATE_NEEDED
-                    && !probation_crash
-                    && crash_update_due(state.consecutive_failures)
-                {
+                if crash_update_wanted(
+                    exit_code,
+                    is_port_conflict,
+                    probation_crash,
+                    state.consecutive_failures,
+                ) {
                     #[cfg(any(target_os = "windows", target_os = "macos"))]
                     if let Some((_, status_tx)) = tray {
                         status_tx.send(WrapperStatus::Updating).ok();
                     }
                     let started = std::time::Instant::now();
-                    if crash_loop_update(&exe_path, log_dir, exit_code, state.consecutive_failures)
-                        && spawn_new_wrapper(&exe_path, log_dir)
-                    {
-                        return Ok(());
+                    match crash_loop_update(
+                        &exe_path,
+                        log_dir,
+                        exit_code,
+                        state.consecutive_failures,
+                    ) {
+                        CrashLoopUpdateNext::RestartWrapper => {
+                            #[cfg(any(target_os = "windows", target_os = "macos"))]
+                            if let Some((_, status_tx)) = tray {
+                                status_tx.send(WrapperStatus::UpdatedRestarting).ok();
+                            }
+                            if spawn_new_wrapper(&exe_path, log_dir) {
+                                return Ok(());
+                            }
+                        }
+                        CrashLoopUpdateNext::ExitForBundleUpdater => {
+                            #[cfg(any(target_os = "windows", target_os = "macos"))]
+                            if let Some((_, status_tx)) = tray {
+                                status_tx.send(WrapperStatus::UpdatedRestarting).ok();
+                            }
+                            return Ok(());
+                        }
+                        CrashLoopUpdateNext::Relaunch => {}
                     }
                     secs = secs.saturating_sub(started.elapsed().as_secs());
                 }
