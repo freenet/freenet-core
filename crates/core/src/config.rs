@@ -4744,9 +4744,7 @@ impl ConfigPathsArgs {
                     // (e.g., "The Freenet Project Inc/Freenet") won't exist yet.
                     // A failure here surfaces as the rename's error below.
                     if let Some(parent) = app_data_dir.parent() {
-                        if let Err(e) = fs::create_dir_all(parent) {
-                            tracing::debug!(error = %e, "Could not create Local AppData parent");
-                        }
+                        drop(fs::create_dir_all(parent));
                     }
                     if let Err(e) = fs::rename(&old_roaming, &app_data_dir) {
                         tracing::warn!(

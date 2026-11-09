@@ -51,9 +51,6 @@ mod platform {
     ///
     /// Uses `run_return` instead of `run` so the event loop returns control
     /// to the caller when the dialog closes (tao's `run` calls `process::exit`).
-    // The event loop's `match` ends in a wildcard: tao's `Event` is
-    // non-exhaustive, and the wizard handles only the events it names.
-    #[allow(clippy::wildcard_enum_match_arm)]
     pub fn show_setup_dialog() -> anyhow::Result<SetupResult> {
         let mut event_loop = EventLoopBuilder::<UiEvent>::with_user_event().build();
         let proxy = event_loop.create_proxy();
@@ -100,6 +97,9 @@ mod platform {
         event_loop.run_return(|event, _, control_flow| {
             *control_flow = ControlFlow::Wait;
 
+            // Ends in a wildcard: tao's `Event` is non-exhaustive, and the
+            // wizard handles only the events it names.
+            #[allow(clippy::wildcard_enum_match_arm)]
             match event {
                 Event::WindowEvent {
                     event: WindowEvent::CloseRequested,
@@ -152,8 +152,7 @@ mod platform {
                         InstallProgress::DownloadingFdev => {
                             "updateProgress(35, 'Downloading developer tools...')".to_string()
                         }
-                        InstallProgress::FdevSkipped(reason) => {
-                            tracing::warn!(%reason, "Developer tools skipped");
+                        InstallProgress::FdevSkipped(_) => {
                             "updateProgress(42, 'Developer tools skipped')".to_string()
                         }
                         InstallProgress::AddingToPath => {
@@ -177,13 +176,11 @@ mod platform {
                             format!("showError('{escaped}')")
                         }
                     };
-                    if let Err(e) = webview.evaluate_script(&js) {
-                        tracing::debug!(error = %e, "Setup wizard: script evaluation failed");
-                    }
+                    // Best-effort: a failed UI update is not recoverable here.
+                    drop(webview.evaluate_script(&js));
                 }
 
-                // Every other event is ignored (`Event` is non-exhaustive; see
-                // the allow on this function).
+                // Every other event is ignored.
                 _ => {}
             }
         });

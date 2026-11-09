@@ -880,7 +880,7 @@ jobs:
   # check built no test target, and Linux clippy never sees a
   # `cfg(windows)` line, so a Windows-only unused import, an undocumented
   # `unsafe` block or a test that did not compile on Windows passed every
-  # job. By November 2026 about 25 such errors had built up on main.
+  # job.
   windows_check:
     name: Windows Check
     runs-on: windows-latest
@@ -1200,9 +1200,10 @@ jobs:
 
   # Windows unit tests for the wrapper's Windows-only code paths (named-mutex
   # single-instance guard, process classification, etc). `windows_check` above
-  # only `cargo check`s — compilation is not verification of a `#[cfg(target_os
-  # = "windows")]` path (see .claude/rules/deployment.md) — so without this job
-  # the Windows-specific tests in commands::service would never actually run.
+  # compiles and lints every target but runs nothing, and compilation is not
+  # verification of a `#[cfg(target_os = "windows")]` path (see
+  # .claude/rules/deployment.md), so without this job the Windows-specific
+  # tests in commands::service would never actually run.
   # Added alongside the #5132 fix (Windows wrapper had no single-instance
   # guard at all), mirroring macos_unit above.
   windows_unit:

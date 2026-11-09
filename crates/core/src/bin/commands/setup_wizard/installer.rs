@@ -16,7 +16,9 @@ pub enum InstallProgress {
     StoppingExisting,
     CopyingBinary,
     DownloadingFdev,
-    FdevSkipped(String),
+    // The reason is never read: the wizard shows "skipped" without it. Kept
+    // for `Debug` output; showing or logging it would be a behaviour change.
+    FdevSkipped(#[allow(dead_code)] String),
     AddingToPath,
     InstallingService,
     LaunchingService,
