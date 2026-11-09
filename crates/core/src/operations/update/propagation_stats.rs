@@ -296,8 +296,8 @@ impl PropagationEvent {
 
     /// True for a receiver-side event (`Rx*`). These are recorded before any
     /// hosting check, keyed by a contract id an inbound message names, so they
-    /// may only count against a contract already tracked this window; see
-    /// [`UpdatePropagationStats::record_event`].
+    /// create a per-contract entry only for a contract this node hosts; see
+    /// [`record_received_event`].
     pub(crate) const fn is_received(self) -> bool {
         matches!(
             self,
@@ -694,18 +694,35 @@ impl UpdatePropagationStats {
     /// Production code reaches this through [`record_propagation_event`], which
     /// also feeds the telemetry window.
     ///
-    /// A receiver-side event ([`PropagationEvent::is_received`]) never creates
-    /// an entry: it only counts against a contract this node already tracks in
-    /// the window. Those events are recorded before any hosting check, keyed
-    /// by whatever contract id an inbound broadcast names, so a peer sending
-    /// broadcasts for random keys could otherwise fill the
-    /// [`MAX_TRACKED_CONTRACTS`] map and lock this node's own contracts out of
-    /// it for the window.
+    /// A receiver-side event ([`PropagationEvent::is_received`]) recorded
+    /// here never creates an entry; production records those through
+    /// [`record_received_event`], which says whether this node hosts the
+    /// contract.
     pub(crate) fn record_event(&self, contract: ContractInstanceId, ev: PropagationEvent) {
-        let entry = if ev.is_received() {
-            self.contracts.get_mut(&contract)
-        } else {
+        if ev.is_received() {
+            self.record_received(contract, ev, false);
+        } else if let Some(mut entry) = self.counters(contract) {
+            entry.events.add(ev, 1);
+        }
+    }
+
+    /// Count a receiver-side event, creating an entry for `contract` only
+    /// when this node hosts it (`hosted`), and otherwise only counting
+    /// against an entry already tracked this window. Receiver events are
+    /// recorded before any hosting check, keyed by whatever contract id an
+    /// inbound broadcast names, so allocating for any id would let a peer
+    /// sending broadcasts for random keys fill the [`MAX_TRACKED_CONTRACTS`]
+    /// map and lock this node's own contracts out of it for the window.
+    pub(crate) fn record_received(
+        &self,
+        contract: ContractInstanceId,
+        ev: PropagationEvent,
+        hosted: bool,
+    ) {
+        let entry = if hosted {
             self.counters(contract)
+        } else {
+            self.contracts.get_mut(&contract)
         };
         if let Some(mut entry) = entry {
             entry.events.add(ev, 1);
@@ -1086,8 +1103,8 @@ impl PropagationSink {
 /// event, with two exceptions where the node-wide telemetry counts an event
 /// the per-contract summary leaves out: any event for a contract new to the
 /// window once [`MAX_TRACKED_CONTRACTS`] are tracked, and a receiver-side
-/// `rx_*` event for a contract with no entry in the window (see
-/// [`UpdatePropagationStats::record_event`]).
+/// `rx_*` event for a contract this node does not host and has no entry for
+/// in the window (see [`record_received_event`]).
 pub(crate) fn record_propagation_event(
     op_manager: &crate::node::OpManager,
     contract: &ContractInstanceId,
@@ -1096,6 +1113,22 @@ pub(crate) fn record_propagation_event(
     op_manager
         .update_propagation_stats
         .record_event(*contract, ev);
+    op_manager.payload_mix.record_propagation_event(ev);
+}
+
+/// Count a receiver-side `rx_*` event like [`record_propagation_event`],
+/// except that the per-contract summary creates an entry for `key` only when
+/// this node hosts it (see [`UpdatePropagationStats::record_received`]).
+/// Telemetry counts every one.
+pub(crate) fn record_received_event(
+    op_manager: &crate::node::OpManager,
+    key: &freenet_stdlib::prelude::ContractKey,
+    ev: PropagationEvent,
+) {
+    let hosted = op_manager.ring.is_hosting_contract(key);
+    op_manager
+        .update_propagation_stats
+        .record_received(*key.id(), ev, hosted);
     op_manager.payload_mix.record_propagation_event(ev);
 }
 
@@ -1758,10 +1791,32 @@ mod tests {
             0,
             "no entry for an untracked contract"
         );
+        for i in 0..MAX_TRACKED_CONTRACTS + 1 {
+            stats.record_received(id_at(i), PropagationEvent::RxDedup, false);
+        }
+        assert_eq!(
+            stats.contracts.len(),
+            0,
+            "nor for one this node does not host"
+        );
+
+        let hosted = cid(201);
+        stats.record_received(hosted, PropagationEvent::RxBackoff, true);
+        assert_eq!(
+            stats
+                .events_for_test(&hosted)
+                .get(PropagationEvent::RxBackoff),
+            1,
+            "a hosted contract gets an entry for its received events"
+        );
 
         let own = cid(200);
         stats.record_event(own, PropagationEvent::ClientOriginated);
-        assert_eq!(stats.contracts.len(), 1, "this node's contract is tracked");
+        assert_eq!(
+            stats.contracts.len(),
+            2,
+            "this node's contracts are tracked"
+        );
         stats.record_event(own, PropagationEvent::RxDedup);
         assert_eq!(
             stats.events_for_test(&own).get(PropagationEvent::RxDedup),

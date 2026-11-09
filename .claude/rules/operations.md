@@ -538,9 +538,11 @@ WHEN adding a way for a broadcast leg, fan-out or heal to end:
     `PayloadMix` directly: the one function feeds both. Telemetry counts
     every event; the per-contract summary leaves out any event for a
     contract new to the window once 4096 are tracked, and an `rx_*` event
-    for a contract with no entry in the window (receiver events are keyed by
-    whatever contract an inbound message names, before any hosting check,
-    so they never allocate an entry).
+    for a contract this node does not host and has no entry for in the
+    window. Receiver events are keyed by whatever contract an inbound
+    message names, before any hosting check, so they go through
+    `record_received_event`, which creates an entry only for a hosted
+    contract.
   → A new event needs a variant, a label (a stable log/telemetry field name)
     and a production recording site. The pin test
     `every_propagation_event_has_a_production_recording_site` fails on a

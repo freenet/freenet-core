@@ -1871,7 +1871,8 @@ fn seed_sender_summary_from_broadcast(
 }
 
 /// Count a receiver-side skip of an inbound broadcast (dedup, already
-/// applied, merge backoff) in the per-contract propagation summary (#6143).
+/// applied, merge backoff) in the per-contract propagation summary (#6143),
+/// which tracks the contract only if this node hosts it.
 /// Each skip logs at debug only, which release builds compile out, so this
 /// count is how a receiver dropping one sender's broadcasts becomes visible.
 fn count_receiver_skip(
@@ -1879,7 +1880,7 @@ fn count_receiver_skip(
     key: &ContractKey,
     ev: super::propagation_stats::PropagationEvent,
 ) {
-    super::propagation_stats::record_propagation_event(op_manager, key.id(), ev);
+    super::propagation_stats::record_received_event(op_manager, key, ev);
 }
 
 /// Inner driver for `BroadcastTo`. Mirrors `update.rs:595-825`.
@@ -4542,8 +4543,27 @@ mod tests {
             ContractInstanceId::new([13u8; 32]),
             CodeHash::new([14u8; 32]),
         );
+        // Only a hosted contract gets a per-contract entry for a received
+        // event; `unhosted` stands for a key a peer made up.
+        let unhosted = ContractKey::from_id_and_code(
+            ContractInstanceId::new([15u8; 32]),
+            CodeHash::new([16u8; 32]),
+        );
+        for key in [inline_key, stream_key] {
+            host_for_test(&op_manager, key);
+        }
 
         for _ in 0..2 {
+            let _result: Result<(), OpError> = drive_relay_broadcast_to(
+                &op_manager,
+                Transaction::new::<UpdateMsg>(),
+                unhosted,
+                DeltaOrFullState::Delta(vec![7, 8, 9]),
+                Vec::new(),
+                sender_addr,
+                crate::ring::broadcast_coverage::CoveredPeers::empty(),
+            )
+            .await;
             // The stand-in handler answers queue-full; only the pre-merge
             // dedup outcome matters here.
             let _result: Result<(), OpError> = drive_relay_broadcast_to(
@@ -4576,6 +4596,31 @@ mod tests {
                 .events_for_test(key.id());
             assert_eq!(events.get(Ev::RxDedup), 1, "{key}: {events:?}");
         }
+        let events = op_manager
+            .update_propagation_stats
+            .events_for_test(unhosted.id());
+        assert_eq!(
+            events.get(Ev::RxDedup),
+            0,
+            "an unhosted contract must not get a per-contract entry: {events:?}"
+        );
+        assert_eq!(
+            op_manager
+                .payload_mix
+                .propagation_event_for_test(Ev::RxDedup),
+            3,
+            "telemetry still counts every received skip"
+        );
+    }
+
+    /// Mark `key` hosted, as a contract this node stores is.
+    fn host_for_test(op_manager: &OpManager, key: ContractKey) {
+        op_manager.ring.host_contract(
+            key,
+            10,
+            crate::ring::AccessType::Get,
+            crate::ring::HostingCause::Other,
+        );
     }
 
     /// #6143: the other two receiver pre-merge skips, on both receive paths.
@@ -4598,6 +4643,9 @@ mod tests {
             )
         };
         let (inline_key, stream_key) = (key_of(21), key_of(23));
+        for key in [inline_key, stream_key] {
+            host_for_test(&op_manager, key);
+        }
         let inline = |key: ContractKey, bytes: Vec<u8>| {
             let op_manager = &op_manager;
             async move {
