@@ -15,10 +15,16 @@
 //! short and control bodies are assembled in order from those pieces, copying
 //! the ones that arrive early ([`BodyReader::next_chunk`]); a `Stream`'s
 //! payload goes straight into its charged buffer at its offset. What a gap
-//! still costs is one received range per stream (quinn's and our mirror,
-//! [`RangeMirror`]), capped per connection ([`MAX_RANGES_PER_CONNECTION`]).
+//! still costs is one received range (quinn's `recvd` entry and our mirror,
+//! [`RangeMirror`]), capped per connection ([`MAX_GAPS_PER_CONNECTION`]).
+//! quinn keeps a stopped stream's ranges until the peer finishes or resets
+//! it, which a peer may never do, so those stay counted for the connection's
+//! life ([`ConnRanges::keep`]); a second time past the cap closes the path.
 //! A stream waiting for room in the delivery channel keeps reading its
-//! payload, so the wait never holds the peer's flow-control credit.
+//! payload, so the wait never holds the peer's flow-control credit, but it
+//! leaves the stream's end unread until the stream is announced: reading the
+//! end frees quinn's slot, and the slots are what bound how many waiters a
+//! peer can make.
 //!
 //! Admission follows the UDP transport's rules (`.claude/rules/transport.md`,
 //! "WHEN admitting or sending a stream"):
@@ -186,7 +192,7 @@ pub(in crate::transport::quic) struct Receiver<T> {
     accept_data: bool,
     /// Closes the path on the first data frame it refuses ([`Self::accept_data`]).
     closer: super::super::QuicCloser,
-    /// The connection's received ranges over all its streams.
+    /// The connection's gaps over all its streams.
     ranges: Arc<ConnRanges>,
     /// Panic on the next stream, to test the supervisor.
     #[cfg(test)]
@@ -194,10 +200,16 @@ pub(in crate::transport::quic) struct Receiver<T> {
 }
 
 impl<T: TimeSource> Receiver<T> {
-    /// The connection's range count. Tests only.
+    /// The connection's gap count. Tests only.
     #[cfg(test)]
     pub(in crate::transport::quic) fn ranges(&self) -> Arc<ConnRanges> {
         self.ranges.clone()
+    }
+
+    /// Replace the gap cap, before any stream is read. Tests only.
+    #[cfg(test)]
+    pub(in crate::transport::quic) fn set_gap_cap(&mut self, cap: usize) {
+        self.ranges = Arc::new(ConnRanges::new(cap));
     }
 
     pub(in crate::transport::quic) fn new(
@@ -220,7 +232,7 @@ impl<T: TimeSource> Receiver<T> {
             next_short_key: AtomicU32::new(1),
             accept_data,
             closer,
-            ranges: Arc::new(ConnRanges::new(MAX_RANGES_PER_CONNECTION)),
+            ranges: Arc::new(ConnRanges::new(MAX_GAPS_PER_CONNECTION)),
             #[cfg(test)]
             panic_on_stream: false,
         }
@@ -278,8 +290,8 @@ enum ReadFailure {
     Age,
     Reset,
     ConnectionLost,
-    /// The connection's streams held more received ranges than
-    /// [`MAX_RANGES_PER_CONNECTION`] (gaps the peer left).
+    /// The connection's streams held more gaps than
+    /// [`MAX_GAPS_PER_CONNECTION`].
     TooManyRanges,
     /// quinn delivered a byte twice, which an unordered read never does.
     Overlap,
@@ -340,8 +352,10 @@ struct BodyReader<T: TimeSource> {
     /// One past the last offset this stream may carry, once its header is
     /// known; a byte past it is `Overlong`.
     end: Option<u64>,
-    /// quinn reported the end of the stream.
+    /// quinn reported the end of the stream, and so freed its state.
     finished: bool,
+    /// quinn reported a reset, and so freed the stream's state.
+    reset: bool,
     /// Every byte range received on this stream, merged.
     ranges: RangeMirror,
     /// The connection's count of ranges over all its streams.
@@ -371,6 +385,7 @@ impl<T: TimeSource> BodyReader<T> {
             staged: BTreeMap::new(),
             end: None,
             finished: false,
+            reset: false,
             ranges: RangeMirror::default(),
             conn_ranges,
         }
@@ -389,6 +404,13 @@ impl<T: TimeSource> BodyReader<T> {
     /// first byte (the header's).
     fn set_end(&mut self, end: u64) {
         self.end = Some(end);
+    }
+
+    /// Every byte up to the declared end has been read; only the end of the
+    /// stream itself is left, which [`Self::next_unordered`] would read next.
+    fn all_read(&self) -> bool {
+        self.end
+            .is_some_and(|end| self.ranges.ranges.as_slice() == [(0, end)])
     }
 
     /// Stop judging idleness ([`Self::idle_paused`]); the armed timer is
@@ -439,7 +461,15 @@ impl<T: TimeSource> BodyReader<T> {
                             self.finished = true;
                             Ok(None)
                         }
-                        Err(error) => Err(error.into()),
+                        Err(error) => {
+                            let failure = ReadFailure::from(error);
+                            // quinn frees the stream's state when it reports a
+                            // reset (`Chunks::next`), and all of it with the
+                            // connection.
+                            self.reset =
+                                matches!(failure, ReadFailure::Reset | ReadFailure::ConnectionLost);
+                            Err(failure)
+                        }
                     };
                 }
                 () = &mut self.timer => {
@@ -510,6 +540,8 @@ impl<T: TimeSource> BodyReader<T> {
                     return Ok(Some(bytes));
                 }
                 Some((offset, bytes)) => {
+                    #[cfg(test)]
+                    self.conn_ranges.staged.fetch_add(1, Ordering::Relaxed);
                     // Copied, so the staged bytes do not keep quinn's datagram.
                     self.staged.insert(offset, Bytes::copy_from_slice(&bytes));
                 }
@@ -589,28 +621,53 @@ impl<T: TimeSource> BodyReader<T> {
 
 impl<T: TimeSource> Drop for BodyReader<T> {
     fn drop(&mut self) {
-        self.conn_ranges.remove(self.ranges.len());
+        let gaps = self.ranges.gaps();
+        if self.finished || self.reset {
+            self.conn_ranges.remove(gaps);
+        } else {
+            // quinn's `Recv::stop` (also run when a `RecvStream` is dropped
+            // unfinished) clears the buffered data but keeps `recvd` until
+            // the peer sends FIN or RESET_STREAM, which it may never do, and
+            // nothing tells us when it does. So the gaps stay counted.
+            self.conn_ranges.keep(gaps);
+        }
     }
 }
 
-/// Most byte ranges a connection's streams may hold at once, counted as
-/// disjoint received ranges per stream ([`RangeMirror`]). Each range costs
-/// about 70 B (quinn's `recvd` entry, which nothing in quinn caps, and our
-/// mirror), and each gap costs the peer at least one byte of credit. One
-/// range per KiB of the largest connection window (2,048, about 140 KB); honest
-/// loss leaves about loss x packets in flight, far fewer.
-pub(in crate::transport::quic) const MAX_RANGES_PER_CONNECTION: usize =
+/// Most gaps a connection's streams may hold, counted per stream as received
+/// ranges past the first ([`RangeMirror::gaps`]), over open streams and the
+/// stopped ones quinn may still hold ([`ConnRanges::keep`]). A contiguous
+/// stream costs nothing here: its one range is bounded by the stream limit.
+/// Each gap costs about 70 B (quinn's `recvd` entry, which nothing in quinn
+/// caps, and our mirror) and the peer at least one byte of credit. One gap
+/// per KiB of the largest connection window (2,048, about 140 KB); honest loss
+/// leaves about loss x packets in flight, far fewer.
+pub(in crate::transport::quic) const MAX_GAPS_PER_CONNECTION: usize =
     (super::super::config::MAX_WINDOW_BYTES / 1024) as usize;
 
-/// A connection's count of received ranges over its streams, against
-/// [`MAX_RANGES_PER_CONNECTION`].
+/// A connection's count of gaps over its streams, against
+/// [`MAX_GAPS_PER_CONNECTION`].
 #[derive(Debug)]
 pub(in crate::transport::quic) struct ConnRanges {
     held: AtomicUsize,
     cap: usize,
+    /// Times a stream went past the cap.
+    trips: AtomicUsize,
+    /// Gaps kept for stopped streams. Tests only.
+    #[cfg(test)]
+    kept: AtomicUsize,
     /// The most held at once. Tests only.
     #[cfg(test)]
     peak: AtomicUsize,
+    /// Streams whose end was read before they were announced, which must
+    /// not happen. Kept here, beside the rest of the per-connection read
+    /// state tests look at. Tests only.
+    #[cfg(test)]
+    pub(in crate::transport::quic) ended_before_announce: AtomicUsize,
+    /// Pieces that arrived ahead of the in-order position while a header,
+    /// metadata or body was assembled, and were staged. Tests only.
+    #[cfg(test)]
+    pub(in crate::transport::quic) staged: AtomicUsize,
 }
 
 impl ConnRanges {
@@ -618,12 +675,43 @@ impl ConnRanges {
         Self {
             held: AtomicUsize::new(0),
             cap,
+            trips: AtomicUsize::new(0),
+            #[cfg(test)]
+            kept: AtomicUsize::new(0),
             #[cfg(test)]
             peak: AtomicUsize::new(0),
+            #[cfg(test)]
+            ended_before_announce: AtomicUsize::new(0),
+            #[cfg(test)]
+            staged: AtomicUsize::new(0),
         }
     }
 
-    /// Change the count by `delta`; false if it is now past the cap.
+    /// A stream went past the cap; true if one had before. The first trip
+    /// stops the stream; a second closes the path, since the gaps of stopped
+    /// streams never leave the count and an honest peer does not reach the
+    /// cap once.
+    fn trip(&self) -> bool {
+        self.trips.fetch_add(1, Ordering::Relaxed) > 0
+    }
+
+    /// A stream's reader ended with `gaps` that quinn may still hold: they
+    /// stay in the count for the connection's life.
+    fn keep(&self, gaps: usize) {
+        #[cfg(test)]
+        self.kept.fetch_add(gaps, Ordering::Relaxed);
+        let _ = gaps;
+    }
+
+    /// Gaps kept for stopped streams. Tests only.
+    #[cfg(test)]
+    pub(in crate::transport::quic) fn kept(&self) -> usize {
+        self.kept.load(Ordering::Relaxed)
+    }
+
+    /// Change the count by `delta`; false if a new gap took it past the
+    /// cap. A change that adds no gap never fails, even while kept gaps hold
+    /// the count past the cap.
     fn add(&self, delta: isize) -> bool {
         let held = if delta >= 0 {
             self.held.fetch_add(delta.unsigned_abs(), Ordering::Relaxed) + delta.unsigned_abs()
@@ -634,20 +722,20 @@ impl ConnRanges {
         };
         #[cfg(test)]
         self.peak.fetch_max(held, Ordering::Relaxed);
-        held <= self.cap
+        held <= self.cap || delta <= 0
     }
 
     fn remove(&self, ranges: usize) {
         self.held.fetch_sub(ranges, Ordering::Relaxed);
     }
 
-    /// The most ranges held at once. Tests only.
+    /// The most gaps held at once. Tests only.
     #[cfg(test)]
     pub(in crate::transport::quic) fn peak(&self) -> usize {
         self.peak.load(Ordering::Relaxed)
     }
 
-    /// Ranges held now. Tests only.
+    /// Gaps held now. Tests only.
     #[cfg(test)]
     pub(in crate::transport::quic) fn held(&self) -> usize {
         self.held.load(Ordering::Relaxed)
@@ -661,13 +749,19 @@ struct RangeMirror {
 }
 
 impl RangeMirror {
+    #[cfg(test)]
     fn len(&self) -> usize {
         self.ranges.len()
     }
 
-    /// Record `start..stop`; returns how the number of ranges changed (+1 for
-    /// an isolated range, 0 when it extends one, negative when it joins
-    /// several), or `Overlap` if any byte was already received.
+    /// Ranges past the first: the gaps between them.
+    fn gaps(&self) -> usize {
+        self.ranges.len().saturating_sub(1)
+    }
+
+    /// Record `start..stop`; returns how the number of gaps changed (+1 for
+    /// an isolated range after the first, 0 when it extends one, negative
+    /// when it joins several), or `Overlap` if any byte was already received.
     fn insert(&mut self, start: u64, stop: u64) -> Result<isize, ReadFailure> {
         if start >= stop {
             return Ok(0);
@@ -683,7 +777,7 @@ impl RangeMirror {
             }
             j += 1;
         }
-        let before = self.ranges.len();
+        let before = self.gaps();
         let merged_start = if i < j {
             self.ranges[i].0.min(start)
         } else {
@@ -695,7 +789,7 @@ impl RangeMirror {
             stop
         };
         self.ranges.splice(i..j, [(merged_start, merged_stop)]);
-        Ok(self.ranges.len() as isize - before as isize)
+        Ok(self.gaps() as isize - before as isize)
     }
 }
 
@@ -1032,6 +1126,15 @@ impl<T: TimeSource> Receiver<T> {
             ReadFailure::TooManyRanges => {
                 stats.record(QuicInboundOutcome::TooManyRanges);
                 reader.stop(stop_code::EVICTED);
+                // DOWNGRADE until the budget's own close code exists: the
+                // peer falls back to the UDP session.
+                if self.ranges.trip() && self.closer.close(QuicCloseCode::Downgrade) {
+                    stats.record(QuicInboundOutcome::ClosedTooManyRanges);
+                    tracing::warn!(
+                        "QUIC path: the peer left more gaps than the connection's cap \
+                         a second time; closing the path so the peer falls back to UDP"
+                    );
+                }
             }
             ReadFailure::Overlap => {
                 stats.record(QuicInboundOutcome::ReadFailed);
@@ -1288,7 +1391,11 @@ impl<T: TimeSource> Receiver<T> {
                 reader.pause_idle();
                 let mut reserve = std::pin::pin!(self.streams.reserve());
                 let waited = loop {
-                    if reader.finished {
+                    // The end is not read before the announce: reading it
+                    // frees quinn's slot for the stream, and the slots are
+                    // what bound how many readers can be waiting here (the
+                    // stream limit, not `MAX_INBOUND_STREAMS_PER_CONNECTION`).
+                    if reader.finished || reader.all_read() {
                         break reader.until_age(&mut reserve).await;
                     }
                     enum Next<P> {
@@ -1338,6 +1445,12 @@ impl<T: TimeSource> Receiver<T> {
                 return;
             }
         };
+        #[cfg(test)]
+        if reader.finished {
+            self.ranges
+                .ended_before_announce
+                .fetch_add(1, Ordering::Relaxed);
+        }
         permit.send(arrival);
         self.stats.record(QuicInboundOutcome::AnnouncedStream);
 
@@ -1652,12 +1765,14 @@ mod tests {
     #[test]
     fn the_range_mirror_merges_counts_and_refuses_overlap() {
         let mut m = RangeMirror::default();
-        assert_eq!(m.insert(10, 20), Ok(1));
+        assert_eq!(m.insert(10, 20), Ok(0), "one range, no gap");
         assert_eq!(m.insert(30, 40), Ok(1));
         assert_eq!(m.len(), 2);
+        assert_eq!(m.gaps(), 1);
         assert_eq!(m.insert(20, 25), Ok(0), "extends the first");
         assert_eq!(m.insert(25, 30), Ok(-1), "joins both");
         assert_eq!(m.ranges, vec![(10, 40)]);
+        assert_eq!(m.gaps(), 0);
         assert_eq!(m.insert(0, 5), Ok(1));
         assert_eq!(m.insert(39, 41), Err(ReadFailure::Overlap));
         assert_eq!(m.insert(0, 1), Err(ReadFailure::Overlap));
@@ -1666,18 +1781,25 @@ mod tests {
         assert_eq!(m.insert(7, 7), Ok(0), "empty");
     }
 
-    /// The connection's count is checked against its cap as ranges come and
-    /// go, and what a stream held goes back when it ends.
+    /// The connection's count is checked against its cap as gaps come and
+    /// go, what a finished stream held goes back, what a stopped one held
+    /// stays, and only a second trip past the cap asks for the close.
     #[test]
-    fn the_connection_range_count_has_a_cap() {
+    fn the_connection_gap_count_has_a_cap() {
         let conn = ConnRanges::new(3);
         assert!(conn.add(2));
         assert!(conn.add(1));
         assert!(!conn.add(1), "past the cap");
+        assert!(!conn.trip(), "the first trip stops the stream only");
+        assert!(conn.add(0), "no new gap, so no trip, while past the cap");
         assert!(conn.add(-2));
         assert_eq!(conn.held(), 2);
-        conn.remove(2);
-        assert_eq!(conn.held(), 0);
+        conn.remove(1);
+        assert_eq!(conn.held(), 1);
+        conn.keep(1);
+        assert_eq!(conn.held(), 1, "a stopped stream's gaps stay counted");
+        assert_eq!(conn.kept(), 1);
+        assert!(conn.trip(), "the second trip closes");
     }
 
     /// The receive side relies on quinn-proto 0.11.17 or later within 0.11:

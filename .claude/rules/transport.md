@@ -1949,9 +1949,16 @@ Unordered reads: every inbound stream is read with read_chunk(_, false) from
   connection's credit); a Stream's payload is written at its offset into the
   charged buffer (the Rechunker stages a fragment until it is whole and holds
   the last one to complete until the stream's end). A gap costs one received
-  range (quinn's recvd set and our mirror, ~70 B); a connection's streams may
-  hold at most inbound::MAX_RANGES_PER_CONNECTION (2,048), past which the
-  stream is stopped EVICTED and counted too_many_ranges. A byte past the
+  range (quinn's recvd set and our mirror, ~70 B); gaps are counted per stream
+  as ranges past the first, and a connection's streams may hold at most
+  inbound::MAX_GAPS_PER_CONNECTION (2,048), past which the stream is stopped
+  EVICTED and counted too_many_ranges. quinn keeps a stopped stream's recvd
+  until the peer sends FIN or RESET (it may never), so the gaps of a stream
+  whose end or reset we did not read stay counted for the connection's life;
+  a second trip past the cap closes the path with DOWNGRADE
+  (closed_too_many_ranges). A Stream waiting for room in the delivery channel
+  reads its payload but NOT its end until it is announced: reading the end
+  frees quinn's slot, and the slots bound how many streams can wait. A byte past the
   declared end is Overlong as soon as it arrives, so an overlong stream can
   fail before it is announced. GRO stays off (QuicSocket::max_receive_segments
   is 1, pinned): with GRO a 1-byte chunk would keep a whole batch. quinn-proto

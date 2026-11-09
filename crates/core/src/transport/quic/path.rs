@@ -303,6 +303,10 @@ pub(crate) struct QuicPathLimits {
     /// (supervisor test).
     #[cfg(test)]
     pub(crate) panic_in_watch: bool,
+    /// The receive side's gap cap (`inbound::MAX_GAPS_PER_CONNECTION`), lower
+    /// in a test that trips it.
+    #[cfg(test)]
+    pub(crate) max_gaps: usize,
 }
 
 impl QuicPathLimits {
@@ -329,6 +333,8 @@ impl QuicPathLimits {
         panic_in_receive: false,
         #[cfg(test)]
         panic_in_watch: false,
+        #[cfg(test)]
+        max_gaps: inbound::MAX_GAPS_PER_CONNECTION,
     };
 
     /// [`Self::DEFAULT`] for a path in shadow mode: control frames only.
@@ -439,10 +445,15 @@ quic_outcomes! {
         ShortRefusedBudget => "short_refused_budget",
         /// A Stream did not fit the inbound budget (as above).
         StreamRefusedBudget => "stream_refused_budget",
-        /// The connection's streams held more received ranges (gaps the peer
-        /// left) than `inbound::MAX_RANGES_PER_CONNECTION`; the stream that
-        /// went past it was stopped (`stop_code::EVICTED`).
+        /// The connection's streams held more gaps (received ranges past the
+        /// first, per stream) than `inbound::MAX_GAPS_PER_CONNECTION`; the
+        /// stream that went past it was stopped (`stop_code::EVICTED`).
         TooManyRanges => "too_many_ranges",
+        /// The connection went past `inbound::MAX_GAPS_PER_CONNECTION` a
+        /// second time, so the path was closed with DOWNGRADE (once per path):
+        /// the gaps of streams it stopped stay counted for the connection's
+        /// life, because quinn keeps them until the peer ends the stream.
+        ClosedTooManyRanges => "closed_too_many_ranges",
     }
 }
 
@@ -851,6 +862,7 @@ impl QuicPath {
         #[cfg(test)]
         {
             receiver.panic_on_stream = limits.panic_in_receive;
+            receiver.set_gap_cap(limits.max_gaps);
         }
         #[cfg(test)]
         let inbound_ranges = receiver.ranges();
@@ -951,11 +963,34 @@ impl QuicPath {
         })
     }
 
-    /// The most received ranges the receive side's streams held at once.
-    /// Tests only.
+    /// The most gaps the receive side's streams held at once. Tests only.
     #[cfg(test)]
-    pub(in crate::transport) fn inbound_ranges_peak(&self) -> usize {
+    pub(in crate::transport) fn inbound_gaps_peak(&self) -> usize {
         self.inbound_ranges.peak()
+    }
+
+    /// Streams the receive side announced after reading their end, which
+    /// must not happen. Tests only.
+    #[cfg(test)]
+    pub(in crate::transport) fn inbound_ended_before_announce(&self) -> usize {
+        self.inbound_ranges
+            .ended_before_announce
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Pieces the receive side staged because they arrived ahead of the
+    /// header or metadata being assembled. Tests only.
+    #[cfg(test)]
+    pub(in crate::transport) fn inbound_staged(&self) -> usize {
+        self.inbound_ranges
+            .staged
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Gaps of stopped streams the receive side keeps counted. Tests only.
+    #[cfg(test)]
+    pub(in crate::transport) fn inbound_gaps_kept(&self) -> usize {
+        self.inbound_ranges.kept()
     }
 
     /// Whether the path's data sends are paced.
