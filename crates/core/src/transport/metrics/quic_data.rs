@@ -25,6 +25,8 @@
 //! | `quic_ended_loss_rate_<bucket>` | paths that ended in the period, by the bucket they were in at the end (same buckets) |
 //! | `quic_ended_paths_below_floor` | paths that ended in the period before sending 200 packets, so in no bucket |
 //! | `quic_streams_sampled_paths`, `quic_streams_open_ge_<n>`, `quic_streams_peak_max` | per path and period, the peak of inbound streams read at once: the paths sampled, those whose peak reached each level, and the highest peak |
+//! | `quic_send_resets`, `quic_path_ms` | sends a path reset on this side, and the time QUIC paths were up, shadow paths included, up to each path's last tick: resets per connection-hour is their ratio |
+//! | `quic_send_resets_reached_<n>`, `quic_send_resets_path_max` | paths whose lifetime reset count reached each level in the period, and the highest count a reset in the period took a path to: how close paths get to `recycle::SEND_ABORT_LIMIT` |
 //!
 //! What the loss rate is: quinn's lost over sent (quinn-proto 0.11.19). `sent`
 //! counts every packet quinn built, acknowledgement-only ones included. `lost`
@@ -45,6 +47,15 @@
 //! `quic_sends` and `quic_stream_permit_waited` over `quic_streamed_sends` below 0.5%, and
 //! `quic_streams_open_ge_48` below 0.2% of `quic_streams_sampled_paths`. Both
 //! wait counts are of attempts: a send that waits and then times out is counted.
+//!
+//! The reset counts are for the per-connection fixed charge
+//! (`quic::config::QUIC_CONNECTION_CHARGE_BYTES`): each reset of a stream
+//! whose `stopped()` was polled leaves an entry in quinn's `stopped` map until
+//! the connection closes, so the charge takes the limit's worst case
+//! (`SEND_ABORT_LIMIT` x `QUIC_STOPPED_ENTRY_BYTES`). Field rates and peaks well
+//! under the limit are what would justify a lower charge or limit. A path whose
+//! acknowledgement watch is off or panicked stops adding to `quic_path_ms`,
+//! while its resets are still counted.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -166,6 +177,10 @@ struct LossCounts {
 /// (`quic::config::STREAMED_SEND_LIMIT`), which is the bar.
 pub(crate) const QUIC_STREAMS_OPEN_THRESHOLDS: [u32; 4] = [8, 16, 32, 48];
 
+/// The levels `quic_send_resets_reached_<n>` reports, up to
+/// `recycle::SEND_ABORT_LIMIT`: one more reset past the last closes the path.
+pub(crate) const QUIC_SEND_RESET_LEVELS: [u64; 4] = [64, 512, 2048, 4096];
+
 /// The streams-open counts of one period, under one lock with its period, as the
 /// connection-level inbound concurrency counts are.
 #[derive(Debug, Default, Clone, Copy)]
@@ -204,6 +219,10 @@ pub(crate) struct QuicDataCounters {
     loss: Mutex<LossCounts>,
     streams_epoch: AtomicU64,
     streams: Mutex<StreamsOpenCounts>,
+    send_resets: AtomicU64,
+    path_ms: AtomicU64,
+    send_resets_reached: [AtomicU64; QUIC_SEND_RESET_LEVELS.len()],
+    send_resets_path_max: AtomicU64,
 }
 
 impl QuicDataCounters {
@@ -226,6 +245,10 @@ impl QuicDataCounters {
             loss: Mutex::new(LossCounts::default()),
             streams_epoch: AtomicU64::new(1),
             streams: Mutex::new(StreamsOpenCounts::default()),
+            send_resets: zero(),
+            path_ms: zero(),
+            send_resets_reached: std::array::from_fn(|_| zero()),
+            send_resets_path_max: zero(),
         }
     }
 
@@ -361,6 +384,26 @@ impl QuicDataCounters {
         counts.max = counts.max.max(open);
     }
 
+    /// A path reset a send on this side, its `path_count`th
+    /// (`recycle::SendAborts`, while the connection is open).
+    pub(crate) fn record_send_reset(&self, path_count: u64) {
+        self.send_resets.fetch_add(1, Ordering::Relaxed);
+        // A path's count rises by one per reset, so it equals each level once.
+        if let Some(i) = QUIC_SEND_RESET_LEVELS
+            .iter()
+            .position(|level| *level == path_count)
+        {
+            self.send_resets_reached[i].fetch_add(1, Ordering::Relaxed);
+        }
+        self.send_resets_path_max
+            .fetch_max(path_count, Ordering::Relaxed);
+    }
+
+    /// A path was up for `ms` more milliseconds (`recycle::PathReport`).
+    pub(crate) fn record_path_time(&self, ms: u64) {
+        self.path_ms.fetch_add(ms, Ordering::Relaxed);
+    }
+
     /// The period's counts, reset when `reset`. The gauge is read, never reset.
     pub(crate) fn snapshot(&self, reset: bool) -> QuicDataSnapshot {
         let get = |a: &AtomicU64| {
@@ -415,6 +458,10 @@ impl QuicDataCounters {
             streams_open_paths_sampled: streams.paths_sampled,
             streams_open_ge: streams.ge.to_vec(),
             streams_open_max: streams.max,
+            send_resets: get(&self.send_resets),
+            path_ms: get(&self.path_ms),
+            send_resets_reached: self.send_resets_reached.iter().map(get).collect(),
+            send_resets_path_max: get(&self.send_resets_path_max),
         }
     }
 }
@@ -456,6 +503,11 @@ pub struct QuicDataSnapshot {
     /// By `QUIC_STREAMS_OPEN_THRESHOLDS`.
     pub streams_open_ge: Vec<u32>,
     pub streams_open_max: u32,
+    pub send_resets: u64,
+    pub path_ms: u64,
+    /// By `QUIC_SEND_RESET_LEVELS`.
+    pub send_resets_reached: Vec<u64>,
+    pub send_resets_path_max: u64,
 }
 
 impl QuicDataSnapshot {
@@ -498,6 +550,10 @@ impl QuicDataSnapshot {
             streams_open_paths_sampled,
             streams_open_ge,
             streams_open_max,
+            send_resets,
+            path_ms,
+            send_resets_reached,
+            send_resets_path_max,
         } = self;
         let mut keys = Vec::new();
         let mut family = |prefix: &'static str, labels: Vec<String>, values: Vec<u64>| {
@@ -570,6 +626,14 @@ impl QuicDataSnapshot {
                 .collect(),
             streams_open_ge.iter().map(|n| u64::from(*n)).collect(),
         );
+        family(
+            "quic_send_resets_reached_",
+            QUIC_SEND_RESET_LEVELS
+                .iter()
+                .map(|level| level.to_string())
+                .collect(),
+            send_resets_reached.clone(),
+        );
         for (key, value) in [
             ("quic_enabled_data_paths", *data_enabled),
             (LIVE_DATA_PATHS, *data_paths),
@@ -589,6 +653,9 @@ impl QuicDataSnapshot {
                 u64::from(*streams_open_paths_sampled),
             ),
             ("quic_streams_peak_max", u64::from(*streams_open_max)),
+            ("quic_send_resets", *send_resets),
+            ("quic_path_ms", *path_ms),
+            ("quic_send_resets_path_max", *send_resets_path_max),
         ] {
             keys.push((None, key.to_string(), value));
         }
@@ -634,6 +701,10 @@ impl QuicDataSnapshot {
             streams_open_paths_sampled,
             streams_open_ge: _,
             streams_open_max: _,
+            send_resets,
+            path_ms,
+            send_resets_reached,
+            send_resets_path_max: _,
         } = self;
         let any = |values: &[u64]| values.iter().any(|n| *n != 0);
         any(sends)
@@ -642,6 +713,7 @@ impl QuicDataSnapshot {
             || any(inbound)
             || any(session_ended_with_data_path)
             || any(ended_loss_rate)
+            || any(send_resets_reached)
             || [
                 *data_enabled,
                 *sends_opened,
@@ -656,6 +728,8 @@ impl QuicDataSnapshot {
                 *congestion_events,
                 *ended_below_floor,
                 u64::from(*streams_open_paths_sampled),
+                *send_resets,
+                *path_ms,
             ]
             .iter()
             .any(|n| *n != 0)
@@ -1043,6 +1117,36 @@ mod tests {
         let uploaded: std::collections::HashMap<String, u64> =
             counters.snapshot(true).upload_keys().collect();
         assert_eq!(uploaded.get("quic_ended_paths_below_floor"), Some(&1));
+    }
+
+    /// Resets reach their keys: the total, each level a path's count passes,
+    /// and the highest count; path time sums. All reset by the snapshot.
+    #[test]
+    fn send_resets_and_path_time_reach_their_keys_and_reset() {
+        let counters = QuicDataCounters::new();
+        // One path to 600 resets, another to 3.
+        for count in 1..=600 {
+            counters.record_send_reset(count);
+        }
+        for count in 1..=3 {
+            counters.record_send_reset(count);
+        }
+        counters.record_path_time(2_000);
+        counters.record_path_time(1_500);
+        let snap = counters.snapshot(true);
+        assert!(snap.has_activity());
+        let keys: std::collections::BTreeMap<_, _> = snap.keys().into_iter().collect();
+        assert_eq!(keys["quic_send_resets"], 603);
+        assert_eq!(keys["quic_path_ms"], 3_500);
+        assert_eq!(keys["quic_send_resets_reached_64"], 1);
+        assert_eq!(keys["quic_send_resets_reached_512"], 1);
+        assert_eq!(keys["quic_send_resets_reached_2048"], 0);
+        assert_eq!(keys["quic_send_resets_reached_4096"], 0);
+        assert_eq!(keys["quic_send_resets_path_max"], 600);
+
+        let after = counters.snapshot(true);
+        assert!(!after.has_activity());
+        assert!(after.keys().iter().all(|(_, value)| *value == 0));
     }
 
     /// The snapshot round-trips through bincode, as the event log stores it.

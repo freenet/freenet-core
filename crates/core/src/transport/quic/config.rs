@@ -19,9 +19,12 @@
 //! stateless-reset key, `min_reset_interval` and the server's system clock.
 //!
 //! Memory: [`QUIC_CONNECTION_FIXED_BYTES`], [`QUIC_ASSEMBLER_HOLD_PER_STREAM_BYTES`],
-//! [`QUIC_ASSEMBLER_HOLD_WINDOW_MULTIPLE`] and [`QUIC_ACK_TAIL_BYTES`] are
+//! [`QUIC_ASSEMBLER_HOLD_WINDOW_MULTIPLE`], [`QUIC_ACK_TAIL_BYTES`],
+//! [`QUIC_OPEN_STREAM_BYTES`] and [`QUIC_STOPPED_ENTRY_BYTES`] are
 //! measurements of named terms under stated conditions (`quic::memory_tests`),
-//! not a ceiling on what one connection can hold. Not measured:
+//! not a ceiling on what one connection can hold; the fixed charge per
+//! connection ([`QUIC_CONNECTION_CHARGE_BYTES`]) sums the ones that do not
+//! scale with the windows. Not measured:
 //! - datagram sizes other than 1200 B (every stream shape measured pads its
 //!   datagrams to the 1200-byte MTU);
 //! - quinn's queue of datagrams from the endpoint driver to each connection;
@@ -29,7 +32,7 @@
 //! - allocators other than jemalloc on linux-gnu (macOS and Windows builds
 //!   round differently);
 //! - CRYPTO-frame reassembly, quinn-proto's second assembler (its buffer is
-//!   `crypto_buffer_size`, 16 KiB here);
+//!   [`QUIC_CRYPTO_BUFFER_BYTES`], charged at that limit);
 //! - arrival orders other than a single gap at offset 0 of each stream.
 
 use std::sync::Arc;
@@ -314,6 +317,58 @@ pub(crate) const QUIC_OPEN_STREAM_BYTES: usize = 1152;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const QUIC_STOPPED_ENTRY_BYTES: usize = 104;
 
+/// quinn-proto's CRYPTO-frame reassembly buffer per connection
+/// (`crypto_buffer_size`), a limit, not a measurement.
+pub(crate) const QUIC_CRYPTO_BUFFER_BYTES: usize = 16 * 1024;
+
+/// The fixed charge per QUIC connection, shadow paths included: every term of
+/// one connection's memory that does not scale with its windows, so the
+/// node-wide buffer budget ([`quic_buffer_budget_for`]) does not meter it.
+///
+/// | Term | Bytes |
+/// |---|---|
+/// | idle connection state ([`QUIC_CONNECTION_FIXED_BYTES`]) | 65,536 |
+/// | [`MAX_UNI_STREAMS`] open streams x [`QUIC_OPEN_STREAM_BYTES`] | 73,728 |
+/// | CRYPTO reassembly ([`QUIC_CRYPTO_BUFFER_BYTES`]) | 16,384 |
+/// | quinn's `stopped` map, `recycle::SEND_ABORT_LIMIT` x [`QUIC_STOPPED_ENTRY_BYTES`] | 425,984 |
+/// | ACK-only tail ([`QUIC_ACK_TAIL_BYTES`]) | 245,760 |
+/// | **total** | **827,392 (808 KiB)** |
+///
+/// The `stopped` map is charged at the limit's worst case. quinn adds an entry
+/// when a stream's `stopped()` is polled and removes it only when the peer
+/// stops the stream or the stream is finished and acknowledged, so every
+/// stream this side resets after a poll keeps one until the connection
+/// closes. Polling `stopped()` later would not avoid it: a writer blocked on
+/// connection credit must still see the peer's stop, so the poll stays on
+/// every wait. The reset rate and how close paths come to the limit are
+/// reported (`quic_send_resets`, `quic_path_ms`,
+/// `quic_send_resets_reached_<n>`) so field data can justify a lower charge.
+///
+/// Not yet summed in the node aggregate: the aggregate-accounting step of the
+/// buffer budget (#5940) sums `quic_connections x` this, and waits for the
+/// small-host decision.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const QUIC_CONNECTION_CHARGE_BYTES: usize = QUIC_CONNECTION_FIXED_BYTES
+    + MAX_UNI_STREAMS as usize * QUIC_OPEN_STREAM_BYTES
+    + QUIC_CRYPTO_BUFFER_BYTES
+    + super::recycle::SEND_ABORT_LIMIT as usize * QUIC_STOPPED_ENTRY_BYTES
+    + QUIC_ACK_TAIL_BYTES;
+
+/// The share of the node's memory for QUIC buffers that scale with the windows,
+/// as a divisor: one sixteenth.
+const QUIC_BUFFER_BUDGET_DIVISOR: usize = 16;
+
+/// The node-wide budget for QUIC memory that scales with the flow-control
+/// windows (received data, send windows, gaps), node memory / 16: 64 MiB at
+/// 1 GiB, 128 MiB at 2 GiB, 475 MiB at the 7600 MiB gateway. What does not
+/// scale with them is charged per connection ([`QUIC_CONNECTION_CHARGE_BYTES`]).
+/// Nothing is metered against it yet: the meter comes with the dynamic windows,
+/// and the aggregate sum with the aggregate-accounting step (#5940).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn quic_buffer_budget_for(memory_limit: usize) -> usize {
+    memory_limit / QUIC_BUFFER_BUDGET_DIVISOR
+}
+
 /// The quinn, quinn-proto and rustls versions the figures above were
 /// measured with, checked against `Cargo.lock` by `quic::memory_tests`.
 #[cfg(test)]
@@ -535,7 +590,7 @@ pub(crate) fn transport_config<T: TimeSource>(
         .time_threshold(9.0 / 8.0)
         .persistent_congestion_threshold(3)
         .ack_frequency_config(None)
-        .crypto_buffer_size(16 * 1024)
+        .crypto_buffer_size(QUIC_CRYPTO_BUFFER_BYTES)
         // The spin bit lets an on-path observer measure a connection's RTT.
         .allow_spin(false)
         // No unreliable datagrams: messages go on streams.

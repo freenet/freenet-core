@@ -7719,6 +7719,10 @@ mod tests {
         data.loss_rate = (1019..1027).collect();
         data.ended_loss_rate = (1027..1035).collect();
         data.ended_below_floor = 1035;
+        data.send_resets = 1036;
+        data.path_ms = 1037;
+        data.send_resets_reached = (1038..1042).collect();
+        data.send_resets_path_max = 1042;
         let want: std::collections::BTreeMap<String, u64> =
             snapshot.quic_data.keys().into_iter().collect();
         assert!(want.values().all(|value| *value != 0));

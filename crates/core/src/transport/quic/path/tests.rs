@@ -2581,6 +2581,49 @@ fn recycle_closes_to(remote: SocketAddr) -> Vec<QuicCloseCode> {
         .collect()
 }
 
+/// The reset gauge for the fixed charge (buffer-budget PR 2): a path's
+/// resets reach the node counters with the levels its count passes, and its
+/// time up is reported tick by tick, so resets per connection-hour can be
+/// read from the field.
+#[test]
+fn a_paths_resets_and_time_reach_the_node_counters() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let counters: &'static crate::transport::metrics::QuicDataCounters =
+            Box::leak(Box::new(crate::transport::metrics::QuicDataCounters::new()));
+        let limits = QuicPathLimits {
+            counters: Some(counters),
+            ..QuicPathLimits::DEFAULT
+        };
+        // `paths` gives `a` the same counters; only `b` resets sends.
+        let p = paths("quic-path-reset-gauge", 24, limits).await;
+        let (b, time) = (p.b.clone(), p.time());
+        let (resets, timed) = p
+            .drive(async move {
+                abort_sends(b.clone(), 64).await;
+                let resets = counters.snapshot(true);
+                time.sleep(Duration::from_secs(20)).await;
+                (resets, counters.snapshot(true))
+            })
+            .await;
+        assert_eq!(p.b.send_aborts(), 64);
+        let keys: std::collections::BTreeMap<_, _> = resets.keys().into_iter().collect();
+        assert_eq!(keys["quic_send_resets"], 64);
+        assert_eq!(keys["quic_send_resets_reached_64"], 1);
+        assert_eq!(keys["quic_send_resets_reached_512"], 0);
+        assert_eq!(keys["quic_send_resets_path_max"], 64);
+        // Two paths, 20 s between the two snapshots, each reported at its
+        // watch's 2 s ticks.
+        let tick = recycle::ACK_WATCH_TICK.as_millis() as u64;
+        assert!(
+            (2 * (20_000 - tick)..=2 * (20_000 + tick)).contains(&timed.path_ms),
+            "{} ms of path time for two paths in 20 s",
+            timed.path_ms
+        );
+        assert_eq!(timed.send_resets, 0);
+    });
+}
+
 /// #5940 step M6, guard 1: a path that has reset its limit of sends stays
 /// open (checked at the limit minus one and at the limit), and the next
 /// reset closes it with `close_code::SEND_ABORT_LIMIT`, counted once; the

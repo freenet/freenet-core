@@ -1049,3 +1049,22 @@ fn quic_memory_figures_match_the_locked_versions() {
         );
     }
 }
+
+/// The fixed charge per connection is the sum the buffer-budget design gives
+/// (808 KiB, the `stopped` map at the reset limit's worst case), and the budget
+/// for what scales with the windows is a sixteenth of node memory. A change to
+/// any term moves the first figure, so the design's connection caps are
+/// re-derived with it.
+#[test]
+fn the_fixed_charge_and_the_buffer_budget_match_the_design() {
+    use super::config::{QUIC_CONNECTION_CHARGE_BYTES, quic_buffer_budget_for};
+    assert_eq!(
+        super::recycle::SEND_ABORT_LIMIT as usize * QUIC_STOPPED_ENTRY_BYTES,
+        416 * 1024
+    );
+    assert_eq!(QUIC_CONNECTION_CHARGE_BYTES, 827_392);
+    const MIB: usize = 1024 * 1024;
+    assert_eq!(quic_buffer_budget_for(1024 * MIB), 64 * MIB);
+    assert_eq!(quic_buffer_budget_for(2048 * MIB), 128 * MIB);
+    assert_eq!(quic_buffer_budget_for(7600 * MIB), 475 * MIB);
+}
