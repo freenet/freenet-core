@@ -127,6 +127,7 @@ fn register(
         origin_contract: origin,
         connection_scope: crate::client_events::ConnectionScope::Local,
         user_context: None,
+        lane_ticket: Default::default(),
     }
 }
 
@@ -143,6 +144,7 @@ fn app_messages(
         origin_contract: None,
         connection_scope: crate::client_events::ConnectionScope::Local,
         user_context: None,
+        lane_ticket: Default::default(),
     }
 }
 
@@ -533,6 +535,7 @@ async fn not_now_delivers_nothing_and_a_remote_registration_binds_no_app() {
                 origin_contract: Some(app(3)),
                 connection_scope: crate::client_events::ConnectionScope::Remote,
                 user_context: None,
+                lane_ticket: Default::default(),
             })
             .await
             .unwrap(),
@@ -1137,6 +1140,7 @@ async fn a_remote_unregister_keeps_the_record() {
         origin_contract: origin,
         connection_scope: scope,
         user_context: None,
+        lane_ticket: Default::default(),
     };
     let remote = answer(
         lp.send
@@ -1175,6 +1179,7 @@ async fn a_remote_unregister_keeps_the_record() {
                 user_context: Some(crate::wasm_runtime::UserSecretContext::from_token(
                     b"capability-record-hosted-user",
                 )),
+                lane_ticket: Default::default(),
             })
             .await
             .unwrap(),

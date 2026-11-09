@@ -2153,8 +2153,10 @@ fn extract_stream_content(
 /// work that a hosted visitor could flood with?":
 ///
 /// - `ContractOp` — GET/PUT/UPDATE/SUBSCRIBE on the contract loop.
-/// - `DelegateOp` — runs a delegate's WASM on the SAME serial contract loop
-///   (fresh wasmtime instance + secret-store fsync/redb txn); per-user secret
+/// - `DelegateOp` — runs a delegate's WASM on the node's ONE delegate
+///   executor, serialized node-wide by its lock (on the delegate lane, or the
+///   contract loop for a round-trip that needs it), with a fresh wasmtime
+///   instance + secret-store fsync/redb txn; per-user secret
 ///   ops are the whole point of hosted mode, so this is the primary flood
 ///   vector. The existing `DelegateRateLimiter` only backs off a delegate KEY
 ///   that is repeatedly FAILING; a successful-but-abusive delegate flood is

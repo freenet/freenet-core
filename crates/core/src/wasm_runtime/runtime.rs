@@ -1058,6 +1058,11 @@ impl Runtime {
         self.engine.is_healthy()
     }
 
+    /// See `WasmEngine::set_store_arena_budget_bytes`.
+    pub(crate) fn set_store_arena_budget_bytes(&mut self, bytes: u64) {
+        self.engine.set_store_arena_budget_bytes(bytes);
+    }
+
     /// Get a clone of the backend engine for sharing with other runtimes.
     pub(crate) fn clone_backend_engine(&self) -> BackendEngine {
         self.engine.clone_backend_engine()
@@ -1125,13 +1130,17 @@ impl Runtime {
     ///
     /// PERFORMANCE: this decrypts every entry AND writes each to disk (one ReDb
     /// index update + one file per secret), synchronously. The live-import caller
-    /// (`RuntimePool::import_secrets`) runs it ON the contract loop (serialized
-    /// with delegate `store_secret`) — DELIBERATELY on-loop, because the import
-    /// WRITES and the store write path assumes node-wide write serialization
-    /// (running it off-loop would let it race another writer on the same secret
-    /// file). The loop-block is acceptable: the endpoint is loopback +
-    /// dashboard-gated (a one-shot operator migration), not the authenticated-
-    /// remote DoS surface that justified moving the read-only EXPORT off-loop.
+    /// (`RuntimePool::import_secrets`) runs it on the node's delegate executor,
+    /// under that executor's lock (`PooledDelegateRunner::with_executor`), the
+    /// same lock every delegate `process()` and so every delegate
+    /// `store_secret` takes: the import WRITES and the store write path assumes
+    /// node-wide write serialization, so running it anywhere else would let it
+    /// race another writer on the same secret file. (Before the delegate lane
+    /// that serialization came from running on the contract loop; the loop
+    /// still handles the event and waits for the lock.) The wait is acceptable:
+    /// the endpoint is loopback + dashboard-gated (a one-shot operator
+    /// migration), not the authenticated-remote DoS surface that justified
+    /// moving the read-only EXPORT off-loop.
     pub(crate) fn import_secret_bundle(
         &mut self,
         bundle: &[u8],
@@ -1161,8 +1170,11 @@ impl Runtime {
     /// [`SecretsStore::migrate_secrets`] for the full contract (Local-only DEK
     /// carve-out, no-delete invariant, one-shot / anti-resurrection marker).
     ///
-    /// Runs ON the contract loop (serialized with delegate `store_secret`),
-    /// mirroring the on-loop write discipline of `import_secret_bundle`.
+    /// Must run serialized with delegate `store_secret`, as
+    /// `import_secret_bundle` does. That used to mean "on the contract loop";
+    /// since the delegate lane it means "under the delegate executor's lock"
+    /// (`PooledDelegateRunner`), which every delegate run and the live import
+    /// take. Re-wiring this must go through that lock too.
     ///
     /// HAS NO CALLER as of GHSA-824h-7x5x-wfmf. Its only one was the
     /// `DelegateRequest::RegisterDelegateWithPredecessors` handler in

@@ -85,6 +85,7 @@ impl DelegateStore {
             db,
             SharedDelegateIndex::default(),
             new_code_cache(max_size),
+            true,
         )
     }
 
@@ -92,11 +93,16 @@ impl DelegateStore {
     /// so every pool executor's store shares one of each. Both are populated
     /// idempotently, so it does not matter which executor is constructed first.
     /// See [`SharedDelegateIndex`] and [`SharedDelegateCodeCache`].
+    ///
+    /// `clean_tmp_records`: whether to delete temporary `.reg` records left
+    /// by a crash mid-repair. Only a store built where no `ensure_reg_file`
+    /// can be in flight may do it; see the comment at the deletion.
     pub fn new_with_shared(
         delegates_dir: PathBuf,
         db: Storage,
         shared_index: SharedDelegateIndex,
         shared_code_cache: SharedDelegateCodeCache,
+        clean_tmp_records: bool,
     ) -> RuntimeResult<Self> {
         std::fs::create_dir_all(&delegates_dir).map_err(|err| {
             tracing::error!("error creating delegate dir: {err}");
@@ -129,17 +135,24 @@ impl DelegateStore {
             for entry in dir.flatten() {
                 let path = entry.path();
                 // A temporary record left by a crash mid-repair
-                // (`ensure_reg_file`). Never a record itself. Deleting it
-                // unconditionally relies on no `ensure_reg_file` being in
-                // flight while a store is built over this directory: both run
-                // on the contract loop (registration, replacement executors)
-                // or before it starts (pool start-up), one at a time.
+                // (`ensure_reg_file`). Never a record itself, so it is
+                // skipped either way. Deleting it is safe only where no
+                // `ensure_reg_file` can be in flight on this directory.
+                // Registration and repair run on the node's one delegate
+                // executor, under its lock, possibly on the delegate lane
+                // while the loop builds a CONTRACT executor's store. So only
+                // the delegate executor's own store deletes them: built at
+                // pool start-up before the lane exists, or as a replacement
+                // while its lock is held. Contract executors' stores pass
+                // `false` (`SharedStores::clean_delegate_tmp_records`).
                 if path
                     .file_name()
                     .and_then(|n| n.to_str())
                     .is_some_and(|n| n.contains(REG_TMP_MARKER))
                 {
-                    drop(std::fs::remove_file(&path));
+                    if clean_tmp_records {
+                        drop(std::fs::remove_file(&path));
+                    }
                     continue;
                 }
                 if path.extension().is_none_or(|e| e != "reg") {
@@ -1564,6 +1577,41 @@ mod test {
             .is_err(),
             "a record that cannot be seen or written must fail registration"
         );
+        Ok(())
+    }
+
+    /// A store built without permission to clean (a contract executor's,
+    /// which can be built while the delegate executor is mid-repair) leaves a
+    /// temporary record in place, and still never reads it as a record.
+    ///
+    /// FALSIFY: delete the `if clean_tmp_records` guard around the removal.
+    #[tokio::test]
+    async fn a_store_without_cleanup_leaves_temporary_records()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let delegate_dir = temp_dir.path().join("delegates");
+        std::fs::create_dir_all(&delegate_dir)?;
+        let delegate = honest_delegate(vec![5, 6], b"room".to_vec());
+        let tmp = delegate_dir.join(format!("{}{REG_TMP_MARKER}1-0", delegate.key().encode()));
+        let mut body = vec![REG_FILE_VERSION];
+        body.extend_from_slice(delegate.code_hash().as_ref());
+        body.extend_from_slice(&4u32.to_le_bytes());
+        body.extend_from_slice(b"room");
+        std::fs::write(&tmp, body)?;
+
+        let db = create_test_db(temp_dir.path()).await;
+        let store = DelegateStore::new_with_shared(
+            delegate_dir,
+            db,
+            SharedDelegateIndex::default(),
+            new_code_cache(10_000),
+            false,
+        )?;
+        assert!(
+            tmp.exists(),
+            "a contract executor's store must not delete it"
+        );
+        assert!(store.code_hash_from_key(delegate.key()).is_none());
         Ok(())
     }
 

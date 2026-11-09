@@ -18,7 +18,10 @@
 //! the single serial loop — so nothing else on the node ran until it finished.
 //! For a permission prompt that is up to `USER_INPUT_TIMEOUT` (60 s) during
 //! which no GET, PUT, UPDATE, subscribe or delegate notification is serviced
-//! anywhere on this node.
+//! anywhere on this node. (That described every request when #5544 landed.
+//! Since the delegate lane, client delegate requests to OTHER delegates are
+//! served by the lane's own task and would not have waited; contract work and
+//! every other loop event still would.)
 //!
 //! Parking replaces that: the loop hands the slow half to a spawned task and
 //! returns immediately, and the delegate is re-entered on a later iteration
@@ -27,12 +30,12 @@
 //! # Why this needs per-delegate exclusion
 //!
 //! The context cache has one entry per delegate and hosted user, and each entry
-//! is last-write-wins. It is only sound while at most ONE `process()` per delegate is in flight,
-//! and — see that type's rustdoc, corrected in this same change — that
-//! property is supplied ENTIRELY by the serial loop, not by the runtime. There
-//! is no per-delegate lock in `prepare_delegate_call`, no per-delegate
-//! affinity in `RuntimePool::execute_delegate_request`, and no mutex anywhere
-//! in `wasm_runtime::delegate`.
+//! is last-write-wins. It is only sound while at most ONE round-trip per
+//! delegate is in flight, and nothing in the runtime supplies that: there is no
+//! per-delegate lock in `prepare_delegate_call` and no mutex in
+//! `wasm_runtime::delegate`. (The delegate executor's lock serializes single
+//! `process()` CALLS, not round-trips.) It is supplied by the loop, by this
+//! module's exclusion, and against the delegate lane by `DelegateGate`.
 //!
 //! So the moment a round-trip spans two loop iterations, that protection is
 //! gone: a second request for the same delegate would run `process()` in the
@@ -42,7 +45,10 @@
 //!
 //! [`DelegateParkCtx`] therefore keeps its own per-delegate exclusion: while a
 //! delegate is parked, further requests for it are QUEUED rather than run, and
-//! drained when it resumes. That preserves the invariant the delegate author
+//! drained when it resumes. With a delegate lane running, a parked delegate's
+//! client requests still arrive here: the park's gate claim keeps the lane
+//! off the delegate, so the lane forwards them to the loop's ordinary path.
+//! That preserves the invariant the delegate author
 //! already relies on, and converts a node-wide stall into a per-delegate one —
 //! which is the correct semantics, not a compromise. Everything else on the
 //! node keeps running.
@@ -50,77 +56,64 @@
 //! # What parking does NOT relax: `process()` stays globally serial
 //!
 //! Parking releases the loop while a delegate is **suspended**, never while it
-//! is **running**. That distinction is load-bearing for code outside this
-//! module, so state it as an invariant:
+//! is **running**. The invariant this module relies on, stated in full:
 //!
 //! > **At most one delegate `process()` executes node-wide at any instant, and
-//! > it always executes on the `contract_handling` loop.**
+//! > every one runs on the node's one delegate executor, under its lock. A
+//! > delegate's round-trip is never interleaved with another run of the same
+//! > delegate.**
 //!
-//! What depends on it:
+//! Before the delegate lane (`super::delegate_lane`) the first sentence read
+//! "...and it always executes on the `contract_handling` loop", and was held
+//! by the shape of the call graph: every route to `process()` was awaited
+//! from that one task, with no lock anywhere. The lane is a second task that
+//! starts delegate runs (client `ApplicationMessages` requests), so the
+//! property is now held by a LOCK: every `process()`, lane or loop, goes
+//! through `PooledDelegateRunner`, one executor behind one mutex. That also
+//! keeps every delegate secret write on one `SecretsStore`, which its
+//! in-memory index and the hosted per-user quota counter assume
+//! (`secrets_store::quota`); the "third invariant resting on the serial loop
+//! by accident" this section used to predict turned out to be those two.
 //!
-//! * `DelegateContextCache` needs one `process()` **per delegate** — that is
-//!   the narrower guarantee, and it is the one [`DelegateParkCtx`]'s exclusion
-//!   supplies, because parking genuinely does let a delegate's round-trip span
-//!   loop iterations.
+//! What depends on the second sentence:
 //!
-//! Nothing documented needs the full NODE-wide property any more. The V2
-//! delegate write path's non-atomic read-then-write (#5490) did; it went with
-//! the delegate write host functions in #5637. The property is kept, and
-//! pinned in `contract.rs`, as a deliberate defensive margin.
+//! * `DelegateContextCache` needs one round-trip per **delegate** in flight.
+//!   On the loop, [`DelegateParkCtx`]'s exclusion supplies the parked half: a
+//!   request for a parked delegate is queued, not run. Between the loop and
+//!   the lane, `DelegateGate` supplies it: every loop entry into a delegate
+//!   claims it (waiting out a lane call in progress, and first running any
+//!   round-trip the lane handed over), every park entry holds a claim for as
+//!   long as it lives, and the lane runs only a delegate nobody has claimed.
 //!
-//! Why the global property still holds after #5544, by construction rather than
-//! by convention:
+//! On the loop the routes into `handle_delegate_with_contract_requests` are
+//! still all awaited from `contract_handling`:
 //!
-//! 1. `execute_delegate_request` and `execute_delegate_hop` (the
-//!    inter-delegate hop) are reached ONLY through
-//!    `handle_delegate_with_contract_requests`.
-//! 2. Every route into that function is awaited, directly or one hop removed,
-//!    from `contract_handling` — a single task per node:
+//! ```text
+//! contract_handling
+//!   ├─ run_lane_unit (lane continuations) ─► dispatch_delegate_request ─┐
+//!   ├─ handle_contract_event ─────────► dispatch_delegate_request ──┤
+//!   ├─ handle_delegate_notification ─────────────────────────────────┤
+//!   ├─ run_lifecycle ────────────────────────────────────────────────┤
+//!   └─ handle_delegate_resume ──┬────────────────────────────────────┤
+//!                               ├─► dispatch_delegate_request ───────┤
+//!                               └─► run_queued_notification ─────────┘
+//!                                                                    │
+//!                        handle_delegate_with_contract_requests ◄────┘
+//!                                    ├─► execute_delegate_request
+//!                                    └─► execute_delegate_hop
+//! ```
 //!
-//!    ```text
-//!    contract_handling
-//!      ├─ handle_contract_event ─────────► dispatch_delegate_request ─┐
-//!      ├─ handle_delegate_notification ────────────────────────────────┤
-//!      └─ handle_delegate_resume ──┬───────────────────────────────────┤
-//!                                  ├─► dispatch_delegate_request ──────┤
-//!                                  └─► run_queued_notification ────────┘
-//!                                                                      │
-//!                          handle_delegate_with_contract_requests ◄─────┘
-//!                                      ├─► execute_delegate_request
-//!                                      └─► execute_delegate_hop
-//!    ```
+//! The off-loop task this module spawns captures a `ParkGuard`, an
+//! `Arc<P: UserInputPrompter>`, an `Option<Arc<OpManager>>` and plain data, not
+//! the `ContractHandler` or an executor, so it cannot invoke a delegate. A
+//! resume re-enters the delegate from `handle_delegate_resume`, on the loop.
 //!
-//!    Stated as the PROPERTY — every route is awaited from the one loop — and
-//!    not as a count. An exact tally is a fact with an expiry date: this list
-//!    said "four call sites" until `run_queued_notification` was added for the
-//!    notification-coalescing fix, and was wrong the moment it was. The
-//!    property survives a new caller; the number does not. If you add a route,
-//!    it must be awaited from this loop or the invariant is gone.
-//! 3. The off-loop task this module spawns captures a `ParkGuard`, an
-//!    `Arc<P: UserInputPrompter>`, an `Option<Arc<OpManager>>` and plain data.
-//!    It does **not** capture the `ContractHandler` or an executor, so it
-//!    cannot invoke a delegate even by mistake. Its two jobs — waiting on a
-//!    human and driving a sub-op GET — need neither.
-//! 4. A resume re-enters the delegate from `handle_delegate_resume`, which runs
-//!    **on the loop**. The spawned task only ships a result back down a
-//!    channel; it never runs the continuation itself.
-//!
-//! So the window parking opens is a window in which a *different* delegate may
-//! **start**, not one in which two may **run**.
-//!
-//! **What would break it.** Spawning any work that holds the
-//! `ContractHandler`, or resuming a continuation anywhere other than the loop.
-//! If you are about to do either, first make sure two `process()` calls for
-//! one delegate still cannot overlap (the `DelegateContextCache` requirement
-//! above), and update this section and the pin in `contract.rs`. The
-//! nearest existing precedent is deliberately NOT a counter-example: #4531's
-//! hosted-secret export does run off-loop holding a pooled executor, but it
-//! enumerates and seals secrets and never invokes a delegate.
-//!
-//! **The pattern worth noticing.** This is the second documented-but-unenforced
-//! invariant found to be resting on the serial loop by accident rather than by
-//! design — the context cache was the first. Neither said so where it was
-//! relied upon. When touching this loop, assume there is a third.
+//! **What would break it.** Running a delegate on anything but the delegate
+//! runner; starting a loop run of a delegate without claiming it on the gate;
+//! resuming a continuation anywhere other than the loop. The pins are
+//! `every_loop_delegate_run_goes_through_the_round_trip_chokepoint`,
+//! `every_delegate_process_runs_on_the_one_delegate_executor` and
+//! `every_loop_delegate_run_claims_the_delegate_on_the_gate` in `contract.rs`.
 //!
 //! # Ownership
 //!
@@ -1145,6 +1138,10 @@ pub(super) struct Continuation {
 
 /// One parked delegate.
 struct ParkEntry {
+    /// Keeps the delegate lane off this delegate for as long as it is parked
+    /// (`super::delegate_lane`). Released by the entry's drop, so every way a
+    /// park ends releases it. `None` when no lane is running.
+    _lane_claim: Option<super::delegate_lane::LoopClaim>,
     continuation: Continuation,
     /// Identity of THIS park; see [`DelegateResume::epoch`].
     epoch: u64,
@@ -1753,6 +1750,44 @@ pub(super) struct DelegateParkCtx {
     /// Kept here rather than threaded separately so every call site needs only
     /// a single `&mut DelegateParkCtx`.
     resume_tx: tokio::sync::mpsc::UnboundedSender<DelegateResume>,
+    /// The per-delegate exclusion shared with the delegate lane, when one is
+    /// running. Kept here because every loop path that starts a delegate run
+    /// already holds `&mut DelegateParkCtx`.
+    gate: Option<std::sync::Arc<super::delegate_lane::DelegateGate>>,
+    /// Delegates whose round-trip is running a hop target's handed-off lane
+    /// unit inline (see the hop in `handle_delegate_with_contract_requests`).
+    /// Non-empty means the current round-trip is nested inside another one,
+    /// and each key here is mid-round-trip on this loop.
+    hop_unit_stack: Vec<DelegateKey>,
+    /// Inter-delegate messages dropped because the target was mid-round-trip
+    /// (parked, or nested in the hop that delivers it). Counted, not only
+    /// logged.
+    dropped_hops: u64,
+}
+
+/// See [`DelegateParkCtx::enter_hop_unit`]. Derefs to the park context, so the
+/// nested run borrows it through the guard.
+pub(super) struct HopUnitScope<'a> {
+    park: &'a mut DelegateParkCtx,
+}
+
+impl std::ops::Deref for HopUnitScope<'_> {
+    type Target = DelegateParkCtx;
+    fn deref(&self) -> &DelegateParkCtx {
+        self.park
+    }
+}
+
+impl std::ops::DerefMut for HopUnitScope<'_> {
+    fn deref_mut(&mut self) -> &mut DelegateParkCtx {
+        self.park
+    }
+}
+
+impl Drop for HopUnitScope<'_> {
+    fn drop(&mut self) {
+        self.park.hop_unit_stack.pop();
+    }
 }
 
 /// Why parked work was turned away, counted rather than only logged (L9).
@@ -1782,7 +1817,55 @@ impl DelegateParkCtx {
             next_epoch: 0,
             refused: RefusalCounts::default(),
             resume_tx,
+            gate: None,
+            hop_unit_stack: Vec::new(),
+            dropped_hops: 0,
         }
+    }
+
+    /// Share `gate` with the delegate lane. Called once by `contract_handling`
+    /// when it starts a lane.
+    pub(super) fn set_gate(&mut self, gate: std::sync::Arc<super::delegate_lane::DelegateGate>) {
+        self.gate = Some(gate);
+    }
+
+    /// The gate shared with the delegate lane, if one is running.
+    pub(super) fn gate(&self) -> Option<std::sync::Arc<super::delegate_lane::DelegateGate>> {
+        self.gate.clone()
+    }
+
+    /// Whether the current round-trip is nested inside a hop that is running
+    /// its target's lane unit.
+    pub(super) fn in_hop_unit(&self) -> bool {
+        !self.hop_unit_stack.is_empty()
+    }
+
+    /// Whether `key`'s round-trip is suspended in a hop running another
+    /// delegate's lane unit, so running `key` now would clobber it.
+    pub(super) fn is_mid_hop(&self, key: &DelegateKey) -> bool {
+        self.hop_unit_stack.contains(key)
+    }
+
+    /// Record `caller` as suspended in a hop running another delegate's lane
+    /// unit, for as long as the returned guard lives. RAII so an early return
+    /// between entering and leaving cannot leave the stack non-empty, which
+    /// would make every later hop look nested and drop it.
+    pub(super) fn enter_hop_unit(&mut self, caller: &DelegateKey) -> HopUnitScope<'_> {
+        self.hop_unit_stack.push(caller.clone());
+        HopUnitScope { park: self }
+    }
+
+    /// Count one dropped inter-delegate message (also in telemetry); returns
+    /// the new total.
+    pub(super) fn count_dropped_hop(&mut self) -> u64 {
+        crate::node::network_status::record_inter_delegate_dropped();
+        self.dropped_hops = self.dropped_hops.saturating_add(1);
+        self.dropped_hops
+    }
+
+    #[cfg(test)]
+    pub(super) fn dropped_hops(&self) -> u64 {
+        self.dropped_hops
     }
 
     /// The byte budget this registry is enforcing. Tests assert against THIS
@@ -1881,9 +1964,11 @@ impl DelegateParkCtx {
         self.parked_bytes = self.parked_bytes.saturating_add(bytes);
         let epoch = self.next_epoch;
         self.next_epoch = self.next_epoch.wrapping_add(1);
+        let lane_claim = self.gate.as_ref().map(|gate| gate.hold(&key));
         self.parked.insert(
             key,
             ParkEntry {
+                _lane_claim: lane_claim,
                 continuation,
                 epoch,
                 task_bytes: task_bytes.get(),
@@ -2221,10 +2306,16 @@ impl DelegateParkCtx {
     /// it needs the same remedy rather than an argument about how short the
     /// window is.
     ///
-    /// Call this immediately before each force-resume, with no `.await`
-    /// between: it and [`Self::take_matching`] (the first statement of
-    /// `handle_delegate_resume`) are both synchronous, so the observation and
-    /// the removal cannot be separated by a suspension point.
+    /// Call this immediately before each force-resume, with nothing that
+    /// suspends between: it and [`Self::take_matching`] are both synchronous,
+    /// and the one await `handle_delegate_resume` makes before
+    /// `take_matching` (claiming the delegate on the lane's gate) does not
+    /// suspend for a key that is still parked: the park entry holds a gate
+    /// claim, so the lane has no run or unit for it and `DelegateGate::claim`
+    /// returns at its first check (pinned by
+    /// `delegate_lane::tests::a_claim_on_a_parked_delegate_does_not_suspend`).
+    /// So the observation and the removal cannot be separated by a suspension
+    /// point.
     ///
     /// RESIDUAL, stated rather than implied: a guard that fires in the
     /// instants between this call and `take_matching` is still lost. That is
