@@ -730,9 +730,11 @@ struct Window {
     /// when it is handed to the bridge, and the `prop_wire_stream_*` fields
     /// count how each stream then ended.
     propagation_events: [u64; PropagationEvent::COUNT],
-    /// Contracts the propagation summary WARNed as stalled
+    /// Contracts the propagation summary found stalled
     /// (`update_propagation_stalled`) in the summary window that ended
-    /// during this rollup window.
+    /// during this rollup window. Counts every stalled contract, including
+    /// those past the per-window WARN cap that only the rollup WARN names, so
+    /// it can exceed the number of stall WARN lines.
     origination_stalls: u64,
 }
 
@@ -1171,7 +1173,9 @@ impl PayloadMix {
         self.window.lock().origination_stalls
     }
 
-    /// Add the propagation summary's stall WARN count for its last window.
+    /// Add the number of contracts the propagation summary found stalled in
+    /// its last window (not the number of WARN lines; see
+    /// `origination_stalls`).
     pub(crate) fn record_origination_stalls(&self, n: u64) {
         if n == 0 {
             return;
