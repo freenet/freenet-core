@@ -4425,6 +4425,77 @@ mod egress_cap_tests {
         }
     }
 
+    /// #6143: the abandon in the cwnd wait (the scenario above) names its
+    /// cause on the completion sender too, not only the one at the capped
+    /// take (`an_egress_abandon_is_reported_on_the_completion_sender`). Only
+    /// `send_stream` takes a completion sender.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_cwnd_wait_abandon_is_reported_on_the_completion_sender() {
+        let _seed = GlobalRng::seed_guard(15);
+        let time = VirtualTime::new();
+        let cap = EgressCap::new(500, time.clone());
+        cap.charge_unpaced(cap.burst_bytes() as usize - 1_200);
+        let socket = Arc::new(DemuxSocket::wrap(
+            RecordingSocket::new(&time, None),
+            Some(cap),
+        ));
+        let congestion = window(20 * MAX_DATA_SIZE, &time);
+        let filler = {
+            let (congestion, time) = (congestion.clone(), time.clone());
+            GlobalExecutor::spawn(async move {
+                time.sleep(Duration::from_secs(1)).await;
+                let filled = 20 * MAX_DATA_SIZE;
+                let _token = congestion.on_send_with_token(filled);
+                for _ in 0..10_000 {
+                    time.sleep(Duration::from_millis(1)).await;
+                }
+                congestion.release_flightsize(filled);
+                Err::<TransferStats, _>(TransportError::ChannelClosed)
+            })
+        };
+        let payload = Sender::Send.fragment_payload();
+        let (completion_tx, mut completion_rx) = oneshot::channel();
+        let stream = GlobalExecutor::spawn(send_stream(
+            StreamId::next_transport_internal(),
+            Arc::new(AtomicU32::new(0)),
+            socket.clone(),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 20_000)),
+            Bytes::from(vec![0u8; 3 * payload]),
+            Aes128Gcm::new_from_slice(&[7u8; 16]).unwrap(),
+            Arc::new(parking_lot::Mutex::new(
+                SentPacketTracker::new_with_time_source(time.clone()),
+            )),
+            own_connection(&time).1,
+            congestion,
+            time.clone(),
+            None,
+            Some(completion_tx),
+            None,
+        ));
+        let results = drive_results(&time, vec![stream]).await;
+        filler.abort();
+        assert!(
+            matches!(results[0], Err(TransportError::OutboundStreamFailed(_))),
+            "premise: the stream is failed at the deadline: {:?}",
+            results[0]
+        );
+        assert_eq!(
+            socket
+                .egress_cap()
+                .expect("cap")
+                .stats()
+                .streams_abandoned
+                .iter()
+                .sum::<u64>(),
+            1,
+            "premise: blamed on the cap"
+        );
+        assert_eq!(
+            completion_rx.try_recv(),
+            Ok(crate::transport::StreamSendOutcome::EgressAbandoned)
+        );
+    }
+
     /// The check before the take is the one that fires when the window is
     /// free again on the iteration where the gap has just passed the
     /// deadline: the cwnd loop checks only while it is blocked, and nothing
