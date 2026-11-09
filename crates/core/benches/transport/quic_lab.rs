@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 use freenet::transport::quic_lab::set_connection_gap;
 use freenet::transport::quic_lab::{
     Competitor, ConnSample, FRAGMENT_BYTES, LabConfig, LabController, LabMany, LabPair, LabSocket,
-    LinkSpec, StreamsRun, link_report, set_controller, set_gap_on_connection_progress,
+    LinkSpec, StreamsRun, link_counts, link_report, set_controller, set_gap_on_connection_progress,
     set_initial_window, set_min_window, set_mtu, set_piece_bytes, set_rate_start, set_send_window,
     shape_port,
 };
@@ -1406,6 +1406,9 @@ fn quic_lab_cold() {
                     loss,
                     seed: seed + rep,
                 };
+                // No delay, rate or loss: plain loopback, no shaping task.
+                let shaped = (delay_ms, rate_mbit, loss) != (0, 0, 0.0);
+                let link = shaped.then_some(link);
                 let rt = runtime(threads);
                 let line = rt.block_on(async {
                     match transport.as_str() {
@@ -1413,7 +1416,7 @@ fn quic_lab_cold() {
                             let mut pair = LabPair::connect(LabConfig {
                                 window_bytes: window,
                                 bandwidth_limit: None,
-                                link: Some(link),
+                                link,
                             })
                             .await;
                             match mode.as_str() {
@@ -1462,8 +1465,7 @@ fn quic_lab_cold() {
                             }
                         }
                         "udp" => {
-                            let (send, mut got, _tasks, a_port) =
-                                udp_pair(None, Some(link)).await;
+                            let (send, mut got, _tasks, a_port) = udp_pair(None, link).await;
                             let mut wait = async |n: usize| {
                                 tokio::time::timeout(limit, got.recv())
                                     .await
@@ -1520,5 +1522,164 @@ fn quic_lab_cold() {
                 );
             }
         }
+    }
+}
+
+/// A burst of cold connections on an uplink a loss-based flow already uses:
+/// how fast the burst finishes, and what it costs that flow. One `LAB_BURST`
+/// line per repetition.
+///
+/// `LAB_CONNS` connections from one sender socket are set up first, then the
+/// competing flow (`quic_lab::Competitor`) runs alone for `LAB_WARM_S` (20),
+/// then every connection sends one `LAB_STREAM_KIB` (256) message at once.
+/// The flow's throughput over the `LAB_MEASURE_S` (5) before the burst is
+/// the baseline, against the same length from the burst's start. Link:
+/// `LAB_RATE_MBIT` (5), `LAB_DELAY_MS` one way (50), `LAB_QUEUE_KIB` (32),
+/// `LAB_LOSS` (0). `LAB_TRANSPORT` quic or udp, `LAB_WINDOW_KIB` (8192), the
+/// start knobs of [`apply_start_knobs`], `LAB_REPS` (3).
+#[test]
+fn quic_lab_burst() {
+    if !enabled("quic_lab_burst") {
+        return;
+    }
+    let transport = std::env::var("LAB_TRANSPORT").unwrap_or_else(|_| "quic".into());
+    let conns: usize = env_or("LAB_CONNS", 4);
+    let stream_bytes = env_or("LAB_STREAM_KIB", 256usize) * 1024;
+    let window = env_or("LAB_WINDOW_KIB", 8192u64) * 1024;
+    let reps: u64 = env_or("LAB_REPS", 3);
+    let threads: usize = env_or("LAB_THREADS", 4);
+    let rate_mbit: u64 = env_or("LAB_RATE_MBIT", 5);
+    let delay_ms: u64 = env_or("LAB_DELAY_MS", 50);
+    let queue_kib: usize = env_or("LAB_QUEUE_KIB", 32);
+    let loss: f64 = env_or("LAB_LOSS", 0.0);
+    let warm = Duration::from_secs(env_or("LAB_WARM_S", 20));
+    let measure = Duration::from_secs(env_or("LAB_MEASURE_S", 5));
+    let limit = Duration::from_secs(env_or("LAB_LIMIT_S", 120));
+    let knobs = apply_start_knobs();
+    for rep in 0..reps {
+        let link = LinkSpec {
+            rate_bps: rate_mbit * 1_000_000,
+            one_way_delay: Duration::from_millis(delay_ms),
+            queue_bytes: queue_kib * 1024,
+            loss,
+            seed: 1 + rep,
+        };
+        let rt = runtime(threads);
+        let line = rt.block_on(async {
+            enum Side {
+                Quic(LabMany),
+                Udp(
+                    Vec<mpsc::Sender<Vec<u8>>>,
+                    mpsc::UnboundedReceiver<(usize, usize)>,
+                    Vec<tokio::task::JoinHandle<()>>,
+                ),
+            }
+            let (mut side, port) = match transport.as_str() {
+                "quic" => {
+                    let many = LabMany::connect(
+                        LabConfig {
+                            window_bytes: window,
+                            bandwidth_limit: None,
+                            link: Some(link),
+                        },
+                        conns,
+                    )
+                    .await;
+                    let port = many.sender_port().expect("shaped");
+                    (Side::Quic(many), port)
+                }
+                "udp" => {
+                    let (senders, got, tasks, port) = udp_many(conns, link).await;
+                    (Side::Udp(senders, got, tasks), port)
+                }
+                other => panic!("unknown transport {other}"),
+            };
+            let comp = Competitor::start(port).expect("shaped");
+            tokio::time::sleep(warm - measure).await;
+            let base0 = comp.delivered();
+            tokio::time::sleep(measure).await;
+            let base1 = comp.delivered();
+            let (c_off0, c_lost0, c_q0) = comp.counts();
+            let (h_off0, h_drop0) = link_counts(port).expect("shaped");
+            let start = Instant::now();
+            let burst = async {
+                match &mut side {
+                    Side::Quic(many) => {
+                        let run = many.send_all(1, stream_bytes, limit).await;
+                        let mut done: Vec<f64> = run
+                            .last_returned
+                            .iter()
+                            .zip(&run.sent)
+                            .filter(|(_, s)| **s == 1)
+                            .map(|(t, _)| t.as_secs_f64())
+                            .collect();
+                        done.sort_by(f64::total_cmp);
+                        (run.sent.iter().sum::<usize>(), done)
+                    }
+                    Side::Udp(senders, got, _) => {
+                        for sender in senders.iter() {
+                            sender
+                                .send(vec![0x5Au8; stream_bytes])
+                                .await
+                                .expect("driver runs");
+                        }
+                        let mut done = Vec::new();
+                        while done.len() < conns && start.elapsed() < limit {
+                            match tokio::time::timeout(limit, got.recv()).await {
+                                Ok(Some(_)) => done.push(start.elapsed().as_secs_f64()),
+                                Ok(None) | Err(_) => break,
+                            }
+                        }
+                        (done.len(), done)
+                    }
+                }
+            };
+            let watch = async {
+                tokio::time::sleep(measure).await;
+                let during = comp.delivered() - base1;
+                let (c_off1, c_lost1, _) = comp.counts();
+                let (h_off1, h_drop1) = link_counts(port).expect("shaped");
+                (
+                    during,
+                    c_off1 - c_off0,
+                    c_lost1 - c_lost0,
+                    comp.queue_p90_since(c_q0),
+                    h_off1 - h_off0,
+                    h_drop1 - h_drop0,
+                )
+            };
+            let ((delivered, done), (during, c_off, c_lost, c_q90, h_off, h_drop)) =
+                tokio::join!(burst, watch);
+            // Datagrams from the burst's own connections, and those of them
+            // the queue dropped, in the measured window.
+            let own_off = h_off.saturating_sub(c_off);
+            let own_drop = h_drop.saturating_sub(c_lost.min(h_drop));
+            let pick = |p: f64| {
+                if done.is_empty() {
+                    f64::NAN
+                } else {
+                    done[((done.len() - 1) as f64 * p).round() as usize]
+                }
+            };
+            let secs = measure.as_secs_f64();
+            format!(
+                "delivered={delivered}/{conns} done_s_p50={:.2} done_s_max={:.2} \
+                 comp_base_kBps={:.0} comp_during_kBps={:.0} comp_share={:.2} \
+                 comp_loss_during={:.3} comp_queue_p90_ms_during={c_q90:.0} \
+                 burst_datagrams={own_off} burst_dropped~={own_drop}",
+                pick(0.5),
+                pick(1.0),
+                (base1 - base0) as f64 / secs / 1000.0,
+                during as f64 / secs / 1000.0,
+                during as f64 / (base1 - base0).max(1) as f64,
+                c_lost as f64 / c_off.max(1) as f64,
+            )
+        });
+        rt.shutdown_timeout(Duration::from_secs(1));
+        println!(
+            "LAB_BURST transport={transport} {knobs} conns={conns} stream_kib={} \
+             rate_mbit={rate_mbit} delay_ms={delay_ms} queue_kib={queue_kib} loss={loss} rep={rep} {line}",
+            stream_bytes / 1024,
+        );
     }
 }

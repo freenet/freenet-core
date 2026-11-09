@@ -180,6 +180,15 @@ struct Shaper {
     queued_us: parking_lot::Mutex<Vec<u32>>,
 }
 
+/// The uplink of the shaped socket on `port`: datagrams offered and dropped
+/// at the queue so far, counting everything that shares it (a competing
+/// flow too).
+pub fn link_counts(port: u16) -> Option<(u64, u64)> {
+    let shaper = shaper_on(port)?;
+    let stats = shaper.model.host_stats(shaper.local);
+    Some((stats.offered, stats.dropped_queue_full))
+}
+
 /// Every shaped socket, by local port, for [`link_report`] and
 /// [`Competitor::start`].
 static SHAPERS: std::sync::Mutex<Vec<(u16, Arc<Shaper>)>> = std::sync::Mutex::new(Vec::new());
@@ -333,6 +342,24 @@ impl Competitor {
     /// Bytes acknowledged so far.
     pub fn delivered(&self) -> u64 {
         self.delivered.load(Ordering::Relaxed)
+    }
+
+    /// Datagrams offered and lost so far, and how many queueing samples it
+    /// has (for [`Self::queue_p90_since`]).
+    pub fn counts(&self) -> (u64, u64, usize) {
+        (
+            self.offered.load(Ordering::Relaxed),
+            self.lost.load(Ordering::Relaxed),
+            self.queued_us.lock().len(),
+        )
+    }
+
+    /// The 90th percentile of its datagrams' queueing, in milliseconds, over
+    /// the samples from index `from` on.
+    pub fn queue_p90_since(&self, from: usize) -> f64 {
+        let mut samples: Vec<u32> = self.queued_us.lock()[from..].to_vec();
+        samples.sort_unstable();
+        percentile(&samples, 0.9)
     }
 
     /// Its measured loss and queueing so far.
