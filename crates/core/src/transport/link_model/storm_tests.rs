@@ -269,16 +269,21 @@ fn seeds() -> Vec<u64> {
 
 /// The storm rows: 16 connections share the 4 Mbit/s (500 kB/s) uplink,
 /// 512 KiB each, 60 s, with the cap above the uplink so retransmits storm
-/// (a cap under the uplink means no storm, so it cannot fail). At 1 MB/s (2x
-/// the uplink, the planned default cap of #6045) capped retransmits must
-/// complete at least as many streams as main on every seed. At 2 MB/s (4x),
-/// where single seeds vary more, the total and the median per seed must be
-/// at least main's. Either way nothing retransmitted is forgiven past the cap.
+/// (a cap under the uplink means no storm, so it cannot fail). Capped
+/// retransmits must complete at least as many streams as main in total and
+/// at the median per seed, at 1 MB/s (2x the uplink, the planned default cap
+/// of #6045) and at 2 MB/s (4x). At 1 MB/s no seed may also trail main by
+/// more than one stream: that is the measured noise floor of a per-seed
+/// comparison (on 40 seeds no sweep had seen, the head before the deferral
+/// limit trailed main by one stream on two seeds), and it still fails a real
+/// regression such as the -8 on one seed that a wider bucket spacing gave.
+/// Either way nothing retransmitted is forgiven past the cap, and each row
+/// must have deferred something.
 ///
-/// The per-seed comparison is strict on 3 seeds, which is sound only while
-/// the runs are deterministic: a change to scheduling or RNG consumption
-/// elsewhere can move a seed by a stream without any regression here, and
-/// then the 40-seed sweep (`FREENET_STORM_SEEDS`) is what tells the two apart.
+/// The per-seed comparison holds only while the runs are deterministic: a
+/// change to scheduling or RNG consumption elsewhere can move a seed without
+/// any regression here, and then a 40-seed sweep (`FREENET_STORM_SEEDS`) is
+/// what tells the two apart.
 #[test]
 fn storm_under_a_cap_matches_or_beats_main() {
     // Override with `FREENET_STORM_PEERS` to explore the wake rate at a
@@ -288,6 +293,7 @@ fn storm_under_a_cap_matches_or_beats_main() {
         .map(|v| v.trim().parse().expect("decimal"))
         .unwrap_or(16);
     const PER_SEED_CAP: u64 = 1_000_000;
+    const PER_SEED_SLACK: usize = 1;
     // Override with `FREENET_STORM_CAP` (bytes per second) to explore.
     let caps: Vec<u64> = match std::env::var("FREENET_STORM_CAP") {
         Ok(v) => vec![v.trim().parse().expect("decimal bytes per second")],
@@ -313,7 +319,10 @@ fn storm_under_a_cap_matches_or_beats_main() {
                 capped.summary("capped")
             );
             eprintln!("{line}");
-            if capped.cap_forgiven > 0 || (cap == PER_SEED_CAP && capped.completed < main.completed)
+            // At 1 MB/s a seed may trail main by at most PER_SEED_SLACK
+            // streams, the measured noise floor (see the doc comment).
+            if capped.cap_forgiven > 0
+                || (cap == PER_SEED_CAP && capped.completed + PER_SEED_SLACK < main.completed)
             {
                 failures.push(line);
             }
@@ -347,7 +356,7 @@ fn storm_under_a_cap_matches_or_beats_main() {
             capped_deferred > 0,
             "premise: the cap deferred resends in the storm at {cap} B/s"
         );
-        if cap != PER_SEED_CAP && (totals.1 < totals.0 || medians.1 < medians.0) {
+        if totals.1 < totals.0 || medians.1 < medians.0 {
             failures.push(format!(
                 "cap {cap} B/s: total {} / {}, median {} / {}",
                 totals.0, totals.1, medians.0, medians.1
