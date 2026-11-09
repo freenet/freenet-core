@@ -164,9 +164,29 @@ pub(crate) fn is_local_client(
     connection_scope.is_local() && user_context.is_none()
 }
 
-/// Why the lane forwarded a request instead of running it (telemetry).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ForwardReason {
+/// Declares [`ForwardReason`] and its [`ALL`](ForwardReason::ALL) list from
+/// ONE list of variants, so no variant can be left out of `ALL`, and a
+/// variant's index is its position (`as usize` on implicit discriminants).
+/// [`FORWARDED`] is sized from `ALL`, so `record_forward` cannot index past
+/// it.
+macro_rules! forward_reasons {
+    ($($(#[$doc:meta])* $variant:ident,)+) => {
+        /// Why the lane forwarded a request instead of running it (telemetry).
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub(crate) enum ForwardReason {
+            $($(#[$doc])* $variant,)+
+        }
+
+        impl ForwardReason {
+            /// Every reason, in declaration order, which is
+            /// [`index`](Self::index) order.
+            pub(crate) const ALL: [ForwardReason; [$(ForwardReason::$variant,)+].len()] =
+                [$(Self::$variant,)+];
+        }
+    };
+}
+
+forward_reasons! {
     /// The loop holds the delegate (a claim, a claim waiting, a pending unit).
     Busy,
     /// A park entry holds the delegate.
@@ -179,39 +199,20 @@ pub(crate) enum ForwardReason {
     NotRunnable,
     /// A forged node-only inbound message: the loop refuses it.
     Forged,
-    /// The lane task has exited (it panicked outside a run): the request
-    /// went to the loop because there is no lane. Counted both for requests
-    /// the dying lane handed over and for later ones that found its intake
-    /// closed.
+    /// The lane task has exited: the request went to the loop because
+    /// there is no lane. Counted both for requests the dying lane handed
+    /// over and for later ones that found its intake closed, which also
+    /// happens while the node shuts down.
     LaneDown,
 }
 
 impl ForwardReason {
-    /// Every reason, in [`index`](Self::index) order.
-    pub(crate) const ALL: [ForwardReason; 7] = [
-        Self::Busy,
-        Self::Parked,
-        Self::LoopOwned,
-        Self::UnitBound,
-        Self::NotRunnable,
-        Self::Forged,
-        Self::LaneDown,
-    ];
     pub(crate) const COUNT: usize = Self::ALL.len();
 
-    /// Index into [`FORWARDED`]. Exhaustive, so a new reason does not
-    /// compile until it has one; the const check below rejects an index
-    /// that does not match its position in [`ALL`](Self::ALL).
+    /// Index into [`FORWARDED`]: the variant's position in the declaration
+    /// (and so in [`ALL`](Self::ALL)).
     pub(crate) const fn index(self) -> usize {
-        match self {
-            Self::Busy => 0,
-            Self::Parked => 1,
-            Self::LoopOwned => 2,
-            Self::UnitBound => 3,
-            Self::NotRunnable => 4,
-            Self::Forged => 5,
-            Self::LaneDown => 6,
-        }
+        self as usize
     }
 }
 
@@ -243,6 +244,24 @@ pub(crate) struct RoutingCounts {
 impl RoutingCounts {
     pub(crate) fn forwarded(&self, reason: ForwardReason) -> u64 {
         self.forwarded[reason.index()]
+    }
+
+    /// Copy these counts into the router snapshot's fields. The match is
+    /// exhaustive, so a new reason does not compile until it has a field.
+    pub(crate) fn write_into(&self, snapshot: &mut crate::router::RouterSnapshotInfo) {
+        snapshot.delegate_lane_runs = Some(self.lane_runs);
+        for reason in ForwardReason::ALL {
+            let field = match reason {
+                ForwardReason::Busy => &mut snapshot.delegate_lane_forwarded_busy,
+                ForwardReason::Parked => &mut snapshot.delegate_lane_forwarded_parked,
+                ForwardReason::LoopOwned => &mut snapshot.delegate_lane_forwarded_loop_owned,
+                ForwardReason::UnitBound => &mut snapshot.delegate_lane_forwarded_unit_bound,
+                ForwardReason::NotRunnable => &mut snapshot.delegate_lane_forwarded_not_runnable,
+                ForwardReason::Forged => &mut snapshot.delegate_lane_forwarded_forged,
+                ForwardReason::LaneDown => &mut snapshot.delegate_lane_forwarded_lane_down,
+            };
+            *field = Some(self.forwarded(reason));
+        }
     }
 }
 
@@ -889,10 +908,26 @@ pub(crate) async fn run_lane(
             // a sender that took its permit before the close may still be
             // completing its send, and `try_recv` reports that as `Empty`.
             // `recv` returns `None` only once every permit is used or dropped.
+            //
+            // Each hand-over runs under its own `catch_unwind`: if the panic
+            // that killed the lane came from the forwarder, it may panic
+            // again, and one such panic must not drop every request still
+            // buffered behind it.
             intake.close();
             while let Some(request) = intake.recv().await {
                 let reason = not_lane_runnable(&request).unwrap_or(ForwardReason::LaneDown);
-                forward_to_loop(&gate, &*forward, request, reason);
+                let delegate_key = request.req.key().clone();
+                let handed_over = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    forward_to_loop(&gate, &*forward, request, reason)
+                }));
+                if let Err(payload) = handed_over {
+                    tracing::error!(
+                        %delegate_key,
+                        reason = %panic_reason(&*payload),
+                        "Handing a buffered delegate request to the contract loop PANICKED; \
+                         that client gets an error, the rest are still handed over"
+                    );
+                }
             }
         }
     }
@@ -1513,6 +1548,57 @@ mod tests {
         assert!(tx.is_closed());
     }
 
+    /// A forwarder that panics again while the dying lane hands over its
+    /// buffer loses only the request it panicked on; the rest still reach
+    /// the loop.
+    ///
+    /// FALSIFY: call `forward_to_loop` in the drain without its
+    /// `catch_unwind`; the second panic ends the task and requests 3 and 4
+    /// are dropped.
+    #[tokio::test]
+    async fn a_panic_while_handing_over_loses_only_that_request() {
+        /// Panics on its first two forwards, then collects.
+        struct PanicsTwice(
+            std::sync::atomic::AtomicUsize,
+            tokio::sync::mpsc::UnboundedSender<Forwarded>,
+        );
+        impl LoopForward for PanicsTwice {
+            fn forward(&self, request: LaneRequest, ticket: LaneTicket) {
+                if self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2 {
+                    panic!("forwarder bug");
+                }
+                self.1.send((request, ticket)).expect("receiver alive");
+            }
+        }
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let (ftx, mut frx) = tokio::sync::mpsc::unbounded_channel();
+        for i in 1..=4u8 {
+            let k = key(60 + i);
+            let (r, a) = request_with(&k, i as u64, DelegateRequest::UnregisterDelegate(k.clone()));
+            std::mem::forget(a);
+            tx.try_send(r).expect("room");
+        }
+        let lane = tokio::spawn(run_lane(
+            Arc::new(Counts(Default::default())),
+            DelegateGate::new(),
+            Arc::new(PanicsTwice(Default::default(), ftx)),
+            rx,
+        ));
+        tokio::time::timeout(Duration::from_secs(5), lane)
+            .await
+            .expect("the lane ends")
+            .expect("both panics are caught");
+        let mut ids = Vec::new();
+        while let Ok((r, _)) = frx.try_recv() {
+            ids.push(r.id);
+        }
+        assert_eq!(
+            ids,
+            vec![3, 4],
+            "the requests after the second panic still reach the loop"
+        );
+    }
+
     /// A dying lane drains its intake with `recv`, so a sender that reserved
     /// a slot BEFORE the close still has its request handed to the loop.
     /// Each drained request is counted by its real reason (`LaneDown` for
@@ -1596,6 +1682,49 @@ mod tests {
         for (i, r) in ForwardReason::ALL.iter().enumerate() {
             assert_eq!(r.index(), i);
         }
+    }
+
+    /// Each reason's count lands in its own router snapshot field.
+    ///
+    /// FALSIFY: swap two fields in `RoutingCounts::write_into`'s match.
+    #[test]
+    fn each_forward_reason_lands_in_its_own_snapshot_field() {
+        use arbitrary::{Arbitrary, Unstructured};
+        let counts = RoutingCounts {
+            lane_runs: 99,
+            forwarded: std::array::from_fn(|i| 100 + i as u64),
+        };
+        let mut u = Unstructured::new(&[0u8; 4096]);
+        let mut s = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
+            .expect("construct RouterSnapshotInfo for test");
+        counts.write_into(&mut s);
+        let want = |r: ForwardReason| Some(100 + r.index() as u64);
+        assert_eq!(s.delegate_lane_runs, Some(99));
+        assert_eq!(s.delegate_lane_forwarded_busy, want(ForwardReason::Busy));
+        assert_eq!(
+            s.delegate_lane_forwarded_parked,
+            want(ForwardReason::Parked)
+        );
+        assert_eq!(
+            s.delegate_lane_forwarded_loop_owned,
+            want(ForwardReason::LoopOwned)
+        );
+        assert_eq!(
+            s.delegate_lane_forwarded_unit_bound,
+            want(ForwardReason::UnitBound)
+        );
+        assert_eq!(
+            s.delegate_lane_forwarded_not_runnable,
+            want(ForwardReason::NotRunnable)
+        );
+        assert_eq!(
+            s.delegate_lane_forwarded_forged,
+            want(ForwardReason::Forged)
+        );
+        assert_eq!(
+            s.delegate_lane_forwarded_lane_down,
+            want(ForwardReason::LaneDown)
+        );
     }
 
     /// A panic inside ONE delegate run fails that request only: its client

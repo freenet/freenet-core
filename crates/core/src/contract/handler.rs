@@ -629,6 +629,10 @@ impl ContractHandlerChannel<SenderHalve> {
             Err(mpsc::error::TrySendError::Closed(request)) => {
                 // No lane (its task exited): the request goes to the loop.
                 // Counted, so traffic after a lane death does not look flat.
+                // The count also ticks while the node shuts down, when the
+                // lane is stopped with the loop. No loop-owned mark: the mark
+                // only tells the lane to forward, and no lane is left to
+                // check it.
                 super::delegate_lane::record_forward(super::delegate_lane::ForwardReason::LaneDown);
                 Some(InternalCHEvent {
                     ev: ContractHandlerEvent::DelegateRequest {

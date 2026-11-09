@@ -2315,21 +2315,11 @@ impl Ring {
             if let Some((refused, panics, deaths, dropped)) =
                 crate::node::network_status::delegate_lane_counts()
             {
-                use crate::contract::DelegateForwardReason as R;
                 snapshot.delegate_lane_requests_refused = Some(refused);
                 snapshot.delegate_lane_panics = Some(panics);
                 snapshot.delegate_lane_deaths = Some(deaths);
                 snapshot.inter_delegate_messages_dropped = Some(dropped);
-                let counts = crate::contract::delegate_lane_routing_counts();
-                snapshot.delegate_lane_runs = Some(counts.lane_runs);
-                snapshot.delegate_lane_forwarded_busy = Some(counts.forwarded(R::Busy));
-                snapshot.delegate_lane_forwarded_parked = Some(counts.forwarded(R::Parked));
-                snapshot.delegate_lane_forwarded_loop_owned = Some(counts.forwarded(R::LoopOwned));
-                snapshot.delegate_lane_forwarded_unit_bound = Some(counts.forwarded(R::UnitBound));
-                snapshot.delegate_lane_forwarded_not_runnable =
-                    Some(counts.forwarded(R::NotRunnable));
-                snapshot.delegate_lane_forwarded_forged = Some(counts.forwarded(R::Forged));
-                snapshot.delegate_lane_forwarded_lane_down = Some(counts.forwarded(R::LaneDown));
+                crate::contract::delegate_lane_routing_counts().write_into(&mut snapshot);
             }
 
             // Streamed-transfer abort counters (Group B): isolate the

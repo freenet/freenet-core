@@ -18,9 +18,7 @@ mod executor;
 mod fair_queue;
 #[cfg(all(test, feature = "wasmtime-backend", feature = "redb"))]
 mod wakeup_wasm_tests;
-pub(crate) use delegate_lane::{
-    ForwardReason as DelegateForwardReason, routing_counts as delegate_lane_routing_counts,
-};
+pub(crate) use delegate_lane::routing_counts as delegate_lane_routing_counts;
 pub(crate) use fair_queue::Priority;
 /// Fair-queue occupancy for the status snapshot (#4917). Re-exported rather
 /// than widening `fair_queue` itself, which is otherwise private to this
@@ -5795,8 +5793,15 @@ async fn dispatch_delegate_request<CH, P>(
     // loop: what its first `process()` call returned. See `RunSeed`.
     first_values: Option<Vec<OutboundDelegateMsg>>,
     // The claim and loop-owned mark held for THIS run only: released just
-    // before the client is answered on every path that answers, or when this
-    // returns without answering (queued behind a park, or parked).
+    // before the client is answered on every path here that answers, or when
+    // this returns without answering (queued behind a park, or parked).
+    // That covers only what `release` holds. Some callers hold a claim of
+    // their own across this call: `claim_delegate` running a pending unit
+    // (it passes an empty `release`), and the resume drain in
+    // `handle_delegate_resume`. On those paths the client is answered while
+    // that claim is still held. That costs latency only: the client's next
+    // request for the delegate is forwarded as `Busy` and waits for the
+    // loop, in order.
     release: delegate_lane::LoopRelease,
 ) where
     CH: ContractHandler + Send + 'static,
@@ -8530,11 +8535,26 @@ mod tests {
     /// while the delegate executor is repairing a record on the lane.
     ///
     /// FALSIFY: set `clean_delegate_tmp_records: true` in
-    /// `SharedStores::new`, or drop it from `create_delegate_executor`.
+    /// `SharedStores::new`; drop it from `create_delegate_executor`; or pass
+    /// `false` instead of the flag to `DelegateStore::new_with_shared` in
+    /// `get_runtime_stores`.
     #[test]
     fn only_the_delegate_executor_cleans_temporary_delegate_records() {
         let pool = strip_comments(include_str!("contract/executor/runtime/pool.rs"));
         let shared = strip_comments(include_str!("wasm_runtime.rs"));
+        let executor = strip_comments(include_str!("contract/executor.rs"));
+        let stores = fn_region(&executor, "    pub(crate) fn get_runtime_stores(");
+        let call = stores
+            .split_once("DelegateStore::new_with_shared(")
+            .expect("the pool executors' delegate store is built with new_with_shared")
+            .1;
+        let args = &call[..call.find(")?").expect("the call's end")];
+        assert!(
+            args.trim_end()
+                .trim_end_matches(',')
+                .ends_with("shared.clean_delegate_tmp_records"),
+            "the flag reaches the store: {args}"
+        );
         assert_eq!(
             pool.matches("clean_delegate_tmp_records: true").count(),
             1,
@@ -13037,14 +13057,23 @@ mod hol_4391_tests {
         let key = delegate_key_n(0x6C);
         let gate = delegate_lane::DelegateGate::new();
         let during = Arc::new(std::sync::Mutex::new(Vec::new()));
+        // The run waits (bounded) until the test has registered its waker on
+        // the answer, so the loop cannot answer before the waker is in place.
+        let registered = Arc::new(std::sync::atomic::AtomicBool::new(false));
         {
             let rt = handler.runtime_mut();
             rt.delegate_script.lock().unwrap().push_back(ScriptedRun {
                 outbound: vec![app_out(b"done")],
                 writes_context: None,
             });
-            let (g, d) = (gate.clone(), during.clone());
+            let (g, d, r) = (gate.clone(), during.clone(), registered.clone());
             *rt.delegate_run_hook.lock().unwrap() = Some(Box::new(move |k: &DelegateKey| {
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                while !r.load(std::sync::atomic::Ordering::SeqCst)
+                    && std::time::Instant::now() < deadline
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
                 d.lock().unwrap().push(g.is_tracking(k));
             }));
         }
@@ -13071,6 +13100,7 @@ mod hol_4391_tests {
         }));
         let snap = SnapshotOnWake::new(&gate, &key);
         snap.register(&mut answer);
+        registered.store(true, std::sync::atomic::Ordering::SeqCst);
         wait_until("the client to be answered", || {
             snap.tracked_at_wake().is_some()
         })
