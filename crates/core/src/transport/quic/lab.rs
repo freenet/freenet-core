@@ -85,6 +85,18 @@ pub fn set_gap_on_connection_progress(_on: bool) {}
 /// own connection window applies).
 pub fn set_connection_gap(_window: Option<Duration>) {}
 
+/// The datagram size for endpoints built from now on (both ends must agree,
+/// as they do in the lab); `None` for the node's 1200. Discovery stays off.
+pub fn set_mtu(bytes: Option<u16>) {
+    super::config::lab::MTU.store(bytes.unwrap_or(0), Ordering::Relaxed);
+}
+
+/// The size of the pieces a streamed send writes into quinn; `None` for the
+/// node's (one UDP fragment's payload).
+pub fn set_piece_bytes(bytes: Option<usize>) {
+    super::config::lab::PIECE_BYTES.store(bytes.unwrap_or(0) as u64, Ordering::Relaxed);
+}
+
 /// The congestion controller's initial window in bytes for connections
 /// built from now on; `None` for quinn's (10 datagrams, 12,000 bytes).
 pub fn set_initial_window(bytes: Option<u64>) {

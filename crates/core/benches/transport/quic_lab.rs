@@ -35,7 +35,8 @@ use freenet::transport::quic_lab::set_connection_gap;
 use freenet::transport::quic_lab::{
     Competitor, ConnSample, FRAGMENT_BYTES, LabConfig, LabController, LabMany, LabPair, LabSocket,
     LinkSpec, StreamsRun, link_report, set_controller, set_gap_on_connection_progress,
-    set_initial_window, set_min_window, set_rate_start, set_send_window, shape_port,
+    set_initial_window, set_min_window, set_mtu, set_piece_bytes, set_rate_start, set_send_window,
+    shape_port,
 };
 use freenet::transport::{TRANSPORT_METRICS, TransportKeypair, create_connection_handler};
 use tokio::sync::mpsc;
@@ -312,7 +313,11 @@ fn apply_start_knobs() -> String {
     set_initial_window((iw > 0).then_some(iw * 1200));
     let rate: u64 = env_or("LAB_RATE_START_KBPS", 0);
     set_rate_start((rate > 0).then_some(rate * 1000));
-    format!("iw_pkts={iw} rate_start_kbps={rate}")
+    let mtu: u16 = env_or("LAB_MTU", 0);
+    set_mtu((mtu > 0).then_some(mtu));
+    let piece: usize = env_or("LAB_PIECE_BYTES", 0);
+    set_piece_bytes((piece > 0).then_some(piece));
+    format!("iw_pkts={iw} rate_start_kbps={rate} mtu={mtu} piece_bytes={piece}")
 }
 
 /// A UDP-transport pair on loopback: send a message with `send`, read each
@@ -1426,7 +1431,17 @@ fn quic_lab_cold() {
                                 other => panic!("unknown mode {other}"),
                             }
                             let cwnd_before = pair.cwnd();
+                            // A snapshot resets the counters, so the next is this transfer's.
+                            ingress_drops();
+                            let cpu0 = process_cpu();
                             let result = pair.transfer_timed(bytes, limit).await;
+                            let cpu = process_cpu() - cpu0;
+                            let (src, queue) = ingress_drops();
+                            let drops = format!(
+                                "ingress_source_full={src} ingress_queue_full={queue} \
+                                 cpu_ns_per_byte={:.1}",
+                                cpu.as_nanos() as f64 / bytes as f64
+                            );
                             let link = pair
                                 .sender_port()
                                 .and_then(link_report)
@@ -1434,7 +1449,7 @@ fn quic_lab_cold() {
                             match result {
                                 Ok((arrived, done)) => format!(
                                     "ok=1 arrival_s={:.3} sent_s={:.3} cwnd_before={cwnd_before} \
-                                     {} sender_link[{link}]",
+                                     {drops} {} sender_link[{link}]",
                                     arrived.as_secs_f64(),
                                     done.as_secs_f64(),
                                     pair.describe()

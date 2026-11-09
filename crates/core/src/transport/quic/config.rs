@@ -457,7 +457,7 @@ pub(crate) fn endpoint_config_with_cid_key(cid_key: [u8; 32]) -> std::io::Result
     GlobalRng::fill_bytes(&mut seed);
     config
         // MAX_UDP_PAYLOAD (1200) is within quinn's accepted 1200..=65527.
-        .max_udp_payload_size(MAX_UDP_PAYLOAD)
+        .max_udp_payload_size(lab_mtu())
         .unwrap_or_else(|_| unreachable!("1200 is quinn's minimum UDP payload size"))
         .supported_versions(vec![QUIC_VERSION])
         // Must stay false: a cleared fixed bit could make a short-header
@@ -486,11 +486,33 @@ fn send_window(window: u64) -> u64 {
     window
 }
 
+/// The datagram size: [`MAX_UDP_PAYLOAD`], or in a bench build the QUIC
+/// lab's override (`lab::MTU`, 0 for none).
+fn lab_mtu() -> u16 {
+    #[cfg(feature = "bench")]
+    {
+        let lab = lab::MTU.load(std::sync::atomic::Ordering::Relaxed);
+        if lab > 0 {
+            return lab;
+        }
+    }
+    MAX_UDP_PAYLOAD
+}
+
 /// Bench-only switches for the QUIC lab (`quic::lab`). Nothing in a node
 /// sets them.
 #[cfg(feature = "bench")]
 pub(crate) mod lab {
-    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::{AtomicU16, AtomicU64};
+
+    /// The datagram size (initial and minimum MTU, and the largest UDP
+    /// payload the endpoint accepts) for endpoints and connections built
+    /// after it is set; 0 keeps 1200. Discovery stays off.
+    pub(crate) static MTU: AtomicU16 = AtomicU16::new(0);
+
+    /// The size of the pieces a streamed send writes into quinn; 0 keeps
+    /// `FRAGMENT_PAYLOAD_SIZE`.
+    pub(crate) static PIECE_BYTES: AtomicU64 = AtomicU64::new(0);
 
     /// quinn's send window (bytes buffered and unacknowledged, across the
     /// connection's streams) for connections built after it is set; 0 keeps
@@ -522,8 +544,8 @@ pub(crate) fn transport_config<T: TimeSource>(
         .receive_window(VarInt::from_u32(window as u32))
         .send_window(send_window(window))
         .send_fairness(true)
-        .initial_mtu(MAX_UDP_PAYLOAD)
-        .min_mtu(MAX_UDP_PAYLOAD)
+        .initial_mtu(lab_mtu())
+        .min_mtu(lab_mtu())
         .mtu_discovery_config(None::<MtuDiscoveryConfig>)
         .pad_to_mtu(false)
         .enable_segmentation_offload(false)

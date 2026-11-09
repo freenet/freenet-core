@@ -1196,7 +1196,16 @@ impl QuicPath {
             (Some(self.stream_slot().await?), self.pacing())
         };
         let mut send = self.open(&header, &[], slot, pacing, progress).await?;
-        for piece in payload.chunks(FRAGMENT_PAYLOAD_SIZE) {
+        #[cfg(feature = "bench")]
+        let piece_bytes = match super::config::lab::PIECE_BYTES
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            0 => FRAGMENT_PAYLOAD_SIZE,
+            n => n as usize,
+        };
+        #[cfg(not(feature = "bench"))]
+        let piece_bytes = FRAGMENT_PAYLOAD_SIZE;
+        for piece in payload.chunks(piece_bytes) {
             send.take_turns().await;
             send.write_paced(piece).await?;
             if let Some(observer) = observer {
