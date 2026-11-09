@@ -598,19 +598,20 @@ WHEN adding a way for a broadcast leg, fan-out or heal to end:
 The fields: `client_originated` (a client apply that changed
 state); `sent_delta` / `sent_full` (handed to the bridge); the skips
 `skip_summary_equal`, `skip_cached_converged`, `skip_probe_converged`,
-`skip_empty_delta`, `skip_not_hosted`, `skip_no_address`; `send_failed`;
-transport `wire_short` (one packet), `wire_stream` and its fate
+`skip_empty_delta`, `skip_not_hosted`, `skip_no_address`, `skip_superseded`;
+`send_failed`; transport `wire_short` (one packet), `wire_stream` and its fate
 `wire_stream_delivered` / `_failed` / `_egress_abandoned`, `wire_unobserved`
 (QUIC path), `wire_send_failed`; `fanout_event_dropped` /
-`heal_event_dropped` (`try_notify` refused); and the receiver's `rx_dedup`,
+`heal_event_dropped` (`try_notify` refused); `heal_target` (a heal's leg,
+registered when its peer resolves); and the receiver's `rx_dedup`,
 `rx_already_applied`, `rx_backoff`.
 
 `send_failed` is a leg the bridge refused (the send or stream dispatch
 returned `Err`, or the payload did not serialize); that leg has no `sent_*`.
-`wire_send_failed` is the connection task failing to send an inline
-broadcast the bridge already took; that leg counted `sent_*`, possibly in an
-earlier window (a queued message failing while the connection drains before
-shutdown). Like every `wire_*` count it never raises the WARN.
+`wire_send_failed` is the connection task failing to send (or to serialize)
+an inline broadcast the bridge already took; that leg counted `sent_*`,
+possibly in an earlier window (a queued message failing while the connection
+drains before shutdown). Like every `wire_*` count it never raises the WARN.
 
 `update_propagation_stalled` WARNs (counted as `origination_stalls` in
 telemetry) at the end of window W for a contract that, over W-1 and W
@@ -618,9 +619,16 @@ together, had:
 
 - a client update in W-1;
 - every resolved leg ended unsent: the `skip_*` counts plus `send_failed`
-  reach `targets_total` (above zero). Or a fan-out was dropped
-  (`fanout_event_dropped`);
+  reach the legs resolved, `targets_total` (fan-outs) plus `heal_target`
+  (heals), above zero. Or a fan-out was dropped (`fanout_event_dropped`);
 - nothing handed to the bridge (`sent_delta + sent_full == 0`).
+
+A queued leg replaced by a newer fan-out or heal for the same (contract,
+peer) pair counts `skip_superseded`: its update rides on the newer leg, whose
+own outcome decides whether anything was sent. Before #6143 a superseded leg
+recorded nothing, so a burst of client updates resolved more legs than could
+ever end, and the stall could not fire. A heal registers its own leg, so a
+heal's skip never stands in for a fan-out leg's outcome.
 
 W is grace for a leg queued late in W-1, and reading both windows catches an
 update applied at the end of W-1 whose fan-out is processed in W. The state
@@ -677,10 +685,11 @@ transport losses (#6145).
 
 Two ways it can be wrong: the drop counter cannot tell a client fan-out from
 a relayed one, so a relayed fan-out dropped beside a client update whose legs
-are still held is counted as the client's (skips need their own targets, but
-legs of a fan-out whose targets were counted before W-1 can skip in W-1 and
-count toward the client's); and a contract whose window-W counts were
-refused at the 4096-contract cap reads as having sent nothing in W.
+are still held is counted as the client's (skips need their own legs, which
+relayed fan-outs and heals both register, but legs of a fan-out whose targets
+were counted before W-1 can skip in W-1 and count toward the client's); and
+a contract whose window-W counts were refused at the 4096-contract cap reads
+as having sent nothing in W.
 
 The INFO summary's per-contract lines are the top 8 by update activity, so a
 stalled contract can fall into the "...and N others" rollup behind busier

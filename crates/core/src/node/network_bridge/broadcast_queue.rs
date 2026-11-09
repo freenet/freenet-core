@@ -792,6 +792,26 @@ pub(super) async fn fanout_send_needed(
     }
 }
 
+/// The connected peer a targeted heal (`SyncStateToPeer`) for `key` goes
+/// to, `None` when no connection has `target_addr`. A resolved heal
+/// registers its leg (`HealTarget`, #6143), as a fan-out registers its
+/// resolved targets, so the stall check has a leg for that leg's outcome.
+/// Without it a heal's skip counts toward a fan-out leg instead, and
+/// repeated converged heals can make a client update whose legs are only
+/// held look as if every leg ended unsent.
+pub(super) fn resolve_heal_target(
+    op_manager: &OpManager,
+    key: &ContractKey,
+    target_addr: std::net::SocketAddr,
+) -> Option<PeerKeyLocation> {
+    let target = op_manager
+        .ring
+        .connection_manager
+        .get_peer_by_addr(target_addr)?;
+    record_propagation_event(op_manager, key.id(), PropagationEvent::HealTarget);
+    Some(target)
+}
+
 // The `BroadcastQueue` struct (constants, types, impl) is only used in the
 // production `p2p_protoc` path. Under `simulation_tests` the code routes
 // through `broadcast_to_single_peer` directly (see p2p_protoc.rs), so the
@@ -1486,12 +1506,27 @@ mod queue {
                 &target,
                 new_state.size(),
             );
-            self.enqueue_in_lane(lane, key, target, new_state, fanout)
+            let superseded = self
+                .enqueue_in_lane(lane, key, target, new_state, fanout)
                 .await;
+            if superseded {
+                // #6143: the replaced leg ends here without a send of its own.
+                // Its update rides on this newer leg, whose outcome decides
+                // whether anything was sent. Each fan-out or heal registered
+                // its own target, so without this the legs never add up.
+                crate::operations::update::propagation_stats::record_propagation_event(
+                    op_manager,
+                    key.id(),
+                    crate::operations::update::propagation_stats::PropagationEvent::SkipSuperseded,
+                );
+            }
         }
 
         /// The lane-agnostic half of [`Self::enqueue`], split out so tests can
         /// drive the real queue without standing up an `OpManager`.
+        ///
+        /// Returns whether the entry replaced a queued one for the same
+        /// (contract, peer) pair, which [`Self::enqueue`] counts.
         async fn enqueue_in_lane(
             &self,
             lane: QueuedPayloadClass,
@@ -1499,7 +1534,7 @@ mod queue {
             target: PeerKeyLocation,
             new_state: WrappedState,
             fanout: FanoutTargets,
-        ) {
+        ) -> bool {
             let dedup_key = (key, target.clone());
             let state_size = new_state.size();
             let mut queue = self.queue.lock().await;
@@ -1585,6 +1620,7 @@ mod queue {
 
             drop(queue);
             self.notify_for(lane).notify_one();
+            previous_lane.is_some()
         }
 
         /// Start the background workers that drain the queue with bounded
@@ -2095,7 +2131,7 @@ mod queue {
                 "enqueue must derive its lane from lane_for — not merely mention it"
             );
             assert!(
-                enq_body.contains("self.enqueue_in_lane(lane,"),
+                enq_body.contains(".enqueue_in_lane(lane,"),
                 "...and must enqueue with THAT lane; deriving it and then passing a \
                  different one would pass the check above"
             );
@@ -7061,6 +7097,136 @@ mod tests {
             );
         }
         assert_eq!(recorded, vec![None, None], "nothing recorded for the peer");
+    }
+
+    /// #6143 review round 6: a newer leg for a (contract, peer) pair still
+    /// queued replaces the queued one, and the real `enqueue` counts the
+    /// replaced leg as `skip_superseded`, in the per-contract summary and in
+    /// telemetry. Before this the replaced leg recorded nothing, so a burst
+    /// of client updates resolved more legs than could ever end.
+    #[cfg(not(feature = "simulation_tests"))]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_superseded_queued_leg_is_counted() {
+        use freenet_stdlib::prelude::WrappedState;
+
+        use crate::operations::update::propagation_stats::PropagationEvent as Ev;
+
+        let node =
+            one_peer_node("bq-6143-superseded", WrappedState::new(vec![3u8; 32]), true).await;
+        let op_manager = &node.op_manager;
+        // No workers started, so every entry stays queued.
+        let queue = super::BroadcastQueue::new();
+        let enqueue = |byte: u8| {
+            queue.enqueue(
+                op_manager,
+                node.key,
+                node.target.clone(),
+                WrappedState::new(vec![byte; 32]),
+                super::no_fanout(),
+            )
+        };
+        let superseded = || {
+            op_manager
+                .update_propagation_stats
+                .events_for_test(node.key.id())
+                .get(Ev::SkipSuperseded)
+        };
+
+        enqueue(4).await;
+        assert_eq!(superseded(), 0, "a first leg replaces nothing");
+        enqueue(5).await;
+        assert_eq!(superseded(), 1, "the queued leg was replaced");
+        enqueue(6).await;
+        assert_eq!(superseded(), 2);
+        assert_eq!(
+            op_manager
+                .payload_mix
+                .propagation_event_for_test(Ev::SkipSuperseded),
+            2,
+            "telemetry counts what the summary counts"
+        );
+    }
+
+    /// #6143 review round 6: a targeted heal registers its leg
+    /// (`heal_target`) once its peer resolves, so a heal's skip accounts for
+    /// that leg and not for a fan-out's. An unknown peer starts no leg. And
+    /// `handle_sync_state_to_peer` resolves its peer through this, after the
+    /// broken-contract gate and before either send path.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_resolved_heal_registers_its_leg() {
+        use freenet_stdlib::prelude::WrappedState;
+
+        use crate::operations::update::propagation_stats::PropagationEvent as Ev;
+
+        let node = one_peer_node("bq-6143-heal-leg", WrappedState::new(vec![3u8; 32]), true).await;
+        let op_manager = &node.op_manager;
+        let heal_legs = || {
+            op_manager
+                .update_propagation_stats
+                .events_for_test(node.key.id())
+                .get(Ev::HealTarget)
+        };
+        let addr = node
+            .target
+            .socket_addr()
+            .expect("premise: the connected peer has an address");
+
+        let resolved = super::resolve_heal_target(op_manager, &node.key, addr);
+        assert_eq!(
+            resolved.map(|t| t.pub_key().clone()),
+            Some(node.target.pub_key().clone()),
+            "the heal goes to the connected peer"
+        );
+        assert_eq!(heal_legs(), 1);
+        assert_eq!(
+            op_manager
+                .payload_mix
+                .propagation_event_for_test(Ev::HealTarget),
+            1,
+            "telemetry counts what the summary counts"
+        );
+
+        let unknown: std::net::SocketAddr = "203.0.113.9:4000".parse().unwrap();
+        assert!(super::resolve_heal_target(op_manager, &node.key, unknown).is_none());
+        assert_eq!(heal_legs(), 1, "an unresolved heal starts no leg");
+
+        // The heal handler lives on the event loop's state, which no test
+        // builds, so its use of this is pinned by source: comments and
+        // whitespace removed, inside the handler, between the gate and the
+        // sends.
+        let src = include_str!("p2p_protoc/broadcast.rs");
+        let signature = "\n    pub(super) async fn handle_sync_state_to_peer(";
+        assert_eq!(src.matches(signature).count(), 1, "heal handler signature");
+        let start = src.find(signature).unwrap() + 1;
+        let len = src[start..]
+            .find("\n    }\n")
+            .expect("end of the heal handler");
+        let body: String = src[start..start + len]
+            .lines()
+            .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+            .flat_map(str::chars)
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let call = "letSome(target)=super::super::broadcast_queue::resolve_heal_target(\
+                    op_manager,&key,target_addr)else{";
+        let at = body
+            .find(call)
+            .expect("the heal handler resolves its peer here");
+        let gate = body.find("is_contract_broken(&key)").expect("broken gate");
+        let first_send = [".enqueue(", "broadcast_to_single_peer("]
+            .iter()
+            .filter_map(|send| body.find(send))
+            .min()
+            .expect("the heal's sends");
+        assert!(
+            gate < at && at < first_send,
+            "gate, then resolve, then send"
+        );
+        assert_eq!(
+            body.matches("get_peer_by_addr(").count(),
+            0,
+            "one resolution"
+        );
     }
 
     /// #6143: driving the REAL `broadcast_to_single_peer`, each exit counts
