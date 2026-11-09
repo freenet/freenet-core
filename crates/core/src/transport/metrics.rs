@@ -21,6 +21,7 @@
 //! }
 //! ```
 
+#[cfg(any(test, feature = "testing"))]
 use dashmap::DashMap;
 use std::net::SocketAddr;
 use std::sync::LazyLock;
@@ -765,7 +766,7 @@ pub struct TransportMetrics {
     //
     // When the table is full a new entry evicts the least-recently-updated
     // entry (LRU on `last_seen_tick`).
-    per_peer_stats: DashMap<SocketAddr, PeerTransferStats>,
+    per_peer_stats: crate::util::DecisionDashMap<SocketAddr, PeerTransferStats>,
 
     // Monotonically increasing tick stamped onto each per-peer entry on
     // update. Used purely for LRU ordering — no wall-clock semantics, so
@@ -1255,7 +1256,7 @@ impl TransportMetrics {
             max_rtt_us: AtomicU64::new(0),
             rtt_sum_us: AtomicU64::new(0),
             rtt_samples: AtomicU32::new(0),
-            per_peer_stats: DashMap::new(),
+            per_peer_stats: Default::default(),
             per_peer_tick: AtomicU64::new(0),
             loss: LossCounters::default(),
             nat_detail: NatDetailCounters::default(),

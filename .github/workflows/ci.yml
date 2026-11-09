@@ -1451,14 +1451,16 @@ jobs:
             # e2e lib tests (`kind(lib) & test(sim_e2e_tests)`) — so the ~3000
             # ordinary freenet lib unit tests (already covered by the
             # workspace test job) are NOT re-run here. They were all built with
-            # --no-run above.
+            # --no-run above. `test(decision_hasher)` adds the unit tests of
+            # `util::decision_hasher` (#6132): they exist only under
+            # `simulation_tests`, so this job is the only one that can run them.
             cargo nextest run -p freenet --locked \
               --lib \
               --test simulation_integration \
               --test simulation_smoke \
               --test streaming_e2e \
               --test state_verification \
-              -E 'kind(test) | (kind(lib) & test(sim_e2e_tests))' \
+              -E 'kind(test) | (kind(lib) & (test(sim_e2e_tests) | test(decision_hasher)))' \
               --features simulation_tests,testing --profile ci 2>&1
             rc=$?
             echo "== $(date -u +%H:%M:%S) nextest done rc=${rc}"

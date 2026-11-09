@@ -59,6 +59,18 @@ filter = "test(test_fanout_liveness)"
 slow-timeout = { period = "600s", terminate-after = 2 }
 retries = 0
 
+# #6132 same-seed trace test: one 1-gateway / 9-node Turmoil simulation of
+# about 300s virtual time, run five times in one process and compared event
+# by event. Measured 48-53s wall-clock locally for three runs (so about 85s
+# for five), too close to the default 120s period on a contended runner.
+# retries = 0: a retry could turn a determinism regression (one run in two
+# diverging) into a pass, the masking described for test_ping_blocked_peers
+# below.
+[[profile.ci.overrides]]
+filter = "test(test_same_seed_same_trace_in_one_process_past_four_minutes)"
+slow-timeout = { period = "300s", terminate-after = 2 }
+retries = 0
+
 # test_ping_blocked_peers is the canary for the CONNECT promotion-drop bug
 # class (#3838, fixed in #3893). The profile-wide retries = 2 masked a ~40%
 # per-run failure rate as ~6% effective during the flaky period, making an

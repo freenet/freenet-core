@@ -86,7 +86,7 @@ pub struct OrphanStreamRegistry {
     /// each other. With two maps — orphans and waiters — the claim could see no
     /// orphan and park a waiter while the transport saw no waiter and parked an
     /// orphan, stranding the stream until `STREAM_CLAIM_TIMEOUT`.
-    slots: DashMap<StreamKey, Slot>,
+    slots: crate::util::DecisionDashMap<StreamKey, Slot>,
 
     /// Streams that have already been claimed. Used for deduplication when
     /// both the embedded metadata (in fragment #1) and the separate metadata
@@ -98,7 +98,7 @@ impl OrphanStreamRegistry {
     /// Creates a new empty registry.
     pub fn new() -> Self {
         Self {
-            slots: DashMap::new(),
+            slots: Default::default(),
             claimed_streams: DashMap::new(),
         }
     }

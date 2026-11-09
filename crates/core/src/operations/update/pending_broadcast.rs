@@ -87,7 +87,6 @@
 //! even a hypothetical small skew could only shift an eviction by a tolerance
 //! far below the window. No shared/atomic clock is needed here.
 
-use dashmap::DashMap;
 use freenet_stdlib::prelude::{ContractInstanceId, WrappedState};
 
 use crate::config::GlobalSimulationTime;
@@ -115,13 +114,13 @@ struct PendingEntry {
 /// Bounded store of broadcasts that found no targets and are awaiting the first
 /// interested peer to re-fan-out to. See module docs.
 pub(crate) struct PendingBroadcastStore {
-    entries: DashMap<ContractInstanceId, PendingEntry>,
+    entries: crate::util::DecisionDashMap<ContractInstanceId, PendingEntry>,
 }
 
 impl PendingBroadcastStore {
     pub(crate) fn new() -> Self {
         Self {
-            entries: DashMap::new(),
+            entries: Default::default(),
         }
     }
 

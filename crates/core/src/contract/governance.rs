@@ -743,7 +743,7 @@ impl GovernanceManager {
         //    window are excluded — a new contract whose benefit hasn't
         //    accumulated yet would skew the distribution and might be
         //    flagged for being new rather than for being abusive.
-        let actionable_samples: HashMap<ContractInstanceId, f64> = self
+        let actionable_samples: crate::util::DecisionHashMap<ContractInstanceId, f64> = self
             .scores
             .iter()
             .filter_map(|entry| {

@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -364,7 +363,7 @@ pub(crate) struct CongestionProbe {
 pub struct PeerConnection<S = super::UdpSocket, T: TimeSource = RealTime> {
     remote_conn: RemoteConnection<S, T>,
     received_tracker: ReceivedPacketTracker<InstantTimeSrc>,
-    inbound_streams: HashMap<StreamId, mpsc::Sender<(u32, bytes::Bytes)>>,
+    inbound_streams: crate::util::DecisionHashMap<StreamId, mpsc::Sender<(u32, bytes::Bytes)>>,
     /// Legacy reassembly tasks. Each returns its accounting token with its
     /// result, so the stream's charge is held until `recv()` has taken the
     /// output (see `inbound_budget::Liveness::Task`).
@@ -453,7 +452,7 @@ pub struct PeerConnection<S = super::UdpSocket, T: TimeSource = RealTime> {
     /// cancelled the handle, or after the driver claimed-then-timed-out) leaks
     /// the underlying `Arc<LockFreeStreamBuffer>` until the entire connection
     /// drops. See issue #4079.
-    streaming_handles: HashMap<StreamId, (streaming::StreamHandle, u64)>,
+    streaming_handles: crate::util::DecisionHashMap<StreamId, (streaming::StreamHandle, u64)>,
     /// Time source for deterministic simulation support
     time_source: T,
     /// Registry that receives inbound operations streams, handling the race
@@ -482,7 +481,7 @@ pub struct PeerConnection<S = super::UdpSocket, T: TimeSource = RealTime> {
     /// retransmission does not start one again.
     completed_inbound_streams: lru::LruCache<StreamId, ()>,
     /// Tokens of the legacy streams in `inbound_streams`, to cancel them.
-    legacy_tokens: HashMap<StreamId, Arc<inbound_budget::LegacyStreamToken>>,
+    legacy_tokens: crate::util::DecisionHashMap<StreamId, Arc<inbound_budget::LegacyStreamToken>>,
     /// This connection's inbound stream outcomes, indexed by
     /// `InboundStreamOutcome` (also counted node-wide in `TRANSPORT_METRICS`).
     inbound_outcomes: [u64; super::metrics::InboundStreamOutcome::COUNT],
@@ -1020,7 +1019,7 @@ pub(super) fn streaming_handle_idle_timeout() -> Duration {
 /// logic can be unit-tested against a plain map without constructing a
 /// full `PeerConnection`. See issue #4079 for the leak scenarios.
 fn sweep_streaming_handles_inner(
-    streaming_handles: &mut HashMap<StreamId, (streaming::StreamHandle, u64)>,
+    streaming_handles: &mut crate::util::DecisionHashMap<StreamId, (streaming::StreamHandle, u64)>,
     streaming_registry: &streaming::StreamRegistry,
     now_nanos: u64,
     threshold: Duration,
@@ -1529,7 +1528,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             peer_identity: peer_identity::PeerIdentity::default(),
             remote_conn,
             received_tracker: ReceivedPacketTracker::new(),
-            inbound_streams: HashMap::new(),
+            inbound_streams: Default::default(),
             inbound_stream_futures: FuturesUnordered::new(),
             outbound_stream_futures: FuturesUnordered::new(),
             failure_count: 0,
@@ -1541,7 +1540,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             keep_alive_handle: Some(keep_alive_handle),
             pending_pings,
             streaming_registry: Arc::new(streaming::StreamRegistry::new()),
-            streaming_handles: HashMap::new(),
+            streaming_handles: Default::default(),
             time_source,
             inbound_stream_registry: None,
             dispatched_msg_hashes: lru::LruCache::new(DEDUP_CACHE_CAPACITY),
@@ -1549,7 +1548,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             closed_by_stream_refusals: false,
             refusal_log: RefusalLog::default(),
             completed_inbound_streams: lru::LruCache::new(COMPLETED_STREAM_MEMORY),
-            legacy_tokens: HashMap::new(),
+            legacy_tokens: Default::default(),
             inbound_outcomes: [0; super::metrics::InboundStreamOutcome::COUNT],
             quic_path: None,
             #[cfg(test)]
@@ -7149,8 +7148,10 @@ mod tests {
         // cancelled by the sweep (push_fragment must return Cancelled after).
         let stale_clone = stale_handle.clone();
 
-        let mut streaming_handles: HashMap<StreamId, (streaming::StreamHandle, u64)> =
-            HashMap::new();
+        let mut streaming_handles: crate::util::DecisionHashMap<
+            StreamId,
+            (streaming::StreamHandle, u64),
+        > = Default::default();
         streaming_handles.insert(stale_id, (stale_handle, stale_nanos));
         streaming_handles.insert(fresh_id, (fresh_handle, fresh_nanos));
 
@@ -7209,8 +7210,10 @@ mod tests {
         let last_activity_nanos =
             now_nanos.saturating_sub(STREAMING_HANDLE_IDLE_TIMEOUT_PROD.as_nanos() as u64) + 1;
 
-        let mut streaming_handles: HashMap<StreamId, (streaming::StreamHandle, u64)> =
-            HashMap::new();
+        let mut streaming_handles: crate::util::DecisionHashMap<
+            StreamId,
+            (streaming::StreamHandle, u64),
+        > = Default::default();
         streaming_handles.insert(id, (handle.clone(), last_activity_nanos));
 
         let peer_addr = SocketAddr::new(Ipv4Addr::new(127, 0, 0, 1).into(), 9001);
@@ -7259,8 +7262,10 @@ mod tests {
         // idle = threshold + 1 ns -> DROP
         let past_last_activity = now_nanos - threshold_nanos - 1;
 
-        let mut streaming_handles: HashMap<StreamId, (streaming::StreamHandle, u64)> =
-            HashMap::new();
+        let mut streaming_handles: crate::util::DecisionHashMap<
+            StreamId,
+            (streaming::StreamHandle, u64),
+        > = Default::default();
         streaming_handles.insert(exact_id, (exact_handle, exact_last_activity));
         streaming_handles.insert(past_id, (past_handle, past_last_activity));
 
@@ -7295,8 +7300,10 @@ mod tests {
         let handle = registry.register(id, 64 * 1024);
         let now_nanos = STREAMING_HANDLE_IDLE_TIMEOUT_PROD.as_nanos() as u64 * 4;
 
-        let mut streaming_handles: HashMap<StreamId, (streaming::StreamHandle, u64)> =
-            HashMap::new();
+        let mut streaming_handles: crate::util::DecisionHashMap<
+            StreamId,
+            (streaming::StreamHandle, u64),
+        > = Default::default();
         streaming_handles.insert(id, (handle, 0));
 
         let peer_addr = SocketAddr::new(Ipv4Addr::new(127, 0, 0, 1).into(), 9003);
@@ -7347,8 +7354,10 @@ mod tests {
             "registry + local handle = 2 buffer clones at start"
         );
 
-        let mut streaming_handles: HashMap<StreamId, (streaming::StreamHandle, u64)> =
-            HashMap::new();
+        let mut streaming_handles: crate::util::DecisionHashMap<
+            StreamId,
+            (streaming::StreamHandle, u64),
+        > = Default::default();
         streaming_handles.insert(id, (handle.clone(), 0));
         // Now: registry + local handle + map = 3 Arc clones of the buffer.
         assert_eq!(handle.buffer_strong_count(), 3);
@@ -7385,8 +7394,10 @@ mod tests {
         let threshold_nanos = STREAMING_HANDLE_IDLE_TIMEOUT_PROD.as_nanos() as u64;
         let now_nanos = threshold_nanos * 100;
 
-        let mut streaming_handles: HashMap<StreamId, (streaming::StreamHandle, u64)> =
-            HashMap::new();
+        let mut streaming_handles: crate::util::DecisionHashMap<
+            StreamId,
+            (streaming::StreamHandle, u64),
+        > = Default::default();
         let mut expected_to_keep = Vec::new();
         let mut expected_to_drop = Vec::new();
         for i in 0..10u64 {
