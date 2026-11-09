@@ -1200,8 +1200,10 @@ pair is in the slice when its bucket is below the percentage, so 0 holds none,
   `QUIC_DATA_RECEIVER_READY` is true: `recv` reads the path's data ("QUIC receive
   flow" below).
   The machine reads no key to decide it.
-  A path carries data only with both bits. `Ready` and `ReadyAck` carry the
-  sender's own bit. The peer's bit is read from the frame that activates the
+  A path carries data only with both bits, and only with both control stream
+  bits too ("Control stream" below): a peer without caps::CONTROL_STREAM gets no
+  data from this node, whatever its data bit. `Ready` and `ReadyAck` carry the
+  sender's own bits. The peer's bit is read from the frame that activates the
   attempt and held in `State::Active` for that attempt, so a later frame changes
   nothing and the next attempt negotiates again. With both set the machine emits
   `Action::EnableData` and `Outcome::DataEnabled`, which has no counter yet:
@@ -1209,7 +1211,8 @@ pair is in the slice when its bucket is below the percentage, so 0 holds none,
   new upgrade count needs a labelled set of its own.
     own 0, peer any: refuses inbound data with NOT_ACCEPTING_DATA, may not send.
     own 1, peer 0: accepts inbound data, may not send.
-    own 1, peer 1: accepts inbound data, may send (`QuicPath::enable_data`).
+    own 1, peer 1: accepts inbound data, may send (`QuicPath::enable_data`),
+      if both also set CONTROL_STREAM; otherwise as own 1, peer 0.
   Accepting is set when the path is built, from the own bit alone
   (`QuicPathLimits::SHADOW` or `DEFAULT`), because the peer's first stream can
   overtake the frame carrying its bit. Sending is `QuicPath::send_data`, which
@@ -1745,11 +1748,12 @@ it by "QUIC send route" below.
 ```
 One message per QUIC uni stream: an 18-byte header, then metadata, then
 payload, then the stream's end.
-  version u8 (1) | kind u8 (0 Short, 1 Stream, 2 Control) |
+  version u8 (1) | kind u8 (0 Short, 1 Stream, 2 Control, 3 ControlStream) |
   stream_id u32 BE | total_len u64 BE (payload) | metadata_len u32 BE
 FrameHeader::decode refuses, never panics: unknown version or kind;
   total_len 0 or > MAX_STREAM_TOTAL_BYTES (check_declared_stream_length)
   for Short and Stream; Control 0 or > MAX_CONTROL_BYTES (4 KiB);
+  ControlStream any total_len but 0;
   metadata_len > MAX_METADATA_BYTES (1120, what UDP embeds in fragment
   #1, the shared embeds_metadata predicate; the sender leaves larger
   metadata out of the frame, and the caller sends the announcing message
@@ -1934,7 +1938,8 @@ Shadow mode (QuicPathLimits::SHADOW, accept_data = false; DEFAULT
   metadata or payload is read, and counted (refused_not_accepting_data,
   per path). Nothing is charged to the shared inbound budget and no budget
   refusal is recorded, so QUIC in shadow can neither take UDP's room nor
-  leave UDP a sticky refusal. Control frames are read as usual.
+  leave UDP a sticky refusal. Control frames and the control stream are read
+  as usual.
 Receiving: one task per connection reads every stream (FuturesUnordered,
   no task per stream) and only uses try_send. If that task panics it is
   counted (receive_task_panicked) and the connection is closed with
@@ -2085,7 +2090,8 @@ Control payload (quic/control.rs), the body of a Control frame, one per
   first (a later version is UnknownVersion at any length), refuses an
   unknown type and a v1 payload of any other length (bytes appended at the
   end too, so a field cannot be added without a version), and clears caps
-  bits outside caps::KNOWN (caps::DATA = 1, the only bit, see "Data slice").
+  bits outside caps::KNOWN (caps::DATA = 1, see "Data slice";
+  caps::CONTROL_STREAM = 2, see "Control stream").
   The Offer's caps field is separate and stays 0.
   A new type or field needs a new version. UpgradeControl differs: bincode
   tolerates trailing bytes there, so it grows by caps-gated variants. A
@@ -2098,6 +2104,33 @@ Control payload (quic/control.rs), the body of a Control frame, one per
   QuicInbound::controls and counts refusals per path
   (control_unknown_version, control_unknown_type, control_malformed); they
   are counted only through it, not by QuicControl::decode.
+Control stream (quic/path/control.rs, caps::CONTROL_STREAM): every node with
+  QUIC on sets the bit (QuicPolicy::own_caps), in shadow too. When the frame
+  that activates a path shows both bits, the machine emits
+  Action::OpenControlStream before EnableData, and the driver calls
+  QuicPath::expect_control_stream (data opens wait for it from then: QuicPath::open
+  waits in ControlSide::wait_settled) and opens it in a task
+  (open_control_stream_bounded, CONTROL_SEND_TIMEOUT): one uni stream with a
+  ControlStream header, quinn priority CONTROL_STREAM_PRIORITY (1, data 0),
+  never finished while the path lives, so it holds its slot and never waits for
+  MAX_STREAMS. Opening it first is the whole slot argument; do not let a data
+  stream open before it. A failed open closes the path with DOWNGRADE.
+  Payloads on it: u16 BE length (1 to MAX_CONTROL_BYTES) then the bytes, each
+  delivered on QuicInbound::controls like a control frame's. No message type
+  uses it yet (send_on_control_stream_bounded is test-only); the first goes in
+  a new control version, which a peer that set the bit reads.
+  Receiver: one per path; a second, a length out of bounds, the stream ending,
+  or a payload that stops partway for the idle timeout closes the path with
+  CONTROL_REFUSED (control_stream_duplicate, _malformed, _ended, _idle). Nothing
+  is timed between payloads. A shadow path reads it (it is not data).
+  A control write blocked on credit holds the ControlGate; data writers wait
+  there between fragments (Outgoing::write_fragments), so at most one fragment
+  per writer already past it goes first. The gate never waits for a slot, so it
+  cannot deadlock against open_uni.
+  Mixed versions: a node before the bit clears it on decode and sends 0; the
+  pair gets no control stream, and this node sends it no data, though it still
+  accepts the peer's data (own data bit). Pinned by
+  test_quic_peer_without_the_control_stream_bit_gets_no_control_stream.
 Counts: per path (QuicPath::stats) and node-wide ("QUIC data telemetry" above).
 QUIC send route (#5940 e5b-6, quic/upgrade/data_route.rs,
   peer_connection/quic_send.rs, quic/path/route.rs):

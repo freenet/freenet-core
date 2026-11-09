@@ -17,8 +17,10 @@
 //! [`CONTROL_LEN`] (10) bytes, exactly. `attempt` is the `attempt` of the
 //! `UpgradeControl` Offer this connection was made for, so a frame from an
 //! earlier attempt can be told apart. `caps` carries what the sender
-//! supports on this path. [`caps::DATA`] is the only bit: a path carries data
-//! only if both sides set it (`upgrade::machine`).
+//! supports on this path: [`caps::DATA`] (a path carries data only if both
+//! sides set it, `upgrade::machine`) and [`caps::CONTROL_STREAM`] (each side
+//! opens a long-lived control stream once both set it, and a path carries
+//! data from a node only with that stream).
 //!
 //! Compatibility rules:
 //! - Unknown caps bits are ignored: [`QuicControl::decode`] clears every bit
@@ -55,8 +57,14 @@ pub(crate) mod caps {
     /// share of pairs (`upgrade::slice`). A node before this bit clears it on
     /// decode and sends 0, so the pair stays in shadow.
     pub(crate) const DATA: u32 = 1;
+    /// The sender opens a long-lived control stream on this path once the
+    /// peer sets this bit too, before any data stream, and reads the peer's.
+    /// Set whenever QUIC is on, whatever the data bit. A node before this bit
+    /// clears it on decode and sends 0, so it gets no control stream, and this
+    /// node sends it no data (`upgrade::machine`).
+    pub(crate) const CONTROL_STREAM: u32 = 2;
     /// Every bit this node knows.
-    pub(crate) const KNOWN: u32 = DATA;
+    pub(crate) const KNOWN: u32 = DATA | CONTROL_STREAM;
 }
 
 /// A control message on a QUIC path.
@@ -202,19 +210,30 @@ mod tests {
             [1, 0, 0, 0, 0, 7, 0, 0, 0, 1],
             "the data bit is the low bit of the field"
         );
+        assert_eq!(
+            QuicControl::Ready {
+                attempt: 7,
+                caps: caps::CONTROL_STREAM,
+            }
+            .encode(),
+            [1, 0, 0, 0, 0, 7, 0, 0, 0, 2],
+            "the control stream bit is the next one"
+        );
         const { assert!(CONTROL_LEN as u64 <= MAX_CONTROL_BYTES) };
     }
 
     /// A newer node may set caps bits this node does not know: the frame
-    /// still decodes, with those bits cleared and the known one kept.
+    /// still decodes, with those bits cleared and the known ones kept.
     #[test]
     fn unknown_caps_bits_are_ignored() {
         for (kind, raw_caps, kept) in [
-            (0u8, u32::MAX, caps::DATA),
+            (0u8, u32::MAX, caps::KNOWN),
             (1, 0x8000_0001, caps::DATA),
             (0, 1, caps::DATA),
             (1, 0x8000_0000, 0),
-            (0, 2, 0),
+            (0, 2, caps::CONTROL_STREAM),
+            (1, 0x8000_0002, caps::CONTROL_STREAM),
+            (0, 4, 0),
             (1, 0, 0),
         ] {
             let mut bytes = [1, kind, 0, 0, 0, 9, 0, 0, 0, 0];

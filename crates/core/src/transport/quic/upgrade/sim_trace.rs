@@ -49,6 +49,8 @@ struct TraceData {
     initial_on_attempt: Mutex<BTreeSet<SocketAddr>>,
     /// Nodes that build their paths to refuse data while they advertise the bit.
     refuse_data: Mutex<BTreeSet<SocketAddr>>,
+    /// Nodes that do not set the control stream bit, as a release before it.
+    no_control_stream: Mutex<BTreeSet<SocketAddr>>,
     /// The version a peer reports, and the release it then reads as.
     release: Mutex<Option<(Version, Version)>>,
 }
@@ -127,6 +129,12 @@ impl QuicUpgradeTrace {
     /// closes the path, and the pair's data goes on UDP.
     pub fn refuse_data_while_advertising(&self, node: SocketAddr) {
         self.data.refuse_data.lock().insert(node);
+    }
+
+    /// `node` does not set the control stream bit, as a release before the bit
+    /// would not: it opens no control stream, and its peers open none to it.
+    pub fn omit_control_stream_bit(&self, node: SocketAddr) {
+        self.data.no_control_stream.lock().insert(node);
     }
 
     /// A peer that reports `real` is treated as running `release` when the machine
@@ -222,6 +230,14 @@ impl NodeTrace {
 
     pub(crate) fn refuses_data_while_advertising(&self) -> bool {
         self.trace.data.refuse_data.lock().contains(&self.addr)
+    }
+
+    pub(crate) fn omits_control_stream_bit(&self) -> bool {
+        self.trace
+            .data
+            .no_control_stream
+            .lock()
+            .contains(&self.addr)
     }
 
     pub(crate) fn wrong_record(&self) -> bool {

@@ -18,8 +18,9 @@
 //! dialing through active, at `quic-max-paths`. A permit is released when it
 //! is dropped, so a path cannot keep one past its own end.
 //!
-//! [`QuicPolicy::own_caps`] is this node's half of the data negotiation: the
-//! data bit for a peer in the slice, in `prefer` mode only.
+//! [`QuicPolicy::own_caps`] is this node's half of the negotiation: the
+//! control stream bit whenever QUIC is on, and the data bit for a peer in the
+//! slice, in `prefer` mode only.
 //!
 //! [`super::driver`] reads the policy for each decision. [`log_startup`] runs
 //! at node startup.
@@ -216,6 +217,15 @@ impl QuicPolicy {
         local: &TransportPublicKey,
         peer: &TransportPublicKey,
     ) -> u32 {
+        let control = match self.mode {
+            QuicMode::Off => 0,
+            QuicMode::Shadow | QuicMode::Prefer => caps::CONTROL_STREAM,
+        };
+        control | self.data_caps(local, peer)
+    }
+
+    /// The data half of [`Self::own_caps`].
+    fn data_caps(&self, local: &TransportPublicKey, peer: &TransportPublicKey) -> u32 {
         if !data_bit_allowed(cfg!(any(test, feature = "testing"))) {
             return 0;
         }
@@ -496,24 +506,35 @@ mod tests {
             let up = QuicAvailabilityWatch::for_test(QuicAvailability::Up).1;
             QuicPolicy::new(&config, BreakerOutcome::NotConsulted, up).own_caps(&local, &peer)
         };
+        let data = |mode: &str, percent: Option<String>| caps_with(mode, percent) & caps::DATA;
         assert_eq!(QUIC_DATA_PERCENT, 0, "this release carries no data");
-        assert_eq!(caps_with("prefer", None), 0);
-        assert_eq!(caps_with("prefer", Some("lots".to_string())), 0);
-        assert_eq!(caps_with("prefer", Some("100".to_string())), caps::DATA);
-        assert_eq!(caps_with("prefer", Some("0".to_string())), 0);
+        assert_eq!(data("prefer", None), 0);
+        assert_eq!(data("prefer", Some("lots".to_string())), 0);
+        assert_eq!(data("prefer", Some("100".to_string())), caps::DATA);
+        assert_eq!(data("prefer", Some("0".to_string())), 0);
         assert_eq!(
-            caps_with("prefer", Some(bucket.to_string())),
+            data("prefer", Some(bucket.to_string())),
             0,
             "a bucket equal to the percentage is out"
         );
         assert_eq!(
-            caps_with("prefer", Some((bucket + 1).to_string())),
+            data("prefer", Some((bucket + 1).to_string())),
             caps::DATA,
             "the bucket below the percentage is in"
         );
         for mode in ["shadow", "off"] {
-            assert_eq!(caps_with(mode, Some("100".to_string())), 0, "{mode}");
+            assert_eq!(data(mode, Some("100".to_string())), 0, "{mode}");
         }
+        // The control stream bit is set whenever QUIC is on, whatever the data
+        // bit, and never with QUIC off.
+        for (mode, percent) in [("shadow", None), ("prefer", None), ("prefer", Some("100"))] {
+            assert_eq!(
+                caps_with(mode, percent.map(str::to_string)) & caps::CONTROL_STREAM,
+                caps::CONTROL_STREAM,
+                "{mode} {percent:?}"
+            );
+        }
+        assert_eq!(caps_with("off", Some("100".to_string())), 0);
     }
 
     /// The receive side exists, so a build without `cfg(test)` or the `testing`
@@ -525,18 +546,18 @@ mod tests {
         assert!(data_bit_allowed(false));
         assert!(data_bit_allowed(true));
         // Tests build with the testing cfg, so only the source can show that
-        // `own_caps` consults the gate before anything else.
+        // the data bit consults the gate before anything else.
         let source = include_str!("policy.rs");
         let body = source
-            .split("fn own_caps(")
+            .split("fn data_caps(")
             .nth(1)
-            .expect("own_caps exists");
+            .expect("data_caps exists");
         let gate = body
             .find("if !data_bit_allowed(cfg!(any(test, feature = \"testing\")))")
-            .expect("own_caps consults the gate");
+            .expect("data_caps consults the gate");
         let mode = body
             .find("match self.mode")
-            .expect("own_caps reads the mode");
+            .expect("data_caps reads the mode");
         assert!(gate < mode, "the gate comes first");
     }
 

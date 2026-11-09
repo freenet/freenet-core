@@ -641,13 +641,25 @@ fn expected_with(
         (Role::Client, S::Connecting | S::Confirming, "ready")
             | (Role::Server, S::Confirming, "ready_ack")
     );
-    if activates && own_caps & peer_caps & caps::DATA != 0 {
+    if activates && own_caps & peer_caps & caps::CONTROL_STREAM != 0 {
+        actions.push(Action::OpenControlStream {
+            attempt: attempt_of(role),
+        });
+    }
+    if activates && carries(own_caps, peer_caps) {
         actions.push(Action::EnableData {
             attempt: attempt_of(role),
         });
         actions.push(Action::Record(Outcome::DataEnabled));
     }
     Some((next, actions))
+}
+
+/// Whether a path between these caps carries data: both data bits and both
+/// control stream bits.
+fn carries(own_caps: u32, peer_caps: u32) -> bool {
+    let both = own_caps & peer_caps;
+    both & caps::DATA != 0 && both & caps::CONTROL_STREAM != 0
 }
 
 fn holds_a_permit(state: S) -> bool {
@@ -791,8 +803,13 @@ fn check_with(
     assert_eq!(label(&rig.machine), next, "{case}: next state");
     assert_eq!(
         rig.machine.carries_data(),
-        next == S::Active && own_caps & peer_caps & caps::DATA != 0,
+        next == S::Active && carries(own_caps, peer_caps),
         "{case}: carries data"
+    );
+    assert_eq!(
+        rig.machine.has_control_stream(),
+        next == S::Active && own_caps & peer_caps & caps::CONTROL_STREAM != 0,
+        "{case}: control stream"
     );
     assert_eq!(
         rig.in_use(),
@@ -845,10 +862,11 @@ fn every_transition_for_the_current_attempt() {
 /// counts only in the frame that activates its own attempt.
 #[test]
 fn every_transition_for_every_pair_of_data_bits() {
-    let bits = [0, caps::DATA];
+    let both = caps::DATA | caps::CONTROL_STREAM;
+    let bits = [0, caps::DATA, caps::CONTROL_STREAM, both];
     for own_caps in bits {
-        // A bit this node does not know is no data bit.
-        for peer_caps in [0, caps::DATA, 0x8000_0000] {
+        // A bit this node does not know is neither.
+        for peer_caps in [0, caps::DATA, caps::CONTROL_STREAM, both, 0x8000_0000] {
             for (role, state) in pairs() {
                 for name in ATTEMPT_EVENTS.into_iter().chain(OTHER_EVENTS) {
                     check_with(
@@ -870,22 +888,32 @@ fn every_transition_for_every_pair_of_data_bits() {
     }
 }
 
-/// Written out once, apart from the table: each role with both bits gets
-/// `EnableData` for its attempt, and a pair with either bit clear stays shadow,
-/// though each side's frame says what it has.
+/// Written out once, apart from the table: each role with both data bits and
+/// both control stream bits opens its control stream and gets `EnableData` for
+/// its attempt; with both control stream bits alone it opens the stream and
+/// stays shadow; a pair with either data bit or either control stream bit
+/// clear carries no data, though each side's frame says what it has.
 #[test]
 fn a_path_carries_data_only_with_both_bits() {
     let data = caps::DATA;
-    for (own, peer, carries) in [
-        (0, 0, false),
-        (0, data, false),
-        (data, 0, false),
-        (data, data, true),
+    let control = caps::CONTROL_STREAM;
+    let full = data | control;
+    for (own, peer, opens, carries) in [
+        (0, 0, false, false),
+        (0, full, false, false),
+        (full, 0, false, false),
+        (data, data, false, false),
+        (full, data, false, false),
+        (data, full, false, false),
+        (control, control, true, false),
+        (full, control, true, false),
+        (control, full, true, false),
+        (full, full, true, true),
     ] {
         let case = format!("own {own}, peer {peer}");
         let mut server = reach_with(Role::Server, S::Connecting, own, peer);
         let attempt = SERVER_ATTEMPT;
-        assert_eq!(server.machine.accepts_data(), own == data, "{case}");
+        assert_eq!(server.machine.accepts_data(), own & data != 0, "{case}");
         assert_eq!(
             server.step(Event::PathEstablished { attempt }),
             [Action::SendControl(QuicControl::Ready {
@@ -895,6 +923,9 @@ fn a_path_carries_data_only_with_both_bits() {
             "{case}: Ready says what this node has"
         );
         let mut want = vec![Action::Record(Outcome::Established(Role::Server))];
+        if opens {
+            want.push(Action::OpenControlStream { attempt });
+        }
         if carries {
             want.push(Action::EnableData { attempt });
             want.push(Action::Record(Outcome::DataEnabled));
@@ -908,6 +939,7 @@ fn a_path_carries_data_only_with_both_bits() {
             "{case}: server"
         );
         assert_eq!(server.machine.carries_data(), carries, "{case}");
+        assert_eq!(server.machine.has_control_stream(), opens, "{case}");
 
         let mut client = reach_with(Role::Client, S::Connecting, own, peer);
         let attempt = CLIENT_ATTEMPT;
@@ -915,6 +947,9 @@ fn a_path_carries_data_only_with_both_bits() {
             Action::SendControl(QuicControl::ReadyAck { attempt, caps: own }),
             Action::Record(Outcome::Established(Role::Client)),
         ];
+        if opens {
+            want.push(Action::OpenControlStream { attempt });
+        }
         if carries {
             want.push(Action::EnableData { attempt });
             want.push(Action::Record(Outcome::DataEnabled));
@@ -928,6 +963,7 @@ fn a_path_carries_data_only_with_both_bits() {
             "{case}: client"
         );
         assert_eq!(client.machine.carries_data(), carries, "{case}");
+        assert_eq!(client.machine.has_control_stream(), opens, "{case}");
     }
 }
 
@@ -960,7 +996,8 @@ fn a_node_without_the_bit_sends_caps_zero() {
 /// peer cannot turn data on or off after the path is up.
 #[test]
 fn a_later_frame_does_not_change_an_active_path() {
-    for (own, first, later) in [(caps::DATA, 0, caps::DATA), (caps::DATA, caps::DATA, 0)] {
+    let full = caps::DATA | caps::CONTROL_STREAM;
+    for (own, first, later) in [(full, 0, full), (full, full, 0), (full, caps::DATA, full)] {
         let mut server = reach_with(Role::Server, S::Active, own, first);
         let carried = server.machine.carries_data();
         let again = server.step(Event::Control(QuicControl::ReadyAck {
@@ -969,6 +1006,10 @@ fn a_later_frame_does_not_change_an_active_path() {
         }));
         assert!(again.is_empty(), "{again:?}");
         assert_eq!(server.machine.carries_data(), carried);
+        assert_eq!(
+            server.machine.has_control_stream(),
+            first & caps::CONTROL_STREAM != 0
+        );
 
         let mut client = reach_with(Role::Client, S::Active, own, first);
         let carried = client.machine.carries_data();
@@ -987,7 +1028,8 @@ fn a_later_frame_does_not_change_an_active_path() {
 /// cannot change it.
 #[test]
 fn each_attempt_negotiates_data_again() {
-    let mut server = reach_with(Role::Server, S::Active, caps::DATA, caps::DATA);
+    let full = caps::DATA | caps::CONTROL_STREAM;
+    let mut server = reach_with(Role::Server, S::Active, full, full);
     assert!(server.machine.carries_data());
     server.step(Event::PathFailed {
         attempt: SERVER_ATTEMPT,
@@ -2489,7 +2531,10 @@ impl Pair {
                     self.wire
                         .push((at, peer, Event::PathFailed { attempt, kind }));
                 }
-                Action::TearDown { .. } | Action::EnableData { .. } | Action::Record(_) => {}
+                Action::TearDown { .. }
+                | Action::OpenControlStream { .. }
+                | Action::EnableData { .. }
+                | Action::Record(_) => {}
             }
         }
     }

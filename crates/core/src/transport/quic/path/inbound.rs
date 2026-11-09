@@ -172,6 +172,8 @@ pub(in crate::transport::quic) struct Receiver<T> {
     accept_data: bool,
     /// Closes the path on the first data frame it refuses ([`Self::accept_data`]).
     closer: super::super::QuicCloser,
+    /// The peer opened its control stream; a second one is refused.
+    control_stream_seen: std::sync::atomic::AtomicBool,
     /// Panic on the next stream, to test the supervisor.
     #[cfg(test)]
     pub(in crate::transport::quic) panic_on_stream: bool,
@@ -198,6 +200,7 @@ impl<T: TimeSource> Receiver<T> {
             next_short_key: AtomicU32::new(1),
             accept_data,
             closer,
+            control_stream_seen: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             panic_on_stream: false,
         }
@@ -322,6 +325,14 @@ impl<T: TimeSource> BodyReader<T> {
             timer,
             timer_at,
         }
+    }
+
+    /// Judge idleness with `idle`, or not at all with `None`, from now.
+    fn set_idle(&mut self, idle: Option<Duration>) {
+        self.idle_nanos = idle.map_or(u64::MAX, nanos);
+        self.last_progress = self.time.now_nanos();
+        self.timer_at = self.deadline();
+        self.timer = self.time.sleep_until(self.timer_at);
     }
 
     fn deadline(&self) -> u64 {
@@ -691,7 +702,7 @@ async fn read_one<T: TimeSource>(recv: quinn::RecvStream, receiver: Arc<Receiver
     // reads `Sent`, keeps sending on the path and loses every such message. The
     // close makes it fall back to UDP and negotiate the path again. Either side's
     // gating is wrong here, and both bits are read again on the next attempt.
-    if !receiver.accept_data && header.kind() != FrameKind::Control {
+    if !receiver.accept_data && !header.kind().is_control() {
         receiver
             .stats
             .record(QuicInboundOutcome::RefusedNotAcceptingData);
@@ -720,6 +731,7 @@ async fn read_one<T: TimeSource>(recv: quinn::RecvStream, receiver: Arc<Receiver
         FrameKind::Short => receiver.read_short(reader, header).await,
         FrameKind::Stream => receiver.read_stream(reader, header).await,
         FrameKind::Control => receiver.read_control(reader, header).await,
+        FrameKind::ControlStream => receiver.read_control_stream(reader).await,
     }
 }
 
@@ -1088,6 +1100,82 @@ impl<T: TimeSource> Receiver<T> {
         match self.controls.try_send(payload) {
             Ok(()) => self.stats.record(QuicInboundOutcome::DeliveredControl),
             Err(_) => self.stats.record(QuicInboundOutcome::ControlDroppedFull),
+        }
+    }
+}
+
+impl<T: TimeSource> Receiver<T> {
+    /// Read the peer's control stream (`path::control`) for as long as the
+    /// path lives: each control payload goes on `controls`, as a control
+    /// frame's does. One per path. Between payloads nothing is timed (the
+    /// stream is meant to be quiet); once a payload has started, the rest must
+    /// keep arriving within the idle timeout. A second control stream, a
+    /// payload length out of bounds, the stream ending, or a payload that stops
+    /// partway closes the path with CONTROL_REFUSED: the peer's side of it is
+    /// broken.
+    async fn read_control_stream(&self, mut reader: BodyReader<T>) {
+        use super::control::{CONTROL_MESSAGE_LEN_BYTES, message_len};
+        if self
+            .control_stream_seen
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            self.refuse_control_stream(&mut reader, QuicInboundOutcome::ControlStreamDuplicate);
+            return;
+        }
+        self.stats.record(QuicInboundOutcome::ControlStreamAccepted);
+        reader.set_age_limit(Duration::MAX);
+        let idle = streaming_handle_idle_timeout();
+        loop {
+            reader.set_idle(None);
+            let first = match reader.read_exact(1).await {
+                Ok(first) => first,
+                Err(failure) => return self.control_stream_failed(&mut reader, failure),
+            };
+            reader.set_idle(Some(idle));
+            let second = match reader.read_exact(CONTROL_MESSAGE_LEN_BYTES - 1).await {
+                Ok(second) => second,
+                Err(failure) => return self.control_stream_failed(&mut reader, failure),
+            };
+            let Some(len) = message_len([first[0], second[0]]) else {
+                self.refuse_control_stream(&mut reader, QuicInboundOutcome::ControlStreamMalformed);
+                return;
+            };
+            let payload = match reader.read_exact(len).await {
+                Ok(payload) => payload,
+                Err(failure) => return self.control_stream_failed(&mut reader, failure),
+            };
+            match self.controls.try_send(payload) {
+                Ok(()) => self.stats.record(QuicInboundOutcome::DeliveredControl),
+                Err(_) => self.stats.record(QuicInboundOutcome::ControlDroppedFull),
+            }
+        }
+    }
+
+    /// The control stream read failed: count why, and close the path unless
+    /// the connection is already gone.
+    fn control_stream_failed(&self, reader: &mut BodyReader<T>, failure: ReadFailure) {
+        let outcome = match failure {
+            ReadFailure::ConnectionLost => {
+                self.stats.record(QuicInboundOutcome::ConnectionLost);
+                return;
+            }
+            ReadFailure::Idle | ReadFailure::Age => QuicInboundOutcome::ControlStreamIdle,
+            ReadFailure::Truncated(_)
+            | ReadFailure::Overlong
+            | ReadFailure::Reset
+            | ReadFailure::Other => QuicInboundOutcome::ControlStreamEnded,
+        };
+        self.refuse_control_stream(reader, outcome);
+    }
+
+    fn refuse_control_stream(&self, reader: &mut BodyReader<T>, outcome: QuicInboundOutcome) {
+        self.stats.record(outcome);
+        reader.stop(stop_code::HEADER_REFUSED);
+        if self.closer.close(QuicCloseCode::ControlRefused) {
+            tracing::warn!(
+                ?outcome,
+                "QUIC path: the peer's control stream is broken; closing the path"
+            );
         }
     }
 }

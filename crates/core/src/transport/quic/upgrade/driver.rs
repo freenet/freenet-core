@@ -710,6 +710,7 @@ impl Session {
                 Action::SendUpgrade(control) => sends.push(UdpSend::Reply(control)),
                 Action::Dial { attempt } => self.dial(state, attempt),
                 Action::SendControl(control) => self.send_control(state, control),
+                Action::OpenControlStream { attempt } => self.open_control_stream(state, attempt),
                 Action::EnableData { attempt } => self.enable_data(state, attempt),
                 Action::TearDown { attempt, code } => {
                     // A later step of this same batch must not send it.
@@ -1130,6 +1131,33 @@ impl Session {
         }));
     }
 
+    /// Open this side's control stream on the live attempt's path, in a task.
+    /// Data sends wait for it from this call on, which comes before
+    /// `EnableData` in the same batch, so no data stream opens first. A
+    /// stream that cannot be opened closes the path, which the machine sees.
+    fn open_control_stream(&self, state: &mut SessionState, attempt: u32) {
+        let Some(held) = state.attempt.as_mut().filter(|held| held.id == attempt) else {
+            return;
+        };
+        let Some(path) = held.path.as_ref().map(Arc::clone) else {
+            return;
+        };
+        if !path.expect_control_stream() {
+            return;
+        }
+        let clock = self.hub.path_clock.clone();
+        let note = self.route_note();
+        held.tasks.push(GlobalExecutor::spawn(async move {
+            match path
+                .open_control_stream_bounded(&clock, CONTROL_SEND_TIMEOUT)
+                .await
+            {
+                Ok(()) => note.note(|| "opened the control stream".to_string()),
+                Err(error) => note.note(|| format!("could not open the control stream: {error}")),
+            }
+        }));
+    }
+
     fn tear_down(&self, state: &mut SessionState, attempt: u32, code: QuicCloseCode) {
         let Some(held) = state.attempt.take_if(|held| held.id == attempt) else {
             return;
@@ -1247,7 +1275,17 @@ impl Session {
             older.end();
         }
         let backoff = self.hub.seeds.lock().seed_for(&key);
-        let own_caps = self.hub.policy.own_caps(&self.hub.local_key, &key);
+        #[cfg_attr(not(any(test, feature = "testing")), allow(unused_mut))]
+        let mut own_caps = self.hub.policy.own_caps(&self.hub.local_key, &key);
+        #[cfg(any(test, feature = "testing"))]
+        if self
+            .hub
+            .trace
+            .as_ref()
+            .is_some_and(|trace| trace.omits_control_stream_bit())
+        {
+            own_caps &= !crate::transport::quic::control::caps::CONTROL_STREAM;
+        }
         let sends = {
             let mut state = self.state.lock();
             if state.ended {

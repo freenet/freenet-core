@@ -614,7 +614,11 @@ fn a_routed_attempt_becomes_a_shadow_path() {
         let payload = peer_inbound.controls.try_recv().expect("Ready arrived");
         assert_eq!(
             peer_path.decode_control(&payload),
-            Ok(QuicControl::Ready { attempt, caps: 0 })
+            Ok(QuicControl::Ready {
+                attempt,
+                caps: crate::transport::quic::control::caps::CONTROL_STREAM,
+            }),
+            "a shadow path says it reads a control stream, and no data"
         );
     });
 }
@@ -693,12 +697,15 @@ fn a_path_follows_the_data_bits() {
     use crate::transport::quic::path::QuicInboundOutcome;
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
+        let full = caps::DATA | caps::CONTROL_STREAM;
         for (subnet, mode, percent, peer_caps, accepts, sends) in [
-            (30, "prefer", Some("100"), caps::DATA, true, true),
+            (30, "prefer", Some("100"), full, true, true),
             (31, "prefer", Some("100"), 0, true, false),
-            (32, "prefer", Some("0"), caps::DATA, false, false),
-            (33, "shadow", Some("100"), caps::DATA, false, false),
-            (34, "prefer", None, caps::DATA, false, false),
+            (32, "prefer", Some("0"), full, false, false),
+            (33, "shadow", Some("100"), full, false, false),
+            (34, "prefer", None, full, false, false),
+            // A peer without the control stream bit gets no data.
+            (38, "prefer", Some("100"), caps::DATA, true, false),
         ] {
             let case = format!("{mode} {percent:?}, peer {peer_caps}");
             let h = Harness::server_with("quic-driver-bits", subnet, mode, percent).await;
@@ -730,7 +737,8 @@ fn a_path_follows_the_data_bits() {
                 if accepts { (1, 0) } else { (0, 1) },
                 "{case}: a frame before the peer's bit has arrived"
             );
-            let want_caps = if accepts { caps::DATA } else { 0 };
+            // The control stream bit is set whenever QUIC is on.
+            let want_caps = caps::CONTROL_STREAM | if accepts { caps::DATA } else { 0 };
             let payload = peer_inbound.controls.try_recv().expect("Ready arrived");
             assert_eq!(
                 peer_path.decode_control(&payload),
@@ -776,7 +784,7 @@ fn a_route_ends_with_its_path_and_what_it_holds_goes_on_udp() {
                 up
             })
             .await;
-        ready_ack(&session, attempt, caps::DATA);
+        ready_ack(&session, attempt, caps::DATA | caps::CONTROL_STREAM);
         let route = session.data_route().expect("both bits");
         let path = Arc::downgrade(&route.path_handle());
 
@@ -833,7 +841,8 @@ fn data_paths_are_counted_while_they_carry_data() {
     use crate::transport::quic::control::caps;
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        for (subnet, peer_caps, carries) in [(94, caps::DATA, true), (95, 0, false)] {
+        let full = caps::DATA | caps::CONTROL_STREAM;
+        for (subnet, peer_caps, carries) in [(94, full, true), (95, 0, false)] {
             let h = Harness::server_with("quic-driver-data-counts", subnet, "prefer", Some("100"))
                 .await;
             let (session, inbox) = h.session();
@@ -884,7 +893,7 @@ fn a_refused_path_leaves_the_gauge_once_and_does_not_end_with_data() {
             up
         })
         .await;
-        ready_ack(&session, attempt, caps::DATA);
+        ready_ack(&session, attempt, caps::DATA | caps::CONTROL_STREAM);
         // A second data path on the node, so a double decrement would show.
         h.counters.data_path_started();
         assert_eq!(h.counters.snapshot(false).data_paths, 2);
@@ -974,9 +983,9 @@ fn data_is_enabled_once_per_activation() {
             up
         })
         .await;
-        ready_ack(&session, attempt, caps::DATA);
+        ready_ack(&session, attempt, caps::DATA | caps::CONTROL_STREAM);
         let first = session.data_route().expect("both bits");
-        ready_ack(&session, attempt, caps::DATA);
+        ready_ack(&session, attempt, caps::DATA | caps::CONTROL_STREAM);
         assert!(session.data_route().expect("still").is(&first));
         // The debug assertion is the check; a release build returns at the guard.
         #[cfg(debug_assertions)]
@@ -1897,7 +1906,7 @@ fn a_data_route_is_paced_only_when_the_session_has_a_pacer() {
                     up
                 })
                 .await;
-            ready_ack(&session, attempt, caps::DATA);
+            ready_ack(&session, attempt, caps::DATA | caps::CONTROL_STREAM);
             let route = session.data_route().expect("both bits");
             assert_eq!(route.path().is_paced(), paced, "{case}");
             session.end();

@@ -21245,6 +21245,60 @@ fn test_quic_data_needs_both_bits() {
     }
 }
 
+/// A peer without the control stream bit, as a release before it: the pair's
+/// path still comes up, no control stream is opened either way, and no data goes
+/// on the path though both set the data bit (a path carries data from a node only
+/// with its control stream), so the pair's traffic stays on UDP. With the bit on
+/// both, each side opens its control stream once.
+#[test_log::test]
+fn test_quic_peer_without_the_control_stream_bit_gets_no_control_stream() {
+    for (name, seed, gateway_has_bit) in [
+        ("quic-control-stream-old-peer", 0x5940_E5C2_0001, false),
+        ("quic-control-stream-both", 0x5940_E5C2_0002, true),
+    ] {
+        let run = run_quic_shadow_sim(name, seed, (1, 1), 8, |sim, trace, labels| {
+            for label in labels {
+                sim.with_node_transport_quic(label, "prefer");
+                sim.with_node_quic_data_percent(label, 100);
+            }
+            run_as_first_negotiating_release(trace);
+            if !gateway_has_bit {
+                let gateway = sim.all_node_addresses()[&labels[0]];
+                trace.omit_control_stream_bit(gateway);
+            }
+        });
+        for node in &run.nodes {
+            assert_eq!(run.whats(*node, "Established"), 1, "{name}: {}", run.dump());
+            assert_eq!(
+                run.whats(*node, "opened the control stream"),
+                usize::from(gateway_has_bit),
+                "{name}: {}",
+                run.dump()
+            );
+            assert_eq!(
+                run.whats(*node, "DataEnabled"),
+                usize::from(gateway_has_bit),
+                "{name}: {}",
+                run.dump()
+            );
+        }
+        assert_eq!(
+            run.total("could not open the control stream"),
+            0,
+            "{name}: {}",
+            run.dump()
+        );
+        if !gateway_has_bit {
+            assert_eq!(
+                run.total("path sent data: sent 0, maybe 0, on udp 0, dropped 0"),
+                2,
+                "{name}: neither side sent data on its path: {}",
+                run.dump()
+            );
+        }
+    }
+}
+
 /// Data on a test percentage, end to end: both nodes negotiate it and their
 /// messages go on the path, come out of `recv` and decode as real network messages.
 /// The counts come from each end: what the receiver took off the path, what the
@@ -21428,6 +21482,7 @@ fn test_quic_data_path_cut_mid_transfer_falls_back_to_udp() {
     let contract = SimOperation::create_test_contract(0x63);
     let key = contract.key();
     let warm_up = SimOperation::create_test_contract(0x64);
+    let late = SimOperation::create_test_contract(0x65);
     let state: Vec<u8> = (0..STATE_LEN).map(|i| (i % 251) as u8).collect();
 
     let node = NodeLabel::node(NETWORK, 1);
@@ -21469,6 +21524,18 @@ fn test_quic_data_path_cut_mid_transfer_falls_back_to_udp() {
             SimOperation::Put {
                 contract,
                 state: state.clone(),
+                subscribe: false,
+            },
+        ),
+        // The gateway sends on its path after the cut, more than a stall window
+        // after its last acknowledgement, so its path goes suspect by
+        // construction rather than only if some other message of its happens
+        // to time out there.
+        ScheduledOperation::new(
+            gateway.clone(),
+            SimOperation::Put {
+                contract: late,
+                state: vec![2; 64],
                 subscribe: false,
             },
         ),

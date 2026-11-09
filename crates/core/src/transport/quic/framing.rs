@@ -78,6 +78,11 @@ pub(crate) enum FrameKind {
     Stream,
     /// A QUIC path control frame.
     Control,
+    /// The sender's long-lived control stream on this path
+    /// (`control::caps::CONTROL_STREAM`): length-prefixed control payloads,
+    /// never finished while the path lives. Sent only to a peer that set the
+    /// bit, so a node that does not know this kind never receives one.
+    ControlStream,
 }
 
 impl FrameKind {
@@ -86,6 +91,16 @@ impl FrameKind {
             FrameKind::Short => 0,
             FrameKind::Stream => 1,
             FrameKind::Control => 2,
+            FrameKind::ControlStream => 3,
+        }
+    }
+
+    /// A control frame or the control stream: read on a path whatever its
+    /// data bit, never charged to the inbound budget.
+    pub(crate) fn is_control(self) -> bool {
+        match self {
+            FrameKind::Control | FrameKind::ControlStream => true,
+            FrameKind::Short | FrameKind::Stream => false,
         }
     }
 
@@ -94,6 +109,7 @@ impl FrameKind {
             0 => Some(FrameKind::Short),
             1 => Some(FrameKind::Stream),
             2 => Some(FrameKind::Control),
+            3 => Some(FrameKind::ControlStream),
             _ => None,
         }
     }
@@ -125,16 +141,17 @@ pub(crate) enum HeaderError {
     /// `total_len` is 0 or above `MAX_STREAM_TOTAL_BYTES` (Short, Stream).
     #[error("invalid declared length: {0:?}")]
     InvalidLength(StreamLengthRejection),
-    /// A `Control` frame above [`MAX_CONTROL_BYTES`], or empty.
+    /// A `Control` frame above [`MAX_CONTROL_BYTES`], or empty; or a
+    /// `ControlStream` header declaring any length (it has none).
     #[error("invalid control frame length {0}")]
     InvalidControlLength(u64),
     /// `metadata_len` above [`MAX_METADATA_BYTES`].
     #[error("metadata length {0} above the limit")]
     MetadataTooLong(u32),
-    /// Metadata on a Short or Control frame.
+    /// Metadata on a Short, Control or ControlStream frame.
     #[error("metadata on a frame kind that has none")]
     UnexpectedMetadata,
-    /// A nonzero stream id on a Short or Control frame.
+    /// A nonzero stream id on a Short, Control or ControlStream frame.
     #[error("a stream id on a frame kind that has none")]
     UnexpectedStreamId,
     /// A Stream frame whose id is not caller-named ([`StreamId::next`]).
@@ -164,6 +181,16 @@ impl FrameHeader {
         Self::checked(FrameKind::Control, StreamId(0), len, 0)
     }
 
+    /// The header that opens a control stream.
+    pub(crate) fn control_stream() -> Self {
+        Self {
+            kind: FrameKind::ControlStream,
+            stream_id: StreamId(0),
+            total_len: 0,
+            metadata_len: 0,
+        }
+    }
+
     /// The receiver's checks, in one place for both directions.
     fn checked(
         kind: FrameKind,
@@ -172,7 +199,7 @@ impl FrameHeader {
         metadata_len: u32,
     ) -> Result<Self, HeaderError> {
         match kind {
-            FrameKind::Short | FrameKind::Control => {
+            FrameKind::Short | FrameKind::Control | FrameKind::ControlStream => {
                 if stream_id.0 != 0 {
                     return Err(HeaderError::UnexpectedStreamId);
                 }
@@ -195,6 +222,11 @@ impl FrameHeader {
             }
             FrameKind::Control => {
                 if total_len == 0 || total_len > MAX_CONTROL_BYTES {
+                    return Err(HeaderError::InvalidControlLength(total_len));
+                }
+            }
+            FrameKind::ControlStream => {
+                if total_len != 0 {
                     return Err(HeaderError::InvalidControlLength(total_len));
                 }
             }
@@ -294,6 +326,7 @@ mod tests {
             FrameHeader::short(1).unwrap(),
             FrameHeader::short(MAX_STREAM_TOTAL_BYTES).unwrap(),
             FrameHeader::control(MAX_CONTROL_BYTES).unwrap(),
+            FrameHeader::control_stream(),
             FrameHeader::stream(caller_named(1), 1, 0).unwrap(),
             FrameHeader::stream(
                 caller_named(1),
@@ -352,7 +385,11 @@ mod tests {
             ),
             (raw(0, 0, 0, 10, 0), HeaderError::UnknownVersion(0)),
             (raw(2, 0, 0, 10, 0), HeaderError::UnknownVersion(2)),
-            (raw(1, 3, 0, 10, 0), HeaderError::UnknownKind(3)),
+            (raw(1, 3, 0, 10, 0), HeaderError::InvalidControlLength(10)),
+            (raw(1, 3, 0, 1, 0), HeaderError::InvalidControlLength(1)),
+            (raw(1, 3, 0, 0, 1), HeaderError::UnexpectedMetadata),
+            (raw(1, 3, 5, 0, 0), HeaderError::UnexpectedStreamId),
+            (raw(1, 4, 0, 10, 0), HeaderError::UnknownKind(4)),
             (raw(1, 0xFF, 0, 10, 0), HeaderError::UnknownKind(0xFF)),
         ];
         for (bytes, expected) in cases {
@@ -361,6 +398,10 @@ mod tests {
         // The edges themselves are accepted.
         assert!(FrameHeader::decode(&raw(1, 1, 0x8000_0001, 10, MAX_METADATA_BYTES)).is_ok());
         assert!(FrameHeader::decode(&raw(1, 2, 0, MAX_CONTROL_BYTES, 0)).is_ok());
+        assert_eq!(
+            FrameHeader::decode(&raw(1, 3, 0, 0, 0)),
+            Ok(FrameHeader::control_stream())
+        );
         assert!(FrameHeader::decode(&raw(1, 2, 0, 1, 0)).is_ok());
         assert!(FrameHeader::decode(&raw(1, 0, 0, MAX_STREAM_TOTAL_BYTES, 0)).is_ok());
     }
@@ -452,6 +493,7 @@ mod tests {
                             && metadata_len == 0
                             && (1..=MAX_CONTROL_BYTES).contains(&total_len)
                     }
+                    3 => stream_id == 0 && metadata_len == 0 && total_len == 0,
                     _ => false,
                 };
             let bytes = raw(version, kind, stream_id, total_len, metadata_len);

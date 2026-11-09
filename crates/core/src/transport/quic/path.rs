@@ -131,6 +131,7 @@
 //! [`StreamHandle`]: crate::transport::peer_connection::streaming::StreamHandle
 
 pub(crate) mod bounded;
+pub(crate) mod control;
 pub(crate) mod inbound;
 pub(in crate::transport) mod pacer;
 
@@ -439,6 +440,20 @@ quic_outcomes! {
         ShortRefusedBudget => "short_refused_budget",
         /// A Stream did not fit the inbound budget (as above).
         StreamRefusedBudget => "stream_refused_budget",
+        /// The peer's control stream was opened on this path.
+        ControlStreamAccepted => "control_stream_accepted",
+        /// A second control stream from the peer: the path was closed with
+        /// CONTROL_REFUSED.
+        ControlStreamDuplicate => "control_stream_duplicate",
+        /// A control payload length of 0 or above `MAX_CONTROL_BYTES` on the
+        /// control stream: the path was closed with CONTROL_REFUSED.
+        ControlStreamMalformed => "control_stream_malformed",
+        /// The peer finished or reset its control stream, which it never does
+        /// while the path lives: the path was closed with CONTROL_REFUSED.
+        ControlStreamEnded => "control_stream_ended",
+        /// A control payload on the control stream stopped arriving partway
+        /// for the idle timeout: the path was closed with CONTROL_REFUSED.
+        ControlStreamIdle => "control_stream_idle",
     }
 }
 
@@ -705,6 +720,9 @@ pub(crate) struct QuicPath {
     /// once set ([`Self::pace_with`]); unset, as with no limit, nothing is
     /// paced. Control frames are never paced.
     pacer: std::sync::OnceLock<Arc<dyn pacer::SendPacer>>,
+    /// This side's long-lived control stream, once both sides set its bit
+    /// ([`control`]).
+    control: control::ControlSide,
     #[cfg(test)]
     budget: SharedInboundBudget,
 }
@@ -901,6 +919,7 @@ impl QuicPath {
                 suspect: std::sync::atomic::AtomicBool::new(false),
                 heard,
                 pacer: std::sync::OnceLock::new(),
+                control: control::ControlSide::new(),
                 #[cfg(test)]
                 budget,
             },
@@ -1225,6 +1244,105 @@ impl QuicPath {
         send.finish().await
     }
 
+    /// Both sides set the control stream bit: data sends wait for this side's
+    /// control stream from now until it is open (or failed), so it never waits
+    /// for a slot data streams hold. Call before data is enabled, then open it
+    /// with [`Self::open_control_stream_bounded`]. True the first time.
+    pub(in crate::transport) fn expect_control_stream(&self) -> bool {
+        self.control.expect()
+    }
+
+    /// Open this side's control stream within `timeout` on `time`: a uni
+    /// stream with a `ControlStream` header, at [`control::CONTROL_STREAM_PRIORITY`],
+    /// never finished while the path lives. If it cannot be opened the path is
+    /// closed with DOWNGRADE, since data on it would go without its control
+    /// stream; the peer falls back to UDP and negotiates again. Never paced and
+    /// takes no streamed-message permit.
+    pub(in crate::transport) async fn open_control_stream_bounded<T: TimeSource>(
+        &self,
+        time: &T,
+        timeout: Duration,
+    ) -> Result<(), QuicSendError> {
+        let open = async {
+            let mut send = self.connection.inner().open_uni().await?;
+            send.set_priority(control::CONTROL_STREAM_PRIORITY).ok();
+            send.write_all(&FrameHeader::control_stream().encode())
+                .await?;
+            Ok::<_, QuicSendError>(send)
+        };
+        let opened = tokio::select! {
+            opened = open => opened,
+            () = time.sleep_cancelable(timeout) => Err(QuicSendError::Closed),
+        };
+        match opened {
+            Ok(send) => {
+                self.control.opened(send);
+                Ok(())
+            }
+            Err(error) => {
+                self.control.failed();
+                if self.connection.closer().close(QuicCloseCode::Downgrade) {
+                    tracing::warn!(
+                        %error,
+                        "QUIC path: could not open the control stream; closing the path"
+                    );
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Write `payload` on this side's control stream within `timeout` on
+    /// `time`, waiting for no acknowledgement. While the write is blocked on
+    /// credit, data writers wait between fragments ([`control::ControlGate`]).
+    /// A write that does not finish leaves the stream mid-message, so the path
+    /// is then closed with DOWNGRADE. No message type uses it yet; the first
+    /// that does goes in a new control version, which a peer that set
+    /// `caps::CONTROL_STREAM` reads.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(in crate::transport) async fn send_on_control_stream_bounded<T: TimeSource>(
+        &self,
+        time: &T,
+        timeout: Duration,
+        payload: &[u8],
+    ) -> Result<(), QuicSendError> {
+        let framed = control::frame_message(payload).map_err(|_| QuicSendError::Closed)?;
+        let Some(stream) = self.control.stream() else {
+            return Err(QuicSendError::Closed);
+        };
+        let gate = self.control.gate();
+        let write = async {
+            let mut send = stream.lock().await;
+            let mut write = std::pin::pin!(send.write_all(&framed));
+            match futures::poll!(write.as_mut()) {
+                std::task::Poll::Ready(written) => written,
+                std::task::Poll::Pending => {
+                    let _hold = gate.hold();
+                    write.await
+                }
+            }
+        };
+        let written = tokio::select! {
+            written = write => written.map_err(QuicSendError::from),
+            () = time.sleep_cancelable(timeout) => Err(QuicSendError::Closed),
+        };
+        if let Err(error) = &written {
+            if self.connection.closer().close(QuicCloseCode::Downgrade) {
+                tracing::warn!(
+                    %error,
+                    "QUIC path: a control message did not go out; closing the path"
+                );
+            }
+        }
+        written
+    }
+
+    /// The control gate. Tests only.
+    #[cfg(test)]
+    pub(in crate::transport) fn control_gate(&self) -> Arc<control::ControlGate> {
+        self.control.gate()
+    }
+
     /// Send `control` as a control frame, within `timeout` on `time`
     /// ([`bounded`]).
     #[cfg_attr(not(test), allow(dead_code))]
@@ -1496,6 +1614,14 @@ impl QuicPath {
         pacing: Option<pacer::Pacing>,
         progress: SendProgress,
     ) -> Result<Outgoing, QuicSendError> {
+        // Data streams open only after the control stream, while one is
+        // being opened, so it never waits for a slot data streams hold.
+        let gate = if header.kind().is_control() {
+            None
+        } else {
+            self.control.wait_settled().await;
+            Some(self.control.gate())
+        };
         let paid = match &pacing {
             Some(pacing) => {
                 let bytes = super::framing::HEADER_LEN + metadata.len();
@@ -1518,7 +1644,7 @@ impl QuicPath {
         };
         let stream = opened?;
         progress.mark_opened();
-        let mut send = Outgoing::new(stream, self.aborts.clone(), slot, pacing, progress);
+        let mut send = Outgoing::new(stream, self.aborts.clone(), slot, pacing, progress, gate);
         send.write_all(&header.encode()).await?;
         if !metadata.is_empty() {
             send.write_all(metadata).await?;
@@ -1686,6 +1812,9 @@ struct Outgoing {
     wrote_a_piece: bool,
     /// The send's pacing, for a paced data send ([`Self::write_paced`]).
     pacing: Option<pacer::Pacing>,
+    /// Where a data send waits between fragments while a control write is
+    /// blocked ([`control::ControlGate`]); `None` for a control frame.
+    gate: Option<Arc<control::ControlGate>>,
 }
 
 type StoppedResult = Result<Option<quinn::VarInt>, quinn::StoppedError>;
@@ -1697,6 +1826,7 @@ impl Outgoing {
         slot: Option<tokio::sync::OwnedSemaphorePermit>,
         pacing: Option<pacer::Pacing>,
         progress: SendProgress,
+        gate: Option<Arc<control::ControlGate>>,
     ) -> Self {
         let stopped = Box::pin(send.stopped());
         Self {
@@ -1709,6 +1839,7 @@ impl Outgoing {
             awaiting_ack: false,
             wrote_a_piece: false,
             pacing,
+            gate,
         }
     }
 
@@ -1804,6 +1935,9 @@ impl Outgoing {
     ) -> Result<(), QuicSendError> {
         while !chunk.is_empty() {
             self.take_turns().await;
+            if let Some(gate) = self.gate.clone() {
+                self.race(gate.wait_clear()).await?;
+            }
             let fragment = chunk.split_to(chunk.len().min(FRAGMENT_PAYLOAD_SIZE));
             let paid = self.pace(fragment.len()).await?;
             self.write_chunk(fragment).await?;

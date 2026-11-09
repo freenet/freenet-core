@@ -61,9 +61,12 @@
 //! Idle or Off SessionEnded                  Off         -
 //! ```
 //!
-//! "+ data" is [`Action::EnableData`] and [`Outcome::DataEnabled`], when this
-//! node's bit and the bit in the peer's frame are both set; otherwise the path
-//! stays in shadow, with nothing more to do. The peer's bit is recorded in
+//! "+ data" is [`Action::OpenControlStream`] when this node's control stream
+//! bit and the one in the peer's frame are both set, then
+//! [`Action::EnableData`] and [`Outcome::DataEnabled`] when both data bits are
+//! set as well: a path carries data from this node only with its control
+//! stream ([`caps::CONTROL_STREAM`]). Otherwise the path stays in shadow, with
+//! nothing more to do. The peer's bit is recorded in
 //! `Active` for that attempt alone, so a later path negotiates again. `Ready` and
 //! `ReadyAck` carry this node's bit, which comes in with [`Event::Promoted`]:
 //! the machine computes nothing from the keys. A side reads data as soon as
@@ -265,7 +268,11 @@ pub(in crate::transport) enum Action {
     /// Send on the path, bounded by [`CONTROL_SEND_TIMEOUT`], and report
     /// [`Event::ControlSent`].
     SendControl(QuicControl),
-    /// Both sides set the data bit on the active path of `attempt`: it may send.
+    /// Both sides set the control stream bit on the active path of
+    /// `attempt`: open this node's control stream, before any data stream.
+    OpenControlStream { attempt: u32 },
+    /// Both sides set the data bit and the control stream bit on the active
+    /// path of `attempt`: it may send data.
     EnableData { attempt: u32 },
     /// Drop whatever `attempt` holds: the `allow_peer` permit, a dial, the
     /// connection. A connection still open closes with `code`.
@@ -602,11 +609,24 @@ impl UpgradeMachine {
         self.own_caps & caps::DATA != 0
     }
 
-    /// Whether the active path has both sides' data bit. `false` in any other
-    /// state.
+    /// Whether the active path has both sides' control stream bit. `false` in
+    /// any other state.
+    pub(in crate::transport) fn has_control_stream(&self) -> bool {
+        match self.state {
+            State::Active { peer_caps, .. } => {
+                self.own_caps & peer_caps & caps::CONTROL_STREAM != 0
+            }
+            State::Idle | State::Setup { .. } | State::Rechecking { .. } | State::Off => false,
+        }
+    }
+
+    /// Whether the active path has both sides' data bit and both sides'
+    /// control stream bit. `false` in any other state.
     pub(in crate::transport) fn carries_data(&self) -> bool {
         match self.state {
-            State::Active { peer_caps, .. } => self.accepts_data() && peer_caps & caps::DATA != 0,
+            State::Active { peer_caps, .. } => {
+                self.has_control_stream() && self.accepts_data() && peer_caps & caps::DATA != 0
+            }
             State::Idle | State::Setup { .. } | State::Rechecking { .. } | State::Off => false,
         }
     }
@@ -979,16 +999,18 @@ impl UpgradeMachine {
         actions
     }
 
-    /// What follows activation if both sides set the data bit.
+    /// What follows activation: the control stream if both sides set its
+    /// bit, then data if both set the data bit too.
     fn data_actions(&self, attempt: u32) -> Vec<Action> {
-        if self.carries_data() {
-            vec![
-                Action::EnableData { attempt },
-                Action::Record(Outcome::DataEnabled),
-            ]
-        } else {
-            Vec::new()
+        let mut actions = Vec::new();
+        if self.has_control_stream() {
+            actions.push(Action::OpenControlStream { attempt });
         }
+        if self.carries_data() {
+            actions.push(Action::EnableData { attempt });
+            actions.push(Action::Record(Outcome::DataEnabled));
+        }
+        actions
     }
 
     fn on_send_refused(
