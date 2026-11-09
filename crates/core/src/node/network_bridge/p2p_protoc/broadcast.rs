@@ -731,7 +731,7 @@ impl P2pConnManager {
             return;
         }
 
-        // Registers the heal's leg for the stall check (#6143), on both the
+        // Counts the heal's leg as `heal_target` (#6143), on both the
         // production and the simulation path below.
         let Some(target) =
             super::super::broadcast_queue::resolve_heal_target(op_manager, &key, target_addr)
@@ -858,7 +858,7 @@ impl P2pConnManager {
         target_result: crate::operations::update::BroadcastTargetResult,
     ) {
         // Each leg's outcome is counted like the production queue's (#6143),
-        // so the stall check reads the same counts in simulation builds.
+        // so simulation builds report the same counts.
         use crate::operations::update::propagation_stats::{
             PropagationEvent, record_propagation_event,
         };

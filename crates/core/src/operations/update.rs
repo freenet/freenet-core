@@ -940,9 +940,9 @@ pub(crate) async fn update_contract(
             // enumerated there.
             op_manager.payload_mix.record_apply(origin, state_changed);
             if state_changed && origin == crate::node::ApplyOrigin::ClientLocal {
-                // #6143: the denominator of the propagation stall check. A
-                // client update that changed state emitted a fan-out; the
-                // summary WARNs if that fan-out put nothing on the wire.
+                // #6143: a client update that changed state emitted a
+                // fan-out. Read against `sent_*` in the summary, it shows
+                // whether this node's own updates are leaving it.
                 propagation_stats::record_propagation_event(
                     op_manager,
                     key.id(),
@@ -2938,8 +2938,8 @@ mod tests {
             .expect("update must succeed");
             let after = op_manager.payload_mix.applies_snapshot();
 
-            // #6143: only a CLIENT apply that changed state is an origination
-            // for the propagation stall check.
+            // #6143: only a CLIENT apply that changed state counts as
+            // `client_originated`.
             let originated = op_manager
                 .update_propagation_stats
                 .events_for_test(key.id())
@@ -2999,8 +2999,8 @@ mod tests {
 
         // #6143: a CLIENT apply whose merge kept our state (`UpdateResponse`
         // with `state_changed: false`, the executor's `CurrentWon`) emitted no
-        // fan-out, so it is not an origination: counting it would make the
-        // stall check expect sends that were never owed. (`UpdateNoChange`,
+        // fan-out, so it is not an origination: counting it would make
+        // `client_originated` promise sends that were never owed. (`UpdateNoChange`,
         // the stand-in above, never reaches the counting branch at all.)
         let (op_manager, _state, _summary, _guard) = build_summary_test_node_with(
             "update-applies-6143-current-won",

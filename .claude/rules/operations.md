@@ -555,7 +555,7 @@ Pins (source-scrape, fail the build on regression):
   `recv_waiter_reply_*` (op_ctx.rs) and
   `orphaned_transaction_wakes_parked_waiter_with_peer_disconnected` (op_state_manager.rs)
 
-## UPDATE propagation counters and the stall WARN (#6143)
+## UPDATE propagation counters (#6143)
 
 Every place an UPDATE broadcast leg can end without a send logs at debug or
 trace, which release builds compile out. Each outcome is counted instead as a
@@ -612,103 +612,40 @@ returned `Err`, or the payload did not serialize); that leg has no `sent_*`.
 `wire_send_failed` is the connection task failing to send (or to serialize)
 an inline broadcast the bridge already took; that leg counted `sent_*`,
 possibly in an earlier window (a queued message failing while the connection
-drains before shutdown). Like every `wire_*` count it never raises the WARN.
+drains before shutdown).
 
-`update_propagation_stalled` WARNs (counted as `origination_stalls` in
-telemetry) at the end of window W for a contract that, over W-1 and W
-together, had:
+`skip_superseded` is a queued leg replaced by a newer fan-out or heal for the
+same (contract, peer) pair: its update rides on the newer leg. `skip_evicted`
+is a leg the full broadcast queue dropped to make room (`evict_oldest`),
+counted against its own contract. `heal_target` counts a heal's leg apart
+from a fan-out's resolved targets.
 
-- a client update in W-1;
-- every open leg ended unsent: the evidence skips (every `skip_*` but
-  `skip_superseded` and `skip_evicted`) plus `send_failed` reach the open
-  legs. The open legs are `targets_total` (fan-outs) plus `heal_target`
-  (heals) minus `skip_superseded`, above zero, and `targets_total` must be
-  above zero too. Or a fan-out was dropped (`fanout_event_dropped`);
-- nothing handed to the bridge (`sent_delta + sent_full == 0`).
+**There is no stall WARN.** A rule that WARNed when every leg of a client
+update ended unsent was tried in #6145 and still raised false WARNs in its
+general form; it is deferred to #6165. Do not add one back without the
+analysis there. Diagnose from the INFO line and telemetry instead:
 
-A queued leg replaced by a newer fan-out or heal for the same (contract,
-peer) pair counts `skip_superseded`: its update rides on the newer leg, whose
-own outcome decides whether anything was sent, so it is closed and subtracted
-from the legs. It is not evidence: a relayed fan-out counted before W-1 whose
-legs a client update supersedes would otherwise stand in for the client
-update's own legs while they are still held. Before #6143 a superseded leg
-recorded nothing, so a burst of client updates resolved more legs than could
-ever end, and the stall could not fire. A heal registers its own leg, so a
-heal's skip never stands in for a fan-out leg's outcome, and heals alone,
-with no fan-out target, are never a stall.
-
-A leg the full broadcast queue drops to make room (`evict_oldest`) counts
-`skip_evicted` against its own contract. It is a counter only, neither
-evidence nor subtracted, so an eviction can only hide a stall, never raise
-one.
-
-W is grace for a leg queued late in W-1, and reading both windows catches an
-update applied at the end of W-1 whose fan-out is processed in W. The state
-is the previous window's summaries of client-updated contracts, nothing
-more. At most one WARN per contract per window, and at most
-`MAX_STALL_WARNS_PER_WINDOW` per window plus a rollup. `origination_stalls`
-and the value `drain_and_log` returns count stalled contracts, including the
-rolled-up ones, not WARN lines.
-
-Every leg must be accounted for because resolved targets alone prove nothing.
-A leg is held while its (contract, peer) pair is busy, and a stream keeps the
-pair busy for up to `stream_completion_timeout`; the large lane's permits are
-held up to 120 s each. A held or queued leg records nothing, so "targets and
-no send" is a normal state when every target is mid-stream, and it would WARN
-every window. For the same reason one refused leg (a peer that disconnected)
-beside siblings that are only held is not a stall.
-
-So the WARN targets the sender-side shapes: every leg skipped or refused by
-the bridge, or the whole fan-out dropped. Transport outcomes (`wire_*`) are
-counters only and never raise it, so a slow stream delivered many windows
-later is never a false WARN, and a failed one never a WARN.
-
-A client update whose legs were all skipped as converged
-(`skip_summary_equal` and the like) counts as a stall: the update changed
-this node's state, so no peer can already hold it, and the skip means this
-node's belief about the peer is stale. That is the leading
-#6143 hypothesis. Exception: a contract with a lossy summary (two states can
-share one) can legitimately match a peer's summary after a real change, so
-its WARNs describe the contract, not the network.
-
-Do not rebuild stream-fate tracking into the WARN. Waiting on each stream's
-fate means carrying candidates across windows, which raises false and missed
-WARNs at every window boundary, and it still cannot see the likeliest
-transport losses.
-
-**It cannot see:**
-- loss at or after the transport: a stream that fails after the bridge took
-  it, a single packet abandoned after its retransmits, a lost QUIC message.
-  Diagnose those from the `wire_*` counts and the receivers' `rx_*` counts
-  across the fleet;
-- a fan-out with a leg evicted from the broadcast queue at capacity
-  (`evict_oldest`): that leg counts only `skip_evicted`, so the others can
-  never account for every leg. The queue also WARNs each eviction itself;
-- relayed updates: only a client update makes a contract a candidate;
-- partial failure: one leg handed to the bridge in either window clears the
-  contract, so 13 of 14 legs failing raises nothing;
-- a stalled update beside one that went out: any send for the contract in
-  W-1 or W clears it, including a send for a relayed update or an earlier
-  client update;
-- a fan-out that resolves no targets (`no_targets`, which has its own
-  `BROADCAST_NO_TARGETS` WARN), and a no-targets retry whose re-emission
-  fails: it uses the blocking `notify_node_event`, so the failure is logged,
-  not counted as `fanout_event_dropped`;
-- a drain between the executor's fan-out and `client_originated`, which
-  `update_contract` records after the executor returns. The legs then land
-  in the window before the client update and are not read with it.
-
-Two ways it can be wrong: the drop counter cannot tell a client fan-out from
-a relayed one, so a relayed fan-out dropped beside a client update whose legs
-are still held is counted as the client's (skips need their own legs, which
-relayed fan-outs and heals both register, but legs of a fan-out whose targets
-were counted before W-1 can skip in W-1 and count toward the client's); and
-a contract whose window-W counts were refused at the 4096-contract cap reads
-as having sent nothing in W.
+- `client_originated > 0` with `sent_delta + sent_full == 0` for a contract,
+  sustained across windows, means its client updates are not leaving this
+  node. The `skip_*`, `send_failed` and `fanout_event_dropped` counts say
+  where the legs went.
+- One window of targets and no send is not by itself a failure. A leg is held
+  without recording anything while its (contract, peer) pair is busy (a
+  stream keeps it busy for up to `stream_completion_timeout`) or while it
+  waits for the large lane's permits (held up to 120 s each).
+- All legs of a client update skipped as converged (`skip_summary_equal` and
+  the like) is suspect: the update changed this node's state, so no peer can
+  already hold it, and the skip means this node's belief about the peer is
+  stale. That is the leading #6143 hypothesis. Exception: a contract with a
+  lossy summary (two states can share one) can legitimately match.
+- Loss at or after the transport (a stream that fails after the bridge took
+  it, a single packet abandoned after its retransmits, a lost QUIC message)
+  shows in the `wire_*` counts and the receivers' `rx_*` counts across the
+  fleet.
 
 The INFO summary's per-contract lines are the top 8 by update activity, so a
-stalled contract can fall into the "...and N others" rollup behind busier
-ones. Its stall WARN is unaffected.
+contract can fall into the "...and N others" rollup behind busier ones; the
+node-wide line and the `prop_*` telemetry fields still count it.
 
 ## Event emission review (targeted vs fan-out)
 

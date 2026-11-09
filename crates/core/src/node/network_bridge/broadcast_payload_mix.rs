@@ -730,12 +730,6 @@ struct Window {
     /// when it is handed to the bridge, and the `prop_wire_stream_*` fields
     /// count how each stream then ended.
     propagation_events: [u64; PropagationEvent::COUNT],
-    /// Contracts the propagation summary found stalled
-    /// (`update_propagation_stalled`) in the summary window that ended
-    /// during this rollup window. Counts every stalled contract, including
-    /// those past the per-window WARN cap that only the rollup WARN names, so
-    /// it can exceed the number of stall WARN lines.
-    origination_stalls: u64,
 }
 
 impl Default for Window {
@@ -758,7 +752,6 @@ impl Default for Window {
             tracked_missing_bytes: [0; SummaryMissingReason::ALL.len()],
             applies: [[0; 2]; ApplyOrigin::COUNT],
             propagation_events: [0; PropagationEvent::COUNT],
-            origination_stalls: 0,
         }
     }
 }
@@ -1165,23 +1158,6 @@ impl PayloadMix {
             .get(ev.index())
             .copied()
             .unwrap_or(0)
-    }
-
-    /// Test-only view of the stall count, without draining.
-    #[cfg(test)]
-    pub(crate) fn origination_stalls_for_test(&self) -> u64 {
-        self.window.lock().origination_stalls
-    }
-
-    /// Add the number of contracts the propagation summary found stalled in
-    /// its last window (not the number of WARN lines; see
-    /// `origination_stalls`).
-    pub(crate) fn record_origination_stalls(&self, n: u64) {
-        if n == 0 {
-            return;
-        }
-        let mut w = self.window.lock();
-        w.origination_stalls = w.origination_stalls.saturating_add(n);
     }
 
     /// Test-only view of the apply counters, indexed `[origin][changed]`.
@@ -1632,14 +1608,13 @@ fn payload_mix_json(
 }
 
 /// Add the #6143 propagation counts to a rollup payload, as
-/// `prop_<label>` fields plus `origination_stalls`.
+/// `prop_<label>` fields.
 ///
 /// Every event is always published, zero or not, so a dashboard can tell "no
 /// skips" from "a node too old to report skips" by the field's presence.
 fn insert_propagation_fields(
     payload: &mut serde_json::Value,
     events: &[u64; PropagationEvent::COUNT],
-    origination_stalls: u64,
 ) {
     let Some(obj) = payload.as_object_mut() else {
         return;
@@ -1648,7 +1623,6 @@ fn insert_propagation_fields(
         let n = events.get(ev.index()).copied().unwrap_or(0);
         obj.insert(format!("prop_{}", ev.label()), n.into());
     }
-    obj.insert("origination_stalls".into(), origination_stalls.into());
 }
 
 /// Emit one `broadcast_payload_mix` rollup and reset the window.
@@ -1677,11 +1651,7 @@ pub(crate) fn emit_payload_mix_rollup(
         &window.applies(),
         window_secs,
     );
-    insert_propagation_fields(
-        &mut payload,
-        &window.propagation_events,
-        window.origination_stalls,
-    );
+    insert_propagation_fields(&mut payload, &window.propagation_events);
     crate::tracing::telemetry::send_standalone_event_with_peer_id(
         "broadcast_payload_mix",
         local_peer_id,
@@ -3275,13 +3245,11 @@ mod tests {
     /// #6143: the propagation counts reach the telemetry payload, every event
     /// as its own `prop_<label>` field (zeros included), and the window resets.
     #[test]
-    fn rollup_publishes_propagation_events_and_stalls() {
+    fn rollup_publishes_propagation_events() {
         let mix = PayloadMix::new();
         mix.record_propagation_event(PropagationEvent::SkipSummaryEqual);
         mix.record_propagation_event(PropagationEvent::SkipSummaryEqual);
         mix.record_propagation_event(PropagationEvent::RxBackoff);
-        mix.record_origination_stalls(2);
-        mix.record_origination_stalls(0);
 
         let payload = emit_payload_mix_rollup(&mix, "peer", 60);
         for ev in PropagationEvent::ALL {
@@ -3298,10 +3266,7 @@ mod tests {
                 "{ev:?}"
             );
         }
-        assert_eq!(payload["origination_stalls"], serde_json::json!(2));
-
         let next = emit_payload_mix_rollup(&mix, "peer", 60);
         assert_eq!(next["prop_skip_summary_equal"], serde_json::json!(0));
-        assert_eq!(next["origination_stalls"], serde_json::json!(0));
     }
 }

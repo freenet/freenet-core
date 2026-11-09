@@ -782,16 +782,11 @@ impl OpManager {
         // DEBUG demotions without re-introducing per-event log volume. It runs
         // for the node's lifetime, so its handle is registered with the
         // BackgroundTaskMonitor rather than dropped fire-and-forget.
-        let payload_mix =
-            Arc::new(crate::node::network_bridge::broadcast_payload_mix::PayloadMix::new());
         let update_propagation_stats =
             Arc::new(crate::operations::update::propagation_stats::UpdatePropagationStats::new());
-        let stall_sink = payload_mix.clone();
         task_monitor.register(
             "update_propagation_summary",
-            update_propagation_stats
-                .clone()
-                .start_summary_task(move |stalls| stall_sink.record_origination_stalls(stalls)),
+            update_propagation_stats.clone().start_summary_task(),
         );
         let bootstrap_pacer = Arc::new(Mutex::new(
             crate::operations::connect::bootstrap::BootstrapPacer::new(
@@ -814,7 +809,9 @@ impl OpManager {
             outbound_mix: Arc::new(
                 crate::node::network_bridge::outbound_message_mix::OutboundMix::new(),
             ),
-            payload_mix,
+            payload_mix: Arc::new(
+                crate::node::network_bridge::broadcast_payload_mix::PayloadMix::new(),
+            ),
             interest_manager,
             broadcast_dedup_cache: Arc::new(crate::operations::update::BroadcastDedupCache::new()),
             broadcast_coverage: Arc::new(

@@ -793,12 +793,10 @@ pub(super) async fn fanout_send_needed(
 }
 
 /// The connected peer a targeted heal (`SyncStateToPeer`) for `key` goes
-/// to, `None` when no connection has `target_addr`. A resolved heal
-/// registers its leg (`HealTarget`, #6143), as a fan-out registers its
-/// resolved targets, so the stall check has a leg for that leg's outcome.
-/// Without it a heal's skip counts toward a fan-out leg instead, and
-/// repeated converged heals can make a client update whose legs are only
-/// held look as if every leg ended unsent.
+/// to, `None` when no connection has `target_addr`. A resolved heal counts
+/// its leg (`HealTarget`, #6143), as a fan-out counts its resolved targets,
+/// so a heal's skip or send can be read against the heal legs that produced
+/// it rather than against a fan-out's targets.
 pub(super) fn resolve_heal_target(
     op_manager: &OpManager,
     key: &ContractKey,
@@ -1542,8 +1540,7 @@ mod queue {
                 record_propagation_event(op_manager, key.id(), PropagationEvent::SkipSuperseded);
             }
             // #6143: a leg dropped to make room ends without a send, possibly
-            // for another contract. A counter only: the stall check reads it
-            // as neither evidence nor a closed leg.
+            // for another contract.
             for evicted in &outcome.evicted {
                 record_propagation_event(op_manager, evicted.id(), PropagationEvent::SkipEvicted);
             }
@@ -7523,54 +7520,6 @@ mod tests {
             .events_for_test(key.id());
         assert_eq!(events.get(Ev::SentDelta), 1, "{events:?}");
         assert_eq!(events.get(Ev::SentFull), 0, "{events:?}");
-        node.handler.abort();
-    }
-
-    /// #6143: the node's summary task hands each window's stall WARN count
-    /// to the `broadcast_payload_mix` telemetry window. Drives the task
-    /// `OpManager::new` starts, on paused time.
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn the_stall_count_reaches_the_telemetry_window() {
-        use freenet_stdlib::prelude::WrappedState;
-
-        use crate::operations::update::propagation_stats::{
-            PropagationEvent as Ev, SUMMARY_WINDOW,
-        };
-
-        let settle = || async {
-            for _ in 0..50 {
-                tokio::task::yield_now().await;
-            }
-        };
-        let node = one_peer_node(
-            "bq-6143-stall-wiring",
-            WrappedState::new(vec![8u8; 32]),
-            true,
-        )
-        .await;
-        let op_manager = &node.op_manager;
-        settle().await;
-        assert_eq!(op_manager.payload_mix.origination_stalls_for_test(), 0);
-
-        // A client update whose every leg was skipped.
-        let contract = *node.key.id();
-        let stats = &op_manager.update_propagation_stats;
-        stats.record_event(contract, Ev::ClientOriginated);
-        stats.record_broadcast(contract, 3, 0);
-        for _ in 0..3 {
-            stats.record_event(contract, Ev::SkipSummaryEqual);
-        }
-
-        tokio::time::advance(SUMMARY_WINDOW).await;
-        settle().await;
-        assert_eq!(
-            op_manager.payload_mix.origination_stalls_for_test(),
-            0,
-            "the first window is grace"
-        );
-        tokio::time::advance(SUMMARY_WINDOW).await;
-        settle().await;
-        assert_eq!(op_manager.payload_mix.origination_stalls_for_test(), 1);
         node.handler.abort();
     }
 
