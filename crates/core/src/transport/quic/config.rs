@@ -368,7 +368,12 @@ pub(crate) const QUIC_CRYPTO_HOLD_BYTES: usize = QUIC_CRYPTO_BUFFER_BYTES + 32 *
 /// | CRYPTO reassembly, one space, derived ([`QUIC_CRYPTO_HOLD_BYTES`]) | 49,152 |
 /// | quinn's `stopped` map, `recycle::SEND_ABORT_LIMIT` x [`QUIC_STOPPED_ENTRY_BYTES`] | 425,984 |
 /// | ACK-only tail ([`QUIC_ACK_TAIL_BYTES`]) | 245,760 |
-/// | **total** | **860,160 (840 KiB)** |
+/// | in-order-phase hold at the initial window, under the detector (`hold::hold_charge` of [`INITIAL_RECEIVE_WINDOW_BYTES`]) | 57,868 |
+/// | **total** | **918,028 (about 897 KiB)** |
+///
+/// A data path's hold at its own window is in its buffer-budget charge
+/// (`budget`); this term covers every connection, a shadow path included,
+/// at the window it starts with.
 ///
 /// The `stopped` map is charged at the limit's worst case. quinn adds an entry
 /// when a stream's `stopped()` is polled and removes it only when the peer
@@ -388,7 +393,8 @@ pub(crate) const QUIC_CONNECTION_CHARGE_BYTES: usize = QUIC_CONNECTION_FIXED_BYT
     + MAX_UNI_STREAMS as usize * QUIC_OPEN_STREAM_BYTES
     + QUIC_CRYPTO_HOLD_BYTES
     + super::recycle::SEND_ABORT_LIMIT as usize * QUIC_STOPPED_ENTRY_BYTES
-    + QUIC_ACK_TAIL_BYTES;
+    + QUIC_ACK_TAIL_BYTES
+    + super::hold::hold_charge(INITIAL_RECEIVE_WINDOW_BYTES) as usize;
 
 /// The share of the node's memory for QUIC buffers that scale with the windows,
 /// as a divisor: one sixteenth.

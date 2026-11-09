@@ -27,6 +27,7 @@
 //! | `quic_streams_sampled_paths`, `quic_streams_open_ge_<n>`, `quic_streams_peak_max` | per path and period, the peak of inbound streams read at once: the paths sampled, those whose peak reached each level, and the highest peak |
 //! | `quic_send_resets`, `quic_path_ms` | sends a path reset on this side, and the time QUIC paths were up, shadow paths included, up to each path's last tick: resets per connection-hour is their ratio |
 //! | `quic_budget_bytes`, `quic_budget_charged_bytes`, `quic_budget_charged_peak_bytes` | the node's QUIC buffer budget, what its data paths are charged against it now (gauges, not reset, uploaded when not 0), and the most charged at once in the period (`quic::budget`) |
+//! | `quic_hold_trips`, `quic_hold_peak_pct` | times a connection's in-order-phase hold passed its threshold, and the highest hold any connection reached in the period as a percentage of its threshold (`quic::hold`) |
 //! | `quic_window_grew`, `quic_window_grow_refused`, `quic_window_shrank` | window-limited data paths whose receive window grew, those that found no room, and paths whose windows the budget lowered |
 //! | `quic_send_resets_reached_<n>`, `quic_send_resets_path_max` | paths whose lifetime reset count reached each level in the period, and the highest count a reset in the period took a path to: how close paths get to `recycle::SEND_ABORT_LIMIT` |
 //!
@@ -234,6 +235,8 @@ pub(crate) struct QuicDataCounters {
     budget_charged: AtomicU64,
     budget_charged_peak: AtomicU64,
     window_changes: [AtomicU64; 3],
+    hold_trips: AtomicU64,
+    hold_peak_pct: AtomicU64,
 }
 
 impl QuicDataCounters {
@@ -264,6 +267,8 @@ impl QuicDataCounters {
             budget_charged: zero(),
             budget_charged_peak: zero(),
             window_changes: std::array::from_fn(|_| zero()),
+            hold_trips: zero(),
+            hold_peak_pct: zero(),
         }
     }
 
@@ -444,6 +449,16 @@ impl QuicDataCounters {
         self.window_changes[index].fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A connection's hold reached `pct` percent of its threshold.
+    pub(crate) fn record_hold_level(&self, pct: u64) {
+        self.hold_peak_pct.fetch_max(pct, Ordering::Relaxed);
+    }
+
+    /// A connection's hold passed its threshold; its in-order streams are stopped.
+    pub(crate) fn record_hold_trip(&self) {
+        self.hold_trips.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// The period's counts, reset when `reset`. The gauge is read, never reset.
     pub(crate) fn snapshot(&self, reset: bool) -> QuicDataSnapshot {
         let get = |a: &AtomicU64| {
@@ -516,6 +531,8 @@ impl QuicDataCounters {
             window_grew: get(&self.window_changes[0]),
             window_grow_refused: get(&self.window_changes[1]),
             window_shrank: get(&self.window_changes[2]),
+            hold_trips: get(&self.hold_trips),
+            hold_peak_pct: get(&self.hold_peak_pct),
         }
     }
 }
@@ -570,6 +587,8 @@ pub struct QuicDataSnapshot {
     pub window_grew: u64,
     pub window_grow_refused: u64,
     pub window_shrank: u64,
+    pub hold_trips: u64,
+    pub hold_peak_pct: u64,
 }
 
 impl QuicDataSnapshot {
@@ -622,6 +641,8 @@ impl QuicDataSnapshot {
             window_grew,
             window_grow_refused,
             window_shrank,
+            hold_trips,
+            hold_peak_pct,
         } = self;
         let mut keys = Vec::new();
         let mut family = |prefix: &'static str, labels: Vec<String>, values: Vec<u64>| {
@@ -730,6 +751,8 @@ impl QuicDataSnapshot {
             ("quic_window_grew", *window_grew),
             ("quic_window_grow_refused", *window_grow_refused),
             ("quic_window_shrank", *window_shrank),
+            ("quic_hold_trips", *hold_trips),
+            ("quic_hold_peak_pct", *hold_peak_pct),
         ] {
             keys.push((None, key.to_string(), value));
         }
@@ -785,6 +808,8 @@ impl QuicDataSnapshot {
             window_grew,
             window_grow_refused,
             window_shrank,
+            hold_trips,
+            hold_peak_pct: _,
         } = self;
         let any = |values: &[u64]| values.iter().any(|n| *n != 0);
         any(sends)
@@ -813,6 +838,7 @@ impl QuicDataSnapshot {
                 *window_grew,
                 *window_grow_refused,
                 *window_shrank,
+                *hold_trips,
             ]
             .iter()
             .any(|n| *n != 0)

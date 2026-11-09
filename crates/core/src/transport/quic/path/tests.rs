@@ -6555,6 +6555,10 @@ fn a_data_paths_window_grows_when_delivery_fills_it() {
             snap.budget_charged_peak
         );
         assert!(snap.budget_charged_peak <= total);
+        assert_eq!(
+            snap.hold_trips, 0,
+            "an honest transfer never trips the hold"
+        );
     })
 }
 
@@ -6597,5 +6601,78 @@ fn only_a_path_that_takes_data_lets_its_peer_open_every_stream() {
                 .await;
             assert_eq!(opened, expected as usize, "{network}");
         }
+    })
+}
+
+/// A stream whose first datagram (its header) is lost stays in its in-order
+/// phase while the peer's other stream keeps arriving; once the datagrams since
+/// that phase began pass the hold threshold (`hold`), the stream is stopped
+/// (`EvictedHold`) and quinn frees what it held, while the other stream, whose
+/// header arrived, is delivered.
+#[test]
+fn a_stream_waiting_for_its_header_is_stopped_when_the_hold_passes_its_threshold() {
+    bounded(|| async move {
+        use crate::transport::in_memory_socket::{
+            PacketDeliveryDecision, set_packet_delivery_callback,
+        };
+        let _seed = GlobalRng::seed_guard(SEED);
+        let counters = leaked_counters();
+        let limits = QuicPathLimits {
+            counters: Some(counters),
+            // Past the threshold at the first datagram after a phase begins, so
+            // the trip comes before quinn resends the lost header.
+            hold_threshold: Some(1),
+            ..QuicPathLimits::DEFAULT
+        };
+        let network = "quic-path-hold-trip";
+        let mut p = paths(network, 29, limits).await;
+        let settle = p.time();
+        p.drive(async move { settle.sleep(Duration::from_millis(200)).await })
+            .await;
+        // The first datagram `a` sends from here, the waiting stream's header,
+        // is lost (and so is every resend of it, while the test runs).
+        let from = p.pair.a_addr;
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = seen.clone();
+        set_packet_delivery_callback(
+            network,
+            Some(Arc::new(move |_, sender, _, _| {
+                if sender == from && counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0
+                {
+                    PacketDeliveryDecision::Drop
+                } else {
+                    PacketDeliveryDecision::Deliver
+                }
+            })),
+        );
+        let raw = p.a_raw();
+        let a = p.a.clone();
+        let body = Bytes::from(payload(256 * 1024));
+        let sent = body.clone();
+        let waiting = p
+            .drive(async move {
+                // Opened first, so its header is the dropped datagram.
+                let waiting = tokio::spawn(raw_unfinished(raw, vec![9u8; 4096]));
+                tokio::task::yield_now().await;
+                a.send_stream(StreamId::next(), None, sent)
+                    .await
+                    .expect("sent");
+                waiting.await.expect("joined")
+            })
+            .await;
+        set_packet_delivery_callback(network, None);
+        assert_eq!(
+            waiting,
+            Some(u64::from(stop_code::EVICTED)),
+            "the waiting stream was stopped"
+        );
+        assert_eq!(p.b.stats().count(QuicInboundOutcome::EvictedHold), 1);
+        assert!(counters.snapshot(false).hold_trips >= 1);
+        let arrival = p
+            .b_in
+            .streams
+            .try_recv()
+            .expect("the other stream was announced");
+        assert_eq!(arrival.handle.assemble().await.expect("assembled"), body);
     })
 }

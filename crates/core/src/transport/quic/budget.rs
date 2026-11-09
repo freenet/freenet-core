@@ -8,9 +8,12 @@
 //! [`QuicBudget`], which charges the connection
 //!
 //! ```text
-//! (W + debt) + S_charged x 9/8 + gaps x GAP_BYTES + CONTROL_BUFFER_BYTES
+//! hold_charge(W + debt) + S_charged x 9/8 + gaps x GAP_BYTES + CONTROL_BUFFER_BYTES
 //! ```
 //!
+//! - **hold_charge(W + debt)**, about 3.2 x (W + debt): what quinn can hold for
+//!   the connection's streams under its hold detector (`hold`), whose threshold
+//!   the meter sets from W + debt.
 //! - **W + debt.** quinn lowers a receive window by recording a shrink debt,
 //!   paid by later credits (quinn-proto 0.11.19 `streams/state.rs`,
 //!   `set_receive_window` and `add_read_credits`), so the credit the peer may
@@ -59,6 +62,7 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 
+use super::hold::HoldDetector;
 use super::path::inbound::ConnRanges;
 use crate::transport::metrics::QuicDataCounters;
 
@@ -113,7 +117,10 @@ pub(crate) fn gap_cap(credit: u64) -> usize {
 
 /// The charge of a path at the floor windows with gaps at the floor cap.
 pub(crate) fn floor_grant(floor: u64) -> u64 {
-    floor + send_charge(floor) + MIN_GAPS_PER_CONNECTION as u64 * GAP_BYTES + CONTROL_BUFFER_BYTES
+    super::hold::hold_charge(floor)
+        + send_charge(floor)
+        + MIN_GAPS_PER_CONNECTION as u64 * GAP_BYTES
+        + CONTROL_BUFFER_BYTES
 }
 
 /// A send window's charge with quinn's sent-packet records.
@@ -181,6 +188,8 @@ struct ConnState {
     held_send: Vec<(u64, Weak<()>)>,
     /// Until when the connection counts as growing, in nanoseconds.
     growing_until: u64,
+    /// The connection's hold detector, whose threshold follows W + debt.
+    hold: Option<Arc<HoldDetector>>,
 }
 
 impl ConnState {
@@ -203,8 +212,7 @@ impl ConnState {
 
     fn charge_with(&mut self, recv_window: u64, send_window: u64) -> u64 {
         let send = self.send_charged_with(send_window);
-        recv_window
-            .saturating_add(self.debt)
+        super::hold::hold_charge(recv_window.saturating_add(self.debt))
             .saturating_add(send_charge(send))
             .saturating_add(self.fixed())
     }
@@ -219,8 +227,16 @@ impl ConnState {
         }
         self.recv_window = window;
         self.control.set_receive_window(window);
-        self.ranges
-            .set_cap(gap_cap(self.recv_window.saturating_add(self.debt)));
+        self.credit_changed();
+    }
+
+    /// W + debt moved: the gap cap and the hold threshold follow it.
+    fn credit_changed(&self) {
+        let credit = self.recv_window.saturating_add(self.debt);
+        self.ranges.set_cap(gap_cap(credit));
+        if let Some(hold) = &self.hold {
+            hold.set_threshold(super::hold::hold_threshold(credit));
+        }
     }
 
     fn set_send(&mut self, window: u64) {
@@ -288,6 +304,7 @@ impl QuicBudget {
                 send_epoch,
                 held_send: Vec::new(),
                 growing_until: 0,
+                hold: None,
             },
         );
         self.publish(&mut state);
@@ -340,7 +357,10 @@ impl QuicBudget {
         let mut state = self.state.lock();
         let (limited, cwnd) = {
             let conn = state.conns.get_mut(&id)?;
-            conn.debt = conn.debt.saturating_sub(read);
+            if read > 0 && conn.debt > 0 {
+                conn.debt = conn.debt.saturating_sub(read);
+                conn.credit_changed();
+            }
             let rtt = conn.control.rtt().max(Duration::from_millis(1));
             let rtt_nanos = u64::try_from(rtt.as_nanos()).unwrap_or(u64::MAX);
             // Contiguous delivery per round trip reached LIMITED_PERCENT of the
@@ -436,6 +456,13 @@ impl QuicBudget {
         }
     }
 
+    fn watch_hold(&self, id: u64, hold: Arc<HoldDetector>) {
+        if let Some(conn) = self.state.lock().conns.get_mut(&id) {
+            conn.hold = Some(hold);
+            conn.credit_changed();
+        }
+    }
+
     fn deregister(&self, id: u64) {
         let mut state = self.state.lock();
         state.conns.remove(&id);
@@ -467,14 +494,18 @@ impl QuicBudget {
 fn shrink_toward(conn: &mut ConnState, share: u64, floor: u64) -> bool {
     let mut lowered = false;
     let room = share.saturating_sub(conn.fixed());
-    let recv = room
-        .saturating_sub(send_charge(conn.send_window))
-        .max(floor);
+    let recv =
+        super::hold::credit_for_hold_charge(room.saturating_sub(send_charge(conn.send_window)))
+            .max(floor);
     if recv < conn.recv_window {
         conn.set_recv(recv);
         lowered = true;
     }
-    let send = (room.saturating_sub(conn.recv_window).saturating_mul(8) / 9).max(floor);
+    let send = (room
+        .saturating_sub(super::hold::hold_charge(conn.recv_window))
+        .saturating_mul(8)
+        / 9)
+    .max(floor);
     if send < conn.send_window {
         conn.set_send(send);
         lowered = true;
@@ -557,6 +588,11 @@ impl ConnMeter {
         let delivered = self.delivered.swap(0, Ordering::Relaxed);
         self.budget
             .evaluate(self.id, read, delivered, now.saturating_sub(last), now)
+    }
+
+    /// Set `hold`'s threshold from this path's W + debt from now on (`hold`).
+    pub(crate) fn watch_hold(&self, hold: Arc<HoldDetector>) {
+        self.budget.watch_hold(self.id, hold);
     }
 
     /// The epoch a stream opened now holds until it ends, which keeps a

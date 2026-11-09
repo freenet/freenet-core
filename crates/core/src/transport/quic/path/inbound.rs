@@ -114,6 +114,7 @@ use tokio::sync::mpsc;
 
 use super::super::budget::ConnMeter;
 use super::super::framing::{FrameHeader, FrameKind, HEADER_LEN, HeaderError};
+use super::super::hold::{HoldDetector, HoldPhase};
 use super::{QuicInboundOutcome, QuicPathStats, stop_code};
 use crate::simulation::TimeSource;
 use crate::transport::StreamId;
@@ -200,6 +201,9 @@ pub(in crate::transport::quic) struct Receiver<T> {
     /// The connection's share of the node's buffer budget, for a path that
     /// reads data (`budget::ConnMeter`); told of every read.
     meter: Option<Arc<ConnMeter>>,
+    /// Bounds what quinn holds for streams in their in-order phase
+    /// (`super::super::hold`).
+    hold: Option<Arc<HoldDetector>>,
     /// Panic on the next stream, to test the supervisor.
     #[cfg(test)]
     pub(in crate::transport::quic) panic_on_stream: bool,
@@ -209,6 +213,12 @@ impl<T: TimeSource> Receiver<T> {
     /// The connection's gap count.
     pub(in crate::transport::quic) fn ranges(&self) -> Arc<ConnRanges> {
         self.ranges.clone()
+    }
+
+    /// Open an in-order phase on `hold` for every stream from now on. Before
+    /// any stream is read.
+    pub(in crate::transport::quic) fn set_hold(&mut self, hold: Arc<HoldDetector>) {
+        self.hold = Some(hold);
     }
 
     /// Tell `meter` of every read from now on. Before any stream is read.
@@ -250,6 +260,7 @@ impl<T: TimeSource> Receiver<T> {
                 super::super::config::MAX_UNI_STREAMS as usize,
             )),
             meter: None,
+            hold: None,
             #[cfg(test)]
             panic_on_stream: false,
         }
@@ -312,6 +323,9 @@ enum ReadFailure {
     TooManyRanges,
     /// quinn delivered a byte twice, which an unordered read never does.
     Overlap,
+    /// The connection's hold detector tripped while the stream was in its
+    /// in-order phase (`super::super::hold`).
+    HoldEvicted,
     Other,
 }
 
@@ -375,6 +389,9 @@ struct BodyReader<T: TimeSource> {
     conn_ranges: Arc<ConnRanges>,
     /// The connection's budget meter, told of each read.
     meter: Option<Arc<ConnMeter>>,
+    /// The stream's in-order phase on the connection's hold detector, open
+    /// until the first unordered read or the stream's end.
+    phase: Option<HoldPhase>,
 }
 
 impl<T: TimeSource> BodyReader<T> {
@@ -387,6 +404,7 @@ impl<T: TimeSource> BodyReader<T> {
         idle: Duration,
         conn_ranges: Arc<ConnRanges>,
         meter: Option<Arc<ConnMeter>>,
+        hold: Option<&Arc<HoldDetector>>,
     ) -> Self {
         let now = time.now_nanos();
         let idle_nanos = nanos(idle);
@@ -408,6 +426,7 @@ impl<T: TimeSource> BodyReader<T> {
             ranges: RangeMirror::default(),
             conn_ranges,
             meter,
+            phase: hold.map(HoldDetector::begin_phase),
         }
     }
 
@@ -461,7 +480,12 @@ impl<T: TimeSource> BodyReader<T> {
                         .fetch_add(1, Ordering::Relaxed);
                     return self.on_read(read, true);
                 }
-                None => self.ordered = false,
+                None => {
+                    self.ordered = false;
+                    // Read unordered from here, quinn holds nothing for the
+                    // stream: its in-order phase is over.
+                    self.phase = None;
+                }
             }
         }
         self.read_piece(usize::MAX, false).await
@@ -521,6 +545,7 @@ impl<T: TimeSource> BodyReader<T> {
             }
             Ok(None) => {
                 self.finished = true;
+                self.phase = None;
                 Ok(None)
             }
             Err(error) => {
@@ -544,8 +569,15 @@ impl<T: TimeSource> BodyReader<T> {
             return Ok(None);
         }
         loop {
+            // Biased so a read that is ready wins over a hold trip or a timer
+            // that fired at the same time: a stream that can read in order is
+            // leaving its in-order phase, and a read is progress for the idle
+            // timer. No arm can starve another: each completes at most once
+            // per call, and the call returns or re-arms.
             tokio::select! {
+                biased;
                 read = self.recv.read_chunk(max, ordered) => return self.on_read(read, ordered),
+                () = phase_tripped(&self.phase) => return Err(ReadFailure::HoldEvicted),
                 () = &mut self.timer => {
                     let now = self.time.now_nanos();
                     // Idle first, as the UDP sweep does.
@@ -633,6 +665,54 @@ impl<T: TimeSource> BodyReader<T> {
         Ok(out.finish())
     }
 
+    /// The rest of the stream up to its declared end, which is `len` bytes
+    /// from `start` (the read position after the header), read unordered
+    /// ([`Self::next_unordered`]) into one buffer written at each piece's
+    /// offset. The buffer grows to the highest offset received, never past the
+    /// declared end, which credit and the charge already bound. `progress` is
+    /// told the bytes held after each piece.
+    async fn read_rest_unordered_with(
+        &mut self,
+        start: u64,
+        len: usize,
+        mut progress: impl FnMut(usize),
+    ) -> Result<Bytes, ReadFailure> {
+        let mut out: Vec<u8> = Vec::new();
+        let mut held = 0usize;
+        while !self.all_read() {
+            match self.next_unordered().await? {
+                Some((offset, bytes)) => {
+                    let Some(at) = offset
+                        .checked_sub(start)
+                        .and_then(|at| usize::try_from(at).ok())
+                    else {
+                        return Err(ReadFailure::Other);
+                    };
+                    let stop = at.saturating_add(bytes.len());
+                    if stop > len {
+                        return Err(ReadFailure::Overlong);
+                    }
+                    if out.len() < stop {
+                        out.resize(stop, 0);
+                    }
+                    out[at..stop].copy_from_slice(&bytes);
+                    held = held.saturating_add(bytes.len());
+                    progress(held);
+                }
+                None => return Err(ReadFailure::Truncated(held)),
+            }
+        }
+        Ok(Bytes::from(out))
+    }
+
+    /// The end of a stream read unordered, with nothing more before it.
+    async fn expect_end_unordered(&mut self) -> Result<(), ReadFailure> {
+        match self.next_unordered().await? {
+            None => Ok(()),
+            Some(_) => Err(ReadFailure::Overlong),
+        }
+    }
+
     /// The end of the stream, with nothing more before it.
     async fn expect_end(&mut self) -> Result<(), ReadFailure> {
         match self.next_chunk(usize::MAX).await? {
@@ -661,6 +741,15 @@ impl<T: TimeSource> Drop for BodyReader<T> {
             // (`ClosedStream`). See `ConnRanges::keep`.
             self.conn_ranges.keep(gaps, self.time.now_nanos());
         }
+    }
+}
+
+/// Completes when the stream's in-order phase must end because the
+/// connection's hold detector tripped; never with no phase open.
+async fn phase_tripped(phase: &Option<HoldPhase>) {
+    match phase {
+        Some(phase) => phase.tripped().await,
+        None => std::future::pending().await,
     }
 }
 
@@ -1193,6 +1282,7 @@ async fn read_one<T: TimeSource>(recv: quinn::RecvStream, receiver: Arc<Receiver
         streaming_handle_idle_timeout(),
         receiver.ranges.clone(),
         receiver.meter.clone(),
+        receiver.hold.as_ref(),
     );
     let header = match reader.read_exact(HEADER_LEN).await {
         Ok(bytes) => FrameHeader::decode(&bytes),
@@ -1310,6 +1400,11 @@ impl<T: TimeSource> Receiver<T> {
                 stats.record(QuicInboundOutcome::ReadFailed);
                 reader.stop(stop_code::EVICTED);
             }
+            ReadFailure::HoldEvicted => {
+                stats.record(QuicInboundOutcome::EvictedHold);
+                // `Recv::stop` frees what quinn held for the stream.
+                reader.stop(stop_code::EVICTED);
+            }
             ReadFailure::Reset => stats.record(QuicInboundOutcome::ResetByPeer),
             ReadFailure::ConnectionLost => stats.record(QuicInboundOutcome::ConnectionLost),
             ReadFailure::Other => stats.record(QuicInboundOutcome::ReadFailed),
@@ -1392,11 +1487,13 @@ impl<T: TimeSource> Receiver<T> {
             reader.set_age_limit(inbound_stream_age_limit(total));
         }
         let was_charged = if charged { Charged::Yes } else { Charged::No };
-        // One buffer of the charged length (see `read_exact`).
+        // Read unordered now the header gave the length (and, past one packet,
+        // it is charged), so quinn holds nothing behind a gap in the body and
+        // the stream's in-order phase ends with the header (`hold`).
         let read = {
             let token = guard.as_ref().and_then(|guard| guard.token.as_ref());
             reader
-                .read_exact_with(clamp(total), |held| {
+                .read_rest_unordered_with(HEADER_LEN as u64, clamp(total), |held| {
                     if let Some(token) = token {
                         token.report(held as u64);
                     }
@@ -1447,7 +1544,7 @@ impl<T: TimeSource> Receiver<T> {
                 return;
             }
         };
-        if let Err(failure) = reader.expect_end().await {
+        if let Err(failure) = reader.expect_end_unordered().await {
             self.fail(&mut reader, failure, was_charged);
             return;
         }

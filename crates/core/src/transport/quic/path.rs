@@ -307,6 +307,11 @@ pub(crate) struct QuicPathLimits {
     /// in a test that trips it.
     #[cfg(test)]
     pub(crate) max_gaps: usize,
+    /// A hold-detector threshold in bytes for a test path with no buffer budget
+    /// (`hold`); `None` leaves such a path without a detector. A path with a
+    /// budget always has one.
+    #[cfg(test)]
+    pub(crate) hold_threshold: Option<u64>,
 }
 
 impl QuicPathLimits {
@@ -335,6 +340,8 @@ impl QuicPathLimits {
         panic_in_watch: false,
         #[cfg(test)]
         max_gaps: inbound::MAX_GAPS_PER_CONNECTION,
+        #[cfg(test)]
+        hold_threshold: None,
     };
 
     /// [`Self::DEFAULT`] for a path in shadow mode: control frames only.
@@ -454,6 +461,11 @@ quic_outcomes! {
         /// the gaps of streams it stopped stay counted for the connection's
         /// life, because quinn keeps them until the peer ends the stream.
         ClosedTooManyRanges => "closed_too_many_ranges",
+        /// The stream was still in its in-order phase (header, metadata or
+        /// control body) when the connection's hold passed its threshold
+        /// (`quic::hold`), so it was stopped (`stop_code::EVICTED`) and quinn
+        /// freed what it held for it.
+        EvictedHold => "evicted_hold",
     }
 }
 
@@ -682,6 +694,9 @@ pub(crate) struct QuicPath {
     /// The path's share of the node's buffer budget, for a path that reads
     /// data (`budget::ConnMeter`); `None` for a shadow path.
     meter: Option<Arc<super::budget::ConnMeter>>,
+    /// Counts datagrams into the path's hold detector while the path lives
+    /// (`hold`).
+    _hold: Option<super::hold::HoldRegistration>,
     /// One permit per streamed message in flight
     /// ([`STREAMED_SEND_LIMIT`]), so the remaining uni stream slots stay
     /// for short messages and control frames. Never closed.
@@ -890,6 +905,29 @@ impl QuicPath {
         if let Some(meter) = &meter {
             receiver.set_meter(meter.clone());
         }
+        // What quinn holds for streams in their in-order phase is bounded by a
+        // detector (`hold`): from the meter's window on a data path, from the
+        // endpoint's initial window on a shadow path. A test path with no budget
+        // has one only if its limits name a threshold.
+        #[cfg(test)]
+        let test_threshold = limits.hold_threshold;
+        #[cfg(not(test))]
+        let test_threshold: Option<u64> = None;
+        let hold_threshold = match (windows, test_threshold) {
+            (Some(_), _) => Some(super::hold::hold_threshold(
+                super::config::INITIAL_RECEIVE_WINDOW_BYTES,
+            )),
+            (None, threshold) => threshold,
+        };
+        let hold =
+            hold_threshold.map(|threshold| super::hold::HoldDetector::new(threshold, stats.node()));
+        let hold_registration = hold.as_ref().map(|hold| {
+            receiver.set_hold(hold.clone());
+            if let Some(meter) = &meter {
+                meter.watch_hold(hold.clone());
+            }
+            connection.register_hold(hold)
+        });
         #[cfg(test)]
         let inbound_ranges = receiver.ranges();
         let aborts = Arc::new(SendAborts::new(
@@ -944,6 +982,7 @@ impl QuicPath {
                 receive,
                 aborts,
                 meter,
+                _hold: hold_registration,
                 stream_slots: Arc::new(tokio::sync::Semaphore::new(STREAMED_SEND_LIMIT as usize)),
                 send_data: AtomicU8::new(SEND_DATA_NEVER),
                 counted_as_data_path: std::sync::atomic::AtomicBool::new(false),

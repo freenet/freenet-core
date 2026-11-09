@@ -73,7 +73,7 @@ fn a_new_path_is_charged_its_floor_windows() {
     let a = conn(&budget, 0);
     assert_eq!(
         a.meter.charge(),
-        FLOOR + FLOOR + FLOOR / 8 + CONTROL_BUFFER_BYTES
+        crate::transport::quic::hold::hold_charge(FLOOR) + FLOOR + FLOOR / 8 + CONTROL_BUFFER_BYTES
     );
     assert!(a.meter.charge() <= floor_grant(FLOOR));
     assert_eq!(budget.charged(), a.meter.charge());
@@ -129,7 +129,7 @@ fn gapped_reads_do_not_grow_a_window() {
 /// share, and the node's charge stays within the budget.
 #[test]
 fn growing_paths_stay_within_their_share_and_the_budget() {
-    let total = 4 << 20;
+    let total = 12 << 20;
     let budget = QuicBudget::new(total, FLOOR, counters());
     let paths: Vec<Conn> = (0..4).map(|_| conn(&budget, 0)).collect();
     let mut windows = vec![FLOOR; paths.len()];
@@ -161,7 +161,7 @@ fn growing_paths_stay_within_their_share_and_the_budget() {
 /// charged, and the gap cap follows W + debt.
 #[test]
 fn a_path_above_its_share_shrinks_and_keeps_its_debt_charged_until_read() {
-    let total = 4 << 20;
+    let total = 12 << 20;
     let budget = QuicBudget::new(total, FLOOR, counters());
     let big = conn(&budget, 0);
     let mut at = 10 * MS;
@@ -206,7 +206,7 @@ fn a_path_above_its_share_shrinks_and_keeps_its_debt_charged_until_read() {
 /// is judged on W + debt, not on W alone.
 #[test]
 fn debt_counts_against_growth() {
-    let total = 4 << 20;
+    let total = 12 << 20;
     let budget = QuicBudget::new(total, FLOOR, counters());
     let a = conn(&budget, 0);
     let b = conn(&budget, 0);
@@ -264,7 +264,8 @@ fn the_floor_and_the_gap_cap_follow_the_design() {
     assert_eq!(floor_window_bytes(2 << 30), MIN_WINDOW_BYTES);
     assert_eq!(gap_cap(MIN_WINDOW_BYTES), MIN_GAPS_PER_CONNECTION);
     assert_eq!(gap_cap(MAX_WINDOW_BYTES), 8192);
-    // The design's floor grants: 354 KiB at 2 GiB and up, 218 KiB below.
-    assert_eq!(floor_grant(MIN_WINDOW_BYTES).div_ceil(1024), 354);
-    assert_eq!(floor_grant(MIN_WINDOW_SMALL_HOST_BYTES).div_ceil(1024), 218);
+    // The design's floor grants with the hold under its detector (about
+    // 3.45 x the window): 669 KiB at 2 GiB and up, 376 KiB below.
+    assert_eq!(floor_grant(MIN_WINDOW_BYTES).div_ceil(1024), 669);
+    assert_eq!(floor_grant(MIN_WINDOW_SMALL_HOST_BYTES).div_ceil(1024), 376);
 }

@@ -281,6 +281,9 @@ pub(crate) struct QuicSocket<S> {
     ingress_closed_logged: AtomicBool,
     /// Told of a panic caught here.
     health: Arc<EndpointHealth>,
+    /// Each connection's in-order-phase hold detector, told of every datagram
+    /// from its peer (`hold`).
+    holds: Arc<super::hold::HoldRegistry>,
     /// The endpoint driver's waker from its last receive, woken when the
     /// adapter catches a panic so the driver comes back to receive, gets the
     /// error and ends (it might otherwise wait for a datagram that never
@@ -406,6 +409,11 @@ impl<S> fmt::Debug for QuicSocket<S> {
 impl<S: Socket> QuicSocket<S> {
     /// Empty hold records for this socket's cap, from which each connection's
     /// own is made ([`CapHolds::like`], [`with_poller_holds`]).
+    /// The registry of this socket's connections' hold detectors.
+    pub(crate) fn hold_registry(&self) -> Arc<super::hold::HoldRegistry> {
+        self.holds.clone()
+    }
+
     pub(crate) fn cap_holds(&self) -> Arc<CapHolds> {
         self.cap_holds.clone()
     }
@@ -422,6 +430,7 @@ impl<S: Socket> QuicSocket<S> {
         Self {
             socket,
             cap_holds,
+            holds: Arc::default(),
             ingress: parking_lot::Mutex::new(ingress),
             local_addr,
             send_errors: AtomicU64::new(0),
@@ -731,8 +740,12 @@ impl<S: Socket> QuicSocket<S> {
         // would be malformed for quinn anyway, so a cut one is dropped there.
         let len = datagram.bytes.len().min(buf.len());
         buf[..len].copy_from_slice(&datagram.bytes[..len]);
+        let addr = self.quinn_addr(datagram.from);
+        // Counted as quinn gets it, under the address quinn knows the
+        // connection by (`hold`).
+        self.holds.on_datagram(addr);
         *slot = RecvMeta {
-            addr: self.quinn_addr(datagram.from),
+            addr,
             len,
             stride: len,
             ecn: None,
