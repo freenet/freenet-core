@@ -450,7 +450,8 @@ inbound session key (`handshake_unauthenticated_dropped`), QUIC endpoint deaths
 and no breaker state is left), QUIC crash-loop breaker trips at startup
 (`quic_breaker_trips`, on unix counted for any abnormal end of a QUIC-enabled
 run, not only a QUIC fault, and on Windows for three runs in a row that ended
-within ten minutes, for any reason, each starting within 24 h of the one before;
+within ten minutes after recording a panic in QUIC code (quinn, quinn-proto or
+transport/quic, by panic location), each starting within 24 h of the one before;
 see `quic/breaker.rs`) and whether the breaker keeps QUIC
 off in this process (`quic_breaker_suppressed`, a state that is never reset and
 is not activity by itself) and QUIC connections this node closed, by close code
@@ -1941,6 +1942,43 @@ Receiving: one task per connection reads every stream (FuturesUnordered,
   close code DOWNGRADE (the peer falls back to UDP). Short
   and Control go to bounded channels (full: dropped and counted); Stream
   goes through the INBOUND ADAPTER (path/inbound.rs).
+Unordered reads: the header, the metadata, and short and control bodies are
+  read IN ORDER (read_chunk(_, true)): quinn holds what arrives past a gap
+  without returning credit for it, so the connection window bounds it. A
+  Stream's payload, once charged, is read with read_chunk(_, false), so
+  quinn hands over each piece as it arrives, gap or not, and it is written at
+  its offset into the charged buffer (the Rechunker stages a fragment until it
+  is whole and holds the one that completes the stream until its end).
+  → NEVER read unordered before the header is known: an unordered read
+    returns the peer's credit for every byte read, so bytes read past a
+    missing header have no bound but the age limit.
+  → Switch only once an in-order read would block (BodyReader::next_unordered
+    drains what is contiguous first): quinn-proto 0.11.19 does not trim a
+    buffered resend against the read position at the switch, and read
+    unordered it counts those bytes as read again, so bytes_read passes the
+    final size, the end is never reported, and Recv::stop underflows.
+  A gap costs one received range (quinn's recvd set and our mirror, ~70 B);
+  gaps are counted per stream as ranges past the first, and a connection's
+  streams may hold at most inbound::MAX_GAPS_PER_CONNECTION (2,048), past
+  which the stream is stopped EVICTED and counted too_many_ranges. quinn
+  keeps a stopped stream's recvd until the peer sends FIN or RESET, and after
+  a stop nothing tells us when (received_reset returns at once). After a stop
+  quinn adds nothing to recvd, and a stopped stream holds state only while it
+  holds its slot, so at most MAX_UNI_STREAMS of them at once: the count takes
+  the sum of the MAX_UNI_STREAMS largest frozen gap counts, not of all of
+  them, so it does not grow with the connection's age; after KEPT_GAPS_GRACE
+  (30 s) each counts 32 less (a quinn peer resets a stopped stream within a
+  round trip). A second trip past the cap closes the path with
+  DOWNGRADE (closed_too_many_ranges). A Stream waiting for room in the
+  delivery channel reads its payload but NOT its end until it is announced
+  (reading the end frees quinn's slot, and the slots bound how many streams
+  can wait); one that ends short fails Truncated at once. While it waits it
+  is evicted idle if its payload stops arriving; once the payload is all
+  here only the age limit applies. A byte past the
+  declared end is Overlong as soon as it arrives, so an overlong stream can
+  fail before it is announced. GRO stays off (QuicSocket::max_receive_segments
+  is 1, pinned): with GRO a 1-byte chunk would keep a whole batch. quinn-proto
+  must be 0.11.17 or later within 0.11 (pinned from Cargo.lock).
 Inbound adapter: a Stream's payload goes into an ordinary StreamHandle,
   re-chunked to the UDP fragment shape (fragment i = bytes
   [(i-1)F, iF), F = FRAGMENT_PAYLOAD_SIZE), so fork / assemble / pipe /
@@ -2258,7 +2296,11 @@ QUIC receive flow (#5940 e5b-4):
   or a reused QUIC id with that id is taken for a new stream instead of refused.
   Full channels: a Short or Stream whose channel is full waits in its own reader
   future (reserve, raced with the stream's age limit) and is stopped EVICTED past
-  it; Control is still dropped and counted. A Short waits BEFORE its end is read
+  it; Control is still dropped and counted. A waiting Stream keeps reading its
+  payload into its charged buffer (evicted idle if the payload stops
+  arriving; once it is all here only the age limit applies), so the wait does
+  not hold the sender's flow-control credit; its end stays unread until it is
+  announced. A Short waits BEFORE its end is read
   (reading the end frees the stream and returns its credit), so waiters are
   capped by MAX_UNI_STREAMS. A Short of one packet or less
   (fits_one_packet) is not charged, as on UDP, and is bounded by that cap and
@@ -2477,10 +2519,16 @@ Liveness ("alive" = the endpoint driver has not ENDED; it does not mean
     deterministic fault recurs once per start. A panic that is not
     contained aborts the process. On unix the next start trips the breaker
     (quic_breaker_trips, see quic/breaker.rs). On Windows the breaker does
-    not look at how a run ended: it counts runs that lasted under 10 minutes,
-    so the fourth start after three such aborts in a row trips it, and an
-    abort after 10 minutes or more never does, nor do aborts a day apart
-    (quic/breaker/short_runs.rs).
+    not look at how a run ended: a panic hook records a panic located in QUIC
+    code in the run's marker, and it counts runs that lasted under 10 minutes
+    and recorded one, so the fourth start after three such aborts in a row
+    trips it. An ordinary stop records no panic and never counts; an abort
+    after 10 minutes or more never does, nor do aborts a day apart
+    (quic/breaker/short_runs.rs). A panic counts as QUIC's when the thread
+    is inside a QuicCode guard (quinn's driver polls in runtime.rs, the socket
+    adapter's catch_unwind calls) or, failing that, by location. The hook is
+    process-global: only a child-process test installs it (the arming tests
+    pass a no-op installer).
   → When the node drops its last handle, the availability is Released
     (final; the first final state stored wins, so a release and a
     driver return racing never overwrite each other) and the driver's
