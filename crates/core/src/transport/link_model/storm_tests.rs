@@ -1,4 +1,4 @@
-//! Timer retransmits under a node-wide egress cap (`EgressCap::try_take_retransmit`).
+//! Timer retransmits under a node-wide egress cap (`EgressCap::admit_retransmit`).
 //!
 //! The harness is #6100's (`fix-6100`): the real `PeerConnection` loops over
 //! `MockSocket` and the [`LinkModel`] on virtual time, as `r1_tests` does,
@@ -255,7 +255,9 @@ async fn run_storm(
 }
 
 /// Seeds for the gate. Override with `FREENET_STORM_SEEDS` (comma-separated).
-const GATE_SEEDS: [u64; 3] = [7, 0x6100_0001, 0x6100_0002];
+/// Seed 35 is the 1 MB/s seed where a wider bucket spacing trailed main by
+/// eight streams: it keeps the per-seed clause of the storm gate exercised.
+const GATE_SEEDS: [u64; 4] = [7, 0x6100_0001, 0x6100_0002, 35];
 
 fn seeds() -> Vec<u64> {
     match std::env::var("FREENET_STORM_SEEDS") {
@@ -413,8 +415,8 @@ struct ReverseLossReport {
 }
 
 /// The longest flight left at the idle point can take to drain under the
-/// abandonment rules, with retransmits capped at `rate` (derivation in
-/// RETX-CAP-DESIGN.md, "Receipt-loss flight bound"). Nothing new is sent
+/// abandonment rules, with retransmits capped at `rate` (the derivation is
+/// summarised here, term by term). Nothing new is sent
 /// after the idle point, so flight leaves only by receipt or abandonment.
 /// A packet tracked at the idle point has at most `M` =
 /// `MAX_PACKET_RETRANSMITS` resends left before the expiry that abandons it,
@@ -425,7 +427,9 @@ struct ReverseLossReport {
 /// - plus the wait for admission. A connection's resends are refused at most
 ///   one effective RTO in a row (`RETX_DEFER_LIMIT_RTOS`) before the due ones
 ///   go uncapped, so this is at most `MAX_EFFECTIVE_RTO` plus the resend
-///   yields to send them per interval, whatever else holds the cap. On an
+///   yields to send them per interval, however much other unpaced traffic
+///   holds the bucket in debt (it assumes the uncapped sends themselves go
+///   out, as the socket sends them without waiting). On an
 ///   idle node it is also at most, across all intervals, the retransmits
 ///   still possible, `M x pending x MAX_PACKET_SIZE`, at the retransmit
 ///   share of the rate; the bound takes the smaller. Plus one deferral floor
@@ -698,11 +702,14 @@ fn receipt_loss_under_a_cap_matches_or_beats_main() {
         }
     }
     // The row must exercise the cap: at the stream rate it binds.
-    if let Some(&deferred) = deferred_by_rate.get(&1_250_000) {
-        assert!(
+    match deferred_by_rate.get(&1_250_000) {
+        Some(&deferred) => assert!(
             deferred > 0,
             "premise: the cap deferred resends under receipt loss at the stream rate"
-        );
+        ),
+        None => {
+            eprintln!("premise NOT checked: FREENET_RECEIPT_RATES omits the stream rate (1250000)")
+        }
     }
     assert!(
         failures.is_empty(),

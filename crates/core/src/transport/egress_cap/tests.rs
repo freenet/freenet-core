@@ -2401,3 +2401,84 @@ fn a_booking_is_handed_back_or_costs_one_datagram() {
         "a closed connection loses one datagram"
     );
 }
+
+/// Many lossy connections at a low cap: 400 connections, each always holding
+/// a due RTO resend, on a 100 kB/s cap kept at the retransmit debt limit by
+/// other traffic, for two seconds. The bucket-refusal spacing must not run
+/// ahead without bound: slots are never handed back, so without a bound the
+/// next slot would move past the deferral limit and every refused resend
+/// would wait a full RTO and then go uncapped. No wait may pass half the
+/// deferral limit plus the bucket's own wait and the floor.
+#[test]
+fn bucket_spacing_lead_stays_bounded_with_many_lossy_connections() {
+    use crate::transport::sent_packet_tracker::ResendKind;
+    let rate = 100_000u64;
+    let (cap, time) = cap_at(rate);
+    let rto = Duration::from_millis(500);
+    let count = 400;
+    let mut runs: Vec<RetxDeferral> = (0..count).map(|_| RetxDeferral::default()).collect();
+    let start = time.now_nanos();
+    let end = start + 2_000_000_000;
+    let mut due: std::collections::BinaryHeap<std::cmp::Reverse<(u64, usize)>> =
+        (0..count).map(|i| std::cmp::Reverse((start, i))).collect();
+    let mut longest = Duration::ZERO;
+    while let Some(std::cmp::Reverse((at, i))) = due.pop() {
+        if at >= end {
+            break;
+        }
+        time.advance(Duration::from_nanos(at.saturating_sub(time.now_nanos())));
+        // At the retransmit debt limit (100 ms at 100 kB/s): every resend
+        // just misses.
+        let level = cap.level_bytes();
+        cap.charge_unpaced(usize::try_from(level + 10_000).unwrap_or(0));
+        let next = match runs[i].admit(&cap, ResendKind::Rto, PACKET, rto, at) {
+            RetxAdmit::Defer(wait) => {
+                longest = longest.max(wait);
+                at + u64::try_from(wait.as_nanos()).unwrap()
+            }
+            // The run has lasted an RTO: a new one starts after it goes.
+            RetxAdmit::Uncapped => {
+                runs[i].end_run(Some(&cap));
+                at + 1_000_000
+            }
+            other @ (RetxAdmit::Take(_) | RetxAdmit::SkipProbe) => {
+                panic!("nothing fits at the limit, got {other:?}")
+            }
+        };
+        due.push(std::cmp::Reverse((next.max(at + 1), i)));
+    }
+    // Half the deferral limit, plus the bucket's own wait (a datagram at
+    // 100 kB/s is 12 ms) and the floor: well inside the limit.
+    let ceiling = rto / 2 + Duration::from_millis(12) + RETX_DEFER_MIN;
+    assert!(ceiling < rto);
+    assert!(
+        longest <= ceiling,
+        "a bucket-refused resend waited {longest:?}, more than {ceiling:?}"
+    );
+}
+
+/// A probe the cap takes does not restart a refused RTO resend's run: the
+/// deferral limit still sends the resend uncapped one RTO after its first
+/// refusal (#4345).
+#[test]
+fn a_probe_taken_does_not_restart_the_deferral_run() {
+    use crate::transport::sent_packet_tracker::ResendKind;
+    let (held, _t) = cap_at(RATE);
+    held.charge_unpaced(BURST as usize + RATE as usize);
+    let (free, _t2) = cap_at(RATE);
+    let rto = Duration::from_millis(500);
+    let ms = |n: u64| n * 1_000_000;
+    let mut run = RetxDeferral::default();
+    assert!(matches!(
+        run.admit(&held, ResendKind::Rto, PACKET, rto, ms(1_000)),
+        RetxAdmit::Defer(_)
+    ));
+    assert!(matches!(
+        run.admit(&free, ResendKind::Probe, PACKET, rto, ms(1_200)),
+        RetxAdmit::Take(_)
+    ));
+    assert!(matches!(
+        run.admit(&held, ResendKind::Rto, PACKET, rto, ms(1_500)),
+        RetxAdmit::Uncapped
+    ));
+}

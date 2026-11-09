@@ -309,7 +309,7 @@ at most one booking per connection; refunded on run end, which an ack leads
 to, on a dropped take and on going uncapped; a closed connection loses at
 most that one datagram), so waiting connections wake one per slot; a BUCKET
 refusal waits for the next free datagram time among bucket-refused
-retransmits, two slots per datagram time (retx_bucket_next_ns, RETX_BUCKET_SPACING_DIV = 2; a timing hint, nothing paid). Booking on
+retransmits, two slots per datagram time (retx_bucket_next_ns, RETX_BUCKET_SPACING_DIV = 2; a timing hint, nothing paid; its lead is clamped to half the deferral limit, since slots are never handed back). Booking on
 bucket refusals too was tried and cost 1 MB/s storm streams (383 vs 550):
 it paced bucket-limited repairs at the share rate. Without
 it they all woke on the same deficit and node-wide wakes grew with N (97k/s
@@ -317,10 +317,12 @@ at 256 connections); pinned by
 share_waiters_wake_once_per_slot_whatever_their_number. Booking, take and
 refund are atomics only: nothing under the sent_tracker lock takes a lock.
 Counters: egress_retransmits_deferred (refusals, not packets),
-egress_retransmits_uncapped, egress_probes_skipped.
+egress_retransmits_uncapped(_bytes), egress_probes_skipped.
 The share is NODE-WIDE: one lossy peer can use it; the deferral limit bounds
 how long another connection's resend is held (one RTO).
-Flight bound derivation: RETX-CAP-DESIGN.md; pinned by
+Flight bound: (M+1) x (60 s RTO cap + PTO + floor + yield) + min(all
+remaining retransmits at the share, (M+1) x (one RTO + uncapped drain));
+derivation term by term in the flight_drain_bound rustdoc; pinned by
 link_model::storm_tests::flight_drain_bound and
 sent_packet_tracker::held_cap_debt_cannot_stop_abandonment.
 ```

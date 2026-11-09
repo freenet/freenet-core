@@ -242,9 +242,11 @@ once because their turn on the connection would have come after the 5 s deadline
 together), `egress_debt_hwm_bytes` (the largest control-traffic
 debt), `egress_debt_forgiven_bytes`, `egress_retransmits_deferred` (refusals of a
 due resend by the cap; it counts refusals, not packets, since a resend can be refused at
-several wakes), `egress_retransmits_uncapped` (resends sent anyway after being deferred
-for one retransmission timeout; non-zero means other unpaced traffic held the cap past
-the retransmit limit) and `egress_probes_skipped` (tail-loss probes the cap had no
+several wakes), `egress_retransmits_uncapped` and `egress_retransmits_uncapped_bytes` (resends sent
+anyway after a connection's resends were refused for one retransmission timeout in a
+row, and their bytes: what went out past the retransmit limits; non-zero when other
+unpaced traffic held the cap past the retransmit limit, when the retransmit share
+could not serve every waiting connection within a timeout, or at a very small cap) and `egress_probes_skipped` (tail-loss probes the cap had no
 room for). `<cause>` is what took most of the gap: `cap`
 (sleeping for the node-wide cap), `connection` (sleeping for the connection's own
 bucket) or `other` (mostly waiting for the congestion window, or for the upstream stream when the stream is relayed). `egress_waited` and the
