@@ -1515,9 +1515,10 @@ exposes (its module doc lists the few it does not):
   max_udp_payload / initial and min MTU 1200, no MTU discovery, no GSO,
   keepalive 15 s (None when the TimeSource disables keepalive), idle = the
   TimeSource's connection idle timeout, Cubic with its window capped to the
-  configured bandwidth (recycle::CappedCubic), 64 uni / 0 bidi streams,
-  receive / send window = the floor (128 KiB, 64 KiB under 2 GiB), stream
-  receive window 8 MiB, data paths' windows then set by the buffer budget, no unreliable datagrams, no
+  configured bandwidth (recycle::CappedCubic), 4 uni / 0 bidi streams and a
+  16 KiB receive window until a path takes data (a data path raises the
+  streams to 64 and its meter the windows), send window the floor (128 KiB,
+  64 KiB under 2 GiB), stream receive window 8 MiB, no unreliable datagrams, no
   spin bit, migration off, max_incoming 64, incoming buffers 64 KiB / 1 MiB,
   no NEW_TOKEN tokens (Retry only), rustls ring, TLS 1.3, fixed ALPN, no SNI, no
   resumption, no early data. Keys and seeds (reset key, token key, CID key,
@@ -1528,16 +1529,21 @@ Connection IDs (quic/cid.rs) carry a keyed BLAKE3 MAC, so quinn drops a
   generator can be spoofed and would answer it with a stateless reset.
 ```
 
-QUIC memory: every connection starts at the floor window (128 KiB, or 64 KiB
-under 2 GiB, `budget::floor_window_bytes`) for its connection receive and
-send windows, and the stream receive window is the largest a connection
-grows to (`budget::MAX_WINDOW_BYTES`, 8 MiB); all are capped at
+QUIC memory: every connection starts with a 16 KiB receive window and 4 uni
+streams (`config::INITIAL_RECEIVE_WINDOW_BYTES`, `INITIAL_UNI_STREAMS`): quinn
+cannot take a grant back, and a stream in its in-order phase can make quinn
+hold several times the window in datagrams. A path that takes data raises
+the streams to 64 at build and its meter raises the receive window to the
+floor (128 KiB, or 64 KiB under 2 GiB, `budget::floor_window_bytes`); the
+send window starts at the floor, and the stream receive window is the
+largest a connection grows to (`budget::MAX_WINDOW_BYTES`, 8 MiB); all are capped at
 `MAX_INBOUND_STREAM_BYTES_PER_CONNECTION`, which does not bind today
 (`windows_never_exceed_the_reassembly_allowance` guards future constant
-changes). A shadow path keeps the floor. A data path registers a
+changes). A shadow path keeps the initial window. A data path registers a
 `budget::ConnMeter` with the node's `budget::QuicBudget` (memory / 16,
-`quic_buffer_budget_for`), which charges it (W + debt) + send x 9/8 +
-gaps x 70 B + 64 KiB and sets its windows at runtime
+`quic_buffer_budget_for`), which charges it hold::hold_charge(W + debt)
+(about 3.45 x, below) + send x 9/8 + gaps x 70 B + 64 KiB and sets its
+windows at runtime
 (`quinn::Connection::set_receive_window` / `set_send_window`):
   → W + debt: quinn records a shrink as debt paid by later credits; the
     meter mirrors it from the bytes the reader reads (credits from a STOP
@@ -1559,6 +1565,30 @@ gaps x 70 B + 64 KiB and sets its windows at runtime
     and at each 2 s acknowledgement-watch tick.
   Telemetry: quic_budget_bytes, quic_budget_charged_bytes and
   quic_budget_charged_peak_bytes, quic_window_grew, _grow_refused, _shrank.
+  In-order-phase hold (quic/hold.rs): headers, metadata and control bodies are
+  read in order, and quinn keeps a whole datagram per frame behind a gap
+  (measured 4 to 5.3 x the window with nothing read). Short bodies and Stream
+  payloads are read unordered once the header gave their length, so an
+  in-order phase spans at most 18 + 1,120 B or a 4 KiB control body. The
+  socket adapter counts each connection's datagrams as it hands them to
+  quinn (HoldRegistry, keyed by the address quinn knows); each stream opens a
+  phase at accept and closes it at its first unordered read or its end. quinn
+  holds at most 1,344 B per datagram received since the OLDEST open phase
+  began plus a compaction copy of at most 1.25 x (W + debt) (pinned by
+  memory_tests::quinn_holds_no_more_than_its_received_datagrams; from the
+  phase start, not the start of a blocked read, since data from an earlier
+  block can still be held). Past the threshold, HOLD_THRESHOLD_TENTHS (2.2,
+  provisional until the 3c harness measures honest false stops under loss)
+  of W + debt (the meter sets it; a shadow path's is at the initial window),
+  every stream still in its phase is stopped EVICTED (evicted_hold) and quinn
+  frees what it held; counted quic_hold_trips, with quic_hold_peak_pct the
+  period's highest hold as a share of its threshold. The per-datagram check
+  bounds the hold at any instant; spreading across connections does not
+  defeat it, since each is held to its own threshold and the charges sum.
+  The reader's select is biased toward a ready read, so a stream that can
+  leave its phase is not stopped by a trip seen in the same poll.
+  Relies on quinn 0.11.12 / quinn-proto 0.11.19 retaining only received
+  datagrams (QUIC_MEMORY_MEASURED_WITH pins the versions).
   Not metered: unread chunks between two polls of a reader, and the fixed
   per-connection terms (`QUIC_CONNECTION_CHARGE_BYTES`).
 `quic/config.rs` pins MEASUREMENTS of named terms under stated conditions
@@ -1988,10 +2018,12 @@ Receiving: one task per connection reads every stream (FuturesUnordered,
   close code DOWNGRADE (the peer falls back to UDP). Short
   and Control go to bounded channels (full: dropped and counted); Stream
   goes through the INBOUND ADAPTER (path/inbound.rs).
-Unordered reads: the header, the metadata, and short and control bodies are
-  read IN ORDER (read_chunk(_, true)): quinn holds what arrives past a gap
-  without returning credit for it, so the connection window bounds it. A
-  Stream's payload, once charged, is read with read_chunk(_, false), so
+Unordered reads: the header, the metadata and control bodies are read IN
+  ORDER (read_chunk(_, true)): quinn holds what arrives past a gap without
+  returning credit for it, bounded by the hold detector above. A Short's body
+  is read unordered into one buffer at each piece's offset (growing to the
+  highest offset received, exact at the end). A Stream's payload, once
+  charged, is read with read_chunk(_, false), so
   quinn hands over each piece as it arrives, gap or not, and it is written at
   its offset into the charged buffer (the Rechunker stages a fragment until it
   is whole and holds the one that completes the stream until its end).
@@ -2005,7 +2037,7 @@ Unordered reads: the header, the metadata, and short and control bodies are
     final size, the end is never reported, and Recv::stop underflows.
   A gap costs one received range (quinn's recvd set and our mirror, ~70 B);
   gaps are counted per stream as ranges past the first, and a connection's
-  streams may hold at most inbound::MAX_GAPS_PER_CONNECTION (2,048), past
+  streams may hold at most R_conn (budget::gap_cap, max(256, (W + debt) / 1 KiB); 256 without a meter), past
   which the stream is stopped EVICTED and counted too_many_ranges. quinn
   keeps a stopped stream's recvd until the peer sends FIN or RESET, and after
   a stop nothing tells us when (received_reset returns at once). After a stop
