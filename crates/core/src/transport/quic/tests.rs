@@ -2163,6 +2163,19 @@ fn with_poller_holds_puts_the_slot_back() {
     assert!(next_poller_holds().is_none());
 }
 
+/// GRO stays off: quinn copies a GRO batch into one allocation and splits
+/// it (`quinn/src/endpoint.rs`), so with GRO a 1-byte STREAM chunk could keep
+/// a whole batch (up to about 64 KiB) alive; the inbound reader's memory
+/// accounting assumes one datagram per allocation.
+#[test]
+fn the_quic_socket_receives_one_datagram_per_allocation() {
+    use quinn::AsyncUdpSocket;
+    let time = VirtualTime::new();
+    let local: SocketAddr = "10.201.43.1:5000".parse().unwrap();
+    let (socket, _demux) = scripted(local, SendMode::Send, Vec::new(), Some((1_000_000, &time)));
+    assert_eq!(socket.max_receive_segments(), 1);
+}
+
 /// A poller built outside `with_poller_holds` (quinn 0.11.12 builds one only
 /// on a rebind, which needs migration, which is off) is counted on its own
 /// socket's template record, where a test can see it, and one built inside

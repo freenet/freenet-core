@@ -1941,6 +1941,21 @@ Receiving: one task per connection reads every stream (FuturesUnordered,
   close code DOWNGRADE (the peer falls back to UDP). Short
   and Control go to bounded channels (full: dropped and counted); Stream
   goes through the INBOUND ADAPTER (path/inbound.rs).
+Unordered reads: every inbound stream is read with read_chunk(_, false) from
+  its first byte, so quinn's assembler hands over each piece as it arrives,
+  gap or not, and holds none of a stream's bytes behind a gap. Header,
+  metadata, short and control bodies are assembled in order from the pieces
+  (early pieces copied and staged; unique bytes, so bounded by the
+  connection's credit); a Stream's payload is written at its offset into the
+  charged buffer (the Rechunker stages a fragment until it is whole and holds
+  the last one to complete until the stream's end). A gap costs one received
+  range (quinn's recvd set and our mirror, ~70 B); a connection's streams may
+  hold at most inbound::MAX_RANGES_PER_CONNECTION (2,048), past which the
+  stream is stopped EVICTED and counted too_many_ranges. A byte past the
+  declared end is Overlong as soon as it arrives, so an overlong stream can
+  fail before it is announced. GRO stays off (QuicSocket::max_receive_segments
+  is 1, pinned): with GRO a 1-byte chunk would keep a whole batch. quinn-proto
+  must be 0.11.17 or later within 0.11 (pinned from Cargo.lock).
 Inbound adapter: a Stream's payload goes into an ordinary StreamHandle,
   re-chunked to the UDP fragment shape (fragment i = bytes
   [(i-1)F, iF), F = FRAGMENT_PAYLOAD_SIZE), so fork / assemble / pipe /
@@ -2258,7 +2273,9 @@ QUIC receive flow (#5940 e5b-4):
   or a reused QUIC id with that id is taken for a new stream instead of refused.
   Full channels: a Short or Stream whose channel is full waits in its own reader
   future (reserve, raced with the stream's age limit) and is stopped EVICTED past
-  it; Control is still dropped and counted. A Short waits BEFORE its end is read
+  it; Control is still dropped and counted. A waiting Stream keeps reading its
+  payload into its charged buffer (idleness is not judged meanwhile), so the
+  wait does not hold the sender's flow-control credit. A Short waits BEFORE its end is read
   (reading the end frees the stream and returns its credit), so waiters are
   capped by MAX_UNI_STREAMS. A Short of one packet or less
   (fits_one_packet) is not charged, as on UDP, and is bounded by that cap and

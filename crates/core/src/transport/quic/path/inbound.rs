@@ -7,6 +7,19 @@
 //! of the UDP shape ([`Rechunker`]), so `fork`, `assemble`, `pipe_stream`,
 //! `StreamIdentity` and the orphan registry work unchanged.
 //!
+//! Every stream is read unordered from its first byte
+//! (`read_chunk(_, false)`, [`BodyReader::next_unordered`]): quinn's
+//! assembler hands over each piece as it arrives, gap or not, so it holds
+//! none of the stream's bytes waiting for a gap to fill (a peer that leaves a
+//! gap cannot make quinn hold the bytes after it). The header, metadata,
+//! short and control bodies are assembled in order from those pieces, copying
+//! the ones that arrive early ([`BodyReader::next_chunk`]); a `Stream`'s
+//! payload goes straight into its charged buffer at its offset. What a gap
+//! still costs is one received range per stream (quinn's and our mirror,
+//! [`RangeMirror`]), capped per connection ([`MAX_RANGES_PER_CONNECTION`]).
+//! A stream waiting for room in the delivery channel keeps reading its
+//! payload, so the wait never holds the peer's flow-control credit.
+//!
 //! Admission follows the UDP transport's rules (`.claude/rules/transport.md`,
 //! "WHEN admitting or sending a stream"):
 //! - Before anything is created from a declared length, the header has
@@ -56,12 +69,12 @@
 //! in, so keeping a 1-byte chunk keeps its whole ~1200-byte datagram. The
 //! header, metadata, short and control reads therefore copy each chunk into
 //! one buffer that grows as data arrives and ends exactly the declared
-//! length (`ReadBuffer`), and keep no chunk. The payload of a `Stream` is
-//! copied into fragments by the `Rechunker`, each in a fresh buffer of
-//! exactly its length, so a fragment pins only its own bytes whatever
-//! quinn's chunks were (including after quinn-proto's `Assembler::defragment`,
-//! which the peer can trigger and which merges buffered data into one large
-//! allocation). A fragment `Bytes` may therefore outlive the inbound charge.
+//! length (`ReadBuffer`), and copy pieces that arrive before their turn
+//! (staged, unique bytes, so bounded by the connection's credit). The
+//! payload of a `Stream` is copied into fragments by the `Rechunker`, each a
+//! buffer of exactly its length filled at its offsets, so a fragment pins
+//! only its own bytes whatever quinn's chunks were. A fragment `Bytes` may
+//! therefore outlive the inbound charge.
 //!
 //! Simulation: `VirtualSleep` has no deregistration on drop, so each
 //! stream's last armed timer stays in `VirtualTime`'s pending wakeups until
@@ -79,10 +92,11 @@
 //! same id arrives, before it is refused as `StreamIdInUse`. Completed ids
 //! are not remembered, so once released an id can be used again.
 
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
@@ -172,12 +186,20 @@ pub(in crate::transport::quic) struct Receiver<T> {
     accept_data: bool,
     /// Closes the path on the first data frame it refuses ([`Self::accept_data`]).
     closer: super::super::QuicCloser,
+    /// The connection's received ranges over all its streams.
+    ranges: Arc<ConnRanges>,
     /// Panic on the next stream, to test the supervisor.
     #[cfg(test)]
     pub(in crate::transport::quic) panic_on_stream: bool,
 }
 
 impl<T: TimeSource> Receiver<T> {
+    /// The connection's range count. Tests only.
+    #[cfg(test)]
+    pub(in crate::transport::quic) fn ranges(&self) -> Arc<ConnRanges> {
+        self.ranges.clone()
+    }
+
     pub(in crate::transport::quic) fn new(
         time: T,
         budget: SharedInboundBudget,
@@ -198,6 +220,7 @@ impl<T: TimeSource> Receiver<T> {
             next_short_key: AtomicU32::new(1),
             accept_data,
             closer,
+            ranges: Arc::new(ConnRanges::new(MAX_RANGES_PER_CONNECTION)),
             #[cfg(test)]
             panic_on_stream: false,
         }
@@ -255,6 +278,11 @@ enum ReadFailure {
     Age,
     Reset,
     ConnectionLost,
+    /// The connection's streams held more received ranges than
+    /// [`MAX_RANGES_PER_CONNECTION`] (gaps the peer left).
+    TooManyRanges,
+    /// quinn delivered a byte twice, which an unordered read never does.
+    Overlap,
     Other,
 }
 
@@ -301,13 +329,30 @@ struct BodyReader<T: TimeSource> {
     timer: Pin<Box<dyn Future<Output = ()> + Send>>,
     /// The deadline `timer` is armed for.
     timer_at: u64,
+    /// Idleness is not judged while this side is the one waiting (a full
+    /// delivery channel): only the age limit applies.
+    idle_paused: bool,
+    /// The next stream offset an in-order read ([`Self::next_chunk`]) wants.
+    next: u64,
+    /// Bytes received past `next`, copied out of quinn's datagrams, by offset.
+    /// Unique bytes, so their total is bounded by the connection's credit.
+    staged: BTreeMap<u64, Bytes>,
+    /// One past the last offset this stream may carry, once its header is
+    /// known; a byte past it is `Overlong`.
+    end: Option<u64>,
+    /// quinn reported the end of the stream.
+    finished: bool,
+    /// Every byte range received on this stream, merged.
+    ranges: RangeMirror,
+    /// The connection's count of ranges over all its streams.
+    conn_ranges: Arc<ConnRanges>,
 }
 
 impl<T: TimeSource> BodyReader<T> {
     /// A reader with the idle timeout and an age limit of
     /// [`uncharged_age_limit`]; admission replaces the age limit with the
     /// stream's own ([`Self::set_age_limit`]).
-    fn new(recv: quinn::RecvStream, time: T, idle: Duration) -> Self {
+    fn new(recv: quinn::RecvStream, time: T, idle: Duration, conn_ranges: Arc<ConnRanges>) -> Self {
         let now = time.now_nanos();
         let idle_nanos = nanos(idle);
         let age_deadline = now.saturating_add(nanos(uncharged_age_limit()));
@@ -321,13 +366,104 @@ impl<T: TimeSource> BodyReader<T> {
             last_progress: now,
             timer,
             timer_at,
+            idle_paused: false,
+            next: 0,
+            staged: BTreeMap::new(),
+            end: None,
+            finished: false,
+            ranges: RangeMirror::default(),
+            conn_ranges,
         }
     }
 
     fn deadline(&self) -> u64 {
+        if self.idle_paused {
+            return self.age_deadline;
+        }
         self.last_progress
             .saturating_add(self.idle_nanos)
             .min(self.age_deadline)
+    }
+
+    /// The stream may carry bytes up to `end` (exclusive), counted from its
+    /// first byte (the header's).
+    fn set_end(&mut self, end: u64) {
+        self.end = Some(end);
+    }
+
+    /// Stop judging idleness ([`Self::idle_paused`]); the armed timer is
+    /// moved to the age deadline if it was set for the idle one.
+    fn pause_idle(&mut self) {
+        self.idle_paused = true;
+        if self.timer_at != self.age_deadline {
+            self.timer_at = self.age_deadline;
+            self.timer = self.time.sleep_until(self.timer_at);
+        }
+    }
+
+    /// Judge idleness again, from now.
+    fn resume_idle(&mut self) {
+        self.idle_paused = false;
+        self.last_progress = self.time.now_nanos();
+        self.timer_at = self.deadline();
+        self.timer = self.time.sleep_until(self.timer_at);
+    }
+
+    /// The next piece of the stream in arrival order, with its offset, or
+    /// `None` at the end. Read unordered (`read_chunk(max, false)`), so quinn's
+    /// assembler releases each chunk as soon as it arrives, gap or not: the
+    /// bytes then live only where the caller copies them. Checks the declared
+    /// end and the connection's range cap.
+    async fn next_unordered(&mut self) -> Result<Option<(u64, Bytes)>, ReadFailure> {
+        if self.finished {
+            return Ok(None);
+        }
+        loop {
+            tokio::select! {
+                read = self.recv.read_chunk(usize::MAX, false) => {
+                    return match read {
+                        Ok(Some(chunk)) => {
+                            self.last_progress = self.time.now_nanos();
+                            let start = chunk.offset;
+                            let stop = start.saturating_add(chunk.bytes.len() as u64);
+                            if self.end.is_some_and(|end| stop > end) {
+                                return Err(ReadFailure::Overlong);
+                            }
+                            let added = self.ranges.insert(start, stop)?;
+                            if !self.conn_ranges.add(added) {
+                                return Err(ReadFailure::TooManyRanges);
+                            }
+                            Ok(Some((start, chunk.bytes)))
+                        }
+                        Ok(None) => {
+                            self.finished = true;
+                            Ok(None)
+                        }
+                        Err(error) => Err(error.into()),
+                    };
+                }
+                () = &mut self.timer => {
+                    let now = self.time.now_nanos();
+                    // Idle first, as the UDP sweep does.
+                    if !self.idle_paused
+                        && now >= self.last_progress.saturating_add(self.idle_nanos)
+                    {
+                        return Err(ReadFailure::Idle);
+                    }
+                    if now >= self.age_deadline {
+                        return Err(ReadFailure::Age);
+                    }
+                    self.timer_at = self.deadline();
+                    self.timer = self.time.sleep_until(self.timer_at);
+                }
+            }
+        }
+    }
+
+    /// Take out every staged piece, in offset order: the payload phase takes
+    /// over from the in-order reads.
+    fn take_staged(&mut self) -> Vec<(u64, Bytes)> {
+        std::mem::take(&mut self.staged).into_iter().collect()
     }
 
     /// Start the age limit, from now. The armed timer is kept when it
@@ -346,32 +482,36 @@ impl<T: TimeSource> BodyReader<T> {
         }
     }
 
-    /// The next chunk of at most `max` bytes (at least 1), or `None` at the
-    /// end of the stream.
+    /// The next chunk of at most `max` bytes (at least 1) at the in-order
+    /// position, or `None` at the end of the stream. Pieces that arrive past
+    /// the position are copied and staged until the gap before them fills.
     async fn next_chunk(&mut self, max: usize) -> Result<Option<Bytes>, ReadFailure> {
         loop {
-            tokio::select! {
-                read = self.recv.read_chunk(max, true) => {
-                    return match read {
-                        Ok(Some(chunk)) => {
-                            self.last_progress = self.time.now_nanos();
-                            Ok(Some(chunk.bytes))
-                        }
-                        Ok(None) => Ok(None),
-                        Err(error) => Err(error.into()),
-                    };
+            if let Some(entry) = self.staged.first_entry()
+                && *entry.key() == self.next
+            {
+                let mut piece = entry.remove();
+                if piece.len() > max {
+                    let rest = piece.split_off(max);
+                    self.staged.insert(self.next + max as u64, rest);
                 }
-                () = &mut self.timer => {
-                    let now = self.time.now_nanos();
-                    // Idle first, as the UDP sweep does.
-                    if now >= self.last_progress.saturating_add(self.idle_nanos) {
-                        return Err(ReadFailure::Idle);
+                self.next += piece.len() as u64;
+                return Ok(Some(piece));
+            }
+            match self.next_unordered().await? {
+                None => return Ok(None),
+                Some((offset, mut bytes)) if offset == self.next => {
+                    if bytes.len() > max {
+                        let rest = Bytes::copy_from_slice(&bytes[max..]);
+                        bytes.truncate(max);
+                        self.staged.insert(self.next + max as u64, rest);
                     }
-                    if now >= self.age_deadline {
-                        return Err(ReadFailure::Age);
-                    }
-                    self.timer_at = self.deadline();
-                    self.timer = self.time.sleep_until(self.timer_at);
+                    self.next += bytes.len() as u64;
+                    return Ok(Some(bytes));
+                }
+                Some((offset, bytes)) => {
+                    // Copied, so the staged bytes do not keep quinn's datagram.
+                    self.staged.insert(offset, Bytes::copy_from_slice(&bytes));
                 }
             }
         }
@@ -444,6 +584,118 @@ impl<T: TimeSource> BodyReader<T> {
     /// ended.
     fn stop(&mut self, code: u32) {
         self.recv.stop(code.into()).ok();
+    }
+}
+
+impl<T: TimeSource> Drop for BodyReader<T> {
+    fn drop(&mut self) {
+        self.conn_ranges.remove(self.ranges.len());
+    }
+}
+
+/// Most byte ranges a connection's streams may hold at once, counted as
+/// disjoint received ranges per stream ([`RangeMirror`]). Each range costs
+/// about 70 B (quinn's `recvd` entry, which nothing in quinn caps, and our
+/// mirror), and each gap costs the peer at least one byte of credit. One
+/// range per KiB of the largest connection window (2,048, about 140 KB); honest
+/// loss leaves about loss x packets in flight, far fewer.
+pub(in crate::transport::quic) const MAX_RANGES_PER_CONNECTION: usize =
+    (super::super::config::MAX_WINDOW_BYTES / 1024) as usize;
+
+/// A connection's count of received ranges over its streams, against
+/// [`MAX_RANGES_PER_CONNECTION`].
+#[derive(Debug)]
+pub(in crate::transport::quic) struct ConnRanges {
+    held: AtomicUsize,
+    cap: usize,
+    /// The most held at once. Tests only.
+    #[cfg(test)]
+    peak: AtomicUsize,
+}
+
+impl ConnRanges {
+    pub(in crate::transport::quic) fn new(cap: usize) -> Self {
+        Self {
+            held: AtomicUsize::new(0),
+            cap,
+            #[cfg(test)]
+            peak: AtomicUsize::new(0),
+        }
+    }
+
+    /// Change the count by `delta`; false if it is now past the cap.
+    fn add(&self, delta: isize) -> bool {
+        let held = if delta >= 0 {
+            self.held.fetch_add(delta.unsigned_abs(), Ordering::Relaxed) + delta.unsigned_abs()
+        } else {
+            self.held
+                .fetch_sub(delta.unsigned_abs(), Ordering::Relaxed)
+                .saturating_sub(delta.unsigned_abs())
+        };
+        #[cfg(test)]
+        self.peak.fetch_max(held, Ordering::Relaxed);
+        held <= self.cap
+    }
+
+    fn remove(&self, ranges: usize) {
+        self.held.fetch_sub(ranges, Ordering::Relaxed);
+    }
+
+    /// The most ranges held at once. Tests only.
+    #[cfg(test)]
+    pub(in crate::transport::quic) fn peak(&self) -> usize {
+        self.peak.load(Ordering::Relaxed)
+    }
+
+    /// Ranges held now. Tests only.
+    #[cfg(test)]
+    pub(in crate::transport::quic) fn held(&self) -> usize {
+        self.held.load(Ordering::Relaxed)
+    }
+}
+
+/// The byte ranges received on one stream, merged, sorted by start.
+#[derive(Debug, Default)]
+struct RangeMirror {
+    ranges: Vec<(u64, u64)>,
+}
+
+impl RangeMirror {
+    fn len(&self) -> usize {
+        self.ranges.len()
+    }
+
+    /// Record `start..stop`; returns how the number of ranges changed (+1 for
+    /// an isolated range, 0 when it extends one, negative when it joins
+    /// several), or `Overlap` if any byte was already received.
+    fn insert(&mut self, start: u64, stop: u64) -> Result<isize, ReadFailure> {
+        if start >= stop {
+            return Ok(0);
+        }
+        // First range ending at or after `start`.
+        let i = self.ranges.partition_point(|&(_, end)| end < start);
+        // Ranges from `i` that touch or overlap `start..stop`.
+        let mut j = i;
+        while j < self.ranges.len() && self.ranges[j].0 <= stop {
+            let (s, e) = self.ranges[j];
+            if s < stop && e > start {
+                return Err(ReadFailure::Overlap);
+            }
+            j += 1;
+        }
+        let before = self.ranges.len();
+        let merged_start = if i < j {
+            self.ranges[i].0.min(start)
+        } else {
+            start
+        };
+        let merged_stop = if i < j {
+            self.ranges[j - 1].1.max(stop)
+        } else {
+            stop
+        };
+        self.ranges.splice(i..j, [(merged_start, merged_stop)]);
+        Ok(self.ranges.len() as isize - before as isize)
     }
 }
 
@@ -529,92 +781,107 @@ fn uncharged_age_limit() -> Duration {
     inbound_stream_age_limit(0)
 }
 
-/// Numbered fragments, in order.
+/// Numbered fragments.
 type Fragments = Vec<(u32, Bytes)>;
 
-/// Cuts a byte stream of `total` bytes into fragments of the UDP stream
-/// shape: fragment `i` holds bytes `[(i-1)F, iF)` with
-/// `F = FRAGMENT_PAYLOAD_SIZE`, so every fragment is full except the last,
-/// none is empty, and there are `ceil(total / F)` of them (the buffer has
-/// one more slot, for senders that shorten fragment #1).
+/// Cuts the payload of a stream of `total` bytes, arriving in pieces at any
+/// offset, into fragments of the UDP stream shape: fragment `i` holds bytes
+/// `[(i-1)F, iF)` with `F = FRAGMENT_PAYLOAD_SIZE`, so every fragment is full
+/// except the last, none is empty, and there are `ceil(total / F)` of them
+/// (the buffer has one more slot, for senders that shorten fragment #1).
 ///
+/// A fragment is staged in a buffer of exactly its length until all its bytes
+/// have arrived, then handed out. Staged bytes are payload bytes held once
+/// (the buffer becomes the fragment), so they are inside the stream's charge.
 /// The fragment that completes the stream is held back until
-/// [`Self::finish`], which the caller calls only at the end of the stream,
-/// so the buffer never reports a stream complete that then turns out to be
-/// longer than declared.
+/// [`Self::finish`], which the caller calls only at the end of the stream, so
+/// the buffer never reports a stream complete that then turns out to be longer
+/// than declared.
 struct Rechunker {
     total: u64,
     received: u64,
-    /// Bytes handed out in fragments.
-    emitted: u64,
-    next_fragment: u32,
-    pending: BytesMut,
+    fragments: u32,
+    completed: u32,
+    /// Fragments with some of their bytes: the buffer and how many it holds.
+    partial: HashMap<u32, (BytesMut, usize)>,
+    /// The fragment that completed the stream, until its end is seen.
+    held: Option<(u32, Bytes)>,
 }
 
 impl Rechunker {
     fn new(total: u64) -> Self {
+        let full = FRAGMENT_PAYLOAD_SIZE as u64;
         Self {
             total,
             received: 0,
-            emitted: 0,
-            next_fragment: 1,
-            pending: BytesMut::new(),
+            fragments: u32::try_from(total.div_ceil(full)).unwrap_or(u32::MAX),
+            completed: 0,
+            partial: HashMap::new(),
+            held: None,
         }
     }
 
-    /// Bytes still expected.
-    fn remaining(&self) -> u64 {
-        self.total - self.received
+    fn fragment_len(&self, number: u32) -> usize {
+        let full = FRAGMENT_PAYLOAD_SIZE as u64;
+        let start = u64::from(number - 1) * full;
+        (self.total - start).min(full) as usize
     }
 
-    /// Take `chunk`, returning the fragments it completed, in order. Every
-    /// fragment is copied into a buffer of its own: none shares an
-    /// allocation with `chunk` or with another fragment.
-    fn feed(&mut self, mut chunk: Bytes) -> Result<Fragments, ReadFailure> {
-        let len = chunk.len() as u64;
-        if len > self.remaining() {
+    /// Take `data`, which starts at payload offset `offset`, returning the
+    /// fragments it completed. Every fragment is a buffer of its own: none
+    /// shares an allocation with `data` or with another fragment. The caller
+    /// guarantees no byte is fed twice (`RangeMirror`).
+    fn feed(&mut self, offset: u64, data: &[u8]) -> Result<Fragments, ReadFailure> {
+        let len = data.len() as u64;
+        if offset.checked_add(len).is_none_or(|stop| stop > self.total) {
             return Err(ReadFailure::Overlong);
         }
         self.received += len;
-        let full = FRAGMENT_PAYLOAD_SIZE;
+        let full = FRAGMENT_PAYLOAD_SIZE as u64;
         let mut out = Vec::new();
-        while !chunk.is_empty() {
-            // A fragment may go out only if it does not end the stream.
-            let can_emit = self.emitted + (full as u64) < self.total;
-            if self.pending.is_empty() {
-                // A fresh buffer of exactly this fragment's length, so it
-                // never grows (a grown buffer would be kept, up to twice the
-                // fragment) and never shares an allocation with the next one.
-                let this_fragment = (self.total - self.emitted).min(full as u64) as usize;
-                self.pending = BytesMut::with_capacity(this_fragment);
+        let mut pos = offset;
+        let mut rest = data;
+        while !rest.is_empty() {
+            let number = u32::try_from(pos / full + 1).unwrap_or(u32::MAX);
+            let within = (pos % full) as usize;
+            let frag_len = self.fragment_len(number);
+            let take = (frag_len - within).min(rest.len());
+            let (buf, filled) = self
+                .partial
+                .entry(number)
+                .or_insert_with(|| (BytesMut::zeroed(frag_len), 0));
+            buf[within..within + take].copy_from_slice(&rest[..take]);
+            *filled += take;
+            if *filled == frag_len {
+                let (buf, _) = self
+                    .partial
+                    .remove(&number)
+                    .expect("the entry was just filled");
+                self.completed += 1;
+                let fragment = buf.freeze();
+                if self.completed == self.fragments {
+                    self.held = Some((number, fragment));
+                } else {
+                    out.push((number, fragment));
+                }
             }
-            let take = (full - self.pending.len()).min(chunk.len());
-            self.pending.extend_from_slice(&chunk.split_to(take));
-            if self.pending.len() == full && can_emit {
-                let fragment = std::mem::take(&mut self.pending).freeze();
-                out.push(self.emit(fragment));
-            }
+            pos += take as u64;
+            rest = &rest[take..];
         }
         Ok(out)
     }
 
-    fn emit(&mut self, fragment: Bytes) -> (u32, Bytes) {
-        self.emitted += fragment.len() as u64;
-        let number = self.next_fragment;
-        self.next_fragment += 1;
-        (number, fragment)
-    }
-
-    /// The last fragment, once every declared byte has arrived and the
-    /// stream has ended. The completion test is on BYTES, never on a count
+    /// The last fragment to complete, once every declared byte has arrived and
+    /// the stream has ended. The completion test is on BYTES, never on a count
     /// of fragments.
     fn finish(&mut self) -> Result<(u32, Bytes), ReadFailure> {
         if self.received < self.total {
             return Err(ReadFailure::Truncated(self.received as usize));
         }
-        let last = std::mem::take(&mut self.pending).freeze();
-        debug_assert!(!last.is_empty(), "a stream of {} bytes", self.total);
-        Ok(self.emit(last))
+        // Every byte arrived exactly once, so the last fragment completed.
+        self.held
+            .take()
+            .ok_or(ReadFailure::Truncated(self.received as usize))
     }
 }
 
@@ -657,7 +924,12 @@ async fn read_one<T: TimeSource>(recv: quinn::RecvStream, receiver: Arc<Receiver
     if receiver.panic_on_stream {
         panic!("test: the receive task panics");
     }
-    let mut reader = BodyReader::new(recv, receiver.time.clone(), streaming_handle_idle_timeout());
+    let mut reader = BodyReader::new(
+        recv,
+        receiver.time.clone(),
+        streaming_handle_idle_timeout(),
+        receiver.ranges.clone(),
+    );
     let header = match reader.read_exact(HEADER_LEN).await {
         Ok(bytes) => FrameHeader::decode(&bytes),
         Err(ReadFailure::Truncated(got)) => Err(HeaderError::Truncated(got)),
@@ -667,7 +939,16 @@ async fn read_one<T: TimeSource>(recv: quinn::RecvStream, receiver: Arc<Receiver
         }
     };
     let header = match header {
-        Ok(header) => header,
+        Ok(header) => {
+            let body = match header.kind() {
+                FrameKind::Control => header.total_len(),
+                FrameKind::Short | FrameKind::Stream => {
+                    u64::from(header.metadata_len()).saturating_add(header.total_len())
+                }
+            };
+            reader.set_end((HEADER_LEN as u64).saturating_add(body));
+            header
+        }
         Err(error) => {
             receiver
                 .stats
@@ -746,6 +1027,14 @@ impl<T: TimeSource> Receiver<T> {
                     Charged::Yes => stats.record_shared(InboundStreamOutcome::EvictedAge),
                     Charged::No => stats.record(QuicInboundOutcome::AgedUncharged),
                 }
+                reader.stop(stop_code::EVICTED);
+            }
+            ReadFailure::TooManyRanges => {
+                stats.record(QuicInboundOutcome::TooManyRanges);
+                reader.stop(stop_code::EVICTED);
+            }
+            ReadFailure::Overlap => {
+                stats.record(QuicInboundOutcome::ReadFailed);
                 reader.stop(stop_code::EVICTED);
             }
             ReadFailure::Reset => stats.record(QuicInboundOutcome::ResetByPeer),
@@ -971,16 +1260,65 @@ impl<T: TimeSource> Receiver<T> {
             metadata,
             handle: guard.handle().clone(),
         };
+        let payload_start = (HEADER_LEN as u64) + u64::from(header.metadata_len());
+        let mut rechunker = Rechunker::new(total);
+        // Payload pieces that arrived before the metadata was complete.
+        for (offset, piece) in reader.take_staged() {
+            if !self.feed(
+                &mut reader,
+                &mut rechunker,
+                guard.handle(),
+                offset - payload_start,
+                &piece,
+            ) {
+                return;
+            }
+        }
         // Wait for room rather than refuse: a small stream can be fully
         // acknowledged before this point, and a refusal would then read as
-        // `Sent` at the sender. Only this reader waits (see `read_short`).
+        // `Sent` at the sender. Only this reader waits (see `read_short`). The
+        // payload keeps being read meanwhile, into the charged buffer, so quinn
+        // holds none of it for our wait and the peer's credit is not held by
+        // our consumer; idleness is not judged while we are the one waiting.
         let permit = match self.streams.try_reserve() {
             Ok(permit) => permit,
             Err(mpsc::error::TrySendError::Full(())) => {
                 let waiting =
                     WaitingGuard::new(&self.stats, QuicInboundOutcome::StreamAbandonedWaiting);
-                let waited = reader.until_age(self.streams.reserve()).await;
+                reader.pause_idle();
+                let mut reserve = std::pin::pin!(self.streams.reserve());
+                let waited = loop {
+                    if reader.finished {
+                        break reader.until_age(&mut reserve).await;
+                    }
+                    enum Next<P> {
+                        Room(P),
+                        Piece(Result<Option<(u64, Bytes)>, ReadFailure>),
+                    }
+                    let next = tokio::select! {
+                        room = &mut reserve => Next::Room(room),
+                        piece = reader.next_unordered() => Next::Piece(piece),
+                    };
+                    match next {
+                        Next::Room(room) => break Ok(room),
+                        Next::Piece(Ok(Some((offset, piece)))) => {
+                            if !self.feed(
+                                &mut reader,
+                                &mut rechunker,
+                                guard.handle(),
+                                offset - payload_start,
+                                &piece,
+                            ) {
+                                waiting.disarm();
+                                return;
+                            }
+                        }
+                        Next::Piece(Ok(None)) => {}
+                        Next::Piece(Err(failure)) => break Err(failure),
+                    }
+                };
                 waiting.disarm();
+                reader.resume_idle();
                 match waited {
                     Ok(Ok(permit)) => permit,
                     Ok(Err(_)) => {
@@ -1003,32 +1341,25 @@ impl<T: TimeSource> Receiver<T> {
         permit.send(arrival);
         self.stats.record(QuicInboundOutcome::AnnouncedStream);
 
-        let mut rechunker = Rechunker::new(total);
-        while rechunker.remaining() > 0 {
-            let chunk = match reader.next_chunk(clamp(rechunker.remaining())).await {
-                Ok(Some(chunk)) => chunk,
+        loop {
+            match reader.next_unordered().await {
+                Ok(Some((offset, piece))) => {
+                    if !self.feed(
+                        &mut reader,
+                        &mut rechunker,
+                        guard.handle(),
+                        offset - payload_start,
+                        &piece,
+                    ) {
+                        return;
+                    }
+                }
                 Ok(None) => break,
                 Err(failure) => {
                     self.fail(&mut reader, failure, Charged::Yes);
                     return;
                 }
-            };
-            let fragments = match rechunker.feed(chunk) {
-                Ok(fragments) => fragments,
-                Err(failure) => {
-                    self.fail(&mut reader, failure, Charged::Yes);
-                    return;
-                }
-            };
-            for (number, fragment) in fragments {
-                if !self.push(&mut reader, guard.handle(), number, fragment) {
-                    return;
-                }
             }
-        }
-        if let Err(failure) = reader.expect_end().await {
-            self.fail(&mut reader, failure, Charged::Yes);
-            return;
         }
         let (number, last) = match rechunker.finish() {
             Ok(last) => last,
@@ -1043,6 +1374,31 @@ impl<T: TimeSource> Receiver<T> {
         debug_assert_eq!(guard.handle().received_bytes(), total);
         guard.complete = true;
         self.stats.record(QuicInboundOutcome::CompletedStream);
+    }
+
+    /// Feed one payload piece to `rechunker` and push the fragments it
+    /// completes. False if the stream has ended (counted and stopped here).
+    fn feed(
+        &self,
+        reader: &mut BodyReader<T>,
+        rechunker: &mut Rechunker,
+        handle: &StreamHandle,
+        offset: u64,
+        piece: &[u8],
+    ) -> bool {
+        let fragments = match rechunker.feed(offset, piece) {
+            Ok(fragments) => fragments,
+            Err(failure) => {
+                self.fail(reader, failure, Charged::Yes);
+                return false;
+            }
+        };
+        for (number, fragment) in fragments {
+            if !self.push(reader, handle, number, fragment) {
+                return false;
+            }
+        }
+        true
     }
 
     /// Push one fragment. False if the stream must end: its handle was
@@ -1111,29 +1467,39 @@ mod tests {
             .into()
     }
 
-    /// Feed `total` bytes in chunks of the given sizes and return every
-    /// fragment, the last from `finish`.
-    fn rechunk(total: usize, chunk_sizes: &[usize]) -> (Fragments, Fragments) {
+    /// Feed `total` bytes in chunks of the given sizes, in order or last chunk
+    /// first, and return the fragments handed out before `finish` (in the
+    /// order they came) and every fragment, sorted by number.
+    fn rechunk(total: usize, chunk_sizes: &[usize], reversed: bool) -> (Fragments, Fragments) {
         let data = bytes(total, 3);
-        let mut rechunker = Rechunker::new(total as u64);
-        let mut early = Vec::new();
+        let mut pieces = Vec::new();
         let mut at = 0;
         for &size in chunk_sizes.iter().cycle() {
             if at == total {
                 break;
             }
             let size = size.min(total - at);
-            early.extend(rechunker.feed(data.slice(at..at + size)).unwrap());
+            pieces.push((at, size));
             at += size;
+        }
+        if reversed {
+            pieces.reverse();
+        }
+        let mut rechunker = Rechunker::new(total as u64);
+        let mut early = Vec::new();
+        for (at, size) in pieces {
+            early.extend(rechunker.feed(at as u64, &data[at..at + size]).unwrap());
         }
         let mut all = early.clone();
         all.push(rechunker.finish().unwrap());
+        all.sort_by_key(|(number, _)| *number);
         (early, all)
     }
 
-    /// Every chunking of a stream gives the UDP fragment shape: fragment `i`
-    /// is bytes `[(i-1)F, iF)`, all full but the last, none empty, numbered
-    /// from 1, and the last one only from `finish`.
+    /// Every chunking of a stream, in order or out of order, gives the UDP
+    /// fragment shape: fragment `i` is bytes `[(i-1)F, iF)`, all full but the
+    /// last, none empty, numbered from 1, and the last to complete only from
+    /// `finish`.
     #[test]
     fn rechunking_gives_the_udp_fragment_shape_whatever_the_chunks() {
         for total in [1, F - 1, F, F + 1, 2 * F, 2 * F + 1, 10 * F + 17] {
@@ -1146,20 +1512,22 @@ mod tests {
                 &[usize::MAX],
                 &[F - 1, 2, 5000],
             ] {
-                let (early, all) = rechunk(total, chunks);
-                let data = bytes(total, 3);
-                assert_eq!(all.len(), total.div_ceil(F), "{total} bytes in {chunks:?}");
-                assert_eq!(
-                    early.len(),
-                    all.len() - 1,
-                    "the last fragment waits for finish"
-                );
-                for (i, (number, fragment)) in all.iter().enumerate() {
-                    assert_eq!(*number as usize, i + 1);
-                    let start = i * F;
-                    let end = (start + F).min(total);
-                    assert_eq!(&fragment[..], &data[start..end], "fragment {number}");
-                    assert!(!fragment.is_empty());
+                for reversed in [false, true] {
+                    let (early, all) = rechunk(total, chunks, reversed);
+                    let data = bytes(total, 3);
+                    assert_eq!(all.len(), total.div_ceil(F), "{total} bytes in {chunks:?}");
+                    assert_eq!(
+                        early.len(),
+                        all.len() - 1,
+                        "the last fragment waits for finish"
+                    );
+                    for (i, (number, fragment)) in all.iter().enumerate() {
+                        assert_eq!(*number as usize, i + 1);
+                        let start = i * F;
+                        let end = (start + F).min(total);
+                        assert_eq!(&fragment[..], &data[start..end], "fragment {number}");
+                        assert!(!fragment.is_empty());
+                    }
                 }
             }
         }
@@ -1170,15 +1538,26 @@ mod tests {
     #[test]
     fn rechunked_fragments_complete_a_stream_buffer_only_at_the_last() {
         for total in [1, F, F + 1, 5 * F] {
-            let (_, all) = rechunk(total, &[777]);
-            let handle = StreamHandle::new(StreamId(0x8000_0001), total as u64);
-            let last = all.len() - 1;
-            for (i, (number, fragment)) in all.into_iter().enumerate() {
-                assert!(!handle.is_complete(), "complete before fragment {number}");
-                assert_eq!(handle.push_fragment(number, fragment), Ok(true));
-                assert_eq!(handle.is_complete(), i == last);
+            for reversed in [false, true] {
+                let data = bytes(total, 3);
+                let mut rechunker = Rechunker::new(total as u64);
+                let mut pieces: Vec<_> = (0..total).step_by(777).collect();
+                if reversed {
+                    pieces.reverse();
+                }
+                let handle = StreamHandle::new(StreamId(0x8000_0001), total as u64);
+                for at in pieces {
+                    let end = (at + 777).min(total);
+                    for (number, fragment) in rechunker.feed(at as u64, &data[at..end]).unwrap() {
+                        assert_eq!(handle.push_fragment(number, fragment), Ok(true));
+                        assert!(!handle.is_complete(), "complete before the last fragment");
+                    }
+                }
+                let (number, last) = rechunker.finish().unwrap();
+                assert_eq!(handle.push_fragment(number, last), Ok(true));
+                assert!(handle.is_complete());
+                assert_eq!(handle.try_assemble().unwrap(), data.to_vec());
             }
-            assert_eq!(handle.try_assemble().unwrap(), bytes(total, 3).to_vec());
         }
     }
 
@@ -1218,7 +1597,7 @@ mod tests {
         for total in [1usize, F, F + 1, 3 * F] {
             let data = bytes(total, 0);
             let mut short = Rechunker::new(total as u64);
-            short.feed(data.slice(..total - 1)).unwrap();
+            short.feed(0, &data[..total - 1]).unwrap();
             assert_eq!(
                 short.finish(),
                 Err(ReadFailure::Truncated(total - 1)),
@@ -1226,15 +1605,18 @@ mod tests {
             );
 
             let mut long = Rechunker::new(total as u64);
-            long.feed(data.clone()).unwrap();
-            assert_eq!(
-                long.feed(Bytes::from_static(b"x")),
-                Err(ReadFailure::Overlong)
-            );
+            long.feed(0, &data).unwrap();
+            assert_eq!(long.feed(total as u64, b"x"), Err(ReadFailure::Overlong));
             let mut long_in_one = Rechunker::new(total as u64);
             let mut more = data.to_vec();
             more.push(0);
-            assert_eq!(long_in_one.feed(more.into()), Err(ReadFailure::Overlong));
+            assert_eq!(long_in_one.feed(0, &more), Err(ReadFailure::Overlong));
+            // A gap left open is truncated, whichever side of it arrived.
+            if total > 1 {
+                let mut gapped = Rechunker::new(total as u64);
+                gapped.feed(1, &data[1..]).unwrap();
+                assert_eq!(gapped.finish(), Err(ReadFailure::Truncated(total - 1)));
+            }
         }
     }
 
@@ -1246,7 +1628,7 @@ mod tests {
         let chunk = bytes(total, 5);
         let range = chunk.as_ptr() as usize..chunk.as_ptr() as usize + chunk.len();
         let mut rechunker = Rechunker::new(total as u64);
-        let mut all = rechunker.feed(chunk.clone()).unwrap();
+        let mut all = rechunker.feed(0, &chunk).unwrap();
         all.push(rechunker.finish().unwrap());
         assert_eq!(all.len(), 5);
         let mut spans = Vec::new();
@@ -1263,5 +1645,73 @@ mod tests {
         for pair in spans.windows(2) {
             assert!(pair[0].1 <= pair[1].0, "two fragments overlap");
         }
+    }
+
+    /// The mirror merges what touches, counts disjoint ranges, and refuses a
+    /// byte received twice.
+    #[test]
+    fn the_range_mirror_merges_counts_and_refuses_overlap() {
+        let mut m = RangeMirror::default();
+        assert_eq!(m.insert(10, 20), Ok(1));
+        assert_eq!(m.insert(30, 40), Ok(1));
+        assert_eq!(m.len(), 2);
+        assert_eq!(m.insert(20, 25), Ok(0), "extends the first");
+        assert_eq!(m.insert(25, 30), Ok(-1), "joins both");
+        assert_eq!(m.ranges, vec![(10, 40)]);
+        assert_eq!(m.insert(0, 5), Ok(1));
+        assert_eq!(m.insert(39, 41), Err(ReadFailure::Overlap));
+        assert_eq!(m.insert(0, 1), Err(ReadFailure::Overlap));
+        assert_eq!(m.insert(5, 10), Ok(-1));
+        assert_eq!(m.ranges, vec![(0, 40)]);
+        assert_eq!(m.insert(7, 7), Ok(0), "empty");
+    }
+
+    /// The connection's count is checked against its cap as ranges come and
+    /// go, and what a stream held goes back when it ends.
+    #[test]
+    fn the_connection_range_count_has_a_cap() {
+        let conn = ConnRanges::new(3);
+        assert!(conn.add(2));
+        assert!(conn.add(1));
+        assert!(!conn.add(1), "past the cap");
+        assert!(conn.add(-2));
+        assert_eq!(conn.held(), 2);
+        conn.remove(2);
+        assert_eq!(conn.held(), 0);
+    }
+
+    /// The receive side relies on quinn-proto 0.11.17 or later within 0.11:
+    /// `COMPACT_THRESHOLD` and `MAX_CHUNKS` bound what its assembler can hold
+    /// for a stream between two of our reads, and unordered reads release each
+    /// chunk as it arrives. A version outside that range must be re-read
+    /// (`assembler.rs`) before it is taken.
+    #[test]
+    fn quinn_proto_is_one_whose_assembler_this_reader_was_written_for() {
+        let lock =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.lock"))
+                .expect("read Cargo.lock");
+        let marker = "name = \"quinn-proto\"\nversion = \"";
+        let versions: Vec<&str> = lock
+            .match_indices(marker)
+            .map(|(at, _)| {
+                let rest = &lock[at + marker.len()..];
+                &rest[..rest.find('"').expect("a quoted version")]
+            })
+            .collect();
+        assert_eq!(
+            versions.len(),
+            1,
+            "one quinn-proto in Cargo.lock: {versions:?}"
+        );
+        let parts: Vec<u64> = versions[0]
+            .split('.')
+            .map(|part| part.parse().expect("a numeric version"))
+            .collect();
+        assert_eq!(&parts[..2], &[0, 11], "quinn-proto {}", versions[0]);
+        assert!(
+            parts[2] >= 17,
+            "quinn-proto {} predates MAX_CHUNKS",
+            versions[0]
+        );
     }
 }

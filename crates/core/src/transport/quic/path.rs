@@ -439,6 +439,10 @@ quic_outcomes! {
         ShortRefusedBudget => "short_refused_budget",
         /// A Stream did not fit the inbound budget (as above).
         StreamRefusedBudget => "stream_refused_budget",
+        /// The connection's streams held more received ranges (gaps the peer
+        /// left) than `inbound::MAX_RANGES_PER_CONNECTION`; the stream that
+        /// went past it was stopped (`stop_code::EVICTED`).
+        TooManyRanges => "too_many_ranges",
     }
 }
 
@@ -707,6 +711,9 @@ pub(crate) struct QuicPath {
     pacer: std::sync::OnceLock<Arc<dyn pacer::SendPacer>>,
     #[cfg(test)]
     budget: SharedInboundBudget,
+    /// The receive side's count of received ranges. Tests only.
+    #[cfg(test)]
+    inbound_ranges: Arc<inbound::ConnRanges>,
 }
 
 /// The path never had both data bits: nothing may send data on it.
@@ -845,6 +852,8 @@ impl QuicPath {
         {
             receiver.panic_on_stream = limits.panic_in_receive;
         }
+        #[cfg(test)]
+        let inbound_ranges = receiver.ranges();
         let aborts = Arc::new(SendAborts::new(limits.max_send_aborts, connection.closer()));
         // Read once: quinn keeps one controller per connection while migration is
         // off (`config`), so the record stays the connection's. The ack watch
@@ -903,6 +912,8 @@ impl QuicPath {
                 pacer: std::sync::OnceLock::new(),
                 #[cfg(test)]
                 budget,
+                #[cfg(test)]
+                inbound_ranges,
             },
             controls,
         )
@@ -938,6 +949,13 @@ impl QuicPath {
         self.pacer.get().map(|pacer| pacer::Pacing {
             pacer: Arc::clone(pacer),
         })
+    }
+
+    /// The most received ranges the receive side's streams held at once.
+    /// Tests only.
+    #[cfg(test)]
+    pub(in crate::transport) fn inbound_ranges_peak(&self) -> usize {
+        self.inbound_ranges.peak()
     }
 
     /// Whether the path's data sends are paced.

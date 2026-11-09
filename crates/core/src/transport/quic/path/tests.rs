@@ -574,18 +574,25 @@ fn truncated_and_overlong_streams_fail_and_are_counted() {
             bytes.extend_from_slice(&payload(sent));
             let conn = p.a_raw();
             p.drive(raw_stream(conn, bytes)).await;
-            let arrival = p
-                .b_in
-                .streams
-                .try_recv()
-                .expect("announced before the payload");
-            assert!(!arrival.handle.is_complete(), "case {n}");
-            assert!(arrival.handle.received_bytes() < total, "case {n}");
-            assert_eq!(
-                arrival.handle.assemble().await,
-                Err(StreamError::Cancelled),
-                "case {n}"
-            );
+            // Read unordered, the payload may arrive with the header, so an
+            // overlong stream can fail before it is announced; a truncated one
+            // is always announced (its end comes after every byte it has).
+            match p.b_in.streams.try_recv() {
+                Ok(arrival) => {
+                    assert!(!arrival.handle.is_complete(), "case {n}");
+                    assert!(arrival.handle.received_bytes() < total, "case {n}");
+                    assert_eq!(
+                        arrival.handle.assemble().await,
+                        Err(StreamError::Cancelled),
+                        "case {n}"
+                    );
+                }
+                Err(_) => assert_eq!(
+                    outcome,
+                    QuicInboundOutcome::Overlong,
+                    "case {n}: only an overlong stream can fail before it is announced"
+                ),
+            }
             assert_eq!(p.b.stats().count(outcome), before + 1, "case {n}");
         }
         // Short (kind 0) and control (kind 2) frames, one byte short and over.
@@ -608,7 +615,8 @@ fn truncated_and_overlong_streams_fail_and_are_counted() {
         let conn = p.a_raw();
         let code = p.drive(raw_unfinished(conn, bytes)).await;
         assert_eq!(code, Some(u64::from(stop_code::OVERLONG)));
-        drop(p.b_in.streams.try_recv().expect("announced"));
+        // Announced or not (see above), nothing completes.
+        drop(p.b_in.streams.try_recv());
         assert!(
             p.b_in.shorts.try_recv().is_err(),
             "no short message delivered"
@@ -833,8 +841,9 @@ fn an_uncharged_stream_is_evicted_at_its_age_limit() {
 /// A full control channel drops and counts the frame (nothing is waiting on a
 /// control frame). A full short or stream channel makes only that message's
 /// reader wait, holding the stream's credit: nothing is lost, and the message
-/// arrives once the consumer takes one. A second stream with an id the path
-/// already holds is stopped with `STREAM_ID_IN_USE`.
+/// arrives once the consumer takes one, its payload read meanwhile. A second
+/// stream with an id the path already holds is stopped with
+/// `STREAM_ID_IN_USE`.
 #[test]
 fn full_channels_hold_data_and_drop_control_and_reused_ids_are_refused() {
     bounded(|| async move {
@@ -861,8 +870,12 @@ fn full_channels_hold_data_and_drop_control_and_reused_ids_are_refused() {
             })
             .await;
         assert_stopped(reused, stop_code::STREAM_ID_IN_USE);
-        // A stream announced behind a full channel is not stopped: its sender
-        // is blocked on flow control until the consumer takes the first.
+        // A stream behind a full channel is not stopped, and its payload keeps
+        // being read into its charged buffer while it waits to be announced:
+        // the sender is not held on flow control by this side's consumer, so a
+        // stream larger than the flow-control window completes before the
+        // consumer takes anything. (Reading stopped during the wait until the
+        // unordered reader; the sender then stayed blocked.)
         let a = p.a.clone();
         let second_id = StreamId::next();
         let second =
@@ -870,7 +883,10 @@ fn full_channels_hold_data_and_drop_control_and_reused_ids_are_refused() {
         let time = p.time();
         p.drive(async move { time.sleep(Duration::from_secs(1)).await })
             .await;
-        assert!(!second.is_finished(), "the second stream waits for room");
+        assert!(
+            second.is_finished(),
+            "the second stream's payload was read while it waited for room"
+        );
         let stats = p.b.stats();
         assert_eq!(stats.count(QuicInboundOutcome::ShortDroppedFull), 0);
         assert_eq!(stats.count(QuicInboundOutcome::StreamDroppedFull), 0);
@@ -892,6 +908,60 @@ fn full_channels_hold_data_and_drop_control_and_reused_ids_are_refused() {
         assert_eq!(p.b_in.streams.try_recv().unwrap().stream_id, second_id);
         assert_eq!(stats.count(QuicInboundOutcome::ShortDroppedFull), 0);
         assert_eq!(stats.count(QuicInboundOutcome::StreamDroppedFull), 0);
+    })
+}
+
+/// The receive side reads past a gap: with one of the sender's datagrams
+/// lost, the bytes after it are read at once (unordered), so the stream holds
+/// more than one received range until the retransmission fills the gap, and
+/// quinn keeps nothing of them waiting for it. The stream still assembles
+/// byte for byte. Read in order, nothing past the gap is read, and the stream
+/// never holds a second range.
+#[test]
+fn a_lost_datagram_does_not_stop_reading_past_it() {
+    bounded(|| async move {
+        use crate::transport::in_memory_socket::{
+            PacketDeliveryDecision, set_packet_delivery_callback,
+        };
+        let _seed = GlobalRng::seed_guard(SEED);
+        let network = "quic-path-unordered-gap";
+        let mut p = paths(network, 83, QuicPathLimits::DEFAULT).await;
+        let from = p.pair.a_addr;
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = seen.clone();
+        set_packet_delivery_callback(
+            network,
+            Some(Arc::new(move |_, sender, _, _| {
+                // The fourth datagram from `a` after this point is lost once.
+                if sender == from && counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 3
+                {
+                    PacketDeliveryDecision::Drop
+                } else {
+                    PacketDeliveryDecision::Deliver
+                }
+            })),
+        );
+        let len = 32 * 1024;
+        let body = Bytes::from(payload(len));
+        let (a, id) = (p.a.clone(), StreamId::next());
+        let sent = body.clone();
+        p.drive(async move { a.send_stream(id, None, sent).await.expect("sent") })
+            .await;
+        set_packet_delivery_callback(network, None);
+        let arrival = p.b_in.streams.try_recv().expect("announced");
+        assert_eq!(
+            arrival.handle.assemble().await.expect("assembled"),
+            body.to_vec()
+        );
+        assert!(
+            seen.load(std::sync::atomic::Ordering::Relaxed) > 3,
+            "premise: the datagram was dropped"
+        );
+        assert!(
+            p.b.inbound_ranges_peak() >= 2,
+            "bytes past the gap were read before it filled: peak {}",
+            p.b.inbound_ranges_peak()
+        );
     })
 }
 
