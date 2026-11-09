@@ -119,9 +119,22 @@
 //! window, which is what keeps a path's rate to about `rate`; its pacer reads
 //! the same window and only spreads the sends. With no limit configured, or
 //! before the first acknowledgement, the window is Cubic's. The RTT is the
-//! latest quinn reports to `on_ack`, which for the first batch of
-//! acknowledgements is still quinn's initial estimate (333 ms,
-//! `config::transport_config`), so the cap is loose for that one batch.
+//! latest quinn reports to `on_ack`. quinn updates its estimate only after it
+//! has called `on_ack` for every packet an ACK frame acknowledges, so each
+//! `on_ack` sees the estimate from before that frame, and the first ones see
+//! quinn's initial estimate (333 ms, `config::transport_config`). After the
+//! handshake the stored RTT can still be that initial estimate when the first
+//! data is sent (the e5b-9 cold-start lab saw 333 ms on an 800 ms path), so
+//! the cap is loose, or tight, until the first data is acknowledged.
+//!
+//! # The initial window
+//!
+//! Cubic starts at [`INITIAL_WINDOW_DATAGRAMS`] datagrams instead of quinn's
+//! 10. quinn does not grow the window while the connection is limited by the
+//! application, so a connection that only carries small messages keeps its
+//! initial window for life: on most connections the initial window is the
+//! window. quinn paces it (1.25 x window / RTT), so the larger start is spread
+//! over the first round trip rather than sent at once.
 //!
 //! While the cap binds, a send it holds back counts in quinn as blocked by
 //! congestion, not limited by the application, so Cubic would keep growing on
@@ -145,7 +158,7 @@ use quinn::FrameStats;
 use quinn::congestion::{Controller, ControllerFactory, ControllerMetrics};
 
 use super::QuicCloser;
-use super::config::QuicRateLimit;
+use super::config::{MAX_UDP_PAYLOAD, QuicRateLimit};
 #[cfg(doc)]
 use super::error::close_code;
 use super::socket::{CapHoldReading, CapHolds};
@@ -234,8 +247,18 @@ impl SendAborts {
     }
 }
 
+/// Cubic's initial window in datagrams of [`MAX_UDP_PAYLOAD`] (quinn's default
+/// is 10). Measured in the e5b-9 cold-start lab against 10 and 64, with
+/// pacing: a 64 KiB message on a fresh or application-limited connection at
+/// 300 ms RTT arrives in 0.53 s instead of 0.82 s (UDP: 0.15 s), 16 KiB in one
+/// round trip, and a burst of 10 such connections on a 5 Mbit/s uplink leaves
+/// a competing loss-based flow less loss than the UDP transport does (2.2%
+/// against 17%). 64 was faster again but cost a competing flow about what the
+/// UDP transport does.
+pub(crate) const INITIAL_WINDOW_DATAGRAMS: u64 = 32;
+
 /// Builds [`CappedCubic`] controllers around Cubic, capped by `rate`.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct CappedCubicFactory {
     cubic: Arc<quinn::congestion::CubicConfig>,
     rate: QuicRateLimit,
@@ -243,10 +266,18 @@ pub(crate) struct CappedCubicFactory {
 
 impl CappedCubicFactory {
     pub(crate) fn new(rate: QuicRateLimit) -> Self {
+        let mut cubic = quinn::congestion::CubicConfig::default();
+        cubic.initial_window(INITIAL_WINDOW_DATAGRAMS * u64::from(MAX_UDP_PAYLOAD));
         Self {
-            cubic: Arc::default(),
+            cubic: Arc::new(cubic),
             rate,
         }
+    }
+}
+
+impl Default for CappedCubicFactory {
+    fn default() -> Self {
+        Self::new(QuicRateLimit::default())
     }
 }
 
@@ -396,6 +427,12 @@ impl Controller for CappedCubic {
         rtt: &quinn_proto::RttEstimator,
     ) {
         self.state.lock().acked += 1;
+        // quinn updates `rtt` only after this call for the ACK frame, so this
+        // is the estimate from before it: the initial 333 ms on the first
+        // frames, and possibly still when the first data goes out after the
+        // handshake (see "The window cap" in the module docs). The cap reads
+        // it; anything that sizes a window from the RTT before the first data
+        // is acknowledged should use this packet's sample, `now - sent`.
         self.srtt = Some(rtt.get());
         // A send the cap holds back is not Cubic's doing: while the cap is
         // below Cubic's window, do not let Cubic grow (see the module docs).
