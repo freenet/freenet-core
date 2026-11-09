@@ -1424,6 +1424,18 @@ mod queue {
         }
     }
 
+    /// What [`BroadcastQueue::enqueue_in_lane`] did beside queuing the
+    /// entry, for [`BroadcastQueue::enqueue`] to count (#6143).
+    #[derive(Debug, Default)]
+    struct EnqueueOutcome {
+        /// The entry replaced a queued one for the same (contract, peer)
+        /// pair.
+        superseded: bool,
+        /// The contracts of the entries evicted at capacity to make room,
+        /// one per evicted leg.
+        evicted: Vec<ContractKey>,
+    }
+
     /// Global broadcast queue that serializes outbound broadcast streams
     /// with bounded concurrency and deduplication.
     ///
@@ -1461,6 +1473,16 @@ mod queue {
             Self::with_spacing(Arc::new(BroadcastSpacing::new(Arc::new(
                 crate::util::time_source::InstantTimeSrc::new(),
             ))))
+        }
+
+        /// The same queue holding at most `depth` entries, for tests that
+        /// need capacity eviction without filling the default depth.
+        #[cfg(test)]
+        pub(crate) fn with_max_queue_depth(self, depth: usize) -> Self {
+            Self {
+                max_queue_depth: depth,
+                ..self
+            }
         }
 
         pub(crate) fn with_spacing(spacing: Arc<BroadcastSpacing>) -> Self {
@@ -1506,19 +1528,24 @@ mod queue {
                 &target,
                 new_state.size(),
             );
-            let superseded = self
+            use crate::operations::update::propagation_stats::{
+                PropagationEvent, record_propagation_event,
+            };
+            let outcome = self
                 .enqueue_in_lane(lane, key, target, new_state, fanout)
                 .await;
-            if superseded {
+            if outcome.superseded {
                 // #6143: the replaced leg ends here without a send of its own.
                 // Its update rides on this newer leg, whose outcome decides
                 // whether anything was sent. Each fan-out or heal registered
                 // its own target, so without this the legs never add up.
-                crate::operations::update::propagation_stats::record_propagation_event(
-                    op_manager,
-                    key.id(),
-                    crate::operations::update::propagation_stats::PropagationEvent::SkipSuperseded,
-                );
+                record_propagation_event(op_manager, key.id(), PropagationEvent::SkipSuperseded);
+            }
+            // #6143: a leg dropped to make room ends without a send, possibly
+            // for another contract. A counter only: the stall check reads it
+            // as neither evidence nor a closed leg.
+            for evicted in &outcome.evicted {
+                record_propagation_event(op_manager, evicted.id(), PropagationEvent::SkipEvicted);
             }
         }
 
@@ -1526,7 +1553,8 @@ mod queue {
         /// drive the real queue without standing up an `OpManager`.
         ///
         /// Returns whether the entry replaced a queued one for the same
-        /// (contract, peer) pair, which [`Self::enqueue`] counts.
+        /// (contract, peer) pair, and the contracts of the entries evicted to
+        /// make room for it, which [`Self::enqueue`] counts.
         async fn enqueue_in_lane(
             &self,
             lane: QueuedPayloadClass,
@@ -1534,7 +1562,8 @@ mod queue {
             target: PeerKeyLocation,
             new_state: WrappedState,
             fanout: FanoutTargets,
-        ) -> bool {
+        ) -> EnqueueOutcome {
+            let mut outcome = EnqueueOutcome::default();
             let dedup_key = (key, target.clone());
             let state_size = new_state.size();
             let mut queue = self.queue.lock().await;
@@ -1582,6 +1611,7 @@ mod queue {
                 while queue.len() >= self.max_queue_depth {
                     if let Some(entry) = queue.evict_oldest(Instant::now(), &self.spacing) {
                         crate::node::BROADCAST_QUEUE_EFFICIENCY_METRICS.record_capacity_eviction();
+                        outcome.evicted.push(entry.key);
                         tracing::warn!(
                             contract = %entry.key,
                             peer = ?entry.target.socket_addr(),
@@ -1620,7 +1650,8 @@ mod queue {
 
             drop(queue);
             self.notify_for(lane).notify_one();
-            previous_lane.is_some()
+            outcome.superseded = previous_lane.is_some();
+            outcome
         }
 
         /// Start the background workers that drain the queue with bounded
@@ -7147,6 +7178,57 @@ mod tests {
         );
     }
 
+    /// #6143 review round 7: a leg the full queue drops to make room
+    /// (`evict_oldest`) is counted by the real `enqueue` as `skip_evicted`
+    /// against the EVICTED leg's contract, in the per-contract summary and in
+    /// telemetry. A replacement for a queued pair evicts nothing.
+    #[cfg(not(feature = "simulation_tests"))]
+    #[tokio::test(flavor = "current_thread")]
+    // Publishes the process-global broadcast-queue depth gauge; serialized
+    // against `shadow_demand::tests::broadcast_queue_depth_gauge_round_trips`,
+    // which asserts an exact value of it.
+    #[serial_test::serial(broadcast_queue_depth_gauge)]
+    async fn an_evicted_queued_leg_is_counted_against_its_contract() {
+        use freenet_stdlib::prelude::WrappedState;
+
+        use crate::operations::update::propagation_stats::PropagationEvent as Ev;
+
+        let node = one_peer_node("bq-6143-evicted", WrappedState::new(vec![3u8; 32]), true).await;
+        let op_manager = &node.op_manager;
+        // No workers started, so every entry stays queued; room for one.
+        let queue = super::BroadcastQueue::new().with_max_queue_depth(1);
+        let other = make_contract_key(0x61);
+        let enqueue = |key: ContractKey, byte: u8| {
+            queue.enqueue(
+                op_manager,
+                key,
+                node.target.clone(),
+                WrappedState::new(vec![byte; 32]),
+                super::no_fanout(),
+            )
+        };
+        let evicted = |key: &ContractKey| {
+            op_manager
+                .update_propagation_stats
+                .events_for_test(key.id())
+                .get(Ev::SkipEvicted)
+        };
+
+        enqueue(node.key, 4).await;
+        enqueue(node.key, 5).await;
+        assert_eq!(evicted(&node.key), 0, "a replacement evicts nothing");
+        enqueue(other, 6).await;
+        assert_eq!(evicted(&node.key), 1, "the queued leg made room");
+        assert_eq!(evicted(&other), 0, "the newcomer was not evicted");
+        assert_eq!(
+            op_manager
+                .payload_mix
+                .propagation_event_for_test(Ev::SkipEvicted),
+            1,
+            "telemetry counts what the summary counts"
+        );
+    }
+
     /// #6143 review round 6: a targeted heal registers its leg
     /// (`heal_target`) once its peer resolves, so a heal's skip accounts for
     /// that leg and not for a fan-out's. An unknown peer starts no leg. And
@@ -7221,6 +7303,14 @@ mod tests {
         assert!(
             gate < at && at < first_send,
             "gate, then resolve, then send"
+        );
+        // At the handler's top level, not inside a block that may never run
+        // (`if false { ... }`): the braces before it leave only the handler's
+        // own open. The body's format strings hold balanced braces only.
+        let depth = body[..at].matches('{').count() - body[..at].matches('}').count();
+        assert_eq!(
+            depth, 1,
+            "the heal handler resolves its peer unconditionally"
         );
         assert_eq!(
             body.matches("get_peer_by_addr(").count(),
