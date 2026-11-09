@@ -4742,8 +4742,9 @@ impl ConfigPathsArgs {
                     // Ensure the parent directory exists before rename.
                     // On a fresh Local AppData install, the intermediate dirs
                     // (e.g., "The Freenet Project Inc/Freenet") won't exist yet.
+                    // A failure here surfaces as the rename's error below.
                     if let Some(parent) = app_data_dir.parent() {
-                        let _ = fs::create_dir_all(parent);
+                        drop(fs::create_dir_all(parent));
                     }
                     if let Err(e) = fs::rename(&old_roaming, &app_data_dir) {
                         tracing::warn!(

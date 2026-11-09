@@ -346,6 +346,7 @@ mod tests {
         std::fs::write(tmp.path().join("fdev"), b"fake").unwrap();
         std::fs::write(tmp.path().join("freenet-service-wrapper.sh"), b"fake").unwrap();
 
+        #[cfg_attr(target_os = "windows", allow(unused_variables))]
         let removed = remove_binaries(tmp.path()).unwrap();
         #[cfg(not(target_os = "windows"))]
         assert_eq!(removed.len(), 3);

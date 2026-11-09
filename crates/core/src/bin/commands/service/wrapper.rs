@@ -467,6 +467,7 @@ pub(super) fn run_wrapper(version: &str) -> Result<()> {
     // See #3933 / #3934 and `.claude/rules/bug-prevention-patterns.md`
     // at the repo root for the rule + audit grep.
     #[cfg(target_os = "windows")]
+    // SAFETY: FreeConsole has no preconditions.
     unsafe {
         winapi::um::wincon::FreeConsole();
     }

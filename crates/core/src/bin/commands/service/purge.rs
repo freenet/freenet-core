@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "linux")]
 use super::linux::home_dir_for_user;
+#[cfg(unix)]
 use super::wrapper::log_wrapper_event;
 
 /// Per-platform directory the wrapper writes its lifecycle log to. Mirrors the
