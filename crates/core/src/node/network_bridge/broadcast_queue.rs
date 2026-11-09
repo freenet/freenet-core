@@ -5158,6 +5158,25 @@ mod stream_completion_timeout_tests {
     /// The flat wait this replaced, for every payload size.
     const FLAT_WAIT: Duration = Duration::from_secs(120);
 
+    /// #6143: the stall check holds a candidate while one of its streams is
+    /// in flight, for at most `MAX_STALL_CARRY_WINDOWS` windows after the one
+    /// that raised it. Any stream started in that window has reported its
+    /// fate by then, so a late delivery is never reported as a stall. One
+    /// window of slack covers a stream that started at the very start of
+    /// the raising window.
+    #[test]
+    fn stall_carry_outlasts_the_longest_stream_wait() {
+        use crate::operations::update::propagation_stats::{
+            MAX_STALL_CARRY_WINDOWS, SUMMARY_WINDOW,
+        };
+        let longest = stream_completion_timeout(MAX_STREAM_TOTAL_BYTES);
+        let carry = SUMMARY_WINDOW * (MAX_STALL_CARRY_WINDOWS - 1);
+        assert!(
+            longest + SUMMARY_WINDOW <= carry,
+            "the longest stream wait ({longest:?}) outlasts the stall carry ({carry:?})"
+        );
+    }
+
     /// The wait is the receiver's age limit for the size (5 minutes for small
     /// streams, the stream at 32 KiB/s above that) less a tenth of it, and at
     /// least 30 s.
@@ -6719,6 +6738,9 @@ mod tests {
     /// A peer summary for which `one_peer_node`'s stand-in fails the first
     /// delta query (see the handler).
     const PROBE_FAILS_ONCE: &[u8] = &[0xBB];
+    /// A peer summary for which `one_peer_node`'s stand-in returns a small,
+    /// non-empty delta, so the leg sends a delta.
+    const DELTA_PEER: &[u8] = &[0xCC];
 
     struct OnePeerNode {
         op_manager: std::sync::Arc<crate::node::OpManager>,
@@ -6736,17 +6758,29 @@ mod tests {
         stored: freenet_stdlib::prelude::WrappedState,
         snapshot_ok: bool,
     ) -> OnePeerNode {
+        one_peer_node_with(id, stored, snapshot_ok, None).await
+    }
+
+    /// [`one_peer_node`] with the node's streaming threshold set, so a small
+    /// full state goes out as a stream.
+    async fn one_peer_node_with(
+        id: &str,
+        stored: freenet_stdlib::prelude::WrappedState,
+        snapshot_ok: bool,
+        streaming_threshold: Option<usize>,
+    ) -> OnePeerNode {
         use std::net::SocketAddr;
         use std::sync::Arc;
 
         use crate::contract::{ContractHandlerEvent, StoreResponse};
         use crate::ring::PeerKeyLocation;
 
-        let config_args = crate::config::ConfigArgs {
+        let mut config_args = crate::config::ConfigArgs {
             id: Some(id.to_string()),
             mode: Some(crate::contract::OperationMode::Local),
             ..Default::default()
         };
+        config_args.network_api.streaming_threshold = streaming_threshold;
         let node_config =
             crate::node::NodeConfig::new(config_args.build().await.expect("build Config"))
                 .await
@@ -6825,8 +6859,11 @@ mod tests {
                     // one exception, `PROBE_FAILS_ONCE`, fails its first query,
                     // so the staleness probe cannot decide and the leg goes on
                     // to `compute_delta`, which then gets the empty delta.
+                    // `DELTA_PEER` gets a two-byte delta.
                     ContractHandlerEvent::GetDeltaQuery { key, their_summary } => {
-                        let delta = if their_summary.as_ref() == PROBE_FAILS_ONCE
+                        let delta = if their_summary.as_ref() == DELTA_PEER {
+                            Ok(freenet_stdlib::prelude::StateDelta::from(vec![0xD1, 0xD2]))
+                        } else if their_summary.as_ref() == PROBE_FAILS_ONCE
                             && !probe_failed.swap(true, std::sync::atomic::Ordering::Relaxed)
                         {
                             Err(crate::contract::ExecutorError::other(
@@ -7157,6 +7194,273 @@ mod tests {
         );
         assert_eq!(events().get(Ev::SkipNotHosted), 0);
 
+        // The telemetry window got exactly what the per-contract summary got,
+        // through the same recording call.
+        let unhosted_events = op_manager
+            .update_propagation_stats
+            .events_for_test(unhosted.id());
+        for ev in Ev::ALL {
+            assert_eq!(
+                op_manager.payload_mix.propagation_event_for_test(ev),
+                events().get(ev) + unhosted_events.get(ev),
+                "telemetry disagrees with the summary on {ev:?}"
+            );
+        }
+
+        node.handler.abort();
+    }
+
+    /// Connect one more peer to a `one_peer_node`, with no summary cached for
+    /// it, and return it as a broadcast target.
+    fn add_peer(op_manager: &crate::node::OpManager, n: u8) -> crate::ring::PeerKeyLocation {
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 47_200 + u16::from(n)));
+        let public = crate::transport::TransportPublicKey::from_bytes([n; 32]);
+        assert!(op_manager.ring.connection_manager.add_connection(
+            crate::ring::Location::new(f64::from(n) / 256.0),
+            addr,
+            public.clone(),
+            false,
+        ));
+        crate::ring::PeerKeyLocation::new(public, addr)
+    }
+
+    /// #6143: a leg that sends a delta through the real
+    /// `broadcast_to_single_peer` is counted as `SentDelta`, not `SentFull`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_delta_leg_is_counted_as_sent_delta() {
+        use std::sync::Arc;
+
+        use freenet_stdlib::prelude::WrappedState;
+
+        use crate::message::{DeltaOrFullState, NetMessage, NetMessageV1};
+        use crate::node::network_bridge::p2p_protoc::{P2pBridge, P2pBridgeEvent};
+        use crate::operations::update::UpdateMsg;
+        use crate::operations::update::propagation_stats::PropagationEvent as Ev;
+        use crate::ring::interest::SummaryPopulationSource;
+
+        let state = WrappedState::new(vec![6u8; 32]);
+        let node = one_peer_node("bq-6143-sent-delta", state.clone(), true).await;
+        let op_manager = &node.op_manager;
+        let key = node.key;
+        op_manager.interest_manager.upsert_peer_summary_from(
+            &key,
+            &node.peer_key,
+            StateSummary::from(DELTA_PEER.to_vec()),
+            SummaryPopulationSource::Delivery,
+        );
+        let (bridge_tx, mut bridge_rx) = tokio::sync::mpsc::channel::<P2pBridgeEvent>(16);
+        let bridge = P2pBridge::new_for_test(bridge_tx, op_manager.clone());
+        super::broadcast_to_single_peer(
+            &bridge,
+            op_manager,
+            key,
+            state.clone(),
+            node.target.clone(),
+            None,
+            Arc::new(vec![node.target.pub_key().clone()]),
+        )
+        .await;
+
+        let Ok(P2pBridgeEvent::Message(_, msg)) = bridge_rx.try_recv() else {
+            panic!("the leg must send a message");
+        };
+        assert!(
+            matches!(
+                *msg,
+                NetMessage::V1(NetMessageV1::Update(
+                    UpdateMsg::BroadcastTo {
+                        payload: DeltaOrFullState::Delta(_),
+                        ..
+                    } | UpdateMsg::BroadcastToV2 {
+                        payload: DeltaOrFullState::Delta(_),
+                        ..
+                    }
+                ))
+            ),
+            "premise: the leg sent a delta: {msg:?}"
+        );
+        let events = op_manager
+            .update_propagation_stats
+            .events_for_test(key.id());
+        assert_eq!(events.get(Ev::SentDelta), 1, "{events:?}");
+        assert_eq!(events.get(Ev::SentFull), 0, "{events:?}");
+        node.handler.abort();
+    }
+
+    /// #6143: the node's summary task hands each window's stall WARN count
+    /// to the `broadcast_payload_mix` telemetry window. Drives the task
+    /// `OpManager::new` starts, on paused time.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn the_stall_count_reaches_the_telemetry_window() {
+        use freenet_stdlib::prelude::WrappedState;
+
+        use crate::operations::update::propagation_stats::{
+            PropagationEvent as Ev, SUMMARY_WINDOW,
+        };
+
+        let settle = || async {
+            for _ in 0..50 {
+                tokio::task::yield_now().await;
+            }
+        };
+        let node = one_peer_node(
+            "bq-6143-stall-wiring",
+            WrappedState::new(vec![8u8; 32]),
+            true,
+        )
+        .await;
+        let op_manager = &node.op_manager;
+        settle().await;
+        assert_eq!(op_manager.payload_mix.origination_stalls_for_test(), 0);
+
+        // A client update that found targets and sent nothing.
+        let contract = *node.key.id();
+        let stats = &op_manager.update_propagation_stats;
+        stats.record_event(contract, Ev::ClientOriginated);
+        stats.record_broadcast(contract, 3, 0);
+        stats.record_event(contract, Ev::SkipSummaryEqual);
+
+        tokio::time::advance(SUMMARY_WINDOW).await;
+        settle().await;
+        assert_eq!(
+            op_manager.payload_mix.origination_stalls_for_test(),
+            0,
+            "the first window is grace"
+        );
+        tokio::time::advance(SUMMARY_WINDOW).await;
+        settle().await;
+        assert_eq!(op_manager.payload_mix.origination_stalls_for_test(), 1);
+        node.handler.abort();
+    }
+
+    /// #6143: a full-state leg sent as a stream, through the real
+    /// `broadcast_to_single_peer`, counts `SentFull` and `WireStream` when
+    /// the stream is dispatched and then its fate from the completion signal;
+    /// a failure of either send counts `SendFailed` and nothing sent.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_full_state_stream_leg_counts_its_fate() {
+        use std::sync::Arc;
+
+        use freenet_stdlib::prelude::WrappedState;
+
+        use crate::node::network_bridge::p2p_protoc::{P2pBridge, P2pBridgeEvent};
+        use crate::operations::update::propagation_stats::PropagationEvent as Ev;
+
+        #[derive(Debug, Clone, Copy)]
+        enum Fate {
+            Signal(StreamSendOutcome),
+            /// The completion sender is dropped unsignalled.
+            Unsignalled,
+            /// The metadata message cannot be sent: the bridge is closed.
+            MetadataSendFails,
+            /// The metadata message is accepted and the stream dispatch is
+            /// refused.
+            DispatchFails,
+        }
+
+        let state = WrappedState::new(vec![7u8; 32]);
+        let node = one_peer_node_with("bq-6143-stream-fates", state.clone(), true, Some(8)).await;
+        let op_manager = &node.op_manager;
+        let key = node.key;
+        let events = || {
+            op_manager
+                .update_propagation_stats
+                .events_for_test(key.id())
+        };
+
+        let cases = [
+            (
+                Fate::Signal(StreamSendOutcome::Delivered),
+                &[
+                    (Ev::SentFull, 1),
+                    (Ev::WireStream, 1),
+                    (Ev::WireStreamDelivered, 1),
+                ][..],
+            ),
+            (
+                Fate::Signal(StreamSendOutcome::Dropped),
+                &[
+                    (Ev::SentFull, 1),
+                    (Ev::WireStream, 1),
+                    (Ev::WireStreamFailed, 1),
+                ][..],
+            ),
+            (
+                Fate::Signal(StreamSendOutcome::EgressAbandoned),
+                &[
+                    (Ev::SentFull, 1),
+                    (Ev::WireStream, 1),
+                    (Ev::WireStreamEgressAbandoned, 1),
+                ][..],
+            ),
+            (
+                Fate::Unsignalled,
+                &[
+                    (Ev::SentFull, 1),
+                    (Ev::WireStream, 1),
+                    (Ev::WireStreamFailed, 1),
+                ][..],
+            ),
+            (Fate::MetadataSendFails, &[(Ev::SendFailed, 1)][..]),
+            (Fate::DispatchFails, &[(Ev::SendFailed, 1)][..]),
+        ];
+        for (n, (fate, want)) in cases.into_iter().enumerate() {
+            let target = add_peer(op_manager, 20 + n as u8);
+            let fanout: super::FanoutTargets = Arc::new(vec![target.pub_key().clone()]);
+            // Capacity 1: the stream dispatch waits behind the metadata
+            // message, so the responder can act between the two.
+            let (bridge_tx, mut bridge_rx) = tokio::sync::mpsc::channel::<P2pBridgeEvent>(1);
+            let bridge = P2pBridge::new_for_test(bridge_tx, op_manager.clone());
+            if matches!(fate, Fate::MetadataSendFails) {
+                bridge_rx.close();
+            }
+            let before = events();
+            let leg = super::broadcast_to_single_peer(
+                &bridge,
+                op_manager,
+                key,
+                state.clone(),
+                target,
+                None,
+                fanout,
+            );
+            let responder = async {
+                match fate {
+                    Fate::MetadataSendFails => {}
+                    Fate::DispatchFails => {
+                        while bridge_rx.is_empty() {
+                            tokio::task::yield_now().await;
+                        }
+                        // The metadata message is buffered; refuse the rest.
+                        bridge_rx.close();
+                    }
+                    Fate::Signal(_) | Fate::Unsignalled => {
+                        let Some(P2pBridgeEvent::Message(..)) = bridge_rx.recv().await else {
+                            panic!("the metadata message comes first");
+                        };
+                        let Some(P2pBridgeEvent::StreamSend { completion_tx, .. }) =
+                            bridge_rx.recv().await
+                        else {
+                            panic!("then the stream");
+                        };
+                        let completion_tx = completion_tx.expect("the leg waits on its fate");
+                        if let Fate::Signal(outcome) = fate {
+                            let _ignored = completion_tx.send(outcome);
+                        }
+                    }
+                }
+            };
+            tokio::join!(leg, responder);
+            let after = events();
+            for ev in Ev::ALL {
+                let expected = want.iter().find(|(e, _)| *e == ev).map_or(0, |(_, n)| *n);
+                assert_eq!(
+                    after.get(ev) - before.get(ev),
+                    expected,
+                    "{fate:?}: {ev:?} (after {after:?})"
+                );
+            }
+        }
         node.handler.abort();
     }
 

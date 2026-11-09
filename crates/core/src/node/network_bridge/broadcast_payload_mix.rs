@@ -1154,6 +1154,23 @@ impl PayloadMix {
         }
     }
 
+    /// Test-only view of the [`PropagationEvent`] counts, without draining.
+    #[cfg(test)]
+    pub(crate) fn propagation_event_for_test(&self, ev: PropagationEvent) -> u64 {
+        self.window
+            .lock()
+            .propagation_events
+            .get(ev.index())
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Test-only view of the stall count, without draining.
+    #[cfg(test)]
+    pub(crate) fn origination_stalls_for_test(&self) -> u64 {
+        self.window.lock().origination_stalls
+    }
+
     /// Add the propagation summary's stall WARN count for its last window.
     pub(crate) fn record_origination_stalls(&self, n: u64) {
         if n == 0 {

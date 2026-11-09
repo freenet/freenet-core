@@ -239,7 +239,12 @@ that reach LONG_WAIT
 upstream stream for relayed streams, and the rest): egress_long_waits_<cause>,
 egress_streams_abandoned_<cause>, egress_streams_refused_<cause>. Each has
 its own rate-limited WARN with one line per cause seen since the last, each
-with its count and remedy; the per-stream abandonment line is at debug. The
+with its count and remedy; the per-stream abandonment line is at debug. A
+stream abandoned at the deadline (the cwnd-wait check or a capped Abandon)
+signals StreamSendOutcome::EgressAbandoned on its completion_tx, not
+Dropped, so the UPDATE broadcast counters can name the cause per contract
+(#6143). Every consumer treats any outcome other than Delivered as not
+delivered; keep it that way when adding a variant. The
 cap counts UDP payload, not IP/UDP headers.
 EgressCap::poll_admit is the poll form for a sender that is polled (the QUIC
 endpoint's UdpPoller, #5940): Ready exactly when try_take would succeed at
@@ -2156,6 +2161,8 @@ QUIC send route (#5940 e5b-6, quic/upgrade/data_route.rs,
   Fallback: QuicPath::settle counts an outcome and path::route::next_step says what
   happens next. A message goes on UDP only when the outcome proves the receiver
   cannot deliver it:
+    (StreamSendOutcome is Delivered, Dropped, or EgressAbandoned, which only
+    a UDP stream at the egress deadline reports; see "Node-wide egress cap".)
     Sent: done (StreamSendOutcome::Delivered).
     MaybeDelivered: never resent, the peer may hold it. A stream reports
       StreamSendOutcome::Dropped: quinn may still have held part of it unsent, and
