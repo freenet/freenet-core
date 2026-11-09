@@ -1323,10 +1323,10 @@ snapshot except the two gauges.
   `PathGauge` guard inside the attempt, so dropping the attempt leaves the gauge.
   `quic_paths_active` is also in `resource_utilization` beside
   `memory_rss_bytes`.
-  `quic_flow_control_window_bytes`: the flow-control window of this node's QUIC
-  connections (per connection and direction), set when the endpoint is built,
-  0 without one; a state, not reset and not activity. Throughput by window
-  size shows whether nodes at the 128 KiB floor are slower on QUIC than on UDP.
+  `quic_flow_control_window_bytes`: the window every QUIC connection of this
+  node starts with (the floor, per direction), set when the endpoint is built,
+  0 without one; a state, not reset and not activity. A data path's windows
+  then move within the buffer budget (`quic_window_*`, `quic_budget_*`).
   Not built: the `transport=legacy|quic` attribute on connection, transfer and
   disconnect events; quinn's RTT, min RTT and lost bytes on a QUIC transfer's
   events (those fields are None today); the per-peer byte counters and the
@@ -1516,8 +1516,8 @@ exposes (its module doc lists the few it does not):
   keepalive 15 s (None when the TimeSource disables keepalive), idle = the
   TimeSource's connection idle timeout, Cubic with its window capped to the
   configured bandwidth (recycle::CappedCubic), 64 uni / 0 bidi streams,
-  stream / receive / send window = clamp(5% of memory / (2 x
-  max-number-of-connections), 128 KiB, 2 MiB), no unreliable datagrams, no
+  receive / send window = the floor (128 KiB, 64 KiB under 2 GiB), stream
+  receive window 8 MiB, data paths' windows then set by the buffer budget, no unreliable datagrams, no
   spin bit, migration off, max_incoming 64, incoming buffers 64 KiB / 1 MiB,
   no NEW_TOKEN tokens (Retry only), rustls ring, TLS 1.3, fixed ALPN, no SNI, no
   resumption, no early data. Keys and seeds (reset key, token key, CID key,
@@ -1528,16 +1528,39 @@ Connection IDs (quic/cid.rs) carry a keyed BLAKE3 MAC, so quinn drops a
   generator can be spoofed and would answer it with a stateless reset.
 ```
 
-QUIC memory: the flow-control windows (connection receive, stream receive,
-send; all one value from `connection_window_bytes`) are clamped and capped
-at `MAX_INBOUND_STREAM_BYTES_PER_CONNECTION`; the stream window never
-exceeds the connection window. The cap does not bind today (2 MiB clamp);
-`windows_never_exceed_the_reassembly_allowance` only guards future constant
-changes. The windows are the same class of per-connection exception as
-inbound stream reassembly and are in `NOT_SUMMED` in
-`declared_cache_ceiling`, but they are NOT covered by it: they are in
-addition to reassembly, the send window is outbound, and quinn holds
-received data and per-connection state the windows do not limit.
+QUIC memory: every connection starts at the floor window (128 KiB, or 64 KiB
+under 2 GiB, `budget::floor_window_bytes`) for its connection receive and
+send windows, and the stream receive window is the largest a connection
+grows to (`budget::MAX_WINDOW_BYTES`, 8 MiB); all are capped at
+`MAX_INBOUND_STREAM_BYTES_PER_CONNECTION`, which does not bind today
+(`windows_never_exceed_the_reassembly_allowance` guards future constant
+changes). A shadow path keeps the floor. A data path registers a
+`budget::ConnMeter` with the node's `budget::QuicBudget` (memory / 16,
+`quic_buffer_budget_for`), which charges it (W + debt) + send x 9/8 +
+gaps x 70 B + 64 KiB and sets its windows at runtime
+(`quinn::Connection::set_receive_window` / `set_send_window`):
+  → W + debt: quinn records a shrink as debt paid by later credits; the
+    meter mirrors it from the bytes the reader reads (credits from a STOP
+    are not seen, so it over-estimates).
+  → Growth only when window-limited on CONTIGUOUS delivery (the in-order
+    prefix of each stream, `RangeMirror::prefix`, at least 75% of a window
+    per round trip), at most doubling, up to 8 MiB, while the path's charge
+    stays within its share C (floor grant plus the budget above every
+    path's floor grant, split over the paths growing) and the node's within
+    the budget. Bytes read above a gap are credit, never growth.
+  → A grow that does not fit shrinks the paths furthest above C toward it;
+    the room comes as their debt is read, never by taking credit back.
+  → The send window follows 2 x cwnd within the same share, lowered only at
+    half; a window lowered while streams opened before it are open stays
+    charged until they end (the stream's epoch, held with its permit).
+  → The gap cap R_conn is max(256, (W + debt) / 1 KiB), set as the window
+    changes (`ConnRanges::set_cap`); a path without a meter keeps 256.
+  → Evaluated from the reader at most once per round trip (10 ms at least)
+    and at each 2 s acknowledgement-watch tick.
+  Telemetry: quic_budget_bytes, quic_budget_charged_bytes and
+  quic_budget_charged_peak_bytes, quic_window_grew, _grow_refused, _shrank.
+  Not metered: unread chunks between two polls of a reader, and the fixed
+  per-connection terms (`QUIC_CONNECTION_CHARGE_BYTES`).
 `quic/config.rs` pins MEASUREMENTS of named terms under stated conditions
 (`quic::memory_tests`, jemalloc-rounded on linux-gnu), not a ceiling on what
 a connection can hold: `QUIC_CONNECTION_FIXED_BYTES` (64 KiB, an idle

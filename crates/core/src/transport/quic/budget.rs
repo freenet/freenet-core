@@ -254,11 +254,6 @@ impl QuicBudget {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn floor(&self) -> u64 {
-        self.floor
-    }
-
     pub(crate) fn total(&self) -> u64 {
         self.total
     }

@@ -878,9 +878,11 @@ pub struct TransportMetrics {
     quic_paths_offered_or_dialing: AtomicU64,
     /// Paths active on this node's evidence (state, never reset).
     quic_paths_active: AtomicU64,
-    /// The flow-control window of this node's QUIC connections, per
-    /// connection and direction (`quic::config::connection_window_bytes`):
-    /// a state set when the endpoint is built, 0 without one.
+    /// The flow-control window every QUIC connection of this node starts
+    /// with, per direction (`quic::config::QuicSettings::window_bytes`, the
+    /// floor): a state set when the endpoint is built, 0 without one. A data
+    /// path's windows then move within the buffer budget
+    /// (`quic_budget_*`, `quic_window_*`).
     quic_flow_control_window_bytes: AtomicU64,
     /// What QUIC paths' data sends and receives did (`quic_data`).
     pub(crate) quic_data: QuicDataCounters,

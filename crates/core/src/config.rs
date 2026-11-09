@@ -3112,10 +3112,10 @@ impl NetworkApiConfig {
     /// lowered to [`Self::max_connections`], which is also the value when the
     /// key is unset or cannot be parsed ([`Self::quic_max_paths_setting`]).
     ///
-    /// The cap is `max_connections` because the endpoint's flow-control
-    /// windows are sized for that many connections
-    /// (`quic::config::connection_window_bytes`); more paths would exceed the
-    /// memory share they were sized for. At the default the limit rarely
+    /// The cap is `max_connections`: a path needs a UDP session, and the
+    /// node's QUIC memory is bounded per path (the fixed charge,
+    /// `quic::config::QUIC_CONNECTION_CHARGE_BYTES`) and by the buffer budget
+    /// its data paths' windows share (`quic::budget`). At the default the limit rarely
     /// binds: a connection has at most one path, but a permit is held from
     /// the offer, so a path still closing can briefly hold a slot.
     pub(crate) fn quic_max_paths(&self) -> usize {
