@@ -2873,8 +2873,16 @@ fn ensure_service_file_updated(_binary_path: &Path, _quiet: bool) -> Result<()> 
     Ok(())
 }
 
+/// Where [`replace_binary`] moves the binary it replaces before moving the new
+/// one in. Between those two renames there is no binary at `dest`, so a
+/// supervisor that kills `freenet update` there puts this one back (the run
+/// wrapper's crash-loop update, #6152).
+pub(crate) fn binary_backup_path(dest: &Path) -> PathBuf {
+    dest.with_extension("old")
+}
+
 fn replace_binary(new_binary: &Path, dest: &Path) -> Result<()> {
-    let backup_path = dest.with_extension("old");
+    let backup_path = binary_backup_path(dest);
     let parent_dir = dest
         .parent()
         .context("Destination path has no parent directory")?;
