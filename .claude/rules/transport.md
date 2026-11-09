@@ -1951,16 +1951,23 @@ Unordered reads: the header, the metadata, and short and control bodies are
   → NEVER read unordered before the header is known: an unordered read
     returns the peer's credit for every byte read, so bytes read past a
     missing header have no bound but the age limit.
+  → Switch only once an in-order read would block (BodyReader::next_unordered
+    drains what is contiguous first): quinn-proto 0.11.19 does not trim a
+    buffered resend against the read position at the switch, and read
+    unordered it counts those bytes as read again, so bytes_read passes the
+    final size, the end is never reported, and Recv::stop underflows.
   A gap costs one received range (quinn's recvd set and our mirror, ~70 B);
   gaps are counted per stream as ranges past the first, and a connection's
   streams may hold at most inbound::MAX_GAPS_PER_CONNECTION (2,048), past
   which the stream is stopped EVICTED and counted too_many_ranges. quinn
   keeps a stopped stream's recvd until the peer sends FIN or RESET, and after
-  a stop nothing tells us when (received_reset returns at once), so a stopped
-  stream's gaps stay counted; after KEPT_GAPS_GRACE (30 s) up to 32 of them
-  per stream leave the count (a quinn peer resets a stopped stream within a
-  round trip; one that never does loses that stream's slot for good, so at
-  most 64 such streams). A second trip past the cap closes the path with
+  a stop nothing tells us when (received_reset returns at once). After a stop
+  quinn adds nothing to recvd, and a stopped stream holds state only while it
+  holds its slot, so at most MAX_UNI_STREAMS of them at once: the count takes
+  the sum of the MAX_UNI_STREAMS largest frozen gap counts, not of all of
+  them, so it does not grow with the connection's age; after KEPT_GAPS_GRACE
+  (30 s) each counts 32 less (a quinn peer resets a stopped stream within a
+  round trip). A second trip past the cap closes the path with
   DOWNGRADE (closed_too_many_ranges). A Stream waiting for room in the
   delivery channel reads its payload but NOT its end until it is announced
   (reading the end frees quinn's slot, and the slots bound how many streams

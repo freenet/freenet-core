@@ -1435,6 +1435,96 @@ fn a_short_stream_waiting_for_room_fails_at_once() {
     })
 }
 
+/// A copy of the bytes that end the metadata is buffered before the header
+/// arrives, and the header then arrives in a resend that also carries them.
+/// The sender writes the stream in two pieces, so its first datagram carries
+/// the header and part of the metadata, and its second the rest. The second
+/// arrives late, after the sender has declared both lost; until a set
+/// instant every datagram carrying the header is lost (the first, and the
+/// resends, which carry both pieces). Then quinn holds the second piece,
+/// which starts inside the metadata, and a resend holding all of it: the
+/// in-order reads take the resend, and the first unordered read returns the
+/// second piece, below where they stopped. The bytes already read are
+/// dropped, and the stream arrives intact instead of failing as an overlap.
+#[test]
+fn a_second_copy_of_the_metadata_end_is_read_once() {
+    bounded(|| async move {
+        use crate::transport::in_memory_socket::{
+            PacketDeliveryDecision, set_packet_delivery_callback,
+        };
+        let _seed = GlobalRng::seed_guard(SEED);
+        let network = "quic-path-dup-boundary";
+        let mut p = paths(network, 95, QuicPathLimits::DEFAULT).await;
+        let from = p.pair.a_addr;
+        let time = p.time();
+        let release = time.now_nanos() + nanos_of(Duration::from_millis(1500));
+        let first_len = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let delayed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (len_seen, late, counted, clock) = (
+            first_len.clone(),
+            delayed.clone(),
+            dropped.clone(),
+            time.clone(),
+        );
+        set_packet_delivery_callback(
+            network,
+            Some(Arc::new(move |_, sender, _, data| {
+                use std::sync::atomic::Ordering::Relaxed;
+                if sender != from || clock.now_nanos() >= release {
+                    return PacketDeliveryDecision::Deliver;
+                }
+                if len_seen.load(Relaxed) == 0 {
+                    len_seen.store(data.len(), Relaxed);
+                }
+                // The first datagram, and resends of both pieces together.
+                if data.len() == len_seen.load(Relaxed) || data.len() > 1000 {
+                    counted.fetch_add(1, Relaxed);
+                    return PacketDeliveryDecision::Drop;
+                }
+                // The second piece (pings and acks are small) arrives late.
+                if data.len() > 200 && late.fetch_add(1, Relaxed) == 0 {
+                    return PacketDeliveryDecision::DelayedDelivery(Duration::from_secs(1));
+                }
+                PacketDeliveryDecision::Deliver
+            })),
+        );
+        let metadata = vec![9u8; 1000];
+        let body = payload(100);
+        let mut bytes = header(1, 1, StreamId::next().0, body.len() as u64, 1000);
+        bytes.extend_from_slice(&metadata);
+        bytes.extend_from_slice(&body);
+        let (conn, sleeper) = (p.a_raw(), time.clone());
+        p.drive(async move {
+            let mut send = conn.open_uni().await.unwrap();
+            send.write_all(&bytes[..518]).await.unwrap();
+            sleeper.sleep(Duration::from_millis(50)).await;
+            send.write_all(&bytes[518..]).await.unwrap();
+            send.finish().unwrap();
+            sleeper.sleep(Duration::from_secs(5)).await;
+        })
+        .await;
+        set_packet_delivery_callback(network, None);
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::Relaxed) > 1,
+            "premise: the first datagram and its resends were lost"
+        );
+        assert!(
+            delayed.load(std::sync::atomic::Ordering::Relaxed) >= 1,
+            "premise: the second piece arrived late"
+        );
+        let stats = p.b.stats();
+        assert_eq!(stats.count(QuicInboundOutcome::ReadFailed), 0);
+        let arrival = p.b_in.streams.try_recv().expect("announced");
+        assert_eq!(arrival.metadata.as_deref(), Some(&metadata[..]));
+        assert_eq!(arrival.handle.assemble().await.expect("assembled"), body);
+    })
+}
+
+fn nanos_of(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).expect("fits")
+}
+
 /// A message held for room in a full channel is stopped at its age limit, so
 /// the wait is bounded and the charge is released.
 #[test]
