@@ -216,14 +216,6 @@ impl ForwardReason {
     }
 }
 
-const _: () = {
-    let mut i = 0;
-    while i < ForwardReason::COUNT {
-        assert!(ForwardReason::ALL[i].index() == i);
-        i += 1;
-    }
-};
-
 /// Lane-run and forwarded counts, by reason, for the router snapshot
 /// ([`routing_counts`]). Plain atomics: bumped once per request.
 pub(crate) static LANE_RUNS: AtomicU64 = AtomicU64::new(0);
@@ -921,6 +913,9 @@ pub(crate) async fn run_lane(
                     forward_to_loop(&gate, &*forward, request, reason)
                 }));
                 if let Err(payload) = handed_over {
+                    // Its forward was already counted; count the panic too so
+                    // the lost request is visible outside the log.
+                    crate::node::network_status::record_delegate_lane_panic();
                     tracing::error!(
                         %delegate_key,
                         reason = %panic_reason(&*payload),

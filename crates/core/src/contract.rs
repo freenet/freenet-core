@@ -7845,7 +7845,7 @@ mod tests {
     pub(super) fn fn_region<'a>(code: &'a str, signature: &str) -> &'a str {
         let start = code.find(signature).unwrap_or_else(|| {
             panic!(
-                "`{signature}` must exist in the production text of contract.rs. \
+                "`{signature}` must exist in the scanned production source. \
                  If it was renamed, give this pin the new name — do not let it \
                  quietly scan nothing."
             )
