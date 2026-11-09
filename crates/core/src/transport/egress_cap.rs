@@ -247,6 +247,16 @@ pub(crate) fn retx_defer_min(rto: Duration) -> Duration {
     RETX_DEFER_MIN
 }
 
+/// Retransmits the bucket refused come back this many per datagram time
+/// at the cap's rate ([`EgressCap::space_retx_bucket_wait`]): spaced so they
+/// do not all retry on one deficit, but more often than the bucket refills,
+/// so a repair is not held behind the spacing when first copies take some
+/// of the refill. Chosen from the storm row at 1 MB/s over 40 seeds: one
+/// per datagram time completed 567 streams against main's 327 but two seeds
+/// did worse than main; two per datagram time 560 with none worse; four
+/// 545 with one worse.
+pub(crate) const RETX_BUCKET_SPACING_DIV: i64 = 2;
+
 /// A connection's refused RTO resends are deferred until they have been
 /// refused for this many effective RTOs in a row ([`RetxDeferral`]), then
 /// sent uncapped ([`EgressCap::admit_retransmit`]).
@@ -1201,18 +1211,19 @@ impl EgressCap {
     }
 
     /// How long a retransmit the bucket refused with `wait` should wait: to
-    /// the next free datagram time after `wait` among the retransmits the
-    /// bucket refused, so they come back one per datagram of refill. A
+    /// the next free slot after `wait` among the retransmits the bucket
+    /// refused, [`RETX_BUCKET_SPACING_DIV`] slots per datagram of refill. A
     /// timing hint only: nothing is paid, so nothing can leak.
     fn space_retx_bucket_wait(&self, bytes: usize, wait: Duration) -> Duration {
-        let cost = self.cost_ns(bytes as u64);
+        // In tests `FREENET_RETX_BUCKET_SPACING_DIV` overrides it, to sweep.
         #[cfg(test)]
-        let cost = cost
-            / std::env::var("FREENET_RETX_BUCKET_SPACING_DIV")
-                .ok()
-                .and_then(|v| v.trim().parse::<i64>().ok())
-                .unwrap_or(1)
-                .max(1);
+        let div = std::env::var("FREENET_RETX_BUCKET_SPACING_DIV")
+            .ok()
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .map_or(RETX_BUCKET_SPACING_DIV, |d| d.max(1));
+        #[cfg(not(test))]
+        let div = RETX_BUCKET_SPACING_DIV;
+        let cost = self.cost_ns(bytes as u64) / div;
         let now = self.now();
         let at = now.saturating_add(i64::try_from(wait.as_nanos()).unwrap_or(i64::MAX));
         let mut next = self.retx_bucket_next_ns.load(Ordering::Acquire);
