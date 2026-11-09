@@ -42,15 +42,11 @@ runs:
       # contract key is derived from the room-contract WASM bundled into
       # riverctl, so any pin (exact OR a semver range) eventually computes a
       # stale contract key or misses a client fix once River ships past it.
+      # (A `^0.1.70` pin froze CI on 0.1.80, which misreported successful sends
+      # as failures, so the retry loop below posted duplicates; see #6162.)
       #
-      # This used to be `^0.1.70`, which silently froze CI on 0.1.80 when
-      # riverctl went to 0.2.x. 0.1.80 misreads the node's reply to a send that
-      # succeeded (fixed in riverctl 0.2.17, freenet/river#688), exits non-zero,
-      # and the retry loop below posts again. Every dev-room notification
-      # sampled in 2026-11 needed 2+ attempts (a backlog sweep that took 3
-      # attempts landed in the room 3 times), while the unpinned public-room
-      # notifier on 0.2.25 succeeded on attempt 1.
-      run: cargo install riverctl
+      # `riverctl --version` is logged so a run shows which client it used.
+      run: cargo install riverctl && riverctl --version
 
     - name: Post to the dev room (with exponential backoff)
       shell: bash
@@ -67,8 +63,9 @@ runs:
         fi
 
         # Materialise the bot's riverctl config from the secret. `message send`
-        # fetches fresh room state from the network, so the config only needs
-        # the signing key + invitation secrets — the stored state is ignored.
+        # fetches fresh room state from the network, so the config mainly
+        # supplies the signing key + invitation secrets. (The stored state is
+        # still read as a migration fallback if the room contract was re-keyed.)
         CFG="$(mktemp -d)"
         trap 'rm -rf "$CFG"' EXIT
         if ! printf '%s' "$BOT_CONFIG" | base64 -d > "$CFG/rooms.json" 2>/dev/null; then
