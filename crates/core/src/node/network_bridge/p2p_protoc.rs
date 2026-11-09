@@ -3473,7 +3473,7 @@ async fn send_observed_broadcast(
         ObservedSend::Short => propagation.record(&contract, PropagationEvent::WireShort),
         ObservedSend::Unobserved => propagation.record(&contract, PropagationEvent::WireUnobserved),
         ObservedSend::Stream => {
-            let start = propagation.record_stream_start(&contract);
+            propagation.record(&contract, PropagationEvent::WireStream);
             let propagation = propagation.clone();
             let wait = super::broadcast_queue::stream_completion_timeout(len);
             // Short-lived: ends when the stream reports, its sender is
@@ -3483,16 +3483,16 @@ async fn send_observed_broadcast(
                     Ok(Ok(outcome)) => Some(outcome),
                     Ok(Err(_)) | Err(_) => None,
                 };
-                let ev = propagation.record_stream_fate(&contract, start, outcome);
+                let ev = propagation.record_stream_fate(&contract, outcome);
                 if ev != PropagationEvent::WireStreamDelivered {
                     // Debug, not WARN: under a bandwidth cap or a saturated
                     // uplink this fires per stream, which is the per-event
                     // volume #4252/#4272 removed, and the transport keeps its
                     // own per-stream egress abandons at debug for the same
                     // reason. The release-build signal is the per-contract
-                    // `wire_stream_*` count in `update_propagation_summary`
-                    // and the stall WARN built on it. This line adds the
-                    // contract and peer for a debug-level investigation.
+                    // `wire_stream_*` count in `update_propagation_summary`.
+                    // This line adds the contract and peer for a debug-level
+                    // investigation.
                     tracing::debug!(
                         contract = %contract,
                         peer = %peer,
@@ -4445,38 +4445,29 @@ pub(crate) mod tests {
                             "telemetry disagrees with the summary on {ev:?}"
                         );
                     }
-                    (result, events, stats.stream_fates_for_test(key.id()))
+                    (result, events)
                 }
             };
         let run = |fail: bool, observe: Option<(ObservedSend, Option<StreamSendOutcome>)>| {
             run_variant(false, fail, observe)
         };
 
-        let (r, e, _) = run(false, Some((ObservedSend::Short, None))).await;
+        let (r, e) = run(false, Some((ObservedSend::Short, None))).await;
         assert!(r.is_ok());
-        assert_eq!((e.get(Ev::WireShort), e.reached_wire()), (1, 1), "{e:?}");
+        assert_eq!(e.get(Ev::WireShort), 1, "{e:?}");
 
-        let (_, e, _) = run(false, Some((ObservedSend::Unobserved, None))).await;
-        assert_eq!(
-            (e.get(Ev::WireUnobserved), e.reached_wire()),
-            (1, 1),
-            "{e:?}"
-        );
+        let (_, e) = run(false, Some((ObservedSend::Unobserved, None))).await;
+        assert_eq!(e.get(Ev::WireUnobserved), 1, "{e:?}");
 
-        let (_, e, fates) = run(
+        let (_, e) = run(
             false,
             Some((ObservedSend::Stream, Some(StreamSendOutcome::Delivered))),
         )
         .await;
         assert_eq!(e.get(Ev::WireStream), 1, "{e:?}");
         assert_eq!(e.get(Ev::WireStreamDelivered), 1, "{e:?}");
-        assert_eq!(e.reached_wire(), 1);
-        // The fate is matched to the window the stream started in, which the
-        // stall check needs.
-        assert_eq!(fates.same_window, 1, "{fates:?}");
-        assert_eq!(fates.latest_delivered_start, Some(0), "{fates:?}");
 
-        let (_, e, _) = run(
+        let (_, e) = run(
             false,
             Some((
                 ObservedSend::Stream,
@@ -4485,22 +4476,16 @@ pub(crate) mod tests {
         )
         .await;
         assert_eq!(e.get(Ev::WireStreamEgressAbandoned), 1, "{e:?}");
-        assert_eq!(
-            e.reached_wire(),
-            0,
-            "an abandoned stream did not reach the wire"
-        );
 
-        let (_, e, _) = run(false, Some((ObservedSend::Stream, None))).await;
+        let (_, e) = run(false, Some((ObservedSend::Stream, None))).await;
         assert_eq!(e.get(Ev::WireStreamFailed), 1, "unsignalled sender: {e:?}");
-        assert_eq!(e.reached_wire(), 0);
 
-        let (r, e, _) = run(true, None).await;
+        let (r, e) = run(true, None).await;
         assert!(r.is_err());
         assert_eq!(e.get(Ev::SendFailed), 1, "{e:?}");
 
         // The V2 wire variant (with a coverage list) is followed the same way.
-        let (_, e, _) = run_variant(true, false, Some((ObservedSend::Short, None))).await;
+        let (_, e) = run_variant(true, false, Some((ObservedSend::Short, None))).await;
         assert_eq!(e.get(Ev::WireShort), 1, "BroadcastToV2: {e:?}");
 
         // Not a broadcast: nothing is attributed.

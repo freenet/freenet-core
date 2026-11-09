@@ -567,17 +567,16 @@ in the per-minute `update_propagation_summary` INFO line and node-wide as
 WHEN adding a way for a broadcast leg, fan-out or heal to end:
   → Count it through `record_propagation_event` (or `PropagationSink::record`
     where there is no OpManager). Never call `UpdatePropagationStats` or
-    `PayloadMix` directly: the one function feeds both, so the log and the
-    telemetry cannot disagree.
+    `PayloadMix` directly: the one function feeds both. They agree except at
+    the 4096-contract tracking cap, where a contract new to the window is
+    left out of the per-contract summary and still counted in telemetry.
   → A new event needs a variant, a label (a stable log/telemetry field name)
     and a production recording site. The pin test
-    `every_propagation_event_has_a_production_recording_site`
-    fails on a variant nothing records.
-  → A stream's start and fate go through `record_propagation_stream_start` /
-    `record_propagation_stream_fate` (or the `PropagationSink` methods), which
-    match each fate to the window the stream started in. Recording
-    `WireStream*` as a plain event loses that, and the stall check then waits
-    on the wrong window.
+    `every_propagation_event_has_a_production_recording_site` fails on a
+    variant nothing records.
+  → A stream's fate goes through `record_propagation_stream_fate` (or
+    `PropagationSink::record_stream_fate`), which maps the completion signal
+    to its `wire_stream_*` event.
   → Per-event logging stays at debug. The count is the release-build signal;
     a per-stream WARN brings back the #4252/#4272 log volume.
 ```
@@ -592,38 +591,49 @@ transport `wire_short` (one packet), `wire_stream` and its fate
 refused); and the receiver's `rx_dedup`, `rx_already_applied`, `rx_backoff`.
 
 `update_propagation_stalled` WARNs (counted as `origination_stalls` in
-telemetry) for a window in which a contract had a client update with
-resolved targets, or a dropped fan-out while no fan-out of it was processed,
-and nothing for it that started in that window or later reached the wire
-(`ContractSummary::reached_wire_since`: a short packet, a QUIC send, or a
-stream of that window or later delivered) by the end of the next window.
-Each window is its own candidate, keyed `(contract, window)`, so a new stall
-is reported on time behind an older candidate that is still waiting. A
-candidate with one of its own window's streams in flight waits for that
-stream's fate (up to `MAX_STALL_CARRY_WINDOWS`). At most one WARN per contract
-per window, and at most `MAX_STALL_WARNS_PER_WINDOW` per window plus a rollup.
+telemetry) at the end of window W for a contract that, over W-1 and W
+together, had:
 
-A client update whose legs were all skipped as converged (`skip_summary_equal`
-and the like) counts as a stall: the update changed this node's state, so no
-peer can already hold it, and the skip means this node's belief about the
-peer is stale. That is the leading #6143 hypothesis.
+- a client update in W-1;
+- resolved fan-out targets, or a dropped fan-out, in either window;
+- nothing handed to the bridge (`sent_delta + sent_full == 0`).
+
+W is grace for a leg queued late in W-1, and reading both windows catches an
+update applied at the end of W-1 whose fan-out is processed in W. The state
+is the previous window's summaries of client-updated contracts, nothing
+more. At most one WARN per contract per window, and at most
+`MAX_STALL_WARNS_PER_WINDOW` per window plus a rollup.
+
+So the WARN targets the sender-side shapes: every leg skipped, every leg
+failing before the bridge, or the whole fan-out dropped. Transport outcomes
+(`wire_*`) are counters only and never raise it, so a slow stream delivered
+many windows later is never a false WARN. A client update whose legs were
+all skipped as converged (`skip_summary_equal` and the like) counts as a
+stall: the update changed this node's state, so no peer can already hold
+it, and the skip means this node's belief about the peer is stale. That is
+the leading #6143 hypothesis.
+
+Do not rebuild stream-fate tracking into the WARN. Three review rounds of a
+per-window candidate carry that waited on each stream's fate each found new
+false-WARN and missed-WARN bugs, and it still could not see the likeliest
+transport losses (#6145).
 
 **It cannot see:**
-- relayed updates: only client updates are candidates;
-- loss of a single packet or of a QUIC message after the transport took it:
-  those count as reaching the wire. Read the receivers' `rx_*` counts across
-  the fleet;
-- partial failure: one leg on the wire clears the window, so 13 of 14 legs
-  failing raises nothing;
+- loss at or after the transport: a stream that fails after the bridge took
+  it, a single packet abandoned after its retransmits, a lost QUIC message.
+  Diagnose those from the `wire_*` counts and the receivers' `rx_*` counts
+  across the fleet;
+- relayed updates: only a client update makes a contract a candidate;
+- partial failure: one leg handed to the bridge in either window clears the
+  contract, so 13 of 14 legs failing raises nothing;
 - a fan-out that resolves no targets (`no_targets`, which has its own
-  `BROADCAST_NO_TARGETS` WARN);
-- a client fan-out dropped beside a processed relayed fan-out that resolved
-  no targets (the drop counter cannot tell the two apart).
+  `BROADCAST_NO_TARGETS` WARN).
 
-A stream fate that is not attributed (the 4096-contract tracking map was full,
-or more than `MAX_EARLIER_START_WINDOWS` start windows reported in one window)
-leaves its candidate waiting until `MAX_STALL_CARRY_WINDOWS`, then WARNs, which
-is a false WARN about 80 minutes late if the stream was delivered.
+Two ways it can be wrong: the fan-out drop counter cannot tell a client
+fan-out from a relayed one, so a relayed fan-out dropped beside a client
+update that resolved no targets is counted as the client's; and a contract
+whose window-W counts were refused at the 4096-contract cap reads as having
+sent nothing in W.
 
 ## Event emission review (targeted vs fan-out)
 

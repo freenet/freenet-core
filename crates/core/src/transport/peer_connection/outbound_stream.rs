@@ -4428,9 +4428,13 @@ mod egress_cap_tests {
     /// #6143: the abandon in the cwnd wait (the scenario above) names its
     /// cause on the completion sender too, not only the one at the capped
     /// take (`an_egress_abandon_is_reported_on_the_completion_sender`). Only
-    /// `send_stream` takes a completion sender.
+    /// `send_stream` takes a completion sender. Failing at the 5 s deadline
+    /// is what shows the cwnd wait's check fired: the capped take is never
+    /// reached while the window is full, and the generic cwnd timeout fires
+    /// later and reports no egress abandon.
     #[tokio::test(flavor = "current_thread")]
     async fn a_cwnd_wait_abandon_is_reported_on_the_completion_sender() {
+        const DEADLINE: Duration = crate::transport::egress_cap::PACED_WAIT_DEADLINE;
         let _seed = GlobalRng::seed_guard(15);
         let time = VirtualTime::new();
         let cap = EgressCap::new(500, time.clone());
@@ -4472,12 +4476,18 @@ mod egress_cap_tests {
             Some(completion_tx),
             None,
         ));
+        let start = time.now_nanos();
         let results = drive_results(&time, vec![stream]).await;
+        let elapsed = Duration::from_nanos(time.now_nanos() - start);
         filler.abort();
         assert!(
             matches!(results[0], Err(TransportError::OutboundStreamFailed(_))),
             "premise: the stream is failed at the deadline: {:?}",
             results[0]
+        );
+        assert!(
+            elapsed >= DEADLINE && elapsed < DEADLINE + Duration::from_millis(100),
+            "failed at {elapsed:?}, expected the cwnd wait's 5 s deadline"
         );
         assert_eq!(
             socket
