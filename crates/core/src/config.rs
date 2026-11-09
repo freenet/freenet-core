@@ -10,7 +10,6 @@ use std::{
     time::Duration,
 };
 
-use anyhow::Context;
 use directories::ProjectDirs;
 use either::Either;
 use serde::{Deserialize, Serialize};
@@ -1238,16 +1237,24 @@ impl ConfigArgs {
         let remotely_loaded_gateways = if mode == OperationMode::Local {
             Gateways::default()
         } else if !self.network_api.skip_load_from_network {
-            load_gateways_from_index(gateways_index, &config_paths.secrets_dir)
-                .await
-                .inspect_err(|error| {
+            match load_gateways_from_index(gateways_index, &config_paths.secrets_dir).await {
+                Ok(load) => {
+                    let cache = fs::read_to_string(&gateways_file)
+                        .ok()
+                        .and_then(|content| parse_gateways_toml(&content, "gateways.toml").ok())
+                        .map(|cache| cache.gateways)
+                        .unwrap_or_default();
+                    keep_cached_entries_for_unusable(load.gateways, &load.unusable, &cache)
+                }
+                Err(error) => {
                     tracing::error!(
                         error = %error,
                         index = gateways_index,
                         "Failed to load gateways from index"
                     );
-                })
-                .unwrap_or_default()
+                    Gateways::default()
+                }
+            }
         } else if let Some(gateways) = self.network_api.gateways {
             let gateways = gateways
                 .into_iter()
@@ -6636,7 +6643,144 @@ pub fn set_logger(
     }
 }
 
-async fn load_gateways_from_index(url: &str, pub_keys_dir: &Path) -> anyhow::Result<Gateways> {
+/// Parse the remote gateway index, dropping an entry that does not deserialize
+/// instead of rejecting the whole index.
+///
+/// The index is shared by every node, so a single malformed entry (a gateway
+/// added without its `public_key`, say) would otherwise make every peer ignore
+/// the update. The strict whole-document parse is tried first; the per-entry
+/// fallback runs only for a document that is valid TOML with a `gateways`
+/// array. A document-level failure (not TOML, or no `gateways` array) is still
+/// an error, never swallowed into an empty list. (A hand-edited local
+/// `gateways.toml` is deliberately NOT parsed this way: see
+/// [`parse_gateways_toml`].)
+fn parse_index_tolerating_bad_entries(content: &str, source: &str) -> anyhow::Result<Gateways> {
+    let strict_error = match parse_gateways_toml(content, source) {
+        Ok(gateways) => return Ok(gateways),
+        Err(e) => e,
+    };
+    let table: toml::Table = toml::from_str(content)?;
+    let Some(toml::Value::Array(entries)) = table.get("gateways") else {
+        return Err(strict_error.into());
+    };
+    let mut gateways = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        let mut single = toml::Table::new();
+        single.insert("gateways".into(), toml::Value::Array(vec![entry.clone()]));
+        let parsed = toml::to_string(&single)
+            .map_err(anyhow::Error::from)
+            .and_then(|doc| parse_gateways_toml(&doc, source).map_err(anyhow::Error::from));
+        match parsed {
+            Ok(mut one) => gateways.append(&mut one.gateways),
+            // The address (when there is one) and position identify the entry;
+            // the raw entry is not logged, so a bad one cannot flood the log.
+            Err(error) => tracing::warn!(
+                entry_index = index,
+                address = %entry
+                    .get("address")
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|| "<none>".to_string()),
+                error = %error,
+                "Skipping malformed gateway entry in the remote index"
+            ),
+        }
+    }
+    Ok(Gateways { gateways })
+}
+
+/// Why fetching one index gateway's key failed. The two are logged apart: a
+/// local disk problem is the operator's to fix, a bad remote key is not.
+enum IndexKeyError {
+    /// The key could not be fetched, or what was served is not a usable key.
+    Unusable(anyhow::Error),
+    /// The key was fetched and is valid but could not be stored locally.
+    LocalWrite(anyhow::Error),
+}
+
+/// A key file already in `pub_keys_dir` for this gateway that holds a valid
+/// X25519 key, from an earlier successful fetch.
+fn cached_gateway_key(gateway: &GatewayConfig, pub_keys_dir: &Path) -> Option<PathBuf> {
+    let path = pub_keys_dir.join(gateway.public_key_path.file_name()?);
+    let content = fs::read_to_string(&path).ok()?;
+    matches!(hex::decode(content.trim()), Ok(bytes) if bytes.len() == 32).then_some(path)
+}
+
+/// Fetch one index gateway's public key into `pub_keys_dir` and return the
+/// local path. The body is validated BEFORE it is written, so a bad response
+/// can never overwrite a good cached key of the same name.
+async fn fetch_index_gateway_key(
+    client: &reqwest::Client,
+    base_url: &reqwest::Url,
+    gateway: &GatewayConfig,
+    pub_keys_dir: &Path,
+) -> Result<PathBuf, IndexKeyError> {
+    use IndexKeyError::{LocalWrite, Unusable};
+    let public_key_url = base_url
+        .join(&gateway.public_key_path.to_string_lossy())
+        .map_err(|e| Unusable(e.into()))?;
+    let content = async {
+        client
+            .get(public_key_url)
+            .send()
+            .await?
+            .error_for_status()?
+            .bytes()
+            .await
+    }
+    .await
+    .map_err(|e| Unusable(e.into()))?;
+    let file_name = gateway
+        .public_key_path
+        .file_name()
+        .ok_or_else(|| Unusable(anyhow::anyhow!("Invalid public key path")))?;
+
+    // Validate the public key (hex-encoded X25519 public key, 32 bytes = 64 hex chars)
+    let text = std::str::from_utf8(&content)
+        .map_err(|_| Unusable(anyhow::anyhow!("public key is not valid UTF-8")))?
+        .trim();
+    // Legacy RSA PEM keys are not usable; the gateway needs to move to X25519.
+    if text.starts_with("-----BEGIN") {
+        return Err(Unusable(anyhow::anyhow!(
+            "legacy RSA PEM public key format; gateway needs to be updated to X25519"
+        )));
+    }
+    let key_bytes = hex::decode(text)
+        .map_err(|e| Unusable(anyhow::anyhow!("invalid public key hex encoding: {e}")))?;
+    if key_bytes.len() != 32 {
+        return Err(Unusable(anyhow::anyhow!(
+            "invalid public key length {} (expected 32)",
+            key_bytes.len()
+        )));
+    }
+
+    let local_path = pub_keys_dir.join(file_name);
+    fs::write(&local_path, &content).map_err(|e| {
+        LocalWrite(
+            anyhow::Error::new(e)
+                .context(format!("failed writing gateway pubkey to {local_path:?}")),
+        )
+    })?;
+    Ok(local_path)
+}
+
+/// What [`load_gateways_from_index`] found.
+struct IndexLoad {
+    /// Gateways whose key is usable locally.
+    gateways: Gateways,
+    /// Index entries skipped because no usable key could be obtained for them,
+    /// with the index's own key path. The caller uses these to keep a cached
+    /// entry for the same address rather than shrink the cache.
+    unusable: Vec<GatewayConfig>,
+}
+
+/// Maximum number of key fetches in flight at once. Each has its own 30 s HTTP
+/// timeout, so an index of up to this many gateways costs at most one timeout
+/// in the worst case instead of one per gateway.
+const INDEX_KEY_FETCH_CONCURRENCY: usize = 8;
+
+async fn load_gateways_from_index(url: &str, pub_keys_dir: &Path) -> anyhow::Result<IndexLoad> {
+    use futures::StreamExt;
+
     // Use an explicit timeout so the node doesn't hang indefinitely when the
     // network is unavailable (e.g., immediately after a Windows restart before
     // the network stack is ready). See #3716, #3717.
@@ -6655,71 +6799,111 @@ async fn load_gateways_from_index(url: &str, pub_keys_dir: &Path) -> anyhow::Res
     // Name the remote index, not a local file: a duplicate spelling published
     // there would otherwise have every node on the network tell its operator to
     // go edit an innocent gateways.toml, on every boot.
-    let mut gateways: Gateways = parse_gateways_toml(&response, url)?;
+    let mut gateways: Gateways = parse_index_tolerating_bad_entries(&response, url)?;
     let mut base_url = reqwest::Url::parse(url)?;
     base_url.set_path("");
-    let mut valid_gateways = Vec::new();
 
-    for gateway in &mut gateways.gateways {
-        gateway.location = None; // always ignore any location from files if set, it should be derived from IP
-        let public_key_url = base_url.join(&gateway.public_key_path.to_string_lossy())?;
-        let public_key_response = client
-            .get(public_key_url)
-            .send()
-            .await?
-            .error_for_status()?;
-        let file_name = gateway
-            .public_key_path
-            .file_name()
-            .ok_or_else(|| anyhow::anyhow!("Invalid public key path"))?;
-        let local_path = pub_keys_dir.join(file_name);
-        let mut public_key_file = File::create(&local_path)?;
-        let content = public_key_response.bytes().await?;
-        std::io::copy(&mut content.as_ref(), &mut public_key_file)?;
-
-        // Validate the public key (hex-encoded X25519 public key, 32 bytes = 64 hex chars)
-        // Also accept legacy RSA PEM keys temporarily for backwards compatibility
-        let mut key_file = File::open(&local_path).with_context(|| {
-            format!(
-                "failed loading gateway pubkey from {:?}",
-                gateway.public_key_path
-            )
-        })?;
-        let mut buf = String::new();
-        key_file.read_to_string(&mut buf)?;
-        let buf = buf.trim();
-
-        // Check if it's a legacy RSA PEM public key
-        if buf.starts_with("-----BEGIN") {
-            tracing::warn!(
-                public_key_path = ?gateway.public_key_path,
-                "Gateway uses legacy RSA PEM public key format. \
-                 Gateway needs to be updated to X25519 format. Skipping."
-            );
-            continue;
-        }
-
-        if let Ok(key_bytes) = hex::decode(buf) {
-            if key_bytes.len() == 32 {
-                gateway.public_key_path = local_path;
-                valid_gateways.push(gateway.clone());
-            } else {
-                tracing::warn!(
-                    public_key_path = ?gateway.public_key_path,
-                    "Invalid public key length {} (expected 32), ignoring",
-                    key_bytes.len()
-                );
+    // One gateway whose key cannot be fetched or validated (a 404 for a gateway
+    // the index lists before its key is served, a truncated body, a timeout)
+    // must not fail the whole load: every peer would then keep its stale cache,
+    // so a single bad entry would block the update for the entire network. Each
+    // entry is resolved on its own. If its fetch fails but an earlier fetch left
+    // a valid key file, that key is reused; otherwise just that entry is skipped.
+    let resolved = futures::stream::iter(std::mem::take(&mut gateways.gateways))
+        .map(|mut gateway| {
+            let (client, base_url) = (&client, &base_url);
+            async move {
+                gateway.location = None; // always ignore any location from files if set, it should be derived from IP
+                match fetch_index_gateway_key(client, base_url, &gateway, pub_keys_dir).await {
+                    Ok(local_path) => Ok((gateway, local_path)),
+                    Err(error) => {
+                        let (what, error) = match error {
+                            IndexKeyError::Unusable(e) => (
+                                "Gateway key from the remote index could not be fetched or is invalid",
+                                e,
+                            ),
+                            IndexKeyError::LocalWrite(e) => (
+                                "Could not store a fetched gateway key on the local disk",
+                                e,
+                            ),
+                        };
+                        tracing::warn!(
+                            address = ?gateway.address,
+                            public_key_path = ?gateway.public_key_path,
+                            error = %format!("{error:#}"),
+                            "{what}"
+                        );
+                        match cached_gateway_key(&gateway, pub_keys_dir) {
+                            Some(local_path) => {
+                                tracing::warn!(
+                                    address = ?gateway.address,
+                                    cached_key = ?local_path,
+                                    "Using the previously cached key for this gateway"
+                                );
+                                Ok((gateway, local_path))
+                            }
+                            None => {
+                                tracing::warn!(
+                                    address = ?gateway.address,
+                                    "Skipping gateway from the remote index: no usable key"
+                                );
+                                Err(gateway)
+                            }
+                        }
+                    }
+                }
             }
-        } else {
-            tracing::warn!(
-                public_key_path = ?gateway.public_key_path,
-                "Invalid public key hex encoding in remote gateway file, ignoring"
-            );
+        })
+        .buffered(INDEX_KEY_FETCH_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+
+    let mut valid_gateways = Vec::with_capacity(resolved.len());
+    let mut unusable = Vec::new();
+    for outcome in resolved {
+        match outcome {
+            Ok((mut gateway, local_path)) => {
+                gateway.public_key_path = local_path;
+                valid_gateways.push(gateway);
+            }
+            Err(gateway) => unusable.push(gateway),
         }
     }
 
     gateways.gateways = valid_gateways;
-    Ok(gateways)
+    Ok(IndexLoad { gateways, unusable })
+}
+
+/// Keep, in the set that will replace and be saved over the local cache, the
+/// cached entry for every address the index listed but whose key was unusable
+/// this time (a transient timeout, or a key not deployed yet).
+///
+/// Without this a partial index would shrink the cache: a gateway that is fine
+/// but whose key host hiccuped once would be dropped from `gateways.toml`.
+/// Only applies when at least one index gateway was usable; if none was, the
+/// caller falls back to the cache (and the compiled-in list) as a whole.
+fn keep_cached_entries_for_unusable(
+    mut loaded: Gateways,
+    unusable: &[GatewayConfig],
+    cache: &[GatewayConfig],
+) -> Gateways {
+    if loaded.gateways.is_empty() {
+        return loaded;
+    }
+    for entry in unusable {
+        if loaded.gateways.iter().any(|g| g.address == entry.address) {
+            continue;
+        }
+        if let Some(cached) = cache.iter().find(|c| c.address == entry.address) {
+            tracing::warn!(
+                address = ?entry.address,
+                "Keeping the locally cached entry for a gateway whose key the \
+                 remote index did not provide this time"
+            );
+            loaded.gateways.push(cached.clone());
+        }
+    }
+    loaded
 }
 
 /// Test-only: build a `ConfigArgs` rooted at `dir` in the given mode, ready to
@@ -8377,7 +8561,9 @@ shutdown-drain-secs = 42
         }
     }
 
-    /// ...and the remote-index call site must actually PASS its URL.
+    /// ...and the remote-index call site must actually PASS its URL (through
+    /// `parse_index_tolerating_bad_entries`, which hands it on to
+    /// `parse_gateways_toml`).
     ///
     /// The message-formatting test above pins what `redundant_key_spellings`
     /// produces; this pins the one line that decides which source it is told
@@ -8391,7 +8577,7 @@ shutdown-drain-secs = 42
         let source = include_str!("config.rs");
         // Assembled at runtime: spelled out as a literal, the needle would
         // appear in this test's own text and match itself. (It did.)
-        let needle = format!("parse_gateways_toml(&response, {})", "url");
+        let needle = format!("parse_index_tolerating_bad_entries(&response, {})", "url");
         assert!(
             source.contains(&needle),
             "load_gateways_from_index must pass the index URL as the source \
@@ -10815,7 +11001,8 @@ shutdown-drain-secs = 42
         let pub_keys_dir = tempfile::tempdir().unwrap();
         let gateways = load_gateways_from_index(&url, pub_keys_dir.path())
             .await
-            .unwrap();
+            .unwrap()
+            .gateways;
 
         assert_eq!(gateways.gateways.len(), 1);
         assert_eq!(
@@ -10827,6 +11014,395 @@ shutdown-drain-secs = 42
             pub_keys_dir.path().join("public_key.pem")
         );
         assert!(pub_keys_dir.path().join("public_key.pem").exists());
+    }
+
+    /// One gateway whose key cannot be used must not poison the whole index:
+    /// the others are still loaded (and so still replace the local cache).
+    /// Before, a single 404 aborted `load_gateways_from_index`, and a newly
+    /// added gateway whose key was not served yet kept every peer on its
+    /// stale cache.
+    #[tokio::test]
+    async fn load_gateways_from_index_skips_a_bad_entry() {
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(all_of!(request::method("GET"), request::path("/gateways")))
+                .times(1..)
+                .respond_with(status_code(200).body(
+                    r#"
+                    [[gateways]]
+                    address = { hostname = "missing-key.example.com" }
+                    public_key = "/keys/missing.pub"
+
+                    [[gateways]]
+                    address = { hostname = "short-key.example.com" }
+                    public_key = "/keys/short.pub"
+
+                    [[gateways]]
+                    address = { hostname = "good.example.com" }
+                    public_key = "/keys/good.pub"
+
+                    [[gateways]]
+                    address = { hostname = "not-hex.example.com" }
+                    public_key = "/keys/not_hex.pub"
+
+                    [[gateways]]
+                    address = { hostname = "no-key-field.example.com" }
+
+                    [[gateways]]
+                    address = { hostname = "good-two.example.com" }
+                    public_key = "/keys/good_two.pub"
+                    "#,
+                )),
+        );
+        let good_hex = hex::encode(TransportKeypair::new().public().as_bytes());
+        let good_two_hex = hex::encode(TransportKeypair::new().public().as_bytes());
+        server.expect(
+            Expectation::matching(request::path("/keys/missing.pub"))
+                .times(1..)
+                .respond_with(status_code(404)),
+        );
+        server.expect(
+            Expectation::matching(request::path("/keys/short.pub"))
+                .times(1..)
+                .respond_with(status_code(200).body(hex::encode([1u8; 31]))),
+        );
+        server.expect(
+            Expectation::matching(request::path("/keys/good.pub"))
+                .times(1..)
+                .respond_with(status_code(200).body(good_hex.clone())),
+        );
+        server.expect(
+            Expectation::matching(request::path("/keys/not_hex.pub"))
+                .times(1..)
+                .respond_with(status_code(200).body("zz-not-hex")),
+        );
+        server.expect(
+            Expectation::matching(request::path("/keys/good_two.pub"))
+                .times(1..)
+                .respond_with(status_code(200).body(good_two_hex.clone())),
+        );
+
+        let pub_keys_dir = tempfile::tempdir().unwrap();
+        // A previously cached good key under a name that a bad key then reuses
+        // must survive: a rejected body must not overwrite it.
+        std::fs::write(pub_keys_dir.path().join("not_hex.pub"), &good_hex).unwrap();
+
+        let gateways = load_gateways_from_index(&server.url_str("/gateways"), pub_keys_dir.path())
+            .await
+            .expect("one bad entry must not fail the whole index")
+            .gateways;
+        let hosts: Vec<_> = gateways
+            .gateways
+            .iter()
+            .map(|gw| gw.address.clone())
+            .collect();
+        assert_eq!(
+            hosts,
+            vec![
+                Address::Hostname("good.example.com".to_string()),
+                // Served a bad body, but an earlier fetch left a valid key:
+                // that one is reused.
+                Address::Hostname("not-hex.example.com".to_string()),
+                Address::Hostname("good-two.example.com".to_string()),
+            ]
+        );
+        assert_eq!(
+            std::fs::read_to_string(pub_keys_dir.path().join("not_hex.pub")).unwrap(),
+            good_hex,
+            "a rejected key body must not overwrite the cached key file"
+        );
+        // The usable keys were actually stored where the entries point.
+        for (gw, expected) in gateways
+            .gateways
+            .iter()
+            .zip([&good_hex, &good_hex, &good_two_hex])
+        {
+            assert_eq!(
+                &std::fs::read_to_string(&gw.public_key_path).unwrap(),
+                expected
+            );
+            assert_eq!(gw.public_key_path.parent().unwrap(), pub_keys_dir.path());
+        }
+        // Rejected bodies left nothing behind for the entries that had no cache.
+        for name in ["missing.pub", "short.pub"] {
+            assert!(!pub_keys_dir.path().join(name).exists(), "{name}");
+        }
+    }
+
+    /// If every entry in the index is unusable the load yields no gateways
+    /// (not an error), so `build()` falls back to the local cache and then the
+    /// compiled-in list instead of starting with nothing.
+    #[tokio::test]
+    async fn load_gateways_from_index_all_bad_yields_empty() {
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(request::path("/gateways"))
+                .times(1..)
+                .respond_with(status_code(200).body(
+                    r#"
+                    [[gateways]]
+                    address = { hostname = "a.example.com" }
+                    public_key = "/keys/a.pub"
+                    "#,
+                )),
+        );
+        server.expect(
+            Expectation::matching(request::path("/keys/a.pub"))
+                .times(1..)
+                .respond_with(status_code(404)),
+        );
+        let pub_keys_dir = tempfile::tempdir().unwrap();
+        let gateways = load_gateways_from_index(&server.url_str("/gateways"), pub_keys_dir.path())
+            .await
+            .unwrap()
+            .gateways;
+        assert!(gateways.gateways.is_empty());
+    }
+
+    fn toml_entry(host: &str, key: Option<&str>) -> String {
+        let key = key
+            .map(|k| format!("public_key = \"{k}\"\n"))
+            .unwrap_or_default();
+        format!("[[gateways]]\naddress = {{ hostname = \"{host}\" }}\n{key}\n")
+    }
+
+    /// The index parser drops a bad entry but never swallows a document-level
+    /// failure into an empty list.
+    #[test]
+    fn parse_index_tolerating_bad_entries_only_tolerates_entries() {
+        // Not TOML at all: error.
+        assert!(parse_index_tolerating_bad_entries("this is [not toml", "idx").is_err());
+        // Valid TOML without a `gateways` array: error.
+        assert!(parse_index_tolerating_bad_entries("name = \"x\"\n", "idx").is_err());
+        assert!(parse_index_tolerating_bad_entries("gateways = 5\n", "idx").is_err());
+        // Empty document: no `gateways` array, so also an error.
+        assert!(parse_index_tolerating_bad_entries("", "idx").is_err());
+
+        // A non-table entry and a keyless one among good ones are dropped.
+        let mixed = r#"
+            gateways = [
+                5,
+                { address = { hostname = "a.example.com" }, public_key = "/k/a.pub" },
+                { address = { hostname = "no-key.example.com" } },
+                { address = { hostname = "b.example.com" }, public_key = "/k/b.pub" },
+            ]
+        "#;
+        let parsed = parse_index_tolerating_bad_entries(mixed, "idx").unwrap();
+        assert_eq!(
+            parsed
+                .gateways
+                .iter()
+                .map(|g| g.address.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                Address::Hostname("a.example.com".to_string()),
+                Address::Hostname("b.example.com".to_string()),
+            ]
+        );
+
+        // A fully valid index takes the strict path unchanged.
+        let ok = format!(
+            "{}{}",
+            toml_entry("a.example.com", Some("/k/a.pub")),
+            toml_entry("b.example.com", Some("/k/b.pub"))
+        );
+        assert_eq!(
+            parse_index_tolerating_bad_entries(&ok, "idx")
+                .unwrap()
+                .gateways
+                .len(),
+            2
+        );
+        // Every entry bad: Ok(empty), the caller falls back to the cache.
+        let none = toml_entry("a.example.com", None);
+        assert!(
+            parse_index_tolerating_bad_entries(&none, "idx")
+                .unwrap()
+                .gateways
+                .is_empty()
+        );
+    }
+
+    /// A partial index (a key that 404s or timed out this time) must not shrink
+    /// the cache: build keeps the previously fetched key, and the saved
+    /// `gateways.toml` still lists the gateway. A brand-new gateway whose key is
+    /// not served yet is simply not added.
+    #[tokio::test]
+    async fn a_partial_index_does_not_shrink_the_gateway_cache() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_dir = temp_dir.path();
+        let args = || ConfigArgs {
+            mode: Some(OperationMode::Network),
+            config_paths: ConfigPathsArgs {
+                config_dir: Some(config_dir.to_path_buf()),
+                data_dir: Some(config_dir.to_path_buf()),
+                log_dir: Some(config_dir.to_path_buf()),
+            },
+            // Not `ConfigArgs::default()`'s network_api: that one sets
+            // skip_load_from_network, which would skip the index entirely.
+            network_api: NetworkArgs::default(),
+            ..Default::default()
+        };
+        let index_doc = ["a", "b", "c", "d"]
+            .iter()
+            .map(|n| toml_entry(&format!("{n}.example.com"), Some(&format!("/k/{n}.pub"))))
+            .collect::<String>();
+        let keys: Vec<String> = (0..3)
+            .map(|_| hex::encode(TransportKeypair::new().public().as_bytes()))
+            .collect();
+        let host = |n: &str| Address::Hostname(format!("{n}.example.com"));
+
+        // Boot 1: A, B, C are served; D does not exist yet.
+        let server1 = Server::run();
+        server1.expect(
+            Expectation::matching(request::path("/idx"))
+                .times(1..)
+                .respond_with(status_code(200).body(index_doc.clone())),
+        );
+        for (n, key) in ["a", "b", "c"].iter().zip(&keys) {
+            server1.expect(
+                Expectation::matching(request::path(format!("/k/{n}.pub")))
+                    .times(1..)
+                    .respond_with(status_code(200).body(key.clone())),
+            );
+        }
+        server1.expect(
+            Expectation::matching(request::path("/k/d.pub"))
+                .times(1..)
+                .respond_with(status_code(404)),
+        );
+        let first = args()
+            .build_with_gateways_index(&server1.url_str("/idx"))
+            .await
+            .unwrap();
+        assert_eq!(
+            first
+                .gateways
+                .iter()
+                .map(|g| g.address.clone())
+                .collect::<Vec<_>>(),
+            vec![host("a"), host("b"), host("c")]
+        );
+        let cached_file = std::fs::read_to_string(config_dir.join("gateways.toml")).unwrap();
+        let cached = parse_gateways_toml(&cached_file, "gateways.toml").unwrap();
+        assert_eq!(cached.gateways.len(), 3);
+
+        // Boot 2: C's key now 404s (and D's still does).
+        let server2 = Server::run();
+        server2.expect(
+            Expectation::matching(request::path("/idx"))
+                .times(1..)
+                .respond_with(status_code(200).body(index_doc)),
+        );
+        for (n, key) in ["a", "b"].iter().zip(&keys) {
+            server2.expect(
+                Expectation::matching(request::path(format!("/k/{n}.pub")))
+                    .times(1..)
+                    .respond_with(status_code(200).body(key.clone())),
+            );
+        }
+        for n in ["c", "d"] {
+            server2.expect(
+                Expectation::matching(request::path(format!("/k/{n}.pub")))
+                    .times(1..)
+                    .respond_with(status_code(404)),
+            );
+        }
+        let second = args()
+            .build_with_gateways_index(&server2.url_str("/idx"))
+            .await
+            .unwrap();
+        assert_eq!(
+            second
+                .gateways
+                .iter()
+                .map(|g| g.address.clone())
+                .collect::<Vec<_>>(),
+            vec![host("a"), host("b"), host("c")],
+            "C keeps its cached key; new, unserved D is not added"
+        );
+        let c = second
+            .gateways
+            .iter()
+            .find(|g| g.address == host("c"))
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&c.public_key_path).unwrap(),
+            keys[2]
+        );
+        let saved = std::fs::read_to_string(config_dir.join("gateways.toml")).unwrap();
+        let saved = parse_gateways_toml(&saved, "gateways.toml").unwrap();
+        assert!(
+            saved.gateways.iter().any(|g| g.address == host("c")),
+            "the saved cache must still list C"
+        );
+        // This is the set the "locally-cached gateways the remote index no
+        // longer lists" warning is computed from: it must be empty.
+        assert!(gateways_dropped_by_remote_replace(&cached.gateways, &second.gateways).is_empty());
+    }
+
+    /// If the cached key file is gone too, the cached ENTRY for that address is
+    /// still carried into the replacement set instead of being dropped.
+    #[test]
+    fn unusable_index_entries_keep_their_cached_entry() {
+        let gw = |host: &str, key: &str| GatewayConfig {
+            address: Address::Hostname(host.to_string()),
+            public_key_path: PathBuf::from(key),
+            location: None,
+        };
+        let loaded = Gateways {
+            gateways: vec![gw("a", "/local/a.pub")],
+        };
+        let unusable = [
+            gw("c", "/k/c.pub"),
+            gw("d", "/k/d.pub"),
+            gw("a", "/k/a.pub"),
+        ];
+        let cache = [gw("a", "/old/a.pub"), gw("c", "/local/c.pub")];
+        let out = keep_cached_entries_for_unusable(loaded, &unusable, &cache);
+        let got: Vec<_> = out
+            .gateways
+            .iter()
+            .map(|g| (g.address.clone(), g.public_key_path.clone()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (Address::Hostname("a".into()), PathBuf::from("/local/a.pub")),
+                (Address::Hostname("c".into()), PathBuf::from("/local/c.pub")),
+            ],
+            "C is carried from the cache; D has no cache entry; A is already loaded"
+        );
+
+        // Nothing usable from the index: leave it empty so build() falls back to
+        // the cache AND the compiled-in gateways as a whole.
+        let out = keep_cached_entries_for_unusable(Gateways::default(), &unusable, &cache);
+        assert!(out.gateways.is_empty());
+    }
+
+    /// A corrupt LOCAL `gateways.toml` still fails startup loudly (the decision
+    /// in #6146); only per-entry problems from the index are tolerated.
+    #[tokio::test]
+    async fn a_corrupt_local_gateways_toml_still_fails_build() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_dir = temp_dir.path();
+        fs::write(config_dir.join("gateways.toml"), "this is [not toml").unwrap();
+        let args = ConfigArgs {
+            mode: Some(OperationMode::Network),
+            config_paths: ConfigPathsArgs {
+                config_dir: Some(config_dir.to_path_buf()),
+                data_dir: Some(config_dir.to_path_buf()),
+                log_dir: Some(config_dir.to_path_buf()),
+            },
+            network_api: NetworkArgs {
+                skip_load_from_network: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        args.build()
+            .await
+            .expect_err("a corrupt local gateways.toml must fail startup");
     }
 
     #[test]
@@ -11079,7 +11655,8 @@ shutdown-drain-secs = 42
         let tmp_dir = tempfile::tempdir().unwrap();
         let gateways = load_gateways_from_index(FREENET_GATEWAYS_INDEX, tmp_dir.path())
             .await
-            .unwrap();
+            .unwrap()
+            .gateways;
         assert!(!gateways.gateways.is_empty());
 
         for gw in gateways.gateways {
