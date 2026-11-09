@@ -585,6 +585,8 @@ fn ack_counting_forwards_every_call_unchanged() {
     let window = c.window();
     let metrics = c.metrics();
     let initial = c.initial_window();
+    // The stack here wraps quinn's default Cubic, not the node's factory, so
+    // this checks forwarding, not the initial window the node uses.
     let reference = Arc::new(quinn::congestion::CubicConfig::default()).build(now, 1200);
     assert_eq!(initial, reference.initial_window());
     assert!(window > 0 && metrics.congestion_window == window);

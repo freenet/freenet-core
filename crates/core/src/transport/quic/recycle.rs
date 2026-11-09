@@ -129,12 +129,21 @@
 //!
 //! # The initial window
 //!
-//! Cubic starts at [`INITIAL_WINDOW_DATAGRAMS`] datagrams instead of quinn's
-//! 10. quinn does not grow the window while the connection is limited by the
-//! application, so a connection that only carries small messages keeps its
-//! initial window for life: on most connections the initial window is the
-//! window. quinn paces it (1.25 x window / RTT), so the larger start is spread
-//! over the first round trip rather than sent at once.
+//! Cubic starts at [`INITIAL_WINDOW_DATAGRAMS`] datagrams of
+//! [`MAX_UDP_PAYLOAD`] (38,400 bytes; a fixed byte count, not 32 x the
+//! runtime MTU) instead of quinn's 10. That is above RFC 9002's recommended
+//! 10 on purpose: quinn does not grow the window while the connection is
+//! limited by the application, so a connection that only carries small
+//! messages keeps its initial window for life, and on most connections the
+//! initial window is the window.
+//!
+//! quinn paces it, but only partly. Its pacer starts with a full bucket of at
+//! least 10 datagrams (`quinn-proto` `connection/pacing.rs`), so the first
+//! 12,000 bytes leave at once, and the remaining 22 datagrams are spread at
+//! 1.25 x window / RTT on quinn's RTT estimate, which says nothing about the
+//! bottleneck's rate. quinn's own estimate is updated by the handshake's
+//! acknowledgements; it is only the copy this controller keeps (`srtt`, see
+//! "The window cap") that can still hold the 333 ms initial value then.
 //!
 //! While the cap binds, a send it holds back counts in quinn as blocked by
 //! congestion, not limited by the application, so Cubic would keep growing on
@@ -248,7 +257,8 @@ impl SendAborts {
 }
 
 /// Cubic's initial window in datagrams of [`MAX_UDP_PAYLOAD`] (quinn's default
-/// is 10). Measured in the e5b-9 cold-start lab against 10 and 64, with
+/// is 10; RFC 9002 recommends 10), applied as `32 x 1200` bytes whatever the
+/// connection's MTU. Measured in the e5b-9 cold-start lab against 10 and 64, with
 /// pacing: a 64 KiB message on a fresh or application-limited connection at
 /// 300 ms RTT arrives in 0.53 s instead of 0.82 s (UDP: 0.15 s), 16 KiB in one
 /// round trip, and a burst of 10 such connections on a 5 Mbit/s uplink leaves

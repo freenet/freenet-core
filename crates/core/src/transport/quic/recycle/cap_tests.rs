@@ -127,6 +127,9 @@ fn the_initial_window_is_thirty_two_datagrams_and_the_cap_still_lowers_it() {
 fn with_no_limit_the_window_is_cubics() {
     let (controller, cubic) = after_a_transfer(QuicRateLimit::default());
     assert_eq!(controller.window(), cubic);
+    // quinn's default Cubic, not the node's factory: this checks the cap's
+    // pass-through, not the initial window (see
+    // `the_initial_window_is_thirty_two_datagrams_and_the_cap_still_lowers_it`).
     let fresh = CappedCubic::new(
         Arc::new(quinn::congestion::CubicConfig::default()).build(Instant::now(), MTU),
         QuicRateLimit::new(Some(1000), None),
@@ -196,6 +199,7 @@ fn with_a_limit_the_window_is_the_lower_of_cubics_and_the_rates() {
     // A limit far above what the path does leaves Cubic's window. (This
     // in-memory pair has a round trip of 0, where any rate gives the floor,
     // so the RTT is set here.)
+    // quinn's default Cubic, not the node's factory: only the cap is checked.
     let mut fast = CappedCubic::new(
         Arc::new(quinn::congestion::CubicConfig::default()).build(Instant::now(), MTU),
         QuicRateLimit::new(Some(usize::MAX / 2), None),
@@ -443,6 +447,12 @@ impl Drop for Link {
 /// more round trips (12 kB, then 24 kB). Freenet connections mostly carry
 /// small messages and quinn does not grow the window while the connection is
 /// application-limited, so this is the time most messages of this size take.
+///
+/// Measured from both ends having finished `establish` to `b` having read the
+/// whole message, on `VirtualTime` (deterministic, so no timing noise and no
+/// retry can move it). That includes quinn's pacing of the 22 datagrams after
+/// its first 10: 300 ms with 32 datagrams, 600 ms with 10. The bound, one
+/// round trip plus one one-way delay (450 ms), sits halfway between them.
 #[test]
 fn a_32_kib_message_on_a_fresh_connection_arrives_within_one_round_trip() {
     bounded(|| async move {
