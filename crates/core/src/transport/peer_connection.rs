@@ -1645,14 +1645,39 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
     /// Hand an already-serialized message to the transport: as one short
     /// message when it fits in a packet, otherwise as a stream.
     pub(crate) async fn send_serialized(&mut self, data: SerializedMessage) -> Result<()> {
+        self.route_serialized(data, None).await.map(|_| ())
+    }
+
+    /// [`Self::send_serialized`], also reporting how the message was carried
+    /// and, for a UDP stream, its fate on `completion_tx` (#6143). Both go
+    /// through [`Self::route_serialized`], so the bytes and the path are the
+    /// same; the only difference is that a UDP stream is given the completion
+    /// sender instead of `None`.
+    pub(crate) async fn send_serialized_observed(
+        &mut self,
+        data: SerializedMessage,
+        completion_tx: tokio::sync::oneshot::Sender<super::StreamSendOutcome>,
+    ) -> Result<super::ObservedSend> {
+        self.route_serialized(data, Some(completion_tx)).await
+    }
+
+    /// The one routing decision for a serialized message, shared by
+    /// [`Self::send_serialized`] and [`Self::send_serialized_observed`] so
+    /// the observed path cannot drift from the real one. Returns the path
+    /// taken. `completion_tx` reaches only a UDP stream; every other path
+    /// drops it, which a waiter reads as "no fate reported".
+    async fn route_serialized(
+        &mut self,
+        data: SerializedMessage,
+        completion_tx: Option<tokio::sync::oneshot::Sender<super::StreamSendOutcome>>,
+    ) -> Result<super::ObservedSend> {
         if !fits_one_packet(data.len() as u64) {
             tracing::trace!(
                 peer_addr = %self.remote_conn.remote_addr,
                 total_size_bytes = data.len(),
                 "Sending as stream"
             );
-            self.outbound_stream(data).await;
-            return Ok(());
+            return Ok(self.outbound_stream(data, completion_tx).await);
         }
         tracing::trace!(
             peer_addr = %self.remote_conn.remote_addr,
@@ -1661,12 +1686,13 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         // Never waits: this runs in the connection's task (`transport.md`).
         let data = match self.quic_data_route() {
             Some(route) => match route.queue_short(data) {
-                Ok(()) => return Ok(()),
+                Ok(()) => return Ok(super::ObservedSend::Unobserved),
                 Err(data) => data,
             },
             None => data,
         };
-        self.outbound_short_message(data).await
+        self.outbound_short_message(data).await?;
+        Ok(super::ObservedSend::Short)
     }
 
     /// The path that carries this connection's data right now, if one does.
@@ -3655,13 +3681,20 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
 
     /// A message past one packet. On a path it is a Short, and only on UDP a
     /// stream of its own, so the id is taken here for the UDP form either way.
-    async fn outbound_stream(&mut self, data: SerializedMessage) {
+    /// Returns how it was carried: only the UDP stream reports its fate on
+    /// `completion_tx`; the path drops it.
+    async fn outbound_stream(
+        &mut self,
+        data: SerializedMessage,
+        completion_tx: Option<tokio::sync::oneshot::Sender<super::StreamSendOutcome>>,
+    ) -> super::ObservedSend {
         let stream_id = StreamId::next_transport_internal();
         let Some(route) = self.quic_data_route() else {
-            self.outbound_stream_with_id(stream_id, data.into(), None, None, None)
+            self.outbound_stream_with_id(stream_id, data.into(), None, completion_tx, None)
                 .await;
-            return;
+            return super::ObservedSend::Stream;
         };
+        drop(completion_tx);
         let task = GlobalExecutor::spawn(
             quic_send::send_large_short_on_path(
                 route,
@@ -3672,6 +3705,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             .instrument(span!(tracing::Level::DEBUG, "outbound_stream")),
         );
         self.outbound_stream_futures.push(task);
+        super::ObservedSend::Unobserved
     }
 
     /// What starts a stream on the UDP session.
@@ -4144,6 +4178,20 @@ impl<S: super::Socket> super::PeerConnectionApi for PeerConnection<S> {
         Box<dyn futures::Future<Output = Result<(), super::TransportError>> + Send + '_>,
     > {
         Box::pin(async move { self.send_serialized(data).await })
+    }
+
+    fn send_bytes_observed(
+        &mut self,
+        data: Vec<u8>,
+        completion_tx: tokio::sync::oneshot::Sender<super::StreamSendOutcome>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn futures::Future<Output = Result<super::ObservedSend, super::TransportError>>
+                + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move { self.send_serialized_observed(data, completion_tx).await })
     }
 
     fn recv(
@@ -6392,6 +6440,97 @@ mod tests {
             .expect("recv");
         assert_eq!(stamp.since_last_receipt(), Duration::ZERO);
         crate::transport::TRANSPORT_METRICS.remove_peer(remote_addr);
+    }
+
+    /// #6143: `send_serialized_observed` reports how a message was carried.
+    /// A message that fits one packet is a `Short` and leaves as one packet;
+    /// a larger one is a `Stream` whose completion sender reports
+    /// `Delivered` once its last fragment has left the socket.
+    #[tokio::test]
+    async fn observed_send_reports_short_and_stream_and_the_streams_fate() {
+        use crate::transport::crypto::TransportKeypair;
+        use crate::util::time_source::SharedMockTimeSource;
+
+        let time_source = SharedMockTimeSource::new();
+        let (_inbound_tx, inbound_rx) = mpsc::channel(16);
+        let remote_addr = SocketAddr::new(Ipv4Addr::new(10, 99, 99, 61).into(), 50061);
+        let mut key = [0u8; 16];
+        crate::config::GlobalRng::fill_bytes(&mut key);
+        let cipher = Aes128Gcm::new(&key.into());
+        let keypair = TransportKeypair::new();
+        let sent_tracker = Arc::new(parking_lot::Mutex::new(
+            SentPacketTracker::new_with_time_source(time_source.clone()),
+        ));
+        let congestion_controller =
+            crate::transport::congestion_control::CongestionControlConfig::default()
+                .build_arc_with_time_source(time_source.clone());
+        let token_bucket = Arc::new(TokenBucket::new_with_time_source(
+            10_000_000,
+            10_000_000,
+            time_source.clone(),
+        ));
+        let (sock_tx, mut sock_rx) = mpsc::channel::<(SocketAddr, Arc<[u8]>)>(64);
+        let fail_sends = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let socket = Arc::new(FailableTestSocket::new(sock_tx, fail_sends));
+        let rolling_rtt_stats = crate::transport::rolling_rtt_stats::RollingRttStatsHandle::new(
+            remote_addr,
+            time_source.clone(),
+        );
+        let remote_conn = RemoteConnection {
+            outbound_symmetric_key: cipher.clone(),
+            remote_addr,
+            sent_tracker,
+            last_packet_id: crate::transport::connection_handler::data_packet_ids(),
+            inbound_packet_recv: inbound_rx,
+            inbound_symmetric_key: cipher,
+            inbound_symmetric_key_bytes: key,
+            my_address: None,
+            remote_protoc_version: None,
+            transport_secret_key: keypair.secret,
+            congestion_controller,
+            token_bucket,
+            socket,
+            global_bandwidth: None,
+            bandwidth_limit: None,
+            rolling_rtt_stats,
+            time_source,
+        };
+        let mut conn = PeerConnection::new(remote_conn);
+        if let Some(handle) = conn.keep_alive_handle.take() {
+            handle.abort();
+        }
+
+        // One packet.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let short = conn
+            .send_serialized_observed(vec![7u8; 100], tx)
+            .await
+            .expect("short send");
+        assert_eq!(short, crate::transport::ObservedSend::Short);
+        assert!(rx.await.is_err(), "a short message reports no fate");
+        sock_rx
+            .recv()
+            .await
+            .expect("the short message left as one packet");
+        assert!(sock_rx.try_recv().is_err(), "exactly one packet");
+
+        // Several packets: a stream, reported delivered once it has left.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let stream = conn
+            .send_serialized_observed(vec![9u8; 4 * MAX_DATA_SIZE], tx)
+            .await
+            .expect("stream send");
+        assert_eq!(stream, crate::transport::ObservedSend::Stream);
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), rx)
+            .await
+            .expect("the stream reports its fate")
+            .expect("the completion sender is signalled, not dropped");
+        assert_eq!(outcome, crate::transport::StreamSendOutcome::Delivered);
+        let mut packets = 0;
+        while sock_rx.try_recv().is_ok() {
+            packets += 1;
+        }
+        assert!(packets >= 4, "the stream's fragments left: {packets}");
     }
 
     /// Outbound-`send` burst coverage related to #3321 (Gap 3 of #3367): a

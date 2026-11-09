@@ -204,6 +204,27 @@ pub(crate) enum StreamSendOutcome {
     /// closed, congestion timeout, no connection, transport send error). The
     /// permit is released but the message was NOT delivered.
     Dropped,
+    /// Not delivered: the stream was failed because its next fragment could
+    /// not be sent within the node-wide egress deadline. A `Dropped` with a
+    /// named cause, kept apart so the node can attribute these abandons to a
+    /// contract (#6143); the transport logs them per stream at debug only.
+    EgressAbandoned,
+}
+
+/// How the transport carried one message given to
+/// [`PeerConnectionApi::send_bytes_observed`] (#6143).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ObservedSend {
+    /// One packet on the UDP session. It is retransmitted until acknowledged
+    /// or abandoned, but nothing reports which, so its fate is not observed.
+    Short,
+    /// A stream on the UDP session. The `completion_tx` handed in reports its
+    /// fate: `Delivered` once the last fragment leaves the sender (NOT a
+    /// receiver acknowledgement), otherwise a drop.
+    Stream,
+    /// A path that reports no per-message fate: the QUIC data path, or an
+    /// implementation that does not observe. `completion_tx` is dropped.
+    Unobserved,
 }
 
 /// Everything the node holds of an open transport.
@@ -588,6 +609,23 @@ pub(crate) trait PeerConnectionApi: Send {
         &mut self,
         data: Vec<u8>,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>>;
+
+    /// [`Self::send_bytes`], also saying how the message was carried and, for
+    /// a stream, reporting its fate on `completion_tx`. The bytes on the wire
+    /// are the same as `send_bytes` would send. Used to attribute UPDATE
+    /// broadcast losses below the bridge to their contract (#6143).
+    ///
+    /// The default sends with `send_bytes` and observes nothing.
+    fn send_bytes_observed(
+        &mut self,
+        data: Vec<u8>,
+        completion_tx: tokio::sync::oneshot::Sender<StreamSendOutcome>,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<ObservedSend, TransportError>> + Send + '_>>
+    {
+        drop(completion_tx);
+        let send = self.send_bytes(data);
+        Box::pin(async move { send.await.map(|()| ObservedSend::Unobserved) })
+    }
 
     /// Receives raw bytes from the remote peer.
     ///

@@ -731,11 +731,11 @@ impl P2pConnManager {
             return;
         }
 
-        let target = op_manager
-            .ring
-            .connection_manager
-            .get_peer_by_addr(target_addr);
-        let Some(target) = target else {
+        // Counts the heal's leg as `heal_target` (#6143), on both the
+        // production and the simulation path below.
+        let Some(target) =
+            super::super::broadcast_queue::resolve_heal_target(op_manager, &key, target_addr)
+        else {
             tracing::debug!(
                 contract = %key,
                 peer = %target_addr,
@@ -857,6 +857,13 @@ impl P2pConnManager {
         new_state: freenet_stdlib::prelude::WrappedState,
         target_result: crate::operations::update::BroadcastTargetResult,
     ) {
+        // Each leg's outcome is counted like the production queue's (#6143),
+        // so simulation builds report the same counts.
+        use crate::operations::update::propagation_stats::{
+            PropagationEvent, record_propagation_event,
+        };
+        let count = |ev| record_propagation_event(op_manager, key.id(), ev);
+
         // Skip the whole fan-out when we hold no local state for `key`: there is
         // nothing to broadcast, and the per-target `get_contract_summary` calls
         // below are the residual #4473 summarize storm on this path. Mirrors the
@@ -867,6 +874,10 @@ impl P2pConnManager {
                 contract = %key,
                 "Skipping broadcast fan-out - contract not hosted or in use"
             );
+            // Production counts this per leg.
+            for _ in &target_result.targets {
+                count(PropagationEvent::SkipNotHosted);
+            }
             return;
         }
 
@@ -922,6 +933,7 @@ impl P2pConnManager {
 
         for target in &target_result.targets {
             let Some(peer_addr) = target.socket_addr() else {
+                count(PropagationEvent::SkipNoAddress);
                 continue;
             };
 
@@ -957,14 +969,16 @@ impl P2pConnManager {
             // converged-but-nondeterministic-summary pair does not re-flood
             // full state. Mirrors production `broadcast_to_single_peer`.
             if let (Some(ours), Some(theirs)) = (&our_summary, &their_summary) {
-                if !super::super::broadcast_queue::fanout_send_needed(
-                    op_manager,
-                    &key,
-                    super::super::broadcast_queue::SummaryPair { ours, theirs },
-                    &mut staleness_probes_used,
-                )
-                .await
+                if let super::super::broadcast_queue::FanoutDecision::Skip(skip) =
+                    super::super::broadcast_queue::fanout_send_needed(
+                        op_manager,
+                        &key,
+                        super::super::broadcast_queue::SummaryPair { ours, theirs },
+                        &mut staleness_probes_used,
+                    )
+                    .await
                 {
+                    count(skip);
                     tracing::trace!(
                         contract = %key,
                         peer = %peer_addr,
@@ -1020,6 +1034,7 @@ impl P2pConnManager {
                             op_manager
                                 .interest_manager
                                 .refresh_peer_interest(&key, &peer_key);
+                            count(PropagationEvent::SkipEmptyDelta);
                             skipped_summary_match += 1;
                             continue;
                         }
@@ -1104,6 +1119,7 @@ impl P2pConnManager {
                             error = %e,
                             "Failed to serialize BroadcastStreamingPayload, skipping"
                         );
+                        count(PropagationEvent::SendFailed);
                         continue;
                     }
                 };
@@ -1218,6 +1234,7 @@ impl P2pConnManager {
 
             if let Err(err) = send_result {
                 send_failed += 1;
+                count(PropagationEvent::SendFailed);
                 tracing::warn!(
                     tx = %update_tx,
                     peer = %peer_addr,
@@ -1226,6 +1243,15 @@ impl P2pConnManager {
                 );
             } else {
                 send_success += 1;
+                // Unlike production, a streamed full state here counts only
+                // `SentFull`, no `wire_stream` or stream fate: `send_stream`
+                // gives no completion signal. Inline sends still get their
+                // `wire_*` count from the connection task, as in production.
+                count(if sent_delta {
+                    PropagationEvent::SentDelta
+                } else {
+                    PropagationEvent::SentFull
+                });
                 // Track delta vs full state sends for testing (PR #2763)
                 if sent_delta {
                     op_manager

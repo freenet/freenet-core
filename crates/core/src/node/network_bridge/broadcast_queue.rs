@@ -42,6 +42,9 @@ use std::time::Duration;
 use freenet_stdlib::prelude::{ContractKey, WrappedState};
 
 use crate::node::OpManager;
+use crate::operations::update::propagation_stats::{
+    PropagationEvent, record_propagation_event, record_propagation_stream_fate,
+};
 use crate::ring::PeerKeyLocation;
 use crate::transport::StreamSendOutcome;
 
@@ -712,10 +715,20 @@ pub(super) fn plan_fanout_send<T: crate::util::time_source::TimeSource + Sync>(
     }
 }
 
+/// Outcome of [`fanout_send_needed`]: send, or skip and why (#6143).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FanoutDecision {
+    Send,
+    /// Skip. The event names which check decided the peer is converged:
+    /// byte-equal summaries, a cached empty delta, or the WASM probe.
+    Skip(PropagationEvent),
+}
+
 /// Full semantic staleness decision for one (contract, peer) fan-out send:
 /// [`plan_fanout_send`] plus the bounded WASM `get_state_delta` probe on a
-/// cache miss. Returns `true` when the peer needs our state (send), `false`
-/// when it is converged (skip).
+/// cache miss. Returns [`FanoutDecision::Send`] when the peer needs our state,
+/// and [`FanoutDecision::Skip`] naming the deciding check when it is
+/// converged.
 ///
 /// `probes_used` is the per-fan-out-invocation probe budget counter (mirrors
 /// the `Summaries` handler's per-message `MAX_STALENESS_PROBES_PER_SUMMARIES`
@@ -740,9 +753,9 @@ pub(super) async fn fanout_send_needed(
     key: &ContractKey,
     summaries: SummaryPair<'_>,
     probes_used: &mut usize,
-) -> bool {
+) -> FanoutDecision {
     match plan_fanout_send(&op_manager.interest_manager, key, summaries, *probes_used) {
-        FanoutSendPlan::Send => true,
+        FanoutSendPlan::Send => FanoutDecision::Send,
         FanoutSendPlan::Skip => {
             // #5147 diagnostic: the pre-existing summary-match skip is the
             // OTHER mechanism suppressing fan-out legs, and it is fed by the
@@ -751,7 +764,13 @@ pub(super) async fn fanout_send_needed(
             // the two visible instead of showing up as an unexplained rise in
             // total sends.
             crate::config::GlobalTestMetrics::record_fanout_summary_skip();
-            false
+            // `plan_fanout_send` skips on byte-equal summaries first and on a
+            // cached empty delta otherwise; re-deriving which is one memcmp.
+            if summaries.ours.as_ref() == summaries.theirs.as_ref() {
+                FanoutDecision::Skip(PropagationEvent::SkipSummaryEqual)
+            } else {
+                FanoutDecision::Skip(PropagationEvent::SkipCachedConverged)
+            }
         }
         FanoutSendPlan::Probe => {
             *probes_used += 1;
@@ -764,9 +783,31 @@ pub(super) async fn fanout_send_needed(
                 .interest_manager
                 .peer_summary_has_pending_state(op_manager, key, theirs, ours)
                 .await;
-            crate::ring::interest::summary_indicates_stale_peer(ours, theirs, verdict)
+            if crate::ring::interest::summary_indicates_stale_peer(ours, theirs, verdict) {
+                FanoutDecision::Send
+            } else {
+                FanoutDecision::Skip(PropagationEvent::SkipProbeConverged)
+            }
         }
     }
+}
+
+/// The connected peer a targeted heal (`SyncStateToPeer`) for `key` goes
+/// to, `None` when no connection has `target_addr`. A resolved heal counts
+/// its leg (`HealTarget`, #6143), as a fan-out counts its resolved targets,
+/// so a heal's skip or send can be read against the heal legs that produced
+/// it rather than against a fan-out's targets.
+pub(super) fn resolve_heal_target(
+    op_manager: &OpManager,
+    key: &ContractKey,
+    target_addr: std::net::SocketAddr,
+) -> Option<PeerKeyLocation> {
+    let target = op_manager
+        .ring
+        .connection_manager
+        .get_peer_by_addr(target_addr)?;
+    record_propagation_event(op_manager, key.id(), PropagationEvent::HealTarget);
+    Some(target)
 }
 
 // The `BroadcastQueue` struct (constants, types, impl) is only used in the
@@ -1381,6 +1422,18 @@ mod queue {
         }
     }
 
+    /// What [`BroadcastQueue::enqueue_in_lane`] did beside queuing the
+    /// entry, for [`BroadcastQueue::enqueue`] to count (#6143).
+    #[derive(Debug, Default)]
+    struct EnqueueOutcome {
+        /// The entry replaced a queued one for the same (contract, peer)
+        /// pair.
+        superseded: bool,
+        /// The contracts of the entries evicted at capacity to make room,
+        /// one per evicted leg.
+        evicted: Vec<ContractKey>,
+    }
+
     /// Global broadcast queue that serializes outbound broadcast streams
     /// with bounded concurrency and deduplication.
     ///
@@ -1418,6 +1471,16 @@ mod queue {
             Self::with_spacing(Arc::new(BroadcastSpacing::new(Arc::new(
                 crate::util::time_source::InstantTimeSrc::new(),
             ))))
+        }
+
+        /// The same queue holding at most `depth` entries, for tests that
+        /// need capacity eviction without filling the default depth.
+        #[cfg(test)]
+        pub(crate) fn with_max_queue_depth(self, depth: usize) -> Self {
+            Self {
+                max_queue_depth: depth,
+                ..self
+            }
         }
 
         pub(crate) fn with_spacing(spacing: Arc<BroadcastSpacing>) -> Self {
@@ -1463,12 +1526,32 @@ mod queue {
                 &target,
                 new_state.size(),
             );
-            self.enqueue_in_lane(lane, key, target, new_state, fanout)
+            use crate::operations::update::propagation_stats::{
+                PropagationEvent, record_propagation_event,
+            };
+            let outcome = self
+                .enqueue_in_lane(lane, key, target, new_state, fanout)
                 .await;
+            if outcome.superseded {
+                // #6143: the replaced leg ends here without a send of its own.
+                // Its update rides on this newer leg, whose outcome decides
+                // whether anything was sent. Each fan-out or heal registered
+                // its own target, so without this the legs never add up.
+                record_propagation_event(op_manager, key.id(), PropagationEvent::SkipSuperseded);
+            }
+            // #6143: a leg dropped to make room ends without a send, possibly
+            // for another contract.
+            for evicted in &outcome.evicted {
+                record_propagation_event(op_manager, evicted.id(), PropagationEvent::SkipEvicted);
+            }
         }
 
         /// The lane-agnostic half of [`Self::enqueue`], split out so tests can
         /// drive the real queue without standing up an `OpManager`.
+        ///
+        /// Returns whether the entry replaced a queued one for the same
+        /// (contract, peer) pair, and the contracts of the entries evicted to
+        /// make room for it, which [`Self::enqueue`] counts.
         async fn enqueue_in_lane(
             &self,
             lane: QueuedPayloadClass,
@@ -1476,7 +1559,8 @@ mod queue {
             target: PeerKeyLocation,
             new_state: WrappedState,
             fanout: FanoutTargets,
-        ) {
+        ) -> EnqueueOutcome {
+            let mut outcome = EnqueueOutcome::default();
             let dedup_key = (key, target.clone());
             let state_size = new_state.size();
             let mut queue = self.queue.lock().await;
@@ -1524,6 +1608,7 @@ mod queue {
                 while queue.len() >= self.max_queue_depth {
                     if let Some(entry) = queue.evict_oldest(Instant::now(), &self.spacing) {
                         crate::node::BROADCAST_QUEUE_EFFICIENCY_METRICS.record_capacity_eviction();
+                        outcome.evicted.push(entry.key);
                         tracing::warn!(
                             contract = %entry.key,
                             peer = ?entry.target.socket_addr(),
@@ -1562,6 +1647,8 @@ mod queue {
 
             drop(queue);
             self.notify_for(lane).notify_one();
+            outcome.superseded = previous_lane.is_some();
+            outcome
         }
 
         /// Start the background workers that drain the queue with bounded
@@ -2072,7 +2159,7 @@ mod queue {
                 "enqueue must derive its lane from lane_for — not merely mention it"
             );
             assert!(
-                enq_body.contains("self.enqueue_in_lane(lane,"),
+                enq_body.contains(".enqueue_in_lane(lane,"),
                 "...and must enqueue with THAT lane; deriving it and then passing a \
                  different one would pass the check above"
             );
@@ -4098,6 +4185,15 @@ fn streaming_completion_delivered(completion: StreamCompletionResult) -> bool {
     matches!(completion, Ok(Ok(StreamSendOutcome::Delivered)))
 }
 
+/// The outcome a streaming completion reported, or `None` when it reported
+/// none (the oneshot was dropped unsignalled, or the wait timed out).
+fn stream_outcome_of(completion: &StreamCompletionResult) -> Option<StreamSendOutcome> {
+    match completion {
+        Ok(Ok(outcome)) => Some(*outcome),
+        Ok(Err(_)) | Err(_) => None,
+    }
+}
+
 /// Result of awaiting the streaming completion oneshot under a timeout:
 /// `timeout(.., completion_rx).await`. The inner `Ok`/`Err` distinguishes a
 /// delivered/dropped signal from a dropped oneshot; the outer `Err` is the
@@ -4336,7 +4432,12 @@ pub(super) async fn broadcast_to_single_peer(
     use crate::ring::PeerKey;
     use crate::transport::StreamId;
 
+    // #6143: every exit below that sends nothing logs at debug/trace only,
+    // which release builds compile out. Each one is counted instead, per
+    // contract, in the `update_propagation_summary` INFO line and the
+    // `broadcast_payload_mix` telemetry (see `propagation_stats`).
     let Some(peer_addr) = target.socket_addr() else {
+        record_propagation_event(op_manager, key.id(), PropagationEvent::SkipNoAddress);
         return;
     };
 
@@ -4361,6 +4462,7 @@ pub(super) async fn broadcast_to_single_peer(
             peer = %peer_addr,
             "Skipping broadcast - contract not hosted or in use"
         );
+        record_propagation_event(op_manager, key.id(), PropagationEvent::SkipNotHosted);
         return;
     }
 
@@ -4448,7 +4550,7 @@ pub(super) async fn broadcast_to_single_peer(
         // Per-invocation probe budget: one (contract, peer) pair per call, so
         // at most one WASM probe per queue entry (see `fanout_send_needed`).
         let mut staleness_probes_used = 0usize;
-        if !fanout_send_needed(
+        if let FanoutDecision::Skip(skip) = fanout_send_needed(
             op_manager,
             &key,
             SummaryPair { ours, theirs },
@@ -4456,6 +4558,7 @@ pub(super) async fn broadcast_to_single_peer(
         )
         .await
         {
+            record_propagation_event(op_manager, key.id(), skip);
             tracing::trace!(
                 contract = %key,
                 peer = %peer_addr,
@@ -4589,6 +4692,11 @@ pub(super) async fn broadcast_to_single_peer(
                     // sent (no bytes). Previously this exit returned without
                     // reporting, undercounting the send-CPU axis.
                     report_send_cpu(op_manager);
+                    record_propagation_event(
+                        op_manager,
+                        key.id(),
+                        PropagationEvent::SkipEmptyDelta,
+                    );
                     return;
                 }
                 Err(err) => {
@@ -4805,6 +4913,7 @@ pub(super) async fn broadcast_to_single_peer(
                     error = %e,
                     "Failed to serialize BroadcastStreamingPayload, skipping"
                 );
+                record_propagation_event(op_manager, key.id(), PropagationEvent::SendFailed);
                 return;
             }
         };
@@ -4895,6 +5004,9 @@ pub(super) async fn broadcast_to_single_peer(
                 // fragment was handed to the transport — also a streaming-
                 // broadcast failure.
                 BROADCAST_STREAM_METRICS.record_attempt(false);
+                // `send_res` (the metadata send) was Ok, so the generic
+                // failure count after this branch does not see this one.
+                record_propagation_event(op_manager, key.id(), PropagationEvent::SendFailed);
                 tracing::warn!(
                     tx = %update_tx,
                     peer = %peer_addr,
@@ -4902,6 +5014,10 @@ pub(super) async fn broadcast_to_single_peer(
                     "Failed to send broadcast stream data"
                 );
             } else {
+                // Handed to the transport, as a stream. Its fate is counted
+                // below from the completion signal.
+                record_propagation_event(op_manager, key.id(), PropagationEvent::SentFull);
+                record_propagation_event(op_manager, key.id(), PropagationEvent::WireStream);
                 // Wait for the stream transfer to actually complete before
                 // doing the delivery bookkeeping. The lane permit is held for
                 // at most `STREAM_PERMIT_HOLD` of the wait; the queue's claim on
@@ -4916,6 +5032,11 @@ pub(super) async fn broadcast_to_single_peer(
                     completion_timeout,
                 )
                 .await;
+                record_propagation_stream_fate(
+                    op_manager,
+                    key.id(),
+                    stream_outcome_of(&completion),
+                );
                 // Classify AND apply the delivery gate in one production call
                 // (#4235): only a real `Delivered` refreshes interest / caches
                 // the summary. See `record_streaming_delivery`.
@@ -5008,6 +5129,15 @@ pub(super) async fn broadcast_to_single_peer(
         // successful enqueue is the terminal state we can observe, so delivery
         // tracks the send result (unchanged pre-#4235 behavior for this path).
         if res.is_ok() {
+            record_propagation_event(
+                op_manager,
+                key.id(),
+                if sent_delta {
+                    PropagationEvent::SentDelta
+                } else {
+                    PropagationEvent::SentFull
+                },
+            );
             if let Some(guard) = missing_attempt_guard.as_mut() {
                 guard.mark_delivered(payload_size);
             }
@@ -5058,6 +5188,7 @@ pub(super) async fn broadcast_to_single_peer(
     };
 
     if let Err(err) = &send_result {
+        record_propagation_event(op_manager, key.id(), PropagationEvent::SendFailed);
         tracing::warn!(
             tx = %update_tx,
             peer = %peer_addr,
@@ -6648,46 +6779,64 @@ mod tests {
         );
     }
 
-    /// One full-state leg for S1 then one for S2 to a peer whose summary was
-    /// never seen, with S2 already stored throughout. Returns every full state
-    /// put on the wire with the summary sent alongside it, the summary cached
-    /// for the peer after each leg, and S1/S2.
-    async fn run_two_full_state_legs(
+    /// A real `OpManager` hosting one contract, connected to one peer, with a
+    /// stand-in contract handler whose stored state is `stored` throughout.
+    /// Shared by the tests below that drive the real `broadcast_to_single_peer`.
+    /// A peer summary for which `one_peer_node`'s stand-in fails the first
+    /// delta query (see the handler).
+    const PROBE_FAILS_ONCE: &[u8] = &[0xBB];
+    /// A peer summary for which `one_peer_node`'s stand-in returns a small,
+    /// non-empty delta, so the leg sends a delta.
+    const DELTA_PEER: &[u8] = &[0xCC];
+
+    struct OnePeerNode {
+        op_manager: std::sync::Arc<crate::node::OpManager>,
+        key: ContractKey,
+        target: crate::ring::PeerKeyLocation,
+        peer_key: PeerKey,
+        handler: tokio::task::JoinHandle<()>,
+        /// Receivers and monitors whose drop would close a channel the node
+        /// still writes to; held for the test's lifetime.
+        _keep_alive: Box<dyn std::any::Any>,
+    }
+
+    async fn one_peer_node(
+        id: &str,
+        stored: freenet_stdlib::prelude::WrappedState,
         snapshot_ok: bool,
-    ) -> (
-        Vec<(Vec<u8>, Vec<u8>)>,
-        Vec<Option<StateSummary<'static>>>,
-        freenet_stdlib::prelude::WrappedState,
-        freenet_stdlib::prelude::WrappedState,
-    ) {
+    ) -> OnePeerNode {
+        one_peer_node_with(id, stored, snapshot_ok, None).await
+    }
+
+    /// [`one_peer_node`] with the node's streaming threshold set, so a small
+    /// full state goes out as a stream.
+    async fn one_peer_node_with(
+        id: &str,
+        stored: freenet_stdlib::prelude::WrappedState,
+        snapshot_ok: bool,
+        streaming_threshold: Option<usize>,
+    ) -> OnePeerNode {
         use std::net::SocketAddr;
         use std::sync::Arc;
 
-        use freenet_stdlib::prelude::WrappedState;
-
         use crate::contract::{ContractHandlerEvent, StoreResponse};
-        use crate::message::{DeltaOrFullState, NetMessage, NetMessageV1};
-        use crate::node::network_bridge::p2p_protoc::{P2pBridge, P2pBridgeEvent};
-        use crate::operations::update::UpdateMsg;
         use crate::ring::PeerKeyLocation;
 
-        let s1 = WrappedState::new(vec![1u8; 32]);
-        let s2 = WrappedState::new(vec![2u8; 32]);
-
-        let config_args = crate::config::ConfigArgs {
-            id: Some(format!("bq-5842-snapshot-{snapshot_ok}")),
+        let mut config_args = crate::config::ConfigArgs {
+            id: Some(id.to_string()),
             mode: Some(crate::contract::OperationMode::Local),
             ..Default::default()
         };
+        config_args.network_api.streaming_threshold = streaming_threshold;
         let node_config =
             crate::node::NodeConfig::new(config_args.build().await.expect("build Config"))
                 .await
                 .expect("build NodeConfig");
-        let (_notifications, notification_tx) = crate::node::event_loop_notification_channel();
+        let (notifications, notification_tx) = crate::node::event_loop_notification_channel();
         let (ops_ch_channel, mut ch_channel, wait_for_event) =
             crate::contract::contract_handler_channel();
         let connection_manager = crate::ring::ConnectionManager::new(&node_config);
-        let (result_router_tx, _result_router_rx) = tokio::sync::mpsc::channel(100);
+        let (result_router_tx, result_router_rx) = tokio::sync::mpsc::channel(100);
         let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
         let op_manager = Arc::new(
             crate::node::OpManager::new(
@@ -6730,9 +6879,7 @@ mod tests {
         let target = PeerKeyLocation::new(peer_pub.clone(), peer_addr);
         let peer_key = PeerKey::from(peer_pub);
 
-        // The stand-in executor. The stored state is S2 throughout: the second
-        // write has already committed when the S1 leg runs.
-        let stored = s2.clone();
+        let probe_failed = std::sync::atomic::AtomicBool::new(false);
         let handler = tokio::spawn(async move {
             while let Ok((id, ev, _priority)) = ch_channel.recv_from_sender().await {
                 #[allow(
@@ -6754,6 +6901,26 @@ mod tests {
                             contract: None,
                         }),
                     },
+                    // Every peer summary this stand-in is asked about is
+                    // converged with the stored state: an empty delta. The
+                    // one exception, `PROBE_FAILS_ONCE`, fails its first query,
+                    // so the staleness probe cannot decide and the leg goes on
+                    // to `compute_delta`, which then gets the empty delta.
+                    // `DELTA_PEER` gets a two-byte delta.
+                    ContractHandlerEvent::GetDeltaQuery { key, their_summary } => {
+                        let delta = if their_summary.as_ref() == DELTA_PEER {
+                            Ok(freenet_stdlib::prelude::StateDelta::from(vec![0xD1, 0xD2]))
+                        } else if their_summary.as_ref() == PROBE_FAILS_ONCE
+                            && !probe_failed.swap(true, std::sync::atomic::Ordering::Relaxed)
+                        {
+                            Err(crate::contract::ExecutorError::other(
+                                crate::contract::ContractQueueFull,
+                            ))
+                        } else {
+                            Ok(freenet_stdlib::prelude::StateDelta::from(Vec::<u8>::new()))
+                        };
+                        ContractHandlerEvent::GetDeltaResponse { key, delta }
+                    }
                     ContractHandlerEvent::GetStateAndSummaryQuery { key } => {
                         ContractHandlerEvent::GetStateAndSummaryResponse {
                             key,
@@ -6773,6 +6940,60 @@ mod tests {
                 }
             }
         });
+
+        OnePeerNode {
+            op_manager,
+            key,
+            target,
+            peer_key,
+            handler,
+            _keep_alive: Box::new((
+                notifications,
+                result_router_rx,
+                wait_for_event,
+                task_monitor,
+            )),
+        }
+    }
+
+    /// One full-state leg for S1 then one for S2 to a peer whose summary was
+    /// never seen, with S2 already stored throughout. Returns every full state
+    /// put on the wire with the summary sent alongside it, the summary cached
+    /// for the peer after each leg, and S1/S2.
+    async fn run_two_full_state_legs(
+        snapshot_ok: bool,
+    ) -> (
+        Vec<(Vec<u8>, Vec<u8>)>,
+        Vec<Option<StateSummary<'static>>>,
+        freenet_stdlib::prelude::WrappedState,
+        freenet_stdlib::prelude::WrappedState,
+    ) {
+        use std::sync::Arc;
+
+        use freenet_stdlib::prelude::WrappedState;
+
+        use crate::message::{DeltaOrFullState, NetMessage, NetMessageV1};
+        use crate::node::network_bridge::p2p_protoc::{P2pBridge, P2pBridgeEvent};
+        use crate::operations::update::UpdateMsg;
+
+        let s1 = WrappedState::new(vec![1u8; 32]);
+        let s2 = WrappedState::new(vec![2u8; 32]);
+
+        // The stored state is S2 throughout: the second write has already
+        // committed when the S1 leg runs.
+        let OnePeerNode {
+            op_manager,
+            key,
+            target,
+            peer_key,
+            handler,
+            _keep_alive,
+        } = one_peer_node(
+            &format!("bq-5842-snapshot-{snapshot_ok}"),
+            s2.clone(),
+            snapshot_ok,
+        )
+        .await;
 
         let (bridge_tx, mut bridge_rx) = tokio::sync::mpsc::channel::<P2pBridgeEvent>(16);
         let bridge = P2pBridge::new_for_test(bridge_tx, op_manager.clone());
@@ -6826,7 +7047,7 @@ mod tests {
         }
 
         handler.abort();
-        drop((wait_for_event, task_monitor));
+        drop(_keep_alive);
         (sent, recorded, s1, s2)
     }
 
@@ -6904,5 +7125,700 @@ mod tests {
             );
         }
         assert_eq!(recorded, vec![None, None], "nothing recorded for the peer");
+    }
+
+    /// #6143 review round 6: a newer leg for a (contract, peer) pair still
+    /// queued replaces the queued one, and the real `enqueue` counts the
+    /// replaced leg as `skip_superseded`, in the per-contract summary and in
+    /// telemetry. Before this the replaced leg recorded nothing, so a burst
+    /// of client updates resolved more legs than could ever end.
+    #[cfg(not(feature = "simulation_tests"))]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_superseded_queued_leg_is_counted() {
+        use freenet_stdlib::prelude::WrappedState;
+
+        use crate::operations::update::propagation_stats::PropagationEvent as Ev;
+
+        let node =
+            one_peer_node("bq-6143-superseded", WrappedState::new(vec![3u8; 32]), true).await;
+        let op_manager = &node.op_manager;
+        // No workers started, so every entry stays queued.
+        let queue = super::BroadcastQueue::new();
+        let enqueue = |byte: u8| {
+            queue.enqueue(
+                op_manager,
+                node.key,
+                node.target.clone(),
+                WrappedState::new(vec![byte; 32]),
+                super::no_fanout(),
+            )
+        };
+        let superseded = || {
+            op_manager
+                .update_propagation_stats
+                .events_for_test(node.key.id())
+                .get(Ev::SkipSuperseded)
+        };
+
+        enqueue(4).await;
+        assert_eq!(superseded(), 0, "a first leg replaces nothing");
+        enqueue(5).await;
+        assert_eq!(superseded(), 1, "the queued leg was replaced");
+        enqueue(6).await;
+        assert_eq!(superseded(), 2);
+        assert_eq!(
+            op_manager
+                .payload_mix
+                .propagation_event_for_test(Ev::SkipSuperseded),
+            2,
+            "telemetry counts what the summary counts"
+        );
+    }
+
+    /// #6143 review round 7: a leg the full queue drops to make room
+    /// (`evict_oldest`) is counted by the real `enqueue` as `skip_evicted`
+    /// against the EVICTED leg's contract, in the per-contract summary and in
+    /// telemetry. A replacement for a queued pair evicts nothing.
+    #[cfg(not(feature = "simulation_tests"))]
+    #[tokio::test(flavor = "current_thread")]
+    // Publishes the process-global broadcast-queue depth gauge; serialized
+    // against `shadow_demand::tests::broadcast_queue_depth_gauge_round_trips`,
+    // which asserts an exact value of it.
+    #[serial_test::serial(broadcast_queue_depth_gauge)]
+    async fn an_evicted_queued_leg_is_counted_against_its_contract() {
+        use freenet_stdlib::prelude::WrappedState;
+
+        use crate::operations::update::propagation_stats::PropagationEvent as Ev;
+
+        let node = one_peer_node("bq-6143-evicted", WrappedState::new(vec![3u8; 32]), true).await;
+        let op_manager = &node.op_manager;
+        // No workers started, so every entry stays queued; room for one.
+        let queue = super::BroadcastQueue::new().with_max_queue_depth(1);
+        let other = make_contract_key(0x61);
+        let enqueue = |key: ContractKey, byte: u8| {
+            queue.enqueue(
+                op_manager,
+                key,
+                node.target.clone(),
+                WrappedState::new(vec![byte; 32]),
+                super::no_fanout(),
+            )
+        };
+        let evicted = |key: &ContractKey| {
+            op_manager
+                .update_propagation_stats
+                .events_for_test(key.id())
+                .get(Ev::SkipEvicted)
+        };
+
+        enqueue(node.key, 4).await;
+        enqueue(node.key, 5).await;
+        assert_eq!(evicted(&node.key), 0, "a replacement evicts nothing");
+        enqueue(other, 6).await;
+        assert_eq!(evicted(&node.key), 1, "the queued leg made room");
+        assert_eq!(evicted(&other), 0, "the newcomer was not evicted");
+        assert_eq!(
+            op_manager
+                .payload_mix
+                .propagation_event_for_test(Ev::SkipEvicted),
+            1,
+            "telemetry counts what the summary counts"
+        );
+    }
+
+    /// #6143 review round 6: a targeted heal registers its leg
+    /// (`heal_target`) once its peer resolves, so a heal's skip accounts for
+    /// that leg and not for a fan-out's. An unknown peer starts no leg. And
+    /// `handle_sync_state_to_peer` resolves its peer through this, after the
+    /// broken-contract gate and before either send path.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_resolved_heal_registers_its_leg() {
+        use freenet_stdlib::prelude::WrappedState;
+
+        use crate::operations::update::propagation_stats::PropagationEvent as Ev;
+
+        let node = one_peer_node("bq-6143-heal-leg", WrappedState::new(vec![3u8; 32]), true).await;
+        let op_manager = &node.op_manager;
+        let heal_legs = || {
+            op_manager
+                .update_propagation_stats
+                .events_for_test(node.key.id())
+                .get(Ev::HealTarget)
+        };
+        let addr = node
+            .target
+            .socket_addr()
+            .expect("premise: the connected peer has an address");
+
+        let resolved = super::resolve_heal_target(op_manager, &node.key, addr);
+        assert_eq!(
+            resolved.map(|t| t.pub_key().clone()),
+            Some(node.target.pub_key().clone()),
+            "the heal goes to the connected peer"
+        );
+        assert_eq!(heal_legs(), 1);
+        assert_eq!(
+            op_manager
+                .payload_mix
+                .propagation_event_for_test(Ev::HealTarget),
+            1,
+            "telemetry counts what the summary counts"
+        );
+
+        let unknown: std::net::SocketAddr = "203.0.113.9:4000".parse().unwrap();
+        assert!(super::resolve_heal_target(op_manager, &node.key, unknown).is_none());
+        assert_eq!(heal_legs(), 1, "an unresolved heal starts no leg");
+
+        // The heal handler lives on the event loop's state, which no test
+        // builds, so its use of this is pinned by source: comments and
+        // whitespace removed, inside the handler, between the gate and the
+        // sends.
+        let src = include_str!("p2p_protoc/broadcast.rs");
+        let signature = "\n    pub(super) async fn handle_sync_state_to_peer(";
+        assert_eq!(src.matches(signature).count(), 1, "heal handler signature");
+        let start = src.find(signature).unwrap() + 1;
+        let len = src[start..]
+            .find("\n    }\n")
+            .expect("end of the heal handler");
+        let body: String = src[start..start + len]
+            .lines()
+            .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+            .flat_map(str::chars)
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        let call = "letSome(target)=super::super::broadcast_queue::resolve_heal_target(\
+                    op_manager,&key,target_addr)else{";
+        let at = body
+            .find(call)
+            .expect("the heal handler resolves its peer here");
+        let gate = body.find("is_contract_broken(&key)").expect("broken gate");
+        let first_send = [".enqueue(", "broadcast_to_single_peer("]
+            .iter()
+            .filter_map(|send| body.find(send))
+            .min()
+            .expect("the heal's sends");
+        assert!(
+            gate < at && at < first_send,
+            "gate, then resolve, then send"
+        );
+        // At the handler's top level, not inside a block that may never run
+        // (`if false { ... }`): the braces before it leave only the handler's
+        // own open. The body's format strings hold balanced braces only.
+        let depth = body[..at].matches('{').count() - body[..at].matches('}').count();
+        assert_eq!(
+            depth, 1,
+            "the heal handler resolves its peer unconditionally"
+        );
+        assert_eq!(
+            body.matches("get_peer_by_addr(").count(),
+            0,
+            "one resolution"
+        );
+    }
+
+    /// #6143: driving the REAL `broadcast_to_single_peer`, each exit counts
+    /// its own outcome against the contract. A source pin cannot establish
+    /// this: it stays green over a recording call moved into a dead branch.
+    ///
+    /// Sequence against one peer, stored state S throughout:
+    /// 1. no cached summary for the peer: full state sent (`SentFull`), and
+    ///    the delivery caches S's summary for the peer;
+    /// 2. same state again: cached summary byte-equal to ours, so the leg is
+    ///    skipped (`SkipSummaryEqual`) and nothing reaches the bridge;
+    /// 3. a target with no socket address (`SkipNoAddress`);
+    /// 4. the bridge's receiver gone: the send fails (`SendFailed`);
+    /// 5. the contract no longer hosted (`SkipNotHosted`).
+    #[tokio::test(flavor = "current_thread")]
+    async fn each_broadcast_leg_exit_is_counted_against_its_contract() {
+        use std::sync::Arc;
+
+        use freenet_stdlib::prelude::WrappedState;
+
+        use crate::node::network_bridge::p2p_protoc::{P2pBridge, P2pBridgeEvent};
+        use crate::operations::update::propagation_stats::PropagationEvent as Ev;
+
+        let state = WrappedState::new(vec![3u8; 32]);
+        let node = one_peer_node("bq-6143-leg-outcomes", state.clone(), true).await;
+        let op_manager = &node.op_manager;
+        let key = node.key;
+        let fanout: super::FanoutTargets = Arc::new(vec![node.target.pub_key().clone()]);
+        let events = || {
+            op_manager
+                .update_propagation_stats
+                .events_for_test(key.id())
+        };
+
+        let (bridge_tx, mut bridge_rx) = tokio::sync::mpsc::channel::<P2pBridgeEvent>(16);
+        let bridge = P2pBridge::new_for_test(bridge_tx, op_manager.clone());
+        let leg = |target: crate::ring::PeerKeyLocation| {
+            super::broadcast_to_single_peer(
+                &bridge,
+                op_manager,
+                key,
+                state.clone(),
+                target,
+                None,
+                fanout.clone(),
+            )
+        };
+
+        // 1. first send: full state.
+        leg(node.target.clone()).await;
+        assert!(bridge_rx.try_recv().is_ok(), "the first leg must send");
+        assert_eq!(events().get(Ev::SentFull), 1, "{:?}", events());
+        assert_eq!(
+            op_manager
+                .interest_manager
+                .get_peer_summary(&key, &node.peer_key),
+            Some(summary_of(state.as_ref())),
+            "precondition for step 2: the delivery cached our summary"
+        );
+
+        // 2. converged by cached summary: skipped, nothing on the bridge.
+        leg(node.target.clone()).await;
+        assert!(
+            bridge_rx.try_recv().is_err(),
+            "a converged peer gets nothing"
+        );
+        assert_eq!(events().get(Ev::SkipSummaryEqual), 1, "{:?}", events());
+        assert_eq!(events().sent(), 1, "the skip must not count as a send");
+
+        // 3. no socket address.
+        leg(crate::ring::PeerKeyLocation::with_unknown_addr(
+            node.target.pub_key().clone(),
+        ))
+        .await;
+        assert_eq!(events().get(Ev::SkipNoAddress), 1, "{:?}", events());
+
+        // 4. bridge closed: a second peer, with no cached summary, gets as
+        //    far as the send, which then fails.
+        drop(bridge_rx);
+        let other_addr: std::net::SocketAddr = "127.0.0.1:47102".parse().unwrap();
+        let other_pub = crate::transport::TransportPublicKey::from_bytes([8u8; 32]);
+        assert!(op_manager.ring.connection_manager.add_connection(
+            crate::ring::Location::new(0.6),
+            other_addr,
+            other_pub.clone(),
+            false,
+        ));
+        leg(crate::ring::PeerKeyLocation::new(other_pub, other_addr)).await;
+        assert_eq!(events().get(Ev::SendFailed), 1, "{:?}", events());
+        assert_eq!(events().sent(), 1, "a failed send is not a send");
+
+        // 5. a contract this node does not host: counted against THAT
+        //    contract, not the hosted one.
+        let unhosted = ContractKey::from_id_and_code(
+            ContractInstanceId::new([59u8; 32]),
+            CodeHash::new([42u8; 32]),
+        );
+        super::broadcast_to_single_peer(
+            &bridge,
+            op_manager,
+            unhosted,
+            state.clone(),
+            node.target.clone(),
+            None,
+            fanout.clone(),
+        )
+        .await;
+        assert_eq!(
+            op_manager
+                .update_propagation_stats
+                .events_for_test(unhosted.id())
+                .get(Ev::SkipNotHosted),
+            1
+        );
+        assert_eq!(events().get(Ev::SkipNotHosted), 0);
+
+        // The telemetry window got exactly what the per-contract summary got,
+        // through the same recording call.
+        let unhosted_events = op_manager
+            .update_propagation_stats
+            .events_for_test(unhosted.id());
+        for ev in Ev::ALL {
+            assert_eq!(
+                op_manager.payload_mix.propagation_event_for_test(ev),
+                events().get(ev) + unhosted_events.get(ev),
+                "telemetry disagrees with the summary on {ev:?}"
+            );
+        }
+
+        node.handler.abort();
+    }
+
+    /// Connect one more peer to a `one_peer_node`, with no summary cached for
+    /// it, and return it as a broadcast target.
+    fn add_peer(op_manager: &crate::node::OpManager, n: u8) -> crate::ring::PeerKeyLocation {
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 47_200 + u16::from(n)));
+        let public = crate::transport::TransportPublicKey::from_bytes([n; 32]);
+        assert!(op_manager.ring.connection_manager.add_connection(
+            crate::ring::Location::new(f64::from(n) / 256.0),
+            addr,
+            public.clone(),
+            false,
+        ));
+        crate::ring::PeerKeyLocation::new(public, addr)
+    }
+
+    /// #6143: a leg that sends a delta through the real
+    /// `broadcast_to_single_peer` is counted as `SentDelta`, not `SentFull`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_delta_leg_is_counted_as_sent_delta() {
+        use std::sync::Arc;
+
+        use freenet_stdlib::prelude::WrappedState;
+
+        use crate::message::{DeltaOrFullState, NetMessage, NetMessageV1};
+        use crate::node::network_bridge::p2p_protoc::{P2pBridge, P2pBridgeEvent};
+        use crate::operations::update::UpdateMsg;
+        use crate::operations::update::propagation_stats::PropagationEvent as Ev;
+        use crate::ring::interest::SummaryPopulationSource;
+
+        let state = WrappedState::new(vec![6u8; 32]);
+        let node = one_peer_node("bq-6143-sent-delta", state.clone(), true).await;
+        let op_manager = &node.op_manager;
+        let key = node.key;
+        op_manager.interest_manager.upsert_peer_summary_from(
+            &key,
+            &node.peer_key,
+            StateSummary::from(DELTA_PEER.to_vec()),
+            SummaryPopulationSource::Delivery,
+        );
+        let (bridge_tx, mut bridge_rx) = tokio::sync::mpsc::channel::<P2pBridgeEvent>(16);
+        let bridge = P2pBridge::new_for_test(bridge_tx, op_manager.clone());
+        super::broadcast_to_single_peer(
+            &bridge,
+            op_manager,
+            key,
+            state.clone(),
+            node.target.clone(),
+            None,
+            Arc::new(vec![node.target.pub_key().clone()]),
+        )
+        .await;
+
+        let Ok(P2pBridgeEvent::Message(_, msg)) = bridge_rx.try_recv() else {
+            panic!("the leg must send a message");
+        };
+        assert!(
+            matches!(
+                *msg,
+                NetMessage::V1(NetMessageV1::Update(
+                    UpdateMsg::BroadcastTo {
+                        payload: DeltaOrFullState::Delta(_),
+                        ..
+                    } | UpdateMsg::BroadcastToV2 {
+                        payload: DeltaOrFullState::Delta(_),
+                        ..
+                    }
+                ))
+            ),
+            "premise: the leg sent a delta: {msg:?}"
+        );
+        let events = op_manager
+            .update_propagation_stats
+            .events_for_test(key.id());
+        assert_eq!(events.get(Ev::SentDelta), 1, "{events:?}");
+        assert_eq!(events.get(Ev::SentFull), 0, "{events:?}");
+        node.handler.abort();
+    }
+
+    /// #6143: a full-state leg sent as a stream, through the real
+    /// `broadcast_to_single_peer`, counts `SentFull` and `WireStream` when
+    /// the stream is dispatched and then its fate from the completion signal;
+    /// a failure of either send counts `SendFailed` and nothing sent.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_full_state_stream_leg_counts_its_fate() {
+        use std::sync::Arc;
+
+        use freenet_stdlib::prelude::WrappedState;
+
+        use crate::node::network_bridge::p2p_protoc::{P2pBridge, P2pBridgeEvent};
+        use crate::operations::update::propagation_stats::PropagationEvent as Ev;
+
+        #[derive(Debug, Clone, Copy)]
+        enum Fate {
+            Signal(StreamSendOutcome),
+            /// The completion sender is dropped unsignalled.
+            Unsignalled,
+            /// The metadata message cannot be sent: the bridge is closed.
+            MetadataSendFails,
+            /// The metadata message is accepted and the stream dispatch is
+            /// refused.
+            DispatchFails,
+        }
+
+        let state = WrappedState::new(vec![7u8; 32]);
+        let node = one_peer_node_with("bq-6143-stream-fates", state.clone(), true, Some(8)).await;
+        let op_manager = &node.op_manager;
+        let key = node.key;
+        let events = || {
+            op_manager
+                .update_propagation_stats
+                .events_for_test(key.id())
+        };
+
+        let cases = [
+            (
+                Fate::Signal(StreamSendOutcome::Delivered),
+                &[
+                    (Ev::SentFull, 1),
+                    (Ev::WireStream, 1),
+                    (Ev::WireStreamDelivered, 1),
+                ][..],
+            ),
+            (
+                Fate::Signal(StreamSendOutcome::Dropped),
+                &[
+                    (Ev::SentFull, 1),
+                    (Ev::WireStream, 1),
+                    (Ev::WireStreamFailed, 1),
+                ][..],
+            ),
+            (
+                Fate::Signal(StreamSendOutcome::EgressAbandoned),
+                &[
+                    (Ev::SentFull, 1),
+                    (Ev::WireStream, 1),
+                    (Ev::WireStreamEgressAbandoned, 1),
+                ][..],
+            ),
+            (
+                Fate::Unsignalled,
+                &[
+                    (Ev::SentFull, 1),
+                    (Ev::WireStream, 1),
+                    (Ev::WireStreamFailed, 1),
+                ][..],
+            ),
+            (Fate::MetadataSendFails, &[(Ev::SendFailed, 1)][..]),
+            (Fate::DispatchFails, &[(Ev::SendFailed, 1)][..]),
+        ];
+        for (n, (fate, want)) in cases.into_iter().enumerate() {
+            let target = add_peer(op_manager, 20 + n as u8);
+            let fanout: super::FanoutTargets = Arc::new(vec![target.pub_key().clone()]);
+            // Capacity 1: the stream dispatch waits behind the metadata
+            // message, so the responder can act between the two.
+            let (bridge_tx, mut bridge_rx) = tokio::sync::mpsc::channel::<P2pBridgeEvent>(1);
+            let bridge = P2pBridge::new_for_test(bridge_tx, op_manager.clone());
+            if matches!(fate, Fate::MetadataSendFails) {
+                bridge_rx.close();
+            }
+            let before = events();
+            let leg = super::broadcast_to_single_peer(
+                &bridge,
+                op_manager,
+                key,
+                state.clone(),
+                target,
+                None,
+                fanout,
+            );
+            let responder = async {
+                match fate {
+                    Fate::MetadataSendFails => {}
+                    Fate::DispatchFails => {
+                        while bridge_rx.is_empty() {
+                            tokio::task::yield_now().await;
+                        }
+                        // The metadata message is buffered; refuse the rest.
+                        bridge_rx.close();
+                    }
+                    Fate::Signal(_) | Fate::Unsignalled => {
+                        let Some(P2pBridgeEvent::Message(..)) = bridge_rx.recv().await else {
+                            panic!("the metadata message comes first");
+                        };
+                        let Some(P2pBridgeEvent::StreamSend { completion_tx, .. }) =
+                            bridge_rx.recv().await
+                        else {
+                            panic!("then the stream");
+                        };
+                        let completion_tx = completion_tx.expect("the leg waits on its fate");
+                        if let Fate::Signal(outcome) = fate {
+                            let _ignored = completion_tx.send(outcome);
+                        }
+                    }
+                }
+            };
+            tokio::join!(leg, responder);
+            let after = events();
+            for ev in Ev::ALL {
+                let expected = want.iter().find(|(e, _)| *e == ev).map_or(0, |(_, n)| *n);
+                assert_eq!(
+                    after.get(ev) - before.get(ev),
+                    expected,
+                    "{fate:?}: {ev:?} (after {after:?})"
+                );
+            }
+        }
+        node.handler.abort();
+    }
+
+    /// #6143: a fan-out or heal dropped because the event-loop channel is full
+    /// is a whole UPDATE that never leaves this node, and the drop itself logs
+    /// at debug. Driving the real `OpManager::try_notify_node_event` into a
+    /// full channel must count each drop against the contract.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_dropped_fanout_or_heal_event_is_counted() {
+        use freenet_stdlib::prelude::WrappedState;
+
+        use crate::message::NodeEvent;
+        use crate::operations::update::propagation_stats::PropagationEvent as Ev;
+
+        let state = WrappedState::new(vec![4u8; 32]);
+        let node = one_peer_node("bq-6143-notify-drops", state.clone(), true).await;
+        let op_manager = &node.op_manager;
+        let key = node.key;
+        let peer_addr = node.target.socket_addr().expect("test peer has an address");
+
+        // Nothing drains the channel, so it fills and then refuses.
+        let mut fanout_drops = 0u64;
+        for _ in 0..100_000 {
+            let ev = NodeEvent::BroadcastStateChange {
+                key,
+                new_state: state.clone(),
+                is_retry: false,
+                is_reemit: false,
+            };
+            if op_manager.try_notify_node_event(ev).is_err() {
+                fanout_drops += 1;
+                if fanout_drops == 3 {
+                    break;
+                }
+            }
+        }
+        assert_eq!(fanout_drops, 3, "the channel never filled");
+        let heal = NodeEvent::SyncStateToPeer {
+            key,
+            new_state: state.clone(),
+            target: peer_addr,
+        };
+        assert!(op_manager.try_notify_node_event(heal).is_err());
+
+        let events = op_manager
+            .update_propagation_stats
+            .events_for_test(key.id());
+        assert_eq!(events.get(Ev::FanoutEventDropped), 3, "{events:?}");
+        assert_eq!(events.get(Ev::HealEventDropped), 1, "{events:?}");
+
+        node.handler.abort();
+    }
+
+    /// #6143: the three converged-skips past the byte compare, through the real
+    /// `broadcast_to_single_peer`. A peer whose cached summary differs from
+    /// ours byte-wise is skipped as `SkipCachedConverged` when the shared delta
+    /// cache already holds an empty delta for the pair, and as
+    /// `SkipProbeConverged` when the bounded WASM probe (the stand-in answers
+    /// an empty delta) says so, and as `SkipEmptyDelta` when the probe cannot
+    /// decide and `compute_delta` then returns an empty delta.
+    #[tokio::test(flavor = "current_thread")]
+    async fn semantic_converged_skips_are_counted_by_the_check_that_decided() {
+        use std::sync::Arc;
+
+        use freenet_stdlib::prelude::{StateDelta, WrappedState};
+
+        use crate::node::network_bridge::p2p_protoc::{P2pBridge, P2pBridgeEvent};
+        use crate::operations::update::propagation_stats::PropagationEvent as Ev;
+        use crate::ring::interest::SummaryPopulationSource;
+
+        let state = WrappedState::new(vec![5u8; 32]);
+        let ours = summary_of(state.as_ref());
+        let node = one_peer_node("bq-6143-semantic-skips", state.clone(), true).await;
+        let op_manager = &node.op_manager;
+        let key = node.key;
+        let fanout: super::FanoutTargets = Arc::new(vec![node.target.pub_key().clone()]);
+        let (bridge_tx, mut bridge_rx) = tokio::sync::mpsc::channel::<P2pBridgeEvent>(16);
+        let bridge = P2pBridge::new_for_test(bridge_tx, op_manager.clone());
+        let events = || {
+            op_manager
+                .update_propagation_stats
+                .events_for_test(key.id())
+        };
+
+        // Cached verdict.
+        let theirs = StateSummary::from(vec![0xEEu8]);
+        assert_ne!(theirs.as_ref(), ours.as_ref());
+        op_manager.interest_manager.upsert_peer_summary_from(
+            &key,
+            &node.peer_key,
+            theirs.clone(),
+            SummaryPopulationSource::Delivery,
+        );
+        op_manager.interest_manager.cache_delta(
+            &key,
+            theirs.as_ref(),
+            ours.as_ref(),
+            StateDelta::from(Vec::<u8>::new()),
+        );
+        super::broadcast_to_single_peer(
+            &bridge,
+            op_manager,
+            key,
+            state.clone(),
+            node.target.clone(),
+            None,
+            fanout.clone(),
+        )
+        .await;
+        assert_eq!(events().get(Ev::SkipCachedConverged), 1, "{:?}", events());
+
+        // Probe verdict: a different summary, nothing cached for it.
+        let other_addr: std::net::SocketAddr = "127.0.0.1:47103".parse().unwrap();
+        let other_pub = crate::transport::TransportPublicKey::from_bytes([9u8; 32]);
+        assert!(op_manager.ring.connection_manager.add_connection(
+            crate::ring::Location::new(0.7),
+            other_addr,
+            other_pub.clone(),
+            false,
+        ));
+        op_manager.interest_manager.upsert_peer_summary_from(
+            &key,
+            &PeerKey::from(other_pub.clone()),
+            StateSummary::from(vec![0xDDu8]),
+            SummaryPopulationSource::Delivery,
+        );
+        super::broadcast_to_single_peer(
+            &bridge,
+            op_manager,
+            key,
+            state.clone(),
+            crate::ring::PeerKeyLocation::new(other_pub, other_addr),
+            None,
+            fanout.clone(),
+        )
+        .await;
+        assert_eq!(events().get(Ev::SkipProbeConverged), 1, "{:?}", events());
+
+        // Empty delta from `compute_delta`: the probe failed, so the leg went
+        // on to compute a delta, and the contract said there is nothing to send.
+        let third_addr: std::net::SocketAddr = "127.0.0.1:47104".parse().unwrap();
+        let third_pub = crate::transport::TransportPublicKey::from_bytes([10u8; 32]);
+        assert!(op_manager.ring.connection_manager.add_connection(
+            crate::ring::Location::new(0.8),
+            third_addr,
+            third_pub.clone(),
+            false,
+        ));
+        op_manager.interest_manager.upsert_peer_summary_from(
+            &key,
+            &PeerKey::from(third_pub.clone()),
+            StateSummary::from(PROBE_FAILS_ONCE.to_vec()),
+            SummaryPopulationSource::Delivery,
+        );
+        super::broadcast_to_single_peer(
+            &bridge,
+            op_manager,
+            key,
+            state.clone(),
+            crate::ring::PeerKeyLocation::new(third_pub, third_addr),
+            None,
+            fanout.clone(),
+        )
+        .await;
+        assert_eq!(events().get(Ev::SkipEmptyDelta), 1, "{:?}", events());
+
+        assert!(bridge_rx.try_recv().is_err(), "no peer was sent anything");
+        assert_eq!(events().sent(), 0);
+        node.handler.abort();
     }
 }
