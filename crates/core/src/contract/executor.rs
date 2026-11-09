@@ -1817,8 +1817,9 @@ pub(crate) fn declared_cache_ceiling_terms(
     // endpoint per node, and fixed. Summed whatever `transport-quic` says, as
     // the ingress queue is. The QUIC flow-control windows and quinn's
     // per-connection state are NOT summed, so this aggregate does not
-    // account a node's QUIC connections; see `NOT_SUMMED` and
-    // `quic::config::connection_window_bytes`.
+    // account a node's QUIC connections; see `NOT_SUMMED` (the buffer budget,
+    // `quic_buffer_budget_for`, and the fixed charge, both summed by the
+    // buffer budget's aggregate-accounting step).
     let quic_incoming = crate::transport::quic::config::INCOMING_BUFFER_TOTAL_BYTES as usize;
     // The delegate context cache (`ctx.write()` bytes). One per node, shared
     // by every executor, so NOT multiplied by the pool.

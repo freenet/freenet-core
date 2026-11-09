@@ -273,10 +273,12 @@ pub(crate) const QUIC_ASSEMBLER_HOLD_PER_STREAM_BYTES: usize = 44 * 1024;
 /// every frame length from 160 to 1100 B, and every third below, on one
 /// stream filling W (268,435 B) found 3.05 W between packets (470 B) and
 /// 4.115 W at any instant (444 B, 1,104,656 B, during compaction); 64
-/// streams of 460 B frames held 3.12 W. The tests run 444 and 470 B at the
-/// smallest window (131,072 B: 2.87 W and 3.04 W), at 2 GiB, and at the
-/// largest (2 MiB: 2.43 W and 2.42 W), plus 50 B frames, 64 streams and a
-/// mix. The version pin, not the tests, guards against quinn-proto changing
+/// streams of 460 B frames held 3.12 W. Measured then at 131,072 B (2.87 W
+/// and 3.04 W) and at 2 MiB (2.43 W and 2.42 W). Since windows are set per
+/// path from the buffer budget the tests run 444 and 470 B at 268,435 B, at
+/// the small-host floor (64 KiB), at 2 MiB and at the largest window a path
+/// grows to (`budget::MAX_WINDOW_BYTES`, 8 MiB), each within the pin, plus
+/// 50 B frames, 64 streams and a mix. The version pin, not the tests, guards against quinn-proto changing
 /// which length is worst. Set to 5, 22% over 4.115.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const QUIC_ASSEMBLER_HOLD_WINDOW_MULTIPLE: usize = 5;
