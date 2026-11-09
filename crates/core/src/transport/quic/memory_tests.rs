@@ -51,13 +51,17 @@ const SETTLE: Duration = Duration::from_secs(30);
 /// still running, and the baseline would not be one.
 const SETTLE_DRIFT_BYTES: isize = 1024;
 
-/// The settings of a node with 2 GiB of memory (the shipped `MemoryMax`) and
-/// the default 200 connections: a window of 268,435 bytes.
+/// The settings of a node with 2 GiB of memory (the shipped `MemoryMax`), at
+/// a window of 268,435 bytes: the window such a node had at 200 connections
+/// before windows were set per path from the buffer budget, which the
+/// measurements' figures were taken at. A data path's window now moves from
+/// the floor (128 KiB) to `budget::MAX_WINDOW_BYTES`; the window-scaled pins
+/// are checked across that range below.
 fn settings() -> QuicSettings {
     QuicSettings {
         memory_limit: 2 * 1024 * 1024 * 1024,
         idle_timeout: None,
-        initial_window: None,
+        initial_window: Some(268_435),
         rate_limit: Default::default(),
     }
 }
@@ -860,7 +864,7 @@ fn measure_gap_hold_at(settings: &QuicSettings, shapes: &[Shape]) -> GapHold {
     }
 }
 
-/// The node's flow-control window at 2 GiB.
+/// The window of [`settings`].
 fn window() -> usize {
     settings().window_bytes() as usize
 }
@@ -973,23 +977,25 @@ fn frames_filling_the_window_measure_within_the_window_multiple() {
         }
     }
 
-    // The same two lengths at the smallest window (MIN_WINDOW_BYTES, a
-    // 512 MiB node) and the largest (MAX_WINDOW_BYTES, a 64 GiB node). At
-    // the largest, these lengths make over 2048 chunks, so the chunk-count
-    // trigger compacts them; the premise is only that the stream held more
-    // than the window.
-    for (memory_limit, expected) in [
-        (512usize << 20, super::config::MIN_WINDOW_BYTES),
-        (64usize << 30, super::config::MAX_WINDOW_BYTES),
+    // The same two lengths at the smallest window a connection can have
+    // (the small-host floor), the 2 MiB window the multiple was first
+    // measured at the top of, and the largest a data path grows to
+    // (budget::MAX_WINDOW_BYTES). At the larger windows these lengths make
+    // over 2048 chunks, so the chunk-count trigger compacts them; the premise
+    // is only that the stream held more than the window.
+    for window in [
+        super::budget::MIN_WINDOW_SMALL_HOST_BYTES,
+        2 * 1024 * 1024,
+        super::budget::MAX_WINDOW_BYTES,
     ] {
         let settings = QuicSettings {
-            memory_limit,
+            memory_limit: 2 * 1024 * 1024 * 1024,
             idle_timeout: None,
-            initial_window: None,
+            initial_window: Some(window),
             rate_limit: Default::default(),
         };
         let w = settings.window_bytes() as usize;
-        assert_eq!(w, expected as usize, "premise: the window at its extreme");
+        assert_eq!(w, window as usize, "premise: the window named");
         for len in [444, 470] {
             let hold = measure_gap_hold_at(&settings, &[Shape::filling(len, w)]);
             assert!(
@@ -999,7 +1005,7 @@ fn frames_filling_the_window_measure_within_the_window_multiple() {
                 assembler_pin(1, w)
             );
             assert!(
-                hold.peak as f64 >= 1.5 * w as f64,
+                hold.peak > w as isize,
                 "premise: the stream held more than the window at W = {w}: {} B",
                 hold.peak
             );

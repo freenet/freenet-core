@@ -184,9 +184,7 @@ async fn raw_unfinished(conn: quinn::Connection, bytes: Vec<u8>) -> Option<u64> 
 /// Longer than the flow-control window, so a sender cannot finish it before
 /// the receiver decides; a refusal then always reaches the sender.
 fn over_window() -> Bytes {
-    Bytes::from(payload(
-        2 * super::super::config::MAX_WINDOW_BYTES as usize + 1,
-    ))
+    Bytes::from(payload(2 * super::super::tests::TEST_WINDOW as usize + 1))
 }
 
 /// A raw header.
@@ -2901,7 +2899,7 @@ impl Scripted {
         let settings = QuicSettings {
             memory_limit: 1024 * 1024 * 1024,
             idle_timeout: None,
-            initial_window: None,
+            initial_window: Some(super::super::tests::TEST_WINDOW),
             rate_limit: Default::default(),
         };
         let (a_keys, b_keys) = (TransportKeypair::new(), TransportKeypair::new());

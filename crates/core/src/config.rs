@@ -7614,9 +7614,6 @@ shutdown-drain-secs = 42
                 on,
                 "transport-quic = {value:?}"
             );
-            if let Some(settings) = cfg.network_api.quic_settings() {
-                assert_eq!(settings.max_connections, cfg.network_api.max_connections);
-            }
             let rewritten = toml::to_string(&cfg).unwrap();
             assert!(
                 rewritten.contains(&format!("transport-quic = \"{value}\"")),
