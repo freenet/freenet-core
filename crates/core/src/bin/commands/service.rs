@@ -4086,47 +4086,139 @@ echo "RC=$?"
         };
         let claim = at("auto_update::claim_update_attempt()");
         let spawn = at(
-            "spawn_update_command_bounded(exe_path,log_dir,Some(exit_code),CRASH_UPDATE_TIMEOUT)",
+            "spawn_update_command_bounded(exe_path,log_dir,Some(exit_code),CRASH_UPDATE_TIMEOUT,)",
         );
         let counter = at("update_counter_action(outcome)");
+        let stopped = at("BoundedUpdate::Stopped{replaced}=>{");
+        let after_stop = at("returncrash_loop_update_after_stop(replaced);");
         let decide = at("letnext=crash_loop_update_next(Some(outcome));");
-        assert!(claim < spawn && spawn < counter && counter < decide);
+        assert!(
+            claim < spawn
+                && spawn < stopped
+                && stopped < after_stop
+                && after_stop < counter
+                && counter < decide
+        );
     }
 
     /// #6157 review: the crash-loop update must never hold the relaunch
     /// indefinitely, so its wait is bounded and an overrunning child is
-    /// stopped. A child that finishes in time reports its status.
-    #[cfg(unix)]
+    /// killed and reaped. A child that finishes in time reports its status.
+    /// Runs on Windows too (the `windows_unit` job), where the kill is
+    /// `TerminateProcess`.
     #[test]
     fn a_bounded_update_wait_stops_a_child_that_overruns() {
-        let child = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .unwrap();
-        let pid = child.id();
+        let mut long = if cfg!(windows) {
+            let mut cmd = std::process::Command::new("ping");
+            cmd.args(["-n", "30", "127.0.0.1"]);
+            cmd
+        } else {
+            let mut cmd = std::process::Command::new("sleep");
+            cmd.arg("30");
+            cmd
+        };
+        let child = long.stdout(std::process::Stdio::null()).spawn().unwrap();
         let started = std::time::Instant::now();
-        assert!(wait_bounded(child, std::time::Duration::from_millis(300)).is_none());
+        let waited = wait_bounded(child, std::time::Duration::from_millis(300));
+        assert!(matches!(waited, BoundedWait::Stopped), "{waited:?}");
         assert!(
             started.elapsed() < std::time::Duration::from_secs(10),
             "returned at the limit, not when the child exited"
         );
-        // Reaped as well as killed: the pid no longer names our child.
-        let alive = std::process::Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .stderr(std::process::Stdio::null())
-            .status()
-            .unwrap()
-            .success();
-        assert!(!alive, "the overrunning child is gone");
 
-        let quick = std::process::Command::new("sh")
-            .args(["-c", "exit 3"])
-            .spawn()
-            .unwrap();
-        let status = wait_bounded(quick, std::time::Duration::from_secs(30))
-            .expect("finished in time")
-            .unwrap();
-        assert_eq!(status.code(), Some(3));
+        let quick = if cfg!(windows) {
+            std::process::Command::new("cmd")
+                .args(["/C", "exit 3"])
+                .spawn()
+                .unwrap()
+        } else {
+            std::process::Command::new("sh")
+                .args(["-c", "exit 3"])
+                .spawn()
+                .unwrap()
+        };
+        match wait_bounded(quick, std::time::Duration::from_secs(30)) {
+            BoundedWait::Finished(Ok(status)) => assert_eq!(status.code(), Some(3)),
+            other @ (BoundedWait::Finished(Err(_))
+            | BoundedWait::Stopped
+            | BoundedWait::Unreaped) => {
+                panic!("finished in time: {other:?}")
+            }
+        }
+    }
+
+    /// #6157 re-check: `freenet update` replaces the binary before its slower
+    /// last steps, so a stop at the limit can come after a successful
+    /// install. The wrapper must then re-exec rather than relaunch under the
+    /// old wrapper, whose image on Windows is the moved-aside `freenet.old`.
+    #[test]
+    fn a_crash_loop_update_stopped_after_its_install_restarts_the_wrapper() {
+        assert_eq!(
+            crash_loop_update_after_stop(true),
+            CrashLoopUpdateNext::RestartWrapper
+        );
+        assert_eq!(
+            crash_loop_update_after_stop(false),
+            CrashLoopUpdateNext::Relaunch
+        );
+        let a = Some(blake3::hash(b"old"));
+        let b = Some(blake3::hash(b"new"));
+        assert!(binary_changed(a, b));
+        assert!(!binary_changed(a, a));
+        assert!(
+            !binary_changed(None, b),
+            "an unreadable reading is no evidence"
+        );
+        assert!(
+            !binary_changed(a, None),
+            "an unreadable reading is no evidence"
+        );
+    }
+
+    /// The bounded spawner end to end, with a stand-in `freenet` (a shell
+    /// script run as `<exe> update --quiet`) stopped at a short limit in each
+    /// place a stop can land: after replacing itself, between the two renames,
+    /// and before doing anything.
+    #[cfg(unix)]
+    #[test]
+    fn a_stopped_update_reports_whether_it_had_replaced_the_binary() {
+        use std::os::unix::fs::PermissionsExt;
+        let limit = std::time::Duration::from_millis(500);
+        let run = |script: &str| {
+            let tmp = tempfile::tempdir().unwrap();
+            let exe = tmp.path().join("freenet");
+            std::fs::write(&exe, format!("#!/bin/sh\n{script}\nsleep 30\n")).unwrap();
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let before = std::fs::read(&exe).unwrap();
+            let outcome = spawn_update_command_bounded(&exe, tmp.path(), Some(1), limit);
+            let after = std::fs::read(&exe).ok();
+            (outcome, before, after, tmp)
+        };
+
+        // Installed, then stopped during the slow last steps.
+        let (outcome, before, after, _tmp) =
+            run(r#"cp "$0" "$0.tmp"; echo '# new' >> "$0.tmp"; mv "$0.tmp" "$0""#);
+        assert!(
+            matches!(outcome, BoundedUpdate::Stopped { replaced: true }),
+            "{outcome:?}"
+        );
+        assert_ne!(after.as_deref(), Some(before.as_slice()));
+
+        // Stopped between the renames: the binary is put back, unchanged.
+        let (outcome, before, after, _tmp) = run(r#"mv "$0" "$0.old""#);
+        assert!(
+            matches!(outcome, BoundedUpdate::Stopped { replaced: false }),
+            "{outcome:?}"
+        );
+        assert_eq!(after.as_deref(), Some(before.as_slice()));
+
+        // Stopped before anything happened.
+        let (outcome, before, after, _tmp) = run(":");
+        assert!(
+            matches!(outcome, BoundedUpdate::Stopped { replaced: false }),
+            "{outcome:?}"
+        );
+        assert_eq!(after.as_deref(), Some(before.as_slice()));
     }
 
     /// Stopping `freenet update` between `replace_binary`'s two renames leaves
@@ -5027,9 +5119,10 @@ echo "RC=$?"
         // node crashed, so it passes the crash's exit code (which also keeps
         // `freenet update`'s supervised download budget). It is bounded in
         // time, so it uses its own spawner.
+        let flat: String = src.split_whitespace().collect();
         assert_eq!(
-            src.matches(
-                "spawn_update_command_bounded(exe_path, log_dir, Some(exit_code), CRASH_UPDATE_TIMEOUT)"
+            flat.matches(
+                "spawn_update_command_bounded(exe_path,log_dir,Some(exit_code),CRASH_UPDATE_TIMEOUT,)"
             )
             .count(),
             1,

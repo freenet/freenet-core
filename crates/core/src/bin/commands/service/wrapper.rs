@@ -302,8 +302,22 @@ pub(super) enum CrashLoopUpdateNext {
     Relaunch,
 }
 
+/// [`CrashLoopUpdateNext`] after an attempt stopped at [`CRASH_UPDATE_TIMEOUT`].
+/// `freenet update` replaces the binary before its slower last steps (the
+/// service-file update, the fdev download), so a stop can come after a
+/// successful install. The wrapper must then re-exec: on Windows the running
+/// wrapper's image is the moved-aside `freenet.old`, and every update it ran
+/// later would fail to remove that file and count toward the lockout.
+pub(super) fn crash_loop_update_after_stop(replaced: bool) -> CrashLoopUpdateNext {
+    if replaced {
+        CrashLoopUpdateNext::RestartWrapper
+    } else {
+        crash_loop_update_next(None)
+    }
+}
+
 /// [`CrashLoopUpdateNext`] for an attempt's outcome; `None` when the attempt
-/// was skipped or stopped at the timeout.
+/// was skipped.
 pub(super) fn crash_loop_update_next(
     outcome: Option<super::super::update::UpdateSubprocessOutcome>,
 ) -> CrashLoopUpdateNext {
@@ -346,17 +360,28 @@ fn crash_loop_update(
         log_dir,
         &format!("{failures} consecutive failures; checking for an update before relaunching..."),
     );
-    let Some(result) =
-        spawn_update_command_bounded(exe_path, log_dir, Some(exit_code), CRASH_UPDATE_TIMEOUT)
-    else {
-        log_wrapper_event(
-            log_dir,
-            &format!(
-                "Update did not finish within {}s; stopped it, continuing the backoff",
-                CRASH_UPDATE_TIMEOUT.as_secs()
-            ),
-        );
-        return crash_loop_update_next(None);
+    let result = match spawn_update_command_bounded(
+        exe_path,
+        log_dir,
+        Some(exit_code),
+        CRASH_UPDATE_TIMEOUT,
+    ) {
+        BoundedUpdate::Finished(result) => result,
+        BoundedUpdate::Stopped { replaced } => {
+            log_wrapper_event(
+                log_dir,
+                &format!(
+                    "Update did not finish within {}s; stopped it. {}",
+                    CRASH_UPDATE_TIMEOUT.as_secs(),
+                    if replaced {
+                        "The binary had already been replaced, restarting wrapper..."
+                    } else {
+                        "Nothing installed, continuing the backoff"
+                    }
+                ),
+            );
+            return crash_loop_update_after_stop(replaced);
+        }
     };
     let outcome = super::super::update::classify_update_subprocess(&result);
     match super::super::update::update_counter_action(outcome) {
@@ -832,38 +857,95 @@ pub(super) fn spawn_update_command(
     update_command(exe_path, log_dir, post_stop_exit_code).status()
 }
 
+/// How a time-bounded `freenet update` ended ([`spawn_update_command_bounded`]).
+#[derive(Debug)]
+pub(super) enum BoundedUpdate {
+    /// It exited, or could not be spawned.
+    Finished(std::io::Result<std::process::ExitStatus>),
+    /// It was stopped at the limit. `replaced`: the binary at the exe path
+    /// differs from the one there before the attempt, so the install had
+    /// already happened.
+    Stopped { replaced: bool },
+}
+
 /// [`spawn_update_command`], waiting at most `limit`. Past it the child is
-/// stopped ([`wait_bounded`]) and `None` returned. A stop can land between
-/// the two renames of `replace_binary`, which leave no binary in place, so the
-/// moved-aside binary is then put back ([`restore_binary_after_stop`]).
-fn spawn_update_command_bounded(
+/// stopped ([`wait_bounded`]). A stop can land between the two renames of
+/// `replace_binary`, which leave no binary in place, so the moved-aside binary
+/// is then put back ([`restore_binary_after_stop`]); not when the child could
+/// not be reaped, since it may still be running. Whether the binary changed is
+/// judged by content ([`binary_identity`]), taken before and after.
+///
+/// Not everything a stop interrupts is restored. On macOS, a kill can leave
+/// the DMG mounted, a copy's temporary directory behind, or a detached bundle
+/// updater that times out waiting; each is cleared by a later attempt.
+pub(super) fn spawn_update_command_bounded(
     exe_path: &Path,
     log_dir: &Path,
     post_stop_exit_code: Option<i32>,
     limit: std::time::Duration,
-) -> Option<std::io::Result<std::process::ExitStatus>> {
+) -> BoundedUpdate {
+    let before = binary_identity(exe_path);
     let child = match update_command(exe_path, log_dir, post_stop_exit_code).spawn() {
         Ok(child) => child,
-        Err(e) => return Some(Err(e)),
+        Err(e) => return BoundedUpdate::Finished(Err(e)),
     };
-    let waited = wait_bounded(child, limit);
-    if waited.is_none() {
-        restore_binary_after_stop(exe_path, log_dir);
+    match wait_bounded(child, limit) {
+        BoundedWait::Finished(result) => BoundedUpdate::Finished(result),
+        BoundedWait::Stopped => {
+            restore_binary_after_stop(exe_path, log_dir);
+            BoundedUpdate::Stopped {
+                replaced: binary_changed(before, binary_identity(exe_path)),
+            }
+        }
+        BoundedWait::Unreaped => {
+            log_wrapper_event(
+                log_dir,
+                "Could not confirm the stopped update exited; leaving its files as they are",
+            );
+            BoundedUpdate::Stopped {
+                replaced: binary_changed(before, binary_identity(exe_path)),
+            }
+        }
     }
-    waited
 }
 
-/// Wait for `child` for at most `limit`. Past it, kill and reap the child and
-/// return `None`; also `None` when its state cannot be read, since waiting on
-/// it unbounded is what this exists to avoid.
+/// A content hash of the binary at `path`, or `None` when it cannot be read.
+pub(super) fn binary_identity(path: &Path) -> Option<blake3::Hash> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut hasher = blake3::Hasher::new();
+    std::io::copy(&mut file, &mut hasher).ok()?;
+    Some(hasher.finalize())
+}
+
+/// Whether the binary changed between two [`binary_identity`] readings. An
+/// unreadable reading is not evidence of a change.
+pub(super) fn binary_changed(before: Option<blake3::Hash>, after: Option<blake3::Hash>) -> bool {
+    matches!((before, after), (Some(before), Some(after)) if before != after)
+}
+
+/// How [`wait_bounded`] ended.
+#[derive(Debug)]
+pub(super) enum BoundedWait {
+    /// The child exited within the limit (or its exit status could not be read).
+    Finished(std::io::Result<std::process::ExitStatus>),
+    /// The child was killed at the limit and reaped.
+    Stopped,
+    /// The child was killed at the limit, but reaping it failed, so it may
+    /// still be running.
+    Unreaped,
+}
+
+/// Wait for `child` for at most `limit`. Past it, or when its state cannot be
+/// polled (waiting on it unbounded is what this exists to avoid), kill and
+/// reap the child.
 pub(super) fn wait_bounded(
     mut child: std::process::Child,
     limit: std::time::Duration,
-) -> Option<std::io::Result<std::process::ExitStatus>> {
+) -> BoundedWait {
     let started = std::time::Instant::now();
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return Some(Ok(status)),
+            Ok(Some(status)) => return BoundedWait::Finished(Ok(status)),
             Ok(None) => {}
             Err(_) => break,
         }
@@ -875,13 +957,14 @@ pub(super) fn wait_bounded(
         }
         std::thread::sleep(left.min(std::time::Duration::from_millis(250)));
     }
-    // Both best-effort: the child may have exited since the last poll, and
-    // either way it is gone once `wait` returns.
+    // Best-effort: the child may have exited since the last poll, so a failed
+    // kill is not itself a problem. Reaping is what says it is gone.
     #[allow(clippy::let_underscore_must_use)]
     let _ = child.kill();
-    #[allow(clippy::let_underscore_must_use)]
-    let _ = child.wait();
-    None
+    match child.wait() {
+        Ok(_) => BoundedWait::Stopped,
+        Err(_) => BoundedWait::Unreaped,
+    }
 }
 
 /// After stopping `freenet update` mid-run: if it was stopped between
