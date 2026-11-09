@@ -3465,7 +3465,11 @@ async fn send_observed_broadcast(
     let observed = match conn.send_bytes_observed(data, completion_tx).await {
         Ok(observed) => observed,
         Err(error) => {
-            propagation.record(&contract, PropagationEvent::SendFailed);
+            // The bridge already took this leg and counted its `Sent*`,
+            // possibly in an earlier window (a queued message failing in
+            // `drain_pending_before_shutdown`), so this is the transport's
+            // refusal, not the bridge's `SendFailed`.
+            propagation.record(&contract, PropagationEvent::WireSendFailed);
             return Err(error);
         }
     };
@@ -4482,7 +4486,12 @@ pub(crate) mod tests {
 
         let (r, e) = run(true, None).await;
         assert!(r.is_err());
-        assert_eq!(e.get(Ev::SendFailed), 1, "{e:?}");
+        assert_eq!(e.get(Ev::WireSendFailed), 1, "{e:?}");
+        assert_eq!(
+            e.get(Ev::SendFailed),
+            0,
+            "a transport refusal is not the bridge's: {e:?}"
+        );
 
         // The V2 wire variant (with a coverage list) is followed the same way.
         let (_, e) = run_variant(true, false, Some((ObservedSend::Short, None))).await;
