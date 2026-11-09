@@ -21520,14 +21520,18 @@ fn test_quic_data_path_cut_mid_transfer_falls_back_to_udp() {
                 .filter(|r| r.node == *address && r.what.starts_with(what))
                 .collect::<Vec<_>>()
         };
+        // On the idle timeout, or on the stall close (STALLED_SENDS_LIMIT
+        // sends timed out in a row with nothing acknowledged), which this node
+        // sends and its machine reads as a lost connection (`Reset`). Which
+        // one depends on timing: an end that had a burst of sends on the path
+        // when it went dark closes on the stall; with windows set per path
+        // from the buffer budget (#5940), the gateway's sends after the
+        // node's slower transfer come in such a burst.
         let fell_back = of_node("Fallback(");
-        assert_eq!(
-            fell_back
-                .iter()
-                .map(|r| r.what.as_str())
-                .collect::<Vec<_>>(),
-            vec!["Fallback(Idle)"],
-            "{address} fell back on the idle timeout: {}",
+        let causes: Vec<&str> = fell_back.iter().map(|r| r.what.as_str()).collect();
+        assert!(
+            causes == ["Fallback(Idle)"] || causes == ["Fallback(Reset)"],
+            "{address} fell back once, on the idle timeout or the stall close: {}",
             run.dump()
         );
         let fell_back_at = fell_back[0].at;
