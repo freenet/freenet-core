@@ -2899,9 +2899,9 @@ impl Scripted {
         register_address_network(a_addr, network);
         register_address_network(b_addr, network);
         let settings = QuicSettings {
-            max_connections: 4,
             memory_limit: 1024 * 1024 * 1024,
             idle_timeout: None,
+            initial_window: None,
             rate_limit: Default::default(),
         };
         let (a_keys, b_keys) = (TransportKeypair::new(), TransportKeypair::new());

@@ -3099,10 +3099,10 @@ impl NetworkApiConfig {
             return None;
         }
         Some(crate::transport::quic::QuicSettings {
-            max_connections: self.max_connections,
             memory_limit: crate::wasm_runtime::read_total_ram_bytes()
                 .unwrap_or(QUIC_FALLBACK_TOTAL_RAM),
             idle_timeout: None,
+            initial_window: None,
             // The transport sets it from its bandwidth settings when it binds.
             rate_limit: Default::default(),
         })

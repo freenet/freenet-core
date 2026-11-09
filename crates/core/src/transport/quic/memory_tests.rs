@@ -55,9 +55,9 @@ const SETTLE_DRIFT_BYTES: isize = 1024;
 /// the default 200 connections: a window of 268,435 bytes.
 fn settings() -> QuicSettings {
     QuicSettings {
-        max_connections: 200,
         memory_limit: 2 * 1024 * 1024 * 1024,
         idle_timeout: None,
+        initial_window: None,
         rate_limit: Default::default(),
     }
 }
@@ -983,9 +983,9 @@ fn frames_filling_the_window_measure_within_the_window_multiple() {
         (64usize << 30, super::config::MAX_WINDOW_BYTES),
     ] {
         let settings = QuicSettings {
-            max_connections: 200,
             memory_limit,
             idle_timeout: None,
+            initial_window: None,
             rate_limit: Default::default(),
         };
         let w = settings.window_bytes() as usize;

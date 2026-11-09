@@ -18,7 +18,8 @@
 //! peer's credit for every byte read, so they start only once the declared
 //! length bounds what may arrive. What a gap still costs is one received
 //! range (quinn's `recvd` entry and our mirror, [`RangeMirror`]), capped per
-//! connection ([`MAX_GAPS_PER_CONNECTION`]). quinn keeps a stopped stream's
+//! connection (`R_conn`, one per KiB of the window, `budget::gap_cap`;
+//! [`MAX_GAPS_PER_CONNECTION`] without a meter). quinn keeps a stopped stream's
 //! ranges until the peer finishes or resets it, which we cannot observe, so
 //! they stay counted ([`ConnRanges::keep`]); a second time past the cap
 //! closes the path. A stream waiting for room in the delivery channel keeps
@@ -111,6 +112,7 @@ use futures::stream::FuturesUnordered;
 use futures::{FutureExt, StreamExt};
 use tokio::sync::mpsc;
 
+use super::super::budget::ConnMeter;
 use super::super::framing::{FrameHeader, FrameKind, HEADER_LEN, HeaderError};
 use super::{QuicInboundOutcome, QuicPathStats, stop_code};
 use crate::simulation::TimeSource;
@@ -195,16 +197,23 @@ pub(in crate::transport::quic) struct Receiver<T> {
     closer: super::super::QuicCloser,
     /// The connection's gaps over all its streams.
     ranges: Arc<ConnRanges>,
+    /// The connection's share of the node's buffer budget, for a path that
+    /// reads data (`budget::ConnMeter`); told of every read.
+    meter: Option<Arc<ConnMeter>>,
     /// Panic on the next stream, to test the supervisor.
     #[cfg(test)]
     pub(in crate::transport::quic) panic_on_stream: bool,
 }
 
 impl<T: TimeSource> Receiver<T> {
-    /// The connection's gap count. Tests only.
-    #[cfg(test)]
+    /// The connection's gap count.
     pub(in crate::transport::quic) fn ranges(&self) -> Arc<ConnRanges> {
         self.ranges.clone()
+    }
+
+    /// Tell `meter` of every read from now on. Before any stream is read.
+    pub(in crate::transport::quic) fn set_meter(&mut self, meter: Arc<ConnMeter>) {
+        self.meter = Some(meter);
     }
 
     /// Replace the gap cap, before any stream is read. Tests only.
@@ -240,6 +249,7 @@ impl<T: TimeSource> Receiver<T> {
                 MAX_GAPS_PER_CONNECTION,
                 super::super::config::MAX_UNI_STREAMS as usize,
             )),
+            meter: None,
             #[cfg(test)]
             panic_on_stream: false,
         }
@@ -363,13 +373,21 @@ struct BodyReader<T: TimeSource> {
     ranges: RangeMirror,
     /// The connection's count of ranges over all its streams.
     conn_ranges: Arc<ConnRanges>,
+    /// The connection's budget meter, told of each read.
+    meter: Option<Arc<ConnMeter>>,
 }
 
 impl<T: TimeSource> BodyReader<T> {
     /// A reader with the idle timeout and an age limit of
     /// [`uncharged_age_limit`]; admission replaces the age limit with the
     /// stream's own ([`Self::set_age_limit`]).
-    fn new(recv: quinn::RecvStream, time: T, idle: Duration, conn_ranges: Arc<ConnRanges>) -> Self {
+    fn new(
+        recv: quinn::RecvStream,
+        time: T,
+        idle: Duration,
+        conn_ranges: Arc<ConnRanges>,
+        meter: Option<Arc<ConnMeter>>,
+    ) -> Self {
         let now = time.now_nanos();
         let idle_nanos = nanos(idle);
         let age_deadline = now.saturating_add(nanos(uncharged_age_limit()));
@@ -389,6 +407,7 @@ impl<T: TimeSource> BodyReader<T> {
             reset: false,
             ranges: RangeMirror::default(),
             conn_ranges,
+            meter,
         }
     }
 
@@ -484,7 +503,17 @@ impl<T: TimeSource> BodyReader<T> {
                 if self.end.is_some_and(|end| stop > end) {
                     return Err(ReadFailure::Overlong);
                 }
+                let prefix = self.ranges.prefix();
                 let added = self.ranges.insert(start, stop)?;
+                if let Some(meter) = &self.meter {
+                    // Every byte read is a credit quinn returns; only bytes that
+                    // extend the in-order prefix are delivery that grows a window.
+                    meter.on_read(
+                        stop - start,
+                        self.ranges.prefix().saturating_sub(prefix),
+                        now,
+                    );
+                }
                 if !self.conn_ranges.add(added, now) {
                     return Err(ReadFailure::TooManyRanges);
                 }
@@ -635,16 +664,19 @@ impl<T: TimeSource> Drop for BodyReader<T> {
     }
 }
 
-/// Most gaps a connection's streams may hold, counted per stream as received
-/// ranges past the first ([`RangeMirror::gaps`]), over open streams and the
-/// stopped ones quinn may still hold ([`ConnRanges::keep`]). A contiguous
-/// stream costs nothing here: its one range is bounded by the stream limit.
-/// Each gap costs about 70 B (quinn's `recvd` entry, which nothing in quinn
-/// caps, and our mirror) and the peer at least one byte of credit. One gap
-/// per KiB of the largest connection window (2,048, about 140 KB); honest loss
-/// leaves about loss x packets in flight, far fewer.
+/// The gap cap of a path with no budget meter (a shadow path, which reads no
+/// data, or a test path): what a path at the floor window gets
+/// (`budget::gap_cap`). Gaps are counted per stream as received ranges past
+/// the first ([`RangeMirror::gaps`]), over open streams and the stopped ones
+/// quinn may still hold ([`ConnRanges::keep`]). A contiguous stream costs
+/// nothing here: its one range is bounded by the stream limit. Each gap costs
+/// about 70 B (quinn's `recvd` entry, which nothing in quinn caps, and our
+/// mirror) and the peer at least one byte of credit. A metered path's cap
+/// follows its window: one gap per KiB of W + debt, at least this many
+/// (`budget::ConnMeter`). Honest loss leaves about loss x packets in flight,
+/// far fewer.
 pub(in crate::transport::quic) const MAX_GAPS_PER_CONNECTION: usize =
-    (super::super::config::MAX_WINDOW_BYTES / 1024) as usize;
+    super::super::budget::MIN_GAPS_PER_CONNECTION;
 
 /// How long a stopped stream's gaps count in full before up to
 /// [`KEPT_GAPS_RELEASED`] of them leave the count. A peer running quinn resets
@@ -682,7 +714,9 @@ struct Frozen {
 #[derive(Debug)]
 pub(in crate::transport::quic) struct ConnRanges {
     held: AtomicUsize,
-    cap: usize,
+    /// `R_conn`: set by the connection's meter as its window changes
+    /// (`budget::gap_cap`), fixed for a path without one.
+    cap: AtomicUsize,
     /// Most stopped streams quinn can hold at once: the stream limit.
     limit: usize,
     /// Times a stream went past the cap.
@@ -716,7 +750,7 @@ impl ConnRanges {
     pub(in crate::transport::quic) fn new(cap: usize, limit: usize) -> Self {
         Self {
             held: AtomicUsize::new(0),
-            cap,
+            cap: AtomicUsize::new(cap),
             limit: limit.max(1),
             trips: AtomicUsize::new(0),
             frozen: parking_lot::Mutex::new(Frozen::default()),
@@ -814,7 +848,17 @@ impl ConnRanges {
         let held = self.change(delta);
         #[cfg(test)]
         self.peak.fetch_max(held, Ordering::Relaxed);
-        held <= self.cap || delta <= 0
+        held <= self.cap.load(Ordering::Relaxed) || delta <= 0
+    }
+
+    /// Set the cap, from the connection's window (`budget::gap_cap`).
+    pub(in crate::transport::quic) fn set_cap(&self, cap: usize) {
+        self.cap.store(cap, Ordering::Relaxed);
+    }
+
+    /// Gaps counted now, kept ones included: what the budget charges.
+    pub(in crate::transport::quic) fn held_now(&self) -> usize {
+        self.held.load(Ordering::Relaxed)
     }
 
     fn remove(&self, gaps: usize) {
@@ -862,6 +906,15 @@ impl RangeMirror {
     #[cfg(test)]
     fn len(&self) -> usize {
         self.ranges.len()
+    }
+
+    /// One past the last byte of the in-order prefix: the end of the range
+    /// starting at offset 0, or 0 if nothing there was received.
+    fn prefix(&self) -> u64 {
+        match self.ranges.first() {
+            Some(&(0, end)) => end,
+            _ => 0,
+        }
     }
 
     /// Ranges past the first: the gaps between them.
@@ -1133,6 +1186,7 @@ async fn read_one<T: TimeSource>(recv: quinn::RecvStream, receiver: Arc<Receiver
         receiver.time.clone(),
         streaming_handle_idle_timeout(),
         receiver.ranges.clone(),
+        receiver.meter.clone(),
     );
     let header = match reader.read_exact(HEADER_LEN).await {
         Ok(bytes) => FrameHeader::decode(&bytes),

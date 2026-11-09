@@ -306,9 +306,9 @@ impl Link {
         .await;
         let b_socket = socket(b_addr, None, Arc::default()).await;
         let settings = |rate_limit| QuicSettings {
-            max_connections: 4,
             memory_limit: 1024 * 1024 * 1024,
             idle_timeout: None,
+            initial_window: None,
             rate_limit,
         };
         let (a_keys, b_keys) = (TransportKeypair::new(), TransportKeypair::new());
