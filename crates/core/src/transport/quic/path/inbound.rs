@@ -435,7 +435,13 @@ impl<T: TimeSource> BodyReader<T> {
         // then.
         if self.ordered {
             match self.recv.read_chunk(usize::MAX, true).now_or_never() {
-                Some(read) => return self.on_read(read, true),
+                Some(read) => {
+                    #[cfg(test)]
+                    self.conn_ranges
+                        .drained_before_switch
+                        .fetch_add(1, Ordering::Relaxed);
+                    return self.on_read(read, true);
+                }
                 None => self.ordered = false,
             }
         }
@@ -698,6 +704,10 @@ pub(in crate::transport::quic) struct ConnRanges {
     /// not happen: nothing bounds them before the header. Tests only.
     #[cfg(test)]
     pub(in crate::transport::quic) read_past_missing_header: AtomicUsize,
+    /// Chunks read in order by the drain before a stream's switch to
+    /// unordered reads (`BodyReader::next_unordered`). Tests only.
+    #[cfg(test)]
+    pub(in crate::transport::quic) drained_before_switch: AtomicUsize,
 }
 
 impl ConnRanges {
@@ -717,6 +727,8 @@ impl ConnRanges {
             ended_before_announce: AtomicUsize::new(0),
             #[cfg(test)]
             read_past_missing_header: AtomicUsize::new(0),
+            #[cfg(test)]
+            drained_before_switch: AtomicUsize::new(0),
         }
     }
 

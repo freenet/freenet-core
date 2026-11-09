@@ -1443,9 +1443,13 @@ fn a_short_stream_waiting_for_room_fails_at_once() {
 /// instant every datagram carrying the header is lost (the first, and the
 /// resends, which carry both pieces). Then quinn holds the second piece,
 /// which starts inside the metadata, and a resend holding all of it: the
-/// in-order reads take the resend, and the first unordered read returns the
-/// second piece, below where they stopped. The bytes already read are
-/// dropped, and the stream arrives intact instead of failing as an overlap.
+/// in-order reads of the header and metadata take the resend, and the second
+/// piece is left buffered below where they stopped. Read unordered, quinn would
+/// count its bytes as read again and never report the end. The reader first
+/// drains in order what is contiguous, which pops that copy, and switches only
+/// once an in-order read would block, so the stream arrives intact. Fails
+/// without the drain (quinn's `Recv::stop` underflows) and with only a trim of
+/// the copy on our side (the stream never ends).
 #[test]
 fn a_second_copy_of_the_metadata_end_is_read_once() {
     bounded(|| async move {
@@ -1515,6 +1519,10 @@ fn a_second_copy_of_the_metadata_end_is_read_once() {
         );
         let stats = p.b.stats();
         assert_eq!(stats.count(QuicInboundOutcome::ReadFailed), 0);
+        assert!(
+            p.b.inbound_drained_before_switch() >= 1,
+            "premise: the drain read past the left-behind copy before the switch"
+        );
         let arrival = p.b_in.streams.try_recv().expect("announced");
         assert_eq!(arrival.metadata.as_deref(), Some(&metadata[..]));
         assert_eq!(arrival.handle.assemble().await.expect("assembled"), body);

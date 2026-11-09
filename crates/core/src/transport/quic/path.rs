@@ -987,6 +987,15 @@ impl QuicPath {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Chunks the receive side read in order by the drain before a switch to
+    /// unordered reads. Tests only.
+    #[cfg(test)]
+    pub(in crate::transport) fn inbound_drained_before_switch(&self) -> usize {
+        self.inbound_ranges
+            .drained_before_switch
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Gaps the receive side counts now. Tests only.
     #[cfg(test)]
     pub(in crate::transport) fn inbound_gaps_held(&self) -> usize {
