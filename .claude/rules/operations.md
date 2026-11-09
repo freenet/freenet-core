@@ -523,6 +523,46 @@ Pins (source-scrape, fail the build on regression):
   `recv_waiter_reply_*` (op_ctx.rs) and
   `orphaned_transaction_wakes_parked_waiter_with_peer_disconnected` (op_state_manager.rs)
 
+## UPDATE propagation counters and the stall WARN (#6143)
+
+Every place an UPDATE broadcast leg can end without a send logs at debug or
+trace, which release builds compile out. Each outcome is counted instead as a
+`PropagationEvent` (`operations/update/propagation_stats.rs`), per contract
+in the per-minute `update_propagation_summary` INFO line and node-wide as
+`prop_<label>` fields of the `broadcast_payload_mix` telemetry event.
+
+```
+WHEN adding a way for a broadcast leg, fan-out or heal to end:
+  → Count it through `record_propagation_event` (or `PropagationSink::record`
+    where there is no OpManager). Never call `UpdatePropagationStats` or
+    `PayloadMix` directly: the one function feeds both, so the log and the
+    telemetry cannot disagree.
+  → A new event needs a variant, a label (a stable log/telemetry field name)
+    and a production recording site; `every_propagation_event_has_a_
+    production_recording_site` fails on a variant nothing records.
+  → Per-event logging stays at debug. The count is the release-build signal;
+    a per-stream WARN brings back the #4252/#4272 log volume.
+```
+
+The fields: `client_originated` (a client apply that changed
+state); `sent_delta` / `sent_full` (handed to the bridge); the skips
+`skip_summary_equal`, `skip_cached_converged`, `skip_probe_converged`,
+`skip_empty_delta`, `skip_not_hosted`, `skip_no_address`; `send_failed`;
+transport `wire_short` (one packet), `wire_stream` and its fate
+`wire_stream_delivered` / `_failed` / `_egress_abandoned`, `wire_unobserved`
+(QUIC path); `fanout_event_dropped` / `heal_event_dropped` (`try_notify`
+refused); and the receiver's `rx_dedup`, `rx_already_applied`, `rx_backoff`.
+
+`update_propagation_stalled` WARNs (at most once per contract per window,
+and counted as `origination_stalls` in telemetry) when a window has a client
+origination with resolved targets or a dropped fan-out, and nothing for that
+contract reaches the wire (`EventCounts::reached_wire`: a short packet, a
+QUIC send, or a delivered stream) in that window or the next. A stream still
+in flight holds the decision until its fate arrives. **It cannot see** loss
+of a single packet or of a QUIC message after the transport took it: those
+count as reaching the wire. For those, read the receivers' `rx_*` counts
+across the fleet.
+
 ## Event emission review (targeted vs fan-out)
 
 **When reviewing (or writing) ANY code that emits a `NodeEvent`, you MUST

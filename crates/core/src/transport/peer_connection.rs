@@ -1646,14 +1646,39 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
     /// Hand an already-serialized message to the transport: as one short
     /// message when it fits in a packet, otherwise as a stream.
     pub(crate) async fn send_serialized(&mut self, data: SerializedMessage) -> Result<()> {
+        self.route_serialized(data, None).await.map(|_| ())
+    }
+
+    /// [`Self::send_serialized`], also reporting how the message was carried
+    /// and, for a UDP stream, its fate on `completion_tx` (#6143). Both go
+    /// through [`Self::route_serialized`], so the bytes and the path are the
+    /// same; the only difference is that a UDP stream is given the completion
+    /// sender instead of `None`.
+    pub(crate) async fn send_serialized_observed(
+        &mut self,
+        data: SerializedMessage,
+        completion_tx: tokio::sync::oneshot::Sender<super::StreamSendOutcome>,
+    ) -> Result<super::ObservedSend> {
+        self.route_serialized(data, Some(completion_tx)).await
+    }
+
+    /// The one routing decision for a serialized message, shared by
+    /// [`Self::send_serialized`] and [`Self::send_serialized_observed`] so
+    /// the observed path cannot drift from the real one. Returns the path
+    /// taken. `completion_tx` reaches only a UDP stream; every other path
+    /// drops it, which a waiter reads as "no fate reported".
+    async fn route_serialized(
+        &mut self,
+        data: SerializedMessage,
+        completion_tx: Option<tokio::sync::oneshot::Sender<super::StreamSendOutcome>>,
+    ) -> Result<super::ObservedSend> {
         if !fits_one_packet(data.len() as u64) {
             tracing::trace!(
                 peer_addr = %self.remote_conn.remote_addr,
                 total_size_bytes = data.len(),
                 "Sending as stream"
             );
-            self.outbound_stream(data).await;
-            return Ok(());
+            return Ok(self.outbound_stream(data, completion_tx).await);
         }
         tracing::trace!(
             peer_addr = %self.remote_conn.remote_addr,
@@ -1662,41 +1687,13 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         // Never waits: this runs in the connection's task (`transport.md`).
         let data = match self.quic_data_route() {
             Some(route) => match route.queue_short(data) {
-                Ok(()) => return Ok(()),
+                Ok(()) => return Ok(super::ObservedSend::Unobserved),
                 Err(data) => data,
             },
             None => data,
         };
-        self.outbound_short_message(data).await
-    }
-
-    /// [`Self::send_serialized`], also reporting how the message was carried
-    /// and, for a UDP stream, its fate on `completion_tx` (#6143). Sends the
-    /// same bytes by the same path `send_serialized` would choose: the only
-    /// difference is that a UDP stream is given the completion sender
-    /// `outbound_stream` would otherwise pass as `None`.
-    pub(crate) async fn send_serialized_observed(
-        &mut self,
-        data: SerializedMessage,
-        completion_tx: tokio::sync::oneshot::Sender<super::StreamSendOutcome>,
-    ) -> Result<super::ObservedSend> {
-        let fits = fits_one_packet(data.len() as u64);
-        // Checked once, with no await before the send below uses the same
-        // answer, so the path reported is the path taken.
-        let on_quic = self.quic_data_route().is_some();
-        if fits || on_quic {
-            self.send_serialized(data).await?;
-            return Ok(if on_quic {
-                super::ObservedSend::Unobserved
-            } else {
-                super::ObservedSend::Short
-            });
-        }
-        // `outbound_stream`'s UDP branch, with the completion sender.
-        let stream_id = StreamId::next_transport_internal();
-        self.outbound_stream_with_id(stream_id, data.into(), None, Some(completion_tx), None)
-            .await;
-        Ok(super::ObservedSend::Stream)
+        self.outbound_short_message(data).await?;
+        Ok(super::ObservedSend::Short)
     }
 
     /// The path that carries this connection's data right now, if one does.
@@ -3685,13 +3682,20 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
 
     /// A message past one packet. On a path it is a Short, and only on UDP a
     /// stream of its own, so the id is taken here for the UDP form either way.
-    async fn outbound_stream(&mut self, data: SerializedMessage) {
+    /// Returns how it was carried: only the UDP stream reports its fate on
+    /// `completion_tx`; the path drops it.
+    async fn outbound_stream(
+        &mut self,
+        data: SerializedMessage,
+        completion_tx: Option<tokio::sync::oneshot::Sender<super::StreamSendOutcome>>,
+    ) -> super::ObservedSend {
         let stream_id = StreamId::next_transport_internal();
         let Some(route) = self.quic_data_route() else {
-            self.outbound_stream_with_id(stream_id, data.into(), None, None, None)
+            self.outbound_stream_with_id(stream_id, data.into(), None, completion_tx, None)
                 .await;
-            return;
+            return super::ObservedSend::Stream;
         };
+        drop(completion_tx);
         let task = GlobalExecutor::spawn(
             quic_send::send_large_short_on_path(
                 route,
@@ -3702,6 +3706,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             .instrument(span!(tracing::Level::DEBUG, "outbound_stream")),
         );
         self.outbound_stream_futures.push(task);
+        super::ObservedSend::Unobserved
     }
 
     /// What starts a stream on the UDP session.
@@ -6438,54 +6443,6 @@ mod tests {
         crate::transport::TRANSPORT_METRICS.remove_peer(remote_addr);
     }
 
-    /// Outbound-`send` burst coverage related to #3321 (Gap 3 of #3367): a
-    /// *burst* of consecutive UDP send failures on a live `PeerConnection`'s
-    /// public `send` path must each surface as a *transient* error and must NOT
-    /// consume/poison the connection object, and once the failures clear the
-    /// same connection must send successfully again.
-    ///
-    /// SCOPE — read this before assuming more than the test proves. This test
-    /// exercises the *outbound* entry point only:
-    /// `send` -> `outbound_short_message` -> `packet_sending().await?`, which
-    /// PROPAGATES the `SendFailed` error to the caller. It pins that this path
-    /// classifies a send-failure burst as transient and recovers. It does NOT
-    /// execute the #3321 connection-*teardown* decision: that decision lives in
-    /// the `recv()` swallow guards (`peer_connection.rs` ~1091/1186/1428, which
-    /// `continue` rather than tear down on a transient send error) and in the
-    /// `p2p_protoc.rs` listener (~3092-3108). Driving those teardown sites under
-    /// a transient send-failure burst is a separate follow-up; this test does
-    /// not run them.
-    ///
-    /// The existing `send_failure_returns_transient_error` /
-    /// `transient_send_failure_then_recovery_succeeds` /
-    /// `send_failed_kinds_classify_as_transient` tests all drive the STATELESS
-    /// `packet_sending` free function — they pin error *classification* on the
-    /// free function but never go through a real `PeerConnection`'s `send`. This
-    /// test adds that `PeerConnection::send` level of coverage via a
-    /// `FailableTestSocket`.
-    ///
-    /// What the test asserts:
-    ///   1. Each failed send returns `Err` classified as transient
-    ///      (`is_transient()`, NOT `ConnectionClosed`), and the
-    ///      `&mut PeerConnection` is neither consumed nor poisoned — we keep
-    ///      calling `send` on the same object across the whole burst.
-    ///   2. After flipping the failure flag off, the very same connection sends
-    ///      successfully and the packet arrives on the rx side.
-    ///
-    /// If the transient-error contract regressed so that a send failure mapped
-    /// to `ConnectionClosed` (or any non-transient variant), the per-send
-    /// classification assertion below would fail before recovery is reached.
-    ///
-    /// NOTE on the swallow sites: the claim that the `recv()`-loop swallow
-    /// guards are not unit-drivable would be overstated. Site ~1091 (the
-    /// ACK-receipt `noop` send) IS drivable in principle — the
-    /// `recv_records_packet_metrics_post_authentication` test below already
-    /// builds a `PeerConnection` and drives `recv()` to completion with a
-    /// hand-crafted encrypted inbound packet, which is the same machinery a
-    /// recv-loop swallow-guard test would need. Site ~1428 is gated on the
-    /// `ack_check` interval timer, which never fires under this module's no-op
-    /// mock clock, so that one is genuinely not drivable here. A recv-loop
-    /// swallow-guard test for site ~1091 is the natural follow-up to this PR.
     /// #6143: `send_serialized_observed` reports how a message was carried.
     /// A message that fits one packet is a `Short` and leaves as one packet;
     /// a larger one is a `Stream` whose completion sender reports
@@ -6577,6 +6534,54 @@ mod tests {
         assert!(packets >= 4, "the stream's fragments left: {packets}");
     }
 
+    /// Outbound-`send` burst coverage related to #3321 (Gap 3 of #3367): a
+    /// *burst* of consecutive UDP send failures on a live `PeerConnection`'s
+    /// public `send` path must each surface as a *transient* error and must NOT
+    /// consume/poison the connection object, and once the failures clear the
+    /// same connection must send successfully again.
+    ///
+    /// SCOPE — read this before assuming more than the test proves. This test
+    /// exercises the *outbound* entry point only:
+    /// `send` -> `outbound_short_message` -> `packet_sending().await?`, which
+    /// PROPAGATES the `SendFailed` error to the caller. It pins that this path
+    /// classifies a send-failure burst as transient and recovers. It does NOT
+    /// execute the #3321 connection-*teardown* decision: that decision lives in
+    /// the `recv()` swallow guards (`peer_connection.rs` ~1091/1186/1428, which
+    /// `continue` rather than tear down on a transient send error) and in the
+    /// `p2p_protoc.rs` listener (~3092-3108). Driving those teardown sites under
+    /// a transient send-failure burst is a separate follow-up; this test does
+    /// not run them.
+    ///
+    /// The existing `send_failure_returns_transient_error` /
+    /// `transient_send_failure_then_recovery_succeeds` /
+    /// `send_failed_kinds_classify_as_transient` tests all drive the STATELESS
+    /// `packet_sending` free function — they pin error *classification* on the
+    /// free function but never go through a real `PeerConnection`'s `send`. This
+    /// test adds that `PeerConnection::send` level of coverage via a
+    /// `FailableTestSocket`.
+    ///
+    /// What the test asserts:
+    ///   1. Each failed send returns `Err` classified as transient
+    ///      (`is_transient()`, NOT `ConnectionClosed`), and the
+    ///      `&mut PeerConnection` is neither consumed nor poisoned — we keep
+    ///      calling `send` on the same object across the whole burst.
+    ///   2. After flipping the failure flag off, the very same connection sends
+    ///      successfully and the packet arrives on the rx side.
+    ///
+    /// If the transient-error contract regressed so that a send failure mapped
+    /// to `ConnectionClosed` (or any non-transient variant), the per-send
+    /// classification assertion below would fail before recovery is reached.
+    ///
+    /// NOTE on the swallow sites: the claim that the `recv()`-loop swallow
+    /// guards are not unit-drivable would be overstated. Site ~1091 (the
+    /// ACK-receipt `noop` send) IS drivable in principle — the
+    /// `recv_records_packet_metrics_post_authentication` test below already
+    /// builds a `PeerConnection` and drives `recv()` to completion with a
+    /// hand-crafted encrypted inbound packet, which is the same machinery a
+    /// recv-loop swallow-guard test would need. Site ~1428 is gated on the
+    /// `ack_check` interval timer, which never fires under this module's no-op
+    /// mock clock, so that one is genuinely not drivable here. A recv-loop
+    /// swallow-guard test for site ~1091 is the natural follow-up to this PR.
     #[tokio::test]
     async fn connection_survives_burst_of_transient_send_failures() {
         use crate::transport::crypto::TransportKeypair;

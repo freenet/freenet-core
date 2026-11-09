@@ -2451,23 +2451,6 @@ async fn notify_node_event_on(
     }
 }
 
-/// Non-blocking emit of a [`NodeEvent`] on the event-loop notification
-/// channel.
-///
-/// Extracted from [`OpManager::try_notify_node_event`] so the try-send
-/// path is testable in isolation without building a full `OpManager`.
-/// On `Full` the event is dropped at debug level (benign back-pressure
-/// under fan-out — was flooding gateways at 30K+/hr, see #4238); on
-/// `Closed` it is dropped at warn level (receiver torn down). Either
-/// arm returns `Err(OpError::NotificationError)`. Best-effort by
-/// design — see the OpManager method doc for the wedge (#4145) this
-/// prevents.
-///
-/// `channel_pending` and `channel_remaining` are passed by the caller
-/// purely for log enrichment; they are read at the call site to avoid
-/// requiring the wrapper type here. `channel_remaining` is the value
-/// returned by `tokio::sync::mpsc::Sender::capacity()`, which is the
-/// *current* available slot count, not the channel's max capacity.
 /// The contract and [`PropagationEvent`] to count if `msg` is dropped by
 /// [`OpManager::try_notify_node_event`]: a fan-out or a targeted heal, which
 /// carry UPDATE propagation, and nothing else.
@@ -2496,6 +2479,23 @@ fn propagation_drop_event(
     }
 }
 
+/// Non-blocking emit of a [`NodeEvent`] on the event-loop notification
+/// channel.
+///
+/// Extracted from [`OpManager::try_notify_node_event`] so the try-send
+/// path is testable in isolation without building a full `OpManager`.
+/// On `Full` the event is dropped at debug level (benign back-pressure
+/// under fan-out — was flooding gateways at 30K+/hr, see #4238); on
+/// `Closed` it is dropped at warn level (receiver torn down). Either
+/// arm returns `Err(OpError::NotificationError)`. Best-effort by
+/// design — see the OpManager method doc for the wedge (#4145) this
+/// prevents.
+///
+/// `channel_pending` and `channel_remaining` are passed by the caller
+/// purely for log enrichment; they are read at the call site to avoid
+/// requiring the wrapper type here. `channel_remaining` is the value
+/// returned by `tokio::sync::mpsc::Sender::capacity()`, which is the
+/// *current* available slot count, not the channel's max capacity.
 fn try_notify_node_event_on(
     notifications_sender: &mpsc::Sender<Either<NetMessage, NodeEvent>>,
     channel_pending: usize,

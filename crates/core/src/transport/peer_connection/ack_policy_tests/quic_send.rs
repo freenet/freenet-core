@@ -257,6 +257,47 @@ fn a_message_of_each_kind_goes_on_the_path_and_not_on_udp() {
     );
 }
 
+/// #6143: with the route up, an observed send of either size goes on the path
+/// and is reported `Unobserved`, with its completion sender dropped: the path
+/// reports no per-message fate. The messages arrive as `send_serialized`'s do.
+#[test]
+fn an_observed_send_on_the_path_is_unobserved() {
+    run(
+        "quic-send-observed",
+        50,
+        QuicPathLimits::DEFAULT,
+        |mut rig| async move {
+            let short = message(1);
+            let (tx, short_fate) = oneshot::channel();
+            let observed = rig
+                .e
+                .conn
+                .send_serialized_observed(short.clone(), tx)
+                .await
+                .unwrap();
+            assert_eq!(observed, crate::transport::ObservedSend::Unobserved);
+            assert!(short_fate.await.is_err(), "no fate is reported");
+
+            let large = vec![3u8; 4000];
+            let (tx, large_fate) = oneshot::channel();
+            let observed = rig
+                .e
+                .conn
+                .send_serialized_observed(large.clone(), tx)
+                .await
+                .unwrap();
+            assert_eq!(observed, crate::transport::ObservedSend::Unobserved);
+            assert!(large_fate.await.is_err(), "no fate is reported");
+
+            rig.path.settle(Duration::from_secs(2)).await;
+            rig.collect_tasks().await;
+            assert_eq!(rig.delivered_shorts(), sorted(vec![short, large]));
+            let udp = rig.udp_data();
+            assert!(udp.ids.is_empty(), "UDP carried data: {:?}", udp.ids);
+        },
+    );
+}
+
 /// The queue takes its capacity and the rest goes on UDP at once, each counted.
 /// Every message arrives once, by one route or the other.
 #[test]

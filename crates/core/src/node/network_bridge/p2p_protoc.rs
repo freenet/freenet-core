@@ -3484,10 +3484,15 @@ async fn send_observed_broadcast(
                 let ev = PropagationEvent::for_stream_outcome(outcome);
                 propagation.record(&contract, ev);
                 if ev != PropagationEvent::WireStreamDelivered {
-                    // The transport's own WARN for this failure (or its debug
-                    // line, for an egress abandon) names no contract; this
-                    // line does.
-                    tracing::warn!(
+                    // Debug, not WARN: under a bandwidth cap or a saturated
+                    // uplink this fires per stream, which is the per-event
+                    // volume #4252/#4272 removed, and the transport keeps its
+                    // own per-stream egress abandons at debug for the same
+                    // reason. The release-build signal is the per-contract
+                    // `wire_stream_*` count in `update_propagation_summary`
+                    // and the stall WARN built on it. This line adds the
+                    // contract and peer for a debug-level investigation.
+                    tracing::debug!(
                         contract = %contract,
                         peer = %peer,
                         outcome = ev.label(),
@@ -4326,7 +4331,8 @@ pub(crate) mod tests {
             observe: None,
         });
         let mix = crate::node::network_bridge::outbound_message_mix::OutboundMix::new();
-        let (sink, _) = crate::operations::update::propagation_stats::PropagationSink::for_test();
+        let (sink, _, _) =
+            crate::operations::update::propagation_stats::PropagationSink::for_test();
         let msg = hosting_announce();
         let expected = bincode::serialize(&msg).unwrap();
 
@@ -4351,7 +4357,8 @@ pub(crate) mod tests {
             observe: None,
         });
         let mix = crate::node::network_bridge::outbound_message_mix::OutboundMix::new();
-        let (sink, _) = crate::operations::update::propagation_stats::PropagationSink::for_test();
+        let (sink, _, _) =
+            crate::operations::update::propagation_stats::PropagationSink::for_test();
 
         let result = super::handle_peer_channel_message(
             &mut conn,
@@ -4368,9 +4375,10 @@ pub(crate) mod tests {
         assert_eq!(rollup["total_bytes"], 0);
     }
 
-    /// #6143: an inline UPDATE broadcast is counted against its contract by
-    /// how the transport carried it, and a stream by its fate, with a WARN
-    /// naming the contract when it fails. Other messages are not counted.
+    /// #6143: an inline UPDATE broadcast, either wire variant, is counted
+    /// against its contract by how the transport carried it, and a stream by
+    /// its fate, in both the per-contract summary and the telemetry window.
+    /// Other messages are not counted.
     #[tokio::test]
     async fn an_inline_broadcast_is_counted_by_how_the_transport_carried_it() {
         use crate::operations::update::propagation_stats::{
@@ -4382,38 +4390,65 @@ pub(crate) mod tests {
             freenet_stdlib::prelude::ContractInstanceId::new([61u8; 32]),
             freenet_stdlib::prelude::CodeHash::new([62u8; 32]),
         );
-        let broadcast = || {
-            crate::message::NetMessage::from(crate::operations::update::UpdateMsg::BroadcastTo {
-                id: crate::message::Transaction::new::<crate::operations::update::UpdateMsg>(),
-                key,
-                payload: crate::message::DeltaOrFullState::Delta(vec![1, 2, 3]),
-                sender_summary_bytes: vec![4, 5],
+        let broadcast = |v2: bool| {
+            let id = crate::message::Transaction::new::<crate::operations::update::UpdateMsg>();
+            let payload = crate::message::DeltaOrFullState::Delta(vec![1, 2, 3]);
+            crate::message::NetMessage::from(if v2 {
+                crate::operations::update::UpdateMsg::BroadcastToV2 {
+                    id,
+                    key,
+                    payload,
+                    sender_summary_bytes: vec![4, 5],
+                    covered: Default::default(),
+                }
+            } else {
+                crate::operations::update::UpdateMsg::BroadcastTo {
+                    id,
+                    key,
+                    payload,
+                    sender_summary_bytes: vec![4, 5],
+                }
             })
         };
         let mix = crate::node::network_bridge::outbound_message_mix::OutboundMix::new();
 
-        let run = |fail: bool, observe: Option<(ObservedSend, Option<StreamSendOutcome>)>| {
-            let mix = &mix;
-            async move {
-                let (sink, stats): (PropagationSink, _) = PropagationSink::for_test();
-                let mut conn: Box<dyn super::PeerConnectionApi> = Box::new(RecordingConnection {
-                    sent: Arc::new(parking_lot::Mutex::new(Vec::new())),
-                    fail,
-                    observe,
-                });
-                let result = super::handle_peer_channel_message(
-                    &mut conn,
-                    either::Left(broadcast()),
-                    mix,
-                    &sink,
-                )
-                .await;
-                // A stream's fate lands on a task of its own.
-                for _ in 0..100 {
-                    tokio::task::yield_now().await;
+        let run_variant =
+            |v2: bool, fail: bool, observe: Option<(ObservedSend, Option<StreamSendOutcome>)>| {
+                let mix = &mix;
+                async move {
+                    let (sink, stats, telemetry): (PropagationSink, _, _) =
+                        PropagationSink::for_test();
+                    let mut conn: Box<dyn super::PeerConnectionApi> =
+                        Box::new(RecordingConnection {
+                            sent: Arc::new(parking_lot::Mutex::new(Vec::new())),
+                            fail,
+                            observe,
+                        });
+                    let result = super::handle_peer_channel_message(
+                        &mut conn,
+                        either::Left(broadcast(v2)),
+                        mix,
+                        &sink,
+                    )
+                    .await;
+                    // A stream's fate lands on a task of its own.
+                    for _ in 0..100 {
+                        tokio::task::yield_now().await;
+                    }
+                    let events = stats.events_for_test(key.id());
+                    // The telemetry window gets exactly what the summary got.
+                    for ev in Ev::ALL {
+                        assert_eq!(
+                            telemetry.propagation_event_for_test(ev),
+                            events.get(ev),
+                            "telemetry disagrees with the summary on {ev:?}"
+                        );
+                    }
+                    (result, events)
                 }
-                (result, stats.events_for_test(key.id()))
-            }
+            };
+        let run = |fail: bool, observe: Option<(ObservedSend, Option<StreamSendOutcome>)>| {
+            run_variant(false, fail, observe)
         };
 
         let (r, e) = run(false, Some((ObservedSend::Short, None))).await;
@@ -4459,8 +4494,12 @@ pub(crate) mod tests {
         assert!(r.is_err());
         assert_eq!(e.get(Ev::SendFailed), 1, "{e:?}");
 
+        // The V2 wire variant (with a coverage list) is followed the same way.
+        let (_, e) = run_variant(true, false, Some((ObservedSend::Short, None))).await;
+        assert_eq!(e.get(Ev::WireShort), 1, "BroadcastToV2: {e:?}");
+
         // Not a broadcast: nothing is attributed.
-        let (sink, stats) = PropagationSink::for_test();
+        let (sink, stats, _) = PropagationSink::for_test();
         let mut conn: Box<dyn super::PeerConnectionApi> = Box::new(RecordingConnection {
             sent: Arc::new(parking_lot::Mutex::new(Vec::new())),
             fail: false,
@@ -4478,15 +4517,19 @@ pub(crate) mod tests {
         assert_eq!(stats.events_for_test(&announced).get(Ev::WireShort), 0);
     }
 
-    /// The failure WARN names the contract (#6143): the transport's own lines
-    /// for these failures do not.
+    /// A failed broadcast stream is counted and logged at debug with its
+    /// contract, never at WARN (#6143). It can fire once per stream under a
+    /// bandwidth cap, which at WARN would bring back the per-event log volume
+    /// #4252/#4272 removed; the release-build signal is the counter.
     #[tokio::test]
-    async fn a_failed_broadcast_stream_warns_with_its_contract() {
-        use crate::operations::update::propagation_stats::PropagationSink;
+    async fn a_failed_broadcast_stream_is_counted_and_not_warned() {
+        use crate::operations::update::propagation_stats::{
+            PropagationEvent as Ev, PropagationSink,
+        };
         use crate::test_utils::TestLogger;
         use crate::transport::{ObservedSend, StreamSendOutcome};
 
-        let logger = TestLogger::new().capture_logs().with_level("warn").init();
+        let logger = TestLogger::new().capture_logs().with_level("debug").init();
         let id = freenet_stdlib::prelude::ContractInstanceId::new([63u8; 32]);
         let key = freenet_stdlib::prelude::ContractKey::from_id_and_code(
             id,
@@ -4499,7 +4542,7 @@ pub(crate) mod tests {
                 payload: crate::message::DeltaOrFullState::Delta(vec![1]),
                 sender_summary_bytes: vec![],
             });
-        let (sink, _) = PropagationSink::for_test();
+        let (sink, stats, _) = PropagationSink::for_test();
         let mix = crate::node::network_bridge::outbound_message_mix::OutboundMix::new();
         let mut conn: Box<dyn super::PeerConnectionApi> = Box::new(RecordingConnection {
             sent: Arc::new(parking_lot::Mutex::new(Vec::new())),
@@ -4512,12 +4555,15 @@ pub(crate) mod tests {
         for _ in 0..100 {
             tokio::task::yield_now().await;
         }
-        assert!(
-            logger.contains(&id.to_string()),
-            "the WARN must name the contract: {:?}",
-            logger.logs()
-        );
-        assert!(logger.contains("wire_stream_failed"), "{:?}", logger.logs());
+        assert_eq!(stats.events_for_test(&id).get(Ev::WireStreamFailed), 1);
+        let line = logger
+            .logs()
+            .into_iter()
+            .find(|l| l.contains("UPDATE broadcast stream to peer failed"))
+            .expect("the failure is logged at debug");
+        assert!(line.contains(&id.to_string()), "names the contract: {line}");
+        assert!(line.contains("wire_stream_failed"), "{line}");
+        assert!(!line.contains("WARN"), "must not be a WARN: {line}");
     }
 
     /// Only this node's own CONNECT request as a joiner is ended at once
