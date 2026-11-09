@@ -12,7 +12,7 @@ use quinn::congestion::{Controller, ControllerFactory};
 use super::super::config::{QuicRateLimit, QuicSettings};
 use super::super::memory_tests::{connected_pair_with, transfer_one_stream};
 use super::super::tests::{bounded, drive};
-use super::{CappedCubic, CappedCubicFactory, rate_window};
+use super::{CappedCubic, CappedCubicFactory, INITIAL_WINDOW_DATAGRAMS, rate_window};
 use crate::simulation::{TimeSource, VirtualTime};
 use crate::transport::Socket;
 use crate::transport::crypto::TransportKeypair;
@@ -98,11 +98,38 @@ fn after_a_transfer(rate: QuicRateLimit) -> (Box<dyn Controller>, u64) {
     (controller, cubic)
 }
 
+/// A node's controller starts at [`INITIAL_WINDOW_DATAGRAMS`] full datagrams,
+/// not quinn's 10, and the bandwidth cap still lowers that start once there
+/// is an RTT.
+#[test]
+fn the_initial_window_is_thirty_two_datagrams_and_the_cap_still_lowers_it() {
+    let start = INITIAL_WINDOW_DATAGRAMS * u64::from(MTU);
+    assert_eq!(start, 38_400);
+    let fresh =
+        Arc::new(CappedCubicFactory::new(QuicRateLimit::default())).build(Instant::now(), MTU);
+    assert_eq!(fresh.initial_window(), start);
+    assert_eq!(fresh.window(), start);
+    let mut capped = Arc::new(CappedCubicFactory::new(QuicRateLimit::new(
+        Some(100_000),
+        None,
+    )))
+    .build(Instant::now(), MTU)
+    .into_any()
+    .downcast::<CappedCubic>()
+    .expect("the CappedCubic");
+    assert_eq!(capped.window(), start, "no RTT yet: Cubic's start");
+    capped.srtt = Some(Duration::from_millis(100));
+    assert_eq!(capped.window(), 10_000, "100 kB/s x 100 ms");
+}
+
 /// Without a limit the window is Cubic's, sample or not.
 #[test]
 fn with_no_limit_the_window_is_cubics() {
     let (controller, cubic) = after_a_transfer(QuicRateLimit::default());
     assert_eq!(controller.window(), cubic);
+    // quinn's default Cubic, not the node's factory: this checks the cap's
+    // pass-through, not the initial window (see
+    // `the_initial_window_is_thirty_two_datagrams_and_the_cap_still_lowers_it`).
     let fresh = CappedCubic::new(
         Arc::new(quinn::congestion::CubicConfig::default()).build(Instant::now(), MTU),
         QuicRateLimit::new(Some(1000), None),
@@ -123,7 +150,7 @@ fn with_no_limit_the_window_is_cubics() {
 /// loss left the window far above the start.
 #[test]
 fn cubic_does_not_grow_behind_the_cap_and_still_backs_off() {
-    let initial = Arc::new(quinn::congestion::CubicConfig::default())
+    let initial = Arc::new(CappedCubicFactory::default())
         .build(Instant::now(), MTU)
         .initial_window();
     let (_, uncapped) = after_a_transfer(QuicRateLimit::default());
@@ -172,6 +199,7 @@ fn with_a_limit_the_window_is_the_lower_of_cubics_and_the_rates() {
     // A limit far above what the path does leaves Cubic's window. (This
     // in-memory pair has a round trip of 0, where any rate gives the floor,
     // so the RTT is set here.)
+    // quinn's default Cubic, not the node's factory: only the cap is checked.
     let mut fast = CappedCubic::new(
         Arc::new(quinn::congestion::CubicConfig::default()).build(Instant::now(), MTU),
         QuicRateLimit::new(Some(usize::MAX / 2), None),
@@ -411,6 +439,39 @@ impl Drop for Link {
         unregister_address_network(&self.b_addr, &self.network);
         unregister_network_time_source(&self.network);
     }
+}
+
+/// A message of 32 KiB on a fresh connection over a 300 ms round trip
+/// arrives in one round trip of the initial window: it fits in
+/// [`INITIAL_WINDOW_DATAGRAMS`] datagrams, where quinn's 10 would take two
+/// more round trips (12 kB, then 24 kB). Freenet connections mostly carry
+/// small messages and quinn does not grow the window while the connection is
+/// application-limited, so this is the time most messages of this size take.
+///
+/// Measured from both ends having finished `establish` to `b` having read the
+/// whole message, on `VirtualTime` (deterministic, so no timing noise and no
+/// retry can move it). That includes quinn's pacing of the 22 datagrams after
+/// its first 10: 300 ms with 32 datagrams, 600 ms with 10. The bound, one
+/// round trip plus one one-way delay (450 ms), sits halfway between them.
+#[test]
+fn a_32_kib_message_on_a_fresh_connection_arrives_within_one_round_trip() {
+    bounded(|| async move {
+        const ONE_WAY_LONG: Duration = Duration::from_millis(150);
+        let link = Link::with(
+            "quic-cap-initial-window",
+            7,
+            [QuicRateLimit::default(), QuicRateLimit::default()],
+            None,
+            ONE_WAY_LONG,
+        )
+        .await;
+        let elapsed = link.send(32 * 1024, Duration::from_secs(60)).await;
+        let rtt = 2 * ONE_WAY_LONG;
+        assert!(
+            elapsed < rtt + ONE_WAY_LONG,
+            "{elapsed:?}: more than one round trip of sending plus the one-way delay"
+        );
+    })
 }
 
 /// A path under `bandwidth-limit` transfers at the limit, within 10%, on

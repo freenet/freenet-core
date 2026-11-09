@@ -83,8 +83,13 @@ impl Rig {
             let inbound = self.e.inbound.clone();
             inbound.send(queued).await.expect("deliver");
         }
+        // Fewer turns than `quic::tests::drive` takes between two moves of
+        // virtual time (64), so the clock moves at most about once during
+        // this wait, not several times. With 256 turns, once only long timers
+        // were armed (every byte already in flight at a close), each move was
+        // an idle-timeout jump and the run passed its 600 s limit inside it.
         let turns = async {
-            for _ in 0..256 {
+            for _ in 0..48 {
                 tokio::task::yield_now().await;
             }
         };

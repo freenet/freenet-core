@@ -2132,6 +2132,12 @@ impl Drop for DropFrom {
 /// How often the scripted peer runs (receives, sends, writes).
 const PEER_STEP: Duration = Duration::from_millis(20);
 
+/// A transfer still in flight 100 ms in, for the tests that cut the link
+/// mid-transfer. The round trip here is about one [`PEER_STEP`], so the window
+/// doubles every 20 ms from the initial 32 datagrams: 1 MiB would be done
+/// before the cut (38 + 77 + 154 + 307 + 614 kB in five round trips).
+const IN_FLIGHT_AT_THE_CUT: usize = 8 * 1024 * 1024;
+
 /// A real `QuicPath` (`a`, the client) connected to a peer `b` that is a
 /// quinn-proto endpoint driven by hand on the simulated network, so a test
 /// decides when `b` sends. `b` acknowledges what reaches it like any QUIC
@@ -2395,7 +2401,7 @@ fn packets_left_outstanding_when_the_peer_stops_acknowledging_close_the_path() {
         let network = "quic-path-ack-watch-partial";
         let mut s = Scripted::connect(network, 2).await;
         s.keep_sending();
-        s.a_sends(1024 * 1024);
+        s.a_sends(IN_FLIGHT_AT_THE_CUT);
         s.wait(Duration::from_millis(100)).await;
         let _cut = DropFrom::new(network, &[s.a_addr]);
         let cut_at = s.time.now_nanos();
@@ -2431,7 +2437,7 @@ fn recovery_from_an_outage_in_both_directions_does_not_close() {
         let network = "quic-path-ack-watch-outage";
         let mut s = Scripted::connect(network, 3).await;
         s.keep_sending();
-        s.a_sends(1024 * 1024);
+        s.a_sends(IN_FLIGHT_AT_THE_CUT);
         s.wait(Duration::from_millis(100)).await;
         // `a`'s packets are lost first, so after the outage `b` has nothing
         // new to acknowledge and `a`'s data waits for its probe timer.
