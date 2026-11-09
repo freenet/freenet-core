@@ -3090,6 +3090,11 @@ mod tests {
                  inside QUIC_CONNECTION_CHARGE_BYTES",
             ),
             (
+                "QUIC_CRYPTO_HOLD_BYTES",
+                "quinn's CRYPTO assembler worst case for ONE QUIC connection's \
+                 1-RTT space, derived; a term inside QUIC_CONNECTION_CHARGE_BYTES",
+            ),
+            (
                 "QUIC_CONNECTION_CHARGE_BYTES",
                 "the fixed charge per QUIC connection; summed as quic_connections x \
                  this by the buffer budget's aggregate-accounting step (#5940), \

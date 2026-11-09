@@ -1294,10 +1294,12 @@ snapshot except the two gauges.
   negative. Subtract only over windows much longer than 150 s (an hour or a
   day). The Step 2 gate, fallbacks per path-day excluding endpoint and
   restart causes, is then
-    (sum over c in idle, reset, protocol, downgrade_rx of
+    (sum over c in idle, reset, protocol, downgrade_rx, over_budget_rx of
        quic_fallback_<c> - quic_churned_fallback_<c>) / path-days,
   with endpoint_down and session_ended_rx left out entirely (session_ended_rx
-  is churn by definition). It is a lower bound on fallbacks where QUIC failed
+  is churn by definition). over_budget_rx is in the sum: it is a close that
+  counted as downgrade_rx before OVER_BUDGET existed (a peer's second trip
+  past the gap cap), and a release before the code counts it as reset. It is a lower bound on fallbacks where QUIC failed
   while UDP kept working: any session end within the window counts, including
   one that the QUIC failure itself caused.
   `quic_close_received_<label>`: one per QUIC connection quinn reports as closed
@@ -1377,7 +1379,9 @@ a test passes its own; tests read their own, never the global).
   recycle::SendAborts while the connection is open) and quic_path_ms (time QUIC
   paths were up, shadow ones included, added at each tick of the acknowledgement
   watch; the last tick to a path's end is not counted), whose ratio over a long
-  window is resets per connection-hour; quic_send_resets_reached_<64|512|2048|4096>
+  window is resets per connection-hour (a path whose acknowledgement watch is
+  off or panicked stops adding time but not resets, so the ratio errs high;
+  each is logged, at WARN and ERROR); quic_send_resets_reached_<64|512|2048|4096>
   and quic_send_resets_path_max (paths whose lifetime reset count reached each
   level in the period, and the highest count a reset in the period took a path
   to). They are for the fixed charge, which takes quinn's stopped map at
@@ -1932,7 +1936,7 @@ Sending (QuicPath::send_short_bounded / send_stream_bounded /
   on a closed connection) and closes the connection past
   recycle::SEND_ABORT_LIMIT (4096) with close code SEND_ABORT_LIMIT (M6).
   The fixed charge per connection (config::QUIC_CONNECTION_CHARGE_BYTES,
-  808 KiB) takes the map at that worst case, 4096 x QUIC_STOPPED_ENTRY_BYTES
+  840 KiB) takes the map at that worst case, 4096 x QUIC_STOPPED_ENTRY_BYTES
   (104 B, measured 88 B). Polling stopped() only after finish() would not
   avoid the entries: a writer blocked on connection credit must still race
   stopped() (below), so the poll stays on every wait and the common resets

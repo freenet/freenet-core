@@ -31,8 +31,9 @@
 //! - send-side packet records and the buffers behind sent data;
 //! - allocators other than jemalloc on linux-gnu (macOS and Windows builds
 //!   round differently);
-//! - CRYPTO-frame reassembly, quinn-proto's second assembler (its buffer is
-//!   [`QUIC_CRYPTO_BUFFER_BYTES`], charged at that limit);
+//! - CRYPTO-frame reassembly, quinn-proto's second assembler (its data limit
+//!   is [`QUIC_CRYPTO_BUFFER_BYTES`]; charged at the assembler's derived
+//!   worst case, [`QUIC_CRYPTO_HOLD_BYTES`]);
 //! - arrival orders other than a single gap at offset 0 of each stream.
 
 use std::sync::Arc;
@@ -298,7 +299,10 @@ pub(crate) const QUIC_ACK_TAIL_BYTES: usize = 240 * 1024;
 /// One open uni stream with one byte on it, both sides together: quinn's
 /// per-stream state on the sender and the receiver, and the receiver's reader
 /// (`quic::memory_tests::an_open_stream_measures_within_its_pin`, at
-/// `STREAMED_SEND_LIMIT` streams on one connection, jemalloc-rounded).
+/// `STREAMED_SEND_LIMIT` (48) streams on one connection, jemalloc-rounded;
+/// the fixed charge applies it to all `MAX_UNI_STREAMS` (64): measuring 64
+/// would wait for the warm-up stream's slot, which quinn returns only once
+/// more than an eighth of the limit is freed).
 /// Measured 988 B with quinn 0.11.12 / quinn-proto 0.11.19; the pin leaves
 /// about 15%. The measurement includes the simulation's timer queue entry for
 /// each stream's reader, which a production timer does not leave, so it
@@ -317,22 +321,34 @@ pub(crate) const QUIC_OPEN_STREAM_BYTES: usize = 1152;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const QUIC_STOPPED_ENTRY_BYTES: usize = 104;
 
-/// quinn-proto's CRYPTO-frame reassembly buffer per connection
-/// (`crypto_buffer_size`), a limit, not a measurement.
+/// quinn-proto's CRYPTO-frame data limit per packet space
+/// (`crypto_buffer_size`): the span of offsets it accepts past what was read,
+/// a data limit, not a memory bound (see [`QUIC_CRYPTO_HOLD_BYTES`]).
 pub(crate) const QUIC_CRYPTO_BUFFER_BYTES: usize = 16 * 1024;
 
-/// The fixed charge per QUIC connection, shadow paths included: every term of
-/// one connection's memory that does not scale with its windows, so the
-/// node-wide buffer budget ([`quic_buffer_budget_for`]) does not meter it.
+/// The memory quinn-proto's CRYPTO assembler can hold in one packet space,
+/// derived, not measured: [`QUIC_CRYPTO_BUFFER_BYTES`] of data, plus the
+/// over-allocation its assembler keeps before it defragments
+/// (quinn-proto 0.11.19 `connection/assembler.rs`, `Assembler::insert`:
+/// `max(32768, 1.5 x buffered)`, which is 32 KiB while buffered is at most
+/// 16 KiB). After the handshake only the 1-RTT space is live, so the charge
+/// takes one space; during the handshake up to three hold this each.
+pub(crate) const QUIC_CRYPTO_HOLD_BYTES: usize = QUIC_CRYPTO_BUFFER_BYTES + 32 * 1024;
+
+/// The fixed charge per QUIC connection, shadow paths included: the terms of
+/// one connection's memory that are fixed per connection rather than scaled
+/// with its windows, so the node-wide buffer budget
+/// ([`quic_buffer_budget_for`]) does not meter them. Terms that depend on
+/// traffic rate and time (the module doc's unmeasured list) are not in it.
 ///
 /// | Term | Bytes |
 /// |---|---|
 /// | idle connection state ([`QUIC_CONNECTION_FIXED_BYTES`]) | 65,536 |
 /// | [`MAX_UNI_STREAMS`] open streams x [`QUIC_OPEN_STREAM_BYTES`] | 73,728 |
-/// | CRYPTO reassembly ([`QUIC_CRYPTO_BUFFER_BYTES`]) | 16,384 |
+/// | CRYPTO reassembly, one space, derived ([`QUIC_CRYPTO_HOLD_BYTES`]) | 49,152 |
 /// | quinn's `stopped` map, `recycle::SEND_ABORT_LIMIT` x [`QUIC_STOPPED_ENTRY_BYTES`] | 425,984 |
 /// | ACK-only tail ([`QUIC_ACK_TAIL_BYTES`]) | 245,760 |
-/// | **total** | **827,392 (808 KiB)** |
+/// | **total** | **860,160 (840 KiB)** |
 ///
 /// The `stopped` map is charged at the limit's worst case. quinn adds an entry
 /// when a stream's `stopped()` is polled and removes it only when the peer
@@ -350,7 +366,7 @@ pub(crate) const QUIC_CRYPTO_BUFFER_BYTES: usize = 16 * 1024;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const QUIC_CONNECTION_CHARGE_BYTES: usize = QUIC_CONNECTION_FIXED_BYTES
     + MAX_UNI_STREAMS as usize * QUIC_OPEN_STREAM_BYTES
-    + QUIC_CRYPTO_BUFFER_BYTES
+    + QUIC_CRYPTO_HOLD_BYTES
     + super::recycle::SEND_ABORT_LIMIT as usize * QUIC_STOPPED_ENTRY_BYTES
     + QUIC_ACK_TAIL_BYTES;
 
