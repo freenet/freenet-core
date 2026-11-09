@@ -455,7 +455,8 @@ impl ContractSummary {
 /// Aggregated view of a single drained window, ready to log.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct WindowSummary {
-    /// Distinct contracts with at least one update attempt this window.
+    /// Distinct contracts with any propagation activity this window: an
+    /// update attempt, or any counted event (including receive-side `rx_*`).
     pub(crate) contracts: usize,
     /// Total update fan-out attempts across all contracts this window.
     pub(crate) updates: u64,

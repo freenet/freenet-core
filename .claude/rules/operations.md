@@ -602,8 +602,8 @@ state); `sent_delta` / `sent_full` (handed to the bridge); the skips
 `skip_empty_delta`, `skip_not_hosted`, `skip_no_address`, `skip_superseded`,
 `skip_evicted`; `send_failed`; transport `wire_short` (one packet),
 `wire_stream` and its fate `wire_stream_delivered` / `_failed` /
-`_egress_abandoned`, `wire_unobserved` (QUIC path), `wire_send_failed`; `fanout_event_dropped` /
-`heal_event_dropped` (`try_notify` refused); `heal_target` (a heal's leg,
+`_egress_abandoned`, `wire_unobserved` (QUIC path), `wire_send_failed`;
+`fanout_event_dropped` / `heal_event_dropped` (`try_notify` refused); `heal_target` (a heal's leg,
 registered when its peer resolves); and the receiver's `rx_dedup`,
 `rx_already_applied`, `rx_backoff`.
 
