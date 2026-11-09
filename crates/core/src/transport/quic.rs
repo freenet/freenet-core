@@ -37,6 +37,7 @@
 //! [`TimeSource`]: crate::simulation::TimeSource
 
 pub(crate) mod breaker;
+pub(crate) mod budget;
 pub(crate) mod cid;
 pub(crate) mod config;
 pub(crate) mod control;
@@ -224,6 +225,9 @@ pub(crate) struct EndpointCore {
     /// Empty hold records for the endpoint's cap; each connection gets a copy
     /// of its own (`socket::CapHolds`, `socket::with_poller_holds`).
     cap_holds: Arc<socket::CapHolds>,
+    /// The node's buffer budget, from which each data path's windows are set
+    /// (`budget`).
+    buffer_budget: Arc<budget::QuicBudget>,
     /// Test hooks that inject faults into quinn's drivers.
     #[cfg(any(test, feature = "testing"))]
     faults: Arc<socket::SocketFaults>,
@@ -428,6 +432,11 @@ fn require_unwinding(unwinds: bool) -> io::Result<()> {
 pub(crate) const UNWINDS: bool = cfg!(panic = "unwind");
 
 impl EndpointCore {
+    /// The node's buffer budget, which sets each data path's windows.
+    pub(crate) fn buffer_budget(&self) -> &Arc<budget::QuicBudget> {
+        &self.buffer_budget
+    }
+
     /// Connection pollers this endpoint's socket built outside
     /// `socket::with_poller_holds`: their cap holds go into a record nobody
     /// reads. Expected 0 (quinn 0.11.12 builds one elsewhere only on a
@@ -582,10 +591,16 @@ impl QuicEndpoint {
                     "the socket's QUIC ingress is already enabled",
                 )
             })??;
+        let buffer_budget = budget::QuicBudget::new(
+            config::quic_buffer_budget_for(settings.memory_limit) as u64,
+            settings.window_bytes(),
+            &super::TRANSPORT_METRICS.quic_data,
+        );
         tracing::info!(
             %local_addr,
-            window_bytes = settings.window_bytes(),
-            "QUIC endpoint built; its paths carry control frames only, application traffic stays on UDP"
+            floor_window_bytes = settings.window_bytes(),
+            buffer_budget_bytes = buffer_budget.total(),
+            "QUIC endpoint built; a data path's windows grow from the floor within the buffer budget"
         );
         Ok(Self {
             owner: Arc::new(EndpointOwner {
@@ -603,6 +618,7 @@ impl QuicEndpoint {
                 health: health.clone(),
                 // Set by the closure, which ran: `endpoint` is built.
                 cap_holds: cap_holds.expect("the QUIC socket's cap holds"),
+                buffer_budget,
                 #[cfg(any(test, feature = "testing"))]
                 faults: faults.unwrap_or_default(),
                 #[cfg(any(test, feature = "testing"))]

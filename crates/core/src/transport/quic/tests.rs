@@ -235,9 +235,9 @@ fn debug_field(debug: &str, name: &str) -> String {
 /// Settings with windows of [`MAX_WINDOW_BYTES`], so a 1 MiB stream fits.
 fn settings() -> QuicSettings {
     QuicSettings {
-        max_connections: 4,
         memory_limit: 1024 * 1024 * 1024,
         idle_timeout: None,
+        initial_window: None,
         rate_limit: Default::default(),
     }
 }
@@ -1642,6 +1642,7 @@ fn transport_config_pins_every_value() {
     // A simulation's short idle timeout replaces the clock's, on either clock.
     let short = QuicSettings {
         idle_timeout: Some(Duration::from_secs(7)),
+        initial_window: None,
         ..settings()
     };
     for shown in [
@@ -1821,9 +1822,9 @@ fn windows_never_exceed_the_reassembly_allowance() {
     for &memory_limit in &limits {
         for &max_connections in &connections {
             let settings = QuicSettings {
-                max_connections,
                 memory_limit,
                 idle_timeout: None,
+                initial_window: None,
                 rate_limit: Default::default(),
             };
             let window = settings.window_bytes();

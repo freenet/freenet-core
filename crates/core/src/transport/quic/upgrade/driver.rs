@@ -1071,6 +1071,7 @@ impl Session {
             limits,
             self.budget.clone(),
             self.data.clone(),
+            Some(self.hub.endpoint.buffer_budget()),
         );
         let pump = spawn_pump(
             attempt,
