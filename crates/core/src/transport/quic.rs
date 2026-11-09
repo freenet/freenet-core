@@ -44,6 +44,8 @@ pub(crate) mod error;
 pub(crate) mod framing;
 pub(crate) mod identity;
 pub(crate) mod liveness;
+#[cfg(feature = "quic-panic-injection")]
+pub(crate) mod panic_injection;
 pub(crate) mod path;
 pub(crate) mod recycle;
 pub(crate) mod runtime;
@@ -84,8 +86,8 @@ pub(crate) use liveness::QuicAvailabilityWatch;
 /// An unset key is [`QuicMode::default_mode`]: shadow on Linux and macOS, and
 /// off elsewhere. Windows stays off until the crash-loop breaker has been
 /// confirmed on a real Windows machine (#6031), and other platforms because the
-/// breaker reads no boot identity there and so cannot trip. That breaker counts short runs instead of
-/// detecting crashes ([`breaker`]). The default is decided when the value is
+/// breaker reads no boot identity there and so cannot trip. The Windows breaker counts short runs
+/// that panicked in QUIC code instead of detecting crashes ([`breaker`]). The default is decided when the value is
 /// read and never written to `config.toml`, so a later release can change it
 /// for every node that did not set the key, which is how a default-off
 /// release turns QUIC off. A value given with `--transport-quic` or
@@ -584,6 +586,8 @@ impl QuicEndpoint {
             window_bytes = settings.window_bytes(),
             "QUIC endpoint built; its paths carry control frames only, application traffic stays on UDP"
         );
+        #[cfg(feature = "quic-panic-injection")]
+        panic_injection::inject_from_env();
         Ok(Self {
             owner: Arc::new(EndpointOwner {
                 health: health.clone(),

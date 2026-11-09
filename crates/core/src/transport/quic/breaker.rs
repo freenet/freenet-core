@@ -9,14 +9,16 @@
 //! **This module doc describes unix.** Windows does not reliably tell a
 //! process that it is being stopped: every design that tried to tell a crash
 //! from a normal stop there (a logoff, a Fast Startup shutdown, a session end)
-//! got one of them wrong. So Windows does not ask. It counts runs that ended
-//! within ten minutes, for any reason, and three in a row, each starting
-//! within the cooldown of the one before, keep QUIC off for the same cooldown,
-//! with the same state and telemetry. [`short_runs`] describes it.
+//! got one of them wrong. So Windows does not ask how a run ended. A panic
+//! hook records a panic located in QUIC code (the failure this breaker is for
+//! always panics before it aborts), and runs that ended within ten minutes
+//! after recording one, three in a row, each starting within the cooldown of
+//! the one before, keep QUIC off for the same cooldown, with the same state
+//! and telemetry. [`short_runs`] describes it.
 //!
-//! **Windows is weaker than unix.** There, a crash loop whose runs each last
-//! ten minutes or more never trips, and neither does a fault that crashes once
-//! a day. That must be weighed before QUIC goes on by default on Windows. QUIC
+//! **Windows is weaker than unix.** There, a crash not preceded by a panic in
+//! QUIC code is not counted, a crash loop whose runs each last ten minutes or
+//! more never trips, and neither does a fault that crashes once a day. That must be weighed before QUIC goes on by default on Windows. QUIC
 //! stays off by default there until the breaker has been confirmed on a real
 //! Windows machine (#6031).
 //!
@@ -247,6 +249,11 @@ pub(crate) enum Marker {
         short_runs: u32,
         started_at_secs: u64,
         nonce: u64,
+        /// The run recorded a panic in QUIC code (quinn, quinn-proto or this
+        /// crate's QUIC transport) while it was still short. Only such a run
+        /// counts. Absent in a marker from an earlier release.
+        #[serde(default)]
+        quic_panicked: bool,
     },
     /// A state this binary does not know, written by a later release.
     #[serde(other)]
@@ -694,6 +701,7 @@ fn arm_when_ready_into(pending: &mut Pending, armed: &OnceLock<(PathBuf, u64)>) 
     if let Some((path, nonce)) = arm(pending.marker.take()) {
         if counts_short_runs {
             short_runs::start_clear_timer(registrar.as_ref(), path.clone(), nonce);
+            short_runs::record_quic_panics(path.clone(), nonce);
         }
         // One node per process in production; a second keeps the first.
         let _first_wins = armed.set((path, nonce));
@@ -1229,6 +1237,7 @@ mod tests {
             short_runs: 1,
             started_at_secs: T0,
             nonce: 7,
+            quic_panicked: false,
         };
         let pending = |path: &Path| Pending {
             marker: Some((path.to_path_buf(), marker.clone())),
@@ -1262,6 +1271,7 @@ mod tests {
             short_runs: 0,
             started_at_secs: T0,
             nonce: 7,
+            quic_panicked: false,
         };
         let pending = |marker: Option<Marker>, signals_ready| Pending {
             marker: marker.map(|marker| (path.clone(), marker)),
@@ -1302,6 +1312,7 @@ mod tests {
             short_runs: 1,
             started_at_secs: T0,
             nonce: 7,
+            quic_panicked: false,
         };
         let arm_now = |marker: Marker, registrar: Option<LateRegistrar>| {
             arm_when_ready(&mut Pending {
