@@ -30,6 +30,8 @@ const MARKER_FILE: &str = "quic-crash-breaker.json";
 const TRANSPORT_BOUND: &str = "UDP socket bound successfully";
 const QUIC_BUILT: &str = "QUIC endpoint built";
 const TRIP_WARN: &str = "Several runs in a row with QUIC enabled ended early";
+// Read only by the panic-injection tests below.
+#[cfg(feature = "quic-panic-injection")]
 const COOLING_WARN: &str = "QUIC stays off: several runs in a row with QUIC enabled ended early";
 /// What a run logs when its marker gets no timer, so it could never clear.
 const NO_TIMER_WARN: &str = "No task registrar";
