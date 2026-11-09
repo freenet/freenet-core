@@ -1197,12 +1197,11 @@ impl QuicPath {
         };
         let mut send = self.open(&header, &[], slot, pacing, progress).await?;
         #[cfg(feature = "bench")]
-        let piece_bytes = match super::config::lab::PIECE_BYTES
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            0 => FRAGMENT_PAYLOAD_SIZE,
-            n => n as usize,
-        };
+        let piece_bytes =
+            match super::config::lab::PIECE_BYTES.load(std::sync::atomic::Ordering::Relaxed) {
+                0 => FRAGMENT_PAYLOAD_SIZE,
+                n => n as usize,
+            };
         #[cfg(not(feature = "bench"))]
         let piece_bytes = FRAGMENT_PAYLOAD_SIZE;
         for piece in payload.chunks(piece_bytes) {

@@ -68,6 +68,8 @@ pub enum LabController {
     /// Cubic that ignores a loss with no queue building
     /// (`recycle::lab::DelayGated`).
     Gated,
+    /// A BBR-style model controller (`recycle::lab::Model`).
+    Model,
 }
 
 /// Choose the controller for connections built from now on.
@@ -79,6 +81,7 @@ pub fn set_controller(controller: LabController) {
         LabController::Veno => lab::VENO,
         LabController::Westwood => lab::WESTWOOD,
         LabController::Gated => lab::GATED,
+        LabController::Model => lab::MODEL,
     };
     lab::INNER_CONTROLLER.store(value, Ordering::Relaxed);
 }
@@ -97,9 +100,24 @@ pub fn set_connection_gap(_window: Option<Duration>) {}
 /// thousandths above which every loss counts.
 pub fn set_gate(delay_permille: u64, min_delay_us: u64, loss_ceil_permille: u64) {
     use super::recycle::lab;
+    lab::GATE_USE_SRTT.store(
+        std::env::var("LAB_GATE_SRTT").as_deref() == Ok("1"),
+        Ordering::Relaxed,
+    );
+    if let Ok(v) = std::env::var("LAB_MODEL_LOSS_PERMILLE") {
+        lab::MODEL_LOSS_PERMILLE.store(v.parse().expect("a number"), Ordering::Relaxed);
+    }
     lab::GATE_DELAY_PERMILLE.store(delay_permille, Ordering::Relaxed);
     lab::GATE_MIN_DELAY_US.store(min_delay_us, Ordering::Relaxed);
     lab::GATE_LOSS_CEIL_PERMILLE.store(loss_ceil_permille, Ordering::Relaxed);
+}
+
+/// [`LabController::Gated`]'s decisions since the last call, reset:
+/// passed for persistent congestion, for the loss share, for the queue;
+/// ignored.
+pub fn take_gate_counts() -> [u64; 4] {
+    let counts = &super::recycle::lab::GATE_COUNTS;
+    std::array::from_fn(|i| counts[i].swap(0, Ordering::Relaxed))
 }
 
 /// The datagram size for endpoints built from now on (both ends must agree,

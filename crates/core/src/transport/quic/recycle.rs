@@ -291,6 +291,17 @@ impl ControllerFactory for CappedCubicFactory {
                     current_mtu,
                 ));
             }
+            lab::MODEL => {
+                return Box::new(CappedCubic::new(
+                    Box::new(lab::Model::new(
+                        now,
+                        current_mtu,
+                        this.cubic.clone().build(now, current_mtu).initial_window(),
+                    )),
+                    this.rate.clone(),
+                    current_mtu,
+                ));
+            }
             lab::GATED => {
                 return Box::new(CappedCubic::new(
                     Box::new(lab::DelayGated::new(
@@ -343,6 +354,259 @@ pub(crate) mod lab {
     pub(crate) const WESTWOOD: u8 = 3;
     /// Cubic inside [`DelayGated`].
     pub(crate) const GATED: u8 = 4;
+    /// [`Model`], no Cubic.
+    pub(crate) const MODEL: u8 = 5;
+
+    /// [`Model`]: a round whose share of bytes lost is at least this many
+    /// thousandths counts as congested (BBRv2 and v3 use 20, 2%).
+    pub(crate) static MODEL_LOSS_PERMILLE: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(150);
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Mode {
+        Startup,
+        Drain,
+        ProbeBw,
+    }
+
+    /// Lab prototype of a model-based controller in the manner of BBRv2/v3,
+    /// sized for quinn's window-driven pacer.
+    ///
+    /// - Bandwidth: one delivery-rate sample per round (bytes acknowledged
+    ///   over at least one minimum RTT), max over the last 10 rounds.
+    /// - Minimum RTT: min of `now - sent` over 10 s.
+    /// - Window: gain x bandwidth x minimum RTT, at least 4 datagrams. quinn
+    ///   paces at 1.25 x window / srtt, so a gain of 1 paces at about 1.25 x
+    ///   the estimate while no queue has built.
+    /// - Startup doubles each round (gain 2) until the estimate grows by less
+    ///   than 25% for 3 rounds, or a round is congested; Drain then runs one
+    ///   round at gain 0.75; ProbeBw cycles 1.25, 0.75, then 1 for 6 rounds.
+    /// - Loss: random loss below [`MODEL_LOSS_PERMILLE`] per round is not a
+    ///   signal. A congested round caps the window at 0.7 x what was in flight
+    ///   (`inflight_hi`); each round in ProbeBw's up phase without congestion
+    ///   raises the cap by a quarter, and it is dropped once it is above the
+    ///   model's window. Persistent congestion resets to 4 datagrams.
+    pub(crate) struct Model {
+        mtu: u16,
+        mode: Mode,
+        min_rtt: Option<Duration>,
+        min_rtt_at: Instant,
+        bw_samples: std::collections::VecDeque<f64>,
+        round_start: Instant,
+        round_acked: u64,
+        round_lost: u64,
+        in_flight: u64,
+        full_bw: f64,
+        full_bw_rounds: u32,
+        cycle: usize,
+        inflight_hi: Option<u64>,
+        initial: u64,
+        congested_round: bool,
+    }
+
+    const PROBE_GAINS: [f64; 8] = [1.25, 0.75, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
+
+    impl Model {
+        pub(crate) fn new(now: Instant, mtu: u16, initial: u64) -> Self {
+            Self {
+                mtu,
+                mode: Mode::Startup,
+                min_rtt: None,
+                min_rtt_at: now,
+                bw_samples: Default::default(),
+                round_start: now,
+                round_acked: 0,
+                round_lost: 0,
+                in_flight: 0,
+                full_bw: 0.0,
+                full_bw_rounds: 0,
+                cycle: 0,
+                inflight_hi: None,
+                initial,
+                congested_round: false,
+            }
+        }
+
+        fn bw(&self) -> f64 {
+            self.bw_samples.iter().copied().fold(0.0, f64::max)
+        }
+
+        fn gain(&self) -> f64 {
+            match self.mode {
+                Mode::Startup => 2.0,
+                Mode::Drain => 0.75,
+                Mode::ProbeBw => PROBE_GAINS[self.cycle % PROBE_GAINS.len()],
+            }
+        }
+
+        fn end_round(&mut self, now: Instant, span: Duration, app_limited: bool) {
+            let total = self.round_acked + self.round_lost;
+            let share = if total > 0 {
+                self.round_lost as f64 / total as f64
+            } else {
+                0.0
+            };
+            let congested = share * 1000.0
+                >= MODEL_LOSS_PERMILLE.load(std::sync::atomic::Ordering::Relaxed) as f64
+                && self.round_lost > 0;
+            if !app_limited && span > Duration::ZERO {
+                let rate = self.round_acked as f64 / span.as_secs_f64();
+                // An app-limited round may only raise the estimate.
+                self.bw_samples.push_back(rate);
+                if self.bw_samples.len() > 10 {
+                    self.bw_samples.pop_front();
+                }
+            }
+            if congested {
+                let hi = (self.in_flight.max(self.round_acked) as f64 * 0.7) as u64;
+                self.inflight_hi = Some(hi.max(4 * u64::from(self.mtu)));
+            }
+            match self.mode {
+                Mode::Startup => {
+                    let bw = self.bw();
+                    if bw >= self.full_bw * 1.25 {
+                        self.full_bw = bw;
+                        self.full_bw_rounds = 0;
+                    } else {
+                        self.full_bw_rounds += 1;
+                    }
+                    if self.full_bw_rounds >= 3 || congested {
+                        self.mode = Mode::Drain;
+                    }
+                }
+                Mode::Drain => {
+                    self.mode = Mode::ProbeBw;
+                    self.cycle = 2;
+                }
+                Mode::ProbeBw => {
+                    if PROBE_GAINS[self.cycle % PROBE_GAINS.len()] > 1.0 && !congested {
+                        if let Some(hi) = self.inflight_hi {
+                            let hi = hi + hi / 4;
+                            self.inflight_hi = (hi < self.model_window()).then_some(hi);
+                        }
+                    }
+                    self.cycle += 1;
+                }
+            }
+            self.congested_round = congested;
+            self.round_start = now;
+            self.round_acked = 0;
+            self.round_lost = 0;
+        }
+
+        fn model_window(&self) -> u64 {
+            let floor = 4 * u64::from(self.mtu);
+            match self.min_rtt {
+                Some(min) if self.bw() > 0.0 => {
+                    ((self.gain() * self.bw() * min.as_secs_f64()) as u64).max(floor)
+                }
+                _ => self.initial.max(floor),
+            }
+        }
+    }
+
+    impl Controller for Model {
+        fn on_sent(&mut self, _now: Instant, bytes: u64, _last_packet_number: u64) {
+            self.in_flight += bytes;
+        }
+
+        fn on_ack(
+            &mut self,
+            now: Instant,
+            sent: Instant,
+            bytes: u64,
+            app_limited: bool,
+            _rtt: &quinn_proto::RttEstimator,
+        ) {
+            self.in_flight = self.in_flight.saturating_sub(bytes);
+            let sample = now.saturating_duration_since(sent);
+            let stale = now.saturating_duration_since(self.min_rtt_at) > Duration::from_secs(10);
+            if self.min_rtt.is_none_or(|m| sample <= m) || stale {
+                self.min_rtt = Some(sample);
+                self.min_rtt_at = now;
+            }
+            self.round_acked += bytes;
+            let span = now.saturating_duration_since(self.round_start);
+            if span >= self.min_rtt.unwrap_or(sample).max(Duration::from_millis(5)) {
+                self.end_round(now, span, app_limited);
+            }
+        }
+
+        fn on_end_acks(
+            &mut self,
+            _now: Instant,
+            in_flight: u64,
+            _app_limited: bool,
+            _largest_packet_num_acked: Option<u64>,
+        ) {
+            self.in_flight = in_flight;
+        }
+
+        fn on_congestion_event(
+            &mut self,
+            _now: Instant,
+            _sent: Instant,
+            is_persistent_congestion: bool,
+            lost_bytes: u64,
+        ) {
+            self.round_lost += lost_bytes;
+            if is_persistent_congestion {
+                // Start over from the initial window, as Cubic would from
+                // its minimum: the path may have changed.
+                self.bw_samples.clear();
+                self.inflight_hi = None;
+                self.mode = Mode::Startup;
+                self.full_bw = 0.0;
+                self.full_bw_rounds = 0;
+            }
+        }
+
+        fn on_mtu_update(&mut self, new_mtu: u16) {
+            self.mtu = new_mtu;
+        }
+
+        fn window(&self) -> u64 {
+            let model = self.model_window();
+            match self.inflight_hi {
+                Some(hi) => model.min(hi),
+                None => model,
+            }
+        }
+
+        fn metrics(&self) -> ControllerMetrics {
+            let mut metrics = ControllerMetrics::default();
+            metrics.congestion_window = self.window();
+            metrics
+        }
+
+        fn clone_box(&self) -> Box<dyn Controller> {
+            Box::new(Self {
+                mtu: self.mtu,
+                mode: self.mode,
+                min_rtt: self.min_rtt,
+                min_rtt_at: self.min_rtt_at,
+                bw_samples: self.bw_samples.clone(),
+                round_start: self.round_start,
+                round_acked: self.round_acked,
+                round_lost: self.round_lost,
+                in_flight: self.in_flight,
+                full_bw: self.full_bw,
+                full_bw_rounds: self.full_bw_rounds,
+                cycle: self.cycle,
+                inflight_hi: self.inflight_hi,
+                initial: self.initial,
+                congested_round: self.congested_round,
+            })
+        }
+
+        fn initial_window(&self) -> u64 {
+            self.initial
+        }
+
+        fn into_any(self: Box<Self>) -> Box<dyn Any> {
+            self
+        }
+    }
 
     /// [`DelayGated`]: a loss is taken as congestion when the smoothed RTT is
     /// at least this many thousandths of the minimum RTT above it...
@@ -353,8 +617,18 @@ pub(crate) mod lab {
         std::sync::atomic::AtomicU64::new(2_000);
     /// ...or when the share of bytes lost over the last round trip is at
     /// least this many thousandths.
+    /// Judge the queue on the smoothed RTT (the first version) instead of
+    /// the minimum sample over the last two rounds.
+    pub(crate) static GATE_USE_SRTT: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
     pub(crate) static GATE_LOSS_CEIL_PERMILLE: std::sync::atomic::AtomicU64 =
-        std::sync::atomic::AtomicU64::new(200);
+        std::sync::atomic::AtomicU64::new(250);
+
+    /// [`DelayGated`] decisions across every connection, for the lab's
+    /// reports: passed for persistent congestion, for the round's loss
+    /// share, for the queue delay; ignored.
+    pub static GATE_COUNTS: [std::sync::atomic::AtomicU64; 4] =
+        [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
     /// Lab prototype: Cubic that ignores a loss when no queue is building.
     ///
@@ -369,6 +643,11 @@ pub(crate) mod lab {
         inner: Box<dyn Controller>,
         min_rtt: Option<Duration>,
         srtt: Option<Duration>,
+        /// The smallest RTT sample in this round and in the last one. Jitter
+        /// only adds delay, so the minimum over a round filters it, while a
+        /// standing queue raises every sample, the minimum too.
+        round_min: Option<Duration>,
+        last_round_min: Option<Duration>,
         round_start: Option<Instant>,
         round_acked: u64,
         round_lost: u64,
@@ -384,6 +663,8 @@ pub(crate) mod lab {
                 inner,
                 min_rtt: None,
                 srtt: None,
+                round_min: None,
+                last_round_min: None,
                 round_start: None,
                 round_acked: 0,
                 round_lost: 0,
@@ -398,37 +679,51 @@ pub(crate) mod lab {
             match self.round_start {
                 Some(start) if now.saturating_duration_since(start) < round => {}
                 _ => {
+                    // A smoothed share (1/4 new) from rounds of at least 16
+                    // datagrams: a small window's share is too noisy to
+                    // read congestion from (2 lost of 8 is 25%).
                     let total = self.round_acked + self.round_lost;
-                    if total > 0 {
-                        self.last_round_share = self.round_lost as f64 / total as f64;
+                    if total >= 16 * 1200 {
+                        let share = self.round_lost as f64 / total as f64;
+                        self.last_round_share = 0.75 * self.last_round_share + 0.25 * share;
                     }
                     self.round_start = Some(now);
                     self.round_acked = 0;
                     self.round_lost = 0;
+                    if self.round_min.is_some() {
+                        self.last_round_min = self.round_min.take();
+                    }
                 }
             }
         }
 
-        fn congested(&self) -> bool {
-            let share = {
-                let total = self.round_acked + self.round_lost;
-                let now_share = if total > 0 {
-                    self.round_lost as f64 / total as f64
-                } else {
-                    0.0
-                };
-                now_share.max(self.last_round_share)
-            };
-            if share * 1000.0 >= GATE_LOSS_CEIL_PERMILLE.load(std::sync::atomic::Ordering::Relaxed) as f64 {
-                return true;
+        /// 1 for the loss share, 2 for the queue, 0 for neither.
+        fn congested(&self) -> usize {
+            let share = self.last_round_share;
+            if share * 1000.0
+                >= GATE_LOSS_CEIL_PERMILLE.load(std::sync::atomic::Ordering::Relaxed) as f64
+            {
+                return 1;
             }
-            let (Some(srtt), Some(min)) = (self.srtt, self.min_rtt) else {
-                return true;
+            let recent = match (self.round_min, self.last_round_min) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+            let recent = if GATE_USE_SRTT.load(std::sync::atomic::Ordering::Relaxed) {
+                self.srtt
+            } else {
+                recent
+            };
+            let (Some(srtt), Some(min)) = (recent, self.min_rtt) else {
+                return 2;
             };
             let queue = srtt.saturating_sub(min);
-            let rel = min.mul_f64(GATE_DELAY_PERMILLE.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0);
-            let abs = Duration::from_micros(GATE_MIN_DELAY_US.load(std::sync::atomic::Ordering::Relaxed));
-            queue >= rel.max(abs)
+            let rel = min.mul_f64(
+                GATE_DELAY_PERMILLE.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0,
+            );
+            let abs =
+                Duration::from_micros(GATE_MIN_DELAY_US.load(std::sync::atomic::Ordering::Relaxed));
+            if queue >= rel.max(abs) { 2 } else { 0 }
         }
     }
 
@@ -449,6 +744,7 @@ pub(crate) mod lab {
             self.min_rtt = Some(self.min_rtt.map_or(sample, |m| m.min(sample)));
             self.srtt = Some(rtt.get());
             self.roll(now);
+            self.round_min = Some(self.round_min.map_or(sample, |m| m.min(sample)));
             self.round_acked += bytes;
             self.inner.on_ack(now, sent, bytes, app_limited, rtt);
         }
@@ -473,7 +769,20 @@ pub(crate) mod lab {
         ) {
             self.roll(now);
             self.round_lost += lost_bytes;
-            if is_persistent_congestion || self.congested() {
+            let why = if is_persistent_congestion {
+                0
+            } else {
+                self.congested()
+            };
+            let reason = if is_persistent_congestion {
+                0
+            } else if why == 0 {
+                3
+            } else {
+                why
+            };
+            GATE_COUNTS[reason].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if reason != 3 {
                 self.passed += 1;
                 self.inner
                     .on_congestion_event(now, sent, is_persistent_congestion, lost_bytes);
@@ -499,6 +808,8 @@ pub(crate) mod lab {
                 inner: self.inner.clone_box(),
                 min_rtt: self.min_rtt,
                 srtt: self.srtt,
+                round_min: self.round_min,
+                last_round_min: self.last_round_min,
                 round_start: self.round_start,
                 round_acked: self.round_acked,
                 round_lost: self.round_lost,

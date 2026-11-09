@@ -35,8 +35,8 @@ use freenet::transport::quic_lab::set_connection_gap;
 use freenet::transport::quic_lab::{
     Competitor, ConnSample, FRAGMENT_BYTES, LabConfig, LabController, LabMany, LabPair, LabSocket,
     LinkSpec, StreamsRun, link_counts, link_report, set_controller, set_gap_on_connection_progress,
-    set_gate, set_initial_window, set_min_window, set_mtu, set_piece_bytes, set_rate_start, set_send_window,
-    shape_port,
+    set_gate, set_initial_window, set_min_window, set_mtu, set_piece_bytes, set_rate_start,
+    set_send_window, shape_port,
 };
 use freenet::transport::{TRANSPORT_METRICS, TransportKeypair, create_connection_handler};
 use tokio::sync::mpsc;
@@ -323,7 +323,7 @@ fn apply_start_knobs() -> String {
     let gate = (
         env_or("LAB_GATE_DELAY_PERMILLE", 100u64),
         env_or("LAB_GATE_MIN_DELAY_US", 2000u64),
-        env_or("LAB_GATE_LOSS_CEIL_PERMILLE", 200u64),
+        env_or("LAB_GATE_LOSS_CEIL_PERMILLE", 250u64),
     );
     set_gate(gate.0, gate.1, gate.2);
     format!(
@@ -378,9 +378,10 @@ async fn udp_pair(
     .await
     .expect("bind a");
     let connecting = a_out.connect(b_pub, SocketAddr::new(host, b_port)).await;
-    let (a_conn, b_conn) = tokio::time::timeout(Duration::from_secs(15), async {
-        tokio::join!(connecting, b_in.next_connection())
-    })
+    let (a_conn, b_conn) = tokio::time::timeout(
+        Duration::from_secs(env_or("LAB_UDP_CONNECT_S", 15)),
+        async { tokio::join!(connecting, b_in.next_connection()) },
+    )
     .await
     .expect("connect within 15 s");
     let (mut a_conn, mut b_conn) = (a_conn.expect("a"), b_conn.expect("b accepts"));
@@ -657,6 +658,7 @@ fn quic_lab_loss() {
         "veno" => LabController::Veno,
         "westwood" => LabController::Westwood,
         "gated" => LabController::Gated,
+        "model" => LabController::Model,
         other => panic!("unknown controller {other}"),
     });
     let knobs = apply_start_knobs();
@@ -983,6 +985,7 @@ fn quic_lab_many() {
         "veno" => LabController::Veno,
         "westwood" => LabController::Westwood,
         "gated" => LabController::Gated,
+        "model" => LabController::Model,
         other => panic!("unknown controller {other}"),
     });
     let knobs = apply_start_knobs();
@@ -1219,6 +1222,7 @@ fn quic_lab_mix() {
         "veno" => LabController::Veno,
         "westwood" => LabController::Westwood,
         "gated" => LabController::Gated,
+        "model" => LabController::Model,
         other => panic!("unknown controller {other}"),
     });
     let gap_rule = std::env::var("LAB_GAP").unwrap_or_else(|_| "stream".into());
@@ -1413,6 +1417,7 @@ fn quic_lab_cold() {
         "veno" => LabController::Veno,
         "westwood" => LabController::Westwood,
         "gated" => LabController::Gated,
+        "model" => LabController::Model,
         other => panic!("unknown controller {other}"),
     });
     let knobs = apply_start_knobs();
@@ -1455,21 +1460,25 @@ fn quic_lab_cold() {
                                 other => panic!("unknown mode {other}"),
                             }
                             let cwnd_before = pair.cwnd();
+                            freenet::transport::quic_lab::take_gate_counts();
                             // A snapshot resets the counters, so the next is this transfer's.
                             ingress_drops();
                             let cpu0 = process_cpu();
                             let result = pair.transfer_timed(bytes, limit).await;
                             let cpu = process_cpu() - cpu0;
+                            let gate = freenet::transport::quic_lab::take_gate_counts();
                             let (src, queue) = ingress_drops();
                             let drops = format!(
                                 "ingress_source_full={src} ingress_queue_full={queue} \
+                                 gate_persist={} gate_share={} gate_queue={} gate_ignored={} \
                                  cpu_ns_per_byte={:.1}",
+                                gate[0],
+                                gate[1],
+                                gate[2],
+                                gate[3],
                                 cpu.as_nanos() as f64 / bytes as f64
                             );
-                            let link = pair
-                                .sender_port()
-                                .and_then(link_report)
-                                .unwrap_or_default();
+                            let link = pair.sender_port().and_then(link_report).unwrap_or_default();
                             match result {
                                 Ok((arrived, done)) => format!(
                                     "ok=1 arrival_s={:.3} sent_s={:.3} cwnd_before={cwnd_before} \
@@ -1479,7 +1488,7 @@ fn quic_lab_cold() {
                                     pair.describe()
                                 ),
                                 Err(e) => format!(
-                                    "ok=0 failure={e:?} cwnd_before={cwnd_before} {} \
+                                    "ok=0 failure={e:?} cwnd_before={cwnd_before} {drops} {} \
                                      sender_link[{link}]",
                                     pair.describe()
                                 ),
@@ -1583,6 +1592,7 @@ fn quic_lab_burst() {
         "veno" => LabController::Veno,
         "westwood" => LabController::Westwood,
         "gated" => LabController::Gated,
+        "model" => LabController::Model,
         other => panic!("unknown controller {other}"),
     });
     let knobs = apply_start_knobs();
