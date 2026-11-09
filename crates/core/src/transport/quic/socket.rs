@@ -450,6 +450,7 @@ impl<S: Socket> QuicSocket<S> {
     /// Run `call` with a panic in it caught: reported, and turned into an
     /// I/O error (see the module docs).
     fn caught<R>(&self, call: &'static str, f: impl FnOnce() -> io::Result<R>) -> io::Result<R> {
+        let _quic = super::breaker::QuicCode::enter();
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
             Ok(result) => result,
             Err(payload) => {
@@ -591,6 +592,7 @@ impl<S: Socket> AsyncUdpSocket for QuicSocket<S> {
         if self.health.has_adapter_panicked() {
             return Poll::Ready(Err(adapter_panicked_error()));
         }
+        let _quic = super::breaker::QuicCode::enter();
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.receive_one(cx, bufs, meta)
         })) {
@@ -821,6 +823,7 @@ impl<S: Socket> UdpPoller for QuicPoller<S> {
         if socket.health.has_adapter_panicked() {
             return Poll::Ready(Err(adapter_panicked_error()));
         }
+        let _quic = super::breaker::QuicCode::enter();
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| this.poll_ready(cx))) {
             Ok(polled) => polled,
             Err(payload) => {

@@ -2637,9 +2637,8 @@ pub struct NetworkArgs {
     /// On unix, if a run with QUIC enabled ends abnormally, the node starts
     /// with QUIC off for 24 hours. On Windows the same happens after three
     /// short runs in a row that each panicked in QUIC code. Set this to run
-    /// QUIC anyway. A
-    /// start with this set erases the trip: removing it later does not bring
-    /// the 24 hours back. Default: false.
+    /// QUIC anyway. A start with this set erases the trip: removing it later
+    /// does not bring the 24 hours back. Default: false.
     ///
     /// Works as a bare flag after the subcommand: `--quic-ignore-crash-breaker`
     /// turns it on, `--quic-ignore-crash-breaker=false` turns it off. Before

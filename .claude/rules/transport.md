@@ -2483,8 +2483,11 @@ Liveness ("alive" = the endpoint driver has not ENDED; it does not mean
     and recorded one, so the fourth start after three such aborts in a row
     trips it. An ordinary stop records no panic and never counts; an abort
     after 10 minutes or more never does, nor do aborts a day apart
-    (quic/breaker/short_runs.rs). The hook is process-global: tests that
-    install it run in a child process.
+    (quic/breaker/short_runs.rs). A panic counts as QUIC's when the thread
+    is inside a QuicCode guard (quinn's driver polls in runtime.rs, the socket
+    adapter's catch_unwind calls) or, failing that, by location. The hook is
+    process-global: only a child-process test installs it (the arming tests
+    pass a no-op installer).
   → When the node drops its last handle, the availability is Released
     (final; the first final state stored wins, so a release and a
     driver return racing never overwrite each other) and the driver's

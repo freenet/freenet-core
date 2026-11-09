@@ -1,10 +1,12 @@
-//! Test builds only (the `quic-panic-injection` feature, never enabled in a
-//! release): inject a panic in QUIC code from the environment, so the Windows
+//! Test builds only (the `quic-panic-injection` feature, which refuses to
+//! build without debug assertions, so a release build cannot carry it):
+//! inject a panic in QUIC code from the environment, so the Windows
 //! crash-loop breaker (`breaker/short_runs.rs`, #6031) can be exercised
-//! through the real binary.
+//! through the real binary. Compiled in unit tests too, for its parser.
 //!
-//! `FREENET_TEST_QUIC_PANIC` is `<mode>:<seconds>`, read once when the QUIC
-//! endpoint is built; `<seconds>` later a thread in this file panics:
+//! `FREENET_TEST_QUIC_PANIC` is `<mode>:<seconds>`, read once when the
+//! breaker's marker is armed (so on Windows the panic hook is already in
+//! place); `<seconds>` later a thread in this file panics:
 //!
 //! - `caught`: a plain panic that ends only its thread, as a panic contained
 //!   by the socket adapter would.
@@ -14,7 +16,14 @@
 
 use std::time::Duration;
 
-/// The variable read at endpoint build.
+#[cfg(all(feature = "quic-panic-injection", not(debug_assertions)))]
+compile_error!(
+    "`quic-panic-injection` is for test builds only and needs debug assertions; \
+     a release build must not be able to inject a panic"
+);
+
+/// The variable read when the marker is armed.
+#[cfg(feature = "quic-panic-injection")]
 pub(crate) const ENV: &str = "FREENET_TEST_QUIC_PANIC";
 
 /// What [`ENV`] asks for.
@@ -35,6 +44,7 @@ fn parse(value: &str) -> Option<Injection> {
 }
 
 /// Start the injection [`ENV`] asks for, if any.
+#[cfg(feature = "quic-panic-injection")]
 pub(crate) fn inject_from_env() {
     let Some(injection) = std::env::var(ENV).ok().as_deref().and_then(parse) else {
         return;

@@ -43,7 +43,9 @@
 //!   a test would have to send the console event, which can reach the runner.
 //! - **Marked** by the panic hook on the first panic attributed to QUIC code,
 //!   but only while the marker is still this run's: after [`SHORT_RUN`] the
-//!   timer has removed it, so a later panic cannot make an old run count.
+//!   timer has removed it, so a later panic finds nothing to mark. The timer
+//!   and the clean exit announce the removal first ([`note_marker_cleared`]),
+//!   so a panic racing them takes its mark back out.
 //! - **Still there at the next start** means the last run lasted less than
 //!   [`SHORT_RUN`] and did not reach a clean exit. [`decide`] counts it if it
 //!   recorded a QUIC panic and started less than the cooldown ago.
@@ -52,7 +54,10 @@
 //!
 //! Process-global, installed once, when the first Windows marker is written.
 //! It calls the hook that was installed before it, so the default panic output
-//! (or any other hook) still runs. It does no logging and takes no lock: it
+//! (or any other hook) still runs. A panic counts as QUIC's if the thread is
+//! inside a [`QuicCode`] guard (quinn's driver polls and the socket adapter's
+//! calls, so a panic in a dependency they call counts), or failing that, if
+//! its location is in QUIC code ([`quic_attributed`]). It does no logging and takes no lock: it
 //! may run on a thread that holds one. It counts every attributed panic, a
 //! caught one included (the socket adapter catches its own panics and turns
 //! QUIC off for the run, #6027): a fault that recurs at every start is what
@@ -127,7 +132,9 @@
 //!   not clear it, followed by this release again within the cooldown, reads
 //!   it as one short run.
 //! - **Known missed trips**: a crash not preceded by a panic attributed to QUIC
-//!   code; a panic whose mark could not be written; a crash loop whose runs
+//!   code (a stack overflow, an out-of-memory abort, an access violation, or
+//!   a panic in a dependency on a thread outside the guarded calls, such as a
+//!   task this crate spawns that calls into `bytes`); a panic whose mark could not be written; a crash loop whose runs
 //!   each last [`SHORT_RUN`] or more never trips; a fault that crashes once per cooldown or less often
 //!   never trips, because the gap resets the count; a crash before the marker
 //!   is written is not counted; a crash in a run whose marker could not be
@@ -340,6 +347,7 @@ async fn clear_after_short_run(time: &impl TimeSource, path: PathBuf, nonce: u64
     for attempt in 1..=CLEAR_ATTEMPTS {
         time.sleep(SHORT_RUN).await;
         let target = path.clone();
+        note_marker_cleared();
         // The disk can be slow on Windows; this task must not hold a worker.
         let outcome = tokio::task::spawn_blocking(move || clear_if_owned(&target, nonce)).await;
         match outcome {
@@ -366,14 +374,61 @@ async fn clear_after_short_run(time: &impl TimeSource, path: PathBuf, nonce: u64
 }
 
 /// Whether a panic at `file` (a panic location's path) is in QUIC code: quinn
-/// or quinn-proto (any crate whose directory starts `quinn-`, as cargo names
-/// a registry or vendored crate), or this crate's QUIC transport. Paths use
-/// either separator, since a Windows build reports backslashes.
+/// or quinn-proto (a crate directory named `quinn` or `quinn-proto`, or
+/// starting `quinn-`, as cargo names a registry or versioned vendored crate),
+/// or this crate's QUIC transport. Paths use either separator, since a Windows
+/// build reports backslashes. The fallback to [`QuicCode`]: a panic in
+/// QUIC code on a thread that is not inside a guarded call.
 pub(super) fn quic_attributed(file: &str) -> bool {
     let file = file.replace('\\', "/");
-    file.split('/').any(|part| part.starts_with("quinn-"))
+    file.split('/')
+        .any(|part| part == "quinn" || part == "quinn-proto" || part.starts_with("quinn-"))
         || file.contains("src/transport/quic/")
         || file.ends_with("src/transport/quic.rs")
+}
+
+thread_local! {
+    /// How many [`QuicCode`] guards this thread is inside.
+    static IN_QUIC_CODE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// While alive, a panic on this thread counts as a panic in QUIC code,
+/// wherever it is located: inside quinn's driver polls (`runtime.rs`) and the
+/// socket adapter's calls (`socket.rs`), a panic in a dependency they call
+/// (`bytes`, `tokio`, `rustls`, the egress cap) is the same QUIC fault. The
+/// count is restored on drop, which during an unwind runs after the hook.
+pub(crate) struct QuicCode(());
+
+impl QuicCode {
+    pub(crate) fn enter() -> Self {
+        IN_QUIC_CODE.with(|depth| depth.set(depth.get().saturating_add(1)));
+        Self(())
+    }
+}
+
+impl Drop for QuicCode {
+    fn drop(&mut self) {
+        IN_QUIC_CODE.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
+/// Whether this thread is inside a [`QuicCode`] guard. `false` if the
+/// thread-local is gone (a panic during thread teardown).
+fn in_quic_code() -> bool {
+    IN_QUIC_CODE
+        .try_with(|depth| depth.get() > 0)
+        .unwrap_or(false)
+}
+
+/// Set by a clean exit or the short-run timer before it removes the marker,
+/// so a panic racing it cannot write the marker back
+/// ([`record_quic_panic_at`]).
+static MARKER_CLEARED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Called before this run's marker is removed on purpose (the short-run
+/// timer, a clean exit).
+pub(super) fn note_marker_cleared() {
+    MARKER_CLEARED.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// Mark the marker at `path` as having recorded a QUIC panic, if it is still
@@ -418,15 +473,20 @@ pub(super) fn record_quic_panics(path: PathBuf, nonce: u64) {
     HOOK_INSTALLED.call_once(|| {
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
-            on_panic(info.location().map(|location| location.file()));
+            on_panic(
+                info.location().map(|location| location.file()),
+                in_quic_code(),
+            );
             previous(info);
         }));
     });
 }
 
-/// What the hook does before calling the hook it replaced.
-fn on_panic(file: Option<&str>) {
-    if !file.is_some_and(quic_attributed) {
+/// What the hook does before calling the hook it replaced: `file` is the
+/// panic's location, `in_quic` whether the panicking thread is inside a
+/// [`QuicCode`] guard.
+fn on_panic(file: Option<&str>, in_quic: bool) {
+    if !(in_quic || file.is_some_and(quic_attributed)) {
         return;
     }
     let Some((path, nonce)) = PANIC_TARGET.get() else {
@@ -435,8 +495,25 @@ fn on_panic(file: Option<&str>) {
     if PANIC_RECORDED.swap(true, std::sync::atomic::Ordering::AcqRel) {
         return;
     }
-    // Best effort: a mark that cannot be written leaves the run uncounted.
-    let _best_effort = mark_quic_panic(path, *nonce);
+    record_quic_panic_at(path, *nonce, || {
+        MARKER_CLEARED.load(std::sync::atomic::Ordering::SeqCst)
+    });
+}
+
+/// Mark the marker, unless `cleared` says the run removed it on purpose, and
+/// if that happened while the mark was being written, remove the marker
+/// again: the clearer sets `cleared` before it removes the file, so either it
+/// removes the marked file or this sees `cleared` and removes it. Best effort:
+/// a mark that cannot be written leaves the run uncounted.
+fn record_quic_panic_at(path: &Path, nonce: u64, cleared: impl Fn() -> bool) {
+    if cleared() {
+        return;
+    }
+    if let Ok(true) = mark_quic_panic(path, nonce) {
+        if cleared() {
+            let _best_effort = clear_if_owned(path, nonce);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -986,6 +1063,8 @@ mod tests {
             "/home/u/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/quinn-0.11.12/src/endpoint.rs",
             "C:\\Users\\u\\.cargo\\registry\\src\\index.crates.io-1949cf8c6b5b557f\\quinn-proto-0.11.18\\src\\connection\\mod.rs",
             "/build/vendor/quinn-udp-0.5.14/src/lib.rs",
+            "/build/vendor/quinn/src/endpoint.rs",
+            "/build/vendor/quinn-proto/src/connection/mod.rs",
             "crates/core/src/transport/quic/runtime.rs",
             "crates\\core\\src\\transport\\quic\\path\\route.rs",
             "crates/core/src/transport/quic.rs",
@@ -1103,16 +1182,118 @@ mod tests {
         write_marker(&path, &marker_after(arm(1), T0, NONCE).unwrap()).unwrap();
         record_quic_panics(path.clone(), NONCE);
 
-        let caught = std::panic::catch_unwind(|| panic!("injected QUIC panic"));
+        // Not QUIC's: located elsewhere, or with no location, outside a
+        // guard. Nothing is marked and nothing latches.
+        on_panic(Some("crates/core/src/node/p2p_impl.rs"), false);
+        on_panic(None, false);
+        assert_eq!(read_previous(&path), running(1, T0), "not QUIC's");
+        // A real panic located in a dependency (alloc), outside a guard.
+        let caught = std::panic::catch_unwind(|| {
+            let v: Vec<u64> = Vec::with_capacity(std::hint::black_box(usize::MAX));
+            v.len()
+        });
         assert!(caught.is_err());
         assert_eq!(EARLIER_HOOK_RUNS.load(Ordering::SeqCst), 1, "chained");
+        assert_eq!(
+            read_previous(&path),
+            running(1, T0),
+            "a dependency's own panic"
+        );
+
+        // The same dependency panic inside a guard (as in quinn's driver or
+        // the socket adapter) is QUIC's.
+        let caught = std::panic::catch_unwind(|| {
+            let _quic = QuicCode::enter();
+            let v: Vec<u64> = Vec::with_capacity(std::hint::black_box(usize::MAX));
+            v.len()
+        });
+        assert!(caught.is_err());
+        assert!(!in_quic_code(), "the guard is released by the unwind");
+        assert_eq!(EARLIER_HOOK_RUNS.load(Ordering::SeqCst), 2, "chained");
         assert_eq!(read_previous(&path), panicked(1, T0), "marked");
 
-        // A later panic does not touch the disk again.
+        // A later panic in QUIC code does not touch the disk again.
         write_marker(&path, &marker_after(arm(1), T0, NONCE).unwrap()).unwrap();
-        let caught = std::panic::catch_unwind(|| panic!("injected QUIC panic, again"));
+        let caught = std::panic::catch_unwind(|| panic!("injected QUIC panic"));
         assert!(caught.is_err());
-        assert_eq!(EARLIER_HOOK_RUNS.load(Ordering::SeqCst), 2, "still chained");
+        assert_eq!(EARLIER_HOOK_RUNS.load(Ordering::SeqCst), 3, "still chained");
         assert_eq!(read_previous(&path), running(1, T0), "marked once only");
+    }
+
+    /// A panic racing the run's own removal of its marker (the short-run
+    /// timer, a clean exit) does not write it back: nothing is written once
+    /// the removal is announced, and a mark written while it is announced is
+    /// taken out again.
+    #[test]
+    fn a_panic_racing_the_clear_does_not_resurrect_the_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = marker_path(dir.path());
+        write_marker(&path, &marker_after(arm(1), T0, NONCE).unwrap()).unwrap();
+        record_quic_panic_at(&path, NONCE, || true);
+        assert_eq!(
+            read_previous(&path),
+            running(1, T0),
+            "announced: not written"
+        );
+
+        // Announced between the check and the write: the mark is removed.
+        let asks = std::cell::Cell::new(0);
+        record_quic_panic_at(&path, NONCE, || {
+            asks.set(asks.get() + 1);
+            asks.get() > 1
+        });
+        assert_eq!(asks.get(), 2);
+        assert!(!path.exists(), "the clearer's removal stands");
+
+        // Not announced: marked.
+        write_marker(&path, &marker_after(arm(1), T0, NONCE).unwrap()).unwrap();
+        record_quic_panic_at(&path, NONCE, || false);
+        assert_eq!(read_previous(&path), panicked(1, T0));
+    }
+
+    /// The guard nests and is released in order.
+    #[test]
+    fn the_quic_code_guard_nests() {
+        assert!(!in_quic_code());
+        let outer = QuicCode::enter();
+        {
+            let _inner = QuicCode::enter();
+            assert!(in_quic_code());
+        }
+        assert!(in_quic_code());
+        drop(outer);
+        assert!(!in_quic_code());
+    }
+
+    /// Pins the guarded call sites, which no unit test reaches through a real
+    /// quinn driver: every driver future quinn spawns is polled inside a
+    /// guard, and so is every catch_unwind call in the socket adapter.
+    #[test]
+    fn quinn_drivers_and_the_socket_adapter_run_inside_the_guard() {
+        let flat = |src: &str| src.split_whitespace().collect::<String>();
+        let runtime = flat(include_str!("../runtime.rs"));
+        let spawn = runtime
+            .find("fnspawn(&self,future:")
+            .expect("Runtime::spawn");
+        let body = &runtime[spawn..];
+        let wrap = body
+            .find("letfuture=Box::pin(InQuicCode(future));")
+            .expect("wrapped");
+        let first_spawn = body.find("GlobalExecutor::spawn(").expect("spawned");
+        assert!(
+            wrap < first_spawn,
+            "the driver is wrapped before it is spawned"
+        );
+        assert!(
+            runtime.contains("let_quic=QuicCode::enter();self.0.as_mut().poll(cx)"),
+            "InQuicCode polls inside the guard"
+        );
+        let socket = flat(include_str!("../socket.rs"));
+        let unwinds = socket.matches("std::panic::catch_unwind(").count();
+        let guarded = socket
+            .matches("let_quic=super::breaker::QuicCode::enter();matchstd::panic::catch_unwind(")
+            .count();
+        assert!(unwinds >= 3, "the adapter's catch_unwind calls: {unwinds}");
+        assert_eq!(guarded, unwinds, "every adapter catch_unwind is guarded");
     }
 }

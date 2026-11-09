@@ -3,8 +3,8 @@
 //!
 //! Runs killed right after they start never count: a kill, like a logoff or a
 //! shutdown, records no QUIC panic. With the `quic-panic-injection` feature
-//! (test builds only), three runs that each abort on an injected QUIC panic
-//! leave a marker that counts them, the fourth start records a trip and runs
+//! (test builds only), a caught QUIC panic marks its run, and three runs that
+//! each abort on an injected QUIC panic leave a marker that counts them, the fourth start records a trip and runs
 //! with QUIC off, and the fifth stays off without moving the trip. The
 //! decision itself is tested on every platform in
 //! `quic/breaker/short_runs.rs`; this test covers what those tests cannot
@@ -213,14 +213,52 @@ fn killed_runs_do_not_count() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A QUIC panic the node survives (as one the socket adapter catches) still
+/// marks the run, so a kill afterwards counts.
+#[cfg(feature = "quic-panic-injection")]
+#[test]
+fn a_caught_quic_panic_counts() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let inject = [("FREENET_TEST_QUIC_PANIC", "caught:2")];
+    let mut node = Node::start_with_env(dir.path(), dir.path().join("logs-0"), QUIC_ON, &inject)?;
+    node.wait_for_log(QUIC_BUILT)?;
+    node.wait_for_marker(dir.path(), 0)?;
+    loop {
+        let marked = read_marker(dir.path())
+            .ok()
+            .flatten()
+            .is_some_and(|marker| marker["quic_panicked"] == true);
+        if marked {
+            break;
+        }
+        anyhow::ensure!(
+            node.child.try_wait()?.is_none(),
+            "the node ended on a caught panic:\n{}",
+            node.logs()
+        );
+        anyhow::ensure!(
+            Instant::now() < node.deadline,
+            "the caught panic did not mark the run:\n{}",
+            node.logs()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    node.child.kill()?;
+    node.child.wait()?;
+    let next = Node::start(dir.path(), dir.path().join("logs-1"), QUIC_ON)?;
+    next.wait_for_marker(dir.path(), 1)?;
+    Ok(())
+}
+
 /// Three runs that abort on a QUIC panic trip; the fourth start runs with
 /// QUIC off and the fifth stays off without moving the trip.
 #[cfg(feature = "quic-panic-injection")]
 #[test]
 fn three_quic_panics_keep_quic_off_for_the_cooldown() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    // Long enough for the marker (and with it the panic hook) to be in place.
-    let inject = [("FREENET_TEST_QUIC_PANIC", "abort:5")];
+    // The countdown starts once the marker, and with it the panic hook, is
+    // in place.
+    let inject = [("FREENET_TEST_QUIC_PANIC", "abort:2")];
     for short_runs in 0..3 {
         let logs = dir.path().join(format!("logs-{short_runs}"));
         let mut node = Node::start_with_env(dir.path(), logs, QUIC_ON, &inject)?;

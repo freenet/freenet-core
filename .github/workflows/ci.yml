@@ -1155,11 +1155,14 @@ jobs:
           tool: cargo-nextest
           fallback: none
 
+      # Every step here builds with `quic-panic-injection` (test builds only;
+      # it lets the QUIC breaker test below abort the node on a QUIC panic),
+      # so the job compiles the crate once.
       - name: Build freenet bin
-        run: cargo build --locked -p freenet --bin freenet
+        run: cargo build --locked -p freenet --bin freenet --features quic-panic-injection
 
       - name: Test service commands
-        run: cargo nextest run -p freenet --bin freenet --profile ci -E 'test(commands::service) | test(commands::url_handler) | test(commands::open_link)'
+        run: cargo nextest run -p freenet --bin freenet --profile ci --features quic-panic-injection -E 'test(commands::service) | test(commands::url_handler) | test(commands::open_link)'
 
       # QUIC shadow is the default on macOS (#5940 Step 2), and its crash-loop
       # breaker reads kern.boottime there: run the real-binary shutdown tests on
@@ -1171,7 +1174,7 @@ jobs:
 
       # freenet:// scheme handler (#5726) against the real binary.
       - name: Test freenet:// handler binary
-        run: cargo nextest run -p freenet --profile ci --test url_scheme_handler
+        run: cargo nextest run -p freenet --profile ci --test url_scheme_handler --features quic-panic-injection
 
       # And through LaunchServices: build an unsigned Freenet.app with the real
       # package-macos.sh, register it, click links with `open`, and check the
@@ -1258,8 +1261,7 @@ jobs:
 
       # The QUIC crash-loop breaker through the real process (#6031). Its
       # decision is tested on every platform; only this reaches the Windows
-      # branch in the binary. `quic-panic-injection` (test builds only) lets
-      # the test abort the node on a QUIC panic.
+      # branch in the binary.
       - name: Test QUIC breaker on Windows
         run: cargo nextest run -p freenet --profile ci --test quic_breaker_windows --features quic-panic-injection
 
