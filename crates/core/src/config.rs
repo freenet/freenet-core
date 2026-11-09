@@ -7547,16 +7547,20 @@ shutdown-drain-secs = 42
         assert_seeded_values_bound(&cfg);
     }
 
-    /// An unset `transport-quic` is shadow, and off on Windows, which must stay
-    /// off until its crash-loop breaker has been confirmed on a real Windows
+    /// An unset `transport-quic` is shadow on Linux, macOS and Windows; Windows
+    /// joined once its crash-loop breaker was confirmed on a real Windows
     /// machine (#6031). The lib tests do not compile on Windows, so
     /// `tests/quic_breaker_windows.rs` pins the Windows half through the real
     /// binary. The default is not written into the config, so a default-off
     /// release turns QUIC off on every node that did not set the key.
     #[test]
-    fn quic_is_shadow_by_default_except_on_windows() {
+    fn quic_is_shadow_by_default_on_linux_macos_and_windows() {
         use crate::transport::quic::QuicMode;
-        let expected = if cfg!(any(target_os = "linux", target_os = "macos")) {
+        let expected = if cfg!(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "windows"
+        )) {
             QuicMode::Shadow
         } else {
             QuicMode::Off

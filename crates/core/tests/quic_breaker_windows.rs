@@ -307,14 +307,15 @@ fn three_quic_panics_keep_quic_off_for_the_cooldown() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// QUIC stays off by default on Windows until the breaker has been confirmed on
-/// a real Windows machine (#6031). This fails if the default changes.
+/// QUIC is shadow by default on Windows, as on Linux and macOS, now that the
+/// breaker has been confirmed on a real Windows machine (#6031): a node with
+/// no `transport-quic` builds the endpoint and arms the breaker's marker. This
+/// fails if the default changes.
 #[test]
-fn quic_is_off_by_default_on_windows() -> anyhow::Result<()> {
+fn quic_is_shadow_by_default_on_windows() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let node = Node::start(dir.path(), dir.path().join("logs"), &[])?;
-    let logs = node.logs();
-    assert!(!logs.contains(QUIC_BUILT), "{logs}");
-    assert_eq!(read_marker(dir.path())?, None, "no marker with QUIC off");
+    let mut node = Node::start(dir.path(), dir.path().join("logs"), &[])?;
+    node.wait_for_log(QUIC_BUILT)?;
+    node.wait_for_marker(dir.path(), 0)?;
     Ok(())
 }

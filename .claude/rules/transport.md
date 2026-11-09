@@ -1077,8 +1077,8 @@ with both bits sends its data on the path ("QUIC send route" below). At a share 
 0, with no `quic-data-percent`, `prefer` differs from `shadow` only by the bit, which
 stays 0. The release that raises the share above 0 must say in its notes that
 existing `prefer` configs start carrying data. Off: no endpoint, no QUIC ingress, nothing
-changes. QUIC must stay off by default on Windows until the crash-loop
-breaker has been confirmed on a real Windows machine (#6031). The default is
+changes. Windows is shadow by default too since its crash-loop breaker was
+confirmed on a real Windows machine (#6031). The default is
 read, never written to config.toml: a node that did not set the key follows the
 release it runs, so a default-off release is the kill switch. It does not reach
 a node that ever ran with `--transport-quic` or `FREENET_TRANSPORT_QUIC`: those
@@ -1619,14 +1619,15 @@ peer presents a key that is not its transport key.
 
 #### QUIC rollout (#5940)
 
-There are no opt-in stages; releases do the rollout. QUIC stays off by default
-on Windows throughout, until its breaker is confirmed on a real Windows machine
-(#6031). Before default-on there, run on real Windows 10 and 11: the
-`quic_breaker_windows` test; logoff, shutdown and restart with Fast Startup on
-and off; tray Restart, Stop and Quit; `freenet service stop` and `restart`; an
-update exit; a real abort; and sleep during a run. Then weigh what that breaker
-never catches: a crash loop with runs of 10 minutes or more, and a fault that
-crashes once a day. Every step watches: peers disappearing per version
+There are no opt-in stages; releases do the rollout. Windows is shadow by
+default since its breaker (a short run counts only if it panicked in QUIC code)
+was confirmed on a real Windows machine (#6031: Windows Server 2022, kills, a
+reboot, a logoff, `service restart`/`stop` never counted; injected aborts and a
+crash loop under the run wrapper tripped). Not run on a machine, covered by the
+rule that only a QUIC panic counts: Fast Startup, sleep, tray Restart/Stop/Quit
+and an update exit. What it never catches: a crash not preceded by a QUIC
+panic, a crash loop with runs of 10 minutes or more, and a fault that crashes
+once a day. Every step watches: peers disappearing per version
 against the previous rollout (a node that dies before reporting is absent from
 every rate), endpoint-down, panics and breaker trips, RSS against
 `quic_paths_active`, CPU and egress, and NAT success, connections and transfers.

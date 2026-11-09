@@ -83,12 +83,12 @@ pub(crate) use liveness::QuicAvailabilityWatch;
 
 /// Whether the node may use QUIC: the `transport-quic` config key.
 ///
-/// An unset key is [`QuicMode::default_mode`]: shadow on Linux and macOS, and
-/// off elsewhere. Windows stays off until the crash-loop breaker has been
-/// confirmed on a real Windows machine (#6031), and other platforms because
-/// the breaker reads no boot identity there and so cannot trip. The Windows
-/// breaker counts short runs that panicked in QUIC code instead of detecting
-/// crashes ([`breaker`]). The default is decided when the value is read and
+/// An unset key is [`QuicMode::default_mode`]: shadow on Linux, macOS and
+/// Windows, and off elsewhere, because the breaker reads no boot identity
+/// there and so cannot trip. The Windows breaker counts short runs that
+/// panicked in QUIC code instead of detecting crashes ([`breaker`]); it was
+/// confirmed on a real Windows machine before Windows defaulted to shadow
+/// (#6031). The default is decided when the value is read and
 /// never written to `config.toml`, so a later release can change it
 /// for every node that did not set the key, which is how a default-off
 /// release turns QUIC off. A value given with `--transport-quic` or
@@ -132,11 +132,16 @@ impl QuicMode {
     /// See [`QuicMode::Prefer`].
     pub const PREFER: &'static str = "prefer";
 
-    /// What an unset `transport-quic` means on this platform: shadow on Linux
-    /// and macOS, and off elsewhere (Windows until #6031; other platforms
-    /// because the crash-loop breaker cannot trip there).
+    /// What an unset `transport-quic` means on this platform: shadow on Linux,
+    /// macOS and Windows, and off elsewhere, because the crash-loop breaker
+    /// cannot trip there. Windows joined once its breaker was confirmed on a
+    /// real Windows machine (#6031).
     pub const fn default_mode() -> Self {
-        if cfg!(any(target_os = "linux", target_os = "macos")) {
+        if cfg!(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "windows"
+        )) {
             Self::Shadow
         } else {
             Self::Off
