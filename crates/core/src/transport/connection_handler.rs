@@ -3983,6 +3983,10 @@ pub mod mock_transport {
         /// this sender, so a socket started at the same address before this
         /// one is dropped (a node restarted at its address) keeps its entry.
         registered: mpsc::WeakUnboundedSender<MockDatagram>,
+        /// A node-wide egress cap, as `DemuxSocket` holds with
+        /// `total-bandwidth-limit`: unpaced sends are charged to it and paced
+        /// ones send what they took. `None` for most tests.
+        pub(crate) egress: Option<crate::transport::egress_cap::EgressCap>,
     }
 
     /// A VirtualTime sleep kept across `recv_from` calls.
@@ -4030,6 +4034,7 @@ pub mod mock_transport {
                 channels,
                 virtual_time: None,
                 link: None,
+                egress: None,
                 pending_inbound: std::sync::Mutex::new(PendingInbound::default()),
                 registered,
             }
@@ -4062,6 +4067,7 @@ pub mod mock_transport {
                 channels,
                 virtual_time: time_source,
                 link: None,
+                egress: None,
                 pending_inbound: std::sync::Mutex::new(PendingInbound::default()),
                 registered,
             }
@@ -4128,7 +4134,50 @@ pub mod mock_transport {
             }
         }
 
+        fn egress_cap(&self) -> Option<&crate::transport::egress_cap::EgressCap> {
+            self.egress.as_ref()
+        }
+
+        /// As `DemuxSocket`: the take pays for the datagram, and what it did
+        /// not use goes back.
+        async fn send_to_paced(
+            &self,
+            buf: &[u8],
+            target: SocketAddr,
+            take: crate::transport::egress_cap::EgressTake<'_>,
+        ) -> std::io::Result<usize> {
+            let sent = self.send_unmetered(buf, target).await?;
+            take.sent(sent);
+            Ok(sent)
+        }
+
+        /// Charged to the egress cap, if any, as `DemuxSocket` charges an
+        /// unpaced send.
         async fn send_to(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+            let sent = self.send_unmetered(buf, target).await?;
+            if let Some(cap) = &self.egress {
+                cap.charge_unpaced(sent);
+            }
+            Ok(sent)
+        }
+
+        fn send_to_blocking(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+            let sent = if self.link.is_some() {
+                self.send_via_link(buf, target)?
+            } else {
+                let (_delay, available_at_nanos) = self.compute_delay_and_timestamp();
+                self.send_packet_internal(buf, target, available_at_nanos)?
+            };
+            if let Some(cap) = &self.egress {
+                cap.charge_unpaced(sent);
+            }
+            Ok(sent)
+        }
+    }
+
+    impl MockSocket {
+        /// A send through the link or the channels, not charged to the cap.
+        async fn send_unmetered(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
             if self.link.is_some() {
                 let result = self.send_via_link(buf, target);
                 tokio::task::yield_now().await;
@@ -4150,16 +4199,6 @@ pub mod mock_transport {
             result
         }
 
-        fn send_to_blocking(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
-            if self.link.is_some() {
-                return self.send_via_link(buf, target);
-            }
-            let (_delay, available_at_nanos) = self.compute_delay_and_timestamp();
-            self.send_packet_internal(buf, target, available_at_nanos)
-        }
-    }
-
-    impl MockSocket {
         fn pending(&self) -> std::sync::MutexGuard<'_, PendingInbound> {
             self.pending_inbound
                 .lock()
@@ -4603,6 +4642,7 @@ pub mod mock_transport {
             time_source,
             None,
             None,
+            None,
         )
         .await
     }
@@ -4622,6 +4662,7 @@ pub mod mock_transport {
         time_source: Option<crate::simulation::VirtualTime>,
         congestion_config: Option<CongestionControlConfig>,
         link: Option<Arc<crate::transport::link_model::LinkModel>>,
+        cap_rate: Option<u64>,
     ) -> Result<
         (
             TransportPublicKey,
@@ -4649,6 +4690,8 @@ pub mod mock_transport {
         )
         .await;
         socket.link = link;
+        socket.egress =
+            cap_rate.map(|rate| crate::transport::egress_cap::EgressCap::new(rate, vt.clone()));
         let socket = Arc::new(socket);
 
         // Use the same VirtualTime for both MockSocket and protocol layer
@@ -4696,6 +4739,7 @@ pub mod mock_transport {
             Some(time_source),
             congestion_config,
             None,
+            None,
         )
         .await
         .map(|(pk, (o, _), s)| (pk, o, s))
@@ -4715,6 +4759,30 @@ pub mod mock_transport {
         OutboundConnectionHandler<MockSocket, crate::simulation::VirtualTime>,
         SocketAddr,
     )> {
+        create_mock_peer_with_link_model_and_cap(
+            link,
+            channels,
+            time_source,
+            congestion_config,
+            None,
+        )
+        .await
+    }
+
+    /// [`create_mock_peer_with_link_model`] with a node-wide egress cap at
+    /// `cap_rate` bytes per second on the socket, as `total-bandwidth-limit`
+    /// gives a real node.
+    pub async fn create_mock_peer_with_link_model_and_cap(
+        link: Arc<crate::transport::link_model::LinkModel>,
+        channels: Channels,
+        time_source: crate::simulation::VirtualTime,
+        congestion_config: Option<CongestionControlConfig>,
+        cap_rate: Option<u64>,
+    ) -> anyhow::Result<(
+        TransportPublicKey,
+        OutboundConnectionHandler<MockSocket, crate::simulation::VirtualTime>,
+        SocketAddr,
+    )> {
         create_mock_peer_internal_vt_with_congestion(
             PacketDropPolicy::ReceiveAll,
             PacketDelayPolicy::NoDelay,
@@ -4724,6 +4792,7 @@ pub mod mock_transport {
             Some(time_source),
             congestion_config,
             Some(link),
+            cap_rate,
         )
         .await
         .map(|(pk, (o, _), s)| (pk, o, s))

@@ -73,10 +73,17 @@
 //! wait longer until the debt is paid. That covers the handshake tasks, the
 //! keepalive task, short messages (sent from the connection's own task, which
 //! also receives for the connection, so a wait there would delay its ACKs),
-//! and everything `PeerConnection::recv` sends: ACKs, Pongs, receipts,
-//! retransmissions. `recv` must never wait here: it runs as a branch of a
-//! `select!` that can be cancelled, and it changes connection state before
-//! some of its sends.
+//! and everything `PeerConnection::recv` sends: ACKs, Pongs, receipts.
+//! `recv` must never wait here: it runs as a branch of a `select!` that can
+//! be cancelled, and it changes connection state before some of its sends.
+//!
+//! Retransmissions (RTO resends and tail-loss probes, sent from `recv`) do
+//! not wait either, but they are not simply charged: they take from the
+//! bucket only within [`RETX_DEBT_LIMIT`] and their share of the rate
+//! ([`EgressCap::admit_retransmit`]). A refused resend is deferred by the
+//! resend timer, for at most one effective RTO from its first refusal
+//! ([`RETX_DEFER_LIMIT_RTOS`]), then sent uncapped; a refused probe is
+//! skipped.
 //!
 //! # What the cap guarantees
 //!
@@ -144,6 +151,7 @@ use super::Socket;
 use super::metrics::{EgressDecision, TRANSPORT_METRICS, WaitCause};
 use super::packet_data::MAX_PACKET_SIZE;
 use super::peer_connection::streaming::STREAM_INACTIVITY_TIMEOUT;
+use super::sent_packet_tracker::ResendKind;
 use crate::simulation::TimeSource;
 
 /// The bucket holds at most this much time at the cap rate, so after an idle
@@ -158,6 +166,223 @@ const MIN_BURST_PACKETS: u64 = 4;
 /// Unpaced debt never exceeds this much time at the cap rate; an unpaced
 /// charge beyond it is forgiven.
 pub(crate) const DEBT_LIMIT: Duration = Duration::from_secs(1);
+
+/// A legacy UDP retransmit may put the bucket this far into debt, and no
+/// further (`EgressCap::admit_retransmit`); past it the retransmit waits
+/// for the rate, and nothing retransmitted is forgiven. Well below
+/// [`DEBT_LIMIT`]: enough to send lost packets ahead of queued first copies,
+/// which then wait in the admission queue, without letting a retransmit storm
+/// run at whatever rate its timers produce.
+pub(crate) const RETX_DEBT_LIMIT: Duration = Duration::from_millis(100);
+
+/// The most of the cap's rate retransmits may use, over [`RETX_SHARE_WINDOW`]:
+/// first copies always get the rest. Without it, where the cap binds and the
+/// receiver's receipts are lost, retransmits of packets it already holds took
+/// the cap ahead of first copies until a stream missed its 5 s fragment
+/// deadline (the receipt-loss row in `link_model::storm_tests`).
+pub(crate) const RETX_SHARE_PERCENT: u64 = 50;
+
+/// The window the retransmit share is measured over: retransmits may burst
+/// to this much of their share at once (after an outage, say), then hold to
+/// the share.
+pub(crate) const RETX_SHARE_WINDOW: Duration = Duration::from_secs(1);
+
+/// [`RETX_SHARE_PERCENT`], or in tests `FREENET_RETX_SHARE_PERCENT` when set.
+fn retx_share_percent() -> u64 {
+    #[cfg(test)]
+    if let Some(pct) = std::env::var("FREENET_RETX_SHARE_PERCENT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        return pct.clamp(1, 100);
+    }
+    RETX_SHARE_PERCENT
+}
+
+/// [`RETX_DEBT_LIMIT`], or in tests `FREENET_RETX_DEBT_LIMIT_MS` when set, so a
+/// storm run can sweep it without a rebuild.
+fn retx_debt_limit() -> Duration {
+    #[cfg(test)]
+    if let Some(ms) = std::env::var("FREENET_RETX_DEBT_LIMIT_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        return Duration::from_millis(ms);
+    }
+    RETX_DEBT_LIMIT
+}
+
+/// The shortest a retransmit the cap refused is deferred for, however small
+/// the deficit: without it a connection whose resend is refused by a
+/// datagram's worth wakes its resend arm about once per datagram time while
+/// the cap stays full. Chosen from the storm rows over 40 seeds (16
+/// connections on a 4 Mbit/s uplink, `link_model::storm_tests`): with no
+/// floor a cap at 4x the uplink completed fewer streams than uncapped
+/// retransmits (166 against 192) at about 230 wakes a second per connection;
+/// 2 ms completed 368 and 23 wakes; 10 ms and RTO / 16 gave back the
+/// retransmits' lead over queued first copies at 2x the uplink.
+pub(crate) const RETX_DEFER_MIN: Duration = Duration::from_millis(2);
+
+/// The shortest deferral of a refused retransmit on a connection whose
+/// effective RTO is `rto`: [`RETX_DEFER_MIN`]. In tests,
+/// `FREENET_RETX_DEFER_MIN_US` sets a fixed floor and
+/// `FREENET_RETX_DEFER_RTO_DIV` a floor of `rto / div`, so a storm run can
+/// sweep it without a rebuild.
+pub(crate) fn retx_defer_min(rto: Duration) -> Duration {
+    #[cfg(test)]
+    {
+        let var = |name: &str| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+        };
+        if let Some(div) = var("FREENET_RETX_DEFER_RTO_DIV") {
+            return rto / u32::try_from(div.max(1)).unwrap_or(u32::MAX);
+        }
+        if let Some(us) = var("FREENET_RETX_DEFER_MIN_US") {
+            return Duration::from_micros(us);
+        }
+    }
+    let _ = rto;
+    RETX_DEFER_MIN
+}
+
+/// Retransmits the bucket refused come back this many per datagram time
+/// at the cap's rate ([`EgressCap::space_retx_bucket_wait`]): spaced so they
+/// do not all retry on one deficit, but more often than the bucket refills,
+/// so a repair is not held behind the spacing when first copies take some
+/// of the refill. Chosen from the storm row at 1 MB/s over 40 seeds: one
+/// per datagram time completed 567 streams against main's 327 but two seeds
+/// did worse than main; two per datagram time 560 with none worse; four
+/// 545 with one worse.
+pub(crate) const RETX_BUCKET_SPACING_DIV: i64 = 2;
+
+/// A connection's refused RTO resends are deferred until they have been
+/// refused for this many effective RTOs in a row ([`RetxDeferral`]), then
+/// sent uncapped ([`EgressCap::admit_retransmit`]).
+/// One: the deferral at most doubles the wait between a packet's resends,
+/// so it is still abandoned after `MAX_PACKET_RETRANSMITS`, within twice the
+/// time it would take without the cap.
+pub(crate) const RETX_DEFER_LIMIT_RTOS: u32 = 1;
+
+/// One connection's run of refused RTO resends, for
+/// [`EgressCap::admit_retransmit`]'s deferral limit. The run starts at the
+/// first refusal and lasts until the cap takes a resend again or nothing due
+/// is refused ([`Self::end_run`]); once it has lasted one effective RTO
+/// ([`RETX_DEFER_LIMIT_RTOS`]) every due resend goes uncapped. It is per
+/// connection, not per packet, because only the head of the resend queue is
+/// asked: a per-packet limit would hold the packets behind it for one RTO
+/// each in turn. And it is measured from the first refusal, not from the
+/// RTO deadline, because an ack that resets the backoff moves every deadline
+/// earlier at once, so a resend just found due would count as long
+/// deferred.
+///
+/// It also holds the connection's booking in the retransmit share: a resend
+/// the share refuses books the next free slot instead of retrying, so the
+/// connections waiting on the share wake one per slot rather than all at
+/// once on the same deficit (with a herd, node-wide wakes grew with the
+/// connection count toward [`RETX_DEFER_MIN`]'s 500 a second each).
+#[derive(Debug, Default)]
+pub(crate) struct RetxDeferral {
+    /// When the run of refusals started (the connection's time source, ns).
+    refused_since: Option<u64>,
+    /// The share this connection has booked and not used. At most one; it
+    /// is used by the next take, or refunded when the run ends or the
+    /// resend goes uncapped. A connection that closes holding one loses
+    /// that one datagram of share.
+    booking: Option<RetxBooking>,
+}
+
+/// A booked slot in the retransmit share ([`RetxDeferral`]).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RetxBooking {
+    /// The share paid for it (ns on the share's meter).
+    share_ns: i64,
+    /// When the slot comes (ns on the cap's clock).
+    slot_ns: i64,
+}
+
+impl RetxDeferral {
+    /// Decide one retransmit at `now_nanos` ([`EgressCap::admit_retransmit`]),
+    /// with this connection's run of refusals.
+    pub(in crate::transport) fn admit<'a>(
+        &mut self,
+        cap: &'a EgressCap,
+        kind: ResendKind,
+        bytes: usize,
+        rto: Duration,
+        now_nanos: u64,
+    ) -> RetxAdmit<'a> {
+        let deferred_for = self.refused_since.map_or(Duration::ZERO, |since| {
+            Duration::from_nanos(now_nanos.saturating_sub(since))
+        });
+        let decision = cap.admit_retransmit(kind, bytes, deferred_for, rto, &mut self.booking);
+        match decision {
+            // Only an RTO resend taken ends the run: a probe taken while an
+            // RTO resend is refused (another packet's, after the head
+            // changed) must not restart the deferral limit, or the refused
+            // resend could be held past it and never abandoned (#4345).
+            RetxAdmit::Take(_) if kind == ResendKind::Rto => self.refused_since = None,
+            RetxAdmit::Take(_) => {}
+            RetxAdmit::Defer(_) => {
+                self.refused_since.get_or_insert(now_nanos);
+            }
+            RetxAdmit::Uncapped | RetxAdmit::SkipProbe => {}
+        }
+        decision
+    }
+
+    /// Tests only: the slot this connection has booked in the share.
+    #[cfg(test)]
+    pub(in crate::transport) fn booked_slot(&self) -> Option<i64> {
+        self.booking.map(|b| b.slot_ns)
+    }
+
+    /// Nothing due was refused: the run, if any, is over, and an unused
+    /// booking is handed back to `cap`.
+    pub(in crate::transport) fn end_run(&mut self, cap: Option<&EgressCap>) {
+        self.refused_since = None;
+        if let (Some(booking), Some(cap)) = (self.booking.take(), cap) {
+            cap.refund_retx_share(booking.share_ns);
+        }
+    }
+}
+
+/// Why a retransmit take was refused, and how long until it would fit.
+#[derive(Debug, Clone, Copy)]
+enum RetxRefused {
+    /// The share is spent. (The wait is read only by the tests'
+    /// `try_take_retransmit`: a refused resend books a slot instead.)
+    Share(#[cfg_attr(not(test), allow(dead_code))] Duration),
+    /// The bucket's debt would pass [`RETX_DEBT_LIMIT`].
+    Bucket(Duration),
+    /// The connection's booked slot has not come yet.
+    Slot(Duration),
+}
+
+impl RetxRefused {
+    #[cfg(test)]
+    fn wait(self) -> Duration {
+        match self {
+            Self::Share(wait) | Self::Bucket(wait) | Self::Slot(wait) => wait,
+        }
+    }
+}
+
+/// What [`EgressCap::admit_retransmit`] decided.
+#[derive(Debug)]
+pub(crate) enum RetxAdmit<'a> {
+    /// Send with this take (`Socket::send_to_paced`).
+    Take(EgressTake<'a>),
+    /// Send uncapped (`Socket::send_to`, charged as an unpaced send): the
+    /// connection's resends have been refused for [`RETX_DEFER_LIMIT_RTOS`]
+    /// effective RTOs in a row.
+    Uncapped,
+    /// Do not send now; ask again after this long.
+    Defer(Duration),
+    /// Skip this probe.
+    SkipProbe,
+}
 
 /// A gap between one stream's fragments at least this long is counted and
 /// logged: half the receiver's stream inactivity timeout, so it is reported
@@ -330,6 +555,14 @@ pub struct EgressCap {
     sleep_until: Box<dyn Fn(u64) -> SleepFuture + Send + Sync>,
     /// Time (ns, on `clock`) at which the bucket level is zero.
     empty_at_ns: AtomicI64,
+    /// Time (ns, on `clock`) at which the retransmit meter is empty: a leaky
+    /// bucket of retransmitted bytes at [`RETX_SHARE_PERCENT`] of the rate,
+    /// holding at most [`RETX_SHARE_WINDOW`] of it
+    /// (`EgressCap::admit_retransmit`).
+    retx_meter_empty_at_ns: AtomicI64,
+    /// The next free datagram time (ns, on `clock`) for a retransmit the
+    /// bucket refused ([`EgressCap::space_retx_bucket_wait`]).
+    retx_bucket_next_ns: AtomicI64,
     /// Wakers of [`Self::poll_admit`] callers that are `Pending`, in the
     /// order they first registered. Shared with each registered
     /// [`AdmissionWaiter`] so dropping one removes its entry.
@@ -348,6 +581,10 @@ pub struct EgressCap {
     refused_since_warn: WarnWindow,
     #[cfg(test)]
     stats: StatCounters,
+    /// Tests only: retransmits are sent and charged as unpaced sends, as
+    /// before they were capped, so one test binary can compare both.
+    #[cfg(test)]
+    retransmits_uncapped: std::sync::atomic::AtomicBool,
 }
 
 impl fmt::Debug for EgressCap {
@@ -778,6 +1015,12 @@ pub struct EgressTake<'a> {
     taken_bytes: u64,
     /// How long the sender slept for the cap before this take.
     waited: Duration,
+    /// Taken without admission (a retransmit), so recorded as an unpaced
+    /// send, as retransmits were before they were capped.
+    unpaced: bool,
+    /// The retransmit share this take holds (ns on the share's meter), handed
+    /// back if the datagram is not sent; 0 for a paced take.
+    retx_share_ns: i64,
 }
 
 impl EgressCap {
@@ -806,6 +1049,9 @@ impl EgressCap {
             clock,
             sleep_until,
             empty_at_ns: AtomicI64::new(now.saturating_sub(burst_ns)),
+            // Long empty: the share starts full, whatever its window.
+            retx_meter_empty_at_ns: AtomicI64::new(i64::MIN / 2),
+            retx_bucket_next_ns: AtomicI64::new(i64::MIN / 2),
             admission: Arc::new(AdmissionQueue::default()),
             last_long_wait_warn_ns: AtomicI64::new(i64::MIN),
             last_abandon_warn_ns: AtomicI64::new(i64::MIN),
@@ -815,6 +1061,8 @@ impl EgressCap {
             refused_since_warn: WarnWindow::default(),
             #[cfg(test)]
             stats: StatCounters::default(),
+            #[cfg(test)]
+            retransmits_uncapped: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -902,6 +1150,283 @@ impl EgressCap {
                 Ok(_) => return (old, new, now),
                 Err(current) => old = current,
             }
+        }
+    }
+
+    /// Whether retransmits must take from this cap
+    /// ([`Self::admit_retransmit`]). Always, outside tests.
+    pub(crate) fn caps_retransmits(&self) -> bool {
+        #[cfg(test)]
+        {
+            !self.retransmits_uncapped.load(Ordering::Relaxed)
+        }
+        #[cfg(not(test))]
+        {
+            true
+        }
+    }
+
+    /// Tests only: send retransmits uncapped, as before #6100's cap.
+    #[cfg(test)]
+    pub(crate) fn uncap_retransmits(&self) {
+        self.retransmits_uncapped.store(true, Ordering::Relaxed);
+    }
+
+    /// Tests only: [`Self::take_retx`] with nothing booked, the refusal as a
+    /// wait.
+    #[cfg(test)]
+    pub(crate) fn try_take_retransmit(&self, bytes: usize) -> Result<EgressTake<'_>, Duration> {
+        self.take_retx(bytes, None).map_err(RetxRefused::wait)
+    }
+
+    /// The share's cost of a `bytes` retransmit and the share's window.
+    fn retx_share_cost(&self, bytes: usize) -> (i64, i64) {
+        let meter_cost = self.cost_ns(bytes as u64).saturating_mul(100)
+            / i64::try_from(retx_share_percent()).unwrap_or(100);
+        let window = i64::try_from(RETX_SHARE_WINDOW.as_nanos())
+            .unwrap_or(i64::MAX)
+            .max(meter_cost);
+        (meter_cost, window)
+    }
+
+    /// Book the next free slot in the share for a `bytes` retransmit: pay
+    /// for it now, whenever it comes ([`RetxDeferral`]).
+    fn book_retx_share(&self, bytes: usize) -> RetxBooking {
+        let (meter_cost, window) = self.retx_share_cost(bytes);
+        let now = self.now();
+        let earliest = now.saturating_sub(window);
+        let mut meter = self.retx_meter_empty_at_ns.load(Ordering::Acquire);
+        loop {
+            let slot = meter.max(earliest).saturating_add(meter_cost);
+            match self.retx_meter_empty_at_ns.compare_exchange_weak(
+                meter,
+                slot,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return RetxBooking {
+                        share_ns: meter_cost,
+                        slot_ns: slot,
+                    };
+                }
+                Err(current) => meter = current,
+            }
+        }
+    }
+
+    /// How long a retransmit the bucket refused with `wait` should wait: to
+    /// the next free slot after `wait` among the retransmits the bucket
+    /// refused, [`RETX_BUCKET_SPACING_DIV`] slots per datagram of refill, at
+    /// most half the deferral limit (`rto`, [`RETX_DEFER_LIMIT_RTOS`]) after
+    /// `wait`. A
+    /// timing hint only: nothing is paid, so nothing can leak.
+    fn space_retx_bucket_wait(&self, bytes: usize, wait: Duration, rto: Duration) -> Duration {
+        // In tests `FREENET_RETX_BUCKET_SPACING_DIV` overrides it, to sweep.
+        #[cfg(test)]
+        let div = std::env::var("FREENET_RETX_BUCKET_SPACING_DIV")
+            .ok()
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .map_or(RETX_BUCKET_SPACING_DIV, |d| d.max(1));
+        #[cfg(not(test))]
+        let div = RETX_BUCKET_SPACING_DIV;
+        let cost = self.cost_ns(bytes as u64) / div;
+        let now = self.now();
+        let at = now.saturating_add(i64::try_from(wait.as_nanos()).unwrap_or(i64::MAX));
+        // The lead is bounded: slots more than half the deferral limit past
+        // `at` start again from `at`. Slots are never handed back (a
+        // connection may go uncapped or end its run before its slot), so
+        // without this enough lossy connections would push the next slot
+        // past the deferral limit and every bucket-refused resend would wait
+        // a full RTO and then go uncapped.
+        let bound = i64::try_from((rto.saturating_mul(RETX_DEFER_LIMIT_RTOS) / 2).as_nanos())
+            .unwrap_or(i64::MAX);
+        let mut next = self.retx_bucket_next_ns.load(Ordering::Acquire);
+        loop {
+            let slot = if next > at.saturating_add(bound) {
+                at
+            } else {
+                next.max(at)
+            };
+            match self.retx_bucket_next_ns.compare_exchange_weak(
+                next,
+                slot.saturating_add(cost),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Duration::from_nanos((slot - now).max(0) as u64),
+                Err(current) => next = current,
+            }
+        }
+    }
+
+    /// Take `bytes` for a legacy UDP retransmit (an RTO resend or a tail-loss
+    /// probe) if retransmits stay within their share of the rate
+    /// ([`RETX_SHARE_PERCENT`] over [`RETX_SHARE_WINDOW`]) and the bucket's
+    /// debt after the take stays within [`RETX_DEBT_LIMIT`]; otherwise take
+    /// nothing and return how long until it would fit. Unlike
+    /// [`Self::charge_unpaced`] nothing is forgiven; unlike a paced take it
+    /// needs no admission and may go into debt, so a lost packet is repaired
+    /// ahead of first copies waiting in the admission queue.
+    ///
+    /// The share is checked first, so a share refusal touches the bucket not
+    /// at all, and the bucket refusal path only hands the share back: both
+    /// are atomic updates with no lock and no await, and neither wakes paced
+    /// waiters. Send the datagram with `Socket::send_to_paced`, which charges
+    /// it once; a take dropped unsent gives back both the bucket and the
+    /// share. With `prepaid` (a booking whose slot has come) the share is
+    /// already paid, and a bucket refusal keeps it for the retry.
+    fn take_retx(&self, bytes: usize, prepaid: Option<i64>) -> Result<EgressTake<'_>, RetxRefused> {
+        let cost = self.cost_ns(bytes as u64);
+        // The retransmit share: a leaky bucket refilled at the share of the
+        // rate, so this datagram costs `100 / share` times its cost at the
+        // full rate. It holds RETX_SHARE_WINDOW, or one datagram if that is
+        // more, so a cap too small for a datagram in a window of its share
+        // (under about 2400 B/s) still admits retransmits at its share.
+        let (meter_cost, window) = match prepaid {
+            Some(paid) => (paid, 0),
+            None => self.retx_share_cost(bytes),
+        };
+        let now = self.now();
+        let mut meter = self.retx_meter_empty_at_ns.load(Ordering::Acquire);
+        while prepaid.is_none() {
+            let after = meter
+                .max(now.saturating_sub(window))
+                .saturating_add(meter_cost);
+            if after > now {
+                return Err(RetxRefused::Share(Duration::from_nanos(
+                    (after - now) as u64,
+                )));
+            }
+            match self.retx_meter_empty_at_ns.compare_exchange_weak(
+                meter,
+                after,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(current) => meter = current,
+            }
+        }
+        let limit = i64::try_from(retx_debt_limit().as_nanos()).unwrap_or(i64::MAX);
+        let fits = |empty_at: i64, now: i64| {
+            let after = self.refilled(empty_at, now).saturating_add(cost);
+            let over = after.saturating_sub(now.saturating_add(limit));
+            if over <= 0 { Ok(after) } else { Err(over) }
+        };
+        let (old, new, now) = self.update(|empty_at, now| fits(empty_at, now).ok());
+        if let Err(over) = fits(old, now) {
+            // A booking is kept for the retry; a share just taken is handed back.
+            if prepaid.is_none() {
+                self.refund_retx_share(meter_cost);
+            }
+            return Err(RetxRefused::Bucket(Duration::from_nanos(over as u64)));
+        }
+        let debt = self.bytes_for(new.saturating_sub(now));
+        if debt > 0 {
+            #[cfg(test)]
+            self.stats.debt_hwm_bytes.fetch_max(debt, Ordering::Relaxed);
+            TRANSPORT_METRICS.record_egress_debt(debt);
+        }
+        Ok(EgressTake {
+            cap: self,
+            taken_bytes: bytes as u64,
+            waited: Duration::ZERO,
+            unpaced: true,
+            retx_share_ns: meter_cost,
+        })
+    }
+
+    /// Decide one legacy UDP retransmit under this cap: `kind` is an RTO
+    /// resend or a tail-loss probe of `bytes`, `deferred_for` how long the
+    /// connection's resends have been refused in a row ([`RetxDeferral`],
+    /// zero at the first refusal), `rto` the connection's effective RTO.
+    ///
+    /// - The cap takes it ([`Self::take_retx`]): [`RetxAdmit::Take`].
+    /// - A refused probe is skipped: [`RetxAdmit::SkipProbe`].
+    /// - A refused RTO resend is deferred ([`RetxAdmit::Defer`]) for at least
+    ///   [`RETX_DEFER_MIN`] and at most until the connection's resends have
+    ///   been refused for one effective RTO ([`RETX_DEFER_LIMIT_RTOS`]);
+    ///   refused then, it goes
+    ///   uncapped ([`RetxAdmit::Uncapped`]), charged as an unpaced send as
+    ///   before the cap. So a resend is never deferred without bound: under
+    ///   unpaced debt above [`RETX_DEBT_LIMIT`] (short messages, receipts and
+    ///   keepalives at or above the rate) the cap could otherwise refuse it
+    ///   for as long as that lasts, and since the retransmit count moves only
+    ///   when a resend goes, the packet would never be abandoned and its
+    ///   flight never released (#4345). It also bounds how long one
+    ///   connection's resends can be held behind another's use of the
+    ///   node-wide share.
+    pub(in crate::transport) fn admit_retransmit(
+        &self,
+        kind: ResendKind,
+        bytes: usize,
+        deferred_for: Duration,
+        rto: Duration,
+        booking: &mut Option<RetxBooking>,
+    ) -> RetxAdmit<'_> {
+        let booked = booking.filter(|_| kind == ResendKind::Rto);
+        let attempt = match booked {
+            Some(b) if self.now() < b.slot_ns => Err(RetxRefused::Slot(Duration::from_nanos(
+                (b.slot_ns - self.now()).max(0) as u64,
+            ))),
+            Some(b) => self.take_retx(bytes, Some(b.share_ns)),
+            None => self.take_retx(bytes, None),
+        };
+        let refused = match attempt {
+            Ok(take) => {
+                if booked.is_some() {
+                    // The take now carries the booked share (refunded if
+                    // it is dropped unsent).
+                    *booking = None;
+                }
+                return RetxAdmit::Take(take);
+            }
+            Err(refused) => refused,
+        };
+        match kind {
+            ResendKind::Probe => {
+                TRANSPORT_METRICS.record_egress_probe_skipped();
+                RetxAdmit::SkipProbe
+            }
+            ResendKind::Rto => {
+                let limit = rto.saturating_mul(RETX_DEFER_LIMIT_RTOS);
+                if deferred_for >= limit {
+                    if let Some(b) = booking.take() {
+                        self.refund_retx_share(b.share_ns);
+                    }
+                    TRANSPORT_METRICS.record_egress_retransmit_uncapped(bytes as u64);
+                    return RetxAdmit::Uncapped;
+                }
+                TRANSPORT_METRICS.record_egress_retransmit_deferred();
+                // The connections waiting wake one at a time, not all on the
+                // same deficit: a share refusal books the next slot in the
+                // share; a bucket refusal (any booking kept) waits for the
+                // next free datagram time on the bucket.
+                let wait = match refused {
+                    RetxRefused::Slot(wait) => wait,
+                    RetxRefused::Share(_) => {
+                        let b = self.book_retx_share(bytes);
+                        *booking = Some(b);
+                        Duration::from_nanos((b.slot_ns - self.now()).max(0) as u64)
+                    }
+                    RetxRefused::Bucket(wait) => self.space_retx_bucket_wait(bytes, wait, rto),
+                };
+                RetxAdmit::Defer(
+                    wait.max(retx_defer_min(rto))
+                        .min(limit.saturating_sub(deferred_for)),
+                )
+            }
+        }
+    }
+
+    /// Hand back a retransmit's share ([`Self::take_retx`], or a
+    /// booking) when
+    /// its datagram was not sent.
+    fn refund_retx_share(&self, meter_cost: i64) {
+        if meter_cost > 0 {
+            self.retx_meter_empty_at_ns
+                .fetch_sub(meter_cost, Ordering::AcqRel);
         }
     }
 
@@ -1053,6 +1578,8 @@ impl EgressCap {
                 cap: self,
                 taken_bytes: bytes as u64,
                 waited,
+                unpaced: false,
+                retx_share_ns: 0,
             },
             own.is_some(),
         ))
@@ -1416,7 +1943,12 @@ impl EgressTake<'_> {
         let this = ManuallyDrop::new(self);
         let sent = (sent_bytes as u64).min(this.taken_bytes);
         this.cap.give_back(this.taken_bytes - sent);
-        let decision = if this.waited.is_zero() {
+        if sent == 0 {
+            this.cap.refund_retx_share(this.retx_share_ns);
+        }
+        let decision = if this.unpaced {
+            EgressDecision::Unpaced
+        } else if this.waited.is_zero() {
             EgressDecision::Immediate
         } else {
             EgressDecision::Waited
@@ -1428,6 +1960,7 @@ impl EgressTake<'_> {
 impl Drop for EgressTake<'_> {
     fn drop(&mut self) {
         self.cap.give_back(self.taken_bytes);
+        self.cap.refund_retx_share(self.retx_share_ns);
     }
 }
 

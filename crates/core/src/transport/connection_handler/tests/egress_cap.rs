@@ -201,14 +201,20 @@ async fn handshake_completes_promptly_with_the_egress_bucket_in_full_debt() {
 
 /// The connection's control traffic never waits for the egress cap, with
 /// both buckets a full second in debt: receipts (standalone ACK NoOps),
-/// keepalive Pings and the Pongs that answer them, and retransmissions are
-/// all charged as unpaced, and none goes through a pacing point.
+/// keepalive Pings and the Pongs that answer them are all charged as
+/// unpaced, and none goes through a pacing point.
 ///
-/// The test first checks that each kind of datagram really was sent, from
-/// the connections' own counters, so a run in which, say, no retransmission
-/// happened cannot pass by saying nothing about it. Once connected, the
-/// joiner drops 30 of its sends (the handshake is not affected), so some of
-/// its short messages are lost and retransmitted.
+/// Retransmissions take from the cap only within `RETX_DEBT_LIMIT`
+/// (`EgressCap::admit_retransmit`), so with the bucket held a full second in
+/// debt (its clock never advances) each due resend is deferred, without the
+/// recv loop waiting on it, and after one effective RTO of deferral sent
+/// uncapped. So every lost message is still repaired.
+///
+/// The test first checks that each kind of datagram really was sent (and
+/// resends deferred), from the connections' own counters, so a run in which,
+/// say, no retransmission happened cannot pass by saying nothing about it.
+/// Once connected, the joiner drops 30 of its sends (the handshake is not
+/// affected), so some of its short messages are lost and retransmitted.
 #[tokio::test(start_paused = true)]
 async fn control_traffic_never_waits_for_the_egress_cap() {
     let channels: Channels = Arc::new(DashMap::new());
@@ -259,6 +265,13 @@ async fn control_traffic_never_waits_for_the_egress_cap() {
     let (retransmits, joiner_pongs, _) = joiner_conn.control_traffic_counts();
     let (_, gw_pongs, gw_acks) = gw_conn.control_traffic_counts();
     assert!(retransmits > 0, "premise: the joiner retransmitted");
+    let probe = joiner_conn.congestion_probe();
+    assert!(
+        probe.retransmits_deferred > 0 && probe.retransmits_uncapped > 0,
+        "premise: resends were deferred, then sent uncapped ({} deferred, {} uncapped)",
+        probe.retransmits_deferred,
+        probe.retransmits_uncapped
+    );
     assert!(
         joiner_pongs > 0 && gw_pongs > 0,
         "premise: both sides sent keepalive Pings and answered the other's \
