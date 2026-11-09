@@ -246,6 +246,67 @@ pub(super) fn note_child_runtime(state: &mut WrapperState, runtime_secs: u64) {
     }
 }
 
+/// The first crash count at which the wrapper tries an update itself
+/// ([`crash_update_due`], #6152).
+const CRASH_UPDATE_FIRST_AT: u32 = 3;
+
+/// Whether the wrapper tries `freenet update` itself after this many
+/// consecutive failures: at 3, 6, 12, 24 and 48, so at most five attempts
+/// before the wrapper gives up at [`WRAPPER_MAX_CONSECUTIVE_FAILURES`], each
+/// inside one backoff wait. A crash loop whose every run dies before the
+/// node's own update check otherwise never updates, so a release that fixes
+/// the crash cannot reach it (#6152). The attempts do not reset the failure
+/// count: the give-up limit still holds.
+pub(super) fn crash_update_due(consecutive_failures: u32) -> bool {
+    consecutive_failures >= CRASH_UPDATE_FIRST_AT
+        && consecutive_failures % CRASH_UPDATE_FIRST_AT == 0
+        && (consecutive_failures / CRASH_UPDATE_FIRST_AT).is_power_of_two()
+}
+
+/// One crash-loop update attempt ([`crash_update_due`]): claim the attempt
+/// as the node does (a locked-out node spends its daily retry, or skips if it
+/// is spent), run `freenet update` with the crash's exit code, and drive the
+/// failure counter as every other wrapper update path does. Returns whether
+/// the binary on disk was replaced. A failed or skipped attempt changes
+/// nothing else: the wrapper goes on with its backoff and relaunch.
+fn crash_loop_update(exe_path: &Path, log_dir: &Path, exit_code: i32, failures: u32) -> bool {
+    if let Err(reason) = super::super::auto_update::claim_update_attempt() {
+        log_wrapper_event(
+            log_dir,
+            &format!("{failures} consecutive failures; update check skipped: {reason}"),
+        );
+        return false;
+    }
+    log_wrapper_event(
+        log_dir,
+        &format!("{failures} consecutive failures; checking for an update before relaunching..."),
+    );
+    let result = spawn_update_command(exe_path, log_dir, Some(exit_code));
+    let outcome = super::super::update::classify_update_subprocess(&result);
+    match super::super::update::update_counter_action(outcome) {
+        super::super::update::UpdateCounterAction::Clear => {
+            super::super::auto_update::clear_update_failures();
+        }
+        super::super::update::UpdateCounterAction::Record => {
+            super::super::auto_update::record_update_failure();
+        }
+        super::super::update::UpdateCounterAction::NoChange => {}
+    }
+    let replaced = matches!(
+        outcome,
+        super::super::update::UpdateSubprocessOutcome::BinaryReplaced
+    );
+    log_wrapper_event(
+        log_dir,
+        if replaced {
+            "Update installed after a crash loop, restarting wrapper..."
+        } else {
+            "No update installed; continuing the backoff"
+        },
+    );
+    replaced
+}
+
 /// Pure function: given current state and exit info, determine the next action
 /// and update the state. Testable without spawning processes.
 pub(super) fn next_wrapper_action(
@@ -1227,12 +1288,12 @@ fn run_wrapper_loop(
         // `freenet update` (which finds no marker -> Proceed). Both are safe; the
         // in-process gate just avoids an unnecessary subprocess in the common
         // committed-crash case where we have the marker check in hand.
-        if exit_code != 0
+        let probation_crash = exit_code != 0
             && exit_code != WRAPPER_EXIT_ALREADY_RUNNING
             && exit_code != WRAPPER_EXIT_UPDATE_NEEDED
             && !is_port_conflict
-            && super::super::rollback::read_probation().is_some()
-        {
+            && super::super::rollback::read_probation().is_some();
+        if probation_crash {
             log_wrapper_event(
                 log_dir,
                 &format!(
@@ -1423,6 +1484,30 @@ fn run_wrapper_loop(
                         ),
                     );
                     return Ok(());
+                }
+
+                // #6152: a crash loop never reaches the node's own update
+                // check if every run dies first, so at a few crash counts
+                // (`crash_update_due`) the wrapper tries `freenet update`
+                // itself, inside the backoff wait it was going to sleep
+                // anyway. Not after an exit 42 or a probation crash: those
+                // already ran an update for this exit.
+                let mut secs = secs;
+                if exit_code != WRAPPER_EXIT_UPDATE_NEEDED
+                    && !probation_crash
+                    && crash_update_due(state.consecutive_failures)
+                {
+                    #[cfg(any(target_os = "windows", target_os = "macos"))]
+                    if let Some((_, status_tx)) = tray {
+                        status_tx.send(WrapperStatus::Updating).ok();
+                    }
+                    let started = std::time::Instant::now();
+                    if crash_loop_update(&exe_path, log_dir, exit_code, state.consecutive_failures)
+                        && spawn_new_wrapper(&exe_path, log_dir)
+                    {
+                        return Ok(());
+                    }
+                    secs = secs.saturating_sub(started.elapsed().as_secs());
                 }
 
                 #[cfg(any(target_os = "windows", target_os = "macos"))]

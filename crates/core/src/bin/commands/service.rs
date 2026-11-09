@@ -3944,6 +3944,82 @@ echo "RC=$?"
         assert_eq!(state.consecutive_failures, 7);
     }
 
+    /// #6152: a crash loop run to the wrapper's give-up limit tries an update
+    /// itself a bounded number of times, never before the third crash, never
+    /// twice for one failure count, and without resetting the count, so the
+    /// give-up limit still holds.
+    #[test]
+    fn a_crash_loop_triggers_a_bounded_update_attempt() {
+        let mut state = WrapperState::new();
+        let mut attempts_at = Vec::new();
+        let mut gave_up_at = None;
+        for crash in 1..=200u32 {
+            match next_wrapper_action(&mut state, 1, false, None) {
+                WrapperAction::BackoffAndRelaunch { .. } => {}
+                other @ (WrapperAction::Update
+                | WrapperAction::Exit
+                | WrapperAction::KillAndRetry) => {
+                    panic!("crash {crash}: {other:?}")
+                }
+            }
+            if state.consecutive_failures >= WRAPPER_MAX_CONSECUTIVE_FAILURES {
+                gave_up_at = Some(crash);
+                break;
+            }
+            if crash_update_due(state.consecutive_failures) {
+                attempts_at.push(state.consecutive_failures);
+            }
+        }
+        assert_eq!(attempts_at, vec![3, 6, 12, 24, 48]);
+        assert_eq!(gave_up_at, Some(WRAPPER_MAX_CONSECUTIVE_FAILURES));
+        assert!(!(0..3).any(crash_update_due), "not before the third crash");
+    }
+
+    /// The crash-loop update runs in the backoff branch only for an ordinary
+    /// crash (not after an exit 42 or a probation crash, which already ran an
+    /// update), after the give-up check, with the node's claim, the failure
+    /// counter driven like every other wrapper update, and the remaining
+    /// backoff shortened by the time it took. Pinned from the source, since
+    /// the loop spawns processes.
+    #[test]
+    fn the_crash_loop_update_is_wired_into_the_backoff() {
+        let src = include_str!("service/wrapper.rs");
+        let flat: String = src.split_whitespace().collect();
+        let arm = flat
+            .find("WrapperAction::BackoffAndRelaunch{secs}=>{")
+            .expect("the backoff arm");
+        let body = &flat[arm..];
+        let give_up = body.find("Givingupafter").expect("give-up check");
+        let due = body
+            .find("ifexit_code!=WRAPPER_EXIT_UPDATE_NEEDED&&!probation_crash&&crash_update_due(state.consecutive_failures)")
+            .expect("the gate");
+        let call = body
+            .find("crash_loop_update(&exe_path,log_dir,exit_code,state.consecutive_failures)")
+            .expect("the attempt");
+        let shorten = body
+            .find("secs=secs.saturating_sub(started.elapsed().as_secs());")
+            .expect("the shortened backoff");
+        let sleep = body
+            .find("sleep_with_jitter_interruptible(secs")
+            .expect("the sleep");
+        assert!(give_up < due && due < call && call < shorten && shorten < sleep);
+
+        let f = flat
+            .find("fncrash_loop_update(")
+            .expect("crash_loop_update");
+        let f = &flat[f..];
+        let claim = f
+            .find("auto_update::claim_update_attempt()")
+            .expect("claims like the node");
+        let spawn = f
+            .find("spawn_update_command(exe_path,log_dir,Some(exit_code))")
+            .expect("runs the update");
+        let counter = f
+            .find("update_counter_action(outcome)")
+            .expect("drives the counter");
+        assert!(claim < spawn && spawn < counter);
+    }
+
     #[test]
     fn test_wrapper_exit_43_exits_immediately() {
         let mut state = WrapperState::new();
@@ -4797,10 +4873,18 @@ echo "RC=$?"
             "manual tray update paths must pass None so they are not counted as \
              probation crashes (#4073)"
         );
+        // The crash-loop update (#6152) is post-stop too: it runs because the
+        // node crashed, so it passes the crash's exit code.
+        assert_eq!(
+            src.matches("spawn_update_command(exe_path, log_dir, Some(exit_code))")
+                .count(),
+            1,
+            "the crash-loop update must pass Some(exit_code) (#6152)"
+        );
         assert_eq!(
             src.matches("spawn_update_command(").count(),
-            2 + 3 + 1,
-            "every call site is one of the two forms above (plus the definition)"
+            2 + 3 + 1 + 1,
+            "every call site is one of the forms above (plus the definition)"
         );
         assert!(
             src.contains("POST_STOP_EXIT_CODE_ENV_VAR"),
