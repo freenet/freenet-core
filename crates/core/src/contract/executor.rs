@@ -3019,6 +3019,12 @@ mod tests {
                  (each data path's floor grant)",
             ),
             (
+                "RETAINED_DATAGRAM_BYTES",
+                "what quinn keeps per received datagram it holds, for ONE QUIC \
+                 connection's hold bound (quic::hold); a term of hold_charge, \
+                 inside quic_buffer_budget_for and the fixed charge",
+            ),
+            (
                 "INITIAL_RECEIVE_WINDOW_BYTES",
                 "the window ONE QUIC connection starts with before a data path's \
                  meter raises it; part of the fixed charge per connection",

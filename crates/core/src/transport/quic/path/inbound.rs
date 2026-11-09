@@ -693,6 +693,12 @@ impl<T: TimeSource> BodyReader<T> {
                         return Err(ReadFailure::Overlong);
                     }
                     if out.len() < stop {
+                        // Grow as `ReadBuffer` does, doubling up to the
+                        // declared length, and end exact (below).
+                        if stop > out.capacity() {
+                            let target = out.capacity().saturating_mul(2).max(stop).min(len);
+                            out.reserve_exact(target - out.len());
+                        }
                         out.resize(stop, 0);
                     }
                     out[at..stop].copy_from_slice(&bytes);
@@ -702,6 +708,7 @@ impl<T: TimeSource> BodyReader<T> {
                 None => return Err(ReadFailure::Truncated(held)),
             }
         }
+        out.shrink_to_fit();
         Ok(Bytes::from(out))
     }
 
