@@ -446,10 +446,10 @@ quic_outcomes! {
         /// A Stream did not fit the inbound budget (as above).
         StreamRefusedBudget => "stream_refused_budget",
         /// The connection's streams held more gaps (received ranges past the
-        /// first, per stream) than `inbound::MAX_GAPS_PER_CONNECTION`; the
+        /// first, per stream) than the connection's cap (`budget::gap_cap`); the
         /// stream that went past it was stopped (`stop_code::EVICTED`).
         TooManyRanges => "too_many_ranges",
-        /// The connection went past `inbound::MAX_GAPS_PER_CONNECTION` a
+        /// The connection went past its gap cap a
         /// second time, so the path was closed with OVER_BUDGET (once per path):
         /// the gaps of streams it stopped stay counted for the connection's
         /// life, because quinn keeps them until the peer ends the stream.
@@ -679,6 +679,9 @@ pub(crate) struct QuicPath {
     receive: tokio::task::JoinHandle<()>,
     /// Sends this side reset; closes the connection past the limit.
     aborts: Arc<SendAborts>,
+    /// The path's share of the node's buffer budget, for a path that reads
+    /// data (`budget::ConnMeter`); `None` for a shadow path.
+    meter: Option<Arc<super::budget::ConnMeter>>,
     /// One permit per streamed message in flight
     /// ([`STREAMED_SEND_LIMIT`]), so the remaining uni stream slots stay
     /// for short messages and control frames. Never closed.
@@ -788,7 +791,7 @@ impl QuicPath {
         budget: SharedInboundBudget,
     ) -> (Self, QuicInbound) {
         let (data, inbox) = channels_of(limits.short_capacity, limits.stream_capacity);
-        let (path, controls) = Self::with_budget(connection, time, limits, budget, data);
+        let (path, controls) = Self::with_budget(connection, time, limits, budget, data, None);
         let QuicDataInbox { shorts, streams } = inbox;
         (
             path,
@@ -842,6 +845,7 @@ impl QuicPath {
         limits: QuicPathLimits,
         budget: SharedInboundBudget,
         data: QuicDataSenders,
+        windows: Option<&Arc<super::budget::QuicBudget>>,
     ) -> (Self, mpsc::Receiver<Bytes>) {
         let stats = Arc::new(QuicPathStats::new(
             limits
@@ -849,7 +853,6 @@ impl QuicPath {
                 .unwrap_or(&crate::transport::TRANSPORT_METRICS.quic_data),
         ));
         let (controls_tx, controls) = mpsc::channel(limits.control_capacity);
-        #[cfg_attr(not(test), allow(unused_mut))]
         let mut receiver = inbound::Receiver::new(
             time.clone(),
             budget.clone(),
@@ -863,6 +866,19 @@ impl QuicPath {
         {
             receiver.panic_on_stream = limits.panic_in_receive;
             receiver.set_gap_cap(limits.max_gaps);
+        }
+        // A path that reads data takes a share of the node's buffer budget,
+        // which sets its windows from here on; a shadow path keeps the
+        // endpoint's floor windows.
+        let meter = windows.filter(|_| limits.accept_data).map(|windows| {
+            Arc::new(windows.register(
+                Arc::new(connection.inner().clone()),
+                receiver.ranges(),
+                time.now_nanos(),
+            ))
+        });
+        if let Some(meter) = &meter {
+            receiver.set_meter(meter.clone());
         }
         #[cfg(test)]
         let inbound_ranges = receiver.ranges();
@@ -889,8 +905,12 @@ impl QuicPath {
         );
         let heard = Arc::new(recycle::PeerHeard::default());
         #[cfg_attr(not(test), allow(unused_mut))]
-        let mut report =
-            recycle::PathReport::new(connection.inner().clone(), stats.node(), built_at);
+        let mut report = recycle::PathReport::new(
+            connection.inner().clone(),
+            stats.node(),
+            built_at,
+            meter.clone(),
+        );
         #[cfg(test)]
         {
             report.panic_once_bucketed = limits.panic_in_watch;
@@ -913,6 +933,7 @@ impl QuicPath {
                 stats,
                 receive,
                 aborts,
+                meter,
                 stream_slots: Arc::new(tokio::sync::Semaphore::new(STREAMED_SEND_LIMIT as usize)),
                 send_data: AtomicU8::new(SEND_DATA_NEVER),
                 counted_as_data_path: std::sync::atomic::AtomicBool::new(false),
@@ -1591,7 +1612,8 @@ impl QuicPath {
         };
         let stream = opened?;
         progress.mark_opened();
-        let mut send = Outgoing::new(stream, self.aborts.clone(), slot, pacing, progress);
+        let epoch = self.meter.as_ref().and_then(|meter| meter.send_epoch());
+        let mut send = Outgoing::new(stream, self.aborts.clone(), slot, pacing, progress, epoch);
         send.write_all(&header.encode()).await?;
         if !metadata.is_empty() {
             send.write_all(metadata).await?;
@@ -1759,6 +1781,10 @@ struct Outgoing {
     wrote_a_piece: bool,
     /// The send's pacing, for a paced data send ([`Self::write_paced`]).
     pacing: Option<pacer::Pacing>,
+    /// The send-window epoch the stream was opened in (`budget::ConnMeter`),
+    /// held until its data is acknowledged, so a send window lowered since
+    /// stays charged while quinn may still hold the stream's data.
+    epoch: Option<Arc<()>>,
 }
 
 type StoppedResult = Result<Option<quinn::VarInt>, quinn::StoppedError>;
@@ -1770,6 +1796,7 @@ impl Outgoing {
         slot: Option<tokio::sync::OwnedSemaphorePermit>,
         pacing: Option<pacer::Pacing>,
         progress: SendProgress,
+        epoch: Option<Arc<()>>,
     ) -> Self {
         let stopped = Box::pin(send.stopped());
         Self {
@@ -1782,6 +1809,7 @@ impl Outgoing {
             awaiting_ack: false,
             wrote_a_piece: false,
             pacing,
+            epoch,
         }
     }
 
@@ -1996,11 +2024,13 @@ impl Drop for Outgoing {
             return;
         }
         let stopped = std::mem::replace(&mut self.stopped, Box::pin(std::future::pending()));
+        let epoch = self.epoch.take();
         // Bounded as above and ending with the connection, so the handle is
         // not monitored.
         drop(GlobalExecutor::spawn(async move {
             let _ended = stopped.await;
             drop(slot);
+            drop(epoch);
         }));
     }
 }

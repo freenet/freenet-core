@@ -936,6 +936,9 @@ pub(crate) struct PathReport {
     /// When the path's time was last reported, in the time source's
     /// nanoseconds.
     timed_at: u64,
+    /// The path's budget meter, evaluated at each tick so an idle path's send
+    /// window and held epochs are settled too.
+    meter: Option<Arc<super::budget::ConnMeter>>,
     /// The next report that finds the path in a bucket panics, once
     /// (supervisor test).
     #[cfg(test)]
@@ -948,10 +951,12 @@ impl PathReport {
         connection: quinn::Connection,
         node: &'static crate::transport::metrics::QuicDataCounters,
         built_at: u64,
+        meter: Option<Arc<super::budget::ConnMeter>>,
     ) -> Self {
         let stats = connection.stats();
         Self {
             timed_at: built_at,
+            meter,
             bytes: UdpBytes::of(&stats),
             loss: PathLoss::of(&stats),
             window: crate::transport::metrics::PathLossWindow::new(node),
@@ -972,6 +977,9 @@ impl PathReport {
             let ms = now.saturating_sub(self.timed_at) / 1_000_000;
             self.timed_at = self.timed_at.saturating_add(ms * 1_000_000);
             self.node.record_path_time(ms);
+            if let Some(meter) = &self.meter {
+                meter.maybe_evaluate(now);
+            }
         }
         let stats = self.connection.stats();
         let (next, sent, got) = self.bytes.step(UdpBytes::of(&stats));

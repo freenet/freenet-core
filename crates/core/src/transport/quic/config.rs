@@ -394,16 +394,6 @@ pub(crate) const QUIC_MEMORY_MEASURED_WITH: [(&str, &str); 3] = [
     ("rustls", "0.23.45"),
 ];
 
-/// The smallest flow-control window per connection and direction.
-pub(crate) const MIN_WINDOW_BYTES: u64 = 128 * 1024;
-
-/// The largest flow-control window per connection and direction.
-pub(crate) const MAX_WINDOW_BYTES: u64 = 2 * 1024 * 1024;
-
-/// The share of the node's memory all QUIC windows together may hold, as a
-/// divisor: one twentieth, 5%.
-const WINDOW_MEMORY_DIVISOR: usize = 20;
-
 /// The rate a QUIC connection's window is capped at
 /// (`recycle::CappedCubic`): the fair share of `total-bandwidth-limit` when
 /// that is set, otherwise `bandwidth-limit`, otherwise none. The same rule as
@@ -454,14 +444,18 @@ impl QuicRateLimit {
 /// What the endpoint's settings are derived from.
 #[derive(Debug, Clone)]
 pub(crate) struct QuicSettings {
-    /// `max-number-of-connections`: the windows are split between this many.
-    pub max_connections: usize,
-    /// The memory the node may use (host RAM, or a cgroup limit).
+    /// The memory the node may use (host RAM, or a cgroup limit): sizes the
+    /// buffer budget ([`quic_buffer_budget_for`]) and the floor window
+    /// (`budget::floor_window_bytes`).
     pub memory_limit: usize,
     /// Simulation-only: quinn's idle timeout, in place of the time
     /// source's connection idle timeout (24 h on `VirtualTime`), so a
     /// simulation can see a silent QUIC path time out. `None` in production.
     pub idle_timeout: Option<Duration>,
+    /// The window every connection starts with, in place of the floor.
+    /// `None` in production; the memory measurements set it to measure quinn
+    /// at a given window.
+    pub initial_window: Option<u64>,
     /// The rate each connection's window is capped at. Set by the transport
     /// from its bandwidth settings when it binds (`bind_udp_listener`);
     /// none in what the config produces.
@@ -469,49 +463,29 @@ pub(crate) struct QuicSettings {
 }
 
 impl QuicSettings {
-    /// The flow-control window per connection and direction.
+    /// The flow-control window every connection starts with, per direction:
+    /// the floor for the node's memory (`budget::floor_window_bytes`, 128 KiB,
+    /// or 64 KiB under 2 GiB), never more than
+    /// [`MAX_INBOUND_STREAM_BYTES_PER_CONNECTION`]. A data path's windows then
+    /// grow and shrink within the node's buffer budget (`budget`); a shadow
+    /// path keeps these.
+    ///
+    /// [`MAX_INBOUND_STREAM_BYTES_PER_CONNECTION`]: crate::transport::peer_connection::streaming::MAX_INBOUND_STREAM_BYTES_PER_CONNECTION
     pub(crate) fn window_bytes(&self) -> u64 {
-        connection_window_bytes(self.memory_limit, self.max_connections)
+        self.initial_window
+            .unwrap_or_else(|| super::budget::floor_window_bytes(self.memory_limit))
+            .min(PER_CONNECTION_INBOUND_CAP)
     }
 }
 
-/// The flow-control window for one connection in one direction: 5% of the
-/// memory split over every connection's receive and send windows, clamped
-/// to [`MIN_WINDOW_BYTES`], [`MAX_WINDOW_BYTES`], and never more than
-/// [`MAX_INBOUND_STREAM_BYTES_PER_CONNECTION`] (that cap wins over the
-/// floor). The same value is the connection receive window, the per-stream
-/// receive window (so a stream's window is never above its connection's)
-/// and the send window.
-///
-/// The cap does not bind today (the 2 MiB clamp is far below it); it only
-/// stops a future constant change from raising the windows past it. It does
-/// NOT mean a QUIC connection holds no more memory than a UDP-transport one:
-/// QUIC windows come on top of whatever the application reassembles, the
-/// send window is outbound memory the reassembly exception never covered,
-/// and quinn holds received data beyond the window (its assembler keeps
-/// whole datagrams for small frames) and per-connection state the windows do
-/// not limit. Measured terms, and what was not measured, are listed above
-/// [`QUIC_CONNECTION_FIXED_BYTES`].
-///
-/// The windows are the same class of per-connection exception as inbound
-/// stream reassembly and are in the `NOT_SUMMED` table of
-/// `contract::executor::declared_cache_ceiling` (see the "Recorded
-/// exception: inbound stream reassembly" note in
-/// `.claude/rules/bug-prevention-patterns.md`). That memory is NOT
-/// accounted in the node aggregate, and must be before QUIC carries data by
-/// default (Step 3 at 100%; the rollout plan records that gate). Shadow
-/// paths, the default since Step 2, carry none.
-///
-/// [`MAX_INBOUND_STREAM_BYTES_PER_CONNECTION`]: crate::transport::peer_connection::streaming::MAX_INBOUND_STREAM_BYTES_PER_CONNECTION
-pub(crate) fn connection_window_bytes(memory_limit: usize, max_connections: usize) -> u64 {
-    let share = memory_limit / WINDOW_MEMORY_DIVISOR / (2 * max_connections.max(1));
-    (share as u64)
-        .clamp(MIN_WINDOW_BYTES, MAX_WINDOW_BYTES)
-        .min(PER_CONNECTION_INBOUND_CAP)
+/// The per-stream receive window: the largest connection window
+/// (`budget::MAX_WINDOW_BYTES`), within [`PER_CONNECTION_INBOUND_CAP`].
+pub(crate) fn stream_window() -> u64 {
+    super::budget::MAX_WINDOW_BYTES.min(PER_CONNECTION_INBOUND_CAP)
 }
 
-/// [`connection_window_bytes`]'s upper bound: the UDP transport's
-/// per-connection reassembly allowance.
+/// [`QuicSettings::window_bytes`]'s upper bound, and the per-stream receive
+/// window's: the UDP transport's per-connection reassembly allowance.
 const PER_CONNECTION_INBOUND_CAP: u64 =
     crate::transport::peer_connection::streaming::MAX_INBOUND_STREAM_BYTES_PER_CONNECTION;
 
@@ -585,8 +559,11 @@ pub(crate) fn transport_config<T: TimeSource>(
                 .unwrap_or_else(|| time.connection_idle_timeout()),
         )))
         .keep_alive_interval(time.supports_keepalive().then_some(KEEPALIVE_INTERVAL))
-        // A window is at most MAX_WINDOW_BYTES (2 MiB), far inside a VarInt.
-        .stream_receive_window(VarInt::from_u32(window as u32))
+        // A stream may use all of the largest connection window a path can
+        // grow to; the connection window, set per data path from the buffer
+        // budget (`budget`), is what bounds the peer. Both are at most
+        // budget::MAX_WINDOW_BYTES (8 MiB), far inside a VarInt.
+        .stream_receive_window(VarInt::from_u32(stream_window() as u32))
         .receive_window(VarInt::from_u32(window as u32))
         .send_window(window)
         .send_fairness(true)
