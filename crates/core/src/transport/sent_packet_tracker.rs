@@ -3563,7 +3563,9 @@ pub(in crate::transport) mod tests {
                         refused = true;
                         Err(wait)
                     }
-                    other => panic!("expected a deferral, got {other:?}"),
+                    other @ (RetxAdmit::Take(_) | RetxAdmit::Uncapped | RetxAdmit::SkipProbe) => {
+                        panic!("expected a deferral, got {other:?}")
+                    }
                 }
             });
             if matches!(action, ResendAction::WaitUntil(_)) && !refused {

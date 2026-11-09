@@ -2360,7 +2360,9 @@ fn a_booking_is_handed_back_or_costs_one_datagram() {
     ));
     match a.admit(&cap, ResendKind::Rto, PACKET, rto, time.now_nanos()) {
         RetxAdmit::Take(take) => drop(take),
-        other => panic!("the slot has come: expected a take, got {other:?}"),
+        other @ (RetxAdmit::Uncapped | RetxAdmit::Defer(_) | RetxAdmit::SkipProbe) => {
+            panic!("the slot has come: expected a take, got {other:?}")
+        }
     }
     assert_eq!(a.booked_slot(), None, "the take carries the booking");
     assert_eq!(next_slot(&cap), slot, "a dropped take hands it back");
@@ -2372,7 +2374,9 @@ fn a_booking_is_handed_back_or_costs_one_datagram() {
     ));
     match a.admit(&cap, ResendKind::Rto, PACKET, rto, time.now_nanos()) {
         RetxAdmit::Take(take) => take.sent(PACKET),
-        other => panic!("expected a take, got {other:?}"),
+        other @ (RetxAdmit::Uncapped | RetxAdmit::Defer(_) | RetxAdmit::SkipProbe) => {
+            panic!("expected a take, got {other:?}")
+        }
     }
     assert_eq!(next_slot(&cap), slot + one);
 
@@ -2388,7 +2392,9 @@ fn a_booking_is_handed_back_or_costs_one_datagram() {
 
     // Closed holding it: that one datagram, no more.
     let (cap, _time, a, slot) = booked();
-    drop(a);
+    {
+        let _closed = a;
+    }
     assert_eq!(
         next_slot(&cap),
         slot + one,
