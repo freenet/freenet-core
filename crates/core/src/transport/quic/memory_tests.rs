@@ -787,8 +787,19 @@ fn measure_gap_hold(shapes: &[Shape]) -> GapHold {
     measure_gap_hold_at(&settings(), shapes)
 }
 
-/// [`measure_gap_hold`] with the window `settings` give.
+/// [`measure_gap_hold_at`] with nothing read, as a stream in its ordered
+/// phase (header, metadata, short or control body) is while its first bytes
+/// are missing.
 fn measure_gap_hold_at(settings: &QuicSettings, shapes: &[Shape]) -> GapHold {
+    measure_gap_hold_reading(settings, shapes, false)
+}
+
+/// [`measure_gap_hold`] with the window `settings` give. With `unordered`, the
+/// receiver reads every stream unordered after each datagram, as the path's
+/// reader does in a Stream's payload phase, and drops what it read: what is
+/// measured is then quinn's own hold, without the charged buffer the reader
+/// copies into.
+fn measure_gap_hold_reading(settings: &QuicSettings, shapes: &[Shape], unordered: bool) -> GapHold {
     use quinn_proto::Dir;
 
     let _seed = GlobalRng::seed_guard(SEED);
@@ -815,6 +826,7 @@ fn measure_gap_hold_at(settings: &QuicSettings, shapes: &[Shape]) -> GapHold {
     let mut peak = 0isize;
     let mut transient = 0isize;
     let mut first_stream_curve = Vec::new();
+    let mut accepted = Vec::new();
     for (index, shape) in shapes.iter().enumerate() {
         let id = sender
             .conn()
@@ -833,7 +845,23 @@ fn measure_gap_hold_at(settings: &QuicSettings, shapes: &[Shape]) -> GapHold {
                 usize::from(super::config::MAX_UDP_PAYLOAD),
                 "padded to the MTU"
             );
-            let (_, delta, inside) = peak_delta(|| receiver.receive(now, sender.addr, &datagram));
+            let (_, delta, inside) = peak_delta(|| {
+                receiver.receive(now, sender.addr, &datagram);
+                if unordered {
+                    while let Some(stream) = receiver.conn().streams().accept(Dir::Uni) {
+                        accepted.push(stream);
+                    }
+                    for stream in &accepted {
+                        let mut recv = receiver.conn().recv_stream(*stream);
+                        if let Ok(mut chunks) = recv.read(false) {
+                            while let Ok(Some(chunk)) = chunks.next(usize::MAX) {
+                                drop(chunk);
+                            }
+                            let _ = chunks.finalize();
+                        }
+                    }
+                }
+            });
             transient = transient.max(held.rounded + inside);
             // The receiver's acknowledgements are dropped.
             let (_, acks) = live_delta(|| drop(receiver.transmit(now)));
@@ -1078,4 +1106,40 @@ fn the_fixed_charge_and_the_buffer_budget_match_the_design() {
     assert_eq!(quic_buffer_budget_for(1024 * MIB), 64 * MIB);
     assert_eq!(quic_buffer_budget_for(2048 * MIB), 128 * MIB);
     assert_eq!(quic_buffer_budget_for(7600 * MIB), 475 * MIB);
+}
+
+/// A Stream's payload is read unordered (`path::inbound`), so quinn hands over
+/// every chunk as it arrives, gap or not: with the frames that make quinn hold
+/// more than W when nothing is read, quinn holds at most the window's worth when
+/// the reader reads, within the `W + debt` the buffer budget charges a data
+/// path for received data (`budget`). Measured at the floor window and at the
+/// largest a path grows to.
+#[test]
+fn an_unordered_reader_leaves_quinn_within_the_window_charge() {
+    for window in [
+        super::budget::MIN_WINDOW_BYTES,
+        super::budget::MAX_WINDOW_BYTES,
+    ] {
+        let settings = QuicSettings {
+            memory_limit: 2 * 1024 * 1024 * 1024,
+            idle_timeout: None,
+            initial_window: Some(window),
+            rate_limit: Default::default(),
+        };
+        let w = window as usize;
+        for len in [444, 470] {
+            let held = measure_gap_hold_reading(&settings, &[Shape::filling(len, w)], false);
+            assert!(
+                held.peak > w as isize,
+                "premise: unread, {len} B frames held more than W = {w}: {} B",
+                held.peak
+            );
+            let read = measure_gap_hold_reading(&settings, &[Shape::filling(len, w)], true);
+            assert!(
+                read.transient <= w as isize,
+                "read unordered, {len} B frames at W = {w}: quinn held {} B, over the window",
+                read.transient
+            );
+        }
+    }
 }
