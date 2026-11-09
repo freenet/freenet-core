@@ -54,23 +54,37 @@
 //! counted ~14 delta sends per update handed to the bridge, so the loss was
 //! below it.
 //!
-//! On top of that, [`detect_stalls`] WARNs when a window's locally-originated
-//! (client) updates resolved targets, or lost their whole fan-out before it
-//! started, and nothing that started in that window or later reached the wire
-//! for the contract by the end of the next window (longer while one of that
-//! window's own streams is still in flight). Each window is judged on its own.
+//! On top of that, [`detect_stalls`] WARNs, at the end of window W, for a
+//! contract that over windows W-1 and W together had:
+//! - a local client update in W-1;
+//! - resolved fan-out targets, or a dropped fan-out, in either window;
+//! - nothing at all handed to the network bridge (`sent_delta + sent_full`
+//!   is zero across both windows).
+//!
+//! W is grace for a leg queued near the end of W-1, and judging the two
+//! windows together catches an update applied at the end of W-1 whose
+//! fan-out is processed in W. The rule reads only bridge-level counts, so the
+//! WARN targets the sender-side shapes: every leg skipped, every leg failing
+//! before the bridge, or the whole fan-out dropped. What the transport then
+//! did is in the `wire_*` counts, which never raise a WARN.
 //!
 //! What it cannot see:
-//! - Loss after the transport took a message: a single packet abandoned after
-//!   its retransmits, a message lost on the QUIC path (both count as reaching
-//!   the wire), and anything the receiver does with a message that arrived.
-//!   The transport has no per-message receiver acknowledgement to count; the
-//!   receiver-side `rx_*` counts, read across the fleet, are what is left.
-//! - Partial failure: one leg that reaches the wire clears the window, so 13 of
-//!   14 legs failing raises nothing. The per-contract counts show it.
+//! - Loss at or after the transport: a stream that fails after the bridge
+//!   took it, a single packet abandoned after its retransmits, a message lost
+//!   on the QUIC path, and anything the receiver does with a message that
+//!   arrived. Those are diagnosed from the `wire_*` counts here and the
+//!   receiver-side `rx_*` counts across the fleet.
+//! - Partial failure: one leg handed to the bridge clears both windows, so 13
+//!   of 14 legs failing raises nothing. The per-contract counts show it.
 //! - A fan-out that resolves no targets. That is the `no_targets` count, and
 //!   `handle_broadcast_state_change` WARNs once per streak of them.
-//! - Relayed updates. Only a client update is a candidate.
+//! - Relayed updates. Only a client update makes a contract a candidate. The
+//!   fan-out drop counter cannot tell a client fan-out from a relayed one, so
+//!   a relayed fan-out dropped beside a client update that resolved no
+//!   targets is counted as if it were the client's.
+//! - A contract whose window-W counts were refused at the
+//!   [`MAX_TRACKED_CONTRACTS`] cap reads as having sent nothing in W, so at
+//!   the cap a send in W can go unseen and the WARN can be false.
 //!
 //! A client update whose legs were ALL skipped as `skip_summary_equal` (or
 //! another converged skip) is a stall, not a success: it changed this node's
@@ -79,7 +93,6 @@
 //! for #6143.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::Duration;
 
 use dashmap::DashMap;
@@ -103,49 +116,21 @@ const TOP_K: usize = 8;
 /// dropped (its activity goes uncounted for that window) once the map is at
 /// capacity, rather than letting a key churn grow the map without bound.
 /// 4096 is comfortably above the active-contract count of a busy gateway.
-/// Each entry is at most [`MAX_COUNTERS_SIZE`] inline plus
-/// [`MAX_EARLIER_START_WINDOWS`] late-fate slots, so the map holds about 2 MB
-/// at the cap (pinned by `a_tracked_contract_stays_within_its_memory_bound`).
+/// Each entry is at most [`MAX_COUNTERS_SIZE`] plus its key, so the map holds
+/// about 1 MB at the cap, and the previous window's client-updated summaries
+/// kept for the stall check about 1 MB more (pinned by
+/// `a_tracked_contract_stays_within_its_memory_bound`).
 const MAX_TRACKED_CONTRACTS: usize = 4096;
 
-/// Upper bound on `size_of::<ContractCounters>()`, for the memory estimate
-/// above.
+/// Upper bound on `size_of::<ContractCounters>()` and
+/// `size_of::<ContractSummary>()`, for the memory estimate above.
 #[cfg(test)]
-const MAX_COUNTERS_SIZE: usize = 320;
-
-/// Most distinct earlier start windows one contract attributes stream fates
-/// to in one window. A stream outlives a 60 s window only when it is large,
-/// so a contract rarely has fates from more than one or two. A fate past the
-/// cap is counted in the summary and the telemetry but attributed to no start
-/// window, so a stall candidate waiting on it waits until
-/// [`MAX_STALL_CARRY_WINDOWS`].
-const MAX_EARLIER_START_WINDOWS: usize = 8;
+const MAX_COUNTERS_SIZE: usize = 256;
 
 /// Most stall WARN lines in one window. Past it, one more WARN gives the
 /// number left out. Each WARN is one contract, so this bounds the per-node
 /// WARN rate when many of this node's contracts stall at once.
 const MAX_STALL_WARNS_PER_WINDOW: usize = 16;
-
-/// Cap on contracts carried from one window to the next as stall candidates.
-/// A candidate needs a local client update, so the real population is the
-/// handful of contracts this node's own clients write to. The cap only stops
-/// a client flood from growing the map.
-const MAX_STALL_CANDIDATES: usize = 256;
-
-/// How many windows a stall candidate is held, past the one that raised it,
-/// while one of the streams that started in that window is still in flight
-/// (#6143). A stream's fate is counted when it reports, which for the largest
-/// stream the transport accepts is about 76 minutes after it starts
-/// (`broadcast_queue::stream_completion_timeout` of `MAX_STREAM_TOTAL_BYTES`),
-/// so a stream delivered late would otherwise be reported as a stall. A
-/// candidate waits only on its own window's streams, and every one of them
-/// reports by then because its waiter times out; this cap only guards against
-/// a fate that was never attributed (the tracking map was full, or more than
-/// [`MAX_EARLIER_START_WINDOWS`] start windows reported at once). Such a
-/// candidate is reported at the cap, a false WARN about 80 minutes late if
-/// the stream was in fact delivered. Pinned against the longest wait by
-/// `stall_carry_outlasts_the_longest_stream_wait`.
-pub(crate) const MAX_STALL_CARRY_WINDOWS: u32 = 80;
 
 /// One countable thing that happened to an UPDATE's propagation for a
 /// contract, other than the fan-out target resolution `record_broadcast`
@@ -345,67 +330,6 @@ impl EventCounts {
         self.get(PropagationEvent::SentDelta)
             .saturating_add(self.get(PropagationEvent::SentFull))
     }
-
-    /// Messages the transport took and did not report lost this window,
-    /// whatever window they started in: a single packet or an unobserved
-    /// path (neither reports a fate), or a stream whose last fragment left.
-    /// The stall check uses [`ContractSummary::reached_wire_since`], which
-    /// also asks when a stream started.
-    #[cfg(test)]
-    pub(crate) fn reached_wire(&self) -> u64 {
-        self.get(PropagationEvent::WireShort)
-            .saturating_add(self.get(PropagationEvent::WireUnobserved))
-            .saturating_add(self.get(PropagationEvent::WireStreamDelivered))
-    }
-}
-
-/// Where a stream started: the window its `WireStream` was counted in, so its
-/// fate can be matched to that window's stall candidate (#6143). Holds `None`
-/// when the start was not counted (the tracking map was full).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct StreamStart(Option<u64>);
-
-/// One contract's stream fates counted in one window, by the window each
-/// stream started in (#6143).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct StreamFates {
-    /// Fates of streams that started in this same window.
-    pub(crate) same_window: u64,
-    /// Fates of streams that started in an earlier window, as
-    /// `(start window, count)`; at most [`MAX_EARLIER_START_WINDOWS`] entries.
-    pub(crate) earlier: Vec<(u64, u64)>,
-    /// The latest start window among the streams delivered this window.
-    pub(crate) latest_delivered_start: Option<u64>,
-}
-
-impl StreamFates {
-    fn record(&mut self, window: u64, start: u64, delivered: bool) {
-        match start.cmp(&window) {
-            std::cmp::Ordering::Equal => self.same_window = self.same_window.saturating_add(1),
-            std::cmp::Ordering::Less => {
-                if let Some((_, n)) = self.earlier.iter_mut().find(|(w, _)| *w == start) {
-                    *n = n.saturating_add(1);
-                } else if self.earlier.len() < MAX_EARLIER_START_WINDOWS {
-                    self.earlier.push((start, 1));
-                }
-            }
-            // A start is stamped by an entry that existed before this one,
-            // so it is never later than this window.
-            std::cmp::Ordering::Greater => return,
-        }
-        if delivered {
-            self.latest_delivered_start = self.latest_delivered_start.max(Some(start));
-        }
-    }
-
-    /// Fates counted this window of streams that started in window `start`,
-    /// an earlier one.
-    fn started_in(&self, start: u64) -> u64 {
-        self.earlier
-            .iter()
-            .find(|(w, _)| *w == start)
-            .map_or(0, |(_, n)| *n)
-    }
 }
 
 /// Per-contract windowed counters.
@@ -448,11 +372,6 @@ struct ContractCounters {
     interest_resolve_failed: u64,
     /// Per-leg outcomes and the other [`PropagationEvent`]s (#6143).
     events: EventCounts,
-    /// The window this entry counts for, stamped when it is created. A
-    /// stream started on this entry is attributed to it ([`StreamStart`]).
-    window: u64,
-    /// Stream fates counted on this entry, by start window.
-    stream_fates: StreamFates,
 }
 
 impl ContractCounters {
@@ -482,25 +401,9 @@ pub(crate) struct ContractSummary {
     pub(crate) fully_covered: u64,
     pub(crate) interest_resolve_failed: u64,
     pub(crate) events: EventCounts,
-    pub(crate) stream_fates: StreamFates,
 }
 
 impl ContractSummary {
-    /// Whether anything for this contract that started in window `since` or
-    /// later reached the wire this window: a single packet or a QUIC send
-    /// (counted when the transport takes them, so they start this window),
-    /// or a delivered stream that started in `since` or later. A message that
-    /// started later carries state at least as new as window `since`'s
-    /// update. A stream from before `since` does not.
-    fn reached_wire_since(&self, since: u64) -> bool {
-        self.events.get(PropagationEvent::WireShort) > 0
-            || self.events.get(PropagationEvent::WireUnobserved) > 0
-            || self
-                .stream_fates
-                .latest_delivered_start
-                .is_some_and(|start| start >= since)
-    }
-
     /// True when the contract did anything this window worth a line: a
     /// fan-out, or any [`PropagationEvent`]. A heal-only or receive-only
     /// contract has no `updates` but still counts. `interest_resolve_failed`
@@ -615,172 +518,72 @@ pub(crate) fn aggregate_window(
     })
 }
 
-/// A contract whose local client updates resolved fan-out targets (or lost a
-/// whole fan-out to a full event-loop channel) in one window, and got nothing
-/// that started in that window or later onto the wire by the end of the next
-/// (#6143). Several of a contract's windows confirmed at once are merged into
-/// one report.
+/// A contract that stalled (#6143): a local client update in window W-1,
+/// resolved fan-out targets or a dropped fan-out in W-1 or W, and nothing
+/// handed to the network bridge in either window. See [`detect_stalls`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StallReport {
     pub(crate) contract: ContractInstanceId,
-    /// Client updates in the windows reported.
+    /// Client updates in W-1.
     pub(crate) client_originated: u64,
-    /// Targets resolved for this contract in those windows.
+    /// Targets resolved for this contract in W-1 and W.
     pub(crate) targets_total: u64,
-    /// Every event for this contract in those windows, so the WARN can say
-    /// where the legs went.
+    /// Every event for this contract in W-1 and W, so the WARN can say where
+    /// the legs went.
     pub(crate) events: EventCounts,
-    /// Fates of those windows' streams that came in a later window. None of
-    /// them was a delivery, which would have cleared the window.
-    pub(crate) late_stream_fates: u64,
 }
 
-impl StallReport {
-    fn merge(&mut self, other: &StallReport) {
-        self.client_originated = self
-            .client_originated
-            .saturating_add(other.client_originated);
-        self.targets_total = self.targets_total.saturating_add(other.targets_total);
-        self.events.merge(&other.events);
-        self.late_stream_fates = self
-            .late_stream_fates
-            .saturating_add(other.late_stream_fates);
+/// Whether `contract` stalled, judged on its window W-1 summary (`previous`)
+/// and its window W summary (`current`, `None` when it did nothing in W).
+/// Pure so the rule can be unit-tested without a runtime.
+fn stall_of(previous: &ContractSummary, current: Option<&ContractSummary>) -> Option<StallReport> {
+    let client_originated = previous.events.get(PropagationEvent::ClientOriginated);
+    if client_originated == 0 {
+        return None;
     }
-}
-
-/// One window's stall candidate, carried until a later window confirms or
-/// clears it. Keyed by `(contract, window)`, so each window is judged on its
-/// own counts and its own streams.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct StallCandidate {
-    client_originated: u64,
-    targets_total: u64,
-    events: EventCounts,
-    /// Streams started in the raising window with no fate counted in it.
-    streams_open: u64,
-    /// Fates of those streams counted in later windows.
-    late_stream_fates: u64,
-    /// Windows seen since the one that raised the candidate.
-    windows_carried: u32,
-}
-
-impl StallCandidate {
-    fn streams_in_flight(&self) -> u64 {
-        self.streams_open.saturating_sub(self.late_stream_fates)
+    let mut events = previous.events;
+    let mut targets_total = previous.targets_total;
+    if let Some(current) = current {
+        events.merge(&current.events);
+        targets_total = targets_total.saturating_add(current.targets_total);
     }
+    let fanned_out = targets_total > 0 || events.get(PropagationEvent::FanoutEventDropped) > 0;
+    (fanned_out && events.sent() == 0).then_some(StallReport {
+        contract: previous.contract,
+        client_originated,
+        targets_total,
+        events,
+    })
 }
 
-/// Whether window `window`'s summary raises a stall candidate: at least one
-/// local client update, nothing that reached the wire
-/// ([`ContractSummary::reached_wire_since`] this window), and either a
-/// resolved fan-out target or a client fan-out dropped before it started.
+/// The contracts that stalled at the end of window W, given W-1's summaries
+/// of the contracts with a client update (`previous`) and W's summaries
+/// (`current`). Sorted by contract id, at most one report per contract.
 ///
-/// A `BroadcastStateChange` refused by `try_notify` never resolves targets,
-/// so `targets_total` is zero for an update lost that way. The drop counter
-/// cannot tell a client fan-out from a relayed one, so a drop counts only
-/// when no fan-out of the contract was processed in the window
-/// (`updates == 0`). Otherwise a relayed update's drop beside a client update
-/// that resolved no targets (the `no_targets` case, not a stall) would raise
-/// one. The cost: a client fan-out dropped beside a processed relayed fan-out
-/// that resolved no targets is missed.
-fn raises_stall_candidate(s: &ContractSummary, window: u64) -> bool {
-    s.events.get(PropagationEvent::ClientOriginated) > 0
-        && !s.reached_wire_since(window)
-        && (s.targets_total > 0
-            || (s.updates == 0 && s.events.get(PropagationEvent::FanoutEventDropped) > 0))
-}
-
-/// Decide which contracts stalled, given the candidates carried from earlier
-/// windows and window `window`'s per-contract summaries. Updates `pending`
-/// with the candidates to carry into the next window.
+/// A contract stalls when, over W-1 and W together, it had a client update
+/// in W-1, resolved targets or a dropped fan-out in either window, and
+/// nothing handed to the bridge (`sent_delta + sent_full == 0`). W is grace
+/// for a leg queued near the end of W-1, and taking the two windows together
+/// catches an update applied at the end of W-1 whose fan-out is processed in
+/// W. A contract whose client keeps posting while every leg is skipped is
+/// reported every window.
 ///
-/// A candidate is raised by [`raises_stall_candidate`]: every leg was skipped,
-/// failed before the bridge, went out as a stream that then failed, or the
-/// whole fan-out was dropped. It is reported if the NEXT window also gets
-/// nothing that started in the raising window or later onto the wire. The
-/// second window is grace for a leg queued near the end of a window. Each
-/// window raises its own candidate, so a contract that keeps stalling with
-/// fresh client updates is reported in every window, and a stall behind a
-/// candidate that is still waiting is reported on time.
-///
-/// A candidate with one of its own window's streams still in flight is not
-/// reported but carried, for up to [`MAX_STALL_CARRY_WINDOWS`]: a large
-/// stream's fate can arrive many windows after it started, and a late
-/// `Delivered` is not a stall. Only fates of streams that started in the
-/// raising window count toward it, matched by [`StreamStart`]. A delivered
-/// one clears it; once all have failed it is reported.
-///
-/// Zero resolved targets with no dropped fan-out is deliberately not a
-/// candidate: that is the `no_targets` outcome, which
-/// `handle_broadcast_state_change` already WARNs.
-///
-/// Pure so the decision can be unit-tested without a runtime.
+/// Transport outcomes (`wire_*`) are deliberately not read: a leg the
+/// bridge took is not a stall here, however its stream ends, so a slow
+/// stream delivered many windows later never raises a WARN. Zero resolved
+/// targets with no dropped fan-out is not a stall either: that is the
+/// `no_targets` outcome, which `handle_broadcast_state_change` already WARNs.
 pub(crate) fn detect_stalls(
-    pending: &mut HashMap<(ContractInstanceId, u64), StallCandidate>,
-    window: u64,
-    summaries: &[ContractSummary],
+    previous: &HashMap<ContractInstanceId, ContractSummary>,
+    current: &[ContractSummary],
 ) -> Vec<StallReport> {
     let current: HashMap<ContractInstanceId, &ContractSummary> =
-        summaries.iter().map(|s| (s.contract, s)).collect();
-
-    let mut reports = Vec::new();
-    pending.retain(|&(contract, raised), candidate| {
-        let now = current.get(&contract);
-        if now.is_some_and(|s| s.reached_wire_since(raised)) {
-            return false;
-        }
-        if let Some(s) = now {
-            candidate.late_stream_fates = candidate
-                .late_stream_fates
-                .saturating_add(s.stream_fates.started_in(raised));
-        }
-        candidate.windows_carried = candidate.windows_carried.saturating_add(1);
-        if candidate.streams_in_flight() > 0 && candidate.windows_carried < MAX_STALL_CARRY_WINDOWS
-        {
-            return true;
-        }
-        reports.push(StallReport {
-            contract,
-            client_originated: candidate.client_originated,
-            targets_total: candidate.targets_total,
-            events: candidate.events,
-            late_stream_fates: candidate.late_stream_fates,
-        });
-        false
-    });
-    // One report per contract per window.
+        current.iter().map(|s| (s.contract, s)).collect();
+    let mut reports: Vec<StallReport> = previous
+        .values()
+        .filter_map(|p| stall_of(p, current.get(&p.contract).copied()))
+        .collect();
     reports.sort_by(|a, b| a.contract.as_bytes().cmp(b.contract.as_bytes()));
-    reports.dedup_by(|later, kept| {
-        if later.contract == kept.contract {
-            kept.merge(later);
-            true
-        } else {
-            false
-        }
-    });
-
-    for s in summaries {
-        if !raises_stall_candidate(s, window) {
-            continue;
-        }
-        if pending.len() >= MAX_STALL_CANDIDATES {
-            break;
-        }
-        pending.insert(
-            (s.contract, window),
-            StallCandidate {
-                client_originated: s.events.get(PropagationEvent::ClientOriginated),
-                targets_total: s.targets_total,
-                events: s.events,
-                streams_open: s
-                    .events
-                    .get(PropagationEvent::WireStream)
-                    .saturating_sub(s.stream_fates.same_window),
-                late_stream_fates: 0,
-                windows_carried: 0,
-            },
-        );
-    }
     reports
 }
 
@@ -790,31 +593,23 @@ pub(crate) fn detect_stalls(
 /// the background task started with [`Self::start_summary_task`].
 pub(crate) struct UpdatePropagationStats {
     contracts: DashMap<ContractInstanceId, ContractCounters>,
-    /// Stall candidates by `(contract, window)`. Touched only by the drain,
+    /// The previous window's summaries of the contracts that had a client
+    /// update, for [`detect_stalls`]. At most [`MAX_TRACKED_CONTRACTS`]
+    /// entries, since each was a tracked contract. Touched only by the drain,
     /// which runs on one task, so the lock is never contended.
-    stall_candidates: Mutex<HashMap<(ContractInstanceId, u64), StallCandidate>>,
-    /// The number of the window being counted. A new entry is stamped with
-    /// it, and [`Self::drain_window`] advances it.
-    window: AtomicU64,
+    previous_client_windows: Mutex<HashMap<ContractInstanceId, ContractSummary>>,
 }
 
 impl UpdatePropagationStats {
     pub(crate) fn new() -> Self {
         Self {
             contracts: DashMap::new(),
-            stall_candidates: Mutex::new(HashMap::new()),
-            window: AtomicU64::new(0),
+            previous_client_windows: Mutex::new(HashMap::new()),
         }
     }
 
-    /// The entry for `contract`, created and stamped with the current window
-    /// if absent, or `None` when a new contract would pass
-    /// [`MAX_TRACKED_CONTRACTS`].
-    ///
-    /// The stamp is read under the entry's shard guard, and
-    /// [`Self::drain_window`] advances the window before it visits any
-    /// shard, so an entry created after its shard was drained always carries
-    /// the next window's number.
+    /// The entry for `contract`, created if absent, or `None` when a new
+    /// contract would pass [`MAX_TRACKED_CONTRACTS`].
     fn counters(
         &self,
         contract: ContractInstanceId,
@@ -827,58 +622,17 @@ impl UpdatePropagationStats {
         {
             return None;
         }
-        Some(
-            self.contracts
-                .entry(contract)
-                .or_insert_with(|| ContractCounters {
-                    window: self.window.load(AtomicOrdering::SeqCst),
-                    ..ContractCounters::default()
-                }),
-        )
+        Some(self.contracts.entry(contract).or_default())
     }
 
     /// Count one [`PropagationEvent`] for `contract`.
     ///
     /// Same per-key write guard and tracking cap as [`Self::record_broadcast`].
     /// Production code reaches this through [`record_propagation_event`], which
-    /// also feeds the telemetry window, so the log and the telemetry agree.
+    /// also feeds the telemetry window.
     pub(crate) fn record_event(&self, contract: ContractInstanceId, ev: PropagationEvent) {
         if let Some(mut entry) = self.counters(contract) {
             entry.events.add(ev, 1);
-        }
-    }
-
-    /// Count a stream starting for `contract` (`WireStream`) and return
-    /// where it started, for [`Self::record_stream_fate`].
-    pub(crate) fn record_stream_start(&self, contract: ContractInstanceId) -> StreamStart {
-        match self.counters(contract) {
-            Some(mut entry) => {
-                entry.events.add(PropagationEvent::WireStream, 1);
-                StreamStart(Some(entry.window))
-            }
-            None => StreamStart(None),
-        }
-    }
-
-    /// Count the fate of a stream that started at `start`: the event, and
-    /// the start window it belongs to, so the stall check matches it to the
-    /// right window's candidate.
-    pub(crate) fn record_stream_fate(
-        &self,
-        contract: ContractInstanceId,
-        start: StreamStart,
-        ev: PropagationEvent,
-    ) {
-        if let Some(mut entry) = self.counters(contract) {
-            entry.events.add(ev, 1);
-            if let StreamStart(Some(started)) = start {
-                let window = entry.window;
-                entry.stream_fates.record(
-                    window,
-                    started,
-                    ev == PropagationEvent::WireStreamDelivered,
-                );
-            }
         }
     }
 
@@ -892,26 +646,11 @@ impl UpdatePropagationStats {
             .unwrap_or_default()
     }
 
-    /// Non-draining read of one contract's stream fates this window.
-    #[cfg(test)]
-    pub(crate) fn stream_fates_for_test(&self, contract: &ContractInstanceId) -> StreamFates {
-        self.contracts
-            .get(contract)
-            .map(|c| c.stream_fates.clone())
-            .unwrap_or_default()
-    }
-
-    /// The window being counted.
-    #[cfg(test)]
-    pub(crate) fn window_for_test(&self) -> u64 {
-        self.window.load(AtomicOrdering::SeqCst)
-    }
-
     /// Drain one window and run the stall check on it, without logging.
     #[cfg(test)]
     fn drain_stalls_for_test(&self) -> Vec<StallReport> {
-        let (window, drained) = self.drain_window();
-        detect_stalls(&mut self.stall_candidates.lock(), window, &drained)
+        let drained = self.drain_window();
+        self.check_stalls(&drained)
     }
 
     /// Record the terminal outcome of one logical broadcast for `contract`.
@@ -990,20 +729,9 @@ impl UpdatePropagationStats {
     /// P2 — the cap blind-spot under key churn). Any `record_broadcast` that
     /// runs after a shard is visited simply re-creates the entry and is
     /// counted in the next window.
-    ///
-    /// Returns the number of the window drained. The window is advanced
-    /// first, so an entry created during the drain is stamped with the next
-    /// window and is kept for it: every summary returned is of this window,
-    /// and a stream's [`StreamStart`] is always the window its start was
-    /// counted in.
-    fn drain_window(&self) -> (u64, Vec<ContractSummary>) {
-        let window = self.window.fetch_add(1, AtomicOrdering::SeqCst);
+    fn drain_window(&self) -> Vec<ContractSummary> {
         let mut out = Vec::with_capacity(self.contracts.len());
         self.contracts.retain(|id, counters| {
-            if counters.window > window {
-                // Created after the window advanced: the next window's.
-                return true;
-            }
             if !counters.is_empty() {
                 out.push(ContractSummary {
                     contract: *id,
@@ -1013,13 +741,26 @@ impl UpdatePropagationStats {
                     fully_covered: counters.fully_covered,
                     interest_resolve_failed: counters.interest_resolve_failed,
                     events: counters.events,
-                    stream_fates: std::mem::take(&mut counters.stream_fates),
                 });
             }
             // Remove every entry — clears the map so the cap resets each window.
             false
         });
-        (window, out)
+        out
+    }
+
+    /// Run [`detect_stalls`] on the window just drained against the one
+    /// before it, then keep this window's client-updated contracts for the
+    /// next check.
+    fn check_stalls(&self, drained: &[ContractSummary]) -> Vec<StallReport> {
+        let mut previous = self.previous_client_windows.lock();
+        let stalls = detect_stalls(&previous, drained);
+        *previous = drained
+            .iter()
+            .filter(|s| s.events.get(PropagationEvent::ClientOriginated) > 0)
+            .map(|s| (s.contract, s.clone()))
+            .collect();
+        stalls
     }
 
     /// Drain the current window, emit it at INFO, and WARN for any contract
@@ -1030,8 +771,8 @@ impl UpdatePropagationStats {
     /// call it directly after recording, instead of waiting on the real-time
     /// ticker).
     pub(crate) fn drain_and_log(&self) -> u64 {
-        let (window, drained) = self.drain_window();
-        let stalls = detect_stalls(&mut self.stall_candidates.lock(), window, &drained);
+        let drained = self.drain_window();
+        let stalls = self.check_stalls(&drained);
         log_stalls(&stalls);
 
         let Some(summary) = aggregate_window(drained, TOP_K) else {
@@ -1198,17 +939,11 @@ fn log_stall(stall: &StallReport) {
         skip_no_address = e.get(PropagationEvent::SkipNoAddress),
         send_failed = e.get(PropagationEvent::SendFailed),
         fanout_event_dropped = e.get(PropagationEvent::FanoutEventDropped),
-        sent_delta = e.get(PropagationEvent::SentDelta),
-        sent_full = e.get(PropagationEvent::SentFull),
-        wire_stream = e.get(PropagationEvent::WireStream),
-        wire_stream_failed = e.get(PropagationEvent::WireStreamFailed),
-        wire_stream_egress_abandoned = e.get(PropagationEvent::WireStreamEgressAbandoned),
-        late_stream_fates = stall.late_stream_fates,
         window_s = SUMMARY_WINDOW.as_secs(),
         phase = "origination_stall",
-        "update_propagation_stalled: local client updates found broadcast targets \
-         or lost their fan-out, and nothing sent since reached the wire by the end \
-         of the next window (#6143)"
+        "update_propagation_stalled: a local client update found broadcast targets \
+         or lost its fan-out, and nothing was handed to the network for the contract \
+         in that window or the next (#6143)"
     );
 }
 
@@ -1235,23 +970,14 @@ impl PropagationSink {
         self.mix.record_propagation_event(ev);
     }
 
-    /// Same as [`record_propagation_stream_start`].
-    pub(crate) fn record_stream_start(&self, contract: &ContractInstanceId) -> StreamStart {
-        self.mix
-            .record_propagation_event(PropagationEvent::WireStream);
-        self.stats.record_stream_start(*contract)
-    }
-
     /// Same as [`record_propagation_stream_fate`].
     pub(crate) fn record_stream_fate(
         &self,
         contract: &ContractInstanceId,
-        start: StreamStart,
         outcome: Option<crate::transport::StreamSendOutcome>,
     ) -> PropagationEvent {
         let ev = PropagationEvent::for_stream_outcome(outcome);
-        self.stats.record_stream_fate(*contract, start, ev);
-        self.mix.record_propagation_event(ev);
+        self.record(contract, ev);
         ev
     }
 
@@ -1276,8 +1002,10 @@ impl PropagationSink {
 /// Count one [`PropagationEvent`] in BOTH the per-contract INFO summary and
 /// the node-wide `broadcast_payload_mix` telemetry window.
 ///
-/// The single entry point production code uses, so the two can never
-/// disagree about what happened.
+/// The single entry point production code uses, so the two agree on every
+/// event, with one exception: a contract new to the window once
+/// [`MAX_TRACKED_CONTRACTS`] are tracked is left out of the per-contract
+/// summary, while the node-wide telemetry still counts its events.
 pub(crate) fn record_propagation_event(
     op_manager: &crate::node::OpManager,
     contract: &ContractInstanceId,
@@ -1289,36 +1017,16 @@ pub(crate) fn record_propagation_event(
     op_manager.payload_mix.record_propagation_event(ev);
 }
 
-/// Count an UPDATE broadcast stream starting (`WireStream`), like
-/// [`record_propagation_event`], and return where it started. Pass that to
-/// [`record_propagation_stream_fate`] when the stream reports, so the stall
-/// check can match the fate to the window the stream started in.
-pub(crate) fn record_propagation_stream_start(
-    op_manager: &crate::node::OpManager,
-    contract: &ContractInstanceId,
-) -> StreamStart {
-    op_manager
-        .payload_mix
-        .record_propagation_event(PropagationEvent::WireStream);
-    op_manager
-        .update_propagation_stats
-        .record_stream_start(*contract)
-}
-
-/// Count the fate of a stream counted by [`record_propagation_stream_start`],
-/// from its completion signal (`None` when none came). Returns the event
-/// counted.
+/// Count the fate of an UPDATE broadcast stream from its completion signal
+/// (`None` when none came), like [`record_propagation_event`]. Returns the
+/// event counted.
 pub(crate) fn record_propagation_stream_fate(
     op_manager: &crate::node::OpManager,
     contract: &ContractInstanceId,
-    start: StreamStart,
     outcome: Option<crate::transport::StreamSendOutcome>,
 ) -> PropagationEvent {
     let ev = PropagationEvent::for_stream_outcome(outcome);
-    op_manager
-        .update_propagation_stats
-        .record_stream_fate(*contract, start, ev);
-    op_manager.payload_mix.record_propagation_event(ev);
+    record_propagation_event(op_manager, contract, ev);
     ev
 }
 
@@ -1348,7 +1056,6 @@ mod tests {
             fully_covered: 0,
             interest_resolve_failed: 5,
             events: EventCounts::default(),
-            stream_fates: StreamFates::default(),
         }];
         assert!(aggregate_window(summaries, TOP_K).is_none());
     }
@@ -1364,7 +1071,6 @@ mod tests {
                 fully_covered: 0,
                 interest_resolve_failed: 1,
                 events: EventCounts::default(),
-                stream_fates: StreamFates::default(),
             },
             ContractSummary {
                 contract: cid(2),
@@ -1374,7 +1080,6 @@ mod tests {
                 fully_covered: 0,
                 interest_resolve_failed: 4,
                 events: EventCounts::default(),
-                stream_fates: StreamFates::default(),
             },
         ];
         let w = aggregate_window(summaries, TOP_K).expect("non-empty");
@@ -1405,7 +1110,6 @@ mod tests {
                 fully_covered: 0,
                 interest_resolve_failed: 0,
                 events: EventCounts::default(),
-                stream_fates: StreamFates::default(),
             })
             .collect();
         let w = aggregate_window(summaries, 2).expect("non-empty");
@@ -1430,7 +1134,6 @@ mod tests {
                 fully_covered: 0,
                 interest_resolve_failed: 0,
                 events: EventCounts::default(),
-                stream_fates: StreamFates::default(),
             },
             ContractSummary {
                 contract: cid(3),
@@ -1440,7 +1143,6 @@ mod tests {
                 fully_covered: 0,
                 interest_resolve_failed: 0,
                 events: EventCounts::default(),
-                stream_fates: StreamFates::default(),
             },
         ];
         let w = aggregate_window(summaries, 1).expect("non-empty");
@@ -1460,7 +1162,7 @@ mod tests {
         stats.record_broadcast(c, 3, 0);
         stats.record_broadcast(c, 0, 2);
 
-        let drained = stats.drain_window().1;
+        let drained = stats.drain_window();
         assert_eq!(drained.len(), 1);
         let s = &drained[0];
         assert_eq!(s.contract, c);
@@ -1474,7 +1176,7 @@ mod tests {
         assert_eq!(stats.contracts.len(), 0);
 
         // A second drain with no new activity yields nothing.
-        let drained2 = stats.drain_window().1;
+        let drained2 = stats.drain_window();
         assert!(drained2.is_empty());
         assert_eq!(stats.contracts.len(), 0);
     }
@@ -1495,7 +1197,7 @@ mod tests {
             stats.record_broadcast(id_at(i), 1, 0);
         }
         assert_eq!(stats.contracts.len(), MAX_TRACKED_CONTRACTS);
-        let drained = stats.drain_window().1;
+        let drained = stats.drain_window();
         assert_eq!(drained.len(), MAX_TRACKED_CONTRACTS);
         assert_eq!(
             stats.contracts.len(),
@@ -1510,7 +1212,7 @@ mod tests {
             stats.contracts.get(&fresh).is_some(),
             "new contract must be tracked in the window after a full drain"
         );
-        let drained2 = stats.drain_window().1;
+        let drained2 = stats.drain_window();
         assert_eq!(drained2.len(), 1);
         assert_eq!(drained2[0].contract, fresh);
         assert_eq!(drained2[0].targets_total, 2);
@@ -1571,7 +1273,7 @@ mod tests {
                 scope.spawn(move || {
                     let mut acc = (0u64, 0u64, 0u64, 0u64);
                     let mut drain_once = || {
-                        for s in stats.drain_window().1 {
+                        for s in stats.drain_window() {
                             assert!(
                                 s.updates > 0,
                                 "field-split: drained summary has updates==0 with \
@@ -1718,7 +1420,7 @@ mod tests {
 
         stats.record_fully_covered_broadcast(c, 0);
 
-        let summaries = stats.drain_window().1;
+        let summaries = stats.drain_window();
         assert_eq!(summaries.len(), 1, "the outcome must be recorded at all");
         let s = &summaries[0];
 
@@ -1749,7 +1451,7 @@ mod tests {
         // red and the two entry points need re-examining.
         let regressed = UpdatePropagationStats::new();
         regressed.record_broadcast(c, 0, 0);
-        let regressed_summaries = regressed.drain_window().1;
+        let regressed_summaries = regressed.drain_window();
         assert_eq!(
             regressed_summaries[0].no_targets, 1,
             "`record_broadcast` with zero targets is the propagation-FAILURE \
@@ -1883,7 +1585,6 @@ mod tests {
             fully_covered: 0,
             interest_resolve_failed: 0,
             events,
-            stream_fates: StreamFates::default(),
         }
     }
 
@@ -1978,6 +1679,14 @@ mod tests {
         if targets > 0 {
             stats.record_broadcast(c, targets, 0);
         }
+        record(stats, c, events);
+    }
+
+    fn record(
+        stats: &UpdatePropagationStats,
+        c: ContractInstanceId,
+        events: &[(PropagationEvent, u64)],
+    ) {
         for (ev, n) in events {
             for _ in 0..*n {
                 stats.record_event(c, *ev);
@@ -1986,15 +1695,14 @@ mod tests {
     }
 
     /// The #6143 signature: a client update found 14 targets and every leg was
-    /// skipped. One window raises a candidate; a second window with no send
-    /// confirms it, exactly once.
+    /// skipped. The window it happened in is grace; the end of the next window
+    /// reports it, exactly once.
     #[test]
     fn a_client_update_with_targets_and_no_send_for_two_windows_is_a_stall() {
         let stats = UpdatePropagationStats::new();
         let c = cid(9);
         client_update(&stats, c, 14, &[(PropagationEvent::SkipSummaryEqual, 14)]);
         assert!(stats.drain_stalls_for_test().is_empty(), "grace window");
-        assert_eq!(stats.stall_candidates.lock().len(), 1);
 
         let reports = stats.drain_stalls_for_test();
         assert_eq!(reports.len(), 1);
@@ -2007,139 +1715,45 @@ mod tests {
             "the WARN must carry where the legs went"
         );
         assert!(
-            stats.stall_candidates.lock().is_empty(),
+            stats.drain_stalls_for_test().is_empty(),
             "reported once, not every window after"
         );
-        assert!(stats.drain_stalls_for_test().is_empty());
     }
 
-    /// The shape #6143's own telemetry fits: every leg handed to the bridge,
-    /// and every one then lost as a failed or abandoned stream. Counting at
-    /// the bridge alone would call this healthy.
+    /// An update applied at the end of W-1 whose fan-out is processed in W:
+    /// the client update and the targets land in different windows. Judging
+    /// W-1 alone sees a client update with no targets; judging W alone sees
+    /// targets with no client update. Together they are a stall.
     #[test]
-    fn legs_handed_to_the_bridge_whose_streams_all_failed_are_a_stall() {
+    fn an_update_straddling_two_windows_is_a_stall() {
         let stats = UpdatePropagationStats::new();
         let c = cid(10);
-        let lose_all = || {
-            client_update(&stats, c, 14, &[(PropagationEvent::SentDelta, 14)]);
-            for i in 0..14 {
-                let start = stats.record_stream_start(c);
-                let fate = if i < 10 {
-                    PropagationEvent::WireStreamFailed
-                } else {
-                    PropagationEvent::WireStreamEgressAbandoned
-                };
-                stats.record_stream_fate(c, start, fate);
-            }
-        };
-        lose_all();
-        assert!(stats.drain_stalls_for_test().is_empty(), "grace window");
-        lose_all();
+        stats.record_event(c, PropagationEvent::ClientOriginated);
+        assert!(stats.drain_stalls_for_test().is_empty());
+        stats.record_broadcast(c, 3, 0);
+        record(&stats, c, &[(PropagationEvent::SkipSummaryEqual, 3)]);
         let reports = stats.drain_stalls_for_test();
-        assert_eq!(reports.len(), 1);
-        assert_eq!(
-            reports[0].events.get(PropagationEvent::SentDelta),
-            14,
-            "the first window's own counts"
-        );
-        assert_eq!(
-            reports[0]
-                .events
-                .get(PropagationEvent::WireStreamEgressAbandoned),
-            4
-        );
-        assert_eq!(
-            stats.drain_stalls_for_test().len(),
-            1,
-            "the second window is reported on its own"
-        );
+        assert_eq!(reports.len(), 1, "{reports:?}");
+        assert_eq!(reports[0].client_originated, 1);
+        assert_eq!(reports[0].targets_total, 3, "W's targets count");
+        assert_eq!(reports[0].events.get(PropagationEvent::SkipSummaryEqual), 3);
     }
 
-    /// A stream still in flight at the window boundary, delivered in the next
-    /// window, clears the candidate.
+    /// The same straddle, with the fan-out dropped in W rather than resolved.
     #[test]
-    fn a_stream_delivered_in_the_grace_window_clears_the_candidate() {
+    fn a_fanout_dropped_in_the_next_window_is_a_stall() {
         let stats = UpdatePropagationStats::new();
         let c = cid(11);
-        client_update(&stats, c, 2, &[(PropagationEvent::SentDelta, 2)]);
-        let starts = [stats.record_stream_start(c), stats.record_stream_start(c)];
+        stats.record_event(c, PropagationEvent::ClientOriginated);
         assert!(stats.drain_stalls_for_test().is_empty());
+        stats.record_event(c, PropagationEvent::FanoutEventDropped);
+        let reports = stats.drain_stalls_for_test();
+        assert_eq!(reports.len(), 1, "{reports:?}");
+        assert_eq!(reports[0].targets_total, 0);
         assert_eq!(
-            stats.stall_candidates.lock().len(),
-            1,
-            "in flight: nothing has reached the wire yet"
+            reports[0].events.get(PropagationEvent::FanoutEventDropped),
+            1
         );
-        stats.record_stream_fate(c, starts[0], PropagationEvent::WireStreamDelivered);
-        assert!(stats.drain_stalls_for_test().is_empty());
-        assert!(stats.stall_candidates.lock().is_empty());
-    }
-
-    #[test]
-    fn a_send_in_the_grace_window_clears_the_candidate() {
-        let stats = UpdatePropagationStats::new();
-        let c = cid(9);
-        client_update(&stats, c, 3, &[]);
-        assert!(stats.drain_stalls_for_test().is_empty());
-        // The legs were queued near the boundary and went out in the next window.
-        stats.record_event(c, PropagationEvent::SentDelta);
-        stats.record_event(c, PropagationEvent::WireShort);
-        assert!(stats.drain_stalls_for_test().is_empty());
-        assert!(stats.stall_candidates.lock().is_empty());
-    }
-
-    #[test]
-    fn non_candidates_never_warn() {
-        let stats = UpdatePropagationStats::new();
-        // Reached the wire in the same window.
-        client_update(&stats, cid(1), 5, &[(PropagationEvent::SentFull, 1)]);
-        let start = stats.record_stream_start(cid(1));
-        stats.record_stream_fate(cid(1), start, PropagationEvent::WireStreamDelivered);
-        // No targets: the NO_TARGETS path, which already WARNs itself.
-        client_update(&stats, cid(2), 0, &[]);
-        stats.record_broadcast(cid(2), 0, 0);
-        // No client update: relayed traffic that found every peer current.
-        stats.record_broadcast(cid(3), 5, 0);
-        stats.record_event(cid(3), PropagationEvent::SkipSummaryEqual);
-        assert!(stats.drain_stalls_for_test().is_empty());
-        assert!(
-            stats.stall_candidates.lock().is_empty(),
-            "none of these is a candidate"
-        );
-        assert!(stats.drain_stalls_for_test().is_empty());
-    }
-
-    /// A stall that keeps going while the client keeps posting is reported in
-    /// every window, each report carrying its own window's counts.
-    #[test]
-    fn a_continuing_stall_is_reported_once_per_window() {
-        let stats = UpdatePropagationStats::new();
-        let c = cid(9);
-        let stall = || client_update(&stats, c, 14, &[(PropagationEvent::SkipEmptyDelta, 14)]);
-        stall();
-        assert!(stats.drain_stalls_for_test().is_empty());
-        for _ in 0..3 {
-            stall();
-            let reports = stats.drain_stalls_for_test();
-            assert_eq!(reports.len(), 1);
-            assert_eq!(reports[0].events.get(PropagationEvent::SkipEmptyDelta), 14);
-            assert_eq!(
-                stats.stall_candidates.lock().len(),
-                1,
-                "this window's updates are a new candidate"
-            );
-        }
-    }
-
-    #[test]
-    fn stall_candidates_are_capped() {
-        let stats = UpdatePropagationStats::new();
-        for i in 0..MAX_STALL_CANDIDATES + 10 {
-            let mut bytes = [0u8; 32];
-            bytes[..8].copy_from_slice(&(i as u64).to_le_bytes());
-            client_update(&stats, ContractInstanceId::new(bytes), 1, &[]);
-        }
-        stats.drain_stalls_for_test();
-        assert_eq!(stats.stall_candidates.lock().len(), MAX_STALL_CANDIDATES);
     }
 
     /// A client update whose whole fan-out was dropped by `try_notify` never
@@ -2151,284 +1765,134 @@ mod tests {
         let c = cid(12);
         client_update(&stats, c, 0, &[(PropagationEvent::FanoutEventDropped, 1)]);
         assert!(stats.drain_stalls_for_test().is_empty(), "grace");
-        assert_eq!(
-            stats.stall_candidates.lock().len(),
-            1,
-            "a dropped fan-out raises a candidate"
-        );
         let reports = stats.drain_stalls_for_test();
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].targets_total, 0);
-        assert_eq!(
-            reports[0].events.get(PropagationEvent::FanoutEventDropped),
-            1
-        );
     }
 
-    /// The drop counter cannot tell a client fan-out from a relayed one. When
-    /// a fan-out of the contract WAS processed in the window (here the
-    /// client's, which found no targets), the drop is taken as a relayed
-    /// update's and raises nothing: the client update is a `no_targets`
-    /// outcome, not a stall.
+    /// A leg handed to the bridge in either window clears the contract,
+    /// whether it went with the update (W-1) or was queued near the boundary
+    /// and went out in W.
     #[test]
-    fn a_dropped_fanout_beside_a_processed_one_is_not_a_stall() {
-        let stats = UpdatePropagationStats::new();
-        let c = cid(17);
-        client_update(&stats, c, 0, &[(PropagationEvent::FanoutEventDropped, 1)]);
-        stats.record_broadcast(c, 0, 0);
-        assert!(stats.drain_stalls_for_test().is_empty());
-        assert!(stats.stall_candidates.lock().is_empty());
-        assert!(stats.drain_stalls_for_test().is_empty());
-    }
-
-    /// A stream still in flight when the grace window ends is not a stall
-    /// yet: its fate decides. Delivered several windows later clears it;
-    /// failed several windows later reports it.
-    #[test]
-    fn a_candidate_with_a_stream_in_flight_waits_for_its_fate() {
-        let stats = UpdatePropagationStats::new();
-        let (late_ok, late_fail) = (cid(13), cid(14));
-        let mut starts = Vec::new();
-        for c in [late_ok, late_fail] {
-            client_update(&stats, c, 1, &[(PropagationEvent::SentFull, 1)]);
-            starts.push(stats.record_stream_start(c));
+    fn a_send_in_either_window_clears_the_contract() {
+        for sent in [PropagationEvent::SentDelta, PropagationEvent::SentFull] {
+            let stats = UpdatePropagationStats::new();
+            let (same, next) = (cid(13), cid(14));
+            client_update(&stats, same, 3, &[(sent, 1)]);
+            client_update(&stats, next, 3, &[]);
+            assert!(stats.drain_stalls_for_test().is_empty());
+            stats.record_event(next, sent);
+            assert!(stats.drain_stalls_for_test().is_empty(), "{sent:?}");
+            assert!(stats.drain_stalls_for_test().is_empty(), "{sent:?}");
         }
-        assert!(stats.drain_stalls_for_test().is_empty());
-        for _ in 0..3 {
-            assert!(
-                stats.drain_stalls_for_test().is_empty(),
-                "a stream in flight is not a stall"
-            );
-            assert_eq!(stats.stall_candidates.lock().len(), 2, "both are carried");
-        }
-        stats.record_stream_fate(late_ok, starts[0], PropagationEvent::WireStreamDelivered);
-        stats.record_stream_fate(late_fail, starts[1], PropagationEvent::WireStreamFailed);
-        let reports = stats.drain_stalls_for_test();
-        assert_eq!(reports.len(), 1, "{reports:?}");
-        assert_eq!(reports[0].contract, late_fail);
-        assert_eq!(reports[0].events.get(PropagationEvent::WireStream), 1);
-        assert_eq!(reports[0].late_stream_fates, 1);
-        assert!(stats.stall_candidates.lock().is_empty());
     }
 
-    /// A stream whose fate is never counted cannot hold a candidate forever.
+    /// Only W-1 and W are read: a send two windows before the client update
+    /// does not clear it.
     #[test]
-    fn an_in_flight_stream_holds_a_candidate_for_a_bounded_number_of_windows() {
+    fn a_send_before_the_update_window_does_not_clear_it() {
         let stats = UpdatePropagationStats::new();
         let c = cid(15);
-        client_update(&stats, c, 1, &[]);
-        let _never_reported = stats.record_stream_start(c);
-        stats.drain_stalls_for_test();
-        let mut windows = 0;
-        loop {
-            windows += 1;
-            if !stats.drain_stalls_for_test().is_empty() {
-                break;
+        stats.record_broadcast(c, 2, 0);
+        record(&stats, c, &[(PropagationEvent::SentDelta, 2)]);
+        assert!(stats.drain_stalls_for_test().is_empty());
+        client_update(&stats, c, 2, &[(PropagationEvent::SkipSummaryEqual, 2)]);
+        assert!(stats.drain_stalls_for_test().is_empty());
+        assert_eq!(stats.drain_stalls_for_test().len(), 1);
+    }
+
+    /// A large stream the bridge took can report many windows later. It was
+    /// handed to transport, so it is never a stall, whenever and however it
+    /// ends: transport outcomes are counters only.
+    #[test]
+    fn a_slow_stream_never_warns_however_it_ends() {
+        use crate::test_utils::TestLogger;
+
+        let logger = TestLogger::new().capture_logs().with_level("warn").init();
+        for fate in [
+            PropagationEvent::WireStreamDelivered,
+            PropagationEvent::WireStreamFailed,
+            PropagationEvent::WireStreamEgressAbandoned,
+        ] {
+            let stats = UpdatePropagationStats::new();
+            let c = cid(16);
+            client_update(
+                &stats,
+                c,
+                1,
+                &[
+                    (PropagationEvent::SentFull, 1),
+                    (PropagationEvent::WireStream, 1),
+                ],
+            );
+            for _ in 0..10 {
+                assert_eq!(stats.drain_and_log(), 0, "{fate:?}: in flight");
             }
-            assert!(windows < 1000, "never reported");
+            stats.record_event(c, fate);
+            assert_eq!(stats.drain_and_log(), 0, "{fate:?}: reported");
+            assert_eq!(stats.drain_and_log(), 0, "{fate:?}");
         }
-        assert_eq!(windows, MAX_STALL_CARRY_WINDOWS);
-        assert!(stats.stall_candidates.lock().is_empty());
+        let warns = logger.logs_matching(|l| l.contains("update_propagation_stalled"));
+        assert!(warns.is_empty(), "{warns:#?}");
     }
 
-    /// Each window is judged on its own: a client update whose legs all fail
-    /// while an earlier window's candidate is still waiting on a slow stream
-    /// is reported one window later, not when the slow stream reports.
     #[test]
-    fn a_stall_behind_a_carried_candidate_is_reported_on_time() {
+    fn non_candidates_never_warn() {
         let stats = UpdatePropagationStats::new();
-        let c = cid(18);
-        client_update(&stats, c, 1, &[(PropagationEvent::SentFull, 1)]);
-        let slow = stats.record_stream_start(c);
+        // Handed to the bridge in the same window.
+        client_update(&stats, cid(1), 5, &[(PropagationEvent::SentFull, 1)]);
+        // No targets and no dropped fan-out: the NO_TARGETS path, which
+        // already WARNs itself.
+        client_update(&stats, cid(2), 0, &[]);
+        stats.record_broadcast(cid(2), 0, 0);
+        // No client update: relayed traffic that found every peer current.
+        stats.record_broadcast(cid(3), 5, 0);
+        stats.record_event(cid(3), PropagationEvent::SkipSummaryEqual);
+        // A dropped fan-out with no client update.
+        stats.record_event(cid(4), PropagationEvent::FanoutEventDropped);
         assert!(stats.drain_stalls_for_test().is_empty());
-
-        client_update(&stats, c, 3, &[(PropagationEvent::SkipSummaryEqual, 3)]);
-        assert!(
-            stats.drain_stalls_for_test().is_empty(),
-            "grace, and in flight"
-        );
-        let reports = stats.drain_stalls_for_test();
-        assert_eq!(reports.len(), 1, "the second window's stall, on time");
-        assert_eq!(reports[0].events.get(PropagationEvent::SkipSummaryEqual), 3);
-        assert_eq!(
-            reports[0].events.get(PropagationEvent::WireStream),
-            0,
-            "the carried window's counts are not merged in"
-        );
-        assert_eq!(
-            stats.stall_candidates.lock().len(),
-            1,
-            "the first window still waits on its stream"
-        );
-
-        stats.record_stream_fate(c, slow, PropagationEvent::WireStreamDelivered);
+        // Targets and a drop in W do not make W-1 a candidate without a
+        // client update in W-1.
+        stats.record_broadcast(cid(3), 5, 0);
+        stats.record_event(cid(4), PropagationEvent::FanoutEventDropped);
         assert!(stats.drain_stalls_for_test().is_empty());
-        assert!(stats.stall_candidates.lock().is_empty());
+        assert!(stats.drain_stalls_for_test().is_empty());
     }
 
-    /// A candidate waits only on its own window's streams. A stream started
-    /// later, still in flight when the candidate's own stream fails, does not
-    /// hold it.
+    /// A stall that keeps going while the client keeps posting is reported in
+    /// every window, each report carrying the two windows it judged, and once
+    /// more after the client stops.
     #[test]
-    fn a_stream_started_during_a_carry_does_not_hold_the_candidate() {
+    fn a_continuing_stall_is_reported_once_per_window() {
         let stats = UpdatePropagationStats::new();
-        let c = cid(19);
-        client_update(&stats, c, 1, &[(PropagationEvent::SentFull, 1)]);
-        let own = stats.record_stream_start(c);
+        let c = cid(17);
+        let stall = || client_update(&stats, c, 14, &[(PropagationEvent::SkipEmptyDelta, 14)]);
+        stall();
         assert!(stats.drain_stalls_for_test().is_empty());
-        assert!(
-            stats.drain_stalls_for_test().is_empty(),
-            "own stream in flight"
-        );
-
-        // A relayed update's stream starts and is still in flight when the
-        // candidate's own stream fails.
-        stats.record_broadcast(c, 1, 0);
-        stats.record_event(c, PropagationEvent::SentFull);
-        let _relayed = stats.record_stream_start(c);
-        stats.record_stream_fate(c, own, PropagationEvent::WireStreamFailed);
-        let reports = stats.drain_stalls_for_test();
-        assert_eq!(reports.len(), 1, "its own stream failed: {reports:?}");
-        assert_eq!(reports[0].late_stream_fates, 1);
-        assert!(stats.stall_candidates.lock().is_empty());
-    }
-
-    /// An older window's stream delivered late clears that window, not a
-    /// newer one whose own stream is still in flight: it carries older state.
-    #[test]
-    fn an_older_streams_delivery_does_not_clear_a_newer_candidate() {
-        let stats = UpdatePropagationStats::new();
-        let c = cid(20);
-        client_update(&stats, c, 1, &[(PropagationEvent::SentFull, 1)]);
-        let first = stats.record_stream_start(c);
-        assert!(stats.drain_stalls_for_test().is_empty());
-        client_update(&stats, c, 1, &[(PropagationEvent::SentFull, 1)]);
-        let second = stats.record_stream_start(c);
-        assert!(stats.drain_stalls_for_test().is_empty());
-        assert_eq!(stats.stall_candidates.lock().len(), 2);
-
-        stats.record_stream_fate(c, first, PropagationEvent::WireStreamDelivered);
-        assert!(stats.drain_stalls_for_test().is_empty());
-        assert_eq!(
-            stats
-                .stall_candidates
-                .lock()
-                .keys()
-                .map(|(_, w)| *w)
-                .collect::<Vec<_>>(),
-            vec![1],
-            "only the first window is cleared"
-        );
-
-        stats.record_stream_fate(c, second, PropagationEvent::WireStreamFailed);
-        let reports = stats.drain_stalls_for_test();
-        assert_eq!(reports.len(), 1);
-        assert_eq!(reports[0].late_stream_fates, 1);
-    }
-
-    /// A newer window's stream delivered clears an older candidate: it
-    /// carries state at least as new.
-    #[test]
-    fn a_newer_streams_delivery_clears_an_older_candidate() {
-        let stats = UpdatePropagationStats::new();
-        let c = cid(21);
-        client_update(&stats, c, 1, &[(PropagationEvent::SentFull, 1)]);
-        let _slow = stats.record_stream_start(c);
-        assert!(stats.drain_stalls_for_test().is_empty());
-        stats.record_broadcast(c, 1, 0);
-        let newer = stats.record_stream_start(c);
-        stats.record_stream_fate(c, newer, PropagationEvent::WireStreamDelivered);
-        assert!(stats.drain_stalls_for_test().is_empty());
-        assert!(stats.stall_candidates.lock().is_empty());
-    }
-
-    /// Fates are attributed to the window the stream's start was counted in,
-    /// whichever window they arrive in.
-    #[test]
-    fn a_stream_fate_is_attributed_to_its_start_window() {
-        let stats = UpdatePropagationStats::new();
-        let c = cid(22);
-        let s0 = stats.record_stream_start(c);
-        assert_eq!(s0, StreamStart(Some(0)));
-        stats.record_stream_fate(c, s0, PropagationEvent::WireStreamFailed);
-        let s0b = stats.record_stream_start(c);
-        assert_eq!(stats.stream_fates_for_test(&c).same_window, 1);
-        stats.drain_window();
-        let s1 = stats.record_stream_start(c);
-        assert_eq!(s1, StreamStart(Some(1)));
-        stats.record_stream_fate(c, s0b, PropagationEvent::WireStreamDelivered);
-        let fates = stats.stream_fates_for_test(&c);
-        assert_eq!(fates.same_window, 0);
-        assert_eq!(fates.earlier, vec![(0, 1)]);
-        assert_eq!(fates.latest_delivered_start, Some(0));
-        let (window, drained) = stats.drain_window();
-        assert_eq!(window, 1);
-        assert_eq!(drained[0].stream_fates.started_in(0), 1);
-        assert_eq!(stats.window_for_test(), 2);
-    }
-
-    /// An entry created after a drain advanced the window, but before the
-    /// drain reached its shard, belongs to the next window: the drain keeps
-    /// it. Otherwise a stream started on it would be counted in this window
-    /// while stamped with the next, and its fate never matched. Emulates the
-    /// interleaving by stamping the entry ahead of the drain.
-    #[test]
-    fn an_entry_created_during_a_drain_is_kept_for_the_next_window() {
-        let stats = UpdatePropagationStats::new();
-        let c = cid(24);
-        stats.window.store(1, AtomicOrdering::SeqCst);
-        let start = stats.record_stream_start(c);
-        assert_eq!(start, StreamStart(Some(1)));
-        stats.window.store(0, AtomicOrdering::SeqCst);
-
-        let (window, drained) = stats.drain_window();
-        assert_eq!(window, 0);
-        assert!(drained.is_empty(), "{drained:?}");
-        let (window, drained) = stats.drain_window();
-        assert_eq!(window, 1);
-        assert_eq!(drained.len(), 1);
-        assert_eq!(drained[0].events.get(PropagationEvent::WireStream), 1);
-    }
-
-    /// The late-fate list is bounded: past [`MAX_EARLIER_START_WINDOWS`]
-    /// start windows a fate is counted but not attributed.
-    #[test]
-    fn late_fates_are_attributed_to_a_bounded_number_of_start_windows() {
-        let stats = UpdatePropagationStats::new();
-        let c = cid(23);
-        let starts: Vec<_> = (0..MAX_EARLIER_START_WINDOWS + 3)
-            .map(|_| {
-                let s = stats.record_stream_start(c);
-                stats.drain_window();
-                s
-            })
-            .collect();
-        for s in &starts {
-            stats.record_stream_fate(c, *s, PropagationEvent::WireStreamFailed);
+        for _ in 0..3 {
+            stall();
+            let reports = stats.drain_stalls_for_test();
+            assert_eq!(reports.len(), 1);
+            assert_eq!(reports[0].client_originated, 1, "W-1's client updates");
+            assert_eq!(reports[0].events.get(PropagationEvent::SkipEmptyDelta), 28);
         }
-        let fates = stats.stream_fates_for_test(&c);
-        assert_eq!(fates.earlier.len(), MAX_EARLIER_START_WINDOWS);
-        assert_eq!(
-            stats
-                .events_for_test(&c)
-                .get(PropagationEvent::WireStreamFailed),
-            starts.len() as u64,
-            "every fate is still counted"
-        );
+        assert_eq!(stats.drain_stalls_for_test().len(), 1, "the last update");
+        assert!(stats.drain_stalls_for_test().is_empty());
     }
 
     /// The memory estimate on [`MAX_TRACKED_CONTRACTS`] holds.
     #[test]
     fn a_tracked_contract_stays_within_its_memory_bound() {
-        assert!(
-            std::mem::size_of::<ContractCounters>() <= MAX_COUNTERS_SIZE,
-            "{} bytes",
-            std::mem::size_of::<ContractCounters>()
-        );
+        for (what, size) in [
+            ("ContractCounters", std::mem::size_of::<ContractCounters>()),
+            ("ContractSummary", std::mem::size_of::<ContractSummary>()),
+        ] {
+            assert!(size <= MAX_COUNTERS_SIZE, "{what}: {size} bytes");
+        }
     }
 
     /// After a runtime stall or a suspend the summary task must not drain a
-    /// burst of milliseconds-long windows: that would confirm a candidate
+    /// burst of milliseconds-long windows: that would report a stall
     /// with no real grace window. One drain covers the missed span, and the
     /// next comes a full window after it (`Delay`), not at the next multiple
     /// of the period from the start (`Skip`).
@@ -2476,31 +1940,39 @@ mod tests {
         task.abort();
     }
 
-    /// More stalled contracts in a window than [`MAX_STALL_WARNS_PER_WINDOW`]
-    /// give that many WARNs and one rollup; the count returned is all of them.
+    /// Up to [`MAX_STALL_WARNS_PER_WINDOW`] stalled contracts in a window give
+    /// one WARN each and no rollup; one more gives that many WARNs and a
+    /// rollup of 1. The count returned is all of them either way.
     #[test]
     fn stall_warns_are_capped_per_window() {
         use crate::test_utils::TestLogger;
 
-        let logger = TestLogger::new().capture_logs().with_level("warn").init();
-        let stats = UpdatePropagationStats::new();
-        let n = MAX_STALL_WARNS_PER_WINDOW + 5;
-        for i in 0..n {
-            client_update(&stats, cid(100 + i as u8), 2, &[]);
+        for (n, rollup) in [
+            (MAX_STALL_WARNS_PER_WINDOW, None),
+            (MAX_STALL_WARNS_PER_WINDOW + 1, Some("1 more contract(s)")),
+        ] {
+            let logger = TestLogger::new().capture_logs().with_level("warn").init();
+            let stats = UpdatePropagationStats::new();
+            for i in 0..n {
+                client_update(&stats, cid(100 + i as u8), 2, &[]);
+            }
+            assert_eq!(stats.drain_and_log(), 0);
+            assert_eq!(stats.drain_and_log(), n as u64);
+            let logs = logger.logs();
+            let per_contract = logs
+                .iter()
+                .filter(|l| l.contains("origination_stall") && !l.contains("rollup"))
+                .count();
+            assert_eq!(per_contract, MAX_STALL_WARNS_PER_WINDOW, "n={n}: {logs:#?}");
+            let found = logs.iter().find(|l| l.contains("origination_stall_rollup"));
+            match rollup {
+                None => assert!(found.is_none(), "n={n}: {found:?}"),
+                Some(text) => {
+                    let line = found.expect("one rollup line");
+                    assert!(line.contains(text), "n={n}: {line}");
+                }
+            }
         }
-        assert_eq!(stats.drain_and_log(), 0);
-        assert_eq!(stats.drain_and_log(), n as u64);
-        let logs = logger.logs();
-        let per_contract = logs
-            .iter()
-            .filter(|l| l.contains("origination_stall") && !l.contains("rollup"))
-            .count();
-        assert_eq!(per_contract, MAX_STALL_WARNS_PER_WINDOW, "{logs:#?}");
-        let rollup = logs
-            .iter()
-            .find(|l| l.contains("origination_stall_rollup"))
-            .expect("one rollup line");
-        assert!(rollup.contains("5 more contract(s)"), "{rollup}");
     }
 
     /// End to end through the real recorders and the real drain: the INFO line
@@ -2584,25 +2056,22 @@ mod tests {
                 !line.starts_with("//") && line.contains(needle)
             })
         };
-        // A stream's start and its three fates are recorded by the stream
-        // recorders, which BOTH stream paths must call: the broadcast queue's
-        // full-state streams and the connection task's inline broadcasts.
+        // Both stream paths (the broadcast queue's full-state streams and the
+        // connection task's inline broadcasts) must count a stream's start
+        // and record its fate through the stream-fate recorder, which maps
+        // the outcome to one of the three fate events.
         let by_outcome = [
             PropagationEvent::WireStream,
             PropagationEvent::WireStreamDelivered,
             PropagationEvent::WireStreamFailed,
             PropagationEvent::WireStreamEgressAbandoned,
         ];
-        for (src, start, fate) in [
-            (
-                sources[0],
-                "record_propagation_stream_start(",
-                "record_propagation_stream_fate(",
-            ),
-            (sources[1], ".record_stream_start(", ".record_stream_fate("),
+        for (src, fate) in [
+            (sources[0], "record_propagation_stream_fate("),
+            (sources[1], ".record_stream_fate("),
         ] {
             assert!(
-                named(src, start) && named(src, fate),
+                named(src, "PropagationEvent::WireStream)") && named(src, fate),
                 "a stream path no longer records its stream's start and fate"
             );
         }
