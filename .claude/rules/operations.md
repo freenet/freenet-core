@@ -230,7 +230,9 @@ production always does), `ContractHandlerChannel::send_to_handler` hands a
 `DelegateRequest` to the lane's bounded intake (128, `try_send`; full means
 refused at once; a request that is not the node's own local client, i.e. a
 non-local scope or a hosted user, may fill only 7/8 of it,
-`LOCAL_INTAKE_RESERVE`). The lane runs a request itself only when its
+`LOCAL_INTAKE_RESERVE`; on a hosted node the reserve therefore protects only
+the operator's own local requests, and hosted users share the other 7/8 among
+themselves). The lane runs a request itself only when its
 delegate is free and fewer than `MAX_PENDING_UNITS` (16) continuations wait
 for the loop; every other request it FORWARDS, unchanged (same id, priority,
 scope, user, responder), into this loop's event channel. The fair-queue
@@ -242,7 +244,12 @@ through the lane. A forwarded request carries a `LaneTicket` marking its
 (delegate key, user) "loop-owned" until the event is dropped (after the
 `DelegateRequest` arm finishes, before the client is answered, or when the
 fair queue refuses it), so that user's later requests for the delegate
-follow rather than overtake. A forged node-only message is forwarded
+follow rather than overtake. That order is per client and fair-queue
+priority slot (each slot is FIFO; client delegate requests are all
+`ClientLocal`). If the lane task dies it hands its buffered requests to the
+loop, later requests go to the loop directly, and the router snapshot counts
+the death (`delegate_lane_deaths`) and those requests
+(`delegate_lane_forwarded_lane_down`). A forged node-only message is forwarded
 without a ticket. Units (continuations of lane runs) run at the
 TOP of each loop iteration, ahead of the fair queue, at most
 `MAX_LANE_UNITS_PER_ITERATION` (4) per iteration; every `claim_delegate` and

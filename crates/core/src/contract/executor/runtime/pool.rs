@@ -286,8 +286,16 @@ impl ExecutorFactory {
     /// The delegate executor: a pool-shaped executor with its own small,
     /// fixed Store arena budget (`DELEGATE_STORE_ARENA_BYTES`), so it does not
     /// take a share of the contract executors' RAM-scaled arena envelope.
+    ///
+    /// Its store is the only one that deletes temporary `.reg` records: it is
+    /// built at start-up before the lane exists, or as a replacement while
+    /// the delegate executor's lock is held, so no repair is in flight.
     async fn create_delegate_executor(&self) -> anyhow::Result<Executor<Runtime>> {
-        let mut executor = self.create().await?;
+        let stores = SharedStores {
+            clean_delegate_tmp_records: true,
+            ..self.shared_stores.clone()
+        };
+        let mut executor = self.create_with(stores).await?;
         executor
             .runtime
             .set_store_arena_budget_bytes(crate::wasm_runtime::DELEGATE_STORE_ARENA_BYTES as u64);
@@ -295,6 +303,10 @@ impl ExecutorFactory {
     }
 
     async fn create(&self) -> anyhow::Result<Executor<Runtime>> {
+        self.create_with(self.shared_stores.clone()).await
+    }
+
+    async fn create_with(&self, stores: SharedStores) -> anyhow::Result<Executor<Runtime>> {
         let mut executor = Executor::from_config_with_shared_modules(
             self.config.clone(),
             self.shared_state_store.clone(),
@@ -305,7 +317,7 @@ impl ExecutorFactory {
             self.shared_delegate_counter.clone(),
             self.shared_inherited_origins.clone(),
             Some(self.shared_backend_engine.clone()),
-            self.shared_stores.clone(),
+            stores,
         )
         .await?;
         executor.set_shared_notifications(
@@ -338,9 +350,10 @@ impl ExecutorFactory {
 ///   writer (`secrets_store::quota`). The live secret import takes the same
 ///   lock for the same reason.
 ///
-/// The lock is held only around the synchronous `delegate_request` call and a
-/// replacement after a WASM panic; nothing that waits on the contract loop
-/// runs under it, so the loop awaiting it cannot deadlock.
+/// The lock is held only around the synchronous `delegate_request` call, the
+/// live secret import (a full bundle decrypt and write), and a replacement
+/// after a WASM panic; nothing that waits on the contract loop runs under it,
+/// so the loop awaiting it cannot deadlock.
 ///
 /// Separate from the pool rather than one of its slots, so a delegate run
 /// never takes an executor contract work needs, and a 1-executor node still

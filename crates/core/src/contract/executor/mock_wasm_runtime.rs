@@ -228,6 +228,10 @@ pub(crate) struct MockWasmRuntime {
     /// (see [`PauseAfterNextRun`]). Lets a test hold a loop round-trip
     /// BETWEEN two `process()` calls, with the runner's lock released.
     pub(crate) delegate_pause_after: DelegatePauseSlot,
+    /// Called with the delegate key at the start of every scripted delegate
+    /// run, on whichever task runs it. Lets a test observe node state WHILE
+    /// a run is in progress.
+    pub(crate) delegate_run_hook: DelegateRunHook,
     /// A delegate lane runner over this mock's delegate state, when a test
     /// opted in with [`MockWasmRuntime::enable_delegate_lane`]. `None` (the
     /// default) keeps every delegate run on the contract loop, as every test
@@ -246,7 +250,12 @@ pub(crate) struct MockDelegateState {
     unregistered: UnregisteredDelegates,
     wrong_variant: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pause_after: DelegatePauseSlot,
+    run_hook: DelegateRunHook,
 }
+
+/// See [`MockWasmRuntime::delegate_run_hook`].
+pub(crate) type DelegateRunHook =
+    std::sync::Arc<std::sync::Mutex<Option<Box<dyn FnMut(&DelegateKey) + Send>>>>;
 
 /// Shared slot for a [`PauseAfterNextRun`].
 pub(crate) type DelegatePauseSlot = std::sync::Arc<std::sync::Mutex<Option<PauseAfterNextRun>>>;
@@ -323,6 +332,7 @@ impl MockWasmRuntime {
             unregistered: self.unregistered_delegates.clone(),
             wrong_variant: self.delegate_wrong_variant.clone(),
             pause_after: self.delegate_pause_after.clone(),
+            run_hook: self.delegate_run_hook.clone(),
         }
     }
 
@@ -756,6 +766,14 @@ fn scripted_delegate_request(
     // stays the "not supported" error it has always been, so no existing
     // test changes behaviour.
     let key = req.key().clone();
+    if let Some(hook) = state
+        .run_hook
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()
+    {
+        hook(&key);
+    }
     if state
         .wrong_variant
         .load(std::sync::atomic::Ordering::SeqCst)
@@ -1050,6 +1068,7 @@ impl Executor<MockWasmRuntime, MockStateStorage> {
             unregistered_delegates: UnregisteredDelegates::default(),
             delegate_wrong_variant: std::sync::Arc::default(),
             delegate_pause_after: std::sync::Arc::default(),
+            delegate_run_hook: std::sync::Arc::default(),
             delegate_lane: None,
         };
 
@@ -1091,6 +1110,7 @@ impl Executor<MockWasmRuntime, MockStateStorage> {
             unregistered_delegates: UnregisteredDelegates::default(),
             delegate_wrong_variant: std::sync::Arc::default(),
             delegate_pause_after: std::sync::Arc::default(),
+            delegate_run_hook: std::sync::Arc::default(),
             delegate_lane: None,
         };
 
@@ -1124,6 +1144,7 @@ impl Executor<MockWasmRuntime, MockStateStorage> {
             unregistered_delegates: UnregisteredDelegates::default(),
             delegate_wrong_variant: std::sync::Arc::default(),
             delegate_pause_after: std::sync::Arc::default(),
+            delegate_run_hook: std::sync::Arc::default(),
             delegate_lane: None,
         };
 

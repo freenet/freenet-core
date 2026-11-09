@@ -761,12 +761,13 @@ pub(crate) struct RouterSnapshotInfo {
     /// populated them.
     pub hosting_retractions_emitted: Option<u64>,
     pub hosting_retractions_dropped: Option<u64>,
-    /// Delegate lane refusals (full intake), lane panics and dropped
-    /// inter-delegate messages (`network_status::delegate_lane_counts`).
-    /// Monotonic lifetime totals; `None` until the ring's snapshot task has
-    /// populated them.
+    /// Delegate lane refusals (full intake), caught run panics, lane task
+    /// deaths (permanent fallback to the loop) and dropped inter-delegate
+    /// messages (`network_status::delegate_lane_counts`). Monotonic lifetime
+    /// totals; `None` until the ring's snapshot task has populated them.
     pub delegate_lane_requests_refused: Option<u64>,
     pub delegate_lane_panics: Option<u64>,
+    pub delegate_lane_deaths: Option<u64>,
     pub inter_delegate_messages_dropped: Option<u64>,
     /// Client delegate requests the delegate lane ran itself, and those it
     /// forwarded to the contract loop, by reason
@@ -779,6 +780,7 @@ pub(crate) struct RouterSnapshotInfo {
     pub delegate_lane_forwarded_unit_bound: Option<u64>,
     pub delegate_lane_forwarded_not_runnable: Option<u64>,
     pub delegate_lane_forwarded_forged: Option<u64>,
+    pub delegate_lane_forwarded_lane_down: Option<u64>,
     /// Computed-upstream vs. stored-`is_upstream`-flag divergence counters
     /// (hosting redesign piece D, #4642 / #4671). `comparisons` is the
     /// denominator (one per `send_unsubscribe_upstream`), `divergences` the times
@@ -3595,6 +3597,7 @@ impl Router {
             hosting_retractions_dropped: None,
             delegate_lane_requests_refused: None,
             delegate_lane_panics: None,
+            delegate_lane_deaths: None,
             inter_delegate_messages_dropped: None,
             delegate_lane_runs: None,
             delegate_lane_forwarded_busy: None,
@@ -3603,6 +3606,7 @@ impl Router {
             delegate_lane_forwarded_unit_bound: None,
             delegate_lane_forwarded_not_runnable: None,
             delegate_lane_forwarded_forged: None,
+            delegate_lane_forwarded_lane_down: None,
             // Computed-upstream vs. stored-flag divergence counters (piece D,
             // #4642 / #4671), populated by Ring from the network_status
             // singleton on the snapshot cadence.

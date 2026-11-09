@@ -18,7 +18,9 @@ mod executor;
 mod fair_queue;
 #[cfg(all(test, feature = "wasmtime-backend", feature = "redb"))]
 mod wakeup_wasm_tests;
-pub(crate) use delegate_lane::routing_counts as delegate_lane_routing_counts;
+pub(crate) use delegate_lane::{
+    ForwardReason as DelegateForwardReason, routing_counts as delegate_lane_routing_counts,
+};
 pub(crate) use fair_queue::Priority;
 /// Fair-queue occupancy for the status snapshot (#4917). Re-exported rather
 /// than widening `fair_queue` itself, which is otherwise private to this
@@ -5793,7 +5795,8 @@ async fn dispatch_delegate_request<CH, P>(
     // loop: what its first `process()` call returned. See `RunSeed`.
     first_values: Option<Vec<OutboundDelegateMsg>>,
     // The claim and loop-owned mark held for THIS run only: released just
-    // before the client is answered (or when this returns on another path).
+    // before the client is answered on every path that answers, or when this
+    // returns without answering (queued behind a park, or parked).
     release: delegate_lane::LoopRelease,
 ) where
     CH: ContractHandler + Send + 'static,
@@ -5815,6 +5818,7 @@ async fn dispatch_delegate_request<CH, P>(
             "Refused a client delegate request carrying an inbound message only the \
              node delivers"
         );
+        release.release();
         send_delegate_response(
             contract_handler,
             id,
@@ -5899,6 +5903,7 @@ async fn dispatch_delegate_request<CH, P>(
                 return;
             }
         };
+        release.release();
         send_delegate_response(contract_handler, id, &delegate_key, response).await;
         return;
     };
@@ -5920,6 +5925,7 @@ async fn dispatch_delegate_request<CH, P>(
                 delegate_key = %delegate_key,
                 "A delegate-lane continuation found its delegate parked; refusing it"
             );
+            release.release();
             send_delegate_response(
                 contract_handler,
                 id,
@@ -6003,12 +6009,16 @@ async fn dispatch_delegate_request<CH, P>(
     )
     .await;
 
-    // Release before answering, as the lane does, so the client's next
-    // request for this delegate finds it free rather than being forwarded.
-    // A parked run is held by its park entry's own claim.
-    release.release();
+    // `release` (this run's claim and loop-owned mark) is released before the
+    // client is answered, as the lane does, so the client's next request for
+    // this delegate finds it free rather than being forwarded. It is released
+    // AFTER the capability hook, so a lane run cannot see a registered
+    // delegate without its manifest record (or an unregistered one with its
+    // grant still present). A parked run is held by its park entry's own
+    // claim.
     match outcome {
         DelegateRunOutcome::Parked => {
+            release.release();
             // Move the client's responder into the park so the resumed run can
             // answer it. The client then sees ONE response covering the whole
             // round-trip, exactly as it does today when the loop blocks.
@@ -6019,10 +6029,12 @@ async fn dispatch_delegate_request<CH, P>(
             if let Some(hook) = hook {
                 finish_capability_hook(contract_handler, prompter, hook);
             }
+            release.release();
             send_delegate_response(contract_handler, id, &delegate_key, Ok(response)).await;
         }
         // #5263 propagation, carried through parking.
         DelegateRunOutcome::Failed(err) => {
+            release.release();
             send_delegate_response(contract_handler, id, &delegate_key, Err(err)).await;
         }
     }
@@ -8513,6 +8525,33 @@ mod tests {
         }
     }
 
+    /// Only the delegate executor's store deletes temporary `.reg` records:
+    /// a contract executor's store can be built (a replacement, on the loop)
+    /// while the delegate executor is repairing a record on the lane.
+    ///
+    /// FALSIFY: set `clean_delegate_tmp_records: true` in
+    /// `SharedStores::new`, or drop it from `create_delegate_executor`.
+    #[test]
+    fn only_the_delegate_executor_cleans_temporary_delegate_records() {
+        let pool = strip_comments(include_str!("contract/executor/runtime/pool.rs"));
+        let shared = strip_comments(include_str!("wasm_runtime.rs"));
+        assert_eq!(
+            pool.matches("clean_delegate_tmp_records: true").count(),
+            1,
+            "one executor cleans"
+        );
+        assert!(
+            fn_region(&pool, "    async fn create_delegate_executor(")
+                .contains("clean_delegate_tmp_records: true"),
+            "and it is the delegate executor"
+        );
+        let new = fn_region(&shared, "    pub fn new(max_size: u64) -> Self {");
+        assert!(
+            new.contains("clean_delegate_tmp_records: false"),
+            "every other executor's stores do not"
+        );
+    }
+
     /// PIN, half 2 of 2 (half 1 is
     /// `every_loop_delegate_run_goes_through_the_round_trip_chokepoint`): every delegate
     /// `process()` on a production node runs on the ONE delegate executor,
@@ -8643,6 +8682,37 @@ mod tests {
                 "the lane must not reach a delegate except through its runner; found `{forbidden}`"
             );
         }
+    }
+
+    /// In `dispatch_delegate_request`, a completed run's capability hook
+    /// (manifest record on register, grant removal on unregister) runs
+    /// BEFORE the claim and mark are released, and both come before the
+    /// client is answered. Released first, a lane run of the same delegate
+    /// could observe the registration without its capability record.
+    ///
+    /// FALSIFY: move `release.release();` above the `finish_capability_hook`
+    /// call in the `Completed` arm, or below `send_delegate_response`.
+    #[test]
+    fn a_completed_run_releases_after_its_capability_hook_and_before_answering() {
+        let code = production_code();
+        let dispatch = fn_region(&code, "async fn dispatch_delegate_request<");
+        let completed = dispatch
+            .split_once("DelegateRunOutcome::Completed(response) =>")
+            .expect("the parked-path Completed arm")
+            .1
+            .split_once("DelegateRunOutcome::Failed(")
+            .expect("the Completed arm is followed by the Failed arm")
+            .0;
+        let at = |needle: &str| {
+            let hits: Vec<_> = completed.match_indices(needle).collect();
+            assert_eq!(hits.len(), 1, "`{needle}` once in the Completed arm");
+            hits[0].0
+        };
+        let hook = at("finish_capability_hook(");
+        let release = at("release.release();");
+        let answer = at("send_delegate_response(");
+        assert!(hook < release, "release after the capability hook");
+        assert!(release < answer, "release before answering");
     }
 
     /// PIN: every LOOP path that starts a delegate run claims the delegate on
@@ -12791,10 +12861,9 @@ mod hol_4391_tests {
     /// handled it: the next request for that delegate runs on the lane again,
     /// even while the loop is stuck in contract WASM.
     ///
-    /// FALSIFY: drop the `take_forwarded_delegate(id.id)` binding in the
-    /// `DelegateRequest` arm of `handle_contract_event`; the delegate stays
-    /// loop-owned, the second request is forwarded to the held loop and is not
-    /// answered.
+    /// FALSIFY: make `LoopOwned::drop` not decrement the user's count; the
+    /// delegate stays loop-owned, the second request is forwarded to the held
+    /// loop and is not answered.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_forwarded_request_gives_its_delegate_back_to_the_lane() {
         let _guard = TEST_GUARD.lock().await;
@@ -12899,6 +12968,156 @@ mod hol_4391_tests {
             },
             rx,
         )
+    }
+
+    /// A waker that records, at the moment it is woken, whether `gate` still
+    /// tracks `key`. A tokio oneshot wakes its receiver's waker synchronously
+    /// inside `send`, so polling a client's answer future once with this
+    /// waker captures the gate state AT the instant the client is answered.
+    struct SnapshotOnWake {
+        gate: Arc<delegate_lane::DelegateGate>,
+        key: DelegateKey,
+        tracked_at_wake: std::sync::Mutex<Option<bool>>,
+    }
+
+    impl std::task::Wake for SnapshotOnWake {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            let mut at = self.tracked_at_wake.lock().unwrap();
+            if at.is_none() {
+                *at = Some(self.gate.is_tracking(&self.key));
+            }
+        }
+    }
+
+    impl SnapshotOnWake {
+        fn new(gate: &Arc<delegate_lane::DelegateGate>, key: &DelegateKey) -> Arc<Self> {
+            Arc::new(Self {
+                gate: gate.clone(),
+                key: key.clone(),
+                tracked_at_wake: std::sync::Mutex::new(None),
+            })
+        }
+
+        /// Poll `fut` once with this waker; it must be pending.
+        fn register<F: std::future::Future + Unpin>(self: &Arc<Self>, fut: &mut F) {
+            let waker = std::task::Waker::from(self.clone());
+            let mut cx = std::task::Context::from_waker(&waker);
+            assert!(
+                std::pin::Pin::new(fut).poll(&mut cx).is_pending(),
+                "the client is not answered before the run"
+            );
+        }
+
+        fn tracked_at_wake(&self) -> Option<bool> {
+            *self.tracked_at_wake.lock().unwrap()
+        }
+    }
+
+    /// The loop's `DelegateRequest` arm holds a forwarded request's
+    /// loop-owned mark for the whole run, and releases it BEFORE the client
+    /// is answered: so the client's next request finds the delegate free.
+    ///
+    /// The mark is a ticket from a test-owned gate, carried in the event as
+    /// the lane's forwarder carries it. The mock's run hook samples the gate
+    /// during the run; a waker on the client's answer samples it at the
+    /// answer.
+    ///
+    /// FALSIFY: in the `DelegateRequest` arm of `handle_contract_event`, bind
+    /// `lane_ticket: _` and pass `ticket: Default::default()` (the mark is
+    /// gone during the run); or in `dispatch_delegate_request` move
+    /// `release.release()` after `send_delegate_response` in the `Completed`
+    /// arm (the mark is still held when the client is woken).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_loop_holds_a_forwarded_mark_for_the_run_and_releases_it_before_answering() {
+        let _guard = TEST_GUARD.lock().await;
+        let (mut handler, send) = build_handler(vec![]).await;
+        let key = delegate_key_n(0x6C);
+        let gate = delegate_lane::DelegateGate::new();
+        let during = Arc::new(std::sync::Mutex::new(Vec::new()));
+        {
+            let rt = handler.runtime_mut();
+            rt.delegate_script.lock().unwrap().push_back(ScriptedRun {
+                outbound: vec![app_out(b"done")],
+                writes_context: None,
+            });
+            let (g, d) = (gate.clone(), during.clone());
+            *rt.delegate_run_hook.lock().unwrap() = Some(Box::new(move |k: &DelegateKey| {
+                d.lock().unwrap().push(g.is_tracking(k));
+            }));
+        }
+        let handle = GlobalExecutor::spawn(contract_handling(
+            handler,
+            crate::contract::user_input::AutoApprovePrompter,
+        ));
+        let ContractHandlerEvent::DelegateRequest {
+            req,
+            origin_contract,
+            connection_scope,
+            user_context,
+            ..
+        } = delegate_event(&key)
+        else {
+            panic!("delegate_event builds a DelegateRequest");
+        };
+        let mut answer = Box::pin(send.send_to_handler(ContractHandlerEvent::DelegateRequest {
+            req,
+            origin_contract,
+            connection_scope,
+            user_context,
+            lane_ticket: gate.ticket_for_test(&key, None),
+        }));
+        let snap = SnapshotOnWake::new(&gate, &key);
+        snap.register(&mut answer);
+        wait_until("the client to be answered", || {
+            snap.tracked_at_wake().is_some()
+        })
+        .await;
+        let response = tokio::time::timeout(Duration::from_secs(5), answer)
+            .await
+            .expect("answered")
+            .expect("answer received");
+        assert_eq!(app_payloads(&response), vec![b"done".to_vec()]);
+        assert_eq!(
+            *during.lock().unwrap(),
+            vec![true],
+            "the mark is held while the loop runs the forwarded request"
+        );
+        assert_eq!(
+            snap.tracked_at_wake(),
+            Some(false),
+            "the mark is released before the client is answered"
+        );
+        handle.abort();
+    }
+
+    /// A lane continuation drained by the loop releases the claim it was
+    /// taken with BEFORE its client is answered.
+    ///
+    /// FALSIFY: in `dispatch_delegate_request` move `release.release()` after
+    /// `send_delegate_response` in the `Completed` arm; the claim is still
+    /// held when the client is woken.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_drained_continuation_releases_its_claim_before_answering() {
+        let _guard = TEST_GUARD.lock().await;
+        let key = delegate_key_n(0x6D);
+        let (mut handler, mut park, gate, _observations, mut answers) =
+            hop_harness(vec![(key.clone(), vec![app_out(b"done")])], 0).await;
+        let prompter = Arc::new(crate::contract::user_input::AutoApprovePrompter);
+        let mut answer = answers.pop().expect("one client");
+        let snap = SnapshotOnWake::new(&gate, &key);
+        snap.register(&mut answer);
+        let (claim, unit) = gate.take_next_unit().expect("the unit");
+        run_lane_unit(&mut handler, &mut park, &prompter, unit, Some(claim)).await;
+        assert_eq!(
+            snap.tracked_at_wake(),
+            Some(false),
+            "the claim is released before the client is answered"
+        );
+        let (_, response) = answer.await.expect("answered");
+        assert_eq!(app_payloads(&response), vec![b"done".to_vec()]);
     }
 
     /// A handler with a mock lane runner, a park context sharing a gate with

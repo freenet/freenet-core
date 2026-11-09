@@ -626,18 +626,23 @@ impl ContractHandlerChannel<SenderHalve> {
                 }
                 None
             }
-            Err(mpsc::error::TrySendError::Closed(request)) => Some(InternalCHEvent {
-                ev: ContractHandlerEvent::DelegateRequest {
-                    req: request.req,
-                    origin_contract: request.origin_contract,
-                    connection_scope: request.connection_scope,
-                    user_context: request.user_context,
-                    lane_ticket: Default::default(),
-                },
-                id: request.id,
-                priority: request.priority,
-                result: request.responder,
-            }),
+            Err(mpsc::error::TrySendError::Closed(request)) => {
+                // No lane (its task exited): the request goes to the loop.
+                // Counted, so traffic after a lane death does not look flat.
+                super::delegate_lane::record_forward(super::delegate_lane::ForwardReason::LaneDown);
+                Some(InternalCHEvent {
+                    ev: ContractHandlerEvent::DelegateRequest {
+                        req: request.req,
+                        origin_contract: request.origin_contract,
+                        connection_scope: request.connection_scope,
+                        user_context: request.user_context,
+                        lane_ticket: Default::default(),
+                    },
+                    id: request.id,
+                    priority: request.priority,
+                    result: request.responder,
+                })
+            }
         }
     }
 
@@ -1502,19 +1507,25 @@ pub mod test {
     /// proxy) fills the lane's intake only up to its local reserve, so a
     /// local request is still admitted.
     ///
+    /// The flood is sent ONE request at a time, each settled (queued in the
+    /// intake or refused) before the next is sent. The reserve check is
+    /// check-then-act, so concurrent senders may overshoot it (see
+    /// `offer_to_delegate_lane`); sequential senders make the boundary
+    /// exact, which is what lets this test assert it exactly.
+    ///
     /// FALSIFY: drop the local-reserve refusal in `offer_to_delegate_lane`;
-    /// the flood takes every slot and the local request is refused.
+    /// no remote request is refused and the local one is refused instead.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_remote_flood_leaves_the_local_reserve() -> anyhow::Result<()> {
         use crate::contract::delegate_lane::{LANE_INTAKE_CAPACITY, LOCAL_INTAKE_RESERVE};
         for hosted in [false, true] {
             let (send, mut rcv, _) = contract_handler_channel();
-            let (tx, mut lane_rx) = mpsc::channel(LANE_INTAKE_CAPACITY);
+            let (tx, lane_rx) = mpsc::channel(LANE_INTAKE_CAPACITY);
             rcv.install_delegate_lane(DelegateLaneIntake { tx });
             let send = Arc::new(send);
             let refused = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let mut tasks = Vec::new();
-            for _ in 0..LANE_INTAKE_CAPACITY {
+            for sent in 1..=LANE_INTAKE_CAPACITY {
                 let (s, r) = (send.clone(), refused.clone());
                 let ContractHandlerEvent::DelegateRequest {
                     req,
@@ -1540,35 +1551,35 @@ pub mod test {
                         r.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     }
                 }));
+                // Settle this request before sending the next.
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                while refused.load(std::sync::atomic::Ordering::SeqCst) + lane_rx.len() < sent {
+                    anyhow::ensure!(
+                        tokio::time::Instant::now() < deadline,
+                        "remote request {sent} neither queued nor refused (hosted={hosted})"
+                    );
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
             }
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-            while refused.load(std::sync::atomic::Ordering::SeqCst) < LOCAL_INTAKE_RESERVE {
-                anyhow::ensure!(tokio::time::Instant::now() < deadline, "refusals");
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
+            assert_eq!(
+                refused.load(std::sync::atomic::Ordering::SeqCst),
+                LOCAL_INTAKE_RESERVE,
+                "exactly the reserve is refused to non-local requests (hosted={hosted})"
+            );
+            assert_eq!(lane_rx.len(), LANE_INTAKE_CAPACITY - LOCAL_INTAKE_RESERVE);
             let s = send.clone();
             let local =
                 GlobalExecutor::spawn(
                     async move { s.send_to_handler(lane_delegate_request()).await },
                 );
-            let mut queued = Vec::new();
             let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-            while queued.len() < LANE_INTAKE_CAPACITY - LOCAL_INTAKE_RESERVE + 1 {
+            while lane_rx.len() < LANE_INTAKE_CAPACITY - LOCAL_INTAKE_RESERVE + 1 {
                 anyhow::ensure!(
                     tokio::time::Instant::now() < deadline && !local.is_finished(),
                     "the local request must be queued, not refused (hosted={hosted})"
                 );
-                match lane_rx.try_recv() {
-                    Ok(r) => queued.push(r),
-                    Err(_) => tokio::time::sleep(Duration::from_millis(5)).await,
-                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
-            assert!(
-                queued
-                    .iter()
-                    .any(|r| r.user_context.is_none() && r.connection_scope.is_local()),
-                "the local request reached the lane (hosted={hosted})"
-            );
             local.abort();
             for t in tasks {
                 t.abort();
@@ -1581,9 +1592,13 @@ pub mod test {
     /// exactly as the handler would have: same id, same priority, and the
     /// client's own responder, so the loop's answer reaches the client.
     ///
+    /// The lane's loop-owned mark (`LaneTicket`) rides in the event, and is
+    /// released only when the event is dropped.
+    ///
     /// FALSIFY: in `LoopForwarder::forward`, send with `Priority::DEFAULT`
-    /// instead of the request's priority, or a fresh responder; the
-    /// assertions on priority / the client's answer fail.
+    /// instead of the request's priority, or a fresh responder, or
+    /// `lane_ticket: Default::default()`; the assertions on priority / the
+    /// client's answer / the mark fail.
     #[tokio::test]
     async fn a_forwarded_request_reaches_the_loop_as_the_client_sent_it() -> anyhow::Result<()> {
         use crate::contract::delegate_lane::LoopForward;
@@ -1597,12 +1612,23 @@ pub mod test {
         };
         request.id = 4242;
         request.priority = crate::contract::fair_queue::Priority::Background;
-        forwarder.forward(request, Default::default());
+        let key = request.req.key().clone();
+        let gate = crate::contract::delegate_lane::DelegateGate::new();
+        forwarder.forward(request, gate.ticket_for_test(&key, None));
         let (id, ev, priority) =
             tokio::time::timeout(Duration::from_secs(5), rcv.recv_from_sender()).await??;
         assert_eq!(id.id, 4242);
         assert_eq!(priority, crate::contract::fair_queue::Priority::Background);
-        assert!(matches!(ev, ContractHandlerEvent::DelegateRequest { .. }));
+        let ContractHandlerEvent::DelegateRequest { lane_ticket, .. } = &ev else {
+            panic!("the loop receives the delegate request, got {ev}");
+        };
+        assert!(lane_ticket.is_held(), "the mark rides in the event");
+        assert!(gate.is_tracking(&key));
+        drop(ev);
+        assert!(
+            !gate.is_tracking(&key),
+            "dropping the event releases the mark"
+        );
         rcv.send_to_sender(id, ContractHandlerEvent::DelegateResponse(Ok(Vec::new())))
             .await?;
         let (_, answer) = tokio::time::timeout(Duration::from_secs(5), answer).await??;

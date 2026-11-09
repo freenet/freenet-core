@@ -89,6 +89,7 @@ fn setup_mock() -> MockWasmRuntime {
         delegate_wrong_variant: Default::default(),
         delegate_lane: None,
         delegate_pause_after: Default::default(),
+        delegate_run_hook: Default::default(),
         registered_params: Default::default(),
     }
 }

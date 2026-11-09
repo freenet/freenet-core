@@ -748,7 +748,10 @@ pub struct HostingRetractionStats {
 /// Delegate lane (`contract::delegate_lane`) and inter-delegate delivery
 /// counters. Each is a client-visible loss that is otherwise only a log line:
 /// a request the lane refused (its intake was full), a delegate run that
-/// panicked on the lane, and an inter-delegate message the hop dropped because its target was mid-round-trip. Monotonic
+/// panicked on the lane (caught; the lane carries on), the lane task itself
+/// dying (every later request falls back to the loop for the rest of the
+/// process), and an inter-delegate message the hop dropped because its
+/// target was mid-round-trip. Monotonic
 /// lifetime totals; the collector differences them. Plain atomics rather
 /// than fields under the `NETWORK_STATUS` lock: they are bumped once per
 /// refused request, i.e. at flood rate, and must not take a global write lock
@@ -756,6 +759,7 @@ pub struct HostingRetractionStats {
 /// (they are telemetry only).
 static DELEGATE_LANE_REFUSED: AtomicU64 = AtomicU64::new(0);
 static DELEGATE_LANE_PANICS: AtomicU64 = AtomicU64::new(0);
+static DELEGATE_LANE_DEATHS: AtomicU64 = AtomicU64::new(0);
 static INTER_DELEGATE_DROPPED: AtomicU64 = AtomicU64::new(0);
 
 /// Streamed-transfer (> 64 KB `streaming_threshold`) abort counters, aggregated
@@ -1355,9 +1359,20 @@ pub fn record_delegate_lane_refusal() -> u64 {
     DELEGATE_LANE_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
 }
 
-/// Record one delegate run that panicked on the delegate lane.
+/// Record one delegate run that panicked on the delegate lane (caught).
 pub fn record_delegate_lane_panic() {
     DELEGATE_LANE_PANICS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Record the delegate lane task exiting on a panic outside a run.
+pub fn record_delegate_lane_death() {
+    DELEGATE_LANE_DEATHS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The lane-death total, readable before the singleton is initialized.
+#[cfg(test)]
+pub(crate) fn delegate_lane_deaths_total() -> u64 {
+    DELEGATE_LANE_DEATHS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Record one inter-delegate message dropped because its target was
@@ -1366,14 +1381,16 @@ pub fn record_inter_delegate_dropped() {
     INTER_DELEGATE_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// `(requests_refused, lane_panics, inter_delegate_dropped)` for the snapshot
-/// cadence; `None` before the singleton is initialized, like its siblings.
-pub fn delegate_lane_counts() -> Option<(u64, u64, u64)> {
+/// `(requests_refused, lane_panics, lane_deaths, inter_delegate_dropped)`
+/// for the snapshot cadence; `None` before the singleton is initialized,
+/// like its siblings.
+pub fn delegate_lane_counts() -> Option<(u64, u64, u64, u64)> {
     NETWORK_STATUS.get()?;
     let load = |c: &AtomicU64| c.load(std::sync::atomic::Ordering::Relaxed);
     Some((
         load(&DELEGATE_LANE_REFUSED),
         load(&DELEGATE_LANE_PANICS),
+        load(&DELEGATE_LANE_DEATHS),
         load(&INTER_DELEGATE_DROPPED),
     ))
 }

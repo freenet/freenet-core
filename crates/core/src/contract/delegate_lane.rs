@@ -69,8 +69,11 @@
 //!   arm, a fair-queue refusal or eviction, a closed channel). So once one of
 //!   a user's requests for `D` is forwarded, that user's later requests for `D`
 //!   are forwarded too until the loop has done the earlier ones, and none
-//!   overtakes it: the loop's channel and the fair queue's slot for client
-//!   delegate requests are both FIFO.
+//!   overtakes it: the loop's channel and each of the fair queue's
+//!   per-priority slots are FIFO. The promise is therefore per client and
+//!   priority slot: two forwarded requests at DIFFERENT priorities sit in
+//!   different slots and may run in either order. Client delegate requests
+//!   are all sent `ClientLocal`, so in practice that is one slot.
 //!
 //! The mark is per (delegate key, hosted user), the finest scope the event
 //! carries: a `DelegateRequest` names no client or connection, only its user
@@ -120,6 +123,11 @@
 //!   until it finishes. The loop-owned MARK is finer, per (key, user), since
 //!   that is all the ordering it protects needs: a user's later request
 //!   follows that user's forwarded one, and does not hold back other users.
+//! * On a node that is not hosted, every client has user `None`, so the
+//!   mark is effectively per key there: any client's forwarded request (a
+//!   registration, say) sends every client's requests for that delegate to
+//!   the loop until the loop has done it. That costs pre-lane latency, never
+//!   a refusal, and `delegate_lane_forwarded_loop_owned` shows it.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -171,24 +179,30 @@ pub(crate) enum ForwardReason {
     NotRunnable,
     /// A forged node-only inbound message: the loop refuses it.
     Forged,
+    /// The lane task has exited (it panicked outside a run): the request
+    /// went to the loop because there is no lane. Counted both for requests
+    /// the dying lane handed over and for later ones that found its intake
+    /// closed.
+    LaneDown,
 }
 
-/// Lane-run and forwarded counts, by reason, for the router snapshot
-/// (`network_status::delegate_lane_routing_counts`). Plain atomics: bumped
-/// once per request.
-pub(crate) static LANE_RUNS: AtomicU64 = AtomicU64::new(0);
-pub(crate) static FORWARDED: [AtomicU64; 6] = [
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-];
-
 impl ForwardReason {
-    /// Index into [`FORWARDED`], in declaration order.
-    pub(crate) fn index(self) -> usize {
+    /// Every reason, in [`index`](Self::index) order.
+    pub(crate) const ALL: [ForwardReason; 7] = [
+        Self::Busy,
+        Self::Parked,
+        Self::LoopOwned,
+        Self::UnitBound,
+        Self::NotRunnable,
+        Self::Forged,
+        Self::LaneDown,
+    ];
+    pub(crate) const COUNT: usize = Self::ALL.len();
+
+    /// Index into [`FORWARDED`]. Exhaustive, so a new reason does not
+    /// compile until it has one; the const check below rejects an index
+    /// that does not match its position in [`ALL`](Self::ALL).
+    pub(crate) const fn index(self) -> usize {
         match self {
             Self::Busy => 0,
             Self::Parked => 1,
@@ -196,18 +210,47 @@ impl ForwardReason {
             Self::UnitBound => 3,
             Self::NotRunnable => 4,
             Self::Forged => 5,
+            Self::LaneDown => 6,
         }
     }
 }
 
-/// `(lane_runs, forwarded[busy, parked, loop_owned, unit_bound, not_runnable,
-/// forged])`.
-pub(crate) fn routing_counts() -> (u64, [u64; 6]) {
-    let mut forwarded = [0u64; 6];
-    for (out, counter) in forwarded.iter_mut().zip(FORWARDED.iter()) {
-        *out = counter.load(AtomicOrdering::Relaxed);
+const _: () = {
+    let mut i = 0;
+    while i < ForwardReason::COUNT {
+        assert!(ForwardReason::ALL[i].index() == i);
+        i += 1;
     }
-    (LANE_RUNS.load(AtomicOrdering::Relaxed), forwarded)
+};
+
+/// Lane-run and forwarded counts, by reason, for the router snapshot
+/// ([`routing_counts`]). Plain atomics: bumped once per request.
+pub(crate) static LANE_RUNS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static FORWARDED: [AtomicU64; ForwardReason::COUNT] =
+    [const { AtomicU64::new(0) }; ForwardReason::COUNT];
+
+/// Count one request that went to the loop for `reason`.
+pub(crate) fn record_forward(reason: ForwardReason) {
+    FORWARDED[reason.index()].fetch_add(1, AtomicOrdering::Relaxed);
+}
+
+/// A snapshot of the lane's routing counters.
+pub(crate) struct RoutingCounts {
+    pub(crate) lane_runs: u64,
+    forwarded: [u64; ForwardReason::COUNT],
+}
+
+impl RoutingCounts {
+    pub(crate) fn forwarded(&self, reason: ForwardReason) -> u64 {
+        self.forwarded[reason.index()]
+    }
+}
+
+pub(crate) fn routing_counts() -> RoutingCounts {
+    RoutingCounts {
+        lane_runs: LANE_RUNS.load(AtomicOrdering::Relaxed),
+        forwarded: std::array::from_fn(|i| FORWARDED[i].load(AtomicOrdering::Relaxed)),
+    }
 }
 
 /// Count one refused client delegate request (telemetry); returns the
@@ -830,7 +873,7 @@ pub(crate) async fn run_lane(
         Ok(()) => tracing::debug!("Delegate lane task ended: its intake closed"),
         Err(payload) => {
             let reason = panic_reason(&*payload);
-            crate::node::network_status::record_delegate_lane_panic();
+            crate::node::network_status::record_delegate_lane_death();
             tracing::error!(
                 %reason,
                 "Delegate lane task PANICKED; client delegate requests fall back to \
@@ -841,11 +884,30 @@ pub(crate) async fn run_lane(
             // closed intake and go to the loop directly; a sender racing the
             // close may still put its request on the loop's channel before a
             // drained one, so order across this hand-over is best effort.
+            //
+            // `recv` until `None`, not `try_recv` until empty: after `close`,
+            // a sender that took its permit before the close may still be
+            // completing its send, and `try_recv` reports that as `Empty`.
+            // `recv` returns `None` only once every permit is used or dropped.
             intake.close();
-            while let Ok(request) = intake.try_recv() {
-                forward_to_loop(&gate, &*forward, request, ForwardReason::Busy);
+            while let Some(request) = intake.recv().await {
+                let reason = not_lane_runnable(&request).unwrap_or(ForwardReason::LaneDown);
+                forward_to_loop(&gate, &*forward, request, reason);
             }
         }
+    }
+}
+
+/// Why the lane never runs `request` itself, whatever the gate's state:
+/// only `ApplicationMessages` are lane work, and a forged node-only message
+/// is the loop's to refuse.
+fn not_lane_runnable(request: &LaneRequest) -> Option<ForwardReason> {
+    if !matches!(request.req, DelegateRequest::ApplicationMessages { .. }) {
+        Some(ForwardReason::NotRunnable)
+    } else if super::node_only_inbound(&request.req).is_some() {
+        Some(ForwardReason::Forged)
+    } else {
+        None
     }
 }
 
@@ -857,7 +919,7 @@ fn forward_to_loop(
     request: LaneRequest,
     reason: ForwardReason,
 ) {
-    FORWARDED[reason.index()].fetch_add(1, AtomicOrdering::Relaxed);
+    record_forward(reason);
     let key = request.req.key().clone();
     tracing::debug!(
         delegate_key = %key,
@@ -891,12 +953,9 @@ async fn serve(
 ) {
     let key = request.req.key().clone();
     let user = request.user_context.as_ref().map(|u| *u.user_id());
-    let run = if !matches!(request.req, DelegateRequest::ApplicationMessages { .. }) {
-        Err(ForwardReason::NotRunnable)
-    } else if super::node_only_inbound(&request.req).is_some() {
-        Err(ForwardReason::Forged)
-    } else {
-        gate.try_begin_lane_run(&key, user)
+    let run = match not_lane_runnable(&request) {
+        Some(reason) => Err(reason),
+        None => gate.try_begin_lane_run(&key, user),
     };
     let run = match run {
         Ok(run) => run,
@@ -1452,6 +1511,91 @@ mod tests {
             "the buffered requests reach the loop, in order"
         );
         assert!(tx.is_closed());
+    }
+
+    /// A dying lane drains its intake with `recv`, so a sender that reserved
+    /// a slot BEFORE the close still has its request handed to the loop.
+    /// Each drained request is counted by its real reason (`LaneDown` for
+    /// lane work), and the lane's death is counted apart from a caught run
+    /// panic.
+    ///
+    /// The counters are process-global and only ever increase, so the test
+    /// asserts on deltas. Another test that bumps the same counter
+    /// concurrently can only make a delta larger, so a correct lane never
+    /// fails here; it could hide a counting mutation in a rare interleaving.
+    ///
+    /// FALSIFY: drain with `while let Ok(r) = intake.try_recv()` (the
+    /// reserved request is lost); count drained requests as `Busy` (the
+    /// `LaneDown` delta is 0); or record the death with
+    /// `record_delegate_lane_panic` (the death delta is 0).
+    #[tokio::test]
+    async fn a_dying_lane_waits_for_reserved_slots_and_counts_by_reason() {
+        /// Panics on its first forward (outside any run), then collects.
+        struct PanicsOnce(
+            std::sync::atomic::AtomicBool,
+            tokio::sync::mpsc::UnboundedSender<Forwarded>,
+        );
+        impl LoopForward for PanicsOnce {
+            fn forward(&self, request: LaneRequest, ticket: LaneTicket) {
+                if !self.0.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    panic!("forwarder bug");
+                }
+                self.1.send((request, ticket)).expect("receiver alive");
+            }
+        }
+        let load = |r: ForwardReason| FORWARDED[r.index()].load(AtomicOrdering::Relaxed);
+        let deaths_before = crate::node::network_status::delegate_lane_deaths_total();
+        let down_before = load(ForwardReason::LaneDown);
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let (ftx, mut frx) = tokio::sync::mpsc::unbounded_channel();
+        // Request 1 makes the forwarder panic, killing the lane.
+        let k1 = key(50);
+        let (r1, a1) = request_with(&k1, 1, DelegateRequest::UnregisterDelegate(k1.clone()));
+        std::mem::forget(a1);
+        tx.try_send(r1).expect("room");
+        // A slot reserved before the lane dies, used only after the close.
+        let permit = tx.clone().reserve_owned().await.expect("room");
+        let lane = tokio::spawn(run_lane(
+            Arc::new(Counts(Default::default())),
+            DelegateGate::new(),
+            Arc::new(PanicsOnce(Default::default(), ftx)),
+            rx,
+        ));
+        // Current-thread runtime: the lane runs until it has closed its
+        // intake and is draining.
+        while !tx.is_closed() {
+            tokio::task::yield_now().await;
+        }
+        let (r2, a2) = request(&key(51), 2);
+        std::mem::forget(a2);
+        permit.send(r2);
+        tokio::time::timeout(Duration::from_secs(5), lane)
+            .await
+            .expect("the lane ends")
+            .expect("its panic is caught");
+        let mut ids = Vec::new();
+        while let Ok((r, _)) = frx.try_recv() {
+            ids.push(r.id);
+        }
+        assert_eq!(ids, vec![2], "the reserved request reaches the loop");
+        assert!(
+            load(ForwardReason::LaneDown) > down_before,
+            "a drained ApplicationMessages request counts as LaneDown"
+        );
+        assert!(
+            crate::node::network_status::delegate_lane_deaths_total() > deaths_before,
+            "the lane's death is counted"
+        );
+    }
+
+    /// The forwarded-count array is sized from the reasons, and each reason
+    /// reads back its own counter.
+    #[test]
+    fn every_forward_reason_has_its_own_counter() {
+        assert_eq!(FORWARDED.len(), ForwardReason::ALL.len());
+        for (i, r) in ForwardReason::ALL.iter().enumerate() {
+            assert_eq!(r.index(), i);
+        }
     }
 
     /// A panic inside ONE delegate run fails that request only: its client

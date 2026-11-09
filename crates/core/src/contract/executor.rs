@@ -2162,6 +2162,7 @@ where
                     db.clone(),
                     shared.delegate_index,
                     shared.delegate_code,
+                    shared.clean_delegate_tmp_records,
                 )?,
             ),
             // Standalone / mock executors own their state.

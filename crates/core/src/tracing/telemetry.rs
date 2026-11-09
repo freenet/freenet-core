@@ -4020,6 +4020,10 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     serde_json::json!(snapshot.delegate_lane_panics),
                 );
                 obj.insert(
+                    "delegate_lane_deaths".to_string(),
+                    serde_json::json!(snapshot.delegate_lane_deaths),
+                );
+                obj.insert(
                     "inter_delegate_messages_dropped".to_string(),
                     serde_json::json!(snapshot.inter_delegate_messages_dropped),
                 );
@@ -4050,6 +4054,10 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 obj.insert(
                     "delegate_lane_forwarded_forged".to_string(),
                     serde_json::json!(snapshot.delegate_lane_forwarded_forged),
+                );
+                obj.insert(
+                    "delegate_lane_forwarded_lane_down".to_string(),
+                    serde_json::json!(snapshot.delegate_lane_forwarded_lane_down),
                 );
                 // Streamed-transfer abort counters (Group B), routing/hosting
                 // attribution (Group C), and connect-emit counters — same
@@ -5175,6 +5183,8 @@ mod tests {
         info.delegate_lane_forwarded_unit_bound = Some(625);
         info.delegate_lane_forwarded_not_runnable = Some(627);
         info.delegate_lane_forwarded_forged = Some(629);
+        info.delegate_lane_deaths = Some(631);
+        info.delegate_lane_forwarded_lane_down = Some(641);
         let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
         for (key, want) in [
             ("delegate_lane_requests_refused", 601),
@@ -5187,6 +5197,8 @@ mod tests {
             ("delegate_lane_forwarded_unit_bound", 625),
             ("delegate_lane_forwarded_not_runnable", 627),
             ("delegate_lane_forwarded_forged", 629),
+            ("delegate_lane_deaths", 631),
+            ("delegate_lane_forwarded_lane_down", 641),
         ] {
             assert_eq!(json[key], want, "{key} must reach the OTLP body");
         }
