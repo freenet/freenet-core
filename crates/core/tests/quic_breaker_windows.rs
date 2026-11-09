@@ -30,6 +30,9 @@ const MARKER_FILE: &str = "quic-crash-breaker.json";
 const TRANSPORT_BOUND: &str = "UDP socket bound successfully";
 const QUIC_BUILT: &str = "QUIC endpoint built";
 const TRIP_WARN: &str = "Several runs in a row with QUIC enabled ended early";
+/// Only the `quic-panic-injection` tests read it, so it is gated with them:
+/// without the feature (CI's Windows Check) it is dead code under `-D warnings`.
+#[cfg(feature = "quic-panic-injection")]
 const COOLING_WARN: &str = "QUIC stays off: several runs in a row with QUIC enabled ended early";
 /// What a run logs when its marker gets no timer, so it could never clear.
 const NO_TIMER_WARN: &str = "No task registrar";
