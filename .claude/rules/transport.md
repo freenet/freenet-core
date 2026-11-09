@@ -1373,7 +1373,15 @@ a test passes its own; tests read their own, never the global).
   path's route still carried data); quic_streams_sampled_paths,
   quic_streams_open_ge_<8|16|32|48> and quic_streams_peak_max (per path and period,
   the peak of inbound streams read at once, counted as inbound_concurrency counts
-  connections).
+  connections); quic_send_resets (sends a path reset on this side, counted by
+  recycle::SendAborts while the connection is open) and quic_path_ms (time QUIC
+  paths were up, shadow ones included, added at each tick of the acknowledgement
+  watch; the last tick to a path's end is not counted), whose ratio over a long
+  window is resets per connection-hour; quic_send_resets_reached_<64|512|2048|4096>
+  and quic_send_resets_path_max (paths whose lifetime reset count reached each
+  level in the period, and the highest count a reset in the period took a path
+  to). They are for the fixed charge, which takes quinn's stopped map at
+  SEND_ABORT_LIMIT x QUIC_STOPPED_ENTRY_BYTES until field data justifies less.
   A family is the keys of one label list under one prefix
   (`QuicDataSnapshot::keys_by_family`). No other key starts with a family's
   prefix or with the prefix sibling families share (`quic_data_` for the send,
@@ -1923,6 +1931,12 @@ Sending (QuicPath::send_short_bounded / send_stream_bounded /
   surfaced through a write or through stopped(), is not one; nor is a reset
   on a closed connection) and closes the connection past
   recycle::SEND_ABORT_LIMIT (4096) with close code SEND_ABORT_LIMIT (M6).
+  The fixed charge per connection (config::QUIC_CONNECTION_CHARGE_BYTES,
+  808 KiB) takes the map at that worst case, 4096 x QUIC_STOPPED_ENTRY_BYTES
+  (104 B, measured 88 B). Polling stopped() only after finish() would not
+  avoid the entries: a writer blocked on connection credit must still race
+  stopped() (below), so the poll stays on every wait and the common resets
+  register anyway.
   Every write, and the wait for a source's next chunk, races the
   stream's stopped() future and resets on a stop:
   quinn-proto 0.11.19 does not report STOP_SENDING to a writer blocked on
