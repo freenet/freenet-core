@@ -21529,9 +21529,14 @@ fn test_quic_data_path_cut_mid_transfer_falls_back_to_udp() {
         // node's slower transfer come in such a burst.
         let fell_back = of_node("Fallback(");
         let causes: Vec<&str> = fell_back.iter().map(|r| r.what.as_str()).collect();
+        let closed_here = of_node("path stall-closed: ");
+        let stall_closed = closed_here.iter().any(|r| {
+            r.what == "path stall-closed: 1, first closed by this node with: Some(Downgrade)"
+        });
         assert!(
-            causes == ["Fallback(Idle)"] || causes == ["Fallback(Reset)"],
-            "{address} fell back once, on the idle timeout or the stall close: {}",
+            causes == ["Fallback(Idle)"] || (causes == ["Fallback(Reset)"] && stall_closed),
+            "{address} fell back once, on the idle timeout, or on a Reset that was its own \
+             stall close and no other close: {}",
             run.dump()
         );
         let fell_back_at = fell_back[0].at;

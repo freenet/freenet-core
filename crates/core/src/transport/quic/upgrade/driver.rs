@@ -1171,6 +1171,14 @@ impl Session {
                 )
             });
             self.note(|| {
+                use crate::transport::quic::path::QuicSendEvent as E;
+                format!(
+                    "path stall-closed: {}, first closed by this node with: {:?}",
+                    path.stats().send_event_count(E::StalledClosed),
+                    path.connection().closer().closed_with()
+                )
+            });
+            self.note(|| {
                 use crate::transport::quic::path::QuicSendResult as R;
                 let stats = path.stats();
                 format!(

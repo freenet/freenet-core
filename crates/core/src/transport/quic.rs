@@ -1216,6 +1216,8 @@ pub(crate) struct QuicCloser {
     /// The endpoint's health: a close is counted only while it can still
     /// be sent ([`EndpointHealth::closes_can_be_sent`]).
     health: Arc<EndpointHealth>,
+    /// The code of the close this closer sent, if it sent one.
+    closed_with: Arc<std::sync::OnceLock<QuicCloseCode>>,
 }
 
 impl QuicCloser {
@@ -1224,6 +1226,7 @@ impl QuicCloser {
             connection,
             closing: Arc::default(),
             health,
+            closed_with: Arc::default(),
         }
     }
 
@@ -1253,7 +1256,13 @@ impl QuicCloser {
             TRANSPORT_METRICS.record_quic_close_sent(code, self.connection.remote_address());
         }
         self.connection.close(code.code().into(), code.reason());
+        let _first = self.closed_with.set(code);
         true
+    }
+
+    /// The code of the close this node sent on the connection, if it sent one.
+    pub(crate) fn closed_with(&self) -> Option<QuicCloseCode> {
+        self.closed_with.get().copied()
     }
 
     /// Whether the connection is still open (quinn has no close reason).
