@@ -1,6 +1,6 @@
 [package]
 name = "freenet"
-version = "0.2.155"
+version = "0.2.156"
 edition = "2024"
 rust-version = "1.85"
 publish = true
@@ -347,6 +347,10 @@ nightly_tests = []
 jemalloc-prof = ["tikv-jemallocator/profiling", "dep:tikv-jemalloc-ctl"]
 # WASM runtime backend
 wasmtime-backend = ["dep:wasmtime"]
+# Test builds only, never a release: `FREENET_TEST_QUIC_PANIC` injects a panic
+# in QUIC code, to exercise the Windows QUIC crash-loop breaker through the
+# real binary (transport/quic/panic_injection.rs, #6031).
+quic-panic-injection = []
 
 # ==============================================================================
 # Lint Configuration

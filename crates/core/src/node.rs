@@ -15,15 +15,12 @@
 //! The main node data structure and execution loop.
 //! See [`../../architecture.md`](../../architecture.md) for a high-level overview of the node's role and the event loop interactions.
 
-use anyhow::Context;
 use freenet_stdlib::{
     client_api::{ClientRequest, ErrorKind},
     prelude::ContractInstanceId,
 };
 use std::{
     borrow::Cow,
-    fs::File,
-    io::Read,
     net::{IpAddr, SocketAddr, ToSocketAddrs},
     sync::Arc,
     time::Duration,
@@ -666,6 +663,11 @@ impl NodeConfig {
 
         let mut gateways = Vec::with_capacity(config.gateways.len());
         let mut gateway_addrs = Vec::with_capacity(config.gateways.len());
+        // The last resolution failure, returned only if NO gateway resolved.
+        let mut unresolved_error = None;
+        // Why each gateway with an unusable key was skipped; reported (all of
+        // them, capped) only if NO gateway was usable.
+        let mut skipped_reasons: Vec<String> = Vec::new();
         for gw in &config.gateways {
             let GatewayConfig {
                 address,
@@ -675,13 +677,29 @@ impl NodeConfig {
 
             // Wait for the public key file to be in X25519 hex format.
             // The gateway may still be initializing and converting from RSA PEM.
+            //
+            // A key that is missing, unreadable, or malformed skips THIS
+            // gateway with a warning rather than failing startup: the key files
+            // come from a remote index and a cache, so one bad entry (a key the
+            // index lists before it serves it, a truncated download) must not
+            // stop the node bootstrapping through the other gateways.
             let mut key_bytes = None;
             for attempt in 0..10 {
-                let mut key_file = File::open(public_key_path).with_context(|| {
-                    format!("failed loading gateway pubkey from {public_key_path:?}")
-                })?;
-                let mut buf = String::new();
-                key_file.read_to_string(&mut buf)?;
+                let buf = match std::fs::read_to_string(public_key_path) {
+                    Ok(buf) => buf,
+                    Err(e) => {
+                        tracing::warn!(
+                            public_key_path = ?public_key_path,
+                            address = ?address,
+                            error = %e,
+                            "Skipping gateway whose public key cannot be read"
+                        );
+                        skipped_reasons.push(format!(
+                            "{address:?}: failed loading gateway pubkey from {public_key_path:?}: {e}"
+                        ));
+                        break;
+                    }
+                };
                 let buf = buf.trim();
 
                 // Check for legacy RSA PEM format - gateway may still be initializing
@@ -699,6 +717,9 @@ impl NodeConfig {
                             public_key_path = ?public_key_path,
                             "Gateway public key still in RSA PEM format after 5s. Skipping this gateway."
                         );
+                        skipped_reasons.push(format!(
+                            "{address:?}: public key {public_key_path:?} still in legacy RSA PEM format"
+                        ));
                         break;
                     }
                 }
@@ -706,20 +727,32 @@ impl NodeConfig {
                 match hex::decode(buf) {
                     Ok(bytes) if bytes.len() == 32 => {
                         key_bytes = Some(bytes);
-                        break;
                     }
                     Ok(bytes) => {
-                        anyhow::bail!(
-                            "invalid gateway pubkey length {} (expected 32) from {public_key_path:?}",
+                        tracing::warn!(
+                            public_key_path = ?public_key_path,
+                            address = ?address,
+                            "Skipping gateway with invalid public key length {} (expected 32)",
                             bytes.len()
                         );
+                        skipped_reasons.push(format!(
+                            "{address:?}: invalid gateway pubkey length {} (expected 32) from {public_key_path:?}",
+                            bytes.len()
+                        ));
                     }
                     Err(e) => {
-                        anyhow::bail!(
-                            "failed to decode gateway pubkey hex from {public_key_path:?}: {e}"
+                        tracing::warn!(
+                            public_key_path = ?public_key_path,
+                            address = ?address,
+                            error = %e,
+                            "Skipping gateway whose public key is not valid hex"
                         );
+                        skipped_reasons.push(format!(
+                            "{address:?}: failed to decode gateway pubkey hex from {public_key_path:?}: {e}"
+                        ));
                     }
                 }
+                break;
             }
 
             let key_bytes = match key_bytes {
@@ -739,13 +772,55 @@ impl NodeConfig {
                 continue;
             }
 
-            let address = Self::parse_socket_addr(address).await?;
+            // One unresolvable gateway must not stop the node: a cached or
+            // compiled-in hostname outlives its DNS record once that gateway is
+            // retired, and the remaining gateways can still bootstrap us. The
+            // skip lasts for this process: a gateway that failed to resolve
+            // only transiently is not retried until the next start.
+            let address = match Self::parse_socket_addr(address).await {
+                Ok(address) => address,
+                Err(error) => {
+                    tracing::warn!(
+                        address = ?address,
+                        error = %error,
+                        "Skipping gateway whose address cannot be resolved"
+                    );
+                    unresolved_error = Some(error);
+                    continue;
+                }
+            };
             gateway_addrs.push(address);
             let peer_key_location = PeerKeyLocation::new(transport_pub_key, address);
             let location = location
                 .map(Location::new)
                 .unwrap_or_else(|| Location::from_address(&address));
             gateways.push(InitPeerNode::new(peer_key_location, location));
+        }
+        // A gateway may run with no bootstrap peers (isolated gateways are a
+        // valid configuration), so only a peer that needs one fails here.
+        if gateways.is_empty() && !config.is_gateway {
+            if !skipped_reasons.is_empty() {
+                const SHOWN: usize = 5;
+                let total = skipped_reasons.len();
+                let mut detail = skipped_reasons
+                    .iter()
+                    .take(SHOWN)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                if total > SHOWN {
+                    detail.push_str(&format!("; and {} more", total - SHOWN));
+                }
+                if let Some(error) = &unresolved_error {
+                    detail.push_str(&format!("; other gateways did not resolve: {error:#}"));
+                }
+                return Err(anyhow::anyhow!(
+                    "no configured gateway could be used ({total} skipped): {detail}"
+                ));
+            }
+            if let Some(error) = unresolved_error {
+                return Err(error.context("no configured gateway address could be resolved"));
+            }
         }
         tracing::info!(
             "Node will be listening at {}:{} internal address",
@@ -7216,6 +7291,222 @@ mod tests {
             "the activity gate (is_receiving_updates || has_downstream_subscribers \
              || pending_broadcasts.contains) MUST precede get_contract_state_by_id, \
              or the #4473 fetch_contract churn regresses for phantom contracts"
+        );
+    }
+
+    /// A gateway whose hostname no longer resolves (a retired gateway still in
+    /// a cache or in the compiled-in fallback list) is skipped, so the node
+    /// still starts with the gateways that do resolve. Only when NONE resolve
+    /// is it an error. Before, the first unresolvable entry aborted startup.
+    #[tokio::test]
+    async fn unresolvable_gateway_is_skipped_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("gw.pub");
+        std::fs::write(
+            &key_path,
+            hex::encode(TransportKeypair::new().public().as_bytes()),
+        )
+        .unwrap();
+        // RFC 6761: `.invalid` never resolves.
+        let unresolvable = GatewayConfig {
+            address: Address::Hostname("retired-gateway.invalid:31337".to_string()),
+            public_key_path: key_path.clone(),
+            location: None,
+        };
+        let resolvable_addr: SocketAddr = "127.0.0.1:31337".parse().unwrap();
+        let resolvable = GatewayConfig {
+            address: Address::HostAddress(resolvable_addr),
+            public_key_path: key_path,
+            location: None,
+        };
+        let build = |gateways: Vec<GatewayConfig>, id: &str, is_gateway: bool| {
+            let id = id.to_string();
+            async move {
+                let mut config = crate::config::ConfigArgs {
+                    id: Some(id),
+                    mode: Some(crate::contract::OperationMode::Local),
+                    ..Default::default()
+                }
+                .build()
+                .await
+                .expect("build Config");
+                config.gateways = gateways;
+                config.is_gateway = is_gateway;
+                NodeConfig::new(config).await
+            }
+        };
+
+        let node_config = build(
+            vec![unresolvable.clone(), resolvable],
+            "unresolvable-gw-skipped",
+            false,
+        )
+        .await
+        .expect("one unresolvable gateway must not stop the node");
+        assert_eq!(
+            node_config
+                .gateways
+                .iter()
+                .map(|gw| gw.peer_key_location.socket_addr())
+                .collect::<Vec<_>>(),
+            vec![Some(resolvable_addr)]
+        );
+
+        let Err(err) = build(vec![unresolvable.clone()], "unresolvable-gw-only", false).await
+        else {
+            panic!("with no gateway resolvable, startup must still fail");
+        };
+        assert!(
+            format!("{err:#}").contains("no configured gateway address could be resolved"),
+            "got: {err:#}"
+        );
+
+        // A gateway may run with no bootstrap peers, so it still starts.
+        let gateway = build(vec![unresolvable], "unresolvable-gw-gateway", true)
+            .await
+            .expect("a gateway with no resolvable bootstrap peer must still start");
+        assert!(gateway.gateways.is_empty());
+    }
+
+    /// A gateway whose public key is unusable (wrong length, not hex, or the
+    /// file is missing or unreadable) is skipped with the other gateways still
+    /// used; before, the first such entry aborted startup. When NO gateway key
+    /// is usable a non-gateway still fails clearly, and a gateway still starts.
+    #[tokio::test]
+    async fn gateway_with_unusable_key_is_skipped_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let write_key = |name: &str, content: String| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, content).unwrap();
+            path
+        };
+        let good_key = write_key(
+            "good.pub",
+            hex::encode(TransportKeypair::new().public().as_bytes()),
+        );
+        let short_key = write_key("short.pub", hex::encode([7u8; 31]));
+        let long_key = write_key("long.pub", hex::encode([7u8; 33]));
+        let not_hex_key = write_key("not_hex.pub", "zz-not-hex".to_string());
+        let missing_key = dir.path().join("missing.pub");
+        // A directory where a key file should be: opens, but cannot be read.
+        let unreadable_key = dir.path().join("unreadable.pub");
+        std::fs::create_dir(&unreadable_key).unwrap();
+
+        let gw = |addr: &str, key: &std::path::PathBuf| GatewayConfig {
+            address: Address::HostAddress(addr.parse().unwrap()),
+            public_key_path: key.clone(),
+            location: None,
+        };
+        let good_addr: SocketAddr = "127.0.0.1:31337".parse().unwrap();
+        let bad = vec![
+            gw("127.0.0.2:31337", &short_key),
+            gw("127.0.0.3:31337", &long_key),
+            gw("127.0.0.4:31337", &not_hex_key),
+            gw("127.0.0.5:31337", &missing_key),
+            gw("127.0.0.6:31337", &unreadable_key),
+        ];
+        let build = |gateways: Vec<GatewayConfig>, id: &str, is_gateway: bool| {
+            let id = id.to_string();
+            async move {
+                let mut config = crate::config::ConfigArgs {
+                    id: Some(id),
+                    mode: Some(crate::contract::OperationMode::Local),
+                    ..Default::default()
+                }
+                .build()
+                .await
+                .expect("build Config");
+                config.gateways = gateways;
+                config.is_gateway = is_gateway;
+                NodeConfig::new(config).await
+            }
+        };
+
+        // Bad entries on both sides of the good one.
+        let mut mixed = bad.clone();
+        mixed.insert(2, gw("127.0.0.1:31337", &good_key));
+        let node_config = build(mixed, "unusable-key-skipped", false)
+            .await
+            .expect("bad gateway keys must not stop the node");
+        assert_eq!(
+            node_config
+                .gateways
+                .iter()
+                .map(|gw| gw.peer_key_location.socket_addr())
+                .collect::<Vec<_>>(),
+            vec![Some(good_addr)]
+        );
+
+        let Err(err) = build(bad.clone(), "unusable-key-only", false).await else {
+            panic!("with no usable gateway key, a non-gateway must still fail");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("no configured gateway could be used (5 skipped)"),
+            "got: {msg}"
+        );
+        // Every distinct reason is reported, not just the last.
+        for reason in [
+            "invalid gateway pubkey length 31",
+            "invalid gateway pubkey length 33",
+            "failed to decode gateway pubkey hex",
+            "failed loading gateway pubkey",
+        ] {
+            assert!(msg.contains(reason), "missing {reason:?} in: {msg}");
+        }
+
+        let gateway = build(bad, "unusable-key-gateway", true)
+            .await
+            .expect("a gateway with no usable bootstrap peer must still start");
+        assert!(gateway.gateways.is_empty());
+    }
+
+    /// A gateway key that stays in the legacy RSA PEM format is skipped like
+    /// any other unusable key, and a non-gateway whose only gateway is such an
+    /// entry gets the clear error rather than a silently empty bootstrap list.
+    #[tokio::test]
+    async fn gateway_with_only_pem_key_fails_clearly_for_a_non_gateway() {
+        let dir = tempfile::tempdir().unwrap();
+        let pem_key = dir.path().join("pem.pub");
+        std::fs::write(
+            &pem_key,
+            "-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----\n",
+        )
+        .unwrap();
+        let build = |is_gateway: bool, id: &'static str| {
+            let pem_key = pem_key.clone();
+            async move {
+                let mut config = crate::config::ConfigArgs {
+                    id: Some(id.to_string()),
+                    mode: Some(crate::contract::OperationMode::Local),
+                    ..Default::default()
+                }
+                .build()
+                .await
+                .expect("build Config");
+                config.gateways = vec![GatewayConfig {
+                    address: Address::HostAddress("127.0.0.2:31337".parse().unwrap()),
+                    public_key_path: pem_key,
+                    location: None,
+                }];
+                config.is_gateway = is_gateway;
+                NodeConfig::new(config).await
+            }
+        };
+        let Err(err) = build(false, "pem-only-peer").await else {
+            panic!("a non-gateway whose only gateway key is PEM must fail");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("no configured gateway could be used") && msg.contains("RSA PEM"),
+            "got: {msg}"
+        );
+        assert!(
+            build(true, "pem-only-gateway")
+                .await
+                .expect("a gateway still starts")
+                .gateways
+                .is_empty()
         );
     }
 

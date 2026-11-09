@@ -24,6 +24,64 @@ pub(crate) enum ValidateOverride {
     /// Always `Valid`, recording the bytes of every state validated, so a test
     /// can assert which states were (and were not) validated.
     Record(std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>),
+    /// `Valid`, but only once the gate is released: the validate call BLOCKS
+    /// the calling thread until then, the way a long contract WASM call holds
+    /// the contract loop.
+    Block(std::sync::Arc<BlockingGate>),
+}
+
+/// A synchronous gate for [`ValidateOverride::Block`].
+#[derive(Default)]
+pub(crate) struct BlockingGate {
+    /// `(entered, released)`.
+    state: std::sync::Mutex<(bool, bool)>,
+    changed: std::sync::Condvar,
+}
+
+impl std::fmt::Debug for BlockingGate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BlockingGate")
+    }
+}
+
+impl BlockingGate {
+    /// Whether a caller has reached the gate.
+    #[cfg(test)]
+    pub(crate) fn entered(&self) -> bool {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn release(&self) {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).1 = true;
+        self.changed.notify_all();
+    }
+
+    /// Blocks the calling thread like a long contract WASM call does. On a
+    /// multi-thread runtime it does so inside `block_in_place`, as
+    /// `execute_wasm_blocking` does for real contract WASM: that hands the
+    /// worker's queued tasks to another thread. Blocking the worker outright
+    /// instead would strand whatever task was queued behind the loop on that
+    /// worker (a task the loop just woke sits in that worker's LIFO slot,
+    /// which other workers do not steal), which production does not do.
+    fn wait(&self) {
+        if matches!(
+            tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()),
+            Ok(tokio::runtime::RuntimeFlavor::MultiThread)
+        ) {
+            tokio::task::block_in_place(|| self.wait_inner());
+        } else {
+            self.wait_inner();
+        }
+    }
+
+    fn wait_inner(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.0 = true;
+        while !state.1 {
+            state = self.changed.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+    }
 }
 
 /// Configurable `update_state` behavior for testing related contract flows.
@@ -166,6 +224,127 @@ pub(crate) struct MockWasmRuntime {
     /// by a helper-call indirection. A prohibition worth pinning is worth being
     /// able to execute.
     pub(crate) delegate_wrong_variant: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// A one-shot pause after the next delegate run through the lane runner
+    /// (see [`PauseAfterNextRun`]). Lets a test hold a loop round-trip
+    /// BETWEEN two `process()` calls, with the runner's lock released.
+    pub(crate) delegate_pause_after: DelegatePauseSlot,
+    /// Called with the delegate key at the start of every scripted delegate
+    /// run, on whichever task runs it. Lets a test observe node state WHILE
+    /// a run is in progress.
+    pub(crate) delegate_run_hook: DelegateRunHook,
+    /// A delegate lane runner over this mock's delegate state, when a test
+    /// opted in with [`MockWasmRuntime::enable_delegate_lane`]. `None` (the
+    /// default) keeps every delegate run on the contract loop, as every test
+    /// written before the lane expects.
+    pub(crate) delegate_lane: Option<std::sync::Arc<MockDelegateRunner>>,
+}
+
+/// The delegate half of [`MockWasmRuntime`], as handles a lane runner can
+/// share with the executor.
+#[derive(Clone)]
+pub(crate) struct MockDelegateState {
+    script: DelegateScript,
+    calls: DelegateCallLog,
+    contexts: DelegateContexts,
+    observations: DelegateObservations,
+    unregistered: UnregisteredDelegates,
+    wrong_variant: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pause_after: DelegatePauseSlot,
+    run_hook: DelegateRunHook,
+}
+
+/// See [`MockWasmRuntime::delegate_run_hook`].
+pub(crate) type DelegateRunHook =
+    std::sync::Arc<std::sync::Mutex<Option<Box<dyn FnMut(&DelegateKey) + Send>>>>;
+
+/// Shared slot for a [`PauseAfterNextRun`].
+pub(crate) type DelegatePauseSlot = std::sync::Arc<std::sync::Mutex<Option<PauseAfterNextRun>>>;
+
+/// Taken by the next delegate run through [`MockDelegateRunner`]: once that
+/// run's `process()` has returned and the runner's lock is released, the
+/// caller marks `reached` and waits for one `release` permit.
+#[derive(Clone)]
+pub(crate) struct PauseAfterNextRun {
+    pub(crate) reached: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) release: std::sync::Arc<tokio::sync::Semaphore>,
+}
+
+impl Default for PauseAfterNextRun {
+    fn default() -> Self {
+        Self {
+            reached: std::sync::Arc::default(),
+            release: std::sync::Arc::new(tokio::sync::Semaphore::new(0)),
+        }
+    }
+}
+
+/// The mock's delegate runner: one lock around the scripted run, shared by the
+/// executor's own delegate calls and the lane, like `PooledDelegateRunner`.
+pub(crate) struct MockDelegateRunner {
+    state: MockDelegateState,
+    lock: tokio::sync::Mutex<()>,
+}
+
+impl crate::contract::delegate_lane::DelegateRunner for MockDelegateRunner {
+    fn run<'a>(
+        &'a self,
+        req: DelegateRequest<'a>,
+        _origin_contract: Option<&'a ContractInstanceId>,
+        _caller_delegate: Option<&'a DelegateKey>,
+        _connection_scope: crate::client_events::ConnectionScope,
+        user_context: Option<&'a UserSecretContext>,
+    ) -> futures::future::BoxFuture<'a, Response> {
+        Box::pin(async move {
+            let result = {
+                let _serial = self.lock.lock().await;
+                let user = user_context.map(|u| *u.user_id());
+                scripted_delegate_request(&self.state, req, user, user)
+            };
+            let pause = self
+                .state
+                .pause_after
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            if let Some(pause) = pause {
+                pause
+                    .reached
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                pause
+                    .release
+                    .acquire()
+                    .await
+                    .expect("pause semaphore closed")
+                    .forget();
+            }
+            result
+        })
+    }
+}
+
+impl MockWasmRuntime {
+    fn delegate_state(&self) -> MockDelegateState {
+        MockDelegateState {
+            script: self.delegate_script.clone(),
+            calls: self.delegate_calls.clone(),
+            contexts: self.delegate_contexts.clone(),
+            observations: self.delegate_observations.clone(),
+            unregistered: self.unregistered_delegates.clone(),
+            wrong_variant: self.delegate_wrong_variant.clone(),
+            pause_after: self.delegate_pause_after.clone(),
+            run_hook: self.delegate_run_hook.clone(),
+        }
+    }
+
+    /// Serve client delegate requests on a delegate lane, as the production
+    /// pool does. Call before handing the handler to `contract_handling`.
+    #[cfg(test)]
+    pub(crate) fn enable_delegate_lane(&mut self) {
+        self.delegate_lane = Some(std::sync::Arc::new(MockDelegateRunner {
+            state: self.delegate_state(),
+            lock: tokio::sync::Mutex::new(()),
+        }));
+    }
 }
 
 /// One scripted delegate invocation.
@@ -292,6 +471,10 @@ impl ContractRuntimeInterface for MockWasmRuntime {
                     seen.lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .push(_state.as_ref().to_vec());
+                    ValidateResult::Valid
+                }
+                ValidateOverride::Block(gate) => {
+                    gate.wait();
                     ValidateResult::Valid
                 }
             });
@@ -570,119 +753,109 @@ impl ContractStoreBridge for MockWasmRuntime {
 
 impl crate::wasm_runtime::ContractRuntimeBridge for MockWasmRuntime {}
 
-impl Executor<MockWasmRuntime, MockStateStorage> {
-    /// The scripted delegate run behind both `execute_delegate_request` and
-    /// `execute_delegate_hop`. `context_user` selects the context entry, as
-    /// in the real runtime.
-    fn scripted_delegate_request(
-        &mut self,
-        req: DelegateRequest<'_>,
-        secret_user: Option<crate::wasm_runtime::UserId>,
-        context_user: Option<crate::wasm_runtime::UserId>,
-    ) -> Response {
-        // Scripted, for the #5544 park/resume tests. Without a script this
-        // stays the "not supported" error it has always been, so no existing
-        // test changes behaviour.
-        let key = req.key().clone();
-        if self
-            .runtime
-            .delegate_wrong_variant
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            // An internal invariant violation: the executor answering a
-            // delegate request with something that is not a delegate response.
-            // Any non-delegate variant does; `StreamChunk` is simply the
-            // cheapest to construct.
-            return Ok(freenet_stdlib::client_api::HostResponse::StreamChunk {
-                stream_id: 0,
-                index: 0,
-                total: 1,
-                data: Default::default(),
-            });
+/// The scripted delegate run behind both `execute_delegate_request` and
+/// `execute_delegate_hop`, and behind the mock lane runner. `context_user`
+/// selects the context entry, as in the real runtime.
+fn scripted_delegate_request(
+    state: &MockDelegateState,
+    req: DelegateRequest<'_>,
+    secret_user: Option<crate::wasm_runtime::UserId>,
+    context_user: Option<crate::wasm_runtime::UserId>,
+) -> Response {
+    // Scripted, for the #5544 park/resume tests. Without a script this
+    // stays the "not supported" error it has always been, so no existing
+    // test changes behaviour.
+    let key = req.key().clone();
+    if let Some(hook) = state
+        .run_hook
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()
+    {
+        hook(&key);
+    }
+    if state
+        .wrong_variant
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        // An internal invariant violation: the executor answering a
+        // delegate request with something that is not a delegate response.
+        // Any non-delegate variant does; `StreamChunk` is simply the
+        // cheapest to construct.
+        return Ok(freenet_stdlib::client_api::HostResponse::StreamChunk {
+            stream_id: 0,
+            index: 0,
+            total: 1,
+            data: Default::default(),
+        });
+    }
+
+    if state.unregistered.lock().unwrap().contains(&key) {
+        return Err(ExecutorError::request(
+            freenet_stdlib::client_api::DelegateError::Missing(key),
+        ));
+    }
+
+    // Model the real `DelegateContextCache` read-modify-write around every
+    // invocation (#5544 S7): read on entry, record what was seen, write on
+    // exit. Same key (delegate and hosted user), same last-write-wins
+    // semantics as the runtime's.
+    let context_key: DelegateContextKey = (key.clone(), context_user);
+    let observed_context = state.contexts.lock().unwrap().get(&context_key).cloned();
+    // Only `ApplicationMessages` carries inbound to classify; the
+    // registration variants carry none. The wildcard is required by
+    // `#[non_exhaustive]` and is listed alongside the known variants so a
+    // future one is not silently swallowed.
+    let (inbound_kinds, params): (Vec<&'static str>, Vec<u8>) = match &req {
+        DelegateRequest::ApplicationMessages {
+            inbound, params, ..
+        } => (
+            inbound.iter().map(inbound_kind).collect(),
+            params.as_ref().to_vec(),
+        ),
+        DelegateRequest::RegisterDelegate { .. } | DelegateRequest::UnregisterDelegate(_) | _ => {
+            (Vec::new(), Vec::new())
         }
+    };
 
-        if self
-            .runtime
-            .unregistered_delegates
-            .lock()
-            .unwrap()
-            .contains(&key)
-        {
-            return Err(ExecutorError::request(
-                freenet_stdlib::client_api::DelegateError::Missing(key),
-            ));
-        }
-
-        // Model the real `DelegateContextCache` read-modify-write around every
-        // invocation (#5544 S7): read on entry, record what was seen, write on
-        // exit. Same key (delegate and hosted user), same last-write-wins
-        // semantics as the runtime's.
-        let context_key: DelegateContextKey = (key.clone(), context_user);
-        let observed_context = self
-            .runtime
-            .delegate_contexts
-            .lock()
-            .unwrap()
-            .get(&context_key)
-            .cloned();
-        // Only `ApplicationMessages` carries inbound to classify; the
-        // registration variants carry none. The wildcard is required by
-        // `#[non_exhaustive]` and is listed alongside the known variants so a
-        // future one is not silently swallowed.
-        let (inbound_kinds, params): (Vec<&'static str>, Vec<u8>) = match &req {
-            DelegateRequest::ApplicationMessages {
-                inbound, params, ..
-            } => (
-                inbound.iter().map(inbound_kind).collect(),
-                params.as_ref().to_vec(),
-            ),
-            DelegateRequest::RegisterDelegate { .. }
-            | DelegateRequest::UnregisterDelegate(_)
-            | _ => (Vec::new(), Vec::new()),
-        };
-
-        let script = self.runtime.delegate_script.lock().unwrap().pop_front();
-        let record = |rt: &MockWasmRuntime, writes: Option<Vec<u8>>| {
-            rt.delegate_calls.lock().unwrap().push(key.clone());
-            rt.delegate_observations
+    let script = state.script.lock().unwrap().pop_front();
+    let record = |rt: &MockDelegateState, writes: Option<Vec<u8>>| {
+        rt.calls.lock().unwrap().push(key.clone());
+        rt.observations.lock().unwrap().push(DelegateObservation {
+            delegate_key: key.clone(),
+            inbound_kinds: inbound_kinds.clone(),
+            observed_context: observed_context.clone(),
+            params: params.clone(),
+            secret_user,
+        });
+        if let Some(bytes) = writes {
+            rt.contexts
                 .lock()
                 .unwrap()
-                .push(DelegateObservation {
-                    delegate_key: key.clone(),
-                    inbound_kinds: inbound_kinds.clone(),
-                    observed_context: observed_context.clone(),
-                    params: params.clone(),
-                    secret_user,
-                });
-            if let Some(bytes) = writes {
-                rt.delegate_contexts
-                    .lock()
-                    .unwrap()
-                    .insert(context_key.clone(), bytes);
-            }
-        };
+                .insert(context_key.clone(), bytes);
+        }
+    };
 
-        let Some(run) = script else {
-            if self.runtime.delegate_calls.lock().unwrap().is_empty() {
-                return Err(ExecutorError::other(anyhow::anyhow!(
-                    "delegates not supported in MockWasmRuntime"
-                )));
-            }
-            // Script exhausted after a real scripted run: the delegate has
-            // nothing more to say. Record the entry so exclusion assertions
-            // still see it.
-            record(&self.runtime, None);
-            return Ok(freenet_stdlib::client_api::HostResponse::DelegateResponse {
-                key,
-                values: Vec::new(),
-            });
-        };
-        record(&self.runtime, run.writes_context);
-        Ok(freenet_stdlib::client_api::HostResponse::DelegateResponse {
+    let Some(run) = script else {
+        if state.calls.lock().unwrap().is_empty() {
+            return Err(ExecutorError::other(anyhow::anyhow!(
+                "delegates not supported in MockWasmRuntime"
+            )));
+        }
+        // Script exhausted after a real scripted run: the delegate has
+        // nothing more to say. Record the entry so exclusion assertions
+        // still see it.
+        record(state, None);
+        return Ok(freenet_stdlib::client_api::HostResponse::DelegateResponse {
             key,
-            values: run.outbound,
-        })
-    }
+            values: Vec::new(),
+        });
+    };
+    record(state, run.writes_context);
+    Ok(freenet_stdlib::client_api::HostResponse::DelegateResponse {
+        key,
+        values: run.outbound,
+    })
 }
 
 impl ContractExecutor for Executor<MockWasmRuntime, MockStateStorage> {
@@ -777,19 +950,48 @@ impl ContractExecutor for Executor<MockWasmRuntime, MockStateStorage> {
         _connection_scope: crate::client_events::ConnectionScope,
         user_context: Option<&UserSecretContext>,
     ) -> Response {
+        if let Some(runner) = self.runtime.delegate_lane.clone() {
+            use crate::contract::delegate_lane::DelegateRunner;
+            return runner
+                .run(req, None, None, _connection_scope, user_context)
+                .await;
+        }
         let user = user_context.map(|u| *u.user_id());
-        self.scripted_delegate_request(req, user, user)
+        scripted_delegate_request(&self.runtime.delegate_state(), req, user, user)
+    }
+
+    fn delegate_runner(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::contract::delegate_lane::DelegateRunner>> {
+        self.runtime
+            .delegate_lane
+            .clone()
+            .map(|r| r as std::sync::Arc<dyn crate::contract::delegate_lane::DelegateRunner>)
     }
 
     async fn execute_delegate_hop(
         &mut self,
         req: DelegateRequest<'_>,
-        _caller_delegate: &DelegateKey,
-        _connection_scope: crate::client_events::ConnectionScope,
+        caller_delegate: &DelegateKey,
+        connection_scope: crate::client_events::ConnectionScope,
         user_context: Option<&UserSecretContext>,
     ) -> Response {
+        if let Some(runner) = self.runtime.delegate_lane.clone() {
+            use crate::contract::delegate_lane::DelegateRunner;
+            // The hop's attested caller rides through the runner, as in
+            // `RuntimePool::execute_delegate_hop`.
+            return runner
+                .run(
+                    req,
+                    None,
+                    Some(caller_delegate),
+                    connection_scope,
+                    user_context,
+                )
+                .await;
+        }
         let user = user_context.map(|u| *u.user_id());
-        self.scripted_delegate_request(req, user, user)
+        scripted_delegate_request(&self.runtime.delegate_state(), req, user, user)
     }
 
     fn hosted_mode(&self) -> bool {
@@ -865,6 +1067,9 @@ impl Executor<MockWasmRuntime, MockStateStorage> {
             registered_params: RegisteredParams::default(),
             unregistered_delegates: UnregisteredDelegates::default(),
             delegate_wrong_variant: std::sync::Arc::default(),
+            delegate_pause_after: std::sync::Arc::default(),
+            delegate_run_hook: std::sync::Arc::default(),
+            delegate_lane: None,
         };
 
         Executor::new(
@@ -904,6 +1109,9 @@ impl Executor<MockWasmRuntime, MockStateStorage> {
             registered_params: RegisteredParams::default(),
             unregistered_delegates: UnregisteredDelegates::default(),
             delegate_wrong_variant: std::sync::Arc::default(),
+            delegate_pause_after: std::sync::Arc::default(),
+            delegate_run_hook: std::sync::Arc::default(),
+            delegate_lane: None,
         };
 
         Executor::new(state_store, || Ok(()), OperationMode::Local, runtime, None).await
@@ -935,6 +1143,9 @@ impl Executor<MockWasmRuntime, MockStateStorage> {
             registered_params: RegisteredParams::default(),
             unregistered_delegates: UnregisteredDelegates::default(),
             delegate_wrong_variant: std::sync::Arc::default(),
+            delegate_pause_after: std::sync::Arc::default(),
+            delegate_run_hook: std::sync::Arc::default(),
+            delegate_lane: None,
         };
 
         Executor::new(

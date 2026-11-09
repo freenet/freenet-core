@@ -875,10 +875,16 @@ jobs:
   # platform-specific errors that Linux CI misses. Added after #3685 where
   # PRs #3669/#3680 introduced Windows-only code that failed to compile,
   # but wasn't caught until the release cross-compile workflow ran.
+  #
+  # Clippy over all targets, not `cargo check` of the default ones: the
+  # check built no test target, and Linux clippy never sees a
+  # `cfg(windows)` line, so a Windows-only unused import, an undocumented
+  # `unsafe` block or a test that did not compile on Windows passed every
+  # job.
   windows_check:
     name: Windows Check
     runs-on: windows-latest
-    timeout-minutes: 20
+    timeout-minutes: 40
     if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
 
     steps:
@@ -887,11 +893,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.93.0
+          components: clippy
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Check compilation
-        run: cargo check --locked -p freenet -p fdev
+      - name: Clippy (all targets)
+        run: cargo clippy --locked -p freenet -p fdev --all-targets -- -D warnings
 
   test_unit:
     name: Unit & Integration
@@ -1193,9 +1200,10 @@ jobs:
 
   # Windows unit tests for the wrapper's Windows-only code paths (named-mutex
   # single-instance guard, process classification, etc). `windows_check` above
-  # only `cargo check`s — compilation is not verification of a `#[cfg(target_os
-  # = "windows")]` path (see .claude/rules/deployment.md) — so without this job
-  # the Windows-specific tests in commands::service would never actually run.
+  # compiles and lints every target but runs nothing, and compilation is not
+  # verification of a `#[cfg(target_os = "windows")]` path (see
+  # .claude/rules/deployment.md), so without this job the Windows-specific
+  # tests in commands::service would never actually run.
   # Added alongside the #5132 fix (Windows wrapper had no single-instance
   # guard at all), mirroring macos_unit above.
   windows_unit:
@@ -1243,24 +1251,27 @@ jobs:
           tool: cargo-nextest
           fallback: none
 
+      # Every step here builds with `quic-panic-injection` (test builds only;
+      # it lets the QUIC breaker test below abort the node on a QUIC panic),
+      # so the job compiles the crate once.
       - name: Build freenet bin
-        run: cargo build --locked -p freenet --bin freenet
+        run: cargo build --locked -p freenet --bin freenet --features quic-panic-injection
 
       - name: Test service commands
-        run: cargo nextest run -p freenet --bin freenet --profile ci -E 'test(commands::service) | test(commands::url_handler) | test(commands::open_link)'
+        run: cargo nextest run -p freenet --bin freenet --profile ci --features quic-panic-injection -E 'test(commands::service) | test(commands::url_handler) | test(commands::open_link)'
 
       # freenet:// scheme handler (#5726). Includes the argument-injection
       # test: the command line registered in HKCU, with hostile links
       # substituted for %1 and launched raw, so the real Windows argv parser
       # splits it.
       - name: Test freenet:// handler binary
-        run: cargo nextest run -p freenet --profile ci --test url_scheme_handler
+        run: cargo nextest run -p freenet --profile ci --test url_scheme_handler --features quic-panic-injection
 
       # The QUIC crash-loop breaker through the real process (#6031). Its
       # decision is tested on every platform; only this reaches the Windows
       # branch in the binary.
       - name: Test QUIC breaker on Windows
-        run: cargo nextest run -p freenet --profile ci --test quic_breaker_windows
+        run: cargo nextest run -p freenet --profile ci --test quic_breaker_windows --features quic-panic-injection
 
       # And through real protocol activation: Start-Process hands the link to
       # Windows, which looks up HKCU\Software\Classes\freenet and runs the
@@ -1451,14 +1462,16 @@ jobs:
             # e2e lib tests (`kind(lib) & test(sim_e2e_tests)`) — so the ~3000
             # ordinary freenet lib unit tests (already covered by the
             # workspace test job) are NOT re-run here. They were all built with
-            # --no-run above.
+            # --no-run above. `test(decision_hasher)` adds the unit tests of
+            # `util::decision_hasher` (#6132): they exist only under
+            # `simulation_tests`, so this job is the only one that can run them.
             cargo nextest run -p freenet --locked \
               --lib \
               --test simulation_integration \
               --test simulation_smoke \
               --test streaming_e2e \
               --test state_verification \
-              -E 'kind(test) | (kind(lib) & test(sim_e2e_tests))' \
+              -E 'kind(test) | (kind(lib) & (test(sim_e2e_tests) | test(decision_hasher)))' \
               --features simulation_tests,testing --profile ci 2>&1
             rc=$?
             echo "== $(date -u +%H:%M:%S) nextest done rc=${rc}"

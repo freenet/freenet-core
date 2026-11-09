@@ -68,7 +68,6 @@
 // terminology + epic #4642.
 
 use freenet_stdlib::prelude::ContractKey;
-use std::collections::HashMap;
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -1068,7 +1067,7 @@ pub struct HostingCache<T: TimeSource> {
     /// Contract metadata indexed by key. Eviction order is derived from each
     /// entry's subscriber counts + `recency_seq` (via [`victim_order`]), not from
     /// a separate LRU list, so there is no second structure to keep in sync.
-    contracts: HashMap<ContractKey, HostedContract>,
+    contracts: crate::util::DecisionHashMap<ContractKey, HostedContract>,
     /// Monotonic access counter. Incremented on every access (insert / read /
     /// seed / touch) and stamped onto the entry's `last_access_seq`, giving an
     /// exact least-recently-accessed tiebreak for eviction that is independent
@@ -1424,7 +1423,7 @@ impl<T: TimeSource> HostingCache<T> {
         Self {
             budget_bytes,
             current_bytes: 0,
-            contracts: HashMap::new(),
+            contracts: Default::default(),
             access_seq: 0,
             eviction_floor: 0.0,
             budget_evictions_total: 0,

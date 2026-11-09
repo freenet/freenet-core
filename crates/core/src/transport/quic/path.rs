@@ -166,7 +166,7 @@ use crate::transport::peer_connection::{embeds_metadata, fits_one_packet};
 
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use bounded::{BoundedSend, MaybeDelivered, NotOpened, SendDeadlines, SendFailure};
-use bounded::{SendProgress, bounded_send};
+use bounded::{ConnectionProgress, SendProgress, bounded_send};
 pub(crate) use inbound::{InboundShort, InboundStreamArrival};
 #[cfg(test)]
 pub(crate) use route::STALLED_SENDS_LIMIT;
@@ -303,6 +303,10 @@ pub(crate) struct QuicPathLimits {
     /// (supervisor test).
     #[cfg(test)]
     pub(crate) panic_in_watch: bool,
+    /// The receive side's gap cap (`inbound::MAX_GAPS_PER_CONNECTION`), lower
+    /// in a test that trips it.
+    #[cfg(test)]
+    pub(crate) max_gaps: usize,
 }
 
 impl QuicPathLimits {
@@ -329,6 +333,8 @@ impl QuicPathLimits {
         panic_in_receive: false,
         #[cfg(test)]
         panic_in_watch: false,
+        #[cfg(test)]
+        max_gaps: inbound::MAX_GAPS_PER_CONNECTION,
     };
 
     /// [`Self::DEFAULT`] for a path in shadow mode: control frames only.
@@ -439,6 +445,15 @@ quic_outcomes! {
         ShortRefusedBudget => "short_refused_budget",
         /// A Stream did not fit the inbound budget (as above).
         StreamRefusedBudget => "stream_refused_budget",
+        /// The connection's streams held more gaps (received ranges past the
+        /// first, per stream) than `inbound::MAX_GAPS_PER_CONNECTION`; the
+        /// stream that went past it was stopped (`stop_code::EVICTED`).
+        TooManyRanges => "too_many_ranges",
+        /// The connection went past `inbound::MAX_GAPS_PER_CONNECTION` a
+        /// second time, so the path was closed with DOWNGRADE (once per path):
+        /// the gaps of streams it stopped stay counted for the connection's
+        /// life, because quinn keeps them until the peer ends the stream.
+        ClosedTooManyRanges => "closed_too_many_ranges",
     }
 }
 
@@ -678,6 +693,16 @@ pub(crate) struct QuicPath {
     counted_as_data_path: std::sync::atomic::AtomicBool,
     /// Send timeouts while nothing is acknowledged ([`route::StallCount`]).
     stall: parking_lot::Mutex<route::StallCount>,
+    /// The [`bounded::QuietProof`] sends that ran out of gap left, read (not
+    /// taken) by every settle; a proof of the same counts is merged into it.
+    quiet: Arc<parking_lot::Mutex<Option<bounded::QuietProof>>>,
+    /// The connection's acknowledged count and when it was last seen to
+    /// move, on the path's clock ([`bounded::AckRecord`]); the count at build
+    /// and the build time to start, as for the stall count, so a path dark
+    /// from its start has its first sends' cap holds credited for one
+    /// `route::hold_credit` after it is built (seconds at a high cap, minutes
+    /// at a low one).
+    last_acked: Arc<bounded::AckRecord>,
     /// The connection's count of acknowledged packets, `None` if its controller
     /// does not keep one.
     ack_progress: Option<recycle::AckProgress>,
@@ -697,6 +722,9 @@ pub(crate) struct QuicPath {
     pacer: std::sync::OnceLock<Arc<dyn pacer::SendPacer>>,
     #[cfg(test)]
     budget: SharedInboundBudget,
+    /// The receive side's count of received ranges. Tests only.
+    #[cfg(test)]
+    inbound_ranges: Arc<inbound::ConnRanges>,
 }
 
 /// The path never had both data bits: nothing may send data on it.
@@ -834,7 +862,10 @@ impl QuicPath {
         #[cfg(test)]
         {
             receiver.panic_on_stream = limits.panic_in_receive;
+            receiver.set_gap_cap(limits.max_gaps);
         }
+        #[cfg(test)]
+        let inbound_ranges = receiver.ranges();
         let aborts = Arc::new(SendAborts::new(limits.max_send_aborts, connection.closer()));
         // Read once: quinn keeps one controller per connection while migration is
         // off (`config`), so the record stays the connection's. The ack watch
@@ -847,9 +878,10 @@ impl QuicPath {
                  send timeout counts toward the stall close"
             );
         }
+        let built_at = time.now_nanos();
         let stall = route::StallCount::new(
             ack_progress.as_ref().map(recycle::AckProgress::acked),
-            time.now_nanos(),
+            built_at,
         );
         let heard = Arc::new(recycle::PeerHeard::default());
         #[cfg_attr(not(test), allow(unused_mut))]
@@ -880,6 +912,11 @@ impl QuicPath {
                 send_data: AtomicU8::new(SEND_DATA_NEVER),
                 counted_as_data_path: std::sync::atomic::AtomicBool::new(false),
                 stall: parking_lot::Mutex::new(stall),
+                quiet: Arc::default(),
+                last_acked: Arc::new(bounded::AckRecord::new(
+                    ack_progress.as_ref().map_or(0, recycle::AckProgress::acked),
+                    built_at,
+                )),
                 ack_progress,
                 suspect_since_acked: parking_lot::Mutex::new(None),
                 suspect: std::sync::atomic::AtomicBool::new(false),
@@ -887,6 +924,8 @@ impl QuicPath {
                 pacer: std::sync::OnceLock::new(),
                 #[cfg(test)]
                 budget,
+                #[cfg(test)]
+                inbound_ranges,
             },
             controls,
         )
@@ -922,6 +961,51 @@ impl QuicPath {
         self.pacer.get().map(|pacer| pacer::Pacing {
             pacer: Arc::clone(pacer),
         })
+    }
+
+    /// The most gaps the receive side's streams held at once. Tests only.
+    #[cfg(test)]
+    pub(in crate::transport) fn inbound_gaps_peak(&self) -> usize {
+        self.inbound_ranges.peak()
+    }
+
+    /// Streams the receive side announced after reading their end, which
+    /// must not happen. Tests only.
+    #[cfg(test)]
+    pub(in crate::transport) fn inbound_ended_before_announce(&self) -> usize {
+        self.inbound_ranges
+            .ended_before_announce
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Chunks the receive side read past a header it did not have yet,
+    /// which must not happen. Tests only.
+    #[cfg(test)]
+    pub(in crate::transport) fn inbound_read_past_missing_header(&self) -> usize {
+        self.inbound_ranges
+            .read_past_missing_header
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Chunks the receive side read in order by the drain before a switch to
+    /// unordered reads. Tests only.
+    #[cfg(test)]
+    pub(in crate::transport) fn inbound_drained_before_switch(&self) -> usize {
+        self.inbound_ranges
+            .drained_before_switch
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Gaps the receive side counts now. Tests only.
+    #[cfg(test)]
+    pub(in crate::transport) fn inbound_gaps_held(&self) -> usize {
+        self.inbound_ranges.held()
+    }
+
+    /// Gaps of stopped streams the receive side keeps counted. Tests only.
+    #[cfg(test)]
+    pub(in crate::transport) fn inbound_gaps_kept(&self) -> usize {
+        self.inbound_ranges.kept()
     }
 
     /// Whether the path's data sends are paced.
@@ -1128,6 +1212,18 @@ impl QuicPath {
         );
     }
 
+    /// What a send's gap reads of this path's connection
+    /// ([`bounded::ConnectionProgress`]); `None` when the controller counts no
+    /// acknowledgements, and then only the send's own gap applies.
+    fn connection_progress(&self) -> Option<ConnectionProgress> {
+        self.ack_progress.clone().map(|acks| ConnectionProgress {
+            acks,
+            cap_holds: self.connection.cap_holds(),
+            quiet: self.quiet.clone(),
+            last_acked: self.last_acked.clone(),
+        })
+    }
+
     /// Send one serialized message. Tests only, with no deadline; nodes use
     /// [`Self::send_short_bounded`].
     #[cfg(test)]
@@ -1146,7 +1242,7 @@ impl QuicPath {
         deadlines: impl Into<SendDeadlines>,
         payload: &[u8],
     ) -> BoundedSend {
-        bounded_send(time, deadlines, |progress| {
+        bounded_send(time, deadlines, self.connection_progress(), |progress| {
             self.send_short_with(payload, None, progress)
         })
         .await
@@ -1207,7 +1303,7 @@ impl QuicPath {
         control: QuicControl,
     ) -> BoundedSend {
         let payload = control.encode();
-        bounded_send(time, timeout, |progress| {
+        bounded_send(time, timeout, None, |progress| {
             self.send_control_with(&payload[..], progress)
         })
         .await
@@ -1242,7 +1338,7 @@ impl QuicPath {
         payload: Bytes,
         observer: Option<&dyn StreamProgressObserver>,
     ) -> BoundedSend {
-        bounded_send(time, deadlines, |progress| {
+        bounded_send(time, deadlines, self.connection_progress(), |progress| {
             self.send_stream_with(stream_id, metadata, payload, observer, progress)
         })
         .await
@@ -1355,7 +1451,7 @@ impl QuicPath {
             total: deadlines.total - waited,
             ..deadlines
         };
-        bounded_send(time, deadlines, |progress| {
+        bounded_send(time, deadlines, self.connection_progress(), |progress| {
             self.send_stream_chunks_with(
                 stream_id, total_len, metadata, first, chunks, observer, progress,
             )
@@ -1381,6 +1477,7 @@ impl QuicPath {
         let metadata = frame_metadata(metadata);
         let header = FrameHeader::stream(stream_id, total_len, metadata.len())?;
         let slot = self.stream_slot().await?;
+        let source_wait = progress.clone();
         let mut send = self
             .open(&header, metadata, Some(slot), self.pacing(), progress)
             .await?;
@@ -1389,7 +1486,12 @@ impl QuicPath {
         let failure = loop {
             let item = match next.take() {
                 Some(chunk) => Some(Ok(chunk)),
-                None => send.race(chunks.next()).await?,
+                None => {
+                    source_wait.waiting_on_source(true);
+                    let item = send.race(chunks.next()).await;
+                    source_wait.waiting_on_source(false);
+                    item?
+                }
             };
             match item {
                 None if delivered == total_len => break None,

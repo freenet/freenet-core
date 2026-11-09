@@ -9,14 +9,16 @@
 //! **This module doc describes unix.** Windows does not reliably tell a
 //! process that it is being stopped: every design that tried to tell a crash
 //! from a normal stop there (a logoff, a Fast Startup shutdown, a session end)
-//! got one of them wrong. So Windows does not ask. It counts runs that ended
-//! within ten minutes, for any reason, and three in a row, each starting
-//! within the cooldown of the one before, keep QUIC off for the same cooldown,
-//! with the same state and telemetry. [`short_runs`] describes it.
+//! got one of them wrong. So Windows does not ask how a run ended. A panic
+//! hook records a panic located in QUIC code (the failure this breaker is for
+//! always panics before it aborts), and runs that ended within ten minutes
+//! after recording one, three in a row, each starting within the cooldown of
+//! the one before, keep QUIC off for the same cooldown, with the same state
+//! and telemetry. [`short_runs`] describes it.
 //!
-//! **Windows is weaker than unix.** There, a crash loop whose runs each last
-//! ten minutes or more never trips, and neither does a fault that crashes once
-//! a day. That must be weighed before QUIC goes on by default on Windows. QUIC
+//! **Windows is weaker than unix.** There, a crash not preceded by a panic in
+//! QUIC code is not counted, a crash loop whose runs each last ten minutes or
+//! more never trips, and neither does a fault that crashes once a day. That must be weighed before QUIC goes on by default on Windows. QUIC
 //! stays off by default there until the breaker has been confirmed on a real
 //! Windows machine (#6031).
 //!
@@ -135,6 +137,7 @@ use serde::{Deserialize, Serialize};
 use crate::node::background_task_monitor::LateRegistrar;
 
 mod short_runs;
+pub(crate) use short_runs::QuicCode;
 
 /// How long QUIC stays off after a run with QUIC enabled ended abnormally.
 pub(crate) const QUIC_BREAKER_COOLDOWN: Duration = Duration::from_secs(24 * 60 * 60);
@@ -204,6 +207,7 @@ pub fn quic_breaker_signals_ready() {
 /// and the auto-update exit) and on no other.
 pub fn quic_breaker_clean_exit() {
     if let Some((path, nonce)) = ARMED.get() {
+        short_runs::note_marker_cleared();
         if let Err(error) = clear_if_owned(path, *nonce) {
             tracing::warn!(
                 %error,
@@ -247,6 +251,11 @@ pub(crate) enum Marker {
         short_runs: u32,
         started_at_secs: u64,
         nonce: u64,
+        /// The run recorded a panic in QUIC code (quinn, quinn-proto or this
+        /// crate's QUIC transport) while it was still short. Only such a run
+        /// counts. Absent in a marker from an earlier release.
+        #[serde(default)]
+        quic_panicked: bool,
     },
     /// A state this binary does not know, written by a later release.
     #[serde(other)]
@@ -680,12 +689,18 @@ struct Pending {
 /// are installed. Called under the `PENDING` lock from both events, so
 /// whichever comes second writes it, exactly once.
 fn arm_when_ready(pending: &mut Pending) {
-    arm_when_ready_into(pending, &ARMED);
+    arm_when_ready_into(pending, &ARMED, short_runs::record_quic_panics);
 }
 
 /// [`arm_when_ready`], recording what was written in `armed`, which is the
-/// static [`ARMED`] outside tests.
-fn arm_when_ready_into(pending: &mut Pending, armed: &OnceLock<(PathBuf, u64)>) {
+/// static [`ARMED`] outside tests, and installing the Windows panic hook with
+/// `record_panics`, which tests replace: the real hook is process-global, so
+/// only a test in a child process may install it.
+fn arm_when_ready_into(
+    pending: &mut Pending,
+    armed: &OnceLock<(PathBuf, u64)>,
+    record_panics: fn(PathBuf, u64),
+) {
     if !(pending.quic_up && pending.signals_ready) {
         return;
     }
@@ -694,7 +709,12 @@ fn arm_when_ready_into(pending: &mut Pending, armed: &OnceLock<(PathBuf, u64)>) 
     if let Some((path, nonce)) = arm(pending.marker.take()) {
         if counts_short_runs {
             short_runs::start_clear_timer(registrar.as_ref(), path.clone(), nonce);
+            record_panics(path.clone(), nonce);
         }
+        // Test builds only: start an injected QUIC panic's countdown now that
+        // the marker (and on Windows the panic hook) is in place.
+        #[cfg(feature = "quic-panic-injection")]
+        super::panic_injection::inject_from_env();
         // One node per process in production; a second keeps the first.
         let _first_wins = armed.set((path, nonce));
     }
@@ -864,7 +884,7 @@ mod platform {
         rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
 
-    /// Unused: Windows counts short runs instead.
+    /// Unused: Windows counts short runs that panicked in QUIC code instead.
     #[cfg(not(unix))]
     pub(super) fn pid_alive(_pid: u32) -> bool {
         false
@@ -879,6 +899,10 @@ mod tests {
     const OWN: u32 = 99;
     const T0: u64 = 1_800_000_000;
     const BOOT: &str = "boot-a";
+
+    /// The panic-hook installer for tests: the real hook is process-global,
+    /// so only the child-process test in `short_runs.rs` installs it.
+    fn no_hook(_path: PathBuf, _nonce: u64) {}
 
     fn armed(pid: u32, boot: Option<&str>) -> Previous {
         Previous::Marker(Marker::Armed {
@@ -1229,6 +1253,7 @@ mod tests {
             short_runs: 1,
             started_at_secs: T0,
             nonce: 7,
+            quic_panicked: false,
         };
         let pending = |path: &Path| Pending {
             marker: Some((path.to_path_buf(), marker.clone())),
@@ -1238,14 +1263,14 @@ mod tests {
         };
 
         let armed = OnceLock::new();
-        arm_when_ready_into(&mut pending(&path), &armed);
+        arm_when_ready_into(&mut pending(&path), &armed, no_hook);
         assert_eq!(armed.get(), Some(&(path.clone(), 7)));
         assert!(clear_if_owned(&path, armed.get().unwrap().1).unwrap());
 
         let blocker = dir.path().join("a-file");
         std::fs::write(&blocker, b"").unwrap();
         let armed = OnceLock::new();
-        arm_when_ready_into(&mut pending(&marker_path(&blocker)), &armed);
+        arm_when_ready_into(&mut pending(&marker_path(&blocker)), &armed, no_hook);
         assert_eq!(armed.get(), None, "the write failed");
     }
 
@@ -1262,6 +1287,7 @@ mod tests {
             short_runs: 0,
             started_at_secs: T0,
             nonce: 7,
+            quic_panicked: false,
         };
         let pending = |marker: Option<Marker>, signals_ready| Pending {
             marker: marker.map(|marker| (path.clone(), marker)),
@@ -1283,10 +1309,11 @@ mod tests {
         // Held while the marker waits for the signal handlers, gone after.
         note_transport_up(&mut p, true, Some(&registrar));
         assert!(p.registrar.is_some());
-        arm_when_ready(&mut p);
+        let written = OnceLock::new();
+        arm_when_ready_into(&mut p, &written, no_hook);
         assert!(p.registrar.is_some(), "still waiting");
         p.signals_ready = true;
-        arm_when_ready(&mut p);
+        arm_when_ready_into(&mut p, &written, no_hook);
         assert!(p.registrar.is_none());
     }
 
@@ -1302,14 +1329,20 @@ mod tests {
             short_runs: 1,
             started_at_secs: T0,
             nonce: 7,
+            quic_panicked: false,
         };
+        let written = OnceLock::new();
         let arm_now = |marker: Marker, registrar: Option<LateRegistrar>| {
-            arm_when_ready(&mut Pending {
-                marker: Some((path.clone(), marker)),
-                quic_up: true,
-                signals_ready: true,
-                registrar,
-            })
+            arm_when_ready_into(
+                &mut Pending {
+                    marker: Some((path.clone(), marker)),
+                    quic_up: true,
+                    signals_ready: true,
+                    registrar,
+                },
+                &written,
+                no_hook,
+            )
         };
 
         arm_now(marker_of(armed(PID, Some(BOOT))), Some(registrar.clone()));
@@ -1384,7 +1417,8 @@ mod tests {
         );
     }
 
-    /// Windows is the one platform that decides by short runs, and it does so
+    /// Windows is the one platform that decides by short runs (those that
+    /// panicked in QUIC code), and it does so
     /// only when the breaker is enabled. `gate` is inert in unit tests and the
     /// branch cannot be taken on unix, so this pins the two lines; the
     /// real-process test is `tests/quic_breaker_windows.rs`.

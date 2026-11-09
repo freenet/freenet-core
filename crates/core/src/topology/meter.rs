@@ -2,7 +2,6 @@ use std::collections::BTreeMap;
 use std::sync::RwLock;
 use std::time::Duration;
 
-use dashmap::DashMap;
 use tokio::time::Instant;
 
 use freenet_stdlib::prelude::*;
@@ -113,7 +112,7 @@ impl Meter {
     /// Creates a new `Meter`.
     pub fn new_with_window_size(running_average_window_size: usize) -> Self {
         Meter {
-            attribution_meters: DashMap::new(),
+            attribution_meters: Default::default(),
             running_average_window_size,
             cached_estimated_usage_rate: RwLock::new(BTreeMap::new()),
         }
@@ -663,7 +662,7 @@ impl ResourceType {
     }
 }
 
-type AttributionMeters = DashMap<AttributionSource, ResourceTotals>;
+type AttributionMeters = crate::util::DecisionDashMap<AttributionSource, ResourceTotals>;
 
 /// A structure that holds running averages of resource usage for different resource types.
 struct ResourceTotals {

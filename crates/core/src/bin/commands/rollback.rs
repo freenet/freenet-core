@@ -3028,6 +3028,7 @@ pub(crate) mod tests {
     /// Turns [`lock_helper_subprocess`] from a no-op test into a helper
     /// process: `probe:<path>` or `hold:<ms>:<path>` (`ms` empty: until
     /// stdin closes).
+    #[cfg(unix)]
     const LOCK_HELPER_ENV: &str = "FREENET_TEST_LOCK_HELPER";
 
     /// Not a test of its own: a no-op unless [`LockHelper`] re-executes this

@@ -4025,6 +4025,56 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     "hosting_retractions_dropped".to_string(),
                     serde_json::json!(snapshot.hosting_retractions_dropped),
                 );
+                // Delegate lane counters. Pinned by
+                // `router_snapshot_json_includes_delegate_lane_counters`.
+                obj.insert(
+                    "delegate_lane_requests_refused".to_string(),
+                    serde_json::json!(snapshot.delegate_lane_requests_refused),
+                );
+                obj.insert(
+                    "delegate_lane_panics".to_string(),
+                    serde_json::json!(snapshot.delegate_lane_panics),
+                );
+                obj.insert(
+                    "delegate_lane_deaths".to_string(),
+                    serde_json::json!(snapshot.delegate_lane_deaths),
+                );
+                obj.insert(
+                    "inter_delegate_messages_dropped".to_string(),
+                    serde_json::json!(snapshot.inter_delegate_messages_dropped),
+                );
+                obj.insert(
+                    "delegate_lane_runs".to_string(),
+                    serde_json::json!(snapshot.delegate_lane_runs),
+                );
+                obj.insert(
+                    "delegate_lane_forwarded_busy".to_string(),
+                    serde_json::json!(snapshot.delegate_lane_forwarded_busy),
+                );
+                obj.insert(
+                    "delegate_lane_forwarded_parked".to_string(),
+                    serde_json::json!(snapshot.delegate_lane_forwarded_parked),
+                );
+                obj.insert(
+                    "delegate_lane_forwarded_loop_owned".to_string(),
+                    serde_json::json!(snapshot.delegate_lane_forwarded_loop_owned),
+                );
+                obj.insert(
+                    "delegate_lane_forwarded_unit_bound".to_string(),
+                    serde_json::json!(snapshot.delegate_lane_forwarded_unit_bound),
+                );
+                obj.insert(
+                    "delegate_lane_forwarded_not_runnable".to_string(),
+                    serde_json::json!(snapshot.delegate_lane_forwarded_not_runnable),
+                );
+                obj.insert(
+                    "delegate_lane_forwarded_forged".to_string(),
+                    serde_json::json!(snapshot.delegate_lane_forwarded_forged),
+                );
+                obj.insert(
+                    "delegate_lane_forwarded_lane_down".to_string(),
+                    serde_json::json!(snapshot.delegate_lane_forwarded_lane_down),
+                );
                 // Streamed-transfer abort counters (Group B), routing/hosting
                 // attribution (Group C), and connect-emit counters — same
                 // hand-mirror footgun: a new `RouterSnapshotInfo` field is
@@ -5124,6 +5174,47 @@ mod tests {
         for (key, want) in [
             ("hosting_retractions_emitted", 509),
             ("hosting_retractions_dropped", 521),
+        ] {
+            assert_eq!(json[key], want, "{key} must reach the OTLP body");
+        }
+    }
+
+    /// Pin: the delegate lane counters must reach the hand-mirrored OTLP
+    /// body. Each counts a client-visible loss (a refused request, a panicked
+    /// run, a dropped inter-delegate message) that is otherwise only a log
+    /// line.
+    #[test]
+    fn router_snapshot_json_includes_delegate_lane_counters() {
+        use arbitrary::{Arbitrary, Unstructured};
+        let mut u = Unstructured::new(&[0u8; 4096]);
+        let mut info = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
+            .expect("construct RouterSnapshotInfo for test");
+        info.delegate_lane_requests_refused = Some(601);
+        info.delegate_lane_panics = Some(607);
+        info.inter_delegate_messages_dropped = Some(613);
+        info.delegate_lane_runs = Some(617);
+        info.delegate_lane_forwarded_busy = Some(619);
+        info.delegate_lane_forwarded_parked = Some(621);
+        info.delegate_lane_forwarded_loop_owned = Some(623);
+        info.delegate_lane_forwarded_unit_bound = Some(625);
+        info.delegate_lane_forwarded_not_runnable = Some(627);
+        info.delegate_lane_forwarded_forged = Some(629);
+        info.delegate_lane_deaths = Some(631);
+        info.delegate_lane_forwarded_lane_down = Some(641);
+        let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
+        for (key, want) in [
+            ("delegate_lane_requests_refused", 601),
+            ("delegate_lane_panics", 607),
+            ("inter_delegate_messages_dropped", 613),
+            ("delegate_lane_runs", 617),
+            ("delegate_lane_forwarded_busy", 619),
+            ("delegate_lane_forwarded_parked", 621),
+            ("delegate_lane_forwarded_loop_owned", 623),
+            ("delegate_lane_forwarded_unit_bound", 625),
+            ("delegate_lane_forwarded_not_runnable", 627),
+            ("delegate_lane_forwarded_forged", 629),
+            ("delegate_lane_deaths", 631),
+            ("delegate_lane_forwarded_lane_down", 641),
         ] {
             assert_eq!(json[key], want, "{key} must reach the OTLP body");
         }

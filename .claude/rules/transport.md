@@ -493,7 +493,8 @@ inbound session key (`handshake_unauthenticated_dropped`), QUIC endpoint deaths
 and no breaker state is left), QUIC crash-loop breaker trips at startup
 (`quic_breaker_trips`, on unix counted for any abnormal end of a QUIC-enabled
 run, not only a QUIC fault, and on Windows for three runs in a row that ended
-within ten minutes, for any reason, each starting within 24 h of the one before;
+within ten minutes after recording a panic in QUIC code (quinn, quinn-proto or
+transport/quic, by panic location), each starting within 24 h of the one before;
 see `quic/breaker.rs`) and whether the breaker keeps QUIC
 off in this process (`quic_breaker_suppressed`, a state that is never reset and
 is not activity by itself) and QUIC connections this node closed, by close code
@@ -896,7 +897,12 @@ Rate calculation on every rate update (peer_connection::paced_rate; #6047):
   packet. Not charged, as on UDP: one-packet Shorts and control frames,
   which never wait behind data. With no limit nothing is paced. A write
   reserves with reserve_within, limited to what the send's current deadline
-  leaves, and waits in the send's own task; a refused reservation takes
+  leaves for its stage (with the stream open, its own gap, never the
+  connection's window: bounded::SendProgress::time_left; the window would let
+  the queue hold about 10 s of the rate instead of 5 s, refusing more opens;
+  a wait for a pipe's source is not a step, so after a slow chunk the next
+  write may be offered little and refused mid-stream, as in #6126),
+  and waits in the send's own task; a refused reservation takes
   nothing and ends the send NotOpened(Paced) before the stream opened
   (header and metadata are taken before open_uni) or Failed(Paced) after
   (the stream is reset). A message the pacer refused that UDP then sent is
@@ -1871,6 +1877,55 @@ Sending (QuicPath::send_short_bounded / send_stream_bounded /
   (STREAM_INACTIVITY_TIMEOUT) and inbound_stream_age_limit(len); a plain
   Duration is one deadline for all of it. A send from a source waits for the
   first chunk for the gap, counted in total, and open runs from when it arrives.
+  The gap is judged on CONNECTION progress (bounded::ConnectionWatch): a node
+  send runs out of gap only once its own gap has passed AND nothing on the
+  connection was newly acknowledged (recycle::AckProgress) for
+  STALL_PROGRESS_WINDOW (10 s), the stall count's rule. An egress cap hold of
+  this connection's transmit (recycle::cap_held, its own record) also counts,
+  but only within route::hold_credit of the connection's last acknowledgement:
+  the window, or socket::cap_transmit_wait (the longest one transmit can wait
+  at the cap, the derivation cap_hold_validity also uses) if longer. That is
+  10 s at 1 MB/s, about 13.3 s at 100 kB/s, about 19.8 s at 64 KiB/s, about
+  124 s at 10 kB/s and about 6.8 h at 50 B/s. The last acknowledgement is the
+  path's record (QuicPath::last_acked), kept by the stall count at settles and
+  by every send's watch at its wakes, so a new send whose first transmits wait
+  past its gap in a deep cap queue on a live path is credited. The record
+  holds the count with the time (bounded::AckRecord), so a count it has not
+  seen (an acknowledgement after the last settle or wake) is dated at the new
+  send's start rather than missed. A connection
+  nothing has acknowledged for the credit gets nothing from holds: a dark
+  connection's own probes wait for a saturated cap too, and counted without
+  that limit they kept a dark send going for 32 s. For the
+  credit after its last ack a dark path's own held probes do still count (on
+  main they counted for as long as they were held). Under random loss the 384 KiB send window drains at Cubic's window per
+  round trip, so writes wait past 5 s while acks still arrive; failing them
+  reset streams the peer was receiving (E5B9-LAB, 8 MiB at 5% loss and 200 ms
+  failed). The connection is read at the timer's wakes, so a send that stops
+  moving ends at its own gap or within 2 x STALL_PROGRESS_WINDOW of the last
+  move, never past total. It gives nothing until a wake during the send has
+  seen a move, so a path dark before the send fails it at 5 s with no cap
+  holding its transmits; where the cap holds them, at most at the record's
+  last acknowledgement plus hold_credit plus one window (after an idle
+  spell, a capped path that went dark gets one such credit from its first
+  new send, whose start dates the keepalive acknowledgements from before it
+  went dark); a path that
+  goes dark mid-send fails it at 12 to 22 s (its own early acknowledgements
+  are a move; 22 s when one lands just after the 2 s first wake; pinned at
+  12 s by
+  a_path_dark_mid_send_fails_within_two_windows_and_goes_suspect). Nothing
+  while the send waits for its own source (the connection is not what holds
+  it; a stalled source is bounded by the send's own gap, as pipe_stream's 5 s
+  upstream inactivity bounds it on UDP; the receiver's QUIC reader idles at
+  30 s in production. A SeqCst flag handshake wakes the loop to re-arm when
+  that drops an extended deadline, once: a timer already armed at the own gap
+  is not re-armed), and nothing without a CappedCubic
+  controller. Control sends have no gap. A receiver reads every announced
+  stream to its end whatever its consumer does (push_fragment does not wait);
+  its one wait is announcing a stream into a full channel, bounded by
+  inbound_stream_age_limit(len), the sender's total, so the two give up
+  together. With keepalive PINGs (15 s apart) as its only acknowledgements, at
+  most two wakes in a row (10 s apart) can each see a new one, so they alone
+  extend a stopped send by at most two wakes. Argued, not tested.
   One timer per send, re-armed when it fires, as BodyReader. Messages are
   written in pieces of at most FRAGMENT_PAYLOAD_SIZE, each returning when quinn
   has buffered it, and each is a step of the gap and, for a stream, one
@@ -1930,6 +1985,43 @@ Receiving: one task per connection reads every stream (FuturesUnordered,
   close code DOWNGRADE (the peer falls back to UDP). Short
   and Control go to bounded channels (full: dropped and counted); Stream
   goes through the INBOUND ADAPTER (path/inbound.rs).
+Unordered reads: the header, the metadata, and short and control bodies are
+  read IN ORDER (read_chunk(_, true)): quinn holds what arrives past a gap
+  without returning credit for it, so the connection window bounds it. A
+  Stream's payload, once charged, is read with read_chunk(_, false), so
+  quinn hands over each piece as it arrives, gap or not, and it is written at
+  its offset into the charged buffer (the Rechunker stages a fragment until it
+  is whole and holds the one that completes the stream until its end).
+  → NEVER read unordered before the header is known: an unordered read
+    returns the peer's credit for every byte read, so bytes read past a
+    missing header have no bound but the age limit.
+  → Switch only once an in-order read would block (BodyReader::next_unordered
+    drains what is contiguous first): quinn-proto 0.11.19 does not trim a
+    buffered resend against the read position at the switch, and read
+    unordered it counts those bytes as read again, so bytes_read passes the
+    final size, the end is never reported, and Recv::stop underflows.
+  A gap costs one received range (quinn's recvd set and our mirror, ~70 B);
+  gaps are counted per stream as ranges past the first, and a connection's
+  streams may hold at most inbound::MAX_GAPS_PER_CONNECTION (2,048), past
+  which the stream is stopped EVICTED and counted too_many_ranges. quinn
+  keeps a stopped stream's recvd until the peer sends FIN or RESET, and after
+  a stop nothing tells us when (received_reset returns at once). After a stop
+  quinn adds nothing to recvd, and a stopped stream holds state only while it
+  holds its slot, so at most MAX_UNI_STREAMS of them at once: the count takes
+  the sum of the MAX_UNI_STREAMS largest frozen gap counts, not of all of
+  them, so it does not grow with the connection's age; after KEPT_GAPS_GRACE
+  (30 s) each counts 32 less (a quinn peer resets a stopped stream within a
+  round trip). A second trip past the cap closes the path with
+  DOWNGRADE (closed_too_many_ranges). A Stream waiting for room in the
+  delivery channel reads its payload but NOT its end until it is announced
+  (reading the end frees quinn's slot, and the slots bound how many streams
+  can wait); one that ends short fails Truncated at once. While it waits it
+  is evicted idle if its payload stops arriving; once the payload is all
+  here only the age limit applies. A byte past the
+  declared end is Overlong as soon as it arrives, so an overlong stream can
+  fail before it is announced. GRO stays off (QuicSocket::max_receive_segments
+  is 1, pinned): with GRO a 1-byte chunk would keep a whole batch. quinn-proto
+  must be 0.11.17 or later within 0.11 (pinned from Cargo.lock).
 Inbound adapter: a Stream's payload goes into an ordinary StreamHandle,
   re-chunked to the UDP fragment shape (fragment i = bytes
   [(i-1)F, iF), F = FRAGMENT_PAYLOAD_SIZE), so fork / assemble / pipe /
@@ -2047,11 +2139,19 @@ Path recycling (quic/recycle.rs, #5940 step M6): besides the send-reset
   outstanding (in flight after the latest acknowledgements, minus losses,
   or a send since), so recovery from an outage does not close the path.
   quinn counts a transmit's frames, and its bytes in flight, when it builds
-  it, before the egress cap admits it. Guard 2 is therefore inactive while
-  the egress cap holds QUIC transmits: while the cap holds any (or held one
-  since the previous sample; socket::CapHolds, node-wide) no window runs on
-  any path, so on a node whose cap binds most of the time guard 2 is off
-  most of the time. Do not narrow this to the sends counted since the hold:
+  it, before the egress cap admits it. Guard 2 is therefore inactive on a
+  connection while the egress cap holds its transmits: while the cap holds
+  one of this connection's (or held one since the previous sample;
+  socket::CapHolds, one record per connection since #6128, handed to the
+  poller quinn creates inside connect_with / accept_with by
+  socket::with_poller_holds, which relies on quinn 0.11.12 building that
+  poller synchronously on the calling thread; a poller built elsewhere is
+  counted per endpoint, CapHolds::fallback_pollers, and the path tests
+  assert 0) no window runs on that path (pinned per connection by
+  a_held_connection_does_not_pause_another_connections_ack_watch). Never node-wide:
+  on a node whose cap binds, some connection is nearly always held, and a
+  node-wide record kept every path's guard 2, stall count and send gap from
+  firing. Do not narrow this to the sends counted since the hold:
   a held transmit is also in quinn's bytes in flight. A hold whose poller
   is not polled again within socket::cap_hold_validity of the cap's rate
   (a poller left by an ended connection) stops counting.
@@ -2136,10 +2236,37 @@ QUIC send route (#5940 e5b-6, quic/upgrade/data_route.rs,
   that are being acknowledged, or a receiver whose consumer is slow while its QUIC
   stack acknowledges, is closed and loses what the receiver's readers hold. Known
   gap: a consumer stalled past the window while nothing else on the path is
-  acknowledged reads as a stalled path. An egress cap hold counts as progress,
-  by the ack watch's rule (recycle::cap_held, shared): while
-  total-bandwidth-limit holds QUIC transmits nothing can be acknowledged, and at
-  a low cap one held transmit waits longer than the window. A pipe that timed out
+  acknowledged reads as a stalled path. An egress cap hold of THIS connection's
+  transmit counts as progress, by the ack watch's rule (recycle::cap_held,
+  shared), while total-bandwidth-limit holds them nothing can be acknowledged;
+  but only for route::hold_credit after the connection's last acknowledgement
+  (as seen at a settle): the window, or the longest one transmit can wait at
+  the cap if that is longer (10 s at 1 MB/s, about 13.3 s at 100 kB/s, about
+  19.8 s at 64 KiB/s). A live path whose transmit the cap holds is acknowledged
+  again within that, so it is not stall-closed (pinned at 50 B/s and at
+  100 kB/s); a dark connection whose own probes the cap holds stops counting
+  them after it. total-bandwidth-limit has no floor (MIN_BANDWIDTH_LIMIT only
+  floors the per-connection bandwidth-limit), so the credit grows without bound
+  as the cap falls. The real bound on a busy capped node: a path gone dark goes
+  suspect at a send timeout at least hold_credit after the last acknowledgement
+  the path recorded (dated when a settle or a wake saw it, and moved back to a
+  quiet proof's since when one applies), so one credit plus one gap. The credit
+  covers this node's cap only: a peer whose own cap is saturated delays its
+  acknowledgements, and below about 137 kB/s (where cap_transmit_wait reaches
+  the window) that delay can pass a window,
+  which reads as a quiet path here (not new with this rule); until then new streams that time
+  out after opening are dropped (as before), a short that times out before its
+  end is written goes to UDP, and a one-packet short (written whole at once)
+  ends MaybeDelivered and is not resent, so on a dark path it can be lost in
+  that time, as before suspect existed. A send that
+  ran out of its gap leaves a QuietProof (the acked count and hold count, and
+  since when they stood still); while the counts still match, the stall count
+  dates the progress it sees from then, so the first timeout after a path goes
+  dark mid-send counts and the path goes suspect at once. The path has one
+  slot, read (not taken) by every settle; a later timeout's proof of the same
+  counts is merged into it (earlier since kept), so it cannot push an earlier
+  send's date forward. Both counts only grow, which is what makes a matching
+  proof sound. A pipe that timed out
   waiting for its source does not count (WatchedSource). It costs a normal
   backoff.
   Fast path: Session::routed is an atomic set only while the live attempt holds a
@@ -2212,7 +2339,11 @@ QUIC receive flow (#5940 e5b-4):
   or a reused QUIC id with that id is taken for a new stream instead of refused.
   Full channels: a Short or Stream whose channel is full waits in its own reader
   future (reserve, raced with the stream's age limit) and is stopped EVICTED past
-  it; Control is still dropped and counted. A Short waits BEFORE its end is read
+  it; Control is still dropped and counted. A waiting Stream keeps reading its
+  payload into its charged buffer (evicted idle if the payload stops
+  arriving; once it is all here only the age limit applies), so the wait does
+  not hold the sender's flow-control credit; its end stays unread until it is
+  announced. A Short waits BEFORE its end is read
   (reading the end frees the stream and returns its credit), so waiters are
   capped by MAX_UNI_STREAMS. A Short of one packet or less
   (fits_one_packet) is not charged, as on UDP, and is bounded by that cap and
@@ -2431,10 +2562,16 @@ Liveness ("alive" = the endpoint driver has not ENDED; it does not mean
     deterministic fault recurs once per start. A panic that is not
     contained aborts the process. On unix the next start trips the breaker
     (quic_breaker_trips, see quic/breaker.rs). On Windows the breaker does
-    not look at how a run ended: it counts runs that lasted under 10 minutes,
-    so the fourth start after three such aborts in a row trips it, and an
-    abort after 10 minutes or more never does, nor do aborts a day apart
-    (quic/breaker/short_runs.rs).
+    not look at how a run ended: a panic hook records a panic located in QUIC
+    code in the run's marker, and it counts runs that lasted under 10 minutes
+    and recorded one, so the fourth start after three such aborts in a row
+    trips it. An ordinary stop records no panic and never counts; an abort
+    after 10 minutes or more never does, nor do aborts a day apart
+    (quic/breaker/short_runs.rs). A panic counts as QUIC's when the thread
+    is inside a QuicCode guard (quinn's driver polls in runtime.rs, the socket
+    adapter's catch_unwind calls) or, failing that, by location. The hook is
+    process-global: only a child-process test installs it (the arming tests
+    pass a no-op installer).
   → When the node drops its last handle, the availability is Released
     (final; the first final state stored wins, so a release and a
     driver return racing never overwrite each other) and the driver's

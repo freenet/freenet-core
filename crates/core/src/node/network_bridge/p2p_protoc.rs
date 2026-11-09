@@ -763,7 +763,8 @@ pub(in crate::node) struct P2pConnManager {
     /// Used to suppress repetitive WARN logs after the first few failures.
     /// Bounded to MAX_BROADCAST_STREAK_ENTRIES to prevent unbounded growth from
     /// network-influenced contract keys.
-    broadcast_no_target_streak: HashMap<freenet_stdlib::prelude::ContractKey, u32>,
+    broadcast_no_target_streak:
+        crate::util::DecisionHashMap<freenet_stdlib::prelude::ContractKey, u32>,
     /// Global broadcast queue that serializes outbound broadcast streams
     /// with bounded concurrency to prevent uplink saturation (issue #3337).
     #[cfg(not(feature = "simulation_tests"))]
@@ -1372,7 +1373,7 @@ impl P2pConnManager {
             quic_policy,
             blocked_addresses: config.blocked_addresses.clone(),
             broadcast_retries: HashMap::new(),
-            broadcast_no_target_streak: HashMap::new(),
+            broadcast_no_target_streak: Default::default(),
             #[cfg(not(feature = "simulation_tests"))]
             broadcast_queue: super::broadcast_queue::BroadcastQueue::with_spacing(
                 broadcast_spacing,
@@ -3279,7 +3280,8 @@ struct EventListenerState {
     /// Cleaned up via `TransactionTimedOut` and `TransactionCompleted` handlers.
     tx_to_client: HashMap<Transaction, HashSet<ClientId>>,
     client_waiting_transaction: Vec<(WaitingTransaction, HashSet<ClientId>)>,
-    awaiting_connection: HashMap<SocketAddr, Vec<Box<dyn ConnectResultSender>>>,
+    awaiting_connection:
+        crate::util::DecisionHashMap<SocketAddr, Vec<Box<dyn ConnectResultSender>>>,
     awaiting_connection_txs: HashMap<SocketAddr, Vec<Transaction>>,
     pending_op_results: HashMap<Transaction, Sender<WaiterReply>>,
     /// Last time pending_op_results was scanned for closed senders.
@@ -3298,7 +3300,7 @@ impl EventListenerState {
             pending_from_executor: HashSet::new(),
             tx_to_client: HashMap::new(),
             client_waiting_transaction: Vec::new(),
-            awaiting_connection: HashMap::new(),
+            awaiting_connection: Default::default(),
             pending_op_results: HashMap::new(),
             last_pending_op_cleanup: Instant::now(),
             awaiting_connection_txs: HashMap::new(),

@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 
 use quinn::{AsyncTimer, AsyncUdpSocket, Runtime};
 
+use super::breaker::QuicCode;
 use super::liveness::{EndpointHealth, watch_endpoint_driver};
 use crate::config::GlobalExecutor;
 use crate::simulation::TimeSource;
@@ -104,6 +105,10 @@ impl<T: TimeSource> Runtime for QuicRuntime<T> {
         // connection; each ends when its endpoint or connection does. None
         // is registered with BackgroundTaskMonitor: their end must not stop
         // the node. The endpoint driver's end is reported instead.
+        // Each poll of a driver runs inside a `QuicCode` guard, so the Windows
+        // crash-loop breaker counts a panic in anything the driver calls
+        // (#6031), wherever it is located.
+        let future = Box::pin(InQuicCode(future));
         let endpoint_driver = self.endpoint_driver.lock().take();
         match endpoint_driver {
             Some(health) => {
@@ -126,6 +131,18 @@ impl<T: TimeSource> Runtime for QuicRuntime<T> {
 
     fn now(&self) -> Instant {
         self.clock.now()
+    }
+}
+
+/// A quinn driver future, polled inside a [`QuicCode`] guard.
+struct InQuicCode(Pin<Box<dyn Future<Output = ()> + Send>>);
+
+impl Future for InQuicCode {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let _quic = QuicCode::enter();
+        self.0.as_mut().poll(cx)
     }
 }
 

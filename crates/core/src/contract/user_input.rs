@@ -419,6 +419,9 @@ fn open_permission_page_in_browser(url: &str) {
         let operation: Vec<u16> = OsStr::new("open").encode_wide().chain(Some(0)).collect();
         let url_wide: Vec<u16> = OsStr::new(url).encode_wide().chain(Some(0)).collect();
 
+        // SAFETY: both buffers are NUL-terminated UTF-16 strings that outlive
+        // the call, and the remaining pointer arguments are null, which
+        // ShellExecuteW accepts.
         unsafe {
             winapi::um::shellapi::ShellExecuteW(
                 std::ptr::null_mut(),

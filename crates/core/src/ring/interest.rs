@@ -1332,7 +1332,7 @@ pub struct InterestManager<T: TimeSource> {
 
     /// Reverse index: which contracts is each peer interested in?
     /// Enables O(1) cleanup when a peer disconnects instead of O(contracts) scan.
-    peer_contracts: DashMap<PeerKey, HashSet<ContractKey>>,
+    peer_contracts: DashMap<PeerKey, crate::util::DecisionHashSet<ContractKey>>,
 
     /// Track our local interest reasons for each contract.
     local_interests: DashMap<ContractKey, LocalInterest>,
@@ -1380,7 +1380,7 @@ pub struct InterestManager<T: TimeSource> {
     /// deadline (now + INTEREST_DISCONNECT_GRACE_PERIOD). The sweep task executes
     /// the removal after the deadline passes. If the peer reconnects before the
     /// deadline, the entry is removed from this map and interests are preserved.
-    pending_removals: DashMap<PeerKey, Instant>,
+    pending_removals: crate::util::DecisionDashMap<PeerKey, Instant>,
 
     /// Rate-limit gate for queue-full `ResyncRequest`s, keyed by
     /// (contract, target peer address). Bounded LRU so remote peers cannot grow
@@ -1549,7 +1549,7 @@ impl<T: TimeSource + Sync> InterestManager<T> {
             delta_bytes_saved: AtomicU64::new(0),
             resync_requests_received: AtomicU64::new(0),
             summary_notify_timestamps: DashMap::new(),
-            pending_removals: DashMap::new(),
+            pending_removals: Default::default(),
             resync_retry_slots: Arc::new(AtomicUsize::new(0)),
             resync_request_throttle: Mutex::new(LruCache::new(
                 NonZeroUsize::new(RESYNC_THROTTLE_CACHE_SIZE)
@@ -2610,7 +2610,10 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     ///
     /// Uses the `peer_contracts` reverse index for O(1) lookup.
     /// Used by the heartbeat handler to implement full-replace semantics.
-    pub fn get_contracts_for_peer(&self, peer: &PeerKey) -> HashSet<ContractKey> {
+    pub fn get_contracts_for_peer(
+        &self,
+        peer: &PeerKey,
+    ) -> crate::util::DecisionHashSet<ContractKey> {
         self.peer_contracts
             .get(peer)
             .map(|entry| entry.value().clone())

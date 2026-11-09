@@ -313,7 +313,8 @@ async fn run_disabled_idle(config_dir: &std::path::Path) -> anyhow::Result<()> {
     }
     #[cfg(not(unix))]
     {
-        let _ = signal::ctrl_c().await;
+        // An error here (no Ctrl+C handler) also ends the wait, as before.
+        drop(signal::ctrl_c().await);
     }
 
     tracing::info!("Disabled daemon received shutdown signal; exiting cleanly.");
@@ -435,7 +436,8 @@ async fn run_network_node_with_signals(
 
             #[cfg(not(unix))]
             let shutdown_reason = {
-                let _ = signal::ctrl_c().await;
+                // An error here (no Ctrl+C handler) also ends the wait, as before.
+                drop(signal::ctrl_c().await);
                 "received SIGINT (Ctrl+C)"
             };
 

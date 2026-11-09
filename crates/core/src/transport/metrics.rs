@@ -21,6 +21,7 @@
 //! }
 //! ```
 
+#[cfg(any(test, feature = "testing"))]
 use dashmap::DashMap;
 use std::net::SocketAddr;
 use std::sync::LazyLock;
@@ -765,7 +766,7 @@ pub struct TransportMetrics {
     //
     // When the table is full a new entry evicts the least-recently-updated
     // entry (LRU on `last_seen_tick`).
-    per_peer_stats: DashMap<SocketAddr, PeerTransferStats>,
+    per_peer_stats: crate::util::DecisionDashMap<SocketAddr, PeerTransferStats>,
 
     // Monotonically increasing tick stamped onto each per-peer entry on
     // update. Used purely for LRU ordering — no wall-clock semantics, so
@@ -1266,7 +1267,7 @@ impl TransportMetrics {
             max_rtt_us: AtomicU64::new(0),
             rtt_sum_us: AtomicU64::new(0),
             rtt_samples: AtomicU32::new(0),
-            per_peer_stats: DashMap::new(),
+            per_peer_stats: Default::default(),
             per_peer_tick: AtomicU64::new(0),
             loss: LossCounters::default(),
             nat_detail: NatDetailCounters::default(),
@@ -3175,7 +3176,8 @@ pub struct TransportSnapshot {
     pub quic_adapter_panicked: u64,
     /// Times the QUIC crash-loop breaker tripped, so this run started with
     /// QUIC off (#5940): on unix a run with QUIC enabled ended abnormally, on
-    /// Windows three runs in a row ended within ten minutes for any reason.
+    /// Windows three runs in a row ended within ten minutes after a panic in
+    /// QUIC code.
     pub quic_breaker_trips: u64,
     /// Sends the QUIC socket refused with `WouldBlock` (egress cap or full
     /// socket buffer). Chiefly datagrams quinn's endpoint made on its own,
@@ -3911,7 +3913,8 @@ struct SnapshotExtras {
     pub quic_adapter_panicked: u64,
     /// Times the QUIC crash-loop breaker tripped, so this run started with
     /// QUIC off (#5940): on unix a run with QUIC enabled ended abnormally, on
-    /// Windows three runs in a row ended within ten minutes for any reason.
+    /// Windows three runs in a row ended within ten minutes after a panic in
+    /// QUIC code.
     pub quic_breaker_trips: u64,
     /// Sends the QUIC socket refused with `WouldBlock` (egress cap or full
     /// socket buffer). Chiefly datagrams quinn's endpoint made on its own,

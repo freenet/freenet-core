@@ -150,7 +150,7 @@ impl Eq for InternedBytes {}
 /// summary among them once. See the module docs.
 #[derive(Debug, Default)]
 pub(super) struct ContractPeers {
-    peers: HashMap<PeerKey, PeerInterest>,
+    peers: crate::util::DecisionHashMap<PeerKey, PeerInterest>,
     /// Distinct summary bytes held by `peers`, each with the number of records
     /// holding it. Never contains a zero count.
     summaries: HashMap<InternedBytes, Slot>,
@@ -187,7 +187,7 @@ struct Slot {
 }
 
 impl Deref for ContractPeers {
-    type Target = HashMap<PeerKey, PeerInterest>;
+    type Target = crate::util::DecisionHashMap<PeerKey, PeerInterest>;
 
     fn deref(&self) -> &Self::Target {
         &self.peers

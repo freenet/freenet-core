@@ -38,14 +38,15 @@ runs:
     - name: Install riverctl
       shell: bash
       continue-on-error: true
-      # Private-room message sending landed in riverctl 0.1.70 (freenet/river#350);
-      # earlier versions can only post to PUBLIC rooms and would fail here. The
-      # `^0.1.70` range (>=0.1.70, <0.2.0) is deliberately NOT pinned to an exact
-      # version: the room contract key is derived from the bundled room-contract
-      # WASM, so if that WASM changes and riverctl is republished, an exact pin
-      # would keep computing the OLD contract key and silently send nowhere.
-      # Tracking the latest 0.1.x keeps CI in sync with the deployed contract.
-      run: cargo install riverctl --version '^0.1.70'
+      # Always the latest published riverctl, deliberately unpinned. The room
+      # contract key is derived from the room-contract WASM bundled into
+      # riverctl, so any pin (exact OR a semver range) eventually computes a
+      # stale contract key or misses a client fix once River ships past it.
+      # (A `^0.1.70` pin froze CI on 0.1.80, which misreported successful sends
+      # as failures, so the retry loop below posted duplicates; see #6162.)
+      #
+      # `riverctl --version` is logged so a run shows which client it used.
+      run: cargo install riverctl && riverctl --version
 
     - name: Post to the dev room (with exponential backoff)
       shell: bash
@@ -62,8 +63,9 @@ runs:
         fi
 
         # Materialise the bot's riverctl config from the secret. `message send`
-        # fetches fresh room state from the network, so the config only needs
-        # the signing key + invitation secrets — the stored state is ignored.
+        # fetches fresh room state from the network, so the config mainly
+        # supplies the signing key + invitation secrets. (The stored state is
+        # still read as a migration fallback if the room contract was re-keyed.)
         CFG="$(mktemp -d)"
         trap 'rm -rf "$CFG"' EXIT
         if ! printf '%s' "$BOT_CONFIG" | base64 -d > "$CFG/rooms.json" 2>/dev/null; then

@@ -10,6 +10,7 @@ const NO_CAP: CapHoldReading = CapHoldReading {
     holds: 0,
     held_now: false,
     validity: Duration::ZERO,
+    longest_wait: Duration::ZERO,
 };
 
 /// The ticks of the window (`window / tick`), and the tick a window
@@ -107,6 +108,7 @@ fn run(ticks: u64, mut at: impl FnMut(u64) -> Reading) -> Option<u64> {
                 holds: r.cap_holds,
                 held_now: r.cap_held_now,
                 validity: r.cap_validity,
+                longest_wait: Duration::ZERO,
             },
         )
     };
@@ -583,6 +585,8 @@ fn ack_counting_forwards_every_call_unchanged() {
     let window = c.window();
     let metrics = c.metrics();
     let initial = c.initial_window();
+    // The stack here wraps quinn's default Cubic, not the node's factory, so
+    // this checks forwarding, not the initial window the node uses.
     let reference = Arc::new(quinn::congestion::CubicConfig::default()).build(now, 1200);
     assert_eq!(initial, reference.initial_window());
     assert!(window > 0 && metrics.congestion_window == window);

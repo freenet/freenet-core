@@ -37,6 +37,16 @@ mod wasmtime_engine;
 #[cfg(all(feature = "wasmtime-backend", test))]
 pub(crate) use wasmtime_engine::store_arena_budget_for;
 
+/// Retired-instance bytes the node's ONE delegate executor's Store may hold
+/// before it is refreshed (`contract::executor::runtime::pool::
+/// PooledDelegateRunner`). Fixed and small rather than a share of the
+/// RAM-scaled contract envelope (`store_arena_budget_for`): delegate modules
+/// are small (a River chat-delegate signing call is ~1.4 ms of WASM), and
+/// taking a share would have shrunk every contract executor's arena, halving
+/// it on a one-worker host. Summed separately in
+/// `contract::executor::declared_cache_ceiling`.
+pub(crate) const DELEGATE_STORE_ARENA_BYTES: usize = 16 * 1024 * 1024;
+
 use super::ContractError;
 use super::runtime::RuntimeConfig;
 
@@ -123,6 +133,10 @@ pub(crate) trait WasmEngine: Send {
 
     /// Returns true if the engine is in a healthy state and can execute WASM.
     fn is_healthy(&self) -> bool;
+
+    /// Replace the Store arena byte budget this engine was built with (see
+    /// `DELEGATE_STORE_ARENA_BYTES`).
+    fn set_store_arena_budget_bytes(&mut self, bytes: u64);
 
     // -- Compilation --
 

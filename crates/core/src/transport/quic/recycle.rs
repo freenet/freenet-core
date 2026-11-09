@@ -72,11 +72,12 @@
 //!   counts a transmit's frames, and its bytes in flight, when it builds
 //!   it, and the cap may hold it longer than the window.
 //!
-//! **Guard 2 is inactive while the egress cap holds QUIC transmits.** While
-//! the cap holds any QUIC transmit, or held one since the previous sample,
-//! no window runs, on any path: the cap is node-wide and quinn does not say
-//! which connection a held transmit belongs to. On a node whose cap binds
-//! most of the time, guard 2 is then off most of the time. Narrowing the
+//! **Guard 2 is inactive while the egress cap holds this connection's
+//! transmits.** While the cap holds one of them, or held one since the
+//! previous sample, no window runs on this path. The holds are counted per
+//! connection (`socket::with_poller_holds` gives quinn's poller for the
+//! connection its own record), so a cap kept busy by other connections does
+//! not switch guard 2 off here. Narrowing the
 //! pause to the sends counted since the hold would not be enough, because a
 //! held transmit is also counted in quinn's bytes in flight. A hold left
 //! behind by a connection that ended stops counting after its validity
@@ -118,9 +119,31 @@
 //! window, which is what keeps a path's rate to about `rate`; its pacer reads
 //! the same window and only spreads the sends. With no limit configured, or
 //! before the first acknowledgement, the window is Cubic's. The RTT is the
-//! latest quinn reports to `on_ack`, which for the first batch of
-//! acknowledgements is still quinn's initial estimate (333 ms,
-//! `config::transport_config`), so the cap is loose for that one batch.
+//! latest quinn reports to `on_ack`. quinn updates its estimate only after it
+//! has called `on_ack` for every packet an ACK frame acknowledges, so each
+//! `on_ack` sees the estimate from before that frame, and the first ones see
+//! quinn's initial estimate (333 ms, `config::transport_config`). After the
+//! handshake the stored RTT can still be that initial estimate when the first
+//! data is sent (the e5b-9 cold-start lab saw 333 ms on an 800 ms path), so
+//! the cap is loose, or tight, until the first data is acknowledged.
+//!
+//! # The initial window
+//!
+//! Cubic starts at [`INITIAL_WINDOW_DATAGRAMS`] datagrams of
+//! [`MAX_UDP_PAYLOAD`] (38,400 bytes; a fixed byte count, not 32 x the
+//! runtime MTU) instead of quinn's 10. That is above RFC 9002's recommended
+//! 10 on purpose: quinn does not grow the window while the connection is
+//! limited by the application, so a connection that only carries small
+//! messages keeps its initial window for life, and on most connections the
+//! initial window is the window.
+//!
+//! quinn paces it, but only partly. Its pacer starts with a full bucket of at
+//! least 10 datagrams (`quinn-proto` `connection/pacing.rs`), so the first
+//! 12,000 bytes leave at once, and the remaining 22 datagrams are spread at
+//! 1.25 x window / RTT on quinn's RTT estimate, which says nothing about the
+//! bottleneck's rate. quinn's own estimate is updated by the handshake's
+//! acknowledgements; it is only the copy this controller keeps (`srtt`, see
+//! "The window cap") that can still hold the 333 ms initial value then.
 //!
 //! While the cap binds, a send it holds back counts in quinn as blocked by
 //! congestion, not limited by the application, so Cubic would keep growing on
@@ -144,7 +167,7 @@ use quinn::FrameStats;
 use quinn::congestion::{Controller, ControllerFactory, ControllerMetrics};
 
 use super::QuicCloser;
-use super::config::QuicRateLimit;
+use super::config::{MAX_UDP_PAYLOAD, QuicRateLimit};
 #[cfg(doc)]
 use super::error::close_code;
 use super::socket::{CapHoldReading, CapHolds};
@@ -233,8 +256,19 @@ impl SendAborts {
     }
 }
 
+/// Cubic's initial window in datagrams of [`MAX_UDP_PAYLOAD`] (quinn's default
+/// is 10; RFC 9002 recommends 10), applied as `32 x 1200` bytes whatever the
+/// connection's MTU. Measured in the e5b-9 cold-start lab against 10 and 64, with
+/// pacing: a 64 KiB message on a fresh or application-limited connection at
+/// 300 ms RTT arrives in 0.53 s instead of 0.82 s (UDP: 0.15 s), 16 KiB in one
+/// round trip, and a burst of 10 such connections on a 5 Mbit/s uplink leaves
+/// a competing loss-based flow less loss than the UDP transport does (2.2%
+/// against 17%). 64 was faster again but cost a competing flow about what the
+/// UDP transport does.
+pub(crate) const INITIAL_WINDOW_DATAGRAMS: u64 = 32;
+
 /// Builds [`CappedCubic`] controllers around Cubic, capped by `rate`.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct CappedCubicFactory {
     cubic: Arc<quinn::congestion::CubicConfig>,
     rate: QuicRateLimit,
@@ -242,10 +276,18 @@ pub(crate) struct CappedCubicFactory {
 
 impl CappedCubicFactory {
     pub(crate) fn new(rate: QuicRateLimit) -> Self {
+        let mut cubic = quinn::congestion::CubicConfig::default();
+        cubic.initial_window(INITIAL_WINDOW_DATAGRAMS * u64::from(MAX_UDP_PAYLOAD));
         Self {
-            cubic: Arc::default(),
+            cubic: Arc::new(cubic),
             rate,
         }
+    }
+}
+
+impl Default for CappedCubicFactory {
+    fn default() -> Self {
+        Self::new(QuicRateLimit::default())
     }
 }
 
@@ -324,6 +366,18 @@ impl AckProgress {
     pub(crate) fn acked(&self) -> u64 {
         self.0.lock().acked
     }
+
+    /// A record of no connection, moved by [`Self::ack`]. Tests only.
+    #[cfg(test)]
+    pub(crate) fn detached() -> Self {
+        Self(Arc::default())
+    }
+
+    /// The peer newly acknowledged one more packet. Tests only.
+    #[cfg(test)]
+    pub(crate) fn ack(&self) {
+        self.0.lock().acked += 1;
+    }
 }
 
 /// A congestion controller that lowers `inner`'s window to the configured
@@ -383,6 +437,12 @@ impl Controller for CappedCubic {
         rtt: &quinn_proto::RttEstimator,
     ) {
         self.state.lock().acked += 1;
+        // quinn updates `rtt` only after this call for the ACK frame, so this
+        // is the estimate from before it: the initial 333 ms on the first
+        // frames, and possibly still when the first data goes out after the
+        // handshake (see "The window cap" in the module docs). The cap reads
+        // it; anything that sizes a window from the RTT before the first data
+        // is acknowledged should use this packet's sample, `now - sent`.
         self.srtt = Some(rtt.get());
         // A send the cap holds back is not Cubic's doing: while the cap is
         // below Cubic's window, do not let Cubic grow (see the module docs).
@@ -519,7 +579,7 @@ pub(crate) struct AckSample {
     sent: u64,
     /// Frames received from the peer.
     received: u64,
-    /// The QUIC transmits the egress cap holds, node-wide.
+    /// This connection's QUIC transmits the egress cap holds.
     cap: CapHoldReading,
 }
 
