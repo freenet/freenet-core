@@ -1243,6 +1243,10 @@ impl P2pConnManager {
                 );
             } else {
                 send_success += 1;
+                // Unlike production, a streamed full state here counts only
+                // `SentFull`, no `wire_stream` or stream fate: `send_stream`
+                // gives no completion signal. Inline sends still get their
+                // `wire_*` count from the connection task, as in production.
                 count(if sent_delta {
                     PropagationEvent::SentDelta
                 } else {

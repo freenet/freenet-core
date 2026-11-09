@@ -57,21 +57,24 @@
 //! On top of that, [`detect_stalls`] WARNs, at the end of window W, for a
 //! contract that over windows W-1 and W together had:
 //! - a local client update in W-1;
-//! - positive evidence that a leg ended unsent in either window: any
-//!   `skip_*`, a dropped fan-out (`fanout_event_dropped`), or a leg the
-//!   bridge refused (`send_failed`);
+//! - every resolved leg ended unsent: the `skip_*` counts plus the legs the
+//!   bridge refused (`send_failed`) reach the targets resolved
+//!   (`targets_total`, above zero). Or a whole fan-out was dropped
+//!   (`fanout_event_dropped`);
 //! - nothing at all handed to the network bridge (`sent_delta + sent_full`
 //!   is zero across both windows).
 //!
 //! W is grace for a leg queued near the end of W-1, and judging the two
 //! windows together catches an update applied at the end of W-1 whose
-//! fan-out is processed in W. The evidence is required because resolved
-//! targets alone prove nothing: a leg held while its (contract, peer) pair is
-//! busy with a stream, or queued behind the large lane's permits, records
-//! nothing while it waits, and that can outlast both windows. The rule reads
-//! only bridge-level counts, so the WARN targets the sender-side shapes: every
-//! leg skipped, or the whole fan-out dropped. What the transport then did is
-//! in the `wire_*` counts, which never raise a WARN.
+//! fan-out is processed in W. Every leg must be accounted for because
+//! resolved targets alone prove nothing: a leg held while its (contract,
+//! peer) pair is busy with a stream, or queued behind the large lane's
+//! permits, records nothing while it waits, and that can outlast both
+//! windows. So one refused leg beside siblings that are only held is not a
+//! stall. The rule reads only bridge-level counts, so the WARN targets the
+//! sender-side shapes: every leg skipped or refused, or the whole fan-out
+//! dropped. What the transport then did is in the `wire_*` counts, which
+//! never raise a WARN.
 //!
 //! What it cannot see:
 //! - Loss at or after the transport: a stream that fails after the bridge
@@ -89,11 +92,21 @@
 //! - A fan-out that resolves no targets. That is the `no_targets` count, and
 //!   `handle_broadcast_state_change` WARNs once per streak of them.
 //! - Relayed updates. Only a client update makes a contract a candidate.
+//! - A drain between the executor's fan-out and the client apply's
+//!   `client_originated` (recorded in `update_contract` once the executor
+//!   returns, after it emitted the fan-out). The legs then land in the
+//!   window before the client update, which is not read with it.
+//! - A no-targets retry whose re-emission fails. It uses the blocking
+//!   `notify_node_event`, not `try_notify`, so a failure is logged and not
+//!   counted as `fanout_event_dropped`.
 //!
 //! How it can be wrong:
-//! - The skip and drop counters cannot tell a client fan-out from a relayed
-//!   one, so a relayed fan-out skipped or dropped beside a client update whose
-//!   legs are still held counts as if it were the client's.
+//! - The drop counter cannot tell a client fan-out from a relayed one, so a
+//!   relayed fan-out dropped beside a client update whose legs are still
+//!   held counts as the client's. A relayed fan-out's skips do not do this
+//!   alone, since it adds its own targets too; but the legs of a fan-out
+//!   whose targets were counted before W-1 can record their skips in W-1,
+//!   and those count toward the client update's legs.
 //! - A contract whose window-W counts were refused at the
 //!   [`MAX_TRACKED_CONTRACTS`] cap reads as having sent nothing in W, so at
 //!   the cap a send in W can go unseen and the WARN can be false.
@@ -181,12 +194,11 @@ pub(crate) enum PropagationEvent {
     SkipNotHosted,
     /// Skipped: the target had no socket address.
     SkipNoAddress,
-    /// A send failed. Counted at two layers, so it is not a per-leg outcome
-    /// disjoint from `SentDelta`/`SentFull`:
-    /// - the bridge: `bridge.send` or the stream dispatch returned `Err`, or
-    ///   the payload failed to serialize. That leg counts no `Sent*`.
-    /// - the connection task: the transport refused a message the bridge had
-    ///   already taken. That leg ALSO counted a `Sent*` event.
+    /// The network bridge refused a leg: `bridge.send` or the stream dispatch
+    /// returned `Err`, or the payload failed to serialize. That leg counts no
+    /// `Sent*`, so this is a per-leg outcome disjoint from `SentDelta` /
+    /// `SentFull`. A refusal further down, by the transport, is
+    /// [`Self::WireSendFailed`].
     SendFailed,
     /// A `BroadcastStateChange` (a whole fan-out) was dropped because the
     /// event-loop notification channel was full.
@@ -214,6 +226,12 @@ pub(crate) enum PropagationEvent {
     /// Transport: a stream failed because a fragment missed the node-wide
     /// egress deadline. The transport logs these per stream at debug only.
     WireStreamEgressAbandoned,
+    /// Transport: the connection task could not send an inline UPDATE
+    /// broadcast the bridge had already taken (the connection refused it, or
+    /// was failing while draining its queue before shutdown). That leg
+    /// counted a `Sent*` event when the bridge took it, possibly in an
+    /// earlier window. A counter only, like every `Wire*` event.
+    WireSendFailed,
     /// Receiver: an inbound broadcast skipped by the 60 s payload dedup cache.
     RxDedup,
     /// Receiver: an inbound broadcast skipped because the payload is already
@@ -227,7 +245,7 @@ pub(crate) enum PropagationEvent {
 impl PropagationEvent {
     /// Every event, in reporting order. Kept in lockstep with
     /// [`Self::index`] by `propagation_events_are_densely_indexed`.
-    pub(crate) const ALL: [PropagationEvent; 21] = [
+    pub(crate) const ALL: [PropagationEvent; 22] = [
         PropagationEvent::ClientOriginated,
         PropagationEvent::SentDelta,
         PropagationEvent::SentFull,
@@ -246,6 +264,7 @@ impl PropagationEvent {
         PropagationEvent::WireStreamDelivered,
         PropagationEvent::WireStreamFailed,
         PropagationEvent::WireStreamEgressAbandoned,
+        PropagationEvent::WireSendFailed,
         PropagationEvent::RxDedup,
         PropagationEvent::RxAlreadyApplied,
         PropagationEvent::RxBackoff,
@@ -273,9 +292,10 @@ impl PropagationEvent {
             PropagationEvent::WireStreamDelivered => 15,
             PropagationEvent::WireStreamFailed => 16,
             PropagationEvent::WireStreamEgressAbandoned => 17,
-            PropagationEvent::RxDedup => 18,
-            PropagationEvent::RxAlreadyApplied => 19,
-            PropagationEvent::RxBackoff => 20,
+            PropagationEvent::WireSendFailed => 18,
+            PropagationEvent::RxDedup => 19,
+            PropagationEvent::RxAlreadyApplied => 20,
+            PropagationEvent::RxBackoff => 21,
         }
     }
 
@@ -341,6 +361,7 @@ impl PropagationEvent {
             PropagationEvent::WireStreamDelivered => "wire_stream_delivered",
             PropagationEvent::WireStreamFailed => "wire_stream_failed",
             PropagationEvent::WireStreamEgressAbandoned => "wire_stream_egress_abandoned",
+            PropagationEvent::WireSendFailed => "wire_send_failed",
             PropagationEvent::RxDedup => "rx_dedup",
             PropagationEvent::RxAlreadyApplied => "rx_already_applied",
             PropagationEvent::RxBackoff => "rx_backoff",
@@ -569,9 +590,10 @@ pub(crate) fn aggregate_window(
     })
 }
 
-/// A contract that stalled (#6143): a local client update in window W-1, a
-/// skipped leg or a dropped fan-out in W-1 or W, and nothing handed to the
-/// network bridge in either window. See [`detect_stalls`].
+/// A contract that stalled (#6143): a local client update in window W-1,
+/// every resolved leg skipped or refused by the bridge (or a fan-out dropped)
+/// over W-1 and W, and nothing handed to the network bridge in either window.
+/// See [`detect_stalls`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StallReport {
     pub(crate) contract: ContractInstanceId,
@@ -598,18 +620,19 @@ fn stall_of(previous: &ContractSummary, current: Option<&ContractSummary>) -> Op
         events.merge(&current.events);
         targets_total = targets_total.saturating_add(current.targets_total);
     }
-    // Positive evidence that a leg ended without a send. Resolved targets
-    // alone are not: a leg held while its (contract, peer) pair is busy with
-    // a stream, or queued behind the large lane's permits, records nothing
-    // for as long as it waits.
-    let evidence = PropagationEvent::ALL
+    // Positive evidence that the update never left: every resolved leg
+    // ended unsent (skipped, or refused by the bridge), or a whole fan-out
+    // was dropped before it resolved any. Resolved targets alone are not
+    // evidence, and neither is one refused leg among them: a leg held while
+    // its (contract, peer) pair is busy with a stream, or queued behind the
+    // large lane's permits, records nothing for as long as it waits.
+    let ended_unsent = PropagationEvent::ALL
         .iter()
-        .any(|&ev| ev.is_skip() && events.get(ev) > 0)
-        || events.get(PropagationEvent::FanoutEventDropped) > 0
-        // A leg the bridge refused. A transport-level `send_failed` always
-        // comes with that leg's `Sent*`, so it can never pass `sent() == 0`.
-        || events.get(PropagationEvent::SendFailed) > 0;
-    (evidence && events.sent() == 0).then_some(StallReport {
+        .filter(|ev| ev.is_skip() || **ev == PropagationEvent::SendFailed)
+        .fold(0u64, |n, &ev| n.saturating_add(events.get(ev)));
+    let every_leg_ended_unsent = targets_total > 0 && ended_unsent >= targets_total;
+    let fanout_dropped = events.get(PropagationEvent::FanoutEventDropped) > 0;
+    ((every_leg_ended_unsent || fanout_dropped) && events.sent() == 0).then_some(StallReport {
         contract: previous.contract,
         client_originated,
         targets_total,
@@ -621,23 +644,27 @@ fn stall_of(previous: &ContractSummary, current: Option<&ContractSummary>) -> Op
 /// of the contracts with a client update (`previous`) and W's summaries
 /// (`current`). Sorted by contract id, at most one report per contract.
 ///
-/// A contract stalls when, over W-1 and W together, it had a client update
-/// in W-1, positive evidence that a leg ended unsent (any `skip_*`, a
-/// dropped fan-out, or a bridge-level `send_failed`) in either window, and nothing handed to the bridge
-/// (`sent_delta + sent_full == 0`). W is grace for a leg queued near the end
-/// of W-1, and taking the two windows together catches an update applied at
-/// the end of W-1 whose fan-out is processed in W. A contract whose client
-/// keeps posting while every leg is skipped is reported every window.
+/// A contract stalls when, over W-1 and W together, it had:
+/// - a client update in W-1;
+/// - every resolved leg accounted for as ended unsent (the `skip_*` counts
+///   plus `send_failed` reach `targets_total`, which is above zero), or a
+///   fan-out dropped by `try_notify` (`fanout_event_dropped`);
+/// - nothing handed to the bridge (`sent_delta + sent_full == 0`).
 ///
-/// Resolved targets with no leg outcome yet are not a stall: a leg held
-/// behind a busy (contract, peer) pair or the large lane's permits records
-/// nothing while it waits, which can outlast both windows. Transport
-/// outcomes (`wire_*`) are deliberately not read either: a leg the bridge
-/// took is not a stall here, however its stream ends, so a slow stream
-/// delivered many windows later never raises a WARN, and neither does a
-/// failed one. A bridge-level `send_failed` is evidence; a transport-level one
-/// always comes with the leg's `Sent*`, so it never passes. Zero resolved targets with no
-/// dropped fan-out is the `no_targets` outcome, which
+/// W is grace for a leg queued near the end of W-1, and taking the two
+/// windows together catches an update applied at the end of W-1 whose
+/// fan-out is processed in W. A contract whose client keeps posting while
+/// every leg is skipped is reported every window.
+///
+/// Legs with no outcome yet are not evidence: a leg held behind a busy
+/// (contract, peer) pair or the large lane's permits records nothing while
+/// it waits, which can outlast both windows. So one refused leg beside legs
+/// still held is not a stall; every leg must be accounted for. Transport
+/// outcomes (`wire_*`, including `wire_send_failed`) are deliberately not
+/// read: a leg the bridge took is not a stall here, however the transport
+/// then fares with it, so a slow stream delivered many windows later never
+/// raises a WARN, and neither does a failed one. Zero resolved targets with
+/// no dropped fan-out is the `no_targets` outcome, which
 /// `handle_broadcast_state_change` already WARNs.
 pub(crate) fn detect_stalls(
     previous: &HashMap<ContractInstanceId, ContractSummary>,
@@ -903,6 +930,7 @@ impl UpdatePropagationStats {
             wire_stream_delivered = e.get(PropagationEvent::WireStreamDelivered),
             wire_stream_failed = e.get(PropagationEvent::WireStreamFailed),
             wire_stream_egress_abandoned = e.get(PropagationEvent::WireStreamEgressAbandoned),
+            wire_send_failed = e.get(PropagationEvent::WireSendFailed),
             fanout_event_dropped = e.get(PropagationEvent::FanoutEventDropped),
             heal_event_dropped = e.get(PropagationEvent::HealEventDropped),
             rx_dedup = e.get(PropagationEvent::RxDedup),
@@ -938,6 +966,7 @@ impl UpdatePropagationStats {
                 wire_stream_delivered = e.get(PropagationEvent::WireStreamDelivered),
                 wire_stream_failed = e.get(PropagationEvent::WireStreamFailed),
                 wire_stream_egress_abandoned = e.get(PropagationEvent::WireStreamEgressAbandoned),
+                wire_send_failed = e.get(PropagationEvent::WireSendFailed),
                 fanout_event_dropped = e.get(PropagationEvent::FanoutEventDropped),
                 heal_event_dropped = e.get(PropagationEvent::HealEventDropped),
                 rx_dedup = e.get(PropagationEvent::RxDedup),
@@ -1041,9 +1070,9 @@ fn log_stall(stall: &StallReport) {
         fanout_event_dropped = e.get(PropagationEvent::FanoutEventDropped),
         window_s = SUMMARY_WINDOW.as_secs(),
         phase = "origination_stall",
-        "update_propagation_stalled: a local client update found broadcast targets \
-         or lost its fan-out, and nothing was handed to the network for the contract \
-         in that window or the next (#6143)"
+        "update_propagation_stalled: every broadcast leg of a local client update \
+         was skipped or refused, or its fan-out was dropped, and nothing was handed \
+         to the network for the contract in that window or the next (#6143)"
     );
 }
 
@@ -1123,6 +1152,13 @@ pub(crate) fn record_propagation_event(
 /// except that the per-contract summary creates an entry for `key` only when
 /// this node hosts it (see [`UpdatePropagationStats::record_received`]).
 /// Telemetry counts every one.
+///
+/// The gate is `is_hosting_contract`, narrower than the send side's
+/// `should_broadcast_contract` (hosted or in use, and state on disk). That
+/// one reads the state store, too costly for every inbound broadcast. So a
+/// contract that is in use but not hosted gets its `rx_*` counts only once
+/// something else (a client update, a fan-out) has created its entry in the
+/// window; telemetry counts them regardless.
 pub(crate) fn record_received_event(
     op_manager: &crate::node::OpManager,
     key: &freenet_stdlib::prelude::ContractKey,
@@ -1929,14 +1965,20 @@ mod tests {
     }
 
     /// Every leg of a client update refused by the bridge (no `Sent*`) is a
-    /// stall: the update never left the node. A transport-level failure of a
-    /// leg the bridge took also counts `send_failed`, but always beside that
-    /// leg's `Sent*`, so it never WARNs.
+    /// stall: the update never left the node. A transport refusal
+    /// (`wire_send_failed`) is not evidence, wherever its leg's `Sent*` is:
+    /// beside it in the same window, or two windows back and so not read (a
+    /// message the bridge took in W-2 that failed while the connection
+    /// drained its queue before shutdown).
     #[test]
     fn legs_refused_by_the_bridge_are_a_stall_but_a_transport_failure_is_not() {
         let stats = UpdatePropagationStats::new();
         let refused = cid(13);
         let taken = cid(14);
+        let taken_earlier = cid(15);
+        // `taken_earlier`'s leg went to the bridge in W-2.
+        record(&stats, taken_earlier, &[(PropagationEvent::SentDelta, 1)]);
+        assert!(stats.drain_stalls_for_test().is_empty());
         client_update(&stats, refused, 3, &[(PropagationEvent::SendFailed, 3)]);
         client_update(
             &stats,
@@ -1944,14 +1986,78 @@ mod tests {
             3,
             &[
                 (PropagationEvent::SentDelta, 3),
-                (PropagationEvent::SendFailed, 3),
+                (PropagationEvent::WireSendFailed, 3),
             ],
+        );
+        client_update(
+            &stats,
+            taken_earlier,
+            1,
+            &[(PropagationEvent::WireSendFailed, 1)],
         );
         assert!(stats.drain_stalls_for_test().is_empty(), "grace");
         let reports = stats.drain_stalls_for_test();
         assert_eq!(reports.len(), 1, "{reports:?}");
         assert_eq!(reports[0].contract, refused);
         assert_eq!(reports[0].events.get(PropagationEvent::SendFailed), 3);
+    }
+
+    /// One leg ended unsent while its siblings are only held (their pairs
+    /// busy with a stream, or queued) is not a stall: a held leg records
+    /// nothing, so the rule needs every resolved leg accounted for. The
+    /// skips and bridge refusals together, across both windows, must reach
+    /// the targets resolved.
+    #[test]
+    fn a_stall_needs_every_resolved_leg_to_have_ended_unsent() {
+        let stats = UpdatePropagationStats::new();
+        let (skip, refused) = (
+            PropagationEvent::SkipSummaryEqual,
+            PropagationEvent::SendFailed,
+        );
+        // One refused leg (a peer that disconnected), the other 13 held.
+        client_update(&stats, cid(20), 14, &[(refused, 1)]);
+        // One skipped leg, the other 13 held.
+        client_update(&stats, cid(21), 14, &[(skip, 1)]);
+        // One short of every leg.
+        client_update(&stats, cid(22), 14, &[(skip, 10), (refused, 3)]);
+        // Every leg, skips and refusals mixed.
+        let mixed = cid(23);
+        client_update(&stats, mixed, 14, &[(skip, 10), (refused, 4)]);
+        // Half the legs ended in W-1, the rest in W.
+        let straddling = cid(24);
+        client_update(&stats, straddling, 14, &[(skip, 7)]);
+        assert!(stats.drain_stalls_for_test().is_empty(), "grace");
+        record(&stats, straddling, &[(refused, 7)]);
+        let stalled: Vec<_> = stats
+            .drain_stalls_for_test()
+            .into_iter()
+            .map(|r| r.contract)
+            .collect();
+        assert_eq!(stalled, {
+            let mut want = vec![mixed, straddling];
+            want.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+            want
+        });
+    }
+
+    /// Every sender-side skip is evidence: a client update whose legs were
+    /// all skipped for any one reason is a stall.
+    #[test]
+    fn every_skip_reason_is_evidence_of_a_stall() {
+        let skips: Vec<_> = PropagationEvent::ALL
+            .into_iter()
+            .filter(|ev| ev.is_skip())
+            .collect();
+        assert_eq!(skips.len(), 6, "a new skip reason needs a look here");
+        for skip in skips {
+            let stats = UpdatePropagationStats::new();
+            let c = cid(25);
+            client_update(&stats, c, 3, &[(skip, 3)]);
+            assert!(stats.drain_stalls_for_test().is_empty(), "{skip:?}: grace");
+            let reports = stats.drain_stalls_for_test();
+            assert_eq!(reports.len(), 1, "{skip:?} is not counted as evidence");
+            assert_eq!(reports[0].events.get(skip), 3, "{skip:?}");
+        }
     }
 
     /// The same straddle, with the fan-out dropped in W rather than resolved.
@@ -1987,11 +2093,11 @@ mod tests {
 
     /// A leg handed to the bridge in either window clears the contract,
     /// whether it went with the update (W-1) or was queued near the boundary
-    /// and went out in W. The other legs were skipped, so without the send
-    /// each would be a stall.
+    /// and went out in W. Every resolved leg was skipped (the send is another
+    /// fan-out's leg), so without the send each would be a stall.
     #[test]
     fn a_send_in_either_window_clears_the_contract() {
-        let skipped = (PropagationEvent::SkipSummaryEqual, 2);
+        let skipped = (PropagationEvent::SkipSummaryEqual, 3);
         for sent in [PropagationEvent::SentDelta, PropagationEvent::SentFull] {
             let stats = UpdatePropagationStats::new();
             let (same, next) = (cid(13), cid(14));
@@ -2019,14 +2125,19 @@ mod tests {
     }
 
     /// A stream the bridge took is never a stall, whenever its fate arrives
-    /// (in W-1 with the update, in W, or many windows later) and however it
-    /// ends: transport outcomes are counters only. The other leg was skipped,
-    /// so the contract has positive evidence and a rule that discounted a
-    /// failed stream's send would WARN here.
+    /// in the two windows the rule reads (W-1 with the update, or W) and
+    /// however it ends: transport outcomes are counters only. A fate any
+    /// later is never read at all, since the contract has left the previous
+    /// window's map; nothing needs testing there.
     ///
-    /// A stream fate with no `Sent*` and no skip (the transport's view of a
-    /// leg whose bridge-level count is missing) is not evidence either, so a
-    /// rule that read failed streams as unsent legs would WARN on that too.
+    /// With the send: the stream leg and two skipped legs (one of the update's,
+    /// one of an earlier fan-out whose targets were counted before W-1), so
+    /// the skips reach `targets_total` and a rule that discounted a failed
+    /// stream's send would WARN here.
+    ///
+    /// Without it (the transport's view of a leg whose bridge-level count is
+    /// missing), the stream is the only leg, so a rule that read a failed
+    /// stream as an unsent leg would WARN on that too.
     #[test]
     fn a_stream_never_warns_however_and_whenever_it_ends() {
         use crate::test_utils::TestLogger;
@@ -2039,17 +2150,20 @@ mod tests {
         ] {
             for with_sent in [true, false] {
                 // The window, counted from the update's, that the fate lands in.
-                for fate_window in [0, 1, 10] {
+                for fate_window in [0, 1] {
                     let what = format!("{fate:?}, sent={with_sent}, window {fate_window}");
                     let stats = UpdatePropagationStats::new();
                     let c = cid(16);
                     let mut legs = vec![(PropagationEvent::WireStream, 1)];
-                    if with_sent {
+                    let targets = if with_sent {
                         legs.push((PropagationEvent::SentFull, 1));
-                        legs.push((PropagationEvent::SkipSummaryEqual, 1));
-                    }
-                    client_update(&stats, c, 2, &legs);
-                    for window in 0..=fate_window.max(1) + 1 {
+                        legs.push((PropagationEvent::SkipSummaryEqual, 2));
+                        2
+                    } else {
+                        1
+                    };
+                    client_update(&stats, c, targets, &legs);
+                    for window in 0..3 {
                         if window == fate_window {
                             stats.record_event(c, fate);
                         }
@@ -2081,9 +2195,9 @@ mod tests {
         client_update(&stats, cid(5), 14, &[]);
         assert!(stats.drain_stalls_for_test().is_empty());
         // Targets and a drop in W do not make W-1 a candidate without a
-        // client update in W-1. (cid(5)'s held legs failing at the bridge in
-        // W WOULD be a stall: see
-        // `legs_refused_by_the_bridge_are_a_stall_but_a_transport_failure_is_not`.)
+        // client update in W-1. (cid(5)'s held legs ALL failing at the bridge
+        // in W WOULD be a stall: see
+        // `a_stall_needs_every_resolved_leg_to_have_ended_unsent`.)
         stats.record_broadcast(cid(3), 5, 0);
         stats.record_event(cid(4), PropagationEvent::FanoutEventDropped);
         assert!(stats.drain_stalls_for_test().is_empty());
@@ -2149,7 +2263,7 @@ mod tests {
         settle().await;
 
         let c = cid(16);
-        client_update(&stats, c, 3, &[(PropagationEvent::SkipSummaryEqual, 1)]);
+        client_update(&stats, c, 3, &[(PropagationEvent::SkipSummaryEqual, 3)]);
 
         // The node was stalled for five and a half windows.
         let half = SUMMARY_WINDOW / 2;
@@ -2266,32 +2380,59 @@ mod tests {
     /// fan-out `simulation_tests` builds run) counts each leg's outcome like
     /// the production queue. Without the `Sent*` counts every client update in
     /// a simulation read as unsent, and without the skips none could stall.
+    ///
+    /// A source pin, not a behavioural test: that function exists only under
+    /// `simulation_tests`, which the lib test job does not build, and the
+    /// simulation job runs no lib test outside `sim_e2e_tests`. So each
+    /// recording site is pinned exactly: the expected number of calls, each
+    /// at statement position, inside that function's body. Deleting one of
+    /// the two `SendFailed` calls, or commenting any call out, fails it.
     #[test]
     fn the_simulation_fan_out_counts_its_legs() {
         let src = include_str!("../../node/network_bridge/p2p_protoc/broadcast.rs");
-        let start = "    async fn broadcast_state_to_peers(";
-        let at = src.find(start).expect("simulation fan-out not found");
+        let signature = "\n    async fn broadcast_state_to_peers(";
+        assert_eq!(
+            src.matches(signature).count(),
+            1,
+            "the simulation fan-out's signature must be unique"
+        );
+        let at = src.find(signature).expect("simulation fan-out not found") + 1;
+        // The method is indented four spaces, so its closing brace is the
+        // first line holding only `    }`; nothing inside it sits that far
+        // left.
         let len = src[at..]
             .find("\n    }\n")
             .expect("end of the simulation fan-out not found");
-        let body: String = src[at..at + len]
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        for needle in [
-            "count(PropagationEvent::SkipNotHosted);",
-            "count(PropagationEvent::SkipNoAddress);",
-            "FanoutDecision::Skip(skip)",
-            "count(skip);",
-            "count(PropagationEvent::SkipEmptyDelta);",
-            "count(PropagationEvent::SendFailed);",
-            "PropagationEvent::SentDelta",
-            "PropagationEvent::SentFull",
+        let body = &src[at..at + len];
+        let at_statement = |needle: &str| {
+            body.lines()
+                .filter(|line| line.trim_start().starts_with(needle))
+                .count()
+        };
+        for (needle, want) in [
+            ("count(PropagationEvent::SkipNotHosted);", 1),
+            ("count(PropagationEvent::SkipNoAddress);", 1),
+            ("count(skip);", 1),
+            ("count(PropagationEvent::SkipEmptyDelta);", 1),
+            // Payload serialization failure and a refused send.
+            ("count(PropagationEvent::SendFailed);", 2),
+            ("count(if sent_delta {", 1),
         ] {
-            assert!(
-                body.contains(needle),
-                "the simulation fan-out no longer counts a leg outcome: `{needle}`"
+            assert_eq!(
+                at_statement(needle),
+                want,
+                "the simulation fan-out's calls of `{needle}`"
+            );
+        }
+        // The two arms of `count(if sent_delta { .. } else { .. })`.
+        for (arm, want) in [
+            ("PropagationEvent::SentDelta", 1),
+            ("PropagationEvent::SentFull", 1),
+        ] {
+            assert_eq!(
+                at_statement(arm),
+                want,
+                "the simulation fan-out's `{arm}` arm"
             );
         }
     }

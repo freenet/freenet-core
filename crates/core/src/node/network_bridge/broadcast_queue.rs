@@ -7296,12 +7296,14 @@ mod tests {
         settle().await;
         assert_eq!(op_manager.payload_mix.origination_stalls_for_test(), 0);
 
-        // A client update that found targets and sent nothing.
+        // A client update whose every leg was skipped.
         let contract = *node.key.id();
         let stats = &op_manager.update_propagation_stats;
         stats.record_event(contract, Ev::ClientOriginated);
         stats.record_broadcast(contract, 3, 0);
-        stats.record_event(contract, Ev::SkipSummaryEqual);
+        for _ in 0..3 {
+            stats.record_event(contract, Ev::SkipSummaryEqual);
+        }
 
         tokio::time::advance(SUMMARY_WINDOW).await;
         settle().await;
