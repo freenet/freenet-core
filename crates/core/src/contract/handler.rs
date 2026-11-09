@@ -1470,10 +1470,17 @@ pub mod test {
     /// with the same event id, the same priority and the client's own
     /// responder, so the loop's answer reaches the client.
     ///
+    /// The fallback is counted as `LaneDown`, so traffic after a lane death
+    /// does not read as no traffic. The counter is process-global and only
+    /// increases, so the assertion is on a delta.
+    ///
     /// FALSIFY: refuse in the `Closed` arm (return `None`), or rebuild the
-    /// event with a fresh id/responder; the client is not answered.
+    /// event with a fresh id/responder (the client is not answered); or drop
+    /// the `record_forward(LaneDown)` call (the count does not move).
     #[tokio::test]
     async fn a_closed_delegate_lane_falls_back_to_the_loop() -> anyhow::Result<()> {
+        use crate::contract::delegate_lane::{ForwardReason, routing_counts};
+        let down_before = routing_counts().forwarded(ForwardReason::LaneDown);
         let (send, mut rcv, _) = contract_handler_channel();
         let (tx, lane_rx) = mpsc::channel(8);
         drop(lane_rx);
@@ -1490,6 +1497,10 @@ pub mod test {
         assert!(
             matches!(ev, ContractHandlerEvent::DelegateRequest { .. }),
             "the loop receives the delegate request, got {ev}"
+        );
+        assert!(
+            routing_counts().forwarded(ForwardReason::LaneDown) > down_before,
+            "the fallback is counted as LaneDown"
         );
         assert_eq!(priority, crate::contract::fair_queue::Priority::ClientLocal);
         rcv.send_to_sender(id, ContractHandlerEvent::DelegateResponse(Ok(Vec::new())))
