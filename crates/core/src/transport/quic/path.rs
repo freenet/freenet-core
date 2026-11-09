@@ -774,7 +774,8 @@ impl QuicPath {
         limits: QuicPathLimits,
     ) -> (Self, QuicInbound) {
         let budget = SharedInboundBudget::new(limits.max_streams, limits.max_bytes);
-        let (path, inbound) = Self::with_budget_and_own_channels(connection, time, limits, budget);
+        let (path, inbound) =
+            Self::with_budget_and_own_channels(connection, time, limits, budget, None);
         // A test path has no negotiation: one that accepts data sends it too.
         if limits.accept_data {
             path.enable_data();
@@ -789,9 +790,10 @@ impl QuicPath {
         time: T,
         limits: QuicPathLimits,
         budget: SharedInboundBudget,
+        windows: Option<&Arc<super::budget::QuicBudget>>,
     ) -> (Self, QuicInbound) {
         let (data, inbox) = channels_of(limits.short_capacity, limits.stream_capacity);
-        let (path, controls) = Self::with_budget(connection, time, limits, budget, data, None);
+        let (path, controls) = Self::with_budget(connection, time, limits, budget, data, windows);
         let QuicDataInbox { shorts, streams } = inbox;
         (
             path,
