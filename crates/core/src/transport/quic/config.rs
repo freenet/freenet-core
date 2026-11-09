@@ -300,6 +300,7 @@ pub(crate) const QUIC_ACK_TAIL_BYTES: usize = 240 * 1024;
 /// about 15%. The measurement includes the simulation's timer queue entry for
 /// each stream's reader, which a production timer does not leave, so it
 /// overstates a little.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const QUIC_OPEN_STREAM_BYTES: usize = 1152;
 
 /// What polling `stopped()` on a stream this side then resets leaves on the
@@ -310,6 +311,7 @@ pub(crate) const QUIC_OPEN_STREAM_BYTES: usize = 1152;
 /// (`quic::memory_tests::polling_stopped_on_a_reset_stream_costs_at_most_its_entry`,
 /// jemalloc-rounded); the pin leaves about 18%. Bounded per connection by
 /// `recycle::SEND_ABORT_LIMIT` resets.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const QUIC_STOPPED_ENTRY_BYTES: usize = 104;
 
 /// The quinn, quinn-proto and rustls versions the figures above were
