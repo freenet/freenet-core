@@ -611,7 +611,9 @@ together, had:
 
 - a client update in W-1;
 - positive evidence that a leg ended unsent, in either window: any
-  `skip_*`, or `fanout_event_dropped`;
+  `skip_*`, `fanout_event_dropped`, or `send_failed` (a bridge-level
+  failure has no `sent_*`; a transport-level one always comes with its
+  leg's `sent_*`, so it can never pass the next condition);
 - nothing handed to the bridge (`sent_delta + sent_full == 0`).
 
 W is grace for a leg queued late in W-1, and reading both windows catches an
@@ -629,8 +631,8 @@ up to 120 s each. A held or queued leg records nothing, so "targets and no
 send" is a normal state when every target is mid-stream, and it would WARN
 every window.
 
-So the WARN targets the sender-side shapes: every leg skipped, or the whole
-fan-out dropped. Transport outcomes (`wire_*`) are counters only and never
+So the WARN targets the sender-side shapes: every leg skipped or refused by
+the bridge, or the whole fan-out dropped. Transport outcomes (`wire_*`) are counters only and never
 raise it, so a slow stream delivered many windows later is never a false
 WARN, and a failed one never a WARN. A client update whose legs were all
 skipped as converged (`skip_summary_equal` and the like) counts as a stall:
@@ -650,7 +652,6 @@ transport losses (#6145).
   it, a single packet abandoned after its retransmits, a lost QUIC message.
   Diagnose those from the `wire_*` counts and the receivers' `rx_*` counts
   across the fleet;
-- legs that fail at the bridge with no skip: `send_failed` is not evidence;
 - legs evicted from the broadcast queue at capacity (`evict_oldest`): no
   event is counted, though the queue WARNs each eviction itself;
 - relayed updates: only a client update makes a contract a candidate;
