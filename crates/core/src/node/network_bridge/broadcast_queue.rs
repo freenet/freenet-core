@@ -42,7 +42,10 @@ use std::time::Duration;
 use freenet_stdlib::prelude::{ContractKey, WrappedState};
 
 use crate::node::OpManager;
-use crate::operations::update::propagation_stats::{PropagationEvent, record_propagation_event};
+use crate::operations::update::propagation_stats::{
+    PropagationEvent, record_propagation_event, record_propagation_stream_fate,
+    record_propagation_stream_start,
+};
 use crate::ring::PeerKeyLocation;
 use crate::transport::StreamSendOutcome;
 
@@ -4951,7 +4954,7 @@ pub(super) async fn broadcast_to_single_peer(
                 // Handed to the transport, as a stream. Its fate is counted
                 // below from the completion signal.
                 record_propagation_event(op_manager, key.id(), PropagationEvent::SentFull);
-                record_propagation_event(op_manager, key.id(), PropagationEvent::WireStream);
+                let stream_start = record_propagation_stream_start(op_manager, key.id());
                 // Wait for the stream transfer to actually complete before
                 // doing the delivery bookkeeping. The lane permit is held for
                 // at most `STREAM_PERMIT_HOLD` of the wait; the queue's claim on
@@ -4966,10 +4969,11 @@ pub(super) async fn broadcast_to_single_peer(
                     completion_timeout,
                 )
                 .await;
-                record_propagation_event(
+                record_propagation_stream_fate(
                     op_manager,
                     key.id(),
-                    PropagationEvent::for_stream_outcome(stream_outcome_of(&completion)),
+                    stream_start,
+                    stream_outcome_of(&completion),
                 );
                 // Classify AND apply the delivery gate in one production call
                 // (#4235): only a real `Delivered` refreshes interest / caches
@@ -7415,6 +7419,10 @@ mod tests {
                 bridge_rx.close();
             }
             let before = events();
+            let fates_before = op_manager
+                .update_propagation_stats
+                .stream_fates_for_test(key.id())
+                .same_window;
             let leg = super::broadcast_to_single_peer(
                 &bridge,
                 op_manager,
@@ -7451,6 +7459,19 @@ mod tests {
                 }
             };
             tokio::join!(leg, responder);
+            // A stream's fate is matched to the window it started in.
+            let fates = op_manager
+                .update_propagation_stats
+                .stream_fates_for_test(key.id());
+            let streamed = matches!(fate, Fate::Signal(_) | Fate::Unsignalled);
+            assert_eq!(
+                fates.same_window - fates_before,
+                u64::from(streamed),
+                "{fate:?}: {fates:?}"
+            );
+            if matches!(fate, Fate::Signal(StreamSendOutcome::Delivered)) {
+                assert_eq!(fates.latest_delivered_start, Some(0), "{fates:?}");
+            }
             let after = events();
             for ev in Ev::ALL {
                 let expected = want.iter().find(|(e, _)| *e == ev).map_or(0, |(_, n)| *n);
