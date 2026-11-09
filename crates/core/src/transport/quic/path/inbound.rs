@@ -856,6 +856,12 @@ impl ConnRanges {
         self.cap.store(cap, Ordering::Relaxed);
     }
 
+    /// The cap now. Tests only.
+    #[cfg(test)]
+    pub(in crate::transport::quic) fn cap(&self) -> usize {
+        self.cap.load(Ordering::Relaxed)
+    }
+
     /// Gaps counted now, kept ones included: what the budget charges.
     pub(in crate::transport::quic) fn held_now(&self) -> usize {
         self.held.load(Ordering::Relaxed)
@@ -2004,7 +2010,9 @@ mod tests {
     /// so the connection never trips.
     #[test]
     fn many_honest_stops_do_not_drift_toward_the_cap() {
-        let conn = ConnRanges::new(MAX_GAPS_PER_CONNECTION, 64);
+        // The cap of a 2 MiB window: 64 stopped streams of 20 gaps each
+        // (1,280) fit under it, and the point is that they do not add up.
+        let conn = ConnRanges::new(super::super::super::budget::gap_cap(2 << 20), 64);
         let step = nanos(Duration::from_millis(10));
         let mut now = 0;
         for _ in 0..100_000 {

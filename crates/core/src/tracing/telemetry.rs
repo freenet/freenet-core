@@ -7814,6 +7814,12 @@ mod tests {
         data.path_ms = 1037;
         data.send_resets_reached = (1038..1042).collect();
         data.send_resets_path_max = 1042;
+        data.budget_bytes = 1043;
+        data.budget_charged = 1044;
+        data.budget_charged_peak = 1045;
+        data.window_grew = 1046;
+        data.window_grow_refused = 1047;
+        data.window_shrank = 1048;
         let want: std::collections::BTreeMap<String, u64> =
             snapshot.quic_data.keys().into_iter().collect();
         assert!(want.values().all(|value| *value != 0));

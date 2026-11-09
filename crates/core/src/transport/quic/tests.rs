@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use super::config::{
     self, ALPN, INCOMING_BUFFER_BYTES, INCOMING_BUFFER_TOTAL_BYTES, KEEPALIVE_INTERVAL,
-    MAX_INCOMING, MAX_UDP_PAYLOAD, MAX_WINDOW_BYTES, MIN_WINDOW_BYTES,
+    MAX_INCOMING, MAX_UDP_PAYLOAD,
 };
 use super::identity::{PeerKey, PinnedClientKey, PinnedServerKey, QuicIdentity};
 use super::test_tls::TestIdentity;
@@ -232,12 +232,16 @@ fn debug_field(debug: &str, name: &str) -> String {
     panic!("no field {name:?} in {debug}");
 }
 
-/// Settings with windows of [`MAX_WINDOW_BYTES`], so a 1 MiB stream fits.
+/// The window test endpoints start with, and keep: test paths have no budget
+/// meter. 2 MiB, so a 1 MiB stream fits.
+pub(super) const TEST_WINDOW: u64 = 2 * 1024 * 1024;
+
+/// Settings with windows of [`TEST_WINDOW`].
 fn settings() -> QuicSettings {
     QuicSettings {
         memory_limit: 1024 * 1024 * 1024,
         idle_timeout: None,
-        initial_window: None,
+        initial_window: Some(TEST_WINDOW),
         rate_limit: Default::default(),
     }
 }
@@ -1584,7 +1588,8 @@ fn pinned_transport_fields(window: u64) -> Vec<(&'static str, String)> {
         ("max_concurrent_bidi_streams", "0".into()),
         // The uni value is set from field data (see its doc).
         ("max_concurrent_uni_streams", "64".into()),
-        ("stream_receive_window", window.to_string()),
+        // Every stream may use the largest window a data path grows to.
+        ("stream_receive_window", "8388608".into()),
         ("receive_window", window.to_string()),
         ("send_window", window.to_string()),
         ("send_fairness", "true".into()),
@@ -1612,10 +1617,7 @@ fn pinned_transport_fields(window: u64) -> Vec<(&'static str, String)> {
 #[test]
 fn transport_config_pins_every_value() {
     let window = settings().window_bytes();
-    assert_eq!(
-        window, MAX_WINDOW_BYTES,
-        "these settings reach the window cap"
-    );
+    assert_eq!(window, TEST_WINDOW, "the settings' initial window");
     let real = format!(
         "{:?}",
         config::transport_config(&settings(), &RealTime::new())
@@ -1788,50 +1790,53 @@ fn tls_configs_pin_every_value() {
     assert!(identity.refusing_server_tls().is_ok());
 }
 
-/// The window is 5% of memory split over every connection's receive and
-/// send windows, clamped to [128 KiB, 2 MiB].
+/// A connection starts at the floor window for the node's memory (128 KiB, or
+/// 64 KiB under 2 GiB) unless the settings name one; a data path's windows then
+/// move within the buffer budget (`budget`).
 #[test]
-fn windows_are_a_clamped_share_of_memory() {
+fn the_initial_window_is_the_floor_for_the_memory() {
     const GIB: usize = 1024 * 1024 * 1024;
-    let window = config::connection_window_bytes;
-    // 4 GiB / 20 / (2 * 200) = 536 870 bytes: inside the clamp.
-    assert_eq!(window(4 * GIB, 200), (4 * GIB / 20 / 400) as u64);
-    assert_eq!(window(256 * 1024 * 1024, 200), MIN_WINDOW_BYTES, "floor");
-    assert_eq!(window(64 * GIB, 4), MAX_WINDOW_BYTES, "ceiling");
+    let at = |memory_limit, initial_window| {
+        QuicSettings {
+            memory_limit,
+            idle_timeout: None,
+            initial_window,
+            rate_limit: Default::default(),
+        }
+        .window_bytes()
+    };
+    assert_eq!(at(GIB, None), 64 * 1024, "under 2 GiB");
+    assert_eq!(at(2 * GIB, None), 128 * 1024);
     assert_eq!(
-        window(GIB, 0),
-        MAX_WINDOW_BYTES,
-        "zero connections does not divide by zero"
+        at(64 * GIB, None),
+        128 * 1024,
+        "the floor, whatever the memory"
     );
+    assert_eq!(at(GIB, Some(300_000)), 300_000, "named in the settings");
 }
 
-/// The connection receive window, the stream receive window and the send
-/// window are at most `MAX_INBOUND_STREAM_BYTES_PER_CONNECTION` (read from
-/// the constant, not copied) at every memory limit and connection count, the
-/// stream window is at most the connection window, and the transport
-/// configuration quinn is given carries exactly those values. The cap does
-/// not bind with today's 2 MiB clamp, so this guards only a future change of
-/// the window constants. It says nothing about a connection's total memory,
-/// which is not accounted (see `config::connection_window_bytes`).
+/// The connection receive window and the send window are the initial window,
+/// the stream receive window is the largest window a data path grows to, and
+/// none is above `MAX_INBOUND_STREAM_BYTES_PER_CONNECTION` (read from the
+/// constant, not copied), at every memory limit; the transport configuration
+/// quinn is given carries exactly those values. The cap does not bind with
+/// today's 8 MiB largest window, so this guards only a future change of the
+/// window constants.
 #[test]
 fn windows_never_exceed_the_reassembly_allowance() {
     use crate::transport::peer_connection::streaming::MAX_INBOUND_STREAM_BYTES_PER_CONNECTION as CAP;
     const MIB: usize = 1024 * 1024;
     let limits = [0, MIB, 256 * MIB, 1024 * MIB, 64 * 1024 * MIB, usize::MAX];
-    let connections = [0, 1, 4, 200, 10_000];
     for &memory_limit in &limits {
-        for &max_connections in &connections {
+        for initial_window in [None, Some(u64::MAX)] {
             let settings = QuicSettings {
                 memory_limit,
                 idle_timeout: None,
-                initial_window: None,
+                initial_window,
                 rate_limit: Default::default(),
             };
             let window = settings.window_bytes();
-            assert!(
-                window <= CAP,
-                "{memory_limit} B / {max_connections} connections: window {window} > {CAP}"
-            );
+            assert!(window <= CAP, "{memory_limit} B: window {window} > {CAP}");
             let debug = format!(
                 "{:?}",
                 config::transport_config(&settings, &VirtualTime::new())
@@ -1842,8 +1847,9 @@ fn windows_never_exceed_the_reassembly_allowance() {
                 field("receive_window"),
                 field("send_window"),
             );
-            assert_eq!((stream, connection, send), (window, window, window));
-            assert!(stream <= connection && connection <= CAP && send <= CAP);
+            assert_eq!((connection, send), (window, window));
+            assert_eq!(stream, config::stream_window());
+            assert!(stream <= CAP && connection <= CAP && send <= CAP);
         }
     }
 }
