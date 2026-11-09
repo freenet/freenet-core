@@ -292,6 +292,26 @@ pub(crate) const QUIC_ASSEMBLER_HOLD_WINDOW_MULTIPLE: usize = 5;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const QUIC_ACK_TAIL_BYTES: usize = 240 * 1024;
 
+/// One open uni stream with one byte on it, both sides together: quinn's
+/// per-stream state on the sender and the receiver, and the receiver's reader
+/// (`quic::memory_tests::an_open_stream_measures_within_its_pin`, at
+/// `STREAMED_SEND_LIMIT` streams on one connection, jemalloc-rounded).
+/// Measured 988 B with quinn 0.11.12 / quinn-proto 0.11.19; the pin leaves
+/// about 15%. The measurement includes the simulation's timer queue entry for
+/// each stream's reader, which a production timer does not leave, so it
+/// overstates a little.
+pub(crate) const QUIC_OPEN_STREAM_BYTES: usize = 1152;
+
+/// What polling `stopped()` on a stream this side then resets leaves on the
+/// connection until it closes: quinn's `stopped` map entry, an `Arc<Notify>`
+/// and its share of the map's table (quinn 0.11.12 `send_stream.rs`; a local
+/// reset produces neither event that removes it). Measured 88 B as the
+/// difference between 1,024 resets with the poll and without
+/// (`quic::memory_tests::polling_stopped_on_a_reset_stream_costs_at_most_its_entry`,
+/// jemalloc-rounded); the pin leaves about 18%. Bounded per connection by
+/// `recycle::SEND_ABORT_LIMIT` resets.
+pub(crate) const QUIC_STOPPED_ENTRY_BYTES: usize = 104;
+
 /// The quinn, quinn-proto and rustls versions the figures above were
 /// measured with, checked against `Cargo.lock` by `quic::memory_tests`.
 #[cfg(test)]
