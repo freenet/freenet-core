@@ -76,12 +76,50 @@ async fn paths_with(
     b_limits: QuicPathLimits,
     b_budget: Option<SharedInboundBudget>,
 ) -> Paths {
-    paths_built(network, subnet, b_limits, b_budget, None).await
+    paths_built(
+        network,
+        subnet,
+        b_limits,
+        b_budget,
+        None,
+        Windows::default(),
+    )
+    .await
+}
+
+/// The buffer budgets a test's paths take their windows from, if any
+/// (`budget::QuicBudget`): `b`'s, as the receiving node's, and `a`'s, as the
+/// sending node's. A path with none keeps the endpoint's initial window.
+#[derive(Default, Clone)]
+struct Windows {
+    a: Option<Arc<super::super::budget::QuicBudget>>,
+    b: Option<Arc<super::super::budget::QuicBudget>>,
+}
+
+/// [`paths`] with each side's path taking its windows from a buffer budget.
+async fn paths_metered(network: &str, subnet: u8, windows: Windows) -> Paths {
+    paths_built(
+        network,
+        subnet,
+        QuicPathLimits::DEFAULT,
+        None,
+        None,
+        windows,
+    )
+    .await
 }
 
 /// [`paths`] with an egress cap of `a_cap` bytes per second on `a`'s socket.
 async fn paths_capped(network: &str, subnet: u8, a_cap: u64) -> Paths {
-    paths_built(network, subnet, QuicPathLimits::DEFAULT, None, Some(a_cap)).await
+    paths_built(
+        network,
+        subnet,
+        QuicPathLimits::DEFAULT,
+        None,
+        Some(a_cap),
+        Windows::default(),
+    )
+    .await
 }
 
 async fn paths_built(
@@ -90,6 +128,7 @@ async fn paths_built(
     b_limits: QuicPathLimits,
     b_budget: Option<SharedInboundBudget>,
     a_cap: Option<u64>,
+    windows: Windows,
 ) -> Paths {
     let a_addr: SocketAddr = format!("10.203.{subnet}.1:5000").parse().unwrap();
     let b_addr: SocketAddr = format!("10.203.{subnet}.2:5000").parse().unwrap();
@@ -121,18 +160,26 @@ async fn paths_built(
         counters: b_limits.counters,
         ..QuicPathLimits::DEFAULT
     };
-    let (a, a_in) = QuicPath::with_limits(client, pair.time.clone(), a_limits);
-    let (b, b_in) = match b_budget {
-        Some(budget) => {
-            let (b, b_in) =
-                QuicPath::with_budget_and_own_channels(server, pair.time.clone(), b_limits, budget);
-            if b_limits.accept_data {
-                b.enable_data();
-            }
-            (b, b_in)
-        }
-        None => QuicPath::with_limits(server, pair.time.clone(), b_limits),
-    };
+    let own =
+        |limits: QuicPathLimits| SharedInboundBudget::new(limits.max_streams, limits.max_bytes);
+    let (a, a_in) = QuicPath::with_budget_and_own_channels(
+        client,
+        pair.time.clone(),
+        a_limits,
+        own(a_limits),
+        windows.a.as_ref(),
+    );
+    a.enable_data();
+    let (b, b_in) = QuicPath::with_budget_and_own_channels(
+        server,
+        pair.time.clone(),
+        b_limits,
+        b_budget.unwrap_or_else(|| own(b_limits)),
+        windows.b.as_ref(),
+    );
+    if b_limits.accept_data {
+        b.enable_data();
+    }
     Paths {
         pair,
         a: Arc::new(a),
@@ -6434,5 +6481,67 @@ fn a_first_chunk_at_the_deadline_opens_no_stream() {
         }
         assert_eq!(p.a.send_aborts(), 0);
         assert_eq!(p.b.stats().count(QuicInboundOutcome::AnnouncedStream), 0);
+    })
+}
+
+// The buffer budget (#5940, buffer-budget PR 3): a data path's windows are set
+// from the node's budget (`budget`).
+
+/// A budget of `total` bytes whose paths start at the test endpoints' window.
+fn test_budget(
+    total: u64,
+    counters: &'static crate::transport::metrics::QuicDataCounters,
+) -> Arc<super::super::budget::QuicBudget> {
+    super::super::budget::QuicBudget::new(total, super::super::tests::TEST_WINDOW, counters)
+}
+
+fn leaked_counters() -> &'static crate::transport::metrics::QuicDataCounters {
+    Box::leak(Box::new(crate::transport::metrics::QuicDataCounters::new()))
+}
+
+/// On a real connection, a stream whose in-order delivery fills the receive
+/// window grows it, and the node's charge stays within the budget.
+#[test]
+fn a_data_paths_window_grows_when_delivery_fills_it() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let counters = leaked_counters();
+        let total = 64 << 20;
+        let windows = Windows {
+            a: Some(test_budget(total, leaked_counters())),
+            b: Some(test_budget(total, counters)),
+        };
+        let network = "quic-budget-window-grows";
+        let p = paths_metered(network, 25, windows).await;
+        // 20 ms each way, so the window is what limits the transfer.
+        crate::transport::in_memory_socket::set_packet_delivery_callback(
+            network,
+            Some(Arc::new(|_, _, _, _| {
+                crate::transport::in_memory_socket::PacketDeliveryDecision::DelayedDelivery(
+                    Duration::from_millis(20),
+                )
+            })),
+        );
+        let a = p.a.clone();
+        let body = Bytes::from(payload(24 * MIB));
+        let sent = body.clone();
+        p.drive(async move {
+            a.send_stream(StreamId::next(), None, sent)
+                .await
+                .expect("sent")
+        })
+        .await;
+        let mut p = p;
+        let arrival = p.b_in.streams.try_recv().expect("announced");
+        assert_eq!(arrival.handle.assemble().await.expect("assembled"), body);
+        let snap = counters.snapshot(false);
+        assert!(snap.window_grew > 0, "the receive window grew: {snap:?}");
+        let grant = super::super::budget::floor_grant(super::super::tests::TEST_WINDOW);
+        assert!(
+            snap.budget_charged_peak > grant,
+            "charged {} at most, the floor grant is {grant}",
+            snap.budget_charged_peak
+        );
+        assert!(snap.budget_charged_peak <= total);
     })
 }

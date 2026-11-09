@@ -263,8 +263,12 @@ impl QuicBudget {
         self.total
     }
 
-    /// Register a data path's connection at the floor windows. Its gap cap
-    /// follows its window from now on.
+    /// Register a data path's connection at the floor windows, which are set
+    /// on it. The connection must not already have a larger receive window:
+    /// lowering it here would leave quinn a debt the meter does not mirror
+    /// (the endpoint starts every connection at the floor,
+    /// `config::QuicSettings::window_bytes`). Its gap cap follows its window
+    /// from now on.
     pub(in crate::transport::quic) fn register(
         self: &Arc<Self>,
         control: Arc<dyn WindowControl>,
@@ -275,6 +279,8 @@ impl QuicBudget {
         let id = state.next_id;
         state.next_id += 1;
         ranges.set_cap(gap_cap(self.floor));
+        control.set_receive_window(self.floor);
+        control.set_send_window(self.floor);
         let send_epoch = Arc::new(());
         state.conns.insert(
             id,
