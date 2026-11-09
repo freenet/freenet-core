@@ -7,24 +7,26 @@
 //! of the UDP shape ([`Rechunker`]), so `fork`, `assemble`, `pipe_stream`,
 //! `StreamIdentity` and the orphan registry work unchanged.
 //!
-//! Every stream is read unordered from its first byte
-//! (`read_chunk(_, false)`, [`BodyReader::next_unordered`]): quinn's
-//! assembler hands over each piece as it arrives, gap or not, so it holds
-//! none of the stream's bytes waiting for a gap to fill (a peer that leaves a
-//! gap cannot make quinn hold the bytes after it). The header, metadata,
-//! short and control bodies are assembled in order from those pieces, copying
-//! the ones that arrive early ([`BodyReader::next_chunk`]); a `Stream`'s
-//! payload goes straight into its charged buffer at its offset. What a gap
-//! still costs is one received range (quinn's `recvd` entry and our mirror,
-//! [`RangeMirror`]), capped per connection ([`MAX_GAPS_PER_CONNECTION`]).
-//! quinn keeps a stopped stream's ranges until the peer finishes or resets
-//! it, which a peer may never do, so those stay counted for the connection's
-//! life ([`ConnRanges::keep`]); a second time past the cap closes the path.
-//! A stream waiting for room in the delivery channel keeps reading its
-//! payload, so the wait never holds the peer's flow-control credit, but it
-//! leaves the stream's end unread until the stream is announced: reading the
-//! end frees quinn's slot, and the slots are what bound how many waiters a
-//! peer can make.
+//! The header, the metadata, and short and control bodies are read in order
+//! ([`BodyReader::next_chunk`]): quinn holds what arrives past a gap without
+//! returning the peer's credit for it, so the connection's flow-control
+//! window bounds it. A `Stream`'s payload, once the stream is charged, is read
+//! unordered (`read_chunk(_, false)`, [`BodyReader::next_unordered`]):
+//! quinn's assembler hands over each piece as it arrives, gap or not, and the
+//! piece goes straight into the charged buffer at its offset, so quinn holds
+//! none of the payload waiting for a gap to fill. Unordered reads return the
+//! peer's credit for every byte read, so they start only once the declared
+//! length bounds what may arrive. What a gap still costs is one received
+//! range (quinn's `recvd` entry and our mirror, [`RangeMirror`]), capped per
+//! connection ([`MAX_GAPS_PER_CONNECTION`]). quinn keeps a stopped stream's
+//! ranges until the peer finishes or resets it, which we cannot observe, so
+//! they stay counted ([`ConnRanges::keep`]); a second time past the cap
+//! closes the path. A stream waiting for room in the delivery channel keeps
+//! reading its payload, so the wait never holds the peer's flow-control
+//! credit, but it leaves the stream's end unread until the stream is
+//! announced (one that ends short fails at once): reading the end frees
+//! quinn's slot, and the slots are what bound how many waiters a peer can
+//! make.
 //!
 //! Admission follows the UDP transport's rules (`.claude/rules/transport.md`,
 //! "WHEN admitting or sending a stream"):
@@ -75,8 +77,7 @@
 //! in, so keeping a 1-byte chunk keeps its whole ~1200-byte datagram. The
 //! header, metadata, short and control reads therefore copy each chunk into
 //! one buffer that grows as data arrives and ends exactly the declared
-//! length (`ReadBuffer`), and copy pieces that arrive before their turn
-//! (staged, unique bytes, so bounded by the connection's credit). The
+//! length (`ReadBuffer`). The
 //! payload of a `Stream` is copied into fragments by the `Rechunker`, each a
 //! buffer of exactly its length filled at its offsets, so a fragment pins
 //! only its own bytes whatever quinn's chunks were. A fragment `Bytes` may
@@ -98,7 +99,7 @@
 //! same id arrives, before it is refused as `StreamIdInUse`. Completed ids
 //! are not remembered, so once released an id can be used again.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -341,14 +342,10 @@ struct BodyReader<T: TimeSource> {
     timer: Pin<Box<dyn Future<Output = ()> + Send>>,
     /// The deadline `timer` is armed for.
     timer_at: u64,
-    /// Idleness is not judged while this side is the one waiting (a full
-    /// delivery channel): only the age limit applies.
-    idle_paused: bool,
-    /// The next stream offset an in-order read ([`Self::next_chunk`]) wants.
-    next: u64,
-    /// Bytes received past `next`, copied out of quinn's datagrams, by offset.
-    /// Unique bytes, so their total is bounded by the connection's credit.
-    staged: BTreeMap<u64, Bytes>,
+    /// Reads are still in order ([`Self::next_chunk`]); the first unordered
+    /// read ([`Self::next_unordered`]) ends that, for good (quinn refuses
+    /// unordered to ordered, `ensure_ordering`).
+    ordered: bool,
     /// One past the last offset this stream may carry, once its header is
     /// known; a byte past it is `Overlong`.
     end: Option<u64>,
@@ -380,9 +377,7 @@ impl<T: TimeSource> BodyReader<T> {
             last_progress: now,
             timer,
             timer_at,
-            idle_paused: false,
-            next: 0,
-            staged: BTreeMap::new(),
+            ordered: true,
             end: None,
             finished: false,
             reset: false,
@@ -392,9 +387,6 @@ impl<T: TimeSource> BodyReader<T> {
     }
 
     fn deadline(&self) -> u64 {
-        if self.idle_paused {
-            return self.age_deadline;
-        }
         self.last_progress
             .saturating_add(self.idle_nanos)
             .min(self.age_deadline)
@@ -413,46 +405,64 @@ impl<T: TimeSource> BodyReader<T> {
             .is_some_and(|end| self.ranges.ranges.as_slice() == [(0, end)])
     }
 
-    /// Stop judging idleness ([`Self::idle_paused`]); the armed timer is
-    /// moved to the age deadline if it was set for the idle one.
-    fn pause_idle(&mut self) {
-        self.idle_paused = true;
-        if self.timer_at != self.age_deadline {
-            self.timer_at = self.age_deadline;
-            self.timer = self.time.sleep_until(self.timer_at);
-        }
-    }
-
-    /// Judge idleness again, from now.
-    fn resume_idle(&mut self) {
-        self.idle_paused = false;
-        self.last_progress = self.time.now_nanos();
-        self.timer_at = self.deadline();
-        self.timer = self.time.sleep_until(self.timer_at);
-    }
-
     /// The next piece of the stream in arrival order, with its offset, or
     /// `None` at the end. Read unordered (`read_chunk(max, false)`), so quinn's
     /// assembler releases each chunk as soon as it arrives, gap or not: the
-    /// bytes then live only where the caller copies them. Checks the declared
-    /// end and the connection's range cap.
+    /// bytes then live only where the caller copies them. Only after the
+    /// header and metadata (read in order, [`Self::next_chunk`]): an unordered
+    /// read returns the peer's credit for every byte read, gap or not, so
+    /// bytes read ahead of a missing header would have no bound but the age
+    /// limit, while once the header is known they go into the charged buffer
+    /// and stop at the declared end.
     async fn next_unordered(&mut self) -> Result<Option<(u64, Bytes)>, ReadFailure> {
+        debug_assert!(self.end.is_some(), "unordered reads start after the header");
+        self.ordered = false;
+        self.read_piece(usize::MAX, false).await
+    }
+
+    /// The next chunk of at most `max` bytes (at least 1) at the in-order
+    /// position, or `None` at the end of the stream. quinn holds what arrives
+    /// past a gap until the gap fills, without returning the peer's credit for
+    /// it, so what it holds is bounded by the connection's flow-control
+    /// window (and quinn's own compaction, `MAX_CHUNKS`).
+    async fn next_chunk(&mut self, max: usize) -> Result<Option<Bytes>, ReadFailure> {
+        if !self.ordered {
+            debug_assert!(false, "an in-order read after an unordered one");
+            return Err(ReadFailure::Other);
+        }
+        Ok(self.read_piece(max, true).await?.map(|(_, bytes)| bytes))
+    }
+
+    /// One `read_chunk(max, ordered)`, with the idle and age limits, the
+    /// declared end and the connection's gap cap applied.
+    async fn read_piece(
+        &mut self,
+        max: usize,
+        ordered: bool,
+    ) -> Result<Option<(u64, Bytes)>, ReadFailure> {
         if self.finished {
             return Ok(None);
         }
         loop {
             tokio::select! {
-                read = self.recv.read_chunk(usize::MAX, false) => {
+                read = self.recv.read_chunk(max, ordered) => {
                     return match read {
                         Ok(Some(chunk)) => {
-                            self.last_progress = self.time.now_nanos();
+                            let now = self.time.now_nanos();
+                            self.last_progress = now;
                             let start = chunk.offset;
                             let stop = start.saturating_add(chunk.bytes.len() as u64);
+                            #[cfg(test)]
+                            if self.end.is_none() && stop > HEADER_LEN as u64 {
+                                self.conn_ranges
+                                    .read_past_missing_header
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
                             if self.end.is_some_and(|end| stop > end) {
                                 return Err(ReadFailure::Overlong);
                             }
                             let added = self.ranges.insert(start, stop)?;
-                            if !self.conn_ranges.add(added) {
+                            if !self.conn_ranges.add(added, now) {
                                 return Err(ReadFailure::TooManyRanges);
                             }
                             Ok(Some((start, chunk.bytes)))
@@ -475,9 +485,7 @@ impl<T: TimeSource> BodyReader<T> {
                 () = &mut self.timer => {
                     let now = self.time.now_nanos();
                     // Idle first, as the UDP sweep does.
-                    if !self.idle_paused
-                        && now >= self.last_progress.saturating_add(self.idle_nanos)
-                    {
+                    if now >= self.last_progress.saturating_add(self.idle_nanos) {
                         return Err(ReadFailure::Idle);
                     }
                     if now >= self.age_deadline {
@@ -488,12 +496,6 @@ impl<T: TimeSource> BodyReader<T> {
                 }
             }
         }
-    }
-
-    /// Take out every staged piece, in offset order: the payload phase takes
-    /// over from the in-order reads.
-    fn take_staged(&mut self) -> Vec<(u64, Bytes)> {
-        std::mem::take(&mut self.staged).into_iter().collect()
     }
 
     /// Start the age limit, from now. The armed timer is kept when it
@@ -509,43 +511,6 @@ impl<T: TimeSource> BodyReader<T> {
         if self.timer_at > deadline {
             self.timer_at = deadline;
             self.timer = self.time.sleep_until(deadline);
-        }
-    }
-
-    /// The next chunk of at most `max` bytes (at least 1) at the in-order
-    /// position, or `None` at the end of the stream. Pieces that arrive past
-    /// the position are copied and staged until the gap before them fills.
-    async fn next_chunk(&mut self, max: usize) -> Result<Option<Bytes>, ReadFailure> {
-        loop {
-            if let Some(entry) = self.staged.first_entry()
-                && *entry.key() == self.next
-            {
-                let mut piece = entry.remove();
-                if piece.len() > max {
-                    let rest = piece.split_off(max);
-                    self.staged.insert(self.next + max as u64, rest);
-                }
-                self.next += piece.len() as u64;
-                return Ok(Some(piece));
-            }
-            match self.next_unordered().await? {
-                None => return Ok(None),
-                Some((offset, mut bytes)) if offset == self.next => {
-                    if bytes.len() > max {
-                        let rest = Bytes::copy_from_slice(&bytes[max..]);
-                        bytes.truncate(max);
-                        self.staged.insert(self.next + max as u64, rest);
-                    }
-                    self.next += bytes.len() as u64;
-                    return Ok(Some(bytes));
-                }
-                Some((offset, bytes)) => {
-                    #[cfg(test)]
-                    self.conn_ranges.staged.fetch_add(1, Ordering::Relaxed);
-                    // Copied, so the staged bytes do not keep quinn's datagram.
-                    self.staged.insert(offset, Bytes::copy_from_slice(&bytes));
-                }
-            }
         }
     }
 
@@ -627,9 +592,10 @@ impl<T: TimeSource> Drop for BodyReader<T> {
         } else {
             // quinn's `Recv::stop` (also run when a `RecvStream` is dropped
             // unfinished) clears the buffered data but keeps `recvd` until
-            // the peer sends FIN or RESET_STREAM, which it may never do, and
-            // nothing tells us when it does. So the gaps stay counted.
-            self.conn_ranges.keep(gaps);
+            // the peer sends FIN or RESET_STREAM, and nothing tells us when it
+            // does: after a stop, `received_reset` returns at once
+            // (`ClosedStream`). See `ConnRanges::keep`.
+            self.conn_ranges.keep(gaps, self.time.now_nanos());
         }
     }
 }
@@ -645,6 +611,23 @@ impl<T: TimeSource> Drop for BodyReader<T> {
 pub(in crate::transport::quic) const MAX_GAPS_PER_CONNECTION: usize =
     (super::super::config::MAX_WINDOW_BYTES / 1024) as usize;
 
+/// How long a stopped stream's gaps stay counted before up to
+/// [`KEPT_GAPS_RELEASED`] of them leave the count. A peer running quinn resets
+/// a stream when it is stopped (STOP_SENDING), within a round trip, which
+/// frees quinn's state for it; we cannot observe that.
+const KEPT_GAPS_GRACE: Duration = Duration::from_secs(30);
+
+/// Gaps of one stopped stream that leave the count after
+/// [`KEPT_GAPS_GRACE`]; any more stay counted for the connection's life.
+/// A peer that never resets a stopped stream keeps quinn's state for it, but
+/// also loses that stream's slot for good (quinn returns a slot only once the
+/// stream is finished or reset), so at most `MAX_UNI_STREAMS` (64) such
+/// streams exist over a connection's life: what is released but may still be
+/// held is at most 64 x 32 gaps x ~70 B, about 143 KB. Honest loss on one
+/// stream leaves far fewer than 32 gaps, so an honest connection's count
+/// does not drift toward the cap.
+const KEPT_GAPS_RELEASED: usize = 32;
+
 /// A connection's count of gaps over its streams, against
 /// [`MAX_GAPS_PER_CONNECTION`].
 #[derive(Debug)]
@@ -653,7 +636,9 @@ pub(in crate::transport::quic) struct ConnRanges {
     cap: usize,
     /// Times a stream went past the cap.
     trips: AtomicUsize,
-    /// Gaps kept for stopped streams. Tests only.
+    /// Releases due for stopped streams' gaps: (time, gaps), in time order.
+    releases: parking_lot::Mutex<VecDeque<(u64, usize)>>,
+    /// Gaps of stopped streams counted now. Tests only.
     #[cfg(test)]
     kept: AtomicUsize,
     /// The most held at once. Tests only.
@@ -664,10 +649,10 @@ pub(in crate::transport::quic) struct ConnRanges {
     /// state tests look at. Tests only.
     #[cfg(test)]
     pub(in crate::transport::quic) ended_before_announce: AtomicUsize,
-    /// Pieces that arrived ahead of the in-order position while a header,
-    /// metadata or body was assembled, and were staged. Tests only.
+    /// Chunks read past the header before the header was known, which must
+    /// not happen: nothing bounds them before the header. Tests only.
     #[cfg(test)]
-    pub(in crate::transport::quic) staged: AtomicUsize,
+    pub(in crate::transport::quic) read_past_missing_header: AtomicUsize,
 }
 
 impl ConnRanges {
@@ -676,6 +661,7 @@ impl ConnRanges {
             held: AtomicUsize::new(0),
             cap,
             trips: AtomicUsize::new(0),
+            releases: parking_lot::Mutex::new(VecDeque::new()),
             #[cfg(test)]
             kept: AtomicUsize::new(0),
             #[cfg(test)]
@@ -683,50 +669,84 @@ impl ConnRanges {
             #[cfg(test)]
             ended_before_announce: AtomicUsize::new(0),
             #[cfg(test)]
-            staged: AtomicUsize::new(0),
+            read_past_missing_header: AtomicUsize::new(0),
         }
     }
 
     /// A stream went past the cap; true if one had before. The first trip
-    /// stops the stream; a second closes the path, since the gaps of stopped
-    /// streams never leave the count and an honest peer does not reach the
-    /// cap once.
+    /// stops the stream; a second closes the path. An honest peer does not
+    /// reach the cap once.
     fn trip(&self) -> bool {
         self.trips.fetch_add(1, Ordering::Relaxed) > 0
     }
 
-    /// A stream's reader ended with `gaps` that quinn may still hold: they
-    /// stay in the count for the connection's life.
-    fn keep(&self, gaps: usize) {
+    /// A stream's reader ended, stopped, with `gaps` that quinn may still
+    /// hold: they stay in the count, and up to [`KEPT_GAPS_RELEASED`] of them
+    /// leave it after [`KEPT_GAPS_GRACE`].
+    fn keep(&self, gaps: usize, now: u64) {
+        self.release_due(now);
+        if gaps == 0 {
+            return;
+        }
         #[cfg(test)]
         self.kept.fetch_add(gaps, Ordering::Relaxed);
-        let _ = gaps;
+        let due = now.saturating_add(nanos(KEPT_GAPS_GRACE));
+        self.releases
+            .lock()
+            .push_back((due, gaps.min(KEPT_GAPS_RELEASED)));
     }
 
-    /// Gaps kept for stopped streams. Tests only.
+    /// Take out of the count the releases that are due by `now`.
+    fn release_due(&self, now: u64) {
+        let mut releases = self.releases.lock();
+        while let Some(&(due, gaps)) = releases.front() {
+            if due > now {
+                break;
+            }
+            releases.pop_front();
+            self.remove(gaps);
+            #[cfg(test)]
+            self.kept.fetch_sub(gaps, Ordering::Relaxed);
+        }
+    }
+
+    /// Gaps of stopped streams counted now. Tests only.
     #[cfg(test)]
     pub(in crate::transport::quic) fn kept(&self) -> usize {
         self.kept.load(Ordering::Relaxed)
     }
 
-    /// Change the count by `delta`; false if a new gap took it past the
-    /// cap. A change that adds no gap never fails, even while kept gaps hold
-    /// the count past the cap.
-    fn add(&self, delta: isize) -> bool {
-        let held = if delta >= 0 {
-            self.held.fetch_add(delta.unsigned_abs(), Ordering::Relaxed) + delta.unsigned_abs()
-        } else {
-            self.held
-                .fetch_sub(delta.unsigned_abs(), Ordering::Relaxed)
-                .saturating_sub(delta.unsigned_abs())
-        };
+    /// Change the count by `delta` at `now`; false if a new gap took it past
+    /// the cap. A change that adds no gap never fails, even while kept gaps
+    /// hold the count past the cap.
+    fn add(&self, delta: isize, now: u64) -> bool {
+        self.release_due(now);
+        let held = self.change(delta);
         #[cfg(test)]
         self.peak.fetch_max(held, Ordering::Relaxed);
         held <= self.cap || delta <= 0
     }
 
-    fn remove(&self, ranges: usize) {
-        self.held.fetch_sub(ranges, Ordering::Relaxed);
+    fn remove(&self, gaps: usize) {
+        self.change(-(gaps as isize));
+    }
+
+    /// Change the count by `delta`, saturating at zero; the new count.
+    fn change(&self, delta: isize) -> usize {
+        let apply = |held: usize| {
+            if delta >= 0 {
+                held.saturating_add(delta.unsigned_abs())
+            } else {
+                held.saturating_sub(delta.unsigned_abs())
+            }
+        };
+        let before = self
+            .held
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
+                Some(apply(held))
+            })
+            .unwrap_or_else(|held| held);
+        apply(before)
     }
 
     /// The most gaps held at once. Tests only.
@@ -1365,37 +1385,28 @@ impl<T: TimeSource> Receiver<T> {
         };
         let payload_start = (HEADER_LEN as u64) + u64::from(header.metadata_len());
         let mut rechunker = Rechunker::new(total);
-        // Payload pieces that arrived before the metadata was complete.
-        for (offset, piece) in reader.take_staged() {
-            if !self.feed(
-                &mut reader,
-                &mut rechunker,
-                guard.handle(),
-                offset - payload_start,
-                &piece,
-            ) {
-                return;
-            }
-        }
         // Wait for room rather than refuse: a small stream can be fully
         // acknowledged before this point, and a refusal would then read as
         // `Sent` at the sender. Only this reader waits (see `read_short`). The
         // payload keeps being read meanwhile, into the charged buffer, so quinn
         // holds none of it for our wait and the peer's credit is not held by
-        // our consumer; idleness is not judged while we are the one waiting.
+        // our consumer. Idleness is judged while payload is still missing (the
+        // peer is the one being waited on); once it is all here, only the age
+        // limit applies.
         let permit = match self.streams.try_reserve() {
             Ok(permit) => permit,
             Err(mpsc::error::TrySendError::Full(())) => {
                 let waiting =
                     WaitingGuard::new(&self.stats, QuicInboundOutcome::StreamAbandonedWaiting);
-                reader.pause_idle();
                 let mut reserve = std::pin::pin!(self.streams.reserve());
                 let waited = loop {
                     // The end is not read before the announce: reading it
                     // frees quinn's slot for the stream, and the slots are
                     // what bound how many readers can be waiting here (the
                     // stream limit, not `MAX_INBOUND_STREAMS_PER_CONNECTION`).
-                    if reader.finished || reader.all_read() {
+                    // A stream that ends short fails at once (below), so no
+                    // waiting reader has read its end.
+                    if reader.all_read() {
                         break reader.until_age(&mut reserve).await;
                     }
                     enum Next<P> {
@@ -1420,12 +1431,16 @@ impl<T: TimeSource> Receiver<T> {
                                 return;
                             }
                         }
-                        Next::Piece(Ok(None)) => {}
+                        // The end before the declared length.
+                        Next::Piece(Ok(None)) => {
+                            break Err(ReadFailure::Truncated(
+                                guard.handle().received_bytes() as usize
+                            ));
+                        }
                         Next::Piece(Err(failure)) => break Err(failure),
                     }
                 };
                 waiting.disarm();
-                reader.resume_idle();
                 match waited {
                     Ok(Ok(permit)) => permit,
                     Ok(Err(_)) => {
@@ -1782,24 +1797,45 @@ mod tests {
     }
 
     /// The connection's count is checked against its cap as gaps come and
-    /// go, what a finished stream held goes back, what a stopped one held
-    /// stays, and only a second trip past the cap asks for the close.
+    /// go, what a finished stream held goes back, and only a second trip past
+    /// the cap asks for the close.
     #[test]
     fn the_connection_gap_count_has_a_cap() {
         let conn = ConnRanges::new(3);
-        assert!(conn.add(2));
-        assert!(conn.add(1));
-        assert!(!conn.add(1), "past the cap");
+        assert!(conn.add(2, 0));
+        assert!(conn.add(1, 0));
+        assert!(!conn.add(1, 0), "past the cap");
         assert!(!conn.trip(), "the first trip stops the stream only");
-        assert!(conn.add(0), "no new gap, so no trip, while past the cap");
-        assert!(conn.add(-2));
+        assert!(conn.add(0, 0), "no new gap, so no trip, while past the cap");
+        assert!(conn.add(-2, 0));
         assert_eq!(conn.held(), 2);
         conn.remove(1);
         assert_eq!(conn.held(), 1);
-        conn.keep(1);
-        assert_eq!(conn.held(), 1, "a stopped stream's gaps stay counted");
-        assert_eq!(conn.kept(), 1);
+        conn.remove(5);
+        assert_eq!(conn.held(), 0, "the count saturates at zero");
         assert!(conn.trip(), "the second trip closes");
+    }
+
+    /// A stopped stream's gaps stay counted through the grace period; then up
+    /// to `KEPT_GAPS_RELEASED` of them leave the count, and the rest stay.
+    #[test]
+    fn a_stopped_streams_gaps_are_released_after_the_grace_period() {
+        let conn = ConnRanges::new(1000);
+        let grace = nanos(KEPT_GAPS_GRACE);
+        assert!(conn.add(5, 0));
+        conn.keep(5, 0);
+        assert!(conn.add(KEPT_GAPS_RELEASED as isize + 10, 10));
+        conn.keep(KEPT_GAPS_RELEASED + 10, 10);
+        assert_eq!(conn.held(), KEPT_GAPS_RELEASED + 15);
+        assert!(conn.add(0, grace - 1));
+        assert_eq!(conn.held(), KEPT_GAPS_RELEASED + 15, "not yet due");
+        assert!(conn.add(0, grace));
+        assert_eq!(conn.held(), KEPT_GAPS_RELEASED + 10, "the first stream's 5");
+        conn.keep(0, grace + 10);
+        assert_eq!(conn.held(), 10, "the second stream's first 32");
+        assert_eq!(conn.kept(), 10);
+        conn.keep(0, u64::MAX);
+        assert_eq!(conn.held(), 10, "past 32 per stream, gaps stay counted");
     }
 
     /// The receive side relies on quinn-proto 0.11.17 or later within 0.11:
@@ -1809,17 +1845,7 @@ mod tests {
     /// (`assembler.rs`) before it is taken.
     #[test]
     fn quinn_proto_is_one_whose_assembler_this_reader_was_written_for() {
-        let lock =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.lock"))
-                .expect("read Cargo.lock");
-        let marker = "name = \"quinn-proto\"\nversion = \"";
-        let versions: Vec<&str> = lock
-            .match_indices(marker)
-            .map(|(at, _)| {
-                let rest = &lock[at + marker.len()..];
-                &rest[..rest.find('"').expect("a quoted version")]
-            })
-            .collect();
+        let versions = super::super::super::tests::locked_versions("quinn-proto");
         assert_eq!(
             versions.len(),
             1,

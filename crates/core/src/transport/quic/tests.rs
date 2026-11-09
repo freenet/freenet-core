@@ -415,6 +415,19 @@ pub(super) fn payload(len: usize) -> Vec<u8> {
 
 pub(super) const MIB: usize = 1024 * 1024;
 
+/// The versions `Cargo.lock` locks for the package `name`. Line endings are
+/// normalised, so a checkout with CRLF endings reads the same.
+pub(super) fn locked_versions(name: &str) -> Vec<String> {
+    let lock = include_str!("../../../../../Cargo.lock").replace("\r\n", "\n");
+    let header = format!("[[package]]\nname = \"{name}\"\nversion = \"");
+    lock.match_indices(&header)
+        .map(|(at, _)| {
+            let rest = &lock[at + header.len()..];
+            rest[..rest.find('"').expect("closing quote")].to_owned()
+        })
+        .collect()
+}
+
 /// Two endpoints on the simulated network complete a TLS 1.3 handshake
 /// with Ed25519 raw public keys and move 1 MiB on a unidirectional stream,
 /// on virtual time. Each side sees the other's key, the fixed ALPN, and no

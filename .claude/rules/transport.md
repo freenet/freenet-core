@@ -1941,24 +1941,32 @@ Receiving: one task per connection reads every stream (FuturesUnordered,
   close code DOWNGRADE (the peer falls back to UDP). Short
   and Control go to bounded channels (full: dropped and counted); Stream
   goes through the INBOUND ADAPTER (path/inbound.rs).
-Unordered reads: every inbound stream is read with read_chunk(_, false) from
-  its first byte, so quinn's assembler hands over each piece as it arrives,
-  gap or not, and holds none of a stream's bytes behind a gap. Header,
-  metadata, short and control bodies are assembled in order from the pieces
-  (early pieces copied and staged; unique bytes, so bounded by the
-  connection's credit); a Stream's payload is written at its offset into the
-  charged buffer (the Rechunker stages a fragment until it is whole and holds
-  the last one to complete until the stream's end). A gap costs one received
-  range (quinn's recvd set and our mirror, ~70 B); gaps are counted per stream
-  as ranges past the first, and a connection's streams may hold at most
-  inbound::MAX_GAPS_PER_CONNECTION (2,048), past which the stream is stopped
-  EVICTED and counted too_many_ranges. quinn keeps a stopped stream's recvd
-  until the peer sends FIN or RESET (it may never), so the gaps of a stream
-  whose end or reset we did not read stay counted for the connection's life;
-  a second trip past the cap closes the path with DOWNGRADE
-  (closed_too_many_ranges). A Stream waiting for room in the delivery channel
-  reads its payload but NOT its end until it is announced: reading the end
-  frees quinn's slot, and the slots bound how many streams can wait. A byte past the
+Unordered reads: the header, the metadata, and short and control bodies are
+  read IN ORDER (read_chunk(_, true)): quinn holds what arrives past a gap
+  without returning credit for it, so the connection window bounds it. A
+  Stream's payload, once charged, is read with read_chunk(_, false), so
+  quinn hands over each piece as it arrives, gap or not, and it is written at
+  its offset into the charged buffer (the Rechunker stages a fragment until it
+  is whole and holds the one that completes the stream until its end).
+  → NEVER read unordered before the header is known: an unordered read
+    returns the peer's credit for every byte read, so bytes read past a
+    missing header have no bound but the age limit.
+  A gap costs one received range (quinn's recvd set and our mirror, ~70 B);
+  gaps are counted per stream as ranges past the first, and a connection's
+  streams may hold at most inbound::MAX_GAPS_PER_CONNECTION (2,048), past
+  which the stream is stopped EVICTED and counted too_many_ranges. quinn
+  keeps a stopped stream's recvd until the peer sends FIN or RESET, and after
+  a stop nothing tells us when (received_reset returns at once), so a stopped
+  stream's gaps stay counted; after KEPT_GAPS_GRACE (30 s) up to 32 of them
+  per stream leave the count (a quinn peer resets a stopped stream within a
+  round trip; one that never does loses that stream's slot for good, so at
+  most 64 such streams). A second trip past the cap closes the path with
+  DOWNGRADE (closed_too_many_ranges). A Stream waiting for room in the
+  delivery channel reads its payload but NOT its end until it is announced
+  (reading the end frees quinn's slot, and the slots bound how many streams
+  can wait); one that ends short fails Truncated at once. While it waits it
+  is evicted idle if its payload stops arriving; once the payload is all
+  here only the age limit applies. A byte past the
   declared end is Overlong as soon as it arrives, so an overlong stream can
   fail before it is announced. GRO stays off (QuicSocket::max_receive_segments
   is 1, pinned): with GRO a 1-byte chunk would keep a whole batch. quinn-proto
@@ -2281,8 +2289,10 @@ QUIC receive flow (#5940 e5b-4):
   Full channels: a Short or Stream whose channel is full waits in its own reader
   future (reserve, raced with the stream's age limit) and is stopped EVICTED past
   it; Control is still dropped and counted. A waiting Stream keeps reading its
-  payload into its charged buffer (idleness is not judged meanwhile), so the
-  wait does not hold the sender's flow-control credit. A Short waits BEFORE its end is read
+  payload into its charged buffer (evicted idle if the payload stops
+  arriving; once it is all here only the age limit applies), so the wait does
+  not hold the sender's flow-control credit; its end stays unread until it is
+  announced. A Short waits BEFORE its end is read
   (reading the end frees the stream and returns its credit), so waiters are
   capped by MAX_UNI_STREAMS. A Short of one packet or less
   (fits_one_packet) is not charged, as on UDP, and is bounded by that cap and

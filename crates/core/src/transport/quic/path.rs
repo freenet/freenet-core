@@ -978,13 +978,19 @@ impl QuicPath {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Pieces the receive side staged because they arrived ahead of the
-    /// header or metadata being assembled. Tests only.
+    /// Chunks the receive side read past a header it did not have yet,
+    /// which must not happen. Tests only.
     #[cfg(test)]
-    pub(in crate::transport) fn inbound_staged(&self) -> usize {
+    pub(in crate::transport) fn inbound_read_past_missing_header(&self) -> usize {
         self.inbound_ranges
-            .staged
+            .read_past_missing_header
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Gaps the receive side counts now. Tests only.
+    #[cfg(test)]
+    pub(in crate::transport) fn inbound_gaps_held(&self) -> usize {
+        self.inbound_ranges.held()
     }
 
     /// Gaps of stopped streams the receive side keeps counted. Tests only.
