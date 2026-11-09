@@ -35,7 +35,7 @@ use freenet::transport::quic_lab::set_connection_gap;
 use freenet::transport::quic_lab::{
     Competitor, ConnSample, FRAGMENT_BYTES, LabConfig, LabController, LabMany, LabPair, LabSocket,
     LinkSpec, StreamsRun, link_counts, link_report, set_controller, set_gap_on_connection_progress,
-    set_initial_window, set_min_window, set_mtu, set_piece_bytes, set_rate_start, set_send_window,
+    set_gate, set_initial_window, set_min_window, set_mtu, set_piece_bytes, set_rate_start, set_send_window,
     shape_port,
 };
 use freenet::transport::{TRANSPORT_METRICS, TransportKeypair, create_connection_handler};
@@ -317,7 +317,20 @@ fn apply_start_knobs() -> String {
     set_mtu((mtu > 0).then_some(mtu));
     let piece: usize = env_or("LAB_PIECE_BYTES", 0);
     set_piece_bytes((piece > 0).then_some(piece));
-    format!("iw_pkts={iw} rate_start_kbps={rate} mtu={mtu} piece_bytes={piece}")
+    let jitter: u64 = env_or("LAB_JITTER_MS", 0);
+    freenet::transport::quic_lab::JITTER_US
+        .store(jitter * 1000, std::sync::atomic::Ordering::Relaxed);
+    let gate = (
+        env_or("LAB_GATE_DELAY_PERMILLE", 100u64),
+        env_or("LAB_GATE_MIN_DELAY_US", 2000u64),
+        env_or("LAB_GATE_LOSS_CEIL_PERMILLE", 200u64),
+    );
+    set_gate(gate.0, gate.1, gate.2);
+    format!(
+        "iw_pkts={iw} rate_start_kbps={rate} mtu={mtu} piece_bytes={piece} gate={}/{}/{} \
+         jitter_ms={jitter}",
+        gate.0, gate.1, gate.2
+    )
 }
 
 /// A UDP-transport pair on loopback: send a message with `send`, read each
@@ -642,6 +655,8 @@ fn quic_lab_loss() {
         "cubic" => LabController::Cubic,
         "bbr" => LabController::Bbr,
         "veno" => LabController::Veno,
+        "westwood" => LabController::Westwood,
+        "gated" => LabController::Gated,
         other => panic!("unknown controller {other}"),
     });
     let knobs = apply_start_knobs();
@@ -966,6 +981,8 @@ fn quic_lab_many() {
         "cubic" => LabController::Cubic,
         "bbr" => LabController::Bbr,
         "veno" => LabController::Veno,
+        "westwood" => LabController::Westwood,
+        "gated" => LabController::Gated,
         other => panic!("unknown controller {other}"),
     });
     let knobs = apply_start_knobs();
@@ -1200,6 +1217,8 @@ fn quic_lab_mix() {
         "cubic" => LabController::Cubic,
         "bbr" => LabController::Bbr,
         "veno" => LabController::Veno,
+        "westwood" => LabController::Westwood,
+        "gated" => LabController::Gated,
         other => panic!("unknown controller {other}"),
     });
     let gap_rule = std::env::var("LAB_GAP").unwrap_or_else(|_| "stream".into());
@@ -1392,6 +1411,8 @@ fn quic_lab_cold() {
         "cubic" => LabController::Cubic,
         "bbr" => LabController::Bbr,
         "veno" => LabController::Veno,
+        "westwood" => LabController::Westwood,
+        "gated" => LabController::Gated,
         other => panic!("unknown controller {other}"),
     });
     let knobs = apply_start_knobs();
@@ -1555,6 +1576,15 @@ fn quic_lab_burst() {
     let warm = Duration::from_secs(env_or("LAB_WARM_S", 20));
     let measure = Duration::from_secs(env_or("LAB_MEASURE_S", 5));
     let limit = Duration::from_secs(env_or("LAB_LIMIT_S", 120));
+    let controller = std::env::var("LAB_CONTROLLER").unwrap_or_else(|_| "cubic".into());
+    set_controller(match controller.as_str() {
+        "cubic" => LabController::Cubic,
+        "bbr" => LabController::Bbr,
+        "veno" => LabController::Veno,
+        "westwood" => LabController::Westwood,
+        "gated" => LabController::Gated,
+        other => panic!("unknown controller {other}"),
+    });
     let knobs = apply_start_knobs();
     for rep in 0..reps {
         let link = LinkSpec {
@@ -1677,7 +1707,7 @@ fn quic_lab_burst() {
         });
         rt.shutdown_timeout(Duration::from_secs(1));
         println!(
-            "LAB_BURST transport={transport} {knobs} conns={conns} stream_kib={} \
+            "LAB_BURST transport={transport} controller={controller} {knobs} conns={conns} stream_kib={} \
              rate_mbit={rate_mbit} delay_ms={delay_ms} queue_kib={queue_kib} loss={loss} rep={rep} {line}",
             stream_bytes / 1024,
         );

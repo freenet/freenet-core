@@ -280,6 +280,29 @@ impl ControllerFactory for CappedCubicFactory {
             ));
         }
         #[cfg(feature = "bench")]
+        match lab::INNER_CONTROLLER.load(Ordering::Relaxed) {
+            lab::WESTWOOD => {
+                return Box::new(CappedCubic::new(
+                    Box::new(lab::Westwood::new(
+                        this.cubic.clone().build(now, current_mtu),
+                        current_mtu,
+                    )),
+                    this.rate.clone(),
+                    current_mtu,
+                ));
+            }
+            lab::GATED => {
+                return Box::new(CappedCubic::new(
+                    Box::new(lab::DelayGated::new(
+                        this.cubic.clone().build(now, current_mtu),
+                    )),
+                    this.rate.clone(),
+                    current_mtu,
+                ));
+            }
+            _ => {}
+        }
+        #[cfg(feature = "bench")]
         if lab::INNER_CONTROLLER.load(Ordering::Relaxed) == lab::BBR {
             return Box::new(CappedCubic::new(
                 {
@@ -316,6 +339,318 @@ pub(crate) mod lab {
     pub(crate) const BBR: u8 = 1;
     /// Cubic inside [`VenoCubic`].
     pub(crate) const VENO: u8 = 2;
+    /// Cubic inside [`Westwood`].
+    pub(crate) const WESTWOOD: u8 = 3;
+    /// Cubic inside [`DelayGated`].
+    pub(crate) const GATED: u8 = 4;
+
+    /// [`DelayGated`]: a loss is taken as congestion when the smoothed RTT is
+    /// at least this many thousandths of the minimum RTT above it...
+    pub(crate) static GATE_DELAY_PERMILLE: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(100);
+    /// ...or at least this many microseconds above it...
+    pub(crate) static GATE_MIN_DELAY_US: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(2_000);
+    /// ...or when the share of bytes lost over the last round trip is at
+    /// least this many thousandths.
+    pub(crate) static GATE_LOSS_CEIL_PERMILLE: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(200);
+
+    /// Lab prototype: Cubic that ignores a loss when no queue is building.
+    ///
+    /// A drop-tail bottleneck drops when its queue is full, so a congestion
+    /// loss comes with the RTT above its minimum by the queue's delay. A
+    /// random loss comes with no queue. So a loss is passed to Cubic only when
+    /// the smoothed RTT is above the minimum by [`GATE_DELAY_PERMILLE`] of it
+    /// or [`GATE_MIN_DELAY_US`], or when the round's loss share is at least
+    /// [`GATE_LOSS_CEIL_PERMILLE`] (a policer, or a path too lossy to push).
+    /// Persistent congestion is always passed.
+    pub(crate) struct DelayGated {
+        inner: Box<dyn Controller>,
+        min_rtt: Option<Duration>,
+        srtt: Option<Duration>,
+        round_start: Option<Instant>,
+        round_acked: u64,
+        round_lost: u64,
+        last_round_share: f64,
+        /// Losses passed to Cubic and ignored, for the lab's reports.
+        pub(crate) passed: u64,
+        pub(crate) ignored: u64,
+    }
+
+    impl DelayGated {
+        pub(crate) fn new(inner: Box<dyn Controller>) -> Self {
+            Self {
+                inner,
+                min_rtt: None,
+                srtt: None,
+                round_start: None,
+                round_acked: 0,
+                round_lost: 0,
+                last_round_share: 0.0,
+                passed: 0,
+                ignored: 0,
+            }
+        }
+
+        fn roll(&mut self, now: Instant) {
+            let round = self.srtt.unwrap_or(Duration::from_millis(100));
+            match self.round_start {
+                Some(start) if now.saturating_duration_since(start) < round => {}
+                _ => {
+                    let total = self.round_acked + self.round_lost;
+                    if total > 0 {
+                        self.last_round_share = self.round_lost as f64 / total as f64;
+                    }
+                    self.round_start = Some(now);
+                    self.round_acked = 0;
+                    self.round_lost = 0;
+                }
+            }
+        }
+
+        fn congested(&self) -> bool {
+            let share = {
+                let total = self.round_acked + self.round_lost;
+                let now_share = if total > 0 {
+                    self.round_lost as f64 / total as f64
+                } else {
+                    0.0
+                };
+                now_share.max(self.last_round_share)
+            };
+            if share * 1000.0 >= GATE_LOSS_CEIL_PERMILLE.load(std::sync::atomic::Ordering::Relaxed) as f64 {
+                return true;
+            }
+            let (Some(srtt), Some(min)) = (self.srtt, self.min_rtt) else {
+                return true;
+            };
+            let queue = srtt.saturating_sub(min);
+            let rel = min.mul_f64(GATE_DELAY_PERMILLE.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0);
+            let abs = Duration::from_micros(GATE_MIN_DELAY_US.load(std::sync::atomic::Ordering::Relaxed));
+            queue >= rel.max(abs)
+        }
+    }
+
+    impl Controller for DelayGated {
+        fn on_sent(&mut self, now: Instant, bytes: u64, last_packet_number: u64) {
+            self.inner.on_sent(now, bytes, last_packet_number);
+        }
+
+        fn on_ack(
+            &mut self,
+            now: Instant,
+            sent: Instant,
+            bytes: u64,
+            app_limited: bool,
+            rtt: &quinn_proto::RttEstimator,
+        ) {
+            let sample = now.saturating_duration_since(sent);
+            self.min_rtt = Some(self.min_rtt.map_or(sample, |m| m.min(sample)));
+            self.srtt = Some(rtt.get());
+            self.roll(now);
+            self.round_acked += bytes;
+            self.inner.on_ack(now, sent, bytes, app_limited, rtt);
+        }
+
+        fn on_end_acks(
+            &mut self,
+            now: Instant,
+            in_flight: u64,
+            app_limited: bool,
+            largest_packet_num_acked: Option<u64>,
+        ) {
+            self.inner
+                .on_end_acks(now, in_flight, app_limited, largest_packet_num_acked);
+        }
+
+        fn on_congestion_event(
+            &mut self,
+            now: Instant,
+            sent: Instant,
+            is_persistent_congestion: bool,
+            lost_bytes: u64,
+        ) {
+            self.roll(now);
+            self.round_lost += lost_bytes;
+            if is_persistent_congestion || self.congested() {
+                self.passed += 1;
+                self.inner
+                    .on_congestion_event(now, sent, is_persistent_congestion, lost_bytes);
+            } else {
+                self.ignored += 1;
+            }
+        }
+
+        fn on_mtu_update(&mut self, new_mtu: u16) {
+            self.inner.on_mtu_update(new_mtu);
+        }
+
+        fn window(&self) -> u64 {
+            self.inner.window()
+        }
+
+        fn metrics(&self) -> ControllerMetrics {
+            self.inner.metrics()
+        }
+
+        fn clone_box(&self) -> Box<dyn Controller> {
+            Box::new(Self {
+                inner: self.inner.clone_box(),
+                min_rtt: self.min_rtt,
+                srtt: self.srtt,
+                round_start: self.round_start,
+                round_acked: self.round_acked,
+                round_lost: self.round_lost,
+                last_round_share: self.last_round_share,
+                passed: self.passed,
+                ignored: self.ignored,
+            })
+        }
+
+        fn initial_window(&self) -> u64 {
+            self.inner.initial_window()
+        }
+
+        fn into_any(self: Box<Self>) -> Box<dyn Any> {
+            self
+        }
+    }
+
+    /// Lab prototype: Cubic with a Westwood+ floor. A bandwidth estimate is
+    /// kept from the acknowledged bytes (one sample per round trip, filtered
+    /// 7/8 old, 1/8 new); at a congestion event Cubic backs off as usual, but
+    /// the window is held at no less than estimate x minimum RTT until the
+    /// next event. Under random loss the estimate is the path's delivery, so
+    /// the window stays near what the path carries instead of collapsing;
+    /// under congestion the estimate is the bottleneck's share and estimate x
+    /// minimum RTT drains the queue.
+    pub(crate) struct Westwood {
+        inner: Box<dyn Controller>,
+        mtu: u16,
+        min_rtt: Option<Duration>,
+        srtt: Option<Duration>,
+        sample_start: Option<Instant>,
+        sample_bytes: u64,
+        bwe: f64,
+        floor: u64,
+    }
+
+    impl Westwood {
+        pub(crate) fn new(inner: Box<dyn Controller>, mtu: u16) -> Self {
+            Self {
+                inner,
+                mtu,
+                min_rtt: None,
+                srtt: None,
+                sample_start: None,
+                sample_bytes: 0,
+                bwe: 0.0,
+                floor: 0,
+            }
+        }
+    }
+
+    impl Controller for Westwood {
+        fn on_sent(&mut self, now: Instant, bytes: u64, last_packet_number: u64) {
+            self.inner.on_sent(now, bytes, last_packet_number);
+        }
+
+        fn on_ack(
+            &mut self,
+            now: Instant,
+            sent: Instant,
+            bytes: u64,
+            app_limited: bool,
+            rtt: &quinn_proto::RttEstimator,
+        ) {
+            let sample = now.saturating_duration_since(sent);
+            self.min_rtt = Some(self.min_rtt.map_or(sample, |m| m.min(sample)));
+            self.srtt = Some(rtt.get());
+            let start = *self.sample_start.get_or_insert(now);
+            self.sample_bytes += bytes;
+            let span = now.saturating_duration_since(start);
+            let round = self.srtt.unwrap_or(sample).max(Duration::from_millis(10));
+            if span >= round && !app_limited {
+                let rate = self.sample_bytes as f64 / span.as_secs_f64();
+                self.bwe = if self.bwe == 0.0 {
+                    rate
+                } else {
+                    0.875 * self.bwe + 0.125 * rate
+                };
+                self.sample_start = Some(now);
+                self.sample_bytes = 0;
+            } else if span >= round {
+                self.sample_start = Some(now);
+                self.sample_bytes = 0;
+            }
+            self.inner.on_ack(now, sent, bytes, app_limited, rtt);
+        }
+
+        fn on_end_acks(
+            &mut self,
+            now: Instant,
+            in_flight: u64,
+            app_limited: bool,
+            largest_packet_num_acked: Option<u64>,
+        ) {
+            self.inner
+                .on_end_acks(now, in_flight, app_limited, largest_packet_num_acked);
+        }
+
+        fn on_congestion_event(
+            &mut self,
+            now: Instant,
+            sent: Instant,
+            is_persistent_congestion: bool,
+            lost_bytes: u64,
+        ) {
+            self.inner
+                .on_congestion_event(now, sent, is_persistent_congestion, lost_bytes);
+            self.floor = match (is_persistent_congestion, self.min_rtt) {
+                (false, Some(min)) if self.bwe > 0.0 => {
+                    ((self.bwe * min.as_secs_f64()) as u64).max(4 * u64::from(self.mtu))
+                }
+                _ => 0,
+            };
+        }
+
+        fn on_mtu_update(&mut self, new_mtu: u16) {
+            self.mtu = new_mtu;
+            self.inner.on_mtu_update(new_mtu);
+        }
+
+        fn window(&self) -> u64 {
+            self.inner.window().max(self.floor)
+        }
+
+        fn metrics(&self) -> ControllerMetrics {
+            let mut metrics = self.inner.metrics();
+            metrics.congestion_window = self.window();
+            metrics
+        }
+
+        fn clone_box(&self) -> Box<dyn Controller> {
+            Box::new(Self {
+                inner: self.inner.clone_box(),
+                mtu: self.mtu,
+                min_rtt: self.min_rtt,
+                srtt: self.srtt,
+                sample_start: self.sample_start,
+                sample_bytes: self.sample_bytes,
+                bwe: self.bwe,
+                floor: self.floor,
+            })
+        }
+
+        fn initial_window(&self) -> u64 {
+            self.inner.initial_window()
+        }
+
+        fn into_any(self: Box<Self>) -> Box<dyn Any> {
+            self
+        }
+    }
 
     use std::any::Any;
     use std::time::{Duration, Instant};

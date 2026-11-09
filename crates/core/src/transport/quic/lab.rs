@@ -63,6 +63,11 @@ pub enum LabController {
     /// Cubic that backs off less on loss with no queue building
     /// (`recycle::lab::VenoCubic`, a lab prototype).
     Veno,
+    /// Cubic with a Westwood+ floor (`recycle::lab::Westwood`).
+    Westwood,
+    /// Cubic that ignores a loss with no queue building
+    /// (`recycle::lab::DelayGated`).
+    Gated,
 }
 
 /// Choose the controller for connections built from now on.
@@ -72,6 +77,8 @@ pub fn set_controller(controller: LabController) {
         LabController::Cubic => lab::CUBIC,
         LabController::Bbr => lab::BBR,
         LabController::Veno => lab::VENO,
+        LabController::Westwood => lab::WESTWOOD,
+        LabController::Gated => lab::GATED,
     };
     lab::INNER_CONTROLLER.store(value, Ordering::Relaxed);
 }
@@ -84,6 +91,16 @@ pub fn set_gap_on_connection_progress(_on: bool) {}
 /// Kept for the older lab scripts; does nothing since #6128 (the node's
 /// own connection window applies).
 pub fn set_connection_gap(_window: Option<Duration>) {}
+
+/// [`LabController::Gated`]'s thresholds: queue delay as thousandths of the
+/// minimum RTT, its floor in microseconds, and the round's loss share in
+/// thousandths above which every loss counts.
+pub fn set_gate(delay_permille: u64, min_delay_us: u64, loss_ceil_permille: u64) {
+    use super::recycle::lab;
+    lab::GATE_DELAY_PERMILLE.store(delay_permille, Ordering::Relaxed);
+    lab::GATE_MIN_DELAY_US.store(min_delay_us, Ordering::Relaxed);
+    lab::GATE_LOSS_CEIL_PERMILLE.store(loss_ceil_permille, Ordering::Relaxed);
+}
 
 /// The datagram size for endpoints built from now on (both ends must agree,
 /// as they do in the lab); `None` for the node's 1200. Discovery stays off.
@@ -178,7 +195,15 @@ struct Shaper {
     /// Queueing delay of each datagram this socket's traffic got through the
     /// bottleneck, in microseconds. The competing flow keeps its own.
     queued_us: parking_lot::Mutex<Vec<u32>>,
+    /// Jitter state: the latest arrival time handed out (arrivals stay in
+    /// order) and a xorshift generator.
+    jitter: parking_lot::Mutex<(u64, u64)>,
 }
+
+/// Extra delay added to each datagram on every shaped link, uniform in
+/// `0..JITTER_US` microseconds, keeping datagrams in order (a later datagram
+/// never arrives before an earlier one). 0 for none.
+pub static JITTER_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The uplink of the shaped socket on `port`: datagrams offered and dropped
 /// at the queue so far, counting everything that shares it (a competing
@@ -442,6 +467,7 @@ impl LabSocket {
             local,
             out,
             queued_us: parking_lot::Mutex::new(Vec::new()),
+            jitter: parking_lot::Mutex::new((0, 0x9E37_79B9_7F4A_7C15 ^ u64::from(local.port()))),
         });
         SHAPERS
             .lock()
@@ -468,10 +494,20 @@ impl LabSocket {
                 arrival.at_nanos,
                 buf.len(),
             ));
-            shaper
-                .out
-                .send((arrival.at_nanos, buf.to_vec(), target))
-                .ok();
+            let jitter_ns = JITTER_US.load(Ordering::Relaxed) * 1000;
+            let at = if jitter_ns == 0 {
+                arrival.at_nanos
+            } else {
+                let mut state = shaper.jitter.lock();
+                let (last, rng) = &mut *state;
+                *rng ^= *rng << 13;
+                *rng ^= *rng >> 7;
+                *rng ^= *rng << 17;
+                let at = (arrival.at_nanos + *rng % jitter_ns).max(*last);
+                *last = at;
+                at
+            };
+            shaper.out.send((at, buf.to_vec(), target)).ok();
         }
         Some(buf.len())
     }
