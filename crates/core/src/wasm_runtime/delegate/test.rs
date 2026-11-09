@@ -6,6 +6,7 @@ use freenet_stdlib::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
 use crate::util::tests::get_temp_dir;
@@ -1758,6 +1759,10 @@ async fn test_store_and_retrieve_secret() -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
+// Unix only: it makes the secrets directory unwritable through its mode bits.
+// Windows ignores the read-only attribute on a directory, so the store would
+// still succeed there.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_set_secret_failure_returns_secret_store_failed()
 -> Result<(), Box<dyn std::error::Error>> {

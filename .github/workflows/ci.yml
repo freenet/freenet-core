@@ -875,10 +875,16 @@ jobs:
   # platform-specific errors that Linux CI misses. Added after #3685 where
   # PRs #3669/#3680 introduced Windows-only code that failed to compile,
   # but wasn't caught until the release cross-compile workflow ran.
+  #
+  # Clippy over all targets, not `cargo check` of the default ones: the
+  # check built no test target, and Linux clippy never sees a
+  # `cfg(windows)` line, so a Windows-only unused import, an undocumented
+  # `unsafe` block or a test that did not compile on Windows passed every
+  # job. By November 2026 about 25 such errors had built up on main.
   windows_check:
     name: Windows Check
     runs-on: windows-latest
-    timeout-minutes: 20
+    timeout-minutes: 40
     if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
 
     steps:
@@ -887,11 +893,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.93.0
+          components: clippy
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Check compilation
-        run: cargo check --locked -p freenet -p fdev
+      - name: Clippy (all targets)
+        run: cargo clippy --locked -p freenet -p fdev --all-targets -- -D warnings
 
   test_unit:
     name: Unit & Integration

@@ -5,7 +5,7 @@
 //! fdev) don't block the installation.
 
 use anyhow::{Context, Result};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use super::detection::get_install_dir;
 use crate::commands::service::DASHBOARD_URL;
@@ -299,6 +299,8 @@ fn broadcast_environment_change() {
         .chain(Some(0))
         .collect();
 
+    // SAFETY: `environment` is a NUL-terminated UTF-16 string that outlives
+    // the call, and the result pointer may be null.
     unsafe {
         winapi::um::winuser::SendMessageTimeoutW(
             winapi::um::winuser::HWND_BROADCAST,

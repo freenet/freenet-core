@@ -205,6 +205,7 @@ pub(super) fn acquire_wrapper_single_instance_lock() -> AcquireWrapperLockOutcom
     if handle.is_null() {
         tracing::warn!(
             "Wrapper lock: CreateMutexW failed (error {}); proceeding without lock",
+            // SAFETY: GetLastError has no preconditions.
             unsafe { winapi::um::errhandlingapi::GetLastError() }
         );
         return AcquireWrapperLockOutcome::UnavailableSoProceed;

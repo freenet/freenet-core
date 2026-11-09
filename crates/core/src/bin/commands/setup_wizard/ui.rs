@@ -51,6 +51,9 @@ mod platform {
     ///
     /// Uses `run_return` instead of `run` so the event loop returns control
     /// to the caller when the dialog closes (tao's `run` calls `process::exit`).
+    // The event loop's `match` ends in a wildcard: tao's `Event` is
+    // non-exhaustive, and the wizard handles only the events it names.
+    #[allow(clippy::wildcard_enum_match_arm)]
     pub fn show_setup_dialog() -> anyhow::Result<SetupResult> {
         let mut event_loop = EventLoopBuilder::<UiEvent>::with_user_event().build();
         let proxy = event_loop.create_proxy();
@@ -81,7 +84,8 @@ mod platform {
         let webview = WebViewBuilder::new_with_web_context(&mut web_context)
             .with_html(SETUP_HTML)
             .with_ipc_handler(move |msg| {
-                let _ = ipc_proxy.send_event(UiEvent::Action(msg.body().to_string()));
+                // Fails only once the event loop has exited.
+                drop(ipc_proxy.send_event(UiEvent::Action(msg.body().to_string())));
             })
             .with_devtools(false)
             .build(&window)
@@ -117,12 +121,12 @@ mod platform {
                         let install_proxy = proxy.clone();
                         let handle = std::thread::spawn(move || {
                             let cb_result = installer::run_install(|progress| {
-                                let _ = install_proxy.send_event(UiEvent::Progress(progress));
+                                drop(install_proxy.send_event(UiEvent::Progress(progress)));
                             });
                             if let Err(e) = cb_result {
-                                let _ = install_proxy.send_event(UiEvent::Progress(
+                                drop(install_proxy.send_event(UiEvent::Progress(
                                     InstallProgress::Error(format!("{e:#}")),
-                                ));
+                                )));
                             }
                         });
                         install_handle = Some(handle);
@@ -148,7 +152,8 @@ mod platform {
                         InstallProgress::DownloadingFdev => {
                             "updateProgress(35, 'Downloading developer tools...')".to_string()
                         }
-                        InstallProgress::FdevSkipped(_) => {
+                        InstallProgress::FdevSkipped(reason) => {
+                            tracing::warn!(%reason, "Developer tools skipped");
                             "updateProgress(42, 'Developer tools skipped')".to_string()
                         }
                         InstallProgress::AddingToPath => {
@@ -172,9 +177,13 @@ mod platform {
                             format!("showError('{escaped}')")
                         }
                     };
-                    let _ = webview.evaluate_script(&js);
+                    if let Err(e) = webview.evaluate_script(&js) {
+                        tracing::debug!(error = %e, "Setup wizard: script evaluation failed");
+                    }
                 }
 
+                // Every other event is ignored (`Event` is non-exhaustive; see
+                // the allow on this function).
                 _ => {}
             }
         });
@@ -182,7 +191,8 @@ mod platform {
         // Drop the webview so WebView2 releases file locks on the data dir
         drop(webview);
         // Clean up the temporary WebView2 data directory
-        let _ = std::fs::remove_dir_all(&webview2_data_dir);
+        // Best-effort: a leftover temporary directory is harmless.
+        drop(std::fs::remove_dir_all(&webview2_data_dir));
 
         Ok(result)
     }
