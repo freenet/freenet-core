@@ -1137,7 +1137,7 @@ fn a_stream_stopped_with_gaps_is_released_after_the_grace_period() {
 }
 
 /// Past the gap cap, the stream that went over it is stopped; its gaps stay
-/// counted, so the next time past the cap closes the path with DOWNGRADE and
+/// counted, so the next time past the cap closes the path with OVER_BUDGET and
 /// the peer falls back to UDP. Here the cap is 2 and every other datagram is
 /// lost, so each stream leaves gaps.
 #[test]
@@ -1184,11 +1184,11 @@ fn a_second_trip_past_the_gap_cap_closes_the_path() {
             ))) => {
                 assert_eq!(
                     close.error_code.into_inner(),
-                    u64::from(super::super::error::close_code::DOWNGRADE),
-                    "closed with DOWNGRADE"
+                    u64::from(super::super::error::close_code::OVER_BUDGET),
+                    "closed with OVER_BUDGET"
                 );
             }
-            other => panic!("expected the path closed with DOWNGRADE, got {other:?}"),
+            other => panic!("expected the path closed with OVER_BUDGET, got {other:?}"),
         }
         let stats = p.b.stats();
         assert_eq!(stats.count(QuicInboundOutcome::TooManyRanges), 2);

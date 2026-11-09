@@ -1136,7 +1136,7 @@ doc has the transition table.
   seed may come off a clock with another epoch. A promotion's first offer waits
   for the later of the seed and its own delay. e5a-5b must carry it per peer key
   across a replaced session, or a session that flaps retries at session rate.
-  Failures: close codes 1, 3, 4, 5 and 6, a lost connection, an idle timeout and a
+  Failures: close codes 1, 3, 4, 5, 6 and 8, a lost connection, an idle timeout and a
   deadline each mean fallback plus normal backoff, then a new offer. Never a
   permanent downgrade. Identity: close code 2 received, or Event::IdentityMismatch
   (closes with IDENTITY_MISMATCH). A TLS failure during the handshake
@@ -1263,7 +1263,7 @@ snapshot except the two gauges.
   offered and declined_uncharged. Both sides count `established`; only the
   offerer's is the numerator. Counts are node-wide; there is no per-pair series.
   `quic_fallback_<label>` (`QuicFallback`): idle, reset, protocol, downgrade_rx,
-  endpoint_down, session_ended_rx. Paths that had been active only; an attempt
+  endpoint_down, session_ended_rx, over_budget_rx. Paths that had been active only; an attempt
   that ends in setup is counted in `quic_upgrade_*`. A close this node sent for
   send_abort_limit or peer_not_acknowledging reaches the machine as a lost
   connection, so it counts as `reset`; its count is `quic_close_sent_*`. A key
@@ -1969,7 +1969,7 @@ Unordered reads: the header, the metadata, and short and control bodies are
   them, so it does not grow with the connection's age; after KEPT_GAPS_GRACE
   (30 s) each counts 32 less (a quinn peer resets a stopped stream within a
   round trip). A second trip past the cap closes the path with
-  DOWNGRADE (closed_too_many_ranges). A Stream waiting for room in the
+  OVER_BUDGET (closed_too_many_ranges). A Stream waiting for room in the
   delivery channel reads its payload but NOT its end until it is announced
   (reading the end frees quinn's slot, and the slots bound how many streams
   can wait); one that ends short fails Truncated at once. While it waits it
@@ -2403,7 +2403,13 @@ Application error codes, one range per QUIC frame type, all one-byte
                 and counts quic_fallback_session_ended_rx, or
                 setup_downgrade_rx in setup; a node without this code reads
                 ConnectionLost: quic_fallback_reset, or
-                quic_upgrade_handshake_failed in setup)
+                quic_upgrade_handshake_failed in setup), 0x07 left to the
+                ramp branch's RECYCLE_FOR_DATA, OVER_BUDGET 8 (the peer held
+                more of this node's QUIC buffer budget than it allows: its
+                gaps past the cap a second time; the peer reads it as
+                Refused{OverBudget}, falls back, charges as for Downgrade and
+                counts quic_fallback_over_budget_rx, or setup_downgrade_rx in
+                setup; a node without this code reads ConnectionLost)
     0x10..=0x1f STOP_SENDING: path::stop_code (receiver refusals;
                 NOT_ACCEPTING_DATA 0x19 is a shadow path refusing data. Data
                 may be sent only after caps negotiation, so it is a counter

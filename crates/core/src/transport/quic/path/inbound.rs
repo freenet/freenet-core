@@ -1236,9 +1236,9 @@ impl<T: TimeSource> Receiver<T> {
             ReadFailure::TooManyRanges => {
                 stats.record(QuicInboundOutcome::TooManyRanges);
                 reader.stop(stop_code::EVICTED);
-                // DOWNGRADE until the budget's own close code exists: the
-                // peer falls back to the UDP session.
-                if self.ranges.trip() && self.closer.close(QuicCloseCode::Downgrade) {
+                // The peer falls back to the UDP session and counts it as
+                // `quic_fallback_over_budget_rx`.
+                if self.ranges.trip() && self.closer.close(QuicCloseCode::OverBudget) {
                     stats.record(QuicInboundOutcome::ClosedTooManyRanges);
                     tracing::warn!(
                         "QUIC path: the peer left more gaps than the connection's cap \
