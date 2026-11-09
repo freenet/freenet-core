@@ -180,6 +180,11 @@ pub(crate) const QUIC_STREAMS_OPEN_THRESHOLDS: [u32; 4] = [8, 16, 32, 48];
 /// The levels `quic_send_resets_reached_<n>` reports, up to
 /// `recycle::SEND_ABORT_LIMIT`: one more reset past the last closes the path.
 pub(crate) const QUIC_SEND_RESET_LEVELS: [u64; 4] = [64, 512, 2048, 4096];
+const _: () = assert!(
+    QUIC_SEND_RESET_LEVELS[QUIC_SEND_RESET_LEVELS.len() - 1]
+        == crate::transport::quic::recycle::SEND_ABORT_LIMIT,
+    "the last level is the reset limit"
+);
 
 /// The streams-open counts of one period, under one lock with its period, as the
 /// connection-level inbound concurrency counts are.
@@ -1147,6 +1152,23 @@ mod tests {
         let after = counters.snapshot(true);
         assert!(!after.has_activity());
         assert!(after.keys().iter().all(|(_, value)| *value == 0));
+    }
+
+    /// The reset and path-time counts are activity on their own, so a period with
+    /// only them is uploaded.
+    #[test]
+    fn resets_or_path_time_alone_are_activity() {
+        let counters = QuicDataCounters::new();
+        counters.record_send_reset(1);
+        assert!(counters.snapshot(true).has_activity(), "a reset");
+        counters.record_path_time(1);
+        assert!(counters.snapshot(true).has_activity(), "path time");
+        let reached = QuicDataSnapshot {
+            send_resets_reached: vec![0, 1, 0, 0],
+            ..QuicDataSnapshot::default()
+        };
+        assert!(reached.has_activity(), "a level reached");
+        assert!(!counters.snapshot(true).has_activity());
     }
 
     /// The snapshot round-trips through bincode, as the event log stores it.

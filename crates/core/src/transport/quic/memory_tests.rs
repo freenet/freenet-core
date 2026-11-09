@@ -7,7 +7,12 @@
 //! measurement runs both endpoints, quinn's drivers and the paths' receive
 //! tasks on the test's current-thread runtime, over `SimulationSocket` on
 //! one `VirtualTime`, with `GlobalRng` seeded, so a run is repeatable. The
-//! stream measurements drive quinn-proto directly, with no runtime at all.
+//! received-data measurements (assembler hold, ACK tail) drive quinn-proto
+//! directly, with no runtime at all. The open-stream and `stopped`-entry
+//! measurements (`StreamRig`) run real endpoints the same way as the
+//! idle-connection one, on the current-thread runtime, and take the
+//! `stopped`-entry figure as the difference of two runs, so the simulated
+//! clock's retained timer-queue capacity cancels out.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -1051,7 +1056,7 @@ fn quic_memory_figures_match_the_locked_versions() {
 }
 
 /// The fixed charge per connection is the sum the buffer-budget design gives
-/// (808 KiB, the `stopped` map at the reset limit's worst case), and the budget
+/// (840 KiB, the `stopped` map at the reset limit's worst case), and the budget
 /// for what scales with the windows is a sixteenth of node memory. A change to
 /// any term moves the first figure, so the design's connection caps are
 /// re-derived with it.
@@ -1062,7 +1067,7 @@ fn the_fixed_charge_and_the_buffer_budget_match_the_design() {
         super::recycle::SEND_ABORT_LIMIT as usize * QUIC_STOPPED_ENTRY_BYTES,
         416 * 1024
     );
-    assert_eq!(QUIC_CONNECTION_CHARGE_BYTES, 827_392);
+    assert_eq!(QUIC_CONNECTION_CHARGE_BYTES, 860_160);
     const MIB: usize = 1024 * 1024;
     assert_eq!(quic_buffer_budget_for(1024 * MIB), 64 * MIB);
     assert_eq!(quic_buffer_budget_for(2048 * MIB), 128 * MIB);

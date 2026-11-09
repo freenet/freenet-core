@@ -1193,6 +1193,11 @@ fn a_second_trip_past_the_gap_cap_closes_the_path() {
         let stats = p.b.stats();
         assert_eq!(stats.count(QuicInboundOutcome::TooManyRanges), 2);
         assert_eq!(stats.count(QuicInboundOutcome::ClosedTooManyRanges), 1);
+        assert_eq!(
+            crate::transport::metrics::TRANSPORT_METRICS.quic_close_sent_to(from),
+            vec![QuicCloseCode::OverBudget],
+            "counted as quic_close_sent_over_budget"
+        );
         assert!(
             p.b.inbound_gaps_kept() >= 2,
             "the first stream's gaps stayed"
