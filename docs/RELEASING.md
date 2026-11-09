@@ -500,7 +500,11 @@ Current wire-gated floors:
   release.yml's validate job then refuses a live cut of that version when the
   clock is more than 3 h from T0 either side (`scripts/check_quic_data_ramp_t0.sh`;
   a dry run only warns). It checks no other version, so both constants stay set
-  afterwards. A node whose
+  afterwards. Because it is keyed on the exact version, cut the ramp release
+  with `--field version=X.Y.Z` set to the value of `QUIC_DATA_RAMP_RELEASE`,
+  not the auto-bump. If the ramp ships under another version, the check passes
+  without checking anything. If that version is already taken, change the
+  constant in the same reviewed PR as T0. A node whose
   clock reads before T0 gets 5%. The soak runs before T0, so it exercises only
   the 5% share. That PR also updates the expectation that pins the release's
   share, the `quic-data-release-share` case in `simulation_integration.rs`.

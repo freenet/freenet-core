@@ -459,6 +459,7 @@ pub(crate) fn log_startup(config: &NetworkApiConfig) {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
 
     /// A ramp start names the release it ships in, so the release-time check
     /// (`scripts/check_quic_data_ramp_t0.sh`) has a version to key on; a
@@ -484,7 +485,6 @@ mod tests {
             );
         }
     }
-    use super::*;
 
     const AVAILABILITIES: [QuicAvailability; 4] = [
         QuicAvailability::Disabled,

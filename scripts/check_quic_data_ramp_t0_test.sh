@@ -73,6 +73,21 @@ check_case "ramp release 3 h 1 s before T0, live: refused" 1 "min before its ram
 check_case "ramp release a day late, dry run: warning only" 0 "::warning" -- \
     --version 0.2.157 --live false --now $((T0 + 24 * HOUR)) --policy "$set_both"
 
+# The two declarations as rustfmt would wrap them if they grew past the line
+# width: read the same as on one line.
+wrapped="$WORK/wrapped.rs"
+cat > "$wrapped" <<'RUST'
+pub(in crate::transport) const QUIC_DATA_RAMP_START: Option<u64> = Some(
+    1_800_000_000,
+);
+pub(in crate::transport) const QUIC_DATA_RAMP_RELEASE: Option<&str> =
+    Some("0.2.157");
+RUST
+check_case "wrapped declarations, ramp release at T0" 0 "within 180 min" -- \
+    --version 0.2.157 --live true --now "$T0" --policy "$wrapped"
+check_case "wrapped declarations, 3 h 1 s late, live: refused" 1 "min after its ramp start" -- \
+    --version 0.2.157 --live true --now $((T0 + 3 * HOUR + 1)) --policy "$wrapped"
+
 release_no_start="$(policy None 'Some("0.2.157")')"
 check_case "ramp release with no start, live: refused" 1 "QUIC_DATA_RAMP_START is None" -- \
     --version 0.2.157 --live true --now "$T0" --policy "$release_no_start"

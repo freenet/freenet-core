@@ -64,20 +64,32 @@ if [[ ! -f "$POLICY" ]]; then
 fi
 
 # Sets DECLARED to the value of the one declaration of constant $1 whose type
-# is $2, or exits 2. Matches the whole line, so a comment or test that mentions
-# the name is not read, and two declarations are refused rather than one
-# picked. (Not a command substitution: its error message would be captured.)
+# is $2, or exits 2. The declaration starts a line and runs to its `;`,
+# possibly over several lines (rustfmt wraps a long one), and its whitespace
+# is collapsed, so `Some(\n    1_800_000_000,\n)` reads as `Some(1_800_000_000)`.
+# Starting a line keeps a comment or test that mentions the name from being
+# read; two declarations are refused rather than one picked. (Not a command
+# substitution: its error message would be captured.)
 DECLARED=""
 read_declared() {
-    local name="$1" type="$2" lines count
-    lines="$(grep -E "^pub\(in crate::transport\) const ${name}: ${type} = .*;$" "$POLICY")"
-    count="$(printf '%s' "$lines" | grep -c . || true)"
+    local name="$1" type="$2" found count
+    found="$(awk -v head="pub(in crate::transport) const ${name}: ${type} =" '
+        index($0, head) == 1 { inside = 1; text = "" }
+        inside { text = text " " $0; if ($0 ~ /;[[:space:]]*$/) { print text; inside = 0 } }
+    ' "$POLICY")"
+    count="$(printf '%s' "$found" | grep -c . || true)"
     if [[ "$count" != "1" ]]; then
         echo "::error::check_quic_data_ramp_t0: expected one declaration of ${name}: ${type} in $POLICY, found ${count}"
         exit 2
     fi
-    lines="${lines#*= }"
-    DECLARED="${lines%;}"
+    found="${found#*= }"
+    found="${found%;*}"
+    # Collapse whitespace, then drop it inside the parentheses and a trailing
+    # comma rustfmt adds to a wrapped argument.
+    found="$(printf '%s' "$found" | tr -s '[:space:]' ' ')"
+    found="${found// /}"
+    found="${found/,)/)}"
+    DECLARED="$found"
 }
 
 read_declared QUIC_DATA_RAMP_RELEASE 'Option<&str>'
