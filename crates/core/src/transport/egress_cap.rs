@@ -336,8 +336,9 @@ impl RetxDeferral {
 /// Why a retransmit take was refused, and how long until it would fit.
 #[derive(Debug, Clone, Copy)]
 enum RetxRefused {
-    /// The share is spent.
-    Share(Duration),
+    /// The share is spent. (The wait is read only by the tests'
+    /// `try_take_retransmit`: a refused resend books a slot instead.)
+    Share(#[cfg_attr(not(test), allow(dead_code))] Duration),
     /// The bucket's debt would pass [`RETX_DEBT_LIMIT`].
     Bucket(Duration),
     /// The connection's booked slot has not come yet.
@@ -345,6 +346,7 @@ enum RetxRefused {
 }
 
 impl RetxRefused {
+    #[cfg(test)]
     fn wait(self) -> Duration {
         match self {
             Self::Share(wait) | Self::Bucket(wait) | Self::Slot(wait) => wait,
@@ -1155,21 +1157,9 @@ impl EgressCap {
         self.retransmits_uncapped.store(true, Ordering::Relaxed);
     }
 
-    /// Take `bytes` for a legacy UDP retransmit (an RTO resend or a tail-loss
-    /// probe) if retransmits stay within their share of the rate
-    /// ([`RETX_SHARE_PERCENT`] over [`RETX_SHARE_WINDOW`]) and the bucket's
-    /// debt after the take stays within [`RETX_DEBT_LIMIT`]; otherwise take
-    /// nothing and return how long until it would fit. Unlike
-    /// [`Self::charge_unpaced`] nothing is forgiven; unlike a paced take it
-    /// needs no admission and may go into debt, so a lost packet is repaired
-    /// ahead of first copies waiting in the admission queue.
-    ///
-    /// The share is checked first, so a share refusal touches the bucket not
-    /// at all, and the bucket refusal path only hands the share back: both
-    /// are atomic updates with no lock and no await, and neither wakes paced
-    /// waiters. Send the datagram with `Socket::send_to_paced`, which charges
-    /// it once; a take dropped unsent gives back both the bucket and the
-    /// share.
+    /// Tests only: [`Self::take_retx`] with nothing booked, the refusal as a
+    /// wait.
+    #[cfg(test)]
     pub(crate) fn try_take_retransmit(&self, bytes: usize) -> Result<EgressTake<'_>, Duration> {
         self.take_retx(bytes, None).map_err(RetxRefused::wait)
     }
@@ -1216,6 +1206,13 @@ impl EgressCap {
     /// timing hint only: nothing is paid, so nothing can leak.
     fn space_retx_bucket_wait(&self, bytes: usize, wait: Duration) -> Duration {
         let cost = self.cost_ns(bytes as u64);
+        #[cfg(test)]
+        let cost = cost
+            / std::env::var("FREENET_RETX_BUCKET_SPACING_DIV")
+                .ok()
+                .and_then(|v| v.trim().parse::<i64>().ok())
+                .unwrap_or(1)
+                .max(1);
         let now = self.now();
         let at = now.saturating_add(i64::try_from(wait.as_nanos()).unwrap_or(i64::MAX));
         let mut next = self.retx_bucket_next_ns.load(Ordering::Acquire);
@@ -1233,8 +1230,22 @@ impl EgressCap {
         }
     }
 
-    /// [`Self::try_take_retransmit`], with the share already paid
-    /// (`prepaid`, a booking whose slot has come) or not.
+    /// Take `bytes` for a legacy UDP retransmit (an RTO resend or a tail-loss
+    /// probe) if retransmits stay within their share of the rate
+    /// ([`RETX_SHARE_PERCENT`] over [`RETX_SHARE_WINDOW`]) and the bucket's
+    /// debt after the take stays within [`RETX_DEBT_LIMIT`]; otherwise take
+    /// nothing and return how long until it would fit. Unlike
+    /// [`Self::charge_unpaced`] nothing is forgiven; unlike a paced take it
+    /// needs no admission and may go into debt, so a lost packet is repaired
+    /// ahead of first copies waiting in the admission queue.
+    ///
+    /// The share is checked first, so a share refusal touches the bucket not
+    /// at all, and the bucket refusal path only hands the share back: both
+    /// are atomic updates with no lock and no await, and neither wakes paced
+    /// waiters. Send the datagram with `Socket::send_to_paced`, which charges
+    /// it once; a take dropped unsent gives back both the bucket and the
+    /// share. With `prepaid` (a booking whose slot has come) the share is
+    /// already paid, and a bucket refusal keeps it for the retry.
     fn take_retx(&self, bytes: usize, prepaid: Option<i64>) -> Result<EgressTake<'_>, RetxRefused> {
         let cost = self.cost_ns(bytes as u64);
         // The retransmit share: a leaky bucket refilled at the share of the
