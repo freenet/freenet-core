@@ -265,7 +265,7 @@ const stale = { id: 5, body: STICKY + '\n### Rule Review: No issues found' };
   t('API refused the run (1 turn): one outage issue opened', r.creates.length === 1);
   t('outage issue body carries the dedup marker and mentions @sanity', r.creates[0][2].includes(MARKER) && r.creates[0][2].includes('@sanity'));
   t('outage issue has its title', r.creates[0][1] === 'CI: Claude rule review is failing to run');
-  t('outage issue body asserts no dated cause', !/2025-09-27|expired\)\./.test(r.creates[0][2]));
+  t('outage issue body states no date and no certain cause', !/2025-09-27/.test(r.creates[0][2]) && /If the run ended within about a turn/.test(r.creates[0][2]));
 
   r = await run({ outcome: 'failure', exec: resErr(1), open: [bot(7)] });
   t('outage issue already open: no duplicate created', r.creates.length === 0);
@@ -333,9 +333,29 @@ const stale = { id: 5, body: STICKY + '\n### Rule Review: No issues found' };
   r = await run({ outcome: 'success', exec: [null, ...okReport] });
   t('a null entry in the execution file does not lose the review', r.statuses.length === 1 && r.statuses[0][1] === 'success' && r.creates.length === 0);
 
-  // Recovery needs a result that says it succeeded.
-  r = await run({ outcome: 'success', exec: [okReport[0], { type: 'result', subtype: 'error_during_execution', is_error: false, num_turns: 3 }], open: [bot(7)] });
-  t('a non-success subtype does not close the outage issue', r.closes.length === 0);
+  // One definition of "clean" for both gates: only a result that says it succeeded counts.
+  // Anything else that is present is a non-run, and never closes the outage issue.
+  const unclean = {
+    'non-success subtype with is_error false': { type: 'result', subtype: 'error_max_turns', is_error: false, num_turns: 26 },
+    'is_error missing': { type: 'result', subtype: 'success', num_turns: 3 },
+    'is_error null': { type: 'result', subtype: 'success', is_error: null, num_turns: 3 },
+    'subtype missing': { type: 'result', is_error: false, num_turns: 3 },
+  };
+  for (const [name, entry] of Object.entries(unclean)) {
+    r = await run({ outcome: 'success', exec: [reportEntry('Let me look at the diff'), entry], open: [bot(7)] });
+    t(`result with ${name}: a non-run, not a green review`, r.statuses.length === 1 && r.statuses[0][1] === 'failure' && /did not run/i.test(r.statuses[0][2]), JSON.stringify(r.statuses));
+    t(`result with ${name}: the outage issue is NOT closed`, r.closes.length === 0);
+  }
+
+  // Malformed fields and nulls must not lose the status or a real review.
+  r = await run({ outcome: 'failure', exec: '[{"type":"result","is_error":true,"num_turns":{"toString":"x"}}]' });
+  t('malformed num_turns on a failed step: job does not throw, FAILURE status set', r.threw === null && r.statuses.length === 1 && r.statuses[0][1] === 'failure', String(r.threw));
+  r = await run({ outcome: 'success', exec: [reportEntry('Invalid API key'), JSON.parse('{"type":"result","is_error":true,"num_turns":{"toString":"x"}}')] });
+  t('malformed num_turns after a "successful" step: job does not throw, FAILURE status set', r.threw === null && r.statuses.length === 1 && r.statuses[0][1] === 'failure', String(r.threw));
+  r = await run({ outcome: 'failure', exec: [...resErr(2), null] });
+  t('trailing null entry on a failed step: the last real entry decides (2 turns, not an outage)', r.creates.length === 0 && r.statuses[0][1] === 'failure');
+  r = await run({ outcome: 'success', exec: [{ type: 'assistant', message: { content: [null, { type: 'text', text: '### Rule Review: No issues found\n<!-- warning-count: 0 -->' }] } }, okResult] });
+  t('null in message content does not lose the review', r.statuses.length === 1 && r.statuses[0][1] === 'success');
 
   // --- property 2: bookkeeping failures never cost the status or the job -----
   for (const name of ['paginate', 'issue.create']) {
@@ -426,9 +446,19 @@ mutate_and_expect_fail "dedup creator filter dropped" \
 mutate_and_expect_fail "issue opens even when the run got going (max-turns)" \
     "s/const systemic = !(turns > 1);/const systemic = true;/" "real max-turns run"
 mutate_and_expect_fail "outage issue closes without a clean result entry" \
-    "s/if (resultEntry \&\& resultEntry.is_error === false \&\& resultEntry.subtype === 'success') {/if (true) {/" "NOT closed"
-mutate_and_expect_fail "outage issue closes on any non-error result, whatever its subtype" \
-    "s/ \&\& resultEntry.subtype === 'success') {/) {/" "non-success subtype"
+    "s/if (cleanResult(resultEntry)) {/if (true) {/" "NOT closed"
+mutate_and_expect_fail "a result is a non-run only when is_error is exactly true (the two gates disagree)" \
+    "s/if (resultEntry \&\& !cleanResult(resultEntry)) {/if (resultEntry \&\& resultEntry.is_error === true) {/" "non-success subtype with is_error false"
+mutate_and_expect_fail "a non-success subtype counts as a clean run" \
+    "s/ \&\& e.subtype === 'success';/;/" "subtype missing"
+mutate_and_expect_fail "a missing is_error counts as a clean run" \
+    "s/e.is_error === false \&\&/e.is_error !== true \&\&/" "is_error missing"
+mutate_and_expect_fail "a malformed num_turns can throw before the status is set" \
+    "s/try { turns = Number(e.num_turns); } catch (_) { \/\* malformed: counts as not got going \*\/ }/turns = Number(e.num_turns);/" "malformed num_turns"
+mutate_and_expect_fail "a trailing null entry hides the final result" \
+    "s/entries.filter(x => x).pop()/entries[entries.length - 1]/" "trailing null entry"
+mutate_and_expect_fail "a null in message content loses the review" \
+    "s/.filter(c => c \&\& c.type === 'text')/.filter(c => c.type === 'text')/" "null in message content"
 mutate_and_expect_fail "a null entry in the execution file loses the review" \
     "s/turns.filter(t => t \&\& t.type === 'assistant'/turns.filter(t => t.type === 'assistant'/" "null entry"
 mutate_and_expect_fail "a malformed entry can throw before the status is set" \
@@ -436,7 +466,7 @@ mutate_and_expect_fail "a malformed entry can throw before the status is set" \
 mutate_and_expect_fail "a non-run leaves the stale sticky comment in place" \
     "s/await postStickyComment(notReviewedBody);/\/\/ removed/" "stale sticky comment is replaced"
 mutate_and_expect_fail "an error final result is believed to be a review" \
-    "s/if (resultEntry \&\& resultEntry.is_error === true) {/if (false) {/" "final result is an error but a report exists"
+    "s/if (resultEntry \&\& !cleanResult(resultEntry)) {/if (false) {/" "final result is an error but a report exists"
 mutate_and_expect_fail "per-PR model text leaks into the public annotation" \
     "s/const excerpt = systemic ? /const excerpt = true ? /" "model text is NOT in the annotation"
 mutate_and_expect_fail "issues are closed without a reason" \

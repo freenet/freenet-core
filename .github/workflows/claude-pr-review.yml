@@ -723,6 +723,13 @@ jobs:
             // Total on purpose: it runs before the status is set on some paths, so
             // a malformed entry (an object where a string is expected) must not
             // throw and fail the required job. `safe` stringifies anything.
+            // The ONE definition of a clean run, used by both gates below: a result
+            // that says it succeeded. Anything else that is present (a missing or
+            // non-boolean is_error, a non-success subtype) is not evidence of a
+            // review, so it is a non-run, and it never closes the outage issue.
+            // Absence of evidence is not a pass (#5628).
+            const cleanResult = (e) => !!e && e.is_error === false && e.subtype === 'success';
+
             const safe = (v) => {
               try { return String(v ?? ''); } catch (_) { return '[unprintable]'; }
             };
@@ -740,7 +747,7 @@ jobs:
             const describeFailure = () => {
               try {
                 const entries = JSON.parse(fs.readFileSync(execFile, 'utf8'));
-                const last = Array.isArray(entries) ? entries[entries.length - 1] : null;
+                const last = Array.isArray(entries) ? entries.filter(x => x).pop() : null;
                 if (last && last.type === 'result') return describeEntry(last);
                 return { detail: 'execution file has no result entry', systemic: true };
               } catch (e) {
@@ -819,7 +826,7 @@ jobs:
                 if (assistantTurns.length > 0) {
                   const last = assistantTurns[assistantTurns.length - 1];
                   const textParts = last.message.content
-                    .filter(c => c.type === 'text')
+                    .filter(c => c && c.type === 'text')
                     .map(c => c.text);
                   report = textParts.join('\n');
                 }
@@ -833,9 +840,11 @@ jobs:
             }
 
             // The action normally fails its own step when the final result is an
-            // error. If it ever does not, the "report" below would be an error
-            // message read as a review ("No warnings found"). Believe the result.
-            if (resultEntry && resultEntry.is_error === true) {
+            // error. If it ever does not, or the result's shape drifts, the
+            // "report" below could be an error message, or text from a run that
+            // never completed, read as a review ("No warnings found"). A result
+            // that does not say it succeeded is a non-run.
+            if (resultEntry && !cleanResult(resultEntry)) {
               await reportNotRun(NOT_RUN_TEXT, describeEntry(resultEntry));
               return;
             }
@@ -892,7 +901,7 @@ jobs:
             // issue only on clear evidence: a final `result` entry that says it
             // succeeded (a real one reads subtype=success is_error=false). Done
             // last, so it can never cost the comment or the status.
-            if (resultEntry && resultEntry.is_error === false && resultEntry.subtype === 'success') {
+            if (cleanResult(resultEntry)) {
               await clearOutage();
             }
 
