@@ -18,9 +18,11 @@ pub enum ConformanceProperty {
     ///
     /// When the contract REFUSES one of the two merges (a `ContractError`) for two
     /// states it validates, the two peers holding them are simulated exchanging
-    /// states until they agree or neither moves (#5725). Each receive follows the
-    /// protocol: the delta computed from the receiver's summary first, the whole
-    /// state when there is no usable delta or the delta does not get through.
+    /// states until they agree or neither moves (#5725). Each receive tries the delta
+    /// computed from the receiver's summary first, as production does, and then the
+    /// whole state whenever the delta does not get through. That is deliberately
+    /// more generous than the protocol, which sends nothing more after an empty or
+    /// no-op delta, so "stuck" means neither route gets through.
     /// Agreeing is the honest transient refusal (River's ban-cap skew) and stays
     /// [`Inconclusive::ContractError`]. Stopping while apart is a stable
     /// disagreement, the freenet/river#423 class, and is a violation of this law

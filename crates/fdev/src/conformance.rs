@@ -2967,6 +2967,10 @@ mod tests {
     struct GrowOnly;
 
     impl ConformanceOracle for GrowOnly {
+        fn reads_host_clock(&self) -> bool {
+            false
+        }
+
         fn validate_state(
             &mut self,
             _state: &[u8],
@@ -3227,6 +3231,10 @@ mod tests {
     }
 
     impl freenet::conformance::ConformanceOracle for CountingOracle {
+        fn reads_host_clock(&self) -> bool {
+            false
+        }
+
         fn validate_state(
             &mut self,
             _state: &[u8],
@@ -4111,6 +4119,10 @@ mod tests {
         // tests, which this crate cannot reach; keep the two in step.
         struct SettlesOnlyWhenShort;
         impl freenet::conformance::ConformanceOracle for SettlesOnlyWhenShort {
+            fn reads_host_clock(&self) -> bool {
+                false
+            }
+
             fn validate_state(
                 &mut self,
                 _state: &[u8],
@@ -4184,6 +4196,10 @@ mod tests {
             sorts: bool,
         }
         impl freenet::conformance::ConformanceOracle for Flips {
+            fn reads_host_clock(&self) -> bool {
+                false
+            }
+
             fn validate_state(
                 &mut self,
                 _state: &[u8],

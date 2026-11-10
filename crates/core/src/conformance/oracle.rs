@@ -111,9 +111,7 @@ pub trait ConformanceOracle {
     /// clock, because a clock-gated refusal (a timestamp too far in the future)
     /// reproduces on a re-run and still clears as time passes.
     ///
-    /// The default is `false`, which is right for an oracle with no code to inspect.
-    /// An oracle over real WASM must answer it, or a clock-gated refusal is reported.
-    fn reads_host_clock(&self) -> bool {
-        false
-    }
+    /// Required, with no default: `false` is the answer that lets a refusal be
+    /// reported, so an oracle must choose it deliberately rather than inherit it.
+    fn reads_host_clock(&self) -> bool;
 }

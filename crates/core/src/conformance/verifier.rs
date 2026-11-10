@@ -1064,7 +1064,7 @@ fn refused_merge_outcome<O: ConformanceOracle + ?Sized>(
             let cause = match refusal {
                 Some(refusal) => format!("the contract refused ({refusal})"),
                 None => format!(
-                    "each merge returned the state its peer already held (an earlier \
+                    "each side's merge returned the state it already held (an earlier \
                      merge was refused: {first_refusal})"
                 ),
             };
@@ -1187,15 +1187,17 @@ impl KnownMerges {
 /// The sender computes `get_state_delta(sender, summarize(holder))`, as
 /// [`reconciliation_cycle`] models. An empty delta, or one production's size gate
 /// would refuse ([`delta_would_be_refused`]), is not sent, and the whole state is
-/// merged instead. A delta the holder refuses, or one that does not move it, also
-/// falls back to the whole state. That last step is deliberately generous: it
-/// gives the contract every route the protocol has, so "stuck" means neither the
-/// delta nor the whole state gets through. Erring toward movement is the safe
-/// direction for a check that accuses a contract.
+/// merged instead. A delta the holder refuses, one whose result the contract
+/// does not validate (production drops that state and resyncs with the whole
+/// state), or one that does not move it, also falls back to the whole state. That
+/// last fallback is deliberately generous: production sends nothing more after an
+/// empty or no-op delta, but this gives the contract every route the protocol has,
+/// so "stuck" means neither the delta nor the whole state gets through. Erring
+/// toward movement is the safe direction for a check that accuses a contract.
 ///
-/// A merged state the contract does not validate is
-/// [`Inconclusive::InputNotValid`], as in [`reconciliation_cycle`]: the network
-/// drops it, the defect is [`ConformanceProperty::EmittedStateValidity`]'s, and
+/// A WHOLE-STATE merge result the contract does not validate is
+/// [`Inconclusive::InputNotValid`], as in [`reconciliation_cycle`]: there is no
+/// further route, the defect is [`ConformanceProperty::EmittedStateValidity`]'s, and
 /// reporting it here would accuse the right contract under the wrong law. A runtime
 /// or resource failure is not the contract's answer and propagates as inconclusive.
 fn exchange_step<O: ConformanceOracle + ?Sized>(
@@ -1213,8 +1215,17 @@ fn exchange_step<O: ConformanceOracle + ?Sized>(
     if !delta.is_empty() && !delta_would_be_refused(&delta, sender) {
         match refusable(apply_delta_bytes(oracle, holder, &delta))? {
             Ok(next) if next != holder => {
-                require_valid(oracle, &next, related)?;
-                return Ok((next, None));
+                match oracle
+                    .validate_state(&next, related)
+                    .map_err(inconclusive_from)?
+                {
+                    ValidateResult::Valid => return Ok((next, None)),
+                    // Production drops it and resyncs with the whole state.
+                    ValidateResult::Invalid => {
+                        refusal = Some("the delta's result is not a valid state".to_string())
+                    }
+                    ValidateResult::RequestRelated(_) => return Err(Inconclusive::RelatedRequired),
+                }
             }
             Ok(_) => {}
             Err(reason) => refusal = Some(reason),
@@ -1449,13 +1460,6 @@ fn digest(bytes: &[u8]) -> [u8; 32] {
     *blake3::hash(bytes).as_bytes()
 }
 
-/// Would the network refuse to send this delta and ship the whole state instead?
-///
-/// Deliberately conservative relative to `ring::interest::gate_delta_size`: a delta
-/// at least as large as the state it would replace carries no saving, and the
-/// production path treats that case as a full-state send. Erring toward the fallback
-/// only ever makes the simulation converge more readily, which is the safe direction
-/// for a check whose failure mode is accusing a correct contract.
 /// Whether production would refuse this delta and send the whole state instead.
 ///
 /// `sender_state` is the state of the peer COMPUTING the delta, which is what

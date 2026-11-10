@@ -2222,11 +2222,97 @@ fn a_runtime_failure_validating_inside_the_refusal_exchange_is_inconclusive() {
     );
 }
 
-/// A refusal-derived finding travels as evidence and a recipient reproduces it,
-/// like every other self-verifying finding: the stuck exchange is re-derived from
-/// the two input states alone.
+/// A delta whose result the contract does not validate is dropped, as production
+/// drops it, and the whole state is tried next. Here the whole state gets through,
+/// so the transient refusal clears.
 #[test]
-fn a_stuck_refusal_finding_replays_from_evidence() {
+fn an_invalid_delta_result_falls_back_to_the_whole_state() {
+    let mut fake = Fake::conforming()
+        .merging(|a, b| {
+            if a == [1] && b == [2] {
+                return Err(OracleError::contract("refused"));
+            }
+            Ok(union(a, b))
+        })
+        // `[2, 1]` and the like: not canonical, so not valid.
+        .applying(|a, d| Ok([a, d].concat()));
+    assert_inconclusive(
+        verify_case(
+            &mut fake,
+            &case(ConformanceProperty::StateCommutativity, &[&[1], &[2]]),
+        ),
+        Inconclusive::ContractError("refused".into()),
+    );
+}
+
+/// A delta production would refuse to send (not meaningfully smaller than the
+/// sender's state) is never applied. Here applying it would carry both peers to
+/// `[9]`, while the whole state is refused, so the peers are stuck: only the gate
+/// keeps the oversized delta from hiding that.
+#[test]
+fn an_oversized_delta_is_not_applied_in_the_refusal_exchange() {
+    let oversized = crate::ring::interest::MIN_FULL_STATE_SAVING_BYTES + 1;
+    let mut fake = Fake::conforming()
+        .merging(|_, _| Err(OracleError::contract("refused")))
+        .deltaing(move |_, _| Ok(vec![0; oversized]))
+        .applying(|_, _| Ok(vec![9]))
+        .validating(single_byte_valid);
+    assert_violates(
+        verify_case(
+            &mut fake,
+            &case(ConformanceProperty::StateCommutativity, &[&[1], &[2]]),
+        ),
+        ConformanceProperty::StateCommutativity,
+    );
+}
+
+/// A delta that applies but moves nothing still falls back to the whole state,
+/// which here moves the peer, so the refusal clears.
+#[test]
+fn a_no_op_delta_falls_back_to_the_whole_state() {
+    let mut fake = Fake::conforming()
+        .merging(|a, b| {
+            if a == [1] && b == [2] {
+                return Err(OracleError::contract("refused"));
+            }
+            Ok(union(a, b))
+        })
+        .applying(|a, _| Ok(a.to_vec()));
+    assert_inconclusive(
+        verify_case(
+            &mut fake,
+            &case(ConformanceProperty::StateCommutativity, &[&[1], &[2]]),
+        ),
+        Inconclusive::ContractError("refused".into()),
+    );
+}
+
+/// A refused delta followed by a whole-state merge that succeeds moves the peer, so
+/// the refusal clears.
+#[test]
+fn a_refused_delta_falls_back_to_the_whole_state() {
+    let mut fake = Fake::conforming()
+        .merging(|a, b| {
+            if a == [1] && b == [2] {
+                return Err(OracleError::contract("refused"));
+            }
+            Ok(union(a, b))
+        })
+        .applying(|_, _| Err(OracleError::contract("no deltas")));
+    assert_inconclusive(
+        verify_case(
+            &mut fake,
+            &case(ConformanceProperty::StateCommutativity, &[&[1], &[2]]),
+        ),
+        Inconclusive::ContractError("refused".into()),
+    );
+}
+
+/// A refusal-derived case survives the evidence round trip (build, bounds check,
+/// back to a case) and a recipient re-running it reaches the same finding: the
+/// stuck exchange is re-derived from the two input states alone.
+#[test]
+fn a_stuck_refusal_case_survives_the_evidence_round_trip() {
     let build = || {
         let refuse = |_: &[u8], _: &[u8]| -> Result<Vec<u8>, OracleError> {
             Err(OracleError::contract("refused"))

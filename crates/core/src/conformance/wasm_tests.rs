@@ -580,3 +580,27 @@ async fn a_contract_sees_the_overridden_clock_through_real_wasm()
 
     Ok(())
 }
+
+/// `RuntimeOracle` answers `reads_host_clock` from the code: `false` for a module
+/// that does not import the clock. The fixture used elsewhere in this file imports
+/// it, so without this test a hard-coded `true` would pass.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_clock_free_contract_does_not_read_the_host_clock()
+-> Result<(), Box<dyn std::error::Error>> {
+    use super::oracle::ConformanceOracle;
+    // The smallest module `RuntimeOracle::standalone` accepts as a contract: a
+    // memory and the four entry points, and no imports at all.
+    let wasm = wat::parse_str(
+        "(module\n  \
+           (memory (export \"memory\") 1)\n  \
+           (func (export \"validate_state\") (result i32) i32.const 0)\n  \
+           (func (export \"update_state\") (result i32) i32.const 0)\n  \
+           (func (export \"summarize_state\") (result i32) i32.const 0)\n  \
+           (func (export \"get_state_delta\") (result i32) i32.const 0)\n\
+         )\n",
+    )?;
+    assert!(!super::imports_host_clock(&wasm));
+    let oracle = RuntimeOracle::standalone(wasm, vec![]).await?;
+    assert!(!oracle.reads_host_clock());
+    Ok(())
+}

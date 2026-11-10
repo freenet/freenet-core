@@ -214,8 +214,8 @@ impl ConformanceOracle for RuntimeOracle {
 /// merge, so the probe's verdict comes from the same law the verifier checks rather
 /// than from a second copy of it.
 ///
-/// It has no code bytes in hand, so it keeps the default
-/// [`ConformanceOracle::reads_host_clock`] of `false`. That is safe only while its
+/// It has no code bytes in hand, so it answers
+/// [`ConformanceOracle::reads_host_clock`] with `false`. That is safe only while its
 /// one caller runs the associativity heal step and never the commutativity refusal
 /// exchange, which is the only reader of that answer.
 pub(crate) struct BorrowedRuntimeOracle<'a, 'p, R: ?Sized> {
@@ -239,6 +239,10 @@ impl<'a, 'p, R: ContractRuntimeInterface + ?Sized> BorrowedRuntimeOracle<'a, 'p,
 }
 
 impl<R: ContractRuntimeInterface + ?Sized> ConformanceOracle for BorrowedRuntimeOracle<'_, '_, R> {
+    fn reads_host_clock(&self) -> bool {
+        false
+    }
+
     fn validate_state(
         &mut self,
         state: &[u8],
