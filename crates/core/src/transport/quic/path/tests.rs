@@ -9,7 +9,7 @@ use std::time::Duration;
 use bytes::Bytes;
 
 use super::super::framing::{HEADER_LEN, MAX_CONTROL_BYTES, MAX_METADATA_BYTES};
-use super::super::tests::{MIB, Pair, SEED, bounded, drive, pair, payload};
+use super::super::tests::{MIB, Pair, SEED, bounded, drive, pair_with, payload};
 use super::*;
 use crate::config::GlobalRng;
 use crate::simulation::{TimeSource, VirtualTime};
@@ -76,12 +76,27 @@ async fn paths_with(
     b_limits: QuicPathLimits,
     b_budget: Option<SharedInboundBudget>,
 ) -> Paths {
-    paths_built(network, subnet, b_limits, b_budget, None).await
+    paths_built(network, subnet, b_limits, b_budget, None, true).await
 }
 
 /// [`paths`] with an egress cap of `a_cap` bytes per second on `a`'s socket.
 async fn paths_capped(network: &str, subnet: u8, a_cap: u64) -> Paths {
-    paths_built(network, subnet, QuicPathLimits::DEFAULT, None, Some(a_cap)).await
+    paths_built(
+        network,
+        subnet,
+        QuicPathLimits::DEFAULT,
+        None,
+        Some(a_cap),
+        true,
+    )
+    .await
+}
+
+/// [`paths`] with plain Cubic, no loss gate (`recycle::loss_gate`), so
+/// random loss collapses the window: for the path's rules on a connection
+/// that drains slowly while it is still acknowledged.
+async fn paths_without_loss_gate(network: &str, subnet: u8) -> Paths {
+    paths_built(network, subnet, QuicPathLimits::DEFAULT, None, None, false).await
 }
 
 async fn paths_built(
@@ -90,10 +105,13 @@ async fn paths_built(
     b_limits: QuicPathLimits,
     b_budget: Option<SharedInboundBudget>,
     a_cap: Option<u64>,
+    loss_gate: bool,
 ) -> Paths {
     let a_addr: SocketAddr = format!("10.203.{subnet}.1:5000").parse().unwrap();
     let b_addr: SocketAddr = format!("10.203.{subnet}.2:5000").parse().unwrap();
-    let pair = pair(network, a_addr, b_addr, a_cap).await;
+    let mut settings = super::super::tests::settings();
+    settings.rate_limit.without_loss_gate = !loss_gate;
+    let pair = pair_with(network, a_addr, b_addr, a_cap, settings).await;
     let permit = pair
         .b
         .allow_peer(pair.a_addr, pair.a_keys.public())
@@ -3325,15 +3343,20 @@ fn seeded_loss_from(
 /// nothing on the connection was acknowledged for `STALL_PROGRESS_WINDOW`, so
 /// the send completes. Before, it timed out (`SendFailure::TimedOut`) and went
 /// to UDP from the start.
+///
+/// The path runs plain Cubic: the loss gate (`recycle::loss_gate`) ignores
+/// random loss with no queue, so through it this send is not slowed at all.
+/// Cubic's collapse is still what happens when the gate passes losses (a
+/// queue, or a loss share above its ceiling), and that is the case tested.
 #[test]
 fn a_lossy_path_finishes_a_stream_whose_writes_wait_past_the_gap() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
         let network = "quic-path-lossy-gap";
-        let loss = seeded_loss_from(network, 30, 0x5940_0007, Some(Duration::from_millis(100)));
-        let p = paths(network, 47, QuicPathLimits::DEFAULT).await;
+        let loss = seeded_loss_from(network, 5, 0x5940_0007, Some(Duration::from_millis(100)));
+        let p = paths_without_loss_gate(network, 47).await;
         let (a, time) = (p.a.clone(), p.time());
-        const LEN: usize = 2 * MIB;
+        const LEN: usize = 8 * MIB;
         let gaps = Arc::new(WriteGaps::new(time.clone()));
         let watched = gaps.clone();
         let sent = p

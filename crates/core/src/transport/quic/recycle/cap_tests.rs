@@ -159,7 +159,11 @@ fn cubic_does_not_grow_behind_the_cap_and_still_backs_off() {
         "a free transfer grows Cubic: {uncapped}"
     );
 
-    let (controller, cubic) = after_a_transfer(QuicRateLimit::new(Some(100_000), None));
+    // Plain Cubic: this in-memory pair has no queue, so the loss gate would
+    // ignore the loss below, and what is checked is Cubic's own response.
+    let mut rate = QuicRateLimit::new(Some(100_000), None);
+    rate.without_loss_gate = true;
+    let (controller, cubic) = after_a_transfer(rate);
     assert_eq!(cubic, initial, "Cubic stayed where it was while capped");
 
     let mut capped = controller

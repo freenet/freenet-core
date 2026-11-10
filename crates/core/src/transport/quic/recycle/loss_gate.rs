@@ -154,6 +154,7 @@ impl GateState {
     }
 
     /// The smoothed share of bytes lost per round trip.
+    #[cfg(test)]
     pub(crate) fn loss_share(&self) -> f64 {
         self.share
     }

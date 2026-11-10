@@ -414,6 +414,11 @@ const WINDOW_MEMORY_DIVISOR: usize = 20;
 pub(crate) struct QuicRateLimit {
     bandwidth_limit: Option<usize>,
     global: Option<Arc<GlobalBandwidthManager>>,
+    /// Tests only: build plain Cubic without the loss gate
+    /// (`recycle::loss_gate`), for tests of what the path does when Cubic's
+    /// window collapses under loss.
+    #[cfg(test)]
+    pub(crate) without_loss_gate: bool,
 }
 
 impl QuicRateLimit {
@@ -424,6 +429,8 @@ impl QuicRateLimit {
         Self {
             bandwidth_limit,
             global,
+            #[cfg(test)]
+            without_loss_gate: false,
         }
     }
 

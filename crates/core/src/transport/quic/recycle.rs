@@ -303,8 +303,13 @@ impl Default for CappedCubicFactory {
 
 impl ControllerFactory for CappedCubicFactory {
     fn build(self: Arc<Self>, now: Instant, current_mtu: u16) -> Box<dyn Controller> {
+        let cubic = self.cubic.clone().build(now, current_mtu);
+        #[cfg(test)]
+        if self.rate.without_loss_gate {
+            return Box::new(CappedCubic::new(cubic, self.rate.clone(), current_mtu));
+        }
         Box::new(CappedCubic::new(
-            Box::new(LossGate::new(self.cubic.clone().build(now, current_mtu))),
+            Box::new(LossGate::new(cubic)),
             self.rate.clone(),
             current_mtu,
         ))

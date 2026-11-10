@@ -233,7 +233,7 @@ fn debug_field(debug: &str, name: &str) -> String {
 }
 
 /// Settings with windows of [`MAX_WINDOW_BYTES`], so a 1 MiB stream fits.
-fn settings() -> QuicSettings {
+pub(in crate::transport::quic) fn settings() -> QuicSettings {
     QuicSettings {
         max_connections: 4,
         memory_limit: 1024 * 1024 * 1024,
@@ -277,6 +277,17 @@ pub(in crate::transport::quic) async fn pair(
     b_addr: SocketAddr,
     a_cap: Option<u64>,
 ) -> Pair {
+    pair_with(network, a_addr, b_addr, a_cap, settings()).await
+}
+
+/// [`pair`] with both endpoints built from `settings`.
+pub(in crate::transport::quic) async fn pair_with(
+    network: &str,
+    a_addr: SocketAddr,
+    b_addr: SocketAddr,
+    a_cap: Option<u64>,
+    settings: QuicSettings,
+) -> Pair {
     let time = VirtualTime::new();
     register_network_time_source(network, time.clone());
     register_address_network(a_addr, network);
@@ -302,9 +313,9 @@ pub(in crate::transport::quic) async fn pair(
     let b_socket = bind(b_addr, None).await;
     let a_keys = TransportKeypair::new();
     let b_keys = TransportKeypair::new();
-    let a = QuicEndpoint::bind(a_socket.clone(), a_addr, time.clone(), &settings(), &a_keys)
+    let a = QuicEndpoint::bind(a_socket.clone(), a_addr, time.clone(), &settings, &a_keys)
         .expect("endpoint a");
-    let b = QuicEndpoint::bind(b_socket.clone(), b_addr, time.clone(), &settings(), &b_keys)
+    let b = QuicEndpoint::bind(b_socket.clone(), b_addr, time.clone(), &settings, &b_keys)
         .expect("endpoint b");
     let pumps = vec![pump(a_socket.clone()), pump(b_socket.clone())];
     Pair {
