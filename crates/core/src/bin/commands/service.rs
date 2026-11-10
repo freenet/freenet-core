@@ -3900,8 +3900,8 @@ echo "RC=$?"
     /// crash-loop breaker's stop note to its child, and records the child's
     /// pid in it as the statement right before every kill of any form
     /// (`child.kill()`, `start_kill`, a `taskkill` of `child.id()`), so a
-    /// tray Restart, Stop, Quit or update is not read as a crash. The breaker
-    /// is off on Windows.
+    /// tray Restart, Stop, Quit or update is not read as a crash. Windows has
+    /// no stop note: its breaker counts only runs that panicked in QUIC code.
     #[test]
     fn wrapper_records_every_deliberate_child_kill_for_the_quic_breaker() {
         let body = quic_breaker_pin_body(
