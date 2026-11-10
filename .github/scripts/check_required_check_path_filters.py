@@ -105,6 +105,7 @@ REQUIRED_CONTEXTS = frozenset(
         "Rule Lint",
         "Claude Rule Review",
         "macOS bundle-swap E2E",
+        "Windows Check",
     }
 )
 
