@@ -6,9 +6,10 @@
 //! one place an operator would look shows nothing.
 //!
 //! These findings are diagnostics recorded locally. Nodes do not remove contracts for
-//! breaking a merge law (see `policy`'s module docs). The view still matters: the findings are only useful to
-//! an operator or a contract author who can read them, and grepping a peer's log
-//! files before they rotate is evidence most of them cannot reach.
+//! breaking a merge law (see `policy`'s module docs). The view still matters: the
+//! findings are only useful to an operator or a contract author who can read them,
+//! and grepping a peer's log files before they rotate is evidence most of them
+//! cannot reach.
 //!
 //! # Shape
 //!

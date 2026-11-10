@@ -895,7 +895,7 @@ fn wide_averaging_and_climbing_are_reported_at_any_width() {
 /// A merge that keeps moving without repeating a state and without settling within
 /// the pass budget, while absorbing every re-delivery, is inconclusive rather than
 /// reported: running out of budget is not proof, and the bias is away from a false
-/// removal.
+/// finding.
 ///
 /// State `[counter, tag]`. Merging a state with a different tag bumps the counter
 /// past both and takes the incoming tag; merging one with the same tag keeps the
@@ -1113,7 +1113,7 @@ fn emitted_state_the_contract_would_reject_is_caught() {
 fn non_empty_self_delta_is_reported_but_only_as_a_diagnostic() {
     // A delta against an exact summary of the same state should be empty. Returning
     // the whole state instead is the #5072 shape: wasteful, but it still converges,
-    // so it must never be grounds for removal.
+    // so it must never be reported as a law break.
     let mut fake = Fake::conforming().deltaing(|state, _summary| Ok(state.to_vec()));
 
     let outcome = verify_case(
@@ -1123,7 +1123,7 @@ fn non_empty_self_delta_is_reported_but_only_as_a_diagnostic() {
     assert_violates(outcome.clone(), ConformanceProperty::SelfDeltaEmpty);
     assert!(
         !outcome.is_enforceable_violation(),
-        "a wasteful self-delta must not be eligible as removal evidence"
+        "a wasteful self-delta must not count as a law break"
     );
     assert_eq!(outcome.violation().unwrap().severity, Severity::Diagnostic);
 

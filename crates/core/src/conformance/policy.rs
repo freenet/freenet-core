@@ -309,6 +309,37 @@ mod tests {
         assert_eq!(finding_class(&v), FindingClass::Persistent);
     }
 
+    /// The persistent properties, in `ConformanceProperty::ALL` order. Every other
+    /// property is report-only.
+    const PERSISTENT_PROPERTIES: &[ConformanceProperty] = &[
+        ConformanceProperty::StateIdempotence,
+        ConformanceProperty::StateCommutativity,
+        ConformanceProperty::StateAssociativity,
+        ConformanceProperty::EmittedStateValidity,
+        ConformanceProperty::UpdateDeterminism,
+        ConformanceProperty::SummaryDeterminism,
+        ConformanceProperty::DeltaDeterminism,
+        ConformanceProperty::ReconciliationCycle,
+    ];
+
+    /// Every property, through the per-finding function: an unrefined finding is
+    /// persistent exactly when its property is listed, and report-only otherwise.
+    #[test]
+    fn every_property_has_the_listed_finding_class() {
+        for property in ConformanceProperty::ALL {
+            let expected = if PERSISTENT_PROPERTIES.contains(property) {
+                FindingClass::Persistent
+            } else {
+                FindingClass::ReportOnly
+            };
+            assert_eq!(
+                finding_class(&violation_of(*property)),
+                expected,
+                "{property}"
+            );
+        }
+    }
+
     /// The whole partition, stated once. A property moving between classes changes
     /// what the shadow counts and `fdev`'s evidence mean, so it must show up as a
     /// change to this list, not only as a changed arm in `property_class`.
@@ -319,28 +350,7 @@ mod tests {
             .copied()
             .filter(|p| property_class(*p) == FindingClass::Persistent)
             .collect();
-        assert_eq!(
-            persistent,
-            vec![
-                ConformanceProperty::StateIdempotence,
-                ConformanceProperty::StateCommutativity,
-                ConformanceProperty::StateAssociativity,
-                ConformanceProperty::EmittedStateValidity,
-                ConformanceProperty::UpdateDeterminism,
-                ConformanceProperty::SummaryDeterminism,
-                ConformanceProperty::DeltaDeterminism,
-                ConformanceProperty::ReconciliationCycle,
-            ]
-        );
-        // And `finding_class` agrees for an unrefined finding of each, so the list
-        // is a fact about the per-finding function and not only about the table.
-        for property in persistent {
-            assert_eq!(
-                finding_class(&violation_of(property)),
-                FindingClass::Persistent,
-                "{property}"
-            );
-        }
+        assert_eq!(persistent, PERSISTENT_PROPERTIES);
     }
 
     /// A diagnostic is report-only in the table, so a diagnostic can never be

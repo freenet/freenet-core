@@ -158,9 +158,10 @@ pub struct ShadowReport {
     ///
     /// The population changed with the report-only class. Before it, this counted
     /// diagnostics only; it now also holds every report-only `Violation`,
-    /// including the settled idempotence class that used to be in
-    /// `persistent`. `report_only_violations` is that second part on its own,
-    /// so `reported - report_only_violations` is the old series.
+    /// including the settled idempotence class that used to be counted in
+    /// `would_remove` (this series' former name). `report_only_violations` is that
+    /// second part on its own, so `reported - report_only_violations` is the old
+    /// series.
     pub reported: usize,
     /// The subset of `reported` that are `Severity::Violation`s of the report-only
     /// class: real law breaks that are not counted as persistent.
@@ -1338,7 +1339,8 @@ fn tally_decisions(
                     report.persistent += 1;
                 } else {
                     report.reported += 1;
-                    // Severity from the property, as `finding_class` reads it.
+                    // Severity from the property, not from the `Violation`'s own
+                    // field, as `PropertyOutcome::is_enforceable_violation` reads it.
                     if violation.property.severity() == Severity::Violation {
                         report.report_only_violations += 1;
                     }

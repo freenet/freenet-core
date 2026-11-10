@@ -1200,8 +1200,9 @@ fn write_evidence<O: ConformanceOracle + ?Sized>(
 
         // A report-only finding (`policy::finding_class`) gets no evidence file:
         // anyone's inputs may produce one, or it describes a contract that
-        // converges after a bounded cost. Checked after the local-only test so that count keeps meaning what it says, and before
-        // minimising for the same cost reason.
+        // converges after a bounded cost. Checked after the local-only test so
+        // that count keeps meaning what it says, and before minimising for the
+        // same cost reason.
         let Some(checked) = outcome.violation() else {
             continue;
         };
@@ -1815,8 +1816,8 @@ impl Report {
                 PropertyOutcome::Holds => holds += 1,
                 PropertyOutcome::Violated(v) => {
                     violations += 1;
-                    // Severity from the property, as `decide` and `exit_code` read
-                    // it, for both counts, so a persistent count can never
+                    // Severity from the property, as `exit_code` reads it, for
+                    // both counts, so a persistent count can never
                     // include a diagnostic and the two counts cannot disagree on
                     // what a law break is.
                     let severity = v.property.severity();
@@ -4323,7 +4324,7 @@ mod tests {
     }
 
     /// Both law-break counts, the finding's severity and its human line read
-    /// severity from the PROPERTY, as `decide` and `exit_code` do, never from the
+    /// severity from the PROPERTY, as `exit_code` does, never from the
     /// `Violation`'s own field. A field claiming `Diagnostic` on a law-break
     /// property must not drop it from either count or relabel it.
     #[test]

@@ -102,8 +102,9 @@
 //! bytes differ" is inconclusive. Three properties reach a verdict another way and
 //! are worth naming rather than glossing: [`ConformanceProperty::EmittedStateValidity`]
 //! fires on the contract's own `Invalid` verdict, the two self-delta checks fire on a
-//! size threshold (and are [`Severity::Diagnostic`], so they never fail `fdev`), and [`ConformanceProperty::ReconciliationCycle`] fires on a repeated
-//! state pair across simulated rounds.
+//! size threshold (and are [`Severity::Diagnostic`], so they never fail `fdev`), and
+//! [`ConformanceProperty::ReconciliationCycle`] fires on a repeated state pair across
+//! simulated rounds.
 //!
 //! A violation is also required to reproduce: [`verify_case`] re-runs any failing
 //! check and, if the second run disagrees, re-reports under

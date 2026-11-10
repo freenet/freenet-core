@@ -103,8 +103,9 @@ pub enum ConformanceProperty {
     /// does not state the law.
     ///
     /// The property stays [`Severity::Diagnostic`] and report-only only because
-    /// nodes act on no conformance verdict (see `policy`'s module docs). The severity is not a judgment that non-idempotent
-    /// deltas are acceptable: a finding here is a bug the author should fix.
+    /// nodes act on no conformance verdict (see `policy`'s module docs). The
+    /// severity is not a judgment that non-idempotent deltas are acceptable: a
+    /// finding here is a bug the author should fix.
     ///
     /// # Why this one stays [`PremiseSource::EvidenceBytes`], and what makes that safe
     ///
@@ -228,8 +229,8 @@ pub enum ConformanceProperty {
     /// would not, which would HIDE a real divergence rather than invent one.
     ///
     /// It is nevertheless `Severity::Violation` of the persistent class
-    /// (`policy::property_class`), because a genuine reconciliation loop is exactly the #5153 shape this whole effort
-    /// exists to catch.
+    /// (`policy::property_class`), because a genuine reconciliation loop is
+    /// exactly the #5153 shape this whole effort exists to catch.
     ///
     /// Ian's call (2026-08-17) was to leave it at this severity and settle the
     /// question with real shadow telemetry rather than a five-contract sample.
