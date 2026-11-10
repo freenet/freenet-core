@@ -1691,6 +1691,11 @@ once a day. Every step watches: peers disappearing per version
 against the previous rollout (a node that dies before reporting is absent from
 every rate), endpoint-down, panics and breaker trips, RSS against
 `quic_paths_active`, CPU and egress, and NAT success, connections and transfers.
+From the first release with the Windows default, the release watch also reads
+Windows separately: `quic_adapter_panicked` and `quic_breaker_trips` by version
+against the previous release, and peers with `quic_breaker_suppressed`. A
+Windows QUIC panic in the field is read (location, version) before the next
+release goes out.
 
 - Step 0: the first negotiating release ships with QUIC off. Its nodes answer
   offers (`Decline{disabled}` with the key off); `upgrade_control_received`
