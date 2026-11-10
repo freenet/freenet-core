@@ -278,6 +278,10 @@ mod tests {
     struct LastWriteWins;
 
     impl ConformanceOracle for LastWriteWins {
+        fn reads_host_clock(&self) -> bool {
+            false
+        }
+
         fn validate_state(
             &mut self,
             _state: &[u8],
@@ -323,6 +327,10 @@ mod tests {
     struct AlwaysConforming;
 
     impl ConformanceOracle for AlwaysConforming {
+        fn reads_host_clock(&self) -> bool {
+            false
+        }
+
         fn validate_state(
             &mut self,
             _state: &[u8],
@@ -442,6 +450,10 @@ mod tests {
         // Order-dependent apply: concatenation. Any two distinct deltas witness it.
         struct Concat;
         impl ConformanceOracle for Concat {
+            fn reads_host_clock(&self) -> bool {
+                false
+            }
+
             fn validate_state(
                 &mut self,
                 _state: &[u8],
@@ -509,6 +521,10 @@ mod tests {
         // DeltaPermutationInvariance fails and there is a witness to shrink.
         struct Append;
         impl ConformanceOracle for Append {
+            fn reads_host_clock(&self) -> bool {
+                false
+            }
+
             fn validate_state(
                 &mut self,
                 _state: &[u8],
@@ -623,6 +639,10 @@ mod tests {
     struct SettlesOnlyWhenShort;
 
     impl ConformanceOracle for SettlesOnlyWhenShort {
+        fn reads_host_clock(&self) -> bool {
+            false
+        }
+
         fn validate_state(
             &mut self,
             _state: &[u8],
@@ -708,6 +728,10 @@ mod tests {
     }
 
     impl ConformanceOracle for Flips {
+        fn reads_host_clock(&self) -> bool {
+            false
+        }
+
         fn validate_state(
             &mut self,
             _state: &[u8],

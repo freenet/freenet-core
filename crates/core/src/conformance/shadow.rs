@@ -99,7 +99,9 @@ const MAX_CASES_PER_PROBE: usize = 64;
 /// each WASM call traps at the runtime's epoch deadline (`max_execution_seconds`,
 /// 5s by default), and a reconciliation case drives up to `MAX_RECONCILIATION_ROUNDS`
 /// rounds of them, so a deliberately-slow contract can hold one case for far longer
-/// than ten seconds. It cannot run unbounded.
+/// than ten seconds. It cannot run unbounded. A commutativity case whose merge the
+/// contract refuses is the other long case: the refusal exchange (#5725) adds up to
+/// `MAX_REFUSAL_EXCHANGE_ROUNDS` rounds of at most ten contract calls each.
 ///
 /// Two reasons this is left as it is rather than tightened. The probe runs on a
 /// blocking thread, so an overshoot costs CPU rather than event-loop latency, which is
