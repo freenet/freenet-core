@@ -368,12 +368,12 @@ pub(crate) const QUIC_CRYPTO_HOLD_BYTES: usize = QUIC_CRYPTO_BUFFER_BYTES + 32 *
 /// | CRYPTO reassembly, one space, derived ([`QUIC_CRYPTO_HOLD_BYTES`]) | 49,152 |
 /// | quinn's `stopped` map, `recycle::SEND_ABORT_LIMIT` x [`QUIC_STOPPED_ENTRY_BYTES`] | 425,984 |
 /// | ACK-only tail ([`QUIC_ACK_TAIL_BYTES`]) | 245,760 |
-/// | in-order-phase hold at the initial window, under the detector (`hold::hold_charge` of [`INITIAL_RECEIVE_WINDOW_BYTES`]) | 57,868 |
-/// | **total** | **918,028 (about 897 KiB)** |
+/// | receive side at the initial window: unread credit and the staging cap (`budget::receive_charge` of [`INITIAL_RECEIVE_WINDOW_BYTES`]) | 49,152 |
+/// | **total** | **909,312 (888 KiB)** |
 ///
-/// A data path's hold at its own window is in its buffer-budget charge
-/// (`budget`); this term covers every connection, a shadow path included,
-/// at the window it starts with.
+/// A data path's receive side at its own window is in its buffer-budget
+/// charge (`budget`); this term covers every connection, a shadow path
+/// included, at the window it starts with.
 ///
 /// The `stopped` map is charged at the limit's worst case. quinn adds an entry
 /// when a stream's `stopped()` is polled and removes it only when the peer
@@ -394,7 +394,7 @@ pub(crate) const QUIC_CONNECTION_CHARGE_BYTES: usize = QUIC_CONNECTION_FIXED_BYT
     + QUIC_CRYPTO_HOLD_BYTES
     + super::recycle::SEND_ABORT_LIMIT as usize * QUIC_STOPPED_ENTRY_BYTES
     + QUIC_ACK_TAIL_BYTES
-    + super::hold::hold_charge(INITIAL_RECEIVE_WINDOW_BYTES) as usize;
+    + super::budget::receive_charge(INITIAL_RECEIVE_WINDOW_BYTES) as usize;
 
 /// The share of the node's memory for QUIC buffers that scale with the windows,
 /// as a divisor: one sixteenth.
@@ -404,9 +404,8 @@ const QUIC_BUFFER_BUDGET_DIVISOR: usize = 16;
 /// windows (received data, send windows, gaps), node memory / 16: 64 MiB at
 /// 1 GiB, 128 MiB at 2 GiB, 475 MiB at the 7600 MiB gateway. What does not
 /// scale with them is charged per connection ([`QUIC_CONNECTION_CHARGE_BYTES`]).
-/// Nothing is metered against it yet: the meter comes with the dynamic windows,
-/// and the aggregate sum with the aggregate-accounting step (#5940).
-#[cfg_attr(not(test), allow(dead_code))]
+/// Each data path's windows are set from it (`budget::QuicBudget`); the node
+/// aggregate sums it in the aggregate-accounting step (#5940).
 pub(crate) fn quic_buffer_budget_for(memory_limit: usize) -> usize {
     memory_limit / QUIC_BUFFER_BUDGET_DIVISOR
 }

@@ -43,7 +43,6 @@ pub(crate) mod config;
 pub(crate) mod control;
 pub(crate) mod error;
 pub(crate) mod framing;
-pub(crate) mod hold;
 pub(crate) mod identity;
 pub(crate) mod liveness;
 #[cfg(any(test, feature = "quic-panic-injection"))]
@@ -229,8 +228,6 @@ pub(crate) struct EndpointCore {
     /// The node's buffer budget, from which each data path's windows are set
     /// (`budget`).
     buffer_budget: Arc<budget::QuicBudget>,
-    /// The socket's registry of connection hold detectors (`hold`).
-    holds: Arc<hold::HoldRegistry>,
     /// Test hooks that inject faults into quinn's drivers.
     #[cfg(any(test, feature = "testing"))]
     faults: Arc<socket::SocketFaults>,
@@ -561,7 +558,6 @@ impl QuicEndpoint {
         #[cfg(any(test, feature = "testing"))]
         let mut faults = None;
         let mut cap_holds = None;
-        let mut holds = None;
         // If quinn refuses the socket after the ingress is enabled, the
         // ingress is disabled again, so the node is left as with QUIC off.
         let endpoint = socket
@@ -573,7 +569,6 @@ impl QuicEndpoint {
                     health.clone(),
                 ));
                 cap_holds = Some(quic_socket.cap_holds());
-                holds = Some(quic_socket.hold_registry());
                 #[cfg(any(test, feature = "testing"))]
                 {
                     faults = Some(quic_socket.faults());
@@ -624,8 +619,6 @@ impl QuicEndpoint {
                 // Set by the closure, which ran: `endpoint` is built.
                 cap_holds: cap_holds.expect("the QUIC socket's cap holds"),
                 buffer_budget,
-                // Set by the closure, as `cap_holds`.
-                holds: holds.expect("the QUIC socket's hold registry"),
                 #[cfg(any(test, feature = "testing"))]
                 faults: faults.unwrap_or_default(),
                 #[cfg(any(test, feature = "testing"))]
@@ -914,7 +907,6 @@ impl QuicEndpoint {
             peer,
             self.health.clone(),
             holds,
-            self.holds.clone(),
         ))
     }
 }
@@ -964,7 +956,6 @@ impl EndpointCore {
                 peer: expected,
                 hold,
                 cap_holds: Arc::new(self.cap_holds.like()),
-                holds: self.holds.clone(),
             });
         }
     }
@@ -986,8 +977,6 @@ pub(crate) struct QuicIncoming {
     hold: KeyHold,
     /// The connection's own record of cap-held transmits, given to its poller.
     cap_holds: Arc<socket::CapHolds>,
-    /// The endpoint's hold-detector registry, handed to the connection.
-    holds: Arc<hold::HoldRegistry>,
 }
 
 impl QuicIncoming {
@@ -1052,7 +1041,6 @@ impl QuicIncoming {
             self.peer,
             self.health,
             self.cap_holds,
-            self.holds,
         ))
     }
 }
@@ -1070,8 +1058,6 @@ pub(crate) struct QuicConnection {
     /// This connection's record of cap-held transmits, for the path's watch,
     /// stall count and send gaps.
     cap_holds: Arc<socket::CapHolds>,
-    /// Where the path registers its hold detector (`hold`).
-    holds: Arc<hold::HoldRegistry>,
 }
 
 impl std::fmt::Debug for QuicConnection {
@@ -1090,7 +1076,6 @@ impl QuicConnection {
         peer: PeerKey,
         health: Arc<EndpointHealth>,
         cap_holds: Arc<socket::CapHolds>,
-        holds: Arc<hold::HoldRegistry>,
     ) -> Self {
         let mut availability = health.watch();
         let mut adapter_panic = health.adapter_panic_watch();
@@ -1149,7 +1134,6 @@ impl QuicConnection {
             closer,
             peer,
             cap_holds,
-            holds,
         }
     }
 
@@ -1180,16 +1164,6 @@ impl QuicConnection {
     /// This connection's record of the QUIC transmits the egress cap holds.
     pub(crate) fn cap_holds(&self) -> Arc<socket::CapHolds> {
         self.cap_holds.clone()
-    }
-
-    /// Count datagrams from the peer into `detector` while the registration
-    /// lives.
-    pub(crate) fn register_hold(
-        &self,
-        detector: &Arc<hold::HoldDetector>,
-    ) -> hold::HoldRegistration {
-        self.holds
-            .register(self.connection.remote_address(), detector)
     }
 
     /// The connection's closer, for another task that may close it (the

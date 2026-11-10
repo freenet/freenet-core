@@ -307,11 +307,25 @@ pub(crate) struct QuicPathLimits {
     /// in a test that trips it.
     #[cfg(test)]
     pub(crate) max_gaps: usize,
-    /// A hold-detector threshold in bytes for a test path with no buffer budget
-    /// (`hold`); `None` leaves such a path without a detector. A path with a
-    /// budget always has one.
+    /// The cap of the connection's staged bytes for a test path with no
+    /// buffer budget (`inbound::ConnStaging`); `None` keeps the default
+    /// ([`staging_cap_without_meter`]). A metered path's follows its credit.
     #[cfg(test)]
-    pub(crate) hold_threshold: Option<u64>,
+    pub(crate) staging_cap: Option<usize>,
+}
+
+/// The cap of a connection's staged bytes on a path with no buffer budget
+/// meter: twice the credit its connection starts with. A shadow path keeps the
+/// endpoint's initial window (`config::INITIAL_RECEIVE_WINDOW_BYTES`); a data
+/// path without a meter (tests only: every node path has the budget) is taken
+/// to run at the floor window.
+fn staging_cap_without_meter(accept_data: bool) -> usize {
+    let credit = if accept_data {
+        super::budget::MIN_WINDOW_BYTES
+    } else {
+        super::config::INITIAL_RECEIVE_WINDOW_BYTES
+    };
+    super::budget::staging_cap(credit)
 }
 
 impl QuicPathLimits {
@@ -341,7 +355,7 @@ impl QuicPathLimits {
         #[cfg(test)]
         max_gaps: inbound::MAX_GAPS_PER_CONNECTION,
         #[cfg(test)]
-        hold_threshold: None,
+        staging_cap: None,
     };
 
     /// [`Self::DEFAULT`] for a path in shadow mode: control frames only.
@@ -461,11 +475,15 @@ quic_outcomes! {
         /// the gaps of streams it stopped stay counted for the connection's
         /// life, because quinn keeps them until the peer ends the stream.
         ClosedTooManyRanges => "closed_too_many_ranges",
-        /// The stream was still in its in-order phase (header, metadata or
-        /// control body) when the connection's hold passed its threshold
-        /// (`quic::hold`), so it was stopped (`stop_code::EVICTED`) and quinn
-        /// freed what it held for it.
-        EvictedHold => "evicted_hold",
+        /// Staging what the stream had read before its header, metadata or
+        /// control body was taken would have passed the connection's staging
+        /// cap (`inbound::ConnStaging`), so the stream was stopped
+        /// (`stop_code::EVICTED`).
+        EvictedStaged => "evicted_staged",
+        /// A second stream passed the staging cap within
+        /// `inbound::STAGED_TRIP_WINDOW`, so the path was closed with
+        /// OVER_BUDGET (once per path).
+        ClosedStagedOverCap => "closed_staged_over_cap",
     }
 }
 
@@ -694,9 +712,6 @@ pub(crate) struct QuicPath {
     /// The path's share of the node's buffer budget, for a path that reads
     /// data (`budget::ConnMeter`); `None` for a shadow path.
     meter: Option<Arc<super::budget::ConnMeter>>,
-    /// Counts datagrams into the path's hold detector while the path lives
-    /// (`hold`).
-    _hold: Option<super::hold::HoldRegistration>,
     /// One permit per streamed message in flight
     /// ([`STREAMED_SEND_LIMIT`]), so the remaining uni stream slots stay
     /// for short messages and control frames. Never closed.
@@ -870,6 +885,12 @@ impl QuicPath {
                 .unwrap_or(&crate::transport::TRANSPORT_METRICS.quic_data),
         ));
         let (controls_tx, controls) = mpsc::channel(limits.control_capacity);
+        #[cfg(test)]
+        let staging_cap = limits
+            .staging_cap
+            .unwrap_or_else(|| staging_cap_without_meter(limits.accept_data));
+        #[cfg(not(test))]
+        let staging_cap = staging_cap_without_meter(limits.accept_data);
         let mut receiver = inbound::Receiver::new(
             time.clone(),
             budget.clone(),
@@ -878,6 +899,7 @@ impl QuicPath {
             controls_tx,
             limits.accept_data,
             connection.closer(),
+            staging_cap,
         );
         #[cfg(test)]
         {
@@ -899,35 +921,13 @@ impl QuicPath {
             Arc::new(windows.register(
                 Arc::new(connection.inner().clone()),
                 receiver.ranges(),
+                receiver.staging(),
                 time.now_nanos(),
             ))
         });
         if let Some(meter) = &meter {
             receiver.set_meter(meter.clone());
         }
-        // What quinn holds for streams in their in-order phase is bounded by a
-        // detector (`hold`): from the meter's window on a data path, from the
-        // endpoint's initial window on a shadow path. A test path with no budget
-        // has one only if its limits name a threshold.
-        #[cfg(test)]
-        let test_threshold = limits.hold_threshold;
-        #[cfg(not(test))]
-        let test_threshold: Option<u64> = None;
-        let hold_threshold = match (windows, test_threshold) {
-            (Some(_), _) => Some(super::hold::hold_threshold(
-                super::config::INITIAL_RECEIVE_WINDOW_BYTES,
-            )),
-            (None, threshold) => threshold,
-        };
-        let hold =
-            hold_threshold.map(|threshold| super::hold::HoldDetector::new(threshold, stats.node()));
-        let hold_registration = hold.as_ref().map(|hold| {
-            receiver.set_hold(hold.clone());
-            if let Some(meter) = &meter {
-                meter.watch_hold(hold.clone());
-            }
-            connection.register_hold(hold)
-        });
         #[cfg(test)]
         let inbound_ranges = receiver.ranges();
         let aborts = Arc::new(SendAborts::new(
@@ -982,7 +982,6 @@ impl QuicPath {
                 receive,
                 aborts,
                 meter,
-                _hold: hold_registration,
                 stream_slots: Arc::new(tokio::sync::Semaphore::new(STREAMED_SEND_LIMIT as usize)),
                 send_data: AtomicU8::new(SEND_DATA_NEVER),
                 counted_as_data_path: std::sync::atomic::AtomicBool::new(false),
@@ -1049,33 +1048,6 @@ impl QuicPath {
     #[cfg(test)]
     pub(in crate::transport) fn inbound_gaps_peak(&self) -> usize {
         self.inbound_ranges.peak()
-    }
-
-    /// Streams the receive side announced after reading their end, which
-    /// must not happen. Tests only.
-    #[cfg(test)]
-    pub(in crate::transport) fn inbound_ended_before_announce(&self) -> usize {
-        self.inbound_ranges
-            .ended_before_announce
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// Chunks the receive side read past a header it did not have yet,
-    /// which must not happen. Tests only.
-    #[cfg(test)]
-    pub(in crate::transport) fn inbound_read_past_missing_header(&self) -> usize {
-        self.inbound_ranges
-            .read_past_missing_header
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// Chunks the receive side read in order by the drain before a switch to
-    /// unordered reads. Tests only.
-    #[cfg(test)]
-    pub(in crate::transport) fn inbound_drained_before_switch(&self) -> usize {
-        self.inbound_ranges
-            .drained_before_switch
-            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Gaps the receive side counts now. Tests only.
@@ -1670,6 +1642,7 @@ impl QuicPath {
         progress.mark_opened();
         let epoch = self.meter.as_ref().and_then(|meter| meter.send_epoch());
         let mut send = Outgoing::new(stream, self.aborts.clone(), slot, pacing, progress, epoch);
+        send.meter = self.meter.clone();
         send.write_all(&header.encode()).await?;
         if !metadata.is_empty() {
             send.write_all(metadata).await?;
@@ -1841,6 +1814,9 @@ struct Outgoing {
     /// held until its data is acknowledged, so a send window lowered since
     /// stays charged while quinn may still hold the stream's data.
     epoch: Option<Arc<()>>,
+    /// The path's budget meter, woken by each write so a path that only sends
+    /// still has its send window evaluated (`budget::ConnMeter::note_send`).
+    meter: Option<Arc<super::budget::ConnMeter>>,
 }
 
 type StoppedResult = Result<Option<quinn::VarInt>, quinn::StoppedError>;
@@ -1866,6 +1842,7 @@ impl Outgoing {
             wrote_a_piece: false,
             pacing,
             epoch,
+            meter: None,
         }
     }
 
@@ -1993,6 +1970,9 @@ impl Outgoing {
         match written {
             Ok(()) => {
                 self.progress.step();
+                if let Some(meter) = &self.meter {
+                    meter.note_send();
+                }
                 Ok(())
             }
             Err(quinn::WriteError::Stopped(code)) => Err(self.stopped_early(Ok(Some(code)))),
