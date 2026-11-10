@@ -242,6 +242,16 @@ jobs:
       - name: Self-test required-check path-filter guard
         run: bash scripts/required_check_path_filters_test.sh
 
+      # Regression gate for #5628: the rule review is a required check whose
+      # review step is continue-on-error, so a dead reviewer used to leave every
+      # PR with a green `rule-review/warnings` for a review that never ran. Pins
+      # that a non-run reports FAILURE, never success, and that the outage-issue
+      # bookkeeping can never cost the comment/status or fail the required job.
+      # Runs the post step's real script under mocks, then mutates it and checks
+      # the harness goes red.
+      - name: Self-test rule-review post step
+        run: bash scripts/claude_pr_review_post_step_test.sh
+
       # Regression gate for the Rust cache warm (#6105). ci-cache-warm.yml
       # writes the main-scoped caches the heavy PR jobs restore, and drift
       # between the two files fails silently (green checks, cold builds).

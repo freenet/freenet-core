@@ -11,6 +11,16 @@ name: Claude PR Rule Review
 #
 # To bypass: add 'review-override' label (requires maintainer, logged).
 #
+# When the reviewer cannot run (#5628): the review step is continue-on-error and
+# only the JOB "Claude Rule Review" is a required check, so a broken reviewer
+# never blocks merge. But a PR that was not reviewed must not look like one that
+# was, so `rule-review/warnings` is set to FAILURE ("did not run"), the sticky
+# comment says so, and an outage that PR content cannot cause (the run died
+# within a turn, or left nothing readable) opens one tracking issue that the next
+# completed review closes. The outage bookkeeping is best-effort and runs after
+# the comment and status, because an API error there must not fail the job.
+# Covered by scripts/claude_pr_review_post_step_test.sh.
+#
 # Triggers:
 # - pull_request_target: runs for all PRs (including forks) with base-repo
 #   secrets available. Safe because we only read the diff — we never execute
@@ -541,9 +551,6 @@ jobs:
             **INFO** — Style suggestions and minor improvements:
             - Missing doc comments on new public APIs
             - Catch-all `_ =>` in exhaustive matches
-            - PR bundles more than one logical change, or a commit subject is over
-              72 characters or not in conventional-commit form. Report these as INFO
-              only, never as WARNING.
 
             ## Output Format
 
@@ -591,118 +598,172 @@ jobs:
             const marker = '<!-- claude-rule-review -->';
             const reviewOutcome = '${{ steps.review.outcome }}';
             const runUrl = '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}';
+            const execFile = '${{ steps.review.outputs.execution_file }}' || '/home/runner/work/_temp/claude-execution-output.json';
 
-            // The review step is continue-on-error so a broken reviewer never
-            // blocks merge. That also makes a dead CLAUDE_CODE_OAUTH_TOKEN
-            // invisible (the job stays green): the 2026-09-27 token expiry went
-            // unnoticed for six weeks. So an outage opens ONE tracking issue
-            // (deduplicated by this marker) and the next successful review
-            // closes it again.
+            // A review that did not run must not read as one that found nothing
+            // (#5628). The review step is continue-on-error so a broken reviewer
+            // never blocks merge, and only the JOB "Claude Rule Review" is a
+            // required check, not the `rule-review/warnings` status. So a
+            // non-run reports that status as FAILURE: visible on the PR page,
+            // not a merge gate. A reviewer outage also opens ONE tracking
+            // issue, which the next review that completes closes again.
+            const NOT_RUN_STATE = 'failure';
             const outageMarker = '<!-- claude-rule-review-outage -->';
             const outageTitle = 'CI: Claude rule review is failing to run';
-            const findOutageIssue = async () => {
+
+            const setStatus = (state, description, targetUrl) =>
+              github.rest.repos.createCommitStatus({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                sha: '${{ github.event.pull_request.head.sha }}',
+                state,
+                context: 'rule-review/warnings',
+                description,
+                target_url: targetUrl || runUrl,
+              });
+
+            // Outage bookkeeping is best-effort and runs AFTER the PR comment and
+            // commit status are set: the job is a required check, so an API
+            // error here (rate limit, locked issue, 5xx) must never fail it.
+            const bestEffort = async (what, fn) => {
+              try {
+                await fn();
+              } catch (e) {
+                core.warning(`${what} failed (ignored): ${e.message}`);
+              }
+            };
+
+            // Open outage issues. They are matched by creator AND marker: the
+            // marker text is public, so the creator filter (issues made with
+            // GITHUB_TOKEN are authored by github-actions[bot]) is what stops an
+            // outsider's issue matching. If this workflow ever moves to a PAT or
+            // App token, the creator must change with it or dedup breaks.
+            const listOutageIssues = async () => {
               const issues = await github.paginate(github.rest.issues.listForRepo, {
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 state: 'open',
-                // Issues made with GITHUB_TOKEN are authored by this bot; the
-                // filter keeps this from paging through every open issue on
-                // each PR run.
                 creator: 'github-actions[bot]',
                 per_page: 100,
               });
-              return issues.find(i => !i.pull_request && (i.body || '').includes(outageMarker));
+              return issues.filter(i => !i.pull_request && (i.body || '').includes(outageMarker));
             };
 
-            // If Claude step failed, post a warning instead of silently doing nothing
-            if (reviewOutcome === 'failure') {
-              // The action hides the API error (show_full_output is off), but the
-              // execution file still carries the final `result` entry. Surface a
-              // short, backtick-free excerpt in a red annotation only; it is
-              // deliberately not copied into the PR comment or the issue.
-              let detail = 'unknown (no execution file)';
-              try {
-                const execRaw = fs.readFileSync(
-                  '${{ steps.review.outputs.execution_file }}' || '/home/runner/work/_temp/claude-execution-output.json', 'utf8');
-                const entries = JSON.parse(execRaw);
-                const last = Array.isArray(entries) ? entries[entries.length - 1] : null;
-                if (last && last.type === 'result') {
-                  detail = `subtype=${last.subtype} is_error=${last.is_error} turns=${last.num_turns} cost=${last.total_cost_usd} result=${String(last.result ?? '').replace(/`/g, "'").slice(0, 300)}`;
-                }
-              } catch (e) {
-                detail = `unreadable execution file: ${e.message}`;
-              }
-              core.error(`Claude rule review failed to run: ${detail}`);
-
-              if (!(await findOutageIssue())) {
-                await github.rest.issues.create({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  title: outageTitle,
-                  body: outageMarker + '\n' +
-                    'The `Claude PR Rule Review` workflow could not run its review, so PRs are being merged without it. ' +
-                    'The job still reports green because the review step is `continue-on-error`.\n\n' +
-                    'Most likely cause: the `CLAUDE_CODE_OAUTH_TOKEN` repository secret has expired or been revoked ' +
-                    '(re-issue it with `claude setup-token` and update the secret), or the account behind it is out of usage. ' +
-                    'The step\'s error annotation on the run below has the actual API error.\n\n' +
-                    `First failing run: ${runUrl}\n\n` +
-                    'This issue is opened and closed automatically by the workflow; it closes itself after the next successful review.',
-                });
-              }
-
-              const warningBody = marker + '\n' +
-                '### Claude Rule Review: Failed to run\n\n' +
-                'The Claude rule review step failed (likely an authentication or API issue). ' +
-                'Check the [workflow logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.\n\n' +
-                '---\n*Advisory review against `.claude/rules/`. Critical patterns are enforced by the Rule Lint CI job.*';
-
-              const { data: comments } = await github.rest.issues.listComments({
+            // Only an outage that PR content cannot cause opens an issue: the run
+            // died within about a turn (API refused it: credential, usage, or
+            // outage), or never left a readable result. A max-turns or oversized
+            // diff failure is per-PR and only gets the red status and annotation.
+            const reportOutage = (detail, systemic) => bestEffort('outage reporting', async () => {
+              core.error(`Claude rule review did not run: ${detail}`);
+              if (!systemic) return;
+              if ((await listOutageIssues()).length > 0) return;
+              await github.rest.issues.create({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                issue_number: context.issue.number,
-                per_page: 100,
+                title: outageTitle,
+                body: outageMarker + '\n' +
+                  '@sanity: the `Claude PR Rule Review` workflow could not complete a review. ' +
+                  'Affected PRs show a red `rule-review/warnings` status; the required `Claude Rule Review` check stays green, so merges are not blocked.\n\n' +
+                  'The run ended within about a turn, before any model work, which points at the credential or account rather than the diff: ' +
+                  'the account behind `CLAUDE_CODE_OAUTH_TOKEN` out of usage, or the token revoked or expired (the secret dates from 2025-09-27). ' +
+                  'See #5628 for the pattern. The error annotation on the run below carries the API error text.\n\n' +
+                  `First failing run: ${runUrl}\n\n` +
+                  'This issue is opened and closed automatically; it closes itself after the next review that completes.',
               });
+            });
 
-              const existing = comments.find(c => c.body.includes(marker));
-              if (existing) {
-                await github.rest.issues.updateComment({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  comment_id: existing.id,
-                  body: warningBody,
-                });
-              } else {
+            const clearOutage = () => bestEffort('closing outage issue', async () => {
+              for (const issue of await listOutageIssues()) {
                 await github.rest.issues.createComment({
                   owner: context.repo.owner,
                   repo: context.repo.repo,
-                  issue_number: context.issue.number,
-                  body: warningBody,
+                  issue_number: issue.number,
+                  body: `A review completed again: ${runUrl}. Closing.`,
+                });
+                await github.rest.issues.update({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issue.number,
+                  state: 'closed',
+                  state_reason: 'completed',
                 });
               }
-              // Don't block merge because the review tool broke — set success
-              await github.rest.repos.createCommitStatus({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                sha: '${{ github.event.pull_request.head.sha }}',
-                state: 'success',
-                context: 'rule-review/warnings',
-                description: 'Review failed to run — not blocking merge',
-                target_url: '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
+            });
+
+            // The final `result` entry of the execution file, as a one-line
+            // description for the annotation. The action hides the API error
+            // (show_full_output is off) but the file still has it. The excerpt is
+            // capped and backtick-free and goes ONLY to the annotation, not to the
+            // PR comment or the issue. `systemic` is true unless the entry shows a
+            // run that got going (more than one turn) and then failed.
+            const describeFailure = () => {
+              try {
+                const entries = JSON.parse(fs.readFileSync(execFile, 'utf8'));
+                const last = Array.isArray(entries) ? entries[entries.length - 1] : null;
+                if (last && last.type === 'result') {
+                  return {
+                    detail: `subtype=${last.subtype} is_error=${last.is_error} turns=${last.num_turns} cost=${last.total_cost_usd} result=${String(last.result ?? '').replace(/`/g, "'").slice(0, 300)}`,
+                    systemic: !(last.is_error === true && Number(last.num_turns) > 1),
+                  };
+                }
+                return { detail: 'execution file has no result entry', systemic: true };
+              } catch (e) {
+                return { detail: `unreadable execution file: ${e.message}`, systemic: true };
+              }
+            };
+
+            // If Claude step failed, say so instead of silently doing nothing
+            if (reviewOutcome === 'failure') {
+              const failure = describeFailure();
+
+              const warningBody = marker + '\n' +
+                '### Claude Rule Review: Failed to run\n\n' +
+                'The Claude rule review step failed, so this PR was **not reviewed**. ' +
+                'The `rule-review/warnings` status is red for that reason and is not a merge gate. ' +
+                'Check the [workflow logs](' + runUrl + ') for details.\n\n' +
+                '---\n*Advisory review against `.claude/rules/`. Critical patterns are enforced by the Rule Lint CI job.*';
+
+              // Status first: it is the primary signal and must not be lost to a
+              // failure posting the comment.
+              await setStatus(NOT_RUN_STATE, 'Review did not run, re-run required (not a merge gate)');
+              await bestEffort('posting the not-reviewed comment', async () => {
+                const { data: comments } = await github.rest.issues.listComments({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.issue.number,
+                  per_page: 100,
+                });
+                const existing = comments.find(c => c.body.includes(marker));
+                if (existing) {
+                  await github.rest.issues.updateComment({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    comment_id: existing.id,
+                    body: warningBody,
+                  });
+                } else {
+                  await github.rest.issues.createComment({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: context.issue.number,
+                    body: warningBody,
+                  });
+                }
               });
-              core.warning('Claude rule review failed — warning comment posted on PR');
+              await reportOutage(failure.detail, failure.systemic);
               return;
             }
 
-            const execFile = '${{ steps.review.outputs.execution_file }}' || '/home/runner/work/_temp/claude-execution-output.json';
-
             // Read Claude's output — the file is a JSON array of Turn objects
             let report = '';
+            let resultEntry = null;
             try {
               const raw = fs.readFileSync(execFile, 'utf8');
               const turns = JSON.parse(raw);
 
               // Find the last assistant turn with text content
               if (Array.isArray(turns)) {
+                resultEntry = turns.filter(t => t && t.type === 'result').pop() || null;
                 const assistantTurns = turns.filter(t => t.type === 'assistant' && t.message?.content);
                 if (assistantTurns.length > 0) {
                   const last = assistantTurns[assistantTurns.length - 1];
@@ -714,48 +775,18 @@ jobs:
               }
             } catch (e) {
               console.log(`Could not parse execution file: ${e.message}`);
-              // Set success so we don't block merge on parse failure
-              await github.rest.repos.createCommitStatus({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                sha: '${{ github.event.pull_request.head.sha }}',
-                state: 'success',
-                context: 'rule-review/warnings',
-                description: 'Parse error — not blocking merge',
-              });
+              // The step reported success but left nothing usable: that is a
+              // non-run too, and the same silent outage as a failed step.
+              await setStatus(NOT_RUN_STATE, 'Review output unreadable, re-run required (not a merge gate)');
+              await reportOutage(`unparseable execution file: ${e.message}`, true);
               return;
             }
 
             if (!report || report.trim().length === 0) {
               console.log('No report content found');
-              // Set success so we don't block merge
-              await github.rest.repos.createCommitStatus({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                sha: '${{ github.event.pull_request.head.sha }}',
-                state: 'success',
-                context: 'rule-review/warnings',
-                description: 'No report content — not blocking merge',
-              });
+              await setStatus(NOT_RUN_STATE, 'Review produced no report, re-run required (not a merge gate)');
+              await reportOutage('review step succeeded but produced no report text', true);
               return;
-            }
-
-            // A real report means the reviewer works again: close any open outage issue.
-            const outage = await findOutageIssue();
-            if (outage) {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: outage.number,
-                body: `Review ran successfully again: ${runUrl}. Closing.`,
-              });
-              await github.rest.issues.update({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: outage.number,
-                state: 'closed',
-                state_reason: 'completed',
-              });
             }
 
             // Count WARNING-level findings using structured marker (reliable)
@@ -782,51 +813,54 @@ jobs:
               : '';
             const body = report + '\n\n---\n*Rule review against `.claude/rules/`. WARNING findings block merge.' + statusSuffix + '*';
 
-            // Find and update existing sticky comment, or create new one
-            const { data: comments } = await github.rest.issues.listComments({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              per_page: 100,
-            });
-
-            const existing = comments.find(c => c.body.includes(marker));
-            const fullBody = marker + '\n' + body;
-
-            if (existing) {
-              await github.rest.issues.updateComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                comment_id: existing.id,
-                body: fullBody,
-              });
-              console.log(`Updated existing comment ${existing.id}`);
-            } else {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: context.issue.number,
-                body: fullBody,
-              });
-              console.log('Created new review comment');
-            }
-
-            // Set commit status based on warnings
+            // Set commit status based on warnings. Status first: it is the primary
+            // signal, and an API error posting the comment must not lose it.
             const state = hasWarnings ? 'failure' : 'success';
             const description = hasWarnings
               ? `${warningCount} warning(s) found — fix or add review-override label`
               : 'No warnings found';
 
-            await github.rest.repos.createCommitStatus({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              sha: '${{ github.event.pull_request.head.sha }}',
-              state,
-              context: 'rule-review/warnings',
-              description,
-              target_url: `${{ github.server_url }}/${{ github.repository }}/pull/${{ github.event.pull_request.number }}`
-            });
+            await setStatus(state, description,
+              `${{ github.server_url }}/${{ github.repository }}/pull/${{ github.event.pull_request.number }}`);
             console.log(`Set commit status: ${state} (${description})`);
+
+            // Find and update existing sticky comment, or create new one
+            await bestEffort('posting the review comment', async () => {
+              const { data: comments } = await github.rest.issues.listComments({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                per_page: 100,
+              });
+
+              const existing = comments.find(c => c.body.includes(marker));
+              const fullBody = marker + '\n' + body;
+
+              if (existing) {
+                await github.rest.issues.updateComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  comment_id: existing.id,
+                  body: fullBody,
+                });
+                console.log(`Updated existing comment ${existing.id}`);
+              } else {
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.issue.number,
+                  body: fullBody,
+                });
+                console.log('Created new review comment');
+              }
+            });
+
+            // A completed review means the reviewer works again. Close the outage
+            // issue only on clear evidence: a final `result` entry that is not an
+            // error. Done last, so it can never cost the comment or the status.
+            if (resultEntry && resultEntry.is_error !== true) {
+              await clearOutage();
+            }
 
       - name: Set status to success if skipped
         if: github.event_name != 'merge_group' && steps.override.outputs.overridden != 'true' && steps.rules.outputs.skip == 'true'
