@@ -336,17 +336,24 @@ fn apply_start_knobs() -> String {
     )
 }
 
-/// A UDP-transport pair on loopback: send a message with `send`, read each
-/// assembled message's length from the receiver.
-async fn udp_pair(
-    limit: Option<usize>,
-    link: Option<LinkSpec>,
-) -> (
+type UdpPair = (
     mpsc::Sender<Vec<u8>>,
     mpsc::UnboundedReceiver<usize>,
     Vec<tokio::task::JoinHandle<()>>,
     u16,
-) {
+);
+
+/// A UDP-transport pair on loopback: send a message with `send`, read each
+/// assembled message's length from the receiver.
+async fn udp_pair(limit: Option<usize>, link: Option<LinkSpec>) -> UdpPair {
+    try_udp_pair(limit, link)
+        .await
+        .expect("connect within LAB_UDP_CONNECT_S")
+}
+
+/// [`udp_pair`], `None` when the handshake does not complete within
+/// `LAB_UDP_CONNECT_S` (15 s).
+async fn try_udp_pair(limit: Option<usize>, link: Option<LinkSpec>) -> Option<UdpPair> {
     let free_port = || {
         std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
             .unwrap()
@@ -386,7 +393,7 @@ async fn udp_pair(
         async { tokio::join!(connecting, b_in.next_connection()) },
     )
     .await
-    .expect("connect within 15 s");
+    .ok()?;
     let (mut a_conn, mut b_conn) = (a_conn.expect("a"), b_conn.expect("b accepts"));
     let (send_tx, mut send_rx) = mpsc::channel::<Vec<u8>>(1);
     let (got_tx, got_rx) = mpsc::unbounded_channel();
@@ -417,7 +424,7 @@ async fn udp_pair(
     // The listeners' handles only report how they ended; dropping them
     // leaves the tasks running.
     drop((a_listener, b_listener));
-    (send_tx, got_rx, vec![a_task, b_task, keep], a_port)
+    Some((send_tx, got_rx, vec![a_task, b_task, keep], a_port))
 }
 
 enum Pair {
@@ -1498,7 +1505,11 @@ fn quic_lab_cold() {
                             }
                         }
                         "udp" => {
-                            let (send, mut got, _tasks, a_port) = udp_pair(None, link).await;
+                            let Some((send, mut got, _tasks, a_port)) =
+                                try_udp_pair(None, link).await
+                            else {
+                                return "ok=0 failure=\"connect\"".to_string();
+                            };
                             let mut wait = async |n: usize| {
                                 tokio::time::timeout(limit, got.recv())
                                     .await
