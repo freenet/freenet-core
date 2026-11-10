@@ -758,6 +758,9 @@ pub(crate) struct QuicPath {
     /// The receive side's count of received ranges. Tests only.
     #[cfg(test)]
     inbound_ranges: Arc<inbound::ConnRanges>,
+    /// The receive side's staged bytes. Tests only.
+    #[cfg(test)]
+    inbound_staging: Arc<inbound::ConnStaging>,
 }
 
 /// The path never had both data bits: nothing may send data on it.
@@ -930,6 +933,8 @@ impl QuicPath {
         }
         #[cfg(test)]
         let inbound_ranges = receiver.ranges();
+        #[cfg(test)]
+        let inbound_staging = receiver.staging();
         let aborts = Arc::new(SendAborts::new(
             limits.max_send_aborts,
             connection.closer(),
@@ -1000,6 +1005,8 @@ impl QuicPath {
                 budget,
                 #[cfg(test)]
                 inbound_ranges,
+                #[cfg(test)]
+                inbound_staging,
             },
             controls,
         )
@@ -1048,6 +1055,24 @@ impl QuicPath {
     #[cfg(test)]
     pub(in crate::transport) fn inbound_gaps_peak(&self) -> usize {
         self.inbound_ranges.peak()
+    }
+
+    /// Staged bytes the receive side holds now. Tests only.
+    #[cfg(test)]
+    pub(in crate::transport) fn inbound_staged(&self) -> usize {
+        self.inbound_staging.held()
+    }
+
+    /// Charges the inbound budget holds now. Tests only.
+    #[cfg(test)]
+    pub(in crate::transport) fn inbound_budget_streams(&self) -> usize {
+        self.budget.lock().stream_count()
+    }
+
+    /// The receive side's staging cap now. Tests only.
+    #[cfg(test)]
+    pub(in crate::transport) fn inbound_staging_cap(&self) -> usize {
+        self.inbound_staging.cap()
     }
 
     /// Gaps the receive side counts now. Tests only.

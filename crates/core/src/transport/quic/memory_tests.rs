@@ -1015,8 +1015,9 @@ fn frames_filling_the_window_measure_within_the_window_multiple() {
     // (the small-host floor), the 2 MiB window the multiple was first
     // measured at the top of, and the largest a data path grows to
     // (budget::MAX_WINDOW_BYTES). At the larger windows these lengths make
-    // over 2048 chunks, so the chunk-count trigger compacts them; the premise
-    // is only that the stream held more than the window.
+    // over 2048 chunks, so the chunk-count trigger compacts them earlier: the
+    // premise there is only that the stream held more than the window, and at
+    // the windows main measured (up to 2 MiB) it is still half as much again.
     for window in [
         super::budget::MIN_WINDOW_SMALL_HOST_BYTES,
         2 * 1024 * 1024,
@@ -1038,9 +1039,14 @@ fn frames_filling_the_window_measure_within_the_window_multiple() {
                 hold.transient,
                 assembler_pin(1, w)
             );
+            let premise = if window <= 2 * 1024 * 1024 {
+                w as f64 * 1.5
+            } else {
+                w as f64
+            };
             assert!(
-                hold.peak > w as isize,
-                "premise: the stream held more than the window at W = {w}: {} B",
+                hold.peak as f64 > premise,
+                "premise: the stream held more than {premise} B at W = {w}: {} B",
                 hold.peak
             );
         }
@@ -1096,7 +1102,7 @@ fn quic_memory_figures_match_the_locked_versions() {
 }
 
 /// The fixed charge per connection is the sum the buffer-budget design gives
-/// (about 897 KiB, the `stopped` map at the reset limit's worst case), and the budget
+/// (888 KiB, the `stopped` map at the reset limit's worst case), and the budget
 /// for what scales with the windows is a sixteenth of node memory. A change to
 /// any term moves the first figure, so the design's connection caps are
 /// re-derived with it.
@@ -1107,19 +1113,20 @@ fn the_fixed_charge_and_the_buffer_budget_match_the_design() {
         super::recycle::SEND_ABORT_LIMIT as usize * QUIC_STOPPED_ENTRY_BYTES,
         416 * 1024
     );
-    assert_eq!(QUIC_CONNECTION_CHARGE_BYTES, 918_028);
+    assert_eq!(QUIC_CONNECTION_CHARGE_BYTES, 909_312);
     const MIB: usize = 1024 * 1024;
     assert_eq!(quic_buffer_budget_for(1024 * MIB), 64 * MIB);
     assert_eq!(quic_buffer_budget_for(2048 * MIB), 128 * MIB);
     assert_eq!(quic_buffer_budget_for(7600 * MIB), 475 * MIB);
 }
 
-/// A Stream's payload is read unordered (`path::inbound`), so quinn hands over
-/// every chunk as it arrives, gap or not: with the frames that make quinn hold
-/// more than W when nothing is read, quinn holds at most the window's worth when
-/// the reader reads, within the `W + debt` the buffer budget charges a data
-/// path for received data (`budget`). Measured at the floor window and at the
-/// largest a path grows to.
+/// Every stream is read unordered from its first byte (`path::inbound`), so
+/// quinn hands over every chunk as it arrives, gap or not: with the frames
+/// that make quinn hold more than W when nothing is read, and the stream's
+/// first byte withheld, quinn holds at most the window's worth when the reader
+/// reads, within the `W + debt` the buffer budget charges a data path for
+/// received data that is not read yet (`budget::receive_charge`). Measured at
+/// the floor window and at the largest a path grows to.
 #[test]
 fn an_unordered_reader_leaves_quinn_within_the_window_charge() {
     for window in [
@@ -1146,52 +1153,6 @@ fn an_unordered_reader_leaves_quinn_within_the_window_charge() {
                 "read unordered, {len} B frames at W = {w}: quinn held {} B, over the window",
                 read.transient
             );
-        }
-    }
-}
-
-/// What the hold detector's bound rests on (`hold`): quinn retains only
-/// datagrams it received, so with nothing read its hold is at most
-/// `RETAINED_DATAGRAM_BYTES` per datagram plus its compaction copy, at most
-/// 1.25 x the unique bytes, which the window bounds. Checked at the instant of
-/// compaction too, at the initial window and the floor, with one and four
-/// streams, over frame lengths that span quinn's compaction triggers (the
-/// worst found in a full sweep of 1 to 1,150 B were 380 B at 16 KiB and 420 B
-/// at 128 KiB). The quinn-proto version pin (`QUIC_MEMORY_MEASURED_WITH`)
-/// makes a bump re-check it.
-#[test]
-fn quinn_holds_no_more_than_its_received_datagrams() {
-    use super::hold::RETAINED_DATAGRAM_BYTES;
-    for window in [
-        super::config::INITIAL_RECEIVE_WINDOW_BYTES,
-        super::budget::MIN_WINDOW_BYTES,
-    ] {
-        let settings = QuicSettings {
-            memory_limit: 2 * 1024 * 1024 * 1024,
-            idle_timeout: None,
-            initial_window: Some(window),
-            rate_limit: Default::default(),
-        };
-        let w = window as usize;
-        for len in [1usize, 50, 380, 420, 444, 470, 1100] {
-            for streams in [1usize, 4] {
-                let per = w / streams;
-                if (per - 1) / len == 0 {
-                    continue;
-                }
-                let shapes: Vec<Shape> = (0..streams).map(|_| Shape::filling(len, per)).collect();
-                let datagrams: usize = shapes.iter().map(|s| s.frames + 1).sum();
-                let unique: usize = shapes.iter().map(Shape::credit).sum();
-                let hold = measure_gap_hold_at(&settings, &shapes);
-                let bound = datagrams as u64 * RETAINED_DATAGRAM_BYTES
-                    + (datagrams * 1200).min(unique) as u64 * 5 / 4;
-                assert!(
-                    hold.transient as u64 <= bound,
-                    "W = {w}, {streams} streams of {len} B frames: quinn held {} B at its \
-                     highest over {datagrams} datagrams, more than {bound} B",
-                    hold.transient
-                );
-            }
         }
     }
 }

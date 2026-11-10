@@ -4,18 +4,29 @@ use std::time::Duration;
 
 use super::*;
 use crate::transport::metrics::QuicDataCounters;
-use crate::transport::quic::path::inbound::ConnRanges;
+use crate::transport::quic::path::inbound::{ConnRanges, ConnStaging};
 
 const MS: u64 = 1_000_000;
 const RTT: Duration = Duration::from_millis(10);
 const FLOOR: u64 = MIN_WINDOW_BYTES;
 
 /// A connection that records the windows set on it.
-#[derive(Default)]
 struct Fake {
     recv: Mutex<Vec<u64>>,
     send: Mutex<Vec<u64>>,
     cwnd: AtomicU64,
+    rtt: Mutex<Duration>,
+}
+
+impl Default for Fake {
+    fn default() -> Self {
+        Self {
+            recv: Mutex::default(),
+            send: Mutex::default(),
+            cwnd: AtomicU64::default(),
+            rtt: Mutex::new(RTT),
+        }
+    }
 }
 
 impl WindowControl for Fake {
@@ -26,7 +37,7 @@ impl WindowControl for Fake {
         self.send.lock().unwrap().push(bytes);
     }
     fn rtt(&self) -> Duration {
-        RTT
+        *self.rtt.lock().unwrap()
     }
     fn congestion_window(&self) -> u64 {
         self.cwnd.load(Ordering::Relaxed)
@@ -46,16 +57,19 @@ fn counters() -> &'static QuicDataCounters {
 struct Conn {
     fake: Arc<Fake>,
     ranges: Arc<ConnRanges>,
+    staging: Arc<ConnStaging>,
     meter: ConnMeter,
 }
 
 fn conn(budget: &Arc<QuicBudget>, now: u64) -> Conn {
     let fake = Arc::new(Fake::default());
     let ranges = Arc::new(ConnRanges::new(MIN_GAPS_PER_CONNECTION, 64));
-    let meter = budget.register(fake.clone(), ranges.clone(), now);
+    let staging = Arc::new(ConnStaging::new(0, counters()));
+    let meter = budget.register(fake.clone(), ranges.clone(), staging.clone(), now);
     Conn {
         fake,
         ranges,
+        staging,
         meter,
     }
 }
@@ -73,9 +87,14 @@ fn a_new_path_is_charged_its_floor_windows() {
     let a = conn(&budget, 0);
     assert_eq!(
         a.meter.charge(),
-        crate::transport::quic::hold::hold_charge(FLOOR) + FLOOR + FLOOR / 8 + CONTROL_BUFFER_BYTES
+        3 * FLOOR
+            + FLOOR
+            + FLOOR / 8
+            + MIN_GAPS_PER_CONNECTION as u64 * GAP_BYTES
+            + CONTROL_BUFFER_BYTES
     );
-    assert!(a.meter.charge() <= floor_grant(FLOOR));
+    assert_eq!(a.meter.charge(), floor_grant(FLOOR));
+    assert_eq!(a.staging.cap(), 2 * FLOOR as usize, "the staging cap follows the credit");
     assert_eq!(budget.charged(), a.meter.charge());
     drop(a);
     assert_eq!(budget.charged(), 0, "a dropped path frees its share");
@@ -180,8 +199,16 @@ fn a_path_above_its_share_shrinks_and_keeps_its_debt_charged_until_read() {
 
     let newcomer = conn(&budget, at);
     deliver_window(&newcomer, FLOOR, at + 10 * MS);
+    assert_eq!(
+        big.fake.last_recv(),
+        Some(grown),
+        "another connection's evaluation only asks for the shrink"
+    );
+    assert!(big.meter.pending_shrink().is_some());
+    big.meter.evaluate(at + 11 * MS).unwrap();
     let shrunk = big.fake.last_recv().unwrap();
-    assert!(shrunk < grown, "the big path was shrunk: {shrunk}");
+    assert!(shrunk < grown, "the big path shrank in its own evaluation: {shrunk}");
+    assert!(big.meter.pending_shrink().is_none());
     let debt = big.meter.debt();
     assert_eq!(debt, grown - shrunk);
     assert_eq!(
@@ -194,6 +221,7 @@ fn a_path_above_its_share_shrinks_and_keeps_its_debt_charged_until_read() {
         gap_cap(shrunk + debt),
         "the gap cap follows W + debt"
     );
+    assert_eq!(big.staging.cap(), staging_cap(shrunk + debt));
 
     // The peer's data is read: the debt is paid and the charge falls.
     big.meter.on_read(debt, 0, at + 19 * MS);
@@ -216,18 +244,27 @@ fn debt_counts_against_growth() {
         window = deliver_window(&a, window, at).recv_window;
         at += 10 * MS;
     }
-    // b's growth shrinks a; a now holds debt.
+    // b's growth asks a to shrink.
     let mut bw = FLOOR;
     for _ in 0..8 {
         bw = deliver_window(&b, bw, at).recv_window;
         at += 10 * MS;
         assert!(budget.charged() <= total);
     }
-    assert!(a.meter.debt() > 0, "premise: a holds debt");
-    // a is limited again, but its debt is unread (nothing read): it may not
-    // grow past its share counting the debt.
-    a.meter.on_read(0, a.fake.last_recv().unwrap(), at - 1);
+    // a applies its shrink, then is limited again, but its debt is unread
+    // (nothing read): it may not grow at all while the debt holds the share.
     a.meter.evaluate(at).unwrap();
+    at += 10 * MS;
+    let debt = a.meter.debt();
+    assert!(debt > 0, "premise: a holds debt");
+    let before = a.fake.last_recv().unwrap();
+    a.meter.on_read(0, before, at - 1);
+    let seen = a.meter.evaluate(at).unwrap();
+    assert!(seen.limited, "premise: a is window-limited");
+    assert_eq!(
+        seen.recv_window, before,
+        "no growth while {debt} B of debt is unread"
+    );
     assert!(
         budget.charged() <= total,
         "{} over {total}",
@@ -264,8 +301,158 @@ fn the_floor_and_the_gap_cap_follow_the_design() {
     assert_eq!(floor_window_bytes(2 << 30), MIN_WINDOW_BYTES);
     assert_eq!(gap_cap(MIN_WINDOW_BYTES), MIN_GAPS_PER_CONNECTION);
     assert_eq!(gap_cap(MAX_WINDOW_BYTES), 8192);
-    // The design's floor grants with the hold under its detector (about
-    // 3.45 x the window): 669 KiB at 2 GiB and up, 376 KiB below.
-    assert_eq!(floor_grant(MIN_WINDOW_BYTES).div_ceil(1024), 669);
-    assert_eq!(floor_grant(MIN_WINDOW_SMALL_HOST_BYTES).div_ceil(1024), 376);
+    // The design's floor grants with the receive side at 3 x the credit:
+    // 609.5 KiB at 2 GiB and up, 345.5 KiB below.
+    assert_eq!(floor_grant(MIN_WINDOW_BYTES), 624_128);
+    assert_eq!(floor_grant(MIN_WINDOW_SMALL_HOST_BYTES), 353_792);
+    assert_eq!(receive_charge(MIN_WINDOW_BYTES), 3 * MIN_WINDOW_BYTES);
+    assert_eq!(staging_cap(MIN_WINDOW_BYTES), 2 * MIN_WINDOW_BYTES as usize);
+}
+
+/// The debt mirror counts reads made before a shrink against the debt quinn
+/// had then: a shrink asked for by another connection is applied in this
+/// connection's own evaluation, after its pending reads are taken off, so the
+/// debt equals the window it gave up and is paid exactly by later reads.
+#[test]
+fn reads_before_a_shrink_do_not_pay_its_debt() {
+    let total = 12 << 20;
+    let budget = QuicBudget::new(total, FLOOR, counters());
+    let big = conn(&budget, 0);
+    let mut at = 10 * MS;
+    let mut window = FLOOR;
+    for _ in 0..8 {
+        window = deliver_window(&big, window, at).recv_window;
+        at += 10 * MS;
+    }
+    let newcomer = conn(&budget, at);
+    deliver_window(&newcomer, FLOOR, at + MS);
+    assert!(big.meter.pending_shrink().is_some(), "premise: a shrink is asked for");
+    // Read before the shrink reaches quinn: quinn returns this credit
+    // against the window it had, so it must not pay the new debt.
+    big.meter.on_read(5000, 0, at + 2 * MS - 1);
+    big.meter.evaluate(at + 2 * MS).unwrap();
+    let shrunk = big.fake.last_recv().unwrap();
+    assert_eq!(big.meter.debt(), window - shrunk, "the whole window given up");
+}
+
+/// Evaluations are at least a round trip apart: with a long round trip, a
+/// burst of reads within it does not evaluate again.
+#[test]
+fn evaluations_are_a_round_trip_apart() {
+    let budget = QuicBudget::new(64 << 20, FLOOR, counters());
+    let a = conn(&budget, 0);
+    *a.fake.rtt.lock().unwrap() = Duration::from_millis(200);
+    assert!(a.meter.evaluate(10 * MS).is_some());
+    assert!(a.meter.maybe_evaluate(50 * MS).is_none(), "within the round trip");
+    assert!(a.meter.maybe_evaluate(150 * MS).is_none(), "within the round trip");
+    assert!(a.meter.maybe_evaluate(211 * MS).is_some(), "a round trip later");
+}
+
+/// A connection that grew and then delivers little has its receive window
+/// halved toward the floor once per IDLE_DECAY, and no further than the floor.
+#[test]
+fn an_idle_window_decays_toward_the_floor() {
+    let budget = QuicBudget::new(64 << 20, FLOOR, counters());
+    let a = conn(&budget, 0);
+    let mut at = 10 * MS;
+    let mut window = FLOOR;
+    for _ in 0..3 {
+        window = deliver_window(&a, window, at).recv_window;
+        at += 10 * MS;
+    }
+    assert_eq!(window, 8 * FLOOR, "premise: it grew");
+    let decay = nanos(IDLE_DECAY);
+    assert_eq!(a.meter.evaluate(at + decay / 2).unwrap().recv_window, window);
+    let mut seen = Vec::new();
+    for i in 1..=5 {
+        seen.push(a.meter.evaluate(at + i * decay + MS).unwrap().recv_window);
+    }
+    assert_eq!(
+        seen,
+        vec![4 * FLOOR, 2 * FLOOR, FLOOR, FLOOR, FLOOR],
+        "halved once per period, down to the floor"
+    );
+}
+
+/// A shrink never sets the gap cap below the gaps a connection already
+/// holds, so another connection's growth cannot turn the next honest gap
+/// into a trip.
+#[test]
+fn a_shrink_keeps_the_gap_cap_above_the_gaps_held() {
+    let total = 12 << 20;
+    let budget = QuicBudget::new(total, FLOOR, counters());
+    let big = conn(&budget, 0);
+    let mut at = 10 * MS;
+    let mut window = FLOOR;
+    for _ in 0..8 {
+        window = deliver_window(&big, window, at).recv_window;
+        at += 10 * MS;
+    }
+    let cap = big.ranges.cap();
+    big.ranges.set_cap(usize::MAX);
+    big.ranges.add_for_test(cap as isize);
+    big.ranges.set_cap(cap);
+    // Pay the debt so the credit falls below the gaps held.
+    let newcomer = conn(&budget, at);
+    deliver_window(&newcomer, FLOOR, at + MS);
+    big.meter.evaluate(at + 2 * MS).unwrap();
+    big.meter.on_read(big.meter.debt(), 0, at + 3 * MS);
+    big.meter.evaluate(at + 4 * MS).unwrap();
+    assert!(
+        gap_cap(big.fake.last_recv().unwrap()) < cap,
+        "premise: the credit alone would lower the cap"
+    );
+    assert!(big.ranges.cap() >= cap, "{} < {cap}", big.ranges.cap());
+}
+
+/// Growth with a budget too small for every path to grow: paths still grow
+/// within it, none past the budget, and none falls below the floor.
+#[test]
+fn growth_within_a_small_budget() {
+    let total = 4 * floor_grant(FLOOR) + 2 * FLOOR;
+    let budget = QuicBudget::new(total, FLOOR, counters());
+    let paths: Vec<Conn> = (0..4).map(|_| conn(&budget, 0)).collect();
+    let mut windows = vec![FLOOR; paths.len()];
+    let mut at = 10 * MS;
+    for _ in 0..12 {
+        for (path, window) in paths.iter().zip(windows.iter_mut()) {
+            *window = deliver_window(path, *window, at).recv_window;
+            at += MS;
+            assert!(*window >= FLOOR);
+        }
+        assert!(budget.charged() <= total, "{} over {total}", budget.charged());
+    }
+    assert!(windows.iter().any(|w| *w > FLOOR), "some room was used: {windows:?}");
+}
+
+/// Paths evaluated from several threads at once keep the node within its
+/// budget and the running total equal to a recount.
+#[test]
+fn concurrent_evaluations_stay_within_the_budget() {
+    let total = 16 << 20;
+    let budget = QuicBudget::new(total, FLOOR, counters());
+    let paths: Vec<Arc<Conn>> = (0..8).map(|_| Arc::new(conn(&budget, 0))).collect();
+    let threads: Vec<_> = paths
+        .iter()
+        .cloned()
+        .map(|path| {
+            let budget = budget.clone();
+            std::thread::spawn(move || {
+                let mut window = FLOOR;
+                let mut at = 10 * MS;
+                for _ in 0..200 {
+                    window = deliver_window(&path, window, at).recv_window;
+                    path.meter.on_read(path.meter.debt(), 0, at + 1);
+                    at += 10 * MS;
+                    assert!(budget.charged() <= total);
+                }
+            })
+        })
+        .collect();
+    for thread in threads {
+        thread.join().expect("no panic");
+    }
+    let recount = budget.charged();
+    assert!(recount <= total, "{recount} over {total}");
+    assert_eq!(budget.running_total(), recount, "the running total is a recount");
 }

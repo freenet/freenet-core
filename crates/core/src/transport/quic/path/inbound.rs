@@ -1184,6 +1184,12 @@ impl ConnRanges {
         self.peak.load(Ordering::Relaxed)
     }
 
+    /// Change the count as a read would. Tests only.
+    #[cfg(test)]
+    pub(in crate::transport::quic) fn add_for_test(&self, delta: isize) -> bool {
+        self.add(delta, 0)
+    }
+
     /// Gaps held now. Tests only.
     #[cfg(test)]
     pub(in crate::transport::quic) fn held(&self) -> usize {

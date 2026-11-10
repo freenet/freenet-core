@@ -953,10 +953,9 @@ fn full_channels_hold_data_and_drop_control_and_reused_ids_are_refused() {
         assert_eq!(p.b_in.streams.try_recv().unwrap().stream_id, second_id);
         assert_eq!(stats.count(QuicInboundOutcome::ShortDroppedFull), 0);
         assert_eq!(stats.count(QuicInboundOutcome::StreamDroppedFull), 0);
-        // The second stream was received whole while it waited, but its end
-        // was left unread until the announce, so quinn kept its slot: the
-        // slots bound how many streams can wait.
-        assert_eq!(p.b.inbound_ended_before_announce(), 0);
+        // The second stream was received whole, its end included, while it
+        // waited: the reader reads on while it waits, so quinn holds nothing
+        // for it, and the waiters are bounded by the inbound budget.
     })
 }
 
@@ -1016,13 +1015,10 @@ fn a_lost_datagram_does_not_stop_reading_past_it() {
 
 /// Several streams start together and the first datagrams, which carry
 /// their headers, are lost: the bytes after each header arrive about a round
-/// trip before it does. Nothing past a missing header is read (so no credit
-/// is returned for it: until the header says how long the stream is, nothing
-/// would bound what is read), and every stream is still read, announced and
-/// assembled byte for byte, and none is stopped. A quinn sender cannot
-/// withhold a header for long (it retransmits), so this is the case a peer
-/// withholding one would reach: with the header read unordered, the bytes
-/// after it were read and staged with no bound but the age limit.
+/// trip before it does. They are read and staged (`inbound::Staging`) under
+/// the connection's staging cap, and every stream is still read, announced and
+/// assembled byte for byte, and none is stopped: honest loss of a header stays
+/// well under the cap.
 #[test]
 fn streams_whose_first_datagrams_are_lost_all_arrive() {
     bounded(|| async move {
@@ -1095,10 +1091,11 @@ fn streams_whose_first_datagrams_are_lost_all_arrive() {
         );
         assert_eq!(stats.count(QuicInboundOutcome::TooManyRanges), 0);
         assert_eq!(
-            p.b.inbound_read_past_missing_header(),
+            stats.count(QuicInboundOutcome::EvictedStaged),
             0,
-            "nothing past a missing header is read"
+            "honest header loss stays under the staging cap"
         );
+        assert_eq!(p.b.inbound_staged(), 0, "nothing is left staged");
     })
 }
 
@@ -1446,7 +1443,8 @@ fn a_delayed_header_and_metadata_still_arrive() {
             arrival.handle.assemble().await.expect("assembled"),
             body.to_vec()
         );
-        assert_eq!(p.b.inbound_read_past_missing_header(), 0);
+        assert_eq!(p.b.stats().count(QuicInboundOutcome::EvictedStaged), 0);
+        assert_eq!(p.b.inbound_staged(), 0, "nothing is left staged");
     })
 }
 
@@ -1482,7 +1480,6 @@ fn a_short_stream_waiting_for_room_fails_at_once() {
         .await;
         let stats = p.b.stats();
         assert_eq!(stats.count(QuicInboundOutcome::Truncated), 1);
-        assert_eq!(p.b.inbound_ended_before_announce(), 0);
         assert_eq!(p.b_in.streams.try_recv().unwrap().stream_id, held);
         assert!(
             p.b_in.streams.try_recv().is_err(),
@@ -1499,12 +1496,10 @@ fn a_short_stream_waiting_for_room_fails_at_once() {
 /// instant every datagram carrying the header is lost (the first, and the
 /// resends, which carry both pieces). Then quinn holds the second piece,
 /// which starts inside the metadata, and a resend holding all of it: the
-/// in-order reads of the header and metadata take the resend, and the second
-/// piece is left buffered below where they stopped. Only in-order reads clear
-/// buffered duplicates, so the reader first drains in order what is
-/// contiguous, which pops that copy, and switches only once an in-order read
-/// would block, so the stream arrives intact. Fails without the drain and with
-/// only a trim of the copy on our side.
+/// reads of the header and metadata take the resend, and the second piece is
+/// a second copy of bytes already read. Every stream is read unordered from
+/// its first byte, and an unordered read hands out each byte once, so the
+/// copy is never read again and the stream arrives intact.
 #[test]
 fn a_second_copy_of_the_metadata_end_is_read_once() {
     bounded(|| async move {
@@ -1574,10 +1569,6 @@ fn a_second_copy_of_the_metadata_end_is_read_once() {
         );
         let stats = p.b.stats();
         assert_eq!(stats.count(QuicInboundOutcome::ReadFailed), 0);
-        assert!(
-            p.b.inbound_drained_before_switch() >= 1,
-            "premise: the drain read past the left-behind copy before the switch"
-        );
         let arrival = p.b_in.streams.try_recv().expect("announced");
         assert_eq!(arrival.metadata.as_deref(), Some(&metadata[..]));
         assert_eq!(arrival.handle.assemble().await.expect("assembled"), body);
@@ -6554,16 +6545,23 @@ fn a_data_paths_window_grows_when_delivery_fills_it() {
             snap.budget_charged_peak
         );
         assert!(snap.budget_charged_peak <= total);
+        assert!(
+            p.b.inbound_staging_cap()
+                > super::super::budget::staging_cap(super::super::tests::TEST_WINDOW),
+            "the staging cap followed the grown window: {}",
+            p.b.inbound_staging_cap()
+        );
         assert_eq!(
-            snap.hold_trips, 0,
-            "an honest transfer never trips the hold"
+            p.b.stats().count(QuicInboundOutcome::EvictedStaged),
+            0,
+            "an honest transfer stays under the staging cap"
         );
     })
 }
 
 /// A connection starts with `config::INITIAL_UNI_STREAMS` streams for its peer;
 /// a path that accepts data raises that to `MAX_UNI_STREAMS`, and a shadow path
-/// leaves it, so a shadow peer can make quinn hold in-order data on few streams.
+/// leaves it.
 #[test]
 fn only_a_path_that_takes_data_lets_its_peer_open_every_stream() {
     bounded(|| async move {
@@ -6603,75 +6601,194 @@ fn only_a_path_that_takes_data_lets_its_peer_open_every_stream() {
     })
 }
 
-/// A stream whose first datagram (its header) is lost stays in its in-order
-/// phase while the peer's other stream keeps arriving; once the datagrams since
-/// that phase began pass the hold threshold (`hold`), the stream is stopped
-/// (`EvictedHold`) and quinn frees what it held, while the other stream, whose
-/// header arrived, is delivered.
+/// Send `bytes` on a new raw uni stream of `raw` with its first datagram lost
+/// (and every resend of it, while the callback stays), so the receiver reads
+/// what follows before the stream's header. The stop code the sender saw.
+async fn send_without_its_first_datagram(
+    network: &str,
+    from: SocketAddr,
+    raw: quinn::Connection,
+    bytes: Vec<u8>,
+) -> Option<u64> {
+    use crate::transport::in_memory_socket::{
+        PacketDeliveryDecision, set_packet_delivery_callback,
+    };
+    let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    set_packet_delivery_callback(
+        network,
+        Some(Arc::new(move |_, sender, _, _| {
+            if sender == from && seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+                PacketDeliveryDecision::Drop
+            } else {
+                PacketDeliveryDecision::Deliver
+            }
+        })),
+    );
+    let stopped = raw_unfinished(raw, bytes).await;
+    set_packet_delivery_callback(network, None);
+    stopped
+}
+
+/// A stream whose first datagram (its header) is lost has what follows staged
+/// (`inbound::Staging`); past the connection's staging cap it is stopped
+/// (`EvictedStaged`) and its staged bytes freed, while another stream, whose
+/// header arrived, is delivered. A second stream past the cap within
+/// `inbound::STAGED_TRIP_WINDOW` closes the path with OVER_BUDGET.
 #[test]
-fn a_stream_waiting_for_its_header_is_stopped_when_the_hold_passes_its_threshold() {
+fn streams_past_the_staging_cap_are_stopped_and_a_second_closes_the_path() {
     bounded(|| async move {
-        use crate::transport::in_memory_socket::{
-            PacketDeliveryDecision, set_packet_delivery_callback,
-        };
         let _seed = GlobalRng::seed_guard(SEED);
         let counters = leaked_counters();
         let limits = QuicPathLimits {
             counters: Some(counters),
-            // Past the threshold at the first datagram after a phase begins, so
-            // the trip comes before quinn resends the lost header.
-            hold_threshold: Some(1),
+            // Room for one datagram's worth of an honest stream's first piece,
+            // not for two datagrams of a stream whose header is missing.
+            staging_cap: Some(2048),
             ..QuicPathLimits::DEFAULT
         };
-        let network = "quic-path-hold-trip";
+        let network = "quic-path-staging-cap";
         let mut p = paths(network, 29, limits).await;
         let settle = p.time();
         p.drive(async move { settle.sleep(Duration::from_millis(200)).await })
             .await;
-        // The first datagram `a` sends from here, the waiting stream's header,
-        // is lost (and so is every resend of it, while the test runs).
-        let from = p.pair.a_addr;
-        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counted = seen.clone();
-        set_packet_delivery_callback(
-            network,
-            Some(Arc::new(move |_, sender, _, _| {
-                if sender == from && counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0
-                {
-                    PacketDeliveryDecision::Drop
-                } else {
-                    PacketDeliveryDecision::Deliver
-                }
-            })),
-        );
-        let raw = p.a_raw();
-        let a = p.a.clone();
+        let (from, raw, a) = (p.pair.a_addr, p.a_raw(), p.a.clone());
         let body = Bytes::from(payload(256 * 1024));
         let sent = body.clone();
-        let waiting = p
+        let stopped = p
             .drive(async move {
-                // Opened first, so its header is the dropped datagram.
-                let waiting = tokio::spawn(raw_unfinished(raw, vec![9u8; 4096]));
-                tokio::task::yield_now().await;
+                let stopped = send_without_its_first_datagram(
+                    "quic-path-staging-cap",
+                    from,
+                    raw,
+                    vec![9u8; 8192],
+                )
+                .await;
                 a.send_stream(StreamId::next(), None, sent)
                     .await
                     .expect("sent");
-                waiting.await.expect("joined")
+                stopped
             })
             .await;
-        set_packet_delivery_callback(network, None);
         assert_eq!(
-            waiting,
+            stopped,
             Some(u64::from(stop_code::EVICTED)),
-            "the waiting stream was stopped"
+            "the stream past the cap was stopped"
         );
-        assert_eq!(p.b.stats().count(QuicInboundOutcome::EvictedHold), 1);
-        assert!(counters.snapshot(false).hold_trips >= 1);
+        let stats = p.b.stats();
+        assert_eq!(stats.count(QuicInboundOutcome::EvictedStaged), 1);
+        assert_eq!(stats.count(QuicInboundOutcome::ClosedStagedOverCap), 0);
+        assert_eq!(p.b.inbound_staged(), 0, "its staged bytes were freed");
+        assert!(counters.snapshot(false).staged_peak_pct > 0);
         let arrival = p
             .b_in
             .streams
             .try_recv()
             .expect("the other stream was announced");
         assert_eq!(arrival.handle.assemble().await.expect("assembled"), body);
+
+        // A second, within the window: the path closes.
+        let raw = p.a_raw();
+        p.drive(async move {
+            send_without_its_first_datagram("quic-path-staging-cap", from, raw, vec![9u8; 8192])
+                .await
+        })
+        .await;
+        assert_eq!(stats.count(QuicInboundOutcome::EvictedStaged), 2);
+        assert_eq!(stats.count(QuicInboundOutcome::ClosedStagedOverCap), 1);
+        assert_eq!(p.b.closed_with(), Some(QuicCloseCode::OverBudget));
+    })
+}
+
+/// A reader waiting for room in a full channel keeps reading (condition of the
+/// buffer budget: quinn must hold nothing for a waiting stream). A Short whose
+/// body is complete, waiting for room, and whose sender then writes past the
+/// declared end, is stopped as `Overlong` at once, while the channel is still
+/// full; a reader that stopped reading while it waited would leave those bytes
+/// with quinn until room came or the age limit passed. The same for a Stream.
+#[test]
+fn a_reader_waiting_for_room_keeps_reading() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let limits = QuicPathLimits {
+            short_capacity: 1,
+            stream_capacity: 1,
+            ..QuicPathLimits::DEFAULT
+        };
+        let mut p = paths("quic-path-wait-reads", 30, limits).await;
+        let (a, held) = (p.a.clone(), StreamId::next());
+        p.drive(async move {
+            a.send_short(b"fills").await.unwrap();
+            a.send_stream(held, None, Bytes::from_static(b"fills"))
+                .await
+                .unwrap();
+        })
+        .await;
+        for kind in [0u8, 1u8] {
+            let (raw, time) = (p.a_raw(), p.time());
+            let stopped = p
+                .drive(async move {
+                    let mut bytes = header(1, kind, if kind == 1 { 77 } else { 0 }, 100, 0);
+                    bytes.extend_from_slice(&payload(100));
+                    let mut send = raw.open_uni().await.unwrap();
+                    send.write_all(&bytes).await.unwrap();
+                    // The body is complete and the reader waits for room;
+                    // now bytes past the declared end.
+                    time.sleep(Duration::from_millis(100)).await;
+                    let _ = send.write_all(&payload(4000)).await;
+                    tokio::time::timeout(Duration::from_secs(1), send.stopped())
+                        .await
+                        .expect("stopped while the channel is still full")
+                        .expect("stopped")
+                        .map(|code| code.into_inner())
+                })
+                .await;
+            assert_eq!(stopped, Some(u64::from(stop_code::OVERLONG)), "kind {kind}");
+        }
+        assert_eq!(p.b.stats().count(QuicInboundOutcome::Overlong), 2);
+        assert!(
+            p.b_in.shorts.try_recv().is_ok() && p.b_in.streams.try_recv().is_ok(),
+            "the channels were full the whole time"
+        );
+    })
+}
+
+/// A one-packet Short is not charged, but one that has to wait for room reads
+/// on and may read its end, which frees its quinn slot, so it takes a charge
+/// before it waits: waiting messages are bounded by the inbound budget. It is
+/// delivered once room comes, and its charge goes when it is taken.
+#[test]
+fn a_waiting_one_packet_short_takes_a_charge() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let limits = QuicPathLimits {
+            short_capacity: 1,
+            ..QuicPathLimits::DEFAULT
+        };
+        let mut p = paths("quic-path-wait-charge", 31, limits).await;
+        let a = p.a.clone();
+        p.drive(async move { a.send_short(b"fills").await.unwrap() })
+            .await;
+        assert_eq!(p.b.inbound_budget_streams(), 0, "premise: one packet is not charged");
+        let (a, time) = (p.a.clone(), p.time());
+        let waiting = p
+            .drive(async move {
+                let waiting =
+                    tokio::spawn(async move { a.send_short(b"waits").await });
+                time.sleep(Duration::from_millis(200)).await;
+                waiting
+            })
+            .await;
+        assert_eq!(p.b.inbound_budget_streams(), 1, "the waiting short is charged");
+        assert_eq!(&p.b_in.shorts.try_recv().unwrap().payload()[..], b"fills");
+        let time = p.time();
+        p.drive(async move {
+            time.sleep(Duration::from_millis(200)).await;
+            waiting.await.unwrap().expect("sent");
+        })
+        .await;
+        let delivered = p.b_in.shorts.try_recv().expect("delivered after room came");
+        assert_eq!(&delivered.payload()[..], b"waits");
+        drop(delivered);
+        assert_eq!(p.b.inbound_budget_streams(), 0, "released when taken");
     })
 }

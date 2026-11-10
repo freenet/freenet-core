@@ -680,7 +680,6 @@ async fn attempt(
                             incoming.peer,
                             incoming.health,
                             incoming.cap_holds,
-                            incoming.holds,
                         ))
                     }
                 }

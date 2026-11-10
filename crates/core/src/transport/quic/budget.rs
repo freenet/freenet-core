@@ -406,6 +406,12 @@ impl QuicBudget {
         state.conns.values_mut().map(ConnState::charge).sum()
     }
 
+    /// The running total. Tests only.
+    #[cfg(test)]
+    pub(crate) fn running_total(&self) -> u64 {
+        self.state.lock().charged
+    }
+
     fn publish(&self, state: &BudgetState) {
         self.node.set_budget_charged(state.charged);
     }
