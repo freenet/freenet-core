@@ -296,7 +296,7 @@ pub(crate) struct QuicPathLimits {
     /// `TRANSPORT_METRICS`. A test passes its own, since every test in a process
     /// writes the global one.
     pub(crate) counters: Option<&'static QuicDataCounters>,
-    /// The receive task panics on its first stream (supervisor test).
+    /// The receive task panics on its first short message (supervisor test).
     #[cfg(test)]
     pub(crate) panic_in_receive: bool,
     /// The acknowledgement watch panics once the path is in a loss-rate bucket

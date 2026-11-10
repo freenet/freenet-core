@@ -374,6 +374,16 @@ impl IncomingStream {
         self.0.total_fragments()
     }
 
+    /// The longest gap between two pieces of this stream a consumer should
+    /// wait before it gives up: `STREAM_INACTIVITY_TIMEOUT` (5 s) when the
+    /// UDP transport fills it, and the reader's idle limit when a QUIC path
+    /// does (quinn retransmits until the path's own rules end the stream).
+    /// [`Self::assemble`] applies it already; a consumer of [`Self::chunks`]
+    /// brings its own timer and uses this.
+    pub(crate) fn fragment_gap_limit(&self) -> std::time::Duration {
+        self.0.fragment_gap_limit()
+    }
+
     /// Abandon the stream: anyone waiting on it gets `StreamError::Cancelled`.
     pub(crate) fn cancel(&self) {
         self.0.cancel()
@@ -413,8 +423,9 @@ impl IncomingStream {
 ///
 /// - It yields `Err` once, if the stream is cancelled or fails, and then ends.
 /// - It has **no inactivity timer**: if the sender stalls, it waits forever.
-///   A consumer must bring its own timeout (the UDP pipe uses
-///   `STREAM_INACTIVITY_TIMEOUT`).
+///   A consumer must bring its own timeout, of
+///   [`IncomingStream::fragment_gap_limit`] (as the UDP pipe does), which is
+///   not 5 s for a stream a QUIC path fills.
 /// - Under UDP it ends cleanly only once every declared byte was yielded: a
 ///   sender that filled every fragment slot short gets an `Err` instead
 ///   (#5445). A consumer should still count bytes against
