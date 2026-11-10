@@ -19,10 +19,13 @@ name: Claude PR Rule Review
 # running (step failed, unreadable execution file, no report, a final error
 # result) sets `rule-review/warnings` to FAILURE ("did not run"), replaces any
 # stale sticky comment, and, if the run ended within about a turn or left nothing
-# readable (an outage PR content cannot cause), opens one tracking issue that the
+# readable (an outage PR content is unlikely to cause), opens one tracking issue that the
 # next completed review closes. Dedup is by creator + marker and is not atomic:
-# concurrent runs can open two (the next completed review closes all), and a
-# flaky reviewer opens and closes it repeatedly. The status is set first; the
+# every run that starts before the first issue exists can open its own (the next
+# completed review closes them all), and a flaky reviewer opens and closes it
+# repeatedly, with an @sanity mention each time. A fork PR whose title provoked a
+# refusal at the very first call would look like an outage too; that is accepted.
+# The status is set first; the
 # comment and issue work are best-effort because an API error there must not fail
 # the required job. A failure of the status call itself still fails the job, on
 # purpose: nothing else can report it.
@@ -656,7 +659,7 @@ jobs:
               return issues.filter(i => !i.pull_request && (i.body || '').includes(outageMarker));
             };
 
-            // Only an outage that PR content cannot cause opens an issue: the run
+            // Only an outage PR content is unlikely to cause opens an issue: the run
             // died within about a turn (API refused it: credential, usage, or
             // outage), or never left a readable result. A max-turns or oversized
             // diff failure is per-PR and only gets the red status and annotation.
@@ -703,20 +706,33 @@ jobs:
 
             // A final `result` entry as a one-line annotation. `systemic` is true
             // unless the run got going (more than one turn). An API refusal ends
-            // the run at the first call, so anything that took more turns reached
-            // the model and is per-PR (max turns, an oversized diff), not an
-            // outage. The converse is a known blind spot: a rate limit hit
-            // mid-run looks per-PR and only the following runs reveal it. The result text is only included for a systemic
-            // failure, where it is the API's own error; for a per-PR failure it is
-            // model text the PR may have steered. Always capped and backtick-free,
-            // and it goes ONLY to the annotation, never to a comment or the issue.
+            // the run at the first call, so a run that took more turns reached the
+            // model and is treated as per-PR (max turns, an oversized diff), not
+            // an outage. Only max turns has been checked against real runs. The
+            // converse is a known blind spot: a rate limit hit mid-run looks
+            // per-PR and only the following runs reveal it.
+            //
+            // The `result` text is included only for a systemic failure, where it
+            // should be the API's own error (not yet confirmed against a real
+            // refusal: #5628 shows the entry but not its text). For a per-PR
+            // failure it is model text the PR may have steered, so it is left out.
+            // Always whitespace-collapsed, capped and backtick-free, and it goes
+            // ONLY to the annotation, never to a comment or the issue.
             // Observed shape of a real max-turns run (2026-09-09, #5628):
             // subtype=error_max_turns is_error=true num_turns=26, no result text.
+            // Total on purpose: it runs before the status is set on some paths, so
+            // a malformed entry (an object where a string is expected) must not
+            // throw and fail the required job. `safe` stringifies anything.
+            const safe = (v) => {
+              try { return String(v ?? ''); } catch (_) { return '[unprintable]'; }
+            };
             const describeEntry = (e) => {
-              const systemic = !(Number(e.num_turns) > 1);
-              const excerpt = systemic ? ` result=${String(e.result ?? '').replace(/`/g, "'").slice(0, 300)}` : '';
+              let turns = NaN;
+              try { turns = Number(e.num_turns); } catch (_) { /* malformed: counts as not got going */ }
+              const systemic = !(turns > 1);
+              const excerpt = systemic ? ` result=${safe(e.result).replace(/`/g, "'").replace(/\s+/g, ' ').slice(0, 300)}` : '';
               return {
-                detail: `subtype=${e.subtype} is_error=${e.is_error} turns=${e.num_turns} cost=${e.total_cost_usd}${excerpt}`,
+                detail: `subtype=${safe(e.subtype)} is_error=${safe(e.is_error)} turns=${safe(e.num_turns)} cost=${safe(e.total_cost_usd)}${excerpt}`,
                 systemic,
               };
             };
@@ -799,7 +815,7 @@ jobs:
               // Find the last assistant turn with text content
               if (Array.isArray(turns)) {
                 resultEntry = turns.filter(t => t && t.type === 'result').pop() || null;
-                const assistantTurns = turns.filter(t => t.type === 'assistant' && t.message?.content);
+                const assistantTurns = turns.filter(t => t && t.type === 'assistant' && t.message?.content);
                 if (assistantTurns.length > 0) {
                   const last = assistantTurns[assistantTurns.length - 1];
                   const textParts = last.message.content
@@ -873,9 +889,10 @@ jobs:
             await postStickyComment(marker + '\n' + body);
 
             // A completed review means the reviewer works again. Close the outage
-            // issue only on clear evidence: a final `result` entry that is not an
-            // error. Done last, so it can never cost the comment or the status.
-            if (resultEntry && resultEntry.is_error !== true) {
+            // issue only on clear evidence: a final `result` entry that says it
+            // succeeded (a real one reads subtype=success is_error=false). Done
+            // last, so it can never cost the comment or the status.
+            if (resultEntry && resultEntry.is_error === false && resultEntry.subtype === 'success') {
               await clearOutage();
             }
 

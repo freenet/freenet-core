@@ -96,42 +96,71 @@ const t = (desc, ok, extra) => { if (ok) console.log('ok   - ' + desc); else { f
 
 const STATES = ['error', 'failure', 'pending', 'success'];
 
-async function run({ outcome, exec, open = [], comments = [], throwOn = [], throwForIssue = [] }) {
+// Every mock method yields before recording, like a real network call. A call the
+// script forgets to `await` is then missing from `calls` when the script returns,
+// instead of being recorded synchronously and passing unnoticed.
+const tick = () => new Promise(r => setImmediate(r));
+
+async function run({ outcome, exec, open = [], comments = [], throwOn = [], throwForIssue = [], expectThrow = false }) {
   const calls = [];
   const maybe = name => { if (throwOn.includes(name)) throw new Error('boom:' + name); };
   const execPath = workDir + '/exec.json';
   if (exec === undefined) fs.rmSync(execPath, { force: true });
   else fs.writeFileSync(execPath, typeof exec === 'string' ? exec : JSON.stringify(exec));
-  const src = src0.replace(/__OUTCOME__/g, outcome).replace(/__EXEC__/g, execPath);
+  // Function replacers: a `$` in a path must not be read as a replacement pattern.
+  const src = src0.replace(/__OUTCOME__/g, () => outcome).replace(/__EXEC__/g, () => execPath);
   const listForRepo = function listForRepo() {};
+  // Calls must target this repo, with the paging the code relies on.
+  const target = a => { if (a.owner !== 'o' || a.repo !== 'r') throw new Error('wrong repo target ' + a.owner + '/' + a.repo); };
+  const paged = a => { if (a.per_page !== 100) throw new Error('missing per_page 100 (got ' + a.per_page + ')'); };
+  const known = new Set([1, ...open.map(i => i.number)]);
   const github = {
     // Like the real paginate it is handed the endpoint method itself.
     paginate: async (fn, args) => {
       if (fn !== listForRepo) throw new Error('paginate called with something other than issues.listForRepo');
-      calls.push(['paginate', args]); maybe('paginate'); return open;
+      target(args); paged(args);
+      await tick(); calls.push(['paginate', args]); maybe('paginate'); return open;
     },
     rest: {
       issues: {
         listForRepo,
-        listComments: async () => { maybe('listComments'); return { data: comments }; },
+        listComments: async a => {
+          target(a); paged(a);
+          if (a.issue_number !== 1) throw new Error('wrong listComments issue_number ' + a.issue_number);
+          await tick(); maybe('listComments'); return { data: comments };
+        },
         // The PR is #1 (context.issue.number); any other number is the outage issue.
         createComment: async a => {
-          calls.push(['comment', a.issue_number, a.body]);
+          target(a);
+          if (!known.has(a.issue_number)) throw new Error('wrong createComment issue_number ' + a.issue_number);
+          await tick(); calls.push(['comment', a.issue_number, a.body]);
           if (throwForIssue.includes(a.issue_number)) throw new Error('locked:' + a.issue_number);
           maybe(a.issue_number === 1 ? 'prComment' : 'createComment');
         },
-        updateComment: async a => { calls.push(['updateComment', a.comment_id, a.body]); },
-        create: async a => { calls.push(['issue.create', a.title, a.body]); maybe('issue.create'); },
-        update: async a => { calls.push(['issue.update', a.issue_number, a.state, a.state_reason]); maybe('issue.update'); },
+        updateComment: async a => {
+          target(a);
+          if (!comments.some(c => c.id === a.comment_id)) throw new Error('wrong updateComment comment_id ' + a.comment_id);
+          await tick(); calls.push(['updateComment', a.comment_id, a.body]);
+        },
+        create: async a => { target(a); await tick(); calls.push(['issue.create', a.title, a.body]); maybe('issue.create'); },
+        update: async a => {
+          target(a);
+          if (!known.has(a.issue_number)) throw new Error('wrong update issue_number ' + a.issue_number);
+          await tick(); calls.push(['issue.update', a.issue_number, a.state, a.state_reason]); maybe('issue.update');
+        },
       },
       repos: {
         createCommitStatus: async a => {
+          target(a);
           // What the real API would reject with a 422.
           if (!STATES.includes(a.state)) throw new Error('422 bad state ' + a.state);
           if (typeof a.description !== 'string' || a.description.length > 140) throw new Error('422 description over 140 chars: ' + (a.description || '').length);
           if (a.context !== 'rule-review/warnings') throw new Error('wrong status context ' + a.context);
           if (a.sha !== 'abc') throw new Error('wrong sha ' + a.sha);
-          calls.push(['status', a.state, a.description]); maybe('status');
+          if (typeof a.target_url !== 'string' || !/^https:\/\/github\.com\/o\/r\/(pull\/1|actions\/runs\/99)$/.test(a.target_url)) throw new Error('wrong target_url ' + a.target_url);
+          // Deliberately the slowest call: a status the script forgot to await lands after the comment.
+          for (let i = 0; i < 6; i++) await tick();
+          calls.push(['status', a.state, a.description, a.target_url]); maybe('status');
         },
       },
     },
@@ -143,8 +172,11 @@ async function run({ outcome, exec, open = [], comments = [], throwOn = [], thro
   try { await new AsyncFn('github', 'context', 'core', 'require', src)(github, ctx, core, require); }
   catch (e) { threw = e; }
   console.log = origLog;
-  // A violation of the API limits the mocks enforce is a test failure in its own right, named, not just a thrown error.
-  if (threw && /^(422|wrong status|wrong sha|paginate called)/.test(threw.message)) t('mock API contract holds', false, threw.message);
+  // A violation of the API contract the mocks enforce is a test failure in its own right, named, not just a thrown error.
+  if (threw && /^(422|wrong |missing |paginate called)/.test(threw.message)) t('mock API contract holds', false, threw.message);
+  // Only the status call may fail the job, and only where a case says so: a throw anywhere else
+  // would turn the required check red.
+  if (threw && !expectThrow) t('the job does not throw', false, String(threw));
   const idx = k => calls.findIndex(c => c[0] === k);
   return { calls, threw, statuses: calls.filter(c => c[0] === 'status'), creates: calls.filter(c => c[0] === 'issue.create'),
            closes: calls.filter(c => c[0] === 'issue.update'), errors: calls.filter(c => c[0] === 'core.error'),
@@ -171,15 +203,19 @@ const stale = { id: 5, body: STICKY + '\n### Rule Review: No issues found' };
   t('step failed: status is set BEFORE the comment', r.idx('status') !== -1 && r.idx('status') < r.idx('comment'));
 
   // Every non-run replaces a stale "No issues found" sticky comment.
+  // `outage` says whether the branch counts as an outage (opens the issue).
   const nonRuns = {
-    'step failed': { outcome: 'failure', exec: resErr(1) },
-    'unparseable execution file': { outcome: 'success', exec: 'not json {' },
-    'no report text, no result entry': { outcome: 'success', exec: [{ type: 'assistant', message: { content: [] } }] },
-    'no report text after a clean run': { outcome: 'success', exec: [okResult] },
-    'final result is an error but a report exists': { outcome: 'success', exec: [reportEntry('Invalid API key'), ...resErr(1)] },
+    'step failed': { outcome: 'failure', exec: resErr(1), outage: true },
+    'unparseable execution file': { outcome: 'success', exec: 'not json {', outage: true },
+    'no report text, no result entry': { outcome: 'success', exec: [{ type: 'assistant', message: { content: [] } }], outage: true },
+    'no report text after a clean run': { outcome: 'success', exec: [okResult], outage: false },
+    'whitespace-only report': { outcome: 'success', exec: [reportEntry('  \n '), okResult], outage: false },
+    'final result is an error but a report exists': { outcome: 'success', exec: [reportEntry('Invalid API key'), ...resErr(1)], outage: true },
   };
-  for (const [name, args] of Object.entries(nonRuns)) {
+  for (const [name, { outage, ...args }] of Object.entries(nonRuns)) {
     r = await run({ ...args, comments: [stale] });
+    t(`${name}: the status text says the review did not run`, r.statuses.length === 1 && /did not run/i.test(r.statuses[0][2]), JSON.stringify(r.statuses));
+    t(`${name}: ${outage ? 'opens' : 'does not open'} the outage issue`, r.creates.length === (outage ? 1 : 0));
     t(`${name}: status is FAILURE`, r.statuses.length === 1 && r.statuses[0][1] === 'failure', JSON.stringify(r.statuses));
     t(`${name}: the stale sticky comment is replaced with a not-reviewed one`, r.updates.length === 1 && /not reviewed/i.test(r.updates[0][2]) && r.prComments.length === 0);
   }
@@ -188,7 +224,29 @@ const stale = { id: 5, body: STICKY + '\n### Rule Review: No issues found' };
   t('good review with no warnings: status is success', r.statuses.length === 1 && r.statuses[0][1] === 'success');
   t('success path: the status is set BEFORE the sticky comment', r.idx('status') !== -1 && r.idx('status') < r.idx('comment'));
 
+  // --- where the status points, what the comments say, and what order things happen in
+  r = await run({ outcome: 'failure', exec: resErr(1) });
+  t('non-run status links to the run', r.statuses[0][3] === 'https://github.com/o/r/actions/runs/99');
+  t('failure path: the status comes before the comment, the issue lookup and the issue', r.idx('status') !== -1 && r.idx('status') < r.idx('comment') && r.idx('status') < r.idx('paginate') && r.idx('status') < r.idx('issue.create'));
+  t('not-reviewed comment carries the marker and says so', r.prComments.length === 1 && r.prComments[0][2].startsWith(STICKY) && /not reviewed/i.test(r.prComments[0][2]));
+  t('outage issue links the run', r.creates[0][2].includes('/actions/runs/99'));
+  r = await run({ outcome: 'success', exec: okReport, comments: [stale] });
+  t('review status links to the PR', r.statuses[0][3] === 'https://github.com/o/r/pull/1');
+  t('review comment carries the marker and the report', r.updates.length === 1 && r.updates[0][2].startsWith(STICKY) && r.updates[0][2].includes('No issues found'));
+
+  // --- the LAST entries decide, not the first (real files have dozens of turns) ---
+  r = await run({ outcome: 'success', exec: [reportEntry('Let me look at the diff'), reportEntry('#### Warnings\n- a\n<!-- warning-count: 1 -->'), okResult] });
+  t('several assistant turns: the last one is the review', r.statuses[0][1] === 'failure' && r.statuses[0][2].includes('1 warning(s)'), JSON.stringify(r.statuses));
+  r = await run({ outcome: 'success', exec: [{ type: 'result', subtype: 'success', is_error: false, num_turns: 1 }, reportEntry('x'), ...realMaxTurns] });
+  t('a stale early result does not hide a final error result', r.statuses[0][1] === 'failure' && /did not run/i.test(r.statuses[0][2]));
+  r = await run({ outcome: 'failure', exec: [{ type: 'result', subtype: 'success', is_error: false, num_turns: 5 }, ...resErr(1)] });
+  t('step failed with an earlier result: the last entry decides, so an outage', r.creates.length === 1);
+
   // --- warnings: the merge-adjacent status for every normal PR ----------------
+  r = await run({ outcome: 'success', exec: [reportEntry('#### Warnings\n<!-- warning-count: 3 -->'), okResult] });
+  t('marker 3 with no bullets: the marker wins', r.statuses[0][1] === 'failure' && r.statuses[0][2].includes('3 warning(s)'), JSON.stringify(r.statuses));
+  r = await run({ outcome: 'success', exec: [reportEntry('#### Warnings\n- a\n- b\n<!-- warning-count: 0 -->'), okResult] });
+  t('marker 0 next to bullets: the marker wins', r.statuses[0][1] === 'success', JSON.stringify(r.statuses));
   r = await run({ outcome: 'success', exec: [reportEntry('#### Warnings\n- a\n- b\n<!-- warning-count: 2 -->'), okResult] });
   t('warning-count marker 2: status FAILURE naming 2 warnings', r.statuses[0][1] === 'failure' && r.statuses[0][2].includes('2 warning(s)'), JSON.stringify(r.statuses));
   r = await run({ outcome: 'success', exec: [reportEntry('#### Warnings\n- a\n- b\n- c\n'), okResult] });
@@ -223,6 +281,8 @@ const stale = { id: 5, body: STICKY + '\n### Rule Review: No issues found' };
 
   r = await run({ outcome: 'failure', exec: undefined });
   t('no execution file at all: treated as an outage', r.statuses[0][1] === 'failure' && r.creates.length === 1);
+  r = await run({ outcome: 'failure', exec: [{ type: 'assistant', message: { content: [] } }] });
+  t('execution file with no result entry: treated as an outage', r.statuses[0][1] === 'failure' && r.creates.length === 1);
 
   r = await run({ outcome: 'success', exec: [okResult] });
   t('no report after a run that got going: not an outage, no issue', r.creates.length === 0 && r.statuses[0][1] === 'failure');
@@ -231,8 +291,10 @@ const stale = { id: 5, body: STICKY + '\n### Rule Review: No issues found' };
 
   const long = 'x`y'.repeat(200);
   r = await run({ outcome: 'failure', exec: resErr(1, long) });
-  t('annotation excerpt is capped and has no backticks', r.errors.length === 1 && !r.errors[0][1].includes('`') && r.errors[0][1].length < 500, String(r.errors[0] && r.errors[0][1].length));
+  t('annotation excerpt is capped at 300 characters and has no backticks', r.errors.length === 1 && !r.errors[0][1].includes('`') && r.errors[0][1].split('result=')[1].length <= 300, String(r.errors[0] && r.errors[0][1].length));
   t('the excerpt is NOT copied into the public issue body', r.creates.length === 1 && !r.creates[0][2].includes('x\'y'));
+  r = await run({ outcome: 'failure', exec: resErr(1, 'line one\n::set-output name=x::y\r\nline three') });
+  t('annotation excerpt is a single line', r.errors.length === 1 && !/[\r\n]/.test(r.errors[0][1]), JSON.stringify(r.errors[0] && r.errors[0][1]));
 
   r = await run({ outcome: 'failure', exec: resErr(1) });
   const lf = r.calls.find(c => c[0] === 'paginate');
@@ -252,6 +314,29 @@ const stale = { id: 5, body: STICKY + '\n### Rule Review: No issues found' };
   r = await run({ outcome: 'success', exec: okReport, open: [bot(7), bot(12)], throwForIssue: [7] });
   t('one outage issue cannot be closed: the others still are', r.threw === null && r.closes.length === 1 && r.closes[0][1] === 12, JSON.stringify(r.closes));
 
+  // --- the one-turn boundary and malformed entries ----------------------------
+  r = await run({ outcome: 'failure', exec: resErr(1) });
+  t('1 turn (refused at the first call): an outage', r.creates.length === 1);
+  r = await run({ outcome: 'failure', exec: resErr(2) });
+  t('2 turns (the run reached the model): not an outage', r.creates.length === 0 && r.statuses[0][1] === 'failure');
+  r = await run({ outcome: 'failure', exec: [{ type: 'result', is_error: true, result: 'x' }] });
+  t('num_turns missing: treated as an outage', r.creates.length === 1);
+
+  // A malformed entry must not throw before the status is set (the required job must stay green).
+  r = await run({ outcome: 'failure', exec: '[{"type":"result","is_error":true,"num_turns":1,"result":{"toString":"x"},"subtype":{"toString":"y"}}]' });
+  t('malformed result entry (objects where strings belong): job does not throw', r.threw === null, String(r.threw));
+  t('malformed result entry: FAILURE status still set and the outage reported', r.statuses.length === 1 && r.statuses[0][1] === 'failure' && r.creates.length === 1);
+  r = await run({ outcome: 'success', exec: [reportEntry('Invalid API key'), JSON.parse('{"type":"result","is_error":true,"num_turns":1,"result":{"toString":"x"}}')] });
+  t('malformed error result after a "successful" step: job does not throw', r.threw === null && r.statuses.length === 1 && r.statuses[0][1] === 'failure', String(r.threw));
+
+  // A null in the array must not lose a real review.
+  r = await run({ outcome: 'success', exec: [null, ...okReport] });
+  t('a null entry in the execution file does not lose the review', r.statuses.length === 1 && r.statuses[0][1] === 'success' && r.creates.length === 0);
+
+  // Recovery needs a result that says it succeeded.
+  r = await run({ outcome: 'success', exec: [okReport[0], { type: 'result', subtype: 'error_during_execution', is_error: false, num_turns: 3 }], open: [bot(7)] });
+  t('a non-success subtype does not close the outage issue', r.closes.length === 0);
+
   // --- property 2: bookkeeping failures never cost the status or the job -----
   for (const name of ['paginate', 'issue.create']) {
     r = await run({ outcome: 'failure', exec: resErr(1), throwOn: [name] });
@@ -270,11 +355,15 @@ const stale = { id: 5, body: STICKY + '\n### Rule Review: No issues found' };
     t(`success path, ${name} throws: the review status was still set`, r.statuses.length === 1 && r.statuses[0][1] === 'success');
   }
   // The one call that is NOT best-effort, on purpose: nothing else can report it.
-  r = await run({ outcome: 'failure', exec: resErr(1), throwOn: ['status'] });
+  r = await run({ outcome: 'failure', exec: resErr(1), throwOn: ['status'], expectThrow: true });
   t('the status call itself failing fails the job loudly', r.threw !== null && /boom:status/.test(String(r.threw)));
 
   process.exit(failures ? 1 : 0);
-})();
+})().catch(e => {
+  // A crash in an assertion (an unexpected shape after a regression) must be a named failure.
+  console.error('FAIL - harness crashed: ' + (e && e.stack ? e.stack.split('\n').slice(0, 3).join(' | ') : e));
+  process.exit(1);
+});
 EOF
 
 run_harness() {
@@ -314,7 +403,9 @@ mutate_and_expect_fail() {
     if out=$(run_harness "$mutated" 2>&1); then
         echo "FAIL - mutation SURVIVED (harness still passes): $desc" >&2
         FAILURES=$((FAILURES + 1))
-    elif [[ "$out" == *"$want"* ]]; then
+    elif printf '%s\n' "$out" | grep '^FAIL - ' | grep -qF -- "$want"; then
+        # Only FAIL lines count: $out also holds every passing check's `ok` line,
+        # which would match any substring and make this check vacuous.
         echo "ok   - mutation caught at '$want': $desc"
     else
         echo "FAIL - mutation was caught, but not at '$want' (wrong reason): $desc" >&2
@@ -333,9 +424,15 @@ mutate_and_expect_fail "bookkeeping errors are no longer swallowed" \
 mutate_and_expect_fail "dedup creator filter dropped" \
     "/creator: 'github-actions\[bot\]',/d" "issue lookup filters on creator"
 mutate_and_expect_fail "issue opens even when the run got going (max-turns)" \
-    "s/const systemic = !(Number(e.num_turns) > 1);/const systemic = true;/" "real max-turns run"
+    "s/const systemic = !(turns > 1);/const systemic = true;/" "real max-turns run"
 mutate_and_expect_fail "outage issue closes without a clean result entry" \
-    "s/if (resultEntry \&\& resultEntry.is_error !== true) {/if (true) {/" "NOT closed"
+    "s/if (resultEntry \&\& resultEntry.is_error === false \&\& resultEntry.subtype === 'success') {/if (true) {/" "NOT closed"
+mutate_and_expect_fail "outage issue closes on any non-error result, whatever its subtype" \
+    "s/ \&\& resultEntry.subtype === 'success') {/) {/" "non-success subtype"
+mutate_and_expect_fail "a null entry in the execution file loses the review" \
+    "s/turns.filter(t => t \&\& t.type === 'assistant'/turns.filter(t => t.type === 'assistant'/" "null entry"
+mutate_and_expect_fail "a malformed entry can throw before the status is set" \
+    "s/try { return String(v ?? ''); } catch (_) { return '\[unprintable\]'; }/return String(v ?? '');/" "malformed error result after"
 mutate_and_expect_fail "a non-run leaves the stale sticky comment in place" \
     "s/await postStickyComment(notReviewedBody);/\/\/ removed/" "stale sticky comment is replaced"
 mutate_and_expect_fail "an error final result is believed to be a review" \
@@ -353,7 +450,18 @@ mutate_and_expect_fail "a status description over the API's 140-character limit"
 mutate_and_expect_fail "warnings never turn the status red" \
     "s/const state = hasWarnings ? 'failure' : 'success';/const state = 'success';/" "warning-count marker 2"
 mutate_and_expect_fail "one locked outage issue strands the others" \
-    "s/await bestEffort(\`closing outage issue #\${issue.number}\`, async () => {/await (async () => {/; s/^                });\$/                })();/" "one outage issue cannot be closed"
+    "/closing outage issue #/,/^              }\$/ { s/await bestEffort(\`closing outage issue #\${issue.number}\`, async () => {/await (async () => {/; s/^                });\$/                })();/; }" "one outage issue cannot be closed"
+
+# --- the premises the script cannot check itself -------------------------------
+# The extracted script is only half the design. Take away a permission or the
+# tolerance on the review step and it keeps passing here while production breaks:
+# without `issues: write` every issue call 403s and best-effort swallows it, so the
+# outage issue silently never opens; without `continue-on-error` a broken reviewer
+# blocks every merge.
+check "job grants issues: write" "$(grep -Ec '^      issues: write$' "$WORKFLOW")" "1"
+check "job grants statuses: write" "$(grep -Ec '^      statuses: write$' "$WORKFLOW")" "1"
+REVIEW_TOLERANT=$(awk '/^        id: review$/ { f = 1 } f && /^        continue-on-error: true$/ { print "yes"; exit } f && /^        uses: / { print "no"; exit }' "$WORKFLOW")
+check "the review step is continue-on-error" "${REVIEW_TOLERANT:-missing}" "yes"
 
 # --- wiring: a guard nobody runs is not a guard -------------------------------
 # Anchored to a real `run:` line, so a commented-out or no-op step that merely
