@@ -1175,7 +1175,7 @@ impl Session {
                 format!(
                     "path stall-closed: {}, first closed by this node with: {:?}",
                     path.stats().send_event_count(E::StalledClosed),
-                    path.connection().closer().closed_with()
+                    path.closed_with()
                 )
             });
             self.note(|| {

@@ -1006,6 +1006,13 @@ impl QuicPath {
         )
     }
 
+    /// The code of the close this node sent on the path's connection, if it
+    /// sent one.
+    #[cfg_attr(not(any(test, feature = "testing")), allow(dead_code))]
+    pub(in crate::transport) fn closed_with(&self) -> Option<QuicCloseCode> {
+        self.connection.closer().closed_with()
+    }
+
     /// Pace this path's data sends with `pacer` (`pacer` module): the
     /// connection's token bucket when a bandwidth limit is set. A second call
     /// changes nothing.
