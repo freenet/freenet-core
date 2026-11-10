@@ -342,11 +342,13 @@ fn run<O: ConformanceOracle + ?Sized>(
             // direction a future reader picks decides whether a live egress
             // suppression starts firing on canonicalizing contracts (#5462).
             //
-            // Sequencing note: canonicalising at install removes the benign class
-            // entirely. Until then, expect `SettledAfter(1)` findings against correct
-            // contracts and read them as "the install path has not been fixed yet",
-            // not as "this contract is broken". `policy::finding_class` makes that
-            // class report-only, so it is never counted as persistent.
+            // A `SettledAfter` finding against a correct contract means a raw
+            // non-canonical state reached it (for example a client PUT that no merge
+            // has normalised yet), not that the contract is broken.
+            // `policy::finding_class` makes that class report-only, so it is never
+            // counted as persistent. Canonicalising at install was considered and
+            // rejected (#5521): three captured corpora held no such findings, and the
+            // extra call changed nothing, errored, or churned on real contracts.
             let a: &[u8] = &case.states[0];
             let once = merge(oracle, a, a)?;
             if once == a {
