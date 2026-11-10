@@ -19,9 +19,8 @@
 //! loss to Cubic only when:
 //!
 //! - quinn declares persistent congestion (always passed), or
-//! - the queue it estimates is at least [`queue_threshold`] of the minimum
-//!   RTT ([`QUEUE_FRACTION`], at least [`QUEUE_FLOOR`], at most
-//!   [`QUEUE_CEILING`]), or
+//! - the queue it estimates is at least [`queue_threshold`]: a tenth of the
+//!   minimum RTT ([`QUEUE_FRACTION`]), at least [`QUEUE_FLOOR`], or
 //! - the smoothed share of bytes lost per round trip is at least
 //!   [`LOSS_SHARE_CEILING`] (a policer, or a path too lossy to push), or
 //! - there is no RTT sample yet.
@@ -29,10 +28,20 @@
 //! Otherwise the loss is ignored: quinn still retransmits the data, and the
 //! window stays where it was.
 //!
-//! The queue estimate is the smallest RTT sample over this round trip and the
-//! last one, less the smallest sample seen on the connection. Jitter only
-//! adds delay, so the minimum over a round filters it, while a standing
-//! queue raises every sample, the minimum too.
+//! The queue is judged at the time the lost packet was sent: the smallest RTT
+//! of the packets sent within [`NEAR_WINDOW_FRACTION`] of an RTT of it (at
+//! least [`NEAR_WINDOW_MIN`]), less the smallest RTT seen on the connection.
+//! A queue that overflowed delayed the packets sent just before and after
+//! the one it dropped; a random loss leaves its neighbours with whatever
+//! queue there was, usually none. Jitter only adds delay, so the minimum
+//! over the neighbours filters it. When no neighbour's RTT is known (a
+//! packet sent more than [`SEND_BUCKETS`] buckets ago), the smallest RTT
+//! over this round trip and the last one stands in.
+//!
+//! An earlier version judged every loss by that round minimum alone. A queue
+//! that fills and drains each round (one flow on a shallow buffer) has a low
+//! minimum, so its overflow losses read as random and the flow kept up to a
+//! fifth of what it sent being dropped (e5b-9 lab).
 //!
 //! # What this does to other traffic
 //!
@@ -48,6 +57,7 @@
 //! falls back to plain Cubic, the behaviour before this gate.
 
 use std::any::Any;
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use quinn::congestion::{Controller, ControllerMetrics};
@@ -58,11 +68,12 @@ pub(crate) const QUEUE_FRACTION: f64 = 0.1;
 
 /// The smallest queue delay threshold, for short paths where a tenth of the
 /// RTT is within timer and scheduling noise.
+///
+/// There is deliberately no largest: a ceiling of 3 ms let the gate see
+/// shallow queues on long paths, but 10 ms of jitter then read as a queue and
+/// the gate passed random losses, so an 8 MiB message at 5% loss took as long
+/// as with plain Cubic (e5b-9 lab).
 pub(crate) const QUEUE_FLOOR: Duration = Duration::from_millis(2);
-
-/// The largest queue delay threshold, so a shallow queue on a long path is
-/// still seen.
-pub(crate) const QUEUE_CEILING: Duration = Duration::from_millis(3);
 
 /// The smoothed share of bytes lost per round trip at which every loss
 /// counts, queue or not.
@@ -79,12 +90,26 @@ const SHARE_GAIN: f64 = 0.25;
 /// The round length before the first RTT sample.
 const DEFAULT_ROUND: Duration = Duration::from_millis(100);
 
+/// A lost packet's neighbours are the packets sent within this fraction of
+/// the smoothed RTT of it, either side.
+const NEAR_WINDOW_FRACTION: u32 = 4;
+
+/// ... and never less than this.
+const NEAR_WINDOW_MIN: Duration = Duration::from_millis(5);
+
+/// RTT samples are kept as the smallest per span of send times, each span an
+/// eighth of the smoothed RTT (at least [`BUCKET_MIN`]), for the last this
+/// many spans: about four round trips, more than quinn takes to declare a
+/// loss (9/8 of an RTT, or a probe timeout).
+const SEND_BUCKETS: usize = 32;
+
+/// The shortest span of send times one bucket covers.
+const BUCKET_MIN: Duration = Duration::from_millis(1);
+
 /// The queue delay at which a loss counts as congestion on a path whose
 /// minimum RTT is `min_rtt`.
 pub(crate) fn queue_threshold(min_rtt: Duration) -> Duration {
-    min_rtt
-        .mul_f64(QUEUE_FRACTION)
-        .clamp(QUEUE_FLOOR, QUEUE_CEILING)
+    min_rtt.mul_f64(QUEUE_FRACTION).max(QUEUE_FLOOR)
 }
 
 /// Why a loss was passed to the inner controller, or that it was not.
@@ -113,6 +138,10 @@ pub(crate) struct GateState {
     round_acked: u64,
     round_lost: u64,
     share: f64,
+    /// The smallest RTT of the packets sent in each recent span of send
+    /// times: (start of the span, smallest RTT), oldest first. A span ends
+    /// where the next begins.
+    sends: VecDeque<(Instant, Duration)>,
     /// Losses passed to the inner controller, and ignored.
     pub(crate) passed: u64,
     pub(crate) ignored: u64,
@@ -128,13 +157,21 @@ impl GateState {
         self.roll(now);
         self.round_min = Some(self.round_min.map_or(sample, |m| m.min(sample)));
         self.round_acked += bytes;
+        self.record_send(sent, sample);
     }
 
-    /// A loss of `lost_bytes`; returns whether it counts as congestion.
-    pub(crate) fn on_loss(&mut self, now: Instant, lost_bytes: u64, persistent: bool) -> Verdict {
+    /// A loss of `lost_bytes`, the last of them sent at `sent`; returns
+    /// whether it counts as congestion.
+    pub(crate) fn on_loss(
+        &mut self,
+        now: Instant,
+        sent: Instant,
+        lost_bytes: u64,
+        persistent: bool,
+    ) -> Verdict {
         self.roll(now);
         self.round_lost += lost_bytes;
-        let verdict = self.judge(persistent);
+        let verdict = self.judge(sent, persistent);
         if verdict == Verdict::Ignored {
             self.ignored += 1;
         } else {
@@ -153,20 +190,62 @@ impl GateState {
         Some(recent?.saturating_sub(self.min_rtt?))
     }
 
+    /// The queue around `sent`: the smallest RTT of the packets sent near it
+    /// (see the module docs), less the smallest sample seen. `None` when no
+    /// span near it is kept.
+    pub(crate) fn queue_at(&self, sent: Instant) -> Option<Duration> {
+        let window = (self.srtt? / NEAR_WINDOW_FRACTION).max(NEAR_WINDOW_MIN);
+        let (from, to) = (sent.checked_sub(window).unwrap_or(sent), sent + window);
+        let mut near: Option<Duration> = None;
+        for (i, &(start, rtt)) in self.sends.iter().enumerate() {
+            let end = self.sends.get(i + 1).map(|&(next, _)| next);
+            let overlaps = start <= to && end.is_none_or(|end| end > from);
+            if overlaps {
+                near = Some(near.map_or(rtt, |m| m.min(rtt)));
+            }
+        }
+        Some(near?.saturating_sub(self.min_rtt?))
+    }
+
+    /// Keep `sample` as the RTT of a packet sent at `sent`.
+    fn record_send(&mut self, sent: Instant, sample: Duration) {
+        let width = self
+            .srtt
+            .map_or(BUCKET_MIN, |srtt| (srtt / 8).max(BUCKET_MIN));
+        match self.sends.back_mut() {
+            Some((start, min)) if sent >= *start && sent < *start + width => {
+                *min = (*min).min(sample);
+            }
+            Some((start, _)) if sent < *start => {
+                // Acknowledged out of order: the span it was sent in, if kept.
+                if let Some((_, min)) = self.sends.iter_mut().rev().find(|(s, _)| *s <= sent) {
+                    *min = (*min).min(sample);
+                }
+            }
+            _ => {
+                if self.sends.len() == SEND_BUCKETS {
+                    self.sends.pop_front();
+                }
+                self.sends.push_back((sent, sample));
+            }
+        }
+    }
+
     /// The smoothed share of bytes lost per round trip.
     #[cfg(test)]
     pub(crate) fn loss_share(&self) -> f64 {
         self.share
     }
 
-    fn judge(&self, persistent: bool) -> Verdict {
+    fn judge(&self, sent: Instant, persistent: bool) -> Verdict {
         if persistent {
             return Verdict::Persistent;
         }
         if self.share >= LOSS_SHARE_CEILING {
             return Verdict::LossShare;
         }
-        let (Some(queue), Some(min_rtt)) = (self.queue(), self.min_rtt) else {
+        let queue = self.queue_at(sent).or_else(|| self.queue());
+        let (Some(queue), Some(min_rtt)) = (queue, self.min_rtt) else {
             return Verdict::NoSample;
         };
         if queue >= queue_threshold(min_rtt) {
@@ -258,7 +337,7 @@ impl Controller for LossGate {
     ) {
         if self
             .state
-            .on_loss(now, lost_bytes, is_persistent_congestion)
+            .on_loss(now, sent, lost_bytes, is_persistent_congestion)
             != Verdict::Ignored
         {
             self.inner
