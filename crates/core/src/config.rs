@@ -106,6 +106,10 @@ const FALLBACK_GATEWAYS: &[(&str, &str)] = &[
         "gw2.freenet.org:31338",
         "a7e93b2b0f6c353a66a115b618547bcb739353f4640f1431cae91833beaf690c",
     ),
+    (
+        "gw3.freenet.org:31336",
+        "0d4a65d85b0772d46878668ecbad74332aa599dbea947969eb6c99def5adbb62",
+    ),
 ];
 
 #[derive(clap::Parser, Debug, Clone)]
