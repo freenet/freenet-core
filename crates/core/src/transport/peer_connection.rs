@@ -41,6 +41,7 @@ pub mod streaming_buffer;
 #[cfg(not(feature = "bench"))]
 pub(crate) mod streaming_buffer;
 
+use super::egress_cap::{RetxAdmit, RetxDeferral};
 use super::{
     TransportError, TransportPublicKey,
     bbr::DeliveryRateToken,
@@ -106,6 +107,16 @@ const ACK_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 const SIMULATION_ACK_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 const SIMULATION_RESEND_CHECK_INTERVAL: Duration = Duration::from_millis(50);
 const SIMULATION_RESEND_YIELD_DELAY: Duration = Duration::from_millis(10);
+
+/// The most resends (and abandonments) the recv loop's resend arm handles in
+/// one iteration, so it cannot monopolise the select loop; the rest wait
+/// [`RESEND_YIELD_DELAY`] (see the top of the loop), so inbound branches can
+/// interleave.
+pub(in crate::transport) const MAX_RESENDS_PER_ITERATION: usize = 4;
+
+/// How long the resend arm yields after [`MAX_RESENDS_PER_ITERATION`],
+/// outside simulation.
+pub(in crate::transport) const RESEND_YIELD_DELAY: Duration = Duration::from_millis(2);
 
 /// An inbound packet as the listener hands it to an established connection,
 /// with the time the listener queued it (nanoseconds from the listener's
@@ -310,6 +321,10 @@ struct TelemetryTestCounts {
     transfers_acked: u32,
     abandoned: u32,
     retransmissions: u32,
+    /// RTO resends the egress cap deferred.
+    retransmits_deferred: u32,
+    /// RTO resends sent uncapped after their deferral limit.
+    retransmits_uncapped: u32,
     keepalive_rtt_samples: u32,
     standalone_ack_flushes: u32,
     outbound_streams_failed: u32,
@@ -337,6 +352,16 @@ pub(crate) struct CongestionProbe {
     pub abandoned_packets: u32,
     /// Outbound streams whose send task failed (e.g. the cwnd-wait timeout).
     pub outbound_streams_failed: u32,
+    /// Timer retransmits (RTO resends and probes) sent.
+    pub retransmissions: u32,
+    /// RTO resends the node-wide egress cap deferred.
+    pub retransmits_deferred: u32,
+    /// RTO resends sent uncapped after their deferral limit.
+    pub retransmits_uncapped: u32,
+    /// Packets the sent-packet tracker still waits on a receipt for.
+    pub pending_packets: usize,
+    /// The tail-loss probe timeout; `None` before the first RTT sample.
+    pub probe_timeout: Option<Duration>,
 }
 
 /// The `PeerConnection` struct is responsible for managing the connection with a remote peer.
@@ -428,6 +453,9 @@ pub struct PeerConnection<S = super::UdpSocket, T: TimeSource = RealTime> {
     /// the idle timeout, so the node can report the disconnect as a timeout
     /// rather than a generic transport closure (telemetry only).
     closed_by_idle_timeout: bool,
+    /// This connection's run of RTO resends the node-wide egress cap refused
+    /// (`EgressCap::admit_retransmit`'s deferral limit).
+    retx_deferral: RetxDeferral,
     /// Test-only per-connection tallies of the telemetry events this
     /// connection recorded, so tests need not read process-wide counters
     /// that concurrent tests also move.
@@ -871,7 +899,7 @@ impl<T: TimeSource> RecvTimers<T> {
             resend_yield: if in_simulation {
                 SIMULATION_RESEND_YIELD_DELAY
             } else {
-                Duration::from_millis(2)
+                RESEND_YIELD_DELAY
             },
         }
     }
@@ -1518,6 +1546,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             recv_timers,
             timeout_checks_run: 0,
             closed_by_idle_timeout: false,
+            retx_deferral: RetxDeferral::default(),
             #[cfg(test)]
             telemetry_test_counts: TelemetryTestCounts::default(),
             receipts_flush_due: false,
@@ -2413,29 +2442,83 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                     }
                     self.recv_timers.resend.poll_fire(cx)
                 }) => {
-                    // Bound retransmissions per iteration to prevent monopolizing the
-                    // select loop. Remaining resends are deferred by a short sleep
-                    // (see top of loop) so inbound branches can interleave.
-                    const MAX_RESENDS_PER_ITERATION: usize = 4;
                     let mut resend_count = 0;
                     loop {
                         tracing::trace!(
                             peer_addr = %self.remote_conn.remote_addr,
                             "Checking for resends"
                         );
-                        let maybe_resend = self.remote_conn
-                            .sent_tracker
-                            .lock()
-                            .get_resend();
+                        // With a node-wide egress cap, a resend or probe goes
+                        // only if the cap takes it (`EgressCap::admit_retransmit`,
+                        // no await, no lock): a refused RTO resend is deferred
+                        // with its state unchanged, at most until it has been
+                        // due for one effective RTO, then sent uncapped; a
+                        // refused probe is skipped. Without a cap nothing is
+                        // asked. A deferred resend calls the congestion
+                        // controller's on_timeout when it goes (below), once
+                        // per expiry as on main, at most one RTO later.
+                        let socket = &self.remote_conn.socket;
+                        let cap = socket.egress_cap().filter(|cap| cap.caps_retransmits());
+                        let mut take = None;
+                        let mut deferred = false;
+                        #[cfg(test)]
+                        let mut uncapped = false;
+                        let maybe_resend = {
+                            let mut tracker = self.remote_conn.sent_tracker.lock();
+                            let rto = tracker.effective_rto();
+                            let now = self.time_source.now_nanos();
+                            let retx_deferral = &mut self.retx_deferral;
+                            tracker.get_resend_admitted(|kind, len| {
+                                let Some(cap) = cap else {
+                                    return Ok(());
+                                };
+                                match retx_deferral.admit(cap, kind, len, rto, now) {
+                                    RetxAdmit::Take(taken) => {
+                                        take = Some(taken);
+                                        Ok(())
+                                    }
+                                    RetxAdmit::Uncapped => {
+                                        #[cfg(test)]
+                                        {
+                                            uncapped = true;
+                                        }
+                                        Ok(())
+                                    }
+                                    RetxAdmit::Defer(wait) => {
+                                        deferred = true;
+                                        Err(wait)
+                                    }
+                                    RetxAdmit::SkipProbe => Err(Duration::ZERO),
+                                }
+                            })
+                        };
                         // Extract (idx, packet) from the resend action, applying
                         // action-specific side effects (congestion notification, logging).
                         // Abandon releases flight size and is handled inline (it neither
                         // re-sends nor re-registers). See #4345.
+                        #[cfg(test)]
+                        if uncapped {
+                            self.telemetry_test_counts.retransmits_uncapped += 1;
+                        }
                         let (idx, packet) = match maybe_resend {
+                            // Also where the cap deferred a resend: it keeps its
+                            // place, and the timer brings the arm back when the
+                            // rate has made room. The loop never waits here.
                             ResendAction::WaitUntil(deadline_nanos) => {
+                                if deferred {
+                                    #[cfg(test)]
+                                    {
+                                        self.telemetry_test_counts.retransmits_deferred += 1;
+                                    }
+                                } else {
+                                    // Nothing due was refused: a run of
+                                    // refusals, if any, is over.
+                                    self.retx_deferral.end_run(cap);
+                                }
                                 self.recv_timers.resend.arm_at(deadline_nanos);
                                 break;
                             }
+
                             ResendAction::Abandon { packet_id, payload_len } => {
                                 // The packet was retransmitted MAX_PACKET_RETRANSMITS times
                                 // with no ACK and is now permanently lost. Release its bytes
@@ -2489,11 +2572,17 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
 
                         // Common path for both Resend and TlpProbe: send the packet,
                         // re-register for ACK tracking, and enforce per-iteration limit.
-                        match self.remote_conn
-                            .socket
-                            .send_to(&packet, self.remote_conn.remote_addr)
-                            .await
-                        {
+                        // Charged once: by the cap's take when there is one,
+                        // else as an unpaced send by the socket.
+                        let sent = match take {
+                            Some(take) => {
+                                socket
+                                    .send_to_paced(&packet, self.remote_conn.remote_addr, take)
+                                    .await
+                            }
+                            None => socket.send_to(&packet, self.remote_conn.remote_addr).await,
+                        };
+                        match sent {
                             Ok(_) => {
                                 super::TRANSPORT_METRICS.record_retransmission_sent();
                                 #[cfg(test)]
@@ -2701,7 +2790,25 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             rto_expiries: tracker.rto_expiries(),
             abandoned_packets: self.telemetry_test_counts.abandoned,
             outbound_streams_failed: self.telemetry_test_counts.outbound_streams_failed,
+            retransmissions: self.telemetry_test_counts.retransmissions,
+            retransmits_deferred: self.telemetry_test_counts.retransmits_deferred,
+            retransmits_uncapped: self.telemetry_test_counts.retransmits_uncapped,
+            pending_packets: tracker.pending_len(),
+            probe_timeout: tracker.probe_timeout(),
         }
+    }
+
+    /// The counters of the node-wide egress cap on this connection's socket,
+    /// if it has one.
+    #[cfg(test)]
+    pub(crate) fn egress_stats(&self) -> Option<super::egress_cap::EgressStats> {
+        self.egress_cap().map(|cap| cap.stats())
+    }
+
+    /// The node-wide egress cap on this connection's socket, if it has one.
+    #[cfg(test)]
+    pub(crate) fn egress_cap(&self) -> Option<&super::egress_cap::EgressCap> {
+        self.remote_conn.socket.egress_cap()
     }
 
     /// Returns a handle for accessing an inbound stream incrementally.

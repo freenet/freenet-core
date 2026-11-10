@@ -102,7 +102,7 @@ const MAX_RTO_BACKOFF: u32 = 512;
 /// A still-progressing transfer is never abandoned: any ACK for the stuck
 /// packet resets its count, and a 12-consecutive-RTO black hole on an otherwise
 /// healthy path is a genuinely dead fragment.
-const MAX_PACKET_RETRANSMITS: u32 = 12;
+pub(in crate::transport) const MAX_PACKET_RETRANSMITS: u32 = 12;
 
 /// Minimum RTO after RTT samples have been collected.
 ///
@@ -122,6 +122,10 @@ const MIN_RTO: Duration = Duration::from_millis(500);
 ///
 /// RFC 8985 suggests a minimum of 10ms to prevent excessive probing on very fast networks.
 const MIN_TLP_TIMEOUT: Duration = Duration::from_millis(10);
+
+/// The largest effective RTO, base and backoff together (RFC 6298 Section
+/// 2.5 allows a cap of at least 60 s).
+pub(in crate::transport) const MAX_EFFECTIVE_RTO: Duration = Duration::from_secs(60);
 
 /// Determines the accuracy/sensitivity of the packet loss estimate. A lower value will result
 /// in a more accurate estimate, but it will take longer to converge to the true value.
@@ -416,7 +420,7 @@ impl<T: TimeSource> SentPacketTracker<T> {
     /// Calculate PTO (Probe Timeout) for TLP.
     /// PTO = max(2 * SRTT, MIN_TLP_TIMEOUT)
     /// Returns None if no RTT samples yet (TLP disabled).
-    fn probe_timeout(&self) -> Option<Duration> {
+    pub(super) fn probe_timeout(&self) -> Option<Duration> {
         self.srtt.map(|srtt| {
             let pto = srtt.saturating_mul(2);
             pto.max(MIN_TLP_TIMEOUT)
@@ -882,8 +886,7 @@ impl<T: TimeSource> SentPacketTracker<T> {
     /// This is the actual timeout to use for retransmissions
     pub(super) fn effective_rto(&self) -> Duration {
         let backed_off = self.rto.saturating_mul(self.rto_backoff);
-        // Cap at 60 seconds (RFC 6298 Section 2.5)
-        backed_off.min(Duration::from_secs(60))
+        backed_off.min(MAX_EFFECTIVE_RTO)
     }
 
     /// Called on retransmission timeout - doubles the RTO backoff (RFC 6298 Section 5.5)
@@ -944,7 +947,31 @@ impl<T: TimeSource> SentPacketTracker<T> {
     /// TLP (Tail Loss Probe) fires before RTO to detect tail loss earlier.
     /// - TLP returns TlpProbe action (no backoff applied, speculative)
     /// - RTO returns Resend action (backoff applied, definite loss)
+    #[cfg(test)]
     pub(super) fn get_resend(&mut self) -> ResendAction {
+        self.get_resend_admitted(|_, _| Ok(()))
+    }
+
+    /// [`Self::get_resend`], asking `admit` before a packet is resent or
+    /// probed, with the kind and its size in bytes, and before any of the
+    /// packet's state changes (`admit` is the node-wide egress cap's
+    /// retransmit decision, `EgressCap::admit_retransmit` through
+    /// `RetxDeferral`).
+    ///
+    /// - An RTO resend `admit` refuses (`Err(wait)`) keeps its place at the
+    ///   front of the queue with its retransmit count, its backoff and its
+    ///   send time unchanged, and the result is [`ResendAction::WaitUntil`]
+    ///   at `now + wait`. The count moves only when a resend goes, and a
+    ///   packet due for abandonment is abandoned without asking, since
+    ///   nothing is sent; so `admit` must let a resend go within a bounded
+    ///   time of falling due, or the packet is never abandoned.
+    /// - A tail-loss probe `admit` refuses is skipped: it is speculative, and
+    ///   the packet's RTO covers it. It is marked probed, as a sent probe is,
+    ///   so it does not ask again, and the entry is re-examined for its RTO.
+    pub(super) fn get_resend_admitted(
+        &mut self,
+        mut admit: impl FnMut(ResendKind, usize) -> Result<(), Duration>,
+    ) -> ResendAction {
         let now_nanos = self.time_source.now_nanos();
         let pto = self.probe_timeout();
         let effective_rto_nanos = self.effective_rto().as_nanos() as u64;
@@ -982,6 +1009,16 @@ impl<T: TimeSource> SentPacketTracker<T> {
                 if now_nanos >= tlp_at && now_nanos < rto_deadline {
                     // TLP fires! Clone packet data for the probe
                     if let Some((packet, _, _, _)) = self.pending_receipts.get(&entry.packet_id) {
+                        if admit(ResendKind::Probe, packet.len()).is_err() {
+                            // Skipped: marked as probed so it does not ask
+                            // again, and its RTO still covers it. The entry
+                            // goes back to the front and is popped again,
+                            // now with no probe due, so it reaches the RTO
+                            // check or waits for its RTO deadline.
+                            self.tlp_sent_packets.insert(entry.packet_id);
+                            self.resend_queue.push_front(entry);
+                            continue;
+                        }
                         let packet_clone = packet.clone();
                         let packet_id = entry.packet_id;
 
@@ -1003,6 +1040,26 @@ impl<T: TimeSource> SentPacketTracker<T> {
             // Check if RTO should fire (only for a still-tracked packet —
             // get_resend keeps resent packets in pending_receipts since #4345).
             if now_nanos >= rto_deadline && self.pending_receipts.contains_key(&entry.packet_id) {
+                // A resend that will go (not an abandonment) asks first, and
+                // changes nothing when refused.
+                let abandoning = self
+                    .retransmit_counts
+                    .get(&entry.packet_id)
+                    .copied()
+                    .unwrap_or(0)
+                    >= MAX_PACKET_RETRANSMITS;
+                if !abandoning {
+                    let len = self
+                        .pending_receipts
+                        .get(&entry.packet_id)
+                        .map_or(0, |(packet, _, _, _)| packet.len());
+                    if let Err(wait) = admit(ResendKind::Rto, len) {
+                        self.resend_queue.push_front(entry);
+                        return ResendAction::WaitUntil(
+                            now_nanos.saturating_add(wait.as_nanos() as u64),
+                        );
+                    }
+                }
                 // Update packet loss proportion for a lost packet
                 self.packet_loss_proportion = self.packet_loss_proportion
                     * (1.0 - PACKET_LOSS_DECAY_FACTOR)
@@ -1113,6 +1170,15 @@ impl<T: TimeSource> SentPacketTracker<T> {
         let deadline_nanos = self.time_source.now_nanos() + self.effective_rto().as_nanos() as u64;
         ResendAction::WaitUntil(deadline_nanos)
     }
+}
+
+/// What [`SentPacketTracker::get_resend_admitted`] asks to send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ResendKind {
+    /// An RTO resend: the packet is lost.
+    Rto,
+    /// A tail-loss probe: speculative.
+    Probe,
 }
 
 #[derive(Debug, PartialEq)]
@@ -3289,5 +3355,230 @@ pub(in crate::transport) mod tests {
             assert_eq!(tracker.watch_stream_ack(stream, 0), None);
         }
         assert_eq!(tracker.stream_ack_watches.len(), MAX_STREAM_ACK_WATCHES);
+    }
+
+    /// An RTO resend the cap refuses changes nothing: no resend, no count,
+    /// no backoff, no new send time, and the result is a wait of the cap's
+    /// length. Taken later, it is resent as if never refused.
+    #[test]
+    fn a_refused_rto_resend_keeps_its_state() {
+        let mut tracker = mock_sent_packet_tracker();
+        tracker.report_sent_packet(1, vec![1, 2, 3].into());
+        tracker.time_source.advance(tracker.effective_rto());
+        let sent_before = tracker.pending_receipts.get(&1).expect("tracked").1;
+        let now = tracker.time_source.now_nanos();
+        let wait = Duration::from_millis(7);
+        let mut asked = Vec::new();
+        let action = tracker.get_resend_admitted(|kind, len| {
+            asked.push((kind, len));
+            Err(wait)
+        });
+        assert_eq!(asked, vec![(ResendKind::Rto, 3)]);
+        assert!(
+            matches!(action, ResendAction::WaitUntil(at) if at == now + wait.as_nanos() as u64),
+            "{action:?}"
+        );
+        assert_eq!(tracker.rto_backoff(), 1, "no backoff");
+        assert_eq!(tracker.retransmit_counts.get(&1), None, "not counted");
+        assert_eq!(tracker.rto_expiries(), 0);
+        assert!(!tracker.retransmitted_packets.contains(&1));
+        assert_eq!(
+            tracker.pending_receipts.get(&1).expect("tracked").1,
+            sent_before
+        );
+        assert_eq!(tracker.resend_queue.front().map(|e| e.packet_id), Some(1));
+
+        tracker.time_source.advance(wait);
+        assert!(matches!(
+            tracker.get_resend_admitted(|_, _| Ok(())),
+            ResendAction::Resend(1, _)
+        ));
+        assert_eq!(tracker.retransmit_counts.get(&1), Some(&1));
+        assert_eq!(tracker.rto_backoff(), 2);
+    }
+
+    /// A probe the cap refuses is skipped and marked probed, so it does not
+    /// ask again; its RTO still resends it.
+    #[test]
+    fn a_refused_probe_is_skipped_and_the_rto_still_covers_it() {
+        let mut tracker = mock_sent_packet_tracker();
+        tracker.update_rtt(Duration::from_millis(100));
+        tracker.report_sent_packet(1, vec![1, 2, 3].into());
+        let pto = tracker.probe_timeout().expect("an RTT sample");
+        assert!(pto < tracker.effective_rto());
+        tracker.time_source.advance(pto);
+        let mut asked = Vec::new();
+        let action = tracker.get_resend_admitted(|kind, _| {
+            asked.push(kind);
+            Err(Duration::from_millis(1))
+        });
+        assert_eq!(asked, vec![ResendKind::Probe]);
+        assert!(matches!(action, ResendAction::WaitUntil(_)), "{action:?}");
+        assert!(tracker.tlp_sent_packets.contains(&1), "marked probed");
+        assert!(!tracker.retransmitted_packets.contains(&1), "nothing sent");
+
+        let mut asked = Vec::new();
+        let _ = tracker.get_resend_admitted(|kind, _| {
+            asked.push(kind);
+            Ok(())
+        });
+        assert!(asked.is_empty(), "the skipped probe does not ask again");
+
+        tracker.time_source.advance(tracker.effective_rto());
+        let action = tracker.get_resend_admitted(|kind, _| {
+            assert_eq!(kind, ResendKind::Rto);
+            Ok(())
+        });
+        assert!(matches!(action, ResendAction::Resend(1, _)), "{action:?}");
+    }
+
+    /// A packet due for abandonment is abandoned without asking the cap,
+    /// since nothing is sent: refusals cannot hold flight past
+    /// `MAX_PACKET_RETRANSMITS`.
+    #[test]
+    fn abandonment_does_not_ask_the_cap() {
+        let mut tracker = mock_sent_packet_tracker();
+        tracker.report_sent_packet(1, vec![1, 2, 3].into());
+        for _ in 0..MAX_PACKET_RETRANSMITS {
+            tracker.time_source.advance(tracker.effective_rto());
+            assert!(matches!(
+                tracker.get_resend_admitted(|_, _| Ok(())),
+                ResendAction::Resend(1, _)
+            ));
+        }
+        tracker.time_source.advance(tracker.effective_rto());
+        let action = tracker.get_resend_admitted(|_, _| panic!("asked the cap to abandon"));
+        assert!(
+            matches!(action, ResendAction::Abandon { packet_id: 1, .. }),
+            "{action:?}"
+        );
+    }
+
+    /// With the node-wide egress cap held in debt above the retransmit limit
+    /// for good (its clock never moves), the connection's resends are
+    /// deferred at most one effective RTO in a row (`RetxDeferral`) and then
+    /// go uncapped, so lost packets are still abandoned after
+    /// `MAX_PACKET_RETRANSMITS` and their flight released, within twice the
+    /// time it takes with no cap.
+    #[test]
+    fn held_cap_debt_cannot_stop_abandonment() {
+        use crate::transport::egress_cap::{EgressCap, RetxAdmit, RetxDeferral};
+        let cap = EgressCap::new(10_000, VirtualTime::new());
+        cap.charge_unpaced(1_000_000);
+        let mut tracker = mock_sent_packet_tracker();
+        // Twenty lost packets: only the queue's head is ever asked, so a
+        // per-packet limit would hold each behind the one before it.
+        const PACKETS: u32 = 20;
+        for id in 0..PACKETS {
+            tracker.report_sent_packet(id, vec![0u8; 1_000].into());
+        }
+        let mut abandoned = 0;
+        let start = tracker.time_source.now_nanos();
+        let (mut deferred, mut uncapped, mut taken) = (0u32, 0u32, 0u32);
+        let mut run = RetxDeferral::default();
+        let abandoned_at = loop {
+            let rto = tracker.effective_rto();
+            let now = tracker.time_source.now_nanos();
+            let mut refused = false;
+            let action = tracker.get_resend_admitted(|kind, len| {
+                match run.admit(&cap, kind, len, rto, now) {
+                    RetxAdmit::Take(_) => {
+                        taken += 1;
+                        Ok(())
+                    }
+                    RetxAdmit::Uncapped => {
+                        uncapped += 1;
+                        Ok(())
+                    }
+                    RetxAdmit::Defer(wait) => {
+                        deferred += 1;
+                        refused = true;
+                        Err(wait)
+                    }
+                    RetxAdmit::SkipProbe => Err(Duration::ZERO),
+                }
+            });
+            match action {
+                ResendAction::WaitUntil(at) => {
+                    if !refused {
+                        run.end_run(Some(&cap));
+                    }
+                    tracker
+                        .time_source
+                        .advance(Duration::from_nanos(at.saturating_sub(now).max(1)));
+                }
+                ResendAction::Resend(..) | ResendAction::TlpProbe(..) => {}
+                ResendAction::Abandon { .. } => {
+                    abandoned += 1;
+                    if tracker.pending_len() == 0 {
+                        break tracker.time_source.now_nanos();
+                    }
+                }
+            }
+            assert!(deferred < 1_000_000, "never abandoned");
+        };
+        assert_eq!(taken, 0, "nothing fits a bucket held in debt");
+        assert_eq!(abandoned, PACKETS);
+        assert_eq!(
+            uncapped,
+            MAX_PACKET_RETRANSMITS * PACKETS,
+            "every resend went uncapped"
+        );
+        assert!(deferred > 0);
+        let elapsed = Duration::from_nanos(abandoned_at - start);
+        let bound = MAX_EFFECTIVE_RTO * 2 * (MAX_PACKET_RETRANSMITS + 1);
+        assert!(
+            elapsed <= bound,
+            "abandoned after {elapsed:?}, bound {bound:?}"
+        );
+        assert_eq!(tracker.pending_len(), 0, "flight released");
+    }
+
+    /// A booking in the share is handed back when its packet is acked: the
+    /// resend arm then finds nothing due refused and ends the run (as
+    /// `PeerConnection::recv` does on a `WaitUntil` with nothing deferred),
+    /// so the next connection to book gets the acked packet's slot.
+    #[test]
+    fn an_acked_booking_is_handed_back() {
+        use crate::transport::egress_cap::{EgressCap, RetxAdmit, RetxDeferral};
+        let cap_time = VirtualTime::new();
+        let cap = EgressCap::new(1_000_000, cap_time.clone());
+        // Spend the share (500 kB in its 1 s window), keeping the bucket
+        // clear of its debt limit.
+        while let Ok(take) = cap.try_take_retransmit(1_200) {
+            take.sent(1_200);
+            cap_time.advance(Duration::from_millis(2));
+        }
+        let mut tracker = mock_sent_packet_tracker();
+        tracker.report_sent_packet(1, vec![0u8; 1_200].into());
+        tracker.time_source.advance(tracker.effective_rto());
+        let rto = tracker.effective_rto();
+        let mut run = RetxDeferral::default();
+        let arm = |tracker: &mut SentPacketTracker<VirtualTime>, run: &mut RetxDeferral| {
+            let now = tracker.time_source.now_nanos();
+            let mut refused = false;
+            let action = tracker.get_resend_admitted(|kind, len| {
+                match run.admit(&cap, kind, len, rto, now) {
+                    RetxAdmit::Defer(wait) => {
+                        refused = true;
+                        Err(wait)
+                    }
+                    other @ (RetxAdmit::Take(_) | RetxAdmit::Uncapped | RetxAdmit::SkipProbe) => {
+                        panic!("expected a deferral, got {other:?}")
+                    }
+                }
+            });
+            if matches!(action, ResendAction::WaitUntil(_)) && !refused {
+                run.end_run(Some(&cap));
+            }
+        };
+        arm(&mut tracker, &mut run);
+        let slot = run.booked_slot().expect("booked");
+        let _ = tracker.report_received_receipts(&[1]);
+        arm(&mut tracker, &mut run);
+        assert_eq!(run.booked_slot(), None, "the run ended with the ack");
+        let mut other = RetxDeferral::default();
+        let _ = other.admit(&cap, ResendKind::Rto, 1_200, rto, 0);
+        assert_eq!(other.booked_slot(), Some(slot), "its slot was handed back");
     }
 }
