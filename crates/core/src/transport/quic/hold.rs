@@ -31,7 +31,7 @@
 //! switches to unordered reads or ends. When the count passes the connection's
 //! threshold the detector trips: every stream still in its in-order phase is
 //! stopped (`stop_code::EVICTED`, counted as `QuicInboundOutcome::EvictedHold`),
-//! quinn frees what it held for them (`Recv::stop`), and their phases close.
+//! quinn frees what it held for them, and their phases close.
 //!
 //! An in-order phase spans at most a header and its metadata (18 + 1,120 B)
 //! or a control body (at most 4 KiB), so an honest one lasts at most about a

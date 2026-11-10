@@ -461,16 +461,13 @@ impl<T: TimeSource> BodyReader<T> {
     async fn next_unordered(&mut self) -> Result<Option<(u64, Bytes)>, ReadFailure> {
         debug_assert!(self.end.is_some(), "unordered reads start after the header");
         // Before the switch, read in order whatever is already contiguous.
-        // quinn trims a buffered chunk against what was read only when that
-        // chunk is read in order, and the switch does not trim against it
-        // (`Assembler::ensure_ordering` defragments from offset 0). So a
-        // second copy of bytes already read (a resend) can still be buffered
-        // below the read position; read unordered, quinn would count its
-        // bytes as read again and never report the stream's end, since
-        // `bytes_read` would pass the final size. An in-order read pops or
-        // trims every such copy before it returns, and blocks only once every
-        // buffered chunk starts past the read position, so the switch is made
-        // then.
+        // This is required for correctness: only in-order reads clear
+        // buffered duplicates. A second copy of bytes already read (a resend)
+        // can still be buffered below the read position, and the switch does
+        // not clear it; read unordered, it would break the stream. An
+        // in-order read pops or trims every such copy before it returns, and
+        // blocks only once every buffered chunk starts past the read
+        // position, so the switch is made then.
         if self.ordered {
             match self.recv.read_chunk(usize::MAX, true).now_or_never() {
                 Some(read) => {
@@ -573,7 +570,14 @@ impl<T: TimeSource> BodyReader<T> {
             // that fired at the same time: a stream that can read in order is
             // leaving its in-order phase, and a read is progress for the idle
             // timer. No arm can starve another: each completes at most once
-            // per call, and the call returns or re-arms.
+            // per call, and the call returns or re-arms. A peer cannot keep
+            // the read arm ready for long either: an in-order read covers
+            // only a header and its metadata (or a control body), and an
+            // unordered read stops at the declared end, so a trip or timer
+            // that loses a race is seen on a later call.
+            // Cancellation: quinn's `read_chunk` is cancel-safe (a dropped
+            // read loses no data), and the timer and trip futures are
+            // re-created or polled again on the next call.
             tokio::select! {
                 biased;
                 read = self.recv.read_chunk(max, ordered) => return self.on_read(read, ordered),
@@ -741,8 +745,8 @@ impl<T: TimeSource> Drop for BodyReader<T> {
         if self.finished || self.reset {
             self.conn_ranges.remove(gaps);
         } else {
-            // quinn's `Recv::stop` (also run when a `RecvStream` is dropped
-            // unfinished) clears the buffered data but keeps `recvd` until
+            // Stopping a stream in quinn (also done when a `RecvStream` is
+            // dropped unfinished) clears the buffered data but keeps `recvd` until
             // the peer sends FIN or RESET_STREAM, and nothing tells us when it
             // does: after a stop, `received_reset` returns at once
             // (`ClosedStream`). See `ConnRanges::keep`.
@@ -1409,7 +1413,7 @@ impl<T: TimeSource> Receiver<T> {
             }
             ReadFailure::HoldEvicted => {
                 stats.record(QuicInboundOutcome::EvictedHold);
-                // `Recv::stop` frees what quinn held for the stream.
+                // Stopping the stream frees what quinn held for it.
                 reader.stop(stop_code::EVICTED);
             }
             ReadFailure::Reset => stats.record(QuicInboundOutcome::ResetByPeer),

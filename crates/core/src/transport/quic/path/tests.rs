@@ -1500,12 +1500,11 @@ fn a_short_stream_waiting_for_room_fails_at_once() {
 /// resends, which carry both pieces). Then quinn holds the second piece,
 /// which starts inside the metadata, and a resend holding all of it: the
 /// in-order reads of the header and metadata take the resend, and the second
-/// piece is left buffered below where they stopped. Read unordered, quinn would
-/// count its bytes as read again and never report the end. The reader first
-/// drains in order what is contiguous, which pops that copy, and switches only
-/// once an in-order read would block, so the stream arrives intact. Fails
-/// without the drain (quinn's `Recv::stop` underflows) and with only a trim of
-/// the copy on our side (the stream never ends).
+/// piece is left buffered below where they stopped. Only in-order reads clear
+/// buffered duplicates, so the reader first drains in order what is
+/// contiguous, which pops that copy, and switches only once an in-order read
+/// would block, so the stream arrives intact. Fails without the drain and with
+/// only a trim of the copy on our side.
 #[test]
 fn a_second_copy_of_the_metadata_end_is_read_once() {
     bounded(|| async move {

@@ -2074,10 +2074,10 @@ Unordered reads: the header, the metadata and control bodies are read IN
     returns the peer's credit for every byte read, so bytes read past a
     missing header have no bound but the age limit.
   → Switch only once an in-order read would block (BodyReader::next_unordered
-    drains what is contiguous first): quinn-proto 0.11.19 does not trim a
-    buffered resend against the read position at the switch, and read
-    unordered it counts those bytes as read again, so bytes_read passes the
-    final size, the end is never reported, and Recv::stop underflows.
+    drains what is contiguous first). This is a correctness requirement: only
+    in-order reads clear buffered duplicates (a resend of bytes already read
+    can still be buffered below the read position), and a duplicate read
+    unordered after the switch breaks the stream.
   A gap costs one received range (quinn's recvd set and our mirror, ~70 B);
   gaps are counted per stream as ranges past the first, and a connection's
   streams may hold at most R_conn (budget::gap_cap, max(256, (W + debt) / 1 KiB); 256 without a meter), past
