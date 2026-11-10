@@ -747,9 +747,12 @@ impl LabPair {
                 let assembled_tx = assembled_tx.clone();
                 let arrived = arrived.clone();
                 tokio::spawn(async move {
-                    if let Ok(body) = arrival.handle.assemble().await {
-                        *arrived.lock() = Some(Instant::now());
-                        assembled_tx.send(body.len()).ok();
+                    match arrival.handle.assemble().await {
+                        Ok(body) => {
+                            *arrived.lock() = Some(Instant::now());
+                            assembled_tx.send(body.len()).ok();
+                        }
+                        Err(e) => eprintln!("LAB_ASSEMBLE_ERR {e:?}"),
                     }
                 });
             }
