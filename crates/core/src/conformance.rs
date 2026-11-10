@@ -45,11 +45,10 @@
 //! - [`activity`] — how busy each contract has recently been on this peer, which
 //!   weights focus toward contracts that will actually produce samples (#5913).
 //! - [`shadow`] — the opt-in loop that replays sampled states on a peer and records
-//!   what it would remove, without acting on it.
-//! - [`policy`] — what a peer is permitted to do about a finding. Removal was the
-//!   last step of the RFC #5320 deployment plan; that plan is superseded and nodes
-//!   do not remove contracts for breaking a merge law (see [`policy`]). The
-//!   retained, unreachable removal path is kept unable to fire there, by tests.
+//!   what it finds, without acting on it.
+//! - [`policy`]: whether a finding is reported, and whether it is persistent or
+//!   report-only. Nodes do not remove contracts for breaking a merge law (see
+//!   [`policy`]).
 //!
 //! # Relationship to the existing probe
 //!
@@ -71,11 +70,9 @@
 //!
 //! This module does not replace or disable that probe. The node can run this verifier
 //! in an opt-in shadow mode: set `FREENET_CONFORMANCE_CAPTURE_DIR` (see [`capture`] and
-//! [`shadow`]) and it samples observed states and records what it *would* remove.
-//! Those results are diagnostics recorded locally. The node never removes a
-//! contract on a conformance verdict: the [`EnforcementMode::Enforce`] path exists
-//! in the code but is unreachable from configuration, and enabling it is not
-//! planned. With the variable unset none of this runs.
+//! [`shadow`]) and it samples observed states and records what it finds. Those
+//! results are diagnostics recorded locally. The node never acts on a contract
+//! because of a conformance verdict. With the variable unset none of this runs.
 //!
 //! # Removal is not the plan
 //!
@@ -105,9 +102,9 @@
 //! bytes differ" is inconclusive. Three properties reach a verdict another way and
 //! are worth naming rather than glossing: [`ConformanceProperty::EmittedStateValidity`]
 //! fires on the contract's own `Invalid` verdict, the two self-delta checks fire on a
-//! size threshold (and are [`Severity::Diagnostic`], so they can never justify
-//! removal), and [`ConformanceProperty::ReconciliationCycle`] fires on a repeated
-//! state pair across simulated rounds.
+//! size threshold (and are [`Severity::Diagnostic`], so they never fail `fdev`), and
+//! [`ConformanceProperty::ReconciliationCycle`] fires on a repeated state pair across
+//! simulated rounds.
 //!
 //! A violation is also required to reproduce: [`verify_case`] re-runs any failing
 //! check and, if the second run disagrees, re-reports under
@@ -168,7 +165,7 @@ pub use host_clock::{
 pub use minimize::{MinimizeConfig, MinimizeReport, minimize, minimize_toward};
 pub use oracle::{ConformanceOracle, OracleError, OracleErrorKind};
 pub use policy::{
-    ConformanceAction, EnforcementMode, RemovalTier, decide, property_tier, removal_tier,
+    ConformanceAction, EnforcementMode, FindingClass, decide, finding_class, property_class,
 };
 pub use property::{
     ConformanceProperty, IdempotenceSettling, Inconclusive, OutputDigest, PremiseSource,

@@ -4945,12 +4945,9 @@ mod tests {
                         property: "state_idempotence",
                         severity: Severity::Violation,
                         settling,
-                        // The decision `policy::removal_tier` gives the class: a
+                        // The class `policy::finding_class` gives the finding: a
                         // settled finding is report-only.
-                        would_remove: !matches!(
-                            settling,
-                            Some(IdempotenceSettling::SettledAfter(_))
-                        ),
+                        persistent: !matches!(settling, Some(IdempotenceSettling::SettledAfter(_))),
                     }],
                 )],
                 1,
@@ -4987,17 +4984,16 @@ mod tests {
         );
     }
 
-    /// A report-only `Violation` must not be labelled removal-eligible.
+    /// A report-only `Violation` must be labelled report-only.
     ///
-    /// Every `Violation` row used to say "removal-eligible", which stopped being
-    /// true when some laws became report-only in every mode. The panel reads the
-    /// decision (`would_remove`) for the generic label; this checks the ROW, since
-    /// the legend below it mentions both tiers and would satisfy a whole-card match.
+    /// The panel reads the finding's class (`persistent`) for the generic label;
+    /// this checks the ROW, since the legend below it mentions both classes and
+    /// would satisfy a whole-card match.
     #[test]
     fn the_panel_labels_a_report_only_violation_as_report_only() {
         use freenet_stdlib::prelude::ContractInstanceId;
 
-        let rendered = |property: &'static str, would_remove: bool| {
+        let rendered = |property: &'static str, persistent: bool| {
             let key_id = ContractInstanceId::new([8u8; 32]);
             let key = key_id.to_string();
             let mut status = MergeCheckStatus::default();
@@ -5011,7 +5007,7 @@ mod tests {
                         property,
                         severity: Severity::Violation,
                         settling: None,
-                        would_remove,
+                        persistent,
                     }],
                 )],
                 1,
@@ -5028,22 +5024,22 @@ mod tests {
         assert!(
             report_only.contains("Violation (report-only)")
                 && !report_only.contains(r#">Violation</span>"#),
-            "a report-only finding was labelled as removal-eligible:\n{report_only}"
+            "a report-only finding was labelled as persistent:\n{report_only}"
         );
-        // The "Report-only" column carries the tier decision itself.
+        // The "Report-only" column carries the class itself.
         assert!(
             report_only.contains(r#"<td class="right">yes</td></tr>"#),
             "a report-only finding must show 'report-only: yes':\n{report_only}"
         );
-        let eligible = rendered("state_commutativity", true);
+        let persistent = rendered("state_commutativity", true);
         assert!(
-            eligible.contains(r#">Violation</span>"#)
-                && !eligible.contains("Violation (report-only)"),
-            "a removal-eligible finding lost its label:\n{eligible}"
+            persistent.contains(r#">Violation</span>"#)
+                && !persistent.contains("Violation (report-only)"),
+            "a persistent finding lost its label:\n{persistent}"
         );
         assert!(
-            eligible.contains(r#"<td class="right">no</td></tr>"#),
-            "a removal-eligible finding must show 'report-only: no':\n{eligible}"
+            persistent.contains(r#"<td class="right">no</td></tr>"#),
+            "a persistent finding must show 'report-only: no':\n{persistent}"
         );
     }
 
@@ -5061,7 +5057,7 @@ mod tests {
     /// assertion is retargeted rather than dropped, because the property it
     /// guards — an explanation rather than a bare enum name — is unchanged.
     #[test]
-    fn merge_card_lists_findings_with_severity_and_removal_distinguished() {
+    fn merge_card_lists_findings_with_severity_and_class_distinguished() {
         use freenet_stdlib::prelude::ContractInstanceId;
 
         let key_id = ContractInstanceId::new([5u8; 32]);
@@ -5078,14 +5074,14 @@ mod tests {
                         property: "state_commutativity",
                         severity: Severity::Violation,
                         settling: None,
-                        would_remove: true,
+                        persistent: true,
                     },
                     MergeFinding {
                         contract: key_id,
                         property: "self_delta_empty",
                         severity: Severity::Diagnostic,
                         settling: None,
-                        would_remove: false,
+                        persistent: false,
                     },
                 ],
             )],
@@ -5201,7 +5197,7 @@ mod tests {
                     property: "state_commutativity",
                     severity: Severity::Violation,
                     settling: None,
-                    would_remove: true,
+                    persistent: true,
                 }],
             )],
             1,
@@ -5220,7 +5216,7 @@ mod tests {
                         property: "state_idempotence",
                         severity: Severity::Violation,
                         settling: None,
-                        would_remove: true,
+                        persistent: true,
                     }],
                 )],
                 1,
@@ -5389,7 +5385,7 @@ mod tests {
                     property: "state_commutativity",
                     severity: Severity::Violation,
                     settling: None,
-                    would_remove: true,
+                    persistent: true,
                 }],
             )],
             1,
@@ -5680,7 +5676,7 @@ mod tests {
     /// #5403 L6: every property name these card tests plant must be one the checker
     /// can actually emit.
     ///
-    /// `merge_card_lists_findings_with_severity_and_removal_distinguished` asserted on
+    /// `merge_card_lists_findings_with_severity_and_class_distinguished` asserted on
     /// `self_delta_size`, which `ConformanceProperty::as_str` cannot produce — the
     /// real name is `self_delta_empty`. The test was internally consistent (it planted
     /// the string and then found it), so it passed while asserting about a card state
