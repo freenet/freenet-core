@@ -1640,7 +1640,9 @@ impl<T: TimeSource> Receiver<T> {
         let token = LegacyStreamToken::new();
         let key = {
             let mut budget = self.budget.lock();
-            budget.check(total, Releaser::Quic)?;
+            if let Err(rejection) = budget.check(total, Releaser::Quic) {
+                return Err(rejection);
+            }
             let key = self.short_key(&budget);
             budget.charge(
                 key,
