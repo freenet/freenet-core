@@ -70,6 +70,8 @@ pub enum LabController {
     Gated,
     /// A BBR-style model controller (`recycle::lab::Model`).
     Model,
+    /// The loss gate of the PR (`recycle::loss_gate::LossGate`).
+    GatePr,
 }
 
 /// Choose the controller for connections built from now on.
@@ -82,6 +84,7 @@ pub fn set_controller(controller: LabController) {
         LabController::Westwood => lab::WESTWOOD,
         LabController::Gated => lab::GATED,
         LabController::Model => lab::MODEL,
+        LabController::GatePr => lab::GATE_PR,
     };
     lab::INNER_CONTROLLER.store(value, Ordering::Relaxed);
 }

@@ -341,6 +341,15 @@ impl ControllerFactory for CappedCubicFactory {
                     current_mtu,
                 ));
             }
+            lab::GATE_PR => {
+                return Box::new(CappedCubic::new(
+                    Box::new(loss_gate::LossGate::new(
+                        this.cubic.clone().build(now, current_mtu),
+                    )),
+                    this.rate.clone(),
+                    current_mtu,
+                ));
+            }
             lab::MODEL => {
                 return Box::new(CappedCubic::new(
                     Box::new(lab::Model::new(
@@ -406,6 +415,8 @@ pub(crate) mod lab {
     pub(crate) const GATED: u8 = 4;
     /// [`Model`], no Cubic.
     pub(crate) const MODEL: u8 = 5;
+    /// `loss_gate::LossGate`, the code of the PR (fix/quic-delay-gated-cubic).
+    pub(crate) const GATE_PR: u8 = 6;
 
     /// [`Model`]: a round whose share of bytes lost is at least this many
     /// thousandths counts as congested (BBRv2 and v3 use 20, 2%).
@@ -1841,6 +1852,8 @@ pub(crate) async fn watch_acknowledgements<T: TimeSource>(
         }
     }
 }
+
+pub(crate) mod loss_gate;
 
 #[cfg(test)]
 mod cap_tests;

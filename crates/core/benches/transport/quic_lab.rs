@@ -670,6 +670,7 @@ fn quic_lab_loss() {
         "westwood" => LabController::Westwood,
         "gated" => LabController::Gated,
         "model" => LabController::Model,
+        "gatepr" => LabController::GatePr,
         other => panic!("unknown controller {other}"),
     });
     let knobs = apply_start_knobs();
@@ -997,6 +998,7 @@ fn quic_lab_many() {
         "westwood" => LabController::Westwood,
         "gated" => LabController::Gated,
         "model" => LabController::Model,
+        "gatepr" => LabController::GatePr,
         other => panic!("unknown controller {other}"),
     });
     let knobs = apply_start_knobs();
@@ -1234,6 +1236,7 @@ fn quic_lab_mix() {
         "westwood" => LabController::Westwood,
         "gated" => LabController::Gated,
         "model" => LabController::Model,
+        "gatepr" => LabController::GatePr,
         other => panic!("unknown controller {other}"),
     });
     let gap_rule = std::env::var("LAB_GAP").unwrap_or_else(|_| "stream".into());
@@ -1429,6 +1432,7 @@ fn quic_lab_cold() {
         "westwood" => LabController::Westwood,
         "gated" => LabController::Gated,
         "model" => LabController::Model,
+        "gatepr" => LabController::GatePr,
         other => panic!("unknown controller {other}"),
     });
     let knobs = apply_start_knobs();
@@ -1608,6 +1612,7 @@ fn quic_lab_burst() {
         "westwood" => LabController::Westwood,
         "gated" => LabController::Gated,
         "model" => LabController::Model,
+        "gatepr" => LabController::GatePr,
         other => panic!("unknown controller {other}"),
     });
     let knobs = apply_start_knobs();
