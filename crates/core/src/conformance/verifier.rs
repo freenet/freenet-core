@@ -263,7 +263,7 @@ fn reproduced_identically(first: &Violation, second: &Violation) -> bool {
         | ConformanceProperty::SummaryDeterminism
         | ConformanceProperty::DeltaDeterminism => true,
         // `settling` too, not just the digests. It is decision-relevant data — the
-        // whole point of carrying it is that an enforcement policy branches on it —
+        // whole point of carrying it is that `policy::finding_class` branches on it,
         // so a classification that differs between runs must not be reported as
         // though it had reproduced. A contract whose settling varies IS
         // non-deterministic, and falling through to `escalate_to_determinism` names
@@ -321,14 +321,13 @@ fn run<O: ConformanceOracle + ?Sized>(
             // carrying no information. That is idempotence broken on any honest
             // reading, and the loop was suppressing a true finding.
             //
-            // The choice looked binary — flag every canonicalizing contract as
-            // removal-eligible, or suppress — and it is not. The distinction is
-            // kept as DATA on the finding ([`IdempotenceSettling`]) rather than as
-            // a severity fork, so the removal policy branches on it
-            // (`policy::removal_tier`) without the verifier having pre-decided the
-            // answer. Bending the
-            // classification to soften an enforcement consequence is the specific
-            // mistake this replaced (#5462).
+            // The choice looked binary (flag every canonicalizing contract as
+            // persistent, or suppress), and it is not. The distinction is kept as
+            // DATA on the finding ([`IdempotenceSettling`]) rather than as a
+            // severity fork, so the classification branches on it
+            // (`policy::finding_class`) without the verifier having pre-decided the
+            // answer. Bending the classification to soften a consequence is the
+            // specific mistake this replaced (#5462).
             //
             // DELIBERATE DIVERGENCE from the executor's in-tree probe — do NOT
             // "reconcile" them without reading both. `probe_identical_input_idempotency`
@@ -346,8 +345,8 @@ fn run<O: ConformanceOracle + ?Sized>(
             // Sequencing note: canonicalising at install removes the benign class
             // entirely. Until then, expect `SettledAfter(1)` findings against correct
             // contracts and read them as "the install path has not been fixed yet",
-            // not as "this contract is broken". `policy::removal_tier` makes that
-            // class report-only in every mode, so it never reaches `WouldRemove`.
+            // not as "this contract is broken". `policy::finding_class` makes that
+            // class report-only, so it is never counted as persistent.
             let a: &[u8] = &case.states[0];
             let once = merge(oracle, a, a)?;
             if once == a {
@@ -368,8 +367,8 @@ fn run<O: ConformanceOracle + ?Sized>(
                 // established above — reporting "we could not tell" about a
                 // contract already caught. The never-settling class grows its
                 // state on every apply, so it is the likeliest to hit a fuel or
-                // size ceiling on exactly these follow-up merges: the class
-                // enforcement can act on would be the one that silently
+                // size ceiling on exactly these follow-up merges: the most
+                // serious class would be the one that silently
                 // disappeared, and a contract could arrange that in one line by
                 // trapping on the second identical merge.
                 let merged = match merge(oracle, &current, &current) {
@@ -440,7 +439,7 @@ fn run<O: ConformanceOracle + ?Sized>(
             // the class is report-only. If the byte order instead depends on merge
             // history, so that peers holding the same content keep different
             // bytes, the two merge orders differ and `StateCommutativity` reports
-            // it as its own finding (removal-eligible).
+            // it as its own finding (persistent).
             if is_reordering(&once, a) {
                 detail.push_str(
                     ". NOTE: the rewritten state holds exactly the same bytes in a \
@@ -497,9 +496,9 @@ fn run<O: ConformanceOracle + ?Sized>(
             // when a later removal (a ban) or a raised cap frees it, while the other
             // grouping still holds the entry. Measured on River's room contract: ~30%
             // of generated triples fail strictly and every one converges on the next
-            // exchange. Reporting them would make every capped chat, feed or log
-            // removable, and anyone able to trigger a removal could build a failing
-            // triple on purpose. So it is reported only if it does not HEAL, in the
+            // exchange. Reporting them would flag every capped chat, feed or log,
+            // and anyone able to trigger an eviction could build a failing triple
+            // on purpose. So it is reported only if it does not HEAL, in the
             // sense `associativity_heals` defines.
             //
             // A grouping the contract rejects is reported outright. Both inputs and

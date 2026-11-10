@@ -1781,7 +1781,7 @@ fn a_runtime_failure_is_inconclusive_not_a_contract_error() {
     );
 }
 
-/// Neither culprit is removal-eligible, whatever the label says: `Inconclusive`
+/// Neither culprit is a violation, whatever the label says: `Inconclusive`
 /// never reaches `PropertyOutcome::Violated`, so the split label above cannot make a
 /// runtime bug more actionable against the contract than it already wasn't.
 #[test]
@@ -1922,7 +1922,7 @@ fn resource_exhaustion_is_inconclusive() {
 /// both order-invariant and idempotent (union) or neither (append).
 ///
 /// Two things are asserted: the idempotence check fires, and it is a Diagnostic, so
-/// a counter-style contract is not removal-eligible for it. Deltas must be
+/// a counter-style contract does not fail `fdev` for it. Deltas must be
 /// idempotent (settled 2026-11-06), but nodes act on no conformance verdict.
 #[test]
 fn a_commutative_but_non_idempotent_delta_is_a_diagnostic_not_a_violation() {
@@ -1949,7 +1949,7 @@ fn a_commutative_but_non_idempotent_delta_is_a_diagnostic_not_a_violation() {
     assert_eq!(outcome.violation().unwrap().severity, Severity::Diagnostic);
     assert!(
         !outcome.is_enforceable_violation(),
-        "a counter-style delta must not be removal-eligible: DeltaIdempotence is a \
+        "a counter-style delta must not be a law-break finding: DeltaIdempotence is a \
          diagnostic, and nodes act on no conformance verdict"
     );
 
@@ -2403,7 +2403,7 @@ fn a_sound_bounded_collection_is_not_accused() {
 
 /// The same cap, evicting by something INDEPENDENT of the merge's own ordering, is
 /// caught — and that is correct rather than a false positive: such a contract is
-/// already removal-eligible under `StateAssociativity`, for the same underlying
+/// already has a persistent finding under `StateAssociativity`, for the same underlying
 /// reason (an entry dropped early destroys information a different merge order
 /// would have kept).
 ///
@@ -2466,7 +2466,7 @@ fn capped_collection_evicting_outside_the_merge_order_is_caught() {
 /// Brute-forced over its whole state space on 2026-08-23 (universe of five elements,
 /// `1` causally after `5`, N = 2, ties by keeping the largest: 15 valid states) it
 /// is commutative and idempotent with zero failures, and NOT associative — 532
-/// failing triples. So it is already removal-eligible under `StateAssociativity`
+/// failing triples. So it already has a persistent `StateAssociativity` finding
 /// before this property is consulted, which is what closes the gap: the transition
 /// law condemns no contract the settled algebra acquits. It fires here too, which is
 /// the consistency the semilattice argument in `TransitionPathAgreement`'s
@@ -3209,7 +3209,7 @@ fn evidence_at_the_related_contract_limit_is_accepted() {
 /// because the SENDER witnessed that `result` was reached from `base`, and that
 /// witness is not in the bytes — so a fabricated pair from a conforming grow-only
 /// contract would have every recipient independently confirm a violation against a
-/// correct contract. The property is also report-only (`policy::removal_tier`); the
+/// correct contract. The property is also report-only (`policy::finding_class`); the
 /// refusal is the first of the two guards.
 #[test]
 fn evidence_for_a_property_that_is_not_self_verifying_is_refused() {
@@ -3322,8 +3322,8 @@ fn every_property_declares_whether_it_is_self_verifying() {
 /// a delta is always `get_state_delta(sender, recipient_summary)`. Fed the
 /// causally-sequenced pair `D1 = add A^t`, `D2 = remove t`, the two orders diverge —
 /// and this property is `Severity::Violation`. It is also report-only now
-/// (`policy::removal_tier`), so `policy::decide` would only report it; the refusal
-/// is the first of two guards, and stays because a recipient would still confirm a
+/// (`policy::finding_class`), so it would never be counted as persistent; the
+/// refusal is the first of two guards, and stays because a recipient would still confirm a
 /// violation against a correct contract.
 #[test]
 fn evidence_for_delta_permutation_invariance_is_refused() {
@@ -3372,7 +3372,7 @@ fn evidence_for_delta_permutation_invariance_is_refused() {
 /// constrains their size and nothing else, and no `require_valid` analogue exists for
 /// a summary. So a property that reads a supplied summary is in the same hazard class
 /// as one that reads a delta, and
-/// [`no_shippable_removal_eligible_property_consumes_unvalidated_bytes`] must see it.
+/// [`no_shippable_persistent_property_consumes_unvalidated_bytes`] must see it.
 ///
 /// A local exhaustive match rather than a method on `ConformanceProperty`: this is a
 /// fact about `verify_case`'s branches, not part of the type's public contract, and
@@ -3437,21 +3437,22 @@ fn verdict_survives_fabricated_bytes(property: ConformanceProperty) -> bool {
 /// validates a delta or a supplied summary — there is no `require_valid` analogue for
 /// either, because a contract exposes no "is this delta/summary well-formed" entry
 /// point. So a property that (a) travels as evidence, (b) consumes delta or supplied
-/// summary bytes, and (c) is removal-eligible would let an attacker choose bytes that
-/// go straight into another peer's WASM and come back out as a removal verdict.
+/// summary bytes, and (c) is persistent would let an attacker choose bytes that go
+/// straight into another peer's WASM and come back out as a persistent finding
+/// against a correct contract.
 ///
 /// Two properties carry deltas. `DeltaPermutationInvariance` is `Violation` and is
 /// kept off the wire by `premise_source` (and is report-only besides).
 /// `DeltaIdempotence` ships, and is safe only because it is `Diagnostic` and
-/// report-only, which `policy::decide` never turns into a removal — so neither its
-/// severity nor its tier is independently adjustable, and its own documentation says
-/// so. This test is what makes that a rule rather than a note: making it
-/// removal-eligible without revisiting `premise_source` in the same change fails here.
+/// report-only, so a fabricated delta buys an attacker a report-only finding and
+/// nothing else. Neither its severity nor its class is independently adjustable, and
+/// its own documentation says so. This test is what makes that a rule rather than a
+/// note: making it persistent without revisiting `premise_source` in the same change
+/// fails here.
 ///
-/// "Removal-eligible" here is what `policy::decide` can turn into a removal: a
-/// `Violation` whose `policy::property_tier` is `RemovalEligible`. The per-finding
-/// refinement in `policy::removal_tier` can only lower that tier, so the property
-/// level is the conservative question to ask.
+/// "Persistent" here is a `Violation` whose `policy::property_class` is
+/// `Persistent`. The per-finding refinement in `policy::finding_class` can only
+/// lower that class, so the property level is the conservative question to ask.
 ///
 /// One property consumes a supplied SUMMARY: `DeltaDeterminism`, which both ships and
 /// is `Violation`. It is in scope here — the earlier version of this test filtered on
@@ -3463,13 +3464,12 @@ fn verdict_survives_fabricated_bytes(property: ConformanceProperty) -> bool {
 /// name in a list precisely so a NEW summary-consuming property has to answer the
 /// question rather than inherit the answer.
 #[test]
-fn no_shippable_removal_eligible_property_consumes_unvalidated_bytes() {
+fn no_shippable_persistent_property_consumes_unvalidated_bytes() {
     let consumes_unvalidated =
         |p: ConformanceProperty| p.delta_arity() > 0 || consumes_supplied_summary(p);
-    let removal_eligible = |p: ConformanceProperty| {
+    let persistent = |p: ConformanceProperty| {
         p.severity() == Severity::Violation
-            && crate::conformance::property_tier(p)
-                == crate::conformance::RemovalTier::RemovalEligible
+            && crate::conformance::property_class(p) == crate::conformance::FindingClass::Persistent
     };
 
     let hazardous: Vec<ConformanceProperty> = ConformanceProperty::ALL
@@ -3478,17 +3478,17 @@ fn no_shippable_removal_eligible_property_consumes_unvalidated_bytes() {
         .filter(|p| {
             consumes_unvalidated(*p)
                 && p.is_self_verifying()
-                && removal_eligible(*p)
+                && persistent(*p)
                 && !verdict_survives_fabricated_bytes(*p)
         })
         .collect();
     assert!(
         hazardous.is_empty(),
         "{hazardous:?}: a property that ships as evidence, runs attacker-chosen \
-         delta or summary bytes through the WASM, and is removal-eligible is the \
+         delta or summary bytes through the WASM, and is persistent is the \
          combination the evidence gate exists to prevent. Either mark it \
          `PremiseSource::LocalProvenance`, or make it report-only \
-         (`policy::property_tier`), or give those bytes a validity check first — do \
+         (`policy::property_class`), or give those bytes a validity check first; do \
          not simply update this test"
     );
 
@@ -3509,12 +3509,12 @@ fn no_shippable_removal_eligible_property_consumes_unvalidated_bytes() {
     let carried_only_by_the_exemption: Vec<ConformanceProperty> = ConformanceProperty::ALL
         .iter()
         .copied()
-        .filter(|p| consumes_unvalidated(*p) && p.is_self_verifying() && removal_eligible(*p))
+        .filter(|p| consumes_unvalidated(*p) && p.is_self_verifying() && persistent(*p))
         .collect();
     assert_eq!(
         carried_only_by_the_exemption,
         vec![ConformanceProperty::DeltaDeterminism],
-        "the set of shippable removal-eligible properties consuming unvalidated \
+        "the set of shippable persistent properties consuming unvalidated \
          bytes has changed. `DeltaDeterminism` is here because a fabricated summary \
          cannot manufacture a nondeterminism verdict; anything joining it needs that \
          argument made for it in `verdict_survives_fabricated_bytes`, and anything \

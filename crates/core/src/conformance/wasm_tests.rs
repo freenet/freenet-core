@@ -260,8 +260,8 @@ async fn verifier_matches_real_wasm_for_every_planted_defect()
     // cap evicts by an index derived from the set's own contents — independent of
     // the merge's ordering — and merging the reached state back into its base
     // genuinely does not reproduce it. That is the same information loss
-    // `StateAssociativity` already reports for this mode, so the contract is
-    // removal-eligible either way; what matters is that it is a real divergence and
+    // `StateAssociativity` already reports for this mode, so the contract has
+    // a persistent finding either way; what matters is that it is a real divergence and
     // not an artifact of capping.
     //
     // The cap applies to the mode's DELTA path as well as its merge path, which is
