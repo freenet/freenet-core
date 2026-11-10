@@ -44,6 +44,8 @@ use rand::{Rng, SeedableRng};
 
 #[cfg(test)]
 mod r1_tests;
+#[cfg(test)]
+mod storm_tests;
 
 const NANOS_PER_SEC: u128 = 1_000_000_000;
 

@@ -306,6 +306,7 @@ use freenet_stdlib::prelude::ContractInstanceId;
 use parking_lot::Mutex;
 
 use crate::node::background_task_monitor::BackgroundTaskMonitor;
+use crate::operations::update::propagation_stats::PropagationEvent;
 use crate::ring::interest::SummaryMissingReason;
 use crate::tracing::event_kind::{STATE_SIZE_BUCKET_COUNT, state_size_bucket};
 
@@ -716,6 +717,19 @@ struct Window {
     /// Fixed cardinality (2 x 2 `u64`s), no per-contract map: see the module
     /// docs for why the per-contract refinement is deliberately not here.
     applies: [[u64; 2]; ApplyOrigin::COUNT],
+
+    /// Node-wide [`PropagationEvent`] counts (#6143): what each fan-out leg
+    /// actually did, how the transport carried it, the best-effort
+    /// fan-out/heal events dropped before they started, and the receiver's
+    /// pre-merge skips. The per-contract split is in the
+    /// `update_propagation_summary` INFO line; this is the fleet-queryable
+    /// copy.
+    ///
+    /// Not the same count as `delta_sends` / the full-state arms above. Those
+    /// count a full-state STREAM when it completes; `prop_sent_full` counts it
+    /// when it is handed to the bridge, and the `prop_wire_stream_*` fields
+    /// count how each stream then ended.
+    propagation_events: [u64; PropagationEvent::COUNT],
 }
 
 impl Default for Window {
@@ -737,6 +751,7 @@ impl Default for Window {
             tracked_missing_sends: [0; SummaryMissingReason::ALL.len()],
             tracked_missing_bytes: [0; SummaryMissingReason::ALL.len()],
             applies: [[0; 2]; ApplyOrigin::COUNT],
+            propagation_events: [0; PropagationEvent::COUNT],
         }
     }
 }
@@ -1121,6 +1136,28 @@ impl PayloadMix {
             // obviously-clamped one.
             counts[changed_idx] = counts[changed_idx].saturating_add(1);
         }
+    }
+
+    /// Count one [`PropagationEvent`] (#6143). Production code calls this
+    /// through `propagation_stats::record_propagation_event`, which also
+    /// feeds the per-contract INFO summary.
+    pub(crate) fn record_propagation_event(&self, ev: PropagationEvent) {
+        let mut w = self.window.lock();
+        // Fallible indexing for the same reason as `record_apply`.
+        if let Some(slot) = w.propagation_events.get_mut(ev.index()) {
+            *slot = slot.saturating_add(1);
+        }
+    }
+
+    /// Test-only view of the [`PropagationEvent`] counts, without draining.
+    #[cfg(test)]
+    pub(crate) fn propagation_event_for_test(&self, ev: PropagationEvent) -> u64 {
+        self.window
+            .lock()
+            .propagation_events
+            .get(ev.index())
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Test-only view of the apply counters, indexed `[origin][changed]`.
@@ -1570,6 +1607,24 @@ fn payload_mix_json(
     serde_json::Value::Object(obj)
 }
 
+/// Add the #6143 propagation counts to a rollup payload, as
+/// `prop_<label>` fields.
+///
+/// Every event is always published, zero or not, so a dashboard can tell "no
+/// skips" from "a node too old to report skips" by the field's presence.
+fn insert_propagation_fields(
+    payload: &mut serde_json::Value,
+    events: &[u64; PropagationEvent::COUNT],
+) {
+    let Some(obj) = payload.as_object_mut() else {
+        return;
+    };
+    for ev in PropagationEvent::ALL {
+        let n = events.get(ev.index()).copied().unwrap_or(0);
+        obj.insert(format!("prop_{}", ev.label()), n.into());
+    }
+}
+
 /// Emit one `broadcast_payload_mix` rollup and reset the window.
 ///
 /// Returns the payload so callers (and tests) can inspect what was sent.
@@ -1582,7 +1637,7 @@ pub(crate) fn emit_payload_mix_rollup(
     // exactly the same set of broadcasts, so the top-N list always reconciles
     // against `full_state_bytes`.
     let window = mix.take_window();
-    let payload = payload_mix_json(
+    let mut payload = payload_mix_json(
         &window.arms(),
         &window.top_contracts(),
         &window.top_not_efficient_contracts(),
@@ -1596,6 +1651,7 @@ pub(crate) fn emit_payload_mix_rollup(
         &window.applies(),
         window_secs,
     );
+    insert_propagation_fields(&mut payload, &window.propagation_events);
     crate::tracing::telemetry::send_standalone_event_with_peer_id(
         "broadcast_payload_mix",
         local_peer_id,
@@ -3184,5 +3240,33 @@ mod tests {
             "the no-change apply must be recorded BEFORE the state-recovery \
              fallback can bail out ({no_change_pos} < {fallback_err_pos})"
         );
+    }
+
+    /// #6143: the propagation counts reach the telemetry payload, every event
+    /// as its own `prop_<label>` field (zeros included), and the window resets.
+    #[test]
+    fn rollup_publishes_propagation_events() {
+        let mix = PayloadMix::new();
+        mix.record_propagation_event(PropagationEvent::SkipSummaryEqual);
+        mix.record_propagation_event(PropagationEvent::SkipSummaryEqual);
+        mix.record_propagation_event(PropagationEvent::RxBackoff);
+
+        let payload = emit_payload_mix_rollup(&mix, "peer", 60);
+        for ev in PropagationEvent::ALL {
+            let want = if ev == PropagationEvent::SkipSummaryEqual {
+                2
+            } else if ev == PropagationEvent::RxBackoff {
+                1
+            } else {
+                0
+            };
+            assert_eq!(
+                payload[format!("prop_{}", ev.label())],
+                serde_json::json!(want),
+                "{ev:?}"
+            );
+        }
+        let next = emit_payload_mix_rollup(&mix, "peer", 60);
+        assert_eq!(next["prop_skip_summary_equal"], serde_json::json!(0));
     }
 }

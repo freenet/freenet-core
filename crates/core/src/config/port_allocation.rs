@@ -102,20 +102,35 @@ mod tests {
 
     #[test]
     fn test_multiple_port_allocations() -> std::io::Result<()> {
-        // Get multiple ports in succession
-        let port1 = find_available_port()?;
-        let port2 = find_available_port()?;
-        let port3 = find_available_port()?;
+        // `find_available_port` promises a port that is free at the moment it
+        // returns, not one distinct from earlier calls: once a returned port is
+        // released, the OS may legitimately hand it out again. So hold each
+        // port bound while asking for the next one. A repeat is then a real
+        // bug, because the function returned a port that is in use.
+        //
+        // Hold on loopback, the address the OS fallback checks. Binding
+        // 0.0.0.0 here would also demand the port be free on every other
+        // interface, which the function does not promise (on nova a
+        // mosh-server on the public IP failed exactly that). A loopback hold
+        // still conflicts with the 0.0.0.0 probe used for the Windows/WSL
+        // safe ranges, so a repeat on that path would be caught too.
+        let mut held = Vec::new();
+        for _ in 0..3 {
+            let port = find_available_port()?;
+            assert!(
+                port > 1024,
+                "port {port} should be above the privileged range"
+            );
+            let socket = UdpSocket::bind(SocketAddr::new(LOOPBACK_V4, port))
+                .unwrap_or_else(|e| panic!("returned port {port} is not bindable: {e}"));
+            held.push((port, socket));
+        }
 
-        // Verify they're all different
-        assert_ne!(port1, port2);
-        assert_ne!(port2, port3);
-        assert_ne!(port1, port3);
-
-        // Verify ports are in valid range (above 1024 for unprivileged ports)
-        assert!(port1 > 1024);
-        assert!(port2 > 1024);
-        assert!(port3 > 1024);
+        for (i, (a, _)) in held.iter().enumerate() {
+            for (b, _) in &held[i + 1..] {
+                assert_ne!(a, b, "a port still held was returned again");
+            }
+        }
 
         Ok(())
     }

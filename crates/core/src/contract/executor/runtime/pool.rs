@@ -14,8 +14,12 @@ pub struct PoolHealthStatus {
     pub checked_out: usize,
     /// Total pool size (should equal available + checked_out)
     pub total: usize,
-    /// Number of executors that were replaced due to failures
+    /// Number of POOL executors that were replaced due to failures.
     pub replacements: usize,
+    /// Number of times the delegate executor ([`PooledDelegateRunner`]),
+    /// which is outside the pool, was replaced. Not included in
+    /// `replacements`, which with `total` describes the pool only.
+    pub delegate_replacements: usize,
     /// Number of distinct contracts currently being processed.
     /// Observability-only: the sequential event loop means this is always 0 or 1.
     pub contracts_in_flight: usize,
@@ -163,10 +167,6 @@ pub struct RuntimePool {
     shared_summaries: SharedSummaries,
     /// Per-client subscription count for O(1) limit enforcement.
     shared_client_counts: SharedClientCounts,
-    /// Shared compiled contract module cache (avoids 16x duplication across pool
-    /// executors), keyed by CODE hash so instances differing only in parameters
-    /// share one compiled module (#5268).
-    shared_contract_modules: SharedModuleCache<CodeHash>,
     /// Per-node store state every executor's `ContractStore`/`DelegateStore`
     /// shares: the instance indexes (so a contract or delegate stored / indexed
     /// / removed via any executor is visible to all the others, #4218) and the
@@ -174,11 +174,81 @@ pub struct RuntimePool {
     /// than `pool_size` copies, #5268). Cloned into every executor at
     /// construction and into replacements.
     shared_stores: SharedStores,
+    /// Shared `ctx.write()` cache, one entry per delegate and hosted user (see
+    /// `DelegateContextCache`).
+    shared_delegate_contexts: crate::wasm_runtime::DelegateContextCache,
+    /// Manifests, consent-once grants and the unprompted-run budget for this
+    /// node's delegates (`contract::delegate_capabilities`). Per node, never
+    /// a process global: simulation tests run many nodes in one process.
+    ///
+    /// `None` in hosted mode: there every client can present any app's token
+    /// from what the node sees as a local connection, and runs have no
+    /// per-user secret namespace, so neither app identity nor a node-wide
+    /// grant means anything there.
+    delegate_capabilities:
+        Option<Arc<crate::contract::delegate_capabilities::DelegateCapabilities>>,
+    /// Receiver for delegate notifications (taken once by `contract_handling()`).
+    delegate_notification_rx: Option<super::DelegateNotificationReceiver>,
+    /// Per-contract executor usage tracking (for observability).
+    /// Not used for enforcement since the event loop is sequential.
+    /// Tracked via RAII `InFlightGuard` in: `fetch_contract`, `upsert_contract_state`,
+    /// `summarize_contract_state`, `get_contract_state_delta`.
+    /// Intentionally NOT tracked in: `execute_delegate_request` and
+    /// `execute_delegate_hop` (no contract key),
+    /// `register_contract_notifier` (synchronous, no executor checkout),
+    /// `lookup_key`, `get_subscription_info`, `remove_client`
+    /// (read-only / no executor checkout).
+    in_flight_contracts: HashMap<ContractKey, usize>,
+    /// Bounds how many hosted-mode secret exports may run OFF-LOOP concurrently
+    /// (#4381 P5). Each admitted export holds one permit (in its `ExportJob`)
+    /// AND one pool executor for its duration. Sized to
+    /// [`effective_export_permits`] (`min(MAX_CONCURRENT_EXPORTS, pool_size-1)`)
+    /// so >=1 executor is ALWAYS reserved for normal contract ops — this is the
+    /// enforced anti-deadlock invariant (see `effective_export_permits`), not a
+    /// prose hope. `Arc` so an admitted `ExportJob` can hold an owned permit
+    /// across the spawned background task without borrowing the pool.
+    ///
+    /// NOTE: this is EXPORT-only. The live secret IMPORT (#4592) is handled
+    /// on the contract loop and takes no permit here. What serializes it with
+    /// delegate `store_secret` is NOT the loop (since the delegate lane, the
+    /// lane runs delegates too) but the delegate executor's lock: `import_secrets`
+    /// runs under `PooledDelegateRunner::with_executor`, as every delegate
+    /// `process()` does. See the `import_secrets` impl and the `ImportSecrets`
+    /// arm in `contract.rs` (the store write path assumes node-wide write
+    /// serialization).
+    export_semaphore: Arc<Semaphore>,
+    /// Inactive-user reclaim sweep task (#4561, P5 of #4381). `Some` ONLY when
+    /// hosted mode is on AND `per-user-inactive-ttl > 0`. The pool owns the
+    /// abort guard so the sweep — which holds a clone of the shared ReDb
+    /// `Storage` — is aborted when the pool is dropped on node shutdown, matching
+    /// the #4401 teardown discipline for every other `Storage`-holding task.
+    /// `None` on a Local single-user node, so that node spawns nothing and the
+    /// reclaim machinery is entirely inert.
+    _inactive_user_sweep: Option<crate::util::AbortOnDrop>,
+    /// The ONE executor every delegate `process()` runs on, lane or loop, and
+    /// the factory that builds a replacement for any executor. See
+    /// [`PooledDelegateRunner`].
+    delegate_runner: Arc<PooledDelegateRunner>,
+}
+
+/// Everything needed to build an executor that shares this pool's state.
+/// Held by [`PooledDelegateRunner`] so it can replace its own executor after a
+/// WASM panic without reaching back into the pool, which the loop owns.
+struct ExecutorFactory {
+    config: Arc<Config>,
+    op_manager: Arc<OpManager>,
+    shared_state_store: StateStore<Storage>,
+    shared_notifications: SharedNotifications,
+    shared_summaries: SharedSummaries,
+    shared_client_counts: SharedClientCounts,
+    /// Shared compiled contract module cache (avoids 16x duplication across pool
+    /// executors), keyed by CODE hash so instances differing only in parameters
+    /// share one compiled module (#5268).
+    shared_contract_modules: SharedModuleCache<CodeHash>,
+    shared_stores: SharedStores,
     /// Shared compiled delegate module cache, keyed by CODE hash for the same
     /// reason the contract one is (#5268).
     shared_delegate_modules: SharedModuleCache<CodeHash>,
-    /// Shared `ctx.write()` cache, one entry per delegate and hosted user (see
-    /// `DelegateContextCache`).
     shared_delegate_contexts: crate::wasm_runtime::DelegateContextCache,
     /// This node's created-delegate count, shared by every executor so
     /// `MAX_CREATED_DELEGATES_PER_NODE` is enforced per node rather than per
@@ -208,53 +278,273 @@ pub struct RuntimePool {
     shared_summary_cache: super::SharedSummaryCache,
     /// Delta twin of `shared_summary_cache`.
     shared_delta_cache: super::SharedDeltaCache,
-    /// Manifests, consent-once grants and the unprompted-run budget for this
-    /// node's delegates (`contract::delegate_capabilities`). Per node, never
-    /// a process global: simulation tests run many nodes in one process.
-    ///
-    /// `None` in hosted mode: there every client can present any app's token
-    /// from what the node sees as a local connection, and runs have no
-    /// per-user secret namespace, so neither app identity nor a node-wide
-    /// grant means anything there.
-    delegate_capabilities:
-        Option<Arc<crate::contract::delegate_capabilities::DelegateCapabilities>>,
     /// Sender for delegate notifications (cloned into each executor and replacements).
     delegate_notification_tx: super::DelegateNotificationSender,
-    /// Receiver for delegate notifications (taken once by `contract_handling()`).
-    delegate_notification_rx: Option<super::DelegateNotificationReceiver>,
-    /// Per-contract executor usage tracking (for observability).
-    /// Not used for enforcement since the event loop is sequential.
-    /// Tracked via RAII `InFlightGuard` in: `fetch_contract`, `upsert_contract_state`,
-    /// `summarize_contract_state`, `get_contract_state_delta`.
-    /// Intentionally NOT tracked in: `execute_delegate_request` and
-    /// `execute_delegate_hop` (no contract key),
-    /// `register_contract_notifier` (synchronous, no executor checkout),
-    /// `lookup_key`, `get_subscription_info`, `remove_client`
-    /// (read-only / no executor checkout).
-    in_flight_contracts: HashMap<ContractKey, usize>,
-    /// Bounds how many hosted-mode secret exports may run OFF-LOOP concurrently
-    /// (#4381 P5). Each admitted export holds one permit (in its `ExportJob`)
-    /// AND one pool executor for its duration. Sized to
-    /// [`effective_export_permits`] (`min(MAX_CONCURRENT_EXPORTS, pool_size-1)`)
-    /// so >=1 executor is ALWAYS reserved for normal contract ops — this is the
-    /// enforced anti-deadlock invariant (see `effective_export_permits`), not a
-    /// prose hope. `Arc` so an admitted `ExportJob` can hold an owned permit
-    /// across the spawned background task without borrowing the pool.
+}
+
+impl ExecutorFactory {
+    /// The delegate executor: a pool-shaped executor with its own small,
+    /// fixed Store arena budget (`DELEGATE_STORE_ARENA_BYTES`), so it does not
+    /// take a share of the contract executors' RAM-scaled arena envelope.
     ///
-    /// NOTE: this is EXPORT-only. The live secret IMPORT (#4592) deliberately
-    /// runs ON the contract loop (serialized with delegate `store_secret`), not
-    /// off-loop, so it takes no permit here — see the `import_secrets` impl and
-    /// the `ImportSecrets` arm in `contract.rs` for why (the store write path
-    /// assumes node-wide write serialization).
-    export_semaphore: Arc<Semaphore>,
-    /// Inactive-user reclaim sweep task (#4561, P5 of #4381). `Some` ONLY when
-    /// hosted mode is on AND `per-user-inactive-ttl > 0`. The pool owns the
-    /// abort guard so the sweep — which holds a clone of the shared ReDb
-    /// `Storage` — is aborted when the pool is dropped on node shutdown, matching
-    /// the #4401 teardown discipline for every other `Storage`-holding task.
-    /// `None` on a Local single-user node, so that node spawns nothing and the
-    /// reclaim machinery is entirely inert.
-    _inactive_user_sweep: Option<crate::util::AbortOnDrop>,
+    /// Its store is the only one that deletes temporary `.reg` records: it is
+    /// built at start-up before the lane exists, or as a replacement while
+    /// the delegate executor's lock is held, so no repair is in flight.
+    async fn create_delegate_executor(&self) -> anyhow::Result<Executor<Runtime>> {
+        let stores = SharedStores {
+            clean_delegate_tmp_records: true,
+            ..self.shared_stores.clone()
+        };
+        let mut executor = self.create_with(stores).await?;
+        executor
+            .runtime
+            .set_store_arena_budget_bytes(crate::wasm_runtime::DELEGATE_STORE_ARENA_BYTES as u64);
+        Ok(executor)
+    }
+
+    async fn create(&self) -> anyhow::Result<Executor<Runtime>> {
+        self.create_with(self.shared_stores.clone()).await
+    }
+
+    async fn create_with(&self, stores: SharedStores) -> anyhow::Result<Executor<Runtime>> {
+        let mut executor = Executor::from_config_with_shared_modules(
+            self.config.clone(),
+            self.shared_state_store.clone(),
+            Some(self.op_manager.clone()),
+            self.shared_contract_modules.clone(),
+            self.shared_delegate_modules.clone(),
+            self.shared_delegate_contexts.clone(),
+            self.shared_delegate_counter.clone(),
+            self.shared_inherited_origins.clone(),
+            Some(self.shared_backend_engine.clone()),
+            stores,
+        )
+        .await?;
+        executor.set_shared_notifications(
+            self.shared_notifications.clone(),
+            self.shared_summaries.clone(),
+            self.shared_client_counts.clone(),
+        );
+        executor.set_recovery_guard(self.shared_recovery_guard.clone());
+        executor.set_shared_fast_path_caches(
+            self.shared_summary_cache.clone(),
+            self.shared_delta_cache.clone(),
+        );
+        executor.set_delegate_notification_tx(self.delegate_notification_tx.clone());
+        Ok(executor)
+    }
+}
+
+/// The node's delegate executor: one `Executor<Runtime>`, outside the
+/// contract pool, behind one async lock.
+///
+/// EVERY delegate `process()` on the node runs here: the contract loop's
+/// runs (through `RuntimePool::execute_delegate_request` /
+/// `execute_delegate_hop`) and the delegate lane's
+/// (`contract::delegate_lane`). So:
+///
+/// * at most one delegate `process()` executes node-wide at any instant, now
+///   by this lock rather than by every caller being the one loop task;
+/// * every delegate secret write goes through ONE `SecretsStore`, whose
+///   in-memory index and per-user quota counter assume a single serialized
+///   writer (`secrets_store::quota`). The live secret import takes the same
+///   lock for the same reason.
+///
+/// The lock is held only around the synchronous `delegate_request` call, the
+/// live secret import (a full bundle decrypt and write), and a replacement
+/// after a WASM panic; nothing that waits on the contract loop runs under it,
+/// so the loop awaiting it cannot deadlock.
+///
+/// Separate from the pool rather than one of its slots, so a delegate run
+/// never takes an executor contract work needs, and a 1-executor node still
+/// has both.
+pub(crate) struct PooledDelegateRunner {
+    executor: tokio::sync::Mutex<Executor<Runtime>>,
+    factory: ExecutorFactory,
+    /// Times the delegate executor was replaced (unhealthy after a run, or
+    /// a call into it panicked). Reported in the pool's health status as
+    /// `delegate_replacements`, so a delegate executor that keeps breaking is
+    /// visible next to the contract executors.
+    replacements: AtomicUsize,
+    /// Set while a call into the executor is in progress; still set after
+    /// the call only if it PANICKED (the delegate lane catches the panic and
+    /// carries on). See [`SuspectFlag`].
+    suspect: SuspectFlag,
+}
+
+/// Marks an executor whose last call did not return. A panic inside
+/// `f(&mut executor)` unwinds past the post-call health check, and the tokio
+/// mutex is not poisoned, so without this the next caller would run on an
+/// executor left mid-call. [`Self::begin`] arms it; [`SuspectCall::done`]
+/// disarms it after a normal return; [`Self::recover`] clears it only once a
+/// replacement has actually succeeded.
+#[derive(Default)]
+pub(crate) struct SuspectFlag(std::sync::atomic::AtomicBool);
+
+/// One call in progress; see [`SuspectFlag`].
+pub(crate) struct SuspectCall<'a>(&'a SuspectFlag);
+
+impl SuspectFlag {
+    pub(crate) fn begin(&self) -> SuspectCall<'_> {
+        self.0.store(true, Ordering::SeqCst);
+        SuspectCall(self)
+    }
+
+    /// Whether the last call panicked (or a replacement is still owed).
+    pub(crate) fn is_set(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+
+    /// Run `replace` with the mark SET, and clear it only if `replace`
+    /// reports success. A replacement that fails, or whose future is dropped
+    /// before it finishes (the lane aborted mid-await), leaves the mark set,
+    /// so the next call tries again instead of running on the executor
+    /// unchecked.
+    pub(crate) async fn recover(&self, replace: impl std::future::Future<Output = bool>) {
+        self.0.store(true, Ordering::SeqCst);
+        if replace.await {
+            self.0.store(false, Ordering::SeqCst);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take(&self) -> bool {
+        self.0.swap(false, Ordering::SeqCst)
+    }
+}
+
+impl SuspectCall<'_> {
+    pub(crate) fn done(self) {
+        (self.0).0.store(false, Ordering::SeqCst);
+    }
+}
+
+/// The call protocol around the delegate executor, generic so it can be
+/// tested without building a real executor:
+///
+/// 1. If the previous call panicked out of `f` (the mark is set), replace the
+///    executor first. If that replacement FAILS (or the future is dropped
+///    mid-replacement), do NOT run `f` on the executor left mid-call: return
+///    `None`, with the mark still set, so the next call retries.
+/// 2. Run `f` with the mark armed; a normal return disarms it.
+/// 3. If the executor is unhealthy afterwards, replace it; a failure leaves
+///    the mark set, so the next call retries before running.
+pub(crate) async fn run_guarded<E, R, Fut>(
+    suspect: &SuspectFlag,
+    executor: &mut E,
+    replace: impl Fn(&'static str) -> Fut,
+    healthy: impl Fn(&E) -> bool,
+    f: impl FnOnce(&mut E) -> R,
+) -> Option<R>
+where
+    Fut: std::future::Future<Output = Option<E>>,
+{
+    if suspect.is_set() {
+        suspect
+            .recover(async {
+                match replace("a call into it panicked").await {
+                    Some(new) => {
+                        *executor = new;
+                        true
+                    }
+                    None => false,
+                }
+            })
+            .await;
+        if suspect.is_set() {
+            return None;
+        }
+    }
+    let call = suspect.begin();
+    let result = f(executor);
+    call.done();
+    if !healthy(executor) {
+        suspect
+            .recover(async {
+                match replace("it became unhealthy").await {
+                    Some(new) => {
+                        *executor = new;
+                        true
+                    }
+                    None => false,
+                }
+            })
+            .await;
+    }
+    Some(result)
+}
+
+impl PooledDelegateRunner {
+    /// Run `f` on the delegate executor under its lock (see [`run_guarded`]).
+    /// `Err` only when the executor must be replaced and could not be: the
+    /// caller is refused rather than run on a broken executor.
+    async fn with_executor<R>(
+        &self,
+        operation: &'static str,
+        f: impl FnOnce(&mut Executor<Runtime>) -> R,
+    ) -> Result<R, ExecutorError> {
+        let mut executor = self.executor.lock().await;
+        run_guarded(
+            &self.suspect,
+            &mut *executor,
+            |why| self.replacement(operation, why),
+            |executor| executor.runtime.is_healthy(),
+            f,
+        )
+        .await
+        .ok_or_else(|| {
+            ExecutorError::other(anyhow::anyhow!(
+                "the delegate executor needs replacing after a failed call and \
+                 the replacement could not be built; retry"
+            ))
+        })
+    }
+
+    /// A fresh delegate executor, or `None` if one could not be built.
+    /// Counted only on success.
+    async fn replacement(&self, operation: &str, why: &str) -> Option<Executor<Runtime>> {
+        tracing::warn!(operation, why, "Replacing the delegate executor");
+        match self.factory.create_delegate_executor().await {
+            Ok(replacement) => {
+                let replacement_number = self.replacements.fetch_add(1, Ordering::SeqCst) + 1;
+                tracing::warn!(replacement_number, "Replaced the delegate executor");
+                Some(replacement)
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "Failed to replace the delegate executor; it stays marked for \
+                     replacement, and calls are refused until a replacement succeeds"
+                );
+                None
+            }
+        }
+    }
+}
+
+impl crate::contract::delegate_lane::DelegateRunner for PooledDelegateRunner {
+    fn run<'a>(
+        &'a self,
+        req: DelegateRequest<'a>,
+        origin_contract: Option<&'a ContractInstanceId>,
+        caller_delegate: Option<&'a DelegateKey>,
+        connection_scope: crate::client_events::ConnectionScope,
+        user_context: Option<&'a UserSecretContext>,
+    ) -> futures::future::BoxFuture<'a, Response> {
+        Box::pin(async move {
+            self.with_executor("delegate_request", move |executor| {
+                executor.delegate_request(
+                    req,
+                    origin_contract,
+                    caller_delegate,
+                    connection_scope,
+                    user_context,
+                )
+            })
+            .await
+            .and_then(|response| response)
+        })
+    }
 }
 
 /// Max hosted-mode secret exports allowed to run off-loop at once (#4381 P5),
@@ -666,7 +956,34 @@ impl RuntimePool {
             Some(caps)
         };
 
+        let factory = ExecutorFactory {
+            config: config.clone(),
+            op_manager: op_manager.clone(),
+            shared_state_store: shared_state_store.clone(),
+            shared_notifications: shared_notifications.clone(),
+            shared_summaries: shared_summaries.clone(),
+            shared_client_counts: shared_client_counts.clone(),
+            shared_contract_modules: shared_contract_modules.clone(),
+            shared_stores: shared_stores.clone(),
+            shared_delegate_modules: shared_delegate_modules.clone(),
+            shared_delegate_contexts: shared_delegate_contexts.clone(),
+            shared_delegate_counter: shared_delegate_counter.clone(),
+            shared_inherited_origins: shared_inherited_origins.clone(),
+            shared_backend_engine: shared_backend_engine.clone(),
+            shared_recovery_guard: shared_recovery_guard.clone(),
+            shared_summary_cache: shared_summary_cache.clone(),
+            shared_delta_cache: shared_delta_cache.clone(),
+            delegate_notification_tx: delegate_notification_tx.clone(),
+        };
+        let delegate_runner = Arc::new(PooledDelegateRunner {
+            executor: tokio::sync::Mutex::new(factory.create_delegate_executor().await?),
+            factory,
+            replacements: AtomicUsize::new(0),
+            suspect: SuspectFlag::default(),
+        });
+
         Ok(Self {
+            delegate_runner,
             delegate_capabilities,
             runtimes,
             available: Semaphore::new(pool_size_usize),
@@ -679,17 +996,8 @@ impl RuntimePool {
             shared_notifications,
             shared_summaries,
             shared_client_counts,
-            shared_contract_modules,
             shared_stores,
-            shared_delegate_modules,
             shared_delegate_contexts,
-            shared_delegate_counter,
-            shared_inherited_origins,
-            shared_backend_engine,
-            shared_recovery_guard,
-            shared_summary_cache,
-            shared_delta_cache,
-            delegate_notification_tx,
             delegate_notification_rx: Some(delegate_notification_rx),
             in_flight_contracts: HashMap::new(),
             export_semaphore: Arc::new(Semaphore::new(effective_export_permits(pool_size_usize))),
@@ -707,6 +1015,7 @@ impl RuntimePool {
     pub fn health_status(&self) -> PoolHealthStatus {
         let available = self.runtimes.iter().filter(|s| s.is_some()).count();
         let checked_out = self.checked_out.load(Ordering::SeqCst);
+        let delegate_replacements = self.delegate_runner.replacements.load(Ordering::SeqCst);
         let replacements = self.replacements_count.load(Ordering::SeqCst);
 
         // Check for pool degradation
@@ -726,6 +1035,7 @@ impl RuntimePool {
             checked_out,
             total: self.pool_size,
             replacements,
+            delegate_replacements,
             contracts_in_flight: self.in_flight_contracts.len(),
         }
     }
@@ -734,14 +1044,16 @@ impl RuntimePool {
     /// Called periodically when there have been replacements to help diagnose issues.
     fn log_health_if_degraded(&self) {
         let status = self.health_status();
-        if status.replacements > 0 {
+        if status.replacements > 0 || status.delegate_replacements > 0 {
             tracing::info!(
                 available = status.available,
                 checked_out = status.checked_out,
                 total = status.total,
                 replacements = status.replacements,
-                "RuntimePool health status (degraded - {} replacements)",
-                status.replacements
+                delegate_replacements = status.delegate_replacements,
+                "RuntimePool health status (degraded - {} contract and {} delegate replacements)",
+                status.replacements,
+                status.delegate_replacements
             );
         }
     }
@@ -862,34 +1174,7 @@ impl RuntimePool {
     /// Uses the shared StateStore to avoid opening a new database connection.
     async fn create_replacement_executor(&self) -> anyhow::Result<Executor<Runtime>> {
         tracing::warn!("Creating replacement executor due to previous failure");
-        let mut executor = Executor::from_config_with_shared_modules(
-            self.config.clone(),
-            self.shared_state_store.clone(),
-            Some(self.op_manager.clone()),
-            self.shared_contract_modules.clone(),
-            self.shared_delegate_modules.clone(),
-            self.shared_delegate_contexts.clone(),
-            self.shared_delegate_counter.clone(),
-            self.shared_inherited_origins.clone(),
-            Some(self.shared_backend_engine.clone()),
-            self.shared_stores.clone(),
-        )
-        .await?;
-
-        // Set shared notification storage so the replacement executor uses pool-level storage
-        executor.set_shared_notifications(
-            self.shared_notifications.clone(),
-            self.shared_summaries.clone(),
-            self.shared_client_counts.clone(),
-        );
-        executor.set_recovery_guard(self.shared_recovery_guard.clone());
-        executor.set_shared_fast_path_caches(
-            self.shared_summary_cache.clone(),
-            self.shared_delta_cache.clone(),
-        );
-        executor.set_delegate_notification_tx(self.delegate_notification_tx.clone());
-
-        Ok(executor)
+        self.delegate_runner.factory.create().await
     }
 
     /// Return an executor to the pool, replacing it if unhealthy.
@@ -1400,17 +1685,17 @@ impl ContractExecutor for RuntimePool {
         connection_scope: crate::client_events::ConnectionScope,
         user_context: Option<&UserSecretContext>,
     ) -> Response {
-        let mut executor = self.pop_executor().await;
-        let result = executor.delegate_request(
-            req,
-            origin_contract,
-            caller_delegate,
-            connection_scope,
-            user_context,
-        );
-        self.return_checked(executor, "execute_delegate_request")
-            .await;
-        result
+        // The delegate executor, never a pooled one: see `PooledDelegateRunner`.
+        use crate::contract::delegate_lane::DelegateRunner;
+        self.delegate_runner
+            .run(
+                req,
+                origin_contract,
+                caller_delegate,
+                connection_scope,
+                user_context,
+            )
+            .await
     }
 
     async fn execute_delegate_hop(
@@ -1420,18 +1705,22 @@ impl ContractExecutor for RuntimePool {
         connection_scope: crate::client_events::ConnectionScope,
         user_context: Option<&UserSecretContext>,
     ) -> Response {
-        let mut executor = self.pop_executor().await;
+        use crate::contract::delegate_lane::DelegateRunner;
         // The hop's target runs under the originating user: that user's
         // secrets and context (`None` on a node that is not hosted).
-        let result = executor.delegate_request(
-            req,
-            None,
-            Some(caller_delegate),
-            connection_scope,
-            user_context,
-        );
-        self.return_checked(executor, "execute_delegate_hop").await;
-        result
+        self.delegate_runner
+            .run(
+                req,
+                None,
+                Some(caller_delegate),
+                connection_scope,
+                user_context,
+            )
+            .await
+    }
+
+    fn delegate_runner(&self) -> Option<Arc<dyn crate::contract::delegate_lane::DelegateRunner>> {
+        Some(self.delegate_runner.clone())
     }
 
     fn hosted_mode(&self) -> bool {
@@ -1537,19 +1826,16 @@ impl ContractExecutor for RuntimePool {
         result
     }
 
-    /// Run a live secret import ON the contract loop (#4592). DELIBERATELY
-    /// on-loop, NOT off-loop like the export: the import WRITES to the
+    /// Run a live secret import (#4592), awaited ON the contract loop, on the
+    /// DELEGATE executor under its lock. The import WRITES to the
     /// `SecretsStore`, whose write path (fixed sibling `.tmp` + check-then-write)
-    /// assumes node-wide write serialization. Checking out a pooled executor and
-    /// running the import here — awaited by the single-threaded contract loop —
-    /// keeps every secret write in one serialization domain (with delegate
-    /// `store_secret`), so an import can never race another writer on the same
-    /// secret file (Codex P1). The heavy work is acceptable on the loop because
-    /// the endpoint is loopback + dashboard-gated (operator's one-shot migration),
-    /// not the authenticated-remote DoS surface that justified off-loop export.
-    ///
-    /// `pop_executor().await` always succeeds promptly: an in-flight export holds
-    /// at most `pool_size-1` executors, so >=1 is always free for the loop.
+    /// assumes node-wide write serialization. Every delegate `set_secret` runs on
+    /// the same executor under the same lock (`PooledDelegateRunner`), so an
+    /// import can never race another writer on the same secret file (Codex P1),
+    /// including one from a delegate run on the delegate lane. The heavy work is
+    /// acceptable on the loop because the endpoint is loopback +
+    /// dashboard-gated (operator's one-shot migration), not the
+    /// authenticated-remote DoS surface that justified off-loop export.
     async fn import_secrets(
         &mut self,
         target_scope: crate::contract::handler::ImportTargetScope,
@@ -1560,7 +1846,6 @@ impl ContractExecutor for RuntimePool {
     ) -> Result<crate::wasm_runtime::secret_export::ImportReport, ExecutorError> {
         use crate::contract::handler::{BundleKeyKind, ImportTargetScope};
         use crate::wasm_runtime::secret_export::{BundleKeyMaterial, TargetScope};
-        let mut executor = self.pop_executor().await;
         let scope = match target_scope {
             ImportTargetScope::Local => TargetScope::Local,
         };
@@ -1568,13 +1853,16 @@ impl ContractExecutor for RuntimePool {
             BundleKeyKind::Token => BundleKeyMaterial::Token(key),
             BundleKeyKind::Passphrase => BundleKeyMaterial::Passphrase(key),
         };
-        // Synchronous decrypt + per-secret write. No `.await` between checkout and
-        // return, so the executor is held for exactly this op.
-        let result = executor.import_secrets(&scope, bundle, &material, overwrite);
-        // The import runs no WASM, so the executor stays healthy; route it back
-        // through the health-checked return for accounting parity with every op.
-        self.return_checked(executor, "import_secrets").await;
-        result
+        // On the DELEGATE executor, under its lock: delegate `set_secret`
+        // writes go through that executor's `SecretsStore`, so this keeps
+        // every secret write in one serialization domain now that delegates
+        // run off the loop too (see `PooledDelegateRunner`).
+        self.delegate_runner
+            .with_executor("import_secrets", |executor| {
+                executor.import_secrets(&scope, bundle, &material, overwrite)
+            })
+            .await
+            .and_then(|result| result)
     }
 
     fn get_subscription_info(&self) -> Vec<crate::message::SubscriptionInfo> {
@@ -1679,6 +1967,97 @@ mod tests {
     };
     use std::num::NonZeroUsize;
     use std::sync::Arc;
+
+    /// Through the call protocol: after a call PANICKED, a failed replacement
+    /// refuses the next call (it does not run on the executor left mid-call)
+    /// and keeps the mark, so the call after that retries; a successful
+    /// replacement runs the call on the NEW executor and clears the mark.
+    ///
+    /// FALSIFY: in `run_guarded`, drop the `if suspect.is_set() { return
+    /// None; }` after the pre-call recover; the refused call runs on the
+    /// panicked executor (and its `done()` clears the mark).
+    #[tokio::test]
+    async fn a_failed_replacement_refuses_the_call_and_retries_next_time() {
+        #[derive(Debug, PartialEq)]
+        struct Fake(u32);
+        let flag = SuspectFlag::default();
+        let mut executor = Fake(1);
+        // A call panicked: armed, never disarmed.
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _call = flag.begin();
+            panic!("host bug");
+        }));
+        assert!(panicked.is_err());
+        let mut ran = 0;
+        let out = run_guarded(
+            &flag,
+            &mut executor,
+            |_| async { None::<Fake> },
+            |_| true,
+            |_| {
+                ran += 1;
+            },
+        )
+        .await;
+        assert!(out.is_none(), "the call is refused");
+        assert_eq!(ran, 0, "nothing ran on the executor left mid-call");
+        assert!(flag.is_set(), "still marked, so the next call retries");
+        assert_eq!(executor, Fake(1));
+
+        let out = run_guarded(
+            &flag,
+            &mut executor,
+            |_| async { Some(Fake(2)) },
+            |_| true,
+            |e: &mut Fake| e.0,
+        )
+        .await;
+        assert_eq!(out, Some(2), "the call ran on the replacement");
+        assert!(!flag.is_set());
+    }
+
+    /// The mark is cleared only by a SUCCESSFUL replacement: a failed one, or
+    /// one whose future is dropped mid-await, leaves it set for a retry.
+    ///
+    /// FALSIFY: clear the mark before awaiting `replace` in
+    /// `SuspectFlag::recover` (or clear it unconditionally after).
+    #[tokio::test]
+    async fn a_failed_or_cancelled_replacement_keeps_the_executor_suspect() {
+        let flag = SuspectFlag::default();
+        flag.recover(async { false }).await;
+        assert!(flag.is_set(), "a failed replacement leaves the mark set");
+        flag.recover(async { true }).await;
+        assert!(!flag.is_set(), "a successful replacement clears it");
+        let pending = flag.recover(std::future::pending::<bool>());
+        assert!(
+            futures::FutureExt::now_or_never(pending).is_none(),
+            "the replacement is still in progress"
+        );
+        assert!(flag.is_set(), "a cancelled replacement leaves the mark set");
+    }
+
+    /// A call that PANICS out of `with_executor`'s closure leaves the
+    /// delegate executor marked suspect, so the next call replaces it before
+    /// running; a call that returns does not.
+    ///
+    /// FALSIFY: give `SuspectCall` a `Drop` that clears the flag (a panic then
+    /// clears it too), or have `begin` not set it.
+    #[test]
+    fn a_call_that_panics_leaves_the_executor_suspect() {
+        let flag = SuspectFlag::default();
+        flag.begin().done();
+        assert!(!flag.take(), "a call that returned is not suspect");
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _call = flag.begin();
+            panic!("delegate call panicked");
+        }));
+        assert!(panicked.is_err());
+        assert!(
+            flag.take(),
+            "a call that panicked leaves the executor suspect"
+        );
+        assert!(!flag.take(), "taking the mark clears it");
+    }
 
     /// The contract module cache is keyed by code hash, so its interest
     /// predicate must answer "is ANY in-use instance running this code?" — a
@@ -2137,20 +2516,39 @@ mod tests {
         .await
         .expect("build RuntimePool");
 
+        // The production pool ENABLES the delegate lane: `contract_handling`
+        // starts a lane only for an executor whose `delegate_runner()` is
+        // `Some`, and every test with the mock runtime opts in by hand, so a
+        // pool returning `None` would turn the whole lane off with every other
+        // test still green. It must also be the pool's own runner, the one its
+        // `execute_delegate_request` uses, so the loop and the lane share one
+        // lock.
+        {
+            use crate::contract::executor::ContractExecutor;
+            let runner = pool
+                .delegate_runner()
+                .expect("the production RuntimePool must provide a delegate runner");
+            assert_eq!(
+                Arc::as_ptr(&runner) as *const (),
+                Arc::as_ptr(&pool.delegate_runner) as *const (),
+                "the lane must run on the pool's own delegate runner"
+            );
+        }
         for slot in &pool.runtimes {
             let executor = slot.as_ref().expect("executor present");
             assert!(Arc::ptr_eq(
                 executor.summary_cache_handle(),
-                &pool.shared_summary_cache
+                &pool.delegate_runner.factory.shared_summary_cache
             ));
             assert!(Arc::ptr_eq(
                 executor.delta_cache_handle(),
-                &pool.shared_delta_cache
+                &pool.delegate_runner.factory.shared_delta_cache
             ));
             assert!(
                 executor
                     .delegate_notification_tx_handle()
-                    .is_some_and(|tx| tx.same_channel(&pool.delegate_notification_tx)),
+                    .is_some_and(|tx| tx
+                        .same_channel(&pool.delegate_runner.factory.delegate_notification_tx)),
                 "pool executor lacks the pool's delegate notification sender"
             );
         }
@@ -2160,24 +2558,26 @@ mod tests {
             .expect("replacement executor");
         assert!(Arc::ptr_eq(
             replacement.summary_cache_handle(),
-            &pool.shared_summary_cache
+            &pool.delegate_runner.factory.shared_summary_cache
         ));
         assert!(Arc::ptr_eq(
             replacement.delta_cache_handle(),
-            &pool.shared_delta_cache
+            &pool.delegate_runner.factory.shared_delta_cache
         ));
         assert!(
-            replacement
-                .delegate_notification_tx_handle()
-                .is_some_and(|tx| tx.same_channel(&pool.delegate_notification_tx)),
+            replacement.delegate_notification_tx_handle().is_some_and(
+                |tx| tx.same_channel(&pool.delegate_runner.factory.delegate_notification_tx)
+            ),
             "replacement executor lacks the pool's delegate notification sender"
         );
         drop(replacement);
 
         let summary_budget =
-            super::super::lock_fast_path_cache(&pool.shared_summary_cache).byte_budget();
+            super::super::lock_fast_path_cache(&pool.delegate_runner.factory.shared_summary_cache)
+                .byte_budget();
         let delta_budget =
-            super::super::lock_fast_path_cache(&pool.shared_delta_cache).byte_budget();
+            super::super::lock_fast_path_cache(&pool.delegate_runner.factory.shared_delta_cache)
+                .byte_budget();
         assert_eq!(
             summary_budget,
             super::super::pool_summary_cache_budget_bytes(POOL)
@@ -2193,11 +2593,13 @@ mod tests {
         assert_eq!(summary_budget, POOL * per_exec_summary);
         assert_eq!(delta_budget, POOL * per_exec_delta);
         assert_eq!(
-            super::super::lock_fast_path_cache(&pool.shared_summary_cache).max_entry_bytes(),
+            super::super::lock_fast_path_cache(&pool.delegate_runner.factory.shared_summary_cache)
+                .max_entry_bytes(),
             per_exec_summary
         );
         assert_eq!(
-            super::super::lock_fast_path_cache(&pool.shared_delta_cache).max_entry_bytes(),
+            super::super::lock_fast_path_cache(&pool.delegate_runner.factory.shared_delta_cache)
+                .max_entry_bytes(),
             per_exec_delta
         );
         let snap = op_manager

@@ -1580,6 +1580,10 @@ fn fallbacks_and_churned_fallbacks_reach_their_own_counters() {
                 FallbackCause::SessionEndedReceived,
                 QuicFallback::SessionEndedReceived,
             ),
+            (
+                FallbackCause::OverBudgetReceived,
+                QuicFallback::OverBudgetReceived,
+            ),
         ];
         assert_eq!(causes.len(), QuicFallback::COUNT);
         let mut state = session.state.lock();

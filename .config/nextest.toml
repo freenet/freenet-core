@@ -157,3 +157,24 @@ fail-fast = false
 # (test_get_reliability_with_latency: 100 nodes + fault injection).
 # Allow 15 min per period with 2 periods = 30 min hard cap.
 slow-timeout = { period = "900s", terminate-after = 2 }
+
+# Retransmit-cap rows (transport::link_model::storm_tests): real PeerConnection
+# loops on virtual time, each row run twice (retransmits capped and as on
+# main) on the same seed. The receipt-loss row runs 12 connection runs and
+# reads flight until it drains after the idle point (at least 180 s of
+# virtual time each); measured 420 s wall-clock under a load of ~35 on 16
+# cores. The storm rows (16 connections, 60 s, 3 seeds, 2 caps) measured
+# 136 s, the outage row 80 s. They are seeded and on virtual time, so
+# deterministic: a retry cannot pass what failed, and would only triple the
+# runner time of a hang.
+[[profile.ci.overrides]]
+filter = "test(receipt_loss_under_a_cap_matches_or_beats_main) | test(storm_under_a_cap_matches_or_beats_main) | test(an_outage_under_a_cap_matches_or_beats_main)"
+slow-timeout = { period = "600s", terminate-after = 2 }
+retries = 0
+
+# The Windows QUIC crash-loop breaker tests (#6031) drive the real binary
+# through several starts each; a failure is deterministic (an injected panic
+# is counted or it is not), so a retry only repeats the minutes.
+[[profile.ci.overrides]]
+filter = "binary(quic_breaker_windows)"
+retries = 0

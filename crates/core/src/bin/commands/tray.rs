@@ -303,7 +303,9 @@ mod tests {
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 mod platform {
     use super::*;
-    use muda::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
+    #[cfg(target_os = "macos")]
+    use muda::CheckMenuItem;
+    use muda::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
     use std::sync::mpsc as std_mpsc;
     use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 

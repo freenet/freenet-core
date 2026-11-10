@@ -313,7 +313,8 @@ async fn run_disabled_idle(config_dir: &std::path::Path) -> anyhow::Result<()> {
     }
     #[cfg(not(unix))]
     {
-        let _ = signal::ctrl_c().await;
+        // An error here (no Ctrl+C handler) also ends the wait, as before.
+        drop(signal::ctrl_c().await);
     }
 
     tracing::info!("Disabled daemon received shutdown signal; exiting cleanly.");
@@ -435,7 +436,8 @@ async fn run_network_node_with_signals(
 
             #[cfg(not(unix))]
             let shutdown_reason = {
-                let _ = signal::ctrl_c().await;
+                // An error here (no Ctrl+C handler) also ends the wait, as before.
+                drop(signal::ctrl_c().await);
                 "received SIGINT (Ctrl+C)"
             };
 
@@ -580,10 +582,16 @@ async fn run_network_node_with_signals(
         // #5799: a release that could not be fetched recently is cooling down.
         // GitHub would only report it again, so the check is skipped, before
         // any request and before the claim.
+        //
+        // #6152: the decision is made here without spending anything
+        // (`peek_update_attempt`), and the retry is claimed only after the
+        // jitter, right before GitHub is asked (`claim_after_jitter`). This
+        // task runs beside the node, so a node that dies during the jitter
+        // used to spend its daily retry without a check.
         let cooling = commands::rollback::update_cooldown_pending(build_info::VERSION);
         let startup_attempt = match &cooling {
             Some(_) => None,
-            None => Some(commands::auto_update::claim_update_attempt()),
+            None => Some(commands::auto_update::peek_update_attempt()),
         };
         if let Some((version, left)) = &cooling {
             tracing::warn!(
@@ -599,22 +607,38 @@ async fn run_network_node_with_signals(
                 "Startup update check skipped: {reason}. Run `freenet update` to update now."
             );
         }
-        let startup_attempt = startup_attempt.and_then(Result::ok);
-        let startup_check_ran = startup_attempt.is_some();
         let startup_jitter_secs = freenet::config::GlobalRng::random_u64() % 60;
-        if startup_check_ran && startup_jitter_secs > 0 {
-            tokio::time::sleep(std::time::Duration::from_secs(startup_jitter_secs)).await;
-        }
-        let latest = match startup_attempt {
-            Some(attempt) => {
-                tracing::info!(
-                    current = build_info::VERSION,
-                    jitter_secs = startup_jitter_secs,
-                    "Startup update check against GitHub"
-                );
-                startup_update_check(attempt, build_info::VERSION).await
+        // `startup_check_ran` is true only if the claim, made after the
+        // jitter, allowed the check.
+        let (startup_check_ran, latest) = match startup_attempt {
+            Some(Ok(())) => {
+                let jitter =
+                    tokio::time::sleep(std::time::Duration::from_secs(startup_jitter_secs));
+                let checked = commands::auto_update::claim_after_jitter(
+                    jitter,
+                    claim_update_attempt,
+                    |attempt| {
+                        tracing::info!(
+                            current = build_info::VERSION,
+                            jitter_secs = startup_jitter_secs,
+                            "Startup update check against GitHub"
+                        );
+                        startup_update_check(attempt, build_info::VERSION)
+                    },
+                )
+                .await;
+                match checked {
+                    Ok(latest) => (true, latest),
+                    Err(reason) => {
+                        tracing::warn!(
+                            reason = %reason,
+                            "Startup update check skipped: {reason}. Run `freenet update` to update now."
+                        );
+                        (false, None)
+                    }
+                }
             }
-            None => None,
+            Some(Err(_)) | None => (false, None),
         };
         if let Some(new_version) = latest {
             // #4073: don't auto-update to a version that is locally BLOCKED — a
@@ -3326,6 +3350,31 @@ mod tests {
         );
     }
 
+    /// #6152: the startup check decides without spending (`peek`), and claims
+    /// a locked-out node's retry only after the jitter, inside
+    /// `claim_after_jitter`, so a node that dies during the jitter spends
+    /// nothing. `claim_after_jitter` itself is tested in auto_update.rs.
+    #[test]
+    fn the_startup_check_claims_after_its_jitter() {
+        let flat = squeeze(production_region(&strip_line_comments(include_str!(
+            "freenet.rs"
+        ))));
+        let peek = flat
+            .find("Some(commands::auto_update::peek_update_attempt())")
+            .expect("the startup check peeks first");
+        let jitter = flat
+            .find("letjitter=tokio::time::sleep(std::time::Duration::from_secs(startup_jitter_secs));")
+            .expect("the jitter");
+        let claim = flat
+            .find("commands::auto_update::claim_after_jitter(jitter,claim_update_attempt,")
+            .expect("claimed after the jitter");
+        assert!(peek < jitter && jitter < claim);
+        assert!(
+            !flat[peek..claim].contains("claim_update_attempt()"),
+            "nothing claims between the peek and the jitter"
+        );
+    }
+
     /// #5799: while a newer release cools down, no trigger asks GitHub or
     /// claims a lockout retry, and every CoolingDown arm keeps its signal and
     /// does not send. Every gate re-reads the record, so a stay early in a tick
@@ -3340,8 +3389,8 @@ mod tests {
             (
                 "letcooling=commands::rollback::update_cooldown_pending(build_info::VERSION);\
                  letstartup_attempt=match&cooling{Some(_)=>None,\
-                 None=>Some(commands::auto_update::claim_update_attempt()),};",
-                "the startup check, before its claim",
+                 None=>Some(commands::auto_update::peek_update_attempt()),};",
+                "the startup check, before its claim (made after the jitter, #6152)",
             ),
             (
                 "letcooling=||commands::rollback::update_cooldown_pending(build_info::VERSION).is_some();",

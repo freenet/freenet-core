@@ -1868,7 +1868,7 @@ mod tests {
             "the connection entry must hold the stamp"
         );
         assert!(
-            squashed.contains("conn_id,outbound_mix,link_use)"),
+            squashed.contains("conn_id,outbound_mix,propagation,link_use)"),
             "the listener must be given the same stamp"
         );
         assert!(
@@ -2530,6 +2530,7 @@ mod tests {
             events_tx,
             7,
             Arc::new(crate::node::network_bridge::outbound_message_mix::OutboundMix::new()),
+            crate::operations::update::propagation_stats::PropagationSink::for_test().0,
             link_use,
         ));
 

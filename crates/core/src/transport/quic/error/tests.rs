@@ -616,6 +616,7 @@ fn close_codes_have_fixed_distinct_wire_values() {
         (QuicCloseCode::PeerNotAcknowledging, 4),
         (QuicCloseCode::ControlRefused, 5),
         (QuicCloseCode::SessionEnded, 6),
+        (QuicCloseCode::OverBudget, 8),
     ];
     assert_eq!(expected.len(), QuicCloseCode::COUNT);
     for (code, wire) in expected {
@@ -623,9 +624,33 @@ fn close_codes_have_fixed_distinct_wire_values() {
         assert_eq!(QuicCloseCode::from_code(u64::from(wire)), Some(code));
         assert!(!code.reason().is_empty());
     }
-    for unknown in [7_u64, 0x0f, 0x11, 0x21, u64::from(u32::MAX)] {
+    // 7 is left to the ramp branch's RECYCLE_FOR_DATA.
+    for unknown in [7_u64, 9, 0x0f, 0x11, 0x21, u64::from(u32::MAX)] {
         assert_eq!(QuicCloseCode::from_code(unknown), None, "{unknown:#x}");
     }
+}
+
+/// OVER_BUDGET reads as its own refusal, a downgrade-class kind the endpoint
+/// attributes like the others. A release before the code reads it as a lost
+/// connection, which also falls back.
+#[test]
+fn an_over_budget_close_reads_as_its_own_refusal() {
+    use super::super::liveness::QuicAvailability;
+    let over_budget = QuicErrorKind::Refused {
+        reason: QuicRefusal::OverBudget,
+    };
+    let closed = QuicErrorKind::from(quinn::ConnectionError::ApplicationClosed(
+        quinn::ApplicationClose {
+            error_code: quinn::VarInt::from_u32(super::close_code::OVER_BUDGET),
+            reason: Default::default(),
+        },
+    ));
+    assert_eq!(closed, over_budget);
+    assert_eq!(
+        attribute(QuicAvailability::Down, over_budget),
+        QuicErrorKind::EndpointDown
+    );
+    assert_eq!(attribute(QuicAvailability::Up, over_budget), over_budget);
 }
 
 /// SESSION_ENDED reads as its own refusal, a downgrade-class kind that the

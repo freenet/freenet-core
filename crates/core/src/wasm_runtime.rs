@@ -45,13 +45,18 @@ pub use delegate_store::{
 /// adopted together: an executor that shares the index but not the byte cache
 /// (the pre-#5268 shape) silently keeps `pool_size` copies of the same WASM,
 /// and an executor that shares neither cannot see a delegate a sibling
-/// registered. Cloning this is cheap — every field is a handle.
+/// registered. Cloning this is cheap: every field but the flag is a handle.
 #[derive(Clone)]
 pub struct SharedStores {
     pub contract_index: SharedContractIndex,
     pub contract_code: SharedCodeCache,
     pub delegate_index: SharedDelegateIndex,
     pub delegate_code: SharedDelegateCodeCache,
+    /// Whether the `DelegateStore` built from these deletes temporary `.reg`
+    /// records. `false` here; set only for the delegate executor's store
+    /// (`ExecutorFactory::create_delegate_executor`). See
+    /// `DelegateStore::new_with_shared`.
+    pub clean_delegate_tmp_records: bool,
 }
 
 impl SharedStores {
@@ -62,10 +67,11 @@ impl SharedStores {
             contract_code: contract_store::new_code_cache(max_size),
             delegate_index: SharedDelegateIndex::default(),
             delegate_code: delegate_store::new_code_cache(max_size),
+            clean_delegate_tmp_records: false,
         }
     }
 }
-pub(crate) use engine::BackendEngine;
+pub(crate) use engine::{BackendEngine, DELEGATE_STORE_ARENA_BYTES};
 pub(crate) use error::{
     ContractError, DELEGATE_HOSTED_RUN_WITHOUT_USER, DELEGATE_PARAMS_MISMATCH,
     DELEGATE_UNREGISTER_HOSTED, DELEGATE_UNREGISTER_NOT_LOCAL, RuntimeInnerError, RuntimeResult,

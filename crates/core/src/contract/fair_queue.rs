@@ -1300,6 +1300,7 @@ mod tests {
                     origin_contract: None,
                     connection_scope: crate::client_events::ConnectionScope::Local,
                     user_context: None,
+                    lane_ticket: Default::default(),
                 },
             ),
             (

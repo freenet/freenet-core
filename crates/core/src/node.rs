@@ -97,7 +97,7 @@ mod network_bridge;
 /// Where an applied contract update came from (#5062). Re-exported because
 /// `operations::update` has to name it to declare its provenance, and
 /// `network_bridge` is private outside this module.
-pub(crate) use network_bridge::broadcast_payload_mix::ApplyOrigin;
+pub(crate) use network_bridge::broadcast_payload_mix::{ApplyOrigin, PayloadMix};
 
 // Re-export fault injection types for test infrastructure.
 // No cfg gate: underlying items are unconditionally compiled and integration

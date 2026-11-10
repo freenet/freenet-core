@@ -939,6 +939,16 @@ pub(crate) async fn update_contract(
             // causes the executor to emit a fan-out, modulo the residuals
             // enumerated there.
             op_manager.payload_mix.record_apply(origin, state_changed);
+            if state_changed && origin == crate::node::ApplyOrigin::ClientLocal {
+                // #6143: a client update that changed state emitted a
+                // fan-out. Read against `sent_*` in the summary, it shows
+                // whether this node's own updates are leaving it.
+                propagation_stats::record_propagation_event(
+                    op_manager,
+                    key.id(),
+                    propagation_stats::PropagationEvent::ClientOriginated,
+                );
+            }
             if state_changed {
                 // A `BroadcastStateChange` was emitted for this write, so hand
                 // the coverage to it. Otherwise the guard's drop clears it —
@@ -2704,6 +2714,37 @@ mod tests {
         StateSummary<'static>,
         Box<dyn std::any::Any>,
     ) {
+        let reply = if update_changes_state {
+            StandInUpdateReply::Changed
+        } else {
+            StandInUpdateReply::NoChange
+        };
+        build_summary_test_node_with(id, summary_ok, reply).await
+    }
+
+    /// How `build_summary_test_node_with`'s stand-in answers an `UpdateQuery`.
+    #[derive(Clone, Copy)]
+    enum StandInUpdateReply {
+        /// `UpdateResponse { state_changed: true }`.
+        Changed,
+        /// `UpdateNoChange`.
+        NoChange,
+        /// `UpdateResponse { new_value: Ok, state_changed: false }`: the
+        /// executor's `CurrentWon` reply, where the merge kept our state.
+        CurrentWon,
+    }
+
+    /// [`build_summary_test_node`] with the stand-in's update reply chosen.
+    async fn build_summary_test_node_with(
+        id: &str,
+        summary_ok: bool,
+        update_reply: StandInUpdateReply,
+    ) -> (
+        std::sync::Arc<OpManager>,
+        WrappedState,
+        StateSummary<'static>,
+        Box<dyn std::any::Any>,
+    ) {
         let config_args = crate::config::ConfigArgs {
             id: Some(id.to_string()),
             mode: Some(crate::contract::OperationMode::Local),
@@ -2758,19 +2799,22 @@ mod tests {
                             },
                         }
                     }
-                    ContractHandlerEvent::UpdateQuery { key, .. } => {
-                        if update_changes_state {
-                            ContractHandlerEvent::UpdateResponse {
-                                new_value: Ok(handler_state.clone()),
-                                state_changed: true,
-                            }
-                        } else {
-                            // The merged-to-no-change reply. `update_contract`
-                            // answers this by re-fetching state via GetQuery,
-                            // which this stand-in already serves.
+                    ContractHandlerEvent::UpdateQuery { key, .. } => match update_reply {
+                        StandInUpdateReply::Changed => ContractHandlerEvent::UpdateResponse {
+                            new_value: Ok(handler_state.clone()),
+                            state_changed: true,
+                        },
+                        // The merged-to-no-change reply. `update_contract`
+                        // answers this by re-fetching state via GetQuery,
+                        // which this stand-in already serves.
+                        StandInUpdateReply::NoChange => {
                             ContractHandlerEvent::UpdateNoChange { key }
                         }
-                    }
+                        StandInUpdateReply::CurrentWon => ContractHandlerEvent::UpdateResponse {
+                            new_value: Ok(handler_state.clone()),
+                            state_changed: false,
+                        },
+                    },
                     other => panic!("unexpected handler event: {other:?}"),
                 };
                 if ch_channel.send_to_sender(id, response).await.is_err() {
@@ -2894,6 +2938,18 @@ mod tests {
             .expect("update must succeed");
             let after = op_manager.payload_mix.applies_snapshot();
 
+            // #6143: only a CLIENT apply that changed state counts as
+            // `client_originated`.
+            let originated = op_manager
+                .update_propagation_stats
+                .events_for_test(key.id())
+                .get(propagation_stats::PropagationEvent::ClientOriginated);
+            assert_eq!(
+                originated, 1,
+                "{origin:?}: the client apply counts once and the relay apply \
+                 after it adds nothing"
+            );
+
             assert_eq!(
                 after[arm][CHANGED],
                 before[arm][CHANGED] + 1,
@@ -2939,6 +2995,43 @@ mod tests {
             after[RELAY][CHANGED], before[RELAY][CHANGED],
             "a no-op merge emits no broadcast, so it must NOT be counted as \
              changed — that slot is the fan-out multiplier's denominator"
+        );
+
+        // #6143: a CLIENT apply whose merge kept our state (`UpdateResponse`
+        // with `state_changed: false`, the executor's `CurrentWon`) emitted no
+        // fan-out, so it is not an origination: counting it would make
+        // `client_originated` promise sends that were never owed. (`UpdateNoChange`,
+        // the stand-in above, never reaches the counting branch at all.)
+        let (op_manager, _state, _summary, _guard) = build_summary_test_node_with(
+            "update-applies-6143-current-won",
+            true,
+            StandInUpdateReply::CurrentWon,
+        )
+        .await;
+        let execution = update_contract(
+            &op_manager,
+            key,
+            UpdateData::Delta(StateDelta::from(vec![1u8, 2, 3])),
+            RelatedContracts::default(),
+            crate::contract::Priority::ClientLocal,
+            ApplyOrigin::ClientLocal,
+            BroadcastOrigin::local(),
+        )
+        .await
+        .expect("a merge that kept our state is still a successful apply");
+        assert!(!execution.changed, "premise: the state did not change");
+        assert_eq!(
+            op_manager.payload_mix.applies_snapshot()[CLIENT][UNCHANGED],
+            1,
+            "premise: counted as an unchanged client apply"
+        );
+        assert_eq!(
+            op_manager
+                .update_propagation_stats
+                .events_for_test(key.id())
+                .get(propagation_stats::PropagationEvent::ClientOriginated),
+            0,
+            "an unchanged client apply is not an origination"
         );
     }
 

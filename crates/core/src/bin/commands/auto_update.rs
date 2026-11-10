@@ -1878,6 +1878,40 @@ pub fn claim_update_attempt() -> Result<UpdateAttempt, ClaimRefused> {
     }
 }
 
+/// Why [`claim_update_attempt`] would refuse an attempt now, or `Ok` if it
+/// would allow one, without spending anything.
+pub fn peek_update_attempt() -> Result<(), ClaimRefused> {
+    match state_dir() {
+        Some(dir) => {
+            claim_decision_at(&dir, env!("CARGO_PKG_VERSION"), SystemTime::now()).map(|_| ())
+        }
+        None => Err(ClaimRefused::NoStateDir),
+    }
+}
+
+/// The startup update check, ordered so that a locked-out node's daily retry
+/// is spent only on a check that runs (#6152): wait out `jitter` first, and
+/// only then `claim` the attempt and run `check` with it. The startup check
+/// runs in a task beside the node, so a node that dies during the jitter
+/// (a crash loop) used to spend its retry without ever asking GitHub, and
+/// could go days without a check. Dropped during the jitter, this spends
+/// nothing.
+pub async fn claim_after_jitter<J, C, F, Fut>(
+    jitter: J,
+    claim: C,
+    check: F,
+) -> Result<Option<String>, ClaimRefused>
+where
+    J: std::future::Future<Output = ()>,
+    C: FnOnce() -> Result<UpdateAttempt, ClaimRefused>,
+    F: FnOnce(UpdateAttempt) -> Fut,
+    Fut: std::future::Future<Output = Option<String>>,
+{
+    jitter.await;
+    let attempt = claim()?;
+    Ok(check(attempt).await)
+}
+
 /// Whether [`claim_update_attempt`] would allow an attempt now, without
 /// spending anything. The version-less triggers check this before staging and
 /// claim only once staging decides to exit (#5799), so a stay does not spend a
@@ -4862,5 +4896,72 @@ mod tests {
         // With no header we still promise a retry rather than leaving it open.
         let vague = GithubRateLimitedError { retry_after: None }.user_message();
         assert!(vague.contains("within the hour"), "{vague}");
+    }
+
+    /// #6152: a locked-out node whose process dies during the startup
+    /// jitter spends no retry, so the next start still checks; one that gets
+    /// through the jitter claims it and runs the check with the claim.
+    #[tokio::test]
+    async fn dying_inside_the_startup_jitter_spends_no_retry() {
+        use std::future::Future;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let now = lock_out(dir) + UPDATE_LOCKOUT_COOLDOWN;
+        assert!(
+            update_attempt_claimable_at(dir, "0.2.140", now),
+            "premise: retry due"
+        );
+
+        // The process dies while the jitter is still running: the future is
+        // dropped part-way.
+        let checked = std::cell::Cell::new(false);
+        {
+            let mut startup = Box::pin(claim_after_jitter(
+                std::future::pending::<()>(),
+                || claim_update_attempt_unless_cooling_at(dir, "0.2.140", now),
+                |_attempt| async {
+                    checked.set(true);
+                    None
+                },
+            ));
+            let waker = futures::task::noop_waker();
+            let mut cx = std::task::Context::from_waker(&waker);
+            assert!(startup.as_mut().poll(&mut cx).is_pending());
+        }
+        assert!(!checked.get());
+        assert!(!dir.join(LOCKOUT_RETRY_FILE).exists(), "nothing spent");
+        assert!(
+            update_attempt_claimable_at(dir, "0.2.140", now),
+            "still due"
+        );
+
+        // The next start gets through the jitter: claimed, then checked.
+        let latest = claim_after_jitter(
+            async {},
+            || claim_update_attempt_unless_cooling_at(dir, "0.2.140", now),
+            |_attempt| async {
+                checked.set(true);
+                Some("0.2.141".to_string())
+            },
+        )
+        .await;
+        assert_eq!(latest, Ok(Some("0.2.141".to_string())));
+        assert!(checked.get());
+        assert!(dir.join(LOCKOUT_RETRY_FILE).exists(), "spent by the check");
+        assert!(!update_attempt_claimable_at(dir, "0.2.140", now));
+
+        // Spent: a further start refuses after its jitter and checks nothing.
+        checked.set(false);
+        let refused = claim_after_jitter(
+            async {},
+            || claim_update_attempt_unless_cooling_at(dir, "0.2.140", now),
+            |_attempt| async {
+                checked.set(true);
+                None
+            },
+        )
+        .await;
+        assert!(refused.is_err());
+        assert!(!checked.get());
     }
 }
