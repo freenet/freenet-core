@@ -328,8 +328,11 @@ fn apply_start_knobs() -> String {
     set_gate(gate.0, gate.1, gate.2);
     format!(
         "iw_pkts={iw} rate_start_kbps={rate} mtu={mtu} piece_bytes={piece} gate={}/{}/{} \
-         jitter_ms={jitter}",
-        gate.0, gate.1, gate.2
+         gate_max_us={} jitter_ms={jitter}",
+        gate.0,
+        gate.1,
+        gate.2,
+        std::env::var("LAB_GATE_MAX_DELAY_US").unwrap_or_else(|_| "0".into())
     )
 }
 

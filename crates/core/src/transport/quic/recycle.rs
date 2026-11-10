@@ -665,6 +665,10 @@ pub(crate) mod lab {
     /// ...or at least this many microseconds above it...
     pub(crate) static GATE_MIN_DELAY_US: std::sync::atomic::AtomicU64 =
         std::sync::atomic::AtomicU64::new(2_000);
+    /// The relative threshold is capped at this many microseconds (0: no
+    /// cap), so a shallow queue on a long path is still seen.
+    pub(crate) static GATE_MAX_DELAY_US: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
     /// ...or when the share of bytes lost over the last round trip is at
     /// least this many thousandths.
     /// Judge the queue on the smoothed RTT (the first version) instead of
@@ -773,6 +777,12 @@ pub(crate) mod lab {
             );
             let abs =
                 Duration::from_micros(GATE_MIN_DELAY_US.load(std::sync::atomic::Ordering::Relaxed));
+            let cap = GATE_MAX_DELAY_US.load(std::sync::atomic::Ordering::Relaxed);
+            let rel = if cap > 0 {
+                rel.min(Duration::from_micros(cap))
+            } else {
+                rel
+            };
             if queue >= rel.max(abs) { 2 } else { 0 }
         }
     }
