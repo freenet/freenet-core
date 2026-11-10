@@ -541,6 +541,9 @@ jobs:
             **INFO** — Style suggestions and minor improvements:
             - Missing doc comments on new public APIs
             - Catch-all `_ =>` in exhaustive matches
+            - PR bundles more than one logical change, or a commit subject is over
+              72 characters or not in conventional-commit form. Report these as INFO
+              only, never as WARNING.
 
             ## Output Format
 
@@ -587,9 +590,66 @@ jobs:
             const fs = require('fs');
             const marker = '<!-- claude-rule-review -->';
             const reviewOutcome = '${{ steps.review.outcome }}';
+            const runUrl = '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}';
+
+            // The review step is continue-on-error so a broken reviewer never
+            // blocks merge. That also makes a dead CLAUDE_CODE_OAUTH_TOKEN
+            // invisible (the job stays green): the 2026-09-27 token expiry went
+            // unnoticed for six weeks. So an outage opens ONE tracking issue
+            // (deduplicated by this marker) and the next successful review
+            // closes it again.
+            const outageMarker = '<!-- claude-rule-review-outage -->';
+            const outageTitle = 'CI: Claude rule review is failing to run';
+            const findOutageIssue = async () => {
+              const issues = await github.paginate(github.rest.issues.listForRepo, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                state: 'open',
+                // Issues made with GITHUB_TOKEN are authored by this bot; the
+                // filter keeps this from paging through every open issue on
+                // each PR run.
+                creator: 'github-actions[bot]',
+                per_page: 100,
+              });
+              return issues.find(i => !i.pull_request && (i.body || '').includes(outageMarker));
+            };
 
             // If Claude step failed, post a warning instead of silently doing nothing
             if (reviewOutcome === 'failure') {
+              // The action hides the API error (show_full_output is off), but the
+              // execution file still carries the final `result` entry. Surface a
+              // short, backtick-free excerpt in a red annotation only; it is
+              // deliberately not copied into the PR comment or the issue.
+              let detail = 'unknown (no execution file)';
+              try {
+                const execRaw = fs.readFileSync(
+                  '${{ steps.review.outputs.execution_file }}' || '/home/runner/work/_temp/claude-execution-output.json', 'utf8');
+                const entries = JSON.parse(execRaw);
+                const last = Array.isArray(entries) ? entries[entries.length - 1] : null;
+                if (last && last.type === 'result') {
+                  detail = `subtype=${last.subtype} is_error=${last.is_error} turns=${last.num_turns} cost=${last.total_cost_usd} result=${String(last.result ?? '').replace(/`/g, "'").slice(0, 300)}`;
+                }
+              } catch (e) {
+                detail = `unreadable execution file: ${e.message}`;
+              }
+              core.error(`Claude rule review failed to run: ${detail}`);
+
+              if (!(await findOutageIssue())) {
+                await github.rest.issues.create({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  title: outageTitle,
+                  body: outageMarker + '\n' +
+                    'The `Claude PR Rule Review` workflow could not run its review, so PRs are being merged without it. ' +
+                    'The job still reports green because the review step is `continue-on-error`.\n\n' +
+                    'Most likely cause: the `CLAUDE_CODE_OAUTH_TOKEN` repository secret has expired or been revoked ' +
+                    '(re-issue it with `claude setup-token` and update the secret), or the account behind it is out of usage. ' +
+                    'The step\'s error annotation on the run below has the actual API error.\n\n' +
+                    `First failing run: ${runUrl}\n\n` +
+                    'This issue is opened and closed automatically by the workflow; it closes itself after the next successful review.',
+                });
+              }
+
               const warningBody = marker + '\n' +
                 '### Claude Rule Review: Failed to run\n\n' +
                 'The Claude rule review step failed (likely an authentication or API issue). ' +
@@ -678,6 +738,24 @@ jobs:
                 description: 'No report content — not blocking merge',
               });
               return;
+            }
+
+            // A real report means the reviewer works again: close any open outage issue.
+            const outage = await findOutageIssue();
+            if (outage) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: outage.number,
+                body: `Review ran successfully again: ${runUrl}. Closing.`,
+              });
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: outage.number,
+                state: 'closed',
+                state_reason: 'completed',
+              });
             }
 
             // Count WARNING-level findings using structured marker (reliable)
