@@ -359,7 +359,7 @@ impl Default for ConfigArgs {
                 ledbat_min_ssthresh: None, // Uses default from NetworkApiConfig
                 congestion_control: None,  // Default: fixedrate (set in NetworkApiConfig)
                 bbr_startup_rate: None,    // Uses default from BBR config
-                transport_quic: None,      // Default: shadow on Linux and macOS
+                transport_quic: None,      // Default: shadow on Linux, macOS and Windows
                 quic_max_paths: None,      // Default: max-number-of-connections
                 quic_data_percent: None,   // Default: this release's share of pairs
                 quic_ignore_crash_breaker: None,
@@ -2578,7 +2578,7 @@ pub struct NetworkArgs {
     pub bbr_startup_rate: Option<u64>,
 
     /// QUIC transport (#5940): `off`, `shadow` or `prefer`. Unset means
-    /// `shadow` on Linux and macOS, and `off` elsewhere, Windows included.
+    /// `shadow` on Linux, macOS and Windows, and `off` elsewhere.
     ///
     /// `shadow` builds a QUIC endpoint on the network port and upgrades
     /// connections to peers that also run it to a QUIC path. The path carries
@@ -2963,7 +2963,7 @@ pub struct NetworkApiConfig {
     pub bbr_startup_rate: Option<u64>,
 
     /// QUIC transport (#5940): `off`, `shadow` or `prefer`; unset reads as
-    /// `QuicMode::default_mode` (shadow on Linux and macOS). Kept as written, so a value from a later release
+    /// `QuicMode::default_mode` (shadow on Linux, macOS and Windows). Kept as written, so a value from a later release
     /// round-trips; see [`Self::quic_settings`] for how it is read.
     #[serde(
         default,
@@ -7591,8 +7591,8 @@ shutdown-drain-secs = 42
         assert_eq!(unset.network_api.transport_quic, None);
         assert_eq!(
             unset.network_api.quic_settings().is_some(),
-            cfg!(any(target_os = "linux", target_os = "macos")),
-            "an unset key builds an endpoint on Linux and macOS only"
+            crate::transport::quic::QuicMode::default_mode().builds_endpoint(),
+            "an unset key builds an endpoint where the platform default does"
         );
         assert!(
             !toml::to_string(&unset).unwrap().contains("transport-quic"),

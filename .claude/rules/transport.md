@@ -1117,8 +1117,8 @@ it must not wait unless it is a pacing point.
 #### QUIC endpoint (`transport/quic.rs`, #5940 step c2)
 
 `transport-quic` (config key: `off`, `shadow` or `prefer`; unset is
-`QuicMode::default_mode`, shadow on Linux and macOS and off elsewhere, since
-the breaker cannot trip without a boot identity) decides whether `bind_udp_listener` builds a quinn endpoint over the DemuxSocket.
+`QuicMode::default_mode`, shadow on Linux, macOS and Windows and off
+elsewhere, since the breaker cannot trip without a boot identity) decides whether `bind_udp_listener` builds a quinn endpoint over the DemuxSocket.
 `prefer` negotiates data with the release's share of pairs ("Data slice" below;
 `upgrade::policy::log_startup` reports the share at INFO once per node), and a pair
 with both bits sends its data on the path ("QUIC send route" below). At a share of
@@ -1702,7 +1702,8 @@ release goes out.
   stays near 0 and UDP metrics do not change.
 - Step 1: nova gateways and framework in shadow for 24-48 h. The 24 h gateway
   A/B runs only if something looks odd. Rollback: set the key to off and restart.
-- Step 2: shadow on by default on Linux and macOS (`QuicMode::default_mode`). Gate: at least 95% upgrade
+- Step 2: shadow on by default on Linux and macOS, then Windows once its
+  breaker was confirmed on a real machine (`QuicMode::default_mode`). Gate: at least 95% upgrade
   success by `established_as_offerer / accepted`; fewer than 1 fallback per
   path-day excluding endpoint and restart causes; memory within the measured
   terms (about 0.3 to 0.5 MiB per idle path). An abort spike stops the step.
@@ -2301,7 +2302,7 @@ QUIC send route (#5940 e5b-6, quic/upgrade/data_route.rs,
   waiting for its source does not count (WatchedSource). It costs a normal
   backoff.
   Fast path: Session::routed is an atomic set only while the live attempt holds a
-  route, so a connection with no route (shadow, the default on Linux and macOS)
+  route, so a connection with no route (shadow, the default on Linux, macOS and Windows)
   sends without taking the session's lock. enable_data runs once per activation
   (debug assertion); a second route would orphan the first one's worker.
   A path gone dark: the first send timeout that counts toward the stall close
@@ -2402,7 +2403,7 @@ QUIC receive flow (#5940 e5b-4):
 
 #### QUIC errors, close codes and liveness (`quic/error.rs`, `quic/liveness.rs`, #5940 step e4)
 
-Live in production on Linux and macOS, where shadow is the default: the
+Live in production on Linux, macOS and Windows, where shadow is the default: the
 paths carry control frames only, but endpoints, connections and their errors
 are real. With `transport-quic` off no endpoint is built and the transport
 reports `Disabled`.

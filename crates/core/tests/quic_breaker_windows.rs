@@ -100,6 +100,9 @@ impl Node {
             .env_remove("FREENET_DISABLE_LOGS")
             .env_remove("FREENET_LOG_FORMAT")
             .env_remove("FREENET_TEST_QUIC_PANIC")
+            // An ambient setting would make the default test pass without
+            // testing the default.
+            .env_remove("FREENET_TRANSPORT_QUIC")
             .envs(env.iter().copied())
             .args(["--ws-api-address", "127.0.0.1"])
             .args(["--ws-api-port", &ws_port])
