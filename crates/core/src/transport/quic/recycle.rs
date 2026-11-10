@@ -166,6 +166,7 @@ use parking_lot::Mutex;
 use quinn::FrameStats;
 use quinn::congestion::{Controller, ControllerFactory, ControllerMetrics};
 
+use self::loss_gate::LossGate;
 use super::QuicCloser;
 use super::config::{MAX_UDP_PAYLOAD, QuicRateLimit};
 #[cfg(doc)]
@@ -303,7 +304,7 @@ impl Default for CappedCubicFactory {
 impl ControllerFactory for CappedCubicFactory {
     fn build(self: Arc<Self>, now: Instant, current_mtu: u16) -> Box<dyn Controller> {
         Box::new(CappedCubic::new(
-            self.cubic.clone().build(now, current_mtu),
+            Box::new(LossGate::new(self.cubic.clone().build(now, current_mtu))),
             self.rate.clone(),
             current_mtu,
         ))
@@ -425,10 +426,10 @@ impl CappedCubic {
         }
     }
 
-    /// Whether the wrapped controller is a `C`.
+    /// The loss gate inside, if the wrapped controller is one.
     #[cfg(test)]
-    pub(crate) fn wraps<C: Controller + 'static>(&self) -> bool {
-        self.inner.clone_box().into_any().downcast::<C>().is_ok()
+    pub(crate) fn gate(&self) -> Option<Box<LossGate>> {
+        self.inner.clone_box().into_any().downcast::<LossGate>().ok()
     }
 }
 
@@ -899,6 +900,8 @@ pub(crate) async fn watch_acknowledgements<T: TimeSource>(
         }
     }
 }
+
+pub(crate) mod loss_gate;
 
 #[cfg(test)]
 mod cap_tests;

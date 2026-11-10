@@ -483,8 +483,9 @@ fn handshake_and_one_mib_stream_on_virtual_time() {
                 .into_any()
                 .downcast::<super::recycle::CappedCubic>()
                 .expect("the acknowledgement-counting controller");
+            let gate = controller.gate().expect("Cubic behind the loss gate");
             assert!(
-                controller.wraps::<quinn::congestion::Cubic>(),
+                gate.wraps::<quinn::congestion::Cubic>(),
                 "Cubic congestion control"
             );
         }
