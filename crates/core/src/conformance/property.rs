@@ -15,6 +15,15 @@ pub enum ConformanceProperty {
     /// `merge(A, A) == A`
     StateIdempotence,
     /// `merge(A, B) == merge(B, A)`
+    ///
+    /// When the contract REFUSES one of the two merges (a `ContractError`) for two
+    /// states it validates, the two peers holding them are simulated exchanging
+    /// states until they agree or neither moves (#5725). Agreeing is the honest
+    /// transient refusal (River's ban-cap skew) and stays
+    /// [`Inconclusive::ContractError`]. Stopping while apart is a stable
+    /// disagreement, the freenet/river#423 class, and is a violation of this law
+    /// between the two states the peers end on. Running out of
+    /// `MAX_REFUSAL_EXCHANGE_ROUNDS` is [`Inconclusive::RoundLimit`].
     StateCommutativity,
     /// `merge(merge(A, B), C) == merge(A, merge(B, C))`, or the two groupings heal:
     /// they converge in one exchange to a state that, re-merged with both groupings
@@ -926,6 +935,12 @@ pub enum Inconclusive {
     RelatedRequired,
     /// The contract returned an error. A single rejection is not a conformance
     /// failure — contracts are supposed to reject updates they consider illegitimate.
+    ///
+    /// Two places report a refusal instead (#5725): a refused associativity
+    /// heal-step merge, and a refused commutativity merge after which the two
+    /// peers, exchanging states, stop moving while still holding different states.
+    /// See [`ConformanceProperty::StateCommutativity`]. A commutativity refusal
+    /// that clears on the exchange is reported here.
     ContractError(String),
     /// `update_state` returned neither a new state nor a related-contract request.
     NoOutputState,
