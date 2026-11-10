@@ -704,6 +704,15 @@ jobs:
               }
             });
 
+            // The ONE definition of a clean run, used by both gates below: a result
+            // that says it succeeded. A result that is PRESENT but does not say so
+            // (a missing or non-boolean is_error, a non-success subtype) is not
+            // evidence of a review, so it is a non-run and never closes the outage
+            // issue (#5628). Known gap: a succeeded step whose execution file has
+            // a report but NO result entry at all is not caught by this gate; every
+            // real run's file has one, so this needs a truncated file.
+            const cleanResult = (e) => !!e && e.is_error === false && e.subtype === 'success';
+
             // A final `result` entry as a one-line annotation. `systemic` is true
             // unless the run got going (more than one turn). An API refusal ends
             // the run at the first call, so a run that took more turns reached the
@@ -723,13 +732,6 @@ jobs:
             // Total on purpose: it runs before the status is set on some paths, so
             // a malformed entry (an object where a string is expected) must not
             // throw and fail the required job. `safe` stringifies anything.
-            // The ONE definition of a clean run, used by both gates below: a result
-            // that says it succeeded. Anything else that is present (a missing or
-            // non-boolean is_error, a non-success subtype) is not evidence of a
-            // review, so it is a non-run, and it never closes the outage issue.
-            // Absence of evidence is not a pass (#5628).
-            const cleanResult = (e) => !!e && e.is_error === false && e.subtype === 'success';
-
             const safe = (v) => {
               try { return String(v ?? ''); } catch (_) { return '[unprintable]'; }
             };
