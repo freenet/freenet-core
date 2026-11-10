@@ -669,6 +669,11 @@ pub(crate) mod lab {
     /// cap), so a shallow queue on a long path is still seen.
     pub(crate) static GATE_MAX_DELAY_US: std::sync::atomic::AtomicU64 =
         std::sync::atomic::AtomicU64::new(0);
+    /// Judge the queue at the lost packet's send time: the smallest RTT of
+    /// the acknowledged packets sent within a window around it, instead of
+    /// the smallest over the last two rounds.
+    pub(crate) static GATE_LOCAL: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
     /// ...or when the share of bytes lost over the last round trip is at
     /// least this many thousandths.
     /// Judge the queue on the smoothed RTT (the first version) instead of
@@ -706,6 +711,8 @@ pub(crate) mod lab {
         round_acked: u64,
         round_lost: u64,
         last_round_share: f64,
+        /// Recent acknowledged packets: send time and RTT sample.
+        recent: std::collections::VecDeque<(Instant, Duration)>,
         /// Losses passed to Cubic and ignored, for the lab's reports.
         pub(crate) passed: u64,
         pub(crate) ignored: u64,
@@ -723,9 +730,26 @@ pub(crate) mod lab {
                 round_acked: 0,
                 round_lost: 0,
                 last_round_share: 0.0,
+                recent: Default::default(),
                 passed: 0,
                 ignored: 0,
             }
+        }
+
+        /// The queue around `sent`: the smallest RTT of packets sent within
+        /// max(srtt / 4, 5 ms) of it, less the minimum.
+        fn queue_at(&self, sent: Instant) -> Option<Duration> {
+            let window = (self.srtt? / 4).max(Duration::from_millis(5));
+            let near = self
+                .recent
+                .iter()
+                .filter(|(at, _)| {
+                    let d = if *at > sent { *at - sent } else { sent - *at };
+                    d <= window
+                })
+                .map(|(_, rtt)| *rtt)
+                .min()?;
+            Some(near.saturating_sub(self.min_rtt?))
         }
 
         fn roll(&mut self, now: Instant) {
@@ -752,7 +776,7 @@ pub(crate) mod lab {
         }
 
         /// 1 for the loss share, 2 for the queue, 0 for neither.
-        fn congested(&self) -> usize {
+        fn congested(&self, sent: Instant) -> usize {
             let share = self.last_round_share;
             if share * 1000.0
                 >= GATE_LOSS_CEIL_PERMILLE.load(std::sync::atomic::Ordering::Relaxed) as f64
@@ -771,7 +795,14 @@ pub(crate) mod lab {
             let (Some(srtt), Some(min)) = (recent, self.min_rtt) else {
                 return 2;
             };
-            let queue = srtt.saturating_sub(min);
+            let queue = if GATE_LOCAL.load(std::sync::atomic::Ordering::Relaxed) {
+                match self.queue_at(sent) {
+                    Some(q) => q,
+                    None => srtt.saturating_sub(min),
+                }
+            } else {
+                srtt.saturating_sub(min)
+            };
             let rel = min.mul_f64(
                 GATE_DELAY_PERMILLE.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0,
             );
@@ -806,6 +837,10 @@ pub(crate) mod lab {
             self.roll(now);
             self.round_min = Some(self.round_min.map_or(sample, |m| m.min(sample)));
             self.round_acked += bytes;
+            self.recent.push_back((sent, sample));
+            if self.recent.len() > 512 {
+                self.recent.pop_front();
+            }
             self.inner.on_ack(now, sent, bytes, app_limited, rtt);
         }
 
@@ -832,7 +867,7 @@ pub(crate) mod lab {
             let why = if is_persistent_congestion {
                 0
             } else {
-                self.congested()
+                self.congested(sent)
             };
             let reason = if is_persistent_congestion {
                 0
@@ -874,6 +909,7 @@ pub(crate) mod lab {
                 round_acked: self.round_acked,
                 round_lost: self.round_lost,
                 last_round_share: self.last_round_share,
+                recent: self.recent.clone(),
                 passed: self.passed,
                 ignored: self.ignored,
             })

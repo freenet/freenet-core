@@ -104,6 +104,10 @@ pub fn set_gate(delay_permille: u64, min_delay_us: u64, loss_ceil_permille: u64)
         std::env::var("LAB_GATE_SRTT").as_deref() == Ok("1"),
         Ordering::Relaxed,
     );
+    lab::GATE_LOCAL.store(
+        std::env::var("LAB_GATE_LOCAL").as_deref() == Ok("1"),
+        Ordering::Relaxed,
+    );
     if let Ok(v) = std::env::var("LAB_GATE_MAX_DELAY_US") {
         lab::GATE_MAX_DELAY_US.store(v.parse().expect("a number"), Ordering::Relaxed);
     }
