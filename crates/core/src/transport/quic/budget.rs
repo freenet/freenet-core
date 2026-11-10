@@ -11,7 +11,7 @@
 //! hold_charge(W + debt) + S_charged x 9/8 + gaps x GAP_BYTES + CONTROL_BUFFER_BYTES
 //! ```
 //!
-//! - **hold_charge(W + debt)**, about 3.2 x (W + debt): what quinn can hold for
+//! - **hold_charge(W + debt)**, about 3.45 x (W + debt): what quinn can hold for
 //!   the connection's streams under its hold detector (`hold`), whose threshold
 //!   the meter sets from W + debt.
 //! - **W + debt.** quinn lowers a receive window by recording a shrink debt,
