@@ -46,6 +46,8 @@ pub struct RuntimeOracle {
     runtime: Runtime,
     key: ContractKey,
     parameters: Parameters<'static>,
+    /// Whether the code imports the host clock, read once at construction.
+    reads_host_clock: bool,
     /// Kept alive for as long as the oracle runs: dropping it deletes the store the
     /// runtime reads the contract from.
     _scratch: Option<tempfile::TempDir>,
@@ -102,6 +104,7 @@ impl RuntimeOracle {
         )?;
 
         let parameters = Parameters::from(parameters);
+        let reads_host_clock = super::imports_host_clock(&wasm);
         let container = ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
             Arc::new(ContractCode::from(wasm)),
             parameters.clone(),
@@ -141,6 +144,7 @@ impl RuntimeOracle {
             runtime,
             key,
             parameters,
+            reads_host_clock,
             _scratch: Some(scratch),
         })
     }
@@ -197,6 +201,10 @@ impl ConformanceOracle for RuntimeOracle {
             .map(|delta| delta.into_bytes())
             .map_err(classify)
     }
+
+    fn reads_host_clock(&self) -> bool {
+        self.reads_host_clock
+    }
 }
 
 /// An oracle over a runtime someone else owns, for one contract.
@@ -205,6 +213,11 @@ impl ConformanceOracle for RuntimeOracle {
 /// ([`super::verifier::associativity_heals`]) on the runtime that just performed the
 /// merge, so the probe's verdict comes from the same law the verifier checks rather
 /// than from a second copy of it.
+///
+/// It has no code bytes in hand, so it keeps the default
+/// [`ConformanceOracle::reads_host_clock`] of `false`. That is safe only while its
+/// one caller runs the associativity heal step and never the commutativity refusal
+/// exchange, which is the only reader of that answer.
 pub(crate) struct BorrowedRuntimeOracle<'a, 'p, R: ?Sized> {
     runtime: &'a mut R,
     key: &'a ContractKey,

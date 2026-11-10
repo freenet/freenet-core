@@ -128,6 +128,14 @@ async fn verifier_matches_real_wasm_for_every_planted_defect()
     // non-trivial number of generated cases — the false-positive gate against
     // real WASM execution, not just against the pure-Rust fakes in `tests.rs`.
     let mut conforming = RuntimeOracle::standalone(wasm.clone(), vec![CONFORMING]).await?;
+    // The oracle answers `reads_host_clock` from the code it was built over, which
+    // is what keeps a clock-gated refusal from being reported (#5725). This fixture
+    // imports the clock (mode 4 reads it), so the answer must be `true` here.
+    {
+        use super::oracle::ConformanceOracle;
+        assert!(super::imports_host_clock(&wasm));
+        assert!(conforming.reads_host_clock());
+    }
     let corpus = Corpus {
         deltas: vec![bytes(&[9]), bytes(&[7])],
         ..Corpus::from_states(vec![

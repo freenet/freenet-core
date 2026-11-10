@@ -45,6 +45,7 @@ struct Fake {
     apply: BinaryFn,
     summarize: UnaryFn,
     delta: BinaryFn,
+    reads_clock: bool,
 }
 
 impl Fake {
@@ -63,7 +64,20 @@ impl Fake {
             apply: Box::new(|a, d| Ok(union(a, d))),
             summarize: Box::new(|a| Ok(a.to_vec())),
             delta: Box::new(|a, summary| Ok(difference(a, summary))),
+            reads_clock: false,
         }
+    }
+
+    /// No usable delta path, so every update in a refusal exchange travels as a whole
+    /// state. Tests of the exchange's merge logic use this to keep the default
+    /// union delta from carrying the states together.
+    fn full_state_only(self) -> Self {
+        self.deltaing(|_, _| Ok(Vec::new()))
+    }
+
+    fn reading_clock(mut self) -> Self {
+        self.reads_clock = true;
+        self
     }
 
     fn merging(
@@ -149,6 +163,10 @@ impl ConformanceOracle for Fake {
 
     fn get_state_delta(&mut self, state: &[u8], summary: &[u8]) -> Result<Vec<u8>, OracleError> {
         (self.delta)(state, summary)
+    }
+
+    fn reads_host_clock(&self) -> bool {
+        self.reads_clock
     }
 }
 
@@ -1744,9 +1762,10 @@ fn an_intermediate_the_contract_rejects_is_inconclusive() {
 }
 
 /// A contract that refuses to merge two states it validates, in both directions and
-/// every time, leaves the two peers holding them apart for good (#5725, the
-/// freenet/river#423 class). Exchanging the states again changes nothing, so this is
-/// a stable disagreement and is reported under `StateCommutativity`.
+/// by every route (whole state and delta), every time, leaves the two peers holding
+/// them apart for good (#5725, the freenet/river#423 class). Exchanging the states
+/// again changes nothing, so this is a stable disagreement and is reported under
+/// `StateCommutativity`.
 ///
 /// Until #5725 this case was pinned as inconclusive ("one rejection is not a
 /// merge-law failure"). That holds for an update the other side can move past, and
@@ -1754,11 +1773,12 @@ fn an_intermediate_the_contract_rejects_is_inconclusive() {
 /// it does not hold for a refusal between two valid states that never clears.
 #[test]
 fn a_refusal_that_leaves_the_peers_apart_is_a_violation() {
-    let mut fake = Fake::conforming().merging(|_a, _b| {
+    let refuse = |_: &[u8], _: &[u8]| -> Result<Vec<u8>, OracleError> {
         Err(OracleError::contract(
             "signature does not chain to the owner",
         ))
-    });
+    };
+    let mut fake = Fake::conforming().merging(refuse).applying(refuse);
     let outcome = verify_case(
         &mut fake,
         &case(ConformanceProperty::StateCommutativity, &[&[1, 2], &[2, 3]]),
@@ -1778,20 +1798,41 @@ fn a_refusal_that_leaves_the_peers_apart_is_a_violation() {
     );
 }
 
+/// A contract that refuses the WHOLE state but accepts the delta computed from the
+/// receiver's summary converges on the network, because production sends the delta
+/// first. Not a finding: the exchange must follow the same order.
+#[test]
+fn a_refusal_of_the_whole_state_that_the_delta_gets_past_is_not_reported() {
+    let mut fake = Fake::conforming().merging(|_, _| Err(OracleError::contract("no whole states")));
+    assert_inconclusive(
+        verify_case(
+            &mut fake,
+            &case(ConformanceProperty::StateCommutativity, &[&[1, 2], &[2, 3]]),
+        ),
+        Inconclusive::ContractError("no whole states".into()),
+    );
+}
+
 /// A refusal on one side where the other side moves, and the two then agree, is the
 /// honest transient case (River's ban-cap skew): not a finding. It stays
 /// inconclusive with the contract's own reason, as before #5725.
+///
+/// This test guards against OVER-reporting, so it passes with or without the
+/// exchange: what it pins is that the exchange does not turn a transient refusal
+/// into a finding.
 ///
 /// Union, except that the holder of `[1]` refuses `[2]` alone. The holder of `[2]`
 /// accepts `[1]` and reaches `[1, 2]`, which the holder of `[1]` then accepts.
 #[test]
 fn a_refusal_that_clears_on_the_next_exchange_is_not_reported() {
-    let mut fake = Fake::conforming().merging(|a, b| {
-        if a == [1] && b == [2] {
-            return Err(OracleError::contract("ban cap skew"));
-        }
-        Ok(union(a, b))
-    });
+    let mut fake = Fake::conforming()
+        .merging(|a, b| {
+            if a == [1] && b == [2] {
+                return Err(OracleError::contract("ban cap skew"));
+            }
+            Ok(union(a, b))
+        })
+        .full_state_only();
     assert_inconclusive(
         verify_case(
             &mut fake,
@@ -1802,15 +1843,18 @@ fn a_refusal_that_clears_on_the_next_exchange_is_not_reported() {
 }
 
 /// The same transient shape with the refusal on the REVERSE merge, so the first
-/// merge succeeds and the second refuses. Also not a finding.
+/// merge succeeds and the second refuses. Also not a finding. Like the test above,
+/// this guards against over-reporting and passes with or without the exchange.
 #[test]
 fn a_reverse_refusal_that_clears_is_not_reported() {
-    let mut fake = Fake::conforming().merging(|a, b| {
-        if a == [2] && b == [1] {
-            return Err(OracleError::contract("ban cap skew"));
-        }
-        Ok(union(a, b))
-    });
+    let mut fake = Fake::conforming()
+        .merging(|a, b| {
+            if a == [2] && b == [1] {
+                return Err(OracleError::contract("ban cap skew"));
+            }
+            Ok(union(a, b))
+        })
+        .full_state_only();
     assert_inconclusive(
         verify_case(
             &mut fake,
@@ -1818,6 +1862,14 @@ fn a_reverse_refusal_that_clears_is_not_reported() {
         ),
         Inconclusive::ContractError("ban cap skew".into()),
     );
+}
+
+fn single_byte_valid(state: &[u8]) -> Result<ValidateResult, OracleError> {
+    if state.len() == 1 {
+        Ok(ValidateResult::Valid)
+    } else {
+        Ok(ValidateResult::Invalid)
+    }
 }
 
 /// One side keeps its own state without an error (`merge(A, B) == A`) and the other
@@ -1832,13 +1884,8 @@ fn a_one_sided_refusal_where_neither_side_moves_is_a_violation() {
             }
             Ok(a.to_vec())
         })
-        .validating(|state| {
-            if state.len() == 1 {
-                Ok(ValidateResult::Valid)
-            } else {
-                Ok(ValidateResult::Invalid)
-            }
-        });
+        .full_state_only()
+        .validating(single_byte_valid);
     assert_violates(
         verify_case(
             &mut fake,
@@ -1848,24 +1895,83 @@ fn a_one_sided_refusal_where_neither_side_moves_is_a_violation() {
     );
 }
 
-/// A merged state the contract itself rejects is dropped by a real node, which
-/// keeps the state it held. The exchange models that, so a refusal followed by
-/// merges that only ever emit invalid states is a stable disagreement too.
+/// A stuck exchange on a contract that reads the host clock is not reported: a
+/// clock-gated refusal (a timestamp too far ahead, #5465) reproduces on the re-run
+/// and still clears as time passes. It stays inconclusive and says why.
 #[test]
-fn a_refusal_whose_only_way_forward_is_an_invalid_state_is_a_violation() {
-    let mut fake = Fake::conforming().merging(|a, b| {
-        if a == [1] {
-            return Err(OracleError::contract("refused"));
+fn a_stuck_refusal_on_a_clock_reading_contract_is_not_reported() {
+    let refuse = |_: &[u8], _: &[u8]| -> Result<Vec<u8>, OracleError> {
+        Err(OracleError::contract("timestamp in the future"))
+    };
+    let mut fake = Fake::conforming()
+        .merging(refuse)
+        .applying(refuse)
+        .reading_clock();
+    match verify_case(
+        &mut fake,
+        &case(ConformanceProperty::StateCommutativity, &[&[1, 2], &[2, 3]]),
+    ) {
+        PropertyOutcome::Inconclusive(Inconclusive::ContractError(reason)) => {
+            assert!(reason.contains("timestamp in the future"), "{reason}");
+            assert!(reason.contains("reads the host clock"), "{reason}");
         }
-        // `[2, 1]`: not canonical, so `validate_state` rejects it.
-        Ok([a, b].concat())
-    });
-    assert_violates(
+        other @ (PropertyOutcome::Holds
+        | PropertyOutcome::Violated(_)
+        | PropertyOutcome::Inconclusive(_)) => {
+            panic!("expected an inconclusive contract error, got {other:?}")
+        }
+    }
+}
+
+/// A merged state the contract rejects, reached inside the exchange, is
+/// `InputNotValid`, as in `reconciliation_cycle`. The defect is
+/// `EmittedStateValidity`'s, and reporting it as a stuck exchange would accuse the
+/// right contract under the wrong law.
+#[test]
+fn an_invalid_state_reached_in_the_refusal_exchange_is_inconclusive() {
+    let mut fake = Fake::conforming()
+        .merging(|a, b| {
+            if a == [1] {
+                return Err(OracleError::contract("refused"));
+            }
+            // `[2, 1]`: not canonical, so `validate_state` rejects it.
+            Ok([a, b].concat())
+        })
+        .full_state_only();
+    assert_inconclusive(
         verify_case(
             &mut fake,
             &case(ConformanceProperty::StateCommutativity, &[&[1], &[2]]),
         ),
-        ConformanceProperty::StateCommutativity,
+        Inconclusive::InputNotValid,
+    );
+}
+
+/// A state reached inside the exchange that needs related-contract state is
+/// `RelatedRequired`, as anywhere else.
+#[test]
+fn related_state_needed_inside_the_refusal_exchange_is_inconclusive() {
+    let mut fake = Fake::conforming()
+        .merging(|a, b| {
+            if a == [1] {
+                return Err(OracleError::contract("refused"));
+            }
+            Ok(vec![a[0] + b[0]])
+        })
+        .full_state_only()
+        .validating(|state| {
+            if state == [3] {
+                Ok(ValidateResult::RequestRelated(Vec::new()))
+            } else {
+                Ok(ValidateResult::Valid)
+            }
+        });
+    assert_inconclusive(
+        verify_case(
+            &mut fake,
+            &case(ConformanceProperty::StateCommutativity, &[&[1], &[2]]),
+        ),
+        Inconclusive::RelatedRequired,
     );
 }
 
@@ -1881,8 +1987,35 @@ fn a_refusal_whose_exchange_never_settles_is_inconclusive() {
             }
             Ok(vec![a[0].max(b[0]).wrapping_add(1)])
         })
+        .full_state_only()
+        .validating(single_byte_valid);
+    assert_inconclusive(
+        verify_case(
+            &mut fake,
+            &case(ConformanceProperty::StateCommutativity, &[&[0], &[1]]),
+        ),
+        Inconclusive::RoundLimit,
+    );
+}
+
+/// An exchange that revisits a state pair is a true cycle under the one delivery
+/// order modelled. It is not reported: another order might converge, so it ends as
+/// `RoundLimit`, not as a finding.
+///
+/// After the refusal, each peer advances its own counter mod 4 on every receive, so
+/// the pair walks `(0, 2), (1, 3), (2, 0), (3, 1)` and repeats without ever meeting.
+#[test]
+fn a_refusal_whose_exchange_cycles_is_inconclusive() {
+    let mut fake = Fake::conforming()
+        .merging(|a, b| {
+            if a == [0] && b == [1] {
+                return Err(OracleError::contract("refused"));
+            }
+            Ok(vec![(a[0] + 1) % 4])
+        })
+        .full_state_only()
         .validating(|state| {
-            if state.len() == 1 {
+            if state.len() == 1 && state[0] < 4 {
                 Ok(ValidateResult::Valid)
             } else {
                 Ok(ValidateResult::Invalid)
@@ -1897,16 +2030,162 @@ fn a_refusal_whose_exchange_never_settles_is_inconclusive() {
     );
 }
 
-/// A runtime failure during the exchange is ours, not the contract's: it stays
+/// The round bound, at its edge. `merge(K, 0)` is refused, so the exchange starts.
+/// Then the `[0]` peer climbs by one on every receive while the `[K]` peer keeps its
+/// state, so the two meet at the end of round `K`. Meeting on the last allowed round
+/// is convergence (this exercises the check after the loop); one round later is
+/// `RoundLimit`.
+#[test]
+fn the_refusal_exchange_round_bound_is_exact() {
+    use super::verifier::MAX_REFUSAL_EXCHANGE_ROUNDS;
+    let climbing = |k: u8| {
+        Fake::conforming()
+            .merging(move |a, b| {
+                if a == [k] && b == [0] {
+                    return Err(OracleError::contract("refused"));
+                }
+                Ok(if a[0] < b[0] {
+                    vec![a[0] + 1]
+                } else {
+                    a.to_vec()
+                })
+            })
+            .full_state_only()
+            .validating(single_byte_valid)
+    };
+    let last = MAX_REFUSAL_EXCHANGE_ROUNDS as u8;
+    assert_inconclusive(
+        verify_case(
+            &mut climbing(last),
+            &case(ConformanceProperty::StateCommutativity, &[&[0], &[last]]),
+        ),
+        Inconclusive::ContractError("refused".into()),
+    );
+    assert_inconclusive(
+        verify_case(
+            &mut climbing(last + 1),
+            &case(
+                ConformanceProperty::StateCommutativity,
+                &[&[0], &[last + 1]],
+            ),
+        ),
+        Inconclusive::RoundLimit,
+    );
+}
+
+/// The `A` peer receives first, and the `B` peer then receives from the `A` peer's
+/// NEW state. Pinned on the calls the exchange makes: the first summary is of `A`'s
+/// state (the receiver), the first delta is computed from `B`'s, and the second
+/// delta is computed from the state `A` moved to.
+#[test]
+fn the_refusal_exchange_starts_with_the_first_state_receiving() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let summaries: Rc<RefCell<Vec<Vec<u8>>>> = Rc::default();
+    let senders: Rc<RefCell<Vec<Vec<u8>>>> = Rc::default();
+    let (s, d) = (summaries.clone(), senders.clone());
+    let mut fake = Fake::conforming()
+        .merging(|a, b| match (a[0], b[0]) {
+            (1, 2) => Ok(vec![3]),
+            (2, 1) => Err(OracleError::contract("refused")),
+            (2, 3) => Ok(vec![3]),
+            _ => Ok(a.to_vec()),
+        })
+        .summarizing(move |state| {
+            s.borrow_mut().push(state.to_vec());
+            Ok(state.to_vec())
+        })
+        .deltaing(move |state, _| {
+            d.borrow_mut().push(state.to_vec());
+            Ok(Vec::new())
+        })
+        .validating(single_byte_valid);
+    assert_inconclusive(
+        verify_case(
+            &mut fake,
+            &case(ConformanceProperty::StateCommutativity, &[&[1], &[2]]),
+        ),
+        Inconclusive::ContractError("refused".into()),
+    );
+    assert_eq!(summaries.borrow()[..2], [vec![1], vec![2]]);
+    assert_eq!(senders.borrow()[..2], [vec![2], vec![3]]);
+}
+
+/// A stuck exchange whose peers MOVED before getting stuck reports the states they
+/// end on, and names the refusal seen in the last exchange, not the first one.
+#[test]
+fn a_stuck_exchange_reports_the_end_states_and_the_last_refusal() {
+    let mut fake = Fake::conforming()
+        .merging(|a, b| match (a[0], b[0]) {
+            (1, 5) => Err(OracleError::contract("first refusal")),
+            (5, 1) => Ok(vec![3]),
+            (1, 3) => Err(OracleError::contract("last refusal")),
+            _ => Ok(a.to_vec()),
+        })
+        .full_state_only()
+        .validating(single_byte_valid);
+    let outcome = verify_case(
+        &mut fake,
+        &case(ConformanceProperty::StateCommutativity, &[&[1], &[5]]),
+    );
+    let violation = outcome.violation().cloned().expect("a violation");
+    assert_violates(outcome, ConformanceProperty::StateCommutativity);
+    assert_eq!(violation.left, OutputDigest::of(&[1]));
+    assert_eq!(violation.right, OutputDigest::of(&[3]));
+    assert!(
+        violation.detail.contains("last refusal"),
+        "{}",
+        violation.detail
+    );
+    assert!(
+        !violation.detail.contains("first refusal"),
+        "{}",
+        violation.detail
+    );
+}
+
+/// A refusal that leaves the peers stuck on the first run and is gone on the re-run
+/// does not reproduce, so it is not reported.
+#[test]
+fn a_stuck_refusal_that_does_not_reproduce_is_not_reported() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    // The first run makes exactly two merge calls: the exchange reuses both refusals.
+    let calls = Rc::new(Cell::new(0u32));
+    let counter = calls.clone();
+    let mut fake = Fake::conforming()
+        .merging(move |a, b| {
+            counter.set(counter.get() + 1);
+            if counter.get() <= 2 {
+                return Err(OracleError::contract("refused once"));
+            }
+            Ok(union(a, b))
+        })
+        .full_state_only();
+    let outcome = verify_case(
+        &mut fake,
+        &case(ConformanceProperty::StateCommutativity, &[&[1], &[2]]),
+    );
+    assert!(calls.get() > 2, "the re-run never happened");
+    assert!(!outcome.is_violation(), "reported {outcome:?}");
+}
+
+/// A runtime failure inside the exchange is ours, not the contract's: it stays
 /// inconclusive under its own label rather than becoming a finding (#5509).
+///
+/// The initial merges refuse and succeed; the trap is on `merge([1], [3])`, and
+/// `[3]` exists only once the `B` peer has moved inside the exchange.
 #[test]
 fn a_runtime_failure_during_the_refusal_exchange_is_inconclusive() {
-    let mut fake = Fake::conforming().merging(|a, b| {
-        if a == [1] && b == [2] {
-            return Err(OracleError::contract("refused"));
-        }
-        Err(OracleError::runtime("trap"))
-    });
+    let mut fake = Fake::conforming()
+        .merging(|a, b| match (a[0], b[0]) {
+            (1, 2) => Err(OracleError::contract("refused")),
+            (2, 1) => Ok(vec![3]),
+            (1, 3) => Err(OracleError::runtime("trap")),
+            _ => Ok(a.to_vec()),
+        })
+        .full_state_only()
+        .validating(single_byte_valid);
     assert_inconclusive(
         verify_case(
             &mut fake,
@@ -1916,34 +2195,86 @@ fn a_runtime_failure_during_the_refusal_exchange_is_inconclusive() {
     );
 }
 
+/// The same for `validate_state`: the runtime fails validating `[3]`, a state the
+/// commutativity check never validates outside the exchange.
+#[test]
+fn a_runtime_failure_validating_inside_the_refusal_exchange_is_inconclusive() {
+    let mut fake = Fake::conforming()
+        .merging(|a, b| match (a[0], b[0]) {
+            (1, 2) => Err(OracleError::contract("refused")),
+            (2, 1) => Ok(vec![3]),
+            _ => Ok(a.to_vec()),
+        })
+        .full_state_only()
+        .validating(|state| {
+            if state == [3] {
+                Err(OracleError::runtime("trap"))
+            } else {
+                single_byte_valid(state)
+            }
+        });
+    assert_inconclusive(
+        verify_case(
+            &mut fake,
+            &case(ConformanceProperty::StateCommutativity, &[&[1], &[2]]),
+        ),
+        Inconclusive::RuntimeError("trap".into()),
+    );
+}
+
+/// A refusal-derived finding travels as evidence and a recipient reproduces it,
+/// like every other self-verifying finding: the stuck exchange is re-derived from
+/// the two input states alone.
+#[test]
+fn a_stuck_refusal_finding_replays_from_evidence() {
+    let build = || {
+        let refuse = |_: &[u8], _: &[u8]| -> Result<Vec<u8>, OracleError> {
+            Err(OracleError::contract("refused"))
+        };
+        Fake::conforming().merging(refuse).applying(refuse)
+    };
+    let pair = case(ConformanceProperty::StateCommutativity, &[&[1, 2], &[2, 3]]);
+    let observed = verify_case(&mut build(), &pair);
+    assert_violates(observed.clone(), ConformanceProperty::StateCommutativity);
+    let evidence =
+        ConformanceEvidence::new(instance(7), vec![], &pair, observed.violation().cloned());
+    evidence.check_bounds().expect("bounds");
+    let replayed = verify_case(&mut build(), &evidence.to_case().expect("to_case"));
+    assert_eq!(replayed, observed);
+}
+
+/// A Z32 contract: merges and deltas both carry the whole state, so the delta path
+/// takes exactly the merge's decisions.
+fn z32_contract() -> Fake {
+    Fake::conforming()
+        .merging(|a, b| z32_merge(a[0], b[0]).map(|s| vec![s]))
+        .applying(|a, d| z32_merge(a[0], d[0]).map(|s| vec![s]))
+        .deltaing(|state, _| Ok(state.to_vec()))
+        .validating(|state| {
+            if state.len() == 1 && state[0] < 32 {
+                Ok(ValidateResult::Valid)
+            } else {
+                Ok(ValidateResult::Invalid)
+            }
+        })
+}
+
 /// The Z32 model from #5725, exhaustively: a cyclic pick-one merge that refuses only
 /// the step crossing the numeric wrap. Before #5725, the 240 pairs it refuses came
 /// back inconclusive and the commutativity check reported nothing, while the peers
 /// holding them stayed apart for good. Each of those pairs is now a finding, and
 /// every pair the merge accepts still holds.
 ///
-/// The associativity check is not where this hides: a heal-step refusal there is
-/// already a violation (`a_contract_refusing_to_reconcile_its_own_groupings_is_reported`),
-/// so the triple check reports the model too.
+/// The associativity check does not hide this either: a heal-step refusal there is
+/// already a violation (`a_contract_refusing_to_reconcile_its_own_groupings_is_reported`).
+/// Its count is pinned as measured on 2026-11-10.
 #[test]
 fn the_z32_selective_refusal_model_is_reported() {
-    let build = || {
-        Fake::conforming()
-            .merging(|a, b| z32_merge(a[0], b[0]).map(|s| vec![s]))
-            .validating(|state| {
-                if state.len() == 1 && state[0] < 32 {
-                    Ok(ValidateResult::Valid)
-                } else {
-                    Ok(ValidateResult::Invalid)
-                }
-            })
-    };
-
     let (mut holds, mut violations, mut other) = (0, 0, 0);
     for a in 0..32u8 {
         for b in 0..32u8 {
             match verify_case(
-                &mut build(),
+                &mut z32_contract(),
                 &case(ConformanceProperty::StateCommutativity, &[&[a], &[b]]),
             ) {
                 PropertyOutcome::Holds => holds += 1,
@@ -1957,22 +2288,25 @@ fn the_z32_selective_refusal_model_is_reported() {
     }
     assert_eq!((holds, violations, other), (784, 240, 0));
 
-    let mut associativity_violations = 0;
+    let (mut holds, mut violations, mut other) = (0, 0, 0);
     for a in 0..32u8 {
         for b in 0..32u8 {
             for c in 0..32u8 {
-                if verify_case(
-                    &mut build(),
+                match verify_case(
+                    &mut z32_contract(),
                     &case(ConformanceProperty::StateAssociativity, &[&[a], &[b], &[c]]),
-                )
-                .is_violation()
-                {
-                    associativity_violations += 1;
+                ) {
+                    PropertyOutcome::Holds => holds += 1,
+                    PropertyOutcome::Violated(_) => violations += 1,
+                    PropertyOutcome::Inconclusive(_) => other += 1,
                 }
             }
         }
     }
-    assert!(associativity_violations > 0);
+    // 4080 is the heal-step refusal count #5725 measured; each is a violation here.
+    // The 9040 inconclusive triples are refusals while computing a grouping, which
+    // the triple check leaves to the commutativity cases of the same pairs.
+    assert_eq!((holds, violations, other), (19648, 4080, 9040));
 }
 
 /// The merge for [`the_z32_selective_refusal_model_is_reported`]: `b` beats `a` when
