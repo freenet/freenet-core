@@ -917,7 +917,7 @@ fn a_limit_does_not_delay_a_control_sized_exchange() {
 /// `VirtualTime`. Every loss here is random, so the loss gate
 /// (`recycle::loss_gate`) passes none of them to Cubic and the window keeps
 /// growing. Plain Cubic cuts its window by 30% at every loss and takes about
-/// N s (measured with the gate removed).
+/// 14 s (0.75 s with the gate; measured with it removed from the factory).
 #[test]
 fn a_one_mib_message_through_five_percent_random_loss_is_not_slowed_by_it() {
     bounded(|| async move {
