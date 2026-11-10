@@ -864,6 +864,13 @@ impl StreamingInboundStream {
             self.listener = None;
             return Some(Poll::Ready(None));
         }
+        // A QUIC-fed stream whose reader stopped short gets no more
+        // fragments: end with the reason once the ones already here are read
+        // (forks included, which do not see the reader's cancel).
+        if let Some(reason) = self.handle.quic.as_ref().and_then(|quic| quic.ended()) {
+            self.listener = None;
+            return Some(Poll::Ready(Some(Err(reason.error()))));
+        }
         None
     }
 
@@ -1992,6 +1999,40 @@ mod tests {
             // A fork taken after the end sees it too.
             assert!(handle.fork().assemble().await.is_err(), "{reason:?}");
         }
+    }
+
+    /// `chunks()` of a fork of a QUIC-fed stream yields what arrived and then
+    /// ends with the reader's reason when the reader stops short, rather than
+    /// waiting forever (it has no timer, and a fork does not see the cancel).
+    #[tokio::test(start_paused = true)]
+    async fn quic_source_end_ends_a_forks_stream_after_what_arrived() {
+        use super::super::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
+        use futures::StreamExt;
+
+        let total = (FRAGMENT_PAYLOAD_SIZE * 3) as u64;
+        let handle = StreamHandle::new_quic(make_stream_id(), total);
+        let mut stream = handle.fork().stream();
+        handle
+            .push_fragment(1, Bytes::from(vec![1u8; FRAGMENT_PAYLOAD_SIZE]))
+            .unwrap();
+        let reader = tokio::spawn(async move {
+            let mut items = Vec::new();
+            while let Some(item) = stream.next().await {
+                let failed = item.is_err();
+                items.push(item);
+                if failed {
+                    break;
+                }
+            }
+            items
+        });
+        tokio::task::yield_now().await;
+        handle.end_quic_source(QuicSourceEnd::Idle);
+        handle.cancel();
+        let items = reader.await.unwrap();
+        assert_eq!(items.len(), 2, "{items:?}");
+        assert_eq!(items[0].as_ref().unwrap().len(), FRAGMENT_PAYLOAD_SIZE);
+        assert_eq!(items[1], Err(StreamError::InactivityTimeout));
     }
 
     /// A stream that completed before its reader stopped still assembles.
