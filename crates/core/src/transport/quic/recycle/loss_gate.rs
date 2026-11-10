@@ -255,7 +255,11 @@ impl Controller for LossGate {
         is_persistent_congestion: bool,
         lost_bytes: u64,
     ) {
-        if self.state.on_loss(now, lost_bytes, is_persistent_congestion) != Verdict::Ignored {
+        if self
+            .state
+            .on_loss(now, lost_bytes, is_persistent_congestion)
+            != Verdict::Ignored
+        {
             self.inner
                 .on_congestion_event(now, sent, is_persistent_congestion, lost_bytes);
         }

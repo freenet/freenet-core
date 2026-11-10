@@ -675,11 +675,12 @@ fn a_pacer_is_offered_at_most_the_gap_on_a_lossy_live_path() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
         let network = "quic-pacer-lossy-window";
-        let loss = seeded_loss_from(network, 5, 0x5940_0007, Some(Duration::from_millis(100)));
+        let loss = seeded_loss_from(network, 30, 0x5940_0007, Some(Duration::from_millis(100)));
         let p = paths(network, 47, QuicPathLimits::DEFAULT).await;
         let pacer = Scripted::new(&p.time(), usize::MAX, Duration::ZERO);
         p.a.pace_with(pacer.clone());
-        let (elapsed, outcome) = time_a_stream(&p, 8 * MIB).await;
+        let (elapsed, outcome) = time_a_stream(&p, 2 * MIB).await;
+        println!("lossy pacer: {elapsed:?}");
         crate::transport::in_memory_socket::set_packet_delivery_callback(network, None);
         let dropped = loss.dropped.load(Ordering::Relaxed);
         assert!(dropped > 0, "the loss happened");

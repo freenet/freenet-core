@@ -3330,10 +3330,10 @@ fn a_lossy_path_finishes_a_stream_whose_writes_wait_past_the_gap() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
         let network = "quic-path-lossy-gap";
-        let loss = seeded_loss_from(network, 5, 0x5940_0007, Some(Duration::from_millis(100)));
+        let loss = seeded_loss_from(network, 30, 0x5940_0007, Some(Duration::from_millis(100)));
         let p = paths(network, 47, QuicPathLimits::DEFAULT).await;
         let (a, time) = (p.a.clone(), p.time());
-        const LEN: usize = 8 * MIB;
+        const LEN: usize = 2 * MIB;
         let gaps = Arc::new(WriteGaps::new(time.clone()));
         let watched = gaps.clone();
         let sent = p

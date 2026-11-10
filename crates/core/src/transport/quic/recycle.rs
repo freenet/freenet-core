@@ -429,7 +429,11 @@ impl CappedCubic {
     /// The loss gate inside, if the wrapped controller is one.
     #[cfg(test)]
     pub(crate) fn gate(&self) -> Option<Box<LossGate>> {
-        self.inner.clone_box().into_any().downcast::<LossGate>().ok()
+        self.inner
+            .clone_box()
+            .into_any()
+            .downcast::<LossGate>()
+            .ok()
     }
 }
 

@@ -123,7 +123,11 @@ fn a_heavy_loss_share_counts_with_no_queue() {
         }
         now += rtt;
     }
-    assert!(gate.loss_share() >= LOSS_SHARE_CEILING, "{}", gate.loss_share());
+    assert!(
+        gate.loss_share() >= LOSS_SHARE_CEILING,
+        "{}",
+        gate.loss_share()
+    );
     assert_eq!(verdicts.last(), Some(&Verdict::LossShare));
     assert_eq!(verdicts.first(), Some(&Verdict::Ignored));
 }
@@ -144,7 +148,11 @@ fn fifteen_percent_loss_stays_under_the_share_ceiling() {
         }
         now += rtt;
     }
-    assert!((gate.loss_share() - 0.15).abs() < 0.02, "{}", gate.loss_share());
+    assert!(
+        (gate.loss_share() - 0.15).abs() < 0.02,
+        "{}",
+        gate.loss_share()
+    );
 }
 
 /// A round with too few datagrams does not move the share: one loss in a
