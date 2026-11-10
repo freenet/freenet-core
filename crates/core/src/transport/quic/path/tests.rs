@@ -2320,13 +2320,159 @@ fn dropping_the_path_cancels_streams_in_progress() {
             .await;
         let arrival = p.b_in.streams.try_recv().expect("announced");
         assert!(!arrival.handle.is_cancelled());
+        // A fork does not share the handle's cancel; it must still end.
+        let fork = arrival.handle.fork();
+        let forked = tokio::spawn(async move { fork.assemble().await });
         let b =
             Arc::try_unwrap(std::mem::replace(&mut p.b, p.a.clone())).expect("the only reference");
         drop(b);
         // The receive task is aborted on its next poll.
         p.drive(async { tokio::task::yield_now().await }).await;
         assert!(arrival.handle.is_cancelled());
+        let forked = p.drive(async move { forked.await.unwrap() }).await;
+        assert_eq!(forked, Err(StreamError::Cancelled));
         drop(open);
+    })
+}
+
+/// Write the first `split` bytes of a `total`-byte Stream frame on a new
+/// stream of `p.a`, let them reach `b`, and return the open stream and
+/// `b`'s announcement of it.
+async fn half_sent_stream(
+    p: &mut Paths,
+    body: &[u8],
+    split: usize,
+) -> (quinn::SendStream, InboundStreamArrival) {
+    let conn = p.a_raw();
+    let mut first = header(1, 1, StreamId::next().0, body.len() as u64, 0);
+    first.extend_from_slice(&body[..split]);
+    let time = p.time();
+    let send = p
+        .drive(async move {
+            let mut send = conn.open_uni().await.unwrap();
+            send.write_all(&first).await.unwrap();
+            time.sleep(Duration::from_secs(1)).await;
+            send
+        })
+        .await;
+    let arrival = p.b_in.streams.try_recv().expect("announced");
+    (send, arrival)
+}
+
+/// Assemble `arrival` through a clone and a fork of its handle, on a task.
+fn assemble_both(
+    arrival: &InboundStreamArrival,
+) -> tokio::task::JoinHandle<(Result<Vec<u8>, StreamError>, Result<Vec<u8>, StreamError>)> {
+    let handle = arrival.handle.clone();
+    let fork = arrival.handle.fork();
+    tokio::spawn(async move { tokio::join!(handle.assemble(), fork.assemble()) })
+}
+
+/// A QUIC-fed stream whose sender is silent for longer than the UDP
+/// transport's fragment gap (`STREAM_INACTIVITY_TIMEOUT`, 5 s) and shorter
+/// than the path's idle limit still assembles, through the handle and a fork.
+/// quinn's retransmit backoff at a high RTT with loss leaves such gaps in a
+/// stream it then delivers. The gap passes on both clocks: the path's virtual
+/// one, under the idle limit, and tokio's paused one, which `assemble()`'s
+/// UDP timer runs on.
+#[test]
+fn a_quic_fed_stream_assembles_across_a_gap_past_the_udp_limit() {
+    bounded(|| async move {
+        use crate::transport::peer_connection::streaming::STREAM_INACTIVITY_TIMEOUT;
+        let _seed = GlobalRng::seed_guard(SEED);
+        let mut p = paths("quic-path-gap", 200, QuicPathLimits::DEFAULT).await;
+        tokio::time::pause();
+        let idle = streaming_handle_idle_timeout();
+        let gap = idle - Duration::from_secs(5);
+        assert!(gap > STREAM_INACTIVITY_TIMEOUT * 4, "premise: {gap:?}");
+        let body = payload(10_000);
+        let (mut send, arrival) = half_sent_stream(&mut p, &body, 5000).await;
+        assert!(!arrival.handle.is_complete(), "premise: half sent");
+        let assembled = assemble_both(&arrival);
+        let time = p.time();
+        let rest = body[5000..].to_vec();
+        p.drive(async move {
+            tokio::time::advance(gap).await;
+            time.sleep(gap).await;
+            send.write_all(&rest).await.unwrap();
+            send.finish().unwrap();
+            send.stopped().await.ok();
+        })
+        .await;
+        let (handle, fork) = p.drive(async move { assembled.await.unwrap() }).await;
+        assert_eq!(handle.as_deref(), Ok(&body[..]));
+        assert_eq!(fork.as_deref(), Ok(&body[..]));
+        assert_eq!(
+            p.b.stats().shared_count(InboundStreamOutcome::EvictedIdle),
+            0
+        );
+    })
+}
+
+/// A QUIC-fed stream whose sender goes silent ends for every consumer when
+/// the path evicts it idle, with `InactivityTimeout`, forks included (a fork
+/// does not see the handle's cancel), and not before.
+#[test]
+fn a_quic_fed_stream_evicted_idle_ends_every_consumer_with_inactivity() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let mut p = paths("quic-path-gap-idle", 201, QuicPathLimits::DEFAULT).await;
+        let idle = streaming_handle_idle_timeout();
+        let body = payload(10_000);
+        let (send, arrival) = half_sent_stream(&mut p, &body, 5000).await;
+        let assembled = assemble_both(&arrival);
+        let time = p.time();
+        let started = time.now_nanos();
+        let ((handle, fork), ended) = p
+            .drive(async move {
+                let ended = assembled.await.unwrap();
+                (ended, time.now_nanos())
+            })
+            .await;
+        assert_eq!(handle, Err(StreamError::InactivityTimeout));
+        assert_eq!(fork, Err(StreamError::InactivityTimeout));
+        let waited = Duration::from_nanos(ended - started);
+        assert!(
+            waited + Duration::from_secs(1) >= idle,
+            "ended after {waited:?}, before the idle limit {idle:?}"
+        );
+        assert_eq!(
+            p.b.stats().shared_count(InboundStreamOutcome::EvictedIdle),
+            1
+        );
+        drop(send);
+    })
+}
+
+/// A panic in the receive task ends a stream it was receiving for every
+/// consumer, forks included: unwinding drops the stream's reader.
+#[test]
+fn a_panicking_receive_task_ends_a_stream_in_progress_for_forks() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let limits = QuicPathLimits {
+            panic_in_receive: true,
+            ..QuicPathLimits::DEFAULT
+        };
+        let mut p = paths("quic-path-gap-panic", 202, limits).await;
+        let body = payload(10_000);
+        let (send, arrival) = half_sent_stream(&mut p, &body, 5000).await;
+        let assembled = assemble_both(&arrival);
+        let a = p.a.clone();
+        let (handle, fork) = p
+            .drive(async move {
+                // The send itself may fail when the connection closes.
+                a.send_short(b"boom").await.ok();
+                assembled.await.unwrap()
+            })
+            .await;
+        assert_eq!(handle, Err(StreamError::Cancelled));
+        assert_eq!(fork, Err(StreamError::Cancelled));
+        assert_eq!(
+            p.b.stats().count(QuicInboundOutcome::ReceiveTaskPanicked),
+            1
+        );
+        drop(send);
     })
 }
 

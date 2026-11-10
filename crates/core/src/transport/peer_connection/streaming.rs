@@ -52,7 +52,58 @@ use super::streaming_buffer::LockFreeStreamBuffer;
 /// A 5-second gap between fragments is conclusive evidence the stream is dead.
 /// The previous 30s value caused users to wait 30s+ before retry on stalled streams
 /// (0.9% of all transfers), turning a sub-second retry into a 30-40s experience.
+///
+/// It applies to streams the UDP transport fills. A stream a QUIC path fills
+/// ([`StreamHandle::new_quic`]) has no gap limit at the consumer: quinn
+/// retransmits until the path's own rules end the stream, and at a high RTT
+/// with loss its retransmit backoff can leave more than 5 s between two
+/// completed fragments of a stream it will still deliver.
 pub const STREAM_INACTIVITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Why the reader of a QUIC-fed stream stopped before the stream completed
+/// ([`StreamHandle::end_quic_source`]). More reasons may be added as the
+/// reader gains rules; each maps to the [`StreamError`] consumers see.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QuicSourceEnd {
+    /// The stream received nothing for the reader's idle limit
+    /// (`streaming_handle_idle_timeout`). Consumers see
+    /// [`StreamError::InactivityTimeout`], as on the UDP transport.
+    Idle,
+    /// The stream passed its age limit (`inbound_stream_age_limit`).
+    /// Consumers see [`StreamError::Cancelled`].
+    Age,
+    /// Any other end: truncated, overlong, reset or refused, the consumers
+    /// gone, the reader's task ended or panicked, or the path or connection
+    /// closed. Consumers see [`StreamError::Cancelled`].
+    Ended,
+}
+
+impl QuicSourceEnd {
+    fn error(self) -> StreamError {
+        match self {
+            QuicSourceEnd::Idle => StreamError::InactivityTimeout,
+            QuicSourceEnd::Age | QuicSourceEnd::Ended => StreamError::Cancelled,
+        }
+    }
+}
+
+/// The source of a QUIC-fed stream, shared by every clone and fork of its
+/// handle: why its reader stopped, once it has.
+#[derive(Debug, Default)]
+pub(crate) struct QuicSource {
+    end: std::sync::OnceLock<QuicSourceEnd>,
+}
+
+impl QuicSource {
+    /// Record why the reader stopped. The first reason stays.
+    pub(crate) fn end(&self, reason: QuicSourceEnd) {
+        let _ = self.end.set(reason);
+    }
+
+    fn ended(&self) -> Option<QuicSourceEnd> {
+        self.end.get().copied()
+    }
+}
 
 /// Allowance for the envelope around the largest payloads in
 /// [`MAX_STREAM_TOTAL_BYTES`]: the serialized `NetMessage` / streaming-payload
@@ -251,6 +302,11 @@ pub struct StreamHandle {
     stream_id: StreamId,
     /// Total expected bytes.
     total_bytes: u64,
+    /// Set when a QUIC path's reader fills the stream
+    /// ([`StreamHandle::new_quic`]); `None` for the UDP transport. Shared by
+    /// forks, which do not share `sync`, so a fork learns from it that no
+    /// more fragments will come.
+    quic: Option<Arc<QuicSource>>,
 }
 
 impl StreamHandle {
@@ -262,6 +318,46 @@ impl StreamHandle {
         Self::from_buffer(stream_id, LockFreeStreamBuffer::new(total_bytes))
     }
 
+    /// A handle for a stream a QUIC path's reader fills. [`Self::assemble`]
+    /// applies no gap limit of its own to it: it waits until the stream
+    /// completes, the handle is cancelled, or the reader records why it
+    /// stopped ([`Self::end_quic_source`]). The reader's own rules bound that
+    /// wait: its idle and age limits, and the path or connection ending,
+    /// which drops the reader.
+    pub(crate) fn new_quic(stream_id: StreamId, total_bytes: u64) -> Self {
+        Self {
+            quic: Some(Arc::new(QuicSource::default())),
+            ..Self::new(stream_id, total_bytes)
+        }
+    }
+
+    /// The source of a QUIC-fed stream, for its reader to record why it
+    /// stopped; `None` for the UDP transport.
+    pub(crate) fn quic_source(&self) -> Option<&Arc<QuicSource>> {
+        self.quic.as_ref()
+    }
+
+    /// Record that the reader of a QUIC-fed stream stopped before the stream
+    /// completed, and wake every waiter, forks included. The first reason
+    /// stays. No-op on a UDP-fed stream.
+    pub(crate) fn end_quic_source(&self, reason: QuicSourceEnd) {
+        if let Some(quic) = &self.quic {
+            quic.end(reason);
+            self.buffer.notifier().notify(usize::MAX);
+        }
+    }
+
+    /// The longest gap between two fragments a consumer of this stream
+    /// should expect before it fails: [`STREAM_INACTIVITY_TIMEOUT`] for the
+    /// UDP transport, and the reader's idle limit for a QUIC-fed stream.
+    pub(crate) fn fragment_gap_limit(&self) -> std::time::Duration {
+        if self.quic.is_some() {
+            super::streaming_handle_idle_timeout()
+        } else {
+            STREAM_INACTIVITY_TIMEOUT
+        }
+    }
+
     fn from_buffer(stream_id: StreamId, buffer: LockFreeStreamBuffer) -> Self {
         let total_bytes = buffer.total_bytes();
         Self {
@@ -269,6 +365,7 @@ impl StreamHandle {
             sync: Arc::new(parking_lot::RwLock::new(SyncState::new())),
             stream_id,
             total_bytes,
+            quic: None,
         }
     }
 
@@ -443,6 +540,7 @@ impl StreamHandle {
             sync: Arc::new(parking_lot::RwLock::new(sync)),
             stream_id: self.stream_id,
             total_bytes: self.total_bytes,
+            quic: self.quic.clone(),
         }
     }
 
@@ -512,10 +610,13 @@ impl StreamHandle {
     /// This is useful when you don't need incremental processing.
     /// Uses the buffer's built-in Notify for efficient async waiting.
     ///
-    /// Includes an inactivity timeout ([`STREAM_INACTIVITY_TIMEOUT`]): if no new
-    /// fragment arrives within the timeout window, returns
-    /// [`StreamError::InactivityTimeout`]. This prevents operations from hanging
-    /// forever when the sending peer's connection dies mid-transfer.
+    /// On a UDP-fed stream it includes an inactivity timeout
+    /// ([`STREAM_INACTIVITY_TIMEOUT`]): if no new fragment arrives within the
+    /// timeout window, returns [`StreamError::InactivityTimeout`]. This
+    /// prevents operations from hanging forever when the sending peer's
+    /// connection dies mid-transfer. A QUIC-fed stream ([`Self::new_quic`])
+    /// has no timer here: it ends when its reader records why it stopped
+    /// (`InactivityTimeout` for idle, `Cancelled` otherwise).
     pub async fn assemble(&self) -> Result<Vec<u8>, StreamError> {
         self.assemble_inner(|| {}).await
     }
@@ -529,6 +630,18 @@ impl StreamHandle {
             // check notifies this listener instead of going unseen until the
             // inactivity timeout (#5785).
             let listener = self.buffer.notifier().listen();
+
+            // A QUIC-fed stream whose reader stopped short gets no more
+            // fragments. Checked before `cancelled`, which the reader also
+            // sets on its own clones, so the reason (idle or not) reaches
+            // clones and forks alike. The reader records an end only when
+            // the stream did not complete.
+            if let Some(reason) = self.quic.as_ref().and_then(|quic| quic.ended()) {
+                if let Some(data) = self.buffer.assemble() {
+                    return Ok(data);
+                }
+                return Err(self.quic_source_ended(reason));
+            }
 
             // Check cancelled state
             if self.sync.read().cancelled {
@@ -561,6 +674,14 @@ impl StreamHandle {
             }
 
             before_wait();
+
+            // A QUIC-fed stream has no gap limit here: quinn retransmits until
+            // the reader's own rules end the stream, and the reader then
+            // records why (checked above) and wakes this listener.
+            if self.quic.is_some() {
+                listener.await;
+                continue;
+            }
 
             // Wait for notification with inactivity timeout.
             // Each arriving fragment triggers a notification, so the timeout resets
@@ -597,6 +718,30 @@ impl StreamHandle {
                 }
             }
         }
+    }
+}
+
+impl StreamHandle {
+    /// Count and report the end of a QUIC-fed stream whose reader stopped
+    /// before it completed, as the UDP path's timeout and cancel are counted.
+    fn quic_source_ended(&self, reason: QuicSourceEnd) -> StreamError {
+        let received = Some(self.buffer.inserted_count() as u32);
+        let total = Some(self.buffer.total_fragments() as u32);
+        let error = reason.error();
+        match error {
+            StreamError::InactivityTimeout => {
+                tracing::warn!(
+                    stream_id = %self.stream_id.0,
+                    total_bytes = self.total_bytes,
+                    received_fragments = self.buffer.inserted_count(),
+                    total_fragments = self.buffer.total_fragments(),
+                    "Stream assembly ended: the QUIC path received nothing for its idle limit"
+                );
+                crate::node::network_status::record_stream_recv_abort_inactivity(received, total);
+            }
+            _ => crate::node::network_status::record_stream_recv_abort_cancelled(received, total),
+        }
+        error
     }
 }
 
@@ -1785,6 +1930,103 @@ mod tests {
             "Inactivity timeout should fire within ~5s, took {:?}",
             elapsed
         );
+    }
+
+    /// A QUIC-fed stream has no 5 s gap at the consumer: its handle and a
+    /// fork wait through gaps of 6 s and 25 s and assemble, where a UDP-fed
+    /// stream fails at 5 s (above). quinn's retransmit backoff at a high RTT
+    /// with loss leaves such gaps in a stream it then delivers.
+    #[tokio::test(start_paused = true)]
+    async fn quic_fed_assemble_waits_past_the_udp_gap() {
+        use super::super::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
+        use std::time::Duration;
+
+        let total = (FRAGMENT_PAYLOAD_SIZE * 3) as u64;
+        let handle = StreamHandle::new_quic(make_stream_id(), total);
+        let fork = handle.fork();
+        let (a, b) = (handle.clone(), fork.clone());
+        let consumers = tokio::spawn(async move { tokio::join!(a.assemble(), b.assemble()) });
+        for (number, gap) in [(1u32, 0u64), (2, 6), (3, 25)] {
+            tokio::time::sleep(Duration::from_secs(gap)).await;
+            handle
+                .push_fragment(
+                    number,
+                    Bytes::from(vec![number as u8; FRAGMENT_PAYLOAD_SIZE]),
+                )
+                .unwrap();
+        }
+        let (a, b) = consumers.await.unwrap();
+        assert_eq!(a.unwrap().len(), total as usize);
+        assert_eq!(b.unwrap().len(), total as usize);
+    }
+
+    /// When the reader of a QUIC-fed stream records why it stopped, every
+    /// waiting consumer ends at once with that reason's error: a fork too,
+    /// which does not share the handle's cancel. The first reason stays.
+    #[tokio::test(start_paused = true)]
+    async fn quic_source_end_ends_clones_and_forks_with_its_reason() {
+        use super::super::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
+
+        for (reason, expected) in [
+            (QuicSourceEnd::Idle, StreamError::InactivityTimeout),
+            (QuicSourceEnd::Age, StreamError::Cancelled),
+            (QuicSourceEnd::Ended, StreamError::Cancelled),
+        ] {
+            let total = (FRAGMENT_PAYLOAD_SIZE * 2) as u64;
+            let handle = StreamHandle::new_quic(make_stream_id(), total);
+            handle
+                .push_fragment(1, Bytes::from(vec![1u8; FRAGMENT_PAYLOAD_SIZE]))
+                .unwrap();
+            let (a, b) = (handle.clone(), handle.fork());
+            let consumers = tokio::spawn(async move { tokio::join!(a.assemble(), b.assemble()) });
+            tokio::task::yield_now().await;
+            let start = tokio::time::Instant::now();
+            // As the reader does: record the reason, then cancel its clone.
+            handle.end_quic_source(reason);
+            handle.end_quic_source(QuicSourceEnd::Ended);
+            handle.cancel();
+            let (a, b) = consumers.await.unwrap();
+            assert_eq!(a, Err(expected.clone()), "{reason:?}");
+            assert_eq!(b, Err(expected), "{reason:?}");
+            assert_eq!(start.elapsed(), std::time::Duration::ZERO, "{reason:?}");
+            // A fork taken after the end sees it too.
+            assert!(handle.fork().assemble().await.is_err(), "{reason:?}");
+        }
+    }
+
+    /// A stream that completed before its reader stopped still assembles.
+    #[tokio::test(start_paused = true)]
+    async fn quic_source_end_after_completion_still_assembles() {
+        use super::super::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
+
+        let total = FRAGMENT_PAYLOAD_SIZE as u64;
+        let handle = StreamHandle::new_quic(make_stream_id(), total);
+        handle
+            .push_fragment(1, Bytes::from(vec![1u8; FRAGMENT_PAYLOAD_SIZE]))
+            .unwrap();
+        handle.end_quic_source(QuicSourceEnd::Ended);
+        assert_eq!(
+            handle.fork().assemble().await.unwrap().len(),
+            total as usize
+        );
+    }
+
+    /// The gap a consumer of `chunks()` should time out at: 5 s for a
+    /// UDP-fed stream, the QUIC reader's idle limit for a QUIC-fed one, and
+    /// forks keep it.
+    #[test]
+    fn fragment_gap_limit_follows_the_transport() {
+        let udp = StreamHandle::new(make_stream_id(), 10);
+        assert_eq!(udp.fragment_gap_limit(), STREAM_INACTIVITY_TIMEOUT);
+        assert_eq!(udp.fork().fragment_gap_limit(), STREAM_INACTIVITY_TIMEOUT);
+        let quic = StreamHandle::new_quic(make_stream_id(), 10);
+        let idle = super::super::streaming_handle_idle_timeout();
+        assert!(idle > STREAM_INACTIVITY_TIMEOUT);
+        assert_eq!(quic.fragment_gap_limit(), idle);
+        assert_eq!(quic.fork().fragment_gap_limit(), idle);
+        // A UDP-fed stream has no source to end.
+        udp.end_quic_source(QuicSourceEnd::Idle);
+        assert!(udp.quic_source().is_none());
     }
 
     #[tokio::test]
