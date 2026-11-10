@@ -3313,6 +3313,50 @@ mod tests {
         Ok(())
     }
 
+    /// A relay piping a QUIC-fed inbound stream onward waits on its source
+    /// with the source's own gap limit, not the UDP 5 s: a 6 s gap between
+    /// two fragments (quinn's retransmit backoff at a high RTT with loss)
+    /// does not fail the pipe, where the same gap on a UDP-fed source does
+    /// (`pipe_stream_inactivity_stall_fails_stream_not_connection`).
+    #[tokio::test(start_paused = true)]
+    async fn pipe_stream_waits_out_a_quic_fed_source_gap_past_five_seconds() {
+        use crate::transport::peer_connection::streaming::StreamHandle;
+        use crate::transport::peer_connection::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
+
+        let (outbound_sender, mut outbound_receiver) = mpsc::channel(1000);
+        let drain = tokio::spawn(async move { while outbound_receiver.recv().await.is_some() {} });
+        let remote_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080);
+        let total = FRAGMENT_PAYLOAD_SIZE * 2;
+        let source = StreamHandle::new_quic(StreamId::next(), total as u64);
+        let pipe_task = GlobalExecutor::spawn(pipe_stream(
+            source.fork().into(),
+            StreamId::next(),
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(TestSocket::new(outbound_sender)),
+            remote_addr,
+            random_cipher(),
+            Arc::new(parking_lot::Mutex::new(SentPacketTracker::new())),
+            Arc::new(TokenBucket::new(1_000_000, 100_000_000)),
+            big_cwnd(),
+            RealTime::new(),
+            None,
+            None,
+        ));
+        source
+            .push_fragment(1, Bytes::from(vec![1u8; FRAGMENT_PAYLOAD_SIZE]))
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        source
+            .push_fragment(2, Bytes::from(vec![2u8; FRAGMENT_PAYLOAD_SIZE]))
+            .unwrap();
+        let stats = pipe_task
+            .await
+            .expect("join error")
+            .expect("a 6 s gap on a QUIC-fed source is not a stall");
+        assert_eq!(stats.bytes_transferred, total as u64);
+        drain.abort();
+    }
+
     /// Regression test for #4345 (relay-pipe inbound-stream-error path,
     /// outbound_stream.rs:471): when the UPSTREAM inbound stream yields an
     /// error, pipe_stream must fail only THIS stream — not the DOWNSTREAM
