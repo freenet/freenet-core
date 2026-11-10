@@ -239,7 +239,12 @@ that reach LONG_WAIT
 upstream stream for relayed streams, and the rest): egress_long_waits_<cause>,
 egress_streams_abandoned_<cause>, egress_streams_refused_<cause>. Each has
 its own rate-limited WARN with one line per cause seen since the last, each
-with its count and remedy; the per-stream abandonment line is at debug. The
+with its count and remedy; the per-stream abandonment line is at debug. A
+stream abandoned at the deadline (the cwnd-wait check or a capped Abandon)
+signals StreamSendOutcome::EgressAbandoned on its completion_tx, not
+Dropped, so the UPDATE broadcast counters can name the cause per contract
+(#6143). Every consumer treats any outcome other than Delivered as not
+delivered; keep it that way when adding a variant. The
 cap counts UDP payload, not IP/UDP headers.
 EgressCap::poll_admit is the poll form for a sender that is polled (the QUIC
 endpoint's UdpPoller, #5940): Ready exactly when try_take would succeed at
@@ -282,6 +287,49 @@ VirtualTime). In a simulation the endpoint runs on the network's
 VirtualTime, so bind_udp_listener refuses a simulated node with both
 transport-quic and total-bandwidth-limit.
 Tests assert on per-cap EgressCap::stats(), never the global counters.
+```
+
+### Retransmit cap (legacy UDP, #6147)
+
+```
+With a cap, RTO resends and TLP probes go through EgressCap::admit_retransmit
+from the resend arm of PeerConnection::recv: NO await, NO lock (share meter
+CAS, then bucket CAS; a bucket refusal only refunds the share). Takes only
+while retransmits < RETX_SHARE_PERCENT (50%) of the rate over
+RETX_SHARE_WINDOW (1 s, at least one datagram) AND bucket debt after the take
+<= RETX_DEBT_LIMIT (100 ms). Nothing retransmitted is forgiven.
+Refused RTO resend: state UNCHANGED (count, backoff, send time), timer
+re-armed at max(wait, RETX_DEFER_MIN = 2 ms), capped at the deferral limit:
+once the CONNECTION's resends have been refused for RETX_DEFER_LIMIT_RTOS (1)
+effective RTO in a row (RetxDeferral: from the first refusal, not the RTO
+deadline, since a backoff reset moves every deadline; per connection, not
+per packet, since only the queue head is asked) every due resend goes
+UNCAPPED (charged unpaced) until the cap takes one or nothing due is
+refused. Do NOT remove that limit: the count moves only when a
+resend goes, so an unbounded deferral (unpaced debt > 100 ms, or a tiny cap)
+never abandons the packet and pins flight (#4345). Refused probe: skipped,
+marked probed. Abandonment never asks the cap. No cap -> nothing asked.
+A SHARE refusal BOOKS the next slot in the share (RetxDeferral,
+at most one booking per connection; refunded on run end, which an ack leads
+to, on a dropped take and on going uncapped; a closed connection loses at
+most that one datagram), so waiting connections wake one per slot; a BUCKET
+refusal waits for the next free datagram time among bucket-refused
+retransmits, two slots per datagram time (retx_bucket_next_ns, RETX_BUCKET_SPACING_DIV = 2; a timing hint, nothing paid; its lead is clamped to half the deferral limit, since slots are never handed back). Booking on
+bucket refusals too was tried and cost 1 MB/s storm streams (383 vs 550):
+it paced bucket-limited repairs at the share rate. Without
+it they all woke on the same deficit and node-wide wakes grew with N (97k/s
+at 256 connections); pinned by
+share_waiters_wake_once_per_slot_whatever_their_number. Booking, take and
+refund are atomics only: nothing under the sent_tracker lock takes a lock.
+Counters: egress_retransmits_deferred (refusals, not packets),
+egress_retransmits_uncapped(_bytes), egress_probes_skipped.
+The share is NODE-WIDE: one lossy peer can use it; the deferral limit bounds
+how long another connection's resend is held (one RTO).
+Flight bound: (M+1) x (60 s RTO cap + PTO + floor + yield) + min(all
+remaining retransmits at the share, (M+1) x (one RTO + uncapped drain));
+derivation term by term in the flight_drain_bound rustdoc; pinned by
+link_model::storm_tests::flight_drain_bound and
+sent_packet_tracker::held_cap_debt_cannot_stop_abandonment.
 ```
 
 ### WHEN modifying congestion control
@@ -1136,7 +1184,7 @@ doc has the transition table.
   seed may come off a clock with another epoch. A promotion's first offer waits
   for the later of the seed and its own delay. e5a-5b must carry it per peer key
   across a replaced session, or a session that flaps retries at session rate.
-  Failures: close codes 1, 3, 4, 5 and 6, a lost connection, an idle timeout and a
+  Failures: close codes 1, 3, 4, 5, 6 and 8, a lost connection, an idle timeout and a
   deadline each mean fallback plus normal backoff, then a new offer. Never a
   permanent downgrade. Identity: close code 2 received, or Event::IdentityMismatch
   (closes with IDENTITY_MISMATCH). A TLS failure during the handshake
@@ -1263,7 +1311,7 @@ snapshot except the two gauges.
   offered and declined_uncharged. Both sides count `established`; only the
   offerer's is the numerator. Counts are node-wide; there is no per-pair series.
   `quic_fallback_<label>` (`QuicFallback`): idle, reset, protocol, downgrade_rx,
-  endpoint_down, session_ended_rx. Paths that had been active only; an attempt
+  endpoint_down, session_ended_rx, over_budget_rx. Paths that had been active only; an attempt
   that ends in setup is counted in `quic_upgrade_*`. A close this node sent for
   send_abort_limit or peer_not_acknowledging reaches the machine as a lost
   connection, so it counts as `reset`; its count is `quic_close_sent_*`. A key
@@ -1294,10 +1342,12 @@ snapshot except the two gauges.
   negative. Subtract only over windows much longer than 150 s (an hour or a
   day). The Step 2 gate, fallbacks per path-day excluding endpoint and
   restart causes, is then
-    (sum over c in idle, reset, protocol, downgrade_rx of
+    (sum over c in idle, reset, protocol, downgrade_rx, over_budget_rx of
        quic_fallback_<c> - quic_churned_fallback_<c>) / path-days,
   with endpoint_down and session_ended_rx left out entirely (session_ended_rx
-  is churn by definition). It is a lower bound on fallbacks where QUIC failed
+  is churn by definition). over_budget_rx is in the sum: it is a close that
+  counted as downgrade_rx before OVER_BUDGET existed (a peer's second trip
+  past the gap cap), and a release before the code counts it as reset. It is a lower bound on fallbacks where QUIC failed
   while UDP kept working: any session end within the window counts, including
   one that the QUIC failure itself caused.
   `quic_close_received_<label>`: one per QUIC connection quinn reports as closed
@@ -1373,7 +1423,17 @@ a test passes its own; tests read their own, never the global).
   path's route still carried data); quic_streams_sampled_paths,
   quic_streams_open_ge_<8|16|32|48> and quic_streams_peak_max (per path and period,
   the peak of inbound streams read at once, counted as inbound_concurrency counts
-  connections).
+  connections); quic_send_resets (sends a path reset on this side, counted by
+  recycle::SendAborts while the connection is open) and quic_path_ms (time QUIC
+  paths were up, shadow ones included, added at each tick of the acknowledgement
+  watch; the last tick to a path's end is not counted), whose ratio over a long
+  window is resets per connection-hour (a path whose acknowledgement watch is
+  off or panicked stops adding time but not resets, so the ratio errs high;
+  each is logged, at WARN and ERROR); quic_send_resets_reached_<64|512|2048|4096>
+  and quic_send_resets_path_max (paths whose lifetime reset count reached each
+  level in the period, and the highest count a reset in the period took a path
+  to). They are for the fixed charge, which takes quinn's stopped map at
+  SEND_ABORT_LIMIT x QUIC_STOPPED_ENTRY_BYTES until field data justifies less.
   A family is the keys of one label list under one prefix
   (`QuicDataSnapshot::keys_by_family`). No other key starts with a family's
   prefix or with the prefix sibling families share (`quic_data_` for the send,
@@ -1924,6 +1984,12 @@ Sending (QuicPath::send_short_bounded / send_stream_bounded /
   surfaced through a write or through stopped(), is not one; nor is a reset
   on a closed connection) and closes the connection past
   recycle::SEND_ABORT_LIMIT (4096) with close code SEND_ABORT_LIMIT (M6).
+  The fixed charge per connection (config::QUIC_CONNECTION_CHARGE_BYTES,
+  840 KiB) takes the map at that worst case, 4096 x QUIC_STOPPED_ENTRY_BYTES
+  (104 B, measured 88 B). Polling stopped() only after finish() would not
+  avoid the entries: a writer blocked on connection credit must still race
+  stopped() (below), so the poll stays on every wait and the common resets
+  register anyway.
   Every write, and the wait for a source's next chunk, races the
   stream's stopped() future and resets on a stop:
   quinn-proto 0.11.19 does not report STOP_SENDING to a writer blocked on
@@ -1943,6 +2009,43 @@ Receiving: one task per connection reads every stream (FuturesUnordered,
   close code DOWNGRADE (the peer falls back to UDP). Short
   and Control go to bounded channels (full: dropped and counted); Stream
   goes through the INBOUND ADAPTER (path/inbound.rs).
+Unordered reads: the header, the metadata, and short and control bodies are
+  read IN ORDER (read_chunk(_, true)): quinn holds what arrives past a gap
+  without returning credit for it, so the connection window bounds it. A
+  Stream's payload, once charged, is read with read_chunk(_, false), so
+  quinn hands over each piece as it arrives, gap or not, and it is written at
+  its offset into the charged buffer (the Rechunker stages a fragment until it
+  is whole and holds the one that completes the stream until its end).
+  → NEVER read unordered before the header is known: an unordered read
+    returns the peer's credit for every byte read, so bytes read past a
+    missing header have no bound but the age limit.
+  → Switch only once an in-order read would block (BodyReader::next_unordered
+    drains what is contiguous first): quinn-proto 0.11.19 does not trim a
+    buffered resend against the read position at the switch, and read
+    unordered it counts those bytes as read again, so bytes_read passes the
+    final size, the end is never reported, and Recv::stop underflows.
+  A gap costs one received range (quinn's recvd set and our mirror, ~70 B);
+  gaps are counted per stream as ranges past the first, and a connection's
+  streams may hold at most inbound::MAX_GAPS_PER_CONNECTION (2,048), past
+  which the stream is stopped EVICTED and counted too_many_ranges. quinn
+  keeps a stopped stream's recvd until the peer sends FIN or RESET, and after
+  a stop nothing tells us when (received_reset returns at once). After a stop
+  quinn adds nothing to recvd, and a stopped stream holds state only while it
+  holds its slot, so at most MAX_UNI_STREAMS of them at once: the count takes
+  the sum of the MAX_UNI_STREAMS largest frozen gap counts, not of all of
+  them, so it does not grow with the connection's age; after KEPT_GAPS_GRACE
+  (30 s) each counts 32 less (a quinn peer resets a stopped stream within a
+  round trip). A second trip past the cap closes the path with
+  OVER_BUDGET (closed_too_many_ranges). A Stream waiting for room in the
+  delivery channel reads its payload but NOT its end until it is announced
+  (reading the end frees quinn's slot, and the slots bound how many streams
+  can wait); one that ends short fails Truncated at once. While it waits it
+  is evicted idle if its payload stops arriving; once the payload is all
+  here only the age limit applies. A byte past the
+  declared end is Overlong as soon as it arrives, so an overlong stream can
+  fail before it is announced. GRO stays off (QuicSocket::max_receive_segments
+  is 1, pinned): with GRO a 1-byte chunk would keep a whole batch. quinn-proto
+  must be 0.11.17 or later within 0.11 (pinned from Cargo.lock).
 Inbound adapter: a Stream's payload goes into an ordinary StreamHandle,
   re-chunked to the UDP fragment shape (fragment i = bytes
   [(i-1)F, iF), F = FRAGMENT_PAYLOAD_SIZE), so fork / assemble / pipe /
@@ -2120,6 +2223,8 @@ QUIC send route (#5940 e5b-6, quic/upgrade/data_route.rs,
   Fallback: QuicPath::settle counts an outcome and path::route::next_step says what
   happens next. A message goes on UDP only when the outcome proves the receiver
   cannot deliver it:
+    (StreamSendOutcome is Delivered, Dropped, or EgressAbandoned, which only
+    a UDP stream at the egress deadline reports; see "Node-wide egress cap".)
     Sent: done (StreamSendOutcome::Delivered).
     MaybeDelivered: never resent, the peer may hold it. A stream reports
       StreamSendOutcome::Dropped: quinn may still have held part of it unsent, and
@@ -2260,7 +2365,11 @@ QUIC receive flow (#5940 e5b-4):
   or a reused QUIC id with that id is taken for a new stream instead of refused.
   Full channels: a Short or Stream whose channel is full waits in its own reader
   future (reserve, raced with the stream's age limit) and is stopped EVICTED past
-  it; Control is still dropped and counted. A Short waits BEFORE its end is read
+  it; Control is still dropped and counted. A waiting Stream keeps reading its
+  payload into its charged buffer (evicted idle if the payload stops
+  arriving; once it is all here only the age limit applies), so the wait does
+  not hold the sender's flow-control credit; its end stays unread until it is
+  announced. A Short waits BEFORE its end is read
   (reading the end frees the stream and returns its credit), so waiters are
   capped by MAX_UNI_STREAMS. A Short of one packet or less
   (fits_one_packet) is not charged, as on UDP, and is bounded by that cap and
@@ -2363,7 +2472,13 @@ Application error codes, one range per QUIC frame type, all one-byte
                 and counts quic_fallback_session_ended_rx, or
                 setup_downgrade_rx in setup; a node without this code reads
                 ConnectionLost: quic_fallback_reset, or
-                quic_upgrade_handshake_failed in setup)
+                quic_upgrade_handshake_failed in setup), 0x07 left to the
+                ramp branch's RECYCLE_FOR_DATA, OVER_BUDGET 8 (the peer held
+                more of this node's QUIC buffer budget than it allows: its
+                gaps past the cap a second time; the peer reads it as
+                Refused{OverBudget}, falls back, charges as for Downgrade and
+                counts quic_fallback_over_budget_rx, or setup_downgrade_rx in
+                setup; a node without this code reads ConnectionLost)
     0x10..=0x1f STOP_SENDING: path::stop_code (receiver refusals;
                 NOT_ACCEPTING_DATA 0x19 is a shadow path refusing data. Data
                 may be sent only after caps negotiation, so it is a counter

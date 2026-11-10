@@ -2132,8 +2132,6 @@ fn extract_tar_gz(archive_path: &Path, dest_dir: &Path, dest_dir_canonical: &Pat
 
 #[cfg(target_os = "windows")]
 fn extract_zip(archive_path: &Path, dest_dir: &Path, dest_dir_canonical: &Path) -> Result<()> {
-    use std::io::Read;
-
     let file = File::open(archive_path).context("Failed to open archive")?;
     let mut archive = zip::ZipArchive::new(file).context("Failed to read zip archive")?;
 
@@ -2826,14 +2824,13 @@ fn ensure_service_file_updated(binary_path: &Path, quiet: bool) -> Result<()> {
     let needs_update = match &current_value {
         None => {
             // No registry entry — check if there's a legacy scheduled task to migrate
-            let has_legacy_task = std::process::Command::new("schtasks")
+            std::process::Command::new("schtasks")
                 .args(["/query", "/tn", "Freenet"])
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status()
                 .map(|s| s.success())
-                .unwrap_or(false);
-            has_legacy_task
+                .unwrap_or(false)
         }
         Some(val) => !val.contains("run-wrapper"),
     };
@@ -2876,8 +2873,16 @@ fn ensure_service_file_updated(_binary_path: &Path, _quiet: bool) -> Result<()> 
     Ok(())
 }
 
+/// Where [`replace_binary`] moves the binary it replaces before moving the new
+/// one in. Between those two renames there is no binary at `dest`, so a
+/// supervisor that kills `freenet update` there puts this one back (the run
+/// wrapper's crash-loop update, #6152).
+pub(crate) fn binary_backup_path(dest: &Path) -> PathBuf {
+    dest.with_extension("old")
+}
+
 fn replace_binary(new_binary: &Path, dest: &Path) -> Result<()> {
-    let backup_path = dest.with_extension("old");
+    let backup_path = binary_backup_path(dest);
     let parent_dir = dest
         .parent()
         .context("Destination path has no parent directory")?;

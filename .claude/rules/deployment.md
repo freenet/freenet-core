@@ -72,6 +72,12 @@ Its sibling `FREENET_GIT_COMMIT_HASH` has the same empty-means-no-override rule
 and must be <= 40 hex characters. Passing a placeholder such as `unknown` FAILS
 THE BUILD; pass empty instead and let build.rs's own fallback report `unknown`.
 See docs/nix.md.
+
+The daily retry of a locked-out node (`claim_update_attempt`) must be spent
+only on a check that actually runs: the startup check claims AFTER its jitter,
+and the Windows/macOS run wrapper's crash-loop update (`crash_update_due`, at 3,
+6, 12, 24 and 48 consecutive failures, at most 10 minutes each) claims right
+before it runs `freenet update`. `freenet update` itself never claims (#6152).
 ```
 
 ### WHEN tightening security (sandbox, CSP, CORS)

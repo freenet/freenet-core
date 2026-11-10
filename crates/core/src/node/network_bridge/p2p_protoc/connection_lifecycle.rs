@@ -1691,6 +1691,9 @@ impl P2pConnManager {
         // GlobalExecutor::spawn uses Handle::try_current().spawn() which doesn't
         // reliably poll tasks in certain test contexts (see issue #2709).
         let outbound_mix = self.bridge.op_manager.outbound_mix.clone();
+        let propagation = crate::operations::update::propagation_stats::PropagationSink::of(
+            &self.bridge.op_manager,
+        );
         tokio::spawn(async move {
             peer_connection_listener(
                 rx,
@@ -1699,6 +1702,7 @@ impl P2pConnManager {
                 conn_events,
                 conn_id,
                 outbound_mix,
+                propagation,
                 link_use,
             )
             .await;

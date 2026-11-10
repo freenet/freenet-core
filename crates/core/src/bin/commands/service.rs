@@ -967,7 +967,10 @@ mod tests {
     fn wrapper_single_instance_lock_is_exclusive() {
         let first = match acquire_wrapper_single_instance_lock() {
             AcquireWrapperLockOutcome::Acquired(guard) => guard,
-            other => panic!("first acquire must succeed on an unheld mutex, got {other:?}"),
+            other @ (AcquireWrapperLockOutcome::AnotherWrapperRunning
+            | AcquireWrapperLockOutcome::UnavailableSoProceed) => {
+                panic!("first acquire must succeed on an unheld mutex, got {other:?}")
+            }
         };
         assert!(
             matches!(
@@ -3944,6 +3947,336 @@ echo "RC=$?"
         assert_eq!(state.consecutive_failures, 7);
     }
 
+    /// #6152: a crash loop run to the wrapper's give-up limit tries an update
+    /// itself a bounded number of times, never before the third crash, never
+    /// twice for one failure count, and without resetting the count, so the
+    /// give-up limit still holds.
+    #[test]
+    fn a_crash_loop_triggers_a_bounded_update_attempt() {
+        let mut state = WrapperState::new();
+        let mut attempts_at = Vec::new();
+        let mut gave_up_at = None;
+        for crash in 1..=200u32 {
+            match next_wrapper_action(&mut state, 1, false, None) {
+                WrapperAction::BackoffAndRelaunch { .. } => {}
+                other @ (WrapperAction::Update
+                | WrapperAction::Exit
+                | WrapperAction::KillAndRetry) => {
+                    panic!("crash {crash}: {other:?}")
+                }
+            }
+            if state.consecutive_failures >= WRAPPER_MAX_CONSECUTIVE_FAILURES {
+                gave_up_at = Some(crash);
+                break;
+            }
+            if crash_update_due(state.consecutive_failures) {
+                attempts_at.push(state.consecutive_failures);
+            }
+        }
+        assert_eq!(attempts_at, vec![3, 6, 12, 24, 48]);
+        assert_eq!(gave_up_at, Some(WRAPPER_MAX_CONSECUTIVE_FAILURES));
+        assert!(!(0..3).any(crash_update_due), "not before the third crash");
+    }
+
+    /// #6157 review: the crash-loop update runs only after an ordinary crash.
+    /// Not after an exit 42 or a probation crash (each already ran an update
+    /// for this exit), and not after a port conflict: the attempt forwards the
+    /// exit code, which during probation `freenet update` would count as a
+    /// crash, so a stale process holding the port after an update could roll
+    /// back and pin a good release.
+    #[test]
+    fn the_crash_loop_update_skips_port_conflicts_and_exits_already_updated() {
+        assert!(
+            crash_update_wanted(1, false, false, 3),
+            "an ordinary crash at 3"
+        );
+        assert!(
+            !crash_update_wanted(1, true, false, 3),
+            "a port conflict must not reach `freenet update` as a crash"
+        );
+        assert!(!crash_update_wanted(1, false, true, 3), "a probation crash");
+        assert!(
+            !crash_update_wanted(WRAPPER_EXIT_UPDATE_NEEDED, false, false, 3),
+            "an exit 42 already ran an update"
+        );
+        assert!(!crash_update_wanted(1, false, false, 4), "not a due count");
+    }
+
+    /// #6157 review: on the macOS app, `freenet update` exits 44 after staging
+    /// the bundle updater, which waits for the wrapper to exit before it swaps
+    /// the bundle. The crash-loop update must exit the wrapper for it, as the
+    /// other wrapper update paths do; relaunching makes the updater time out
+    /// and delete the staged bundle. Only a replaced binary re-execs the
+    /// wrapper, and everything else (including a skipped or stopped attempt)
+    /// relaunches.
+    #[test]
+    fn a_crash_loop_update_that_stages_the_bundle_exits_for_the_updater() {
+        use crate::commands::update::UpdateSubprocessOutcome as O;
+        for (outcome, next) in [
+            (Some(O::BinaryReplaced), CrashLoopUpdateNext::RestartWrapper),
+            (
+                Some(O::BundleUpdateStaged),
+                CrashLoopUpdateNext::ExitForBundleUpdater,
+            ),
+            (Some(O::AlreadyUpToDate), CrashLoopUpdateNext::Relaunch),
+            (Some(O::OtherFailure), CrashLoopUpdateNext::Relaunch),
+            (Some(O::SpawnFailed), CrashLoopUpdateNext::Relaunch),
+            (None, CrashLoopUpdateNext::Relaunch),
+        ] {
+            assert_eq!(crash_loop_update_next(outcome), next, "{outcome:?}");
+        }
+    }
+
+    /// The crash-loop update is wired into the backoff branch: after the
+    /// give-up check, gated by `crash_update_wanted` with the real port-conflict
+    /// and probation flags, a replaced binary re-execs the wrapper and a staged
+    /// bundle exits it, and the remaining backoff is shortened by the time the
+    /// attempt took. Inside the attempt: the node's claim, a bounded
+    /// `freenet update`, the failure counter driven like every other wrapper
+    /// update, then the decision. Pinned from the source with comments
+    /// stripped, since the loop spawns processes.
+    #[test]
+    fn the_crash_loop_update_is_wired_into_the_backoff() {
+        let flat: String = include_str!("service/wrapper.rs")
+            .lines()
+            .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+            .collect::<String>()
+            .split_whitespace()
+            .collect();
+        let arm = flat
+            .find("WrapperAction::BackoffAndRelaunch{secs}=>{")
+            .expect("the backoff arm");
+        let body = &flat[arm..];
+        let at = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("backoff arm is missing `{needle}`"))
+        };
+        let give_up = at("Givingupafter");
+        let gate = at(
+            "ifcrash_update_wanted(exit_code,is_port_conflict,probation_crash,state.consecutive_failures,){",
+        );
+        let call =
+            at("matchcrash_loop_update(&exe_path,log_dir,exit_code,state.consecutive_failures,){");
+        let restart = at("CrashLoopUpdateNext::RestartWrapper=>{");
+        let respawn = at("ifspawn_new_wrapper(&exe_path,log_dir){returnOk(());}");
+        let bundle = at("CrashLoopUpdateNext::ExitForBundleUpdater=>{");
+        let relaunch = at("CrashLoopUpdateNext::Relaunch=>{}");
+        let shorten = at("secs=secs.saturating_sub(attempt_clock.now().as_secs());");
+        let sleep = at("sleep_with_jitter_interruptible(secs");
+        assert!(
+            give_up < gate
+                && gate < call
+                && call < restart
+                && restart < respawn
+                && respawn < bundle
+                && bundle < relaunch
+                && relaunch < shorten
+                && shorten < sleep
+        );
+        let bundle_arm = &body[bundle..relaunch];
+        assert!(
+            bundle_arm.ends_with("returnOk(());}"),
+            "a staged bundle exits the wrapper: {bundle_arm}"
+        );
+
+        let f = flat
+            .find("fncrash_loop_update(")
+            .expect("crash_loop_update");
+        let f = &flat[f..];
+        let at = |needle: &str| {
+            f.find(needle)
+                .unwrap_or_else(|| panic!("crash_loop_update is missing `{needle}`"))
+        };
+        let claim = at("auto_update::claim_update_attempt()");
+        let spawn = at(
+            "spawn_update_command_bounded(exe_path,log_dir,Some(exit_code),CRASH_UPDATE_TIMEOUT,)",
+        );
+        let counter = at("update_counter_action(outcome)");
+        let stopped = at("BoundedUpdate::Stopped{replaced}=>{");
+        let after_stop = at("returncrash_loop_update_after_stop(replaced);");
+        let decide = at("letnext=crash_loop_update_next(Some(outcome));");
+        assert!(
+            claim < spawn
+                && spawn < stopped
+                && stopped < after_stop
+                && after_stop < counter
+                && counter < decide
+        );
+    }
+
+    /// #6157 review: the crash-loop update must never hold the relaunch
+    /// indefinitely, so its wait is bounded and an overrunning child is
+    /// killed and reaped. A child that finishes in time reports its status.
+    /// Runs on Windows too (the `windows_unit` job), where the kill is
+    /// `TerminateProcess`.
+    #[test]
+    fn a_bounded_update_wait_stops_a_child_that_overruns() {
+        let mut long = if cfg!(windows) {
+            let mut cmd = std::process::Command::new("ping");
+            cmd.args(["-n", "30", "127.0.0.1"]);
+            cmd
+        } else {
+            let mut cmd = std::process::Command::new("sleep");
+            cmd.arg("30");
+            cmd
+        };
+        let child = long.stdout(std::process::Stdio::null()).spawn().unwrap();
+        let started = std::time::Instant::now();
+        let waited = wait_until(child, || {
+            started.elapsed() >= std::time::Duration::from_millis(300)
+        });
+        assert!(matches!(waited, BoundedWait::Stopped), "{waited:?}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "returned at the limit, not when the child exited"
+        );
+
+        let quick = if cfg!(windows) {
+            std::process::Command::new("cmd")
+                .args(["/C", "exit 3"])
+                .spawn()
+                .unwrap()
+        } else {
+            std::process::Command::new("sh")
+                .args(["-c", "exit 3"])
+                .spawn()
+                .unwrap()
+        };
+        match wait_until(quick, || false) {
+            BoundedWait::Finished(Ok(status)) => assert_eq!(status.code(), Some(3)),
+            other @ (BoundedWait::Finished(Err(_))
+            | BoundedWait::Stopped
+            | BoundedWait::Unreaped) => {
+                panic!("finished in time: {other:?}")
+            }
+        }
+    }
+
+    /// #6157 re-check: `freenet update` replaces the binary before its slower
+    /// last steps, so a stop at the limit can come after a successful
+    /// install. The wrapper must then re-exec rather than relaunch under the
+    /// old wrapper, whose image on Windows is the moved-aside `freenet.old`.
+    #[test]
+    fn a_crash_loop_update_stopped_after_its_install_restarts_the_wrapper() {
+        assert_eq!(
+            crash_loop_update_after_stop(true),
+            CrashLoopUpdateNext::RestartWrapper
+        );
+        assert_eq!(
+            crash_loop_update_after_stop(false),
+            CrashLoopUpdateNext::Relaunch
+        );
+        let a = Some(blake3::hash(b"old"));
+        let b = Some(blake3::hash(b"new"));
+        assert!(binary_changed(a, b));
+        assert!(!binary_changed(a, a));
+        assert!(
+            !binary_changed(None, b),
+            "an unreadable reading is no evidence"
+        );
+        assert!(
+            !binary_changed(a, None),
+            "an unreadable reading is no evidence"
+        );
+    }
+
+    /// The bounded spawner end to end, with a stand-in `freenet` (a shell
+    /// script run as `<exe> update --quiet`) stopped in each place a stop can
+    /// land: after replacing itself, between the two renames, and before doing
+    /// anything. The stop is triggered by a marker the script writes once its
+    /// step is done, not by wall time, so a slow machine cannot change the
+    /// result (a bound of a minute only keeps a broken script from hanging the
+    /// test, and then the marker assertion fails).
+    #[cfg(unix)]
+    #[test]
+    fn a_stopped_update_reports_whether_it_had_replaced_the_binary() {
+        use std::os::unix::fs::PermissionsExt;
+        let run = |step: &str| {
+            let tmp = tempfile::tempdir().unwrap();
+            let exe = tmp.path().join("freenet");
+            let marker = tmp.path().join("step-done");
+            std::fs::write(
+                &exe,
+                format!("#!/bin/sh\n{step}\n: > '{}'\nsleep 30\n", marker.display()),
+            )
+            .unwrap();
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let before = std::fs::read(&exe).unwrap();
+            // A file just written can fail to exec with ETXTBSY while another
+            // test thread forks with our write descriptor still open
+            // (rust-lang/rust#114554); the descriptor closes once that fork
+            // execs, so retry briefly.
+            let mut tries = 0;
+            let outcome = loop {
+                let started = std::time::Instant::now();
+                let outcome = spawn_update_command_until(&exe, tmp.path(), Some(1), || {
+                    marker.exists() || started.elapsed() > std::time::Duration::from_secs(60)
+                });
+                match &outcome {
+                    BoundedUpdate::Finished(Err(e))
+                        if e.raw_os_error() == Some(libc::ETXTBSY) && tries < 50 =>
+                    {
+                        tries += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    BoundedUpdate::Finished(_) | BoundedUpdate::Stopped { .. } => break outcome,
+                }
+            };
+            assert!(marker.exists(), "the script reached its stop point");
+            let after = std::fs::read(&exe).ok();
+            (outcome, before, after, tmp)
+        };
+
+        // Installed, then stopped during the slow last steps.
+        let (outcome, before, after, _tmp) =
+            run(r#"cp "$0" "$0.tmp"; echo '# new' >> "$0.tmp"; mv "$0.tmp" "$0""#);
+        assert!(
+            matches!(outcome, BoundedUpdate::Stopped { replaced: true }),
+            "{outcome:?}"
+        );
+        assert_ne!(after.as_deref(), Some(before.as_slice()));
+
+        // Stopped between the renames: the binary is put back, unchanged.
+        let (outcome, before, after, _tmp) = run(r#"mv "$0" "$0.old""#);
+        assert!(
+            matches!(outcome, BoundedUpdate::Stopped { replaced: false }),
+            "{outcome:?}"
+        );
+        assert_eq!(after.as_deref(), Some(before.as_slice()));
+
+        // Stopped before anything happened.
+        let (outcome, before, after, _tmp) = run(":");
+        assert!(
+            matches!(outcome, BoundedUpdate::Stopped { replaced: false }),
+            "{outcome:?}"
+        );
+        assert_eq!(after.as_deref(), Some(before.as_slice()));
+    }
+
+    /// Stopping `freenet update` between `replace_binary`'s two renames leaves
+    /// no binary in place. The wrapper puts the moved-aside one back, and
+    /// touches nothing when the binary is in place.
+    #[test]
+    fn a_stopped_update_never_leaves_the_install_without_a_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = tmp.path().join(if cfg!(windows) {
+            "freenet.exe"
+        } else {
+            "freenet"
+        });
+        let backup = crate::commands::update::binary_backup_path(&exe);
+        std::fs::write(&backup, b"previous").unwrap();
+        restore_binary_after_stop(&exe, tmp.path());
+        assert_eq!(std::fs::read(&exe).unwrap(), b"previous");
+        assert!(!backup.exists());
+
+        // Binary in place (the stop came before or after the renames): keep it.
+        std::fs::write(&backup, b"older").unwrap();
+        restore_binary_after_stop(&exe, tmp.path());
+        assert_eq!(std::fs::read(&exe).unwrap(), b"previous");
+        assert_eq!(std::fs::read(&backup).unwrap(), b"older");
+    }
+
     #[test]
     fn test_wrapper_exit_43_exits_immediately() {
         let mut state = WrapperState::new();
@@ -4566,7 +4899,19 @@ echo "RC=$?"
                 .collect::<Vec<_>>()
                 .join("\n")
         };
-        let spawn = body_of("pub(super) fn spawn_update_command(");
+        // Every wrapper update path builds its command in `update_command`.
+        for spawner in [
+            "pub(super) fn spawn_update_command(",
+            "fn spawn_update_command_until(",
+        ] {
+            let body = body_of(spawner);
+            assert!(
+                body.contains("update_command(exe_path, log_dir, post_stop_exit_code)")
+                    && !body.contains("Command::new"),
+                "`{spawner}` must build its command with `update_command`"
+            );
+        }
+        let spawn = body_of("\nfn update_command(");
         for pattern in [
             "let (stdout, stderr) = update_output_stdio(log_dir);",
             ".stdin(std::process::Stdio::null())",
@@ -4575,7 +4920,7 @@ echo "RC=$?"
         ] {
             assert!(
                 spawn.contains(pattern),
-                "spawn_update_command must contain `{pattern}` — a standard handle \
+                "update_command must contain `{pattern}` — a standard handle \
                  left to be inherited makes Windows autostart fire a silent spawn \
                  failure with os error 6 (#3933 / #3934)."
             );
@@ -4800,7 +5145,25 @@ echo "RC=$?"
         assert_eq!(
             src.matches("spawn_update_command(").count(),
             2 + 3 + 1,
-            "every call site is one of the two forms above (plus the definition)"
+            "every call site is one of the forms above (plus the definition)"
+        );
+        // The crash-loop update (#6152) is post-stop too: it runs because the
+        // node crashed, so it passes the crash's exit code (which also keeps
+        // `freenet update`'s supervised download budget). It is bounded in
+        // time, so it uses its own spawner.
+        let flat: String = src.split_whitespace().collect();
+        assert_eq!(
+            flat.matches(
+                "spawn_update_command_bounded(exe_path,log_dir,Some(exit_code),CRASH_UPDATE_TIMEOUT,)"
+            )
+            .count(),
+            1,
+            "the crash-loop update must pass Some(exit_code) (#6152)"
+        );
+        assert_eq!(
+            src.matches("spawn_update_command_bounded(").count(),
+            1 + 1,
+            "the bounded spawner has one call site (plus the definition)"
         );
         assert!(
             src.contains("POST_STOP_EXIT_CODE_ENV_VAR"),

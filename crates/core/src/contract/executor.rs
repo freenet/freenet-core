@@ -1220,9 +1220,10 @@ pub(crate) trait ContractExecutor: Send + 'static {
     }
 
     /// Import delegate secrets from an encrypted `bundle` into the node's secrets
-    /// store at `target_scope`, LIVE (#4592). Runs ON the contract loop
-    /// (serialized with delegate `store_secret`) — DELIBERATELY not off-loop like
-    /// the export, because the import WRITES and the store write path assumes
+    /// store at `target_scope`, LIVE (#4592). Awaited on the contract loop and
+    /// serialized with delegate `store_secret` (the pool runs it under the
+    /// delegate executor's lock), DELIBERATELY not off-loop like the export,
+    /// because the import WRITES and the store write path assumes
     /// node-wide write serialization (see `RuntimePool::import_secrets` and the
     /// `ImportSecrets` arm in `contract.rs`).
     ///
@@ -1327,6 +1328,14 @@ pub(crate) trait ContractExecutor: Send + 'static {
     fn delegate_capabilities(
         &self,
     ) -> Option<Arc<crate::contract::delegate_capabilities::DelegateCapabilities>> {
+        None
+    }
+
+    /// The runner every delegate `process()` of this executor goes through,
+    /// shared with the delegate lane (`contract::delegate_lane`). `None`
+    /// keeps every delegate run on the contract loop, as before the lane
+    /// existed; mock executors answer `None` unless a test opts in.
+    fn delegate_runner(&self) -> Option<Arc<dyn crate::contract::delegate_lane::DelegateRunner>> {
         None
     }
 
@@ -1767,8 +1776,11 @@ pub(crate) fn declared_cache_ceiling_terms(
     let summary = summary_budget_for(memory_limit, pool_size);
     let delta = delta_budget_for(memory_limit, pool_size);
     // One wasmtime Store per executor, each holding retired-instance bytes up
-    // to its arena budget between refreshes.
+    // to its arena budget between refreshes. The node's ONE delegate executor
+    // (`runtime::pool::PooledDelegateRunner`), outside the pool, has its own
+    // Store with a fixed budget, summed below as a node-wide term.
     let arena = crate::wasm_runtime::engine::store_arena_budget_for(memory_limit, pool_size);
+    let delegate_arena = crate::wasm_runtime::DELEGATE_STORE_ARENA_BYTES;
 
     // NODE-WIDE — one of each, shared by every executor.
     let contract_modules = crate::wasm_runtime::budget_for_ram(memory_limit);
@@ -1827,6 +1839,7 @@ pub(crate) fn declared_cache_ceiling_terms(
         ("summary_budget_for", pool_size * summary),
         ("delta_budget_for", pool_size * delta),
         ("store_arena_budget_for", pool_size * arena),
+        ("DELEGATE_STORE_ARENA_BYTES", delegate_arena),
         ("budget_for_ram", contract_modules),
         // Labelled by the DIVISOR because the delegate module cache has no
         // budget function of its own: it is a fraction of the contract module
@@ -2149,6 +2162,7 @@ where
                     db.clone(),
                     shared.delegate_index,
                     shared.delegate_code,
+                    shared.clean_delegate_tmp_records,
                 )?,
             ),
             // Standalone / mock executors own their state.
@@ -2318,6 +2332,7 @@ mod tests {
             "delta_budget_for",
             "store_arena_budget_for",
             // node-wide
+            "DELEGATE_STORE_ARENA_BYTES",
             "budget_for_ram",
             "DELEGATE_MODULE_CACHE_BUDGET_DIVISOR",
             "SOURCE_CODE_CACHE_MAX_BYTES",
@@ -2367,23 +2382,37 @@ mod tests {
                 .map(|(_, bytes)| *bytes)
                 .unwrap_or_else(|| panic!("`{label}` must be a summed term"))
         };
-        for (label, per_executor) in [
-            ("summary_budget_for", summary_budget_for(ONE_GIB, POOL)),
-            ("delta_budget_for", delta_budget_for(ONE_GIB, POOL)),
+        // The delegate executor (`PooledDelegateRunner`) is outside the pool
+        // and has its own fixed arena, checked below.
+        for (label, per_executor, executors) in [
+            (
+                "summary_budget_for",
+                summary_budget_for(ONE_GIB, POOL),
+                POOL,
+            ),
+            ("delta_budget_for", delta_budget_for(ONE_GIB, POOL), POOL),
             (
                 "store_arena_budget_for",
                 crate::wasm_runtime::engine::store_arena_budget_for(ONE_GIB, POOL),
+                POOL,
             ),
         ] {
             assert_eq!(
                 value(&terms, label),
-                POOL * per_executor,
+                executors * per_executor,
                 "`{label}` is PER-EXECUTOR, so the aggregate must count \
-                 `pool_size` of them. Declaring one copy of a budget the node \
-                 commits {POOL} times is #5268's defect 3, and it hides memory \
-                 from the aggregate-safety checks"
+                 {executors} of them at pool size {POOL}. Declaring fewer copies \
+                 of a budget than the node commits is #5268's defect 3, and it \
+                 hides memory from the aggregate-safety checks"
             );
         }
+
+        assert_eq!(
+            value(&terms, "DELEGATE_STORE_ARENA_BYTES"),
+            crate::wasm_runtime::DELEGATE_STORE_ARENA_BYTES,
+            "the node's one delegate executor has its own Store, with a fixed \
+             arena budget outside the pool's; it must be counted once"
+        );
 
         // THE THREE TERMS NOTHING ELSE CHECKS. The non-zero check in the
         // sibling guard is a FLOOR, not a value: drop the `2 *` from
@@ -2721,6 +2750,11 @@ mod tests {
                 "CGROUP_UNLIMITED_THRESHOLD_BYTES",
                 "sentinel for reading the cgroup limit, not a budget",
             ),
+            (
+                "contract_arena_envelope",
+                "consumed inside store_arena_budget_for (the RAM share less the \
+                 delegate executor's fixed arena), which is summed",
+            ),
             ("MAX_PARKED_BYTES", "clamp inside parked_budget_for"),
             ("MIN_PARKED_BYTES", "clamp inside parked_budget_for"),
             (
@@ -3033,6 +3067,44 @@ mod tests {
                  (memory gate M2, #5940) must re-check it against quinn-proto's \
                  behaviour, plus the unmeasured terms in the quic::config module \
                  doc; summed once a QUIC path cap exists (M4, #5940)",
+            ),
+            // Buffer-budget terms (#5940): the fixed charge per QUIC connection
+            // and the node-wide budget for what scales with the windows. Both
+            // are summed (budget + quic_connections x charge) by the buffer
+            // budget's aggregate-accounting step, which waits for the
+            // small-host decision; nothing is charged against either yet.
+            (
+                "QUIC_OPEN_STREAM_BYTES",
+                "a measurement of one QUIC connection term (one open stream, both \
+                 sides), not a ceiling; a term inside QUIC_CONNECTION_CHARGE_BYTES",
+            ),
+            (
+                "QUIC_STOPPED_ENTRY_BYTES",
+                "a measurement of one QUIC connection term (one entry of quinn's \
+                 stopped map), not a ceiling; a term inside \
+                 QUIC_CONNECTION_CHARGE_BYTES",
+            ),
+            (
+                "QUIC_CRYPTO_BUFFER_BYTES",
+                "quinn's CRYPTO reassembly limit for ONE QUIC connection; a term \
+                 inside QUIC_CONNECTION_CHARGE_BYTES",
+            ),
+            (
+                "QUIC_CRYPTO_HOLD_BYTES",
+                "quinn's CRYPTO assembler worst case for ONE QUIC connection's \
+                 1-RTT space, derived; a term inside QUIC_CONNECTION_CHARGE_BYTES",
+            ),
+            (
+                "QUIC_CONNECTION_CHARGE_BYTES",
+                "the fixed charge per QUIC connection; summed as quic_connections x \
+                 this by the buffer budget's aggregate-accounting step (#5940), \
+                 which waits for the small-host decision on the connection cap",
+            ),
+            (
+                "quic_buffer_budget_for",
+                "the node-wide QUIC buffer budget (memory / 16); summed by the buffer \
+                 budget's aggregate-accounting step (#5940), which waits for the \
+                 small-host decision; nothing is metered against it yet",
             ),
             (
                 "READ_START_BYTES",

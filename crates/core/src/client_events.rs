@@ -1920,6 +1920,7 @@ async fn process_open_request(
                             origin_contract,
                             connection_scope,
                             user_context,
+                            lane_ticket: Default::default(),
                         },
                         crate::contract::Priority::ClientLocal,
                     )

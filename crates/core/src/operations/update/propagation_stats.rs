@@ -34,6 +34,48 @@
 //! map is size-capped ([`MAX_TRACKED_CONTRACTS`]) so a churn of
 //! network-influenced contract keys cannot grow it unboundedly (per the
 //! per-key-collection rule in `.claude/rules/code-style.md`).
+//!
+//! ## Per-leg outcomes (#6143)
+//!
+//! `targets_avg` counts fan-out targets RESOLVED, which is decided before any
+//! per-peer work. In #6143 a node logged `targets_avg=14.0` for each of its
+//! own UPDATEs for 80 minutes while no receiver applied any of them, and every
+//! place a leg can end without a send logged at debug or trace, which release
+//! builds compile out (`release_max_level_info`). So the summary also counts
+//! what each leg actually did ([`PropagationEvent`]): handed a delta or a full
+//! state to the network bridge, or skipped and why; how the transport then
+//! carried it (one packet, or a stream, and whether the stream's last
+//! fragment left); the best-effort `try_notify` drops that lose a whole
+//! fan-out or heal before it starts; and the receiver-side pre-merge skips.
+//! The same counts go to the `broadcast_payload_mix` telemetry event so the
+//! fleet can see them.
+//!
+//! The transport layer matters for #6143 itself: that node's telemetry
+//! counted ~14 delta sends per update handed to the bridge, so the loss was
+//! below it.
+//!
+//! There is no stall WARN. A rule that WARNed when every leg of a client
+//! update ended unsent still raised false WARNs in its general form, so it is
+//! deferred to #6165. Diagnose from the counts instead: a contract with
+//! `client_originated > 0` and `sent_delta + sent_full == 0`, sustained across
+//! windows, has client updates that are not leaving this node, and the
+//! `skip_*`, `send_failed` and `fanout_event_dropped` counts say where its
+//! legs went. A leg can be held without recording anything while its
+//! (contract, peer) pair is busy with a stream or queued behind the large
+//! lane's permits, so one window of targets and no send is not by itself a
+//! failure. Loss at or after the transport shows in the `wire_*` counts here
+//! and the receivers' `rx_*` counts across the fleet.
+//!
+//! A client update whose legs were all skipped as converged
+//! (`skip_summary_equal` and the like) is suspect: it changed this node's
+//! state, so no peer can already hold it, and the skip says this node's
+//! belief about the peer is wrong. That is the leading hypothesis for #6143.
+//! One exception: a contract whose summary is lossy (two different states can
+//! share one) can legitimately match a peer's summary after a real change.
+//!
+//! The per-contract INFO lines are the top [`TOP_K`] by update activity, so a
+//! contract can be left out of them, into the rollup count, by busier ones.
+//! The node-wide line and the telemetry still count it.
 
 use std::time::Duration;
 
@@ -45,7 +87,7 @@ use crate::config::GlobalExecutor;
 /// How often the summary task drains the counters and emits a window summary.
 /// 60s is the natural starting point per issue #4281 — short enough for
 /// usable debugging granularity, long enough to keep the log rate trivial.
-const SUMMARY_WINDOW: Duration = Duration::from_secs(60);
+pub(crate) const SUMMARY_WINDOW: Duration = Duration::from_secs(60);
 
 /// Maximum number of per-contract lines emitted per window (top-K by update
 /// activity). Contracts beyond the top-K are summarised in a single rollup
@@ -56,9 +98,266 @@ const TOP_K: usize = 8;
 /// Maximum number of distinct contracts tracked at once. A new contract is
 /// dropped (its activity goes uncounted for that window) once the map is at
 /// capacity, rather than letting a key churn grow the map without bound.
-/// 4096 is comfortably above the active-contract count of a busy gateway
-/// while still capping memory at a few hundred KB worst case.
+/// 4096 is comfortably above the active-contract count of a busy gateway.
+/// Each entry is at most [`MAX_COUNTERS_SIZE`] plus its key (pinned by
+/// `a_tracked_contract_stays_within_its_memory_bound`), about 1.3 MB of
+/// entries at the cap. A hash table holds 4096 entries in 8192 buckets
+/// (hashbrown's 7/8 load factor rounds up to the next power of two), so the
+/// map is about 2.6 MB at the cap.
 const MAX_TRACKED_CONTRACTS: usize = 4096;
+
+/// Upper bound on `size_of::<ContractCounters>()` and
+/// `size_of::<ContractSummary>()`, for the memory estimate above.
+#[cfg(test)]
+const MAX_COUNTERS_SIZE: usize = 288;
+
+/// One countable thing that happened to an UPDATE's propagation for a
+/// contract, other than the fan-out target resolution `record_broadcast`
+/// already counts. See the module docs (#6143).
+///
+/// Counts are per event, not per leg: one leg is usually a `Sent*` event and
+/// then a `Wire*` event, and a stream one more `WireStream*` outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PropagationEvent {
+    /// A local client UPDATE that changed this node's state, and so emitted a
+    /// fan-out. Read against `SentDelta` / `SentFull` to see whether this
+    /// node's own updates leave it.
+    ClientOriginated,
+    /// A delta handed to the network bridge (`bridge.send` returned `Ok`).
+    SentDelta,
+    /// A full state handed to the network bridge: an inline send that
+    /// returned `Ok`, or a stream whose dispatch returned `Ok`.
+    SentFull,
+    /// Skipped: our cached copy of the peer's summary is byte-equal to ours.
+    SkipSummaryEqual,
+    /// Skipped: the shared delta cache holds an empty delta for this summary
+    /// pair, so the peer is believed converged.
+    SkipCachedConverged,
+    /// Skipped: the bounded WASM staleness probe said the peer is converged.
+    SkipProbeConverged,
+    /// Skipped: `compute_delta` returned an empty delta (`Ok(None)`).
+    SkipEmptyDelta,
+    /// Skipped: `should_broadcast_contract` was false (not hosted or in use).
+    SkipNotHosted,
+    /// Skipped: the target had no socket address.
+    SkipNoAddress,
+    /// Ended unsent: a newer fan-out or heal replaced this leg's queued
+    /// (contract, peer) entry before it ran. Its update rides on the newer
+    /// leg, whose own outcome decides whether anything was sent; this leg
+    /// recorded nothing before #6143.
+    SkipSuperseded,
+    /// Ended unsent: the broadcast queue was full and dropped this queued
+    /// leg to make room (`evict_oldest`).
+    SkipEvicted,
+    /// The network bridge refused a leg: `bridge.send` or the stream dispatch
+    /// returned `Err`, or the payload failed to serialize. That leg counts no
+    /// `Sent*`, so this is a per-leg outcome disjoint from `SentDelta` /
+    /// `SentFull`. A refusal further down, by the transport, is
+    /// [`Self::WireSendFailed`].
+    SendFailed,
+    /// A `BroadcastStateChange` (a whole fan-out) was dropped because the
+    /// event-loop notification channel was full.
+    FanoutEventDropped,
+    /// A `SyncStateToPeer` (a targeted heal) was dropped because the
+    /// event-loop notification channel was full.
+    HealEventDropped,
+    /// A targeted heal resolved its peer and started a leg. The heal's
+    /// counterpart of a fan-out's resolved targets (`targets_total`), so heal
+    /// legs can be read apart from fan-out legs.
+    HealTarget,
+    /// Transport: an UPDATE broadcast message left as one UDP packet. It is
+    /// retransmitted until acknowledged or abandoned, and nothing reports
+    /// which, so this is the last thing observed of it.
+    WireShort,
+    /// Transport: an UPDATE broadcast went out as a stream, either an inline
+    /// message too big for one packet or a full-state broadcast stream. Its
+    /// fate is one of the three `WireStream*` events below.
+    WireStream,
+    /// Transport: an UPDATE broadcast message on a path that reports no
+    /// per-message fate (the QUIC data path).
+    WireUnobserved,
+    /// Transport: a stream's last fragment left the sender. NOT a receiver
+    /// acknowledgement; the UDP stream path has none.
+    WireStreamDelivered,
+    /// Transport: a stream failed before its last fragment left (cwnd wait
+    /// timeout, send error, connection gone, or no outcome in time).
+    WireStreamFailed,
+    /// Transport: a stream failed because a fragment missed the node-wide
+    /// egress deadline. The transport logs these per stream at debug only.
+    WireStreamEgressAbandoned,
+    /// Transport: the connection task could not send an inline UPDATE
+    /// broadcast the bridge had already taken (the message failed to
+    /// serialize, the connection refused it, or it was failing while
+    /// draining its queue before shutdown). That leg
+    /// counted a `Sent*` event when the bridge took it, possibly in an
+    /// earlier window.
+    WireSendFailed,
+    /// Receiver: an inbound broadcast skipped by the 60 s payload dedup cache.
+    RxDedup,
+    /// Receiver: an inbound broadcast skipped because the payload is already
+    /// merged into local state.
+    RxAlreadyApplied,
+    /// Receiver: an inbound broadcast skipped by the merge-failure backoff
+    /// (per-sender cooldown or a known-failed payload).
+    RxBackoff,
+}
+
+impl PropagationEvent {
+    /// Every event, in reporting order. Kept in lockstep with
+    /// [`Self::index`] by `propagation_events_are_densely_indexed`.
+    pub(crate) const ALL: [PropagationEvent; 25] = [
+        PropagationEvent::ClientOriginated,
+        PropagationEvent::SentDelta,
+        PropagationEvent::SentFull,
+        PropagationEvent::SkipSummaryEqual,
+        PropagationEvent::SkipCachedConverged,
+        PropagationEvent::SkipProbeConverged,
+        PropagationEvent::SkipEmptyDelta,
+        PropagationEvent::SkipNotHosted,
+        PropagationEvent::SkipNoAddress,
+        PropagationEvent::SkipSuperseded,
+        PropagationEvent::SkipEvicted,
+        PropagationEvent::SendFailed,
+        PropagationEvent::FanoutEventDropped,
+        PropagationEvent::HealEventDropped,
+        PropagationEvent::HealTarget,
+        PropagationEvent::WireShort,
+        PropagationEvent::WireStream,
+        PropagationEvent::WireUnobserved,
+        PropagationEvent::WireStreamDelivered,
+        PropagationEvent::WireStreamFailed,
+        PropagationEvent::WireStreamEgressAbandoned,
+        PropagationEvent::WireSendFailed,
+        PropagationEvent::RxDedup,
+        PropagationEvent::RxAlreadyApplied,
+        PropagationEvent::RxBackoff,
+    ];
+
+    pub(crate) const COUNT: usize = Self::ALL.len();
+
+    pub(crate) const fn index(self) -> usize {
+        match self {
+            PropagationEvent::ClientOriginated => 0,
+            PropagationEvent::SentDelta => 1,
+            PropagationEvent::SentFull => 2,
+            PropagationEvent::SkipSummaryEqual => 3,
+            PropagationEvent::SkipCachedConverged => 4,
+            PropagationEvent::SkipProbeConverged => 5,
+            PropagationEvent::SkipEmptyDelta => 6,
+            PropagationEvent::SkipNotHosted => 7,
+            PropagationEvent::SkipNoAddress => 8,
+            PropagationEvent::SkipSuperseded => 9,
+            PropagationEvent::SkipEvicted => 10,
+            PropagationEvent::SendFailed => 11,
+            PropagationEvent::FanoutEventDropped => 12,
+            PropagationEvent::HealEventDropped => 13,
+            PropagationEvent::HealTarget => 14,
+            PropagationEvent::WireShort => 15,
+            PropagationEvent::WireStream => 16,
+            PropagationEvent::WireUnobserved => 17,
+            PropagationEvent::WireStreamDelivered => 18,
+            PropagationEvent::WireStreamFailed => 19,
+            PropagationEvent::WireStreamEgressAbandoned => 20,
+            PropagationEvent::WireSendFailed => 21,
+            PropagationEvent::RxDedup => 22,
+            PropagationEvent::RxAlreadyApplied => 23,
+            PropagationEvent::RxBackoff => 24,
+        }
+    }
+
+    /// True for a receiver-side event (`Rx*`). These are recorded before any
+    /// hosting check, keyed by a contract id an inbound message names, so they
+    /// create a per-contract entry only for a contract this node hosts; see
+    /// [`record_received_event`].
+    pub(crate) const fn is_received(self) -> bool {
+        matches!(
+            self,
+            PropagationEvent::RxDedup
+                | PropagationEvent::RxAlreadyApplied
+                | PropagationEvent::RxBackoff
+        )
+    }
+
+    /// The `WireStream*` event for a stream's completion signal: `None` when
+    /// none came (the sender was dropped unsignalled, or the wait ran out).
+    /// A cwnd-wait timeout ends that way, as does a stream orphaned at
+    /// connection teardown.
+    pub(crate) fn for_stream_outcome(outcome: Option<crate::transport::StreamSendOutcome>) -> Self {
+        use crate::transport::StreamSendOutcome;
+        match outcome {
+            Some(StreamSendOutcome::Delivered) => PropagationEvent::WireStreamDelivered,
+            Some(StreamSendOutcome::EgressAbandoned) => PropagationEvent::WireStreamEgressAbandoned,
+            Some(StreamSendOutcome::Dropped) | None => PropagationEvent::WireStreamFailed,
+        }
+    }
+
+    /// Stable field name, used in the INFO line and as the telemetry field
+    /// suffix. Changing one breaks log and dashboard queries.
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            PropagationEvent::ClientOriginated => "client_originated",
+            PropagationEvent::SentDelta => "sent_delta",
+            PropagationEvent::SentFull => "sent_full",
+            PropagationEvent::SkipSummaryEqual => "skip_summary_equal",
+            PropagationEvent::SkipCachedConverged => "skip_cached_converged",
+            PropagationEvent::SkipProbeConverged => "skip_probe_converged",
+            PropagationEvent::SkipEmptyDelta => "skip_empty_delta",
+            PropagationEvent::SkipNotHosted => "skip_not_hosted",
+            PropagationEvent::SkipNoAddress => "skip_no_address",
+            PropagationEvent::SkipSuperseded => "skip_superseded",
+            PropagationEvent::SkipEvicted => "skip_evicted",
+            PropagationEvent::SendFailed => "send_failed",
+            PropagationEvent::FanoutEventDropped => "fanout_event_dropped",
+            PropagationEvent::HealEventDropped => "heal_event_dropped",
+            PropagationEvent::HealTarget => "heal_target",
+            PropagationEvent::WireShort => "wire_short",
+            PropagationEvent::WireStream => "wire_stream",
+            PropagationEvent::WireUnobserved => "wire_unobserved",
+            PropagationEvent::WireStreamDelivered => "wire_stream_delivered",
+            PropagationEvent::WireStreamFailed => "wire_stream_failed",
+            PropagationEvent::WireStreamEgressAbandoned => "wire_stream_egress_abandoned",
+            PropagationEvent::WireSendFailed => "wire_send_failed",
+            PropagationEvent::RxDedup => "rx_dedup",
+            PropagationEvent::RxAlreadyApplied => "rx_already_applied",
+            PropagationEvent::RxBackoff => "rx_backoff",
+        }
+    }
+}
+
+/// Per-event counts, indexed by [`PropagationEvent::index`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct EventCounts([u64; PropagationEvent::COUNT]);
+
+impl EventCounts {
+    pub(crate) fn get(&self, ev: PropagationEvent) -> u64 {
+        // `index()` is an exhaustive match and `ALL`'s length sizes the
+        // array; `propagation_events_are_densely_indexed` keeps them in step,
+        // and `get` degrades to 0 rather than panicking if they drift.
+        self.0.get(ev.index()).copied().unwrap_or(0)
+    }
+
+    fn add(&mut self, ev: PropagationEvent, n: u64) {
+        if let Some(slot) = self.0.get_mut(ev.index()) {
+            *slot = slot.saturating_add(n);
+        }
+    }
+
+    fn merge(&mut self, other: &EventCounts) {
+        for ev in PropagationEvent::ALL {
+            self.add(ev, other.get(ev));
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.iter().all(|&n| n == 0)
+    }
+
+    /// Payloads handed to the network bridge.
+    pub(crate) fn sent(&self) -> u64 {
+        self.get(PropagationEvent::SentDelta)
+            .saturating_add(self.get(PropagationEvent::SentFull))
+    }
+}
 
 /// Per-contract windowed counters.
 ///
@@ -98,6 +397,8 @@ struct ContractCounters {
     /// from `BroadcastTargetResult`). A persistently non-zero value points at
     /// stale interest state.
     interest_resolve_failed: u64,
+    /// Per-leg outcomes and the other [`PropagationEvent`]s (#6143).
+    events: EventCounts,
 }
 
 impl ContractCounters {
@@ -108,6 +409,7 @@ impl ContractCounters {
             && self.no_targets == 0
             && self.fully_covered == 0
             && self.interest_resolve_failed == 0
+            && self.events.is_empty()
     }
 }
 
@@ -125,9 +427,18 @@ pub(crate) struct ContractSummary {
     /// `no_targets`.
     pub(crate) fully_covered: u64,
     pub(crate) interest_resolve_failed: u64,
+    pub(crate) events: EventCounts,
 }
 
 impl ContractSummary {
+    /// True when the contract did anything this window worth a line: a
+    /// fan-out, or any [`PropagationEvent`]. A heal-only or receive-only
+    /// contract has no `updates` but still counts. `interest_resolve_failed`
+    /// alone does not, since it is only ever recorded alongside an update.
+    fn is_active(&self) -> bool {
+        self.updates > 0 || !self.events.is_empty()
+    }
+
     /// Mean resolved targets per update attempt, rounded to one decimal.
     /// Returns 0.0 when there were no attempts (avoids divide-by-zero).
     fn targets_avg(&self) -> f64 {
@@ -144,7 +455,8 @@ impl ContractSummary {
 /// Aggregated view of a single drained window, ready to log.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct WindowSummary {
-    /// Distinct contracts with at least one update attempt this window.
+    /// Distinct contracts with any propagation activity this window: an
+    /// update attempt, or any counted event (including receive-side `rx_*`).
     pub(crate) contracts: usize,
     /// Total update fan-out attempts across all contracts this window.
     pub(crate) updates: u64,
@@ -157,6 +469,8 @@ pub(crate) struct WindowSummary {
     pub(crate) fully_covered: u64,
     /// Total interest-resolve failures across all contracts this window.
     pub(crate) interest_resolve_failed: u64,
+    /// [`PropagationEvent`] totals across all contracts this window.
+    pub(crate) events: EventCounts,
     /// The top-K contracts by update activity (descending), for per-contract
     /// lines. Length is at most [`TOP_K`].
     pub(crate) top: Vec<ContractSummary>,
@@ -179,16 +493,16 @@ impl WindowSummary {
 
 /// Pure aggregation: turn a set of drained per-contract summaries into a
 /// bounded [`WindowSummary`]. Selects the top-`top_k` contracts by update
-/// count (ties broken by contract id for determinism) and rolls the rest up
-/// into an `others` count. Contracts with zero update attempts are ignored
-/// (a tracked contract can have a live map entry but no activity this window).
+/// count, then by bridge sends (ties broken by contract id for determinism)
+/// and rolls the rest up into an `others` count. Inactive contracts (see
+/// [`ContractSummary::is_active`]) are ignored.
 ///
 /// Extracted from the draining/IO so it can be unit-tested without a runtime.
 pub(crate) fn aggregate_window(
     mut summaries: Vec<ContractSummary>,
     top_k: usize,
 ) -> Option<WindowSummary> {
-    summaries.retain(|s| s.updates > 0);
+    summaries.retain(ContractSummary::is_active);
     if summaries.is_empty() {
         return None;
     }
@@ -199,6 +513,10 @@ pub(crate) fn aggregate_window(
     let no_targets: u64 = summaries.iter().map(|s| s.no_targets).sum();
     let fully_covered: u64 = summaries.iter().map(|s| s.fully_covered).sum();
     let interest_resolve_failed: u64 = summaries.iter().map(|s| s.interest_resolve_failed).sum();
+    let mut events = EventCounts::default();
+    for s in &summaries {
+        events.merge(&s.events);
+    }
 
     // Most active first; deterministic tie-break on the contract's raw bytes
     // so a given window always produces the same top-K regardless of map
@@ -208,6 +526,7 @@ pub(crate) fn aggregate_window(
     summaries.sort_by(|a, b| {
         b.updates
             .cmp(&a.updates)
+            .then_with(|| b.events.sent().cmp(&a.events.sent()))
             .then_with(|| a.contract.as_bytes().cmp(b.contract.as_bytes()))
     });
 
@@ -221,6 +540,7 @@ pub(crate) fn aggregate_window(
         no_targets,
         fully_covered,
         interest_resolve_failed,
+        events,
         top: summaries,
         others,
     })
@@ -239,6 +559,74 @@ impl UpdatePropagationStats {
         Self {
             contracts: DashMap::new(),
         }
+    }
+
+    /// The entry for `contract`, created if absent, or `None` when a new
+    /// contract would pass [`MAX_TRACKED_CONTRACTS`].
+    fn counters(
+        &self,
+        contract: ContractInstanceId,
+    ) -> Option<dashmap::mapref::one::RefMut<'_, ContractInstanceId, ContractCounters>> {
+        // Cap only blocks *new* contracts; updates to already-tracked
+        // contracts always proceed. `len()` can briefly race other inserters,
+        // but the cap is a soft memory guard (not a correctness boundary), so
+        // a small overshoot is acceptable.
+        if !self.contracts.contains_key(&contract) && self.contracts.len() >= MAX_TRACKED_CONTRACTS
+        {
+            return None;
+        }
+        Some(self.contracts.entry(contract).or_default())
+    }
+
+    /// Count one [`PropagationEvent`] for `contract`.
+    ///
+    /// Same per-key write guard and tracking cap as [`Self::record_broadcast`].
+    /// Production code reaches this through [`record_propagation_event`], which
+    /// also feeds the telemetry window.
+    ///
+    /// A receiver-side event ([`PropagationEvent::is_received`]) recorded
+    /// here never creates an entry; production records those through
+    /// [`record_received_event`], which says whether this node hosts the
+    /// contract.
+    pub(crate) fn record_event(&self, contract: ContractInstanceId, ev: PropagationEvent) {
+        if ev.is_received() {
+            self.record_received(contract, ev, false);
+        } else if let Some(mut entry) = self.counters(contract) {
+            entry.events.add(ev, 1);
+        }
+    }
+
+    /// Count a receiver-side event, creating an entry for `contract` only
+    /// when this node hosts it (`hosted`), and otherwise only counting
+    /// against an entry already tracked this window. Receiver events are
+    /// recorded before any hosting check, keyed by whatever contract id an
+    /// inbound broadcast names, so allocating for any id would let a peer
+    /// sending broadcasts for random keys fill the [`MAX_TRACKED_CONTRACTS`]
+    /// map and lock this node's own contracts out of it for the window.
+    pub(crate) fn record_received(
+        &self,
+        contract: ContractInstanceId,
+        ev: PropagationEvent,
+        hosted: bool,
+    ) {
+        let entry = if hosted {
+            self.counters(contract)
+        } else {
+            self.contracts.get_mut(&contract)
+        };
+        if let Some(mut entry) = entry {
+            entry.events.add(ev, 1);
+        }
+    }
+
+    /// Non-draining read of one contract's counters, for tests in other
+    /// modules that drive the real production call sites.
+    #[cfg(test)]
+    pub(crate) fn events_for_test(&self, contract: &ContractInstanceId) -> EventCounts {
+        self.contracts
+            .get(contract)
+            .map(|c| c.events)
+            .unwrap_or_default()
     }
 
     /// Record the terminal outcome of one logical broadcast for `contract`.
@@ -262,16 +650,9 @@ impl UpdatePropagationStats {
         targets: usize,
         interest_resolve_failed: usize,
     ) {
-        // Cap only blocks *new* contracts; updates to already-tracked
-        // contracts always proceed. `len()` can briefly race other inserters,
-        // but the cap is a soft memory guard (not a correctness boundary), so
-        // a small overshoot is acceptable.
-        if !self.contracts.contains_key(&contract) && self.contracts.len() >= MAX_TRACKED_CONTRACTS
-        {
+        let Some(mut entry) = self.counters(contract) else {
             return;
-        }
-
-        let mut entry = self.contracts.entry(contract).or_default();
+        };
         entry.updates += 1;
         entry.targets_total += targets as u64;
         if targets == 0 {
@@ -301,12 +682,9 @@ impl UpdatePropagationStats {
         contract: ContractInstanceId,
         interest_resolve_failed: usize,
     ) {
-        if !self.contracts.contains_key(&contract) && self.contracts.len() >= MAX_TRACKED_CONTRACTS
-        {
+        let Some(mut entry) = self.counters(contract) else {
             return;
-        }
-
-        let mut entry = self.contracts.entry(contract).or_default();
+        };
         entry.updates += 1;
         entry.fully_covered += 1;
         entry.interest_resolve_failed += interest_resolve_failed as u64;
@@ -338,6 +716,7 @@ impl UpdatePropagationStats {
                     no_targets: counters.no_targets,
                     fully_covered: counters.fully_covered,
                     interest_resolve_failed: counters.interest_resolve_failed,
+                    events: counters.events,
                 });
             }
             // Remove every entry — clears the map so the cap resets each window.
@@ -346,15 +725,18 @@ impl UpdatePropagationStats {
         out
     }
 
-    /// Drain the current window and emit it at INFO. Public for the periodic
-    /// task and for deterministic unit tests (which call it directly after
-    /// recording, instead of waiting on the real-time ticker).
+    /// Drain the current window and emit it at INFO.
+    ///
+    /// Public for the periodic task and for deterministic unit tests (which
+    /// call it directly after recording, instead of waiting on the real-time
+    /// ticker).
     pub(crate) fn drain_and_log(&self) {
         let Some(summary) = aggregate_window(self.drain_window(), TOP_K) else {
             // Nothing happened this window — stay silent (budget rule).
             return;
         };
 
+        let e = &summary.events;
         tracing::info!(
             contracts = summary.contracts,
             updates = summary.updates,
@@ -362,12 +744,38 @@ impl UpdatePropagationStats {
             no_targets = summary.no_targets,
             fully_covered = summary.fully_covered,
             interest_resolve_failed = summary.interest_resolve_failed,
+            client_originated = e.get(PropagationEvent::ClientOriginated),
+            sent_delta = e.get(PropagationEvent::SentDelta),
+            sent_full = e.get(PropagationEvent::SentFull),
+            skip_summary_equal = e.get(PropagationEvent::SkipSummaryEqual),
+            skip_cached_converged = e.get(PropagationEvent::SkipCachedConverged),
+            skip_probe_converged = e.get(PropagationEvent::SkipProbeConverged),
+            skip_empty_delta = e.get(PropagationEvent::SkipEmptyDelta),
+            skip_not_hosted = e.get(PropagationEvent::SkipNotHosted),
+            skip_no_address = e.get(PropagationEvent::SkipNoAddress),
+            skip_superseded = e.get(PropagationEvent::SkipSuperseded),
+            skip_evicted = e.get(PropagationEvent::SkipEvicted),
+            send_failed = e.get(PropagationEvent::SendFailed),
+            wire_short = e.get(PropagationEvent::WireShort),
+            wire_stream = e.get(PropagationEvent::WireStream),
+            wire_unobserved = e.get(PropagationEvent::WireUnobserved),
+            wire_stream_delivered = e.get(PropagationEvent::WireStreamDelivered),
+            wire_stream_failed = e.get(PropagationEvent::WireStreamFailed),
+            wire_stream_egress_abandoned = e.get(PropagationEvent::WireStreamEgressAbandoned),
+            wire_send_failed = e.get(PropagationEvent::WireSendFailed),
+            fanout_event_dropped = e.get(PropagationEvent::FanoutEventDropped),
+            heal_event_dropped = e.get(PropagationEvent::HealEventDropped),
+            heal_target = e.get(PropagationEvent::HealTarget),
+            rx_dedup = e.get(PropagationEvent::RxDedup),
+            rx_already_applied = e.get(PropagationEvent::RxAlreadyApplied),
+            rx_backoff = e.get(PropagationEvent::RxBackoff),
             window_s = SUMMARY_WINDOW.as_secs(),
             phase = "summary",
             "update_propagation_summary"
         );
 
         for c in &summary.top {
+            let e = &c.events;
             tracing::info!(
                 contract = %format!("{:.8}", c.contract),
                 updates = c.updates,
@@ -375,6 +783,31 @@ impl UpdatePropagationStats {
                 no_targets = c.no_targets,
                 fully_covered = c.fully_covered,
                 interest_resolve_failed = c.interest_resolve_failed,
+                client_originated = e.get(PropagationEvent::ClientOriginated),
+                sent_delta = e.get(PropagationEvent::SentDelta),
+                sent_full = e.get(PropagationEvent::SentFull),
+                skip_summary_equal = e.get(PropagationEvent::SkipSummaryEqual),
+                skip_cached_converged = e.get(PropagationEvent::SkipCachedConverged),
+                skip_probe_converged = e.get(PropagationEvent::SkipProbeConverged),
+                skip_empty_delta = e.get(PropagationEvent::SkipEmptyDelta),
+                skip_not_hosted = e.get(PropagationEvent::SkipNotHosted),
+                skip_no_address = e.get(PropagationEvent::SkipNoAddress),
+                skip_superseded = e.get(PropagationEvent::SkipSuperseded),
+                skip_evicted = e.get(PropagationEvent::SkipEvicted),
+                send_failed = e.get(PropagationEvent::SendFailed),
+                wire_short = e.get(PropagationEvent::WireShort),
+                wire_stream = e.get(PropagationEvent::WireStream),
+                wire_unobserved = e.get(PropagationEvent::WireUnobserved),
+                wire_stream_delivered = e.get(PropagationEvent::WireStreamDelivered),
+                wire_stream_failed = e.get(PropagationEvent::WireStreamFailed),
+                wire_stream_egress_abandoned = e.get(PropagationEvent::WireStreamEgressAbandoned),
+                wire_send_failed = e.get(PropagationEvent::WireSendFailed),
+                fanout_event_dropped = e.get(PropagationEvent::FanoutEventDropped),
+                heal_event_dropped = e.get(PropagationEvent::HealEventDropped),
+                heal_target = e.get(PropagationEvent::HealTarget),
+                rx_dedup = e.get(PropagationEvent::RxDedup),
+                rx_already_applied = e.get(PropagationEvent::RxAlreadyApplied),
+                rx_backoff = e.get(PropagationEvent::RxBackoff),
                 phase = "summary_contract",
                 "update_propagation_summary contract detail"
             );
@@ -422,6 +855,114 @@ impl UpdatePropagationStats {
     }
 }
 
+/// The two places a [`PropagationEvent`] is counted, held for code that has
+/// no [`crate::node::OpManager`] at hand: the per-connection send task, which
+/// sees how the transport carried each UPDATE broadcast.
+#[derive(Clone)]
+pub(crate) struct PropagationSink {
+    stats: std::sync::Arc<UpdatePropagationStats>,
+    mix: std::sync::Arc<crate::node::PayloadMix>,
+}
+
+impl PropagationSink {
+    pub(crate) fn of(op_manager: &crate::node::OpManager) -> Self {
+        Self {
+            stats: op_manager.update_propagation_stats.clone(),
+            mix: op_manager.payload_mix.clone(),
+        }
+    }
+
+    /// Same as [`record_propagation_event`].
+    pub(crate) fn record(&self, contract: &ContractInstanceId, ev: PropagationEvent) {
+        self.stats.record_event(*contract, ev);
+        self.mix.record_propagation_event(ev);
+    }
+
+    /// Same as [`record_propagation_stream_fate`].
+    pub(crate) fn record_stream_fate(
+        &self,
+        contract: &ContractInstanceId,
+        outcome: Option<crate::transport::StreamSendOutcome>,
+    ) -> PropagationEvent {
+        let ev = PropagationEvent::for_stream_outcome(outcome);
+        self.record(contract, ev);
+        ev
+    }
+
+    /// A sink of its own, for tests, with the stats and the telemetry window
+    /// it records into.
+    #[cfg(test)]
+    pub(crate) fn for_test() -> (
+        Self,
+        std::sync::Arc<UpdatePropagationStats>,
+        std::sync::Arc<crate::node::PayloadMix>,
+    ) {
+        let stats = std::sync::Arc::new(UpdatePropagationStats::new());
+        let mix = std::sync::Arc::new(crate::node::PayloadMix::new());
+        let sink = Self {
+            stats: stats.clone(),
+            mix: mix.clone(),
+        };
+        (sink, stats, mix)
+    }
+}
+
+/// Count one [`PropagationEvent`] in BOTH the per-contract INFO summary and
+/// the node-wide `broadcast_payload_mix` telemetry window.
+///
+/// The single entry point production code uses, so the two agree on every
+/// event, with two exceptions where the node-wide telemetry counts an event
+/// the per-contract summary leaves out: any event for a contract new to the
+/// window once [`MAX_TRACKED_CONTRACTS`] are tracked, and a receiver-side
+/// `rx_*` event for a contract this node does not host and has no entry for
+/// in the window (see [`record_received_event`]).
+pub(crate) fn record_propagation_event(
+    op_manager: &crate::node::OpManager,
+    contract: &ContractInstanceId,
+    ev: PropagationEvent,
+) {
+    op_manager
+        .update_propagation_stats
+        .record_event(*contract, ev);
+    op_manager.payload_mix.record_propagation_event(ev);
+}
+
+/// Count a receiver-side `rx_*` event like [`record_propagation_event`],
+/// except that the per-contract summary creates an entry for `key` only when
+/// this node hosts it (see [`UpdatePropagationStats::record_received`]).
+/// Telemetry counts every one.
+///
+/// The gate is `is_hosting_contract`, narrower than the send side's
+/// `should_broadcast_contract` (hosted or in use, and state on disk). That
+/// one reads the state store, too costly for every inbound broadcast. So a
+/// contract that is in use but not hosted gets its `rx_*` counts only once
+/// something else (a client update, a fan-out) has created its entry in the
+/// window; telemetry counts them regardless.
+pub(crate) fn record_received_event(
+    op_manager: &crate::node::OpManager,
+    key: &freenet_stdlib::prelude::ContractKey,
+    ev: PropagationEvent,
+) {
+    let hosted = op_manager.ring.is_hosting_contract(key);
+    op_manager
+        .update_propagation_stats
+        .record_received(*key.id(), ev, hosted);
+    op_manager.payload_mix.record_propagation_event(ev);
+}
+
+/// Count the fate of an UPDATE broadcast stream from its completion signal
+/// (`None` when none came), like [`record_propagation_event`]. Returns the
+/// event counted.
+pub(crate) fn record_propagation_stream_fate(
+    op_manager: &crate::node::OpManager,
+    contract: &ContractInstanceId,
+    outcome: Option<crate::transport::StreamSendOutcome>,
+) -> PropagationEvent {
+    let ev = PropagationEvent::for_stream_outcome(outcome);
+    record_propagation_event(op_manager, contract, ev);
+    ev
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -447,6 +988,7 @@ mod tests {
             no_targets: 0,
             fully_covered: 0,
             interest_resolve_failed: 5,
+            events: EventCounts::default(),
         }];
         assert!(aggregate_window(summaries, TOP_K).is_none());
     }
@@ -461,6 +1003,7 @@ mod tests {
                 no_targets: 0,
                 fully_covered: 0,
                 interest_resolve_failed: 1,
+                events: EventCounts::default(),
             },
             ContractSummary {
                 contract: cid(2),
@@ -469,6 +1012,7 @@ mod tests {
                 no_targets: 3,
                 fully_covered: 0,
                 interest_resolve_failed: 4,
+                events: EventCounts::default(),
             },
         ];
         let w = aggregate_window(summaries, TOP_K).expect("non-empty");
@@ -498,6 +1042,7 @@ mod tests {
                 no_targets: 0,
                 fully_covered: 0,
                 interest_resolve_failed: 0,
+                events: EventCounts::default(),
             })
             .collect();
         let w = aggregate_window(summaries, 2).expect("non-empty");
@@ -521,6 +1066,7 @@ mod tests {
                 no_targets: 0,
                 fully_covered: 0,
                 interest_resolve_failed: 0,
+                events: EventCounts::default(),
             },
             ContractSummary {
                 contract: cid(3),
@@ -529,6 +1075,7 @@ mod tests {
                 no_targets: 0,
                 fully_covered: 0,
                 interest_resolve_failed: 0,
+                events: EventCounts::default(),
             },
         ];
         let w = aggregate_window(summaries, 1).expect("non-empty");
@@ -950,5 +1497,465 @@ mod tests {
             "the fresh-no-target record must be gated on `!is_retry && !is_reemit` so retry \
              and #4359 deferred re-emissions are not counted as fresh broadcasts."
         );
+    }
+
+    // ── #6143: per-leg outcomes ───────────────────────────────────────────
+
+    fn counts(pairs: &[(PropagationEvent, u64)]) -> EventCounts {
+        let mut c = EventCounts::default();
+        for (ev, n) in pairs {
+            c.add(*ev, *n);
+        }
+        c
+    }
+
+    fn summary(contract: ContractInstanceId, targets: u64, events: EventCounts) -> ContractSummary {
+        ContractSummary {
+            contract,
+            updates: u64::from(targets > 0),
+            targets_total: targets,
+            no_targets: 0,
+            fully_covered: 0,
+            interest_resolve_failed: 0,
+            events,
+        }
+    }
+
+    #[test]
+    fn propagation_events_are_densely_indexed() {
+        let mut labels = std::collections::HashSet::new();
+        for (i, ev) in PropagationEvent::ALL.iter().enumerate() {
+            assert_eq!(ev.index(), i, "{ev:?} is out of place in ALL");
+            assert!(labels.insert(ev.label()), "duplicate label {}", ev.label());
+        }
+    }
+
+    #[test]
+    fn a_stream_outcome_maps_to_its_wire_event() {
+        use crate::transport::StreamSendOutcome;
+        for (outcome, want) in [
+            (
+                Some(StreamSendOutcome::Delivered),
+                PropagationEvent::WireStreamDelivered,
+            ),
+            (
+                Some(StreamSendOutcome::EgressAbandoned),
+                PropagationEvent::WireStreamEgressAbandoned,
+            ),
+            (
+                Some(StreamSendOutcome::Dropped),
+                PropagationEvent::WireStreamFailed,
+            ),
+            (None, PropagationEvent::WireStreamFailed),
+        ] {
+            assert_eq!(
+                PropagationEvent::for_stream_outcome(outcome),
+                want,
+                "{outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_event_is_counted_against_its_own_contract() {
+        let stats = UpdatePropagationStats::new();
+        let (a, b) = (cid(1), cid(2));
+        for ev in PropagationEvent::ALL {
+            stats.record_event(a, ev);
+        }
+        stats.record_event(a, PropagationEvent::SkipSummaryEqual);
+        stats.record_event(b, PropagationEvent::SkipNoAddress);
+        stats.record_event(b, PropagationEvent::RxBackoff);
+
+        let a_events = stats.events_for_test(&a);
+        for ev in PropagationEvent::ALL {
+            let want = if ev == PropagationEvent::SkipSummaryEqual {
+                2
+            } else {
+                1
+            };
+            assert_eq!(a_events.get(ev), want, "{ev:?}");
+        }
+        let b_events = stats.events_for_test(&b);
+        assert_eq!(b_events.get(PropagationEvent::RxBackoff), 1);
+        assert_eq!(b_events.sent(), 0);
+        assert_eq!(a_events.sent(), 2, "sent = sent_delta + sent_full");
+    }
+
+    /// A receiver-side event names whatever contract an inbound broadcast
+    /// carries, before any hosting check, so it counts only against a
+    /// contract already tracked: a peer replaying broadcasts for random keys
+    /// must not fill the tracking cap and lock this node's own contracts out.
+    #[test]
+    fn a_received_event_never_allocates_a_tracking_entry() {
+        let id_at = |i: usize| {
+            let mut bytes = [0u8; 32];
+            bytes[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            ContractInstanceId::new(bytes)
+        };
+        let stats = UpdatePropagationStats::new();
+        for rx in [
+            PropagationEvent::RxDedup,
+            PropagationEvent::RxAlreadyApplied,
+            PropagationEvent::RxBackoff,
+        ] {
+            assert!(rx.is_received());
+            for i in 0..MAX_TRACKED_CONTRACTS + 1 {
+                stats.record_event(id_at(i), rx);
+            }
+        }
+        assert_eq!(
+            stats.contracts.len(),
+            0,
+            "no entry for an untracked contract"
+        );
+        for i in 0..MAX_TRACKED_CONTRACTS + 1 {
+            stats.record_received(id_at(i), PropagationEvent::RxDedup, false);
+        }
+        assert_eq!(
+            stats.contracts.len(),
+            0,
+            "nor for one this node does not host"
+        );
+
+        let hosted = cid(201);
+        stats.record_received(hosted, PropagationEvent::RxBackoff, true);
+        assert_eq!(
+            stats
+                .events_for_test(&hosted)
+                .get(PropagationEvent::RxBackoff),
+            1,
+            "a hosted contract gets an entry for its received events"
+        );
+
+        let own = cid(200);
+        stats.record_event(own, PropagationEvent::ClientOriginated);
+        assert_eq!(
+            stats.contracts.len(),
+            2,
+            "this node's contracts are tracked"
+        );
+        stats.record_event(own, PropagationEvent::RxDedup);
+        assert_eq!(
+            stats.events_for_test(&own).get(PropagationEvent::RxDedup),
+            1,
+            "a tracked contract still counts its received events"
+        );
+        for ev in PropagationEvent::ALL {
+            let rx = matches!(
+                ev,
+                PropagationEvent::RxDedup
+                    | PropagationEvent::RxAlreadyApplied
+                    | PropagationEvent::RxBackoff
+            );
+            assert_eq!(ev.is_received(), rx, "{ev:?}");
+        }
+    }
+
+    /// A contract with no fan-out of its own (a heal-only or receive-only
+    /// contract) still has a story to tell, so it must not be filtered out of
+    /// the window the way an idle contract is.
+    #[test]
+    fn a_window_with_only_propagation_events_is_still_reported() {
+        let w = aggregate_window(
+            vec![summary(
+                cid(4),
+                0,
+                counts(&[(PropagationEvent::RxDedup, 3)]),
+            )],
+            TOP_K,
+        )
+        .expect("an event-only contract is activity");
+        assert_eq!(w.contracts, 1);
+        assert_eq!(w.updates, 0);
+        assert_eq!(w.events.get(PropagationEvent::RxDedup), 3);
+    }
+
+    /// The memory estimate on [`MAX_TRACKED_CONTRACTS`] holds.
+    #[test]
+    fn a_tracked_contract_stays_within_its_memory_bound() {
+        for (what, size) in [
+            ("ContractCounters", std::mem::size_of::<ContractCounters>()),
+            ("ContractSummary", std::mem::size_of::<ContractSummary>()),
+        ] {
+            assert!(size <= MAX_COUNTERS_SIZE, "{what}: {size} bytes");
+        }
+    }
+
+    /// End to end through the real recorders and the real drain: the INFO line
+    /// carries the per-leg counts.
+    #[test]
+    fn drain_and_log_reports_leg_outcomes() {
+        use crate::test_utils::TestLogger;
+
+        let logger = TestLogger::new().capture_logs().with_level("info").init();
+        let stats = UpdatePropagationStats::new();
+        let c = cid(42);
+        stats.record_event(c, PropagationEvent::ClientOriginated);
+        stats.record_broadcast(c, 3, 0);
+        for _ in 0..3 {
+            stats.record_event(c, PropagationEvent::SkipSummaryEqual);
+        }
+
+        // The captured lines carry ANSI colour codes between a field's name
+        // and its value; strip them to match `name: value`.
+        let plain = |logger: &TestLogger| {
+            let mut out = String::new();
+            for line in logger.logs() {
+                let mut chars = line.chars();
+                while let Some(ch) = chars.next() {
+                    if ch == '\u{1b}' {
+                        for c in chars.by_ref() {
+                            if c == 'm' {
+                                break;
+                            }
+                        }
+                    } else {
+                        out.push(ch);
+                    }
+                }
+                out.push('\n');
+            }
+            out
+        };
+
+        stats.drain_and_log();
+        let text = plain(&logger);
+        assert!(text.contains("skip_summary_equal: 3"), "{text}");
+        assert!(text.contains("client_originated: 1"), "{text}");
+        assert!(text.contains("sent_delta: 0"), "{text}");
+    }
+
+    /// Pin: the simulation fan-out (`broadcast_state_to_peers`, the only
+    /// fan-out `simulation_tests` builds run) counts each leg's outcome like
+    /// the production queue. Without the `Sent*` counts every client update in
+    /// a simulation read as unsent, and without the skips a simulation could
+    /// not show where its legs went.
+    ///
+    /// A source pin, not a behavioural test: that function exists only under
+    /// `simulation_tests`, which the lib test job does not build, and the
+    /// simulation job runs no lib test outside `sim_e2e_tests`. So each
+    /// recording site is pinned in its place, on the function's body with
+    /// comments and whitespace removed (so a commented-out call is gone and
+    /// rustfmt cannot move a needle): the number of calls, and for each its
+    /// context. The `SkipNotHosted` count runs once per target; every other
+    /// site is in the per-target loop; each skip and the serialization
+    /// failure end their leg with a `continue` in the same block; the refused
+    /// send is counted in the `Err` arm of the send result and the `Sent*`
+    /// count in its `else` arm, with the delta and full arms the right way
+    /// round.
+    #[test]
+    fn the_simulation_fan_out_counts_its_legs() {
+        let src = include_str!("../../node/network_bridge/p2p_protoc/broadcast.rs");
+        let signature = "\n    async fn broadcast_state_to_peers(";
+        assert_eq!(
+            src.matches(signature).count(),
+            1,
+            "the simulation fan-out's signature must be unique"
+        );
+        let at = src.find(signature).expect("simulation fan-out not found") + 1;
+        // The method is indented four spaces, so its closing brace is the
+        // first line holding only `    }`; nothing inside it sits that far
+        // left.
+        let len = src[at..]
+            .find("\n    }\n")
+            .expect("end of the simulation fan-out not found");
+        // Line comments and all whitespace removed. The body holds no string
+        // with `//` in it, so cutting at `//` removes only comments.
+        let body: String = src[at..at + len]
+            .lines()
+            .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+            .flat_map(str::chars)
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        // The span of the block whose `{` is at `open`, without its braces.
+        let block = |text: &str, open: usize| -> (usize, usize) {
+            assert_eq!(&text[open..=open], "{", "not a block");
+            let mut depth = 0usize;
+            for (i, ch) in text[open..].char_indices() {
+                match ch {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return (open + 1, open + i);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            panic!("unbalanced block at {open}");
+        };
+        // The block opened by the unique occurrence of `head`, which ends
+        // in `{`.
+        let block_after = |text: &str, head: &str| -> (usize, usize) {
+            assert_eq!(
+                text.matches(head).count(),
+                1,
+                "the simulation fan-out must hold `{head}` once"
+            );
+            let open = text.find(head).map(|i| i + head.len() - 1).unwrap_or(0);
+            block(text, open)
+        };
+        // What follows `at` up to the end of its block, at that block's
+        // nesting level only.
+        let rest_of_block = |text: &str, at: usize| -> String {
+            let mut depth = 0usize;
+            let mut out = String::new();
+            for ch in text[at..].chars() {
+                match ch {
+                    '{' => depth += 1,
+                    '}' if depth == 0 => break,
+                    '}' => depth -= 1,
+                    _ if depth == 0 => out.push(ch),
+                    _ => {}
+                }
+            }
+            out
+        };
+        let calls = |needle: &str| body.matches(needle).count();
+
+        // Every `count(..)` below records against the fan-out's own contract:
+        // the closure is defined once, at the fan-out's top level, keyed by
+        // `key`.
+        let closure = "letcount=|ev|record_propagation_event(op_manager,key.id(),ev);";
+        assert_eq!(calls("letcount="), 1, "one `count` closure");
+        let closure_at = body.find(closure).expect("`count` records against `key`");
+        assert_eq!(
+            body[..closure_at].matches('{').count(),
+            body[..closure_at].matches('}').count() + 1,
+            "the `count` closure is defined at the fan-out's top level"
+        );
+
+        // Not hosted: one count per target, then out.
+        let not_hosted = "count(PropagationEvent::SkipNotHosted);";
+        assert_eq!(calls(not_hosted), 1, "`{not_hosted}`");
+        assert!(
+            body.contains(&format!(
+                "for_in&target_result.targets{{{not_hosted}}}return;"
+            )),
+            "the not-hosted skip must be counted once per target"
+        );
+
+        let (loop_start, loop_end) = block_after(&body, "fortargetin&target_result.targets{");
+        let per_leg = &body[loop_start..loop_end];
+        // The no-address skip is the loop's first statement and ends the leg.
+        assert!(
+            per_leg.starts_with(
+                "letSome(peer_addr)=target.socket_addr()else{\
+                 count(PropagationEvent::SkipNoAddress);continue;};"
+            ),
+            "the no-address skip must be counted, then end its leg"
+        );
+        // Each skip, and the serialization failure, ends its leg.
+        for needle in [
+            "count(PropagationEvent::SkipNoAddress);",
+            "count(skip);",
+            "count(PropagationEvent::SkipEmptyDelta);",
+        ] {
+            assert_eq!(calls(needle), 1, "`{needle}`");
+            let at = per_leg.find(needle).expect("in the per-target loop");
+            assert!(
+                rest_of_block(per_leg, at + needle.len()).contains("continue;"),
+                "`{needle}` must end its leg"
+            );
+        }
+        let failed = "count(PropagationEvent::SendFailed);";
+        assert_eq!(calls(failed), 2, "`{failed}`");
+        assert_eq!(per_leg.matches(failed).count(), 2, "`{failed}` per leg");
+
+        // The send result: refused in `Err`, sent in `else`.
+        let head = "ifletErr(err)=send_result{";
+        let (err_start, err_end) = block_after(per_leg, head);
+        let err_arm = &per_leg[err_start..err_end];
+        assert!(
+            rest_of_block(err_arm, 0).contains(failed),
+            "a refused send must be counted in the `Err` arm"
+        );
+        let serialize_failed = per_leg
+            .match_indices(failed)
+            .map(|(i, _)| i)
+            .find(|&i| i < err_start || i >= err_end)
+            .expect("the serialization failure's count");
+        assert!(
+            rest_of_block(per_leg, serialize_failed + failed.len()).contains("continue;"),
+            "the serialization failure must end its leg"
+        );
+        assert!(
+            per_leg[err_end..].starts_with("}else{"),
+            "the send result must have an `else` arm"
+        );
+        let (else_start, else_end) = block(per_leg, err_end + "}else".len());
+        let sent =
+            "count(ifsent_delta{PropagationEvent::SentDelta}else{PropagationEvent::SentFull});";
+        assert_eq!(calls(sent), 1, "`{sent}`");
+        let else_arm = &per_leg[else_start..else_end];
+        let in_else = else_arm
+            .find(sent)
+            .expect("the `Sent*` count in the `else` arm");
+        assert_eq!(
+            else_arm[..in_else].matches('{').count(),
+            else_arm[..in_else].matches('}').count(),
+            "the `Sent*` count must be a statement of the send result's `else` arm"
+        );
+    }
+
+    /// Pin: every [`PropagationEvent`] is recorded somewhere in production
+    /// code. Counting the recorder in tests proves nothing if no production
+    /// path calls it with that variant — the "manually-mirrored counter rots"
+    /// pattern in `.claude/rules/bug-prevention-patterns.md`.
+    #[test]
+    fn every_propagation_event_has_a_production_recording_site() {
+        let sources = [
+            include_str!("../../node/network_bridge/broadcast_queue.rs"),
+            include_str!("../../node/network_bridge/p2p_protoc.rs"),
+            include_str!("../../node/op_state_manager.rs"),
+            include_str!("../update.rs"),
+            include_str!("op_ctx_task.rs"),
+        ];
+        // Production code only: everything above the first top-level test
+        // module, whatever its visibility.
+        let production = |src: &'static str| -> &'static str {
+            let test_mod = src.match_indices("\n#[cfg(test)]\n").find(|(i, m)| {
+                let rest = &src[i + m.len()..];
+                ["mod ", "pub(crate) mod ", "pub(super) mod "]
+                    .iter()
+                    .any(|p| rest.starts_with(p))
+            });
+            test_mod.map_or(src, |(i, _)| &src[..i])
+        };
+        let named = |src: &'static str, needle: &str| {
+            production(src).lines().any(|line| {
+                let line = line.trim_start();
+                !line.starts_with("//") && line.contains(needle)
+            })
+        };
+        // Both stream paths (the broadcast queue's full-state streams and the
+        // connection task's inline broadcasts) must count a stream's start
+        // and record its fate through the stream-fate recorder, which maps
+        // the outcome to one of the three fate events.
+        let by_outcome = [
+            PropagationEvent::WireStream,
+            PropagationEvent::WireStreamDelivered,
+            PropagationEvent::WireStreamFailed,
+            PropagationEvent::WireStreamEgressAbandoned,
+        ];
+        for (src, fate) in [
+            (sources[0], "record_propagation_stream_fate("),
+            (sources[1], ".record_stream_fate("),
+        ] {
+            assert!(
+                named(src, "PropagationEvent::WireStream)") && named(src, fate),
+                "a stream path no longer records its stream's start and fate"
+            );
+        }
+        for ev in PropagationEvent::ALL {
+            if by_outcome.contains(&ev) {
+                continue;
+            }
+            let needle = format!("PropagationEvent::{ev:?}");
+            let found = sources.iter().any(|src| named(src, &needle));
+            assert!(found, "{needle} is never recorded by production code");
+        }
     }
 }

@@ -3083,6 +3083,10 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 "quic_close_sent_session_ended".into(),
                 serde_json::json!(snapshot.quic_close_sent_session_ended),
             );
+            m.insert(
+                "quic_close_sent_over_budget".into(),
+                serde_json::json!(snapshot.quic_close_sent_over_budget),
+            );
             {
                 use crate::transport::metrics::{
                     QuicCloseCode, QuicFallback, QuicPathAge, QuicUpgradeOutcome,
@@ -3344,6 +3348,22 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
             m.insert(
                 "egress_debt_forgiven_bytes".into(),
                 serde_json::json!(snapshot.egress_debt_forgiven_bytes),
+            );
+            m.insert(
+                "egress_retransmits_deferred".into(),
+                serde_json::json!(snapshot.egress_retransmits_deferred),
+            );
+            m.insert(
+                "egress_retransmits_uncapped".into(),
+                serde_json::json!(snapshot.egress_retransmits_uncapped),
+            );
+            m.insert(
+                "egress_retransmits_uncapped_bytes".into(),
+                serde_json::json!(snapshot.egress_retransmits_uncapped_bytes),
+            );
+            m.insert(
+                "egress_probes_skipped".into(),
+                serde_json::json!(snapshot.egress_probes_skipped),
             );
             for (key, count) in snapshot.nonzero_conn_identity() {
                 m.insert(key, serde_json::json!(count));
@@ -4008,6 +4028,56 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 obj.insert(
                     "hosting_retractions_dropped".to_string(),
                     serde_json::json!(snapshot.hosting_retractions_dropped),
+                );
+                // Delegate lane counters. Pinned by
+                // `router_snapshot_json_includes_delegate_lane_counters`.
+                obj.insert(
+                    "delegate_lane_requests_refused".to_string(),
+                    serde_json::json!(snapshot.delegate_lane_requests_refused),
+                );
+                obj.insert(
+                    "delegate_lane_panics".to_string(),
+                    serde_json::json!(snapshot.delegate_lane_panics),
+                );
+                obj.insert(
+                    "delegate_lane_deaths".to_string(),
+                    serde_json::json!(snapshot.delegate_lane_deaths),
+                );
+                obj.insert(
+                    "inter_delegate_messages_dropped".to_string(),
+                    serde_json::json!(snapshot.inter_delegate_messages_dropped),
+                );
+                obj.insert(
+                    "delegate_lane_runs".to_string(),
+                    serde_json::json!(snapshot.delegate_lane_runs),
+                );
+                obj.insert(
+                    "delegate_lane_forwarded_busy".to_string(),
+                    serde_json::json!(snapshot.delegate_lane_forwarded_busy),
+                );
+                obj.insert(
+                    "delegate_lane_forwarded_parked".to_string(),
+                    serde_json::json!(snapshot.delegate_lane_forwarded_parked),
+                );
+                obj.insert(
+                    "delegate_lane_forwarded_loop_owned".to_string(),
+                    serde_json::json!(snapshot.delegate_lane_forwarded_loop_owned),
+                );
+                obj.insert(
+                    "delegate_lane_forwarded_unit_bound".to_string(),
+                    serde_json::json!(snapshot.delegate_lane_forwarded_unit_bound),
+                );
+                obj.insert(
+                    "delegate_lane_forwarded_not_runnable".to_string(),
+                    serde_json::json!(snapshot.delegate_lane_forwarded_not_runnable),
+                );
+                obj.insert(
+                    "delegate_lane_forwarded_forged".to_string(),
+                    serde_json::json!(snapshot.delegate_lane_forwarded_forged),
+                );
+                obj.insert(
+                    "delegate_lane_forwarded_lane_down".to_string(),
+                    serde_json::json!(snapshot.delegate_lane_forwarded_lane_down),
                 );
                 // Streamed-transfer abort counters (Group B), routing/hosting
                 // attribution (Group C), and connect-emit counters — same
@@ -5108,6 +5178,47 @@ mod tests {
         for (key, want) in [
             ("hosting_retractions_emitted", 509),
             ("hosting_retractions_dropped", 521),
+        ] {
+            assert_eq!(json[key], want, "{key} must reach the OTLP body");
+        }
+    }
+
+    /// Pin: the delegate lane counters must reach the hand-mirrored OTLP
+    /// body. Each counts a client-visible loss (a refused request, a panicked
+    /// run, a dropped inter-delegate message) that is otherwise only a log
+    /// line.
+    #[test]
+    fn router_snapshot_json_includes_delegate_lane_counters() {
+        use arbitrary::{Arbitrary, Unstructured};
+        let mut u = Unstructured::new(&[0u8; 4096]);
+        let mut info = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
+            .expect("construct RouterSnapshotInfo for test");
+        info.delegate_lane_requests_refused = Some(601);
+        info.delegate_lane_panics = Some(607);
+        info.inter_delegate_messages_dropped = Some(613);
+        info.delegate_lane_runs = Some(617);
+        info.delegate_lane_forwarded_busy = Some(619);
+        info.delegate_lane_forwarded_parked = Some(621);
+        info.delegate_lane_forwarded_loop_owned = Some(623);
+        info.delegate_lane_forwarded_unit_bound = Some(625);
+        info.delegate_lane_forwarded_not_runnable = Some(627);
+        info.delegate_lane_forwarded_forged = Some(629);
+        info.delegate_lane_deaths = Some(631);
+        info.delegate_lane_forwarded_lane_down = Some(641);
+        let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
+        for (key, want) in [
+            ("delegate_lane_requests_refused", 601),
+            ("delegate_lane_panics", 607),
+            ("inter_delegate_messages_dropped", 613),
+            ("delegate_lane_runs", 617),
+            ("delegate_lane_forwarded_busy", 619),
+            ("delegate_lane_forwarded_parked", 621),
+            ("delegate_lane_forwarded_loop_owned", 623),
+            ("delegate_lane_forwarded_unit_bound", 625),
+            ("delegate_lane_forwarded_not_runnable", 627),
+            ("delegate_lane_forwarded_forged", 629),
+            ("delegate_lane_deaths", 631),
+            ("delegate_lane_forwarded_lane_down", 641),
         ] {
             assert_eq!(json[key], want, "{key} must reach the OTLP body");
         }
@@ -7715,6 +7826,10 @@ mod tests {
         data.loss_rate = (1019..1027).collect();
         data.ended_loss_rate = (1027..1035).collect();
         data.ended_below_floor = 1035;
+        data.send_resets = 1036;
+        data.path_ms = 1037;
+        data.send_resets_reached = (1038..1042).collect();
+        data.send_resets_path_max = 1042;
         let want: std::collections::BTreeMap<String, u64> =
             snapshot.quic_data.keys().into_iter().collect();
         assert!(want.values().all(|value| *value != 0));
@@ -7783,6 +7898,10 @@ mod tests {
             egress_streams_refused_other: 119,
             egress_debt_hwm_bytes: 30,
             egress_debt_forgiven_bytes: 31,
+            egress_retransmits_deferred: 32,
+            egress_probes_skipped: 33,
+            egress_retransmits_uncapped: 34,
+            egress_retransmits_uncapped_bytes: 35,
             ..Default::default()
         };
         let reference = serde_json::to_value(&snapshot).unwrap();
@@ -7832,6 +7951,10 @@ mod tests {
             ("egress_streams_refused_other", 119),
             ("egress_debt_hwm_bytes", 30),
             ("egress_debt_forgiven_bytes", 31),
+            ("egress_retransmits_deferred", 32),
+            ("egress_probes_skipped", 33),
+            ("egress_retransmits_uncapped", 34),
+            ("egress_retransmits_uncapped_bytes", 35),
         ] {
             assert_eq!(json[key], expected, "event-log value for {key}");
             assert_eq!(json[key], reference[key], "serde value for {key}");
@@ -7970,6 +8093,7 @@ mod tests {
             quic_close_sent_peer_not_acknowledging: 6,
             quic_close_sent_control_refused: 8,
             quic_close_sent_session_ended: 10,
+            quic_close_sent_over_budget: 11,
             quic_breaker_trips: 7,
             quic_send_refused: 9,
             quic_breaker_suppressed: true,
@@ -7989,6 +8113,7 @@ mod tests {
             ("quic_close_sent_peer_not_acknowledging", 6),
             ("quic_close_sent_control_refused", 8),
             ("quic_close_sent_session_ended", 10),
+            ("quic_close_sent_over_budget", 11),
             ("quic_breaker_trips", 7),
             ("quic_send_refused", 9),
         ] {

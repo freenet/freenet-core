@@ -1870,6 +1870,19 @@ fn seed_sender_summary_from_broadcast(
     )
 }
 
+/// Count a receiver-side skip of an inbound broadcast (dedup, already
+/// applied, merge backoff) in the per-contract propagation summary (#6143),
+/// which tracks the contract only if this node hosts it.
+/// Each skip logs at debug only, which release builds compile out, so this
+/// count is how a receiver dropping one sender's broadcasts becomes visible.
+fn count_receiver_skip(
+    op_manager: &OpManager,
+    key: &ContractKey,
+    ev: super::propagation_stats::PropagationEvent,
+) {
+    super::propagation_stats::record_received_event(op_manager, key, ev);
+}
+
 /// Inner driver for `BroadcastTo`. Mirrors `update.rs:595-825`.
 ///
 /// 1. Update sender's cached summary in `interest_manager`.
@@ -1951,6 +1964,11 @@ async fn drive_relay_broadcast_to(
         op_manager.interest_manager.now(),
     ) {
         receiver_terminal.mark_dedup();
+        count_receiver_skip(
+            op_manager,
+            &key,
+            super::propagation_stats::PropagationEvent::RxDedup,
+        );
         tracing::debug!(
             tx = %incoming_tx,
             %key,
@@ -1978,6 +1996,11 @@ async fn drive_relay_broadcast_to(
             .payload_hash(is_delta, &payload_bytes),
     ) {
         receiver_terminal.mark_already_applied();
+        count_receiver_skip(
+            op_manager,
+            &key,
+            super::propagation_stats::PropagationEvent::RxAlreadyApplied,
+        );
         tracing::debug!(
             tx = %incoming_tx,
             %key,
@@ -2009,6 +2032,11 @@ async fn drive_relay_broadcast_to(
         decision @ (crate::ring::merge_backoff::MergeDecision::InBackoff
         | crate::ring::merge_backoff::MergeDecision::KnownFailedPayload) => {
             receiver_terminal.mark_backoff();
+            count_receiver_skip(
+                op_manager,
+                &key,
+                super::propagation_stats::PropagationEvent::RxBackoff,
+            );
             crate::config::GlobalTestMetrics::record_merge_suppressed_by_backoff();
             tracing::debug!(
                 tx = %incoming_tx,
@@ -2923,6 +2951,11 @@ async fn apply_streaming_broadcast(
         op_manager.interest_manager.now(),
     ) {
         receiver_terminal.mark_dedup();
+        count_receiver_skip(
+            op_manager,
+            &key,
+            super::propagation_stats::PropagationEvent::RxDedup,
+        );
         tracing::debug!(
             tx = %incoming_tx,
             %key,
@@ -2941,6 +2974,11 @@ async fn apply_streaming_broadcast(
             .payload_hash(false, &state_bytes),
     ) {
         receiver_terminal.mark_already_applied();
+        count_receiver_skip(
+            op_manager,
+            &key,
+            super::propagation_stats::PropagationEvent::RxAlreadyApplied,
+        );
         tracing::debug!(
             tx = %incoming_tx,
             %key,
@@ -2962,6 +3000,11 @@ async fn apply_streaming_broadcast(
         decision @ (crate::ring::merge_backoff::MergeDecision::InBackoff
         | crate::ring::merge_backoff::MergeDecision::KnownFailedPayload) => {
             receiver_terminal.mark_backoff();
+            count_receiver_skip(
+                op_manager,
+                &key,
+                super::propagation_stats::PropagationEvent::RxBackoff,
+            );
             crate::config::GlobalTestMetrics::record_merge_suppressed_by_backoff();
             tracing::debug!(
                 tx = %incoming_tx,
@@ -4479,6 +4522,189 @@ mod tests {
             "a second streaming queue-full drop within the throttle window MUST \
              NOT emit another ResyncRequest (bounds #4251 amplification)"
         );
+    }
+
+    /// #6143: a receiver skipping a broadcast before the merge logs at debug,
+    /// so release builds cannot see it. Driving both real receive paths with
+    /// the same payload twice must count the second as a dedup skip against
+    /// the contract.
+    #[tokio::test]
+    async fn receiver_dedup_skip_is_counted_on_both_broadcast_paths() {
+        use crate::operations::update::propagation_stats::PropagationEvent as Ev;
+
+        let (op_manager, _notification_rx, _guard) =
+            build_queue_full_test_node("rx-dedup-count-6143").await;
+        let sender_addr: SocketAddr = "127.0.0.1:12300".parse().unwrap();
+        let inline_key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([11u8; 32]),
+            CodeHash::new([12u8; 32]),
+        );
+        let stream_key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([13u8; 32]),
+            CodeHash::new([14u8; 32]),
+        );
+        // Only a hosted contract gets a per-contract entry for a received
+        // event; `unhosted` stands for a key a peer made up.
+        let unhosted = ContractKey::from_id_and_code(
+            ContractInstanceId::new([15u8; 32]),
+            CodeHash::new([16u8; 32]),
+        );
+        for key in [inline_key, stream_key] {
+            host_for_test(&op_manager, key);
+        }
+
+        for _ in 0..2 {
+            let _result: Result<(), OpError> = drive_relay_broadcast_to(
+                &op_manager,
+                Transaction::new::<UpdateMsg>(),
+                unhosted,
+                DeltaOrFullState::Delta(vec![7, 8, 9]),
+                Vec::new(),
+                sender_addr,
+                crate::ring::broadcast_coverage::CoveredPeers::empty(),
+            )
+            .await;
+            // The stand-in handler answers queue-full; only the pre-merge
+            // dedup outcome matters here.
+            let _result: Result<(), OpError> = drive_relay_broadcast_to(
+                &op_manager,
+                Transaction::new::<UpdateMsg>(),
+                inline_key,
+                DeltaOrFullState::Delta(vec![1, 2, 3]),
+                Vec::new(),
+                sender_addr,
+                crate::ring::broadcast_coverage::CoveredPeers::empty(),
+            )
+            .await;
+            // The stand-in handler answers queue-full; only the pre-merge
+            // dedup outcome matters here.
+            let _result: Result<(), OpError> = apply_streaming_broadcast(
+                &op_manager,
+                Transaction::new::<UpdateMsg>(),
+                stream_key,
+                vec![4, 5, 6],
+                Vec::new(),
+                sender_addr,
+                crate::ring::broadcast_coverage::CoveredPeers::empty(),
+            )
+            .await;
+        }
+
+        for key in [inline_key, stream_key] {
+            let events = op_manager
+                .update_propagation_stats
+                .events_for_test(key.id());
+            assert_eq!(events.get(Ev::RxDedup), 1, "{key}: {events:?}");
+        }
+        let events = op_manager
+            .update_propagation_stats
+            .events_for_test(unhosted.id());
+        assert_eq!(
+            events.get(Ev::RxDedup),
+            0,
+            "an unhosted contract must not get a per-contract entry: {events:?}"
+        );
+        assert_eq!(
+            op_manager
+                .payload_mix
+                .propagation_event_for_test(Ev::RxDedup),
+            3,
+            "telemetry still counts every received skip"
+        );
+    }
+
+    /// Mark `key` hosted, as a contract this node stores is.
+    fn host_for_test(op_manager: &OpManager, key: ContractKey) {
+        op_manager.ring.host_contract(
+            key,
+            10,
+            crate::ring::AccessType::Get,
+            crate::ring::HostingCause::Other,
+        );
+    }
+
+    /// #6143: the other two receiver pre-merge skips, on both receive paths.
+    /// A payload already merged into local state is `RxAlreadyApplied`; one
+    /// from a sender whose per-sender merge backoff has tripped is
+    /// `RxBackoff`. Each case uses a fresh payload so the dedup cache does
+    /// not take it first.
+    #[tokio::test]
+    async fn receiver_already_applied_and_backoff_skips_are_counted() {
+        use crate::operations::update::propagation_stats::PropagationEvent as Ev;
+        use crate::ring::merge_backoff::MergeFailureClass;
+
+        let (op_manager, _notification_rx, _guard) =
+            build_queue_full_test_node("rx-skips-count-6143").await;
+        let sender_addr: SocketAddr = "127.0.0.1:12400".parse().unwrap();
+        let key_of = |seed: u8| {
+            ContractKey::from_id_and_code(
+                ContractInstanceId::new([seed; 32]),
+                CodeHash::new([seed + 1; 32]),
+            )
+        };
+        let (inline_key, stream_key) = (key_of(21), key_of(23));
+        for key in [inline_key, stream_key] {
+            host_for_test(&op_manager, key);
+        }
+        let inline = |key: ContractKey, bytes: Vec<u8>| {
+            let op_manager = &op_manager;
+            async move {
+                let _result: Result<(), OpError> = drive_relay_broadcast_to(
+                    op_manager,
+                    Transaction::new::<UpdateMsg>(),
+                    key,
+                    DeltaOrFullState::Delta(bytes),
+                    Vec::new(),
+                    sender_addr,
+                    crate::ring::broadcast_coverage::CoveredPeers::empty(),
+                )
+                .await;
+            }
+        };
+        let streamed = |key: ContractKey, bytes: Vec<u8>| {
+            let op_manager = &op_manager;
+            async move {
+                let _result: Result<(), OpError> = apply_streaming_broadcast(
+                    op_manager,
+                    Transaction::new::<UpdateMsg>(),
+                    key,
+                    bytes,
+                    Vec::new(),
+                    sender_addr,
+                    crate::ring::broadcast_coverage::CoveredPeers::empty(),
+                )
+                .await;
+            }
+        };
+
+        // Already applied.
+        let applied = &op_manager.ring.applied_payloads;
+        applied.record_absorbed(&inline_key, applied.payload_hash(true, &[1, 1]));
+        applied.record_absorbed(&stream_key, applied.payload_hash(false, &[2, 2]));
+        inline(inline_key, vec![1, 1]).await;
+        streamed(stream_key, vec![2, 2]).await;
+
+        // Per-sender backoff: three consecutive Invalid failures trip it.
+        for key in [inline_key, stream_key] {
+            for h in [0x31u64, 0x32, 0x33] {
+                op_manager.ring.merge_backoff.record_failure(
+                    key.id(),
+                    sender_addr,
+                    MergeFailureClass::Invalid,
+                    h,
+                );
+            }
+        }
+        inline(inline_key, vec![3, 3]).await;
+        streamed(stream_key, vec![4, 4]).await;
+
+        for key in [inline_key, stream_key] {
+            let events = op_manager
+                .update_propagation_stats
+                .events_for_test(key.id());
+            assert_eq!(events.get(Ev::RxAlreadyApplied), 1, "{key}: {events:?}");
+            assert_eq!(events.get(Ev::RxBackoff), 1, "{key}: {events:?}");
+        }
     }
 
     /// A generic contract-exec rejection: `is_contract_exec_rejection() == true`

@@ -574,18 +574,25 @@ fn truncated_and_overlong_streams_fail_and_are_counted() {
             bytes.extend_from_slice(&payload(sent));
             let conn = p.a_raw();
             p.drive(raw_stream(conn, bytes)).await;
-            let arrival = p
-                .b_in
-                .streams
-                .try_recv()
-                .expect("announced before the payload");
-            assert!(!arrival.handle.is_complete(), "case {n}");
-            assert!(arrival.handle.received_bytes() < total, "case {n}");
-            assert_eq!(
-                arrival.handle.assemble().await,
-                Err(StreamError::Cancelled),
-                "case {n}"
-            );
+            // Read unordered, the payload may arrive with the header, so an
+            // overlong stream can fail before it is announced; a truncated one
+            // is always announced (its end comes after every byte it has).
+            match p.b_in.streams.try_recv() {
+                Ok(arrival) => {
+                    assert!(!arrival.handle.is_complete(), "case {n}");
+                    assert!(arrival.handle.received_bytes() < total, "case {n}");
+                    assert_eq!(
+                        arrival.handle.assemble().await,
+                        Err(StreamError::Cancelled),
+                        "case {n}"
+                    );
+                }
+                Err(_) => assert_eq!(
+                    outcome,
+                    QuicInboundOutcome::Overlong,
+                    "case {n}: only an overlong stream can fail before it is announced"
+                ),
+            }
             assert_eq!(p.b.stats().count(outcome), before + 1, "case {n}");
         }
         // Short (kind 0) and control (kind 2) frames, one byte short and over.
@@ -608,7 +615,8 @@ fn truncated_and_overlong_streams_fail_and_are_counted() {
         let conn = p.a_raw();
         let code = p.drive(raw_unfinished(conn, bytes)).await;
         assert_eq!(code, Some(u64::from(stop_code::OVERLONG)));
-        drop(p.b_in.streams.try_recv().expect("announced"));
+        // Announced or not (see above), nothing completes.
+        drop(p.b_in.streams.try_recv());
         assert!(
             p.b_in.shorts.try_recv().is_err(),
             "no short message delivered"
@@ -833,8 +841,9 @@ fn an_uncharged_stream_is_evicted_at_its_age_limit() {
 /// A full control channel drops and counts the frame (nothing is waiting on a
 /// control frame). A full short or stream channel makes only that message's
 /// reader wait, holding the stream's credit: nothing is lost, and the message
-/// arrives once the consumer takes one. A second stream with an id the path
-/// already holds is stopped with `STREAM_ID_IN_USE`.
+/// arrives once the consumer takes one, its payload read meanwhile. A second
+/// stream with an id the path already holds is stopped with
+/// `STREAM_ID_IN_USE`.
 #[test]
 fn full_channels_hold_data_and_drop_control_and_reused_ids_are_refused() {
     bounded(|| async move {
@@ -861,8 +870,12 @@ fn full_channels_hold_data_and_drop_control_and_reused_ids_are_refused() {
             })
             .await;
         assert_stopped(reused, stop_code::STREAM_ID_IN_USE);
-        // A stream announced behind a full channel is not stopped: its sender
-        // is blocked on flow control until the consumer takes the first.
+        // A stream behind a full channel is not stopped, and its payload keeps
+        // being read into its charged buffer while it waits to be announced:
+        // the sender is not held on flow control by this side's consumer, so a
+        // stream larger than the flow-control window completes before the
+        // consumer takes anything. (Reading stopped during the wait until the
+        // unordered reader; the sender then stayed blocked.)
         let a = p.a.clone();
         let second_id = StreamId::next();
         let second =
@@ -870,7 +883,10 @@ fn full_channels_hold_data_and_drop_control_and_reused_ids_are_refused() {
         let time = p.time();
         p.drive(async move { time.sleep(Duration::from_secs(1)).await })
             .await;
-        assert!(!second.is_finished(), "the second stream waits for room");
+        assert!(
+            second.is_finished(),
+            "the second stream's payload was read while it waited for room"
+        );
         let stats = p.b.stats();
         assert_eq!(stats.count(QuicInboundOutcome::ShortDroppedFull), 0);
         assert_eq!(stats.count(QuicInboundOutcome::StreamDroppedFull), 0);
@@ -892,7 +908,634 @@ fn full_channels_hold_data_and_drop_control_and_reused_ids_are_refused() {
         assert_eq!(p.b_in.streams.try_recv().unwrap().stream_id, second_id);
         assert_eq!(stats.count(QuicInboundOutcome::ShortDroppedFull), 0);
         assert_eq!(stats.count(QuicInboundOutcome::StreamDroppedFull), 0);
+        // The second stream was received whole while it waited, but its end
+        // was left unread until the announce, so quinn kept its slot: the
+        // slots bound how many streams can wait.
+        assert_eq!(p.b.inbound_ended_before_announce(), 0);
     })
+}
+
+/// The receive side reads past a gap: with one of the sender's datagrams
+/// lost, the bytes after it are read at once (unordered), so the stream holds
+/// a gap until the retransmission fills it, and quinn keeps nothing of them
+/// waiting for it. The stream still assembles byte for byte. Read in order,
+/// nothing past the gap is read, and the stream never holds a gap.
+#[test]
+fn a_lost_datagram_does_not_stop_reading_past_it() {
+    bounded(|| async move {
+        use crate::transport::in_memory_socket::{
+            PacketDeliveryDecision, set_packet_delivery_callback,
+        };
+        let _seed = GlobalRng::seed_guard(SEED);
+        let network = "quic-path-unordered-gap";
+        let mut p = paths(network, 83, QuicPathLimits::DEFAULT).await;
+        let from = p.pair.a_addr;
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = seen.clone();
+        set_packet_delivery_callback(
+            network,
+            Some(Arc::new(move |_, sender, _, _| {
+                // The fourth datagram from `a` after this point is lost once.
+                if sender == from && counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 3
+                {
+                    PacketDeliveryDecision::Drop
+                } else {
+                    PacketDeliveryDecision::Deliver
+                }
+            })),
+        );
+        let len = 32 * 1024;
+        let body = Bytes::from(payload(len));
+        let (a, id) = (p.a.clone(), StreamId::next());
+        let sent = body.clone();
+        p.drive(async move { a.send_stream(id, None, sent).await.expect("sent") })
+            .await;
+        set_packet_delivery_callback(network, None);
+        let arrival = p.b_in.streams.try_recv().expect("announced");
+        assert_eq!(
+            arrival.handle.assemble().await.expect("assembled"),
+            body.to_vec()
+        );
+        assert!(
+            seen.load(std::sync::atomic::Ordering::Relaxed) > 3,
+            "premise: the datagram was dropped"
+        );
+        assert!(
+            p.b.inbound_gaps_peak() >= 1,
+            "bytes past the gap were read before it filled: peak {}",
+            p.b.inbound_gaps_peak()
+        );
+        assert_eq!(p.b.inbound_gaps_kept(), 0, "the stream finished");
+    })
+}
+
+/// Several streams start together and the first datagrams, which carry
+/// their headers, are lost: the bytes after each header arrive about a round
+/// trip before it does. Nothing past a missing header is read (so no credit
+/// is returned for it: until the header says how long the stream is, nothing
+/// would bound what is read), and every stream is still read, announced and
+/// assembled byte for byte, and none is stopped. A quinn sender cannot
+/// withhold a header for long (it retransmits), so this is the case a peer
+/// withholding one would reach: with the header read unordered, the bytes
+/// after it were read and staged with no bound but the age limit.
+#[test]
+fn streams_whose_first_datagrams_are_lost_all_arrive() {
+    bounded(|| async move {
+        use crate::transport::in_memory_socket::{
+            PacketDeliveryDecision, set_packet_delivery_callback,
+        };
+        let _seed = GlobalRng::seed_guard(SEED);
+        let network = "quic-path-first-loss";
+        let mut p = paths(network, 88, QuicPathLimits::DEFAULT).await;
+        let from = p.pair.a_addr;
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = seen.clone();
+        set_packet_delivery_callback(
+            network,
+            Some(Arc::new(move |_, sender, _, _| {
+                // The first four datagrams from `a` after this point are lost
+                // once.
+                if sender == from && counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4
+                {
+                    PacketDeliveryDecision::Drop
+                } else {
+                    PacketDeliveryDecision::Deliver
+                }
+            })),
+        );
+        const STREAMS: usize = 4;
+        let len = 64 * 1024;
+        let bodies: Vec<Bytes> = (0..STREAMS)
+            .map(|i| {
+                let mut body = payload(len);
+                body[0] = i as u8;
+                Bytes::from(body)
+            })
+            .collect();
+        let ids: Vec<StreamId> = (0..STREAMS).map(|_| StreamId::next()).collect();
+        let a = p.a.clone();
+        let sends: Vec<_> = ids.iter().copied().zip(bodies.iter().cloned()).collect();
+        p.drive(async move {
+            let results = futures::future::join_all(sends.into_iter().map(|(id, body)| {
+                let a = a.clone();
+                async move { a.send_stream(id, None, body).await }
+            }))
+            .await;
+            for result in results {
+                result.expect("sent");
+            }
+        })
+        .await;
+        set_packet_delivery_callback(network, None);
+        assert!(
+            seen.load(std::sync::atomic::Ordering::Relaxed) > 4,
+            "premise: the datagrams were dropped"
+        );
+        let mut arrived = std::collections::HashMap::new();
+        for _ in 0..STREAMS {
+            let arrival = p.b_in.streams.try_recv().expect("announced");
+            arrived.insert(arrival.stream_id, arrival);
+        }
+        for (id, body) in ids.iter().zip(&bodies) {
+            let arrival = arrived.remove(id).expect("this stream was announced");
+            assert_eq!(
+                arrival.handle.assemble().await.expect("assembled"),
+                body.to_vec()
+            );
+        }
+        let stats = p.b.stats();
+        assert_eq!(
+            stats.count(QuicInboundOutcome::CompletedStream),
+            STREAMS as u64
+        );
+        assert_eq!(stats.count(QuicInboundOutcome::TooManyRanges), 0);
+        assert_eq!(
+            p.b.inbound_read_past_missing_header(),
+            0,
+            "nothing past a missing header is read"
+        );
+    })
+}
+
+/// A stream stopped with gaps leaves them counted: quinn keeps a stopped
+/// stream's received ranges until the peer finishes or resets it, which we
+/// cannot observe. A quinn sender resets a stopped stream at once, so after
+/// the grace period (`KEPT_GAPS_GRACE`) the gaps of a stream with only a few
+/// leave the count, and an honest connection's count does not drift. Here
+/// the sender's datagrams stop arriving after some were lost, so the stream
+/// is evicted idle with gaps.
+#[test]
+fn a_stream_stopped_with_gaps_is_released_after_the_grace_period() {
+    bounded(|| async move {
+        use crate::transport::in_memory_socket::{
+            PacketDeliveryDecision, set_packet_delivery_callback,
+        };
+        let _seed = GlobalRng::seed_guard(SEED);
+        let network = "quic-path-stopped-gaps";
+        let mut p = paths(network, 89, QuicPathLimits::DEFAULT).await;
+        let from = p.pair.a_addr;
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = seen.clone();
+        set_packet_delivery_callback(
+            network,
+            Some(Arc::new(move |_, sender, _, _| {
+                if sender != from {
+                    return PacketDeliveryDecision::Deliver;
+                }
+                // Every other one of the first 16 datagrams from `a` arrives;
+                // none after.
+                let n = counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n < 16 && n % 2 == 0 {
+                    PacketDeliveryDecision::Deliver
+                } else {
+                    PacketDeliveryDecision::Drop
+                }
+            })),
+        );
+        let (a, id) = (p.a.clone(), StreamId::next());
+        let sender = tokio::spawn(async move { a.send_stream(id, None, over_window()).await });
+        let time = p.time();
+        let idle = streaming_handle_idle_timeout();
+        p.drive(async move { time.sleep(idle + Duration::from_secs(1)).await })
+            .await;
+        set_packet_delivery_callback(network, None);
+        let stats = p.b.stats();
+        assert!(
+            seen.load(std::sync::atomic::Ordering::Relaxed) > 16,
+            "premise: datagrams were dropped"
+        );
+        assert_eq!(
+            stats.shared_count(InboundStreamOutcome::EvictedIdle),
+            1,
+            "premise: the stream was stopped"
+        );
+        let arrival = p.b_in.streams.try_recv().expect("announced");
+        assert!(arrival.handle.is_cancelled());
+        let kept = p.b.inbound_gaps_kept();
+        assert!(kept >= 1, "the stopped stream's gaps stay counted");
+        assert!(
+            kept <= 32,
+            "premise: few enough gaps to be released: {kept}"
+        );
+        // Past the grace period, the next read on the connection releases them.
+        let (a, time) = (p.a.clone(), p.time());
+        p.drive(async move {
+            assert_stopped(sender.await.unwrap(), stop_code::EVICTED);
+            time.sleep(Duration::from_secs(30)).await;
+            a.send_stream(StreamId::next(), None, Bytes::from_static(b"later"))
+                .await
+                .expect("sent");
+        })
+        .await;
+        assert_eq!(
+            p.b.inbound_gaps_kept(),
+            0,
+            "released after the grace period"
+        );
+        assert_eq!(p.b.inbound_gaps_held(), 0);
+    })
+}
+
+/// Past the gap cap, the stream that went over it is stopped; its gaps stay
+/// counted, so the next time past the cap closes the path with OVER_BUDGET and
+/// the peer falls back to UDP. Here the cap is 2 and every other datagram is
+/// lost, so each stream leaves gaps.
+#[test]
+fn a_second_trip_past_the_gap_cap_closes_the_path() {
+    bounded(|| async move {
+        use crate::transport::in_memory_socket::{
+            PacketDeliveryDecision, set_packet_delivery_callback,
+        };
+        let _seed = GlobalRng::seed_guard(SEED);
+        let network = "quic-path-gap-trips";
+        let limits = QuicPathLimits {
+            max_gaps: 2,
+            ..QuicPathLimits::DEFAULT
+        };
+        let p = paths(network, 90, limits).await;
+        let from = p.pair.a_addr;
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = seen.clone();
+        set_packet_delivery_callback(
+            network,
+            Some(Arc::new(move |_, sender, _, _| {
+                if sender == from
+                    && counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 2 == 1
+                {
+                    PacketDeliveryDecision::Drop
+                } else {
+                    PacketDeliveryDecision::Deliver
+                }
+            })),
+        );
+        let a = p.a.clone();
+        let (first, second) = p
+            .drive(async move {
+                let first = a.send_stream(StreamId::next(), None, over_window()).await;
+                let second = a.send_stream(StreamId::next(), None, over_window()).await;
+                (first, second)
+            })
+            .await;
+        set_packet_delivery_callback(network, None);
+        assert_stopped(first, stop_code::EVICTED);
+        match second {
+            Err(QuicSendError::ConnectionLost(quinn::ConnectionError::ApplicationClosed(
+                close,
+            ))) => {
+                assert_eq!(
+                    close.error_code.into_inner(),
+                    u64::from(super::super::error::close_code::OVER_BUDGET),
+                    "closed with OVER_BUDGET"
+                );
+            }
+            other => panic!("expected the path closed with OVER_BUDGET, got {other:?}"),
+        }
+        let stats = p.b.stats();
+        assert_eq!(stats.count(QuicInboundOutcome::TooManyRanges), 2);
+        assert_eq!(stats.count(QuicInboundOutcome::ClosedTooManyRanges), 1);
+        assert_eq!(
+            crate::transport::metrics::TRANSPORT_METRICS.quic_close_sent_to(from),
+            vec![QuicCloseCode::OverBudget],
+            "counted as quic_close_sent_over_budget"
+        );
+        assert!(
+            p.b.inbound_gaps_kept() >= 2,
+            "the first stream's gaps stayed"
+        );
+    })
+}
+
+/// A stream larger than the flow-control window, through random loss, is
+/// delivered byte for byte, never trips the gap cap, and its gaps stay far
+/// under it: honest loss leaves about loss x packets in flight.
+#[test]
+fn a_stream_through_random_loss_arrives_intact_far_under_the_gap_cap() {
+    bounded(|| async move {
+        use crate::transport::in_memory_socket::{
+            PacketDeliveryDecision, set_packet_delivery_callback,
+        };
+        let _seed = GlobalRng::seed_guard(SEED);
+        let network = "quic-path-random-loss";
+        let mut p = paths(network, 91, QuicPathLimits::DEFAULT).await;
+        let lost = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = lost.clone();
+        let sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        set_packet_delivery_callback(
+            network,
+            Some(Arc::new(move |_, _, _, _| {
+                // About 3% loss, both ways, by a fixed hash of the datagram's
+                // number, so the run is the same every time.
+                let n = sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if (n.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) % 100 < 3 {
+                    counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    PacketDeliveryDecision::Drop
+                } else {
+                    PacketDeliveryDecision::Deliver
+                }
+            })),
+        );
+        let body = over_window();
+        let (a, id, sent) = (p.a.clone(), StreamId::next(), body.clone());
+        p.drive(async move { a.send_stream(id, None, sent).await.expect("sent") })
+            .await;
+        set_packet_delivery_callback(network, None);
+        assert!(
+            lost.load(std::sync::atomic::Ordering::Relaxed) > 10,
+            "premise: datagrams were lost"
+        );
+        let arrival = p.b_in.streams.try_recv().expect("announced");
+        assert_eq!(
+            arrival.handle.assemble().await.expect("assembled"),
+            body.to_vec()
+        );
+        assert_eq!(p.b.stats().count(QuicInboundOutcome::TooManyRanges), 0);
+        let peak = p.b.inbound_gaps_peak();
+        assert!(peak >= 1, "premise: bytes past a gap were read");
+        assert!(
+            peak < inbound::MAX_GAPS_PER_CONNECTION / 8,
+            "gap peak {peak} against a cap of {}",
+            inbound::MAX_GAPS_PER_CONNECTION
+        );
+        assert_eq!(
+            p.b.inbound_gaps_held(),
+            0,
+            "the finished stream released its gaps"
+        );
+    })
+}
+
+/// A stream the sender resets while it has gaps releases them at once:
+/// quinn freed its state on the reset, so they are not kept. The receiver's
+/// acknowledgements are delayed so the sender cannot retransmit the lost
+/// datagrams before it resets. A stream the sender finishes short releases
+/// its gaps too (quinn reports the end only once every byte is in, so it has
+/// none left by then).
+#[test]
+fn reset_and_short_streams_release_their_gaps_at_once() {
+    bounded(|| async move {
+        use crate::transport::in_memory_socket::{
+            PacketDeliveryDecision, set_packet_delivery_callback,
+        };
+        let _seed = GlobalRng::seed_guard(SEED);
+        let network = "quic-path-reset-gaps";
+        let p = paths(network, 92, QuicPathLimits::DEFAULT).await;
+        let from = p.pair.a_addr;
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = seen.clone();
+        set_packet_delivery_callback(
+            network,
+            Some(Arc::new(move |_, sender, _, _| {
+                if sender != from {
+                    return PacketDeliveryDecision::DelayedDelivery(Duration::from_millis(500));
+                }
+                // Datagrams 2 to 5 from `a` after this point are lost.
+                let n = counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if (2..6).contains(&n) {
+                    PacketDeliveryDecision::Drop
+                } else {
+                    PacketDeliveryDecision::Deliver
+                }
+            })),
+        );
+        let (conn, time) = (p.a_raw(), p.time());
+        let total = 1_000_000u64;
+        p.drive(async move {
+            let mut reset = conn.open_uni().await.unwrap();
+            reset
+                .write_all(&header(1, 1, StreamId::next().0, total, 0))
+                .await
+                .unwrap();
+            reset.write_all(&payload(8 * 1024)).await.unwrap();
+            time.sleep(Duration::from_millis(100)).await;
+            reset.reset(0u32.into()).unwrap();
+            time.sleep(Duration::from_millis(100)).await;
+        })
+        .await;
+        let stats = p.b.stats();
+        assert!(
+            seen.load(std::sync::atomic::Ordering::Relaxed) > 6,
+            "premise: datagrams were dropped"
+        );
+        assert!(
+            p.b.inbound_gaps_peak() >= 1,
+            "premise: the stream held a gap"
+        );
+        assert_eq!(stats.count(QuicInboundOutcome::ResetByPeer), 1);
+        assert_eq!(
+            p.b.inbound_gaps_kept(),
+            0,
+            "a reset stream's gaps are not kept"
+        );
+        assert_eq!(p.b.inbound_gaps_held(), 0);
+        set_packet_delivery_callback(network, None);
+        let (conn, time) = (p.a_raw(), p.time());
+        p.drive(async move {
+            let mut short = conn.open_uni().await.unwrap();
+            short
+                .write_all(&header(1, 1, StreamId::next().0, total, 0))
+                .await
+                .unwrap();
+            short.write_all(&payload(64 * 1024)).await.unwrap();
+            short.finish().unwrap();
+            time.sleep(Duration::from_secs(1)).await;
+        })
+        .await;
+        assert_eq!(stats.count(QuicInboundOutcome::Truncated), 1);
+        assert_eq!(p.b.inbound_gaps_kept(), 0);
+        assert_eq!(p.b.inbound_gaps_held(), 0);
+    })
+}
+
+/// The datagram carrying a stream's header and metadata arrives late rather
+/// than not at all (reordered): the stream is still read, announced with its
+/// metadata, and assembled byte for byte.
+#[test]
+fn a_delayed_header_and_metadata_still_arrive() {
+    bounded(|| async move {
+        use crate::transport::in_memory_socket::{
+            PacketDeliveryDecision, set_packet_delivery_callback,
+        };
+        let _seed = GlobalRng::seed_guard(SEED);
+        let network = "quic-path-delayed-header";
+        let mut p = paths(network, 93, QuicPathLimits::DEFAULT).await;
+        let from = p.pair.a_addr;
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = seen.clone();
+        set_packet_delivery_callback(
+            network,
+            Some(Arc::new(move |_, sender, _, _| {
+                // The first datagram from `a` after this point arrives 20 ms
+                // late, behind the ones after it.
+                if sender == from && counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0
+                {
+                    PacketDeliveryDecision::DelayedDelivery(Duration::from_millis(20))
+                } else {
+                    PacketDeliveryDecision::Deliver
+                }
+            })),
+        );
+        let body = Bytes::from(payload(48 * 1024));
+        let metadata = vec![7u8; 300];
+        let (a, id, sent, meta) = (
+            p.a.clone(),
+            StreamId::next(),
+            body.clone(),
+            metadata.clone(),
+        );
+        p.drive(async move { a.send_stream(id, Some(&meta), sent).await.expect("sent") })
+            .await;
+        set_packet_delivery_callback(network, None);
+        assert!(
+            seen.load(std::sync::atomic::Ordering::Relaxed) > 1,
+            "premise: the datagram was delayed"
+        );
+        let arrival = p.b_in.streams.try_recv().expect("announced");
+        assert_eq!(arrival.metadata.as_deref(), Some(&metadata[..]));
+        assert_eq!(
+            arrival.handle.assemble().await.expect("assembled"),
+            body.to_vec()
+        );
+        assert_eq!(p.b.inbound_read_past_missing_header(), 0);
+    })
+}
+
+/// A stream that ends short while it waits for room fails as Truncated at
+/// once: once quinn reports the end it has freed the stream's slot, so the
+/// reader must not stay waiting (the slots bound the waiters).
+#[test]
+fn a_short_stream_waiting_for_room_fails_at_once() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let limits = QuicPathLimits {
+            stream_capacity: 1,
+            ..QuicPathLimits::DEFAULT
+        };
+        let mut p = paths("quic-path-wait-short", 94, limits).await;
+        let a = p.a.clone();
+        let held = StreamId::next();
+        p.drive(async move {
+            a.send_stream(held, None, Bytes::from_static(b"held"))
+                .await
+                .unwrap();
+        })
+        .await;
+        let (conn, time) = (p.a_raw(), p.time());
+        p.drive(async move {
+            let mut send = conn.open_uni().await.unwrap();
+            let mut bytes = header(1, 1, StreamId::next().0, 10_000, 0);
+            bytes.extend_from_slice(&payload(5000));
+            send.write_all(&bytes).await.unwrap();
+            send.finish().unwrap();
+            time.sleep(Duration::from_secs(1)).await;
+        })
+        .await;
+        let stats = p.b.stats();
+        assert_eq!(stats.count(QuicInboundOutcome::Truncated), 1);
+        assert_eq!(p.b.inbound_ended_before_announce(), 0);
+        assert_eq!(p.b_in.streams.try_recv().unwrap().stream_id, held);
+        assert!(
+            p.b_in.streams.try_recv().is_err(),
+            "the short stream was not announced"
+        );
+    })
+}
+
+/// A copy of the bytes that end the metadata is buffered before the header
+/// arrives, and the header then arrives in a resend that also carries them.
+/// The sender writes the stream in two pieces, so its first datagram carries
+/// the header and part of the metadata, and its second the rest. The second
+/// arrives late, after the sender has declared both lost; until a set
+/// instant every datagram carrying the header is lost (the first, and the
+/// resends, which carry both pieces). Then quinn holds the second piece,
+/// which starts inside the metadata, and a resend holding all of it: the
+/// in-order reads of the header and metadata take the resend, and the second
+/// piece is left buffered below where they stopped. Read unordered, quinn would
+/// count its bytes as read again and never report the end. The reader first
+/// drains in order what is contiguous, which pops that copy, and switches only
+/// once an in-order read would block, so the stream arrives intact. Fails
+/// without the drain (quinn's `Recv::stop` underflows) and with only a trim of
+/// the copy on our side (the stream never ends).
+#[test]
+fn a_second_copy_of_the_metadata_end_is_read_once() {
+    bounded(|| async move {
+        use crate::transport::in_memory_socket::{
+            PacketDeliveryDecision, set_packet_delivery_callback,
+        };
+        let _seed = GlobalRng::seed_guard(SEED);
+        let network = "quic-path-dup-boundary";
+        let mut p = paths(network, 95, QuicPathLimits::DEFAULT).await;
+        let from = p.pair.a_addr;
+        let time = p.time();
+        let release = time.now_nanos() + nanos_of(Duration::from_millis(1500));
+        let first_len = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let delayed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (len_seen, late, counted, clock) = (
+            first_len.clone(),
+            delayed.clone(),
+            dropped.clone(),
+            time.clone(),
+        );
+        set_packet_delivery_callback(
+            network,
+            Some(Arc::new(move |_, sender, _, data| {
+                use std::sync::atomic::Ordering::Relaxed;
+                if sender != from || clock.now_nanos() >= release {
+                    return PacketDeliveryDecision::Deliver;
+                }
+                if len_seen.load(Relaxed) == 0 {
+                    len_seen.store(data.len(), Relaxed);
+                }
+                // The first datagram, and resends of both pieces together.
+                if data.len() == len_seen.load(Relaxed) || data.len() > 1000 {
+                    counted.fetch_add(1, Relaxed);
+                    return PacketDeliveryDecision::Drop;
+                }
+                // The second piece (pings and acks are small) arrives late.
+                if data.len() > 200 && late.fetch_add(1, Relaxed) == 0 {
+                    return PacketDeliveryDecision::DelayedDelivery(Duration::from_secs(1));
+                }
+                PacketDeliveryDecision::Deliver
+            })),
+        );
+        let metadata = vec![9u8; 1000];
+        let body = payload(100);
+        let mut bytes = header(1, 1, StreamId::next().0, body.len() as u64, 1000);
+        bytes.extend_from_slice(&metadata);
+        bytes.extend_from_slice(&body);
+        let (conn, sleeper) = (p.a_raw(), time.clone());
+        p.drive(async move {
+            let mut send = conn.open_uni().await.unwrap();
+            send.write_all(&bytes[..518]).await.unwrap();
+            sleeper.sleep(Duration::from_millis(50)).await;
+            send.write_all(&bytes[518..]).await.unwrap();
+            send.finish().unwrap();
+            sleeper.sleep(Duration::from_secs(5)).await;
+        })
+        .await;
+        set_packet_delivery_callback(network, None);
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::Relaxed) > 1,
+            "premise: the first datagram and its resends were lost"
+        );
+        assert!(
+            delayed.load(std::sync::atomic::Ordering::Relaxed) >= 1,
+            "premise: the second piece arrived late"
+        );
+        let stats = p.b.stats();
+        assert_eq!(stats.count(QuicInboundOutcome::ReadFailed), 0);
+        assert!(
+            p.b.inbound_drained_before_switch() >= 1,
+            "premise: the drain read past the left-behind copy before the switch"
+        );
+        let arrival = p.b_in.streams.try_recv().expect("announced");
+        assert_eq!(arrival.metadata.as_deref(), Some(&metadata[..]));
+        assert_eq!(arrival.handle.assemble().await.expect("assembled"), body);
+    })
+}
+
+fn nanos_of(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).expect("fits")
 }
 
 /// A message held for room in a full channel is stopped at its age limit, so
@@ -981,10 +1624,13 @@ fn waiters_for_a_full_channel_are_capped_by_the_stream_limit() {
     })
 }
 
-/// After a wait for room, idleness applies again: a stream that waits longer
-/// than the idle timeout, then stalls, is evicted idle, not at its age limit.
+/// While a stream waits for room, idleness is judged only while its payload
+/// is still missing: a stream whose sender stalls halfway is evicted idle
+/// during the wait (the peer is the one being waited on), while a stream
+/// that has all its payload waits past the idle timeout and is announced once
+/// there is room (the consumer is the one being waited on).
 #[test]
-fn a_stream_that_waited_for_room_is_evicted_idle_when_it_stalls() {
+fn a_waiting_stream_is_evicted_idle_only_while_its_payload_is_missing() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
         let limits = QuicPathLimits {
@@ -996,7 +1642,7 @@ fn a_stream_that_waited_for_room_is_evicted_idle_when_it_stalls() {
         let total = 10_000u64;
         assert!(
             max_inbound_stream_age(total) > idle * 5,
-            "the wait and the stall must fit inside the age limit"
+            "the wait must fit inside the age limit"
         );
         let a = p.a.clone();
         let held = StreamId::next();
@@ -1006,31 +1652,53 @@ fn a_stream_that_waited_for_room_is_evicted_idle_when_it_stalls() {
                 .unwrap();
         })
         .await;
-        // Announced behind the full channel; half its payload, never finished.
+        // Behind the full channel: one stream half sent and never finished,
+        // one sent whole.
         let conn = p.a_raw();
-        let sender = tokio::spawn(async move {
+        let started = p.time().now_nanos();
+        let stalled = tokio::spawn(async move {
             let mut send = conn.open_uni().await.unwrap();
             let mut bytes = header(1, 1, StreamId::next().0, total, 0);
             bytes.extend_from_slice(&payload(5000));
             send.write_all(&bytes).await.unwrap();
             send.stopped().await.unwrap().map(|c| c.into_inner())
         });
+        let (a, whole) = (p.a.clone(), StreamId::next());
+        let complete = tokio::spawn(async move {
+            a.send_stream(whole, None, Bytes::from(payload(total as usize)))
+                .await
+        });
         let time = p.time();
-        let sleeper = time.clone();
-        p.drive(async move { sleeper.sleep(idle * 3).await }).await;
-        assert!(!sender.is_finished(), "waiting for room is not idleness");
-        let stats = p.b.stats();
-        assert_eq!(stats.shared_count(InboundStreamOutcome::EvictedIdle), 0);
-        assert_eq!(p.b_in.streams.try_recv().unwrap().stream_id, held);
-        let released = time.now_nanos();
-        let code = p.drive(async move { sender.await.unwrap() }).await;
+        let code = p.drive(async move { stalled.await.unwrap() }).await;
         assert_eq!(code, Some(u64::from(stop_code::EVICTED)));
-        let stalled = Duration::from_nanos(time.now_nanos() - released);
+        let after = Duration::from_nanos(time.now_nanos() - started);
         assert!(
-            stalled >= idle && stalled < idle * 2,
-            "evicted {stalled:?} after the wait ended, idle timeout {idle:?}"
+            after >= idle && after < idle * 2,
+            "evicted {after:?} into the wait, idle timeout {idle:?}"
         );
+        let stats = p.b.stats();
         assert_eq!(stats.shared_count(InboundStreamOutcome::EvictedIdle), 1);
+        // The whole stream is still waiting, past the idle timeout.
+        let sleeper = time.clone();
+        p.drive(async move { sleeper.sleep(idle * 2).await }).await;
+        assert_eq!(stats.shared_count(InboundStreamOutcome::EvictedIdle), 1);
+        assert_eq!(p.b_in.streams.try_recv().unwrap().stream_id, held);
+        let sleeper = time.clone();
+        p.drive(async move {
+            complete.await.unwrap().expect("sent");
+            sleeper.sleep(Duration::from_secs(1)).await;
+        })
+        .await;
+        let arrival = p
+            .b_in
+            .streams
+            .try_recv()
+            .expect("announced once there was room");
+        assert_eq!(arrival.stream_id, whole);
+        assert_eq!(
+            arrival.handle.assemble().await.expect("assembled"),
+            payload(total as usize)
+        );
         assert_eq!(stats.shared_count(InboundStreamOutcome::EvictedAge), 0);
     })
 }
@@ -1918,6 +2586,49 @@ fn recycle_closes_to(remote: SocketAddr) -> Vec<QuicCloseCode> {
         .collect()
 }
 
+/// The reset gauge for the fixed charge (buffer-budget PR 2): a path's
+/// resets reach the node counters with the levels its count passes, and its
+/// time up is reported tick by tick, so resets per connection-hour can be
+/// read from the field.
+#[test]
+fn a_paths_resets_and_time_reach_the_node_counters() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let counters: &'static crate::transport::metrics::QuicDataCounters =
+            Box::leak(Box::new(crate::transport::metrics::QuicDataCounters::new()));
+        let limits = QuicPathLimits {
+            counters: Some(counters),
+            ..QuicPathLimits::DEFAULT
+        };
+        // `paths` gives `a` the same counters; only `b` resets sends.
+        let p = paths("quic-path-reset-gauge", 24, limits).await;
+        let (b, time) = (p.b.clone(), p.time());
+        let (resets, timed) = p
+            .drive(async move {
+                abort_sends(b.clone(), 64).await;
+                let resets = counters.snapshot(true);
+                time.sleep(Duration::from_secs(20)).await;
+                (resets, counters.snapshot(true))
+            })
+            .await;
+        assert_eq!(p.b.send_aborts(), 64);
+        let keys: std::collections::BTreeMap<_, _> = resets.keys().into_iter().collect();
+        assert_eq!(keys["quic_send_resets"], 64);
+        assert_eq!(keys["quic_send_resets_reached_64"], 1);
+        assert_eq!(keys["quic_send_resets_reached_512"], 0);
+        assert_eq!(keys["quic_send_resets_path_max"], 64);
+        // Two paths, 20 s between the two snapshots, each reported at its
+        // watch's 2 s ticks.
+        let tick = recycle::ACK_WATCH_TICK.as_millis() as u64;
+        assert!(
+            (2 * (20_000 - tick)..=2 * (20_000 + tick)).contains(&timed.path_ms),
+            "{} ms of path time for two paths in 20 s",
+            timed.path_ms
+        );
+        assert_eq!(timed.send_resets, 0);
+    });
+}
+
 /// #5940 step M6, guard 1: a path that has reset its limit of sends stays
 /// open (checked at the limit minus one and at the limit), and the next
 /// reset closes it with `close_code::SEND_ABORT_LIMIT`, counted once; the
@@ -2131,6 +2842,12 @@ impl Drop for DropFrom {
 
 /// How often the scripted peer runs (receives, sends, writes).
 const PEER_STEP: Duration = Duration::from_millis(20);
+
+/// A transfer still in flight 100 ms in, for the tests that cut the link
+/// mid-transfer. The round trip here is about one [`PEER_STEP`], so the window
+/// doubles every 20 ms from the initial 32 datagrams: 1 MiB would be done
+/// before the cut (38 + 77 + 154 + 307 + 614 kB in five round trips).
+const IN_FLIGHT_AT_THE_CUT: usize = 8 * 1024 * 1024;
 
 /// A real `QuicPath` (`a`, the client) connected to a peer `b` that is a
 /// quinn-proto endpoint driven by hand on the simulated network, so a test
@@ -2395,7 +3112,7 @@ fn packets_left_outstanding_when_the_peer_stops_acknowledging_close_the_path() {
         let network = "quic-path-ack-watch-partial";
         let mut s = Scripted::connect(network, 2).await;
         s.keep_sending();
-        s.a_sends(1024 * 1024);
+        s.a_sends(IN_FLIGHT_AT_THE_CUT);
         s.wait(Duration::from_millis(100)).await;
         let _cut = DropFrom::new(network, &[s.a_addr]);
         let cut_at = s.time.now_nanos();
@@ -2431,7 +3148,7 @@ fn recovery_from_an_outage_in_both_directions_does_not_close() {
         let network = "quic-path-ack-watch-outage";
         let mut s = Scripted::connect(network, 3).await;
         s.keep_sending();
-        s.a_sends(1024 * 1024);
+        s.a_sends(IN_FLIGHT_AT_THE_CUT);
         s.wait(Duration::from_millis(100)).await;
         // `a`'s packets are lost first, so after the outage `b` has nothing
         // new to acknowledge and `a`'s data waits for its probe timer.

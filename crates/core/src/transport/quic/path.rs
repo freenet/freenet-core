@@ -303,6 +303,10 @@ pub(crate) struct QuicPathLimits {
     /// (supervisor test).
     #[cfg(test)]
     pub(crate) panic_in_watch: bool,
+    /// The receive side's gap cap (`inbound::MAX_GAPS_PER_CONNECTION`), lower
+    /// in a test that trips it.
+    #[cfg(test)]
+    pub(crate) max_gaps: usize,
 }
 
 impl QuicPathLimits {
@@ -329,6 +333,8 @@ impl QuicPathLimits {
         panic_in_receive: false,
         #[cfg(test)]
         panic_in_watch: false,
+        #[cfg(test)]
+        max_gaps: inbound::MAX_GAPS_PER_CONNECTION,
     };
 
     /// [`Self::DEFAULT`] for a path in shadow mode: control frames only.
@@ -439,6 +445,15 @@ quic_outcomes! {
         ShortRefusedBudget => "short_refused_budget",
         /// A Stream did not fit the inbound budget (as above).
         StreamRefusedBudget => "stream_refused_budget",
+        /// The connection's streams held more gaps (received ranges past the
+        /// first, per stream) than `inbound::MAX_GAPS_PER_CONNECTION`; the
+        /// stream that went past it was stopped (`stop_code::EVICTED`).
+        TooManyRanges => "too_many_ranges",
+        /// The connection went past `inbound::MAX_GAPS_PER_CONNECTION` a
+        /// second time, so the path was closed with OVER_BUDGET (once per path):
+        /// the gaps of streams it stopped stay counted for the connection's
+        /// life, because quinn keeps them until the peer ends the stream.
+        ClosedTooManyRanges => "closed_too_many_ranges",
     }
 }
 
@@ -707,6 +722,9 @@ pub(crate) struct QuicPath {
     pacer: std::sync::OnceLock<Arc<dyn pacer::SendPacer>>,
     #[cfg(test)]
     budget: SharedInboundBudget,
+    /// The receive side's count of received ranges. Tests only.
+    #[cfg(test)]
+    inbound_ranges: Arc<inbound::ConnRanges>,
 }
 
 /// The path never had both data bits: nothing may send data on it.
@@ -844,8 +862,15 @@ impl QuicPath {
         #[cfg(test)]
         {
             receiver.panic_on_stream = limits.panic_in_receive;
+            receiver.set_gap_cap(limits.max_gaps);
         }
-        let aborts = Arc::new(SendAborts::new(limits.max_send_aborts, connection.closer()));
+        #[cfg(test)]
+        let inbound_ranges = receiver.ranges();
+        let aborts = Arc::new(SendAborts::new(
+            limits.max_send_aborts,
+            connection.closer(),
+            stats.node(),
+        ));
         // Read once: quinn keeps one controller per connection while migration is
         // off (`config`), so the record stays the connection's. The ack watch
         // compares records by pointer because it samples, and does not need to here.
@@ -864,7 +889,8 @@ impl QuicPath {
         );
         let heard = Arc::new(recycle::PeerHeard::default());
         #[cfg_attr(not(test), allow(unused_mut))]
-        let mut report = recycle::PathReport::new(connection.inner().clone(), stats.node());
+        let mut report =
+            recycle::PathReport::new(connection.inner().clone(), stats.node(), built_at);
         #[cfg(test)]
         {
             report.panic_once_bucketed = limits.panic_in_watch;
@@ -903,6 +929,8 @@ impl QuicPath {
                 pacer: std::sync::OnceLock::new(),
                 #[cfg(test)]
                 budget,
+                #[cfg(test)]
+                inbound_ranges,
             },
             controls,
         )
@@ -938,6 +966,51 @@ impl QuicPath {
         self.pacer.get().map(|pacer| pacer::Pacing {
             pacer: Arc::clone(pacer),
         })
+    }
+
+    /// The most gaps the receive side's streams held at once. Tests only.
+    #[cfg(test)]
+    pub(in crate::transport) fn inbound_gaps_peak(&self) -> usize {
+        self.inbound_ranges.peak()
+    }
+
+    /// Streams the receive side announced after reading their end, which
+    /// must not happen. Tests only.
+    #[cfg(test)]
+    pub(in crate::transport) fn inbound_ended_before_announce(&self) -> usize {
+        self.inbound_ranges
+            .ended_before_announce
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Chunks the receive side read past a header it did not have yet,
+    /// which must not happen. Tests only.
+    #[cfg(test)]
+    pub(in crate::transport) fn inbound_read_past_missing_header(&self) -> usize {
+        self.inbound_ranges
+            .read_past_missing_header
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Chunks the receive side read in order by the drain before a switch to
+    /// unordered reads. Tests only.
+    #[cfg(test)]
+    pub(in crate::transport) fn inbound_drained_before_switch(&self) -> usize {
+        self.inbound_ranges
+            .drained_before_switch
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Gaps the receive side counts now. Tests only.
+    #[cfg(test)]
+    pub(in crate::transport) fn inbound_gaps_held(&self) -> usize {
+        self.inbound_ranges.held()
+    }
+
+    /// Gaps of stopped streams the receive side keeps counted. Tests only.
+    #[cfg(test)]
+    pub(in crate::transport) fn inbound_gaps_kept(&self) -> usize {
+        self.inbound_ranges.kept()
     }
 
     /// Whether the path's data sends are paced.

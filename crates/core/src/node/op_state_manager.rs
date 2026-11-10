@@ -1163,12 +1163,24 @@ impl OpManager {
     /// error as advisory and continue.**
     pub fn try_notify_node_event(&self, msg: NodeEvent) -> Result<(), OpError> {
         tracing::debug!(event = %msg, "try_notify_node_event: queuing node event (non-blocking)");
-        try_notify_node_event_on(
+        // #6143: a dropped fan-out or heal is a whole UPDATE that never left
+        // this node, and the drop below logs at debug only. Count it in the
+        // propagation summary so release builds can see it.
+        let dropped_event = propagation_drop_event(&msg);
+        let result = try_notify_node_event_on(
             self.to_event_listener.notifications_sender(),
             self.to_event_listener.notification_channel_pending(),
             self.to_event_listener.notifications_sender().capacity(),
             msg,
-        )
+        );
+        if result.is_err() {
+            if let Some((contract, ev)) = dropped_event {
+                crate::operations::update::propagation_stats::record_propagation_event(
+                    self, &contract, ev,
+                );
+            }
+        }
+        result
     }
 
     // The blocking `notify_node_event` is still used by callers that
@@ -2433,6 +2445,34 @@ async fn notify_node_event_on(
                 "notification channel send timed out — event loop is likely stuck".into(),
             ))
         }
+    }
+}
+
+/// The contract and [`PropagationEvent`] to count if `msg` is dropped by
+/// [`OpManager::try_notify_node_event`]: a fan-out or a targeted heal, which
+/// carry UPDATE propagation, and nothing else.
+///
+/// [`PropagationEvent`]: crate::operations::update::propagation_stats::PropagationEvent
+fn propagation_drop_event(
+    msg: &NodeEvent,
+) -> Option<(
+    ContractInstanceId,
+    crate::operations::update::propagation_stats::PropagationEvent,
+)> {
+    use crate::operations::update::propagation_stats::PropagationEvent;
+    #[allow(
+        clippy::wildcard_enum_match_arm,
+        reason = "only the two UPDATE-propagation events are counted; every \
+                  other node event is unrelated to propagation"
+    )]
+    match msg {
+        NodeEvent::BroadcastStateChange { key, .. } => {
+            Some((*key.id(), PropagationEvent::FanoutEventDropped))
+        }
+        NodeEvent::SyncStateToPeer { key, .. } => {
+            Some((*key.id(), PropagationEvent::HealEventDropped))
+        }
+        _ => None,
     }
 }
 

@@ -1647,6 +1647,50 @@ impl ReDb {
         })
     }
 
+    /// The code hashes recorded for the 32-byte delegate key `key` in the
+    /// secrets index: in the single-user table when `user` is `None`, else in
+    /// the per-user table, keeping only `user`'s rows. A prefix range scan
+    /// over this key's rows: in the per-user table that visits the key's rows
+    /// for EVERY user and filters them, so the cost is all of this key's rows,
+    /// never the whole table.
+    /// Used by the secrets export to recover a delegate's real code hash
+    /// (`SecretsStore::walk_scope_secrets_on_disk`).
+    pub fn code_hashes_for_delegate(
+        &self,
+        key: &[u8; 32],
+        user: Option<&[u8; 32]>,
+    ) -> Result<Vec<[u8; 32]>, redb::Error> {
+        let suffix = if user.is_some() { 64 } else { 32 };
+        let mut lo = vec![0u8; 32 + suffix];
+        let mut hi = vec![0xffu8; 32 + suffix];
+        lo[..32].copy_from_slice(key);
+        hi[..32].copy_from_slice(key);
+        let table = if user.is_some() {
+            USER_SECRETS_INDEX_TABLE
+        } else {
+            SECRETS_INDEX_TABLE
+        };
+        self.read_guarded(|txn| {
+            let tbl = txn.open_table(table)?;
+            let mut out = Vec::new();
+            for entry in tbl.range(lo.as_slice()..=hi.as_slice())? {
+                let (k, _) = entry?;
+                let k = k.value();
+                if k.len() != 32 + suffix {
+                    continue;
+                }
+                if let Some(user) = user
+                    && &k[64..] != user.as_slice()
+                {
+                    continue;
+                }
+                let code_hash: [u8; 32] = k[32..64].try_into().unwrap();
+                out.push(code_hash);
+            }
+            Ok(out)
+        })
+    }
+
     // ============== Per-User Secrets Index Methods (P1 of #4381) ==============
     // SEPARATE table from the single-user index above; the DelegateKey is
     // suffixed with the 32-byte UserId so each user's set is independent. The

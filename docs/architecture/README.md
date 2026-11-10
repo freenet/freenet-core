@@ -108,6 +108,7 @@ UDP networking with security and performance features:
 | FixedRate | Stable networks | ✅ |
 | LEDBAT++ | Background traffic | |
 | BBRv3 | Lossy/high-latency paths | |
+| Cubic in `CappedCubic` (QUIC path) | QUIC connections; initial window 32 x 1200 bytes, paced by quinn after its first 10 datagrams | ✅ on QUIC |
 
 **Features:**
 - Token bucket rate limiting

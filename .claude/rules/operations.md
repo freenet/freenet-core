@@ -224,6 +224,38 @@ starve NetworkRelay/Background — but that is a backstop, not a license to
 mis-tag.
 ```
 
+**Client `DelegateRequest`s and the delegate lane (#6144).** Once
+`contract_handling` has started a delegate lane (`contract/delegate_lane.rs`;
+production always does), `ContractHandlerChannel::send_to_handler` hands a
+`DelegateRequest` to the lane's bounded intake (128, `try_send`; full means
+refused at once; a request that is not the node's own local client, i.e. a
+non-local scope or a hosted user, may fill only 7/8 of it,
+`LOCAL_INTAKE_RESERVE`; on a hosted node the reserve therefore protects only
+the operator's own local requests, and hosted users share the other 7/8 among
+themselves). The lane runs a request itself only when its
+delegate is free and fewer than `MAX_PENDING_UNITS` (16) continuations wait
+for the loop; every other request it FORWARDS, unchanged (same id, priority,
+scope, user, responder), into this loop's event channel. The fair-queue
+bounds above (capacity, per-slot cap, `CLIENT_LOCAL_RESERVE`) and, for a
+parked delegate, the park's `queue_pending` cap and byte budget apply ONLY
+to forwarded requests; a request the lane runs never enters the fair queue.
+Keep tagging `DelegateRequest` ClientLocal at the send site: the tag rides
+through the lane. A forwarded request carries a `LaneTicket` marking its
+(delegate key, user) "loop-owned" until the event is dropped (after the
+`DelegateRequest` arm finishes, before the client is answered, or when the
+fair queue refuses it), so that user's later requests for the delegate
+follow rather than overtake. That order is per client and fair-queue
+priority slot (each slot is FIFO; client delegate requests are all
+`ClientLocal`). If the lane task dies it hands its buffered requests to the
+loop, later requests go to the loop directly, and the router snapshot counts
+the death (`delegate_lane_deaths`) and those requests
+(`delegate_lane_forwarded_lane_down`). A forged node-only message is forwarded
+without a ticket. Units (continuations of lane runs) run at the
+TOP of each loop iteration, ahead of the fair queue, at most
+`MAX_LANE_UNITS_PER_ITERATION` (4) per iteration; every `claim_delegate` and
+the inter-delegate hop may also run one pending unit for the delegate it
+claims.
+
 ## Critical Invariant: Initialize-Before-Send
 
 ```
@@ -522,6 +554,98 @@ Pins (source-scrape, fail the build on regression):
 - behavioural: `parked_driver_always_observes_peer_disconnected_under_churn`,
   `recv_waiter_reply_*` (op_ctx.rs) and
   `orphaned_transaction_wakes_parked_waiter_with_peer_disconnected` (op_state_manager.rs)
+
+## UPDATE propagation counters (#6143)
+
+Every place an UPDATE broadcast leg can end without a send logs at debug or
+trace, which release builds compile out. Each outcome is counted instead as a
+`PropagationEvent` (`operations/update/propagation_stats.rs`), per contract
+in the per-minute `update_propagation_summary` INFO line and node-wide as
+`prop_<label>` fields of the `broadcast_payload_mix` telemetry event.
+
+```
+WHEN adding a way for a broadcast leg, fan-out or heal to end:
+  → Count it through `record_propagation_event` (or `PropagationSink::record`
+    where there is no OpManager). Never call `UpdatePropagationStats` or
+    `PayloadMix` directly: the one function feeds both. Telemetry counts
+    every event; the per-contract summary leaves out any event for a
+    contract new to the window once 4096 are tracked, and an `rx_*` event
+    for a contract this node does not host and has no entry for in the
+    window. Receiver events are keyed by whatever contract an inbound
+    message names, before any hosting check, so they go through
+    `record_received_event`, which creates an entry only for a hosted
+    contract (`is_hosting_contract`, not the send side's
+    `should_broadcast_contract`, which reads the state store and is too
+    costly per inbound broadcast).
+  → A new event needs a variant, a label (a stable log/telemetry field name)
+    and a production recording site. The pin test
+    `every_propagation_event_has_a_production_recording_site` fails on a
+    variant nothing records.
+  → BOTH fan-out paths must count it: the production queue
+    (`broadcast_queue.rs`) and the simulation's inline copy
+    (`p2p_protoc/broadcast.rs::broadcast_state_to_peers`), pinned by
+    `the_simulation_fan_out_counts_its_legs` (exact call counts at statement
+    position). Two known differences: the simulation's streamed full state
+    counts `sent_full` but no `wire_stream` or stream fate, since its
+    `send_stream` gives no completion signal; and it has no queue, so it
+    never counts `skip_superseded` or `skip_evicted`.
+  → A stream's fate goes through `record_propagation_stream_fate` (or
+    `PropagationSink::record_stream_fate`), which maps the completion signal
+    to its `wire_stream_*` event.
+  → Per-event logging stays at debug. The count is the release-build signal;
+    a per-stream WARN brings back the #4252/#4272 log volume.
+```
+
+The fields: `client_originated` (a client apply that changed
+state); `sent_delta` / `sent_full` (handed to the bridge); the skips
+`skip_summary_equal`, `skip_cached_converged`, `skip_probe_converged`,
+`skip_empty_delta`, `skip_not_hosted`, `skip_no_address`, `skip_superseded`,
+`skip_evicted`; `send_failed`; transport `wire_short` (one packet),
+`wire_stream` and its fate `wire_stream_delivered` / `_failed` /
+`_egress_abandoned`, `wire_unobserved` (QUIC path), `wire_send_failed`;
+`fanout_event_dropped` / `heal_event_dropped` (`try_notify` refused); `heal_target` (a heal's leg,
+registered when its peer resolves); and the receiver's `rx_dedup`,
+`rx_already_applied`, `rx_backoff`.
+
+`send_failed` is a leg the bridge refused (the send or stream dispatch
+returned `Err`, or the payload did not serialize); that leg has no `sent_*`.
+`wire_send_failed` is the connection task failing to send (or to serialize)
+an inline broadcast the bridge already took; that leg counted `sent_*`,
+possibly in an earlier window (a queued message failing while the connection
+drains before shutdown).
+
+`skip_superseded` is a queued leg replaced by a newer fan-out or heal for the
+same (contract, peer) pair: its update rides on the newer leg. `skip_evicted`
+is a leg the full broadcast queue dropped to make room (`evict_oldest`),
+counted against its own contract. `heal_target` counts a heal's leg apart
+from a fan-out's resolved targets.
+
+**There is no stall WARN.** A rule that WARNed when every leg of a client
+update ended unsent was tried in #6145 and still raised false WARNs in its
+general form; it is deferred to #6165. Do not add one back without the
+analysis there. Diagnose from the INFO line and telemetry instead:
+
+- `client_originated > 0` with `sent_delta + sent_full == 0` for a contract,
+  sustained across windows, means its client updates are not leaving this
+  node. The `skip_*`, `send_failed` and `fanout_event_dropped` counts say
+  where the legs went.
+- One window of targets and no send is not by itself a failure. A leg is held
+  without recording anything while its (contract, peer) pair is busy (a
+  stream keeps it busy for up to `stream_completion_timeout`) or while it
+  waits for the large lane's permits (held up to 120 s each).
+- All legs of a client update skipped as converged (`skip_summary_equal` and
+  the like) is suspect: the update changed this node's state, so no peer can
+  already hold it, and the skip means this node's belief about the peer is
+  stale. That is the leading #6143 hypothesis. Exception: a contract with a
+  lossy summary (two states can share one) can legitimately match.
+- Loss at or after the transport (a stream that fails after the bridge took
+  it, a single packet abandoned after its retransmits, a lost QUIC message)
+  shows in the `wire_*` counts and the receivers' `rx_*` counts across the
+  fleet.
+
+The INFO summary's per-contract lines are the top 8 by update activity, so a
+contract can fall into the "...and N others" rollup behind busier ones; the
+node-wide line and the `prop_*` telemetry fields still count it.
 
 ## Event emission review (targeted vs fan-out)
 

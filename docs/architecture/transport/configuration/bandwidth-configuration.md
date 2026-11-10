@@ -192,9 +192,10 @@ Only one kind of send waits for the bucket:
 | Send | Behaviour when the bucket is empty |
 |------|------------------------------------|
 | Stream fragments (`send_stream`, `pipe_stream`) | First reserve the datagram on the per-connection bucket and sleep until it is due, so a connection serves its streams in order; a reservation whose wait would reach the stream's 5 s deadline is not made, so it takes no place in the connection's order, and the stream fails at once (counted as refused, `egress_streams_refused_*`). A reservation that was made and is later given back (the stream is cancelled or fails on a later wait) does not move the fragments behind it up; their waits are not recomputed. An admitted new stream can still delay streams already in progress on the connection, as without a cap; a per-connection scheduler is future work. This looks only at the connection's wait, so a fragment can still fail on the node-wide bucket at the deadline. The fragment keeps that reservation through later waits. Then wait in the node-wide bucket's admission queue, the same queue the QUIC endpoint waits in, until the bucket holds the datagram; after any wait, check cwnd again; then take the datagram from the node-wide bucket and send at once. Nothing is held on the node-wide bucket while waiting: the queue holds the stream's place, not bytes. Once admitted, the stream holds one datagram until it takes it, for at most 1 ms. If its take fails (an ACK or another unpaced send took the datagram first), or its congestion window holds it longer than that, it waits again at the same place in the queue, not at the back. A stream whose next fragment has not been sent 5 s after its previous one (or after the stream started; the gap the receiver times, whatever the wait was for) fails. |
-| Everything else (handshakes, short messages, ACKs, receipts, keepalives, Pongs, retransmissions) | Sent at once and charged once sent. The bucket goes into debt, and the next stream fragments wait longer to pay it. |
+| Everything else (handshakes, short messages, ACKs, receipts, keepalives, Pongs) | Sent at once and charged once sent. The bucket goes into debt, and the next stream fragments wait longer to pay it. |
+| Retransmissions (RTO resends and tail-loss probes of the legacy UDP transport) | Never waited for: the connection's receive loop asks the bucket and moves on. A retransmit goes only while retransmits have used under half the cap's rate over the last second (`RETX_SHARE_PERCENT`, `RETX_SHARE_WINDOW`) and the bucket's debt after it stays within 100 ms of the rate (`RETX_DEBT_LIMIT`); nothing retransmitted is forgiven. A refused resend keeps its place and is asked again by timer (at least 2 ms later); one still refused one retransmission timeout after its first refusal is sent anyway, charged like the sends above, so a resend is never held without bound and a lost packet is still abandoned after its retransmission count. A refused tail-loss probe is skipped. |
 
-The sends that never wait are sent from places that must not block: the receive path
+The sends that never wait (retransmissions included: they are deferred by timer, never waited for) are sent from places that must not block: the receive path
 of a connection, which runs inside a `select!` that can be cancelled, the connection's
 own task (which sends short messages and also receives for the connection), the
 handshake tasks, and the keepalive task. A failed send is not charged.
@@ -239,7 +240,14 @@ half the receiver's 5 s stream inactivity timeout), `egress_streams_abandoned_<c
 once because their turn on the connection would have come after the 5 s deadline;
 `connection` or `other`; `egress_long_waits_*` does not count these, so read the two
 together), `egress_debt_hwm_bytes` (the largest control-traffic
-debt) and `egress_debt_forgiven_bytes`. `<cause>` is what took most of the gap: `cap`
+debt), `egress_debt_forgiven_bytes`, `egress_retransmits_deferred` (refusals of a
+due resend by the cap; it counts refusals, not packets, since a resend can be refused at
+several wakes), `egress_retransmits_uncapped` and `egress_retransmits_uncapped_bytes` (resends sent
+anyway after a connection's resends were refused for one retransmission timeout in a
+row, and their bytes: what went out past the retransmit limits; non-zero when other
+unpaced traffic held the cap past the retransmit limit, when the retransmit share
+could not serve every waiting connection within a timeout, or at a very small cap) and `egress_probes_skipped` (tail-loss probes the cap had no
+room for). `<cause>` is what took most of the gap: `cap`
 (sleeping for the node-wide cap), `connection` (sleeping for the connection's own
 bucket) or `other` (mostly waiting for the congestion window, or for the upstream stream when the stream is relayed). `egress_waited` and the
 wait times count sleeps for either bucket. All are zero without a cap. A gap of 2.5 s or
@@ -479,8 +487,8 @@ freenet --total-bandwidth-limit 50000000 --min-bandwidth-per-connection 2000000
 ### Total bandwidth exceeding limit
 
 The egress cap holds the average at `total-bandwidth-limit`. Short bursts above it
-are the unpaced sends (ACKs, retransmissions, handshakes, keepalives, short
-messages); check `egress_unpaced`, `egress_debt_hwm_bytes` and
+are the unpaced sends (ACKs, handshakes, keepalives, short messages, and
+retransmissions within 100 ms of debt or sent after their deferral limit); check `egress_unpaced`, `egress_debt_hwm_bytes` and
 `egress_debt_forgiven_bytes` in the `transport_snapshot` telemetry. Forgiven bytes
 mean unpaced traffic alone exceeded the cap for more than a second: raise the total,
 or lower `max-number-of-connections`.

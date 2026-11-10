@@ -6,6 +6,7 @@ use freenet_stdlib::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
 use crate::util::tests::get_temp_dir;
@@ -1758,6 +1759,10 @@ async fn test_store_and_retrieve_secret() -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
+// Unix only: it makes the secrets directory unwritable through its mode bits.
+// Windows ignores the read-only attribute on a directory, so the store would
+// still succeed there.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_set_secret_failure_returns_secret_store_failed()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -4946,12 +4951,16 @@ async fn reentering_an_id_with_a_live_guest_fails_closed_even_with_no_env()
 ///
 /// This pins the fact that makes the #5554 interaction safe, and which nothing
 /// else states. #5554 parks delegates off the serial `contract_handling` loop,
-/// so a delegate's round trip can now span two loop iterations; its own comment
-/// notes that the serial loop was the ONLY thing guaranteeing one `process()`
-/// per delegate. What keeps that sound is ordering: `_guard` is a local of
-/// `exec_inbound_with_env`, so `DELEGATE_ENV` is cleared strictly before the
-/// `Err` reaches `inbound_app_message`, before `DelegateRunOutcome::Failed`, and
-/// therefore before a park can release a queued run for the same delegate.
+/// so a delegate's round trip can now span two loop iterations. When #5554
+/// merged, the serial loop was the only thing guaranteeing one `process()` per
+/// delegate; since the delegate lane (`contract::delegate_lane`) that is held
+/// by the delegate executor's lock (`PooledDelegateRunner`) and `DelegateGate`
+/// between the lane and the loop. What keeps it sound here is ordering:
+/// `_guard` is a local of `exec_inbound_with_env`, so `DELEGATE_ENV` is cleared
+/// strictly before the `Err` reaches `inbound_app_message`, before
+/// `DelegateRunOutcome::Failed`, and therefore before a park can release a
+/// queued run for the same delegate, and before the delegate executor's lock
+/// passes to the next caller (lane or loop).
 ///
 /// That is the placement of one local variable, load-bearing across two merged
 /// changes, and until this test nothing checked it. A `std::mem::forget(_guard)`

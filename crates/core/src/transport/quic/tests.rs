@@ -415,6 +415,19 @@ pub(super) fn payload(len: usize) -> Vec<u8> {
 
 pub(super) const MIB: usize = 1024 * 1024;
 
+/// The versions `Cargo.lock` locks for the package `name`. Line endings are
+/// normalised, so a checkout with CRLF endings reads the same.
+pub(super) fn locked_versions(name: &str) -> Vec<String> {
+    let lock = include_str!("../../../../../Cargo.lock").replace("\r\n", "\n");
+    let header = format!("[[package]]\nname = \"{name}\"\nversion = \"");
+    lock.match_indices(&header)
+        .map(|(at, _)| {
+            let rest = &lock[at + header.len()..];
+            rest[..rest.find('"').expect("closing quote")].to_owned()
+        })
+        .collect()
+}
+
 /// Two endpoints on the simulated network complete a TLS 1.3 handshake
 /// with Ed25519 raw public keys and move 1 MiB on a unidirectional stream,
 /// on virtual time. Each side sees the other's key, the fixed ALPN, and no
@@ -2163,6 +2176,19 @@ fn with_poller_holds_puts_the_slot_back() {
     assert!(next_poller_holds().is_none());
 }
 
+/// GRO stays off: quinn copies a GRO batch into one allocation and splits
+/// it (`quinn/src/endpoint.rs`), so with GRO a 1-byte STREAM chunk could keep
+/// a whole batch (up to about 64 KiB) alive; the inbound reader's memory
+/// accounting assumes one datagram per allocation.
+#[test]
+fn the_quic_socket_receives_one_datagram_per_allocation() {
+    use quinn::AsyncUdpSocket;
+    let time = VirtualTime::new();
+    let local: SocketAddr = "10.201.43.1:5000".parse().unwrap();
+    let (socket, _demux) = scripted(local, SendMode::Send, Vec::new(), Some((1_000_000, &time)));
+    assert_eq!(socket.max_receive_segments(), 1);
+}
+
 /// A poller built outside `with_poller_holds` (quinn 0.11.12 builds one only
 /// on a rebind, which needs migration, which is off) is counted on its own
 /// socket's template record, where a test can see it, and one built inside
@@ -2789,6 +2815,9 @@ fn close_codes_reach_the_peer() {
             },
             QuicCloseCode::SessionEnded => QuicErrorKind::Refused {
                 reason: QuicRefusal::SessionEnded,
+            },
+            QuicCloseCode::OverBudget => QuicErrorKind::Refused {
+                reason: QuicRefusal::OverBudget,
             },
         };
         let mut sent_by_a = Vec::new();
