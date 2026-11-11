@@ -3314,7 +3314,7 @@ mod tests {
     /// 5 s source gap, however long the source path's own gap is: the UDP
     /// receiver downstream gives up after 5 s, so waiting longer would only
     /// keep sending to a peer that has gone. A 6 s gap fails the pipe even
-    /// though the source path's gap (16 x 800 ms) would allow it.
+    /// though the source path's gap (24 x 800 ms) would allow it.
     #[tokio::test(start_paused = true)]
     async fn a_udp_pipe_keeps_five_seconds_for_a_quic_fed_source() {
         use crate::transport::peer_connection::streaming::{PathRtt, QuicSourcePath, StreamHandle};

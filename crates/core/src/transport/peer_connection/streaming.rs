@@ -91,9 +91,13 @@ impl QuicSourceEnd {
 /// before it gives up ([`quic_fragment_gap`]). quinn's probe timeout is at
 /// least one smoothed round trip and doubles each time it fires in a row,
 /// so a tail lost twice in a row waits about 1 + 2 + 4 = 7 probe timeouts
-/// before it can arrive; 16 round trips covers that with the probe timeout
-/// up to about twice the round trip (its variance term under loss).
-pub(crate) const QUIC_GAP_RTT_MULTIPLE: u32 = 16;
+/// before it can arrive. 24 round trips covers that with the probe timeout up
+/// to about three times the round trip (its variance term under loss). At
+/// 800 ms and 15% loss, 16 was overrun by 2 of 300 streams of 64 KiB and 24
+/// by none of 600 (`a_slow_lossy_path_stays_within_its_consumer_gap`). The
+/// tail is the probe timeout doubling, which no multiple below the idle limit
+/// bounds; an overrun fails the stream, and the operation retries.
+pub(crate) const QUIC_GAP_RTT_MULTIPLE: u32 = 24;
 
 /// The gap a consumer of a QUIC-fed stream allows between two pieces:
 /// [`QUIC_GAP_RTT_MULTIPLE`] round trips of its path, at least
@@ -418,8 +422,10 @@ impl StreamHandle {
     /// The longest gap between two fragments a consumer of this stream
     /// should expect before it fails: [`STREAM_INACTIVITY_TIMEOUT`] for the
     /// UDP transport, and [`quic_fragment_gap`] of its path for a QUIC-fed
-    /// stream (5 s until the reader has set the path). Read at each wait, so
-    /// it follows the path's round trip as it changes.
+    /// stream (5 s until the reader has set the path). It follows the path's
+    /// round trip as it changes: [`Self::assemble`] reads it at each wait,
+    /// while a QUIC pipe and the GET drain window take it once, when they
+    /// start.
     pub(crate) fn fragment_gap_limit(&self) -> std::time::Duration {
         self.quic
             .as_ref()
@@ -2150,7 +2156,7 @@ mod tests {
     }
 
     /// The gap a consumer should time out at: 5 s for a UDP-fed stream; for
-    /// a QUIC-fed one, 16 round trips of its path, at least 5 s and at most
+    /// a QUIC-fed one, 24 round trips of its path, at least 5 s and at most
     /// the reader's idle limit, read at each call (the path's round trip
     /// moves), and 5 s before the reader has set the path. Forks keep it.
     #[test]
@@ -2163,7 +2169,7 @@ mod tests {
         assert_eq!(unset.fragment_gap_limit(), STREAM_INACTIVITY_TIMEOUT);
         for (rtt, gap) in [
             (Duration::from_millis(50), Duration::from_secs(5)),
-            (Duration::from_millis(800), Duration::from_millis(12_800)),
+            (Duration::from_millis(800), Duration::from_millis(19_200)),
             (Duration::from_secs(5), Duration::from_secs(30)),
         ] {
             let quic = quic_handle_on_path(10, rtt);
@@ -2180,7 +2186,7 @@ mod tests {
                 idle: Duration::from_secs(30),
             });
         rtt.set(Duration::from_secs(1));
-        assert_eq!(moving.fragment_gap_limit(), Duration::from_secs(16));
+        assert_eq!(moving.fragment_gap_limit(), Duration::from_secs(24));
         // A UDP-fed stream has no source to end.
         udp.end_quic_source(QuicSourceEnd::Idle);
         assert!(udp.quic_source().is_none());

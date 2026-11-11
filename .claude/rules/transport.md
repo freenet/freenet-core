@@ -1945,12 +1945,18 @@ Sending (QuicPath::send_short_bounded / send_stream_bounded /
   admitted and each ack-watch tick, and its own idle limit) and records why
   it stopped (QuicSourceEnd: Idle, Age, Ended), which wakes every clone and
   fork. Consumers wait quic_fragment_gap between pieces:
-  QUIC_GAP_RTT_MULTIPLE (16) round trips, at least 5 s, at most the reader's
+  QUIC_GAP_RTT_MULTIPLE (24) round trips, at least 5 s, at most the reader's
   idle limit (30 s in production); 5 s before the reader set the path.
-  assemble() applies it as its timer and also ends at once on a recorded end;
-  chunks() yields the end as an Err. A pipe whose sink is UDP (pipe_stream,
-  and a QUIC pipe's fallback to UDP) keeps 5 s whatever its source, because
-  its UDP receiver gives up at 5 s. Control sends have no gap. A receiver reads every announced
+  assemble() applies it as its timer, read at each wait, and also ends at
+  once on a recorded end; chunks() yields the end as an Err. A QUIC pipe
+  takes min(the source's gap, QuicPath::receiver_gap: the gap the next hop's
+  receiver allows, from this end's round trip) once, when it starts, so a
+  slow upstream feeding a fast downstream still fails at the downstream gap
+  and never pipes into a stream its receiver gave up on; the GET drain window
+  also takes the gap once. A pipe whose sink is UDP (pipe_stream, and a QUIC
+  pipe's fallback to UDP) keeps 5 s whatever its source, because its UDP
+  receiver gives up at 5 s. End to end, a fast last hop still fails a slow
+  chain at its own gap: the receiver does not learn the upstream gap. Control sends have no gap. A receiver reads every announced
   stream to its end whatever its consumer does (push_fragment does not wait);
   its one wait is announcing a stream into a full channel, bounded by
   inbound_stream_age_limit(len), the sender's total, so the two give up

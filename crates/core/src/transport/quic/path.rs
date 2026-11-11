@@ -1068,6 +1068,20 @@ impl QuicPath {
         self.budget.lock().stream_count()
     }
 
+    /// The gap the receiver of a stream sent on this path allows between two
+    /// pieces before it gives up: [`quic_fragment_gap`] of the round trip as
+    /// this end measures it, under the idle limit every reader uses. A pipe
+    /// into this path waits on its source no longer than this, so it never
+    /// writes into a stream its receiver has given up on.
+    ///
+    /// [`quic_fragment_gap`]: crate::transport::peer_connection::streaming::quic_fragment_gap
+    pub(crate) fn receiver_gap(&self) -> Duration {
+        crate::transport::peer_connection::streaming::quic_fragment_gap(
+            self.connection.inner().rtt(),
+            crate::transport::peer_connection::streaming_handle_idle_timeout(),
+        )
+    }
+
     /// The connection, for tests that write raw streams.
     #[cfg(test)]
     pub(crate) fn connection(&self) -> &QuicConnection {

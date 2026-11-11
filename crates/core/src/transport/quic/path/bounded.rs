@@ -561,7 +561,7 @@ pub(crate) struct QuietProof {
 /// what holds it then, and a source that stalls is bounded by the send's own
 /// source gap ([`SendDeadlines::source_gap`]): 5 s for a UDP-fed source, as
 /// pipe_stream bounds one, and the source path's gap for a QUIC-fed one
-/// (`streaming::quic_fragment_gap`: 16 round trips, at least 5 s, at most the
+/// (`streaming::quic_fragment_gap`: 24 round trips, at least 5 s, at most the
 /// reader's idle limit).
 ///
 /// The connection is read only at the timer's wakes, so a move is dated to

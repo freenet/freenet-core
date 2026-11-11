@@ -2330,7 +2330,7 @@ fn assemble_both(
 }
 
 /// A QUIC-fed stream on a slow path (400 ms each way, so the reader gives
-/// its consumers 16 round trips, 12.8 s) whose sender is silent for 8 s,
+/// its consumers 24 round trips, 19.2 s) whose sender is silent for 8 s,
 /// longer than the UDP transport's fragment gap (`STREAM_INACTIVITY_TIMEOUT`,
 /// 5 s), still assembles, through the handle and a fork. quinn's retransmit
 /// backoff at a high RTT with loss leaves such gaps in a stream it then
@@ -6721,8 +6721,14 @@ fn a_first_chunk_at_the_deadline_opens_no_stream() {
 /// The case that motivated a path-derived consumer gap (e5b-9-perf's cold
 /// start lab, 64 KiB at 800 ms RTT and 15% loss): over many seeds, the worst
 /// gap between two fragments arriving at the receiver stays under the gap
-/// the handle gives its consumers (16 round trips, about 12.8 s here), and
+/// the handle gives its consumers (24 round trips, about 19.2 s here), and
 /// every stream assembles. Prints the worst gap per seed.
+///
+/// Deterministic: virtual time, loss drawn from a per-seed RNG, and the
+/// global RNG seeded, so the gaps are the same on every run, alone or beside
+/// other tests (checked: identical per-seed output over repeated and parallel
+/// runs). Worst here 8.09 s against 19.2 s. A wider sweep (outside CI) is in
+/// the PR.
 #[test]
 fn a_slow_lossy_path_stays_within_its_consumer_gap() {
     bounded(|| async move {
