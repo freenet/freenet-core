@@ -19,6 +19,8 @@
 //! loss to Cubic only when:
 //!
 //! - quinn declares persistent congestion (always passed), or
+//! - it is an ECN congestion mark (quinn reports it with no lost bytes;
+//!   the node's socket does not read ECN today, so none arrive), or
 //! - the queue it estimates is at least [`queue_threshold`]: a tenth of the
 //!   minimum RTT ([`QUEUE_FRACTION`]), at least [`QUEUE_FLOOR`], or
 //! - the smoothed share of bytes lost per round trip is at least
@@ -45,12 +47,19 @@
 //!
 //! # What this does to other traffic
 //!
-//! On a path with a queue the controller is Cubic once the queue reaches the
-//! threshold, so it holds a standing queue of about the threshold instead of
-//! filling the buffer, and it backs off for a competing flow. On a queue
+//! On a drop-tail queue deeper than the threshold, an overflow loss comes
+//! with the queue full, so it passes: with no random loss the controller is
+//! exactly Cubic and fills the buffer as Cubic does. With random loss too,
+//! the random losses taken while the queue is below the threshold are
+//! ignored, so it holds more of the link than Cubic would. On a queue
 //! shallower than the threshold a congestion loss looks random; the
-//! loss-share ceiling is then what stops it. The e5b-9 lab measured both; the
-//! numbers are in the pull request that added this gate.
+//! loss-share ceiling is then what stops it, and a competing loss-based flow
+//! keeps less of the link than next to Cubic.
+//!
+//! The figures cited here were measured with the `quic_lab_cold` and
+//! `quic_lab_burst` benches (`crates/core/benches/transport/quic_lab.rs` on
+//! the `lab/quic-cold-start` branch, "e5b-9 lab"); the tables are in PR
+//! #6185.
 //!
 //! # Telemetry
 //!
@@ -127,6 +136,9 @@ pub(crate) fn queue_threshold(min_rtt: Duration) -> Duration {
 pub(crate) enum Verdict {
     /// quinn declared persistent congestion.
     Persistent,
+    /// An ECN congestion mark (quinn reports it with no lost bytes): a
+    /// router's own congestion signal, never random loss.
+    Ecn,
     /// The smoothed loss share is at or above [`LOSS_SHARE_CEILING`].
     LossShare,
     /// The queue estimate is at or above [`queue_threshold`].
@@ -139,10 +151,11 @@ pub(crate) enum Verdict {
 
 impl Verdict {
     /// Every verdict, in the order of [`VERDICT_LABELS`].
-    pub(crate) const ALL: [Verdict; 5] = [
+    pub(crate) const ALL: [Verdict; GATE_VERDICTS] = [
         Verdict::Queue,
         Verdict::LossShare,
         Verdict::Persistent,
+        Verdict::Ecn,
         Verdict::NoSample,
         Verdict::Ignored,
     ];
@@ -152,23 +165,33 @@ impl Verdict {
             Verdict::Queue => 0,
             Verdict::LossShare => 1,
             Verdict::Persistent => 2,
-            Verdict::NoSample => 3,
-            Verdict::Ignored => 4,
+            Verdict::Ecn => 3,
+            Verdict::NoSample => 4,
+            Verdict::Ignored => 5,
         }
     }
 }
 
 /// The telemetry labels of the verdicts (`quic_gate_loss_<label>`), in the
 /// order of [`Verdict::ALL`].
-pub(crate) const VERDICT_LABELS: [&str; 5] =
-    ["queue", "share", "persistent", "no_sample", "ignored"];
+pub(crate) const VERDICT_LABELS: [&str; GATE_VERDICTS] = [
+    "queue",
+    "share",
+    "persistent",
+    "ecn",
+    "no_sample",
+    "ignored",
+];
+
+/// The number of verdicts.
+pub(crate) const GATE_VERDICTS: usize = 6;
 
 /// A connection's congestion events by the gate's verdict, since the
 /// connection started. Shared by the gate and its clones (quinn's
 /// `Connection::congestion_state`), so the path's report reads the live
 /// counts (`recycle::PathReport`, `quic_gate_loss_<verdict>`).
 #[derive(Debug, Default)]
-pub(crate) struct GateVerdicts([AtomicU64; 5]);
+pub(crate) struct GateVerdicts([AtomicU64; GATE_VERDICTS]);
 
 impl GateVerdicts {
     fn record(&self, verdict: Verdict) {
@@ -176,7 +199,7 @@ impl GateVerdicts {
     }
 
     /// The counts so far, in the order of [`Verdict::ALL`].
-    pub(crate) fn read(&self) -> [u64; 5] {
+    pub(crate) fn read(&self) -> [u64; GATE_VERDICTS] {
         std::array::from_fn(|i| self.0[i].load(Ordering::Relaxed))
     }
 }
@@ -193,9 +216,10 @@ pub(crate) struct GateState {
     round_lost: u64,
     share: f64,
     /// The smallest RTT of the packets sent in each recent span of send
-    /// times: (start of the span, smallest RTT), oldest first. A span ends
-    /// where the next begins.
-    sends: VecDeque<(Instant, Duration)>,
+    /// times: (start, end, smallest RTT), oldest first. A span covers
+    /// `start..end` and nothing after it, so after an idle gap a span from
+    /// before the gap is not taken to cover a packet sent after it.
+    sends: VecDeque<(Instant, Instant, Duration)>,
     /// Losses passed to the inner controller, and ignored.
     pub(crate) passed: u64,
     pub(crate) ignored: u64,
@@ -225,7 +249,7 @@ impl GateState {
     ) -> Verdict {
         self.roll(now);
         self.round_lost += lost_bytes;
-        let verdict = self.judge(sent, persistent);
+        let verdict = self.judge(sent, lost_bytes, persistent);
         if verdict == Verdict::Ignored {
             self.ignored += 1;
         } else {
@@ -251,10 +275,8 @@ impl GateState {
         let window = (self.srtt? / NEAR_WINDOW_FRACTION).max(NEAR_WINDOW_MIN);
         let (from, to) = (sent.checked_sub(window).unwrap_or(sent), sent + window);
         let mut near: Option<Duration> = None;
-        for (i, &(start, rtt)) in self.sends.iter().enumerate() {
-            let end = self.sends.get(i + 1).map(|&(next, _)| next);
-            let overlaps = start <= to && end.is_none_or(|end| end > from);
-            if overlaps {
+        for &(start, end, rtt) in &self.sends {
+            if start <= to && end > from {
                 near = Some(near.map_or(rtt, |m| m.min(rtt)));
             }
         }
@@ -267,12 +289,17 @@ impl GateState {
             .srtt
             .map_or(BUCKET_MIN, |srtt| (srtt / 8).max(BUCKET_MIN));
         match self.sends.back_mut() {
-            Some((start, min)) if sent >= *start && sent < *start + width => {
+            Some((start, end, min)) if sent >= *start && sent < *end => {
                 *min = (*min).min(sample);
             }
-            Some((start, _)) if sent < *start => {
+            Some((start, _, _)) if sent < *start => {
                 // Acknowledged out of order: the span it was sent in, if kept.
-                if let Some((_, min)) = self.sends.iter_mut().rev().find(|(s, _)| *s <= sent) {
+                if let Some((_, _, min)) = self
+                    .sends
+                    .iter_mut()
+                    .rev()
+                    .find(|(s, e, _)| *s <= sent && sent < *e)
+                {
                     *min = (*min).min(sample);
                 }
             }
@@ -280,7 +307,7 @@ impl GateState {
                 if self.sends.len() == SEND_BUCKETS {
                     self.sends.pop_front();
                 }
-                self.sends.push_back((sent, sample));
+                self.sends.push_back((sent, sent + width, sample));
             }
         }
     }
@@ -291,9 +318,12 @@ impl GateState {
         self.share
     }
 
-    fn judge(&self, sent: Instant, persistent: bool) -> Verdict {
+    fn judge(&self, sent: Instant, lost_bytes: u64, persistent: bool) -> Verdict {
         if persistent {
             return Verdict::Persistent;
+        }
+        if lost_bytes == 0 {
+            return Verdict::Ecn;
         }
         if self.share >= LOSS_SHARE_CEILING {
             return Verdict::LossShare;

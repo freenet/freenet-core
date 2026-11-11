@@ -1434,10 +1434,11 @@ a test passes its own; tests read their own, never the global).
   level in the period, and the highest count a reset in the period took a path
   to). They are for the fixed charge, which takes quinn's stopped map at
   SEND_ABORT_LIMIT x QUIC_STOPPED_ENTRY_BYTES until field data justifies less.
-  quic_gate_loss_<queue|share|persistent|no_sample|ignored> (congestion events by
-  the loss gate's verdict, recycle::loss_gate, reported by the path's report at
-  each tick; they sum to quic_congestion_events, since quinn counts an event
-  where it calls the controller) and quic_gate_ended_queue_<lt_10pct|lt_50pct|
+  quic_gate_loss_<queue|share|persistent|ecn|no_sample|ignored> (congestion
+  events by the loss gate's verdict, recycle::loss_gate, reported by the path's
+  report at each tick; over a path's life they sum to its quic_congestion_events,
+  since quinn counts an event where it calls the controller, while one period's
+  sums can differ by the events between a tick's two reads) and quic_gate_ended_queue_<lt_10pct|lt_50pct|
   ge_50pct> (paths that ended in the period after at least 20 verdicts, by the
   share passed as a queue). A path whose losses mostly read as a queue runs as
   plain Cubic, from a real queue or from jitter; with the path's loss rate this
