@@ -1905,7 +1905,7 @@ pub(crate) struct PathReport {
     window: crate::transport::metrics::PathLossWindow,
     /// The loss gate's verdict counts and those already reported; `None` when
     /// the connection's controller has no gate.
-    gate: Option<(Arc<GateVerdicts>, [u64; 5])>,
+    gate: Option<(Arc<GateVerdicts>, [u64; loss_gate::GATE_VERDICTS])>,
     gate_window: crate::transport::metrics::PathGateWindow,
     /// When the path's time was last reported, in the time source's
     /// nanoseconds.
@@ -1968,7 +1968,8 @@ impl PathReport {
         self.loss = next;
         if let Some((verdicts, seen)) = &mut self.gate {
             let now = verdicts.read();
-            let delta: [u64; 5] = std::array::from_fn(|i| now[i].saturating_sub(seen[i]));
+            let delta: [u64; loss_gate::GATE_VERDICTS] =
+                std::array::from_fn(|i| now[i].saturating_sub(seen[i]));
             *seen = now;
             self.node.record_gate(&mut self.gate_window, delta);
         }

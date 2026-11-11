@@ -3443,6 +3443,18 @@ fn the_loss_gates_verdicts_reach_the_node_counters() {
             keys["quic_gate_loss_ignored"] * 2 > verdicts,
             "random loss with no queue is mostly ignored: {keys:?}"
         );
+        // When the path ends, `a`'s report counts it in the bucket of its
+        // share passed as a queue (`b` sent too little to have 20 verdicts).
+        assert!(verdicts >= 20, "{verdicts} verdicts");
+        let (a, b, time) = (p.a.clone(), p.b.clone(), p.time());
+        p.drive(async move {
+            a.connection().close(QuicCloseCode::Downgrade);
+            time.sleep(Duration::from_secs(5)).await;
+            drop(b);
+        })
+        .await;
+        let ended = counters.snapshot(true).gate_ended_queue;
+        assert_eq!(ended, vec![1, 0, 0], "under 10% passed as a queue");
     })
 }
 

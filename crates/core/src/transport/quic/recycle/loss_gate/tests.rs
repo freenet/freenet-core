@@ -169,7 +169,42 @@ fn an_out_of_order_acknowledgement_goes_to_its_own_span() {
     let before = gate.queue_at(early);
     gate.on_ack(early + rtt, early, 1200, rtt);
     assert!(gate.queue_at(early) < before, "{before:?}");
-    assert_eq!(gate.sends.back().map(|s| s.1), Some(rtt + 10 * MS));
+    assert_eq!(gate.sends.back().map(|s| s.2), Some(rtt + 10 * MS));
+}
+
+/// A span ends where it was made to end, not where the next begins: after
+/// an idle gap, the newest span from before the gap does not cover a packet
+/// sent after it, so a lost packet of a new burst into a queue is not judged
+/// by the RTTs of before the gap.
+#[test]
+fn a_span_from_before_an_idle_gap_does_not_cover_a_later_loss() {
+    let mut gate = GateState::default();
+    let rtt = 100 * MS;
+    let (now, last) = steady(&mut gate, Instant::now(), rtt, Duration::ZERO, 4, 40);
+    let resumed = now + Duration::from_secs(2);
+    assert_eq!(gate.queue_at(last), Some(Duration::ZERO));
+    assert_eq!(gate.queue_at(resumed), None, "no span covers the new burst");
+    // The new burst's first acknowledged packets show a queue; one sent
+    // between them is lost.
+    for i in 0..10u32 {
+        let at = resumed + MS * (2 * i);
+        gate.on_ack(at + rtt + THRESHOLD_100, at, 1200, rtt);
+    }
+    assert_eq!(
+        gate.on_loss(resumed + rtt * 2, resumed + 5 * MS, 1200, false),
+        Verdict::Queue
+    );
+}
+
+/// An ECN congestion mark (quinn passes it with no lost bytes) always
+/// reaches Cubic, with no queue and a low loss share.
+#[test]
+fn an_ecn_mark_always_counts() {
+    let mut gate = GateState::default();
+    let (now, last) = steady(&mut gate, Instant::now(), 100 * MS, Duration::ZERO, 4, 40);
+    assert_eq!(gate.queue_at(last), Some(Duration::ZERO));
+    assert_eq!(gate.on_loss(now, last, 0, false), Verdict::Ecn);
+    assert_eq!(gate.on_loss(now, last, 1200, false), Verdict::Ignored);
 }
 
 #[test]

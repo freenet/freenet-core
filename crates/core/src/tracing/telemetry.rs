@@ -7830,6 +7830,8 @@ mod tests {
         data.path_ms = 1037;
         data.send_resets_reached = (1038..1042).collect();
         data.send_resets_path_max = 1042;
+        data.gate_loss = (1043..1049).collect();
+        data.gate_ended_queue = (1049..1052).collect();
         let want: std::collections::BTreeMap<String, u64> =
             snapshot.quic_data.keys().into_iter().collect();
         assert!(want.values().all(|value| *value != 0));
