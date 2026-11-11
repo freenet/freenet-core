@@ -6035,6 +6035,62 @@ fn a_permit_held_past_a_timed_out_send_returns_on_close() {
     })
 }
 
+/// A one-packet Short takes no permit, but its send epoch stays held past
+/// `MaybeDelivered(TimedOut)` until the acknowledgement, so a send window
+/// lowered meanwhile stays charged while quinn may still hold its data.
+#[test]
+fn a_one_packet_short_holds_its_send_epoch_until_the_ack() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let windows = Windows {
+            a: Some(test_budget(64 << 20, leaked_counters())),
+            b: None,
+        };
+        let network = "quic-path-short-epoch";
+        let p = paths_metered(network, 78, windows).await;
+        let limit = super::super::config::STREAMED_SEND_LIMIT as usize;
+        let silenced = DropFrom::new(network, &[p.pair.b_addr]);
+        let (a, time) = (p.a.clone(), p.time());
+        let (outcome, slots, holders) = p
+            .drive(async move {
+                let outcome = a
+                    .send_short_bounded(&time, Duration::from_secs(1), b"short")
+                    .await;
+                time.sleep(Duration::from_secs(2)).await;
+                (outcome, a.free_stream_slots(), a.send_epoch_holders())
+            })
+            .await;
+        assert!(
+            matches!(
+                outcome,
+                BoundedSend::MaybeDelivered(MaybeDelivered::TimedOut)
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(slots, limit, "premise: a one-packet Short takes no permit");
+        assert_eq!(holders, 1, "the unacknowledged Short holds its epoch");
+
+        drop(silenced);
+        let (a, time) = (p.a.clone(), p.time());
+        let released = p
+            .drive(async move {
+                for _ in 0..600 {
+                    if a.send_epoch_holders() == 0 {
+                        return true;
+                    }
+                    time.sleep(Duration::from_millis(100)).await;
+                }
+                false
+            })
+            .await;
+        assert!(released, "the acknowledgement releases the epoch");
+        assert!(
+            p.a.connection().inner().close_reason().is_none(),
+            "released by the ack, not by the connection ending"
+        );
+    })
+}
+
 /// A Short past one packet waits for a permit as a stream does, and one that
 /// fits a packet does not.
 #[test]
