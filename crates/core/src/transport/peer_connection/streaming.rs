@@ -1992,12 +1992,21 @@ mod tests {
             handle.end_quic_source(reason);
             handle.end_quic_source(QuicSourceEnd::Ended);
             handle.cancel();
-            let (a, b) = consumers.await.unwrap();
+            // Bounded, so a consumer that misses the end fails here instead
+            // of parking the paused runtime forever.
+            let bound = std::time::Duration::from_secs(60);
+            let (a, b) = tokio::time::timeout(bound, consumers)
+                .await
+                .expect("a consumer did not end with its reader")
+                .unwrap();
             assert_eq!(a, Err(expected.clone()), "{reason:?}");
             assert_eq!(b, Err(expected), "{reason:?}");
             assert_eq!(start.elapsed(), std::time::Duration::ZERO, "{reason:?}");
             // A fork taken after the end sees it too.
-            assert!(handle.fork().assemble().await.is_err(), "{reason:?}");
+            let late = tokio::time::timeout(bound, handle.fork().assemble())
+                .await
+                .expect("a fork taken after the end did not see it");
+            assert!(late.is_err(), "{reason:?}");
         }
     }
 
@@ -2029,7 +2038,12 @@ mod tests {
         tokio::task::yield_now().await;
         handle.end_quic_source(QuicSourceEnd::Idle);
         handle.cancel();
-        let items = reader.await.unwrap();
+        // Bounded, so a stream that misses the end fails here instead of
+        // parking the paused runtime forever.
+        let items = tokio::time::timeout(std::time::Duration::from_secs(60), reader)
+            .await
+            .expect("the fork's stream did not end with its reader")
+            .unwrap();
         assert_eq!(items.len(), 2, "{items:?}");
         assert_eq!(items[0].as_ref().unwrap().len(), FRAGMENT_PAYLOAD_SIZE);
         assert_eq!(items[1], Err(StreamError::InactivityTimeout));
