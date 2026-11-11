@@ -22537,3 +22537,41 @@ fn test_quic_mixed_modes_are_deterministic() {
     };
     assert_eq!(once("quic-mixed-det-run1"), once("quic-mixed-det-run2"));
 }
+
+/// M1 measurement (temporary): non-convergent contract, flag ON vs OFF.
+#[test_log::test]
+fn m1_measure_flag_on_off() {
+    use freenet::dev_tool::sim_m1::*;
+    let iters: usize = std::env::var("M1_ITERS").ok().and_then(|v| v.parse().ok()).unwrap_or(3000);
+    let nodes: usize = std::env::var("M1_NODES").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
+    let m = 4u8;
+    let mut rows = vec![];
+    for (label, off) in [("flag_ON", false), ("flag_OFF", true)] {
+        set_bad_contract_modulus(m);
+        set_gates_off(off);
+        let _ = take_merge_counts();
+        let name: &'static str = if off { "m1-off" } else { "m1-on" };
+        let res = TestConfig::medium(name, 0x4D31_0001)
+            .with_nodes(nodes)
+            .with_gateways(2)
+            .with_iterations(iters)
+            .with_max_contracts(8)
+            .with_connections(4, 10)
+            .with_event_wait(Duration::from_millis(200))
+            .with_mock_wasm()
+            .no_convergence_wait()
+            .run_direct();
+        let counts = take_merge_counts();
+        let (bad, good): (Vec<_>, Vec<_>) = counts.iter().partition(|(b, _, _)| b % m == 0);
+        let sum = |v: &Vec<&(u8, String, u64)>| v.iter().map(|x| x.2).sum::<u64>();
+        let conv = &res.convergence;
+        println!(
+            "M1ROW {label} nodes={nodes} iters={iters} virt_secs~{} bad_contracts={} bad_merges={} good_contracts={} good_merges={} converged={} diverged={} events={}",
+            iters as f64 * 0.2, bad.len(), sum(&bad), good.len(), sum(&good),
+            conv.converged.len(), conv.diverged.len(), res.event_count
+        );
+        rows.push(label);
+    }
+    set_bad_contract_modulus(0);
+    set_gates_off(false);
+}

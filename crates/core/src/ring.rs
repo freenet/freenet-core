@@ -108,7 +108,7 @@ mod hosting;
 #[cfg(test)]
 pub(crate) use broken_invariants::{BROKEN_INVARIANT_TTL, EMITTED_FLAG_EVENTS};
 pub(crate) use broken_invariants::{
-    BrokenInvariant, BrokenInvariantDetector, BrokenInvariantsTracker, FLAG_TELEMETRY_EVENT,
+    BrokenInvariant, BrokenInvariantDetector, BrokenInvariantsTracker, FLAG_TELEMETRY_EVENT, SIM_GATES_OFF,
 };
 /// Pre-write admission-gate rejection type (#4683, PR 3). Surfaced to the
 /// executor chokepoints so a write that would overflow the aggregate disk

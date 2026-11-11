@@ -114,6 +114,10 @@
 //! the UPDATE rate limiter.
 
 use std::sync::Arc;
+
+/// Simulation hook (M1 measurement): when set, `is_broken` reports false so
+/// the commit/broadcast/egress gates are open while detection still records.
+pub static SIM_GATES_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 use std::time::Duration;
 
 use dashmap::DashMap;
@@ -359,6 +363,9 @@ impl BrokenInvariantsTracker {
     /// physically reclaimed by the periodic [`BrokenInvariantsTracker::cleanup`]
     /// sweep, so this stays cheap on the broadcast/commit hot path.
     pub fn is_broken(&self, id: &ContractInstanceId) -> bool {
+        if SIM_GATES_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+            return false;
+        }
         let now = self.time_source.now();
         match self.flags.get(id) {
             Some(entry) => now.saturating_duration_since(entry.recorded_at) < entry.ttl,
