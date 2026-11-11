@@ -233,6 +233,19 @@ struct Shaper {
 /// never arrives before an earlier one). 0 for none.
 pub static JITTER_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// A fixed-rate sender on the uplink of the next shaped socket bound after
+/// [`arm_background`], in kbit/s (0 for none), running from its bind, so a
+/// connection's handshake already sees its queue: the legacy UDP transport's
+/// unresponsive load, which keeps a standing queue near the link rate.
+pub static BG_KBPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static BG_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Put the [`BG_KBPS`] sender on the next shaped socket bound (the sender of
+/// a lab pair, which binds first). It runs until its runtime is dropped.
+pub fn arm_background() {
+    BG_ARMED.store(BG_KBPS.load(Ordering::Relaxed) > 0, Ordering::Relaxed);
+}
+
 /// The AQM on every shaped uplink bound from now on: 0 none, 1 CoDel, 2 PIE.
 pub static AQM_KIND: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// The AQM's target delay in microseconds; 0 for its default (CoDel 5 ms,
@@ -332,6 +345,8 @@ fn queue_summary(samples: &[u32]) -> String {
 /// it was sent. Slow start to the first loss, then +1 datagram per window
 /// per round trip, halving at most once per round trip.
 pub struct Competitor {
+    /// The fixed-rate background sender ([`BG_KBPS`]), if any.
+    background: Option<tokio::task::JoinHandle<()>>,
     delivered: Arc<std::sync::atomic::AtomicU64>,
     queued_us: Arc<parking_lot::Mutex<Vec<u32>>>,
     lost: Arc<std::sync::atomic::AtomicU64>,
@@ -355,6 +370,7 @@ impl Competitor {
             offered.clone(),
             queued_us.clone(),
         );
+        let background: Option<tokio::task::JoinHandle<()>> = None;
         let task = tokio::spawn(async move {
             const LEN: usize = 1200;
             let target: SocketAddr = (Ipv4Addr::new(127, 0, 0, 1), 9).into();
@@ -407,6 +423,7 @@ impl Competitor {
             }
         });
         Some(Self {
+            background,
             delivered,
             queued_us,
             lost,
@@ -452,6 +469,9 @@ impl Competitor {
 impl Drop for Competitor {
     fn drop(&mut self) {
         self.task.abort();
+        if let Some(background) = &self.background {
+            background.abort();
+        }
     }
 }
 
@@ -525,6 +545,30 @@ impl LabSocket {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .push((local.port(), shaper.clone()));
+        let bg_kbps = BG_KBPS.load(Ordering::Relaxed);
+        if BG_ARMED.swap(false, Ordering::Relaxed) && bg_kbps > 0 {
+            let shaper = shaper.clone();
+            tokio::spawn(async move {
+                const LEN: usize = 1200;
+                let target: SocketAddr = (Ipv4Addr::new(127, 0, 0, 1), 10).into();
+                let gap_ns = (LEN as u64 * 8 * 1_000_000) / bg_kbps;
+                let mut next = shaper.epoch.elapsed().as_nanos() as u64;
+                let mut seq = 0u64;
+                loop {
+                    let now = shaper.epoch.elapsed().as_nanos() as u64;
+                    while next <= now {
+                        seq += 1;
+                        let mut packet = [0u8; LEN];
+                        packet[..8].copy_from_slice(&seq.to_be_bytes());
+                        packet[8] = 0xbb;
+                        shaper.model.on_send(next, shaper.local, target, &packet);
+                        next += gap_ns;
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            });
+        }
+
         Ok(Self {
             inner,
             shaper: Some(shaper),

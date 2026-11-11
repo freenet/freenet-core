@@ -333,12 +333,14 @@ fn apply_start_knobs() -> String {
         _ => 0,
     };
     let aqm_target: u64 = env_or("LAB_AQM_TARGET_US", 0);
+    let bg_kbps: u64 = env_or("LAB_BG_KBPS", 0);
+    freenet::transport::quic_lab::BG_KBPS.store(bg_kbps, std::sync::atomic::Ordering::Relaxed);
     freenet::transport::quic_lab::AQM_KIND.store(aqm_kind, std::sync::atomic::Ordering::Relaxed);
     freenet::transport::quic_lab::AQM_TARGET_US
         .store(aqm_target, std::sync::atomic::Ordering::Relaxed);
     format!(
         "iw_pkts={iw} rate_start_kbps={rate} mtu={mtu} piece_bytes={piece} gate={}/{}/{} \
-         gate_max_us={} gate_local={} jitter_ms={jitter} aqm={aqm}/{aqm_target}",
+         gate_max_us={} gate_local={} jitter_ms={jitter} aqm={aqm}/{aqm_target} bg_kbps={bg_kbps}",
         gate.0,
         gate.1,
         gate.2,
@@ -1635,6 +1637,7 @@ fn quic_lab_burst() {
             seed: 1 + rep,
         };
         let rt = runtime(threads);
+        freenet::transport::quic_lab::arm_background();
         let line = rt.block_on(async {
             enum Side {
                 Quic(LabMany),
