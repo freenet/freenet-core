@@ -6725,6 +6725,37 @@ fn an_honest_stream_whose_first_packet_is_lost_stays_within_the_staging_cap() {
     }
 }
 
+/// The receive side reads every stream unordered: its one quinn read is
+/// `read_chunk(_, false)`, and no code outside comments calls an in-order
+/// read (`read_chunk(_, true)`, `read`, `read_exact`, `read_to_end` or
+/// `read_chunks`) on a `RecvStream`. An in-order read would leave what
+/// quinn holds for the stream outside every bound the reader keeps.
+#[test]
+fn the_receive_side_never_reads_a_stream_in_order() {
+    let source = include_str!("inbound.rs");
+    let code = source
+        .lines()
+        .map(|line| line.split("//").next().unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let unordered = code.matches(".read_chunk(max, false)").count();
+    assert_eq!(unordered, 1, "the reader's one quinn read is unordered");
+    assert_eq!(
+        code.matches("read_chunk(").count(),
+        unordered,
+        "every read_chunk is unordered"
+    );
+    for in_order in [
+        "recv.read(",
+        "recv.read_exact(",
+        "recv.read_to_end(",
+        "recv.read_chunks(",
+        ".read_chunk(max, true)",
+    ] {
+        assert!(!code.contains(in_order), "an in-order read: {in_order}");
+    }
+}
+
 /// An admitted Stream whose metadata is lost (its header arrived alone)
 /// sends the payload that arrives meanwhile straight to its charged buffer,
 /// not to staging: with a staging cap far below the payload, the stream is
