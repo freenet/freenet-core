@@ -233,6 +233,29 @@ struct Shaper {
 /// never arrives before an earlier one). 0 for none.
 pub static JITTER_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// The AQM on every shaped uplink bound from now on: 0 none, 1 CoDel, 2 PIE.
+pub static AQM_KIND: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The AQM's target delay in microseconds; 0 for its default (CoDel 5 ms,
+/// PIE 15 ms).
+pub static AQM_TARGET_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn lab_aqm() -> crate::transport::link_model::Aqm {
+    use crate::transport::link_model::Aqm;
+    let target = AQM_TARGET_US.load(Ordering::Relaxed);
+    let us = |default: u64| Duration::from_micros(if target == 0 { default } else { target });
+    match AQM_KIND.load(Ordering::Relaxed) {
+        1 => Aqm::Codel {
+            target: us(5_000),
+            interval: Duration::from_millis(100),
+        },
+        2 => Aqm::Pie {
+            target: us(15_000),
+            tupdate: Duration::from_millis(15),
+        },
+        _ => Aqm::None,
+    }
+}
+
 /// The uplink of the shaped socket on `port`: datagrams offered and dropped
 /// at the queue so far, counting everything that shares it (a competing
 /// flow too).
@@ -477,6 +500,7 @@ impl LabSocket {
             },
             link.seed,
         );
+        model.set_aqm(lab_aqm());
         let epoch = Instant::now();
         let (out, mut queued) = mpsc::unbounded_channel::<(u64, Vec<u8>, SocketAddr)>();
         let sender = inner.clone();
@@ -549,11 +573,12 @@ impl Shaper {
         let stats = self.model.host_stats(self.local);
         let lost = stats.dropped_queue_full + stats.dropped_random;
         format!(
-            "offered={} delivered={} dropped_queue_full={} dropped_random={} \
+            "offered={} delivered={} dropped_queue_full={} dropped_aqm={} dropped_random={} \
              measured_loss={:.3} max_queueing_ms={:.1} {}",
             stats.offered,
             stats.delivered,
             stats.dropped_queue_full,
+            stats.dropped_aqm,
             stats.dropped_random,
             lost as f64 / stats.offered.max(1) as f64,
             stats.max_queueing_delay.as_secs_f64() * 1000.0,

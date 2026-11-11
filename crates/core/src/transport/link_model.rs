@@ -66,6 +66,37 @@ pub enum Loss {
     },
 }
 
+/// Active queue management at a host's uplink (lab only). Applied on top of
+/// the drop-tail limit, which still holds.
+#[derive(Clone, Copy, Debug, Default)]
+pub enum Aqm {
+    #[default]
+    None,
+    /// CoDel (RFC 8289), judged on each packet's sojourn at the time it
+    /// would start serializing (the queue is FIFO, so that order is the
+    /// dequeue order).
+    Codel { target: Duration, interval: Duration },
+    /// PIE (RFC 8033), dropping at enqueue with a probability updated every
+    /// `tupdate` from the queueing delay.
+    Pie { target: Duration, tupdate: Duration },
+}
+
+#[derive(Default)]
+struct AqmState {
+    // CoDel
+    first_above: u64,
+    dropping: bool,
+    count: u32,
+    last_count: u32,
+    drop_next: u64,
+    // PIE
+    p: f64,
+    qdelay_old: f64,
+    last_update: u64,
+    burst_allowance: f64,
+    pie_started: bool,
+}
+
 /// One host's access link. Everything the host sends goes through it.
 #[derive(Clone, Debug)]
 pub struct HostLink {
@@ -138,6 +169,8 @@ pub struct HostStats {
     pub dropped_outage: u64,
     /// Largest time any packet waited in the queue before serialization.
     pub max_queueing_delay: Duration,
+    /// Packets the AQM dropped (also counted in `dropped_queue_full`).
+    pub dropped_aqm: u64,
 }
 
 #[derive(Default)]
@@ -154,6 +187,7 @@ struct PathState {
 struct HostState {
     busy_until_nanos: u64,
     stats: HostStats,
+    aqm: AqmState,
 }
 
 struct State {
@@ -168,6 +202,7 @@ struct State {
     events: Vec<LinkEvent>,
     hosts: HashMap<SocketAddr, HostState>,
     paths: HashMap<(SocketAddr, SocketAddr), PathState>,
+    aqm: Aqm,
 }
 
 /// The shared link fabric. One instance serves every `MockSocket` in a test.
@@ -189,8 +224,14 @@ impl LinkModel {
                 events: Vec::new(),
                 hosts: HashMap::new(),
                 paths: HashMap::new(),
+                aqm: Aqm::None,
             }),
         }
+    }
+
+    /// Every uplink's AQM from now on (lab only).
+    pub fn set_aqm(&self, aqm: Aqm) {
+        self.lock().aqm = aqm;
     }
 
     pub fn set_host_link(&self, host: SocketAddr, link: HostLink) {
@@ -235,6 +276,7 @@ impl LinkModel {
             events,
             hosts,
             paths,
+            aqm,
         } = &mut *guard;
         let link = overrides.get(&from).unwrap_or(&self.default_link);
         let host = hosts.entry(from).or_default();
@@ -267,6 +309,11 @@ impl LinkModel {
             let backlog_bytes = waited as u128 * link.uplink_bps as u128 / 8 / NANOS_PER_SEC;
             if backlog_bytes + len as u128 > link.queue_bytes as u128 {
                 host.stats.dropped_queue_full += 1;
+                return Vec::new();
+            }
+            if aqm_drops(*aqm, &mut host.aqm, rng, start, waited, backlog_bytes as u64) {
+                host.stats.dropped_queue_full += 1;
+                host.stats.dropped_aqm += 1;
                 return Vec::new();
             }
             let serialization = (len as u128 * 8 * NANOS_PER_SEC / link.uplink_bps as u128) as u64;
@@ -589,5 +636,114 @@ mod tests {
         assert_eq!(unique_bytes_between(&d, 0, u64::MAX), 1);
         // Offers include the copy the outage dropped.
         assert_eq!(m.offers(addr(1), addr(2)).len(), 3);
+    }
+}
+
+/// Whether the AQM drops a packet that would start serializing at `start`
+/// after waiting `waited` ns behind `backlog` bytes.
+fn aqm_drops(
+    aqm: Aqm,
+    st: &mut AqmState,
+    rng: &mut SmallRng,
+    start: u64,
+    waited: u64,
+    backlog: u64,
+) -> bool {
+    const MTU: u64 = 1500;
+    match aqm {
+        Aqm::None => false,
+        Aqm::Codel { target, interval } => {
+            let (target, interval) = (target.as_nanos() as u64, interval.as_nanos() as u64);
+            let control_law =
+                |t: u64, count: u32| t + (interval as f64 / f64::from(count.max(1)).sqrt()) as u64;
+            let now = start;
+            let ok_to_drop = if waited < target || backlog <= MTU {
+                st.first_above = 0;
+                false
+            } else if st.first_above == 0 {
+                st.first_above = now + interval;
+                false
+            } else {
+                now >= st.first_above
+            };
+            if st.dropping {
+                if !ok_to_drop {
+                    st.dropping = false;
+                    false
+                } else if now >= st.drop_next {
+                    st.count += 1;
+                    st.drop_next = control_law(st.drop_next, st.count);
+                    true
+                } else {
+                    false
+                }
+            } else if ok_to_drop {
+                st.dropping = true;
+                let delta = st.count.saturating_sub(st.last_count);
+                st.count = if delta > 1 && now.saturating_sub(st.drop_next) < 16 * interval {
+                    delta
+                } else {
+                    1
+                };
+                st.last_count = st.count;
+                st.drop_next = control_law(now, st.count);
+                true
+            } else {
+                false
+            }
+        }
+        Aqm::Pie { target, tupdate } => {
+            let (target_s, tupdate_ns) = (target.as_secs_f64(), tupdate.as_nanos() as u64);
+            let now = start.saturating_sub(waited);
+            if !st.pie_started {
+                st.pie_started = true;
+                st.last_update = now;
+                st.burst_allowance = 0.150;
+            }
+            let qdelay = waited as f64 / 1e9;
+            while now >= st.last_update + tupdate_ns {
+                st.last_update += tupdate_ns;
+                let mut delta = 0.125 * (qdelay - target_s) + 1.25 * (qdelay - st.qdelay_old);
+                let p = st.p;
+                let scale = if p < 0.000_001 {
+                    2048.0
+                } else if p < 0.000_01 {
+                    512.0
+                } else if p < 0.000_1 {
+                    128.0
+                } else if p < 0.001 {
+                    32.0
+                } else if p < 0.01 {
+                    8.0
+                } else if p < 0.1 {
+                    2.0
+                } else {
+                    1.0
+                };
+                delta /= scale;
+                if p >= 0.1 && delta > 0.02 {
+                    delta = 0.02;
+                }
+                st.p = (st.p + delta).clamp(0.0, 1.0);
+                if qdelay == 0.0 && st.qdelay_old == 0.0 {
+                    st.p *= 0.98;
+                }
+                st.burst_allowance = (st.burst_allowance - tupdate.as_secs_f64()).max(0.0);
+                if st.p == 0.0 && qdelay < target_s / 2.0 && st.qdelay_old < target_s / 2.0 {
+                    st.burst_allowance = 0.150;
+                }
+                st.qdelay_old = qdelay;
+            }
+            if st.burst_allowance > 0.0 {
+                return false;
+            }
+            if st.qdelay_old < target_s / 2.0 && st.p < 0.2 {
+                return false;
+            }
+            if backlog <= 2 * MTU {
+                return false;
+            }
+            rng.random::<f64>() < st.p
+        }
     }
 }

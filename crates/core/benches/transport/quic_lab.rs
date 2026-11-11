@@ -326,9 +326,19 @@ fn apply_start_knobs() -> String {
         env_or("LAB_GATE_LOSS_CEIL_PERMILLE", 250u64),
     );
     set_gate(gate.0, gate.1, gate.2);
+    let aqm = std::env::var("LAB_AQM").unwrap_or_default();
+    let aqm_kind = match aqm.as_str() {
+        "codel" => 1,
+        "pie" => 2,
+        _ => 0,
+    };
+    let aqm_target: u64 = env_or("LAB_AQM_TARGET_US", 0);
+    freenet::transport::quic_lab::AQM_KIND.store(aqm_kind, std::sync::atomic::Ordering::Relaxed);
+    freenet::transport::quic_lab::AQM_TARGET_US
+        .store(aqm_target, std::sync::atomic::Ordering::Relaxed);
     format!(
         "iw_pkts={iw} rate_start_kbps={rate} mtu={mtu} piece_bytes={piece} gate={}/{}/{} \
-         gate_max_us={} gate_local={} jitter_ms={jitter}",
+         gate_max_us={} gate_local={} jitter_ms={jitter} aqm={aqm}/{aqm_target}",
         gate.0,
         gate.1,
         gate.2,
