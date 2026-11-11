@@ -828,11 +828,12 @@ impl ConnStaging {
     }
 
     fn release(&self, bytes: usize) {
-        let _ = self
-            .held
+        // The closure never refuses, so this cannot fail.
+        self.held
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
                 Some(held.saturating_sub(bytes))
-            });
+            })
+            .ok();
     }
 
     /// A stream was stopped for passing the cap at `now`; true if another was
@@ -1639,9 +1640,7 @@ impl<T: TimeSource> Receiver<T> {
         let token = LegacyStreamToken::new();
         let key = {
             let mut budget = self.budget.lock();
-            if let Err(rejection) = budget.check(total, Releaser::Quic) {
-                return Err(rejection);
-            }
+            budget.check(total, Releaser::Quic)?;
             let key = self.short_key(&budget);
             budget.charge(
                 key,

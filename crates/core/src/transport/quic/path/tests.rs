@@ -6751,7 +6751,7 @@ fn a_reader_waiting_for_room_keeps_reading() {
                     // The body is complete and the reader waits for room;
                     // now bytes past the declared end.
                     time.sleep(Duration::from_millis(100)).await;
-                    let _ = send.write_all(&payload(4000)).await;
+                    send.write_all(&payload(4000)).await.ok();
                     tokio::time::timeout(Duration::from_secs(1), send.stopped())
                         .await
                         .expect("stopped while the channel is still full")
@@ -6791,6 +6791,8 @@ fn a_waiting_one_packet_short_takes_a_charge() {
             "premise: one packet is not charged"
         );
         let (a, time) = (p.a.clone(), p.time());
+        // The handle is awaited later, outside the drive.
+        #[allow(clippy::async_yields_async)]
         let waiting = p
             .drive(async move {
                 let waiting = tokio::spawn(async move { a.send_short(b"waits").await });

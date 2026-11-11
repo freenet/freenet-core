@@ -467,8 +467,8 @@ fn concurrent_evaluations_stay_within_the_budget() {
     let paths: Vec<Arc<Conn>> = (0..8).map(|_| Arc::new(conn(&budget, 0))).collect();
     let threads: Vec<_> = paths
         .iter()
-        .cloned()
         .map(|path| {
+            let path = path.clone();
             let budget = budget.clone();
             std::thread::spawn(move || {
                 let mut window = FLOOR;
