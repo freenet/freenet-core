@@ -329,11 +329,19 @@ impl ConnState {
         self.staging.set_cap(staging_cap(credit));
     }
 
+    /// A shrink opens a new epoch and holds the old window for the old one.
+    /// A growth raises every held window to the new one: the send window is
+    /// the connection's, so a stream opened before a shrink may buffer up to
+    /// any window set while it is open.
     fn set_send(&mut self, window: u64, changes: &mut Changes) {
         if window < self.send_window {
             let old = std::mem::replace(&mut self.send_epoch, Arc::new(()));
             self.held_send
                 .push((self.send_window, Arc::downgrade(&old)));
+        } else {
+            for (held, _) in &mut self.held_send {
+                *held = (*held).max(window);
+            }
         }
         self.send_window = window;
         changes.send = Some(window);
@@ -800,6 +808,20 @@ impl ConnMeter {
     #[cfg(test)]
     pub(crate) fn charge(&self) -> u64 {
         self.budget.conn_charge(self.id).unwrap_or(0)
+    }
+
+    /// The streams holding a send epoch of this connection, current or held.
+    #[cfg(test)]
+    pub(crate) fn send_epoch_holders(&self) -> usize {
+        let state = self.budget.state.lock();
+        state.conns.get(&self.id).map_or(0, |conn| {
+            Arc::strong_count(&conn.send_epoch) - 1
+                + conn
+                    .held_send
+                    .iter()
+                    .map(|(_, epoch)| epoch.strong_count())
+                    .sum::<usize>()
+        })
     }
 
     #[cfg(test)]
