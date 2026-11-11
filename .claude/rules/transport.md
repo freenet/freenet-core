@@ -1611,7 +1611,10 @@ credit; the cap is never set below the bytes staged) + send x 9/8 + R_conn x
     stays silent: that limits other paths' growth, not memory.
   → The send window follows 2 x cwnd within the same share, lowered only at
     half; a window lowered while streams opened before it are open stays
-    charged until they end (the stream's epoch, held with its permit).
+    charged until they end, at the largest window set while they are open
+    (the stream's epoch, held until its data is acknowledged). Streams
+    opened before the lower window is applied to the connection take the
+    old epoch.
   → The gap cap R_conn is max(256, (W + debt) / 1 KiB), set as the window
     changes (`ConnRanges::set_cap`) and never below the gaps held; it is
     charged at the cap; a path without a meter keeps 256.
@@ -1634,7 +1637,8 @@ credit; the cap is never set below the bytes staged) + send x 9/8 + R_conn x
   the initial window on a shadow path), checked before the buffer grows. A
   read that would pass the cap stops its stream (EVICTED, evicted_staged); a
   second within 30 s closes the path with OVER_BUDGET
-  (closed_staged_over_cap). The factor 2 is provisional until the 3c harness
+  (closed_staged_over_cap). A control body stays charged to staging until
+  its stream's end arrives. The factor 2 is provisional until the 3c harness
   measures honest stops under loss.
   Not metered: unread chunks between two polls of a reader (bounded only by
   how long the reader task waits to run; 3c measures it under CPU load), and
@@ -2096,11 +2100,11 @@ Unordered reads: every stream is read with read_chunk(_, false) from its
   which the stream is stopped EVICTED and counted too_many_ranges. A stopped
   stream's gaps stay counted (inbound::ConnRanges::keep), since nothing tells
   us when the peer ends it; it gains no gaps after the stop, and at most
-  MAX_UNI_STREAMS stopped streams hold a stream slot at once: the count takes
+  MAX_UNI_STREAMS stopped streams count at once: the count takes
   the sum of the MAX_UNI_STREAMS largest frozen gap counts, not of all of
   them, so it does not grow with the connection's age; after KEPT_GAPS_GRACE
-  (30 s) each counts 32 less (a quinn peer resets a stopped stream within a
-  round trip). A second trip past the cap within 30 s
+  (30 s) each counts 32 less (an honest peer ends a stopped stream well
+  within it). A second trip past the cap within 30 s
   (inbound::STAGED_TRIP_WINDOW) closes the path with OVER_BUDGET
   (closed_too_many_ranges). A Stream waiting for room in the
   delivery channel reads on, its end included (its charge bounds how many

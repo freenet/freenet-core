@@ -18,8 +18,10 @@
 //!   reader may stage for streams whose header it has not taken yet
 //!   (`path::inbound::ConnStaging`, capped at [`staging_cap`], twice the
 //!   credit). After a shrink the cap is never set below the bytes staged,
-//!   so the larger of the two is charged. Every stream is read unordered from its first byte, so quinn
-//!   holds nothing for a stream beyond the chunks its reader has not polled.
+//!   so the larger of the two is charged. A control body stays charged to
+//!   staging until its stream's end arrives. Every stream is read unordered
+//!   from its first byte, so quinn holds nothing for a stream beyond the
+//!   chunks its reader has not polled.
 //! - **W + debt.** quinn lowers a receive window by recording a shrink debt,
 //!   paid by later credits (quinn-proto 0.11.19 `streams/state.rs`,
 //!   `set_receive_window` and `add_read_credits`), so the credit the peer may

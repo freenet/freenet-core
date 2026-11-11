@@ -1100,9 +1100,9 @@ fn streams_whose_first_datagrams_are_lost_all_arrive() {
 }
 
 /// A stream stopped with gaps leaves them counted, since we cannot observe
-/// when the peer ends it. A quinn sender resets a stopped stream at once, so after
-/// the grace period (`KEPT_GAPS_GRACE`) the gaps of a stream with only a few
-/// leave the count, and an honest connection's count does not drift. Here
+/// when the peer ends it. An honest peer ends a stopped stream well within
+/// the grace period (`KEPT_GAPS_GRACE`), after which the gaps of a stream
+/// with only a few leave the count, and an honest connection's count does not drift. Here
 /// the sender's datagrams stop arriving after some were lost, so the stream
 /// is evicted idle with gaps.
 #[test]
