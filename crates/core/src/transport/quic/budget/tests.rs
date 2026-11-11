@@ -308,10 +308,12 @@ fn the_floor_and_the_gap_cap_follow_the_design() {
     assert_eq!(floor_window_bytes(2 << 30), MIN_WINDOW_BYTES);
     assert_eq!(gap_cap(MIN_WINDOW_BYTES), MIN_GAPS_PER_CONNECTION);
     assert_eq!(gap_cap(MAX_WINDOW_BYTES), 8192);
-    // The design's floor grants with the receive side at 3 x the credit:
-    // 609.5 KiB at 2 GiB and up, 345.5 KiB below.
-    assert_eq!(floor_grant(MIN_WINDOW_BYTES), 624_128);
-    assert_eq!(floor_grant(MIN_WINDOW_SMALL_HOST_BYTES), 353_792);
+    // The design's floor grants with the receive side at 3 x the credit and
+    // the waiting one-packet Shorts charged: 689.5 KiB at 2 GiB and up,
+    // 425.5 KiB below.
+    assert_eq!(CONTROL_BUFFER_BYTES, 147_456);
+    assert_eq!(floor_grant(MIN_WINDOW_BYTES), 706_048);
+    assert_eq!(floor_grant(MIN_WINDOW_SMALL_HOST_BYTES), 435_712);
     assert_eq!(receive_charge(MIN_WINDOW_BYTES), 3 * MIN_WINDOW_BYTES);
     assert_eq!(staging_cap(MIN_WINDOW_BYTES), 2 * MIN_WINDOW_BYTES as usize);
 }

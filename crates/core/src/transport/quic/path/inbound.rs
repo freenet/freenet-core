@@ -29,7 +29,8 @@
 //! the window, `budget::gap_cap`; [`MAX_GAPS_PER_CONNECTION`] without a
 //! meter). quinn keeps a stopped stream's ranges until the peer finishes or
 //! resets it, which we cannot observe, so they stay counted
-//! ([`ConnRanges::keep`]); a second time past the cap closes the path.
+//! ([`ConnRanges::keep`]); a second time past the cap within
+//! [`STAGED_TRIP_WINDOW`] closes the path.
 //!
 //! A reader never stops reading: a stream waiting for room in the delivery
 //! channel keeps reading, so the wait never leaves data with quinn. Bytes past
@@ -237,7 +238,10 @@ impl<T: TimeSource> Receiver<T> {
         connection: quinn::Connection,
         limit: u32,
     ) {
-        self.stream_limit = StreamLimit::new(Some(connection), limit);
+        let set = move |limit: u32| {
+            connection.set_max_concurrent_uni_streams(quinn::VarInt::from_u32(limit));
+        };
+        self.stream_limit = StreamLimit::new(Some(Box::new(set)), limit);
         self.stream_limit.apply(0);
     }
 
@@ -313,25 +317,24 @@ pub(in crate::transport::quic) const REFUSAL_CLOSE_DELAY: Duration = Duration::f
 /// Changed only from the path's receive task, where every reader runs, so
 /// the limits quinn is told arrive in the order the count moved.
 struct StreamLimit {
-    connection: Option<quinn::Connection>,
+    /// Tells quinn the limit; `None` on a path that reads no data.
+    set: Option<Box<dyn Fn(u32) + Send + Sync>>,
     limit: u32,
     waiting: AtomicU32,
 }
 
 impl StreamLimit {
-    fn new(connection: Option<quinn::Connection>, limit: u32) -> Self {
+    fn new(set: Option<Box<dyn Fn(u32) + Send + Sync>>, limit: u32) -> Self {
         Self {
-            connection,
+            set,
             limit,
             waiting: AtomicU32::new(0),
         }
     }
 
     fn apply(&self, waiting: u32) {
-        if let Some(connection) = &self.connection {
-            connection.set_max_concurrent_uni_streams(quinn::VarInt::from_u32(
-                self.limit.saturating_sub(waiting),
-            ));
+        if let Some(set) = &self.set {
+            set(self.limit.saturating_sub(waiting));
         }
     }
 
@@ -1183,8 +1186,9 @@ pub(in crate::transport::quic) struct ConnRanges {
     cap: AtomicUsize,
     /// Most stopped streams quinn can hold at once: the stream limit.
     limit: usize,
-    /// Times a stream went past the cap.
-    trips: AtomicUsize,
+    /// When a stream last went past the cap, in the time source's
+    /// nanoseconds plus one (0: never).
+    last_trip: AtomicU64,
     frozen: parking_lot::Mutex<Frozen>,
     /// Some entry of `frozen` is still in its grace period, so a read must
     /// check whether it has ended; false on the common path, which then
@@ -1203,7 +1207,7 @@ impl ConnRanges {
             held: AtomicUsize::new(0),
             cap: AtomicUsize::new(cap),
             limit: limit.max(1),
-            trips: AtomicUsize::new(0),
+            last_trip: AtomicU64::new(0),
             frozen: parking_lot::Mutex::new(Frozen::default()),
             grace_pending: AtomicBool::new(false),
             #[cfg(test)]
@@ -1211,11 +1215,15 @@ impl ConnRanges {
         }
     }
 
-    /// A stream went past the cap; true if one had before. The first trip
-    /// stops the stream; a second closes the path. An honest peer does not
-    /// reach the cap once.
-    fn trip(&self) -> bool {
-        self.trips.fetch_add(1, Ordering::Relaxed) > 0
+    /// A stream went past the cap at `now`; true if another had within
+    /// [`STAGED_TRIP_WINDOW`] before, as for the staging cap. The trip stops
+    /// the stream; a second within the window closes the path. An honest peer
+    /// does not reach the cap once.
+    fn trip(&self, now: u64) -> bool {
+        let before = self
+            .last_trip
+            .swap(now.saturating_add(1), Ordering::Relaxed);
+        before != 0 && now.saturating_sub(before - 1) <= nanos(STAGED_TRIP_WINDOW)
     }
 
     /// A stream's reader ended, stopped, with `gaps` that quinn may still
@@ -1736,11 +1744,13 @@ impl<T: TimeSource> Receiver<T> {
                 reader.stop(stop_code::EVICTED);
                 // The peer falls back to the UDP session and counts it as
                 // `quic_fallback_over_budget_rx`.
-                if self.ranges.trip() && self.closer.close(QuicCloseCode::OverBudget) {
+                if self.ranges.trip(self.time.now_nanos())
+                    && self.closer.close(QuicCloseCode::OverBudget)
+                {
                     stats.record(QuicInboundOutcome::ClosedTooManyRanges);
                     tracing::warn!(
                         "QUIC path: the peer left more gaps than the connection's cap \
-                         a second time; closing the path so the peer falls back to UDP"
+                         a second time within the window; closing the path so the peer falls back to UDP"
                     );
                 }
             }
@@ -2569,14 +2579,14 @@ mod tests {
 
     /// The connection's count is checked against its cap as gaps come and
     /// go, what a finished stream held goes back, and only a second trip past
-    /// the cap asks for the close.
+    /// the cap within `STAGED_TRIP_WINDOW` asks for the close.
     #[test]
     fn the_connection_gap_count_has_a_cap() {
         let conn = ConnRanges::new(3, 64);
         assert!(conn.add(2, 0));
         assert!(conn.add(1, 0));
         assert!(!conn.add(1, 0), "past the cap");
-        assert!(!conn.trip(), "the first trip stops the stream only");
+        assert!(!conn.trip(0), "the first trip stops the stream only");
         assert!(conn.add(0, 0), "no new gap, so no trip, while past the cap");
         assert!(conn.add(-2, 0));
         assert_eq!(conn.held(), 2);
@@ -2584,7 +2594,12 @@ mod tests {
         assert_eq!(conn.held(), 1);
         conn.remove(5);
         assert_eq!(conn.held(), 0, "the count saturates at zero");
-        assert!(conn.trip(), "the second trip closes");
+        let window = nanos(STAGED_TRIP_WINDOW);
+        assert!(
+            !conn.trip(window + 1),
+            "a second trip past the window does not close"
+        );
+        assert!(conn.trip(2 * window), "a second within it closes");
     }
 
     /// A stopped stream's gaps stay counted through the grace period; then up
@@ -2672,5 +2687,22 @@ mod tests {
             "quinn-proto {} predates MAX_CHUNKS",
             versions[0]
         );
+    }
+
+    /// Each waiting one-packet Short takes one off the peer's stream limit
+    /// while it waits, and the limit comes back as each leaves, to the full
+    /// limit once none waits.
+    #[test]
+    fn waiting_shorts_lower_the_stream_limit_until_they_leave() {
+        let told = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let seen = told.clone();
+        let limit = StreamLimit::new(Some(Box::new(move |n| seen.lock().push(n))), 64);
+        let a = limit.hold();
+        let b = limit.hold();
+        drop(a);
+        let c = limit.hold();
+        drop(b);
+        drop(c);
+        assert_eq!(*told.lock(), vec![63, 62, 63, 62, 63, 64]);
     }
 }

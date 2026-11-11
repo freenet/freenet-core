@@ -3049,6 +3049,11 @@ mod tests {
                  quic_buffer_budget_for",
             ),
             (
+                "WAITING_SHORT_BYTES",
+                "one waiting one-packet Short body on ONE QUIC data path, inside \
+                 CONTROL_BUFFER_BYTES",
+            ),
+            (
                 "CONTROL_BUFFER_BYTES",
                 "the control and short buffers of one QUIC data path, inside \
                  quic_buffer_budget_for",

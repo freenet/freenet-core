@@ -103,8 +103,17 @@ pub(crate) const GAP_BYTES: u64 = 70;
 /// The fewest gaps a connection may hold, whatever its window.
 pub(crate) const MIN_GAPS_PER_CONNECTION: usize = 256;
 
-/// The control channel and the reader's short buffers, per data path.
-pub(crate) const CONTROL_BUFFER_BYTES: u64 = 64 * 1024;
+/// The control channel and the reader's short buffers, per data path: the
+/// control channel's 16 frames of at most 4 KiB, and one buffer of a
+/// one-packet Short (allocated at 1280 B, its size class) for each Short that
+/// may wait for room with the peer's stream limit lowered for it
+/// (`path::inbound::StreamLimit`, at most `MAX_UNI_STREAMS`). Shorts queued
+/// in the session's delivery channel are the session's, as on UDP.
+pub(crate) const CONTROL_BUFFER_BYTES: u64 =
+    16 * 4096 + super::config::MAX_UNI_STREAMS as u64 * WAITING_SHORT_BYTES;
+
+/// One waiting one-packet Short's body, at its allocator size class.
+pub(crate) const WAITING_SHORT_BYTES: u64 = 1280;
 
 /// A connection's staged bytes may reach this many times its credit
 /// (provisional: the hostile-sender harness measures honest stops under loss,

@@ -6725,6 +6725,22 @@ fn an_honest_stream_whose_first_packet_is_lost_stays_within_the_staging_cap() {
     }
 }
 
+/// The per-path buffer term charges each waiting one-packet Short at
+/// `budget::WAITING_SHORT_BYTES`: the largest body that fits one packet is
+/// within it at its allocator size class.
+#[test]
+fn a_waiting_one_packet_short_fits_its_charge() {
+    let largest = (1..=u64::from(u16::MAX))
+        .take_while(|len| crate::transport::peer_connection::fits_one_packet(*len))
+        .last()
+        .expect("some length fits one packet");
+    let class = super::inbound::allocation_class(largest as usize) as u64;
+    assert!(
+        class <= super::super::budget::WAITING_SHORT_BYTES,
+        "a {largest} B body allocates {class} B"
+    );
+}
+
 /// The receive side reads every stream unordered: its one quinn read is
 /// `read_chunk(_, false)`, and no code outside comments calls an in-order
 /// read (`read_chunk(_, true)`, `read`, `read_exact`, `read_to_end` or

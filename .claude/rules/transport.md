@@ -2539,7 +2539,7 @@ Application error codes, one range per QUIC frame type, all one-byte
                 quic_upgrade_handshake_failed in setup), 0x07 left to the
                 ramp branch's RECYCLE_FOR_DATA, OVER_BUDGET 8 (the peer held
                 more of this node's QUIC buffer budget than it allows: its
-                gaps past the cap a second time; the peer reads it as
+                gaps or staged bytes past their cap a second time within 30 s; the peer reads it as
                 Refused{OverBudget}, falls back, charges as for Downgrade and
                 counts quic_fallback_over_budget_rx, or setup_downgrade_rx in
                 setup; a node without this code reads ConnectionLost)
