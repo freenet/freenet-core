@@ -988,6 +988,12 @@ impl ConnStaging {
         self.cap.load(Ordering::Relaxed)
     }
 
+    /// Stage `bytes` as a reader would; false past the cap. Tests only.
+    #[cfg(test)]
+    pub(in crate::transport::quic) fn add_for_test(&self, bytes: usize) -> bool {
+        self.try_add(bytes)
+    }
+
     /// The most staged at once, per mille of the cap then. Tests only.
     #[cfg(test)]
     pub(in crate::transport::quic) fn peak_permille(&self) -> usize {

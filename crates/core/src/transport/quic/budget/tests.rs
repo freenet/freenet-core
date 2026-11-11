@@ -493,3 +493,43 @@ fn concurrent_evaluations_stay_within_the_budget() {
         "the running total is a recount"
     );
 }
+
+/// A shrink whose debt is then read lowers the staging cap, but never below
+/// what is staged, and the charge covers the cap as set: staged bytes are
+/// never over the cap or uncharged.
+#[test]
+fn the_staging_cap_never_falls_below_what_is_staged() {
+    let total = 12 << 20;
+    let budget = QuicBudget::new(total, FLOOR, counters());
+    let big = conn(&budget, 0);
+    let mut at = 10 * MS;
+    let mut window = FLOOR;
+    for _ in 0..8 {
+        window = deliver_window(&big, window, at).recv_window;
+        at += 10 * MS;
+    }
+    assert!(window > 4 * FLOOR, "premise: it grew, to {window}");
+    let staged = big.staging.cap() * 9 / 10;
+    assert!(big.staging.add_for_test(staged), "premise: room to stage");
+    // Another path's growth shrinks it; its debt is then read.
+    let newcomer = conn(&budget, at);
+    deliver_window(&newcomer, FLOOR, at + 10 * MS);
+    big.meter.evaluate(at + 11 * MS).unwrap();
+    let debt = big.meter.debt();
+    assert!(debt > 0, "premise: it shrank");
+    big.meter.on_read(debt, 0, at + 19 * MS);
+    big.meter.evaluate(at + 30 * MS).unwrap();
+    let credit = big.fake.last_recv().unwrap();
+    assert!(
+        staging_cap(credit) < staged,
+        "premise: the credit alone would put the cap below what is staged"
+    );
+    assert!(
+        big.staging.cap() >= staged,
+        "the cap is floored at what is staged"
+    );
+    assert!(
+        big.meter.charge() >= credit + staged as u64,
+        "the staged bytes are charged"
+    );
+}
