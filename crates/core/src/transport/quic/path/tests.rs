@@ -3394,6 +3394,58 @@ fn a_lossy_path_finishes_a_stream_whose_writes_wait_past_the_gap() {
     })
 }
 
+/// The loss gate's verdicts reach the node counters (`quic_gate_loss_<verdict>`)
+/// from the path's report, one per congestion event: quinn counts an event in
+/// `congestion_events` exactly where it calls the controller, so the verdicts
+/// sum to it. With random loss and no queue most losses are ignored.
+#[test]
+fn the_loss_gates_verdicts_reach_the_node_counters() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let counters: &'static crate::transport::metrics::QuicDataCounters =
+            Box::leak(Box::new(crate::transport::metrics::QuicDataCounters::new()));
+        let network = "quic-path-gate-verdicts";
+        let _loss = seeded_loss_from(network, 5, 0x5940_0011, Some(Duration::from_millis(50)));
+        let limits = QuicPathLimits {
+            counters: Some(counters),
+            ..QuicPathLimits::DEFAULT
+        };
+        let p = paths(network, 200, limits).await;
+        let (a, time) = (p.a.clone(), p.time());
+        const LEN: usize = MIB;
+        let (sent, snap) = p
+            .drive(async move {
+                let sent = a
+                    .send_stream_bounded(
+                        &time,
+                        SendDeadlines::stream(LEN as u64),
+                        StreamId::next(),
+                        None,
+                        payload(LEN).into(),
+                        None,
+                    )
+                    .await;
+                // Two ticks of the acknowledgement watch report the counts.
+                time.sleep(2 * recycle::ACK_WATCH_TICK).await;
+                (sent, counters.snapshot(true))
+            })
+            .await;
+        crate::transport::in_memory_socket::set_packet_delivery_callback(network, None);
+        assert!(matches!(sent, BoundedSend::Sent), "{sent:?}");
+        let keys: std::collections::BTreeMap<_, _> = snap.keys().into_iter().collect();
+        let verdicts: u64 = snap.gate_loss.iter().sum();
+        assert!(
+            snap.congestion_events > 0,
+            "the loss caused congestion events"
+        );
+        assert_eq!(verdicts, snap.congestion_events, "{keys:?}");
+        assert!(
+            keys["quic_gate_loss_ignored"] * 2 > verdicts,
+            "random loss with no queue is mostly ignored: {keys:?}"
+        );
+    })
+}
+
 /// The longest wait between two fragments a send handed to quinn.
 struct WriteGaps {
     time: VirtualTime,

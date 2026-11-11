@@ -49,8 +49,15 @@
 //! threshold, so it holds a standing queue of about the threshold instead of
 //! filling the buffer, and it backs off for a competing flow. On a queue
 //! shallower than the threshold a congestion loss looks random; the
-//! loss-share ceiling is then what stops it. The e5b-9 lab measured both
-//! (`QUIC-LOSS-CONTROLLER.md` in the transport redesign notes).
+//! loss-share ceiling is then what stops it. The e5b-9 lab measured both; the
+//! numbers are in the pull request that added this gate.
+//!
+//! # Telemetry
+//!
+//! Every verdict is counted per connection ([`GateVerdicts`]) and reported
+//! node-wide by the path's report as `quic_gate_loss_<verdict>`, with
+//! `quic_gate_ended_queue_<bucket>` counting ended paths by the share of
+//! their losses passed as a queue (`transport::metrics::quic_data`).
 //!
 //! The minimum RTT is never forgotten. If a route grows longer the estimate
 //! reads the extra delay as a queue and every loss is passed: the controller
@@ -58,6 +65,8 @@
 
 use std::any::Any;
 use std::collections::VecDeque;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use quinn::congestion::{Controller, ControllerMetrics};
@@ -126,6 +135,50 @@ pub(crate) enum Verdict {
     NoSample,
     /// None of the above: the loss is taken as random and ignored.
     Ignored,
+}
+
+impl Verdict {
+    /// Every verdict, in the order of [`VERDICT_LABELS`].
+    pub(crate) const ALL: [Verdict; 5] = [
+        Verdict::Queue,
+        Verdict::LossShare,
+        Verdict::Persistent,
+        Verdict::NoSample,
+        Verdict::Ignored,
+    ];
+
+    fn index(self) -> usize {
+        match self {
+            Verdict::Queue => 0,
+            Verdict::LossShare => 1,
+            Verdict::Persistent => 2,
+            Verdict::NoSample => 3,
+            Verdict::Ignored => 4,
+        }
+    }
+}
+
+/// The telemetry labels of the verdicts (`quic_gate_loss_<label>`), in the
+/// order of [`Verdict::ALL`].
+pub(crate) const VERDICT_LABELS: [&str; 5] =
+    ["queue", "share", "persistent", "no_sample", "ignored"];
+
+/// A connection's congestion events by the gate's verdict, since the
+/// connection started. Shared by the gate and its clones (quinn's
+/// `Connection::congestion_state`), so the path's report reads the live
+/// counts (`recycle::PathReport`, `quic_gate_loss_<verdict>`).
+#[derive(Debug, Default)]
+pub(crate) struct GateVerdicts([AtomicU64; 5]);
+
+impl GateVerdicts {
+    fn record(&self, verdict: Verdict) {
+        self.0[verdict.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The counts so far, in the order of [`Verdict::ALL`].
+    pub(crate) fn read(&self) -> [u64; 5] {
+        std::array::from_fn(|i| self.0[i].load(Ordering::Relaxed))
+    }
 }
 
 /// The gate's state, apart from the controller it wraps.
@@ -287,6 +340,7 @@ impl GateState {
 pub(crate) struct LossGate {
     inner: Box<dyn Controller>,
     pub(crate) state: GateState,
+    verdicts: Arc<GateVerdicts>,
 }
 
 impl LossGate {
@@ -294,7 +348,13 @@ impl LossGate {
         Self {
             inner,
             state: GateState::default(),
+            verdicts: Arc::default(),
         }
+    }
+
+    /// The connection's verdict counts, shared with every clone.
+    pub(crate) fn verdicts(&self) -> Arc<GateVerdicts> {
+        self.verdicts.clone()
     }
 
     /// Whether the controller inside is a `C`.
@@ -340,11 +400,11 @@ impl Controller for LossGate {
         is_persistent_congestion: bool,
         lost_bytes: u64,
     ) {
-        if self
+        let verdict = self
             .state
-            .on_loss(now, sent, lost_bytes, is_persistent_congestion)
-            != Verdict::Ignored
-        {
+            .on_loss(now, sent, lost_bytes, is_persistent_congestion);
+        self.verdicts.record(verdict);
+        if verdict != Verdict::Ignored {
             self.inner
                 .on_congestion_event(now, sent, is_persistent_congestion, lost_bytes);
         }
@@ -366,6 +426,7 @@ impl Controller for LossGate {
         Box::new(Self {
             inner: self.inner.clone_box(),
             state: self.state.clone(),
+            verdicts: self.verdicts.clone(),
         })
     }
 
