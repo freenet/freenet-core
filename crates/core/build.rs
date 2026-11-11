@@ -62,28 +62,39 @@ fn emit_min_compatible_version() {
         panic!("FREENET_MIN_COMPATIBLE_VERSION ({min_compat}) must be in X.Y.Z format");
     }
 
-    // Must share major.minor (wire format only encodes min_patch).
-    if pkg_parts.len() >= 2 && (pkg_parts[0] != min_parts[0] || pkg_parts[1] != min_parts[1]) {
-        panic!(
-            "FREENET_MIN_COMPATIBLE_VERSION ({min_compat}) must share major.minor \
-             with package version ({pkg_version}). The wire format only encodes \
-             min_patch; major.minor is inherited from the version field."
-        );
-    }
+    let num = |name: &str, v: &str| -> u64 {
+        v.parse()
+            .unwrap_or_else(|_| panic!("{name} component {v:?} is not numeric"))
+    };
+    let pkg = (
+        num("CARGO_PKG_VERSION", pkg_parts[0]),
+        num("CARGO_PKG_VERSION", pkg_parts[1]),
+        num("CARGO_PKG_VERSION", pkg_parts[2]),
+    );
+    let min = (
+        num("FREENET_MIN_COMPATIBLE_VERSION", min_parts[0]),
+        num("FREENET_MIN_COMPATIBLE_VERSION", min_parts[1]),
+        num("FREENET_MIN_COMPATIBLE_VERSION", min_parts[2]),
+    );
 
     // Must not exceed the package version (would reject all peers including ourselves).
-    // Compare numerically, not lexicographically ("0.1.9" > "0.1.152" in string order).
-    let min_patch: u64 = min_parts[2].parse().unwrap_or_else(|_| {
-        panic!("FREENET_MIN_COMPATIBLE_VERSION ({min_compat}) has non-numeric patch")
-    });
-    let pkg_patch: u64 = pkg_parts[2]
-        .parse()
-        .unwrap_or_else(|_| panic!("CARGO_PKG_VERSION ({pkg_version}) has non-numeric patch"));
-    if min_patch > pkg_patch {
+    // Compared numerically as a tuple, not lexicographically ("0.1.9" > "0.1.152" as strings).
+    if min > pkg {
         panic!(
             "FREENET_MIN_COMPATIBLE_VERSION ({min_compat}) must be <= package version \
              ({pkg_version}). A min_compatible higher than our own version would \
              reject all peers."
+        );
+    }
+
+    // A floor in the same major.minor series uses wire format 1. A floor in a
+    // different series uses wire format 2 (version_cmp.rs), which can only
+    // express a major at most one below ours, minor < 64 and patch < 256.
+    if (pkg.0, pkg.1) != (min.0, min.1) && (pkg.0 - min.0 > 1 || min.1 > 63 || min.2 > 255) {
+        panic!(
+            "FREENET_MIN_COMPATIBLE_VERSION ({min_compat}) is in a different series from \
+             package version ({pkg_version}) and cannot be encoded on the wire: the floor \
+             major may be at most one below ours, with minor < 64 and patch < 256."
         );
     }
 
