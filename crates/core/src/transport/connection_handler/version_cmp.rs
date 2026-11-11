@@ -1,8 +1,8 @@
-use crate::config::{MIN_COMPATIBLE_VERSION, PCK_VERSION};
-
 // Shared with build.rs so the build-time check and the encoder cannot drift.
 #[path = "../../../build/version_floor.rs"]
 mod version_floor;
+
+use crate::config::{MIN_COMPATIBLE_VERSION, PCK_VERSION};
 use version_floor::check_floor;
 
 /// New-format marker byte. Old peers see major=0xFF (!=their major) → clean reject.
@@ -681,9 +681,9 @@ mod tests {
         assert!(is_compatible(&b, &a).is_ok());
     }
 
-    /// Cross-major version peers are always incompatible because min_compatible
-    /// inherits major.minor from the version (wire format only encodes min_patch).
-    /// A 1.0.x peer's min_compatible is always (1, 0, _), which no 0.x peer satisfies.
+    /// With a same-series floor (wire format 1) the floor inherits major.minor
+    /// from the version, so a 1.0.x peer's floor is (1, 0, _), which no 0.x peer
+    /// satisfies. A cross-series floor (format 2) is covered by the bridge tests.
     #[test]
     fn test_cross_major_version_always_incompatible() {
         let v1 = encode_new_format("1.0.5", "1.0.3");
