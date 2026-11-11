@@ -1161,6 +1161,8 @@ struct HostileShape {
     /// Lose every other step's datagrams while writing the frames, so each
     /// stream holds a gap between every two frames.
     alternate_drop: bool,
+    /// The honest stream that grows the window first.
+    grow_bytes: usize,
 }
 
 /// One run of [`hostile_against_hub`].
@@ -1230,7 +1232,7 @@ async fn hostile_against_hub(
         let (peer, path, mut inbound) = hub.hostile_leaf().await;
         assert!(peer.handshaken(), "the hostile peer finished its handshake");
         // Grow: one honest stream, read as it arrives.
-        let total = 24 * MIB;
+        let total = shape.map_or(24 * MIB, |shape| shape.grow_bytes);
         let mut first = header(1, 1, StreamId::next().0, total as u64, 0);
         first.extend_from_slice(&vec![0x11; total]);
         let (id, written) = peer.open_and_write(&first).expect("stream credit");
@@ -1454,6 +1456,7 @@ fn a_hostile_peer_cannot_exceed_its_charge() {
                 skip: 0,
                 then_contiguous: 0,
                 alternate_drop: false,
+                grow_bytes: 24 * MIB,
             },
             HostileShape {
                 streams: 32,
@@ -1462,6 +1465,7 @@ fn a_hostile_peer_cannot_exceed_its_charge() {
                 skip: 0,
                 then_contiguous: 0,
                 alternate_drop: false,
+                grow_bytes: 24 * MIB,
             },
             HostileShape {
                 streams: 60,
@@ -1470,6 +1474,7 @@ fn a_hostile_peer_cannot_exceed_its_charge() {
                 skip: 0,
                 then_contiguous: 0,
                 alternate_drop: false,
+                grow_bytes: 24 * MIB,
             },
             HostileShape {
                 streams: 8,
@@ -1478,6 +1483,7 @@ fn a_hostile_peer_cannot_exceed_its_charge() {
                 skip: MIB - 64,
                 then_contiguous: 0,
                 alternate_drop: false,
+                grow_bytes: 24 * MIB,
             },
             HostileShape {
                 streams: 60,
@@ -1486,6 +1492,7 @@ fn a_hostile_peer_cannot_exceed_its_charge() {
                 skip: 128 * 1024,
                 then_contiguous: 0,
                 alternate_drop: false,
+                grow_bytes: 24 * MIB,
             },
             // Spans just past a power of two, where a buffer grown by
             // doubling is charged about twice its span.
@@ -1496,6 +1503,7 @@ fn a_hostile_peer_cannot_exceed_its_charge() {
                 skip: 512 * 1024 - HEADER_LEN + 1,
                 then_contiguous: 0,
                 alternate_drop: false,
+                grow_bytes: 24 * MIB,
             },
             HostileShape {
                 streams: 31,
@@ -1504,6 +1512,7 @@ fn a_hostile_peer_cannot_exceed_its_charge() {
                 skip: 256 * 1024 - HEADER_LEN + 1,
                 then_contiguous: 0,
                 alternate_drop: false,
+                grow_bytes: 24 * MIB,
             },
             // A gap between every two one-byte frames on 16 streams: more
             // gaps than the connection's cap allows.
@@ -1514,6 +1523,18 @@ fn a_hostile_peer_cannot_exceed_its_charge() {
                 skip: 0,
                 then_contiguous: 0,
                 alternate_drop: true,
+                grow_bytes: 24 * MIB,
+            },
+            // The same on a window grown only a little, so it has room to
+            // grow: it must not grow on bytes above gaps.
+            HostileShape {
+                streams: 4,
+                frame_len: 1,
+                frames: 400,
+                skip: 0,
+                then_contiguous: 0,
+                alternate_drop: true,
+                grow_bytes: 512 * 1024,
             },
             // Grow, stage about half the credit under withheld headers, keep
             // the rest, wait past the idle decay, then spend the rest in
@@ -1525,6 +1546,7 @@ fn a_hostile_peer_cannot_exceed_its_charge() {
                 skip: 0,
                 then_contiguous: 3 * MIB,
                 alternate_drop: false,
+                grow_bytes: 24 * MIB,
             },
         ];
         for (index, shape) in shapes.into_iter().enumerate() {
