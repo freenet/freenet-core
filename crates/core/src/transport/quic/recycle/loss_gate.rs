@@ -334,6 +334,8 @@ impl GateState {
         };
         if queue >= queue_threshold(min_rtt) {
             Verdict::Queue
+        } else if lab_standing_passes(self.queue()) {
+            Verdict::Queue
         } else {
             Verdict::Ignored
         }
@@ -471,3 +473,20 @@ impl Controller for LossGate {
 
 #[cfg(test)]
 mod tests;
+
+/// Lab only: pass a loss when the queue over this round and the last
+/// (`GateState::queue`) is at least this many microseconds: a standing queue
+/// that never drains, as an AQM keeps. 0 for off.
+#[cfg(feature = "bench")]
+pub static LAB_STANDING_US: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(feature = "bench")]
+fn lab_standing_passes(queue: Option<Duration>) -> bool {
+    let us = LAB_STANDING_US.load(Ordering::Relaxed);
+    us > 0 && queue.is_some_and(|q| q >= Duration::from_micros(us))
+}
+
+#[cfg(not(feature = "bench"))]
+fn lab_standing_passes(_queue: Option<Duration>) -> bool {
+    false
+}
