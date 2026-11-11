@@ -236,6 +236,10 @@ fn state_update(bytes: &[u8]) -> UpdateData<'static> {
 pub(crate) struct IdenticalIsNoOp<'a, O: ?Sized>(pub(crate) &'a mut O);
 
 impl<O: ConformanceOracle + ?Sized> ConformanceOracle for IdenticalIsNoOp<'_, O> {
+    fn reads_host_clock(&self) -> bool {
+        self.0.reads_host_clock()
+    }
+
     fn validate_state(
         &mut self,
         state: &[u8],
@@ -317,6 +321,10 @@ impl<'a, O: ConformanceOracle + ?Sized> Budgeted<'a, O> {
 }
 
 impl<O: ConformanceOracle + ?Sized> ConformanceOracle for Budgeted<'_, O> {
+    fn reads_host_clock(&self) -> bool {
+        self.inner.reads_host_clock()
+    }
+
     fn validate_state(
         &mut self,
         state: &[u8],
@@ -391,6 +399,10 @@ mod tests {
     }
 
     impl ConformanceOracle for Fake {
+        fn reads_host_clock(&self) -> bool {
+            false
+        }
+
         fn validate_state(
             &mut self,
             state: &[u8],
@@ -611,6 +623,10 @@ mod tests {
             clock: SharedMockTimeSource,
         }
         impl ConformanceOracle for SlowFirst {
+            fn reads_host_clock(&self) -> bool {
+                false
+            }
+
             fn validate_state(
                 &mut self,
                 state: &[u8],
@@ -714,6 +730,10 @@ mod tests {
     fn a_reapply_with_no_output_state_is_inconclusive() {
         struct NoState;
         impl ConformanceOracle for NoState {
+            fn reads_host_clock(&self) -> bool {
+                false
+            }
+
             fn validate_state(
                 &mut self,
                 _: &[u8],
@@ -753,6 +773,10 @@ mod tests {
         /// Asks for a related contract when validating anything.
         struct NeedsRelated(Fake);
         impl ConformanceOracle for NeedsRelated {
+            fn reads_host_clock(&self) -> bool {
+                false
+            }
+
             fn validate_state(
                 &mut self,
                 _: &[u8],
@@ -803,6 +827,10 @@ mod tests {
         on_identical: OnIdentical,
     }
     impl ConformanceOracle for IdenticalMergeMisbehaves {
+        fn reads_host_clock(&self) -> bool {
+            false
+        }
+
         fn validate_state(
             &mut self,
             state: &[u8],

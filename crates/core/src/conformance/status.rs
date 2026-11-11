@@ -5,12 +5,11 @@
 //! not enumerated event kinds, so they never reach the telemetry collector either. The
 //! one place an operator would look shows nothing.
 //!
-//! These findings are diagnostics recorded locally. Removal was the RFC #5320 plan,
-//! with a gate requiring that every prospective deletion "has been understood"; that
-//! plan is superseded and nodes do not remove contracts for breaking a merge law (see
-//! `policy`'s module docs). The view still matters: the findings are only useful to
-//! an operator or a contract author who can read them, and grepping a peer's log
-//! files before they rotate is evidence most of them cannot reach.
+//! These findings are diagnostics recorded locally. Nodes do not remove contracts for
+//! breaking a merge law (see `policy`'s module docs). The view still matters: the
+//! findings are only useful to an operator or a contract author who can read them,
+//! and grepping a peer's log files before they rotate is evidence most of them
+//! cannot reach.
 //!
 //! # Shape
 //!
@@ -120,9 +119,9 @@ pub struct MergeFinding {
     /// The law that was broken, e.g. `state_commutativity`.
     pub property: &'static str,
     /// `Diagnostic` means the contract is legal but wasteful. `Violation` means it
-    /// broke an algebraic law. Whether that law may lead to a removal is a separate
-    /// question (`policy::removal_tier`), and its answer for this finding is
-    /// `would_remove`.
+    /// broke an algebraic law. How serious the finding is on its own is a separate
+    /// question (`policy::finding_class`), and its answer for this finding is
+    /// `persistent`.
     ///
     /// It does NOT mean "cannot converge". That was true when every `Violation` was
     /// a divergence, and `state_idempotence` now reports a class that converges: a
@@ -134,14 +133,15 @@ pub struct MergeFinding {
     /// property.
     ///
     /// Carried here and not only in `fdev` because this is the path that generates
-    /// the shadow corpus, and `ConformanceAction::WouldRemove` is the diagnostic
-    /// count of serious findings. A distinction that exists only in the offline
+    /// the shadow corpus, and `ShadowReport::persistent` is the diagnostic count of
+    /// serious findings. A distinction that exists only in the offline
     /// tool is a distinction the shadow diagnostics never see.
     pub settling: Option<IdempotenceSettling>,
-    /// Whether enforcement, were it enabled, would have removed the contract for this.
-    /// Diagnostic only: enforcement is unreachable and not planned, and nodes do not
-    /// remove contracts for breaking a merge law (see `policy`'s module docs).
-    pub would_remove: bool,
+    /// Whether the finding is [`FindingClass::Persistent`] (`policy::finding_class`).
+    /// Diagnostic only: nodes act on no conformance finding.
+    ///
+    /// [`FindingClass::Persistent`]: super::policy::FindingClass::Persistent
+    pub persistent: bool,
 }
 
 /// Everything the checker knows about ONE contract.
@@ -266,25 +266,25 @@ impl CheckedContract {
             // Deduplicating on the property alone would silently pick whichever
             // classification arrived first. Since #5462 two `state_idempotence`
             // findings on one contract can carry DIFFERENT settling classes, and
-            // they are not equally important: `NeverSettled` is the removal-eligible
+            // they are not equally important: `NeverSettled` is the persistent
             // (most serious) class, while `SettledAfter` is waiting on the
             // install-path fix. Keeping the first would let a benign case mask a
             // non-convergent one on the same contract — the operator would read
             // "settles after a rewrite" for a contract that also never settles.
             //
-            // So the SERIOUS finding wins the slot: one that would remove outranks
-            // one that would not, then the settling class decides, and an unknown
+            // So the SERIOUS finding wins the slot: a persistent one outranks a
+            // report-only one, then the settling class decides, and an unknown
             // class outranks a benign one because it has not been shown to be
             // benign. Same order as `shadow::LoggedSeverity`, so the log and the
             // dashboard name the same finding.
             //
             // The winner supplies BOTH fields. Taking the decision from one finding
             // and the class from another could render "settles after a rewrite
-            // (report-only)" beside "Would remove: yes". Since `would_remove` leads
+            // (report-only)" beside "Report-only: no". Since `persistent` leads
             // the order, the kept decision is still true if any finding's was.
             if slot_rank(&finding) > slot_rank(existing) {
                 existing.settling = finding.settling;
-                existing.would_remove = finding.would_remove;
+                existing.persistent = finding.persistent;
             }
             return;
         }
@@ -295,7 +295,7 @@ impl CheckedContract {
 /// The order in which [`CheckedContract::note_finding`] picks the finding that
 /// keeps a slot: the decision first, then [`settling_rank`].
 fn slot_rank(finding: &MergeFinding) -> (bool, u8) {
-    (finding.would_remove, settling_rank(finding.settling))
+    (finding.persistent, settling_rank(finding.settling))
 }
 
 /// How much a settling classification should outrank another for the one slot a
@@ -305,8 +305,8 @@ fn slot_rank(finding: &MergeFinding) -> (bool, u8) {
 /// partly to keep it that way. This orders how much a reader NEEDS to see it when
 /// two findings for one property must collapse to one: an unknown class outranks a
 /// benign one because it has not been shown benign, and a never-settling class
-/// outranks both because it is the removal-eligible (most serious) class. The benign class,
-/// `SettledAfter`, is report-only (`policy::removal_tier`).
+/// outranks both because it is the persistent (most serious) class. The benign class,
+/// `SettledAfter`, is report-only (`policy::finding_class`).
 pub(crate) fn settling_rank(settling: Option<IdempotenceSettling>) -> u8 {
     match settling {
         Some(IdempotenceSettling::NeverSettled) => 3,
@@ -612,7 +612,7 @@ pub(crate) fn checked_contracts(
             property: finding.violation.property.as_str(),
             severity: finding.violation.property.severity(),
             settling: finding.violation.settling,
-            would_remove: finding.would_remove,
+            persistent: finding.persistent,
         };
         match out.iter_mut().find(|c| c.contract == finding.contract) {
             // Through `note_finding`, which deduplicates on the property. `probe_one`
@@ -726,7 +726,7 @@ mod tests {
             property,
             severity: Severity::Violation,
             settling: None,
-            would_remove: true,
+            persistent: true,
         }
     }
 
@@ -752,7 +752,7 @@ mod tests {
                 detail: "merge(A, A) != A".to_string(),
                 settling: Some(IdempotenceSettling::NeverSettled),
             },
-            would_remove: true,
+            persistent: true,
         }];
 
         let out = checked_contracts(&[], &findings);
@@ -810,17 +810,17 @@ mod tests {
             ),
         ] {
             let mut record = CheckedContract::new(instance(1), 1, 0, Instant::now());
-            // Each fixture carries the decision `policy::removal_tier` gives its
+            // Each fixture carries the decision `policy::finding_class` gives its
             // class: a settled finding is report-only.
             let settled = |s: Option<IdempotenceSettling>| {
                 matches!(s, Some(IdempotenceSettling::SettledAfter(_)))
             };
             let mut a = finding(1, "state_idempotence");
             a.settling = first;
-            a.would_remove = !settled(first);
+            a.persistent = !settled(first);
             let mut b = finding(1, "state_idempotence");
             b.settling = second;
-            b.would_remove = !settled(second);
+            b.persistent = !settled(second);
             record.note_finding(a);
             record.note_finding(b);
 
@@ -833,22 +833,22 @@ mod tests {
         }
     }
 
-    /// The kept slot says "would remove" if ANY finding for that property did.
+    /// The kept slot is persistent if ANY finding for that property was.
     ///
     /// A settled idempotence finding is report-only and a never-settling one is
-    /// not, so the two arrive with different `would_remove`. Keeping the first
-    /// arrival's value would render a never-settling contract as "would remove:
-    /// no" next to a "never settles" label whenever the settled case came first.
+    /// not, so the two arrive with different `persistent`. Keeping the first
+    /// arrival's value would render a never-settling contract as "report-only:
+    /// yes" next to a "never settles" label whenever the settled case came first.
     #[test]
-    fn deduplication_keeps_would_remove_if_any_finding_would_remove() {
+    fn deduplication_keeps_persistent_if_any_finding_persistent() {
         for settled_first in [true, false] {
             let mut record = CheckedContract::new(instance(1), 1, 0, Instant::now());
             let mut settled = finding(1, "state_idempotence");
             settled.settling = Some(IdempotenceSettling::SettledAfter(1));
-            settled.would_remove = false;
+            settled.persistent = false;
             let mut never = finding(1, "state_idempotence");
             never.settling = Some(IdempotenceSettling::NeverSettled);
-            never.would_remove = true;
+            never.persistent = true;
             if settled_first {
                 record.note_finding(settled);
                 record.note_finding(never);
@@ -859,7 +859,7 @@ mod tests {
             let kept = record.findings();
             assert_eq!(kept.len(), 1);
             assert!(
-                kept[0].would_remove,
+                kept[0].persistent,
                 "settled_first={settled_first}: the never-settling finding's decision was lost"
             );
             assert_eq!(
@@ -873,31 +873,31 @@ mod tests {
         let mut record = CheckedContract::new(instance(1), 1, 0, Instant::now());
         for _ in 0..2 {
             let mut f = finding(1, "path_agreement");
-            f.would_remove = false;
+            f.persistent = false;
             record.note_finding(f);
         }
-        assert!(!record.findings()[0].would_remove);
+        assert!(!record.findings()[0].persistent);
     }
 
     /// The kept slot takes its decision AND its settling class from one finding,
     /// so a row can never pair "settles after a rewrite (report-only)" with
-    /// "would remove: yes".
+    /// "report-only: no".
     ///
-    /// Not reachable from today's policy, which never gives a settled finding a
-    /// would-remove decision; the mixed pair here is a removal-eligible finding
+    /// Not reachable from today's policy, which never classes a settled finding as
+    /// persistent; the mixed pair here is a persistent finding
     /// with no settling class against a settled report-only one. Under the old
     /// rule (class by settling rank, decision by OR) the slot read SettledAfter
-    /// with would_remove = true in both orders.
+    /// with persistent = true in both orders.
     #[test]
     fn deduplication_takes_the_decision_and_class_from_the_same_finding() {
         for settled_first in [true, false] {
             let mut record = CheckedContract::new(instance(1), 1, 0, Instant::now());
             let mut settled = finding(1, "state_idempotence");
             settled.settling = Some(IdempotenceSettling::SettledAfter(1));
-            settled.would_remove = false;
+            settled.persistent = false;
             let mut unclassified = finding(1, "state_idempotence");
             unclassified.settling = None;
-            unclassified.would_remove = true;
+            unclassified.persistent = true;
             if settled_first {
                 record.note_finding(settled);
                 record.note_finding(unclassified);
@@ -907,7 +907,7 @@ mod tests {
             }
             let kept = &record.findings()[0];
             assert_eq!(
-                (kept.would_remove, kept.settling),
+                (kept.persistent, kept.settling),
                 (true, None),
                 "settled_first={settled_first}"
             );
@@ -1156,7 +1156,7 @@ mod tests {
                 detail: "synthesised for the unreachable branch".to_string(),
                 settling: None,
             },
-            would_remove: true,
+            persistent: true,
         };
 
         // Deliberately empty: that is what makes this the branch under test.

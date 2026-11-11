@@ -22,7 +22,7 @@
 //! [`ConformanceEvidence::check_bounds`]: super::evidence::ConformanceEvidence::check_bounds
 
 use super::oracle::ConformanceOracle;
-use super::policy::{RemovalTier, removal_tier};
+use super::policy::{FindingClass, finding_class};
 use super::property::{ConformanceProperty, PropertyOutcome};
 use super::verifier::{Bytes, ConformanceCase, verify_case};
 
@@ -57,17 +57,17 @@ pub struct MinimizeReport {
 }
 
 /// Shrink `case` while it keeps producing a violation of the same property with
-/// the same removal tier (`policy::removal_tier`).
+/// the same class (`policy::finding_class`).
 ///
-/// The tier is part of what the finding is. A never-settling `StateIdempotence`
+/// The class is part of what the finding is. A never-settling `StateIdempotence`
 /// case can have a smaller input that settles after a rewrite: the same property,
-/// but report-only. Swapping that in would turn removal-eligible evidence into
-/// evidence no peer may act on.
+/// but report-only. Swapping that in would turn evidence of a persistent finding
+/// into evidence of a different, benign one.
 ///
-/// Tier equality is deliberately coarse. It does not pin the settling class, so
+/// Class equality is deliberately coarse. It does not pin the settling class, so
 /// a `NeverSettled` case may shrink to an `Indeterminate` one: both are
-/// removal-eligible today, and pinning the class would refuse shrinks that change
-/// nothing a receiving peer decides.
+/// persistent today, and pinning the settling class would refuse shrinks that
+/// change nothing a reader of the evidence concludes.
 ///
 /// Returns the case unchanged if it does not currently violate anything: shrinking
 /// a case that does not fail would be searching for a failure, which is a different
@@ -107,7 +107,7 @@ pub fn minimize<O: ConformanceOracle + ?Sized>(
 }
 
 /// [`minimize`] toward a finding the caller already established: shrink `case`
-/// while each trial violates `target.0` with removal tier `target.1`.
+/// while each trial violates `target.0` with class `target.1`.
 ///
 /// Re-deriving the target here would verify `case` again, and against a
 /// contract whose verdict is not stable between runs (a nondeterministic one, or
@@ -117,7 +117,7 @@ pub fn minimize<O: ConformanceOracle + ?Sized>(
 pub fn minimize_toward<O: ConformanceOracle + ?Sized>(
     oracle: &mut O,
     case: &ConformanceCase,
-    target: (ConformanceProperty, RemovalTier),
+    target: (ConformanceProperty, FindingClass),
     state_candidates: &[Bytes],
     delta_candidates: &[Bytes],
     config: &MinimizeConfig,
@@ -138,7 +138,7 @@ pub fn minimize_toward<O: ConformanceOracle + ?Sized>(
 fn shrink<O: ConformanceOracle + ?Sized>(
     oracle: &mut O,
     case: &ConformanceCase,
-    finding: (ConformanceProperty, RemovalTier),
+    finding: (ConformanceProperty, FindingClass),
     state_candidates: &[Bytes],
     delta_candidates: &[Bytes],
     config: &MinimizeConfig,
@@ -208,13 +208,13 @@ fn shrink<O: ConformanceOracle + ?Sized>(
 }
 
 /// Try to replace one input slot with the smallest candidate that still fails the
-/// same law with the same removal tier. Returns false when the attempt budget is
+/// same law with the same class. Returns false when the attempt budget is
 /// spent.
 #[allow(clippy::too_many_arguments)]
 fn shrink_slot<O: ConformanceOracle + ?Sized>(
     oracle: &mut O,
     current: &mut ConformanceCase,
-    finding: (ConformanceProperty, RemovalTier),
+    finding: (ConformanceProperty, FindingClass),
     ordered: &[Bytes],
     config: &MinimizeConfig,
     report: &mut MinimizeReport,
@@ -239,7 +239,7 @@ fn shrink_slot<O: ConformanceOracle + ?Sized>(
 
         // The trial must fail the SAME law. A trial that fails a different one is a
         // different finding, and quietly swapping it in would relabel the evidence as
-        // being about something it never demonstrated. The tier is compared for
+        // being about something it never demonstrated. The class is compared for
         // the same reason (see `minimize`).
         if violated_finding(oracle, &trial) == Some(finding) {
             *current = trial;
@@ -252,10 +252,10 @@ fn shrink_slot<O: ConformanceOracle + ?Sized>(
 fn violated_finding<O: ConformanceOracle + ?Sized>(
     oracle: &mut O,
     case: &ConformanceCase,
-) -> Option<(ConformanceProperty, RemovalTier)> {
+) -> Option<(ConformanceProperty, FindingClass)> {
     match verify_case(oracle, case) {
         PropertyOutcome::Violated(violation) => {
-            Some((violation.property, removal_tier(&violation)))
+            Some((violation.property, finding_class(&violation)))
         }
         PropertyOutcome::Holds | PropertyOutcome::Inconclusive(_) => None,
     }
@@ -278,6 +278,10 @@ mod tests {
     struct LastWriteWins;
 
     impl ConformanceOracle for LastWriteWins {
+        fn reads_host_clock(&self) -> bool {
+            false
+        }
+
         fn validate_state(
             &mut self,
             _state: &[u8],
@@ -323,6 +327,10 @@ mod tests {
     struct AlwaysConforming;
 
     impl ConformanceOracle for AlwaysConforming {
+        fn reads_host_clock(&self) -> bool {
+            false
+        }
+
         fn validate_state(
             &mut self,
             _state: &[u8],
@@ -442,6 +450,10 @@ mod tests {
         // Order-dependent apply: concatenation. Any two distinct deltas witness it.
         struct Concat;
         impl ConformanceOracle for Concat {
+            fn reads_host_clock(&self) -> bool {
+                false
+            }
+
             fn validate_state(
                 &mut self,
                 _state: &[u8],
@@ -509,6 +521,10 @@ mod tests {
         // DeltaPermutationInvariance fails and there is a witness to shrink.
         struct Append;
         impl ConformanceOracle for Append {
+            fn reads_host_clock(&self) -> bool {
+                false
+            }
+
             fn validate_state(
                 &mut self,
                 _state: &[u8],
@@ -616,13 +632,17 @@ mod tests {
 
     /// Short states are canonicalized by sorting (settles after one rewrite, so
     /// report-only); longer ones grow on every merge (never settles, so
-    /// removal-eligible). Both are `StateIdempotence` violations.
+    /// persistent). Both are `StateIdempotence` violations.
     ///
-    /// fdev's `minimisation_keeps_a_removal_eligible_finding_removal_eligible` has
+    /// fdev's `minimisation_keeps_a_persistent_finding_persistent` has
     /// its own copy (fdev cannot reach this test module); keep the two in step.
     struct SettlesOnlyWhenShort;
 
     impl ConformanceOracle for SettlesOnlyWhenShort {
+        fn reads_host_clock(&self) -> bool {
+            false
+        }
+
         fn validate_state(
             &mut self,
             _state: &[u8],
@@ -658,12 +678,12 @@ mod tests {
         }
     }
 
-    /// Shrinking keeps the removal tier as well as the property. The only smaller
+    /// Shrinking keeps the class as well as the property. The only smaller
     /// candidate still breaks idempotence, but settles after a rewrite, which is
-    /// report-only: accepting it would turn removal-eligible evidence into evidence
-    /// no peer may act on.
+    /// report-only: accepting it would turn evidence of a persistent finding into
+    /// evidence of a benign one.
     #[test]
-    fn shrinking_does_not_trade_a_removal_eligible_finding_for_a_report_only_one() {
+    fn shrinking_does_not_trade_a_persistent_finding_for_a_report_only_one() {
         let original =
             ConformanceCase::new(ConformanceProperty::StateIdempotence, vec![bytes(64, 7)]);
         let unsorted: Bytes = Arc::from(vec![3u8, 2, 1].as_slice());
@@ -677,17 +697,17 @@ mod tests {
             panic!("the fixture's short state must break idempotence");
         };
         assert_eq!(
-            removal_tier(&smaller),
-            RemovalTier::ReportOnly,
+            finding_class(&smaller),
+            FindingClass::ReportOnly,
             "fixture: the smaller candidate must be the report-only class"
         );
         assert_eq!(
             violated_finding(&mut SettlesOnlyWhenShort, &original),
             Some((
                 ConformanceProperty::StateIdempotence,
-                RemovalTier::RemovalEligible
+                FindingClass::Persistent
             )),
-            "fixture: the original must be the removal-eligible class"
+            "fixture: the original must be the persistent class"
         );
 
         let (minimized, _) = minimize(
@@ -702,12 +722,16 @@ mod tests {
 
     /// A contract whose verdict changes between runs: while `sorts`, every merge
     /// sorts (settles after one rewrite, report-only); otherwise every merge
-    /// grows the state (never settles, removal-eligible).
+    /// grows the state (never settles, persistent).
     struct Flips {
         sorts: bool,
     }
 
     impl ConformanceOracle for Flips {
+        fn reads_host_clock(&self) -> bool {
+            false
+        }
+
         fn validate_state(
             &mut self,
             _state: &[u8],
@@ -744,7 +768,7 @@ mod tests {
     }
 
     /// `minimize_toward` shrinks toward the finding it is given, never one it
-    /// re-derives. The caller checked a removal-eligible finding; by the time it
+    /// re-derives. The caller checked a persistent finding; by the time it
     /// minimizes, the contract has flipped and the case (and a smaller candidate)
     /// now settle. Re-deriving the target would shrink toward the report-only
     /// finding the caller never checked.
@@ -760,7 +784,7 @@ mod tests {
             &original,
             (
                 ConformanceProperty::StateIdempotence,
-                RemovalTier::RemovalEligible,
+                FindingClass::Persistent,
             ),
             &[Arc::from(vec![2u8, 1].as_slice())],
             &[],
