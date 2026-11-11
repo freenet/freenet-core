@@ -117,18 +117,15 @@ pub(crate) const MAX_UNI_STREAMS: u32 = 64;
 /// data: enough for the upgrade's control frames (`Ready`, `ReadyAck`). A
 /// path that accepts data raises it to [`MAX_UNI_STREAMS`] when it is built
 /// (`QuicPath::with_budget`). quinn applies a raise at once and cannot take a
-/// grant back, so a connection starts low: a stream in its in-order phase
-/// (header, metadata, short or control body) can make quinn hold up to about
-/// 44 KiB of datagrams (`QUIC_ASSEMBLER_HOLD_PER_STREAM_BYTES`), and a shadow
-/// path reads its headers in order too.
+/// grant back, so a connection starts with what a shadow path needs.
 pub(crate) const INITIAL_UNI_STREAMS: u32 = 4;
 
 /// The connection receive window every connection starts with, until a data
 /// path's buffer-budget meter raises it to the floor (`budget`). Small for the
-/// reason [`INITIAL_UNI_STREAMS`] is: what a peer sends past a missing byte of
-/// an in-order phase stays in quinn's assembler as whole datagrams, up to
-/// about 5 x the window (`QUIC_ASSEMBLER_HOLD_WINDOW_MULTIPLE`), and a shadow
-/// path, which carries only control frames, needs little.
+/// reason [`INITIAL_UNI_STREAMS`] is: quinn cannot take credit back, and a
+/// shadow path, which carries only control frames, needs little. Its receive
+/// side is in the fixed charge at this window
+/// ([`QUIC_CONNECTION_CHARGE_BYTES`]).
 pub(crate) const INITIAL_RECEIVE_WINDOW_BYTES: u64 = 16 * 1024;
 
 /// Uni stream slots left for short messages and control frames when every
@@ -257,7 +254,12 @@ pub(crate) const QUIC_CONNECTION_FIXED_BYTES: usize = 64 * 1024;
 
 /// Received stream data quinn held per open uni stream, measured with
 /// one-byte STREAM frames above a gap at the start of the stream, each in
-/// its own datagram padded to 1200 B.
+/// its own datagram padded to 1200 B, with nothing read.
+///
+/// What quinn keeps for a stream nobody reads past a gap. No path reads a
+/// stream that way (`path::inbound` reads every stream unordered from its
+/// first byte), so this and [`QUIC_ASSEMBLER_HOLD_WINDOW_MULTIPLE`] measure
+/// what the reader avoids; neither is a term of any charge.
 ///
 /// quinn keeps every STREAM frame as a slice of the datagram it arrived in
 /// (`quinn/src/endpoint.rs`, one buffer per datagram), so a frame keeps a

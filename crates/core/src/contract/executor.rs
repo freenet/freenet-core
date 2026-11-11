@@ -3019,9 +3019,9 @@ mod tests {
                  (each data path's floor grant)",
             ),
             (
-                "RETAINED_DATAGRAM_BYTES",
-                "what quinn keeps per received datagram it holds, for ONE QUIC \
-                 connection's hold bound (quic::hold); a term of hold_charge, \
+                "STAGING_BUFFER_OVERHEAD_BYTES",
+                "the overhead charged per staging buffer of ONE QUIC stream \
+                 (quic::path::inbound), against its connection's staging cap, \
                  inside quic_buffer_budget_for and the fixed charge",
             ),
             (
@@ -3123,16 +3123,9 @@ mod tests {
             ),
             (
                 "quic_buffer_budget_for",
-                "the node-wide QUIC buffer budget (memory / 16); summed by the buffer \
-                 budget's aggregate-accounting step (#5940), which waits for the \
-                 small-host decision; nothing is metered against it yet",
-            ),
-            (
-                "READ_START_BYTES",
-                "initial allocation of ONE QUIC stream read (quic::path::inbound), \
-                 at most the stream's declared length, which is charged to the \
-                 per-connection inbound budget or held to a small per-message \
-                 bound; not a node budget",
+                "the node-wide QUIC buffer budget (memory / 16), from which each data \
+                 path's windows are set (quic::budget); summed by the buffer budget's \
+                 aggregate-accounting step (#5940)",
             ),
             (
                 "MAX_CONTROL_BYTES",

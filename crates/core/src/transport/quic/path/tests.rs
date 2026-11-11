@@ -3363,7 +3363,8 @@ fn seeded_loss_from(
 }
 
 /// A streamed send over a path with 5% random loss and a 200 ms round trip:
-/// the 384 KiB send buffer drains at cwnd/RTT, so a write waits past the 5 s
+/// the send window (the floor: this path has no budget meter) drains at
+/// cwnd/RTT, so a write waits past the 5 s
 /// gap while the connection keeps acknowledging. The gap counts only when
 /// nothing on the connection was acknowledged for `STALL_PROGRESS_WINDOW`, so
 /// the send completes. Before, it timed out (`SendFailure::TimedOut`) and went

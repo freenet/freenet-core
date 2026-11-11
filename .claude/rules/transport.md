@@ -1574,8 +1574,7 @@ Connection IDs (quic/cid.rs) carry a keyed BLAKE3 MAC, so quinn drops a
 
 QUIC memory: every connection starts with a 16 KiB receive window and 4 uni
 streams (`config::INITIAL_RECEIVE_WINDOW_BYTES`, `INITIAL_UNI_STREAMS`): quinn
-cannot take a grant back, and a stream in its in-order phase can make quinn
-hold several times the window in datagrams. A path that takes data raises
+cannot take a grant back. A path that takes data raises
 the streams to 64 at build and its meter raises the receive window to the
 floor (128 KiB, or 64 KiB under 2 GiB, `budget::floor_window_bytes`); the
 send window starts at the floor, and the stream receive window is the
@@ -1584,56 +1583,61 @@ largest a connection grows to (`budget::MAX_WINDOW_BYTES`, 8 MiB); all are cappe
 (`windows_never_exceed_the_reassembly_allowance` guards future constant
 changes). A shadow path keeps the initial window. A data path registers a
 `budget::ConnMeter` with the node's `budget::QuicBudget` (memory / 16,
-`quic_buffer_budget_for`), which charges it hold::hold_charge(W + debt)
-(about 3.45 x, below) + send x 9/8 + gaps x 70 B + 64 KiB and sets its
-windows at runtime
+`quic_buffer_budget_for`), which charges it budget::receive_charge(W + debt)
+(3 x: the unread credit plus the staging cap, below) + send x 9/8 + R_conn x
+70 B + 64 KiB and sets its windows at runtime
 (`quinn::Connection::set_receive_window` / `set_send_window`):
   → W + debt: quinn records a shrink as debt paid by later credits; the
     meter mirrors it from the bytes the reader reads (credits from a STOP
-    are not seen, so it over-estimates).
+    are not seen, so it over-estimates). Every window change and every read
+    of a connection happens in its receive task: a shrink another path asks
+    for is applied in the shrunk path's own evaluation, after its pending
+    reads are counted, and quinn is told after the budget's lock is
+    released. Keep it so, or the mirror under-estimates.
   → Growth only when window-limited on CONTIGUOUS delivery (the in-order
     prefix of each stream, `RangeMirror::prefix`, at least 75% of a window
     per round trip), at most doubling, up to 8 MiB, while the path's charge
     stays within its share C (floor grant plus the budget above every
     path's floor grant, split over the paths growing) and the node's within
     the budget. Bytes read above a gap are credit, never growth.
-  → A grow that does not fit shrinks the paths furthest above C toward it;
-    the room comes as their debt is read, never by taking credit back.
+  → A grow that does not fit asks the paths furthest above C to shrink
+    toward it; the room comes as their debt is read, never by taking credit
+    back.
+  → A path delivering under a quarter of its window per round trip for
+    budget::IDLE_DECAY (10 s) halves its receive window toward the floor,
+    once per period. Credit already granted stays charged until the peer
+    uses it, so a peer that grew and went silent keeps its charge while it
+    stays silent: that limits other paths' growth, not memory.
   → The send window follows 2 x cwnd within the same share, lowered only at
     half; a window lowered while streams opened before it are open stays
     charged until they end (the stream's epoch, held with its permit).
   → The gap cap R_conn is max(256, (W + debt) / 1 KiB), set as the window
-    changes (`ConnRanges::set_cap`); a path without a meter keeps 256.
-  → Evaluated from the reader at most once per round trip (10 ms at least)
-    and at each 2 s acknowledgement-watch tick.
+    changes (`ConnRanges::set_cap`) and never below the gaps held; it is
+    charged at the cap; a path without a meter keeps 256.
+  → The staging cap (below) is 2 x (W + debt), set with it.
+  → Evaluated from the receive task at most once per round trip (10 ms at
+    least): on reads, at each 2 s acknowledgement-watch tick, and when the
+    path's sends progress (`ConnMeter::note_send` wakes the receive task).
+  → A running total: an evaluation does no work proportional to the number
+    of paths, except counting the paths growing (at most once per 10 ms
+    node-wide) and asking others to shrink.
   Telemetry: quic_budget_bytes, quic_budget_charged_bytes and
-  quic_budget_charged_peak_bytes, quic_window_grew, _grow_refused, _shrank.
-  In-order-phase hold (quic/hold.rs): headers, metadata and control bodies are
-  read in order, and quinn keeps a whole datagram per frame behind a gap
-  (measured 4 to 5.3 x the window with nothing read). Short bodies and Stream
-  payloads are read unordered once the header gave their length, so an
-  in-order phase spans at most 18 + 1,120 B or a 4 KiB control body. The
-  socket adapter counts each connection's datagrams as it hands them to
-  quinn (HoldRegistry, keyed by the address quinn knows); each stream opens a
-  phase at accept and closes it at its first unordered read or its end. quinn
-  holds at most 1,344 B per datagram received since the OLDEST open phase
-  began plus a compaction copy of at most 1.25 x (W + debt) (pinned by
-  memory_tests::quinn_holds_no_more_than_its_received_datagrams; from the
-  phase start, not the start of a blocked read, since data from an earlier
-  block can still be held). Past the threshold, HOLD_THRESHOLD_TENTHS (2.2,
-  provisional until the 3c harness measures honest false stops under loss)
-  of W + debt (the meter sets it; a shadow path's is at the initial window),
-  every stream still in its phase is stopped EVICTED (evicted_hold) and quinn
-  frees what it held; counted quic_hold_trips, with quic_hold_peak_pct the
-  period's highest hold as a share of its threshold. The per-datagram check
-  bounds the hold at any instant; spreading across connections does not
-  defeat it, since each is held to its own threshold and the charges sum.
-  The reader's select is biased toward a ready read, so a stream that can
-  leave its phase is not stopped by a trip seen in the same poll.
-  Relies on quinn 0.11.12 / quinn-proto 0.11.19 retaining only received
-  datagrams (QUIC_MEMORY_MEASURED_WITH pins the versions).
-  Not metered: unread chunks between two polls of a reader, and the fixed
-  per-connection terms (`QUIC_CONNECTION_CHARGE_BYTES`).
+  quic_budget_charged_peak_bytes, quic_window_grew, _grow_refused, _shrank,
+  quic_staged_peak_pct.
+  Staging (path/inbound.rs, `ConnStaging`): every stream is read unordered
+  from its first byte, so quinn holds nothing for a stream beyond the chunks
+  its reader has not polled yet. Bytes read for a stream before its header,
+  metadata or control body has been taken are staged in one buffer per
+  stream, from the read position to the highest byte staged, charged at its
+  allocation size against the connection's staging cap (2 x (W + debt); 2 x
+  the initial window on a shadow path), checked before the buffer grows. A
+  read that would pass the cap stops its stream (EVICTED, evicted_staged); a
+  second within 30 s closes the path with OVER_BUDGET
+  (closed_staged_over_cap). The factor 2 is provisional until the 3c harness
+  measures honest stops under loss.
+  Not metered: unread chunks between two polls of a reader (bounded only by
+  how long the reader task waits to run; 3c measures it under CPU load), and
+  the fixed per-connection terms (`QUIC_CONNECTION_CHARGE_BYTES`).
 `quic/config.rs` pins MEASUREMENTS of named terms under stated conditions
 (`quic::memory_tests`, jemalloc-rounded on linux-gnu), not a ceiling on what
 a connection can hold: `QUIC_CONNECTION_FIXED_BYTES` (64 KiB, an idle
@@ -1967,7 +1971,7 @@ Sending (QuicPath::send_short_bounded / send_stream_bounded /
   connection's own probes wait for a saturated cap too, and counted without
   that limit they kept a dark send going for 32 s. For the
   credit after its last ack a dark path's own held probes do still count (on
-  main they counted for as long as they were held). Under random loss the 384 KiB send window drains at Cubic's window per
+  main they counted for as long as they were held). Under random loss a send window (384 KiB when this was measured; set per path from the buffer budget since) drains at Cubic's window per
   round trip, so writes wait past 5 s while acks still arrive; failing them
   reset streams the peer was receiving (E5B9-LAB, 8 MiB at 5% loss and 200 ms
   failed). The connection is read at the timer's wakes, so a send that stops
@@ -2061,23 +2065,24 @@ Receiving: one task per connection reads every stream (FuturesUnordered,
   close code DOWNGRADE (the peer falls back to UDP). Short
   and Control go to bounded channels (full: dropped and counted); Stream
   goes through the INBOUND ADAPTER (path/inbound.rs).
-Unordered reads: the header, the metadata and control bodies are read IN
-  ORDER (read_chunk(_, true)): quinn holds what arrives past a gap without
-  returning credit for it, bounded by the hold detector above. A Short's body
-  is read unordered into one buffer at each piece's offset (growing to the
-  highest offset received, exact at the end). A Stream's payload, once
-  charged, is read with read_chunk(_, false), so
-  quinn hands over each piece as it arrives, gap or not, and it is written at
-  its offset into the charged buffer (the Rechunker stages a fragment until it
-  is whole and holds the one that completes the stream until its end).
-  → NEVER read unordered before the header is known: an unordered read
-    returns the peer's credit for every byte read, so bytes read past a
-    missing header have no bound but the age limit.
-  → Switch only once an in-order read would block (BodyReader::next_unordered
-    drains what is contiguous first). This is a correctness requirement: only
-    in-order reads clear buffered duplicates (a resend of bytes already read
-    can still be buffered below the read position), and a duplicate read
-    unordered after the switch breaks the stream.
+Unordered reads: every stream is read with read_chunk(_, false) from its
+  first byte, so quinn hands over each piece as it arrives, gap or not, and
+  each byte once. Until the header (and metadata, or control body) has been
+  taken, pieces are staged under the staging cap (above); then a Short's body
+  goes into one buffer at each piece's offset (growing to the highest offset
+  received, exact at the end), and a Stream's payload into the charged buffer
+  at its offset (the Rechunker stages a fragment until it is whole and holds
+  the one that completes the stream until its end).
+  → NEVER read a QUIC stream in order (read_chunk(_, true)) on a path: quinn
+    keeps what arrives past a gap for an in-order reader, outside every bound
+    here, and a stream must not switch from in-order to unordered reads.
+  → NEVER keep bytes read before the header outside the staging cap: an
+    unordered read returns the peer's credit for every byte read.
+  → A reader never stops reading, including while it waits for channel room:
+    a byte past the declared end is Overlong at once, and the end may be read
+    before the stream is announced, which frees quinn's slot. Waiting messages
+    are therefore bounded by the inbound budget (a one-packet Short that has
+    to wait takes a charge first), not by the stream limit.
   A gap costs one received range (quinn's recvd set and our mirror, ~70 B);
   gaps are counted per stream as ranges past the first, and a connection's
   streams may hold at most R_conn (budget::gap_cap, max(256, (W + debt) / 1 KiB); 256 without a meter), past
