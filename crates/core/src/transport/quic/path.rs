@@ -475,9 +475,8 @@ quic_outcomes! {
         TooManyRanges => "too_many_ranges",
         /// The connection went past its gap cap a
         /// second time within `inbound::STAGED_TRIP_WINDOW`, so the path was
-        /// closed with OVER_BUDGET (once per path):
-        /// the gaps of streams it stopped stay counted for the connection's
-        /// life, because quinn keeps them until the peer ends the stream.
+        /// closed with OVER_BUDGET (once per path). The gaps of streams it
+        /// stopped stay counted (`inbound::ConnRanges::keep`).
         ClosedTooManyRanges => "closed_too_many_ranges",
         /// Staging what the stream had read before its header, metadata or
         /// control body was taken would have passed the connection's staging

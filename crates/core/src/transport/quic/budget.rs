@@ -8,14 +8,17 @@
 //! [`QuicBudget`], which charges the connection
 //!
 //! ```text
-//! receive_charge(W + debt) + S_charged x 9/8 + R_conn x GAP_BYTES + CONTROL_BUFFER_BYTES
+//! (W + debt) + max(staging_cap(W + debt), staging cap as set)
+//!   + S_charged x 9/8 + R_conn x GAP_BYTES + CONTROL_BUFFER_BYTES
 //! ```
 //!
-//! - **receive_charge(W + debt)**, 3 x (W + debt): the bytes the peer may have
-//!   sent that the reader has not read yet (at most the credit), plus what the
+//! - **W + debt and the staging cap**, 3 x (W + debt) with the cap as the
+//!   credit sets it ([`receive_charge`]): the bytes the peer may have sent
+//!   that the reader has not read yet (at most the credit), plus what the
 //!   reader may stage for streams whose header it has not taken yet
 //!   (`path::inbound::ConnStaging`, capped at [`staging_cap`], twice the
-//!   credit). Every stream is read unordered from its first byte, so quinn
+//!   credit). After a shrink the cap is never set below the bytes staged,
+//!   so the larger of the two is charged. Every stream is read unordered from its first byte, so quinn
 //!   holds nothing for a stream beyond the chunks its reader has not polled.
 //! - **W + debt.** quinn lowers a receive window by recording a shrink debt,
 //!   paid by later credits (quinn-proto 0.11.19 `streams/state.rs`,
@@ -97,7 +100,7 @@ pub(crate) const MIN_WINDOW_SMALL_HOST_BYTES: u64 = 64 * 1024;
 /// Hosts with less memory get the smaller floor window.
 pub(crate) const SMALL_HOST_MEMORY: usize = 2 * 1024 * 1024 * 1024;
 
-/// What one gap costs: quinn's `recvd` entry and the reader's mirror (derived).
+/// What one gap is charged: a received range on each side of the reader (derived).
 pub(crate) const GAP_BYTES: u64 = 70;
 
 /// The fewest gaps a connection may hold, whatever its window.

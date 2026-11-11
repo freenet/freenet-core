@@ -1099,9 +1099,8 @@ fn streams_whose_first_datagrams_are_lost_all_arrive() {
     })
 }
 
-/// A stream stopped with gaps leaves them counted: quinn keeps a stopped
-/// stream's received ranges until the peer finishes or resets it, which we
-/// cannot observe. A quinn sender resets a stopped stream at once, so after
+/// A stream stopped with gaps leaves them counted, since we cannot observe
+/// when the peer ends it. A quinn sender resets a stopped stream at once, so after
 /// the grace period (`KEPT_GAPS_GRACE`) the gaps of a stream with only a few
 /// leave the count, and an honest connection's count does not drift. Here
 /// the sender's datagrams stop arriving after some were lost, so the stream
@@ -6776,7 +6775,9 @@ fn an_honest_stream_whose_first_packet_is_lost_stays_within_the_staging_cap() {
             let peak = p.b.inbound_staged_peak_permille();
             eprintln!("{mib} MiB at {one_way} ms: staged peak {peak} per mille of the cap");
             assert!(peak > 0, "premise: the lost header made the reader stage");
-            assert!(peak < 1000, "{mib} MiB: staged {peak} per mille of the cap");
+            // Measured at most 500 (the size-class growth); doubling the
+            // staging buffer peaks at 625.
+            assert!(peak <= 550, "{mib} MiB: staged {peak} per mille of the cap");
         });
     }
 }
