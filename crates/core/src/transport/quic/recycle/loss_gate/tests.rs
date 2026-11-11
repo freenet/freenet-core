@@ -237,22 +237,58 @@ fn fifteen_percent_loss_stays_under_the_share_ceiling() {
     );
 }
 
-/// A round with too few datagrams does not move the share: one loss in a
-/// window of 8 is not a 12% loss rate.
+/// A round with too few datagrams does not move the share on its own: one
+/// loss in a window of 8 is not a 12% loss rate.
 #[test]
 fn small_rounds_do_not_move_the_loss_share() {
     let mut gate = GateState::default();
     let rtt = 100 * MS;
+    let now = Instant::now();
+    for i in 0..7u32 {
+        let at = now + rtt.mul_f64(f64::from(i) / 7.0);
+        gate.on_ack(at + rtt, at, 1200, rtt);
+    }
+    gate.on_loss(now + rtt, now, 1200, false);
+    // The next round starts: 8 datagrams are too few to judge.
+    gate.on_ack(now + 2 * rtt + MS, now + rtt, 1200, rtt);
+    assert_eq!(gate.loss_share(), 0.0);
+}
+
+/// Small rounds add up: their datagrams carry into the next round until
+/// there are enough to judge. Otherwise a share that once crossed the
+/// ceiling would stay there once Cubic's window is below 16 datagrams,
+/// every loss would keep counting, and the window could not grow back (the
+/// 4-flow, 8 KiB queue, 5% loss row in the e5b-9 lab took as long as plain
+/// Cubic).
+#[test]
+fn a_high_share_decays_through_small_rounds() {
+    let mut gate = GateState::default();
+    let rtt = 100 * MS;
     let mut now = Instant::now();
-    for _ in 0..20 {
-        for i in 0..6u32 {
-            let at = now + rtt.mul_f64(f64::from(i) / 6.0);
+    // Push the share over the ceiling: a third lost, 45 datagrams a round.
+    for _ in 0..12 {
+        for i in 0..30u32 {
+            let at = now + rtt.mul_f64(f64::from(i) / 30.0);
             gate.on_ack(at + rtt, at, 1200, rtt);
         }
-        gate.on_loss(now + rtt, now, 2400, false);
+        gate.on_loss(now + rtt, now, 15 * 1200, false);
         now += rtt;
     }
-    assert_eq!(gate.loss_share(), 0.0);
+    assert!(gate.loss_share() >= LOSS_SHARE_CEILING);
+    // The window collapsed: 4 datagrams a round, none lost.
+    for _ in 0..80 {
+        for i in 0..4u32 {
+            let at = now + rtt.mul_f64(f64::from(i) / 4.0);
+            gate.on_ack(at + rtt, at, 1200, rtt);
+        }
+        now += rtt;
+    }
+    assert!(
+        gate.loss_share() < LOSS_SHARE_CEILING,
+        "{}",
+        gate.loss_share()
+    );
+    assert_eq!(gate.on_loss(now, now - rtt, 1200, false), Verdict::Ignored);
 }
 
 /// A route that grows longer reads as a queue, so the gate passes every
