@@ -1229,7 +1229,13 @@ impl<T: TimeSource> Receiver<T> {
             source.end(match failure {
                 ReadFailure::Idle => QuicSourceEnd::Idle,
                 ReadFailure::Age => QuicSourceEnd::Age,
-                _ => QuicSourceEnd::Ended,
+                ReadFailure::Truncated(_)
+                | ReadFailure::Overlong
+                | ReadFailure::Reset
+                | ReadFailure::ConnectionLost
+                | ReadFailure::TooManyRanges
+                | ReadFailure::Overlap
+                | ReadFailure::Other => QuicSourceEnd::Ended,
             });
         }
         let stats = &self.stats;
