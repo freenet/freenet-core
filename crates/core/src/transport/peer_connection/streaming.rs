@@ -53,11 +53,11 @@ use super::streaming_buffer::LockFreeStreamBuffer;
 /// The previous 30s value caused users to wait 30s+ before retry on stalled streams
 /// (0.9% of all transfers), turning a sub-second retry into a 30-40s experience.
 ///
-/// It applies to streams the UDP transport fills. A stream a QUIC path fills
-/// ([`StreamHandle::new_quic`]) has no gap limit at the consumer: quinn
-/// retransmits until the path's own rules end the stream, and at a high RTT
-/// with loss its retransmit backoff can leave more than 5 s between two
-/// completed fragments of a stream it will still deliver.
+/// It applies to streams the UDP transport fills, and is the floor for a
+/// stream a QUIC path fills ([`StreamHandle::new_quic`]), whose gap follows
+/// the path's round trip ([`quic_fragment_gap`]): quinn retransmits on its
+/// own backoff, and at a high RTT with loss that can leave more than 5 s
+/// between two completed fragments of a stream it will still deliver.
 pub const STREAM_INACTIVITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Why the reader of a QUIC-fed stream stopped before the stream completed
@@ -87,11 +87,67 @@ impl QuicSourceEnd {
     }
 }
 
+/// Round trips a consumer of a QUIC-fed stream waits between two pieces
+/// before it gives up ([`quic_fragment_gap`]). quinn's probe timeout is at
+/// least one smoothed round trip and doubles each time it fires in a row,
+/// so a tail lost twice in a row waits about 1 + 2 + 4 = 7 probe timeouts
+/// before it can arrive; 16 round trips covers that with the probe timeout
+/// up to about twice the round trip (its variance term under loss).
+pub(crate) const QUIC_GAP_RTT_MULTIPLE: u32 = 16;
+
+/// The gap a consumer of a QUIC-fed stream allows between two pieces:
+/// [`QUIC_GAP_RTT_MULTIPLE`] round trips of its path, at least
+/// [`STREAM_INACTIVITY_TIMEOUT`], so a fast path still fails as fast as UDP,
+/// and at most the reader's idle limit `idle`, past which the reader ends the
+/// stream anyway.
+pub(crate) fn quic_fragment_gap(
+    rtt: std::time::Duration,
+    idle: std::time::Duration,
+) -> std::time::Duration {
+    rtt.saturating_mul(QUIC_GAP_RTT_MULTIPLE).clamp(
+        STREAM_INACTIVITY_TIMEOUT,
+        idle.max(STREAM_INACTIVITY_TIMEOUT),
+    )
+}
+
+/// A QUIC path's smoothed round trip, kept current by the path (at each
+/// stream it admits and at each tick of its acknowledgement watch) and read
+/// by the consumers of the streams it fills.
+#[derive(Debug)]
+pub(crate) struct PathRtt(std::sync::atomic::AtomicU64);
+
+impl PathRtt {
+    pub(crate) fn new(rtt: std::time::Duration) -> Self {
+        let this = Self(std::sync::atomic::AtomicU64::new(0));
+        this.set(rtt);
+        this
+    }
+
+    pub(crate) fn set(&self, rtt: std::time::Duration) {
+        let nanos = u64::try_from(rtt.as_nanos()).unwrap_or(u64::MAX);
+        self.0.store(nanos, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn get(&self) -> std::time::Duration {
+        std::time::Duration::from_nanos(self.0.load(std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+/// What the reader of a QUIC-fed stream tells its consumers: its path's
+/// round trip and its own idle limit, from which they take their gap.
+#[derive(Debug)]
+pub(crate) struct QuicSourcePath {
+    pub(crate) rtt: Arc<PathRtt>,
+    pub(crate) idle: std::time::Duration,
+}
+
 /// The source of a QUIC-fed stream, shared by every clone and fork of its
-/// handle: why its reader stopped, once it has.
+/// handle: its path, once the reader sets it, and why its reader stopped,
+/// once it has.
 #[derive(Debug, Default)]
 pub(crate) struct QuicSource {
     end: std::sync::OnceLock<QuicSourceEnd>,
+    path: std::sync::OnceLock<QuicSourcePath>,
 }
 
 impl QuicSource {
@@ -102,6 +158,19 @@ impl QuicSource {
 
     fn ended(&self) -> Option<QuicSourceEnd> {
         self.end.get().copied()
+    }
+
+    /// Set the path the stream comes over. The first setting stays.
+    pub(crate) fn set_path(&self, path: QuicSourcePath) {
+        let _first = self.path.set(path);
+    }
+
+    /// The gap a consumer allows: [`quic_fragment_gap`] for the path, or
+    /// [`STREAM_INACTIVITY_TIMEOUT`] before the reader has set one.
+    fn gap(&self) -> std::time::Duration {
+        self.path.get().map_or(STREAM_INACTIVITY_TIMEOUT, |path| {
+            quic_fragment_gap(path.rtt.get(), path.idle)
+        })
     }
 }
 
@@ -319,11 +388,10 @@ impl StreamHandle {
     }
 
     /// A handle for a stream a QUIC path's reader fills. [`Self::assemble`]
-    /// applies no gap limit of its own to it: it waits until the stream
-    /// completes, the handle is cancelled, or the reader records why it
-    /// stopped ([`Self::end_quic_source`]). The reader's own rules bound that
-    /// wait: its idle and age limits, and the path or connection ending,
-    /// which drops the reader.
+    /// waits until the stream completes, the handle is cancelled, the reader
+    /// records why it stopped ([`Self::end_quic_source`]), or no piece arrives
+    /// for [`Self::fragment_gap_limit`], which follows the path's round trip
+    /// once the reader has set it ([`QuicSource::set_path`]).
     pub(crate) fn new_quic(stream_id: StreamId, total_bytes: u64) -> Self {
         Self {
             quic: Some(Arc::new(QuicSource::default())),
@@ -349,13 +417,13 @@ impl StreamHandle {
 
     /// The longest gap between two fragments a consumer of this stream
     /// should expect before it fails: [`STREAM_INACTIVITY_TIMEOUT`] for the
-    /// UDP transport, and the reader's idle limit for a QUIC-fed stream.
+    /// UDP transport, and [`quic_fragment_gap`] of its path for a QUIC-fed
+    /// stream (5 s until the reader has set the path). Read at each wait, so
+    /// it follows the path's round trip as it changes.
     pub(crate) fn fragment_gap_limit(&self) -> std::time::Duration {
-        if self.quic.is_some() {
-            super::streaming_handle_idle_timeout()
-        } else {
-            STREAM_INACTIVITY_TIMEOUT
-        }
+        self.quic
+            .as_ref()
+            .map_or(STREAM_INACTIVITY_TIMEOUT, |quic| quic.gap())
     }
 
     fn from_buffer(stream_id: StreamId, buffer: LockFreeStreamBuffer) -> Self {
@@ -610,12 +678,12 @@ impl StreamHandle {
     /// This is useful when you don't need incremental processing.
     /// Uses the buffer's built-in Notify for efficient async waiting.
     ///
-    /// On a UDP-fed stream it includes an inactivity timeout
-    /// ([`STREAM_INACTIVITY_TIMEOUT`]): if no new fragment arrives within the
-    /// timeout window, returns [`StreamError::InactivityTimeout`]. This
+    /// It includes an inactivity timeout of [`Self::fragment_gap_limit`]
+    /// ([`STREAM_INACTIVITY_TIMEOUT`] on a UDP-fed stream): if no new fragment
+    /// arrives within it, returns [`StreamError::InactivityTimeout`]. This
     /// prevents operations from hanging forever when the sending peer's
     /// connection dies mid-transfer. A QUIC-fed stream ([`Self::new_quic`])
-    /// has no timer here: it ends when its reader records why it stopped
+    /// also ends as soon as its reader records why it stopped
     /// (`InactivityTimeout` for idle, `Cancelled` otherwise).
     pub async fn assemble(&self) -> Result<Vec<u8>, StreamError> {
         self.assemble_inner(|| {}).await
@@ -675,18 +743,14 @@ impl StreamHandle {
 
             before_wait();
 
-            // A QUIC-fed stream has no gap limit here: quinn retransmits until
-            // the reader's own rules end the stream, and the reader then
-            // records why (checked above) and wakes this listener.
-            if self.quic.is_some() {
-                listener.await;
-                continue;
-            }
-
-            // Wait for notification with inactivity timeout.
-            // Each arriving fragment triggers a notification, so the timeout resets
-            // on every fragment. Only fires when the stream is truly stalled.
-            match tokio::time::timeout(STREAM_INACTIVITY_TIMEOUT, listener).await {
+            // Wait for notification with inactivity timeout: 5 s on UDP, the
+            // path's own gap on QUIC, read again each time. Each arriving
+            // fragment triggers a notification, so the timeout resets on
+            // every fragment. Only fires when the stream is truly stalled. A
+            // QUIC reader that stops records why (checked above) and wakes
+            // this listener first.
+            let gap = self.fragment_gap_limit();
+            match tokio::time::timeout(gap, listener).await {
                 Ok(()) => { /* fragment arrived or stream cancelled — loop to check */ }
                 Err(_) => {
                     // Re-check before declaring timeout. The listener is created
@@ -707,7 +771,7 @@ impl StreamHandle {
                         total_bytes = self.total_bytes,
                         received_fragments = self.buffer.inserted_count(),
                         total_fragments = self.buffer.total_fragments(),
-                        timeout_secs = STREAM_INACTIVITY_TIMEOUT.as_secs(),
+                        timeout_ms = gap.as_millis() as u64,
                         "Stream assembly timed out — no fragments received within inactivity window"
                     );
                     crate::node::network_status::record_stream_recv_abort_inactivity(
@@ -1943,17 +2007,18 @@ mod tests {
         );
     }
 
-    /// A QUIC-fed stream has no 5 s gap at the consumer: its handle and a
-    /// fork wait through gaps of 6 s and 25 s and assemble, where a UDP-fed
-    /// stream fails at 5 s (above). quinn's retransmit backoff at a high RTT
-    /// with loss leaves such gaps in a stream it then delivers.
+    /// A QUIC-fed stream on a slow path (2 s round trip, so a gap of 30 s,
+    /// the reader's idle limit) has no 5 s gap at the consumer: its handle
+    /// and a fork wait through gaps of 6 s and 25 s and assemble, where a
+    /// UDP-fed stream fails at 5 s (above). quinn's retransmit backoff at a
+    /// high RTT with loss leaves such gaps in a stream it then delivers.
     #[tokio::test(start_paused = true)]
     async fn quic_fed_assemble_waits_past_the_udp_gap() {
         use super::super::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
         use std::time::Duration;
 
         let total = (FRAGMENT_PAYLOAD_SIZE * 3) as u64;
-        let handle = StreamHandle::new_quic(make_stream_id(), total);
+        let handle = quic_handle_on_path(total, Duration::from_secs(2));
         let fork = handle.fork();
         let (a, b) = (handle.clone(), fork.clone());
         let consumers = tokio::spawn(async move { tokio::join!(a.assemble(), b.assemble()) });
@@ -2070,22 +2135,103 @@ mod tests {
         );
     }
 
-    /// The gap a consumer of `chunks()` should time out at: 5 s for a
-    /// UDP-fed stream, the QUIC reader's idle limit for a QUIC-fed one, and
-    /// forks keep it.
+    /// A QUIC-fed handle whose reader set its path: round trip `rtt`, idle
+    /// limit 30 s (production's).
+    fn quic_handle_on_path(total: u64, rtt: std::time::Duration) -> StreamHandle {
+        let handle = StreamHandle::new_quic(make_stream_id(), total);
+        handle
+            .quic_source()
+            .expect("QUIC-fed")
+            .set_path(QuicSourcePath {
+                rtt: Arc::new(PathRtt::new(rtt)),
+                idle: std::time::Duration::from_secs(30),
+            });
+        handle
+    }
+
+    /// The gap a consumer should time out at: 5 s for a UDP-fed stream; for
+    /// a QUIC-fed one, 16 round trips of its path, at least 5 s and at most
+    /// the reader's idle limit, read at each call (the path's round trip
+    /// moves), and 5 s before the reader has set the path. Forks keep it.
     #[test]
     fn fragment_gap_limit_follows_the_transport() {
+        use std::time::Duration;
         let udp = StreamHandle::new(make_stream_id(), 10);
         assert_eq!(udp.fragment_gap_limit(), STREAM_INACTIVITY_TIMEOUT);
         assert_eq!(udp.fork().fragment_gap_limit(), STREAM_INACTIVITY_TIMEOUT);
-        let quic = StreamHandle::new_quic(make_stream_id(), 10);
-        let idle = super::super::streaming_handle_idle_timeout();
-        assert!(idle > STREAM_INACTIVITY_TIMEOUT);
-        assert_eq!(quic.fragment_gap_limit(), idle);
-        assert_eq!(quic.fork().fragment_gap_limit(), idle);
+        let unset = StreamHandle::new_quic(make_stream_id(), 10);
+        assert_eq!(unset.fragment_gap_limit(), STREAM_INACTIVITY_TIMEOUT);
+        for (rtt, gap) in [
+            (Duration::from_millis(50), Duration::from_secs(5)),
+            (Duration::from_millis(800), Duration::from_millis(12_800)),
+            (Duration::from_secs(5), Duration::from_secs(30)),
+        ] {
+            let quic = quic_handle_on_path(10, rtt);
+            assert_eq!(quic.fragment_gap_limit(), gap, "{rtt:?}");
+            assert_eq!(quic.fork().fragment_gap_limit(), gap, "{rtt:?}");
+        }
+        let rtt = Arc::new(PathRtt::new(Duration::from_millis(50)));
+        let moving = StreamHandle::new_quic(make_stream_id(), 10);
+        moving
+            .quic_source()
+            .expect("QUIC-fed")
+            .set_path(QuicSourcePath {
+                rtt: rtt.clone(),
+                idle: Duration::from_secs(30),
+            });
+        rtt.set(Duration::from_secs(1));
+        assert_eq!(moving.fragment_gap_limit(), Duration::from_secs(16));
         // A UDP-fed stream has no source to end.
         udp.end_quic_source(QuicSourceEnd::Idle);
         assert!(udp.quic_source().is_none());
+    }
+
+    /// A QUIC-fed stream on a fast path fails as fast as a UDP-fed one: a
+    /// consumer gets `InactivityTimeout` 5 s after the last fragment, with
+    /// the reader still running.
+    #[tokio::test(start_paused = true)]
+    async fn a_quic_fed_stream_on_a_fast_path_times_out_at_five_seconds() {
+        use super::super::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
+        let handle = quic_handle_on_path(
+            (FRAGMENT_PAYLOAD_SIZE * 2) as u64,
+            std::time::Duration::from_millis(20),
+        );
+        handle
+            .push_fragment(1, Bytes::from(vec![1u8; FRAGMENT_PAYLOAD_SIZE]))
+            .unwrap();
+        let start = tokio::time::Instant::now();
+        let ended =
+            tokio::time::timeout(std::time::Duration::from_secs(60), handle.fork().assemble())
+                .await
+                .expect("bounded by the gap");
+        assert_eq!(ended, Err(StreamError::InactivityTimeout));
+        assert_eq!(start.elapsed(), STREAM_INACTIVITY_TIMEOUT);
+    }
+
+    /// Recording the end wakes a waiting fork by itself, with no cancel: a
+    /// fork does not share the handle's cancel, so the notify in
+    /// `end_quic_source` is the only thing that wakes it before its gap.
+    #[tokio::test(start_paused = true)]
+    async fn a_recorded_end_alone_wakes_a_waiting_fork() {
+        use super::super::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
+        let handle = quic_handle_on_path(
+            (FRAGMENT_PAYLOAD_SIZE * 2) as u64,
+            std::time::Duration::from_secs(2),
+        );
+        handle
+            .push_fragment(1, Bytes::from(vec![1u8; FRAGMENT_PAYLOAD_SIZE]))
+            .unwrap();
+        let fork = handle.fork();
+        let waiting = tokio::spawn(async move { fork.assemble().await });
+        tokio::task::yield_now().await;
+        let start = tokio::time::Instant::now();
+        handle.end_quic_source(QuicSourceEnd::Age);
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(60), waiting)
+            .await
+            .expect("bounded")
+            .unwrap();
+        assert_eq!(ended, Err(StreamError::Cancelled));
+        assert_eq!(start.elapsed(), std::time::Duration::ZERO);
     }
 
     #[tokio::test]

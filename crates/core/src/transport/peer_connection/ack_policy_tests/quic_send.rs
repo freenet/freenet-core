@@ -1332,10 +1332,10 @@ fn pipes_whose_source_stalls_do_not_close_the_path() {
     );
 }
 
-/// A pipe from a QUIC-fed source waits for the source's own gap limit, not
-/// 5 s: an 8 s gap between two pieces (quinn's retransmit backoff at a high
-/// RTT with loss) ends `Sent`, where a UDP-fed source would time out. So does
-/// an 8 s wait for the first piece.
+/// A pipe from a QUIC-fed source on a slow path waits for the source's own
+/// gap (16 round trips), not 5 s: an 8 s gap between two pieces (quinn's
+/// retransmit backoff at a high RTT with loss) ends `Sent`, where a UDP-fed
+/// source would time out. So does an 8 s wait for the first piece.
 #[test]
 fn a_pipe_from_a_quic_fed_source_waits_out_a_gap_past_five_seconds() {
     run(
@@ -1344,9 +1344,22 @@ fn a_pipe_from_a_quic_fed_source_waits_out_a_gap_past_five_seconds() {
         QuicPathLimits::DEFAULT,
         |mut rig| async move {
             let total = 2 * FRAGMENT_PAYLOAD_SIZE;
-            // `mid` has its first piece, `first` has nothing yet.
+            // `mid` has its first piece, `first` has nothing yet. Both come
+            // over a slow path (800 ms round trip, so a 12.8 s gap).
+            let on_slow_path = |handle: &StreamHandle| {
+                use crate::transport::peer_connection::streaming::{PathRtt, QuicSourcePath};
+                handle
+                    .quic_source()
+                    .expect("QUIC-fed")
+                    .set_path(QuicSourcePath {
+                        rtt: Arc::new(PathRtt::new(Duration::from_millis(800))),
+                        idle: Duration::from_secs(30),
+                    });
+            };
             let mid = StreamHandle::new_quic(StreamId::next(), total as u64);
             let first = StreamHandle::new_quic(StreamId::next(), total as u64);
+            on_slow_path(&mid);
+            on_slow_path(&first);
             mid.push_fragment(1, Bytes::from(vec![1u8; FRAGMENT_PAYLOAD_SIZE]))
                 .unwrap();
             for source in [&mid, &first] {

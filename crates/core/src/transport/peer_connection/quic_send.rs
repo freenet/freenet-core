@@ -309,8 +309,10 @@ pub(super) async fn pipe_stream_on_path<S: Socket, T: TimeSource>(
     let bytes = inbound_handle.total_bytes();
     let transfer = PathTransfer::start(stream_id, udp.remote_addr, bytes, udp.time_source.clone());
     let mut source = WatchedSource::new(inbound_handle.chunks());
-    // The source's own gap: 5 s for a UDP-fed stream, the reader's idle limit
-    // for a QUIC-fed one, whose chunks end when its reader does.
+    // The source's own gap: 5 s for a UDP-fed stream, the source path's gap
+    // (16 round trips, at least 5 s) for a QUIC-fed one, whose chunks also
+    // end when its reader does. This sink is a QUIC path, which allows the
+    // same; a fallback to UDP pipes with UDP's 5 s.
     let deadlines =
         SendDeadlines::stream(bytes).with_source_gap(inbound_handle.fragment_gap_limit());
     let outcome = route

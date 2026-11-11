@@ -2371,26 +2371,41 @@ fn assemble_both(
     tokio::spawn(async move { tokio::join!(handle.assemble(), fork.assemble()) })
 }
 
-/// A QUIC-fed stream whose sender is silent for longer than the UDP
-/// transport's fragment gap (`STREAM_INACTIVITY_TIMEOUT`, 5 s) and shorter
-/// than the path's idle limit still assembles, through the handle and a fork.
-/// quinn's retransmit backoff at a high RTT with loss leaves such gaps in a
-/// stream it then delivers. The gap passes on both clocks: the path's virtual
-/// one, under the idle limit, and tokio's paused one, which `assemble()`'s
-/// UDP timer runs on.
+/// A QUIC-fed stream on a slow path (400 ms each way, so the reader gives
+/// its consumers 16 round trips, 12.8 s) whose sender is silent for 8 s,
+/// longer than the UDP transport's fragment gap (`STREAM_INACTIVITY_TIMEOUT`,
+/// 5 s), still assembles, through the handle and a fork. quinn's retransmit
+/// backoff at a high RTT with loss leaves such gaps in a stream it then
+/// delivers. The gap passes on both clocks: the path's virtual one, and
+/// tokio's paused one, which `assemble()`'s timer runs on. The reader set the
+/// path's round trip on the handle, so this fails if it does not.
 #[test]
 fn a_quic_fed_stream_assembles_across_a_gap_past_the_udp_limit() {
     bounded(|| async move {
         use crate::transport::peer_connection::streaming::STREAM_INACTIVITY_TIMEOUT;
         let _seed = GlobalRng::seed_guard(SEED);
-        let mut p = paths("quic-path-gap", 200, QuicPathLimits::DEFAULT).await;
+        let network = "quic-path-gap";
+        // Before the handshake, so its round trip is quinn's first sample.
+        crate::transport::in_memory_socket::set_packet_delivery_callback(
+            network,
+            Some(Arc::new(|_, _, _, _| {
+                crate::transport::in_memory_socket::PacketDeliveryDecision::DelayedDelivery(
+                    Duration::from_millis(400),
+                )
+            })),
+        );
+        let mut p = paths(network, 200, QuicPathLimits::DEFAULT).await;
         tokio::time::pause();
-        let idle = streaming_handle_idle_timeout();
-        let gap = idle - Duration::from_secs(5);
-        assert!(gap > STREAM_INACTIVITY_TIMEOUT * 4, "premise: {gap:?}");
+        let gap = Duration::from_secs(8);
+        assert!(gap > STREAM_INACTIVITY_TIMEOUT, "premise: {gap:?}");
         let body = payload(10_000);
         let (mut send, arrival) = half_sent_stream(&mut p, &body, 5000).await;
         assert!(!arrival.handle.is_complete(), "premise: half sent");
+        assert!(
+            arrival.handle.fragment_gap_limit() > gap,
+            "the reader gave the handle its path's gap: {:?}",
+            arrival.handle.fragment_gap_limit()
+        );
         let assembled = assemble_both(&arrival);
         let time = p.time();
         let rest = body[5000..].to_vec();
@@ -5107,6 +5122,48 @@ fn the_source_gap_applies_only_to_source_waits() {
             "{on_write:?}"
         );
         assert_eq!(took, Duration::from_secs(5));
+    })
+}
+
+/// A source wait that ends re-arms the timer at the send's own gap: the
+/// source gap (30 s) armed during the wait does not carry over to a write
+/// that stalls after the chunk arrives, which fails at its own gap (5 s
+/// after the chunk), not at 30 s.
+#[test]
+fn the_end_of_a_source_wait_rearms_the_timer_at_the_own_gap() {
+    bounded(|| async move {
+        let time = VirtualTime::new();
+        let clock = time.clone();
+        let (outcome, took) = drive(&time, LIMIT, async move {
+            let deadlines = SendDeadlines {
+                open: Duration::from_secs(2),
+                gap: Some(Duration::from_secs(5)),
+                source_gap: None,
+                total: Duration::from_secs(120),
+            }
+            .with_source_gap(Duration::from_secs(30));
+            let start = clock.now();
+            let sleeps = clock.clone();
+            let outcome = bounded_send(&clock, deadlines, None, |progress| async move {
+                progress.mark_opened();
+                progress.waiting_on_source(true);
+                // Long enough for the loop to arm at the source gap.
+                sleeps.sleep(Duration::from_secs(1)).await;
+                progress.waiting_on_source(false);
+                progress.step();
+                // A write that stalls.
+                sleeps.sleep(Duration::from_secs(60)).await;
+                Ok(())
+            })
+            .await;
+            (outcome, clock.now() - start)
+        })
+        .await;
+        assert!(
+            matches!(outcome, BoundedSend::Failed(SendFailure::TimedOut)),
+            "{outcome:?}"
+        );
+        assert_eq!(took, Duration::from_secs(6));
     })
 }
 

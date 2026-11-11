@@ -937,6 +937,7 @@ impl QuicPath {
         let inbound_ranges = receiver.ranges();
         #[cfg(test)]
         let inbound_staging = receiver.staging();
+        let receiver_rtt = receiver.path_rtt();
         let aborts = Arc::new(SendAborts::new(
             limits.max_send_aborts,
             connection.closer(),
@@ -978,6 +979,7 @@ impl QuicPath {
             time,
             recycle::AckWatchParts {
                 cap_holds: connection.cap_holds(),
+                rtt: receiver_rtt,
                 heard: heard.clone(),
                 report,
             },
@@ -1778,6 +1780,7 @@ async fn supervise_receive<T: TimeSource>(
     // report: it ends with this task ([`recycle::PathReport`]).
     let recycle::AckWatchParts {
         cap_holds,
+        rtt,
         heard,
         mut report,
     } = watch;
@@ -1787,6 +1790,7 @@ async fn supervise_receive<T: TimeSource>(
         time,
         cap_holds,
         heard,
+        rtt,
         &mut report,
     ))
     .catch_unwind();
