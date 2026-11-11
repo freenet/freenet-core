@@ -85,12 +85,12 @@ pub(crate) use liveness::QuicAvailabilityWatch;
 
 /// Whether the node may use QUIC: the `transport-quic` config key.
 ///
-/// An unset key is [`QuicMode::default_mode`]: shadow on Linux and macOS, and
-/// off elsewhere. Windows stays off until the crash-loop breaker has been
-/// confirmed on a real Windows machine (#6031), and other platforms because
-/// the breaker reads no boot identity there and so cannot trip. The Windows
-/// breaker counts short runs that panicked in QUIC code instead of detecting
-/// crashes ([`breaker`]). The default is decided when the value is read and
+/// An unset key is [`QuicMode::default_mode`]: shadow on Linux, macOS and
+/// Windows, and off elsewhere, because the breaker reads no boot identity
+/// there and so cannot trip. The Windows breaker counts short runs that
+/// panicked in QUIC code instead of detecting crashes ([`breaker`]); it was
+/// confirmed on a real Windows machine before Windows defaulted to shadow
+/// (#6031). The default is decided when the value is read and
 /// never written to `config.toml`, so a later release can change it
 /// for every node that did not set the key, which is how a default-off
 /// release turns QUIC off. A value given with `--transport-quic` or
@@ -99,7 +99,7 @@ pub(crate) use liveness::QuicAvailabilityWatch;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuicMode {
     /// No QUIC endpoint is built and no QUIC datagram is read. The default on
-    /// platforms other than Linux and macOS.
+    /// platforms other than Linux, macOS and Windows.
     Off,
     /// The node builds a QUIC endpoint on its UDP port and upgrades a UDP
     /// session to a QUIC path that carries only control frames: all
@@ -110,7 +110,8 @@ pub enum QuicMode {
     /// endpoint driver and one upgrade task per connection run; a promoted
     /// connection's higher key sends `Upgrade` messages on its UDP session; and
     /// the endpoint's memory. If the endpoint cannot be built the node logs a
-    /// warning and runs with QUIC off. The default on Linux and macOS.
+    /// warning and runs with QUIC off. The default on Linux, macOS and
+    /// Windows.
     Shadow,
     /// Negotiates data on a path to a peer in the release's slice
     /// (`upgrade::slice`), and sends its data on a path where both sides did. At a
@@ -134,11 +135,16 @@ impl QuicMode {
     /// See [`QuicMode::Prefer`].
     pub const PREFER: &'static str = "prefer";
 
-    /// What an unset `transport-quic` means on this platform: shadow on Linux
-    /// and macOS, and off elsewhere (Windows until #6031; other platforms
-    /// because the crash-loop breaker cannot trip there).
+    /// What an unset `transport-quic` means on this platform: shadow on Linux,
+    /// macOS and Windows, and off elsewhere, because the crash-loop breaker
+    /// cannot trip there. Windows joined once its breaker was confirmed on a
+    /// real Windows machine (#6031).
     pub const fn default_mode() -> Self {
-        if cfg!(any(target_os = "linux", target_os = "macos")) {
+        if cfg!(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "windows"
+        )) {
             Self::Shadow
         } else {
             Self::Off

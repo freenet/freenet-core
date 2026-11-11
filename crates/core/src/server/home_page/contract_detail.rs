@@ -300,8 +300,8 @@ pub fn contract_detail_html_from(
 ///    explicitly NOT reported as fine.
 /// 3. Checked, no findings for this contract.
 /// 4. Checked, with one or more findings, each carrying the property that
-///    broke, its severity, and whether its law is report-only (the retained
-///    `would_remove` decision, inverted; nothing is removed).
+///    broke, its severity, and whether it is report-only (the finding's
+///    `persistent` class, inverted).
 ///
 /// `without_verdict_last_tick` — focus contracts the checker formed no opinion
 /// about in its most recent tick — is surfaced
@@ -513,10 +513,10 @@ fn merge_law_card(merge_enabled: bool, merge_view: Option<&status::MergeCheckVie
             // were the second is the misreading this whole change exists to
             // prevent.
             //
-            // A `Violation` is not removal-eligible just for being one: some laws
-            // are report-only (`conformance::policy::removal_tier`). The decision
-            // that was actually made travels as `would_remove`, so the generic
-            // label reads that rather than restating a rule the policy owns.
+            // A `Violation` is not persistent just for being one: some laws are
+            // report-only (`conformance::policy::finding_class`). The class that
+            // was actually assigned travels as `persistent`, so the generic label
+            // reads that rather than restating a rule the policy owns.
             let (pill_class, label) = match (f.severity, f.settling) {
                 (Severity::Violation, Some(IdempotenceSettling::SettledAfter(_))) => (
                     "fresh-stale",
@@ -528,16 +528,16 @@ fn merge_law_card(merge_enabled: bool, merge_view: Option<&status::MergeCheckVie
                 (Severity::Violation, Some(IdempotenceSettling::Indeterminate)) => {
                     ("fresh-stale", "Violation — settling unknown")
                 }
-                (Severity::Violation, _) if f.would_remove => ("fresh-stale", "Violation"),
+                (Severity::Violation, _) if f.persistent => ("fresh-stale", "Violation"),
                 (Severity::Violation, _) => ("fresh-stale", "Violation (report-only)"),
                 (Severity::Diagnostic, _) => ("use-idle", "Diagnostic — legal but wasteful"),
             };
             rows.push_str(&format!(
                 r#"<tr><td>{property}</td><td><span class="fresh-pill {pill_class}">{label}</span></td><td class="right">{report_only}</td></tr>"#,
                 property = html_escape(f.property),
-                // `would_remove` is the retained tier decision: false for every
+                // `persistent` is the finding's class: false for every
                 // report-only law and every diagnostic.
-                report_only = if f.would_remove { "no" } else { "yes" },
+                report_only = if f.persistent { "no" } else { "yes" },
             ));
         }
         format!(
@@ -634,7 +634,7 @@ mod tests {
             property: PROPERTY,
             severity: Severity::Violation,
             settling: None,
-            would_remove: false,
+            persistent: false,
         });
         status::publish([record], 1, 0, tokio::time::Instant::now());
 

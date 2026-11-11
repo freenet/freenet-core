@@ -1117,16 +1117,16 @@ it must not wait unless it is a pacing point.
 #### QUIC endpoint (`transport/quic.rs`, #5940 step c2)
 
 `transport-quic` (config key: `off`, `shadow` or `prefer`; unset is
-`QuicMode::default_mode`, shadow on Linux and macOS and off elsewhere, since
-the breaker cannot trip without a boot identity) decides whether `bind_udp_listener` builds a quinn endpoint over the DemuxSocket.
+`QuicMode::default_mode`, shadow on Linux, macOS and Windows and off
+elsewhere, since the breaker cannot trip without a boot identity) decides whether `bind_udp_listener` builds a quinn endpoint over the DemuxSocket.
 `prefer` negotiates data with the release's share of pairs ("Data slice" below;
 `upgrade::policy::log_startup` reports the share at INFO once per node), and a pair
 with both bits sends its data on the path ("QUIC send route" below). At a share of
 0, with no `quic-data-percent`, `prefer` differs from `shadow` only by the bit, which
 stays 0. The release that raises the share above 0 must say in its notes that
 existing `prefer` configs start carrying data. Off: no endpoint, no QUIC ingress, nothing
-changes. QUIC must stay off by default on Windows until the crash-loop
-breaker has been confirmed on a real Windows machine (#6031). The default is
+changes. Windows is shadow by default too since its crash-loop breaker was
+confirmed on a real Windows machine (#6031). The default is
 read, never written to config.toml: a node that did not set the key follows the
 release it runs, so a default-off release is the kill switch. It does not reach
 a node that ever ran with `--transport-quic` or `FREENET_TRANSPORT_QUIC`: those
@@ -1434,6 +1434,14 @@ a test passes its own; tests read their own, never the global).
   level in the period, and the highest count a reset in the period took a path
   to). They are for the fixed charge, which takes quinn's stopped map at
   SEND_ABORT_LIMIT x QUIC_STOPPED_ENTRY_BYTES until field data justifies less.
+  quic_gate_loss_<queue|share|persistent|no_sample|ignored> (congestion events by
+  the loss gate's verdict, recycle::loss_gate, reported by the path's report at
+  each tick; they sum to quic_congestion_events, since quinn counts an event
+  where it calls the controller) and quic_gate_ended_queue_<lt_10pct|lt_50pct|
+  ge_50pct> (paths that ended in the period after at least 20 verdicts, by the
+  share passed as a queue). A path whose losses mostly read as a queue runs as
+  plain Cubic, from a real queue or from jitter; with the path's loss rate this
+  sizes how often jitter defeats the gate in the field.
   A family is the keys of one label list under one prefix
   (`QuicDataSnapshot::keys_by_family`). No other key starts with a family's
   prefix or with the prefix sibling families share (`quic_data_` for the send,
@@ -1679,24 +1687,31 @@ peer presents a key that is not its transport key.
 
 #### QUIC rollout (#5940)
 
-There are no opt-in stages; releases do the rollout. QUIC stays off by default
-on Windows throughout, until its breaker is confirmed on a real Windows machine
-(#6031). Before default-on there, run on real Windows 10 and 11: the
-`quic_breaker_windows` test; logoff, shutdown and restart with Fast Startup on
-and off; tray Restart, Stop and Quit; `freenet service stop` and `restart`; an
-update exit; a real abort; and sleep during a run. Then weigh what that breaker
-never catches: a crash loop with runs of 10 minutes or more, and a fault that
-crashes once a day. Every step watches: peers disappearing per version
+There are no opt-in stages; releases do the rollout. Windows is shadow by
+default since its breaker (a short run counts only if it panicked in QUIC code)
+was confirmed on a real Windows machine (#6031: Windows Server 2022, kills, a
+reboot, a logoff, `service restart`/`stop` never counted; injected aborts and a
+crash loop under the run wrapper tripped). Not run on a machine, covered by the
+rule that only a QUIC panic counts: Fast Startup, sleep, tray Restart/Stop/Quit
+and an update exit. What it never catches: a crash not preceded by a QUIC
+panic, a crash loop with runs of 10 minutes or more, and a fault that crashes
+once a day. Every step watches: peers disappearing per version
 against the previous rollout (a node that dies before reporting is absent from
 every rate), endpoint-down, panics and breaker trips, RSS against
 `quic_paths_active`, CPU and egress, and NAT success, connections and transfers.
+From the first release with the Windows default, the release watch also reads
+Windows separately: `quic_adapter_panicked` and `quic_breaker_trips` by version
+against the previous release, and peers with `quic_breaker_suppressed`. A
+Windows QUIC panic in the field is read (location, version) before the next
+release goes out.
 
 - Step 0: the first negotiating release ships with QUIC off. Its nodes answer
   offers (`Decline{disabled}` with the key off); `upgrade_control_received`
   stays near 0 and UDP metrics do not change.
 - Step 1: nova gateways and framework in shadow for 24-48 h. The 24 h gateway
   A/B runs only if something looks odd. Rollback: set the key to off and restart.
-- Step 2: shadow on by default on Linux and macOS (`QuicMode::default_mode`). Gate: at least 95% upgrade
+- Step 2: shadow on by default on Linux and macOS, then Windows once its
+  breaker was confirmed on a real machine (`QuicMode::default_mode`). Gate: at least 95% upgrade
   success by `established_as_offerer / accepted`; fewer than 1 fallback per
   path-day excluding endpoint and restart causes; memory within the measured
   terms (about 0.3 to 0.5 MiB per idle path). An abort spike stops the step.
@@ -2295,7 +2310,7 @@ QUIC send route (#5940 e5b-6, quic/upgrade/data_route.rs,
   waiting for its source does not count (WatchedSource). It costs a normal
   backoff.
   Fast path: Session::routed is an atomic set only while the live attempt holds a
-  route, so a connection with no route (shadow, the default on Linux and macOS)
+  route, so a connection with no route (shadow, the default on Linux, macOS and Windows)
   sends without taking the session's lock. enable_data runs once per activation
   (debug assertion); a second route would orphan the first one's worker.
   A path gone dark: the first send timeout that counts toward the stall close
@@ -2396,7 +2411,7 @@ QUIC receive flow (#5940 e5b-4):
 
 #### QUIC errors, close codes and liveness (`quic/error.rs`, `quic/liveness.rs`, #5940 step e4)
 
-Live in production on Linux and macOS, where shadow is the default: the
+Live in production on Linux, macOS and Windows, where shadow is the default: the
 paths carry control frames only, but endpoints, connections and their errors
 are real. With `transport-quic` off no endpoint is built and the transport
 reports `Disabled`.

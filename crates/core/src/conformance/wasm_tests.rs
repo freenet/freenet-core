@@ -128,6 +128,14 @@ async fn verifier_matches_real_wasm_for_every_planted_defect()
     // non-trivial number of generated cases — the false-positive gate against
     // real WASM execution, not just against the pure-Rust fakes in `tests.rs`.
     let mut conforming = RuntimeOracle::standalone(wasm.clone(), vec![CONFORMING]).await?;
+    // The oracle answers `reads_host_clock` from the code it was built over, which
+    // is what keeps a clock-gated refusal from being reported (#5725). This fixture
+    // imports the clock (mode 4 reads it), so the answer must be `true` here.
+    {
+        use super::oracle::ConformanceOracle;
+        assert!(super::imports_host_clock(&wasm));
+        assert!(conforming.reads_host_clock());
+    }
     let corpus = Corpus {
         deltas: vec![bytes(&[9]), bytes(&[7])],
         ..Corpus::from_states(vec![
@@ -260,8 +268,8 @@ async fn verifier_matches_real_wasm_for_every_planted_defect()
     // cap evicts by an index derived from the set's own contents — independent of
     // the merge's ordering — and merging the reached state back into its base
     // genuinely does not reproduce it. That is the same information loss
-    // `StateAssociativity` already reports for this mode, so the contract is
-    // removal-eligible either way; what matters is that it is a real divergence and
+    // `StateAssociativity` already reports for this mode, so the contract has
+    // a persistent finding either way; what matters is that it is a real divergence and
     // not an artifact of capping.
     //
     // The cap applies to the mode's DELTA path as well as its merge path, which is
@@ -570,5 +578,29 @@ async fn a_contract_sees_the_overridden_clock_through_real_wasm()
         "the real clock was not restored when the guard dropped"
     );
 
+    Ok(())
+}
+
+/// `RuntimeOracle` answers `reads_host_clock` from the code: `false` for a module
+/// that does not import the clock. The fixture used elsewhere in this file imports
+/// it, so without this test a hard-coded `true` would pass.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_clock_free_contract_does_not_read_the_host_clock()
+-> Result<(), Box<dyn std::error::Error>> {
+    use super::oracle::ConformanceOracle;
+    // The smallest module `RuntimeOracle::standalone` accepts as a contract: a
+    // memory and the four entry points, and no imports at all.
+    let wasm = wat::parse_str(
+        "(module\n  \
+           (memory (export \"memory\") 1)\n  \
+           (func (export \"validate_state\") (result i32) i32.const 0)\n  \
+           (func (export \"update_state\") (result i32) i32.const 0)\n  \
+           (func (export \"summarize_state\") (result i32) i32.const 0)\n  \
+           (func (export \"get_state_delta\") (result i32) i32.const 0)\n\
+         )\n",
+    )?;
+    assert!(!super::imports_host_clock(&wasm));
+    let oracle = RuntimeOracle::standalone(wasm, vec![]).await?;
+    assert!(!oracle.reads_host_clock());
     Ok(())
 }

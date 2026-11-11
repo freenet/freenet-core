@@ -18,9 +18,9 @@
 //!
 //! **Windows is weaker than unix.** There, a crash not preceded by a panic in
 //! QUIC code is not counted, a crash loop whose runs each last ten minutes or
-//! more never trips, and neither does a fault that crashes once a day. That must be weighed before QUIC goes on by default on Windows. QUIC
-//! stays off by default there until the breaker has been confirmed on a real
-//! Windows machine (#6031).
+//! more never trips, and neither does a fault that crashes once a day. QUIC
+//! became shadow by default on Windows after this breaker was confirmed on a
+//! real Windows machine (#6031), with those limits weighed.
 //!
 //! # The marker
 //!

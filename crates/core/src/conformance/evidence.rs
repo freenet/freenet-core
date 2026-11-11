@@ -284,7 +284,7 @@ impl ConformanceEvidence {
         // sound, because production would never apply them in the other order.
         // Either way, every peer receiving the fabrication would independently reach
         // a violation verdict against a correct contract. Both properties are also
-        // report-only (`policy::removal_tier`), which is the second guard, not a
+        // report-only (`policy::finding_class`), which is the second guard, not a
         // reason to drop this one.
         //
         // Refused rather than deprioritised: a lower rank still lets it in, and the

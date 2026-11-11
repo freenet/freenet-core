@@ -597,9 +597,7 @@ async fn run_writer(
     let mut since_flush = 0usize;
     // Shadow mode rides the capture task: it already owns the samples, and it is
     // already off the merge path, which is the property that matters most. The
-    // mode is `default()` — Shadow — and there is deliberately no way to reach
-    // `Enforce` from here. Enforce is retained, unreachable and not planned (see
-    // `policy`'s module docs).
+    // mode is `default()`, which is Shadow.
     let mut shadow = crate::conformance::shadow::ShadowRunner::new(
         &dir,
         crate::conformance::policy::EnforcementMode::default(),
@@ -954,10 +952,12 @@ async fn run_writer(
                     probed = report.probed,
                     cases = report.cases,
                     inconclusive = report.inconclusive,
-                    // Findings whose law is not report-only; report-only ones,
-                    // the idempotence class that settles after a rewrite
-                    // included, are in `reported`. Nothing is removed for either.
-                    would_remove = report.would_remove,
+                    // Persistent findings (`policy::finding_class`); report-only
+                    // ones, the idempotence class that settles after a rewrite
+                    // included, are in `reported`. Nothing is acted on for either.
+                    // Logged as `would_remove` before the removal plan's code was
+                    // deleted; same series.
+                    persistent = report.persistent,
                     reported = report.reported,
                     // The report-only violations inside `reported`; the rest of
                     // it is diagnostics.

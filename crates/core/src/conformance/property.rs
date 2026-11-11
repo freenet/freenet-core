@@ -15,6 +15,27 @@ pub enum ConformanceProperty {
     /// `merge(A, A) == A`
     StateIdempotence,
     /// `merge(A, B) == merge(B, A)`
+    ///
+    /// When the contract REFUSES one of the two merges (a `ContractError`) for two
+    /// states it validates, the two peers holding them are simulated exchanging
+    /// states until they agree or neither moves (#5725). Each receive tries the delta
+    /// computed from the receiver's summary first, as production does, and then the
+    /// whole state whenever the delta does not get through. That is deliberately
+    /// more generous than the protocol, which sends nothing more after an empty or
+    /// no-op delta, so "stuck" means neither route gets through.
+    /// Agreeing is the honest transient refusal (River's ban-cap skew) and stays
+    /// [`Inconclusive::ContractError`]. Stopping while apart is a stable
+    /// disagreement, the freenet/river#423 class, and is a violation of this law
+    /// between the two states the peers end on, unless the contract reads the host
+    /// clock, where it stays [`Inconclusive::ContractError`] because a clock-gated
+    /// refusal clears as time passes. Running out of `MAX_REFUSAL_EXCHANGE_ROUNDS`
+    /// is [`Inconclusive::RoundLimit`].
+    ///
+    /// Unlike the plain comparison, this part rests on a model of the protocol, the
+    /// same one [`ConformanceProperty::ReconciliationCycle`] uses. It also makes
+    /// [`Inconclusive::InputNotValid`] and [`Inconclusive::RelatedRequired`]
+    /// reachable for a commutativity case whose inputs validate: a state reached
+    /// during the exchange can be invalid or need related state.
     StateCommutativity,
     /// `merge(merge(A, B), C) == merge(A, merge(B, C))`, or the two groupings heal:
     /// they converge in one exchange to a state that, re-merged with both groupings
@@ -48,9 +69,9 @@ pub enum ConformanceProperty {
     /// when a later removal (a ban) or a raised cap frees it, while the other
     /// grouping still holds the entry. Measured on River's room contract
     /// (freenet/river#793): 956 of 3200 generated triples fail strictly, about 30%,
-    /// and every one converges on the next exchange. Enforcing the strict form would
-    /// make every capped chat, feed or log removable, and a participant able to
-    /// trigger a removal could build a failing triple on purpose. Ian's decision,
+    /// and every one converges on the next exchange. Checking the strict form would
+    /// flag every capped chat, feed or log, and a participant able to trigger an
+    /// eviction could build a failing triple on purpose. Ian's decision,
     /// 2026-10-16: heal-guarded, not diagnostic-only, severity unchanged; 2026-10-17:
     /// healing means converge AND stable.
     ///
@@ -103,9 +124,9 @@ pub enum ConformanceProperty {
     /// does not state the law.
     ///
     /// The property stays [`Severity::Diagnostic`] and report-only only because
-    /// nodes act on no conformance verdict (the removal plan is superseded, see
-    /// `policy`'s module docs). The severity is not a judgment that non-idempotent
-    /// deltas are acceptable: a finding here is a bug the author should fix.
+    /// nodes act on no conformance verdict (see `policy`'s module docs). The
+    /// severity is not a judgment that non-idempotent deltas are acceptable: a
+    /// finding here is a bug the author should fix.
     ///
     /// # Why this one stays [`PremiseSource::EvidenceBytes`], and what makes that safe
     ///
@@ -130,19 +151,22 @@ pub enum ConformanceProperty {
     /// rule on [`ConformanceProperty::premise_source`]. Neither existing guard would
     /// notice: the partition pin asserts the classification the code states rather
     /// than deriving it from the generator, and
-    /// `no_shippable_removal_eligible_property_consumes_unvalidated_bytes` only
-    /// fires on a severity or removal-tier change, which such a refinement does not
+    /// `no_shippable_persistent_property_consumes_unvalidated_bytes` only
+    /// fires on a severity or class change, which such a refinement does not
     /// make.
     ///
     /// What keeps the unvalidated bytes harmless is that it is
-    /// [`Severity::Diagnostic`] and report-only (`policy::property_tier`), which
-    /// `policy::decide` never maps to a removal: a fabricated delta buys an attacker
-    /// a report and nothing else. That coupling is NOT incidental. This is the only
-    /// property that both travels as evidence and consumes delta bytes, so making it
-    /// removal-eligible (a `Violation` with a `RemovalEligible` tier), which nothing
-    /// plans since nodes act on no verdict, would have to revisit this
-    /// classification in the same change. `no_shippable_removal_eligible_property_consumes_unvalidated_bytes`
-    /// is the test that forces it to.
+    /// [`Severity::Diagnostic`] and report-only (`policy::property_class`): a
+    /// fabricated delta buys an attacker a report-only finding and nothing else.
+    /// That coupling is NOT incidental. This is the only property that both
+    /// travels as evidence and consumes delta bytes, so making it persistent (a
+    /// `Violation` of [`FindingClass::Persistent`]) would let attacker-chosen bytes
+    /// produce a persistent finding against a correct contract, and would have to
+    /// revisit this classification in the same change.
+    /// `no_shippable_persistent_property_consumes_unvalidated_bytes` is the test
+    /// that forces it to.
+    ///
+    /// [`FindingClass::Persistent`]: super::policy::FindingClass::Persistent
     DeltaIdempotence,
     /// Concurrent, independent deltas applied in either order reach the same
     /// canonical state.
@@ -154,10 +178,9 @@ pub enum ConformanceProperty {
     ///
     /// # Report-only
     ///
-    /// Findings here are [`RemovalTier::ReportOnly`]: never `WouldRemove` or
-    /// `Remove`, in any mode. The same-base pairing below is necessary for
-    /// concurrency and not sufficient, so capture cannot yet prove that a pair it
-    /// found was concurrent. Until it can, a finding may be about a pair the law
+    /// Findings here are [`FindingClass::ReportOnly`]. The same-base pairing below
+    /// is necessary for concurrency and not sufficient, so capture cannot yet prove
+    /// that a pair it found was concurrent. Until it can, a finding may be about a pair the law
     /// does not cover.
     ///
     /// The generator only pairs deltas observed against the SAME base state, which is
@@ -196,7 +219,7 @@ pub enum ConformanceProperty {
     /// `get_state_delta(sender, recipient_summary)`. Hand it the causally-sequenced
     /// pair `D1 = add A^t`, `D2 = remove t`: the two orders diverge, and every
     /// recipient independently confirms a violation against a correct contract
-    /// (removal-eligible, before this property became report-only). That
+    /// (a persistent one, before this property became report-only). That
     /// contract's own same-base pairs are concurrent and permute fine, so nothing
     /// observed locally ever fires.
     ///
@@ -207,7 +230,7 @@ pub enum ConformanceProperty {
     /// it would break the property, for the reason the paragraph above gives.
     ///
     /// [`ConformanceEvidence`]: super::evidence::ConformanceEvidence
-    /// [`RemovalTier::ReportOnly`]: super::policy::RemovalTier::ReportOnly
+    /// [`FindingClass::ReportOnly`]: super::policy::FindingClass::ReportOnly
     DeltaPermutationInvariance,
     /// A delta against an exact summary of the same state should be empty (#5072).
     SelfDeltaEmpty,
@@ -218,7 +241,7 @@ pub enum ConformanceProperty {
     ///
     /// # Open decision: is this severity right?
     ///
-    /// This is the only check here that is not pure algebra. It rests on a MODEL of
+    /// Unlike the algebraic laws, this check rests on a MODEL of
     /// how the protocol reconciles — which side sends what, when the full-state
     /// fallback triggers, how the delta size gate behaves — so a finding depends on
     /// that model being faithful, not just on the contract being wrong. Two model
@@ -226,23 +249,22 @@ pub enum ConformanceProperty {
     /// peer's state (fixed), and the full-state fallback may fire where production
     /// would not, which would HIDE a real divergence rather than invent one.
     ///
-    /// It is nevertheless `Severity::Violation` with a removal-eligible tier
-    /// (`policy::property_tier`), because a genuine reconciliation loop is exactly the #5153 shape this whole effort
-    /// exists to catch.
+    /// It is nevertheless `Severity::Violation` of the persistent class
+    /// (`policy::property_class`), because a genuine reconciliation loop is
+    /// exactly the #5153 shape this whole effort exists to catch.
     ///
-    /// Ian's call (2026-08-17) was to leave it removal-eligible and settle the
+    /// Ian's call (2026-08-17) was to leave it at this severity and settle the
     /// question with real shadow telemetry rather than a five-contract sample.
     /// Reaffirmed 2026-10-22 (#5906) when [`ConformanceProperty::PathAgreement`]
-    /// became report-only: this is the sync-loop check, and it stays
-    /// removal-eligible. The removal plan itself is now superseded and `Enforce`
-    /// is unreachable and not planned (see `policy`'s module docs), so the tier
-    /// only decides whether a finding is counted as `would_remove` or as reported
-    /// in the shadow diagnostics.
+    /// became report-only: this is the sync-loop check, and it stays persistent.
+    /// Nodes act on no conformance verdict (see `policy`'s module docs), so the
+    /// class only decides whether a finding is counted as `persistent` or as
+    /// reported in the shadow diagnostics.
     ///
     /// What would settle it, in either direction:
     ///
     /// - Shadow-mode counts of contracts flagged by THIS property and by no other
-    ///   removal-eligible property. On the live corpus that number was zero: every
+    ///   persistent property. On the live corpus that number was zero: every
     ///   contract it flagged also broke commutativity, mutual rejection included. If
     ///   shadow keeps it at zero, the property earns nothing at this severity and
     ///   should drop to `Diagnostic`. If it is the sole finding for real contracts,
@@ -280,10 +302,10 @@ pub enum ConformanceProperty {
     ///
     /// # Report-only
     ///
-    /// Findings here are reported in every mode and never proposed for removal
-    /// (`policy::removal_tier`, decided 2026-10-22, #5906). The severity argument
-    /// below still says why a finding is a real break worth telling the author
-    /// about. It is not enough for removal: it rests on a model of which path the
+    /// Findings here are report-only (`policy::property_class`,
+    /// decided 2026-10-22, #5906). The severity argument below still says why a
+    /// finding is a real break worth telling the author about. It is not enough to
+    /// count as persistent: it rests on a model of which path the
     /// protocol takes, and its "a delta can only move `base` toward `base ⊔ other`"
     /// step assumes a semilattice join, which heal-guarded associativity (#5915) no
     /// longer implies.
@@ -329,12 +351,11 @@ pub enum ConformanceProperty {
     /// which is the narrower assumption of the two.
     ///
     /// Shadow-mode counts are what would settle whether it should count as
-    /// removal-eligible again (a diagnostic distinction only: nodes do not remove
-    /// contracts, see `policy`'s module docs). Its findings are in the shadow `reported` count, not
-    /// `would_remove`; the number to read is contracts flagged by THIS property and
-    /// by no removal-eligible one. If that number stays at zero the property adds
-    /// nothing a removal could rest on; if it is the sole finding for real
-    /// contracts, it is carrying signal the algebraic checks miss.
+    /// persistent again. Its findings are in the shadow `reported` count, not
+    /// `persistent`; the number to read is contracts flagged by THIS property and
+    /// by no persistent one. If that number stays at zero the property adds
+    /// nothing; if it is the sole finding for real contracts, it is carrying
+    /// signal the algebraic checks miss.
     ///
     /// # Two measured limits, both of them misses rather than false accusations
     ///
@@ -402,8 +423,8 @@ pub enum ConformanceProperty {
     ///
     /// # Report-only
     ///
-    /// Findings here are reported in every mode and never proposed for removal
-    /// (`policy::removal_tier`, decided 2026-10-22, #5906). Its premise is
+    /// Findings here are report-only (`policy::property_class`,
+    /// decided 2026-10-22, #5906). Its premise is
     /// provenance the observing peer cannot prove to anyone else (see the last
     /// section), and since #5915 the argument below rests partly on measurement.
     /// The argument still says why a finding is a real break for the author.
@@ -415,7 +436,7 @@ pub enum ConformanceProperty {
     /// Suppose the contract satisfies [`ConformanceProperty::StateCommutativity`],
     /// [`ConformanceProperty::StateAssociativity`] and
     /// [`ConformanceProperty::StateIdempotence`] — the three laws that are already
-    /// removal-eligible on their own. Then `merge` is a semilattice join, and it
+    /// persistent on their own. Then `merge` is a semilattice join, and it
     /// induces a partial order on states:
     ///
     /// ```text
@@ -437,9 +458,9 @@ pub enum ConformanceProperty {
     /// agree — and it needs no carve-out for bounded collections or any other
     /// contract shape.
     ///
-    /// If the contract does NOT satisfy those three laws, it is already
-    /// removal-eligible under whichever of them it breaks, so a firing here costs it
-    /// nothing it had not already lost. Either way there is no contract that this
+    /// If the contract does NOT satisfy those three laws, it already has a
+    /// persistent finding under whichever of them it breaks, so a firing here adds
+    /// nothing it did not already have. Either way there is no contract that this
     /// property alone condemns while the settled algebra would have acquitted it.
     ///
     /// **What changed with #5915.** `StateAssociativity` no longer means strict
@@ -475,7 +496,7 @@ pub enum ConformanceProperty {
     ///   exactly the ones the cap drops again.
     /// - A cap that evicts by something independent of that ordering — arrival
     ///   order, a hash, `CAPPED_SET` in the fixture contract — does fire, and that
-    ///   contract is already removal-eligible under
+    ///   contract already has a persistent finding under
     ///   [`ConformanceProperty::StateAssociativity`] for the same underlying reason.
     /// - The **partially-ordered** cap is the case the first version of this
     ///   property could not rule out: keep the at-most-N *maximal* elements under a
@@ -487,7 +508,7 @@ pub enum ConformanceProperty {
     ///   idempotent with zero failures — and **not associative**, 532 failing
     ///   triples, the smallest being
     ///   `(({1} ⊔ {2}) ⊔ {3,5}) = {2,3}` against `({1} ⊔ ({2} ⊔ {3,5})) = {1,3}`.
-    ///   So it is already removal-eligible under `StateAssociativity` before this
+    ///   So it already has a persistent `StateAssociativity` finding before this
     ///   property is consulted, which closes the gap: the transition law condemns no
     ///   contract the settled algebra acquits. Under the #5915 heal step every one of
     ///   those 532 triples cycles rather than settling, so this still holds. It
@@ -518,7 +539,7 @@ pub enum ConformanceProperty {
     /// valid states with `base ⊄ result` — is structurally indistinguishable from a
     /// genuine information-losing update, and every receiving peer would
     /// independently confirm a violation against a correct contract (and, before
-    /// this property was report-only, a removal-eligible one). `check_bounds`
+    /// this property was report-only, a persistent one). `check_bounds`
     /// therefore REFUSES evidence carrying this property outright rather than
     /// merely deprioritising it.
     ///
@@ -562,18 +583,16 @@ pub enum PremiseSource {
 
 /// How seriously a failed property should be taken.
 ///
-/// The split matters because only [`Severity::Violation`] is ever allowed to become
-/// removal evidence. That is necessary and not sufficient: a `Violation` of a
-/// report-only law is reported and never removed (`policy::removal_tier`). The RFC
-/// is explicit that size alone is not a merge-law proof:
-/// a contract whose self-delta is the whole state is wasteful, not unsound, and
-/// deleting it would be deleting a working application over an efficiency
-/// complaint.
+/// The split matters because only [`Severity::Violation`] fails `fdev` and can be
+/// counted as a persistent finding. That is necessary and not sufficient: a
+/// `Violation` of a report-only law is reported and not counted as persistent
+/// (`policy::finding_class`). The RFC is explicit that size alone is not a
+/// merge-law proof: a contract whose self-delta is the whole state is wasteful,
+/// not unsound.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Severity {
-    /// Breaks a merge law. Necessary for removal and not sufficient: only a
-    /// violation whose `policy::removal_tier` is `RemovalEligible` can justify one,
-    /// and only after independent verification. Every `Violation` fails `fdev`.
+    /// Breaks a merge law. Every `Violation` fails `fdev`. Whether it counts as
+    /// persistent is decided separately, by `policy::finding_class`.
     Violation,
     /// Wasteful or suspicious, but not a proof of non-convergence. Report only.
     Diagnostic,
@@ -608,20 +627,18 @@ impl ConformanceProperty {
             // what this property's own documentation already promises. Saying "a
             // reporting signal, not allowed to influence anything on the network
             // until measured against deployed WASM" while handing it the same
-            // enforcement weight as commutativity would make the comment a wish
-            // rather than a rule — and it is exactly the kind of gap that closes
-            // itself the day someone enables enforcement for the settled properties
-            // and this one rides along unnoticed.
+            // weight as commutativity would make the comment a wish rather than a
+            // rule.
             //
-            // This tier is also load-bearing for the evidence gate, and NOT
+            // This severity also matters to the evidence gate, and is NOT
             // independently adjustable. After `DeltaPermutationInvariance` moved to
             // `LocalProvenance`, this is the only property that both ships as
             // evidence and consumes delta bytes — which `verify_case` never
             // validates, there being no `require_valid` for a delta. Promoting it to
-            // `Violation` with a `RemovalEligible` tier without revisiting
-            // `premise_source` in the same change would make attacker-chosen delta
-            // bytes removal-eligible. The test
-            // `no_shippable_removal_eligible_property_consumes_unvalidated_bytes`
+            // a persistent `Violation` without revisiting `premise_source` in the
+            // same change would let attacker-chosen delta bytes produce a
+            // persistent finding. The test
+            // `no_shippable_persistent_property_consumes_unvalidated_bytes`
             // fails if that happens.
             ConformanceProperty::DeltaIdempotence => Severity::Diagnostic,
             ConformanceProperty::StateIdempotence
@@ -829,20 +846,19 @@ pub struct Violation {
 /// first application changed it.
 ///
 /// Carried structurally rather than folded into [`Violation::detail`], which is
-/// documented as diagnostic and never parsed. This distinction is the one an
-/// eventual removal policy has to branch on: a contract that normalises once and
+/// documented as diagnostic and never parsed. This distinction is the one
+/// `policy::finding_class` branches on: a contract that normalises once and
 /// then holds still is a materially different animal from one that mutates on
 /// every redelivery, and only the second is unambiguously non-convergent.
 ///
 /// It is deliberately NOT a severity fork. Both are `Severity::Violation`, because
 /// `merge(A, A) != A` breaks idempotence either way. Letting the settling
 /// behaviour choose the severity would repeat the move that produced the defect
-/// this replaced: bending the *classification* to soften an *enforcement*
-/// consequence (#5462).
+/// this replaced: bending the *classification* to soften a *consequence* (#5462).
 ///
-/// The enforcement consequence is decided separately, by `policy::removal_tier`:
-/// [`IdempotenceSettling::SettledAfter`] is report-only, and every other class
-/// keeps the property's removal-eligible tier.
+/// The finding's class is decided separately, by `policy::finding_class`:
+/// [`IdempotenceSettling::SettledAfter`] is report-only, and every other settling
+/// class keeps the property's persistent class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum IdempotenceSettling {
@@ -856,20 +872,18 @@ pub enum IdempotenceSettling {
     /// arrives — but the harm is phantom anti-entropy rather than divergence.
     /// Canonicalising at install removes this class entirely.
     ///
-    /// Report-only in every mode (`policy::removal_tier`): the contract converges
+    /// Report-only (`policy::finding_class`): the contract converges
     /// after a bounded cost, and anyone who can PUT can produce one.
     SettledAfter(u32),
     /// No fixpoint within the budget: the state changes on every re-apply, so
     /// redelivery of the same state keeps mutating it, at least for as long as the
-    /// budget looked. Keeps the property's removal-eligible tier. A bounded budget
+    /// budget looked. Keeps the property's persistent class. A bounded budget
     /// running out is not a proof that the state never settles; replacing it with
     /// one (a repeated state, or a re-delivery failure) is tracked in #5906.
     ///
-    /// **Known gap** (it would have had to close before Enforce could become
-    /// reachable; Enforce is not planned, see `policy`'s module docs): a contract
-    /// that settles after more rewrites than the budget lands here and is
-    /// removal-eligible. Pinned as current behaviour by
-    /// `policy::tests::known_gap_idempotence_not_shown_to_settle_stays_removal_eligible`.
+    /// **Known gap:** a contract that settles after more rewrites than the budget
+    /// lands here and is counted as persistent. Pinned as current behaviour by
+    /// `policy::tests::known_gap_idempotence_not_shown_to_settle_stays_persistent`.
     NeverSettled,
     /// Classification could not complete, so whether the state settles is unknown.
     ///
@@ -888,8 +902,8 @@ pub enum IdempotenceSettling {
     /// classification merges used to propagate their error out of the whole check,
     /// which turned an established violation into "we could not tell" — and the
     /// never-settling class GROWS its state on every apply, so it is the most
-    /// likely to trip a fuel or size ceiling on the second or third one. The class
-    /// an enforcement policy can act on was the class that vanished, and a hostile
+    /// likely to trip a fuel or size ceiling on the second or third one. The most
+    /// serious class was the class that vanished, and a hostile
     /// contract could arrange it in one line by trapping on the second identical
     /// merge.
     ///
@@ -898,14 +912,12 @@ pub enum IdempotenceSettling {
     /// into `settling: None` (ambiguous with "this property carries no settling
     /// data at all").
     ///
-    /// **Known gap** (it would have had to close before Enforce could become
-    /// reachable; Enforce is not planned, see `policy`'s module docs): this class
-    /// keeps the property's removal-eligible tier, yet it can come from a fuel trap
-    /// or a resource ceiling on the follow-up merges, which a PUT of an unusual or
-    /// large state can reach. A removal would have had to rest on proof that the
-    /// state never settles, not on classification failing. Pinned as current
-    /// behaviour by
-    /// `policy::tests::known_gap_idempotence_not_shown_to_settle_stays_removal_eligible`.
+    /// **Known gap:** this class keeps the property's persistent class, yet it can
+    /// come from a fuel trap or a resource ceiling on the follow-up merges, which a
+    /// PUT of an unusual or large state can reach. Proof that the state never
+    /// settles would be a stronger basis than classification failing. Pinned as
+    /// current behaviour by
+    /// `policy::tests::known_gap_idempotence_not_shown_to_settle_stays_persistent`.
     Indeterminate,
 }
 
@@ -935,6 +947,12 @@ pub enum Inconclusive {
     RelatedRequired,
     /// The contract returned an error. A single rejection is not a conformance
     /// failure — contracts are supposed to reject updates they consider illegitimate.
+    ///
+    /// Two places report a refusal instead (#5725): a refused associativity
+    /// heal-step merge, and a refused commutativity merge after which the two
+    /// peers, exchanging states, stop moving while still holding different states.
+    /// See [`ConformanceProperty::StateCommutativity`]. A commutativity refusal
+    /// that clears on the exchange is reported here.
     ContractError(String),
     /// `update_state` returned neither a new state nor a related-contract request.
     NoOutputState,
@@ -973,7 +991,7 @@ pub enum Inconclusive {
     /// error) — not the contract rejecting its input.
     ///
     /// Kept just as non-enforceable as [`Inconclusive::ContractError`]: a harness or
-    /// runtime bug is not a merge-law proof either, and removing a contract for a
+    /// runtime bug is not a merge-law proof either, and blaming a contract for a
     /// defect in the code that executes it would be exactly backwards. What must not
     /// be shared is the LABEL — see #5509. Naming a runtime trap "contract error"
     /// accuses the wrong party for every case of this kind, and it is the only
@@ -1065,8 +1083,8 @@ impl PropertyOutcome {
     ///
     /// Diagnostics are excluded here on purpose; see [`Severity`]. This is what
     /// fails `fdev`, so an author hears about every broken law. It is NOT the
-    /// removal decision: a violation of a report-only law is true here and never
-    /// removed. Use `policy::decide` / `policy::removal_tier` for that.
+    /// finding's class: a violation of a report-only law is true here too. Use
+    /// `policy::finding_class` for that.
     pub fn is_enforceable_violation(&self) -> bool {
         // Derive the severity from the PROPERTY rather than reading the field the
         // `Violation` carries. `Violation` is `Deserialize` with public fields and
