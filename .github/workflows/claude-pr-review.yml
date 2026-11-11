@@ -1,15 +1,35 @@
 name: Claude PR Rule Review
 
 # Rule review: checks every PR against .claude/rules/ and posts findings
-# as a sticky comment. WARNING-level findings block merge via commit status.
+# as a sticky comment. WARNING-level findings set the `rule-review/warnings`
+# commit status to failure. That status is advisory: the ruleset's required
+# check is the JOB "Claude Rule Review", which stays green.
 #
 # Enforcement layers (defense-in-depth):
 # 1. Agent rules (.claude/rules/testing.md) — make agents write better code
 # 2. Rule Lint (ci.yml grep) — hard-fail on banned patterns + missing tests
-# 3. This review — AI catches nuanced issues, WARNINGs block merge
+# 3. This review — AI catches nuanced issues; WARNINGs turn the status red
 # 4. Human review — final backstop
 #
 # To bypass: add 'review-override' label (requires maintainer, logged).
+#
+# When the reviewer cannot run (#5628): the review step is continue-on-error and
+# only the JOB is required, so a broken reviewer never blocks merge. But a PR
+# that was not reviewed must not look like one that was. Every way of not
+# running (step failed, unreadable execution file, no report, a final error
+# result) sets `rule-review/warnings` to FAILURE ("did not run"), replaces any
+# stale sticky comment, and, if the run ended within about a turn or left nothing
+# readable (an outage PR content is unlikely to cause), opens one tracking issue that the
+# next completed review closes. Dedup is by creator + marker and is not atomic:
+# every run that starts before the first issue exists can open its own (the next
+# completed review closes them all), and a flaky reviewer opens and closes it
+# repeatedly, with an @sanity mention each time. A fork PR whose title provoked a
+# refusal at the very first call would look like an outage too; that is accepted.
+# The status is set first; the
+# comment and issue work are best-effort because an API error there must not fail
+# the required job. A failure of the status call itself still fails the job, on
+# purpose: nothing else can report it.
+# Covered by scripts/claude_pr_review_post_step_test.sh.
 #
 # Triggers:
 # - pull_request_target: runs for all PRs (including forks) with base-repo
@@ -587,96 +607,257 @@ jobs:
             const fs = require('fs');
             const marker = '<!-- claude-rule-review -->';
             const reviewOutcome = '${{ steps.review.outcome }}';
+            const runUrl = '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}';
+            const execFile = '${{ steps.review.outputs.execution_file }}' || '/home/runner/work/_temp/claude-execution-output.json';
 
-            // If Claude step failed, post a warning instead of silently doing nothing
-            if (reviewOutcome === 'failure') {
-              const warningBody = marker + '\n' +
-                '### Claude Rule Review: Failed to run\n\n' +
-                'The Claude rule review step failed (likely an authentication or API issue). ' +
-                'Check the [workflow logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.\n\n' +
-                '---\n*Advisory review against `.claude/rules/`. Critical patterns are enforced by the Rule Lint CI job.*';
+            // A review that did not run must not read as one that found nothing
+            // (#5628). The review step is continue-on-error so a broken reviewer
+            // never blocks merge, and only the JOB "Claude Rule Review" is a
+            // required check, not the `rule-review/warnings` status. So a
+            // non-run reports that status as FAILURE: visible on the PR page,
+            // not a merge gate. A reviewer outage also opens ONE tracking
+            // issue, which the next review that completes closes again.
+            const NOT_RUN_STATE = 'failure';
+            const outageMarker = '<!-- claude-rule-review-outage -->';
+            const outageTitle = 'CI: Claude rule review is failing to run';
 
+            const setStatus = (state, description, targetUrl) =>
+              github.rest.repos.createCommitStatus({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                sha: '${{ github.event.pull_request.head.sha }}',
+                state,
+                context: 'rule-review/warnings',
+                description,
+                target_url: targetUrl || runUrl,
+              });
+
+            // Outage bookkeeping is best-effort and runs AFTER the PR comment and
+            // commit status are set: the job is a required check, so an API
+            // error here (rate limit, locked issue, 5xx) must never fail it.
+            const bestEffort = async (what, fn, level = 'warning') => {
+              try {
+                await fn();
+              } catch (e) {
+                core[level](`${what} failed (ignored): ${e.message}`);
+              }
+            };
+
+            // Open outage issues. They are matched by creator AND marker: the
+            // marker text is public, so the creator filter (issues made with
+            // GITHUB_TOKEN are authored by github-actions[bot]) is what stops an
+            // outsider's issue matching. If this workflow ever moves to a PAT or
+            // App token, the creator must change with it or dedup breaks.
+            const listOutageIssues = async () => {
+              const issues = await github.paginate(github.rest.issues.listForRepo, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                state: 'open',
+                creator: 'github-actions[bot]',
+                per_page: 100,
+              });
+              return issues.filter(i => !i.pull_request && (i.body || '').includes(outageMarker));
+            };
+
+            // Only an outage PR content is unlikely to cause opens an issue: the run
+            // died within about a turn (API refused it: credential, usage, or
+            // outage), or never left a readable result. A max-turns or oversized
+            // diff failure is per-PR and only gets the red status and annotation.
+            const reportOutage = (detail, systemic) => bestEffort('outage reporting', async () => {
+              core.error(`Claude rule review did not run: ${detail}`);
+              if (!systemic) return;
+              if ((await listOutageIssues()).length > 0) return;
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: outageTitle,
+                body: outageMarker + '\n' +
+                  '@sanity: the `Claude PR Rule Review` workflow could not complete a review, so affected PRs were not reviewed. ' +
+                  'They show a red `rule-review/warnings` status; the required `Claude Rule Review` check stays green, so merges are not blocked.\n\n' +
+                  'If the run ended within about a turn, before any model work, that points at the credential or account behind ' +
+                  '`CLAUDE_CODE_OAUTH_TOKEN` rather than the diff (usage exhausted, or the token revoked or expired); see #5628 for that pattern. ' +
+                  'This was opened for a run that did not complete; the error annotation on the run below carries what the action recorded.\n\n' +
+                  `First failing run: ${runUrl}\n\n` +
+                  'This issue is opened and closed automatically. It closes itself after the next review that completes, ' +
+                  'so a flaky reviewer can open and close it repeatedly.',
+              });
+            });
+
+            // One bad issue (locked, deleted) must not strand the others.
+            const clearOutage = () => bestEffort('closing outage issues', async () => {
+              for (const issue of await listOutageIssues()) {
+                await bestEffort(`closing outage issue #${issue.number}`, async () => {
+                  await github.rest.issues.createComment({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: issue.number,
+                    body: `A review completed again: ${runUrl}. Closing.`,
+                  });
+                  await github.rest.issues.update({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: issue.number,
+                    state: 'closed',
+                    state_reason: 'completed',
+                  });
+                });
+              }
+            });
+
+            // The ONE definition of a clean run, used by both gates below: a result
+            // that says it succeeded. A result that is PRESENT but does not say so
+            // (a missing or non-boolean is_error, a non-success subtype) is not
+            // evidence of a review, so it is a non-run and never closes the outage
+            // issue (#5628). Known gap: a succeeded step whose execution file has
+            // a report but NO result entry at all is not caught by this gate; every
+            // real run's file has one, so this needs a truncated file.
+            const cleanResult = (e) => !!e && e.is_error === false && e.subtype === 'success';
+
+            // A final `result` entry as a one-line annotation. `systemic` is true
+            // unless the run got going (more than one turn). An API refusal ends
+            // the run at the first call, so a run that took more turns reached the
+            // model and is treated as per-PR (max turns, an oversized diff), not
+            // an outage. Only max turns has been checked against real runs. The
+            // converse is a known blind spot: a rate limit hit mid-run looks
+            // per-PR and only the following runs reveal it.
+            //
+            // The `result` text is included only for a systemic failure, where it
+            // should be the API's own error (not yet confirmed against a real
+            // refusal: #5628 shows the entry but not its text). For a per-PR
+            // failure it is model text the PR may have steered, so it is left out.
+            // Always whitespace-collapsed, capped and backtick-free, and it goes
+            // ONLY to the annotation, never to a comment or the issue.
+            // Observed shape of a real max-turns run (2026-09-09, #5628):
+            // subtype=error_max_turns is_error=true num_turns=26, no result text.
+            // Total on purpose: it runs before the status is set on some paths, so
+            // a malformed entry (an object where a string is expected) must not
+            // throw and fail the required job. `safe` stringifies anything.
+            const safe = (v) => {
+              try { return String(v ?? ''); } catch (_) { return '[unprintable]'; }
+            };
+            const describeEntry = (e) => {
+              let turns = NaN;
+              try { turns = Number(e.num_turns); } catch (_) { /* malformed: counts as not got going */ }
+              const systemic = !(turns > 1);
+              const excerpt = systemic ? ` result=${safe(e.result).replace(/`/g, "'").replace(/\s+/g, ' ').slice(0, 300)}` : '';
+              return {
+                detail: `subtype=${safe(e.subtype)} is_error=${safe(e.is_error)} turns=${safe(e.num_turns)} cost=${safe(e.total_cost_usd)}${excerpt}`,
+                systemic,
+              };
+            };
+
+            const describeFailure = () => {
+              try {
+                const entries = JSON.parse(fs.readFileSync(execFile, 'utf8'));
+                const last = Array.isArray(entries) ? entries.filter(x => x).pop() : null;
+                if (last && last.type === 'result') return describeEntry(last);
+                return { detail: 'execution file has no result entry', systemic: true };
+              } catch (e) {
+                return { detail: `unreadable execution file: ${e.message}`, systemic: true };
+              }
+            };
+
+            // Post or refresh the one sticky comment. Best-effort: it is never
+            // allowed to cost the status, and a failure is an error annotation
+            // (not a warning) because the PR may be left with a red status and no
+            // comment explaining it.
+            const postStickyComment = (body) => bestEffort('posting the PR comment', async () => {
               const { data: comments } = await github.rest.issues.listComments({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 issue_number: context.issue.number,
                 per_page: 100,
               });
-
               const existing = comments.find(c => c.body.includes(marker));
               if (existing) {
                 await github.rest.issues.updateComment({
                   owner: context.repo.owner,
                   repo: context.repo.repo,
                   comment_id: existing.id,
-                  body: warningBody,
+                  body,
                 });
+                console.log(`Updated existing comment ${existing.id}`);
               } else {
                 await github.rest.issues.createComment({
                   owner: context.repo.owner,
                   repo: context.repo.repo,
                   issue_number: context.issue.number,
-                  body: warningBody,
+                  body,
                 });
+                console.log('Created new review comment');
               }
-              // Don't block merge because the review tool broke — set success
-              await github.rest.repos.createCommitStatus({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                sha: '${{ github.event.pull_request.head.sha }}',
-                state: 'success',
-                context: 'rule-review/warnings',
-                description: 'Review failed to run — not blocking merge',
-                target_url: '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
-              });
-              core.warning('Claude rule review failed — warning comment posted on PR');
+            }, 'error');
+
+            // EVERY way of not running (step failed, unreadable file, no report, a
+            // final error result) goes through here, so each one: sets the red
+            // status first (the primary signal), replaces any stale sticky review
+            // comment (so an old "No issues found" cannot sit beside a red status),
+            // and reports the outage.
+            const notReviewedBody = marker + '\n' +
+              '### Claude Rule Review: Failed to run\n\n' +
+              'The Claude rule review did not complete, so this PR was **not reviewed**. ' +
+              'The `rule-review/warnings` status is red for that reason and is not a merge gate. ' +
+              'Check the [workflow logs](' + runUrl + ') for details.\n\n' +
+              '---\n*Advisory review against `.claude/rules/`. Critical patterns are enforced by the Rule Lint CI job.*';
+
+            const reportNotRun = async (statusText, outcome) => {
+              await setStatus(NOT_RUN_STATE, statusText);
+              await postStickyComment(notReviewedBody);
+              await reportOutage(outcome.detail, outcome.systemic);
+            };
+
+            const NOT_RUN_TEXT = 'Review did not run; re-run it or add review-override (not a merge gate)';
+
+            // If Claude step failed, say so instead of silently doing nothing
+            if (reviewOutcome === 'failure') {
+              await reportNotRun(NOT_RUN_TEXT, describeFailure());
               return;
             }
 
-            const execFile = '${{ steps.review.outputs.execution_file }}' || '/home/runner/work/_temp/claude-execution-output.json';
-
             // Read Claude's output — the file is a JSON array of Turn objects
             let report = '';
+            let resultEntry = null;
             try {
               const raw = fs.readFileSync(execFile, 'utf8');
               const turns = JSON.parse(raw);
 
               // Find the last assistant turn with text content
               if (Array.isArray(turns)) {
-                const assistantTurns = turns.filter(t => t.type === 'assistant' && t.message?.content);
+                resultEntry = turns.filter(t => t && t.type === 'result').pop() || null;
+                const assistantTurns = turns.filter(t => t && t.type === 'assistant' && t.message?.content);
                 if (assistantTurns.length > 0) {
                   const last = assistantTurns[assistantTurns.length - 1];
                   const textParts = last.message.content
-                    .filter(c => c.type === 'text')
+                    .filter(c => c && c.type === 'text')
                     .map(c => c.text);
                   report = textParts.join('\n');
                 }
               }
             } catch (e) {
               console.log(`Could not parse execution file: ${e.message}`);
-              // Set success so we don't block merge on parse failure
-              await github.rest.repos.createCommitStatus({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                sha: '${{ github.event.pull_request.head.sha }}',
-                state: 'success',
-                context: 'rule-review/warnings',
-                description: 'Parse error — not blocking merge',
-              });
+              // The step reported success but left nothing usable: a non-run too,
+              // and the same silent outage as a failed step.
+              await reportNotRun(NOT_RUN_TEXT, { detail: `unparseable execution file: ${e.message}`, systemic: true });
+              return;
+            }
+
+            // The action normally fails its own step when the final result is an
+            // error. If it ever does not, or the result's shape drifts, the
+            // "report" below could be an error message, or text from a run that
+            // never completed, read as a review ("No warnings found"). A result
+            // that does not say it succeeded is a non-run.
+            if (resultEntry && !cleanResult(resultEntry)) {
+              await reportNotRun(NOT_RUN_TEXT, describeEntry(resultEntry));
               return;
             }
 
             if (!report || report.trim().length === 0) {
               console.log('No report content found');
-              // Set success so we don't block merge
-              await github.rest.repos.createCommitStatus({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                sha: '${{ github.event.pull_request.head.sha }}',
-                state: 'success',
-                context: 'rule-review/warnings',
-                description: 'No report content — not blocking merge',
-              });
+              // Same classification as a failed step: a run that got going and
+              // then said nothing is not evidence of an outage.
+              await reportNotRun(NOT_RUN_TEXT, resultEntry
+                ? { ...describeEntry(resultEntry), detail: `no report text; ${describeEntry(resultEntry).detail}` }
+                : { detail: 'review step succeeded but produced no report text and no result entry', systemic: true });
               return;
             }
 
@@ -702,53 +883,29 @@ jobs:
             const statusSuffix = hasWarnings
               ? ` ⚠️ ${warningCount} warning(s) — fix or add \`review-override\` label`
               : '';
-            const body = report + '\n\n---\n*Rule review against `.claude/rules/`. WARNING findings block merge.' + statusSuffix + '*';
+            const body = report + '\n\n---\n*Rule review against `.claude/rules/`. WARNING findings turn the `rule-review/warnings` status red.' + statusSuffix + '*';
 
-            // Find and update existing sticky comment, or create new one
-            const { data: comments } = await github.rest.issues.listComments({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              per_page: 100,
-            });
-
-            const existing = comments.find(c => c.body.includes(marker));
-            const fullBody = marker + '\n' + body;
-
-            if (existing) {
-              await github.rest.issues.updateComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                comment_id: existing.id,
-                body: fullBody,
-              });
-              console.log(`Updated existing comment ${existing.id}`);
-            } else {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: context.issue.number,
-                body: fullBody,
-              });
-              console.log('Created new review comment');
-            }
-
-            // Set commit status based on warnings
+            // Set commit status based on warnings. Status first: it is the primary
+            // signal, and an API error posting the comment must not lose it.
             const state = hasWarnings ? 'failure' : 'success';
             const description = hasWarnings
               ? `${warningCount} warning(s) found — fix or add review-override label`
               : 'No warnings found';
 
-            await github.rest.repos.createCommitStatus({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              sha: '${{ github.event.pull_request.head.sha }}',
-              state,
-              context: 'rule-review/warnings',
-              description,
-              target_url: `${{ github.server_url }}/${{ github.repository }}/pull/${{ github.event.pull_request.number }}`
-            });
+            await setStatus(state, description,
+              `${{ github.server_url }}/${{ github.repository }}/pull/${{ github.event.pull_request.number }}`);
             console.log(`Set commit status: ${state} (${description})`);
+
+            // Find and update existing sticky comment, or create new one
+            await postStickyComment(marker + '\n' + body);
+
+            // A completed review means the reviewer works again. Close the outage
+            // issue only on clear evidence: a final `result` entry that says it
+            // succeeded (a real one reads subtype=success is_error=false). Done
+            // last, so it can never cost the comment or the status.
+            if (cleanResult(resultEntry)) {
+              await clearOutage();
+            }
 
       - name: Set status to success if skipped
         if: github.event_name != 'merge_group' && steps.override.outputs.overridden != 'true' && steps.rules.outputs.skip == 'true'

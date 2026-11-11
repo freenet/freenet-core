@@ -369,10 +369,9 @@ State merging rules:
     recorded locally. Instead, nodes decline work a contract with a lawful
     merge never needs: a payload already merged into the node's current
     state is not merged again (`ring::applied_payloads`). The removal
-    machinery in `conformance::policy` (`EnforcementMode::Enforce`,
-    `ConformanceAction::Remove`, `RemovalTier`) and the shadow
-    `would_remove` count are retained, unreachable, and not planned to be
-    enabled; deleting that code is a separate decision.
+    code was deleted. `conformance::policy::FindingClass` still separates
+    persistent findings from report-only ones for the shadow counts and
+    `fdev`'s evidence files; it decides nothing on the network.
   - Invalid merges should return error, not panic
 ```
 

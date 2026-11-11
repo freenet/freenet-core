@@ -102,4 +102,16 @@ pub trait ConformanceOracle {
     /// leakage reachable again. If that happens, this is where it gets handled, and
     /// the determinism checks start covering a second class of bug for free.
     fn reset_instance(&mut self) {}
+
+    /// Does the contract's code import the host clock
+    /// ([`imports_host_clock`](super::imports_host_clock))?
+    ///
+    /// Read by the commutativity check's refusal exchange (#5725): a refusal that
+    /// leaves two peers apart is not reported against a contract that reads the
+    /// clock, because a clock-gated refusal (a timestamp too far in the future)
+    /// reproduces on a re-run and still clears as time passes.
+    ///
+    /// Required, with no default: `false` is the answer that lets a refusal be
+    /// reported, so an oracle must choose it deliberately rather than inherit it.
+    fn reads_host_clock(&self) -> bool;
 }

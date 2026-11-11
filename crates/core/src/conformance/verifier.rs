@@ -263,7 +263,7 @@ fn reproduced_identically(first: &Violation, second: &Violation) -> bool {
         | ConformanceProperty::SummaryDeterminism
         | ConformanceProperty::DeltaDeterminism => true,
         // `settling` too, not just the digests. It is decision-relevant data — the
-        // whole point of carrying it is that an enforcement policy branches on it —
+        // whole point of carrying it is that `policy::finding_class` branches on it,
         // so a classification that differs between runs must not be reported as
         // though it had reproduced. A contract whose settling varies IS
         // non-deterministic, and falling through to `escalate_to_determinism` names
@@ -321,14 +321,13 @@ fn run<O: ConformanceOracle + ?Sized>(
             // carrying no information. That is idempotence broken on any honest
             // reading, and the loop was suppressing a true finding.
             //
-            // The choice looked binary — flag every canonicalizing contract as
-            // removal-eligible, or suppress — and it is not. The distinction is
-            // kept as DATA on the finding ([`IdempotenceSettling`]) rather than as
-            // a severity fork, so the removal policy branches on it
-            // (`policy::removal_tier`) without the verifier having pre-decided the
-            // answer. Bending the
-            // classification to soften an enforcement consequence is the specific
-            // mistake this replaced (#5462).
+            // The choice looked binary (flag every canonicalizing contract as
+            // persistent, or suppress), and it is not. The distinction is kept as
+            // DATA on the finding ([`IdempotenceSettling`]) rather than as a
+            // severity fork, so the classification branches on it
+            // (`policy::finding_class`) without the verifier having pre-decided the
+            // answer. Bending the classification to soften a consequence is the
+            // specific mistake this replaced (#5462).
             //
             // DELIBERATE DIVERGENCE from the executor's in-tree probe — do NOT
             // "reconcile" them without reading both. `probe_identical_input_idempotency`
@@ -343,11 +342,13 @@ fn run<O: ConformanceOracle + ?Sized>(
             // direction a future reader picks decides whether a live egress
             // suppression starts firing on canonicalizing contracts (#5462).
             //
-            // Sequencing note: canonicalising at install removes the benign class
-            // entirely. Until then, expect `SettledAfter(1)` findings against correct
-            // contracts and read them as "the install path has not been fixed yet",
-            // not as "this contract is broken". `policy::removal_tier` makes that
-            // class report-only in every mode, so it never reaches `WouldRemove`.
+            // A `SettledAfter` finding against a correct contract means a raw
+            // non-canonical state reached it (for example a client PUT that no merge
+            // has normalised yet), not that the contract is broken.
+            // `policy::finding_class` makes that class report-only, so it is never
+            // counted as persistent. Canonicalising at install was considered and
+            // rejected (#5521): three captured corpora held no such findings, and the
+            // extra call changed nothing, errored, or churned on real contracts.
             let a: &[u8] = &case.states[0];
             let once = merge(oracle, a, a)?;
             if once == a {
@@ -368,8 +369,8 @@ fn run<O: ConformanceOracle + ?Sized>(
                 // established above — reporting "we could not tell" about a
                 // contract already caught. The never-settling class grows its
                 // state on every apply, so it is the likeliest to hit a fuel or
-                // size ceiling on exactly these follow-up merges: the class
-                // enforcement can act on would be the one that silently
+                // size ceiling on exactly these follow-up merges: the most
+                // serious class would be the one that silently
                 // disappeared, and a contract could arrange that in one line by
                 // trapping on the second identical merge.
                 let merged = match merge(oracle, &current, &current) {
@@ -440,7 +441,7 @@ fn run<O: ConformanceOracle + ?Sized>(
             // the class is report-only. If the byte order instead depends on merge
             // history, so that peers holding the same content keep different
             // bytes, the two merge orders differ and `StateCommutativity` reports
-            // it as its own finding (removal-eligible).
+            // it as its own finding (persistent).
             if is_reordering(&once, a) {
                 detail.push_str(
                     ". NOTE: the rewritten state holds exactly the same bytes in a \
@@ -464,14 +465,27 @@ fn run<O: ConformanceOracle + ?Sized>(
 
         ConformanceProperty::StateCommutativity => {
             let (a, b) = (&case.states[0], &case.states[1]);
-            let ab = merge(oracle, a, b)?;
-            let ba = merge(oracle, b, a)?;
-            Ok(compare(
-                case.property,
-                &ab,
-                &ba,
-                "merge(A, B) must equal merge(B, A)",
-            ))
+            // A refusal is the contract's own `ContractError`; a runtime or resource
+            // failure still propagates as inconclusive (#5509), in the same order
+            // as before: `merge(A, B)` first.
+            let ab = heal_merge(oracle, a, b)?;
+            let ba = heal_merge(oracle, b, a)?;
+            match (ab, ba) {
+                (Ok(ab), Ok(ba)) => Ok(compare(
+                    case.property,
+                    &ab,
+                    &ba,
+                    "merge(A, B) must equal merge(B, A)",
+                )),
+                (ab, ba) => refused_merge_outcome(
+                    oracle,
+                    case.property,
+                    a,
+                    b,
+                    FirstMerges { ab, ba },
+                    &case.related,
+                ),
+            }
         }
 
         ConformanceProperty::StateAssociativity => {
@@ -497,9 +511,9 @@ fn run<O: ConformanceOracle + ?Sized>(
             // when a later removal (a ban) or a raised cap frees it, while the other
             // grouping still holds the entry. Measured on River's room contract: ~30%
             // of generated triples fail strictly and every one converges on the next
-            // exchange. Reporting them would make every capped chat, feed or log
-            // removable, and anyone able to trigger a removal could build a failing
-            // triple on purpose. So it is reported only if it does not HEAL, in the
+            // exchange. Reporting them would flag every capped chat, feed or log,
+            // and anyone able to trigger an eviction could build a failing triple
+            // on purpose. So it is reported only if it does not HEAL, in the
             // sense `associativity_heals` defines.
             //
             // A grouping the contract rejects is reported outright. Both inputs and
@@ -959,17 +973,277 @@ pub(crate) fn associativity_heals<O: ConformanceOracle + ?Sized>(
     Ok(Heal::OutOfPasses)
 }
 
-/// A heal-step merge: the contract's own rejection comes back as `Ok(Err(reason))`
-/// so the caller can report it, and every other failure as `Err`, inconclusive.
+/// A merge whose refusal the caller acts on (the associativity heal step, and the
+/// commutativity refusal exchange): the contract's own rejection comes back as
+/// `Ok(Err(reason))` so the caller can judge it, and every other failure as `Err`,
+/// inconclusive.
 fn heal_merge<O: ConformanceOracle + ?Sized>(
     oracle: &mut O,
     base: &[u8],
     other: &[u8],
 ) -> Result<Result<Vec<u8>, String>, Inconclusive> {
-    match merge(oracle, base, other) {
+    refusable(merge(oracle, base, other))
+}
+
+/// Split a contract call's result into the contract's own refusal, `Ok(Err(reason))`,
+/// and every other failure, `Err`, which stays inconclusive.
+fn refusable(
+    result: Result<Vec<u8>, Inconclusive>,
+) -> Result<Result<Vec<u8>, String>, Inconclusive> {
+    match result {
         Ok(state) => Ok(Ok(state)),
         Err(Inconclusive::ContractError(reason)) => Ok(Err(reason)),
         Err(other) => Err(other),
+    }
+}
+
+/// What a commutativity case reports when the contract refused `merge(A, B)` or
+/// `merge(B, A)` for two states it validates (#5725).
+///
+/// A refusal on its own is not a finding: a contract may reject an update the other
+/// side then moves past (River's transient ban-cap skew clears after the reverse
+/// merge and one more exchange). What is a finding is a refusal that leaves the two
+/// peers holding different states for good, the freenet/river#423 class. A node
+/// that refuses an update keeps its own state, so if neither peer accepts what the
+/// other sends, by delta or by whole state, they never converge.
+///
+/// So the two peers are simulated exchanging states, see [`refusal_exchange`]:
+///
+/// - They agree: the refusal was transient. Inconclusive with the contract's reason,
+///   as before #5725.
+/// - They stop moving while still apart: a stable disagreement, reported as a
+///   [`ConformanceProperty::StateCommutativity`] violation between the two states
+///   they end on. This is the same law a contract breaks when it keeps its own state
+///   by returning it (mutual rejection, see [`ConformanceProperty`]); refusing by
+///   error is the same behaviour reached by a different return value. It is
+///   checkable from the evidence bytes alone, and `verify_case` re-runs it before
+///   reporting, so the refusal must reproduce with the same outcome.
+/// - The rounds run out: [`Inconclusive::RoundLimit`]. A cycle lands here too,
+///   deliberately: the exchange follows one delivery order, and a different order
+///   might converge. A fixpoint does not have that problem, because two peers
+///   holding states neither will accept from the other stay put under every order.
+///
+/// # A contract that reads the host clock is not accused
+///
+/// A clock-gated refusal (the common shape is rejecting a timestamp more than K
+/// seconds in the future, #5465) reproduces on the re-run, yet the network
+/// converges once time passes. Re-running cannot tell that apart from a permanent
+/// refusal, so when [`ConformanceOracle::reads_host_clock`] says the contract imports
+/// the clock, a stuck exchange stays [`Inconclusive::ContractError`], with a reason
+/// that says why it was not reported. That leaves a residual: a clock-reading
+/// contract whose refusal is permanent is not reported here.
+fn refused_merge_outcome<O: ConformanceOracle + ?Sized>(
+    oracle: &mut O,
+    property: ConformanceProperty,
+    a: &[u8],
+    b: &[u8],
+    first: FirstMerges,
+    related: &RelatedContracts<'static>,
+) -> Result<PropertyOutcome, Inconclusive> {
+    let first_refusal = match (&first.ab, &first.ba) {
+        (Err(reason), _) | (Ok(_), Err(reason)) => reason.clone(),
+        (Ok(_), Ok(_)) => {
+            return Err(Inconclusive::MalformedCase(
+                "refusal exchange started without a refusal".to_string(),
+            ));
+        }
+    };
+    match refusal_exchange(oracle, a, b, first, related)? {
+        Exchange::Converged => Err(Inconclusive::ContractError(first_refusal)),
+        Exchange::OutOfRounds => Err(Inconclusive::RoundLimit),
+        Exchange::Stuck { .. } if oracle.reads_host_clock() => {
+            Err(Inconclusive::ContractError(format!(
+                "{first_refusal}; exchanging states left the two peers apart, but the \
+                 contract reads the host clock, so the refusal may clear as time passes \
+                 and is not reported as a finding (#5725)"
+            )))
+        }
+        Exchange::Stuck {
+            left,
+            right,
+            refusal,
+        } => {
+            let cause = match refusal {
+                Some(refusal) => format!("the contract refused ({refusal})"),
+                None => format!(
+                    "each side's merge returned the state it already held (an earlier \
+                     merge was refused: {first_refusal})"
+                ),
+            };
+            Ok(compare(
+                property,
+                &left,
+                &right,
+                &format!(
+                    "the contract refused to merge two states it validates, and \
+                     exchanging states until neither side moves leaves the two peers \
+                     holding different states; in the last exchange {cause}, so they \
+                     never converge (#5725)"
+                ),
+            ))
+        }
+    }
+}
+
+/// The two full-state merges the commutativity check already ran, `merge(A, B)` and
+/// `merge(B, A)`, with a refusal as `Err(reason)`. The exchange reuses them rather
+/// than calling the contract again for the same inputs.
+struct FirstMerges {
+    ab: Result<Vec<u8>, String>,
+    ba: Result<Vec<u8>, String>,
+}
+
+/// How many exchanges [`refusal_exchange`] simulates before giving up, as
+/// [`Inconclusive::RoundLimit`].
+///
+/// Spent only on a commutativity case whose merge the contract refused. Each round
+/// costs at most, per side, one summary, one delta, one delta apply, one full-state
+/// merge and one validation. River's transient refusal, the case this exists to
+/// acquit, clears in two rounds (the reverse merge, then one more exchange), and
+/// every stuck case in the tests stops moving within two. 8 leaves room for slower
+/// convergence while keeping one case to at most 80 contract calls.
+pub const MAX_REFUSAL_EXCHANGE_ROUNDS: usize = 8;
+
+/// How [`refusal_exchange`] ended.
+#[derive(Debug, PartialEq, Eq)]
+enum Exchange {
+    /// The two peers hold the same state.
+    Converged,
+    /// A full exchange moved neither peer, and they still differ.
+    Stuck {
+        left: Vec<u8>,
+        right: Vec<u8>,
+        /// The refusal seen in the last exchange, if the contract raised one there.
+        /// `None` means both sides kept their state by returning it.
+        refusal: Option<String>,
+    },
+    /// [`MAX_REFUSAL_EXCHANGE_ROUNDS`] ran out with neither of the above.
+    OutOfRounds,
+}
+
+/// Two peers, one holding `a` and one holding `b`, exchange states until they agree
+/// or a full exchange moves neither of them.
+///
+/// Each round, the `a` peer receives from the `b` peer, then the `b` peer receives
+/// from the `a` peer's NEW state, which is the order the commutativity check itself
+/// starts in. How one peer receives is [`exchange_step`].
+///
+/// This differs from [`reconciliation_cycle`], which models both deltas of a round
+/// against the pre-round states. That check looks for a loop, where a sequential
+/// schedule could hide one; this one looks for a fixpoint, which is the same under
+/// every schedule, and the sequential order is the one where a transient refusal
+/// clears soonest.
+fn refusal_exchange<O: ConformanceOracle + ?Sized>(
+    oracle: &mut O,
+    a: &[u8],
+    b: &[u8],
+    first: FirstMerges,
+    related: &RelatedContracts<'static>,
+) -> Result<Exchange, Inconclusive> {
+    let mut known = KnownMerges {
+        ab: (a.to_vec(), b.to_vec(), first.ab),
+        ba: (b.to_vec(), a.to_vec(), first.ba),
+    };
+    let (mut left, mut right) = (a.to_vec(), b.to_vec());
+    for _ in 0..MAX_REFUSAL_EXCHANGE_ROUNDS {
+        if left == right {
+            return Ok(Exchange::Converged);
+        }
+        let (next_left, left_refusal) = exchange_step(oracle, &left, &right, related, &mut known)?;
+        let (next_right, right_refusal) =
+            exchange_step(oracle, &right, &next_left, related, &mut known)?;
+        if next_left == left && next_right == right {
+            return Ok(Exchange::Stuck {
+                left,
+                right,
+                refusal: right_refusal.or(left_refusal),
+            });
+        }
+        (left, right) = (next_left, next_right);
+    }
+    if left == right {
+        return Ok(Exchange::Converged);
+    }
+    Ok(Exchange::OutOfRounds)
+}
+
+/// The two full-state merges already computed, keyed by their exact inputs.
+struct KnownMerges {
+    ab: (Vec<u8>, Vec<u8>, Result<Vec<u8>, String>),
+    ba: (Vec<u8>, Vec<u8>, Result<Vec<u8>, String>),
+}
+
+impl KnownMerges {
+    fn get(&self, holder: &[u8], incoming: &[u8]) -> Option<Result<Vec<u8>, String>> {
+        [&self.ab, &self.ba]
+            .into_iter()
+            .find(|(h, i, _)| h == holder && i == incoming)
+            .map(|(_, _, result)| result.clone())
+    }
+}
+
+/// One peer holding `holder` receives from the peer holding `sender`, in the order
+/// production uses: returns the state it then holds, and the contract's reason if it
+/// refused.
+///
+/// The sender computes `get_state_delta(sender, summarize(holder))`, as
+/// [`reconciliation_cycle`] models. An empty delta, or one production's size gate
+/// would refuse ([`delta_would_be_refused`]), is not sent, and the whole state is
+/// merged instead. A delta the holder refuses, one whose result the contract
+/// does not validate (production drops that state and resyncs with the whole
+/// state), or one that does not move it, also falls back to the whole state. That
+/// last fallback is deliberately generous: production sends nothing more after an
+/// empty or no-op delta, but this gives the contract every route the protocol has,
+/// so "stuck" means neither the delta nor the whole state gets through. Erring
+/// toward movement is the safe direction for a check that accuses a contract.
+///
+/// A WHOLE-STATE merge result the contract does not validate is
+/// [`Inconclusive::InputNotValid`], as in [`reconciliation_cycle`]: there is no
+/// further route, the defect is [`ConformanceProperty::EmittedStateValidity`]'s, and
+/// reporting it here would accuse the right contract under the wrong law. A runtime
+/// or resource failure is not the contract's answer and propagates as inconclusive.
+fn exchange_step<O: ConformanceOracle + ?Sized>(
+    oracle: &mut O,
+    holder: &[u8],
+    sender: &[u8],
+    related: &RelatedContracts<'static>,
+    known: &mut KnownMerges,
+) -> Result<(Vec<u8>, Option<String>), Inconclusive> {
+    let summary = oracle.summarize_state(holder).map_err(inconclusive_from)?;
+    let delta = oracle
+        .get_state_delta(sender, &summary)
+        .map_err(inconclusive_from)?;
+    let mut refusal = None;
+    if !delta.is_empty() && !delta_would_be_refused(&delta, sender) {
+        match refusable(apply_delta_bytes(oracle, holder, &delta))? {
+            Ok(next) if next != holder => {
+                match oracle
+                    .validate_state(&next, related)
+                    .map_err(inconclusive_from)?
+                {
+                    ValidateResult::Valid => return Ok((next, None)),
+                    // Production drops it and resyncs with the whole state.
+                    ValidateResult::Invalid => {
+                        refusal = Some("the delta's result is not a valid state".to_string())
+                    }
+                    ValidateResult::RequestRelated(_) => return Err(Inconclusive::RelatedRequired),
+                }
+            }
+            Ok(_) => {}
+            Err(reason) => refusal = Some(reason),
+        }
+    }
+    let merged = match known.get(holder, sender) {
+        Some(result) => result,
+        None => heal_merge(oracle, holder, sender)?,
+    };
+    match merged {
+        Ok(next) if next != holder => {
+            require_valid(oracle, &next, related)?;
+            Ok((next, None))
+        }
+        Ok(_) => Ok((holder.to_vec(), refusal)),
+        Err(reason) => Ok((holder.to_vec(), Some(reason))),
     }
 }
 
@@ -1188,13 +1462,6 @@ fn digest(bytes: &[u8]) -> [u8; 32] {
     *blake3::hash(bytes).as_bytes()
 }
 
-/// Would the network refuse to send this delta and ship the whole state instead?
-///
-/// Deliberately conservative relative to `ring::interest::gate_delta_size`: a delta
-/// at least as large as the state it would replace carries no saving, and the
-/// production path treats that case as a full-state send. Erring toward the fallback
-/// only ever makes the simulation converge more readily, which is the safe direction
-/// for a check whose failure mode is accusing a correct contract.
 /// Whether production would refuse this delta and send the whole state instead.
 ///
 /// `sender_state` is the state of the peer COMPUTING the delta, which is what
@@ -1298,8 +1565,11 @@ fn inconclusive_from(err: OracleError) -> Inconclusive {
         // a violation's premise and then needs a merge the contract refuses:
         // `heal_merge` turns a `ContractError` (never a runtime or resource one)
         // into a `StateAssociativity` finding, because by then the contract is
-        // refusing to reconcile two valid states it emitted itself (#5725). Every
-        // other caller still gets the inconclusive below.
+        // refusing to reconcile two valid states it emitted itself (#5725). The
+        // other is `refused_merge_outcome`, which reports a refusal between two
+        // valid states as a `StateCommutativity` finding only when exchanging
+        // states leaves the two peers apart for good (#5725). Every other caller
+        // still gets the inconclusive below.
         //
         // The two are also LABELLED apart: a trap in the host or the WASM module is
         // not the contract's fault, and folding it into

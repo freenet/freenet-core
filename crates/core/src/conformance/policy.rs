@@ -1,87 +1,56 @@
-//! What a peer is allowed to *do* about a conformance finding.
+//! What a peer does with a conformance finding, and how serious the finding is.
 //!
 //! **Nodes do not remove contracts for breaking a merge law.** Removal was the
-//! plan in RFC #5320: offline validation, single-peer shadow validation, a full
-//! release of fleet-wide shadow mode, then an enforcement gate after which a
-//! verified violation would remove the contract. That plan is superseded, see
+//! plan in RFC #5320 and is superseded, see
 //! <https://github.com/freenet/freenet-core/issues/5906#issuecomment-6677346389>.
 //! Verifier and shadow results are diagnostics, recorded locally. Instead, nodes
 //! decline work that a contract with a lawful merge never needs: a payload already
 //! merged into the node's current state is not merged again
 //! (`ring::applied_payloads`).
 //!
-//! The removal machinery in this module ([`EnforcementMode::Enforce`],
-//! [`ConformanceAction::Remove`], [`RemovalTier`], and the `would_remove` count
-//! the shadow probe keeps) is retained and unreachable: nothing constructs
-//! `Enforce`, and enabling it is not planned. Whether to delete that code is a
-//! separate decision. While it exists, the decision function and its tests keep
-//! the invariants below, so the unreachable path cannot become live through one
-//! plausible-looking commit that treats a violation as a removal. Three invariants
-//! are pinned:
+//! Two things are decided here:
 //!
-//! 1. Under [`EnforcementMode::Shadow`], **no input of any kind produces a removal.**
-//! 2. A [`Severity::Diagnostic`] finding never proposes removal in *any* mode. A
-//!    wasteful self-delta (#5072, #5056) is an efficiency report about a contract
-//!    that still converges. Deleting an application over that would be absurd, and
-//!    the distinction is exactly the sort that erodes once "violation" becomes one
-//!    undifferentiated word.
-//! 3. A [`RemovalTier::ReportOnly`] finding is a [`ConformanceAction::Report`] in
-//!    every mode that runs, Shadow included. See [`removal_tier`].
+//! 1. [`decide`]: whether a verified outcome is reported at all. It is reported in
+//!    every mode that runs, and nothing else happens to it.
+//! 2. [`finding_class`]: whether a finding is [`FindingClass::Persistent`] (on its
+//!    own, it shows a contract that does not converge or is not deterministic) or
+//!    [`FindingClass::ReportOnly`] (anyone may be able to produce it on demand, or
+//!    it describes a contract that converges after a bounded cost). The class
+//!    decides which shadow count a finding lands in, whether `fdev` writes evidence
+//!    for it, and which finding the minimizer may shrink toward. A
+//!    [`Severity::Diagnostic`] finding is always `ReportOnly`.
+//!
+//! [`Severity::Diagnostic`]: super::property::Severity::Diagnostic
 
 use serde::{Deserialize, Serialize};
 
-use super::property::{
-    ConformanceProperty, IdempotenceSettling, PropertyOutcome, Severity, Violation,
-};
+use super::property::{ConformanceProperty, IdempotenceSettling, PropertyOutcome, Violation};
 
-/// How much authority the conformance mechanism currently has.
+/// Whether the conformance mechanism runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum EnforcementMode {
     /// Nothing runs. Sampling and checking are off entirely.
     Disabled,
-    /// The full mechanism runs and reports, but nothing is ever removed.
-    ///
-    /// The default, and the mode the conformance mechanism runs in. Its findings
-    /// are diagnostics recorded locally.
+    /// The full mechanism runs and reports. Its findings are diagnostics recorded
+    /// locally. The default.
     #[default]
     Shadow,
-    /// Verified violations would remove the contract locally.
-    ///
-    /// Retained and unreachable: nothing constructs it, and enabling it is not
-    /// planned, because the removal plan is superseded (see the module docs). It
-    /// was kept so the shadow-mode code path was the same one enforcement would
-    /// have used.
-    Enforce,
 }
 
 /// What the peer should do about one verified outcome.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConformanceAction {
-    /// The law held, or the check reached no verdict. Nothing to do.
+    /// The law held, the check reached no verdict, or the mechanism is disabled.
+    /// Nothing to do.
     Nothing,
-    /// Worth telling the author and the telemetry, but not grounds for removal.
+    /// Worth telling the author and the local diagnostics.
     Report(Violation),
-    /// Would have been removed had enforcement been enabled. Under the superseded
-    /// removal plan this was the number an enforcement gate would have been judged
-    /// on; it is now a diagnostic count recorded locally.
-    WouldRemove(Violation),
-    /// Remove the contract locally: stop executing, serving, propagating and
-    /// hosting it, and remember the id so ordinary traffic cannot immediately
-    /// reintroduce it. Unreachable: only [`EnforcementMode::Enforce`] produces it,
-    /// and nothing constructs that mode.
-    Remove(Violation),
 }
 
 impl ConformanceAction {
-    pub fn removes(&self) -> bool {
-        matches!(self, ConformanceAction::Remove(_))
-    }
-
     pub fn violation(&self) -> Option<&Violation> {
         match self {
-            ConformanceAction::Report(v)
-            | ConformanceAction::WouldRemove(v)
-            | ConformanceAction::Remove(v) => Some(v),
+            ConformanceAction::Report(v) => Some(v),
             ConformanceAction::Nothing => None,
         }
     }
@@ -93,101 +62,72 @@ impl ConformanceAction {
 /// takes an outcome rather than evidence: there is no argument you can pass it that
 /// means "another peer says so", because a remote claim is never grounds for
 /// anything on its own.
-///
-/// Only a [`Severity::Violation`] whose [`removal_tier`] is
-/// [`RemovalTier::RemovalEligible`] can propose a removal. Everything else that
-/// was violated is a [`ConformanceAction::Report`].
 pub fn decide(mode: EnforcementMode, outcome: &PropertyOutcome) -> ConformanceAction {
-    let violation = match outcome {
-        PropertyOutcome::Violated(v) => v.clone(),
-        PropertyOutcome::Holds | PropertyOutcome::Inconclusive(_) => {
-            return ConformanceAction::Nothing;
+    match (mode, outcome) {
+        (EnforcementMode::Disabled, _) => ConformanceAction::Nothing,
+        (EnforcementMode::Shadow, PropertyOutcome::Violated(v)) => {
+            ConformanceAction::Report(v.clone())
         }
-    };
-
-    // Severity comes from the property, not from the field the `Violation` carries:
-    // the headline invariant here is that a diagnostic never proposes removal in any
-    // mode, and that invariant should not rest on the caller never handing us a
-    // deserialized `Violation`. Same expression, no trust dependency.
-    match (
-        mode,
-        violation.property.severity(),
-        removal_tier(&violation),
-    ) {
-        (EnforcementMode::Disabled, _, _) => ConformanceAction::Nothing,
-        // Diagnostics are reports in every mode, enforcement included.
-        (_, Severity::Diagnostic, _) => ConformanceAction::Report(violation),
-        // So are report-only findings, and Shadow is not an exception: a
-        // `WouldRemove` is the diagnostic count of serious findings, and a
-        // finding anyone can produce on demand must not be able to move it.
-        (_, Severity::Violation, RemovalTier::ReportOnly) => ConformanceAction::Report(violation),
-        (EnforcementMode::Shadow, Severity::Violation, RemovalTier::RemovalEligible) => {
-            ConformanceAction::WouldRemove(violation)
-        }
-        (EnforcementMode::Enforce, Severity::Violation, RemovalTier::RemovalEligible) => {
-            ConformanceAction::Remove(violation)
+        (EnforcementMode::Shadow, PropertyOutcome::Holds | PropertyOutcome::Inconclusive(_)) => {
+            ConformanceAction::Nothing
         }
     }
 }
 
-/// Whether a finding may ever propose a removal, in any mode.
+/// How serious a finding is, separately from its [`Severity`].
 ///
-/// A separate axis from [`Severity`] on purpose. Severity says what the finding
-/// IS: a `Violation` broke a merge law, and `fdev` fails on it so the author fixes
-/// it. This says what the NETWORK may do about it. A law can be broken for real and
-/// still be no ground for removal, because removal needs more than a broken law:
-/// the finding must not be producible by inputs anyone may supply, and the
-/// contract must not converge after a bounded cost anyway. Folding that into the
-/// severity would bend the classification to soften an enforcement consequence,
-/// which is the move #5462 rejected.
+/// [`Severity`]: super::property::Severity
 ///
-/// Retained with the rest of the removal machinery, which is unreachable (see the
-/// module docs). Today the tier only decides whether a finding is counted as
-/// `would_remove` or as reported in the shadow diagnostics.
+/// Severity says what the finding IS: a `Violation` broke a merge law, and `fdev`
+/// fails on it so the author fixes it. The class says whether the finding, on its
+/// own, shows a contract that does not converge or is not deterministic. A law can
+/// be broken for real and still be `ReportOnly`: the finding may be producible by
+/// inputs anyone may supply, rest on a premise the bytes cannot carry, or describe
+/// a contract that converges after a bounded cost. Folding that into the severity
+/// would bend the classification, which is the move #5462 rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum RemovalTier {
-    /// [`ConformanceAction::WouldRemove`] in Shadow, [`ConformanceAction::Remove`]
-    /// under Enforce.
-    RemovalEligible,
-    /// [`ConformanceAction::Report`] in every mode that runs, Shadow included.
+pub enum FindingClass {
+    /// On its own, the finding shows a contract that does not converge or is not
+    /// deterministic.
+    Persistent,
+    /// Reported, and not counted as persistent.
     ReportOnly,
 }
 
-/// The tier a property's findings get before anything about the individual
+/// The class a property's findings get before anything about the individual
 /// finding is considered.
 ///
 /// An exhaustive match with no wildcard arm, so a new property does not compile
-/// until someone has decided whether it may lead to a removal.
+/// until someone has decided its class.
 ///
 /// The report-only set was decided on 2026-10-22 (merge-law conformance tracker
 /// #5906): properties whose findings can be produced by inputs anyone may supply,
-/// or that describe a contract which converges after a bounded cost, are reported
-/// and never removed.
-pub fn property_tier(property: ConformanceProperty) -> RemovalTier {
+/// or that describe a contract which converges after a bounded cost, are
+/// report-only.
+pub fn property_class(property: ConformanceProperty) -> FindingClass {
     match property {
         // Diagnostics: wasteful, or (delta idempotence) a law nodes act on no
         // verdict for. Never a proof of non-convergence.
-        // `decide` also refuses them by severity; listing them here keeps the tier
-        // table a complete answer on its own.
         ConformanceProperty::DeltaIdempotence
         | ConformanceProperty::SelfDeltaEmpty
-        | ConformanceProperty::WholeStateSelfDelta => RemovalTier::ReportOnly,
+        | ConformanceProperty::WholeStateSelfDelta => FindingClass::ReportOnly,
         // The delta-order law covers concurrent, independent deltas. Capture pairs
         // only deltas recorded against the same base, which is necessary for that
         // and not sufficient: it does not prove the two were concurrent. Until it
         // can, a finding here may be about a causally sequenced pair the law does
         // not cover.
-        ConformanceProperty::DeltaPermutationInvariance => RemovalTier::ReportOnly,
+        ConformanceProperty::DeltaPermutationInvariance => FindingClass::ReportOnly,
         // Both path-agreement forms rest on more than the contract's algebra: the
         // pairwise form on a model of which path the protocol takes, the transition
         // form on provenance (`result` was reached from `base`) that the bytes
-        // cannot carry. Their removal arguments also assumed a semilattice join,
-        // which heal-guarded associativity (#5915) no longer implies.
+        // cannot carry. Their argument for being persistent also assumed a
+        // semilattice join, which heal-guarded associativity (#5915) no longer
+        // implies.
         ConformanceProperty::PathAgreement | ConformanceProperty::TransitionPathAgreement => {
-            RemovalTier::ReportOnly
+            FindingClass::ReportOnly
         }
-        // `StateIdempotence` is refined per finding by `removal_tier`: a state that
-        // settles after a rewrite is report-only, anything else keeps this tier.
+        // `StateIdempotence` is refined per finding by `finding_class`: a state that
+        // settles after a rewrite is report-only, anything else keeps this class.
         ConformanceProperty::StateIdempotence
         | ConformanceProperty::StateCommutativity
         | ConformanceProperty::StateAssociativity
@@ -195,11 +135,11 @@ pub fn property_tier(property: ConformanceProperty) -> RemovalTier {
         | ConformanceProperty::UpdateDeterminism
         | ConformanceProperty::SummaryDeterminism
         | ConformanceProperty::DeltaDeterminism
-        | ConformanceProperty::ReconciliationCycle => RemovalTier::RemovalEligible,
+        | ConformanceProperty::ReconciliationCycle => FindingClass::Persistent,
     }
 }
 
-/// The tier of one finding: [`property_tier`], refined by what this peer
+/// The class of one finding: [`property_class`], refined by what this peer
 /// recomputed about the finding.
 ///
 /// The one refinement is idempotence. A `StateIdempotence` finding whose state
@@ -208,127 +148,95 @@ pub fn property_tier(property: ConformanceProperty) -> RemovalTier {
 /// stores raw client bytes without running the merge, so anyone who can PUT can
 /// produce one. A finding that did not settle within the budget
 /// ([`IdempotenceSettling::NeverSettled`]) or whose classification could not
-/// complete ([`IdempotenceSettling::Indeterminate`]) keeps the property's tier.
-/// Neither is a proof that the state never settles, so both were a known gap to
-/// close before Enforce could become reachable. Enforce is not planned (see the
-/// module docs), so this now affects only which diagnostic count a finding lands in.
+/// complete ([`IdempotenceSettling::Indeterminate`]) keeps the property's class.
+/// Neither is a proof that the state never settles; see
+/// `tests::known_gap_idempotence_not_shown_to_settle_stays_persistent`.
 ///
-/// This tier governs conformance REMOVAL only. The live re-apply probe
-/// (`ring::broken_invariants`, fed by `contract::executor::runtime::reapply_probe`)
-/// suppresses propagation for a contract whose merge does not settle when an
-/// incoming state is re-applied, independently of this tier.
+/// This class is separate from the live re-apply probe
+/// (`ring::broken_invariants`, fed by `contract::executor::runtime::reapply_probe`),
+/// which suppresses propagation for a contract whose merge does not settle when an
+/// incoming state is re-applied, independently of this class.
 ///
 /// `settling` is read from the `Violation` because nothing else carries it. That
-/// is sound for the same reason [`decide`] is: its caller re-executed the case
-/// itself, so the classification is local. It can also only LOWER the tier: the
-/// arm keys on the property, so a `settling` value on any other property is
-/// ignored, and every other settling class leaves the property's tier unchanged.
-pub fn removal_tier(violation: &Violation) -> RemovalTier {
+/// is sound because the callers re-executed the case themselves, so the
+/// classification is local. It can also only LOWER the class: the arm keys on the
+/// property, so a `settling` value on any other property is ignored, and every
+/// other settling class leaves the property's class unchanged.
+pub fn finding_class(violation: &Violation) -> FindingClass {
     match (violation.property, violation.settling) {
         (ConformanceProperty::StateIdempotence, Some(IdempotenceSettling::SettledAfter(_))) => {
-            RemovalTier::ReportOnly
+            FindingClass::ReportOnly
         }
-        (property, _) => property_tier(property),
+        (property, _) => property_class(property),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::conformance::property::Severity;
     use crate::conformance::property::{Inconclusive, OutputDigest};
 
     fn violation(property: ConformanceProperty) -> PropertyOutcome {
-        PropertyOutcome::Violated(Violation {
+        PropertyOutcome::Violated(violation_of(property))
+    }
+
+    fn violation_of(property: ConformanceProperty) -> Violation {
+        Violation {
             property,
             severity: property.severity(),
             left: OutputDigest::of(b"left"),
             right: OutputDigest::of(b"right"),
             detail: "test".to_string(),
             settling: None,
-        })
+        }
     }
 
     /// A `Violation` whose carried severity disagrees with its property must not be
-    /// able to buy itself removal eligibility.
+    /// able to make itself persistent.
     ///
     /// `Violation` is `Deserialize` with public fields and travels inside evidence,
     /// so in any future that feeds wire data to these functions the field is
-    /// attacker-influenceable while the property is not. The invariant this module
-    /// leads with — a diagnostic never proposes removal in any mode — should hold
-    /// because of what the property IS, not because every caller can be trusted to
-    /// have built the struct honestly.
+    /// attacker-influenceable while the property is not.
     #[test]
-    fn a_forged_severity_cannot_make_a_diagnostic_removable() {
+    fn a_forged_severity_cannot_make_a_diagnostic_persistent() {
         // DeltaIdempotence is a diagnostic; claim otherwise in the struct.
-        let forged = PropertyOutcome::Violated(Violation {
-            property: ConformanceProperty::DeltaIdempotence,
+        let forged = Violation {
             severity: Severity::Violation,
-            left: OutputDigest::of(b"left"),
-            right: OutputDigest::of(b"right"),
-            detail: "claims to be enforceable".to_string(),
-            settling: None,
-        });
-
+            detail: "claims to be a law break".to_string(),
+            ..violation_of(ConformanceProperty::DeltaIdempotence)
+        };
         assert!(
-            !forged.is_enforceable_violation(),
+            !PropertyOutcome::Violated(forged.clone()).is_enforceable_violation(),
             "severity must come from the property, not from the carried field"
         );
-        assert!(
-            !decide(EnforcementMode::Enforce, &forged).removes(),
-            "a diagnostic property must not be removable even under Enforce, and even \
-             when the struct says otherwise"
-        );
+        assert_eq!(finding_class(&forged), FindingClass::ReportOnly);
     }
 
-    /// The load-bearing test. If a future change makes shadow mode capable of
-    /// removing anything, this fails. Shadow is the mode that runs, and nodes do
-    /// not remove contracts for breaking a merge law.
+    /// Every verified violation is reported while the mechanism runs, whatever its
+    /// property or class, and nothing is reported for an outcome without one.
     #[test]
-    fn shadow_mode_never_removes_anything() {
+    fn shadow_reports_every_violation_and_nothing_else() {
         for property in ConformanceProperty::ALL {
-            let action = decide(EnforcementMode::Shadow, &violation(*property));
             assert!(
-                !action.removes(),
-                "shadow mode proposed a removal for {property}"
+                matches!(
+                    decide(EnforcementMode::Shadow, &violation(*property)),
+                    ConformanceAction::Report(_)
+                ),
+                "{property}"
             );
         }
-        assert!(!decide(EnforcementMode::Shadow, &PropertyOutcome::Holds).removes());
-        assert!(
-            !decide(
+        assert_eq!(
+            decide(EnforcementMode::Shadow, &PropertyOutcome::Holds),
+            ConformanceAction::Nothing
+        );
+        assert_eq!(
+            decide(
                 EnforcementMode::Shadow,
                 &PropertyOutcome::Inconclusive(Inconclusive::RoundLimit)
-            )
-            .removes()
+            ),
+            ConformanceAction::Nothing
         );
-    }
-
-    /// A wasteful self-delta is an efficiency complaint about a contract that still
-    /// converges. It must never propose removal, even under the unreachable
-    /// `Enforce` mode.
-    #[test]
-    fn diagnostics_never_propose_removal_even_under_enforcement() {
-        for property in ConformanceProperty::ALL {
-            if property.severity() != Severity::Diagnostic {
-                continue;
-            }
-            let action = decide(EnforcementMode::Enforce, &violation(*property));
-            assert!(
-                matches!(action, ConformanceAction::Report(_)),
-                "diagnostic {property} produced {action:?} under enforcement"
-            );
-        }
-    }
-
-    /// The counterpart: the check must be capable of proposing removal at all, or
-    /// the two tests above would pass against a mechanism that does nothing.
-    #[test]
-    fn a_merge_law_break_would_be_removed_in_shadow_and_is_under_enforcement() {
-        let outcome = violation(ConformanceProperty::StateCommutativity);
-        assert!(matches!(
-            decide(EnforcementMode::Shadow, &outcome),
-            ConformanceAction::WouldRemove(_)
-        ));
-        assert!(decide(EnforcementMode::Enforce, &outcome).removes());
     }
 
     #[test]
@@ -342,189 +250,118 @@ mod tests {
     }
 
     /// Shadow is the default because a mode that had to be opted *into* would mean
-    /// the safe state depends on every call site remembering to ask for it.
+    /// the running state depends on every call site remembering to ask for it.
     #[test]
     fn the_default_mode_is_shadow() {
         assert_eq!(EnforcementMode::default(), EnforcementMode::Shadow);
     }
 
-    /// Every mode, written so a new one does not compile until it is listed here.
-    fn every_mode() -> [EnforcementMode; 3] {
-        let modes = [
-            EnforcementMode::Disabled,
-            EnforcementMode::Shadow,
-            EnforcementMode::Enforce,
-        ];
-        for mode in modes {
-            match mode {
-                EnforcementMode::Disabled | EnforcementMode::Shadow | EnforcementMode::Enforce => {}
-            }
-        }
-        modes
-    }
-
-    fn idempotence_with(settling: Option<IdempotenceSettling>) -> PropertyOutcome {
-        PropertyOutcome::Violated(Violation {
+    fn idempotence_with(settling: Option<IdempotenceSettling>) -> Violation {
+        Violation {
             settling,
             ..violation_of(ConformanceProperty::StateIdempotence)
-        })
-    }
-
-    fn violation_of(property: ConformanceProperty) -> Violation {
-        match violation(property) {
-            PropertyOutcome::Violated(v) => v,
-            PropertyOutcome::Holds | PropertyOutcome::Inconclusive(_) => {
-                unreachable!("violation() builds a violation")
-            }
-        }
-    }
-
-    /// A report-only finding is `Report` in every mode that runs, Shadow included,
-    /// and `Nothing` when the mechanism is disabled.
-    #[track_caller]
-    fn assert_report_only_in_every_mode(outcome: &PropertyOutcome) {
-        for mode in every_mode() {
-            let action = decide(mode, outcome);
-            match mode {
-                EnforcementMode::Disabled => assert_eq!(action, ConformanceAction::Nothing),
-                EnforcementMode::Shadow | EnforcementMode::Enforce => assert!(
-                    matches!(action, ConformanceAction::Report(_)),
-                    "a report-only finding produced {action:?} under {mode:?}"
-                ),
-            }
         }
     }
 
     #[test]
-    fn a_settled_idempotence_finding_is_report_only_in_every_mode() {
+    fn a_settled_idempotence_finding_is_report_only() {
         for rewrites in [1, 2, u32::MAX] {
-            assert_report_only_in_every_mode(&idempotence_with(Some(
-                IdempotenceSettling::SettledAfter(rewrites),
-            )));
+            assert_eq!(
+                finding_class(&idempotence_with(Some(IdempotenceSettling::SettledAfter(
+                    rewrites
+                )))),
+                FindingClass::ReportOnly
+            );
         }
-    }
-
-    #[test]
-    fn transition_path_agreement_is_report_only_in_every_mode() {
-        assert_report_only_in_every_mode(&violation(ConformanceProperty::TransitionPathAgreement));
-    }
-
-    #[test]
-    fn delta_permutation_invariance_is_report_only_in_every_mode() {
-        assert_report_only_in_every_mode(&violation(
-            ConformanceProperty::DeltaPermutationInvariance,
-        ));
-    }
-
-    #[test]
-    fn path_agreement_is_report_only_in_every_mode() {
-        assert_report_only_in_every_mode(&violation(ConformanceProperty::PathAgreement));
-    }
-
-    #[test]
-    fn delta_idempotence_is_report_only_in_every_mode() {
-        assert_report_only_in_every_mode(&violation(ConformanceProperty::DeltaIdempotence));
-    }
-
-    #[test]
-    fn self_delta_empty_is_report_only_in_every_mode() {
-        assert_report_only_in_every_mode(&violation(ConformanceProperty::SelfDeltaEmpty));
-    }
-
-    #[test]
-    fn whole_state_self_delta_is_report_only_in_every_mode() {
-        assert_report_only_in_every_mode(&violation(ConformanceProperty::WholeStateSelfDelta));
     }
 
     /// The counterpart to the settled case: an idempotence finding that is NOT shown
-    /// to settle keeps the property's tier. Without this, making all of
+    /// to settle keeps the property's class. Without this, making all of
     /// `StateIdempotence` report-only would pass the settled test above.
     ///
     /// KNOWN GAP, pinned on purpose. `NeverSettled` here means "did not settle
     /// within the budget" and `Indeterminate` means "classification failed" (a trap
     /// or a resource ceiling can cause it). Neither is a proof that the state never
-    /// settles. Under the superseded removal plan both had to be resolved before
-    /// Enforce could become reachable (#5906). Enforce is not planned, so this test
-    /// records what the policy does today: which diagnostic count the finding
-    /// lands in.
+    /// settles (#5906). This test records what the classification does today.
     #[test]
-    fn known_gap_idempotence_not_shown_to_settle_stays_removal_eligible() {
+    fn known_gap_idempotence_not_shown_to_settle_stays_persistent() {
         for settling in [
             Some(IdempotenceSettling::NeverSettled),
             Some(IdempotenceSettling::Indeterminate),
             None,
         ] {
-            let outcome = idempotence_with(settling);
-            assert!(
-                matches!(
-                    decide(EnforcementMode::Shadow, &outcome),
-                    ConformanceAction::WouldRemove(_)
-                ),
-                "{settling:?} must stay would-remove in shadow"
-            );
-            assert!(
-                decide(EnforcementMode::Enforce, &outcome).removes(),
-                "{settling:?} must stay removable under enforcement"
+            assert_eq!(
+                finding_class(&idempotence_with(settling)),
+                FindingClass::Persistent,
+                "{settling:?}"
             );
         }
     }
 
     /// `settling` refines idempotence only. A `SettledAfter` attached to any other
-    /// property must not buy it the report-only tier.
+    /// property must not make it report-only.
     #[test]
-    fn a_settling_value_on_another_property_does_not_change_its_tier() {
-        let outcome = PropertyOutcome::Violated(Violation {
+    fn a_settling_value_on_another_property_does_not_change_its_class() {
+        let v = Violation {
             settling: Some(IdempotenceSettling::SettledAfter(1)),
             ..violation_of(ConformanceProperty::StateCommutativity)
-        });
-        assert!(decide(EnforcementMode::Enforce, &outcome).removes());
+        };
+        assert_eq!(finding_class(&v), FindingClass::Persistent);
     }
 
-    /// The whole partition, stated once. A property moving between tiers is a
-    /// decision about what the network may do, so it must show up as a change to
-    /// this list, not only as a changed arm in `property_tier`.
+    /// The persistent properties, in `ConformanceProperty::ALL` order. Every other
+    /// property is report-only.
+    const PERSISTENT_PROPERTIES: &[ConformanceProperty] = &[
+        ConformanceProperty::StateIdempotence,
+        ConformanceProperty::StateCommutativity,
+        ConformanceProperty::StateAssociativity,
+        ConformanceProperty::EmittedStateValidity,
+        ConformanceProperty::UpdateDeterminism,
+        ConformanceProperty::SummaryDeterminism,
+        ConformanceProperty::DeltaDeterminism,
+        ConformanceProperty::ReconciliationCycle,
+    ];
+
+    /// Every property, through the per-finding function: an unrefined finding is
+    /// persistent exactly when its property is listed, and report-only otherwise.
     #[test]
-    fn the_removal_eligible_properties_are_exactly_these() {
-        let eligible: Vec<ConformanceProperty> = ConformanceProperty::ALL
-            .iter()
-            .copied()
-            .filter(|p| property_tier(*p) == RemovalTier::RemovalEligible)
-            .collect();
-        assert_eq!(
-            eligible,
-            vec![
-                ConformanceProperty::StateIdempotence,
-                ConformanceProperty::StateCommutativity,
-                ConformanceProperty::StateAssociativity,
-                ConformanceProperty::EmittedStateValidity,
-                ConformanceProperty::UpdateDeterminism,
-                ConformanceProperty::SummaryDeterminism,
-                ConformanceProperty::DeltaDeterminism,
-                ConformanceProperty::ReconciliationCycle,
-            ]
-        );
-        // And each of them really does reach `WouldRemove`, so the list is a fact
-        // about `decide` and not only about the table.
-        for property in eligible {
-            assert!(
-                matches!(
-                    decide(EnforcementMode::Shadow, &violation(property)),
-                    ConformanceAction::WouldRemove(_)
-                ),
-                "{property} is listed removal-eligible but shadow did not propose it"
+    fn every_property_has_the_listed_finding_class() {
+        for property in ConformanceProperty::ALL {
+            let expected = if PERSISTENT_PROPERTIES.contains(property) {
+                FindingClass::Persistent
+            } else {
+                FindingClass::ReportOnly
+            };
+            assert_eq!(
+                finding_class(&violation_of(*property)),
+                expected,
+                "{property}"
             );
         }
     }
 
-    /// A diagnostic is report-only in the table too, so the two refusals in
-    /// `decide` cannot disagree about any property.
+    /// The whole partition, stated once. A property moving between classes changes
+    /// what the shadow counts and `fdev`'s evidence mean, so it must show up as a
+    /// change to this list, not only as a changed arm in `property_class`.
+    #[test]
+    fn the_persistent_properties_are_exactly_these() {
+        let persistent: Vec<ConformanceProperty> = ConformanceProperty::ALL
+            .iter()
+            .copied()
+            .filter(|p| property_class(*p) == FindingClass::Persistent)
+            .collect();
+        assert_eq!(persistent, PERSISTENT_PROPERTIES);
+    }
+
+    /// A diagnostic is report-only in the table, so a diagnostic can never be
+    /// counted as a persistent finding.
     #[test]
     fn every_diagnostic_property_is_report_only() {
         for property in ConformanceProperty::ALL {
             if property.severity() == Severity::Diagnostic {
                 assert_eq!(
-                    property_tier(*property),
-                    RemovalTier::ReportOnly,
+                    property_class(*property),
+                    FindingClass::ReportOnly,
                     "{property}"
                 );
             }
