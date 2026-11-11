@@ -8,8 +8,8 @@
 //! `StreamIdentity` and the orphan registry work unchanged.
 //!
 //! Every stream is read unordered from its first byte (`read_chunk(_, false)`,
-//! [`BodyReader::next_piece`]): quinn's assembler hands over each piece as it
-//! arrives, gap or not, so quinn holds nothing for a stream beyond the chunks
+//! [`BodyReader::next_piece`]): quinn hands over each piece as it arrives,
+//! gap or not, so quinn holds nothing for a stream beyond the chunks
 //! the reader has not polled yet. Unordered reads return the peer's credit for
 //! every byte read, so what the reader keeps is bounded here instead:
 //! - Before a stream's header, metadata or control body has been taken, the
@@ -85,9 +85,8 @@
 //!   header with an invalid declared length is also counted as
 //!   `InboundStreamOutcome::RefusedInvalidLength`, as the UDP path counts it.
 //!
-//! Memory: quinn hands out stream data as slices of the datagram it arrived
-//! in, so keeping a 1-byte chunk keeps its whole datagram. Every read
-//! therefore copies: staged bytes into the stream's staging buffer, a short or
+//! Memory: a chunk quinn hands out may share an allocation larger than
+//! itself, so the reader never keeps one. Every read copies: staged bytes into the stream's staging buffer, a short or
 //! control body into one buffer that grows as data arrives and ends exactly
 //! the declared length, and a `Stream`'s payload into fragments (the
 //! `Rechunker`), each a buffer of exactly its length filled at its offsets, so
@@ -558,7 +557,7 @@ impl<T: TimeSource> BodyReader<T> {
 
     /// The next piece of the stream in arrival order, with its offset, or
     /// `None` at the end. Read unordered (`read_chunk(max, false)`), so quinn's
-    /// assembler releases each chunk as soon as it arrives, gap or not: the
+    /// releases each chunk as soon as it arrives, gap or not: the
     /// bytes then live only where the caller copies them, which is charged or
     /// staged against a cap.
     async fn next_piece(&mut self) -> Result<Option<(u64, Bytes)>, ReadFailure> {
@@ -2373,9 +2372,9 @@ mod tests {
         }
     }
 
-    /// A read buffer allocates nothing for bytes that have not arrived: it
-    /// starts at `READ_START_BYTES` whatever the declared length, grows by
-    /// doubling but never past that length, and ends exactly that long.
+    /// A rechunked stream finishes only with every declared byte and no
+    /// more: one short is `Truncated`, one past is `Overlong`, and a gap
+    /// left open is truncated whichever side of it arrived.
     #[test]
     fn finish_requires_every_declared_byte_and_no_more() {
         for total in [1usize, F, F + 1, 3 * F] {
@@ -2652,11 +2651,9 @@ mod tests {
         assert_eq!(conn.kept(), 0);
     }
 
-    /// The receive side relies on quinn-proto 0.11.17 or later within 0.11:
-    /// `COMPACT_THRESHOLD` and `MAX_CHUNKS` bound what its assembler can hold
-    /// for a stream between two of our reads, and unordered reads release each
-    /// chunk as it arrives. A version outside that range must be re-read
-    /// (`assembler.rs`) before it is taken.
+    /// The receive side was written against quinn-proto 0.11.17 or later
+    /// within 0.11, where unordered reads release each chunk as it arrives.
+    /// A version outside that range must be re-read before it is taken.
     #[test]
     fn quinn_proto_is_one_whose_assembler_this_reader_was_written_for() {
         let versions = super::super::super::tests::locked_versions("quinn-proto");

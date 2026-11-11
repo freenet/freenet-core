@@ -3070,17 +3070,6 @@ mod tests {
                  in the quic::config module doc; summed once a QUIC path cap exists \
                  (M4, #5940)",
             ),
-            // QUIC_ASSEMBLER_HOLD_WINDOW_MULTIPLE (a multiple of the window,
-            // so not a `_BYTES` name the discovery scan finds) is the other
-            // half of this term: streams x this + that multiple x W.
-            (
-                "QUIC_ASSEMBLER_HOLD_PER_STREAM_BYTES",
-                "a measurement of one QUIC connection term (received data per uni \
-                 stream, 1200-byte datagrams; with QUIC_ASSEMBLER_HOLD_WINDOW_MULTIPLE \
-                 x W), not a ceiling; an input to the per-path ceiling (memory gate \
-                 M2, #5940), plus the unmeasured terms in the quic::config module \
-                 doc; summed once a QUIC path cap exists (M4, #5940)",
-            ),
             (
                 "QUIC_ACK_TAIL_BYTES",
                 "a measurement of one QUIC connection term (ACK-only records after \
@@ -3092,8 +3081,9 @@ mod tests {
             // Buffer-budget terms (#5940): the fixed charge per QUIC connection
             // and the node-wide budget for what scales with the windows. Both
             // are summed (budget + quic_connections x charge) by the buffer
-            // budget's aggregate-accounting step, which waits for the
-            // small-host decision; nothing is charged against either yet.
+            // budget's aggregate-accounting step (PR 5), which must land before
+            // any release carries data on QUIC
+            // (`no_data_share_before_the_quic_budget_is_summed`).
             (
                 "QUIC_OPEN_STREAM_BYTES",
                 "a measurement of one QUIC connection term (one open stream, both \
@@ -3118,8 +3108,8 @@ mod tests {
             (
                 "QUIC_CONNECTION_CHARGE_BYTES",
                 "the fixed charge per QUIC connection; summed as quic_connections x \
-                 this by the buffer budget's aggregate-accounting step (#5940), \
-                 which waits for the small-host decision on the connection cap",
+                 this by the buffer budget's aggregate-accounting step (#5940, PR 5), \
+                 before any release carries data on QUIC",
             ),
             (
                 "quic_buffer_budget_for",

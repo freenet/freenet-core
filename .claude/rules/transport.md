@@ -1527,7 +1527,7 @@ release's value cannot stop the node. On the command line a negative value
 needs `=` (`--quic-max-paths=-1`): with a space clap reads `-1` as a flag and
 refuses the command line, as for every numeric option.
 The default is `max-number-of-connections`, and a larger value is lowered to
-it, because the flow-control windows are sized for that many connections.
+it.
 At the default the limit rarely binds (a permit is held from the offer, so a
 path still closing can briefly hold a slot). A rollback to a release before
 the key drops it: the older binary rewrites `config.toml` without it. It is
@@ -1641,23 +1641,19 @@ changes). A shadow path keeps the initial window. A data path registers a
 `quic/config.rs` pins MEASUREMENTS of named terms under stated conditions
 (`quic::memory_tests`, jemalloc-rounded on linux-gnu), not a ceiling on what
 a connection can hold: `QUIC_CONNECTION_FIXED_BYTES` (64 KiB, an idle
-connection with its path), `QUIC_ASSEMBLER_HOLD_PER_STREAM_BYTES` (44 KiB per
-uni stream) and `QUIC_ASSEMBLER_HOLD_WINDOW_MULTIPLE` (5 x W) for received
-data in datagrams padded to 1200 B, frames of 50 to 470 B above a single
-gap at offset 0 of each stream (quinn keeps a whole datagram per STREAM
-frame until its assembler compacts), and `QUIC_ACK_TAIL_BYTES` (240 KiB, the
+connection with its path) and `QUIC_ACK_TAIL_BYTES` (240 KiB, the
 acknowledgement-only packets tracked after the last ack-eliciting send, up
 to quinn-proto's cap of 1000; M2 must re-check this term against
 quinn-proto's behaviour). Not measured: datagram sizes other than 1200 B,
 quinn's endpoint-to-connection datagram queue, send-side packet records and
 the buffers behind sent data, allocators other than jemalloc, CRYPTO-frame
-reassembly (quinn-proto's second assembler, `crypto_buffer_size` 16 KiB), and arrival
-orders other than a single gap at offset 0. Some quinn terms depend on
+reassembly (`crypto_buffer_size` 16 KiB, charged in the fixed charge). Some quinn terms depend on
 traffic rate and time rather than configuration, as the UDP transport's
 dedup window and sent-packet tracker do, so the per-path ceiling (memory
 gate M2, #5940) cannot be the sum of these measurements alone. This
 memory is NOT accounted in the node aggregate and must be before QUIC carries
-data by default (Step 3 at 100%, rollout gate). Shadow paths carry no data, so
+data by default (before `QUIC_DATA_PERCENT` > 0, pinned by
+`no_data_share_before_the_quic_budget_is_summed`). Shadow paths carry no data, so
 what they hold is the fixed per-path terms, and Step 2's gate watches that as
 RSS against `quic_paths_active`. The fixed
 node-wide endpoint buffers are summed whatever `transport-quic` says:
@@ -2048,7 +2044,7 @@ Sending (QuicPath::send_short_bounded / send_stream_bounded /
   on a closed connection) and closes the connection past
   recycle::SEND_ABORT_LIMIT (4096) with close code SEND_ABORT_LIMIT (M6).
   The fixed charge per connection (config::QUIC_CONNECTION_CHARGE_BYTES,
-  840 KiB) takes the map at that worst case, 4096 x QUIC_STOPPED_ENTRY_BYTES
+  888 KiB) takes the map at that worst case, 4096 x QUIC_STOPPED_ENTRY_BYTES
   (104 B, measured 88 B). Polling stopped() only after finish() would not
   avoid the entries: a writer blocked on connection credit must still race
   stopped() (below), so the poll stays on every wait and the common resets
@@ -2080,9 +2076,9 @@ Unordered reads: every stream is read with read_chunk(_, false) from its
   received, exact at the end), and a Stream's payload into the charged buffer
   at its offset (the Rechunker stages a fragment until it is whole and holds
   the one that completes the stream until its end).
-  → NEVER read a QUIC stream in order (read_chunk(_, true)) on a path: quinn
-    keeps what arrives past a gap for an in-order reader, outside every bound
-    here, and a stream must not switch from in-order to unordered reads.
+  → NEVER read a QUIC stream in order (read_chunk(_, true)) on a path: what
+    quinn holds for an in-order reader is outside every bound here, and a
+    stream must not switch from in-order to unordered reads.
   → NEVER keep bytes read before the header outside the staging cap: an
     unordered read returns the peer's credit for every byte read.
   → A reader never stops reading, including while it waits for channel room:
@@ -2106,9 +2102,8 @@ Unordered reads: every stream is read with read_chunk(_, false) from its
   (30 s) each counts 32 less (a quinn peer resets a stopped stream within a
   round trip). A second trip past the cap closes the path with
   OVER_BUDGET (closed_too_many_ranges). A Stream waiting for room in the
-  delivery channel reads its payload but NOT its end until it is announced
-  (reading the end frees quinn's slot, and the slots bound how many streams
-  can wait); one that ends short fails Truncated at once. While it waits it
+  delivery channel reads on, its end included (its charge bounds how many
+  wait); one that ends short fails Truncated at once. While it waits it
   is evicted idle if its payload stops arriving; once the payload is all
   here only the age limit applies. A byte past the
   declared end is Overlong as soon as it arrives, so an overlong stream can

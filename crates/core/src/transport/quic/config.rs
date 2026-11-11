@@ -18,8 +18,7 @@
 //! (`NoneTokenStore`), the initial destination CID provider, the
 //! stateless-reset key, `min_reset_interval` and the server's system clock.
 //!
-//! Memory: [`QUIC_CONNECTION_FIXED_BYTES`], [`QUIC_ASSEMBLER_HOLD_PER_STREAM_BYTES`],
-//! [`QUIC_ASSEMBLER_HOLD_WINDOW_MULTIPLE`], [`QUIC_ACK_TAIL_BYTES`],
+//! Memory: [`QUIC_CONNECTION_FIXED_BYTES`], [`QUIC_ACK_TAIL_BYTES`],
 //! [`QUIC_OPEN_STREAM_BYTES`] and [`QUIC_STOPPED_ENTRY_BYTES`] are
 //! measurements of named terms under stated conditions (`quic::memory_tests`),
 //! not a ceiling on what one connection can hold; the fixed charge per
@@ -251,57 +250,6 @@ pub(crate) const INCOMING_BUFFER_TOTAL_BYTES: u64 = 1024 * 1024;
 /// measurement, 54,770 B.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const QUIC_CONNECTION_FIXED_BYTES: usize = 64 * 1024;
-
-/// Received stream data quinn held per open uni stream, measured with
-/// one-byte STREAM frames above a gap at the start of the stream, each in
-/// its own datagram padded to 1200 B, with nothing read.
-///
-/// What quinn keeps for a stream nobody reads past a gap. No path reads a
-/// stream that way (`path::inbound` reads every stream unordered from its
-/// first byte), so this and [`QUIC_ASSEMBLER_HOLD_WINDOW_MULTIPLE`] measure
-/// what the reader avoids; neither is a term of any charge.
-///
-/// quinn keeps every STREAM frame as a slice of the datagram it arrived in
-/// (`quinn/src/endpoint.rs`, one buffer per datagram), so a frame keeps a
-/// 1200-byte datagram (1280 B in jemalloc) alive until the stream is read
-/// or quinn-proto's assembler copies it out. The assembler compacts a
-/// stream on either of two triggers (quinn-proto `connection/assembler.rs`,
-/// `Assembler::insert`): its estimate of the waste passes
-/// `max(32768, 1.5 x buffered)`, or the stream holds more than
-/// `COMPACT_THRESHOLD` (2048) chunks. With
-/// one-byte frames one stream peaked at 39,408 B (28 frames, then
-/// compaction); 256 such streams held 10,020,960 B (39,144 B each), and
-/// `MAX_UNI_STREAMS` (64), the count the test runs, held 2,511,968 B
-/// (about 39,250 B each). Set to that peak plus 14%, 44 KiB.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) const QUIC_ASSEMBLER_HOLD_PER_STREAM_BYTES: usize = 44 * 1024;
-
-/// Received stream data quinn held on a connection, as a multiple of the
-/// flow-control window W, measured with frames of 50 to 470 B, each in its
-/// own datagram padded to 1200 B, filling the window above a single gap at
-/// offset 0 of each stream. The tests check
-/// `streams x QUIC_ASSEMBLER_HOLD_PER_STREAM_BYTES +
-/// QUIC_ASSEMBLER_HOLD_WINDOW_MULTIPLE x W` against those shapes; `streams`
-/// counts uni streams, the only kind a peer may open ([`MAX_BIDI_STREAMS`]).
-///
-/// Above about 22 KB buffered on a stream the proportional waste threshold
-/// governs. At the 2 GiB window, with frames over about 460 B the
-/// assembler did not compact, and with slightly shorter ones it copied
-/// while the old chunks were still alive. At the 2 MiB window the same
-/// lengths make over 2048 chunks, so the chunk-count trigger compacted
-/// them. A manual sweep (not in the tests), at the 2 GiB window only, of
-/// every frame length from 160 to 1100 B, and every third below, on one
-/// stream filling W (268,435 B) found 3.05 W between packets (470 B) and
-/// 4.115 W at any instant (444 B, 1,104,656 B, during compaction); 64
-/// streams of 460 B frames held 3.12 W. Measured then at 131,072 B (2.87 W
-/// and 3.04 W) and at 2 MiB (2.43 W and 2.42 W). Since windows are set per
-/// path from the buffer budget the tests run 444 and 470 B at 268,435 B, at
-/// the small-host floor (64 KiB), at 2 MiB and at the largest window a path
-/// grows to (`budget::MAX_WINDOW_BYTES`, 8 MiB), each within the pin, plus
-/// 50 B frames, 64 streams and a mix. The version pin, not the tests, guards against quinn-proto changing
-/// which length is worst. Set to 5, 22% over 4.115.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) const QUIC_ASSEMBLER_HOLD_WINDOW_MULTIPLE: usize = 5;
 
 /// The acknowledgement-only packet records quinn-proto tracked after the
 /// last ack-eliciting send, up to its cap of 1000, with none of them
