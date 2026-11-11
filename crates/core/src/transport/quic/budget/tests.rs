@@ -108,7 +108,12 @@ fn a_new_path_is_charged_its_floor_windows() {
         2 * FLOOR as usize,
         "the staging cap follows the credit"
     );
-    assert_eq!(budget.charged(), a.meter.charge());
+    assert_eq!(
+        budget.charged(),
+        0,
+        "the floor grant is the path's fixed charge, not the growth budget's"
+    );
+    assert_eq!(budget.running_total(), 0);
     drop(a);
     assert_eq!(budget.charged(), 0, "a dropped path frees its share");
 }
@@ -157,8 +162,9 @@ fn gapped_reads_do_not_grow_a_window() {
     }
 }
 
-/// Paths growing at once share what is above their floors: none passes its
-/// share, and the node's charge stays within the budget.
+/// Paths growing at once share the growth budget: none passes its share (its
+/// floor grant plus an equal part of the budget), and the growth charged
+/// stays within the budget.
 #[test]
 fn growing_paths_stay_within_their_share_and_the_budget() {
     let total = 12 << 20;
@@ -177,7 +183,7 @@ fn growing_paths_stay_within_their_share_and_the_budget() {
             budget.charged()
         );
     }
-    let share = floor_grant(FLOOR) + (total - 4 * floor_grant(FLOOR)) / 4;
+    let share = floor_grant(FLOOR) + total / 4;
     for path in &paths {
         assert!(
             path.meter.charge() <= share,
@@ -392,6 +398,49 @@ fn a_send_shrink_with_no_stream_open_is_released_at_once() {
         budget.charged(),
         "the running total is the recount"
     );
+}
+
+/// Paths arriving while one path holds the whole growth budget never push the
+/// growth charged over it: a newcomer's floor grant is its fixed charge, so it
+/// adds nothing here, and it grows only from room a squeeze frees.
+#[test]
+fn newcomers_never_push_the_growth_over_the_budget() {
+    let total = 12 << 20;
+    let budget = QuicBudget::new(total, FLOOR, counters());
+    let big = conn(&budget, 0);
+    let mut at = 10 * MS;
+    let mut window = FLOOR;
+    for _ in 0..12 {
+        window = deliver_window(&big, window, at).recv_window;
+        at += 10 * MS;
+    }
+    assert!(
+        budget.running_total() + floor_grant(FLOOR) > total,
+        "premise: one more floor grant would not fit, {} of {total}",
+        budget.running_total()
+    );
+    let mut newcomers = Vec::new();
+    for _ in 0..20 {
+        newcomers.push(conn(&budget, at));
+        assert!(
+            budget.running_total() <= total,
+            "{} over {total} with {} newcomers",
+            budget.running_total(),
+            newcomers.len()
+        );
+        // Each newcomer wants to grow, which squeezes the big path.
+        for (i, newcomer) in newcomers.iter().enumerate() {
+            deliver_window(newcomer, FLOOR, at + i as u64 + 1);
+        }
+        big.meter.evaluate(at + MS).unwrap();
+        assert!(budget.running_total() <= total);
+        assert_eq!(
+            budget.running_total(),
+            budget.charged(),
+            "the total is the recount"
+        );
+        at += 10 * MS;
+    }
 }
 
 #[test]
