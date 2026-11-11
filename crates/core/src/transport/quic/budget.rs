@@ -224,6 +224,8 @@ struct BudgetState {
     /// [`MIN_EVALUATION_INTERVAL`] node-wide, since counting the connections
     /// growing takes a pass over all of them.
     share: Option<(u64, u64)>,
+    /// When other connections were last asked to shrink.
+    squeezed_at: Option<u64>,
 }
 
 struct ConnState {
@@ -519,7 +521,7 @@ impl QuicBudget {
         let conn = state.conns.get_mut(&id)?;
         let others = state.charged.saturating_sub(conn.charged);
         let allowed = share.min(self.total.saturating_sub(others));
-        let mut squeeze_others = false;
+        let mut squeeze_need = 0;
         if grows {
             let target = conn.recv_window.saturating_mul(2).min(MAX_WINDOW_BYTES);
             let send = conn.send_window;
@@ -534,7 +536,12 @@ impl QuicBudget {
             }
             // Held back by the budget rather than by its share: others are
             // above theirs. They make room as their debt is read.
-            squeeze_others = window < target && allowed < share;
+            if window < target && allowed < share {
+                squeeze_need = conn
+                    .charge_with(target, send)
+                    .min(share)
+                    .saturating_sub(allowed);
+            }
         } else if conn.recv_window > self.floor
             && now.saturating_sub(conn.active_at) >= nanos(IDLE_DECAY)
         {
@@ -563,17 +570,26 @@ impl QuicBudget {
             send_window: conn.send_window,
         };
         Self::recount(&mut state.charged, conn);
-        if squeeze_others {
-            self.squeeze_others(state, id, share);
+        if squeeze_need > 0 {
+            self.squeeze_others(state, id, share, squeeze_need, now);
         }
         self.publish(state);
         Some((result, changes))
     }
 
     /// Ask the connections whose charge is above `share` to shrink toward it,
-    /// largest first, until the node's charge after their debts are read fits
-    /// the budget. Each applies the shrink in its own next evaluation.
-    fn squeeze_others(&self, state: &mut BudgetState, id: u64, share: u64) {
+    /// largest first, until what they give up covers `need` bytes. Each
+    /// applies the shrink in its own next evaluation, and the room comes as
+    /// its debt is read. At most once per [`MIN_EVALUATION_INTERVAL`]
+    /// node-wide, since it passes over every path.
+    fn squeeze_others(&self, state: &mut BudgetState, id: u64, share: u64, need: u64, now: u64) {
+        if state
+            .squeezed_at
+            .is_some_and(|at| now.saturating_sub(at) < nanos(MIN_EVALUATION_INTERVAL))
+        {
+            return;
+        }
+        state.squeezed_at = Some(now);
         let mut over: Vec<(u64, u64)> = state
             .conns
             .iter()
@@ -581,9 +597,19 @@ impl QuicBudget {
             .map(|(other, conn)| (*other, conn.charged))
             .collect();
         over.sort_unstable_by_key(|(_, charge)| std::cmp::Reverse(*charge));
-        for (other, _) in over {
+        let mut freed = 0u64;
+        for (other, charged) in over {
+            if freed >= need {
+                break;
+            }
             if let Some(conn) = state.conns.get_mut(&other) {
-                conn.shrink_to = shrink_target(conn, share, self.floor);
+                // A shrink already asked of it counts too.
+                if conn.shrink_to.is_none() {
+                    conn.shrink_to = shrink_target(conn, share, self.floor);
+                }
+                if conn.shrink_to.is_some() {
+                    freed = freed.saturating_add(charged.saturating_sub(share));
+                }
             }
         }
     }

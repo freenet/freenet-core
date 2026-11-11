@@ -533,3 +533,53 @@ fn the_staging_cap_never_falls_below_what_is_staged() {
         "the staged bytes are charged"
     );
 }
+
+/// A growth the budget refuses asks the paths above their share to shrink
+/// largest first, only as many as cover what it needs: with three grown
+/// paths and a newcomer growing into a full budget, the largest is asked
+/// first and not all of them are.
+#[test]
+fn a_squeeze_asks_the_largest_first_and_only_as_many_as_needed() {
+    let total = 24 << 20;
+    let budget = QuicBudget::new(total, FLOOR, counters());
+    let paths: Vec<Conn> = (0..3).map(|_| conn(&budget, 0)).collect();
+    let mut at = 10 * MS;
+    // Grow them to different sizes: 2, 3 and 4 doublings past the floor.
+    for (i, path) in paths.iter().enumerate() {
+        let mut window = FLOOR;
+        for _ in 0..(i + 2) {
+            window = deliver_window(path, window, at).recv_window;
+            at += 10 * MS;
+        }
+    }
+    // Fill the rest of the budget with paths at the floor so growth is
+    // refused by the budget, not the share.
+    let mut fillers = Vec::new();
+    while budget.charged() + floor_grant(FLOOR) <= total {
+        fillers.push(conn(&budget, at));
+    }
+    let newcomer = fillers.pop().expect("premise: room for fillers");
+    let charges: Vec<u64> = paths.iter().map(|p| p.meter.charge()).collect();
+    assert!(
+        charges[2] > charges[1] && charges[2] > charges[0],
+        "premise: one path is the largest: {charges:?}"
+    );
+    // The newcomer grows until the budget, not its share, holds it back.
+    let mut window = FLOOR;
+    for _ in 0..6 {
+        at += 10 * MS;
+        window = deliver_window(&newcomer, window, at).recv_window;
+        if paths.iter().any(|p| p.meter.pending_shrink().is_some()) {
+            break;
+        }
+    }
+    let asked: Vec<bool> = paths
+        .iter()
+        .map(|p| p.meter.pending_shrink().is_some())
+        .collect();
+    assert!(asked[2], "the largest is asked: {asked:?}");
+    assert!(
+        asked.iter().filter(|a| **a).count() < 3,
+        "only as many as needed: {asked:?}"
+    );
+}
