@@ -6725,6 +6725,69 @@ fn an_honest_stream_whose_first_packet_is_lost_stays_within_the_staging_cap() {
     }
 }
 
+/// An admitted Stream whose metadata is lost (its header arrived alone)
+/// sends the payload that arrives meanwhile straight to its charged buffer,
+/// not to staging: with a staging cap far below the payload, the stream is
+/// delivered whole, metadata included, and nothing is evicted.
+#[test]
+fn payload_read_while_the_metadata_is_missing_is_not_staged() {
+    bounded(|| async move {
+        use crate::transport::in_memory_socket::{
+            PacketDeliveryDecision, set_packet_delivery_callback,
+        };
+        let _seed = GlobalRng::seed_guard(SEED);
+        let limits = QuicPathLimits {
+            staging_cap: Some(16 * 1024),
+            ..QuicPathLimits::DEFAULT
+        };
+        let network = "quic-path-metadata-lost";
+        let mut p = paths(network, 30, limits).await;
+        let (from, raw, time) = (p.pair.a_addr, p.a_raw(), p.time());
+        let id = StreamId::next().0;
+        let metadata = payload(1000);
+        let body = payload(256 * 1024);
+        let total = body.len() as u64;
+        let (meta, data) = (metadata.clone(), body.clone());
+        let net = network.to_string();
+        p.drive(async move {
+            let mut send = raw.open_uni().await.unwrap();
+            send.write_all(&header(1, 1, id, total, meta.len() as u32))
+                .await
+                .unwrap();
+            time.sleep(Duration::from_millis(50)).await;
+            // The header has gone alone; lose the first large datagram after
+            // it, which carries the metadata.
+            let seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            set_packet_delivery_callback(
+                &net,
+                Some(Arc::new(move |_: &str, sender, _, bytes: &[u8]| {
+                    if sender == from
+                        && bytes.len() >= 1000
+                        && !seen.swap(true, std::sync::atomic::Ordering::Relaxed)
+                    {
+                        PacketDeliveryDecision::Drop
+                    } else {
+                        PacketDeliveryDecision::Deliver
+                    }
+                })),
+            );
+            send.write_all(&meta).await.unwrap();
+            send.write_all(&data).await.unwrap();
+            send.finish().unwrap();
+            send.stopped().await.unwrap();
+        })
+        .await;
+        set_packet_delivery_callback(network, None);
+        let arrival = p.b_in.streams.try_recv().expect("announced");
+        assert_eq!(arrival.metadata.as_deref(), Some(&metadata[..]));
+        assert_eq!(
+            &arrival.handle.assemble().await.expect("assembled")[..],
+            &body[..]
+        );
+        assert_eq!(p.b.stats().count(QuicInboundOutcome::EvictedStaged), 0);
+    })
+}
+
 /// A stream whose first datagram (its header) is lost has what follows staged
 /// (`inbound::Staging`); past the connection's staging cap it is stopped
 /// (`EvictedStaged`) and its staged bytes freed, while another stream, whose
