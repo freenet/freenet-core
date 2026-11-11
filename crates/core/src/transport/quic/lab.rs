@@ -246,7 +246,7 @@ pub fn arm_background() {
     BG_ARMED.store(BG_KBPS.load(Ordering::Relaxed) > 0, Ordering::Relaxed);
 }
 
-pub use super::recycle::loss_gate::LAB_STANDING_US;
+pub use super::recycle::loss_gate::{LAB_BUCKET_RULE, LAB_STANDING_US};
 
 /// The AQM on every shaped uplink bound from now on: 0 none, 1 CoDel, 2 PIE.
 pub static AQM_KIND: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

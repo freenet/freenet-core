@@ -275,7 +275,19 @@ impl GateState {
         let window = (self.srtt? / NEAR_WINDOW_FRACTION).max(NEAR_WINDOW_MIN);
         let (from, to) = (sent.checked_sub(window).unwrap_or(sent), sent + window);
         let mut near: Option<Duration> = None;
-        for &(start, end, rtt) in &self.sends {
+        let srtt = self.srtt?;
+        for (i, &(start, end, rtt)) in self.sends.iter().enumerate() {
+            let end = match LAB_BUCKET_RULE.load(Ordering::Relaxed) {
+                // Old rule: up to the next span, the newest without end.
+                1 => self.sends.get(i + 1).map_or(sent + srtt * 4, |next| next.0),
+                // Up to the next span, but at most one smoothed RTT past
+                // the span's own end.
+                2 => self
+                    .sends
+                    .get(i + 1)
+                    .map_or(end + srtt, |next| next.0.min(end + srtt)),
+                _ => end,
+            };
             if start <= to && end > from {
                 near = Some(near.map_or(rtt, |m| m.min(rtt)));
             }
@@ -490,3 +502,8 @@ fn lab_standing_passes(queue: Option<Duration>) -> bool {
 fn lab_standing_passes(_queue: Option<Duration>) -> bool {
     false
 }
+
+/// Lab only: how a span's end is taken in `queue_at` (0 its own end, 1 the
+/// next span's start, 2 the next span's start capped at one srtt past its
+/// own end).
+pub static LAB_BUCKET_RULE: AtomicU64 = AtomicU64::new(0);

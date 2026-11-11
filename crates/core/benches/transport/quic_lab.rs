@@ -335,6 +335,9 @@ fn apply_start_knobs() -> String {
     let aqm_target: u64 = env_or("LAB_AQM_TARGET_US", 0);
     let bg_kbps: u64 = env_or("LAB_BG_KBPS", 0);
     let standing: u64 = env_or("LAB_GATE_STANDING_US", 0);
+    let bucket_rule: u64 = env_or("LAB_BUCKET_RULE", 0);
+    freenet::transport::quic_lab::LAB_BUCKET_RULE
+        .store(bucket_rule, std::sync::atomic::Ordering::Relaxed);
     freenet::transport::quic_lab::LAB_STANDING_US
         .store(standing, std::sync::atomic::Ordering::Relaxed);
     freenet::transport::quic_lab::BG_KBPS.store(bg_kbps, std::sync::atomic::Ordering::Relaxed);
@@ -343,7 +346,7 @@ fn apply_start_knobs() -> String {
         .store(aqm_target, std::sync::atomic::Ordering::Relaxed);
     format!(
         "iw_pkts={iw} rate_start_kbps={rate} mtu={mtu} piece_bytes={piece} gate={}/{}/{} \
-         gate_max_us={} gate_local={} jitter_ms={jitter} aqm={aqm}/{aqm_target} bg_kbps={bg_kbps} standing_us={standing}",
+         gate_max_us={} gate_local={} jitter_ms={jitter} aqm={aqm}/{aqm_target} bg_kbps={bg_kbps} standing_us={standing} bucket_rule={bucket_rule}",
         gate.0,
         gate.1,
         gate.2,
