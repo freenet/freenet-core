@@ -719,3 +719,786 @@ fn quinns_hold_between_reader_polls_under_cpu_load() {
         assert_eq!(run.assembled, run.sent, "{run:?}");
     }
 }
+
+// Ramp gate (3): hostile peers.
+
+/// A node (the hub) on one simulated network and `VirtualTime`, with one
+/// node budget its data paths share, to which honest leaves (real
+/// `QuicPath`s) and hostile peers (hand-driven quinn-proto clients) connect.
+struct Hub {
+    time: VirtualTime,
+    network: String,
+    subnet: u8,
+    addr: SocketAddr,
+    keys: crate::transport::crypto::TransportKeypair,
+    endpoint: super::super::super::QuicEndpoint,
+    budget: Arc<QuicBudget>,
+    next_leaf: u8,
+    keep: Vec<super::super::super::QuicEndpoint>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for Hub {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+        crate::transport::in_memory_socket::set_packet_delivery_callback(&self.network, None);
+        crate::transport::in_memory_socket::unregister_network_time_source(&self.network);
+    }
+}
+
+/// What a hub path for one peer holds of the node's budget and staging.
+#[derive(Debug, Default, Clone, Copy)]
+struct HubPathPeak {
+    staged: usize,
+    staging_cap: usize,
+    node_charged: u64,
+    /// The most staged past the cap at one sample (the cap can fall below
+    /// what is held when the window shrinks).
+    over_cap: usize,
+    /// The lowest cap seen.
+    min_cap: usize,
+}
+
+impl Hub {
+    fn settings() -> super::super::super::config::QuicSettings {
+        super::super::super::config::QuicSettings {
+            memory_limit: NODE_MEMORY,
+            idle_timeout: None,
+            initial_window: None,
+            rate_limit: Default::default(),
+        }
+    }
+
+    /// Bind an endpoint at `addr` on `network`, with its socket pump in
+    /// `tasks`.
+    async fn bind_on(
+        network: &str,
+        time: &VirtualTime,
+        tasks: &mut Vec<tokio::task::JoinHandle<()>>,
+        addr: SocketAddr,
+        keys: &crate::transport::crypto::TransportKeypair,
+    ) -> super::super::super::QuicEndpoint {
+        use crate::transport::Socket;
+        use crate::transport::demux::DemuxSocket;
+        use crate::transport::in_memory_socket::{SimulationSocket, register_address_network};
+        use crate::transport::packet_data::MAX_RECV_PACKET_SIZE;
+        register_address_network(addr, network);
+        let socket = Arc::new(DemuxSocket::wrap(
+            SimulationSocket::bind(addr).await.expect("sim bind"),
+            None,
+        ));
+        let endpoint = super::super::super::QuicEndpoint::bind(
+            socket.clone(),
+            addr,
+            time.clone(),
+            &Self::settings(),
+            keys,
+        )
+        .expect("endpoint");
+        tasks.push(tokio::spawn(async move {
+            let mut buf = vec![0u8; MAX_RECV_PACKET_SIZE];
+            while socket.recv_classified(&mut buf).await.is_ok() {}
+        }));
+        endpoint
+    }
+
+    async fn build(network: &str, subnet: u8) -> Self {
+        let time = VirtualTime::new();
+        crate::transport::in_memory_socket::register_network_time_source(network, time.clone());
+        let addr: SocketAddr = format!("10.208.{subnet}.1:5000").parse().unwrap();
+        let keys = crate::transport::crypto::TransportKeypair::new();
+        let mut tasks = Vec::new();
+        let endpoint = Self::bind_on(network, &time, &mut tasks, addr, &keys).await;
+        // Every datagram takes HUB_ONE_WAY, so windows limit transfers.
+        crate::transport::in_memory_socket::set_packet_delivery_callback(
+            network,
+            Some(Arc::new(|_, _, _, _| {
+                crate::transport::in_memory_socket::PacketDeliveryDecision::DelayedDelivery(
+                    HUB_ONE_WAY,
+                )
+            })),
+        );
+        Self {
+            time,
+            network: network.to_string(),
+            subnet,
+            addr,
+            keys,
+            endpoint,
+            budget: node_budget(leaked_counters()),
+            next_leaf: 2,
+            keep: Vec::new(),
+            tasks,
+        }
+    }
+
+    fn next_addr(&mut self) -> SocketAddr {
+        let addr = format!("10.208.{}.{}:5000", self.subnet, self.next_leaf)
+            .parse()
+            .unwrap();
+        self.next_leaf += 1;
+        addr
+    }
+
+    /// The hub's path for a connection, metered from the node budget.
+    fn hub_path(
+        &self,
+        server: super::super::super::QuicConnection,
+    ) -> (Arc<QuicPath>, QuicInbound) {
+        use crate::transport::peer_connection::inbound_budget::SharedInboundBudget;
+        let limits = QuicPathLimits::DEFAULT;
+        let (path, inbound) = QuicPath::with_budget_and_own_channels(
+            server,
+            self.time.clone(),
+            limits,
+            SharedInboundBudget::new(limits.max_streams, limits.max_bytes),
+            Some(&self.budget),
+        );
+        path.enable_data();
+        (Arc::new(path), inbound)
+    }
+
+    /// An honest leaf: a real `QuicPath` that sends to the hub, and the hub's
+    /// path for it.
+    async fn honest_leaf(&mut self) -> (Arc<QuicPath>, Arc<QuicPath>, QuicInbound) {
+        use crate::transport::peer_connection::inbound_budget::SharedInboundBudget;
+        let addr = self.next_addr();
+        let keys = crate::transport::crypto::TransportKeypair::new();
+        let endpoint = Self::bind_on(&self.network, &self.time, &mut self.tasks, addr, &keys).await;
+        let permit = self.endpoint.allow_peer(addr, keys.public()).expect("room");
+        let (client_end, server_end, hub_addr, hub_key) = (
+            endpoint.clone(),
+            self.endpoint.clone(),
+            self.addr,
+            self.keys.public().clone(),
+        );
+        let (client, server) = drive(&self.time, LIMIT, async move {
+            let (client, server) = tokio::join!(client_end.connect(hub_addr, &hub_key), async {
+                server_end
+                    .accept()
+                    .await
+                    .expect("an attempt")
+                    .establish()
+                    .await
+            });
+            (client.expect("client"), server.expect("server"))
+        })
+        .await;
+        drop(permit);
+        let limits = QuicPathLimits::DEFAULT;
+        let (sender, _) = QuicPath::with_budget_and_own_channels(
+            client,
+            self.time.clone(),
+            limits,
+            SharedInboundBudget::new(limits.max_streams, limits.max_bytes),
+            Some(&node_budget(leaked_counters())),
+        );
+        sender.enable_data();
+        self.keep.push(endpoint);
+        let (receiver, inbound) = self.hub_path(server);
+        (Arc::new(sender), receiver, inbound)
+    }
+
+    /// A hostile peer: a quinn-proto client driven by hand, connected to the
+    /// hub, and the hub's path for it.
+    async fn hostile_leaf(&mut self) -> (HostilePeer, Arc<QuicPath>, QuicInbound) {
+        let addr = self.next_addr();
+        let (peer, permit) = HostilePeer::connect(self, addr).await;
+        let server_end = self.endpoint.clone();
+        let server = drive(&self.time, LIMIT, async move {
+            server_end
+                .accept()
+                .await
+                .expect("an attempt")
+                .establish()
+                .await
+                .expect("server")
+        })
+        .await;
+        drop(permit);
+        let (receiver, inbound) = self.hub_path(server);
+        (peer, receiver, inbound)
+    }
+
+    /// Sample a hub path's staging and the node's charge.
+    fn sample(&self, path: &QuicPath, peak: &mut HubPathPeak) {
+        let (staged, cap) = (path.inbound_staged(), path.inbound_staging_cap());
+        peak.staged = peak.staged.max(staged);
+        peak.staging_cap = peak.staging_cap.max(cap);
+        peak.over_cap = peak.over_cap.max(staged.saturating_sub(cap));
+        peak.min_cap = if peak.min_cap == 0 {
+            cap
+        } else {
+            peak.min_cap.min(cap)
+        };
+        peak.node_charged = peak.node_charged.max(self.budget.running_total());
+    }
+}
+
+/// What the script asks of a [`HostilePeer`] at its next step.
+#[derive(Default)]
+struct HostileState {
+    /// Hand datagrams from the hub to the connection (acknowledgements and
+    /// credit). Off, the peer never learns that anything was lost, and never
+    /// learns of new credit.
+    feed_in: bool,
+    /// Run the connection's timers. Off, it never sends a probe or a resend.
+    run_timers: bool,
+    /// Datagrams to drop from the next transmits.
+    drop_out: usize,
+    /// Drop every datagram of the next step.
+    drop_step: bool,
+    /// Datagrams sent and dropped.
+    sent: u64,
+    dropped: u64,
+}
+
+/// A quinn-proto client the test drives by hand: every [`PEER_STEP`] of
+/// virtual time it takes in what reached it (if `feed_in`), runs its timers
+/// (if `run_timers`) and sends what it has, dropping as told. A test writes
+/// to its streams with [`Self::with_conn`].
+struct HostilePeer {
+    proto: Arc<std::sync::Mutex<super::super::super::memory_tests::ProtoPeer>>,
+    state: Arc<std::sync::Mutex<HostileState>>,
+}
+
+/// The one-way delay of every datagram on a [`Hub`]'s network.
+const HUB_ONE_WAY: Duration = Duration::from_millis(20);
+
+/// How often a [`HostilePeer`] runs.
+const HOSTILE_STEP: Duration = Duration::from_millis(2);
+
+impl HostilePeer {
+    async fn connect(
+        hub: &mut Hub,
+        addr: SocketAddr,
+    ) -> (Self, super::super::super::QuicPeerPermit) {
+        use super::super::super::config;
+        use super::super::super::identity::{PeerKey, QuicIdentity};
+        use crate::transport::in_memory_socket::{SimulationSocket, register_address_network};
+        use crate::transport::packet_data::MAX_RECV_PACKET_SIZE;
+        use std::collections::VecDeque;
+        use std::time::Instant;
+
+        register_address_network(addr, &hub.network);
+        let keys = crate::transport::crypto::TransportKeypair::new();
+        let permit = hub.endpoint.allow_peer(addr, keys.public()).expect("room");
+        let identity = QuicIdentity::new(&keys).expect("identity");
+        let hub_peer = PeerKey::of(hub.keys.public()).expect("hub key");
+        let mut transport = config::transport_config(&Hub::settings(), &hub.time);
+        let mut cubic = quinn::congestion::CubicConfig::default();
+        cubic.initial_window(1 << 30);
+        // A hostile peer sets its own send window: nothing it has sent waits
+        // for an acknowledgement before it sends more.
+        transport
+            .pad_to_mtu(true)
+            .send_window(1 << 30)
+            .congestion_controller_factory(Arc::new(cubic));
+        let client = config::client_config(
+            Arc::new(identity.client_tls(&hub_peer).expect("client tls")),
+            Arc::new(transport),
+        );
+        let mut proto = super::super::super::memory_tests::ProtoPeer {
+            addr,
+            endpoint: quinn_proto::Endpoint::new(
+                Arc::new(config::endpoint_config().expect("endpoint config")),
+                None,
+                false,
+                None,
+            ),
+            conn: None,
+        };
+        // quinn-proto takes `Instant`s; `base` is only the epoch they are
+        // counted from, and every elapsed time comes from the virtual clock.
+        let base = Instant::now();
+        let at = move |time: &VirtualTime| base + Duration::from_nanos(time.now_nanos());
+        proto.conn = Some(
+            proto
+                .endpoint
+                .connect(at(&hub.time), client, hub.addr, config::SERVER_NAME)
+                .expect("connect"),
+        );
+        let proto = Arc::new(std::sync::Mutex::new(proto));
+        let state = Arc::new(std::sync::Mutex::new(HostileState {
+            feed_in: true,
+            run_timers: true,
+            ..HostileState::default()
+        }));
+        let socket = Arc::new(SimulationSocket::bind(addr).await.expect("sim bind"));
+        type Inbox = std::sync::Mutex<VecDeque<(Vec<u8>, SocketAddr)>>;
+        let inbox: Arc<Inbox> = Arc::default();
+        let (reading, queue) = (socket.clone(), inbox.clone());
+        hub.tasks.push(tokio::spawn(async move {
+            let mut buf = vec![0u8; MAX_RECV_PACKET_SIZE];
+            while let Ok((len, from)) = reading.recv_from(&mut buf).await {
+                queue.lock().unwrap().push_back((buf[..len].to_vec(), from));
+            }
+        }));
+        let (time, hub_addr, driven, script) =
+            (hub.time.clone(), hub.addr, proto.clone(), state.clone());
+        hub.tasks.push(tokio::spawn(async move {
+            loop {
+                time.sleep(HOSTILE_STEP).await;
+                let now = at(&time);
+                let arrived: Vec<_> = inbox.lock().unwrap().drain(..).collect();
+                let out = {
+                    let mut peer = driven.lock().unwrap();
+                    let (feed_in, run_timers) = {
+                        let state = script.lock().unwrap();
+                        (state.feed_in, state.run_timers)
+                    };
+                    let mut out = Vec::new();
+                    if feed_in {
+                        for (datagram, from) in arrived {
+                            out.extend(peer.receive(now, from, &datagram));
+                        }
+                    }
+                    if run_timers {
+                        peer.pump(now);
+                    } else {
+                        Self::pump_without_timers(&mut peer);
+                    }
+                    if let Some((_, conn)) = peer.conn.as_mut() {
+                        let mut buf = Vec::new();
+                        while let Some(transmit) = conn.poll_transmit(now, 1, &mut buf) {
+                            out.push(buf[..transmit.size].to_vec());
+                            buf.clear();
+                        }
+                    }
+                    out
+                };
+                let drop_step = std::mem::take(&mut script.lock().unwrap().drop_step);
+                for datagram in out {
+                    if drop_step {
+                        let mut state = script.lock().unwrap();
+                        state.sent += 1;
+                        state.dropped += 1;
+                        continue;
+                    }
+                    let drop_it = {
+                        let mut state = script.lock().unwrap();
+                        state.sent += 1;
+                        if state.drop_out > 0 {
+                            state.drop_out -= 1;
+                            state.dropped += 1;
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if !drop_it {
+                        socket.send_to(&datagram, hub_addr).await.ok();
+                    }
+                }
+            }
+        }));
+        (Self { proto, state }, permit)
+    }
+
+    /// [`ProtoPeer::pump`] without running the connection's timers.
+    fn pump_without_timers(peer: &mut super::super::super::memory_tests::ProtoPeer) {
+        let super::super::super::memory_tests::ProtoPeer { endpoint, conn, .. } = peer;
+        let Some((handle, conn)) = conn.as_mut() else {
+            return;
+        };
+        while let Some(event) = conn.poll_endpoint_events() {
+            if let Some(event) = endpoint.handle_event(*handle, event) {
+                conn.handle_event(event);
+            }
+        }
+        while conn.poll().is_some() {}
+    }
+
+    fn with_conn<R>(&self, f: impl FnOnce(&mut quinn_proto::Connection) -> R) -> R {
+        f(self.proto.lock().unwrap().conn())
+    }
+
+    fn script(&self, f: impl FnOnce(&mut HostileState)) {
+        f(&mut self.state.lock().unwrap())
+    }
+
+    fn handshaken(&self) -> bool {
+        self.with_conn(|conn| !conn.is_handshaking())
+    }
+
+    /// Open a uni stream and write `bytes` on it; the stream, or `None` if no
+    /// stream credit was left. Writes what flow control takes.
+    fn open_and_write(&self, bytes: &[u8]) -> Option<(quinn_proto::StreamId, usize)> {
+        self.with_conn(|conn| {
+            let id = conn.streams().open(quinn_proto::Dir::Uni)?;
+            let written = conn.send_stream(id).write(bytes).unwrap_or(0);
+            Some((id, written))
+        })
+    }
+
+    fn write(&self, id: quinn_proto::StreamId, bytes: &[u8]) -> usize {
+        self.with_conn(|conn| conn.send_stream(id).write(bytes).unwrap_or(0))
+    }
+}
+
+/// What a hostile peer does once its window has grown.
+#[derive(Debug, Clone, Copy)]
+struct HostileShape {
+    /// Streams it opens with their first datagram (the header) withheld.
+    streams: usize,
+    /// Bytes per write above the withheld header; each write goes out in
+    /// the next transmit, several streams' writes packed per datagram.
+    frame_len: usize,
+    /// Writes per stream (each of `frame_len` bytes), as credit allows.
+    frames: usize,
+    /// Bytes per stream, after the header, sent and lost before the frames,
+    /// so the frames land that far above the read position.
+    skip: usize,
+    /// After 12 s of quiet (past the idle decay), bytes sent in order on a
+    /// new stream with its header: they repay the window's debt, so the
+    /// staging cap falls while the withheld streams stay staged.
+    then_contiguous: usize,
+}
+
+/// One run of [`hostile_against_hub`].
+// Read through `Debug` in the printed rows.
+#[allow(dead_code)]
+#[derive(Debug)]
+struct HostileRun {
+    shape: Option<HostileShape>,
+    /// How long the honest leaf's transfer took, in virtual time.
+    honest_took: Duration,
+    honest_outcome: String,
+    /// The hub's path for the hostile peer.
+    peak: HubPathPeak,
+    stops: StagingStops,
+    hostile_closed: Option<String>,
+    budget_total: u64,
+    hostile_dropped: u64,
+    /// Bytes the hostile peer wrote above its withheld headers.
+    hostile_written: usize,
+}
+
+/// Bytes the honest leaf sends while the hostile peer runs.
+const HONEST_BYTES: usize = 16 * MIB;
+
+/// Write all of `bytes` on stream `id` of `peer`, driving time as credit
+/// allows, for at most `limit` of virtual time.
+async fn write_all_driven(hub: &Hub, peer: &HostilePeer, id: quinn_proto::StreamId, bytes: &[u8]) {
+    let mut written = 0;
+    let start = hub.time.now_nanos();
+    while written < bytes.len() {
+        written += peer.write(id, &bytes[written..]);
+        let time = hub.time.clone();
+        drive(
+            &hub.time,
+            LIMIT,
+            async move { time.sleep(HOSTILE_STEP).await },
+        )
+        .await;
+        assert!(
+            hub.time.now_nanos() - start < LIMIT.as_nanos() as u64,
+            "the write did not finish"
+        );
+    }
+}
+
+/// A hub with an honest leaf sending [`HONEST_BYTES`] and, with `shape`, a
+/// hostile peer that first grows its window honestly (one 24 MiB stream,
+/// read as it arrives) and then pins it: it stops hearing the hub and stops
+/// running its timers, so nothing it sends is ever resent, and sends
+/// `shape`. Samples the hub's path for the hostile peer and the node's
+/// charge every 2 ms.
+async fn hostile_against_hub(
+    network: &'static str,
+    subnet: u8,
+    shape: Option<HostileShape>,
+) -> HostileRun {
+    let mut hub = Hub::build(network, subnet).await;
+    let (honest, honest_in_hub, mut honest_inbound) = hub.honest_leaf().await;
+    let mut hostile = None;
+    if shape.is_some() {
+        let (peer, path, mut inbound) = hub.hostile_leaf().await;
+        assert!(peer.handshaken(), "the hostile peer finished its handshake");
+        // Grow: one honest stream, read as it arrives.
+        let total = 24 * MIB;
+        let mut first = header(1, 1, StreamId::next().0, total as u64, 0);
+        first.extend_from_slice(&vec![0x11; total]);
+        let (id, written) = peer.open_and_write(&first).expect("stream credit");
+        let reader = tokio::spawn(async move {
+            let arrival = inbound.streams.recv().await.expect("announced");
+            arrival.handle.assemble().await.map(|body| body.len())
+        });
+        write_all_driven(&hub, &peer, id, &first[written..]).await;
+        peer.with_conn(|conn| conn.send_stream(id).finish().expect("finish"));
+        let grown = drive(
+            &hub.time,
+            LIMIT,
+            async move { reader.await.expect("reader") },
+        )
+        .await;
+        assert_eq!(grown, Ok(total), "the growth stream arrived");
+        // Keep hearing the hub for a few round trips, so the peer holds the
+        // last acknowledgements and the whole credit before it pins it.
+        let time = hub.time.clone();
+        drive(&hub.time, LIMIT, async move {
+            time.sleep(HUB_ONE_WAY * 10).await
+        })
+        .await;
+        hostile = Some((peer, path));
+    }
+    // The honest leaf's transfer, timed, with the hostile shape running
+    // beside it.
+    let (sender, time) = (honest.clone(), hub.time.clone());
+    let honest_task = tokio::spawn(async move {
+        let started = time.now_nanos();
+        let outcome = sender
+            .send_stream_bounded(
+                &time,
+                SendDeadlines::stream(HONEST_BYTES as u64),
+                StreamId::next(),
+                None,
+                Bytes::from(vec![0x22; HONEST_BYTES]),
+                None,
+            )
+            .await;
+        (
+            format!("{outcome:?}"),
+            Duration::from_nanos(time.now_nanos() - started),
+        )
+    });
+    let honest_reader = tokio::spawn(async move {
+        let arrival = honest_inbound
+            .streams
+            .recv()
+            .await
+            .expect("honest announced");
+        arrival.handle.assemble().await.map(|body| body.len())
+    });
+    let mut peak = HubPathPeak::default();
+    let mut dropped = 0;
+    let mut written = 0;
+    if let (Some(shape), Some((peer, path))) = (shape, hostile.as_ref()) {
+        peer.script(|state| {
+            state.feed_in = false;
+            state.run_timers = false;
+        });
+        let mut streams = Vec::new();
+        for _ in 0..shape.streams {
+            let first = header(
+                1,
+                1,
+                StreamId::next().0,
+                (shape.skip + shape.frame_len * shape.frames) as u64,
+                0,
+            );
+            let Some((id, _)) = peer.open_and_write(&first) else {
+                break;
+            };
+            // The next step sends only this header and the skipped bytes:
+            // lose all of it.
+            written += peer.write(id, &vec![0x33; shape.skip]);
+            peer.script(|state| state.drop_step = true);
+            let time = hub.time.clone();
+            drive(
+                &hub.time,
+                LIMIT,
+                async move { time.sleep(HOSTILE_STEP).await },
+            )
+            .await;
+            streams.push(id);
+        }
+        let frame = vec![0x5a; shape.frame_len];
+        for _ in 0..shape.frames {
+            for id in &streams {
+                written += peer.write(*id, &frame);
+            }
+            let time = hub.time.clone();
+            drive(
+                &hub.time,
+                LIMIT,
+                async move { time.sleep(HOSTILE_STEP).await },
+            )
+            .await;
+            hub.sample(path, &mut peak);
+        }
+        if shape.then_contiguous > 0 {
+            for _ in 0..120 {
+                let time = hub.time.clone();
+                drive(&hub.time, LIMIT, async move {
+                    time.sleep(Duration::from_millis(100)).await
+                })
+                .await;
+                hub.sample(path, &mut peak);
+            }
+            let declared = shape.then_contiguous as u64;
+            let mut bytes = header(1, 1, StreamId::next().0, declared, 0);
+            bytes.extend_from_slice(&vec![0x44; shape.then_contiguous]);
+            if let Some((id, first)) = peer.open_and_write(&bytes) {
+                written += first;
+                let mut sent = first;
+                for _ in 0..500 {
+                    if sent >= bytes.len() {
+                        break;
+                    }
+                    let more = peer.write(id, &bytes[sent..]);
+                    sent += more;
+                    written += more;
+                    let time = hub.time.clone();
+                    drive(
+                        &hub.time,
+                        LIMIT,
+                        async move { time.sleep(HOSTILE_STEP).await },
+                    )
+                    .await;
+                    hub.sample(path, &mut peak);
+                }
+            }
+        }
+        dropped = peer.state.lock().unwrap().dropped;
+    }
+    // Let the honest transfer finish, sampling the hostile path meanwhile.
+    let (honest_outcome, honest_took) = loop {
+        if honest_task.is_finished() {
+            break honest_task.await.expect("honest task");
+        }
+        let time = hub.time.clone();
+        drive(
+            &hub.time,
+            LIMIT,
+            async move { time.sleep(HOSTILE_STEP).await },
+        )
+        .await;
+        if let Some((_, path)) = hostile.as_ref() {
+            hub.sample(path, &mut peak);
+        }
+    };
+    let honest_got = drive(&hub.time, LIMIT, async move {
+        honest_reader.await.expect("reader")
+    })
+    .await;
+    assert_eq!(honest_got, Ok(HONEST_BYTES), "the honest transfer arrived");
+    // Then 25 s of quiet, past the idle decay (10 s) and short of the
+    // readers' idle eviction (30 s): the window may shrink under what the
+    // hostile peer left staged.
+    if let Some((_, path)) = hostile.as_ref() {
+        for _ in 0..250 {
+            let time = hub.time.clone();
+            drive(&hub.time, LIMIT, async move {
+                time.sleep(Duration::from_millis(100)).await
+            })
+            .await;
+            hub.sample(path, &mut peak);
+        }
+    }
+    drop(honest_in_hub);
+    let (stops, hostile_closed) = match hostile.as_ref() {
+        Some((_, path)) => (
+            StagingStops::of(path),
+            path.connection()
+                .inner()
+                .close_reason()
+                .map(|reason| format!("{reason}")),
+        ),
+        None => (StagingStops::default(), None),
+    };
+    HostileRun {
+        shape,
+        honest_took,
+        honest_outcome,
+        peak,
+        stops,
+        hostile_closed,
+        budget_total: hub.budget.total(),
+        hostile_dropped: dropped,
+        hostile_written: written,
+    }
+}
+
+/// Ramp gate (3): a hostile peer that grew its window honestly and then
+/// withholds headers, with large frames, tiny frames, or many streams,
+/// cannot stage past its cap or charge the node past its budget, is stopped
+/// or closed, and an honest leaf on the same node is slowed by at most 10%.
+#[test]
+fn a_hostile_peer_cannot_exceed_its_charge() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let baseline = hostile_against_hub("quic-3c-hostile-baseline", 1, None).await;
+        eprintln!("3c hostile: {baseline:?}");
+        let shapes = [
+            HostileShape {
+                streams: 4,
+                frame_len: 1100,
+                frames: 2000,
+                skip: 0,
+                then_contiguous: 0,
+            },
+            HostileShape {
+                streams: 32,
+                frame_len: 1,
+                frames: 400,
+                skip: 0,
+                then_contiguous: 0,
+            },
+            HostileShape {
+                streams: 60,
+                frame_len: 64,
+                frames: 200,
+                skip: 0,
+                then_contiguous: 0,
+            },
+            HostileShape {
+                streams: 8,
+                frame_len: 1,
+                frames: 1,
+                skip: MIB - 64,
+                then_contiguous: 0,
+            },
+            HostileShape {
+                streams: 60,
+                frame_len: 1,
+                frames: 1,
+                skip: 128 * 1024,
+                then_contiguous: 0,
+            },
+            // Spans just past a power of two, where a buffer grown by
+            // doubling is charged about twice its span.
+            HostileShape {
+                streams: 15,
+                frame_len: 1,
+                frames: 1,
+                skip: 512 * 1024 - HEADER_LEN + 1,
+                then_contiguous: 0,
+            },
+            HostileShape {
+                streams: 31,
+                frame_len: 1,
+                frames: 1,
+                skip: 256 * 1024 - HEADER_LEN + 1,
+                then_contiguous: 0,
+            },
+            // Grow, stage about half the credit under withheld headers, keep
+            // the rest, wait past the idle decay, then spend the rest in
+            // order (#6173 review r2, F1 and M1).
+            HostileShape {
+                streams: 4,
+                frame_len: 1100,
+                frames: 1000,
+                skip: 0,
+                then_contiguous: 3 * MIB,
+            },
+        ];
+        for (index, shape) in shapes.into_iter().enumerate() {
+            let network: &'static str =
+                Box::leak(format!("quic-3c-hostile-{index}").into_boxed_str());
+            let run = hostile_against_hub(network, 2 + index as u8, Some(shape)).await;
+            eprintln!("3c hostile: {run:?}");
+            assert!(
+                run.peak.staged <= run.peak.staging_cap,
+                "staged past the cap: {run:?}"
+            );
+            assert!(run.peak.node_charged <= run.budget_total, "{run:?}");
+            assert!(
+                run.honest_took.as_secs_f64() <= baseline.honest_took.as_secs_f64() * 1.1,
+                "the honest leaf was slowed by more than 10%: {run:?} against {baseline:?}"
+            );
+        }
+    })
+}
