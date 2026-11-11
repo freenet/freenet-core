@@ -1487,7 +1487,7 @@ impl QuicPath {
     /// [`Self::send_stream_bounded`] does, and tells `observer` the same.
     ///
     /// Waits for the first chunk before anything else, for as long as
-    /// [`SendDeadlines::gap`] and `total` allow, so a source that has nothing
+    /// [`SendDeadlines::source_gap`] (or `gap`) and `total` allow, so a source that has nothing
     /// yet holds no permit and no stream. `open` runs from when it arrives;
     /// `total` counts the wait. A wait that runs out or a connection lost
     /// during it is [`SendFailure::NotOpened`]. A source that ends or fails
@@ -1516,7 +1516,7 @@ impl QuicPath {
         let started = time.now_nanos();
         let connection = self.connection.inner();
         let wait = deadlines
-            .gap
+            .gap_for(true)
             .map_or(deadlines.total, |gap| gap.min(deadlines.total));
         let first = tokio::select! {
             first = chunks.next() => first,

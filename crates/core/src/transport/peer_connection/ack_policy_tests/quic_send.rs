@@ -1332,6 +1332,96 @@ fn pipes_whose_source_stalls_do_not_close_the_path() {
     );
 }
 
+/// A pipe from a QUIC-fed source waits for the source's own gap limit, not
+/// 5 s: an 8 s gap between two pieces (quinn's retransmit backoff at a high
+/// RTT with loss) ends `Sent`, where a UDP-fed source would time out. So does
+/// an 8 s wait for the first piece.
+#[test]
+fn a_pipe_from_a_quic_fed_source_waits_out_a_gap_past_five_seconds() {
+    run(
+        "quic-send-pipe-quic-gap",
+        76,
+        QuicPathLimits::DEFAULT,
+        |mut rig| async move {
+            let total = 2 * FRAGMENT_PAYLOAD_SIZE;
+            // `mid` has its first piece, `first` has nothing yet.
+            let mid = StreamHandle::new_quic(StreamId::next(), total as u64);
+            let first = StreamHandle::new_quic(StreamId::next(), total as u64);
+            mid.push_fragment(1, Bytes::from(vec![1u8; FRAGMENT_PAYLOAD_SIZE]))
+                .unwrap();
+            for source in [&mid, &first] {
+                rig.e
+                    .conn
+                    .pipe_stream_to_remote(
+                        StreamId::next(),
+                        crate::transport::IncomingStream::from(source.fork()),
+                        None,
+                        None,
+                    )
+                    .await;
+            }
+            rig.path.settle(Duration::from_secs(8)).await;
+            mid.push_fragment(2, Bytes::from(vec![2u8; FRAGMENT_PAYLOAD_SIZE]))
+                .unwrap();
+            for index in 1..=2 {
+                first
+                    .push_fragment(index, Bytes::from(vec![3u8; FRAGMENT_PAYLOAD_SIZE]))
+                    .unwrap();
+            }
+            rig.path.settle(Duration::from_secs(5)).await;
+            assert_eq!(rig.stats().send_count(SendKind::Pipe, R::Sent), 2);
+            for result in [R::MaybeDelivered, R::NotOpenedUdp, R::FailedUdp, R::Dropped] {
+                assert_eq!(
+                    rig.stats().send_count(SendKind::Pipe, result),
+                    0,
+                    "{result:?}"
+                );
+            }
+        },
+    );
+}
+
+/// The same pipe ends as soon as its source's reader stops (here: evicted
+/// idle), without waiting out the long gap, and it is the source's doing, so
+/// the path stays up.
+#[test]
+fn a_pipe_from_a_quic_fed_source_ends_when_the_reader_stops() {
+    use crate::transport::peer_connection::streaming::QuicSourceEnd;
+    run(
+        "quic-send-pipe-quic-end",
+        77,
+        QuicPathLimits::DEFAULT,
+        |mut rig| async move {
+            let total = 2 * FRAGMENT_PAYLOAD_SIZE;
+            let source = StreamHandle::new_quic(StreamId::next(), total as u64);
+            source
+                .push_fragment(1, Bytes::from(vec![1u8; FRAGMENT_PAYLOAD_SIZE]))
+                .unwrap();
+            rig.e
+                .conn
+                .pipe_stream_to_remote(
+                    StreamId::next(),
+                    crate::transport::IncomingStream::from(source.fork()),
+                    None,
+                    None,
+                )
+                .await;
+            rig.path.settle(Duration::from_secs(1)).await;
+            assert_eq!(rig.stats().send_total(R::Sent), 0);
+            source.end_quic_source(QuicSourceEnd::Idle);
+            rig.path.settle(Duration::from_secs(1)).await;
+            assert_eq!(rig.stats().send_count(SendKind::Pipe, R::Sent), 0);
+            let ended: u64 = [R::FailedUdp, R::Dropped]
+                .into_iter()
+                .map(|result| rig.stats().send_count(SendKind::Pipe, result))
+                .sum();
+            assert_eq!(ended, 1, "the pipe ended within 1 s of its reader");
+            assert_eq!(rig.stats().send_event_count(E::StalledClosed), 0);
+            assert!(rig.route.path().quinn_connection().close_reason().is_none());
+        },
+    );
+}
+
 /// A UDP session that records what the worker hands it.
 #[derive(Default)]
 struct CollectUdp(std::sync::Mutex<Vec<Vec<u8>>>);

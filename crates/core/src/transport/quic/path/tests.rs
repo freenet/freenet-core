@@ -4498,6 +4498,7 @@ fn the_gap_runs_from_the_last_step_and_total_still_binds() {
         let deadlines = SendDeadlines {
             open: Duration::from_secs(2),
             gap: Some(Duration::from_secs(5)),
+            source_gap: None,
             total: Duration::from_secs(60),
         };
         let (stalled, stalled_after, steady, steady_after) = drive(&time, LIMIT, async move {
@@ -4562,6 +4563,7 @@ async fn stuck_send(
     let deadlines = SendDeadlines {
         open: Duration::from_secs(2),
         gap: Some(Duration::from_secs(5)),
+        source_gap: None,
         total,
     };
     let start = clock.now();
@@ -4684,6 +4686,7 @@ fn a_live_send_held_in_the_cap_queue_past_its_gap_is_sent() {
             let deadlines = SendDeadlines {
                 open: Duration::from_secs(2),
                 gap: Some(Duration::from_secs(5)),
+                source_gap: None,
                 total: Duration::from_secs(120),
             };
             let ticking = clock.clone();
@@ -4749,6 +4752,7 @@ fn an_acknowledgement_the_record_has_not_seen_credits_the_next_send() {
             let deadlines = SendDeadlines {
                 open: Duration::from_secs(2),
                 gap: Some(Duration::from_secs(5)),
+                source_gap: None,
                 total: Duration::from_secs(120),
             };
             let ticking = clock.clone();
@@ -4857,6 +4861,7 @@ fn a_send_waiting_for_its_source_ends_at_its_own_gap() {
             let deadlines = SendDeadlines {
                 open: Duration::from_secs(2),
                 gap: Some(Duration::from_secs(5)),
+                source_gap: None,
                 total: Duration::from_secs(120),
             };
             let start = clock.now();
@@ -4915,6 +4920,7 @@ fn progress_from_before_the_send_does_not_extend_its_gap() {
             let deadlines = SendDeadlines {
                 open: Duration::from_secs(2),
                 gap: Some(Duration::from_secs(5)),
+                source_gap: None,
                 total: Duration::from_secs(120),
             };
             let start = clock.now();
@@ -4948,6 +4954,7 @@ fn a_quiet_proof_says_whether_its_send_saw_a_live_hold() {
             let deadlines = SendDeadlines {
                 open: Duration::from_secs(2),
                 gap: Some(Duration::from_secs(5)),
+                source_gap: None,
                 total: Duration::from_secs(120),
             };
             let mut proofs = Vec::new();
@@ -5012,6 +5019,7 @@ fn a_hold_read_live_by_a_wake_voids_the_proof() {
             let deadlines = SendDeadlines {
                 open: Duration::from_secs(2),
                 gap: Some(Duration::from_secs(5)),
+                source_gap: None,
                 total: Duration::from_secs(120),
             };
             let start = clock.now();
@@ -5052,6 +5060,53 @@ fn a_hold_read_live_by_a_wake_voids_the_proof() {
     })
 }
 
+/// `source_gap` bounds only the waits for the send's own source: a send
+/// waiting 20 s for its source under a 30 s source gap goes on, and the same
+/// send stuck 20 s on a write (not its source) fails at the 5 s gap.
+#[test]
+fn the_source_gap_applies_only_to_source_waits() {
+    bounded(|| async move {
+        let time = VirtualTime::new();
+        let clock = time.clone();
+        let (on_source, on_write) = drive(&time, LIMIT, async move {
+            let deadlines = SendDeadlines {
+                open: Duration::from_secs(2),
+                gap: Some(Duration::from_secs(5)),
+                source_gap: None,
+                total: Duration::from_secs(120),
+            }
+            .with_source_gap(Duration::from_secs(30));
+            let sleeps = clock.clone();
+            let on_source = bounded_send(&clock, deadlines, None, |progress| async move {
+                progress.mark_opened();
+                progress.waiting_on_source(true);
+                sleeps.sleep(Duration::from_secs(20)).await;
+                progress.waiting_on_source(false);
+                progress.step();
+                Ok(())
+            })
+            .await;
+            let start = clock.now();
+            let sleeps = clock.clone();
+            let on_write = bounded_send(&clock, deadlines, None, |progress| async move {
+                progress.mark_opened();
+                sleeps.sleep(Duration::from_secs(20)).await;
+                Ok(())
+            })
+            .await;
+            (on_source, (on_write, clock.now() - start))
+        })
+        .await;
+        assert!(matches!(on_source, BoundedSend::Sent), "{on_source:?}");
+        let (on_write, took) = on_write;
+        assert!(
+            matches!(on_write, BoundedSend::Failed(SendFailure::TimedOut)),
+            "{on_write:?}"
+        );
+        assert_eq!(took, Duration::from_secs(5));
+    })
+}
+
 /// A wait for the source wakes the timer loop only when the connection's
 /// window has pushed the timer past the send's own gap: a send that reads
 /// its source many times with no window arms its timer only a few times, not
@@ -5071,6 +5126,7 @@ fn source_waits_do_not_rearm_the_timer_without_an_extension() {
             let deadlines = SendDeadlines {
                 open: Duration::from_secs(2),
                 gap: Some(Duration::from_secs(5)),
+                source_gap: None,
                 total: Duration::from_secs(120),
             };
             let arms = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -5116,6 +5172,7 @@ fn source_waits_rearm_the_timer_once_while_it_is_extended() {
             let deadlines = SendDeadlines {
                 open: Duration::from_secs(2),
                 gap: Some(Duration::from_secs(5)),
+                source_gap: None,
                 total: Duration::from_secs(120),
             };
             let ticking = clock.clone();
@@ -5181,6 +5238,7 @@ fn a_later_proof_of_the_same_counts_keeps_the_earlier_since() {
             let deadlines = SendDeadlines {
                 open: Duration::from_secs(2),
                 gap: Some(Duration::from_secs(5)),
+                source_gap: None,
                 total: Duration::from_secs(120),
             };
             let stuck = |progress: bounded::SendProgress| async move {
@@ -5237,6 +5295,7 @@ fn the_gap_ends_at_the_end_of_the_stream_and_open_binds_first() {
         let deadlines = SendDeadlines {
             open: Duration::from_secs(2),
             gap: Some(Duration::from_secs(5)),
+            source_gap: None,
             total: Duration::from_secs(60),
         };
         let (finished, finished_after, unopened, unopened_after) =
@@ -5650,6 +5709,7 @@ fn a_real_path_carries_its_last_acknowledgement_to_the_next_send() {
                 let deadlines = SendDeadlines {
                     open: Duration::from_secs(2),
                     gap: Some(Duration::from_secs(5)),
+                    source_gap: None,
                     total: Duration::from_secs(120),
                 };
                 let ticking = time.clone();

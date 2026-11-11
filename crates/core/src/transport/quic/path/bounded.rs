@@ -62,6 +62,15 @@ pub(crate) struct SendDeadlines {
     /// connection has also gone [`STALL_PROGRESS_WINDOW`] with nothing newly
     /// acknowledged.
     pub(crate) gap: Option<Duration>,
+    /// The longest wait for the send's own source, in place of `gap`, for a
+    /// send that pipes a stream ([`SendProgress::waiting_on_source`]). `None`:
+    /// `gap`. A stream a QUIC path fills keeps arriving past 5 s gaps (quinn
+    /// retransmits on its own backoff), and its reader ends it on the path's
+    /// rules, so a pipe from it waits for the source's own limit
+    /// ([`IncomingStream::fragment_gap_limit`]). At least `open`, as `gap` is.
+    ///
+    /// [`IncomingStream::fragment_gap_limit`]: crate::transport::IncomingStream::fragment_gap_limit
+    pub(crate) source_gap: Option<Duration>,
     /// From the start of the send to its end, whatever the send is doing.
     pub(crate) total: Duration,
 }
@@ -72,6 +81,7 @@ impl SendDeadlines {
         Self {
             open: timeout,
             gap: None,
+            source_gap: None,
             total: timeout,
         }
     }
@@ -84,6 +94,7 @@ impl SendDeadlines {
             Self {
                 open: SHORT_OPEN_TIMEOUT,
                 gap: None,
+                source_gap: None,
                 total: SHORT_TOTAL_TIMEOUT,
             }
         } else {
@@ -99,7 +110,26 @@ impl SendDeadlines {
         Self {
             open: STREAM_OPEN_TIMEOUT,
             gap: Some(STREAM_INACTIVITY_TIMEOUT),
+            source_gap: None,
             total: inbound_stream_age_limit(len),
+        }
+    }
+
+    /// The same, waiting up to `limit` for each piece of the send's own
+    /// source ([`Self::source_gap`]).
+    pub(crate) fn with_source_gap(self, limit: Duration) -> Self {
+        Self {
+            source_gap: Some(limit),
+            ..self
+        }
+    }
+
+    /// The gap for a send waiting (`on_source`) or not waiting for its source.
+    pub(crate) fn gap_for(&self, on_source: bool) -> Option<Duration> {
+        if on_source {
+            self.source_gap.or(self.gap)
+        } else {
+            self.gap
         }
     }
 }
@@ -319,18 +349,17 @@ impl SendProgress {
         let total = started.saturating_add(nanos(deadlines.total));
         match self.stage() {
             STAGE_OPENING => started.saturating_add(nanos(deadlines.open)).min(total),
-            STAGE_OPENED => deadlines.gap.map_or(total, |gap| {
-                self.0
-                    .last_step
-                    .load(Ordering::Acquire)
-                    .saturating_add(nanos(gap))
-                    .max(if self.0.on_source.load(Ordering::SeqCst) {
-                        0
-                    } else {
-                        connection_until
-                    })
-                    .min(total)
-            }),
+            STAGE_OPENED => {
+                let on_source = self.0.on_source.load(Ordering::SeqCst);
+                deadlines.gap_for(on_source).map_or(total, |gap| {
+                    self.0
+                        .last_step
+                        .load(Ordering::Acquire)
+                        .saturating_add(nanos(gap))
+                        .max(if on_source { 0 } else { connection_until })
+                        .min(total)
+                })
+            }
             _ => total,
         }
     }
@@ -496,9 +525,9 @@ pub(crate) struct QuietProof {
 /// its own gap and that window have run out. Not while the send waits for
 /// its own source ([`SendProgress::waiting_on_source`]): the connection is not
 /// what holds it then, and a source that stalls is bounded by the send's own
-/// gap, as a relayed stream on UDP is by pipe_stream's 5 s upstream
-/// inactivity. (The receiver does not force this: a QUIC stream's reader
-/// idles out at `streaming_handle_idle_timeout`, 30 s in production.)
+/// source gap ([`SendDeadlines::source_gap`]): 5 s for a UDP-fed source, as
+/// pipe_stream bounds one, and the reader's idle limit
+/// (`streaming_handle_idle_timeout`, 30 s in production) for a QUIC-fed one.
 ///
 /// The connection is read only at the timer's wakes, so a move is dated to
 /// the wake that saw it, which can come up to one window after it. A send
@@ -656,7 +685,10 @@ where
 {
     let deadlines = deadlines.into();
     debug_assert!(
-        deadlines.gap.is_none_or(|gap| gap >= deadlines.open),
+        [deadlines.gap, deadlines.source_gap]
+            .iter()
+            .flatten()
+            .all(|gap| *gap >= deadlines.open),
         "a gap shorter than `open` could leave the timer armed too late"
     );
     let started = time.now_nanos();
