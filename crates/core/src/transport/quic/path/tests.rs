@@ -6830,7 +6830,13 @@ fn a_control_body_awaiting_its_end_stays_charged() {
                 (held, b.inbound_staged())
             })
             .await;
-        assert_eq!(held, streams * 4000, "every waiting body is charged");
+        let each =
+            super::inbound::allocation_class(4000) + super::inbound::STAGING_BUFFER_OVERHEAD_BYTES;
+        assert_eq!(
+            held,
+            streams * each,
+            "every waiting body is charged as staged"
+        );
         assert_eq!(after, 0, "released once each end arrives");
         assert_eq!(
             p.b.stats().count(QuicInboundOutcome::DeliveredControl),

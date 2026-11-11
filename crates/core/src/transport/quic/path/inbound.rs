@@ -879,7 +879,7 @@ pub(in crate::transport::quic) const STAGED_TRIP_WINDOW: Duration = Duration::fr
 
 /// Charged per staging buffer besides its allocation: the allocator's
 /// bookkeeping and the reader's handle on it.
-const STAGING_BUFFER_OVERHEAD_BYTES: usize = 64;
+pub(in crate::transport::quic) const STAGING_BUFFER_OVERHEAD_BYTES: usize = 64;
 
 /// The size of the allocation the allocator makes for `bytes`, rounded up to
 /// its size class: four classes per doubling, as jemalloc's (at most a quarter
@@ -1301,13 +1301,12 @@ impl ConnRanges {
         self.cap.store(cap, Ordering::Relaxed);
     }
 
-    /// The cap now. Tests only.
-    #[cfg(test)]
+    /// The cap now, which the budget charges.
     pub(in crate::transport::quic) fn cap(&self) -> usize {
         self.cap.load(Ordering::Relaxed)
     }
 
-    /// Gaps counted now, kept ones included: what the budget charges.
+    /// Gaps counted now, kept ones included.
     pub(in crate::transport::quic) fn held_now(&self) -> usize {
         self.held.load(Ordering::Relaxed)
     }
@@ -2251,10 +2250,18 @@ impl<T: TimeSource> Receiver<T> {
             }
         };
         // The body stays charged to the connection's staging while the
-        // stream's end is awaited: a peer that withholds it would otherwise
-        // hold a body per stream outside every charge.
-        let Some(_held) = StagedHold::new(reader.staging.conn.clone(), payload.len()) else {
-            self.fail(&mut reader, ReadFailure::StagedOverCap, Charged::No);
+        // stream's end is awaited, as staging charged it: a peer that
+        // withholds the end would otherwise hold a body per stream outside
+        // every charge.
+        let charge = allocation_class(payload.len()) + STAGING_BUFFER_OVERHEAD_BYTES;
+        let Some(_held) = StagedHold::new(reader.staging.conn.clone(), charge) else {
+            // Unreachable: the body's own staging charge, no smaller, was
+            // freed with no await since. If it ever is reached it is this
+            // side's accounting, not the peer's doing, so it is not counted
+            // as a trip toward closing the path.
+            debug_assert!(false, "a control body's staging charge was refused");
+            self.stats.record(QuicInboundOutcome::EvictedStaged);
+            reader.stop(stop_code::EVICTED);
             return;
         };
         if let Err(failure) = reader.expect_end().await {

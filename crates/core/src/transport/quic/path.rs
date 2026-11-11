@@ -2089,12 +2089,13 @@ impl Drop for Outgoing {
     ///
     /// A stream dropped while it waits for its acknowledgement goes on to the
     /// end, so its permit and its send epoch wait with it, in a small task:
-    /// one per cancelled send awaiting its acknowledgement. Those are at most
-    /// the streams the peer's uni-stream limit lets this side have open, plus
-    /// streams the peer has read in full whose acknowledgement is in flight.
-    /// Each task ends with its stream's acknowledgement or the connection,
-    /// and the acknowledgement watch closes a path whose peer stops
-    /// acknowledging.
+    /// one per cancelled send awaiting its acknowledgement. Those are the
+    /// streams the peer's uni-stream limit lets this side have open, plus
+    /// streams the peer has read in full but not yet acknowledged, for as
+    /// long as the peer delays those acknowledgements: that second part is
+    /// not bounded by a count. Each task ends with its stream's
+    /// acknowledgement or with the connection, and the acknowledgement watch
+    /// closes a path whose peer acknowledges nothing.
     fn drop(&mut self) {
         self.reset(reset_code::SENDER_ABORTED);
         if !self.awaiting_ack {

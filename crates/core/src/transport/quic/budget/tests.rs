@@ -371,6 +371,29 @@ fn a_stream_opened_while_a_shrink_is_applied_keeps_the_old_window_charged() {
     );
 }
 
+/// A send shrink with no stream open leaves the node's total at once, not at
+/// the connection's next evaluation: the epoch renewal recounts it.
+#[test]
+fn a_send_shrink_with_no_stream_open_is_released_at_once() {
+    let budget = QuicBudget::new(64 << 20, FLOOR, counters());
+    let a = conn(&budget, 0);
+    a.fake.cwnd.store(4 * FLOOR, Ordering::Relaxed);
+    assert_eq!(a.meter.evaluate(10 * MS).unwrap().send_window, 8 * FLOOR);
+    let before = budget.charged();
+    a.fake.cwnd.store(FLOOR / 4, Ordering::Relaxed);
+    assert_eq!(a.meter.evaluate(20 * MS).unwrap().send_window, FLOOR);
+    assert!(
+        budget.charged() < before,
+        "released at once: {} vs {before}",
+        budget.charged()
+    );
+    assert_eq!(
+        budget.charged(),
+        a.meter.charge(),
+        "the total is the recount"
+    );
+}
+
 #[test]
 fn the_floor_and_the_gap_cap_follow_the_design() {
     assert_eq!(floor_window_bytes(1 << 30), MIN_WINDOW_SMALL_HOST_BYTES);
@@ -500,6 +523,20 @@ fn a_shrink_keeps_the_gap_cap_above_the_gaps_held() {
         "premise: the credit alone would lower the cap"
     );
     assert!(big.ranges.cap() >= cap, "{} < {cap}", big.ranges.cap());
+    // The gaps then close: the cap in force stays until the credit next
+    // changes, and so does its charge.
+    let charged = big.meter.charge();
+    big.ranges.add_for_test(-(cap as isize));
+    assert_eq!(big.ranges.held_now(), 0, "premise: the gaps closed");
+    assert!(
+        big.ranges.cap() >= cap,
+        "premise: the cap is still in force"
+    );
+    assert_eq!(
+        big.meter.charge(),
+        charged,
+        "the cap in force stays charged after its gaps close"
+    );
 }
 
 /// Growth with a budget too small for every path to grow: paths still grow

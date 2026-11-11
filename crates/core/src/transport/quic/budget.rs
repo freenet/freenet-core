@@ -295,8 +295,12 @@ impl ConnState {
 
     /// The terms no window sets directly: gaps at their cap and the control
     /// buffers.
+    /// The gap cap in force is charged when it is above the one `credit`
+    /// sets: it is floored at the gaps held when it was set
+    /// ([`Self::credit_changed`]) and stays there until the credit next
+    /// changes, even once those gaps close, as the staging cap does.
     fn fixed_with(&self, credit: u64) -> u64 {
-        (gap_cap(credit).max(self.ranges.held_now()) as u64)
+        (gap_cap(credit).max(self.ranges.cap()) as u64)
             .saturating_mul(GAP_BYTES)
             .saturating_add(CONTROL_BUFFER_BYTES)
     }
@@ -652,10 +656,16 @@ impl QuicBudget {
 
     /// Streams opened from now on take a new send epoch: a shrink was applied
     /// to the connection, and the old epoch is held at the old window.
+    /// The connection is recounted, so the old window leaves its charge as
+    /// soon as no stream holds the old epoch, not at its next evaluation.
     fn renew_send_epoch(&self, id: u64) {
-        if let Some(conn) = self.state.lock().conns.get_mut(&id) {
+        let mut guard = self.state.lock();
+        let state = &mut *guard;
+        if let Some(conn) = state.conns.get_mut(&id) {
             conn.send_epoch = Arc::new(());
+            Self::recount(&mut state.charged, conn);
         }
+        self.publish(state);
     }
 
     fn send_epoch(&self, id: u64) -> Option<Arc<()>> {
