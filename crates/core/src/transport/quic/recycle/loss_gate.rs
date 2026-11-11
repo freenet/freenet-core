@@ -216,9 +216,13 @@ pub(crate) struct GateState {
     round_lost: u64,
     share: f64,
     /// The smallest RTT of the packets sent in each recent span of send
-    /// times: (start, end, smallest RTT), oldest first. A span covers
-    /// `start..end` and nothing after it, so after an idle gap a span from
-    /// before the gap is not taken to cover a packet sent after it.
+    /// times: (start, end, smallest RTT), oldest first. In `queue_at` a span
+    /// covers up to the next span's start, but at most a smoothed RTT past
+    /// its own end, so after an idle gap a span from before the gap is not
+    /// taken to cover a packet sent after it. Ending each span at its own
+    /// end instead left gaps between spans that a lost packet's neighbours
+    /// often fell into: 8 MiB at 5% loss with 30 ms of jitter at 300 ms took
+    /// over 15 s in 7 of 46 lab runs, against 2 of 32 with this rule.
     sends: VecDeque<(Instant, Instant, Duration)>,
     /// Losses passed to the inner controller, and ignored.
     pub(crate) passed: u64,
@@ -275,7 +279,16 @@ impl GateState {
         let window = (self.srtt? / NEAR_WINDOW_FRACTION).max(NEAR_WINDOW_MIN);
         let (from, to) = (sent.checked_sub(window).unwrap_or(sent), sent + window);
         let mut near: Option<Duration> = None;
-        for &(start, end, rtt) in &self.sends {
+        let srtt = self.srtt?;
+        for (i, &(start, end, rtt)) in self.sends.iter().enumerate() {
+            // A span covers up to the next one, but never more than a
+            // smoothed RTT past its own end, so it does not reach across an
+            // idle gap.
+            let reach = end + srtt;
+            let end = self
+                .sends
+                .get(i + 1)
+                .map_or(reach, |&(next, _, _)| next.min(reach));
             if start <= to && end > from {
                 near = Some(near.map_or(rtt, |m| m.min(rtt)));
             }

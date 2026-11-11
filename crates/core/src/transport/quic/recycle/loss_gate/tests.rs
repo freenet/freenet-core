@@ -196,6 +196,17 @@ fn a_span_from_before_an_idle_gap_does_not_cover_a_later_loss() {
     );
 }
 
+/// ... while a short gap, under a smoothed RTT, stays covered by the span
+/// before it, so a loss in it is still judged by its neighbours.
+#[test]
+fn a_span_covers_a_gap_shorter_than_a_round_trip() {
+    let mut gate = GateState::default();
+    let rtt = 100 * MS;
+    let (now, _) = steady(&mut gate, Instant::now(), rtt, Duration::ZERO, 4, 40);
+    assert_eq!(gate.queue_at(now + 40 * MS), Some(Duration::ZERO));
+    assert_eq!(gate.queue_at(now + 3 * rtt), None);
+}
+
 /// An ECN congestion mark (quinn passes it with no lost bytes) always
 /// reaches Cubic, with no queue and a low loss share.
 #[test]
