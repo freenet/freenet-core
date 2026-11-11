@@ -34,10 +34,11 @@
 //! A reader never stops reading: a stream waiting for room in the delivery
 //! channel keeps reading, so the wait never leaves data with quinn. Bytes past
 //! the declared end fail the stream (`Overlong`), and the stream's end may be
-//! read before the stream is announced. That frees quinn's slot for it, so
-//! waiting messages are bounded by the inbound budget, not by the stream
-//! limit: a one-packet `Short` that reads its end while it waits takes a
-//! charge then.
+//! read before the stream is announced. That frees quinn's slot for it, so a
+//! charged message that waits is bounded by its charge, and an uncharged
+//! one-packet `Short` lowers the peer's stream limit by one while it waits
+//! ([`StreamLimit`]): at most the stream limit of them wait, and none is
+//! refused after its sender may have seen it acknowledged.
 //!
 //! Admission follows the UDP transport's rules (`.claude/rules/transport.md`,
 //! "WHEN admitting or sending a stream"):

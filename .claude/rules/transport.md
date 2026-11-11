@@ -2087,9 +2087,12 @@ Unordered reads: every stream is read with read_chunk(_, false) from its
     unordered read returns the peer's credit for every byte read.
   → A reader never stops reading, including while it waits for channel room:
     a byte past the declared end is Overlong at once, and the end may be read
-    before the stream is announced, which frees quinn's slot. Waiting messages
-    are therefore bounded by the inbound budget (a one-packet Short that has
-    to wait takes a charge first), not by the stream limit.
+    before the stream is announced, which frees quinn's slot. A charged
+    message that waits is bounded by its charge; an uncharged one-packet
+    Short lowers the peer's stream limit by one while it waits
+    (inbound::StreamLimit), so at most MAX_UNI_STREAMS wait.
+  → NEVER charge or refuse a one-packet Short after its body is read: its
+    sender may already read it as Sent, and a refusal then loses it.
   A gap costs one received range (quinn's recvd set and our mirror, ~70 B);
   gaps are counted per stream as ranges past the first, and a connection's
   streams may hold at most R_conn (budget::gap_cap, max(256, (W + debt) / 1 KiB); 256 without a meter), past
