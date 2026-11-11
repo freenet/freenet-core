@@ -1566,8 +1566,10 @@ exposes (its module doc lists the few it does not):
   grease_quic_bit(false) (the demux rule depends on it), versions [1],
   max_udp_payload / initial and min MTU 1200, no MTU discovery, no GSO,
   keepalive 15 s (None when the TimeSource disables keepalive), idle = the
-  TimeSource's connection idle timeout, Cubic with its window capped to the
-  configured bandwidth (recycle::CappedCubic), 64 uni / 0 bidi streams,
+  TimeSource's connection idle timeout, Cubic behind the loss gate
+  (recycle::loss_gate::LossGate, see below) with its window capped to the
+  configured bandwidth (recycle::CappedCubic; QuicRateLimit::without_loss_gate,
+  test-only, gives plain capped Cubic), 64 uni / 0 bidi streams,
   stream / receive / send window = clamp(5% of memory / (2 x
   max-number-of-connections), 128 KiB, 2 MiB), no unreliable datagrams, no
   spin bit, migration off, max_incoming 64, incoming buffers 64 KiB / 1 MiB,
@@ -1579,6 +1581,35 @@ Connection IDs (quic/cid.rs) carry a keyed BLAKE3 MAC, so quinn drops a
   short-header packet with a forged ID silently; quinn's own hashed
   generator can be spoofed and would answer it with a stateless reset.
 ```
+
+QUIC loss gate (quic/recycle/loss_gate.rs, every QUIC path by default): Cubic
+cuts its window on every loss, so under a few percent of random loss (Wi-Fi,
+cheap routers) its window collapses and large messages take minutes. The gate
+passes a congestion event to Cubic only when: quinn declares persistent
+congestion; it is an ECN mark (lost_bytes 0; the socket reads no ECN today);
+there is no RTT sample yet; the queue estimated around the lost packet's send
+time is at least queue_threshold = max(10% of min RTT, 2 ms) (QUEUE_FRACTION,
+QUEUE_FLOOR); or the smoothed per-round loss share is at least 0.25
+(LOSS_SHARE_CEILING). Otherwise the loss is ignored (quinn still retransmits,
+the window stays). Limits, all known and measured in the e5b-9 lab (tables in
+#6185 and #6183, which tracks the follow-up):
+- min RTT is never forgotten (deliberately: a windowed minimum would let the
+  gate's own standing queue become the baseline). A route that grows longer
+  reads the extra delay as a queue and the path runs as plain Cubic.
+- On a drop-tail queue deeper than the threshold, with no random loss, it is
+  exactly Cubic. On a queue shallower than the threshold (or an AQM such as
+  CoDel/PIE whose target is below it, the common case for 100-250 ms node
+  RTTs) congestion losses look random and only the 0.25 share ceiling stops
+  the flow, so it holds a standing queue near the threshold and a competing
+  flow keeps less of the link than next to Cubic (still far more than next
+  to legacy UDP).
+- Jitter above the threshold reads as a queue, so the gate passes random
+  losses and the path behaves as Cubic (30 ms of jitter on a 100 ms path;
+  10 ms of jitter there is still absorbed).
+Verdicts are exported as quic_gate_loss_<verdict> and
+quic_gate_ended_queue_<bucket> (see the telemetry keys above). Do not raise
+the threshold, add a threshold cap or a windowed min RTT without lab cells
+for jitter, AQM and shallow queues: each was tried and broke one of them.
 
 QUIC memory: the flow-control windows (connection receive, stream receive,
 send; all one value from `connection_window_bytes`) are clamped and capped
@@ -1930,10 +1961,12 @@ Sending (QuicPath::send_short_bounded / send_stream_bounded /
   connection's own probes wait for a saturated cap too, and counted without
   that limit they kept a dark send going for 32 s. For the
   credit after its last ack a dark path's own held probes do still count (on
-  main they counted for as long as they were held). Under random loss the 384 KiB send window drains at Cubic's window per
-  round trip, so writes wait past 5 s while acks still arrive; failing them
-  reset streams the peer was receiving (E5B9-LAB, 8 MiB at 5% loss and 200 ms
-  failed). The connection is read at the timer's wakes, so a send that stops
+  main they counted for as long as they were held). Under random loss that reaches Cubic (plain Cubic before
+  the loss gate, or a loss the gate passes: a queue, jitter, a loss share at
+  or above 0.25) the 384 KiB send window drains at Cubic's window per round
+  trip, so writes wait past 5 s while acks still arrive; failing them reset
+  streams the peer was receiving (E5B9-LAB, plain Cubic, 8 MiB at 5% loss and
+  200 ms failed). The connection is read at the timer's wakes, so a send that stops
   moving ends at its own gap or within 2 x STALL_PROGRESS_WINDOW of the last
   move, never past total. It gives nothing until a wake during the send has
   seen a move, so a path dark before the send fails it at 5 s with no cap

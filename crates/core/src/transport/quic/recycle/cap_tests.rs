@@ -935,7 +935,6 @@ fn a_one_mib_message_through_five_percent_random_loss_is_not_slowed_by_it() {
         )
         .await;
         let elapsed = link.send(1024 * 1024, Duration::from_secs(600)).await;
-        println!("1 MiB at 5% loss, 100 ms RTT: {elapsed:?}");
         assert!(
             elapsed < Duration::from_secs(3),
             "{elapsed:?}: random loss slowed the transfer"

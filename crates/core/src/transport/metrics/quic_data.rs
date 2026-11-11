@@ -591,7 +591,9 @@ pub struct QuicDataSnapshot {
     pub send_resets_reached: Vec<u64>,
     pub send_resets_path_max: u64,
     /// Congestion events by loss-gate verdict, by `loss_gate::Verdict::ALL`.
-    /// Defaulted, so a snapshot from before the gate decodes.
+    /// Defaulted, so JSON from before the gate decodes. This does not help
+    /// bincode: the local event log drops a snapshot written by an older
+    /// release (see `upload_json`).
     #[serde(default)]
     pub gate_loss: Vec<u64>,
     /// Paths that ended in the period, by `GATE_QUEUE_LABELS`.
