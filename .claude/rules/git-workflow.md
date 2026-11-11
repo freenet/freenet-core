@@ -52,6 +52,13 @@ Does the PR bundle more than one logical change?
     "fix:", unrelated cleanup riding along) is grounds for closing.
 ```
 
+**Reviewer severity for these two checks.** The CI rule review
+(`claude-pr-review.yml`) reports "bundles more than one logical change" and a
+commit subject that is over 72 characters or not in conventional-commit form
+as **INFO**, never WARNING. They are still expected of authors. The
+`conventional_commits` check in `ci.yml` validates the PR title only; scope is
+a human-review call, and nothing automated checks per-commit subject length.
+
 ### WHEN creating a PR
 
 ```
