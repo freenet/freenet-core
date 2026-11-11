@@ -211,6 +211,9 @@ pub(in crate::transport::quic) struct Receiver<T> {
     meter: Option<Arc<ConnMeter>>,
     /// The connection's staged bytes, against their cap ([`ConnStaging`]).
     staging: Arc<ConnStaging>,
+    /// The peer's uni-stream limit, lowered while one-packet Shorts wait for
+    /// room ([`StreamLimit`]).
+    stream_limit: StreamLimit,
     /// Panic on the next stream, to test the supervisor.
     #[cfg(test)]
     pub(in crate::transport::quic) panic_on_stream: bool,
@@ -225,6 +228,17 @@ impl<T: TimeSource> Receiver<T> {
     /// The connection's staged bytes, whose cap the meter sets.
     pub(in crate::transport::quic) fn staging(&self) -> Arc<ConnStaging> {
         self.staging.clone()
+    }
+
+    /// Let the peer of `connection` open `limit` uni streams, less one for
+    /// each one-packet Short waiting for room. Before any stream is read.
+    pub(in crate::transport::quic) fn set_stream_limit(
+        &mut self,
+        connection: quinn::Connection,
+        limit: u32,
+    ) {
+        self.stream_limit = StreamLimit::new(Some(connection), limit);
+        self.stream_limit.apply(0);
     }
 
     /// Tell `meter` of every read from now on. Before any stream is read.
@@ -272,6 +286,7 @@ impl<T: TimeSource> Receiver<T> {
             )),
             meter: None,
             staging: Arc::new(ConnStaging::new(staging_cap, node)),
+            stream_limit: StreamLimit::new(None, 0),
             #[cfg(test)]
             panic_on_stream: false,
         }
@@ -281,6 +296,74 @@ impl<T: TimeSource> Receiver<T> {
 /// How long after its first refused data frame a path that accepts no data
 /// closes: long enough for the stops it sent to reach the sender first.
 pub(in crate::transport::quic) const REFUSAL_CLOSE_DELAY: Duration = Duration::from_secs(2);
+
+/// The uni streams the peer may open, lowered by one for each one-packet
+/// Short that waits for room in a full channel.
+///
+/// A waiting reader reads on, and reading the stream's end frees quinn's
+/// slot for it, which would let the peer open another stream at once. A
+/// one-packet Short is not charged (its sender may already read it as
+/// `Sent`, so refusing it could lose it), so without this nothing would
+/// bound how many wait. Lowering the limit holds back new stream credit
+/// instead (quinn grants none while the streams it counts reach the limit),
+/// so at most `limit` such Shorts wait, each one packet, and the sender's
+/// further messages find no stream and go on UDP. Charged messages are
+/// bounded by their charge and need none of this.
+///
+/// Changed only from the path's receive task, where every reader runs, so
+/// the limits quinn is told arrive in the order the count moved.
+struct StreamLimit {
+    connection: Option<quinn::Connection>,
+    limit: u32,
+    waiting: AtomicU32,
+}
+
+impl StreamLimit {
+    fn new(connection: Option<quinn::Connection>, limit: u32) -> Self {
+        Self {
+            connection,
+            limit,
+            waiting: AtomicU32::new(0),
+        }
+    }
+
+    fn apply(&self, waiting: u32) {
+        if let Some(connection) = &self.connection {
+            connection.set_max_concurrent_uni_streams(quinn::VarInt::from_u32(
+                self.limit.saturating_sub(waiting),
+            ));
+        }
+    }
+
+    /// One more Short waits, until the guard is dropped.
+    fn hold(&self) -> StreamLimitHold<'_> {
+        let waiting = self
+            .waiting
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        self.apply(waiting);
+        StreamLimitHold(self)
+    }
+
+    /// Shorts waiting now. Tests only.
+    #[cfg(test)]
+    fn waiting(&self) -> u32 {
+        self.waiting.load(Ordering::Relaxed)
+    }
+}
+
+struct StreamLimitHold<'a>(&'a StreamLimit);
+
+impl Drop for StreamLimitHold<'_> {
+    fn drop(&mut self) {
+        let waiting = self
+            .0
+            .waiting
+            .fetch_sub(1, Ordering::Relaxed)
+            .saturating_sub(1);
+        self.0.apply(waiting);
+    }
+}
 
 /// Accept every uni stream of `connection` and read them all concurrently
 /// in this one task, until the connection ends; then let the readers see the
@@ -1683,7 +1766,7 @@ impl<T: TimeSource> Receiver<T> {
             }
             reader.set_age_limit(inbound_stream_age_limit(total));
         }
-        let mut was_charged = if guard.is_some() {
+        let was_charged = if guard.is_some() {
             Charged::Yes
         } else {
             Charged::No
@@ -1712,30 +1795,15 @@ impl<T: TimeSource> Receiver<T> {
         // `Sent`. Only this reader waits (each reader is its own future), so a
         // slow consumer does not hold up the other streams. The reader reads on
         // while it waits ([`BodyReader::read_while_waiting`]), so quinn holds
-        // nothing for it; that may read the stream's end and free quinn's slot,
-        // so the waiters are bounded by the inbound budget rather than the
-        // stream limit, and an uncharged message takes a charge before it
-        // waits. Past the age limit the stream is stopped.
+        // nothing for it; that may read the stream's end and free quinn's slot.
+        // A charged message is bounded by its charge; an uncharged one lowers
+        // the peer's stream limit while it waits ([`StreamLimit`]), so at most
+        // the stream limit of them wait, as when a waiter held its slot. Past
+        // the age limit the stream is stopped.
         let permit = match self.shorts.try_reserve() {
             Ok(permit) => permit,
             Err(mpsc::error::TrySendError::Full(())) => {
-                if guard.is_none() {
-                    match self.charge_short(total) {
-                        Ok(charge) => {
-                            guard = Some(charge);
-                            was_charged = Charged::Yes;
-                        }
-                        Err(rejection) => {
-                            self.refuse(
-                                &mut reader,
-                                rejection,
-                                total,
-                                QuicInboundOutcome::ShortRefusedBudget,
-                            );
-                            return;
-                        }
-                    }
-                }
+                let _held = guard.is_none().then(|| self.stream_limit.hold());
                 let waiting =
                     WaitingGuard::new(&self.stats, QuicInboundOutcome::ShortAbandonedWaiting);
                 let waited = reader.read_while_waiting(self.shorts.reserve()).await;

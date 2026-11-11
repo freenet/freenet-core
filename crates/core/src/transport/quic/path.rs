@@ -104,12 +104,14 @@
 //!
 //! A Short or Stream whose channel is full waits for room in its own reader
 //! future (`reserve`, raced with the stream's age limit), not in the task: the
-//! other readers and the accept loop carry on. A Short waits after its payload
-//! is read and BEFORE the stream's end is read (reading the end frees the
-//! stream in quinn and returns its credit), and the waiting reader keeps its
-//! `RecvStream`, so at most `MAX_UNI_STREAMS` readers wait on a path, charged
-//! or not, and a slow consumer slows the sender instead of losing messages the
-//! sender has seen acknowledged. Past the age limit the stream is stopped
+//! other readers and the accept loop carry on. A waiting reader reads on (a
+//! byte past the declared end is `Overlong` at once), so quinn holds nothing
+//! for it, and reading the stream's end frees quinn's slot. A charged message
+//! is bounded by its charge; a one-packet Short, uncharged, lowers the peer's
+//! stream limit by one while it waits (`inbound::StreamLimit`), so at most
+//! `MAX_UNI_STREAMS` of them wait on a path, and a slow consumer slows the
+//! sender instead of losing messages the sender has seen acknowledged. Past
+//! the age limit the stream is stopped
 //! (`stop_code::EVICTED`). A sender still waiting for its acknowledgement sees
 //! the stop; one whose bytes were all acknowledged has already reported `Sent`,
 //! and the message is lost, as a message dropped from a full channel is on UDP.
@@ -253,7 +255,8 @@ pub(crate) mod reset_code {
 /// Capacity of [`QuicDataInbox::shorts`]. A queued message of more than one
 /// packet holds its inbound budget charge, so the budget bounds those bytes; a
 /// one-packet message is uncharged and bounded by this capacity (about one
-/// packet each) plus the readers waiting for room, at most `MAX_UNI_STREAMS`.
+/// packet each) plus the readers waiting for room, at most `MAX_UNI_STREAMS`
+/// (`inbound::StreamLimit`).
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const SHORT_CHANNEL_CAPACITY: usize = 256;
 /// Capacity of [`QuicDataInbox::streams`]. Each queued stream holds its charge.
@@ -911,11 +914,10 @@ impl QuicPath {
         }
         // A path that reads data lets the peer open every stream the path's
         // limits allow (the endpoint starts each connection at
-        // `config::INITIAL_UNI_STREAMS`).
+        // `config::INITIAL_UNI_STREAMS`), less one per one-packet Short
+        // waiting for room (`inbound::StreamLimit`).
         if limits.accept_data {
-            connection
-                .inner()
-                .set_max_concurrent_uni_streams(quinn::VarInt::from_u32(MAX_UNI_STREAMS));
+            receiver.set_stream_limit(connection.inner().clone(), MAX_UNI_STREAMS);
         }
         // A path that reads data takes a share of the node's buffer budget,
         // which sets its windows from here on; a shadow path keeps the

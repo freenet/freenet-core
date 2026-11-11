@@ -1609,60 +1609,57 @@ fn a_message_waiting_for_room_is_evicted_at_its_age_limit() {
     })
 }
 
-/// Waiters for room in a full channel are capped by the inbound budget: a
-/// reader reads on while it waits, so it may read its stream's end, which
-/// frees quinn's slot, and a one-packet Short that has to wait takes a charge
-/// first. With nothing draining, at most the channel's capacity plus the
-/// budget's stream allowance are held; the rest are refused (BUDGET_REFUSED)
-/// and counted, so the memory held does not grow with the peer's upload. Once
-/// the consumer drains, every message that was held arrives.
+/// Waiters for room in a full channel are capped by the stream limit. A
+/// waiting reader reads on and may read its stream's end, which frees quinn's
+/// slot, so each waiting one-packet Short (uncharged: its sender may already
+/// read it as `Sent`, so it must not be refused) lowers the peer's stream
+/// limit by one while it waits (`inbound::StreamLimit`). With nothing
+/// draining, the sends that complete are those the channel holds plus at most
+/// `MAX_UNI_STREAMS` waiting; the rest block in `open_uni`, none is refused,
+/// and the memory held does not grow with the peer's upload. Once the
+/// consumer drains, all of them arrive.
 #[test]
-fn waiters_for_a_full_channel_are_capped_by_the_inbound_budget() {
+fn waiters_for_a_full_channel_are_capped_by_the_stream_limit() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let allowance = 32;
-        let limits = QuicPathLimits {
-            max_streams: allowance,
-            ..QuicPathLimits::DEFAULT
-        };
-        let mut p = paths("quic-path-waiters", 80, limits).await;
-        let count = SHORT_CHANNEL_CAPACITY + allowance + 40;
+        let mut p = paths("quic-path-waiters", 80, QuicPathLimits::DEFAULT).await;
+        let limit = super::super::config::MAX_UNI_STREAMS as usize;
+        let count = SHORT_CHANNEL_CAPACITY + limit + 40;
+        let done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         for i in 0..count {
-            let a = p.a.clone();
-            // A refused one-packet Short may read as sent at its sender (it was
-            // acknowledged first), so the outcome is judged at the receiver.
-            tokio::spawn(async move { a.send_short(&(i as u32).to_be_bytes()).await });
+            let (a, done) = (p.a.clone(), done.clone());
+            tokio::spawn(async move {
+                a.send_short(&(i as u32).to_be_bytes()).await.unwrap();
+                done.fetch_add(1, Ordering::SeqCst);
+            });
         }
         let time = p.time();
         p.drive(async move { time.sleep(Duration::from_secs(5)).await })
             .await;
+        let sent = done.load(Ordering::SeqCst);
+        assert!(
+            sent <= SHORT_CHANNEL_CAPACITY + limit,
+            "{sent} sends completed with nothing draining"
+        );
+        assert!(sent >= SHORT_CHANNEL_CAPACITY, "only {sent} completed");
         let stats = p.b.stats();
         assert_eq!(p.b_in.shorts.len(), SHORT_CHANNEL_CAPACITY);
-        assert!(
-            p.b.inbound_budget_streams() <= allowance,
-            "{} waiters charged",
-            p.b.inbound_budget_streams()
-        );
-        let refused = stats.count(QuicInboundOutcome::ShortRefusedBudget) as usize;
-        assert_eq!(refused, count - SHORT_CHANNEL_CAPACITY - allowance);
+        assert_eq!(p.b.inbound_budget_streams(), 0, "no waiter is charged");
+        assert_eq!(stats.count(QuicInboundOutcome::ShortRefusedBudget), 0);
         let mut got = std::collections::BTreeSet::new();
         for _ in 0..200 {
             while let Ok(message) = p.b_in.shorts.try_recv() {
                 let bytes: [u8; 4] = message.payload()[..].try_into().unwrap();
                 got.insert(u32::from_be_bytes(bytes));
             }
-            if got.len() == count - refused {
+            if got.len() == count {
                 break;
             }
             let time = p.time();
             p.drive(async move { time.sleep(Duration::from_millis(10)).await })
                 .await;
         }
-        assert_eq!(
-            got.len(),
-            count - refused,
-            "every message held arrived once drained"
-        );
+        assert_eq!(got.len(), count, "every message arrived once drained");
         assert_eq!(stats.count(QuicInboundOutcome::ShortDroppedFull), 0);
     })
 }
@@ -2567,7 +2564,10 @@ fn quic_admission_holds_one_budget_lock_from_check_to_charge() {
         &body,
         "charge_short",
         lock,
-        &[check, "let key = self.short_key(&budget);"],
+        &[
+            "budget.check(total, Releaser::Quic)?;",
+            "let key = self.short_key(&budget);",
+        ],
         "budget.charge(",
     );
     let body = pin::fn_body(source, "async fn read_stream(");
@@ -6769,12 +6769,11 @@ fn a_reader_waiting_for_room_keeps_reading() {
     })
 }
 
-/// A one-packet Short is not charged, but one that has to wait for room reads
-/// on and may read its end, which frees its quinn slot, so it takes a charge
-/// before it waits: waiting messages are bounded by the inbound budget. It is
-/// delivered once room comes, and its charge goes when it is taken.
+/// A one-packet Short that has to wait for room reads on and may read its
+/// end, but stays uncharged (a refusal could lose a message its sender has
+/// seen acknowledged); it is delivered once room comes, with no charge.
 #[test]
-fn a_waiting_one_packet_short_takes_a_charge() {
+fn a_waiting_one_packet_short_is_not_charged() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
         let limits = QuicPathLimits {
@@ -6802,8 +6801,8 @@ fn a_waiting_one_packet_short_takes_a_charge() {
             .await;
         assert_eq!(
             p.b.inbound_budget_streams(),
-            1,
-            "the waiting short is charged"
+            0,
+            "the waiting short is not charged"
         );
         assert_eq!(&p.b_in.shorts.try_recv().unwrap().payload()[..], b"fills");
         let time = p.time();
@@ -6815,6 +6814,6 @@ fn a_waiting_one_packet_short_takes_a_charge() {
         let delivered = p.b_in.shorts.try_recv().expect("delivered after room came");
         assert_eq!(&delivered.payload()[..], b"waits");
         let (_, key) = delivered.into_parts();
-        assert!(key.is_some(), "it carries its charge to the consumer");
+        assert!(key.is_none(), "it carries no charge");
     })
 }
