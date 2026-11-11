@@ -759,6 +759,8 @@ struct HubPathPeak {
     over_cap: usize,
     /// The lowest cap seen.
     min_cap: usize,
+    /// The most gaps the path counted at one sample.
+    gaps: usize,
 }
 
 impl Hub {
@@ -928,6 +930,7 @@ impl Hub {
         peak.staged = peak.staged.max(staged);
         peak.staging_cap = peak.staging_cap.max(cap);
         peak.over_cap = peak.over_cap.max(staged.saturating_sub(cap));
+        peak.gaps = peak.gaps.max(path.inbound_gaps_held());
         peak.min_cap = if peak.min_cap == 0 {
             cap
         } else {
@@ -1155,6 +1158,9 @@ struct HostileShape {
     /// new stream with its header: they repay the window's debt, so the
     /// staging cap falls while the withheld streams stay staged.
     then_contiguous: usize,
+    /// Lose every other step's datagrams while writing the frames, so each
+    /// stream holds a gap between every two frames.
+    alternate_drop: bool,
 }
 
 /// One run of [`hostile_against_hub`].
@@ -1174,6 +1180,12 @@ struct HostileRun {
     hostile_dropped: u64,
     /// Bytes the hostile peer wrote above its withheld headers.
     hostile_written: usize,
+    /// The hub path's staging cap when the hostile peer pinned its window:
+    /// a cap that rises afterwards means the window grew on gapped bytes.
+    cap_at_pin: usize,
+    /// Streams the gap cap stopped, and whether it closed the path.
+    too_many_ranges: u64,
+    closed_too_many_ranges: u64,
 }
 
 /// Bytes the honest leaf sends while the hostile peer runs.
@@ -1275,6 +1287,7 @@ async fn hostile_against_hub(
     let mut peak = HubPathPeak::default();
     let mut dropped = 0;
     let mut written = 0;
+    let mut cap_at_pin = 0;
     if let (Some(shape), Some((peer, path))) = (shape, hostile.as_ref()) {
         peer.script(|state| {
             state.feed_in = false;
@@ -1306,9 +1319,13 @@ async fn hostile_against_hub(
             streams.push(id);
         }
         let frame = vec![0x5a; shape.frame_len];
-        for _ in 0..shape.frames {
+        cap_at_pin = path.inbound_staging_cap();
+        for step in 0..shape.frames {
             for id in &streams {
                 written += peer.write(*id, &frame);
+            }
+            if shape.alternate_drop && step % 2 == 1 {
+                peer.script(|state| state.drop_step = true);
             }
             let time = hub.time.clone();
             drive(
@@ -1409,6 +1426,13 @@ async fn hostile_against_hub(
         budget_total: hub.budget.total(),
         hostile_dropped: dropped,
         hostile_written: written,
+        cap_at_pin,
+        too_many_ranges: hostile.as_ref().map_or(0, |(_, path)| {
+            path.stats().count(QuicInboundOutcome::TooManyRanges)
+        }),
+        closed_too_many_ranges: hostile.as_ref().map_or(0, |(_, path)| {
+            path.stats().count(QuicInboundOutcome::ClosedTooManyRanges)
+        }),
     }
 }
 
@@ -1429,6 +1453,7 @@ fn a_hostile_peer_cannot_exceed_its_charge() {
                 frames: 2000,
                 skip: 0,
                 then_contiguous: 0,
+                alternate_drop: false,
             },
             HostileShape {
                 streams: 32,
@@ -1436,6 +1461,7 @@ fn a_hostile_peer_cannot_exceed_its_charge() {
                 frames: 400,
                 skip: 0,
                 then_contiguous: 0,
+                alternate_drop: false,
             },
             HostileShape {
                 streams: 60,
@@ -1443,6 +1469,7 @@ fn a_hostile_peer_cannot_exceed_its_charge() {
                 frames: 200,
                 skip: 0,
                 then_contiguous: 0,
+                alternate_drop: false,
             },
             HostileShape {
                 streams: 8,
@@ -1450,6 +1477,7 @@ fn a_hostile_peer_cannot_exceed_its_charge() {
                 frames: 1,
                 skip: MIB - 64,
                 then_contiguous: 0,
+                alternate_drop: false,
             },
             HostileShape {
                 streams: 60,
@@ -1457,6 +1485,7 @@ fn a_hostile_peer_cannot_exceed_its_charge() {
                 frames: 1,
                 skip: 128 * 1024,
                 then_contiguous: 0,
+                alternate_drop: false,
             },
             // Spans just past a power of two, where a buffer grown by
             // doubling is charged about twice its span.
@@ -1466,6 +1495,7 @@ fn a_hostile_peer_cannot_exceed_its_charge() {
                 frames: 1,
                 skip: 512 * 1024 - HEADER_LEN + 1,
                 then_contiguous: 0,
+                alternate_drop: false,
             },
             HostileShape {
                 streams: 31,
@@ -1473,6 +1503,17 @@ fn a_hostile_peer_cannot_exceed_its_charge() {
                 frames: 1,
                 skip: 256 * 1024 - HEADER_LEN + 1,
                 then_contiguous: 0,
+                alternate_drop: false,
+            },
+            // A gap between every two one-byte frames on 16 streams: more
+            // gaps than the connection's cap allows.
+            HostileShape {
+                streams: 16,
+                frame_len: 1,
+                frames: 2000,
+                skip: 0,
+                then_contiguous: 0,
+                alternate_drop: true,
             },
             // Grow, stage about half the credit under withheld headers, keep
             // the rest, wait past the idle decay, then spend the rest in
@@ -1483,6 +1524,7 @@ fn a_hostile_peer_cannot_exceed_its_charge() {
                 frames: 1000,
                 skip: 0,
                 then_contiguous: 3 * MIB,
+                alternate_drop: false,
             },
         ];
         for (index, shape) in shapes.into_iter().enumerate() {
@@ -1495,6 +1537,16 @@ fn a_hostile_peer_cannot_exceed_its_charge() {
                 "staged past the cap: {run:?}"
             );
             assert!(run.peak.node_charged <= run.budget_total, "{run:?}");
+            assert!(
+                run.peak.staging_cap <= run.cap_at_pin,
+                "the window grew while the peer sent above gaps: {run:?}"
+            );
+            if shape.alternate_drop {
+                assert!(
+                    run.too_many_ranges > 0 || run.closed_too_many_ranges > 0,
+                    "the gap cap stopped the gapped streams: {run:?}"
+                );
+            }
             assert!(
                 run.honest_took.as_secs_f64() <= baseline.honest_took.as_secs_f64() * 1.1,
                 "the honest leaf was slowed by more than 10%: {run:?} against {baseline:?}"
