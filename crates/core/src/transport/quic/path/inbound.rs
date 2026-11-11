@@ -903,6 +903,10 @@ pub(in crate::transport::quic) fn allocation_class(bytes: usize) -> usize {
 #[derive(Debug)]
 pub(in crate::transport::quic) struct ConnStaging {
     held: AtomicUsize,
+    /// The most held at once, and the cap then, as a per-mille of it.
+    /// Tests only.
+    #[cfg(test)]
+    peak_permille: AtomicUsize,
     cap: AtomicUsize,
     /// When a stream was last stopped for passing the cap, in the time
     /// source's nanoseconds plus one (0: never).
@@ -919,6 +923,8 @@ impl ConnStaging {
     ) -> Self {
         Self {
             held: AtomicUsize::new(0),
+            #[cfg(test)]
+            peak_permille: AtomicUsize::new(0),
             cap: AtomicUsize::new(cap),
             last_trip: AtomicU64::new(0),
             node,
@@ -937,6 +943,11 @@ impl ConnStaging {
             Ok(before) => {
                 let pct = (before + bytes).saturating_mul(100) / cap.max(1);
                 self.node.record_staged_level(pct as u64);
+                #[cfg(test)]
+                self.peak_permille.fetch_max(
+                    (before + bytes).saturating_mul(1000) / cap.max(1),
+                    Ordering::Relaxed,
+                );
                 true
             }
             Err(_) => false,
@@ -975,6 +986,12 @@ impl ConnStaging {
     /// The cap now.
     pub(in crate::transport::quic) fn cap(&self) -> usize {
         self.cap.load(Ordering::Relaxed)
+    }
+
+    /// The most staged at once, per mille of the cap then. Tests only.
+    #[cfg(test)]
+    pub(in crate::transport::quic) fn peak_permille(&self) -> usize {
+        self.peak_permille.load(Ordering::Relaxed)
     }
 
     /// Staged bytes charged now. Tests only.

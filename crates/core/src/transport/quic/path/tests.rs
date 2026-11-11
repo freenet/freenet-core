@@ -6645,6 +6645,86 @@ async fn send_without_its_first_datagram(
     stopped
 }
 
+/// An honest stream whose first datagram (its header) is lost, at a window
+/// the budget has grown and a round trip that makes the resend take a while:
+/// what arrives meanwhile is staged and stays within the staging cap, so the
+/// stream is neither stopped nor the path closed, and it is delivered whole.
+/// Run at several transfer sizes, so the window has grown when the loss hits,
+/// and at 20 and 100 ms each way.
+#[test]
+fn an_honest_stream_whose_first_packet_is_lost_stays_within_the_staging_cap() {
+    for (case, mib, one_way) in [(0u8, 1usize, 20u64), (1, 8, 20), (2, 24, 20), (3, 24, 100)] {
+        bounded(move || async move {
+            use crate::transport::in_memory_socket::{
+                PacketDeliveryDecision, set_packet_delivery_callback,
+            };
+            let _seed = GlobalRng::seed_guard(SEED);
+            let windows = Windows {
+                a: Some(test_budget(64 << 20, leaked_counters())),
+                b: Some(test_budget(64 << 20, leaked_counters())),
+            };
+            let network = format!("quic-staging-honest-loss-{case}");
+            let p = paths_metered(&network, 40 + case, windows).await;
+            let a = p.a.clone();
+            // Grow the window first with a transfer of the same size.
+            let warm = Bytes::from(payload(mib * MIB));
+            let delay = move |_: &str, _, _, _: &[u8]| {
+                PacketDeliveryDecision::DelayedDelivery(Duration::from_millis(one_way))
+            };
+            set_packet_delivery_callback(&network, Some(Arc::new(delay)));
+            p.drive(async move {
+                a.send_stream(StreamId::next(), None, warm)
+                    .await
+                    .expect("warm")
+            })
+            .await;
+            let mut p = p;
+            let warm = p.b_in.streams.try_recv().expect("warm announced");
+            warm.handle.assemble().await.expect("warm assembled");
+            // Then lose the first large datagram from a: the next stream's
+            // header and first payload.
+            let from = p.pair.a_addr;
+            let seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            set_packet_delivery_callback(
+                &network,
+                Some(Arc::new(move |_: &str, sender, _, bytes: &[u8]| {
+                    if sender == from
+                        && bytes.len() >= 1000
+                        && !seen.swap(true, std::sync::atomic::Ordering::Relaxed)
+                    {
+                        PacketDeliveryDecision::Drop
+                    } else {
+                        PacketDeliveryDecision::DelayedDelivery(Duration::from_millis(one_way))
+                    }
+                })),
+            );
+            let a = p.a.clone();
+            let body = Bytes::from(payload(mib * MIB));
+            let sent = body.clone();
+            p.drive(async move {
+                a.send_stream(StreamId::next(), None, sent)
+                    .await
+                    .expect("sent")
+            })
+            .await;
+            set_packet_delivery_callback(&network, None);
+            let arrival = p.b_in.streams.try_recv().expect("announced");
+            assert_eq!(arrival.handle.assemble().await.expect("assembled"), body);
+            let stats = p.b.stats();
+            assert_eq!(
+                stats.count(QuicInboundOutcome::EvictedStaged),
+                0,
+                "{mib} MiB"
+            );
+            assert_eq!(stats.count(QuicInboundOutcome::ClosedStagedOverCap), 0);
+            let peak = p.b.inbound_staged_peak_permille();
+            eprintln!("{mib} MiB at {one_way} ms: staged peak {peak} per mille of the cap");
+            assert!(peak > 0, "premise: the lost header made the reader stage");
+            assert!(peak < 1000, "{mib} MiB: staged {peak} per mille of the cap");
+        });
+    }
+}
+
 /// A stream whose first datagram (its header) is lost has what follows staged
 /// (`inbound::Staging`); past the connection's staging cap it is stopped
 /// (`EvictedStaged`) and its staged bytes freed, while another stream, whose

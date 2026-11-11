@@ -1077,6 +1077,13 @@ impl QuicPath {
         self.inbound_staging.cap()
     }
 
+    /// The most the receive side staged at once, per mille of its cap.
+    /// Tests only.
+    #[cfg(test)]
+    pub(in crate::transport) fn inbound_staged_peak_permille(&self) -> usize {
+        self.inbound_staging.peak_permille()
+    }
+
     /// Gaps the receive side counts now. Tests only.
     #[cfg(test)]
     pub(in crate::transport) fn inbound_gaps_held(&self) -> usize {
