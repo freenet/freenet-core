@@ -3126,6 +3126,7 @@ impl Scripted {
         recycle::AckSample::of(
             self.a.connection().inner(),
             &self.a.connection().cap_holds(),
+            self.a.writers(),
         )
         .expect("a CappedCubic controller")
     }
@@ -3626,9 +3627,11 @@ async fn max_outstanding(paths: [Arc<QuicPath>; 2], time: VirtualTime, end: u64)
     let mut max = 0;
     while time.now_nanos() < end {
         for path in &paths {
-            if let Some(sample) =
-                recycle::AckSample::of(path.connection().inner(), &path.connection().cap_holds())
-            {
+            if let Some(sample) = recycle::AckSample::of(
+                path.connection().inner(),
+                &path.connection().cap_holds(),
+                path.writers(),
+            ) {
                 max = max.max(sample.outstanding_after_acks());
             }
         }

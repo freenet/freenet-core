@@ -35,6 +35,19 @@ struct Reading {
     cap_holds: u64,
     cap_held_now: bool,
     cap_validity: Duration,
+    /// The credit watch's readings ([`Reading::credit`]).
+    credit: Credit,
+}
+
+/// What the credit watch reads ([`CreditWatch`]), all 0 unless a test sets
+/// them.
+#[derive(Clone, Copy, Default)]
+struct Credit {
+    acked_bytes: u64,
+    congestion_limited_batches: u64,
+    blocked: u64,
+    stream_frames: u64,
+    writers: usize,
 }
 
 const fn reading(acked: u64, outstanding: u64, sent: u64, received: u64) -> Reading {
@@ -44,6 +57,13 @@ const fn reading(acked: u64, outstanding: u64, sent: u64, received: u64) -> Read
         cap_holds: 0,
         cap_held_now: false,
         cap_validity: Duration::from_secs(3600),
+        credit: Credit {
+            acked_bytes: 0,
+            congestion_limited_batches: 0,
+            blocked: 0,
+            stream_frames: 0,
+            writers: 0,
+        },
         outstanding,
         sent,
         received,
@@ -83,6 +103,11 @@ impl Reading {
         }
     }
 
+    /// The same reading with these credit-watch readings.
+    const fn credit(self, credit: Credit) -> Self {
+        Self { credit, ..self }
+    }
+
     /// The same reading with no transmit held now.
     const fn released(self) -> Self {
         Self {
@@ -94,7 +119,12 @@ impl Reading {
 
 /// Feed a watch one sample per `ACK_WATCH_TICK`, from tick 1 to `ticks`
 /// (tick 0 is the first sample); the first tick at which it said close.
-fn run(ticks: u64, mut at: impl FnMut(u64) -> Reading) -> Option<u64> {
+fn run(ticks: u64, at: impl FnMut(u64) -> Reading) -> Option<u64> {
+    run_why(ticks, at).map(|(tick, _)| tick)
+}
+
+/// [`run`], with why the watch said close.
+fn run_why(ticks: u64, mut at: impl FnMut(u64) -> Reading) -> Option<(u64, Stall)> {
     let record = Arc::default();
     let sample = |r: Reading| {
         AckSample::synthetic(
@@ -111,9 +141,20 @@ fn run(ticks: u64, mut at: impl FnMut(u64) -> Reading) -> Option<u64> {
                 longest_wait: Duration::ZERO,
             },
         )
+        .with_credit(
+            r.credit.acked_bytes,
+            r.credit.congestion_limited_batches,
+            r.credit.blocked,
+            r.credit.stream_frames,
+            r.credit.writers,
+        )
     };
     let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample(at(0)));
-    (1..=ticks).find(|tick| watch.observe(tick * ACK_WATCH_TICK.as_secs() * SEC, sample(at(*tick))))
+    (1..=ticks).find_map(|tick| {
+        watch
+            .observe(tick * ACK_WATCH_TICK.as_secs() * SEC, sample(at(tick)))
+            .then(|| (tick, watch.stall().expect("a reason")))
+    })
 }
 
 /// A send at tick 1, never acknowledged, while the peer sends every tick:
@@ -148,11 +189,15 @@ fn an_acknowledgement_of_everything_starts_no_window() {
     assert_eq!(closed, None);
 }
 
-/// The peer silent throughout: never closed (quinn's idle timeout ends
-/// that connection).
+/// The peer silent throughout while this side keeps sending and nothing is
+/// acknowledged: a dark path, closed a window after the first send, without
+/// waiting for quinn's idle timeout.
 #[test]
-fn a_silent_peer_is_left_to_the_idle_timeout() {
-    assert_eq!(run(100, |t| reading(5, 1200, 10 + t, 100)), None);
+fn a_silent_peer_with_sends_outstanding_is_a_dark_path() {
+    assert_eq!(
+        run_why(100, |t| reading(5, 1200, 10 + t, 100)),
+        Some((closes_at(1), Stall::Dark))
+    );
 }
 
 /// One sample with nothing from the peer inside the window does not end it
@@ -167,8 +212,9 @@ fn two_samples_in_a_row_with_nothing_from_the_peer_end_the_window() {
     });
     assert_eq!(closed, Some(closes_at(1)));
     // Nothing from the peer at ticks 4 and 5: the window ends at 5, and
-    // the send at tick 6 starts the next one.
-    let closed = run(100, |t| {
+    // the send at tick 6 starts the next one. The dark-path window those two
+    // silent samples start ends when the peer is heard again.
+    let closed = run_why(100, |t| {
         let received = match t {
             0..=3 => 100 + t,
             4 | 5 => 103,
@@ -176,7 +222,7 @@ fn two_samples_in_a_row_with_nothing_from_the_peer_end_the_window() {
         };
         reading(5, 0, 10 + t, received)
     });
-    assert_eq!(closed, Some(closes_at(6)));
+    assert_eq!(closed, Some((closes_at(6), Stall::NotAcknowledging)));
 }
 
 /// Review finding (second round): a window started by an acknowledgement
@@ -273,21 +319,25 @@ fn a_hold_past_its_validity_no_longer_pauses_the_watch() {
     assert_eq!(closed, Some(closes_at(5)));
 }
 
-/// Recovery from an outage in both directions. Before it, sends with
-/// nothing from the peer (probes); after it, packets still outstanding but
-/// nothing new sent and nothing acknowledged (the probe timer is backed
-/// off), while the peer sends every tick: no window. The probe at tick 30
-/// is acknowledged at tick 31: still no close.
+/// An outage in both directions longer than the window, with this side's
+/// probes unacknowledged, is a dark path: closed a window after the first
+/// probe. One shorter than the window is not: after it, packets still
+/// outstanding but nothing new sent and nothing acknowledged (the probe
+/// timer is backed off), while the peer sends every tick, start no window,
+/// and the probe at tick 30 is acknowledged at tick 31.
 #[test]
-fn recovery_from_an_outage_in_both_directions_does_not_close() {
+fn only_an_outage_longer_than_the_window_closes() {
+    let long = run_why(200, |t| reading(5, 1200, 10 + t.min(15), 100));
+    assert_eq!(long, Some((closes_at(1), Stall::Dark)));
     let closed = run(200, |t| match t {
-        // The outage: probes, nothing from the peer.
-        0..=15 => reading(5, 1200, 10 + t, 100),
+        // The outage, shorter than the window: probes, nothing from the
+        // peer.
+        0..=3 => reading(5, 1200, 10 + t, 100),
         // Recovered: the peer sends every tick, nothing of ours moves.
-        16..=29 => reading(5, 1200, 25, 100 + t),
+        4..=29 => reading(5, 1200, 13, 100 + t),
         // The backed-off probe, then its acknowledgement.
-        30 => reading(5, 1200, 26, 100 + t),
-        _ => reading(6, 0, 26, 100 + t),
+        30 => reading(5, 1200, 14, 100 + t),
+        _ => reading(6, 0, 14, 100 + t),
     });
     assert_eq!(closed, None);
 }
@@ -600,6 +650,7 @@ fn ack_counting_forwards_every_call_unchanged() {
             batches: 1,
             in_flight_after_acks: 2400,
             lost_since_acks: 1200,
+            ..AckState::default()
         }
     );
     assert_eq!(record.lock().outstanding_after_acks(), 1200);
@@ -882,5 +933,205 @@ fn path_loss_reports_the_change_since_the_last_report() {
         delta,
         at(10, 0, 0, 0),
         "from the last report, not the start"
+    );
+}
+
+/// A busy conforming peer's reading at tick `t` (acknowledgements, sends and
+/// frames from the peer every tick), with credit-watch readings `credit`: the
+/// other rules never close it, so only the credit rule can.
+fn busy(t: u64, credit: Credit) -> Reading {
+    reading(t * 7, 30_000, t * 9, t * 11).credit(credit)
+}
+
+/// Bytes the floor rate gives in one tick.
+const FLOOR_PER_TICK: u64 = FLOOR_RATE_BYTES_PER_SEC * 2;
+
+/// A send blocked by the peer's credit, with nothing more streamed and
+/// almost nothing acknowledged: closed as soon as it has waited
+/// `CREDIT_LIMITED_MIN`, two intervals after the blocked frame was first
+/// seen (that first interval is not counted: it began at the first sample,
+/// whose time is unknown). A credit raise for another stream (MAX_STREAM_DATA the blocked
+/// send cannot use) sends no STREAM frame, so it changes nothing here.
+#[test]
+fn a_send_starved_of_credit_closes() {
+    let closed = run_why(100, |t| {
+        busy(
+            t,
+            Credit {
+                acked_bytes: 100 * t,
+                blocked: u64::from(t >= 1),
+                stream_frames: 50,
+                writers: 1,
+                ..Credit::default()
+            },
+        )
+    });
+    assert_eq!(closed, Some((3, Stall::CreditStarved)));
+}
+
+/// A peer that raises its credit in tiny steps: each step lets the blocked
+/// send write a little (STREAM frames) and block again at the new limit (a
+/// new blocked frame), so every interval still counts, and the bytes
+/// acknowledged stay under the floor rate: closed.
+#[test]
+fn credit_raised_in_tiny_steps_still_closes() {
+    let closed = run_why(100, |t| {
+        busy(
+            t,
+            Credit {
+                acked_bytes: 4 * 1024 * t,
+                blocked: t,
+                stream_frames: 50 + 3 * t,
+                writers: 1,
+                ..Credit::default()
+            },
+        )
+    });
+    assert_eq!(closed, Some((3, Stall::CreditStarved)));
+}
+
+/// Blocked frames every tick, but every interval also has a batch of
+/// acknowledgements while quinn had data its congestion window held back: a
+/// path limited by its congestion window, a shared uplink (40 busy
+/// connections on 1 MB/s, about 25 KiB/s each, under the floor rate) or a
+/// backlog is not waiting on the peer, and is never closed.
+#[test]
+fn a_congestion_limited_path_under_the_floor_rate_is_never_closed() {
+    let closed = run(1000, |t| {
+        busy(
+            t,
+            Credit {
+                acked_bytes: 50 * 1024 * t,
+                congestion_limited_batches: t,
+                blocked: t,
+                stream_frames: 50 + 40 * t,
+                writers: 3,
+            },
+        )
+    });
+    assert_eq!(closed, None);
+}
+
+/// Waiting on the peer's credit every interval, with the acknowledged rate at
+/// the floor rate or above: never closed. Just under it: closed.
+#[test]
+fn the_floor_rate_is_the_bound() {
+    let at = |per_tick: u64| {
+        run(1000, move |t| {
+            busy(
+                t,
+                Credit {
+                    acked_bytes: per_tick * t,
+                    blocked: t,
+                    stream_frames: 50 + 40 * t,
+                    writers: 1,
+                    ..Credit::default()
+                },
+            )
+        })
+    };
+    assert_eq!(at(FLOOR_PER_TICK), None);
+    assert_eq!(at(2 * FLOOR_PER_TICK), None);
+    assert_eq!(at(FLOOR_PER_TICK - 1), Some(3));
+}
+
+/// A blocked frame from a send that has since ended (nothing writing) does
+/// not keep the path counted as waiting: never closed, however idle.
+#[test]
+fn a_blocked_frame_from_an_ended_send_does_not_count() {
+    let closed = run(1000, |t| {
+        busy(
+            t,
+            Credit {
+                blocked: 1,
+                stream_frames: 50,
+                writers: usize::from(t <= 1),
+                ..Credit::default()
+            },
+        )
+    });
+    assert_eq!(closed, None);
+}
+
+/// A send blocked once, then given credit it uses (STREAM frames, no new
+/// blocked frame), then waiting on a slow source with little acknowledged:
+/// the wait is not the peer's, never closed.
+#[test]
+fn a_send_waiting_on_its_source_after_a_credit_raise_is_not_starved() {
+    let closed = run(1000, |t| {
+        busy(
+            t,
+            Credit {
+                acked_bytes: 100 * t,
+                blocked: u64::from(t >= 1),
+                stream_frames: 50 + u64::from(t >= 2),
+                writers: 1,
+                ..Credit::default()
+            },
+        )
+    });
+    assert_eq!(closed, None);
+}
+
+/// While the egress cap holds this connection's transmits, waiting is this
+/// side's back-pressure: never closed by the credit rule.
+#[test]
+fn a_send_held_by_the_egress_cap_is_not_starved() {
+    let closed = run(100, |t| {
+        busy(
+            t,
+            Credit {
+                blocked: t,
+                stream_frames: 50,
+                writers: 1,
+                ..Credit::default()
+            },
+        )
+        .cap_held(t)
+    });
+    assert_eq!(closed, None);
+}
+
+/// One interval with a block is under `CREDIT_LIMITED_MIN` (the block may
+/// have come at its end): a send that blocks once, as an honest one may on
+/// the connection's small first window, and then streams as credit comes,
+/// with little acknowledged by then, is never closed.
+#[test]
+fn a_single_block_then_streaming_is_not_starved() {
+    let closed = run(100, |t| {
+        busy(
+            t,
+            Credit {
+                acked_bytes: if t <= 2 { 0 } else { 2 * FLOOR_PER_TICK * t },
+                blocked: u64::from(t >= 2),
+                stream_frames: if t <= 2 { 50 } else { 50 + t },
+                writers: 1,
+                ..Credit::default()
+            },
+        )
+    });
+    assert_eq!(closed, None);
+}
+
+/// A peer that raises its credit in one interval and lets the send block in
+/// the next, over and over, with little acknowledged: every other interval
+/// counts, and it is closed once two have.
+#[test]
+fn credit_raised_every_other_interval_still_closes() {
+    let closed = run_why(100, |t| {
+        busy(
+            t,
+            Credit {
+                acked_bytes: 1024 * t,
+                blocked: t.div_ceil(2),
+                stream_frames: 50 + t / 2,
+                writers: 1,
+                ..Credit::default()
+            },
+        )
+    });
+    assert!(
+        matches!(closed, Some((tick, Stall::CreditStarved)) if tick <= 5),
+        "{closed:?}"
     );
 }

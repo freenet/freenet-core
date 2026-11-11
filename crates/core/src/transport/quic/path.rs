@@ -1170,6 +1170,12 @@ impl QuicPath {
             .map_or(0, |meter| meter.send_epoch_holders())
     }
 
+    /// The path's sends still writing (`recycle::Writers`). Tests only.
+    #[cfg(test)]
+    pub(crate) fn writers(&self) -> &recycle::Writers {
+        &self.writers
+    }
+
     /// Streamed-message permits free right now.
     #[cfg(test)]
     pub(crate) fn free_stream_slots(&self) -> usize {

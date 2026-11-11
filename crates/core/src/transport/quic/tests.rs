@@ -4857,3 +4857,109 @@ fn a_handoff_is_used_only_by_its_own_cap() {
         "Y's send must not use X's handoff as Y's admission"
     );
 }
+
+/// Connect `a` to `b` on `pair` and return both connections.
+async fn connected(pair: &Pair) -> (QuicConnection, QuicConnection) {
+    let permit = pair
+        .b
+        .allow_peer(pair.a_addr, pair.a_keys.public())
+        .expect("allow-set has room");
+    let (a, b) = (pair.a.clone(), pair.b.clone());
+    let (b_addr, b_key) = (pair.b_addr, pair.b_key());
+    let result = drive(&pair.time, Duration::from_secs(30), async move {
+        let (client, server) = tokio::join!(a.connect(b_addr, &b_key), async {
+            b.accept()
+                .await
+                .expect("an incoming attempt")
+                .establish()
+                .await
+        });
+        (
+            client.expect("client handshake"),
+            server.expect("server accepted"),
+        )
+    })
+    .await;
+    drop(permit);
+    result
+}
+
+/// DATA_BLOCKED and STREAM_DATA_BLOCKED frames this side sent.
+fn blocked_frames(connection: &QuicConnection) -> u64 {
+    let tx = connection.inner().stats().frame_tx;
+    tx.data_blocked + tx.stream_data_blocked
+}
+
+/// The credit rule (`recycle::CreditWatch`) depends on quinn sending a
+/// DATA_BLOCKED or STREAM_DATA_BLOCKED frame when a write is blocked by the
+/// peer's flow-control limit, and none when it is held by this side's own
+/// send window. Pinned on a real connection, so a quinn version that changes
+/// either fails here instead of silently disabling the rule.
+#[test]
+fn quinn_reports_a_write_blocked_by_the_peers_credit_and_only_that() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        // Held by the peer's credit: the receiver reads nothing, and this
+        // side's send window is far above the peer's credit.
+        let credit = pair(
+            "quic-blocked-credit",
+            "10.201.90.1:5000".parse().unwrap(),
+            "10.201.90.2:5000".parse().unwrap(),
+            None,
+        )
+        .await;
+        let (client, server) = connected(&credit).await;
+        client.inner().set_send_window(8 * MIB as u64);
+        let (raw, time) = (client.inner().clone(), credit.time.clone());
+        let blocked = drive(&credit.time, Duration::from_secs(30), async move {
+            let mut send = raw.open_uni().await.expect("open");
+            let writer = tokio::spawn(async move {
+                // Twice the peer's whole credit (`TEST_WINDOW`).
+                let _ = send.write_all(&payload(2 * TEST_WINDOW as usize)).await;
+                send
+            });
+            let _recv = server.inner().accept_uni().await.expect("accept");
+            time.sleep(Duration::from_secs(5)).await;
+            writer.abort();
+            blocked_frames(&client)
+        })
+        .await;
+        assert!(blocked > 0, "a write held by the peer's credit is reported");
+
+        // Held by this side's send window only: the receiver reads at once
+        // and its window is far above this side's send window.
+        let own = pair(
+            "quic-blocked-own",
+            "10.201.91.1:5000".parse().unwrap(),
+            "10.201.91.2:5000".parse().unwrap(),
+            None,
+        )
+        .await;
+        let (client, server) = connected(&own).await;
+        server
+            .inner()
+            .set_receive_window(quinn::VarInt::from_u32(8 * MIB as u32));
+        client.inner().set_send_window(8 * 1024);
+        let raw = client.inner().clone();
+        let (written, read) = drive(&own.time, Duration::from_secs(120), async move {
+            let mut send = raw.open_uni().await.expect("open");
+            tokio::join!(
+                async {
+                    send.write_all(&payload(MIB)).await.expect("write");
+                    send.finish().expect("finish");
+                    blocked_frames(&client)
+                },
+                async {
+                    let mut recv = server.inner().accept_uni().await.expect("accept");
+                    recv.read_to_end(2 * MIB).await.expect("read").len()
+                }
+            )
+        })
+        .await;
+        assert_eq!(read, MIB, "premise: the whole stream arrived");
+        assert_eq!(
+            written, 0,
+            "a write held by this side's send window is not reported"
+        );
+    })
+}

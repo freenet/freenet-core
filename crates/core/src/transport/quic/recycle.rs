@@ -224,8 +224,9 @@ pub(crate) const ACK_WATCH_TICK: Duration = Duration::from_secs(2);
 pub(crate) const FLOOR_RATE_BYTES_PER_SEC: u64 = 32 * 1024;
 
 /// How long within [`ACK_WATCH_WINDOW`] a path must have waited on the peer's
-/// credit before its acknowledged rate is judged ([`CreditWatch`]).
-pub(crate) const CREDIT_LIMITED_MIN: Duration = Duration::from_secs(2);
+/// credit before its acknowledged rate is judged ([`CreditWatch`]): two
+/// sampling intervals, since waiting is counted in whole intervals.
+pub(crate) const CREDIT_LIMITED_MIN: Duration = Duration::from_secs(2 * ACK_WATCH_TICK.as_secs());
 
 /// Counts the sends a path reset, and closes its connection past the
 /// limit. Shared by the path and every send in progress on it.
@@ -935,11 +936,13 @@ impl AckWatch {
         }
         let outstanding = outstanding_after_acks || self.sent_after_acks;
         // The dark-path rule: this side's packets outstanding at every sample
-        // for the window, from a send, and none acknowledged, whether or not
-        // the peer sends. A send is required to start it, so bytes left
-        // counted from an old batch (handshake keys discarded) on an idle
-        // path start nothing.
-        if !outstanding || acknowledged {
+        // for the window, from a send, none acknowledged and nothing from the
+        // peer. A send is required to start it, so bytes left counted from an
+        // old batch (handshake keys discarded) on an idle path start nothing.
+        // A peer that sends ends it: one that sends and acknowledges nothing
+        // is the rule below's, and one that sends after an outage while this
+        // side's backed-off probe has not gone yet is alive.
+        if !outstanding || acknowledged || peer_sent {
             self.dark_since = None;
         } else if self.dark_since.is_none() && sent_new {
             self.dark_since = Some(now_nanos);
@@ -973,8 +976,8 @@ pub(crate) enum Stall {
     /// The peer kept sending and acknowledged none of this side's packets
     /// for the window.
     NotAcknowledging,
-    /// This side's packets were outstanding for the window and nothing was
-    /// acknowledged, with or without anything from the peer.
+    /// This side's packets were outstanding for the window, nothing was
+    /// acknowledged and nothing came from the peer.
     Dark,
     /// Sends waited on the peer's credit for at least
     /// [`CREDIT_LIMITED_MIN`] of the window, and the peer acknowledged less
@@ -1004,7 +1007,8 @@ impl Stall {
 ///   STREAM_DATA_BLOCKED frame was sent in the interval, or one was sent
 ///   earlier and no STREAM frame has been sent since (a credit raise that
 ///   lets the blocked send go on shows as STREAM frames; one that does not,
-///   such as MAX_STREAM_DATA for another stream, leaves it waiting);
+///   such as MAX_STREAM_DATA for another stream, leaves it waiting; one in
+///   tiny steps blocks again at each new limit);
 /// - every batch of acknowledgements in the interval came while quinn was
 ///   application-limited, so its congestion window was not what held the
 ///   data back (a path limited by its congestion window, a shared uplink or
@@ -1014,7 +1018,15 @@ impl Stall {
 /// The path is closed when the time it waited, within the last
 /// [`ACK_WATCH_WINDOW`], is at least [`CREDIT_LIMITED_MIN`] and the bytes
 /// acknowledged in the window are under [`FLOOR_RATE_BYTES_PER_SEC`] times
-/// that time. Time is counted in whole sampling intervals.
+/// that time.
+///
+/// Time is counted in whole sampling intervals ([`ACK_WATCH_TICK`]), and a
+/// block may come at the very end of one, so one interval says little about
+/// how long the send waited: [`CREDIT_LIMITED_MIN`] is two intervals. A send
+/// that blocks once (as an honest one may on a connection's small first
+/// window) and then streams counts one. A peer that lets the send block in
+/// every other interval, raising its credit between, counts every other one
+/// and is judged on them.
 pub(crate) struct CreditWatch {
     window_nanos: u64,
     /// A blocked frame was sent and no STREAM frame since.
