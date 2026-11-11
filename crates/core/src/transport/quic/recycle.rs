@@ -158,8 +158,9 @@
 //! [`QuicCloseCode`]: crate::transport::metrics::QuicCloseCode
 
 use std::any::Any;
+use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -214,6 +215,17 @@ pub(crate) const ACK_WATCH_WINDOW: Duration = Duration::from_secs(10);
 /// `ACK_WATCH_WINDOW + ACK_WATCH_TICK` after it, given that the window was
 /// not ended in between (see [`AckWatch`]).
 pub(crate) const ACK_WATCH_TICK: Duration = Duration::from_secs(2);
+
+/// The acknowledged rate a path whose sends wait on the peer's credit must
+/// keep ([`CreditWatch`]). The receiver reads every byte as it arrives and
+/// never lowers its window below the floor, so an honest peer returns credit
+/// at least at floor window / round trip: 32 KiB/s at the 64 KiB small-host
+/// floor up to a 2 s round trip.
+pub(crate) const FLOOR_RATE_BYTES_PER_SEC: u64 = 32 * 1024;
+
+/// How long within [`ACK_WATCH_WINDOW`] a path must have waited on the peer's
+/// credit before its acknowledged rate is judged ([`CreditWatch`]).
+pub(crate) const CREDIT_LIMITED_MIN: Duration = Duration::from_secs(2);
 
 /// Counts the sends a path reset, and closes its connection past the
 /// limit. Shared by the path and every send in progress on it.
@@ -334,6 +346,13 @@ pub(crate) fn window_floor(mtu: u16) -> u64 {
 pub(crate) struct AckState {
     /// Ack-eliciting packets the peer newly acknowledged (`on_ack` calls).
     acked: u64,
+    /// Their bytes (`on_ack`'s `bytes`): packet bytes, so headers and our own
+    /// control frames are included, a few percent over the stream bytes.
+    acked_bytes: u64,
+    /// Batches of acknowledgements that came while quinn was not
+    /// application-limited (`on_end_acks` with `app_limited` false): it had
+    /// data to send that its congestion window held back.
+    congestion_limited_batches: u64,
     /// Batches of acknowledgements (`on_end_acks` calls), counting those
     /// that acknowledged only acknowledgement-only packets, which have no
     /// `on_ack`.
@@ -445,7 +464,11 @@ impl Controller for CappedCubic {
         app_limited: bool,
         rtt: &quinn_proto::RttEstimator,
     ) {
-        self.state.lock().acked += 1;
+        {
+            let mut state = self.state.lock();
+            state.acked += 1;
+            state.acked_bytes = state.acked_bytes.saturating_add(bytes);
+        }
         // quinn updates `rtt` only after this call for the ACK frame, so this
         // is the estimate from before it: the initial 333 ms on the first
         // frames, and possibly still when the first data goes out after the
@@ -474,6 +497,9 @@ impl Controller for CappedCubic {
         {
             let mut state = self.state.lock();
             state.batches += 1;
+            if !app_limited {
+                state.congestion_limited_batches += 1;
+            }
             state.in_flight_after_acks = in_flight;
             state.lost_since_acks = 0;
         }
@@ -590,6 +616,14 @@ pub(crate) struct AckSample {
     received: u64,
     /// This connection's QUIC transmits the egress cap holds.
     cap: CapHoldReading,
+    /// DATA_BLOCKED and STREAM_DATA_BLOCKED frames this side sent: quinn
+    /// sends one when a write is blocked by the peer's flow-control limit,
+    /// once per limit, and never for this side's own send window.
+    blocked: u64,
+    /// STREAM frames this side sent.
+    stream_frames: u64,
+    /// The path's sends with data still to write ([`Writers`]).
+    writers: usize,
 }
 
 impl AckSample {
@@ -604,7 +638,11 @@ impl AckSample {
     /// the stats was built after the record's state that this sample holds,
     /// and a transmit counted there that the cap then held is already
     /// recorded as held when `cap_holds` is read.
-    pub(crate) fn of(connection: &quinn::Connection, cap_holds: &CapHolds) -> Option<Self> {
+    pub(crate) fn of(
+        connection: &quinn::Connection,
+        cap_holds: &CapHolds,
+        writers: &Writers,
+    ) -> Option<Self> {
         let record = connection
             .congestion_state()
             .into_any()
@@ -620,6 +658,12 @@ impl AckSample {
             sent: ack_eliciting_frames(&stats.frame_tx),
             received: frames_received(&stats.frame_rx),
             cap,
+            blocked: stats
+                .frame_tx
+                .data_blocked
+                .saturating_add(stats.frame_tx.stream_data_blocked),
+            stream_frames: stats.frame_tx.stream,
+            writers: writers.count(),
         })
     }
 
@@ -653,12 +697,64 @@ impl AckSample {
                 acked,
                 batches,
                 in_flight_after_acks: outstanding_after_acks,
-                lost_since_acks: 0,
+                ..AckState::default()
             },
             sent,
             received,
             cap,
+            blocked: 0,
+            stream_frames: 0,
+            writers: 0,
         }
+    }
+
+    /// The same sample with these credit-watch readings ([`CreditWatch`]):
+    /// acknowledged bytes, batches while congestion-limited, blocked frames
+    /// sent, STREAM frames sent and sends still writing.
+    #[cfg(test)]
+    pub(crate) fn with_credit(
+        mut self,
+        acked_bytes: u64,
+        congestion_limited_batches: u64,
+        blocked: u64,
+        stream_frames: u64,
+        writers: usize,
+    ) -> Self {
+        self.state.acked_bytes = acked_bytes;
+        self.state.congestion_limited_batches = congestion_limited_batches;
+        self.blocked = blocked;
+        self.stream_frames = stream_frames;
+        self.writers = writers;
+        self
+    }
+}
+
+/// A path's sends that still have data to write: counted from the stream's
+/// open until the end of its data is sent, or the send is dropped. Read by
+/// [`CreditWatch`], so a blocked frame from a send that has since ended does
+/// not keep the path counted as waiting on the peer's credit.
+#[derive(Debug, Default)]
+pub(crate) struct Writers(AtomicUsize);
+
+impl Writers {
+    /// One more send writing, until the guard is dropped.
+    pub(crate) fn start(self: &Arc<Self>) -> Writing {
+        self.0.fetch_add(1, Ordering::Relaxed);
+        Writing(self.clone())
+    }
+
+    pub(crate) fn count(&self) -> usize {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+/// One send counted in [`Writers`] while it is held.
+#[derive(Debug)]
+pub(crate) struct Writing(Arc<Writers>);
+
+impl Drop for Writing {
+    fn drop(&mut self) {
+        self.0.0.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -712,6 +808,12 @@ impl AckSample {
 pub(crate) struct AckWatch {
     window_nanos: u64,
     previous: AckSample,
+    /// When this side's packets were last seen outstanding with nothing
+    /// acknowledged since, from a send (the dark-path rule, [`Stall::Dark`]).
+    dark_since: Option<u64>,
+    credit: CreditWatch,
+    /// Why the last [`Self::observe`] that said close did.
+    stall: Option<Stall>,
     /// When the window started.
     since: Option<u64>,
     /// An ack-eliciting send was seen after the latest batch of
@@ -765,8 +867,12 @@ impl AckWatch {
     }
 
     pub(crate) fn new(window: Duration, first: AckSample) -> Self {
+        let window_nanos = u64::try_from(window.as_nanos()).unwrap_or(u64::MAX);
         Self {
-            window_nanos: u64::try_from(window.as_nanos()).unwrap_or(u64::MAX),
+            window_nanos,
+            credit: CreditWatch::new(window_nanos, &first),
+            dark_since: None,
+            stall: None,
             previous: first,
             since: None,
             sent_after_acks: false,
@@ -775,8 +881,19 @@ impl AckWatch {
         }
     }
 
-    /// Take `sample`, taken at `now_nanos`; whether the path must close.
+    /// Why the path must close, once [`Self::observe`] said so.
+    pub(crate) fn stall(&self) -> Option<Stall> {
+        self.stall
+    }
+
+    /// Take `sample`, taken at `now_nanos`; whether the path must close
+    /// ([`Self::stall`] says why).
     pub(crate) fn observe(&mut self, now_nanos: u64, sample: AckSample) -> bool {
+        self.stall = self.decide(now_nanos, sample);
+        self.stall.is_some()
+    }
+
+    fn decide(&mut self, now_nanos: u64, sample: AckSample) -> Option<Stall> {
         let same_controller = Arc::ptr_eq(&sample.record, &self.previous.record);
         // A new controller restarts the counts: read it as an
         // acknowledgement, with nothing known to be outstanding.
@@ -787,6 +904,13 @@ impl AckWatch {
         let outstanding_after_acks = same_controller && sample.state.outstanding_after_acks() > 0;
         let previous_cap = self.previous.cap;
         let cap_held = self.cap_held(now_nanos, &sample.cap, &previous_cap);
+        let starved = self.credit.observe(
+            now_nanos,
+            &self.previous,
+            &sample,
+            same_controller,
+            cap_held,
+        );
         self.previous = sample;
         if new_batch {
             self.sent_after_acks = false;
@@ -803,23 +927,167 @@ impl AckWatch {
             // cap, so nothing says when it left: no latch, no window.
             self.sent_after_acks = false;
             self.since = None;
-            return false;
+            self.dark_since = None;
+            return None;
+        }
+        if starved {
+            return Some(Stall::CreditStarved);
         }
         let outstanding = outstanding_after_acks || self.sent_after_acks;
+        // The dark-path rule: this side's packets outstanding at every sample
+        // for the window, from a send, and none acknowledged, whether or not
+        // the peer sends. A send is required to start it, so bytes left
+        // counted from an old batch (handshake keys discarded) on an idle
+        // path start nothing.
+        if !outstanding || acknowledged {
+            self.dark_since = None;
+        } else if self.dark_since.is_none() && sent_new {
+            self.dark_since = Some(now_nanos);
+        }
+        if self
+            .dark_since
+            .is_some_and(|start| now_nanos.saturating_sub(start) >= self.window_nanos)
+        {
+            return Some(Stall::Dark);
+        }
         if !outstanding || self.quiet_samples >= QUIET_SAMPLES_END_WINDOW {
             self.since = None;
-            return false;
+            return None;
         }
         if acknowledged {
             self.since = peer_sent.then_some(now_nanos);
-            return false;
+            return None;
         }
         let start = match self.since {
             Some(start) => start,
             None if sent_new && peer_sent => *self.since.insert(now_nanos),
-            None => return false,
+            None => return None,
         };
-        now_nanos.saturating_sub(start) >= self.window_nanos
+        (now_nanos.saturating_sub(start) >= self.window_nanos).then_some(Stall::NotAcknowledging)
+    }
+}
+
+/// Why [`AckWatch`] closes a path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Stall {
+    /// The peer kept sending and acknowledged none of this side's packets
+    /// for the window.
+    NotAcknowledging,
+    /// This side's packets were outstanding for the window and nothing was
+    /// acknowledged, with or without anything from the peer.
+    Dark,
+    /// Sends waited on the peer's credit for at least
+    /// [`CREDIT_LIMITED_MIN`] of the window, and the peer acknowledged less
+    /// than [`FLOOR_RATE_BYTES_PER_SEC`] over that time ([`CreditWatch`]).
+    CreditStarved,
+}
+
+impl Stall {
+    /// The label it is logged and counted under.
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::NotAcknowledging => "not_acknowledging",
+            Self::Dark => "dark",
+            Self::CreditStarved => "credit_starved",
+        }
+    }
+}
+
+/// The credit rule: a path whose sends wait on the peer's flow-control credit
+/// must have its data acknowledged at [`FLOOR_RATE_BYTES_PER_SEC`] or better
+/// over the time it waited.
+///
+/// Between two samples, the path waited on the peer's credit when all of
+/// these held:
+/// - a send still had data to write ([`Writers`]);
+/// - quinn reported a write blocked by the peer's limit: a DATA_BLOCKED or
+///   STREAM_DATA_BLOCKED frame was sent in the interval, or one was sent
+///   earlier and no STREAM frame has been sent since (a credit raise that
+///   lets the blocked send go on shows as STREAM frames; one that does not,
+///   such as MAX_STREAM_DATA for another stream, leaves it waiting);
+/// - every batch of acknowledgements in the interval came while quinn was
+///   application-limited, so its congestion window was not what held the
+///   data back (a path limited by its congestion window, a shared uplink or
+///   the egress cap is this side's back-pressure, not the peer's); and
+/// - the egress cap held no QUIC transmit.
+///
+/// The path is closed when the time it waited, within the last
+/// [`ACK_WATCH_WINDOW`], is at least [`CREDIT_LIMITED_MIN`] and the bytes
+/// acknowledged in the window are under [`FLOOR_RATE_BYTES_PER_SEC`] times
+/// that time. Time is counted in whole sampling intervals.
+pub(crate) struct CreditWatch {
+    window_nanos: u64,
+    /// A blocked frame was sent and no STREAM frame since.
+    carry: bool,
+    /// Per sample within the window: when it was taken, the time waited on
+    /// credit in the interval it ended, and the bytes acknowledged by then.
+    /// The oldest entry is the window's start and its own interval is not
+    /// counted.
+    history: VecDeque<(u64, u64, u64)>,
+}
+
+/// [`CreditWatch::history`]'s time for a sample taken at an unknown time.
+const UNKNOWN_AT: u64 = u64::MAX;
+
+impl CreditWatch {
+    fn new(window_nanos: u64, first: &AckSample) -> Self {
+        Self {
+            window_nanos,
+            carry: false,
+            // Taken at an unknown time: the first interval is not counted.
+            history: VecDeque::from([(UNKNOWN_AT, 0, first.state.acked_bytes)]),
+        }
+    }
+
+    /// Take `sample` at `now_nanos`, after `previous`; whether the path is
+    /// starved of credit.
+    fn observe(
+        &mut self,
+        now_nanos: u64,
+        previous: &AckSample,
+        sample: &AckSample,
+        same_controller: bool,
+        cap_held: bool,
+    ) -> bool {
+        if !same_controller {
+            self.carry = false;
+            self.history = VecDeque::from([(now_nanos, 0, sample.state.acked_bytes)]);
+            return false;
+        }
+        let new_block = sample.blocked != previous.blocked;
+        let streamed = sample.stream_frames != previous.stream_frames;
+        let blocked = new_block || (self.carry && !streamed);
+        self.carry = sample.writers > 0 && (new_block || (self.carry && !streamed));
+        let congestion_limited =
+            sample.state.congestion_limited_batches != previous.state.congestion_limited_batches;
+        let waited = sample.writers > 0 && blocked && !congestion_limited && !cap_held;
+        let since = self.history.back().map_or(UNKNOWN_AT, |&(at, _, _)| at);
+        let interval = if waited && since != UNKNOWN_AT {
+            now_nanos.saturating_sub(since)
+        } else {
+            0
+        };
+        self.history
+            .push_back((now_nanos, interval, sample.state.acked_bytes));
+        let start = now_nanos.saturating_sub(self.window_nanos);
+        while self.history.len() > 1
+            && (self.history[0].0 == UNKNOWN_AT || self.history[1].0 <= start)
+        {
+            self.history.pop_front();
+        }
+        let limited: u64 = self
+            .history
+            .iter()
+            .skip(1)
+            .map(|&(_, waited, _)| waited)
+            .sum();
+        let min = u64::try_from(CREDIT_LIMITED_MIN.as_nanos()).unwrap_or(u64::MAX);
+        if limited < min {
+            return false;
+        }
+        let acked = sample.state.acked_bytes.saturating_sub(self.history[0].2);
+        let floor = u128::from(FLOOR_RATE_BYTES_PER_SEC) * u128::from(limited) / 1_000_000_000;
+        u128::from(acked) < floor
     }
 }
 
@@ -857,10 +1125,11 @@ pub(crate) async fn watch_acknowledgements<T: TimeSource>(
     closer: QuicCloser,
     time: T,
     cap_holds: Arc<CapHolds>,
+    writers: Arc<Writers>,
     heard: Arc<PeerHeard>,
     report: &mut PathReport,
 ) {
-    let Some(first) = AckSample::of(&connection, &cap_holds) else {
+    let Some(first) = AckSample::of(&connection, &cap_holds, &writers) else {
         tracing::warn!(
             remote = %connection.remote_address(),
             "QUIC path: the connection's congestion controller does not count \
@@ -879,7 +1148,7 @@ pub(crate) async fn watch_acknowledgements<T: TimeSource>(
         if closed {
             return;
         }
-        let Some(sample) = AckSample::of(&connection, &cap_holds) else {
+        let Some(sample) = AckSample::of(&connection, &cap_holds, &writers) else {
             return;
         };
         if sample.received != received {
@@ -887,12 +1156,15 @@ pub(crate) async fn watch_acknowledgements<T: TimeSource>(
             heard.report();
         }
         if watch.observe(time.now_nanos(), sample) {
+            // One close code for all three: it tells the peer only that this
+            // side stopped using the path.
             if closer.close(QuicCloseCode::PeerNotAcknowledging) {
                 tracing::warn!(
                     remote = %connection.remote_address(),
                     window = ?ACK_WATCH_WINDOW,
-                    "QUIC path: the peer kept sending but acknowledged none of this \
-                     node's packets; closing the path so the peer falls back to UDP"
+                    stall = watch.stall().map_or("", Stall::label),
+                    "QUIC path: the peer did not acknowledge this node's data within \
+                     the window; closing the path so the connection falls back to UDP"
                 );
             }
             return;
@@ -906,6 +1178,7 @@ mod cap_tests;
 /// What a path's receive supervisor keeps for its acknowledgement watch.
 pub(crate) struct AckWatchParts {
     pub(crate) cap_holds: Arc<CapHolds>,
+    pub(crate) writers: Arc<Writers>,
     pub(crate) heard: Arc<PeerHeard>,
     pub(crate) report: PathReport,
 }

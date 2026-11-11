@@ -737,6 +737,9 @@ pub(crate) struct QuicPath {
     /// ([`STREAMED_SEND_LIMIT`]), so the remaining uni stream slots stay
     /// for short messages and control frames. Never closed.
     stream_slots: Arc<tokio::sync::Semaphore>,
+    /// Sends with data still to write, for the credit rule
+    /// (`recycle::CreditWatch`).
+    writers: Arc<recycle::Writers>,
     /// Whether this path may send data, one of the `SEND_DATA_*` values. Off for a
     /// path in shadow, where a fragment taken from an inbound handle cannot
     /// outlive its charge because nothing is ever forwarded.
@@ -982,6 +985,7 @@ impl QuicPath {
             built_at,
         );
         let heard = Arc::new(recycle::PeerHeard::default());
+        let writers = Arc::new(recycle::Writers::default());
         #[cfg_attr(not(test), allow(unused_mut))]
         let mut report = recycle::PathReport::new(
             connection.inner().clone(),
@@ -1001,6 +1005,7 @@ impl QuicPath {
             time,
             recycle::AckWatchParts {
                 cap_holds: connection.cap_holds(),
+                writers: writers.clone(),
                 heard: heard.clone(),
                 report,
             },
@@ -1013,6 +1018,7 @@ impl QuicPath {
                 aborts,
                 meter,
                 stream_slots: Arc::new(tokio::sync::Semaphore::new(STREAMED_SEND_LIMIT as usize)),
+                writers,
                 send_data: AtomicU8::new(SEND_DATA_NEVER),
                 counted_as_data_path: std::sync::atomic::AtomicBool::new(false),
                 stall: parking_lot::Mutex::new(stall),
@@ -1715,6 +1721,7 @@ impl QuicPath {
         let epoch = self.meter.as_ref().and_then(|meter| meter.send_epoch());
         let mut send = Outgoing::new(stream, self.aborts.clone(), slot, pacing, progress, epoch);
         send.meter = self.meter.clone();
+        send.writing = Some(self.writers.start());
         send.write_all(&header.encode()).await?;
         if !metadata.is_empty() {
             send.write_all(metadata).await?;
@@ -1816,6 +1823,7 @@ async fn supervise_receive<T: TimeSource>(
     // report: it ends with this task ([`recycle::PathReport`]).
     let recycle::AckWatchParts {
         cap_holds,
+        writers,
         heard,
         mut report,
     } = watch;
@@ -1824,6 +1832,7 @@ async fn supervise_receive<T: TimeSource>(
         closer.clone(),
         time,
         cap_holds,
+        writers,
         heard,
         &mut report,
     ))
@@ -1889,6 +1898,9 @@ struct Outgoing {
     /// The path's budget meter, woken by each write so a path that only sends
     /// still has its send window evaluated (`budget::ConnMeter::note_send`).
     meter: Option<Arc<super::budget::ConnMeter>>,
+    /// Counted among the path's sends still writing until the end of the
+    /// stream is sent (`recycle::Writers`).
+    writing: Option<recycle::Writing>,
 }
 
 type StoppedResult = Result<Option<quinn::VarInt>, quinn::StoppedError>;
@@ -1915,6 +1927,7 @@ impl Outgoing {
             pacing,
             epoch,
             meter: None,
+            writing: None,
         }
     }
 
@@ -2095,6 +2108,7 @@ impl Outgoing {
     async fn finish(mut self) -> Result<(), QuicSendError> {
         self.closed = true;
         self.send.finish().map_err(|_| QuicSendError::Closed)?;
+        self.writing = None;
         self.progress.mark_finished();
         self.awaiting_ack = true;
         let stopped = (&mut self.stopped).await;

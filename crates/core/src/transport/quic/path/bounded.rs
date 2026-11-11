@@ -35,8 +35,8 @@ use super::super::socket::{CapHoldReading, CapHolds};
 use super::QuicSendError;
 use super::route::{STALL_PROGRESS_WINDOW, hold_credit};
 use crate::simulation::TimeSource;
+use crate::transport::peer_connection::fits_one_packet;
 use crate::transport::peer_connection::streaming::STREAM_INACTIVITY_TIMEOUT;
-use crate::transport::peer_connection::{fits_one_packet, inbound_stream_age_limit};
 
 /// How long a message of one packet may take to open its stream.
 const SHORT_OPEN_TIMEOUT: Duration = Duration::from_secs(1);
@@ -92,14 +92,15 @@ impl SendDeadlines {
     }
 
     /// For a streamed message of `len` bytes. The gap is the one the UDP
-    /// sender and the receiver work to, and past `total` the receiver evicts
-    /// the stream anyway.
+    /// sender and the receiver work to. The total is the receiver's age
+    /// limit for a charged stream (`inbound::STREAM_AGE_LIMIT`), whatever
+    /// the size: the connection's progress is judged by `recycle::AckWatch`.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn stream(len: u64) -> Self {
+    pub(crate) fn stream(_len: u64) -> Self {
         Self {
             open: STREAM_OPEN_TIMEOUT,
             gap: Some(STREAM_INACTIVITY_TIMEOUT),
-            total: inbound_stream_age_limit(len),
+            total: super::inbound::stream_age_limit(),
         }
     }
 }

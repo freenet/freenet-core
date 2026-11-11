@@ -1597,6 +1597,23 @@ fn uncharged_age_limit() -> Duration {
     inbound_stream_age_limit(0)
 }
 
+/// The longest a charged stream may take, sender and receiver alike
+/// (`bounded::SendDeadlines::stream`), whatever its size. Progress is the
+/// connection's concern (`recycle::AckWatch`): quinn shares a connection
+/// between its streams round-robin, so a stream's own rate depends on the
+/// streams sent alongside it, and a per-stream rate deadline would fail
+/// honest streams on a busy connection. This bounds only a peer that keeps
+/// the connection alive but trickles one stream. What such a stream holds is
+/// bounded by its charge (the inbound budget) and by the stream limit, not by
+/// time.
+pub(in crate::transport::quic) const STREAM_AGE_LIMIT: Duration = Duration::from_secs(2 * 60 * 60);
+
+/// [`STREAM_AGE_LIMIT`], or the (longer) simulation idle threshold when it
+/// is on, as `inbound_stream_age_limit` does.
+pub(in crate::transport::quic) fn stream_age_limit() -> Duration {
+    STREAM_AGE_LIMIT.max(inbound_stream_age_limit(0))
+}
+
 /// How long a stream may take to deliver its header. An honest header is
 /// the stream's first 18 bytes, sent in its first packet, so a stream with
 /// none after this long holds a stream slot (and what it staged) for
@@ -1962,7 +1979,7 @@ impl<T: TimeSource> Receiver<T> {
                 key,
                 total,
                 self.time.now_nanos(),
-                inbound_stream_age_limit(total),
+                stream_age_limit(),
                 Liveness::Task(Arc::downgrade(&token)),
             );
             key
@@ -1997,7 +2014,7 @@ impl<T: TimeSource> Receiver<T> {
                     return;
                 }
             }
-            reader.set_age_limit(inbound_stream_age_limit(total));
+            reader.set_age_limit(stream_age_limit());
         }
         let was_charged = if guard.is_some() {
             Charged::Yes
@@ -2116,7 +2133,7 @@ impl<T: TimeSource> Receiver<T> {
                 key,
                 total,
                 self.time.now_nanos(),
-                inbound_stream_age_limit(total),
+                stream_age_limit(),
                 Liveness::Buffer(handle.buffer_weak()),
             );
             handle
@@ -2130,7 +2147,7 @@ impl<T: TimeSource> Receiver<T> {
             token: None,
             complete: false,
         };
-        reader.set_age_limit(inbound_stream_age_limit(total));
+        reader.set_age_limit(stream_age_limit());
         let payload_start = (HEADER_LEN as u64) + u64::from(header.metadata_len());
         let mut rechunker = Rechunker::new(total);
         let metadata = match header.metadata_len() {

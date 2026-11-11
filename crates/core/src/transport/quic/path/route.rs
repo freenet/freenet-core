@@ -160,17 +160,22 @@ pub(crate) fn next_step(kind: SendKind, outcome: &BoundedSend) -> (NextStep, Qui
     (step, result)
 }
 
-/// Whether `outcome` is a send deadline running out: before the stream opened,
-/// with the stream open and not moving, or waiting for the acknowledgement of
-/// its end. Whether it counts against the path is [`StallCount`]'s decision.
-/// A send the pacer refused is not one: this side held it back, and the path
-/// said nothing (`pacer` module), so it never counts toward the stall close.
+/// Whether `outcome` is a send deadline running out with the stream open and
+/// not moving, or waiting for the acknowledgement of its end. Whether it
+/// counts against the path is [`StallCount`]'s decision. A send the pacer
+/// refused is not one: this side held it back, and the path said nothing
+/// (`pacer` module), so it never counts toward the stall close. Nor is one
+/// that ran out before its stream opened: it waited for its source, for one
+/// of this side's permits or for the peer's stream credit, which is
+/// back-pressure, not a stall. A path whose permits are all held by sends
+/// that are not acknowledged is closed by its acknowledgement watch
+/// (`recycle::AckWatch`).
 fn timed_out(outcome: &BoundedSend) -> bool {
     match outcome {
         BoundedSend::MaybeDelivered(MaybeDelivered::TimedOut)
-        | BoundedSend::Failed(SendFailure::NotOpened(NotOpened::TimedOut))
         | BoundedSend::Failed(SendFailure::TimedOut) => true,
-        BoundedSend::Sent
+        BoundedSend::Failed(SendFailure::NotOpened(NotOpened::TimedOut))
+        | BoundedSend::Sent
         | BoundedSend::MaybeDelivered(MaybeDelivered::ConnectionLost)
         | BoundedSend::Failed(SendFailure::NotOpened(NotOpened::ConnectionLost(_)))
         | BoundedSend::Failed(SendFailure::NotOpened(NotOpened::Paced))
@@ -210,11 +215,11 @@ pub(crate) struct StallVerdict {
 /// The path's count of send timeouts in a row, kept only while the path makes no
 /// forward progress.
 ///
-/// Decision (e5b-5 review, kept in the e5b-6 review): every kind of timeout can
-/// count, `NotOpened(TimedOut)` and `MaybeDelivered(TimedOut)` included. A path
-/// whose permits are all held by sends stuck waiting for acknowledgements past
-/// `MaybeDelivered` costs every streamed send its 2 s open deadline, and only this
-/// close recycles it. But a timeout counts only when no packet on the connection
+/// A timeout with the stream open counts, `MaybeDelivered(TimedOut)` included;
+/// one before the stream opened does not ([`timed_out`]: a wait for a permit or
+/// for the peer's stream credit is back-pressure). A path whose permits are all
+/// held by sends stuck waiting for acknowledgements is closed by the
+/// acknowledgement watch's dark-path rule (`recycle::AckWatch`). A timeout counts only when no packet on the connection
 /// was newly acknowledged within [`STALL_PROGRESS_WINDOW`] (quinn's acknowledged
 /// packets, read from `recycle::CappedCubic`). So a busy relay whose 48 permits
 /// are held by transfers that are being acknowledged, or a receiver whose consumer
