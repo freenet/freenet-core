@@ -110,7 +110,7 @@
 //! same id arrives, before it is refused as `StreamIdInUse`. Completed ids
 //! are not remembered, so once released an id can be used again.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -553,8 +553,7 @@ impl<T: TimeSource> BodyReader<T> {
     /// Every byte up to the declared end has been read; only the end of the
     /// stream itself is left, which [`Self::next_piece`] would read next.
     fn all_read(&self) -> bool {
-        self.end
-            .is_some_and(|end| self.ranges.ranges.as_slice() == [(0, end)])
+        self.end.is_some_and(|end| self.ranges.is_exactly(end))
     }
 
     /// The next piece of the stream in arrival order, with its offset, or
@@ -723,6 +722,45 @@ impl<T: TimeSource> BodyReader<T> {
         while self.ranges.contiguous_from(self.staging.taken) < want {
             match self.next_piece().await? {
                 Some((offset, bytes)) => self.staging.stage(offset, &bytes, self.end)?,
+                None => {
+                    let got = self
+                        .ranges
+                        .contiguous_from(self.staging.taken)
+                        .saturating_sub(self.staging.taken);
+                    return Err(ReadFailure::Truncated(clamp(got)));
+                }
+            }
+        }
+        Ok(self.staging.take(len))
+    }
+
+    /// [`Self::read_exact`], but a piece read meanwhile at or past both the
+    /// wanted bytes' end and what is already staged goes to `beyond` instead
+    /// of being staged (an admitted Stream's payload, which has a charged
+    /// buffer to go to, so it is never staged twice). A piece across that
+    /// point is split. `beyond` returning false ends the read with
+    /// `ReadFailure::Other`; it has recorded why.
+    async fn read_exact_with(
+        &mut self,
+        len: usize,
+        mut beyond: impl FnMut(u64, &[u8]) -> bool,
+    ) -> Result<Bytes, ReadFailure> {
+        let want = self.staging.taken.saturating_add(len as u64);
+        while self.ranges.contiguous_from(self.staging.taken) < want {
+            match self.next_piece().await? {
+                Some((offset, bytes)) => {
+                    let split = want.max(self.staging.stop());
+                    let stop = offset.saturating_add(bytes.len() as u64);
+                    let cut = usize::try_from(split.saturating_sub(offset))
+                        .unwrap_or(usize::MAX)
+                        .min(bytes.len());
+                    if cut > 0 {
+                        self.staging.stage(offset, &bytes[..cut], self.end)?;
+                    }
+                    if stop > split && !beyond(offset + cut as u64, &bytes[cut..]) {
+                        return Err(ReadFailure::Other);
+                    }
+                }
                 None => {
                     let got = self
                         .ranges
@@ -923,13 +961,18 @@ impl ConnStaging {
         before != 0 && now.saturating_sub(before - 1) <= nanos(STAGED_TRIP_WINDOW)
     }
 
-    /// Set the cap, from the connection's credit (`budget::staging_cap`).
+    /// Set the cap, from the connection's credit (`budget::staging_cap`),
+    /// but never below what is staged now: a shrink must not leave staged
+    /// bytes over the cap, which would evict the next honest piece and leave
+    /// the bytes held uncharged. The meter charges this cap. Called from the
+    /// receive task only, as every staging read is, so nothing is staged
+    /// between the two loads.
     pub(in crate::transport::quic) fn set_cap(&self, cap: usize) {
-        self.cap.store(cap, Ordering::Relaxed);
+        let held = self.held.load(Ordering::Relaxed);
+        self.cap.store(cap.max(held), Ordering::Relaxed);
     }
 
-    /// The cap now. Tests only.
-    #[cfg(test)]
+    /// The cap now.
     pub(in crate::transport::quic) fn cap(&self) -> usize {
         self.cap.load(Ordering::Relaxed)
     }
@@ -989,8 +1032,11 @@ impl Staging {
         };
         let need = at.saturating_add(bytes.len());
         if need > self.buf.capacity() {
-            // Double, up to the declared end once it is known.
-            let mut target = self.buf.capacity().saturating_mul(2).max(need);
+            // To the allocator's size class of what is needed (at most a
+            // quarter over, so growth stays geometric), never past the
+            // declared end once it is known: the charge stays within 1.25 x
+            // the span staged.
+            let mut target = allocation_class(need);
             if let Some(end) = end {
                 let span = usize::try_from(end.saturating_sub(self.base)).unwrap_or(usize::MAX);
                 target = target.min(span).max(need);
@@ -1007,6 +1053,16 @@ impl Staging {
         }
         self.buf[at..need].copy_from_slice(bytes);
         Ok(())
+    }
+
+    /// One past the highest stream offset the buffer covers (`taken` if it
+    /// is empty).
+    fn stop(&self) -> u64 {
+        if self.buf.is_empty() {
+            self.taken
+        } else {
+            self.base.saturating_add(self.buf.len() as u64)
+        }
     }
 
     /// Take the next `len` bytes, which the caller has checked are all
@@ -1026,7 +1082,7 @@ impl Staging {
     /// ones are not handed out (they hold no data, only the gap's zeros).
     fn drain(&mut self, ranges: &RangeMirror, mut each: impl FnMut(u64, &[u8])) {
         let stop = self.base.saturating_add(self.buf.len() as u64);
-        for &(start, end) in &ranges.ranges {
+        for (start, end) in ranges.iter() {
             let (start, end) = (start.max(self.taken), end.min(stop));
             if start < end {
                 let (from, to) = ((start - self.base) as usize, (end - self.base) as usize);
@@ -1278,7 +1334,10 @@ impl ConnRanges {
 /// The byte ranges received on one stream, merged, sorted by start.
 #[derive(Debug, Default)]
 struct RangeMirror {
-    ranges: Vec<(u64, u64)>,
+    /// Received runs, start to one past the end, merged: none touch.
+    /// Ordered by start, so each insert is logarithmic in the runs held
+    /// (up to the connection's gap cap), whatever order pieces arrive in.
+    ranges: BTreeMap<u64, u64>,
 }
 
 impl RangeMirror {
@@ -1287,26 +1346,37 @@ impl RangeMirror {
         self.ranges.len()
     }
 
+    /// The runs, in order. Tests only.
+    #[cfg(test)]
+    fn runs(&self) -> Vec<(u64, u64)> {
+        self.iter().collect()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        self.ranges.iter().map(|(&start, &end)| (start, end))
+    }
+
+    /// Exactly `0..end` has been received.
+    fn is_exactly(&self, end: u64) -> bool {
+        self.ranges.len() == 1 && self.ranges.get(&0) == Some(&end)
+    }
+
     /// One past the last byte of the in-order prefix: the end of the range
     /// starting at offset 0, or 0 if nothing there was received.
     fn prefix(&self) -> u64 {
-        match self.ranges.first() {
-            Some(&(0, end)) => end,
-            _ => 0,
-        }
+        self.ranges.get(&0).copied().unwrap_or(0)
     }
 
     /// One past the highest byte received, or 0.
     fn last_stop(&self) -> u64 {
-        self.ranges.last().map_or(0, |&(_, end)| end)
+        self.ranges.last_key_value().map_or(0, |(_, &end)| end)
     }
 
     /// One past the last byte of the received run that starts at or covers
     /// `from`, or `from` if byte `from` has not been received.
     fn contiguous_from(&self, from: u64) -> u64 {
-        let i = self.ranges.partition_point(|&(_, end)| end <= from);
-        match self.ranges.get(i) {
-            Some(&(start, end)) if start <= from => end,
+        match self.ranges.range(..=from).next_back() {
+            Some((_, &end)) if end > from => end,
             _ => from,
         }
     }
@@ -1317,36 +1387,35 @@ impl RangeMirror {
     }
 
     /// Record `start..stop`; returns how the number of gaps changed (+1 for
-    /// an isolated range after the first, 0 when it extends one, negative
-    /// when it joins several), or `Overlap` if any byte was already received.
+    /// an isolated range after the first, 0 when it extends one, -1 when it
+    /// joins two), or `Overlap` if any byte was already received.
     fn insert(&mut self, start: u64, stop: u64) -> Result<isize, ReadFailure> {
         if start >= stop {
             return Ok(0);
         }
-        // First range ending at or after `start`.
-        let i = self.ranges.partition_point(|&(_, end)| end < start);
-        // Ranges from `i` that touch or overlap `start..stop`.
-        let mut j = i;
-        while j < self.ranges.len() && self.ranges[j].0 <= stop {
-            let (s, e) = self.ranges[j];
-            if s < stop && e > start {
-                return Err(ReadFailure::Overlap);
-            }
-            j += 1;
+        let before = self
+            .ranges
+            .range(..=start)
+            .next_back()
+            .map(|(&s, &e)| (s, e));
+        if before.is_some_and(|(_, end)| end > start)
+            || self.ranges.range(start..stop).next().is_some()
+        {
+            return Err(ReadFailure::Overlap);
         }
-        let before = self.gaps();
-        let merged_start = if i < j {
-            self.ranges[i].0.min(start)
-        } else {
-            start
-        };
-        let merged_stop = if i < j {
-            self.ranges[j - 1].1.max(stop)
-        } else {
-            stop
-        };
-        self.ranges.splice(i..j, [(merged_start, merged_stop)]);
-        Ok(self.gaps() as isize - before as isize)
+        let gaps = self.gaps();
+        let mut merged = (start, stop);
+        if let Some((s, e)) = before
+            && e == start
+        {
+            self.ranges.remove(&s);
+            merged.0 = s;
+        }
+        if let Some(e) = self.ranges.remove(&stop) {
+            merged.1 = e;
+        }
+        self.ranges.insert(merged.0, merged.1);
+        Ok(self.gaps() as isize - gaps as isize)
     }
 }
 
@@ -1892,23 +1961,51 @@ impl<T: TimeSource> Receiver<T> {
             complete: false,
         };
         reader.set_age_limit(inbound_stream_age_limit(total));
+        let payload_start = (HEADER_LEN as u64) + u64::from(header.metadata_len());
+        let mut rechunker = Rechunker::new(total);
         let metadata = match header.metadata_len() {
             0 => None,
-            len => match reader.read_exact(len as usize).await {
-                Ok(metadata) => Some(metadata),
-                Err(failure) => {
-                    self.fail(&mut reader, failure, Charged::Yes);
-                    return;
+            len => {
+                // Payload that arrives while the metadata is missing goes
+                // to the charged buffer, not to staging.
+                let handle = guard.handle().clone();
+                let mut stopped = None;
+                let read = reader
+                    .read_exact_with(len as usize, |offset, piece| {
+                        match self.feed_staged(
+                            &mut rechunker,
+                            &handle,
+                            offset - payload_start,
+                            piece,
+                        ) {
+                            Ok(()) => true,
+                            Err(code) => {
+                                stopped = Some(code);
+                                false
+                            }
+                        }
+                    })
+                    .await;
+                drop(handle);
+                match (read, stopped) {
+                    (Ok(metadata), _) => Some(metadata),
+                    // Recorded where the piece was refused.
+                    (Err(_), Some(code)) => {
+                        reader.stop(code);
+                        return;
+                    }
+                    (Err(failure), None) => {
+                        self.fail(&mut reader, failure, Charged::Yes);
+                        return;
+                    }
                 }
-            },
+            }
         };
         let arrival = InboundStreamArrival {
             stream_id,
             metadata,
             handle: guard.handle().clone(),
         };
-        let payload_start = (HEADER_LEN as u64) + u64::from(header.metadata_len());
-        let mut rechunker = Rechunker::new(total);
         // Payload read before the stream was admitted was staged; it moves to
         // the charged buffer now.
         let mut fed = Ok(());
@@ -2438,13 +2535,13 @@ mod tests {
         assert_eq!(m.gaps(), 1);
         assert_eq!(m.insert(20, 25), Ok(0), "extends the first");
         assert_eq!(m.insert(25, 30), Ok(-1), "joins both");
-        assert_eq!(m.ranges, vec![(10, 40)]);
+        assert_eq!(m.runs(), vec![(10, 40)]);
         assert_eq!(m.gaps(), 0);
         assert_eq!(m.insert(0, 5), Ok(1));
         assert_eq!(m.insert(39, 41), Err(ReadFailure::Overlap));
         assert_eq!(m.insert(0, 1), Err(ReadFailure::Overlap));
         assert_eq!(m.insert(5, 10), Ok(-1));
-        assert_eq!(m.ranges, vec![(0, 40)]);
+        assert_eq!(m.runs(), vec![(0, 40)]);
         assert_eq!(m.insert(7, 7), Ok(0), "empty");
     }
 

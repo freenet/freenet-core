@@ -285,7 +285,12 @@ impl ConnState {
     fn charge_with(&mut self, recv_window: u64, send_window: u64) -> u64 {
         let credit = recv_window.saturating_add(self.debt);
         let send = self.send_charged_with(send_window);
-        receive_charge(credit)
+        // The staging cap is floored at the bytes staged when it was last set
+        // (`ConnStaging::set_cap`), so it may sit above `staging_cap(credit)`
+        // after a shrink: the larger is charged.
+        let staging = (staging_cap(credit) as u64).max(self.staging.cap() as u64);
+        credit
+            .saturating_add(staging)
             .saturating_add(send_charge(send))
             .saturating_add(self.fixed_with(credit))
     }
