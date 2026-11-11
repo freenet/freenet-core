@@ -1575,7 +1575,11 @@ Connection IDs (quic/cid.rs) carry a keyed BLAKE3 MAC, so quinn drops a
 QUIC memory: every connection starts with a 16 KiB receive window and 4 uni
 streams (`config::INITIAL_RECEIVE_WINDOW_BYTES`, `INITIAL_UNI_STREAMS`): quinn
 cannot take a grant back. A path that takes data raises
-the streams to 64 at build and its meter raises the receive window to the
+the streams to 16 at build (`config::DATA_START_UNI_STREAMS`), doubling
+toward 64 once the peer has had every stream in use at once and as many
+again have completed with none failing and no budget throttle
+(`inbound::StreamLimit`, never lowered; a waiting one-packet Short takes
+one off while it waits), and its meter raises the receive window to the
 floor (128 KiB, or 64 KiB under 2 GiB, `budget::floor_window_bytes`); the
 send window starts at the floor, and the stream receive window is the
 largest a connection grows to (`budget::MAX_WINDOW_BYTES`, 8 MiB); all are capped at
@@ -2146,12 +2150,18 @@ Inbound adapter: a Stream's payload goes into an ordinary StreamHandle,
     exactly its length (Rechunker::feed always copies; no fragment shares
     an allocation with a quinn chunk, so a fragment Bytes does not keep
     a datagram or a defragmented allocation alive). Streams
-    with no charge (header phase, control frames) have an age limit too
-    (inbound_stream_age_limit(0)).
+    with no charge have an age limit too: inbound::HEADER_PHASE_AGE (30 s,
+    at least the idle timeout) until the header is read, then
+    inbound_stream_age_limit(0) (control frames, one-packet Shorts).
   → Idle and age eviction: streaming_handle_idle_timeout and
     inbound_stream_age_limit, counted EvictedIdle / EvictedAge, checked by
     one timer per stream on the path's clock (not the timeout_check
     tick). Every QUIC chunk is new bytes, so every chunk is progress.
+    While the buffer budget throttles the connection
+    (budget::ConnMeter::throttled_since), a stream that made progress in
+    the idle period before the throttle began has its idle timer paused
+    (the slowdown is ours); its age limit still applies and is counted
+    ThrottledPastAge, never EvictedIdle / EvictedAge.
     In simulation each stream's last armed timer stays in VirtualTime's
     pending wakeups until its deadline (VirtualSleep has no drop
     deregistration); the timer is replaced only when it fires.
