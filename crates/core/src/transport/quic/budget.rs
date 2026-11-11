@@ -611,7 +611,11 @@ impl QuicBudget {
 
     #[cfg(test)]
     fn pending_shrink(&self, id: u64) -> Option<(u64, u64)> {
-        self.state.lock().conns.get(&id).and_then(|conn| conn.shrink_to)
+        self.state
+            .lock()
+            .conns
+            .get(&id)
+            .and_then(|conn| conn.shrink_to)
     }
 }
 
@@ -624,12 +628,9 @@ fn shrink_target(conn: &mut ConnState, share: u64, floor: u64) -> Option<(u64, u
     let recv = credit_for_receive_charge(room.saturating_sub(send_charge(conn.send_window)))
         .max(floor)
         .min(conn.recv_window);
-    let send = (room
-        .saturating_sub(receive_charge(recv))
-        .saturating_mul(8)
-        / 9)
-    .max(floor)
-    .min(conn.send_window);
+    let send = (room.saturating_sub(receive_charge(recv)).saturating_mul(8) / 9)
+        .max(floor)
+        .min(conn.send_window);
     (recv < conn.recv_window || send < conn.send_window).then_some((recv, send))
 }
 
@@ -729,10 +730,8 @@ impl ConnMeter {
         let read = self.read.swap(0, Ordering::Relaxed);
         let delivered = self.delivered.swap(0, Ordering::Relaxed);
         let rtt = self.control.rtt();
-        self.interval.store(
-            nanos(rtt.max(MIN_EVALUATION_INTERVAL)),
-            Ordering::Relaxed,
-        );
+        self.interval
+            .store(nanos(rtt.max(MIN_EVALUATION_INTERVAL)), Ordering::Relaxed);
         let (result, changes) = self.budget.evaluate(
             self.id,
             read,

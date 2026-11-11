@@ -117,8 +117,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering}
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
-use futures::stream::FuturesUnordered;
 use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 use tokio::sync::mpsc;
 
 use super::super::budget::ConnMeter;
@@ -613,10 +613,7 @@ impl<T: TimeSource> BodyReader<T> {
     /// now is past it (`Overlong`); the end of the stream may be read here,
     /// which frees quinn's slot, and the wait then goes on to the age limit
     /// ([`Self::until_age`]).
-    async fn read_while_waiting<F: Future>(
-        &mut self,
-        ready: F,
-    ) -> Result<F::Output, ReadFailure> {
+    async fn read_while_waiting<F: Future>(&mut self, ready: F) -> Result<F::Output, ReadFailure> {
         debug_assert!(self.all_read());
         let mut ready = std::pin::pin!(ready);
         if !self.finished {
@@ -841,7 +838,9 @@ impl ConnStaging {
     /// A stream was stopped for passing the cap at `now`; true if another was
     /// within [`STAGED_TRIP_WINDOW`] before, which closes the path.
     fn trip(&self, now: u64) -> bool {
-        let before = self.last_trip.swap(now.saturating_add(1), Ordering::Relaxed);
+        let before = self
+            .last_trip
+            .swap(now.saturating_add(1), Ordering::Relaxed);
         before != 0 && now.saturating_sub(before - 1) <= nanos(STAGED_TRIP_WINDOW)
     }
 

@@ -6634,7 +6634,12 @@ async fn send_without_its_first_datagram(
         // The receiver closed the connection (OVER_BUDGET) right after the stop.
         Err(quinn::WriteError::ConnectionLost(_)) => None,
         Err(error) => panic!("write failed: {error}"),
-        Ok(()) => send.stopped().await.ok().flatten().map(|code| code.into_inner()),
+        Ok(()) => send
+            .stopped()
+            .await
+            .ok()
+            .flatten()
+            .map(|code| code.into_inner()),
     };
     set_packet_delivery_callback(network, None);
     stopped
@@ -6780,17 +6785,24 @@ fn a_waiting_one_packet_short_takes_a_charge() {
         let a = p.a.clone();
         p.drive(async move { a.send_short(b"fills").await.unwrap() })
             .await;
-        assert_eq!(p.b.inbound_budget_streams(), 0, "premise: one packet is not charged");
+        assert_eq!(
+            p.b.inbound_budget_streams(),
+            0,
+            "premise: one packet is not charged"
+        );
         let (a, time) = (p.a.clone(), p.time());
         let waiting = p
             .drive(async move {
-                let waiting =
-                    tokio::spawn(async move { a.send_short(b"waits").await });
+                let waiting = tokio::spawn(async move { a.send_short(b"waits").await });
                 time.sleep(Duration::from_millis(200)).await;
                 waiting
             })
             .await;
-        assert_eq!(p.b.inbound_budget_streams(), 1, "the waiting short is charged");
+        assert_eq!(
+            p.b.inbound_budget_streams(),
+            1,
+            "the waiting short is charged"
+        );
         assert_eq!(&p.b_in.shorts.try_recv().unwrap().payload()[..], b"fills");
         let time = p.time();
         p.drive(async move {

@@ -94,7 +94,11 @@ fn a_new_path_is_charged_its_floor_windows() {
             + CONTROL_BUFFER_BYTES
     );
     assert_eq!(a.meter.charge(), floor_grant(FLOOR));
-    assert_eq!(a.staging.cap(), 2 * FLOOR as usize, "the staging cap follows the credit");
+    assert_eq!(
+        a.staging.cap(),
+        2 * FLOOR as usize,
+        "the staging cap follows the credit"
+    );
     assert_eq!(budget.charged(), a.meter.charge());
     drop(a);
     assert_eq!(budget.charged(), 0, "a dropped path frees its share");
@@ -207,7 +211,10 @@ fn a_path_above_its_share_shrinks_and_keeps_its_debt_charged_until_read() {
     assert!(big.meter.pending_shrink().is_some());
     big.meter.evaluate(at + 11 * MS).unwrap();
     let shrunk = big.fake.last_recv().unwrap();
-    assert!(shrunk < grown, "the big path shrank in its own evaluation: {shrunk}");
+    assert!(
+        shrunk < grown,
+        "the big path shrank in its own evaluation: {shrunk}"
+    );
     assert!(big.meter.pending_shrink().is_none());
     let debt = big.meter.debt();
     assert_eq!(debt, grown - shrunk);
@@ -326,13 +333,20 @@ fn reads_before_a_shrink_do_not_pay_its_debt() {
     }
     let newcomer = conn(&budget, at);
     deliver_window(&newcomer, FLOOR, at + MS);
-    assert!(big.meter.pending_shrink().is_some(), "premise: a shrink is asked for");
+    assert!(
+        big.meter.pending_shrink().is_some(),
+        "premise: a shrink is asked for"
+    );
     // Read before the shrink reaches quinn: quinn returns this credit
     // against the window it had, so it must not pay the new debt.
     big.meter.on_read(5000, 0, at + 2 * MS - 1);
     big.meter.evaluate(at + 2 * MS).unwrap();
     let shrunk = big.fake.last_recv().unwrap();
-    assert_eq!(big.meter.debt(), window - shrunk, "the whole window given up");
+    assert_eq!(
+        big.meter.debt(),
+        window - shrunk,
+        "the whole window given up"
+    );
 }
 
 /// Evaluations are at least a round trip apart: with a long round trip, a
@@ -343,9 +357,18 @@ fn evaluations_are_a_round_trip_apart() {
     let a = conn(&budget, 0);
     *a.fake.rtt.lock().unwrap() = Duration::from_millis(200);
     assert!(a.meter.evaluate(10 * MS).is_some());
-    assert!(a.meter.maybe_evaluate(50 * MS).is_none(), "within the round trip");
-    assert!(a.meter.maybe_evaluate(150 * MS).is_none(), "within the round trip");
-    assert!(a.meter.maybe_evaluate(211 * MS).is_some(), "a round trip later");
+    assert!(
+        a.meter.maybe_evaluate(50 * MS).is_none(),
+        "within the round trip"
+    );
+    assert!(
+        a.meter.maybe_evaluate(150 * MS).is_none(),
+        "within the round trip"
+    );
+    assert!(
+        a.meter.maybe_evaluate(211 * MS).is_some(),
+        "a round trip later"
+    );
 }
 
 /// A connection that grew and then delivers little has its receive window
@@ -362,7 +385,10 @@ fn an_idle_window_decays_toward_the_floor() {
     }
     assert_eq!(window, 8 * FLOOR, "premise: it grew");
     let decay = nanos(IDLE_DECAY);
-    assert_eq!(a.meter.evaluate(at + decay / 2).unwrap().recv_window, window);
+    assert_eq!(
+        a.meter.evaluate(at + decay / 2).unwrap().recv_window,
+        window
+    );
     let mut seen = Vec::new();
     for i in 1..=5 {
         seen.push(a.meter.evaluate(at + i * decay + MS).unwrap().recv_window);
@@ -420,9 +446,16 @@ fn growth_within_a_small_budget() {
             at += MS;
             assert!(*window >= FLOOR);
         }
-        assert!(budget.charged() <= total, "{} over {total}", budget.charged());
+        assert!(
+            budget.charged() <= total,
+            "{} over {total}",
+            budget.charged()
+        );
     }
-    assert!(windows.iter().any(|w| *w > FLOOR), "some room was used: {windows:?}");
+    assert!(
+        windows.iter().any(|w| *w > FLOOR),
+        "some room was used: {windows:?}"
+    );
 }
 
 /// Paths evaluated from several threads at once keep the node within its
@@ -454,5 +487,9 @@ fn concurrent_evaluations_stay_within_the_budget() {
     }
     let recount = budget.charged();
     assert!(recount <= total, "{recount} over {total}");
-    assert_eq!(budget.running_total(), recount, "the running total is a recount");
+    assert_eq!(
+        budget.running_total(),
+        recount,
+        "the running total is a recount"
+    );
 }
