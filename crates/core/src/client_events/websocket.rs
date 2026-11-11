@@ -395,31 +395,24 @@ pub(crate) fn is_allowed_host(
 }
 
 /// Returns `true` if the request's `Host` header IP is acceptable for a
-/// privileged WS upgrade **and** the `Origin` is compatible with it.
+/// privileged WS upgrade **and** the `Origin` is a same-IP literal for it.
 ///
-/// Two acceptance branches with **different Origin policies**:
+/// The Host IP qualifies on either of two branches:
 ///
 /// 1. **Operator-configured CIDR** (`--allowed-source-cidrs` / config
-///    `allowed-source-cidrs`): accepts the upgrade when the Host IP is in
-///    the CIDR and the Origin is **either** `null` (sandboxed iframe
-///    served from the same node) **or** a same-IP literal (direct browser
-///    access). The operator has explicitly opted into the null-origin
-///    risk surface — see `origin_compatible_with_host_ip`.
+///    `allowed-source-cidrs`), e.g. a Tailnet range.
+/// 2. **Default LAN/private** (no operator config required): the Host IP
+///    is private (RFC 1918 / loopback / link-local / IPv6 ULA, but **not**
+///    the unspecified `0.0.0.0` / `::`).
 ///
-/// 2. **Default LAN/private** (no operator config required): accepts the
-///    upgrade when the Host IP is private (RFC 1918 / loopback /
-///    link-local / IPv6 ULA, but **not** the unspecified `0.0.0.0` / `::`)
-///    and the Origin is a **same-IP literal** matching the Host IP.
-///    `Origin: null` is **rejected** on this branch because any site can
-///    serve a `<iframe sandbox>` whose origin is null and use it to probe
-///    LAN-bound nodes — a default-on CSWSH would expose every desktop
-///    install on a LAN. Operators who genuinely need null-origin
-///    sandboxed access from non-localhost contexts must opt in via
-///    `--allowed-source-cidrs`.
+/// On both branches the Origin must be an IP literal equal to the Host IP
+/// (direct browser access, or the shell page served from that address).
+/// `Origin: null` is **rejected** on both: it identifies no page, and the
+/// node's own dApp iframe never needs it because the shell page opens the
+/// real WebSocket on its behalf (its Origin is the node's own address).
 ///
-/// This dual policy closes #3957 (LAN access works out of the box)
-/// without widening CSWSH exposure beyond what an explicit operator
-/// opt-in already accepts. The default-LAN branch matches what
+/// This closes #3957 (LAN access works out of the box). The default-LAN
+/// branch matches what
 /// [`is_private_ip`](crate::server::is_private_ip) and the
 /// `private_network_filter` accept for **source** IPs, modulo the
 /// unspecified-address exclusion, so the HTTP and WS layers agree on
@@ -430,40 +423,72 @@ pub(crate) fn is_allowed_host(
 /// CGNAT, and other non-private but operator-controlled ranges still
 /// require `--allowed-source-cidrs` (see `host_header_ip_in_tailscale_cidr_allowed`).
 ///
-/// CSWSH defence (both branches): `https://evil.com`'s JS opening
-/// `ws://<victim-lan-ip>:7509/...` sends `Origin: https://evil.com`, which
-/// parses to a hostname — not an IP, not matching the Host IP — so it's
-/// refused. DNS rebinding is defeated because no DNS resolution happens
-/// at this layer; only string-parseable IP literals are compared.
+/// An `Origin` that is a hostname (for example `https://example.com`) is
+/// refused: only an IP literal matching the Host IP is accepted. No DNS
+/// resolution happens at this layer; only string-parseable IP literals are
+/// compared.
 pub(crate) fn host_header_ip_in_cidrs(
     headers: &axum::http::HeaderMap,
     origin_str: &str,
     allowed_cidrs: &crate::server::AllowedSourceCidrs,
 ) -> bool {
-    let Some(host_header) = headers
+    let Some(host_ip) = trusted_host_header_ip(headers, allowed_cidrs) else {
+        return false;
+    };
+    origin_is_same_ip_literal(origin_str, host_ip)
+}
+
+/// Returns `true` if the request's `Host` header names this node: `localhost`
+/// on any port (so an SSH tunnel or port map such as `localhost:8000`
+/// qualifies), an entry in `allowed_hosts`, or an IP literal on either branch
+/// of [`host_header_ip_in_cidrs`] (private/LAN, or inside
+/// `allowed-source-cidrs`).
+///
+/// This is the Host half of the check without an Origin, for endpoints a
+/// browser reaches by top-level navigation (which carries no `Origin`),
+/// such as the contract shell page that issues an app-identity token. A
+/// browser sets `Host` from the URL it loads, so a page can only produce one
+/// of these values from an origin that is that value: `localhost:<port>` is
+/// no broader than `127.0.0.1:<port>`. Any other name, including
+/// `*.localhost`, is refused unless it is on the allowlist; names are never
+/// resolved.
+pub(crate) fn is_host_acceptable(
+    headers: &axum::http::HeaderMap,
+    allowed_hosts: &HashSet<String>,
+    allowed_cidrs: &crate::server::AllowedSourceCidrs,
+) -> bool {
+    is_localhost_host(headers)
+        || is_allowed_host(headers, allowed_hosts)
+        || trusted_host_header_ip(headers, allowed_cidrs).is_some()
+}
+
+/// Whether the `Host` header is `localhost` with an optional numeric port
+/// (case-insensitive). `localhost.` and subdomains do not qualify.
+fn is_localhost_host(headers: &axum::http::HeaderMap) -> bool {
+    let Some(host) = headers
         .get(axum::http::header::HOST)
         .and_then(|h| h.to_str().ok())
     else {
         return false;
     };
-    let Some(ip) = parse_host_header_ip(host_header) else {
-        return false;
-    };
-    let host_ip = normalize_mapped_v6(ip);
+    let name_len = host.find(':').unwrap_or(host.len());
+    let (name, port) = host.split_at(name_len);
+    name.eq_ignore_ascii_case("localhost") && (port.is_empty() || is_colon_port(port))
+}
 
-    // Operator-configured CIDR: permissive Origin policy (null OK).
-    if allowed_cidrs.contains_ip(&host_ip) {
-        return origin_compatible_with_host_ip(origin_str, host_ip);
-    }
-
-    // Default LAN/private: stricter Origin policy (same-IP literal only,
-    // no null) to prevent default-on CSWSH from sandboxed iframes hosted
-    // on arbitrary sites.
-    if is_default_lan_host_ip(&host_ip) {
-        return origin_is_same_ip_literal(origin_str, host_ip);
-    }
-
-    false
+/// The `Host` header's IP (IPv4-mapped v6 normalized to v4) when it is inside
+/// an operator-configured CIDR or qualifies for the default LAN/private
+/// branch; `None` for a hostname, a malformed value, a missing header, or any
+/// other IP.
+fn trusted_host_header_ip(
+    headers: &axum::http::HeaderMap,
+    allowed_cidrs: &crate::server::AllowedSourceCidrs,
+) -> Option<std::net::IpAddr> {
+    let host_header = headers
+        .get(axum::http::header::HOST)
+        .and_then(|h| h.to_str().ok())?;
+    let host_ip = normalize_mapped_v6(parse_host_header_ip(host_header)?);
+    (allowed_cidrs.contains_ip(&host_ip) || is_default_lan_host_ip(&host_ip)).then_some(host_ip)
 }
 
 /// Whether a `Host` header IP qualifies for the default LAN/private path.
@@ -481,39 +506,15 @@ fn is_default_lan_host_ip(ip: &std::net::IpAddr) -> bool {
     crate::server::is_private_ip(ip)
 }
 
-/// Strict Origin gate used by the default LAN/private branch: requires
-/// the Origin to parse to an IP literal that matches the Host IP after
-/// IPv4-mapped-v6 normalization. `Origin: null` and hostname Origins are
-/// rejected.
+/// Origin gate shared by both branches of [`host_header_ip_in_cidrs`]:
+/// requires the Origin to parse to an IP literal that matches the Host IP
+/// after IPv4-mapped-v6 normalization. `Origin: null` and hostname Origins
+/// are rejected.
 fn origin_is_same_ip_literal(origin_str: &str, host_ip: std::net::IpAddr) -> bool {
     let Some(origin_host) = parse_origin_host(origin_str) else {
         return false;
     };
     let Ok(origin_ip) = origin_host.parse::<std::net::IpAddr>() else {
-        return false;
-    };
-    normalize_mapped_v6(origin_ip) == host_ip
-}
-
-/// Decides whether an `Origin` header value is compatible with a `Host` IP
-/// that's already been confirmed to be inside an allowed CIDR.
-///
-/// See `host_header_ip_in_cidrs` for the full rationale.
-fn origin_compatible_with_host_ip(origin_str: &str, host_ip: std::net::IpAddr) -> bool {
-    // `Origin: null` is what Freenet's dApp sandbox iframe actually sends.
-    // A malicious sandboxed iframe on evil.com would also send `null`, but
-    // that's the same risk surface as an operator-configured `allowed-host`
-    // entry (existing behaviour); extending the risk to operator-configured
-    // CIDRs is a deliberate choice documented in the PR description.
-    if origin_str == "null" {
-        return true;
-    }
-    let Some(origin_host) = parse_origin_host(origin_str) else {
-        return false;
-    };
-    let Ok(origin_ip) = origin_host.parse::<std::net::IpAddr>() else {
-        // Origin is a hostname (e.g. `evil.com`). Never accept — this is the
-        // primary CSWSH guard.
         return false;
     };
     normalize_mapped_v6(origin_ip) == host_ip
@@ -569,7 +570,7 @@ fn is_colon_port(s: &str) -> bool {
 
 /// Extracts the host part of an `Origin` header (e.g. `https://100.64.1.5:7509`
 /// → `100.64.1.5`). Returns `None` for unparseable or scheme-less values so
-/// `origin_compatible_with_host_ip` falls through to reject.
+/// `origin_is_same_ip_literal` falls through to reject.
 ///
 /// We hand-roll a minimal parser rather than pull in `url`: browsers produce
 /// `scheme://authority` for Origin, and we only need the authority's host-part.
@@ -1165,25 +1166,35 @@ async fn connection_info(
     if is_ws_upgrade {
         if let Some(origin) = req.headers().get(axum::http::header::ORIGIN) {
             if let Ok(origin_str) = origin.to_str() {
-                // Accept the upgrade when the origin is localhost, the Host
-                // header matches an explicit `allowed-host` entry, or the
-                // Host is an acceptable IP (private/LAN by default, or
-                // inside `allowed-source-cidrs`) *and* the Origin is
-                // compatible with it (null sandboxed iframe or same-IP).
-                // See `host_header_ip_in_cidrs` for the CSWSH rationale.
-                if !is_localhost_origin(origin_str)
-                    && !is_allowed_host(req.headers(), &allowed_hosts)
-                    && !host_header_ip_in_cidrs(req.headers(), origin_str, &allowed_source_cidrs)
-                {
+                // A browser always sends `Origin` on a WebSocket handshake.
+                // Accept only when the ORIGIN is trusted: a loopback origin
+                // (any port; a local dev server is a local process that could
+                // open the socket without a browser anyway), a same-IP literal
+                // on a private/allowed-CIDR Host, or an origin whose authority
+                // equals an allowed Host. The
+                // shell page opens the real socket on behalf of the sandboxed
+                // iframe, so the node's own UI never needs `Origin: null`,
+                // and `null` is refused. Non-browser clients send no Origin and
+                // are not affected. Same decision as the permission endpoints.
+                if !crate::server::client_api::is_origin_trusted(
+                    req.headers(),
+                    origin_str,
+                    Some(&allowed_hosts),
+                    Some(&allowed_source_cidrs),
+                ) {
                     let host_header = req
                         .headers()
                         .get(axum::http::header::HOST)
                         .and_then(|h| h.to_str().ok());
+                    let forwarded_proto = req
+                        .headers()
+                        .get("x-forwarded-proto")
+                        .and_then(|h| h.to_str().ok());
                     tracing::warn!(
                         origin = origin_str,
                         host = ?host_header,
-                        "Rejected WebSocket connection: Host header not in allowed hosts \
-                         (possible DNS rebinding attack)"
+                        forwarded_proto = ?forwarded_proto,
+                        "Rejected WebSocket connection: Origin not trusted"
                     );
                     return (
                         StatusCode::FORBIDDEN,
@@ -3313,6 +3324,302 @@ mod tests {
         );
     }
 
+    /// The WebSocket upgrade's Origin policy, for each kind of Host.
+    ///
+    /// Drives the real `connection_info` middleware with the production
+    /// `build_allowed_hosts` output for a loopback node on 7509 that also
+    /// lists `try.freenet.org` (the hosted-mode reverse proxy passes that
+    /// Host through), plus a Tailnet CIDR.
+    #[tokio::test]
+    async fn ws_upgrade_origin_policy() {
+        use axum::{Extension, Router, body::Body, http::Request, http::StatusCode, routing::get};
+        use tower::ServiceExt;
+
+        async fn handler() -> &'static str {
+            "ok"
+        }
+        let allowed_hosts: crate::server::AllowedHosts =
+            std::sync::Arc::new(crate::server::build_allowed_hosts(
+                std::net::Ipv4Addr::LOCALHOST.into(),
+                7509,
+                &["try.freenet.org".to_string()],
+            ));
+        let router = Router::new()
+            .route("/v1/contract/command", get(handler))
+            .layer(axum::middleware::from_fn(connection_info))
+            .layer(Extension(crate::server::HostedMode(false)))
+            .layer(Extension(allowed_hosts))
+            .layer(Extension(cidrs(&["100.64.0.0/10"])));
+
+        async fn status(router: &Router, host: &str, origin: Option<&str>) -> StatusCode {
+            let mut builder = Request::builder()
+                .uri("/v1/contract/command")
+                .header("host", host)
+                .header("upgrade", "websocket")
+                .header("connection", "Upgrade");
+            if let Some(origin) = origin {
+                builder = builder.header("origin", origin);
+            }
+            router
+                .clone()
+                .oneshot(builder.body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+                .status()
+        }
+
+        let allowed: &[(&str, Option<&str>)] = &[
+            // Non-browser clients (fdev, riverctl, CLIs) send no Origin.
+            ("127.0.0.1:7509", None),
+            // The node's own shell page.
+            ("127.0.0.1:7509", Some("http://127.0.0.1:7509")),
+            ("localhost:7509", Some("http://localhost:7509")),
+            ("[::1]:7509", Some("http://[::1]:7509")),
+            // A local dev server on another port (e.g. `dx serve`).
+            ("127.0.0.1:7509", Some("http://localhost:8080")),
+            // Hosted mode: Origin authority equals an allowed Host.
+            ("try.freenet.org", Some("https://try.freenet.org")),
+            // LAN and Tailnet access by IP, from the shell served there.
+            ("192.168.1.5:7509", Some("http://192.168.1.5:7509")),
+            ("100.64.1.5:7509", Some("http://100.64.1.5:7509")),
+        ];
+        for (host, origin) in allowed {
+            assert_eq!(
+                status(&router, host, *origin).await,
+                StatusCode::OK,
+                "Host {host}, Origin {origin:?} must be accepted"
+            );
+        }
+
+        let forbidden: &[(&str, &str)] = &[
+            ("127.0.0.1:7509", "https://evil.example"),
+            ("127.0.0.1:7509", "http://127.0.0.1.evil.com"),
+            ("127.0.0.1:7509", "http://localhost.evil.com"),
+            ("localhost:7509", "https://evil.example"),
+            ("[::1]:7509", "https://evil.example"),
+            // An opaque origin.
+            ("127.0.0.1:7509", "null"),
+            ("localhost:7509", "null"),
+            ("100.64.1.5:7509", "null"),
+            ("192.168.1.5:7509", "null"),
+            // An allowed hostname does not admit a foreign Origin.
+            ("try.freenet.org", "https://evil.example"),
+            ("try.freenet.org", "null"),
+            // An unlisted name in both Host and Origin.
+            ("other.example:7509", "http://other.example:7509"),
+        ];
+        for (host, origin) in forbidden {
+            assert_eq!(
+                status(&router, host, Some(origin)).await,
+                StatusCode::FORBIDDEN,
+                "Host {host}, Origin {origin} must be refused"
+            );
+        }
+    }
+
+    /// A native app grant connection (#5264) still passes the upgrade's Origin
+    /// gate: it carries its token in the `Authorization` header and, as a
+    /// non-browser client, no `Origin`. `connection_info` must admit it and
+    /// record the header token, which `websocket_commands` requires before it
+    /// consults the grant store. A native WebSocket library that adds a
+    /// loopback `Origin` is admitted too; a foreign Origin is refused whatever
+    /// token it presents.
+    #[tokio::test]
+    async fn ws_upgrade_admits_native_grant_connections() {
+        use axum::{Extension, Router, body::Body, http::Request, http::StatusCode, routing::get};
+        use tower::ServiceExt;
+
+        async fn handler(Extension(from_header): Extension<AuthTokenFromHeader>) -> String {
+            from_header.0.to_string()
+        }
+        let allowed_hosts: crate::server::AllowedHosts = std::sync::Arc::new(
+            crate::server::build_allowed_hosts(std::net::Ipv4Addr::LOCALHOST.into(), 7509, &[]),
+        );
+        let router = Router::new()
+            .route("/v1/contract/command", get(handler))
+            .layer(axum::middleware::from_fn(connection_info))
+            .layer(Extension(crate::server::HostedMode(false)))
+            .layer(Extension(allowed_hosts))
+            .layer(Extension(crate::server::AllowedSourceCidrs::default()));
+
+        async fn call(router: &Router, host: &str, origin: Option<&str>) -> (StatusCode, String) {
+            let mut builder = Request::builder()
+                .uri("/v1/contract/command?encodingProtocol=native")
+                .header("host", host)
+                .header("upgrade", "websocket")
+                .header("connection", "Upgrade")
+                .header("authorization", "Bearer grant-token-value");
+            if let Some(origin) = origin {
+                builder = builder.header("origin", origin);
+            }
+            let resp = router
+                .clone()
+                .oneshot(builder.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = resp.status();
+            let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+            (status, String::from_utf8_lossy(&body).into_owned())
+        }
+
+        for (host, origin) in [
+            ("127.0.0.1:7509", None),
+            ("localhost:7509", None),
+            ("[::1]:7509", None),
+            ("127.0.0.1:7509", Some("http://127.0.0.1:7509")),
+            ("127.0.0.1:7509", Some("http://localhost")),
+        ] {
+            assert_eq!(
+                call(&router, host, origin).await,
+                (StatusCode::OK, "true".to_string()),
+                "grant upgrade with Host {host}, Origin {origin:?} must pass with a header token"
+            );
+        }
+        for origin in ["https://evil.example", "null"] {
+            assert_eq!(
+                call(&router, "127.0.0.1:7509", Some(origin)).await.0,
+                StatusCode::FORBIDDEN,
+                "a bearer token does not admit Origin {origin}"
+            );
+        }
+    }
+
+    /// Drives `connection_info` as a WebSocket upgrade and returns the status.
+    async fn ws_upgrade_status(
+        router: &axum::Router,
+        host: &str,
+        origin: Option<&str>,
+        forwarded_proto: Option<&str>,
+    ) -> axum::http::StatusCode {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+        let mut builder = Request::builder()
+            .uri("/v1/contract/command")
+            .header("host", host)
+            .header("upgrade", "websocket")
+            .header("connection", "Upgrade");
+        if let Some(origin) = origin {
+            builder = builder.header("origin", origin);
+        }
+        if let Some(proto) = forwarded_proto {
+            builder = builder.header("x-forwarded-proto", proto);
+        }
+        router
+            .clone()
+            .oneshot(builder.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    fn origin_gate_router(
+        hosted: bool,
+        bind: std::net::IpAddr,
+        extra_hosts: &[&str],
+    ) -> axum::Router {
+        use axum::{Extension, Router, routing::get};
+        async fn handler() -> &'static str {
+            "ok"
+        }
+        let extra: Vec<String> = extra_hosts.iter().map(|h| h.to_string()).collect();
+        let allowed_hosts: crate::server::AllowedHosts =
+            std::sync::Arc::new(crate::server::build_allowed_hosts(bind, 7509, &extra));
+        Router::new()
+            .route("/v1/contract/command", get(handler))
+            .layer(axum::middleware::from_fn(connection_info))
+            .layer(Extension(crate::server::HostedMode(hosted)))
+            .layer(Extension(allowed_hosts))
+            .layer(Extension(crate::server::AllowedSourceCidrs::default()))
+    }
+
+    /// The upgrade's Origin gate on a HOSTED node (try.freenet.org behind a
+    /// TLS proxy that passes the public Host through and sets
+    /// `X-Forwarded-Proto: https`). The gate runs before hosted-mode token
+    /// handling, so these upgrades carry no user token: an admitted one
+    /// reaches the handler, a refused one is 403 here.
+    #[tokio::test]
+    async fn ws_upgrade_origin_gate_on_a_hosted_node() {
+        use axum::http::StatusCode;
+        let router = origin_gate_router(
+            true,
+            std::net::Ipv4Addr::LOCALHOST.into(),
+            &["try.freenet.org"],
+        );
+        let host = "try.freenet.org";
+        for (origin, proto) in [
+            ("https://try.freenet.org", Some("https")),
+            // A proxy that omits X-Forwarded-Proto: authority-only comparison.
+            ("https://try.freenet.org", None),
+            // Scheme comparison is case-insensitive.
+            ("https://try.freenet.org", Some("HTTPS")),
+            // Only the first (client-facing) element of a list is compared,
+            // so a chain whose last hop was plain HTTP is still `https`.
+            ("https://try.freenet.org", Some("https, http")),
+            // A plain-HTTP deployment that says so.
+            ("http://try.freenet.org", Some("http")),
+        ] {
+            assert_eq!(
+                ws_upgrade_status(&router, host, Some(origin), proto).await,
+                StatusCode::OK,
+                "Origin {origin}, X-Forwarded-Proto {proto:?}"
+            );
+        }
+        for (origin, proto) in [
+            ("https://evil.example", Some("https")),
+            ("null", Some("https")),
+            // Same authority: the scheme must match X-Forwarded-Proto.
+            ("http://try.freenet.org", Some("https")),
+            // First element of a list is the client-facing scheme.
+            ("http://try.freenet.org", Some("https, http")),
+            ("https://try.freenet.org.evil.example", Some("https")),
+        ] {
+            assert_eq!(
+                ws_upgrade_status(&router, host, Some(origin), proto).await,
+                StatusCode::FORBIDDEN,
+                "Origin {origin}, X-Forwarded-Proto {proto:?}"
+            );
+        }
+        // Host 127.0.0.1 with a non-loopback Origin: refused.
+        assert_eq!(
+            ws_upgrade_status(
+                &router,
+                "127.0.0.1:7509",
+                Some("https://evil.example"),
+                Some("https")
+            )
+            .await,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    /// An `--allowed-host` reached on the node's port: the browser sends
+    /// `Host: myhost:7509` and `Origin: http://myhost:7509`. Accepted whether
+    /// the operator listed the bare name or `name:port`; a different port in
+    /// the Origin is refused.
+    #[tokio::test]
+    async fn ws_upgrade_accepts_a_port_bearing_allowed_host() {
+        use axum::http::StatusCode;
+        for listed in ["myhost", "myhost:7509"] {
+            let router =
+                origin_gate_router(false, std::net::Ipv4Addr::UNSPECIFIED.into(), &[listed]);
+            assert_eq!(
+                ws_upgrade_status(&router, "myhost:7509", Some("http://myhost:7509"), None).await,
+                StatusCode::OK,
+                "listed as {listed}"
+            );
+            assert_eq!(
+                ws_upgrade_status(&router, "myhost:7509", Some("http://myhost:8080"), None).await,
+                StatusCode::FORBIDDEN,
+                "listed as {listed}: Origin port differs from Host"
+            );
+            assert_eq!(
+                ws_upgrade_status(&router, "myhost:7509", Some("https://evil.example"), None).await,
+                StatusCode::FORBIDDEN,
+                "listed as {listed}"
+            );
+        }
+    }
+
     /// End-to-end wire check (PR #4781): a connection that presents a
     /// stale/invalid auth token is closed with the trusted application close
     /// code `AUTH_TOKEN_INVALID_CLOSE_CODE` (4401). This is the shell's
@@ -4003,19 +4310,19 @@ mod tests {
         let allowed = cidrs(&["100.64.0.0/10"]);
         assert!(host_header_ip_in_cidrs(
             &headers_with_host("100.64.1.5:7509"),
-            "null",
+            "http://100.64.1.5:7509",
             &allowed,
         ));
         assert!(host_header_ip_in_cidrs(
             &headers_with_host("100.64.1.5"),
-            "null",
+            "http://100.64.1.5",
             &allowed,
         ));
         // A neighbouring user's tailnet IP is still inside 100.64.0.0/10;
         // if the operator widened the CIDR, that's the operator's choice.
         assert!(host_header_ip_in_cidrs(
             &headers_with_host("100.127.9.9:7509"),
-            "null",
+            "http://100.127.9.9:7509",
             &allowed,
         ));
     }
@@ -4027,17 +4334,17 @@ mod tests {
         let allowed = cidrs(&["100.64.0.0/10"]);
         assert!(!host_header_ip_in_cidrs(
             &headers_with_host("8.8.8.8:7509"),
-            "null",
+            "http://8.8.8.8:7509",
             &allowed,
         ));
         assert!(!host_header_ip_in_cidrs(
             &headers_with_host("100.128.0.1:7509"),
-            "null",
+            "http://100.128.0.1:7509",
             &allowed,
         ));
         assert!(!host_header_ip_in_cidrs(
             &headers_with_host("100.63.255.255:7509"),
-            "null",
+            "http://100.63.255.255:7509",
             &allowed,
         ));
     }
@@ -4051,29 +4358,26 @@ mod tests {
         let allowed = cidrs(&["100.64.0.0/10"]);
         assert!(!host_header_ip_in_cidrs(
             &headers_with_host("evil.com"),
-            "null",
+            "http://100.64.1.5",
             &allowed,
         ));
         assert!(!host_header_ip_in_cidrs(
             &headers_with_host("evil.com:7509"),
-            "null",
+            "http://100.64.1.5:7509",
             &allowed,
         ));
         // A hostname that happens to look like an IP at a glance is still a
         // hostname to `IpAddr::from_str`, so still rejected.
         assert!(!host_header_ip_in_cidrs(
             &headers_with_host("100-64-1-5.evil.com"),
-            "null",
+            "http://100.64.1.5:7509",
             &allowed,
         ));
     }
 
     /// Default-allow for private/LAN IPs only when the Origin is a
     /// same-IP literal; default-deny for public IPs and for `Origin: null`
-    /// on the default-private branch. The `null` rejection is the CSWSH
-    /// guard against a malicious `<iframe sandbox>` on `evil.com` probing
-    /// LAN-bound nodes — operators who need null-origin sandboxed access
-    /// from non-localhost contexts must opt in via `--allowed-source-cidrs`.
+    /// (refused on every branch).
     #[test]
     fn host_header_empty_cidrs_accepts_private_with_ip_literal_origin() {
         let empty = crate::server::AllowedSourceCidrs::default();
@@ -4192,7 +4496,7 @@ mod tests {
         let permissive = cidrs(&["0.0.0.0/8"]);
         assert!(host_header_ip_in_cidrs(
             &headers_with_host("0.0.0.0:7509"),
-            "null",
+            "http://0.0.0.0:7509",
             &permissive,
         ));
     }
@@ -4208,19 +4512,19 @@ mod tests {
         let allowed = cidrs(&["fd7a:115c:a1e0::/48"]);
         assert!(host_header_ip_in_cidrs(
             &headers_with_host("[fd7a:115c:a1e0::1]:7509"),
-            "null",
+            "http://[fd7a:115c:a1e0::1]:7509",
             &allowed,
         ));
         assert!(host_header_ip_in_cidrs(
             &headers_with_host("[fd7a:115c:a1e0::1]"),
-            "null",
+            "http://[fd7a:115c:a1e0::1]",
             &allowed,
         ));
         // Public IPv6 (documentation prefix) outside the /48 — rejected
         // because it isn't ULA/loopback/link-local AND isn't in the CIDR.
         assert!(!host_header_ip_in_cidrs(
             &headers_with_host("[2001:db8::1]:7509"),
-            "null",
+            "http://[2001:db8::1]:7509",
             &allowed,
         ));
     }
@@ -4233,18 +4537,18 @@ mod tests {
         let allowed = cidrs(&["100.64.0.0/10"]);
         assert!(host_header_ip_in_cidrs(
             &headers_with_host("[::ffff:100.64.1.5]:7509"),
-            "null",
+            "http://100.64.1.5:7509",
             &allowed,
         ));
         assert!(host_header_ip_in_cidrs(
             &headers_with_host("[::ffff:100.64.1.5]"),
-            "null",
+            "http://[::ffff:100.64.1.5]",
             &allowed,
         ));
         // Mapped v6 OUTSIDE the v4 CIDR still rejected.
         assert!(!host_header_ip_in_cidrs(
             &headers_with_host("[::ffff:8.8.8.8]:7509"),
-            "null",
+            "http://8.8.8.8:7509",
             &allowed,
         ));
     }
@@ -4255,7 +4559,7 @@ mod tests {
         let allowed = cidrs(&["100.64.0.0/10"]);
         assert!(!host_header_ip_in_cidrs(
             &axum::http::HeaderMap::new(),
-            "null",
+            "http://100.64.1.5:7509",
             &allowed,
         ));
     }
@@ -4306,20 +4610,22 @@ mod tests {
         ));
     }
 
-    /// The `Origin: null` case covers Freenet's sandboxed dApp iframe, which
-    /// deliberately strips origin via `<iframe sandbox=...>` without
-    /// `allow-same-origin`. Must be accepted when Host IP is in CIDR. A
-    /// malicious sandboxed iframe hosted on evil.com would also send
-    /// `Origin: null` — this is the documented CSWSH risk the operator
-    /// accepts when configuring `--allowed-source-cidrs` (equivalent risk
-    /// profile to an explicit `--allowed-host` entry).
+    /// `Origin: null` is refused even when the Host IP is inside an
+    /// operator-configured CIDR. Freenet's own sandboxed dApp iframe never
+    /// needs it: the shell page opens the real WebSocket, so the node sees the
+    /// shell's Origin.
     #[test]
-    fn origin_null_accepted_for_sandboxed_iframe() {
+    fn origin_null_rejected_even_inside_operator_cidr() {
         let allowed = cidrs(&["100.64.0.0/10"]);
-        assert!(host_header_ip_in_cidrs(
+        assert!(!host_header_ip_in_cidrs(
             &headers_with_host("100.64.1.5:7509"),
             "null",
             &allowed,
+        ));
+        assert!(!host_header_ip_in_cidrs(
+            &headers_with_host("[fd7a:115c:a1e0::1]:7509"),
+            "null",
+            &cidrs(&["fd7a:115c:a1e0::/48"]),
         ));
     }
 
