@@ -960,6 +960,17 @@ impl ConnMeter {
     pub(crate) fn pending_shrink(&self) -> Option<(u64, u64)> {
         self.budget.pending_shrink(self.id)
     }
+
+    /// The receive window and the debt not yet read: what the peer may hold.
+    #[cfg(test)]
+    pub(crate) fn credit(&self) -> (u64, u64) {
+        self.budget
+            .state
+            .lock()
+            .conns
+            .get(&self.id)
+            .map_or((0, 0), |conn| (conn.recv_window, conn.debt))
+    }
 }
 
 impl Drop for ConnMeter {

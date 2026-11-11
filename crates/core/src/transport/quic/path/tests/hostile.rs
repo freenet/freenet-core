@@ -7,7 +7,7 @@
 
 use super::super::bounded::SendDeadlines;
 use super::*;
-use crate::transport::quic::budget::{QuicBudget, floor_window_bytes};
+use crate::transport::quic::budget::{QuicBudget, floor_grant, floor_window_bytes};
 use crate::transport::quic::config::quic_buffer_budget_for;
 
 /// The node memory the budgets below are sized for: 2 GiB, the smallest host
@@ -1572,6 +1572,333 @@ fn a_hostile_peer_cannot_exceed_its_charge() {
             assert!(
                 run.honest_took.as_secs_f64() <= baseline.honest_took.as_secs_f64() * 1.1,
                 "the honest leaf was slowed by more than 10%: {run:?} against {baseline:?}"
+            );
+        }
+    })
+}
+
+/// What [`squeezed_under_staged`] saw of the victim's hub path.
+// Read through `Debug` in the printed rows.
+#[allow(dead_code)]
+#[derive(Debug, Default)]
+struct SqueezeRun {
+    budget_total: u64,
+    /// The victim's receive window once grown, and what it staged under a
+    /// withheld header.
+    grown_window: u64,
+    staged: usize,
+    cap_when_staged: usize,
+    /// The most debt the victim's meter showed after the newcomer started:
+    /// non-zero means the squeeze reached it.
+    debt_peak: u64,
+    /// The debt left once the victim's in-order bytes were read.
+    debt_after_read: u64,
+    /// In-order bytes the victim wrote, and bytes the hub path read, while
+    /// pinned.
+    in_order_written: usize,
+    read_while_pinned: u64,
+    /// The lowest receive window after the squeeze.
+    window_low: u64,
+    /// Samples where the credit alone (window plus unread debt) would have
+    /// put the cap below what was staged: the case the floor is for.
+    premise_samples: usize,
+    samples: usize,
+    /// The least the cap exceeded what was staged at any sample (negative:
+    /// staged past the cap).
+    min_cap_headroom: i64,
+    /// The least the victim's charge exceeded its credit plus what it
+    /// staged.
+    min_charge_headroom: i64,
+    node_peak: u64,
+    stops: StagingStops,
+    closed: Option<String>,
+    /// The withheld stream arrived whole once its header did.
+    delivered: bool,
+    newcomer_outcome: String,
+}
+
+#[derive(Default)]
+struct SqueezeSamples {
+    premise: usize,
+    samples: usize,
+    min_cap_headroom: Option<i64>,
+    min_charge_headroom: Option<i64>,
+    debt_peak: u64,
+    window_low: Option<u64>,
+    node_peak: u64,
+}
+
+impl SqueezeSamples {
+    fn sample(&mut self, hub: &Hub, path: &QuicPath) {
+        use crate::transport::quic::budget::staging_cap;
+        let meter = path.meter.as_ref().expect("metered");
+        let (window, debt) = meter.credit();
+        let (held, cap) = (path.inbound_staged(), path.inbound_staging_cap());
+        self.samples += 1;
+        if held > 0 && staging_cap(window + debt) < held {
+            self.premise += 1;
+        }
+        let headroom = cap as i64 - held as i64;
+        self.min_cap_headroom = Some(self.min_cap_headroom.map_or(headroom, |m| m.min(headroom)));
+        let charge = meter.charge() as i64 - (window + debt) as i64 - held as i64;
+        self.min_charge_headroom = Some(self.min_charge_headroom.map_or(charge, |m| m.min(charge)));
+        self.debt_peak = self.debt_peak.max(debt);
+        self.window_low = Some(self.window_low.map_or(window, |w| w.min(window)));
+        self.node_peak = self.node_peak.max(hub.budget.running_total());
+    }
+}
+
+/// One step of a hostile peer's virtual time.
+async fn hub_step(hub: &Hub) {
+    let time = hub.time.clone();
+    drive(
+        &hub.time,
+        LIMIT,
+        async move { time.sleep(HOSTILE_STEP).await },
+    )
+    .await;
+}
+
+/// The F1 case of the #6173 review, on real paths: a node budget small
+/// enough to bind; a victim (a hostile peer) grows its window, then stages
+/// `staged_share` per cent of that window under a withheld header; a
+/// newcomer's growth squeezes the victim's window; the victim then sends
+/// bytes in order on another stream, which are read and repay the debt, so
+/// its credit falls. Last the header is released. Samples the victim's hub
+/// path every 2 ms throughout.
+async fn squeezed_under_staged(
+    network: &'static str,
+    subnet: u8,
+    budget_total: u64,
+    staged_share: u64,
+) -> SqueezeRun {
+    let mut hub = Hub::build(network, subnet).await;
+    hub.budget = QuicBudget::new(
+        budget_total,
+        floor_window_bytes(NODE_MEMORY),
+        leaked_counters(),
+    );
+    let (peer, path, inbound) = hub.hostile_leaf().await;
+    assert!(peer.handshaken(), "the victim finished its handshake");
+    // Grow: one stream read as it arrives.
+    let total = 24 * MIB;
+    let mut first = header(1, 1, StreamId::next().0, total as u64, 0);
+    first.extend_from_slice(&vec![0x11; total]);
+    let (id, written) = peer.open_and_write(&first).expect("stream credit");
+    let mut arrivals = inbound.streams;
+    let reader = tokio::spawn(async move {
+        let arrival = arrivals.recv().await.expect("announced");
+        let body = arrival.handle.assemble().await.map(|body| body.len());
+        (body, arrivals)
+    });
+    write_all_driven(&hub, &peer, id, &first[written..]).await;
+    peer.with_conn(|conn| conn.send_stream(id).finish().expect("finish"));
+    let (grown, arrivals) = drive(
+        &hub.time,
+        LIMIT,
+        async move { reader.await.expect("reader") },
+    )
+    .await;
+    assert_eq!(grown, Ok(total), "the growth stream arrived");
+    let time = hub.time.clone();
+    drive(&hub.time, LIMIT, async move {
+        time.sleep(HUB_ONE_WAY * 10).await
+    })
+    .await;
+    let meter = path.meter.clone().expect("metered");
+    let grown_window = meter.credit().0;
+    // Every later arrival is assembled as it is announced.
+    let delivered = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (got, mut arrivals) = (delivered.clone(), arrivals);
+    hub.tasks.push(tokio::spawn(async move {
+        while let Some(arrival) = arrivals.recv().await {
+            let got = got.clone();
+            tokio::spawn(async move {
+                let body = arrival.handle.assemble().await;
+                got.lock().unwrap().push(body.map(|b| b.len()));
+            });
+        }
+    }));
+
+    // Pin, and stage under a withheld header.
+    peer.script(|state| {
+        state.feed_in = false;
+        state.run_timers = false;
+    });
+    let staged_len = (grown_window * staged_share / 100) as usize;
+    let staged_header = header(1, 1, StreamId::next().0, staged_len as u64, 0);
+    let (staged_id, _) = peer.open_and_write(&staged_header).expect("stream credit");
+    peer.script(|state| state.drop_step = true);
+    hub_step(&hub).await;
+    let body = vec![0x33; staged_len];
+    let mut sent = 0;
+    for _ in 0..2000 {
+        if sent >= body.len() {
+            break;
+        }
+        sent += peer.write(staged_id, &body[sent..]);
+        hub_step(&hub).await;
+    }
+    assert_eq!(sent, staged_len, "the victim had credit to stage");
+    peer.with_conn(|conn| conn.send_stream(staged_id).finish().expect("finish"));
+    for _ in 0..50 {
+        hub_step(&hub).await;
+    }
+    let mut samples = SqueezeSamples::default();
+    samples.sample(&hub, &path);
+    let (staged, cap_when_staged) = (path.inbound_staged(), path.inbound_staging_cap());
+
+    // The newcomer grows; the victim is squeezed.
+    let (newcomer, _newcomer_in_hub, mut newcomer_inbound) = hub.honest_leaf().await;
+    let (sender, time) = (newcomer.clone(), hub.time.clone());
+    let newcomer_task = tokio::spawn(async move {
+        let outcome = sender
+            .send_stream_bounded(
+                &time,
+                SendDeadlines::stream(HONEST_BYTES as u64),
+                StreamId::next(),
+                None,
+                Bytes::from(vec![0x22; HONEST_BYTES]),
+                None,
+            )
+            .await;
+        format!("{outcome:?}")
+    });
+    hub.tasks.push(tokio::spawn(async move {
+        if let Some(arrival) = newcomer_inbound.streams.recv().await {
+            let _body = arrival.handle.assemble().await;
+        }
+    }));
+    for _ in 0..500 {
+        hub_step(&hub).await;
+        samples.sample(&hub, &path);
+        if meter.debt() > 0 && samples.debt_peak > 0 {
+            break;
+        }
+    }
+
+    // The victim sends in order on a new stream, which is read: it repays
+    // the debt, so the credit falls to the lowered window.
+    let in_order_len = grown_window as usize;
+    let mut in_order = header(1, 1, StreamId::next().0, in_order_len as u64, 0);
+    in_order.extend_from_slice(&vec![0x44; in_order_len]);
+    let read_before = meter.read_total();
+    let (in_order_id, mut in_order_sent) = peer.open_and_write(&in_order).expect("stream credit");
+    // 3 s: reads that come in one burst are applied at the path's next
+    // periodic evaluation (`recycle::ACK_WATCH_TICK`, 2 s).
+    for _ in 0..1500 {
+        in_order_sent += peer.write(in_order_id, &in_order[in_order_sent..]);
+        hub_step(&hub).await;
+        samples.sample(&hub, &path);
+    }
+
+    let debt_after_read = meter.debt();
+    let (in_order_written, read_while_pinned) = (in_order_sent, meter.read_total() - read_before);
+    // Release the header: the victim hears the hub and runs its timers
+    // again, so the lost header is resent; it sends the rest in order.
+    peer.script(|state| {
+        state.feed_in = true;
+        state.run_timers = true;
+    });
+    for _ in 0..5000 {
+        if in_order_sent < in_order.len() {
+            in_order_sent += peer.write(in_order_id, &in_order[in_order_sent..]);
+            if in_order_sent == in_order.len() {
+                peer.with_conn(|conn| conn.send_stream(in_order_id).finish().expect("finish"));
+            }
+        }
+        hub_step(&hub).await;
+        samples.sample(&hub, &path);
+        if delivered.lock().unwrap().len() >= 2 {
+            break;
+        }
+    }
+    let newcomer_outcome = if newcomer_task.is_finished() {
+        newcomer_task.await.expect("newcomer task")
+    } else {
+        newcomer_task.abort();
+        "unfinished".to_string()
+    };
+    let delivered_whole = delivered
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|body| *body == Ok(staged_len));
+    SqueezeRun {
+        budget_total,
+        grown_window,
+        staged,
+        cap_when_staged,
+        debt_peak: samples.debt_peak,
+        debt_after_read,
+        in_order_written,
+        read_while_pinned,
+        window_low: samples.window_low.unwrap_or(0),
+        premise_samples: samples.premise,
+        samples: samples.samples,
+        min_cap_headroom: samples.min_cap_headroom.unwrap_or(0),
+        min_charge_headroom: samples.min_charge_headroom.unwrap_or(0),
+        node_peak: samples.node_peak,
+        stops: StagingStops::of(&path),
+        closed: path
+            .connection()
+            .inner()
+            .close_reason()
+            .map(|reason| format!("{reason}")),
+        delivered: delivered_whole,
+        newcomer_outcome,
+    }
+}
+
+/// F1 of the #6173 review on real paths: a squeeze lowers the window of a
+/// victim that has bytes staged under a withheld header, and the victim then
+/// repays the debt with bytes in order. The staging cap never falls below
+/// what is staged, nothing is stopped or closed for staging, the withheld
+/// stream is delivered once its header arrives, and the victim's charge
+/// covers its credit and its staged bytes.
+///
+/// On real paths the credit alone never puts the cap below what is staged
+/// (`premise_samples` is 0 in every run): staged bytes use the peer's
+/// flow-control credit, so they never exceed the credit (W plus unread
+/// debt), and the cap is twice the credit. The floor in
+/// `ConnStaging::set_cap` is covered by the budget's unit test
+/// (`the_staging_cap_never_falls_below_what_is_staged`), not here.
+#[test]
+fn a_squeeze_never_puts_the_cap_under_what_is_staged() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let mut runs = Vec::new();
+        for (index, (budget_mib, share)) in [(12u64, 30u64), (12, 50), (12, 90), (24, 50), (24, 85)]
+            .into_iter()
+            .enumerate()
+        {
+            let network: &'static str =
+                Box::leak(format!("quic-3c-squeeze-{index}").into_boxed_str());
+            let run =
+                squeezed_under_staged(network, 40 + index as u8, budget_mib << 20, share).await;
+            eprintln!("3c squeeze: {run:?}");
+            runs.push(run);
+        }
+        for run in &runs {
+            assert!(
+                run.debt_peak > 0,
+                "premise: the squeeze reached the victim: {run:?}"
+            );
+            assert!(run.min_cap_headroom >= 0, "staged past the cap: {run:?}");
+            assert_eq!(run.stops, StagingStops::default(), "{run:?}");
+            assert_eq!(run.closed, None, "{run:?}");
+            assert!(run.delivered, "the withheld stream arrived: {run:?}");
+            assert!(
+                run.min_charge_headroom >= 0,
+                "staged bytes uncharged: {run:?}"
+            );
+            // The newcomer is admitted at its floor grant while the victim,
+            // which grew alone, holds the whole budget: the node is over by
+            // that grant until the victim's shrink is applied and its debt
+            // read. Pinned at the measured bound; reported on #6173.
+            assert!(
+                run.node_peak <= run.budget_total + floor_grant(floor_window_bytes(NODE_MEMORY)),
+                "{run:?}"
             );
         }
     })
