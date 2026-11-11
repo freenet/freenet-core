@@ -385,3 +385,337 @@ fn a_lost_first_packet_on_a_grown_window_is_not_stopped() {
         }
     })
 }
+
+// Ramp gate (2): what quinn holds between two polls of a reader.
+
+/// One node (the hub) with a metered data path to each of several leaves,
+/// every endpoint on one simulated network and one `VirtualTime`. The hub's
+/// paths share one node budget, as a node's do.
+struct Star {
+    time: VirtualTime,
+    network: String,
+    /// Per leaf: the leaf's sending path, the hub's receiving path and its
+    /// inbound channels.
+    links: Vec<(Arc<QuicPath>, Arc<QuicPath>, QuicInbound)>,
+    _endpoints: Vec<super::super::super::QuicEndpoint>,
+    pumps: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for Star {
+    fn drop(&mut self) {
+        for pump in &self.pumps {
+            pump.abort();
+        }
+        crate::transport::in_memory_socket::set_packet_delivery_callback(&self.network, None);
+        crate::transport::in_memory_socket::unregister_network_time_source(&self.network);
+    }
+}
+
+impl Star {
+    /// A hub on `10.207.<subnet>.1` and `leaves` leaves on `.2` onward, each
+    /// connected and its path enabled for data. Runs on the caller's runtime
+    /// (one of several workers or the current thread).
+    async fn build(network: &str, subnet: u8, leaves: usize) -> Self {
+        use super::super::super::QuicEndpoint;
+        use super::super::super::config::QuicSettings;
+        use crate::transport::Socket;
+        use crate::transport::crypto::TransportKeypair;
+        use crate::transport::demux::DemuxSocket;
+        use crate::transport::in_memory_socket::{
+            SimulationSocket, register_address_network, register_network_time_source,
+        };
+        use crate::transport::packet_data::MAX_RECV_PACKET_SIZE;
+        use crate::transport::peer_connection::inbound_budget::SharedInboundBudget;
+
+        let time = VirtualTime::new();
+        register_network_time_source(network, time.clone());
+        let settings = QuicSettings {
+            memory_limit: NODE_MEMORY,
+            idle_timeout: None,
+            initial_window: None,
+            rate_limit: Default::default(),
+        };
+        let mut pumps = Vec::new();
+        let mut endpoints = Vec::new();
+        let bind = |addr: SocketAddr| {
+            let (time, settings) = (time.clone(), settings.clone());
+            register_address_network(addr, network);
+            async move {
+                let socket = Arc::new(DemuxSocket::wrap(
+                    SimulationSocket::bind(addr).await.expect("sim bind"),
+                    None,
+                ));
+                let keys = TransportKeypair::new();
+                let endpoint = QuicEndpoint::bind(socket.clone(), addr, time, &settings, &keys)
+                    .expect("endpoint");
+                let pump = tokio::spawn(async move {
+                    let mut buf = vec![0u8; MAX_RECV_PACKET_SIZE];
+                    while socket.recv_classified(&mut buf).await.is_ok() {}
+                });
+                (endpoint, keys, pump)
+            }
+        };
+        let hub_addr: SocketAddr = format!("10.207.{subnet}.1:5000").parse().unwrap();
+        let (hub, hub_keys, pump) = bind(hub_addr).await;
+        pumps.push(pump);
+        let budget = node_budget(leaked_counters());
+        let mut links = Vec::new();
+        for leaf in 0..leaves {
+            let addr: SocketAddr = format!("10.207.{subnet}.{}:5000", leaf + 2)
+                .parse()
+                .unwrap();
+            let (endpoint, keys, pump) = bind(addr).await;
+            pumps.push(pump);
+            let permit = hub.allow_peer(addr, keys.public()).expect("allow-set room");
+            let (client_end, server_end) = (endpoint.clone(), hub.clone());
+            let hub_key = hub_keys.public().clone();
+            let (client, server) =
+                super::super::super::tests::drive_on_threads(&time, LIMIT, async move {
+                    let (client, server) =
+                        tokio::join!(client_end.connect(hub_addr, &hub_key), async {
+                            server_end
+                                .accept()
+                                .await
+                                .expect("an attempt")
+                                .establish()
+                                .await
+                        });
+                    (client.expect("client"), server.expect("server"))
+                })
+                .await;
+            drop(permit);
+            let limits = QuicPathLimits::DEFAULT;
+            let own = || SharedInboundBudget::new(limits.max_streams, limits.max_bytes);
+            let (sender, _sender_in) = QuicPath::with_budget_and_own_channels(
+                client,
+                time.clone(),
+                limits,
+                own(),
+                Some(&node_budget(leaked_counters())),
+            );
+            sender.enable_data();
+            let (receiver, inbound) = QuicPath::with_budget_and_own_channels(
+                server,
+                time.clone(),
+                limits,
+                own(),
+                Some(&budget),
+            );
+            receiver.enable_data();
+            links.push((Arc::new(sender), Arc::new(receiver), inbound));
+            endpoints.push(endpoint);
+        }
+        endpoints.push(hub);
+        Self {
+            time,
+            network: network.to_string(),
+            links,
+            _endpoints: endpoints,
+            pumps,
+        }
+    }
+}
+
+/// One sample of a hub path: what quinn had counted received and what the
+/// reader had read, at one instant.
+#[derive(Clone, Copy)]
+struct HoldSample {
+    udp_rx: u64,
+    read: u64,
+}
+
+/// One run of [`hold_between_polls`].
+// Read through `Debug` in the printed rows.
+#[allow(dead_code)]
+#[derive(Debug)]
+struct HoldRun {
+    connections: usize,
+    workers: usize,
+    hogs: usize,
+    /// The largest estimated hold of any one connection, in bytes.
+    worst_per_connection: u64,
+    /// The largest sum over connections at one sample, in bytes.
+    worst_total: u64,
+    /// Streams the hub assembled, of those sent.
+    assembled: usize,
+    sent: usize,
+}
+
+/// Bytes each leaf sends to the hub in [`hold_between_polls`], as streams of
+/// [`HOLD_STREAM_BYTES`].
+const HOLD_STREAMS_PER_LEAF: usize = 4;
+const HOLD_STREAM_BYTES: usize = MIB;
+
+/// Every leaf of a [`Star`] sends [`HOLD_STREAMS_PER_LEAF`] streams to the hub
+/// at once, while `hogs` tasks keep the runtime's `workers` busy (each spins
+/// for 200 us of real time between yields). Every 1 ms of virtual time a
+/// sampler reads, for each hub path, quinn's received-byte count and the
+/// bytes its reader has read. The hold is estimated as received bytes scaled
+/// by the run's final payload fraction (read / received once everything is
+/// read) minus the bytes read, so it errs high by the overhead of ack-only
+/// packets received in bursts.
+fn hold_between_polls(connections: usize, workers: usize, hogs: usize, subnet: u8) -> HoldRun {
+    let network: &'static str =
+        Box::leak(format!("quic-3c-hold-{connections}-{workers}-{hogs}").into_boxed_str());
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(workers)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.block_on(async move {
+                let _seed = GlobalRng::seed_guard(SEED);
+                let star = Star::build(network, subnet, connections).await;
+                let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let mut hog_tasks = Vec::new();
+                for _ in 0..hogs {
+                    let stop = stop.clone();
+                    hog_tasks.push(tokio::spawn(async move {
+                        // Real CPU time on purpose: the load is what delays
+                        // the readers. Not a clock read the code under test
+                        // makes.
+                        #[allow(clippy::disallowed_methods)]
+                        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                            let until = std::time::Instant::now() + Duration::from_micros(200);
+                            while std::time::Instant::now() < until {
+                                std::hint::spin_loop();
+                            }
+                            tokio::task::yield_now().await;
+                        }
+                    }));
+                }
+                let mut star = star;
+                let links = std::mem::take(&mut star.links);
+                let time = star.time.clone();
+                let receivers: Vec<Arc<QuicPath>> = links
+                    .iter()
+                    .map(|(_, receiver, _)| receiver.clone())
+                    .collect();
+                let sent = connections * HOLD_STREAMS_PER_LEAF;
+                let assembled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let mut work = Vec::new();
+                for (sender, _receiver, mut inbound) in links {
+                    for index in 0..HOLD_STREAMS_PER_LEAF {
+                        let (sender, time) = (sender.clone(), time.clone());
+                        work.push(tokio::spawn(async move {
+                            let body = Bytes::from(vec![index as u8; HOLD_STREAM_BYTES]);
+                            sender
+                                .send_stream_bounded(
+                                    &time,
+                                    SendDeadlines::stream(HOLD_STREAM_BYTES as u64),
+                                    StreamId::next(),
+                                    None,
+                                    body,
+                                    None,
+                                )
+                                .await;
+                        }));
+                    }
+                    let assembled = assembled.clone();
+                    work.push(tokio::spawn(async move {
+                        let mut taken = 0;
+                        while taken < HOLD_STREAMS_PER_LEAF {
+                            let Some(arrival) = inbound.streams.recv().await else {
+                                break;
+                            };
+                            taken += 1;
+                            if arrival
+                                .handle
+                                .assemble()
+                                .await
+                                .is_ok_and(|body| body.len() == HOLD_STREAM_BYTES)
+                            {
+                                assembled.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
+                    }));
+                }
+                let sampling = Arc::new(std::sync::atomic::AtomicBool::new(true));
+                let (sampler_on, sampler_time, watched) =
+                    (sampling.clone(), time.clone(), receivers.clone());
+                let sampler = tokio::spawn(async move {
+                    let mut samples: Vec<Vec<HoldSample>> = Vec::new();
+                    while sampler_on.load(std::sync::atomic::Ordering::Relaxed) {
+                        samples.push(
+                            watched
+                                .iter()
+                                .map(|path| HoldSample {
+                                    udp_rx: path.connection().inner().stats().udp_rx.bytes,
+                                    read: path.inbound_read_total().unwrap_or(0),
+                                })
+                                .collect(),
+                        );
+                        sampler_time.sleep(Duration::from_millis(1)).await;
+                    }
+                    samples
+                });
+                let all = futures::future::join_all(work);
+                super::super::super::tests::drive_on_threads(&time, LIMIT, async move {
+                    all.await;
+                })
+                .await;
+                sampling.store(false, std::sync::atomic::Ordering::Relaxed);
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                let samples =
+                    super::super::super::tests::drive_on_threads(&time, LIMIT, async move {
+                        sampler.await.expect("sampler")
+                    })
+                    .await;
+                for hog in hog_tasks {
+                    hog.await.ok();
+                }
+                // Each path's payload fraction, from its final counts.
+                let fractions: Vec<f64> = receivers
+                    .iter()
+                    .map(|path| {
+                        let rx = path.connection().inner().stats().udp_rx.bytes.max(1);
+                        path.inbound_read_total().unwrap_or(0) as f64 / rx as f64
+                    })
+                    .collect();
+                let (mut worst_per_connection, mut worst_total) = (0u64, 0u64);
+                for sample in &samples {
+                    let mut total = 0u64;
+                    for (at, fraction) in sample.iter().zip(&fractions) {
+                        let hold = (at.udp_rx as f64 * fraction) as u64;
+                        let hold = hold.saturating_sub(at.read);
+                        worst_per_connection = worst_per_connection.max(hold);
+                        total += hold;
+                    }
+                    worst_total = worst_total.max(total);
+                }
+                drop(star);
+                HoldRun {
+                    connections,
+                    workers,
+                    hogs,
+                    worst_per_connection,
+                    worst_total,
+                    assembled: assembled.load(std::sync::atomic::Ordering::Relaxed),
+                    sent,
+                }
+            })
+        }));
+        done.send(outcome).ok();
+    });
+    match finished.recv_timeout(Duration::from_secs(600)) {
+        Ok(Ok(run)) => run,
+        Ok(Err(panic)) => std::panic::resume_unwind(panic),
+        Err(_) => panic!("the hold run did not finish within 600 s"),
+    }
+}
+
+/// Ramp gate (2): the between-polls hold under CPU load, with many
+/// connections on few workers. Prints one row per shape; asserts only that
+/// the transfers complete.
+#[test]
+fn quinns_hold_between_reader_polls_under_cpu_load() {
+    let mut subnet = 1u8;
+    for (connections, workers, hogs) in [(8, 2, 0), (8, 2, 4), (32, 2, 4), (32, 1, 2), (64, 2, 8)] {
+        let run = hold_between_polls(connections, workers, hogs, subnet);
+        subnet += 1;
+        eprintln!("3c hold: {run:?}");
+        assert_eq!(run.assembled, run.sent, "{run:?}");
+    }
+}

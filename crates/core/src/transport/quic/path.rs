@@ -1078,6 +1078,13 @@ impl QuicPath {
         self.budget.lock().stream_count()
     }
 
+    /// Every byte the receive side has read from quinn, if the path is
+    /// metered. Tests only.
+    #[cfg(test)]
+    pub(in crate::transport) fn inbound_read_total(&self) -> Option<u64> {
+        self.meter.as_ref().map(|meter| meter.read_total())
+    }
+
     /// The receive side's staging cap now. Tests only.
     #[cfg(test)]
     pub(in crate::transport) fn inbound_staging_cap(&self) -> usize {

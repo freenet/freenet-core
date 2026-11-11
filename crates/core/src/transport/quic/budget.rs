@@ -457,6 +457,8 @@ impl QuicBudget {
             budget: self.clone(),
             control,
             read: AtomicU64::new(0),
+            #[cfg(test)]
+            read_total: AtomicU64::new(0),
             delivered: AtomicU64::new(0),
             written: AtomicU64::new(0),
             evaluated_at: AtomicU64::new(now),
@@ -824,6 +826,10 @@ pub(crate) struct ConnMeter {
     control: Arc<dyn WindowControl>,
     /// Bytes read since the last evaluation: quinn's credits.
     read: AtomicU64,
+    /// Every byte read over the meter's life. Tests only (3c measures
+    /// quinn's hold between reads with it).
+    #[cfg(test)]
+    read_total: AtomicU64,
     /// Contiguous bytes delivered since the last evaluation.
     delivered: AtomicU64,
     /// Bytes quinn took from this path's sends since the last evaluation.
@@ -843,6 +849,8 @@ impl ConnMeter {
     /// least [`MIN_EVALUATION_INTERVAL`] apart).
     pub(crate) fn on_read(&self, bytes: u64, contiguous: u64, now: u64) {
         self.read.fetch_add(bytes, Ordering::Relaxed);
+        #[cfg(test)]
+        self.read_total.fetch_add(bytes, Ordering::Relaxed);
         self.delivered.fetch_add(contiguous, Ordering::Relaxed);
         self.maybe_evaluate(now);
     }
@@ -907,6 +915,12 @@ impl ConnMeter {
     /// shrunk send window charged while quinn may still hold its data.
     pub(crate) fn send_epoch(&self) -> Option<Arc<()>> {
         self.budget.send_epoch(self.id)
+    }
+
+    /// Every byte the reader has read on this connection. Tests only.
+    #[cfg(test)]
+    pub(crate) fn read_total(&self) -> u64 {
+        self.read_total.load(Ordering::Relaxed)
     }
 
     #[cfg(test)]
