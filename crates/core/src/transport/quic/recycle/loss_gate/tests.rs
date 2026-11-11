@@ -207,6 +207,32 @@ fn a_span_covers_a_gap_shorter_than_a_round_trip() {
     assert_eq!(gate.queue_at(now + 3 * rtt), None);
 }
 
+/// A span reaches at most a smoothed RTT past its own end, and a loss's
+/// neighbours are within a quarter RTT of it, so a span covers a lost packet
+/// sent up to about 1.25 to 1.4 smoothed RTTs after the span began. A loss
+/// in a burst that starts 1.5 RTTs after the last send before an idle spell
+/// is judged by the new burst's RTTs only.
+#[test]
+fn a_span_does_not_reach_a_loss_one_and_a_half_round_trips_later() {
+    let mut gate = GateState::default();
+    let rtt = 100 * MS;
+    let (_, last) = steady(&mut gate, Instant::now(), rtt, Duration::ZERO, 4, 40);
+    let resumed = last + rtt.mul_f64(1.5);
+    assert_eq!(
+        gate.queue_at(resumed + 5 * MS),
+        None,
+        "the old span reaches the loss"
+    );
+    for i in 0..10u32 {
+        let at = resumed + MS * (2 * i);
+        gate.on_ack(at + rtt + THRESHOLD_100, at, 1200, rtt);
+    }
+    assert_eq!(
+        gate.on_loss(resumed + rtt * 2, resumed + 5 * MS, 1200, false),
+        Verdict::Queue
+    );
+}
+
 /// An ECN congestion mark (quinn passes it with no lost bytes) always
 /// reaches Cubic, with no queue and a low loss share.
 #[test]

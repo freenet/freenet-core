@@ -59,7 +59,7 @@
 //! The figures cited here were measured with the `quic_lab_cold` and
 //! `quic_lab_burst` benches (`crates/core/benches/transport/quic_lab.rs` on
 //! the `lab/quic-cold-start` branch, "e5b-9 lab"); the tables are in PR
-//! #6185.
+//! #6185 and issue #6183, which keep them if the branch goes.
 //!
 //! # Telemetry
 //!
@@ -218,8 +218,10 @@ pub(crate) struct GateState {
     /// The smallest RTT of the packets sent in each recent span of send
     /// times: (start, end, smallest RTT), oldest first. In `queue_at` a span
     /// covers up to the next span's start, but at most a smoothed RTT past
-    /// its own end, so after an idle gap a span from before the gap is not
-    /// taken to cover a packet sent after it. Ending each span at its own
+    /// its own end. With the quarter-RTT neighbour window that lets a span
+    /// judge a lost packet sent up to about 1.25 smoothed RTTs after the
+    /// span's end (1.4 after its start), so after a longer idle gap a span
+    /// from before the gap does not judge a loss after it. Ending each span at its own
     /// end instead left gaps between spans that a lost packet's neighbours
     /// often fell into: 8 MiB at 5% loss with 30 ms of jitter at 300 ms took
     /// over 15 s in 7 of 46 lab runs, against 2 of 32 with this rule.
@@ -282,8 +284,10 @@ impl GateState {
         let srtt = self.srtt?;
         for (i, &(start, end, rtt)) in self.sends.iter().enumerate() {
             // A span covers up to the next one, but never more than a
-            // smoothed RTT past its own end, so it does not reach across an
-            // idle gap.
+            // smoothed RTT past its own end. With the neighbour window, a
+            // loss sent up to about 1.25 smoothed RTTs after the span's end
+            // can still be judged by it, so it does not reach across a
+            // longer idle gap.
             let reach = end + srtt;
             let end = self
                 .sends
