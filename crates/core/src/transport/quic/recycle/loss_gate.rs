@@ -81,7 +81,8 @@ pub(crate) const LOSS_SHARE_CEILING: f64 = 0.25;
 
 /// A round trip's loss share enters the smoothed share only when at least
 /// this many bytes were acknowledged or lost in it: in a small window one
-/// loss is a large share (2 of 8 is 25%).
+/// loss is a large share (2 of 8 is 25%). A smaller round's bytes carry into
+/// the next round.
 const SHARE_MIN_BYTES: u64 = 16 * 1200;
 
 /// The weight of a new round trip's share in the smoothed share.
@@ -263,14 +264,18 @@ impl GateState {
                 return;
             }
         }
+        // Bytes of a round too small to judge carry into the next, so the
+        // share keeps moving when the window is small: a share above the
+        // ceiling would otherwise never come down once Cubic's window fell
+        // below [`SHARE_MIN_BYTES`].
         let total = self.round_acked + self.round_lost;
         if total >= SHARE_MIN_BYTES {
             let share = self.round_lost as f64 / total as f64;
             self.share = (1.0 - SHARE_GAIN) * self.share + SHARE_GAIN * share;
+            self.round_acked = 0;
+            self.round_lost = 0;
         }
         self.round_start = Some(now);
-        self.round_acked = 0;
-        self.round_lost = 0;
         if self.round_min.is_some() {
             self.last_round_min = self.round_min.take();
         }
