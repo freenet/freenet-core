@@ -97,7 +97,7 @@ pub(crate) struct QuicSource {
 impl QuicSource {
     /// Record why the reader stopped. The first reason stays.
     pub(crate) fn end(&self, reason: QuicSourceEnd) {
-        let _ = self.end.set(reason);
+        self.end.get_or_init(|| reason);
     }
 
     fn ended(&self) -> Option<QuicSourceEnd> {
@@ -739,7 +739,11 @@ impl StreamHandle {
                 );
                 crate::node::network_status::record_stream_recv_abort_inactivity(received, total);
             }
-            _ => crate::node::network_status::record_stream_recv_abort_cancelled(received, total),
+            StreamError::Cancelled
+            | StreamError::NotFound
+            | StreamError::InvalidFragment { .. } => {
+                crate::node::network_status::record_stream_recv_abort_cancelled(received, total)
+            }
         }
         error
     }

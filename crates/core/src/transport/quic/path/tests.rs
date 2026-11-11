@@ -2359,10 +2359,13 @@ async fn half_sent_stream(
     (send, arrival)
 }
 
+/// What one consumer's `assemble()` returned.
+type Assembled = Result<Vec<u8>, StreamError>;
+
 /// Assemble `arrival` through a clone and a fork of its handle, on a task.
 fn assemble_both(
     arrival: &InboundStreamArrival,
-) -> tokio::task::JoinHandle<(Result<Vec<u8>, StreamError>, Result<Vec<u8>, StreamError>)> {
+) -> tokio::task::JoinHandle<(Assembled, Assembled)> {
     let handle = arrival.handle.clone();
     let fork = arrival.handle.fork();
     tokio::spawn(async move { tokio::join!(handle.assemble(), fork.assemble()) })
