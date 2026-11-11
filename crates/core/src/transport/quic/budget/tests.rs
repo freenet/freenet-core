@@ -379,18 +379,18 @@ fn a_send_shrink_with_no_stream_open_is_released_at_once() {
     let a = conn(&budget, 0);
     a.fake.cwnd.store(4 * FLOOR, Ordering::Relaxed);
     assert_eq!(a.meter.evaluate(10 * MS).unwrap().send_window, 8 * FLOOR);
-    let before = budget.charged();
+    let before = budget.running_total();
     a.fake.cwnd.store(FLOOR / 4, Ordering::Relaxed);
     assert_eq!(a.meter.evaluate(20 * MS).unwrap().send_window, FLOOR);
     assert!(
-        budget.charged() < before,
+        budget.running_total() < before,
         "released at once: {} vs {before}",
-        budget.charged()
+        budget.running_total()
     );
     assert_eq!(
+        budget.running_total(),
         budget.charged(),
-        a.meter.charge(),
-        "the total is the recount"
+        "the running total is the recount"
     );
 }
 
