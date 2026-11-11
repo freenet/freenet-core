@@ -534,52 +534,52 @@ fn the_staging_cap_never_falls_below_what_is_staged() {
     );
 }
 
-/// A growth the budget refuses asks the paths above their share to shrink
-/// largest first, only as many as cover what it needs: with three grown
-/// paths and a newcomer growing into a full budget, the largest is asked
-/// first and not all of them are.
+/// A squeeze asks the paths above the share to shrink largest first, and
+/// only as many as cover what is needed: with three paths above the share
+/// and a need one of them covers, only the largest is asked; with a need
+/// none covers alone, more are.
 #[test]
 fn a_squeeze_asks_the_largest_first_and_only_as_many_as_needed() {
-    let total = 24 << 20;
-    let budget = QuicBudget::new(total, FLOOR, counters());
+    let budget = QuicBudget::new(64 << 20, FLOOR, counters());
     let paths: Vec<Conn> = (0..3).map(|_| conn(&budget, 0)).collect();
     let mut at = 10 * MS;
-    // Grow them to different sizes: 2, 3 and 4 doublings past the floor.
-    for (i, path) in paths.iter().enumerate() {
-        let mut window = FLOOR;
-        for _ in 0..(i + 2) {
-            window = deliver_window(path, window, at).recv_window;
-            at += 10 * MS;
+    let mut windows = [FLOOR; 3];
+    // Grow them to different sizes: 3, 4 and 5 doublings.
+    for round in 0..6 {
+        for (i, path) in paths.iter().enumerate() {
+            if round < i + 3 {
+                windows[i] = deliver_window(path, windows[i], at).recv_window;
+            }
         }
+        at += 10 * MS;
     }
-    // Fill the rest of the budget with paths at the floor so growth is
-    // refused by the budget, not the share.
-    let mut fillers = Vec::new();
-    while budget.charged() + floor_grant(FLOOR) <= total {
-        fillers.push(conn(&budget, at));
-    }
-    let newcomer = fillers.pop().expect("premise: room for fillers");
     let charges: Vec<u64> = paths.iter().map(|p| p.meter.charge()).collect();
     assert!(
-        charges[2] > charges[1] && charges[2] > charges[0],
-        "premise: one path is the largest: {charges:?}"
+        charges[2] > charges[1] && charges[1] > charges[0],
+        "premise: three sizes: {charges:?}"
     );
-    // The newcomer grows until the budget, not its share, holds it back.
-    let mut window = FLOOR;
-    for _ in 0..6 {
-        at += 10 * MS;
-        window = deliver_window(&newcomer, window, at).recv_window;
-        if paths.iter().any(|p| p.meter.pending_shrink().is_some()) {
-            break;
+    let share = floor_grant(FLOOR);
+    let asked = |need: u64, at: u64| {
+        for path in &paths {
+            budget
+                .state
+                .lock()
+                .conns
+                .get_mut(&path.meter.id)
+                .unwrap()
+                .shrink_to = None;
         }
-    }
-    let asked: Vec<bool> = paths
-        .iter()
-        .map(|p| p.meter.pending_shrink().is_some())
-        .collect();
-    assert!(asked[2], "the largest is asked: {asked:?}");
-    assert!(
-        asked.iter().filter(|a| **a).count() < 3,
-        "only as many as needed: {asked:?}"
+        budget.squeeze_others(&mut budget.state.lock(), u64::MAX, share, need, at);
+        paths
+            .iter()
+            .map(|p| p.meter.pending_shrink().is_some())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(asked(1, at), vec![false, false, true], "the largest alone");
+    let both = charges[2] - share + 1;
+    assert_eq!(
+        asked(both, at + 20 * MS),
+        vec![false, true, true],
+        "the two largest"
     );
 }
