@@ -1631,7 +1631,7 @@ fn the_stream_limit_starts_low_and_doubles_with_load() {
         let mut p = paths("quic-path-stream-raise", 82, limits).await;
         // Sends that complete while nothing drains: what the channel holds
         // plus the readers waiting, one per stream the peer may open.
-        let mut fill = async |p: &mut Paths, base: u32, count: usize| {
+        let fill = async |p: &mut Paths, base: u32, count: usize| {
             let done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             for i in 0..count {
                 let (a, done) = (p.a.clone(), done.clone());
@@ -6754,6 +6754,196 @@ async fn send_without_its_first_datagram(
     };
     set_packet_delivery_callback(network, None);
     stopped
+}
+
+/// An honest stream whose first datagram (its header) is lost, at a window
+/// the budget has grown and a round trip that makes the resend take a while:
+/// what arrives meanwhile is staged and stays within the staging cap, so the
+/// stream is neither stopped nor the path closed, and it is delivered whole.
+/// Run at several transfer sizes, so the window has grown when the loss hits,
+/// and at 20 and 100 ms each way.
+#[test]
+fn an_honest_stream_whose_first_packet_is_lost_stays_within_the_staging_cap() {
+    for (case, mib, one_way) in [(0u8, 1usize, 20u64), (1, 8, 20), (2, 24, 20), (3, 24, 100)] {
+        bounded(move || async move {
+            use crate::transport::in_memory_socket::{
+                PacketDeliveryDecision, set_packet_delivery_callback,
+            };
+            let _seed = GlobalRng::seed_guard(SEED);
+            let windows = Windows {
+                a: Some(test_budget(64 << 20, leaked_counters())),
+                b: Some(test_budget(64 << 20, leaked_counters())),
+            };
+            let network = format!("quic-staging-honest-loss-{case}");
+            let p = paths_metered(&network, 40 + case, windows).await;
+            let a = p.a.clone();
+            // Grow the window first with a transfer of the same size.
+            let warm = Bytes::from(payload(mib * MIB));
+            let delay = move |_: &str, _, _, _: &[u8]| {
+                PacketDeliveryDecision::DelayedDelivery(Duration::from_millis(one_way))
+            };
+            set_packet_delivery_callback(&network, Some(Arc::new(delay)));
+            p.drive(async move {
+                a.send_stream(StreamId::next(), None, warm)
+                    .await
+                    .expect("warm")
+            })
+            .await;
+            let mut p = p;
+            let warm = p.b_in.streams.try_recv().expect("warm announced");
+            warm.handle.assemble().await.expect("warm assembled");
+            // Then lose the first large datagram from a: the next stream's
+            // header and first payload.
+            let from = p.pair.a_addr;
+            let seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            set_packet_delivery_callback(
+                &network,
+                Some(Arc::new(move |_: &str, sender, _, bytes: &[u8]| {
+                    if sender == from
+                        && bytes.len() >= 1000
+                        && !seen.swap(true, std::sync::atomic::Ordering::Relaxed)
+                    {
+                        PacketDeliveryDecision::Drop
+                    } else {
+                        PacketDeliveryDecision::DelayedDelivery(Duration::from_millis(one_way))
+                    }
+                })),
+            );
+            let a = p.a.clone();
+            let body = Bytes::from(payload(mib * MIB));
+            let sent = body.clone();
+            p.drive(async move {
+                a.send_stream(StreamId::next(), None, sent)
+                    .await
+                    .expect("sent")
+            })
+            .await;
+            set_packet_delivery_callback(&network, None);
+            let arrival = p.b_in.streams.try_recv().expect("announced");
+            assert_eq!(arrival.handle.assemble().await.expect("assembled"), body);
+            let stats = p.b.stats();
+            assert_eq!(
+                stats.count(QuicInboundOutcome::EvictedStaged),
+                0,
+                "{mib} MiB"
+            );
+            assert_eq!(stats.count(QuicInboundOutcome::ClosedStagedOverCap), 0);
+            let peak = p.b.inbound_staged_peak_permille();
+            eprintln!("{mib} MiB at {one_way} ms: staged peak {peak} per mille of the cap");
+            assert!(peak > 0, "premise: the lost header made the reader stage");
+            assert!(peak < 1000, "{mib} MiB: staged {peak} per mille of the cap");
+        });
+    }
+}
+
+/// The per-path buffer term charges each waiting one-packet Short at
+/// `budget::WAITING_SHORT_BYTES`: the largest body that fits one packet is
+/// within it at its allocator size class.
+#[test]
+fn a_waiting_one_packet_short_fits_its_charge() {
+    let largest = (1..=u64::from(u16::MAX))
+        .take_while(|len| crate::transport::peer_connection::fits_one_packet(*len))
+        .last()
+        .expect("some length fits one packet");
+    let class = super::inbound::allocation_class(largest as usize) as u64;
+    assert!(
+        class <= super::super::budget::WAITING_SHORT_BYTES,
+        "a {largest} B body allocates {class} B"
+    );
+}
+
+/// The receive side reads every stream unordered: its one quinn read is
+/// `read_chunk(_, false)`, and no code outside comments calls an in-order
+/// read (`read_chunk(_, true)`, `read`, `read_exact`, `read_to_end` or
+/// `read_chunks`) on a `RecvStream`. An in-order read would leave what
+/// quinn holds for the stream outside every bound the reader keeps.
+#[test]
+fn the_receive_side_never_reads_a_stream_in_order() {
+    let source = include_str!("inbound.rs");
+    let code = source
+        .lines()
+        .map(|line| line.split("//").next().unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let unordered = code.matches(".read_chunk(max, false)").count();
+    assert_eq!(unordered, 1, "the reader's one quinn read is unordered");
+    assert_eq!(
+        code.matches("read_chunk(").count(),
+        unordered,
+        "every read_chunk is unordered"
+    );
+    for in_order in [
+        "recv.read(",
+        "recv.read_exact(",
+        "recv.read_to_end(",
+        "recv.read_chunks(",
+        ".read_chunk(max, true)",
+    ] {
+        assert!(!code.contains(in_order), "an in-order read: {in_order}");
+    }
+}
+
+/// An admitted Stream whose metadata is lost (its header arrived alone)
+/// sends the payload that arrives meanwhile straight to its charged buffer,
+/// not to staging: with a staging cap far below the payload, the stream is
+/// delivered whole, metadata included, and nothing is evicted.
+#[test]
+fn payload_read_while_the_metadata_is_missing_is_not_staged() {
+    bounded(|| async move {
+        use crate::transport::in_memory_socket::{
+            PacketDeliveryDecision, set_packet_delivery_callback,
+        };
+        let _seed = GlobalRng::seed_guard(SEED);
+        let limits = QuicPathLimits {
+            staging_cap: Some(16 * 1024),
+            ..QuicPathLimits::DEFAULT
+        };
+        let network = "quic-path-metadata-lost";
+        let mut p = paths(network, 30, limits).await;
+        let (from, raw, time) = (p.pair.a_addr, p.a_raw(), p.time());
+        let id = StreamId::next().0;
+        let metadata = payload(1000);
+        let body = payload(256 * 1024);
+        let total = body.len() as u64;
+        let (meta, data) = (metadata.clone(), body.clone());
+        let net = network.to_string();
+        p.drive(async move {
+            let mut send = raw.open_uni().await.unwrap();
+            send.write_all(&header(1, 1, id, total, meta.len() as u32))
+                .await
+                .unwrap();
+            time.sleep(Duration::from_millis(50)).await;
+            // The header has gone alone; lose the first large datagram after
+            // it, which carries the metadata.
+            let seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            set_packet_delivery_callback(
+                &net,
+                Some(Arc::new(move |_: &str, sender, _, bytes: &[u8]| {
+                    if sender == from
+                        && bytes.len() >= 1000
+                        && !seen.swap(true, std::sync::atomic::Ordering::Relaxed)
+                    {
+                        PacketDeliveryDecision::Drop
+                    } else {
+                        PacketDeliveryDecision::Deliver
+                    }
+                })),
+            );
+            send.write_all(&meta).await.unwrap();
+            send.write_all(&data).await.unwrap();
+            send.finish().unwrap();
+            send.stopped().await.unwrap();
+        })
+        .await;
+        set_packet_delivery_callback(network, None);
+        let arrival = p.b_in.streams.try_recv().expect("announced");
+        assert_eq!(arrival.metadata.as_deref(), Some(&metadata[..]));
+        assert_eq!(
+            &arrival.handle.assemble().await.expect("assembled")[..],
+            &body[..]
+        );
+        assert_eq!(p.b.stats().count(QuicInboundOutcome::EvictedStaged), 0);
+    })
 }
 
 /// A stream whose first datagram (its header) is lost has what follows staged

@@ -8,8 +8,8 @@
 //! `StreamIdentity` and the orphan registry work unchanged.
 //!
 //! Every stream is read unordered from its first byte (`read_chunk(_, false)`,
-//! [`BodyReader::next_piece`]): quinn's assembler hands over each piece as it
-//! arrives, gap or not, so quinn holds nothing for a stream beyond the chunks
+//! [`BodyReader::next_piece`]): quinn hands over each piece as it arrives,
+//! gap or not, so quinn holds nothing for a stream beyond the chunks
 //! the reader has not polled yet. Unordered reads return the peer's credit for
 //! every byte read, so what the reader keeps is bounded here instead:
 //! - Before a stream's header, metadata or control body has been taken, the
@@ -29,7 +29,8 @@
 //! the window, `budget::gap_cap`; [`MAX_GAPS_PER_CONNECTION`] without a
 //! meter). quinn keeps a stopped stream's ranges until the peer finishes or
 //! resets it, which we cannot observe, so they stay counted
-//! ([`ConnRanges::keep`]); a second time past the cap closes the path.
+//! ([`ConnRanges::keep`]); a second time past the cap within
+//! [`STAGED_TRIP_WINDOW`] closes the path.
 //!
 //! A reader never stops reading: a stream waiting for room in the delivery
 //! channel keeps reading, so the wait never leaves data with quinn. Bytes past
@@ -85,9 +86,8 @@
 //!   header with an invalid declared length is also counted as
 //!   `InboundStreamOutcome::RefusedInvalidLength`, as the UDP path counts it.
 //!
-//! Memory: quinn hands out stream data as slices of the datagram it arrived
-//! in, so keeping a 1-byte chunk keeps its whole datagram. Every read
-//! therefore copies: staged bytes into the stream's staging buffer, a short or
+//! Memory: a chunk quinn hands out may share an allocation larger than
+//! itself, so the reader never keeps one. Every read copies: staged bytes into the stream's staging buffer, a short or
 //! control body into one buffer that grows as data arrives and ends exactly
 //! the declared length, and a `Stream`'s payload into fragments (the
 //! `Rechunker`), each a buffer of exactly its length filled at its offsets, so
@@ -111,7 +111,7 @@
 //! same id arrives, before it is refused as `StreamIdInUse`. Completed ids
 //! are not remembered, so once released an id can be used again.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -640,13 +640,12 @@ impl<T: TimeSource> BodyReader<T> {
     /// Every byte up to the declared end has been read; only the end of the
     /// stream itself is left, which [`Self::next_piece`] would read next.
     fn all_read(&self) -> bool {
-        self.end
-            .is_some_and(|end| self.ranges.ranges.as_slice() == [(0, end)])
+        self.end.is_some_and(|end| self.ranges.is_exactly(end))
     }
 
     /// The next piece of the stream in arrival order, with its offset, or
     /// `None` at the end. Read unordered (`read_chunk(max, false)`), so quinn's
-    /// assembler releases each chunk as soon as it arrives, gap or not: the
+    /// releases each chunk as soon as it arrives, gap or not: the
     /// bytes then live only where the caller copies them, which is charged or
     /// staged against a cap.
     async fn next_piece(&mut self) -> Result<Option<(u64, Bytes)>, ReadFailure> {
@@ -720,10 +719,10 @@ impl<T: TimeSource> BodyReader<T> {
                 () = &mut self.timer => {
                     let now = self.time.now_nanos();
                     // Idle first, as the UDP sweep does.
-                    if now >= self.last_progress.saturating_add(self.idle_nanos) {
-                        if !self.pause_for_throttle(now) {
-                            return Err(ReadFailure::Idle);
-                        }
+                    if now >= self.last_progress.saturating_add(self.idle_nanos)
+                        && !self.pause_for_throttle(now)
+                    {
+                        return Err(ReadFailure::Idle);
                     }
                     if now >= self.age_deadline {
                         return Err(if self.paused {
@@ -836,6 +835,45 @@ impl<T: TimeSource> BodyReader<T> {
         while self.ranges.contiguous_from(self.staging.taken) < want {
             match self.next_piece().await? {
                 Some((offset, bytes)) => self.staging.stage(offset, &bytes, self.end)?,
+                None => {
+                    let got = self
+                        .ranges
+                        .contiguous_from(self.staging.taken)
+                        .saturating_sub(self.staging.taken);
+                    return Err(ReadFailure::Truncated(clamp(got)));
+                }
+            }
+        }
+        Ok(self.staging.take(len))
+    }
+
+    /// [`Self::read_exact`], but a piece read meanwhile at or past both the
+    /// wanted bytes' end and what is already staged goes to `beyond` instead
+    /// of being staged (an admitted Stream's payload, which has a charged
+    /// buffer to go to, so it is never staged twice). A piece across that
+    /// point is split. `beyond` returning false ends the read with
+    /// `ReadFailure::Other`; it has recorded why.
+    async fn read_exact_with(
+        &mut self,
+        len: usize,
+        mut beyond: impl FnMut(u64, &[u8]) -> bool,
+    ) -> Result<Bytes, ReadFailure> {
+        let want = self.staging.taken.saturating_add(len as u64);
+        while self.ranges.contiguous_from(self.staging.taken) < want {
+            match self.next_piece().await? {
+                Some((offset, bytes)) => {
+                    let split = want.max(self.staging.stop());
+                    let stop = offset.saturating_add(bytes.len() as u64);
+                    let cut = usize::try_from(split.saturating_sub(offset))
+                        .unwrap_or(usize::MAX)
+                        .min(bytes.len());
+                    if cut > 0 {
+                        self.staging.stage(offset, &bytes[..cut], self.end)?;
+                    }
+                    if stop > split && !beyond(offset + cut as u64, &bytes[cut..]) {
+                        return Err(ReadFailure::Other);
+                    }
+                }
                 None => {
                     let got = self
                         .ranges
@@ -986,6 +1024,10 @@ pub(in crate::transport::quic) fn allocation_class(bytes: usize) -> usize {
 #[derive(Debug)]
 pub(in crate::transport::quic) struct ConnStaging {
     held: AtomicUsize,
+    /// The most held at once, and the cap then, as a per-mille of it.
+    /// Tests only.
+    #[cfg(test)]
+    peak_permille: AtomicUsize,
     cap: AtomicUsize,
     /// When a stream was last stopped for passing the cap, in the time
     /// source's nanoseconds plus one (0: never).
@@ -1002,6 +1044,8 @@ impl ConnStaging {
     ) -> Self {
         Self {
             held: AtomicUsize::new(0),
+            #[cfg(test)]
+            peak_permille: AtomicUsize::new(0),
             cap: AtomicUsize::new(cap),
             last_trip: AtomicU64::new(0),
             node,
@@ -1020,6 +1064,11 @@ impl ConnStaging {
             Ok(before) => {
                 let pct = (before + bytes).saturating_mul(100) / cap.max(1);
                 self.node.record_staged_level(pct as u64);
+                #[cfg(test)]
+                self.peak_permille.fetch_max(
+                    (before + bytes).saturating_mul(1000) / cap.max(1),
+                    Ordering::Relaxed,
+                );
                 true
             }
             Err(_) => false,
@@ -1044,15 +1093,32 @@ impl ConnStaging {
         before != 0 && now.saturating_sub(before - 1) <= nanos(STAGED_TRIP_WINDOW)
     }
 
-    /// Set the cap, from the connection's credit (`budget::staging_cap`).
+    /// Set the cap, from the connection's credit (`budget::staging_cap`),
+    /// but never below what is staged now: a shrink must not leave staged
+    /// bytes over the cap, which would evict the next honest piece and leave
+    /// the bytes held uncharged. The meter charges this cap. Called from the
+    /// receive task only, as every staging read is, so nothing is staged
+    /// between the two loads.
     pub(in crate::transport::quic) fn set_cap(&self, cap: usize) {
-        self.cap.store(cap, Ordering::Relaxed);
+        let held = self.held.load(Ordering::Relaxed);
+        self.cap.store(cap.max(held), Ordering::Relaxed);
     }
 
-    /// The cap now. Tests only.
-    #[cfg(test)]
+    /// The cap now.
     pub(in crate::transport::quic) fn cap(&self) -> usize {
         self.cap.load(Ordering::Relaxed)
+    }
+
+    /// Stage `bytes` as a reader would; false past the cap. Tests only.
+    #[cfg(test)]
+    pub(in crate::transport::quic) fn add_for_test(&self, bytes: usize) -> bool {
+        self.try_add(bytes)
+    }
+
+    /// The most staged at once, per mille of the cap then. Tests only.
+    #[cfg(test)]
+    pub(in crate::transport::quic) fn peak_permille(&self) -> usize {
+        self.peak_permille.load(Ordering::Relaxed)
     }
 
     /// Staged bytes charged now. Tests only.
@@ -1110,8 +1176,11 @@ impl Staging {
         };
         let need = at.saturating_add(bytes.len());
         if need > self.buf.capacity() {
-            // Double, up to the declared end once it is known.
-            let mut target = self.buf.capacity().saturating_mul(2).max(need);
+            // To the allocator's size class of what is needed (at most a
+            // quarter over, so growth stays geometric), never past the
+            // declared end once it is known: the charge stays within 1.25 x
+            // the span staged.
+            let mut target = allocation_class(need);
             if let Some(end) = end {
                 let span = usize::try_from(end.saturating_sub(self.base)).unwrap_or(usize::MAX);
                 target = target.min(span).max(need);
@@ -1128,6 +1197,16 @@ impl Staging {
         }
         self.buf[at..need].copy_from_slice(bytes);
         Ok(())
+    }
+
+    /// One past the highest stream offset the buffer covers (`taken` if it
+    /// is empty).
+    fn stop(&self) -> u64 {
+        if self.buf.is_empty() {
+            self.taken
+        } else {
+            self.base.saturating_add(self.buf.len() as u64)
+        }
     }
 
     /// Take the next `len` bytes, which the caller has checked are all
@@ -1147,7 +1226,7 @@ impl Staging {
     /// ones are not handed out (they hold no data, only the gap's zeros).
     fn drain(&mut self, ranges: &RangeMirror, mut each: impl FnMut(u64, &[u8])) {
         let stop = self.base.saturating_add(self.buf.len() as u64);
-        for &(start, end) in &ranges.ranges {
+        for (start, end) in ranges.iter() {
             let (start, end) = (start.max(self.taken), end.min(stop));
             if start < end {
                 let (from, to) = ((start - self.base) as usize, (end - self.base) as usize);
@@ -1226,8 +1305,9 @@ pub(in crate::transport::quic) struct ConnRanges {
     cap: AtomicUsize,
     /// Most stopped streams quinn can hold at once: the stream limit.
     limit: usize,
-    /// Times a stream went past the cap.
-    trips: AtomicUsize,
+    /// When a stream last went past the cap, in the time source's
+    /// nanoseconds plus one (0: never).
+    last_trip: AtomicU64,
     frozen: parking_lot::Mutex<Frozen>,
     /// Some entry of `frozen` is still in its grace period, so a read must
     /// check whether it has ended; false on the common path, which then
@@ -1246,7 +1326,7 @@ impl ConnRanges {
             held: AtomicUsize::new(0),
             cap: AtomicUsize::new(cap),
             limit: limit.max(1),
-            trips: AtomicUsize::new(0),
+            last_trip: AtomicU64::new(0),
             frozen: parking_lot::Mutex::new(Frozen::default()),
             grace_pending: AtomicBool::new(false),
             #[cfg(test)]
@@ -1254,11 +1334,15 @@ impl ConnRanges {
         }
     }
 
-    /// A stream went past the cap; true if one had before. The first trip
-    /// stops the stream; a second closes the path. An honest peer does not
-    /// reach the cap once.
-    fn trip(&self) -> bool {
-        self.trips.fetch_add(1, Ordering::Relaxed) > 0
+    /// A stream went past the cap at `now`; true if another had within
+    /// [`STAGED_TRIP_WINDOW`] before, as for the staging cap. The trip stops
+    /// the stream; a second within the window closes the path. An honest peer
+    /// does not reach the cap once.
+    fn trip(&self, now: u64) -> bool {
+        let before = self
+            .last_trip
+            .swap(now.saturating_add(1), Ordering::Relaxed);
+        before != 0 && now.saturating_sub(before - 1) <= nanos(STAGED_TRIP_WINDOW)
     }
 
     /// A stream's reader ended, stopped, with `gaps` that quinn may still
@@ -1399,7 +1483,10 @@ impl ConnRanges {
 /// The byte ranges received on one stream, merged, sorted by start.
 #[derive(Debug, Default)]
 struct RangeMirror {
-    ranges: Vec<(u64, u64)>,
+    /// Received runs, start to one past the end, merged: none touch.
+    /// Ordered by start, so each insert is logarithmic in the runs held
+    /// (up to the connection's gap cap), whatever order pieces arrive in.
+    ranges: BTreeMap<u64, u64>,
 }
 
 impl RangeMirror {
@@ -1408,26 +1495,37 @@ impl RangeMirror {
         self.ranges.len()
     }
 
+    /// The runs, in order. Tests only.
+    #[cfg(test)]
+    fn runs(&self) -> Vec<(u64, u64)> {
+        self.iter().collect()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        self.ranges.iter().map(|(&start, &end)| (start, end))
+    }
+
+    /// Exactly `0..end` has been received.
+    fn is_exactly(&self, end: u64) -> bool {
+        self.ranges.len() == 1 && self.ranges.get(&0) == Some(&end)
+    }
+
     /// One past the last byte of the in-order prefix: the end of the range
     /// starting at offset 0, or 0 if nothing there was received.
     fn prefix(&self) -> u64 {
-        match self.ranges.first() {
-            Some(&(0, end)) => end,
-            _ => 0,
-        }
+        self.ranges.get(&0).copied().unwrap_or(0)
     }
 
     /// One past the highest byte received, or 0.
     fn last_stop(&self) -> u64 {
-        self.ranges.last().map_or(0, |&(_, end)| end)
+        self.ranges.last_key_value().map_or(0, |(_, &end)| end)
     }
 
     /// One past the last byte of the received run that starts at or covers
     /// `from`, or `from` if byte `from` has not been received.
     fn contiguous_from(&self, from: u64) -> u64 {
-        let i = self.ranges.partition_point(|&(_, end)| end <= from);
-        match self.ranges.get(i) {
-            Some(&(start, end)) if start <= from => end,
+        match self.ranges.range(..=from).next_back() {
+            Some((_, &end)) if end > from => end,
             _ => from,
         }
     }
@@ -1438,36 +1536,35 @@ impl RangeMirror {
     }
 
     /// Record `start..stop`; returns how the number of gaps changed (+1 for
-    /// an isolated range after the first, 0 when it extends one, negative
-    /// when it joins several), or `Overlap` if any byte was already received.
+    /// an isolated range after the first, 0 when it extends one, -1 when it
+    /// joins two), or `Overlap` if any byte was already received.
     fn insert(&mut self, start: u64, stop: u64) -> Result<isize, ReadFailure> {
         if start >= stop {
             return Ok(0);
         }
-        // First range ending at or after `start`.
-        let i = self.ranges.partition_point(|&(_, end)| end < start);
-        // Ranges from `i` that touch or overlap `start..stop`.
-        let mut j = i;
-        while j < self.ranges.len() && self.ranges[j].0 <= stop {
-            let (s, e) = self.ranges[j];
-            if s < stop && e > start {
-                return Err(ReadFailure::Overlap);
-            }
-            j += 1;
+        let before = self
+            .ranges
+            .range(..=start)
+            .next_back()
+            .map(|(&s, &e)| (s, e));
+        if before.is_some_and(|(_, end)| end > start)
+            || self.ranges.range(start..stop).next().is_some()
+        {
+            return Err(ReadFailure::Overlap);
         }
-        let before = self.gaps();
-        let merged_start = if i < j {
-            self.ranges[i].0.min(start)
-        } else {
-            start
-        };
-        let merged_stop = if i < j {
-            self.ranges[j - 1].1.max(stop)
-        } else {
-            stop
-        };
-        self.ranges.splice(i..j, [(merged_start, merged_stop)]);
-        Ok(self.gaps() as isize - before as isize)
+        let gaps = self.gaps();
+        let mut merged = (start, stop);
+        if let Some((s, e)) = before
+            && e == start
+        {
+            self.ranges.remove(&s);
+            merged.0 = s;
+        }
+        if let Some(e) = self.ranges.remove(&stop) {
+            merged.1 = e;
+        }
+        self.ranges.insert(merged.0, merged.1);
+        Ok(self.gaps() as isize - gaps as isize)
     }
 }
 
@@ -1791,11 +1888,13 @@ impl<T: TimeSource> Receiver<T> {
                 reader.stop(stop_code::EVICTED);
                 // The peer falls back to the UDP session and counts it as
                 // `quic_fallback_over_budget_rx`.
-                if self.ranges.trip() && self.closer.close(QuicCloseCode::OverBudget) {
+                if self.ranges.trip(self.time.now_nanos())
+                    && self.closer.close(QuicCloseCode::OverBudget)
+                {
                     stats.record(QuicInboundOutcome::ClosedTooManyRanges);
                     tracing::warn!(
                         "QUIC path: the peer left more gaps than the connection's cap \
-                         a second time; closing the path so the peer falls back to UDP"
+                         a second time within the window; closing the path so the peer falls back to UDP"
                     );
                 }
             }
@@ -2040,23 +2139,51 @@ impl<T: TimeSource> Receiver<T> {
             complete: false,
         };
         reader.set_age_limit(inbound_stream_age_limit(total));
+        let payload_start = (HEADER_LEN as u64) + u64::from(header.metadata_len());
+        let mut rechunker = Rechunker::new(total);
         let metadata = match header.metadata_len() {
             0 => None,
-            len => match reader.read_exact(len as usize).await {
-                Ok(metadata) => Some(metadata),
-                Err(failure) => {
-                    self.fail(&mut reader, failure, Charged::Yes);
-                    return;
+            len => {
+                // Payload that arrives while the metadata is missing goes
+                // to the charged buffer, not to staging.
+                let handle = guard.handle().clone();
+                let mut stopped = None;
+                let read = reader
+                    .read_exact_with(len as usize, |offset, piece| {
+                        match self.feed_staged(
+                            &mut rechunker,
+                            &handle,
+                            offset - payload_start,
+                            piece,
+                        ) {
+                            Ok(()) => true,
+                            Err(code) => {
+                                stopped = Some(code);
+                                false
+                            }
+                        }
+                    })
+                    .await;
+                drop(handle);
+                match (read, stopped) {
+                    (Ok(metadata), _) => Some(metadata),
+                    // Recorded where the piece was refused.
+                    (Err(_), Some(code)) => {
+                        reader.stop(code);
+                        return;
+                    }
+                    (Err(failure), None) => {
+                        self.fail(&mut reader, failure, Charged::Yes);
+                        return;
+                    }
                 }
-            },
+            }
         };
         let arrival = InboundStreamArrival {
             stream_id,
             metadata,
             handle: guard.handle().clone(),
         };
-        let payload_start = (HEADER_LEN as u64) + u64::from(header.metadata_len());
-        let mut rechunker = Rechunker::new(total);
         // Payload read before the stream was admitted was staged; it moves to
         // the charged buffer now.
         let mut fed = Ok(());
@@ -2402,9 +2529,9 @@ mod tests {
         }
     }
 
-    /// A read buffer allocates nothing for bytes that have not arrived: it
-    /// starts at `READ_START_BYTES` whatever the declared length, grows by
-    /// doubling but never past that length, and ends exactly that long.
+    /// A rechunked stream finishes only with every declared byte and no
+    /// more: one short is `Truncated`, one past is `Overlong`, and a gap
+    /// left open is truncated whichever side of it arrived.
     #[test]
     fn finish_requires_every_declared_byte_and_no_more() {
         for total in [1usize, F, F + 1, 3 * F] {
@@ -2587,26 +2714,26 @@ mod tests {
         assert_eq!(m.gaps(), 1);
         assert_eq!(m.insert(20, 25), Ok(0), "extends the first");
         assert_eq!(m.insert(25, 30), Ok(-1), "joins both");
-        assert_eq!(m.ranges, vec![(10, 40)]);
+        assert_eq!(m.runs(), vec![(10, 40)]);
         assert_eq!(m.gaps(), 0);
         assert_eq!(m.insert(0, 5), Ok(1));
         assert_eq!(m.insert(39, 41), Err(ReadFailure::Overlap));
         assert_eq!(m.insert(0, 1), Err(ReadFailure::Overlap));
         assert_eq!(m.insert(5, 10), Ok(-1));
-        assert_eq!(m.ranges, vec![(0, 40)]);
+        assert_eq!(m.runs(), vec![(0, 40)]);
         assert_eq!(m.insert(7, 7), Ok(0), "empty");
     }
 
     /// The connection's count is checked against its cap as gaps come and
     /// go, what a finished stream held goes back, and only a second trip past
-    /// the cap asks for the close.
+    /// the cap within `STAGED_TRIP_WINDOW` asks for the close.
     #[test]
     fn the_connection_gap_count_has_a_cap() {
         let conn = ConnRanges::new(3, 64);
         assert!(conn.add(2, 0));
         assert!(conn.add(1, 0));
         assert!(!conn.add(1, 0), "past the cap");
-        assert!(!conn.trip(), "the first trip stops the stream only");
+        assert!(!conn.trip(0), "the first trip stops the stream only");
         assert!(conn.add(0, 0), "no new gap, so no trip, while past the cap");
         assert!(conn.add(-2, 0));
         assert_eq!(conn.held(), 2);
@@ -2614,7 +2741,12 @@ mod tests {
         assert_eq!(conn.held(), 1);
         conn.remove(5);
         assert_eq!(conn.held(), 0, "the count saturates at zero");
-        assert!(conn.trip(), "the second trip closes");
+        let window = nanos(STAGED_TRIP_WINDOW);
+        assert!(
+            !conn.trip(window + 1),
+            "a second trip past the window does not close"
+        );
+        assert!(conn.trip(2 * window), "a second within it closes");
     }
 
     /// A stopped stream's gaps stay counted through the grace period; then up
@@ -2681,11 +2813,9 @@ mod tests {
         assert_eq!(conn.kept(), 0);
     }
 
-    /// The receive side relies on quinn-proto 0.11.17 or later within 0.11:
-    /// `COMPACT_THRESHOLD` and `MAX_CHUNKS` bound what its assembler can hold
-    /// for a stream between two of our reads, and unordered reads release each
-    /// chunk as it arrives. A version outside that range must be re-read
-    /// (`assembler.rs`) before it is taken.
+    /// The receive side was written against quinn-proto 0.11.17 or later
+    /// within 0.11, where unordered reads release each chunk as it arrives.
+    /// A version outside that range must be re-read before it is taken.
     #[test]
     fn quinn_proto_is_one_whose_assembler_this_reader_was_written_for() {
         let versions = super::super::super::tests::locked_versions("quinn-proto");
@@ -2779,5 +2909,22 @@ mod tests {
         // Already silent for the whole idle period when it began.
         assert!(!idle_is_ours(100, idle, Some(130)));
         assert!(!idle_is_ours(100, idle, Some(200)));
+    }
+
+    /// Each waiting one-packet Short takes one off the peer's stream limit
+    /// while it waits, and the limit comes back as each leaves, to the full
+    /// limit once none waits.
+    #[test]
+    fn waiting_shorts_lower_the_stream_limit_until_they_leave() {
+        let told = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let seen = told.clone();
+        let limit = StreamLimit::new(Some(Box::new(move |n| seen.lock().push(n))), 64, 64);
+        let a = limit.hold();
+        let b = limit.hold();
+        drop(a);
+        let c = limit.hold();
+        drop(b);
+        drop(c);
+        assert_eq!(*told.lock(), vec![63, 62, 63, 62, 63, 64]);
     }
 }
