@@ -2254,6 +2254,13 @@ impl<T: TimeSource> Receiver<T> {
                 return;
             }
         };
+        // The body stays charged to the connection's staging while the
+        // stream's end is awaited: a peer that withholds it would otherwise
+        // hold a body per stream outside every charge.
+        let Some(_held) = StagedHold::new(reader.staging.conn.clone(), payload.len()) else {
+            self.fail(&mut reader, ReadFailure::StagedOverCap, Charged::No);
+            return;
+        };
         if let Err(failure) = reader.expect_end().await {
             self.fail(&mut reader, failure, Charged::No);
             return;
@@ -2262,6 +2269,25 @@ impl<T: TimeSource> Receiver<T> {
             Ok(()) => self.stats.record(QuicInboundOutcome::DeliveredControl),
             Err(_) => self.stats.record(QuicInboundOutcome::ControlDroppedFull),
         }
+    }
+}
+
+/// Bytes taken out of staging that stay charged to it until dropped.
+struct StagedHold {
+    conn: Arc<ConnStaging>,
+    bytes: usize,
+}
+
+impl StagedHold {
+    /// Charge `bytes`; `None` past the cap.
+    fn new(conn: Arc<ConnStaging>, bytes: usize) -> Option<Self> {
+        conn.try_add(bytes).then_some(Self { conn, bytes })
+    }
+}
+
+impl Drop for StagedHold {
+    fn drop(&mut self) {
+        self.conn.release(self.bytes);
     }
 }
 

@@ -6798,6 +6798,47 @@ fn a_waiting_one_packet_short_fits_its_charge() {
     );
 }
 
+/// A control body whose stream's end has not arrived stays charged to the
+/// connection's staging until the end comes, so a peer that withholds the
+/// end of its control streams holds nothing outside the charge.
+#[test]
+fn a_control_body_awaiting_its_end_stays_charged() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths("quic-path-control-end", 79, QuicPathLimits::DEFAULT).await;
+        let (raw, b, time) = (p.a_raw(), p.b.clone(), p.time());
+        let body = payload(4000);
+        let streams = 6;
+        let (held, after) = p
+            .drive(async move {
+                let header = FrameHeader::control(body.len() as u64)
+                    .expect("a control header")
+                    .encode();
+                let mut sends = Vec::new();
+                for _ in 0..streams {
+                    let mut send = raw.open_uni().await.expect("open");
+                    send.write_all(&header).await.expect("header");
+                    send.write_all(&body).await.expect("body");
+                    sends.push(send);
+                }
+                time.sleep(Duration::from_secs(1)).await;
+                let held = b.inbound_staged();
+                for mut send in sends {
+                    send.finish().expect("finish");
+                }
+                time.sleep(Duration::from_secs(1)).await;
+                (held, b.inbound_staged())
+            })
+            .await;
+        assert_eq!(held, streams * 4000, "every waiting body is charged");
+        assert_eq!(after, 0, "released once each end arrives");
+        assert_eq!(
+            p.b.stats().count(QuicInboundOutcome::DeliveredControl),
+            streams as u64
+        );
+    })
+}
+
 /// The receive side reads every stream unordered: its one quinn read is
 /// `read_chunk(_, false)`, and no code outside comments calls an in-order
 /// read (`read_chunk(_, true)`, `read`, `read_exact`, `read_to_end` or

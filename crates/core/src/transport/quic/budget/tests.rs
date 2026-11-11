@@ -16,6 +16,10 @@ struct Fake {
     send: Mutex<Vec<u64>>,
     cwnd: AtomicU64,
     rtt: Mutex<Duration>,
+    /// When set, a send-window change takes a send epoch of this connection
+    /// as it is applied, as a stream opened at that moment would.
+    epoch_on_send: Mutex<Option<(Arc<QuicBudget>, u64)>>,
+    taken: Mutex<Option<Arc<()>>>,
 }
 
 impl Default for Fake {
@@ -25,6 +29,8 @@ impl Default for Fake {
             send: Mutex::default(),
             cwnd: AtomicU64::default(),
             rtt: Mutex::new(RTT),
+            epoch_on_send: Mutex::default(),
+            taken: Mutex::default(),
         }
     }
 }
@@ -35,6 +41,9 @@ impl WindowControl for Fake {
     }
     fn set_send_window(&self, bytes: u64) {
         self.send.lock().unwrap().push(bytes);
+        if let Some((budget, id)) = self.epoch_on_send.lock().unwrap().as_ref() {
+            *self.taken.lock().unwrap() = budget.send_epoch(*id);
+        }
     }
     fn rtt(&self) -> Duration {
         *self.rtt.lock().unwrap()
@@ -328,6 +337,38 @@ fn a_send_window_grown_after_a_shrink_stays_charged_for_older_streams() {
     );
     drop(stream);
     assert!(a.meter.charge() < charged, "released when it ends");
+}
+
+/// A stream opened while a send shrink is being applied, after the budget
+/// decided it but before the connection has the lower window, may still
+/// buffer up to the old window: it takes the epoch held at the old window,
+/// and the old window stays charged until it ends.
+#[test]
+fn a_stream_opened_while_a_shrink_is_applied_keeps_the_old_window_charged() {
+    let budget = QuicBudget::new(64 << 20, FLOOR, counters());
+    let a = conn(&budget, 0);
+    a.fake.cwnd.store(4 * FLOOR, Ordering::Relaxed);
+    assert_eq!(a.meter.evaluate(10 * MS).unwrap().send_window, 8 * FLOOR);
+    let charged = a.meter.charge();
+    *a.fake.epoch_on_send.lock().unwrap() = Some((budget.clone(), a.meter.id));
+    a.fake.cwnd.store(FLOOR / 4, Ordering::Relaxed);
+    assert_eq!(a.meter.evaluate(20 * MS).unwrap().send_window, FLOOR);
+    *a.fake.epoch_on_send.lock().unwrap() = None;
+    let stream = a.fake.taken.lock().unwrap().take().expect("an epoch");
+    assert_eq!(
+        a.meter.charge(),
+        charged,
+        "the old window stays charged for the stream opened mid-shrink"
+    );
+    drop(stream);
+    let low = a.meter.charge();
+    assert!(low < charged, "released when it ends");
+    let _after = a.meter.send_epoch().expect("an epoch");
+    assert_eq!(
+        a.meter.charge(),
+        low,
+        "a stream opened once the shrink is applied is charged at the new window"
+    );
 }
 
 #[test]
