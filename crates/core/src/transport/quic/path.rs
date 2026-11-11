@@ -353,7 +353,14 @@ impl QuicPathLimits {
         control_capacity: CONTROL_CHANNEL_CAPACITY,
         max_send_aborts: recycle::SEND_ABORT_LIMIT,
         accept_data: true,
+        // Tests that are not about the raise start at the full limit, which
+        // their premises (exhausting the peer's streams) are written against;
+        // the raise has its own tests, and the simulation tests run the
+        // production start.
+        #[cfg(not(test))]
         start_streams: super::config::DATA_START_UNI_STREAMS,
+        #[cfg(test)]
+        start_streams: MAX_UNI_STREAMS,
         counters: None,
         #[cfg(test)]
         panic_in_receive: false,
@@ -1089,6 +1096,12 @@ impl QuicPath {
 
     /// The receive side's staging cap now. Tests only.
     #[cfg(test)]
+    /// The path's buffer-budget meter, if it reads data under a budget.
+    #[cfg(test)]
+    pub(in crate::transport) fn meter(&self) -> Option<&Arc<super::budget::ConnMeter>> {
+        self.meter.as_ref()
+    }
+
     pub(in crate::transport) fn inbound_staging_cap(&self) -> usize {
         self.inbound_staging.cap()
     }

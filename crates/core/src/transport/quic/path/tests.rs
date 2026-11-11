@@ -841,16 +841,21 @@ fn idle_and_old_streams_are_evicted() {
     })
 }
 
-/// A stream that trickles its header (or a control frame) never goes idle
-/// but holds one of the peer's stream slots while it does; it has no budget
-/// charge, so it gets the smallest age limit and is evicted at it.
+/// A stream that trickles its header never goes idle but holds one of the
+/// peer's stream slots while it does; it has no budget charge, so it is
+/// evicted at the header phase's age limit (`inbound::HEADER_PHASE_AGE`, at
+/// least the idle timeout), well before the uncharged age limit.
 #[test]
 fn an_uncharged_stream_is_evicted_at_its_age_limit() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
         let p = paths("quic-path-uncharged-age", 17, QuicPathLimits::DEFAULT).await;
         let idle = streaming_handle_idle_timeout();
-        let age = max_inbound_stream_age(0);
+        let age = super::inbound::HEADER_PHASE_AGE.max(idle);
+        assert!(
+            age < max_inbound_stream_age(0),
+            "premise: the header phase is shorter"
+        );
         let (conn, time) = (p.a_raw(), p.time());
         let started = time.now_nanos();
         let code = p
@@ -1606,6 +1611,60 @@ fn a_message_waiting_for_room_is_evicted_at_its_age_limit() {
             .await;
         assert!(p.b_in.shorts.try_recv().is_err(), "the second was evicted");
         assert_eq!(p.b.stats().count(QuicInboundOutcome::ShortDroppedFull), 0);
+    })
+}
+
+/// A data path's peer starts with `config::DATA_START_UNI_STREAMS` streams.
+/// Once it has had them all in use at once (here: Shorts waiting for room in
+/// a full channel) and as many have completed, the limit doubles, and the
+/// next time the channel is full more Shorts get a stream.
+#[test]
+fn the_stream_limit_starts_low_and_doubles_with_load() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let start = super::super::config::DATA_START_UNI_STREAMS as usize;
+        let limits = QuicPathLimits {
+            short_capacity: 1,
+            start_streams: start as u32,
+            ..QuicPathLimits::DEFAULT
+        };
+        let mut p = paths("quic-path-stream-raise", 82, limits).await;
+        // Sends that complete while nothing drains: what the channel holds
+        // plus the readers waiting, one per stream the peer may open.
+        let mut fill = async |p: &mut Paths, base: u32, count: usize| {
+            let done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            for i in 0..count {
+                let (a, done) = (p.a.clone(), done.clone());
+                tokio::spawn(async move {
+                    a.send_short(&(base + i as u32).to_be_bytes())
+                        .await
+                        .unwrap();
+                    done.fetch_add(1, Ordering::SeqCst);
+                });
+            }
+            let time = p.time();
+            p.drive(async move { time.sleep(Duration::from_secs(2)).await })
+                .await;
+            let held = done.load(Ordering::SeqCst);
+            let mut got = 0;
+            while got < count {
+                while p.b_in.shorts.try_recv().is_ok() {
+                    got += 1;
+                }
+                let time = p.time();
+                p.drive(async move { time.sleep(Duration::from_millis(10)).await })
+                    .await;
+            }
+            held
+        };
+        let first = fill(&mut p, 0, 2 * start).await;
+        assert!(first <= 1 + start, "{first} completed at the start limit");
+        assert_eq!(p.b.stats().count(QuicInboundOutcome::StreamLimitRaised), 1);
+        let second = fill(&mut p, 1000, 3 * start).await;
+        assert!(
+            second > 1 + start && second <= 1 + 2 * start,
+            "{second} completed after one raise"
+        );
     })
 }
 
@@ -6506,6 +6565,58 @@ fn leaked_counters() -> &'static crate::transport::metrics::QuicDataCounters {
 
 /// On a real connection, a stream whose in-order delivery fills the receive
 /// window grows it, and the node's charge stays within the budget.
+/// While the buffer budget throttles a connection, a stream that was making
+/// progress when the throttle began does not go idle: its idle timer is
+/// paused, since the slowdown is this node's decision. It still has its age
+/// limit, and reaching it while paused counts `ThrottledPastAge`, not an
+/// idle or age eviction.
+#[test]
+fn a_throttle_pauses_idle_and_the_age_limit_counts_apart() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let windows = Windows {
+            a: Some(test_budget(64 << 20, leaked_counters())),
+            b: Some(test_budget(64 << 20, leaked_counters())),
+        };
+        let p = paths_metered("quic-budget-throttle-idle", 26, windows).await;
+        let meter = p.b.meter().expect("b reads data under a budget").clone();
+        let idle = streaming_handle_idle_timeout();
+        let total = 10_000u64;
+        let age = max_inbound_stream_age(total);
+        assert!(
+            age > idle * 3,
+            "premise: the age limit is past several idle periods"
+        );
+        let (raw, time) = (p.a_raw(), p.time());
+        let started = time.now_nanos();
+        let code = p
+            .drive(async move {
+                let id = StreamId::next().0;
+                let mut bytes = header(1, 1, id, total, 0);
+                bytes.extend_from_slice(&payload(1000));
+                let mut send = raw.open_uni().await.unwrap();
+                send.write_all(&bytes).await.unwrap();
+                time.sleep(Duration::from_millis(100)).await;
+                // The throttle begins just after the stream's last progress
+                // and lasts past its age limit.
+                let now = time.now_nanos();
+                meter.throttle_for_test(now, now + 2 * age.as_nanos() as u64);
+                send.stopped().await.unwrap().map(|code| code.into_inner())
+            })
+            .await;
+        assert_eq!(code, Some(u64::from(stop_code::EVICTED)));
+        let waited = Duration::from_nanos(p.time().now_nanos() - started);
+        assert!(
+            waited >= age,
+            "stopped at its age limit, not idle: {waited:?}"
+        );
+        let stats = p.b.stats();
+        assert_eq!(stats.count(QuicInboundOutcome::ThrottledPastAge), 1);
+        assert_eq!(stats.shared_count(InboundStreamOutcome::EvictedIdle), 0);
+        assert_eq!(stats.shared_count(InboundStreamOutcome::EvictedAge), 0);
+    })
+}
+
 #[test]
 fn a_data_paths_window_grows_when_delivery_fills_it() {
     bounded(|| async move {

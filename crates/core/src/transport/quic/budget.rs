@@ -786,6 +786,14 @@ impl ConnMeter {
             .then(|| self.throttle_began.load(Ordering::Relaxed))
     }
 
+    /// Count the connection as throttled from `began` until `until`. Tests
+    /// only, for the readers' side of a throttle.
+    #[cfg(test)]
+    pub(crate) fn throttle_for_test(&self, began: u64, until: u64) {
+        self.throttle_began.store(began, Ordering::Relaxed);
+        self.throttled_until.store(until, Ordering::Relaxed);
+    }
+
     /// The epoch a stream opened now holds until it ends, which keeps a
     /// shrunk send window charged while quinn may still hold its data.
     pub(crate) fn send_epoch(&self) -> Option<Arc<()>> {

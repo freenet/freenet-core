@@ -493,3 +493,52 @@ fn concurrent_evaluations_stay_within_the_budget() {
         "the running total is a recount"
     );
 }
+
+/// A path the budget holds below what it needs is throttled: a grow it needs
+/// that does not fit, or a shrink another path's growth asked of it. The
+/// throttle lasts `GROWING_FOR` past the last such evaluation and remembers
+/// when it began; a path that grows freely is never throttled.
+#[test]
+fn a_held_back_path_is_throttled_until_it_is_not() {
+    let total = 4 << 20;
+    let budget = QuicBudget::new(total, FLOOR, counters());
+    let a = conn(&budget, 0);
+    let b = conn(&budget, 0);
+    let mut at = 10 * MS;
+    let mut window = FLOOR;
+    let mut first = None;
+    for _ in 0..12 {
+        let seen = deliver_window(&a, window, at);
+        window = seen.recv_window;
+        if seen.throttled && first.is_none() {
+            first = Some(at);
+        }
+        if first.is_none() {
+            assert!(a.meter.throttled_since(at).is_none(), "grew freely");
+        }
+        at += 10 * MS;
+    }
+    let began = first.expect("a reached the budget and was held back");
+    assert_eq!(a.meter.throttled_since(at - 10 * MS), Some(began));
+    // b's growth squeezes a, which then counts as throttled too.
+    let mut bw = FLOOR;
+    for _ in 0..12 {
+        bw = deliver_window(&b, bw, at).recv_window;
+        at += 10 * MS;
+    }
+    assert!(
+        a.meter.pending_shrink().is_some(),
+        "premise: b asked a to shrink"
+    );
+    let later = at + nanos(GROWING_FOR) * 2;
+    assert!(a.meter.throttled_since(later).is_none(), "premise: lapsed");
+    let seen = a.meter.evaluate(later).unwrap();
+    assert!(seen.throttled, "a shrink it was asked for throttles it");
+    assert_eq!(a.meter.throttled_since(later + MS), Some(later));
+    assert!(
+        a.meter
+            .throttled_since(later + nanos(GROWING_FOR) + MS)
+            .is_none(),
+        "the throttle lapses"
+    );
+}

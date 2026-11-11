@@ -746,14 +746,11 @@ impl<T: TimeSource> BodyReader<T> {
     /// now) and true is returned. A stream already silent then keeps its
     /// idle timer (buffer-budget design M6). The age limit still applies.
     fn pause_for_throttle(&mut self, now: u64) -> bool {
-        let Some(began) = self
+        let began = self
             .meter
             .as_ref()
-            .and_then(|meter| meter.throttled_since(now))
-        else {
-            return false;
-        };
-        if self.last_progress.saturating_add(self.idle_nanos) <= began {
+            .and_then(|meter| meter.throttled_since(now));
+        if !idle_is_ours(self.last_progress, self.idle_nanos, began) {
             return false;
         }
         self.paused = true;
@@ -919,6 +916,14 @@ impl<T: TimeSource> Drop for BodyReader<T> {
             self.conn_ranges.keep(gaps, self.time.now_nanos());
         }
     }
+}
+
+/// Whether a stream that last made progress at `last_progress` and has now
+/// passed the idle timeout `idle_nanos` is idle because of our own throttle,
+/// which began at `throttle_began` if it is on: it was not already idle when
+/// the throttle began.
+fn idle_is_ours(last_progress: u64, idle_nanos: u64, throttle_began: Option<u64>) -> bool {
+    throttle_began.is_some_and(|began| last_progress.saturating_add(idle_nanos) > began)
 }
 
 /// Copy `bytes`, read at stream offset `offset`, into `out`, the buffer of a
@@ -2762,5 +2767,17 @@ mod tests {
         let limit = StreamLimit::new(None, 0, 0);
         limit.on_open(100);
         assert!(!(0..100).any(|_| limit.on_completed(false)));
+    }
+
+    #[test]
+    fn only_a_stream_active_when_the_throttle_began_has_its_idle_paused() {
+        let idle = 30;
+        // No throttle: the peer is idle.
+        assert!(!idle_is_ours(100, idle, None));
+        // Progress 10 before a throttle that began at 110: active then.
+        assert!(idle_is_ours(100, idle, Some(110)));
+        // Already silent for the whole idle period when it began.
+        assert!(!idle_is_ours(100, idle, Some(130)));
+        assert!(!idle_is_ours(100, idle, Some(200)));
     }
 }
