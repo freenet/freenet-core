@@ -2117,9 +2117,13 @@ impl Drop for Outgoing {
     /// that simply ended early.
     ///
     /// A stream dropped while it waits for its acknowledgement goes on to the
-    /// end, so its permit and its send epoch wait with it, in a small task.
-    /// There is at most one per send stream quinn still holds, and each ends
-    /// with that stream's acknowledgement or with the connection.
+    /// end, so its permit and its send epoch wait with it, in a small task:
+    /// one per cancelled send awaiting its acknowledgement. Those are at most
+    /// the streams the peer's uni-stream limit lets this side have open, plus
+    /// streams the peer has read in full whose acknowledgement is in flight.
+    /// Each task ends with its stream's acknowledgement or the connection,
+    /// and the acknowledgement watch closes a path whose peer stops
+    /// acknowledging.
     fn drop(&mut self) {
         self.reset(reset_code::SENDER_ABORTED);
         if !self.awaiting_ack {
@@ -2134,8 +2138,8 @@ impl Drop for Outgoing {
             return;
         }
         let stopped = std::mem::replace(&mut self.stopped, Box::pin(std::future::pending()));
-        // Bounded as above and ending with the connection, so the handle is
-        // not monitored.
+        // Bounded as above, and ending with the acknowledgement or the
+        // connection, so the handle is not monitored.
         drop(GlobalExecutor::spawn(async move {
             let _ended = stopped.await;
             drop(slot);

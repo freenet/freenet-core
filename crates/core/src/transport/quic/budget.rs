@@ -18,8 +18,10 @@
 //!   reader may stage for streams whose header it has not taken yet
 //!   (`path::inbound::ConnStaging`, capped at [`staging_cap`], twice the
 //!   credit). After a shrink the cap is never set below the bytes staged,
-//!   so the larger of the two is charged. Every stream is read unordered from its first byte, so quinn
-//!   holds nothing for a stream beyond the chunks its reader has not polled.
+//!   so the larger of the two is charged. A control body stays charged to
+//!   staging until its stream's end arrives. Every stream is read unordered
+//!   from its first byte, so quinn holds nothing for a stream beyond the
+//!   chunks its reader has not polled.
 //! - **W + debt.** quinn lowers a receive window by recording a shrink debt,
 //!   paid by later credits (quinn-proto 0.11.19 `streams/state.rs`,
 //!   `set_receive_window` and `add_read_credits`), so the credit the peer may
@@ -275,6 +277,9 @@ struct ConnState {
 struct Changes {
     recv: Option<u64>,
     send: Option<u64>,
+    /// A send shrink: streams opened once it is applied take a new epoch
+    /// ([`ConnState::set_send`]).
+    new_send_epoch: bool,
 }
 
 impl ConnState {
@@ -332,15 +337,18 @@ impl ConnState {
         self.staging.set_cap(staging_cap(credit));
     }
 
-    /// A shrink opens a new epoch and holds the old window for the old one.
-    /// A growth raises every held window to the new one: the send window is
-    /// the connection's, so a stream opened before a shrink may buffer up to
-    /// any window set while it is open.
+    /// A shrink holds the old window for the current epoch, and streams
+    /// opened once the shrink is applied to the connection take a new one
+    /// ([`ConnMeter::evaluate`]): until then a stream opened now may still
+    /// buffer up to the old window, so it takes the held epoch. A growth
+    /// raises every held window to the new one: the send window is the
+    /// connection's, so a stream opened before a shrink may buffer up to any
+    /// window set while it is open.
     fn set_send(&mut self, window: u64, changes: &mut Changes) {
         if window < self.send_window {
-            let old = std::mem::replace(&mut self.send_epoch, Arc::new(()));
             self.held_send
-                .push((self.send_window, Arc::downgrade(&old)));
+                .push((self.send_window, Arc::downgrade(&self.send_epoch)));
+            changes.new_send_epoch = true;
         } else {
             for (held, _) in &mut self.held_send {
                 *held = (*held).max(window);
@@ -651,6 +659,14 @@ impl QuicBudget {
         self.publish(&state);
     }
 
+    /// Streams opened from now on take a new send epoch: a shrink was applied
+    /// to the connection, and the old epoch is held at the old window.
+    fn renew_send_epoch(&self, id: u64) {
+        if let Some(conn) = self.state.lock().conns.get_mut(&id) {
+            conn.send_epoch = Arc::new(());
+        }
+    }
+
     fn send_epoch(&self, id: u64) -> Option<Arc<()>> {
         self.state
             .lock()
@@ -823,6 +839,9 @@ impl ConnMeter {
         }
         if let Some(window) = changes.send {
             self.control.set_send_window(window);
+        }
+        if changes.new_send_epoch {
+            self.budget.renew_send_epoch(self.id);
         }
         Some(result)
     }

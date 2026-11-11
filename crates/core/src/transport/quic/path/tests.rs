@@ -1105,9 +1105,9 @@ fn streams_whose_first_datagrams_are_lost_all_arrive() {
 }
 
 /// A stream stopped with gaps leaves them counted, since we cannot observe
-/// when the peer ends it. A quinn sender resets a stopped stream at once, so after
-/// the grace period (`KEPT_GAPS_GRACE`) the gaps of a stream with only a few
-/// leave the count, and an honest connection's count does not drift. Here
+/// when the peer ends it. An honest peer ends a stopped stream well within
+/// the grace period (`KEPT_GAPS_GRACE`), after which the gaps of a stream
+/// with only a few leave the count, and an honest connection's count does not drift. Here
 /// the sender's datagrams stop arriving after some were lost, so the stream
 /// is evicted idle with gaps.
 #[test]
@@ -6907,6 +6907,47 @@ fn a_waiting_one_packet_short_fits_its_charge() {
         class <= super::super::budget::WAITING_SHORT_BYTES,
         "a {largest} B body allocates {class} B"
     );
+}
+
+/// A control body whose stream's end has not arrived stays charged to the
+/// connection's staging until the end comes, so a peer that withholds the
+/// end of its control streams holds nothing outside the charge.
+#[test]
+fn a_control_body_awaiting_its_end_stays_charged() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths("quic-path-control-end", 79, QuicPathLimits::DEFAULT).await;
+        let (raw, b, time) = (p.a_raw(), p.b.clone(), p.time());
+        let body = payload(4000);
+        let streams = 6;
+        let (held, after) = p
+            .drive(async move {
+                let header = FrameHeader::control(body.len() as u64)
+                    .expect("a control header")
+                    .encode();
+                let mut sends = Vec::new();
+                for _ in 0..streams {
+                    let mut send = raw.open_uni().await.expect("open");
+                    send.write_all(&header).await.expect("header");
+                    send.write_all(&body).await.expect("body");
+                    sends.push(send);
+                }
+                time.sleep(Duration::from_secs(1)).await;
+                let held = b.inbound_staged();
+                for mut send in sends {
+                    send.finish().expect("finish");
+                }
+                time.sleep(Duration::from_secs(1)).await;
+                (held, b.inbound_staged())
+            })
+            .await;
+        assert_eq!(held, streams * 4000, "every waiting body is charged");
+        assert_eq!(after, 0, "released once each end arrives");
+        assert_eq!(
+            p.b.stats().count(QuicInboundOutcome::DeliveredControl),
+            streams as u64
+        );
+    })
 }
 
 /// The receive side reads every stream unordered: its one quinn read is

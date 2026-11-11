@@ -52,8 +52,8 @@
 //!   so they never meet the UDP side's `InboundKey::Udp` ones.
 //! - A refusal is counted by reason in the shared `InboundStreamOutcome`
 //!   counters (path and process-wide) and the stream is stopped
-//!   (STOP_SENDING, [`stop_code`]), which tells the sender and discards
-//!   whatever quinn still holds of it.
+//!   (STOP_SENDING, [`stop_code`]), which tells the sender; nothing more is
+//!   read from it.
 //! - The charge is held until all reassembly state is gone, observed through
 //!   a `Weak` (the buffer for a stream; for a short message, a token that
 //!   travels with it until the consumer takes its payload).
@@ -932,8 +932,7 @@ impl<T: TimeSource> BodyReader<T> {
     }
 
     /// Stop the stream (STOP_SENDING) with `code`. Harmless if it already
-    /// ended. quinn discards what it held for the stream and what arrives for
-    /// it later.
+    /// ended. Nothing more is read from it.
     fn stop(&mut self, code: u32) {
         self.recv.stop(code.into()).ok();
     }
@@ -1250,7 +1249,7 @@ impl Drop for Staging {
 /// data, or a test path): what a path at the floor window gets
 /// (`budget::gap_cap`). Gaps are counted per stream as received ranges past
 /// the first ([`RangeMirror::gaps`]), over open streams and the stopped ones
-/// quinn may still hold ([`ConnRanges::keep`]). A contiguous stream costs
+/// that still count ([`ConnRanges::keep`]). A contiguous stream costs
 /// nothing here: its one range is bounded by the stream limit. Each gap is
 /// charged about 70 B (`budget::GAP_BYTES`) and costs the peer at least one
 /// byte of credit. A metered path's cap
@@ -1261,9 +1260,9 @@ pub(in crate::transport::quic) const MAX_GAPS_PER_CONNECTION: usize =
     super::super::budget::MIN_GAPS_PER_CONNECTION;
 
 /// How long a stopped stream's gaps count in full before up to
-/// [`KEPT_GAPS_RELEASED`] of them leave the count. A peer running quinn resets
-/// a stream when it is stopped (STOP_SENDING), within a round trip, which
-/// frees quinn's state for it; we cannot observe that.
+/// [`KEPT_GAPS_RELEASED`] of them leave the count. An honest peer ends a
+/// stream it was asked to stop (STOP_SENDING) well within this; we cannot
+/// observe when it does.
 const KEPT_GAPS_GRACE: Duration = Duration::from_secs(30);
 
 /// Gaps of one stopped stream that leave the count after
@@ -1272,12 +1271,10 @@ const KEPT_GAPS_GRACE: Duration = Duration::from_secs(30);
 /// is over.
 const KEPT_GAPS_RELEASED: usize = 32;
 
-/// The gaps of stopped streams that quinn may still hold. After a stop quinn
-/// adds nothing to the stream's `recvd` (`Recv::ingest` skips stopped
-/// streams), so each stopped stream's gaps are frozen, and they live only as
-/// long as its slot: quinn returns a slot once the stream is finished or
-/// reset, so at most `limit` stopped streams hold state at once. So the
-/// count is the sum of the `limit` largest frozen counts, not of all of them,
+/// The gaps of stopped streams that still count. Nothing is read from a
+/// stream after its stop, so each stopped stream's gaps are frozen, and a
+/// stopped stream holds one of the peer's stream slots until it ends, so at
+/// most `limit` of them count at once. So the count is the sum of the `limit` largest frozen counts, not of all of them,
 /// and does not grow with the connection's age. After the grace period each
 /// counts [`KEPT_GAPS_RELEASED`] less. What may be held but not counted: at
 /// most `limit` x 32 gaps x ~70 B (about 143 KB at 64), plus the same again
@@ -1299,7 +1296,7 @@ pub(in crate::transport::quic) struct ConnRanges {
     /// `R_conn`: set by the connection's meter as its window changes
     /// (`budget::gap_cap`), fixed for a path without one.
     cap: AtomicUsize,
-    /// Most stopped streams quinn can hold at once: the stream limit.
+    /// Most stopped streams that count at once: the stream limit.
     limit: usize,
     /// When a stream last went past the cap, in the time source's
     /// nanoseconds plus one (0: never).
@@ -1341,8 +1338,7 @@ impl ConnRanges {
         before != 0 && now.saturating_sub(before - 1) <= nanos(STAGED_TRIP_WINDOW)
     }
 
-    /// A stream's reader ended, stopped, with `gaps` that quinn may still
-    /// hold. Its open-stream gaps leave the count, and it joins [`Frozen`].
+    /// A stream's reader ended, stopped, with `gaps` that still count. Its open-stream gaps leave the count, and it joins [`Frozen`].
     fn keep(&self, gaps: usize, now: u64) {
         self.remove(gaps);
         let mut frozen = self.frozen.lock();
@@ -2401,6 +2397,13 @@ impl<T: TimeSource> Receiver<T> {
                 return;
             }
         };
+        // The body stays charged to the connection's staging while the
+        // stream's end is awaited: a peer that withholds it would otherwise
+        // hold a body per stream outside every charge.
+        let Some(_held) = StagedHold::new(reader.staging.conn.clone(), payload.len()) else {
+            self.fail(&mut reader, ReadFailure::StagedOverCap, Charged::No);
+            return;
+        };
         if let Err(failure) = reader.expect_end().await {
             self.fail(&mut reader, failure, Charged::No);
             return;
@@ -2409,6 +2412,25 @@ impl<T: TimeSource> Receiver<T> {
             Ok(()) => self.stats.record(QuicInboundOutcome::DeliveredControl),
             Err(_) => self.stats.record(QuicInboundOutcome::ControlDroppedFull),
         }
+    }
+}
+
+/// Bytes taken out of staging that stay charged to it until dropped.
+struct StagedHold {
+    conn: Arc<ConnStaging>,
+    bytes: usize,
+}
+
+impl StagedHold {
+    /// Charge `bytes`; `None` past the cap.
+    fn new(conn: Arc<ConnStaging>, bytes: usize) -> Option<Self> {
+        conn.try_add(bytes).then_some(Self { conn, bytes })
+    }
+}
+
+impl Drop for StagedHold {
+    fn drop(&mut self) {
+        self.conn.release(self.bytes);
     }
 }
 
@@ -2768,7 +2790,7 @@ mod tests {
     }
 
     /// Only the `limit` largest frozen counts count, since at most `limit`
-    /// stopped streams hold quinn's state at once: a long-lived connection
+    /// stopped streams count at once: a long-lived connection
     /// with many stops does not drift toward the cap. Here the limit is 2.
     #[test]
     fn only_the_largest_frozen_counts_count() {
