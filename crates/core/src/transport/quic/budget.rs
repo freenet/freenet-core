@@ -25,8 +25,8 @@
 //!   and every read of a connection happens in that connection's receive task
 //!   (a shrink another connection asks for is applied there,
 //!   [`ConnState::shrink_to`]), so the mirror sees each read before or after
-//!   each change exactly as quinn did. Credits from a STOP also pay the debt
-//!   and are not seen here, so the mirror over-estimates, the safe direction.
+//!   each change exactly as quinn did. Where it can differ, it over-estimates,
+//!   the safe direction.
 //! - **S_charged.** quinn keeps data already buffered above a lowered send
 //!   window until it is acknowledged, so after a shrink the previous window
 //!   stays charged until every stream opened before the shrink has ended (an

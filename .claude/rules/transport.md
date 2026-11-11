@@ -1588,8 +1588,8 @@ changes). A shadow path keeps the initial window. A data path registers a
 70 B + 64 KiB and sets its windows at runtime
 (`quinn::Connection::set_receive_window` / `set_send_window`):
   → W + debt: quinn records a shrink as debt paid by later credits; the
-    meter mirrors it from the bytes the reader reads (credits from a STOP
-    are not seen, so it over-estimates). Every window change and every read
+    meter mirrors it from the bytes the reader reads (where it can differ,
+    it over-estimates). Every window change and every read
     of a connection happens in its receive task: a shrink another path asks
     for is applied in the shrunk path's own evaluation, after its pending
     reads are counted, and quinn is told after the budget's lock is
