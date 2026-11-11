@@ -166,6 +166,7 @@ use parking_lot::Mutex;
 use quinn::FrameStats;
 use quinn::congestion::{Controller, ControllerFactory, ControllerMetrics};
 
+use self::loss_gate::{GateVerdicts, LossGate};
 use super::QuicCloser;
 use super::config::{MAX_UDP_PAYLOAD, QuicRateLimit};
 #[cfg(doc)]
@@ -302,8 +303,13 @@ impl Default for CappedCubicFactory {
 
 impl ControllerFactory for CappedCubicFactory {
     fn build(self: Arc<Self>, now: Instant, current_mtu: u16) -> Box<dyn Controller> {
+        let cubic = self.cubic.clone().build(now, current_mtu);
+        #[cfg(test)]
+        if self.rate.without_loss_gate {
+            return Box::new(CappedCubic::new(cubic, self.rate.clone(), current_mtu));
+        }
         Box::new(CappedCubic::new(
-            self.cubic.clone().build(now, current_mtu),
+            Box::new(LossGate::new(cubic)),
             self.rate.clone(),
             current_mtu,
         ))
@@ -425,10 +431,24 @@ impl CappedCubic {
         }
     }
 
-    /// Whether the wrapped controller is a `C`.
+    /// The loss gate's verdict counts, if the wrapped controller is a gate.
+    fn gate_verdicts(&self) -> Option<Arc<GateVerdicts>> {
+        self.inner
+            .clone_box()
+            .into_any()
+            .downcast::<LossGate>()
+            .ok()
+            .map(|gate| gate.verdicts())
+    }
+
+    /// The loss gate inside, if the wrapped controller is one.
     #[cfg(test)]
-    pub(crate) fn wraps<C: Controller + 'static>(&self) -> bool {
-        self.inner.clone_box().into_any().downcast::<C>().is_ok()
+    pub(crate) fn gate(&self) -> Option<Box<LossGate>> {
+        self.inner
+            .clone_box()
+            .into_any()
+            .downcast::<LossGate>()
+            .ok()
     }
 }
 
@@ -900,6 +920,8 @@ pub(crate) async fn watch_acknowledgements<T: TimeSource>(
     }
 }
 
+pub(crate) mod loss_gate;
+
 #[cfg(test)]
 mod cap_tests;
 
@@ -933,6 +955,10 @@ pub(crate) struct PathReport {
     bytes: UdpBytes,
     loss: PathLoss,
     window: crate::transport::metrics::PathLossWindow,
+    /// The loss gate's verdict counts and those already reported; `None` when
+    /// the connection's controller has no gate.
+    gate: Option<(Arc<GateVerdicts>, [u64; loss_gate::GATE_VERDICTS])>,
+    gate_window: crate::transport::metrics::PathGateWindow,
     /// When the path's time was last reported, in the time source's
     /// nanoseconds.
     timed_at: u64,
@@ -950,11 +976,23 @@ impl PathReport {
         built_at: u64,
     ) -> Self {
         let stats = connection.stats();
+        let gate = connection
+            .congestion_state()
+            .into_any()
+            .downcast::<CappedCubic>()
+            .ok()
+            .and_then(|capped| capped.gate_verdicts())
+            .map(|verdicts| {
+                let seen = verdicts.read();
+                (verdicts, seen)
+            });
         Self {
             timed_at: built_at,
             bytes: UdpBytes::of(&stats),
             loss: PathLoss::of(&stats),
             window: crate::transport::metrics::PathLossWindow::new(node),
+            gate,
+            gate_window: crate::transport::metrics::PathGateWindow::new(node),
             connection,
             node,
             #[cfg(test)]
@@ -980,6 +1018,13 @@ impl PathReport {
         let (next, delta) = self.loss.step(PathLoss::of(&stats));
         self.node.record_path_loss(&mut self.window, delta);
         self.loss = next;
+        if let Some((verdicts, seen)) = &mut self.gate {
+            let now = verdicts.read();
+            let delta: [u64; loss_gate::GATE_VERDICTS] =
+                std::array::from_fn(|i| now[i].saturating_sub(seen[i]));
+            *seen = now;
+            self.node.record_gate(&mut self.gate_window, delta);
+        }
         #[cfg(test)]
         if self.panic_once_bucketed && self.window.is_bucketed() {
             self.panic_once_bucketed = false;

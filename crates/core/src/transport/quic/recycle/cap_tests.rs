@@ -159,7 +159,11 @@ fn cubic_does_not_grow_behind_the_cap_and_still_backs_off() {
         "a free transfer grows Cubic: {uncapped}"
     );
 
-    let (controller, cubic) = after_a_transfer(QuicRateLimit::new(Some(100_000), None));
+    // Plain Cubic: this in-memory pair has no queue, so the loss gate would
+    // ignore the loss below, and what is checked is Cubic's own response.
+    let mut rate = QuicRateLimit::new(Some(100_000), None);
+    rate.without_loss_gate = true;
+    let (controller, cubic) = after_a_transfer(rate);
     assert_eq!(cubic, initial, "Cubic stayed where it was while capped");
 
     let mut capped = controller
@@ -215,13 +219,21 @@ fn with_a_limit_the_window_is_the_lower_of_cubics_and_the_rates() {
 }
 
 /// A socket that delivers each datagram `delay` after it is sent, on
-/// `time`, and counts the bytes it sends with the virtual time.
+/// `time`, and counts the bytes it sends with the virtual time. With
+/// `drop_every` above 0 it drops every `drop_every`-th datagram after the
+/// first [`LOSSLESS_DATAGRAMS`] (so the handshake is not what is measured):
+/// random loss with no queue, deterministically.
 struct Delayed {
     inner: Arc<SimulationSocket>,
     time: VirtualTime,
     delay: Duration,
     sent: Arc<Mutex<Vec<(u64, usize, bool)>>>,
+    drop_every: u64,
+    count: AtomicU64,
 }
+
+/// Datagrams a lossy [`Delayed`] sends before it starts dropping.
+const LOSSLESS_DATAGRAMS: u64 = 20;
 
 impl Delayed {
     fn send_later(&self, buf: &[u8], target: SocketAddr) -> usize {
@@ -231,6 +243,10 @@ impl Delayed {
             .lock()
             .unwrap()
             .push((self.time.now_nanos(), buf.len(), quic));
+        let n = self.count.fetch_add(1, Ordering::Relaxed) + 1;
+        if self.drop_every > 0 && n > LOSSLESS_DATAGRAMS && n % self.drop_every == 0 {
+            return buf.len();
+        }
         // The wakeup is registered now, so datagrams keep their order.
         let wake = self.time.sleep(self.delay);
         let (inner, bytes) = (self.inner.clone(), buf.to_vec());
@@ -303,6 +319,19 @@ impl Link {
         a_cap: Option<u64>,
         one_way: Duration,
     ) -> Self {
+        Self::lossy(network, subnet, rates, a_cap, one_way, 0).await
+    }
+
+    /// [`Self::with`], each direction dropping every `drop_every`-th
+    /// datagram (see [`Delayed`]); 0 drops none.
+    async fn lossy(
+        network: &str,
+        subnet: u8,
+        rates: [QuicRateLimit; 2],
+        a_cap: Option<u64>,
+        one_way: Duration,
+        drop_every: u64,
+    ) -> Self {
         let [a_rate, b_rate] = rates;
         let a_addr: SocketAddr = format!("10.207.{subnet}.1:5000").parse().unwrap();
         let b_addr: SocketAddr = format!("10.207.{subnet}.2:5000").parse().unwrap();
@@ -321,6 +350,8 @@ impl Link {
                         time,
                         delay: one_way,
                         sent,
+                        drop_every,
+                        count: AtomicU64::new(0),
                     },
                     cap,
                 ))
@@ -882,5 +913,31 @@ fn a_limit_does_not_delay_a_control_sized_exchange() {
             finished.push((elapsed, link.time.now_nanos()));
         }
         assert_eq!(finished[0], finished[1], "with and without a limit");
+    })
+}
+
+/// A 1 MiB message over a 100 ms round trip with 5% of datagrams lost in
+/// each direction and no queue anywhere arrives within 3 s on
+/// `VirtualTime`. Every loss here is random, so the loss gate
+/// (`recycle::loss_gate`) passes none of them to Cubic and the window keeps
+/// growing. Plain Cubic cuts its window by 30% at every loss and takes about
+/// 14 s (0.75 s with the gate; measured with it removed from the factory).
+#[test]
+fn a_one_mib_message_through_five_percent_random_loss_is_not_slowed_by_it() {
+    bounded(|| async move {
+        let link = Link::lossy(
+            "quic-cap-random-loss",
+            8,
+            [QuicRateLimit::default(), QuicRateLimit::default()],
+            None,
+            Duration::from_millis(50),
+            20,
+        )
+        .await;
+        let elapsed = link.send(1024 * 1024, Duration::from_secs(600)).await;
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "{elapsed:?}: random loss slowed the transfer"
+        );
     })
 }
