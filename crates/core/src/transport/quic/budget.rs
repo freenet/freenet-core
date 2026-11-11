@@ -328,6 +328,9 @@ impl ConnState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Evaluation {
     pub(crate) limited: bool,
+    /// The budget held the connection below what it needed: a grow it
+    /// needed was refused or cut short, or another path's growth shrank it.
+    pub(crate) throttled: bool,
     pub(crate) recv_window: u64,
     pub(crate) send_window: u64,
 }
@@ -396,6 +399,8 @@ impl QuicBudget {
             evaluated_at: AtomicU64::new(now),
             interval: AtomicU64::new(nanos(MIN_EVALUATION_INTERVAL)),
             wake: tokio::sync::Notify::new(),
+            throttled_until: AtomicU64::new(0),
+            throttle_began: AtomicU64::new(0),
         }
     }
 
@@ -466,6 +471,7 @@ impl QuicBudget {
         let mut guard = self.state.lock();
         let state = &mut *guard;
         let mut changes = Changes::default();
+        let mut throttled = false;
         let limited = {
             let conn = state.conns.get_mut(&id)?;
             // Reads made before any change this evaluation makes, so they paid
@@ -478,6 +484,7 @@ impl QuicBudget {
                 if recv < conn.recv_window {
                     conn.set_recv(recv, &mut changes);
                     self.node.record_window_change(WindowChange::Shrank);
+                    throttled = true;
                 }
                 if send < conn.send_window {
                     conn.set_send(send, &mut changes);
@@ -530,6 +537,7 @@ impl QuicBudget {
             // Held back by the budget rather than by its share: others are
             // above theirs. They make room as their debt is read.
             squeeze_others = window < target && allowed < share;
+            throttled |= window < target;
         } else if conn.recv_window > self.floor
             && now.saturating_sub(conn.active_at) >= nanos(IDLE_DECAY)
         {
@@ -554,6 +562,7 @@ impl QuicBudget {
         }
         let result = Evaluation {
             limited,
+            throttled,
             recv_window: conn.recv_window,
             send_window: conn.send_window,
         };
@@ -689,6 +698,11 @@ pub(crate) struct ConnMeter {
     /// Woken by sends, so a path that only sends still has its send window
     /// evaluated ([`Self::send_progress`]).
     wake: tokio::sync::Notify,
+    /// Until when the connection counts as throttled, in nanoseconds
+    /// ([`Self::throttled_since`]).
+    throttled_until: AtomicU64,
+    /// When the current throttle began.
+    throttle_began: AtomicU64,
 }
 
 impl ConnMeter {
@@ -741,6 +755,17 @@ impl ConnMeter {
             self.control.congestion_window(),
             now,
         )?;
+        if result.throttled {
+            if self.throttled_until.load(Ordering::Relaxed) <= now {
+                self.throttle_began.store(now, Ordering::Relaxed);
+            }
+            let hold = self
+                .interval
+                .load(Ordering::Relaxed)
+                .max(nanos(GROWING_FOR));
+            self.throttled_until
+                .store(now.saturating_add(hold), Ordering::Relaxed);
+        }
         // After the budget's lock is released, in the order decided.
         if let Some(window) = changes.recv {
             self.control.set_receive_window(window);
@@ -749,6 +774,16 @@ impl ConnMeter {
             self.control.set_send_window(window);
         }
         Some(result)
+    }
+
+    /// When the budget began holding this connection below what it needs,
+    /// if it still does at `now`: an evaluation found it throttled
+    /// ([`Evaluation::throttled`]) within the last [`GROWING_FOR`] (or round
+    /// trip, if longer). Our decision, so its readers do not count the
+    /// slowdown it causes as the peer's idleness (buffer-budget design M6).
+    pub(crate) fn throttled_since(&self, now: u64) -> Option<u64> {
+        (now < self.throttled_until.load(Ordering::Relaxed))
+            .then(|| self.throttle_began.load(Ordering::Relaxed))
     }
 
     /// The epoch a stream opened now holds until it ends, which keeps a

@@ -295,6 +295,9 @@ pub(crate) struct QuicPathLimits {
     /// refuses data with [`stop_code::NOT_ACCEPTING_DATA`] right after the
     /// header, before anything is charged to the inbound budget.
     pub(crate) accept_data: bool,
+    /// The uni streams a data path's peer may open at first, raised with
+    /// load up to [`MAX_UNI_STREAMS`] (`inbound::StreamLimit`).
+    pub(crate) start_streams: u32,
     /// Where the path's counts are also kept node-wide; `None` is
     /// `TRANSPORT_METRICS`. A test passes its own, since every test in a process
     /// writes the global one.
@@ -350,6 +353,7 @@ impl QuicPathLimits {
         control_capacity: CONTROL_CHANNEL_CAPACITY,
         max_send_aborts: recycle::SEND_ABORT_LIMIT,
         accept_data: true,
+        start_streams: super::config::DATA_START_UNI_STREAMS,
         counters: None,
         #[cfg(test)]
         panic_in_receive: false,
@@ -487,6 +491,13 @@ quic_outcomes! {
         /// `inbound::STAGED_TRIP_WINDOW`, so the path was closed with
         /// OVER_BUDGET (once per path).
         ClosedStagedOverCap => "closed_staged_over_cap",
+        /// A stream reached its age limit while its idle timer was paused
+        /// because the buffer budget was throttling the connection
+        /// (`budget::ConnMeter::throttled_since`); stopped
+        /// (`stop_code::EVICTED`), and not counted as an idle or age eviction.
+        ThrottledPastAge => "throttled_past_age",
+        /// The peer's stream limit doubled with load (`inbound::StreamLimit`).
+        StreamLimitRaised => "stream_limit_raised",
     }
 }
 
@@ -912,12 +923,17 @@ impl QuicPath {
             receiver.panic_on_stream = limits.panic_in_receive;
             receiver.set_gap_cap(limits.max_gaps);
         }
-        // A path that reads data lets the peer open every stream the path's
-        // limits allow (the endpoint starts each connection at
-        // `config::INITIAL_UNI_STREAMS`), less one per one-packet Short
-        // waiting for room (`inbound::StreamLimit`).
+        // A path that reads data lets the peer open
+        // `config::DATA_START_UNI_STREAMS` streams (the endpoint starts each
+        // connection at `config::INITIAL_UNI_STREAMS`), raised with load up
+        // to `MAX_UNI_STREAMS`, less one per one-packet Short waiting for room
+        // (`inbound::StreamLimit`).
         if limits.accept_data {
-            receiver.set_stream_limit(connection.inner().clone(), MAX_UNI_STREAMS);
+            receiver.set_stream_limit(
+                connection.inner().clone(),
+                limits.start_streams,
+                MAX_UNI_STREAMS,
+            );
         }
         // A path that reads data takes a share of the node's buffer budget,
         // which sets its windows from here on; a shadow path keeps the

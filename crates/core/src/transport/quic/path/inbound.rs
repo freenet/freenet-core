@@ -99,9 +99,10 @@
 //! its deadline passes (one per ended stream; the timer is not replaced on
 //! progress, only when it fires).
 //!
-//! Streams with no budget charge (in the header phase, and control frames)
-//! get an age limit too ([`uncharged_age_limit`]), so a peer cannot hold
-//! one of its `MAX_UNI_STREAMS` stream slots by trickling bytes.
+//! Streams with no budget charge get an age limit too, so a peer cannot hold
+//! one of its stream slots by trickling bytes: [`HEADER_PHASE_AGE`] until
+//! the header is read, then [`uncharged_age_limit`] (control frames, and
+//! Shorts of one packet).
 //!
 //! Stream id lifetime: a `Stream` id is held on the path from admission
 //! until all of its state is gone (the reader is done and every handle
@@ -231,15 +232,33 @@ impl<T: TimeSource> Receiver<T> {
         self.staging.clone()
     }
 
-    /// Let the peer of `connection` open `limit` uni streams, less one for
-    /// each one-packet Short waiting for room. Before any stream is read.
+    /// Let the peer of `connection` open `start` uni streams, raised with
+    /// load up to `max`, less one for each one-packet Short waiting for room
+    /// ([`StreamLimit`]). Before any stream is read.
     pub(in crate::transport::quic) fn set_stream_limit(
         &mut self,
         connection: quinn::Connection,
-        limit: u32,
+        start: u32,
+        max: u32,
     ) {
-        self.stream_limit = StreamLimit::new(Some(connection), limit);
-        self.stream_limit.apply(0);
+        let set = move |limit: u32| {
+            connection.set_max_concurrent_uni_streams(quinn::VarInt::from_u32(limit));
+        };
+        self.stream_limit = StreamLimit::new(Some(Box::new(set)), start, max);
+        self.stream_limit.apply();
+    }
+
+    fn throttled(&self) -> bool {
+        self.meter
+            .as_ref()
+            .is_some_and(|meter| meter.throttled_since(self.time.now_nanos()).is_some())
+    }
+
+    /// A data stream delivered all it declared.
+    fn completed(&self) {
+        if self.stream_limit.on_completed(self.throttled()) {
+            self.stats.record(QuicInboundOutcome::StreamLimitRaised);
+        }
     }
 
     /// Tell `meter` of every read from now on. Before any stream is read.
@@ -287,7 +306,7 @@ impl<T: TimeSource> Receiver<T> {
             )),
             meter: None,
             staging: Arc::new(ConnStaging::new(staging_cap, node)),
-            stream_limit: StreamLimit::new(None, 0),
+            stream_limit: StreamLimit::new(None, 0, 0),
             #[cfg(test)]
             panic_on_stream: false,
         }
@@ -298,52 +317,115 @@ impl<T: TimeSource> Receiver<T> {
 /// closes: long enough for the stops it sent to reach the sender first.
 pub(in crate::transport::quic) const REFUSAL_CLOSE_DELAY: Duration = Duration::from_secs(2);
 
-/// The uni streams the peer may open, lowered by one for each one-packet
-/// Short that waits for room in a full channel.
+/// The uni streams the peer may open: a base that starts low and rises with
+/// load, lowered by one for each one-packet Short that waits for room in a
+/// full channel.
 ///
-/// A waiting reader reads on, and reading the stream's end frees quinn's
-/// slot for it, which would let the peer open another stream at once. A
-/// one-packet Short is not charged (its sender may already read it as
-/// `Sent`, so refusing it could lose it), so without this nothing would
-/// bound how many wait. Lowering the limit holds back new stream credit
+/// **Waiting Shorts.** A waiting reader reads on, and reading the stream's
+/// end frees quinn's slot for it, which would let the peer open another
+/// stream at once. A one-packet Short is not charged (its sender may already
+/// read it as `Sent`, so refusing it could lose it), so without this nothing
+/// would bound how many wait. Lowering the limit holds back new stream credit
 /// instead (quinn grants none while the streams it counts reach the limit),
-/// so at most `limit` such Shorts wait, each one packet, and the sender's
-/// further messages find no stream and go on UDP. Charged messages are
-/// bounded by their charge and need none of this.
+/// so at most the limit of such Shorts wait, each one packet, and the
+/// sender's further messages find no stream and go on UDP. Charged messages
+/// are bounded by their charge and need none of this.
+///
+/// **The base.** A data path starts at [`DATA_START_UNI_STREAMS`]. It
+/// doubles, up to [`MAX_UNI_STREAMS`], once the peer has had every stream it
+/// may open in use at once and then as many streams again have completed,
+/// with none failing in between (idle, age, gaps or staging past their caps,
+/// a length mismatch, a budget refusal) and the budget not throttling the
+/// connection when the last of them completed. A raise is never taken back:
+/// quinn cannot take stream credit back, and lowering on load would churn.
 ///
 /// Changed only from the path's receive task, where every reader runs, so
-/// the limits quinn is told arrive in the order the count moved.
+/// the limits quinn is told arrive in the order the counts moved.
+///
+/// [`DATA_START_UNI_STREAMS`]: super::super::config::DATA_START_UNI_STREAMS
+/// [`MAX_UNI_STREAMS`]: super::super::config::MAX_UNI_STREAMS
 struct StreamLimit {
-    connection: Option<quinn::Connection>,
-    limit: u32,
+    /// Tells quinn the limit; `None` on a path that reads no data.
+    set: Option<Box<dyn Fn(u32) + Send + Sync>>,
+    base: AtomicU32,
+    max: u32,
     waiting: AtomicU32,
+    /// Every stream the peer may open was in use at once since the base was
+    /// last set or a stream last failed.
+    saturated: AtomicBool,
+    /// Streams completed since then.
+    completed: AtomicU32,
 }
 
 impl StreamLimit {
-    fn new(connection: Option<quinn::Connection>, limit: u32) -> Self {
+    fn new(set: Option<Box<dyn Fn(u32) + Send + Sync>>, base: u32, max: u32) -> Self {
         Self {
-            connection,
-            limit,
+            set,
+            base: AtomicU32::new(base),
+            max,
             waiting: AtomicU32::new(0),
+            saturated: AtomicBool::new(false),
+            completed: AtomicU32::new(0),
         }
     }
 
-    fn apply(&self, waiting: u32) {
-        if let Some(connection) = &self.connection {
-            connection.set_max_concurrent_uni_streams(quinn::VarInt::from_u32(
-                self.limit.saturating_sub(waiting),
-            ));
+    fn apply(&self) {
+        if let Some(set) = &self.set {
+            let base = self.base.load(Ordering::Relaxed);
+            let waiting = self.waiting.load(Ordering::Relaxed);
+            set(base.saturating_sub(waiting));
         }
     }
 
     /// One more Short waits, until the guard is dropped.
     fn hold(&self) -> StreamLimitHold<'_> {
-        let waiting = self
-            .waiting
+        self.waiting.fetch_add(1, Ordering::Relaxed);
+        self.apply();
+        StreamLimitHold(self)
+    }
+
+    /// `open` streams are being read now.
+    fn on_open(&self, open: usize) {
+        if open >= self.base.load(Ordering::Relaxed) as usize {
+            self.saturated.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// A stream delivered all it declared; `throttled` if the budget is
+    /// holding the connection back now. True if the base was raised.
+    fn on_completed(&self, throttled: bool) -> bool {
+        if self.set.is_none() || !self.saturated.load(Ordering::Relaxed) {
+            return false;
+        }
+        let completed = self
+            .completed
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1);
-        self.apply(waiting);
-        StreamLimitHold(self)
+        let base = self.base.load(Ordering::Relaxed);
+        if completed < base || throttled || base >= self.max {
+            return false;
+        }
+        self.base
+            .store(base.saturating_mul(2).min(self.max), Ordering::Relaxed);
+        self.restart();
+        self.apply();
+        true
+    }
+
+    /// A stream failed: a pending raise needs a fresh run of load.
+    fn on_failed(&self) {
+        self.restart();
+    }
+
+    fn restart(&self) {
+        self.saturated.store(false, Ordering::Relaxed);
+        self.completed.store(0, Ordering::Relaxed);
+    }
+
+    /// The base now. Tests only.
+    #[cfg(test)]
+    fn base(&self) -> u32 {
+        self.base.load(Ordering::Relaxed)
     }
 }
 
@@ -351,12 +433,8 @@ struct StreamLimitHold<'a>(&'a StreamLimit);
 
 impl Drop for StreamLimitHold<'_> {
     fn drop(&mut self) {
-        let waiting = self
-            .0
-            .waiting
-            .fetch_sub(1, Ordering::Relaxed)
-            .saturating_sub(1);
-        self.0.apply(waiting);
+        self.0.waiting.fetch_sub(1, Ordering::Relaxed);
+        self.0.apply();
     }
 }
 
@@ -390,6 +468,7 @@ pub(in crate::transport::quic) async fn receive<T: TimeSource>(
             accepted = &mut accept => match accepted {
                 Ok(recv) => {
                     readers.push(read_one(recv, receiver.clone()));
+                    receiver.stream_limit.on_open(readers.len());
                     receiver.stats.node().record_streams_open(
                         &mut peak,
                         u32::try_from(readers.len()).unwrap_or(u32::MAX),
@@ -434,6 +513,9 @@ enum ReadFailure {
     /// Staging the bytes just read would have taken the connection's staged
     /// bytes past their cap ([`ConnStaging`]).
     StagedOverCap,
+    /// The age limit came while the idle timer was paused for our own
+    /// throttle ([`BodyReader::read_piece`]).
+    ThrottledPastAge,
     Other,
 }
 
@@ -496,11 +578,15 @@ struct BodyReader<T: TimeSource> {
     meter: Option<Arc<ConnMeter>>,
     /// Bytes read but not yet taken ([`Self::read_exact`]).
     staging: Staging,
+    /// The idle timer was paused for the connection's throttle since the
+    /// stream last made progress.
+    paused: bool,
 }
 
 impl<T: TimeSource> BodyReader<T> {
     /// A reader with the idle timeout and an age limit of
-    /// [`uncharged_age_limit`]; admission replaces the age limit with the
+    /// [`header_phase_age_limit`] until the header is read
+    /// ([`uncharged_age_limit`] after it); admission replaces the age limit with the
     /// stream's own ([`Self::set_age_limit`]).
     fn new(
         recv: quinn::RecvStream,
@@ -512,7 +598,7 @@ impl<T: TimeSource> BodyReader<T> {
     ) -> Self {
         let now = time.now_nanos();
         let idle_nanos = nanos(idle);
-        let age_deadline = now.saturating_add(nanos(uncharged_age_limit()));
+        let age_deadline = now.saturating_add(nanos(header_phase_age_limit()));
         let timer_at = now.saturating_add(idle_nanos).min(age_deadline);
         let timer = time.sleep_until(timer_at);
         Self {
@@ -530,6 +616,7 @@ impl<T: TimeSource> BodyReader<T> {
             conn_ranges,
             meter,
             staging: Staging::new(conn_staging),
+            paused: false,
         }
     }
 
@@ -576,6 +663,7 @@ impl<T: TimeSource> BodyReader<T> {
             Ok(Some(chunk)) => {
                 let now = self.time.now_nanos();
                 self.last_progress = now;
+                self.paused = false;
                 let start = chunk.offset;
                 let stop = start.saturating_add(chunk.bytes.len() as u64);
                 if self.end.is_some_and(|end| stop > end) {
@@ -633,16 +721,44 @@ impl<T: TimeSource> BodyReader<T> {
                     let now = self.time.now_nanos();
                     // Idle first, as the UDP sweep does.
                     if now >= self.last_progress.saturating_add(self.idle_nanos) {
-                        return Err(ReadFailure::Idle);
+                        if !self.pause_for_throttle(now) {
+                            return Err(ReadFailure::Idle);
+                        }
                     }
                     if now >= self.age_deadline {
-                        return Err(ReadFailure::Age);
+                        return Err(if self.paused {
+                            ReadFailure::ThrottledPastAge
+                        } else {
+                            ReadFailure::Age
+                        });
                     }
                     self.timer_at = self.deadline();
                     self.timer = self.time.sleep_until(self.timer_at);
                 }
             }
         }
+    }
+
+    /// The idle timeout passed at `now`. If the budget is throttling the
+    /// connection and this stream was not already idle when the throttle
+    /// began (it made progress in the idle period before it), the slowdown
+    /// is ours, not the peer's: the idle timer is paused (restarted from
+    /// now) and true is returned. A stream already silent then keeps its
+    /// idle timer (buffer-budget design M6). The age limit still applies.
+    fn pause_for_throttle(&mut self, now: u64) -> bool {
+        let Some(began) = self
+            .meter
+            .as_ref()
+            .and_then(|meter| meter.throttled_since(now))
+        else {
+            return false;
+        };
+        if self.last_progress.saturating_add(self.idle_nanos) <= began {
+            return false;
+        }
+        self.paused = true;
+        self.last_progress = now;
+        true
     }
 
     /// Start the age limit, from now. The armed timer is kept when it
@@ -1387,6 +1503,17 @@ fn uncharged_age_limit() -> Duration {
     inbound_stream_age_limit(0)
 }
 
+/// How long a stream may take to deliver its header. An honest header is
+/// the stream's first 18 bytes, sent in its first packet, so a stream with
+/// none after this long holds a stream slot (and what it staged) for
+/// nothing. At least the idle timeout, so a simulation's longer idle
+/// threshold is not cut short.
+pub(in crate::transport::quic) const HEADER_PHASE_AGE: Duration = Duration::from_secs(30);
+
+fn header_phase_age_limit() -> Duration {
+    HEADER_PHASE_AGE.max(streaming_handle_idle_timeout())
+}
+
 /// Numbered fragments.
 type Fragments = Vec<(u32, Bytes)>;
 
@@ -1558,6 +1685,9 @@ async fn read_one<T: TimeSource>(recv: quinn::RecvStream, receiver: Arc<Receiver
                 receiver.fail(&mut reader, failure, Charged::No);
                 return;
             }
+            // Past the header phase: the uncharged age limit, until
+            // admission sets the stream's own.
+            reader.set_age_limit(uncharged_age_limit());
             header
         }
         Err(error) => {
@@ -1620,6 +1750,11 @@ impl<T: TimeSource> Receiver<T> {
     /// something.
     fn fail(&self, reader: &mut BodyReader<T>, failure: ReadFailure, charged: Charged) {
         let stats = &self.stats;
+        // Anything but the peer resetting the stream or the connection ending
+        // holds back a raise of the stream limit until a fresh run of load.
+        if !matches!(failure, ReadFailure::Reset | ReadFailure::ConnectionLost) {
+            self.stream_limit.on_failed();
+        }
         match failure {
             ReadFailure::Truncated(_) => stats.record(QuicInboundOutcome::Truncated),
             ReadFailure::Overlong => {
@@ -1638,6 +1773,12 @@ impl<T: TimeSource> Receiver<T> {
                     Charged::Yes => stats.record_shared(InboundStreamOutcome::EvictedAge),
                     Charged::No => stats.record(QuicInboundOutcome::AgedUncharged),
                 }
+                reader.stop(stop_code::EVICTED);
+            }
+            ReadFailure::ThrottledPastAge => {
+                // Not the peer's fault: counted apart from `EvictedIdle` and
+                // `EvictedAge`, so a budget that throttles too hard shows.
+                stats.record(QuicInboundOutcome::ThrottledPastAge);
                 reader.stop(stop_code::EVICTED);
             }
             ReadFailure::TooManyRanges => {
@@ -1695,6 +1836,7 @@ impl<T: TimeSource> Receiver<T> {
         };
         self.stats.record_shared(outcome);
         self.stats.record(kind);
+        self.stream_limit.on_failed();
         tracing::debug!(?rejection, total, "QUIC path: refusing an inbound stream");
         reader.stop(stop_code::BUDGET_REFUSED);
     }
@@ -1842,6 +1984,7 @@ impl<T: TimeSource> Receiver<T> {
             _charge: charge,
         });
         self.stats.record(QuicInboundOutcome::DeliveredShort);
+        self.completed();
     }
 
     async fn read_stream(&self, mut reader: BodyReader<T>, header: FrameHeader) {
@@ -2033,6 +2176,7 @@ impl<T: TimeSource> Receiver<T> {
         debug_assert_eq!(guard.handle().received_bytes(), total);
         guard.complete = true;
         self.stats.record(QuicInboundOutcome::CompletedStream);
+        self.completed();
     }
 
     /// Feed one payload piece to `rechunker` and push the fragments it
@@ -2555,5 +2699,68 @@ mod tests {
             "quinn-proto {} predates MAX_CHUNKS",
             versions[0]
         );
+    }
+
+    fn limit(base: u32, max: u32) -> (StreamLimit, Arc<parking_lot::Mutex<Vec<u32>>>) {
+        let told = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let seen = told.clone();
+        let set = move |limit: u32| seen.lock().push(limit);
+        (StreamLimit::new(Some(Box::new(set)), base, max), told)
+    }
+
+    /// Saturate, then complete `count` streams.
+    fn run(limit: &StreamLimit, count: u32, throttled: bool) -> bool {
+        limit.on_open(limit.base() as usize);
+        (0..count).fold(false, |raised, _| limit.on_completed(throttled) || raised)
+    }
+
+    #[test]
+    fn the_stream_limit_doubles_after_saturation_and_as_many_completions() {
+        let (limit, told) = limit(16, 64);
+        // Completions without every stream in use at once do not count.
+        assert!(!(0..40).any(|_| limit.on_completed(false)));
+        limit.on_open(15);
+        assert!(!(0..40).any(|_| limit.on_completed(false)));
+        assert!(!run(&limit, 15, false), "15 completions are one short");
+        assert!(limit.on_completed(false));
+        assert_eq!(limit.base(), 32);
+        assert!(run(&limit, 32, false));
+        assert_eq!(limit.base(), 64);
+        assert!(!run(&limit, 200, false), "never past the max");
+        assert_eq!(*told.lock(), vec![32, 64]);
+    }
+
+    #[test]
+    fn a_failure_or_a_throttle_holds_back_a_raise() {
+        let (limit, _) = limit(16, 64);
+        assert!(!run(&limit, 10, false));
+        limit.on_failed();
+        assert!(
+            !(0..20).any(|_| limit.on_completed(false)),
+            "load starts over"
+        );
+        assert!(!run(&limit, 16, true), "not while throttled");
+        assert!(limit.on_completed(false), "once the throttle is gone");
+        assert_eq!(limit.base(), 32);
+    }
+
+    #[test]
+    fn waiting_shorts_lower_the_limit_below_the_base() {
+        let (limit, told) = limit(16, 64);
+        {
+            let _a = limit.hold();
+            let _b = limit.hold();
+            assert_eq!(told.lock().last(), Some(&14));
+            assert!(run(&limit, 16, false));
+            assert_eq!(told.lock().last(), Some(&30), "a raise keeps the waiters");
+        }
+        assert_eq!(told.lock().last(), Some(&32));
+    }
+
+    #[test]
+    fn a_path_without_data_never_raises() {
+        let limit = StreamLimit::new(None, 0, 0);
+        limit.on_open(100);
+        assert!(!(0..100).any(|_| limit.on_completed(false)));
     }
 }

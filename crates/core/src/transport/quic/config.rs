@@ -115,10 +115,17 @@ pub(crate) const MAX_UNI_STREAMS: u32 = 64;
 
 /// The uni streams every connection's peer may open until the path takes
 /// data: enough for the upgrade's control frames (`Ready`, `ReadyAck`). A
-/// path that accepts data raises it to [`MAX_UNI_STREAMS`] when it is built
-/// (`QuicPath::with_budget`). quinn applies a raise at once and cannot take a
+/// path that accepts data raises it to [`DATA_START_UNI_STREAMS`] when it is
+/// built (`QuicPath::with_budget`), and with load toward [`MAX_UNI_STREAMS`]. quinn applies a raise at once and cannot take a
 /// grant back, so a connection starts with what a shadow path needs.
 pub(crate) const INITIAL_UNI_STREAMS: u32 = 4;
+
+/// The uni streams a data path's peer may open at first. The limit doubles
+/// toward [`MAX_UNI_STREAMS`] once the peer has used every stream at once and
+/// as many again have completed with none failing and the buffer budget not
+/// throttling the connection (`path::inbound::StreamLimit`): the stream limit
+/// is the one term per connection a raise cannot take back, so it is earned.
+pub(crate) const DATA_START_UNI_STREAMS: u32 = 16;
 
 /// The connection receive window every connection starts with, until a data
 /// path's buffer-budget meter raises it to the floor (`budget`). Small for the
