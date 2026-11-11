@@ -993,7 +993,6 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
     pipe_chunks(
         inbound_handle.total_bytes(),
         inbound_handle.chunks(),
-        inbound_handle.fragment_gap_limit(),
         outbound_stream_id,
         last_packet_id,
         socket,
@@ -1015,7 +1014,6 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
 async fn pipe_chunks<S, T, C>(
     total_bytes: u64,
     chunks: C,
-    inactivity_timeout: Duration,
     outbound_stream_id: StreamId,
     last_packet_id: Arc<AtomicU32>,
     socket: Arc<S>,
@@ -1078,11 +1076,11 @@ where
     let mut fragment_number = 1u32;
     let mut pending_metadata = metadata;
 
-    // `inactivity_timeout`: if no fragment arrives from the inbound stream
-    // within it, the pipe fails rather than hanging indefinitely. It is the
-    // source's own gap limit (`IncomingStream::fragment_gap_limit`), the one
-    // `assemble()` applies: 5 s for a UDP-fed stream, the QUIC reader's idle
-    // limit for a QUIC-fed one.
+    // Inactivity timeout for piped streams. If no fragment arrives from the
+    // inbound buffer within this duration, the pipe fails rather than hanging
+    // indefinitely. This matches STREAM_INACTIVITY_TIMEOUT used by assemble().
+    use super::streaming::STREAM_INACTIVITY_TIMEOUT;
+    let inactivity_timeout = STREAM_INACTIVITY_TIMEOUT;
 
     loop {
         // Use tokio::select! with time_source.sleep() for DST compatibility.
@@ -1794,7 +1792,6 @@ mod tests {
         let task = GlobalExecutor::spawn(super::pipe_chunks(
             total,
             chunks,
-            super::super::streaming::STREAM_INACTIVITY_TIMEOUT,
             StreamId::next(),
             Arc::new(AtomicU32::new(0)),
             Arc::new(TestSocket::new(outbound_sender)),
@@ -3313,14 +3310,14 @@ mod tests {
         Ok(())
     }
 
-    /// A relay piping a QUIC-fed inbound stream onward waits on its source
-    /// with the source's own gap limit, not the UDP 5 s: a 6 s gap between
-    /// two fragments (quinn's retransmit backoff at a high RTT with loss)
-    /// does not fail the pipe, where the same gap on a UDP-fed source does
-    /// (`pipe_stream_inactivity_stall_fails_stream_not_connection`).
+    /// A relay piping a QUIC-fed inbound stream onward over UDP keeps the UDP
+    /// 5 s source gap, however long the source path's own gap is: the UDP
+    /// receiver downstream gives up after 5 s, so waiting longer would only
+    /// keep sending to a peer that has gone. A 6 s gap fails the pipe even
+    /// though the source path's gap (16 x 800 ms) would allow it.
     #[tokio::test(start_paused = true)]
-    async fn pipe_stream_waits_out_a_quic_fed_source_gap_past_five_seconds() {
-        use crate::transport::peer_connection::streaming::StreamHandle;
+    async fn a_udp_pipe_keeps_five_seconds_for_a_quic_fed_source() {
+        use crate::transport::peer_connection::streaming::{PathRtt, QuicSourcePath, StreamHandle};
         use crate::transport::peer_connection::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
 
         let (outbound_sender, mut outbound_receiver) = mpsc::channel(1000);
@@ -3328,6 +3325,14 @@ mod tests {
         let remote_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080);
         let total = FRAGMENT_PAYLOAD_SIZE * 2;
         let source = StreamHandle::new_quic(StreamId::next(), total as u64);
+        source
+            .quic_source()
+            .expect("QUIC-fed")
+            .set_path(QuicSourcePath {
+                rtt: Arc::new(PathRtt::new(Duration::from_millis(800))),
+                idle: Duration::from_secs(30),
+            });
+        assert!(source.fragment_gap_limit() > Duration::from_secs(6));
         let pipe_task = GlobalExecutor::spawn(pipe_stream(
             source.fork().into(),
             StreamId::next(),
@@ -3349,11 +3354,10 @@ mod tests {
         source
             .push_fragment(2, Bytes::from(vec![2u8; FRAGMENT_PAYLOAD_SIZE]))
             .unwrap();
-        let stats = pipe_task
+        pipe_task
             .await
             .expect("join error")
-            .expect("a 6 s gap on a QUIC-fed source is not a stall");
-        assert_eq!(stats.bytes_transferred, total as u64);
+            .expect_err("a 6 s gap fails a UDP pipe whatever its source");
         drain.abort();
     }
 
@@ -3752,7 +3756,6 @@ mod egress_cap_tests {
                 GlobalExecutor::spawn(pipe_chunks(
                     len as u64,
                     futures::stream::iter(chunks),
-                    super::super::streaming::STREAM_INACTIVITY_TIMEOUT,
                     StreamId::next(),
                     Arc::new(AtomicU32::new(0)),
                     socket.clone(),

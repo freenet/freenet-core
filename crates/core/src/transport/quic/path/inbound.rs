@@ -121,7 +121,7 @@ use crate::transport::peer_connection::inbound_budget::{
     SharedInboundBudget,
 };
 use crate::transport::peer_connection::streaming::{
-    QuicSource, QuicSourceEnd, StreamError, StreamHandle,
+    PathRtt, QuicSource, QuicSourceEnd, QuicSourcePath, StreamError, StreamHandle,
 };
 use crate::transport::peer_connection::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
 use crate::transport::peer_connection::{
@@ -197,6 +197,10 @@ pub(in crate::transport::quic) struct Receiver<T> {
     closer: super::super::QuicCloser,
     /// The connection's gaps over all its streams.
     ranges: Arc<ConnRanges>,
+    /// The connection's round trip, for the consumers of the streams it
+    /// fills (`StreamHandle::fragment_gap_limit`): set at each stream
+    /// admitted and at each tick of the path's acknowledgement watch.
+    rtt: Arc<PathRtt>,
     /// Panic on the next short message, to test the supervisor.
     #[cfg(test)]
     pub(in crate::transport::quic) panic_on_stream: bool,
@@ -207,6 +211,12 @@ impl<T: TimeSource> Receiver<T> {
     #[cfg(test)]
     pub(in crate::transport::quic) fn ranges(&self) -> Arc<ConnRanges> {
         self.ranges.clone()
+    }
+
+    /// The connection's round trip as the receiver keeps it, for the path's
+    /// acknowledgement watch to keep current.
+    pub(in crate::transport::quic) fn path_rtt(&self) -> Arc<PathRtt> {
+        self.rtt.clone()
     }
 
     /// Replace the gap cap, before any stream is read. Tests only.
@@ -237,6 +247,7 @@ impl<T: TimeSource> Receiver<T> {
             controls,
             next_short_key: AtomicU32::new(1),
             accept_data,
+            rtt: Arc::new(PathRtt::new(closer.rtt())),
             closer,
             ranges: Arc::new(ConnRanges::new(
                 MAX_GAPS_PER_CONNECTION,
@@ -1487,6 +1498,14 @@ impl<T: TimeSource> Receiver<T> {
         };
         reader.set_age_limit(inbound_stream_age_limit(total));
         reader.source = guard.handle().quic_source().cloned();
+        if let Some(source) = &reader.source {
+            // The round trip as of this stream; the watch keeps it current.
+            self.rtt.set(self.closer.rtt());
+            source.set_path(QuicSourcePath {
+                rtt: self.rtt.clone(),
+                idle: Duration::from_nanos(reader.idle_nanos),
+            });
+        }
         let metadata = match header.metadata_len() {
             0 => None,
             len => match reader.read_exact(len as usize).await {

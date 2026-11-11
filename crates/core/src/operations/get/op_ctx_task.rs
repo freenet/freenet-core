@@ -2195,7 +2195,7 @@ async fn claim_noting_progress<T>(claim: impl std::future::Future<Output = T>) -
 /// starts and whenever `received_fragments` has grown since the last
 /// check (once a second), with the stream's own stall window
 /// (`fragment_gap`, `StreamHandle::fragment_gap_limit`: 5 s on the UDP
-/// transport, the reader's idle limit on a QUIC path) plus the check
+/// transport, the source path's gap on a QUIC path) plus the check
 /// spacing, and with the tail window when assembly succeeds. The
 /// shutdown drain then keeps waiting for a client GET whose body is
 /// streaming in, and stops soon after the stream stalls. A no-op on the

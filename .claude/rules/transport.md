@@ -1931,12 +1931,26 @@ Sending (QuicPath::send_short_bounded / send_stream_bounded /
   12 s by
   a_path_dark_mid_send_fails_within_two_windows_and_goes_suspect). Nothing
   while the send waits for its own source (the connection is not what holds
-  it; a stalled source is bounded by the send's own gap, as pipe_stream's 5 s
-  upstream inactivity bounds it on UDP; the receiver's QUIC reader idles at
-  30 s in production. A SeqCst flag handshake wakes the loop to re-arm when
-  that drops an extended deadline, once: a timer already armed at the own gap
-  is not re-armed), and nothing without a CappedCubic
-  controller. Control sends have no gap. A receiver reads every announced
+  it; a stalled source is bounded by the send's source gap,
+  SendDeadlines::source_gap, which a QUIC pipe sets from the source's
+  fragment_gap_limit: 5 s for a UDP-fed source, the source path's gap for a
+  QUIC-fed one, below. Two SeqCst flag handshakes wake the loop to re-arm:
+  when a source wait starts and drops an extended deadline (once: a timer
+  already armed at the own gap is not re-armed), and when a source wait ends
+  while the timer is armed at a source gap longer than the own gap, so a
+  write that stalls after a slow chunk is caught at the own gap), and nothing
+  without a CappedCubic controller.
+  QUIC-fed streams (streaming::StreamHandle::new_quic, QuicSource): the
+  reader sets the stream's path (its PathRtt, kept current at each stream
+  admitted and each ack-watch tick, and its own idle limit) and records why
+  it stopped (QuicSourceEnd: Idle, Age, Ended), which wakes every clone and
+  fork. Consumers wait quic_fragment_gap between pieces:
+  QUIC_GAP_RTT_MULTIPLE (16) round trips, at least 5 s, at most the reader's
+  idle limit (30 s in production); 5 s before the reader set the path.
+  assemble() applies it as its timer and also ends at once on a recorded end;
+  chunks() yields the end as an Err. A pipe whose sink is UDP (pipe_stream,
+  and a QUIC pipe's fallback to UDP) keeps 5 s whatever its source, because
+  its UDP receiver gives up at 5 s. Control sends have no gap. A receiver reads every announced
   stream to its end whatever its consumer does (push_fragment does not wait);
   its one wait is announcing a stream into a full channel, bounded by
   inbound_stream_age_limit(len), the sender's total, so the two give up

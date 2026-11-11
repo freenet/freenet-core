@@ -858,6 +858,7 @@ pub(crate) async fn watch_acknowledgements<T: TimeSource>(
     time: T,
     cap_holds: Arc<CapHolds>,
     heard: Arc<PeerHeard>,
+    rtt: Arc<crate::transport::peer_connection::streaming::PathRtt>,
     report: &mut PathReport,
 ) {
     let Some(first) = AckSample::of(&connection, &cap_holds) else {
@@ -872,6 +873,7 @@ pub(crate) async fn watch_acknowledgements<T: TimeSource>(
     let mut watch = AckWatch::new(ACK_WATCH_WINDOW, first);
     loop {
         time.sleep(ACK_WATCH_TICK).await;
+        rtt.set(connection.rtt());
         // Read before the counts, so a closed connection's counts are its
         // final ones.
         let closed = connection.close_reason().is_some();
@@ -906,6 +908,9 @@ mod cap_tests;
 /// What a path's receive supervisor keeps for its acknowledgement watch.
 pub(crate) struct AckWatchParts {
     pub(crate) cap_holds: Arc<CapHolds>,
+    /// The connection's round trip for the consumers of its streams, set at
+    /// each tick (`streaming::PathRtt`).
+    pub(crate) rtt: Arc<crate::transport::peer_connection::streaming::PathRtt>,
     pub(crate) heard: Arc<PeerHeard>,
     pub(crate) report: PathReport,
 }

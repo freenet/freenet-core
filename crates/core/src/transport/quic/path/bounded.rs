@@ -64,10 +64,10 @@ pub(crate) struct SendDeadlines {
     pub(crate) gap: Option<Duration>,
     /// The longest wait for the send's own source, in place of `gap`, for a
     /// send that pipes a stream ([`SendProgress::waiting_on_source`]). `None`:
-    /// `gap`. A stream a QUIC path fills keeps arriving past 5 s gaps (quinn
-    /// retransmits on its own backoff), and its reader ends it on the path's
-    /// rules, so a pipe from it waits for the source's own limit
-    /// ([`IncomingStream::fragment_gap_limit`]). At least `open`, as `gap` is.
+    /// `gap`. A stream a QUIC path fills can arrive with gaps past 5 s on a
+    /// slow lossy path (quinn retransmits on its own backoff), so a pipe from
+    /// it waits for the source's own gap ([`IncomingStream::fragment_gap_limit`],
+    /// from the source path's round trip). At least `open`, as `gap` is.
     ///
     /// [`IncomingStream::fragment_gap_limit`]: crate::transport::IncomingStream::fragment_gap_limit
     pub(crate) source_gap: Option<Duration>,
@@ -217,7 +217,12 @@ struct ProgressState {
     /// The armed timer is past the send's own gap because of the connection's
     /// progress, so a wait for the source would bring the deadline earlier.
     extended: AtomicBool,
-    /// Told when a wait for the source starts while `extended`.
+    /// The armed timer is at the source gap ([`SendDeadlines::source_gap`]),
+    /// longer than the send's own gap, so the end of the source wait would
+    /// bring the deadline earlier.
+    armed_on_source: AtomicBool,
+    /// Told when a wait for the source starts while `extended`, or ends while
+    /// `armed_on_source`: the loop re-arms its timer.
     source_wait: tokio::sync::Notify,
     /// Timers armed by [`bounded_send`]. Tests only.
     #[cfg(test)]
@@ -240,6 +245,7 @@ impl SendProgress {
             last_step: AtomicU64::new(0),
             on_source: AtomicBool::new(false),
             extended: AtomicBool::new(false),
+            armed_on_source: AtomicBool::new(false),
             source_wait: tokio::sync::Notify::new(),
             #[cfg(test)]
             arms: AtomicU64::new(0),
@@ -256,6 +262,7 @@ impl SendProgress {
             last_step: AtomicU64::new(time.now_nanos()),
             on_source: AtomicBool::new(false),
             extended: AtomicBool::new(false),
+            armed_on_source: AtomicBool::new(false),
             source_wait: tokio::sync::Notify::new(),
             #[cfg(test)]
             arms: AtomicU64::new(0),
@@ -314,14 +321,24 @@ impl SendProgress {
     /// The connection's progress does not extend the gap meanwhile: it is not
     /// what holds the send ([`ConnectionWatch`]).
     ///
-    /// With [`bounded_send`]'s loop this is a store-then-load handshake on two
-    /// flags, both `SeqCst`: this side stores `on_source` then reads
-    /// `extended`, the loop stores `extended` then reads `on_source`, so at
-    /// least one sees the other's store, and either the loop arms its timer
-    /// for the send's own gap or this wakes it to re-arm.
+    /// With [`bounded_send`]'s loop this is a store-then-load handshake on
+    /// two pairs of flags, all `SeqCst`. A wait starting: this side stores
+    /// `on_source` then reads `extended`, the loop stores `extended` then
+    /// reads `on_source`. A wait ending: this side stores `on_source` then
+    /// reads `armed_on_source`, the loop stores `armed_on_source` then reads
+    /// `on_source`. Either way at least one sees the other's store, so either
+    /// the loop arms its timer for the deadline that now applies or this wakes
+    /// it to re-arm. Without the second, a timer armed at a long source gap
+    /// stays armed after the chunk arrives, and a write that then stalls is
+    /// noticed only at the source gap.
     pub(super) fn waiting_on_source(&self, waiting: bool) {
         self.0.on_source.store(waiting, Ordering::SeqCst);
-        if waiting && self.0.extended.load(Ordering::SeqCst) {
+        let rearm = if waiting {
+            self.0.extended.load(Ordering::SeqCst)
+        } else {
+            self.0.armed_on_source.load(Ordering::SeqCst)
+        };
+        if rearm {
             self.0.source_wait.notify_one();
         }
     }
@@ -346,21 +363,38 @@ impl SendProgress {
     /// `connection_until` (0 for none), unless the send waits for its source,
     /// and never after `total`.
     fn deadline(&self, deadlines: &SendDeadlines, started: u64, connection_until: u64) -> u64 {
+        self.deadline_and_source(deadlines, started, connection_until)
+            .0
+    }
+
+    /// [`Self::deadline`], and whether it is the source gap, longer than
+    /// the send's own gap: the end of the source wait would bring it earlier.
+    fn deadline_and_source(
+        &self,
+        deadlines: &SendDeadlines,
+        started: u64,
+        connection_until: u64,
+    ) -> (u64, bool) {
         let total = started.saturating_add(nanos(deadlines.total));
         match self.stage() {
-            STAGE_OPENING => started.saturating_add(nanos(deadlines.open)).min(total),
+            STAGE_OPENING => (
+                started.saturating_add(nanos(deadlines.open)).min(total),
+                false,
+            ),
             STAGE_OPENED => {
                 let on_source = self.0.on_source.load(Ordering::SeqCst);
-                deadlines.gap_for(on_source).map_or(total, |gap| {
+                let deadline = deadlines.gap_for(on_source).map_or(total, |gap| {
                     self.0
                         .last_step
                         .load(Ordering::Acquire)
                         .saturating_add(nanos(gap))
                         .max(if on_source { 0 } else { connection_until })
                         .min(total)
-                })
+                });
+                let longer = on_source && deadlines.gap_for(true) > deadlines.gap_for(false);
+                (deadline, longer)
             }
-            _ => total,
+            _ => (total, false),
         }
     }
 
@@ -526,8 +560,9 @@ pub(crate) struct QuietProof {
 /// its own source ([`SendProgress::waiting_on_source`]): the connection is not
 /// what holds it then, and a source that stalls is bounded by the send's own
 /// source gap ([`SendDeadlines::source_gap`]): 5 s for a UDP-fed source, as
-/// pipe_stream bounds one, and the reader's idle limit
-/// (`streaming_handle_idle_timeout`, 30 s in production) for a QUIC-fed one.
+/// pipe_stream bounds one, and the source path's gap for a QUIC-fed one
+/// (`streaming::quic_fragment_gap`: 16 round trips, at least 5 s, at most the
+/// reader's idle limit).
 ///
 /// The connection is read only at the timer's wakes, so a move is dated to
 /// the wake that saw it, which can come up to one window after it. A send
@@ -708,12 +743,19 @@ where
         // the send's own gap (the send is waiting for its source) has
         // nothing a source wait could bring earlier, so later source waits
         // do not wake the loop to re-arm the same deadline.
+        // `armed_on_source` before any read of `on_source`, and cleared only
+        // if the deadline armed did not use the source gap (see
+        // `waiting_on_source`).
+        progress.0.armed_on_source.store(true, Ordering::SeqCst);
         let own = progress.deadline(&deadlines, started, 0);
         let window = until(&watch);
         progress.0.extended.store(window > own, Ordering::SeqCst);
-        let deadline = progress.deadline(&deadlines, started, window);
+        let (deadline, on_source_gap) = progress.deadline_and_source(&deadlines, started, window);
         if deadline <= own {
             progress.0.extended.store(false, Ordering::SeqCst);
+        }
+        if !on_source_gap {
+            progress.0.armed_on_source.store(false, Ordering::SeqCst);
         }
         #[cfg(test)]
         progress.0.arms.fetch_add(1, Ordering::Relaxed);
