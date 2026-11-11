@@ -4,6 +4,8 @@ use std::process::Command;
 // Unit-tested from the library via a `#[cfg(test)]` module in `src/lib.rs`.
 #[path = "build/git_watch.rs"]
 mod git_watch;
+#[path = "build/version_floor.rs"]
+mod version_floor;
 
 fn main() {
     // Emit build metadata for startup logging
@@ -66,35 +68,30 @@ fn emit_min_compatible_version() {
         v.parse()
             .unwrap_or_else(|_| panic!("{name} component {v:?} is not numeric"))
     };
-    let pkg = (
-        num("CARGO_PKG_VERSION", pkg_parts[0]),
-        num("CARGO_PKG_VERSION", pkg_parts[1]),
-        num("CARGO_PKG_VERSION", pkg_parts[2]),
-    );
-    let min = (
-        num("FREENET_MIN_COMPATIBLE_VERSION", min_parts[0]),
-        num("FREENET_MIN_COMPATIBLE_VERSION", min_parts[1]),
-        num("FREENET_MIN_COMPATIBLE_VERSION", min_parts[2]),
-    );
+    let narrow = |name: &str, parts: &[&str]| -> (u8, u8, u16) {
+        let conv = |v: &str, max: u64| {
+            let n = num(name, v);
+            if n > max {
+                panic!("{name} component {v} is out of range for the wire format");
+            }
+            n
+        };
+        (
+            conv(parts[0], 255) as u8,
+            conv(parts[1], 255) as u8,
+            conv(parts[2], 65535) as u16,
+        )
+    };
+    let pkg = narrow("CARGO_PKG_VERSION", &pkg_parts);
+    let min = narrow("FREENET_MIN_COMPATIBLE_VERSION", &min_parts);
 
-    // Must not exceed the package version (would reject all peers including ourselves).
-    // Compared numerically as a tuple, not lexicographically ("0.1.9" > "0.1.152" as strings).
-    if min > pkg {
+    // Floor must not exceed the version (would reject all peers including
+    // ourselves) and must be encodable on the wire: same series (format 1) or
+    // a representable earlier series (format 2, see version_cmp.rs).
+    if let Err(why) = version_floor::check_floor(pkg, min) {
         panic!(
-            "FREENET_MIN_COMPATIBLE_VERSION ({min_compat}) must be <= package version \
-             ({pkg_version}). A min_compatible higher than our own version would \
-             reject all peers."
-        );
-    }
-
-    // A floor in the same major.minor series uses wire format 1. A floor in a
-    // different series uses wire format 2 (version_cmp.rs), which can only
-    // express a major at most one below ours, minor < 64 and patch < 256.
-    if (pkg.0, pkg.1) != (min.0, min.1) && (pkg.0 - min.0 > 1 || min.1 > 63 || min.2 > 255) {
-        panic!(
-            "FREENET_MIN_COMPATIBLE_VERSION ({min_compat}) is in a different series from \
-             package version ({pkg_version}) and cannot be encoded on the wire: the floor \
-             major may be at most one below ours, with minor < 64 and patch < 256."
+            "FREENET_MIN_COMPATIBLE_VERSION ({min_compat}) is not valid for package version \
+             ({pkg_version}): {why}."
         );
     }
 

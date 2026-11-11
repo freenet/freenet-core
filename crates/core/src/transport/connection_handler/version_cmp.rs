@@ -1,5 +1,10 @@
 use crate::config::{MIN_COMPATIBLE_VERSION, PCK_VERSION};
 
+// Shared with build.rs so the build-time check and the encoder cannot drift.
+#[path = "../../../build/version_floor.rs"]
+mod version_floor;
+use version_floor::check_floor;
+
 /// New-format marker byte. Old peers see major=0xFF (!=their major) → clean reject.
 const NEW_FORMAT_MARKER: u8 = 0xFF;
 /// Format version byte in position 7. Old peers see reserved!=0 → clean reject.
@@ -16,14 +21,18 @@ const FORMAT_VERSION: u8 = 1;
 /// Releases before this one parse bytes 5-6 as `min_patch` in the SENDER's
 /// series (format byte is not inspected). The `0x8000` bit makes that value at
 /// least 32768, above any real patch, so they see "remote requires a newer
-/// version than ours": a clean handshake reject plus the urgent-update path,
+/// version than ours" (whenever the sender's major.minor is at least theirs, which
+/// is always the case for a real successor release): a clean handshake reject
+/// plus the urgent-update path,
 /// never a misparse as compatible.
 const FORMAT_CROSS_SERIES: u8 = 2;
 const CROSS_FLAG: u16 = 0x8000;
 
 /// Our version in the new 8-byte wire format.
 ///
-/// Layout: `[0xFF, major, minor, patch_hi, patch_lo, min_patch_hi, min_patch_lo, format=1]`
+/// Layout: `[0xFF, major, minor, patch_hi, patch_lo, min_patch_hi, min_patch_lo, format]`
+/// with format=1 when the floor shares the version's major.minor, or format=2
+/// (see `FORMAT_CROSS_SERIES`) when it does not.
 ///
 /// Old peers (0.1.152 and earlier) used: `[major, minor, patch_u8, flags(4), reserved=0]`
 /// They see byte[0]=0xFF as major mismatch → clean ack_error. No crypto confusion.
@@ -56,11 +65,8 @@ const fn encode_new_format(version: &str, min_compatible: &str) -> [u8; 8] {
 const fn encode_wire(version: (u8, u8, u16), floor: (u8, u8, u16)) -> [u8; 8] {
     let (major, minor, patch) = version;
     let (f_major, f_minor, f_patch) = floor;
-    if f_major > major
-        || (f_major == major && f_minor > minor)
-        || (f_major == major && f_minor == minor && f_patch > patch)
-    {
-        panic!("min_compatible must not exceed the version");
+    if let Err(why) = check_floor(version, floor) {
+        panic!("{}", why);
     }
     if f_major == major && f_minor == minor {
         return [
@@ -75,9 +81,6 @@ const fn encode_wire(version: (u8, u8, u16), floor: (u8, u8, u16)) -> [u8; 8] {
         ];
     }
     let major_back = major - f_major;
-    if major_back > 1 || f_minor > 63 || f_patch > 255 {
-        panic!("cross-series min_compatible not representable in wire format 2");
-    }
     let packed: u16 = CROSS_FLAG | ((major_back as u16) << 14) | ((f_minor as u16) << 8) | f_patch;
     [
         NEW_FORMAT_MARKER,
@@ -94,14 +97,18 @@ const fn encode_wire(version: (u8, u8, u16), floor: (u8, u8, u16)) -> [u8; 8] {
 /// `version` in the new 8-byte format, with this binary's min_compatible,
 /// for a simulated node that advertises an older version (see
 /// `UdpTransportConfig::advertised_version_override`).
-pub(super) fn encode_version((major, minor, patch): (u8, u8, u16)) -> [u8; 8] {
-    if PROTOC_VERSION[7] == FORMAT_CROSS_SERIES {
-        let floor = parse_version_bytes(&PROTOC_VERSION)
+pub(super) fn encode_version(version: (u8, u8, u16)) -> [u8; 8] {
+    encode_version_from(PROTOC_VERSION, version)
+}
+
+fn encode_version_from(base: [u8; 8], (major, minor, patch): (u8, u8, u16)) -> [u8; 8] {
+    if base[7] == FORMAT_CROSS_SERIES {
+        let floor = parse_version_bytes(&base)
             .min_compatible
             .expect("format 2 always carries a floor");
         return encode_wire((major, minor, patch), floor);
     }
-    let mut bytes = PROTOC_VERSION;
+    let mut bytes = base;
     bytes[1] = major;
     bytes[2] = minor;
     bytes[3..5].copy_from_slice(&patch.to_be_bytes());
@@ -564,7 +571,7 @@ mod tests {
     /// Format 1 inherits major.minor from the version; a floor in another
     /// series switches to format 2.
     #[test]
-    fn test_min_compatible_shares_major_minor_with_version() {
+    fn test_min_compatible_format_follows_series() {
         // min_compatible always gets the same major.minor as the version
         let v = encode_new_format("0.1.200", "0.1.150");
         let info = parse_version_bytes(&v);
@@ -794,21 +801,64 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
+    #[should_panic(expected = "must not exceed")]
     fn floor_above_version_is_rejected() {
         let _ = encode_wire((1, 0, 0), (1, 0, 1));
     }
 
     #[test]
-    #[should_panic]
+    #[should_panic(expected = "at most one below")]
     fn floor_two_majors_back_is_rejected() {
         let _ = encode_wire((2, 0, 0), (0, 2, 1));
     }
 
     #[test]
-    #[should_panic]
+    #[should_panic(expected = "patch < 256")]
     fn unrepresentable_floor_patch_is_rejected() {
         let _ = encode_wire((1, 0, 0), (0, 2, 256));
+    }
+
+    #[test]
+    #[should_panic(expected = "minor < 64")]
+    fn unrepresentable_floor_minor_is_rejected() {
+        let _ = encode_wire((1, 0, 0), (0, 64, 1));
+    }
+
+    /// The build-time check and the encoder share `check_floor`; pin its boundary.
+    #[test]
+    fn check_floor_boundaries() {
+        assert!(check_floor((1, 0, 0), (0, 63, 255)).is_ok());
+        assert!(check_floor((1, 0, 0), (0, 64, 0)).is_err());
+        assert!(check_floor((1, 0, 0), (0, 0, 256)).is_err());
+        assert!(check_floor((2, 0, 0), (0, 2, 1)).is_err());
+        assert!(check_floor((1, 0, 0), (1, 0, 1)).is_err());
+        assert!(check_floor((0, 2, 158), (0, 2, 122)).is_ok());
+        // Same series has no minor/patch limits beyond <= version.
+        assert!(check_floor((0, 200, 60000), (0, 200, 59999)).is_ok());
+    }
+
+    /// A future format byte (3+) with the high bit set is read as format 1:
+    /// a floor above any real patch, so today's binaries reject it as
+    /// "requires newer" rather than accept it.
+    #[test]
+    fn unknown_future_format_reads_as_requires_newer() {
+        let local = encode_wire((0, 2, 158), (0, 2, 122));
+        let b = [0xFF, 1, 0, 0, 0, 0xC2, 0x9E, 3];
+        assert!(is_compatible(&local, &b).is_err());
+        assert!(remote_requires_newer_than_us(&local, &b));
+    }
+
+    /// `encode_version` keeps the floor when the base bytes are format 2, and
+    /// rejects an override below the floor instead of emitting a bad floor.
+    #[test]
+    fn encode_version_preserves_cross_series_floor() {
+        let base = encode_wire((1, 0, 0), (0, 2, 158));
+        let b = encode_version_from(base, (0, 2, 160));
+        assert_eq!(parse_version_bytes(&b).version, (0, 2, 160));
+        assert_eq!(parse_version_bytes(&b).min_compatible, Some((0, 2, 158)));
+        let at = encode_version_from(base, (0, 2, 158));
+        assert_eq!(parse_version_bytes(&at).min_compatible, Some((0, 2, 158)));
+        assert!(std::panic::catch_unwind(|| encode_version_from(base, (0, 2, 157))).is_err());
     }
 
     /// Legacy format 1 and bridge format 2 interoperate in every direction
@@ -828,8 +878,10 @@ mod tests {
         // 1.0.0 refuses a pre-bridge node (its version < floor), cleanly.
         assert!(is_compatible(&one_oh, &pre_bridge).is_err());
         assert!(!remote_requires_newer_than_us(&one_oh, &pre_bridge));
-        // A 1.0.0 with a lenient floor would accept the pre-bridge node.
-        assert!(is_compatible(&one_oh_lenient, &pre_bridge).is_ok());
+        // A real pre-bridge binary rejects even a 1.0.0 with a lenient floor:
+        // format 2 always reads as a floor it cannot meet.
+        assert!(!frozen_legacy::is_compatible(&pre_bridge, &one_oh_lenient));
+        assert!(frozen_legacy::requires_newer(&pre_bridge, &one_oh_lenient));
         // Pre-bridge and bridge still connect as before.
         assert!(is_compatible(&pre_bridge, &bridge).is_ok());
         assert!(is_compatible(&bridge, &pre_bridge).is_ok());
@@ -910,8 +962,17 @@ mod tests {
             ("bridge-0.2.160", encode_wire((0, 2, 160), (0, 2, 122))),
             ("one-oh", encode_wire((1, 0, 0), (0, 2, 158))),
         ];
+        // Pre-bridge nodes decide with the FROZEN legacy functions, everyone
+        // else with production. A handshake succeeds only if both sides accept.
+        let accepts = |name: &str, local: &[u8; 8], remote: &[u8; 8]| {
+            if name.starts_with("pre") {
+                frozen_legacy::is_compatible(local, remote)
+            } else {
+                is_compatible(local, remote).is_ok()
+            }
+        };
         let connects =
-            |a: &[u8; 8], b: &[u8; 8]| is_compatible(a, b).is_ok() && is_compatible(b, a).is_ok();
+            |an: &str, a: &[u8; 8], bn: &str, b: &[u8; 8]| accepts(an, a, b) && accepts(bn, b, a);
         for (an, a) in &nodes {
             for (bn, b) in &nodes {
                 let a_pre = an.starts_with("pre");
@@ -919,7 +980,7 @@ mod tests {
                 let a_one = an.starts_with("one");
                 let b_one = bn.starts_with("one");
                 let expect = !((a_pre && b_one) || (b_pre && a_one));
-                assert_eq!(connects(a, b), expect, "{an} <-> {bn}");
+                assert_eq!(connects(an, a, bn, b), expect, "{an} <-> {bn}");
                 // Neither a bridge nor a 1.0.0 node is asked to update by the other.
                 if !a_pre && !b_pre {
                     assert!(
