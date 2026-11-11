@@ -345,12 +345,6 @@ impl StreamLimit {
         self.apply(waiting);
         StreamLimitHold(self)
     }
-
-    /// Shorts waiting now. Tests only.
-    #[cfg(test)]
-    fn waiting(&self) -> u32 {
-        self.waiting.load(Ordering::Relaxed)
-    }
 }
 
 struct StreamLimitHold<'a>(&'a StreamLimit);
