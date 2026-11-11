@@ -47,6 +47,14 @@ and it works perfectly on a loopback socket, which is where a same-host reverse
 proxy talks to the node. That is also the only arrangement in which hosted
 mode's per-user tokens are honoured at all.
 
+A reverse proxy must pass the browser's `Host` header through unchanged
+(Caddy does by default; nginx needs `proxy_set_header Host $http_host;`,
+Apache `ProxyPreserveHost On`). Behind a proxy, a browser's WebSocket is
+accepted only when its `Origin` matches the `Host` the node sees, so a proxy
+that rewrites `Host` to `127.0.0.1:7509` gets every browser connection
+refused. The node also refuses to serve web app and dashboard pages for a
+`Host` it does not recognise.
+
 ## Keep the flag in the invocation
 
 A node persists its resolved configuration to `config.toml` on every boot. That

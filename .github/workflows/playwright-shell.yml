@@ -29,6 +29,10 @@ on:
     branches: [main]
     paths:
       - 'crates/core/src/server/**'
+      # The WebSocket upgrade's Origin/Host gate and the Host allowlist it
+      # reads live outside server/; websocket-origin.spec.ts exercises both.
+      - 'crates/core/src/server.rs'
+      - 'crates/core/src/client_events/websocket.rs'
       - 'crates/core/tests/playwright/**'
       - 'crates/core/tests/playwright_shell.rs'
       # fdev is the publish path the harness shells out to; a regression in
@@ -38,6 +42,10 @@ on:
   pull_request:
     paths:
       - 'crates/core/src/server/**'
+      # The WebSocket upgrade's Origin/Host gate and the Host allowlist it
+      # reads live outside server/; websocket-origin.spec.ts exercises both.
+      - 'crates/core/src/server.rs'
+      - 'crates/core/src/client_events/websocket.rs'
       - 'crates/core/tests/playwright/**'
       - 'crates/core/tests/playwright_shell.rs'
       - 'crates/fdev/**'

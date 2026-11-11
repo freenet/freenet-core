@@ -531,6 +531,9 @@ operator's job. The proxy fronting a hosted node MUST:
   default, so an explicit `proxy_set_header` that overwrites the value is
   the mechanism that also stops pass-through — make sure no `http`/server
   block leaks the client value through.
+- **Any proxy** must pass the browser's `Host` through unchanged (Caddy does by
+  default; nginx needs `proxy_set_header Host $http_host;`). See
+  [client-api-exposure.md](client-api-exposure.md).
 
 ### Security note (known limitation)
 
