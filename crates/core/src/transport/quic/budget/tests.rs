@@ -308,10 +308,12 @@ fn the_floor_and_the_gap_cap_follow_the_design() {
     assert_eq!(floor_window_bytes(2 << 30), MIN_WINDOW_BYTES);
     assert_eq!(gap_cap(MIN_WINDOW_BYTES), MIN_GAPS_PER_CONNECTION);
     assert_eq!(gap_cap(MAX_WINDOW_BYTES), 8192);
-    // The design's floor grants with the receive side at 3 x the credit:
-    // 609.5 KiB at 2 GiB and up, 345.5 KiB below.
-    assert_eq!(floor_grant(MIN_WINDOW_BYTES), 624_128);
-    assert_eq!(floor_grant(MIN_WINDOW_SMALL_HOST_BYTES), 353_792);
+    // The design's floor grants with the receive side at 3 x the credit and
+    // the waiting one-packet Shorts charged: 689.5 KiB at 2 GiB and up,
+    // 425.5 KiB below.
+    assert_eq!(CONTROL_BUFFER_BYTES, 147_456);
+    assert_eq!(floor_grant(MIN_WINDOW_BYTES), 706_048);
+    assert_eq!(floor_grant(MIN_WINDOW_SMALL_HOST_BYTES), 435_712);
     assert_eq!(receive_charge(MIN_WINDOW_BYTES), 3 * MIN_WINDOW_BYTES);
     assert_eq!(staging_cap(MIN_WINDOW_BYTES), 2 * MIN_WINDOW_BYTES as usize);
 }
@@ -540,5 +542,95 @@ fn a_held_back_path_is_throttled_until_it_is_not() {
             .throttled_since(later + nanos(GROWING_FOR) + MS)
             .is_none(),
         "the throttle lapses"
+    );
+}
+
+/// A shrink whose debt is then read lowers the staging cap, but never below
+/// what is staged, and the charge covers the cap as set: staged bytes are
+/// never over the cap or uncharged.
+#[test]
+fn the_staging_cap_never_falls_below_what_is_staged() {
+    let total = 12 << 20;
+    let budget = QuicBudget::new(total, FLOOR, counters());
+    let big = conn(&budget, 0);
+    let mut at = 10 * MS;
+    let mut window = FLOOR;
+    for _ in 0..8 {
+        window = deliver_window(&big, window, at).recv_window;
+        at += 10 * MS;
+    }
+    assert!(window > 4 * FLOOR, "premise: it grew, to {window}");
+    let staged = big.staging.cap() * 9 / 10;
+    assert!(big.staging.add_for_test(staged), "premise: room to stage");
+    // Another path's growth shrinks it; its debt is then read.
+    let newcomer = conn(&budget, at);
+    deliver_window(&newcomer, FLOOR, at + 10 * MS);
+    big.meter.evaluate(at + 11 * MS).unwrap();
+    let debt = big.meter.debt();
+    assert!(debt > 0, "premise: it shrank");
+    big.meter.on_read(debt, 0, at + 19 * MS);
+    big.meter.evaluate(at + 30 * MS).unwrap();
+    let credit = big.fake.last_recv().unwrap();
+    assert!(
+        staging_cap(credit) < staged,
+        "premise: the credit alone would put the cap below what is staged"
+    );
+    assert!(
+        big.staging.cap() >= staged,
+        "the cap is floored at what is staged"
+    );
+    assert!(
+        big.meter.charge() >= credit + staged as u64,
+        "the staged bytes are charged"
+    );
+}
+
+/// A squeeze asks the paths above the share to shrink largest first, and
+/// only as many as cover what is needed: with three paths above the share
+/// and a need one of them covers, only the largest is asked; with a need
+/// none covers alone, more are.
+#[test]
+fn a_squeeze_asks_the_largest_first_and_only_as_many_as_needed() {
+    let budget = QuicBudget::new(64 << 20, FLOOR, counters());
+    let paths: Vec<Conn> = (0..3).map(|_| conn(&budget, 0)).collect();
+    let mut at = 10 * MS;
+    let mut windows = [FLOOR; 3];
+    // Grow them to different sizes: 3, 4 and 5 doublings.
+    for round in 0..6 {
+        for (i, path) in paths.iter().enumerate() {
+            if round < i + 3 {
+                windows[i] = deliver_window(path, windows[i], at).recv_window;
+            }
+        }
+        at += 10 * MS;
+    }
+    let charges: Vec<u64> = paths.iter().map(|p| p.meter.charge()).collect();
+    assert!(
+        charges[2] > charges[1] && charges[1] > charges[0],
+        "premise: three sizes: {charges:?}"
+    );
+    let share = floor_grant(FLOOR);
+    let asked = |need: u64, at: u64| {
+        for path in &paths {
+            budget
+                .state
+                .lock()
+                .conns
+                .get_mut(&path.meter.id)
+                .unwrap()
+                .shrink_to = None;
+        }
+        budget.squeeze_others(&mut budget.state.lock(), u64::MAX, share, need, at);
+        paths
+            .iter()
+            .map(|p| p.meter.pending_shrink().is_some())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(asked(1, at), vec![false, false, true], "the largest alone");
+    let both = charges[2] - share + 1;
+    assert_eq!(
+        asked(both, at + 20 * MS),
+        vec![false, true, true],
+        "the two largest"
     );
 }

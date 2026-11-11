@@ -25,8 +25,8 @@
 //!   and every read of a connection happens in that connection's receive task
 //!   (a shrink another connection asks for is applied there,
 //!   [`ConnState::shrink_to`]), so the mirror sees each read before or after
-//!   each change exactly as quinn did. Credits from a STOP also pay the debt
-//!   and are not seen here, so the mirror over-estimates, the safe direction.
+//!   each change exactly as quinn did. Where it can differ, it over-estimates,
+//!   the safe direction.
 //! - **S_charged.** quinn keeps data already buffered above a lowered send
 //!   window until it is acknowledged, so after a shrink the previous window
 //!   stays charged until every stream opened before the shrink has ended (an
@@ -103,8 +103,17 @@ pub(crate) const GAP_BYTES: u64 = 70;
 /// The fewest gaps a connection may hold, whatever its window.
 pub(crate) const MIN_GAPS_PER_CONNECTION: usize = 256;
 
-/// The control channel and the reader's short buffers, per data path.
-pub(crate) const CONTROL_BUFFER_BYTES: u64 = 64 * 1024;
+/// The control channel and the reader's short buffers, per data path: the
+/// control channel's 16 frames of at most 4 KiB, and one buffer of a
+/// one-packet Short (allocated at 1280 B, its size class) for each Short that
+/// may wait for room with the peer's stream limit lowered for it
+/// (`path::inbound::StreamLimit`, at most `MAX_UNI_STREAMS`). Shorts queued
+/// in the session's delivery channel are the session's, as on UDP.
+pub(crate) const CONTROL_BUFFER_BYTES: u64 =
+    16 * 4096 + super::config::MAX_UNI_STREAMS as u64 * WAITING_SHORT_BYTES;
+
+/// One waiting one-packet Short's body, at its allocator size class.
+pub(crate) const WAITING_SHORT_BYTES: u64 = 1280;
 
 /// A connection's staged bytes may reach this many times its credit
 /// (provisional: the hostile-sender harness measures honest stops under loss,
@@ -224,6 +233,8 @@ struct BudgetState {
     /// [`MIN_EVALUATION_INTERVAL`] node-wide, since counting the connections
     /// growing takes a pass over all of them.
     share: Option<(u64, u64)>,
+    /// When other connections were last asked to shrink.
+    squeezed_at: Option<u64>,
 }
 
 struct ConnState {
@@ -285,7 +296,12 @@ impl ConnState {
     fn charge_with(&mut self, recv_window: u64, send_window: u64) -> u64 {
         let credit = recv_window.saturating_add(self.debt);
         let send = self.send_charged_with(send_window);
-        receive_charge(credit)
+        // The staging cap is floored at the bytes staged when it was last set
+        // (`ConnStaging::set_cap`), so it may sit above `staging_cap(credit)`
+        // after a shrink: the larger is charged.
+        let staging = (staging_cap(credit) as u64).max(self.staging.cap() as u64);
+        credit
+            .saturating_add(staging)
             .saturating_add(send_charge(send))
             .saturating_add(self.fixed_with(credit))
     }
@@ -521,7 +537,7 @@ impl QuicBudget {
         let conn = state.conns.get_mut(&id)?;
         let others = state.charged.saturating_sub(conn.charged);
         let allowed = share.min(self.total.saturating_sub(others));
-        let mut squeeze_others = false;
+        let mut squeeze_need = 0;
         if grows {
             let target = conn.recv_window.saturating_mul(2).min(MAX_WINDOW_BYTES);
             let send = conn.send_window;
@@ -536,7 +552,12 @@ impl QuicBudget {
             }
             // Held back by the budget rather than by its share: others are
             // above theirs. They make room as their debt is read.
-            squeeze_others = window < target && allowed < share;
+            if window < target && allowed < share {
+                squeeze_need = conn
+                    .charge_with(target, send)
+                    .min(share)
+                    .saturating_sub(allowed);
+            }
             throttled |= window < target;
         } else if conn.recv_window > self.floor
             && now.saturating_sub(conn.active_at) >= nanos(IDLE_DECAY)
@@ -567,17 +588,26 @@ impl QuicBudget {
             send_window: conn.send_window,
         };
         Self::recount(&mut state.charged, conn);
-        if squeeze_others {
-            self.squeeze_others(state, id, share);
+        if squeeze_need > 0 {
+            self.squeeze_others(state, id, share, squeeze_need, now);
         }
         self.publish(state);
         Some((result, changes))
     }
 
     /// Ask the connections whose charge is above `share` to shrink toward it,
-    /// largest first, until the node's charge after their debts are read fits
-    /// the budget. Each applies the shrink in its own next evaluation.
-    fn squeeze_others(&self, state: &mut BudgetState, id: u64, share: u64) {
+    /// largest first, until what they give up covers `need` bytes. Each
+    /// applies the shrink in its own next evaluation, and the room comes as
+    /// its debt is read. At most once per [`MIN_EVALUATION_INTERVAL`]
+    /// node-wide, since it passes over every path.
+    fn squeeze_others(&self, state: &mut BudgetState, id: u64, share: u64, need: u64, now: u64) {
+        if state
+            .squeezed_at
+            .is_some_and(|at| now.saturating_sub(at) < nanos(MIN_EVALUATION_INTERVAL))
+        {
+            return;
+        }
+        state.squeezed_at = Some(now);
         let mut over: Vec<(u64, u64)> = state
             .conns
             .iter()
@@ -585,9 +615,19 @@ impl QuicBudget {
             .map(|(other, conn)| (*other, conn.charged))
             .collect();
         over.sort_unstable_by_key(|(_, charge)| std::cmp::Reverse(*charge));
-        for (other, _) in over {
+        let mut freed = 0u64;
+        for (other, charged) in over {
+            if freed >= need {
+                break;
+            }
             if let Some(conn) = state.conns.get_mut(&other) {
-                conn.shrink_to = shrink_target(conn, share, self.floor);
+                // A shrink already asked of it counts too.
+                if conn.shrink_to.is_none() {
+                    conn.shrink_to = shrink_target(conn, share, self.floor);
+                }
+                if conn.shrink_to.is_some() {
+                    freed = freed.saturating_add(charged.saturating_sub(share));
+                }
             }
         }
     }

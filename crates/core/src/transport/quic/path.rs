@@ -485,7 +485,8 @@ quic_outcomes! {
         /// stream that went past it was stopped (`stop_code::EVICTED`).
         TooManyRanges => "too_many_ranges",
         /// The connection went past its gap cap a
-        /// second time, so the path was closed with OVER_BUDGET (once per path):
+        /// second time within `inbound::STAGED_TRIP_WINDOW`, so the path was
+        /// closed with OVER_BUDGET (once per path):
         /// the gaps of streams it stopped stay counted for the connection's
         /// life, because quinn keeps them until the peer ends the stream.
         ClosedTooManyRanges => "closed_too_many_ranges",
@@ -1094,16 +1095,23 @@ impl QuicPath {
         self.budget.lock().stream_count()
     }
 
-    /// The receive side's staging cap now. Tests only.
-    #[cfg(test)]
     /// The path's buffer-budget meter, if it reads data under a budget.
     #[cfg(test)]
     pub(in crate::transport) fn meter(&self) -> Option<&Arc<super::budget::ConnMeter>> {
         self.meter.as_ref()
     }
 
+    /// The receive side's staging cap now. Tests only.
+    #[cfg(test)]
     pub(in crate::transport) fn inbound_staging_cap(&self) -> usize {
         self.inbound_staging.cap()
+    }
+
+    /// The most the receive side staged at once, per mille of its cap.
+    /// Tests only.
+    #[cfg(test)]
+    pub(in crate::transport) fn inbound_staged_peak_permille(&self) -> usize {
+        self.inbound_staging.peak_permille()
     }
 
     /// Gaps the receive side counts now. Tests only.

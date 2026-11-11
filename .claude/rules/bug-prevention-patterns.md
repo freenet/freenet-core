@@ -898,8 +898,9 @@ path's windows are set from one node-wide budget (`quic::budget`,
 what does not scale with the windows is a fixed charge per connection
 (`quic::config::QUIC_CONNECTION_CHARGE_BYTES`). Both are in `NOT_SUMMED`
 until the buffer budget's aggregate-accounting step sums them, which must
-happen before QUIC carries data by default (Step 3 at 100%; shadow paths, on
-by default since Step 2, carry no data). Do not copy the per-connection
+happen before any release sets `QUIC_DATA_PERCENT` above 0 (pinned by
+`upgrade::policy::tests::no_data_share_before_the_quic_budget_is_summed`;
+shadow paths, on by default since Step 2, carry no data). Do not copy the per-connection
 exception shape for memory the node holds on its own initiative.
 
 ```bash
