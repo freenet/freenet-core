@@ -5082,7 +5082,7 @@ fn the_source_gap_applies_only_to_source_waits() {
 /// A source wait that ends re-arms the timer at the send's own gap: the
 /// source gap (30 s) armed during the wait does not carry over to a write
 /// that stalls after the chunk arrives, which fails at its own gap (5 s
-/// after the chunk), not at 30 s.
+/// after the chunk), not 30 s after the last step before the wait.
 #[test]
 fn the_end_of_a_source_wait_rearms_the_timer_at_the_own_gap() {
     bounded(|| async move {
@@ -5100,12 +5100,17 @@ fn the_end_of_a_source_wait_rearms_the_timer_at_the_own_gap() {
             let sleeps = clock.clone();
             let outcome = bounded_send(&clock, deadlines, None, |progress| async move {
                 progress.mark_opened();
+                // A write until 3 s: the loop wakes at the 2 s open deadline
+                // and arms at the own gap (5 s).
+                sleeps.sleep(Duration::from_secs(3)).await;
+                progress.step();
+                // A source wait from 3 s to 6 s: the 5 s timer fires during
+                // it, and the loop arms at the source gap (33 s).
                 progress.waiting_on_source(true);
-                // Long enough for the loop to arm at the source gap.
-                sleeps.sleep(Duration::from_secs(1)).await;
+                sleeps.sleep(Duration::from_secs(3)).await;
                 progress.waiting_on_source(false);
                 progress.step();
-                // A write that stalls.
+                // A write that stalls from 6 s.
                 sleeps.sleep(Duration::from_secs(60)).await;
                 Ok(())
             })
@@ -5117,7 +5122,9 @@ fn the_end_of_a_source_wait_rearms_the_timer_at_the_own_gap() {
             matches!(outcome, BoundedSend::Failed(SendFailure::TimedOut)),
             "{outcome:?}"
         );
-        assert_eq!(took, Duration::from_secs(6));
+        // 6 s plus the own gap, where a timer left at the source gap would
+        // fire at 33 s.
+        assert_eq!(took, Duration::from_secs(11));
     })
 }
 
@@ -6708,5 +6715,92 @@ fn a_first_chunk_at_the_deadline_opens_no_stream() {
         }
         assert_eq!(p.a.send_aborts(), 0);
         assert_eq!(p.b.stats().count(QuicInboundOutcome::AnnouncedStream), 0);
+    })
+}
+
+/// The case that motivated a path-derived consumer gap (e5b-9-perf's cold
+/// start lab, 64 KiB at 800 ms RTT and 15% loss): over many seeds, the worst
+/// gap between two fragments arriving at the receiver stays under the gap
+/// the handle gives its consumers (16 round trips, about 12.8 s here), and
+/// every stream assembles. Prints the worst gap per seed.
+#[test]
+fn a_slow_lossy_path_stays_within_its_consumer_gap() {
+    bounded(|| async move {
+        use crate::transport::quic::path::bounded::SendDeadlines;
+        let _seed = GlobalRng::seed_guard(SEED);
+        let mut worst = Duration::ZERO;
+        let mut subnet = 150u8;
+        for len in [64 * 1024usize, 256 * 1024] {
+            for seed in 1..=20u64 {
+                let network: &'static str =
+                    Box::leak(format!("quic-gap-lossy-{len}-{seed}").into_boxed_str());
+                // The handshake runs on the delay alone, so the round trip is
+                // known before the loss starts.
+                crate::transport::in_memory_socket::set_packet_delivery_callback(
+                    network,
+                    Some(Arc::new(|_, _, _, _| {
+                        crate::transport::in_memory_socket::PacketDeliveryDecision::DelayedDelivery(
+                            Duration::from_millis(400),
+                        )
+                    })),
+                );
+                let mut p = paths(network, subnet, QuicPathLimits::DEFAULT).await;
+                subnet += 1;
+                let _loss = seeded_loss_from(network, 15, seed, Some(Duration::from_millis(400)));
+                let (a, time) = (p.a.clone(), p.time());
+                let send = tokio::spawn(async move {
+                    a.send_stream_bounded(
+                        &time,
+                        SendDeadlines::stream(len as u64),
+                        StreamId::next(),
+                        None,
+                        Bytes::from(payload(len)),
+                        None,
+                    )
+                    .await
+                });
+                // Wait for the announcement, then watch its fragments arrive.
+                let time = p.time();
+                let mut b_in =
+                    std::mem::replace(&mut p.b_in.streams, tokio::sync::mpsc::channel(1).1);
+                let (gap, limit, assembled) = p
+                    .drive(async move {
+                        let arrival = b_in.recv().await.expect("announced");
+                        let handle = arrival.handle;
+                        let limit = handle.fragment_gap_limit();
+                        let mut last_change = time.now_nanos();
+                        let mut seen = handle.received_bytes();
+                        let mut gap = 0u64;
+                        while !handle.is_complete() && handle.try_assemble().is_none() {
+                            time.sleep(Duration::from_millis(10)).await;
+                            let now = time.now_nanos();
+                            let got = handle.received_bytes();
+                            if got != seen {
+                                seen = got;
+                                last_change = now;
+                            }
+                            gap = gap.max(now - last_change);
+                            if Duration::from_nanos(now - last_change) > Duration::from_secs(60) {
+                                break;
+                            }
+                        }
+                        let assembled = handle.try_assemble().is_some();
+                        let _outcome = send.await.expect("the send task ran");
+                        (Duration::from_nanos(gap), limit, assembled)
+                    })
+                    .await;
+                eprintln!(
+                    "gap lossy: len {len} seed {seed}: worst gap {gap:?}, limit {limit:?}, assembled {assembled}"
+                );
+                worst = worst.max(gap);
+                assert!(
+                    gap < limit,
+                    "len {len} seed {seed}: gap {gap:?} >= {limit:?}"
+                );
+                assert!(assembled, "len {len} seed {seed}: did not assemble");
+                crate::transport::in_memory_socket::set_packet_delivery_callback(network, None);
+            }
+        }
+        eprintln!("gap lossy: worst over all seeds {worst:?}");
     })
 }
