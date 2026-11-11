@@ -24,12 +24,11 @@
 //!   charged buffer at its offset and a `Short`'s body into one buffer of its
 //!   declared length, and both stop at the declared end.
 //!
-//! What a gap still costs is one received range (quinn's `recvd` entry and our
-//! mirror, [`RangeMirror`]), capped per connection (`R_conn`, one per KiB of
-//! the window, `budget::gap_cap`; [`MAX_GAPS_PER_CONNECTION`] without a
-//! meter). quinn keeps a stopped stream's ranges until the peer finishes or
-//! resets it, which we cannot observe, so they stay counted
-//! ([`ConnRanges::keep`]); a second time past the cap within
+//! What a gap still costs is one received range (charged at `GAP_BYTES`,
+//! with our mirror, [`RangeMirror`]), capped per connection (`R_conn`, one per
+//! KiB of the window, `budget::gap_cap`; [`MAX_GAPS_PER_CONNECTION`] without a
+//! meter). A stopped stream's gaps stay counted ([`ConnRanges::keep`]), since
+//! we cannot observe when the peer ends it; a second time past the cap within
 //! [`STAGED_TRIP_WINDOW`] closes the path.
 //!
 //! A reader never stops reading: a stream waiting for room in the delivery
@@ -946,11 +945,8 @@ impl<T: TimeSource> Drop for BodyReader<T> {
         if self.finished || self.reset {
             self.conn_ranges.remove(gaps);
         } else {
-            // Stopping a stream in quinn (also done when a `RecvStream` is
-            // dropped unfinished) clears the buffered data but keeps `recvd` until
-            // the peer sends FIN or RESET_STREAM, and nothing tells us when it
-            // does: after a stop, `received_reset` returns at once
-            // (`ClosedStream`). See `ConnRanges::keep`.
+            // A stream stopped unfinished keeps its gaps counted, since
+            // nothing tells us when the peer ends it. See `ConnRanges::keep`.
             self.conn_ranges.keep(gaps, self.time.now_nanos());
         }
     }
@@ -1255,9 +1251,9 @@ impl Drop for Staging {
 /// (`budget::gap_cap`). Gaps are counted per stream as received ranges past
 /// the first ([`RangeMirror::gaps`]), over open streams and the stopped ones
 /// quinn may still hold ([`ConnRanges::keep`]). A contiguous stream costs
-/// nothing here: its one range is bounded by the stream limit. Each gap costs
-/// about 70 B (quinn's `recvd` entry, which nothing in quinn caps, and our
-/// mirror) and the peer at least one byte of credit. A metered path's cap
+/// nothing here: its one range is bounded by the stream limit. Each gap is
+/// charged about 70 B (`budget::GAP_BYTES`) and costs the peer at least one
+/// byte of credit. A metered path's cap
 /// follows its window: one gap per KiB of W + debt, at least this many
 /// (`budget::ConnMeter`). Honest loss leaves about loss x packets in flight,
 /// far fewer.

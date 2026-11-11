@@ -486,9 +486,8 @@ quic_outcomes! {
         TooManyRanges => "too_many_ranges",
         /// The connection went past its gap cap a
         /// second time within `inbound::STAGED_TRIP_WINDOW`, so the path was
-        /// closed with OVER_BUDGET (once per path):
-        /// the gaps of streams it stopped stay counted for the connection's
-        /// life, because quinn keeps them until the peer ends the stream.
+        /// closed with OVER_BUDGET (once per path). The gaps of streams it
+        /// stopped stay counted (`inbound::ConnRanges::keep`).
         ClosedTooManyRanges => "closed_too_many_ranges",
         /// Staging what the stream had read before its header, metadata or
         /// control body was taken would have passed the connection's staging
@@ -1154,6 +1153,15 @@ impl QuicPath {
     #[cfg(test)]
     pub(crate) fn send_aborts(&self) -> u64 {
         self.aborts.count()
+    }
+
+    /// The sends holding one of the path's send-window epochs, 0 without a
+    /// budget meter.
+    #[cfg(test)]
+    pub(crate) fn send_epoch_holders(&self) -> usize {
+        self.meter
+            .as_ref()
+            .map_or(0, |meter| meter.send_epoch_holders())
     }
 
     /// Streamed-message permits free right now.
@@ -2109,22 +2117,23 @@ impl Drop for Outgoing {
     /// that simply ended early.
     ///
     /// A stream dropped while it waits for its acknowledgement goes on to the
-    /// end, so its permit waits with it, in a small task. There are at most
-    /// [`STREAMED_SEND_LIMIT`] per path, and each ends with the connection.
+    /// end, so its permit and its send epoch wait with it, in a small task.
+    /// There is at most one per send stream quinn still holds, and each ends
+    /// with that stream's acknowledgement or with the connection.
     fn drop(&mut self) {
         self.reset(reset_code::SENDER_ABORTED);
         if !self.awaiting_ack {
             return;
         }
-        let Some(slot) = self.slot.take() else {
+        let (slot, epoch) = (self.slot.take(), self.epoch.take());
+        if slot.is_none() && epoch.is_none() {
             return;
-        };
-        // With no runtime the node is stopping, and the permit has no users.
+        }
+        // With no runtime the node is stopping, and neither has users.
         if tokio::runtime::Handle::try_current().is_err() {
             return;
         }
         let stopped = std::mem::replace(&mut self.stopped, Box::pin(std::future::pending()));
-        let epoch = self.epoch.take();
         // Bounded as above and ending with the connection, so the handle is
         // not monitored.
         drop(GlobalExecutor::spawn(async move {

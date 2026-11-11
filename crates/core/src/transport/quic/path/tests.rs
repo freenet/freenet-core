@@ -1104,9 +1104,8 @@ fn streams_whose_first_datagrams_are_lost_all_arrive() {
     })
 }
 
-/// A stream stopped with gaps leaves them counted: quinn keeps a stopped
-/// stream's received ranges until the peer finishes or resets it, which we
-/// cannot observe. A quinn sender resets a stopped stream at once, so after
+/// A stream stopped with gaps leaves them counted, since we cannot observe
+/// when the peer ends it. A quinn sender resets a stopped stream at once, so after
 /// the grace period (`KEPT_GAPS_GRACE`) the gaps of a stream with only a few
 /// leave the count, and an honest connection's count does not drift. Here
 /// the sender's datagrams stop arriving after some were lost, so the stream
@@ -6094,6 +6093,62 @@ fn a_permit_held_past_a_timed_out_send_returns_on_close() {
     })
 }
 
+/// A one-packet Short takes no permit, but its send epoch stays held past
+/// `MaybeDelivered(TimedOut)` until the acknowledgement, so a send window
+/// lowered meanwhile stays charged while quinn may still hold its data.
+#[test]
+fn a_one_packet_short_holds_its_send_epoch_until_the_ack() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let windows = Windows {
+            a: Some(test_budget(64 << 20, leaked_counters())),
+            b: None,
+        };
+        let network = "quic-path-short-epoch";
+        let p = paths_metered(network, 78, windows).await;
+        let limit = super::super::config::STREAMED_SEND_LIMIT as usize;
+        let silenced = DropFrom::new(network, &[p.pair.b_addr]);
+        let (a, time) = (p.a.clone(), p.time());
+        let (outcome, slots, holders) = p
+            .drive(async move {
+                let outcome = a
+                    .send_short_bounded(&time, Duration::from_secs(1), b"short")
+                    .await;
+                time.sleep(Duration::from_secs(2)).await;
+                (outcome, a.free_stream_slots(), a.send_epoch_holders())
+            })
+            .await;
+        assert!(
+            matches!(
+                outcome,
+                BoundedSend::MaybeDelivered(MaybeDelivered::TimedOut)
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(slots, limit, "premise: a one-packet Short takes no permit");
+        assert_eq!(holders, 1, "the unacknowledged Short holds its epoch");
+
+        drop(silenced);
+        let (a, time) = (p.a.clone(), p.time());
+        let released = p
+            .drive(async move {
+                for _ in 0..600 {
+                    if a.send_epoch_holders() == 0 {
+                        return true;
+                    }
+                    time.sleep(Duration::from_millis(100)).await;
+                }
+                false
+            })
+            .await;
+        assert!(released, "the acknowledgement releases the epoch");
+        assert!(
+            p.a.connection().inner().close_reason().is_none(),
+            "released by the ack, not by the connection ending"
+        );
+    })
+}
+
 /// A Short past one packet waits for a permit as a stream does, and one that
 /// fits a packet does not.
 #[test]
@@ -6831,7 +6886,9 @@ fn an_honest_stream_whose_first_packet_is_lost_stays_within_the_staging_cap() {
             let peak = p.b.inbound_staged_peak_permille();
             eprintln!("{mib} MiB at {one_way} ms: staged peak {peak} per mille of the cap");
             assert!(peak > 0, "premise: the lost header made the reader stage");
-            assert!(peak < 1000, "{mib} MiB: staged {peak} per mille of the cap");
+            // Measured at most 500 (the size-class growth); doubling the
+            // staging buffer peaks at 625.
+            assert!(peak <= 550, "{mib} MiB: staged {peak} per mille of the cap");
         });
     }
 }

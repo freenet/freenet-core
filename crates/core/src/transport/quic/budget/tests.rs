@@ -302,6 +302,34 @@ fn a_shrunk_send_window_stays_charged_while_its_streams_are_open() {
     assert!(a.meter.charge() < charged, "released when it ends");
 }
 
+/// A send window grown after a shrink is charged for a stream opened before
+/// the shrink: the window is the connection's, so that stream may buffer up
+/// to it, and a second shrink must not drop the charge to the window it was
+/// opened at.
+#[test]
+fn a_send_window_grown_after_a_shrink_stays_charged_for_older_streams() {
+    let budget = QuicBudget::new(64 << 20, FLOOR, counters());
+    let a = conn(&budget, 0);
+    a.fake.cwnd.store(4 * FLOOR, Ordering::Relaxed);
+    assert_eq!(a.meter.evaluate(10 * MS).unwrap().send_window, 8 * FLOOR);
+    let stream = a.meter.send_epoch().expect("an epoch");
+    a.fake.cwnd.store(FLOOR / 4, Ordering::Relaxed);
+    assert_eq!(a.meter.evaluate(20 * MS).unwrap().send_window, FLOOR);
+    a.fake.cwnd.store(16 * FLOOR, Ordering::Relaxed);
+    let grown = a.meter.evaluate(30 * MS).unwrap().send_window;
+    assert!(grown > 8 * FLOOR, "premise: grown past the first window");
+    let charged = a.meter.charge();
+    a.fake.cwnd.store(FLOOR / 4, Ordering::Relaxed);
+    assert_eq!(a.meter.evaluate(40 * MS).unwrap().send_window, FLOOR);
+    assert_eq!(
+        a.meter.charge(),
+        charged,
+        "the grown window stays charged while the older stream is open"
+    );
+    drop(stream);
+    assert!(a.meter.charge() < charged, "released when it ends");
+}
+
 #[test]
 fn the_floor_and_the_gap_cap_follow_the_design() {
     assert_eq!(floor_window_bytes(1 << 30), MIN_WINDOW_SMALL_HOST_BYTES);

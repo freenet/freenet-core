@@ -1587,9 +1587,10 @@ largest a connection grows to (`budget::MAX_WINDOW_BYTES`, 8 MiB); all are cappe
 (`windows_never_exceed_the_reassembly_allowance` guards future constant
 changes). A shadow path keeps the initial window. A data path registers a
 `budget::ConnMeter` with the node's `budget::QuicBudget` (memory / 16,
-`quic_buffer_budget_for`), which charges it budget::receive_charge(W + debt)
-(3 x: the unread credit plus the staging cap, below) + send x 9/8 + R_conn x
-70 B + 64 KiB and sets its windows at runtime
+`quic_buffer_budget_for`), which charges it (W + debt) + max(staging_cap(W +
+debt), the staging cap as set) (3 x (W + debt) when the cap follows the
+credit; the cap is never set below the bytes staged) + send x 9/8 + R_conn x
+70 B + CONTROL_BUFFER_BYTES (144 KiB) and sets its windows at runtime
 (`quinn::Connection::set_receive_window` / `set_send_window`):
   → W + debt: quinn records a shrink as debt paid by later credits; the
     meter mirrors it from the bytes the reader reads (where it can differ,
@@ -2080,9 +2081,9 @@ Unordered reads: every stream is read with read_chunk(_, false) from its
   received, exact at the end), and a Stream's payload into the charged buffer
   at its offset (the Rechunker stages a fragment until it is whole and holds
   the one that completes the stream until its end).
-  → NEVER read a QUIC stream in order (read_chunk(_, true)) on a path: what
-    quinn holds for an in-order reader is outside every bound here, and a
-    stream must not switch from in-order to unordered reads.
+  → NEVER read a QUIC stream in order (read_chunk(_, true)) on a path: every
+    bound here assumes unordered reads, and a stream must not switch from
+    in-order to unordered reads.
   → NEVER keep bytes read before the header outside the staging cap: an
     unordered read returns the peer's credit for every byte read.
   → A reader never stops reading, including while it waits for channel room:
@@ -2093,19 +2094,19 @@ Unordered reads: every stream is read with read_chunk(_, false) from its
     (inbound::StreamLimit), so at most MAX_UNI_STREAMS wait.
   → NEVER charge or refuse a one-packet Short after its body is read: its
     sender may already read it as Sent, and a refusal then loses it.
-  A gap costs one received range (quinn's recvd set and our mirror, ~70 B);
+  A gap is charged as one received range (~70 B, budget::GAP_BYTES);
   gaps are counted per stream as ranges past the first, and a connection's
   streams may hold at most R_conn (budget::gap_cap, max(256, (W + debt) / 1 KiB); 256 without a meter), past
-  which the stream is stopped EVICTED and counted too_many_ranges. quinn
-  keeps a stopped stream's recvd until the peer sends FIN or RESET, and after
-  a stop nothing tells us when (received_reset returns at once). After a stop
-  quinn adds nothing to recvd, and a stopped stream holds state only while it
-  holds its slot, so at most MAX_UNI_STREAMS of them at once: the count takes
+  which the stream is stopped EVICTED and counted too_many_ranges. A stopped
+  stream's gaps stay counted (inbound::ConnRanges::keep), since nothing tells
+  us when the peer ends it; it gains no gaps after the stop, and at most
+  MAX_UNI_STREAMS stopped streams hold a stream slot at once: the count takes
   the sum of the MAX_UNI_STREAMS largest frozen gap counts, not of all of
   them, so it does not grow with the connection's age; after KEPT_GAPS_GRACE
   (30 s) each counts 32 less (a quinn peer resets a stopped stream within a
-  round trip). A second trip past the cap closes the path with
-  OVER_BUDGET (closed_too_many_ranges). A Stream waiting for room in the
+  round trip). A second trip past the cap within 30 s
+  (inbound::STAGED_TRIP_WINDOW) closes the path with OVER_BUDGET
+  (closed_too_many_ranges). A Stream waiting for room in the
   delivery channel reads on, its end included (its charge bounds how many
   wait); one that ends short fails Truncated at once. While it waits it
   is evicted idle if its payload stops arriving; once the payload is all
@@ -2137,14 +2138,14 @@ Inbound adapter: a Stream's payload goes into an ordinary StreamHandle,
     before the StreamIdInUse test). An id is held from admission until
     then, and is free again afterwards (completed ids are not
     remembered).
-  → No chunk is kept: quinn's chunks are slices of the ~1200-byte
-    datagram, so header, metadata, short and control reads copy into one
-    buffer that grows as data arrives (from 64 KiB, never past the
-    declared length, exact at the end; a declared length is not allocated
-    up front). Stream payload goes into fragments, each a fresh buffer of
+  → No chunk is kept: a chunk may share an allocation larger than itself,
+    so header, metadata, short and control reads copy into one buffer that
+    grows to the highest offset received (doubling, never past the declared
+    length, exact at the end; a declared length is not allocated up
+    front). Stream payload goes into fragments, each a fresh buffer of
     exactly its length (Rechunker::feed always copies; no fragment shares
-    an allocation with a quinn chunk, so a fragment Bytes does not keep
-    a datagram or a defragmented allocation alive). Streams
+    an allocation with a quinn chunk, so a fragment Bytes keeps nothing
+    larger than itself alive). Streams
     with no charge have an age limit too: inbound::HEADER_PHASE_AGE (30 s,
     at least the idle timeout) until the header is read, then
     inbound_stream_age_limit(0) (control frames, one-packet Shorts).
