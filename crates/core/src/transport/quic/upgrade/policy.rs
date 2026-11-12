@@ -43,14 +43,26 @@ use crate::transport::quic::liveness::{QuicAvailability, QuicAvailabilityWatch};
 pub(in crate::transport) const QUIC_DATA_PERCENT: u8 = 0;
 
 /// Whether this node, as configured, may carry data on QUIC: `transport-quic`
-/// is `prefer` and its share of pairs (`quic-data-percent`, or
-/// [`QUIC_DATA_PERCENT`]) is above 0. While it is not, its QUIC paths are
-/// shadow paths, which take no data and cost only the fixed charge, so the
+/// is `prefer` and its share of pairs can be above 0 while it runs: a
+/// `quic-data-percent` above 0, or with none, this release's ramp
+/// ([`QUIC_DATA_RAMP_START`], from its first minute) or a fixed
+/// [`QUIC_DATA_PERCENT`] above 0. While it is not, its QUIC paths are shadow
+/// paths, which take no data and cost only the fixed charge, so the
 /// connection limit is not lowered for QUIC memory
-/// (`NetworkApiConfig::connection_limit`).
+/// (`NetworkApiConfig::connection_limit`). The emergency-stop release (no
+/// ramp, a share of 0) makes it false, so that release also gives the node
+/// its configured limit back.
 pub(crate) fn may_carry_data(config: &NetworkApiConfig) -> bool {
+    may_carry_data_with(config, QUIC_DATA_RAMP_START)
+}
+
+/// [`may_carry_data`] with `ramp_start` in place of the release's.
+fn may_carry_data_with(config: &NetworkApiConfig, ramp_start: Option<u64>) -> bool {
     configured_mode(config) == QuicMode::Prefer
-        && config.quic_data_percent().unwrap_or(QUIC_DATA_PERCENT) > 0
+        && match DataShare::of(config.quic_data_percent(), ramp_start) {
+            DataShare::Fixed(percent) => percent > 0,
+            DataShare::Ramp { .. } => true,
+        }
 }
 
 /// When this release's data ramp starts, in seconds since the Unix epoch, or
@@ -814,9 +826,9 @@ mod tests {
                 config.quic_data_percent = percent.map(str::to_string);
                 let up = QuicAvailabilityWatch::for_test(QuicAvailability::Up).1;
                 let policy = QuicPolicy::new(&config, BreakerOutcome::NotConsulted, up);
-                let some_pair_carries = pairs
-                    .iter()
-                    .any(|(local, peer)| policy.own_caps(local, peer) & caps::DATA != 0);
+                let some_pair_carries = pairs.iter().any(|(local, peer)| {
+                    policy.own_caps(local, peer, std::time::SystemTime::now()) & caps::DATA != 0
+                });
                 assert_eq!(
                     may_carry_data(&config),
                     some_pair_carries,
@@ -824,6 +836,36 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// With a ramp in the release, a `prefer` node may carry data from the
+    /// ramp's first minute unless `quic-data-percent` overrides it, so the
+    /// connection limit is lowered for the whole ramp; without one (the
+    /// emergency-stop release) it may not, at this release's share of 0.
+    #[test]
+    fn may_carry_data_follows_the_ramp() {
+        let ramp = Some(1_700_000_000);
+        for (mode, percent, start, want) in [
+            ("prefer", None, ramp, true),
+            ("prefer", Some("0"), ramp, false),
+            ("prefer", Some("5"), ramp, true),
+            ("prefer", None, None, QUIC_DATA_PERCENT > 0),
+            ("prefer", Some("0"), None, false),
+            ("shadow", None, ramp, false),
+            ("off", None, ramp, false),
+        ] {
+            let mut config = config(mode, None);
+            config.quic_data_percent = percent.map(str::to_string);
+            assert_eq!(
+                may_carry_data_with(&config, start),
+                want,
+                "{mode} {percent:?} {start:?}"
+            );
+        }
+        assert_eq!(
+            QUIC_DATA_PERCENT, 0,
+            "the emergency-stop case above reads false"
+        );
     }
 
     /// The share reported as `quic_ramp_share_pct`: the policy's share in
