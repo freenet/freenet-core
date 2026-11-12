@@ -908,6 +908,9 @@ pub struct TransportMetrics {
     /// Fallbacks this period that the UDP session's end followed, by the
     /// fallback's [`QuicFallback`].
     quic_churned_fallback: [AtomicU64; QuicFallback::COUNT],
+    /// Fallbacks this period of paths that carried data when they ended, by
+    /// [`QuicFallback`].
+    quic_carried_fallback: [AtomicU64; QuicFallback::COUNT],
     /// Active paths that ended this period, by [`QuicPathAge`].
     quic_path_age: [AtomicU64; QuicPathAge::COUNT],
     /// Establish latencies this period in ms (bounded), and how many there
@@ -1371,6 +1374,7 @@ impl TransportMetrics {
             quic_upgrade: Default::default(),
             quic_fallback: Default::default(),
             quic_churned_fallback: Default::default(),
+            quic_carried_fallback: Default::default(),
             quic_path_age: Default::default(),
             quic_establish_ms: Default::default(),
             quic_establish_samples: AtomicU64::new(0),
@@ -2021,6 +2025,16 @@ impl TransportMetrics {
         #[cfg(not(test))]
         let _ = remote;
         self.quic_fallback[cause as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The path to `remote` that `record_quic_fallback` counted for `cause`
+    /// carried data when it ended, as the upgrade machine decided.
+    pub(crate) fn record_quic_carried_fallback(&self, cause: QuicFallback, remote: SocketAddr) {
+        #[cfg(test)]
+        self.note_quic_event(remote, ("carrying", cause));
+        #[cfg(not(test))]
+        let _ = remote;
+        self.quic_carried_fallback[cause as usize].fetch_add(1, Ordering::Relaxed);
     }
 
     /// The UDP session to `remote` ended within the upgrade machine's churn
@@ -2809,6 +2823,7 @@ impl TransportMetrics {
             quic_upgrade: std::array::from_fn(|i| get64(&self.quic_upgrade[i])),
             quic_fallback: std::array::from_fn(|i| get64(&self.quic_fallback[i])),
             quic_churned_fallback: std::array::from_fn(|i| get64(&self.quic_churned_fallback[i])),
+            quic_carried_fallback: std::array::from_fn(|i| get64(&self.quic_carried_fallback[i])),
             quic_path_age_at_close: std::array::from_fn(|i| get64(&self.quic_path_age[i])),
             quic_establish_ms_p50: establish_p50,
             quic_establish_ms_p90: establish_p90,
@@ -3498,6 +3513,11 @@ pub struct TransportSnapshot {
     /// longer than 150 s. The rule docs ("Upgrade telemetry") give the gate
     /// formula.
     pub quic_churned_fallback: [u64; QuicFallback::COUNT],
+    /// The fallbacks of paths that carried data when they ended, by label
+    /// (`quic_carried_fallback_<label>`): a subset of `quic_fallback`, counted
+    /// by the same decision. Defaulted, so JSON from before it decodes.
+    #[serde(default)]
+    pub quic_carried_fallback: [u64; QuicFallback::COUNT],
     /// Active paths that ended, by [`QuicPathAge`]
     /// (`quic_path_age_at_close_<label>`).
     pub quic_path_age_at_close: [u64; QuicPathAge::COUNT],
@@ -3890,6 +3910,7 @@ impl TransportSnapshot {
             quic_upgrade,
             quic_fallback,
             quic_churned_fallback,
+            quic_carried_fallback,
             quic_path_age_at_close,
             quic_establish_ms_p50,
             quic_establish_ms_p90,
@@ -4053,6 +4074,7 @@ impl TransportSnapshot {
         self.quic_upgrade = quic_upgrade;
         self.quic_fallback = quic_fallback;
         self.quic_churned_fallback = quic_churned_fallback;
+        self.quic_carried_fallback = quic_carried_fallback;
         self.quic_path_age_at_close = quic_path_age_at_close;
         self.quic_establish_ms_p50 = quic_establish_ms_p50;
         self.quic_establish_ms_p90 = quic_establish_ms_p90;
@@ -4299,6 +4321,10 @@ struct SnapshotExtras {
     /// longer than 150 s. The rule docs ("Upgrade telemetry") give the gate
     /// formula.
     pub quic_churned_fallback: [u64; QuicFallback::COUNT],
+    /// The fallbacks of paths that carried data when they ended, by label
+    /// (`quic_carried_fallback_<label>`): a subset of `quic_fallback`, counted
+    /// by the same decision.
+    pub quic_carried_fallback: [u64; QuicFallback::COUNT],
     /// Active paths that ended, by [`QuicPathAge`]
     /// (`quic_path_age_at_close_<label>`).
     pub quic_path_age_at_close: [u64; QuicPathAge::COUNT],
@@ -4511,6 +4537,10 @@ impl SnapshotExtras {
             || self.quic_fallback.iter().any(|n| *n != 0)
             || self
                 .quic_churned_fallback
+                .iter()
+                .any(|n| *n != 0)
+            || self
+                .quic_carried_fallback
                 .iter()
                 .any(|n| *n != 0)
             || self.quic_path_age_at_close.iter().any(|n| *n != 0)
@@ -5772,6 +5802,14 @@ mod tests {
     }
 
     #[test]
+    fn quic_carried_fallbacks_count_snapshot_and_reset() {
+        check_quic_family(
+            |m, slot, remote| m.record_quic_carried_fallback(QuicFallback::ALL[slot], remote),
+            |snap| snap.quic_carried_fallback,
+        );
+    }
+
+    #[test]
     fn quic_churned_fallbacks_count_snapshot_and_reset() {
         check_quic_family(
             |m, slot, remote| m.record_quic_churned_fallback(QuicFallback::ALL[slot], remote),
@@ -6993,6 +7031,7 @@ mod tests {
             "quic_upgrade",
             "quic_fallback",
             "quic_churned_fallback",
+            "quic_carried_fallback",
             "quic_path_age_at_close",
             "quic_establish_ms_p50",
             "quic_establish_ms_p90",

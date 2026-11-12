@@ -33,6 +33,7 @@
 //! | `quic_budget_bytes`, `quic_budget_charged_bytes`, `quic_budget_charged_peak_bytes` | the node's QUIC buffer budget, what its data paths' windows have grown above their floor grants now (the floor grants are each path's fixed charge, not the budget's, so a node with every path at the floor reports 0 and uploads nothing; gauges, not reset, uploaded when not 0), and the most charged at once in the period (`quic::budget`) |
 //! | `quic_staged_peak_pct` | the most any connection staged in the period (bytes read for streams whose header its reader had not taken yet) as a percentage of its staging cap (`quic::path::inbound::ConnStaging`); streams stopped at the cap are `quic_inbound_evicted_staged` |
 //! | `quic_window_grew`, `quic_window_grow_refused`, `quic_window_shrank` | window-limited data paths whose receive window grew, those that found no room, and paths whose windows the budget lowered |
+//! | `quic_ramp_share_pct` | the share of pairs, in percent, this node sets its data bit for now: its `quic-data-percent`, or the ramp's share at the snapshot (`upgrade::slice::ramp_percent`); 0 unless `transport-quic = prefer`. A gauge, sent every period, 0 included, so the release watch can group each period by ramp step |
 //! | `quic_send_resets_reached_<n>`, `quic_send_resets_path_max` | paths whose lifetime reset count reached each level in the period, and the highest count a reset in the period took a path to: how close paths get to `recycle::SEND_ABORT_LIMIT` |
 //!
 //! What the loss rate is: quinn's lost over sent (quinn-proto 0.11.19). `sent`
@@ -73,9 +74,13 @@ use crate::transport::quic::path::{
     QuicInboundOutcome, QuicSendEvent, QuicSendResult, SendKind, stop_code,
 };
 use crate::transport::quic::recycle::loss_gate::{GATE_VERDICTS, VERDICT_LABELS, Verdict};
+use crate::transport::quic::upgrade::policy::DataShare;
 
 /// The gauge's key, uploaded in every snapshot ([`QuicDataSnapshot::upload_keys`]).
 const LIVE_DATA_PATHS: &str = "quic_live_data_paths";
+
+/// The share gauge's key, uploaded in every snapshot.
+const RAMP_SHARE_PCT: &str = "quic_ramp_share_pct";
 
 /// The loss-rate gauges' prefix; every bucket is uploaded in every snapshot.
 const LOSS_RATE_PREFIX: &str = "quic_loss_rate_";
@@ -363,6 +368,9 @@ pub(crate) struct QuicDataCounters {
     staged_peak_pct: AtomicU64,
     gate_loss: [AtomicU64; GATE_VERDICTS],
     gate_ended_queue: [AtomicU64; GATE_QUEUE_LABELS.len()],
+    /// The data share this node applies, set when its upgrades are built;
+    /// `None` unless `transport-quic = prefer`.
+    share: Mutex<Option<DataShare>>,
 }
 
 impl QuicDataCounters {
@@ -396,7 +404,14 @@ impl QuicDataCounters {
             staged_peak_pct: zero(),
             gate_loss: std::array::from_fn(|_| zero()),
             gate_ended_queue: std::array::from_fn(|_| zero()),
+            share: Mutex::new(None),
         }
+    }
+
+    /// The data share this node applies (`policy::QuicPolicy::advertised_share`),
+    /// read at each snapshot as `quic_ramp_share_pct`.
+    pub(crate) fn set_share(&self, share: Option<DataShare>) {
+        *self.share.lock() = share;
     }
 
     pub(crate) fn record_send(&self, kind: SendKind, result: QuicSendResult) {
@@ -688,6 +703,9 @@ impl QuicDataCounters {
             staged_peak_pct: get(&self.staged_peak_pct),
             gate_loss: self.gate_loss.iter().map(get).collect(),
             gate_ended_queue: self.gate_ended_queue.iter().map(get).collect(),
+            ramp_share_pct: self.share.lock().map_or(0, |share| {
+                u64::from(share.percent_at(std::time::SystemTime::now()))
+            }),
         }
     }
 }
@@ -765,6 +783,10 @@ pub struct QuicDataSnapshot {
     /// Paths that ended in the period, by `GATE_QUEUE_LABELS`.
     #[serde(default)]
     pub gate_ended_queue: Vec<u64>,
+    /// The share of pairs this node sets its data bit for at the snapshot, in
+    /// percent: a gauge.
+    #[serde(default)]
+    pub ramp_share_pct: u64,
 }
 
 impl QuicDataSnapshot {
@@ -825,6 +847,7 @@ impl QuicDataSnapshot {
             staged_peak_pct,
             gate_loss,
             gate_ended_queue,
+            ramp_share_pct,
         } = self;
         let mut keys = Vec::new();
         let mut family = |prefix: &'static str, labels: Vec<String>, values: Vec<u64>| {
@@ -961,6 +984,7 @@ impl QuicDataSnapshot {
             ("quic_window_grow_refused", *window_grow_refused),
             ("quic_window_shrank", *window_shrank),
             ("quic_staged_peak_pct", *staged_peak_pct),
+            (RAMP_SHARE_PCT, *ramp_share_pct),
         ] {
             keys.push((None, key.to_string(), value));
         }
@@ -968,7 +992,8 @@ impl QuicDataSnapshot {
     }
 
     /// The keys the snapshot uploads: every count that is not 0, and the gauges
-    /// (`quic_live_data_paths` and every `quic_loss_rate_` bucket) always, so a
+    /// (`quic_live_data_paths`, `quic_ramp_share_pct` and every loss-rate
+    /// bucket) always, so a
     /// gauge of 0 is told apart from one not reported.
     pub fn upload_keys(&self) -> impl Iterator<Item = (String, u64)> {
         self.keys_by_family()
@@ -976,6 +1001,7 @@ impl QuicDataSnapshot {
             .filter(|(family, key, value)| {
                 *value != 0
                     || key == LIVE_DATA_PATHS
+                    || key == RAMP_SHARE_PCT
                     || *family == Some(LOSS_RATE_PREFIX)
                     || *family == Some(CARRYING_LOSS_RATE_PREFIX)
             })
@@ -1027,6 +1053,7 @@ impl QuicDataSnapshot {
             staged_peak_pct: _,
             gate_loss,
             gate_ended_queue,
+            ramp_share_pct: _,
         } = self;
         let any = |values: &[u64]| values.iter().any(|n| *n != 0);
         any(sends)
@@ -1128,6 +1155,7 @@ mod tests {
         assert!(!after.has_activity(), "a gauge alone is not activity");
         assert!(after.upload_keys().all(|(key, value)| {
             key == "quic_live_data_paths"
+                || (key == "quic_ramp_share_pct" && value == 0)
                 || ((key.starts_with("quic_loss_rate_")
                     || key.starts_with("quic_carrying_loss_rate_"))
                     && value == 0)
@@ -1197,12 +1225,13 @@ mod tests {
         let uploaded: Vec<_> = counters.snapshot(true).upload_keys().collect();
         assert_eq!(
             uploaded.len(),
-            2 * LOSS_RATE_LABELS.len() + 1,
+            2 * LOSS_RATE_LABELS.len() + 2,
             "the gauges and nothing else: {uploaded:?}"
         );
         assert!(uploaded.iter().all(|(key, value)| {
             *value == 0
                 && (key == "quic_live_data_paths"
+                    || key == "quic_ramp_share_pct"
                     || key.starts_with("quic_loss_rate_")
                     || key.starts_with("quic_carrying_loss_rate_"))
         }));
@@ -1212,11 +1241,47 @@ mod tests {
             counters.snapshot(true).upload_keys().collect();
         assert_eq!(
             uploaded.len(),
-            2 * LOSS_RATE_LABELS.len() + 2,
+            2 * LOSS_RATE_LABELS.len() + 3,
             "{uploaded:?}"
         );
         assert_eq!(uploaded["quic_live_data_paths"], 1);
         assert_eq!(uploaded["quic_sends"], 1);
+    }
+
+    /// The share gauge reads the node's share at each snapshot: a fixed share
+    /// as set, a ramp's share at the snapshot's time, 0 with no share.
+    #[test]
+    fn the_ramp_share_gauge_reads_the_share_at_the_snapshot() {
+        use crate::transport::quic::upgrade::slice::ramp_percent;
+        let counters = QuicDataCounters::new();
+        let share = |counters: &QuicDataCounters| {
+            counters
+                .snapshot(true)
+                .upload_keys()
+                .find(|(key, _)| key == RAMP_SHARE_PCT)
+                .map(|(_, value)| value)
+        };
+        assert_eq!(share(&counters), Some(0), "no share: 0, still uploaded");
+        counters.set_share(Some(DataShare::Fixed(40)));
+        assert_eq!(share(&counters), Some(40));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("after the epoch")
+            .as_secs();
+        for hours in [1, 7, 13, 30] {
+            counters.set_share(Some(DataShare::Ramp {
+                start_unix_secs: now - hours * 3600,
+            }));
+            let read = share(&counters).expect("uploaded");
+            // The snapshot reads the clock a moment after `now`.
+            let low = u64::from(ramp_percent(std::time::Duration::from_secs(hours * 3600)));
+            let high = u64::from(ramp_percent(std::time::Duration::from_secs(
+                hours * 3600 + 60,
+            )));
+            assert!((low..=high).contains(&read), "{hours} h: {read}");
+        }
+        counters.set_share(None);
+        assert_eq!(share(&counters), Some(0));
     }
 
     /// The keys with the family each is in, from `keys_by_family`; every key the

@@ -911,6 +911,9 @@ impl Session {
             Outcome::ChurnedFallback(cause) => {
                 TRANSPORT_METRICS.record_quic_churned_fallback(fallback_label(cause), self.remote)
             }
+            Outcome::CarryingFallback(cause) => {
+                TRANSPORT_METRICS.record_quic_carried_fallback(fallback_label(cause), self.remote)
+            }
         }
     }
 
