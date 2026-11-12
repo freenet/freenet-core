@@ -362,6 +362,10 @@ labelled_counters! {
         SourceFull => "source_full",
         /// Dropped: no QUIC ingress is enabled, or its receiver is gone.
         NoIngress => "no_ingress",
+        /// Dropped: only the queue's reserve for quiet sources was free
+        /// (`demux::QUIC_INGRESS_QUIET_RESERVE`) and this source already had
+        /// `demux::QUIC_INGRESS_QUIET_SOURCE_DATAGRAMS` or more queued.
+        ReserveFull => "reserve_full",
     }
 }
 
@@ -2732,6 +2736,7 @@ impl TransportMetrics {
             quic_ingress_queue_full: get64(&quic[QuicIngressOutcome::QueueFull as usize]),
             quic_ingress_source_full: get64(&quic[QuicIngressOutcome::SourceFull as usize]),
             quic_ingress_no_ingress: get64(&quic[QuicIngressOutcome::NoIngress as usize]),
+            quic_ingress_reserve_full: get64(&quic[QuicIngressOutcome::ReserveFull as usize]),
             egress_immediate: get64(&egress.packets[EgressDecision::Immediate as usize]),
             egress_waited: get64(&egress.packets[EgressDecision::Waited as usize]),
             egress_unpaced: get64(&egress.packets[EgressDecision::Unpaced as usize]),
@@ -3404,6 +3409,7 @@ pub struct TransportSnapshot {
     pub quic_ingress_queue_full: u64,
     pub quic_ingress_source_full: u64,
     pub quic_ingress_no_ingress: u64,
+    pub quic_ingress_reserve_full: u64,
     /// Datagrams sent during the period by how the node-wide egress cap
     /// paced them, by [`EgressDecision`], with their bytes, the bytes and
     /// total and longest wait (microseconds) of those that waited, the
@@ -3734,6 +3740,7 @@ impl TransportSnapshot {
             quic_ingress_queue_full,
             quic_ingress_source_full,
             quic_ingress_no_ingress,
+            quic_ingress_reserve_full,
             egress_immediate,
             egress_waited,
             egress_unpaced,
@@ -3882,6 +3889,7 @@ impl TransportSnapshot {
         self.quic_ingress_queue_full = quic_ingress_queue_full;
         self.quic_ingress_source_full = quic_ingress_source_full;
         self.quic_ingress_no_ingress = quic_ingress_no_ingress;
+        self.quic_ingress_reserve_full = quic_ingress_reserve_full;
         self.egress_immediate = egress_immediate;
         self.egress_waited = egress_waited;
         self.egress_unpaced = egress_unpaced;
@@ -4150,6 +4158,7 @@ struct SnapshotExtras {
     pub quic_ingress_queue_full: u64,
     pub quic_ingress_source_full: u64,
     pub quic_ingress_no_ingress: u64,
+    pub quic_ingress_reserve_full: u64,
     /// Datagrams sent during the period by how the node-wide egress cap
     /// paced them, by [`EgressDecision`], with their bytes, the bytes and
     /// total and longest wait (microseconds) of those that waited, the
@@ -4301,6 +4310,7 @@ impl SnapshotExtras {
             || self.quic_ingress_queue_full != 0
             || self.quic_ingress_source_full != 0
             || self.quic_ingress_no_ingress != 0
+            || self.quic_ingress_reserve_full != 0
             // The debt high-water mark alone is not activity: it is only set
             // by a charge, which also counts a packet.
             || self.egress_immediate != 0
@@ -6123,6 +6133,7 @@ mod tests {
             QuicIngressOutcome::QueueFull => snap.quic_ingress_queue_full,
             QuicIngressOutcome::SourceFull => snap.quic_ingress_source_full,
             QuicIngressOutcome::NoIngress => snap.quic_ingress_no_ingress,
+            QuicIngressOutcome::ReserveFull => snap.quic_ingress_reserve_full,
         }
     }
 
@@ -6728,6 +6739,7 @@ mod tests {
             "quic_ingress_queue_full",
             "quic_ingress_source_full",
             "quic_ingress_no_ingress",
+            "quic_ingress_reserve_full",
             "egress_immediate",
             "egress_waited",
             "egress_unpaced",
