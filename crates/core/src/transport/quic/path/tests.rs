@@ -7296,6 +7296,84 @@ fn an_age_limit_after_the_throttle_lapsed_counts_as_age() {
     })
 }
 
+/// A stream that completes after a gap (its first data datagram lost, so a
+/// later one is read first) counts for nothing toward a raise: the peer
+/// saturates its 16 streams and all 16 complete, one gapped, so no raise.
+/// The same run with nothing lost raises.
+#[test]
+fn a_gapped_completion_does_not_count_toward_a_raise() {
+    use crate::transport::in_memory_socket::{
+        PacketDeliveryDecision, set_packet_delivery_callback,
+    };
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let start = super::super::config::DATA_START_UNI_STREAMS as usize;
+        for (network, gapped, raises) in [
+            ("quic-path-raise-gapped", true, 0),
+            ("quic-path-raise-gap-free", false, 1),
+        ] {
+            let p = paths(network, QuicPathLimits::DEFAULT).await;
+            let (raw, time, from) = (p.a_raw(), p.time(), p.pair.a_addr);
+            let total = 4000u64;
+            let net = network.to_string();
+            p.drive(async move {
+                let mut held = Vec::new();
+                for _ in 0..start {
+                    let mut send = raw.open_uni().await.unwrap();
+                    let mut bytes = header(1, 1, StreamId::next().0, total, 0);
+                    bytes.extend_from_slice(&payload(100));
+                    send.write_all(&bytes).await.unwrap();
+                    held.push(send);
+                }
+                time.sleep(Duration::from_millis(200)).await;
+                let last = held.pop().unwrap();
+                for mut send in held {
+                    send.write_all(&payload(total as usize - 100))
+                        .await
+                        .unwrap();
+                    send.finish().unwrap();
+                }
+                time.sleep(Duration::from_millis(200)).await;
+                if gapped {
+                    let seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    set_packet_delivery_callback(
+                        &net,
+                        Some(Arc::new(move |_: &str, sender, _, bytes: &[u8]| {
+                            if sender == from
+                                && bytes.len() >= 1000
+                                && !seen.swap(true, std::sync::atomic::Ordering::Relaxed)
+                            {
+                                PacketDeliveryDecision::Drop
+                            } else {
+                                PacketDeliveryDecision::Deliver
+                            }
+                        })),
+                    );
+                }
+                let mut last = last;
+                last.write_all(&payload(total as usize - 100))
+                    .await
+                    .unwrap();
+                last.finish().unwrap();
+                time.sleep(Duration::from_secs(3)).await;
+                set_packet_delivery_callback(&net, None);
+            })
+            .await;
+            let stats = p.b.stats();
+            assert_eq!(
+                stats.count(QuicInboundOutcome::CompletedStream) as usize,
+                start,
+                "{network}"
+            );
+            assert_eq!(
+                stats.count(QuicInboundOutcome::StreamLimitRaised),
+                raises,
+                "{network}"
+            );
+        }
+    })
+}
+
 /// A header refused mid-run (here a frame of an unknown version) starts a
 /// pending raise of the stream limit over, end to end: the peer saturates
 /// its 16 streams, three complete (quinn returns credit once more than an
