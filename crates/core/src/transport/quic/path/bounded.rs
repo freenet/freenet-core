@@ -116,6 +116,16 @@ impl SendDeadlines {
         }
     }
 
+    /// The same, with `gap` as the gap ([`Self::gap`]); the open deadline
+    /// stays within it.
+    pub(crate) fn with_gap(self, gap: Duration) -> Self {
+        Self {
+            gap: Some(gap),
+            open: self.open.min(gap),
+            ..self
+        }
+    }
+
     /// The same, waiting up to `limit` for each piece of the send's own
     /// source ([`Self::source_gap`]).
     pub(crate) fn with_source_gap(self, limit: Duration) -> Self {

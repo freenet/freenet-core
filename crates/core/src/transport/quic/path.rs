@@ -1247,6 +1247,16 @@ impl QuicPath {
     /// receiver has given up on unlikely, not impossible.
     ///
     /// [`quic_fragment_gap`]: crate::transport::peer_connection::streaming::quic_fragment_gap
+    /// Deadlines for a node's streamed send of `len` bytes on this path:
+    /// [`SendDeadlines::stream`] with the gap the path's receiver allows
+    /// ([`Self::receiver_gap`], from the path's round trip, at least 5 s)
+    /// rather than a flat 5 s, so a slow path's send is not failed at a gap
+    /// its receiver still waits through. The gap applies only once the
+    /// connection has also stopped making progress (`bounded::ConnectionWatch`).
+    pub(crate) fn stream_deadlines(&self, len: u64) -> SendDeadlines {
+        SendDeadlines::stream(len).with_gap(self.receiver_gap())
+    }
+
     pub(crate) fn receiver_gap(&self) -> Duration {
         crate::transport::peer_connection::streaming::quic_fragment_gap(
             self.connection.inner().stats().path.min_rtt,
