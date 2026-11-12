@@ -74,6 +74,9 @@ struct RealHoldRun {
     floor_window_bytes: u64,
     assembled: usize,
     sent: usize,
+    /// QUIC ingress datagrams over the transfer, process-wide (hub and
+    /// leaves): (forwarded, queue_full, source_full).
+    ingress: (u64, u64, u64),
     /// What each send returned.
     send_outcomes: BTreeMap<String, usize>,
     /// What each received stream came to, and streams that never arrived.
@@ -285,9 +288,7 @@ fn hold_real_time(connections: usize, workers: usize, hogs: usize) -> RealHoldRu
         let assembled = Arc::new(AtomicUsize::new(0));
         let (send_tally, receive_tally) = (Tally::default(), Tally::default());
         let rcvbuf_before = host_rcvbuf_errors();
-        if trace::on() {
-            let _ = crate::transport::TRANSPORT_METRICS.take_snapshot();
-        }
+        let _ = crate::transport::TRANSPORT_METRICS.take_snapshot();
         let started = std::time::Instant::now();
         let mut work = Vec::new();
         for (link, (sender, _receiver, mut inbound, _sender_in)) in links.into_iter().enumerate() {
@@ -401,17 +402,18 @@ fn hold_real_time(connections: usize, workers: usize, hogs: usize) -> RealHoldRu
             worst_total = worst_total.max(total);
             worst_total_raw = worst_total_raw.max(total_raw);
         }
-        if trace::on() {
-            let ingress = crate::transport::TRANSPORT_METRICS.take_snapshot().map(|m| {
+        let ingress = crate::transport::TRANSPORT_METRICS
+            .take_snapshot()
+            .map_or((0, 0, 0), |m| {
                 (
                     m.quic_ingress_forwarded,
                     m.quic_ingress_queue_full,
                     m.quic_ingress_source_full,
-                    m.quic_ingress_not_allowed,
                 )
             });
+        if trace::on() {
             eprintln!(
-                "trace: ingress (forwarded, queue_full, source_full, not_allowed) since setup: {ingress:?}; host RcvbufErrors delta {:?}",
+                "trace: ingress (forwarded, queue_full, source_full) over the transfer: {ingress:?}; host RcvbufErrors delta {:?}",
                 rcvbuf_before.zip(host_rcvbuf_errors()).map(|(a, b)| b.saturating_sub(a))
             );
             let rows = series.map(|t| t.join().expect("series")).unwrap_or_default();
@@ -437,6 +439,7 @@ fn hold_real_time(connections: usize, workers: usize, hogs: usize) -> RealHoldRu
             floor_window_bytes: floor_window_bytes(HUB_MEMORY) as u64,
             assembled: assembled.load(Ordering::Relaxed),
             sent,
+            ingress,
             send_outcomes: send_tally.take(),
             receive_outcomes: receive_tally.take(),
         };
