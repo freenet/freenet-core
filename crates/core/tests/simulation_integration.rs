@@ -22653,7 +22653,10 @@ fn test_quic_native_offer_and_decision_reach_the_wire() {
 /// advertise an older version and fail to decode the native variants, as that
 /// release does. The at-floor nodes send them to each other and never to the
 /// older ones, so no connection closes on an undecodable message and every
-/// node joins.
+/// node joins. Fails closed on its premises: an at-floor node did address a
+/// message carrying a native field to an older node (and it went out without
+/// it), an acceptor answered a request whose offer was dropped on the way,
+/// and a joiner received a response with no decision.
 #[test_log::test]
 fn test_quic_native_pre_floor_nodes_never_receive_the_native_variants() {
     use freenet::dev_tool::NodeLabel;
@@ -22662,10 +22665,10 @@ fn test_quic_native_pre_floor_nodes_never_receive_the_native_variants() {
         SimNetwork::min_compatible_protocol_version(),
         SimNetwork::real_protocol_version(),
     );
-    if min == real {
-        tracing::warn!(?real, "SKIPPED: no older version can be advertised");
-        return;
-    }
+    assert_ne!(
+        min, real,
+        "no older version can be advertised, so this test would check nothing"
+    );
     let run = run_native_wire_sim("native-wire-mixed", SEED, |sim| {
         sim.enable_gateway_ack_version();
         // At-floor nodes advertise the real version; the older ones `min`.
@@ -22683,13 +22686,27 @@ fn test_quic_native_pre_floor_nodes_never_receive_the_native_variants() {
     tracing::info!(
         requests_native = t.requests_native(),
         responses_native = t.responses_native(),
+        native_fields_dropped = t.native_fields_dropped(),
         accepts_without_offer = t.accepts_without_offer(),
+        joiner_without = t.joiner_responses_without_decision(),
         undecodable = t.undecodable_closes(),
         "mixed native wire trace"
     );
     assert!(
         t.requests_native() > 0,
         "premise: the at-floor nodes sent RequestNative"
+    );
+    assert!(
+        t.native_fields_dropped() > 0,
+        "premise: a message carrying a native field went to an older node"
+    );
+    assert!(
+        t.accepts_without_offer() > 0,
+        "an acceptor answered a request whose offer was dropped"
+    );
+    assert!(
+        t.joiner_responses_without_decision() > 0,
+        "a joiner received a response with no decision"
     );
     assert_eq!(
         t.undecodable_closes(),
@@ -22701,11 +22718,12 @@ fn test_quic_native_pre_floor_nodes_never_receive_the_native_variants() {
     assert!(connected);
 }
 
-/// At 0% (this release) the native fields change no join: the same seed
-/// with the variants on the wire and with them never sent joins the same
-/// peers into a connected mesh.
+/// At 0% (this release) the native fields change no connection: the same
+/// seed with the variants on the wire and with them never sent (every peer
+/// treated as below the floor, so every message goes out in today's
+/// encoding) forms the same mesh, edge for edge.
 #[test_log::test]
-fn test_quic_native_zero_percent_joins_like_main() {
+fn test_quic_native_zero_percent_forms_the_same_mesh() {
     const SEED: u64 = 0x5940_A3_0003;
     let off = run_native_wire_sim("native-wire-off", SEED, |sim| {
         sim.enable_gateway_ack_version();
@@ -22722,5 +22740,6 @@ fn test_quic_native_zero_percent_joins_like_main() {
     assert!(off_connected);
     assert_eq!(on_peers, off_peers, "the same peers join");
     assert!(on_connected);
+    assert_eq!(on.mesh, off.mesh, "the same connections form");
     assert_eq!(on.trace.undecodable_closes(), 0);
 }

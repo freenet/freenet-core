@@ -244,6 +244,22 @@ pub(crate) fn connect_wire_index(bytes: &[u8]) -> Option<u32> {
     word(8)
 }
 
+/// Whether `msg` is a connect request or response carrying a native offer or
+/// decision, i.e. one the V2 encoding would carry and V1 drops.
+#[cfg(any(test, feature = "testing"))]
+pub(crate) fn carries_native_fields(msg: &crate::message::NetMessage) -> bool {
+    use crate::message::{NetMessage, NetMessageV1};
+    match msg {
+        NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Request { payload, .. })) => {
+            payload.native_offer.is_some()
+        }
+        NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Response { payload, .. })) => {
+            payload.native_decision.is_some()
+        }
+        _ => false,
+    }
+}
+
 /// Per-network record of the QUIC-native wire fields in a simulation, so a
 /// test can assert that the appended variants actually went out and what the
 /// connect op did with them (`SimNetwork::native_wire_trace`).
@@ -261,6 +277,7 @@ pub mod sim_trace {
     #[derive(Debug, Default)]
     struct Counts {
         sent: [AtomicU64; 7],
+        native_fields_dropped: AtomicU64,
         undecodable_closes: AtomicU64,
         accepts_with_offer: AtomicU64,
         accepts_without_offer: AtomicU64,
@@ -274,6 +291,10 @@ pub mod sim_trace {
     pub(crate) enum NativeWireEvent {
         /// A `ConnectMsg` of this wire index was handed to the transport.
         Sent(u32),
+        /// A request or response carrying a native field went out in today's
+        /// encoding (index 0 or 1), so the field was dropped: the peer is
+        /// below the floor or its version is unknown.
+        NativeFieldsDropped,
         /// A connection was closed on a message that did not decode.
         UndecodableClose,
         /// An acceptor answered a request; `retry` for a re-routed one.
@@ -305,6 +326,7 @@ pub mod sim_trace {
                 Some(counter) => counter,
                 None => return,
             },
+            NativeWireEvent::NativeFieldsDropped => &c.native_fields_dropped,
             NativeWireEvent::UndecodableClose => &c.undecodable_closes,
             NativeWireEvent::Accepted {
                 with_offer: true,
@@ -348,6 +370,11 @@ pub mod sim_trace {
         /// Responses sent as `ResponseNative` (index 6).
         pub fn responses_native(&self) -> u64 {
             self.sent(6)
+        }
+        /// Requests and responses whose native field was dropped because the
+        /// peer they went to gets today's encoding.
+        pub fn native_fields_dropped(&self) -> u64 {
+            Self::get(&self.0.native_fields_dropped)
         }
         /// Connections closed on an undecodable message.
         pub fn undecodable_closes(&self) -> u64 {
@@ -471,7 +498,6 @@ mod tests {
                 visited: f.visited.clone(),
                 uphill_budget: 3,
                 native_offer: offer,
-                joiner_transport_held: true,
             },
         }
     }
@@ -604,7 +630,6 @@ mod tests {
                 match (&back, &new) {
                     (ConnectMsg::Request { payload: b, .. }, ConnectMsg::Request { .. }) => {
                         assert_eq!(b.native_offer, None);
-                        assert!(!b.joiner_transport_held, "never on the wire");
                     }
                     (ConnectMsg::Response { payload: b, .. }, ConnectMsg::Response { .. }) => {
                         assert_eq!(b.native_decision, None);
@@ -730,21 +755,49 @@ mod tests {
         }
     }
 
-    /// A level-2 offer from a later release reads as level 1 here.
+    /// A node in the test-only pre-floor mode encodes as an older release
+    /// does: today's bytes to every peer, at or above the floor too.
     #[test]
-    fn a_native_only_offer_decodes_as_capable() {
+    fn pre_floor_mode_never_encodes_the_native_variants() {
+        let f = fixture();
+        let old = super::super::native::NativeWire {
+            floor: FLOOR,
+            pre_floor: true,
+        };
+        let new = super::super::native::NativeWire {
+            floor: FLOOR,
+            pre_floor: false,
+        };
+        let msg = net(request(&f, Some(NativeOffer::capable(40))));
+        for remote in [None, Some(FLOOR), Some((0, 3, 0))] {
+            let bytes = old.encode(&msg, remote).unwrap();
+            assert_eq!(connect_wire_index(&bytes), Some(0), "{remote:?}");
+            assert_eq!(bytes, bincode::serialize(&msg).unwrap());
+        }
+        assert_eq!(
+            connect_wire_index(&new.encode(&msg, Some(FLOOR)).unwrap()),
+            Some(5),
+            "the same message goes out as V2 from an at-floor node"
+        );
+    }
+
+    /// A relay on this release passes on an offer level and a decision value
+    /// a later release sends, byte for byte: what it decodes and encodes again
+    /// for the next at-floor hop is what it received.
+    #[test]
+    fn a_relay_passes_on_values_a_later_release_sends() {
         let f = fixture();
         let offer = NativeOffer {
             level: super::super::native::LEVEL_NATIVE_ONLY,
-            percent: 100,
+            percent: 250,
         };
-        let bytes = encode_for_peer(&net(request(&f, Some(offer))), Some(FLOOR), FLOOR).unwrap();
-        let NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Request { payload, .. })) =
-            bincode::deserialize(&bytes).unwrap()
-        else {
-            panic!("a request")
-        };
-        assert_eq!(payload.native_offer, Some(NativeOffer::capable(100)));
+        let decision = NativeDecision::Unknown(7);
+        for msg in [request(&f, Some(offer)), response(&f, Some(decision))] {
+            let received = encode_for_peer(&net(msg), Some(FLOOR), FLOOR).unwrap();
+            let decoded: NetMessage = bincode::deserialize(&received).unwrap();
+            let forwarded = encode_for_peer(&decoded, Some(FLOOR), FLOOR).unwrap();
+            assert_eq!(forwarded, received);
+        }
     }
 
     #[test]

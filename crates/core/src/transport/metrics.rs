@@ -862,7 +862,10 @@ pub struct TransportMetrics {
     connect_native_offered_zero: AtomicU64,
     connect_native_offered_nonzero: AtomicU64,
     /// QUIC-native decisions this node made as acceptor for a request that
-    /// carried an offer, by decision (reset each snapshot).
+    /// carried an offer, by decision (reset each snapshot). One per accept: a
+    /// relay accepts a transaction at most once, but a join re-routed to
+    /// several acceptors counts at each of them, so these count decisions,
+    /// not joins.
     connect_native_decided_native: AtomicU64,
     connect_native_decided_udp: AtomicU64,
     /// Responses deciding `Native` this node received as joiner and could not
@@ -1236,6 +1239,11 @@ thread_local! {
     /// any test that takes a snapshot, so a test reads these instead.
     pub(crate) static NATIVE_DECISION_FAILURES_ON_THIS_THREAD: std::cell::Cell<[u64; 2]> =
         const { std::cell::Cell::new([0; 2]) };
+
+    /// Test-only: QUIC-native offers recorded on this thread, for the same
+    /// reason.
+    pub(crate) static NATIVE_OFFERS_ON_THIS_THREAD: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -1873,6 +1881,8 @@ impl TransportMetrics {
             .store(offer.percent, Ordering::Relaxed);
         self.connect_native_offer_ready
             .store(ready, Ordering::Relaxed);
+        #[cfg(test)]
+        NATIVE_OFFERS_ON_THIS_THREAD.with(|count| count.set(count.get() + 1));
     }
 
     /// The acceptor decided `decision` for a request that carried an offer.
@@ -1883,7 +1893,9 @@ impl TransportMetrics {
         use crate::operations::connect::native::NativeDecision;
         let counter = match decision {
             NativeDecision::Native => &self.connect_native_decided_native,
-            NativeDecision::Udp => &self.connect_native_decided_udp,
+            // This node never decides a value it does not know; were one to
+            // reach here, it is not `Native`.
+            NativeDecision::Udp | NativeDecision::Unknown(_) => &self.connect_native_decided_udp,
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }
@@ -5277,8 +5289,6 @@ mod tests {
         assert_eq!(snap.inbound_queue_drops, 1);
     }
 
-    /// Received QUIC upgrade control messages reach the snapshot, count as
-    /// activity on their own, and reset.
     /// The QUIC-native connect counters reach the snapshot by kind and reset;
     /// the effective offer is a state that stays.
     #[test]
@@ -5316,6 +5326,8 @@ mod tests {
         assert_eq!(snap.connect_native_offered_zero, 0);
     }
 
+    /// Received QUIC upgrade control messages reach the snapshot, count as
+    /// activity on their own, and reset.
     #[test]
     fn upgrade_decline_suppressed_reaches_snapshot_and_resets() {
         let metrics = TransportMetrics::new();

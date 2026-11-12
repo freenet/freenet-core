@@ -3607,10 +3607,11 @@ async fn handle_peer_channel_message(
                 .ok()
                 .and_then(|bytes| crate::operations::connect::connect_wire_index(bytes))
             {
-                crate::operations::connect::native_wire_trace::record_at(
-                    conn.remote_addr(),
-                    crate::operations::connect::native_wire_trace::NativeWireEvent::Sent(index),
-                );
+                use crate::operations::connect::native_wire_trace::{NativeWireEvent, record_at};
+                record_at(conn.remote_addr(), NativeWireEvent::Sent(index));
+                if index <= 1 && crate::operations::connect::carries_native_fields(&msg) {
+                    record_at(conn.remote_addr(), NativeWireEvent::NativeFieldsDropped);
+                }
             }
             let sent =
                 send_serialized_message(conn, serialized, broadcast_contract, propagation).await;

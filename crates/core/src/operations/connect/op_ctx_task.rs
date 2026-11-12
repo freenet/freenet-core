@@ -398,6 +398,9 @@ async fn drive_client_connect(
     };
 
     let mut accepted: HashSet<PeerKeyLocation> = HashSet::with_capacity(target_connections);
+    // Acceptors that decided `Native`, which this build cannot dial: each is
+    // counted and reported upstream once, whatever duplicates arrive.
+    let mut refused_native: HashSet<PeerKeyLocation> = HashSet::new();
     // `connected_dials`: acceptors actually connected. `accepted` also holds
     // acceptors still queued or being dialled, so it cannot decide that the
     // target is reached.
@@ -781,9 +784,18 @@ async fn drive_client_connect(
                         },
                     );
                 }
+                if accepted.contains(&payload.acceptor)
+                    || refused_native.contains(&payload.acceptor)
+                {
+                    // Duplicate acceptor — ignore.
+                    continue;
+                }
+
                 // `None` and `Udp` go on as today. This build has no native
                 // dial, so a `Native` decision cannot be honoured: the attempt
-                // with this acceptor fails and is counted by why.
+                // with this acceptor fails, is counted by why, and is reported
+                // upstream as `ConnectFailed` like a failed punch, so the relay
+                // re-routes and the acceptor's reservation is released.
                 if let Err(failure) =
                     super::native::joiner_response_action(sent_offer, payload.native_decision)
                 {
@@ -794,13 +806,32 @@ async fn drive_client_connect(
                         acceptor = %payload.acceptor,
                         ?failure,
                         "connect driver: acceptor decided a native connection this node \
-                         cannot set up; skipping it"
+                         cannot set up; reporting it failed"
                     );
-                    continue;
-                }
-
-                if accepted.contains(&payload.acceptor) {
-                    // Duplicate acceptor — ignore.
+                    refused_native.insert(payload.acceptor.clone());
+                    if collection_end.is_none() {
+                        if let Some(failed_acceptor_addr) = payload.acceptor.socket_addr() {
+                            let failed_msg = ConnectMsg::ConnectFailed {
+                                id: tx,
+                                failed_acceptor_addr,
+                            };
+                            if let Err(e) = op_manager
+                                .notify_node_event(NodeEvent::SendNetMessage {
+                                    target: gateway_addr,
+                                    msg: Box::new(NetMessage::V1(NetMessageV1::Connect(
+                                        failed_msg,
+                                    ))),
+                                })
+                                .await
+                            {
+                                tracing::warn!(
+                                    tx = %tx,
+                                    error = %e,
+                                    "connect driver: failed to emit ConnectFailed"
+                                );
+                            }
+                        }
+                    }
                     continue;
                 }
 
@@ -2584,6 +2615,49 @@ mod driver_timing_tests {
         );
     }
 
+    /// The relay's "holds a transport to the joiner" input, read from the
+    /// ring when it decides: a ring connection under the joiner's key (at any
+    /// address), a ring connection at the joiner's address (under any key),
+    /// or a transient transport at its address. Each is read live, so one
+    /// made after the request arrived counts.
+    #[tokio::test(start_paused = true)]
+    async fn the_relay_reads_held_transports_from_the_ring_when_it_decides() {
+        use crate::operations::connect::{RelayContext, RelayEnv};
+        let (op_manager, events) = op_manager_with_events("relay-holds-transport").await;
+        std::mem::forget(events);
+        let connections = &op_manager.ring.connection_manager;
+        let env = RelayEnv::new(&op_manager);
+
+        let by_key = peer(24901);
+        assert!(!env.holds_transport_to(&by_key), "nothing held yet");
+        let other_addr = peer(24902).socket_addr().unwrap();
+        assert!(connections.add_connection(
+            Location::from_address(&other_addr),
+            other_addr,
+            by_key.pub_key().clone(),
+            false,
+        ));
+        assert!(env.holds_transport_to(&by_key), "same key, other address");
+
+        let by_addr = peer(24903);
+        let addr = by_addr.socket_addr().unwrap();
+        assert!(!env.holds_transport_to(&by_addr));
+        assert!(connections.add_connection(
+            Location::from_address(&addr),
+            addr,
+            TransportKeypair::new().public().clone(),
+            false,
+        ));
+        assert!(env.holds_transport_to(&by_addr), "same address, other key");
+
+        let transient = peer(24904);
+        assert!(!env.holds_transport_to(&transient));
+        assert!(connections.try_register_transient(transient.socket_addr().unwrap(), None));
+        assert!(env.holds_transport_to(&transient), "a transient transport");
+
+        assert!(!env.holds_transport_to(&peer(24905)));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_connected_peers_connect_keeps_collecting_acceptors() {
         let (op_manager, events) = op_manager_with_events("driver-connected-peer").await;
@@ -3284,25 +3358,38 @@ mod driver_timing_tests {
         )))
     }
 
-    /// Runs a joiner that sent `sent_offer` against one response per acceptor
-    /// with the given decision; returns the acceptors it dialled.
+    /// What a joiner did with the responses it got.
+    struct DecisionRun {
+        /// The acceptors it dialled.
+        dialled: Vec<SocketAddr>,
+        /// Every acceptor's address, by index.
+        all: Vec<SocketAddr>,
+        /// The acceptors it reported to the gateway as failed.
+        connect_failed: Vec<SocketAddr>,
+    }
+
+    /// Runs a joiner that sent `sent_offer` against `responses`, each an
+    /// acceptor's index and its decision (an index may repeat, for a
+    /// duplicate response).
     async fn dials_for_decisions(
         name: &str,
         sent_offer: Option<crate::operations::connect::native::NativeOffer>,
-        decisions: Vec<Option<crate::operations::connect::native::NativeDecision>>,
-    ) -> (Vec<SocketAddr>, Vec<SocketAddr>) {
+        responses: Vec<(
+            usize,
+            Option<crate::operations::connect::native::NativeDecision>,
+        )>,
+    ) -> DecisionRun {
         let (op_manager, events) = op_manager_with_events(name).await;
         connect_existing_peer(&op_manager, 24949);
         let log = scripted_event_loop(events, vec![]);
         let tx = Transaction::new::<ConnectMsg>();
         let gateway = peer(24950);
-        let acceptors: Vec<_> = (0..decisions.len() as u16)
-            .map(|i| peer(24951 + i))
-            .collect();
+        let count = responses.iter().map(|(i, _)| i + 1).max().unwrap_or(0);
+        let acceptors: Vec<_> = (0..count as u16).map(|i| peer(24951 + i)).collect();
         let (replies_tx, replies_rx) = mpsc::channel(16);
-        for (acceptor, decision) in acceptors.iter().zip(decisions) {
+        for (index, decision) in responses {
             replies_tx
-                .send(response_deciding(tx, acceptor, decision))
+                .send(response_deciding(tx, &acceptors[index], decision))
                 .await
                 .unwrap();
         }
@@ -3328,9 +3415,12 @@ mod driver_timing_tests {
         .expect("bounded")
         .expect("driver result");
         tokio::time::sleep(Duration::from_millis(10)).await;
-        let dialled = log.lock().dials.iter().map(|(addr, _)| *addr).collect();
-        let all = acceptors.iter().map(|a| a.socket_addr().unwrap()).collect();
-        (dialled, all)
+        let log = log.lock();
+        DecisionRun {
+            dialled: log.dials.iter().map(|(addr, _)| *addr).collect(),
+            all: acceptors.iter().map(|a| a.socket_addr().unwrap()).collect(),
+            connect_failed: log.connect_failed.clone(),
+        }
     }
 
     fn decision_failures_here() -> (u64, u64) {
@@ -3340,25 +3430,52 @@ mod driver_timing_tests {
     }
 
     /// A response deciding `Native` to a joiner that offered 0 cannot be
-    /// honoured: that acceptor is not dialled, and it counts as a decision
-    /// without an offer. `Udp` and no decision are dialled as today. (One run
-    /// per test: an `OpManager` per test runtime.)
+    /// honoured: that acceptor is not dialled, it is reported to the gateway
+    /// as failed (so the relay re-routes), and it counts as a decision without
+    /// an offer. `Udp`, no decision and an unknown decision are dialled as
+    /// today. (One run per test: an `OpManager` per test runtime.)
     #[tokio::test(start_paused = true)]
     async fn a_native_decision_to_a_zero_offer_fails_the_attempt() {
         use crate::operations::connect::native::{NativeDecision, NativeOffer};
         let before = decision_failures_here();
-        let (dialled, all) = dials_for_decisions(
+        let run = dials_for_decisions(
             "native-decision-zero-offer",
             Some(NativeOffer::capable(0)),
             vec![
-                None,
-                Some(NativeDecision::Udp),
-                Some(NativeDecision::Native),
+                (0, None),
+                (1, Some(NativeDecision::Udp)),
+                (2, Some(NativeDecision::Native)),
+                (3, Some(NativeDecision::Unknown(9))),
             ],
         )
         .await;
-        assert_eq!(dialled, all[..2].to_vec(), "only the Native one is skipped");
+        assert_eq!(
+            run.dialled,
+            vec![run.all[0], run.all[1], run.all[3]],
+            "only the Native one is skipped"
+        );
+        assert_eq!(run.connect_failed, vec![run.all[2]]);
         assert_eq!(decision_failures_here(), (before.0 + 1, before.1));
+    }
+
+    /// A duplicate of a `Native` response is ignored: one count, one report.
+    #[tokio::test(start_paused = true)]
+    async fn a_duplicate_native_decision_counts_once() {
+        use crate::operations::connect::native::{NativeDecision, NativeOffer};
+        let before = decision_failures_here();
+        let run = dials_for_decisions(
+            "native-decision-duplicate",
+            Some(NativeOffer::capable(30)),
+            vec![
+                (0, Some(NativeDecision::Native)),
+                (0, Some(NativeDecision::Native)),
+                (1, Some(NativeDecision::Udp)),
+            ],
+        )
+        .await;
+        assert_eq!(run.dialled, vec![run.all[1]]);
+        assert_eq!(run.connect_failed, vec![run.all[0]]);
+        assert_eq!(decision_failures_here(), (before.0, before.1 + 1));
     }
 
     /// The same for a joiner that offered above 0: counted as unsupported,
@@ -3367,13 +3484,17 @@ mod driver_timing_tests {
     async fn a_native_decision_to_a_real_offer_fails_the_attempt() {
         use crate::operations::connect::native::{NativeDecision, NativeOffer};
         let before = decision_failures_here();
-        let (dialled, all) = dials_for_decisions(
+        let run = dials_for_decisions(
             "native-decision-real-offer",
             Some(NativeOffer::capable(30)),
-            vec![Some(NativeDecision::Native), Some(NativeDecision::Udp)],
+            vec![
+                (0, Some(NativeDecision::Native)),
+                (1, Some(NativeDecision::Udp)),
+            ],
         )
         .await;
-        assert_eq!(dialled, all[1..].to_vec());
+        assert_eq!(run.dialled, run.all[1..].to_vec());
+        assert_eq!(run.connect_failed, vec![run.all[0]]);
         assert_eq!(decision_failures_here(), (before.0, before.1 + 1));
     }
 

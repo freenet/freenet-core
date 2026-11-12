@@ -46,7 +46,7 @@ pub(crate) const QUIC_NATIVE_PERCENT: u8 = 0;
 pub(crate) const LEVEL_NATIVE_CAPABLE: u8 = 1;
 
 /// Offer level reserved for a node that has no UDP path. Never sent by this
-/// release; a received level other than [`LEVEL_NATIVE_CAPABLE`] reads as it.
+/// release, and not read by it: no decision here depends on the level.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const LEVEL_NATIVE_ONLY: u8 = 2;
 
@@ -62,34 +62,23 @@ const SLICE_DOMAIN: &[u8] = b"freenet-quic-native-slice-v1";
 /// What a joiner offers in its `ConnectRequest`.
 ///
 /// `percent` is the joiner's effective share, 0 to 100 (0 while it cannot dial
-/// native). Decoding is lenient so a later release can extend the offer
-/// without breaking this one: an unknown `level` reads as
-/// [`LEVEL_NATIVE_CAPABLE`] and a `percent` above 100 reads as 100.
+/// native). Both bytes are kept exactly as received, so a relay on this
+/// release passes on a level or percent a later release sends without
+/// rewriting it. They are read only where this node decides: the level not at
+/// all (every level reads as [`LEVEL_NATIVE_CAPABLE`]), and the percent
+/// through [`NativeOffer::effective_percent`], which caps it at 100.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(from = "RawNativeOffer")]
 pub(crate) struct NativeOffer {
     pub level: u8,
     pub percent: u8,
 }
 
-/// The offer's encoding as received, before [`NativeOffer`]'s reading of it.
-/// Same fields in the same order, so the encoding of both is one.
-#[derive(Deserialize)]
-struct RawNativeOffer {
-    level: u8,
-    percent: u8,
-}
-
-impl From<RawNativeOffer> for NativeOffer {
-    fn from(raw: RawNativeOffer) -> Self {
-        // Level 2 (`native_only`) is reserved and not acted on by this
-        // release, and any other value is unknown: every level reads as 1.
-        let _ = raw.level;
-        Self::capable(raw.percent)
-    }
-}
-
 impl NativeOffer {
+    /// The percent this node reads from the offer: as sent, capped at 100.
+    pub(crate) fn effective_percent(self) -> u8 {
+        self.percent.min(100)
+    }
+
     /// A level-1 offer with `percent`, capped at 100.
     pub(crate) fn capable(percent: u8) -> Self {
         Self {
@@ -101,9 +90,10 @@ impl NativeOffer {
 
 /// The acceptor's answer, carried by its `ConnectResponse`.
 ///
-/// Encoded as one byte: 0 is `Udp`, 1 is `Native`, and any other value reads
-/// as `Udp`, so a decision a later release adds can never close a connection
-/// to this one by failing to decode.
+/// Encoded as one byte: 0 is `Udp`, 1 is `Native`. Any other value is a
+/// decision a later release added: it decodes (so it can never close a
+/// connection to this one), a relay passes it on unchanged, and a joiner on
+/// this release reads it as `Udp`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(from = "u8", into = "u8")]
 pub(crate) enum NativeDecision {
@@ -112,13 +102,17 @@ pub(crate) enum NativeDecision {
     Udp,
     /// Set up a native QUIC connection.
     Native,
+    /// A value this release does not know, kept as received. This node never
+    /// decides it.
+    Unknown(u8),
 }
 
 impl From<u8> for NativeDecision {
     fn from(wire: u8) -> Self {
         match wire {
+            0 => Self::Udp,
             1 => Self::Native,
-            _ => Self::Udp,
+            other => Self::Unknown(other),
         }
     }
 }
@@ -128,6 +122,7 @@ impl From<NativeDecision> for u8 {
         match decision {
             NativeDecision::Udp => 0,
             NativeDecision::Native => 1,
+            NativeDecision::Unknown(wire) => wire,
         }
     }
 }
@@ -257,7 +252,7 @@ pub(crate) fn decide_native(
     bucket: u8,
     holds_transport: bool,
 ) -> NativeDecision {
-    let offered = offer.map_or(0, |o| o.percent.min(100));
+    let offered = offer.map_or(0, NativeOffer::effective_percent);
     let native =
         offered > 0 && own.ready && bucket < offered.min(own.percent.min(100)) && !holds_transport;
     if native {
@@ -304,16 +299,17 @@ pub(crate) enum JoinerDecisionFailure {
 }
 
 /// What the joiner does with a response's decision, given the offer it sent.
-/// `None` and `Udp` keep today's behaviour; `Native` fails the attempt, since
-/// this build cannot set up a native connection.
+/// `None`, `Udp` and a decision this release does not know keep today's
+/// behaviour; `Native` fails the attempt, since this build cannot set up a
+/// native connection.
 pub(crate) fn joiner_response_action(
     sent: Option<NativeOffer>,
     decision: Option<NativeDecision>,
 ) -> Result<(), JoinerDecisionFailure> {
     match decision {
-        None | Some(NativeDecision::Udp) => Ok(()),
+        None | Some(NativeDecision::Udp | NativeDecision::Unknown(_)) => Ok(()),
         Some(NativeDecision::Native) => {
-            if sent.is_none_or(|o| o.percent == 0) {
+            if sent.is_none_or(|o| o.effective_percent() == 0) {
                 Err(JoinerDecisionFailure::DecisionWithoutOffer)
             } else {
                 Err(JoinerDecisionFailure::NativeUnsupported)
@@ -570,18 +566,28 @@ mod tests {
         assert_eq!(joiner_response_action(five, native), Err(NativeUnsupported));
     }
 
-    /// A reserved or unknown level reads as level 1, and an out-of-range
-    /// percent as 100.
+    /// Every level and percent decodes and re-encodes to the same bytes, so a
+    /// relay passes them on unchanged; a level does not change a decision, and
+    /// a percent above 100 reads as 100.
     #[test]
-    fn unknown_offer_levels_decode_as_capable() {
+    fn offers_keep_their_bytes_and_read_as_capable() {
         for level in [LEVEL_NATIVE_CAPABLE, LEVEL_NATIVE_ONLY, 0, 7, u8::MAX] {
-            let bytes = bincode::serialize(&(level, 40u8)).unwrap();
-            let offer: NativeOffer = bincode::deserialize(&bytes).unwrap();
-            assert_eq!(offer, NativeOffer::capable(40), "level {level}");
+            for percent in [0u8, 40, 100, 250] {
+                let bytes = bincode::serialize(&(level, percent)).unwrap();
+                let offer: NativeOffer = bincode::deserialize(&bytes).unwrap();
+                assert_eq!((offer.level, offer.percent), (level, percent));
+                assert_eq!(bincode::serialize(&offer).unwrap(), bytes);
+                assert_eq!(offer.effective_percent(), percent.min(100));
+                let own = ready(100);
+                for bucket in [0, 50, 99] {
+                    assert_eq!(
+                        decide_native(Some(offer), own, bucket, false),
+                        decide_native(Some(NativeOffer::capable(percent)), own, bucket, false),
+                        "level {level} percent {percent} bucket {bucket}"
+                    );
+                }
+            }
         }
-        let bytes = bincode::serialize(&(LEVEL_NATIVE_CAPABLE, 250u8)).unwrap();
-        let offer: NativeOffer = bincode::deserialize(&bytes).unwrap();
-        assert_eq!(offer.percent, 100);
         // The encoding is the two bytes, in order.
         assert_eq!(
             bincode::serialize(&NativeOffer::capable(7)).unwrap(),
@@ -589,19 +595,25 @@ mod tests {
         );
     }
 
+    /// A decision is one byte. Every byte decodes and re-encodes to itself,
+    /// so a relay passes on a value a later release adds; a joiner here reads
+    /// an unknown one as `Udp`.
     #[test]
-    fn decisions_are_one_byte_and_unknown_reads_as_udp() {
+    fn decisions_are_one_byte_and_keep_unknown_values() {
         assert_eq!(bincode::serialize(&NativeDecision::Udp).unwrap(), vec![0]);
         assert_eq!(
             bincode::serialize(&NativeDecision::Native).unwrap(),
             vec![1]
         );
-        for wire in [0u8, 2, 9, u8::MAX] {
+        for wire in 0..=u8::MAX {
             let decision: NativeDecision = bincode::deserialize(&[wire]).unwrap();
-            assert_eq!(decision, NativeDecision::Udp, "{wire}");
+            assert_eq!(bincode::serialize(&decision).unwrap(), vec![wire]);
+            if wire > 1 {
+                assert_eq!(decision, NativeDecision::Unknown(wire));
+                let offer = Some(NativeOffer::capable(50));
+                assert_eq!(joiner_response_action(offer, Some(decision)), Ok(()));
+            }
         }
-        let decision: NativeDecision = bincode::deserialize(&[1]).unwrap();
-        assert_eq!(decision, NativeDecision::Native);
     }
 
     #[test]
