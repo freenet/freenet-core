@@ -1440,6 +1440,14 @@ a test passes its own; tests read their own, never the global).
   level in the period, and the highest count a reset in the period took a path
   to). They are for the fixed charge, which takes quinn's stopped map at
   SEND_ABORT_LIMIT x QUIC_STOPPED_ENTRY_BYTES until field data justifies less.
+  quic_dark_episode_<recovered_lt_2s|lt_5s|lt_10s|lt_30s|lt_120s|recovered_ge_120s|
+  unrecovered|closed_at_window>: dark episodes (recycle::AckWatch: packets
+  outstanding, nothing acknowledged, nothing heard) by how they ended. The
+  dark-path rule closes only a path that carries data (QuicPath::enable_data);
+  on every other path (all of them while QUIC_DATA_PERCENT is 0) it only
+  counts, so the field shows how long real dark spells last. The dark
+  threshold (the 10 s window) is to be revisited from these numbers before the
+  data ramp passes 5%.
   quic_gate_loss_<queue|share|persistent|ecn|no_sample|ignored> (congestion
   events by the loss gate's verdict, recycle::loss_gate, reported by the path's
   report at each tick; over a path's life they sum to its quic_congestion_events,
