@@ -7136,6 +7136,205 @@ fn a_throttle_pauses_idle_and_the_age_limit_counts_apart() {
     })
 }
 
+/// A stream the peer opened but sent no byte on (quinn opens every lower id
+/// with a higher one) is not active when a throttle begins, so its idle timer
+/// is not paused: it ends idle while the throttle lasts.
+#[test]
+fn a_stream_with_no_byte_is_not_paused_by_a_throttle() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let windows = Windows {
+            a: Some(test_budget(64 << 20, leaked_counters())),
+            b: Some(test_budget(64 << 20, leaked_counters())),
+        };
+        let p = paths_metered("quic-budget-throttle-empty", windows).await;
+        let meter = p.b.meter().expect("b reads data under a budget").clone();
+        let idle = streaming_handle_idle_timeout();
+        let (raw, time) = (p.a_raw(), p.time());
+        p.drive(async move {
+            let _empty = raw.open_uni().await.unwrap();
+            // A whole control frame on the next id, which opens the first.
+            let mut later = raw.open_uni().await.unwrap();
+            let mut frame = header(1, 2, 0, 4, 0);
+            frame.extend_from_slice(&payload(4));
+            later.write_all(&frame).await.unwrap();
+            later.finish().unwrap();
+            let now = time.now_nanos();
+            meter.throttle_for_test(now, now + 10 * idle.as_nanos() as u64);
+            time.sleep(idle * 2).await;
+        })
+        .await;
+        let stats = p.b.stats();
+        assert_eq!(stats.count(QuicInboundOutcome::ThrottledPastAge), 0);
+        assert!(
+            stats.count(QuicInboundOutcome::IdleUncharged) >= 1,
+            "the empty stream ended idle"
+        );
+    })
+}
+
+/// A pause lasts only while the throttle does: a stream whose idle timer a
+/// throttle paused, and which reaches its age limit after the throttle
+/// lapsed, is counted `EvictedAge`, not `ThrottledPastAge`.
+#[test]
+fn an_age_limit_after_the_throttle_lapsed_counts_as_age() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let windows = Windows {
+            a: Some(test_budget(64 << 20, leaked_counters())),
+            b: Some(test_budget(64 << 20, leaked_counters())),
+        };
+        let p = paths_metered("quic-budget-throttle-lapse", windows).await;
+        let meter = p.b.meter().expect("b reads data under a budget").clone();
+        let idle = streaming_handle_idle_timeout();
+        let total = 10_000u64;
+        let age = max_inbound_stream_age(total);
+        // The stream's last byte at 7 s; paused at each idle period after it.
+        let progress = Duration::from_secs(7);
+        let periods = (age - progress).as_nanos() / idle.as_nanos();
+        let last_pause = progress + idle * periods as u32;
+        assert!(
+            age > last_pause + Duration::from_secs(2),
+            "premise: the age limit comes before the next idle period"
+        );
+        // The throttle lapses after the last pause, before the age limit.
+        let lapse = last_pause + (age - last_pause) / 2;
+        let (raw, time) = (p.a_raw(), p.time());
+        let code = p
+            .drive(async move {
+                let start = time.now_nanos();
+                let mut bytes = header(1, 1, StreamId::next().0, total, 0);
+                bytes.extend_from_slice(&payload(1000));
+                let mut send = raw.open_uni().await.unwrap();
+                send.write_all(&bytes).await.unwrap();
+                time.sleep(progress).await;
+                send.write_all(&payload(1)).await.unwrap();
+                time.sleep(Duration::from_millis(100)).await;
+                meter.throttle_for_test(time.now_nanos(), start + lapse.as_nanos() as u64);
+                send.stopped().await.unwrap().map(|code| code.into_inner())
+            })
+            .await;
+        assert_eq!(code, Some(u64::from(stop_code::EVICTED)));
+        let stats = p.b.stats();
+        assert_eq!(stats.count(QuicInboundOutcome::ThrottledPastAge), 0);
+        assert_eq!(stats.shared_count(InboundStreamOutcome::EvictedAge), 1);
+        assert_eq!(stats.shared_count(InboundStreamOutcome::EvictedIdle), 0);
+    })
+}
+
+/// A Stream whose consumer is waiting in `assemble()` survives a throttle
+/// longer than the consumer's gap: the consumer waits while the budget
+/// throttles the path, as the reader does, and gets the whole stream once
+/// the rest arrives.
+#[test]
+fn a_consumer_waits_through_a_throttle() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let windows = Windows {
+            a: Some(test_budget(64 << 20, leaked_counters())),
+            b: Some(test_budget(64 << 20, leaked_counters())),
+        };
+        let mut p = paths_metered("quic-budget-throttle-consumer", windows).await;
+        let meter = p.b.meter().expect("b reads data under a budget").clone();
+        let idle = streaming_handle_idle_timeout();
+        let total = 10_000usize;
+        let body = payload(total);
+        let mut streams = std::mem::replace(&mut p.b_in.streams, tokio::sync::mpsc::channel(1).1);
+        let (raw, time) = (p.a_raw(), p.time());
+        let sent = body.clone();
+        let (assembled, gap) = p
+            .drive(async move {
+                let mut bytes = header(1, 1, StreamId::next().0, total as u64, 0);
+                bytes.extend_from_slice(&sent[..1000]);
+                let mut send = raw.open_uni().await.unwrap();
+                send.write_all(&bytes).await.unwrap();
+                let arrival = streams.recv().await.expect("announced");
+                let gap = arrival.handle.fragment_gap_limit();
+                let consumer = tokio::spawn(async move { arrival.handle.assemble().await });
+                time.sleep(Duration::from_millis(100)).await;
+                let now = time.now_nanos();
+                // Throttled for longer than the consumer's gap, short of the
+                // reader's idle limit doubled.
+                let held = gap * 3;
+                meter.throttle_for_test(now, now + held.as_nanos() as u64);
+                time.sleep(held - Duration::from_millis(500)).await;
+                send.write_all(&sent[1000..]).await.unwrap();
+                send.finish().unwrap();
+                (consumer.await.unwrap(), gap)
+            })
+            .await;
+        assert!(gap * 3 < idle * 2, "premise: {gap:?} against {idle:?}");
+        assert_eq!(assembled.expect("assembled"), body);
+        assert_eq!(p.b.stats().count(QuicInboundOutcome::CompletedStream), 1);
+    })
+}
+
+/// A header refused mid-run (here a frame of an unknown version) starts a
+/// pending raise of the stream limit over, end to end: the peer saturates
+/// its 16 streams, three complete (quinn returns credit once more than an
+/// eighth of the limit is freed), a refused stream takes a freed slot, and
+/// the other 13 complete; 16 completions, but not since the failure, so no
+/// raise. The same run with a valid control frame in that slot raises.
+#[test]
+fn a_refused_header_starts_a_pending_raise_over() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let start = super::super::config::DATA_START_UNI_STREAMS as usize;
+        for (network, refused, raises) in [
+            ("quic-path-raise-refused", true, 0),
+            ("quic-path-raise-control", false, 1),
+        ] {
+            let p = paths(network, QuicPathLimits::DEFAULT).await;
+            let (raw, time) = (p.a_raw(), p.time());
+            let total = 2000u64;
+            p.drive(async move {
+                let mut held = Vec::new();
+                for _ in 0..start {
+                    let mut send = raw.open_uni().await.unwrap();
+                    let mut bytes = header(1, 1, StreamId::next().0, total, 0);
+                    bytes.extend_from_slice(&payload(100));
+                    send.write_all(&bytes).await.unwrap();
+                    held.push(send);
+                }
+                time.sleep(Duration::from_millis(200)).await;
+                let finish = |mut send: quinn::SendStream| async move {
+                    send.write_all(&payload(total as usize - 100))
+                        .await
+                        .unwrap();
+                    send.finish().unwrap();
+                };
+                for send in held.drain(..3) {
+                    finish(send).await;
+                }
+                time.sleep(Duration::from_millis(200)).await;
+                let mut next = raw.open_uni().await.unwrap();
+                let version = if refused { 9 } else { 1 };
+                let mut bytes = header(version, 2, 0, 4, 0);
+                bytes.extend_from_slice(&payload(4));
+                next.write_all(&bytes).await.unwrap();
+                next.finish().unwrap();
+                time.sleep(Duration::from_millis(200)).await;
+                for send in held {
+                    finish(send).await;
+                }
+                time.sleep(Duration::from_millis(200)).await;
+            })
+            .await;
+            let stats = p.b.stats();
+            assert_eq!(
+                stats.count(QuicInboundOutcome::CompletedStream) as usize,
+                start,
+                "{network}"
+            );
+            assert_eq!(
+                stats.count(QuicInboundOutcome::StreamLimitRaised),
+                raises,
+                "{network}"
+            );
+        }
+    })
+}
+
 /// On a real connection, a stream whose in-order delivery fills the receive
 /// window grows it, and the node's charge stays within the budget.
 #[test]
