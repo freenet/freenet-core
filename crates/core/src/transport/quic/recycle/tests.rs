@@ -45,6 +45,8 @@ struct Reading {
     cap_validity: Duration,
     /// The credit watch's readings ([`Reading::credit`]).
     credit: Credit,
+    /// quinn's smoothed round trip ([`Reading::rtt`]); zero if unknown.
+    rtt: Duration,
 }
 
 /// What the credit watch reads ([`CreditWatch`]), all 0 unless a test sets
@@ -75,6 +77,7 @@ const fn reading(acked: u64, outstanding: u64, sent: u64, received: u64) -> Read
         outstanding,
         sent,
         received,
+        rtt: Duration::ZERO,
     }
 }
 
@@ -114,6 +117,11 @@ impl Reading {
     /// The same reading with these credit-watch readings.
     const fn credit(self, credit: Credit) -> Self {
         Self { credit, ..self }
+    }
+
+    /// The same reading with quinn's smoothed round trip at `rtt`.
+    const fn rtt(self, rtt: Duration) -> Self {
+        Self { rtt, ..self }
     }
 
     /// The same reading with no transmit held now.
@@ -156,6 +164,7 @@ fn run_why(ticks: u64, mut at: impl FnMut(u64) -> Reading) -> Option<(u64, Stall
             r.credit.stream_frames,
             r.credit.writers,
         )
+        .with_rtt(r.rtt)
     };
     let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample(at(0)));
     (1..=ticks).find_map(|tick| {
@@ -1284,6 +1293,83 @@ fn a_send_held_by_the_egress_cap_is_not_starved() {
         .cap_held(t)
     });
     assert_eq!(closed, None);
+}
+
+/// A send blocked by the peer's credit on a path delivering at twice the
+/// floor rate, through an outage in both directions of 3 s or 6 s (no
+/// acknowledgement and nothing acknowledged meanwhile, a loss spell the
+/// dark rule tolerates): the intervals with no acknowledgement say nothing
+/// about credit and are not counted, so the path is not closed as
+/// credit-starved. Counting them would have closed it.
+#[test]
+fn a_credit_blocked_send_through_a_short_outage_is_not_starved() {
+    for outage_ticks in [1u64, 3] {
+        // Delivery stops after tick 4 for `outage_ticks` ticks.
+        let delivered = |t: u64| {
+            let live = if t <= 4 {
+                t
+            } else if t <= 4 + outage_ticks {
+                4
+            } else {
+                t - outage_ticks
+            };
+            2 * FLOOR_PER_TICK * live
+        };
+        let closed = run(40, |t| {
+            let live = t <= 4 || t > 4 + outage_ticks;
+            let acks = if live { t * 7 } else { 28 };
+            reading(acks, 30_000, t * 9, if live { t * 11 } else { 44 }).credit(Credit {
+                acked_bytes: delivered(t),
+                blocked: t,
+                stream_frames: 50 + t,
+                writers: 1,
+                ..Credit::default()
+            })
+        });
+        assert_eq!(closed, None, "a {} s outage", 2 * outage_ticks);
+    }
+}
+
+/// The floor follows the round trip: at a 3 s round trip an honest receiver
+/// with the smallest window (64 KiB) returns 64 KiB per round trip, about
+/// 21.8 KB/s, under the 32 KiB/s floor, and is not closed; the floor at that
+/// round trip is 64 KiB / 3 s. A peer cannot lower it further by acknowledging
+/// later: past `CREDIT_FLOOR_RTT_MAX` (4 s) the floor stays at 16 KiB/s, so a
+/// path delivering at 12 KiB/s on a claimed 8 s round trip is closed.
+#[test]
+fn the_credit_floor_follows_the_round_trip_up_to_its_cap() {
+    assert_eq!(credit_floor_rate(Duration::ZERO), FLOOR_RATE_BYTES_PER_SEC);
+    assert_eq!(
+        credit_floor_rate(Duration::from_secs(1)),
+        FLOOR_RATE_BYTES_PER_SEC
+    );
+    assert_eq!(credit_floor_rate(Duration::from_secs(4)), 16 * 1024);
+    assert_eq!(credit_floor_rate(Duration::from_secs(8)), 16 * 1024);
+    let at = |rtt: Duration, rate: u64| {
+        run_why(100, move |t| {
+            busy(
+                t,
+                Credit {
+                    acked_bytes: rate * 2 * t,
+                    blocked: t,
+                    stream_frames: 50 + t,
+                    writers: 1,
+                    ..Credit::default()
+                },
+            )
+            .rtt(rtt)
+        })
+    };
+    let far = 64 * 1024 / 3;
+    assert_eq!(at(Duration::from_secs(3), far + 512), None);
+    assert_eq!(
+        at(Duration::from_secs(1), far + 512),
+        Some((3, Stall::CreditStarved))
+    );
+    assert_eq!(
+        at(Duration::from_secs(8), 12 * 1024),
+        Some((3, Stall::CreditStarved))
+    );
 }
 
 /// The egress cap holds for most of each window and releases for one

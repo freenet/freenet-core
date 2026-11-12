@@ -233,6 +233,30 @@ pub(crate) const ACK_WATCH_TICK: Duration = Duration::from_secs(2);
 /// floor up to a 2 s round trip.
 pub(crate) const FLOOR_RATE_BYTES_PER_SEC: u64 = 32 * 1024;
 
+/// The longest round trip the credit rule's floor allows for
+/// ([`credit_floor_rate`]). The floor follows the round trip so a far honest
+/// peer is not closed, but a peer controls how late it acknowledges, so the
+/// round trip it can claim is capped: at 4 s the floor is 16 KiB/s. What
+/// bounds a peer that acknowledges slowly on purpose is the stream's age
+/// limit on its streams, and the ack-wait bound on ours (`bounded`).
+pub(crate) const CREDIT_FLOOR_RTT_MAX: Duration = Duration::from_secs(4);
+
+/// The acknowledged rate a credit-waiting path must keep at round trip
+/// `rtt`: an honest receiver returns at least its smallest window
+/// ([`super::budget::MIN_WINDOW_SMALL_HOST_BYTES`], 64 KiB) per round trip,
+/// so the floor is that over the round trip (capped at
+/// [`CREDIT_FLOOR_RTT_MAX`]), and at most [`FLOOR_RATE_BYTES_PER_SEC`]. An
+/// unknown round trip (zero) takes the most.
+pub(crate) fn credit_floor_rate(rtt: Duration) -> u64 {
+    let rtt = rtt.min(CREDIT_FLOOR_RTT_MAX);
+    if rtt.is_zero() {
+        return FLOOR_RATE_BYTES_PER_SEC;
+    }
+    let per_rtt =
+        u128::from(super::budget::MIN_WINDOW_SMALL_HOST_BYTES) * 1_000_000_000 / rtt.as_nanos();
+    FLOOR_RATE_BYTES_PER_SEC.min(u64::try_from(per_rtt).unwrap_or(u64::MAX))
+}
+
 /// How long within [`ACK_WATCH_WINDOW`] a path must have waited on the peer's
 /// credit before its acknowledged rate is judged ([`CreditWatch`]): two
 /// sampling intervals, since waiting is counted in whole intervals.
@@ -1256,7 +1280,13 @@ impl CreditWatch {
         self.carry = sample.writers > 0 && (new_block || (self.carry && !streamed));
         let congestion_limited =
             sample.state.congestion_limited_batches != previous.state.congestion_limited_batches;
-        let waited = sample.writers > 0 && blocked && !congestion_limited && !cap_held;
+        // Affirmative evidence only: the interval had acknowledgements, and
+        // every batch of them was application-limited, so what held delivery
+        // back was the credit, not this side's window. An interval with no
+        // acknowledgement at all says nothing about credit (a silent peer is
+        // the dark rule's) and is not counted.
+        let new_batch = sample.state.batches != previous.state.batches;
+        let waited = sample.writers > 0 && blocked && new_batch && !congestion_limited && !cap_held;
         let since = self.history.back().map_or(UNKNOWN_AT, |&(at, _, _)| at);
         let interval = if waited && since != UNKNOWN_AT {
             now_nanos.saturating_sub(since)
@@ -1282,7 +1312,7 @@ impl CreditWatch {
             return false;
         }
         let acked = sample.state.acked_bytes.saturating_sub(self.history[0].2);
-        let floor = u128::from(FLOOR_RATE_BYTES_PER_SEC) * u128::from(limited) / 1_000_000_000;
+        let floor = u128::from(credit_floor_rate(sample.rtt)) * u128::from(limited) / 1_000_000_000;
         u128::from(acked) < floor
     }
 }
