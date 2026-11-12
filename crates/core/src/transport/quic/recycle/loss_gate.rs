@@ -225,7 +225,10 @@ pub(crate) struct GateState {
     /// end instead left gaps between spans that a lost packet's neighbours
     /// often fell into: 8 MiB at 5% loss with 30 ms of jitter at 300 ms took
     /// over 15 s in 7 of 46 lab runs, against 2 of 32 with this rule.
-    sends: VecDeque<(Instant, Instant, Duration)>,
+    sends: VecDeque<(Instant, Instant, Duration, u32)>,
+    /// LAB: the first acknowledgement's time.
+    #[cfg(test)]
+    first_ack: Option<Instant>,
     /// Losses passed to the inner controller, and ignored.
     pub(crate) passed: u64,
     pub(crate) ignored: u64,
@@ -236,6 +239,10 @@ impl GateState {
     /// RTT `srtt`.
     pub(crate) fn on_ack(&mut self, now: Instant, sent: Instant, bytes: u64, srtt: Duration) {
         let sample = now.saturating_duration_since(sent);
+        #[cfg(test)]
+        {
+            self.first_ack.get_or_insert(now);
+        }
         #[cfg(test)]
         if std::env::var_os("FREENET_GATE_DEBUG").is_some() {
             gate_debug::ACKS
@@ -287,8 +294,9 @@ impl GateState {
         let window = (self.srtt? / NEAR_WINDOW_FRACTION).max(NEAR_WINDOW_MIN);
         let (from, to) = (sent.checked_sub(window).unwrap_or(sent), sent + window);
         let mut near: Option<Duration> = None;
+        let mut samples = 0u32;
         let srtt = self.srtt?;
-        for (i, &(start, end, rtt)) in self.sends.iter().enumerate() {
+        for (i, &(start, end, rtt, count)) in self.sends.iter().enumerate() {
             // A span covers up to the next one, but never more than a
             // smoothed RTT past its own end. With the neighbour window, a
             // loss sent up to about 1.25 smoothed RTTs after the span's end
@@ -298,11 +306,24 @@ impl GateState {
             let end = self
                 .sends
                 .get(i + 1)
-                .map_or(reach, |&(next, _, _)| next.min(reach));
+                .map_or(reach, |&(next, _, _, _)| next.min(reach));
             if start <= to && end > from {
                 near = Some(near.map_or(rtt, |m| m.min(rtt)));
+                samples += count;
             }
         }
+        // LAB: a neighbourhood of one acknowledged packet is no evidence of a
+        // queue (a lone packet waits for the peer's delayed-ack timer).
+        #[cfg(test)]
+        if let Some(min) = std::env::var("FREENET_GATE_MIN_SAMPLES")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+        {
+            if samples < min {
+                return None;
+            }
+        }
+        let _ = samples;
         Some(near?.saturating_sub(self.min_rtt?))
     }
 
@@ -312,25 +333,27 @@ impl GateState {
             .srtt
             .map_or(BUCKET_MIN, |srtt| (srtt / 8).max(BUCKET_MIN));
         match self.sends.back_mut() {
-            Some((start, end, min)) if sent >= *start && sent < *end => {
+            Some((start, end, min, count)) if sent >= *start && sent < *end => {
                 *min = (*min).min(sample);
+                *count += 1;
             }
-            Some((start, _, _)) if sent < *start => {
+            Some((start, _, _, _)) if sent < *start => {
                 // Acknowledged out of order: the span it was sent in, if kept.
-                if let Some((_, _, min)) = self
+                if let Some((_, _, min, count)) = self
                     .sends
                     .iter_mut()
                     .rev()
-                    .find(|(s, e, _)| *s <= sent && sent < *e)
+                    .find(|(s, e, _, _)| *s <= sent && sent < *e)
                 {
                     *min = (*min).min(sample);
+                    *count += 1;
                 }
             }
             _ => {
                 if self.sends.len() == SEND_BUCKETS {
                     self.sends.pop_front();
                 }
-                self.sends.push_back((sent, sent + width, sample));
+                self.sends.push_back((sent, sent + width, sample, 1));
             }
         }
     }
@@ -365,7 +388,55 @@ impl GateState {
         let (Some(queue), Some(min_rtt)) = (queue, self.min_rtt) else {
             return Verdict::NoSample;
         };
+        #[cfg(test)]
+        if std::env::var_os("FREENET_GATE_NEVER_QUEUE").is_some() {
+            return Verdict::Ignored;
+        }
+        #[cfg(test)]
+        if let (Some(ms), Some(first)) = (
+            std::env::var("FREENET_GATE_IGNORE_FIRST_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok()),
+            self.first_ack,
+        ) {
+            if sent < first + Duration::from_millis(ms) {
+                return Verdict::Ignored;
+            }
+        }
+        #[cfg(test)]
+        if std::env::var_os("FREENET_GATE_DEBUG").is_some() && queue >= queue_threshold(min_rtt) {
+            gate_debug::DETAIL.lock().push(format!(
+                "verdict time: lost packet sent {:?} after the first ack",
+                self.first_ack.map(|f| sent.saturating_duration_since(f))
+            ));
+        }
         if queue >= queue_threshold(min_rtt) {
+            #[cfg(test)]
+            if std::env::var_os("FREENET_GATE_DEBUG").is_some() {
+                let first = self.sends.front().map(|f| f.0);
+                let rel =
+                    |t: Instant| first.map_or(0, |f| t.saturating_duration_since(f).as_millis());
+                let window = self.srtt.map_or(NEAR_WINDOW_MIN, |s| {
+                    (s / NEAR_WINDOW_FRACTION).max(NEAR_WINDOW_MIN)
+                });
+                let spans: Vec<String> = self
+                    .sends
+                    .iter()
+                    .filter(|(start, end, _, _)| *end + window >= sent && *start <= sent + window)
+                    .map(|(start, end, rtt, _)| {
+                        format!("[{}..{} {}ms]", rel(*start), rel(*end), rtt.as_millis())
+                    })
+                    .collect();
+                gate_debug::DETAIL.lock().push(format!(
+                    "QUEUE verdict: lost sent at {} ms (rel to oldest span), queue {} ms, min {} ms, srtt {:?}, share {:.3}, neighbour spans {spans:?}, round queue {:?}",
+                    rel(sent),
+                    queue.as_millis(),
+                    min_rtt.as_millis(),
+                    self.srtt,
+                    self.share,
+                    self.queue(),
+                ));
+            }
             Verdict::Queue
         } else {
             Verdict::Ignored
@@ -514,6 +585,7 @@ pub(crate) mod gate_debug {
         parking_lot::Mutex::new(Vec::new());
     pub(crate) static ACKS: parking_lot::Mutex<Vec<(u64, u64)>> =
         parking_lot::Mutex::new(Vec::new());
+    pub(crate) static DETAIL: parking_lot::Mutex<Vec<String>> = parking_lot::Mutex::new(Vec::new());
 
     fn pct(v: &mut [u64], p: usize) -> u64 {
         if v.is_empty() {
@@ -525,6 +597,9 @@ pub(crate) mod gate_debug {
 
     /// Print and clear.
     pub(crate) fn report(label: &str) {
+        for line in std::mem::take(&mut *DETAIL.lock()) {
+            eprintln!("GATEDBG {label}: {line}");
+        }
         let losses = std::mem::take(&mut *LOSSES.lock());
         let acks = std::mem::take(&mut *ACKS.lock());
         let mut samples: Vec<u64> = acks.iter().map(|a| a.0 / 1000).collect();
