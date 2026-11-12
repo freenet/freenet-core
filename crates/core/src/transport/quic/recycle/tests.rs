@@ -19,6 +19,14 @@ fn closes_at(start: u64) -> u64 {
     start + ACK_WATCH_WINDOW.as_secs() / ACK_WATCH_TICK.as_secs()
 }
 
+/// The tick at which the dark-path rule closes a spell that started at
+/// tick `start`, with a send every tick and no round trip known: the window
+/// ends at [`closes_at`], the first send seen after it is at the next tick,
+/// and its grace (one tick, the least) ends a tick later.
+fn dark_closes_at(start: u64) -> u64 {
+    closes_at(start) + 2
+}
+
 /// What one sample reads, in the units `AckSample::synthetic` takes.
 #[derive(Clone, Copy)]
 struct Reading {
@@ -206,7 +214,7 @@ fn a_path_without_data_counts_a_dark_spell_to_its_end() {
     assert_eq!(closed, None, "a path that carries no data is not closed");
     assert_eq!(counts, vec![0, 0, 0, 1, 0, 0, 0, 0]);
     let (closed, counts) = run_observed(40, true, spell);
-    assert_eq!(closed, Some((closes_at(1), Stall::Dark)));
+    assert_eq!(closed, Some((dark_closes_at(1), Stall::Dark)));
     assert_eq!(counts, vec![0, 0, 0, 0, 0, 0, 0, 1]);
 }
 
@@ -293,10 +301,10 @@ fn a_stall_of_this_sides_runtime_does_not_close_the_path() {
     });
     assert_eq!(recovered, None, "a stall of our own is not darkness");
     // Dark from index 1 to the end: the stall counts as one tick, so the
-    // window ends at the sixth sample after index 1, not at the first after
-    // the stall.
+    // window ends five samples after index 1 and the close comes two samples
+    // later ([`dark_closes_at`]), not at the first sample after the stall.
     let dark = run_at(&times, |i| reading(5, 1200, 10 + i as u64, 100));
-    assert_eq!(dark, Some((6, Stall::Dark)));
+    assert_eq!(dark, Some((8, Stall::Dark)));
 }
 
 /// A send at tick 1, never acknowledged, while the peer sends every tick:
@@ -320,6 +328,49 @@ fn packets_left_outstanding_by_an_acknowledgement_close_after_the_window() {
     assert_eq!(closed, Some(closes_at(3)));
 }
 
+/// quinn's probe backoff on an 800 ms path whose peer only acknowledges:
+/// after the last acknowledgement this side sends only at its probes (here
+/// at 2, 6 and 14 s: ticks 1, 3 and 7), and nothing comes back until a probe
+/// is answered. Whether the first two probes met an outage that ended at
+/// 6.5 s or were lost to a burst of tail losses with no outage at all, the
+/// path is dark past the window (tick 6), and the probe at 14 s, the first
+/// sent after the window, is answered at 16 s, inside its grace (three round
+/// trips, 2.4 s): not closed. Unanswered, it closes at the first sample past
+/// its grace (18 s, tick 9).
+#[test]
+fn a_dark_spell_answered_at_the_first_probe_after_the_window_is_not_closed() {
+    let rtt = Duration::from_millis(800);
+    let sent = |t: u64| 10 + u64::from(t >= 1) + u64::from(t >= 3) + u64::from(t >= 7);
+    let watch = |answered: bool| {
+        let record = Arc::default();
+        let sample = |t: u64| {
+            let (acked, outstanding, received) = if answered && t >= 8 {
+                (6, 0, 101)
+            } else {
+                (5, 1200, 100)
+            };
+            AckSample::synthetic(
+                &record,
+                acked,
+                acked,
+                outstanding,
+                sent(t),
+                received,
+                NO_CAP,
+            )
+            .with_rtt(rtt)
+        };
+        let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample(0));
+        (1..=40u64).find_map(|t| {
+            watch
+                .observe(t * ACK_WATCH_TICK.as_secs() * SEC, sample(t))
+                .then(|| (t, watch.stall().expect("a reason")))
+        })
+    };
+    assert_eq!(watch(true), None, "answered within its grace");
+    assert_eq!(watch(false), Some((9, Stall::Dark)));
+}
+
 /// An acknowledgement that leaves nothing outstanding, with nothing sent
 /// after it: no window, however long the peer sends.
 #[test]
@@ -332,13 +383,14 @@ fn an_acknowledgement_of_everything_starts_no_window() {
 }
 
 /// The peer silent throughout while this side keeps sending and nothing is
-/// acknowledged: a dark path, closed a window after the first send, without
-/// waiting for quinn's idle timeout.
+/// acknowledged: a dark path, closed once a send made after the window has
+/// gone unanswered for its grace ([`dark_closes_at`]), without waiting for
+/// quinn's idle timeout.
 #[test]
 fn a_silent_peer_with_sends_outstanding_is_a_dark_path() {
     assert_eq!(
         run_why(100, |t| reading(5, 1200, 10 + t, 100)),
-        Some((closes_at(1), Stall::Dark))
+        Some((dark_closes_at(1), Stall::Dark))
     );
 }
 
@@ -470,7 +522,7 @@ fn a_hold_past_its_validity_no_longer_pauses_the_watch() {
 #[test]
 fn only_an_outage_longer_than_the_window_closes() {
     let long = run_why(200, |t| reading(5, 1200, 10 + t.min(15), 100));
-    assert_eq!(long, Some((closes_at(1), Stall::Dark)));
+    assert_eq!(long, Some((dark_closes_at(1), Stall::Dark)));
     let closed = run(200, |t| match t {
         // The outage, shorter than the window: probes, nothing from the
         // peer.

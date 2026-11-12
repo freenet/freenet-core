@@ -208,6 +208,13 @@ pub(crate) const SEND_ABORT_LIMIT: u64 = 4096;
 /// UDP for that connection only.
 pub(crate) const ACK_WATCH_WINDOW: Duration = Duration::from_secs(10);
 
+/// The most the dark-path rule waits for an answer to its post-window send
+/// ([`AckWatch`]): its grace is three round trips (the round trip from
+/// before the spell, since quinn's estimate does not move while nothing is
+/// acknowledged), at least one [`ACK_WATCH_TICK`] and at most this, so an
+/// inflated round trip cannot postpone a close indefinitely.
+pub(crate) const DARK_GRACE_MAX: Duration = Duration::from_secs(10);
+
 /// How often the acknowledgement watch samples the connection.
 ///
 /// The window starts at the first sample that sees its starting event (a
@@ -647,6 +654,8 @@ pub(crate) struct AckSample {
     stream_frames: u64,
     /// The path's sends with data still to write ([`Writers`]).
     writers: usize,
+    /// quinn's smoothed round trip (`PathStats::rtt`).
+    rtt: Duration,
 }
 
 impl AckSample {
@@ -687,6 +696,7 @@ impl AckSample {
                 .saturating_add(stats.frame_tx.stream_data_blocked),
             stream_frames: stats.frame_tx.stream,
             writers: writers.count(),
+            rtt: stats.path.rtt,
         })
     }
 
@@ -747,6 +757,7 @@ impl AckSample {
             blocked: 0,
             stream_frames: 0,
             writers: 0,
+            rtt: Duration::ZERO,
         }
     }
 
@@ -767,6 +778,13 @@ impl AckSample {
         self.blocked = blocked;
         self.stream_frames = stream_frames;
         self.writers = writers;
+        self
+    }
+
+    /// The same sample with quinn's smoothed round trip at `rtt`. Tests only.
+    #[cfg(test)]
+    pub(crate) fn with_rtt(mut self, rtt: Duration) -> Self {
+        self.rtt = rtt;
         self
     }
 }
@@ -853,6 +871,15 @@ pub(crate) struct AckWatch {
     /// When this side's packets were last seen outstanding with nothing
     /// acknowledged since, from a send (the dark-path rule, [`Stall::Dark`]).
     dark_since: Option<u64>,
+    /// The round trip when the dark episode started.
+    dark_rtt: Duration,
+    /// The sample that first saw an ack-eliciting send made a full window
+    /// after the dark episode started (the previous sample was already past
+    /// the window, so the send was too): once this long unanswered, by the
+    /// grace ([`DARK_GRACE_MAX`]), the peer had its chance.
+    dark_probe_at: Option<u64>,
+    /// When the previous sample was taken, on the watch's clock.
+    previous_now: Option<u64>,
     /// Whether the path carries data, so the dark-path rule closes it; `None`
     /// is a path that does. A path that carries none only counts its dark
     /// episodes, to their end ([`Self::observing`]).
@@ -925,6 +952,9 @@ impl AckWatch {
             window_nanos,
             credit: CreditWatch::new(window_nanos, &first),
             dark_since: None,
+            dark_rtt: Duration::ZERO,
+            dark_probe_at: None,
+            previous_now: None,
             carries_data: None,
             dark_counts: None,
             stall: None,
@@ -981,6 +1011,7 @@ impl AckWatch {
     /// End the dark episode in progress, if any, counted as `ended`, or not
     /// counted with `None`.
     fn end_dark(&mut self, ended: Option<crate::transport::metrics::DarkEnd>) {
+        self.dark_probe_at = None;
         if self.dark_since.take().is_some()
             && let (Some(node), Some(ended)) = (self.dark_counts, ended)
         {
@@ -1017,6 +1048,8 @@ impl AckWatch {
         let outstanding_after_acks = same_controller && sample.state.outstanding_after_acks() > 0;
         let previous_cap = self.previous.cap;
         let cap_held = self.cap_held(now_nanos, &sample.cap, &previous_cap);
+        let previous_now = self.previous_now.replace(now_nanos);
+        let rtt = sample.rtt;
         let starved = self.credit.observe(
             now_nanos,
             &self.previous,
@@ -1065,11 +1098,33 @@ impl AckWatch {
             self.end_dark(Some(crate::transport::metrics::DarkEnd::Unrecovered));
         } else if self.dark_since.is_none() && sent_new {
             self.dark_since = Some(now_nanos);
+            self.dark_rtt = rtt;
+        } else if let Some(start) = self.dark_since
+            && sent_new
+            && self.dark_probe_at.is_none()
+            && previous_now.is_some_and(|at| at.saturating_sub(start) >= self.window_nanos)
+        {
+            self.dark_probe_at = Some(now_nanos);
         }
+        // Dark for the window is not enough: after an outage quinn sends
+        // again only at its next backed-off probe, and an ack-only peer
+        // (keepalive 15 s) sends nothing until then, so a spell shorter than
+        // the window can still look dark past it. Closed once a send made
+        // after the window went unanswered for the grace: every outage
+        // shorter than the window is then survived, whatever the backoff.
+        let grace = u64::try_from(
+            (self.dark_rtt * 3)
+                .clamp(ACK_WATCH_TICK, DARK_GRACE_MAX)
+                .as_nanos(),
+        )
+        .unwrap_or(u64::MAX);
         if self.closes_dark()
             && self
                 .dark_since
                 .is_some_and(|start| now_nanos.saturating_sub(start) >= self.window_nanos)
+            && self
+                .dark_probe_at
+                .is_some_and(|at| now_nanos.saturating_sub(at) >= grace)
         {
             self.end_dark(Some(crate::transport::metrics::DarkEnd::Closed));
             return Some(Stall::Dark);

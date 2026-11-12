@@ -3574,6 +3574,98 @@ fn a_path_dark_in_both_directions_is_closed_as_dark() {
     })
 }
 
+/// The dark-path rule against quinn's probe backoff, on a real path at an
+/// 800 ms round trip whose peer only acknowledges (it sends nothing of its
+/// own, and virtual time runs no keepalive): `a` has data outstanding when
+/// both directions go dark. After an outage quinn sends again only at its
+/// next backed-off probe, so a 6.5 s outage still reads dark past the 10 s
+/// window; the rule waits for a send made after the window and its grace,
+/// and that probe is answered, so the path lives. So is a 13 s outage, past
+/// the window, when it has ended before quinn's first probe after the
+/// window: a dark spell is judged by what that probe meets. A 40 s outage
+/// swallows it and is closed as dark. Prints the close latency
+/// at 50, 300 and 800 ms round trips for a path that stays dark (the figures
+/// in `transport.md`).
+#[test]
+fn the_dark_rule_waits_out_the_probe_backoff_of_an_ack_only_peer() {
+    use crate::transport::in_memory_socket::{
+        PacketDeliveryDecision, set_packet_delivery_callback,
+    };
+    use std::sync::atomic::Ordering::Relaxed;
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        for (one_way_ms, outage_ms, closes) in [
+            (400u64, 6_500u64, false),
+            (400, 13_000, false),
+            (400, 40_000, true),
+            (25, u64::MAX, true),
+            (150, u64::MAX, true),
+            (400, u64::MAX, true),
+        ] {
+            let network: &'static str = Box::leak(
+                format!("quic-path-dark-backoff-{one_way_ms}-{outage_ms}").into_boxed_str(),
+            );
+            let one_way = Duration::from_millis(one_way_ms);
+            let dark_from = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+            let dark_until = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let clock: Arc<std::sync::OnceLock<VirtualTime>> = Arc::default();
+            {
+                let (from, until, clock) = (dark_from.clone(), dark_until.clone(), clock.clone());
+                set_packet_delivery_callback(
+                    network,
+                    Some(Arc::new(move |_, _, _, _| {
+                        let now = clock.get().map_or(0, |time| time.now_nanos());
+                        if now >= from.load(Relaxed) && now < until.load(Relaxed) {
+                            PacketDeliveryDecision::Drop
+                        } else {
+                            PacketDeliveryDecision::DelayedDelivery(one_way)
+                        }
+                    })),
+                );
+            }
+            let mut s = Scripted::connect(network).await;
+            clock.set(s.time.clone()).ok();
+            s.a_sends(IN_FLIGHT_AT_THE_CUT);
+            // About one round trip in: the transfer is still in flight.
+            s.wait(one_way * 2 + Duration::from_millis(100)).await;
+            assert!(
+                s.sample().outstanding_after_acks() > 0,
+                "premise: data outstanding at the cut"
+            );
+            let cut_at = s.time.now_nanos();
+            dark_from.store(cut_at, Relaxed);
+            dark_until.store(
+                cut_at.saturating_add(outage_ms.saturating_mul(1_000_000)),
+                Relaxed,
+            );
+            let case = format!("{}ms RTT, outage {outage_ms} ms", 2 * one_way_ms);
+            if closes {
+                let waited = s.closed_after(cut_at).await;
+                eprintln!("dark close latency: {case}: {waited:?}");
+                assert!(
+                    waited <= Duration::from_secs(36),
+                    "{case}: closed {waited:?} after the cut"
+                );
+                assert!(waited >= recycle::ACK_WATCH_WINDOW, "{case}: {waited:?}");
+                assert_eq!(
+                    recycle::stalls_to(s.b_addr),
+                    vec![recycle::Stall::Dark],
+                    "{case}"
+                );
+            } else {
+                s.wait(Duration::from_secs(60)).await;
+                assert!(
+                    s.a.connection().inner().close_reason().is_none(),
+                    "{case}: {:?}, {:?}",
+                    s.a.connection().inner().close_reason(),
+                    recycle::stalls_to(s.b_addr)
+                );
+                assert!(recycle::stalls_to(s.b_addr).is_empty(), "{case}");
+            }
+        }
+    })
+}
+
 /// A node's streamed send takes its write gap from the path, as its receiver
 /// does (#6186): 5 s on a fast path, and on a 1 s round trip the 24 round
 /// trips the receiver waits between pieces, never a flat 5 s.
