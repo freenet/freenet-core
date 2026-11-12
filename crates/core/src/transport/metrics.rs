@@ -352,7 +352,9 @@ labelled_counters! {
         Forwarded => "forwarded",
         /// Dropped: its source address is not in the ingress allow-set.
         NotAllowed => "not_allowed",
-        /// Dropped: the ingress queue was full.
+        /// Dropped: the ingress queue was full, or only its reserve for quiet
+        /// sources was free and this source was not quiet
+        /// (`demux::QUIC_INGRESS_QUIET_RESERVE`).
         QueueFull => "queue_full",
         /// Dropped: the datagrams already queued from this source address
         /// filled its share of the queue (`demux::QUIC_INGRESS_PER_SOURCE_DATAGRAMS`),
