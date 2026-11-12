@@ -949,6 +949,55 @@ fn the_fixed_charge_and_the_buffer_budget_match_the_design() {
     assert_eq!(quic_buffer_budget_for(7600 * MIB), 475 * MIB);
 }
 
+/// The QUIC connection cap and the memory it bounds (#5940 buffer budget):
+/// the floor grants these were derived with, the cap at each host size, the
+/// three labelled terms of the ceiling (each present and non-zero), and the
+/// ceiling within an eighth of memory, the share the aggregate test checks.
+#[test]
+fn the_connection_cap_keeps_quic_within_an_eighth_of_memory() {
+    use super::budget::{floor_grant, floor_window_bytes};
+    use super::config::{
+        QUIC_CONNECTION_CHARGE_BYTES, QUIC_MEMORY_DIVISOR, quic_buffer_budget_for,
+        quic_connection_cap, quic_memory_ceiling, quic_memory_ceiling_terms,
+    };
+    const MIB: usize = 1024 * 1024;
+    const GIB: usize = 1024 * MIB;
+    assert_eq!(QUIC_MEMORY_DIVISOR, 8);
+    assert_eq!(floor_grant(floor_window_bytes(GIB)), 435_712);
+    assert_eq!(floor_grant(floor_window_bytes(2 * GIB)), 706_048);
+    for (memory, cap) in [
+        (GIB / 2, 24),
+        (GIB, 49),
+        (2 * GIB, 83),
+        (4 * GIB, 166),
+        (8 * GIB, 332),
+        (7_600 * MIB, 308),
+    ] {
+        assert_eq!(quic_connection_cap(memory), cap, "{memory}");
+        let terms = quic_memory_ceiling_terms(memory);
+        assert_eq!(
+            terms.map(|(label, _)| label),
+            [
+                "quic_buffer_budget_for",
+                "QUIC_CONNECTION_CHARGE_BYTES",
+                "floor_grant"
+            ]
+        );
+        assert_eq!(terms[0].1, quic_buffer_budget_for(memory));
+        assert_eq!(terms[1].1, cap * QUIC_CONNECTION_CHARGE_BYTES);
+        assert_eq!(
+            terms[2].1,
+            cap * floor_grant(floor_window_bytes(memory)) as usize
+        );
+        assert!(terms.iter().all(|(_, bytes)| *bytes > 0), "{terms:?}");
+        let ceiling = quic_memory_ceiling(memory);
+        assert!(
+            ceiling <= memory / QUIC_MEMORY_DIVISOR,
+            "{memory}: {ceiling}"
+        );
+    }
+}
+
 /// Every stream is read unordered from its first byte (`path::inbound`), so
 /// quinn hands over every chunk as it arrives, gap or not: with the stream's
 /// first byte withheld and the reader reading after each datagram, quinn

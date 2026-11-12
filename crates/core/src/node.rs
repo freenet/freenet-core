@@ -846,6 +846,8 @@ impl NodeConfig {
         if let Some(own_addr) = &config.peer_id {
             tracing::info!("Node external address: {}", own_addr.socket_addr());
         }
+        let connection_limit = config.network_api.connection_limit();
+        connection_limit.log();
         Ok(NodeConfig {
             should_connect: true,
             is_gateway: config.is_gateway,
@@ -858,7 +860,7 @@ impl NodeConfig {
             config: Arc::new(config.clone()),
             max_hops_to_live: None,
             rnd_if_htl_above: None,
-            max_number_conn: Some(config.network_api.max_connections),
+            max_number_conn: Some(connection_limit.max),
             min_number_conn: Some(config.network_api.min_connections),
             max_upstream_bandwidth: None,
             max_downstream_bandwidth: None,

@@ -53,9 +53,10 @@
 //! memory <= data paths x (QUIC_CONNECTION_CHARGE_BYTES + floor grant) + budget
 //! ```
 //!
-//! The budget does not refuse paths: how many there are is the aggregate
-//! step's cap (PR 5), which sums the first term. It decides only growth and
-//! shrinking:
+//! The budget does not refuse paths: how many there are is bounded by the
+//! node's connection limit, lowered to `config::quic_connection_cap` while the
+//! node may carry QUIC data, and `config::quic_memory_ceiling_terms` sums the
+//! first term at that cap. It decides only growth and shrinking:
 //!
 //! - A connection's receive window grows when it is window-limited on
 //!   CONTIGUOUS delivery: the in-order prefix of its streams advanced, over the

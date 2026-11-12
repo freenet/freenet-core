@@ -1641,12 +1641,21 @@ charge, not of the budget: the budget holds only each path's growth above
 it, so a path that arrives never pushes the budget over, whatever the
 others hold. The bound is
 memory <= data paths x (QUIC_CONNECTION_CHARGE_BYTES + floor grant) + budget.
-Until the aggregate step (PR 5) caps data paths, their number is bounded
-only by the connection limit (default 200). PROVISIONAL figures at 200,
-re-sized by PR 5: 1 GiB: 64 MiB + 200 x 1313.5 KiB = 320.5 MiB; 2 GiB:
-128 MiB + 200 x 1577.5 KiB = 436.1 MiB; 7600 MiB gateway: 475 MiB +
-200 x 1577.5 KiB = 783.1 MiB. No data runs on them: QUIC_DATA_PERCENT stays 0
-until PR 5 (`no_data_share_before_the_quic_budget_is_summed`).
+Data paths are bounded by the connection limit, which is lowered to the QUIC
+connection cap (`quic::config::quic_connection_cap`: an eighth of memory, less
+the budget, over fixed charge + floor grant, every connection counted as a data
+path) while the node may carry data (`upgrade::policy::may_carry_data`: prefer
+with a data share above 0; `NetworkApiConfig::connection_limit`, applied in
+`NodeConfig::new`, never below min-number-of-connections; the configured value
+is kept, so config.toml is unchanged). Cap 49 / 83 / 166 / 332 / 308 at
+1 / 2 / 4 / 8 GiB / the 7600 MiB gateway, so the default 200 is lowered below
+about 5 GiB; QUIC then holds at most an eighth of memory (128 MiB at 1 GiB).
+With a data share of 0 nothing is lowered: shadow paths take only the fixed
+charge. A lowered default logs INFO; a lowered explicit setting logs WARN.
+`quic_memory_ceiling_terms` (budget, cap x charge, cap x floor grant) is summed
+with the caches and the hosting budget in
+`declared_caches_plus_hosting_budget_leave_room_for_the_runtime`, within 75%,
+whatever the data share.
   → W + debt: quinn records a shrink as debt paid by later credits; the
     meter mirrors it from the bytes the reader reads (where it can differ,
     it over-estimates). Every window change and every read
@@ -1717,10 +1726,9 @@ the buffers behind sent data, allocators other than jemalloc, CRYPTO-frame
 reassembly (`crypto_buffer_size` 16 KiB, charged in the fixed charge). Some quinn terms depend on
 traffic rate and time rather than configuration, as the UDP transport's
 dedup window and sent-packet tracker do, so the per-path ceiling (memory
-gate M2, #5940) cannot be the sum of these measurements alone. This
-memory is NOT accounted in the node aggregate and must be before QUIC carries
-data by default (before `QUIC_DATA_PERCENT` > 0, pinned by
-`no_data_share_before_the_quic_budget_is_summed`). Shadow paths carry no data, so
+gate M2, #5940) cannot be the sum of these measurements alone. The node
+aggregate sums this memory as the fixed charge and floor grant per connection
+at the QUIC connection cap, plus the buffer budget (above). Shadow paths carry no data, so
 what they hold is the fixed per-path terms, and Step 2's gate watches that as
 RSS against `quic_paths_active`. The fixed
 node-wide endpoint buffers are summed whatever `transport-quic` says:

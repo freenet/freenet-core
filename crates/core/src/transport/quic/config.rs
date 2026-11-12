@@ -335,10 +335,8 @@ pub(crate) const QUIC_CRYPTO_HOLD_BYTES: usize = QUIC_CRYPTO_BUFFER_BYTES + 32 *
 /// reported (`quic_send_resets`, `quic_path_ms`,
 /// `quic_send_resets_reached_<n>`) so field data can justify a lower charge.
 ///
-/// Not yet summed in the node aggregate: the aggregate-accounting step of the
-/// buffer budget (#5940) sums `quic_connections x` this, plus each data path's
-/// floor grant (`budget::floor_grant`), and waits for the small-host decision.
-#[cfg_attr(not(test), allow(dead_code))]
+/// Summed in the node's memory aggregate by [`quic_memory_ceiling_terms`], at
+/// [`quic_connection_cap`] connections, each counted as a data path.
 pub(crate) const QUIC_CONNECTION_CHARGE_BYTES: usize = QUIC_CONNECTION_FIXED_BYTES
     + MAX_UNI_STREAMS as usize * QUIC_OPEN_STREAM_BYTES
     + QUIC_CRYPTO_HOLD_BYTES
@@ -357,10 +355,66 @@ const QUIC_BUFFER_BUDGET_DIVISOR: usize = 16;
 /// which is per path and NOT in this budget; what does not scale with the
 /// windows is charged per connection ([`QUIC_CONNECTION_CHARGE_BYTES`]). So the
 /// node's QUIC memory is at most data paths x (that charge + floor grant) +
-/// this budget, and the aggregate-accounting step (#5940) sums all three
-/// terms. Each data path's windows are set from it (`budget::QuicBudget`).
+/// this budget; [`quic_memory_ceiling_terms`] sums all three at
+/// [`quic_connection_cap`]. Each data path's windows are set from it
+/// (`budget::QuicBudget`).
 pub(crate) fn quic_buffer_budget_for(memory_limit: usize) -> usize {
     memory_limit / QUIC_BUFFER_BUDGET_DIVISOR
+}
+
+/// The share of the node's memory QUIC may hold at [`quic_connection_cap`]
+/// connections, as a divisor: one eighth. Checked against the room the
+/// caches and the hosting budget leave
+/// (`declared_caches_plus_hosting_budget_leave_room_for_the_runtime`); the
+/// tightest shape is a 1 GiB host, where an eighth is 128 MiB of 128.2.
+pub(crate) const QUIC_MEMORY_DIVISOR: usize = 8;
+
+/// The most QUIC connections whose memory fits in an eighth of the node's
+/// memory: what is left of it after the buffer budget
+/// ([`quic_buffer_budget_for`]), over the fixed charge plus the floor grant
+/// (`budget::floor_grant`) of one data path. Every connection is counted as a
+/// data path, which is what each becomes once all pairs carry data; a shadow
+/// path costs less. 49 at 1 GiB, 83 at 2 GiB, 166 at 4 GiB, 332 at 8 GiB.
+/// The node's connection limit is lowered to it while this node may carry QUIC
+/// data (`NetworkApiConfig::connection_limit`).
+pub(crate) fn quic_connection_cap(memory_limit: usize) -> usize {
+    let per_connection = QUIC_CONNECTION_CHARGE_BYTES as u64
+        + super::budget::floor_grant(super::budget::floor_window_bytes(memory_limit));
+    let room = (memory_limit / QUIC_MEMORY_DIVISOR)
+        .saturating_sub(quic_buffer_budget_for(memory_limit)) as u64;
+    usize::try_from(room / per_connection).unwrap_or(usize::MAX)
+}
+
+/// The most memory a node's QUIC connections hold at [`quic_connection_cap`]
+/// data paths, as labelled terms: the buffer budget, the fixed charges, and
+/// the floor grants. A term reaches the sum only by being in this list, so a
+/// test reading the labels sees what was summed. Read only by the memory
+/// aggregate's tests, as `contract::declared_cache_ceiling` is.
+#[cfg(test)]
+pub(crate) fn quic_memory_ceiling_terms(memory_limit: usize) -> [(&'static str, usize); 3] {
+    let cap = quic_connection_cap(memory_limit);
+    let floor_grant =
+        super::budget::floor_grant(super::budget::floor_window_bytes(memory_limit)) as usize;
+    [
+        (
+            "quic_buffer_budget_for",
+            quic_buffer_budget_for(memory_limit),
+        ),
+        (
+            "QUIC_CONNECTION_CHARGE_BYTES",
+            cap.saturating_mul(QUIC_CONNECTION_CHARGE_BYTES),
+        ),
+        ("floor_grant", cap.saturating_mul(floor_grant)),
+    ]
+}
+
+/// The sum of [`quic_memory_ceiling_terms`].
+#[cfg(test)]
+pub(crate) fn quic_memory_ceiling(memory_limit: usize) -> usize {
+    quic_memory_ceiling_terms(memory_limit)
+        .iter()
+        .map(|(_, bytes)| bytes)
+        .sum()
 }
 
 /// The quinn, quinn-proto and rustls versions the figures above were
