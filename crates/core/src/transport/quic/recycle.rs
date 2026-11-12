@@ -1240,10 +1240,11 @@ pub(crate) struct CreditWatch {
     /// A blocked frame was sent and no STREAM frame since.
     carry: bool,
     /// Per sample within the window: when it was taken, the time waited on
-    /// credit in the interval it ended, and the bytes acknowledged by then.
+    /// credit in the interval it ended, seen with acknowledgements and
+    /// settled (nothing outstanding), and the bytes acknowledged by then.
     /// The oldest entry is the window's start and its own interval is not
     /// counted.
-    history: VecDeque<(u64, u64, u64)>,
+    history: VecDeque<(u64, u64, u64, u64)>,
 }
 
 /// [`CreditWatch::history`]'s time for a sample taken at an unknown time.
@@ -1255,7 +1256,7 @@ impl CreditWatch {
             window_nanos,
             carry: false,
             // Taken at an unknown time: the first interval is not counted.
-            history: VecDeque::from([(UNKNOWN_AT, 0, first.state.acked_bytes)]),
+            history: VecDeque::from([(UNKNOWN_AT, 0, 0, first.state.acked_bytes)]),
         }
     }
 
@@ -1271,7 +1272,7 @@ impl CreditWatch {
     ) -> bool {
         if !same_controller {
             self.carry = false;
-            self.history = VecDeque::from([(now_nanos, 0, sample.state.acked_bytes)]);
+            self.history = VecDeque::from([(now_nanos, 0, 0, sample.state.acked_bytes)]);
             return false;
         }
         let new_block = sample.blocked != previous.blocked;
@@ -1280,39 +1281,58 @@ impl CreditWatch {
         self.carry = sample.writers > 0 && (new_block || (self.carry && !streamed));
         let congestion_limited =
             sample.state.congestion_limited_batches != previous.state.congestion_limited_batches;
-        // Affirmative evidence only: the interval had acknowledgements, and
-        // every batch of them was application-limited, so what held delivery
-        // back was the credit, not this side's window. An interval with no
-        // acknowledgement at all says nothing about credit (a silent peer is
-        // the dark rule's) and is not counted.
+        // Affirmative evidence only. An interval with acknowledgements counts
+        // when every batch of them was application-limited, so what held
+        // delivery back was the credit, not this side's window. An interval
+        // with none counts only if nothing was outstanding at either end of
+        // it ("settled"): everything this side sent was acknowledged, so the
+        // only thing it waits for is credit. With packets outstanding and no
+        // acknowledgement the peer may simply be unreachable for a moment,
+        // which is the dark rule's to judge, and the interval counts nothing.
         let new_batch = sample.state.batches != previous.state.batches;
-        let waited = sample.writers > 0 && blocked && new_batch && !congestion_limited && !cap_held;
-        let since = self.history.back().map_or(UNKNOWN_AT, |&(at, _, _)| at);
-        let interval = if waited && since != UNKNOWN_AT {
-            now_nanos.saturating_sub(since)
-        } else {
-            0
+        let base = sample.writers > 0 && blocked && !cap_held;
+        let waited = base && new_batch && !congestion_limited;
+        let settled = base
+            && !new_batch
+            && sample.state.outstanding_after_acks() == 0
+            && previous.state.outstanding_after_acks() == 0;
+        let since = self.history.back().map_or(UNKNOWN_AT, |&(at, ..)| at);
+        let interval = |counts: bool| {
+            if counts && since != UNKNOWN_AT {
+                now_nanos.saturating_sub(since)
+            } else {
+                0
+            }
         };
-        self.history
-            .push_back((now_nanos, interval, sample.state.acked_bytes));
+        self.history.push_back((
+            now_nanos,
+            interval(waited),
+            interval(settled),
+            sample.state.acked_bytes,
+        ));
         let start = now_nanos.saturating_sub(self.window_nanos);
         while self.history.len() > 1
             && (self.history[0].0 == UNKNOWN_AT || self.history[1].0 <= start)
         {
             self.history.pop_front();
         }
-        let limited: u64 = self
-            .history
-            .iter()
-            .skip(1)
-            .map(|&(_, waited, _)| waited)
-            .sum();
+        let (limited, quiet) = self.history.iter().skip(1).fold(
+            (0u64, 0u64),
+            |(limited, quiet), &(_, waited, settled, _)| (limited + waited, quiet + settled),
+        );
+        // Seen waiting with acknowledgements: CREDIT_LIMITED_MIN is enough.
+        // Settled waiting may also be a link that went quiet just after the
+        // last acknowledgement, so it counts only once it fills the whole
+        // window, as the dark rule's outage must.
         let min = u64::try_from(CREDIT_LIMITED_MIN.as_nanos()).unwrap_or(u64::MAX);
-        if limited < min {
+        if limited < min && quiet < self.window_nanos {
             return false;
         }
-        let acked = sample.state.acked_bytes.saturating_sub(self.history[0].2);
-        let floor = u128::from(credit_floor_rate(sample.rtt)) * u128::from(limited) / 1_000_000_000;
+        // Judged over the waiting that qualified: a settled spell does not
+        // dilute a rate seen with acknowledgements.
+        let counted = if limited >= min { limited } else { limited + quiet };
+        let acked = sample.state.acked_bytes.saturating_sub(self.history[0].3);
+        let floor = u128::from(credit_floor_rate(sample.rtt)) * u128::from(counted) / 1_000_000_000;
         u128::from(acked) < floor
     }
 }

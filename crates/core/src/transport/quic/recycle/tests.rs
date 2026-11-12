@@ -1330,6 +1330,39 @@ fn a_credit_blocked_send_through_a_short_outage_is_not_starved() {
     }
 }
 
+/// A send blocked by the peer's credit with everything it sent acknowledged
+/// ("settled": nothing outstanding) and then no acknowledgement at all, as
+/// when the peer withholds credit and this side has nothing more it may
+/// send: such intervals count only once they fill the window, as the dark
+/// rule's outage must, so a quiet spell of 4 or 6 s is not closed and one
+/// that lasts the window is, as credit-starved.
+#[test]
+fn a_settled_credit_wait_closes_only_when_it_fills_the_window() {
+    let quiet_after = 3u64;
+    let at = |quiet_ticks: u64| {
+        run_why(40, move |t| {
+            let quiet = t > quiet_after && t <= quiet_after + quiet_ticks;
+            let live = if t <= quiet_after {
+                t
+            } else if quiet {
+                quiet_after
+            } else {
+                t - quiet_ticks
+            };
+            reading(live * 7, 0, 10 + live, 100 + live).credit(Credit {
+                acked_bytes: 2 * FLOOR_PER_TICK * live,
+                blocked: live,
+                stream_frames: 50 + live,
+                writers: 1,
+                ..Credit::default()
+            })
+        })
+    };
+    assert_eq!(at(2), None, "a 4 s quiet spell");
+    assert_eq!(at(3), None, "a 6 s quiet spell");
+    assert_eq!(at(30), Some((quiet_after + 5, Stall::CreditStarved)));
+}
+
 /// The floor follows the round trip: at a 3 s round trip an honest receiver
 /// with the smallest window (64 KiB) returns 64 KiB per round trip, about
 /// 21.8 KB/s, under the 32 KiB/s floor, and is not closed; the floor at that

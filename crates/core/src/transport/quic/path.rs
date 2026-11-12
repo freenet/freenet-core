@@ -2360,7 +2360,10 @@ impl Drop for Outgoing {
     /// FINISH it, and the receiver would take a cut-short message for one
     /// that simply ended early.
     ///
-    /// A stream dropped while it waits for its acknowledgement goes on to the
+    /// A stream dropped because its ack wait ran out
+    /// ([`bounded::SendDeadlines::ack_wait`]) is reset and counted as an
+    /// abort. One dropped earlier while it waits for its acknowledgement
+    /// (a cancelled send) goes on to the
     /// end, so its permit and its send epoch wait with it, in a small task
     /// that ends with the stream's acknowledgement or with the connection.
     /// A send holding a permit is one of at most [`STREAMED_SEND_LIMIT`]. One
@@ -2377,6 +2380,21 @@ impl Drop for Outgoing {
     fn drop(&mut self) {
         self.reset(reset_code::SENDER_ABORTED);
         if !self.awaiting_ack {
+            return;
+        }
+        // The send's own deadline for the acknowledgement ran out
+        // (`SendDeadlines::ack_wait`): the peer had the whole stream and
+        // never acknowledged its end. The stream is reset, counted as an
+        // abort (so a peer that does this on every stream reaches
+        // `SEND_ABORT_LIMIT`), and its permit and epoch go now with quinn's
+        // copy of its data. A send cancelled before then (a teardown) waits
+        // below, ending with the acknowledgement or the connection.
+        if self
+            .progress
+            .ack_wait_left()
+            .is_some_and(|left| left.is_zero())
+        {
+            self.reset_finished();
             return;
         }
         let (slot, epoch) = (self.slot.take(), self.epoch.take());

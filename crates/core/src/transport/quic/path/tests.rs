@@ -5221,6 +5221,7 @@ fn the_gap_runs_from_the_last_step_and_total_still_binds() {
             gap: Some(Duration::from_secs(5)),
             source_gap: None,
             total: Duration::from_secs(60),
+            ack_wait: None,
         };
         let (stalled, stalled_after, steady, steady_after) = drive(&time, LIMIT, async move {
             let start = clock.now();
@@ -5286,6 +5287,7 @@ async fn stuck_send(
         gap: Some(Duration::from_secs(5)),
         source_gap: None,
         total,
+        ack_wait: None,
     };
     let start = clock.now();
     let ticking = clock.clone();
@@ -5409,6 +5411,7 @@ fn a_live_send_held_in_the_cap_queue_past_its_gap_is_sent() {
                 gap: Some(Duration::from_secs(5)),
                 source_gap: None,
                 total: Duration::from_secs(120),
+                ack_wait: None,
             };
             let ticking = clock.clone();
             let queue = async move {
@@ -5475,6 +5478,7 @@ fn an_acknowledgement_the_record_has_not_seen_credits_the_next_send() {
                 gap: Some(Duration::from_secs(5)),
                 source_gap: None,
                 total: Duration::from_secs(120),
+                ack_wait: None,
             };
             let ticking = clock.clone();
             let queue = async move {
@@ -5584,6 +5588,7 @@ fn a_send_waiting_for_its_source_ends_at_its_own_gap() {
                 gap: Some(Duration::from_secs(5)),
                 source_gap: None,
                 total: Duration::from_secs(120),
+                ack_wait: None,
             };
             let start = clock.now();
             let ticking = clock.clone();
@@ -5643,6 +5648,7 @@ fn progress_from_before_the_send_does_not_extend_its_gap() {
                 gap: Some(Duration::from_secs(5)),
                 source_gap: None,
                 total: Duration::from_secs(120),
+                ack_wait: None,
             };
             let start = clock.now();
             let sent = bounded_send(&clock, deadlines, Some(connection), |progress| async move {
@@ -5677,6 +5683,7 @@ fn a_quiet_proof_says_whether_its_send_saw_a_live_hold() {
                 gap: Some(Duration::from_secs(5)),
                 source_gap: None,
                 total: Duration::from_secs(120),
+                ack_wait: None,
             };
             let mut proofs = Vec::new();
             for live in [true, false] {
@@ -5742,6 +5749,7 @@ fn a_hold_read_live_by_a_wake_voids_the_proof() {
                 gap: Some(Duration::from_secs(5)),
                 source_gap: None,
                 total: Duration::from_secs(120),
+                ack_wait: None,
             };
             let start = clock.now();
             let holding = clock.clone();
@@ -5795,6 +5803,7 @@ fn the_source_gap_applies_only_to_source_waits() {
                 gap: Some(Duration::from_secs(5)),
                 source_gap: None,
                 total: Duration::from_secs(120),
+                ack_wait: None,
             }
             .with_source_gap(Duration::from_secs(30));
             let sleeps = clock.clone();
@@ -5843,6 +5852,7 @@ fn the_end_of_a_source_wait_rearms_the_timer_at_the_own_gap() {
                 gap: Some(Duration::from_secs(5)),
                 source_gap: None,
                 total: Duration::from_secs(120),
+                ack_wait: None,
             }
             .with_source_gap(Duration::from_secs(30));
             let start = clock.now();
@@ -5898,6 +5908,7 @@ fn source_waits_do_not_rearm_the_timer_without_an_extension() {
                 gap: Some(Duration::from_secs(5)),
                 source_gap: None,
                 total: Duration::from_secs(120),
+                ack_wait: None,
             };
             let arms = Arc::new(std::sync::atomic::AtomicU64::new(0));
             let seen = arms.clone();
@@ -5944,6 +5955,7 @@ fn source_waits_rearm_the_timer_once_while_it_is_extended() {
                 gap: Some(Duration::from_secs(5)),
                 source_gap: None,
                 total: Duration::from_secs(120),
+                ack_wait: None,
             };
             let ticking = clock.clone();
             let peer = async move {
@@ -6010,6 +6022,7 @@ fn a_later_proof_of_the_same_counts_keeps_the_earlier_since() {
                 gap: Some(Duration::from_secs(5)),
                 source_gap: None,
                 total: Duration::from_secs(120),
+                ack_wait: None,
             };
             let stuck = |progress: bounded::SendProgress| async move {
                 progress.mark_opened();
@@ -6067,6 +6080,7 @@ fn the_gap_ends_at_the_end_of_the_stream_and_open_binds_first() {
             gap: Some(Duration::from_secs(5)),
             source_gap: None,
             total: Duration::from_secs(60),
+            ack_wait: None,
         };
         let (finished, finished_after, unopened, unopened_after) =
             drive(&time, LIMIT, async move {
@@ -6603,6 +6617,7 @@ fn a_real_path_carries_its_last_acknowledgement_to_the_next_send() {
                     gap: Some(Duration::from_secs(5)),
                     source_gap: None,
                     total: Duration::from_secs(120),
+                    ack_wait: None,
                 };
                 let ticking = time.clone();
                 let queue = async move {
