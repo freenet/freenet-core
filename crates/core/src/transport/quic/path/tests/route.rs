@@ -131,16 +131,32 @@ const SECOND: u64 = 1_000_000_000;
 /// Past the window with no acknowledgement, from a count made at 0.
 const QUIET: u64 = 11 * SECOND;
 
-fn timeouts() -> [BoundedSend; 3] {
+/// The timeouts that count: each ran out with its stream open.
+fn timeouts() -> [BoundedSend; 2] {
     [
-        BoundedSend::Failed(SendFailure::NotOpened(NotOpened::TimedOut)),
         BoundedSend::MaybeDelivered(MaybeDelivered::TimedOut),
         BoundedSend::Failed(SendFailure::TimedOut),
     ]
 }
 
+/// A send that ran out before its stream opened waited for its source, a
+/// permit or the peer's stream credit, which is back-pressure: it never
+/// counts, however many come in a row on a quiet path.
+#[test]
+fn a_send_that_never_opened_does_not_count() {
+    let not_opened = BoundedSend::Failed(SendFailure::NotOpened(NotOpened::TimedOut));
+    let mut count = StallCount::new(Some(5), 0);
+    for _ in 0..2 * STALLED_SENDS_LIMIT {
+        assert!(!count.take_uncapped(&not_opened, false, Some(5), QUIET));
+    }
+    let mut count = StallCount::new(None, 0);
+    for _ in 0..2 * STALLED_SENDS_LIMIT {
+        assert!(!count.take_uncapped(&not_opened, false, None, 0));
+    }
+}
+
 /// The eighth timeout in a row closes once nothing has been acknowledged for the
-/// window, whichever kind of timeout each is; a `Sent` starts the count again;
+/// window, whichever kind of counting timeout each is; a `Sent` starts the count again;
 /// and an outcome that is no timeout leaves the count alone. A send waiting for
 /// its source does not count.
 #[test]
@@ -167,11 +183,11 @@ fn timeouts_on_a_quiet_path_close_it_and_a_sent_starts_again() {
         MaybeDelivered::ConnectionLost
     )));
     assert!(
-        !count.take_uncapped(&timeouts()[2], true, Some(5), QUIET),
+        !count.take_uncapped(&timeouts()[1], true, Some(5), QUIET),
         "a stalled source"
     );
     let mut take = |outcome: &BoundedSend| count.take_uncapped(outcome, false, Some(5), QUIET);
-    assert!(take(&timeouts()[0]), "the eighth, a send that never opened");
+    assert!(take(&timeouts()[0]), "the eighth");
     assert!(!take(&timeouts()[1]), "the close comes once");
 }
 
@@ -227,7 +243,7 @@ fn a_cap_hold_counts_as_progress() {
     assert!(
         !count
             .take(
-                &timeouts()[2],
+                &timeouts()[1],
                 false,
                 Some(1),
                 reading(1, true),
@@ -240,7 +256,7 @@ fn a_cap_hold_counts_as_progress() {
         let now = acked + second * SECOND;
         assert!(
             !count
-                .take(&timeouts()[2], false, Some(1), reading(1, true), None, now)
+                .take(&timeouts()[1], false, Some(1), reading(1, true), None, now)
                 .quiet_timeout,
             "held at {second} s after the acknowledgement: progress"
         );
@@ -249,14 +265,14 @@ fn a_cap_hold_counts_as_progress() {
         let now = acked + second * SECOND;
         assert!(
             !count
-                .take(&timeouts()[2], false, Some(1), reading(1, true), None, now)
+                .take(&timeouts()[1], false, Some(1), reading(1, true), None, now)
                 .quiet_timeout,
             "within the window of the last progress (15 s)"
         );
     }
     let late = acked + 20 * SECOND;
     for _ in 1..STALLED_SENDS_LIMIT {
-        let verdict = count.take(&timeouts()[2], false, Some(1), reading(1, true), None, late);
+        let verdict = count.take(&timeouts()[1], false, Some(1), reading(1, true), None, late);
         assert!(
             verdict.quiet_timeout && !verdict.close,
             "the hold no longer counts"
@@ -264,7 +280,7 @@ fn a_cap_hold_counts_as_progress() {
     }
     assert!(
         count
-            .take(&timeouts()[2], false, Some(1), reading(1, true), None, late)
+            .take(&timeouts()[1], false, Some(1), reading(1, true), None, late)
             .close,
         "eight timeouts with only a hold close the path"
     );
@@ -273,7 +289,7 @@ fn a_cap_hold_counts_as_progress() {
     let mut count = StallCount::new(Some(0), 0);
     assert!(
         !count
-            .take(&timeouts()[2], false, Some(0), reading(7, true), None, 0)
+            .take(&timeouts()[1], false, Some(0), reading(7, true), None, 0)
             .close
     );
     let stale = 61 * SECOND + QUIET;
@@ -281,7 +297,7 @@ fn a_cap_hold_counts_as_progress() {
         assert!(
             !count
                 .take(
-                    &timeouts()[2],
+                    &timeouts()[1],
                     false,
                     Some(0),
                     reading(7, true),
@@ -294,7 +310,7 @@ fn a_cap_hold_counts_as_progress() {
     assert!(
         count
             .take(
-                &timeouts()[2],
+                &timeouts()[1],
                 false,
                 Some(0),
                 reading(7, true),
@@ -345,7 +361,7 @@ fn a_binding_cap_with_no_acknowledgements_keeps_the_path() {
             }
             assert!(found, "no quiet span with the cap holding");
             for _ in 0..STALLED_SENDS_LIMIT {
-                a.settle(SendKind::Stream, &timeouts()[2], false, time.now_nanos());
+                a.settle(SendKind::Stream, &timeouts()[1], false, time.now_nanos());
             }
             assert!(a.quinn_connection().close_reason().is_none());
             assert_eq!(a.stats().send_event_count(QuicSendEvent::StalledClosed), 0);
@@ -416,12 +432,12 @@ fn a_quiet_path_closes_after_eight_timeouts() {
         );
         let later = p.time().now_nanos() + QUIET;
         for _ in 1..STALLED_SENDS_LIMIT {
-            p.a.settle(SendKind::Stream, &timeouts()[2], false, later);
+            p.a.settle(SendKind::Stream, &timeouts()[1], false, later);
         }
         assert!(p.a.quinn_connection().close_reason().is_none());
-        p.a.settle(SendKind::Stream, &timeouts()[2], false, later);
+        p.a.settle(SendKind::Stream, &timeouts()[1], false, later);
         assert!(p.a.quinn_connection().close_reason().is_some());
-        p.a.settle(SendKind::Stream, &timeouts()[2], false, later);
+        p.a.settle(SendKind::Stream, &timeouts()[1], false, later);
         assert_eq!(
             p.a.stats().send_event_count(QuicSendEvent::StalledClosed),
             1
@@ -465,11 +481,11 @@ fn pacer_refusals_never_count_and_a_dark_paced_path_still_closes() {
             "each refusal is counted once"
         );
         for _ in 1..STALLED_SENDS_LIMIT {
-            p.a.settle(SendKind::Stream, &timeouts()[2], false, later);
+            p.a.settle(SendKind::Stream, &timeouts()[1], false, later);
         }
         assert!(p.a.is_suspect(), "a dark paced path goes suspect");
         assert!(p.a.quinn_connection().close_reason().is_none());
-        p.a.settle(SendKind::Stream, &timeouts()[2], false, later);
+        p.a.settle(SendKind::Stream, &timeouts()[1], false, later);
         assert!(
             p.a.quinn_connection().close_reason().is_some(),
             "and closes at the eighth timeout"
@@ -528,7 +544,7 @@ fn a_quiet_proof_dates_progress_only_while_its_counts_match() {
         live_hold_seen: false,
     };
     let now = SECOND + QUIET;
-    let timeout = &timeouts()[2];
+    let timeout = &timeouts()[1];
     // The acknowledgements it sees (5 to 9) came no later than `since`: quiet.
     let mut count = StallCount::new(Some(5), 0);
     let verdict = count.take(timeout, false, Some(9), free, Some(proof), now);
@@ -667,14 +683,14 @@ fn a_hold_is_credited_for_the_caps_longest_wait_past_the_window() {
     let acked = 5 * SECOND;
     assert!(
         !count
-            .take(&timeouts()[2], false, Some(1), held, None, acked)
+            .take(&timeouts()[1], false, Some(1), held, None, acked)
             .quiet_timeout
     );
     // Past the window (10 s after the acknowledgement), within the credit.
     let within = acked + credit - SECOND;
     assert!(
         !count
-            .take(&timeouts()[2], false, Some(1), held, None, within)
+            .take(&timeouts()[1], false, Some(1), held, None, within)
             .quiet_timeout,
         "a live path held past the window is not stalled"
     );
@@ -683,7 +699,7 @@ fn a_hold_is_credited_for_the_caps_longest_wait_past_the_window() {
     let late = within + QUIET;
     assert!(
         count
-            .take(&timeouts()[2], false, Some(1), held, None, late)
+            .take(&timeouts()[1], false, Some(1), held, None, late)
             .quiet_timeout
     );
 }
@@ -717,14 +733,14 @@ fn a_quiet_proof_dates_the_last_acknowledgement_back() {
     let mut count = StallCount::new(Some(0), 0);
     let _ = count.take(&BoundedSend::Sent, false, Some(5), free, None, 8 * SECOND);
     let _ = count.take(
-        &timeouts()[2],
+        &timeouts()[1],
         false,
         Some(5),
         free,
         Some(proof),
         9 * SECOND,
     );
-    let verdict = count.take(&timeouts()[2], false, Some(5), held, None, 12 * SECOND);
+    let verdict = count.take(&timeouts()[1], false, Some(5), held, None, 12 * SECOND);
     assert!(
         verdict.quiet_timeout,
         "the hold at 12 s is past the credit after the acknowledgement at 1 s"

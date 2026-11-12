@@ -309,6 +309,12 @@ pub(crate) struct QuicPathLimits {
     /// (supervisor test).
     #[cfg(test)]
     pub(crate) panic_in_watch: bool,
+    /// The acknowledgement watch closes the path when a liveness rule says
+    /// so (`recycle::AckWatch`). Off in tests of the send deadlines and the
+    /// stall count on a dark path, which the watch would otherwise close
+    /// first.
+    #[cfg(test)]
+    pub(crate) watch_closes: bool,
     /// The receive side's gap cap (`inbound::MAX_GAPS_PER_CONNECTION`), lower
     /// in a test that trips it.
     #[cfg(test)]
@@ -366,6 +372,8 @@ impl QuicPathLimits {
         panic_in_receive: false,
         #[cfg(test)]
         panic_in_watch: false,
+        #[cfg(test)]
+        watch_closes: true,
         #[cfg(test)]
         max_gaps: inbound::MAX_GAPS_PER_CONNECTION,
         #[cfg(test)]
@@ -996,6 +1004,7 @@ impl QuicPath {
         #[cfg(test)]
         {
             report.panic_once_bucketed = limits.panic_in_watch;
+            report.watch_closes = limits.watch_closes;
         }
         let receive = GlobalExecutor::spawn(supervise_receive(
             connection.inner().clone(),

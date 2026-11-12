@@ -1187,9 +1187,19 @@ pub(crate) async fn watch_acknowledgements<T: TimeSource>(
             heard.report();
         }
         if watch.observe(time.now_nanos(), sample) {
+            #[cfg(test)]
+            if !report.watch_closes {
+                continue;
+            }
             // One close code for all three: it tells the peer only that this
             // side stopped using the path.
             if closer.close(QuicCloseCode::PeerNotAcknowledging) {
+                #[cfg(test)]
+                if let Some(stall) = watch.stall() {
+                    TEST_STALLS
+                        .lock()
+                        .push((connection.remote_address(), stall));
+                }
                 tracing::warn!(
                     remote = %connection.remote_address(),
                     window = ?ACK_WATCH_WINDOW,
@@ -1205,6 +1215,22 @@ pub(crate) async fn watch_acknowledgements<T: TimeSource>(
 
 #[cfg(test)]
 mod cap_tests;
+
+/// Why each watch closed its path, by the path's remote address. Tests only.
+#[cfg(test)]
+pub(crate) static TEST_STALLS: parking_lot::Mutex<Vec<(std::net::SocketAddr, Stall)>> =
+    parking_lot::Mutex::new(Vec::new());
+
+/// Why the watches of paths to `remote` closed them, in order. Tests only.
+#[cfg(test)]
+pub(crate) fn stalls_to(remote: std::net::SocketAddr) -> Vec<Stall> {
+    TEST_STALLS
+        .lock()
+        .iter()
+        .filter(|(to, _)| *to == remote)
+        .map(|(_, stall)| *stall)
+        .collect()
+}
 
 /// What a path's receive supervisor keeps for its acknowledgement watch.
 pub(crate) struct AckWatchParts {
@@ -1247,6 +1273,9 @@ pub(crate) struct PathReport {
     /// (supervisor test).
     #[cfg(test)]
     pub(crate) panic_once_bucketed: bool,
+    /// The watch closes the path when a rule says so (`QuicPathLimits`).
+    #[cfg(test)]
+    pub(crate) watch_closes: bool,
 }
 
 impl PathReport {
@@ -1268,6 +1297,8 @@ impl PathReport {
             node,
             #[cfg(test)]
             panic_once_bucketed: false,
+            #[cfg(test)]
+            watch_closes: true,
         }
     }
 

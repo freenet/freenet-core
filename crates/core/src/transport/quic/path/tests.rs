@@ -158,6 +158,7 @@ async fn paths_built(
     // `a` keeps its node-wide counts where `b` does.
     let a_limits = QuicPathLimits {
         counters: b_limits.counters,
+        watch_closes: b_limits.watch_closes,
         ..QuicPathLimits::DEFAULT
     };
     let own =
@@ -801,29 +802,29 @@ fn idle_and_old_streams_are_evicted() {
         );
         assert!(p.b_in.streams.try_recv().unwrap().handle.is_cancelled());
 
-        // Age: a byte every half idle period, so it is never idle.
+        // Age: a byte every half idle period, so it is never idle. The age
+        // limit of a charged stream is the 2 h cap, whatever its size.
         let total = 100_000u64;
-        let age = max_inbound_stream_age(total);
+        let age = super::inbound::stream_age_limit();
         let conn = p.a_raw();
         let sleeper = time.clone();
         let started = time.now_nanos();
-        let code = p
-            .drive(async move {
-                let mut send = conn.open_uni().await.unwrap();
-                send.write_all(&header(1, 1, StreamId::next().0, total, 0))
-                    .await
-                    .unwrap();
-                loop {
-                    if let Err(quinn::WriteError::Stopped(code)) = send.write_all(b"x").await {
-                        return Some(code.into_inner());
-                    }
-                    tokio::select! {
-                        () = sleeper.sleep(idle / 2) => {}
-                        stopped = send.stopped() => return stopped.unwrap().map(|c| c.into_inner()),
-                    }
+        let code = drive(&p.pair.time, age + LIMIT, async move {
+            let mut send = conn.open_uni().await.unwrap();
+            send.write_all(&header(1, 1, StreamId::next().0, total, 0))
+                .await
+                .unwrap();
+            loop {
+                if let Err(quinn::WriteError::Stopped(code)) = send.write_all(b"x").await {
+                    return Some(code.into_inner());
                 }
-            })
-            .await;
+                tokio::select! {
+                    () = sleeper.sleep(idle / 2) => {}
+                    stopped = send.stopped() => return stopped.unwrap().map(|c| c.into_inner()),
+                }
+            }
+        })
+        .await;
         assert_eq!(code, Some(u64::from(stop_code::EVICTED)));
         let waited = Duration::from_nanos(time.now_nanos() - started);
         assert!(waited >= age, "evicted after {waited:?}, age limit {age:?}");
@@ -1118,7 +1119,13 @@ fn a_stream_stopped_with_gaps_is_released_after_the_grace_period() {
         };
         let _seed = GlobalRng::seed_guard(SEED);
         let network = "quic-path-stopped-gaps";
-        let mut p = paths(network, 89, QuicPathLimits::DEFAULT).await;
+        // `a`'s datagrams stop reaching `b`, so `a`'s watch would close the
+        // path as dark before `b` evicts the stream; this test is `b`'s.
+        let limits = QuicPathLimits {
+            watch_closes: false,
+            ..QuicPathLimits::DEFAULT
+        };
+        let mut p = paths(network, 89, limits).await;
         // Let the paths' stream-limit raises (`config::INITIAL_UNI_STREAMS`)
         // and their acknowledgements settle, so the first datagram `a` sends
         // below is the stream's.
@@ -2947,8 +2954,11 @@ const PEER_STEP: Duration = Duration::from_millis(20);
 /// A transfer still in flight 100 ms in, for the tests that cut the link
 /// mid-transfer. The round trip here is about one [`PEER_STEP`], so the window
 /// doubles every 20 ms from the initial 32 datagrams: 1 MiB would be done
-/// before the cut (38 + 77 + 154 + 307 + 614 kB in five round trips).
-const IN_FLIGHT_AT_THE_CUT: usize = 8 * 1024 * 1024;
+/// before the cut (38 + 77 + 154 + 307 + 614 kB in five round trips). Within
+/// `b`'s credit, which `b` never returns (it reads nothing), so the sender is
+/// never blocked on credit and the credit rule (`recycle::CreditWatch`) stays
+/// out of these tests.
+const IN_FLIGHT_AT_THE_CUT: usize = super::super::tests::TEST_WINDOW as usize - 64 * 1024;
 
 /// A real `QuicPath` (`a`, the client) connected to a peer `b` that is a
 /// quinn-proto endpoint driven by hand on the simulated network, so a test
@@ -3238,8 +3248,9 @@ fn packets_left_outstanding_when_the_peer_stops_acknowledging_close_the_path() {
     })
 }
 
-/// #5940 step M6, guard 2 (review finding 2): an outage of 30 s in both
-/// directions in the middle of a transfer, then recovery. `b` sends all the
+/// #5940 step M6, guard 2 (review finding 2): an outage of 8 s in both
+/// directions in the middle of a transfer, then recovery (shorter than the
+/// window: a longer one is a dark path, closed by the dark-path rule). `b` sends all the
 /// time once it is back, but has nothing new to acknowledge, while `a`'s
 /// data waits for its backed-off probe timer; `b` acknowledges the probe
 /// when it comes. `b` is a conforming peer: `a` must not close.
@@ -3261,7 +3272,7 @@ fn recovery_from_an_outage_in_both_directions_does_not_close() {
         assert!(s.sample().outstanding_after_acks() > 0);
         drop(cut);
         let outage = DropFrom::new(network, &[s.a_addr, s.b_addr]);
-        s.wait(Duration::from_secs(30)).await;
+        s.wait(Duration::from_secs(8)).await;
         drop(outage);
         let at_recovery = s.sample().received();
         s.wait(Duration::from_secs(60)).await;
@@ -3277,6 +3288,74 @@ fn recovery_from_an_outage_in_both_directions_does_not_close() {
             s.a.connection().inner().close_reason()
         );
         assert!(recycle_closes_to(s.b_addr).is_empty());
+    })
+}
+
+/// The dark-path rule on a real path: an outage in both directions in the
+/// middle of a transfer, with `a`'s data outstanding, closes the path within
+/// the window and two ticks of the cut, as dark: nothing is acknowledged and
+/// nothing comes from `b`. The M6 rule cannot see it, since it needs the peer
+/// to keep sending.
+#[test]
+fn a_path_dark_in_both_directions_is_closed_as_dark() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let network = "quic-path-ack-watch-dark";
+        let mut s = Scripted::connect(network, 5).await;
+        s.a_sends(IN_FLIGHT_AT_THE_CUT);
+        s.wait(Duration::from_millis(100)).await;
+        let _dark = DropFrom::new(network, &[s.a_addr, s.b_addr]);
+        let cut_at = s.time.now_nanos();
+        let waited = s.closed_after(cut_at).await;
+        assert!(
+            waited <= recycle::ACK_WATCH_WINDOW + 2 * recycle::ACK_WATCH_TICK,
+            "closed {waited:?} after the cut"
+        );
+        assert_eq!(recycle::stalls_to(s.b_addr), vec![recycle::Stall::Dark]);
+        assert_eq!(
+            recycle_closes_to(s.b_addr),
+            vec![QuicCloseCode::PeerNotAcknowledging]
+        );
+    })
+}
+
+/// The credit rule on a real path: `b` acknowledges everything but never
+/// reads, so it never returns credit, and `a` has more to send than `b`'s
+/// window. `a` closes the path as credit-starved within the window and a
+/// tick of its sends blocking (they block once the window's bytes are
+/// written, within the first second).
+#[test]
+fn a_peer_that_acknowledges_but_returns_no_credit_is_closed_as_credit_starved() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let network = "quic-path-ack-watch-credit";
+        let mut s = Scripted::connect(network, 6).await;
+        let start = s.time.now_nanos();
+        s.a_sends(4 * super::super::tests::TEST_WINDOW as usize);
+        let waited = s.closed_after(start).await;
+        assert!(
+            waited <= Duration::from_secs(1) + recycle::ACK_WATCH_WINDOW + recycle::ACK_WATCH_TICK,
+            "closed {waited:?} after the send started"
+        );
+        assert!(
+            s.a.connection().inner().stats().frame_tx.data_blocked
+                + s.a
+                    .connection()
+                    .inner()
+                    .stats()
+                    .frame_tx
+                    .stream_data_blocked
+                > 0,
+            "premise: blocked by b's credit"
+        );
+        assert_eq!(
+            recycle::stalls_to(s.b_addr),
+            vec![recycle::Stall::CreditStarved]
+        );
+        assert_eq!(
+            recycle_closes_to(s.b_addr),
+            vec![QuicCloseCode::PeerNotAcknowledging]
+        );
     })
 }
 
@@ -4391,8 +4470,10 @@ fn send_deadlines_have_these_values() {
     assert_eq!(stream.gap, Some(Duration::from_secs(5)));
     assert_eq!(
         stream.total,
-        crate::transport::peer_connection::inbound_stream_age_limit(MIB as u64)
+        inbound::stream_age_limit(),
+        "the 2 h cap, whatever the size: progress is the connection's rule"
     );
+    assert_eq!(SendDeadlines::stream(1).total, stream.total);
 
     assert_eq!(
         SendDeadlines::short(MIB as u64),
@@ -5910,7 +5991,13 @@ fn a_dark_path_beside_a_cap_held_one_times_out_and_goes_suspect() {
             })
             .await;
         drop(permit);
-        let (ac, _ac_in) = QuicPath::with_limits(ac, time.clone(), QuicPathLimits::DEFAULT);
+        // The send's deadlines and the hold credit, which the watch would
+        // otherwise preempt by closing the dark connection.
+        let quiet = QuicPathLimits {
+            watch_closes: false,
+            ..QuicPathLimits::DEFAULT
+        };
+        let (ac, _ac_in) = QuicPath::with_limits(ac, time.clone(), quiet);
         let (_ca, _ca_in) = QuicPath::with_limits(_ca, time.clone(), QuicPathLimits::DEFAULT);
         let ac = Arc::new(ac);
         let ab = p.a.clone();
@@ -6621,8 +6708,6 @@ fn leaked_counters() -> &'static crate::transport::metrics::QuicDataCounters {
     Box::leak(Box::new(crate::transport::metrics::QuicDataCounters::new()))
 }
 
-/// On a real connection, a stream whose in-order delivery fills the receive
-/// window grows it, and the node's charge stays within the budget.
 /// While the buffer budget throttles a connection, a stream that was making
 /// progress when the throttle began does not go idle: its idle timer is
 /// paused, since the slowdown is this node's decision. It still has its age
@@ -6640,28 +6725,27 @@ fn a_throttle_pauses_idle_and_the_age_limit_counts_apart() {
         let meter = p.b.meter().expect("b reads data under a budget").clone();
         let idle = streaming_handle_idle_timeout();
         let total = 10_000u64;
-        let age = max_inbound_stream_age(total);
+        let age = super::inbound::stream_age_limit();
         assert!(
             age > idle * 3,
             "premise: the age limit is past several idle periods"
         );
         let (raw, time) = (p.a_raw(), p.time());
         let started = time.now_nanos();
-        let code = p
-            .drive(async move {
-                let id = StreamId::next().0;
-                let mut bytes = header(1, 1, id, total, 0);
-                bytes.extend_from_slice(&payload(1000));
-                let mut send = raw.open_uni().await.unwrap();
-                send.write_all(&bytes).await.unwrap();
-                time.sleep(Duration::from_millis(100)).await;
-                // The throttle begins just after the stream's last progress
-                // and lasts past its age limit.
-                let now = time.now_nanos();
-                meter.throttle_for_test(now, now + 2 * age.as_nanos() as u64);
-                send.stopped().await.unwrap().map(|code| code.into_inner())
-            })
-            .await;
+        let code = drive(&p.pair.time, age + LIMIT, async move {
+            let id = StreamId::next().0;
+            let mut bytes = header(1, 1, id, total, 0);
+            bytes.extend_from_slice(&payload(1000));
+            let mut send = raw.open_uni().await.unwrap();
+            send.write_all(&bytes).await.unwrap();
+            time.sleep(Duration::from_millis(100)).await;
+            // The throttle begins just after the stream's last progress
+            // and lasts past its age limit.
+            let now = time.now_nanos();
+            meter.throttle_for_test(now, now + 2 * age.as_nanos() as u64);
+            send.stopped().await.unwrap().map(|code| code.into_inner())
+        })
+        .await;
         assert_eq!(code, Some(u64::from(stop_code::EVICTED)));
         let waited = Duration::from_nanos(p.time().now_nanos() - started);
         assert!(
@@ -6675,6 +6759,8 @@ fn a_throttle_pauses_idle_and_the_age_limit_counts_apart() {
     })
 }
 
+/// On a real connection, a stream whose in-order delivery fills the receive
+/// window grows it, and the node's charge stays within the budget.
 #[test]
 fn a_data_paths_window_grows_when_delivery_fills_it() {
     bounded(|| async move {
