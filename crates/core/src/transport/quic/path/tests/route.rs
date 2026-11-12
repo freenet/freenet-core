@@ -311,7 +311,7 @@ fn a_cap_hold_counts_as_progress() {
 fn a_binding_cap_with_no_acknowledgements_keeps_the_path() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let p = paths_capped("quic-route-cap", 72, 50).await;
+        let p = paths_capped("quic-route-cap", 50).await;
         let (a, time) = (p.a.clone(), p.time());
         p.drive(async move {
             // A stream the cap holds for many minutes at 50 B/s.
@@ -362,7 +362,7 @@ fn a_binding_cap_with_no_acknowledgements_keeps_the_path() {
 fn a_path_with_a_quiet_timeout_is_suspect_until_the_peer_acknowledges() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let p = paths("quic-route-suspect", 73, QuicPathLimits::DEFAULT).await;
+        let p = paths("quic-route-suspect", QuicPathLimits::DEFAULT).await;
         let (a, time) = (p.a.clone(), p.time());
         let built = time.now_nanos();
         a.settle(SendKind::Short, &timeouts()[0], false, built + SECOND);
@@ -409,7 +409,7 @@ fn with_no_acknowledgement_count_every_timeout_counts() {
 fn a_quiet_path_closes_after_eight_timeouts() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let p = paths("quic-route-stall", 70, QuicPathLimits::DEFAULT).await;
+        let p = paths("quic-route-stall", QuicPathLimits::DEFAULT).await;
         assert!(
             p.a.ack_progress.is_some(),
             "the connection counts acknowledgements"
@@ -440,7 +440,7 @@ fn pacer_refusals_never_count_and_a_dark_paced_path_still_closes() {
     use crate::transport::quic::config::QuicRateLimit;
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let p = paths("quic-route-paced", 124, QuicPathLimits::DEFAULT).await;
+        let p = paths("quic-route-paced", QuicPathLimits::DEFAULT).await;
         p.a.pace_with(Arc::new(
             LimitPacer::new(QuicRateLimit::new(Some(100_000), None), p.time())
                 .expect("a limit paces"),
@@ -484,7 +484,7 @@ fn pacer_refusals_never_count_and_a_dark_paced_path_still_closes() {
 fn a_refusal_stops_new_sends_on_the_path() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let p = paths("quic-route-refused", 71, QuicPathLimits::DEFAULT).await;
+        let p = paths("quic-route-refused", QuicPathLimits::DEFAULT).await;
         assert!(p.a.sends_data());
         p.a.settle(
             SendKind::Stream,

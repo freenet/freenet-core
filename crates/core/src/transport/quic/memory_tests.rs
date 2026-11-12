@@ -125,10 +125,10 @@ async fn settle(time: &VirtualTime) {
 ///   acknowledged are not here.
 /// - socket buffers. `SimulationSocket` has none; a real UDP socket's
 ///   kernel buffers are per endpoint, not per connection.
-async fn measure(network: &str, subnet: u8, n: usize) -> Cost {
+async fn measure(network: &str, n: usize) -> Cost {
     let _seed = GlobalRng::seed_guard(SEED);
-    let a_addr: SocketAddr = format!("10.204.{subnet}.1:5000").parse().unwrap();
-    let b_addr: SocketAddr = format!("10.204.{subnet}.2:5000").parse().unwrap();
+    let net = crate::transport::test_net::subnet();
+    let (a_addr, b_addr) = (net.addr(1), net.addr(2));
     let time = VirtualTime::new();
     register_network_time_source(network, time.clone());
     register_address_network(a_addr, network);
@@ -235,7 +235,7 @@ async fn measure(network: &str, subnet: u8, n: usize) -> Cost {
 #[test]
 fn an_idle_connection_measures_within_the_fixed_pin() {
     bounded(|| async move {
-        let cost = measure("quic-memory-fixed", 1, 16).await;
+        let cost = measure("quic-memory-fixed", 16).await;
         assert!(
             cost.settle_drift.rounded.abs() <= SETTLE_DRIFT_BYTES,
             "premise: nothing was running before the baseline: {cost:?}"
@@ -267,9 +267,9 @@ struct StreamRig {
 }
 
 impl StreamRig {
-    async fn new(network: &str, subnet: u8) -> Self {
-        let a_addr: SocketAddr = format!("10.204.{subnet}.1:5000").parse().unwrap();
-        let b_addr: SocketAddr = format!("10.204.{subnet}.2:5000").parse().unwrap();
+    async fn new(network: &str) -> Self {
+        let net = crate::transport::test_net::subnet();
+        let (a_addr, b_addr) = (net.addr(1), net.addr(2));
         let time = VirtualTime::new();
         register_network_time_source(network, time.clone());
         register_address_network(a_addr, network);
@@ -347,9 +347,9 @@ impl Drop for StreamRig {
 /// the receiver's reader for each (`path::inbound`), with one byte written
 /// on each and the stream left open. A warm-up stream first, a settled
 /// baseline, then the streams, settled, against it.
-async fn measure_open_streams(network: &str, subnet: u8, streams: usize) -> Live {
+async fn measure_open_streams(network: &str, streams: usize) -> Live {
     let _seed = GlobalRng::seed_guard(SEED);
-    let rig = StreamRig::new(network, subnet).await;
+    let rig = StreamRig::new(network).await;
     let (time, raw) = (rig.time.clone(), rig.raw.clone());
     let warm = raw.clone();
     drive(&time, LIMIT, async move {
@@ -385,15 +385,10 @@ async fn measure_open_streams(network: &str, subnet: u8, streams: usize) -> Live
 /// deregistration, so `VirtualTime`'s wakeup queues reach about `streams`
 /// entries, and a `Vec`/`BinaryHeap` keeps its peak capacity once they fire.
 /// Production timers deregister on drop. Compare two runs to cancel it.
-async fn measure_reset_streams(
-    network: &str,
-    subnet: u8,
-    streams: usize,
-    poll_stopped: bool,
-) -> Live {
+async fn measure_reset_streams(network: &str, streams: usize, poll_stopped: bool) -> Live {
     use futures::FutureExt;
     let _seed = GlobalRng::seed_guard(SEED);
-    let rig = StreamRig::new(network, subnet).await;
+    let rig = StreamRig::new(network).await;
     let (time, raw) = (rig.time.clone(), rig.raw.clone());
     let reset_one = move |raw: quinn::Connection| async move {
         let mut send = raw.open_uni().await.expect("open");
@@ -428,8 +423,8 @@ async fn measure_reset_streams(
 fn polling_stopped_on_a_reset_stream_costs_at_most_its_entry() {
     bounded(|| async move {
         let streams = 1024;
-        let polled = measure_reset_streams("quic-memory-stopped", 3, streams, true).await;
-        let plain = measure_reset_streams("quic-memory-unpolled", 4, streams, false).await;
+        let polled = measure_reset_streams("quic-memory-stopped", streams, true).await;
+        let plain = measure_reset_streams("quic-memory-unpolled", streams, false).await;
         let entries = polled.rounded - plain.rounded;
         assert!(
             entries > 0,
@@ -455,7 +450,7 @@ fn an_open_stream_measures_within_its_pin() {
         // Not the whole stream limit: the warm-up stream's slot comes back only
         // once more than an eighth of the limit is freed.
         let streams = super::config::STREAMED_SEND_LIMIT as usize;
-        let cost = measure_open_streams("quic-memory-streams", 2, streams).await;
+        let cost = measure_open_streams("quic-memory-streams", streams).await;
         assert!(
             cost.rounded > 0,
             "premise: the streams held memory: {cost:?}"
@@ -704,8 +699,9 @@ fn connected_pair_with_factory(
         super::config::system_clock(real.clone()),
     )
     .expect("server config");
+    let net = crate::transport::test_net::subnet();
     let mut receiver = ProtoPeer {
-        addr: "10.205.0.2:5000".parse().unwrap(),
+        addr: net.addr(2),
         endpoint: quinn_proto::Endpoint::new(
             Arc::new(super::config::endpoint_config().expect("endpoint config")),
             Some(Arc::new(server)),
@@ -724,7 +720,7 @@ fn connected_pair_with_factory(
         Arc::new(sender_transport),
     );
     let mut sender = ProtoPeer {
-        addr: "10.205.0.1:5000".parse().unwrap(),
+        addr: net.addr(1),
         endpoint: quinn_proto::Endpoint::new(
             Arc::new(super::config::endpoint_config().expect("endpoint config")),
             None,
