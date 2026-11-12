@@ -50,7 +50,7 @@ fn a_paced_path_keeps_to_the_limit_on_a_short_round_trip() {
         let _seed = GlobalRng::seed_guard(SEED);
         const RATE: usize = 100_000;
         const LEN: usize = 500_000;
-        let p = paths("quic-pacer-rate", 120, QuicPathLimits::DEFAULT).await;
+        let p = paths("quic-pacer-rate", QuicPathLimits::DEFAULT).await;
         let (unpaced, outcome) = time_a_stream(&p, LEN).await;
         assert!(matches!(outcome, BoundedSend::Sent), "{outcome:?}");
         assert!(
@@ -75,7 +75,7 @@ fn a_paced_path_keeps_to_the_limit_on_a_short_round_trip() {
 fn control_frames_and_one_packet_shorts_do_not_wait_behind_data() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let p = paths("quic-pacer-control", 121, QuicPathLimits::DEFAULT).await;
+        let p = paths("quic-pacer-control", QuicPathLimits::DEFAULT).await;
         // At the bucket's lowest rate, 1 KiB/s, a 120 kB debt takes over 100 s.
         let pacer = pacer_at(&p.time(), 1024);
         assert!(
@@ -225,7 +225,7 @@ impl SendPacer for Scripted {
 fn a_refusal_after_the_stream_opened_resets_it() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let p = paths("quic-pacer-refused", 122, QuicPathLimits::DEFAULT).await;
+        let p = paths("quic-pacer-refused", QuicPathLimits::DEFAULT).await;
         // Header and metadata, then two fragments, then a refusal.
         let pacer = Scripted::new(&p.time(), 3, Duration::ZERO);
         p.a.pace_with(pacer.clone());
@@ -257,7 +257,7 @@ fn a_refusal_after_the_stream_opened_resets_it() {
 fn bytes_taken_for_a_write_not_made_go_back() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let p = paths("quic-pacer-give-back", 123, QuicPathLimits::DEFAULT).await;
+        let p = paths("quic-pacer-give-back", QuicPathLimits::DEFAULT).await;
         // Header and metadata go at once; the first fragment is granted after
         // 30 s, ignoring the limit it is offered (a real pacer would refuse
         // any wait past the 5 s gap, which is how this case arises: a pacer
@@ -342,7 +342,7 @@ fn a_limit_pacer_paces_at_the_limit_and_follows_the_share() {
 fn each_write_takes_its_own_bytes() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let p = paths("quic-pacer-bytes", 125, QuicPathLimits::DEFAULT).await;
+        let p = paths("quic-pacer-bytes", QuicPathLimits::DEFAULT).await;
         let pacer = Scripted::new(&p.time(), usize::MAX, Duration::ZERO);
         p.a.pace_with(pacer.clone());
         let (a, time) = (p.a.clone(), p.time());
@@ -490,7 +490,7 @@ impl SendPacer for ChargesMidway {
 fn an_open_stream_survives_a_fallback_charge() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let p = paths("quic-pacer-survives", 126, QuicPathLimits::DEFAULT).await;
+        let p = paths("quic-pacer-survives", QuicPathLimits::DEFAULT).await;
         // The charge comes at the second fragment, after the stream opened.
         p.a.pace_with(Arc::new(ChargesMidway {
             inner: pacer_at(&p.time(), 100_000),
@@ -545,7 +545,7 @@ fn a_paced_send_to_a_dark_peer_times_out_and_the_path_goes_suspect() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
         let network = "quic-pacer-dark";
-        let p = paths(network, 127, QuicPathLimits::DEFAULT).await;
+        let p = paths(network, QuicPathLimits::DEFAULT).await;
         let pacer = Arc::new(CountsWaits {
             inner: pacer_at(&p.time(), 400_000),
             waited: AtomicUsize::new(0),
@@ -677,7 +677,7 @@ fn a_pacer_is_offered_at_most_the_gap_on_a_lossy_live_path() {
         let _seed = GlobalRng::seed_guard(SEED);
         let network = "quic-pacer-lossy-window";
         let loss = seeded_loss_from(network, 5, 0x5940_0007, Some(Duration::from_millis(100)));
-        let p = paths_without_loss_gate(network, 47).await;
+        let p = paths_without_loss_gate(network).await;
         let pacer = Scripted::new(&p.time(), usize::MAX, Duration::ZERO);
         p.a.pace_with(pacer.clone());
         let (elapsed, outcome) = time_a_stream(&p, 8 * MIB).await;
@@ -709,7 +709,7 @@ fn a_pacer_is_offered_at_most_the_gap_on_a_lossy_live_path() {
 fn long_pacer_waits_inside_the_gap_complete() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let p = paths("quic-pacer-long-waits", 128, QuicPathLimits::DEFAULT).await;
+        let p = paths("quic-pacer-long-waits", QuicPathLimits::DEFAULT).await;
         let pacer = Honest::new(&p.time(), 1, Duration::from_secs(4));
         p.a.pace_with(pacer.clone());
         let fragments = 3;
@@ -731,7 +731,7 @@ fn long_pacer_waits_inside_the_gap_complete() {
 fn a_pacer_wait_past_the_gap_is_refused_and_counts_for_nothing() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let p = paths("quic-pacer-past-gap", 129, QuicPathLimits::DEFAULT).await;
+        let p = paths("quic-pacer-past-gap", QuicPathLimits::DEFAULT).await;
         let pacer = Honest::new(&p.time(), 1, Duration::from_secs(8));
         p.a.pace_with(pacer.clone());
         let (elapsed, outcome) = time_a_stream(&p, 3 * FRAGMENT_PAYLOAD_SIZE).await;
@@ -759,7 +759,7 @@ fn a_pacer_wait_past_the_gap_is_refused_and_counts_for_nothing() {
 fn the_pacer_is_offered_no_more_than_total_leaves() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let p = paths("quic-pacer-total", 130, QuicPathLimits::DEFAULT).await;
+        let p = paths("quic-pacer-total", QuicPathLimits::DEFAULT).await;
         let pacer = Honest::new(&p.time(), usize::MAX, Duration::ZERO);
         p.a.pace_with(pacer.clone());
         let (a, time) = (p.a.clone(), p.time());
@@ -800,7 +800,7 @@ fn a_paced_path_dark_mid_send_fails_within_two_windows_and_goes_suspect() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
         let network = "quic-pacer-dark-mid-send";
-        let p = paths(network, 131, QuicPathLimits::DEFAULT).await;
+        let p = paths(network, QuicPathLimits::DEFAULT).await;
         let pacer = Arc::new(CountsWaits {
             inner: pacer_at(&p.time(), 400_000),
             waited: AtomicUsize::new(0),

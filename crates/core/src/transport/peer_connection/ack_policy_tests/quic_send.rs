@@ -153,7 +153,7 @@ fn bytes_of(len: usize) -> Bytes {
     (0..len).map(|i| (i / 7) as u8).collect::<Vec<_>>().into()
 }
 
-fn run<F, Fut>(network: &'static str, subnet: u8, peer_limits: QuicPathLimits, test: F)
+fn run<F, Fut>(network: &'static str, peer_limits: QuicPathLimits, test: F)
 where
     F: FnOnce(Rig) -> Fut + Send + 'static,
     Fut: Future<Output = ()> + Send + 'static,
@@ -164,7 +164,6 @@ where
         e.conn.attach_quic_inbox(inbox);
         let path = data_path_to(
             network,
-            subnet,
             QuicPathLimits::DEFAULT,
             peer_limits,
             e.conn.inbound_budget(),
@@ -201,7 +200,6 @@ where
 fn a_message_of_each_kind_goes_on_the_path_and_not_on_udp() {
     run(
         "quic-send-each-kind",
-        50,
         QuicPathLimits::DEFAULT,
         |mut rig| async move {
             let short = message(1);
@@ -269,7 +267,6 @@ fn a_message_of_each_kind_goes_on_the_path_and_not_on_udp() {
 fn an_observed_send_on_the_path_is_unobserved() {
     run(
         "quic-send-observed",
-        50,
         QuicPathLimits::DEFAULT,
         |mut rig| async move {
             let short = message(1);
@@ -309,7 +306,6 @@ fn an_observed_send_on_the_path_is_unobserved() {
 fn a_full_queue_overflows_to_udp_and_nothing_is_lost() {
     run(
         "quic-send-overflow",
-        51,
         QuicPathLimits::DEFAULT,
         |mut rig| async move {
             let over = 5;
@@ -359,7 +355,6 @@ fn a_full_queue_overflows_to_udp_and_nothing_is_lost() {
 fn a_short_never_waits_for_the_path() {
     run(
         "quic-send-no-wait",
-        52,
         QuicPathLimits::DEFAULT,
         |mut rig| async move {
             let _held = rig.hold_stream_credit().await;
@@ -387,7 +382,6 @@ fn a_short_never_waits_for_the_path() {
 fn a_path_closed_with_a_full_queue_hands_every_message_to_udp_once() {
     run(
         "quic-send-close-drain",
-        53,
         QuicPathLimits::DEFAULT,
         |mut rig| async move {
             let _held = rig.hold_stream_credit().await;
@@ -437,7 +431,6 @@ fn a_path_closed_with_a_full_queue_hands_every_message_to_udp_once() {
 fn a_message_whose_ack_is_lost_is_delivered_once() {
     run(
         "quic-send-lost-ack",
-        54,
         QuicPathLimits::DEFAULT,
         |mut rig| async move {
             let silenced = DropFrom::new("quic-send-lost-ack", &[rig.path.peer_addr()]);
@@ -461,7 +454,6 @@ fn a_message_whose_ack_is_lost_is_delivered_once() {
 fn flight_size_returns_to_zero_after_each_way_to_udp() {
     run(
         "quic-send-flight",
-        55,
         QuicPathLimits::DEFAULT,
         |mut rig| async move {
             // The queue overflows.
@@ -518,7 +510,6 @@ fn flight_size_returns_to_zero_after_each_way_to_udp() {
 fn a_udp_send_that_fails_charges_no_flight_and_is_counted() {
     run(
         "quic-send-udp-fails",
-        56,
         QuicPathLimits::DEFAULT,
         |rig| async move {
             rig.e
@@ -541,7 +532,6 @@ fn a_udp_send_that_fails_charges_no_flight_and_is_counted() {
 fn the_largest_short_goes_on_udp_whole() {
     run(
         "quic-send-largest",
-        57,
         QuicPathLimits::DEFAULT,
         |mut rig| async move {
             let largest = (0u64..)
@@ -567,7 +557,6 @@ fn the_largest_short_goes_on_udp_whole() {
 fn a_stream_that_never_opened_goes_on_udp_under_its_id() {
     run(
         "quic-send-stream-udp",
-        58,
         QuicPathLimits::DEFAULT,
         |mut rig| async move {
             let _held = rig.hold_stream_credit().await;
@@ -595,7 +584,6 @@ fn a_stream_that_never_opened_goes_on_udp_under_its_id() {
 fn a_large_short_that_never_opened_goes_on_udp_as_a_stream() {
     run(
         "quic-send-large-udp",
-        59,
         QuicPathLimits::DEFAULT,
         |mut rig| async move {
             let _held = rig.hold_stream_credit().await;
@@ -622,7 +610,6 @@ fn a_large_short_that_never_opened_goes_on_udp_as_a_stream() {
 fn data_the_peer_refuses_goes_on_udp_and_the_peer_closes_the_path() {
     run(
         "quic-send-refused",
-        60,
         QuicPathLimits::SHADOW,
         |mut rig| async move {
             let id = StreamId::next();
@@ -668,7 +655,7 @@ fn a_stream_refused_for_room_is_dropped_and_a_short_is_not() {
         max_bytes: 1024,
         ..QuicPathLimits::DEFAULT
     };
-    run("quic-send-budget", 61, limits, |mut rig| async move {
+    run("quic-send-budget", limits, |mut rig| async move {
         let (done, heard) = oneshot::channel();
         rig.e
             .conn
@@ -703,7 +690,6 @@ fn a_stream_refused_for_room_is_dropped_and_a_short_is_not() {
 fn a_stream_that_stalls_after_opening_is_dropped() {
     run(
         "quic-send-stalled",
-        62,
         QuicPathLimits::DEFAULT,
         |mut rig| async move {
             let (done, heard) = oneshot::channel();
@@ -735,7 +721,6 @@ fn a_stream_that_stalls_after_opening_is_dropped() {
 fn a_pipe_that_never_opened_goes_on_udp_from_its_first_byte() {
     run(
         "quic-send-pipe-udp",
-        63,
         QuicPathLimits::DEFAULT,
         |mut rig| async move {
             let _held = rig.hold_stream_credit().await;
@@ -773,7 +758,6 @@ fn a_pipe_that_never_opened_goes_on_udp_from_its_first_byte() {
 fn a_pipe_with_no_first_chunk_is_dropped() {
     run(
         "quic-send-pipe-empty",
-        64,
         QuicPathLimits::DEFAULT,
         |mut rig| async move {
             let source = StreamHandle::new(StreamId::next(), 2000);
@@ -808,65 +792,60 @@ fn shorts_held_back_by_a_slow_consumer_do_not_close_the_path() {
         short_capacity: 1,
         ..QuicPathLimits::DEFAULT
     };
-    run(
-        "quic-send-slow-consumer",
-        65,
-        limits,
-        |mut rig| async move {
-            let mut sent = 0u32;
-            let mut send = async |rig: &mut Rig, count: u32| {
-                for _ in 0..count {
-                    if sent % 32 == 0 {
-                        tokio::task::yield_now().await;
-                    }
-                    rig.e.conn.send_serialized(message(sent)).await.unwrap();
-                    sent += 1;
+    run("quic-send-slow-consumer", limits, |mut rig| async move {
+        let mut sent = 0u32;
+        let mut send = async |rig: &mut Rig, count: u32| {
+            for _ in 0..count {
+                if sent % 32 == 0 {
+                    tokio::task::yield_now().await;
                 }
-            };
-            // Enough to use up the peer's credit, which its readers then hold.
-            send(&mut rig, 120).await;
-            rig.path.settle(Duration::from_secs(2)).await;
-            let mut seen = Vec::new();
-            // Every 3 s for 33 s the consumer takes ten, which frees credit
-            // (quinn announces it in steps of eight), and a burst follows. A few of
-            // the burst open and are acknowledged; at least eight time out at once,
-            // so only the acknowledgements keep the path from counting them.
-            for _ in 0..11 {
-                for _ in 0..10 {
-                    seen.extend(rig.delivered_shorts());
-                    rig.path.settle(Duration::from_millis(5)).await;
-                }
-                rig.path.settle(Duration::from_millis(50)).await;
-                send(&mut rig, 2 * STALLED_SENDS_LIMIT + 2).await;
-                rig.path.settle(Duration::from_secs(3)).await;
+                rig.e.conn.send_serialized(message(sent)).await.unwrap();
+                sent += 1;
             }
-            assert!(
-                rig.stats().send_count(SendKind::Short, R::NotOpenedUdp)
-                    >= u64::from(10 * STALLED_SENDS_LIMIT),
-                "many sends could not open"
-            );
-            assert_eq!(rig.stats().send_event_count(E::StalledClosed), 0);
-            assert_eq!(
-                rig.stats().send_event_count(E::SuspectEntered),
-                0,
-                "an acknowledged path is never suspect"
-            );
-            assert!(rig.route.path().quinn_connection().close_reason().is_none());
-
-            // The consumer catches up. The channel holds one, so each turn lets
-            // one waiting reader in.
-            for _ in 0..1000 {
+        };
+        // Enough to use up the peer's credit, which its readers then hold.
+        send(&mut rig, 120).await;
+        rig.path.settle(Duration::from_secs(2)).await;
+        let mut seen = Vec::new();
+        // Every 3 s for 33 s the consumer takes ten, which frees credit
+        // (quinn announces it in steps of eight), and a burst follows. A few of
+        // the burst open and are acknowledged; at least eight time out at once,
+        // so only the acknowledgements keep the path from counting them.
+        for _ in 0..11 {
+            for _ in 0..10 {
                 seen.extend(rig.delivered_shorts());
                 rig.path.settle(Duration::from_millis(5)).await;
             }
-            seen.extend(rig.udp_data().shorts);
-            assert_eq!(
-                sorted(seen),
-                sorted((0..sent).map(message).collect::<Vec<_>>()),
-                "each message once"
-            );
-        },
-    );
+            rig.path.settle(Duration::from_millis(50)).await;
+            send(&mut rig, 2 * STALLED_SENDS_LIMIT + 2).await;
+            rig.path.settle(Duration::from_secs(3)).await;
+        }
+        assert!(
+            rig.stats().send_count(SendKind::Short, R::NotOpenedUdp)
+                >= u64::from(10 * STALLED_SENDS_LIMIT),
+            "many sends could not open"
+        );
+        assert_eq!(rig.stats().send_event_count(E::StalledClosed), 0);
+        assert_eq!(
+            rig.stats().send_event_count(E::SuspectEntered),
+            0,
+            "an acknowledged path is never suspect"
+        );
+        assert!(rig.route.path().quinn_connection().close_reason().is_none());
+
+        // The consumer catches up. The channel holds one, so each turn lets
+        // one waiting reader in.
+        for _ in 0..1000 {
+            seen.extend(rig.delivered_shorts());
+            rig.path.settle(Duration::from_millis(5)).await;
+        }
+        seen.extend(rig.udp_data().shorts);
+        assert_eq!(
+            sorted(seen),
+            sorted((0..sent).map(message).collect::<Vec<_>>()),
+            "each message once"
+        );
+    });
 }
 
 /// A busy relay holds all 48 of its streamed-send permits for long transfers that
@@ -876,7 +855,6 @@ fn shorts_held_back_by_a_slow_consumer_do_not_close_the_path() {
 fn a_busy_relay_whose_transfers_are_acknowledged_keeps_its_path() {
     run(
         "quic-send-busy-relay",
-        67,
         QuicPathLimits::DEFAULT,
         |mut rig| async move {
             const PIECES: u32 = 12;
@@ -945,7 +923,6 @@ fn a_busy_relay_whose_transfers_are_acknowledged_keeps_its_path() {
 fn permits_held_with_nothing_acknowledged_close_the_path() {
     run(
         "quic-send-held-permits",
-        73,
         QuicPathLimits::DEFAULT,
         |mut rig| async move {
             let silenced = DropFrom::new("quic-send-held-permits", &[rig.path.peer_addr()]);
@@ -983,7 +960,6 @@ fn permits_held_with_nothing_acknowledged_close_the_path() {
 fn eight_streams_that_stall_after_opening_close_the_path() {
     run(
         "quic-send-stall-close",
-        68,
         QuicPathLimits::DEFAULT,
         |mut rig| async move {
             let silenced = DropFrom::new("quic-send-stall-close", &[rig.path.peer_addr()]);
@@ -1019,7 +995,6 @@ fn eight_streams_that_stall_after_opening_close_the_path() {
 fn messages_whose_ack_is_lost_arrive_once_and_a_stream_reports_dropped() {
     run(
         "quic-send-lost-acks",
-        69,
         QuicPathLimits::DEFAULT,
         |mut rig| async move {
             let silenced = DropFrom::new("quic-send-lost-acks", &[rig.path.peer_addr()]);
@@ -1085,7 +1060,6 @@ fn messages_whose_ack_is_lost_arrive_once_and_a_stream_reports_dropped() {
 fn a_pipe_that_fails_after_sending_part_gives_up() {
     run(
         "quic-send-pipe-partial",
-        70,
         QuicPathLimits::DEFAULT,
         |mut rig| async move {
             let source = StreamHandle::new(StreamId::next(), 4000);
@@ -1126,7 +1100,6 @@ fn a_pipe_that_fails_after_sending_part_gives_up() {
 fn a_pipe_that_stalls_after_opening_gives_up() {
     run(
         "quic-send-pipe-stall-open",
-        74,
         QuicPathLimits::DEFAULT,
         |mut rig| async move {
             let source = StreamHandle::new(StreamId::next(), 4000);
@@ -1166,7 +1139,6 @@ fn a_pipe_that_stalls_after_opening_gives_up() {
 fn a_suspect_path_sends_new_shorts_on_udp_until_it_is_acknowledged() {
     run(
         "quic-send-suspect",
-        75,
         QuicPathLimits::DEFAULT,
         |mut rig| async move {
             let silenced = DropFrom::new("quic-send-suspect", &[rig.path.peer_addr()]);
@@ -1238,7 +1210,7 @@ fn a_suspect_path_sends_new_shorts_on_udp_until_it_is_acknowledged() {
 fn a_session_in_shadow_sends_everything_on_udp() {
     use crate::transport::quic::upgrade::driver::tests::shadow_path;
     crate::transport::quic::upgrade::driver::tests::run_bounded(|| async move {
-        let shadow = shadow_path("quic-send-inert", 93).await;
+        let shadow = shadow_path("quic-send-inert").await;
         let mut e = single(CAPABLE);
         let path = Arc::clone(&shadow.path);
         let time = shadow.time.clone();
@@ -1307,7 +1279,6 @@ fn a_session_in_shadow_sends_everything_on_udp() {
 fn pipes_whose_source_stalls_do_not_close_the_path() {
     run(
         "quic-send-pipe-stall",
-        66,
         QuicPathLimits::DEFAULT,
         |mut rig| async move {
             let mut sources = Vec::new();
@@ -1351,7 +1322,6 @@ fn a_pipe_from_a_quic_fed_source_waits_out_a_gap_past_five_seconds() {
     );
     run(
         "quic-send-pipe-quic-gap",
-        76,
         QuicPathLimits::DEFAULT,
         |mut rig| async move {
             assert!(
@@ -1411,7 +1381,6 @@ fn a_pipe_from_a_quic_fed_source_waits_out_a_gap_past_five_seconds() {
 fn a_pipe_into_a_fast_path_waits_no_longer_than_its_receiver() {
     run(
         "quic-send-pipe-asymmetric",
-        78,
         QuicPathLimits::DEFAULT,
         |mut rig| async move {
             assert_eq!(
@@ -1486,7 +1455,6 @@ fn a_pipe_from_a_quic_fed_source_ends_when_the_reader_stops() {
     use crate::transport::peer_connection::streaming::QuicSourceEnd;
     run(
         "quic-send-pipe-quic-end",
-        77,
         QuicPathLimits::DEFAULT,
         |mut rig| async move {
             let total = 2 * FRAGMENT_PAYLOAD_SIZE;
@@ -1558,7 +1526,7 @@ fn many_tasks_send_while_the_path_closes_and_nothing_goes_twice() {
                         1 << 30,
                     );
                 let (data, _inbox) = data_channels();
-                let mut path = data_path_on_threads("quic-send-threads", 72, budget, data).await;
+                let mut path = data_path_on_threads("quic-send-threads", budget, data).await;
                 let ours = path.ours_handle();
                 ours.enable_data();
                 let time = path.time.clone();
@@ -1711,7 +1679,6 @@ impl crate::transport::quic::path::pacer::SendPacer for RefusingPacer {
 fn messages_the_pacer_refuses_go_on_udp_and_are_charged_to_it() {
     run(
         "quic-send-paced-udp",
-        140,
         QuicPathLimits::DEFAULT,
         |mut rig| async move {
             let pacer = Arc::new(RefusingPacer::default());
@@ -1755,7 +1722,6 @@ fn messages_the_pacer_refuses_go_on_udp_and_are_charged_to_it() {
 fn a_large_short_the_pacer_refuses_after_opening_is_charged_in_full() {
     run(
         "quic-send-paced-open",
-        141,
         QuicPathLimits::DEFAULT,
         |mut rig| async move {
             // The header and the first write go; the next write is refused.
@@ -1793,7 +1759,6 @@ fn a_large_short_the_pacer_refuses_after_opening_is_charged_in_full() {
 fn a_fallback_that_fails_on_udp_leaves_no_debt() {
     run(
         "quic-send-paced-udp-fails",
-        142,
         QuicPathLimits::DEFAULT,
         |mut rig| async move {
             let pacer = Arc::new(RefusingPacer::default());
