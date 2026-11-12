@@ -4108,6 +4108,89 @@ mod tests {
         );
     }
 
+    /// The `ConnectFailed` branches of the relay driver re-run
+    /// `handle_request` on the stored request after marking the failed
+    /// acceptor visited. Driven the same way here, with both sides ready at
+    /// 100% so a lost or zeroed offer would change the decision: the
+    /// re-routed request still carries the offer, and a local accept after
+    /// the re-routed attempt fails too decides `Native` on it.
+    #[test]
+    fn the_offer_survives_connect_failed_reroute_and_local_accept() {
+        let self_loc = make_peer(4000);
+        let joiner = make_peer(5000);
+        let peer_a = make_peer(6000);
+        let peer_b = make_peer(7000);
+        let offer = Some(native::NativeOffer::capable(100));
+        let ready = native::NativeReadiness {
+            ready: true,
+            percent: 100,
+        };
+        let mut state = native_relay_state(&joiner, offer, false);
+        let forward = |state: &mut RelayState, hop: &PeerKeyLocation| {
+            let ctx = TestRelayContext::new(self_loc.clone())
+                .native(ready)
+                .accept(false)
+                .uphill_hop(Some(hop.clone()));
+            let actions = state.handle_request(
+                &ctx,
+                &HashMap::new(),
+                &mut HashMap::new(),
+                &ConnectForwardEstimator::new(),
+                Instant::now(),
+            );
+            let (to, forwarded) = actions.forward.expect("forwards uphill");
+            assert_eq!(to, *hop);
+            forwarded
+        };
+        // What the driver does on a ConnectFailed it re-routes itself.
+        let connect_failed = |state: &mut RelayState, acceptor: &PeerKeyLocation| {
+            state
+                .request
+                .visited
+                .mark_visited(acceptor.socket_addr().expect("test peer has an address"));
+            state.forwarded_to = None;
+            state.forwarded_at = None;
+            state.response_forwarded = false;
+        };
+
+        assert_eq!(forward(&mut state, &peer_a).native_offer, offer);
+        state.response_forwarded = true;
+        connect_failed(&mut state, &peer_a);
+        assert_eq!(
+            forward(&mut state, &peer_b).native_offer,
+            offer,
+            "the re-routed request carries the offer"
+        );
+        connect_failed(&mut state, &peer_b);
+        let local = accept_once(&mut state, &TestRelayContext::new(self_loc).native(ready));
+        assert_eq!(
+            local.response.native_decision,
+            Some(native::NativeDecision::Native),
+            "a local accept after ConnectFailed decides on the stored offer"
+        );
+    }
+
+    /// Every join request, including a bootstrap join through a gateway, is
+    /// built by `prepare_join_request` and carries an offer, at percent 0 in
+    /// this build.
+    #[test]
+    fn every_join_request_carries_an_offer() {
+        let own = make_peer(4000);
+        let gateway = make_peer(5000);
+        let msg = prepare_join_request(
+            Transaction::new::<ConnectMsg>(),
+            &own,
+            &gateway,
+            Location::random(),
+            3,
+            &[],
+        );
+        let ConnectMsg::Request { payload, .. } = msg else {
+            panic!("expected a request, got {msg:?}");
+        };
+        assert_eq!(payload.native_offer, Some(native::NativeOffer::capable(0)));
+    }
+
     #[test]
     fn connect_response_acceptor_starts_with_unknown_address() {
         // Updated from #2207: ConnectResponse.acceptor now starts with Unknown address.
