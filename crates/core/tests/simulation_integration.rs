@@ -22561,3 +22561,167 @@ fn test_quic_mixed_modes_are_deterministic() {
     };
     assert_eq!(once("quic-mixed-det-run1"), once("quic-mixed-det-run2"));
 }
+
+// =============================================================================
+// QUIC-native connect offer and decision on the wire (#5940 A3)
+// =============================================================================
+
+/// One QUIC-native wire run: the mesh of connected pairs and the trace.
+struct NativeWireRun {
+    trace: freenet::dev_tool::NativeWireTrace,
+    mesh: std::collections::BTreeSet<(SocketAddr, SocketAddr)>,
+    nodes: usize,
+}
+
+/// Runs 2 gateways and 8 nodes on the direct runner, after `configure`.
+fn run_native_wire_sim(
+    name: &str,
+    seed: u64,
+    configure: impl FnOnce(&mut SimNetwork),
+) -> NativeWireRun {
+    setup_deterministic_state(seed);
+    let rt = create_runtime();
+    let (sim, logs_handle, trace, nodes) = rt.block_on(async {
+        let mut sim = SimNetwork::new(name, 2, 8, 10, 3, 10, 3, seed).await;
+        configure(&mut sim);
+        let trace = sim.native_wire_trace();
+        let nodes = sim.all_node_addresses().len();
+        let logs_handle = sim.event_logs_handle();
+        (sim, logs_handle, trace, nodes)
+    });
+    drop(rt);
+    sim.run_simulation_direct::<rand::rngs::SmallRng>(seed, 6, 40, Duration::from_millis(200))
+        .expect("direct simulation should succeed");
+    let rt = create_runtime();
+    let mesh = rt.block_on(async {
+        let logs = logs_handle.lock().await;
+        logs.iter()
+            .filter_map(|log| log.kind.connect_connected_addrs())
+            .map(|(a, b)| if a <= b { (a, b) } else { (b, a) })
+            .collect()
+    });
+    NativeWireRun { trace, mesh, nodes }
+}
+
+/// A floor every node of this binary passes, injected because the real one
+/// is above this binary until the release that ships the decoder.
+fn native_floor_for_tests() -> (u8, u8, u16) {
+    SimNetwork::min_compatible_protocol_version()
+}
+
+/// With the floor injected low on every node and versions known on every
+/// link, offers and decisions reach the wire as `RequestNative` /
+/// `ResponseNative`, every accept decides on an offer (including accepts after
+/// a re-route), every joiner receives the decision, and no connection closes
+/// on an undecodable message. Fails closed: each count must be above zero.
+#[test_log::test]
+fn test_quic_native_offer_and_decision_reach_the_wire() {
+    const SEED: u64 = 0x5940_A3_0001;
+    let run = run_native_wire_sim("native-wire-v2", SEED, |sim| {
+        sim.enable_gateway_ack_version();
+        sim.with_quic_native_floor(native_floor_for_tests());
+    });
+    let t = &run.trace;
+    tracing::info!(
+        requests_native = t.requests_native(),
+        responses_native = t.responses_native(),
+        requests_v1 = t.sent(0),
+        responses_v1 = t.sent(1),
+        accepts_with_offer = t.accepts_with_offer(),
+        accepts_without_offer = t.accepts_without_offer(),
+        retry_accepts_with_offer = t.retry_accepts_with_offer(),
+        joiner_decisions = t.joiner_decisions(),
+        joiner_without = t.joiner_responses_without_decision(),
+        undecodable = t.undecodable_closes(),
+        "native wire trace"
+    );
+    assert!(t.requests_native() > 0, "RequestNative went on the wire");
+    assert!(t.responses_native() > 0, "ResponseNative went on the wire");
+    assert!(t.accepts_with_offer() > 0, "acceptors received offers");
+    assert!(
+        t.retry_accepts_with_offer() > 0,
+        "an accept after a re-route still decided on the offer"
+    );
+    assert!(t.joiner_decisions() > 0, "joiners received decisions");
+    assert_eq!(t.undecodable_closes(), 0);
+    let (peers, connected) = quic_mesh_peers_and_connected(&run.mesh);
+    assert_eq!(peers.len(), run.nodes, "every node joined");
+    assert!(connected);
+}
+
+/// A network where some nodes stand in for a release below the floor: they
+/// advertise an older version and fail to decode the native variants, as that
+/// release does. The at-floor nodes send them to each other and never to the
+/// older ones, so no connection closes on an undecodable message and every
+/// node joins.
+#[test_log::test]
+fn test_quic_native_pre_floor_nodes_never_receive_the_native_variants() {
+    use freenet::dev_tool::NodeLabel;
+    const SEED: u64 = 0x5940_A3_0002;
+    let (min, real) = (
+        SimNetwork::min_compatible_protocol_version(),
+        SimNetwork::real_protocol_version(),
+    );
+    if min == real {
+        tracing::warn!(?real, "SKIPPED: no older version can be advertised");
+        return;
+    }
+    let name = "native-wire-mixed";
+    let run = run_native_wire_sim(name, SEED, |sim| {
+        sim.enable_gateway_ack_version();
+        // At-floor nodes advertise the real version; the older ones `min`.
+        sim.with_quic_native_floor(real);
+        for n in [1, 4, 7] {
+            let label = NodeLabel::node(name, n);
+            sim.with_node_advertised_version(&label, min);
+            sim.with_node_pre_floor_native_decoder(&label);
+        }
+        let gateway = NodeLabel::gateway(name, 1);
+        sim.with_node_advertised_version(&gateway, min);
+        sim.with_node_pre_floor_native_decoder(&gateway);
+    });
+    let t = &run.trace;
+    tracing::info!(
+        requests_native = t.requests_native(),
+        responses_native = t.responses_native(),
+        accepts_without_offer = t.accepts_without_offer(),
+        undecodable = t.undecodable_closes(),
+        "mixed native wire trace"
+    );
+    assert!(
+        t.requests_native() > 0,
+        "premise: the at-floor nodes sent RequestNative"
+    );
+    assert_eq!(
+        t.undecodable_closes(),
+        0,
+        "a node below the floor received a native variant"
+    );
+    let (peers, connected) = quic_mesh_peers_and_connected(&run.mesh);
+    assert_eq!(peers.len(), run.nodes, "every node joined");
+    assert!(connected);
+}
+
+/// At 0% (this release) the native fields change no join: the same seed
+/// with the variants on the wire and with them never sent joins the same
+/// peers into a connected mesh.
+#[test_log::test]
+fn test_quic_native_zero_percent_joins_like_main() {
+    const SEED: u64 = 0x5940_A3_0003;
+    let off = run_native_wire_sim("native-wire-off", SEED, |sim| {
+        sim.enable_gateway_ack_version();
+    });
+    let on = run_native_wire_sim("native-wire-on", SEED, |sim| {
+        sim.enable_gateway_ack_version();
+        sim.with_quic_native_floor(native_floor_for_tests());
+    });
+    assert_eq!(off.trace.requests_native(), 0, "premise: off sends none");
+    assert!(on.trace.requests_native() > 0, "premise: on sends them");
+    let (off_peers, off_connected) = quic_mesh_peers_and_connected(&off.mesh);
+    let (on_peers, on_connected) = quic_mesh_peers_and_connected(&on.mesh);
+    assert_eq!(off_peers.len(), off.nodes, "premise: every node joined");
+    assert!(off_connected);
+    assert_eq!(on_peers, off_peers, "the same peers join");
+    assert!(on_connected);
+    assert_eq!(on.trace.undecodable_closes(), 0);
+}
