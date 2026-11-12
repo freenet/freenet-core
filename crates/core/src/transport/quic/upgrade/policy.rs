@@ -124,6 +124,10 @@ pub(crate) struct QuicPolicy {
     mode: QuicMode,
     /// `quic-data-percent`, or the ramp ([`QUIC_DATA_RAMP_START`]).
     share: DataShare,
+    /// `quic-data-percent` is set, so a test's own ramp does not apply
+    /// (`QuicUpgradeTrace::ramp_data_started_before`).
+    #[cfg(any(test, feature = "testing"))]
+    percent_set: bool,
     /// The band last logged at INFO ([`log_band`]); `u8::MAX` before the first.
     logged_band: std::sync::atomic::AtomicU8,
     breaker: BreakerOutcome,
@@ -137,6 +141,8 @@ pub(crate) struct QuicPolicy {
 pub(crate) struct QuicPolicyConfig {
     mode: QuicMode,
     share: DataShare,
+    #[cfg(any(test, feature = "testing"))]
+    percent_set: bool,
     max_paths: usize,
     breaker: BreakerOutcome,
 }
@@ -150,6 +156,8 @@ impl QuicPolicyConfig {
         Self {
             mode: configured_mode(config),
             share: DataShare::of(config.quic_data_percent(), QUIC_DATA_RAMP_START),
+            #[cfg(any(test, feature = "testing"))]
+            percent_set: config.quic_data_percent().is_some(),
             max_paths: config.quic_max_paths(),
             breaker,
         }
@@ -223,6 +231,8 @@ impl QuicPolicy {
         Self {
             mode: config.mode,
             share: config.share,
+            #[cfg(any(test, feature = "testing"))]
+            percent_set: config.percent_set,
             logged_band: std::sync::atomic::AtomicU8::new(u8::MAX),
             breaker: config.breaker,
             availability,
@@ -290,6 +300,12 @@ impl QuicPolicy {
         now: std::time::SystemTime,
     ) -> u32 {
         self.own_caps_with(self.share, local, peer, now)
+    }
+
+    /// Whether `quic-data-percent` is set. Tests only.
+    #[cfg(any(test, feature = "testing"))]
+    pub(in crate::transport) fn percent_set(&self) -> bool {
+        self.percent_set
     }
 
     /// The policy's data share. Tests only.
