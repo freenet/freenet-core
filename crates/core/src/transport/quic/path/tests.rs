@@ -3713,7 +3713,8 @@ fn recovery_from_an_outage_in_both_directions_does_not_close() {
 
 /// The dark-path rule on a real path: an outage in both directions in the
 /// middle of a transfer, with `a`'s data outstanding, closes the path within
-/// the window and two ticks of the cut, as dark: nothing is acknowledged and
+/// `recycle::dark_close_bound` of the cut (the first probe after the window
+/// goes unanswered), as dark: nothing is acknowledged and
 /// nothing comes from `b`. The M6 rule cannot see it, since it needs the peer
 /// to keep sending.
 #[test]
@@ -3728,7 +3729,7 @@ fn a_path_dark_in_both_directions_is_closed_as_dark() {
         let cut_at = s.time.now_nanos();
         let waited = s.closed_after(cut_at).await;
         assert!(
-            waited <= recycle::ACK_WATCH_WINDOW + 2 * recycle::ACK_WATCH_TICK,
+            waited <= recycle::dark_close_bound(Duration::from_millis(50)),
             "closed {waited:?} after the cut"
         );
         assert_eq!(recycle::stalls_to(s.b_addr), vec![recycle::Stall::Dark]);
@@ -3808,7 +3809,7 @@ fn the_dark_rule_waits_out_the_probe_backoff_of_an_ack_only_peer() {
                 let waited = s.closed_after(cut_at).await;
                 eprintln!("dark close latency: {case}: {waited:?}");
                 assert!(
-                    waited <= Duration::from_secs(36),
+                    waited <= recycle::dark_close_bound(one_way * 2),
                     "{case}: closed {waited:?} after the cut"
                 );
                 assert!(waited >= recycle::ACK_WATCH_WINDOW, "{case}: {waited:?}");
@@ -4555,16 +4556,33 @@ async fn max_outstanding(paths: [Arc<QuicPath>; 2], time: VirtualTime, end: u64)
 /// #5940 step M6, guard 2 must not fire on a conforming peer over a lossy
 /// path: 25% of datagrams lost in both directions (seeded), a 2 MiB
 /// transfer each way plus a short message each way every 500 ms, for three
-/// virtual minutes.
+/// virtual minutes. Both ends' consumers take what arrives, as a node's do
+/// (one that never does holds the peer's stream limit down, which the
+/// stream-credit rule closes after a minute).
 #[test]
 fn a_lossy_path_is_not_closed() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
         let network = "quic-path-ack-watch-lossy";
         let loss = seeded_loss(network, 25);
-        let p = paths(network, QuicPathLimits::DEFAULT).await;
+        let mut p = paths(network, QuicPathLimits::DEFAULT).await;
         let (a_addr, b_addr) = (p.pair.a_addr, p.pair.b_addr);
         let (a, b, time) = (p.a.clone(), p.b.clone(), p.time());
+        let consumers = [&mut p.a_in, &mut p.b_in].map(|inbound| {
+            let mut shorts =
+                std::mem::replace(&mut inbound.shorts, tokio::sync::mpsc::channel(1).1);
+            let mut streams =
+                std::mem::replace(&mut inbound.streams, tokio::sync::mpsc::channel(1).1);
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        Some(short) = shorts.recv() => drop(short),
+                        Some(stream) = streams.recv() => drop(stream),
+                        else => break,
+                    }
+                }
+            })
+        });
         let (bulk_ab, bulk_ba, trickles) = p
             .drive(async move {
                 let end = time.now_nanos() + Duration::from_secs(180).as_nanos() as u64;
@@ -4588,6 +4606,9 @@ fn a_lossy_path_is_not_closed() {
             })
             .await;
         let (trickles, max_outstanding) = trickles;
+        for consumer in consumers {
+            consumer.abort();
+        }
         // The loss really happened, and the watch really had packets
         // outstanding to judge, so "no close" is not vacuous.
         let (seen, dropped) = (
@@ -9407,8 +9428,8 @@ fn a_waiting_one_packet_short_is_not_charged() {
 /// `a`: nothing is acknowledged and no credit returns) times out at its own
 /// gap. That comes inside the progress window of the setup's acknowledgements,
 /// so it neither counts nor makes the path suspect; the watch closes the path
-/// within its window, so neither the stall count nor suspect routing is what
-/// ends a dark path.
+/// (within `recycle::dark_close_bound`), so neither the stall count nor
+/// suspect routing is what ends a dark path.
 #[test]
 fn a_dark_path_is_closed_by_the_watch_not_by_its_send_timeouts() {
     bounded(|| async move {
@@ -9442,7 +9463,7 @@ fn a_dark_path_is_closed_by_the_watch_not_by_its_send_timeouts() {
             })
             .await;
         assert!(
-            closed_at - cut_at <= recycle::ACK_WATCH_WINDOW + 2 * recycle::ACK_WATCH_TICK,
+            closed_at - cut_at <= recycle::dark_close_bound(Duration::from_millis(50)),
             "the watch closed it {:?} after the cut",
             closed_at - cut_at
         );
