@@ -4,8 +4,6 @@
 //! All tests run on a paused tokio clock with `RealTime`, so the keepalive
 //! task is live (as in production) and timing is deterministic.
 
-use std::net::Ipv4Addr;
-
 use aes_gcm::KeyInit;
 use bytes::Bytes;
 
@@ -145,8 +143,12 @@ fn end_with_wire_capacity(
     }
 }
 
+/// One address per port, on one subnet for the whole module: the ends here
+/// are fed by hand, on no simulated network.
 fn addr(port: u16) -> SocketAddr {
-    SocketAddr::new(Ipv4Addr::new(10, 77, 0, 1).into(), port)
+    static NET: std::sync::LazyLock<crate::transport::test_net::Subnet> =
+        std::sync::LazyLock::new(crate::transport::test_net::subnet);
+    NET.addr_port(1, port)
 }
 
 /// A single connection end facing a remote of the given version.
@@ -3470,11 +3472,9 @@ async fn rising_offers_with_quic_off_keep_one_tracked_decline() {
 /// gate lets one through per interval. An unpromoted session answers each one.
 #[tokio::test(start_paused = true)]
 async fn rising_offers_with_a_session_keep_one_tracked_decline() {
-    let hub = crate::transport::quic::upgrade::driver::tests::Harness::server(
-        "ack-policy-rising-offers",
-        20,
-    )
-    .await;
+    let hub =
+        crate::transport::quic::upgrade::driver::tests::Harness::server("ack-policy-rising-offers")
+            .await;
     let mut e = single(CAPABLE);
     e.conn = e.conn.with_upgrade_site(&hub.site());
     e.take_offers(1, 200).await;
@@ -3553,11 +3553,9 @@ async fn a_failed_decline_send_leaves_nothing_in_flight() {
 /// hands the driver the events a path's pump sends, not a frame off a real path.
 #[tokio::test(start_paused = true)]
 async fn quic_inbound_does_not_move_the_udp_idle_clocks() {
-    let hub = crate::transport::quic::upgrade::driver::tests::Harness::server(
-        "ack-policy-idle-clocks",
-        21,
-    )
-    .await;
+    let hub =
+        crate::transport::quic::upgrade::driver::tests::Harness::server("ack-policy-idle-clocks")
+            .await;
     let mut e = single(CAPABLE);
     e.conn = e.conn.with_upgrade_site(&hub.site());
     e.deliver(1, short(b"first"), vec![]).await;
@@ -3594,8 +3592,7 @@ async fn quic_inbound_does_not_move_the_udp_idle_clocks() {
 async fn a_quic_receipt_moves_the_stamp_and_no_udp_clock() {
     use std::sync::atomic::Ordering;
     let hub =
-        crate::transport::quic::upgrade::driver::tests::Harness::server("ack-policy-stamp", 23)
-            .await;
+        crate::transport::quic::upgrade::driver::tests::Harness::server("ack-policy-stamp").await;
     let mut e = single(CAPABLE);
     e.conn = e.conn.with_upgrade_site(&hub.site());
     let time = e.conn.remote_conn.time_source.clone();
@@ -3628,7 +3625,7 @@ async fn a_quic_receipt_moves_the_stamp_and_no_udp_clock() {
 #[tokio::test(start_paused = true)]
 async fn set_peer_identity_promotes_the_session_on_set_and_same_only() {
     let hub =
-        crate::transport::quic::upgrade::driver::tests::Harness::server("ack-policy-identity", 22)
+        crate::transport::quic::upgrade::driver::tests::Harness::server("ack-policy-identity")
             .await;
     let key = hub.peer.clone();
     let other = TransportKeypair::new().public().clone();
@@ -3665,11 +3662,10 @@ async fn set_peer_identity_promotes_the_session_on_set_and_same_only() {
 /// from the connection's limit.
 #[tokio::test(start_paused = true)]
 async fn a_session_paces_its_data_only_under_a_limit() {
-    for (case, subnet, limit) in [("none", 30, None), ("limited", 31, Some(100_000))] {
-        let hub = crate::transport::quic::upgrade::driver::tests::Harness::server(
-            &format!("ack-policy-paced-{case}"),
-            subnet,
-        )
+    for (case, limit) in [("none", None), ("limited", Some(100_000))] {
+        let hub = crate::transport::quic::upgrade::driver::tests::Harness::server(&format!(
+            "ack-policy-paced-{case}"
+        ))
         .await;
         let mut e = single(CAPABLE);
         e.conn.remote_conn.bandwidth_limit = limit;
@@ -3689,11 +3685,9 @@ async fn a_session_paces_its_data_only_under_a_limit() {
 /// time here) barely moves.
 #[tokio::test(start_paused = true)]
 async fn a_sessions_pacer_runs_on_the_path_clock() {
-    let hub = crate::transport::quic::upgrade::driver::tests::Harness::server(
-        "ack-policy-pacer-clock",
-        32,
-    )
-    .await;
+    let hub =
+        crate::transport::quic::upgrade::driver::tests::Harness::server("ack-policy-pacer-clock")
+            .await;
     let mut e = single(CAPABLE);
     e.conn.remote_conn.bandwidth_limit = Some(100_000);
     e.conn = e.conn.with_upgrade_site(&hub.site());

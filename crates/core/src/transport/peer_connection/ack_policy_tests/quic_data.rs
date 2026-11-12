@@ -102,7 +102,7 @@ async fn claim(
         .expect("the stream was registered")
 }
 
-fn run<F, Fut>(network: &'static str, subnet: u8, limits: QuicPathLimits, test: F)
+fn run<F, Fut>(network: &'static str, limits: QuicPathLimits, test: F)
 where
     F: FnOnce(Rig) -> Fut + Send + 'static,
     Fut: Future<Output = ()> + Send + 'static,
@@ -113,7 +113,7 @@ where
         e.conn.attach_quic_inbox(inbox);
         let registry = Arc::new(OrphanStreamRegistry::new());
         e.conn.set_inbound_stream_registry(registry.clone());
-        let path = data_path(network, subnet, limits, e.conn.inbound_budget(), data).await;
+        let path = data_path(network, limits, e.conn.inbound_budget(), data).await;
         let time = path.time.clone();
         (time, test(Rig { e, path, registry }))
     });
@@ -130,7 +130,6 @@ fn bytes_of(len: usize) -> Bytes {
 fn a_short_and_a_stream_on_a_path_arrive_as_the_udp_ones_do() {
     run(
         "quic-data-arrive",
-        40,
         QuicPathLimits::DEFAULT,
         |mut rig| async move {
             let clocks = |e: &End| {
@@ -174,7 +173,6 @@ fn a_short_and_a_stream_on_a_path_arrive_as_the_udp_ones_do() {
 fn embedded_metadata_is_suppressed_only_after_the_same_short() {
     run(
         "quic-data-meta",
-        41,
         QuicPathLimits::DEFAULT,
         |mut rig| async move {
             rig.path.send_short(b"first").await;
@@ -203,7 +201,6 @@ fn embedded_metadata_is_suppressed_only_after_the_same_short() {
 fn a_path_ending_mid_stream_frees_its_charge_and_the_stream_reports_failed() {
     run(
         "quic-data-end",
-        42,
         QuicPathLimits::DEFAULT,
         |mut rig| async move {
             let (claimed, unclaimed) = (StreamId::next(), StreamId::next());
@@ -254,7 +251,6 @@ fn a_path_ending_mid_stream_frees_its_charge_and_the_stream_reports_failed() {
 fn a_stream_that_ended_in_the_channel_is_not_registered() {
     run(
         "quic-data-queued",
-        43,
         QuicPathLimits::DEFAULT,
         |mut rig| async move {
             let id = StreamId::next();
@@ -303,7 +299,6 @@ fn fill_budget(rig: &Rig) -> Vec<Arc<LegacyStreamToken>> {
 fn a_budget_full_of_quic_charges_refuses_and_keeps_the_connection() {
     run(
         "quic-data-full",
-        44,
         QuicPathLimits::DEFAULT,
         |mut rig| async move {
             let tokens = fill_budget(&rig);
@@ -360,7 +355,6 @@ fn a_budget_full_of_quic_charges_refuses_and_keeps_the_connection() {
 fn a_stalled_quic_stream_is_released_and_a_udp_stream_then_fits() {
     run(
         "quic-data-stalled",
-        45,
         QuicPathLimits::DEFAULT,
         |mut rig| async move {
             let id = StreamId::next();
@@ -396,7 +390,6 @@ fn a_stalled_quic_stream_is_released_and_a_udp_stream_then_fits() {
 fn a_stream_id_in_use_on_udp_is_refused_on_the_path() {
     run(
         "quic-data-both-udp",
-        46,
         QuicPathLimits::DEFAULT,
         |mut rig| async move {
             let id = StreamId::next();
@@ -434,7 +427,6 @@ fn a_stream_id_in_use_on_udp_is_refused_on_the_path() {
 fn a_stream_id_used_on_the_path_is_refused_on_udp_and_on_the_path_again() {
     run(
         "quic-data-both-quic",
-        47,
         QuicPathLimits::DEFAULT,
         |mut rig| async move {
             let id = StreamId::next();
@@ -474,7 +466,6 @@ fn a_stream_id_used_on_the_path_is_refused_on_udp_and_on_the_path_again() {
 fn a_cancelled_recv_loses_nothing() {
     run(
         "quic-data-cancel",
-        48,
         QuicPathLimits::DEFAULT,
         |mut rig| async move {
             const COUNT: usize = 40;
@@ -528,7 +519,6 @@ fn a_cancelled_recv_loses_nothing() {
 fn a_stream_with_no_registry_is_cancelled_and_its_charge_released() {
     run(
         "quic-data-noregistry",
-        51,
         QuicPathLimits::DEFAULT,
         |mut rig| async move {
             rig.e.conn.inbound_stream_registry = None;
@@ -549,7 +539,6 @@ fn a_stream_with_no_registry_is_cancelled_and_its_charge_released() {
 fn a_path_with_the_bit_at_zero_refuses_data_before_charging() {
     run(
         "quic-data-shadow",
-        49,
         QuicPathLimits::SHADOW,
         |mut rig| async move {
             let _sent = rig
@@ -572,7 +561,6 @@ fn a_path_with_the_bit_at_zero_refuses_data_before_charging() {
 fn a_connection_drop_leaves_no_charge_and_no_registry_row() {
     run(
         "quic-data-drop",
-        50,
         QuicPathLimits::DEFAULT,
         |mut rig| async move {
             let (partial, whole) = (StreamId::next(), StreamId::next());

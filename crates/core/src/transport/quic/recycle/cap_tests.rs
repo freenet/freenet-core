@@ -301,41 +301,32 @@ struct Link {
 const ONE_WAY: Duration = Duration::from_millis(20);
 
 impl Link {
-    async fn new(network: &str, subnet: u8, rate: QuicRateLimit, a_cap: Option<u64>) -> Self {
-        Self::with(
-            network,
-            subnet,
-            [rate, QuicRateLimit::default()],
-            a_cap,
-            ONE_WAY,
-        )
-        .await
+    async fn new(network: &str, rate: QuicRateLimit, a_cap: Option<u64>) -> Self {
+        Self::with(network, [rate, QuicRateLimit::default()], a_cap, ONE_WAY).await
     }
 
     /// [`Self::new`] with `rates` for `a` and `b`, and `one_way` of delay.
     async fn with(
         network: &str,
-        subnet: u8,
         rates: [QuicRateLimit; 2],
         a_cap: Option<u64>,
         one_way: Duration,
     ) -> Self {
-        Self::lossy(network, subnet, rates, a_cap, one_way, 0).await
+        Self::lossy(network, rates, a_cap, one_way, 0).await
     }
 
     /// [`Self::with`], each direction dropping every `drop_every`-th
     /// datagram (see [`Delayed`]); 0 drops none.
     async fn lossy(
         network: &str,
-        subnet: u8,
         rates: [QuicRateLimit; 2],
         a_cap: Option<u64>,
         one_way: Duration,
         drop_every: u64,
     ) -> Self {
         let [a_rate, b_rate] = rates;
-        let a_addr: SocketAddr = format!("10.207.{subnet}.1:5000").parse().unwrap();
-        let b_addr: SocketAddr = format!("10.207.{subnet}.2:5000").parse().unwrap();
+        let net = crate::transport::test_net::subnet();
+        let (a_addr, b_addr) = (net.addr(1), net.addr(2));
         let time = VirtualTime::new();
         register_network_time_source(network, time.clone());
         register_address_network(a_addr, network);
@@ -502,7 +493,6 @@ fn a_32_kib_message_on_a_fresh_connection_arrives_within_one_round_trip() {
         const ONE_WAY_LONG: Duration = Duration::from_millis(150);
         let link = Link::with(
             "quic-cap-initial-window",
-            7,
             [QuicRateLimit::default(), QuicRateLimit::default()],
             None,
             ONE_WAY_LONG,
@@ -527,7 +517,6 @@ fn a_path_under_a_bandwidth_limit_keeps_to_it() {
         const LEN: usize = 2_000_000;
         let link = Link::new(
             "quic-cap-bandwidth-limit",
-            1,
             QuicRateLimit::new(Some(LIMIT), None),
             None,
         )
@@ -553,11 +542,10 @@ fn the_floor_keeps_two_datagrams_in_flight_both_ways() {
         const LEN: usize = 400_000;
         const ONE_WAY_SHORT: Duration = Duration::from_millis(2);
         let two_per_rtt = 2.0 * f64::from(MTU) / (2.0 * ONE_WAY_SHORT.as_secs_f64());
-        for (subnet, from_a) in [(5, true), (6, false)] {
+        for from_a in [true, false] {
             let rate = || QuicRateLimit::new(Some(LIMIT), None);
             let link = Link::with(
-                &format!("quic-cap-floor-{subnet}"),
-                subnet,
+                &format!("quic-cap-floor-{from_a}"),
                 [rate(), rate()],
                 None,
                 ONE_WAY_SHORT,
@@ -594,7 +582,6 @@ fn a_quic_path_and_udp_streams_both_progress_under_an_egress_cap() {
         let link = Arc::new(
             Link::new(
                 "quic-cap-shared",
-                2,
                 QuicRateLimit::new(None, Some(manager)),
                 Some(CAP),
             )
@@ -727,7 +714,6 @@ async fn paced_udp_stream(
 /// connection was up), and the fragments abandoned at the stream deadline.
 async fn quic_and_udp_rates(
     network: &str,
-    subnet: u8,
     seed: u64,
     minimum: Option<usize>,
     streams: usize,
@@ -741,7 +727,6 @@ async fn quic_and_udp_rates(
     let link = Arc::new(
         Link::new(
             network,
-            subnet,
             QuicRateLimit::new(None, Some(manager.clone())),
             Some(CAP),
         )
@@ -821,10 +806,9 @@ async fn quic_and_udp_rates(
 fn a_quic_path_and_udp_streams_each_get_their_fair_share_under_a_saturated_egress_cap() {
     bounded(|| async move {
         let share = 500_000.0 / 2.0;
-        for (subnet, minimum) in [(7, Some(1000)), (8, None)] {
+        for (case, minimum) in [("min", Some(1000)), ("none", None)] {
             let (quic_rate, udp_rate, abandoned) = quic_and_udp_rates(
-                &format!("quic-cap-fair-share-{subnet}"),
-                subnet,
+                &format!("quic-cap-fair-share-{case}"),
                 0x5940_6112,
                 minimum,
                 1,
@@ -915,12 +899,12 @@ fn a_limit_does_not_delay_a_control_sized_exchange() {
     bounded(|| async move {
         use crate::transport::peer_connection::MIN_BANDWIDTH_LIMIT;
         let mut finished = Vec::new();
-        for (subnet, rate) in [
-            (3, QuicRateLimit::default()),
-            (4, QuicRateLimit::new(Some(MIN_BANDWIDTH_LIMIT), None)),
+        for (case, rate) in [
+            ("default", QuicRateLimit::default()),
+            ("min", QuicRateLimit::new(Some(MIN_BANDWIDTH_LIMIT), None)),
         ] {
             let _seed = crate::config::GlobalRng::seed_guard(0x5940_E5B7);
-            let link = Link::new(&format!("quic-cap-control-{subnet}"), subnet, rate, None).await;
+            let link = Link::new(&format!("quic-cap-control-{case}"), rate, None).await;
             let elapsed = link.send(32, Duration::from_secs(10)).await;
             finished.push((elapsed, link.time.now_nanos()));
         }
@@ -939,7 +923,6 @@ fn a_one_mib_message_through_five_percent_random_loss_is_not_slowed_by_it() {
     bounded(|| async move {
         let link = Link::lossy(
             "quic-cap-random-loss",
-            8,
             [QuicRateLimit::default(), QuicRateLimit::default()],
             None,
             Duration::from_millis(50),
