@@ -382,6 +382,20 @@ pub(in crate::transport::quic) async fn receive<T: TimeSource>(
     connection: quinn::Connection,
     receiver: Arc<Receiver<T>>,
 ) {
+    #[cfg(test)]
+    if super::hold_trace::on() {
+        let conn = Arc::as_ptr(&receiver) as *const () as usize;
+        return super::hold_trace::PollGaps {
+            conn,
+            last_us: 0,
+            inner: Box::pin(receive_inner(connection, receiver)),
+        }
+        .await;
+    }
+    receive_inner(connection, receiver).await
+}
+
+async fn receive_inner<T: TimeSource>(connection: quinn::Connection, receiver: Arc<Receiver<T>>) {
     let mut readers = FuturesUnordered::new();
     // Kept across iterations, so a pending accept is never dropped.
     let mut accept = std::pin::pin!(connection.accept_uni());
@@ -512,6 +526,9 @@ struct BodyReader<T: TimeSource> {
     /// The admitted `Stream`'s source, where a failure records why the
     /// stream ended, for consumers that assemble it ([`Receiver::fail`]).
     source: Option<Arc<QuicSource>>,
+    /// DIAGNOSTIC (`hold_trace`): the connection and, once known, the stream.
+    #[cfg(test)]
+    trace: (usize, u32),
 }
 
 impl<T: TimeSource> BodyReader<T> {
@@ -547,6 +564,8 @@ impl<T: TimeSource> BodyReader<T> {
             meter,
             staging: Staging::new(conn_staging),
             source: None,
+            #[cfg(test)]
+            trace: (0, u32::MAX - 1),
         }
     }
 
@@ -591,6 +610,15 @@ impl<T: TimeSource> BodyReader<T> {
     ) -> Result<Option<(u64, Bytes)>, ReadFailure> {
         match read {
             Ok(Some(chunk)) => {
+                #[cfg(test)]
+                super::hold_trace::record(
+                    self.trace.0,
+                    self.trace.1,
+                    super::hold_trace::Kind::Read {
+                        offset: chunk.offset,
+                        len: chunk.bytes.len() as u32,
+                    },
+                );
                 let now = self.time.now_nanos();
                 self.last_progress = now;
                 let start = chunk.offset;
@@ -1556,6 +1584,10 @@ async fn read_one<T: TimeSource>(recv: quinn::RecvStream, receiver: Arc<Receiver
         receiver.meter.clone(),
         receiver.staging.clone(),
     );
+    #[cfg(test)]
+    {
+        reader.trace.0 = Arc::as_ptr(&receiver) as *const () as usize;
+    }
     let header = match reader.read_exact(HEADER_LEN).await {
         Ok(bytes) => FrameHeader::decode(&bytes),
         Err(ReadFailure::Truncated(got)) => Err(HeaderError::Truncated(got)),
@@ -1643,6 +1675,12 @@ impl<T: TimeSource> Receiver<T> {
     /// Count a failed read and stop the stream where that tells the sender
     /// something.
     fn fail(&self, reader: &mut BodyReader<T>, failure: ReadFailure, charged: Charged) {
+        #[cfg(test)]
+        super::hold_trace::record(
+            reader.trace.0,
+            reader.trace.1,
+            super::hold_trace::Kind::Failed(format!("{failure:?}")),
+        );
         if let Some(source) = &reader.source {
             source.end(match failure {
                 ReadFailure::Idle => QuicSourceEnd::Idle,
@@ -1884,6 +1922,15 @@ impl<T: TimeSource> Receiver<T> {
 
     async fn read_stream(&self, mut reader: BodyReader<T>, header: FrameHeader) {
         let stream_id = header.stream_id();
+        #[cfg(test)]
+        {
+            reader.trace.1 = stream_id.0;
+            super::hold_trace::record(
+                reader.trace.0,
+                stream_id.0,
+                super::hold_trace::Kind::Accepted,
+            );
+        }
         let total = header.total_len();
         let handle = {
             let mut budget = self.budget.lock();
@@ -1984,6 +2031,12 @@ impl<T: TimeSource> Receiver<T> {
         let permit = match self.streams.try_reserve() {
             Ok(permit) => permit,
             Err(mpsc::error::TrySendError::Full(())) => {
+                #[cfg(test)]
+                super::hold_trace::record(
+                    reader.trace.0,
+                    reader.trace.1,
+                    super::hold_trace::Kind::WaitedForRoom,
+                );
                 let waiting =
                     WaitingGuard::new(&self.stats, QuicInboundOutcome::StreamAbandonedWaiting);
                 let mut reserve = std::pin::pin!(self.streams.reserve());
@@ -2047,6 +2100,12 @@ impl<T: TimeSource> Receiver<T> {
             }
         };
         permit.send(arrival);
+        #[cfg(test)]
+        super::hold_trace::record(
+            reader.trace.0,
+            reader.trace.1,
+            super::hold_trace::Kind::Announced,
+        );
         self.stats.record(QuicInboundOutcome::AnnouncedStream);
 
         loop {
@@ -2069,6 +2128,8 @@ impl<T: TimeSource> Receiver<T> {
                 }
             }
         }
+        #[cfg(test)]
+        super::hold_trace::record(reader.trace.0, reader.trace.1, super::hold_trace::Kind::End);
         let (number, last) = match rechunker.finish() {
             Ok(last) => last,
             Err(failure) => {
@@ -2152,6 +2213,12 @@ impl<T: TimeSource> Receiver<T> {
         number: u32,
         fragment: Bytes,
     ) -> bool {
+        #[cfg(test)]
+        super::hold_trace::record(
+            reader.trace.0,
+            reader.trace.1,
+            super::hold_trace::Kind::Push { number },
+        );
         match handle.push_fragment(number, fragment) {
             Ok(_) => true,
             Err(StreamError::Cancelled) => {

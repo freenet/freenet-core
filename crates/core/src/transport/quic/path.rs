@@ -133,6 +133,8 @@
 //! [`StreamHandle`]: crate::transport::peer_connection::streaming::StreamHandle
 
 pub(crate) mod bounded;
+#[cfg(test)]
+pub(crate) mod hold_trace;
 pub(crate) mod inbound;
 pub(in crate::transport) mod pacer;
 
