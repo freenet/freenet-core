@@ -507,7 +507,13 @@ is not activity by itself) and the endpoint's state (`quic_endpoint`: `up`, or
 `unknown` before the node reaches the bind; set at startup after the breaker
 gate, at the bind, and at the endpoint's death, which is final for the process;
 a state that is never reset and is not activity by itself) and QUIC connections this node closed, by close code
-(`quic_close_sent_<label>`, one per `QuicCloseCode`) and the shadow-mode upgrade
+(`quic_close_sent_<label>`, one per `QuicCloseCode`), the QUIC-native connect
+offer and decision (`connect_native_offered_{zero,nonzero}` built as joiner,
+`connect_native_decided_{native,udp}` made as acceptor for an offered request,
+`connect_native_decision_{without_offer,native_unsupported}` for a `Native`
+decision a joiner could not use, and the last offer as states
+`connect_native_offer_{level,percent,ready}`; see
+`operations/connect/native.rs`) and the shadow-mode upgrade
 telemetry (below, "Upgrade telemetry"). Each label set is declared once in a
 `labelled_counters!` list, so a new variant needs a snapshot field. Hot
 path writes are single relaxed atomics; `SentPacketTracker` keeps an

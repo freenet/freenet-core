@@ -3268,6 +3268,115 @@ mod driver_timing_tests {
         log
     }
 
+    fn response_deciding(
+        tx: Transaction,
+        acceptor: &PeerKeyLocation,
+        decision: Option<crate::operations::connect::native::NativeDecision>,
+    ) -> WaiterReply {
+        WaiterReply::Reply(NetMessage::V1(NetMessageV1::Connect(
+            ConnectMsg::Response {
+                id: tx,
+                payload: ConnectResponse {
+                    acceptor: acceptor.clone(),
+                    native_decision: decision,
+                },
+            },
+        )))
+    }
+
+    /// Runs a joiner that sent `sent_offer` against one response per acceptor
+    /// with the given decision; returns the acceptors it dialled.
+    async fn dials_for_decisions(
+        name: &str,
+        sent_offer: Option<crate::operations::connect::native::NativeOffer>,
+        decisions: Vec<Option<crate::operations::connect::native::NativeDecision>>,
+    ) -> (Vec<SocketAddr>, Vec<SocketAddr>) {
+        let (op_manager, events) = op_manager_with_events(name).await;
+        connect_existing_peer(&op_manager, 24949);
+        let log = scripted_event_loop(events, vec![]);
+        let tx = Transaction::new::<ConnectMsg>();
+        let gateway = peer(24950);
+        let acceptors: Vec<_> = (0..decisions.len() as u16)
+            .map(|i| peer(24951 + i))
+            .collect();
+        let (replies_tx, replies_rx) = mpsc::channel(16);
+        for (acceptor, decision) in acceptors.iter().zip(decisions) {
+            replies_tx
+                .send(response_deciding(tx, acceptor, decision))
+                .await
+                .unwrap();
+        }
+        drop(replies_tx);
+        let mut connected = 0;
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            super::drive_client_connect(
+                tx,
+                gateway.clone(),
+                gateway.socket_addr().unwrap(),
+                Location::new(0.5),
+                op_manager.ring.connection_manager.min_connections,
+                false,
+                replies_rx,
+                &op_manager,
+                ClientConnectKind::Standard,
+                sent_offer,
+                &mut connected,
+            ),
+        )
+        .await
+        .expect("bounded")
+        .expect("driver result");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let dialled = log.lock().dials.iter().map(|(addr, _)| *addr).collect();
+        let all = acceptors.iter().map(|a| a.socket_addr().unwrap()).collect();
+        (dialled, all)
+    }
+
+    fn decision_failures_here() -> (u64, u64) {
+        let [without_offer, unsupported] =
+            crate::transport::metrics::NATIVE_DECISION_FAILURES_ON_THIS_THREAD.with(|c| c.get());
+        (without_offer, unsupported)
+    }
+
+    /// A response deciding `Native` to a joiner that offered 0 cannot be
+    /// honoured: that acceptor is not dialled, and it counts as a decision
+    /// without an offer. `Udp` and no decision are dialled as today. (One run
+    /// per test: an `OpManager` per test runtime.)
+    #[tokio::test(start_paused = true)]
+    async fn a_native_decision_to_a_zero_offer_fails_the_attempt() {
+        use crate::operations::connect::native::{NativeDecision, NativeOffer};
+        let before = decision_failures_here();
+        let (dialled, all) = dials_for_decisions(
+            "native-decision-zero-offer",
+            Some(NativeOffer::capable(0)),
+            vec![
+                None,
+                Some(NativeDecision::Udp),
+                Some(NativeDecision::Native),
+            ],
+        )
+        .await;
+        assert_eq!(dialled, all[..2].to_vec(), "only the Native one is skipped");
+        assert_eq!(decision_failures_here(), (before.0 + 1, before.1));
+    }
+
+    /// The same for a joiner that offered above 0: counted as unsupported,
+    /// since this build has no native dial.
+    #[tokio::test(start_paused = true)]
+    async fn a_native_decision_to_a_real_offer_fails_the_attempt() {
+        use crate::operations::connect::native::{NativeDecision, NativeOffer};
+        let before = decision_failures_here();
+        let (dialled, all) = dials_for_decisions(
+            "native-decision-real-offer",
+            Some(NativeOffer::capable(30)),
+            vec![Some(NativeDecision::Native), Some(NativeDecision::Udp)],
+        )
+        .await;
+        assert_eq!(dialled, all[1..].to_vec());
+        assert_eq!(decision_failures_here(), (before.0, before.1 + 1));
+    }
+
     /// When the waiter closes, acceptors already taken are still dialled,
     /// queued ones included (review item 2: a connected peer dials one at a
     /// time, so the second acceptor is queued when the waiter closes), but a

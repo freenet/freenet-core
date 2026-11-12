@@ -3715,6 +3715,7 @@ mod tests {
         accept: bool,
         next_hop: Option<PeerKeyLocation>,
         uphill_hop: Option<PeerKeyLocation>,
+        native: Option<native::NativeReadiness>,
     }
 
     impl TestRelayContext {
@@ -3724,7 +3725,15 @@ mod tests {
                 accept: true,
                 next_hop: None,
                 uphill_hop: None,
+                native: None,
             }
+        }
+
+        /// Acceptor readiness for QUIC-native decisions, in place of this
+        /// build's (never ready).
+        fn native(mut self, readiness: native::NativeReadiness) -> Self {
+            self.native = Some(readiness);
+            self
         }
 
         fn accept(mut self, accept: bool) -> Self {
@@ -3769,6 +3778,10 @@ mod tests {
             _recency: &HashMap<PeerKeyLocation, Instant>,
         ) -> Option<PeerKeyLocation> {
             self.uphill_hop.clone()
+        }
+
+        fn native_readiness(&self) -> native::NativeReadiness {
+            self.native.unwrap_or_else(native::NativeReadiness::current)
         }
     }
 
@@ -3986,6 +3999,113 @@ mod tests {
         );
         assert_eq!(accept.joiner.pub_key(), joiner.pub_key());
         assert!(actions.forward.is_none());
+    }
+
+    fn native_relay_state(
+        joiner: &PeerKeyLocation,
+        offer: Option<native::NativeOffer>,
+        held: bool,
+    ) -> RelayState {
+        RelayState {
+            upstream_addr: joiner.socket_addr().expect("test peer must have address"),
+            request: ConnectRequest {
+                desired_location: Location::random(),
+                joiner: joiner.clone(),
+                ttl: 3,
+                visited: VisitedPeers::default(),
+                uphill_budget: DEFAULT_UPHILL_BUDGET,
+                native_offer: offer,
+                joiner_transport_held: held,
+            },
+            forwarded_to: None,
+            forwarded_at: None,
+            observed_sent: false,
+            accepted_locally: false,
+            response_forwarded: false,
+        }
+    }
+
+    fn accept_once(state: &mut RelayState, ctx: &TestRelayContext) -> AcceptOutcome {
+        state
+            .handle_request(
+                ctx,
+                &HashMap::new(),
+                &mut HashMap::new(),
+                &ConnectForwardEstimator::new(),
+                Instant::now(),
+            )
+            .accept
+            .expect("expected acceptance")
+    }
+
+    /// The acceptor answers a request that carried an offer with a decision
+    /// (`Udp` in this build), and one without an offer with none.
+    #[test]
+    fn acceptor_decides_only_when_offered() {
+        let self_loc = make_peer(4000);
+        let joiner = make_peer(5000);
+        let ctx = TestRelayContext::new(self_loc);
+        let mut offered = native_relay_state(&joiner, Some(native::NativeOffer::capable(0)), false);
+        assert_eq!(
+            accept_once(&mut offered, &ctx).response.native_decision,
+            Some(native::NativeDecision::Udp)
+        );
+        let mut plain = native_relay_state(&joiner, None, false);
+        assert_eq!(accept_once(&mut plain, &ctx).response.native_decision, None);
+    }
+
+    /// With both sides at 100%, the acceptor decides `Native` unless it
+    /// already holds a transport to the joiner, which is then reused.
+    #[test]
+    fn acceptor_decides_udp_when_it_holds_a_transport_to_the_joiner() {
+        let self_loc = make_peer(4000);
+        let joiner = make_peer(5000);
+        let ready = native::NativeReadiness {
+            ready: true,
+            percent: 100,
+        };
+        let ctx = TestRelayContext::new(self_loc).native(ready);
+        let offer = Some(native::NativeOffer::capable(100));
+        let mut fresh = native_relay_state(&joiner, offer, false);
+        assert_eq!(
+            accept_once(&mut fresh, &ctx).response.native_decision,
+            Some(native::NativeDecision::Native)
+        );
+        let mut held = native_relay_state(&joiner, offer, true);
+        assert_eq!(
+            accept_once(&mut held, &ctx).response.native_decision,
+            Some(native::NativeDecision::Udp)
+        );
+    }
+
+    /// The offer rides in the stored request: the forwarded copy carries it,
+    /// and an accept after a rejected forward still decides on it.
+    #[test]
+    fn the_offer_survives_a_forward_and_a_retry() {
+        let self_loc = make_peer(4000);
+        let joiner = make_peer(5000);
+        let peer_a = make_peer(6000);
+        let offer = Some(native::NativeOffer::capable(0));
+        let mut state = native_relay_state(&joiner, offer, false);
+        let ctx_a = TestRelayContext::new(self_loc.clone())
+            .accept(false)
+            .uphill_hop(Some(peer_a));
+        let first = state.handle_request(
+            &ctx_a,
+            &HashMap::new(),
+            &mut HashMap::new(),
+            &ConnectForwardEstimator::new(),
+            Instant::now(),
+        );
+        let (_, forwarded) = first.forward.expect("forwards uphill");
+        assert_eq!(forwarded.native_offer, offer);
+        state.forwarded_to = None;
+        state.forwarded_at = None;
+        let retry = accept_once(&mut state, &TestRelayContext::new(self_loc));
+        assert_eq!(
+            retry.response.native_decision,
+            Some(native::NativeDecision::Udp)
+        );
     }
 
     #[test]

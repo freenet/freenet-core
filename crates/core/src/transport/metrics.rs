@@ -1227,6 +1227,15 @@ impl ConnRttDistribution {
 
 #[cfg(test)]
 thread_local! {
+    /// Test-only: joiner decision failures recorded on this thread, by
+    /// `JoinerDecisionFailure` discriminant. The global counters are reset by
+    /// any test that takes a snapshot, so a test reads these instead.
+    pub(crate) static NATIVE_DECISION_FAILURES_ON_THIS_THREAD: std::cell::Cell<[u64; 2]> =
+        const { std::cell::Cell::new([0; 2]) };
+}
+
+#[cfg(test)]
+thread_local! {
     /// Test-only per-address byte totals returned by
     /// [`TransportMetrics::connection_peer_bytes`] in place of the global table.
     pub(crate) static PEER_BYTES_OVERRIDE: std::cell::RefCell<
@@ -1890,6 +1899,12 @@ impl TransportMetrics {
             }
         };
         counter.fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        NATIVE_DECISION_FAILURES_ON_THIS_THREAD.with(|counts| {
+            let mut now = counts.get();
+            now[failure as usize] += 1;
+            counts.set(now);
+        });
     }
 
     /// Test-only: how many times the QUIC endpoint bound at `local` went
@@ -5254,6 +5269,43 @@ mod tests {
 
     /// Received QUIC upgrade control messages reach the snapshot, count as
     /// activity on their own, and reset.
+    /// The QUIC-native connect counters reach the snapshot by kind and reset;
+    /// the effective offer is a state that stays.
+    #[test]
+    fn connect_native_counters_reach_snapshot_and_reset() {
+        use crate::operations::connect::native::{
+            JoinerDecisionFailure, NativeDecision, NativeOffer,
+        };
+        let metrics = TransportMetrics::new();
+        metrics.record_connect_native_offered(NativeOffer::capable(0), false);
+        metrics.record_connect_native_offered(NativeOffer::capable(0), false);
+        metrics.record_connect_native_offered(NativeOffer::capable(25), true);
+        metrics.record_connect_native_decided(NativeDecision::Udp);
+        metrics.record_connect_native_decided(NativeDecision::Udp);
+        metrics.record_connect_native_decided(NativeDecision::Native);
+        metrics.record_connect_native_decision_failure(JoinerDecisionFailure::DecisionWithoutOffer);
+        metrics.record_connect_native_decision_failure(JoinerDecisionFailure::NativeUnsupported);
+        metrics.record_connect_native_decision_failure(JoinerDecisionFailure::NativeUnsupported);
+        let snap = metrics.take_snapshot().expect("offers are activity");
+        assert_eq!(snap.connect_native_offered_zero, 2);
+        assert_eq!(snap.connect_native_offered_nonzero, 1);
+        assert_eq!(snap.connect_native_decided_udp, 2);
+        assert_eq!(snap.connect_native_decided_native, 1);
+        assert_eq!(snap.connect_native_decision_without_offer, 1);
+        assert_eq!(snap.connect_native_decision_native_unsupported, 2);
+        assert_eq!(snap.connect_native_offer_level, 1);
+        assert_eq!(snap.connect_native_offer_percent, 25);
+        assert!(snap.connect_native_offer_ready);
+        let json = serde_json::to_value(&snap).unwrap();
+        assert_eq!(json["connect_native_offered_zero"], 2);
+        assert_eq!(json["connect_native_offer_percent"], 25);
+        assert!(metrics.take_snapshot().is_none(), "the counters reset");
+        metrics.record_connect_native_decided(NativeDecision::Udp);
+        let snap = metrics.take_snapshot().expect("a decision is activity");
+        assert_eq!(snap.connect_native_offer_percent, 25, "the state stays");
+        assert_eq!(snap.connect_native_offered_zero, 0);
+    }
+
     #[test]
     fn upgrade_decline_suppressed_reaches_snapshot_and_resets() {
         let metrics = TransportMetrics::new();
