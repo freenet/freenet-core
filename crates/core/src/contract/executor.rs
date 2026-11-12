@@ -3135,6 +3135,18 @@ mod tests {
                  grant per connection at the QUIC connection cap",
             ),
             (
+                "QUIC_ACK_WAIT_BYTES",
+                "a measurement of one QUIC acknowledgement wait (task, boxed stopped() \
+                 future, stopped map entry); a term inside QUIC_CONNECTION_CHARGE_BYTES \
+                 and QUIC_SHADOW_CONNECTION_CHARGE_BYTES, which the QUIC transport share sums",
+            ),
+            (
+                "QUIC_SHADOW_CONNECTION_CHARGE_BYTES",
+                "what ONE shadow QUIC path may hold, from what it grants; summed at the \
+                 default connection limit in the QUIC transport share's data-off case \
+                 (quic::config::quic_shadow_memory_ceiling)",
+            ),
+            (
                 "quic_connection_cap",
                 "a COUNT of QUIC connections (how many fit an eighth of memory), not \
                  bytes; the node's connection limit is lowered to it while it may \

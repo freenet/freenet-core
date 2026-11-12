@@ -367,18 +367,19 @@ pub(crate) fn log_startup(config: &NetworkApiConfig) {
              this release's share of pairs"
         );
     }
+    let max_connections = config.connection_limit().max;
     match config.quic_max_paths_setting() {
         QuicMaxPathsSetting::Unset => {}
         QuicMaxPathsSetting::Invalid(raw) => tracing::warn!(
             quic_max_paths = %raw,
-            default = config.max_connections,
-            "quic-max-paths is not a whole number and is ignored; using \
-             max-number-of-connections"
+            default = max_connections,
+            "quic-max-paths is not a whole number and is ignored; using the connection \
+             limit"
         ),
-        QuicMaxPathsSetting::Set(limit) if limit > config.max_connections => tracing::info!(
+        QuicMaxPathsSetting::Set(limit) if limit > max_connections => tracing::info!(
             quic_max_paths = limit,
-            max_connections = config.max_connections,
-            "quic-max-paths is above max-number-of-connections and is lowered to it"
+            max_connections,
+            "quic-max-paths is above the connection limit and is lowered to it"
         ),
         QuicMaxPathsSetting::Set(_) => {}
     }
@@ -583,6 +584,39 @@ mod tests {
     /// The data bit needs `prefer`, the peer in the slice, and the key or the
     /// release's share to say so. `shadow` never sets it, whatever the key says,
     /// and at this release's share `prefer` does not either.
+    /// `may_carry_data` (what lowers the connection limit) holds exactly when
+    /// `own_caps` can give some pair the data bit, so the two rules cannot
+    /// drift: for each mode and share, over 400 pairs (at 5% the chance that
+    /// none is in the slice is under 1e-8).
+    #[test]
+    fn may_carry_data_matches_the_data_bit_rule() {
+        use crate::transport::TransportKeypair;
+        let pairs: Vec<_> = (0..400)
+            .map(|_| {
+                (
+                    TransportKeypair::new().public().clone(),
+                    TransportKeypair::new().public().clone(),
+                )
+            })
+            .collect();
+        for mode in ["off", "shadow", "prefer"] {
+            for percent in [None, Some("0"), Some("5"), Some("50"), Some("100")] {
+                let mut config = config(mode, None);
+                config.quic_data_percent = percent.map(str::to_string);
+                let up = QuicAvailabilityWatch::for_test(QuicAvailability::Up).1;
+                let policy = QuicPolicy::new(&config, BreakerOutcome::NotConsulted, up);
+                let some_pair_carries = pairs
+                    .iter()
+                    .any(|(local, peer)| policy.own_caps(local, peer) & caps::DATA != 0);
+                assert_eq!(
+                    may_carry_data(&config),
+                    some_pair_carries,
+                    "{mode} {percent:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn own_caps_needs_prefer_and_the_peer_in_the_slice() {
         use crate::transport::TransportKeypair;
@@ -738,7 +772,7 @@ mod tests {
     fn startup_reports_prefer_and_max_paths() {
         const PREFER: &str = "negotiates data with this share of pairs";
         const INVALID: &str = "quic-max-paths is not a whole number";
-        const LOWERED: &str = "quic-max-paths is above max-number-of-connections";
+        const LOWERED: &str = "quic-max-paths is above the connection limit";
         let above = (config("off", None).max_connections + 1).to_string();
         for (mode, max_paths, expected) in [
             ("off", None, None),

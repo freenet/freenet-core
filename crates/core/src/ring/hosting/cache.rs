@@ -4692,8 +4692,9 @@ mod tests {
                     crate::contract::declared_cache_ceiling(limit as usize, pool_size) as u64;
                 let hosting =
                     resident_overhead_budget_for(limit, DEFAULT_RESIDENT_OVERHEAD_MEM_SHARE);
-                // QUIC at its connection cap, every connection a data path
-                // (#5940 buffer budget), whatever this node's data share.
+                // QUIC, data on or off (#5940 buffer budget): the larger of
+                // every connection a data path at the connection cap, and
+                // every connection a shadow path at the default limit.
                 let transport =
                     crate::transport::quic::config::quic_memory_ceiling(limit as usize) as u64;
                 assert!(

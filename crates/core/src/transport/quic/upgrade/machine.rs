@@ -149,6 +149,13 @@ use crate::util::backoff::ExponentialBackoff;
 pub(in crate::transport) const OFFER_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a side waits for the connection, from `Accept` to established.
 pub(in crate::transport) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// The most control frames this node sends on one path: the server's `Ready`
+/// when the connection is established, or the client's `ReadyAck` when `Ready`
+/// arrives, once per attempt, and a path is one attempt's connection. It bounds
+/// what a shadow path's own sends can leave (`quic::config::QUIC_SHADOW_CONNECTION_CHARGE_BYTES`),
+/// whatever the peer does; pinned by `control_frames_are_sent_once_per_path`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(in crate::transport) const CONTROL_SENDS_PER_PATH: usize = 1;
 /// The bound on one `Ready` or `ReadyAck` send. For the caller.
 pub(in crate::transport) const CONTROL_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a side with a connection waits for the other's frame. Covers the

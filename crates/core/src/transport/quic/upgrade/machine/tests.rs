@@ -981,6 +981,40 @@ fn a_later_frame_does_not_change_an_active_path() {
     }
 }
 
+/// Whatever the peer sends and whatever happens to the path, one attempt
+/// makes at most `CONTROL_SENDS_PER_PATH` control sends: from every state of
+/// the attempt, in each role, each event first and three times over, then
+/// every event in turn.
+#[test]
+fn control_frames_are_sent_once_per_path() {
+    let sends_of = |actions: Vec<Action>, attempt: u32| {
+        actions
+            .iter()
+            .filter(|action| matches!(action, Action::SendControl(c) if c.attempt() == attempt))
+            .count()
+    };
+    for (role, state) in pairs() {
+        let attempt = attempt_of(role);
+        let before = match state {
+            S::Confirming => usize::from(role == Role::Server),
+            S::Active => 1,
+            S::Unpromoted | S::Idle | S::Offered | S::Connecting | S::Rechecking | S::Off => 0,
+        };
+        for first in ATTEMPT_EVENTS {
+            let mut rig = reach(role, state);
+            let mut sends = 0;
+            for name in std::iter::repeat_n(first, 3).chain(ATTEMPT_EVENTS) {
+                let event = event(name, attempt, &rig);
+                sends += sends_of(rig.step(event), attempt);
+            }
+            assert!(
+                sends + before <= super::CONTROL_SENDS_PER_PATH,
+                "{role:?} from {state:?}, {first} first: {sends} more sends after {before}"
+            );
+        }
+    }
+}
+
 /// A path that ends takes the peer's bit with it: the next attempt reads the
 /// peer's new frame, and a peer that stopped setting the bit stays shadow. This
 /// node's own bit stays, as it comes from the promotion. A later promotion
