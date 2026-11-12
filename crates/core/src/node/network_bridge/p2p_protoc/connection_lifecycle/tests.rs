@@ -344,6 +344,8 @@ impl Harness {
                 ttl: 4,
                 visited: VisitedPeers::new(&tx),
                 uphill_budget: 8,
+                native_offer: None,
+                joiner_transport_held: false,
             },
         }));
         let result = self

@@ -148,7 +148,14 @@ use crate::util::{Contains, IterExt};
 use super::VisitedPeers;
 
 pub(crate) mod bootstrap;
+pub(crate) mod native;
 pub(crate) mod op_ctx_task;
+mod wire;
+
+#[cfg(any(test, feature = "testing"))]
+pub(crate) use wire::connect_wire_index;
+#[cfg(any(test, feature = "testing"))]
+pub use wire::sim_trace as native_wire_trace;
 
 #[cfg(test)]
 const FORWARD_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(20);
@@ -199,7 +206,11 @@ fn filter_low_score_peers<T>(scored: &mut Vec<(f64, T)>, eligible_count: usize) 
 }
 
 /// Top-level message envelope used by the new connect handshake.
+///
+/// Encoded through [`wire::ConnectMsgWire`]: the native offer and decision
+/// reach the wire only through `wire::encode_for_peer`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(try_from = "wire::ConnectMsgWire", into = "wire::ConnectMsgWire")]
 pub(crate) enum ConnectMsg {
     /// Join request that travels *towards* the target location.
     /// Routing is determined by `payload.desired_location`, not an embedded target.
@@ -325,6 +336,19 @@ pub(crate) struct ConnectRequest {
     /// Bounds amplification to O(uphill_budget) per transaction regardless of TTL.
     #[serde(default = "default_uphill_budget")]
     pub uphill_budget: u8,
+    /// The joiner's QUIC-native offer. Never in these bytes: it travels in
+    /// the `RequestNative` wire variant, to peers at or above the floor
+    /// (`wire::encode_for_peer`), and is `None` after any other hop.
+    /// Set by `prepare_join_request`; a relay keeps it in
+    /// `RelayState.request`, so every re-route re-sends it.
+    #[serde(skip)]
+    pub native_offer: Option<native::NativeOffer>,
+    /// Whether this node held a transport to the joiner's key or address when
+    /// the request arrived, stamped by the network bridge on receipt
+    /// (`p2p_protoc::connection_lifecycle`), where that is known. Local to
+    /// this node: never on the wire, false on a request built here.
+    #[serde(skip)]
+    pub joiner_transport_held: bool,
 }
 
 fn default_uphill_budget() -> u8 {
@@ -336,6 +360,12 @@ fn default_uphill_budget() -> u8 {
 pub(crate) struct ConnectResponse {
     /// The peer that accepted the join request.
     pub acceptor: PeerKeyLocation,
+    /// The acceptor's QUIC-native decision, `Some` when the request carried
+    /// an offer. Never in these bytes: it travels in the `ResponseNative` wire
+    /// variant, to peers at or above the floor, and is `None` after any other
+    /// hop, which the joiner reads as `Udp`.
+    #[serde(skip)]
+    pub native_decision: Option<native::NativeDecision>,
 }
 
 /// State machine retained for in-file relay/joiner unit tests
@@ -409,6 +439,12 @@ pub(crate) trait RelayContext {
         visited: &VisitedPeers,
         recency: &HashMap<PeerKeyLocation, Instant>,
     ) -> Option<PeerKeyLocation>;
+
+    /// This node's readiness for QUIC-native connections, read when it
+    /// decides as acceptor.
+    fn native_readiness(&self) -> native::NativeReadiness {
+        native::NativeReadiness::current()
+    }
 }
 
 /// Bundle of the two side-effects a relay must emit atomically when it
@@ -599,6 +635,26 @@ impl RelayState {
     /// `now` is passed in (not derived from `Instant::now()`) so callers can
     /// provide a consistent timestamp shared with other time-sensitive operations
     /// in the same routing decision.
+    /// The QUIC-native decision for the response this node is about to send
+    /// as acceptor: `None` when the request carried no offer, else the
+    /// acceptor's decision (`native::decide_native`), counted.
+    fn native_decision<C: RelayContext>(
+        &self,
+        ctx: &C,
+        own_key: &crate::transport::TransportPublicKey,
+    ) -> Option<native::NativeDecision> {
+        let offer = self.request.native_offer?;
+        let bucket = native::native_bucket(own_key, self.request.joiner.pub_key());
+        let decision = native::decide_native(
+            Some(offer),
+            ctx.native_readiness(),
+            bucket,
+            self.request.joiner_transport_held,
+        );
+        crate::transport::metrics::TRANSPORT_METRICS.record_connect_native_decided(decision);
+        Some(decision)
+    }
+
     fn forward_to_peer<C: RelayContext>(
         &mut self,
         _ctx: &C,
@@ -744,8 +800,13 @@ impl RelayState {
                                     let acceptor = PeerKeyLocation::with_unknown_addr(
                                         self_loc.pub_key().clone(),
                                     );
+                                    let native_decision =
+                                        self.native_decision(ctx, self_loc.pub_key());
                                     actions.accept = Some(AcceptOutcome {
-                                        response: ConnectResponse { acceptor },
+                                        response: ConnectResponse {
+                                            acceptor,
+                                            native_decision,
+                                        },
                                         joiner: self.request.joiner.clone(),
                                     });
                                     tracing::info!(
@@ -798,8 +859,12 @@ impl RelayState {
             let self_loc = ctx.self_location();
             let acceptor = PeerKeyLocation::with_unknown_addr(self_loc.pub_key().clone());
             let dist = ring_distance(self_loc.location(), self.request.joiner.location());
+            let native_decision = self.native_decision(ctx, self_loc.pub_key());
             actions.accept = Some(AcceptOutcome {
-                response: ConnectResponse { acceptor },
+                response: ConnectResponse {
+                    acceptor,
+                    native_decision,
+                },
                 joiner: self.request.joiner.clone(),
             });
             // Response is routed hop-by-hop via upstream_addr, no target embedded in message
@@ -1533,12 +1598,20 @@ pub(crate) fn prepare_join_request(
     // external address (especially behind NAT). The first recipient (gateway)
     // will fill this in from the packet source address.
     let joiner = PeerKeyLocation::with_unknown_addr(own.pub_key.clone());
+    // Every request carries an offer, at percent 0 while this node cannot
+    // dial native; the encoder drops it on a hop to a peer below the floor.
+    let readiness = native::NativeReadiness::current();
+    let offer = readiness.offer();
+    crate::transport::metrics::TRANSPORT_METRICS
+        .record_connect_native_offered(offer, readiness.ready);
     let request = ConnectRequest {
         desired_location,
         joiner,
         ttl,
         visited,
         uphill_budget: DEFAULT_UPHILL_BUDGET,
+        native_offer: Some(offer),
+        joiner_transport_held: false,
     };
 
     ConnectMsg::Request {
@@ -3880,6 +3953,8 @@ mod tests {
                 ttl: 3,
                 visited: VisitedPeers::default(),
                 uphill_budget: DEFAULT_UPHILL_BUDGET,
+                native_offer: None,
+                joiner_transport_held: false,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -3929,6 +4004,8 @@ mod tests {
                 ttl: 3,
                 visited: VisitedPeers::default(),
                 uphill_budget: DEFAULT_UPHILL_BUDGET,
+                native_offer: None,
+                joiner_transport_held: false,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -3978,6 +4055,8 @@ mod tests {
                 ttl: 2,
                 visited: VisitedPeers::default(),
                 uphill_budget: DEFAULT_UPHILL_BUDGET,
+                native_offer: None,
+                joiner_transport_held: false,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -4031,6 +4110,8 @@ mod tests {
                 ttl: 3,
                 visited: VisitedPeers::default(),
                 uphill_budget: DEFAULT_UPHILL_BUDGET,
+                native_offer: None,
+                joiner_transport_held: false,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -4100,6 +4181,8 @@ mod tests {
                 ttl: 3,
                 visited: VisitedPeers::default(),
                 uphill_budget: DEFAULT_UPHILL_BUDGET,
+                native_offer: None,
+                joiner_transport_held: false,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -4171,6 +4254,8 @@ mod tests {
                 ttl: 3,
                 visited: VisitedPeers::default(),
                 uphill_budget: DEFAULT_UPHILL_BUDGET,
+                native_offer: None,
+                joiner_transport_held: false,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -4211,6 +4296,7 @@ mod tests {
 
         let response = ConnectResponse {
             acceptor: acceptor.clone(),
+            native_decision: None,
         };
         let result = state.register_acceptance(&response, Instant::now());
         assert!(result.satisfied);
@@ -4279,6 +4365,8 @@ mod tests {
             ttl: 3,
             visited,
             uphill_budget: DEFAULT_UPHILL_BUDGET,
+            native_offer: None,
+            joiner_transport_held: false,
         };
 
         let mut relay_op = ConnectOp::new_relay(
@@ -4361,6 +4449,8 @@ mod tests {
                 ttl: 3,
                 visited: VisitedPeers::default(),
                 uphill_budget: DEFAULT_UPHILL_BUDGET,
+                native_offer: None,
+                joiner_transport_held: false,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -4445,6 +4535,8 @@ mod tests {
             ttl: 3,
             visited,
             uphill_budget: DEFAULT_UPHILL_BUDGET,
+            native_offer: None,
+            joiner_transport_held: false,
         };
 
         let mut relay_op = ConnectOp::new_relay(
@@ -4530,6 +4622,8 @@ mod tests {
                 ttl: 3,
                 visited: VisitedPeers::default(),
                 uphill_budget: DEFAULT_UPHILL_BUDGET,
+                native_offer: None,
+                joiner_transport_held: false,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -4623,6 +4717,8 @@ mod tests {
                 ttl: 3,
                 visited: VisitedPeers::default(),
                 uphill_budget: DEFAULT_UPHILL_BUDGET,
+                native_offer: None,
+                joiner_transport_held: false,
             },
             // Simulate a prior forward that completed: the operation has
             // already committed to a path and must not also accept locally.
@@ -4697,6 +4793,8 @@ mod tests {
             ttl: 3,
             visited,
             uphill_budget: DEFAULT_UPHILL_BUDGET,
+            native_offer: None,
+            joiner_transport_held: false,
         };
 
         // Create the relay op as `new_relay` would on first receipt.
@@ -4771,6 +4869,8 @@ mod tests {
                 ttl: 3,
                 visited: VisitedPeers::default(),
                 uphill_budget: DEFAULT_UPHILL_BUDGET,
+                native_offer: None,
+                joiner_transport_held: false,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -4820,6 +4920,8 @@ mod tests {
                 ttl: 0, // TTL exhausted
                 visited: VisitedPeers::default(),
                 uphill_budget: DEFAULT_UPHILL_BUDGET,
+                native_offer: None,
+                joiner_transport_held: false,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -4884,6 +4986,8 @@ mod tests {
                 ttl: 3,
                 visited: VisitedPeers::default(),
                 uphill_budget: DEFAULT_UPHILL_BUDGET,
+                native_offer: None,
+                joiner_transport_held: false,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -4952,6 +5056,8 @@ mod tests {
                 ttl: 3,
                 visited: VisitedPeers::default(),
                 uphill_budget: DEFAULT_UPHILL_BUDGET,
+                native_offer: None,
+                joiner_transport_held: false,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -5006,6 +5112,8 @@ mod tests {
                 ttl: 0, // TTL exhausted
                 visited: VisitedPeers::default(),
                 uphill_budget: DEFAULT_UPHILL_BUDGET,
+                native_offer: None,
+                joiner_transport_held: false,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -5058,7 +5166,9 @@ mod tests {
                 joiner: joiner.clone(),
                 ttl: 5, // TTL is fine
                 visited: VisitedPeers::default(),
-                uphill_budget: 0, // Budget exhausted
+                uphill_budget: 0, // Budget exhausted,
+                native_offer: None,
+                joiner_transport_held: false,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -5265,6 +5375,8 @@ mod tests {
                 ttl: 3,
                 visited: VisitedPeers::default(),
                 uphill_budget: DEFAULT_UPHILL_BUDGET,
+                native_offer: None,
+                joiner_transport_held: false,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -5309,6 +5421,8 @@ mod tests {
                 ttl: 0, // TTL exhausted
                 visited: VisitedPeers::default(),
                 uphill_budget: DEFAULT_UPHILL_BUDGET,
+                native_offer: None,
+                joiner_transport_held: false,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -5352,6 +5466,8 @@ mod tests {
                 ttl: 3,
                 visited: VisitedPeers::default(),
                 uphill_budget: DEFAULT_UPHILL_BUDGET,
+                native_offer: None,
+                joiner_transport_held: false,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -5404,6 +5520,8 @@ mod tests {
                 ttl: 3,
                 visited: VisitedPeers::default(),
                 uphill_budget: DEFAULT_UPHILL_BUDGET,
+                native_offer: None,
+                joiner_transport_held: false,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -5469,6 +5587,8 @@ mod tests {
                 ttl: 3,
                 visited: VisitedPeers::default(),
                 uphill_budget: DEFAULT_UPHILL_BUDGET,
+                native_offer: None,
+                joiner_transport_held: false,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -5541,6 +5661,8 @@ mod tests {
                 ttl: 3,
                 visited: VisitedPeers::default(),
                 uphill_budget: DEFAULT_UPHILL_BUDGET,
+                native_offer: None,
+                joiner_transport_held: false,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -5912,6 +6034,8 @@ mod tests {
                 ttl: 5,
                 visited: VisitedPeers::new(&Transaction::new::<ConnectMsg>()),
                 uphill_budget: DEFAULT_UPHILL_BUDGET,
+                native_offer: None,
+                joiner_transport_held: false,
             },
             forwarded_to: Some(relay_peer),
             forwarded_at: Some(Instant::now()),
@@ -6128,6 +6252,8 @@ mod tests {
                 ttl: 3,
                 visited: VisitedPeers::default(),
                 uphill_budget: DEFAULT_UPHILL_BUDGET,
+                native_offer: None,
+                joiner_transport_held: false,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -6160,6 +6286,8 @@ mod tests {
                 ttl: 0, // TTL exhausted
                 visited: VisitedPeers::default(),
                 uphill_budget: DEFAULT_UPHILL_BUDGET,
+                native_offer: None,
+                joiner_transport_held: false,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -6190,6 +6318,8 @@ mod tests {
                 ttl: 5,           // TTL is fine
                 uphill_budget: 0, // budget spent
                 visited: VisitedPeers::default(),
+                native_offer: None,
+                joiner_transport_held: false,
             },
             forwarded_to: None,
             forwarded_at: None,
@@ -6224,6 +6354,8 @@ mod tests {
                 ttl: 0,           // reach spent
                 uphill_budget: 0, // budget spent
                 visited: VisitedPeers::default(),
+                native_offer: None,
+                joiner_transport_held: false,
             },
             forwarded_to: None,
             forwarded_at: None,

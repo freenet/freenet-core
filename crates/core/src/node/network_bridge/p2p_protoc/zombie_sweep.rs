@@ -2042,6 +2042,8 @@ mod tests {
                         ttl: 4,
                         visited: VisitedPeers::new(&tx),
                         uphill_budget: 8,
+                        native_offer: None,
+                        joiner_transport_held: false,
                     },
                 })),
                 true,
@@ -2052,6 +2054,7 @@ mod tests {
                     id: tx,
                     payload: ConnectResponse {
                         acceptor: PeerKeyLocation::random(),
+                        native_decision: None,
                     },
                 })),
                 false,
@@ -2532,6 +2535,7 @@ mod tests {
             Arc::new(crate::node::network_bridge::outbound_message_mix::OutboundMix::new()),
             crate::operations::update::propagation_stats::PropagationSink::for_test().0,
             link_use,
+            crate::operations::connect::native::NativeWire::new(None, false),
         ));
 
         let request = every_variant()

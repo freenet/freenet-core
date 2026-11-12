@@ -3060,6 +3060,42 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 serde_json::json!(snapshot.quic_endpoint),
             );
             m.insert(
+                "connect_native_offered_zero".into(),
+                serde_json::json!(snapshot.connect_native_offered_zero),
+            );
+            m.insert(
+                "connect_native_offered_nonzero".into(),
+                serde_json::json!(snapshot.connect_native_offered_nonzero),
+            );
+            m.insert(
+                "connect_native_decided_native".into(),
+                serde_json::json!(snapshot.connect_native_decided_native),
+            );
+            m.insert(
+                "connect_native_decided_udp".into(),
+                serde_json::json!(snapshot.connect_native_decided_udp),
+            );
+            m.insert(
+                "connect_native_decision_without_offer".into(),
+                serde_json::json!(snapshot.connect_native_decision_without_offer),
+            );
+            m.insert(
+                "connect_native_decision_native_unsupported".into(),
+                serde_json::json!(snapshot.connect_native_decision_native_unsupported),
+            );
+            m.insert(
+                "connect_native_offer_level".into(),
+                serde_json::json!(snapshot.connect_native_offer_level),
+            );
+            m.insert(
+                "connect_native_offer_percent".into(),
+                serde_json::json!(snapshot.connect_native_offer_percent),
+            );
+            m.insert(
+                "connect_native_offer_ready".into(),
+                serde_json::json!(snapshot.connect_native_offer_ready),
+            );
+            m.insert(
                 "quic_close_sent_node_dropped_peer".into(),
                 serde_json::json!(snapshot.quic_close_sent_node_dropped_peer),
             );

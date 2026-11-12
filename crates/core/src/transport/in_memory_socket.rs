@@ -161,6 +161,12 @@ fn resolve_address_network(addr: &SocketAddr) -> Result<String, ResolveError> {
     }
 }
 
+/// The simulated network `addr` belongs to, if it resolves to one.
+#[cfg(any(test, feature = "testing"))]
+pub(crate) fn network_of(addr: &SocketAddr) -> Option<String> {
+    resolve_address_network(addr).ok()
+}
+
 /// The `io::Error` a bind returns when `addr` cannot be resolved.
 fn resolve_error(addr: &SocketAddr, kind: io::ErrorKind, err: ResolveError) -> io::Error {
     match err {
@@ -318,6 +324,7 @@ pub(crate) fn deliver_packet_at(addr: SocketAddr, data: Vec<u8>, from: SocketAdd
 #[cfg(any(test, feature = "testing"))]
 pub(crate) fn clear_quic_endpoint_clocks(network: &str) {
     QUIC_UPGRADE_TRACES.remove(network);
+    crate::operations::connect::native_wire_trace::remove(network);
     QUIC_ACCEPT_LOOPS.retain(|(owner, _)| owner != network);
     QUIC_ENDPOINT_CLOCKS.retain(|(owner, _), _| owner != network);
 }

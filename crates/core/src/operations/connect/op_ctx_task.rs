@@ -222,6 +222,15 @@ pub(crate) async fn start_client_connect_counted(
 
     let request_msg =
         super::prepare_join_request(tx, &own, &gateway, desired_location, ttl, &exclude_addrs);
+    // The offer this request carries, against which a response's QUIC-native
+    // decision is judged.
+    let sent_offer = match &request_msg {
+        ConnectMsg::Request { payload, .. } => payload.native_offer,
+        ConnectMsg::Response { .. }
+        | ConnectMsg::ObservedAddress { .. }
+        | ConnectMsg::Rejected { .. }
+        | ConnectMsg::ConnectFailed { .. } => None,
+    };
 
     if let Some(event) = NetEventLog::connect_request_sent(
         &tx,
@@ -278,6 +287,7 @@ pub(crate) async fn start_client_connect_counted(
         receiver,
         op_manager,
         kind,
+        sent_offer,
         &mut connected,
     );
 
@@ -375,6 +385,7 @@ async fn drive_client_connect(
     mut receiver: mpsc::Receiver<WaiterReply>,
     op_manager: &OpManager,
     kind: ClientConnectKind,
+    sent_offer: Option<super::native::NativeOffer>,
     connected_dials: &mut usize,
 ) -> Result<ClientConnectEnd, OpError> {
     use futures::StreamExt;
@@ -761,6 +772,33 @@ async fn drive_client_connect(
                     continue;
                 }
 
+                #[cfg(any(test, feature = "testing"))]
+                if let Some(addr) = payload.acceptor.socket_addr() {
+                    super::wire::sim_trace::record_at(
+                        addr,
+                        super::wire::sim_trace::NativeWireEvent::JoinerResponse {
+                            with_decision: payload.native_decision.is_some(),
+                        },
+                    );
+                }
+                // `None` and `Udp` go on as today. This build has no native
+                // dial, so a `Native` decision cannot be honoured: the attempt
+                // with this acceptor fails and is counted by why.
+                if let Err(failure) =
+                    super::native::joiner_response_action(sent_offer, payload.native_decision)
+                {
+                    crate::transport::metrics::TRANSPORT_METRICS
+                        .record_connect_native_decision_failure(failure);
+                    tracing::warn!(
+                        tx = %tx,
+                        acceptor = %payload.acceptor,
+                        ?failure,
+                        "connect driver: acceptor decided a native connection this node \
+                         cannot set up; skipping it"
+                    );
+                    continue;
+                }
+
                 if accepted.contains(&payload.acceptor) {
                     // Duplicate acceptor — ignore.
                     continue;
@@ -927,6 +965,21 @@ struct AcceptorDial {
     acceptor: PeerKeyLocation,
     acceptor_addr: SocketAddr,
     result: Option<crate::message::ConnectResult>,
+}
+/// Records an accept in the simulation's native-wire trace: whether the
+/// request carried an offer (the response carries a decision exactly then),
+/// and whether it was accepted after a `Rejected` or `ConnectFailed` re-route.
+fn trace_accept(upstream: SocketAddr, response: &super::ConnectResponse, retry: bool) {
+    #[cfg(any(test, feature = "testing"))]
+    super::native_wire_trace::record_at(
+        upstream,
+        super::native_wire_trace::NativeWireEvent::Accepted {
+            with_offer: response.native_decision.is_some(),
+            retry,
+        },
+    );
+    #[cfg(not(any(test, feature = "testing")))]
+    let _ = (upstream, response, retry);
 }
 
 /// Starts the hole punch to `acceptor`, whose Response arrived at
@@ -1289,6 +1342,7 @@ async fn drive_relay_connect(
         ) {
             op_manager.ring.register_events(Either::Left(event)).await;
         }
+        trace_accept(upstream_addr, &accept.response, false);
         let mut ctx = op_manager.op_ctx(incoming_tx);
         ctx.send_fire_and_forget(
             upstream_addr,
@@ -1464,6 +1518,7 @@ async fn drive_relay_connect(
                         op_manager.ring.register_events(Either::Left(event)).await;
                     }
                     dispatch_expect_connection_from(op_manager, incoming_tx, accept.joiner).await?;
+                    trace_accept(upstream_addr, &accept.response, true);
                     let mut ctx = op_manager.op_ctx(incoming_tx);
                     ctx.send_fire_and_forget(
                         upstream_addr,
@@ -1635,6 +1690,7 @@ async fn drive_relay_connect(
                         op_manager.ring.register_events(Either::Left(event)).await;
                     }
                     dispatch_expect_connection_from(op_manager, incoming_tx, accept.joiner).await?;
+                    trace_accept(upstream_addr, &accept.response, true);
                     let mut ctx = op_manager.op_ctx(incoming_tx);
                     ctx.send_fire_and_forget(
                         upstream_addr,
@@ -2165,7 +2221,7 @@ mod tests {
         );
         assert!(
             counted.contains("kind:ClientConnectKind,")
-                && counted.contains("op_manager,kind,&mutconnected,);"),
+                && counted.contains("op_manager,kind,sent_offer,&mutconnected,);"),
             "start_client_connect_counted must forward its kind to the driver"
         );
         let body = item(&driver, "async fn drive_client_connect(", "\n}\n");
@@ -2245,6 +2301,7 @@ mod driver_timing_tests {
             receiver,
             op_manager,
             kind,
+            Some(super::super::native::NativeOffer::capable(0)),
             &mut connected,
         )
         .await
@@ -2361,6 +2418,7 @@ mod driver_timing_tests {
                 id: tx,
                 payload: ConnectResponse {
                     acceptor: acceptor.clone(),
+                    native_decision: None,
                 },
             },
         )))
@@ -3292,6 +3350,7 @@ mod driver_timing_tests {
                 replies_rx,
                 &op_manager,
                 ClientConnectKind::Standard,
+                Some(super::super::native::NativeOffer::capable(0)),
                 &mut connected,
             ),
             expire

@@ -511,6 +511,10 @@ pub(crate) struct ConnectionManager {
     /// exercises the hash-first path before the crate version reaches the
     /// production floor. See `NodeConfig`.
     hash_first_summaries_floor_override: Option<(u8, u8, u16)>,
+    /// How this node encodes and decodes the QUIC-native connect variants:
+    /// the floor (`NodeConfig::quic_native_floor_override` or the production
+    /// one) and the simulation's pre-floor decoder mode.
+    native_wire: crate::operations::connect::native::NativeWire,
     /// Version-gate refusal counters (#5156). Both `supports_hash_first_summaries`
     /// and `supports_summary_first_put` fail closed to the full-bytes fallback
     /// for two causes with opposite implications — a pre-floor peer self-heals
@@ -694,6 +698,10 @@ impl ConnectionManager {
         cm.subscribe_hint_floor_override = config.subscribe_hint_floor_override;
         cm.summary_first_put_floor_override = config.summary_first_put_floor_override;
         cm.hash_first_summaries_floor_override = config.hash_first_summaries_floor_override;
+        cm.native_wire = crate::operations::connect::native::NativeWire::new(
+            config.quic_native_floor_override,
+            config.native_wire_pre_floor,
+        );
         cm.broadcast_target_list_floor_override = config.broadcast_target_list_floor_override;
         cm
     }
@@ -732,6 +740,7 @@ impl ConnectionManager {
             // Default off; `new(config)` overrides from config after init.
             summary_first_put_floor_override: None,
             hash_first_summaries_floor_override: None,
+            native_wire: crate::operations::connect::native::NativeWire::new(None, false),
             hash_first_declined_unknown_version: Arc::new(AtomicU64::new(0)),
             hash_first_declined_pre_floor: Arc::new(AtomicU64::new(0)),
             summary_first_put_declined_unknown_version: Arc::new(AtomicU64::new(0)),
@@ -1587,6 +1596,11 @@ impl ConnectionManager {
     /// production). See `NodeConfig::subscribe_hint_floor_override`.
     pub(crate) fn subscribe_hint_floor_override(&self) -> Option<(u8, u8, u16)> {
         self.subscribe_hint_floor_override
+    }
+
+    /// How this node encodes and decodes the QUIC-native connect variants.
+    pub(crate) fn native_wire(&self) -> crate::operations::connect::native::NativeWire {
+        self.native_wire
     }
 
     /// Record (or CLEAR) the negotiated protocol version for a peer at `addr`,

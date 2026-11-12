@@ -1154,6 +1154,34 @@ pub(crate) fn version_supports_broadcast_target_list(
     remote.is_some_and(|v| v >= floor)
 }
 
+use crate::operations::connect::native::NativeWire;
+
+/// Version floor for the QUIC-native fields of `ConnectMsg` (#5940): the
+/// joiner's offer and the acceptor's decision, carried in the appended
+/// `RequestNative` / `ResponseNative` wire variants (indices 5 and 6 of
+/// `connect::wire::ConnectMsgWire`).
+///
+/// A peer below it has no such variant index and closes the connection on
+/// one, so `connect::wire::encode_for_peer` emits them only to a peer whose
+/// negotiated version is known and at least this; every other encode emits
+/// today's variants without the fields. Per the wire-gated-floor rule in
+/// `docs/RELEASING.md`, this is the release that first ships the decoder, then
+/// frozen. Bias HIGH: too low closes connections to the release below it, too
+/// high only delays the offer.
+pub(crate) const QUIC_NATIVE_MIN_VERSION: (u8, u8, u16) = (0, 2, 157);
+
+/// Has the decoder for the QUIC-native `ConnectMsg` variants shipped, and in
+/// which release?
+///
+/// Same contract as [`HASH_FIRST_SHIPPED_IN`], checked by
+/// `quic_native_floor_tracks_the_shipping_release`: `None` means
+/// [`QUIC_NATIVE_MIN_VERSION`] is a prediction that must stay strictly ABOVE
+/// the crate version; `Some(v)` means it shipped in `v`, which must equal the
+/// floor. Write the literal release when it ships, not
+/// `Some(QUIC_NATIVE_MIN_VERSION)`, which would compare the floor with itself.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const QUIC_NATIVE_SHIPPED_IN: Option<(u8, u8, u16)> = None;
+
 /// Upper bound on the number of hosted contracts examined per new-peer
 /// migration trigger. Each examined contract may emit a best-effort
 /// non-blocking `try_send` (the SubscribeHint nudge), so an unbounded scan
@@ -3556,6 +3584,7 @@ async fn handle_peer_channel_message(
     msg: Either<NetMessage, ConnEvent>,
     outbound_mix: &crate::node::network_bridge::outbound_message_mix::OutboundMix,
     propagation: &crate::operations::update::propagation_stats::PropagationSink,
+    native_wire: NativeWire,
 ) -> Result<(), TransportError> {
     match msg {
         Left(msg) => {
@@ -3568,14 +3597,23 @@ async fn handle_peer_channel_message(
                 crate::node::network_bridge::outbound_message_mix::OutboundClass::classify(&msg);
             let broadcast_contract = inline_broadcast_contract(&msg);
             // The transport moves bytes; serializing the message is this
-            // layer's job.
-            let sent = send_serialized_message(
-                conn,
-                bincode::serialize(&msg),
-                broadcast_contract,
-                propagation,
-            )
-            .await;
+            // layer's job. This is the one encode of a message bound for a
+            // peer, so it is the one that may emit the QUIC-native connect
+            // variants, gated on the version this connection negotiated.
+            let serialized = native_wire.encode(&msg, conn.remote_version());
+            #[cfg(any(test, feature = "testing"))]
+            if let Some(index) = serialized
+                .as_ref()
+                .ok()
+                .and_then(|bytes| crate::operations::connect::connect_wire_index(bytes))
+            {
+                crate::operations::connect::native_wire_trace::record_at(
+                    conn.remote_addr(),
+                    crate::operations::connect::native_wire_trace::NativeWireEvent::Sent(index),
+                );
+            }
+            let sent =
+                send_serialized_message(conn, serialized, broadcast_contract, propagation).await;
             match sent {
                 Ok(serialized_len) => {
                     // #4956: attribute the bytes to the message kind that
@@ -3739,11 +3777,14 @@ async fn drain_pending_before_shutdown(
     remote_addr: SocketAddr,
     outbound_mix: &crate::node::network_bridge::outbound_message_mix::OutboundMix,
     propagation: &crate::operations::update::propagation_stats::PropagationSink,
+    native_wire: NativeWire,
 ) -> usize {
     let mut drained = 0;
     while let Ok(msg) = rx.try_recv() {
         // Best-effort send - connection may already be degraded
-        if let Err(e) = handle_peer_channel_message(conn, msg, outbound_mix, propagation).await {
+        if let Err(e) =
+            handle_peer_channel_message(conn, msg, outbound_mix, propagation, native_wire).await
+        {
             tracing::debug!(
                 to = %remote_addr,
                 ?e,
@@ -3786,6 +3827,7 @@ async fn peer_connection_listener(
     outbound_mix: std::sync::Arc<crate::node::network_bridge::outbound_message_mix::OutboundMix>,
     propagation: crate::operations::update::propagation_stats::PropagationSink,
     link_use: zombie_sweep::LinkUseStamp,
+    native_wire: NativeWire,
 ) {
     let remote_addr = conn.remote_addr();
     tracing::debug!(
@@ -3814,9 +3856,14 @@ async fn peer_connection_listener(
             match rx.try_recv() {
                 Ok(msg) => {
                     drained += 1;
-                    if let Err(error) =
-                        handle_peer_channel_message(&mut conn, msg, &outbound_mix, &propagation)
-                            .await
+                    if let Err(error) = handle_peer_channel_message(
+                        &mut conn,
+                        msg,
+                        &outbound_mix,
+                        &propagation,
+                        native_wire,
+                    )
+                    .await
                     {
                         if !error.closes_connection() {
                             tracing::warn!(
@@ -3838,6 +3885,7 @@ async fn peer_connection_listener(
                                 remote_addr,
                                 &outbound_mix,
                                 &propagation,
+                                native_wire,
                             )
                             .await;
                             notify_transport_closed(
@@ -3885,7 +3933,7 @@ async fn peer_connection_listener(
             msg = rx.recv() => {
                 match msg {
                     Some(msg) => {
-                        if let Err(error) = handle_peer_channel_message(&mut conn, msg, &outbound_mix, &propagation).await {
+                        if let Err(error) = handle_peer_channel_message(&mut conn, msg, &outbound_mix, &propagation, native_wire).await {
                             if !error.closes_connection() {
                                 tracing::warn!(
                                     to = %remote_addr,
@@ -3899,7 +3947,7 @@ async fn peer_connection_listener(
                                     "[CONN_LIFECYCLE] Connection closed after channel command"
                                 );
                                 // Drain any messages that arrived while we were processing this one
-                                drain_pending_before_shutdown(&mut rx, &mut conn, remote_addr, &outbound_mix, &propagation).await;
+                                drain_pending_before_shutdown(&mut rx, &mut conn, remote_addr, &outbound_mix, &propagation, native_wire).await;
                                 notify_transport_closed(
                                     &conn_events,
                                     remote_addr,
@@ -3934,7 +3982,7 @@ async fn peer_connection_listener(
             },
             msg = conn.recv() => {
                 match msg {
-                    Ok(msg) => match decode_msg(&msg) {
+                    Ok(msg) => match native_wire.decode(|| decode_msg(&msg)) {
                         Ok(net_message) => {
                             let tx = *net_message.id();
                             tracing::debug!(
@@ -3962,7 +4010,7 @@ async fn peer_connection_listener(
                                 );
                                 // Drain pending messages - they may still be sendable even if
                                 // the conn_events channel is closed
-                                drain_pending_before_shutdown(&mut rx, &mut conn, remote_addr, &outbound_mix, &propagation).await;
+                                drain_pending_before_shutdown(&mut rx, &mut conn, remote_addr, &outbound_mix, &propagation, native_wire).await;
                                 return;
                             }
                         }
@@ -3972,8 +4020,13 @@ async fn peer_connection_listener(
                                 ?error,
                                 "[CONN_LIFECYCLE] Failed to deserialize inbound message; closing connection"
                             );
+                            #[cfg(any(test, feature = "testing"))]
+                            crate::operations::connect::native_wire_trace::record_at(
+                                remote_addr,
+                                crate::operations::connect::native_wire_trace::NativeWireEvent::UndecodableClose,
+                            );
                             // Drain pending outbound messages before closing - they may still succeed
-                            drain_pending_before_shutdown(&mut rx, &mut conn, remote_addr, &outbound_mix, &propagation).await;
+                            drain_pending_before_shutdown(&mut rx, &mut conn, remote_addr, &outbound_mix, &propagation, native_wire).await;
                             let transport_error = TransportError::Other(anyhow!(
                                 "Failed to deserialize inbound message from {remote_addr}: {error:?}"
                             ));
@@ -4009,7 +4062,7 @@ async fn peer_connection_listener(
                         // waiting in select!, and they would be lost without this drain.
                         // Label the disconnect (see disconnect_reason_for_close).
                         let reason = disconnect_reason_for_close(conn.close_reason());
-                        drain_pending_before_shutdown(&mut rx, &mut conn, remote_addr, &outbound_mix, &propagation).await;
+                        drain_pending_before_shutdown(&mut rx, &mut conn, remote_addr, &outbound_mix, &propagation, native_wire).await;
                         notify_transport_closed(&conn_events, remote_addr, error, connection_id, reason).await;
                         return;
                     }
@@ -4134,6 +4187,46 @@ fn extract_sender_from_message_mut(msg: &mut NetMessage) -> Option<&mut PeerKeyL
 }
 
 // TODO: add testing for the network loop, now it should be possible to do since we don't depend upon having real connections
+
+#[cfg(test)]
+mod quic_native_floor_tests {
+    use super::{QUIC_NATIVE_MIN_VERSION, QUIC_NATIVE_SHIPPED_IN, own_crate_version};
+
+    /// Mirrors `upgrade_floor_tracks_the_shipping_release`: the moment a
+    /// release bump lifts the crate to the floor, this fails until someone
+    /// records that the release carries the decoder (or raises the floor).
+    #[test]
+    fn quic_native_floor_tracks_the_shipping_release() {
+        let crate_version = own_crate_version();
+        match QUIC_NATIVE_SHIPPED_IN {
+            Some(shipped) => {
+                assert_eq!(
+                    shipped, QUIC_NATIVE_MIN_VERSION,
+                    "the release that ships the QUIC-native decoder must EQUAL the floor"
+                );
+                let next = (crate_version.0, crate_version.1, crate_version.2 + 1);
+                assert!(
+                    shipped <= next,
+                    "QUIC_NATIVE_SHIPPED_IN {shipped:?} is beyond the next release {next:?}"
+                );
+            }
+            None => assert!(
+                crate_version < QUIC_NATIVE_MIN_VERSION,
+                "floor {QUIC_NATIVE_MIN_VERSION:?} is a PREDICTION about the next release, \
+                 but the crate is already at {crate_version:?}: either set \
+                 QUIC_NATIVE_SHIPPED_IN = Some(floor) (this release carries the decoder) or \
+                 raise the floor"
+            ),
+        }
+    }
+
+    /// Companion: the floor must never drop to a release without the decoder.
+    #[test]
+    fn quic_native_floor_stays_above_every_release_without_the_decoder() {
+        const LAST_RELEASE_WITHOUT_DECODER: (u8, u8, u16) = (0, 2, 156);
+        assert!(QUIC_NATIVE_MIN_VERSION > LAST_RELEASE_WITHOUT_DECODER);
+    }
+}
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -4373,9 +4466,15 @@ pub(crate) mod tests {
         let msg = hosting_announce();
         let expected = bincode::serialize(&msg).unwrap();
 
-        super::handle_peer_channel_message(&mut conn, either::Left(msg), &mix, &sink)
-            .await
-            .expect("send succeeds");
+        super::handle_peer_channel_message(
+            &mut conn,
+            either::Left(msg),
+            &mix,
+            &sink,
+            super::NativeWire::new(None, false),
+        )
+        .await
+        .expect("send succeeds");
 
         assert_eq!(*sent.lock(), vec![expected.clone()]);
         let rollup = mix.rollup_body_for_test();
@@ -4402,6 +4501,7 @@ pub(crate) mod tests {
             either::Left(hosting_announce()),
             &mix,
             &sink,
+            super::NativeWire::new(None, false),
         )
         .await;
 
@@ -4507,6 +4607,7 @@ pub(crate) mod tests {
                         either::Left(broadcast(v2)),
                         mix,
                         &sink,
+                        super::NativeWire::new(None, false),
                     )
                     .await;
                     // A stream's fate lands on a task of its own.
@@ -4582,6 +4683,7 @@ pub(crate) mod tests {
             either::Left(hosting_announce()),
             &mix,
             &sink,
+            super::NativeWire::new(None, false),
         )
         .await
         .expect("send succeeds");
@@ -4621,9 +4723,15 @@ pub(crate) mod tests {
             fail: false,
             observe: Some((ObservedSend::Stream, Some(StreamSendOutcome::Dropped))),
         });
-        super::handle_peer_channel_message(&mut conn, either::Left(msg), &mix, &sink)
-            .await
-            .expect("send succeeds");
+        super::handle_peer_channel_message(
+            &mut conn,
+            either::Left(msg),
+            &mix,
+            &sink,
+            super::NativeWire::new(None, false),
+        )
+        .await
+        .expect("send succeeds");
         for _ in 0..100 {
             tokio::task::yield_now().await;
         }

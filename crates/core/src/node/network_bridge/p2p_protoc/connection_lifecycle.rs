@@ -1694,6 +1694,7 @@ impl P2pConnManager {
         let propagation = crate::operations::update::propagation_stats::PropagationSink::of(
             &self.bridge.op_manager,
         );
+        let native_wire = self.bridge.op_manager.ring.connection_manager.native_wire();
         tokio::spawn(async move {
             peer_connection_listener(
                 rx,
@@ -1704,6 +1705,7 @@ impl P2pConnManager {
                 outbound_mix,
                 propagation,
                 link_use,
+                native_wire,
             )
             .await;
         });
@@ -2129,6 +2131,24 @@ impl P2pConnManager {
                             }
                         }
                     }
+                }
+
+                // Whether this node holds a transport to the joiner, for the
+                // QUIC-native decision this node makes if it accepts: an
+                // existing transport is reused, so the decision is `Udp`. Read
+                // here because only the bridge knows its transports; by key
+                // (bound above when the joiner is the sender), then by address.
+                if let NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Request {
+                    payload, ..
+                })) = &mut inbound.msg
+                {
+                    payload.joiner_transport_held = self
+                        .connection_entry_by_pub_key(payload.joiner.pub_key())
+                        .is_some()
+                        || payload
+                            .joiner
+                            .socket_addr()
+                            .is_some_and(|addr| self.connections.contains_key(&addr));
                 }
 
                 tracing::debug!(
