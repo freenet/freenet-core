@@ -2105,6 +2105,18 @@ impl Outgoing {
         }
     }
 
+    /// Reset a stream whose end was already sent, so quinn discards what the
+    /// peer has not acknowledged (quinn-proto 0.11.19 `SendState::reset` from
+    /// `DataSent`). Counted as an abort ([`SendAborts`]): `stopped()` was
+    /// polled while the stream waited for its acknowledgement, so the reset
+    /// leaves an entry in quinn's `stopped` map, which is what the abort limit
+    /// bounds. A stream already acknowledged in full is not reset.
+    fn reset_finished(&mut self) {
+        if self.send.reset(reset_code::SENDER_ABORTED.into()).is_ok() {
+            self.aborts.record();
+        }
+    }
+
     /// End the stream and wait until the peer has acknowledged every byte or
     /// stopped it.
     async fn finish(mut self) -> Result<(), QuicSendError> {
@@ -2139,11 +2151,12 @@ impl Drop for Outgoing {
     /// that acknowledges other traffic while withholding some acknowledgements
     /// could keep any number of those waiting, so at most
     /// [`ACK_WAITS_WITHOUT_PERMIT`] wait per path; past that the epoch is
-    /// released at once and counted ([`QuicSendEvent::AckWaitReleased`]). A
-    /// released epoch lets a send window lowered since that stream opened
-    /// leave the charge while quinn may still hold the stream's one packet:
-    /// accepted, as the window it held is charged for as long as any other
-    /// stream of its epoch is open.
+    /// released at once and counted ([`QuicSendEvent::AckWaitReleased`]), and
+    /// the stream is reset, which makes quinn discard its unacknowledged data
+    /// ([`Self::reset_finished`]): releasing the epoch alone would let a send
+    /// window lowered since the stream opened leave the charge while quinn
+    /// still held the packet. The Short may then not arrive; it reported
+    /// `MaybeDelivered` already, so its sender does not count on it.
     fn drop(&mut self) {
         self.reset(reset_code::SENDER_ABORTED);
         if !self.awaiting_ack {
@@ -2160,8 +2173,12 @@ impl Drop for Outgoing {
         let waiting = if slot.is_none() {
             match self.ack_waits.as_ref().map(AckWaits::enter) {
                 Some(Some(waiting)) => Some(waiting),
-                // Past the bound: the epoch goes now.
-                Some(None) => return,
+                // Past the bound: the epoch goes now, and so does the
+                // stream's data, so the release matches the memory freed.
+                Some(None) => {
+                    self.reset_finished();
+                    return;
+                }
                 None => None,
             }
         } else {

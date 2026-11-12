@@ -6466,7 +6466,8 @@ fn a_one_packet_short_holds_its_send_epoch_until_the_ack() {
 
 /// A peer that never acknowledges cancelled one-packet Shorts cannot make
 /// the path keep a task per Short: past the bound, a Short's epoch goes at
-/// once and is counted. Without the bound every one of them waits.
+/// once and is counted, and its stream is reset so quinn drops its data with
+/// it. Without the bound every one of them waits.
 #[test]
 fn cancelled_one_packet_shorts_wait_for_their_ack_only_up_to_the_bound() {
     const BOUND: usize = 4;
@@ -6490,6 +6491,7 @@ fn cancelled_one_packet_shorts_wait_for_their_ack_only_up_to_the_bound() {
             })
             .await;
         assert!(matches!(first, BoundedSend::Sent), "{first:?}");
+        let resets_before = p.a.connection().inner().stats().frame_tx.reset_stream;
         let _silenced = DropFrom::new(network, &[p.pair.b_addr]);
         let (a, time) = (p.a.clone(), p.time());
         let (outcomes, waiting, holders, released) = p
@@ -6522,6 +6524,19 @@ fn cancelled_one_packet_shorts_wait_for_their_ack_only_up_to_the_bound() {
         assert_eq!(waiting, BOUND, "at most the bound wait");
         assert_eq!(holders, BOUND, "the rest released their epochs at once");
         assert_eq!(released, (SHORTS - BOUND) as u64, "each release is counted");
+        // quinn discards a stream's unacknowledged data when it resets it, and
+        // sends a RESET_STREAM for it.
+        let resets = p.a.connection().inner().stats().frame_tx.reset_stream - resets_before;
+        assert_eq!(
+            resets,
+            (SHORTS - BOUND) as u64,
+            "each released Short's stream was reset, so its data went with its epoch"
+        );
+        assert_eq!(
+            p.a.send_aborts(),
+            (SHORTS - BOUND) as u64,
+            "each reset counts toward the abort limit, for its stopped-map entry"
+        );
     })
 }
 

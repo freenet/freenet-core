@@ -843,3 +843,70 @@ fn a_sender_the_window_does_not_hold_back_asks_no_room() {
         "a sender with little to send squeezed another"
     );
 }
+
+/// As [`a_later_sender_reaches_its_share`], with a stream of the first
+/// sender open across the squeeze: its old send window stays charged while
+/// the stream is open, so the second sender waits for that room, with the
+/// budget held throughout, and reaches its share once the stream ends.
+#[test]
+fn a_later_sender_reaches_its_share_once_the_squeezed_streams_end() {
+    let total = 12 << 20;
+    let budget = QuicBudget::new(total, FLOOR, counters());
+    let first = conn(&budget, 0);
+    let mut at = 10 * MS;
+    for _ in 0..12 {
+        send_window(&first, at);
+        at += 10 * MS;
+    }
+    let stream = first.meter.send_epoch().expect("an epoch");
+    let grown = first.meter.charge();
+    assert!(
+        grown > floor_grant(FLOOR) + total / 2,
+        "premise: the first sender took more than a share, {grown}"
+    );
+    let second = conn(&budget, at);
+    let run = |rounds: usize, at: &mut u64| {
+        for _ in 0..rounds {
+            send_window(&second, *at + MS);
+            send_window(&first, *at + 2 * MS);
+            assert!(
+                budget.running_total() <= total,
+                "{} over {total}",
+                budget.running_total()
+            );
+            *at += 10 * MS;
+        }
+    };
+    run(40, &mut at);
+    assert!(
+        first
+            .fake
+            .send
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|w| *w < MAX_WINDOW_BYTES),
+        "premise: the first sender was asked to shrink"
+    );
+    assert_eq!(
+        first.meter.charge(),
+        grown,
+        "the old window stays charged while the stream is open"
+    );
+    let share = floor_grant(FLOOR) + total / 2;
+    assert!(
+        second.meter.charge() + 16 * 1024 < share,
+        "premise: the open stream held the room, the second has {}",
+        second.meter.charge()
+    );
+    drop(stream);
+    run(40, &mut at);
+    for (name, path) in [("first", &first), ("second", &second)] {
+        let charge = path.meter.charge();
+        assert!(charge <= share, "{name}: {charge} over its share {share}");
+        assert!(
+            charge + 16 * 1024 >= share,
+            "{name}: {charge} short of its share {share}"
+        );
+    }
+}

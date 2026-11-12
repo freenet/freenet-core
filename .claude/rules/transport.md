@@ -1960,8 +1960,10 @@ Sending (QuicPath::send_short_bounded / send_stream_bounded /
   connection). A one-packet Short holds no permit but its send epoch, and
   waits the same way, at most ACK_WAITS_WITHOUT_PERMIT (64) per path; past
   that its epoch is released at once and counted
-  (quic_data_event_ack_wait_released), so a peer withholding some
-  acknowledgements cannot make the path hold a task per Short. A streamed send past the limit waits for a permit without
+  (quic_data_event_ack_wait_released) and its stream is reset, so quinn
+  discards the unacknowledged packet with the epoch (the reset counts toward
+  SEND_ABORT_LIMIT, for its stopped-map entry), and a peer withholding some
+  acknowledgements cannot make the path hold a task or data per Short. A streamed send past the limit waits for a permit without
   opening a stream, and that wait races connection.closed(), because the
   semaphore never closes. One-packet shorts and control sends take no
   permit. The limit divides as STREAMED_SEND_LIMIT 48 + UNANNOUNCED_CREDIT_SLACK 8 +
