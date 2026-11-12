@@ -366,6 +366,10 @@ pub(in crate::transport) enum Outcome {
     /// [`Outcome::Fallback`] of this cause: that fallback came with the
     /// session's end. Recorded once per such fallback, at the session end.
     ChurnedFallback(FallbackCause),
+    /// The [`Outcome::Fallback`] of this cause, recorded in the same step, was
+    /// of a path that carried data: active with both data bits, or rechecked
+    /// after it was. Recorded with every such fallback, after it.
+    CarryingFallback(FallbackCause),
 }
 
 /// Why a path ended.
@@ -436,6 +440,8 @@ enum State {
     Rechecking {
         deadline: Duration,
         active_since: Option<Duration>,
+        /// The path carried data when it ended ([`UpgradeMachine::carries_data`]).
+        carried: bool,
     },
     /// Final: the endpoint or the session ended, the policy refuses, the keys
     /// are equal, or the peer is below the version floor.
@@ -694,6 +700,17 @@ impl UpgradeMachine {
         }
     }
 
+    /// Whether the path this machine holds carried data: active with both data
+    /// bits, or waiting out a recheck after it did.
+    fn was_carrying(&self) -> bool {
+        match self.state {
+            State::Rechecking { carried, .. } => carried,
+            State::Idle | State::Setup { .. } | State::Active { .. } | State::Off => {
+                self.carries_data()
+            }
+        }
+    }
+
     /// Take one event.
     pub(in crate::transport) fn step(&mut self, cx: Inputs<'_>, event: Event) -> Vec<Action> {
         let churned = if matches!(event, Event::SessionEnded) {
@@ -701,12 +718,18 @@ impl UpgradeMachine {
         } else {
             Vec::new()
         };
+        let carried = self.was_carrying();
         let mut actions = self.step_inner(cx, event);
+        let mut carrying = Vec::new();
         for action in &actions {
             if let Action::Record(Outcome::Fallback(cause)) = action {
                 self.note_fallback(cx.now, *cause);
+                if carried {
+                    carrying.push(Action::Record(Outcome::CarryingFallback(*cause)));
+                }
             }
         }
+        actions.extend(carrying);
         actions.extend(
             churned
                 .into_iter()
@@ -865,6 +888,7 @@ impl UpgradeMachine {
             State::Rechecking {
                 deadline,
                 active_since,
+                carried: _,
             } => {
                 if cx.now < deadline {
                     return Vec::new();
@@ -1212,10 +1236,12 @@ impl UpgradeMachine {
                 ]
             }
             Verdict::Recheck => {
+                let carried = self.carries_data();
                 let active_since = self.leave_attempt();
                 self.state = State::Rechecking {
                     deadline: cx.now + RECHECK_TIMEOUT,
                     active_since,
+                    carried,
                 };
                 vec![Action::TearDown {
                     attempt,

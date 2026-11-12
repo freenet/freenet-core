@@ -357,6 +357,14 @@ impl QuicPolicy {
             && matches!(share, DataShare::Ramp { .. })
     }
 
+    /// The share this node applies to its pairs' data bit, for telemetry
+    /// (`quic_ramp_share_pct`): the policy's share in `prefer` where the build
+    /// lets the bit be set, else `None` (reported as 0).
+    pub(crate) fn advertised_share(&self) -> Option<DataShare> {
+        (data_bit_allowed(cfg!(any(test, feature = "testing"))) && self.mode == QuicMode::Prefer)
+            .then_some(self.share)
+    }
+
     /// [`Self::bit_may_come_on_with`] with the policy's share.
     pub(in crate::transport) fn bit_may_come_on(&self) -> bool {
         self.bit_may_come_on_with(self.share)
@@ -799,6 +807,23 @@ mod tests {
                     "{mode} {percent:?}"
                 );
             }
+        }
+    }
+
+    /// The share reported as `quic_ramp_share_pct`: the policy's share in
+    /// `prefer`, none in `shadow` or `off`.
+    #[test]
+    fn the_advertised_share_is_the_share_only_in_prefer() {
+        for (mode, want) in [
+            ("prefer", Some(DataShare::Fixed(40))),
+            ("shadow", None),
+            ("off", None),
+        ] {
+            let mut config = config(mode, None);
+            config.quic_data_percent = Some("40".to_string());
+            let up = QuicAvailabilityWatch::for_test(QuicAvailability::Up).1;
+            let policy = QuicPolicy::new(&config, BreakerOutcome::NotConsulted, up);
+            assert_eq!(policy.advertised_share(), want, "{mode}");
         }
     }
 
