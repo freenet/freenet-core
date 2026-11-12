@@ -7305,3 +7305,101 @@ fn a_waiting_one_packet_short_is_not_charged() {
         assert!(key.is_none(), "it carries no charge");
     })
 }
+
+/// The interplay the `watch_closes` tests leave out, with the watch on: a send
+/// on a path whose peer is dark from the start (`b`'s packets stop reaching
+/// `a`: nothing is acknowledged and no credit returns) times out at its own
+/// gap. That comes inside the progress window of the setup's acknowledgements,
+/// so it neither counts nor makes the path suspect; the watch closes the path
+/// within its window, so neither the stall count nor suspect routing is what
+/// ends a dark path.
+#[test]
+fn a_dark_path_is_closed_by_the_watch_not_by_its_send_timeouts() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let network = "quic-path-dark-watch-after";
+        let p = paths(network, 240, QuicPathLimits::DEFAULT).await;
+        let _dark = DropFrom::new(network, &[p.pair.b_addr]);
+        let cut_at = p.time().now();
+        let (a, time) = (p.a.clone(), p.time());
+        let body = over_window();
+        let deadlines = SendDeadlines::stream(body.len() as u64);
+        let outcome = p
+            .drive(async move {
+                a.send_stream_bounded(&time, deadlines, StreamId::next(), None, body, None)
+                    .await
+            })
+            .await;
+        assert!(
+            matches!(outcome, BoundedSend::Failed(SendFailure::TimedOut)),
+            "the send's gap comes first: {outcome:?}"
+        );
+        let now = p.time().now_nanos();
+        p.a.settle(SendKind::Stream, &outcome, false, now);
+        assert_eq!(p.a.stall_state().0, 0, "inside the progress window");
+        assert!(!p.a.is_suspect());
+        let (conn, time) = (p.a.connection().inner().clone(), p.time());
+        let closed_at = p
+            .drive(async move {
+                conn.closed().await;
+                time.now()
+            })
+            .await;
+        assert!(
+            closed_at - cut_at <= recycle::ACK_WATCH_WINDOW + 2 * recycle::ACK_WATCH_TICK,
+            "the watch closed it {:?} after the cut",
+            closed_at - cut_at
+        );
+        assert!(
+            !recycle::stalls_to(p.pair.b_addr).is_empty(),
+            "the watch closed the path"
+        );
+        assert_eq!(
+            p.a.stats().send_event_count(QuicSendEvent::StalledClosed),
+            0,
+            "not the stall count"
+        );
+    })
+}
+
+/// The interplay for the receive side, with the watch on: `a`'s datagrams stop
+/// reaching `b` mid-stream, so `a`'s watch closes the path within its window,
+/// well before `b` would evict the stream idle (`b` never hears the close,
+/// which is lost with the rest, and ends the stream at its own timeouts).
+#[test]
+fn a_path_dark_mid_stream_is_closed_before_the_receiver_evicts_it_idle() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let network = "quic-path-dark-before-idle";
+        let p = paths(network, 241, QuicPathLimits::DEFAULT).await;
+        let settle = p.time();
+        p.drive(async move { settle.sleep(Duration::from_millis(200)).await })
+            .await;
+        let _dark = DropFrom::new(network, &[p.pair.a_addr]);
+        let (a, id) = (p.a.clone(), StreamId::next());
+        let sender = tokio::spawn(async move { a.send_stream(id, None, over_window()).await });
+        let (time, conn) = (p.time(), p.a.connection().inner().clone());
+        let closed_at = p
+            .drive(async move {
+                conn.closed().await;
+                time.now()
+            })
+            .await;
+        assert!(
+            closed_at < streaming_handle_idle_timeout(),
+            "closed at {closed_at:?}, before the idle timeout"
+        );
+        // `a`'s send is blocked on `b`'s credit, which stops with nothing
+        // reaching `b`, so the credit rule (two intervals) comes before the
+        // dark-path window.
+        assert_eq!(
+            recycle::stalls_to(p.pair.b_addr),
+            vec![recycle::Stall::CreditStarved]
+        );
+        sender.abort();
+        assert_eq!(
+            p.b.stats().shared_count(InboundStreamOutcome::EvictedIdle),
+            0
+        );
+    })
+}
