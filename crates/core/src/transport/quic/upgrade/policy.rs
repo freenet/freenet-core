@@ -581,9 +581,6 @@ mod tests {
         );
     }
 
-    /// The data bit needs `prefer`, the peer in the slice, and the key or the
-    /// release's share to say so. `shadow` never sets it, whatever the key says,
-    /// and at this release's share `prefer` does not either.
     /// `may_carry_data` (what lowers the connection limit) holds exactly when
     /// `own_caps` can give some pair the data bit, so the two rules cannot
     /// drift: for each mode and share, over 400 pairs (at 5% the chance that
@@ -617,6 +614,9 @@ mod tests {
         }
     }
 
+    /// The data bit needs `prefer`, the peer in the slice, and the key or the
+    /// release's share to say so. `shadow` never sets it, whatever the key says,
+    /// and at this release's share `prefer` does not either.
     #[test]
     fn own_caps_needs_prefer_and_the_peer_in_the_slice() {
         use crate::transport::TransportKeypair;

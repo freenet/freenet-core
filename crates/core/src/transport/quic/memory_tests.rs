@@ -419,7 +419,11 @@ async fn measure_reset_streams(network: &str, streams: usize, poll_stopped: bool
 /// the one `Outgoing`'s drop leaves for a send waiting for its
 /// acknowledgement: the boxed, polled `stopped()` future (with quinn's
 /// `stopped` map entry it registers), an optional permit and the send-window
-/// epoch, awaited in a spawned task. The streams stay open (not finished), so
+/// epoch, awaited in a spawned task.
+/// The real task also holds the path's `AckWait` guard
+/// (`Option<AckWait>`, an `Arc` and a few words), left out here; it adds at
+/// most 16 B to the future, inside the 384 B charge against the 296 B
+/// measured. The streams stay open (not finished), so
 /// `stopped()` never resolves and no retransmission runs while it is measured.
 async fn measure_ack_waits(network: &str, streams: usize, ack_wait_tasks: bool) -> Live {
     use futures::FutureExt;
@@ -1088,10 +1092,17 @@ fn the_connection_cap_keeps_quic_within_an_eighth_of_memory() {
     }
 }
 
-/// A shadow path's charge is derived from what it grants the peer, each input
-/// pinned to the shadow configuration: raising a shadow grant (uni streams, the
-/// initial window, the gap cap, the control channel) or this node's control
-/// sends per path fails here until the charge is re-derived.
+/// A shadow path's charge is derived from what it grants the peer, each input's
+/// value pinned here: raising a shadow grant (uni streams, the initial window,
+/// the gap cap, the control channel) or this node's control sends per path
+/// fails here until the charge is re-derived. These are constants; the
+/// behaviour they stand for is pinned by
+/// `path::tests::only_a_path_that_takes_data_lets_its_peer_open_streams` (a
+/// shadow peer opens exactly `INITIAL_UNI_STREAMS`),
+/// `tests::endpoint_config_pins_every_value` (the transport parameters),
+/// `path::tests::refused_data_readers_stay_within_the_shadow_stream_grant`
+/// (refused readers stay within the grant) and
+/// `upgrade::machine::tests::control_frames_are_sent_once_per_path`.
 #[test]
 fn a_shadow_path_is_charged_for_what_it_grants() {
     use super::budget::{GAP_BYTES, MIN_GAPS_PER_CONNECTION};
