@@ -1724,7 +1724,11 @@ ACK-only tail, and its own single control send: upgrade::machine::CONTROL_SENDS_
 `a_shadow_path_is_charged_for_what_it_grants` pins each input). At the
 default 200 that is about 95 MiB. A node set to more connections with data
 off holds proportionally more (1,000: about 475 MiB); that is stated, not
-clamped. The aggregate test sums the larger of the two cases
+clamped. Below about 760 MiB the data-off bound is above an eighth of memory,
+and the aggregate is checked from 1 GiB up: at 512 MiB with data off,
+caches + hosting + 200 shadow paths come to about 431 MB against 75% of
+memory (403 MB). Stated, not clamped; lowering connections with data off is
+a separate decision. The aggregate test sums the larger of the two cases
 (`quic_memory_ceiling`: data on at the cap, or shadow at 200) with the caches
 and the hosting budget in
 `declared_caches_plus_hosting_budget_leave_room_for_the_runtime`, within 75%.
@@ -2606,7 +2610,9 @@ QUIC send route (#5940 e5b-6, quic/upgrade/data_route.rs,
   NOT_ACCEPTING_DATA and closes the path with DOWNGRADE REFUSAL_CLOSE_DELAY (2 s)
   later (closed_refusing_data, a WARN once per path). The delay lets the stops
   reach the sender first: a sender that sees the close before a stream's stop
-  drops the stream, where the stop sends it on UDP. Without the close, a Short of
+  drops the stream, where the stop sends it on UDP. The receive task arms the
+  one delayed close per path, and refused readers stay within the stream grant
+  (refused_data_readers_stay_within_the_shadow_stream_grant). Without the close, a Short of
   one packet is acknowledged before its stop arrives, so its sender reads Sent,
   never clears send_data and loses every short on the path. The pair then
   negotiates again after the normal backoff. Residual: a one-packet short sent
