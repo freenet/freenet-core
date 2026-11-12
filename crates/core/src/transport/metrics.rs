@@ -3099,7 +3099,8 @@ pub(crate) enum QuicEndpointState {
     OffBind = 5,
     /// The crash-loop breaker keeps QUIC off for this run.
     OffBreaker = 6,
-    /// The endpoint's driver ended while the node held it. Final.
+    /// The endpoint died while the node held it: its driver ended, or its
+    /// socket adapter caught a panic (`quic::liveness`). Final.
     Died = 7,
 }
 
