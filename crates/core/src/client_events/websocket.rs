@@ -3802,7 +3802,15 @@ mod tests {
             tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
         >;
 
-        async fn serve(hosted: bool) -> (u16, crate::server::client_api::HttpClientApi) {
+        /// Serve the client API. The receiver yields the attested origin
+        /// contract of every GET that reaches the node side.
+        async fn serve(
+            hosted: bool,
+        ) -> (
+            u16,
+            crate::server::client_api::HttpClientApi,
+            tokio::sync::mpsc::UnboundedReceiver<Option<ContractInstanceId>>,
+        ) {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let port = listener.local_addr().unwrap().port();
             let config = crate::config::WebsocketApiConfig {
@@ -3815,9 +3823,24 @@ mod tests {
                 crate::server::serve_client_api_with_listener_for_unit_test(config, listener)
                     .await
                     .unwrap();
-            // Assign connection ids, as the node's client loop would.
-            tokio::spawn(async move { while proxy.recv().await.is_ok() {} });
-            (port, gw)
+            // Assign connection ids, as the node's client loop would, and
+            // report the attested origin of each GET (the probe request; the
+            // synthetic Disconnect every closed connection sends is skipped).
+            let (opened_tx, opened_rx) = tokio::sync::mpsc::unbounded_channel();
+            tokio::spawn(async move {
+                while let Ok(req) = proxy.recv().await {
+                    if matches!(
+                        *req.request,
+                        ClientRequest::ContractOp(ContractRequest::Get { .. })
+                    ) && opened_tx.send(req.origin_contract).is_err()
+                    {
+                        // The test stopped listening; keep serving so
+                        // connection ids are still assigned.
+                        continue;
+                    }
+                }
+            });
+            (port, gw, opened_rx)
         }
 
         /// Open a client-API WebSocket. `token` goes in the `Authorization`
@@ -3896,7 +3919,7 @@ mod tests {
             close_frame(&mut client).await.map(|(code, _)| code)
         }
 
-        let (port, gw) = serve(false).await;
+        let (port, gw, mut opened) = serve(false).await;
         let local = format!("127.0.0.1:{port}");
         // No node behind the router: the grant store is unavailable.
         assert_eq!(
@@ -3938,15 +3961,34 @@ mod tests {
             )
             .unwrap()
         );
+        let app = ContractInstanceId::new([4u8; 32]);
         let mut client = connect(port, &local, token.expose(), true, &[], "").await;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        while state.live_connections(token.hash()) == 0 {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the connection registered under its grant"
-            );
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        // Revoke only once the connection is open: a request from it has
+        // reached the node carrying the granted app. The live registration
+        // alone is not that signal, because it is made BEFORE the grant is
+        // read (see `resolve_connection`), so a revocation in that window
+        // refuses the upgrade as an unknown grant instead.
+        let probe = bincode::serialize(&ClientRequest::ContractOp(ContractRequest::Get {
+            key: ContractInstanceId::new([7u8; 32]),
+            return_contract_code: false,
+            subscribe: false,
+            blocking_subscribe: false,
+        }))
+        .unwrap();
+        client
+            .send(tokio_tungstenite::tungstenite::Message::Binary(
+                probe.into(),
+            ))
+            .await
+            .expect("send a request on the granted connection");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(10), opened.recv())
+                .await
+                .expect("timed out waiting for the request to reach the node"),
+            Some(Some(app)),
+            "a request on the granted connection carries the granted app"
+        );
+        assert_eq!(state.live_connections(token.hash()), 1);
         assert!(state.revoke(caps.clone(), token.hash()).await.unwrap());
         assert_eq!(
             close_frame(&mut client).await,
@@ -3960,6 +4002,78 @@ mod tests {
             close_code_with(port, &local, token.expose()).await,
             Some(AUTH_TOKEN_INVALID_CLOSE_CODE)
         );
+
+        // A revocation between the connection's registration and its grant
+        // read: the read misses the deleted grant and the upgrade is refused
+        // as an unknown grant (4401, grant wording), never opened. This is
+        // the window an early readiness signal let the revocation above fall
+        // into, giving `AUTH_TOKEN_INVALID` instead of "app grant revoked".
+        let token = crate::contract::delegate_capabilities::GrantToken::generate();
+        assert!(
+            caps.create_native_grant(
+                token.hash(),
+                crate::contract::delegate_capabilities::AppIdentity::WebApp(app),
+                "test",
+            )
+            .unwrap()
+        );
+        let release_read = state.hold_next_read();
+        let connecting = tokio::spawn({
+            let local = local.clone();
+            let token = token.expose().to_string();
+            async move {
+                let mut client = connect(port, &local, &token, true, &[], "").await;
+                refusal(&mut client).await
+            }
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while state.live_connections(token.hash()) == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the connection registered under its grant"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(state.revoke(caps.clone(), token.hash()).await.unwrap());
+        release_read
+            .send(())
+            .expect("the grant read was held at the gate until now");
+        let (error, close) = connecting.await.unwrap();
+        assert_eq!(
+            close,
+            Some((
+                AUTH_TOKEN_INVALID_CLOSE_CODE,
+                AUTH_TOKEN_INVALID_ERROR.to_string()
+            ))
+        );
+        assert!(
+            error.contains("the grant was revoked or never issued"),
+            "refused as an unknown grant: {error}"
+        );
+        assert_eq!(opened.try_recv().ok(), None, "the connection never opened");
+
+        /// The error message the node sends before closing, and the close.
+        async fn refusal(client: &mut Client) -> (String, Option<(u16, String)>) {
+            let error = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    #[allow(
+                        clippy::wildcard_enum_match_arm,
+                        reason = "only the binary error frame matters here"
+                    )]
+                    match client.next().await.expect("socket open").expect("ws frame") {
+                        tokio_tungstenite::tungstenite::Message::Binary(b) => {
+                            let response: Result<HostResponse, ClientError> =
+                                bincode::deserialize(&b).expect("a native response");
+                            return response.expect_err("a refusal").to_string();
+                        }
+                        _ => continue,
+                    }
+                }
+            })
+            .await
+            .expect("timed out waiting for the error frame");
+            (error, close_frame(client).await)
+        }
         async fn close_code_with(port: u16, host: &str, token: &str) -> Option<u16> {
             let mut client = connect(port, host, token, true, &[], "").await;
             close_frame(&mut client).await.map(|(code, _)| code)
@@ -3973,7 +4087,7 @@ mod tests {
         // upgrade is refused (403) before the gate runs, and without a user
         // token a hosted node refuses the connection outright. The hosted
         // branch on its own is pinned by `grant_gate_decision`.
-        let (hosted_port, _hosted_gw) = serve(true).await;
+        let (hosted_port, _hosted_gw, _hosted_opened) = serve(true).await;
         let hosted_local = format!("127.0.0.1:{hosted_port}");
         assert_eq!(
             close_code(
