@@ -79,6 +79,23 @@ impl StagedPeak {
     }
 }
 
+/// Delay every datagram on `network` by `one_way`, before the pair is built,
+/// so the handshake already sees the path's round trip. The loss gate keeps
+/// the smallest RTT it has seen as the path's base: a pair connected on a
+/// zero-delay link and delayed afterwards reads every later sample as a full
+/// round trip of queue, and passes every loss to Cubic.
+fn delay_from_the_start(network: &str, one_way: Duration) {
+    use crate::transport::in_memory_socket::{
+        PacketDeliveryDecision, set_packet_delivery_callback,
+    };
+    set_packet_delivery_callback(
+        network,
+        Some(Arc::new(move |_, _, _, _| {
+            PacketDeliveryDecision::DelayedDelivery(one_way)
+        })),
+    );
+}
+
 /// Streams each side sends in [`honest_bulk_both_ways`], all at once.
 const BULK_STREAMS: usize = 6;
 /// The size of each, several receive windows at the floor.
@@ -101,6 +118,7 @@ async fn honest_bulk_both_ways(
         a: Some(node_budget(leaked_counters())),
         b: Some(node_budget(leaked_counters())),
     };
+    delay_from_the_start(network, one_way);
     let mut p = paths_metered(network, subnet, windows).await;
     let loss = seeded_loss_from(network, loss_percent, seed, Some(one_way));
     let (a, b, time) = (p.a.clone(), p.b.clone(), p.time());
@@ -268,6 +286,7 @@ async fn first_packet_lost_on_a_grown_window(
         a: Some(node_budget(leaked_counters())),
         b: Some(node_budget(counters)),
     };
+    delay_from_the_start(network, one_way);
     let mut p = paths_metered(network, subnet, windows).await;
     let a_addr = p.pair.a_addr;
     let to_drop = Arc::new(AtomicUsize::new(0));
