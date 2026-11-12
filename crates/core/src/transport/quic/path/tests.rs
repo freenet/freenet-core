@@ -3192,6 +3192,8 @@ struct Scripted {
     b_addr: SocketAddr,
     keep_sending: Arc<std::sync::atomic::AtomicBool>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// Where `a`'s path counts, its own.
+    counters: &'static crate::transport::metrics::QuicDataCounters,
 }
 
 impl Drop for Scripted {
@@ -3343,10 +3345,14 @@ impl Scripted {
             endpoint.connect(b_addr, &b_key).await.expect("connect")
         })
         .await;
-        let limits = if data {
-            QuicPathLimits::DEFAULT
-        } else {
-            QuicPathLimits::SHADOW
+        let counters = leaked_counters();
+        let limits = QuicPathLimits {
+            counters: Some(counters),
+            ..if data {
+                QuicPathLimits::DEFAULT
+            } else {
+                QuicPathLimits::SHADOW
+            }
         };
         let (a, a_in) = QuicPath::with_limits(conn, time.clone(), limits);
         Self {
@@ -3359,7 +3365,13 @@ impl Scripted {
             b_addr,
             keep_sending,
             tasks,
+            counters,
         }
+    }
+
+    /// `a`'s dark episodes so far, by `quic_dark_episode_<label>`.
+    fn dark_episodes(&self) -> Vec<u64> {
+        self.counters.snapshot(false).dark_episodes
     }
 
     /// A sample of `a`'s connection, as the acknowledgement watch takes it.
@@ -3550,11 +3562,16 @@ fn a_path_dark_in_both_directions_is_closed_as_dark() {
     })
 }
 
-/// On a path that carries no data (every path while no release sends data on
-/// QUIC) the dark-path rule only counts: an outage of 30 s in both directions,
-/// with a control frame sent into it, does not close the path, and the spell
-/// is counted when it ends. quinn's idle timeout (here none) and the M6 rule
-/// still apply.
+/// The dark-path rule closes only a path that carries data. On one that
+/// does not (every path while no release sends data on QUIC), a dark spell
+/// in both directions, with a control frame sent into it, does not close
+/// the path, and the spell is counted when it ends. Its length is read up
+/// to when the peer is heard from again, which waits for quinn's
+/// backed-off probes after the outage ends, so it reads longer than the
+/// outage: here (no idle timeout) a 30 s outage lands below 120 s and a
+/// 100 s one at 120 s or more. With quinn's 120 s idle timeout, an outage
+/// long enough that the backoff passes it ends the path and counts
+/// `unrecovered`. The M6 rule still applies.
 #[test]
 fn a_path_without_data_is_not_closed_by_a_dark_spell() {
     bounded(|| async move {
@@ -3562,28 +3579,44 @@ fn a_path_without_data_is_not_closed_by_a_dark_spell() {
         let network = "quic-path-ack-watch-dark-no-data";
         let mut s = Scripted::connect_without_data(network).await;
         s.wait(Duration::from_secs(1)).await;
-        let dark = DropFrom::new(network, &[s.a_addr, s.b_addr]);
-        let (a, time) = (s.a.clone(), s.time.clone());
-        s.tasks.push(tokio::spawn(async move {
-            a.send_control_bounded(
-                &time,
-                Duration::from_secs(60),
-                QuicControl::Ready {
-                    attempt: 1,
-                    caps: 0,
-                },
-            )
-            .await;
-        }));
-        s.wait(Duration::from_secs(30)).await;
-        drop(dark);
-        s.wait(Duration::from_secs(20)).await;
-        assert!(
-            s.a.connection().inner().close_reason().is_none(),
-            "{:?}, {:?}",
-            s.a.connection().inner().close_reason(),
-            recycle::stalls_to(s.b_addr)
-        );
+        let mut expected = vec![0u64; 8];
+        for (spell, bucket) in [(30, 4), (100, 5)] {
+            let dark = DropFrom::new(network, &[s.a_addr, s.b_addr]);
+            let (a, time) = (s.a.clone(), s.time.clone());
+            s.tasks.push(tokio::spawn(async move {
+                a.send_control_bounded(
+                    &time,
+                    Duration::from_secs(60),
+                    QuicControl::Ready {
+                        attempt: 1,
+                        caps: 0,
+                    },
+                )
+                .await;
+            }));
+            s.wait(Duration::from_secs(spell)).await;
+            drop(dark);
+            // Counted once the peer is heard from again, which waits for
+            // quinn's backed-off probes after the outage ends.
+            let ended = s.time.now_nanos();
+            let mut waited = 0;
+            while s.dark_episodes().iter().sum::<u64>() < expected.iter().sum::<u64>() + 1 {
+                assert!(waited < 300, "the {spell} s spell was never counted");
+                s.wait(Duration::from_secs(1)).await;
+                waited += 1;
+            }
+            let read =
+                Duration::from_nanos(s.time.now_nanos() - ended) + Duration::from_secs(spell);
+            assert!(read > Duration::from_secs(spell), "{read:?}");
+            assert!(
+                s.a.connection().inner().close_reason().is_none(),
+                "{:?}, {:?}",
+                s.a.connection().inner().close_reason(),
+                recycle::stalls_to(s.b_addr)
+            );
+            expected[bucket] += 1;
+            assert_eq!(s.dark_episodes(), expected, "after a {spell} s spell");
+        }
         assert!(recycle::stalls_to(s.b_addr).is_empty());
     })
 }

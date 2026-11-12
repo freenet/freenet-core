@@ -1459,7 +1459,12 @@ a test passes its own; tests read their own, never the global).
   outstanding, nothing acknowledged, nothing heard) by how they ended. The
   dark-path rule closes only a path that carries data (QuicPath::enable_data);
   on every other path (all of them while QUIC_DATA_PERCENT is 0) it only
-  counts, so the field shows how long real dark spells last. The dark
+  counts, so the field shows how long real dark spells last. A spell is read
+  up to when the peer is next heard from, which waits for quinn's backed-off
+  probes after the outage ends, so it reads longer than the outage (in
+  a_path_without_data_is_not_closed_by_a_dark_spell a 30 s outage read about
+  45 s and a 100 s one about 200 s), and an outage whose backoff runs past
+  quinn's 120 s idle timeout ends the path and counts `unrecovered`. The dark
   threshold (the 10 s window) is to be revisited from these numbers before the
   data ramp passes 5%.
   quic_gate_loss_<queue|share|persistent|ecn|no_sample|ignored> (congestion
