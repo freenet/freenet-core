@@ -178,9 +178,14 @@ pub(crate) fn next_step(kind: SendKind, outcome: &BoundedSend) -> (NextStep, Qui
 /// (`pacer` module), so it never counts toward the stall close. Nor is one
 /// that ran out before its stream opened: it waited for its source, for one
 /// of this side's permits or for the peer's stream credit, which is
-/// back-pressure, not a stall. A path whose permits are all held by sends
-/// that are not acknowledged is closed by its acknowledgement watch
-/// (`recycle::AckWatch`).
+/// back-pressure, not a stall. What ends the cases these timeouts no longer
+/// count: a path whose sends nothing acknowledges is closed by its
+/// acknowledgement watch's dark-path rule (`recycle::AckWatch`); a peer that
+/// acknowledges other traffic but never a stream's end has the stream reset
+/// at its ack wait, counted as an abort toward `recycle::SEND_ABORT_LIMIT`
+/// (`bounded::SendDeadlines::ack_wait`); and a peer that withholds its
+/// stream limit is closed by the stream-credit rule
+/// (`recycle::StreamCreditWatch`).
 fn timed_out(outcome: &BoundedSend) -> bool {
     match outcome {
         BoundedSend::MaybeDelivered(MaybeDelivered::TimedOut)
@@ -228,9 +233,8 @@ pub(crate) struct StallVerdict {
 ///
 /// A timeout with the stream open counts, `MaybeDelivered(TimedOut)` included;
 /// one before the stream opened does not ([`timed_out`]: a wait for a permit or
-/// for the peer's stream credit is back-pressure). A path whose permits are all
-/// held by sends stuck waiting for acknowledgements is closed by the
-/// acknowledgement watch's dark-path rule (`recycle::AckWatch`). A timeout counts only when no packet on the connection
+/// for the peer's stream credit is back-pressure; [`timed_out`] says what ends
+/// those cases instead). A timeout counts only when no packet on the connection
 /// was newly acknowledged within [`STALL_PROGRESS_WINDOW`] (quinn's acknowledged
 /// packets, read from `recycle::CappedCubic`). So a busy relay whose 48 permits
 /// are held by transfers that are being acknowledged, or a receiver whose consumer

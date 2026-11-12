@@ -37,6 +37,26 @@
 //!    that sends ACK frames for none of this side's data; a peer that
 //!    acknowledges something within each window is never closed by it.
 //!
+//! The same watch runs three liveness rules (#5940 PR 4), each also closing
+//! with [`close_code::PEER_NOT_ACKNOWLEDGING`] and recorded as a [`Stall`]:
+//!
+//! 3. **Dark** ([`Stall::Dark`]): this side's packets outstanding at every
+//!    sample for the window, nothing acknowledged and nothing heard from the
+//!    peer, and a send made a window after the spell began unanswered for
+//!    its grace (three round trips, from one tick up to [`DARK_GRACE_MAX`]).
+//!    quinn sends again after an outage only at its next backed-off probe,
+//!    so without that probe a spell shorter than the window could still
+//!    close the path ([`dark_close_bound`] gives the latest close). It closes
+//!    only a path that carries data; every path counts its dark episodes.
+//! 4. **Credit-starved** ([`Stall::CreditStarved`], [`CreditWatch`]): sends
+//!    waited on the peer's flow-control credit, seen either with
+//!    application-limited acknowledgements or with nothing outstanding, and
+//!    the peer acknowledged under its floor rate ([`credit_floor_rate`]).
+//! 5. **Stream credit withheld** ([`Stall::StreamCreditWithheld`],
+//!    [`StreamCreditWatch`]): sends waited for the peer's stream limit for
+//!    [`STREAM_CREDIT_WINDOW`] after enough of this side's streams were
+//!    wholly acknowledged that an honest peer would have raised it.
+//!
 //! What "acknowledged" is measured with. quinn's `ConnectionStats` has no
 //! counter of packets the peer newly acknowledged: `frame_rx.acks` counts
 //! ACK frames, including ones that acknowledge nothing new, so it cannot
@@ -66,8 +86,8 @@
 //!   peer acknowledges in turn;
 //! - the handshake: a path is built on an established connection, and the
 //!   window starts no earlier than the path;
-//! - a peer that went silent: quinn's idle timeout ends the connection
-//!   instead;
+//! - a peer that went silent: the dark rule (3) is the one for that, and
+//!   quinn's idle timeout ends a connection that nothing closed first;
 //! - a send the node's egress cap (`total-bandwidth-limit`) holds: quinn
 //!   counts a transmit's frames, and its bytes in flight, when it builds
 //!   it, and the cap may hold it longer than the window.

@@ -75,6 +75,13 @@ pub(super) fn no_fanout() -> FanoutTargets {
 /// lossy uplinks on any transport: a 31 MiB broadcast needs about 271 KB/s to
 /// finish in 120 s.
 ///
+/// On UDP that limit is the receiver's whole age limit. On a QUIC path it is
+/// the stream's first age, which the receiver extends while the connection
+/// reads at 32 KiB/s or more (up to 2 h), so a stream it keeps past this wait
+/// can still complete after the wait counted it undelivered; that costs one
+/// full-state resend, as any timed-out wait does. Either way the wait is no
+/// longer than the receiver's limit, which is what the margin is for.
+///
 /// The margin keeps the sender from recording a delivery the receiver may
 /// already have dropped. On UDP the completion fires when the last fragment is
 /// first handed to the socket, and lost fragments are resent after that; and

@@ -553,7 +553,6 @@ impl QuicDataCounters {
         self.budget_bytes.store(bytes, Ordering::Relaxed);
     }
 
-    /// What the node's data paths are charged against the budget now.
     /// A dark episode ended as `ended` says.
     pub(crate) fn record_dark_episode(&self, ended: DarkEnd) {
         let bucket = match ended {
@@ -574,6 +573,7 @@ impl QuicDataCounters {
         self.dark_episodes[bucket].fetch_add(1, Ordering::Relaxed);
     }
 
+    /// What the node's data paths are charged against the budget now.
     pub(crate) fn set_budget_charged(&self, bytes: u64) {
         self.budget_charged.store(bytes, Ordering::Relaxed);
         self.budget_charged_peak.fetch_max(bytes, Ordering::Relaxed);
