@@ -770,6 +770,170 @@ fn a_sender_that_gives_up_resets_the_stream() {
     })
 }
 
+/// 64 streams held open by a trickle, about 2 KB/s for all of them (32 bytes
+/// a second each, so no stream is ever idle): their connection reads far
+/// under the floor rate, so each is evicted at its first age, its length at
+/// 32 KiB/s and at least 5 min, not at the 2 h ceiling. To keep streams open
+/// past that, a peer must keep its connection delivering at the floor.
+#[test]
+fn a_trickle_holding_many_streams_is_evicted_at_their_first_age() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths("quic-path-trickle-age", QuicPathLimits::FULL_STREAMS).await;
+        const STREAMS: usize = 64;
+        let total = 100_000u64;
+        let age = max_inbound_stream_age(total);
+        assert!(
+            age < super::inbound::STREAM_AGE_LIMIT / 10,
+            "premise: {age:?}"
+        );
+        let (conn, time) = (p.a_raw(), p.time());
+        let started = time.now_nanos();
+        let stopped = drive(&p.pair.time, age * 3, async move {
+            let mut sends = Vec::new();
+            for _ in 0..STREAMS {
+                let mut send = conn.open_uni().await.unwrap();
+                send.write_all(&header(1, 1, StreamId::next().0, total, 0))
+                    .await
+                    .unwrap();
+                sends.push(send);
+            }
+            let mut stopped = 0;
+            while stopped < STREAMS {
+                time.sleep(Duration::from_secs(1)).await;
+                stopped = 0;
+                for send in &mut sends {
+                    if send.write_all(&[0u8; 32]).await.is_err() {
+                        stopped += 1;
+                    }
+                }
+            }
+            stopped
+        })
+        .await;
+        assert_eq!(stopped, STREAMS);
+        let waited = Duration::from_nanos(p.time().now_nanos() - started);
+        assert!(
+            waited >= age && waited < age + Duration::from_secs(10),
+            "evicted after {waited:?}, first age {age:?}"
+        );
+        assert_eq!(
+            p.b.stats().shared_count(InboundStreamOutcome::EvictedAge) as usize,
+            STREAMS
+        );
+    })
+}
+
+/// A slow stream on a busy connection is kept past its first age: a trickle
+/// that alone would be evicted at its first age, beside a bulk stream that
+/// keeps the connection reading above the floor rate. quinn shares a
+/// connection between its streams, so a stream's own rate says little; the
+/// connection's says whether the peer is delivering.
+#[test]
+fn a_slow_stream_on_a_busy_connection_is_kept_past_its_first_age() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let mut p = paths("quic-path-busy-age", QuicPathLimits::DEFAULT).await;
+        let idle = streaming_handle_idle_timeout();
+        let total = 100_000u64;
+        let age = max_inbound_stream_age(total);
+        let (conn, time) = (p.a_raw(), p.time());
+        let held = age + age / 2;
+        let outcome = drive(&p.pair.time, held + LIMIT, async move {
+            let mut slow = conn.open_uni().await.unwrap();
+            slow.write_all(&header(1, 1, StreamId::next().0, total, 0))
+                .await
+                .unwrap();
+            // The bulk: 64 KiB a second, twice the floor, in streams of 1 MiB.
+            let bulk_conn = conn.clone();
+            let bulk_time = time.clone();
+            let bulk = tokio::spawn(async move {
+                loop {
+                    let mut send = bulk_conn.open_uni().await.unwrap();
+                    let len = MIB;
+                    send.write_all(&header(1, 1, StreamId::next().0, len as u64, 0))
+                        .await
+                        .unwrap();
+                    for _ in 0..len / (64 * 1024) {
+                        send.write_all(&payload(64 * 1024)).await.unwrap();
+                        bulk_time.sleep(Duration::from_secs(1)).await;
+                    }
+                    send.finish().unwrap();
+                }
+            });
+            let start = time.now_nanos();
+            let mut evicted = None;
+            while Duration::from_nanos(time.now_nanos() - start) < held {
+                if let Err(quinn::WriteError::Stopped(code)) = slow.write_all(b"x").await {
+                    evicted = Some(code.into_inner());
+                    break;
+                }
+                time.sleep(idle / 2).await;
+            }
+            bulk.abort();
+            evicted
+        })
+        .await;
+        assert_eq!(outcome, None, "kept past its first age {age:?}");
+        assert_eq!(
+            p.b.stats().shared_count(InboundStreamOutcome::EvictedAge),
+            0
+        );
+        while p.b_in.streams.try_recv().is_ok() {}
+    })
+}
+
+/// A send whose acknowledgement does not come within its ack wait
+/// (`SendDeadlines::ack_wait`, here 10 ms on a 200 ms round trip, so it
+/// cannot) ends `MaybeDelivered` at it, and its stream is reset and counted
+/// as an abort, so a peer that never acknowledges a stream's end is
+/// recycled by `SEND_ABORT_LIMIT` and does not hold the permit and epoch.
+#[test]
+fn a_send_past_its_ack_wait_is_reset_and_counted() {
+    use crate::transport::in_memory_socket::{
+        PacketDeliveryDecision, set_packet_delivery_callback,
+    };
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let network = "quic-path-ack-wait";
+        set_packet_delivery_callback(
+            network,
+            Some(Arc::new(|_, _, _, _| {
+                PacketDeliveryDecision::DelayedDelivery(Duration::from_millis(100))
+            })),
+        );
+        let p = paths(network, QuicPathLimits::DEFAULT).await;
+        let (a, time) = (p.a.clone(), p.time());
+        let deadlines = SendDeadlines {
+            ack_wait: Some(Duration::from_millis(10)),
+            ..SendDeadlines::stream(10_000)
+        };
+        let outcome = p
+            .drive(async move {
+                a.send_stream_bounded(
+                    &time,
+                    deadlines,
+                    StreamId::next(),
+                    None,
+                    Bytes::from(payload(10_000)),
+                    None,
+                )
+                .await
+            })
+            .await;
+        set_packet_delivery_callback(network, None);
+        assert!(
+            matches!(
+                outcome,
+                BoundedSend::MaybeDelivered(MaybeDelivered::TimedOut)
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(p.a.send_aborts(), 1, "reset and counted");
+        assert_eq!(p.a.send_epoch_holders(), 0, "nothing left waiting");
+    })
+}
+
 /// A stream that stops making progress is evicted after the idle timeout,
 /// and one that keeps trickling is evicted at its age limit: stopped with
 /// `EVICTED`, counted as the UDP transport counts them, handle cancelled.
@@ -806,10 +970,11 @@ fn idle_and_old_streams_are_evicted() {
         );
         assert!(p.b_in.streams.try_recv().unwrap().handle.is_cancelled());
 
-        // Age: a byte every half idle period, so it is never idle. The age
-        // limit of a charged stream is the 2 h cap, whatever its size.
+        // Age: a byte every half idle period, so it is never idle, and its
+        // connection reads far under the floor rate, so the stream is not
+        // kept past its first age, its length at 32 KiB/s and at least 5 min.
         let total = 100_000u64;
-        let age = super::inbound::stream_age_limit();
+        let age = max_inbound_stream_age(total);
         let conn = p.a_raw();
         let sleeper = time.clone();
         let started = time.now_nanos();
@@ -5201,6 +5366,11 @@ fn send_deadlines_have_these_values() {
         "the 2 h cap, whatever the size: progress is the connection's rule"
     );
     assert_eq!(SendDeadlines::stream(1).total, stream.total);
+    assert_eq!(
+        stream.ack_wait,
+        Some(max_inbound_stream_age(MIB as u64)),
+        "the ack wait is the stream's first age"
+    );
 
     assert_eq!(
         SendDeadlines::short(MIB as u64),
@@ -7772,7 +7942,7 @@ fn a_throttle_pauses_idle_and_the_age_limit_counts_apart() {
         let meter = p.b.meter().expect("b reads data under a budget").clone();
         let idle = streaming_handle_idle_timeout();
         let total = 10_000u64;
-        let age = super::inbound::stream_age_limit();
+        let age = max_inbound_stream_age(total);
         assert!(
             age > idle * 3,
             "premise: the age limit is past several idle periods"
@@ -7920,7 +8090,7 @@ fn an_age_limit_after_the_throttle_lapsed_counts_as_age() {
         let meter = p.b.meter().expect("b reads data under a budget").clone();
         let idle = streaming_handle_idle_timeout();
         let total = 10_000u64;
-        let age = super::inbound::stream_age_limit();
+        let age = max_inbound_stream_age(total);
         // The stream's last byte at 7 s; paused at each idle period after it.
         let progress = Duration::from_secs(7);
         let periods = (age - progress).as_nanos() / idle.as_nanos();

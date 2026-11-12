@@ -1330,7 +1330,11 @@ impl CreditWatch {
         }
         // Judged over the waiting that qualified: a settled spell does not
         // dilute a rate seen with acknowledgements.
-        let counted = if limited >= min { limited } else { limited + quiet };
+        let counted = if limited >= min {
+            limited
+        } else {
+            limited + quiet
+        };
         let acked = sample.state.acked_bytes.saturating_sub(self.history[0].3);
         let floor = u128::from(credit_floor_rate(sample.rtt)) * u128::from(counted) / 1_000_000_000;
         u128::from(acked) < floor

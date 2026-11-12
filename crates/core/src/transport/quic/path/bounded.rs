@@ -250,7 +250,8 @@ struct ProgressState {
     /// bring the deadline earlier.
     armed_on_source: AtomicBool,
     /// Told when a wait for the source starts while `extended`, or ends while
-    /// `armed_on_source`: the loop re-arms its timer.
+    /// `armed_on_source`, and when the end of the stream is sent (the ack
+    /// wait may end before the deadline armed): the loop re-arms its timer.
     source_wait: tokio::sync::Notify,
     /// Timers armed by [`bounded_send`]. Tests only.
     #[cfg(test)]
@@ -402,6 +403,9 @@ impl SendProgress {
     pub(super) fn mark_finished(&self) {
         self.0.finished_at.store((self.0.now)(), Ordering::Release);
         self.0.stage.store(STAGE_FINISHED, Ordering::Release);
+        // The loop re-arms at the ack wait's end, which may come before the
+        // gap deadline it has armed.
+        self.0.source_wait.notify_one();
     }
 
     /// How much of the send's ack wait ([`SendDeadlines::ack_wait`]) is left
