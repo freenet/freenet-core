@@ -572,6 +572,31 @@ topology management; the full list is on `DisconnectReason`). Disconnect
 byte totals are this connection's: the ring `Connection` records the
 per-peer totals when it joins and the event reports the difference.
 
+### Release census (`join_versions`, #5940)
+
+`transport/join_versions.rs` emits `join_versions` once per
+`JOIN_VERSIONS_INTERVAL` (1 h, listed in `PERIODIC_EVENT_TYPES`), only when
+telemetry is on, so the QUIC-only plan can see which releases are out there,
+including nodes whose own telemetry is off. `gateway_joins` (gateways only)
+counts each SUCCESSFUL inbound gateway handshake by transport and the joiner's
+version, at the listener's `complete_gateway_handshake` success arm, never at
+intro receipt (an intro is spoofable); it is process-wide (`GATEWAY_JOINS`) and
+resets at each emission. `neighbours` (every node) is a snapshot of live ring
+connections by peer version (`ConnectionManager::live_neighbour_versions`), so
+reconnects do not skew it. A version is bucketed relative to this build
+(`OWN_VERSION`, `OWN_FLOOR`, the values `PROTOC_VERSION` encodes): the exact
+version for this major.minor and a patch in `own_patch - 31 ..= own_patch`;
+when the floor is in an earlier series (format 2, #6189), also the exact
+version for the floor's major.minor and a patch in `floor_patch ..=
+floor_patch + 31`; else `older`, `newer` or `unknown` (no version). That is at
+most 67 labels whatever a peer sends (35 while the floor shares this
+series), held in fixed arrays. No keys,
+no addresses; in `gateway_joins` a count of 1 to 4 is reported as `"<5"`, and
+zero counts are omitted in both maps. Transport `legacy_intro` is today's UDP
+handshake; `native` is reserved for QUIC-native joins, which do not exist yet,
+and is never counted. It is not a `KnownShadowRollup`: its admission and drop
+counts are in the per-type `tel_t` row like any other event.
+
 ### Dashboard bandwidth sampler (#5152)
 
 `transport/bandwidth_history.rs` runs one more always-on 1 Hz task
@@ -1093,7 +1118,20 @@ one allowed or spoofed-allowed source cannot starve the other connections.
 The trade-off: a lone bulk peer, with no other connection competing, still
 gets only a quarter of the queue, so a burst larger than 256 datagrams that
 the endpoint has not yet drained is dropped (`_source_full`) even when the
-rest of the queue is empty.
+rest of the queue is empty. The last QUIC_INGRESS_QUIET_RESERVE (128) slots
+are for sources holding fewer than QUIC_INGRESS_QUIET_SOURCE_DATAGRAMS (4):
+once only those are free, any other source's datagram is `_reserve_full`, so
+a quiet connection's loss probes and acknowledgements still get in. Without
+it, a full queue dropped a quiet connection's probes one after another, quinn
+doubled its probe timeout each time, and the connection went silent past the
+consumers' 5 s gap (256 connections into one node, debug build). The cost:
+sources holding 4 or more queued datagrams have 12.5% less room between them
+for a burst (896 slots rather than 1024). The 896 is momentary, not a quota:
+a source that drains below 4 counts as quiet again. Many sources spoofing
+allowed addresses can fill the reserve; the queue then holds 1024, as
+without it. Limitation: the reserve helps only while most sources are busy;
+with about 256 or more connections each holding a few datagrams, most
+traffic counts as quiet and the queue behaves close to a plain FIFO.
 `allow_quic_source` returns a QuicSourcePermit: the address stays allowed
 while a permit for it is alive, and the set holds at most
 QUIC_ALLOWED_SOURCES_MAX addresses (past it, `allow_quic_source` refuses; a
@@ -1106,7 +1144,8 @@ connection closed, whatever closed it, and dropping its connection handle
 closes it; an address on the set is bounded by its connection's life, which
 inherits the #5922 gap for a connection held open indefinitely. Each
 QUIC-class datagram is counted as `quic_ingress_forwarded`, `_not_allowed`,
-`_queue_full`, `_source_full` or `_no_ingress` (no ingress enabled, its
+`_queue_full`, `_source_full`, `_reserve_full` (refused at the quiet
+reserve, below) or `_no_ingress` (no ingress enabled, its
 receiver gone, or disabled; every node with `transport-quic` off). The QUIC
 endpoint enables the ingress through `with_quic_ingress`, which disables it
 again (allow-set emptied and closed) if the endpoint cannot be built, so a
