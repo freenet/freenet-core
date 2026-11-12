@@ -1950,9 +1950,10 @@ Sending (QuicPath::send_short_bounded / send_stream_bounded /
   assemble() applies it as its timer, read at each wait, and also ends at
   once on a recorded end; chunks() yields the end as an Err. A QUIC pipe
   takes min(the source's gap, QuicPath::receiver_gap: the gap the next hop's
-  receiver allows, from this end's round trip) once, when it starts, so a
-  slow upstream feeding a fast downstream still fails at the downstream gap
-  and never pipes into a stream its receiver gave up on; the GET drain window
+  receiver allows, estimated from below from this path's minimum round trip,
+  since this end's srtt includes its own queueing) once, when it starts, so a
+  slow upstream feeding a fast downstream still fails at about the downstream
+  gap and rarely pipes into a stream its receiver gave up on; the GET drain window
   also takes the gap once. A pipe whose sink is UDP (pipe_stream, and a QUIC
   pipe's fallback to UDP) keeps 5 s whatever its source, because its UDP
   receiver gives up at 5 s. End to end, a fast last hop still fails a slow

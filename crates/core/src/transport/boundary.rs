@@ -427,7 +427,7 @@ impl IncomingStream {
 ///   A consumer must bring its own timeout. One that forwards to a QUIC path
 ///   uses [`IncomingStream::fragment_gap_limit`] (the source path's gap for a
 ///   stream a QUIC path fills, taken when the pipe starts), but no longer than
-///   the gap that path's receiver allows (`QuicPath::receiver_gap`); one that
+///   an estimate of the gap that path's receiver allows (`QuicPath::receiver_gap`); one that
 ///   forwards over UDP (the UDP pipe) keeps 5 s, the gap its UDP receiver
 ///   allows.
 /// - Under UDP it ends cleanly only once every declared byte was yielded: a

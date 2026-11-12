@@ -311,11 +311,12 @@ pub(super) async fn pipe_stream_on_path<S: Socket, T: TimeSource>(
     let mut source = WatchedSource::new(inbound_handle.chunks());
     // The source's own gap (5 s for a UDP-fed stream, the source path's gap
     // for a QUIC-fed one, whose chunks also end when its reader does), but no
-    // longer than this path's receiver waits between two pieces: past that it
+    // longer than an estimate from below of what this path's receiver waits
+    // between two pieces (`QuicPath::receiver_gap`): past its gap the receiver
     // has given up on the stream, and piping on would write into a stream
     // nobody assembles and could report it sent. A slow upstream feeding a
-    // fast downstream therefore still fails at the downstream gap, as on
-    // UDP. Both are taken once, when the pipe starts. A fallback to UDP pipes
+    // fast downstream therefore still fails at about the downstream gap, as
+    // on UDP. Both are taken once, when the pipe starts. A fallback to UDP pipes
     // with UDP's 5 s.
     let source_gap = inbound_handle
         .fragment_gap_limit()

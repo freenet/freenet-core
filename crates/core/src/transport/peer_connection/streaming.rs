@@ -93,10 +93,12 @@ impl QuicSourceEnd {
 /// so a tail lost twice in a row waits about 1 + 2 + 4 = 7 probe timeouts
 /// before it can arrive. 24 round trips covers that with the probe timeout up
 /// to about three times the round trip (its variance term under loss). At
-/// 800 ms and 15% loss, 16 was overrun by 2 of 300 streams of 64 KiB and 24
-/// by none of 600 (`a_slow_lossy_path_stays_within_its_consumer_gap`). The
-/// tail is the probe timeout doubling, which no multiple below the idle limit
-/// bounds; an overrun fails the stream, and the operation retries.
+/// 800 ms and 15% loss, a sweep outside CI (stated in #6186) had 16 overrun
+/// by 2 of 300 streams of 64 KiB and 24 by none of 1200;
+/// `a_slow_lossy_path_stays_within_its_consumer_gap` runs 40 of them in CI.
+/// The tail is the probe timeout doubling, which no multiple below the idle
+/// limit bounds; an overrun fails the stream (a GET then retries the next
+/// candidate; a PUT or UPDATE relay reports the failure upstream).
 pub(crate) const QUIC_GAP_RTT_MULTIPLE: u32 = 24;
 
 /// The gap a consumer of a QUIC-fed stream allows between two pieces:
