@@ -858,7 +858,11 @@ where
                     {
                         watch.prove_quiet();
                     }
-                    if progress.stage() == STAGE_FINISHED {
+                    // A send with an ack wait (a stream's): its deadline
+                    // after the end, whichever, ends the wait for good. A
+                    // send without one keeps waiting for its acknowledgement
+                    // past its own deadline (`Outgoing`'s drop).
+                    if progress.stage() == STAGE_FINISHED && deadlines.ack_wait.is_some() {
                         progress.0.ack_wait_ended.store(true, Ordering::Release);
                     }
                     return progress.timed_out();

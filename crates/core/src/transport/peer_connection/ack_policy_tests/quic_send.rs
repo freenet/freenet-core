@@ -1170,6 +1170,53 @@ fn a_pipe_that_stalls_after_opening_gives_up() {
     );
 }
 
+/// With the watch on, a dead path costs new traffic seconds, not a minute:
+/// the peer goes silent, a short sent 9 s later times out with nothing
+/// acknowledged and makes the path suspect by 15 s, and from then on new
+/// shorts go on UDP at once, while the path is still up. The watch's dark
+/// rule closes the path only later, waiting out two probe rounds after its
+/// 10 s window (`recycle::dark_close_bound`, about 67 s at this round trip).
+#[test]
+fn a_dark_path_takes_no_new_data_long_before_the_watch_closes_it() {
+    run(
+        "quic-send-suspect-watch-on",
+        QuicPathLimits::DEFAULT,
+        |mut rig| async move {
+            let _silenced = DropFrom::new("quic-send-suspect-watch-on", &[rig.path.peer_addr()]);
+            rig.path.settle(Duration::from_secs(9)).await;
+            rig.e.conn.send_serialized(message(1)).await.unwrap();
+            rig.path.settle(Duration::from_secs(6)).await;
+            assert!(rig.route.path().is_suspect(), "suspect by 15 s");
+            assert!(
+                rig.route.path().quinn_connection().close_reason().is_none(),
+                "the path is still up"
+            );
+            rig.udp_data();
+            rig.e.conn.send_serialized(message(2)).await.unwrap();
+            rig.path.settle(Duration::from_millis(50)).await;
+            assert_eq!(rig.udp_data().shorts, vec![message(2)], "on UDP at once");
+            // The watch closes it later, as dark.
+            let mut waited = Duration::from_secs(15);
+            while rig.route.path().quinn_connection().close_reason().is_none() {
+                assert!(
+                    waited
+                        <= crate::transport::quic::recycle::dark_close_bound(
+                            Duration::from_millis(50)
+                        ),
+                    "not closed {waited:?} after the silence"
+                );
+                rig.path.settle(Duration::from_secs(1)).await;
+                waited += Duration::from_secs(1);
+            }
+            assert!(waited >= Duration::from_secs(30), "closed at {waited:?}");
+            assert_eq!(
+                crate::transport::quic::recycle::stalls_to(rig.path.peer_addr()),
+                vec![crate::transport::quic::recycle::Stall::Dark]
+            );
+        },
+    );
+}
+
 /// A path whose sends time out with nothing acknowledged takes no new data: a
 /// short queued to it then goes on UDP, though the path is up. Once the peer
 /// acknowledges again, data goes on the path again. Across
@@ -1180,8 +1227,9 @@ fn a_pipe_that_stalls_after_opening_gives_up() {
 fn a_suspect_path_sends_new_shorts_on_udp_until_it_is_acknowledged() {
     run_with(
         "quic-send-suspect",
-        // The path is dark for 15 s, which its acknowledgement watch would
-        // close first (`recycle::AckWatch`); this test is the route's.
+        // The route's rule alone: the path is dark for 15 s, and with the
+        // watch on `a_dark_path_takes_no_new_data_long_before_the_watch_closes_it`
+        // covers the same with the watch's close after it.
         QuicPathLimits {
             watch_closes: false,
             ..QuicPathLimits::DEFAULT

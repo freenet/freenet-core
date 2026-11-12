@@ -953,6 +953,86 @@ fn a_send_past_its_ack_wait_is_reset_and_counted() {
     })
 }
 
+/// A peer whose acknowledgement of stream ends never comes in time (here
+/// each send's ack wait is 10 ms on a 200 ms round trip, so it cannot): two
+/// such sends, then a stream wholly acknowledged, which resets the count,
+/// then three more in a row: the path closes after the third
+/// (`StreamEndsUnacknowledged`, `recycle::ACK_WAIT_EXPIRY_LIMIT` = 3), and
+/// not before.
+#[test]
+fn three_ack_wait_expiries_in_a_row_close_the_path_on_a_real_path() {
+    use crate::transport::in_memory_socket::{
+        PacketDeliveryDecision, set_packet_delivery_callback,
+    };
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let network = "quic-path-ack-wait-expiries";
+        set_packet_delivery_callback(
+            network,
+            Some(Arc::new(|_, _, _, _| {
+                PacketDeliveryDecision::DelayedDelivery(Duration::from_millis(100))
+            })),
+        );
+        let p = paths(network, QuicPathLimits::DEFAULT).await;
+        let (a, time) = (p.a.clone(), p.time());
+        let b_addr = p.pair.b_addr;
+        let short_wait = SendDeadlines {
+            ack_wait: Some(Duration::from_millis(10)),
+            ..SendDeadlines::stream(10_000)
+        };
+        let closed_after = p
+            .drive(async move {
+                let send = |deadlines: SendDeadlines| {
+                    let (a, time) = (a.clone(), time.clone());
+                    async move {
+                        a.send_stream_bounded(
+                            &time,
+                            deadlines,
+                            StreamId::next(),
+                            None,
+                            Bytes::from(payload(10_000)),
+                            None,
+                        )
+                        .await
+                    }
+                };
+                let settle = |time: VirtualTime| async move {
+                    time.sleep(Duration::from_secs(3)).await;
+                };
+                for _ in 0..2 {
+                    send(short_wait).await;
+                    settle(time.clone()).await;
+                }
+                assert_eq!(a.writers().ack_wait_expiries(), 2);
+                assert!(matches!(
+                    send(SendDeadlines::stream(10_000)).await,
+                    BoundedSend::Sent
+                ));
+                assert_eq!(
+                    a.writers().ack_wait_expiries(),
+                    0,
+                    "reset by a wholly acknowledged stream"
+                );
+                for i in 1..=3 {
+                    send(short_wait).await;
+                    settle(time.clone()).await;
+                    let closed = a.connection().inner().close_reason().is_some();
+                    if closed {
+                        return Some(i);
+                    }
+                }
+                None
+            })
+            .await;
+        set_packet_delivery_callback(network, None);
+        assert_eq!(closed_after, Some(3), "closed at the third in a row");
+        assert_eq!(
+            recycle::stalls_to(b_addr),
+            vec![recycle::Stall::StreamEndsUnacknowledged]
+        );
+    })
+}
+
 /// A stream that stops making progress is evicted after the idle timeout,
 /// and one that keeps trickling is evicted at its age limit: stopped with
 /// `EVICTED`, counted as the UDP transport counts them, handle cancelled.
@@ -3764,11 +3844,12 @@ fn a_path_dark_in_both_directions_is_closed_as_dark() {
 /// own, and virtual time runs no keepalive): `a` has data outstanding when
 /// both directions go dark. After an outage quinn sends again only at its
 /// next backed-off probe, so a 6.5 s outage still reads dark past the 10 s
-/// window; the rule waits for a send made after the window and its grace,
-/// and that probe is answered, so the path lives. So is a 13 s outage, past
+/// window; the rule waits for two rounds of sends made after the window,
+/// and the first is answered, so the path lives. So is a 13 s outage, past
 /// the window, when it has ended before quinn's first probe after the
-/// window: a dark spell is judged by what that probe meets. A 40 s outage
-/// swallows it and is closed as dark. Prints the close latency
+/// window. A 22 s outage swallows that first post-window round (as a lost
+/// probe pair would) and is still survived: the second round is answered.
+/// A path that stays dark is closed as dark. Prints the close latency
 /// at 50, 300 and 800 ms round trips for a path that stays dark (the figures
 /// in `transport.md`).
 #[test]
@@ -3782,7 +3863,7 @@ fn the_dark_rule_waits_out_the_probe_backoff_of_an_ack_only_peer() {
         for (one_way_ms, outage_ms, closes) in [
             (400u64, 6_500u64, false),
             (400, 13_000, false),
-            (400, 40_000, true),
+            (400, 22_000, false),
             (25, u64::MAX, true),
             (150, u64::MAX, true),
             (400, u64::MAX, true),
@@ -4033,15 +4114,16 @@ fn a_peer_that_never_raises_its_stream_limit_is_closed() {
     })
 }
 
-/// An honest receiver whose consumer stalls for 30 s: one-packet Shorts wait
+/// An honest receiver whose consumer stalls for 45 s: one-packet Shorts wait
 /// for room in its channel (capacity 1), each lowering the limit it
-/// advertises, so `a`'s further sends wait to open for its stream credit.
-/// The stream-credit rule does not engage: the peer raised its limit when
-/// it read the first streams, and no stream `a` opened since was
-/// acknowledged, so nothing says it withholds credit it owes. The consumer
-/// then drains, every Short arrives, and the path is not closed.
+/// advertises, so `a`'s further sends wait to open for its stream credit
+/// while every stream `a` opened is wholly acknowledged. That engages the
+/// stream-credit rule (a withheld spell with nothing in flight), which
+/// would close the path at 60 s; the consumer drains at 45 s, the limit
+/// comes back up, every Short arrives, and the path is not closed. With the
+/// rule's window cut to 20 s this test fails.
 #[test]
-fn a_consumer_that_stalls_half_a_minute_does_not_close_the_path() {
+fn a_consumer_that_stalls_45_s_does_not_close_the_path() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
         let limits = QuicPathLimits {
@@ -4063,13 +4145,26 @@ fn a_consumer_that_stalls_half_a_minute_does_not_close_the_path() {
                         })
                     })
                     .collect();
-                time.sleep(Duration::from_secs(30)).await;
-                let waiting = a.writers().stream_waiters();
-                (sends, waiting)
+                time.sleep(Duration::from_secs(45)).await;
+                let writers = a.writers();
+                let engaged = (
+                    writers.stream_waiters(),
+                    writers.streams_opened(),
+                    writers.streams_acknowledged(),
+                );
+                (sends, engaged)
             })
             .await;
-        let (sends, waiting) = sends;
+        let (sends, (waiting, opened, acknowledged)) = sends;
         assert!(waiting > 0, "premise: sends waited for stream credit");
+        assert!(
+            opened >= 9 && acknowledged == opened,
+            "premise: every stream opened was wholly acknowledged ({acknowledged} of {opened})"
+        );
+        assert!(
+            p.a.connection().inner().close_reason().is_none(),
+            "not closed during the stall"
+        );
         let time = p.time();
         let outcomes = p
             .drive(async move {
