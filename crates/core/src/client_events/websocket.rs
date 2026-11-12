@@ -4002,6 +4002,78 @@ mod tests {
             close_code_with(port, &local, token.expose()).await,
             Some(AUTH_TOKEN_INVALID_CLOSE_CODE)
         );
+
+        // A revocation between the connection's registration and its grant
+        // read: the read misses the deleted grant and the upgrade is refused
+        // as an unknown grant (4401, grant wording), never opened. This is
+        // the window an early readiness signal let the revocation above fall
+        // into, giving `AUTH_TOKEN_INVALID` instead of "app grant revoked".
+        let token = crate::contract::delegate_capabilities::GrantToken::generate();
+        assert!(
+            caps.create_native_grant(
+                token.hash(),
+                crate::contract::delegate_capabilities::AppIdentity::WebApp(app),
+                "test",
+            )
+            .unwrap()
+        );
+        let release_read = state.hold_next_read();
+        let connecting = tokio::spawn({
+            let local = local.clone();
+            let token = token.expose().to_string();
+            async move {
+                let mut client = connect(port, &local, &token, true, &[], "").await;
+                refusal(&mut client).await
+            }
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while state.live_connections(token.hash()) == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the connection registered under its grant"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(state.revoke(caps.clone(), token.hash()).await.unwrap());
+        release_read
+            .send(())
+            .expect("the grant read was held at the gate until now");
+        let (error, close) = connecting.await.unwrap();
+        assert_eq!(
+            close,
+            Some((
+                AUTH_TOKEN_INVALID_CLOSE_CODE,
+                AUTH_TOKEN_INVALID_ERROR.to_string()
+            ))
+        );
+        assert!(
+            error.contains("the grant was revoked or never issued"),
+            "refused as an unknown grant: {error}"
+        );
+        assert_eq!(opened.try_recv().ok(), None, "the connection never opened");
+
+        /// The error message the node sends before closing, and the close.
+        async fn refusal(client: &mut Client) -> (String, Option<(u16, String)>) {
+            let error = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    #[allow(
+                        clippy::wildcard_enum_match_arm,
+                        reason = "only the binary error frame matters here"
+                    )]
+                    match client.next().await.expect("socket open").expect("ws frame") {
+                        tokio_tungstenite::tungstenite::Message::Binary(b) => {
+                            let response: Result<HostResponse, ClientError> =
+                                bincode::deserialize(&b).expect("a native response");
+                            return response.expect_err("a refusal").to_string();
+                        }
+                        _ => continue,
+                    }
+                }
+            })
+            .await
+            .expect("timed out waiting for the error frame");
+            (error, close_frame(client).await)
+        }
         async fn close_code_with(port: u16, host: &str, token: &str) -> Option<u16> {
             let mut client = connect(port, host, token, true, &[], "").await;
             close_frame(&mut client).await.map(|(code, _)| code)
