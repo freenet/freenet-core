@@ -1312,6 +1312,14 @@ impl P2pConnManager {
             quic_breaker_now,
         )
         .await;
+        // The endpoint state telemetry reports, when QUIC is already off here;
+        // otherwise the bind records it.
+        if let Some(state) = crate::transport::quic::upgrade::policy::endpoint_state_before_bind(
+            &config.config.network_api,
+            quic.settings.is_some(),
+        ) {
+            crate::transport::metrics::TRANSPORT_METRICS.set_quic_endpoint_state(state);
+        }
         let quic_policy = crate::transport::quic::upgrade::policy::QuicPolicyConfig::new(
             &config.config.network_api,
             quic.breaker,

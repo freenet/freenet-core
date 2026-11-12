@@ -29,6 +29,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::config::{NetworkApiConfig, QuicMaxPathsSetting};
 use crate::transport::TransportPublicKey;
+use crate::transport::metrics::QuicEndpointState;
 use crate::transport::quic::QuicMode;
 use crate::transport::quic::breaker::{BreakerOutcome, Verdict};
 use crate::transport::quic::control::caps;
@@ -273,6 +274,35 @@ fn configured_mode(config: &NetworkApiConfig) -> QuicMode {
     QuicMode::from_config_value(config.transport_quic.as_deref())
 }
 
+/// The QUIC endpoint state of a node that will not build an endpoint, decided
+/// before it binds: off by its `transport-quic` setting, off by this
+/// platform's default, or kept off by the crash-loop breaker (`gated_on` is
+/// false although the mode builds one). `None` when the node goes on to build
+/// the endpoint; the bind then records `Up` or why it failed.
+pub(crate) fn endpoint_state_before_bind(
+    config: &NetworkApiConfig,
+    gated_on: bool,
+) -> Option<QuicEndpointState> {
+    if configured_mode(config) == QuicMode::Off {
+        return Some(if config.transport_quic.is_some() {
+            QuicEndpointState::OffConfig
+        } else {
+            QuicEndpointState::OffPlatform
+        });
+    }
+    (!gated_on).then_some(QuicEndpointState::OffBreaker)
+}
+
+/// Whether `transport-quic` is set to `off` itself, as opposed to unset or to
+/// a value this binary does not know (which `QuicMode::from_config_value`
+/// warns about).
+fn set_to_off(config: &NetworkApiConfig) -> bool {
+    config
+        .transport_quic
+        .as_deref()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case(QuicMode::OFF))
+}
+
 /// Report the QUIC upgrade configuration once, at node startup: the
 /// configured mode and whether it was set or is the platform default (INFO;
 /// the breaker, a failed bind or an abort build can still keep QUIC off, and
@@ -289,6 +319,12 @@ pub(crate) fn log_startup(config: &NetworkApiConfig) {
         source = if config.transport_quic.is_some() { "configured" } else { "default" },
         "QUIC transport mode configured"
     );
+    if set_to_off(config) {
+        tracing::warn!(
+            "transport-quic = \"off\" is deprecated: QUIC is to replace the UDP transport, \
+             and a later release will not offer a way to turn it off"
+        );
+    }
     if configured_mode(config) != QuicMode::Off && !crate::transport::quic::UNWINDS {
         tracing::warn!(
             transport_quic = ?config.transport_quic,
@@ -353,6 +389,58 @@ mod tests {
         BreakerOutcome::Decided(Verdict::Arm),
         BreakerOutcome::Decided(Verdict::Trip),
     ];
+
+    /// Before the bind, a node reports off by config for `off` or an unknown
+    /// value, off by platform for an unset key on a platform whose default is
+    /// off, and off by the breaker when the breaker took the settings away;
+    /// otherwise it leaves the state to the bind.
+    #[test]
+    fn the_endpoint_state_before_bind_names_why_quic_is_off() {
+        use QuicEndpointState::*;
+        for value in ["off", " OFF ", "bogus"] {
+            let config = config(value, None);
+            assert_eq!(
+                endpoint_state_before_bind(&config, false),
+                Some(OffConfig),
+                "{value}"
+            );
+        }
+        for value in ["shadow", "prefer"] {
+            let config = config(value, None);
+            assert_eq!(endpoint_state_before_bind(&config, true), None, "{value}");
+            assert_eq!(
+                endpoint_state_before_bind(&config, false),
+                Some(OffBreaker),
+                "{value}"
+            );
+        }
+        let mut unset = config("shadow", None);
+        unset.transport_quic = None;
+        if QuicMode::default_mode() == QuicMode::Off {
+            assert_eq!(endpoint_state_before_bind(&unset, false), Some(OffPlatform));
+        } else {
+            assert_eq!(endpoint_state_before_bind(&unset, true), None);
+            assert_eq!(endpoint_state_before_bind(&unset, false), Some(OffBreaker));
+        }
+    }
+
+    /// The deprecation warning is for `off` itself, not for an unset key or an
+    /// unknown value (which has its own warning).
+    #[test]
+    fn only_transport_quic_off_is_deprecated() {
+        for (value, deprecated) in [
+            (Some("off"), true),
+            (Some(" Off "), true),
+            (Some("shadow"), false),
+            (Some("prefer"), false),
+            (Some("bogus"), false),
+            (None, false),
+        ] {
+            let mut config = config("shadow", None);
+            config.transport_quic = value.map(str::to_string);
+            assert_eq!(set_to_off(&config), deprecated, "{value:?}");
+        }
+    }
 
     fn config(transport_quic: &str, max_paths: Option<&str>) -> NetworkApiConfig {
         // Every key has a default, so an empty document is the default config.

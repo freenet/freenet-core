@@ -4842,3 +4842,18 @@ fn a_handoff_is_used_only_by_its_own_cap() {
         "Y's send must not use X's handoff as Y's admission"
     );
 }
+
+/// A bind reports `up` when it built the endpoint, and otherwise why not: an
+/// aborting build is refused before the socket is touched, so its failure is
+/// the abort, and any other failure is the bind.
+#[test]
+fn a_bind_reports_up_or_why_it_failed() {
+    use crate::transport::metrics::QuicEndpointState;
+    assert_eq!(super::bound_state(true, true), QuicEndpointState::Up);
+    assert_eq!(super::bound_state(false, true), QuicEndpointState::Up);
+    assert_eq!(super::bound_state(true, false), QuicEndpointState::OffBind);
+    assert_eq!(
+        super::bound_state(false, false),
+        QuicEndpointState::OffAbort
+    );
+}
