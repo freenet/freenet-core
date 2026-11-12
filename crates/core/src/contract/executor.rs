@@ -3146,6 +3146,11 @@ mod tests {
                 "free-DISK threshold the state directory must have before the node stages \
                  a release (#5791), not memory",
             ),
+            (
+                "SHARE_MIN_BYTES",
+                "QUIC loss gate: bytes a round trip must acknowledge or lose before its \
+                 loss share is sampled (quic::recycle::loss_gate), a threshold, not memory",
+            ),
         ];
 
         // WHAT THE SUM ACTUALLY CONSUMED, not what its source text mentions.

@@ -237,7 +237,7 @@ fn debug_field(debug: &str, name: &str) -> String {
 pub(super) const TEST_WINDOW: u64 = 2 * 1024 * 1024;
 
 /// Settings with windows of [`TEST_WINDOW`].
-fn settings() -> QuicSettings {
+pub(in crate::transport::quic) fn settings() -> QuicSettings {
     QuicSettings {
         memory_limit: 1024 * 1024 * 1024,
         idle_timeout: None,
@@ -281,6 +281,17 @@ pub(in crate::transport::quic) async fn pair(
     b_addr: SocketAddr,
     a_cap: Option<u64>,
 ) -> Pair {
+    pair_with(network, a_addr, b_addr, a_cap, settings()).await
+}
+
+/// [`pair`] with both endpoints built from `settings`.
+pub(in crate::transport::quic) async fn pair_with(
+    network: &str,
+    a_addr: SocketAddr,
+    b_addr: SocketAddr,
+    a_cap: Option<u64>,
+    settings: QuicSettings,
+) -> Pair {
     let time = VirtualTime::new();
     register_network_time_source(network, time.clone());
     register_address_network(a_addr, network);
@@ -306,9 +317,9 @@ pub(in crate::transport::quic) async fn pair(
     let b_socket = bind(b_addr, None).await;
     let a_keys = TransportKeypair::new();
     let b_keys = TransportKeypair::new();
-    let a = QuicEndpoint::bind(a_socket.clone(), a_addr, time.clone(), &settings(), &a_keys)
+    let a = QuicEndpoint::bind(a_socket.clone(), a_addr, time.clone(), &settings, &a_keys)
         .expect("endpoint a");
-    let b = QuicEndpoint::bind(b_socket.clone(), b_addr, time.clone(), &settings(), &b_keys)
+    let b = QuicEndpoint::bind(b_socket.clone(), b_addr, time.clone(), &settings, &b_keys)
         .expect("endpoint b");
     let pumps = vec![pump(a_socket.clone()), pump(b_socket.clone())];
     Pair {
@@ -487,8 +498,9 @@ fn handshake_and_one_mib_stream_on_virtual_time() {
                 .into_any()
                 .downcast::<super::recycle::CappedCubic>()
                 .expect("the acknowledgement-counting controller");
+            let gate = controller.gate().expect("Cubic behind the loss gate");
             assert!(
-                controller.wraps::<quinn::congestion::Cubic>(),
+                gate.wraps::<quinn::congestion::Cubic>(),
                 "Cubic congestion control"
             );
         }

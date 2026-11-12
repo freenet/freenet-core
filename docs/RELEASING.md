@@ -837,10 +837,15 @@ variants a peer can receive.
 
 `release.yml` ships the committed value unchanged, so raising it is its own
 reviewed PR, never a side effect of a release. (`scripts/release.sh` still
-rewrites it; see #5833.) `build.rs` requires an `X.Y.Z` value with the same
-major.minor as the package and no higher than the package version. The
-handshake carries only the patch component. A minor or major version bump
-therefore has to reset the floor in the same PR, or the build fails.
+rewrites it; see #5833.) `build.rs` requires an `X.Y.Z` value no higher than
+the package version. A floor in the same major.minor series is carried as a
+patch number (wire format 1). A floor in a different series (for example a
+1.0.0 build keeping floor 0.2.N) uses wire format 2 and is accepted only if
+its major is at most one below the package's, its minor is below 64 and its
+patch is below 256; `build.rs` fails the build otherwise. Releases before the
+version-floor bridge (0.2.156 and earlier) cannot read format 2: they reject
+such a peer and take the update path, so a cross-series floor only becomes
+safe once the bridge release is on the fleet.
 
 Raise it only to cut off versions that cannot rejoin by themselves, such as
 0.2.120 and 0.2.121, which cannot detect updates (#5221). Set it to the first

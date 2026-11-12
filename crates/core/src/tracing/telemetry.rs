@@ -7837,6 +7837,8 @@ mod tests {
         data.window_grow_refused = 1047;
         data.window_shrank = 1048;
         data.staged_peak_pct = 1049;
+        data.gate_loss = (1050..1056).collect();
+        data.gate_ended_queue = (1056..1059).collect();
         let want: std::collections::BTreeMap<String, u64> =
             snapshot.quic_data.keys().into_iter().collect();
         assert!(want.values().all(|value| *value != 0));

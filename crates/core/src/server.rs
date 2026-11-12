@@ -429,7 +429,8 @@ pub(crate) fn is_source_allowed(ip: IpAddr, allowed: &AllowedSourceCidrs) -> boo
 }
 
 /// Whether a client could reach this bind address directly at the machine's
-/// own IPs.
+/// own IPs (and so whether the machine hostname is allowed at all; see
+/// `HostAllowlistBuilder::add_hostname`).
 ///
 /// A loopback listener cannot be reached at a LAN address, so resolving the
 /// machine's hostname to allow those addresses as `Host` values gains nothing
@@ -438,6 +439,12 @@ pub(crate) fn is_source_allowed(ip: IpAddr, allowed: &AllowedSourceCidrs) -> boo
 /// before the API starts listening, which took about 35 s on a macOS 26 CI
 /// runner and left the node unreachable for all of it (see #5956).
 fn hostname_ips_are_reachable(bind_addr: IpAddr) -> bool {
+    // `::ffff:127.0.0.1` is loopback too, though `Ipv6Addr::is_loopback`
+    // says otherwise.
+    let bind_addr = match bind_addr {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(bind_addr),
+        v4 => v4,
+    };
     !bind_addr.is_loopback()
 }
 
@@ -451,7 +458,7 @@ fn resolve_hostname_ips(hostname: &str, port: u16) -> Vec<IpAddr> {
 ///
 /// Each entry is stored with and without the port suffix so both
 /// `Host: myhost` and `Host: myhost:7509` are accepted.
-fn build_allowed_hosts(
+pub(crate) fn build_allowed_hosts(
     bind_addr: IpAddr,
     port: u16,
     extra_allowed_hosts: &[String],
@@ -529,17 +536,23 @@ impl HostAllowlistBuilder {
         self.add_hostname(name_str, bind_addr, resolve);
     }
 
+    /// Allows the machine's hostname, and the IPs it resolves to, as `Host`
+    /// values, but only for a bind reachable at those IPs.
+    ///
+    /// A loopback bind gets neither; local browsers use `localhost` or
+    /// `127.0.0.1`. Use `--allowed-host` to add the name.
     fn add_hostname(
         &mut self,
         hostname: &str,
         bind_addr: IpAddr,
         resolve: impl FnOnce(&str, u16) -> Vec<IpAddr>,
     ) {
+        if !hostname_ips_are_reachable(bind_addr) {
+            return;
+        }
         self.add(hostname);
-        if hostname_ips_are_reachable(bind_addr) {
-            for ip in resolve(hostname, self.port) {
-                self.add(&ip.to_string());
-            }
+        for ip in resolve(hostname, self.port) {
+            self.add(&ip.to_string());
         }
     }
 
@@ -942,6 +955,8 @@ mod tests {
             IpAddr::V4(Ipv4Addr::LOCALHOST),
             IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)),
             IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+            // IPv4-mapped loopback.
+            IpAddr::V6(Ipv4Addr::LOCALHOST.to_ipv6_mapped()),
         ] {
             assert!(!hostname_ips_are_reachable(loopback), "{loopback}");
         }
@@ -949,9 +964,23 @@ mod tests {
             IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
             IpAddr::V4(Ipv4Addr::new(192, 168, 1, 2)),
+            IpAddr::V6(Ipv4Addr::new(192, 168, 1, 2).to_ipv6_mapped()),
         ] {
             assert!(hostname_ips_are_reachable(reachable), "{reachable}");
         }
+    }
+
+    #[test]
+    fn a_mapped_loopback_bind_does_not_allow_the_machine_hostname() {
+        let mut hosts = HostAllowlistBuilder::new(7509);
+        hosts.add_hostname(
+            "myhost",
+            IpAddr::V6(Ipv4Addr::LOCALHOST.to_ipv6_mapped()),
+            |_, _| panic!("a loopback bind must not resolve the hostname"),
+        );
+        let hosts = hosts.build();
+        assert!(!hosts.contains("myhost"));
+        assert!(!hosts.contains("myhost:7509"));
     }
 
     #[test]
@@ -962,8 +991,8 @@ mod tests {
             panic!("a loopback bind must not resolve the hostname")
         });
         let hosts = hosts.build();
-        assert!(hosts.contains("myhost"));
-        assert!(hosts.contains("myhost:7509"));
+        assert!(!hosts.contains("myhost"));
+        assert!(!hosts.contains("myhost:7509"));
     }
 
     #[test]
@@ -1004,16 +1033,63 @@ mod tests {
     }
 
     #[test]
-    fn a_loopback_bind_still_allows_the_machine_hostname() {
-        // The name stays allowed: a hosts-file entry can map it to loopback,
-        // and such a client sends `Host: <hostname>:7509`.
+    fn a_loopback_bind_does_not_allow_the_machine_hostname() {
+        // Through the production builder with the real hostname: a loopback
+        // bind allows only the loopback names.
         let hosts = build_allowed_hosts(IpAddr::V4(Ipv4Addr::LOCALHOST), 7509, &[]);
         if let Ok(name) = hostname::get() {
             if let Some(name_str) = name.to_str() {
-                assert!(hosts.contains(&name_str.to_lowercase()));
-                assert!(hosts.contains(&format!("{}:7509", name_str.to_lowercase())));
+                let name = name_str.to_lowercase();
+                if !matches!(name.as_str(), "localhost" | "127.0.0.1" | "[::1]") {
+                    assert!(!hosts.contains(&name), "{name}");
+                    assert!(!hosts.contains(&format!("{name}:7509")), "{name}");
+                }
             }
         }
+    }
+
+    /// The allowlist on a loopback bind excludes the hostname for every
+    /// consumer: the shell's Host check and the WebSocket / permission
+    /// Origin check.
+    #[test]
+    fn a_loopback_bind_allowlist_excludes_the_hostname() {
+        let mut builder = HostAllowlistBuilder::new(7509);
+        builder.add_localhost();
+        builder.add_hostname(
+            "foo-macbook.local",
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            |_, _| panic!("a loopback bind must not resolve the hostname"),
+        );
+        let hosts = builder.build();
+        let cidrs = AllowedSourceCidrs::default();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::HOST,
+            "foo-macbook.local:7509".parse().unwrap(),
+        );
+        assert!(!crate::client_events::websocket::is_host_acceptable(
+            &headers, &hosts, &cidrs
+        ));
+        let hosts: AllowedHosts = Arc::new(hosts);
+        assert!(!crate::server::client_api::is_origin_trusted(
+            &headers,
+            "http://foo-macbook.local:7509",
+            Some(&hosts),
+            Some(&cidrs),
+        ));
+
+        // Control: on a wildcard bind (LAN-reachable by design) the name is
+        // allowed, so the refusal above comes from the bind check.
+        let mut builder = HostAllowlistBuilder::new(7509);
+        builder.add_hostname(
+            "foo-macbook.local",
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            |_, _| vec![],
+        );
+        let hosts = builder.build();
+        assert!(crate::client_events::websocket::is_host_acceptable(
+            &headers, &hosts, &cidrs
+        ));
     }
 
     #[test]

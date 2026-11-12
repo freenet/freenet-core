@@ -3810,7 +3810,8 @@ pub struct WebsocketApiConfig {
     pub token_cleanup_interval_seconds: u64,
 
     /// Additional hostnames allowed in the Host header for WebSocket connections.
-    /// Empty means only auto-detected hostnames (machine hostname + bound IP) are allowed.
+    /// Empty means only auto-detected hosts are allowed: the loopback names, the bound
+    /// IP, and (for a non-loopback bind only) the machine hostname and its IPs.
     #[serde(default, rename = "allowed-host")]
     pub allowed_hosts: Vec<String>,
 

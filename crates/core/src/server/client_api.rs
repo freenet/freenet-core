@@ -168,6 +168,8 @@ mod permission_prompts;
 mod v1;
 mod v2;
 
+pub(crate) use permission_prompts::is_origin_trusted;
+
 #[derive(Clone)]
 pub(super) struct HttpClientApiRequest(mpsc::Sender<ClientConnection>);
 
@@ -320,6 +322,8 @@ impl HttpClientApi {
                 "/contract/{key}",
                 axum::routing::get(home_page::contract_detail),
             )
+            // Applies to the four dashboard routes above only.
+            .route_layer(axum::middleware::from_fn(require_trusted_host))
             // Notification service worker, served at the origin root so its
             // default scope (`/`) covers every contract shell page. The shell
             // registers it to show notifications via showNotification() — the
@@ -519,6 +523,7 @@ async fn web_home(
     query_string: Option<String>,
     hosted_mode: bool,
     source_addr: Option<std::net::SocketAddr>,
+    host_trusted: bool,
 ) -> Result<axum::response::Response, WebSocketApiError> {
     // Check if this is the sandboxed iframe requesting its content
     let is_sandbox = query_string
@@ -549,6 +554,7 @@ async fn web_home(
         rs,
         hosted_mode,
         source_addr,
+        host_trusted,
     )
     .await
 }
@@ -576,8 +582,18 @@ async fn render_shell_response(
     // Peer address of the requesting connection, for the issuance audit log.
     // `None` only where no `ConnectInfo` is installed (standalone test routers).
     source_addr: Option<std::net::SocketAddr>,
+    // Result of [`request_host_trusted`] for this request.
+    host_trusted: bool,
 ) -> Result<axum::response::Response, WebSocketApiError> {
     use headers::{Header, HeaderMapExt};
+
+    // The token below attests its holder as this contract's app. Issue it
+    // only when the request's `Host` names this node, the same allowlist the WebSocket
+    // upgrade and `/permission` endpoints apply. Checked before minting so a
+    // refused request leaves no token behind.
+    if !host_trusted {
+        return Ok(untrusted_host_response());
+    }
 
     // Shell page: generate auth token, serve iframe wrapper with CSP
     let token = AuthToken::generate();
@@ -611,17 +627,7 @@ async fn render_shell_response(
         );
     }
 
-    let auth_header = headers::Authorization::<headers::authorization::Bearer>::name().to_string();
-    let version_prefix = api_version.prefix();
-    // Don't set a cookie domain — the browser will default to the request's origin host,
-    // which works for both localhost and remote access.
-    let cookie = cookie::Cookie::build((auth_header, format!("Bearer {}", token.as_str())))
-        .path(format!("/{version_prefix}/contract/web/{key}"))
-        .same_site(cookie::SameSite::Strict)
-        .max_age(cookie::time::Duration::days(1))
-        .secure(!config.localhost)
-        .http_only(false)
-        .build();
+    let cookie = shell_token_cookie(&token, &key, api_version, config.localhost);
 
     let token_header = headers::Authorization::bearer(token.as_str()).unwrap();
     let contract_response = path_handlers::contract_home(
@@ -687,6 +693,80 @@ fn hosted_mode_or_default(ext: Option<Extension<crate::server::HostedMode>>) -> 
     ext.map(|Extension(hm)| hm.0).unwrap_or(false)
 }
 
+/// The cookie carrying a shell page's app-identity token.
+///
+/// `HttpOnly`: nothing in the shell or in a webapp reads it from script (the
+/// shell gets the token from the page body, the sandboxed app from its URL).
+fn shell_token_cookie(
+    token: &AuthToken,
+    key: &str,
+    api_version: ApiVersion,
+    localhost: bool,
+) -> cookie::Cookie<'static> {
+    use headers::Header;
+    let auth_header = headers::Authorization::<headers::authorization::Bearer>::name().to_string();
+    let version_prefix = api_version.prefix();
+    // Don't set a cookie domain — the browser will default to the request's origin host,
+    // which works for both localhost and remote access.
+    cookie::Cookie::build((auth_header, format!("Bearer {}", token.as_str())))
+        .path(format!("/{version_prefix}/contract/web/{key}"))
+        .same_site(cookie::SameSite::Strict)
+        .max_age(cookie::time::Duration::days(1))
+        .secure(!localhost)
+        .http_only(true)
+        .build()
+}
+
+/// The refusal for [`request_host_trusted`]. Not logged; the body tells the
+/// user what to change.
+fn untrusted_host_response() -> axum::response::Response {
+    (
+        axum::http::StatusCode::FORBIDDEN,
+        "Host header not allowed for this node. To use a hostname or public address, \
+         start the node with --allowed-host <name>; a reverse proxy must pass the \
+         browser's Host header through unchanged.",
+    )
+        .into_response()
+}
+
+/// Middleware for the node dashboard pages, which show the node's identity,
+/// peers and hosted contracts: refuse them for an untrusted `Host`.
+async fn require_trusted_host(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if !request_host_trusted(req.headers(), req.extensions()) {
+        return untrusted_host_response();
+    }
+    next.run(req).await
+}
+
+/// Whether this request's `Host` names this node: `localhost` on any port, an
+/// `allowed-host` entry, or a private/LAN or `allowed-source-cidrs` IP literal
+/// (see `is_host_acceptable`). Gates the pages a
+/// browser reaches by navigation, which carries no `Origin`: the contract
+/// shell (before it issues an app-identity token) and the node dashboard.
+///
+/// Where the router carries no `AllowedHosts` / `AllowedSourceCidrs` layer
+/// (the standalone `as_router` composition), the lists are taken as empty, so
+/// only `localhost` or a private IP-literal `Host` qualifies.
+fn request_host_trusted(
+    headers: &axum::http::HeaderMap,
+    extensions: &axum::http::Extensions,
+) -> bool {
+    let no_hosts = crate::server::AllowedHosts::default();
+    let no_cidrs = crate::server::AllowedSourceCidrs::default();
+    crate::client_events::websocket::is_host_acceptable(
+        headers,
+        extensions
+            .get::<crate::server::AllowedHosts>()
+            .unwrap_or(&no_hosts),
+        extensions
+            .get::<crate::server::AllowedSourceCidrs>()
+            .unwrap_or(&no_cidrs),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn web_subpages(
     key: String,
@@ -698,6 +778,7 @@ async fn web_subpages(
     request_sender: HttpClientApiRequest,
     hosted_mode: bool,
     source_addr: Option<std::net::SocketAddr>,
+    host_trusted: bool,
 ) -> Result<axum::response::Response, WebSocketApiError> {
     let is_sandbox = query_string
         .as_ref()
@@ -754,6 +835,7 @@ async fn web_subpages(
             request_sender,
             hosted_mode,
             source_addr,
+            host_trusted,
         )
         .await;
     }
@@ -1999,6 +2081,7 @@ mod tests {
                     sender,
                     false,
                     None,
+                    true,
                 )
                 .await
                 .map(|_| ())
@@ -2034,6 +2117,7 @@ mod tests {
             dead_request_sender(),
             false,
             None,
+            true,
         )
         .await
         .expect("sandbox document load must redirect, not error");
@@ -2055,6 +2139,7 @@ mod tests {
             dead_request_sender(),
             false,
             None,
+            true,
         )
         .await;
         match res {
@@ -2064,6 +2149,387 @@ mod tests {
                 // fetch attempt — that's fine, the point is that we did
                 // not take a redirect branch.
             }
+        }
+    }
+
+    /// The shell refuses to mint an app-identity token for a request whose
+    /// `Host` does not name this node, and refuses BEFORE minting: no
+    /// `NewConnection` reaches the node, and neither the `Authorization`
+    /// header nor the token cookie is set. Covers both entry points (root
+    /// document and deep-link sub-page).
+    #[tokio::test]
+    async fn shell_refuses_untrusted_host_before_minting_a_token() {
+        let key = valid_contract_key_b58();
+        let check = |resp: axum::response::Response, what: &str| {
+            assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN, "{what}");
+            assert!(
+                resp.headers()
+                    .get(axum::http::header::AUTHORIZATION)
+                    .is_none()
+                    && resp.headers().get(axum::http::header::SET_COOKIE).is_none(),
+                "{what}: a refused shell must carry no token"
+            );
+        };
+
+        let (tx, mut rx) = mpsc::channel(4);
+        let resp = web_home(
+            Path(key.clone()),
+            Extension(HttpClientApiRequest::from_sender(tx)),
+            axum::extract::State(localhost_config()),
+            axum::http::HeaderMap::new(),
+            ApiVersion::V1,
+            None,
+            false,
+            None,
+            false,
+        )
+        .await
+        .expect("a refused shell is a response, not an error");
+        check(resp, "root shell");
+        assert!(rx.try_recv().is_err(), "root shell must not reach the node");
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("sec-fetch-dest", "document".parse().unwrap());
+        let (tx, mut rx) = mpsc::channel(4);
+        let resp = web_subpages(
+            key,
+            "page2".to_string(),
+            ApiVersion::V1,
+            None,
+            headers,
+            &localhost_config(),
+            HttpClientApiRequest::from_sender(tx),
+            false,
+            None,
+            false,
+        )
+        .await
+        .expect("a refused shell is a response, not an error");
+        check(resp, "deep-link shell");
+        assert!(
+            rx.try_recv().is_err(),
+            "deep-link shell must not reach the node"
+        );
+    }
+
+    /// `request_host_trusted` applies the node's Host allowlist, and with no
+    /// allowlist layer (standalone `as_router`) accepts only `localhost` or a
+    /// private IP literal.
+    #[test]
+    fn request_host_trusted_uses_the_host_allowlist() {
+        fn headers(host: Option<&str>) -> axum::http::HeaderMap {
+            let mut h = axum::http::HeaderMap::new();
+            if let Some(host) = host {
+                h.insert(axum::http::header::HOST, host.parse().unwrap());
+            }
+            h
+        }
+        let mut layered = axum::http::Extensions::new();
+        layered.insert::<crate::server::AllowedHosts>(Arc::new(
+            crate::server::build_allowed_hosts(
+                std::net::Ipv4Addr::LOCALHOST.into(),
+                7509,
+                &["try.freenet.org".to_string()],
+            ),
+        ));
+        layered.insert(crate::server::AllowedSourceCidrs(Arc::new(vec![
+            "100.64.0.0/10".parse().unwrap(),
+        ])));
+        let bare = axum::http::Extensions::new();
+
+        for host in [
+            "127.0.0.1:7509",
+            "localhost:7509",
+            "[::1]:7509",
+            "try.freenet.org",
+            "192.168.1.5:7509",
+            "[fd00::5]:7509",
+            "100.64.1.5:7509",
+            "localhost:8000",
+            "LOCALHOST",
+        ] {
+            assert!(
+                request_host_trusted(&headers(Some(host)), &layered),
+                "{host} must be trusted"
+            );
+        }
+        for host in [
+            "evil.example",
+            "other.example:7509",
+            "localhost.evil.example:7509",
+            "8.8.8.8:7509",
+            "[2001:db8::1]:7509",
+            "100-64-1-5.evil.example:7509",
+            "localhost.:7509",
+            "localhost:",
+            "localhost:80x",
+            "localhost:+1",
+            "localhost:7509:1",
+            "evil.localhost:7509",
+        ] {
+            assert!(
+                !request_host_trusted(&headers(Some(host)), &layered),
+                "{host} must not be trusted"
+            );
+        }
+        assert!(
+            !request_host_trusted(&headers(None), &layered),
+            "missing Host"
+        );
+
+        assert!(request_host_trusted(
+            &headers(Some("127.0.0.1:1234")),
+            &bare
+        ));
+        assert!(request_host_trusted(
+            &headers(Some("localhost:1234")),
+            &bare
+        ));
+        assert!(!request_host_trusted(&headers(Some("evil.example")), &bare));
+    }
+
+    /// Wiring: the real v1/v2 routes feed the request's `Host` and the
+    /// router's allowlist layers into the shell check. An unlisted Host is
+    /// refused with no token; an allowed Host reaches the render.
+    #[tokio::test]
+    async fn contract_web_routes_refuse_untrusted_host() {
+        use freenet_stdlib::client_api::{ClientRequest, ContractRequest, ContractResponse};
+        use freenet_stdlib::prelude::{
+            ContractCode, ContractContainer, ContractWasmAPIVersion, Parameters, WrappedContract,
+            WrappedState,
+        };
+        use tower::ServiceExt;
+
+        // A real bundle served by a stub node, so an admitted request renders
+        // the actual shell (200 with a token) rather than failing on a closed
+        // node channel, which would also read as "not refused".
+        let mut archive = tar::Builder::new(std::io::Cursor::new(Vec::new()));
+        for (name, body) in [
+            ("index.html", &b"<html><body>root-xwhm</body></html>"[..]),
+            ("page2", b"<html><body>page2-xwhm</body></html>"),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            archive.append_data(&mut header, name, body).unwrap();
+        }
+        let state = WrappedState::new(
+            super::super::app_packaging::WebApp::from_data(Vec::new(), archive)
+                .unwrap()
+                .pack()
+                .unwrap(),
+        );
+        // Unique code, so process-global cache state from other tests cannot
+        // reach this one.
+        let contract = ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
+            Arc::new(ContractCode::from(b"xwhm-contract-web-host-check".to_vec())),
+            Parameters::from(vec![]),
+        )));
+        let key = contract.key().id().to_string();
+
+        let cache_root = tempfile::tempdir().unwrap();
+        let (mut api, router) = HttpClientApi::as_router_with_origin_contracts(
+            &"127.0.0.1:0".parse().unwrap(),
+            Arc::new(DashMap::new()),
+            crate::contract::user_input::pending_prompts(),
+            cache_root.path().to_path_buf(),
+        );
+        let new_connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let node = {
+            let new_connections = new_connections.clone();
+            tokio::spawn(async move {
+                let mut clients = HashMap::new();
+                while let Some(msg) = api.proxy_server_request.recv().await {
+                    match msg {
+                        ClientConnection::NewConnection { callbacks, .. } => {
+                            new_connections.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            let id = ClientId::next();
+                            if callbacks.send(HostCallbackResult::NewId { id }).is_ok() {
+                                clients.insert(id, callbacks);
+                            }
+                        }
+                        ClientConnection::Request { client_id, req, .. } => {
+                            let Some(callbacks) = clients.get(&client_id) else {
+                                continue;
+                            };
+                            if let ClientRequest::ContractOp(ContractRequest::Get { .. }) = *req {
+                                let _sent = callbacks
+                                    .send(HostCallbackResult::Result {
+                                        id: client_id,
+                                        result: Ok(HostResponse::ContractResponse(
+                                            ContractResponse::GetResponse {
+                                                key: contract.key(),
+                                                contract: Some(contract.clone()),
+                                                state: state.clone(),
+                                            },
+                                        )),
+                                    })
+                                    .is_ok();
+                            }
+                        }
+                    }
+                }
+            })
+        };
+
+        let allowed_hosts: crate::server::AllowedHosts =
+            Arc::new(crate::server::build_allowed_hosts(
+                std::net::Ipv4Addr::LOCALHOST.into(),
+                7509,
+                &["try.freenet.org".to_string()],
+            ));
+        let router = router
+            .layer(Extension(allowed_hosts))
+            .layer(Extension(crate::server::AllowedSourceCidrs::default()));
+        for (uri, deep) in [
+            (format!("/v1/contract/web/{key}/"), false),
+            (format!("/v2/contract/web/{key}/"), false),
+            (format!("/v1/contract/web/{key}/page2"), true),
+            (format!("/v2/contract/web/{key}/page2"), true),
+        ] {
+            for (host, refused) in [
+                ("other.example:7509", true),
+                ("evil.localhost:7509", true),
+                ("127.0.0.1:7509", false),
+                ("localhost:8000", false),
+                // Hosted mode: the reverse proxy passes the public Host.
+                ("try.freenet.org", false),
+            ] {
+                let before = new_connections.load(std::sync::atomic::Ordering::SeqCst);
+                let mut req = axum::http::Request::builder()
+                    .uri(&uri)
+                    .header(axum::http::header::HOST, host);
+                if deep {
+                    req = req.header("sec-fetch-dest", "document");
+                }
+                let resp = tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    router
+                        .clone()
+                        .oneshot(req.body(axum::body::Body::empty()).unwrap()),
+                )
+                .await
+                .unwrap_or_else(|_| panic!("{uri} hung"))
+                .unwrap();
+                let after = new_connections.load(std::sync::atomic::Ordering::SeqCst);
+                let has_cookie = resp.headers().get(axum::http::header::SET_COOKIE).is_some();
+                let has_token = resp
+                    .headers()
+                    .get(axum::http::header::AUTHORIZATION)
+                    .is_some();
+                if refused {
+                    assert_eq!(
+                        resp.status(),
+                        axum::http::StatusCode::FORBIDDEN,
+                        "{uri} with Host {host}"
+                    );
+                    assert!(
+                        !has_cookie && !has_token,
+                        "{uri} with Host {host} must carry no token"
+                    );
+                    assert_eq!(after, before, "{uri} with Host {host} reached the node");
+                } else {
+                    assert_eq!(
+                        resp.status(),
+                        axum::http::StatusCode::OK,
+                        "{uri} with Host {host} must render the shell"
+                    );
+                    assert!(
+                        has_cookie && has_token,
+                        "{uri} with Host {host}: the shell carries its token"
+                    );
+                }
+            }
+        }
+        node.abort();
+    }
+
+    /// The node dashboard pages (`/`, `/peer/..`, `/routing`, `/contract/..`) show the
+    /// node's identity, peers and hosted contracts, and are reached by
+    /// navigation (no `Origin`), so they get the same Host check as the shell.
+    #[tokio::test]
+    async fn dashboard_routes_refuse_untrusted_host() {
+        use tower::ServiceExt;
+        let allowed_hosts: crate::server::AllowedHosts = Arc::new(
+            crate::server::build_allowed_hosts(std::net::Ipv4Addr::LOCALHOST.into(), 7509, &[]),
+        );
+        for uri in [
+            "/",
+            "/peer/127.0.0.1:31337",
+            "/routing",
+            "/contract/EqJ5YpEEV3XLqEvKWLQHFhGAac2qXzSUoE6k2zbdnXBr",
+        ] {
+            for (host, refused) in [
+                ("other.example:7509", true),
+                ("localhost.evil.example:7509", true),
+                ("127.0.0.1:7509", false),
+                ("localhost:7509", false),
+                // SSH tunnel / port map, and LAN access by IP.
+                ("localhost:8000", false),
+                ("192.168.1.5:7509", false),
+            ] {
+                let (_api, router) = HttpClientApi::as_router(&"127.0.0.1:0".parse().unwrap());
+                let router = router
+                    .layer(Extension(allowed_hosts.clone()))
+                    .layer(Extension(crate::server::AllowedSourceCidrs::default()));
+                let req = axum::http::Request::builder()
+                    .uri(uri)
+                    .header(axum::http::header::HOST, host)
+                    .body(axum::body::Body::empty())
+                    .unwrap();
+                let status =
+                    tokio::time::timeout(std::time::Duration::from_secs(10), router.oneshot(req))
+                        .await
+                        .unwrap_or_else(|_| panic!("{uri} hung"))
+                        .unwrap()
+                        .status();
+                if refused {
+                    assert_eq!(
+                        status,
+                        axum::http::StatusCode::FORBIDDEN,
+                        "{uri} with Host {host}"
+                    );
+                } else {
+                    assert!(
+                        status != axum::http::StatusCode::FORBIDDEN && !status.is_server_error(),
+                        "{uri} with Host {host}: got {status}"
+                    );
+                }
+            }
+        }
+
+        // The layer covers the dashboard routes only. Gating every route would
+        // refuse non-browser clients and proxies whose Host is not on the
+        // allowlist; the other routes carry their own checks.
+        let (_api, router) = HttpClientApi::as_router(&"127.0.0.1:0".parse().unwrap());
+        let router = router
+            .layer(Extension(allowed_hosts.clone()))
+            .layer(Extension(crate::server::AllowedSourceCidrs::default()));
+        for uri in ["/v1/version", "/freenet-notify-sw.js"] {
+            let req = axum::http::Request::builder()
+                .uri(uri)
+                .header(axum::http::header::HOST, "other.example:7509")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let status = router.clone().oneshot(req).await.unwrap().status();
+            assert_eq!(status, axum::http::StatusCode::OK, "{uri}");
+        }
+    }
+
+    /// The token cookie is `HttpOnly` (script on another localhost port could
+    /// otherwise read it; cookies are not port-isolated), and keeps its
+    /// existing scoping.
+    #[test]
+    fn shell_token_cookie_is_http_only() {
+        let token = AuthToken::from("tok".to_owned());
+        for localhost in [true, false] {
+            let c = shell_token_cookie(&token, "KEY", ApiVersion::V1, localhost);
+            assert_eq!(c.http_only(), Some(true));
+            assert_eq!(c.same_site(), Some(cookie::SameSite::Strict));
+            assert_eq!(c.path(), Some("/v1/contract/web/KEY"));
+            assert_eq!(c.secure(), Some(!localhost));
+            assert!(c.to_string().contains("HttpOnly"));
         }
     }
 
@@ -2106,6 +2572,7 @@ mod tests {
             dead_request_sender(),
             false,
             None,
+            true,
         )
         .await
         .expect("web_subpages must convert the inner error into a response, not propagate it");
@@ -2186,6 +2653,7 @@ mod tests {
                     dead_request_sender(),
                     false,
                     None,
+                    true,
                 )
                 .await
                 .expect("web_subpages must respond, not propagate")
@@ -2729,7 +3197,12 @@ mod tests {
         let request = |method: Method, uri: String, fetch_dest: Option<&'static str>| {
             let router = router.clone();
             async move {
-                let mut req = Request::builder().method(method).uri(&uri);
+                // A browser always sends Host; the shell refuses one that
+                // does not name this node.
+                let mut req = Request::builder()
+                    .method(method)
+                    .uri(&uri)
+                    .header("host", "127.0.0.1:7509");
                 if let Some(dest) = fetch_dest {
                     req = req.header("sec-fetch-dest", dest);
                 }
