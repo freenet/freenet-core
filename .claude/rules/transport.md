@@ -2107,7 +2107,8 @@ Sending (QuicPath::send_short_bounded / send_stream_bounded /
   while the stream is open, and not during the ack wait, which includes a send
   window of backlog) and total. SendDeadlines::short(len) is 1 s and 5 s, or
   a stream's for a message past one packet; ::stream(len) is 2 s, 5 s
-  (STREAM_INACTIVITY_TIMEOUT) and inbound_stream_age_limit(len); a plain
+  (STREAM_INACTIVITY_TIMEOUT) and STREAM_AGE_LIMIT (2 h, below), and a node
+  sends with QuicPath::stream_deadlines (the gap from the path); a plain
   Duration is one deadline for all of it. A send from a source waits for the
   first chunk for the gap, counted in total, and open runs from when it arrives.
   The gap is judged on CONNECTION progress (bounded::ConnectionWatch): a node
@@ -2449,6 +2450,60 @@ Path recycling (quic/recycle.rs, #5940 step M6): besides the send-reset
   a held transmit is also in quinn's bytes in flight. A hold whose poller
   is not polled again within socket::cap_hold_validity of the cap's rate
   (a poller left by an ended connection) stops counting.
+  Liveness rules (#5940 PR 4, recycle::AckWatch, all closing with
+  PEER_NOT_ACKNOWLEDGING; why is in recycle::Stall and the log):
+  → Not acknowledging (above): the peer keeps sending and acknowledges
+    none of ours for ACK_WATCH_WINDOW (10 s).
+  → Dark: this side's packets outstanding at every sample for the window,
+    from a send, nothing acknowledged and nothing heard from the peer.
+    Closes only a path that carries data (QuicPath::enable_data); every
+    other path only counts its dark episodes (quic_dark_episode_*, above).
+    A path whose permits are all held by sends nobody acknowledges is
+    closed by this rule, not by its send timeouts.
+  → Credit-starved (recycle::CreditWatch): sends waited on the peer's
+    flow-control credit (a send still writing, quinn sent DATA_BLOCKED or
+    STREAM_DATA_BLOCKED with no STREAM frame since, every ack batch in the
+    interval application-limited, no egress cap hold) for at least
+    CREDIT_LIMITED_MIN (two 2 s intervals) of the window, and the peer
+    acknowledged under FLOOR_RATE_BYTES_PER_SEC (32 KiB/s) over that time.
+    An honest receiver reads every byte as it arrives and never lowers its
+    window below the floor (64 KiB at the smallest), so it returns credit
+    at no less than floor / round trip, 32 KiB/s up to a 2 s round trip. A
+    path held back by its congestion window, a shared uplink or the egress
+    cap is this side's back-pressure and never counts
+    (a_congestion_limited_path_under_the_floor_rate_is_never_closed).
+    quinn's blocked-frame behaviour this relies on is pinned on a real
+    connection (quinn_reports_a_write_blocked_by_the_peers_credit_and_only_that,
+    quinn_reports_application_limited_batches_as_the_credit_rule_needs).
+  → A send timeout before its stream opened (a wait for its source, for a
+    permit or for the peer's stream credit) is back-pressure and does not
+    count toward the stall close (route::timed_out).
+  → No false close at 800 ms round trip and 15% loss with the loss gate on
+    (a_slow_lossy_path_stays_within_its_consumer_gap: the send ends Sent on
+    a node's deadlines and no watch fires), nor at 25% loss
+    (a_lossy_path_is_not_closed).
+  → A node's streamed send takes its gap from the path
+    (QuicPath::stream_deadlines: the receiver's gap from the path's round
+    trip, at least 5 s), not a flat 5 s, so a slow path's send is not
+    failed at a gap its receiver still waits through.
+  → Total (STREAM_AGE_LIMIT, 2 h, sender and receiver alike, whatever the
+    size): progress is the connection's concern, judged by the rules above;
+    quinn shares a connection between its streams round-robin, so a
+    per-stream rate deadline fails honest streams on a busy connection.
+    The 2 h bounds only a peer that keeps the connection alive and
+    acknowledging while it trickles one stream. It is not what bounds
+    memory: on receive a held stream is bounded by its charge (the inbound
+    budget, at most the connection's window, MAX_WINDOW_BYTES 8 MiB, plus
+    staging) and by the stream limit; on send a stream waiting for its
+    acknowledgement holds one of 48 permits and its send epoch, whose bytes
+    are within the connection's send window (at most 8 MiB, charged to the
+    buffer budget). Per node the sum is the buffer budget whatever the
+    duration, so a longer hold costs time on one connection, not memory.
+  → Once the UDP transport is removed, a close by any of these rules ends
+    the peer's only connection: the node reconnects to it, with the
+    upgrade's backoff (60 s doubling to 1 h, +/-20%), and data to it waits
+    or fails meanwhile. Not built; the dark-episode counts are what the
+    10 s window is to be checked against before the data ramp passes 5%.
   e5 constraint: SEND_ABORT_LIMIT and PEER_NOT_ACKNOWLEDGING ask the peer to
   fall back to UDP for THIS connection only. They are not a permanent
   downgrade: e5 must allow a new upgrade after its normal backoff.
