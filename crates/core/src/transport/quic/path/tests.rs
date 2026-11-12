@@ -6294,6 +6294,128 @@ fn a_live_path_under_a_binding_cap_is_not_stall_closed() {
     })
 }
 
+/// A slow uplink never stall-closes a path that is moving data, also below
+/// the credit rule's floor rate (32 KiB/s). 25 kB/s is one of 40 connections
+/// sharing 1 MB/s. Two ways a node's sends are held back, both this side's
+/// back-pressure and not the peer's: the node's own egress cap
+/// (`a`'s socket cap), and a bottleneck the node cannot see (a 25 kB/s link
+/// with a 250 ms drop-tail queue, so the sender is congestion-window
+/// limited). The peer reads every byte. With the watch and the loss gate on,
+/// a 2 MiB stream on a node's deadlines ends `Sent`, slower than the floor,
+/// and neither end closes or records a stall. Such a path never waits on
+/// the peer's credit (its writes wait on its own send window), so the credit
+/// rule never starts counting: a rule that judged a writing path by its rate
+/// alone fails here, while the rule's congestion and cap exclusions are
+/// pinned by the recycle tests.
+#[test]
+fn a_slow_uplink_below_the_floor_rate_is_never_closed() {
+    use crate::transport::in_memory_socket::{
+        PacketDeliveryDecision, set_packet_delivery_callback,
+    };
+    use std::sync::atomic::Ordering::Relaxed;
+    const RATE: u64 = 25_000;
+    const LEN: usize = 2 * MIB;
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        for (network, capped) in [
+            ("quic-path-slow-uplink-cap", true),
+            ("quic-path-slow-uplink-link", false),
+        ] {
+            let mut p = if capped {
+                paths_capped(network, RATE).await
+            } else {
+                paths(network, QuicPathLimits::DEFAULT).await
+            };
+            let (a_addr, b_addr) = (p.pair.a_addr, p.pair.b_addr);
+            let dropped = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            if !capped {
+                // `a`'s datagrams leave a FIFO link of RATE bytes/s; one that
+                // would wait more than 250 ms in its queue is dropped.
+                let (time, counted) = (p.time(), dropped.clone());
+                let free_at = Arc::new(std::sync::atomic::AtomicU64::new(0));
+                set_packet_delivery_callback(
+                    network,
+                    Some(Arc::new(move |_, sender, _, bytes: &[u8]| {
+                        if sender != a_addr {
+                            return PacketDeliveryDecision::Deliver;
+                        }
+                        let now = time.now_nanos();
+                        let start = free_at.load(Relaxed).max(now);
+                        if start - now > 250_000_000 {
+                            counted.fetch_add(1, Relaxed);
+                            return PacketDeliveryDecision::Drop;
+                        }
+                        let done = start + bytes.len() as u64 * 1_000_000_000 / RATE;
+                        free_at.store(done, Relaxed);
+                        PacketDeliveryDecision::DelayedDelivery(Duration::from_nanos(done - now))
+                    })),
+                );
+            }
+            let (a, time) = (p.a.clone(), p.time());
+            let started = time.now_nanos();
+            let send = tokio::spawn(async move {
+                a.send_stream_bounded(
+                    &time,
+                    a.stream_deadlines(LEN as u64),
+                    StreamId::next(),
+                    None,
+                    Bytes::from(payload(LEN)),
+                    None,
+                )
+                .await
+            });
+            let mut b_in = std::mem::replace(&mut p.b_in.streams, tokio::sync::mpsc::channel(1).1);
+            let time = p.time();
+            let (outcome, assembled, took) = p
+                .drive(async move {
+                    let arrival = b_in.recv().await.expect("announced");
+                    let assembled = arrival.handle.assemble().await;
+                    let outcome = send.await.expect("the send task ran");
+                    (outcome, assembled, time.now_nanos() - started)
+                })
+                .await;
+            set_packet_delivery_callback(network, None);
+            assert!(
+                matches!(outcome, BoundedSend::Sent),
+                "{network}: {outcome:?}"
+            );
+            assert_eq!(assembled.expect("assembled").len(), LEN, "{network}");
+            let rate = LEN as u64 * 1_000_000_000 / took;
+            assert!(
+                rate < recycle::FLOOR_RATE_BYTES_PER_SEC,
+                "{network}: premise: under the floor rate, got {rate} B/s"
+            );
+            if capped {
+                assert!(
+                    p.a.connection().cap_holds().read().holds > 0,
+                    "{network}: premise: the cap held transmits"
+                );
+            } else {
+                assert!(
+                    dropped.load(Relaxed) > 0,
+                    "{network}: premise: the link's queue filled"
+                );
+            }
+            assert!(
+                p.a.connection().inner().close_reason().is_none()
+                    && p.b.connection().inner().close_reason().is_none(),
+                "{network}: {:?}",
+                p.a.connection().inner().close_reason()
+            );
+            assert!(
+                recycle::stalls_to(b_addr).is_empty() && recycle::stalls_to(a_addr).is_empty(),
+                "{network}: a false stall: {:?}",
+                recycle::stalls_to(b_addr)
+            );
+            assert_eq!(
+                p.a.stats().send_event_count(QuicSendEvent::StalledClosed),
+                0,
+                "{network}"
+            );
+        }
+    })
+}
+
 /// How a real path carries its last acknowledgement to its next send: a settle
 /// that sees the peer's acknowledgement records it on the path, and a later
 /// send whose writes the cap queue holds for 8 s, past its 5 s gap, with the
