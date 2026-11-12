@@ -313,12 +313,12 @@ fn three_quic_panics_keep_quic_off_for_the_cooldown() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// QUIC is shadow by default on Windows, as on Linux and macOS, now that the
-/// breaker has been confirmed on a real Windows machine (#6031): a node with
-/// no `transport-quic` builds the endpoint and arms the breaker's marker. This
-/// fails if the default changes.
+/// QUIC is on by default on Windows (prefer, as on Linux and macOS), now that
+/// the breaker has been confirmed on a real Windows machine (#6031): a node
+/// with no `transport-quic` builds the endpoint and arms the breaker's marker.
+/// This fails if the default stops building the endpoint.
 #[test]
-fn quic_is_shadow_by_default_on_windows() -> anyhow::Result<()> {
+fn quic_is_on_by_default_on_windows() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let mut node = Node::start(dir.path(), dir.path().join("logs"), &[])?;
     node.wait_for_log(QUIC_BUILT)?;
