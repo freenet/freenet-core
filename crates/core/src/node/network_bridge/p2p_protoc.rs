@@ -4276,9 +4276,19 @@ pub(crate) mod tests {
     /// manager's open-transport set (read by the relay's QUIC-native decision)
     /// equal to the map's keys. A direct `connections.insert(` elsewhere would
     /// leave a transport the relay cannot see; a direct `remove(` would leave
-    /// a closed one it still counts. Scans the production code of every file
-    /// of the bridge (before each file's first test module, comment lines
-    /// skipped) for any call that changes the map's keys.
+    /// a closed one it still counts.
+    ///
+    /// Scans the production code of every file of the bridge (before each
+    /// file's first test module), comments dropped and whitespace removed so a
+    /// call rustfmt split across lines (`self\n.connections\n.remove(`) reads
+    /// as one statement, and checks:
+    /// - a key-changing method called on anything named `connections` (the
+    ///   field, or a function parameter of that name) appears only in the two
+    ///   helpers;
+    /// - the map is borrowed `&mut` only as a call argument, never bound to
+    ///   another name, and never taken, replaced or swapped out whole;
+    /// - every parameter of the map's type is named `connections`, so the
+    ///   first check sees what a function does with it.
     #[test]
     fn the_connection_map_changes_only_through_its_helpers() {
         const FILES: [(&str, &str); 7] = [
@@ -4320,7 +4330,10 @@ pub(crate) mod tests {
             "pop_last(",
             "extract_if(",
         ];
-        let mut found = Vec::new();
+        const MAP_TYPE: &str = "BTreeMap<SocketAddr,ConnectionEntry>";
+        let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+        let mut key_changes = Vec::new();
+        let mut misuse = Vec::new();
         for (name, src) in FILES {
             // Up to the first test module (a `#[cfg(test)]` on a single item
             // earlier in the file does not end the production code).
@@ -4336,27 +4349,62 @@ pub(crate) mod tests {
                     "the production region of {name} must contain the helpers"
                 );
             }
-            for line in production.lines() {
-                let code = line.trim_start();
-                if code.starts_with("//") {
-                    continue;
+            let flat: String = production
+                .lines()
+                .map(|line| line.split("//").next().unwrap_or(""))
+                .flat_map(str::chars)
+                .filter(|c| !c.is_whitespace())
+                .collect();
+            for (at, _) in flat.match_indices("connections") {
+                let before = &flat[..at];
+                let after = &flat[at + "connections".len()..];
+                if before.chars().next_back().is_some_and(is_ident)
+                    || after.chars().next().is_some_and(is_ident)
+                {
+                    continue; // part of a longer identifier
                 }
-                for (at, _) in code.match_indices("connections.") {
-                    let preceded_by_name = code[..at]
-                        .chars()
-                        .next_back()
-                        .is_some_and(|c| c.is_alphanumeric() || c == '_');
-                    let rest = &code[at + "connections.".len()..];
-                    if !preceded_by_name && KEY_CHANGES.iter().any(|m| rest.starts_with(m)) {
-                        found.push(format!("{name}: {code}"));
+                if let Some(call) = after.strip_prefix('.') {
+                    if KEY_CHANGES.iter().any(|m| call.starts_with(m)) {
+                        let tail = after.find(')').map_or(after, |close| &after[..=close]);
+                        let head: String = before
+                            .chars()
+                            .rev()
+                            .take(5)
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                            .rev()
+                            .collect();
+                        key_changes.push(format!("{name}: {head}connections{tail}"));
+                    }
+                }
+                let borrowed_mut = before.ends_with("&mutself.") || before.ends_with("&mutctx.");
+                if borrowed_mut && !(after.starts_with(',') || after.starts_with(')')) {
+                    misuse.push(format!("{name}: a `&mut` borrow not passed as an argument"));
+                }
+                if borrowed_mut && before.ends_with("=&mutself.") {
+                    misuse.push(format!("{name}: the map bound to another name"));
+                }
+                for whole in ["take(&mut", "replace(&mut", "swap(&mut"] {
+                    if before.ends_with(&format!("{whole}self."))
+                        || before.ends_with(&format!("{whole}ctx."))
+                    {
+                        misuse.push(format!("{name}: the map moved out with mem::{whole}"));
                     }
                 }
             }
+            for (at, _) in flat.match_indices(&format!("&mut{MAP_TYPE}")) {
+                if !flat[..at].ends_with("connections:") {
+                    misuse.push(format!(
+                        "{name}: a `&mut` parameter of the map's type not named `connections`"
+                    ));
+                }
+            }
         }
+        assert_eq!(misuse, Vec::<String>::new());
         assert_eq!(
-            found,
+            key_changes,
             vec![
-                "p2p_protoc.rs: self.connections.insert(addr, entry)".to_string(),
+                "p2p_protoc.rs: self.connections.insert(addr,entry)".to_string(),
                 "p2p_protoc.rs: self.connections.remove(&addr)".to_string(),
             ],
             "the connection map must change only in insert_connection / remove_connection"

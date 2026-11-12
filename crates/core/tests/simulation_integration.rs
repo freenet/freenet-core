@@ -22655,8 +22655,10 @@ fn test_quic_native_offer_and_decision_reach_the_wire() {
 /// older ones, so no connection closes on an undecodable message and every
 /// node joins. Fails closed on its premises: an at-floor node did address a
 /// message carrying a native field to an older node (and it went out without
-/// it), an acceptor answered a request whose offer was dropped on the way,
-/// and a joiner received a response with no decision.
+/// it), an acceptor answered an at-floor joiner's request whose offer was
+/// dropped on the way, and an at-floor joiner received a response with no
+/// decision. Requests and responses between two pre-floor nodes count toward
+/// neither: they carry no native field by design.
 #[test_log::test]
 fn test_quic_native_pre_floor_nodes_never_receive_the_native_variants() {
     use freenet::dev_tool::NodeLabel;
