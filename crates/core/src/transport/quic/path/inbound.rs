@@ -132,7 +132,9 @@ use crate::transport::peer_connection::inbound_budget::{
     BudgetRejection, InboundKey, InboundStreamBudget, LegacyStreamToken, Liveness, Releaser,
     SharedInboundBudget,
 };
-use crate::transport::peer_connection::streaming::{StreamError, StreamHandle};
+use crate::transport::peer_connection::streaming::{
+    PathRtt, QuicSource, QuicSourceEnd, QuicSourcePath, StreamError, StreamHandle,
+};
 use crate::transport::peer_connection::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
 use crate::transport::peer_connection::{
     fits_one_packet, inbound_stream_age_limit, streaming_handle_idle_timeout,
@@ -215,7 +217,11 @@ pub(in crate::transport::quic) struct Receiver<T> {
     /// The peer's uni-stream limit, lowered while one-packet Shorts wait for
     /// room ([`StreamLimit`]).
     stream_limit: StreamLimit,
-    /// Panic on the next stream, to test the supervisor.
+    /// The connection's round trip, for the consumers of the streams it
+    /// fills (`StreamHandle::fragment_gap_limit`): set at each stream
+    /// admitted and at each tick of the path's acknowledgement watch.
+    rtt: Arc<PathRtt>,
+    /// Panic on the next short message, to test the supervisor.
     #[cfg(test)]
     pub(in crate::transport::quic) panic_on_stream: bool,
 }
@@ -265,6 +271,12 @@ impl<T: TimeSource> Receiver<T> {
         self.meter = Some(meter);
     }
 
+    /// The connection's round trip as the receiver keeps it, for the path's
+    /// acknowledgement watch to keep current.
+    pub(in crate::transport::quic) fn path_rtt(&self) -> Arc<PathRtt> {
+        self.rtt.clone()
+    }
+
     /// Replace the gap cap, before any stream is read. Tests only.
     #[cfg(test)]
     pub(in crate::transport::quic) fn set_gap_cap(&mut self, cap: usize) {
@@ -298,6 +310,7 @@ impl<T: TimeSource> Receiver<T> {
             controls,
             next_short_key: AtomicU32::new(1),
             accept_data,
+            rtt: Arc::new(PathRtt::new(closer.rtt())),
             closer,
             ranges: Arc::new(ConnRanges::new(
                 MAX_GAPS_PER_CONNECTION,
@@ -577,6 +590,9 @@ struct BodyReader<T: TimeSource> {
     meter: Option<Arc<ConnMeter>>,
     /// Bytes read but not yet taken ([`Self::read_exact`]).
     staging: Staging,
+    /// The admitted `Stream`'s source, where a failure records why the
+    /// stream ended, for consumers that assemble it ([`Receiver::fail`]).
+    source: Option<Arc<QuicSource>>,
     /// The idle timer was paused for the connection's throttle since the
     /// stream last made progress.
     paused: bool,
@@ -615,6 +631,7 @@ impl<T: TimeSource> BodyReader<T> {
             conn_ranges,
             meter,
             staging: Staging::new(conn_staging),
+            source: None,
             paused: false,
         }
     }
@@ -998,7 +1015,7 @@ pub(in crate::transport::quic) const STAGED_TRIP_WINDOW: Duration = Duration::fr
 
 /// Charged per staging buffer besides its allocation: the allocator's
 /// bookkeeping and the reader's handle on it.
-const STAGING_BUFFER_OVERHEAD_BYTES: usize = 64;
+pub(in crate::transport::quic) const STAGING_BUFFER_OVERHEAD_BYTES: usize = 64;
 
 /// The size of the allocation the allocator makes for `bytes`, rounded up to
 /// its size class: four classes per doubling, as jemalloc's (at most a quarter
@@ -1420,13 +1437,12 @@ impl ConnRanges {
         self.cap.store(cap, Ordering::Relaxed);
     }
 
-    /// The cap now. Tests only.
-    #[cfg(test)]
+    /// The cap now, which the budget charges.
     pub(in crate::transport::quic) fn cap(&self) -> usize {
         self.cap.load(Ordering::Relaxed)
     }
 
-    /// Gaps counted now, kept ones included: what the budget charges.
+    /// Gaps counted now, kept ones included.
     pub(in crate::transport::quic) fn held_now(&self) -> usize {
         self.held.load(Ordering::Relaxed)
     }
@@ -1730,8 +1746,12 @@ impl Rechunker {
 }
 
 /// Owns the reader's handle (or token) of a charged stream: on drop it
-/// cancels the handle if the stream did not complete, drops it, and then
-/// releases the charge if no other clone is left. The reader keeps no
+/// cancels the handle if the stream did not complete, recording on the
+/// stream's source that the reader stopped (a reason a failure recorded
+/// first stays; forks, which do not see the cancel, see this), drops it, and
+/// then releases the charge if no other clone is left. It drops however the
+/// reader ends: a return, a panic in its task, or the path or connection
+/// dropping the reader. The reader keeps no
 /// clone of its own, so the guard's is the last one the reader holds.
 struct StreamGuard {
     budget: SharedInboundBudget,
@@ -1754,6 +1774,7 @@ impl Drop for StreamGuard {
     fn drop(&mut self) {
         if let Some(handle) = self.handle.take() {
             if !self.complete {
+                handle.end_quic_source(QuicSourceEnd::Ended);
                 handle.cancel();
             }
         }
@@ -1764,10 +1785,6 @@ impl Drop for StreamGuard {
 
 /// Read one stream: its header, then by kind.
 async fn read_one<T: TimeSource>(recv: quinn::RecvStream, receiver: Arc<Receiver<T>>) {
-    #[cfg(test)]
-    if receiver.panic_on_stream {
-        panic!("test: the receive task panics");
-    }
     let mut reader = BodyReader::new(
         recv,
         receiver.time.clone(),
@@ -1784,6 +1801,12 @@ async fn read_one<T: TimeSource>(recv: quinn::RecvStream, receiver: Arc<Receiver
             return;
         }
     };
+    // On a short message only, so a test can have a stream in progress
+    // when the task panics.
+    #[cfg(test)]
+    if receiver.panic_on_stream && matches!(&header, Ok(h) if h.kind() == FrameKind::Short) {
+        panic!("test: the receive task panics");
+    }
     let header = match header {
         Ok(header) => {
             let body = match header.kind() {
@@ -1860,6 +1883,21 @@ impl<T: TimeSource> Receiver<T> {
     /// Count a failed read and stop the stream where that tells the sender
     /// something.
     fn fail(&self, reader: &mut BodyReader<T>, failure: ReadFailure, charged: Charged) {
+        if let Some(source) = &reader.source {
+            source.end(match failure {
+                ReadFailure::Idle => QuicSourceEnd::Idle,
+                // The age limit, reached while a throttle paused the idle timer.
+                ReadFailure::Age | ReadFailure::ThrottledPastAge => QuicSourceEnd::Age,
+                ReadFailure::Truncated(_)
+                | ReadFailure::Overlong
+                | ReadFailure::Reset
+                | ReadFailure::ConnectionLost
+                | ReadFailure::TooManyRanges
+                | ReadFailure::Overlap
+                | ReadFailure::StagedOverCap
+                | ReadFailure::Other => QuicSourceEnd::Ended,
+            });
+        }
         let stats = &self.stats;
         // Anything but the peer resetting the stream or the connection ending
         // holds back a raise of the stream limit until a fresh run of load.
@@ -2128,7 +2166,9 @@ impl<T: TimeSource> Receiver<T> {
             }
             // Allocates only the buffer's chunk table (see
             // `LockFreeStreamBuffer`); slots come as fragments arrive.
-            let handle = StreamHandle::new(stream_id, total);
+            // A QUIC-fed handle: its consumers wait on this reader's rules,
+            // not the UDP transport's 5 s fragment gap.
+            let handle = StreamHandle::new_quic(stream_id, total);
             budget.charge(
                 key,
                 total,
@@ -2148,6 +2188,15 @@ impl<T: TimeSource> Receiver<T> {
             complete: false,
         };
         reader.set_age_limit(stream_age_limit());
+        reader.source = guard.handle().quic_source().cloned();
+        if let Some(source) = &reader.source {
+            // The round trip as of this stream; the watch keeps it current.
+            self.rtt.set(self.closer.rtt());
+            source.set_path(QuicSourcePath {
+                rtt: self.rtt.clone(),
+                idle: Duration::from_nanos(reader.idle_nanos),
+            });
+        }
         let payload_start = (HEADER_LEN as u64) + u64::from(header.metadata_len());
         let mut rechunker = Rechunker::new(total);
         let metadata = match header.metadata_len() {
@@ -2415,10 +2464,18 @@ impl<T: TimeSource> Receiver<T> {
             }
         };
         // The body stays charged to the connection's staging while the
-        // stream's end is awaited: a peer that withholds it would otherwise
-        // hold a body per stream outside every charge.
-        let Some(_held) = StagedHold::new(reader.staging.conn.clone(), payload.len()) else {
-            self.fail(&mut reader, ReadFailure::StagedOverCap, Charged::No);
+        // stream's end is awaited, as staging charged it: a peer that
+        // withholds the end would otherwise hold a body per stream outside
+        // every charge.
+        let charge = allocation_class(payload.len()) + STAGING_BUFFER_OVERHEAD_BYTES;
+        let Some(_held) = StagedHold::new(reader.staging.conn.clone(), charge) else {
+            // Unreachable: the body's own staging charge, no smaller, was
+            // freed with no await since. If it ever is reached it is this
+            // side's accounting, not the peer's doing, so it is not counted
+            // as a trip toward closing the path.
+            debug_assert!(false, "a control body's staging charge was refused");
+            self.stats.record(QuicInboundOutcome::EvictedStaged);
+            reader.stop(stop_code::EVICTED);
             return;
         };
         if let Err(failure) = reader.expect_end().await {
@@ -2460,6 +2517,87 @@ fn clamp(len: u64) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Bytes read above a gap are credit the meter counts as read, never as
+    /// delivery that grows a window: the reader tells the meter only how far
+    /// the stream's in-order prefix moved. Counting every byte read as
+    /// delivered would let a peer grow its window by sending gapped data.
+    #[test]
+    fn bytes_read_above_a_gap_are_not_delivery() {
+        use super::super::super::budget::{QuicBudget, WindowControl, floor_window_bytes};
+        use super::super::super::tests::{bounded, drive, pair};
+        bounded(|| async move {
+            let a_addr: std::net::SocketAddr = "10.209.1.1:5000".parse().unwrap();
+            let b_addr: std::net::SocketAddr = "10.209.1.2:5000".parse().unwrap();
+            let p = pair("quic-inbound-gapped-delivery", a_addr, b_addr, None).await;
+            let permit =
+                p.b.allow_peer(p.a_addr, p.a_keys.public())
+                    .expect("allow-set has room");
+            let (a, b) = (p.a.clone(), p.b.clone());
+            let b_key = p.b_keys.public().clone();
+            let time = p.time.clone();
+            let (send, recv, server) = drive(&p.time, Duration::from_secs(10), async move {
+                let (client, server) = tokio::join!(a.connect(b_addr, &b_key), async {
+                    b.accept().await.expect("an attempt").establish().await
+                });
+                let client = client.expect("client handshake");
+                let server = server.expect("server accepted");
+                let mut send = client.inner().open_uni().await.expect("open stream");
+                send.write_all(b"x").await.expect("write");
+                let recv = server.inner().accept_uni().await.expect("accept stream");
+                (send, recv, server)
+            })
+            .await;
+            let counters: &'static crate::transport::metrics::QuicDataCounters =
+                Box::leak(Box::new(crate::transport::metrics::QuicDataCounters::new()));
+            let floor = floor_window_bytes(1 << 30);
+            let budget = QuicBudget::new(64 << 20, floor, counters);
+            let ranges = Arc::new(ConnRanges::new(MAX_GAPS_PER_CONNECTION, 64));
+            let staging = Arc::new(ConnStaging::new(1 << 20, counters));
+            let control: Arc<dyn WindowControl> = Arc::new(server.inner().clone());
+            let meter = Arc::new(budget.register(
+                control,
+                ranges.clone(),
+                staging.clone(),
+                time.now_nanos(),
+            ));
+            let mut reader = BodyReader::new(
+                recv,
+                time.clone(),
+                Duration::from_secs(30),
+                ranges,
+                Some(meter.clone()),
+                staging,
+            );
+            let chunk = |offset: u64, len: usize| {
+                Ok(Some(quinn::Chunk {
+                    offset,
+                    bytes: Bytes::from(vec![7u8; len]),
+                }))
+            };
+            // The clock does not move, so the meter does not evaluate and
+            // what it was told stays readable.
+            reader
+                .on_read(chunk(1000, 500))
+                .expect("a piece above the gap");
+            assert_eq!(
+                meter.unevaluated(),
+                (500, 0),
+                "bytes above a gap are read, not delivered"
+            );
+            reader
+                .on_read(chunk(2000, 300))
+                .expect("another piece above a gap");
+            assert_eq!(meter.unevaluated(), (800, 0));
+            reader.on_read(chunk(0, 1000)).expect("the gap filled");
+            assert_eq!(
+                meter.unevaluated(),
+                (1800, 1500),
+                "filling the gap delivers it and what was above it, up to the next gap"
+            );
+            drop((reader, send, server, permit));
+        })
+    }
 
     const F: usize = FRAGMENT_PAYLOAD_SIZE;
 

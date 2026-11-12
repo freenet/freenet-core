@@ -43,22 +43,34 @@
 //!   go. The cap follows W + debt and is never set below the gaps held.
 //! - **Control and short buffers**, a constant.
 //!
-//! A path at the floor windows is charged the floor grant ([`floor_grant`]).
-//! The budget does not refuse paths: how many fit is the aggregate step's cap
-//! (PR 5). It decides only growth and shrinking:
+//! A path at the floor windows is charged the floor grant ([`floor_grant`]),
+//! and that grant is part of the data path's fixed charge, not of this
+//! budget: the budget holds only each path's growth above it. So a path that
+//! arrives adds nothing here, however much the paths already here have grown,
+//! and the bound is
 //!
-//! - A connection grows when it is window-limited on CONTIGUOUS delivery: the
-//!   in-order prefix of its streams advanced, over the last interval (at least
-//!   one round trip, [`MIN_EVALUATION_INTERVAL`] at least), at least
-//!   [`LIMITED_PERCENT`] of a window per round trip. Bytes read above a gap do
-//!   not count, so a peer cannot grow its window by sending gapped data.
+//! ```text
+//! memory <= data paths x (QUIC_CONNECTION_CHARGE_BYTES + floor grant) + budget
+//! ```
+//!
+//! The budget does not refuse paths: how many there are is the aggregate
+//! step's cap (PR 5), which sums the first term. It decides only growth and
+//! shrinking:
+//!
+//! - A connection's receive window grows when it is window-limited on
+//!   CONTIGUOUS delivery: the in-order prefix of its streams advanced, over the
+//!   last interval (at least one round trip, [`MIN_EVALUATION_INTERVAL`] at
+//!   least), at least [`LIMITED_PERCENT`] of a window per round trip. Bytes
+//!   read above a gap do not count, so a peer cannot grow its window by
+//!   sending gapped data. Its send window grows toward twice the congestion
+//!   window. Either demand counts the connection as growing for the share.
 //! - A grow at most doubles a window, up to [`MAX_WINDOW_BYTES`], and is
 //!   granted only while the connection's charge stays within its share `C`
-//!   and the node's total within the budget. `C` is the floor grant plus the
-//!   budget above every path's floor grant, split over the connections that
-//!   are growing (max-min with a floor).
-//! - When a grow does not fit the budget, the connections furthest above their
-//!   floor grant are asked to shrink toward `C`. A receive shrink frees nothing
+//!   and the node's growth within the budget. `C` is the floor grant plus the
+//!   budget split over the connections that are growing (max-min with a
+//!   floor).
+//! - When a grow of either window does not fit the budget, the connections
+//!   furthest above their floor grant are asked to shrink toward `C`. A receive shrink frees nothing
 //!   until its debt is read, so the room comes as their peers' data is read,
 //!   never by taking credit back.
 //! - A connection that has delivered less than a quarter of its window per
@@ -232,7 +244,8 @@ pub(crate) struct QuicBudget {
 struct BudgetState {
     conns: HashMap<u64, ConnState>,
     next_id: u64,
-    /// The sum of every connection's `charged`.
+    /// The sum of every connection's growth: its `charged` less the floor
+    /// grant, which is the connection's fixed charge, not the budget's.
     charged: u64,
     /// The share cap and when it was computed: recomputed at most once per
     /// [`MIN_EVALUATION_INTERVAL`] node-wide, since counting the connections
@@ -295,8 +308,12 @@ impl ConnState {
 
     /// The terms no window sets directly: gaps at their cap and the control
     /// buffers.
+    /// The gap cap in force is charged when it is above the one `credit`
+    /// sets: it is floored at the gaps held when it was set
+    /// ([`Self::credit_changed`]) and stays there until the credit next
+    /// changes, even once those gaps close, as the staging cap does.
     fn fixed_with(&self, credit: u64) -> u64 {
-        (gap_cap(credit).max(self.ranges.held_now()) as u64)
+        (gap_cap(credit).max(self.ranges.cap()) as u64)
             .saturating_mul(GAP_BYTES)
             .saturating_add(CONTROL_BUFFER_BYTES)
     }
@@ -330,6 +347,15 @@ impl ConnState {
     /// W + debt moved: the gap cap and the staging cap follow it. The gap cap
     /// is never set below the gaps already held, so a shrink cannot make the
     /// next honest gap a trip.
+    ///
+    /// Raising the cap to the gaps held is not checked against the room left:
+    /// accepted. Gaps are held above the cap only after a trip, which stops
+    /// the stream at the first gap past the cap, so each trip adds at most one
+    /// gap ([`GAP_BYTES`], 70 B) to the charge this way, and a second trip
+    /// within 30 s closes the path, so a path that stays open adds at most one
+    /// gap per 30 s. A stopped stream's gaps count 32 less after their grace
+    /// period (`path::inbound::ConnRanges`), which lowers the cap again at the
+    /// next credit change.
     fn credit_changed(&self) {
         let credit = self.recv_window.saturating_add(self.debt);
         self.ranges
@@ -418,7 +444,11 @@ impl QuicBudget {
             };
             conn.credit_changed();
             conn.charged = conn.charge();
-            state.charged = state.charged.saturating_add(conn.charged);
+            // At the floor its growth is 0: a newcomer adds nothing to the
+            // budget, whatever the paths already here hold.
+            state.charged = state
+                .charged
+                .saturating_add(conn.charged.saturating_sub(self.grant()));
             state.conns.insert(id, conn);
             self.publish(&state);
             id
@@ -431,6 +461,7 @@ impl QuicBudget {
             control,
             read: AtomicU64::new(0),
             delivered: AtomicU64::new(0),
+            written: AtomicU64::new(0),
             evaluated_at: AtomicU64::new(now),
             interval: AtomicU64::new(nanos(MIN_EVALUATION_INTERVAL)),
             wake: tokio::sync::Notify::new(),
@@ -439,11 +470,17 @@ impl QuicBudget {
         }
     }
 
-    /// The sum of every connection's charge, recounted.
+    /// The sum of every connection's growth above the floor grant,
+    /// recounted: what the budget holds.
     #[cfg(test)]
     pub(crate) fn charged(&self) -> u64 {
+        let grant = self.grant();
         let mut state = self.state.lock();
-        state.conns.values_mut().map(ConnState::charge).sum()
+        state
+            .conns
+            .values_mut()
+            .map(|conn| conn.charge().saturating_sub(grant))
+            .sum()
     }
 
     /// The running total. Tests only.
@@ -456,15 +493,24 @@ impl QuicBudget {
         self.node.set_budget_charged(state.charged);
     }
 
-    /// Set `conn`'s charge from a recount, keeping the running total.
-    fn recount(total: &mut u64, conn: &mut ConnState) {
+    /// Set `conn`'s charge from a recount, keeping the running total of
+    /// growth above `grant`, the floor grant.
+    fn recount(total: &mut u64, conn: &mut ConnState, grant: u64) {
         let charge = conn.charge();
-        *total = total.saturating_sub(conn.charged).saturating_add(charge);
+        *total = total
+            .saturating_sub(conn.charged.saturating_sub(grant))
+            .saturating_add(charge.saturating_sub(grant));
         conn.charged = charge;
     }
 
-    /// The share cap `C` at `now`: the floor grant plus the budget above every
-    /// path's floor grant, split over the connections growing. Cached for
+    /// A path's charge at the floor windows: part of its fixed charge, not of
+    /// this budget.
+    fn grant(&self) -> u64 {
+        floor_grant(self.floor)
+    }
+
+    /// The share cap `C` at `now`: the floor grant plus the budget (growth
+    /// above floors) split over the connections growing. Cached for
     /// [`MIN_EVALUATION_INTERVAL`]; a connection that starts growing in that
     /// time is counted at the next recount, so for that long a share can be
     /// up to one connection's worth too large, which the node's budget still
@@ -482,14 +528,13 @@ impl QuicBudget {
 
     fn count_share(floor: u64, total: u64, state: &BudgetState, now: u64) -> u64 {
         let grant = floor_grant(floor);
-        let floors = grant.saturating_mul(state.conns.len() as u64);
         let growing = state
             .conns
             .values()
             .filter(|conn| conn.growing_until > now)
             .count()
             .max(1) as u64;
-        grant.saturating_add(total.saturating_sub(floors) / growing)
+        grant.saturating_add(total / growing)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -498,6 +543,7 @@ impl QuicBudget {
         id: u64,
         read: u64,
         delivered: u64,
+        written: u64,
         elapsed: u64,
         rtt: Duration,
         cwnd: u64,
@@ -506,8 +552,9 @@ impl QuicBudget {
         let mut guard = self.state.lock();
         let state = &mut *guard;
         let mut changes = Changes::default();
+        let send_target = cwnd.saturating_mul(2).clamp(self.floor, MAX_WINDOW_BYTES);
         let mut throttled = false;
-        let limited = {
+        let (limited, send_wants) = {
             let conn = state.conns.get_mut(&id)?;
             // Reads made before any change this evaluation makes, so they paid
             // the debt quinn had then.
@@ -533,7 +580,18 @@ impl QuicBudget {
                     >= u128::from(conn.recv_window)
                         * u128::from(elapsed)
                         * u128::from(LIMITED_PERCENT);
-            if limited {
+            // The send side's demand: the sends buffered at least
+            // LIMITED_PERCENT of the send window per round trip (quinn takes
+            // a write only while its unacknowledged data is below the send
+            // window, so that is a sender the window holds back), and the
+            // congestion window wants more than the send window gives.
+            let send_wants = send_target > conn.send_window
+                && elapsed > 0
+                && u128::from(written) * u128::from(rtt_nanos) * 100
+                    >= u128::from(conn.send_window)
+                        * u128::from(elapsed)
+                        * u128::from(LIMITED_PERCENT);
+            if limited || send_wants {
                 if conn.growing_until <= now {
                     // A new grower changes everyone's share.
                     state.share = None;
@@ -548,14 +606,17 @@ impl QuicBudget {
             {
                 conn.active_at = now;
             }
-            Self::recount(&mut state.charged, conn);
-            limited
+            Self::recount(&mut state.charged, conn, self.grant());
+            (limited, send_wants)
         };
         let grows = limited && state.conns.get(&id)?.recv_window < MAX_WINDOW_BYTES;
         let share = self.share(state, now);
         let conn = state.conns.get_mut(&id)?;
-        let others = state.charged.saturating_sub(conn.charged);
-        let allowed = share.min(self.total.saturating_sub(others));
+        let grant = self.grant();
+        let others = state
+            .charged
+            .saturating_sub(conn.charged.saturating_sub(grant));
+        let allowed = share.min(grant.saturating_add(self.total.saturating_sub(others)));
         let mut squeeze_need = 0;
         if grows {
             let target = conn.recv_window.saturating_mul(2).min(MAX_WINDOW_BYTES);
@@ -588,7 +649,8 @@ impl QuicBudget {
         // The send window follows the congestion window, within what is
         // allowed; it is lowered only once it is twice what is needed, so a
         // congestion window that moves does not open an epoch per evaluation.
-        let send_target = cwnd.saturating_mul(2).clamp(self.floor, MAX_WINDOW_BYTES);
+        // Held back by the budget below its share while its sends fill it,
+        // it asks others to make room as the receive side does.
         if send_target > conn.send_window {
             let recv = conn.recv_window;
             let window = largest_fitting(conn.send_window, send_target, |w| {
@@ -596,6 +658,13 @@ impl QuicBudget {
             });
             if window > conn.send_window {
                 conn.set_send(window, &mut changes);
+            }
+            if send_wants && window < send_target && allowed < share {
+                squeeze_need = squeeze_need.max(
+                    conn.charge_with(recv, send_target)
+                        .min(share)
+                        .saturating_sub(allowed),
+                );
             }
         } else if send_target.saturating_mul(2) <= conn.send_window {
             conn.set_send(send_target, &mut changes);
@@ -606,7 +675,7 @@ impl QuicBudget {
             recv_window: conn.recv_window,
             send_window: conn.send_window,
         };
-        Self::recount(&mut state.charged, conn);
+        Self::recount(&mut state.charged, conn, self.grant());
         if squeeze_need > 0 {
             self.squeeze_others(state, id, share, squeeze_need, now);
         }
@@ -654,17 +723,25 @@ impl QuicBudget {
     fn deregister(&self, id: u64) {
         let mut state = self.state.lock();
         if let Some(conn) = state.conns.remove(&id) {
-            state.charged = state.charged.saturating_sub(conn.charged);
+            state.charged = state
+                .charged
+                .saturating_sub(conn.charged.saturating_sub(self.grant()));
         }
         self.publish(&state);
     }
 
     /// Streams opened from now on take a new send epoch: a shrink was applied
     /// to the connection, and the old epoch is held at the old window.
+    /// The connection is recounted, so the old window leaves its charge as
+    /// soon as no stream holds the old epoch, not at its next evaluation.
     fn renew_send_epoch(&self, id: u64) {
-        if let Some(conn) = self.state.lock().conns.get_mut(&id) {
+        let mut guard = self.state.lock();
+        let state = &mut *guard;
+        if let Some(conn) = state.conns.get_mut(&id) {
             conn.send_epoch = Arc::new(());
+            Self::recount(&mut state.charged, conn, self.grant());
         }
+        self.publish(state);
     }
 
     fn send_epoch(&self, id: u64) -> Option<Arc<()>> {
@@ -758,6 +835,8 @@ pub(crate) struct ConnMeter {
     read: AtomicU64,
     /// Contiguous bytes delivered since the last evaluation.
     delivered: AtomicU64,
+    /// Bytes quinn took from this path's sends since the last evaluation.
+    written: AtomicU64,
     evaluated_at: AtomicU64,
     /// The interval between evaluations: the last round trip seen, at least
     /// [`MIN_EVALUATION_INTERVAL`].
@@ -785,7 +864,8 @@ impl ConnMeter {
     /// A send on the path made progress: wake the receive task, which
     /// evaluates if an interval has passed ([`Self::send_progress`]). Called
     /// from the send's own task; it evaluates nothing itself.
-    pub(crate) fn note_send(&self) {
+    pub(crate) fn note_send(&self, bytes: u64) {
+        self.written.fetch_add(bytes, Ordering::Relaxed);
         self.wake.notify_one();
     }
 
@@ -810,6 +890,7 @@ impl ConnMeter {
         let last = self.evaluated_at.swap(now, Ordering::Relaxed);
         let read = self.read.swap(0, Ordering::Relaxed);
         let delivered = self.delivered.swap(0, Ordering::Relaxed);
+        let written = self.written.swap(0, Ordering::Relaxed);
         let rtt = self.control.rtt();
         self.interval
             .store(nanos(rtt.max(MIN_EVALUATION_INTERVAL)), Ordering::Relaxed);
@@ -817,6 +898,7 @@ impl ConnMeter {
             self.id,
             read,
             delivered,
+            written,
             now.saturating_sub(last),
             rtt,
             self.control.congestion_window(),
@@ -892,6 +974,15 @@ impl ConnMeter {
     #[cfg(test)]
     pub(crate) fn debt(&self) -> u64 {
         self.budget.debt(self.id).unwrap_or(0)
+    }
+
+    /// Bytes read, and contiguous bytes delivered, since the last evaluation.
+    #[cfg(test)]
+    pub(crate) fn unevaluated(&self) -> (u64, u64) {
+        (
+            self.read.load(Ordering::Relaxed),
+            self.delivered.load(Ordering::Relaxed),
+        )
     }
 
     #[cfg(test)]

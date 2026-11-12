@@ -4,6 +4,8 @@ use std::process::Command;
 // Unit-tested from the library via a `#[cfg(test)]` module in `src/lib.rs`.
 #[path = "build/git_watch.rs"]
 mod git_watch;
+#[path = "build/version_floor.rs"]
+mod version_floor;
 
 fn main() {
     // Emit build metadata for startup logging
@@ -62,28 +64,34 @@ fn emit_min_compatible_version() {
         panic!("FREENET_MIN_COMPATIBLE_VERSION ({min_compat}) must be in X.Y.Z format");
     }
 
-    // Must share major.minor (wire format only encodes min_patch).
-    if pkg_parts.len() >= 2 && (pkg_parts[0] != min_parts[0] || pkg_parts[1] != min_parts[1]) {
-        panic!(
-            "FREENET_MIN_COMPATIBLE_VERSION ({min_compat}) must share major.minor \
-             with package version ({pkg_version}). The wire format only encodes \
-             min_patch; major.minor is inherited from the version field."
-        );
-    }
+    let num = |name: &str, v: &str| -> u64 {
+        v.parse()
+            .unwrap_or_else(|_| panic!("{name} component {v:?} is not numeric"))
+    };
+    let narrow = |name: &str, parts: &[&str]| -> (u8, u8, u16) {
+        let conv = |v: &str, max: u64| {
+            let n = num(name, v);
+            if n > max {
+                panic!("{name} component {v} is out of range for the wire format");
+            }
+            n
+        };
+        (
+            conv(parts[0], 255) as u8,
+            conv(parts[1], 255) as u8,
+            conv(parts[2], 65535) as u16,
+        )
+    };
+    let pkg = narrow("CARGO_PKG_VERSION", &pkg_parts);
+    let min = narrow("FREENET_MIN_COMPATIBLE_VERSION", &min_parts);
 
-    // Must not exceed the package version (would reject all peers including ourselves).
-    // Compare numerically, not lexicographically ("0.1.9" > "0.1.152" in string order).
-    let min_patch: u64 = min_parts[2].parse().unwrap_or_else(|_| {
-        panic!("FREENET_MIN_COMPATIBLE_VERSION ({min_compat}) has non-numeric patch")
-    });
-    let pkg_patch: u64 = pkg_parts[2]
-        .parse()
-        .unwrap_or_else(|_| panic!("CARGO_PKG_VERSION ({pkg_version}) has non-numeric patch"));
-    if min_patch > pkg_patch {
+    // Floor must not exceed the version (would reject all peers including
+    // ourselves) and must be encodable on the wire: same series (format 1) or
+    // a representable earlier series (format 2, see version_cmp.rs).
+    if let Err(why) = version_floor::check_floor(pkg, min) {
         panic!(
-            "FREENET_MIN_COMPATIBLE_VERSION ({min_compat}) must be <= package version \
-             ({pkg_version}). A min_compatible higher than our own version would \
-             reject all peers."
+            "FREENET_MIN_COMPATIBLE_VERSION ({min_compat}) is not valid for package version \
+             ({pkg_version}): {why}."
         );
     }
 

@@ -675,14 +675,15 @@ impl SendPacer for Honest {
 /// quinn makes writes wait past the gap and the connection's window carries
 /// the send, every reservation is offered at most 5 s and the send completes:
 /// the long waits are quinn's, after a reservation, and the write they end in
-/// is a step, so the next reservation is offered a fresh gap.
+/// is a step, so the next reservation is offered a fresh gap. Plain Cubic,
+/// as in that test.
 #[test]
 fn a_pacer_is_offered_at_most_the_gap_on_a_lossy_live_path() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
         let network = "quic-pacer-lossy-window";
         let loss = seeded_loss_from(network, 5, 0x5940_0007, Some(Duration::from_millis(100)));
-        let p = paths(network, 47, QuicPathLimits::DEFAULT).await;
+        let p = paths_without_loss_gate(network, 47).await;
         let pacer = Scripted::new(&p.time(), usize::MAX, Duration::ZERO);
         p.a.pace_with(pacer.clone());
         let (elapsed, outcome) = time_a_stream(&p, 8 * MIB).await;

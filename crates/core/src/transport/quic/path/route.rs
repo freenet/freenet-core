@@ -126,6 +126,10 @@ quic_outcomes! {
         /// after its stream opened (`pacer` module). Also counted under its
         /// kind's result.
         PacerRefused => "pacer_refused",
+        /// A cancelled one-packet send whose acknowledgement had not come
+        /// released its send epoch at once: `ACK_WAITS_WITHOUT_PERMIT` such
+        /// sends were already waiting on the path (`Outgoing`'s drop).
+        AckWaitReleased => "ack_wait_released",
     }
 }
 

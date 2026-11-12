@@ -344,8 +344,8 @@ pub(crate) const QUIC_CRYPTO_HOLD_BYTES: usize = QUIC_CRYPTO_BUFFER_BYTES + 32 *
 /// `quic_send_resets_reached_<n>`) so field data can justify a lower charge.
 ///
 /// Not yet summed in the node aggregate: the aggregate-accounting step of the
-/// buffer budget (#5940) sums `quic_connections x` this, and waits for the
-/// small-host decision.
+/// buffer budget (#5940) sums `quic_connections x` this, plus each data path's
+/// floor grant (`budget::floor_grant`), and waits for the small-host decision.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const QUIC_CONNECTION_CHARGE_BYTES: usize = QUIC_CONNECTION_FIXED_BYTES
     + MAX_UNI_STREAMS as usize * QUIC_OPEN_STREAM_BYTES
@@ -358,12 +358,15 @@ pub(crate) const QUIC_CONNECTION_CHARGE_BYTES: usize = QUIC_CONNECTION_FIXED_BYT
 /// as a divisor: one sixteenth.
 const QUIC_BUFFER_BUDGET_DIVISOR: usize = 16;
 
-/// The node-wide budget for QUIC memory that scales with the flow-control
-/// windows (received data, send windows, gaps), node memory / 16: 64 MiB at
-/// 1 GiB, 128 MiB at 2 GiB, 475 MiB at the 7600 MiB gateway. What does not
-/// scale with them is charged per connection ([`QUIC_CONNECTION_CHARGE_BYTES`]).
-/// Each data path's windows are set from it (`budget::QuicBudget`); the node
-/// aggregate sums it in the aggregate-accounting step (#5940).
+/// The node-wide budget for the growth of QUIC data paths' windows above
+/// their floor windows (received data, send windows, gaps), node memory / 16:
+/// 64 MiB at 1 GiB, 128 MiB at 2 GiB, 475 MiB at the 7600 MiB gateway. A data
+/// path at the floor windows is charged its floor grant (`budget::floor_grant`),
+/// which is per path and NOT in this budget; what does not scale with the
+/// windows is charged per connection ([`QUIC_CONNECTION_CHARGE_BYTES`]). So the
+/// node's QUIC memory is at most data paths x (that charge + floor grant) +
+/// this budget, and the aggregate-accounting step (#5940) sums all three
+/// terms. Each data path's windows are set from it (`budget::QuicBudget`).
 pub(crate) fn quic_buffer_budget_for(memory_limit: usize) -> usize {
     memory_limit / QUIC_BUFFER_BUDGET_DIVISOR
 }
@@ -387,6 +390,11 @@ pub(crate) const QUIC_MEMORY_MEASURED_WITH: [(&str, &str); 3] = [
 pub(crate) struct QuicRateLimit {
     bandwidth_limit: Option<usize>,
     global: Option<Arc<GlobalBandwidthManager>>,
+    /// Tests only: build plain Cubic without the loss gate
+    /// (`recycle::loss_gate`), for tests of what the path does when Cubic's
+    /// window collapses under loss.
+    #[cfg(test)]
+    pub(crate) without_loss_gate: bool,
 }
 
 impl QuicRateLimit {
@@ -397,6 +405,8 @@ impl QuicRateLimit {
         Self {
             bandwidth_limit,
             global,
+            #[cfg(test)]
+            without_loss_gate: false,
         }
     }
 

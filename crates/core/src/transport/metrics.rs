@@ -25,14 +25,14 @@
 use dashmap::DashMap;
 use std::net::SocketAddr;
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use tokio::sync::mpsc;
 
 use crate::tracing::{TransferDirection, TransferEvent};
 
 mod quic_data;
 pub use quic_data::QuicDataSnapshot;
-pub(crate) use quic_data::{PathLossWindow, QuicDataCounters, StreamsOpenPeak};
+pub(crate) use quic_data::{PathGateWindow, PathLossWindow, QuicDataCounters, StreamsOpenPeak};
 
 /// Global transport metrics instance.
 ///
@@ -850,6 +850,9 @@ pub struct TransportMetrics {
     /// Whether the crash-loop breaker keeps QUIC off in this process (a
     /// state, never reset).
     quic_breaker_suppressed: AtomicBool,
+    /// The QUIC endpoint's state, a [`QuicEndpointState`] as `u8` (a state,
+    /// never reset).
+    quic_endpoint_state: AtomicU8,
     /// QUIC connections this node closed, by [`QuicCloseCode`] (reset each
     /// snapshot). Counted when the close is queued, and only while it can
     /// still be sent (not after the endpoint went Down or its socket adapter
@@ -1296,6 +1299,7 @@ impl TransportMetrics {
             quic_breaker_trips: AtomicU64::new(0),
             quic_send_refused: AtomicU64::new(0),
             quic_breaker_suppressed: AtomicBool::new(false),
+            quic_endpoint_state: AtomicU8::new(QuicEndpointState::Unknown as u8),
             quic_close_sent: Default::default(),
             quic_close_received: Default::default(),
             quic_upgrade: Default::default(),
@@ -1749,6 +1753,7 @@ impl TransportMetrics {
         #[cfg(not(test))]
         let _ = local;
         self.quic_endpoint_down.fetch_add(1, Ordering::Relaxed);
+        self.set_quic_endpoint_state(QuicEndpointState::Died);
     }
 
     /// The socket adapter of the QUIC endpoint bound at `local` caught its
@@ -1788,6 +1793,24 @@ impl TransportMetrics {
     pub(crate) fn set_quic_breaker_suppressed(&self, suppressed: bool) {
         self.quic_breaker_suppressed
             .store(suppressed, Ordering::Relaxed);
+    }
+
+    /// Record the QUIC endpoint's state. [`QuicEndpointState::Died`] is final
+    /// for the process: an endpoint that died is never rebuilt, so nothing
+    /// set after it replaces it.
+    pub(crate) fn set_quic_endpoint_state(&self, state: QuicEndpointState) {
+        let died = QuicEndpointState::Died as u8;
+        // An `Err` is a death already recorded, which stays.
+        self.quic_endpoint_state
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                (current != died).then_some(state as u8)
+            })
+            .ok();
+    }
+
+    /// The QUIC endpoint's state as last recorded.
+    pub(crate) fn quic_endpoint_state(&self) -> QuicEndpointState {
+        QuicEndpointState::from_u8(self.quic_endpoint_state.load(Ordering::Relaxed))
     }
 
     /// Test-only: how many times the QUIC endpoint bound at `local` went
@@ -2600,6 +2623,7 @@ impl TransportMetrics {
             quic_breaker_trips: get64(&self.quic_breaker_trips),
             quic_send_refused: get64(&self.quic_send_refused),
             quic_breaker_suppressed: self.quic_breaker_suppressed.load(Ordering::Relaxed),
+            quic_endpoint: self.quic_endpoint_state().label().to_string(),
             quic_close_sent_node_dropped_peer: get64(
                 &self.quic_close_sent[QuicCloseCode::NodeDroppedPeer as usize],
             ),
@@ -3055,6 +3079,67 @@ impl TransportMetrics {
     }
 }
 
+/// The node's QUIC endpoint state for telemetry: whether it is up, and if
+/// not, why. The telemetry gate for removing the UDP transport counts nodes
+/// whose endpoint is up, not nodes on a release that has one (#5940).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum QuicEndpointState {
+    /// Not decided yet: the node has not reached the point where it builds
+    /// the endpoint (or it is not a node, as in many tests).
+    Unknown = 0,
+    /// The endpoint was built and its driver runs.
+    Up = 1,
+    /// `transport-quic` is set to `off`, or to a value this binary does not
+    /// know.
+    OffConfig = 2,
+    /// `transport-quic` is unset and this platform's default is off.
+    OffPlatform = 3,
+    /// The build aborts on panic, which the QUIC transport refuses.
+    OffAbort = 4,
+    /// The endpoint could not be built (socket or configuration error).
+    OffBind = 5,
+    /// The crash-loop breaker keeps QUIC off for this run.
+    OffBreaker = 6,
+    /// The endpoint died while the node held it: its driver ended, or its
+    /// socket adapter caught a panic (`quic::liveness`). Final.
+    Died = 7,
+}
+
+impl QuicEndpointState {
+    const ALL: [Self; 8] = [
+        Self::Unknown,
+        Self::Up,
+        Self::OffConfig,
+        Self::OffPlatform,
+        Self::OffAbort,
+        Self::OffBind,
+        Self::OffBreaker,
+        Self::Died,
+    ];
+
+    /// The value uploaded in `quic_endpoint`.
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Up => "up",
+            Self::OffConfig => "off_config",
+            Self::OffPlatform => "off_platform",
+            Self::OffAbort => "off_abort",
+            Self::OffBind => "off_bind",
+            Self::OffBreaker => "off_breaker",
+            Self::Died => "died",
+        }
+    }
+
+    fn from_u8(value: u8) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|state| *state as u8 == value)
+            .unwrap_or(Self::Unknown)
+    }
+}
+
 /// Periodic transport metrics snapshot.
 ///
 /// Emitted every N seconds to provide aggregate transport layer statistics
@@ -3197,6 +3282,9 @@ pub struct TransportSnapshot {
     pub quic_send_refused: u64,
     /// Whether the crash-loop breaker keeps QUIC off in this process.
     pub quic_breaker_suppressed: bool,
+    /// The QUIC endpoint's state ([`QuicEndpointState::label`]): `up`, or why
+    /// there is no endpoint. A state, never reset, and not activity.
+    pub quic_endpoint: String,
     /// QUIC connections this node closed, by close code
     /// ([`QuicCloseCode`]).
     pub quic_close_sent_node_dropped_peer: u64,
@@ -3589,6 +3677,7 @@ impl TransportSnapshot {
             quic_breaker_trips,
             quic_send_refused,
             quic_breaker_suppressed,
+            quic_endpoint,
             quic_close_sent_node_dropped_peer,
             quic_close_sent_downgrade,
             quic_close_sent_identity_mismatch,
@@ -3736,6 +3825,7 @@ impl TransportSnapshot {
         self.quic_breaker_trips = quic_breaker_trips;
         self.quic_send_refused = quic_send_refused;
         self.quic_breaker_suppressed = quic_breaker_suppressed;
+        self.quic_endpoint = quic_endpoint;
         self.quic_close_sent_node_dropped_peer = quic_close_sent_node_dropped_peer;
         self.quic_close_sent_downgrade = quic_close_sent_downgrade;
         self.quic_close_sent_identity_mismatch = quic_close_sent_identity_mismatch;
@@ -3938,6 +4028,9 @@ struct SnapshotExtras {
     pub quic_send_refused: u64,
     /// Whether the crash-loop breaker keeps QUIC off in this process.
     pub quic_breaker_suppressed: bool,
+    /// The QUIC endpoint's state ([`QuicEndpointState::label`]): `up`, or why
+    /// there is no endpoint. A state, never reset, and not activity.
+    pub quic_endpoint: String,
     /// QUIC connections this node closed, by close code
     /// ([`QuicCloseCode`]).
     pub quic_close_sent_node_dropped_peer: u64,
@@ -5246,6 +5339,50 @@ mod tests {
         assert!(snap.quic_breaker_suppressed, "the state is not reset");
     }
 
+    /// The endpoint state reaches the snapshot as its label, is not activity,
+    /// is never reset, and `died` is final: nothing recorded after a death
+    /// replaces it.
+    #[test]
+    fn quic_endpoint_state_reaches_snapshot_and_died_is_final() {
+        let metrics = TransportMetrics::new();
+        assert_eq!(metrics.quic_endpoint_state(), QuicEndpointState::Unknown);
+        metrics.set_quic_endpoint_state(QuicEndpointState::Up);
+        assert!(
+            metrics.take_snapshot().is_none(),
+            "an endpoint state alone is not activity"
+        );
+        metrics.record_upgrade_control_received();
+        let snap = metrics.take_snapshot().expect("activity");
+        assert_eq!(snap.quic_endpoint, "up");
+        let json = serde_json::to_value(&snap).unwrap();
+        assert_eq!(json["quic_endpoint"], "up");
+        metrics.record_quic_endpoint_down("127.0.0.1:1".parse().unwrap());
+        assert_eq!(metrics.quic_endpoint_state(), QuicEndpointState::Died);
+        for state in QuicEndpointState::ALL {
+            metrics.set_quic_endpoint_state(state);
+            assert_eq!(
+                metrics.quic_endpoint_state(),
+                QuicEndpointState::Died,
+                "{state:?} after a death"
+            );
+        }
+        let snap = metrics.take_snapshot().expect("the death is activity");
+        assert_eq!(snap.quic_endpoint, "died", "the state is not reset");
+    }
+
+    /// Every endpoint state has its own label and survives the round trip
+    /// through the atomic.
+    #[test]
+    fn quic_endpoint_states_have_distinct_labels_and_round_trip() {
+        let labels: std::collections::BTreeSet<_> =
+            QuicEndpointState::ALL.iter().map(|s| s.label()).collect();
+        assert_eq!(labels.len(), QuicEndpointState::ALL.len());
+        for state in QuicEndpointState::ALL {
+            assert_eq!(QuicEndpointState::from_u8(state as u8), state);
+        }
+        assert_eq!(QuicEndpointState::from_u8(200), QuicEndpointState::Unknown);
+    }
+
     #[test]
     fn quic_send_refused_is_activity_reaches_snapshot_and_resets() {
         let metrics = TransportMetrics::new();
@@ -6535,6 +6672,7 @@ mod tests {
             "quic_breaker_trips",
             "quic_send_refused",
             "quic_breaker_suppressed",
+            "quic_endpoint",
             "quic_close_sent_node_dropped_peer",
             "quic_close_sent_downgrade",
             "quic_close_sent_identity_mismatch",

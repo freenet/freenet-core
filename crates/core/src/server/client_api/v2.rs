@@ -42,6 +42,7 @@ async fn web_home_v2(
     // Same tolerance as `hosted_mode` above.
     extensions: axum::http::Extensions,
 ) -> Result<axum::response::Response, WebSocketApiError> {
+    let host_trusted = request_host_trusted(&headers, &extensions);
     web_home(
         key,
         rs,
@@ -53,6 +54,7 @@ async fn web_home_v2(
         extensions
             .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
             .map(|ci| ci.0),
+        host_trusted,
     )
     .await
 }
@@ -68,6 +70,7 @@ async fn web_subpages_v2(
     // See `web_home_*`: read from extensions so standalone routers do not 500.
     extensions: axum::http::Extensions,
 ) -> Result<axum::response::Response, WebSocketApiError> {
+    let host_trusted = request_host_trusted(&headers, &extensions);
     web_subpages(
         key,
         last_path,
@@ -80,6 +83,7 @@ async fn web_subpages_v2(
         extensions
             .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
             .map(|ci| ci.0),
+        host_trusted,
     )
     .await
 }

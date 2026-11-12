@@ -3118,10 +3118,12 @@ impl NetworkApiConfig {
     ///
     /// The cap is `max_connections`: a path needs a UDP session, and the
     /// node's QUIC memory is bounded per path (the fixed charge,
-    /// `quic::config::QUIC_CONNECTION_CHARGE_BYTES`) and by the buffer budget
-    /// its data paths' windows share (`quic::budget`). At the default the limit rarely
-    /// binds: a connection has at most one path, but a permit is held from
-    /// the offer, so a path still closing can briefly hold a slot.
+    /// `quic::config::QUIC_CONNECTION_CHARGE_BYTES`, plus, for a data path, the
+    /// floor grant, `quic::budget::floor_grant`) and by the buffer budget its
+    /// data paths' windows grow into above that (`quic::budget`). At the
+    /// default the limit rarely binds: a connection has at most one path, but
+    /// a permit is held from the offer, so a path still closing can briefly
+    /// hold a slot.
     pub(crate) fn quic_max_paths(&self) -> usize {
         match self.quic_max_paths_setting() {
             QuicMaxPathsSetting::Set(limit) => limit.min(self.max_connections),
@@ -3810,7 +3812,8 @@ pub struct WebsocketApiConfig {
     pub token_cleanup_interval_seconds: u64,
 
     /// Additional hostnames allowed in the Host header for WebSocket connections.
-    /// Empty means only auto-detected hostnames (machine hostname + bound IP) are allowed.
+    /// Empty means only auto-detected hosts are allowed: the loopback names, the bound
+    /// IP, and (for a non-loopback bind only) the machine hostname and its IPs.
     #[serde(default, rename = "allowed-host")]
     pub allowed_hosts: Vec<String>,
 

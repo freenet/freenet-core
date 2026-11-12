@@ -1817,9 +1817,11 @@ pub(crate) fn declared_cache_ceiling_terms(
     // endpoint per node, and fixed. Summed whatever `transport-quic` says, as
     // the ingress queue is. The QUIC flow-control windows and quinn's
     // per-connection state are NOT summed, so this aggregate does not
-    // account a node's QUIC connections; see `NOT_SUMMED` (the buffer budget,
-    // `quic_buffer_budget_for`, and the fixed charge, both summed by the
-    // buffer budget's aggregate-accounting step).
+    // account a node's QUIC connections; see `NOT_SUMMED`. The aggregate
+    // step (#5940, PR 5) must sum data paths x (the fixed charge
+    // `QUIC_CONNECTION_CHARGE_BYTES` + the floor grant `quic::budget::floor_grant`)
+    // + the buffer budget `quic_buffer_budget_for`, which holds only growth
+    // above the floor grants.
     let quic_incoming = crate::transport::quic::config::INCOMING_BUFFER_TOTAL_BYTES as usize;
     // The delegate context cache (`ctx.write()` bytes). One per node, shared
     // by every executor, so NOT multiplied by the pool.
@@ -3009,20 +3011,23 @@ mod tests {
                 "WAKE_DATAGRAM_BYTES",
                 "egress-cap wake threshold for a QUIC datagram (a rate quantity), not memory",
             ),
-            // A QUIC data path's flow-control windows are set per connection
-            // from the node's buffer budget (quic::budget, quic_buffer_budget_for,
-            // listed below): these are the bounds and terms inside it, not
-            // budgets of their own.
+            // A QUIC data path's flow-control windows are set per connection:
+            // at the floor windows a path is charged its floor grant
+            // (quic::budget::floor_grant), part of the path's fixed charge, and
+            // growth above that comes from the node's buffer budget
+            // (quic_buffer_budget_for, listed below). These are the bounds and
+            // terms inside the two, not budgets of their own.
             (
                 "floor_window_bytes",
-                "the floor window of one QUIC connection, inside quic_buffer_budget_for \
-                 (each data path's floor grant)",
+                "the floor window of one QUIC connection, inside each data path's \
+                 floor grant, which is per path and not in quic_buffer_budget_for",
             ),
             (
                 "STAGING_BUFFER_OVERHEAD_BYTES",
                 "the overhead charged per staging buffer of ONE QUIC stream \
                  (quic::path::inbound), against its connection's staging cap, \
-                 inside quic_buffer_budget_for and the fixed charge",
+                 inside the path's floor grant and its growth charged to \
+                 quic_buffer_budget_for",
             ),
             (
                 "INITIAL_RECEIVE_WINDOW_BYTES",
@@ -3031,22 +3036,24 @@ mod tests {
             ),
             (
                 "MIN_WINDOW_BYTES",
-                "floor of one QUIC connection's window, inside quic_buffer_budget_for",
+                "floor of one QUIC connection's window, inside each data path's \
+                 floor grant (per path, not in quic_buffer_budget_for)",
             ),
             (
                 "MIN_WINDOW_SMALL_HOST_BYTES",
-                "floor of one QUIC connection's window under 2 GiB, inside \
-                 quic_buffer_budget_for",
+                "floor of one QUIC connection's window under 2 GiB, inside each \
+                 data path's floor grant (per path, not in quic_buffer_budget_for)",
             ),
             (
                 "MAX_WINDOW_BYTES",
-                "the largest window one QUIC connection grows to, inside \
-                 quic_buffer_budget_for (per connection, not summed)",
+                "the largest window one QUIC connection grows to; its growth above \
+                 the floor grant is charged to quic_buffer_budget_for (per \
+                 connection, not summed)",
             ),
             (
                 "GAP_BYTES",
-                "the charge per received gap of one QUIC connection, inside \
-                 quic_buffer_budget_for",
+                "the charge per received gap of one QUIC connection, inside the \
+                 path's floor grant and its growth charged to quic_buffer_budget_for",
             ),
             (
                 "WAITING_SHORT_BYTES",
@@ -3055,8 +3062,8 @@ mod tests {
             ),
             (
                 "CONTROL_BUFFER_BYTES",
-                "the control and short buffers of one QUIC data path, inside \
-                 quic_buffer_budget_for",
+                "the control and short buffers of one QUIC data path, inside its \
+                 floor grant (per path, not in quic_buffer_budget_for)",
             ),
             (
                 "INCOMING_BUFFER_BYTES",
@@ -3113,14 +3120,16 @@ mod tests {
             (
                 "QUIC_CONNECTION_CHARGE_BYTES",
                 "the fixed charge per QUIC connection; summed as quic_connections x \
-                 this by the buffer budget's aggregate-accounting step (#5940, PR 5), \
+                 this, plus each data path's floor grant (quic::budget::floor_grant), \
+                 by the buffer budget's aggregate-accounting step (#5940, PR 5), \
                  before any release carries data on QUIC",
             ),
             (
                 "quic_buffer_budget_for",
-                "the node-wide QUIC buffer budget (memory / 16), from which each data \
-                 path's windows are set (quic::budget); summed by the buffer budget's \
-                 aggregate-accounting step (#5940)",
+                "the node-wide QUIC buffer budget (memory / 16): the data paths' \
+                 window growth above their floor grants (quic::budget), which are \
+                 not in it; summed with data paths x (fixed charge + floor grant) \
+                 by the buffer budget's aggregate-accounting step (#5940)",
             ),
             (
                 "MAX_CONTROL_BYTES",
@@ -3136,6 +3145,11 @@ mod tests {
                 "MIN_FREE_BYTES",
                 "free-DISK threshold the state directory must have before the node stages \
                  a release (#5791), not memory",
+            ),
+            (
+                "SHARE_MIN_BYTES",
+                "QUIC loss gate: bytes a round trip must acknowledge or lose before its \
+                 loss share is sampled (quic::recycle::loss_gate), a threshold, not memory",
             ),
         ];
 
