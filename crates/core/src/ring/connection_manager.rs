@@ -550,9 +550,9 @@ pub(crate) struct ConnectionManager {
     transient_connections: Arc<DashMap<SocketAddr, TransientEntry>>,
     /// Addresses of the transports the network bridge holds open, whether or
     /// not they are ring connections or still tracked as transient (a
-    /// transient entry expires while its transport can stay open). Written
-    /// only by `P2pConnManager::insert_connection` / `remove_connection`, so
-    /// it holds exactly the bridge's connection map's keys; bounded by it.
+    /// transient entry expires while its transport can stay open). Written by
+    /// the bridge's `ConnectionMap::insert` / `remove`, the only ways that
+    /// map's keys change, so it holds exactly those keys; bounded by it.
     open_transports: Arc<dashmap::DashSet<SocketAddr>>,
     transient_in_use: Arc<AtomicUsize>,
     transient_budget: usize,

@@ -2130,6 +2130,11 @@ impl SimNetwork {
     #[cfg(any(test, feature = "testing"))]
     pub fn with_node_pre_floor_native_decoder(&mut self, label: &NodeLabel) -> &mut Self {
         self.node_config_mut(label).native_wire_pre_floor = true;
+        let addr = *self
+            .node_addresses
+            .get(label)
+            .expect("a pre-floor node must have an address in this network");
+        crate::operations::connect::native_wire_trace::mark_pre_floor(&self.name, addr);
         self
     }
 

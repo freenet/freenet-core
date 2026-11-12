@@ -1603,7 +1603,7 @@ impl P2pConnManager {
         // network-bridge layer) can gate emission of version-sensitive wire
         // variants — e.g. the summary-first PUT probe's
         // `supports_summary_first_put` check. Keep this write paired with
-        // the `self.connections.insert` above if that call site changes.
+        // the `self.insert_connection` above if that call site changes.
         // Write the Option THROUGH — unconditionally, so a reconnection whose
         // version is unknown CLEARS any stale entry rather than leaving us
         // believing a downgraded peer is still current. Since #5161 a `None`

@@ -780,8 +780,16 @@ async fn drive_client_connect(
                     continue;
                 }
 
+                // A joiner standing in for a release below the floor sends no
+                // offer, so its responses carry no decision by design; only an
+                // at-floor joiner's missing decision is the fallback the trace
+                // counts.
                 #[cfg(any(test, feature = "testing"))]
-                if let Some(addr) = payload.acceptor.socket_addr() {
+                if let Some(addr) = payload
+                    .acceptor
+                    .socket_addr()
+                    .filter(|_| !op_manager.ring.connection_manager.native_wire().pre_floor)
+                {
                     super::wire::sim_trace::record_at(
                         addr,
                         super::wire::sim_trace::NativeWireEvent::JoinerResponse {
@@ -800,7 +808,8 @@ async fn drive_client_connect(
                 // dial, so a `Native` decision cannot be honoured: the attempt
                 // with this acceptor fails, is counted by why, and is reported
                 // upstream as `ConnectFailed` like a failed punch, so the relay
-                // re-routes and the acceptor's reservation is released.
+                // marks the acceptor visited and re-routes. The acceptor's
+                // reservation is not released by this; it times out.
                 if let Err(failure) =
                     super::native::joiner_response_action(sent_offer, payload.native_decision)
                 {
@@ -1016,17 +1025,24 @@ struct AcceptorDial {
 /// Records an accept in the simulation's native-wire trace: whether the
 /// request carried an offer (the response carries a decision exactly then),
 /// and whether it was accepted after a `Rejected` or `ConnectFailed` re-route.
-fn trace_accept(upstream: SocketAddr, response: &super::ConnectResponse, retry: bool) {
+/// Called once the accept is dispatched, so a failed dispatch is not traced.
+fn trace_accept(
+    upstream: SocketAddr,
+    response: &super::ConnectResponse,
+    joiner: Option<SocketAddr>,
+    retry: bool,
+) {
     #[cfg(any(test, feature = "testing"))]
     super::native_wire_trace::record_at(
         upstream,
         super::native_wire_trace::NativeWireEvent::Accepted {
             with_offer: response.native_decision.is_some(),
             retry,
+            joiner,
         },
     );
     #[cfg(not(any(test, feature = "testing")))]
-    let _ = (upstream, response, retry);
+    let _ = (upstream, response, joiner, retry);
 }
 
 /// Starts the hole punch to `acceptor`, whose Response arrived at
@@ -1389,7 +1405,12 @@ async fn drive_relay_connect(
         ) {
             op_manager.ring.register_events(Either::Left(event)).await;
         }
-        trace_accept(upstream_addr, &accept.response, false);
+        trace_accept(
+            upstream_addr,
+            &accept.response,
+            accept.joiner.socket_addr(),
+            false,
+        );
         let mut ctx = op_manager.op_ctx(incoming_tx);
         ctx.send_fire_and_forget(
             upstream_addr,
@@ -1564,8 +1585,9 @@ async fn drive_relay_connect(
                     ) {
                         op_manager.ring.register_events(Either::Left(event)).await;
                     }
+                    let joiner_addr = accept.joiner.socket_addr();
                     dispatch_expect_connection_from(op_manager, incoming_tx, accept.joiner).await?;
-                    trace_accept(upstream_addr, &accept.response, true);
+                    trace_accept(upstream_addr, &accept.response, joiner_addr, true);
                     let mut ctx = op_manager.op_ctx(incoming_tx);
                     ctx.send_fire_and_forget(
                         upstream_addr,
@@ -1736,8 +1758,9 @@ async fn drive_relay_connect(
                     ) {
                         op_manager.ring.register_events(Either::Left(event)).await;
                     }
+                    let joiner_addr = accept.joiner.socket_addr();
                     dispatch_expect_connection_from(op_manager, incoming_tx, accept.joiner).await?;
-                    trace_accept(upstream_addr, &accept.response, true);
+                    trace_accept(upstream_addr, &accept.response, joiner_addr, true);
                     let mut ctx = op_manager.op_ctx(incoming_tx);
                     ctx.send_fire_and_forget(
                         upstream_addr,

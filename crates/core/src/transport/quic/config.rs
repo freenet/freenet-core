@@ -536,7 +536,9 @@ pub(crate) fn endpoint_config_with_cid_key(cid_key: [u8; 32]) -> std::io::Result
         .supported_versions(vec![QUIC_VERSION])
         // Must stay false: a cleared fixed bit could make a short-header
         // packet start with 0x01 or 0x02, which the demux reads as a UDP
-        // transport packet (RFC 9287; transport::demux).
+        // transport packet, or 0x03, which it drops as a native punch
+        // (demux::PUNCH_FIRST_BYTE) (RFC 9287; transport::demux). Every
+        // endpoint, native connections included, is built from this config.
         .grease_quic_bit(false)
         .min_reset_interval(Duration::from_millis(20))
         .rng_seed(Some(seed));

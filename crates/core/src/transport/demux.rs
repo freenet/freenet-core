@@ -205,6 +205,31 @@ impl Drop for QuicSourcePermit {
     }
 }
 
+/// First byte of a QUIC-native punch datagram (#5940, design 2.4): 9 bytes,
+/// this byte then 8 random ones, sent by both sides of a native connection to
+/// open their NATs before the QUIC handshake. It is classified
+/// [`DemuxClass::Other`] like any byte that is neither the UDP transport's nor
+/// QUIC-shaped, so the receiver drops and counts it (`demux_other`); it is
+/// reserved here so no later datagram type takes it. Checked at compile time
+/// against both other classes.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const PUNCH_FIRST_BYTE: u8 = 0x03;
+
+/// Length of a punch datagram: [`PUNCH_FIRST_BYTE`] and 8 random bytes.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const PUNCH_LEN: usize = 9;
+
+const _: () = {
+    assert!(
+        PUNCH_FIRST_BYTE & QUIC_FIRST_BYTE_MASK == 0,
+        "a punch is not QUIC-shaped"
+    );
+    assert!(
+        PUNCH_FIRST_BYTE != PACKET_TYPE_INTRO && PUNCH_FIRST_BYTE != PACKET_TYPE_SYMMETRIC,
+        "a punch is not a UDP transport packet"
+    );
+};
+
 /// Classify a datagram by its first byte. An empty datagram is
 /// [`DemuxClass::Other`].
 pub(crate) fn classify(packet: &[u8]) -> DemuxClass {
@@ -606,13 +631,30 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
-    /// The expected class of a first byte, written out as literal ranges
-    /// rather than through the constants the implementation uses.
+    /// Every first byte's expected class, by value: the UDP transport's two
+    /// types, the reserved punch byte and the QUIC-shaped range, written out
+    /// as literals rather than through the constants the implementation uses.
     fn expected_class(first: u8) -> DemuxClass {
         match first {
             0x01 | 0x02 => DemuxClass::Legacy,
+            // PUNCH_FIRST_BYTE: dropped and counted, like the rest of Other.
+            0x03 => DemuxClass::Other,
             0x40..=0xFF => DemuxClass::Quic,
             _ => DemuxClass::Other,
+        }
+    }
+
+    /// The reserved punch byte is the one the table above names, and a punch
+    /// of any content classifies as `Other`.
+    #[test]
+    fn a_punch_is_dropped_as_other_whatever_its_tail() {
+        assert_eq!(PUNCH_FIRST_BYTE, 0x03);
+        assert_eq!(expected_class(PUNCH_FIRST_BYTE), DemuxClass::Other);
+        for tail in [[0u8; 8], [0xFF; 8], [0x01; 8], [0x40, 0, 0, 0, 0, 0, 0, 0]] {
+            let mut punch = [0u8; PUNCH_LEN];
+            punch[0] = PUNCH_FIRST_BYTE;
+            punch[1..].copy_from_slice(&tail);
+            assert_eq!(classify(&punch), DemuxClass::Other, "{punch:?}");
         }
     }
 

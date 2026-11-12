@@ -53,11 +53,13 @@ use freenet_stdlib::client_api::{ContractResponse, HostResponse};
 
 mod broadcast;
 mod connection_lifecycle;
+mod connection_map;
 mod dispatch;
 mod identity;
 mod migration;
 mod zombie_sweep;
 
+use connection_map::ConnectionMap;
 use zombie_sweep::ZombieSweepState;
 #[cfg(test)]
 use zombie_sweep::{TransportActivity, is_zombie};
@@ -693,9 +695,10 @@ pub(in crate::node) struct P2pConnManager {
     conn_bridge_rx: Receiver<P2pBridgeEvent>,
     event_listener: Box<dyn NetEventRegister>,
     /// Connections indexed by socket address (the transport-level identifier).
-    /// This is the source of truth for active connections.
-    /// Uses BTreeMap for deterministic iteration order in simulation tests.
-    connections: BTreeMap<SocketAddr, ConnectionEntry>,
+    /// This is the source of truth for active connections. Its keys change
+    /// only through [`Self::insert_connection`] and [`Self::remove_connection`]
+    /// (`connection_map`).
+    connections: ConnectionMap,
     /// Reverse lookup: public key -> socket address.
     /// Used to find connections when we only know the peer's identity.
     /// Must be kept in sync with `connections`.
@@ -1245,31 +1248,20 @@ where
 }
 
 impl P2pConnManager {
-    /// Adds a transport to the connection map. Every insert goes through
-    /// here, so the connection manager's open-transport set
-    /// (`ConnectionManager::has_open_transport`) holds exactly this map's keys.
+    /// Adds a transport to the connection map and the connection manager's
+    /// open-transport set (`ConnectionManager::has_open_transport`), which
+    /// `ConnectionMap` keeps equal to the map's keys.
     fn insert_connection(
         &mut self,
         addr: SocketAddr,
         entry: ConnectionEntry,
     ) -> Option<ConnectionEntry> {
-        self.bridge
-            .op_manager
-            .ring
-            .connection_manager
-            .note_transport_open(addr);
         self.connections.insert(addr, entry)
     }
 
-    /// Removes a transport from the connection map; the only removal path,
-    /// for the same reason as [`Self::insert_connection`].
+    /// Removes a transport from the connection map and the open-transport set.
     fn remove_connection(&mut self, addr: SocketAddr) -> Option<ConnectionEntry> {
-        self.bridge
-            .op_manager
-            .ring
-            .connection_manager
-            .note_transport_closed(addr);
-        self.connections.remove(&addr)
+        self.connections.remove(addr)
     }
 
     pub(in crate::node) fn listening_port(&self) -> u16 {
@@ -1384,12 +1376,13 @@ impl P2pConnManager {
             .config
             .network_api
             .warn_if_total_bandwidth_limit_is_zero();
+        let connections = ConnectionMap::new(bridge.op_manager.ring.connection_manager.clone());
         Ok(P2pConnManager {
             gateways,
             bridge,
             conn_bridge_rx: rx_bridge_cmd,
             event_listener: Box::new(event_listener),
-            connections: BTreeMap::new(),
+            connections,
             addr_by_pub_key: identity::KeyIndex::default(),
             conn_event_tx: None,
             key_pair,
@@ -4270,98 +4263,6 @@ pub(crate) mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::mpsc;
     use tokio::time::{Duration, Instant, sleep, timeout};
-
-    /// Every change to the bridge's connection map goes through
-    /// `insert_connection` / `remove_connection`, which keep the connection
-    /// manager's open-transport set (read by the relay's QUIC-native decision)
-    /// equal to the map's keys. A direct `connections.insert(` elsewhere would
-    /// leave a transport the relay cannot see; a direct `remove(` would leave
-    /// a closed one it still counts. Scans the production code of every file
-    /// of the bridge (before each file's first test module, comment lines
-    /// skipped) for any call that changes the map's keys.
-    #[test]
-    fn the_connection_map_changes_only_through_its_helpers() {
-        const FILES: [(&str, &str); 7] = [
-            ("p2p_protoc.rs", include_str!("p2p_protoc.rs")),
-            (
-                "p2p_protoc/broadcast.rs",
-                include_str!("p2p_protoc/broadcast.rs"),
-            ),
-            (
-                "p2p_protoc/connection_lifecycle.rs",
-                include_str!("p2p_protoc/connection_lifecycle.rs"),
-            ),
-            (
-                "p2p_protoc/dispatch.rs",
-                include_str!("p2p_protoc/dispatch.rs"),
-            ),
-            (
-                "p2p_protoc/identity.rs",
-                include_str!("p2p_protoc/identity.rs"),
-            ),
-            (
-                "p2p_protoc/migration.rs",
-                include_str!("p2p_protoc/migration.rs"),
-            ),
-            (
-                "p2p_protoc/zombie_sweep.rs",
-                include_str!("p2p_protoc/zombie_sweep.rs"),
-            ),
-        ];
-        const KEY_CHANGES: [&str; 10] = [
-            "insert(",
-            "remove(",
-            "retain(",
-            "clear(",
-            "entry(",
-            "append(",
-            "split_off(",
-            "pop_first(",
-            "pop_last(",
-            "extract_if(",
-        ];
-        let mut found = Vec::new();
-        for (name, src) in FILES {
-            // Up to the first test module (a `#[cfg(test)]` on a single item
-            // earlier in the file does not end the production code).
-            let production = ["\n#[cfg(test)]\nmod ", "\n#[cfg(test)]\npub(crate) mod "]
-                .iter()
-                .filter_map(|marker| src.find(marker))
-                .min()
-                .map_or(src, |end| &src[..end]);
-            if name == "p2p_protoc.rs" {
-                assert!(
-                    production.contains("fn insert_connection(")
-                        && production.contains("fn remove_connection("),
-                    "the production region of {name} must contain the helpers"
-                );
-            }
-            for line in production.lines() {
-                let code = line.trim_start();
-                if code.starts_with("//") {
-                    continue;
-                }
-                for (at, _) in code.match_indices("connections.") {
-                    let preceded_by_name = code[..at]
-                        .chars()
-                        .next_back()
-                        .is_some_and(|c| c.is_alphanumeric() || c == '_');
-                    let rest = &code[at + "connections.".len()..];
-                    if !preceded_by_name && KEY_CHANGES.iter().any(|m| rest.starts_with(m)) {
-                        found.push(format!("{name}: {code}"));
-                    }
-                }
-            }
-        }
-        assert_eq!(
-            found,
-            vec![
-                "p2p_protoc.rs: self.connections.insert(addr, entry)".to_string(),
-                "p2p_protoc.rs: self.connections.remove(&addr)".to_string(),
-            ],
-            "the connection map must change only in insert_connection / remove_connection"
-        );
-    }
 
     /// Each way the transport listener can stop is logged as the event loop
     /// logged it when it read the listener task's `JoinHandle` itself, and ends

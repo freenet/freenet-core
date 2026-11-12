@@ -495,6 +495,13 @@ fn classify(kind: QuicErrorKind) -> Verdict {
             | QuicRefusal::ConnectionRefused
             | QuicRefusal::UnusableKey
             | QuicRefusal::Local => normal(Outcome::HandshakeFailed, FallbackCause::Reset),
+            // Close codes VERSION_INCOMPATIBLE and HELLO_REFUSED are sent only
+            // on native connections, never on an upgrade path. Should one
+            // arrive here it is read as a node before these codes read it, an
+            // unknown code: a lost connection.
+            QuicRefusal::VersionIncompatible | QuicRefusal::HelloRefused => {
+                normal(Outcome::HandshakeFailed, FallbackCause::Reset)
+            }
         },
     }
 }
