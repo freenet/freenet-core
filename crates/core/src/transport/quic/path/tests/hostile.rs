@@ -7,7 +7,7 @@
 
 use super::super::bounded::SendDeadlines;
 use super::*;
-use crate::transport::quic::budget::{QuicBudget, floor_grant, floor_window_bytes};
+use crate::transport::quic::budget::{QuicBudget, floor_window_bytes};
 use crate::transport::quic::config::quic_buffer_budget_for;
 
 /// The node memory the budgets below are sized for: 2 GiB, the smallest host
@@ -1892,14 +1892,9 @@ fn a_squeeze_never_puts_the_cap_under_what_is_staged() {
                 run.min_charge_headroom >= 0,
                 "staged bytes uncharged: {run:?}"
             );
-            // The newcomer is admitted at its floor grant while the victim,
-            // which grew alone, holds the whole budget: the node is over by
-            // that grant until the victim's shrink is applied and its debt
-            // read. Pinned at the measured bound; reported on #6173.
-            assert!(
-                run.node_peak <= run.budget_total + floor_grant(floor_window_bytes(NODE_MEMORY)),
-                "{run:?}"
-            );
+            // The budget holds growth above the floors, so a newcomer's
+            // floor grant does not push it over.
+            assert!(run.node_peak <= run.budget_total, "{run:?}");
         }
     })
 }
