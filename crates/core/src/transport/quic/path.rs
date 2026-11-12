@@ -142,7 +142,7 @@ pub(in crate::transport) mod pacer;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -746,6 +746,9 @@ pub(crate) struct QuicPath {
     /// ([`STREAMED_SEND_LIMIT`]), so the remaining uni stream slots stay
     /// for short messages and control frames. Never closed.
     stream_slots: Arc<tokio::sync::Semaphore>,
+    /// Control frames taking their stream ([`Self::control_first`]); a data
+    /// send opens no stream while any is.
+    controls_opening: Arc<ControlsOpening>,
     /// Whether this path may send data, one of the `SEND_DATA_*` values. Off for a
     /// path in shadow, where a fragment taken from an inbound handle cannot
     /// outlive its charge because nothing is ever forwarded.
@@ -1026,6 +1029,7 @@ impl QuicPath {
                 ack_waits,
                 meter,
                 stream_slots: Arc::new(tokio::sync::Semaphore::new(STREAMED_SEND_LIMIT as usize)),
+                controls_opening: Arc::default(),
                 send_data: AtomicU8::new(SEND_DATA_NEVER),
                 counted_as_data_path: std::sync::atomic::AtomicBool::new(false),
                 stall: parking_lot::Mutex::new(stall),
@@ -1427,7 +1431,9 @@ impl QuicPath {
         } else {
             (Some(self.stream_slot().await?), self.pacing())
         };
-        let mut send = self.open(&header, &[], slot, pacing, progress).await?;
+        let mut send = self
+            .open(&header, &[], slot, pacing, progress, Opener::Data)
+            .await?;
         for piece in payload.chunks(FRAGMENT_PAYLOAD_SIZE) {
             send.take_turns().await;
             send.write_paced(piece).await?;
@@ -1442,17 +1448,24 @@ impl QuicPath {
     /// [`Self::send_control_bounded`].
     #[cfg(test)]
     pub(super) async fn send_control(&self, payload: &[u8]) -> Result<(), QuicSendError> {
-        self.send_control_with(payload, SendProgress::new()).await
+        self.send_control_with(payload, SendProgress::new(), None)
+            .await
     }
 
     async fn send_control_with(
         &self,
         payload: &[u8],
         progress: SendProgress,
+        first: Option<ControlFirst>,
     ) -> Result<(), QuicSendError> {
         let header = FrameHeader::control(payload.len() as u64)?;
         // Never paced: a control frame must not wait behind data.
-        let mut send = self.open(&header, &[], None, None, progress).await?;
+        let opened = self
+            .open(&header, &[], None, None, progress, Opener::Control)
+            .await;
+        // The stream is ours (or the send failed): data may open again.
+        drop(first);
+        let mut send = opened?;
         send.write_all(payload).await?;
         send.finish().await
     }
@@ -1466,9 +1479,34 @@ impl QuicPath {
         timeout: Duration,
         control: QuicControl,
     ) -> BoundedSend {
+        self.send_control_first(time, timeout, control, self.control_first())
+            .await
+    }
+
+    /// Reserve the next stream for a control frame: until the frame sent
+    /// with `first` ([`Self::send_control_first`]) has its stream, or its
+    /// send ends, no data send on this path opens one. Taken before the
+    /// send is spawned, so data enabled after it cannot take the peer's
+    /// stream slots first: a client's `ReadyAck` goes out in the same step
+    /// that enables its data, and with the peer's slots all taken by data
+    /// it would wait out its deadline and fail the upgrade.
+    pub(crate) fn control_first(&self) -> ControlFirst {
+        self.controls_opening.pending.fetch_add(1, Ordering::SeqCst);
+        ControlFirst(Arc::clone(&self.controls_opening))
+    }
+
+    /// [`Self::send_control_bounded`] with a reservation taken earlier
+    /// ([`Self::control_first`]).
+    pub(crate) async fn send_control_first<T: TimeSource>(
+        &self,
+        time: &T,
+        timeout: Duration,
+        control: QuicControl,
+        first: ControlFirst,
+    ) -> BoundedSend {
         let payload = control.encode();
         bounded_send(time, timeout, None, |progress| {
-            self.send_control_with(&payload[..], progress)
+            self.send_control_with(&payload[..], progress, Some(first))
         })
         .await
     }
@@ -1521,7 +1559,14 @@ impl QuicPath {
         let header = FrameHeader::stream(stream_id, payload.len() as u64, metadata.len())?;
         let slot = self.stream_slot().await?;
         let mut send = self
-            .open(&header, metadata, Some(slot), self.pacing(), progress)
+            .open(
+                &header,
+                metadata,
+                Some(slot),
+                self.pacing(),
+                progress,
+                Opener::Data,
+            )
             .await?;
         send.write_fragments(payload, observer).await?;
         send.finish().await
@@ -1643,7 +1688,14 @@ impl QuicPath {
         let slot = self.stream_slot().await?;
         let source_wait = progress.clone();
         let mut send = self
-            .open(&header, metadata, Some(slot), self.pacing(), progress)
+            .open(
+                &header,
+                metadata,
+                Some(slot),
+                self.pacing(),
+                progress,
+                Opener::Data,
+            )
             .await?;
         let mut delivered: u64 = 0;
         let mut next = Some(first);
@@ -1720,6 +1772,8 @@ impl QuicPath {
     /// in use. The stream takes over `slot`. With `pacing`, the header and
     /// metadata are taken from the pacer before the stream opens, so a
     /// refusal opens nothing, and the stream's later writes are paced too.
+    /// A data send first waits for control frames reserved ahead of it
+    /// ([`Self::control_first`]), within its own open deadline.
     async fn open(
         &self,
         header: &FrameHeader,
@@ -1727,7 +1781,11 @@ impl QuicPath {
         slot: Option<tokio::sync::OwnedSemaphorePermit>,
         pacing: Option<pacer::Pacing>,
         progress: SendProgress,
+        opener: Opener,
     ) -> Result<Outgoing, QuicSendError> {
+        if opener == Opener::Data {
+            self.controls_opening.wait().await;
+        }
         let paid = match &pacing {
             Some(pacing) => {
                 let bytes = super::framing::HEADER_LEN + metadata.len();
@@ -1747,7 +1805,7 @@ impl QuicPath {
                 self.stats.node.record_open(true);
                 // Counted if the send's deadline drops this wait: the peer's
                 // stream limit was full for all of it.
-                let waiting = CreditWait(Some(&self.stats));
+                let waiting = CreditWait(Some((&self.stats, &progress)));
                 let opened = open.await;
                 waiting.disarm();
                 opened
@@ -1770,10 +1828,53 @@ impl QuicPath {
     }
 }
 
-/// A send waiting in `open_uni` for a stream credit; dropped armed (the
-/// send's deadline ended the wait), it counts
-/// [`QuicSendEvent::StreamLimitFull`].
-struct CreditWait<'a>(Option<&'a QuicPathStats>);
+/// Who opens a stream ([`QuicPath::open`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Opener {
+    Data,
+    Control,
+}
+
+/// Control frames reserved ahead of data ([`QuicPath::control_first`]).
+#[derive(Default)]
+struct ControlsOpening {
+    pending: AtomicUsize,
+    opened: tokio::sync::Notify,
+}
+
+impl ControlsOpening {
+    /// Wait until no control frame holds a reservation.
+    async fn wait(&self) {
+        loop {
+            let opened = self.opened.notified();
+            tokio::pin!(opened);
+            opened.as_mut().enable();
+            if self.pending.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            opened.await;
+        }
+    }
+}
+
+/// A control frame's reservation of the next stream on its path
+/// ([`QuicPath::control_first`]); dropped once the frame has its stream or
+/// its send ends.
+pub(crate) struct ControlFirst(Arc<ControlsOpening>);
+
+impl Drop for ControlFirst {
+    fn drop(&mut self) {
+        if self.0.pending.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.0.opened.notify_waiters();
+        }
+    }
+}
+
+/// A send waiting in `open_uni` for a stream credit; dropped armed at the
+/// send's open deadline (the deadline ended the wait), it counts
+/// [`QuicSendEvent::StreamLimitFull`]. A drop before it (the send cancelled
+/// by a teardown or a shutdown) is not counted.
+struct CreditWait<'a>(Option<(&'a QuicPathStats, &'a SendProgress)>);
 
 impl CreditWait<'_> {
     fn disarm(mut self) {
@@ -1783,7 +1884,9 @@ impl CreditWait<'_> {
 
 impl Drop for CreditWait<'_> {
     fn drop(&mut self) {
-        if let Some(stats) = self.0 {
+        if let Some((stats, progress)) = self.0
+            && progress.open_deadline_passed()
+        {
             stats.record_send_event(QuicSendEvent::StreamLimitFull);
         }
     }

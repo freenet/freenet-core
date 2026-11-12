@@ -435,6 +435,13 @@ impl StreamHandle {
         self.quic.as_ref()
     }
 
+    /// Whether the node's buffer budget throttles this stream's QUIC path
+    /// now, as a consumer reads it. Tests only.
+    #[cfg(test)]
+    pub(crate) fn quic_path_throttled(&self) -> bool {
+        self.quic.as_ref().is_some_and(|quic| quic.throttled())
+    }
+
     /// Record that the reader of a QUIC-fed stream stopped before the stream
     /// completed, and wake every waiter, forks included. The first reason
     /// stays. No-op on a UDP-fed stream.
