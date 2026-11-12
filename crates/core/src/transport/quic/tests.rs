@@ -4767,13 +4767,8 @@ fn quinn_reports_a_write_blocked_by_the_peers_credit_and_only_that() {
         let _seed = GlobalRng::seed_guard(SEED);
         // Held by the peer's credit: the receiver reads nothing, and this
         // side's send window is far above the peer's credit.
-        let credit = pair(
-            "quic-blocked-credit",
-            "10.201.90.1:5000".parse().unwrap(),
-            "10.201.90.2:5000".parse().unwrap(),
-            None,
-        )
-        .await;
+        let net = crate::transport::test_net::subnet();
+        let credit = pair("quic-blocked-credit", net.addr(1), net.addr(2), None).await;
         let (client, server) = connected(&credit).await;
         client.inner().set_send_window(8 * MIB as u64);
         let (raw, time) = (client.inner().clone(), credit.time.clone());
@@ -4796,13 +4791,8 @@ fn quinn_reports_a_write_blocked_by_the_peers_credit_and_only_that() {
 
         // Held by this side's send window only: the receiver reads at once
         // and its window is far above this side's send window.
-        let own = pair(
-            "quic-blocked-own",
-            "10.201.91.1:5000".parse().unwrap(),
-            "10.201.91.2:5000".parse().unwrap(),
-            None,
-        )
-        .await;
+        let net = crate::transport::test_net::subnet();
+        let own = pair("quic-blocked-own", net.addr(1), net.addr(2), None).await;
         let (client, server) = connected(&own).await;
         server
             .inner()
@@ -4881,14 +4871,9 @@ fn the_credit_rule_on_real_connections() {
         // first write (as a path's watch runs from the path's start: quinn
         // sends one blocked frame per limit, which the watch must see).
         // `read_every` is how often the peer reads 4 KiB, if it reads.
-        let starved = |name: &'static str, octet: u8, read_every: Option<Duration>| async move {
-            let pair = pair(
-                name,
-                format!("10.201.{octet}.1:5000").parse().unwrap(),
-                format!("10.201.{octet}.2:5000").parse().unwrap(),
-                None,
-            )
-            .await;
+        let starved = |name: &'static str, read_every: Option<Duration>| async move {
+            let net = crate::transport::test_net::subnet();
+            let pair = pair(name, net.addr(1), net.addr(2), None).await;
             let (client, server) = connected(&pair).await;
             client.inner().set_send_window(8 * MIB as u64);
             let (raw, time) = (client.inner().clone(), pair.time.clone());
@@ -4925,25 +4910,20 @@ fn the_credit_rule_on_real_connections() {
             drop(writing);
             result
         };
-        let none = starved("quic-credit-none", 92, None).await;
+        let none = starved("quic-credit-none", None).await;
         assert!(
             matches!(none, Some((tick, Stall::CreditStarved)) if tick <= 6),
             "a peer returning no credit is credit-starved within a window: {none:?}"
         );
-        let slow = starved("quic-credit-slow", 94, Some(Duration::from_millis(200))).await;
+        let slow = starved("quic-credit-slow", Some(Duration::from_millis(200))).await;
         assert!(
             matches!(slow, Some((tick, Stall::CreditStarved)) if tick <= 20),
             "a peer returning credit at 20 KiB/s is credit-starved: {slow:?}"
         );
 
         let network = "quic-cwnd-held";
-        let cwnd = pair(
-            network,
-            "10.201.93.1:5000".parse().unwrap(),
-            "10.201.93.2:5000".parse().unwrap(),
-            None,
-        )
-        .await;
+        let net = crate::transport::test_net::subnet();
+        let cwnd = pair(network, net.addr(1), net.addr(2), None).await;
         let (client, server) = connected(&cwnd).await;
         client.inner().set_send_window(8 * MIB as u64);
         let count = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -5025,13 +5005,8 @@ fn quinn_reports_application_limited_batches_as_the_credit_rule_needs() {
         use super::recycle::Writers;
         let _seed = GlobalRng::seed_guard(SEED);
         let writers = Arc::new(Writers::default());
-        let credit = pair(
-            "quic-app-limited-credit",
-            "10.201.95.1:5000".parse().unwrap(),
-            "10.201.95.2:5000".parse().unwrap(),
-            None,
-        )
-        .await;
+        let net = crate::transport::test_net::subnet();
+        let credit = pair("quic-app-limited-credit", net.addr(1), net.addr(2), None).await;
         let (client, server) = connected(&credit).await;
         client.inner().set_send_window(8 * MIB as u64);
         let (raw, time) = (client.inner().clone(), credit.time.clone());
@@ -5065,13 +5040,8 @@ fn quinn_reports_application_limited_batches_as_the_credit_rule_needs() {
         );
 
         let network = "quic-app-limited-cwnd";
-        let cwnd = pair(
-            network,
-            "10.201.96.1:5000".parse().unwrap(),
-            "10.201.96.2:5000".parse().unwrap(),
-            None,
-        )
-        .await;
+        let net = crate::transport::test_net::subnet();
+        let cwnd = pair(network, net.addr(1), net.addr(2), None).await;
         let (client, server) = connected(&cwnd).await;
         client.inner().set_send_window(8 * MIB as u64);
         crate::transport::in_memory_socket::set_packet_delivery_callback(

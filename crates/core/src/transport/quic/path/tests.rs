@@ -7405,7 +7405,7 @@ fn an_age_limit_after_the_throttle_lapsed_counts_as_age() {
         let meter = p.b.meter().expect("b reads data under a budget").clone();
         let idle = streaming_handle_idle_timeout();
         let total = 10_000u64;
-        let age = max_inbound_stream_age(total);
+        let age = super::inbound::stream_age_limit();
         // The stream's last byte at 7 s; paused at each idle period after it.
         let progress = Duration::from_secs(7);
         let periods = (age - progress).as_nanos() / idle.as_nanos();
@@ -7417,20 +7417,19 @@ fn an_age_limit_after_the_throttle_lapsed_counts_as_age() {
         // The throttle lapses after the last pause, before the age limit.
         let lapse = last_pause + (age - last_pause) / 2;
         let (raw, time) = (p.a_raw(), p.time());
-        let code = p
-            .drive(async move {
-                let start = time.now_nanos();
-                let mut bytes = header(1, 1, StreamId::next().0, total, 0);
-                bytes.extend_from_slice(&payload(1000));
-                let mut send = raw.open_uni().await.unwrap();
-                send.write_all(&bytes).await.unwrap();
-                time.sleep(progress).await;
-                send.write_all(&payload(1)).await.unwrap();
-                time.sleep(Duration::from_millis(100)).await;
-                meter.throttle_for_test(time.now_nanos(), start + lapse.as_nanos() as u64);
-                send.stopped().await.unwrap().map(|code| code.into_inner())
-            })
-            .await;
+        let code = drive(&p.pair.time, age + LIMIT, async move {
+            let start = time.now_nanos();
+            let mut bytes = header(1, 1, StreamId::next().0, total, 0);
+            bytes.extend_from_slice(&payload(1000));
+            let mut send = raw.open_uni().await.unwrap();
+            send.write_all(&bytes).await.unwrap();
+            time.sleep(progress).await;
+            send.write_all(&payload(1)).await.unwrap();
+            time.sleep(Duration::from_millis(100)).await;
+            meter.throttle_for_test(time.now_nanos(), start + lapse.as_nanos() as u64);
+            send.stopped().await.unwrap().map(|code| code.into_inner())
+        })
+        .await;
         assert_eq!(code, Some(u64::from(stop_code::EVICTED)));
         let stats = p.b.stats();
         assert_eq!(stats.count(QuicInboundOutcome::ThrottledPastAge), 0);
