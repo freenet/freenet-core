@@ -4598,8 +4598,10 @@ mod tests {
         // digits); no fleet value approaches it, so it constrains schema shape
         // rather than real bytes. Raised by #5647 for the same 7 counters as
         // MAX_WORST_CASE_JSON_BYTES (147 bytes at u64::MAX): measured 15414.
-        // Raised by #6001 for `tel_t` and `tel`: measured 18703.
-        const MAX_WORST_OTLP_MARGINAL_BYTES: usize = 18_816;
+        // Raised by #6001 for `tel_t` and `tel`: measured 18703. Raised for the
+        // `join_versions` row of `tel_t` (2 counters, 44 bytes at u64::MAX):
+        // measured 18845.
+        const MAX_WORST_OTLP_MARGINAL_BYTES: usize = 18_944;
         const MAX_NULL_OTLP_MARGINAL_BYTES: usize = 64;
 
         let diagnostic = |value| crate::router::NetworkEfficiencyV1 {
