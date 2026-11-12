@@ -1129,7 +1129,9 @@ with both bits sends its data on the path ("QUIC send route" below). At a share 
 0, with no `quic-data-percent`, `prefer` differs from `shadow` only by the bit, which
 stays 0. The release that raises the share above 0 must say in its notes that
 existing `prefer` configs start carrying data. Off: no endpoint, no QUIC ingress, nothing
-changes. Windows is shadow by default too since its crash-loop breaker was
+changes, except that `off` set in the config is deprecated and logs a WARN at
+startup (`upgrade::policy::log_startup`); the endpoint state telemetry reports it
+as `off_config`. Windows is shadow by default too since its crash-loop breaker was
 confirmed on a real Windows machine (#6031). The default is
 read, never written to config.toml: a node that did not set the key follows the
 release it runs, so a default-off release is the kill switch. It does not reach
