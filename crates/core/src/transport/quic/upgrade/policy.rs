@@ -35,11 +35,21 @@ use crate::transport::quic::breaker::{BreakerOutcome, Verdict};
 use crate::transport::quic::control::caps;
 use crate::transport::quic::liveness::{QuicAvailability, QuicAvailabilityWatch};
 
-/// The share of pairs, in percent, that carry data on QUIC in this release, for
-/// a node in `prefer` mode. One value per release, changed in its own PR: 0, 5,
-/// 25, 100. Both sides must set their bit, so a pair moves only once both run a
-/// release that puts it in the slice. `quic-data-percent` replaces it on one node.
+/// The share of pairs, in percent, that carry data on QUIC in this release
+/// when it sets no ramp ([`QUIC_DATA_RAMP_START`]), for a node in `prefer`
+/// mode: a fixed step (0, then 5 for the first data release). Both sides must
+/// set their bit, so a pair moves only once both run a release that puts it in
+/// the slice. `quic-data-percent` replaces it on one node.
 pub(in crate::transport) const QUIC_DATA_PERCENT: u8 = 0;
+
+/// When this release's data ramp starts, in seconds since the Unix epoch, or
+/// `None` for no ramp: then [`QUIC_DATA_PERCENT`] applies. Set in its own reviewed PR, to
+/// the planned publish time, just before the release's soak, and left set: past
+/// 24 h it reads 100%, the steady state. A node in `prefer` mode carries data
+/// with [`super::slice::ramp_percent`] of its pairs, from the wall clock at each
+/// promotion. Both sides must set their bit, so a pair whose clocks disagree only
+/// starts later. `quic-data-percent` replaces the ramp on one node.
+pub(in crate::transport) const QUIC_DATA_RAMP_START: Option<u64> = None;
 
 /// Whether this build reads data from a QUIC path. It does: `PeerConnection::recv`
 /// drains the session's data channels, so a node that says it accepts data delivers
@@ -54,12 +64,57 @@ const fn data_bit_allowed(testing_build: bool) -> bool {
     testing_build || QUIC_DATA_RECEIVER_READY
 }
 
+/// How many of its pairs a `prefer` node carries data with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DataShare {
+    /// This percentage: `quic-data-percent`, or with no ramp
+    /// [`QUIC_DATA_PERCENT`].
+    Fixed(u8),
+    /// The ramp from this start, in seconds since the Unix epoch.
+    Ramp { start_unix_secs: u64 },
+}
+
+impl DataShare {
+    /// The share for a `quic-data-percent` of `fixed`, with a ramp from `start`
+    /// or else the release's fixed share.
+    fn of(fixed: Option<u8>, start: Option<u64>) -> Self {
+        match (fixed, start) {
+            (Some(percent), _) => Self::Fixed(percent),
+            (None, Some(start_unix_secs)) => Self::Ramp { start_unix_secs },
+            (None, None) => Self::Fixed(QUIC_DATA_PERCENT),
+        }
+    }
+
+    /// The percentage at `now`.
+    pub(crate) fn percent_at(self, now: std::time::SystemTime) -> u8 {
+        match self {
+            Self::Fixed(percent) => percent,
+            Self::Ramp { start_unix_secs } => {
+                let start = std::time::UNIX_EPOCH + std::time::Duration::from_secs(start_unix_secs);
+                // Before the start reads as the start.
+                super::slice::ramp_percent(now.duration_since(start).unwrap_or_default())
+            }
+        }
+    }
+}
+
+/// The band a percentage is logged by: 5, then every 10.
+fn log_band(percent: u8) -> u8 {
+    if percent < 10 {
+        percent.min(5)
+    } else {
+        percent / 10 * 10
+    }
+}
+
 /// The node's QUIC upgrade policy. See the module docs.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct QuicPolicy {
     mode: QuicMode,
-    /// `quic-data-percent`, or [`QUIC_DATA_PERCENT`].
-    data_percent: u8,
+    /// `quic-data-percent`, or the ramp ([`QUIC_DATA_RAMP_START`]).
+    share: DataShare,
+    /// The band last logged at INFO ([`log_band`]); `u8::MAX` before the first.
+    logged_band: std::sync::atomic::AtomicU8,
     breaker: BreakerOutcome,
     availability: QuicAvailabilityWatch,
     permits: QuicPathPermits,
@@ -70,7 +125,7 @@ pub(crate) struct QuicPolicy {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct QuicPolicyConfig {
     mode: QuicMode,
-    data_percent: u8,
+    share: DataShare,
     max_paths: usize,
     breaker: BreakerOutcome,
 }
@@ -83,7 +138,7 @@ impl QuicPolicyConfig {
     pub(crate) fn new(config: &NetworkApiConfig, breaker: BreakerOutcome) -> Self {
         Self {
             mode: configured_mode(config),
-            data_percent: config.quic_data_percent().unwrap_or(QUIC_DATA_PERCENT),
+            share: DataShare::of(config.quic_data_percent(), QUIC_DATA_RAMP_START),
             max_paths: config.quic_max_paths(),
             breaker,
         }
@@ -156,7 +211,8 @@ impl QuicPolicy {
     ) -> Self {
         Self {
             mode: config.mode,
-            data_percent: config.data_percent,
+            share: config.share,
+            logged_band: std::sync::atomic::AtomicU8::new(u8::MAX),
             breaker: config.breaker,
             availability,
             permits: QuicPathPermits::new(config.max_paths),
@@ -212,19 +268,104 @@ impl QuicPolicy {
     /// node's record, never from a message, so no message can set the bucket. A
     /// peer picks its own keypair and so its own bucket: the slice controls the
     /// rollout, it is not a defence.
+    ///
+    /// `now` is the wall clock (the node's path clock; a simulation's virtual time)
+    /// when the session is promoted, which is when this is asked: a pair that
+    /// enters the slice later takes data from its next session.
     pub(in crate::transport) fn own_caps(
         &self,
         local: &TransportPublicKey,
         peer: &TransportPublicKey,
+        now: std::time::SystemTime,
+    ) -> u32 {
+        self.own_caps_with(self.share, local, peer, now)
+    }
+
+    /// The policy's data share. Tests only.
+    #[cfg(any(test, feature = "testing"))]
+    pub(in crate::transport) fn share(&self) -> DataShare {
+        self.share
+    }
+
+    /// [`Self::own_caps`] with `share` in place of the policy's (a simulation's
+    /// own ramp start).
+    pub(in crate::transport) fn own_caps_with(
+        &self,
+        share: DataShare,
+        local: &TransportPublicKey,
+        peer: &TransportPublicKey,
+        now: std::time::SystemTime,
     ) -> u32 {
         if !data_bit_allowed(cfg!(any(test, feature = "testing"))) {
             return 0;
         }
         match self.mode {
-            QuicMode::Prefer if super::slice::in_slice(local, peer, self.data_percent) => {
-                caps::DATA
+            QuicMode::Prefer => {
+                let percent = share.percent_at(now);
+                self.log_band(percent, share);
+                let data = if super::slice::in_slice(local, peer, percent) {
+                    caps::DATA
+                } else {
+                    0
+                };
+                // A node that carries data with some pairs, or will, takes a
+                // recycle for data as no fault and is worth recycling toward.
+                // One that never will (a share fixed at 0) does not say so, so
+                // no peer closes a path to it that could never carry data.
+                let recycles = if share == DataShare::Fixed(0) {
+                    0
+                } else {
+                    caps::RECYCLES
+                };
+                data | recycles
             }
-            QuicMode::Off | QuicMode::Shadow | QuicMode::Prefer => 0,
+            QuicMode::Off | QuicMode::Shadow => 0,
+        }
+    }
+
+    /// Whether this node's data bit on a path can still come on while the
+    /// node runs: only on a ramp, in `prefer`. A fixed share gives a pair the
+    /// same bit for the life of the process, so a path without the bit is never
+    /// rechecked for it (`machine::UpgradeMachine::recheck_data`).
+    pub(in crate::transport) fn bit_may_come_on_with(&self, share: DataShare) -> bool {
+        data_bit_allowed(cfg!(any(test, feature = "testing")))
+            && self.mode == QuicMode::Prefer
+            && matches!(share, DataShare::Ramp { .. })
+    }
+
+    /// [`Self::bit_may_come_on_with`] with the policy's share.
+    pub(in crate::transport) fn bit_may_come_on(&self) -> bool {
+        self.bit_may_come_on_with(self.share)
+    }
+
+    /// Report the share at INFO when it enters a new band, so an operator can see
+    /// the ramp move.
+    ///
+    /// Called from `own_caps`, which the upgrade driver calls while it holds a
+    /// session's lock. The INFO line is written only when the band changes
+    /// (an atomic swap decides it): 11 times over a whole ramp (5%, then every
+    /// 10% to 100%), more only if the wall clock steps back and forth. So the
+    /// lock is held over a log write that rarely; every other call is the swap
+    /// alone.
+    fn log_band(&self, percent: u8, share: DataShare) {
+        let band = log_band(percent);
+        let before = self
+            .logged_band
+            .swap(band, std::sync::atomic::Ordering::Relaxed);
+        if before == band {
+            return;
+        }
+        if percent == 0 {
+            tracing::info!(
+                share = ?share,
+                "QUIC data: this node offers data to none of its pairs (share 0%)"
+            );
+        } else {
+            tracing::info!(
+                data_percent = percent,
+                share = ?share,
+                "QUIC data: this node offers data to this share of its pairs"
+            );
         }
     }
 
@@ -334,12 +475,21 @@ pub(crate) fn log_startup(config: &NetworkApiConfig) {
         return;
     }
     if configured_mode(config) == QuicMode::Prefer {
-        tracing::info!(
-            data_percent = config.quic_data_percent().unwrap_or(QUIC_DATA_PERCENT),
-            "transport-quic = \"prefer\" negotiates data with this share of pairs: a pair \
-             sends its data on QUIC only if both sides set their data bit, and all other \
-             traffic stays on UDP"
-        );
+        let share = DataShare::of(config.quic_data_percent(), QUIC_DATA_RAMP_START);
+        if share == DataShare::Fixed(0) {
+            tracing::info!(
+                share = ?share,
+                "transport-quic = \"prefer\" with no data share (no ramp in this build \
+                 and no quic-data-percent): every pair keeps its data on UDP"
+            );
+        } else {
+            tracing::info!(
+                share = ?share,
+                "transport-quic = \"prefer\" negotiates data with this share of pairs: a \
+                 pair sends its data on QUIC only if both sides set their data bit, and all \
+                 other traffic stays on UDP"
+            );
+        }
     }
     // These keys matter only with QUIC on.
     if configured_mode(config) == QuicMode::Off {
@@ -351,7 +501,7 @@ pub(crate) fn log_startup(config: &NetworkApiConfig) {
     ) {
         tracing::warn!(
             quic_data_percent = %raw,
-            default = QUIC_DATA_PERCENT,
+            ramp_start = ?QUIC_DATA_RAMP_START,
             "quic-data-percent is not a whole number from 0 to 100 and is ignored; using \
              this release's share of pairs"
         );
@@ -597,31 +747,72 @@ mod tests {
             let mut config = config(mode, None);
             config.quic_data_percent = percent;
             let up = QuicAvailabilityWatch::for_test(QuicAvailability::Up).1;
-            QuicPolicy::new(&config, BreakerOutcome::NotConsulted, up).own_caps(&local, &peer)
+            QuicPolicy::new(&config, BreakerOutcome::NotConsulted, up).own_caps(
+                &local,
+                &peer,
+                std::time::SystemTime::now(),
+            )
         };
-        assert_eq!(QUIC_DATA_PERCENT, 0, "this release carries no data");
-        assert_eq!(caps_with("prefer", None), 0);
+        if QUIC_DATA_RAMP_START.is_none() {
+            assert_eq!(caps_with("prefer", None), 0, "no ramp, no data");
+        }
+        // With no quic-data-percent the policy takes the release's ramp, and
+        // own_caps asks with it, whether or not this build sets a start.
+        let mut plain = config("prefer", None);
+        plain.quic_data_percent = None;
+        let up = QuicAvailabilityWatch::for_test(QuicAvailability::Up).1;
+        let policy = QuicPolicy::new(&plain, BreakerOutcome::NotConsulted, up);
+        assert_eq!(policy.share(), DataShare::of(None, QUIC_DATA_RAMP_START));
+        let now = std::time::SystemTime::now();
+        for peer in (0..200).map(key) {
+            assert_eq!(
+                policy.own_caps(&local, &peer, now),
+                policy.own_caps_with(policy.share(), &local, &peer, now)
+            );
+        }
         assert_eq!(caps_with("prefer", Some("lots".to_string())), 0);
-        assert_eq!(caps_with("prefer", Some("100".to_string())), caps::DATA);
+        assert_eq!(
+            caps_with("prefer", Some("100".to_string())),
+            caps::DATA | caps::RECYCLES
+        );
         assert_eq!(caps_with("prefer", Some("0".to_string())), 0);
         assert_eq!(
-            caps_with("prefer", Some(bucket.to_string())),
+            caps_with("prefer", Some(bucket.to_string())) & caps::DATA,
             0,
             "a bucket equal to the percentage is out"
         );
         assert_eq!(
             caps_with("prefer", Some((bucket + 1).to_string())),
-            caps::DATA,
+            caps::DATA | caps::RECYCLES,
             "the bucket below the percentage is in"
         );
         for mode in ["shadow", "off"] {
             assert_eq!(caps_with(mode, Some("100".to_string())), 0, "{mode}");
         }
+        // RECYCLES says the node carries data with some pairs or will: any
+        // share but one fixed at 0, in `prefer` only.
+        assert_eq!(
+            caps_with("prefer", Some("1".to_string())) & caps::RECYCLES,
+            caps::RECYCLES
+        );
+        let ramp = DataShare::Ramp {
+            start_unix_secs: 1_900_000_000,
+        };
+        let prefer = QuicPolicy::new(
+            &config("prefer", None),
+            BreakerOutcome::NotConsulted,
+            QuicAvailabilityWatch::for_test(QuicAvailability::Up).1,
+        );
+        assert_eq!(
+            prefer.own_caps_with(ramp, &local, &peer, std::time::UNIX_EPOCH) & caps::RECYCLES,
+            caps::RECYCLES,
+            "on a ramp, before the start"
+        );
     }
 
     /// The receive side exists, so a build without `cfg(test)` or the `testing`
     /// feature may set the data bit. It still does so only through the mode and the
-    /// slice, and `QUIC_DATA_PERCENT` keeps a release's share at 0.
+    /// share (the ramp, or `quic-data-percent`).
     #[test]
     fn a_build_with_the_receive_side_may_set_the_data_bit() {
         const { assert!(QUIC_DATA_RECEIVER_READY, "the receive side is in `recv`") };
@@ -631,9 +822,10 @@ mod tests {
         // `own_caps` consults the gate before anything else.
         let source = include_str!("policy.rs");
         let body = source
-            .split("fn own_caps(")
+            .split("fn own_caps_with(")
             .nth(1)
-            .expect("own_caps exists");
+            .and_then(|rest| rest.split("\n    }\n").next())
+            .expect("own_caps_with exists");
         let gate = body
             .find("if !data_bit_allowed(cfg!(any(test, feature = \"testing\")))")
             .expect("own_caps consults the gate");
@@ -641,6 +833,154 @@ mod tests {
             .find("match self.mode")
             .expect("own_caps reads the mode");
         assert!(gate < mode, "the gate comes first");
+    }
+
+    fn key(seed: u32) -> TransportPublicKey {
+        TransportPublicKey::from_bytes(*blake3::hash(&seed.to_be_bytes()).as_bytes())
+    }
+
+    fn at(secs: u64) -> std::time::SystemTime {
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs)
+    }
+
+    /// Only a ramp, in `prefer`, can turn a pair's bit on while the node runs,
+    /// so only then is a path without the bit rechecked.
+    #[test]
+    fn only_a_ramp_in_prefer_can_turn_the_bit_on() {
+        let up = || QuicAvailabilityWatch::for_test(QuicAvailability::Up).1;
+        let ramp = DataShare::Ramp {
+            start_unix_secs: 1_900_000_000,
+        };
+        let prefer = QuicPolicy::new(&config("prefer", None), BreakerOutcome::NotConsulted, up());
+        let shadow = QuicPolicy::new(&config("shadow", None), BreakerOutcome::NotConsulted, up());
+        assert!(prefer.bit_may_come_on_with(ramp));
+        assert!(!prefer.bit_may_come_on_with(DataShare::Fixed(0)));
+        assert!(!prefer.bit_may_come_on_with(DataShare::Fixed(50)));
+        assert!(!shadow.bit_may_come_on_with(ramp));
+    }
+
+    /// With a ramp, a `prefer` node's bit follows the curve at the time it is
+    /// asked, from the start it is given: none of a pair's peers before the share
+    /// covers it, and every peer once it does. A time before the start reads as
+    /// the start. `quic-data-percent` replaces the ramp, and shadow sets no bit.
+    #[test]
+    fn own_caps_follow_the_ramp_from_its_start() {
+        let up = || QuicAvailabilityWatch::for_test(QuicAvailability::Up).1;
+        let policy = |mode, percent: Option<&str>| {
+            let mut config = config(mode, None);
+            config.quic_data_percent = percent.map(str::to_string);
+            QuicPolicy::new(&config, BreakerOutcome::NotConsulted, up())
+        };
+        let start = 1_900_000_000;
+        let ramp = DataShare::Ramp {
+            start_unix_secs: start,
+        };
+        let prefer = policy("prefer", None);
+        let local = key(0);
+        let peers: Vec<_> = (1..400).map(key).collect();
+        let carrying = |secs| {
+            peers
+                .iter()
+                .filter(|peer| prefer.own_caps_with(ramp, &local, peer, at(secs)) & caps::DATA != 0)
+                .count()
+        };
+        let share = |n: usize| n * 100 / peers.len();
+        assert!(
+            (2..=9).contains(&share(carrying(start - 3600))),
+            "before: the first value"
+        );
+        assert!((2..=9).contains(&share(carrying(start))));
+        assert!((20..=31).contains(&share(carrying(start + 12 * 3600))));
+        assert_eq!(carrying(start + 24 * 3600), peers.len(), "all at 24 h");
+        assert_eq!(
+            DataShare::of(Some(40), Some(start)),
+            DataShare::Fixed(40),
+            "quic-data-percent replaces the ramp"
+        );
+        assert_eq!(DataShare::of(None, None), DataShare::Fixed(0), "no ramp");
+        let shadow = policy("shadow", None);
+        assert_eq!(
+            shadow.own_caps_with(ramp, &local, &peers[0], at(start + 30 * 3600)),
+            0
+        );
+    }
+
+    /// Two nodes whose clocks disagree each set their own bit, and a pair carries
+    /// data only with both, so the pair starts when the slower clock lets it: skew
+    /// delays a pair and never moves one out.
+    #[test]
+    fn clock_skew_between_two_nodes_only_delays_a_pair() {
+        let start = 1_900_000_000u64;
+        let ramp = DataShare::Ramp {
+            start_unix_secs: start,
+        };
+        let skew = 2 * 3600;
+        let pairs: Vec<_> = (0..300).map(|i| (key(2 * i), key(2 * i + 1))).collect();
+        for (a, b) in &pairs {
+            let mut was_on = false;
+            for minute in (0..30 * 60).step_by(5) {
+                let now = start + minute * 60;
+                let fast = super::super::slice::in_slice(a, b, ramp.percent_at(at(now)));
+                let slow = super::super::slice::in_slice(
+                    a,
+                    b,
+                    ramp.percent_at(at(now.saturating_sub(skew))),
+                );
+                let on = fast && slow;
+                assert_eq!(on, slow, "the slower clock decides");
+                assert!(on || !was_on, "a pair never leaves");
+                was_on = on;
+            }
+            assert!(was_on, "every pair is on once both clocks are past 24 h");
+        }
+    }
+
+    /// The share is logged at INFO once per band as `own_caps` sees it move, with
+    /// its own wording at 0%, so a log at 0% does not read as data being on.
+    #[test]
+    fn the_share_is_logged_once_per_band() {
+        const ON: &str = "offers data to this share of its pairs";
+        const NONE: &str = "offers data to none of its pairs";
+        let up = QuicAvailabilityWatch::for_test(QuicAvailability::Up).1;
+        let policy = QuicPolicy::new(&config("prefer", None), BreakerOutcome::NotConsulted, up);
+        let (local, peer) = (key(0), key(1));
+        let (logs, guard) = crate::util::test_log_capture::install();
+        for percent in [0, 0, 5, 7, 37, 39, 100] {
+            policy.own_caps_with(DataShare::Fixed(percent), &local, &peer, at(0));
+        }
+        drop(guard);
+        let logs = logs.lock().unwrap().clone();
+        let ours: Vec<_> = logs
+            .iter()
+            .filter(|line| line.contains(ON) || line.contains(NONE))
+            .collect();
+        assert_eq!(ours.len(), 4, "{logs:?}");
+        assert!(
+            ours[0].contains(NONE) && ours[0].starts_with("INFO"),
+            "{}",
+            ours[0]
+        );
+        for (line, percent) in ours[1..].iter().zip(["5", "37", "100"]) {
+            assert!(line.contains(ON), "{line}");
+            assert!(line.contains(&format!("data_percent={percent}")), "{line}");
+        }
+    }
+
+    /// The bands an operator sees at INFO: 5, then every 10.
+    #[test]
+    fn the_log_bands_are_these() {
+        for (percent, band) in [
+            (0, 0),
+            (5, 5),
+            (9, 5),
+            (10, 10),
+            (15, 10),
+            (25, 20),
+            (99, 90),
+            (100, 100),
+        ] {
+            assert_eq!(log_band(percent), band, "{percent}");
+        }
     }
 
     /// Permits stop at the limit, a dropped permit frees its slot, and the
@@ -741,6 +1081,12 @@ mod tests {
     #[test]
     fn startup_reports_prefer_and_max_paths() {
         const PREFER: &str = "negotiates data with this share of pairs";
+        const NO_SHARE: &str = "with no data share";
+        let prefer = if QUIC_DATA_RAMP_START.is_none() {
+            NO_SHARE
+        } else {
+            PREFER
+        };
         const INVALID: &str = "quic-max-paths is not a whole number";
         const LOWERED: &str = "quic-max-paths is above max-number-of-connections";
         let above = (config("off", None).max_connections + 1).to_string();
@@ -749,7 +1095,7 @@ mod tests {
             ("off", Some("lots"), None),
             ("off", Some(above.as_str()), None),
             ("shadow", Some("3"), None),
-            ("prefer", None, Some(("INFO", PREFER))),
+            ("prefer", None, Some(("INFO", prefer))),
             ("shadow", Some("lots"), Some(("WARN", INVALID))),
             ("shadow", Some(above.as_str()), Some(("INFO", LOWERED))),
         ] {
@@ -760,7 +1106,11 @@ mod tests {
             let logs = logs.lock().unwrap().clone();
             let ours: Vec<_> = logs
                 .iter()
-                .filter(|line| [PREFER, INVALID, LOWERED].iter().any(|n| line.contains(n)))
+                .filter(|line| {
+                    [PREFER, NO_SHARE, INVALID, LOWERED]
+                        .iter()
+                        .any(|n| line.contains(n))
+                })
                 .collect();
             match expected {
                 None => assert!(ours.is_empty(), "{mode} {max_paths:?}: {logs:?}"),

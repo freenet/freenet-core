@@ -21410,13 +21410,248 @@ fn test_quic_data_carries_a_stream_end_to_end() {
     assert_eq!(stored.as_ref(), state.as_slice());
 }
 
+/// The data ramp on the real curve, on paths that stay up: nodes in `prefer`
+/// with no `quic-data-percent` take their share from a ramp that started
+/// `started_before` the run began, for `iterations` events `event_wait` apart.
+/// A path that came up without data is recycled when the share reaches its
+/// pair. Checks what holds over any stretch of the ramp: no node recycles a
+/// pair twice, no pair is recycled before the share covers it (each node notes
+/// its data-share decisions in the trace: the pair's bucket and the percent),
+/// and a recycle is not a fallback. Returns the run and its recycles, at times
+/// on the run's clock.
+fn run_quic_data_ramp(
+    network: &str,
+    seed: u64,
+    started_before: Duration,
+    iterations: usize,
+    event_wait: Duration,
+) -> (QuicShadowRun, Vec<freenet::dev_tool::QuicUpgradeRecord>) {
+    setup_deterministic_state(seed);
+    let rt = create_runtime();
+    let (sim, trace, nodes) = rt.block_on(async {
+        let mut sim = SimNetwork::new(network, 1, 3, 7, 3, 10, 2, seed).await;
+        sim.enable_gateway_ack_version();
+        let trace = sim.quic_upgrade_trace();
+        sim.with_transport_quic("prefer");
+        trace.ramp_data_started_before(started_before);
+        run_as_first_negotiating_release(&trace);
+        let nodes: Vec<_> = sim.all_node_addresses().values().copied().collect();
+        (sim, trace, nodes)
+    });
+    drop(rt);
+    sim.run_simulation_direct::<rand::rngs::SmallRng>(seed, 1, iterations, event_wait)
+        .expect("direct simulation should succeed");
+    let run = QuicShadowRun {
+        trace,
+        nodes,
+        logs_events: 0,
+        mesh: Default::default(),
+    };
+    let records = run.trace.records();
+    let pair = |r: &freenet::dev_tool::QuicUpgradeRecord| (r.node, r.peer);
+    let recycles: Vec<_> = records
+        .iter()
+        .filter(|r| r.what == "RecycledForData { by_peer: false }")
+        .cloned()
+        .collect();
+    // Negative: a pair is recycled only once the share covers it. The node's
+    // latest data-share decision for the pair at or before the recycle had the
+    // pair's bucket below the percent; a pair above the share is never recycled.
+    for recycle in &recycles {
+        let decided = records
+            .iter()
+            .filter(|r| pair(r) == pair(recycle) && r.at <= recycle.at)
+            .filter_map(|r| ramp_share_of(&r.what))
+            .next_back();
+        let Some((bucket, percent)) = decided else {
+            panic!("a recycle with no share decision before it: {}", run.dump());
+        };
+        assert!(
+            bucket < percent,
+            "{:?} recycled at {:?} with bucket {bucket} at {percent}%: {}",
+            pair(recycle),
+            recycle.at,
+            run.dump()
+        );
+    }
+    assert!(
+        records
+            .iter()
+            .filter_map(|r| ramp_share_of(&r.what))
+            .any(|(bucket, percent)| bucket >= percent),
+        "premise: some decision found a pair above the share: {}",
+        run.dump()
+    );
+    let distinct: std::collections::BTreeSet<_> = recycles.iter().map(pair).collect();
+    assert_eq!(
+        distinct.len(),
+        recycles.len(),
+        "no node recycles a pair twice: {}",
+        run.dump()
+    );
+    // Paths also end with their sessions as the topology changes; none of those
+    // fallbacks comes with a recycle, on either side of the pair.
+    for recycle in &recycles {
+        assert!(
+            !records.iter().any(|r| r.what.starts_with("Fallback(")
+                && ((r.node, r.peer) == pair(recycle) || (r.peer, r.node) == pair(recycle))
+                && r.at.abs_diff(recycle.at) <= Duration::from_secs(1)),
+            "a recycle is not a fallback: {}",
+            run.dump()
+        );
+    }
+    (run, recycles)
+}
+
+/// A data-share decision a node noted in the trace: the pair's bucket and the
+/// percent.
+fn ramp_share_of(what: &str) -> Option<(u8, u8)> {
+    let rest = what.strip_prefix("data share: bucket ")?;
+    let (bucket, rest) = rest.split_once(", percent ")?;
+    let (percent, _) = rest.split_once(", caps ")?;
+    Some((bucket.parse().ok()?, percent.parse().ok()?))
+}
+
+/// Every pair whose path came up by `by_less_margin` carries data by that plus
+/// a recheck (45 s +20%), a first-offer delay (10 s at most) and the set-up.
+/// Run times. A pair first connecting later has had no time to set data up,
+/// and the ramp is not what that would test.
+fn assert_ramp_pairs_carry_data_by(run: &QuicShadowRun, full_at: Duration) {
+    let records = run.trace.records();
+    let margin = Duration::from_secs(3 * 60);
+    let by = full_at + margin;
+    let established: std::collections::BTreeSet<_> = records
+        .iter()
+        .filter(|r| r.what.starts_with("Established(") && r.at <= full_at)
+        .map(|r| (r.node, r.peer))
+        .collect();
+    assert!(established.len() >= 4, "paths came up: {}", run.dump());
+    for (node, peer) in &established {
+        assert!(
+            records.iter().any(|r| r.what == "DataEnabled"
+                && r.node == *node
+                && r.peer == *peer
+                && r.at <= by),
+            "{node} and {peer} carry data by {by:?}: {}",
+            run.dump()
+        );
+    }
+}
+
+const RAMP_HOUR: Duration = Duration::from_secs(3600);
+
+/// The end of the data ramp's first stage: it started 5 h before the run, so
+/// the share stays at 5% for the first hour of the run, then grows (to about
+/// 11.7% at 3 h). A path that came up without data is not recycled while the
+/// share is 5% (about 80 rechecks per pair in that hour; the share is the same
+/// over the whole plateau, so the first 5 h would add nothing but run time),
+/// and is recycled once the growing share reaches its pair: with this seed a
+/// pair's bucket is reached during the run, so a recycle after the first hour
+/// is required (the positive control: with recycling disabled this fails). PR
+/// CI's half of the day-long ramp, with
+/// `test_quic_data_ramp_turns_on_every_pair_by_the_end_of_the_day`; the whole
+/// day runs nightly (`test_quic_data_ramp_turns_on_every_pair_within_a_day`).
+#[test_log::test]
+fn test_quic_data_ramp_recycles_nothing_while_the_share_is_five_percent() {
+    let (run, recycles) = run_quic_data_ramp(
+        "quic-data-ramp-start",
+        0x5940_7A00_0002,
+        5 * RAMP_HOUR,
+        3,
+        RAMP_HOUR,
+    );
+    let records = run.trace.records();
+    assert!(
+        records
+            .iter()
+            .filter(|r| r.at < RAMP_HOUR)
+            .filter_map(|r| ramp_share_of(&r.what))
+            .any(|(bucket, percent)| percent == 5 && bucket >= percent),
+        "premise: a path came up without data while the share was 5%: {}",
+        run.dump()
+    );
+    assert!(
+        recycles.iter().all(|r| r.at >= RAMP_HOUR),
+        "nothing is recycled at 5%: {}",
+        run.dump()
+    );
+    assert!(
+        recycles.iter().any(|r| r.at >= RAMP_HOUR),
+        "positive control: a pair is recycled once the growing share reaches it: {}",
+        run.dump()
+    );
+}
+
+/// The end of the data ramp: it started 23 h before the run, so the share
+/// reaches 100% one hour in. By then, plus a recheck and the time to set up
+/// again, every pair whose path came up by then carries data, the pairs the
+/// share had not covered by being recycled, and data arrives on those paths.
+#[test_log::test]
+fn test_quic_data_ramp_turns_on_every_pair_by_the_end_of_the_day() {
+    let (run, recycles) = run_quic_data_ramp(
+        "quic-data-ramp-end",
+        0x5940_7A00_0005,
+        23 * RAMP_HOUR,
+        3,
+        RAMP_HOUR / 2,
+    );
+    assert!(
+        !recycles.is_empty(),
+        "premise: a path came up before the share reached its pair: {}",
+        run.dump()
+    );
+    assert_ramp_pairs_carry_data_by(&run, RAMP_HOUR);
+    // Health: data does arrive on a path after the recycles, so the paths the
+    // share turned on carry the node's traffic, not just the bit.
+    let first_recycle = recycles.iter().map(|r| r.at).min().expect("checked above");
+    assert!(
+        run.trace.records().iter().any(|r| r.at > first_recycle
+            && (r.what.starts_with("received a short on the path")
+                || r.what.starts_with("received a stream on the path"))),
+        "data arrives on a path after the recycles: {}",
+        run.dump()
+    );
+}
+
+/// The whole data ramp over a virtual day, as one run: by 24 h, plus a recheck
+/// and the time to set up again, every pair whose path came up by 24 h carries
+/// data; nothing is recycled during the first 6 h, when the share stays at 5%.
+/// About 13 minutes of wall-clock time, so nightly only; PR CI runs the two
+/// ends of the ramp
+/// (`test_quic_data_ramp_recycles_nothing_while_the_share_is_five_percent`,
+/// `test_quic_data_ramp_turns_on_every_pair_by_the_end_of_the_day`).
+#[cfg(feature = "nightly_tests")]
+#[test_log::test]
+fn test_quic_data_ramp_turns_on_every_pair_within_a_day() {
+    let (run, recycles) = run_quic_data_ramp(
+        "quic-data-ramp",
+        0x5940_7A00_0002,
+        Duration::ZERO,
+        26,
+        RAMP_HOUR,
+    );
+    assert!(
+        !recycles.is_empty(),
+        "premise: a path came up before the share reached its pair: {}",
+        run.dump()
+    );
+    assert!(
+        recycles.iter().all(|r| r.at >= 6 * RAMP_HOUR),
+        "nothing is recycled at 5%: {}",
+        run.dump()
+    );
+    assert_ramp_pairs_carry_data_by(&run, 24 * RAMP_HOUR);
+}
+
 /// The path goes dark in the middle of a transfer: after 384 KiB of QUIC
 /// datagrams have moved between the node and the gateway, every later one is
 /// lost, while their UDP session carries on. Both ends stop putting new data on
 /// the path once its sends time out with nothing acknowledged (it is suspect),
 /// so data reaches the peer on UDP while the path is still up; the path falls
-/// back on its idle timeout with the UDP session up, the pair is offered a path
-/// again, and the gateway ends with the whole state.
+/// back on its idle timeout (or, at the gateway, by the stall close, when enough
+/// of its sends were waiting on the path; see the assertion) with the UDP
+/// session up, the pair is offered a path again, and the gateway ends with the
+/// whole state.
 #[test_log::test]
 fn test_quic_data_path_cut_mid_transfer_falls_back_to_udp() {
     use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation};

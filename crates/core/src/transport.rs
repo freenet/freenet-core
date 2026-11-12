@@ -543,6 +543,11 @@ pub(in crate::transport) enum QuicRefusal {
     /// its QUIC buffer budget than it allows. Fall back to UDP.
     #[error("the peer closed the path for holding more than its budget")]
     OverBudget,
+    /// The peer closed with `close_code::RECYCLE_FOR_DATA`: its data bit for
+    /// this pair came on, and it closed a path that carried no data so the next
+    /// attempt carries the bit. No fault.
+    #[error("the peer recycled the path to carry data")]
+    RecycleForData,
     /// The peer closed with `close_code::IDENTITY_MISMATCH`: the key this
     /// node proved is not the one the peer has on record for it.
     #[error("the peer reported an identity mismatch")]

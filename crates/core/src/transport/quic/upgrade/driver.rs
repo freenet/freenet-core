@@ -151,6 +151,23 @@ pub(in crate::transport) enum PathClock {
     Virtual(VirtualTime),
 }
 
+impl PathClock {
+    /// The wall clock: the system's, or in a simulation the Unix epoch plus the
+    /// network's virtual time, so a simulation can place a ramp start on it.
+    /// The real arm reads `SystemTime::now()`, not the path's time source,
+    /// which is monotonic with no epoch to compare a Unix ramp start against.
+    /// A backward step of the system clock lowers the share; that recycles
+    /// nothing (a path with data is never rechecked), so a pair carrying data
+    /// stays, but a pair whose next session starts during the step may lose
+    /// its bit until the clock is back.
+    pub(in crate::transport) fn wall_now(&self) -> std::time::SystemTime {
+        match self {
+            Self::Real(_) => std::time::SystemTime::now(),
+            Self::Virtual(time) => std::time::UNIX_EPOCH + Duration::from_nanos(time.now_nanos()),
+        }
+    }
+}
+
 impl TimeSource for PathClock {
     fn now_nanos(&self) -> u64 {
         match self {
@@ -610,6 +627,56 @@ impl QuicUpgrades {
         reported
     }
 
+    /// What a test's trace notes of a data-share decision for `peer`: the pair's
+    /// bucket and the share now (`slice`).
+    #[cfg(any(test, feature = "testing"))]
+    fn share_note(&self, peer: &TransportPublicKey, caps: u32) -> String {
+        let (share, now) = self
+            .trace_ramp()
+            .unwrap_or((self.policy.share(), self.path_clock.wall_now()));
+        format!(
+            "data share: bucket {}, percent {}, caps {caps}",
+            super::slice::bucket(&self.local_key, peer),
+            share.percent_at(now),
+        )
+    }
+
+    /// The ramp a test's trace gives, and the wall clock now to read it at. A
+    /// start before the epoch (one before the run began, on the virtual wall
+    /// clock) moves both forward by the same amount: the share reads only the
+    /// time since the start.
+    #[cfg(any(test, feature = "testing"))]
+    fn trace_ramp(&self) -> Option<(super::policy::DataShare, std::time::SystemTime)> {
+        let start = self.trace.as_ref()?.data_ramp_start()?;
+        let shift = Duration::from_secs(start.min(0).unsigned_abs());
+        let share = super::policy::DataShare::Ramp {
+            start_unix_secs: start.max(0).unsigned_abs(),
+        };
+        Some((share, self.path_clock.wall_now() + shift))
+    }
+
+    /// Whether this node's data bit can still come on ([`QuicPolicy::bit_may_come_on`]).
+    /// A test's trace may give the ramp a start of its own.
+    fn bit_may_come_on(&self) -> bool {
+        #[cfg(any(test, feature = "testing"))]
+        if let Some((share, _)) = self.trace_ramp() {
+            return self.policy.bit_may_come_on_with(share);
+        }
+        self.policy.bit_may_come_on()
+    }
+
+    /// This node's caps on a path to `peer`, from the share at the wall clock now
+    /// ([`QuicPolicy::own_caps`]). A test's trace may give the ramp a start of
+    /// its own.
+    fn own_caps(&self, peer: &TransportPublicKey) -> u32 {
+        #[cfg(any(test, feature = "testing"))]
+        if let Some((share, now)) = self.trace_ramp() {
+            return self.policy.own_caps_with(share, &self.local_key, peer, now);
+        }
+        self.policy
+            .own_caps(&self.local_key, peer, self.path_clock.wall_now())
+    }
+
     fn file_seed(&self, key: &TransportPublicKey, session: u64, seed: BackoffSeed) {
         self.seeds.lock().file(key, session, seed);
     }
@@ -685,10 +752,21 @@ impl Session {
     }
 
     fn step(&self, state: &mut SessionState, event: Event) -> Vec<Action> {
+        let key = state.peer_key.clone();
+        let own_caps = || {
+            key.as_ref().map_or(0, |key| {
+                let caps = self.hub.own_caps(key);
+                self.note_share(key, caps);
+                caps
+            })
+        };
+        let bit_may_come_on = || self.hub.bit_may_come_on();
         let inputs = Inputs {
             now: (self.now)(),
             sample: GlobalRng::random_range(0.0..1.0),
             policy: &self.hub.policy,
+            own_caps: &own_caps,
+            bit_may_come_on: &bit_may_come_on,
         };
         state.machine.step(inputs, event)
     }
@@ -775,6 +853,9 @@ impl Session {
                     path.stats().node().record_data_enabled();
                 }
             }
+            // Not a fallback, and counted by its close code
+            // (`quic_close_sent_recycle_for_data`, `quic_close_received_recycle_for_data`).
+            Outcome::RecycledForData { .. } => {}
             Outcome::Declined { reason, uncharged } => {
                 count(declined(reason));
                 if uncharged {
@@ -1257,7 +1338,8 @@ impl Session {
             older.end();
         }
         let backoff = self.hub.seeds.lock().seed_for(&key);
-        let own_caps = self.hub.policy.own_caps(&self.hub.local_key, &key);
+        let own_caps = self.hub.own_caps(&key);
+        self.note_share(&key, own_caps);
         let sends = {
             let mut state = self.state.lock();
             if state.ended {
@@ -1324,6 +1406,15 @@ impl Session {
             });
         }
         self.note(|| "session ended".to_string());
+    }
+
+    /// Note a data-share decision for the peer in a test's trace
+    /// (`data share: bucket B, percent P, caps C`).
+    fn note_share(&self, peer: &TransportPublicKey, caps: u32) {
+        #[cfg(any(test, feature = "testing"))]
+        self.note(|| self.hub.share_note(peer, caps));
+        #[cfg(not(any(test, feature = "testing")))]
+        let _ = (peer, caps);
     }
 
     /// Write a line to a test's trace, when it has one.

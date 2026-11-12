@@ -3088,6 +3088,10 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 serde_json::json!(snapshot.quic_close_sent_session_ended),
             );
             m.insert(
+                "quic_close_sent_recycle_for_data".into(),
+                serde_json::json!(snapshot.quic_close_sent_recycle_for_data),
+            );
+            m.insert(
                 "quic_close_sent_over_budget".into(),
                 serde_json::json!(snapshot.quic_close_sent_over_budget),
             );
@@ -7847,6 +7851,11 @@ mod tests {
         data.staged_peak_pct = 1049;
         data.gate_loss = (1050..1056).collect();
         data.gate_ended_queue = (1056..1059).collect();
+        data.carrying_sent_packets = 1059;
+        data.carrying_lost_packets = 1060;
+        data.carrying_loss_rate = (1061..1069).collect();
+        data.carrying_ended_loss_rate = (1069..1077).collect();
+        data.carrying_ended_below_floor = 1077;
         let want: std::collections::BTreeMap<String, u64> =
             snapshot.quic_data.keys().into_iter().collect();
         assert!(want.values().all(|value| *value != 0));
@@ -8113,6 +8122,7 @@ mod tests {
             quic_close_sent_control_refused: 8,
             quic_close_sent_session_ended: 10,
             quic_close_sent_over_budget: 11,
+            quic_close_sent_recycle_for_data: 12,
             quic_breaker_trips: 7,
             quic_send_refused: 9,
             quic_breaker_suppressed: true,
@@ -8133,6 +8143,7 @@ mod tests {
             ("quic_close_sent_control_refused", 8),
             ("quic_close_sent_session_ended", 10),
             ("quic_close_sent_over_budget", 11),
+            ("quic_close_sent_recycle_for_data", 12),
             ("quic_breaker_trips", 7),
             ("quic_send_refused", 9),
         ] {
