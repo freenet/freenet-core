@@ -89,7 +89,9 @@ fn window_end<T: TimeSource>(clock: &T, deadline: Duration) -> Result<Duration, 
     Ok(end)
 }
 
-/// This node's Hello to `peer`.
+/// This node's Hello to `peer`. The observed address is normalized, so an
+/// IPv4 peer reached through an IPv4-mapped IPv6 address is encoded as IPv4
+/// (family 4), as the reader's counters compare it.
 fn own_hello(peer: SocketAddr, caps: u32) -> Hello {
     Hello {
         protoc_version: native_version::OWN,
@@ -290,6 +292,23 @@ mod tests {
             assert!(punches(&pair, a_addr, b_addr) >= 1);
             assert!(punches(&pair, b_addr, a_addr) >= 1);
         });
+    }
+
+    /// An IPv4-mapped peer address is encoded as IPv4 in this node's Hello;
+    /// an IPv6 one stays IPv6.
+    #[test]
+    fn the_hello_encodes_a_mapped_peer_address_as_ipv4() {
+        let mapped: SocketAddr = "[::ffff:198.51.100.1]:31337".parse().unwrap();
+        let bytes = own_hello(mapped, 0).encode();
+        assert_eq!(bytes[18], 4, "family");
+        assert_eq!(&bytes[19..23], &[198, 51, 100, 1]);
+        let decoded = Hello::decode(&bytes).unwrap();
+        assert_eq!(
+            decoded.observed,
+            "198.51.100.1:31337".parse::<SocketAddr>().unwrap()
+        );
+        let v6: SocketAddr = "[2001:db8::1]:31337".parse().unwrap();
+        assert_eq!(own_hello(v6, 0).encode()[18], 6);
     }
 
     /// With less than MIN_WINDOW_LEFT before the deadline, neither side

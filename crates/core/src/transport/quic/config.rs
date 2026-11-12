@@ -569,8 +569,10 @@ pub(crate) fn endpoint_config_with_cid_key(cid_key: [u8; 32]) -> std::io::Result
         // Must stay false: a cleared fixed bit could make a short-header
         // packet start with 0x01 or 0x02, which the demux reads as a UDP
         // transport packet, or 0x03, which it drops as a native punch
-        // (demux::PUNCH_FIRST_BYTE) (RFC 9287; transport::demux). Every
-        // endpoint, native connections included, is built from this config.
+        // (demux::PUNCH_FIRST_BYTE) (RFC 9287; transport::demux). A native
+        // connection must run on an endpoint built from this config (today
+        // it uses the node's one endpoint, built here); a separate native
+        // endpoint must keep greasing off too.
         .grease_quic_bit(false)
         .min_reset_interval(Duration::from_millis(20))
         .rng_seed(Some(seed));

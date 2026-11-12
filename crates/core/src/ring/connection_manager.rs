@@ -2016,6 +2016,11 @@ impl ConnectionManager {
         self.open_transports.remove(&addr);
     }
 
+    /// How many addresses the open-transport set holds.
+    pub(crate) fn open_transport_count(&self) -> usize {
+        self.open_transports.len()
+    }
+
     /// Whether the bridge holds an open transport to `addr`.
     pub(crate) fn has_open_transport(&self, addr: SocketAddr) -> bool {
         self.open_transports.contains(&addr)
