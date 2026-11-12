@@ -13,3 +13,7 @@ pub(crate) mod hello;
 // Run by the native entry points (the next step); until then only its tests.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod exchange;
+// The attempt router hands native attempts here; only the native accept
+// (the next step) registers a waiter.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod waiters;

@@ -236,14 +236,14 @@ mod tests {
 
     /// The application close code and reason the connection ended with.
     fn closed_with(connection: &QuicConnection) -> Option<(QuicCloseCode, Vec<u8>)> {
-        match connection.inner().close_reason()? {
-            quinn::ConnectionError::ApplicationClosed(close) => Some((
-                QuicCloseCode::from_code(close.error_code.into_inner())?,
-                close.reason.to_vec(),
-            )),
-            quinn::ConnectionError::LocallyClosed => None,
-            _ => None,
-        }
+        let quinn::ConnectionError::ApplicationClosed(close) = connection.inner().close_reason()?
+        else {
+            return None;
+        };
+        Some((
+            QuicCloseCode::from_code(close.error_code.into_inner())?,
+            close.reason.to_vec(),
+        ))
     }
 
     /// Both sides get the other's Hello, with the version as a tuple.

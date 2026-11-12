@@ -61,6 +61,38 @@ pub(crate) const QUIC_VERSION: u32 = 1;
 /// fails the handshake.
 pub(crate) const ALPN: &[u8] = b"freenet-quic/1";
 
+/// The ALPN protocol of a native connection (#5940): one set up without a UDP
+/// session, which begins with the Hello exchange (`native::exchange`). Only
+/// an attempt the endpoint was told to expect as native offers it, and such
+/// an attempt offers nothing else.
+pub(crate) const NATIVE_ALPN: &[u8] = b"freenet-quic/2";
+
+/// Which kind of connection an attempt makes, and so the one ALPN protocol
+/// its TLS offers on either side.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Alpn {
+    /// An upgrade of a UDP session ([`ALPN`]).
+    Upgrade,
+    /// A native connection ([`NATIVE_ALPN`]).
+    Native,
+}
+
+impl Alpn {
+    /// The protocol identifier offered in TLS.
+    pub(crate) fn protocol(self) -> &'static [u8] {
+        match self {
+            Alpn::Upgrade => ALPN,
+            Alpn::Native => NATIVE_ALPN,
+        }
+    }
+}
+
+/// The initial RTT estimate of a native client. A native dial has an 8 s
+/// window for the handshake and the Hello exchange, so the client
+/// retransmits a lost Initial after about 300 ms rather than about a second
+/// at quinn's estimate here (333 ms).
+pub(crate) const NATIVE_INITIAL_RTT: Duration = Duration::from_millis(100);
+
 /// The server name quinn requires for a connection attempt. With SNI off it
 /// is never sent; peers are identified by their raw public keys.
 pub(crate) const SERVER_NAME: &str = "freenet";
@@ -545,6 +577,17 @@ pub(crate) fn endpoint_config_with_cid_key(cid_key: [u8; 32]) -> std::io::Result
     Ok(config)
 }
 
+/// [`transport_config`] for a native client: the same, with
+/// [`NATIVE_INITIAL_RTT`].
+pub(crate) fn native_client_transport_config<T: TimeSource>(
+    settings: &QuicSettings,
+    time: &T,
+) -> TransportConfig {
+    let mut config = transport_config(settings, time);
+    config.initial_rtt(NATIVE_INITIAL_RTT);
+    config
+}
+
 /// The transport configuration shared by both directions of a connection.
 /// `time` decides the keepalive and the idle timeout, as for the UDP
 /// transport: no keepalive and a long idle timeout where the time source
@@ -667,23 +710,35 @@ fn provider() -> Arc<rustls::crypto::CryptoProvider> {
 }
 
 /// The TLS server configuration: TLS 1.3 only with the ring provider, the
-/// raw public key in `key`, peers checked by `verifier`, the fixed ALPN, and
+/// raw public key in `key`, peers checked by `verifier`, the one ALPN of
+/// `alpn`, and
 /// no session resumption, tickets or early data. `identity` builds the key
 /// and the verifiers.
 pub(crate) fn tls_server_config(
     key: Arc<rustls::sign::CertifiedKey>,
     verifier: Arc<dyn rustls::server::danger::ClientCertVerifier>,
+    alpn: Alpn,
 ) -> Result<quinn::crypto::rustls::QuicServerConfig, TlsConfigError> {
-    let config = rustls_server_config(key, verifier)?;
+    let config = rustls_server_config_for(key, verifier, alpn)?;
     Ok(quinn::crypto::rustls::QuicServerConfig::try_from(
         Arc::new(config),
     )?)
 }
 
-/// The rustls half of [`tls_server_config`].
+/// The rustls half of [`tls_server_config`] for an upgrade.
+#[cfg(test)]
 pub(crate) fn rustls_server_config(
     key: Arc<rustls::sign::CertifiedKey>,
     verifier: Arc<dyn rustls::server::danger::ClientCertVerifier>,
+) -> Result<rustls::ServerConfig, rustls::Error> {
+    rustls_server_config_for(key, verifier, Alpn::Upgrade)
+}
+
+/// The rustls half of [`tls_server_config`], offering `alpn` only.
+pub(crate) fn rustls_server_config_for(
+    key: Arc<rustls::sign::CertifiedKey>,
+    verifier: Arc<dyn rustls::server::danger::ClientCertVerifier>,
+    alpn: Alpn,
 ) -> Result<rustls::ServerConfig, rustls::Error> {
     let mut config = rustls::ServerConfig::builder_with_provider(provider())
         .with_protocol_versions(&[&rustls::version::TLS13])?
@@ -691,7 +746,7 @@ pub(crate) fn rustls_server_config(
         .with_cert_resolver(Arc::new(
             rustls::server::AlwaysResolvesServerRawPublicKeys::new(key),
         ));
-    config.alpn_protocols = vec![ALPN.to_vec()];
+    config.alpn_protocols = vec![alpn.protocol().to_vec()];
     config.max_early_data_size = 0;
     config.send_tls13_tickets = 0;
     config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
@@ -701,23 +756,34 @@ pub(crate) fn rustls_server_config(
 }
 
 /// The TLS client configuration: TLS 1.3 only with the ring provider, the
-/// raw public key in `key`, the server checked by `verifier`, the fixed
-/// ALPN, no SNI, and no session resumption or early data. `identity` builds
+/// raw public key in `key`, the server checked by `verifier`, the one ALPN
+/// of `alpn`, no SNI, and no session resumption or early data. `identity` builds
 /// the key and the verifier.
 pub(crate) fn tls_client_config(
     key: Arc<rustls::sign::CertifiedKey>,
     verifier: Arc<dyn rustls::client::danger::ServerCertVerifier>,
+    alpn: Alpn,
 ) -> Result<quinn::crypto::rustls::QuicClientConfig, TlsConfigError> {
-    let config = rustls_client_config(key, verifier)?;
+    let config = rustls_client_config_for(key, verifier, alpn)?;
     Ok(quinn::crypto::rustls::QuicClientConfig::try_from(
         Arc::new(config),
     )?)
 }
 
-/// The rustls half of [`tls_client_config`].
+/// The rustls half of [`tls_client_config`] for an upgrade.
+#[cfg(test)]
 pub(crate) fn rustls_client_config(
     key: Arc<rustls::sign::CertifiedKey>,
     verifier: Arc<dyn rustls::client::danger::ServerCertVerifier>,
+) -> Result<rustls::ClientConfig, rustls::Error> {
+    rustls_client_config_for(key, verifier, Alpn::Upgrade)
+}
+
+/// The rustls half of [`tls_client_config`], offering `alpn` only.
+pub(crate) fn rustls_client_config_for(
+    key: Arc<rustls::sign::CertifiedKey>,
+    verifier: Arc<dyn rustls::client::danger::ServerCertVerifier>,
+    alpn: Alpn,
 ) -> Result<rustls::ClientConfig, rustls::Error> {
     let mut config = rustls::ClientConfig::builder_with_provider(provider())
         .with_protocol_versions(&[&rustls::version::TLS13])?
@@ -726,7 +792,7 @@ pub(crate) fn rustls_client_config(
         .with_client_cert_resolver(Arc::new(
             rustls::client::AlwaysResolvesClientRawPublicKeys::new(key),
         ));
-    config.alpn_protocols = vec![ALPN.to_vec()];
+    config.alpn_protocols = vec![alpn.protocol().to_vec()];
     config.enable_sni = false;
     config.enable_early_data = false;
     config.resumption = rustls::client::Resumption::disabled();
