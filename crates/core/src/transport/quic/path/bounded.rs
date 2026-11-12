@@ -264,6 +264,8 @@ struct ProgressState {
     refused: AtomicBool,
     /// When the end of the stream was sent, on `now`; 0 before.
     finished_at: AtomicU64,
+    /// [`SendProgress::ack_wait_ended`].
+    ack_wait_ended: AtomicBool,
 }
 
 impl SendProgress {
@@ -283,6 +285,7 @@ impl SendProgress {
             deadlines: None,
             refused: AtomicBool::new(false),
             finished_at: AtomicU64::new(0),
+            ack_wait_ended: AtomicBool::new(false),
         }))
     }
 
@@ -301,6 +304,7 @@ impl SendProgress {
             deadlines: Some((deadlines, started)),
             refused: AtomicBool::new(false),
             finished_at: AtomicU64::new(0),
+            ack_wait_ended: AtomicBool::new(false),
         }))
     }
 
@@ -407,21 +411,13 @@ impl SendProgress {
         self.0.source_wait.notify_one();
     }
 
-    /// How much of the send's ack wait ([`SendDeadlines::ack_wait`]) is left
-    /// at `now`; `None` for a send without one, or not finished.
-    pub(super) fn ack_wait_left(&self) -> Option<Duration> {
-        if self.stage() != STAGE_FINISHED {
-            return None;
-        }
-        let (deadlines, _) = self.0.deadlines.as_ref()?;
-        let until = self
-            .0
-            .finished_at
-            .load(Ordering::Acquire)
-            .saturating_add(nanos(deadlines.ack_wait?));
-        Some(Duration::from_nanos(until.saturating_sub((self.0.now)())))
+    /// The send's deadline ran out after the end of its stream was sent: its
+    /// ack wait ([`SendDeadlines::ack_wait`]), or its total if that came
+    /// first. Set by [`bounded_send`] before it returns, so the stream's drop
+    /// sees it.
+    pub(super) fn ack_wait_ended(&self) -> bool {
+        self.0.ack_wait_ended.load(Ordering::Acquire)
     }
-
     fn stage(&self) -> u8 {
         self.0.stage.load(Ordering::Acquire)
     }
@@ -861,6 +857,9 @@ where
                         && let Some(watch) = watch.as_ref()
                     {
                         watch.prove_quiet();
+                    }
+                    if progress.stage() == STAGE_FINISHED {
+                        progress.0.ack_wait_ended.store(true, Ordering::Release);
                     }
                     return progress.timed_out();
                 }

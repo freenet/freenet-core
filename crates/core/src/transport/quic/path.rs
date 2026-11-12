@@ -1286,8 +1286,21 @@ impl QuicPath {
     /// rather than a flat 5 s, so a slow path's send is not failed at a gap
     /// its receiver still waits through. The gap applies only once the
     /// connection has also stopped making progress (`bounded::ConnectionWatch`).
+    ///
+    /// The ack wait follows the path's round trip too: a stream's length at
+    /// the credit rule's floor (`recycle::credit_floor_rate`, at least
+    /// 16 KiB/s), when that is longer than its first age, so an honest slow
+    /// path's stream is not reset while its acknowledgement is on the way.
     pub(crate) fn stream_deadlines(&self, len: u64) -> SendDeadlines {
-        SendDeadlines::stream(len).with_gap(self.receiver_gap())
+        let deadlines = SendDeadlines::stream(len).with_gap(self.receiver_gap());
+        let floor = recycle::credit_floor_rate(self.connection.inner().stats().path.rtt).max(1);
+        let at_floor = Duration::from_secs(len.div_ceil(floor));
+        SendDeadlines {
+            ack_wait: deadlines
+                .ack_wait
+                .map(|wait| wait.max(at_floor).min(deadlines.total)),
+            ..deadlines
+        }
     }
 
     /// The connection, for tests that write raw streams.
@@ -2408,19 +2421,19 @@ impl Drop for Outgoing {
         if !self.awaiting_ack {
             return;
         }
-        // The send's own deadline for the acknowledgement ran out
-        // (`SendDeadlines::ack_wait`): the peer had the whole stream and
-        // never acknowledged its end. The stream is reset, counted as an
-        // abort (so a peer that does this on every stream reaches
-        // `SEND_ABORT_LIMIT`), and its permit and epoch go now with quinn's
-        // copy of its data. A send cancelled before then (a teardown) waits
+        // The send's deadline ran out after its end was sent (its ack wait,
+        // `SendDeadlines::ack_wait`, or its total): the peer had the whole
+        // stream and never acknowledged its end. The stream is reset,
+        // counted as an abort, and its permit and epoch go now with quinn's
+        // copy of its data. It is also counted toward
+        // `recycle::ACK_WAIT_EXPIRY_LIMIT`, which closes the path at the
+        // third in a row. A send cancelled before then (a teardown) waits
         // below, ending with the acknowledgement or the connection.
-        if self
-            .progress
-            .ack_wait_left()
-            .is_some_and(|left| left.is_zero())
-        {
+        if self.progress.ack_wait_ended() {
             self.reset_finished();
+            if let Some(writers) = &self.writers {
+                writers.ack_wait_expired();
+            }
             return;
         }
         let (slot, epoch) = (self.slot.take(), self.epoch.take());
