@@ -8,14 +8,17 @@
 //! delay is bounded by the virtual clock, which only moves when every task
 //! is idle; here it is whatever the scheduler gives it.
 //!
-//! A measurement, not a regression test: it prints one row per shape and
-//! asserts only that every stream arrived. It takes about a minute of real
-//! time and several hundred sockets, so it runs only when
-//! `FREENET_QUIC_HOLD_REALTIME` is set.
+//! A measurement, not a regression test: it prints one row per shape, with
+//! what became of every send and every received stream, and asserts nothing.
+//! The same shape runs over the legacy UDP transport
+//! (`udp_streams_in_real_time`) so a stream lost on a starved node can be read
+//! against what UDP does there. It takes minutes of real time and several
+//! hundred sockets, so it runs only when `FREENET_QUIC_HOLD_REALTIME` is set.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use super::super::bounded::SendDeadlines;
+use super::super::bounded::{BoundedSend, NotOpened, SendDeadlines, SendFailure};
 use super::*;
 use crate::simulation::RealTime;
 use crate::transport::quic::budget::{QuicBudget, floor_window_bytes};
@@ -70,7 +73,54 @@ struct RealHoldRun {
     floor_window_bytes: u64,
     assembled: usize,
     sent: usize,
+    /// What each send returned.
+    send_outcomes: BTreeMap<String, usize>,
+    /// What each received stream came to, and streams that never arrived.
+    receive_outcomes: BTreeMap<String, usize>,
 }
+
+/// Counts of outcomes by name, shared between tasks.
+#[derive(Clone, Default)]
+struct Tally(Arc<parking_lot::Mutex<BTreeMap<String, usize>>>);
+
+impl Tally {
+    fn add(&self, what: impl Into<String>) {
+        *self.0.lock().entry(what.into()).or_default() += 1;
+    }
+
+    fn take(&self) -> BTreeMap<String, usize> {
+        std::mem::take(&mut *self.0.lock())
+    }
+}
+
+/// A send's outcome by name. A `Failed(TimedOut)` does not say which
+/// deadline passed: with the stream open it is the gap (5 s on loopback,
+/// where the round trip is tiny) or the total.
+fn send_outcome(outcome: &BoundedSend) -> String {
+    match outcome {
+        BoundedSend::Sent => "Sent".into(),
+        BoundedSend::MaybeDelivered(why) => format!("MaybeDelivered({why:?})"),
+        BoundedSend::Failed(SendFailure::NotOpened(NotOpened::TimedOut)) => {
+            "Failed(NotOpened(TimedOut)) open deadline".into()
+        }
+        BoundedSend::Failed(SendFailure::NotOpened(NotOpened::ConnectionLost(_))) => {
+            "Failed(NotOpened(ConnectionLost))".into()
+        }
+        BoundedSend::Failed(SendFailure::NotOpened(NotOpened::Paced)) => {
+            "Failed(NotOpened(Paced))".into()
+        }
+        BoundedSend::Failed(SendFailure::TimedOut) => "Failed(TimedOut) gap or total".into(),
+        BoundedSend::Failed(SendFailure::Paced) => "Failed(Paced)".into(),
+        BoundedSend::Failed(SendFailure::Error(error)) => {
+            let mut text = format!("Failed(Error({error:?}))");
+            text.truncate(100);
+            text
+        }
+    }
+}
+
+/// How long a shape may run before the rest is counted as unfinished.
+const SHAPE_LIMIT: Duration = Duration::from_secs(300);
 
 /// A hub endpoint and `connections` leaf endpoints, each on its own real
 /// loopback UDP socket, connected, with a metered data path on each side;
@@ -196,14 +246,15 @@ fn hold_real_time(connections: usize, workers: usize, hogs: usize) -> RealHoldRu
 
         let sent = connections * STREAMS_PER_LEAF;
         let assembled = Arc::new(AtomicUsize::new(0));
+        let (send_tally, receive_tally) = (Tally::default(), Tally::default());
         let started = std::time::Instant::now();
         let mut work = Vec::new();
         for (sender, _receiver, mut inbound, _sender_in) in links {
             for index in 0..STREAMS_PER_LEAF {
-                let (sender, time) = (sender.clone(), time.clone());
+                let (sender, time, tally) = (sender.clone(), time.clone(), send_tally.clone());
                 work.push(tokio::spawn(async move {
                     let body = Bytes::from(vec![index as u8; STREAM_BYTES]);
-                    sender
+                    let outcome = sender
                         .send_stream_bounded(
                             &time,
                             SendDeadlines::stream(STREAM_BYTES as u64),
@@ -213,31 +264,40 @@ fn hold_real_time(connections: usize, workers: usize, hogs: usize) -> RealHoldRu
                             None,
                         )
                         .await;
+                    tally.add(send_outcome(&outcome));
                 }));
             }
-            let assembled = assembled.clone();
+            let (assembled, tally) = (assembled.clone(), receive_tally.clone());
             work.push(tokio::spawn(async move {
                 let mut taken = 0;
                 while taken < STREAMS_PER_LEAF {
                     let Some(arrival) = inbound.streams.recv().await else {
+                        for _ in taken..STREAMS_PER_LEAF {
+                            tally.add("channel closed before it arrived");
+                        }
                         break;
                     };
                     taken += 1;
-                    if arrival
-                        .handle
-                        .assemble()
-                        .await
-                        .is_ok_and(|body| body.len() == STREAM_BYTES)
-                    {
-                        assembled.fetch_add(1, Ordering::Relaxed);
+                    match arrival.handle.assemble().await {
+                        Ok(body) if body.len() == STREAM_BYTES => {
+                            assembled.fetch_add(1, Ordering::Relaxed);
+                            tally.add("assembled");
+                        }
+                        Ok(body) => tally.add(format!("assembled {} bytes", body.len())),
+                        Err(error) => tally.add(format!("assemble failed: {error:?}")),
                     }
                 }
             }));
         }
+        let aborts: Vec<_> = work.iter().map(|task| task.abort_handle()).collect();
         let all = futures::future::join_all(work);
-        tokio::time::timeout(Duration::from_secs(300), all)
-            .await
-            .expect("the transfers finished within 300 s");
+        if tokio::time::timeout(SHAPE_LIMIT, all).await.is_err() {
+            let unfinished = aborts.iter().filter(|task| !task.is_finished()).count();
+            receive_tally.add(format!("tasks unfinished at {SHAPE_LIMIT:?}: {unfinished}"));
+            for task in &aborts {
+                task.abort();
+            }
+        }
         let transfer_ms = started.elapsed().as_millis();
         sampling.store(false, Ordering::Relaxed);
         stop.store(true, Ordering::Relaxed);
@@ -300,6 +360,8 @@ fn hold_real_time(connections: usize, workers: usize, hogs: usize) -> RealHoldRu
             floor_window_bytes: floor_window_bytes(HUB_MEMORY) as u64,
             assembled: assembled.load(Ordering::Relaxed),
             sent,
+            send_outcomes: send_tally.take(),
+            receive_outcomes: receive_tally.take(),
         };
         for pump in pumps {
             pump.abort();
@@ -334,8 +396,258 @@ fn quinns_hold_between_reader_polls_in_real_time() {
         ],
     };
     for (connections, workers, hogs) in shapes {
-        let run = hold_real_time(connections, workers, hogs);
-        eprintln!("3c real-time hold: {run:?}");
-        assert_eq!(run.assembled, run.sent, "{run:?}");
+        if std::env::var_os("FREENET_QUIC_HOLD_SKIP_QUIC").is_none() {
+            let run = hold_real_time(connections, workers, hogs);
+            eprintln!("3c real-time hold: {run:?}");
+        }
+        if std::env::var_os("FREENET_QUIC_HOLD_UDP").is_some() {
+            let run = udp_streams_in_real_time(connections, workers, hogs);
+            eprintln!("3c real-time udp: {run:?}");
+        }
     }
+}
+
+/// One row of the legacy UDP run.
+// Read through `Debug` in the printed rows.
+#[allow(dead_code)]
+#[derive(Debug)]
+struct UdpRun {
+    connections: usize,
+    workers: usize,
+    hogs: usize,
+    /// Real time from the first send to the last stream received, or to
+    /// [`SHAPE_LIMIT`].
+    transfer_ms: u128,
+    received: usize,
+    sent: usize,
+    /// `StreamSendOutcome` of each send, from its completion channel.
+    send_outcomes: BTreeMap<String, usize>,
+    /// What the receivers' `recv` returned, and streams that never arrived.
+    receive_outcomes: BTreeMap<String, usize>,
+}
+
+/// The shape of [`hold_real_time`] over the legacy UDP transport: a hub and
+/// `connections` leaves, each on its own real loopback socket (each leaf on
+/// its own 127.x address, so the per-IP intro limit does not serialize the
+/// handshakes), every leaf sending [`STREAMS_PER_LEAF`] streams of
+/// [`STREAM_BYTES`] at once while `hogs` tasks spin on the runtime's
+/// `workers`. Default congestion control and no bandwidth limit, as a node.
+#[allow(clippy::disallowed_methods)] // a real clock and real threads, on purpose
+fn udp_streams_in_real_time(connections: usize, workers: usize, hogs: usize) -> UdpRun {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async move {
+        use crate::test_utils::{release_local_port, reserve_local_port_on_ip};
+        use crate::transport::StreamSendOutcome;
+        use crate::transport::TransportError;
+        use crate::transport::UdpTransportSocket;
+        use crate::transport::connection_handler::create_connection_handler;
+        use crate::transport::crypto::TransportKeypair;
+        use std::net::{IpAddr, Ipv4Addr};
+
+        async fn handler(
+            ip: Ipv4Addr,
+        ) -> (
+            TransportKeypair,
+            SocketAddr,
+            impl Sized,
+            crate::transport::connection_handler::OutboundConnectionHandler<
+                crate::transport::demux::DemuxSocket<UdpTransportSocket>,
+            >,
+        ) {
+            let keys = TransportKeypair::new();
+            let port = reserve_local_port_on_ip(ip).expect("a port");
+            release_local_port(port);
+            let (out, inbound, task) = create_connection_handler::<UdpTransportSocket>(
+                keys.clone(),
+                IpAddr::V4(ip),
+                port,
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("handler");
+            (
+                keys,
+                SocketAddr::new(IpAddr::V4(ip), port),
+                (inbound, task),
+                out,
+            )
+        }
+
+        let (hub_keys, hub_addr, hub_keep, mut hub_out) = handler(Ipv4Addr::LOCALHOST).await;
+        let mut keep = vec![];
+        let mut pairs = Vec::new();
+        for i in 0..connections {
+            let ip = Ipv4Addr::new(127, 1 + (i / 250) as u8, (i % 250) as u8 + 2, 1);
+            let (keys, addr, leaf_keep, mut leaf_out) = handler(ip).await;
+            let (hub_side, leaf_side) = futures::join!(
+                hub_out.connect(keys.public().clone(), addr),
+                leaf_out.connect(hub_keys.public().clone(), hub_addr),
+            );
+            let (hub_conn, leaf_conn) = tokio::time::timeout(Duration::from_secs(30), async {
+                futures::join!(hub_side, leaf_side)
+            })
+            .await
+            .expect("connected within 30 s");
+            pairs.push((
+                leaf_conn.expect("leaf connects"),
+                hub_conn.expect("hub connects"),
+            ));
+            keep.push((leaf_keep, leaf_out));
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut hog_tasks = Vec::new();
+        for _ in 0..hogs {
+            let stop = stop.clone();
+            hog_tasks.push(tokio::spawn(async move {
+                while !stop.load(Ordering::Relaxed) {
+                    let until = std::time::Instant::now() + Duration::from_micros(200);
+                    while std::time::Instant::now() < until {
+                        std::hint::spin_loop();
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }));
+        }
+
+        let sent = connections * STREAMS_PER_LEAF;
+        let received = Arc::new(AtomicUsize::new(0));
+        let (send_tally, receive_tally) = (Tally::default(), Tally::default());
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+        let started = std::time::Instant::now();
+        let mut done = Vec::new();
+        let mut drivers = Vec::new();
+        let mut completions = Vec::new();
+        for (mut leaf, mut hub) in pairs {
+            let mut stopped = stop_rx.clone();
+            let tally = send_tally.clone();
+            let (sends_tx, sends_rx) = tokio::sync::oneshot::channel();
+            drivers.push(tokio::spawn(async move {
+                let mut waits = Vec::new();
+                for index in 0..STREAMS_PER_LEAF {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    match leaf
+                        .send_serialized_observed(vec![index as u8; STREAM_BYTES], tx)
+                        .await
+                    {
+                        Ok(_) => waits.push(rx),
+                        Err(error) => tally.add(format!("send error: {error:?}")),
+                    }
+                }
+                sends_tx.send(waits).ok();
+                loop {
+                    tokio::select! {
+                        result = leaf.recv() => {
+                            if let Err(TransportError::ConnectionClosed(_)) = result {
+                                break;
+                            }
+                        }
+                        _ = stopped.changed() => break,
+                    }
+                }
+                leaf
+            }));
+            let tally = send_tally.clone();
+            completions.push(tokio::spawn(async move {
+                let Ok(waits) = sends_rx.await else { return };
+                for wait in waits {
+                    match wait.await {
+                        Ok(StreamSendOutcome::Delivered) => tally.add("Delivered"),
+                        Ok(other) => tally.add(format!("{other:?}")),
+                        Err(_) => tally.add("no outcome reported"),
+                    }
+                }
+            }));
+            let mut stopped = stop_rx.clone();
+            let (received, tally) = (received.clone(), receive_tally.clone());
+            let (all_tx, all_rx) = tokio::sync::oneshot::channel::<()>();
+            done.push(all_rx);
+            drivers.push(tokio::spawn(async move {
+                let mut all_tx = Some(all_tx);
+                let mut got = 0;
+                loop {
+                    tokio::select! {
+                        result = hub.recv() => match result {
+                            Ok(message) if message.len() == STREAM_BYTES => {
+                                received.fetch_add(1, Ordering::Relaxed);
+                                tally.add("received");
+                                got += 1;
+                                if got == STREAMS_PER_LEAF {
+                                    if let Some(tx) = all_tx.take() {
+                                        tx.send(()).ok();
+                                    }
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(TransportError::ConnectionClosed(_)) => {
+                                tally.add("connection closed");
+                                break;
+                            }
+                            Err(error) => {
+                                let mut text = format!("recv error: {error:?}");
+                                text.truncate(100);
+                                tally.add(text);
+                            }
+                        },
+                        _ = stopped.changed() => break,
+                    }
+                }
+                hub
+            }));
+        }
+        let all = futures::future::join_all(done);
+        let timed_out = tokio::time::timeout(SHAPE_LIMIT, all).await.is_err();
+        let transfer_ms = started.elapsed().as_millis();
+        // Give send completions a moment to report, then stop everything.
+        let completions = futures::future::join_all(completions);
+        let _ = tokio::time::timeout(Duration::from_secs(10), completions).await;
+        stop_tx.send(true).ok();
+        stop.store(true, Ordering::Relaxed);
+        let connections_kept = futures::future::join_all(drivers).await;
+        for hog in hog_tasks {
+            hog.await.ok();
+        }
+        let received_count = received.load(Ordering::Relaxed);
+        if received_count < sent {
+            receive_tally.add(format!(
+                "never arrived{}",
+                if timed_out {
+                    " (shape limit reached)"
+                } else {
+                    ""
+                }
+            ));
+            if let Some(count) = receive_tally.0.lock().get_mut(&format!(
+                "never arrived{}",
+                if timed_out {
+                    " (shape limit reached)"
+                } else {
+                    ""
+                }
+            )) {
+                *count = sent - received_count;
+            }
+        }
+        drop(connections_kept);
+        drop((keep, hub_keep, hub_out));
+        UdpRun {
+            connections,
+            workers,
+            hogs,
+            transfer_ms,
+            received: received_count,
+            sent,
+            send_outcomes: send_tally.take(),
+            receive_outcomes: receive_tally.take(),
+        }
+    })
 }
