@@ -264,7 +264,7 @@ pub(super) async fn send_stream_on_path<S: Socket, T: TimeSource>(
         .path()
         .send_stream_bounded(
             route.clock(),
-            SendDeadlines::stream(bytes),
+            route.path().stream_deadlines(bytes),
             stream_id,
             metadata.as_deref(),
             data.clone(),
@@ -321,7 +321,10 @@ pub(super) async fn pipe_stream_on_path<S: Socket, T: TimeSource>(
     let source_gap = inbound_handle
         .fragment_gap_limit()
         .min(route.path().receiver_gap());
-    let deadlines = SendDeadlines::stream(bytes).with_source_gap(source_gap);
+    let deadlines = route
+        .path()
+        .stream_deadlines(bytes)
+        .with_source_gap(source_gap);
     let outcome = route
         .path()
         .send_stream_chunks_bounded(

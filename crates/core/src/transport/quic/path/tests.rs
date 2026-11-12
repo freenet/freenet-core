@@ -3562,6 +3562,41 @@ fn a_path_dark_in_both_directions_is_closed_as_dark() {
     })
 }
 
+/// A node's streamed send takes its write gap from the path, as its receiver
+/// does (#6186): 5 s on a fast path, and on a 1 s round trip the 24 round
+/// trips the receiver waits between pieces, never a flat 5 s.
+#[test]
+fn a_streamed_sends_gap_follows_its_paths_round_trip() {
+    use crate::transport::in_memory_socket::{
+        PacketDeliveryDecision, set_packet_delivery_callback,
+    };
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let fast = paths("quic-path-gap-fast", QuicPathLimits::DEFAULT).await;
+        let deadlines = fast.a.stream_deadlines(100_000);
+        assert_eq!(
+            deadlines.gap,
+            Some(crate::transport::peer_connection::streaming::STREAM_INACTIVITY_TIMEOUT)
+        );
+        let network = "quic-path-gap-slow";
+        set_packet_delivery_callback(
+            network,
+            Some(Arc::new(|_, _, _, _| {
+                PacketDeliveryDecision::DelayedDelivery(Duration::from_millis(500))
+            })),
+        );
+        let slow = paths(network, QuicPathLimits::DEFAULT).await;
+        let deadlines = slow.a.stream_deadlines(100_000);
+        assert_eq!(deadlines.gap, Some(slow.a.receiver_gap()));
+        assert!(
+            deadlines.gap.unwrap() >= Duration::from_secs(20),
+            "{deadlines:?}"
+        );
+        assert!(deadlines.open <= deadlines.gap.unwrap());
+        set_packet_delivery_callback(network, None);
+    })
+}
+
 /// The dark-path rule closes only a path that carries data. On one that
 /// does not (every path while no release sends data on QUIC), a dark spell
 /// in both directions, with a control frame sent into it, does not close
