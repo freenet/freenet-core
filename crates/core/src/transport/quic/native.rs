@@ -6,4 +6,7 @@
 //! later step; nothing here is reachable from the connect op while
 //! `connect::native::NATIVE_DIAL_READY` is false.
 
+// Read and written only by the native entry points, which come in the next
+// step; until then only its tests use it.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod hello;

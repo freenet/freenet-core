@@ -334,12 +334,12 @@ mod tests {
         for len in 0..=good.len() + 4 {
             let mut bytes = good.clone();
             bytes.resize(len, 0xAA);
-            let _ = Hello::decode(&bytes);
+            drop(Hello::decode(&bytes));
             for i in 0..len {
                 for flip in [0x01u8, 0x80, 0xFF] {
                     let mut mutated = bytes.clone();
                     mutated[i] ^= flip;
-                    let _ = Hello::decode(&mutated);
+                    drop(Hello::decode(&mutated));
                 }
             }
         }
