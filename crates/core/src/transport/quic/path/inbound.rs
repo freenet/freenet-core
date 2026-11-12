@@ -2362,8 +2362,8 @@ mod tests {
         use super::super::super::budget::{QuicBudget, WindowControl, floor_window_bytes};
         use super::super::super::tests::{bounded, drive, pair};
         bounded(|| async move {
-            let a_addr: std::net::SocketAddr = "10.209.1.1:5000".parse().unwrap();
-            let b_addr: std::net::SocketAddr = "10.209.1.2:5000".parse().unwrap();
+            let net = crate::transport::test_net::subnet();
+            let (a_addr, b_addr) = (net.addr(1), net.addr(2));
             let p = pair("quic-inbound-gapped-delivery", a_addr, b_addr, None).await;
             let permit =
                 p.b.allow_peer(p.a_addr, p.a_keys.public())
