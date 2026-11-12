@@ -181,6 +181,38 @@ mod tests {
         assert_eq!(manager.open_transport_addrs(), keys(&map));
     }
 
+    /// A map replaced whole, by assignment or taken out with `mem::replace`,
+    /// closes its addresses in its own manager's set once it is dropped, and
+    /// the map that replaced it is mirrored in its manager.
+    #[tokio::test]
+    async fn a_replaced_map_closes_its_addresses_in_its_own_manager() {
+        let (first, second, third) = (
+            ConnectionManager::test_default(),
+            ConnectionManager::test_default(),
+            ConnectionManager::test_default(),
+        );
+        let mut map = ConnectionMap::new(first.clone());
+        map.insert(addr(1), entry(1));
+        map.insert(addr(2), entry(2));
+        let taken = std::mem::replace(&mut map, ConnectionMap::new(second.clone()));
+        assert_eq!(
+            first.open_transport_addrs(),
+            keys(&taken),
+            "held while alive"
+        );
+        drop(taken);
+        assert!(first.open_transport_addrs().is_empty());
+        map.insert(addr(3), entry(3));
+        assert_eq!(second.open_transport_addrs(), keys(&map));
+        map = ConnectionMap::new(third.clone());
+        assert!(
+            second.open_transport_addrs().is_empty(),
+            "assignment drops the old map"
+        );
+        map.insert(addr(4), entry(4));
+        assert_eq!(third.open_transport_addrs(), keys(&map));
+    }
+
     /// A second map over a manager that already has open transports is
     /// refused in debug builds: one live map per manager.
     #[cfg(debug_assertions)]

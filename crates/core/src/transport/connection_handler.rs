@@ -43,8 +43,8 @@ pub(crate) mod native_version {
 
     /// Check a peer's version bytes as the UDP handshake checks an intro's:
     /// the version is reported (`report_peer_version`) either way, and a peer
-    /// whose floor is above this build asks for an urgent update. `Err` names
-    /// why the two cannot talk.
+    /// whose floor is above this build asks for an urgent update
+    /// ([`needs_urgent_update`]). `Err` names why the two cannot talk.
     pub(crate) fn check(remote: &[u8; 8]) -> Result<(u8, u8, u16), String> {
         match is_compatible(&OWN, remote) {
             Ok(info) => {
@@ -53,7 +53,7 @@ pub(crate) mod native_version {
             }
             Err(reason) => {
                 crate::transport::report_peer_version(parse_version_bytes(remote).version);
-                if remote_requires_newer_than_us(&OWN, remote) {
+                if needs_urgent_update(remote) {
                     crate::transport::signal_urgent_update();
                 }
                 Err(reason)
@@ -61,16 +61,86 @@ pub(crate) mod native_version {
         }
     }
 
+    /// Whether a peer's version bytes say this build must update: the peer's
+    /// floor is above this build.
+    pub(crate) fn needs_urgent_update(remote: &[u8; 8]) -> bool {
+        remote_requires_newer_than_us(&OWN, remote)
+    }
+
     /// A peer closed with `VERSION_INCOMPATIBLE`, its version bytes as the
-    /// reason. As for a gateway's version-mismatch ack on UDP, only a
-    /// gateway's rejection sets the version-mismatch signal, and only when
-    /// its floor is above this build.
+    /// reason; sets the version-mismatch signal when
+    /// [`rejection_signals_mismatch`] says so.
     pub(crate) fn rejected_by(peer_version: &[u8], peer_is_gateway: bool) {
-        let Ok(bytes) = <[u8; 8]>::try_from(peer_version) else {
-            return;
-        };
-        if peer_is_gateway && remote_requires_newer_than_us(&OWN, &bytes) {
+        if rejection_signals_mismatch(peer_version, peer_is_gateway) {
             crate::transport::signal_version_mismatch();
+        }
+    }
+
+    /// As for a gateway's version-mismatch ack on UDP, only a gateway's
+    /// rejection counts, only when its floor is above this build, and only
+    /// with a reason of exactly 8 bytes.
+    pub(crate) fn rejection_signals_mismatch(peer_version: &[u8], peer_is_gateway: bool) -> bool {
+        let Ok(bytes) = <[u8; 8]>::try_from(peer_version) else {
+            return false;
+        };
+        peer_is_gateway && remote_requires_newer_than_us(&OWN, &bytes)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::super::version_cmp::OWN_VERSION;
+        use super::*;
+
+        /// Version bytes in format 1 for this build's major.minor, with
+        /// `patch` and a floor of `floor`.
+        fn same_series(patch: u16, floor: u16) -> [u8; 8] {
+            let (major, minor, _) = OWN_VERSION;
+            let [p_hi, p_lo] = patch.to_be_bytes();
+            let [f_hi, f_lo] = floor.to_be_bytes();
+            [0xFF, major, minor, p_hi, p_lo, f_hi, f_lo, 1]
+        }
+
+        /// A peer whose floor is above this build.
+        fn requires_newer() -> [u8; 8] {
+            let own = OWN_VERSION.2;
+            let newer = same_series(own + 2, own + 1);
+            assert!(remote_requires_newer_than_us(&OWN, &newer), "premise");
+            newer
+        }
+
+        /// Only a gateway's rejection whose floor is above this build sets
+        /// the mismatch signal; an ordinary peer's, a gateway at this build's
+        /// version, and a reason that is not 8 bytes do not.
+        #[test]
+        fn only_a_gateway_requiring_a_newer_build_signals_a_mismatch() {
+            let newer = requires_newer();
+            assert!(rejection_signals_mismatch(&newer, true));
+            assert!(!rejection_signals_mismatch(&newer, false));
+            assert!(!rejection_signals_mismatch(&OWN, true));
+            assert!(!rejection_signals_mismatch(&newer[..7], true));
+            let mut long = newer.to_vec();
+            long.push(0);
+            assert!(!rejection_signals_mismatch(&long, true));
+            // And the signal is really sent: the generation only moves up, so
+            // another test cannot make this pass or fail.
+            let before = crate::transport::version_mismatch_generation();
+            rejected_by(&newer, true);
+            assert!(crate::transport::version_mismatch_generation() > before);
+        }
+
+        /// A peer whose floor is above this build is incompatible and asks
+        /// for an urgent update; a peer this build is compatible with does
+        /// not.
+        #[test]
+        fn a_peer_requiring_a_newer_build_asks_for_an_urgent_update() {
+            let newer = requires_newer();
+            assert!(needs_urgent_update(&newer));
+            assert!(!needs_urgent_update(&OWN));
+            let before = crate::transport::version_mismatch_generation();
+            assert!(check(&newer).is_err());
+            assert!(crate::transport::is_urgent_update());
+            assert!(crate::transport::version_mismatch_generation() > before);
+            assert_eq!(check(&OWN), Ok(OWN_VERSION));
         }
     }
 }

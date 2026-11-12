@@ -290,7 +290,8 @@ struct ExpectedClients {
 struct ExpectedEntry {
     key: PeerKey,
     /// The one ALPN an attempt from the address is accepted with: native
-    /// only for an address allowed by [`QuicEndpoint::allow_native_peer`].
+    /// only for an address allowed by `QuicEndpoint::allow_native_peer`
+    /// (`native::endpoint`).
     alpn: config::Alpn,
     permits: usize,
     holds: usize,
@@ -824,29 +825,8 @@ impl QuicEndpoint {
         self.allow_peer_for(addr, expected, config::Alpn::Upgrade)
     }
 
-    /// Send one punch datagram (`native::punch::punch_datagram`) to `to` on
-    /// the endpoint's socket, without waiting. It is charged to the egress cap
-    /// like any unpaced send. A send the socket cannot take now is lost, as a
-    /// punch lost on the way would be.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn send_punch(&self, datagram: &[u8; super::demux::PUNCH_LEN], to: SocketAddr) {
-        if let Err(error) = self.sources.try_send(datagram, to) {
-            tracing::debug!(%to, %error, "A QUIC-native punch was not sent");
-        }
-    }
-
-    /// [`Self::allow_peer`] for a native connection: an attempt from `addr`
-    /// is accepted with the native ALPN only, so it completes only if the
-    /// client dialled it as native ([`Self::dial_native`]).
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn allow_native_peer(
-        &self,
-        addr: SocketAddr,
-        expected: &TransportPublicKey,
-    ) -> Result<QuicPeerPermit, QuicAllowError> {
-        self.allow_peer_for(addr, expected, config::Alpn::Native)
-    }
-
+    /// [`Self::allow_peer`] with the one ALPN an attempt from `addr` is
+    /// accepted with (`native::endpoint` allows a native peer through it).
     fn allow_peer_for(
         &self,
         addr: SocketAddr,
@@ -917,23 +897,6 @@ impl QuicEndpoint {
         let peer = PeerKey::of(expected)?;
         let tls = self.identity.client_tls(&peer)?;
         let config = self.client_config(Arc::new(tls));
-        self.connect_with(addr, config, peer).await
-    }
-
-    /// [`Self::connect`] for a native connection: TLS offers the native ALPN
-    /// only, and the client starts from [`config::NATIVE_INITIAL_RTT`]. The
-    /// server must have allowed this node with
-    /// [`Self::allow_native_peer`]; an upgrade server refuses the handshake.
-    /// The caller bounds the wait: quinn gives up only at the idle timeout.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) async fn dial_native(
-        &self,
-        addr: SocketAddr,
-        expected: &TransportPublicKey,
-    ) -> Result<QuicConnection, QuicConnectError> {
-        let peer = PeerKey::of(expected)?;
-        let tls = self.identity.client_tls_for(&peer, config::Alpn::Native)?;
-        let config = config::client_config(Arc::new(tls), self.native_transport.clone());
         self.connect_with(addr, config, peer).await
     }
 
@@ -1079,7 +1042,7 @@ impl QuicIncoming {
     }
 
     /// Whether the attempt is for a native connection: its address was
-    /// allowed by [`QuicEndpoint::allow_native_peer`].
+    /// allowed by `QuicEndpoint::allow_native_peer` (`native::endpoint`).
     pub(crate) fn is_native(&self) -> bool {
         self.alpn == config::Alpn::Native
     }

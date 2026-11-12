@@ -1,18 +1,17 @@
 //! The attempt router's lookup of native waiters (#5940, design 2.4).
 //!
-//! A native server allows its peer with
-//! [`QuicEndpoint::allow_native_peer`](crate::transport::quic::QuicEndpoint::allow_native_peer)
-//! and registers here for the peer's address. The attempt router hands each
-//! native attempt from that address to the waiter, which is the only way a
-//! native attempt reaches anything. An address gets an entry only from
-//! `NativeWaiters::register`, visible to the native module only, whose one
-//! caller is the native accept.
+//! A native server allows its peer as native and registers here for the
+//! peer's address; both happen in `setup::accept_native`, and registering is
+//! private to `setup`. The attempt router hands each native attempt from that
+//! address to the waiter, which is the only way a native attempt reaches
+//! anything.
 //!
-//! At most one attempt per waiter is in flight: while the waiter is
-//! completing one handshake the router ignores the next attempts, and the
-//! channel holds at most one more. An attempt whose sender has not shown it
-//! reads datagrams sent to its address is answered with a Retry first, as an
-//! upgrade attempt is: one more round trip inside the 8 s window.
+//! At most one attempt per waiter is in flight: handing an attempt over marks
+//! the waiter busy, and the router ignores further attempts until the waiter
+//! has finished with it (its [`InFlight`] guard drops). An attempt whose
+//! sender has not shown it reads datagrams sent to its address is answered
+//! with a Retry first, as an upgrade attempt is: one more round trip inside
+//! the 8 s window.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -23,6 +22,37 @@ use tokio::sync::mpsc;
 
 use crate::transport::quic::QuicIncoming;
 
+/// What the router needs of an attempt; [`QuicIncoming`] in production, a
+/// stand-in in tests.
+pub(crate) trait NativeAttempt: Send + 'static {
+    /// The address it came from, normalized as the allow-set does.
+    fn source(&self) -> SocketAddr;
+    /// Whether it returned a Retry token for its address.
+    fn address_validated(&self) -> bool;
+    /// Drop it without an answer.
+    fn ignore(self);
+    /// Answer it with a Retry and drop it.
+    fn retry(self);
+}
+
+impl NativeAttempt for QuicIncoming {
+    fn source(&self) -> SocketAddr {
+        QuicIncoming::source(self)
+    }
+
+    fn address_validated(&self) -> bool {
+        QuicIncoming::address_validated(self)
+    }
+
+    fn ignore(self) {
+        QuicIncoming::ignore(self)
+    }
+
+    fn retry(self) {
+        QuicIncoming::retry(self)
+    }
+}
+
 /// What the router did with a native attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NativeRoute {
@@ -32,37 +62,46 @@ pub(crate) enum NativeRoute {
     Retried,
     /// No waiter for the address: ignored.
     NoWaiter,
-    /// The waiter is completing another attempt, or one is already queued
-    /// for it: ignored.
+    /// The waiter has an attempt it has not finished with: ignored.
     Busy,
 }
 
 /// The native waiters of one endpoint, by address (normalized as the
 /// allow-set normalizes it).
-#[derive(Default)]
-pub(crate) struct NativeWaiters {
-    by_addr: DashMap<SocketAddr, Slot>,
-    next_id: AtomicU64,
+pub(crate) struct NativeWaiters<A = QuicIncoming> {
+    pub(super) by_addr: DashMap<SocketAddr, Slot<A>>,
+    pub(super) next_id: AtomicU64,
 }
 
-struct Slot {
-    id: u64,
-    attempts: mpsc::Sender<QuicIncoming>,
-    /// Set while the waiter completes a handshake.
-    busy: Arc<AtomicBool>,
+impl<A> Default for NativeWaiters<A> {
+    fn default() -> Self {
+        Self {
+            by_addr: DashMap::new(),
+            next_id: AtomicU64::new(0),
+        }
+    }
+}
+
+pub(super) struct Slot<A> {
+    pub(super) id: u64,
+    pub(super) attempts: mpsc::Sender<A>,
+    /// Set when an attempt is handed over, cleared when the waiter has
+    /// finished with it.
+    pub(super) busy: Arc<AtomicBool>,
 }
 
 /// One native server's place in [`NativeWaiters`]. Dropping it removes the
 /// entry, and only its own.
-pub(crate) struct NativeWaiter {
-    waiters: Arc<NativeWaiters>,
-    addr: SocketAddr,
-    id: u64,
-    attempts: mpsc::Receiver<QuicIncoming>,
-    busy: Arc<AtomicBool>,
+pub(crate) struct NativeWaiter<A: NativeAttempt = QuicIncoming> {
+    pub(super) waiters: Arc<NativeWaiters<A>>,
+    pub(super) addr: SocketAddr,
+    pub(super) id: u64,
+    pub(super) attempts: mpsc::Receiver<A>,
+    pub(super) busy: Arc<AtomicBool>,
 }
 
-/// Marks the waiter busy while alive.
+/// Keeps the waiter busy while alive; dropping it lets the router hand over
+/// the next attempt.
 pub(crate) struct InFlight(Arc<AtomicBool>);
 
 impl Drop for InFlight {
@@ -71,70 +110,35 @@ impl Drop for InFlight {
     }
 }
 
-impl NativeWaiters {
-    /// Wait for native attempts from `addr`. `None` when a waiter for it
-    /// already exists: one native connection is set up per address at a
-    /// time. Visible to the native module only, and called there only by
-    /// `setup::accept_native` (pinned in `native::pins`).
-    pub(super) fn register(self: &Arc<Self>, addr: SocketAddr) -> Option<NativeWaiter> {
-        let addr = crate::transport::normalize_mapped_addr(addr);
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = mpsc::channel(1);
-        let busy = Arc::new(AtomicBool::new(false));
-        match self.by_addr.entry(addr) {
-            dashmap::mapref::entry::Entry::Occupied(_) => None,
-            dashmap::mapref::entry::Entry::Vacant(vacant) => {
-                vacant.insert(Slot {
-                    id,
-                    attempts: tx,
-                    busy: busy.clone(),
-                });
-                Some(NativeWaiter {
-                    waiters: self.clone(),
-                    addr,
-                    id,
-                    attempts: rx,
-                    busy,
-                })
-            }
-        }
-    }
-
+impl<A: NativeAttempt> NativeWaiters<A> {
     /// Hand a native attempt to the waiter for its address, without
     /// waiting. Anything not handed is ignored or answered with a Retry, so
-    /// the endpoint keeps no state for it.
-    pub(crate) fn route(&self, incoming: QuicIncoming) -> NativeRoute {
-        let addr = incoming.source();
+    /// the endpoint keeps no state for it. Called from the router task only.
+    pub(crate) fn route(&self, attempt: A) -> NativeRoute {
+        let addr = attempt.source();
         let Some(slot) = self.by_addr.get(&addr) else {
-            incoming.ignore();
+            attempt.ignore();
             return NativeRoute::NoWaiter;
         };
         if slot.busy.load(Ordering::Acquire) {
-            incoming.ignore();
+            attempt.ignore();
             return NativeRoute::Busy;
         }
-        if !incoming.address_validated() {
-            incoming.retry();
+        if !attempt.address_validated() {
+            attempt.retry();
             return NativeRoute::Retried;
         }
-        match slot.attempts.try_send(incoming) {
+        // Busy from here, before the waiter can take it, so the router hands
+        // over nothing more until the waiter's guard drops.
+        slot.busy.store(true, Ordering::Release);
+        match slot.attempts.try_send(attempt) {
             Ok(()) => NativeRoute::Handed,
-            Err(
-                mpsc::error::TrySendError::Full(incoming)
-                | mpsc::error::TrySendError::Closed(incoming),
-            ) => {
-                incoming.ignore();
+            Err(mpsc::error::TrySendError::Full(attempt))
+            | Err(mpsc::error::TrySendError::Closed(attempt)) => {
+                attempt.ignore();
                 NativeRoute::Busy
             }
         }
-    }
-
-    /// [`Self::register`] for a test outside the native module.
-    #[cfg(test)]
-    pub(crate) fn register_for_test(self: &Arc<Self>, addr: SocketAddr) -> Option<NativeWaiter> {
-        // Called by path, so `native::pins` (which counts `.register(` calls
-        // in the module's production code) does not count this test helper.
-        NativeWaiters::register(self, addr)
     }
 
     /// The number of addresses with a waiter.
@@ -144,21 +148,16 @@ impl NativeWaiters {
     }
 }
 
-impl NativeWaiter {
-    /// The next attempt handed to this waiter. Cancel-safe.
-    pub(crate) async fn next(&mut self) -> Option<QuicIncoming> {
-        self.attempts.recv().await
-    }
-
-    /// Mark the waiter busy until the returned guard drops, so the router
-    /// ignores further attempts while one handshake runs.
-    pub(crate) fn in_flight(&self) -> InFlight {
-        self.busy.store(true, Ordering::Release);
-        InFlight(self.busy.clone())
+impl<A: NativeAttempt> NativeWaiter<A> {
+    /// The next attempt handed to this waiter, with the guard that keeps the
+    /// waiter busy until the caller has finished with it. Cancel-safe.
+    pub(crate) async fn next(&mut self) -> Option<(A, InFlight)> {
+        let attempt = self.attempts.recv().await?;
+        Some((attempt, InFlight(self.busy.clone())))
     }
 }
 
-impl Drop for NativeWaiter {
+impl<A: NativeAttempt> Drop for NativeWaiter<A> {
     fn drop(&mut self) {
         self.waiters
             .by_addr
@@ -168,6 +167,7 @@ impl Drop for NativeWaiter {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
     use std::time::Duration;
 
     use super::*;
@@ -176,6 +176,75 @@ mod tests {
 
     const SEED: u64 = 0x0059_40A4_B001;
     const LIMIT: Duration = Duration::from_secs(30);
+
+    /// A stand-in attempt that records what the router did with it.
+    struct Fake {
+        source: SocketAddr,
+        validated: bool,
+        log: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl NativeAttempt for Fake {
+        fn source(&self) -> SocketAddr {
+            self.source
+        }
+        fn address_validated(&self) -> bool {
+            self.validated
+        }
+        fn ignore(self) {
+            self.log.lock().unwrap().push("ignored");
+        }
+        fn retry(self) {
+            self.log.lock().unwrap().push("retried");
+        }
+    }
+
+    fn addr() -> SocketAddr {
+        "10.0.0.1:5000".parse().unwrap()
+    }
+
+    fn fake(validated: bool, log: &Arc<Mutex<Vec<&'static str>>>) -> Fake {
+        Fake {
+            source: addr(),
+            validated,
+            log: log.clone(),
+        }
+    }
+
+    /// Every branch of the routing decision: no waiter, a Retry, a hand-off,
+    /// busy until the waiter's guard drops, a full channel and a closed one
+    /// (both ignored), each attempt ignored or retried exactly once.
+    #[test]
+    fn the_router_takes_each_branch() {
+        bounded(|| async {
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let waiters = Arc::new(NativeWaiters::<Fake>::default());
+            assert_eq!(waiters.route(fake(true, &log)), NativeRoute::NoWaiter);
+            let mut waiter = waiters.register_for_test(addr()).expect("waiter");
+            assert_eq!(waiters.route(fake(false, &log)), NativeRoute::Retried);
+            assert_eq!(waiters.route(fake(true, &log)), NativeRoute::Handed);
+            // Busy from the hand-off, before the waiter takes the attempt.
+            assert_eq!(waiters.route(fake(true, &log)), NativeRoute::Busy);
+            let (_attempt, in_flight) = waiter.next().await.expect("handed");
+            assert_eq!(waiters.route(fake(true, &log)), NativeRoute::Busy);
+            drop(in_flight);
+            assert_eq!(waiters.route(fake(true, &log)), NativeRoute::Handed);
+            // The guard of the one queued is not taken yet; clear busy as a
+            // finished attempt would, so the next meets a full channel.
+            waiter.busy.store(false, Ordering::Release);
+            assert_eq!(waiters.route(fake(true, &log)), NativeRoute::Busy, "full");
+            waiter.busy.store(false, Ordering::Release);
+            waiter.attempts.close();
+            while waiter.attempts.try_recv().is_ok() {}
+            assert_eq!(waiters.route(fake(true, &log)), NativeRoute::Busy, "closed");
+            assert_eq!(
+                *log.lock().unwrap(),
+                [
+                    "ignored", "retried", "ignored", "ignored", "ignored", "ignored"
+                ]
+            );
+        });
+    }
 
     /// A native dial reaches the waiter for its address only after a Retry,
     /// and the handshake completes on the attempt the waiter was handed.
@@ -190,7 +259,9 @@ mod tests {
                 .b
                 .allow_native_peer(pair.a_addr, pair.a_keys.public())
                 .expect("room");
-            let mut waiter = waiters.register(pair.a_addr).expect("first waiter");
+            let mut waiter = waiters
+                .register_for_test(pair.a_addr)
+                .expect("first waiter");
             let (a, b) = (pair.a.clone(), pair.b.clone());
             let (b_addr, b_key) = (pair.b_addr, pair.b_keys.public().clone());
             let router = waiters.clone();
@@ -200,8 +271,7 @@ mod tests {
                     while routes.last() != Some(&NativeRoute::Handed) {
                         routes.push(router.route(b.accept().await.expect("an attempt")));
                     }
-                    let attempt = waiter.next().await.expect("handed");
-                    let _in_flight = waiter.in_flight();
+                    let (attempt, _in_flight) = waiter.next().await.expect("handed");
                     (routes, attempt.establish().await)
                 })
             })
@@ -212,60 +282,21 @@ mod tests {
         });
     }
 
-    /// A native attempt from an address with no waiter is ignored, and an
-    /// attempt while the waiter is busy is ignored too.
-    #[test]
-    fn a_native_attempt_with_no_free_waiter_is_ignored() {
-        bounded(|| async {
-            for registered in [false, true] {
-                let _seed = GlobalRng::seed_guard(SEED);
-                let net = crate::transport::test_net::subnet();
-                let pair = pair("native-waiter-ignored", net.addr(1), net.addr(2), None).await;
-                let waiters = Arc::new(NativeWaiters::default());
-                let _permit = pair
-                    .b
-                    .allow_native_peer(pair.a_addr, pair.a_keys.public())
-                    .expect("room");
-                let waiter = registered.then(|| waiters.register(pair.a_addr).expect("waiter"));
-                let _busy = waiter.as_ref().map(NativeWaiter::in_flight);
-                let (a, b) = (pair.a.clone(), pair.b.clone());
-                let (b_addr, b_key) = (pair.b_addr, pair.b_keys.public().clone());
-                let router = waiters.clone();
-                let route = drive(&pair.time, LIMIT, async move {
-                    let dial = tokio::spawn(async move { a.dial_native(b_addr, &b_key).await });
-                    let route = router.route(b.accept().await.expect("an attempt"));
-                    dial.abort();
-                    route
-                })
-                .await;
-                let expected = if registered {
-                    NativeRoute::Busy
-                } else {
-                    NativeRoute::NoWaiter
-                };
-                assert_eq!(route, expected);
-            }
-        });
-    }
-
     /// One waiter per address; dropping it frees the address, and a stale
     /// waiter's drop does not remove a newer one.
     #[test]
     fn one_waiter_per_address_and_drop_removes_only_its_own() {
-        let waiters = Arc::new(NativeWaiters::default());
-        let addr: SocketAddr = "10.0.0.1:5000".parse().unwrap();
-        let first = waiters.register(addr).expect("first");
-        assert!(waiters.register(addr).is_none(), "one at a time");
-        // The IPv4-mapped form is the same address.
+        let waiters = Arc::new(NativeWaiters::<Fake>::default());
+        let first = waiters.register_for_test(addr()).expect("first");
+        assert!(waiters.register_for_test(addr()).is_none(), "one at a time");
         let mapped: SocketAddr = "[::ffff:10.0.0.1]:5000".parse().unwrap();
-        assert!(waiters.register(mapped).is_none(), "normalized");
+        assert!(waiters.register_for_test(mapped).is_none(), "normalized");
         drop(first);
         assert_eq!(waiters.len(), 0);
-        let second = waiters.register(addr).expect("free again");
-        // A slot for another id is left alone by a drop of a stale waiter.
+        let second = waiters.register_for_test(addr()).expect("free again");
         let stale = NativeWaiter {
             waiters: waiters.clone(),
-            addr,
+            addr: addr(),
             id: second.id + 1,
             attempts: mpsc::channel(1).1,
             busy: Arc::default(),

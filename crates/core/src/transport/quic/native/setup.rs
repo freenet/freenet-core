@@ -16,16 +16,21 @@
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+use tokio::sync::mpsc;
 
 use super::exchange::{HelloFailure, PeerHello, exchange};
 use super::hello::Hello;
-use super::punch::{CLIENT_BYTES_PER_DIAL, PUNCH_BYTES_PER_DIAL, PunchBudget, punch};
-use super::waiters::NativeWaiters;
+use super::punch::{CLIENT_BYTES_PER_DIAL, PUNCH_BYTES_PER_DIAL, PunchBudget, PunchRefusal, punch};
+use super::waiters::{NativeAttempt, NativeWaiter, NativeWaiters, Slot};
 use crate::simulation::TimeSource;
 use crate::transport::connection_handler::native_version;
 use crate::transport::crypto::TransportPublicKey;
 use crate::transport::normalize_mapped_addr;
+use crate::transport::quic::identity::PeerKey;
 use crate::transport::quic::{QuicAllowError, QuicConnectError, QuicConnection, QuicEndpoint};
 
 /// The setup window: punching, the handshake and the Hello exchange.
@@ -64,8 +69,8 @@ impl std::fmt::Debug for NativeConnection {
 pub(crate) enum NativeSetupError {
     #[error("less than {MIN_WINDOW_LEFT:?} of the setup window left")]
     TooLate,
-    #[error("the punch budget for this destination is spent")]
-    OverBudget,
+    #[error("the punch budget is spent ({0:?})")]
+    OverBudget(PunchRefusal),
     #[error("a native setup to this address is already waiting")]
     AlreadyWaiting,
     #[error(transparent)]
@@ -100,6 +105,46 @@ fn own_hello(peer: SocketAddr, caps: u32) -> Hello {
     }
 }
 
+impl<A: NativeAttempt> NativeWaiters<A> {
+    /// Wait for native attempts from `addr`. `None` when a waiter for it
+    /// already exists: one native connection is set up per address at a
+    /// time. Private to this module, so `accept_native` is the only way an
+    /// address gets a waiter, and so the only way a native attempt reaches
+    /// anything.
+    fn register(self: &Arc<Self>, addr: SocketAddr) -> Option<NativeWaiter<A>> {
+        let addr = normalize_mapped_addr(addr);
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = mpsc::channel(1);
+        let busy = Arc::new(AtomicBool::new(false));
+        match self.by_addr.entry(addr) {
+            dashmap::mapref::entry::Entry::Occupied(_) => None,
+            dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                vacant.insert(Slot {
+                    id,
+                    attempts: tx,
+                    busy: busy.clone(),
+                });
+                Some(NativeWaiter {
+                    waiters: self.clone(),
+                    addr,
+                    id,
+                    attempts: rx,
+                    busy,
+                })
+            }
+        }
+    }
+
+    /// [`Self::register`] for a test elsewhere.
+    #[cfg(test)]
+    pub(in crate::transport::quic) fn register_for_test(
+        self: &Arc<Self>,
+        addr: SocketAddr,
+    ) -> Option<NativeWaiter<A>> {
+        self.register(addr)
+    }
+}
+
 /// Punch `to` until `end`, then wait for ever; raced with the setup, which
 /// drops it.
 async fn punch_until<T: TimeSource>(
@@ -121,7 +166,11 @@ async fn punch_until<T: TimeSource>(
 /// Set up a native connection to `peer` as the client: punch, dial once with
 /// the native ALPN, and exchange Hellos, all before the window ends
 /// (`deadline`, on `clock`, cut to [`NATIVE_WINDOW`] from now).
-pub(crate) async fn connect_native<T: TimeSource>(
+///
+/// The budget is charged before anything is sent, after the checks that can
+/// fail without sending (the window, the peer's key). A dial that then fails
+/// still spends its charge, since its punches may already have gone.
+pub(in crate::transport::quic::native) async fn connect_native<T: TimeSource>(
     endpoint: &QuicEndpoint,
     budget: &PunchBudget,
     peer: NativePeer<'_>,
@@ -130,9 +179,10 @@ pub(crate) async fn connect_native<T: TimeSource>(
     deadline: Duration,
 ) -> Result<NativeConnection, NativeSetupError> {
     let end = window_end(clock, deadline)?;
-    if !budget.charge(peer.addr, CLIENT_BYTES_PER_DIAL, clock.now()) {
-        return Err(NativeSetupError::OverBudget);
-    }
+    PeerKey::of(peer.key).map_err(QuicConnectError::from)?;
+    budget
+        .charge(peer.addr, CLIENT_BYTES_PER_DIAL, clock.now())
+        .map_err(NativeSetupError::OverBudget)?;
     let left = end.saturating_sub(clock.now());
     let connection = tokio::select! {
         dialled = endpoint.dial_native(peer.addr, peer.key) => dialled?,
@@ -144,10 +194,12 @@ pub(crate) async fn connect_native<T: TimeSource>(
 
 /// Set up a native connection from `peer` as the server: allow the peer as
 /// native, punch, and take its attempts one at a time until one completes
-/// its handshake, then exchange Hellos, all before the window ends.
-pub(crate) async fn accept_native<T: TimeSource>(
+/// its handshake, then exchange Hellos, all before the window ends. The
+/// budget is charged after the waiter and the allow, which can fail without
+/// sending, and before the first punch.
+pub(in crate::transport::quic::native) async fn accept_native<T: TimeSource>(
     endpoint: &QuicEndpoint,
-    waiters: &std::sync::Arc<NativeWaiters>,
+    waiters: &Arc<NativeWaiters>,
     budget: &PunchBudget,
     peer: NativePeer<'_>,
     caps: u32,
@@ -158,18 +210,17 @@ pub(crate) async fn accept_native<T: TimeSource>(
     let mut waiter = waiters
         .register(peer.addr)
         .ok_or(NativeSetupError::AlreadyWaiting)?;
-    if !budget.charge(peer.addr, PUNCH_BYTES_PER_DIAL, clock.now()) {
-        return Err(NativeSetupError::OverBudget);
-    }
     // Held until the handshake ends; the connection then keeps its own.
     let _permit = endpoint.allow_native_peer(peer.addr, peer.key)?;
+    budget
+        .charge(peer.addr, PUNCH_BYTES_PER_DIAL, clock.now())
+        .map_err(NativeSetupError::OverBudget)?;
     let accept = async {
         loop {
-            let Some(attempt) = waiter.next().await else {
+            let Some((attempt, _in_flight)) = waiter.next().await else {
                 // The router holds the sender while the waiter lives.
                 return Err(NativeSetupError::TimedOut);
             };
-            let _in_flight = waiter.in_flight();
             match attempt.establish().await {
                 Ok(connection) => return Ok(connection),
                 Err(error) => {
@@ -207,12 +258,10 @@ async fn finish<T: TimeSource>(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use super::*;
     use crate::config::GlobalRng;
     use crate::transport::demux::{PUNCH_FIRST_BYTE, PUNCH_LEN};
-    use crate::transport::quic::native::punch::{PUNCH_BUDGET_BYTES, PUNCHES_PER_DIAL};
+    use crate::transport::quic::native::punch::PUNCH_BUDGET_BYTES;
     use crate::transport::quic::tests::{Pair, bounded, drive, pair};
 
     const SEED: u64 = 0x0059_40A4_B002;
@@ -320,7 +369,7 @@ mod tests {
             let pair = pair("native-setup-late", net.addr(1), net.addr(2), None).await;
             let waiters = Arc::new(NativeWaiters::default());
             let budget = PunchBudget::default();
-            let deadline = pair.time.now() + MIN_WINDOW_LEFT - Duration::from_millis(1);
+            let deadline = pair.time.now() + Duration::from_millis(3999);
             let to_b = NativePeer {
                 addr: pair.b_addr,
                 key: pair.b_keys.public(),
@@ -351,8 +400,8 @@ mod tests {
             let waiters = Arc::new(NativeWaiters::default());
             let budget = PunchBudget::default();
             let now = pair.time.now();
-            assert!(budget.charge(pair.b_addr, PUNCH_BUDGET_BYTES, now));
-            assert!(budget.charge(pair.a_addr, PUNCH_BUDGET_BYTES, now));
+            assert_eq!(budget.charge(pair.b_addr, PUNCH_BUDGET_BYTES, now), Ok(()));
+            assert_eq!(budget.charge(pair.a_addr, PUNCH_BUDGET_BYTES, now), Ok(()));
             let deadline = now + NATIVE_WINDOW;
             let to_b = NativePeer {
                 addr: pair.b_addr,
@@ -368,11 +417,17 @@ mod tests {
             let server =
                 accept_native(&pair.b, &waiters, &budget, to_a, 0, &pair.time, deadline).await;
             assert!(
-                matches!(client, Err(NativeSetupError::OverBudget)),
+                matches!(
+                    client,
+                    Err(NativeSetupError::OverBudget(PunchRefusal::Destination))
+                ),
                 "{client:?}"
             );
             assert!(
-                matches!(server, Err(NativeSetupError::OverBudget)),
+                matches!(
+                    server,
+                    Err(NativeSetupError::OverBudget(PunchRefusal::Destination))
+                ),
                 "{server:?}"
             );
             assert!(pair.sent().is_empty());
@@ -387,7 +442,8 @@ mod tests {
     }
 
     /// A side whose peer never answers gives up at the end of its window,
-    /// having punched at most PUNCHES_PER_DIAL times, and the server leaves
+    /// having punched exactly 32 times and sent no more than it was charged,
+    /// and the server leaves
     /// no waiter and no allowed address behind.
     #[test]
     fn a_silent_peer_times_out_at_the_window_end() {
@@ -421,25 +477,50 @@ mod tests {
                         };
                         accept_native(&b, &w, &budget, to_a, 0, &clock, deadline).await
                     };
+                    let ended = clock.now();
+                    // Let the dropped dial's close go out before counting.
+                    clock.sleep(Duration::from_secs(2)).await;
                     router.abort();
-                    (result, clock.now())
+                    (result, ended)
                 })
                 .await;
                 assert!(
                     matches!(result, Err(NativeSetupError::TimedOut)),
                     "client {client_side}: {result:?}"
                 );
-                assert_eq!(ended - started, NATIVE_WINDOW, "client {client_side}");
+                assert_eq!(
+                    ended - started,
+                    Duration::from_secs(8),
+                    "client {client_side}"
+                );
                 let (from, to) = if client_side {
                     (a_addr, b_addr)
                 } else {
                     (b_addr, a_addr)
                 };
-                let sent = punches(&pair, from, to);
+                assert_eq!(punches(&pair, from, to), 32, "client {client_side}");
+                // Everything this side sent toward the peer, punches, Initials
+                // and the close included, is within what it was charged.
+                let bytes: u64 = pair
+                    .sent()
+                    .iter()
+                    .filter(|sent| sent.from == from && sent.to == to)
+                    .map(|sent| sent.bytes.len() as u64)
+                    .sum();
+                let charged = if client_side {
+                    CLIENT_BYTES_PER_DIAL
+                } else {
+                    PUNCH_BYTES_PER_DIAL
+                };
                 assert!(
-                    (1..=PUNCHES_PER_DIAL as usize).contains(&sent),
-                    "client {client_side}: {sent} punches"
+                    bytes <= charged,
+                    "client {client_side}: sent {bytes} B, charged {charged} B"
                 );
+                if client_side {
+                    // The Initials are really there, so the bound is not met
+                    // by a dial that sent nothing.
+                    assert!(bytes > PUNCH_BYTES_PER_DIAL + 8 * 1200, "{bytes} B");
+                }
                 assert_eq!(waiters.len(), 0);
                 drop(
                     pair.b
@@ -447,6 +528,59 @@ mod tests {
                         .expect("not held"),
                 );
             }
+        });
+    }
+
+    /// The window is 8 s, cut to the deadline, and at least 4 s, as literals.
+    #[test]
+    fn the_window_is_eight_seconds_and_at_least_four() {
+        let clock = crate::simulation::VirtualTime::new();
+        let now = clock.now();
+        let far = now + Duration::from_secs(60);
+        assert_eq!(
+            window_end(&clock, far).unwrap() - now,
+            Duration::from_secs(8)
+        );
+        let four = now + Duration::from_secs(4);
+        assert_eq!(window_end(&clock, four).unwrap(), four);
+        assert!(matches!(
+            window_end(&clock, four - Duration::from_millis(1)),
+            Err(NativeSetupError::TooLate)
+        ));
+    }
+
+    /// A server setup whose allow fails takes nothing from the budget.
+    #[test]
+    fn a_failed_allow_takes_nothing_from_the_budget() {
+        bounded(|| async {
+            let net = crate::transport::test_net::subnet();
+            let pair = pair("native-setup-allow", net.addr(1), net.addr(2), None).await;
+            let waiters = Arc::new(NativeWaiters::default());
+            let budget = PunchBudget::default();
+            // The address is held for an upgrade, so a native allow conflicts.
+            let _upgrade = pair
+                .b
+                .allow_peer(pair.a_addr, pair.a_keys.public())
+                .unwrap();
+            let to_a = NativePeer {
+                addr: pair.a_addr,
+                key: pair.a_keys.public(),
+                is_gateway: false,
+            };
+            let deadline = pair.time.now() + NATIVE_WINDOW;
+            let result =
+                accept_native(&pair.b, &waiters, &budget, to_a, 0, &pair.time, deadline).await;
+            assert!(
+                matches!(
+                    result,
+                    Err(NativeSetupError::Allow(QuicAllowError::KeyConflict))
+                ),
+                "{result:?}"
+            );
+            assert_eq!(waiters.len(), 0);
+            assert!(pair.sent().is_empty());
+            let now = pair.time.now();
+            assert_eq!(budget.charge(pair.a_addr, PUNCH_BUDGET_BYTES, now), Ok(()));
         });
     }
 

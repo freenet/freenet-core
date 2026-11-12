@@ -1989,10 +1989,13 @@ either side, and a man in the middle with its own key on either leg.
 
 #### QUIC-native setup (`quic/native/`, #5940 QUIC-native connect, A4)
 
-Built and tested, and unreachable: nothing outside `quic/native` names
-`connect_native` or `accept_native` in production code, and the connect op
-reaches them only once `operations::connect::native::NATIVE_DIAL_READY` is
-true (pinned false). `native::pins` scrapes the crate to hold both.
+Built and tested, and unreachable by construction: `setup::connect_native`,
+`setup::accept_native` and the endpoint's native side (`native/endpoint.rs`:
+`allow_native_peer`, `dial_native`, `send_punch`) are
+`pub(in crate::transport::quic::native)`, and registering a native waiter is
+private to `setup`. Nothing outside `quic/native` can call them; A5 widens
+them in a visible diff. The connect op also gates on
+`operations::connect::native::NATIVE_DIAL_READY` (pinned false).
 
 ```
 ALPN per attempt: an address allowed with allow_native_peer is accepted with
@@ -2000,11 +2003,11 @@ ALPN per attempt: an address allowed with allow_native_peer is accepted with
   is allowed for one kind at a time (KeyConflict for the other). dial_native
   offers /2 only, with a 100 ms initial RTT (NATIVE_INITIAL_RTT).
 Router: an attempt from a native-allowed address goes only to
-  native::waiters (QuicUpgrades::dispatch), never to an upgrade session.
-  NativeWaiters::register is visible to the native module only, and its one
-  production call is in accept_native. A waiter takes one attempt at a time;
-  others are ignored. An attempt without a Retry token gets a Retry first
-  (one more round trip in the window).
+  native::waiters (QuicUpgrades::dispatch), never to an upgrade session. The
+  only production registration is in accept_native. Handing an attempt over
+  marks the waiter busy until its InFlight guard drops; others are ignored.
+  An attempt without a Retry token gets a Retry first (one more round trip
+  in the window).
 Hello (native/hello.rs, frozen layout) is exchanged on one uni stream each
   way (native/exchange.rs). A malformed one closes with HELLO_REFUSED; a
   version this node cannot talk to closes with VERSION_INCOMPATIBLE and this
@@ -2012,12 +2015,22 @@ Hello (native/hello.rs, frozen layout) is exchanged on one uni stream each
   are the UDP handshake's (connection_handler::native_version).
 Punches (native/punch.rs): byte 0x03 + 8 GlobalRng bytes, sent on the
   endpoint's socket with try_send (charged unpaced), at once and every
-  250 ms, at most 32 per setup. PunchBudget: 64 KiB per destination IP per
-  minute (token bucket, 4096 IPs, LRU), charged at the setup's worst case
-  before anything is sent.
+  250 ms, at most 32 per setup (288 B). A client also sends at most 12
+  padded Initials (quinn sends two probes per timeout: 9 in 8 s, a close,
+  and a Retry's restart), so a client setup is charged 14688 B and a server
+  setup 288 B, before anything is sent. PunchBudget: 64 KiB per destination
+  per minute (an IPv4 address, or an IPv6 /64), and 1 MiB per minute for the
+  node (provisional); 4096 destinations remembered, and a new one replaces
+  the least recently charged only once that one has refilled (else
+  refused, PunchRefusal::Table), so forgetting never gives bytes back early.
+  The silent-peer test checks a client sends no more than it was charged.
 Setup (native/setup.rs): one window, 8 s cut to the caller's deadline, not
   started with less than 4 s left; punching, the handshake and the Hello
-  exchange all inside it. Roles by key order are the caller's decision.
+  exchange all inside it. The budget is charged after the checks that fail
+  without sending (window, key, waiter, allow). Roles by key order are the
+  caller's decision.
+Not decided here (A5): fairness of a destination's budget between the
+  requesters that steer setups at it.
 ```
 
 #### QUIC framing and path (`quic/framing.rs`, `quic/path.rs`, #5940 step e3)

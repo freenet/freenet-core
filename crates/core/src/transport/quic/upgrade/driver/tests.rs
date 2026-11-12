@@ -1955,9 +1955,13 @@ fn native_attempts_reach_only_native_waiters() {
         let h = Harness::server("driver-native-dispatch").await;
         let rig = RetryRig::of(&h);
         let (_session, mut inbox) = h.session();
-        let _permit = rig.ours.allow_native_peer(h.remote, &h.peer).expect("room");
+        let _permit = rig
+            .ours
+            .allow_native_peer_for_test(h.remote, &h.peer)
+            .expect("room");
         let (theirs, our_addr, our_key) = (rig.theirs.clone(), rig.our_addr, rig.our_key.clone());
-        let dial = tokio::spawn(async move { theirs.dial_native(our_addr, &our_key).await });
+        let dial =
+            tokio::spawn(async move { theirs.dial_native_for_test(our_addr, &our_key).await });
 
         let attempt = rig.next_attempt().await;
         assert!(attempt.is_native());
@@ -1976,7 +1980,7 @@ fn native_attempts_reach_only_native_waiters() {
             assert!(attempt.is_native());
             h.hub.dispatch(attempt);
         }
-        let handed = drive(&h.pair.time, Duration::from_secs(1), async move {
+        let (handed, _in_flight) = drive(&h.pair.time, Duration::from_secs(1), async move {
             waiter.next().await.expect("handed")
         })
         .await;

@@ -382,31 +382,39 @@ mod tests {
         });
     }
 
-    /// A Hello cut short by the end of its stream is refused.
+    /// A Hello cut short by the end of its stream is refused: before the
+    /// six-byte prefix (empty, or 3 bytes) as too short, after it as a length
+    /// mismatch.
     #[test]
     fn a_hello_ending_early_is_refused() {
         bounded(|| async {
-            let net = crate::transport::test_net::subnet();
-            let pair = pair("native-hello-short", net.addr(1), net.addr(2), None).await;
-            let (a, b, _permit) = connected(&pair).await;
-            let clock = pair.time.clone();
-            let own = hello(native_version::OWN, pair.b_addr);
-            let bytes = hello(native_version::OWN, pair.a_addr).encode();
-            let ra = drive(&pair.time, LIMIT * 2, async move {
-                let raw = async {
-                    let mut stream = b.inner().open_uni().await.expect("open");
-                    stream
-                        .write_all(&bytes[..bytes.len() - 1])
-                        .await
-                        .expect("write");
-                    stream.finish().expect("finish");
-                };
-                let (ra, ()) = tokio::join!(exchange(&a, &own, false, &clock, LIMIT), raw);
-                drop(b);
-                ra
-            })
-            .await;
-            assert_eq!(ra, Err(HelloFailure::Refused(HelloError::LengthMismatch)));
+            let full = hello(native_version::OWN, "198.51.100.1:1".parse().unwrap())
+                .encode()
+                .len();
+            for (keep, expected) in [
+                (0, HelloError::TooShort),
+                (3, HelloError::TooShort),
+                (full - 1, HelloError::LengthMismatch),
+            ] {
+                let net = crate::transport::test_net::subnet();
+                let pair = pair("native-hello-short", net.addr(1), net.addr(2), None).await;
+                let (a, b, _permit) = connected(&pair).await;
+                let clock = pair.time.clone();
+                let own = hello(native_version::OWN, pair.b_addr);
+                let bytes = hello(native_version::OWN, pair.a_addr).encode();
+                let ra = drive(&pair.time, LIMIT * 2, async move {
+                    let raw = async {
+                        let mut stream = b.inner().open_uni().await.expect("open");
+                        stream.write_all(&bytes[..keep]).await.expect("write");
+                        stream.finish().expect("finish");
+                    };
+                    let (ra, ()) = tokio::join!(exchange(&a, &own, false, &clock, LIMIT), raw);
+                    drop(b);
+                    ra
+                })
+                .await;
+                assert_eq!(ra, Err(HelloFailure::Refused(expected)), "{keep} bytes");
+            }
         });
     }
 
