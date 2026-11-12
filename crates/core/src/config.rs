@@ -364,7 +364,7 @@ impl Default for ConfigArgs {
                 congestion_control: None,  // Default: fixedrate (set in NetworkApiConfig)
                 bbr_startup_rate: None,    // Uses default from BBR config
                 transport_quic: None,      // Default: shadow on Linux, macOS and Windows
-                quic_max_paths: None,      // Default: max-number-of-connections
+                quic_max_paths: None,      // Default: the node's connection limit
                 quic_data_percent: None,   // Default: this release's share of pairs
                 quic_ignore_crash_breaker: None,
             },
@@ -2604,8 +2604,9 @@ pub struct NetworkArgs {
     /// The most QUIC paths this node holds at once, counting paths being
     /// offered or dialed (#5940).
     ///
-    /// Default: `max-number-of-connections`; a larger value is lowered to it,
-    /// and 0 turns QUIC upgrades off. A value that is not a whole number is
+    /// Default: the node's connection limit (`max-number-of-connections`,
+    /// lowered for QUIC memory while the node may carry data); a larger value
+    /// is lowered to it, and 0 turns QUIC upgrades off. A value that is not a whole number is
     /// ignored with a warning in the log.
     #[arg(
         long = "quic-max-paths",
@@ -3124,7 +3125,7 @@ impl NetworkApiConfig {
     /// carry data), which is also the value when the key is unset or cannot be
     /// parsed ([`Self::quic_max_paths_setting`]).
     ///
-    /// The cap is `max_connections`: a path needs a UDP session, and the
+    /// The cap is the connection limit: a path needs a UDP session, and the
     /// node's QUIC memory is bounded per path (the fixed charge,
     /// `quic::config::QUIC_CONNECTION_CHARGE_BYTES`, plus, for a data path, the
     /// floor grant, `quic::budget::floor_grant`) and by the buffer budget its

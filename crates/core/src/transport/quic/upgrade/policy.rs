@@ -320,7 +320,7 @@ fn set_to_off(config: &NetworkApiConfig) -> bool {
 /// each says so in its own line), the share of
 /// pairs `prefer` negotiates data with (INFO), and, with QUIC on, a
 /// `quic-data-percent` (WARN) or `quic-max-paths` (WARN) that cannot be parsed, or
-/// a `quic-max-paths` lowered to `max-number-of-connections` (INFO). In a build
+/// a `quic-max-paths` lowered to the node's connection limit (INFO). In a build
 /// that aborts on panic QUIC stays off whatever the
 /// configuration (`QuicEndpoint::bind` refuses), and after the mode line only
 /// that is reported (WARN).
@@ -540,9 +540,9 @@ mod tests {
     }
 
     /// The policy takes its mode and limit from the config: the limit is
-    /// `quic-max-paths` lowered to
-    /// `max-number-of-connections`, and an unparsable value means the
-    /// default.
+    /// `quic-max-paths` lowered to the node's connection limit
+    /// (`max-number-of-connections` here, as mode `off` carries no data), and
+    /// an unparsable value means the default.
     #[test]
     fn the_policy_reads_mode_and_limit_from_the_config() {
         let up = || QuicAvailabilityWatch::for_test(QuicAvailability::Up).1;
@@ -577,7 +577,7 @@ mod tests {
         assert_eq!(
             build("shadow", Some(&above)).permits().limit(),
             max_connections,
-            "lowered to max-number-of-connections"
+            "lowered to the connection limit (max-number-of-connections, as shadow carries no data)"
         );
     }
 
