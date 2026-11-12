@@ -958,11 +958,14 @@ fn permits_held_with_nothing_acknowledged_close_the_path() {
                     .await
                     .unwrap();
             }
-            // The watch's window runs from its first sample that saw the
-            // streams sent (one tick in) to a sample at least the window later.
+            // The dark rule closes once a send made a window into the spell
+            // goes unanswered for its grace: at the latest
+            // `dark_close_bound` after the silence began, 9 s of which have
+            // passed.
             rig.path
                 .settle(
-                    Duration::from_secs(3) + 2 * crate::transport::quic::recycle::ACK_WATCH_TICK,
+                    crate::transport::quic::recycle::dark_close_bound(Duration::from_millis(50))
+                        - Duration::from_secs(9),
                 )
                 .await;
             drop(silenced);

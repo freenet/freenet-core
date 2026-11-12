@@ -21537,7 +21537,7 @@ fn test_quic_data_path_cut_mid_transfer_falls_back_to_udp() {
         // what bounds the data lost to the dark path is how soon the end falls
         // back after the last data the path delivered to it: at most the dark
         // rule's bound at this round trip (`recycle::dark_close_bound`, about
-        // 28 s: the first probe after the window must go unanswered) plus the
+        // 32 s: the first probe after the window must go unanswered) plus the
         // time the close takes to reach the machine.
         let last_on_path = of_node("received a short on the path")
             .iter()
@@ -21548,7 +21548,7 @@ fn test_quic_data_path_cut_mid_transfer_falls_back_to_udp() {
         let fell_back_at = of_node("Fallback(")[0].at;
         let dark_for = fell_back_at.saturating_sub(last_on_path);
         assert!(
-            dark_for <= std::time::Duration::from_secs(30),
+            dark_for <= std::time::Duration::from_secs(35),
             "{address} fell back {dark_for:?} after the path last delivered to it: {}",
             run.dump()
         );

@@ -237,16 +237,21 @@ pub(crate) const DARK_GRACE_MAX: Duration = Duration::from_secs(10);
 
 /// The latest the dark-path rule closes a path that stays dark, after the
 /// outage begins, at round trip `rtt`. The spell's start is seen within a
-/// tick; quinn's probes back off by doubling, so the first one sent a window
-/// after the start goes out by twice that plus one probe timeout (at most
-/// 3 x `rtt` + 25 ms, quinn's with its initial variance); it is seen within a
-/// tick and closes after its grace. About 28 s at a 50 ms or 300 ms round
-/// trip and 31 s at 800 ms; measured on a real path, 19.9 s, 21.6 s and 29.1 s
-/// (`the_dark_rule_waits_out_the_probe_backoff_of_an_ack_only_peer`).
+/// tick, and a send counts only if the sample before it was already a window
+/// past that start, so a send made after outage + window + two ticks counts.
+/// quinn's probes back off by doubling, so the first one after that time
+/// goes out by twice it plus one probe timeout (at most 3 x `rtt` + 25 ms,
+/// quinn's with its initial variance); it is seen within a tick and closes
+/// after its grace. About 32 s at a 50 ms or 300 ms round trip and 35 s at
+/// 800 ms. Measured on real paths: 19.9 s, 21.6 s and 29.1 s
+/// (`the_dark_rule_waits_out_the_probe_backoff_of_an_ack_only_peer`), and
+/// 31 s on a path whose permits were all held
+/// (`permits_held_with_nothing_acknowledged_close_the_path`).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn dark_close_bound(rtt: Duration) -> Duration {
     let pto = rtt * 3 + Duration::from_millis(25);
     let grace = (rtt * 3).clamp(ACK_WATCH_TICK, DARK_GRACE_MAX);
-    (ACK_WATCH_WINDOW + ACK_WATCH_TICK) * 2 + pto + ACK_WATCH_TICK + grace
+    (ACK_WATCH_WINDOW + ACK_WATCH_TICK * 2) * 2 + pto + ACK_WATCH_TICK + grace
 }
 
 /// How often the acknowledgement watch samples the connection.

@@ -2478,10 +2478,11 @@ Path recycling (quic/recycle.rs, #5940 step M6): besides the send-reset
     darkness for the window alone would close paths after 5-7 s outages
     at high round trips; with the post-window send every outage shorter
     than the window is survived whatever the backoff. Worst close latency
-    for a path that stays dark (recycle::dark_close_bound): about 28 s at
-    50 ms and 300 ms, 31 s at 800 ms; measured 19.9 s, 21.6 s and 29.1 s
+    for a path that stays dark (recycle::dark_close_bound): about 32 s at
+    50 ms and 300 ms, 35 s at 800 ms; measured 19.9 s, 21.6 s and 29.1 s
     (the_dark_rule_waits_out_the_probe_backoff_of_an_ack_only_peer, which
-    also keeps a 6.5 s and a 13 s outage at 800 ms open). Closes only a
+    also keeps a 6.5 s and a 13 s outage at 800 ms open) and 31 s with
+    every permit held (permits_held_with_nothing_acknowledged_close_the_path). Closes only a
     path that carries data (QuicPath::enable_data); every other path only
     counts its dark episodes (quic_dark_episode_*, above). A sample more
     than two ticks after the previous one counts as one tick (the watch's
