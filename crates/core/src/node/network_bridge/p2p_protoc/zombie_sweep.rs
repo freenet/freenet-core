@@ -1868,7 +1868,7 @@ mod tests {
             "the connection entry must hold the stamp"
         );
         assert!(
-            squashed.contains("conn_id,outbound_mix,propagation,link_use)"),
+            squashed.contains("conn_id,outbound_mix,propagation,link_use,native_wire)"),
             "the listener must be given the same stamp"
         );
         assert!(
