@@ -2076,6 +2076,59 @@ mod tests {
         assert_eq!(b.unwrap().len(), total as usize);
     }
 
+    /// A consumer of a QUIC-fed stream does not give up on a gap while the
+    /// node's buffer budget throttles the stream's path: with the throttle
+    /// on through a 20 s gap (four times the 5 s gap) it assembles; with it
+    /// off it times out at the gap.
+    #[tokio::test(start_paused = true)]
+    async fn a_quic_consumer_waits_out_a_gap_while_its_path_is_throttled() {
+        use super::super::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        for throttled in [true, false] {
+            let total = (FRAGMENT_PAYLOAD_SIZE * 2) as u64;
+            let on = Arc::new(AtomicBool::new(throttled));
+            let probe = on.clone();
+            let handle = StreamHandle::new_quic(make_stream_id(), total);
+            handle
+                .quic_source()
+                .expect("QUIC-fed")
+                .set_path(QuicSourcePath {
+                    rtt: Arc::new(PathRtt::new(Duration::from_millis(10))),
+                    idle: Duration::from_secs(30),
+                    throttle: Some(ThrottleProbe(Arc::new(move || {
+                        probe.load(Ordering::Relaxed)
+                    }))),
+                });
+            assert_eq!(handle.fragment_gap_limit(), STREAM_INACTIVITY_TIMEOUT);
+            let consumer = {
+                let handle = handle.clone();
+                tokio::spawn(async move { handle.assemble().await })
+            };
+            handle
+                .push_fragment(1, Bytes::from(vec![1u8; FRAGMENT_PAYLOAD_SIZE]))
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            on.store(false, Ordering::Relaxed);
+            // Pushed only if the consumer is still waiting.
+            if !consumer.is_finished() {
+                handle
+                    .push_fragment(2, Bytes::from(vec![2u8; FRAGMENT_PAYLOAD_SIZE]))
+                    .unwrap();
+            }
+            let result = consumer.await.unwrap();
+            if throttled {
+                assert_eq!(result.expect("assembled").len(), total as usize);
+            } else {
+                assert!(
+                    matches!(result, Err(StreamError::InactivityTimeout)),
+                    "{result:?}"
+                );
+            }
+        }
+    }
+
     /// When the reader of a QUIC-fed stream records why it stopped, every
     /// waiting consumer ends at once with that reason's error: a fork too,
     /// which does not share the handle's cancel. The first reason stays.

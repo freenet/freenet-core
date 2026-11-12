@@ -959,3 +959,31 @@ fn a_later_sender_reaches_its_share_once_the_squeezed_streams_end() {
         );
     }
 }
+
+/// A stream-limit raise needs the budget charged at most three quarters
+/// (`QuicBudget::has_room`): a path growing into the budget takes the room
+/// away once its growth passes three quarters, and it comes back when the
+/// path's window decays.
+#[test]
+fn the_budget_has_room_for_a_stream_raise_up_to_three_quarters() {
+    let total = 4 << 20;
+    let budget = QuicBudget::new(total, FLOOR, counters());
+    let a = conn(&budget, 0);
+    assert!(a.meter.budget_has_room(), "nothing charged");
+    let mut at = 10 * MS;
+    let mut window = FLOOR;
+    let mut was_room = true;
+    for _ in 0..12 {
+        window = deliver_window(&a, window, at).recv_window;
+        let charged = budget.running_total();
+        let room = a.meter.budget_has_room();
+        assert_eq!(
+            room,
+            charged * 4 <= total * 3,
+            "charged {charged} of {total}"
+        );
+        was_room &= room;
+        at += 10 * MS;
+    }
+    assert!(!was_room, "premise: the growth passed three quarters");
+}

@@ -4328,6 +4328,80 @@ fn blocked_streamed_sends(
         .collect()
 }
 
+/// Against a fresh data path, whose peer allows `config::DATA_START_UNI_STREAMS`
+/// streams before any raise, more streamed sends than that plus a one-packet
+/// Short and a control frame: with every slot held, each of the excess waits
+/// in `open_uni` for its open deadline and ends `NotOpened`, never
+/// `MaybeDelivered` (nothing was written), so it can go another way; each is
+/// counted `stream_limit_full`. Once the slots are freed, sends open again.
+#[test]
+fn sends_past_a_fresh_peers_stream_limit_end_not_opened() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths("quic-path-fresh-limit", QuicPathLimits::DEFAULT).await;
+        let start = super::super::config::DATA_START_UNI_STREAMS as usize;
+        let excess = 8usize;
+        let (a, time) = (p.a.clone(), p.time());
+        let (streamed, short, control, after) = p
+            .drive(async move {
+                let mut blocked = blocked_streamed_sends(&a, start);
+                let sends = async {
+                    time.sleep(Duration::from_secs(1)).await;
+                    let streamed = futures::future::join_all((0..excess).map(|_| {
+                        let (a, time) = (a.clone(), time.clone());
+                        async move {
+                            a.send_stream_bounded(
+                                &time,
+                                SendDeadlines::stream(2000),
+                                StreamId::next(),
+                                None,
+                                Bytes::from(payload(2000)),
+                                None,
+                            )
+                            .await
+                        }
+                    }))
+                    .await;
+                    let short = a
+                        .send_short_bounded(&time, SendDeadlines::short(7), b"through")
+                        .await;
+                    let control = a
+                        .send_control_bounded(
+                            &time,
+                            Duration::from_secs(5),
+                            QuicControl::Ready {
+                                attempt: 1,
+                                caps: 0,
+                            },
+                        )
+                        .await;
+                    (streamed, short, control)
+                };
+                let (streamed, short, control) = tokio::select! {
+                    done = blocked.next() => panic!("a blocked send returned: {done:?}"),
+                    sent = sends => sent,
+                };
+                drop(blocked);
+                time.sleep(Duration::from_secs(1)).await;
+                let after = a
+                    .send_short_bounded(&time, SendDeadlines::short(5), b"later")
+                    .await;
+                (streamed, short, control, after)
+            })
+            .await;
+        let not_opened =
+            |sent: &BoundedSend| matches!(sent, BoundedSend::Failed(SendFailure::NotOpened(_)));
+        assert!(streamed.iter().all(not_opened), "{streamed:?}");
+        assert!(not_opened(&short), "{short:?}");
+        assert!(not_opened(&control), "{control:?}");
+        assert_eq!(
+            p.a.stats().send_event_count(QuicSendEvent::StreamLimitFull) as usize,
+            excess + 2
+        );
+        assert!(matches!(after, BoundedSend::Sent), "{after:?}");
+    })
+}
+
 /// The reserve is exactly what the division of the limit says, in the worst
 /// case for quinn's batched credit: with 8 freed slots not yet announced and
 /// every permit held by a send blocked on a source that never delivers, 8
@@ -7219,53 +7293,6 @@ fn an_age_limit_after_the_throttle_lapsed_counts_as_age() {
         assert_eq!(stats.count(QuicInboundOutcome::ThrottledPastAge), 0);
         assert_eq!(stats.shared_count(InboundStreamOutcome::EvictedAge), 1);
         assert_eq!(stats.shared_count(InboundStreamOutcome::EvictedIdle), 0);
-    })
-}
-
-/// A Stream whose consumer is waiting in `assemble()` survives a throttle
-/// longer than the consumer's gap: the consumer waits while the budget
-/// throttles the path, as the reader does, and gets the whole stream once
-/// the rest arrives.
-#[test]
-fn a_consumer_waits_through_a_throttle() {
-    bounded(|| async move {
-        let _seed = GlobalRng::seed_guard(SEED);
-        let windows = Windows {
-            a: Some(test_budget(64 << 20, leaked_counters())),
-            b: Some(test_budget(64 << 20, leaked_counters())),
-        };
-        let mut p = paths_metered("quic-budget-throttle-consumer", windows).await;
-        let meter = p.b.meter().expect("b reads data under a budget").clone();
-        let idle = streaming_handle_idle_timeout();
-        let total = 10_000usize;
-        let body = payload(total);
-        let mut streams = std::mem::replace(&mut p.b_in.streams, tokio::sync::mpsc::channel(1).1);
-        let (raw, time) = (p.a_raw(), p.time());
-        let sent = body.clone();
-        let (assembled, gap) = p
-            .drive(async move {
-                let mut bytes = header(1, 1, StreamId::next().0, total as u64, 0);
-                bytes.extend_from_slice(&sent[..1000]);
-                let mut send = raw.open_uni().await.unwrap();
-                send.write_all(&bytes).await.unwrap();
-                let arrival = streams.recv().await.expect("announced");
-                let gap = arrival.handle.fragment_gap_limit();
-                let consumer = tokio::spawn(async move { arrival.handle.assemble().await });
-                time.sleep(Duration::from_millis(100)).await;
-                let now = time.now_nanos();
-                // Throttled for longer than the consumer's gap, short of the
-                // reader's idle limit doubled.
-                let held = gap * 3;
-                meter.throttle_for_test(now, now + held.as_nanos() as u64);
-                time.sleep(held - Duration::from_millis(500)).await;
-                send.write_all(&sent[1000..]).await.unwrap();
-                send.finish().unwrap();
-                (consumer.await.unwrap(), gap)
-            })
-            .await;
-        assert!(gap * 3 < idle * 2, "premise: {gap:?} against {idle:?}");
-        assert_eq!(assembled.expect("assembled"), body);
-        assert_eq!(p.b.stats().count(QuicInboundOutcome::CompletedStream), 1);
     })
 }
 

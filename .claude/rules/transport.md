@@ -1391,7 +1391,7 @@ a test passes its own; tests read their own, never the global).
   quic_data_send_<short|large_short|stream|pipe>_<sent|maybe_delivered|
   not_opened_udp|failed_udp|dropped>; quic_data_event_<short_overflow_udp|
   data_refused|stalled_closed|udp_send_failed|suspect_entered|suspect_left|
-  pacer_refused|ack_wait_released>; quic_data_stop_<code> (stops a
+  pacer_refused|ack_wait_released|stream_limit_full>; quic_data_stop_<code> (stops a
   peer sent to data sends); quic_inbound_<QuicInboundOutcome> (every receive
   outcome, refusals by frame kind as short_refused_budget and
   stream_refused_budget); quic_enabled_data_paths; quic_live_data_paths (a gauge of
@@ -1579,7 +1579,7 @@ exposes (its module doc lists the few it does not):
   configured bandwidth (recycle::CappedCubic; QuicRateLimit::without_loss_gate,
   test-only, gives plain capped Cubic), 4 uni / 0 bidi streams and a
   16 KiB receive window until a path takes data (a data path raises the
-  streams to 64 and its meter the windows), send window the floor (128 KiB,
+  streams to 16, then toward 64 with load, and its meter the windows), send window the floor (128 KiB,
   64 KiB under 2 GiB), stream receive window 8 MiB, no unreliable datagrams, no
   spin bit, migration off, max_incoming 64, incoming buffers 64 KiB / 1 MiB,
   no NEW_TOKEN tokens (Retry only), rustls ring, TLS 1.3, fixed ALPN, no SNI, no
@@ -1623,11 +1623,16 @@ for jitter, AQM and shallow queues: each was tried and broke one of them.
 QUIC memory: every connection starts with a 16 KiB receive window and 4 uni
 streams (`config::INITIAL_RECEIVE_WINDOW_BYTES`, `INITIAL_UNI_STREAMS`): quinn
 cannot take a grant back. A path that takes data raises
-the streams to 16 at build (`config::DATA_START_UNI_STREAMS`), doubling
-toward 64 once the peer has had every stream in use at once and as many
-again have completed with none failing and no budget throttle
-(`inbound::StreamLimit`, never lowered; a waiting one-packet Short takes
-one off while it waits), and its meter raises the receive window to the
+the streams to 16 at build (`config::DATA_START_UNI_STREAMS`, in tests and
+simulations too), doubling toward 64 once the peer has had every stream busy
+at once (holding a slot with its end not yet read; a stream whole and
+waiting on this node's consumer is not busy) and as many again have
+completed with no gap, with none failing (any end but a completion, a reset
+by the sender or the connection ending, through the reader's
+`inbound::LimitTicket`), the connection not throttled and the buffer budget
+charged at most 3/4 (`budget::QuicBudget::has_room`) at the completion that
+would raise (`inbound::StreamLimit`, never lowered; a waiting one-packet
+Short takes one off while it waits), and its meter raises the receive window to the
 floor (128 KiB, or 64 KiB under 2 GiB, `budget::floor_window_bytes`); the
 send window starts at the floor, and the stream receive window is the
 largest a connection grows to (`budget::MAX_WINDOW_BYTES`, 8 MiB); all are capped at
@@ -2006,8 +2011,21 @@ Sending (QuicPath::send_short_bounded / send_stream_bounded /
     the connection's shared flow control and send window (quinn-proto
     write_limit).
   → The division uses this node's MAX_UNI_STREAMS, not the limit the peer
-    advertised: a change to the limit needs a plan for peers still
-    advertising the old one.
+    advertised (quinn 0.11.12 does not expose it). A data path's peer starts
+    at DATA_START_UNI_STREAMS (16) and raises toward 64 only once its streams
+    are all busy, so the sender keeps its 48 permits: capping it below the
+    peer's limit would stop the raise. Until the peer has raised, the reserve
+    does not hold: a send past the peer's limit, streamed, one-packet or
+    control, waits in open_uni until its open deadline (2 s streamed, 1 s a
+    one-packet Short) and ends NotOpened, which goes on UDP; it never ends
+    MaybeDelivered, since nothing was written. Each is counted
+    quic_data_event_stream_limit_full (pinned by
+    sends_past_a_fresh_peers_stream_limit_end_not_opened). Control frames
+    are sent only during setup, before any data stream.
+  → Once the UDP transport is removed there is no UDP to go to: a send that
+    finds the peer's limit full then waits for a slot, bounded by its send
+    deadline, and fails NotOpened at the deadline. Not built; the
+    stream_limit_full count is what sizes that wait.
   → Each bounded send arms TimeSource::sleep_cancelable, which VirtualTime
     removes (wakeup and waker) when the future is dropped; plain sleep
     keeps its wakeup until the deadline (VirtualSleep has no drop
@@ -2187,7 +2205,8 @@ Unordered reads: every stream is read with read_chunk(_, false) from its
     before the stream is announced, which frees quinn's slot. A charged
     message that waits is bounded by its charge; an uncharged one-packet
     Short lowers the peer's stream limit by one while it waits
-    (inbound::StreamLimit), so at most MAX_UNI_STREAMS wait.
+    (inbound::StreamLimit), so at most the peer's current stream limit
+    wait.
   → NEVER charge or refuse a one-packet Short after its body is read: its
     sender may already read it as Sent, and a refusal then loses it.
   A gap is charged as one received range (~70 B, budget::GAP_BYTES);
@@ -2253,7 +2272,18 @@ Inbound adapter: a Stream's payload goes into an ordinary StreamHandle,
     (budget::ConnMeter::throttled_since), a stream that made progress in
     the idle period before the throttle began has its idle timer paused
     (the slowdown is ours); its age limit still applies and is counted
-    ThrottledPastAge, never EvictedIdle / EvictedAge.
+    ThrottledPastAge, never EvictedIdle / EvictedAge. A stream with no
+    byte received is never paused, and a pause ends with the throttle, so
+    an age limit reached after it lapsed is EvictedAge. A consumer in
+    assemble() waits another gap while the throttle lasts
+    (streaming::ThrottleProbe on QuicSourcePath), so a throttled stream
+    does not fail at its consumer either; the reader still ends it if the
+    peer is idle. The throttle cannot tell why a connection was held back:
+    a peer sending flat out into the window it was given marks its own
+    connection throttled and pauses its other active streams' idle timers,
+    which gives it nothing a byte per idle period would not (each stream
+    still ends at its age limit), and such holds are counted
+    ThrottledPastAge too.
     In simulation each stream's last armed timer stays in VirtualTime's
     pending wakeups until its deadline (VirtualSleep has no drop
     deregistration); the timer is replaced only when it fires.

@@ -137,6 +137,11 @@ pub(crate) const WAITING_SHORT_BYTES: u64 = 1280;
 /// and the ramp gate needs them near zero at 5%).
 pub(crate) const STAGING_CREDIT_MULTIPLE: u64 = 2;
 
+/// The share of the budget, as (numerator, denominator), that may be
+/// charged when a data path's stream limit is raised: a raise is new load
+/// the node takes on, so it waits while the budget is mostly spent.
+pub(crate) const ROOM_FOR_A_STREAM_RAISE: (u64, u64) = (3, 4);
+
 /// A connection is window-limited when its contiguous delivery reached this
 /// share of a window per round trip.
 pub(crate) const LIMITED_PERCENT: u64 = 75;
@@ -391,6 +396,8 @@ pub(crate) struct Evaluation {
     pub(crate) limited: bool,
     /// The budget held the connection below what it needed: a grow it
     /// needed was refused or cut short, or another path's growth shrank it.
+    /// The budget cannot tell why it was needed: a peer sending flat out
+    /// into the window it was given makes its own connection throttled.
     pub(crate) throttled: bool,
     pub(crate) recv_window: u64,
     pub(crate) send_window: u64,
@@ -410,6 +417,15 @@ impl QuicBudget {
 
     pub(crate) fn total(&self) -> u64 {
         self.total
+    }
+
+    /// The budget is charged at most three quarters
+    /// ([`ROOM_FOR_A_STREAM_RAISE`]): a data path's stream limit may be
+    /// raised (`path::inbound::StreamLimit`).
+    pub(crate) fn has_room(&self) -> bool {
+        let charged = self.state.lock().charged;
+        charged.saturating_mul(ROOM_FOR_A_STREAM_RAISE.1)
+            <= self.total.saturating_mul(ROOM_FOR_A_STREAM_RAISE.0)
     }
 
     /// Register a data path's connection at the floor windows, which are set
@@ -950,6 +966,12 @@ impl ConnMeter {
     /// shrunk send window charged while quinn may still hold its data.
     pub(crate) fn send_epoch(&self) -> Option<Arc<()>> {
         self.budget.send_epoch(self.id)
+    }
+
+    /// The node's buffer budget has room for a raise of this path's stream
+    /// limit ([`QuicBudget::has_room`]).
+    pub(crate) fn budget_has_room(&self) -> bool {
+        self.budget.has_room()
     }
 
     #[cfg(test)]

@@ -276,7 +276,15 @@ impl<T: TimeSource> Receiver<T> {
             ticket.vote = Vote::Completed;
             ticket.gapped
         });
-        if self.stream_limit.on_completed(self.throttled(), gapped) {
+        let room = || {
+            self.meter
+                .as_ref()
+                .is_none_or(|meter| meter.budget_has_room())
+        };
+        if self
+            .stream_limit
+            .on_completed(self.throttled(), gapped, room)
+        {
             self.stats.record(QuicInboundOutcome::StreamLimitRaised);
         }
     }
@@ -360,14 +368,17 @@ pub(in crate::transport::quic) const REFUSAL_CLOSE_DELAY: Duration = Duration::f
 ///
 /// **The base.** A data path starts at [`DATA_START_UNI_STREAMS`]. It
 /// doubles, up to [`MAX_UNI_STREAMS`], once the peer has had every stream it
-/// may open busy at once and then as many streams again have completed,
-/// with none failing in between and the budget not throttling the
-/// connection when the last of them completed. A stream is busy while it
-/// holds a QUIC slot with bytes still to come from the peer: from its accept
-/// until every byte it declared has arrived, its end is read, or its reader
-/// ends ([`LimitTicket`]). A stream waiting on this node (a Short or Stream
-/// read whole and waiting for channel room or a consumer) is not busy, so a
-/// slow consumer here does not earn the peer a raise. A stream that ends
+/// may open busy at once and then as many streams again have completed
+/// with no gap on any read (a gapped completion counts for nothing but does
+/// not start the run over), with none failing in between, and, at the
+/// completion that would raise, the budget not throttling the connection
+/// and the node's buffer budget charged at most three quarters
+/// (`budget::QuicBudget::has_room`). A stream is busy while it holds a QUIC
+/// slot for the peer: from its accept until its end is read, it is stopped,
+/// or its reader ends ([`LimitTicket`]). A reader waiting for channel room
+/// or a consumer reads on, and reads the end once the stream is whole, so a
+/// slow consumer here does not keep the stream busy and earns the peer no
+/// raise. A stream that ends
 /// any way but a completion, a reset by its sender or the connection
 /// ending (a refused header, a duplicate id, a budget refusal, a failed
 /// read) starts the run over. A raise is never taken back: quinn cannot
@@ -437,8 +448,11 @@ impl StreamLimit {
 
     /// A stream delivered all it declared; `throttled` if the budget is
     /// holding the connection back now, `gapped` if the stream ever had a
-    /// gap. True if the base was raised.
-    fn on_completed(&self, throttled: bool, gapped: bool) -> bool {
+    /// gap (it then counts for nothing, and does not start the run over);
+    /// `room` says whether the node's buffer budget has room
+    /// (`budget::QuicBudget::has_room`), asked only of the completion that
+    /// would raise. True if the base was raised.
+    fn on_completed(&self, throttled: bool, gapped: bool, room: impl FnOnce() -> bool) -> bool {
         if self.set.is_none() || !self.saturated.load(Ordering::Relaxed) || gapped {
             return false;
         }
@@ -447,7 +461,7 @@ impl StreamLimit {
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1);
         let base = self.base.load(Ordering::Relaxed);
-        if completed < base || throttled || base >= self.max {
+        if completed < base || throttled || base >= self.max || !room() {
             return false;
         }
         self.base
@@ -788,12 +802,8 @@ impl<T: TimeSource> BodyReader<T> {
                     return Err(ReadFailure::TooManyRanges);
                 }
                 let gapped = self.ranges.gaps() > 0;
-                let all_read = self.all_read();
                 if let Some(ticket) = &mut self.ticket {
                     ticket.gapped |= gapped;
-                    if all_read {
-                        ticket.idle();
-                    }
                 }
                 Ok(Some((start, chunk.bytes)))
             }
@@ -3135,7 +3145,7 @@ mod tests {
         tickets.iter_mut().fold(false, |raised, ticket| {
             ticket.vote = Vote::Completed;
             ticket.idle();
-            limit.on_completed(throttled, false) || raised
+            limit.on_completed(throttled, false, || true) || raised
         })
     }
 
@@ -3219,8 +3229,29 @@ mod tests {
     fn a_gapped_completion_does_not_count() {
         let (limit, _) = limit(16, 64);
         assert!(!run(&limit, 15, false));
-        assert!(!limit.on_completed(false, true));
+        assert!(!limit.on_completed(false, true, || true));
         assert!(complete(&limit, 1, false));
+    }
+
+    /// The completion that would raise asks whether the budget has room;
+    /// with none it does not raise, and a later one with room does.
+    #[test]
+    fn a_raise_waits_for_room_in_the_budget() {
+        let (limit, _) = limit(16, 64);
+        assert!(!run(&limit, 15, false));
+        let mut asked = 0;
+        let mut ticket = limit.open();
+        ticket.vote = Vote::Completed;
+        ticket.idle();
+        assert!(!limit.on_completed(false, false, || {
+            asked += 1;
+            false
+        }));
+        assert_eq!(asked, 1);
+        assert_eq!(limit.base(), 16);
+        drop(ticket);
+        assert!(complete(&limit, 1, false));
+        assert_eq!(limit.base(), 32);
     }
 
     #[test]
@@ -3240,7 +3271,7 @@ mod tests {
     fn a_path_without_data_never_raises() {
         let limit = Arc::new(StreamLimit::new(None, 0, 0));
         let _busy: Vec<_> = (0..100).map(|_| limit.open()).collect();
-        assert!(!(0..100).any(|_| limit.on_completed(false, false)));
+        assert!(!(0..100).any(|_| limit.on_completed(false, false, || true)));
     }
 
     #[test]

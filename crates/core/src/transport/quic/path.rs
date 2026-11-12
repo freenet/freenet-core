@@ -1745,7 +1745,12 @@ impl QuicPath {
             }
             std::task::Poll::Pending => {
                 self.stats.node.record_open(true);
-                open.await
+                // Counted if the send's deadline drops this wait: the peer's
+                // stream limit was full for all of it.
+                let waiting = CreditWait(Some(&self.stats));
+                let opened = open.await;
+                waiting.disarm();
+                opened
             }
         };
         let stream = opened?;
@@ -1762,6 +1767,25 @@ impl QuicPath {
             paid.spent();
         }
         Ok(send)
+    }
+}
+
+/// A send waiting in `open_uni` for a stream credit; dropped armed (the
+/// send's deadline ended the wait), it counts
+/// [`QuicSendEvent::StreamLimitFull`].
+struct CreditWait<'a>(Option<&'a QuicPathStats>);
+
+impl CreditWait<'_> {
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for CreditWait<'_> {
+    fn drop(&mut self) {
+        if let Some(stats) = self.0 {
+            stats.record_send_event(QuicSendEvent::StreamLimitFull);
+        }
     }
 }
 
